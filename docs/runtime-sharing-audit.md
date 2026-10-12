@@ -1,7 +1,7 @@
 # native / Cloudflare Workers / SORAHOST 共通化監査 (2026-10)
 
 対象: 「Workers 向け・SORAHOST 向けに積んだ機能のうち、実行環境に依存しないのに native と
-共通化されていない経路」の洗い出し。初回監査はコード変更なし。2026-10-12 の再監査ではシリーズ展開を共通化した。
+共通化されていない経路」の洗い出し。初回監査はコード変更なし。2026-10-12 にシリーズ展開を共通化し、後続の実効性監査で登録・保存・設定・Web UI・I/O の優先修正を実施した。
 
 - 初回監査時点の HEAD: `6434f27`〜`4ff29d3`（監査中に他作業で `worker_entry/ci/*` と
   `.github/workflows/platform.yml` が 2 コミット進んだ。本ファイルが引用する
@@ -10,6 +10,54 @@
   `grep` で「共有層の利用有無」を機械的に確認。主要な重複は本文を diff して一致を実測した。
 
 ---
+
+## 2026-10-12 追補: ランタイム実効性監査の優先修正
+
+シリーズ展開後の追加監査で確認した作者登録、Worker/Web UI の無効設定・未反映処理、
+SQLite の保存境界、不要な往復と並行 I/O を修正した。下の旧監査表は調査時点の記録であり、
+本節と重なる項目は本節の実装を優先する。単なる名前・定数の統合と、意味のある動作変更を区別する。
+
+| 優先修正 | 実装した境界・挙動 |
+|---|---|
+| 作者・ユーザー URL | `AuthorListing` と `DownloadTargetExpander` を CLI / Worker / CLI 作者追跡で共用。小説・シリーズ判定を優先し、単発登録と継続追跡を分離。実効 YAML、複数ログイン、ページ送り、シリーズ所属作品の除外を同じ規則で処理する |
+| SQLite の誤削除・不完全復帰 | TOC のストア上の存在で登録を維持。バックアップと YAML 復帰に本文・個別設定・ユーザー定義・挿絵を含め、全書き出し成功後だけマーカーを切替。削除は残った FS コピーを先に消し、旧ファイルから復活させない |
+| canonical 保存先 | 変換前に設定を取り出す。設定焼き込み、挿絵索引、差分復元、clean / illust / inspect、起動時話数補完をストアへ接続。壊れた TOC・挿絵索引は削除を進めない。同期 converter のストア I/O は Tokio 内でも安全に実行する |
+| 一時取り出し | 同一作品の利用者がスコープを共有し、最後の利用者だけが自分たちの作成ファイルを消す。プロセス間は作品単位のロック。ミラー有効時の復元は残す。既存ユーザーファイルを上書きせず、不完全ファイルを atomic publish しない |
+| Web 設定の nil / dirty / CAS | 三状態で未設定を保持。変更項目と表示時の期待値だけを送信。保存先ごとの CAS、HTTP 409、未送信・未知キーの保持、replace の競合検査。未変更保存は POST も書き込みも行わない |
+| Worker 能力と表示 | 共通 capability payload で非対応操作を制限。native 専用 S3 秘密値入力を隠し、無効設定を API でも拒否。concurrency はコンソール分離、keep-txt は既定 false、retry は最大 3。D1 固定を正しく説明し、取得失敗を YAML と推定しない |
+| EPUB | 設定生成と extra assets の消費を両 builder で共有。ストリームでも横書き、挿絵の除外、CSS / DMincho、行高、自動表紙を出力に反映。候補は本文順で探し、保持は 1 枚、書き出しで再利用。非 EPUB 端末と native-only inspect を拒否 |
+| 履歴・通知・更新 | PushHub の保持履歴を実際に取得・消去。再接続でも消去済み行を復活させない。設定保存の config reload と台帳の待機・実行数による table reload timing。進捗・通知は抑止しない |
+| Worker / UI の往復削減 | enqueue / Queue 送信の batch 化、freeze snapshot、必要 ID の投影、選択レコードのみの取得、pending queue の keyset paging。設定・別入力の独立読取と login payload の一度読み、最小 backup status、debounce / single-flight の更新合流 |
+| SQLite と bounded I/O | import / sections / versions / CRC verify / prefix delete を transaction / join / batch 化。本文・再開は 4 件の先読み窓で順序と最初の失敗を維持。小さい既知の S3 オブジェクトは最大 4 件・見積り 8 MiB、大きい／未知サイズは単独。画像 stat も上限付き |
+
+### 制約を残す理由
+
+- 同一サイトへの無制限取得、Worker の CPU 変換、同じ SQLite connection への並行 query は増やさない。
+- EPUB の全画像先読みはしない。本文の窓は追加 I/O の上限であり、変換全体の RAM の厳密な上限ではない。
+  S3 の 8 MiB も一覧サイズによる in-flight 見積りであり、プロセス全体の使用量を保証する値ではない。
+- 複数保存先を跨ぐ設定要求は全期待値を事前検査し、各保存先を CAS する。
+  YAML の global ファイル・local ストア・replace 全体を 1 transaction にしたという意味ではない。
+- 全件更新の複合ソートと UI の client-side 絞り込みに必要な全レコード取得は残す。
+  ID だけ必要な箇所と選択処理・待機キューの全量読取を削減した。
+- Worker の永続的作者追跡 CRUD / scheduler は追加しない。今回接続したのは既存の登録欄からの単発展開。
+- 速度改善率は未計測。改善は往復・投影・batch・先読みの構造と動作の確認であり、benchmark の結果ではない。
+
+### 実行確認
+
+- native の全テストと real-binary DB-only 回帰、Worker wasm build、ローカル Worker の
+  HTTP / Queue / WebSocket / D1 CAS、JS の消費者回帰を実行した。
+- 実ネットワークで `mypage.syosetu.com/2842627/` と `ncode.syosetu.com/s3795b/` を作品ジョブへ展開。
+  取り消し前に 2 話の 1 作品が DL と自動変換まで完了した。全作者作品の DL 完走を意味しない。
+- 隔離した native CLI で DB-only convert（stored INI / replace の反映）、backup ZIP、
+  設定焼き込み、clean、完全な YAML 復帰と編集済みサイト定義の復元を確認した。
+- Firefox の実画面で未設定表示、未変更保存の POST なし、Worker 非対応操作、D1 表示を確認。
+  Worker の実ストリーム EPUB は横書き / 縦書き、挿絵の有無、本文順、CSS のリンク、
+  DMincho 326,420 bytes、行高 2.1em、表紙 viewport 120×90 を ZIP の実内容で確認した。
+- テスト用データは Rust `TempDir` が所有する隔離領域。実ユーザープロファイル・資格情報・
+  規定の実ライブラリは触らない。Windows の既定 TEMP の OS5 と MSVC の失敗は、
+  リポジトリ内のテスト scratch と LLVM compiler/linker の環境指定で回避した。製品設定は変更しない。
+- 本番 Worker / S3 への直接配備・実機 send、外部 supervisor の下での再起動子プロセスの生存は
+  本検証の完了項目に含めない。ローカル配備と API の切替前後・再起動要否を確認した。
 
 ## 2026-10-12 再監査・シリーズ展開の共通化
 

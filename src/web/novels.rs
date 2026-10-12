@@ -16,6 +16,7 @@ use super::state::{ApiResponse, IdPath, ListParams, NovelListItem, NovelListResp
 fn map_application_error(error: ApplicationError) -> (StatusCode, String) {
     match error {
         ApplicationError::InvalidRequest(message) => (StatusCode::BAD_REQUEST, message),
+        ApplicationError::Conflict(message) => (StatusCode::CONFLICT, message),
         ApplicationError::NotFound(message) => (StatusCode::NOT_FOUND, message),
         ApplicationError::Platform(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
     }
@@ -524,10 +525,8 @@ async fn generate_epub_on_demand(
     let _files = crate::native::object_store::NativeStore::for_narou_root(inventory.root_dir())
         .and_then(|store| store.materialize_novel_files(novel_dir))
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let _materialized = crate::native::illustrations::Materialized::new(
-        crate::native::illustrations::materialize(novel_dir).await
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
-    );
+    let _materialized = crate::native::illustrations::materialize(novel_dir).await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     // 保存済み EPUB と同じ命名規則で Content-Disposition 名を決める
     // (変換時の txt basename に `.epub` を付けたもの)。
     // `convert.filename` / `convert.filename-to-ncode` は
@@ -648,6 +647,7 @@ async fn generate_epub_on_demand(
                     Some(user) => crate::converter::NovelConverter::with_user_converter(settings, user),
                     None => crate::converter::NovelConverter::new(settings),
                 };
+                converter.attach_store_illustration_storage(&novel_dir);
                 converter.apply_record_fetch_policy(Some(&record));
                 let toc = crate::downloader::TocObject {
                     title: toc.title, author: toc.author, toc_url: toc.toc_url,
@@ -678,6 +678,9 @@ async fn generate_epub_on_demand(
         };
         return Err((StatusCode::CONFLICT, message.to_string()));
     }
+    // Conversion can fetch images that were absent from the pre-build snapshot.
+    let _new_images = crate::native::illustrations::materialize(novel_dir).await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
     let options = crate::epub_lite::EpubBuildOptions {
         title: record.title.clone(),

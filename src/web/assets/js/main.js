@@ -3,6 +3,7 @@
  */
 import { State, El, initElements } from './core/state.js';
 import { fetchJson, postJson } from './core/http.js';
+import { setCapabilities, applyActionCapabilities, initCapabilityGuard } from './core/capabilities.js';
 import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
 import { initFeatureTour, maybeShowPendingFeatureTour } from './ui/feature_tour.js';
@@ -37,14 +38,31 @@ function applyPerformanceMode() {
   document.body.classList.toggle('performance-mode', isPerformanceModeEnabled());
 }
 
-async function refreshListWithUiState() {
-  await refreshList();
+async function refreshListWithUiState(redraw = true) {
+  await refreshList(redraw);
   applyPerformanceMode();
 }
 
-async function refreshListAndTags() {
-  await refreshListWithUiState();
-  await refreshTags();
+let pendingListRefresh = false;
+let pendingTagRefresh = false;
+let refreshTimer = null;
+
+function scheduleTableRefresh(includeList) {
+  pendingListRefresh ||= includeList;
+  pendingTagRefresh = true;
+  if (refreshTimer !== null) return;
+  refreshTimer = setTimeout(async () => {
+    const reloadList = pendingListRefresh;
+    const reloadTags = pendingTagRefresh;
+    pendingListRefresh = pendingTagRefresh = false;
+    await Promise.all([
+      reloadList ? refreshListWithUiState(false) : null,
+      reloadTags ? refreshTags(false) : null,
+    ]);
+    renderNovelList();
+    refreshTimer = null;
+    if (pendingListRefresh || pendingTagRefresh) scheduleTableRefresh(pendingListRefresh);
+  }, 50);
 }
 
 function isQueueModalOpen() {
@@ -59,6 +77,8 @@ function refreshQueueDetailedIfOpen() {
 
 async function init() {
   initElements();
+  initCapabilityGuard(message => showNotification(message, 'warning'));
+  applyActionCapabilities();
   initDropdowns();
   initFeatureTour();
   applyI18n();
@@ -102,7 +122,8 @@ async function init() {
   void maybeOfferLibraryBackup();
 
   // Initial data load
-  await Promise.all([refreshListWithUiState(), refreshQueue(), refreshQueueDetailed(), refreshTags()]);
+  await Promise.all([refreshListWithUiState(false), refreshQueue(), refreshQueueDetailed(), refreshTags(false)]);
+  renderNovelList();
 
   // Sync UI state (check marks, wide mode, footer)
   syncViewChecks();
@@ -113,8 +134,7 @@ async function init() {
   // Periodic refresh
   const interval = Math.max(State.pollIntervalSeconds, 10) * 1000;
   setInterval(async () => {
-    await refreshListWithUiState();
-    await refreshQueue();
+    await Promise.all([refreshListWithUiState(), refreshQueue()]);
     // イベント取りこぼしで残ったバーを、キューが空になった時点で片付ける。
     clearProgressBarsWhenQueueIdle(State.queueStatus);
     if (isQueueModalOpen()) {
@@ -207,9 +227,8 @@ function applyWebConfig(config) {
     const sel = El.themeSelect;
     if (sel) sel.value = theme;
   }
-  if (config.ws_port) State.wsPort = config.ws_port;
+  setCapabilities(config.capabilities);
   if (config.performance_mode) State.performanceMode = config.performance_mode;
-  if (config.reload_timing) State.tableReloadTiming = config.reload_timing;
   State.debugMode = Boolean(config.debug_mode);
   setConcurrencyEnabled(Boolean(config.concurrency_enabled));
 }
@@ -237,7 +256,7 @@ function mirrorConsoleToDevtools(text, targetConsole) {
 
 async function reloadWebConfig() {
   try {
-    const config = await fetchJson('/api/webui/config');
+    const config = await fetchJson('/api/webui/config?fresh=1');
     if (config) {
       applyWebConfig(config);
       applyPerformanceMode();
@@ -268,10 +287,10 @@ function handleWsMessage(msg) {
     case 'refresh':
     case 'list_updated':
     case 'table.reload':
-      refreshListAndTags();
+      scheduleTableRefresh(true);
       break;
     case 'tag.updateCanvas':
-      refreshTags();
+      scheduleTableRefresh(false);
       break;
     case 'webui.config.reload':
       reloadWebConfig();

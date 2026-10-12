@@ -279,8 +279,7 @@ pub fn site_for_host(host: &str) -> String {
     let host = host.trim().to_ascii_lowercase();
     // The Worker cannot read the site definitions from disk; callers with an
     // in-memory list (bundled definitions) use `site_for_host_with`.
-    let settings = crate::downloader::site_setting::SiteSetting::load_all()
-        .unwrap_or_default();
+    let settings = crate::downloader::site_setting::effective_site_settings();
     site_for_host_with(&settings, &host)
 }
 

@@ -5,9 +5,10 @@
 //! - `POST /api/settings/{id}` — native `save_settings` と同じ受理形・
 //!   エラーメッセージ・成功応答 (`ApiResponse`)。
 //! - `GET /api/devices` — native `list_devices` と同じ形
-//!   (`{devices: [{name, available}]}`)。Worker では外部プロセス依存の
-//!   フォーマット (AozoraEpub3 / kindlegen 要求のもの) を `false` にする。
-//!   `epub` は Lite (同梱エンジン) で生成できるので `true`。
+//!   (`{devices: [{name, available}]}`)。値は共有の
+//!   `application::webui::capabilities::worker_devices()` が唯一の定義で、
+//!   Worker が配信できる Lite の EPUB だけ `true` (外部プロセス・ローカル FS
+//!   前提の出力や、ダウンロード経路の無い text は `false`)。
 //!
 //! 値の解析・検証は native と同じ関数群 (このファイル末尾の `parse_*`
 //! は `src/web/novel_settings.rs` の写し)。
@@ -15,6 +16,7 @@
 use std::collections::HashMap;
 
 use narou_rs::application::{AppServices, NovelSettingsPatch, ReplacePattern};
+use narou_rs::application::webui::capabilities::worker_devices;
 use narou_rs::converter::ini::{IniData, IniValue};
 use narou_rs::setting_info::{VarInfo, VarType, original_setting_var_infos};
 use worker::{Env, Method, Request, Response};
@@ -90,6 +92,10 @@ async fn get_settings(services: &AppServices, id: i64) -> worker::Result<Respons
                 "var_type": entry.var_type,
                 "select_keys": entry.select_keys,
                 "value": ini_value_to_json(entry.value.as_ref()),
+                "worker_ineffective": narou_rs::application::webui::capabilities::worker_novel_setting_ineffective(&entry.name),
+                "worker_note": if narou_rs::application::webui::capabilities::worker_novel_setting_ineffective(&entry.name) {
+                    Some("Cloudflare Workers 版では調査ログを生成できません。")
+                } else { None },
             })
         })
         .collect();
@@ -131,6 +137,9 @@ async fn save_settings(
         let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
+        if narou_rs::application::webui::capabilities::worker_novel_setting_ineffective(name) {
+            return json_error(400, "unsupported_setting", Some("Cloudflare Workers 版では調査ログを生成できません"));
+        }
         let Some(info) = known_vars.get(name) else {
             return json_error(
                 400,
@@ -193,23 +202,20 @@ async fn save_settings(
 // GET /api/devices (native: src/web/novel_settings.rs list_devices)
 // ---------------------------------------------------------------------------
 
-/// native `OutputManager::available_devices` の対応表。Worker は外部プロセス
-/// (AozoraEpub3 / kindlegen) を起動できないので、それを要求するフォーマット
-/// は `false`。`epub` は同梱の Lite エンジンで要求時生成するため `true`、
-/// `text` / `ibunko` は出力自体がテキスト系で Worker 内で完結する。
+/// native `OutputManager::available_devices` と同じ形 (`{devices: [{name, available}]}`)。
+/// 値は共有の [`worker_devices`] が唯一の定義 — `POST /api/convert` の device
+/// override 検証 (`worker_convert_device_supported`) と同じ一覧を使うので、
+/// 端末一覧と受理範囲が乖離しない。
+///
+/// Worker が配信できるのは Lite の EPUB だけ (text は変換の内部形式で
+/// ダウンロード経路が無く、mobi/kobo/ibunko/reader/ibooks は外部プロセスや
+/// ローカル FS 前提の出力)。表示されていても実際には出力できない端末を
+/// `available: true` にしてはいけない。
 fn list_devices() -> worker::Result<Response> {
-    let devices = [
-        ("text", true),
-        ("epub", true),
-        ("mobi", false),
-        ("kobo", false),
-        ("ibunko", true),
-        ("reader", false),
-        ("ibooks", false),
-    ];
+    let devices = worker_devices();
     let list: Vec<serde_json::Value> = devices
         .iter()
-        .map(|(name, available)| serde_json::json!({ "name": name, "available": available }))
+        .map(|choice| serde_json::json!({ "name": &choice.name, "available": choice.available }))
         .collect();
     Response::from_json(&serde_json::json!({ "devices": list }))
 }

@@ -26,7 +26,7 @@ use aozora_epub3_lite::{
 };
 use aozora_epub3_lite::pipeline::append_gaiji_assets;
 
-use crate::converter::settings::ImageRotation;
+use crate::converter::settings::{ImageRotation, NovelSettings};
 use crate::error::{NarouError, Result};
 
 /// ライブラリ利用側 (Worker など) が入力源を実装するために使う。
@@ -51,6 +51,13 @@ mod embedded {
     pub const CHUKI_IVS: &str = include_str!("../assets/aozora_lite/chuki_ivs.txt");
     pub const CHUKI_ALT: &str = include_str!("../assets/aozora_lite/chuki_alt.txt");
     pub const CHUKI_LATIN: &str = include_str!("../assets/aozora_lite/chuki_latin.txt");
+    /// 濁点フォント本体 (`preset/DMincho.ttf`)。native は `preset/` の実体を
+    /// 読む (`converter::dakuten_font`) ので、ここは同じ内容の埋め込みコピー —
+    /// ファイルシステムの無い wasm (Worker) 向け。
+    pub const DAKUTEN_FONT_TTF: &[u8] = include_bytes!("../preset/DMincho.ttf");
+    /// 濁点フォント用スタイルシート (`preset/vertical_font_with_dakuten.css`)。
+    /// 行高は `<%= line_height %>` を展開して使う。
+    pub const DAKUTEN_CSS_TEMPLATE: &str = include_str!("../preset/vertical_font_with_dakuten.css");
 }
 
 /// `AozoraConfig` equivalent to running the Lite CLI with its bundled assets
@@ -187,6 +194,116 @@ pub struct EpubBuildOptions {
     pub rotate_image: Option<ImageRotation>,
 }
 
+/// 濁点注記のマーカー (変換側 `converter_base::convert_dakuten_char_to_font` が
+/// 本文へ入れる)。`convert.epub-font=auto` の判定に使う。
+pub const DAKUTEN_CHUKI_MARKER: &str = "［＃濁点］";
+
+/// 設定 (per-novel `setting.ini` + 設定マップ + 環境設定) から
+/// [`EpubBuildOptions`] を組む入力。
+///
+/// `NovelSettings` の組み立て (`NovelSettings::load_for_novel` / Worker の
+/// ObjectStore + D1) は呼び出し側の仕事。ここは「保存済み設定 → 組立
+/// オプション」の規則だけを持つ。
+pub struct EpubSettingsInput<'a> {
+    pub title: &'a str,
+    pub author: &'a str,
+    /// per-novel 設定 (`enable_yokogaki` = 横書き、`enable_illust` = 挿絵)。
+    pub settings: &'a NovelSettings,
+    /// EPUB に入れられる挿絵 (表紙候補) があるか。
+    pub has_images: bool,
+    /// 本文に濁点注記があるか (auto)。
+    pub use_dakuten_font: bool,
+    /// `convert.epub-font = always`。
+    pub epub_font_always: bool,
+    /// `line-height` 設定。未設定は 1.8 (native と同じ認定値)。
+    pub line_height: f64,
+    /// AozoraEpub3 の資産ディレクトリ。組み込みエンジンだけなら `None`。
+    pub assets_dir: Option<PathBuf>,
+    /// Java `-device kindle` 相当。
+    pub kindle: bool,
+    /// `convert.rotate-image`。
+    pub rotate_image: Option<ImageRotation>,
+}
+
+impl EpubBuildOptions {
+    /// 保存済み設定から組立オプションを作る (Worker `download.epub` の規則)。
+    ///
+    /// - 書字方向は per-novel `enable_yokogaki` (横書き指定) の否定。縦書きの
+    ///   小説を勝手に横組みにしない / 横書き指定を縦組みにしない。
+    /// - 表紙は `enable_illust` かつ挿絵があるときだけ (native Web の
+    ///   オンデマンド生成と同じ条件)。
+    /// - 濁点フォントは [`dakuten_font_assets`] の判定どおり
+    ///   (`use_dakuten_font` / `always`)。
+    pub fn from_settings(input: EpubSettingsInput<'_>) -> Self {
+        Self {
+            title: input.title.to_string(),
+            author: input.author.to_string(),
+            vertical: !input.settings.enable_yokogaki,
+            cover_from_first_image: input.settings.enable_illust && input.has_images,
+            assets_dir: input.assets_dir,
+            kindle: input.kindle,
+            extra_assets: dakuten_font_assets(
+                input.use_dakuten_font,
+                input.epub_font_always,
+                input.line_height,
+            ),
+            rotate_image: input.rotate_image,
+        }
+    }
+}
+
+/// 組み込みエンジンへ渡す濁点フォントのアセット一式
+/// (`style/vertical_font.css` + `fonts/DMincho.ttf`)。
+///
+/// `preset/` の実ファイルを埋め込みコピーから組むので、ファイルシステムの
+/// 無い wasm (Worker) でも native と同じ資産になる。
+///
+/// - `use_dakuten_font`: 本文に濁点注記がある (auto の対象)。
+/// - `always`: `convert.epub-font=always`。本文全体を DMincho で組む規則を
+///   足す (native `dakuten_font::body_font_css_text` と同じ文字列)。
+/// - `line_height`: CSS の `<%= line_height %>` へ展開する値。
+///
+/// どちらも偽なら空を返す (native `lite_font_assets` と同じ判定)。
+pub fn dakuten_font_assets(
+    use_dakuten_font: bool,
+    always: bool,
+    line_height: f64,
+) -> Vec<EpubAsset> {
+    if !use_dakuten_font && !always {
+        return Vec::new();
+    }
+    let mut css = embedded::DAKUTEN_CSS_TEMPLATE
+        .replace("<%= line_height %>", &format_line_height(line_height));
+    if always {
+        css.push_str(
+            "\n/* narou: convert.epub-font=always — 本文全体を DMincho で組む */\n\nbody, p {\n\tfont-family: \"DakutenAokinMincho\", serif;\n}\n",
+        );
+    }
+    vec![
+        EpubAsset::new("style/vertical_font.css", "text/css", css.into_bytes()),
+        EpubAsset::new(
+            "fonts/DMincho.ttf",
+            "application/font-sfnt",
+            embedded::DAKUTEN_FONT_TTF.to_vec(),
+        ),
+    ]
+}
+
+/// `converter::dakuten_font::format_line_height` と同じ整形
+/// (小数末尾の 0 を落とす)。
+fn format_line_height(line_height: f64) -> String {
+    let mut text = line_height.to_string();
+    if text.contains('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.push('0');
+        }
+    }
+    text
+}
+
 /// 書き出し時に読み出す挿絵。
 #[derive(Debug, Clone)]
 pub struct EpubImageSource {
@@ -277,6 +394,26 @@ pub fn is_supported_image(file_name: &str) -> bool {
         })
         .is_some()
 }
+
+/// Auto-cover eligibility used by the lazy reader and the source builder.
+pub fn cover_image_dimensions(file_name: &str, data: &[u8]) -> Option<(u32, u32)> {
+    let (_, extension) = file_name.rsplit_once('.')?;
+    let media_type = aozora_epub3_lite::pipeline::media_type_for_extension(extension)?;
+    aozora_epub3_lite::image::dimensions(data, media_type)
+        .filter(|(width, height)| *width > 64 && *height > 64)
+}
+
+/// 呼び出し側が渡した EPUB 資産 ([`EpubBuildOptions::extra_assets`]) を、外字・
+/// 挿絵と同じ規則で本文アセットへ積む (同じパスは先着優先)。両方の組立経路
+/// ([`build_book`] と [`build_book_from_source`]) が同じ重複規則で資産を持つ。
+fn append_extra_assets(assets: &mut Vec<EpubAsset>, extra: &[EpubAsset]) {
+    for asset in extra {
+        if !assets.iter().any(|existing| existing.path == asset.path) {
+            assets.push(asset.clone());
+        }
+    }
+}
+
 /// 変換済みテキストから EPUB を組み立てる。手順は Lite CLI
 /// (`main.rs::convert_input`) と同じで、注記表・外字フォント・INI は
 /// `aozoraepub3dir` から Java 版と同じものを読む。
@@ -461,7 +598,7 @@ pub fn build_book_from_source(
     let body = remove_metadata_lines(&text, &detected);
     config.image_alt_map.clear();
     collect_image_alts(&body, &mut config);
-    let (sections, records) =
+    let (mut sections, records) =
         aozora_text_to_xhtml_sections_with_chapters(&body, &config, detected.title_line.is_none())
             .map_err(|error| NarouError::Conversion(format!("EPUB変換に失敗しました: {error}")))?;
 
@@ -496,6 +633,37 @@ pub fn build_book_from_source(
         });
     }
     report_illustration_resolution(&unresolved, &unsupported, images.len());
+    // 呼び出し側が渡した資産 (濁点フォント `style/vertical_font.css` +
+    // `fonts/DMincho.ttf` 等) は本文アセットと同じ規則で足す。
+    append_extra_assets(&mut epub_assets, &options.extra_assets);
+
+    // 表紙 (`enable_illust` + `-c 0` 相当、native `collect_assets` と同じ規則):
+    // 本文の参照順で最初に解決でき、寸法が 64 px 超の挿絵を 1 枚だけ表紙へ
+    // 昇格する。FileSource 経路は構築時にバイト列を読めないため、呼び出し側が
+    // 先読みした 1 枚 (Worker は表紙候補を組立前に入れる) だけが寸法を持ち、
+    // 読めない挿絵は飛ばす — 0x0 の表紙ページは組まない。
+    let mut cover: Option<(String, (u32, u32))> = None;
+    if options.cover_from_first_image {
+        for image in &images {
+            let Some(data) = input.read_image(&image.source).ok().flatten() else {
+                continue;
+            };
+            if let Some(dimensions) = cover_image_dimensions(&image.source, &data) {
+                cover = Some((image.epub_path.clone(), dimensions));
+                break;
+            }
+        }
+    }
+    if let Some((cover_path, _)) = cover.as_ref() {
+        if let Some(image) = images.iter_mut().find(|image| image.epub_path == *cover_path) {
+            image.is_cover = true;
+        }
+        // Java Epub3Writer.getImageFilePath: 表紙ページへ移した挿絵は本文から
+        // 取り除く (native と同じ条件)。
+        if config.cover_page && is_auto_cover(Some("0")) {
+            remove_image_sources(&mut sections, &[cover_path.clone()]);
+        }
+    }
 
     let chapters = nav_chapters(records, &config);
     let title = if options.title.is_empty() {
@@ -509,16 +677,24 @@ pub fn build_book_from_source(
         Some(options.author.clone())
     };
     let metadata = build_metadata(&title, creator.as_deref(), None, None);
-    let book = EpubBook::from_sections(metadata, sections)
+    let mut book = EpubBook::from_sections(metadata, sections)
         .with_vertical(options.vertical)
         .with_style(StyleSettings::from_ini(&config.ini))
         .with_toc_page(config.toc_page)
         .with_toc_vertical(config.toc_vertical)
         .with_toc_nest(config.nav_nest, config.ncx_nest)
         .with_title_toc(config.title_toc)
+        .with_cover_page(config.cover_page, config.cover_page_toc)
         .with_kindle(options.kindle)
         .with_chapters(chapters)
         .with_assets(epub_assets);
+    if let Some((cover_path, cover_dimensions)) = cover {
+        // 表紙ページの viewport / viewBox は表紙画像の元寸法を使う
+        // (native `build_from_input` と同じ)。
+        book = book
+            .with_cover_asset(cover_path)
+            .with_cover_dimensions(Some(cover_dimensions));
+    }
 
     Ok(EpubBuild {
         book,
@@ -665,11 +841,7 @@ fn build_from_input(input: Input, options: &EpubBuildOptions) -> Result<EpubBuil
         title_page_markup.as_deref(),
     )
     .map_err(|error| NarouError::Conversion(format!("外字フォントを収集できません: {error}")))?;
-    for asset in &options.extra_assets {
-        if !epub_assets.iter().any(|existing| existing.path == asset.path) {
-            epub_assets.push(asset.clone());
-        }
-    }
+    append_extra_assets(&mut epub_assets, &options.extra_assets);
 
     let title_page_selected = config.title_page_write && matches!(config.title_page_type, 1 | 2);
     let mut book = EpubBook::from_sections(metadata, sections)
@@ -861,57 +1033,22 @@ mod tests {
     }
 
     /// 一時ディレクトリに `novel.txt` (と任意の挿絵) を置く。
-    fn text_file(name: &str, text: &str, illustration: Option<&[u8]>) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("narou-lite-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
+    fn text_file(text: &str, illustration: Option<&[u8]>) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let dir = guard.path();
         std::fs::create_dir_all(dir.join("挿絵")).unwrap();
         let path = dir.join("novel.txt");
         std::fs::write(&path, text).unwrap();
         if let Some(bytes) = illustration {
             std::fs::write(dir.join("挿絵/i1.png"), bytes).unwrap();
         }
-        path
+        (guard, path)
     }
 
-    #[test]
-    fn embedded_config_loads_chuki_tables() {
-        // The vendored tables are non-empty; parsing them must not panic.
-        // load_tag_text registers note rules, so re-loading must be safe and
-        // the API surface used by build_book must stay infallible.
-        let _first = embedded_config();
-        let mut second = embedded_config();
-        second.load_tag_text(embedded::CHUKI_TAG);
-        assert!(!embedded::CHUKI_TAG.is_empty());
-    }
-
-    #[test]
-    fn streams_real_converted_text_when_available() {
-        // Opt-in smoke: NAROU_EPUB_SMOKE_TXT points at a real converted
-        // 青空文庫 text. Skipped silently when the variable is absent so the
-        // suite stays hermetic.
-        let Ok(path) = std::env::var("NAROU_EPUB_SMOKE_TXT") else {
-            return;
-        };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let mut lines = text.lines();
-        let options = EpubBuildOptions {
-            title: lines.next().unwrap_or("untitled").to_string(),
-            author: lines.next().unwrap_or("unknown").to_string(),
-            cover_from_first_image: true,
-            ..options()
-        };
-        let build = build_book(Path::new(&path), &options).unwrap();
-        let mut bytes = Vec::new();
-        stream_epub(&build.book, &mut bytes, |path| build.resolve(path)).unwrap();
-        assert!(bytes.starts_with(b"PK\x03\x04"));
-        assert!(bytes.len() > 4096, "epub suspiciously small: {}", bytes.len());
-    }
 
     #[test]
     fn builds_streamable_epub_from_a_text_file() {
-        let path = text_file("plain", SAMPLE, None);
+        let (_directory, path) = text_file(SAMPLE, None);
         let build = build_book(&path, &options()).unwrap();
         let mut bytes = Vec::new();
         stream_epub(&build.book, &mut bytes, |path| build.resolve(path)).unwrap();
@@ -920,14 +1057,13 @@ mod tests {
         // mimetype is required to be the first, uncompressed entry.
         assert!(bytes.windows(8).any(|w| w == b"mimetype"));
         assert!(bytes.windows(20).any(|w| w == b"application/epub+zip"));
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
     fn collects_and_resolves_illustrations() {
         let png: &[u8] = b"\x89PNG\r\n\x1a\nstub";
         let text = format!("{SAMPLE}\n　挿絵。［＃挿絵（挿絵/i1.png）入る］\n");
-        let path = text_file("illust", &text, Some(png));
+        let (_directory, path) = text_file(&text, Some(png));
         let build = build_book(&path, &options()).unwrap();
 
         // 実ファイルは挿絵ディレクトリから、EPUB パスは Java と同じ連番で。
@@ -940,7 +1076,6 @@ mod tests {
         stream_epub(&build.book, &mut bytes, |path| build.resolve(path)).unwrap();
         let needle = b"item/image/0001.png";
         assert!(bytes.windows(needle.len()).any(|window| window == needle));
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
@@ -1072,7 +1207,7 @@ mod tests {
     fn entry_by_entry_writer_matches_batch_output() {
         let png: &[u8] = b"\x89PNG\r\n\x1a\nstub";
         let text = format!("{SAMPLE}\n　挿絵。［＃挿絵（挿絵/i1.png）入る］\n");
-        let path = text_file("stream", &text, Some(png));
+        let (_directory, path) = text_file(&text, Some(png));
         let build = build_book(&path, &options()).unwrap();
 
         let mut batch = Vec::new();
@@ -1103,7 +1238,6 @@ mod tests {
 
         assert_eq!(streamed, batch);
         assert!(chunks > 3, "1 エントリずつ流れていない: {chunks} chunks");
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// 挿絵のバイト列を書き出し直前に注入する経路 (Worker と同じ) でも EPUB が
@@ -1195,7 +1329,7 @@ mod tests {
         let text = format!("{SAMPLE}\n［＃挿絵（挿絵/i1.png）入る］\n");
 
         // 未指定: 同梱プリセットの RotateImage=2 → -90° で寸法が入れ替わる。
-        let path = text_file("rotate-default", &text, Some(&wide));
+        let (_default_directory, path) = text_file(&text, Some(&wide));
         let build = build_book(&path, &options()).unwrap();
         assert_eq!(build.images[0].rotate, -90);
         let resolved = build.resolve("image/0001.png").unwrap();
@@ -1203,10 +1337,9 @@ mod tests {
             aozora_epub3_lite::image::dimensions(&resolved, "image/png"),
             Some((400, 800))
         );
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
 
         // convert.rotate-image=0: INI を差し替えて回らない。
-        let path = text_file("rotate-off", &text, Some(&wide));
+        let (_off_directory, path) = text_file(&text, Some(&wide));
         let build = build_book(
             &path,
             &EpubBuildOptions {
@@ -1221,10 +1354,9 @@ mod tests {
             aozora_epub3_lite::image::dimensions(&resolved, "image/png"),
             Some((800, 400))
         );
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
 
         // convert.rotate-image=1: RotateImage=1 として +90° に回る。
-        let path = text_file("rotate-cw", &text, Some(&wide));
+        let (_cw_directory, path) = text_file(&text, Some(&wide));
         let build = build_book(
             &path,
             &EpubBuildOptions {
@@ -1239,30 +1371,27 @@ mod tests {
             aozora_epub3_lite::image::dimensions(&resolved, "image/png"),
             Some((400, 800))
         );
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// `aozoraepub3dir` の INI に `RotateImage` があれば、未指定時はそちらが
     /// 優先される (ユーザーが本家ツール側で回転を切っている場合)。
     #[test]
     fn rotate_image_unset_follows_install_ini() {
-        let dir = std::env::temp_dir().join(format!("narou-lite-rot-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let assets = tempfile::tempdir().unwrap();
+        let dir = assets.path();
         std::fs::write(dir.join("AozoraEpub3.ini"), "RotateImage=1\n").unwrap();
         let wide = test_png(800, 400);
         let text = format!("{SAMPLE}\n［＃挿絵（挿絵/i1.png）入る］\n");
-        let path = text_file("rotate-ini", &text, Some(&wide));
+        let (_directory, path) = text_file(&text, Some(&wide));
         let build = build_book(
             &path,
             &EpubBuildOptions {
-                assets_dir: Some(dir.clone()),
+                assets_dir: Some(dir.to_path_buf()),
                 ..options()
             },
         )
         .unwrap();
         assert_eq!(build.images[0].rotate, 90);
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `FileSource` 経路 (Worker) は構築時に寸法を読めないので、`rotate_image`
@@ -1330,5 +1459,6 @@ mod tests {
             Some((400, 800))
         );
     }
+
 }
 

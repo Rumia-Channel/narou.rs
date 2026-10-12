@@ -18,12 +18,23 @@
 //! The ledger does not expose listing primitives (`JobQueue` is per-id only),
 //! so reads go through a direct `env.d1("DB")` handle — the same binding
 //! `WorkerRuntime::build_ui` wires into `D1JobLedger`.
+//!
+//! `GET /api/get_pending_tasks` is cursor-paged (`limit` / opaque `cursor`,
+//! `next_cursor` in the response; `pending_count` / `running_count` are
+//! whole-queue totals) so the modal never loads the entire queue in one body.
+//! The keyset, SQL and cursor codec live in `queue/paging.rs`.
 
 use serde::Deserialize;
 use serde_json::json;
+use wasm_bindgen::JsValue;
 use worker::{Method, Request, Response, Result, console_log};
 
 use crate::db_handle::DbHandle;
+
+use paging::{ACTIVE_PAGE_SQL, ACTIVE_TOTALS_SQL};
+
+/// Keyset paging for the queue modal (`GET /api/get_pending_tasks`).
+mod paging;
 
 /// Entry point; `lib.rs` routes `/api/tag_list`, `/api/queue/status`,
 /// `/api/get_pending_tasks` and `/api/get_queue_size` here.
@@ -284,19 +295,42 @@ fn describe_update_targets(targets: &[String]) -> String {
     }
 }
 
-/// All active (pending / retryable / running) rows in FIFO order.
-async fn select_active_rows(db: &DbHandle) -> Result<Vec<ActiveJobRow>> {
-    let statement = db.prepare(
-        "SELECT job_id, kind, target, options, status, created_at
-         FROM worker_jobs
-         WHERE status IN ('pending', 'retryable', 'running')
-         ORDER BY created_at ASC, job_id ASC",
-    );
-    statement
-        .all()
-        .await
-        .and_then(|result| result.results::<ActiveJobRow>())
-        .map_err(|error| worker::Error::RustError(format!("worker_jobs read: {error}")))
+/// One modal snapshot: the FIFO page for `cursor`/`limit` and the
+/// server-side totals (waiting vs running). Both statements go out as one D1
+/// batch, so a page costs one round trip and never carries the whole queue.
+///
+/// `cursor` is the last `(created_at, job_id)` of the previous page; `None`
+/// starts from the beginning. The page SQL treats empty strings the same way.
+async fn select_pending_page(
+    db: &DbHandle,
+    cursor: Option<(&str, &str)>,
+    limit: usize,
+) -> Result<(Vec<ActiveJobRow>, [i64; 2])> {
+    let (created_at, job_id) = cursor.unwrap_or(("", ""));
+    let page = db
+        .prepare(ACTIVE_PAGE_SQL)
+        .bind(&[
+            JsValue::from_str(created_at),
+            JsValue::from_str(created_at),
+            JsValue::from_str(job_id),
+            JsValue::from_f64(limit as f64),
+        ])?;
+    let totals = db.prepare(ACTIVE_TOTALS_SQL);
+    let results = db.batch(vec![page, totals]).await?;
+    crate::d1_repository::ensure_batch_success(&results)
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    if results.len() != 2 {
+        return Err(worker::Error::RustError("incomplete pending tasks batch".into()));
+    }
+    let rows = results[0].results::<ActiveJobRow>()?;
+    let mut counts = [0i64; 2];
+    for row in results[1].results::<LaneCount>()? {
+        let Some(lane) = counts.get_mut(row.lane) else {
+            return Err(worker::Error::RustError("invalid pending task lane".into()));
+        };
+        *lane += row.n;
+    }
+    Ok((rows, counts))
 }
 
 /// Both status queries share one D1 batch/request. Pending job payloads never
@@ -389,6 +423,10 @@ async fn queue_status(req: Request, env: worker::Env) -> Result<Response> {
 // GET /api/get_pending_tasks
 // ---------------------------------------------------------------------------
 
+/// `GET /api/get_pending_tasks[?limit=N&cursor=<opaque>]` — one FIFO page of
+/// active jobs plus the true totals. A client walks every row by passing the
+/// returned `next_cursor` until it is null; counts are never page-local, so
+/// the header stays correct while paging.
 async fn get_pending_tasks(req: Request, env: worker::Env) -> Result<Response> {
     if let Some(response) = crate::auth_failure(&req, &env).await {
         return response;
@@ -396,10 +434,33 @@ async fn get_pending_tasks(req: Request, env: worker::Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
+    let (limit, cursor) = match req.url() {
+        Ok(url) => (
+            paging::clamp_limit(query_param(&url, "limit").as_deref()),
+            query_param(&url, "cursor").and_then(|raw| paging::decode_cursor(&raw)),
+        ),
+        // A request URL that cannot be parsed has no query parameters.
+        Err(_) => (paging::DEFAULT_PAGE_SIZE, None),
+    };
     let db = database_or_503!(env);
-    let rows = match select_active_rows(&db).await {
-        Ok(rows) => rows,
+    let (rows, counts) = match select_pending_page(
+        &db,
+        cursor.as_ref().map(|(created_at, job_id)| (created_at.as_str(), job_id.as_str())),
+        limit,
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
         Err(_) => return json_error(500, "ledger_read_failed", None),
+    };
+    // A full page may or may not be the last one: hand out the keyset cursor
+    // of its final row and let the next request decide. An empty / partial
+    // page terminates the walk.
+    let next_cursor = if rows.len() == limit {
+        rows.last()
+            .map(|row| paging::encode_cursor(&row.created_at, &row.job_id))
+    } else {
+        None
     };
 
     let pending_json: Vec<serde_json::Value> = rows
@@ -412,14 +473,15 @@ async fn get_pending_tasks(req: Request, env: worker::Env) -> Result<Response> {
         .filter(|row| row.status == "running")
         .map(job_json)
         .collect();
-    let pending_count = pending_json.len();
-    let running_count = running_json.len();
 
     Response::from_json(&json!({
         "pending": pending_json,
         "running": running_json,
-        "pending_count": pending_count,
-        "running_count": running_count,
+        // Totals for the whole active queue, not just this page.
+        "pending_count": counts[0],
+        "running_count": counts[1],
+        "limit": limit,
+        "next_cursor": next_cursor,
         // The worker ledger has no restorable/deferred jobs: nothing survives
         // as a resumable native-style deferred queue entry.
         "restorable_tasks_available": false,

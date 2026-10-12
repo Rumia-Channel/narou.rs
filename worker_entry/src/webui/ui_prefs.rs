@@ -11,6 +11,7 @@
 //!   ツアー定義テーブルと seen/disabled 設定キーは native と同じ。
 //!   ストレージ移行プロンプトは `not(native-runtime)` 側の固定値を返す。
 
+use narou_rs::application::webui::capabilities::{ConsoleHistoryCapabilities, WebUiCapabilities};
 use narou_rs::application::webui::{CURRENT_SORT_KEY, normalize_current_sort_request};
 use narou_rs::setting_core::SettingScope;
 use serde::Serialize;
@@ -70,7 +71,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     match route {
         Route::GetSortState => get_sort_state(&runtime).await,
         Route::SaveSortState => save_sort_state(&mut req, &runtime).await,
-        Route::WebuiConfig => webui_config(&req, &runtime).await,
+        Route::WebuiConfig => webui_config(&req, &env).await,
         Route::FeatureTourPending => feature_tour_pending(&runtime).await,
         Route::FeatureTourAll => feature_tour_all(&runtime).await,
         Route::FeatureTourSeen => feature_tour_seen(&mut req, &runtime).await,
@@ -82,36 +83,56 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
 // GET /api/webui/config (native: src/web/misc.rs:187 webui_config)
 // ---------------------------------------------------------------------------
 
-async fn webui_config(req: &Request, runtime: &WorkerRuntime) -> worker::Result<Response> {
-    let settings = &runtime.services.settings;
+async fn webui_config(req: &Request, env: &Env) -> worker::Result<Response> {
+    // `?fresh=1` は isolate キャッシュを迂回して primary から読む (別 isolate が
+    // 古い値を持っていても、再読み込み時はここで取り直す)。通常の初期化は
+    // キャッシュ経由で軽くする。
+    let fresh = req
+        .url()
+        .ok()
+        .and_then(|url| super::query_param(&url, "fresh"))
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true"));
+    let settings = if fresh {
+        super::metadata::settings_for_writes(env)
+    } else {
+        super::metadata::settings(env)
+    };
+    let Ok(settings) = settings else {
+        return json_error(503, "service_unavailable", None);
+    };
+    // 依存の無い設定は 1 回の `get_many` にまとめる (スコープごとに 1 回だけ
+    // ストアを読む)。
+    const CONFIG_NAMES: &[&str] = &[
+        "webui.theme",
+        "webui.performance-mode",
+        "webui.table.reload-timing",
+        "webui.debug-mode",
+        "concurrency",
+    ];
+    let loaded: Vec<Option<serde_yaml::Value>> = settings
+        .get_many(CONFIG_NAMES)
+        .await
+        .unwrap_or_default();
+    let find = |name: &str| {
+        CONFIG_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+            .and_then(|index| loaded.get(index).cloned().flatten())
+    };
     let string_value = |value: Option<serde_yaml::Value>, default: &str| {
         value
             .and_then(|value| value.as_str().map(str::to_owned))
             .unwrap_or_else(|| default.to_string())
     };
-    let theme = string_value(settings.get("webui.theme").await.ok().flatten(), "Cerulean");
-    let performance_mode = string_value(
-        settings.get("webui.performance-mode").await.ok().flatten(),
-        "auto",
-    );
-    let reload_timing = string_value(
-        settings.get("webui.table.reload-timing").await.ok().flatten(),
-        "every",
-    );
-    let debug_mode = settings
-        .get("webui.debug-mode")
-        .await
-        .ok()
-        .flatten()
+    let theme = string_value(find("webui.theme"), "Cerulean");
+    let performance_mode = string_value(find("webui.performance-mode"), "auto");
+    let reload_timing = string_value(find("webui.table.reload-timing"), "every");
+    let debug_mode = find("webui.debug-mode")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
     // Worker のジョブは常に並列なので既定は有効 (native の `concurrency=true` と
     // 同じ 2 ペイン表示)。明示的に false を保存したときだけ 1 ペインに戻す。
-    let concurrency_enabled = settings
-        .get("concurrency")
-        .await
-        .ok()
-        .flatten()
+    let concurrency_enabled = find("concurrency")
         .and_then(|value| crate::composition::setting_bool(&value))
         .unwrap_or(true);
 
@@ -123,6 +144,16 @@ async fn webui_config(req: &Request, runtime: &WorkerRuntime) -> worker::Result<
         .ok()
         .and_then(|url| url.port_or_known_default());
 
+    // UI が対応済みの操作だけを出すための能力宣言。Worker は 501 を返す経路が
+    // あるので、native と違って全操作が false。コンソール履歴は PushHub DO の
+    // 実装値と共有する。
+    let capabilities = WebUiCapabilities::worker(ConsoleHistoryCapabilities {
+        available: true,
+        capacity: crate::push_hub::HISTORY_CAPACITY,
+        clear: true,
+        max_bytes: crate::push_hub::HISTORY_MAX_BYTES,
+    });
+
     Response::from_json(&serde_json::json!({
         "theme": theme,
         "performance_mode": performance_mode,
@@ -131,6 +162,14 @@ async fn webui_config(req: &Request, runtime: &WorkerRuntime) -> worker::Result<
         "ws_port": port,
         "port": port,
         "concurrency_enabled": concurrency_enabled,
+        // Worker 固有の注記 (native の応答にも同じキーを native 値で入れる):
+        // `concurrency` は実行レーンではなくコンソール分離のみ、`convert.keep-txt`
+        // の既定は false、`queue.max-retries` は配備上限で clamp される。
+        "concurrency_scope": "console",
+        "convert_keep_txt_default": false,
+        "queue_max_retries_limit": crate::consumer::CF_CONSUMER_MAX_RETRIES,
+        "capabilities": serde_json::to_value(&capabilities)
+            .expect("capabilities serialization is infallible"),
     }))
 }
 

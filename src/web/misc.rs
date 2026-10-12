@@ -165,25 +165,51 @@ fn read_notepad_content(path: &Path) -> std::io::Result<String> {
 }
 
 pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let setting = |name: &'static str| async {
-        state.services.settings.get(name).await.ok().flatten()
+    // 依存の無い設定は 1 回の `get_many` にまとめる (スコープごとに 1 回だけ
+    // ストアを読む)。
+    const CONFIG_NAMES: &[&str] = &[
+        "webui.theme",
+        "webui.performance-mode",
+        "webui.table.reload-timing",
+        "webui.debug-mode",
+        "concurrency",
+    ];
+    let loaded: Vec<Option<serde_yaml::Value>> = state
+        .services
+        .settings
+        .get_many(CONFIG_NAMES)
+        .await
+        .unwrap_or_default();
+    let find = |name: &str| {
+        CONFIG_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+            .and_then(|index| loaded.get(index).cloned().flatten())
     };
     let string_value = |value: Option<serde_yaml::Value>, default: &str| {
         value
             .and_then(|value| value.as_str().map(str::to_owned))
             .unwrap_or_else(|| default.to_string())
     };
-    let theme = string_value(setting("webui.theme").await, "Cerulean");
-    let performance_mode = string_value(setting("webui.performance-mode").await, "auto");
-    let reload_timing = string_value(setting("webui.table.reload-timing").await, "every");
-    let debug_mode = setting("webui.debug-mode")
-        .await
+    let theme = string_value(find("webui.theme"), "Cerulean");
+    let performance_mode = string_value(find("webui.performance-mode"), "auto");
+    let reload_timing = string_value(find("webui.table.reload-timing"), "every");
+    let debug_mode = find("webui.debug-mode")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let concurrency_enabled = setting("concurrency")
-        .await
+    let concurrency_enabled = find("concurrency")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+
+    // 能力宣言 (共有定義)。端末一覧だけは実行時の外部ツール検出値を使う。
+    let capabilities = crate::application::webui::capabilities::WebUiCapabilities::native(
+        crate::converter::device::OutputManager::available_devices()
+            .into_iter()
+            .map(|(name, available)| {
+                crate::application::webui::capabilities::DeviceChoice { name: name.into(), available }
+            })
+            .collect(),
+    );
 
     Json(serde_json::json!({
         "theme": theme,
@@ -193,6 +219,14 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
         "ws_port": state.ws_port,
         "port": state.port,
         "concurrency_enabled": concurrency_enabled,
+        // native の注記 (Worker の応答と同じキーを native 値で返す):
+        // `concurrency` は実行レーンの分離、keep-txt の既定 true、
+        // retry の配備上限なし。
+        "concurrency_scope": "lanes",
+        "convert_keep_txt_default": true,
+        "queue_max_retries_limit": serde_json::Value::Null,
+        "capabilities": serde_json::to_value(&capabilities)
+            .expect("capabilities serialization is infallible"),
     }))
 }
 

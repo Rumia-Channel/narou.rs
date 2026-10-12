@@ -14,7 +14,7 @@
 //! wasm 上で動く（`getrandom` の `wasm_js` バックエンド）ので、取り込みや
 //! `Set-Cookie` の書き戻しも D1 だけで完結する。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::{NarouError, Result};
@@ -164,14 +164,6 @@ impl D1CookieStore {
         Ok(())
     }
 
-    /// そのサイトの保存値が暗号化されているか (診断用)。
-    pub async fn is_encrypted(&self, site: &str) -> Result<bool> {
-        let raw = self.load_raw().await?;
-        Ok(raw
-            .get(&site.trim().to_ascii_lowercase())
-            .is_some_and(|value| narou_rs::login::is_encrypted_at_rest(value)))
-    }
-
     /// 復号鍵の出所 (表示用)。
     pub fn key_source(&self) -> &'static str {
         if self.key.is_some() {
@@ -203,8 +195,37 @@ impl D1CookieStore {
     /// (native `InventoryCookieStore::groups`)。
     async fn groups(&self) -> Result<BTreeMap<String, Vec<LoginGroup>>> {
         let raw = self.load_raw().await?;
+        Ok(self.decode_sites(&raw).await?.0)
+    }
+
+    /// 全サイトと、サイトごとの暗号化フラグを 1 回の payload 読み出しで返す
+    /// (`GET /api/login` の `status_payload`)。
+    ///
+    /// フラグは復号前の生値 (`enc:v1:` 前置) から `login::listing` が判定する。
+    /// 旧キーの畳み込みで書き戻しが起きた場合、`save_groups_map` は全サイトを
+    /// 暗号化して書き直すので全サイトを暗号化済みとする — 書き戻しの後に
+    /// 保存行を読み直す旧 `is_encrypted` と同じ結果を、再読込なしで返す。
+    pub async fn groups_and_encryption(
+        &self,
+    ) -> Result<(BTreeMap<String, Vec<LoginGroup>>, BTreeSet<String>)> {
+        let raw = self.load_raw().await?;
+        let (sites, rewrote) = self.decode_sites(&raw).await?;
+        let encrypted = if rewrote {
+            sites.keys().cloned().collect()
+        } else {
+            crate::login::listing::encrypted_sites(&raw, &sites)
+        };
+        Ok((sites, encrypted))
+    }
+
+    /// payload (`raw`) を復号してサイトへ展開する。書き戻しが起きたかを
+    /// 併せて返す (呼び出し側の診断フラグの材料)。
+    async fn decode_sites(
+        &self,
+        raw: &BTreeMap<String, String>,
+    ) -> Result<(BTreeMap<String, Vec<LoginGroup>>, bool)> {
         if raw.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), false));
         }
         // 保存キーが属するサイト。今日のキーはサイト名で、旧ビルドが書いた
         // ホスト名のキーは実効サイト定義で畳み先を決める (native `site_for_key`)。
@@ -216,14 +237,14 @@ impl D1CookieStore {
             // 暗号文の AAD は書き込み時のキー名 (サイトまたは旧ホスト名)。
             let plain = match narou_rs::login::decrypt_stored_value(
                 self.key.as_ref(),
-                &key_name,
-                &value,
+                key_name,
+                value,
             )? {
                 Some(cookie) => cookie,
-                None => value,
+                None => value.clone(),
             };
-            let site = site_for_host_with(&site_settings, &key_name);
-            if site != key_name {
+            let site = site_for_host_with(&site_settings, key_name);
+            if site != *key_name {
                 needs_rekey = true;
             }
             let Ok(decoded) = decode_groups(&plain, &site) else {
@@ -263,7 +284,7 @@ impl D1CookieStore {
         if needs_rekey {
             self.save_groups_map(&stored).await?;
         }
-        Ok(stored)
+        Ok((stored, needs_rekey))
     }
 
     /// サイトごとに暗号化して 1 行に書き戻す (native `save_groups_map`)。

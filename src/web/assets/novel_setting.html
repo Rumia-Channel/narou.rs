@@ -102,6 +102,9 @@ function renderSettingsTable(settings) {
     if (item.help) {
       html += `<tr><td colspan="2"><div class="help">${esc(item.help)}</div></td></tr>`;
     }
+    if (item.worker_note) {
+      html += `<tr><td colspan="2"><div class="help">${esc(item.worker_note)}</div></td></tr>`;
+    }
   }
   html += '</tbody></table>';
   return html;
@@ -112,7 +115,7 @@ function settingInput(item) {
   const value = item.value;
   const type = item.var_type;
   const selectKeys = item.select_keys || [];
-  const base = `data-setting-name="${escAttr(key)}" data-setting-type="${escAttr(type)}"`;
+  const base = `data-setting-name="${escAttr(key)}" data-setting-type="${escAttr(type)}"${item.worker_ineffective ? ' disabled' : ''}`;
   if (type === 'boolean') {
     const selected = value === true ? 'true' : value === false ? 'false' : '';
     return `
@@ -161,6 +164,7 @@ function renderReplaceTable(patterns) {
 function collectSettings() {
   const settings = [];
   document.querySelectorAll('[data-setting-name]').forEach(el => {
+    if (el.disabled) return;
     const name = el.dataset.settingName;
     const type = el.dataset.settingType;
     let value = null;

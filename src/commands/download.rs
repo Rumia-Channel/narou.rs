@@ -439,10 +439,7 @@ pub fn target_is_known(target: &str) -> bool {
     {
         return true;
     }
-    let settings = match narou_rs::downloader::site_setting::SiteSetting::load_all() {
-        Ok(settings) => settings,
-        Err(_) => return false,
-    };
+    let settings = narou_rs::downloader::site_setting::effective_site_settings();
     settings
         .iter()
         .filter(|setting| setting.matches_url(target))
@@ -488,6 +485,17 @@ fn inspect_existing_download(
     let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
     if novel_dir.exists() {
         return Some(ExistingDownloadState::Present(info));
+    }
+    // mirror-files=false の構成では、有効な作品でも保存フォルダが無い。
+    // ストアに本文 (toc.yaml) が残っているなら記録を消してはいけない。
+    // ストアを確認できないときも消さない (誤削除は再取得不能を招く)。
+    match narou_rs::native::object_store::novel_content_stored(&archive_root, &novel_dir) {
+        Ok(true) => return Some(ExistingDownloadState::Present(info)),
+        Ok(false) => {}
+        Err(err) => {
+            sink.emit(Stream::Stderr, &messages::indented_error(err));
+            return Some(ExistingDownloadState::Present(info));
+        }
     }
 
     if let Err(err) = novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(
@@ -670,6 +678,8 @@ fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::commands::download::{ExistingDownloadState, inspect_existing_download};
+
     use super::{EXIT_INTERRUPT, auto_convert_existing_download, parse_confirm_input};
     use narou_rs::downloader::{DownloadResult, UpdateStatus};
     use narou_rs::queue::{JobType, PersistentQueue};
@@ -762,6 +772,96 @@ mod tests {
             snapshot.jobs.front().map(|job| job.target.as_str()),
             Some("3062")
         );
+        *narou_rs::db::DATABASE.lock() = None;
+    }
+
+    /// mirror-files=false の有効な作品は、保存フォルダが無くても
+    /// 「ダウンロード済み」と判定され、記録を消されない。
+    #[test]
+    fn db_only_novel_is_present_without_folder_and_keeps_record() {
+        use narou_rs::application::messages::{MessageSink, Stream};
+        use narou_rs::native::sqlite::state;
+        use narou_rs::platform::{NovelMutation, NovelObjectKeys, ObjectStore};
+
+        struct TestSink;
+        impl MessageSink for TestSink {
+            fn emit(&self, _stream: Stream, _text: &str) {}
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let narou_dir = root.path().join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        state::write_mode(&narou_dir, state::StorageMode::Sqlite).unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(root.path());
+        narou_rs::db::init_database().unwrap();
+
+        let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+        {
+            use chrono::{TimeZone, Utc};
+            novels
+                .apply_batch_sync(vec![NovelMutation::Upsert(narou_rs::db::NovelRecord {
+                    id: 1,
+                    author: "author".to_string(),
+                    title: "DbOnly".to_string(),
+                    file_title: "db-only".to_string(),
+                    toc_url: "https://example.test/1".to_string(),
+                    sitename: "example.test".to_string(),
+                    novel_type: 1,
+                    end: false,
+                    last_update: Utc.with_ymd_and_hms(2026, 4, 20, 0, 0, 0).unwrap(),
+                    new_arrivals_date: None,
+                    use_subdirectory: false,
+                    general_firstup: None,
+                    novelupdated_at: None,
+                    general_lastup: None,
+                    last_mail_date: None,
+                    tags: Vec::new(),
+                    ncode: None,
+                    domain: None,
+                    general_all_no: None,
+                    length: None,
+                    suspend: false,
+                    is_narou: false,
+                    last_check_date: None,
+                    convert_failure: false,
+                    requires_login: false,
+                    login_session: None,
+                    extra_fields: Default::default(),
+                })])
+                .unwrap();
+        }
+
+        let archive_root = root.path().join("小説データ");
+        let keys = NovelObjectKeys::new("example.test", "db-only", false).unwrap();
+        let handle = state::active_for(&narou_dir).expect("sqlite state");
+        let mirror = narou_rs::native::object_store::NativeObjectStore::from_root(
+            archive_root.clone(),
+        )
+        .unwrap();
+        let store = narou_rs::native::sqlite::object_store::SqliteObjectStore::with_mirror_files(
+            handle.conn_ref().clone(),
+            mirror,
+            false,
+        );
+        futures::executor::block_on(store.write_small(
+            &keys.toc(),
+            b"title: DbOnly\nauthor: author\ntoc_url: https://example.test/1\nsubtitles: []\n"
+                .to_vec(),
+        ))
+        .unwrap();
+
+        let sink: std::sync::Arc<dyn MessageSink> = std::sync::Arc::new(TestSink);
+        let inspected = inspect_existing_download("1", &sink);
+        assert!(matches!(
+            inspected,
+            Some(ExistingDownloadState::Present(_))
+        ));
+        let kept = novels
+            .get_sync(1i64.into())
+            .unwrap()
+            .expect("DB-only record must not be deleted");
+        assert_eq!(kept.id, 1);
+
         *narou_rs::db::DATABASE.lock() = None;
     }
 }

@@ -2416,7 +2416,7 @@ pub async fn api_reboot(
 /// Spawns a replacement server process with the same CLI args, then exits this
 /// process after the new one is running. Used by `POST /api/reboot` and by
 /// `POST /api/storage/mode` (backend switch requires a restart).
-pub(crate) async fn schedule_server_reboot(state: AppState) -> Result<(), String> {
+pub async fn schedule_server_reboot(state: AppState) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let current_dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let hide_console = crate::compat::inherited_hide_console_requested();

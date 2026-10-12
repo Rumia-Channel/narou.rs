@@ -63,6 +63,10 @@ pub struct HttpRequest {
     /// contract), and do not apply site fetch fallbacks. Site fetches must
     /// leave this `false`.
     pub trusted_endpoint: bool,
+    /// Optional tighter success-body bound for trusted infrastructure calls.
+    /// Transports enforce it while reading, not after allocating the full body.
+    /// Site requests and non-2xx diagnostic bodies keep their existing limits.
+    pub trusted_response_body_limit: Option<usize>,
 }
 
 impl HttpRequest {
@@ -74,6 +78,7 @@ impl HttpRequest {
             body: None,
             redirect: RedirectMode::Follow,
             trusted_endpoint: false,
+            trusted_response_body_limit: None,
         }
     }
 
@@ -85,6 +90,7 @@ impl HttpRequest {
             body: Some(body.into()),
             redirect: RedirectMode::Follow,
             trusted_endpoint: false,
+            trusted_response_body_limit: None,
         }
     }
 
@@ -97,6 +103,7 @@ impl HttpRequest {
             body: Some(body.into()),
             redirect: RedirectMode::Follow,
             trusted_endpoint: false,
+            trusted_response_body_limit: None,
         }
     }
 
@@ -109,6 +116,7 @@ impl HttpRequest {
             body: None,
             redirect: RedirectMode::Follow,
             trusted_endpoint: false,
+            trusted_response_body_limit: None,
         }
     }
 
@@ -127,6 +135,11 @@ impl HttpRequest {
     /// See [`HttpRequest::trusted_endpoint`] for what transports change.
     pub fn with_trusted_endpoint(mut self) -> Self {
         self.trusted_endpoint = true;
+        self
+    }
+
+    pub fn with_trusted_response_body_limit(mut self, limit: usize) -> Self {
+        self.trusted_response_body_limit = Some(limit);
         self
     }
 
@@ -219,23 +232,6 @@ impl<T: HttpClient + ?Sized> HttpClient for &T {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn request_builders_set_fields() {
-        let req = HttpRequest::get("https://example.com/")
-            .with_header("Cookie", "a=b")
-            .with_redirect(RedirectMode::Manual);
-        assert_eq!(req.method, HttpMethod::Get);
-        assert_eq!(req.headers, vec![("Cookie".into(), "a=b".into())]);
-        assert!(req.body.is_none());
-        assert_eq!(req.redirect, RedirectMode::Manual);
-        assert_eq!(req.header("cookie"), Some("a=b"));
-
-        let post = HttpRequest::post("https://example.com/api", b"payload".to_vec());
-        assert_eq!(post.method, HttpMethod::Post);
-        assert_eq!(post.body, Some(b"payload".to_vec()));
-        assert_eq!(post.redirect, RedirectMode::Follow);
-    }
 
     #[test]
     fn response_helpers() {

@@ -155,15 +155,16 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 引数なしでインタラクティブモード (stdin から URL 入力、TTY時のみ)
 - 凍結チェック: Ruby版と同じ `.narou/freeze.yaml` を優先し、移行互換として `frozen` タグも補助的に認識して凍結済み小説をスキップ
 - ダウンロード済みチェック: 既存小説はスキップ（`--force`で上書き）
-- DB に記録があるのに保存フォルダが消えていた場合は、Ruby版同様に DB インデックスを削除して `再ダウンロードしますか (y/n)?` を確認する。非TTYでは yes 扱いで再DLへ進む
+- DB に記録があって保存フォルダが無い場合も、ObjectStore の `toc.yaml` があれば登録済みとして扱う（SQLite のミラー無効運用）。保存済み TOC も無い場合だけ Ruby版同様に DB インデックスを削除し、再ダウンロード確認へ進む
 - タグ展開: `tag:NAME` → 該当IDに展開、`^tag:NAME` → 補集合
 - `tagname_to_ids`: ID優先、未登録はタグ名として展開
 - `mistook_count` 追跡 → 終了コード反映
 - 複数ターゲット間の水平線セパレータ
-- 有効ターゲット検証: Nコード or URL（サイト設定の小説 URL / シリーズ URL に一致）
+- 有効ターゲット検証: Nコード or URL（サイト設定の小説 URL / シリーズ URL / 作者・ユーザー URL に一致）
 - Nコード指定時は `https://ncode.syosetu.com/<ncode>/` からURLキャプチャを作り、サイト定義の `\k<ncode>` を展開してDLする
 - `webnovel/*.yaml` の `series_url` / `series_item_url` に一致するシリーズ URL は、共通の `application::download_targets::DownloadTargetExpander` で個別小説 URL に展開してから通常の download 処理に渡す。小説家になろう、R18 なろう、カクヨムのシリーズ/コレクション URL に対応。CLI の対話入力もシリーズ URL を受理する
-- Worker の `/api/download`（`/api/download_force` を含む）と `/api/jobs` は、全対象のシリーズ展開が成功してから作品ごとのジョブを登録し、元の `--force` 等を各作品へ引き継ぐ。取得失敗・空一覧は単体小説として処理せずエラーにする。キューの実行境界も同じ展開器を使うため、保存済みシリーズジョブや旧 envelope からの投入も個別作品ジョブになる
+- Worker の `/api/download`（`/api/download_force` を含む）と `/api/jobs` は、全対象のシリーズ・作者 URL 展開が成功してから作品ごとのジョブを登録し、元の `--force` 等を各作品へ引き継ぐ。取得失敗・空シリーズ一覧はエラー。正常に読めた空の作者一覧は追加なし。保存済みジョブ・旧 envelope の実行境界も同じ展開器を使う
+- 作者・ユーザー URL の単発登録と CLI `author` の継続追跡は別機能。`Downloader::author_works` / `AuthorListing` が作品列挙・複数ログインの試行・ページ送り・シリーズ所属作品の除外を共有し、サイト固有の規則は YAML / preprocess DSL に置く。小説・シリーズの URL 判定を優先するため、Pixiv のシリーズを作者一覧として展開しない
 - 新規取得したセクションは解析済みの本文・前書き・後書きに加えて raw HTML も `illust_grep_pattern` の検索対象にし、本文として保存しないサイト固有マークアップ内の挿絵を先取り保存する。未更新セクションは従来どおり保存済み section のみを検索する
 - サイト定義に `illust_grep_pattern` が無いサイト (なろう / R18なろう / カクヨム / Arcadia) は narou.rb `HTML#initialize` の既定 `<img>` パターン (`downloader::DEFAULT_ILLUST_GREP_PATTERN`) で挿絵を先取り保存する。既定パターンでは URL でない注記 (相対パス) は対象外にし、挿絵 URL の protocol-relative (`//host/...`) は本文のスキームで解決し、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない (2026-10-08 修正)
 - 索引 (`.illustration_cache.yaml`) が知っている挿絵でも、`<prefix>/挿絵` の一覧に実体が無ければ取り直す (自己修復)。索引が空でないときだけ 1 小説 1 回一覧するので、通常の更新に余分な往復は付かない (2026-10-08 修正)
@@ -251,8 +252,8 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | サブコマンド | 内容 |
 |---|---|
 | `verify` | `PRAGMA integrity_check` + 全 payload の CRC-32 検査。取込済み `freeze.yaml.imported-*` があれば `repair-freeze` を案内する |
-| `export-yaml [--out DIR]` | レガシー YAML/TXT バンドルを再生成 (旧バージョンへのロールバック用) |
-| `export-yaml --in-place` | `.narou/*.yaml`・`~/.narousetting/global_setting.yaml` を実位置へ書き戻し、`storage-backend` を `yaml` に戻す。narou.rb への完全復帰用 |
+| `export-yaml [--out DIR]` | 管理状態に加え、本文・個別設定・ユーザーサイト定義・挿絵をレガシー配置で書き出す。元の管理方式は変更しない |
+| `export-yaml --in-place` | 同じ内容を実位置へ復元してから `storage-backend` を `yaml` に戻す。読み取り・CRC・保存・S3 取得が失敗した場合は SQLite のまま維持。共有 global_setting は通常のファイル管理を維持 |
 | `vacuum` | VACUUM で容量回収 |
 | `repair-freeze [--dry-run]` | 旧ビルドが残した `freeze.yaml.imported-*` を全て合算し、保存済みの凍結状態に無い ID を凍結へ戻す（和集合のみで、解除はしない）。`--dry-run` は復旧予定の表示のみ。取り込んだファイルは削除しない |
 
@@ -276,6 +277,8 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 **保存形式**: 小説とは別の inventory `author`（SQLite `app_state` / `.narou/author.yaml`）に、**作者ページ URL（ユニーク）→ サイト名** だけを持つ。名前や日時などの帳簿は持たない。
 
 **サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧の取得先の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）/ `author_next_pattern`（ページ分けされた一覧の次ページ。ハーメルンで使用。終了は次ページが無いか訪問済みに戻ったとき）。
+
+**共通取得**: `author add/check` も現在の実効サイト定義を使う。作品一覧の取得・認証・シリーズ所属作品の除外は CLI / Worker の単発 URL 展開と共通。offset 型 API は `author_page_url` / `author_page_size` / `author_page_total_pattern` / `author_page_max_start` でページ送りする。なろう API の公式開始位置上限を越える場合や総件数に届かない場合は、途中までの一覧を成功扱いしない。
 
 ---
 
@@ -338,6 +341,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 **Rust 実装メモ**:
 - HTML の `&nbsp;` は narou.rb と同じ通常スペースへ復元する（本文・前書き・後書き・あらすじの合成入力で回帰確認）。
 - `sqlite.mirror-files=false` の一時取り出しは全ページを走査し、4,096 件を超えるオブジェクトも後片付けの対象にする。既存の実ファイルと挿絵は変更しない。
+- CLI も `setting.ini` / `replace.txt` を取り出してから個別設定を読み、挿絵索引を実効 ObjectStore に保存する。ミラー有効時の復元ファイルは残し、無効時の取り出しファイルだけ最後の利用者が解放した時点で消す。挿絵を含む同期 I/O は既存 Tokio 文脈でも二重 runtime にしない。
 - 挿絵の一時取り出しが途中で失敗した場合も、新規作成した完全／不完全ファイルを片付け、再試行時に不完全な画像を再利用しない。
 - 半角カナは Ruby版 NKF 相当の対応表と濁点・半濁点合成で全角化し、ルビの読みも `ﾛｰﾙﾌﾟﾚｲﾝｸﾞｹﾞｰﾑ` → `ロールプレイングゲーム` と変換する。半角句読点にも対応し、全角英数字や互換文字は変更しない（issue #31）
 - `-o/--output` を direct convert に接続し、フォルダ部分を無視して保存先小説フォルダ配下へ出力する。複数 target 時は Ruby版同様 `basename (n).ext` を付ける
@@ -372,6 +376,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 - AozoraEpub3-JDK21 (1.6.x) は出力ファイルが `-dst` の **実パス** 配下かを検査するため、`-dst` が junction / シンボリックリンク / 8.3 短縮名 を含む形だと、実際には同じ場所でも `java.io.IOException: 出力パスが許可されたディレクトリ外です` で失敗する (検査は出力ファイルが未生成の時点で字句的に正規化したパスと比較されるため)。narou は `-dst` と入力パスを実パスへ解決してから渡す (一時ワークスペース使用時・通常出力時とも)。一時ワークスペースが `%TEMP%` 配下にある場合も同じ理由で失敗していた
 - `lite` feature 有効時は、外部 AozoraEpub3 が見つからない場合に組み込み `epub_lite` エンジンへフォールバックする (設定 `convert.epub-engine` = `auto`/`lite`/`external` で選ぶ。設定ページの「一般」タブからも切替可。1 回だけなら環境変数 `NAROU_RS_EPUB_ENGINE=lite`/`=external` で上書き)（外部ツール (jar / `AozoraEpub3_Lite.exe`) が見つかればそちらを優先する。narou.rb と同じ挙動）。`device=epub` / `kobo` / `reader` / `ibooks` / `mobi` の中間 EPUB 生成を外部ツールなしで行える。**Java 版と同じ資産と組み立て**: `aozoraepub3dir` があれば `chuki_*.txt` (narou カスタム注記込み)・`gaiji/*.ttf`・`AozoraEpub3.ini` を読み、無ければ同梱の `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` で同じフラグを再現する（外字フォントだけは同梱できないので入らない）。Lite の公開パイプライン (`collect_assets` / `decorate_image_tags` / `reflow_image_sections` / `build_title_page_markup` / `append_gaiji_assets` / `build_metadata`) を CLI と同じ順で使う。挿絵は書き出し時に 1 枚ずつ読み、Java と同じ前処理 (余白除去・リサイズ・回転) をかける。実データ検証: `C:\Users\rumia\Documents\WebNovel` の n0421du (401セクション) で Java 版 `AozoraEpub3.jar` の出力と **422/423 ファイルがバイト完全一致**（`aozoraepub3dir` 未設定でも **419/423**）、挿絵入りでも **425/426 がバイト完全一致**。残差は `dcterms:modified` のみ (Java はローカル時刻に `Z`、Lite は UTC) 濁点フォント (`vertical_font_with_dakuten.css` + `DMincho.ttf`) は外部ツールと同じ内容を組み込みエンジンにも渡す。設定 `convert.epub-font` = `auto`(濁点注記のある小説だけ)/`always`(本文全体を DMincho、`U+3000` を描けない Reader 向け) で選ぶ。
 - 挿絵の自動回転は `convert.rotate-image` (`auto`/`0`/`1`/`2`) で制御する。`auto` (既定) は AozoraEpub3.ini の `RotateImage` に従い、`0` は回転しない、`1`/`2` は横長挿絵を +90°/−90°。組み込みエンジン・外部 `AozoraEpub3_Lite.exe` (`-i` で差し替えた一時 INI を渡す。インストール先の INI は書き換えない)・Worker の `download.epub` に効く。Java 版 `AozoraEpub3.jar` は INI パス指定を持たず、インストール先 INI を書き換える方針ではないため本設定は効かない (jar で同じ挙動にするには AozoraEpub3.ini 側を変更する)
+- Worker のストリーミング EPUB も共通設定から横書き・挿絵の有無・濁点フォント・行高を反映し、CSS / フォント資産を実際に埋め込む。自動表紙は本文順の適切な挿絵を最大 1 枚保持して作り、書き出しで再利用する。変換 API の端末指定は EPUB のみ受理し、非対応端末と個別 `enable_inspect` は明示的に拒否する。
 
 **注**: EPUB/MOBI 生成は AozoraEpub3 (Java 版 `AozoraEpub3.jar`、または Rust 製代替 [AozoraEpub3_Lite](https://github.com/Rumia-Channel/AozoraEpub3_Lite)) と kindlegen への依存がある。`aozoraepub3dir` 設定は jar を優先し、無ければ `AozoraEpub3_Lite.exe` / `AozoraEpub3.exe` バイナリを受理する (`canonicalize_aozoraepub3_tool_path`)。詳細は `docs/aozora_lite_evaluation_2026-08-23.md`。
 
@@ -433,6 +438,8 @@ narou setting name         # 読み取り
 - `default.*` / `force.*` は `convert` の小説・テキスト入力の両経路で共通設定ストアから取得し、`--ignore-default` / `--ignore-force` で個別に無効化できる（Issue #22）。
 - `global_setting` は SQLite 管理の対象外とし、storage-backend が `sqlite` でも `~/.narousetting/global_setting.yaml` を維持する (narou.rb 互換・ライブラリ間で共有するため)。旧ビルドが DB へ取り込んで退避した分は、ファイルが無ければ初回読み出しで復旧する
 - local / global 設定の入出力は `src/db/settings.rs` → `Inventory` に統一する。SQLite 利用時は `app_state`、legacy YAML 利用時は従来の設定ファイルに保存し、双方で同じキー・型を扱う。
+- Web の設定フォームは未設定・明示 false・明示 true を区別し、変更項目と表示時の期待値だけを送る。保存先ごとに CAS で更新し、競合は HTTP 409。未送信項目・未知キーは保持し、未変更保存は書き込まない。
+- native の `s3.*` / `sqlite.mirror-files` 変更は長命な Web ストアとの差を避けるため再起動が必要。保存 API と外部変更 watcher が再起動へ接続し、失敗時は保存済み／手動再起動が必要という状態を返す。
 
 **主要 local_setting 項目**:
 
@@ -498,7 +505,7 @@ narou setting name         # 読み取り
 - `--list` 現在値一覧表示
 - `--all` 全変数表示
 - `setting -a` では hidden 項目に加え、`default.*` / `force.*` / `default_args.*` を型・説明付きで Local Variable List に列挙
-- `--burn` による setting.ini への焼き込み
+- `--burn` は個別 `setting.ini` を ObjectStore 経由で読み書きし、SQLite とファイルの設定を分岐させない
 - `--burn` の確認プロンプトと tag ターゲット展開
 - `name` 読み取り、`name=value` 設定、`name=` 削除
 - 不明変数名のエラー、古い変数の掃除削除
@@ -594,7 +601,7 @@ narou setting name         # 読み取り
 | `--merge-from ID` | — | int | — | (P4b) 指定バージョンを作業セットへマージ |
 | `--merge-sections LIST` | — | str | — | (P4b) `--merge-from` の対象話制限 (カンマ区切り) |
 
-> P4b オプションは SQLite バックエンド有効時のみ動作する。履歴は convert 実行時に自動スナップショットされ、保持数は将来 `diff.history-limit` で制御予定。`--restore` / `--merge-from` はミラー更新後に `本文/*.yaml` へも書き戻す（authoritative はファイルのまま）。`--clean` は差分キャッシュに加えて SQLite バージョン履歴も全削除する。
+> P4b オプションは SQLite バックエンド有効時のみ動作する。履歴は convert 実行時に自動スナップショットされ、保持数は将来 `diff.history-limit` で制御予定。`--restore` / `--merge-from` はリレーショナル作業セットに加えて ObjectStore の TOC・本文を更新し、古い話のキーを削除する。ファイル出力はミラー設定に従う。`--clean` は差分キャッシュに加えて SQLite バージョン履歴も全削除する。
 | target | | string | — | 小説指定 (省略時=最終更新) |
 
 **実装状況**:
@@ -726,6 +733,11 @@ narou setting name         # 読み取り
 - favicon は data URL で埋め込み、追加 route なしでブラウザ 404 を出さない
 - バージョン別の機能ツアーを `GET /api/feature_tour/pending` / `GET /api/feature_tour/all` / `POST /api/feature_tour/seen` / `POST /api/feature_tour/config` で提供し、アップデート後に新機能を Web UI で告知する。SQLite 管理への移行はツアー経由の opt-in で、`GET/POST /api/storage/mode` がモードの読み書きを担う（CLI 側の保守コマンドは `narou db`）
 - 設定画面のデータ管理方式は描画後・保存後の再描画時に取得し、固定環境では切替ボタンを隠す。Workers の保存前読み取りは primary を使い、replica／isolate キャッシュの古い値を書き戻さない。メモ帳は `object_id` 検査に加えて条件付き UPSERT で同時保存を排他し、負けた要求に最新本文を含む競合応答を返す。
+- native / Worker が共通 capability payload を返し、Worker で実行できない CSV・送信・mail・端末操作・調査ログ・キュー並べ替え等は UI から実行できないようにする。直接 API の拒否も通知し、成功として扱わない。
+- Worker の `concurrency` はコンソール分離（既定 true）、`convert.keep-txt` は既定 false、`queue.max-retries` は配備上限 3 と表示・保存検証を一致させる。native 専用の `s3.*` は表示せず、ミラー・話キャッシュ・外部 EPUB エンジン等は無効化し、API からも変更を拒否する。
+- Worker の履歴取得・消去は PushHub の永続化履歴に接続し、再接続でも消去済みの行を復活させない。`webui.table.reload-timing` は実際の台帳の待機・実行数でテーブル更新を制御し、進捗・通知は抑止しない。
+- 設定保存は `webui.config.reload` を配信する。UI のテーブル・タグ更新は debounce / single-flight で合流し、古い応答を反映しない。Worker のキュー詳細は cursor で全ページを取得してから表示を交換する（既定 200 件／最大 1000 件、全体の待機・実行数を別に返す）。
+- 保存方式の読み取りが失敗した場合は不明／失敗として表示し、YAML と推定しない。Worker は D1 固定と表示し、切替操作を出さない。native の実際の方式切替だけが再起動を要求する。
 
 **不足動作**:
 - narou.rb の HAML/UI と完全一致するレベルの細かな見た目・配置・文言差分の洗い込み
@@ -740,6 +752,8 @@ narou setting name         # 読み取り
 オプションなし。
 
 **Rust 実装**: `src/commands/backup.rs` で Ruby 版同様に複数 target を順に処理し、`backup/` 直下へ ZIP を保存する。バックアップ名はタイトルを Ruby 版同様に整形して 180 バイトで切り詰める。
+
+SQLite のミラー無効時も本文・設定・挿絵を保存先からスコープ付きで取り出して ZIP に入れる。フォルダが無いだけで登録を削除しない。
 
 ---
 
@@ -758,6 +772,7 @@ narou setting name         # 読み取り
 
 **互換メモ**:
 - Ruby版は `raw/*.txt` を対象にするが、Rust 側の保存形式は `raw/*.html` のため両方を orphan 対象に含めた
+- SQLite のミラー無効時も TOC と保存済みキーから孤児を検出し、ObjectStore の不要な本文・raw を削除する。
 - target 解決は ID / URL / Nコード / タイトル / alias / tag 展開を共通パイプラインで処理
 - `sample\\novel` で `clean`, `clean <alias>`, `clean -f`, `clean --all`, `clean --all -f` を実行し、作為的 orphan の検出と削除を確認済み
 
@@ -785,6 +800,8 @@ narou setting name         # 読み取り
 - `s3-dedup` — 旧 `挿絵/` 配置の S3 オブジェクトを dedup プール (`illustrations/<base64url(sha256)>.<ext>`) へ移し、残ったものを消す。**SQLite モード + S3 保存のときだけ有効**。既定は件数だけ数える dry-run、`-f` で実行。hex 名でない挿絵は小説ごとの配置を保つ。
 
 **Rust 実装**: メンテナンスヘルパー (`find_orphan_illustrations`, `plan_legacy_illustration_migrations` / `apply_legacy_illustration_migrations`, `plan_extension_fixes` / `apply_extension_fixes`, `rebuild_illustration_cache`, `detect_image_extension`) を `src/illustration_store.rs` (crate 側) に集約。`src/commands/illust.rs` は CLI オプション解決と dry-run / `-f` の振り分けに専念し、将来 Web UI から同じ crate 関数を直接呼べる形を維持する。削除系・改名系・移行系はすべて既定 dry-run。`-f` 指定時も本文参照・cache 参照の双方から到達不能 / 移行計画を厳密判定してから実際に変更する (BUG-7/15 と整合)。対象小説の解決は clean と同じく ID / URL / Nコード / タイトル / alias / tag 展開の共通パイプラインを使い、`--all` は凍結済み小説をスキップする。
+
+DB-only ライブラリの `orphan` / `rebuild` / `fix-ext` 等は保存先のデータを取り出して処理し、索引更新・削除・改名をストアへ反映する。壊れた挿絵索引は空として削除を進めず、失敗させる。S3 移行・検証の独立 I/O は最大 4 件、既知の小オブジェクトは見積り 8 MiB の窓で処理し、大きい／サイズ不明の対象は単独で処理する。
 
 **互換メモ**:
 - ハッシュ名 (`<64-hex>.ext`) と mitemin ID 名 (`iNNNN.ext`) は canonical とみなし、cache の対応表に既に載っていれば自動的に "到達可能" として orphan 判定から除外する
@@ -903,6 +920,7 @@ narou setting name         # 読み取り
 
 **Rust 実装**:
 - `src/commands/inspect.rs` で `調査ログ.txt` の読み取り表示を実装。target 省略時は `.narou/latest_convert.yaml` の `id` を使い、複数 target は Ruby版同様に区切り線付きで順に表示する。ログが存在しない場合は `調査ログがまだ無いようです` を表示する
+- SQLite の `調査ログ.txt` は ObjectStore から読み、読み取り失敗を「ログなし」として隠さない。ミラー無効で実フォルダが無い `folder` 操作は利用不能と明示する。
 - `src/converter/inspector.rs` を追加し、変換時に `調査ログ.txt` を保存するようにした
 - `convert.inspect=true` と `convert --inspect` で full display、通常 convert では Ruby版同様 summary 表示にした
 - `auto_join_in_brackets` の警告/エラー、`modify_kana_ni_to_kanji_ni` INFO、`enable_erase_introduction` / `enable_erase_postscript` INFO も inspection に反映した

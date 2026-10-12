@@ -188,6 +188,17 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                 record.author.clone(),
             );
 
+            // `setting.ini` / `replace.txt` / `converter.yaml` はストアにだけ
+            // あることがある (mirror-files=false)。ファイルとして読む前に
+            // 取り出し、この対象の処理が終わるまで保持する。
+            let _materialized_inputs = match narou_rs::converter::materialize_for_conversion(&novel_dir) {
+                Ok(files) => files,
+                Err(err) => {
+                    sink.emit(Stream::Stdout, &messages::indented_error(err));
+                    continue;
+                }
+            };
+
             let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
                 Box::new(WebProgress::new("convert"))
             } else {

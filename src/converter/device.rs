@@ -700,6 +700,20 @@ impl OutputManager {
         base_name: &str,
         include_illust: bool,
     ) -> Result<PathBuf> {
+        if matches!(self.device, Device::Text) {
+            return Ok(input_txt.to_path_buf());
+        }
+        // EPUB/ZIP 組立はローカルの画像ファイルを要求する。挿絵が
+        // ObjectStore / S3 にある構成では実体が無いので、入力テキストの隣へ
+        // 取り出し、この呼び出しを抜ける時点で自分が書いた分だけ片付ける。
+        // (ライブラリ外のテキストファイル変換では取り出す対象が無い。)
+        #[cfg(feature = "native-runtime")]
+        let _materialized = match crate::db::inventory::Inventory::with_default_root() {
+            Ok(_) => Some(crate::native::illustrations::materialize_blocking(
+                input_txt.parent().unwrap_or(input_txt),
+            )?),
+            Err(_) => None,
+        };
         match self.device {
             Device::Text => Ok(input_txt.to_path_buf()),
             Device::Epub => self.epub_output(input_txt, output_dir, ".epub"),
@@ -816,12 +830,8 @@ impl OutputManager {
         output_ext: &str,
     ) -> Result<PathBuf> {
         let context = self.lite_epub.clone().unwrap_or_default();
-        // 挿絵を S3 に置く構成ではローカルに実体が無い。EPUB 生成はファイルを
-        // 要求するので、ここで取り出し、この関数を抜ける時点で片付ける。
-        let novel_dir = input_txt.parent().unwrap_or(input_txt);
-        let _materialized = crate::native::illustrations::Materialized::new(
-            crate::native::illustrations::materialize_blocking(novel_dir)?,
-        );
+        // 挿絵の取り出しは [`Self::convert_file`] が受け持つ (EPUB を要求する
+        // 経路すべてで必要なので、入口 1 箇所に寄せる)。
         // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
         let options = crate::epub_lite::EpubBuildOptions {
             title: context.title.clone(),

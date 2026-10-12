@@ -389,6 +389,19 @@ where
     })
 }
 
+pub(crate) fn compare_locked_file_content(path: &Path, expected: &str, replacement: &str) -> Result<bool> {
+    with_exclusive_file_lock(path, || {
+        let current = read_optional_yaml_file(path)?;
+        if current != expected {
+            return Ok(false);
+        }
+        if current != replacement {
+            atomic_write_locked(path, replacement)?;
+        }
+        Ok(true)
+    })
+}
+
 fn with_exclusive_file_lock<T, F>(path: &Path, operation: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,

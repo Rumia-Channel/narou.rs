@@ -45,25 +45,27 @@ function listHarness() {
   });
   return { state, requests, refresh: () => context.refreshList(), counts: () => ({ renderCount, pruneCount }) };
 }
-test('late pre-deletion response cannot overwrite a newer list or frozen state', async () => {
+test('a refresh requested during deletion skips the old payload and applies the next payload', async () => {
   const h = listHarness();
   const older = h.refresh();
+  await new Promise(setImmediate);
   const newer = h.refresh();
+  assert.equal(h.requests.length, 1, 'refreshes share the in-flight HTTP request');
+  const initial = h.state.novels;
+  h.requests[0].resolve({ data: [{ id: 1, title: 'deleted', frozen: false }] });
+  await new Promise(setImmediate);
+  assert.equal(h.state.novels, initial, 'pre-deletion data must not reappear');
+  assert.equal(h.counts().pruneCount, 0);
   const current = [{ id: 2, title: 'kept', frozen: true }];
   h.requests[1].resolve({ data: current });
-  await newer;
+  await Promise.all([older, newer]);
   assert.equal(h.state.novels, current);
-  const acceptedCounts = h.counts();
-  h.requests[0].resolve({ data: [{ id: 1, title: 'deleted', frozen: false }, { id: 2, frozen: false }] });
-  await older;
-  assert.equal(h.state.novels, current, 'newer accepted list must remain authoritative');
   assert.deepEqual(Array.from(h.state.frozenIds), ['2']);
-  assert.equal(h.counts().pruneCount, acceptedCounts.pruneCount, 'stale response must not prune selection');
-  assert.equal(h.counts().renderCount, acceptedCounts.renderCount, 'stale response must not rerender');
 });
 test('latest successful response still updates list and selection', async () => {
   const h = listHarness();
   const pending = h.refresh();
+  await new Promise(setImmediate);
   const current = [{ id: 3, frozen: true }];
   h.requests[0].resolve({ data: current });
   await pending;
@@ -76,37 +78,24 @@ test('request failure leaves previously loaded state intact', async () => {
   const h = listHarness();
   const original = h.state.novels;
   const pending = h.refresh();
+  await new Promise(setImmediate);
   h.requests[0].reject(new Error('offline'));
   await pending;
   assert.equal(h.state.novels, original);
   assert.equal(h.counts().pruneCount, 0);
 });
 
-test('newer request failure does not reauthorize an older successful response', async () => {
+test('failure of a queued refresh cannot reauthorize the previous stale payload', async () => {
   const h = listHarness();
   const original = h.state.novels;
   const older = h.refresh();
+  await new Promise(setImmediate);
   const newer = h.refresh();
-  h.requests[1].reject(new Error('offline'));
-  await newer;
-  const acceptedCounts = h.counts();
   h.requests[0].resolve({ data: [{ id: 1, title: 'stale', frozen: true }] });
-  await older;
+  await new Promise(setImmediate);
+  h.requests[1].reject(new Error('offline'));
+  await Promise.all([older, newer]);
   assert.equal(h.state.novels, original);
   assert.deepEqual(Array.from(h.state.frozenIds), []);
-  assert.deepEqual(h.counts(), acceptedCounts);
-});
-test('older request failure must not rerender over newer successful request', async () => {
-  const h = listHarness();
-  const older = h.refresh();
-  const newer = h.refresh();
-  const current = [{ id: 2, frozen: true }];
-  h.requests[1].resolve({ data: current });
-  await newer;
-  const acceptedCounts = h.counts();
-  h.requests[0].reject(new Error('old request timed out'));
-  await older;
-  assert.equal(h.state.novels, current);
-  assert.deepEqual(Array.from(h.state.frozenIds), ['2']);
-  assert.deepEqual(h.counts(), acceptedCounts);
+  assert.equal(h.counts().pruneCount, 0);
 });

@@ -3,7 +3,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use futures::future::{self, Either};
 use narou_rs::downloader::http_policy::same_site_hosts;
 use narou_rs::downloader::security::{
@@ -293,6 +293,7 @@ impl WorkerHttpClient {
             }
             init.with_body(Some(JsValue::from(js_sys::Uint8Array::from(body))));
         }
+        let trusted_limit = request.trusted_endpoint.then_some(request.trusted_response_body_limit).flatten();
         let request = Request::new_with_init(&request.url, &init)
             .map_err(|error| NarouError::Platform(format!("invalid HTTP request: {error}")))?;
         self.subrequests.record();
@@ -302,6 +303,9 @@ impl WorkerHttpClient {
             .map_err(|error| NarouError::Http(error.to_string()))?;
         let status = response.status_code();
         let headers = response.headers().entries().collect::<Vec<_>>();
+        let limit = if (200..300).contains(&status) {
+            trusted_limit.unwrap_or(MAX_WORKER_HTTP_BODY).min(MAX_WORKER_HTTP_BODY)
+        } else { MAX_WORKER_HTTP_BODY };
         if response
             .headers()
             .get("content-length")
@@ -309,21 +313,30 @@ impl WorkerHttpClient {
                 NarouError::Platform(format!("invalid HTTP response headers: {error}"))
             })?
             .and_then(|value| value.parse::<usize>().ok())
-            .is_some_and(|size| size > MAX_WORKER_HTTP_BODY)
+            .is_some_and(|size| size > limit)
         {
             return Err(NarouError::Platform(
                 "Worker HTTP response body exceeds limit".to_string(),
             ));
         }
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| NarouError::Http(error.to_string()))?;
-        if body.len() > MAX_WORKER_HTTP_BODY {
-            return Err(NarouError::Platform(
-                "Worker HTTP response body exceeds limit".to_string(),
-            ));
-        }
+        let body = if matches!(response.body(), worker::ResponseBody::Stream(_)) {
+            let mut stream = response.stream().map_err(|error| NarouError::Http(error.to_string()))?;
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|error| NarouError::Http(error.to_string()))?;
+                if chunk.len() > limit.saturating_sub(body.len()) {
+                    return Err(NarouError::Platform("Worker HTTP response body exceeds limit".to_string()));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            body
+        } else {
+            match response.into_parts().1 {
+                worker::ResponseBody::Empty => Vec::new(),
+                worker::ResponseBody::Body(body) if body.len() <= limit => body,
+                _ => return Err(NarouError::Platform("Worker HTTP response body exceeds limit".to_string())),
+            }
+        };
         Ok(HttpResponse {
             status,
             headers,

@@ -1,3 +1,4 @@
+pub(crate) mod author_listing;
 pub mod html;
 pub mod http_policy;
 #[cfg(feature = "native-runtime")]
@@ -32,7 +33,7 @@ use regex::Regex;
 use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
-use self::persistence::{PersistenceService, compute_section_hash};
+use self::persistence::{PersistenceService, SectionLoadFailure, compute_section_hash};
 
 use crate::platform::{CookieStore, LoginGroup};
 use self::section::{SectionCache, download_section};
@@ -680,6 +681,53 @@ fn illustration_sources<'a>(
     .chain(raw_html)
 }
 
+/// 同時に投げる挿絵 `stat` の件数。ストアへの同時要求を絞る (`stat` は
+/// メタデータだけを返すので、画像本体の 64MiB 級 buffer は並行に抱えない)。
+const ILLUSTRATION_VERIFY_WINDOW: usize = 8;
+
+/// 挿絵の索引にあるファイル名を、保存側と同じキー生成で 1 枚ずつ確認する。
+///
+/// `stat` だけを使うので、ストアの一覧 (LIST) が prefix の解釈差などで空を
+/// 返す環境でも実体を見つけられる。確認は [`ILLUSTRATION_VERIFY_WINDOW`] 件の
+/// 並行 `stat` で行い、確認順はファイル名順のまま、失敗したときは最初の
+/// 失敗だけを報告する。キー生成や確認に失敗した場合は `None` (呼び出し側は
+/// 従来どおり索引だけで判断する)。
+async fn verify_illustration_files(
+    assets: &dyn AssetStore,
+    object_keys: &NovelObjectKeys,
+    filenames: &[String],
+) -> Option<std::collections::HashSet<String>> {
+    use futures::StreamExt;
+
+    let keys: Vec<_> = filenames
+        .iter()
+        .map(|filename| object_keys.illustration(filename).ok())
+        .collect::<Option<Vec<_>>>()?;
+
+    let pending: Vec<_> = keys.iter().map(|key| assets.stat(key)).collect();
+    let mut stats = Box::pin(
+        futures::stream::iter(pending).buffered(ILLUSTRATION_VERIFY_WINDOW),
+    );
+    let mut stored = std::collections::HashSet::new();
+    let mut index = 0usize;
+    while let Some(result) = stats.next().await {
+        match result {
+            Ok(Some(_)) => {
+                stored.insert(filenames[index].clone());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::application::debug::emit_error(format!(
+                    "挿絵: 実体の確認に失敗 ({error})"
+                ));
+                return None;
+            }
+        }
+        index += 1;
+    }
+    Some(stored)
+}
+
 impl Downloader {
     /// Native constructor: loads site definitions from the filesystem and the
     /// section hash cache from the Inventory. Worker builds use
@@ -700,196 +748,6 @@ impl Downloader {
             .await
             .unwrap_or_default()
     }
-
-    /// Fetch an author page and list the work URLs its definition finds.
-    ///
-    /// Uses the same transport and rate limiter as a novel fetch, so a site
-    /// that spaces requests (Pixiv, なろう) is spaced here too. A definition
-    /// without `author_novel_pattern` yields no URLs.
-    pub async fn author_novel_urls(
-        &self,
-        setting: &SiteSetting,
-        page_url: &str,
-    ) -> Result<Vec<String>> {
-        if setting.author_novel_urls("").is_none() {
-            return Err(NarouError::SiteSetting(format!(
-                "{} に author_novel_pattern がありません",
-                setting.sitename
-            )));
-        }
-        let mut setting = setting.clone();
-        // 保存済みのログインがあれば作者ページにも送る (ログインが要る作者ページ
-        // のため)。無ければ定義の cookie だけで取得する。
-        let groups = self.stored_groups_for(&setting).await;
-        if let Some(group) = groups.first().map(|group| group.merged_cookie()) {
-            setting.cookie = crate::platform::merge_cookie_headers(setting.cookie(), Some(&group));
-        }
-        let setting = &setting;
-        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
-        // Sites with an author API (なろう) answer with JSON instead of HTML.
-        let mut fetch_url = setting.author_fetch_url(page_url);
-        let mut urls: Vec<String> = Vec::new();
-        // Pixiv は 1 話ずつが作者の作品一覧に混ざる。定義が出す
-        // `author_series::<id>` を集めておき、その回の話を後で除く。
-        let mut series: Vec<String> = Vec::new();
-        // 漫画シリーズの各ページも単体イラスト一覧に混ざる。
-        let mut comic_series: Vec<String> = Vec::new();
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // 一覧がページ分けされているサイト (ハーメルン) は次ページを辿る。
-        // 次ページが無くなるか、既に訪れた URL に戻ったら終わり。訪問済みを
-        // 覚えているのでページ数の上限は要らない。
-        loop {
-            if !visited.insert(fetch_url.clone()) {
-                break;
-            }
-            let mut body = crate::downloader::http_policy::fetch_text(
-                self.http.as_ref(),
-                self.rate_limiter.as_ref(),
-                &fetch_url,
-                &policy,
-                Some(setting.encoding()),
-            )
-            .await?;
-            // `preprocess:` の DSL が `author_novel::` / `author_series::` を
-            // 出せるように、本文を定義に通してから読み取る。
-            crate::downloader::util::pretreatment_source(
-                &mut body,
-                setting.encoding(),
-                Some(setting),
-            );
-            for url in setting.author_novel_urls(&body).unwrap_or_default() {
-                if !urls.contains(&url) {
-                    urls.push(url);
-                }
-            }
-            for id in setting.author_series_ids(&body) {
-                if !series.contains(&id) {
-                    series.push(id);
-                }
-            }
-            for id in setting.author_comic_series_ids(&body) {
-                if !comic_series.contains(&id) {
-                    comic_series.push(id);
-                }
-            }
-            match setting.author_next_url(&body) {
-                Some(next) => fetch_url = next,
-                None => break,
-            }
-        }
-        // シリーズに属する話/ページは作者の作品ではないので落とす (取得できなければ
-        // そのまま返す: 一覧の取りこぼしより、余分に足さない方が害が小さい)。
-        let mut inside_series: Vec<String> = Vec::new();
-        if !series.is_empty()
-            && setting.author_series_episodes_url.is_some()
-            && let Ok(ids) = self.author_series_episodes(setting, page_url, &series).await
-        {
-            inside_series.extend(ids);
-        }
-        if !comic_series.is_empty()
-            && setting.author_comic_series_pages_url.is_some()
-            && let Ok(ids) = self.author_comic_series_pages(setting, page_url, &comic_series).await
-        {
-            inside_series.extend(ids);
-        }
-        if !inside_series.is_empty() {
-            urls.retain(|url| !inside_series.iter().any(|id| url_mentions_id(url, id)));
-        }
-        Ok(urls)
-    }
-
-    /// Artwork ids of the given comic series, read page by page until a page
-    /// stops adding anything (Pixiv returns 12 artworks per page).
-    ///
-    /// Best effort like [`Self::author_series_episodes`].
-    async fn author_comic_series_pages(
-        &self,
-        setting: &SiteSetting,
-        page_url: &str,
-        series: &[String],
-    ) -> Result<Vec<String>> {
-        const MAX_PAGES: usize = 100;
-        let captures = setting
-            .extract_author_url_captures(page_url)
-            .unwrap_or_default();
-        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
-        let mut pages: Vec<String> = Vec::new();
-        for series_id in series {
-            for page in 1..=MAX_PAGES {
-                let Some(url) =
-                    setting.author_comic_series_pages_fetch_url(&captures, series_id, page)
-                else {
-                    break;
-                };
-                let Ok(body) = crate::downloader::http_policy::fetch_text(
-                    self.http.as_ref(),
-                    self.rate_limiter.as_ref(),
-                    &url,
-                    &policy,
-                    Some(setting.encoding()),
-                )
-                .await
-                else {
-                    break;
-                };
-                let ids = setting.author_comic_series_page_ids(&body);
-                if ids.is_empty() {
-                    break;
-                }
-                let before = pages.len();
-                for id in ids {
-                    if !pages.contains(&id) {
-                        pages.push(id);
-                    }
-                }
-                if pages.len() == before {
-                    // 同じページが返り続ける定義でも止まる。
-                    break;
-                }
-            }
-        }
-        Ok(pages)
-    }
-
-    /// Episode ids of the given series, fetched through the definition.
-    ///
-    /// Best effort: a series that cannot be read contributes nothing, so its
-    /// episodes stay in the listing instead of silently vanishing.
-    async fn author_series_episodes(
-        &self,
-        setting: &SiteSetting,
-        page_url: &str,
-        series: &[String],
-    ) -> Result<Vec<String>> {
-        let captures = setting
-            .extract_author_url_captures(page_url)
-            .unwrap_or_default();
-        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
-        let mut episodes: Vec<String> = Vec::new();
-        for series_id in series {
-            let Some(url) = setting.author_series_episodes_fetch_url(&captures, series_id) else {
-                continue;
-            };
-            let Ok(body) = crate::downloader::http_policy::fetch_text(
-                self.http.as_ref(),
-                self.rate_limiter.as_ref(),
-                &url,
-                &policy,
-                Some(setting.encoding()),
-            )
-            .await
-            else {
-                continue;
-            };
-            for id in setting.author_series_episode_ids(&body) {
-                if !episodes.contains(&id) {
-                    episodes.push(id);
-                }
-            }
-        }
-        Ok(episodes)
-    }
-
 
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
     #[cfg(feature = "native-runtime")]
@@ -1195,12 +1053,11 @@ impl Downloader {
             .await
     }
 
-    /// 索引が知っている挿絵の実体を 1 枚ずつ確認する (一覧が使えないときの保険)。
+    /// 索引が知っている挿絵の実体を確認する (一覧が使えないときの保険)。
     ///
-    /// `NovelObjectKeys::illustration` (保存側と同じキー生成) と `stat` だけを使うので、
-    /// ストアの一覧 (LIST) が prefix の解釈差などで空を返す環境でも実体を見つけられる。
-    /// 上限件数を超える場合と確認に失敗した場合は `None` (呼び出し側は従来どおり
-    /// 索引だけで判断する)。
+    /// 上限件数を超える小説は一覧が使える前提に任せる (索引だけで判断する
+    /// 従来の挙動へ戻す)。確認自体は [`verify_illustration_files`] が
+    /// 最大 [`ILLUSTRATION_VERIFY_WINDOW`] 件の並行 `stat` で行う。
     async fn verify_indexed_illustrations(
         &self,
         object_keys: &NovelObjectKeys,
@@ -1209,27 +1066,11 @@ impl Downloader {
         /// 1 小説につき 1 枚ずつ確認する上限。これを超える小説は一覧が使える
         /// 前提に任せる (索引だけで判断する従来の挙動へ戻す)。
         const MAX_VERIFY: usize = 64;
-        let filenames = illustration_store.filenames();
+        let filenames: Vec<String> = illustration_store.filenames().into_iter().collect();
         if filenames.is_empty() || filenames.len() > MAX_VERIFY {
             return None;
         }
-        let mut stored = std::collections::HashSet::new();
-        for filename in filenames {
-            let key = object_keys.illustration(&filename).ok()?;
-            match self.assets.stat(&key).await {
-                Ok(Some(_)) => {
-                    stored.insert(filename);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    crate::application::debug::emit_error(format!(
-                        "挿絵: 実体の確認に失敗 ({error})"
-                    ));
-                    return None;
-                }
-            }
-        }
-        Some(stored)
+        verify_illustration_files(self.assets.as_ref(), object_keys, &filenames).await
     }
 
     /// 挿絵の取得。`stored_illustrations` は索引が知っている実体名の集合で、
@@ -1403,6 +1244,7 @@ impl Downloader {
             self.rate_limiter.as_ref(),
             &self.site_settings,
         )
+        .with_cookie_store(self.cookies.as_deref())
     }
 
     pub fn get_novel_data_dir(&self, record: &NovelRecord) -> PathBuf {
@@ -2018,20 +1860,25 @@ impl Downloader {
                 subtitles.len()
             )));
         }
-        let mut resumed_sections = HashMap::new();
-        for (section_index, subtitle) in subtitles.iter().enumerate().take(resume_from) {
-            let section = self
-                .persistence
-                .load_section(&object_keys, subtitle)
-                .await?
-                .ok_or_else(|| {
-                    NarouError::DownloadResumeCorrupt(format!(
-                        "persisted section {section_index} ({}) is missing",
-                        subtitle.index
-                    ))
-                })?;
-            resumed_sections.insert(section_index, section);
-        }
+        // 再開時に復元する既読セクション。直列 1 件ずつの読みをやめ、
+        // PersistenceService 側の窓 (SECTION_READ_WINDOW) で先読みする。
+        // 走査順で最初の失敗の扱いは直列時と同じ。
+        let resumed = match self
+            .persistence
+            .load_sections_ordered(&object_keys, &subtitles[..resume_from])
+            .await
+        {
+            Ok(sections) => sections,
+            Err(SectionLoadFailure::Missing { section_index }) => {
+                return Err(NarouError::DownloadResumeCorrupt(format!(
+                    "persisted section {section_index} ({}) is missing",
+                    subtitles[section_index].index
+                )));
+            }
+            Err(SectionLoadFailure::Read(error)) => return Err(error),
+        };
+        let mut resumed_sections: HashMap<usize, SectionFile> =
+            resumed.into_iter().enumerate().collect();
 
         // One listing pass replaces a per-section existence read. On the
         // Worker this is the difference between ⌈N/1000⌉ LIST subrequests
@@ -3086,14 +2933,15 @@ mod tests {
     };
     use crate::db::{self, Database};
     use crate::downloader::SectionFile;
-    use crate::platform::NovelRepository;
+    use crate::error::Result;
+    use crate::platform::{NovelRepository, ObjectKey};
     use crate::platform::mocks::{
         FakeRateLimiter, MemoryNovelRepository, MemoryObjectStore, MockHttpClient,
     };
     use crate::downloader::settings::DownloaderSettings;
     use crate::platform::{
-        AssetStore, HttpResponse, NovelMutation, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore,
-        SystemClock,
+        AssetStore, AssetStream, HttpResponse, NovelMutation, NovelObjectKeys, ObjectListRequest,
+        ObjectMetadata, ObjectPrefix, ObjectStore, PlatformFuture, SystemClock,
     };
     use base64::Engine;
     use chrono::TimeZone;
@@ -3170,6 +3018,165 @@ mod tests {
         assert_eq!(
             crate::illustration_store::mitemin_illustration_id(&resolved).as_deref(),
             Some("i88657")
+        );
+    }
+
+    /// 実体確認の並行度と結果を観測する資産ストア。`stat` は 1 回だけ
+    /// Pending を返すので、窓の分だけ並行に走る。
+    struct YieldingAssets {
+        inner: MemoryObjectStore,
+        stats: std::sync::atomic::AtomicUsize,
+        inflight: std::sync::atomic::AtomicUsize,
+        max_inflight: std::sync::atomic::AtomicUsize,
+        fail_on: Option<String>,
+    }
+
+    impl AssetStore for YieldingAssets {
+        fn stat<'a>(
+            &'a self,
+            key: &'a ObjectKey,
+        ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+            let failed = self.fail_on.as_deref() == Some(key.as_ref());
+            Box::pin(async move {
+                let inflight = self
+                    .inflight
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.max_inflight
+                    .fetch_max(inflight, std::sync::atomic::Ordering::SeqCst);
+                self.stats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut first_poll = true;
+                futures::future::poll_fn(|cx| {
+                    if first_poll {
+                        first_poll = false;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(())
+                    }
+                })
+                .await;
+                let result = if failed {
+                    Err(crate::error::NarouError::Platform("stat failed".into()))
+                } else {
+                    ObjectStore::stat(&self.inner, key).await
+                };
+                self.inflight
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                result
+            })
+        }
+
+        fn read_stream<'a>(
+            &'a self,
+            key: &'a ObjectKey,
+        ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+            AssetStore::read_stream(&self.inner, key)
+        }
+
+        fn write_stream<'a>(
+            &'a self,
+            key: &'a ObjectKey,
+            stream: AssetStream,
+        ) -> PlatformFuture<'a, Result<()>> {
+            AssetStore::write_stream(&self.inner, key, stream)
+        }
+
+        fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+            AssetStore::delete(&self.inner, key)
+        }
+
+        fn copy<'a>(
+            &'a self,
+            source: &'a ObjectKey,
+            destination: &'a ObjectKey,
+        ) -> PlatformFuture<'a, Result<()>> {
+            AssetStore::copy(&self.inner, source, destination)
+        }
+
+        fn move_or_copy<'a>(
+            &'a self,
+            source: &'a ObjectKey,
+            destination: &'a ObjectKey,
+        ) -> PlatformFuture<'a, Result<()>> {
+            AssetStore::move_or_copy(&self.inner, source, destination)
+        }
+    }
+
+    /// 挿絵の実体確認は (a) 保存側と同じキーで保存物だけを返し、(b) 同時に
+    /// 走らせる `stat` を窓の件数に抑え、(c) `stat` の失敗では `None` に
+    /// 倒す (呼び出し側は索引だけで判断する従来動作へ戻る)。
+    #[test]
+    fn illustration_file_verification_is_bounded_and_reports_stored_files() {
+        // `stat` 失敗経路はデバッグ行を流すので、プロセス共通状態を触る
+        // テストと直列化する。
+        let _global = crate::test_support::global_state_guard();
+        let keys = NovelObjectKeys::new("example.test", "n1234ab", true).unwrap();
+        let filenames: Vec<String> = (0..20).map(|index| format!("i{index}.png")).collect();
+        let assets = Arc::new(YieldingAssets {
+            inner: MemoryObjectStore::new(),
+            stats: std::sync::atomic::AtomicUsize::new(0),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            max_inflight: std::sync::atomic::AtomicUsize::new(0),
+            fail_on: None,
+        });
+
+        // 先頭 5 枚だけ保存する。
+        futures::executor::block_on(async {
+            for filename in filenames.iter().take(5) {
+                ObjectStore::write_small(
+                    &assets.inner,
+                    &keys.illustration(filename).unwrap(),
+                    b"png".to_vec(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let stored = futures::executor::block_on(super::verify_illustration_files(
+            assets.as_ref(),
+            &keys,
+            &filenames,
+        ))
+        .unwrap();
+        assert_eq!(stored.len(), 5, "見つかった実体だけを返す: {stored:?}");
+        for filename in filenames.iter().take(5) {
+            assert!(stored.contains(filename), "{filename} が見つからない");
+        }
+        assert_eq!(
+            assets.stats.load(std::sync::atomic::Ordering::SeqCst),
+            filenames.len(),
+            "索引の全ファイルを確認する"
+        );
+        assert_eq!(
+            assets
+                .max_inflight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            super::ILLUSTRATION_VERIFY_WINDOW,
+            "同時に走る stat は窓の件数まで"
+        );
+
+        // `stat` の失敗は `None` (索引だけで判断する従来動作へ戻る)。
+        let failing = Arc::new(YieldingAssets {
+            inner: MemoryObjectStore::new(),
+            stats: std::sync::atomic::AtomicUsize::new(0),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            max_inflight: std::sync::atomic::AtomicUsize::new(0),
+            fail_on: Some(
+                keys.illustration(&filenames[2])
+                    .unwrap()
+                    .as_ref()
+                    .to_string(),
+            ),
+        });
+        assert!(
+            futures::executor::block_on(super::verify_illustration_files(
+                failing.as_ref(),
+                &keys,
+                &filenames,
+            ))
+            .is_none()
         );
     }
 
@@ -3993,6 +4000,156 @@ is_narou: false
         );
     }
 
+    /// 再開時のプレフィックスに欠落した話がある場合、その位置を報告して
+    /// 中断する。欠落したプレフィックスは取り直さず、後続の本文取得も
+    /// 始めない (途中まで成功として進めない)。
+    #[tokio::test]
+    async fn resume_with_a_missing_middle_section_reports_the_corrupt_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let db = Database::new().unwrap();
+        let previous_db = {
+            let mut db_slot = db::DATABASE.lock();
+            let previous_db = db_slot.take();
+            *db_slot = Some(db);
+            previous_db
+        };
+        let _db_guard = DatabaseGuard(previous_db);
+
+        struct YieldBeforeSection(usize);
+
+        impl SectionBudget for YieldBeforeSection {
+            fn should_yield(&mut self, next_section_index: usize) -> bool {
+                next_section_index >= self.0
+            }
+        }
+
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: Resume Corrupt Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Resume Corrupt Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: |-
+  <a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        )
+        .unwrap();
+        setting.compile();
+
+        let target = "https://example.com/n1234ab/";
+        let section_1 = "https://example.com/n1234ab/1/";
+        let section_2 = "https://example.com/n1234ab/2/";
+        let section_3 = "https://example.com/n1234ab/3/";
+        let toc = r#"
+<h1>Resume Corrupt Test</h1><span>Author</span>
+<a href="/n1234ab/1/">第1話</a>
+<a href="/n1234ab/2/">第2話</a>
+<a href="/n1234ab/3/">第3話</a>
+"#;
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(target, 200, toc);
+        http.add_text(section_1, 200, r#"<div class="body">本文1</div>"#);
+        http.add_text(section_2, 200, r#"<div class="body">本文2</div>"#);
+        http.add_text(section_3, 200, r#"<div class="body">本文3</div>"#);
+        let store = Arc::new(MemoryObjectStore::new());
+        let objects: Arc<dyn ObjectStore> = store.clone();
+        let assets: Arc<dyn AssetStore> = store;
+        let mut downloader = Downloader::with_platform_and_storage_and_settings(
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects,
+                assets,
+                clock: Arc::new(SystemClock),
+            },
+            vec![setting],
+            HashMap::new(),
+        )
+        .unwrap();
+
+        // 1 回目: 第 1 話だけ保存して第 2 話の直前で予算により中断する。
+        let mut budget = YieldBeforeSection(1);
+        let partial = downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: true,
+                    budget: Some(&mut budget),
+                    resume_from_section: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                partial,
+                crate::error::NarouError::DownloadBudgetExpired {
+                    next_section_index: 1
+                }
+            ),
+            "unexpected partial result: {partial:?}; requests={:?}",
+            http.requested_urls()
+        );
+
+        // 2 回目: 第 2 話が欠落したまま 2 話分の復元を要求する。
+        let error = downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: false,
+                    budget: None,
+                    resume_from_section: Some(2),
+                },
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, crate::error::NarouError::DownloadResumeCorrupt(_)),
+            "unexpected error: {message}; requests={:?}",
+            http.requested_urls()
+        );
+        assert!(
+            message.contains("persisted section 1 (2) is missing"),
+            "the missing middle section must be named: {message}"
+        );
+
+        let requests = http.requested_urls();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|url| url.ends_with(section_1))
+                .count(),
+            1,
+            "the persisted prefix must not be fetched again: {requests:?}"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|url| url.ends_with(section_2))
+                .count(),
+            0,
+            "a corrupt checkpoint must fail before fetching after it: {requests:?}"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|url| url.ends_with(section_3))
+                .count(),
+            0,
+            "a corrupt checkpoint must fail before fetching after it: {requests:?}"
+        );
+    }
+
     /// 強更新 (`update.strong`) の予定段階の取得は予算の対象で、中断しても
     /// 取得済みの本文は保存される。以前は予定段階が予算チェックの外にあり、
     /// 予定段階だけで予算を使い切ると `next_section_index: 0` のまま同じ
@@ -4784,137 +4941,6 @@ is_narou: false
     }
 
     #[test]
-    fn paged_author_listings_are_followed_to_the_end() {
-        // ハーメルンの作者ページは検索ページの一覧を page=2, 3… と辿る。
-        let settings = SiteSetting::load_all().unwrap();
-        let setting = settings
-            .iter()
-            .find(|setting| setting.domain == "syosetu.org")
-            .unwrap();
-        let page = "https://syosetu.org/user/495125/";
-        let first = "https://syosetu.org/search/?mode=search_user_novel_list&uid=495125";
-        assert_eq!(setting.author_fetch_url(page), first);
-        assert!(setting.matches_author_url(page));
-        assert!(!setting.matches_author_url("https://syosetu.org/novel/388533/"));
-
-        let http = MockHttpClient::new();
-        http.add_text(
-            first,
-            200,
-            r#"<a href="https://h.syosetu.org/novel/388533/">作品1</a>
-               <a href="https://h.syosetu.org/novel/388533/1.html">第1話</a>
-               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=2">>></a></li>"#,
-        );
-        http.add_text(
-            "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=2",
-            200,
-            r#"<a href="https://syosetu.org/novel/388855/">作品2</a>
-               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=1"><<</a></li>
-               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=3">>></a></li>"#,
-        );
-        http.add_text(
-            "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=3",
-            200,
-            r#"<a href="https://syosetu.org/novel/400001/">作品3</a>"#,
-        );
-        let downloader = Downloader::with_platform(
-            Arc::new(http),
-            Arc::new(FakeRateLimiter::new()),
-            Arc::new(MemoryNovelRepository::new()),
-        )
-        .unwrap();
-        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
-        assert_eq!(
-            urls,
-            vec![
-                "https://h.syosetu.org/novel/388533/".to_string(),
-                "https://syosetu.org/novel/388855/".to_string(),
-                "https://syosetu.org/novel/400001/".to_string()
-            ],
-            "話ページを作品として数えず、>> の付いた次ページだけを辿る (上限なしで終端まで)"
-        );
-    }
-
-    #[test]
-    fn a_pager_that_links_back_does_not_loop() {
-        // 終端で先頭に戻るページャでも、訪問済みなら止まる (上限は設けない)。
-        let settings = SiteSetting::load_all().unwrap();
-        let setting = settings
-            .iter()
-            .find(|setting| setting.domain == "syosetu.org")
-            .unwrap();
-        let page = "https://syosetu.org/user/495125/";
-        let first = "https://syosetu.org/search/?mode=search_user_novel_list&uid=495125";
-        let second = "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=2";
-
-        let http = MockHttpClient::new();
-        http.add_text(
-            first,
-            200,
-            r#"<a href="https://syosetu.org/novel/1/">作品1</a>
-               <a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=2">>></a>"#,
-        );
-        http.add_text(
-            second,
-            200,
-            r#"<a href="https://syosetu.org/novel/2/">作品2</a>
-               <a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;uid=495125">>></a>"#,
-        );
-        let downloader = Downloader::with_platform(
-            Arc::new(http),
-            Arc::new(FakeRateLimiter::new()),
-            Arc::new(MemoryNovelRepository::new()),
-        )
-        .unwrap();
-        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
-        assert_eq!(
-            urls,
-            vec![
-                "https://syosetu.org/novel/1/".to_string(),
-                "https://syosetu.org/novel/2/".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn author_pages_fall_back_to_the_sites_own_api() {
-        // なろうの作者ページは小説API から作品を取る: 定義の `author_api_url`
-        // に作者ページの capture が流し込まれ、応答の `ncode` から作品 URL を
-        // 組み立てる (大文字の ncode は小文字化する)。
-        let settings = SiteSetting::load_all().unwrap();
-        let setting = settings
-            .iter()
-            .find(|setting| setting.domain == "ncode.syosetu.com")
-            .unwrap();
-        let page = "https://mypage.syosetu.com/2842627/";
-        assert_eq!(
-            setting.author_fetch_url(page),
-            "https://api.syosetu.com/novelapi/api/?out=json&userid=2842627&lim=500"
-        );
-
-        let http = MockHttpClient::new();
-        http.add_text(
-            setting.author_fetch_url(page),
-            200,
-            r#"[{"allcount":2},{"ncode":"N5181MT","title":"作品1"},{"ncode":"N6275MR","title":"作品2"}]"#,
-        );
-        let downloader = Downloader::with_platform(
-            Arc::new(http),
-            Arc::new(FakeRateLimiter::new()),
-            Arc::new(MemoryNovelRepository::new()),
-        )
-        .unwrap();
-        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
-        assert_eq!(
-            urls,
-            vec![
-                "https://ncode.syosetu.com/n5181mt/".to_string(),
-                "https://ncode.syosetu.com/n6275mr/".to_string()
-            ]
-        );
-    }
-
-    #[test]
     fn pixiv_author_listing_yields_novels_and_series() {
         // 作者ページの作品一覧 (/ajax/user/{id}/profile/all) を preprocess に通すと、
         // 単体小説と小説シリーズが作品として並ぶ。
@@ -4972,6 +4998,24 @@ is_narou: false
             "https://www.pixiv.net/novel/show.php?id=25948471",
             "2594847"
         ));
+    }
+
+    #[test]
+    fn pixiv_login_markers_distinguish_novel_pages_from_author_listings() {
+        // 本文が無い小説ページ (R-18 / ログイン限定) は再試行の目印を出す。
+        let novel = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{"id":"29204764","title":"作品","userName":"作者","description":"","content":null,"tags":{"tags":[]}}}"#,
+        );
+        assert!(novel.contains("login_required::1"), "got: {novel}");
+        // 作者一覧の応答はログイン壁ではない: 作品を持たない作者 (空の一覧) が
+        // 「ログインが必要」に化けると、空を成功として返せなくなる。
+        let author = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{"novels":{},"novelSeries":[],"mangaSeries":[],"illusts":[],"manga":[]}}"#,
+        );
+        assert!(!author.contains("login_required::1"), "got: {author}");
+        // 取得できない応答 (削除/非公開/ログイン要求) は目印を残す。
+        let missing = run_pixiv_preprocess(r#"{"error":true,"message":"見つかりません"}"#);
+        assert!(missing.contains("login_required::1"), "got: {missing}");
     }
 
     #[test]

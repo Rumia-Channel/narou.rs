@@ -10,7 +10,6 @@ use std::collections::HashSet;
 
 use narou_rs::author::{self, AuthorRecord};
 use narou_rs::downloader::Downloader;
-use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::{NarouError, Result};
 
 use crate::commands::download::{self, DownloadOptions};
@@ -54,7 +53,10 @@ pub async fn cmd_author(action: AuthorAction) -> Result<()> {
 
 /// Register an author page.
 fn add(url: &str) -> Result<()> {
-    let settings = SiteSetting::load_all()?;
+    // 実効定義を使う: SQLite モードでは管理 API (`/api/sites`) が編集した
+    // 規則がストア側にあり、`SiteSetting::load_all()` (ファイル直読み) では
+    // 見えない。YAML モードでも `load_all` と同じ定義になる。
+    let settings = narou_rs::downloader::site_setting::effective_site_settings();
     let setting = settings
         .iter()
         .find(|setting| setting.matches_author_url(url))
@@ -151,46 +153,25 @@ pub async fn check_tracked_authors(
     if authors.is_empty() {
         return Ok(report);
     }
-    let settings = SiteSetting::load_all()?;
+    // 一覧の取得は展開器 (Downloader) が持つ実効定義・保存済みログインを
+    // 借りた共通実装 (`author_listing::AuthorListing`)。`add` と同じ
+    // `author_url` 定義の探索を、`download <作者URL>` の展開とも共用する。
     let downloader = Downloader::with_user_agent(user_agent)?;
+    let expander = downloader.download_target_expander();
     let mut seen: HashSet<String> = HashSet::new();
 
     for author in &authors {
         // 同じ作者ページを複数の定義が扱うことがある (なろう と R18 版)。
-        // それぞれの作品一覧 API を叩き、見つかった作品をまとめて扱う。
-        let matching: Vec<&SiteSetting> = settings
-            .iter()
-            .filter(|setting| setting.matches_author_url(&author.url))
-            .collect();
-        if matching.is_empty() {
-            eprintln!(
-                "作者 {} を扱うサイト定義がありません (author_url 未定義) ので飛ばします",
-                author.url
-            );
-            report.failed += 1;
-            continue;
-        }
-        let mut urls: Vec<String> = Vec::new();
-        let mut failed = false;
-        for setting in matching {
-            match downloader.author_novel_urls(setting, &author.url).await {
-                Ok(found) => {
-                    for url in found {
-                        if !urls.contains(&url) {
-                            urls.push(url);
-                        }
-                    }
-                }
-                Err(error) => {
-                    eprintln!("作者 {} の確認に失敗しました: {error}", author.url);
-                    failed = true;
-                }
+        // それぞれの作品一覧 API を叩き、見つかった作品をまとめて扱う
+        // (一件も読めなかったときだけ失敗)。
+        let urls = match expander.author_works(&author.url).await {
+            Ok(urls) => urls,
+            Err(error) => {
+                eprintln!("作者 {} の確認に失敗しました: {error}", author.url);
+                report.failed += 1;
+                continue;
             }
-        }
-        if failed && urls.is_empty() {
-            report.failed += 1;
-            continue;
-        }
+        };
         let mut added = 0usize;
         let mut known = 0usize;
         for url in &urls {
@@ -237,6 +218,7 @@ pub async fn check_tracked_authors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use narou_rs::downloader::site_setting::SiteSetting;
 
     #[test]
     fn author_pages_are_recognised_from_the_definition() {
@@ -387,6 +369,43 @@ mod tests {
         assert_eq!(
             setting.author_series_episode_ids(r#"{"body":[{"id":"2594847","title":"x"}]}"#),
             vec!["2594847"]
+        );
+    }
+
+    #[test]
+    fn author_registration_follows_the_effective_definitions() {
+        // SQLite モードでは管理 API (`/api/sites`) が編集した定義がプロセスの
+        // 実効定義になる。`add` はファイル (`webnovel/`) ではなくそれを読む:
+        // 一時ディレクトリには定義ファイルが 1 つも無い。
+        let temp = tempfile::tempdir().unwrap();
+        let _dir = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let custom = SiteSetting::load_bundled(&[r#"
+name: CustomAuthor
+domain: custom.example
+top_url: https://custom.example
+url: https://custom\.example/book/(?<ncode>\d+)
+author_url: ^https?://custom\.example/user/(?<author_id>\d+)/?
+author_novel_pattern: '(?<novel_url>https?://custom\.example/book/\d+)'
+sitename: CustomAuthor
+toc_url: https://custom.example/book/\k<ncode>
+"#])
+        .unwrap();
+        narou_rs::downloader::site_setting::install_effective_site_settings(custom);
+
+        let added = add("https://custom.example/user/5/");
+        let authors = narou_rs::author::authors_for_current_root();
+        // 後始末を先に行う (プロセスグローバルなので、失敗しても戻す)。
+        narou_rs::downloader::site_setting::install_effective_site_settings(
+            SiteSetting::load_all().unwrap_or_default(),
+        );
+
+        added.expect("実効定義の作者ページを登録できる");
+        let authors = authors.expect("登録済みの作者を読める");
+        assert!(
+            authors.iter().any(|author| author.url == "https://custom.example/user/5/"
+                && author.site == "custom.example"),
+            "got {authors:?}"
         );
     }
 }

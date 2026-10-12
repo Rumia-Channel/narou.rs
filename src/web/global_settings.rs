@@ -1,13 +1,12 @@
 //! `GET/POST /api/global_setting`。JSON の組み立ては
 //! [`crate::application::settings_view`] にあり、Worker と同じものを使う。
 
-use axum::{extract::State, response::Json};
+use axum::{extract::State, http::StatusCode, response::{IntoResponse, Json, Response}};
 
 use crate::application::settings_view;
 use crate::application::SettingsEffect;
 
 use super::AppState;
-use super::state::ApiResponse;
 
 /// GET /api/global_setting — 設定一覧（タブ・項目メタデータ・置換設定）
 pub async fn get_global_settings(
@@ -20,14 +19,16 @@ pub async fn get_global_settings(
 pub async fn save_global_settings(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> Json<ApiResponse> {
+) -> Response {
     let effects = match settings_view::apply_save(&state.services.settings, &body).await {
         Ok(effects) => effects,
-        Err(message) => {
-            return Json(ApiResponse {
-                success: false,
-                message,
-            });
+        Err(error) => {
+            let conflict = matches!(&error, crate::application::ApplicationError::Conflict(_));
+            return (if conflict { StatusCode::CONFLICT } else { StatusCode::OK }, Json(serde_json::json!({
+                "success": false,
+                "conflict": conflict,
+                "message": error.to_string(),
+            }))).into_response();
         }
     };
 
@@ -69,8 +70,29 @@ pub async fn save_global_settings(
         }
     }
 
-    Json(ApiResponse {
-        success: true,
-        message: settings_view::SAVE_MESSAGE.to_string(),
-    })
+    if effects.contains(&SettingsEffect::StorageRestartRequired) {
+        return match super::jobs::schedule_server_reboot(state.clone()).await {
+            Ok(()) => {
+                state.push_server.broadcast_event("reboot", "");
+                Json(serde_json::json!({
+                    "success": true,
+                    "reboot": true,
+                    "requires_restart": true,
+                    "message": crate::native::application::STORAGE_RESTART_REQUIRED_NOTE,
+                })).into_response()
+            }
+            Err(error) => Json(serde_json::json!({
+                "success": true,
+                "reboot": false,
+                "requires_restart": true,
+                "message": format!("設定を保存しました。再起動の開始に失敗したため手動で再起動してください: {error}"),
+            })).into_response(),
+        };
+    }
+    Json(serde_json::json!({
+        "success": true,
+        "reboot": false,
+        "requires_restart": false,
+        "message": settings_view::SAVE_MESSAGE,
+    })).into_response()
 }

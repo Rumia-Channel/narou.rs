@@ -127,15 +127,14 @@ fn missing_error(missing: &[NovelId]) -> Option<worker::Result<Response>> {
 /// サーバーソート順に並べ直す。選択外のレコードは捨てる。
 async fn sort_ids_for_request(runtime: &WorkerRuntime, ids: &[i64]) -> Vec<i64> {
     // 並べ替えはこの後の凍結/削除を形作るので、判断材料の読み取りは
-    // 更新系サービス (primary + キャッシュ無し) で行う。
-    let sort_state = load_current_sort_state_for_writes(runtime).await;
-    let records = runtime
-        .write_services()
-        .library
-        .records()
-        .await
-        .unwrap_or_default();
-    sort_ids_from_records(ids, &records, &sort_state)
+    // 更新系サービス (primary + キャッシュ無し) で行う。`sort_ids_from_records`
+    // は選択 id のレコードしか見ないため、全件スキャンではなく選択分だけを
+    // 1 クエリで読み、ソート状態の読み取りとは同時に走らせる。
+    let (records, sort_state) = futures::join!(
+        runtime.write_services().library.records_by_ids(ids),
+        load_current_sort_state_for_writes(runtime),
+    );
+    sort_ids_from_records(ids, &records.unwrap_or_default(), &sort_state)
 }
 
 // ---------------------------------------------------------------------------

@@ -2,9 +2,8 @@
 //!
 //! 設定ページが読む JSON は native と共有する
 //! [`narou_rs::application::settings_view`] が組み立てる（`D1SettingsStore` の上に
-//! 載った `SettingsService` を渡すだけ）。native と違い、保存後の副作用
-//! （自動更新スケジューラーの再起動や `webui.*` の再読み込み）は無い。Worker の
-//! スケジューラーは cron 側で動くため。
+//! 載った `SettingsService` を渡すだけ）。cron は次回の設定を読み、
+//! 表示設定の変更は PushHub で既存の画面へ即時通知する。
 
 use narou_rs::application::settings_view::{self, SAVE_MESSAGE};
 use worker::{console_log, Env, Method, Request, Response};
@@ -50,6 +49,15 @@ pub async fn api_global_setting(mut req: Request, env: Env) -> worker::Result<Re
     // Worker に実行経路が無い項目は画面側で disabled にするが、API を直接
     // 叩かれた場合も値が変わらないようここで弾く (保存自体は行わない)。
     if let Some(changes) = settings_view::parse_changes(&body) {
+        if let Some((_, value)) = changes.iter().find(|(name, _)| name == "queue.max-retries") {
+            let retries = value.as_u64().or_else(|| value.as_str().and_then(|raw| raw.parse().ok()));
+            if retries.is_some_and(|retries| retries > u64::from(crate::consumer::CF_CONSUMER_MAX_RETRIES)) {
+                return Response::from_json(&result_body(
+                    false,
+                    &format!("Cloudflare Workers 版の再試行回数は最大 {} 回です", crate::consumer::CF_CONSUMER_MAX_RETRIES),
+                ));
+            }
+        }
         let rejected: Vec<&str> = changes
             .iter()
             .map(|(name, _)| name.as_str())
@@ -66,8 +74,23 @@ pub async fn api_global_setting(mut req: Request, env: Env) -> worker::Result<Re
         }
     }
     match settings_view::apply_save(&settings, &body).await {
-        Ok(_effects) => Response::from_json(&result_body(true, SAVE_MESSAGE)),
-        Err(message) => Response::from_json(&result_body(false, &message)),
+        Ok(effects) => {
+            if effects.contains(&narou_rs::application::SettingsEffect::WebuiConfigChanged) {
+                let push = crate::push_hub::PushHubClient::new(&env, crate::budget::SubrequestBudget::new());
+                push.broadcast_best_effort(&[
+                    crate::push_hub::event("webui.config.reload", serde_json::json!("")),
+                ]).await;
+            }
+            Response::from_json(&result_body(true, SAVE_MESSAGE))
+        }
+        Err(error) => {
+            let conflict = matches!(&error, narou_rs::application::ApplicationError::Conflict(_));
+            Response::from_json(&serde_json::json!({
+                "success": false,
+                "conflict": conflict,
+                "message": error.to_string(),
+            })).map(|response| response.with_status(if conflict { 409 } else { 200 }))
+        }
     }
 }
 
@@ -103,10 +126,8 @@ fn result_body(success: bool, message: &str) -> serde_json::Value {
 ///   `native-runtime` ゲート (`downloader::process_digest`)。Worker は
 ///   `NarouError::Unsupported` で Blocked になるため読まれない。
 /// - `default_args.*` … CLI コマンドの既定引数。Worker に CLI が無い。
-/// - 個別名 … `aozoraepub3dir` / `line-height` (外部 AozoraEpub3 前提。
-///   Lite は `convert.epub-font` 同様 Worker では参照しない)、`device` /
-///   `convert.multi-device` (Worker convert は端末選択を持たない。
-///   `webui/job_actions.rs` が device を plan に載せないと明記)、
+/// - 個別名 … `aozoraepub3dir` (外部 AozoraEpub3) と `device` /
+///   `convert.multi-device` (Worker の出力は組み込み EPUB のみ)、
 ///   `convert.copy-*` / `folder` / `normalize-filename` /
 ///   `filename-length-limit` / `folder-length-limit` (ローカル FS の
 ///   出力・コピー・ファイル名前提)、`concurrency.*` (native コンソールの
@@ -134,17 +155,46 @@ fn result_body(success: bool, message: &str) -> serde_json::Value {
 /// `NovelSettings::from_sources` 経由で適用)。
 fn mark_worker_ineffective(view: &mut serde_json::Value) {
     const NOTE: &str = "この設定は Cloudflare Workers 版では効きません (実行経路が native 専用)";
-    let Some(items) = view.get_mut("settings").and_then(serde_json::Value::as_array_mut)
-    else {
+    view["runtime"] = serde_json::json!("worker");
+    if let Some(tabs) = view.get_mut("tabs").and_then(serde_json::Value::as_array_mut) {
+        for tab in tabs {
+            if tab["id"] == "global" {
+                tab["info"] = serde_json::json!("この Worker の D1 に保存する Global 設定です。端末のユーザープロファイルには保存しません。");
+            }
+        }
+    }
+    let Some(items) = view.get_mut("settings").and_then(serde_json::Value::as_array_mut) else {
         return;
     };
     for item in items {
         let Some(name) = item.get("name").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        if is_worker_ineffective(name) {
+        let ineffective = is_worker_ineffective(name);
+        let hidden_secret_namespace = name.starts_with("s3.");
+        let (default_value, note, maximum) = match name {
+            "concurrency" => (Some(serde_json::json!(true)), Some("Worker のジョブ実行レーン数は変わりません。有効にするとダウンロードと変換のコンソールを分離します。"), None),
+            "convert.keep-txt" => (Some(serde_json::json!(false)), Some("Worker の既定は保存しないです。EPUB ダウンロード時は保存済み本文から生成します。"), None),
+            "queue.max-retries" => (None, Some("この Worker の再試行回数は配備上限以下です。"), Some(crate::consumer::CF_CONSUMER_MAX_RETRIES)),
+            _ => (None, None, None),
+        };
+        item["requires_restart"] = serde_json::json!(false);
+        if ineffective {
             item["worker_ineffective"] = serde_json::json!(true);
             item["worker_note"] = serde_json::json!(NOTE);
+        }
+        if hidden_secret_namespace {
+            item["invisible"] = serde_json::json!(true);
+            item["value"] = serde_json::Value::Null;
+        }
+        if let Some(value) = default_value {
+            item["default_value"] = value;
+        }
+        if let Some(note) = note {
+            item["worker_note"] = serde_json::json!(note);
+        }
+        if let Some(maximum) = maximum {
+            item["max_value"] = serde_json::json!(maximum);
         }
     }
 }
@@ -164,6 +214,7 @@ fn is_worker_ineffective(name: &str) -> bool {
         "difftool",
         "download.narou-api.",
         "default_args.",
+        "s3.",
     ];
     /// 個別名。変換のコピー先・端末依存のもの、サーバー bind、ローカル FS・
     /// CLI/コンソール・外部プロセスを前提とする設定は Worker では読み出す
@@ -176,8 +227,9 @@ fn is_worker_ineffective(name: &str) -> bool {
         "convert.copy-to-grouping",
         "convert.copy-zip-to",
         "convert.dc-subject-exclude-tags",
-        "convert.epub-font",
         "convert.inspect",
+        "convert.epub-engine",
+        "convert.section-cache",
         "convert.make-zip",
         "convert.multi-device",
         "convert.no-mobi",
@@ -189,16 +241,19 @@ fn is_worker_ineffective(name: &str) -> bool {
         "filename-length-limit",
         "folder",
         "folder-length-limit",
-        "line-height",
         "logging",
         "multiple-delimiter",
         "narou-compat",
         "no-color",
         "normalize-filename",
         "self-update.variant",
+        "sqlite.mirror-files",
         "time-zone",
         "update.max-parallel-domains",
     ];
+    if name.strip_prefix("default.").or_else(|| name.strip_prefix("force.")) == Some("enable_inspect") {
+        return true;
+    }
     PREFIXES.iter().any(|prefix| {
         name.starts_with(prefix) && (name != "server-max-targets-per-request")
     }) || NAMES.contains(&name)

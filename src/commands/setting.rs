@@ -331,6 +331,8 @@ fn burn_default_settings(
     let default_settings = load_settings_by_pattern(inv, "default");
     let original_settings = get_original_settings();
     let archive_root = inv.root_dir().join("小説データ");
+    narou_rs::db::init_database()?;
+    let store = narou_rs::native::object_store::NativeStore::for_narou_root(inv.root_dir())?;
 
     for target in targets {
         let data = match get_data_by_target(&target) {
@@ -352,8 +354,23 @@ fn burn_default_settings(
 
         let archive_path = novel_dir_for_record(&archive_root, &record);
 
+        // Web UI の設定保存と同じ `setting.ini` オブジェクトへ書く。FS だけに
+        // 書くと SQLite モード (`mirror-files=false`) の本文と DB の設定が
+        // 分離し、次の変換で焼き付けが消える。
         let ini_path = archive_path.join("setting.ini");
-        let mut ini = IniData::load_file(&ini_path).unwrap_or_else(|_| IniData::new());
+        let setting_key = narou_rs::native::object_store::novel_object_prefix(
+            &archive_root,
+            &archive_path,
+        )
+        .and_then(|prefix| prefix.join("setting.ini").ok());
+
+        let mut ini = match &setting_key {
+            Some(key) => match read_store_text(&store, key) {
+                Some(text) => IniData::load(&text),
+                None => IniData::load_file(&ini_path).unwrap_or_else(|_| IniData::new()),
+            },
+            None => IniData::load_file(&ini_path).unwrap_or_else(|_| IniData::new()),
+        };
 
         for (name, default_value) in &original_settings {
             if ini.get_global(name).is_none() {
@@ -365,10 +382,35 @@ fn burn_default_settings(
             }
         }
 
-        ini.save(&ini_path)?;
+        let body = ini.to_ini_string();
+        match &setting_key {
+            Some(key) => write_store_text(&store, key, &body)?,
+            None => ini.save(&ini_path)?,
+        }
         println!("{} の設定を保存しました", data.title);
     }
 
+    Ok(())
+}
+
+/// ストア上の小さなテキストを読む (UTF-8 として不正なら `None`)。
+fn read_store_text(
+    store: &narou_rs::native::object_store::NativeStore,
+    key: &narou_rs::platform::ObjectKey,
+) -> Option<String> {
+    use narou_rs::platform::ObjectStore as _;
+    let bytes = futures::executor::block_on(store.read_small(key)).ok().flatten()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// ストア上の小さなテキストを書く (ミラーが有効な構成では実ファイルも更新)。
+fn write_store_text(
+    store: &narou_rs::native::object_store::NativeStore,
+    key: &narou_rs::platform::ObjectKey,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use narou_rs::platform::ObjectStore as _;
+    futures::executor::block_on(store.write_small(key, body.as_bytes().to_vec()))?;
     Ok(())
 }
 

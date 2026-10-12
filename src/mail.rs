@@ -18,7 +18,7 @@ use crate::converter::output::create_output_text_filename;
 use crate::converter::settings::NovelSettings;
 use crate::db::NovelRecord;
 use crate::db::inventory::Inventory;
-use crate::downloader::site_setting::SiteSetting;
+use crate::downloader::site_setting::effective_site_settings;
 use crate::downloader::{Downloader, TargetType, TocObject};
 use crate::error::Result;
 
@@ -540,7 +540,7 @@ fn resolve_record(target: &str) -> std::result::Result<Option<NovelRecord>, Stri
 
     match Downloader::get_target_type(target) {
         TargetType::Url => {
-            let site_settings = SiteSetting::load_all().map_err(|e| e.to_string())?;
+            let site_settings = effective_site_settings();
             for setting in &site_settings {
                 if setting.matches_url(target) {
                     let toc_url = setting

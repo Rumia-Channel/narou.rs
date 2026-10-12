@@ -482,6 +482,8 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     };
 
     let local_map = load_local_settings_map(&env).await;
+    // グローバルスコープの変換設定 (`convert.epub-font` / `line-height`)。
+    let global_map = load_global_settings_map(&env).await;
     // `webui.debug-mode` が ON なら、この要求の間は詳細ログを Web コンソールへ
     // 流す (挿絵が EPUB に入らない等の原因を追えるようにする)。
     narou_rs::application::debug::apply_settings(&local_map);
@@ -489,17 +491,14 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         "EPUB: 生成開始 (id={id}, keep-txt={})",
         crate::convert::keep_converted_text_with(&local_map)
     ));
-    let filename = match epub_download_filename(
-        services.objects.clone(),
-        &record,
-        &keys,
-        &local_map,
-    )
-    .await
-    {
-        Ok(name) => name,
-        Err(error) => return Response::error(format!("Naming error: {error}"), 500),
-    };
+    // 保存済みの per-novel 設定 (`setting.ini`) を組立まで届ける。命名と
+    // 書字方向 (`enable_yokogaki`)・濁点フォントが同じ値を見る。
+    let novel_settings =
+        match load_novel_settings(&services.objects, &record, &keys, &local_map).await {
+            Ok(settings) => settings,
+            Err(error) => return Response::error(format!("Settings error: {error}"), 500),
+        };
+    let filename = epub_download_filename(&record, &novel_settings, &local_map);
 
     let text_key = keys.converted_text();
     // `convert.keep-txt=false` (既定) では変換済みテキストを保存しない構成
@@ -685,29 +684,68 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         narou_rs::application::debug::emit(format!("EPUB: 挿絵を除外: {name}"));
     }
 
-    let options = narou_rs::epub_lite::EpubBuildOptions {
-        title: record.title.clone(),
-        author: record.author.clone(),
-        vertical: true,
-        cover_from_first_image: !image_names.is_empty(),
-        assets_dir: None,
-        kindle: false,
-        // The dakuten font and its stylesheet are read from `preset/` on
-        // disk (`dakuten_font::lite_font_assets`), which this runtime has no
-        // filesystem for; the Worker EPUB keeps the engine's own fonts.
-        extra_assets: Vec::new(),
-        // `convert.rotate-image` (D1 ローカル設定)。未指定は INI 準拠
-        // (この経路は挿絵を回転しない)。指定時だけ Lite の INI へ
-        // `RotateImage` を上書きし、書き出し直前に寸法から回転角を決める。
-        rotate_image: local_map
-            .get("convert.rotate-image")
-            .and_then(setting_text)
-            .and_then(|value| narou_rs::converter::settings::ImageRotation::from_setting(&value)),
+    // 保存済み設定から組立オプションを組む (`vertical: true` 固定にしない):
+    // 書字方向は per-novel `enable_yokogaki`、表紙は `enable_illust`、濁点
+    // フォントは本文の濁点注記 (`convert.epub-font=auto`) か `always` に従う。
+    let options = narou_rs::epub_lite::EpubBuildOptions::from_settings(
+        narou_rs::epub_lite::EpubSettingsInput {
+            title: &record.title,
+            author: &record.author,
+            settings: &novel_settings,
+            has_images: !image_names.is_empty(),
+            // native CLI の `file_contains_dakuten_chuki` と同じ判定。
+            use_dakuten_font: text.contains(narou_rs::epub_lite::DAKUTEN_CHUKI_MARKER),
+            epub_font_always: global_map
+                .get("convert.epub-font")
+                .and_then(setting_text)
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("always")),
+            line_height: setting_line_height(&global_map),
+            assets_dir: None,
+            kindle: false,
+            // `convert.rotate-image` (D1 ローカル設定)。未指定は INI 準拠
+            // (この経路は挿絵を回転しない)。指定時だけ Lite の INI へ
+            // `RotateImage` を上書きし、書き出し直前に寸法から回転角を決める。
+            rotate_image: local_map
+                .get("convert.rotate-image")
+                .and_then(setting_text)
+                .and_then(|value| narou_rs::converter::settings::ImageRotation::from_setting(&value)),
+        },
+    );
+    // 本文の参照順で表紙に適した挿絵を探す。小さなアイコンは native と同じ
+    // 寸法規則で飛ばし、候補の実体だけを FileSource に保持する (最大 16 MiB)。
+    // 保持した実体は書き出しでも再利用し、一度に抱える候補は 1 枚だけ。
+    let mut cover_candidates = if options.cover_from_first_image {
+        narou_rs::epub_lite::illustration_references(&text)
+    } else {
+        Vec::new()
     };
+    cover_candidates.retain(|reference| image_names.iter().any(|name| name == reference));
     let source = std::sync::Arc::new(narou_rs::epub_lite::LazyImageSource::new(
         text,
         image_names,
     ));
+    for name in cover_candidates {
+        if let Ok(key) = narou_rs::platform::ObjectKey::try_new(format!(
+            "{}/{}",
+            keys.prefix().as_ref(),
+            name
+        )) {
+            match services.objects.read_small(&key).await {
+                Ok(Some(bytes)) if bytes.len() <= MAX_IMAGE_BYTES as usize => {
+                    if narou_rs::epub_lite::cover_image_dimensions(&name, &bytes).is_some() {
+                        source.insert_image(&name, bytes);
+                        break;
+                    }
+                }
+                // 一覧/stat と実体の間の競合は表紙なしとして続行する
+                // (本文の書き出しは同じキーをその時点で読み直す)。
+                Ok(_) => {}
+                Err(error) => {
+                    return Response::error(format!("Object store error: {error}"), 500);
+                }
+            }
+        }
+    }
     // 組立中の警告 (本文が参照している挿絵が一覧に無い等) を Web コンソールへ
     // 流すため、組立の間だけ PushHub sink を入れる (ジョブではないので
     // 既定 sink は誰も用意していない)。組立は同期なので短時間で戻る。
@@ -770,32 +808,38 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
                         Ok(key) => key,
                         Err(error) => return Some((Err(stream_error(error)), state)),
                     };
-                    match state.objects.read_small(&key).await {
-                        Ok(Some(raw)) => {
-                            push_debug_line(
-                                &state.push,
-                                format!("EPUB: 挿絵 {relative} を読み込み ({} bytes)", raw.len()),
-                            )
-                            .await;
-                            state.source.insert_image(relative, raw.clone());
-                            let bytes = state.build.resolve(path).or(Some(raw));
-                            // 保持するのは書き出し中の 1 枚分だけにする。
-                            state.source.remove_image(relative);
-                            bytes
-                        }
-                        Ok(None) => {
-                            push_debug_line(
-                                &state.push,
-                                format!("EPUB: 挿絵が見つかりません: {key}"),
-                            )
-                            .await;
-                            return Some((
-                                Err(worker::Error::RustError(format!("missing {relative}"))),
-                                state,
-                            ));
-                        }
-                        Err(error) => return Some((Err(stream_error(error)), state)),
-                    }
+                    // 組立前に先読みした表紙候補はその実体を再利用し、
+                    // オブジェクトストアを二度読まない。
+                    let loaded = match state.source.remove_image(relative) {
+                        Some(raw) => raw,
+                        None => match state.objects.read_small(&key).await {
+                            Ok(Some(raw)) => {
+                                push_debug_line(
+                                    &state.push,
+                                    format!("EPUB: 挿絵 {relative} を読み込み ({} bytes)", raw.len()),
+                                )
+                                .await;
+                                raw
+                            }
+                            Ok(None) => {
+                                push_debug_line(
+                                    &state.push,
+                                    format!("EPUB: 挿絵が見つかりません: {key}"),
+                                )
+                                .await;
+                                return Some((
+                                    Err(worker::Error::RustError(format!("missing {relative}"))),
+                                    state,
+                                ));
+                            }
+                            Err(error) => return Some((Err(stream_error(error)), state)),
+                        },
+                    };
+                    state.source.insert_image(relative, loaded.clone());
+                    let bytes = state.build.resolve(path).or(Some(loaded));
+                    // 保持するのは書き出し中の 1 枚分だけにする。
+                    state.source.remove_image(relative);
+                    bytes
                 }
                 None => None,
             };
@@ -917,27 +961,33 @@ fn setting_text(value: &serde_yaml::Value) -> Option<String> {
     }
 }
 
-/// `download.epub` の Content-Disposition 名を native の保存済み EPUB と同じ
-/// 規則 (`converter::output` の変換出力名に `.epub` を付けたもの) で決める。
-///
-/// 反映される設定は native の変換時と同じ: `setting.ini` /
-/// `default.*` / `force.*` (`NovelSettings::from_sources`) と
-/// `convert.filename-to-ncode` / `ebook-filename-length-limit`
-/// (`OutputNamingEnv::from_local_map`)。fs が無いので local 設定は D1 の
-/// `app_state` スコープ `local` から読む。
-async fn epub_download_filename(
-    objects: std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
+/// D1 のグローバルスコープ設定を読む (fs が無いので `app_state` 経由)。
+/// `convert.epub-font` / `line-height` のような変換側グローバル設定が対象。
+async fn load_global_settings_map(env: &Env) -> HashMap<String, serde_yaml::Value> {
+    let Ok(db) = env.d1("DB") else {
+        return HashMap::new();
+    };
+    let handle = DbHandle::ui(std::sync::Arc::new(db));
+    D1SettingsStore::new(handle)
+        .load(SettingScope::Global)
+        .await
+        .unwrap_or_default()
+}
+
+/// 保存済みの per-novel `setting.ini` と設定マップから [`NovelSettings`] を
+/// 組む。native の `NovelSettings::load_for_novel` と同じ規則
+/// (`default.*` / `force.*` の適用込み) を、ObjectStore + D1 の入力で行う。
+async fn load_novel_settings(
+    objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
     record: &narou_rs::db::NovelRecord,
     keys: &narou_rs::platform::NovelObjectKeys,
     local_map: &HashMap<String, serde_yaml::Value>,
-) -> narou_rs::error::Result<String> {
+) -> narou_rs::error::Result<narou_rs::converter::settings::NovelSettings> {
     let ini = match objects.read_small(&keys.setting()).await? {
-        Some(bytes) => {
-            narou_rs::converter::ini::IniData::load(&String::from_utf8_lossy(&bytes))
-        }
+        Some(bytes) => narou_rs::converter::ini::IniData::load(&String::from_utf8_lossy(&bytes)),
         None => narou_rs::converter::ini::IniData::new(),
     };
-    let settings = narou_rs::converter::settings::NovelSettings::from_sources(
+    Ok(narou_rs::converter::settings::NovelSettings::from_sources(
         Some(record.id),
         &record.title,
         &record.author,
@@ -945,7 +995,37 @@ async fn epub_download_filename(
         local_map,
         false,
         false,
-    );
+    ))
+}
+
+/// `line-height` (グローバル設定) を濁点フォント CSS 用の行高にする。
+/// 未設定・不正は native の `current_line_height` と同じ 1.8。
+fn setting_line_height(global_map: &HashMap<String, serde_yaml::Value>) -> f64 {
+    global_map
+        .get("line-height")
+        .and_then(|value| match value {
+            serde_yaml::Value::Number(number) => {
+                number.as_f64().or_else(|| number.as_i64().map(|i| i as f64))
+            }
+            serde_yaml::Value::String(text) => text.parse::<f64>().ok(),
+            _ => None,
+        })
+        .unwrap_or(1.8)
+}
+
+/// `download.epub` の Content-Disposition 名を native の保存済み EPUB と同じ
+/// 規則 (`converter::output` の変換出力名に `.epub` を付けたもの) で決める。
+///
+/// 反映される設定は native の変換時と同じ: `setting.ini` と
+/// `default.*` / `force.*` (`NovelSettings::from_sources`) と
+/// `convert.filename-to-ncode` / `ebook-filename-length-limit`
+/// (`OutputNamingEnv::from_local_map`)。fs が無いので設定は D1 の
+/// `app_state` から読む (呼び出し側が `load_novel_settings` で組む)。
+fn epub_download_filename(
+    record: &narou_rs::db::NovelRecord,
+    settings: &narou_rs::converter::settings::NovelSettings,
+    local_map: &HashMap<String, serde_yaml::Value>,
+) -> String {
     // 命名には TocObject の title/author/toc_url だけが使われる。
     // `from_sources` が novel_title/novel_author を record で埋めるため、
     // native (`generate_epub_on_demand` が toc.yaml から組み立てる TocObject)
@@ -959,12 +1039,7 @@ async fn epub_download_filename(
         novel_type: Some(record.novel_type),
     };
     let naming_env = narou_rs::converter::output::OutputNamingEnv::from_local_map(local_map);
-    Ok(narou_rs::converter::output::epub_output_filename(
-        &settings,
-        &toc,
-        Some(record),
-        &naming_env,
-    ))
+    narou_rs::converter::output::epub_output_filename(settings, &toc, Some(record), &naming_env)
 }
 
 /// Content-Disposition に埋め込むため、引用符と制御文字を `_` に置き換える。
@@ -1238,20 +1313,23 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
         Ok(plans) => plans,
         Err(error) => return Response::error(format!("download target expansion failed: {error}"), 502),
     };
+    // 展開後の全プランは 1 回の bounded batch で積む (台帳の
+    // lookup→insert→get と凍結判定の対象ごと往復を無くす)。順序は展開順のまま。
+    let plans: Vec<narou_rs::application::JobPlan> = plans.into_iter().flatten().collect();
+    let outcomes = match runtime.enqueue_batch(&plans).await {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            return Response::error(format!("enqueue failed: {error}"), 502);
+        }
+    };
     let mut ids = Vec::new();
     let mut blocked = Vec::new();
-    for plan in plans.into_iter().flatten() {
-        let outcome = match runtime.enqueue_plan(plan).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Response::error(format!("enqueue failed: {error}"), 502);
-            }
-        };
-        if let Some(reason) = outcome.blocked {
+    for outcome in &outcomes {
+        if let Some(reason) = &outcome.blocked {
             console_log!("job {} blocked: {}", outcome.job_id, reason);
-            blocked.push(outcome.job_id);
+            blocked.push(outcome.job_id.clone());
         } else {
-            ids.push(outcome.job_id);
+            ids.push(outcome.job_id.clone());
         }
     }
     Response::from_json(&json!({

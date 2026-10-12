@@ -379,7 +379,7 @@ fn save_group(
 
 /// Site definition matching a URL, domain, or site name.
 fn resolve_site(target: &str) -> std::result::Result<SiteSetting, String> {
-    let settings = SiteSetting::load_all().map_err(|error| error.to_string())?;
+    let settings = narou_rs::downloader::site_setting::effective_site_settings();
     if settings.is_empty() {
         return Err("サイト定義 (webnovel/*.yaml) が見つかりません".to_string());
     }

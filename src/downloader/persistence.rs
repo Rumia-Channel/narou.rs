@@ -2,14 +2,34 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 
-use crate::error::Result;
+use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, Clock, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore, SystemClock,
 };
 
 use super::types::{SectionElement, SectionFile, SubtitleInfo, TocFile};
+
+/// 本文セクションを先読みする件数。
+///
+/// 1 件ずつ直列に待つのをやめ、最初の失敗まで最大この件数を並行に読む。
+/// 先読みの出力バッファは `read_small` の上限 × 窓の件数まで。デコード後の
+/// セクション本体や設定入力は別に保持されるため、変換全体のメモリ上限ではない。
+pub const SECTION_READ_WINDOW: usize = 4;
+
+/// [`PersistenceService::load_sections_ordered`] の失敗。
+///
+/// 呼び出し側が文脈に合うエラー文言へ変換する (`convert` と resume で
+/// 「欠落」の扱いが異なるため、ここではどちらなのかだけを伝える)。
+#[derive(Debug)]
+pub enum SectionLoadFailure {
+    /// 目次にある本文オブジェクトが無い。`section_index` は渡したスライス内の位置。
+    Missing { section_index: usize },
+    /// 読み込み/デコードの失敗 (走査順で最初のもの)。
+    Read(NarouError),
+}
 
 pub fn compute_section_hash(section: &SectionElement) -> String {
     let mut hasher = Sha256::new();
@@ -89,6 +109,39 @@ impl PersistenceService {
             return Ok(None);
         };
         Ok(Some(deserialize_section(&bytes)?))
+    }
+
+    /// 本文セクションを最大 [`SECTION_READ_WINDOW`] 件の並行読みで取得し、
+    /// 入力と同じ順で返す。
+    ///
+    /// 失敗の扱いは 1 件ずつ直列に [`Self::load_section`] を呼んだ場合と
+    /// 同じで、走査順で最初の失敗 (`Missing` または `Read`) を返す。先に
+    /// 読み終えた後続があっても、返る順序と「最初の失敗」の意味は変わらない。
+    /// 最初の失敗より先 (窓の分だけ) を先読みしていた読み込みは破棄される。
+    pub async fn load_sections_ordered(
+        &self,
+        keys: &NovelObjectKeys,
+        subtitles: &[SubtitleInfo],
+    ) -> std::result::Result<Vec<SectionFile>, SectionLoadFailure> {
+        let mut remaining = subtitles.iter();
+        let mut pending = futures::stream::FuturesOrdered::new();
+        for subtitle in remaining.by_ref().take(SECTION_READ_WINDOW) {
+            pending.push_back(self.load_section(keys, subtitle));
+        }
+        let mut sections = Vec::with_capacity(subtitles.len());
+        let mut section_index = 0;
+        while let Some(result) = pending.next().await {
+            match result {
+                Ok(Some(section)) => sections.push(section),
+                Ok(None) => return Err(SectionLoadFailure::Missing { section_index }),
+                Err(error) => return Err(SectionLoadFailure::Read(error)),
+            }
+            section_index += 1;
+            if let Some(subtitle) = remaining.next() {
+                pending.push_back(self.load_section(keys, subtitle));
+            }
+        }
+        Ok(sections)
     }
 
     pub async fn save_section(
@@ -355,8 +408,12 @@ pub fn fix_yaml_block_scalar(yaml: &str) -> String {
 mod tests {
     use super::*;
     use crate::downloader::types::SectionElement;
+    use crate::error::Result;
     use crate::platform::mocks::MemoryObjectStore;
-    use crate::platform::{AssetStore, Clock, ObjectStore};
+    use crate::platform::{
+        AssetStore, Clock, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
+        ObjectStore, PlatformFuture,
+    };
     use chrono::{DateTime, Utc};
     use std::sync::Arc;
 
@@ -451,6 +508,377 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             default_setting_ini().into_bytes()
+        );
+    }
+
+    fn subtitle_at(index: &str) -> SubtitleInfo {
+        SubtitleInfo {
+            index: index.to_string(),
+            href: format!("https://example.test/{index}"),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: format!("第{index}話"),
+            file_subtitle: format!("第{index}話"),
+            subdate: "2026-08-01".to_string(),
+            subupdate: None,
+            download_time: None,
+        }
+    }
+
+    fn section_file(subtitle: &SubtitleInfo, body: &str) -> SectionFile {
+        SectionFile {
+            index: subtitle.index.clone(),
+            href: subtitle.href.clone(),
+            chapter: subtitle.chapter.clone(),
+            subchapter: subtitle.subchapter.clone(),
+            subtitle: subtitle.subtitle.clone(),
+            file_subtitle: subtitle.file_subtitle.clone(),
+            subdate: subtitle.subdate.clone(),
+            subupdate: subtitle.subupdate.clone(),
+            download_time: None,
+            element: SectionElement {
+                data_type: "text".to_string(),
+                introduction: String::new(),
+                postscript: String::new(),
+                body: body.to_string(),
+            },
+        }
+    }
+
+    /// 先読みの完了順と同時実行数をテスト側から制御するストア。
+    ///
+    /// `GatedStore::new` に渡したキーの `read_small` は、対応する sender で
+    /// gate を開けるまで完了しない。開始・完了の記録を見て順番に開けるので、
+    /// 完了順が入力順とずれる状況を決定的に作れる。
+    struct GatedStore {
+        data: MemoryObjectStore,
+        gates: parking_lot::Mutex<Vec<(String, futures::channel::oneshot::Receiver<()>)>>,
+        progress: parking_lot::Mutex<Progress>,
+        progress_cv: parking_lot::Condvar,
+        inflight: std::sync::atomic::AtomicUsize,
+        max_inflight: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct Progress {
+        started: Vec<String>,
+        completed: Vec<String>,
+    }
+
+    /// gate を開ける側。ストアが持つ receiver と対になる。テストが参照を
+    /// 保持している限り未送信の gate は pending のまま (テスト終了時に送信
+    /// されていない sender が落ちても、読み込み先は既に破棄されている)。
+    type Gates = parking_lot::Mutex<
+        std::collections::HashMap<String, futures::channel::oneshot::Sender<()>>,
+    >;
+
+    impl GatedStore {
+        fn new(gated_keys: &[String]) -> (Arc<Self>, Arc<Gates>) {
+            let mut gates = Vec::new();
+            let mut senders = std::collections::HashMap::new();
+            for key in gated_keys {
+                let (sender, receiver) = futures::channel::oneshot::channel();
+                gates.push((key.clone(), receiver));
+                senders.insert(key.clone(), sender);
+            }
+            let store = Arc::new(Self {
+                data: MemoryObjectStore::new(),
+                gates: parking_lot::Mutex::new(gates),
+                progress: parking_lot::Mutex::new(Progress::default()),
+                progress_cv: parking_lot::Condvar::new(),
+                inflight: std::sync::atomic::AtomicUsize::new(0),
+                max_inflight: std::sync::atomic::AtomicUsize::new(0),
+            });
+            (store, Arc::new(parking_lot::Mutex::new(senders)))
+        }
+
+        fn wait_for_started(&self, count: usize) {
+            let mut progress = self.progress.lock();
+            while progress.started.len() < count {
+                self.progress_cv.wait(&mut progress);
+            }
+        }
+
+        fn wait_for_completion(&self, key: &str) {
+            let mut progress = self.progress.lock();
+            while !progress.completed.iter().any(|completed| completed == key) {
+                self.progress_cv.wait(&mut progress);
+            }
+        }
+
+        fn started(&self) -> Vec<String> {
+            self.progress.lock().started.clone()
+        }
+
+        fn completed(&self) -> Vec<String> {
+            self.progress.lock().completed.clone()
+        }
+    }
+
+    impl ObjectStore for GatedStore {
+        fn stat<'a>(
+            &'a self,
+            key: &'a ObjectKey,
+        ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+            ObjectStore::stat(&self.data, key)
+        }
+
+        fn read_small<'a>(
+            &'a self,
+            key: &'a ObjectKey,
+        ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+            let gate = {
+                let mut gates = self.gates.lock();
+                let position = gates
+                    .iter()
+                    .position(|(gated, _)| gated.as_str() == key.as_ref());
+                position.map(|position| gates.swap_remove(position).1)
+            };
+            let Some(gate) = gate else {
+                return self.data.read_small(key);
+            };
+            Box::pin(async move {
+                let key_name = key.as_ref().to_string();
+                let inflight = self.inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                self.max_inflight
+                    .fetch_max(inflight, std::sync::atomic::Ordering::SeqCst);
+                {
+                    let mut progress = self.progress.lock();
+                    progress.started.push(key_name.clone());
+                    self.progress_cv.notify_all();
+                }
+                // gate に対応する sender が落ちた場合も読み込み自体は進める。
+                let _ = gate.await;
+                let result = self.data.read_small(key).await;
+                self.inflight
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                {
+                    let mut progress = self.progress.lock();
+                    progress.completed.push(key_name);
+                    self.progress_cv.notify_all();
+                }
+                result
+            })
+        }
+
+        fn write_small<'a>(
+            &'a self,
+            key: &'a ObjectKey,
+            data: Vec<u8>,
+        ) -> PlatformFuture<'a, Result<()>> {
+            self.data.write_small(key, data)
+        }
+
+        fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+            ObjectStore::delete(&self.data, key)
+        }
+
+        fn list_page<'a>(
+            &'a self,
+            request: &'a ObjectListRequest,
+        ) -> PlatformFuture<'a, Result<ObjectListPage>> {
+            self.data.list_page(request)
+        }
+    }
+
+    /// 後続が先に読み終えても返す順は入力順のまま、同時読み込みは窓の
+    /// 件数までに収まる。
+    #[test]
+    fn load_sections_ordered_prefetches_out_of_order_with_a_bounded_window() {
+        let keys = NovelObjectKeys::new("example.test", "n1234ab", true).unwrap();
+        let subtitles: Vec<SubtitleInfo> = ["1", "2", "3", "4", "5", "6"]
+            .iter()
+            .map(|index| subtitle_at(index))
+            .collect();
+        let section_keys: Vec<String> = subtitles
+            .iter()
+            .map(|subtitle| {
+                keys.section(&subtitle.index, &subtitle.file_subtitle)
+                    .as_ref()
+                    .to_string()
+            })
+            .collect();
+
+        let (store, senders) = GatedStore::new(&section_keys);
+        let service = PersistenceService::new(store.clone(), Arc::new(MemoryObjectStore::new()));
+        futures::executor::block_on(async {
+            for (index, subtitle) in subtitles.iter().enumerate() {
+                let section = section_file(subtitle, &format!("本文{}", index + 1));
+                ObjectStore::write_small(
+                    store.as_ref(),
+                    &keys.section(&subtitle.index, &subtitle.file_subtitle),
+                    serialize_section(&section).unwrap().into_bytes(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        // 最初の窓が全部開始したら、入力順の逆に gate を開けて完了させる。
+        let releaser = std::thread::spawn({
+            let store = store.clone();
+            let senders = senders.clone();
+            let section_keys = section_keys.clone();
+            move || {
+                store.wait_for_started(super::SECTION_READ_WINDOW);
+                for index in [3usize, 2, 1, 0] {
+                    let sender = senders.lock().remove(&section_keys[index]).unwrap();
+                    sender.send(()).unwrap();
+                    store.wait_for_completion(&section_keys[index]);
+                }
+                store.wait_for_started(section_keys.len());
+                for index in [5usize, 4] {
+                    let sender = senders.lock().remove(&section_keys[index]).unwrap();
+                    sender.send(()).unwrap();
+                    store.wait_for_completion(&section_keys[index]);
+                }
+            }
+        });
+
+        let sections =
+            futures::executor::block_on(service.load_sections_ordered(&keys, &subtitles)).unwrap();
+        releaser.join().unwrap();
+
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.element.body.clone())
+                .collect::<Vec<_>>(),
+            vec!["本文1", "本文2", "本文3", "本文4", "本文5", "本文6"],
+            "先に読み終えた後続があっても本文は目次順に返る"
+        );
+        let mut started = store.started();
+        started.sort();
+        let mut expected = section_keys.clone();
+        expected.sort();
+        assert_eq!(started, expected, "全ての本文を先読みする");
+        assert_eq!(
+            store.completed(),
+            vec![
+                section_keys[3].clone(),
+                section_keys[2].clone(),
+                section_keys[1].clone(),
+                section_keys[0].clone(),
+                section_keys[5].clone(),
+                section_keys[4].clone(),
+            ],
+            "テストは完了順を意図どおり制御している"
+        );
+        assert_eq!(
+            store
+                .max_inflight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            super::SECTION_READ_WINDOW,
+            "同時に走る読み込みは窓の件数まで"
+        );
+    }
+
+    /// 走査順で最初の失敗 (欠落 or 読み込みエラー) だけを返す。
+    #[test]
+    fn load_sections_ordered_reports_the_first_failure_in_input_order() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let service = PersistenceService::new(store.clone(), store.clone());
+        let keys = NovelObjectKeys::new("example.test", "n1234ab", true).unwrap();
+        let subtitles: Vec<SubtitleInfo> = ["1", "2", "3"]
+            .iter()
+            .map(|index| subtitle_at(index))
+            .collect();
+        let section_key =
+            |subtitle: &SubtitleInfo| keys.section(&subtitle.index, &subtitle.file_subtitle);
+
+        // 1 話目は正常、2 話目は欠落、3 話目は壊れた YAML。直列時の最初の
+        // 失敗は 2 話目の欠落 (後続のエラーが先に見つかっても勝たない)。
+        let first = section_file(&subtitles[0], "本文1");
+        futures::executor::block_on(async {
+            ObjectStore::write_small(
+                store.as_ref(),
+                &section_key(&subtitles[0]),
+                serialize_section(&first).unwrap().into_bytes(),
+            )
+            .await
+            .unwrap();
+            ObjectStore::write_small(
+                store.as_ref(),
+                &section_key(&subtitles[2]),
+                b"not: [valid yaml".to_vec(),
+            )
+            .await
+            .unwrap();
+        });
+        match futures::executor::block_on(service.load_sections_ordered(&keys, &subtitles)) {
+            Err(SectionLoadFailure::Missing { section_index }) => assert_eq!(section_index, 1),
+            Err(SectionLoadFailure::Read(error)) => {
+                panic!("欠落が先に報告されるべき: {error}")
+            }
+            Ok(sections) => panic!("失敗するはずが {} 件返った", sections.len()),
+        }
+
+        // 1 話目の YAML を壊す。2 話目は欠落のままなので、走査順で先の
+        // 読み込みエラーが最初の失敗になる。
+        futures::executor::block_on(ObjectStore::write_small(
+            store.as_ref(),
+            &section_key(&subtitles[0]),
+            b"not: [valid yaml".to_vec(),
+        ))
+        .unwrap();
+        match futures::executor::block_on(service.load_sections_ordered(&keys, &subtitles)) {
+            Err(SectionLoadFailure::Read(_)) => {}
+            Err(SectionLoadFailure::Missing { section_index }) => {
+                panic!("読み込みエラーが先に報告されるべき: missing {section_index}")
+            }
+            Ok(sections) => panic!("失敗するはずが {} 件返った", sections.len()),
+        }
+    }
+
+    /// 最初の失敗で打ち切り、先読みは窓の件数を超えない。
+    #[test]
+    fn load_sections_ordered_stops_reading_after_the_first_failure() {
+        let keys = NovelObjectKeys::new("example.test", "n1234ab", true).unwrap();
+        let subtitles: Vec<SubtitleInfo> = ["1", "2", "3", "4", "5", "6"]
+            .iter()
+            .map(|index| subtitle_at(index))
+            .collect();
+        let section_keys: Vec<String> = subtitles
+            .iter()
+            .map(|subtitle| {
+                keys.section(&subtitle.index, &subtitle.file_subtitle)
+                    .as_ref()
+                    .to_string()
+            })
+            .collect();
+
+        let (store, senders) = GatedStore::new(&section_keys);
+        let service = PersistenceService::new(store.clone(), Arc::new(MemoryObjectStore::new()));
+        // 1 話目は欠落させたまま、最初の窓が開始したら gate を開ける。
+        // 残りの gate はテストが保持し続けるので、破棄された先読みは完了しない。
+        let releaser = std::thread::spawn({
+            let store = store.clone();
+            let senders = senders.clone();
+            let first_key = section_keys[0].clone();
+            move || {
+                store.wait_for_started(super::SECTION_READ_WINDOW);
+                let sender = senders.lock().remove(&first_key).unwrap();
+                sender.send(()).unwrap();
+            }
+        });
+
+        let failure = futures::executor::block_on(service.load_sections_ordered(&keys, &subtitles))
+            .unwrap_err();
+        releaser.join().unwrap();
+
+        assert!(matches!(
+            failure,
+            SectionLoadFailure::Missing { section_index: 0 }
+        ));
+        assert_eq!(
+            store.completed(),
+            vec![section_keys[0].clone()],
+            "最初の失敗より先の先読みは破棄される"
+        );
+        assert!(
+            store.started().len() <= super::SECTION_READ_WINDOW,
+            "開始する読み込みは窓の件数まで: {:?}",
+            store.started()
         );
     }
 }

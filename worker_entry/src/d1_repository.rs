@@ -12,7 +12,7 @@ use narou_rs::platform::{
     PlatformFuture, SearchField,
 };
 use narou_rs::setting_core::SettingScope;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 use wasm_bindgen::JsValue;
@@ -432,50 +432,82 @@ impl SettingsStore for D1SettingsStore {
         })
     }
 
-    fn save<'a>(
+    fn compare_save<'a>(
         &'a self,
         scope: SettingScope,
-        settings: &'a HashMap<String, YamlValue>,
-    ) -> PlatformFuture<'a, Result<()>> {
-        let entries: Vec<(String, String, String)> = match settings
-            .iter()
-            .map(|(key, value)| {
-                let yaml = serde_yaml::to_string(value).map_err(|error| {
-                    NarouError::Platform(format!("cannot serialize D1 setting {key}: {error}"))
-                })?;
-                let json = serde_json::to_string(value).map_err(|error| {
-                    NarouError::Platform(format!("cannot serialize D1 setting JSON {key}: {error}"))
-                })?;
-                Ok((key.clone(), yaml, json))
-            })
-            .collect::<Result<_>>()
-        {
-            Ok(entries) => entries,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
+        expected: &'a HashMap<String, YamlValue>,
+        replacement: &'a HashMap<String, YamlValue>,
+    ) -> PlatformFuture<'a, Result<bool>> {
         Box::pin(async move {
             let scope_name = Self::scope_name(scope);
-            let mut statements = vec![bind_statement(
-                self.db.prepare("DELETE FROM app_state WHERE scope = ?"),
-                vec![BindValue::Text(scope_name.to_string())],
-            )?];
-            for (key, yaml, json) in entries {
-                statements.push(bind_statement(
-                    self.db.prepare(
-                        "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, ?)",
-                    ),
-                    vec![
-                        BindValue::Text(scope_name.to_string()),
-                        BindValue::Text(key),
-                        BindValue::Text(yaml),
-                        BindValue::Text(json),
-                    ],
-                )?);
+            let rows: Vec<StateRow> = self.db
+                .prepare("SELECT key, value_yaml, value_json FROM app_state WHERE scope = ? ORDER BY key")
+                .bind(&[JsValue::from_str(scope_name)])
+                .map_err(worker_error)?
+                .all().await.map_err(worker_error)?
+                .results().map_err(worker_error)?;
+            if rows.len() != expected.len() {
+                SETTINGS_CACHE.invalidate(scope_name);
+                return Ok(false);
             }
+            for row in &rows {
+                if expected.get(&row.key) != Some(&parse_setting_value(&row.value_yaml, &row.value_json)?) {
+                    SETTINGS_CACHE.invalidate(scope_name);
+                    return Ok(false);
+                }
+            }
+            let snapshot = serde_json::to_string(&rows)
+                .map_err(|error| NarouError::Platform(error.to_string()))?;
+            let guard_key = format!("settings_write_guard/{scope_name}");
+            let token = format!("{}:{}", js_sys::Date::now(), js_sys::Math::random());
+            // D1 batch is one transaction. Its first statement captures a
+            // scope-wide CAS; only that token can authorize the delta writes.
+            let mut statements = vec![bind_statement(self.db.prepare(
+                "INSERT INTO app_state(scope, key, value_yaml, value_json)
+                 SELECT 'inv', ?, ?, '{}'
+                 WHERE (SELECT json_group_array(json_object(
+                   'key', key, 'value_yaml', value_yaml, 'value_json', value_json))
+                   FROM (SELECT key, value_yaml, value_json FROM app_state WHERE scope = ? ORDER BY key)) = ?
+                 ON CONFLICT(scope, key) DO UPDATE SET value_yaml = excluded.value_yaml, value_json = '{}'
+                 RETURNING key"
+            ), vec![
+                BindValue::Text(guard_key.clone()), BindValue::Text(token.clone()),
+                BindValue::Text(scope_name.to_string()), BindValue::Text(snapshot),
+            ])?];
+            for key in expected.keys().filter(|key| !replacement.contains_key(*key)) {
+                statements.push(bind_statement(self.db.prepare(
+                    "DELETE FROM app_state WHERE scope = ? AND key = ?
+                     AND EXISTS(SELECT 1 FROM app_state WHERE scope = 'inv' AND key = ? AND value_yaml = ?)"
+                ), vec![
+                    BindValue::Text(scope_name.to_string()), BindValue::Text(key.clone()),
+                    BindValue::Text(guard_key.clone()), BindValue::Text(token.clone()),
+                ])?);
+            }
+            for (key, value) in replacement {
+                if expected.get(key) == Some(value) {
+                    continue;
+                }
+                let yaml = serde_yaml::to_string(value).map_err(|error| NarouError::Platform(error.to_string()))?;
+                let json = serde_json::to_string(value).map_err(|error| NarouError::Platform(error.to_string()))?;
+                statements.push(bind_statement(self.db.prepare(
+                    "INSERT INTO app_state(scope, key, value_yaml, value_json)
+                     SELECT ?, ?, ?, ? WHERE EXISTS(
+                       SELECT 1 FROM app_state WHERE scope = 'inv' AND key = ? AND value_yaml = ?)
+                     ON CONFLICT(scope, key) DO UPDATE SET
+                       value_yaml = excluded.value_yaml, value_json = excluded.value_json"
+                ), vec![
+                    BindValue::Text(scope_name.to_string()), BindValue::Text(key.clone()),
+                    BindValue::Text(yaml), BindValue::Text(json),
+                    BindValue::Text(guard_key.clone()), BindValue::Text(token.clone()),
+                ])?);
+            }
+            statements.push(bind_statement(self.db.prepare(
+                "DELETE FROM app_state WHERE scope = 'inv' AND key = ? AND value_yaml = ?"
+            ), vec![BindValue::Text(guard_key), BindValue::Text(token)])?);
             let results = self.db.batch(statements).await.map_err(worker_error)?;
             ensure_batch_success(&results)?;
             SETTINGS_CACHE.invalidate(scope_name);
-            Ok(())
+            Ok(!results[0].results::<JsonValue>().map_err(worker_error)?.is_empty())
         })
     }
     fn load_replace_content<'a>(&'a self) -> PlatformFuture<'a, Result<String>> {
@@ -495,22 +527,27 @@ impl SettingsStore for D1SettingsStore {
         })
     }
 
-    fn save_replace_content<'a>(&'a self, content: &'a str) -> PlatformFuture<'a, Result<()>> {
+    fn compare_save_replace_content<'a>(
+        &'a self,
+        expected: &'a str,
+        replacement: &'a str,
+    ) -> PlatformFuture<'a, Result<bool>> {
         Box::pin(async move {
-            let statement = bind_statement(
-                self.db.prepare(
-                    "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, '{}')
-                     ON CONFLICT(scope, key) DO UPDATE SET
-                       value_yaml = excluded.value_yaml, value_json = '{}'",
-                ),
-                vec![
-                    BindValue::Text(GLOBAL_REPLACE_SCOPE.to_string()),
-                    BindValue::Text(GLOBAL_REPLACE_KEY.to_string()),
-                    BindValue::Text(content.to_string()),
-                ],
-            )?;
-            ensure_batch_success(&self.db.batch(vec![statement]).await.map_err(worker_error)?)?;
-            Ok(())
+            let result = bind_statement(self.db.prepare(
+                "INSERT INTO app_state(scope, key, value_yaml, value_json)
+                 SELECT ?, ?, ?, '{}' WHERE COALESCE(
+                   (SELECT value_yaml FROM app_state WHERE scope = ? AND key = ?), '') = ?
+                 ON CONFLICT(scope, key) DO UPDATE SET value_yaml = excluded.value_yaml, value_json = '{}'
+                 RETURNING key"
+            ), vec![
+                BindValue::Text(GLOBAL_REPLACE_SCOPE.to_string()),
+                BindValue::Text(GLOBAL_REPLACE_KEY.to_string()),
+                BindValue::Text(replacement.to_string()),
+                BindValue::Text(GLOBAL_REPLACE_SCOPE.to_string()),
+                BindValue::Text(GLOBAL_REPLACE_KEY.to_string()),
+                BindValue::Text(expected.to_string()),
+            ])?.all().await.map_err(worker_error)?;
+            Ok(!result.results::<JsonValue>().map_err(worker_error)?.is_empty())
         })
     }
 }
@@ -729,7 +766,7 @@ struct IdRow {
 struct SequenceRow {
     id: i64,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct StateRow {
     key: String,
     value_yaml: String,

@@ -216,6 +216,53 @@ impl LibraryService {
             .map_err(ApplicationError::platform)
     }
 
+    /// Every id matching `filter`, ascending, as an ID projection.
+    ///
+    /// Handlers that only need ids (tag-target expansion, the
+    /// `/api/novels/all_ids` endpoint) must not decode whole records:
+    /// [`NovelRepository::scan_ids`] selects `id` alone, and the D1 backend
+    /// already paginates/filters at the SQL level. A `usize::MAX` limit is
+    /// the same unbounded form [`Self::records`] uses; callers that need a
+    /// bound should call the repository scan directly.
+    pub async fn all_ids(
+        &self,
+        filter: &NovelFilter,
+    ) -> Result<Vec<crate::platform::NovelId>, ApplicationError> {
+        self.novels
+            .scan_ids(filter, None, usize::MAX)
+            .await
+            .map_err(ApplicationError::platform)
+    }
+
+    /// Records for a bounded id list, ascending by id; unknown ids are
+    /// simply absent.
+    ///
+    /// Batch handlers that reorder or verify an explicit selection
+    /// (`sort_ids_from_records`, existence checks) only look at those ids;
+    /// this is the id-filtered form of [`Self::records`] — one filtered
+    /// query instead of a whole-library scan.
+    pub async fn records_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<NovelRecord>, ApplicationError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = NovelFilter {
+            ids: Some(ids.iter().copied().map(crate::platform::NovelId).collect()),
+            ..NovelFilter::default()
+        };
+        self.novels
+            .query(&NovelQuery::page(
+                filter,
+                NovelSort::by(crate::platform::NovelSortKey::Id),
+                0,
+                ids.len(),
+            ))
+            .await
+            .map_err(ApplicationError::platform)
+    }
+
 
     /// Fetch one page of the library.
     ///
@@ -756,6 +803,56 @@ mod tests {
         assert_eq!(page.data.len(), 2);
         assert_eq!(page.data[0].id, 2);
         assert_eq!(page.data[1].id, 3);
+    }
+
+    #[test]
+    fn records_by_ids_fetches_only_the_selection_in_id_order() {
+        let mut records = Vec::new();
+        for id in 1..=5 {
+            let mut record = sample_record(id);
+            record.title = format!("novel {id}");
+            records.push(record);
+        }
+        let repo = Arc::new(MemoryNovelRepository::from_records(records));
+        let service = service(repo, Arc::new(FakeClock::default()));
+
+        // Batch handlers pass the raw selection: unsorted, possibly repeated
+        // ids and unknown ids must not change the result — the projection is
+        // exactly the selected records, ascending by id.
+        let selected = futures::executor::block_on(service.records_by_ids(&[4, 2, 2, 99])).unwrap();
+        let ids: Vec<i64> = selected.iter().map(|record| record.id).collect();
+        assert_eq!(ids, vec![2, 4]);
+        assert!(
+            futures::executor::block_on(service.records_by_ids(&[]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn all_ids_projects_every_matching_id_without_records() {
+        let mut records = (1..=4).map(sample_record).collect::<Vec<_>>();
+        records[3].tags = vec!["frozen".into()];
+        let repo = Arc::new(MemoryNovelRepository::from_records(records));
+        let service = service(repo, Arc::new(FakeClock::default()));
+
+        let all: std::collections::HashSet<i64> =
+            futures::executor::block_on(service.all_ids(&NovelFilter::all()))
+                .unwrap()
+                .into_iter()
+                .map(|id| id.0)
+                .collect();
+        let expected: std::collections::HashSet<i64> = (1..=4).collect();
+        assert_eq!(all, expected);
+
+        // The exact-match tag filter backs the frozen-tag fallback; it must
+        // return ids only.
+        let frozen = futures::executor::block_on(service.all_ids(&NovelFilter {
+            tag: Some("frozen".to_string()),
+            ..NovelFilter::default()
+        }))
+        .unwrap();
+        assert_eq!(frozen.iter().map(|id| id.0).collect::<Vec<_>>(), vec![4]);
     }
 
     #[test]

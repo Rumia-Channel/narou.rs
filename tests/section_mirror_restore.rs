@@ -124,11 +124,7 @@ fn conversion_rebuilds_section_files_deleted_outside_narou() {
     let image_path = novel_dir.join("挿絵").join("fixture.png");
     std::fs::remove_file(&image_path).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let materialized = runtime.block_on(async {
-        narou_rs::native::illustrations::Materialized::new(
-            narou_rs::native::illustrations::materialize_blocking(&novel_dir).unwrap(),
-        )
-    });
+    let materialized = runtime.block_on(narou_rs::native::illustrations::materialize(&novel_dir)).unwrap();
     assert_eq!(std::fs::read(&image_path).unwrap(), image_bytes);
     drop(materialized);
     assert!(!image_path.exists(), "staged illustrations must be removed by the guard");

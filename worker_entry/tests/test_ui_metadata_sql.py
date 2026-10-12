@@ -11,8 +11,13 @@ import sqlite3
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = (ROOT / "worker_entry/src/webui/queue.rs").read_text(encoding="utf-8")
-SQL = dict(re.findall(r'const (\w+_SQL): &str = r#"(.*?)"#;', SOURCE, re.S))
+SOURCES = [
+    (ROOT / "worker_entry/src/webui/queue.rs").read_text(encoding="utf-8"),
+    (ROOT / "worker_entry/src/webui/queue/paging.rs").read_text(encoding="utf-8"),
+]
+SQL = {}
+for source in SOURCES:
+    SQL.update(re.findall(r'const (\w+_SQL): &str = r#"(.*?)"#;', source, re.S))
 ACTIVE = {"pending", "retryable", "running"}
 SECONDARY = {"convert", "send", "backup", "mail"}
 STATUSES = (*sorted(ACTIVE), "succeeded", "partial", "blocked", "permanent")
@@ -41,9 +46,13 @@ class UiMetadataSqlTests(unittest.TestCase):
         self.db.execute("INSERT INTO worker_jobs VALUES (?, ?, ?, ?, ?, ?)",
                         (job_id, kind, target, options, status, at))
 
-    def query(self, name):
+    def query(self, name, params=None):
         self.assertIn(name, SQL, "test must use the production SQL, not a copied query")
-        return [dict(row) for row in self.db.execute(SQL[name])]
+        if params is None:
+            # Keyset paging takes an empty cursor (start of the queue) and a
+            # page limit; the other queries take no binds.
+            params = ("", "", "", 1000) if "?" in SQL[name] else ()
+        return [dict(row) for row in self.db.execute(SQL[name], params)]
 
     def test_empty_library_and_queue(self):
         for name in SQL:
@@ -114,6 +123,68 @@ class UiMetadataSqlTests(unittest.TestCase):
         self.assertLessEqual(len(self.query("QUEUE_COUNTS_SQL")), 14)
         self.assertLessEqual(len(self.query("FIRST_RUNNING_SQL")), 1)
         self.assertLessEqual(len(self.query("LANE_COUNTS_SQL")), 2)
+
+    # ------------------------------------------------------------------
+    # Cursor paging for GET /api/get_pending_tasks
+    # ------------------------------------------------------------------
+
+    def page(self, cursor, limit):
+        created_at, job_id = cursor if cursor else ("", "")
+        return self.query("ACTIVE_PAGE_SQL", (created_at, created_at, job_id, limit))
+
+    def test_active_totals_count_waiting_and_running_server_side(self):
+        for status, times in (("pending", 3), ("retryable", 2), ("running", 4), ("succeeded", 9)):
+            for i in range(times):
+                self.insert_job(f"{status}-{i}", "update", status)
+        totals = {r["lane"]: r["n"] for r in self.query("ACTIVE_TOTALS_SQL")}
+        self.assertEqual(totals, {0: 5, 1: 4})
+
+    def test_pending_page_walks_every_row_exactly_once_across_pages(self):
+        # Rows written by one ledger batch share created_at; the job_id tie
+        # breaker must still order them so pages never skip or repeat a row.
+        tied = "2026-10-12T00:00:00.000000000Z"
+        for index in range(25):
+            self.insert_job(f"batch-{index:02d}", "update", "pending", at=tied)
+        self.insert_job("older", "update", "pending", at="2026-10-11T00:00:00Z")
+        self.insert_job("running", "update", "running", at=tied)
+        # Terminal rows must never appear in a page.
+        self.insert_job("done", "update", "succeeded", at="2026-10-10T00:00:00Z")
+        expected = (
+            ["older"]
+            + [f"batch-{index:02d}" for index in range(25)]
+            + ["running"]
+        )
+
+        seen = []
+        cursor = None
+        for _ in range(100):
+            rows = self.page(cursor, 7)
+            if not rows:
+                break
+            seen.extend(row["job_id"] for row in rows)
+            last = rows[-1]
+            cursor = (last["created_at"], last["job_id"])
+            if len(rows) < 7:
+                break
+        self.assertEqual(seen, expected)
+        self.assertEqual(len(seen), len(set(seen)), "a page boundary must not repeat a row")
+
+    def test_pending_page_cursor_is_strictly_after_the_last_row(self):
+        self.insert_job("a", "update", "pending", at="2026-10-12T00:00:00Z")
+        self.insert_job("b", "update", "retryable", at="2026-10-12T00:00:00Z")
+        self.insert_job("c", "update", "running", at="2026-10-12T00:00:01Z")
+        self.assertEqual([r["job_id"] for r in self.page(None, 2)], ["a", "b"])
+        self.assertEqual(
+            [r["job_id"] for r in self.page(("2026-10-12T00:00:00Z", "b"), 2)], ["c"]
+        )
+        # A cursor at the very end returns an empty page (the client stops).
+        self.assertEqual(self.page(("2026-10-12T00:00:01Z", "c"), 2), [])
+
+    def test_pending_page_limit_is_part_of_the_query_not_the_client(self):
+        for i in range(10):
+            self.insert_job(f"job-{i}", "update", "pending")
+        self.assertEqual(len(self.page(None, 3)), 3)
+        self.assertEqual(len(self.page(None, 1000)), 10)
 
 
 if __name__ == "__main__":

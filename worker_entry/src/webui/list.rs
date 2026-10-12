@@ -278,6 +278,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 fn map_application_error(error: ApplicationError) -> worker::Result<Response> {
     let (status, code, message) = match error {
         ApplicationError::InvalidRequest(message) => (400, "invalid_request", message),
+        ApplicationError::Conflict(message) => (409, "conflict", message),
         ApplicationError::NotFound(message) => (404, "not_found", message),
         ApplicationError::Platform(message) => (500, "internal_error", message),
     };

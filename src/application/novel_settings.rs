@@ -99,14 +99,11 @@ impl NovelSettingsService {
             .ok_or_else(|| ApplicationError::NotFound(format!("ID: {}", id.0)))?;
         let keys = self.keys_for(&record)?;
 
-        let ini = self
-            .load_ini(&keys)
-            .await
-            .map_err(ApplicationError::platform)?;
-        let replace = self
-            .load_replace(&keys)
-            .await
-            .map_err(ApplicationError::platform)?;
+        // setting.ini と replace.txt は独立なので同時に読む。エラーの優先
+        // 順位は直列時と同じ (INI → replace) になるよう、この順で評価する。
+        let (ini, replace) = futures::join!(self.load_ini(&keys), self.load_replace(&keys));
+        let ini = ini.map_err(ApplicationError::platform)?;
+        let replace = replace.map_err(ApplicationError::platform)?;
 
         let settings = build_setting_entries(&ini);
         Ok(NovelSettingsView {
@@ -437,5 +434,30 @@ mod tests {
         }])
         .unwrap_err();
         assert!(matches!(err, ApplicationError::InvalidRequest(_)));
+    }
+
+    /// setting.ini と replace.txt が両方読めなくても、直列時と同じく先に
+    /// 読む setting.ini のエラーを返す (2 つの読みを join した後も順序を保つ)。
+    #[test]
+    fn load_reports_the_ini_error_before_the_replace_error() {
+        let (service, _, objects) = service();
+        let keys = NovelObjectKeys::new("example", "title 1", false).unwrap();
+        futures::executor::block_on(async {
+            objects
+                .write_small(&keys.setting(), vec![0xff, 0xfe, 0xfd])
+                .await
+                .unwrap();
+            objects
+                .write_small(&keys.replace(), vec![0xff, 0xfe, 0xfd])
+                .await
+                .unwrap();
+        });
+
+        let error = futures::executor::block_on(service.load(NovelId(1))).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("setting.ini is not UTF-8"),
+            "expected the setting.ini error to win, got: {message}"
+        );
     }
 }
