@@ -1397,52 +1397,12 @@ impl Downloader {
         Ok(())
     }
 
-    pub async fn expand_series_target(&mut self, target: &str) -> Result<Option<Vec<String>>> {
-        if !matches!(Self::get_target_type(target), TargetType::Url) {
-            return Ok(None);
-        }
-        let setting = self
-            .site_settings
-            .iter()
-            .find(|setting| setting.matches_series_url(target))
-            .cloned();
-        let Some(setting) = setting else {
-            return Ok(None);
-        };
-        let pattern = setting.compile_series_item_pattern().ok_or_else(|| {
-            NarouError::SiteSetting(format!(
-                "No series_item_url pattern defined: {}",
-                setting.name
-            ))
-        })?;
-
-        let mut body = crate::downloader::http_policy::fetch_text(
+    pub fn download_target_expander(&self) -> crate::application::download_targets::DownloadTargetExpander<'_> {
+        crate::application::download_targets::DownloadTargetExpander::new(
             self.http.as_ref(),
             self.rate_limiter.as_ref(),
-            target,
-            &crate::downloader::http_policy::FetchPolicy::for_site(&setting),
-            Some(setting.encoding()),
+            &self.site_settings,
         )
-        .await?;
-        crate::downloader::util::pretreatment_source(&mut body, setting.encoding(), None);
-
-        let mut targets = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for caps in pattern.captures_iter(&body) {
-            if let Some(url) = setting.series_item_url_from_captures(target, &pattern, &caps)
-                && seen.insert(url.clone())
-            {
-                targets.push(url);
-            }
-        }
-
-        if targets.is_empty() {
-            return Err(NarouError::NotFound(format!(
-                "No novels found in series URL: {}",
-                target
-            )));
-        }
-        Ok(Some(targets))
     }
 
     pub fn get_novel_data_dir(&self, record: &NovelRecord) -> PathBuf {

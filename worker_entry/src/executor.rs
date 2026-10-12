@@ -128,6 +128,36 @@ pub async fn execute_job(
     // D1 の設定を読む (convert ジョブもこの経路を通る)。
     narou_rs::application::debug::set_enabled(crate::consumer::webui_debug_mode(runtime).await);
 
+    // The execution boundary also accepts raw series plans (persisted ledger
+    // rows and legacy envelopes). Fan out through the same expander as new
+    // requests; the child plans retain per-novel budgets and follow-up convert.
+    let series_result = match downloader.download_target_expander().expand_plan(job).await {
+        Ok(Some(plans)) => {
+            let count = plans.len();
+            Some(runtime.enqueue_batch(&plans).await.map(|_| count))
+        }
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
+    };
+    if let Some(result) = series_result {
+        use narou_rs::application::messages::MessageSink as _;
+        let sink = PushHubSink::install(push.clone());
+        let outcome = match result {
+            Ok(count) => {
+                sink.emit(messages::Stream::Stdout, &messages::download::series_expanded(job.target.as_str(), count));
+                crate::consumer::notify_queue_changed(push).await;
+                JobOutcome::Succeeded
+            }
+            Err(error) => {
+                sink.emit(messages::Stream::Stdout, &messages::indented_error(&error));
+                classify_result(Err(error), job, job_id, runtime, sink.as_ref()).await
+            }
+        };
+        sink.drain().await;
+        narou_rs::application::messages::take_default_sink();
+        return outcome;
+    }
+
     let force = job
         .options
         .iter()

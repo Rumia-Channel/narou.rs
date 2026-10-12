@@ -8,6 +8,7 @@
 //!
 //! Modules:
 //! - [`aliases`]: novel-target alias resolution shared by the CLI and Worker.
+//! - [`download_targets`]: YAML-driven series expansion shared by CLI and Worker.
 //! - [`error`]: the application-layer error type (no HTTP status).
 //! - [`events`]: application-owned platform ports (`FreezeStore`,
 //!   `SiteTimezoneProvider`) plus their no-op defaults.
@@ -19,6 +20,7 @@
 pub mod error;
 pub mod aliases;
 pub mod debug;
+pub mod download_targets;
 pub mod events;
 pub mod convert;
 pub mod messages;

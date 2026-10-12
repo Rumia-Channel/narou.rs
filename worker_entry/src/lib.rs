@@ -1234,9 +1234,13 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
     let planned = runtime.services.jobs.plan(&request);
     let invalid = planned.invalid.clone();
     let duplicates = planned.duplicates.clone();
+    let plans = match runtime.expand_download_plans(planned.plans).await {
+        Ok(plans) => plans,
+        Err(error) => return Response::error(format!("download target expansion failed: {error}"), 502),
+    };
     let mut ids = Vec::new();
     let mut blocked = Vec::new();
-    for plan in planned.plans {
+    for plan in plans.into_iter().flatten() {
         let outcome = match runtime.enqueue_plan(plan).await {
             Ok(outcome) => outcome,
             Err(error) => {

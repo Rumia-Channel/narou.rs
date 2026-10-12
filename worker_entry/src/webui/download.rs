@@ -5,7 +5,8 @@
 //! - body: `{"targets": ["n1234ab" | id | URL | タイトル | 別名, ...], "force"?,
 //!   "mail"?}` (`DownloadBody`)。
 //! - success: HTTP 200 `{"success": true, "results": [{"target", "job_id",
-//!   "status": "queued"}]}` — one entry per input target, in request order.
+//!   "status": "queued"}]}` — one entry per queued novel, grouped in input
+//!   order. Series members retain the original input in `target`.
 //! - validation / enqueue failure: HTTP 200 `{"success": false, "message",
 //!   "results": []}` — the native handler reports every request-level failure
 //!   this way (never a 4xx/5xx for a well-formed request body).
@@ -133,21 +134,27 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
             Err(message) => return download_failure(&message),
         }
     }
+    let plans = match runtime.expand_download_plans(plans).await {
+        Ok(plans) => plans,
+        Err(error) => return download_failure(&error.to_string()),
+    };
 
     // `push_batch` parity: enqueue through the shared ledger + Queue binding;
     // an enqueue failure reports the error string as the message (native does
     // `map_err(|e| e.to_string())` into the same response shape).
     let mut results = Vec::with_capacity(plans.len());
-    for (target, plan) in body.targets.iter().zip(plans.iter()) {
-        let outcome = match runtime.enqueue_plan(plan.clone()).await {
-            Ok(outcome) => outcome,
-            Err(error) => return download_failure(&error.to_string()),
-        };
-        results.push(json!({
-            "target": target,
-            "job_id": outcome.job_id,
-            "status": "queued",
-        }));
+    for (target, members) in body.targets.iter().zip(plans) {
+        for plan in members {
+            let outcome = match runtime.enqueue_plan(plan).await {
+                Ok(outcome) => outcome,
+                Err(error) => return download_failure(&error.to_string()),
+            };
+            results.push(json!({
+                "target": target,
+                "job_id": outcome.job_id,
+                "status": "queued",
+            }));
+        }
     }
 
     // native `api_download` は受理できたジョブを積んだあとに

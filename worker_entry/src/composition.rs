@@ -646,6 +646,25 @@ impl WorkerRuntime {
     }
 
 
+    /// Expand before writing any ledger rows, preserving input groups for the
+    /// Web UI response. UI composition skips site loading, so load the current
+    /// primary definitions only for requests containing download URLs.
+    pub async fn expand_download_plans(&self, plans: Vec<JobPlan>) -> Result<Vec<Vec<JobPlan>>> {
+        use narou_rs::application::{JobKind, JobTarget};
+        if !plans.iter().any(|plan| plan.kind == JobKind::Download && matches!(plan.target, JobTarget::Url(_))) {
+            return Ok(plans.into_iter().map(|plan| vec![plan]).collect());
+        }
+        let sites = crate::bundled_sites::load_site_settings_uncached(&self.write_objects).await?;
+        let expander = narou_rs::application::download_targets::DownloadTargetExpander::new(
+            self.http.as_ref(), self.rate_limiter.as_ref(), &sites,
+        );
+        let mut expanded = Vec::with_capacity(plans.len());
+        for plan in plans {
+            expanded.push(expander.expand_plan(&plan).await?.unwrap_or_else(|| vec![plan]));
+        }
+        Ok(expanded)
+    }
+
     /// Enqueue one plan through the ledger and Queue binding as one operation.
     /// Pending/retryable rows are sent; a live running row is not duplicated.
     pub async fn enqueue_plan(&self, plan: JobPlan) -> Result<DispatchOutcome> {

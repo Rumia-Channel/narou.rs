@@ -70,7 +70,7 @@ async fn cmd_download_inner(
     let multi_clone = multi.clone();
     let mut mistook = 0usize;
     let (expanded_targets, series_mistook) =
-        expand_series_targets(&mut downloader, &targets, sink).await;
+        expand_series_targets(&downloader, &targets, sink).await;
     targets = expanded_targets;
     mistook += series_mistook;
 
@@ -192,14 +192,14 @@ async fn cmd_download_inner(
 }
 
 async fn expand_series_targets(
-    downloader: &mut Downloader,
+    downloader: &Downloader,
     targets: &[String],
     sink: &Arc<dyn MessageSink>,
 ) -> (Vec<String>, usize) {
     let mut expanded = Vec::new();
     let mut mistook = 0usize;
     for target in targets {
-        match downloader.expand_series_target(target).await {
+        match downloader.download_target_expander().expand(target).await {
             Ok(Some(items)) => {
                 sink.emit(
                     Stream::Stdout,
@@ -267,7 +267,8 @@ fn valid_target(downloader: &Downloader, target: &str) -> bool {
     let target_type = Downloader::get_target_type(target);
     match target_type {
         TargetType::Ncode => true,
-        TargetType::Url => downloader.site_setting_matches_url(target),
+        TargetType::Url => downloader.site_setting_matches_url(target)
+            || downloader.download_target_expander().recognizes(target),
         _ => false,
     }
 }
