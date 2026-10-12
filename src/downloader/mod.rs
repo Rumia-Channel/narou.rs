@@ -4405,18 +4405,27 @@ is_narou: false
         let index: crate::illustration_store::IllustrationIndex =
             serde_yaml::from_slice(&cache).unwrap();
         assert_eq!(index.source_count(), 1);
-        let (_, unresolved) = crate::epub_lite::rewrite_illustration_references(
-            "［＃挿絵（//9496.mitemin.net/userpageimage/viewimagebig/icode/i83860/）入る］",
-            |url| {
-                index
-                    .filename_for_source(url)
-                    .map(|name| format!("挿絵/{name}"))
-            },
+        assert_eq!(
+            index.filename_for_source(
+                "//9496.mitemin.net/userpageimage/viewimagebig/icode/i83860/"
+            ),
+            Some("i83860.png")
         );
-        assert!(
-            unresolved.is_empty(),
-            "再開後は EPUB の挿絵参照が解決できる: {unresolved:?}"
-        );
+        #[cfg(feature = "lite")]
+        {
+            let (_, unresolved) = crate::epub_lite::rewrite_illustration_references(
+                "［＃挿絵（//9496.mitemin.net/userpageimage/viewimagebig/icode/i83860/）入る］",
+                |url| {
+                    index
+                        .filename_for_source(url)
+                        .map(|name| format!("挿絵/{name}"))
+                },
+            );
+            assert!(
+                unresolved.is_empty(),
+                "再開後は EPUB の挿絵参照が解決できる: {unresolved:?}"
+            );
+        }
     }
 
     #[test]
