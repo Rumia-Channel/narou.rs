@@ -1,15 +1,103 @@
 # native / Cloudflare Workers / SORAHOST 共通化監査 (2026-10)
 
 対象: 「Workers 向け・SORAHOST 向けに積んだ機能のうち、実行環境に依存しないのに native と
-共通化されていない経路」の洗い出し。**コード変更はしていない**（本ファイルの追加のみ）。
+共通化されていない経路」の洗い出し。初回監査はコード変更なし。2026-10-12 の再監査ではシリーズ展開を共通化した。
 
-- 調査時点の HEAD: `6434f27`〜`4ff29d3`（監査中に他作業で `worker_entry/ci/*` と
+- 初回監査時点の HEAD: `6434f27`〜`4ff29d3`（監査中に他作業で `worker_entry/ci/*` と
   `.github/workflows/platform.yml` が 2 コミット進んだ。本ファイルが引用する
   `src/**` と `worker_entry/src/**` は未変更）
 - 方法: `src/**` / `worker_entry/**` / `sorahost/**` / `scripts/sorahost-proxy/**` を読解し、
   `grep` で「共有層の利用有無」を機械的に確認。主要な重複は本文を diff して一致を実測した。
 
 ---
+
+## 2026-10-12 再監査・シリーズ展開の共通化
+
+取得・変換・作者追跡、設定・資格情報・保存、Web API・キュー、EPUB・SQL、リレー・配備の
+5 領域を現行ソースで再調査した。以下が今回の判定であり、後続の初回監査と異なる場合はこちらを優先する。
+シリーズ以外はソース比較による候補の確認で、障害の実機再現や修正まで済ませたという意味ではない。
+
+### 今回実装した範囲
+
+- `src/application/download_targets.rs` の `DownloadTargetExpander` が、実効 `SiteSetting`、
+  `HttpClient`、`RateLimiter` を借りてシリーズ URL を展開する。サイト固有分岐は追加せず、
+  `series_url` / `series_item_url`、ヘッダ・文字コード・取得間隔の既存規則を共有する。
+- CLI の引数指定と対話入力、native Web の CLI 子プロセス、Worker の `/api/download`・
+  `/api/download_force`・`/api/jobs`、Worker の保存済みジョブ・旧 envelope の実行を同じ処理へ接続した。
+- Worker は全入力の展開成功後に作品ごとの台帳行を作る。ページ順・重複除去・元オプションの
+  引き継ぎを維持し、取得失敗や空一覧を単体小説へフォールバックさせない。
+- なろうのシリーズは「各小説を別レコードとして追加」、Pixiv の小説・漫画シリーズは
+  従来どおり「シリーズ自体を 1 レコードとして追加」。後者を前者の展開へ巻き込まない。
+
+### 残る共通化候補（今回未修正）
+
+| 優先 | 対象・確認した重複／差 | 主な箇所 | 推奨する既存の受け皿 |
+|---|---|---|---|
+| 高 | 普通の native HTTP tier と relay が `Set-Cookie` を保持しない。更新ループ自体も native / Worker の二重実装 | `src/native/http.rs:165-209,422-505,928-937`、`worker_entry/src/http.rs:106-150,227-253`、`src/platform/relay.rs:201-263` | `platform::http` の応答契約、`platform::cookie_store`。relay の JS 実装も同時変更 |
+| 高 | 真偽値の読み取りが `Bool` 限定／`true,false` 限定／`yes,on,1` 対応に分裂。Worker 内でも debug 設定の解釈が違う | `src/db/settings.rs:110-118`、`src/compat.rs:298-317`、`worker_entry/src/composition.rs:243-252`、`consumer.rs:498-508`、`webui/ui_prefs.rs:445-461` | `setting_core` に読み取り規則を置き、未設定と false を区別する |
+| 高 | URL / ID / ncode / タイトルの解決が 5〜6 系統。URL fallback が異なり、Web の `SiteDefinitionProvider` は空実装 | `src/commands/mod.rs:46-87`、`update.rs:494-537`、`src/web/jobs.rs:398-439`、`worker_entry/src/webui/{download,job_actions,read_views}.rs` | `application::library` と既存 `SiteDefinitionProvider`。差を解決モードとして明示 |
+| 高 | native のランタイムサイト定義が `effective()`、Worker が `effective_runtime()` を使用 | `src/native/site_definitions.rs:159-165`、`worker_entry/src/bundled_sites.rs:79-99` | `application::site_definitions` の version gate。古いユーザー定義への影響を確認して切替 |
+| 高 | タグ色の保存で native は挿入順を保持、Worker は `HashMap` へ落とす。次の既定色の選択が順序に依存 | `src/tag_colors.rs:35-66`、`worker_entry/src/d1_repository.rs:608-611`、`src/application/tag_colors.rs:91-105` | `TagColors` の順序保持 codec。色の正規化も同所へ |
+| 高 | Worker のタグ・凍結・削除・notepad・設定更新で native 相当の push 通知が欠ける | `src/web/{batch,novels,tags,misc,global_settings}.rs`、`worker_entry/src/webui/{tag_actions,row_actions,novels,read_views}.rs`、`global_settings.rs` | `application::push_events` の更新種別→イベント列。送信だけ各 runtime に残す |
+| 高 | スケジューラの DST ギャップ、初回 catch-up、last-run 解釈が異なる。native が共有サービスを使わない | `src/web/scheduler.rs:223-296`、`src/application/scheduler.rs:180-189,236-260`、`worker_entry/src/scheduler.rs:201-209` | `SchedulerService`。narou.rb の外部仕様を確認し、保存形式だけ adapter に残す |
+| 高 | EPUB オプションが 3 経路。Worker は横書き設定があっても `vertical: true`、source 経路では表紙・扉ページ設定の反映が異なる | `src/converter/device.rs:826-840`、`src/web/novels.rs:682-710`、`worker_entry/src/lib.rs:688-705`、`src/epub_lite.rs:439-557,586,681-701` | `epub_lite` の共通組立。設定と資産供給を分離する |
+| 中 | 個別設定の JSON→INI パースと検証が約 170 行の写し | `src/web/novel_settings.rs:153-326`、`worker_entry/src/webui/settings.rs:221-392` | `application::novel_settings` に patch パーサを移す |
+| 中 | ログイン一覧 payload、rename / order / clear の規則が CLI・native Web・Worker に分散 | `src/commands/login.rs:186-260`、`src/web/login.rs:114-320`、`worker_entry/src/{login,webui/login_actions}.rs` | `login` / `platform::cookie_store`。CLI の 1 始まり変換だけ外側へ |
+| 中 | Cookie ストアの旧形式畳み・暗号化 map 操作・merge / replace / remove / clear が二重実装 | `src/native/cookie_store.rs:67-232`、`worker_entry/src/d1_cookie_store.rs:204-380` | `platform::cookie_store` の純粋な map codec。鍵取得と I/O は adapter |
+| 中 | WHERE / 検索語 / sort / keyset の SQL 組立と状態 SQL が二重実装 | `src/native/sqlite/query.rs:32-170`、`worker_entry/src/d1_repository.rs:884-1005`、`src/native/sqlite/sql/status_*` | portable な `db` の SQL builder + `NovelBind`。ドライバの bind / transaction は別 |
+| 中 | 更新確認後の `modified` 除去・日時・`end` タグ、自動 404 凍結が CLI と共有サービスで重複 | `src/commands/update.rs:701-763`、`src/compat.rs:529-560`、`src/application/novel_actions.rs:475-563` | 既存 `NovelActionService` を CLI でも消費する |
+| 中 | 更新後の変換要否と `convert_failure` 操作が重複 | `src/commands/{download,update}.rs`、`worker_entry/src/{executor,convert}.rs` | `application::convert` の判定・状態変更。保存しない構成の差は引数化 |
+| 中 | 正常結果の文言は共有済みだが、例外・中断・debug 詳細の dispatch は重複 | `src/commands/download.rs:158-176`、`update.rs:1829-1855`、`worker_entry/src/executor.rs` | `application::jobs` / `messages` のエラー行生成 |
+| 中 | `tag:`・`^tag:`・bare tag 展開、update 入力正規化が重複 | `src/commands/download.rs:275-338`、`update.rs:418-471`、`src/web/jobs.rs:831-862`、`worker_entry/src/webui/job_actions.rs:322-383,616-647` | `application::webui`。repository 検索は port で渡す |
+| 中 | DTO、上限、検索語結合、表示列→sort、タグ検証が複数箇所に残る | `src/web/state.rs:13-154`、`src/web/novels.rs:24-33,86-96`、`worker_entry/src/webui/{download,job_actions,list,novels,row_actions}.rs` | `web_payloads` / `webui`。値が同じだけの別用途の上限は統合しない |
+| 中 | キュー種別・表示ラベルが独立実装で、Worker は元コマンドではなく ledger kind を表示 | `src/queue.rs:38-48`、`src/web/jobs.rs:134-237`、`worker_entry/src/webui/queue.rs:213-285` | `JobKind` と `messages::jobs` / `webui` |
+| 中 | notepad の object ID・競合応答、taginfo / diff / author_comments の表示組立が重複 | `src/web/{misc,jobs,novels}.rs`、`worker_entry/src/webui/{read_views,novels}.rs` | `novel_content` / `webui`。CAS と HTTP 応答の送信は adapter |
+| 中 | feature tour のテーブルと 3 要素 version 比較がコピーされ、既存の共有比較を使わない | `src/web/feature_tour.rs:20-142,281-337`、`worker_entry/src/webui/ui_prefs.rs:198-320,462-520` | 共通のツアーデータと `application::version_compare` |
+| 中 | `convert.keep-txt` の env / YAML 解釈が 3 実装 | `src/converter/mod.rs:169-182`、`src/application/convert.rs:247-277`、`worker_entry/src/convert.rs:211-243` | `setting_core` / `application::convert`。native=true / Worker=false の既定は保持 |
+| 中 | HTTP ヘッダ名・値の安全述語が複数系統、socket の redirect は各 hop の構文検証を通らない | `src/downloader/http_policy.rs:110-117`、`security.rs:13-15`、`src/platform/{relay,http1}.rs`、`worker_entry/src/http.rs:157-207` | 無条件コンパイルの `platform` のヘッダ規則と `url_policy` |
+| 中 | 同じ relay protocol の Node curl 版と Worker 版で follow が異なる | `scripts/sorahost-proxy/server.mjs:75-108`、`worker/worker.mjs:74-87` | `platform::relay` の契約と共通 redirect 方針。`-L` 追加だけではヘッダ解析が壊れる |
+| 中 | レート制限の idle reset 基準・閾値・pending 条件が異なる | `src/downloader/rate_limit.rs:120-150`、`worker_entry/src/site_rate_limiter.rs:53-67` | `platform::rate_limiter` の時系列状態機械。時計と permit 保存だけ別 |
+| 中 | 在庫キー、import / export の管理対象名が別テーブル。Cookie 鍵長など公開済み定数も再宣言 | `src/native/sqlite/{state,export_yaml}.rs`、`src/db/inventory.rs`、`worker_entry/src/{d1_cookie_store,composition}.rs` | 用途を保った共通定数・管理対象表。import と rollback export の欠落を防ぐ |
+| 低 | MIME の WebP 対応と 64 桁 hash 判定が複数実装 | `src/native/object_store.rs:252-265`、`src/platform/object_store.rs:84-96`、`s3_request.rs:72-78`、`src/illustration_store.rs:704`、`src/commands/illust.rs:238-241` | `platform::object_store` / 挿絵キーの共通述語 |
+| 要判断 | 凍結判定は Ruby 互換の inventory-only と Web の store-or-tag が違う。状態文字列も複数実装 | `src/compat.rs:492-496`、`src/commands/manage.rs:506-513`、`src/application/library.rs:472-476`、`src/platform/repository.rs:328-355`、`src/db/{sort,database}.rs` | モードを明示して共有する。単に OR 判定へ統一すると narou.rb 互換を変える |
+| 要判断 | native EPUB は全量 `Vec<u8>`、Worker は共有 stream writer。`ChunkSink` は `Rc/RefCell` で `!Send` | `src/web/novels.rs:708-710`、`src/epub_lite.rs:35,734-775`、`worker_entry/src/lib.rs:727-819` | entry writer は再利用可。Axum 用の Send sink / channel は別途必要 |
+| 要判断 | portable とされるなろう API helper が native gate に閉じ、batch helper に実利用がない | `src/downloader/mod.rs:3-4,2997-3000`、`src/downloader/narou_api.rs:110-235`、`src/commands/update.rs` | 実際に使う API parse / classify を共有するか、未使用 helper を除去する。Worker 機能追加は別判断 |
+| 低 | 配備用 curl 等の pin・manifest と develop / production env が重複 | `.github/workflows/{platform,deploy-sorahost}.yml`、`sorahost/start.sh:77-78`、`scripts/sorahost-proxy/{deploy.ps1,sorahost.json}` | 配備資産の単一表・描画器。GitHub secrets の job 別指定は保持する |
+
+### 初回監査の訂正・意図的な差
+
+- SELECT / UPSERT とレコード codec は現在 `src/db/novel_codec.rs` を両 DB driver が使う。
+  初回 §2.3 の全面的な未共有という読み方は誤り。残る候補は WHERE / term / sort と状態 SQL 等。
+- 初回 A-8 の「踏み台が redirect を辿る」は Node curl 版では成立しない。
+  `server.mjs` には `-L` がなく、`--max-redirs` だけでは follow しない。Worker relay 版は follow する。
+- SORAHOST の `.env` 読み込み、cwd によるライブラリ指定、loopback 前提の起動認証、
+  `/dev/null` による非対話、native の health / relay / S3 probe 未採用は、
+  対応する要求がない限り共通化のためだけに機能追加しない。
+- D1 / SQLite / YAML の I/O、transaction / batch、OS 子プロセス、Worker budget / lease / DO / TTL、
+  raw 非保存・keep-txt の既定差、HTTP 応答上限、native 限定 illustration dedup は意図的な runtime 差として残す。
+- source と既存ドキュメントにもずれがある。現行 `sorahost/start.sh` と配備 workflow には
+  cloudflared / connector の処理が残り、native Web に 501 が実装されているという README の記述は確認できない。
+  本作業はそれらを撤去・実装する変更ではない。
+
+### 今回の検証
+
+- `cargo test -p narou_rs --test application_services`: 6 件成功。順序・重複・HTML entity、
+  YAML 差し替え、force 引き継ぎ、update 非展開、取得失敗・空一覧を確認。
+- `worker-build`: Worker の wasm release build 成功。
+- `cargo check -p narou_worker --target wasm32-unknown-unknown`: 成功。
+  Windows のビルド検証は VS の開発環境とインストール済み `clang-cl` / LLVM を指定した。
+  MSVC の C build が `D8050` で止まるローカル環境を回避するためで、依存や本番設定は変更していない。
+- 実ページ `https://ncode.syosetu.com/s3795b/` は `n7826bd` / `n9364bq` の 2 URL へ展開された。
+  CLI の対話入力も受理し、各作品の DL 開始まで確認。検証用ライブラリで本文保存時に
+  `IO error: アクセスが拒否されました (os error 5)` となったため、CLI の DL 完走は未検証。
+- ローカル Worker の Web UI から同 URL を入力し、HTTP 200 / `success:true` と個別 2 ジョブを確認。
+  `/api/jobs` と `/api/download_force` も同じ 2 URL を登録し、force 等のオプションを保持した。
+- 旧状態を模した保存済みシリーズジョブを cron で再投入し、親 `succeeded`、
+  WebSocket の `queue_complete`、正しい 2 子ジョブ、共通の展開通知を確認した。
+- `[有効 ID, 404 のシリーズ URL]` の登録は `success:false` / `results:[]` となり、
+  待機数は 0→0。展開エラーより前の対象も登録されない。
+- Worker の検証ジョブは登録・fan-out を観測した後に取り消した。シリーズ全作品の DL 完走・EPUB 比較、
+  および監査候補の挙動差の再現試験は今回の検証結果に含めない。
 
 ## 0. 結論
 
