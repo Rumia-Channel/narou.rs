@@ -361,13 +361,14 @@ fn parse_authority_host_and_port(value: &str, is_url: bool) -> Option<(String, O
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
         return None;
     }
-    let authority = if is_url {
-        let (_, rest) = trimmed.split_once("://")?;
-        rest.split(['/', '?', '#']).next()?
-    } else {
-        trimmed
-    };
-    split_host_and_port(authority)
+    if is_url {
+        let url = url::Url::parse(trimmed).ok()?;
+        if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+            return None;
+        }
+        return Some((url.host_str()?.to_ascii_lowercase(), Some(url.port_or_known_default()?)));
+    }
+    split_host_and_port(trimmed)
 }
 
 fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
@@ -379,9 +380,7 @@ fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
         let end = rest.find(']')?;
         let host = rest[..end].to_ascii_lowercase();
         let tail = &rest[end + 1..];
-        let port = tail
-            .strip_prefix(':')
-            .and_then(|value| value.parse::<u16>().ok());
+        let port = if tail.is_empty() { None } else { Some(tail.strip_prefix(':')?.parse::<u16>().ok()?) };
         return Some((host, port));
     }
     if let Some((host, port)) = trimmed.rsplit_once(':')
@@ -390,7 +389,7 @@ fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
             if host.is_empty() {
                 return None;
             }
-            let port = port.parse::<u16>().ok();
+            let port = Some(port.parse::<u16>().ok()?);
             return Some((host, port));
         }
     Some((trimmed.to_ascii_lowercase(), None))
@@ -434,10 +433,14 @@ fn origin_matches_forwarded_host(headers: &HeaderMap, origin: &str) -> bool {
     if normalize_host_name(&origin_host) != normalize_host_name(&host_name) {
         return false;
     }
-    match (origin_port, host_port) {
-        (Some(origin_port), Some(host_port)) => origin_port == host_port,
-        _ => true,
-    }
+    // An omitted URL port means 80/443, never "any port". The public Host
+    // without a port likewise denotes the default for the origin's scheme.
+    let default_port = url::Url::parse(origin).ok().and_then(|url| match url.scheme() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    });
+    origin_port.is_some() && origin_port == host_port.or(default_port)
 }
 
 fn constant_time_str_eq(actual: &str, expected: &str) -> bool {
@@ -987,6 +990,40 @@ mod tests {
         assert!(!origin_allowed(&headers, &state, state.port));
     }
 
+    #[tokio::test]
+    async fn portless_cross_origin_post_cannot_clear_pending_jobs() {
+        let temporary = tempfile::tempdir_in("target").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state = test_state();
+        state.port = listener.local_addr().unwrap().port();
+        state.queue = Arc::new(crate::queue::PersistentQueue::new(
+            &temporary.path().join("queue.yaml"),
+        ).unwrap());
+        state.queue.push(crate::queue::JobType::Update, "1").unwrap();
+        let router = super::create_router(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/api/queue/clear", state.port);
+        let response = client.post(&url)
+            .header("Authorization", "Basic dXNlcjpwYXNz")
+            .header("Origin", "http://127.0.0.1")
+            .send().await.unwrap();
+        let status = response.status();
+        let pending = state.queue.pending_count();
+        let same_origin = client.post(&url)
+            .header("Authorization", "Basic dXNlcjpwYXNz")
+            .header("Origin", format!("http://127.0.0.1:{}", state.port))
+            .send().await.unwrap();
+        let same_origin_status = same_origin.status();
+        let remaining = state.queue.pending_count();
+        server.abort();
+        let _ = server.await;
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "pending after cross-origin POST: {pending}");
+        assert_eq!(pending, 1);
+        assert_eq!(same_origin_status, reqwest::StatusCode::OK);
+        assert_eq!(remaining, 0);
+    }
+
     #[test]
     fn reverse_proxy_mode_accepts_forwarded_same_origin_hosts() {
         let state = test_state();
@@ -1008,6 +1045,16 @@ mod tests {
             axum::http::HeaderValue::from_static("https://evil.example.com:8443"),
         );
         assert!(!origin_allowed(&headers, &state, state.port));
+        for (host, origin, expected) in [
+            ("narou.example.com:8443", "https://narou.example.com", false),
+            ("narou.example.com", "https://narou.example.com:8443", false),
+            ("narou.example.com", "https://narou.example.com", true),
+            ("narou.example.com", "https://narou.example.com:443", true),
+        ] {
+            headers.insert(axum::http::header::HOST, host.parse().unwrap());
+            headers.insert(axum::http::header::ORIGIN, origin.parse().unwrap());
+            assert_eq!(origin_allowed(&headers, &state, state.port), expected);
+        }
     }
 
     #[test]

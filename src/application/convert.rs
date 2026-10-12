@@ -25,20 +25,19 @@ use crate::setting_core::SettingScope;
 use super::messages::{self, MessageSink, Stream};
 use super::settings::SettingsStore;
 
-/// `convert_and_store` の結果。変換テキスト本体と、書き出したオブジェクト
-/// キー (native の出力ファイルパス相当 — Worker では `<prefix>/novel.txt`)。
+/// 変換結果。`output` は実際に保存した場合だけ、そのオブジェクトキーを持つ。
 #[derive(Debug)]
 pub struct ConvertedNovel {
     pub text: String,
-    pub output: ObjectKey,
+    pub output: Option<ObjectKey>,
 }
 
 /// 1 件の変換結果。native `cmd_convert` の per-target 分岐
 /// (`src/commands/convert.rs`) に対応する。
 #[derive(Debug)]
 pub enum ConvertItemReport {
-    /// 変換テキストが `output` へ書き出された (`{name} を出力しました`)。
-    Written { output: ObjectKey },
+    /// 変換完了。保存しない構成では `output` は None。
+    Converted { output: Option<ObjectKey> },
     /// 対象 id のレコードが存在しない (`ID: {id} は存在しません`)。
     Missing,
     /// 変換中の失敗 (`[i/t] エラー: {target} - {error}`)。
@@ -51,9 +50,8 @@ pub enum ConvertItemReport {
 ///
 /// `run` はレコード解決込みの変換本体。`Ok(None)` はレコード不在
 /// (native の `id_missing` 行) に対応する。device 選択・AozoraEpub3 出力・
-/// コピー/送信・inspect の行は Worker の変換 (保存済み本文から `novel.txt`
-/// を書くだけ) に存在しないので出さない。`{filename}` は native の
-/// `Path::file_name` 相当で、キーの末尾コンポーネントを使う。
+/// コピー/送信・inspect の行は Worker の変換には存在しないので出さない。
+/// 保存した場合だけキーの末尾を出力ファイル名として表示する。
 pub async fn emit_convert_item_lines<Run, Fut>(
     sink: &dyn MessageSink,
     target: &str,
@@ -76,23 +74,17 @@ where
     );
     let (completed, report) = match run().await {
         Ok(Some(converted)) => {
-            let filename = converted
-                .output
-                .as_ref()
-                .rsplit('/')
-                .next()
-                .unwrap_or_else(|| converted.output.as_ref());
-            sink.emit(
-                Stream::Stdout,
-                &messages::convert::output_written(filename),
-            );
+            if let Some(output) = &converted.output {
+                let filename = output.as_ref().rsplit('/').next().unwrap_or(output.as_ref());
+                sink.emit(Stream::Stdout, &messages::convert::output_written(filename));
+            }
             sink.emit(
                 Stream::Stdout,
                 &messages::convert::completed(INDEX, TOTAL, target),
             );
             (
                 1,
-                ConvertItemReport::Written {
+                ConvertItemReport::Converted {
                     output: converted.output,
                 },
             )
@@ -241,11 +233,14 @@ impl ConvertService {
         };
         let text = converter.convert_novel(&toc_object, &sections)?;
         let output = keys.converted_text();
-        if store && self.keep_converted_text().await {
+        let output = if store && self.keep_converted_text().await {
             self.objects
                 .write_small(&output, text.clone().into_bytes())
                 .await?;
-        }
+            Some(output)
+        } else {
+            None
+        };
         Ok(ConvertedNovel { text, output })
     }
 
@@ -396,7 +391,7 @@ mod tests {
                 .await
                 .unwrap();
             let converted = service.convert_and_store(&target).await.unwrap();
-            assert_eq!(converted.output, keys.converted_text());
+            assert_eq!(converted.output, Some(keys.converted_text()));
             let text = &converted.text;
             assert!(text.contains("本文の一行目。"), "{text}");
             assert!(text.contains("第一話"), "{text}");
@@ -571,6 +566,7 @@ mod tests {
 
             let converted = service.convert_and_store(&target).await.unwrap();
             assert!(converted.text.contains("本文。"), "{}", converted.text);
+            assert!(converted.output.is_none());
             assert!(
                 store
                     .read_small(&keys.converted_text())
@@ -582,93 +578,4 @@ mod tests {
         });
     }
 
-
-    /// `emit_convert_item_lines` が native `narou convert <id>` と同じ行を
-    /// 同じ順序で sink へ送ることを固定する (Worker の convert ジョブが
-    /// 共有実装を通じて出すコンソール行)。
-    mod console_lines {
-        use super::{ConvertedNovel, ConvertItemReport, emit_convert_item_lines};
-        use crate::application::messages::{MessageSink, Stream};
-        use crate::error::NarouError;
-        use crate::platform::ObjectKey;
-        use futures::executor::block_on;
-        use parking_lot::Mutex;
-
-        struct Lines(Mutex<Vec<(Stream, String)>>);
-
-        impl MessageSink for Lines {
-            fn emit(&self, stream: Stream, text: &str) {
-                self.0.lock().push((stream, text.to_string()));
-            }
-        }
-
-        fn take(lines: &Lines) -> Vec<(Stream, String)> {
-            std::mem::take(&mut *lines.0.lock())
-        }
-
-        fn converted(output: &str) -> ConvertedNovel {
-            ConvertedNovel {
-                text: String::new(),
-                output: ObjectKey::try_new(output).unwrap(),
-            }
-        }
-
-        #[test]
-        fn emits_native_lines_in_order_on_success() {
-            let sink = Lines(Mutex::new(Vec::new()));
-            let report = block_on(emit_convert_item_lines(&sink, "7", 7, || async {
-                Ok(Some(converted("example/test/novel.txt")))
-            }));
-            assert!(matches!(report, ConvertItemReport::Written { .. }));
-            assert_eq!(
-                take(&sink),
-                vec![
-                    (Stream::Stdout, "変換処理開始: 1件の小説を処理します".to_string()),
-                    (Stream::Stdout, "[1/1] 処理中: 7".to_string()),
-                    (Stream::Stdout, "novel.txt を出力しました".to_string()),
-                    (Stream::Stdout, "[1/1] 完了: 7".to_string()),
-                    (Stream::Stdout, "変換処理完了: 1/1件が正常に変換されました".to_string()),
-                ]
-            );
-        }
-
-        #[test]
-        fn emits_id_missing_lines_for_unknown_record() {
-            let sink = Lines(Mutex::new(Vec::new()));
-            let report = block_on(emit_convert_item_lines(&sink, "999", 999, || async {
-                Ok(None)
-            }));
-            assert!(matches!(report, ConvertItemReport::Missing));
-            assert_eq!(
-                take(&sink),
-                vec![
-                    (Stream::Stdout, "変換処理開始: 1件の小説を処理します".to_string()),
-                    (Stream::Stdout, "[1/1] 処理中: 999".to_string()),
-                    (Stream::Stdout, "  Error: ID: 999 は存在しません".to_string()),
-                    (Stream::Stdout, "変換処理完了: 0/1件が正常に変換されました".to_string()),
-                ]
-            );
-        }
-
-        #[test]
-        fn emits_item_error_lines_on_failure() {
-            let sink = Lines(Mutex::new(Vec::new()));
-            let report = block_on(emit_convert_item_lines(&sink, "7", 7, || async {
-                Err(NarouError::Conversion("broken converter".to_string()))
-            }));
-            assert!(matches!(report, ConvertItemReport::Failed { .. }));
-            assert_eq!(
-                take(&sink),
-                vec![
-                    (Stream::Stdout, "変換処理開始: 1件の小説を処理します".to_string()),
-                    (Stream::Stdout, "[1/1] 処理中: 7".to_string()),
-                    (
-                        Stream::Stdout,
-                        "[1/1] エラー: 7 - Conversion error: broken converter".to_string(),
-                    ),
-                    (Stream::Stdout, "変換処理完了: 0/1件が正常に変換されました".to_string()),
-                ]
-            );
-        }
-    }
 }

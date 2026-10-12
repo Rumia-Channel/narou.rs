@@ -27,6 +27,7 @@ use super::security::{MAX_REDIRECTS, is_safe_header_value};
 #[derive(Debug, Clone, Default)]
 pub struct FetchPolicy {
     headers: Vec<(String, String)>,
+    cookie_hosts: Vec<String>,
     narou: bool,
     /// Site definition's `min_interval`, applied to the rate-limit scope.
     min_interval: Option<f64>,
@@ -42,8 +43,11 @@ impl FetchPolicy {
         }
         headers.extend(setting.header_list());
         headers.retain(|(name, value)| is_safe_header_name(name) && is_safe_header_value(value));
+        let mut cookie_hosts = setting.login_cookie_hosts.clone();
+        cookie_hosts.push(setting.domain.to_ascii_lowercase());
         Self {
             headers,
+            cookie_hosts,
             narou: setting.is_narou,
             min_interval: setting.min_interval,
         }
@@ -86,6 +90,18 @@ impl FetchPolicy {
 
     pub fn narou(&self) -> bool {
         self.narou
+    }
+
+    fn allows_cookie(&self, url: &str) -> bool {
+        let Ok(url) = url::Url::parse(url) else {
+            return false;
+        };
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        self.cookie_hosts.iter().any(|scope| {
+            host == scope || host.strip_suffix(scope).is_some_and(|prefix| prefix.ends_with('.'))
+        })
     }
 }
 
@@ -228,6 +244,9 @@ pub async fn resolve_final_url_with_body(
     http.validate_url(url).await?;
     let mut current = url::Url::parse(url).map_err(|e| NarouError::Http(e.to_string()))?;
     let mut headers = policy.headers().to_vec();
+    if !policy.allows_cookie(current.as_str()) {
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Cookie"));
+    }
 
     for hop in 0..=MAX_REDIRECTS {
         http.validate_url(current.as_str()).await?;
@@ -294,6 +313,9 @@ pub async fn fetch_bytes(
 
     let mut request = HttpRequest::get(url);
     for (name, value) in policy.headers() {
+        if name.eq_ignore_ascii_case("Cookie") && !policy.allows_cookie(url) {
+            continue;
+        }
         request = request.with_header(name.clone(), value.clone());
     }
 
@@ -551,40 +573,6 @@ headers:
         );
     }
 
-    #[test]
-    fn fetch_policy_drops_the_cookie_when_a_hop_leaves_the_site() {
-        // サイト定義が小文字で Cookie を書いても、サイト外へのホップでは
-        // クッキージャーを落とす。
-        let setting: super::super::site_setting::SiteSetting = serde_yaml::from_str(
-            r#"
-name: Example
-domain: example.com
-top_url: https://example.com
-sitename: Example
-toc_url: https://example.com/\k<ncode>
-headers:
-  cookie: "over18=yes"
-  Referer: https://example.com/
-"#,
-        )
-        .unwrap();
-        let policy = FetchPolicy::for_site(&setting);
-        let mut headers = policy.headers().to_vec();
-
-        assert!(
-            headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("Cookie"))
-        );
-        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Cookie"));
-        assert!(
-            !headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("Cookie")),
-            "cookie should be gone, headers: {headers:?}"
-        );
-        assert!(headers.iter().any(|(name, _)| name == "Referer"));
-    }
 
     #[test]
     fn stop_fallback_on_definitive_errors() {

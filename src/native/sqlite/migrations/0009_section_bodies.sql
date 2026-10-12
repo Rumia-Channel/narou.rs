@@ -1,27 +1,7 @@
--- Rebuild the objects tables under the BLOB+crc32 schema. The first 0008
--- revision stored base64 TEXT without encoding/crc32; rather than convert
--- in place, drop and let `configure`'s empty-table check re-import every
--- file from the filesystem mirror (which always holds the same bytes).
--- Worker D1 databases never saw the base64 revision in production.
-DROP TABLE IF EXISTS object_chunks;
-DROP TABLE IF EXISTS objects;
-
-CREATE TABLE objects (
-    object_key  TEXT PRIMARY KEY,
-    size        INTEGER NOT NULL,
-    updated_at  TEXT NOT NULL,
-    content_type TEXT,
-    encoding    TEXT NOT NULL DEFAULT 'none',
-    crc32       INTEGER NOT NULL DEFAULT 0,
-    data        BLOB
-) WITHOUT ROWID;
-
-CREATE TABLE object_chunks (
-    object_key  TEXT NOT NULL REFERENCES objects(object_key) ON DELETE CASCADE,
-    seq         INTEGER NOT NULL,
-    data        BLOB NOT NULL,
-    PRIMARY KEY (object_key, seq)
-) WITHOUT ROWID;
+-- Preserve objects, including rows without a filesystem mirror.
+-- `migrations::apply_one` converts the original base64 TEXT schema to
+-- BLOB payloads and adds CRC-32 in this transaction. Databases already
+-- using BLOB+crc32 require no object-table changes.
 
 -- Section-body deduplication (P4c): novel_sections and
 -- novel_version_sections previously stored a full body_yaml copy per row,

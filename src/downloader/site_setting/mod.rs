@@ -100,6 +100,9 @@ pub struct SiteSetting {
     pub confirm_over18: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
+    /// Runtime-only credential destinations; never written into site YAML.
+    #[serde(skip)]
+    pub(super) login_cookie_hosts: Vec<String>,
     /// Extra request headers sent with every fetch for this site (e.g. the
     /// `Referer` some image hosts require). Names/values that could inject a
     /// second header are dropped when the policy is built.

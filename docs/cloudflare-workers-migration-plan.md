@@ -606,6 +606,13 @@ npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
   注意: Lite の `image_references` はパス正規化で空セグメントを弾くため `https://…` を参照として
   認識しない。narou.rs 側の URL 対応スキャナ (`epub_lite::illustration_references`) を使うこと
   (AozoraEpub3_Lite 側は無改造)。
+- **S3 の Range 付き存在確認 (2026-10-11 修正)**: `S3Store::stat_object` は `GET` +
+  `Range: bytes=0-0` を使う。取得経路のキャッシュが Range を変更・除去しても SigV4 が壊れない
+  よう、GET では必須ヘッダだけを署名し、Range は署名に含めず送る。`206` と Range が外れた
+  `200` のサイズ取得は従来どおり。PUT の Content-Type 署名・保存キー・索引は変更しない。
+  `tests/s3_range_transport.rs` が、Range の除去・変更・維持と保存画像の読み出しを検証する。
+  Worker のテキストエラー応答は `text/plain; charset=utf-8` とし、ブラウザの文字コード推測で
+  日本語のキーが壊れて見えることも防ぐ。JSON エラーは既存の Content-Type を保つ。
 - **挿絵の取得はダウンロード時の既定パターンまで (2026-10-08 修正)**: Worker では挿絵の実体を
   ダウンロード時にしか取得しないため、サイト定義が `illust_grep_pattern` を持たないサイト
   (なろう / R18なろう / カクヨム / Arcadia) は挿絵が 1 枚も S3 に入らなかった。narou.rb は

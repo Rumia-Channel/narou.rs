@@ -289,7 +289,7 @@ impl NovelConverter {
     /// Site headers/cookie for illustration downloads, replaced whenever the
     /// converter learns which novel (and therefore which site) it is handling.
     #[cfg(feature = "native-runtime")]
-    fn apply_record_fetch_policy(&mut self, record: Option<&NovelRecord>) {
+    pub(crate) fn apply_record_fetch_policy(&mut self, record: Option<&NovelRecord>) {
         let Some(capabilities) = self.capabilities.as_mut() else {
             return;
         };
@@ -410,7 +410,19 @@ impl NovelConverter {
                     section.element.clone()
                 }
             };
-            let digest = self.compute_digest(section);
+            // Hash the actual conversion input as well as the original section.
+            // A failed image fetch must not pin an imageless cache entry after recovery.
+            let mut digest = self.compute_digest(section);
+            if is_html && self.settings.enable_illust {
+                let mut hasher = Sha256::new();
+                hasher.update(digest.as_bytes());
+                hasher.update(resolved_element.introduction.as_bytes());
+                hasher.update([0]);
+                hasher.update(resolved_element.body.as_bytes());
+                hasher.update([0]);
+                hasher.update(resolved_element.postscript.as_bytes());
+                digest = hex::encode(hasher.finalize());
+            }
 
             if let Some(cached) = self.section_cache.get(&digest) {
                 converted_sections.push(cached.clone());
@@ -1604,7 +1616,7 @@ fn rename_legacy_section_convert_cache(path: &Path) -> Result<()> {
 }
 
 #[cfg(feature = "native-runtime")]
-fn load_sections_from_dir(
+pub(crate) fn load_sections_from_dir(
     novel_dir: &std::path::Path,
     subtitles: &[crate::downloader::SubtitleInfo],
 ) -> Result<Vec<crate::downloader::SectionFile>> {

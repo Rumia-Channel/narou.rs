@@ -137,10 +137,7 @@ impl Inventory {
     pub(crate) fn inventory_path(&self, name: &str, scope: InventoryScope) -> PathBuf {
         let dir = match scope {
             InventoryScope::Local => self.root_dir.join(".narou"),
-            InventoryScope::Global => {
-                let home = dirs_home();
-                home.join(".narousetting")
-            }
+            InventoryScope::Global => global_setting_dir(&self.root_dir),
         };
         dir.join(format!("{}.yaml", name))
     }
@@ -582,6 +579,12 @@ pub(crate) fn find_narou_root() -> Result<PathBuf> {
             ));
         }
     }
+}
+
+/// narou.rb prefers a library-local `.narousetting` directory when present.
+pub(crate) fn global_setting_dir(root: &Path) -> PathBuf {
+    let local = root.join(".narousetting");
+    if local.is_dir() { local } else { dirs_home().join(".narousetting") }
 }
 
 fn dirs_home() -> PathBuf {

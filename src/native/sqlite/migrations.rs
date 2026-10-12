@@ -70,6 +70,9 @@ fn apply_one(conn: &mut Connection, version: i64, sql: &str) -> Result<()> {
     let tx = conn.transaction().map_err(|error| {
         NarouError::Platform(format!("sqlite begin migration {version}: {error}"))
     })?;
+    if version == 9 {
+        migrate_legacy_objects(&tx)?;
+    }
     tx.execute_batch(sql)
         .map_err(|error| NarouError::Platform(format!("sqlite migration {version}: {error}")))?;
     tx.pragma_update(None, "user_version", version)
@@ -79,6 +82,94 @@ fn apply_one(conn: &mut Connection, version: i64, sql: &str) -> Result<()> {
     tx.commit().map_err(|error| {
         NarouError::Platform(format!("sqlite commit migration {version}: {error}"))
     })?;
+    Ok(())
+}
+
+/// Upgrade the original base64 schema without relying on filesystem copies.
+/// Process one object at a time; the enclosing migration transaction also
+/// rolls back column additions and converted rows on corrupt legacy input.
+fn migrate_legacy_objects(conn: &Connection) -> Result<()> {
+    use base64::Engine;
+    use rusqlite::OptionalExtension;
+
+    let columns = conn
+        .prepare("PRAGMA table_info(objects)")
+        .map_err(super::sqlite_error)?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(super::sqlite_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(super::sqlite_error)?;
+    if columns.iter().any(|column| column == "crc32") {
+        return Ok(());
+    }
+    if !columns.iter().any(|column| column == "encoding") {
+        conn.execute_batch("ALTER TABLE objects ADD COLUMN encoding TEXT NOT NULL DEFAULT 'none'")
+            .map_err(super::sqlite_error)?;
+    }
+    conn.execute_batch("ALTER TABLE objects ADD COLUMN crc32 INTEGER NOT NULL DEFAULT 0")
+        .map_err(super::sqlite_error)?;
+    let mut cursor = String::new();
+    loop {
+        let object = conn
+            .query_row(
+                "SELECT object_key, size, encoding, data FROM objects
+                 WHERE object_key > ? ORDER BY object_key LIMIT 1",
+                [&cursor],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?)),
+            )
+            .optional()
+            .map_err(super::sqlite_error)?;
+        let Some((key, size, encoding, inline)) = object else {
+            break;
+        };
+        let encoded = match inline {
+            Some(encoded) => encoded,
+            None => {
+                let mut encoded = String::new();
+                let mut statement = conn
+                    .prepare("SELECT data FROM object_chunks WHERE object_key = ? ORDER BY seq")
+                    .map_err(super::sqlite_error)?;
+                let mut rows = statement.query([&key]).map_err(super::sqlite_error)?;
+                while let Some(row) = rows.next().map_err(super::sqlite_error)? {
+                    encoded.push_str(row.get_ref(0).map_err(super::sqlite_error)?
+                        .as_str().map_err(super::sqlite_error)?);
+                }
+                encoded
+            }
+        };
+        let stored = base64::engine::general_purpose::STANDARD.decode(encoded)
+            .map_err(|error| NarouError::Platform(format!("invalid legacy object base64: {error}")))?;
+        let codec = crate::platform::ObjectEncoding::parse(&encoding)?;
+        let decoded;
+        let payload = if codec == crate::platform::ObjectEncoding::None {
+            stored.as_slice()
+        } else {
+            decoded = crate::platform::decompress_object_payload(&stored, codec)?;
+            decoded.as_slice()
+        };
+        if payload.len() as i64 != size {
+            return Err(NarouError::Platform(format!("legacy object size mismatch: {key}")));
+        }
+        let crc32 = crate::platform::object_crc32(payload) as i64;
+        conn.execute("DELETE FROM object_chunks WHERE object_key = ?", [&key])
+            .map_err(super::sqlite_error)?;
+        let chunked = stored.len() > super::object_store::OBJECT_CHUNK_BYTES;
+        conn.execute(
+            "UPDATE objects SET data = ?, crc32 = ? WHERE object_key = ?",
+            rusqlite::params![(!chunked).then_some(stored.as_slice()), crc32, key],
+        ).map_err(super::sqlite_error)?;
+        if chunked {
+            let mut insert = conn.prepare(
+                "INSERT INTO object_chunks (object_key, seq, data) VALUES (?, ?, ?)",
+            ).map_err(super::sqlite_error)?;
+            for (seq, chunk) in stored.chunks(super::object_store::OBJECT_CHUNK_BYTES).enumerate() {
+                insert.execute(rusqlite::params![key, seq as i64, chunk])
+                    .map_err(super::sqlite_error)?;
+            }
+        }
+        cursor = key;
+    }
     Ok(())
 }
 

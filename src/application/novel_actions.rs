@@ -582,11 +582,35 @@ fn validate_tags(tags: &[String]) -> Result<Vec<String>, ApplicationError> {
 
 /// Delete every object under the novel's key prefix, paging through the
 /// store. Returns the first error message on failure.
+///
+/// 挿絵の実体は小説プレフィックス直下ではなく `<prefix>/挿絵/<file>` に
+/// あり、`SplitStore` は一覧をプレフィックスの形だけで挿絵側のストアへ
+/// 振り分ける (小説プレフィックスの一覧はプライマリ側へ行く)。したがって
+/// `asset_backend=s3` の構成では小説プレフィックスの一覧に挿絵が含まれず、
+/// 挿絵側の一覧を明示的に消さないと「削除しました」と報告しながら実体が
+/// 残る。両方のプレフィックスを同じストア (SplitStore) 経由で消す。
 async fn delete_novel_objects(
     objects: &dyn ObjectStore,
     keys: &NovelObjectKeys,
 ) -> Result<(), String> {
-    let prefix = ObjectPrefix::from(keys.prefix().clone());
+    let mut prefixes = vec![ObjectPrefix::from(keys.prefix().clone())];
+    prefixes.push(
+        ObjectPrefix::new(format!("{}/挿絵", keys.prefix().as_ref()))
+            .map_err(|e| e.to_string())?,
+    );
+    for prefix in prefixes {
+        delete_objects_under_prefix(objects, prefix).await?;
+    }
+    Ok(())
+}
+
+/// Delete every object under one prefix, paging through the store. The cursor
+/// contract is strictly "resume after the last returned key", so deleting the
+/// returned keys between pages is safe.
+async fn delete_objects_under_prefix(
+    objects: &dyn ObjectStore,
+    prefix: ObjectPrefix,
+) -> Result<(), String> {
     let mut cursor: Option<String> = None;
     loop {
         let request = ObjectListRequest::new(prefix.clone(), NonZeroUsize::new(100).unwrap());
@@ -780,6 +804,57 @@ mod tests {
         assert_eq!(result.files, vec![(NovelId(1), FileDeletionStatus::Deleted)]);
         assert!(!futures::executor::block_on(objects.exists(&keys.toc())).unwrap());
         assert!(!futures::executor::block_on(objects.exists(&keys.setting())).unwrap());
+    }
+
+    /// `asset_backend=s3` のような分割ストアでは、小説プレフィックスの一覧は
+    /// プライマリ側にしか行かない (SplitStore は `<prefix>/挿絵` の形だけを
+    /// 挿絵側へ回す)。挿絵プレフィックスを明示的に消さないと、実体だけが
+    /// 残ったまま「削除しました」と報告してしまう。
+    #[test]
+    fn remove_with_split_store_deletes_illustration_prefix_too() {
+        let repo = Arc::new(MemoryNovelRepository::from_records(vec![sample_record(1)]));
+        let primary = Arc::new(MemoryObjectStore::new());
+        let illustrations = Arc::new(MemoryObjectStore::new());
+        let split = Arc::new(crate::platform::SplitStore::new(
+            (primary.clone(), primary.clone()),
+            (illustrations.clone(), illustrations.clone()),
+        ));
+        let keys = NovelObjectKeys::new("example", "title 1", false).unwrap();
+        futures::executor::block_on(split.write_small(&keys.toc(), b"toc".to_vec())).unwrap();
+        let illustration = keys.illustration("0001.jpg").unwrap();
+        futures::executor::block_on(
+            crate::platform::AssetStore::write_stream(
+                split.as_ref(),
+                &illustration,
+                Box::pin(futures::stream::iter(vec![Ok(b"jpg".to_vec())])),
+            ),
+        )
+        .unwrap();
+        // 別小説の似た名前のキーは消さない (prefix 境界)。
+        let sibling = ObjectKey::try_new("novels/example/title 12/挿絵2.jpg").unwrap();
+        futures::executor::block_on(primary.write_small(&sibling, b"x".to_vec())).unwrap();
+
+        let service = service(repo.clone(), Some(split.clone()));
+        let result = futures::executor::block_on(service.remove(&RemoveRequest {
+            ids: vec![NovelId(1)],
+            delete_files: true,
+        }))
+        .unwrap();
+        assert_eq!(result.removed, vec![NovelId(1)]);
+        assert_eq!(result.files, vec![(NovelId(1), FileDeletionStatus::Deleted)]);
+        assert!(!futures::executor::block_on(primary.exists(&keys.toc())).unwrap());
+        assert!(
+            futures::executor::block_on(crate::platform::AssetStore::stat(
+                illustrations.as_ref(),
+                &illustration
+            ))
+            .unwrap().is_none(),
+            "挿絵の実体が残っている"
+        );
+        assert!(
+            futures::executor::block_on(primary.exists(&sibling)).unwrap(),
+            "無関係なキーまで消してはいけない"
+        );
     }
 
     #[test]
