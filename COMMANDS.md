@@ -1,6 +1,6 @@
 # narou.rs コマンド互換性ドキュメント
 
-narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `db` (SQLite 管理 DB 保守)・`illust` (挿絵メンテナンス)・`login` (ログイン情報管理) を含む 27 コマンドを網羅する。
+narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `db` (SQLite 管理 DB 保守)・`illust` (挿絵メンテナンス)・`login` (ログイン情報管理)・`author` (作者追跡) を含む 28 コマンドを網羅する。
 
 ---
 
@@ -232,7 +232,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - ソートキーバリデーション（不正キーでエラー+終了コード127）
 - `setting update.sort-by` の select 値を Ruby版 `Narou::UPDATE_SORT_KEYS` と同期済み
 - 小説間インターバル（Ruby版 `Interval` クラス互換）
-- `update.max-parallel-domains` 設定対応（既定4）。対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列にダウンロードする。同一ドメイン内は常に直列のまま処理されるため対サイト礼儀は崩れない。1で従来通りの逐次動作、フォース指定・ウェブモード・ドメインが1種類しかない時は自動的に逐次処理にフォールバック
+- `update.max-parallel-domains` 設定対応（既定4）。対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカーを割り当てて並列にダウンロードする。同一ドメイン内は常に直列のまま処理されるため対サイト礼儀は崩れない。Web UI でも操作ごとの進捗を分離して並列処理する。1で従来通りの逐次動作、フォース指定・ドメインが1種類しかない時は自動的に逐次処理にフォールバック
+- `update.disabled-author-tracking` で、更新終了後の追跡作者からの新作品追加を停止できる。CLI と native Web UI の共通設定一覧から読み書き可能。Worker は永続的作者追跡の実行経路を持たないため、この設定を無効表示し API 保存も拒否する
 - 全件更新時の凍結スキップ、個別指定時の凍結メッセージ
 - 終了コード: エラー数（最大127）、中断時126
 - Ctrl+C 割り込み時はフラグを検知して `アップデートを中断しました` を表示し、終了コード126で終了
@@ -451,6 +452,7 @@ narou setting name         # 読み取り
 | `logging` | boolean | ログ保存 (コンソール出力を `log/` にも追記) |
 | `update.interval` | float | 同一サイトドメインの小説間ウェイト (秒、最小2.5) |
 | `update.strong` | boolean | 同日更新時の内容チェック |
+| `update.disabled-author-tracking` | boolean | native の更新後の作者追跡を停止 (Worker では無効) |
 | `update.convert-only-new-arrival` | boolean | 新着時のみ変換 |
 | `update.sort-by` | select | 更新順ソートキー |
 | `update.max-parallel-domains` | integer | ドメイン別並列DLのワーカー数 (既定4、1で逐次) |
@@ -700,6 +702,12 @@ narou setting name         # 読み取り
 - 個別メニューの「変換」は、その作品 ID だけを `/api/convert` に送る。一覧で未選択でも動作し、要求送信の失敗は通知する（issue #33）。SQLite + Lite の本文のみ／端末出力の両経路は `convert.keep-txt` を接続ロック取得前に読み、CLI の Tokio 文脈からの挿絵取り出しは別スレッドで実行して EPUB 生成まで完了する。
 - 実行中ジョブの中止 API が HTTP 200 の `error` 応答を返した場合も、Web UI は失敗として通知する。
 - 一覧更新が重なった場合は最新の要求だけを反映し、古い応答で削除済み作品・凍結状態・選択状態が巻き戻らないようにする。
+- 並列取得の進捗は操作 ID と更新番号で分離し、完了・再試行・再接続でも他の進行中操作を上書き／消去しない。Worker の出力・詳細ログもジョブごとの文脈で配信する。
+- `download.interval` / `download.wait-steps` は実際の HTTP 送信ごとに、サイト定義の `min_interval` とともに適用する。リダイレクトと通信手段の切替も待機を省略せず、Worker では待機中も設定スナップショットの有効期限までに再確認する。
+- グローバル設定は変更項目だけを初期値照合付きで保存する。整数表記になる浮動小数値も設定メタデータで照合し、実際に競合した変更は拒否する。個別 INI の更新はファイル・SQLite・D1 の原子的更新を通し、同時変更された別項目と未知項目を保持する。
+- コンソール履歴の取得応答は表示世代で照合し、履歴削除や新しい行より古い応答で表示を巻き戻さない。コンソール操作と真偽値設定はキーボード操作に対応する。狭い画面の操作バーは折り返し、メニューを操作ボタンの下へ表示する。
+- 非対応操作は共通 capability で制限し、Worker の一覧内「保存先を開く」ボタンも無効にする。SQLite のオンデマンド EPUB は変換済みテキストの保存 codec を復号して読み、保存異常をキャッシュ欠落として隠さない。
+- Worker の EPUB 挿絵欠落警告は、挿絵が有効で本文に参照があり、実体を 1 枚も解決できない場合だけ表示する。参照のない作品や挿絵無効時には警告しない。
 - `queue_clear` は deadlock しないように永続キュー保存順を修正済み
 - local `update.auto-schedule.enable` / `update.auto-schedule` が有効なら、Ruby版同様に時刻指定で自動アップデートを Web queue に投入する。設定保存時は Ruby版同様に scheduler を stop/start し、サーバ再起動なしで変更を反映する
 - 自動アップデートは `--gl narou` → `modified` タグ対象 → その他小説の順に child `update` を実行し、child stdout/stderr と Web 用構造化進捗を Web UI コンソールへ中継する。実行中 phase の child PID は通常 job と同じ中止処理へ登録する。各 phase 後に Web サーバ側 DB を再読み込みして `modified` タグ検出漏れを防ぐ。`server_setting.current_sort` は Ruby互換に `column` 数値/数値文字列の両方を受理し、対応する `--sort-by` へ引き継ぐ。`last_check_date` も Ruby版同様に自動アップデート/modified 更新の sort key として使える。Web UI からの「全更新」も Ruby版同様に明示的な update-all 扱いとなり、開始メッセージと実際の update 対象順の両方で現在の一覧ソート順を使う。手動の `最新話掲載日確認 + modified 更新` も Ruby版同様に 1 つの `update_general_lastup` job 内で `--gl` と `tag:modified` を直列実行し、queue 詳細ラベルは `update_general_lastup` / `update_by_tag` の legacy cmd をそのまま表示する。Web UI の選択更新/convert/削除は current sort の snapshot を request に添えて server 側でも並べ直し、選択順ではなく現在の一覧ソート順で処理する。Web UI の modified / update_by_tag 系更新は、CLI `update --sort-by` が対応している列 (`id` / `last_update` / `title` / `author` / `general_lastup` / `last_check_date`) では現在の一覧ソート順を引き継ぐ
@@ -720,7 +728,7 @@ narou setting name         # 読み取り
 - Web UI のタグ編集は既存タグ一覧から入力中タグ名に一致する候補を表示し、タグ名クリック検索は `tag:`、作者名クリック検索は `author:`、掲載サイトクリック検索は `sitename:` を生成する。通常クリックは AND、Ctrl クリックは同一フィールド内 OR、Shift クリックは除外 AND、Shift+Ctrl クリックは除外 OR として検索文字列を更新する
 - Web UI のタグ編集モーダルでは各タグの「色」ボタンまたは右クリックから既存の色選択メニューを開ける。変更成功後はタグ一覧・小説一覧・開いている編集モーダルを再取得し、色を即時反映する
 - Web UI の update 系は、ID 選択・タグ条件・modified followup など入口の違いに関わらず、最終的に通常の `update ID...` 実行経路へ合流する。タグ条件は受付時に ID snapshot を確定し、条件自体は queue meta に残す
-- Web UI の `tag` / `freeze` / `remove` 相当操作は、単体・一括とも child CLI の `tag` / `freeze` / `remove` を実行する経路へ合流し、target 解決、`tag_colors.yaml`、`freeze.yaml`、lock チェック等を CLI と同じ処理で扱う。Web の global settings API は複数設定保存・`replace.txt`・スケジューラ再起動を API 側でまとめつつ、設定名スコープ判定・値キャスト・`device` 変更時の派生設定補正を CLI `setting` と共有する `setting_core` に合流する
+- Web UI の `tag` / `freeze` / `remove` 相当操作は、単体・一括とも共通 use-case と native の操作 port を経由し、target 解決、`tag_colors`、凍結状態、lock チェック等を CLI と同じ規則で扱う。global settings API も設定名スコープ判定・値キャスト・`device` の派生設定補正を CLI と同じ `setting_core` へ合流し、`SettingsService` が保存・競合・ACK を管理する。
 - Web UI の単体/一括削除 API は削除成功時に console history へ削除ログを出力する。`concurrency` 有効時は非外部通信として `#console-stdout2`、無効時は `#console` を使う
 - Web UI の CSV ダウンロードは CLI `csv` の stdout を返し、export 項目を CLI と一致させる
 - Web サーバ起動時は Ruby版 `fill_general_all_no_in_database` 相当に、`general_all_no` 未設定レコードの `toc.yaml` を読んで話数をDBへ補完する

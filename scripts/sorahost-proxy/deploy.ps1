@@ -11,12 +11,21 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\sorahost-proxy\deploy.ps1
 param(
     [string]$WorkDir = "$env:TEMP\narou-sorahost-relay",
-    [string]$CurlVersion = "v8.21.0"
+    [string]$CurlVersion,
+    [string]$Start = $env:RELAY_START
 )
 
 $ErrorActionPreference = "Stop"
 $source = Join-Path $PSScriptRoot "server.mjs"
 if (-not (Test-Path $source)) { throw "server.mjs が見つかりません: $source" }
+$protocolSource = Join-Path $PSScriptRoot "worker\protocol.mjs"
+if (-not (Test-Path $protocolSource)) { throw "protocol.mjs が見つかりません: $protocolSource" }
+$toolsPath = Join-Path (Split-Path $PSScriptRoot -Parent) "deploy-tools.json"
+$tools = Get-Content -Raw $toolsPath | ConvertFrom-Json
+if (-not $CurlVersion) { $CurlVersion = $tools.curl_version }
+if (-not $CurlVersion) { throw "deploy-tools.json に curl_version がありません: $toolsPath" }
+$manifest = Get-Content -Raw (Join-Path $PSScriptRoot "sorahost.json") | ConvertFrom-Json
+if ($Start) { $manifest.start = $Start }
 
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 Push-Location $WorkDir
@@ -35,7 +44,12 @@ try {
     Write-Host "ハッシュ検証 OK: $got"
 
     Copy-Item $source . -Force
-    Set-Content -Path sorahost.json -Encoding ascii -Value '{"mode":"node","framework":"node","start":"node server.mjs","include":["server.mjs","curl","cacert.pem"]}'
+    New-Item -ItemType Directory -Force -Path "worker" | Out-Null
+    Copy-Item $protocolSource "worker\protocol.mjs" -Force
+    [System.IO.File]::WriteAllText(
+        (Join-Path (Get-Location).Path "sorahost.json"),
+        ($manifest | ConvertTo-Json -Depth 10) + "`n"
+    )
 
     Write-Host "PteWorker へデプロイします (接続先とデプロイトークンを入力)…"
     npx --yes sorahost-cli deploy

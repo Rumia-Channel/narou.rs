@@ -47,6 +47,7 @@ use narou_rs::application::aliases::{
     ALIAS_INVENTORY_KEY, ALIAS_INVENTORY_SCOPE, parse_alias_map, resolve_alias_target,
 };
 use narou_rs::application::{JobKind, JobPlan, JobTarget};
+use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::platform::NovelId;
 use serde::Deserialize;
 use serde_json::json;
@@ -274,21 +275,26 @@ async fn resolve_plan_target(
 
     // `TargetType::Other` parity: the downloader would try title first, then
     // ncode, against the library. Resolve to the record id now since the
-    // ledger cannot store a title target.
+    // ledger cannot store a title target. `validate_target` が正規化できない
+    // id / ncode / URL 形は ledger 行として表現できないので、native の
+    // unresolved target と同じく拒否する。
+    if !matches!(Downloader::get_target_type(effective), TargetType::Other) {
+        return Err("invalid download target".to_string());
+    }
     // enqueue 判断の材料なので primary + キャッシュ無しで読む。
+    // title→ncode の順は `TargetLookupPlan::DOWNLOAD` が唯一の定義
+    // (この経路は Other 専用なので URL 解決は起きない)。
     let library = &runtime.write_services().library;
-    let existing = match library
-        .find_by_title(effective)
+    let existing = library
+        .resolve_target(
+            narou_rs::application::target_lookup::TargetLookupPlan::DOWNLOAD,
+            aliases,
+            narou_rs::application::target_lookup::UrlSource::Settings(&[]),
+            effective,
+        )
         .await
         .map_err(|error| error.to_string())?
-    {
-        Some(record) => Some(record.id),
-        None => library
-            .find_by_ncode(effective)
-            .await
-            .map_err(|error| error.to_string())?
-            .map(|record| record.id),
-    };
+        .map(|record| record.id);
     match existing {
         Some(id) => Ok(JobTarget::Id(NovelId(id))),
         None => Err("invalid download target".to_string()),

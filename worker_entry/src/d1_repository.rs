@@ -4,12 +4,15 @@ use narou_rs::application::tag_colors::{TagColorStore, TagColors};
 use narou_rs::application::events::FreezeStore;
 use narou_rs::application::novel_actions::FreezeMutationStore;
 use narou_rs::application::settings::SettingsStore;
-use narou_rs::db::novel_codec::{self, fold, NovelBind, NOVEL_SELECT_SQL, NOVEL_UPSERT_SQL};
+use narou_rs::db::novel_codec::{self, fold, NovelBind, NOVEL_UPSERT_SQL};
+use narou_rs::db::novel_query::{
+    self, select_by_id_sql, select_by_ncode_sql, select_by_title_sql, select_by_toc_url_sql,
+    SqlQuery,
+};
 use narou_rs::db::NovelRecord;
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
-    NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSortKey,
-    PlatformFuture, SearchField,
+    NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, PlatformFuture,
 };
 use narou_rs::setting_core::SettingScope;
 use serde::{Deserialize, Serialize};
@@ -60,11 +63,7 @@ impl D1NovelRepository {
 impl NovelRepository for D1NovelRepository {
     fn get<'a>(&'a self, id: NovelId) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
         Box::pin(async move {
-            self.one(
-                &format!("{} WHERE n.id = ? LIMIT 1", select_sql()),
-                vec![BindValue::Int(id.0)],
-            )
-            .await
+            self.one(&select_by_id_sql(), vec![BindValue::Int(id.0)]).await
         })
     }
 
@@ -74,11 +73,7 @@ impl NovelRepository for D1NovelRepository {
     ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
         let folded = fold(url);
         Box::pin(async move {
-            self.one(
-                &format!("{} WHERE n.toc_url_fold = ? ORDER BY n.id LIMIT 1", select_sql()),
-                vec![BindValue::Text(folded)],
-            )
-            .await
+            self.one(&select_by_toc_url_sql(), vec![BindValue::Text(folded)]).await
         })
     }
 
@@ -88,11 +83,7 @@ impl NovelRepository for D1NovelRepository {
     ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
         let folded = fold(title);
         Box::pin(async move {
-            self.one(
-                &format!("{} WHERE n.title_fold = ? ORDER BY n.id LIMIT 1", select_sql()),
-                vec![BindValue::Text(folded)],
-            )
-            .await
+            self.one(&select_by_title_sql(), vec![BindValue::Text(folded)]).await
         })
     }
 
@@ -103,10 +94,7 @@ impl NovelRepository for D1NovelRepository {
         let folded = fold(ncode);
         Box::pin(async move {
             self.one(
-                &format!(
-                    "{} WHERE n.ncode_fold = ? OR substr(rtrim(n.toc_url_fold, '/'), -(length(?) + 1)) = '/' || ? ORDER BY n.id LIMIT 1",
-                    select_sql()
-                ),
+                &select_by_ncode_sql(),
                 vec![
                     BindValue::Text(folded.clone()),
                     BindValue::Text(folded.clone()),
@@ -118,12 +106,9 @@ impl NovelRepository for D1NovelRepository {
     }
 
     fn count<'a>(&'a self, filter: &'a NovelFilter) -> PlatformFuture<'a, Result<u64>> {
-        let built = build_where(filter);
+        let SqlQuery { sql, binds } = novel_query::count_sql(filter, |bind| bind);
         Box::pin(async move {
-            let statement = self.prepare(
-                &format!("SELECT COUNT(*) AS count FROM novels n {}", built.sql),
-                built.binds,
-            )?;
+            let statement = self.prepare(&sql, binds)?;
             let row = statement
                 .first::<CountRow>(None)
                 .await
@@ -135,17 +120,8 @@ impl NovelRepository for D1NovelRepository {
     }
 
     fn query<'a>(&'a self, query: &'a NovelQuery) -> PlatformFuture<'a, Result<Vec<NovelRecord>>> {
-        let mut built = build_where(&query.filter);
-        built.sql.push_str(" ORDER BY ");
-        built.sql.push_str(sort_expression(query.sort.key));
-        built.sql.push(' ');
-        built.sql.push_str(sort_direction(query.sort.key, query.sort.reverse));
-        built.sql.push_str(if query.sort.reverse { ", n.id DESC" } else { ", n.id ASC" });
-        built.sql.push_str(" LIMIT ? OFFSET ?");
-        built.binds.push(BindValue::Int(query.limit as i64));
-        built.binds.push(BindValue::Int(query.offset as i64));
-
-        Box::pin(async move { self.rows(&format!("{} {}", select_sql(), built.sql), built.binds).await })
+        let SqlQuery { sql, binds } = novel_query::query_sql(query, |bind| bind);
+        Box::pin(async move { self.rows(&sql, binds).await })
     }
 
     fn scan_ids<'a>(
@@ -154,18 +130,9 @@ impl NovelRepository for D1NovelRepository {
         after_id: Option<NovelId>,
         limit: usize,
     ) -> PlatformFuture<'a, Result<Vec<NovelId>>> {
-        let mut built = build_where(filter);
-        if let Some(after_id) = after_id {
-            built.sql.push_str(" AND n.id > ?");
-            built.binds.push(BindValue::Int(after_id.0));
-        }
-        built.sql.push_str(" ORDER BY n.id ASC LIMIT ?");
-        built.binds.push(BindValue::Int(limit as i64));
+        let SqlQuery { sql, binds } = novel_query::scan_ids_sql(filter, after_id, limit, |bind| bind);
         Box::pin(async move {
-            let statement = self.prepare(
-                &format!("SELECT n.id FROM novels n {}", built.sql),
-                built.binds,
-            )?;
+            let statement = self.prepare(&sql, binds)?;
             let result = statement.all().await.map_err(worker_error)?;
             let rows: Vec<IdRow> = result.results().map_err(worker_error)?;
             Ok(rows.into_iter().map(|row| NovelId(row.id)).collect())
@@ -174,14 +141,8 @@ impl NovelRepository for D1NovelRepository {
 
     fn allocate_id(&self) -> PlatformFuture<'_, Result<NovelId>> {
         Box::pin(async move {
-            let update = self.prepare(
-                "UPDATE novel_id_sequence SET next_id = next_id + 1 WHERE id = 1",
-                Vec::new(),
-            )?;
-            let select = self.prepare(
-                "SELECT next_id - 1 AS id FROM novel_id_sequence WHERE id = 1",
-                Vec::new(),
-            )?;
+            let update = self.prepare(novel_query::ALLOCATE_STEP_SQL, Vec::new())?;
+            let select = self.prepare(novel_query::ALLOCATE_READ_SQL, Vec::new())?;
             let results = self.db.batch(vec![update, select]).await.map_err(worker_error)?;
             ensure_batch_success(&results)?;
             let row: SequenceRow = results
@@ -217,14 +178,14 @@ impl NovelRepository for D1NovelRepository {
                         novel_codec::dedup_tags(&mut normalized.tags);
                         let record = &normalized;
                         let max_id = record.id.saturating_add(1);
-                        statements.push(self.prepare(UPSERT_SQL, record_binds(record)?)?);
+                        statements.push(self.prepare(NOVEL_UPSERT_SQL, record_binds(record)?)?);
                         statements.push(self.prepare(
-                            "DELETE FROM novel_tags WHERE novel_id = ?",
+                            novel_query::DELETE_NOVEL_TAGS_SQL,
                             vec![BindValue::Int(record.id)],
                         )?);
                         for (position, tag) in record.tags.iter().enumerate() {
                             statements.push(self.prepare(
-                                "INSERT INTO novel_tags (novel_id, position, tag, tag_fold) VALUES (?, ?, ?, ?)",
+                                novel_query::INSERT_NOVEL_TAG_SQL,
                                 vec![
                                     BindValue::Int(record.id),
                                     BindValue::Int(position as i64),
@@ -233,21 +194,18 @@ impl NovelRepository for D1NovelRepository {
                                 ],
                             )?);
                         }
-                        let refresh_status = format!(
-                            "UPDATE novels AS n SET status_sort = {STATUS_SORT_EXPRESSION} WHERE n.id = ?"
-                        );
                         statements.push(self.prepare(
-                            &refresh_status,
+                            &novel_query::refresh_status_sort_sql(),
                             vec![BindValue::Int(record.id)],
                         )?);
                         statements.push(self.prepare(
-                            "UPDATE novel_id_sequence SET next_id = CASE WHEN next_id < ? THEN ? ELSE next_id END WHERE id = 1",
+                            novel_query::BUMP_SEQUENCE_SQL,
                             vec![BindValue::Int(max_id), BindValue::Int(max_id)],
                         )?);
                     }
                     NovelMutation::Remove(id) => {
                         statements.push(self.prepare(
-                            "DELETE FROM novels WHERE id = ?",
+                            novel_query::DELETE_NOVEL_SQL,
                             vec![BindValue::Int(id.0)],
                         )?);
                     }
@@ -335,11 +293,8 @@ impl FreezeMutationStore for D1FreezeStore {
                     self.db.prepare(sql),
                     vec![BindValue::Int(id.0)],
                 )?);
-                let refresh_status = format!(
-                    "UPDATE novels AS n SET status_sort = {STATUS_SORT_EXPRESSION} WHERE n.id = ?"
-                );
                 statements.push(bind_statement(
-                    self.db.prepare(&refresh_status),
+                    self.db.prepare(&novel_query::refresh_status_sort_sql()),
                     vec![BindValue::Int(id.0)],
                 )?);
             }
@@ -362,10 +317,6 @@ static SETTINGS_CACHE: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
 const GLOBAL_REPLACE_SCOPE: &str = "global_replace";
 const GLOBAL_REPLACE_KEY: &str = "replace.txt";
-const TAG_COLORS_SCOPE: &str = "inv";
-const TAG_COLORS_KEY: &str = "tag_colors";
-const LEGACY_TAG_COLORS_SCOPE: &str = "tag_colors";
-const LEGACY_TAG_COLORS_KEY: &str = "colors";
 const TAG_COLORS_CACHE_KEY: &str = "inv/tag_colors";
 
 #[derive(Debug, Clone)]
@@ -552,30 +503,29 @@ impl SettingsStore for D1SettingsStore {
     }
 }
 
+mod tag_colors;
+
+use tag_colors::{TagColorRow, TagColorSnapshot};
+
 #[derive(Debug, Clone)]
 pub struct D1TagColorStore {
     db: DbHandle,
-    /// `Self::for_writes` は `load` がキャッシュを介さず読む
-    /// (`TagColorService::set` は load→save の read-modify-write なので、
-    /// 変更要件の読み取りで古い色表を使わないため)。
-    fresh_reads: bool,
 }
 
 impl D1TagColorStore {
     pub fn new(db: DbHandle) -> Self {
-        Self {
-            db,
-            fresh_reads: false,
-        }
+        Self { db }
     }
 
-    /// 更新系の読み取り用。`load` が isolate キャッシュを介さずハンドル先を
-    /// 読む。
-    pub fn for_writes(db: DbHandle) -> Self {
-        Self {
-            db,
-            fresh_reads: true,
-        }
+    async fn current_rows(db: &DbHandle) -> Result<TagColorSnapshot> {
+        let rows: Vec<TagColorRow> = db
+            .prepare(tag_colors::READ_SQL)
+            .all()
+            .await
+            .map_err(worker_error)?
+            .results()
+            .map_err(worker_error)?;
+        Ok(TagColorSnapshot::from_rows(rows))
     }
 }
 
@@ -585,93 +535,54 @@ static TAG_COLORS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<TagCol
 
 impl TagColorStore for D1TagColorStore {
     fn load<'a>(&'a self) -> PlatformFuture<'a, Result<TagColors>> {
-        let fresh_reads = self.fresh_reads;
         Box::pin(async move {
-            if !fresh_reads && let Some(cached) = TAG_COLORS_CACHE.get(TAG_COLORS_CACHE_KEY) {
+            if let Some(cached) = TAG_COLORS_CACHE.get(TAG_COLORS_CACHE_KEY) {
                 return Ok(cached);
             }
-            let rows: Vec<TagColorRow> = self
-                .db
-                .prepare(
-                    "SELECT scope, value_yaml, value_json FROM app_state
-                     WHERE (scope = ? AND key = ?) OR (scope = ? AND key = ?)",
-                )
-                .bind(&[
-                    JsValue::from_str(TAG_COLORS_SCOPE),
-                    JsValue::from_str(TAG_COLORS_KEY),
-                    JsValue::from_str(LEGACY_TAG_COLORS_SCOPE),
-                    JsValue::from_str(LEGACY_TAG_COLORS_KEY),
-                ])
-                .map_err(worker_error)?
-                .all()
-                .await
-                .map_err(worker_error)?
-                .results()
-                .map_err(worker_error)?;
-
-            let mut canonical = TagColors::default();
-            let mut legacy = None;
-            for row in rows {
-                let colors = parse_tag_colors_row(row.value_yaml.as_deref(), row.value_json.as_deref())?;
-                if row.scope == TAG_COLORS_SCOPE {
-                    canonical = colors;
-                } else if row.scope == LEGACY_TAG_COLORS_SCOPE {
-                    legacy = Some(colors);
-                }
+            let colors = Self::current_rows(&self.db).await?.colors()?;
+            // A primary update may have populated the cache while this
+            // read-only replica request was in flight.
+            if let Some(cached) = TAG_COLORS_CACHE.get(TAG_COLORS_CACHE_KEY) {
+                return Ok(cached);
             }
-
-            let colors = if let Some(legacy) = legacy {
-                let colors = merge_tag_colors(legacy, canonical);
-                self.save_canonical_tag_colors(&colors).await?;
-                colors
-            } else {
-                canonical
-            };
             TAG_COLORS_CACHE.put(TAG_COLORS_CACHE_KEY, colors.clone());
             Ok(colors)
         })
     }
 
-    fn save<'a>(&'a self, colors: &'a TagColors) -> PlatformFuture<'a, Result<()>> {
+    fn update<'a>(
+        &'a self,
+        update: narou_rs::application::tag_colors::TagColorUpdate,
+    ) -> PlatformFuture<'a, Result<TagColors>> {
         Box::pin(async move {
-            self.save_canonical_tag_colors(colors).await?;
-            TAG_COLORS_CACHE.invalidate(TAG_COLORS_CACHE_KEY);
-            Ok(())
+            let primary = self.db.primary_view();
+            for _ in 0..4 {
+                let snapshot = Self::current_rows(&primary).await?;
+                let mut colors = snapshot.colors()?;
+                narou_rs::application::tag_colors::apply_tag_color_update(&mut colors, &update);
+                let value_yaml = colors.to_yaml_string().map_err(|error| {
+                    NarouError::Platform(format!("cannot serialize D1 tag colors: {error}"))
+                })?;
+                let upsert = bind_statement(
+                    primary.prepare(tag_colors::UPDATE_SQL),
+                    snapshot.into_update_binds(value_yaml),
+                )?;
+                let remove_legacy = primary.prepare(tag_colors::REMOVE_LEGACY_SQL);
+                let results = primary.batch(vec![upsert, remove_legacy]).await.map_err(worker_error)?;
+                ensure_batch_success(&results)?;
+                let cas_result = results.first().ok_or_else(|| {
+                    NarouError::Platform("D1 tag color update batch returned no results".to_string())
+                })?;
+                if !cas_result.results::<JsonValue>().map_err(worker_error)?.is_empty() {
+                    TAG_COLORS_CACHE.invalidate(TAG_COLORS_CACHE_KEY);
+                    TAG_COLORS_CACHE.put(TAG_COLORS_CACHE_KEY, colors.clone());
+                    return Ok(colors);
+                }
+            }
+            Err(NarouError::Platform(
+                "D1 tag color update conflicted after four attempts".to_string(),
+            ))
         })
-    }
-}
-
-impl D1TagColorStore {
-    async fn save_canonical_tag_colors(&self, colors: &TagColors) -> Result<()> {
-        let value = serde_yaml::to_string(&colors.clone().into_map()).map_err(|error| {
-            NarouError::Platform(format!("cannot serialize D1 tag colors: {error}"))
-        })?;
-        let upsert = bind_statement(
-            self.db.prepare(
-                "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, '{}')
-                 ON CONFLICT(scope, key) DO UPDATE SET
-                   value_yaml = excluded.value_yaml, value_json = '{}'",
-            ),
-            vec![
-                BindValue::Text(TAG_COLORS_SCOPE.to_string()),
-                BindValue::Text(TAG_COLORS_KEY.to_string()),
-                BindValue::Text(value),
-            ],
-        )?;
-        let remove_legacy = bind_statement(
-            self.db.prepare("DELETE FROM app_state WHERE scope = ? AND key = ?"),
-            vec![
-                BindValue::Text(LEGACY_TAG_COLORS_SCOPE.to_string()),
-                BindValue::Text(LEGACY_TAG_COLORS_KEY.to_string()),
-            ],
-        )?;
-        ensure_batch_success(
-            &self
-                .db
-                .batch(vec![upsert, remove_legacy])
-                .await
-                .map_err(worker_error)?,
-        )
     }
 }
 
@@ -813,12 +724,6 @@ struct StateYamlRow {
     value_yaml: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct TagColorRow {
-    scope: String,
-    value_yaml: Option<String>,
-    value_json: Option<String>,
-}
 
 fn parse_extra_fields(value: &str) -> Result<BTreeMap<String, YamlValue>> {
     if value.len() > MAX_EXTRA_FIELDS_BYTES {
@@ -859,194 +764,30 @@ fn parse_setting_value(value_yaml: &str, legacy_value_json: &str) -> Result<Yaml
     }
 }
 
-fn parse_tag_colors_row(value_yaml: Option<&str>, value_json: Option<&str>) -> Result<TagColors> {
-    if let Some(yaml) = value_yaml.filter(|value| !value.trim().is_empty() && value.trim() != "{}") {
-        return parse_tag_colors_payload(yaml);
-    }
-    if let Some(json) = value_json.filter(|value| !value.trim().is_empty() && value.trim() != "{}") {
-        return parse_tag_colors_payload(json);
-    }
-    if let Some(yaml) = value_yaml {
-        return parse_tag_colors_payload(yaml);
-    }
-    Ok(TagColors::default())
-}
-
-fn parse_tag_colors_payload(payload: &str) -> Result<TagColors> {
-    let value: YamlValue = serde_yaml::from_str(payload)
-        .map_err(|error| NarouError::Platform(format!("invalid D1 tag colors: {error}")))?;
-    let mut colors = TagColors::default();
-    if let Some(mapping) = value.as_mapping() {
-        for (tag, color) in mapping {
-            if let (Some(tag), Some(color)) = (tag.as_str(), color.as_str()) {
-                colors.set(tag, color);
-            }
-        }
-    }
-    Ok(colors)
-}
-
-fn merge_tag_colors(legacy: TagColors, canonical: TagColors) -> TagColors {
-    let mut merged = legacy.into_map();
-    merged.extend(canonical.into_map());
-    let mut colors = TagColors::default();
-    for (tag, color) in merged {
-        colors.set(&tag, &color);
-    }
-    colors
-}
 
 fn record_binds(record: &NovelRecord) -> Result<Vec<BindValue>> {
     let binds = novel_codec::novel_binds(record)?;
     novel_codec::check_extra_fields_limit(&binds, MAX_EXTRA_FIELDS_BYTES)?;
     // Positional order comes from the SQL itself, never from list order here —
     // a name that does not match the UPSERT columns fails instead of skewing.
-    Ok(novel_codec::ordered_binds(UPSERT_SQL, &binds)?
+    Ok(novel_codec::ordered_binds(NOVEL_UPSERT_SQL, &binds)?
         .into_iter()
         .map(|(_, value)| value.clone())
         .collect())
-}
-
-const UPSERT_SQL: &str = NOVEL_UPSERT_SQL;
-
-fn select_sql() -> &'static str {
-    NOVEL_SELECT_SQL
-}
-
-struct WhereBuilder {
-    sql: String,
-    binds: Vec<BindValue>,
-}
-
-fn build_where(filter: &NovelFilter) -> WhereBuilder {
-    let mut builder = WhereBuilder {
-        sql: "WHERE 1=1".to_string(),
-        binds: Vec::new(),
-    };
-    if let Some(ids) = &filter.ids {
-        if ids.is_empty() {
-            // An explicitly empty id set is "match nothing", not "no filter".
-            builder.sql.push_str(" AND 0=1");
-        } else {
-            let json = serde_json::to_string(&ids.iter().map(|id| id.0).collect::<Vec<_>>())
-                .expect("serializing integer ids cannot fail");
-            builder
-                .sql
-                .push_str(" AND n.id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))");
-            builder.binds.push(BindValue::Text(json));
-        }
-    }
-    if let Some(keyword) = &filter.keyword {
-        let keyword = fold(keyword);
-        let json = serde_json::to_string(&[keyword]).expect("serializing a folded keyword cannot fail");
-        builder.sql.push_str(
-            " AND EXISTS (SELECT 1 FROM json_each(?) WHERE instr(n.title_fold, value) > 0 OR instr(n.author_fold, value) > 0)",
-        );
-        builder.binds.push(BindValue::Text(json));
-    }
-    if let Some(site) = &filter.site {
-        builder.sql.push_str(" AND n.sitename_fold = ?");
-        builder.binds.push(BindValue::Text(fold(site)));
-    }
-    if let Some(domain) = &filter.domain {
-        builder.sql.push_str(" AND n.domain_fold = ?");
-        builder.binds.push(BindValue::Text(fold(domain)));
-    }
-    if let Some(tag) = &filter.tag {
-        builder.sql.push_str(" AND EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = ?)");
-        builder.binds.push(BindValue::Text(tag.clone()));
-    }
-    if let Some(ncode) = &filter.ncode {
-        builder.sql.push_str(" AND n.ncode_fold = ?");
-        builder.binds.push(BindValue::Text(fold(ncode)));
-    }
-    if let Some(is_narou) = filter.is_narou {
-        builder.sql.push_str(" AND n.is_narou = ?");
-        builder.binds.push(BindValue::Int(is_narou as i64));
-    }
-    if let Some(suspend) = filter.suspend {
-        builder.sql.push_str(" AND n.suspend = ?");
-        builder.binds.push(BindValue::Int(suspend as i64));
-    }
-    if let Some(novel_type) = filter.novel_type {
-        builder.sql.push_str(" AND n.novel_type = ?");
-        builder.binds.push(BindValue::Int(i64::from(novel_type)));
-    }
-    if let Some(end) = filter.end {
-        builder.sql.push_str(" AND n.end = ?");
-        builder.binds.push(BindValue::Int(end as i64));
-    }
-    for term in &filter.terms {
-        if term.values.is_empty() {
-            builder.sql.push_str(if term.negated { " AND 1=1" } else { " AND 0=1" });
-            continue;
-        }
-        let values = term.values.iter().map(|value| fold(value)).collect::<Vec<_>>();
-        let json = serde_json::to_string(&values).expect("serializing folded term values cannot fail");
-        builder.sql.push_str(if term.negated {
-            " AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE "
-        } else {
-            " AND EXISTS (SELECT 1 FROM json_each(?) WHERE "
-        });
-        builder.sql.push_str(&term_expression(term.field));
-        builder.sql.push(')');
-        builder.binds.push(BindValue::Text(json));
-    }
-    builder
-}
-
-fn term_expression(field: SearchField) -> String {
-    match field {
-        SearchField::Title => "instr(n.title_fold, value) > 0".to_string(),
-        SearchField::Author => "instr(n.author_fold, value) > 0".to_string(),
-        SearchField::Site => "instr(n.sitename_fold, value) > 0".to_string(),
-        SearchField::Tag => "instr(n.tags_fold, value) > 0".to_string(),
-        SearchField::Status => format!("instr({STATUS_SEARCH_EXPRESSION}, value) > 0"),
-        SearchField::Any => format!(
-            "instr(n.title_fold, value) > 0 OR instr(n.author_fold, value) > 0 OR instr(n.sitename_fold, value) > 0 OR instr(n.tags_fold, value) > 0 OR instr({STATUS_SEARCH_EXPRESSION}, value) > 0 OR instr(n.ncode_fold, value) > 0 OR (instr(value, '://') > 0 AND instr(n.toc_url_fold, rtrim(value, '/')) > 0) OR substr(rtrim(n.toc_url_fold, '/'), -(length(value) + 1)) = '/' || value OR CAST(n.id AS TEXT) = value"
-        ),
-    }
-}
-const STATUS_SEARCH_EXPRESSION: &str = "(CASE WHEN EXISTS (SELECT 1 FROM frozen_novels f WHERE f.novel_id = n.id) OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag_fold = 'frozen') THEN '凍結' ELSE '' END || CASE WHEN (EXISTS (SELECT 1 FROM frozen_novels f WHERE f.novel_id = n.id) OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag_fold = 'frozen')) AND (n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end')) THEN ', ' ELSE '' END || CASE WHEN n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end') THEN '完結' ELSE '' END || CASE WHEN (EXISTS (SELECT 1 FROM frozen_novels f WHERE f.novel_id = n.id) OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag_fold = 'frozen') OR n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end')) AND EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404') THEN ', ' ELSE '' END || CASE WHEN EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404') THEN '削除' ELSE '' END || CASE WHEN (EXISTS (SELECT 1 FROM frozen_novels f WHERE f.novel_id = n.id) OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag_fold = 'frozen') OR n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end') OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404')) AND n.suspend <> 0 THEN ', ' ELSE '' END || CASE WHEN n.suspend <> 0 THEN '中断' ELSE '' END)";
-
-const STATUS_SORT_EXPRESSION: &str = "(CASE WHEN n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end') THEN '完結' ELSE '' END || CASE WHEN (n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end')) AND EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404') THEN ', ' ELSE '' END || CASE WHEN EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404') THEN '削除' ELSE '' END || CASE WHEN (n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end') OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404')) AND n.suspend <> 0 THEN ', ' ELSE '' END || CASE WHEN n.suspend <> 0 THEN '中断' ELSE '' END)";
-
-/// SQL NULL ordering for a sort key, mirroring the native comparators:
-/// `new_arrivals_date` uses `Option::cmp` (None < Some), every other optional
-/// key uses `compare_optional` (Some < None).
-fn sort_direction(key: NovelSortKey, reverse: bool) -> &'static str {
-    match (key, reverse) {
-        (NovelSortKey::NewArrivalsDate, false) => "ASC NULLS FIRST",
-        (NovelSortKey::NewArrivalsDate, true) => "DESC NULLS LAST",
-        (_, false) => "ASC NULLS LAST",
-        (_, true) => "DESC NULLS FIRST",
-    }
-}
-
-fn sort_expression(key: NovelSortKey) -> &'static str {
-    match key {
-        NovelSortKey::Id => "n.id",
-        NovelSortKey::LastUpdate => "n.last_update",
-        NovelSortKey::GeneralLastup => "n.general_lastup",
-        NovelSortKey::LastCheckDate => "n.last_check_date",
-        NovelSortKey::Title => "n.title_fold",
-        NovelSortKey::Author => "n.author_fold",
-        NovelSortKey::SiteName => "n.sitename_fold",
-        NovelSortKey::NovelType => "n.novel_type",
-        NovelSortKey::Tags => "n.tags_sort",
-        NovelSortKey::GeneralAllNo => "n.general_all_no",
-        NovelSortKey::Length => "n.length",
-        NovelSortKey::Status => "n.status_sort",
-        NovelSortKey::TocUrl => "n.toc_url_fold",
-        NovelSortKey::NewArrivalsDate => "n.new_arrivals_date",
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
-    use narou_rs::platform::{SearchTerm, SearchField};
+    use narou_rs::db::novel_query::{self, select_sql, sort_direction, WhereSql};
+    use narou_rs::platform::{NovelSortKey, SearchField, SearchTerm};
+
+    /// D1's bind type *is* the shared [`NovelBind`], so the tests below run the
+    /// same builder the native adapter runs, with the identity conversion.
+    fn build_where(filter: &NovelFilter) -> WhereSql<BindValue> {
+        novel_query::build_where(filter, |bind| bind)
+    }
 
     fn ids_filter(ids: Option<Vec<i64>>) -> NovelFilter {
         NovelFilter {
@@ -1055,7 +796,7 @@ mod tests {
         }
     }
 
-    fn ids_bind(built: &WhereBuilder) -> Vec<i64> {
+    fn ids_bind(built: &WhereSql<BindValue>) -> Vec<i64> {
         match &built.binds[0] {
             BindValue::Text(json) => {
                 serde_json::from_str(json).expect("ids bind must be a JSON array")
@@ -1384,7 +1125,7 @@ mod tests {
         ]));
         let binds = record_binds(&record).unwrap();
         assert_eq!(binds.len(), 36);
-        assert_eq!(UPSERT_SQL.matches('?').count(), 36);
+        assert_eq!(NOVEL_UPSERT_SQL.matches('?').count(), 36);
         let BindValue::Text(yaml) = &binds[32] else {
             panic!("extra fields bind must be text");
         };
@@ -1408,30 +1149,31 @@ mod tests {
     }
 
     #[test]
-    fn tag_colors_use_native_yaml_mapping_and_merge_legacy_worker_rows() {
-        let canonical = parse_tag_colors_payload("shared: blue\ncurrent: green\n").unwrap();
-        let legacy = parse_tag_colors_row(
+    fn tag_colors_merge_legacy_rows_before_canonical_without_hash_order() {
+        let canonical = tag_colors::parse_tag_colors_payload("shared: blue\ncurrent: green\n").unwrap();
+        let legacy = tag_colors::parse_tag_colors_row(
             Some("{}"),
             Some(r#"{"shared":"red","legacy":"yellow"}"#),
         )
         .unwrap();
-        let merged = merge_tag_colors(legacy, canonical);
+        let mut merged = legacy;
+        merged.merge(&canonical);
         assert_eq!(merged.color_for("shared"), Some("blue"));
         assert_eq!(merged.color_for("current"), Some("green"));
         assert_eq!(merged.color_for("legacy"), Some("yellow"));
 
-        let persisted = serde_yaml::to_string(&merged.clone().into_map()).unwrap();
-        let value: YamlValue = serde_yaml::from_str(&persisted).unwrap();
-        assert!(value.is_mapping());
-        assert_eq!(parse_tag_colors_payload(&persisted).unwrap().color_for("legacy"), Some("yellow"));
+        let persisted = merged.to_yaml_string().unwrap();
+        let reloaded = tag_colors::parse_tag_colors_payload(&persisted).unwrap();
+        assert_eq!(reloaded.color_for("legacy"), Some("yellow"));
+        assert_eq!(reloaded.color_for("shared"), Some("blue"));
     }
 
     #[test]
     fn sql_targets_yaml_columns() {
         assert!(select_sql().contains("n.extra_fields_yaml"));
         assert!(!select_sql().contains("extra_fields_json"));
-        assert!(UPSERT_SQL.contains("extra_fields_yaml"));
-        assert!(!UPSERT_SQL.contains("extra_fields_json"));
-        assert!(UPSERT_SQL.contains("extra_fields_bytes"));
+        assert!(NOVEL_UPSERT_SQL.contains("extra_fields_yaml"));
+        assert!(!NOVEL_UPSERT_SQL.contains("extra_fields_json"));
+        assert!(NOVEL_UPSERT_SQL.contains("extra_fields_bytes"));
     }
 }

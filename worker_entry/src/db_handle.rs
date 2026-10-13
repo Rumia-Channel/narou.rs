@@ -24,7 +24,10 @@ pub enum DbHandle {
     /// すべてのクエリが primary に行く経路。
     Primary(Arc<D1Database>),
     /// read replication 対象。読み取りは replica、書き込みは primary。
-    Session(Arc<D1DatabaseSession>),
+    Session {
+        db: Arc<D1Database>,
+        session: Arc<D1DatabaseSession>,
+    },
 }
 
 impl DbHandle {
@@ -35,9 +38,21 @@ impl DbHandle {
 
     /// `first-unconstrained` セッション。read replication 未設定の DB でも
     /// 安全に動く (その場合は従来どおり primary が応答する)。
-    pub fn unconstrained(db: &D1Database) -> worker::Result<Self> {
+    pub fn unconstrained(db: &Arc<D1Database>) -> worker::Result<Self> {
         db.with_session_constraint(D1SessionConstraint::FirstUnconstrained)
-            .map(|session| Self::Session(Arc::new(session)))
+            .map(|session| Self::Session {
+                db: Arc::clone(db),
+                session: Arc::new(session),
+            })
+    }
+
+    /// Retain the original primary binding for atomic write-source reads,
+    /// without opening a session or changing this handle's read routing.
+    pub fn primary_view(&self) -> Self {
+        let db = match self {
+            Self::Primary(db) | Self::Session { db, .. } => Arc::clone(db),
+        };
+        Self::Primary(db)
     }
 
     /// UI 経路用のハンドル。セッションを優先し、生成に失敗した場合は
@@ -59,7 +74,7 @@ impl DbHandle {
     pub fn prepare<T: Into<String>>(&self, query: T) -> D1PreparedStatement {
         match self {
             Self::Primary(db) => db.prepare(query),
-            Self::Session(session) => session.prepare(query),
+            Self::Session { session, .. } => session.prepare(query),
         }
     }
 
@@ -69,7 +84,7 @@ impl DbHandle {
     ) -> worker::Result<Vec<D1Result>> {
         match self {
             Self::Primary(db) => db.batch(statements).await,
-            Self::Session(session) => session.batch(statements).await,
+            Self::Session { session, .. } => session.batch(statements).await,
         }
     }
 }

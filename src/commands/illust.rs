@@ -237,8 +237,7 @@ fn run_s3_dedup(force: bool) -> Result<(), String> {
             // hex 名だけが pool へ寄る (非 hex は小説ごとの配置のまま)。
             let file = key.as_ref().rsplit('/').next().unwrap_or("");
             let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
-            let is_hex = stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit());
-            if !is_hex {
+            if !illustration_store::is_sha256_hex_stem(stem) {
                 skipped_non_hex += 1;
                 continue;
             }

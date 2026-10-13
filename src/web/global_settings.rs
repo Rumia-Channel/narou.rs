@@ -20,8 +20,8 @@ pub async fn save_global_settings(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let effects = match settings_view::apply_save(&state.services.settings, &body).await {
-        Ok(effects) => effects,
+    let result = match settings_view::apply_save(&state.services.settings, &body).await {
+        Ok(result) => result,
         Err(error) => {
             let conflict = matches!(&error, crate::application::ApplicationError::Conflict(_));
             return (if conflict { StatusCode::CONFLICT } else { StatusCode::OK }, Json(serde_json::json!({
@@ -31,12 +31,17 @@ pub async fn save_global_settings(
             }))).into_response();
         }
     };
+    let effects = &result.effects;
+    let mut response = settings_view::save_response(&result);
+    response["reboot"] = serde_json::json!(false);
+    response["requires_restart"] = serde_json::json!(effects.contains(&SettingsEffect::StorageRestartRequired));
 
     if effects
         .iter()
         .any(|effect| matches!(effect, SettingsEffect::AutoScheduleChanged))
     {
         let started = crate::web::scheduler::start_or_restart_auto_update_scheduler(
+            state.services.scheduler.clone(),
             state.queue.clone(),
             state.running_jobs.clone(),
             state.push_server.clone(),
@@ -70,29 +75,20 @@ pub async fn save_global_settings(
         }
     }
 
-    if effects.contains(&SettingsEffect::StorageRestartRequired) {
-        return match super::jobs::schedule_server_reboot(state.clone()).await {
+    if result.failure.is_none() && effects.contains(&SettingsEffect::StorageRestartRequired) {
+        match super::jobs::schedule_server_reboot(state.clone()).await {
             Ok(()) => {
                 state.push_server.broadcast_event("reboot", "");
-                Json(serde_json::json!({
-                    "success": true,
-                    "reboot": true,
-                    "requires_restart": true,
-                    "message": crate::native::application::STORAGE_RESTART_REQUIRED_NOTE,
-                })).into_response()
+                response["reboot"] = serde_json::json!(true);
+                response["message"] = serde_json::json!(crate::native::application::STORAGE_RESTART_REQUIRED_NOTE);
             }
-            Err(error) => Json(serde_json::json!({
-                "success": true,
-                "reboot": false,
-                "requires_restart": true,
-                "message": format!("設定を保存しました。再起動の開始に失敗したため手動で再起動してください: {error}"),
-            })).into_response(),
-        };
+            Err(error) => {
+                response["message"] = serde_json::json!(
+                    format!("設定を保存しました。再起動の開始に失敗したため手動で再起動してください: {error}")
+                );
+            }
+        }
     }
-    Json(serde_json::json!({
-        "success": true,
-        "reboot": false,
-        "requires_restart": false,
-        "message": settings_view::SAVE_MESSAGE,
-    })).into_response()
+    let status = if response["conflict"] == true { StatusCode::CONFLICT } else { StatusCode::OK };
+    (status, Json(response)).into_response()
 }

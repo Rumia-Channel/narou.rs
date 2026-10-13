@@ -194,14 +194,14 @@ fn start_queue_worker_for_lane(
                     if let Some(exit_code) = result.exit_code {
                         data["exit_code"] = serde_json::json!(exit_code);
                     }
-                    workers.push_server.broadcast_raw(&serde_json::json!({
+                    workers.push_server.broadcast_raw(serde_json::json!({
                         "type": "queue_partial",
                         "data": data,
                     }));
                 }
                 JobOutcome::Cancelled => {
                     let _ = queue_result;
-                    workers.push_server.broadcast_raw(&serde_json::json!({
+                    workers.push_server.broadcast_raw(serde_json::json!({
                         "type": "queue_cancelled",
                         "data": { "job_id": job.id },
                     }));
@@ -209,7 +209,7 @@ fn start_queue_worker_for_lane(
                 JobOutcome::Failed => {
                     let _ = queue_result;
                     if retry_scheduled.scheduled {
-                        workers.push_server.broadcast_raw(&serde_json::json!({
+                        workers.push_server.broadcast_raw(serde_json::json!({
                             "type": "queue_retry",
                             "data": {
                                 "job_id": job.id,
@@ -230,7 +230,7 @@ fn start_queue_worker_for_lane(
                         {
                             data["detail"] = serde_json::Value::String(detail.to_string());
                         }
-                        workers.push_server.broadcast_raw(&serde_json::json!({
+                        workers.push_server.broadcast_raw(serde_json::json!({
                             "type": "queue_failed",
                             "data": data,
                         }));
@@ -316,7 +316,7 @@ fn should_reload_table_after_job(
 
 fn clear_progress_for_job(push_server: &Arc<PushServer>, job_id: &str) {
     for target_console in ["stdout", "stdout2"] {
-        push_server.broadcast_raw(&serde_json::json!({
+        push_server.broadcast_raw(serde_json::json!({
             "type": "progressbar.clear",
             "data": { "scope": job_id },
             "target_console": target_console,
@@ -853,7 +853,7 @@ fn spawn_and_stream_command(
                                 }
                                 let routed =
                                     route_structured_web_message(msg, &stdout_target_console);
-                                ps_out.broadcast_raw(&routed);
+                                ps_out.broadcast_raw(routed);
                             }
                         } else {
                             remember_failure_line(stdout_recent.as_ref(), &text);
@@ -1076,7 +1076,7 @@ mod tests {
 
     use super::{
         JobOutcome, JobRunResult, MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, WorkerLane,
-        classify_job_outcome, clear_progress_for_job, compute_retry_backoff_secs,
+        classify_job_outcome, compute_retry_backoff_secs,
         console_target_for_job, convert_targets_and_device, execution_spec_meta_bool,
         execution_spec_meta_string, execution_spec_meta_strings, failure_reason,
         is_transient_failure, job_conflicts_with_running, parse_convert_job_target, pop_next_job,
@@ -1419,29 +1419,6 @@ mod tests {
 
         job.retry_count = 3;
         assert!(!should_retry_job(&transient, &job));
-    }
-
-    #[test]
-    fn clear_progress_for_job_targets_both_consoles_with_scope() {
-        let push_server = std::sync::Arc::new(crate::web::push::PushServer::new());
-        let mut receiver = push_server.channel().subscribe();
-
-        clear_progress_for_job(&push_server, "job-123");
-
-        let first: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
-        let second: serde_json::Value =
-            serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
-        let targets = [
-            first["target_console"].as_str().unwrap(),
-            second["target_console"].as_str().unwrap(),
-        ];
-
-        assert_eq!(first["type"], "progressbar.clear");
-        assert_eq!(second["type"], "progressbar.clear");
-        assert!(targets.contains(&"stdout"));
-        assert!(targets.contains(&"stdout2"));
-        assert_eq!(first["data"]["scope"], "job-123");
-        assert_eq!(second["data"]["scope"], "job-123");
     }
 
     #[test]

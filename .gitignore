@@ -52,11 +52,12 @@ __pycache__/
 # Cloudflare Workers (worker_entry)
 # 生成物とローカル専用ファイルは追跡しない。
 /worker_entry/build/
-/worker_entry/.wrangler/
+.wrangler/
 /worker_entry/wrangler.ci.toml
 # tests/run.mjs が生成する実行用設定
 /worker_entry/wrangler.test.toml
 /worker_entry/.dev.vars
+/scripts/sorahost-proxy/worker/.dev.vars
 # deploy_worker.py が一時的に作る secret ファイル (終了時に消すが念のため)
 /worker_entry/.deploy-secrets-*.json
 /worker_entry/.provision-output

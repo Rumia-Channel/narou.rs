@@ -186,6 +186,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         narou_rs::compat::load_local_setting_bool("concurrency"),
     );
     web::scheduler::start_or_restart_auto_update_scheduler(
+        services.scheduler.clone(),
         queue,
         running_jobs,
         push_server.clone(),
@@ -627,7 +628,9 @@ fn is_first_web_boot(server_setting: &HashMap<String, Value>) -> bool {
     let value = server_setting
         .get("already-server-boot")
         .or_else(|| server_setting.get(":already-server-boot"));
-    !yaml_bool(value).unwrap_or(false)
+    !value
+        .and_then(narou_rs::setting_core::setting_bool_value)
+        .unwrap_or(false)
 }
 
 /// `already-server-boot = true` を narou.rb と同じ素の文字列キーで書く
@@ -691,15 +694,6 @@ fn yaml_string(value: Option<&Value>) -> Option<String> {
         Some(Value::String(s)) => Some(s.clone()),
         Some(Value::Number(n)) => Some(n.to_string()),
         Some(Value::Bool(b)) => Some(b.to_string()),
-        _ => None,
-    }
-}
-
-fn yaml_bool(value: Option<&Value>) -> Option<bool> {
-    match value {
-        Some(Value::Bool(b)) => Some(*b),
-        Some(Value::String(s)) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
-        Some(Value::Number(n)) => Some(n.as_i64().unwrap_or(0) != 0),
         _ => None,
     }
 }
@@ -790,6 +784,7 @@ fn watch_server_settings(state: narou_rs::web::AppState) -> tokio::task::JoinHan
                 let first = last_auto_schedule.replace(auto_schedule).is_none();
                 if !first {
                     let started = narou_rs::web::scheduler::start_or_restart_auto_update_scheduler(
+                        state.services.scheduler.clone(),
                         state.queue.clone(),
                         state.running_jobs.clone(),
                         state.push_server.clone(),

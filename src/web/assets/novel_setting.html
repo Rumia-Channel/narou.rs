@@ -51,7 +51,10 @@
 <div id="msg"></div>
 </div>
 
-<script>
+<script type="module">
+import { fetchJson, postJson, assertApiSuccess } from '/assets/js/core/http.js';
+const settingBaseline = new Map();
+let replaceBaseline = '[]';
 (async () => {
   const path = location.pathname;
   const m = path.match(/^\/novels\/(\d+)\/setting$/);
@@ -59,11 +62,13 @@
   const id = m[1];
 
   try {
-    const resp = await fetch(`/api/settings/${id}`);
-    if (!resp.ok) throw new Error(await resp.text());
-    const data = await resp.json();
+    const data = await fetchJson(`/api/settings/${id}`);
     document.getElementById('page-title').textContent = `個別設定: ${data.title || 'ID ' + id}`;
     renderPage(data);
+    document.querySelectorAll('[data-setting-name]').forEach(el => {
+      settingBaseline.set(el.dataset.settingName, el.value);
+    });
+    replaceBaseline = JSON.stringify(collectReplacePatterns());
     document.getElementById('save-btn').style.display = '';
     document.getElementById('save-btn').addEventListener('click', () => saveSettings(id));
   } catch (e) {
@@ -166,6 +171,7 @@ function collectSettings() {
   document.querySelectorAll('[data-setting-name]').forEach(el => {
     if (el.disabled) return;
     const name = el.dataset.settingName;
+    if (el.value === settingBaseline.get(name)) return;
     const type = el.dataset.settingType;
     let value = null;
     if (type === 'boolean') {
@@ -193,33 +199,66 @@ function collectReplacePatterns() {
     const leftEl = tr.querySelector('[data-replace-left]');
     const rightEl = tr.querySelector('[data-replace-right]');
     if (!leftEl || !rightEl) return;
-    const left = leftEl.value.trim();
-    const right = rightEl.value.trim();
-    if (!left) return;
+    const left = leftEl.value;
+    const right = rightEl.value;
+    if (left === '') return;
     patterns.push({ left, right });
   });
   return patterns;
 }
 
+function acknowledgeSave(result, submitted) {
+  if (!result || typeof result !== 'object') return;
+  const acknowledged = result.settings || {};
+  document.querySelectorAll('[data-setting-name]').forEach(el => {
+    const name = el.dataset.settingName;
+    if (!submitted.has(name) || !Object.hasOwn(acknowledged, name)) return;
+    const value = acknowledged[name];
+    const saved = value == null ? '' : String(value);
+    if (el.value === submitted.get(name)) el.value = saved;
+    settingBaseline.set(name, saved);
+  });
+  if (Object.hasOwn(result, 'replace_patterns')) {
+    replaceBaseline = JSON.stringify(result.replace_patterns);
+  }
+}
+
 async function saveSettings(id) {
-  const body = {
-    settings: collectSettings(),
-    replace_patterns: collectReplacePatterns(),
-  };
+  const button = document.getElementById('save-btn');
+  if (button.disabled) return;
+  const body = { settings: collectSettings() };
+  const replacePatterns = collectReplacePatterns();
+  if (JSON.stringify(replacePatterns) !== replaceBaseline) body.replace_patterns = replacePatterns;
+  if (body.settings.length === 0 && !Object.hasOwn(body, 'replace_patterns')) {
+    const msg = document.getElementById('msg');
+    msg.className = 'msg msg-success';
+    msg.textContent = '保存する変更はありません';
+    return;
+  }
+  const submitted = new Map();
+  document.querySelectorAll('[data-setting-name]').forEach(el => {
+    if (body.settings.some(setting => setting.name === el.dataset.settingName)) {
+      submitted.set(el.dataset.settingName, el.value);
+    }
+  });
+  button.disabled = true;
   try {
-    const resp = await fetch(`/api/settings/${id}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const result = await resp.json();
+    const result = await postJson(`/api/settings/${id}`, body);
+    acknowledgeSave(result, submitted);
+    assertApiSuccess(result, '設定の保存に失敗しました');
     const msg = document.getElementById('msg');
     msg.className = result.success ? 'msg msg-success' : 'msg msg-error';
-    msg.textContent = result.message || (result.success ? '保存しました' : 'エラー');
+    const hasDraft = collectSettings().length > 0
+      || JSON.stringify(collectReplacePatterns()) !== replaceBaseline;
+    msg.textContent = (result.message || '保存しました')
+      + (hasDraft ? '（編集中の変更はまだ保存していません）' : '');
   } catch (e) {
+    acknowledgeSave(e.data, submitted);
     const msg = document.getElementById('msg');
     msg.className = 'msg msg-error';
     msg.textContent = e.message;
+  } finally {
+    button.disabled = false;
   }
 }
 

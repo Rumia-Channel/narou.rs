@@ -5,13 +5,11 @@
 //! 接続を持ち、ジョブ実行側から POST されたイベントを全接続へ転送する。
 //!
 //! 設計:
-//! - replayable イベント (echo / error / log / progress / progressbar.*) を
-//!   直近 [`HISTORY_CAPACITY`] 件・[`HISTORY_MAX_BYTES`] バイトまで
-//!   **DO storage へ永続化**する。以前はメモリ上のリングバッファだけで、
-//!   hibernation 明けに履歴が消えていた。チャンク (1 broadcast POST 分) 単位
-//!   で書き、起動後の初回アクセスで遅延ロードする。表示用の履歴だが、
-//!   再接続のリプレイと `GET /history` が同じバッファを読むので、DO が
-//!   寝ても直近のコンソール文脈は戻る。
+//! - コンソール履歴を [`HISTORY_CAPACITY`] 件・[`HISTORY_MAX_BYTES`] バイトまで
+//!   DO storage に保持する。チャンク (1 broadcast POST 分) 単位で書き、
+//!   起動後の初回アクセスで遅延ロードする。
+//! - 実行中の進捗は履歴とは別に最新状態を永続化する。長いログで進捗が
+//!   押し出されても、再接続・hibernation 後に各操作の状態を復元できる。
 //! - WebSocket は hibernation (`state.accept_web_socket`) で管理する。
 //!   接続一覧は DO が保持し、送信時に `state.get_websockets()` で取るので
 //!   こちらでソケット簿記を自前実装しない。
@@ -34,10 +32,10 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narou_rs::application::messages;
 use narou_rs::application::push_events;
+use narou_rs::application::webui::mutations::{MutationNotice, mutation_events};
 use narou_rs::platform::ProgressReporter;
 use serde_json::{json, Value};
 use wasm_bindgen::JsValue;
@@ -62,16 +60,12 @@ pub const HISTORY_CAPACITY: usize = 200;
 pub const HISTORY_MAX_BYTES: usize = 256 * 1024;
 /// 履歴チャンクの storage キー接頭辞。キーは `h:{seq:016}`。
 const CHUNK_KEY_PREFIX: &str = "h:";
+const PROGRESS_KEY: &str = "progress";
 /// 1 POST で受け付けるイベント数の上限 (高々数件を想定した安全弁)。
 const MAX_EVENTS_PER_POST: usize = 64;
-/// `HubProgress` が `progressbar.step` を送る percent 刻み。1 ジョブあたり
-/// 高々 4 通の step POST に抑え、DO subrequest を食い潰さない。
-const STEP_PERCENT_INCREMENT: u64 = 25;
-/// ジョブ終端 (`PushHubSink::drain`) で送信タスクの完了を待つときの
-/// ポーリング間隔 (ms) と上限回数。送信タスクは空になったら即座に終了する
-/// ので通常は 1〜2 回で抜ける (間引き中に積まれた分を送る場合だけ延びる)。
+/// Drain waits for the sole sender; it never steals a pending batch and races
+/// a terminal event ahead of an in-flight progress update.
 const DRAIN_POLL_MS: u64 = 10;
-const DRAIN_WAIT_STEPS: usize = 50;
 
 /// 履歴チャンクの storage キー。
 fn chunk_key(seq: u64) -> String {
@@ -106,6 +100,7 @@ struct HistoryState {
     next_seq: u64,
     entries: usize,
     bytes: usize,
+    progress: push_events::ProgressReplay,
 }
 
 impl HistoryState {
@@ -115,6 +110,7 @@ impl HistoryState {
             next_seq: 1,
             entries: 0,
             bytes: 0,
+            progress: push_events::ProgressReplay::default(),
         }
     }
 
@@ -141,52 +137,11 @@ impl HistoryState {
     }
 }
 
-/// 履歴として意味を持つ payload から `(本文, 宛先コンソール)` を取り出す。
-/// native `history_body` / `default_history_target_console` /
-/// `message_target_console` (`src/web/push.rs`) と同じ規則 — 本文を持たない
-/// progressbar 系と、宛先の無い行は `None` (どの stream にも出ない)。
-fn history_line(payload: &str) -> Option<(String, String)> {
+/// Console body/stream semantics have the same owner as native history.
+fn history_line(payload: &str, stream: &str) -> Option<String> {
     let value: Value = serde_json::from_str(payload).ok()?;
-    let message_type = value.get("type")?.as_str()?;
-    let body = match message_type {
-        "echo" => value.get("body")?.as_str()?.to_string(),
-        "error" => value
-            .get("data")
-            .and_then(Value::as_str)
-            .or_else(|| value.get("message").and_then(Value::as_str))?
-            .to_string(),
-        "log" => value
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| value.get("text").and_then(Value::as_str))?
-            .to_string(),
-        "progress" => value.get("message").and_then(Value::as_str)?.to_string(),
-        _ => return None,
-    };
-    let target_console = value
-        .get("target_console")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| {
-            matches!(message_type, "echo" | "error" | "log").then(|| "stdout".to_string())
-        })?;
-    Some((body, target_console))
-}
-
-/// 履歴リプレイ対象のイベント種別。native の `history_type_replayable`
-/// (`src/web/push.rs`) と同じ集合 — `table.reload` 等の制御イベントは
-/// 接続直後に再生されないよう履歴に入れない。
-fn history_replayable(message_type: &str) -> bool {
-    matches!(
-        message_type,
-        "echo"
-            | "error"
-            | "log"
-            | "progress"
-            | "progressbar.init"
-            | "progressbar.step"
-            | "progressbar.clear"
-    )
+    if push_events::history_target_console(&value)? != stream { return None; }
+    push_events::history_body(&value).map(str::to_owned)
 }
 
 /// `broadcast_event` 相当の制御イベント (`{"type": name, "data": data}`)。
@@ -291,6 +246,14 @@ pub(crate) async fn broadcast_terminal_events(
     push.broadcast_best_effort(&batch).await;
 }
 
+/// 変更操作のイベント選択 (`application::webui::mutations`) を best-effort で
+/// 配信する。native の各ハンドラが `PushServer` へ送るのと同じイベント列。
+/// 送信専用に budget を新規確保する (リクエスト/ジョブの budget を消費しない)。
+pub(crate) async fn broadcast_mutations(env: &Env, notice: MutationNotice<'_>) {
+    let push = PushHubClient::new(env, crate::budget::SubrequestBudget::new());
+    push.broadcast_best_effort(&mutation_events(notice)).await;
+}
+
 
 /// ジョブ実行側から [`PushHub`] へイベントを送るクライアント。
 ///
@@ -365,8 +328,7 @@ fn event_batches<'a>(events: &'a [Value]) -> impl Iterator<Item = &'a [Value]> +
 /// 1 話ごとの進捗行が完了時にまとめて出ていた。ジョブ境界の `drain()` は
 /// 残りの送信を保証する最後の砦として残す。
 ///
-/// Worker は単一スレッドで jobs を直列実行するため `Mutex` が競合しない
-/// (`MessageSink: Send + Sync` への適合のために `RefCell` ではなく `Mutex`)。
+/// Each invocation owns its queue; concurrent events never share a current sink.
 /// `target_console` は [`Stream::target_console`](narou_rs::application::messages::Stream::target_console)
 /// (native の stdout=`"stdout"` / stderr=`"stdout2"` 対応) に委譲する。
 #[derive(Debug)]
@@ -390,78 +352,47 @@ impl PushHubSink {
         }
     }
 
-    /// sink を作り、深い呼び出し経路向けの既定 sink
-    /// (`narou_rs::application::messages::emit_default` が読む共有スロット) にも
-    /// 登録して返す。download / convert いずれのジョブ境界でも同じ手順。
-    pub fn install(client: PushHubClient) -> std::sync::Arc<Self> {
-        Self::install_with_console(client, None)
+    /// Build an invocation-owned sink without mutating isolate-global routing.
+    pub fn shared(client: PushHubClient, console: Option<&'static str>) -> Arc<Self> {
+        Arc::new(Self::new(client, console))
     }
 
-    /// `stdout` 行の宛先コンソールを上書きして sink を作る。`None` は既定
-    /// (`stdout` / `stdout2` を `Stream` で分ける)。`emit` は
-    /// `Stream::target_console_with` に委譲する。
-    pub fn install_with_console(
-        client: PushHubClient,
-        console: Option<&'static str>,
-    ) -> std::sync::Arc<Self> {
-        let sink = std::sync::Arc::new(Self::new(client, console));
-        narou_rs::application::messages::set_default_sink(sink.clone());
-        sink
+    pub(crate) fn publish(&self, mut event: Value) {
+        if event["type"].as_str().is_some_and(|kind| kind.starts_with("progressbar.")) {
+            event["target_console"] = Value::from(self.console.unwrap_or("stdout"));
+        }
+        if self.queue.push(event) { self.spawn_sender(); }
     }
 
-    /// 積まれた行を送るタスクを起動する (既に動いていれば何もしない)。
+    /// Console lines and progress share one ordered, batched sender.
     fn spawn_sender(&self) {
         let client = self.client.clone();
         let queue = Arc::clone(&self.queue);
         wasm_bindgen_futures::spawn_local(async move {
             loop {
-                while let Some(events) = queue.take() {
+                let wait = queue.wait_ms(now_ms());
+                if wait > 0 {
+                    worker::Delay::from(std::time::Duration::from_millis(wait)).await;
+                }
+                if let Some(events) = queue.take() {
                     client.broadcast_best_effort(&events).await;
                     queue.mark_sent(now_ms());
-                    // まだ積まれているときだけ間隔を空ける (サブリクエスト保護)。
-                    // 空なら即座にループを抜けるので、完了時の遅延は増えない。
-                    if queue.is_pending() {
-                        let wait = queue.wait_ms(now_ms());
-                        if wait > 0 {
-                            worker::Delay::from(std::time::Duration::from_millis(wait)).await;
-                        }
-                    }
                 }
-                // idle に戻す直前に積まれた行は、自分でもう一周して送る。
-                if !queue.finish() {
-                    break;
-                }
+                if !queue.finish() { break; }
             }
         });
     }
 
-    /// 積まれた行を PushHub へ送る (best-effort)。ジョブ実行の区切りごとに
-    /// 呼び、上限を超える場合は複数 POST に分ける。
-    ///
-    /// 送信タスクが動いている間はそれが捌くのを待つ: ジョブの終端イベントは
-    /// `drain()` の後に送られるため、ここで待たないと最後の行が「完了」より
-    /// 後に届きうる。待ち切れなかった分はこの場で送る (POST は発行順に届く)。
     pub async fn drain(&self) {
-        for _ in 0..DRAIN_WAIT_STEPS {
-            if !self.queue.is_sending() {
-                break;
-            }
+        while self.queue.is_sending() {
             worker::Delay::from(std::time::Duration::from_millis(DRAIN_POLL_MS)).await;
-        }
-        if let Some(events) = self.queue.take() {
-            self.client.broadcast_best_effort(&events).await;
         }
     }
 }
 
 impl narou_rs::application::messages::MessageSink for PushHubSink {
     fn emit(&self, stream: narou_rs::application::messages::Stream, text: &str) {
-        if self
-            .queue
-            .push(echo(text, stream.target_console_with(self.console)))
-        {
-            self.spawn_sender();
-        }
+        self.publish(echo(text, stream.target_console_with(self.console)));
     }
 }
 
@@ -493,125 +424,65 @@ mod tests {
     }
 }
 
-/// Worker 内で動く [`ProgressReporter`]。native の `WebProgress`
-/// (`src/progress.rs`) と同じイベント列を吐く:
-/// `progressbar.init` → `progressbar.step` → `progressbar.clear`。
-///
-/// trait のメソッドは同期 API なので送信は `spawn_local` の
-/// fire-and-forget。順序が逆転しても progressbar は後勝ちで収束する。
-/// `step` は [`STEP_PERCENT_INCREMENT`]`%` 境界だけ送る。
+/// Worker transport for the same progress state used by native WebProgress.
+/// Updates share the console sender: no 25% threshold and no POST per step.
 pub(crate) struct HubProgress {
-    client: PushHubClient,
-    topic: String,
-    scope: String,
-    length: AtomicU64,
-    position: AtomicU64,
-    last_step_bucket: AtomicU64,
-    cleared: AtomicBool,
+    sink: Arc<PushHubSink>,
+    state: narou_rs::platform::progress::ProgressState,
 }
 
 impl HubProgress {
-    /// 生成と同時に `progressbar.init` を送る (native `WebProgress::new` 相当)。
-    /// `scope` は job id — `progressbar_scope_clear` と対応する。
-    pub(crate) fn new(client: PushHubClient, topic: impl Into<String>, scope: impl Into<String>) -> Self {
+    pub(crate) fn new(sink: Arc<PushHubSink>, topic: &str, scope: &str, execution_token: &str) -> Self {
         let progress = Self {
-            client,
-            topic: topic.into(),
-            scope: scope.into(),
-            length: AtomicU64::new(0),
-            position: AtomicU64::new(0),
-            last_step_bucket: AtomicU64::new(0),
-            cleared: AtomicBool::new(false),
+            sink,
+            state: narou_rs::platform::progress::ProgressState::new(topic, scope, execution_token),
         };
-        progress.publish([push_events::progressbar_init_scoped(
-            &progress.topic,
-            &progress.scope,
-        )]);
-        progress
-    }
-
-    /// 同期コンテキストからの fire-and-forget 送信。
-    fn publish(&self, events: impl IntoIterator<Item = Value>) {
-        let client = self.client.clone();
-        let events: Vec<Value> = events.into_iter().collect();
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Err(error) = client.broadcast(&events).await {
-                console_log!("push hub broadcast failed: {error}");
-            }
+        progress.state.init(|phase, identity, snapshot| {
+            progress.sink.publish(push_events::progress_update(phase, identity, snapshot));
         });
-    }
-
-    fn emit_step(&self) {
-        let len = self.length.load(Ordering::Relaxed);
-        if len == 0 {
-            return;
-        }
-        let pos = self.position.load(Ordering::Relaxed).min(len);
-        let bucket = pos.saturating_mul(100) / len / STEP_PERCENT_INCREMENT;
-        let previous = self.last_step_bucket.load(Ordering::Relaxed);
-        if bucket <= previous
-            || self
-                .last_step_bucket
-                .compare_exchange(previous, bucket, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return;
-        }
-        let percent = (pos as f64 / len as f64) * 100.0;
-        self.publish([push_events::progressbar_step_scoped(
-            pos,
-            len,
-            percent,
-            &self.topic,
-            &self.scope,
-        )]);
-    }
-
-    fn clear_event(&self) -> Value {
-        push_events::progressbar_clear_scoped(&self.topic, &self.scope)
+        progress
     }
 }
 
 impl ProgressReporter for HubProgress {
     fn set_length(&self, len: u64) {
-        self.length.store(len, Ordering::Relaxed);
+        self.state.set_length(len, |phase, identity, snapshot| {
+            self.sink.publish(push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn set_position(&self, pos: u64) {
-        self.position.store(pos, Ordering::Relaxed);
-        self.emit_step();
+        self.state.set_position(pos, |phase, identity, snapshot| {
+            self.sink.publish(push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn inc(&self, delta: u64) {
-        self.position.fetch_add(delta, Ordering::Relaxed);
-        self.emit_step();
+        self.state.inc(delta, |phase, identity, snapshot| {
+            self.sink.publish(push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
-    fn set_message(&self, _msg: &str) {
-        // native の WebProgress と同じく、バーにメッセージは出さない。
+    fn set_message(&self, msg: &str) {
+        self.state.set_message(msg, |phase, identity, snapshot| {
+            self.sink.publish(push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn finish_with_message(&self, _msg: &str) {
-        // native の WebProgress と同じく完了メッセージ自体はコンソールへ出さず、
-        // `progressbar.clear` だけ送る。clear は Drop でも再送されないよう
-        // フラグで抑止する (native は毎回送るが等価)。
-        if !self.cleared.swap(true, Ordering::AcqRel) {
-            self.publish([self.clear_event()]);
-        }
+        self.state.finish(|phase, identity, snapshot| {
+            self.sink.publish(push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn println(&self, msg: &str) {
-        // Worker では stdout が届かないので trace へ (report_line と同じ扱い)。
-        console_log!("{msg}");
+        use narou_rs::application::messages::{MessageSink, Stream};
+        self.sink.emit(Stream::Stdout, msg);
     }
 }
 
 impl Drop for HubProgress {
-    fn drop(&mut self) {
-        if !self.cleared.swap(true, Ordering::AcqRel) {
-            self.publish([self.clear_event()]);
-        }
-    }
+    fn drop(&mut self) { self.finish_with_message(""); }
 }
 
 #[durable_object]
@@ -662,7 +533,19 @@ impl PushHub {
         });
         loaded.sort_by_key(|(seq, _)| *seq);
         let mut state = HistoryState::new();
+        let persisted_progress = storage.get::<String>(PROGRESS_KEY).await?;
+        let has_persisted_progress = persisted_progress.is_some();
+        if let Some(raw) = persisted_progress {
+            state.progress = serde_json::from_str(&raw)
+                .map_err(|error| Error::RustError(format!("progress history decode: {error}")))?;
+        }
         for (seq, payloads) in loaded {
+            let payloads: Vec<String> = payloads.into_iter().filter(|payload| {
+                let Ok(value) = serde_json::from_str::<Value>(payload) else { return false; };
+                let replayable = push_events::history_replayable(value["type"].as_str().unwrap_or(""));
+                if !has_persisted_progress { state.progress.observe(value); }
+                replayable
+            }).collect();
             let bytes = payloads.iter().map(String::len).sum();
             state.push_chunk(HistoryChunk {
                 seq,
@@ -671,6 +554,10 @@ impl PushHub {
             });
         }
         let dropped = state.prune();
+        if !has_persisted_progress {
+            storage.put(PROGRESS_KEY, serde_json::to_string(&state.progress)
+                .map_err(|error| Error::RustError(format!("progress history encode: {error}")))?).await?;
+        }
         *self.history.borrow_mut() = Some(state);
         if !dropped.is_empty() {
             // 上限を超えた古いチャンクは storage からも消す。失敗しても表示は
@@ -740,6 +627,9 @@ impl PushHub {
                     }
                 }
             }
+            for event in state.progress.snapshots() {
+                server.send_with_str(event.to_string())?;
+            }
         }
         Response::from_websocket(pair.client)
     }
@@ -751,29 +641,51 @@ impl PushHub {
     /// 偽らず 500 で返して送信側の trace に残す。
     async fn broadcast(&self, req: &mut Request) -> Result<Response> {
         let body: Value = req.json().await?;
-        let Some(events) = body.get("events").and_then(Value::as_array) else {
-            return Response::error("expected {\"events\": [...]}", 400);
+        let events = match body {
+            Value::Object(mut body) => match body.remove("events") {
+                Some(Value::Array(events)) => events,
+                _ => return Response::error("expected {\"events\": [...]}", 400),
+            },
+            _ => return Response::error("expected {\"events\": [...]}", 400),
         };
         if events.len() > MAX_EVENTS_PER_POST {
             return Response::error("too many events", 400);
         }
 
-        // payload の直列化は 1 回だけ。履歴に入れる分は replayable なものだけ。
-        let mut payloads: Vec<(&str, String)> = Vec::with_capacity(events.len());
-        for event in events {
+        // Validate the whole batch before mutating replay state.
+        let mut payloads = Vec::with_capacity(events.len());
+        for event in &events {
             let Some(message_type) = event.get("type").and_then(Value::as_str) else {
                 return Response::error("event is missing a string \"type\"", 400);
             };
             let payload = serde_json::to_string(event)
                 .map_err(|error| Error::RustError(format!("push event serialize: {error}")))?;
-            payloads.push((message_type, payload));
+            payloads.push((push_events::history_replayable(message_type), payload));
         }
+        self.ensure_history_loaded().await?;
+        let progress_changed = {
+            let mut guard = self.history.borrow_mut();
+            let state = guard.as_mut().expect("history loaded");
+            let mut changed = false;
+            for event in events { changed |= state.progress.observe(event); }
+            changed
+        };
         let replayable: Vec<String> = payloads
             .iter()
-            .filter(|(message_type, _)| history_replayable(message_type))
+            .filter(|(replayable, _)| *replayable)
             .map(|(_, payload)| payload.clone())
             .collect();
-        let persist_error = self.persist_history(&replayable).await.err();
+        let mut persist_error = self.persist_history(&replayable).await.err();
+        if progress_changed {
+            let progress_json = {
+                let guard = self.history.borrow();
+                serde_json::to_string(&guard.as_ref().expect("history loaded").progress)
+                    .map_err(|error| Error::RustError(format!("progress history encode: {error}")))?
+            };
+            if let Err(error) = self.state.storage().put(PROGRESS_KEY, progress_json).await {
+                if persist_error.is_none() { persist_error = Some(error); }
+            }
+        }
 
         let sockets = self.state.get_websockets();
         let mut delivered = 0usize;
@@ -811,9 +723,7 @@ impl PushHub {
             let state = guard.as_ref().expect("history loaded above");
             for chunk in &state.chunks {
                 for payload in &chunk.payloads {
-                    if let Some((body, target_console)) = history_line(payload)
-                        && target_console == stream
-                    {
+                    if let Some(body) = history_line(payload, &stream) {
                         lines.push(body);
                     }
                 }
@@ -826,6 +736,7 @@ impl PushHub {
     /// 全チャンクとメモリ上の再生バッファを同時に空にする。消去に失敗したら
     /// 成功を偽らずエラーを返し、メモリも触らない。
     async fn clear_history(&self) -> Result<Response> {
+        self.ensure_history_loaded().await?;
         let storage = self.state.storage();
         let listed = storage
             .list_with_options(ListOptions::new().prefix(CHUNK_KEY_PREFIX))
@@ -839,7 +750,10 @@ impl PushHub {
         if !keys.is_empty() {
             storage.delete_multiple(keys).await?;
         }
-        *self.history.borrow_mut() = Some(HistoryState::new());
+        let progress = std::mem::take(&mut self.history.borrow_mut().as_mut().expect("history loaded").progress);
+        let mut state = HistoryState::new();
+        state.progress = progress;
+        *self.history.borrow_mut() = Some(state);
         Response::from_json(&json!({ "ok": true }))
     }
 }

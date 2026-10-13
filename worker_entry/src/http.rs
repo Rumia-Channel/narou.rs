@@ -3,17 +3,17 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use futures::future::{self, Either};
-use narou_rs::downloader::http_policy::same_site_hosts;
 use narou_rs::downloader::security::{
     CONNECT_TIMEOUT_SECS, MAX_REDIRECTS, READ_TIMEOUT_SECS, TOTAL_TIMEOUT_SECS,
 };
 use narou_rs::error::{NarouError, Result};
+use narou_rs::platform::http::{RedirectChain, validate_http_url_syntax};
 use narou_rs::platform::http1::{Http1ResponseDecoder, SocketTarget, encode_request};
-use narou_rs::platform::relay::{RelayRequest, RelayResponse, TOKEN_HEADER};
+use narou_rs::platform::relay::{RelayRequest, RelayResponse, response_wire_limit};
 use narou_rs::platform::{
-    CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, PlatformFuture, RedirectMode,
+    CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, PlatformFuture,
 };
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -31,6 +31,7 @@ use crate::budget::SubrequestBudget;
 /// `illustration_animation` の上限 (40 MiB) で別に制限している。
 pub const MAX_WORKER_HTTP_BODY: usize = 16 * 1024 * 1024;
 
+
 #[derive(Clone, Default)]
 pub struct WorkerHttpClient {
     subrequests: SubrequestBudget,
@@ -42,6 +43,12 @@ pub struct WorkerHttpClient {
     /// 踏み台 (SORAHOST リレー) の接続先と認証トークン。
     /// `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY` が揃ったときだけ Some。
     relay: Option<RelayConfig>,
+}
+
+/// A single fallback hop; neither transport follows redirects itself.
+enum HopExchange<'a> {
+    Socket,
+    Relay(&'a RelayConfig),
 }
 
 /// 踏み台リレーの接続情報。
@@ -99,170 +106,60 @@ impl WorkerHttpClient {
         self
     }
 
-    /// 送信した Cookie に対応する資格情報だけを `Set-Cookie` で更新する。
-    ///
-    /// サイトは複数のログイン情報を持てるので、送っていない資格情報を書き換えては
-    /// いけない (別アカウントのセッションを壊す)。保存値は暗号化されて書き戻る。
-    async fn persist_set_cookie(&self, response: &HttpResponse, sent_cookie: Option<&str>) {
-        let Some(store) = self.cookie_store.as_ref() else {
-            return;
-        };
-        let values: Vec<String> = response
-            .headers
-            .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
-            .map(|(_, value)| value.clone())
-            .collect();
-        if values.is_empty() {
-            return;
-        }
-        // 送った Cookie を含むホストを持つログインだけを更新する。サイトは
-        // 複数のログインを持てるので、別アカウントのセッションは触らない
-        // (native `persist_set_cookie` と同じ)。
-        let Some(sent) = sent_cookie else {
-            return;
-        };
-        let sent_pairs = narou_rs::platform::parse_cookie_header(sent);
-        if sent_pairs.is_empty() {
-            return;
-        }
-        let Ok(all) = store.list_groups().await else {
-            return;
-        };
-        for (site, groups) in all {
-            let mut updated_groups = groups.clone();
-            let mut changed = false;
-            for group in updated_groups.iter_mut() {
-                let Some(host) = group.host_for_sent(&sent_pairs).map(str::to_string) else {
-                    continue;
-                };
-                if let Some(entry) = group.cookies.iter_mut().find(|entry| entry.host == host) {
-                    let updated = narou_rs::platform::apply_set_cookie(&entry.cookie, &values);
-                    if updated != entry.cookie {
-                        entry.cookie = updated;
-                        changed = true;
-                    }
-                }
-            }
-            if changed {
-                let _ = store.save_groups(&site, &updated_groups).await;
-            }
-        }
-    }
 
-    /// GET over a raw `connect()` socket, following the request's redirect
-    /// policy. Returns `Err` whenever the socket path cannot produce a
-    /// trustworthy response (connection refused by the runtime, timeout,
-    /// truncated body, malformed head) so the caller keeps the fetch result.
-    async fn send_via_socket(&self, request: &HttpRequest) -> Result<HttpResponse> {
-        let mut target = SocketTarget::parse(&request.url)?;
-        // RedirectMode::Follow は fetch 経路と揃えてソケット側でも辿る。
-        // native と同じく、サイトの外に出る hop では認証系ヘッダを落とす
-        // (fetch は Cookie を勝手に付けないので寄せる意味もある)。
-        let mut headers = request.headers.clone();
-        // ソケット経路でも UA 無しは送らない (fetch 経路と同じフォールバック)。
-        // カクヨムの CloudFront は User-Agent なしの接続を 403 で弾くため、
-        // これが無いと生ソケットでも同じ 403 が返りフォールバックが無意味になる
-        // (一時アカウントで実測: UA 無し→CloudFront 403、UA 有り→200)。
-        if !self.user_agent.is_empty()
-            && !headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-        {
-            headers.push(("User-Agent".to_string(), self.user_agent.clone()));
-        }
-        let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
-        for hop in 0..=MAX_REDIRECTS {
-            // `connect()` もサブリクエスト枠を消費するので fetch と同じく計上する。
-            self.subrequests.record();
-            let response = socket_exchange(&target, &headers, deadline_ms).await?;
-            if request.redirect != RedirectMode::Follow || !response.is_redirection() {
-                return Ok(response);
-            }
-            let Some(location) = response.header("Location").map(str::to_string) else {
-                return Ok(response);
-            };
-            let next = target.join(&location)?;
-            if !same_site_hosts(Some(&next.host), Some(&target.host)) {
-                headers.retain(|(name, _)| {
-                    !name.eq_ignore_ascii_case("cookie")
-                        && !name.eq_ignore_ascii_case("authorization")
-                });
-            }
-            if hop == MAX_REDIRECTS {
-                return Err(NarouError::Http(
-                    "redirect limit exceeded on socket transport".to_string(),
-                ));
-            }
-            target = next;
-        }
-        unreachable!("redirect loop returns within MAX_REDIRECTS")
-    }
-
-    /// GET via the SORAHOST relay, reached over a plain-http `connect()`
-    /// socket (`RelayRequest` keeps the full site URL and headers inside the
-    /// query, so the wire request is a GET to the relay's `/proxy`).
-    ///
-    /// Returns `Ok(None)` when the relay is not configured. `Err` covers every
-    /// way the relay path cannot produce a trustworthy response (bad config,
-    /// connect/timeout/malformed head, `RelayError`) so the caller keeps the
-    /// fetch result — same policy as [`Self::send_via_socket`].
-    ///
-    /// リダイレクトは踏み台側が辿る (`redirect` パラメータ)。`Manual` のときは
-    /// 上流の 3xx が `status`/`location` に載って返り、そのまま採用する。
-    async fn send_via_relay(&self, request: &HttpRequest) -> Result<Option<HttpResponse>> {
-        let Some(relay) = self.relay.as_ref() else {
-            return Ok(None);
-        };
-        // サイト定義のヘッダはそのまま転送する。UA が無いときは socket 経路と
-        // 同じフォールバックを足す (UA 無しは上流で 403 になりやすい)。
-        let mut headers = request.headers.clone();
-        if !self.user_agent.is_empty()
-            && !headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-        {
-            headers.push(("User-Agent".to_string(), self.user_agent.clone()));
-        }
-        let relay_request = RelayRequest::new(
-            &relay.base_url,
-            &relay.token,
-            &request.url,
-            &headers,
-            request.redirect,
-        )?;
-        let target = SocketTarget::parse(relay_request.url())?;
-        // 踏み台への認証はトランスポート層のヘッダで送る (クエリには載せない)。
-        let wire_headers = vec![(TOKEN_HEADER.to_string(), relay_request.token().to_string())];
-        let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+    /// Execute one hop over `exchange`: a raw socket GET, or one relay call
+    /// whose JSON response is turned back into an [`HttpResponse`].
+    async fn exchange_hop(
+        &self,
+        exchange: &HopExchange<'_>,
+        url: &str,
+        headers: &[(String, String)],
+        deadline_ms: f64,
+    ) -> Result<HttpResponse> {
         // `connect()` もサブリクエスト枠を消費するので fetch と同じく計上する。
         self.subrequests.record();
-        let wire_response = socket_exchange(&target, &wire_headers, deadline_ms).await?;
-        let relay_response = RelayResponse::parse(wire_response.status, &wire_response.body)?;
-        let mut response_headers = Vec::new();
-        if let Some(content_type) = relay_response.content_type {
-            response_headers.push(("content-type".to_string(), content_type));
+        match exchange {
+            HopExchange::Socket => {
+                let target = SocketTarget::parse(url)?;
+                socket_exchange(&target, HttpMethod::Get, headers, None, deadline_ms, MAX_WORKER_HTTP_BODY).await
+            }
+            HopExchange::Relay(relay) => {
+                let relay_request =
+                    RelayRequest::new(&relay.base_url, &relay.token, url, headers)?.into_request();
+                let target = SocketTarget::parse(&relay_request.url)?;
+                let wire_response = socket_exchange(
+                    &target, relay_request.method, &relay_request.headers,
+                    relay_request.body.as_deref().map(Vec::as_slice),
+                    deadline_ms, response_wire_limit(MAX_WORKER_HTTP_BODY),
+                ).await?;
+                let relay_response = RelayResponse::parse(
+                    wire_response.status, &wire_response.body, MAX_WORKER_HTTP_BODY,
+                )?;
+                let mut response_headers = Vec::new();
+                if let Some(content_type) = relay_response.content_type {
+                    response_headers.push(("content-type".to_string(), content_type));
+                }
+                if let Some(location) = relay_response.location {
+                    response_headers.push(("location".to_string(), location));
+                }
+                for cookie in relay_response.set_cookie {
+                    response_headers.push(("set-cookie".to_string(), cookie));
+                }
+                Ok(HttpResponse {
+                    status: relay_response.status,
+                    headers: response_headers,
+                    body: relay_response.body,
+                })
+            }
         }
-        if let Some(location) = relay_response.location {
-            response_headers.push(("location".to_string(), location));
-        }
-        Ok(Some(HttpResponse {
-            status: relay_response.status,
-            headers: response_headers,
-            body: relay_response.body,
-        }))
     }
 
-    async fn send_request(&self, request: &HttpRequest) -> Result<HttpResponse> {
+    async fn send_fetch_hop(&self, request: &HttpRequest) -> Result<HttpResponse> {
         let method = match request.method {
             HttpMethod::Get => Method::Get,
             HttpMethod::Post => Method::Post,
             HttpMethod::Put => Method::Put,
             HttpMethod::Delete => Method::Delete,
-        };
-        let redirect = match request.redirect {
-            RedirectMode::Follow => RequestRedirect::Follow,
-            RedirectMode::Manual => RequestRedirect::Manual,
         };
         let headers = Headers::new();
         for (name, value) in &request.headers {
@@ -270,20 +167,9 @@ impl WorkerHttpClient {
                 .append(name, value)
                 .map_err(|error| NarouError::Platform(format!("invalid HTTP header: {error}")))?;
         }
-        // UA が無いリクエストは多くのサイトで 403 になるので、必ず 1 つ送る。
-        if !self.user_agent.is_empty()
-            && !request
-                .headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-        {
-            headers
-                .append("user-agent", &self.user_agent)
-                .map_err(|error| NarouError::Platform(format!("invalid HTTP header: {error}")))?;
-        }
         let mut init = RequestInit::new();
         init.with_method(method);
-        init.with_redirect(redirect);
+        init.with_redirect(RequestRedirect::Manual);
         init.with_headers(headers);
         if let Some(body) = request.body.as_deref() {
             if body.len() > MAX_WORKER_HTTP_BODY {
@@ -291,21 +177,27 @@ impl WorkerHttpClient {
                     "Worker HTTP request body exceeds limit".to_string(),
                 ));
             }
-            init.with_body(Some(JsValue::from(js_sys::Uint8Array::from(body))));
+            init.with_body(Some(JsValue::from(js_sys::Uint8Array::from(body.as_slice()))));
         }
         let trusted_limit = request.trusted_endpoint.then_some(request.trusted_response_body_limit).flatten();
         let request = Request::new_with_init(&request.url, &init)
             .map_err(|error| NarouError::Platform(format!("invalid HTTP request: {error}")))?;
         self.subrequests.record();
-        let mut response = Fetch::Request(request)
+        let response = Fetch::Request(request)
             .send()
             .await
             .map_err(|error| NarouError::Http(error.to_string()))?;
         let status = response.status_code();
-        let headers = response.headers().entries().collect::<Vec<_>>();
-        let limit = if (200..300).contains(&status) {
-            trusted_limit.unwrap_or(MAX_WORKER_HTTP_BODY).min(MAX_WORKER_HTTP_BODY)
-        } else { MAX_WORKER_HTTP_BODY };
+        let mut headers = response.headers().entries()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("set-cookie"))
+            .collect::<Vec<_>>();
+        for cookie in response.headers().get_all("set-cookie")
+            .map_err(|error| NarouError::Http(error.to_string()))?
+        {
+            headers.push(("set-cookie".to_string(), cookie));
+        }
+        let limit =
+            narou_rs::platform::http::response_body_limit(status, trusted_limit, MAX_WORKER_HTTP_BODY);
         if response
             .headers()
             .get("content-length")
@@ -315,32 +207,110 @@ impl WorkerHttpClient {
             .and_then(|value| value.parse::<usize>().ok())
             .is_some_and(|size| size > limit)
         {
+            if let worker::ResponseBody::Stream(stream) = response.into_parts().1 {
+                let _ = with_timeout(
+                    JsFuture::from(stream.cancel()).map(|result| result.map(|_| ()).map_err(js_error)),
+                    5_000.0, "Fetch body cancel",
+                ).await;
+            }
             return Err(NarouError::Platform(
                 "Worker HTTP response body exceeds limit".to_string(),
             ));
         }
-        let body = if matches!(response.body(), worker::ResponseBody::Stream(_)) {
-            let mut stream = response.stream().map_err(|error| NarouError::Http(error.to_string()))?;
-            let mut body = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|error| NarouError::Http(error.to_string()))?;
-                if chunk.len() > limit.saturating_sub(body.len()) {
-                    return Err(NarouError::Platform("Worker HTTP response body exceeds limit".to_string()));
-                }
-                body.extend_from_slice(&chunk);
-            }
-            body
-        } else {
-            match response.into_parts().1 {
-                worker::ResponseBody::Empty => Vec::new(),
-                worker::ResponseBody::Body(body) if body.len() <= limit => body,
-                _ => return Err(NarouError::Platform("Worker HTTP response body exceeds limit".to_string())),
-            }
-        };
+        let body = read_fetch_body(response.into_parts().1, limit).await?;
         Ok(HttpResponse {
             status,
             headers,
             body,
+        })
+    }
+    fn send_inner<'a>(
+        &'a self,
+        mut request: HttpRequest,
+        pacing: Option<narou_rs::platform::http::HttpPacing<'a>>,
+    ) -> PlatformFuture<'a, Result<HttpResponse>> {
+        if !self.user_agent.is_empty() && request.header("User-Agent").is_none() {
+            request.headers.push(("User-Agent".to_string(), self.user_agent.clone()));
+        }
+        Box::pin(async move {
+            let mut chain = RedirectChain::new(request, MAX_REDIRECTS);
+            loop {
+                let request = chain.request();
+                validate_http_url_syntax(&request.url)?;
+                if !request.trusted_endpoint {
+                    self.validate_url(&request.url).await?;
+                }
+                let scope = pacing.map(|policy| policy.scope_for(&chain)).transpose()?;
+                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                    policy.limiter.acquire(scope).await?;
+                }
+                // Fetch is always manual. A partial/failed Fetch body returns
+                // an error above; only a complete 403 can start fallback.
+                let fetch_response = self.send_fetch_hop(request).await?;
+                let response = if fetch_response.status == 403
+                    && request.method == HttpMethod::Get
+                    && !request.trusted_endpoint
+                {
+                    if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                        policy.limiter.acquire(scope).await?;
+                    }
+                    let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+                    match self.exchange_hop(
+                        &HopExchange::Socket, &request.url, &request.headers, deadline_ms,
+                    ).await {
+                        Ok(response) if response.is_success() || response.is_redirection() => response,
+                        socket_result => {
+                            let relay_result = match self.relay.as_ref() {
+                                Some(relay) => {
+                                    if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                                        policy.limiter.acquire(scope).await?;
+                                    }
+                                    let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+                                    self.exchange_hop(
+                                        &HopExchange::Relay(relay), &request.url,
+                                        &request.headers, deadline_ms,
+                                    ).await.map(Some)
+                                }
+                                None => Ok(None),
+                            };
+                            match relay_result {
+                                Ok(Some(response))
+                                    if response.is_success() || response.is_redirection() => response,
+                                relay_result => {
+                                    match socket_result {
+                                        Ok(response) => console_warn!(
+                                            "socket transport returned {}, keeping fetch 403", response.status
+                                        ),
+                                        Err(error) => console_warn!(
+                                            "socket transport failed, keeping fetch 403: {error}"
+                                        ),
+                                    }
+                                    match relay_result {
+                                        Ok(Some(response)) => console_warn!(
+                                            "relay transport returned {}, keeping fetch 403", response.status
+                                        ),
+                                        Ok(None) => {}
+                                        Err(error) => console_warn!(
+                                            "relay transport failed, keeping fetch 403: {error}"
+                                        ),
+                                    }
+                                    fetch_response
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    fetch_response
+                };
+                if let Some(store) = self.cookie_store.as_deref() {
+                    narou_rs::platform::cookie_store::persist_response_set_cookie(
+                        store, &response, chain.request().header("Cookie"),
+                    ).await;
+                }
+                if !chain.advance(&response)? {
+                    return Ok(response);
+                }
+            }
         })
     }
 }
@@ -357,70 +327,64 @@ impl HttpClient for WorkerHttpClient {
     }
 
     fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
-        let sent_cookie = request.header("Cookie").map(str::to_string);
-        Box::pin(async move {
-            let fetch_response = self.send_request(&request).await?;
-            // fetch は Cloudflare 配下のサイトでエッジから 403 が返ることが
-            // ある (`cf-mitigated`)。`connect()` は fetch とは別の egress
-            // プレフィックスを使うため、403 のときだけ生ソケットで取り直す。
-            // それでも 2xx/3xx が得られないときは SORAHOST リレー (設定済みの
-            // 場合のみ) で最後に取り直す。GET のみ (encoder が GET しか
-            // 組み立てない)。
-            let response = if fetch_response.status == 403
-                && request.method == HttpMethod::Get
-                && !request.trusted_endpoint
-            {
-                match self.send_via_socket(&request).await {
-                    // 通常の応答が取れたときだけ採用する。
-                    Ok(socket_response)
-                        if socket_response.is_success() || socket_response.is_redirection() =>
+        self.send_inner(request, None)
+    }
+
+    fn send_paced<'a>(
+        &'a self,
+        request: HttpRequest,
+        pacing: narou_rs::platform::http::HttpPacing<'a>,
+    ) -> PlatformFuture<'a, Result<HttpResponse>> {
+        self.send_inner(request, Some(pacing))
+    }
+
+}
+
+/// Consume the real stream, cancelling it on size/read failure. Using the
+/// reader directly keeps an aborted partial body from becoming successful EOF.
+async fn read_fetch_body(body: worker::ResponseBody, limit: usize) -> Result<Vec<u8>> {
+    match body {
+        worker::ResponseBody::Empty => Ok(Vec::new()),
+        worker::ResponseBody::Body(body) if body.len() <= limit => Ok(body),
+        worker::ResponseBody::Body(_) => Err(NarouError::Platform(
+            "Worker HTTP response body exceeds limit".to_string(),
+        )),
+        worker::ResponseBody::Stream(stream) => {
+            let reader = stream.get_reader()
+                .dyn_into::<ReadableStreamDefaultReader>()
+                .map_err(|_| NarouError::Http("invalid Fetch response reader".into()))?;
+            let result = async {
+                let mut body = Vec::new();
+                loop {
+                    let value = JsFuture::from(reader.read()).await
+                        .map_err(|error| NarouError::Http(format!("Fetch body read failed: {error:?}")))?;
+                    if js_sys::Reflect::get(&value, &JsValue::from_str("done"))
+                        .map_err(js_error)?.is_truthy()
                     {
-                        socket_response
+                        return Ok(body);
                     }
-                    socket_result => {
-                        // 第三段: 踏み台経由 (設定済みの場合のみ)。こちらも
-                        // 2xx/3xx が取れたときだけ採用する。
-                        match self.send_via_relay(&request).await {
-                            Ok(Some(relay_response))
-                                if relay_response.is_success()
-                                    || relay_response.is_redirection() =>
-                            {
-                                relay_response
-                            }
-                            relay_result => {
-                                // どの経路でも採用できないので fetch の 403 を
-                                // そのまま返す (挙動を変えない)。
-                                match socket_result {
-                                    Ok(socket_response) => console_warn!(
-                                        "socket transport returned {}, keeping fetch 403",
-                                        socket_response.status
-                                    ),
-                                    Err(error) => console_warn!(
-                                        "socket transport failed, keeping fetch 403: {error}"
-                                    ),
-                                }
-                                match relay_result {
-                                    Ok(Some(relay_response)) => console_warn!(
-                                        "relay transport returned {}, keeping fetch 403",
-                                        relay_response.status
-                                    ),
-                                    Ok(None) => {}
-                                    Err(error) => console_warn!(
-                                        "relay transport failed, keeping fetch 403: {error}"
-                                    ),
-                                }
-                                fetch_response
-                            }
-                        }
+                    let chunk = js_sys::Reflect::get(&value, &JsValue::from_str("value"))
+                        .map_err(js_error)?.unchecked_into::<js_sys::Uint8Array>();
+                    let length = chunk.length() as usize;
+                    if length > limit.saturating_sub(body.len()) {
+                        return Err(NarouError::Platform(
+                            "Worker HTTP response body exceeds limit".to_string(),
+                        ));
                     }
+                    let start = body.len();
+                    body.resize(start + length, 0);
+                    chunk.copy_to(&mut body[start..]);
                 }
-            } else {
-                fetch_response
-            };
-            self.persist_set_cookie(&response, sent_cookie.as_deref())
-                .await;
-            Ok(response)
-        })
+            }.await;
+            if result.is_err() {
+                let _ = with_timeout(
+                    JsFuture::from(reader.cancel()).map(|result| result.map(|_| ()).map_err(js_error)),
+                    5_000.0, "Fetch body cancel",
+                ).await;
+            }
+            reader.release_lock();
+            result
+        }
     }
 }
 
@@ -544,7 +508,7 @@ impl RawSocket {
     }
 
     /// Next chunk of response bytes; `None` at EOF.
-    async fn read_chunk(&mut self, deadline_ms: f64) -> Result<Option<Vec<u8>>> {
+    async fn read_chunk(&mut self, deadline_ms: f64) -> Result<Option<js_sys::Uint8Array>> {
         let left = deadline_left(deadline_ms, "read")?;
         let value = with_timeout(
             JsFuture::from(self.reader.read()).map(|result| result.map_err(js_error)),
@@ -561,7 +525,7 @@ impl RawSocket {
         let chunk = js_sys::Reflect::get(&value, &JsValue::from_str("value"))
             .map_err(js_error)?
             .unchecked_into::<js_sys::Uint8Array>();
-        Ok(Some(chunk.to_vec()))
+        Ok(Some(chunk))
     }
 
     /// Release stream locks and close the socket. Best-effort: a stuck close
@@ -583,11 +547,14 @@ impl RawSocket {
 /// One socket round-trip: connect → write request head → parse the response.
 async fn socket_exchange(
     target: &SocketTarget,
+    method: HttpMethod,
     headers: &[(String, String)],
+    body: Option<&[u8]>,
     deadline_ms: f64,
+    body_limit: usize,
 ) -> Result<HttpResponse> {
     let mut socket = connect_socket(target, deadline_ms).await?;
-    let result = socket_roundtrip(&mut socket, target, headers, deadline_ms).await;
+    let result = socket_roundtrip(&mut socket, target, method, headers, body, deadline_ms, body_limit).await;
     socket.close().await;
     result
 }
@@ -595,17 +562,34 @@ async fn socket_exchange(
 async fn socket_roundtrip(
     socket: &mut RawSocket,
     target: &SocketTarget,
+    method: HttpMethod,
     headers: &[(String, String)],
+    body: Option<&[u8]>,
     deadline_ms: f64,
+    body_limit: usize,
 ) -> Result<HttpResponse> {
-    let request = encode_request(target, headers);
+    let request = encode_request(target, method, headers, body.map(<[u8]>::len));
     socket.write_all(&request, deadline_ms).await?;
-    let mut decoder = Http1ResponseDecoder::new(MAX_WORKER_HTTP_BODY);
+    if let Some(body) = body {
+        socket.write_all(body, deadline_ms).await?;
+    }
+    let mut decoder = Http1ResponseDecoder::new(body_limit);
+    // Stage only a bounded slice in wasm memory. A coalesced oversized JS
+    // chunk must reach the decoder's checks before a whole-chunk allocation.
+    let mut buffer = [0u8; 8192];
     loop {
         match socket.read_chunk(deadline_ms).await? {
             Some(chunk) => {
-                if decoder.feed(&chunk)? {
-                    return decoder.into_response();
+                let mut offset = 0u32;
+                let chunk_len = chunk.length();
+                while offset < chunk_len {
+                    let end = offset.saturating_add(buffer.len() as u32).min(chunk_len);
+                    let length = (end - offset) as usize;
+                    chunk.subarray(offset, end).copy_to(&mut buffer[..length]);
+                    if decoder.feed(&buffer[..length])? {
+                        return decoder.into_response();
+                    }
+                    offset = end;
                 }
             }
             None => return decoder.finish(),
@@ -613,12 +597,3 @@ async fn socket_roundtrip(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn body_limit_is_explicit_and_shared() {
-        assert_eq!(MAX_WORKER_HTTP_BODY, 16 * 1024 * 1024);
-    }
-}

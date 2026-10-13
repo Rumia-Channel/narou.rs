@@ -357,35 +357,34 @@ fn burn_default_settings(
         // Web UI の設定保存と同じ `setting.ini` オブジェクトへ書く。FS だけに
         // 書くと SQLite モード (`mirror-files=false`) の本文と DB の設定が
         // 分離し、次の変換で焼き付けが消える。
-        let ini_path = archive_path.join("setting.ini");
         let setting_key = narou_rs::native::object_store::novel_object_prefix(
             &archive_root,
             &archive_path,
         )
-        .and_then(|prefix| prefix.join("setting.ini").ok());
-
-        let mut ini = match &setting_key {
-            Some(key) => match read_store_text(&store, key) {
-                Some(text) => IniData::load(&text),
-                None => IniData::load_file(&ini_path).unwrap_or_else(|_| IniData::new()),
-            },
-            None => IniData::load_file(&ini_path).unwrap_or_else(|_| IniData::new()),
-        };
-
-        for (name, default_value) in &original_settings {
-            if ini.get_global(name).is_none() {
-                if let Some(default_val) = default_settings.get(name) {
-                    ini.set_global(name, yaml_to_ini_value(default_val));
-                } else {
-                    ini.set_global(name, default_value.clone());
+        .ok_or("小説の設定保存先がライブラリ外です")?.join("setting.ini")?;
+        let mut mutate = |raw: Option<&[u8]>| {
+            let text = std::str::from_utf8(raw.unwrap_or_default()).map_err(|error| {
+                narou_rs::error::NarouError::Platform(format!("setting.ini is not UTF-8: {error}"))
+            })?;
+            let mut ini = IniData::load(text);
+            let mut changed = false;
+            for (name, default_value) in &original_settings {
+                if ini.get_global(name).is_none() {
+                    let value = default_settings.get(name).map(yaml_to_ini_value)
+                        .unwrap_or_else(|| default_value.clone());
+                    ini.set_global(name, value);
+                    changed = true;
                 }
             }
-        }
-
-        let body = ini.to_ini_string();
-        match &setting_key {
-            Some(key) => write_store_text(&store, key, &body)?,
-            None => ini.save(&ini_path)?,
+            Ok(changed.then(|| std::borrow::Cow::Owned(ini.to_ini_string().into_bytes())))
+        };
+        let result = futures::executor::block_on(
+            narou_rs::platform::ObjectStore::update_small(&store, &setting_key, &mut mutate),
+        )?;
+        match result {
+            narou_rs::platform::ObjectUpdateResult::Committed => {}
+            narou_rs::platform::ObjectUpdateResult::ProjectionFailed(error) => return Err(error.into()),
+            narou_rs::platform::ObjectUpdateResult::Conflict => return Err("小説設定の保存が競合しました".into()),
         }
         println!("{} の設定を保存しました", data.title);
     }
@@ -393,26 +392,6 @@ fn burn_default_settings(
     Ok(())
 }
 
-/// ストア上の小さなテキストを読む (UTF-8 として不正なら `None`)。
-fn read_store_text(
-    store: &narou_rs::native::object_store::NativeStore,
-    key: &narou_rs::platform::ObjectKey,
-) -> Option<String> {
-    use narou_rs::platform::ObjectStore as _;
-    let bytes = futures::executor::block_on(store.read_small(key)).ok().flatten()?;
-    String::from_utf8(bytes).ok()
-}
-
-/// ストア上の小さなテキストを書く (ミラーが有効な構成では実ファイルも更新)。
-fn write_store_text(
-    store: &narou_rs::native::object_store::NativeStore,
-    key: &narou_rs::platform::ObjectKey,
-    body: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use narou_rs::platform::ObjectStore as _;
-    futures::executor::block_on(store.write_small(key, body.as_bytes().to_vec()))?;
-    Ok(())
-}
 
 fn modify_settings_when_device_changed(settings: &mut HashMap<String, serde_yaml::Value>) {
     let Some(changed) = apply_device_related_settings(settings) else {

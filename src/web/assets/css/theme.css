@@ -18,6 +18,9 @@
   --input-bg: #fff;
   --input-border: #ccc;
   --border-radius: 0.25em;
+  --settings-hidden-control-size: 0.0625rem;
+  --settings-hidden-control-clip: 50%;
+  --control-focus-width: 0.125rem;
 
   /* Buttons */
   --btn-primary-bg: #2fa4e7;
@@ -52,6 +55,19 @@
   --console-bg: #333;
   --console-text: #fff;
   --console-height: 10rem;
+  --console-expanded-height: 80vh;
+  --console-progress-max-height: 70%;
+  --console-progress-gap: 0.35em;
+  --console-progress-padding: 0 0.7em 0.5em;
+  --console-progress-item-gap: 0.2em;
+  --console-progress-label-padding: 0.1em 0.45em;
+  --console-progress-label-font-size: 0.85em;
+  --console-progress-bar-height: 1.2em;
+  --console-progress-bar-transition: width 0.3s ease;
+  --progress-indeterminate-width: 30%;
+  --progress-indeterminate-start: -100%;
+  --progress-indeterminate-end: 350%;
+  --progress-indeterminate-animation: progress-indeterminate 1.2s ease-in-out infinite;
 
   /* Tags (Bootstrap label palette) */
   --tag-green: #5cb85c;

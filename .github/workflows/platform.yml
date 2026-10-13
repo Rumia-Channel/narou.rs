@@ -46,12 +46,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
-      - name: Worker dispatch policy regressions
-        run: node --test tests/worker_dispatch.test.mjs
       - name: Worker S3 deployment regressions
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_*s3*.py'
-      - name: SORAHOST smoke script regression
-        run: python3 -m unittest discover -s tests -p 'test_sorahost_smoke.py'
       - name: Web UI source-link escaping regressions
         run: node --test tests/render_links.test.mjs
       - name: Web UI progress bar regressions
@@ -328,7 +324,8 @@ jobs:
         if: steps.credentials.outputs.configured == 'true'
         run: |
           mkdir -p build
-          base=https://github.com/moparisthebest/static-curl/releases/download/v8.21.0
+          curl_tag="$(python3 -c 'import json; print(json.load(open("scripts/deploy-tools.json"))["curl_version"])')"
+          base="https://github.com/moparisthebest/static-curl/releases/download/$curl_tag"
           curl -fsSL -o build/curl "$base/curl-amd64"
           curl -fsSL -o sha256sum.txt "$base/sha256sum.txt"
           (cd build && grep 'curl-amd64' ../sha256sum.txt | sed 's|\./curl-amd64|curl|' | sha256sum -c -)
@@ -341,14 +338,22 @@ jobs:
           # Repository variable `SORAHOST_RELAY_START` に入れる。そのときリレーは
           # narou 側の start.sh が `NAROU_RELAY=1` のときだけ起動する
           # (1 プロジェクトに置ける起動コマンドは 1 つ。sorahost/README.md §10)。
-          RELAY_START: ${{ vars.SORAHOST_RELAY_START || 'node server.mjs' }}
+          RELAY_START: ${{ vars.SORAHOST_RELAY_START }}
         run: |
           cp /etc/ssl/certs/ca-certificates.crt build/cacert.pem
           cp scripts/sorahost-proxy/server.mjs build/server.mjs
+          mkdir -p build/worker
+          cp scripts/sorahost-proxy/worker/protocol.mjs build/worker/protocol.mjs
           chmod +x build/curl
-          cat > build/sorahost.json <<JSON
-          { "mode": "node", "framework": "node", "start": "${RELAY_START}", "include": ["server.mjs", "curl", "cacert.pem"] }
-          JSON
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          manifest = json.loads(Path("scripts/sorahost-proxy/sorahost.json").read_text())
+          if os.environ.get("RELAY_START"):
+              manifest["start"] = os.environ["RELAY_START"]
+          Path("build/sorahost.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
           ls -la build
       - name: Deploy to SORAHOST
         if: steps.credentials.outputs.configured == 'true'

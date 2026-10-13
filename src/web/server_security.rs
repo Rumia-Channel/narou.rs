@@ -52,7 +52,9 @@ impl ServerSecurity {
         global_setting: &HashMap<String, Value>,
         bind_host: &str,
     ) -> Self {
-        let reverse_proxy_mode = yaml_bool(global_setting.get("server-reverse-proxy.enable"))
+        let reverse_proxy_mode = global_setting
+            .get("server-reverse-proxy.enable")
+            .and_then(crate::setting_core::setting_bool_value)
             .unwrap_or(false);
         Self {
             basic_auth_header: basic_auth_header_from_settings(global_setting),
@@ -67,10 +69,10 @@ impl ServerSecurity {
                 reverse_proxy_mode,
             ),
             reverse_proxy_mode,
-            require_basic_auth_for_external_bind: yaml_bool(
-                global_setting.get("server-basic-auth.require-for-external-bind"),
-            )
-            .unwrap_or(true),
+            require_basic_auth_for_external_bind: global_setting
+                .get("server-basic-auth.require-for-external-bind")
+                .and_then(crate::setting_core::setting_bool_value)
+                .unwrap_or(true),
         }
     }
 }
@@ -98,7 +100,10 @@ impl AppState {
 fn basic_auth_header_from_settings(global_setting: &HashMap<String, Value>) -> Option<String> {
     use base64::Engine as _;
 
-    let enabled = yaml_bool(global_setting.get("server-basic-auth.enable")).unwrap_or(false);
+    let enabled = global_setting
+        .get("server-basic-auth.enable")
+        .and_then(crate::setting_core::setting_bool_value)
+        .unwrap_or(false);
     if !enabled {
         return None;
     }
@@ -184,15 +189,6 @@ fn yaml_string(value: Option<&Value>) -> Option<String> {
         Some(Value::String(s)) => Some(s.clone()),
         Some(Value::Number(n)) => Some(n.to_string()),
         Some(Value::Bool(b)) => Some(b.to_string()),
-        _ => None,
-    }
-}
-
-fn yaml_bool(value: Option<&Value>) -> Option<bool> {
-    match value {
-        Some(Value::Bool(b)) => Some(*b),
-        Some(Value::String(s)) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
-        Some(Value::Number(n)) => Some(n.as_i64().unwrap_or(0) != 0),
         _ => None,
     }
 }

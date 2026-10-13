@@ -20,19 +20,21 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use futures::StreamExt;
+use parking_lot::Mutex;
 use rusqlite::Connection;
 
 use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, AssetStream, ObjectEncoding, ObjectKey, ObjectListPage, ObjectListRequest,
     ObjectMetadata, ObjectPrefix, ObjectStore, PlatformFuture, prefix_upper_bound,
+    ObjectUpdateResult, SmallObjectMutator,
 };
 
 use crate::native::object_store::{
-    NativeObjectStore, content_type_for_path, logical_key_for_native_path, run_blocking,
+    NativeObjectStore, content_type_for_path, logical_key_for_native_path, run_blocking, run_scoped_blocking,
 };
 
 /// Payloads at or below this size are stored inline in `objects.data`;
@@ -113,7 +115,7 @@ impl SqliteObjectStore {
     }
 
     fn stat_blocking(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let conn = self.conn.lock();
         let mut statement = conn
             .prepare("SELECT size, content_type, updated_at FROM objects WHERE object_key = ?")
             .map_err(super::sqlite_error)?;
@@ -147,78 +149,60 @@ impl SqliteObjectStore {
     /// and CRC verification of (potentially large) payloads happen after it is
     /// released, so a read never blocks writers on CPU work.
     fn read_blocking(&self, key: &ObjectKey, limit: Option<u64>) -> Result<Option<Vec<u8>>> {
-        let (stored, encoding, crc32, size) = {
-            let conn = self.conn.lock().expect("sqlite mutex poisoned");
-            let mut statement = conn
-                .prepare("SELECT data, size, encoding, crc32 FROM objects WHERE object_key = ?")
-                .map_err(super::sqlite_error)?;
-            let mut rows = statement
-                .query(rusqlite::params![key.as_ref()])
-                .map_err(super::sqlite_error)?;
-            let Some(row) = rows.next().map_err(super::sqlite_error)? else {
-                return Ok(None);
-            };
-            let size: i64 = row.get(1).map_err(super::sqlite_error)?;
-            if size < 0 || limit.is_some_and(|limit| size as u64 > limit) {
-                return Err(NarouError::Platform(format!("small object exceeds the read cap: {key}")));
-            }
-            let inline = row.get_ref(0).map_err(super::sqlite_error)?;
-            let encoding: String = row.get(2).map_err(super::sqlite_error)?;
-            let encoding = ObjectEncoding::parse(&encoding)?;
-            let crc32: i64 = row.get(3).map_err(super::sqlite_error)?;
-            let stored = if let rusqlite::types::ValueRef::Blob(bytes) = inline {
-                if limit.is_some_and(|limit| bytes.len() as u64 > limit) {
-                    return Err(NarouError::Platform(format!("stored object exceeds the read cap: {key}")));
-                }
-                bytes.to_vec()
-            } else {
-                drop(rows);
-                drop(statement);
-                let mut statement = conn
-                    .prepare("SELECT data FROM object_chunks WHERE object_key = ? ORDER BY seq")
-                    .map_err(super::sqlite_error)?;
-                let mut rows = statement
-                    .query(rusqlite::params![key.as_ref()])
-                    .map_err(super::sqlite_error)?;
-                let mut stored = Vec::new();
-                while let Some(row) = rows.next().map_err(super::sqlite_error)? {
-                    let chunk = row.get_ref(0).map_err(super::sqlite_error)?
-                        .as_blob().map_err(|error| NarouError::Platform(error.to_string()))?;
-                    if limit.is_some_and(|limit| stored.len() as u64 + chunk.len() as u64 > limit) {
-                        return Err(NarouError::Platform(format!("stored object exceeds the read cap: {key}")));
-                    }
-                    stored.extend_from_slice(chunk);
-                }
-                stored
-            };
-            (stored, encoding, crc32, size)
+        let payload = {
+            let conn = self.conn.lock();
+            read_stored_payload(&conn, key, limit)?
         };
-        let data = if encoding == ObjectEncoding::None {
-            stored
-        } else if let Some(limit) = limit {
-            match encoding {
-                ObjectEncoding::Brotli => {
-                    use std::io::Read;
-                    let mut decoded = Vec::new();
-                    brotli::Decompressor::new(stored.as_slice(), 4096)
-                        .take(limit + 1).read_to_end(&mut decoded)?;
-                    if decoded.len() as u64 > limit {
-                        return Err(NarouError::Platform(format!("decoded object exceeds the read cap: {key}")));
-                    }
-                    decoded
-                }
-                ObjectEncoding::Deflate => miniz_oxide::inflate::decompress_to_vec_with_limit(&stored, limit as usize)
-                    .map_err(|error| NarouError::Platform(format!("invalid or oversized deflate object: {error}")))?,
-                ObjectEncoding::None => unreachable!(),
+        payload.map(|payload| decode_stored_payload(payload, key, limit)).transpose()
+    }
+
+    fn update_small_blocking<'data>(
+        &self,
+        key: &ObjectKey,
+        mutate: &mut SmallObjectMutator<'data>,
+    ) -> Result<ObjectUpdateResult> {
+        let path = self.mirror.resolve_path(key)?;
+        let mut operation = || {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(super::sqlite_error)?;
+            let limit = crate::native::object_store::MAX_SMALL_OBJECT_BYTES;
+            let current = match read_stored_payload(&tx, key, Some(limit))? {
+                Some(payload) => Some(decode_stored_payload(payload, key, Some(limit))?),
+                None => self.mirror.read_small_blocking(key)?,
+            };
+            let Some(data) = mutate(current.as_deref())? else {
+                tx.commit().map_err(super::sqlite_error)?;
+                return Ok(ObjectUpdateResult::Committed);
+            };
+            if data.len() as u64 > limit {
+                return Err(NarouError::Platform(format!("small object exceeds {limit} bytes: {key}")));
             }
+            let (stored, encoding) = crate::platform::encode_object_payload(&data);
+            let updated_at = Self::now_rfc3339();
+            insert_stored_object(&tx, StoredObject {
+                key,
+                size: data.len() as i64,
+                crc32: crate::platform::object_crc32(&data) as i64,
+                stored: &stored,
+                encoding,
+                content_type: content_type_for_path(Path::new(key.as_ref())),
+                updated_at: &updated_at,
+            })?;
+            tx.commit().map_err(super::sqlite_error)?;
+            if self.mirror_files
+                && let Err(error) = self.mirror.write_bytes_blocking(key, &data)
+            {
+                return Ok(ObjectUpdateResult::ProjectionFailed(error));
+            }
+            Ok(ObjectUpdateResult::Committed)
+        };
+        if self.mirror_files || path.exists() {
+            self.mirror.ensure_parent_dir(&path)?;
+            crate::db::inventory::with_exclusive_file_lock(&path, operation)
         } else {
-            crate::platform::decompress_object_payload(&stored, encoding)?
-        };
-        crate::platform::verify_object_crc32(&data, crc32 as u32)?;
-        if data.len() as i64 != size {
-            return Err(NarouError::Platform(format!("object payload size mismatch: {key}")));
+            operation()
         }
-        Ok(Some(data))
     }
 
     /// Insert or replace one object (inline or chunked) in a single
@@ -228,7 +212,7 @@ impl SqliteObjectStore {
     fn write_blocking(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
         let (stored, encoding) = crate::platform::compress_object_payload(data);
         let crc32 = crate::platform::object_crc32(data) as i64;
-        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(super::sqlite_error)?;
         let updated_at = Self::now_rfc3339();
         insert_stored_object(
@@ -239,7 +223,7 @@ impl SqliteObjectStore {
                 crc32,
                 stored: &stored,
                 encoding,
-                content_type: content_type_for_key(key),
+                content_type: content_type_for_path(Path::new(key.as_ref())),
                 updated_at: &updated_at,
             },
         )?;
@@ -279,7 +263,7 @@ impl SqliteObjectStore {
             }
         }
 
-        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(super::sqlite_error)?;
         if base.is_empty() {
             tx.execute("DELETE FROM object_chunks", [])
@@ -306,7 +290,7 @@ impl SqliteObjectStore {
     }
 
     fn delete_blocking(&self, key: &ObjectKey) -> Result<()> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM objects WHERE object_key = ?",
             rusqlite::params![key.as_ref()],
@@ -422,7 +406,7 @@ impl SqliteObjectStore {
         let lower = format!("{base}/");
         let upper = prefix_upper_bound(&lower);
         {
-            let conn = self.conn.lock().expect("sqlite mutex poisoned");
+            let conn = self.conn.lock();
             let mut statement = conn
                 .prepare(
                     "SELECT object_key, size, content_type, updated_at FROM objects
@@ -492,11 +476,70 @@ impl SqliteObjectStore {
     }
 }
 
-fn content_type_for_key(key: &ObjectKey) -> Option<String> {
-    // Reuse the extension-based mapping; the key's last component carries the
-    // same extension the mirrored file would have.
-    let name = key.as_ref().rsplit('/').next().unwrap_or_default();
-    content_type_for_path(std::path::Path::new(name))
+struct StoredPayload {
+    data: Vec<u8>,
+    encoding: ObjectEncoding,
+    crc32: u32,
+    size: u64,
+}
+
+fn read_stored_payload(
+    conn: &Connection,
+    key: &ObjectKey,
+    limit: Option<u64>,
+) -> Result<Option<StoredPayload>> {
+    let mut statement = conn.prepare(
+        "SELECT data, size, encoding, crc32 FROM objects WHERE object_key = ?",
+    ).map_err(super::sqlite_error)?;
+    let mut rows = statement.query([key.as_ref()]).map_err(super::sqlite_error)?;
+    let Some(row) = rows.next().map_err(super::sqlite_error)? else { return Ok(None) };
+    let size: i64 = row.get(1).map_err(super::sqlite_error)?;
+    if size < 0 || limit.is_some_and(|limit| size as u64 > limit) {
+        return Err(NarouError::Platform(format!("small object exceeds the read cap: {key}")));
+    }
+    let encoding: String = row.get(2).map_err(super::sqlite_error)?;
+    let encoding = ObjectEncoding::parse(&encoding)?;
+    let crc32: i64 = row.get(3).map_err(super::sqlite_error)?;
+    let data = if let rusqlite::types::ValueRef::Blob(bytes) = row.get_ref(0).map_err(super::sqlite_error)? {
+        if limit.is_some_and(|limit| bytes.len() as u64 > limit) {
+            return Err(NarouError::Platform(format!("stored object exceeds the read cap: {key}")));
+        }
+        bytes.to_vec()
+    } else {
+        drop(rows);
+        drop(statement);
+        let mut statement = conn.prepare(
+            "SELECT data FROM object_chunks WHERE object_key = ? ORDER BY seq",
+        ).map_err(super::sqlite_error)?;
+        let mut rows = statement.query([key.as_ref()]).map_err(super::sqlite_error)?;
+        let mut data = Vec::new();
+        while let Some(row) = rows.next().map_err(super::sqlite_error)? {
+            let chunk = row.get_ref(0).map_err(super::sqlite_error)?.as_blob()
+                .map_err(|error| NarouError::Platform(error.to_string()))?;
+            if limit.is_some_and(|limit| data.len() as u64 + chunk.len() as u64 > limit) {
+                return Err(NarouError::Platform(format!("stored object exceeds the read cap: {key}")));
+            }
+            data.extend_from_slice(chunk);
+        }
+        data
+    };
+    Ok(Some(StoredPayload { data, encoding, crc32: crc32 as u32, size: size as u64 }))
+}
+
+fn decode_stored_payload(payload: StoredPayload, key: &ObjectKey, limit: Option<u64>) -> Result<Vec<u8>> {
+    let StoredPayload { data: stored, encoding, crc32, size } = payload;
+    let data = if encoding == ObjectEncoding::None {
+        stored
+    } else if let Some(limit) = limit {
+        crate::platform::decode_object_payload_limited(&stored, encoding, limit as usize)?.into_owned()
+    } else {
+        crate::platform::decompress_object_payload(&stored, encoding)?
+    };
+    crate::platform::verify_object_crc32(&data, crc32)?;
+    if data.len() as u64 != size {
+        return Err(NarouError::Platform(format!("object payload size mismatch: {key}")));
+    }
+    Ok(data)
 }
 
 /// One object ready to be written: metadata plus the stored (compressed)
@@ -508,7 +551,7 @@ struct StoredObject<'a> {
     crc32: i64,
     stored: &'a [u8],
     encoding: ObjectEncoding,
-    content_type: Option<String>,
+    content_type: Option<&'a str>,
     updated_at: &'a str,
 }
 
@@ -643,6 +686,16 @@ impl ObjectStore for SqliteObjectStore {
                 this.mirror.write_bytes_blocking(&key, &data)?;
             }
             Ok(())
+        })
+    }
+
+    fn update_small<'a, 'data: 'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        mutate: &'a mut SmallObjectMutator<'data>,
+    ) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
+        Box::pin(async move {
+            run_scoped_blocking(|| self.update_small_blocking(key, mutate))
         })
     }
 
@@ -804,8 +857,8 @@ const IMPORT_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// Row cap for one import transaction (many small files).
 const IMPORT_BATCH_ROWS: usize = 256;
 
-/// One file staged for the import batch: read and compressed outside the
-/// connection lock, inserted inside a bounded transaction.
+/// One object staged for the import batch: payloads and empty-version markers
+/// are compressed outside the connection lock and inserted in a bounded transaction.
 struct ImportedObject {
     key: ObjectKey,
     size: i64,
@@ -814,7 +867,54 @@ struct ImportedObject {
     encoding: ObjectEncoding,
 }
 
-/// Import every file under the archive root into `objects`/`object_chunks`.
+enum ArchiveImportEntry {
+    File(PathBuf),
+    EmptyCacheVersion(ObjectKey),
+}
+
+/// Preserve only empty version directories in the recognized novel cache
+/// layout, not arbitrary empty folders. Existing marker files are ordinary
+/// files and retain their payloads through the importer.
+fn collect_archive_import_entries(
+    root: &Path,
+    current: &Path,
+    output: &mut Vec<ArchiveImportEntry>,
+) -> Result<()> {
+    let mut has_entries = false;
+    for entry in std::fs::read_dir(current)? {
+        let path = crate::db::paths::ensure_within_archive_root(&entry?.path(), root)?;
+        has_entries = true;
+        if path.is_dir() {
+            collect_archive_import_entries(root, &path, output)?;
+        } else if path.is_file() {
+            output.push(ArchiveImportEntry::File(path));
+        }
+    }
+    if !has_entries {
+        let novel_dir = current.parent().and_then(Path::parent).and_then(Path::parent);
+        if let Some(novel_dir) = novel_dir {
+            if let (Some(prefix), Some(marker)) = (
+                logical_key_for_native_path(root, novel_dir),
+                logical_key_for_native_path(root, &current.join(".version")),
+            ) {
+                let prefix_depth = prefix.as_ref().split('/').count();
+                if matches!(prefix_depth, 3 | 4)
+                    && prefix.as_ref().starts_with("novels/")
+                    && crate::application::webui::diff::cached_object_parts(
+                        prefix.as_ref(),
+                        marker.as_ref(),
+                    )
+                    .is_some()
+                {
+                    output.push(ArchiveImportEntry::EmptyCacheVersion(marker));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Import archive files and legitimate empty cache versions into the object tables.
 /// Runs once when the table is empty; the upserts keep a partial import
 /// resumable on the next start.
 ///
@@ -827,21 +927,26 @@ pub(crate) fn import_archive_into_objects(
     mirror: &NativeObjectStore,
 ) -> Result<usize> {
     let root = mirror.root().to_path_buf();
-    let mut paths = Vec::new();
+    let mut entries = Vec::new();
     if root.is_dir() {
-        NativeObjectStore::recursive_files(&root, &root, &mut paths)?;
+        collect_archive_import_entries(&root, &root, &mut entries)?;
     }
-    if paths.is_empty() {
+    if entries.is_empty() {
         return Ok(0);
     }
     let mut imported = 0usize;
     let mut batch: Vec<ImportedObject> = Vec::new();
     let mut batch_bytes = 0usize;
-    for path in paths {
-        let Some(key) = logical_key_for_native_path(&root, &path) else {
-            continue;
+    for entry in entries {
+        let (key, data) = match entry {
+            ArchiveImportEntry::File(path) => {
+                let Some(key) = logical_key_for_native_path(&root, &path) else {
+                    continue;
+                };
+                (key, std::fs::read(&path)?)
+            }
+            ArchiveImportEntry::EmptyCacheVersion(key) => (key, Vec::new()),
         };
-        let data = std::fs::read(&path)?;
         let size = data.len() as i64;
         let crc32 = crate::platform::object_crc32(&data) as i64;
         let (stored, encoding) = crate::platform::compress_object_payload(&data);
@@ -874,7 +979,7 @@ fn flush_import_batch(
         return Ok(());
     }
     let updated_at = SqliteObjectStore::now_rfc3339();
-    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+    let mut guard = conn.lock();
     let tx = guard.transaction().map_err(super::sqlite_error)?;
     for object in batch.iter() {
         insert_stored_object(
@@ -885,7 +990,7 @@ fn flush_import_batch(
                 crc32: object.crc32,
                 stored: &object.stored,
                 encoding: object.encoding,
-                content_type: content_type_for_key(&object.key),
+                content_type: content_type_for_path(Path::new(object.key.as_ref())),
                 updated_at: &updated_at,
             },
         )?;
@@ -1121,6 +1226,48 @@ mod tests {
     use crate::platform::ObjectPrefix;
     use std::num::NonZeroUsize;
 
+    #[test]
+    fn db_only_cache_catalog_survives_missing_files_and_corrupt_sections() {
+        use crate::application::webui::diff::{plan_diff_cache_clean, read_diff_cache_catalog};
+        use crate::platform::NovelObjectKeys;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::native::sqlite::migrations::apply(&mut conn).unwrap();
+        let mirror = NativeObjectStore::from_root(dir.path().to_path_buf()).unwrap();
+        let store = SqliteObjectStore::with_mirror_files(Arc::new(Mutex::new(conn)), mirror, false);
+        let keys = NovelObjectKeys::new("site", "title", false).unwrap();
+        let cached = keys.cached_section("v2", "2", "保存済み");
+        let section = "index: '2'\nhref: 'https://example.test/2'\nsubtitle: \"保存済み  \\n\"\nfile_subtitle: 保存済み\nsubdate: ''\nelement:\n  body: 旧本文\n";
+        futures::executor::block_on(async {
+            store.write_small(&cached, section.as_bytes().to_vec()).await.unwrap();
+            store.write_small(&keys.cached_version_marker("v2"), Vec::new()).await.unwrap();
+            store.write_small(&keys.cached_version_marker("v1"), Vec::new()).await.unwrap();
+            store.write_small(&keys.section("2", "現在"), b"current".to_vec()).await.unwrap();
+            assert!(!dir.path().join("site/title").exists(), "all cache objects are DB-only");
+            let versions = read_diff_cache_catalog(&store, keys.prefix(), &[]).await.unwrap();
+            assert_eq!(versions.len(), 2);
+            assert_eq!(versions[0].entries, vec![("2".to_string(), "保存済み".to_string())]);
+            assert!(!versions[0].only_latest_update);
+            assert!(versions[1].only_latest_update);
+
+            store.conn_handle().lock().execute(
+                "UPDATE objects SET crc32 = crc32 + 1 WHERE object_key = ?",
+                [cached.as_ref()],
+            ).unwrap();
+            assert!(store.read_small(&cached).await.is_err(), "exercise a real stored-payload read failure");
+            let corrupt = read_diff_cache_catalog(&store, keys.prefix(), &[]).await.unwrap();
+            assert!(corrupt[0].entries.is_empty());
+            assert!(!corrupt[0].only_latest_update, "failed I/O cannot become an empty version");
+            for key in plan_diff_cache_clean(&store, keys.prefix()).await.unwrap() {
+                ObjectStore::delete(&store, &key).await.unwrap();
+            }
+            assert!(read_diff_cache_catalog(&store, keys.prefix(), &[]).await.unwrap().is_empty());
+            assert_eq!(store.read_small(&keys.section("2", "現在")).await.unwrap().unwrap(), b"current");
+            assert!(!dir.path().join("site/title").exists(), "catalog/clean must not materialize DB-only files");
+        });
+    }
+
     fn temp_store() -> (tempfile::TempDir, SqliteObjectStore) {
         let dir = tempfile::tempdir().unwrap();
         let conn = {
@@ -1259,7 +1406,7 @@ mod tests {
         let payload = "同じ文章の繰り返し。".repeat(10_000).into_bytes();
         futures::executor::block_on(store.write_small(&key, payload.clone())).unwrap();
 
-        let conn = store.conn.lock().expect("sqlite mutex poisoned");
+        let conn = store.conn.lock();
         let (encoding, stored_len): (String, i64) = conn
             .query_row(
                 "SELECT encoding, LENGTH(data) FROM objects WHERE object_key = ?",
@@ -1562,7 +1709,7 @@ mod tests {
         let chunk_key = ObjectKey::try_new("novels/site/title/raw/1.html").unwrap();
         let big = incompressible(OBJECT_CHUNK_BYTES + 1024);
         let body_hash = {
-            let guard = store.conn_handle().lock().unwrap();
+            let guard = store.conn_handle().lock();
             crate::native::sqlite::content::store_body(&guard, "body: verify\n").unwrap()
         };
         futures::executor::block_on(async {
@@ -1578,12 +1725,12 @@ mod tests {
         });
 
         {
-            let guard = store.conn_handle().lock().unwrap();
+            let guard = store.conn_handle().lock();
             assert!(verify_payload_crc32(&guard).unwrap().is_empty());
         }
 
         {
-            let guard = store.conn_handle().lock().unwrap();
+            let guard = store.conn_handle().lock();
             // CRC mismatch on an inline payload.
             guard
                 .execute(
@@ -1614,7 +1761,7 @@ mod tests {
         }
 
         let corruptions = {
-            let guard = store.conn_handle().lock().unwrap();
+            let guard = store.conn_handle().lock();
             verify_payload_crc32(&guard).unwrap()
         };
         let keys: Vec<&str> = corruptions.iter().map(|issue| issue.key.as_str()).collect();
@@ -1676,7 +1823,7 @@ mod tests {
             let data = futures::executor::block_on(store.read_small(&key)).unwrap().unwrap();
             assert_eq!(data, expected, "{key}");
         }
-        let guard = store.conn_handle().lock().unwrap();
+        let guard = store.conn_handle().lock();
         let inline: Option<Vec<u8>> = guard
             .query_row(
                 "SELECT data FROM objects WHERE object_key = 'novels/site/title/raw/1.html'",
@@ -1731,7 +1878,7 @@ mod tests {
             let upper = prefix_upper_bound(&lower);
             (base, lower, upper)
         };
-        let guard = store.conn_handle().lock().unwrap();
+        let guard = store.conn_handle().lock();
         let remaining: i64 = guard
             .query_row(
                 "SELECT COUNT(*) FROM objects

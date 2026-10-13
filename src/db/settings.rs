@@ -108,16 +108,7 @@ pub fn string(scope: SettingScope, key: &str) -> Option<String> {
 }
 
 pub fn bool_value(scope: SettingScope, key: &str) -> Option<bool> {
-    value(scope, key).and_then(|value| match value {
-        Value::Bool(value) => Some(value),
-        Value::Number(value) => value.as_i64().map(|value| value != 0),
-        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "true" | "yes" | "on" | "1" => Some(true),
-            "false" | "no" | "off" | "0" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    })
+    value(scope, key).and_then(|value| crate::setting_core::setting_bool_value(&value))
 }
 
 pub fn list(scope: SettingScope, key: &str) -> Vec<String> {

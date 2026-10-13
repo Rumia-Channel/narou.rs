@@ -52,10 +52,16 @@ impl LoggerState {
 
         let settings = narou_rs::db::settings::load_for_root(&root_dir, SettingScope::Local)
             .unwrap_or_default();
-        let logging_enabled = yaml_bool(settings.get("logging"));
+        let logging_enabled = settings
+            .get("logging")
+            .and_then(narou_rs::setting_core::setting_bool_value)
+            .unwrap_or(false);
         let logging_enabled =
             logging_enabled && std::env::var("NAROU_ENV").ok().as_deref() != Some("test");
-        let split_convert_logs = yaml_bool(settings.get("concurrency"));
+        let split_convert_logs = settings
+            .get("concurrency")
+            .and_then(narou_rs::setting_core::setting_bool_value)
+            .unwrap_or(false);
 
         let log_dir = root_dir.join("log");
         if logging_enabled {
@@ -90,8 +96,8 @@ impl LoggerState {
 }
 
 pub fn init() {
-    let mut state = state().lock().expect("logger state lock poisoned");
-    *state = LoggerState::load();
+    let loaded = LoggerState::load();
+    *state().lock().expect("logger state lock poisoned") = loaded;
 }
 
 pub fn init_tracing(no_color: bool) {
@@ -332,15 +338,6 @@ pub fn find_narou_root() -> Option<PathBuf> {
         if !current.pop() {
             return None;
         }
-    }
-}
-
-fn yaml_bool(value: Option<&serde_yaml::Value>) -> bool {
-    match value {
-        Some(serde_yaml::Value::Bool(v)) => *v,
-        Some(serde_yaml::Value::Number(n)) => n.as_i64().map(|v| v != 0).unwrap_or(false),
-        Some(serde_yaml::Value::String(v)) => matches!(v.as_str(), "true" | "yes" | "on" | "1"),
-        _ => false,
     }
 }
 

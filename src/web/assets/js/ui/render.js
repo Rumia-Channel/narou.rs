@@ -4,6 +4,7 @@
  */
 import { State, El, lsSet, persistListState } from '../core/state.js';
 import { fetchJson, postJson } from '../core/http.js';
+import { postSortedJson } from '../core/sort_state.js';
 import { canUseAction, applyActionCapabilities } from '../core/capabilities.js';
 import { showContextMenu, showTagColorMenu } from './context_menu.js';
 
@@ -21,6 +22,25 @@ const ANNOTATION_COLOR_TIME_LIMIT_MS = 6 * 60 * 60 * 1000;
 
 let selectionDrag = null;
 let queueDragTaskId = null;
+let storyGeneration = 0;
+let storyOwner = null;
+let storyPopover = null;
+
+function closeStoryPopover() {
+  ++storyGeneration;
+  storyPopover?.remove();
+  storyPopover = null;
+  storyOwner = null;
+}
+
+document.addEventListener('click', event => {
+  if (storyOwner && !storyOwner.contains(event.target) && !storyPopover?.contains(event.target)) {
+    closeStoryPopover();
+  }
+}, true);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeStoryPopover();
+});
 
 function materialIcon(name, extraClass = '') {
   const cls = extraClass
@@ -34,6 +54,7 @@ function materialIcon(name, extraClass = '') {
 export function renderNovelList() {
   const tbody = El.novelListBody;
   if (!tbody) return;
+  closeStoryPopover();
 
   const sorted = getFilteredSortedNovels();
   const pageLength = normalizePageLength(State.pageLength);
@@ -247,7 +268,7 @@ function matchFilterToken(novel, token) {
   ].join(' ');
   // The same identities the server-side search accepts: a pasted page URL, the
   // N-code or numeric id in it, and the record id itself.
-  const pageUrl = target(novel.toc_url).replace(/\/+$/, '');
+  const pageUrl = target(novel.display_url || novel.toc_url).replace(/\/+$/, '');
   const urlSegment = pageUrl.split('/').pop() || '';
   const matchIdentity = (value) => {
     if (!value) return false;
@@ -511,7 +532,7 @@ function createRow(novel, rowIndex) {
 
   // Menu button (opens context menu) — glyphicon-option-horizontal equivalent
   const downloadLink = `<a href="/novels/${encodeURIComponent(String(novel.id))}/download" class="row-action-btn btn-download" title="書籍データをダウンロード">${materialIcon('download', 'icon-only')}</a>`;
-  const folderBtn = `<button class="row-action-btn btn-folder" data-folder-id="${novel.id}" type="button" title="保存先を開く">${materialIcon('folder_open', 'icon-only')}</button>`;
+  const folderBtn = `<button class="row-action-btn btn-folder" data-capability="open_folder" data-folder-id="${novel.id}" type="button" title="保存先を開く">${materialIcon('folder_open', 'icon-only')}</button>`;
   const updateBtn = `<button class="row-action-btn btn-update-action" data-update-id="${novel.id}" type="button" title="凍結済みでも更新">${materialIcon('refresh', 'icon-only')}</button>`;
   const menuBtn = `<button class="row-action-btn btn-menu-icon" data-menu-id="${novel.id}" type="button" title="個別メニュー">${materialIcon('more_horiz', 'icon-only')}</button>`;
 
@@ -566,7 +587,7 @@ function createRow(novel, rowIndex) {
     update.addEventListener('click', async (e) => {
       e.stopPropagation();
       try {
-        const result = await postJson('/api/update', { targets: [String(novel.id)], force: true });
+        const result = await postSortedJson('/api/update', { targets: [String(novel.id)], force: true });
         if (result?.success === false) {
           showNotification(result.message || '更新ジョブを追加できませんでした', 'warning');
         }
@@ -581,30 +602,34 @@ function createRow(novel, rowIndex) {
   if (storyBtn) {
     storyBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      const existing = document.querySelector('.story-popover');
-      if (existing) existing.remove();
-
+      if (storyOwner === storyBtn) {
+        closeStoryPopover();
+        return;
+      }
+      closeStoryPopover();
+      const generation = ++storyGeneration;
+      storyOwner = storyBtn;
+      const pop = document.createElement('div');
+      pop.className = 'story-popover';
+      pop.textContent = '読み込み中...';
+      storyPopover = pop;
+      document.body.appendChild(pop);
+      const rect = storyBtn.getBoundingClientRect();
+      pop.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+      pop.style.left = Math.max(0, rect.left + window.scrollX - 200) + 'px';
       const nid = storyBtn.dataset.storyId;
       try {
         const data = await fetchJson(`/api/story?id=${nid}`);
-        if (!data) return;
-        const pop = document.createElement('div');
-        pop.className = 'story-popover';
+        if (generation !== storyGeneration || storyOwner !== storyBtn || !storyBtn.isConnected) return;
+        if (!data) {
+          closeStoryPopover();
+          return;
+        }
         pop.innerHTML = `<div class="story-popover-title">${esc(data.title || '')}</div>
           <div class="story-popover-body">${renderMultilineHtml(data.story, '(あらすじなし)')}</div>`;
-        document.body.appendChild(pop);
-        const rect = storyBtn.getBoundingClientRect();
-        pop.style.top = (rect.bottom + window.scrollY + 4) + 'px';
-        pop.style.left = Math.max(0, rect.left + window.scrollX - 200) + 'px';
-
-        const dismiss = (ev) => {
-          if (!pop.contains(ev.target) && ev.target !== storyBtn) {
-            pop.remove();
-            document.removeEventListener('click', dismiss);
-          }
-        };
-        setTimeout(() => document.addEventListener('click', dismiss), 0);
-      } catch { /* ignore */ }
+      } catch {
+        if (generation === storyGeneration) closeStoryPopover();
+      }
     });
   }
 
@@ -765,9 +790,9 @@ export function getSelectedIdsInDisplayOrder() {
 }
 
 export function pruneSelectedIdsToCurrentList() {
-  const visibleIds = new Set(getFilteredNovels().map(novel => String(novel.id)));
+  const currentIds = new Set(State.novels.map(novel => String(novel.id)));
   for (const id of [...State.selectedIds]) {
-    if (!visibleIds.has(id)) {
+    if (!currentIds.has(id)) {
       State.selectedIds.delete(id);
     }
   }
@@ -1187,6 +1212,7 @@ export function syncViewChecks() {
   const containerMain = document.querySelector('.container-main');
   if (containerMain) containerMain.classList.toggle('wide-mode', State.wideMode);
 
+  El.controlPanel?.classList.toggle('hide', !State.buttonsTop);
   // Footer navbar
   if (El.footerNavbar) {
     El.footerNavbar.classList.toggle('hide', !State.buttonsFooter);

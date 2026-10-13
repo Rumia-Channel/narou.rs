@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::platform::PlatformFuture;
 
+/// Inventory name login credentials are stored under (`login_cookie`).
+pub const INVENTORY_NAME: &str = "login_cookie";
+
 /// One host's cookies inside a login.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostCookie {
@@ -512,20 +515,230 @@ pub fn tidy_groups(groups: &[LoginGroup], site: &str) -> Vec<LoginGroup> {
 }
 
 
+/// A decoded `login_cookie` map: sites in trial order, their per-site
+/// encryption flags, and whether the stored shape had to be rewritten.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DecodedCookieMap {
+    /// Every stored site with its ordered logins.
+    pub sites: BTreeMap<String, Vec<LoginGroup>>,
+    /// Sites whose stored value is encrypted at rest. A rewrite re-encrypts
+    /// every site, so the whole map is flagged after one.
+    pub encrypted: BTreeSet<String>,
+    /// Whether decoding folded an older shape, so the caller must write
+    /// `sites` back in the stored form.
+    pub needs_rewrite: bool,
+}
+
+/// Decode the whole stored `login_cookie` map: decrypt every value, migrate
+/// older shapes (host keys, per-host credential lists) to one login per site,
+/// and report the per-site encryption flags and whether the result must be
+/// written back.
+///
+/// `key` is the library login key; an encrypted value without one is an error
+/// rather than silently dropping the credentials (fail-closed). `settings`
+/// resolves legacy host keys to their site and is passed in because the Worker
+/// reads its site definitions from the object store.
+pub fn decode_cookie_map(
+    raw: &BTreeMap<String, String>,
+    key: Option<&[u8; crate::login::KEY_LEN]>,
+    settings: &[crate::downloader::site_setting::SiteSetting],
+) -> Result<DecodedCookieMap> {
+    let mut stored: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
+    let mut legacy_per_site: BTreeMap<String, Vec<Vec<LoginGroup>>> = BTreeMap::new();
+    let mut needs_rewrite = false;
+    for (key_name, value) in raw {
+        // 暗号文の AAD は書き込み時のキー名 (サイトまたは旧ホスト名)。
+        let plain = match crate::login::decrypt_stored_value(key, key_name, value)? {
+            Some(cookie) => cookie,
+            None => value.clone(),
+        };
+        let site = site_for_host_with(settings, key_name);
+        if site != *key_name {
+            needs_rewrite = true;
+        }
+        let Some(decoded) = decode_groups(&plain, &site).ok() else {
+            continue;
+        };
+        match decoded {
+            // 版 2 はホストごとに「同じアカウントの並び」を持っていた。
+            DecodedGroups::PerHost(groups) => {
+                legacy_per_site.entry(site).or_default().push(groups);
+            }
+            DecodedGroups::Current(groups) => {
+                if !groups.is_empty() {
+                    stored.entry(site).or_default().extend(groups);
+                }
+            }
+        }
+    }
+    for (site, lists) in legacy_per_site {
+        let folded = fold_per_host_lists(lists, &site);
+        stored.entry(site).or_default().extend(folded);
+    }
+    // 同じサイトのログインが複数のキーから来たら 1 つに畳む。
+    let mut tidied: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
+    for (site, groups) in stored {
+        let before = groups.len();
+        let groups = LoginGroup::merge_by_site(groups, &site);
+        if groups.len() != before {
+            // 断片が 1 ログインにまとまった分は書き戻す。
+            needs_rewrite = true;
+        }
+        tidied.insert(site, groups);
+    }
+    let mut sites = tidied;
+    if assign_group_ids(&mut sites) {
+        needs_rewrite = true;
+    }
+    let encrypted = if needs_rewrite {
+        sites.keys().cloned().collect()
+    } else {
+        encrypted_sites(raw, &sites)
+    };
+    Ok(DecodedCookieMap {
+        sites,
+        encrypted,
+        needs_rewrite,
+    })
+}
+
+/// Encrypt a site→logins map for storage: one `enc:v1:` value per non-empty
+/// site, with the site name bound into the authentication tag. Empty sites are
+/// dropped, so an empty map means "nothing stored".
+pub fn encode_cookie_map(
+    sites: &BTreeMap<String, Vec<LoginGroup>>,
+    key: &[u8; crate::login::KEY_LEN],
+) -> Result<BTreeMap<String, String>> {
+    let mut encrypted = BTreeMap::new();
+    for (site, groups) in sites {
+        if groups.is_empty() {
+            continue;
+        }
+        let encoded = encode_groups(groups)?;
+        encrypted.insert(site.clone(), crate::login::encrypt_at_rest(key, site, &encoded)?);
+    }
+    Ok(encrypted)
+}
+
+/// Store one site's logins in a decoded map: normalize the site, tidy the
+/// logins, and drop the entry when nothing remains.
+pub fn save_site_groups(
+    map: &mut BTreeMap<String, Vec<LoginGroup>>,
+    site: &str,
+    groups: &[LoginGroup],
+) {
+    let site = site.trim().to_ascii_lowercase();
+    let groups = tidy_groups(groups, &site);
+    if groups.is_empty() {
+        map.remove(&site);
+    } else {
+        map.insert(site, groups);
+    }
+}
+
+/// Replace a site's logins only while its complete ordered snapshot matches.
+/// A missing site and an empty expected slice describe the same snapshot.
+pub fn compare_save_site_groups(
+    map: &mut BTreeMap<String, Vec<LoginGroup>>,
+    site: &str,
+    expected: &[LoginGroup],
+    replacement: &[LoginGroup],
+) -> bool {
+    let site = normalize_cookie_host(site);
+    if map.get(&site).map(Vec::as_slice).unwrap_or_default() != expected {
+        return false;
+    }
+    save_site_groups(map, &site, replacement);
+    true
+}
+
+/// Merge imported logins into a decoded map, appending to sites that already
+/// have logins; a login with the same cookies is not added twice. Returns the
+/// number of sites stored.
+pub fn merge_site_groups(
+    map: &mut BTreeMap<String, Vec<LoginGroup>>,
+    entries: &BTreeMap<String, Vec<LoginGroup>>,
+) -> usize {
+    for (site, groups) in entries {
+        let site = site.trim().to_ascii_lowercase();
+        let stored = map.entry(site.clone()).or_default();
+        for group in tidy_groups(groups, &site) {
+            if !stored.iter().any(|existing| existing.same_cookies(&group)) {
+                stored.push(group);
+            }
+        }
+    }
+    map.retain(|_, groups| !groups.is_empty());
+    map.len()
+}
+
+/// The map a replace-style import stores: sites that are not part of the
+/// import are dropped.
+pub fn replace_site_groups(
+    entries: &BTreeMap<String, Vec<LoginGroup>>,
+) -> BTreeMap<String, Vec<LoginGroup>> {
+    let mut map: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
+    for (site, groups) in entries {
+        let site = site.trim().to_ascii_lowercase();
+        let groups = tidy_groups(groups, &site);
+        if !groups.is_empty() {
+            map.insert(site, groups);
+        }
+    }
+    map
+}
+
+/// Drop one site's logins from a decoded map. Returns whether it was stored.
+pub fn remove_site_groups(map: &mut BTreeMap<String, Vec<LoginGroup>>, site: &str) -> bool {
+    map.remove(&site.trim().to_ascii_lowercase()).is_some()
+}
+
+/// A positional edit never silently applies to a newer account/order.
+pub const CONCURRENT_EDIT_MESSAGE: &str =
+    "ログイン情報が別の操作で変更されました。一覧を読み直してからもう一度操作してください";
+
 /// Cookie persistence boundary.
 pub trait CookieStore: Send + Sync {
     /// Logins registered for `site`, in the order they should be tried.
     fn load_groups<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<Vec<LoginGroup>>>;
-    /// Replace every login for `site` (an empty slice removes the entry).
+    /// Explicitly replace every login for `site`, atomically preserving the
+    /// latest values of other sites. Positional edits use the checked method.
     fn save_groups<'a>(
         &'a self,
         site: &'a str,
         groups: &'a [LoginGroup],
     ) -> PlatformFuture<'a, Result<()>>;
-    /// Drop the stored logins for `site`.
-    fn clear<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<()>>;
+    /// Replace one site's complete ordered snapshot if it still matches
+    /// `expected`. Returns `false` without replacing a newer snapshot.
+    fn compare_save_groups<'a>(
+        &'a self,
+        site: &'a str,
+        expected: &'a [LoginGroup],
+        replacement: &'a [LoginGroup],
+    ) -> PlatformFuture<'a, Result<bool>>;
+    /// Drop the stored logins for `site`. Returns whether the site was stored.
+    fn clear<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<bool>>;
     /// Every stored site with its ordered logins.
     fn list_groups(&self) -> PlatformFuture<'_, Result<BTreeMap<String, Vec<LoginGroup>>>>;
+    /// Replace every stored site with `groups` in one write (import and
+    /// clear-all).
+    fn save_all_groups<'a>(
+        &'a self,
+        groups: &'a BTreeMap<String, Vec<LoginGroup>>,
+    ) -> PlatformFuture<'a, Result<()>>;
+    /// Merge an import against the latest stored map in one atomic mutation.
+    /// Returns the number of sites stored after the merge.
+    fn merge_all_groups<'a>(
+        &'a self,
+        groups: &'a BTreeMap<String, Vec<LoginGroup>>,
+    ) -> PlatformFuture<'a, Result<usize>>;
+    /// Renew only a login whose cookies still match the actual sent header.
+    /// Removed or concurrently rotated credentials are never re-created.
+    fn renew_response_cookies<'a>(
+        &'a self,
+        sent_cookie: &'a str,
+        set_cookie: &'a [String],
+    ) -> PlatformFuture<'a, Result<bool>>;
 }
 
 /// Canonical form of a request host used as a credential key.
@@ -714,6 +927,166 @@ pub fn mask_cookie(cookie: &str) -> String {
     format!("{names} ({} 件, {length} 文字)", pairs.len())
 }
 
+/// Sites whose stored raw value is encrypted at rest.
+///
+/// The site name is looked up exactly as stored (a legacy per-host key is not
+/// the site-name key), so a host folded into a site that has no site-name key
+/// reads as not encrypted.
+pub fn encrypted_sites(
+    raw: &BTreeMap<String, String>,
+    sites: &BTreeMap<String, Vec<LoginGroup>>,
+) -> BTreeSet<String> {
+    sites
+        .keys()
+        .filter(|site| {
+            raw.get(&site.trim().to_ascii_lowercase())
+                .is_some_and(|value| crate::login::is_encrypted_at_rest(value))
+        })
+        .cloned()
+        .collect()
+}
+
+/// `GET /api/login` の `data`: site names, login names, cookie names and
+/// lengths only — never a cookie value. Order follows the stored trial order.
+pub fn login_status_json(
+    sites: &BTreeMap<String, Vec<LoginGroup>>,
+    encrypted: &BTreeSet<String>,
+    key_source: &str,
+) -> serde_json::Value {
+    let mut total = 0;
+    let entries: Vec<serde_json::Value> = sites
+        .iter()
+        .map(|(site, groups)| {
+            total += groups.len();
+            let logins: Vec<serde_json::Value> = groups
+                .iter()
+                .enumerate()
+                .map(|(index, group)| {
+                    let hosts: Vec<serde_json::Value> = group
+                        .cookies
+                        .iter()
+                        .map(|entry| {
+                            serde_json::json!({
+                                "host": entry.host,
+                                "cookies": mask_cookie(&entry.cookie),
+                                "names": parse_cookie_header(&entry.cookie)
+                                    .into_iter()
+                                    .map(|(name, _)| name)
+                                    .collect::<Vec<_>>(),
+                                "length": entry.cookie.chars().count(),
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "index": index,
+                        "id": group.id,
+                        "short_id": group.short_id(),
+                        "label": group.label,
+                        "display_name": group.display_name(),
+                        "hosts": hosts,
+                        "host_count": group.cookies.len(),
+                        "added_at": group.added_at,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "site": site,
+                "logins": logins,
+                "encrypted": encrypted.contains(site),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "sites": entries,
+        "sites_count": sites.len(),
+        "logins_count": total,
+        "key_source": key_source,
+    })
+}
+
+/// Locate the one stored login represented by the actual sent header.
+///
+/// Static request cookies may accompany a login. A shared consent cookie alone
+/// is not enough to identify an account: its complete merged login must match.
+/// Ambiguous matches are not renewed because no account can safely be chosen.
+/// Coordinates (site in map order, login, host) are valid only for this
+/// snapshot, so renewal need not copy a site key just to release a borrow.
+pub fn sent_login_cookie_target(
+    sites: &BTreeMap<String, Vec<LoginGroup>>,
+    sent_cookie: &str,
+) -> Option<(usize, usize, usize)> {
+    let sent = parse_cookie_header(sent_cookie);
+    if sent.is_empty() {
+        return None;
+    }
+    let mut target = None;
+    for (site_index, groups) in sites.values().enumerate() {
+        for (group_index, group) in groups.iter().enumerate() {
+            let merged = parse_cookie_header(&group.merged_cookie());
+            if merged.is_empty()
+                || !merged.iter().all(|pair| sent.contains(pair))
+            {
+                continue;
+            }
+            let Some(host) = group.host_for_sent(&sent) else {
+                continue;
+            };
+            let host_index = group.cookies.iter().position(|entry| entry.host == host)?;
+            if target.is_some() {
+                return None;
+            }
+            target = Some((site_index, group_index, host_index));
+        }
+    }
+    target
+}
+
+/// Pure response renewal rule, applied inside an adapter's atomic mutation.
+pub fn renew_sent_login(
+    sites: &mut BTreeMap<String, Vec<LoginGroup>>,
+    sent_cookie: &str,
+    set_cookie: &[String],
+) -> bool {
+    if set_cookie.is_empty() {
+        return false;
+    }
+    let Some((site_index, group_index, host_index)) = sent_login_cookie_target(sites, sent_cookie) else {
+        return false;
+    };
+    let entry = &mut sites.values_mut().nth(site_index).expect("matched stored site")[group_index]
+        .cookies[host_index];
+    let updated = apply_set_cookie(&entry.cookie, set_cookie);
+    if updated == entry.cookie {
+        return false;
+    }
+    entry.cookie = updated;
+    true
+}
+
+/// Refresh the stored login that a response's `Set-Cookie` headers belong to.
+///
+/// `sent_cookie` is the exact `Cookie` request header value. Matching and
+/// renewal happen against the latest map inside one atomic store mutation.
+/// Removed or concurrently rotated credentials cannot be resurrected.
+/// Store errors are ignored: best-effort session renewal must not fail a fetch.
+pub async fn persist_response_set_cookie(
+    store: &dyn CookieStore,
+    response: &crate::platform::http::HttpResponse,
+    sent_cookie: Option<&str>,
+) {
+    let values: Vec<String> = response
+        .header_values("set-cookie")
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if values.is_empty() {
+        return;
+    }
+    let Some(sent) = sent_cookie else {
+        return;
+    };
+    let _ = store.renew_response_cookies(sent, &values).await;
+}
 
 #[cfg(test)]
 mod tests {
@@ -851,5 +1224,159 @@ mod tests {
             vec!["www.pixiv.net", "pixiv.net"],
             "具体的なホストが先"
         );
+    }
+
+    #[test]
+    fn decode_cookie_map_folds_legacy_host_keys() {
+        // 版 2 のホストキーはサイト名へ畳まれ、書き戻しが必要になる。
+        let raw = BTreeMap::from([
+            (
+                "pixiv.net".to_string(),
+                r#"[{"id":"g1","host":"pixiv.net","cookie":"PHPSESSID=abc"}]"#.to_string(),
+            ),
+            (
+                "www.pixiv.net".to_string(),
+                r#"[{"id":"g2","host":"www.pixiv.net","cookie":"yuid_b=1"}]"#.to_string(),
+            ),
+        ]);
+        let decoded = decode_cookie_map(&raw, None, &[]).unwrap();
+        assert!(decoded.needs_rewrite, "host keys fold into the site");
+        let groups = &decoded.sites["pixiv.net"];
+        assert_eq!(groups.len(), 1, "1 セッションは 1 ログイン: {groups:?}");
+        assert_eq!(groups[0].hosts(), vec!["www.pixiv.net", "pixiv.net"]);
+        assert!(
+            decoded.encrypted.contains("pixiv.net"),
+            "書き戻しは全サイトを暗号化する"
+        );
+    }
+
+    #[test]
+    fn decode_cookie_map_reads_its_own_ciphertext_and_fails_closed() {
+        let key = [7u8; 32];
+        let sites = BTreeMap::from([(
+            "example.com".to_string(),
+            vec![LoginGroup::new(
+                "example.com",
+                vec![HostCookie {
+                    host: "example.com".to_string(),
+                    cookie: "session=abc".to_string(),
+                }],
+            )
+            .with_id("11111111-2222-4333-8444-555555555555")],
+        )]);
+        let encoded = encode_cookie_map(&sites, &key).unwrap();
+        assert!(!encoded["example.com"].contains("session=abc"), "暗号文だけを保存する");
+
+        let decoded = decode_cookie_map(&encoded, Some(&key), &[]).unwrap();
+        assert!(!decoded.needs_rewrite);
+        assert_eq!(decoded.sites["example.com"][0].cookies[0].cookie, "session=abc");
+        assert!(decoded.encrypted.contains("example.com"));
+
+        // 鍵が無い暗号文は黙って空にせずエラーにする。
+        assert!(decode_cookie_map(&encoded, None, &[]).is_err());
+    }
+
+    #[test]
+    fn login_cookie_mutations_tidy_dedupe_and_replace() {
+        let login = |cookie: &str| {
+            LoginGroup::new(
+                "example.com",
+                vec![HostCookie {
+                    host: "example.com".to_string(),
+                    cookie: cookie.to_string(),
+                }],
+            )
+        };
+        let key = "example.com";
+        let mut map = BTreeMap::new();
+        save_site_groups(&mut map, " Example.COM ", &[login("sid=1"), login("sid=1")]);
+        assert_eq!(map.len(), 1, "サイト名は正規化する");
+        assert_eq!(map[key].len(), 1, "同じ Cookie のログインは重複しない");
+        assert_eq!(map[key][0].site, key);
+
+        save_site_groups(&mut map, key, &[]);
+        assert!(map.is_empty(), "空の保存はエントリを消す");
+
+        let mut map = BTreeMap::from([(key.to_string(), vec![login("sid=1")])]);
+        let imported = BTreeMap::from([(key.to_string(), vec![login("sid=1"), login("sid=2")])]);
+        assert_eq!(merge_site_groups(&mut map, &imported), 1);
+        assert_eq!(map[key].len(), 2, "重複は足さず、新しいログインを後ろに足す");
+        let replaced = replace_site_groups(&imported);
+        assert_eq!(replaced[key].len(), 2);
+        assert!(remove_site_groups(&mut map, "Example.com"));
+        assert!(map.is_empty());
+    }
+
+    fn identified_login(site: &str, id: &str, cookie: &str) -> LoginGroup {
+        LoginGroup::new(site, vec![HostCookie {
+            host: site.to_string(),
+            cookie: cookie.to_string(),
+        }])
+        .with_id(id)
+    }
+
+    #[test]
+    fn checked_site_replacement_rejects_shifted_accounts_and_preserves_other_sites() {
+        let a = identified_login("a.example", "a", "sid=a");
+        let b = identified_login("b.example", "b", "sid=b");
+        let mut sites = BTreeMap::from([
+            ("a.example".to_string(), vec![a]),
+            ("b.example".to_string(), vec![b.clone()]),
+        ]);
+        let expected = vec![b.clone()];
+        remove_site_groups(&mut sites, "a.example");
+        let renamed = b.clone().with_label(Some("new".to_string()));
+        assert!(compare_save_site_groups(&mut sites, " B.EXAMPLE ", &expected, &[renamed]));
+        assert!(!sites.contains_key("a.example"));
+        assert_eq!(sites["b.example"][0].id, "b");
+
+        let replacement = identified_login("b.example", "replacement", "sid=replacement");
+        save_site_groups(&mut sites, "b.example", std::slice::from_ref(&replacement));
+        assert!(!compare_save_site_groups(&mut sites, "b.example", &expected, &[]));
+        assert_eq!(sites["b.example"], vec![replacement]);
+    }
+
+    #[test]
+    fn response_renewal_ignores_shared_consent_and_keeps_latest_metadata() {
+        let main = LoginGroup::new("example.com", vec![
+            HostCookie { host: "example.com".to_string(), cookie: "over18=yes".to_string() },
+            HostCookie { host: "www.example.com".to_string(), cookie: "sid=main".to_string() },
+        ]).with_id("main").with_label(Some("renamed".to_string()));
+        let other = LoginGroup::new("example.com", vec![
+            HostCookie { host: "example.com".to_string(), cookie: "over18=yes".to_string() },
+            HostCookie { host: "www.example.com".to_string(), cookie: "sid=other".to_string() },
+        ]).with_id("other");
+        let unrelated = identified_login("other.example", "unrelated", "sid=unrelated");
+        let mut sites = BTreeMap::from([
+            ("example.com".to_string(), vec![main, other.clone()]),
+            ("other.example".to_string(), vec![unrelated.clone()]),
+        ]);
+        assert!(renew_sent_login(
+            &mut sites, "over18=yes; sid=main; static=1", &["over18=renewed".to_string()],
+        ));
+        assert_eq!(sites["example.com"][0].cookies[0].cookie, "over18=renewed");
+        assert_eq!(sites["example.com"][0].id, "main");
+        assert_eq!(sites["example.com"][0].label.as_deref(), Some("renamed"));
+        assert_eq!(sites["example.com"][1], other);
+        assert_eq!(sites["other.example"], vec![unrelated]);
+        assert!(!renew_sent_login(
+            &mut sites, "over18=yes; sid=main", &["sid=late".to_string()],
+        ), "a response for an older rotation must not overwrite the current login");
+        remove_site_groups(&mut sites, "example.com");
+        assert!(!renew_sent_login(
+            &mut sites, "over18=renewed; sid=main", &["sid=late".to_string()],
+        ), "deleted credentials must not be re-created");
+        assert!(!sites.contains_key("example.com"));
+    }
+
+    #[test]
+    fn response_renewal_refuses_ambiguous_matching_accounts() {
+        let mut sites = BTreeMap::from([
+            ("a.example".to_string(), vec![identified_login("a.example", "a", "sid=same")]),
+            ("b.example".to_string(), vec![identified_login("b.example", "b", "sid=same")]),
+        ]);
+        let before = sites.clone();
+        assert!(!renew_sent_login(&mut sites, "sid=same", &["sid=new".to_string()]));
+        assert_eq!(sites, before);
     }
 }

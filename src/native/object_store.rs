@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
     ObjectStore, PlatformFuture, S3Store, SplitStore,
+    ObjectUpdateResult, SmallObjectMutator,
 };
 
 pub(crate) const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
@@ -142,7 +143,7 @@ impl NativeObjectStore {
             key: key.clone(),
             size: metadata.len(),
             etag: None,
-            content_type: content_type_for_path(path),
+            content_type: content_type_for_path(path).map(str::to_string),
             last_modified,
         }))
     }
@@ -172,6 +173,25 @@ impl NativeObjectStore {
         let path = self.resolve_path(key)?;
         self.ensure_parent_dir(&path)?;
         atomic_write_bytes(&path, &data)
+    }
+
+    pub(crate) fn update_small_blocking<'data>(
+        &self,
+        key: &ObjectKey,
+        mutate: &mut SmallObjectMutator<'data>,
+    ) -> Result<ObjectUpdateResult> {
+        let path = self.resolve_path(key)?;
+        self.ensure_parent_dir(&path)?;
+        crate::db::inventory::with_exclusive_file_lock(&path, || {
+            let current = self.read_small_blocking(key)?;
+            if let Some(data) = mutate(current.as_deref())? {
+                if data.len() as u64 > MAX_SMALL_OBJECT_BYTES {
+                    return Err(NarouError::Platform(format!("small object exceeds {MAX_SMALL_OBJECT_BYTES} bytes: {key}")));
+                }
+                self.write_bytes_blocking(key, &data)?;
+            }
+            Ok(ObjectUpdateResult::Committed)
+        })
     }
 
     pub(crate) fn read_small_blocking(&self, key: &ObjectKey) -> Result<Option<Vec<u8>>> {
@@ -251,6 +271,16 @@ where
     }
 }
 
+pub(crate) fn run_scoped_blocking<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+        handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    }) {
+        tokio::task::block_in_place(operation)
+    } else {
+        operation()
+    }
+}
+
 pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -271,19 +301,10 @@ pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn content_type_for_path(path: &Path) -> Option<String> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("yaml" | "yml") => Some("application/yaml".to_string()),
-        Some("ini" | "txt") => Some("text/plain; charset=utf-8".to_string()),
-        Some("html") => Some("text/html; charset=utf-8".to_string()),
-        Some("jpg" | "jpeg") => Some("image/jpeg".to_string()),
-        Some("png") => Some("image/png".to_string()),
-        Some("gif") => Some("image/gif".to_string()),
-        Some("webp") => Some("image/webp".to_string()),
-        Some("epub") => Some("application/epub+zip".to_string()),
-        Some("zip") => Some("application/zip".to_string()),
-        _ => None,
-    }
+pub(crate) fn content_type_for_path(path: &Path) -> Option<&'static str> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(crate::platform::object_store::content_type_for_extension)
 }
 
 impl ObjectStore for NativeObjectStore {
@@ -313,6 +334,16 @@ impl ObjectStore for NativeObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || this.write_small_blocking(&key, data))
+    }
+
+    fn update_small<'a, 'data: 'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        mutate: &'a mut SmallObjectMutator<'data>,
+    ) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
+        Box::pin(async move {
+            run_scoped_blocking(|| self.update_small_blocking(key, mutate))
+        })
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
@@ -501,17 +532,38 @@ impl AssetStore for NativeObjectStore {
             if !source.exists() {
                 return Ok(());
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            match fs::rename(&source, &destination) {
+            let owned_version_dir = if crate::application::webui::diff::is_diff_cache_section(&destination_key) {
+                let parent = destination.parent().ok_or_else(|| {
+                    NarouError::Platform("cache section has no version directory".to_string())
+                })?;
+                if let Some(cache_root) = parent.parent() {
+                    fs::create_dir_all(cache_root)?;
+                }
+                // create_dir (not create_dir_all) proves this move owns the
+                // new version directory, even when another writer races it.
+                match fs::create_dir(parent) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && parent.is_dir() => false,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                false
+            };
+            let result = match fs::rename(&source, &destination) {
                 Ok(()) => Ok(()),
-                Err(_) => {
-                    fs::copy(&source, &destination)?;
-                    fs::remove_file(source)?;
-                    Ok(())
+                Err(_) => fs::copy(&source, &destination).and_then(|_| fs::remove_file(&source)),
+            };
+            if result.is_err() && owned_version_dir {
+                if let Some(parent) = destination.parent() {
+                    // Never recursively delete or remove a directory that
+                    // already existed. Nonempty/concurrently written dirs stay.
+                    let _ = fs::remove_dir(parent);
                 }
             }
+            result.map_err(NarouError::from)
         })
     }
 }
@@ -767,6 +819,17 @@ impl ObjectStore for NativeStore {
         }
     }
 
+    fn update_small<'a, 'data: 'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        mutate: &'a mut SmallObjectMutator<'data>,
+    ) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
+        match self {
+            NativeStore::Fs(store) => store.update_small(key, mutate),
+            NativeStore::Sqlite(store) => store.update_small(key, mutate),
+        }
+    }
+
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
         match self {
             NativeStore::Fs(store) => ObjectStore::delete(store, key),
@@ -901,6 +964,34 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
         assert!(ObjectKey::try_new("novels/../escape").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_cache_move_removes_only_its_new_empty_version_directory() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let keys = crate::platform::NovelObjectKeys::new("site", "title", false).unwrap();
+        let source = keys.section("1", "locked");
+        futures::executor::block_on(store.write_small(&source, b"old body".to_vec())).unwrap();
+        let source_path = store.resolve_path(&source).unwrap();
+        for (version, existed) in [("new", false), ("legacy-empty", true)] {
+            let destination = keys.cached_section(version, "1", "locked");
+            let destination_path = store.resolve_path(&destination).unwrap();
+            let version_dir = destination_path.parent().unwrap();
+            if existed {
+                fs::create_dir_all(version_dir).unwrap();
+            }
+            let locked = fs::OpenOptions::new().read(true).share_mode(0).open(&source_path).unwrap();
+            let result = futures::executor::block_on(AssetStore::move_or_copy(&store, &source, &destination));
+            drop(locked);
+            assert!(result.is_err(), "the real rename and copy must fail on the exclusive source handle");
+            assert_eq!(version_dir.exists(), existed, "only the newly owned empty directory is removable");
+            assert_eq!(fs::read(&source_path).unwrap(), b"old body");
+            assert!(!store.resolve_path(&keys.cached_version_marker(version)).unwrap().exists());
+        }
     }
 
     /// `mirror-files=false` の有効な作品はフォルダが無くても「保存済み」と

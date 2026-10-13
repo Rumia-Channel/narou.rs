@@ -109,7 +109,7 @@ let temp = tempfile::tempdir().unwrap();
     // Maintenance operations succeed against the live handle.
     let conn = state.conn_ref().clone();
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         let status: String = guard
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .unwrap();
@@ -242,7 +242,7 @@ fn p4b_version_snapshot_restore_merge_prune() {
     // Seed a minimal novel row so FK constraints hold.
     {
         let conn = state.conn_ref();
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard
             .execute(
                 "INSERT INTO novels (id, author, author_fold, title, title_fold, file_title, toc_url, toc_url_fold, sitename, sitename_fold, last_update)
@@ -256,48 +256,48 @@ fn p4b_version_snapshot_restore_merge_prune() {
 
     let mut sec1 = std::collections::BTreeMap::new();
     sec1.insert("1".to_string(), (Some("第一".into()), "body: v1\n".into()));
-    narou_rs::native::sqlite::content::store_sections(&mut conn.lock().unwrap(), 7, &sec1).unwrap();
-    let v1 = narou_rs::native::sqlite::versions::snapshot_working_set(&mut conn.lock().unwrap(), 7, "update", None).unwrap();
+    narou_rs::native::sqlite::content::store_sections(&mut conn.lock(), 7, &sec1).unwrap();
+    let v1 = narou_rs::native::sqlite::versions::snapshot_working_set(&mut conn.lock(), 7, "update", None).unwrap();
 
     let mut sec2 = std::collections::BTreeMap::new();
     sec2.insert("1".to_string(), (Some("第一".into()), "body: v2\n".into()));
     sec2.insert("2".to_string(), (Some("第二".into()), "body: new\n".into()));
-    narou_rs::native::sqlite::content::store_sections(&mut conn.lock().unwrap(), 7, &sec2).unwrap();
-    let v2 = narou_rs::native::sqlite::versions::snapshot_working_set(&mut conn.lock().unwrap(), 7, "update", None).unwrap();
+    narou_rs::native::sqlite::content::store_sections(&mut conn.lock(), 7, &sec2).unwrap();
+    let v2 = narou_rs::native::sqlite::versions::snapshot_working_set(&mut conn.lock(), 7, "update", None).unwrap();
 
-    let versions = narou_rs::native::sqlite::versions::list_versions(&conn.lock().unwrap(), 7).unwrap();
+    let versions = narou_rs::native::sqlite::versions::list_versions(&conn.lock(), 7).unwrap();
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].id, v2);
 
-    let diff = narou_rs::native::sqlite::versions::version_diff(&conn.lock().unwrap(), v2).unwrap().unwrap();
+    let diff = narou_rs::native::sqlite::versions::version_diff(&conn.lock(), 7, v2).unwrap().unwrap();
     assert!(diff.contains("-body: v1"), "diff must show removed line");
     assert!(diff.contains("+body: v2"), "diff must show added line");
 
     // Restore older version (copy-forward): working set matches v1 and a new
     // rollback head is recorded.
-    narou_rs::native::sqlite::versions::restore_version(&mut conn.lock().unwrap(), 7, v1, false).unwrap();
-    let working_after_restore = narou_rs::native::sqlite::content::load_sections(&conn.lock().unwrap(), 7).unwrap().unwrap();
+    narou_rs::native::sqlite::versions::restore_version(&mut conn.lock(), 7, v1, false).unwrap();
+    let working_after_restore = narou_rs::native::sqlite::content::load_sections(&conn.lock(), 7).unwrap().unwrap();
     assert_eq!(working_after_restore.len(), 1);
     assert!(working_after_restore["1"].1.contains("v1"));
-    assert_eq!(narou_rs::native::sqlite::versions::list_versions(&conn.lock().unwrap(), 7).unwrap().len(), 3);
+    assert_eq!(narou_rs::native::sqlite::versions::list_versions(&conn.lock(), 7).unwrap().len(), 3);
 
     // Merge section 2 of v2 onto the restored working set.
     narou_rs::native::sqlite::versions::merge_from_version(
-        &mut conn.lock().unwrap(),
+        &mut conn.lock(),
         7,
         v2,
         Some(&["2".to_string()]),
         Some("take second section"),
     )
     .unwrap();
-    let merged = narou_rs::native::sqlite::content::load_sections(&conn.lock().unwrap(), 7).unwrap().unwrap();
+    let merged = narou_rs::native::sqlite::content::load_sections(&conn.lock(), 7).unwrap().unwrap();
     assert_eq!(merged.len(), 2, "merged section appended");
     assert!(merged["1"].1.contains("v1"), "unselected section unchanged");
 
     // Prune keeps the newest heads only.
-    let pruned = narou_rs::native::sqlite::versions::prune_history(&conn.lock().unwrap(), 7, 2).unwrap();
+    let pruned = narou_rs::native::sqlite::versions::prune_history(&conn.lock(), 7, 2).unwrap();
     assert_eq!(pruned, 2);
-    assert_eq!(narou_rs::native::sqlite::versions::list_versions(&conn.lock().unwrap(), 7).unwrap().len(), 2);
+    assert_eq!(narou_rs::native::sqlite::versions::list_versions(&conn.lock(), 7).unwrap().len(), 2);
 }
 
 fn fixture_record_defaults(id: i64) -> NovelRecord {

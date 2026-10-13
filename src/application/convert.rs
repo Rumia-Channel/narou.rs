@@ -9,7 +9,6 @@
 //! ObjectStore から読む。`default.*` / `force.*` は `SettingsStore`
 //! (native=Inventory, Worker=D1) から読んだ値を適用する。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::converter::ini::IniData;
@@ -18,7 +17,7 @@ use crate::converter::user_converter::UserConverter;
 use crate::converter::{ConverterCapabilities, NovelConverter};
 use crate::db::NovelRecord;
 use crate::downloader::persistence::{PersistenceService, SectionLoadFailure};
-use crate::downloader::{SectionFile, TocObject};
+use crate::downloader::{SectionFile, TocObject, UpdateStatus};
 use crate::error::{NarouError, Result};
 use crate::platform::{AssetStore, NovelObjectKeys, ObjectKey, ObjectStore};
 use crate::setting_core::SettingScope;
@@ -107,6 +106,50 @@ where
         &messages::convert::convert_finished(completed, TOTAL),
     );
     report
+}
+
+/// `--no-convert` の適用範囲は native と Worker で既存差があるため、
+/// 呼び出し側が自分の契約を明示する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoConvertScope {
+    /// `--no-convert` は全ステータスを抑止する (Worker の現行)。
+    Everything,
+    /// `--no-convert` は `Ok` だけを抑止し、`None` の再変換は続行する
+    /// (native の narou.rb 互換動作)。
+    SuccessOnly,
+}
+
+/// 更新/ダウンロード結果から自動変換 (follow-up convert) を積むか。
+///
+/// 各入力は呼び出し側の契約:
+/// - `convert_only_new_arrival` は Update の `Ok` にだけ効く (Download は
+///   取得成功なら `false` を渡す)。
+/// - `convert_failure` は保存済みレコードの `convert_failure` フラグ。
+/// - `missing_cached_text` は Worker の自己修復 (keep-txt 有効で変換済み
+///   テキストが無い) 用の実行時入力。native は存在確認を持たず `false`。
+///
+/// `Failed` / `Canceled` は常に積まない。
+pub fn needs_convert_after_download(
+    status: UpdateStatus,
+    no_convert: bool,
+    no_convert_scope: NoConvertScope,
+    new_arrivals: bool,
+    convert_only_new_arrival: bool,
+    convert_failure: bool,
+    missing_cached_text: bool,
+) -> bool {
+    let no_convert_blocks = match no_convert_scope {
+        NoConvertScope::Everything => no_convert,
+        NoConvertScope::SuccessOnly => no_convert && status == UpdateStatus::Ok,
+    };
+    if no_convert_blocks {
+        return false;
+    }
+    match status {
+        UpdateStatus::Ok => !convert_only_new_arrival || new_arrivals,
+        UpdateStatus::None => convert_failure || missing_cached_text,
+        UpdateStatus::Failed | UpdateStatus::Canceled => false,
+    }
 }
 
 /// 小説 1 件の変換テキストを作って保存する。
@@ -244,7 +287,15 @@ impl ConvertService {
         };
         let text = converter.convert_novel(&toc_object, &sections)?;
         let output = keys.converted_text();
-        let output = if store && Self::keep_converted_text(&local_settings) {
+        // `convert.keep-txt` の解釈は native のファイル経路 (`converter::mod`)
+        // と Worker で共有する (`setting_core::keep_converted_text`)。既定は
+        // native と同じ「保存する」。
+        let keep_text = crate::setting_core::keep_converted_text(
+            &local_settings,
+            std::env::var("NAROU_RS_KEEP_TXT").ok().as_deref(),
+            true,
+        );
+        let output = if store && keep_text {
             self.objects
                 .write_small(&output, text.clone().into_bytes())
                 .await?;
@@ -253,28 +304,6 @@ impl ConvertService {
             None
         };
         Ok(ConvertedNovel { text, output })
-    }
-
-    /// 変換済みテキストを保存するか (`convert.keep-txt`)。
-    ///
-    /// 環境変数 `NAROU_RS_KEEP_TXT` (0/false/no/off) が最優先、次に local
-    /// 設定。未設定は保存する (Worker 側は `worker_entry::convert` が別途
-    /// 既定 false を与えるので、このフォールバックは主に native と共有の
-    /// テスト/ユースケース向け)。local 設定は変換の入力に使った同じ
-    /// スナップショットを見る (このために二度読みしない)。
-    fn keep_converted_text(local: &HashMap<String, serde_yaml::Value>) -> bool {
-        if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
-            let value = value.trim().to_ascii_lowercase();
-            return !matches!(value.as_str(), "0" | "false" | "no" | "off");
-        }
-        match local.get("convert.keep-txt") {
-            Some(serde_yaml::Value::Bool(value)) => *value,
-            Some(serde_yaml::Value::String(value)) => !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            ),
-            _ => true,
-        }
     }
 
     async fn load_ini(&self, keys: &NovelObjectKeys) -> Result<IniData> {
@@ -303,6 +332,39 @@ mod tests {
     use crate::downloader::types::{SectionElement, SubtitleInfo, TocFile};
     use crate::platform::mocks::MemoryObjectStore;
     use futures::executor::block_on;
+
+    /// `NAROU_RS_KEEP_TXT` が設定された環境でもテスト結果が変わらないよう、
+    /// テストの間だけ外す。プロセス共通の env を触るため、既存の全体ロックを
+    /// 共有して直列化する。
+    struct KeepTxtEnvGuard {
+        _state: crate::test_support::GlobalStateGuard,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl KeepTxtEnvGuard {
+        fn cleared() -> Self {
+            let state = crate::test_support::global_state_guard();
+            let original = std::env::var_os("NAROU_RS_KEEP_TXT");
+            // SAFETY: 全体ロックを保持している間だけ書き換える。
+            unsafe { std::env::remove_var("NAROU_RS_KEEP_TXT") };
+            Self {
+                _state: state,
+                original,
+            }
+        }
+    }
+
+    impl Drop for KeepTxtEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: 同上。
+            unsafe {
+                match self.original.take() {
+                    Some(value) => std::env::set_var("NAROU_RS_KEEP_TXT", value),
+                    None => std::env::remove_var("NAROU_RS_KEEP_TXT"),
+                }
+            }
+        }
+    }
 
     fn record(id: i64) -> NovelRecord {
         NovelRecord {
@@ -340,6 +402,7 @@ mod tests {
     /// Worker の `JobKind::Convert` はこの経路をそのまま呼ぶ。
     #[test]
     fn assembles_converted_text_from_stored_sections() {
+        let _env = KeepTxtEnvGuard::cleared();
         let store = Arc::new(MemoryObjectStore::new());
         let settings = Arc::new(crate::application::settings::MemorySettingsStore::new());
         let service = ConvertService::new(store.clone(), store.clone(), settings);
@@ -620,6 +683,7 @@ mod tests {
     /// オブジェクトは書かれない (EPUB は都度再変換で組み立てる構成)。
     #[test]
     fn keeps_no_converted_text_when_keep_txt_is_disabled() {
+        let _env = KeepTxtEnvGuard::cleared();
         let store = Arc::new(MemoryObjectStore::new());
         let settings = Arc::new(crate::application::settings::MemorySettingsStore::new().with_local(
             std::collections::HashMap::from([(
@@ -695,4 +759,120 @@ mod tests {
         });
     }
 
+    /// 自動変換の判定は native/Worker の契約モードを保持する
+    /// (どちらも現行の outward 挙動のまま)。
+    #[test]
+    fn followup_convert_decision_preserves_both_contract_modes() {
+        // `--no-convert`: Worker (Everything) は全ステータス、native
+        // (SuccessOnly) は `Ok` だけを抑止する。
+        for status in [
+            UpdateStatus::Ok,
+            UpdateStatus::None,
+            UpdateStatus::Failed,
+            UpdateStatus::Canceled,
+        ] {
+            assert!(
+                !needs_convert_after_download(
+                    status,
+                    true,
+                    NoConvertScope::Everything,
+                    true,
+                    false,
+                    true,
+                    true,
+                ),
+                "{status:?} with --no-convert must not convert (Everything)"
+            );
+        }
+        assert!(!needs_convert_after_download(
+            UpdateStatus::Ok,
+            true,
+            NoConvertScope::SuccessOnly,
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(needs_convert_after_download(
+            UpdateStatus::None,
+            true,
+            NoConvertScope::SuccessOnly,
+            false,
+            false,
+            true,
+            false,
+        ));
+
+        // `Ok`: `convert_only_new_arrival` は新着が無いときだけ抑止する
+        // (Download は false 固定)。
+        assert!(needs_convert_after_download(
+            UpdateStatus::Ok,
+            false,
+            NoConvertScope::Everything,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!needs_convert_after_download(
+            UpdateStatus::Ok,
+            false,
+            NoConvertScope::Everything,
+            false,
+            true,
+            false,
+            false,
+        ));
+        assert!(needs_convert_after_download(
+            UpdateStatus::Ok,
+            false,
+            NoConvertScope::Everything,
+            true,
+            true,
+            false,
+            false,
+        ));
+
+        // `None`: `convert_failure` と `missing_cached_text` のどちらでも変換する。
+        assert!(!needs_convert_after_download(
+            UpdateStatus::None,
+            false,
+            NoConvertScope::Everything,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(needs_convert_after_download(
+            UpdateStatus::None,
+            false,
+            NoConvertScope::Everything,
+            false,
+            false,
+            true,
+            false,
+        ));
+        assert!(needs_convert_after_download(
+            UpdateStatus::None,
+            false,
+            NoConvertScope::Everything,
+            false,
+            false,
+            false,
+            true,
+        ));
+
+        // `Failed` / `Canceled` は常に変換しない。
+        for status in [UpdateStatus::Failed, UpdateStatus::Canceled] {
+            assert!(!needs_convert_after_download(
+                status,
+                false,
+                NoConvertScope::Everything,
+                true,
+                false,
+                true,
+                true,
+            ));
+        }
+    }
 }

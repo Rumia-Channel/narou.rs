@@ -3,6 +3,10 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use narou_rs::application::messages::{self, MessageSink, Stream};
+use narou_rs::application::target_lookup::{
+    TagExpansionVariant, TargetLookupPlan, UrlSource, expand_tag_targets_sync,
+    resolve_target_record_sync,
+};
 use narou_rs::compat::{configure_web_subprocess_command, convert_existing_novel};
 use narou_rs::downloader::{DownloadResult, Downloader, TargetType, UpdateStatus};
 use narou_rs::mail::{
@@ -274,89 +278,11 @@ fn valid_target(downloader: &Downloader, target: &str) -> bool {
 }
 
 pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
-    let mut expanded = Vec::new();
-    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-
-    // tag index 相当: 完全一致タグで絞った ID 一覧 (D1 では novel_tags join)。
-    let tag_ids = |tag_name: &str| -> Vec<i64> {
-        let filter = narou_rs::platform::NovelFilter {
-            tag: Some(tag_name.to_string()),
-            ..Default::default()
-        };
-        novels
-            .scan_ids_sync(&filter, None, usize::MAX)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|id| id.0)
-            .collect()
-    };
-
-    for target in targets {
-        if let Some(tag_name) = target.strip_prefix("tag:") {
-            let ids = tag_ids(tag_name);
-            if ids.is_empty() {
-                expanded.push(tag_name.to_string());
-            } else {
-                for id in ids {
-                    let s = id.to_string();
-                    if !expanded.contains(&s) {
-                        expanded.push(s);
-                    }
-                }
-            }
-        } else if let Some(tag_name) = target.strip_prefix("^tag:") {
-            let exclude_ids: std::collections::HashSet<i64> =
-                tag_ids(tag_name).into_iter().collect();
-            let filter = narou_rs::platform::NovelFilter::all();
-            let all_ids: Vec<i64> = novels
-                .scan_ids_sync(&filter, None, usize::MAX)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|id| id.0)
-                .collect();
-            for id in all_ids {
-                if !exclude_ids.contains(&id) {
-                    let s = id.to_string();
-                    if !expanded.contains(&s) {
-                        expanded.push(s);
-                    }
-                }
-            }
-        } else if let Ok(id) = target.parse::<i64>() {
-            let exists = novels.get_sync(id.into()).ok().flatten().is_some();
-            if exists {
-                if !expanded.contains(&target.clone()) {
-                    expanded.push(target.clone());
-                }
-            } else {
-                let ids = tag_ids(target);
-                if ids.is_empty() {
-                    expanded.push(target.clone());
-                } else {
-                    for id in ids {
-                        let s = id.to_string();
-                        if !expanded.contains(&s) {
-                            expanded.push(s);
-                        }
-                    }
-                }
-            }
-        } else {
-            let ids = tag_ids(target);
-            if ids.is_empty() {
-                expanded.push(target.clone());
-            } else {
-                for id in ids {
-                    let s = id.to_string();
-                    if !expanded.contains(&s) {
-                        expanded.push(s);
-                    }
-                }
-            }
-        }
-    }
-
-    expanded
+    expand_tag_targets_sync(
+        targets,
+        &narou_rs::native::novel_repository::NativeNovelRepository::new(),
+        TagExpansionVariant::Download,
+    )
 }
 
 pub(crate) struct RecordInfo {
@@ -374,58 +300,22 @@ enum ExistingDownloadState {
 }
 
 pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
-    let target = super::resolve_alias_target(target);
-    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let target_type = Downloader::get_target_type(&target);
-    match target_type {
-        TargetType::Id => {
-            if let Ok(id) = target.parse::<i64>() {
-                novels
-                    .get_sync(id.into())
-                    .ok()
-                    .flatten()
-                    .map(|r| RecordInfo {
-                        id: r.id,
-                        title: r.title,
-                        toc_url: r.toc_url,
-                    })
-            } else {
-                None
-            }
-        }
-        TargetType::Url => {
-            let toc_url = resolve_toc_url_from_url(&target)?;
-            novels
-                .find_by_toc_url_sync(&toc_url)
-                .ok()
-                .flatten()
-                .map(|r| RecordInfo {
-                    id: r.id,
-                    title: r.title,
-                    toc_url: r.toc_url,
-                })
-        }
-        TargetType::Ncode => {
-            novels
-                .find_by_ncode_sync(&target)
-                .ok()
-                .flatten()
-                .map(|r| RecordInfo {
-                    id: r.id,
-                    title: r.title,
-                    toc_url: r.toc_url,
-                })
-        }
-        _ => novels
-            .find_by_title_sync(&target)
-            .ok()
-            .flatten()
-            .map(|r| RecordInfo {
-                id: r.id,
-                title: r.title,
-                toc_url: r.toc_url,
-            }),
-    }
+    let aliases = super::load_alias_map();
+    let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
+    resolve_target_record_sync(
+        TargetLookupPlan::DOWNLOAD_CHECK,
+        &aliases,
+        UrlSource::Settings(&site_settings),
+        target,
+        &narou_rs::native::novel_repository::NativeNovelRepository::new(),
+    )
+    .ok()
+    .flatten()
+    .map(|record| RecordInfo {
+        id: record.id,
+        title: record.title,
+        toc_url: record.toc_url,
+    })
 }
 
 /// Whether `target` is already managed.
@@ -455,17 +345,10 @@ pub fn target_is_known(target: &str) -> bool {
 }
 
 fn resolve_toc_url_from_url(target: &str) -> Option<String> {
-    let settings = narou_rs::downloader::site_setting::effective_site_settings();
-    for setting in &settings {
-        if setting.matches_url(target) {
-            return Some(
-                setting
-                    .toc_url_with_url_captures(target)
-                    .unwrap_or_else(|| setting.toc_url()),
-            );
-        }
-    }
-    None
+    narou_rs::application::target_lookup::first_matching_toc_url(
+        &narou_rs::downloader::site_setting::effective_site_settings(),
+        target,
+    )
 }
 
 fn inspect_existing_download(

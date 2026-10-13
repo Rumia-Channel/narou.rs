@@ -10,10 +10,6 @@ pub const MAX_RESPONSE_BYTES: usize = 50_000_000;
 pub const MAX_YAML_REGEX_PATTERN_LEN: usize = 4 * 1024;
 pub const MAX_REGEX_INPUT_LEN: usize = 8 * 1024 * 1024;
 
-pub fn is_safe_header_value(value: &str) -> bool {
-    !value.bytes().any(|byte| byte.is_ascii_control())
-}
-
 /// DNS まで見る検証。解決手段を持つ呼び出し側 (native トランスポート) 用。
 pub fn is_safe_public_url(url: &str) -> bool {
     validate_public_url(url).is_ok()
@@ -61,10 +57,7 @@ pub fn validate_resolved_addresses(addresses: &[IpAddr]) -> std::result::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_safe_header_value, is_safe_public_url, is_safe_public_url_syntax,
-        validate_resolved_addresses,
-    };
+    use super::{is_safe_public_url, is_safe_public_url_syntax, validate_resolved_addresses};
 
     #[test]
     fn safe_public_url_accepts_public_http_and_https() {
@@ -110,10 +103,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn safe_header_value_rejects_control_characters() {
-        assert!(is_safe_header_value("session=abc123"));
-        assert!(!is_safe_header_value("session=abc\r\nX-Test: 1"));
-        assert!(!is_safe_header_value("session=\0"));
-    }
 }

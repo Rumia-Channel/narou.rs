@@ -13,6 +13,7 @@ use std::sync::Arc;
 use super::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
     ObjectPrefix, ObjectStore, PlatformFuture,
+    ObjectUpdateResult, SmallObjectMutator,
 };
 use crate::error::{NarouError, Result};
 
@@ -138,6 +139,14 @@ impl ObjectStore for SplitStore {
         data: Vec<u8>,
     ) -> PlatformFuture<'a, Result<()>> {
         self.pair_for(key).objects.write_small(key, data)
+    }
+
+    fn update_small<'a, 'data: 'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        mutate: &'a mut SmallObjectMutator<'data>,
+    ) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
+        self.pair_for(key).objects.update_small(key, mutate)
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {

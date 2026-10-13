@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 
 use crate::downloader::persistence::{
-    compute_section_hash, default_replace_txt, default_setting_ini, raw_filename, section_filename,
+    compute_section_hash, raw_filename, section_filename,
 };
 use crate::downloader::{SectionElement, SectionFile, SubtitleInfo, TocFile};
 use crate::error::Result;
@@ -128,21 +128,6 @@ pub fn save_toc_file(novel_dir: &Path, toc: &TocFile) -> Result<()> {
     Ok(())
 }
 
-pub fn ensure_default_files(novel_dir: &Path, title: &str, author: &str, toc_url: &str) {
-    let Ok(novel_dir) = validate_archive_write_dir(novel_dir, 1) else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(&novel_dir);
-    let setting_path = novel_dir.join("setting.ini");
-    if !setting_path.exists() {
-        let _ = std::fs::write(&setting_path, default_setting_ini());
-    }
-
-    let replace_path = novel_dir.join("replace.txt");
-    if !replace_path.exists() {
-        let _ = std::fs::write(&replace_path, default_replace_txt(title, author, toc_url));
-    }
-}
 
 fn validate_archive_write_dir(path: &Path, fallback_depth: usize) -> Result<PathBuf> {
     let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))

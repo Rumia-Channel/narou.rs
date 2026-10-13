@@ -37,6 +37,59 @@ pub fn setting_scope(name: &str) -> Option<SettingScope> {
     None
 }
 
+/// 保存済み設定値を bool として解釈する。
+///
+/// `Bool` と `Number` (非 0) のほか、`String` は前後の空白と大文字小文字を
+/// 無視して `true`/`yes`/`on`/`1` を真、`false`/`no`/`off`/`0` を偽とする。
+/// 未設定や解釈できない値 (`Null`・配列・Map・それ以外の文字列) は `None`。
+pub fn setting_bool_value(value: &serde_yaml::Value) -> Option<bool> {
+    match value {
+        serde_yaml::Value::Bool(value) => Some(*value),
+        serde_yaml::Value::Number(value) => value.as_i64().map(|value| value != 0),
+        serde_yaml::Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => Some(true),
+            "false" | "no" | "off" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 設定 map の `key` を bool として読む。未設定・解釈不能は `default`。
+pub fn bool_or(map: &HashMap<String, serde_yaml::Value>, key: &str, default: bool) -> bool {
+    map.get(key).and_then(setting_bool_value).unwrap_or(default)
+}
+
+/// 環境変数スイッチの解釈 (既定 ON の機能を `0`/`false`/`no`/`off` で切る形)。
+/// 前後の空白と大文字小文字を無視し、それ以外の値は有効のままにする。
+pub fn flag_enabled(raw: &str) -> bool {
+    !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// 変換済みテキストを保存するか (`convert.keep-txt`)。
+///
+/// `env_override` (`NAROU_RS_KEEP_TXT`) が最優先、次に設定 map、未設定は
+/// `default`。文字列は [`flag_enabled`] と同じ「切る値の列挙」で解釈する
+/// (空文字や解釈できない文字列は保存する側)。既定は呼び出し側が明示する
+/// (native のファイル経路と `ConvertService` は `true`、Worker は `false`)。
+pub fn keep_converted_text(
+    map: &HashMap<String, serde_yaml::Value>,
+    env_override: Option<&str>,
+    default: bool,
+) -> bool {
+    if let Some(raw) = env_override {
+        return flag_enabled(raw);
+    }
+    match map.get("convert.keep-txt") {
+        Some(serde_yaml::Value::String(value)) => flag_enabled(value),
+        Some(value) => setting_bool_value(value).unwrap_or(default),
+        None => default,
+    }
+}
+
 pub fn cast_setting_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> {
     if let Some(info) = setting_info::setting_variables().get(name) {
         return cast_value_for_type(info.var_type, value_str, info.select_keys.as_deref());
@@ -552,5 +605,103 @@ mod tests {
             settings.get("default.enable_half_indent_bracket"),
             Some(&serde_yaml::Value::Bool(false))
         );
+    }
+
+    #[test]
+    fn setting_bool_value_accepts_ruby_style_values() {
+        for (value, expected) in [
+            (serde_yaml::Value::Bool(true), Some(true)),
+            (serde_yaml::Value::Bool(false), Some(false)),
+            (serde_yaml::Value::Number(1.into()), Some(true)),
+            (serde_yaml::Value::Number(0.into()), Some(false)),
+            (serde_yaml::Value::String("true".into()), Some(true)),
+            (serde_yaml::Value::String("TRUE".into()), Some(true)),
+            (serde_yaml::Value::String(" yes ".into()), Some(true)),
+            (serde_yaml::Value::String("On".into()), Some(true)),
+            (serde_yaml::Value::String("1".into()), Some(true)),
+            (serde_yaml::Value::String("false".into()), Some(false)),
+            (serde_yaml::Value::String("NO".into()), Some(false)),
+            (serde_yaml::Value::String("off".into()), Some(false)),
+            (serde_yaml::Value::String("0".into()), Some(false)),
+            (serde_yaml::Value::String("maybe".into()), None),
+            (serde_yaml::Value::Null, None),
+            (serde_yaml::Value::Sequence(Vec::new()), None),
+        ] {
+            assert_eq!(setting_bool_value(&value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn bool_or_uses_the_explicit_default() {
+        let map = HashMap::from([
+            (
+                "enabled".to_string(),
+                serde_yaml::Value::String(" on ".into()),
+            ),
+            (
+                "broken".to_string(),
+                serde_yaml::Value::String("maybe".into()),
+            ),
+        ]);
+        assert!(bool_or(&map, "enabled", false));
+        assert!(!bool_or(&map, "broken", false));
+        assert!(bool_or(&map, "broken", true));
+        assert!(bool_or(&map, "missing", true));
+        assert!(!bool_or(&map, "missing", false));
+    }
+
+    #[test]
+    fn flag_enabled_only_treats_off_values_as_disabled() {
+        for disabled in ["0", "false", "FALSE", " no ", "off"] {
+            assert!(!flag_enabled(disabled), "{disabled:?}");
+        }
+        for enabled in ["1", "true", "", "yes", "on", "other"] {
+            assert!(flag_enabled(enabled), "{enabled:?}");
+        }
+    }
+
+    #[test]
+    fn keep_converted_text_prefers_env_then_setting_then_default() {
+        let setting = |value: serde_yaml::Value| {
+            HashMap::from([("convert.keep-txt".to_string(), value)])
+        };
+        let enabled = setting(serde_yaml::Value::Bool(true));
+        let disabled = setting(serde_yaml::Value::Bool(false));
+        // env が最優先 (設定が true でも env の 0/off で切れる)。
+        assert!(!keep_converted_text(&enabled, Some(" 0 "), true));
+        assert!(!keep_converted_text(&enabled, Some("off"), true));
+        assert!(keep_converted_text(&disabled, Some("1"), false));
+        // 設定は Bool と Number (非 0) を解釈する。
+        assert!(!keep_converted_text(&disabled, None, true));
+        assert!(keep_converted_text(&enabled, None, false));
+        assert!(!keep_converted_text(
+            &setting(serde_yaml::Value::Number(0.into())),
+            None,
+            true
+        ));
+        assert!(keep_converted_text(
+            &setting(serde_yaml::Value::Number(1.into())),
+            None,
+            false
+        ));
+        // 文字列は「切る値の列挙」だけで解釈する (解釈できない文字列は保存する側)。
+        assert!(keep_converted_text(
+            &setting(serde_yaml::Value::String("maybe".into())),
+            None,
+            false
+        ));
+        assert!(!keep_converted_text(
+            &setting(serde_yaml::Value::String("0".into())),
+            None,
+            true
+        ));
+        // 未設定・解釈不能は呼び出し側の既定 (native true / Worker false)。
+        assert!(keep_converted_text(&HashMap::new(), None, true));
+        assert!(!keep_converted_text(&HashMap::new(), None, false));
+        assert!(keep_converted_text(
+            &setting(serde_yaml::Value::Null),
+            None,
+            true
+        ));
     }
 }

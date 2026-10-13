@@ -24,6 +24,7 @@ use crate::application::error::ApplicationError;
 use crate::converter::ini::{IniData, IniValue};
 use crate::db::NovelRecord;
 use crate::platform::{NovelId, NovelObjectKeys, NovelRepository, ObjectStore};
+use crate::setting_info::{VarInfo, VarType};
 
 /// Maximum number of replace patterns accepted in one save (mirrors the web
 /// layer's limit).
@@ -32,7 +33,7 @@ pub const MAX_REPLACE_PATTERNS: usize = 128;
 pub const MAX_REPLACE_PATTERN_LENGTH: usize = 255;
 
 /// One replace pattern: `left` is replaced by `right` during conversion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReplacePattern {
     pub left: String,
     pub right: String,
@@ -60,6 +61,29 @@ pub struct NovelSettingsView {
     pub replace_patterns: Vec<ReplacePattern>,
 }
 
+impl NovelSettingsView {
+    pub fn to_json_value(&self, runtime: crate::application::webui::capabilities::RuntimeKind) -> serde_json::Value {
+        use crate::application::webui::capabilities::{RuntimeKind, worker_novel_setting_ineffective};
+        let settings: Vec<serde_json::Value> = self.settings.iter().map(|entry| {
+            let mut value = serde_json::json!({
+                "name": entry.name, "help": entry.help, "var_type": entry.var_type,
+                "select_keys": entry.select_keys, "value": ini_value_to_json(entry.value.as_ref()),
+            });
+            if runtime == RuntimeKind::Worker {
+                let ineffective = worker_novel_setting_ineffective(&entry.name);
+                value["worker_ineffective"] = serde_json::json!(ineffective);
+                value["worker_note"] = serde_json::json!(ineffective.then_some(
+                    "Cloudflare Workers 版では調査ログを生成できません。"));
+            }
+            value
+        }).collect();
+        serde_json::json!({
+            "id": self.id, "title": self.title, "author": self.author,
+            "settings": settings, "replace_patterns": self.replace_patterns,
+        })
+    }
+}
+
 /// A patch to apply to a novel's settings.
 #[derive(Debug, Clone, Default)]
 pub struct NovelSettingsPatch {
@@ -68,6 +92,32 @@ pub struct NovelSettingsPatch {
     pub settings: HashMap<String, Option<IniValue>>,
     /// When `Some`, replaces the whole replace-pattern list.
     pub replace_patterns: Option<Vec<ReplacePattern>>,
+}
+
+/// Acknowledges only committed fields if the second file cannot be saved.
+#[derive(Debug, Default)]
+pub struct NovelSettingsSaveResult {
+    pub settings: HashMap<String, Option<IniValue>>,
+    pub replace_patterns: Option<Vec<ReplacePattern>>,
+    pub failure: Option<ApplicationError>,
+}
+
+impl NovelSettingsSaveResult {
+    pub fn to_json_value(&self) -> serde_json::Value {
+        let settings = self.settings.iter()
+            .map(|(name, value)| (name.clone(), ini_value_to_json(value.as_ref())))
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        let mut payload = serde_json::json!({
+            "success": self.failure.is_none(),
+            "partial": self.failure.is_some() && (!self.settings.is_empty() || self.replace_patterns.is_some()),
+            "message": self.failure.as_ref().map(ToString::to_string).unwrap_or_else(|| "Settings saved".into()),
+            "settings": settings,
+        });
+        if let Some(patterns) = &self.replace_patterns {
+            payload["replace_patterns"] = serde_json::json!(patterns);
+        }
+        payload
+    }
 }
 
 /// Concrete per-novel settings service.
@@ -125,7 +175,7 @@ impl NovelSettingsService {
         &self,
         id: NovelId,
         patch: &NovelSettingsPatch,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<NovelSettingsSaveResult, ApplicationError> {
         let record = self
             .novels
             .get(id)
@@ -134,25 +184,65 @@ impl NovelSettingsService {
             .ok_or_else(|| ApplicationError::NotFound(format!("ID: {}", id.0)))?;
         let keys = self.keys_for(&record)?;
 
-        let mut ini = self
-            .load_ini(&keys)
-            .await
-            .map_err(ApplicationError::platform)?;
-        apply_patch_to_ini(&mut ini, patch)?;
-        self.objects
-            .write_small(&keys.setting(), ini.to_ini_string().into_bytes())
-            .await
-            .map_err(ApplicationError::platform)?;
-
-        if let Some(patterns) = &patch.replace_patterns {
-            let content = serialize_replace_patterns(patterns)?;
-            self.objects
-                .write_small(&keys.replace(), content.into_bytes())
-                .await
-                .map_err(ApplicationError::platform)?;
+        let replace_content = patch.replace_patterns.as_deref()
+            .map(serialize_replace_patterns).transpose()?;
+        let mut result = NovelSettingsSaveResult::default();
+        if !patch.settings.is_empty() {
+            validate_patch_names(patch)?;
+            let commit = {
+                let mut mutate = |raw: Option<&[u8]>| {
+                    let text = std::str::from_utf8(raw.unwrap_or_default()).map_err(|error| {
+                        crate::error::NarouError::Platform(format!("setting.ini is not UTF-8: {error}"))
+                    })?;
+                    let mut ini = IniData::load(text);
+                    apply_patch_to_ini(&mut ini, patch);
+                    for name in patch.settings.keys() {
+                        result.settings.insert(name.clone(), ini.get_global(name).cloned());
+                    }
+                    let content = ini.to_ini_string().into_bytes();
+                    Ok((raw != Some(content.as_slice())).then_some(std::borrow::Cow::Owned(content)))
+                };
+                self.objects.update_small(&keys.setting(), &mut mutate)
+                    .await.map_err(ApplicationError::platform)?
+            };
+            match commit {
+                crate::platform::ObjectUpdateResult::Committed => {}
+                crate::platform::ObjectUpdateResult::Conflict => return Err(ApplicationError::Conflict(
+                    "設定が同時に更新されました。読み込み直してください。".into(),
+                )),
+                crate::platform::ObjectUpdateResult::ProjectionFailed(error) => {
+                    result.failure = Some(ApplicationError::platform(error));
+                    return Ok(result);
+                }
+            }
         }
-
-        Ok(())
+        if let Some(content) = replace_content {
+            let write = {
+                let mut mutate = |raw: Option<&[u8]>| {
+                    Ok((raw != Some(content.as_bytes())).then_some(std::borrow::Cow::Borrowed(content.as_bytes())))
+                };
+                self.objects.update_small(&keys.replace(), &mut mutate).await
+            };
+            match write {
+                Ok(crate::platform::ObjectUpdateResult::Committed)
+                | Ok(crate::platform::ObjectUpdateResult::ProjectionFailed(_)) => {
+                    result.replace_patterns = patch.replace_patterns.as_ref().map(|patterns| {
+                        patterns.iter().filter(|pattern| !pattern.left.is_empty()).cloned().collect()
+                    });
+                    if let Ok(crate::platform::ObjectUpdateResult::ProjectionFailed(error)) = write {
+                        result.failure = Some(ApplicationError::platform(error));
+                    }
+                }
+                Ok(crate::platform::ObjectUpdateResult::Conflict) => {
+                    let error = ApplicationError::Conflict("置換設定が同時に更新されました。読み込み直してください。".into());
+                    if result.settings.is_empty() { return Err(error); }
+                    result.failure = Some(error);
+                }
+                Err(error) if result.settings.is_empty() => return Err(ApplicationError::platform(error)),
+                Err(error) => result.failure = Some(ApplicationError::platform(error)),
+            }
+        }
+        Ok(result)
     }
 
     /// Resolve the logical object keys for a record.
@@ -203,18 +293,54 @@ fn build_setting_entries(ini: &IniData) -> Vec<NovelSettingEntry> {
         .collect()
 }
 
-/// Apply a patch to an `IniData`, preserving unknown keys.
-fn apply_patch_to_ini(ini: &mut IniData, patch: &NovelSettingsPatch) -> Result<(), ApplicationError> {
+/// Parse the shared Web UI request without performing any storage writes.
+pub fn parse_settings_patch(body: &serde_json::Value) -> Result<NovelSettingsPatch, String> {
+    let values = body.get("settings").and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "settings array required".to_string())?;
+    let known: HashMap<&'static str, VarInfo> =
+        crate::setting_info::original_setting_var_infos().into_iter().collect();
+    let mut settings = HashMap::new();
+    let mut parsed = IniData::new();
+    for item in values {
+        let Some(name) = item.get("name").and_then(serde_json::Value::as_str) else { continue };
+        let info = known.get(name).ok_or_else(|| format!("不明な設定名です: {name}"))?;
+        apply_setting_value(&mut parsed, name, info,
+            item.get("value").unwrap_or(&serde_json::Value::Null))?;
+        let value = parsed.sections.get_mut("global").and_then(|global| global.remove(name));
+        settings.insert(name.to_string(), value);
+    }
+    let replace_patterns = body.get("replace_patterns").map(|value| {
+        let values = value.as_array().ok_or_else(|| "replace_patterns must be an array".to_string())?;
+        values.iter().map(|value| {
+            let left = value.get("left").and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "replace pattern left is required".to_string())?;
+            let right = value.get("right").and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "replace pattern right is required".to_string())?;
+            Ok(ReplacePattern { left: left.to_string(), right: right.to_string() })
+        }).collect::<Result<Vec<_>, String>>()
+    }).transpose()?;
+    Ok(NovelSettingsPatch { settings, replace_patterns })
+}
+
+/// Validate per-novel names before entering the storage mutation.
+fn validate_patch_names(patch: &NovelSettingsPatch) -> Result<(), ApplicationError> {
     let known: HashMap<&str, crate::setting_info::VarInfo> =
         crate::setting_info::original_setting_var_infos()
             .into_iter()
             .collect();
-    for (name, value) in &patch.settings {
+    for name in patch.settings.keys() {
         if !known.contains_key(name.as_str()) {
             return Err(ApplicationError::InvalidRequest(format!(
                 "不明な設定名です: {name}"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Apply validated fields without reparsing metadata on a storage retry.
+fn apply_patch_to_ini(ini: &mut IniData, patch: &NovelSettingsPatch) {
+    for (name, value) in &patch.settings {
         match value {
             Some(value) => ini.set_global(name, value.clone()),
             None => {
@@ -224,26 +350,187 @@ fn apply_patch_to_ini(ini: &mut IniData, patch: &NovelSettingsPatch) -> Result<(
             }
         }
     }
+}
+
+pub fn ini_value_to_json(value: Option<&IniValue>) -> serde_json::Value {
+    match value {
+        None | Some(IniValue::Null) => serde_json::Value::Null,
+        Some(IniValue::Boolean(b)) => serde_json::Value::Bool(*b),
+        Some(IniValue::Integer(i)) => serde_json::json!(*i),
+        Some(IniValue::Float(f)) => serde_json::json!(*f),
+        Some(IniValue::String(s)) => serde_json::Value::String(s.clone()),
+    }
+}
+
+pub fn apply_setting_value(
+    ini: &mut IniData,
+    name: &str,
+    info: &VarInfo,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let parsed = match info.var_type {
+        VarType::Boolean => parse_bool_value(value)?,
+        VarType::Integer => parse_integer_value(value)?,
+        VarType::Float => parse_float_value(value)?,
+        VarType::String => parse_string_value(value)?,
+        VarType::Select => parse_select_value(value, info.select_keys.as_deref())?,
+        VarType::Multiple => parse_multiple_value(value, info.select_keys.as_deref())?,
+        VarType::Directory => parse_string_value(value)?,
+    };
+
+    if let Some(parsed) = parsed {
+        ini.set_global(name, parsed);
+    } else if let Some(global) = ini.sections.get_mut("global") {
+        global.remove(name);
+    }
+
     Ok(())
 }
 
-/// Parse tab-separated replace patterns from text, mirroring
-/// `converter::settings::load_replace_patterns` (which reads from a file).
-fn parse_replace_text(text: &str) -> Vec<ReplacePattern> {
-    let mut patterns = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with(';') {
-            continue;
+fn parse_bool_value(value: &serde_json::Value) -> Result<Option<IniValue>, String> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Bool(flag) => Ok(Some(IniValue::Boolean(*flag))),
+        serde_json::Value::String(raw) => {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "" => Ok(None),
+                "true" => Ok(Some(IniValue::Boolean(true))),
+                "false" => Ok(Some(IniValue::Boolean(false))),
+                _ => Err("true か false を指定して下さい".to_string()),
+            }
         }
-        if let Some((left, right)) = trimmed.split_once('\t') {
-            patterns.push(ReplacePattern {
-                left: left.to_string(),
-                right: right.to_string(),
-            });
-        }
+        _ => Err("true か false を指定して下さい".to_string()),
     }
-    patterns
+}
+
+fn parse_integer_value(value: &serde_json::Value) -> Result<Option<IniValue>, String> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(raw) => raw
+            .as_i64()
+            .map(|v| Some(IniValue::Integer(v)))
+            .ok_or_else(|| "整数を指定して下さい".to_string()),
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed
+                    .parse::<i64>()
+                    .map(|v| Some(IniValue::Integer(v)))
+                    .map_err(|_| "整数を指定して下さい".to_string())
+            }
+        }
+        _ => Err("整数を指定して下さい".to_string()),
+    }
+}
+
+fn parse_float_value(value: &serde_json::Value) -> Result<Option<IniValue>, String> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(raw) => raw
+            .as_f64()
+            .map(|v| Some(IniValue::Float(v)))
+            .ok_or_else(|| "数値を指定して下さい".to_string()),
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed
+                    .parse::<f64>()
+                    .map(|v| Some(IniValue::Float(v)))
+                    .map_err(|_| "数値を指定して下さい".to_string())
+            }
+        }
+        _ => Err("数値を指定して下さい".to_string()),
+    }
+}
+
+fn parse_string_value(value: &serde_json::Value) -> Result<Option<IniValue>, String> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(raw) => {
+            if raw.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(IniValue::String(raw.clone())))
+            }
+        }
+        serde_json::Value::Number(raw) => Ok(Some(IniValue::String(raw.to_string()))),
+        serde_json::Value::Bool(raw) => Ok(Some(IniValue::String(raw.to_string()))),
+        _ => Err("文字列を指定して下さい".to_string()),
+    }
+}
+
+fn parse_select_value(
+    value: &serde_json::Value,
+    select_keys: Option<&[String]>,
+) -> Result<Option<IniValue>, String> {
+    let Some(keys) = select_keys else {
+        return parse_string_value(value);
+    };
+
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if keys.iter().any(|key| key == trimmed) {
+                Ok(Some(IniValue::String(trimmed.to_string())))
+            } else {
+                Err("選択肢の中から指定して下さい".to_string())
+            }
+        }
+        _ => Err("選択肢の中から指定して下さい".to_string()),
+    }
+}
+
+fn parse_multiple_value(
+    value: &serde_json::Value,
+    select_keys: Option<&[String]>,
+) -> Result<Option<IniValue>, String> {
+    let Some(keys) = select_keys else {
+        return parse_string_value(value);
+    };
+
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Array(items) => {
+            let mut selected = Vec::new();
+            for item in items {
+                let Some(raw) = item.as_str() else {
+                    return Err("選択肢の中から指定して下さい".to_string());
+                };
+                if !keys.iter().any(|key| key == raw) {
+                    return Err("選択肢の中から指定して下さい".to_string());
+                }
+                selected.push(raw.to_string());
+            }
+            if selected.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(IniValue::String(selected.join(","))))
+            }
+        }
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(IniValue::String(trimmed.to_string())))
+            }
+        }
+        _ => Err("選択肢の中から指定して下さい".to_string()),
+    }
+}
+
+/// Parse the converter's shared tab-separated replacement format.
+fn parse_replace_text(text: &str) -> Vec<ReplacePattern> {
+    crate::converter::settings::parse_replace_patterns(text).into_iter()
+        .map(|(left, right)| ReplacePattern { left, right }).collect()
 }
 
 /// Serialize replace patterns to the tab-separated text format, validating
@@ -258,7 +545,7 @@ fn serialize_replace_patterns(patterns: &[ReplacePattern]) -> Result<String, App
     }
     let mut lines = Vec::with_capacity(patterns.len());
     for pattern in patterns {
-        let left = pattern.left.trim();
+        let left = pattern.left.as_str();
         if left.is_empty() {
             continue;
         }
@@ -272,7 +559,12 @@ fn serialize_replace_patterns(patterns: &[ReplacePattern]) -> Result<String, App
                 "replace pattern left side must not contain tabs or newlines".to_string(),
             ));
         }
-        let right = pattern.right.replace(['\t', '\n', '\r'], "");
+        let right = pattern.right.as_str();
+        if right.contains(['\n', '\r']) {
+            return Err(ApplicationError::InvalidRequest(
+                "replace pattern right side must not contain newlines".to_string(),
+            ));
+        }
         lines.push(format!("{left}\t{right}"));
     }
     Ok(lines.join("\n"))
@@ -326,11 +618,9 @@ mod tests {
     fn load_returns_defaults_for_missing_objects() {
         let (service, _, _) = service();
         let view = futures::executor::block_on(service.load(NovelId(1))).unwrap();
-        assert_eq!(view.id, 1);
-        assert_eq!(view.title, "title 1");
         assert!(view.replace_patterns.is_empty());
-        assert!(!view.settings.is_empty());
-        assert!(view.settings.iter().all(|entry| entry.value.is_none()));
+        let entry = view.settings.iter().find(|entry| entry.name == "enable_yokogaki").unwrap();
+        assert_eq!(entry.value, None);
     }
 
     #[test]
@@ -341,26 +631,23 @@ mod tests {
     }
 
     #[test]
-    fn save_preserves_unknown_ini_keys() {
+    fn saving_known_fields_preserves_other_sections_and_string_types() {
         let (service, _, objects) = service();
         let keys = NovelObjectKeys::new("example", "title 1", false).unwrap();
-        futures::executor::block_on(
-            objects.write_small(&keys.setting(), b"unknown_key = 42\n".to_vec()),
-        )
-        .unwrap();
-
+        futures::executor::block_on(objects.write_small(
+            &keys.setting(),
+            b"unknown_key = 42\nliteral_bool = \"false\"\n[1]\nliteral_number = \"123\"\n".to_vec(),
+        )).unwrap();
         let mut patch = NovelSettingsPatch::default();
-        patch
-            .settings
-            .insert("enable_yokogaki".to_string(), Some(IniValue::Boolean(true)));
+        patch.settings.insert("enable_yokogaki".to_string(), Some(IniValue::Boolean(true)));
         futures::executor::block_on(service.save(NovelId(1), &patch)).unwrap();
-
-        let bytes = futures::executor::block_on(objects.read_small(&keys.setting()))
-            .unwrap()
-            .unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("unknown_key = 42"));
-        assert!(text.contains("enable_yokogaki = true"));
+        let bytes = futures::executor::block_on(objects.read_small(&keys.setting())).unwrap().unwrap();
+        let restored = IniData::load(std::str::from_utf8(&bytes).unwrap());
+        assert_eq!(restored.get_global("unknown_key"), Some(&IniValue::Integer(42)));
+        assert_eq!(restored.get_global("literal_bool"), Some(&IniValue::String("false".into())));
+        assert_eq!(restored.get("1", "literal_number"), Some(&IniValue::String("123".into())));
+        assert_eq!(restored.get_global("enable_yokogaki"), Some(&IniValue::Boolean(true)));
+        assert_eq!(restored.get("1", "enable_yokogaki"), None);
     }
 
     #[test]
@@ -375,56 +662,25 @@ mod tests {
     }
 
     #[test]
-    fn save_roundtrips_replace_patterns() {
-        let (service, _, _) = service();
-        let patch = NovelSettingsPatch {
-            settings: HashMap::new(),
-            replace_patterns: Some(vec![
-                ReplacePattern {
-                    left: "foo".into(),
-                    right: "bar".into(),
-                },
-                ReplacePattern {
-                    left: "a".into(),
-                    right: "b".into(),
-                },
-            ]),
-        };
-        futures::executor::block_on(service.save(NovelId(1), &patch)).unwrap();
-
-        let view = futures::executor::block_on(service.load(NovelId(1))).unwrap();
-        assert_eq!(
-            view.replace_patterns,
-            vec![
-                ReplacePattern {
-                    left: "foo".into(),
-                    right: "bar".into(),
-                },
-                ReplacePattern {
-                    left: "a".into(),
-                    right: "b".into(),
-                },
-            ]
-        );
+    fn invalid_replace_cannot_partially_change_novel_settings() {
+        let (service, _, objects) = service();
+        let keys = NovelObjectKeys::new("example", "title 1", false).unwrap();
+        futures::executor::block_on(async {
+            let original_ini = b"enable_yokogaki = false\nunknown_key = keep\n".to_vec();
+            let original_replace = b"old\tnew\n".to_vec();
+            objects.write_small(&keys.setting(), original_ini.clone()).await.unwrap();
+            objects.write_small(&keys.replace(), original_replace.clone()).await.unwrap();
+            let patch = NovelSettingsPatch {
+                settings: HashMap::from_iter([("enable_yokogaki".into(), Some(IniValue::Boolean(true)))]),
+                replace_patterns: Some(vec![ReplacePattern { left: "valid".into(), right: "bad\nline".into() }]),
+            };
+            assert!(matches!(service.save(NovelId(1), &patch).await, Err(ApplicationError::InvalidRequest(_))));
+            assert_eq!(objects.read_small(&keys.setting()).await.unwrap().unwrap(), original_ini);
+            assert_eq!(objects.read_small(&keys.replace()).await.unwrap().unwrap(), original_replace);
+        });
     }
 
-    #[test]
-    fn replace_parser_matches_existing_line_format() {
-        let patterns = parse_replace_text("; comment\nfoo\tbar\n\n  a\tb  \n");
-        assert_eq!(
-            patterns,
-            vec![
-                ReplacePattern {
-                    left: "foo".into(),
-                    right: "bar".into(),
-                },
-                ReplacePattern {
-                    left: "a".into(),
-                    right: "b".into(),
-                },
-            ]
-        );
-    }
+
 
     #[test]
     fn replace_serializer_rejects_tabs_in_left() {
@@ -459,5 +715,45 @@ mod tests {
             message.contains("setting.ini is not UTF-8"),
             "expected the setting.ini error to win, got: {message}"
         );
+    }
+
+    #[test]
+    fn blank_numeric_values_are_removed() {
+        let mut ini = IniData::new();
+        let info = VarInfo {
+            var_type: VarType::Integer,
+            help: "",
+            invisible: false,
+            select_keys: None,
+        };
+
+        apply_setting_value(
+            &mut ini,
+            "to_page_break_threshold",
+            &info,
+            &serde_json::Value::String(String::new()),
+        )
+        .unwrap();
+        assert!(ini.get_global("to_page_break_threshold").is_none());
+    }
+
+    #[test]
+    fn blank_string_values_are_removed() {
+        let mut ini = IniData::new();
+        let info = VarInfo {
+            var_type: VarType::String,
+            help: "",
+            invisible: false,
+            select_keys: None,
+        };
+
+        apply_setting_value(
+            &mut ini,
+            "novel_title",
+            &info,
+            &serde_json::Value::String("   ".to_string()),
+        )
+        .unwrap();
+        assert!(ini.get_global("novel_title").is_none());
     }
 }

@@ -16,6 +16,7 @@ use crate::platform::{
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, ObjectKey, ObjectListPage,
     ObjectListRequest, ObjectMetadata, ObjectStore, PlatformFuture, RateLimitScope, RateLimiter,
     paginate_object_listing,
+    ObjectUpdateResult, SmallObjectMutator,
 };
 
 /// HTTP client backed by a caller-provided responder closure.
@@ -84,7 +85,7 @@ impl HttpClient for MockHttpClient {
             self.sent
                 .lock()
                 .push((request.url.clone(), request.headers.clone()));
-            self.bodies.lock().push(request.body.clone());
+            self.bodies.lock().push(request.body.as_deref().cloned());
             self.requests
                 .lock()
                 .push(format!("{} {}", method_name(request.method), request.url));
@@ -155,6 +156,20 @@ impl ObjectStore for MemoryObjectStore {
         Box::pin(async move {
             self.objects.lock().insert(key.as_ref().to_string(), data);
             Ok(())
+        })
+    }
+
+    fn update_small<'a, 'data: 'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        mutate: &'a mut SmallObjectMutator<'data>,
+    ) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
+        Box::pin(async move {
+            let mut objects = self.objects.lock();
+            if let Some(data) = mutate(objects.get(key.as_ref()).map(Vec::as_slice))? {
+                objects.insert(key.as_ref().to_string(), data.into_owned());
+            }
+            Ok(ObjectUpdateResult::Committed)
         })
     }
 
@@ -494,7 +509,7 @@ impl RateLimiter for FakeRateLimiter {
 #[derive(Debug, Default, Clone)]
 pub struct MemoryCookieStore {
     groups: std::sync::Arc<
-        std::sync::Mutex<std::collections::BTreeMap<String, Vec<LoginGroup>>>,
+        parking_lot::Mutex<std::collections::BTreeMap<String, Vec<LoginGroup>>>,
     >,
 }
 
@@ -504,7 +519,7 @@ impl MemoryCookieStore {
     }
 
     pub fn len(&self) -> usize {
-        self.groups.lock().unwrap().len()
+        self.groups.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -519,7 +534,6 @@ impl CookieStore for MemoryCookieStore {
             Ok(self
                 .groups
                 .lock()
-                .unwrap()
                 .get(&site)
                 .cloned()
                 .unwrap_or_default())
@@ -531,29 +545,76 @@ impl CookieStore for MemoryCookieStore {
         site: &'a str,
         groups: &'a [LoginGroup],
     ) -> PlatformFuture<'a, Result<()>> {
-        let site = site.trim().to_ascii_lowercase();
-        let groups: Vec<LoginGroup> = groups.to_vec();
         Box::pin(async move {
-            let mut stored = self.groups.lock().unwrap();
-            if groups.is_empty() {
-                stored.remove(&site);
-            } else {
-                stored.insert(site, groups);
-            }
+            crate::platform::cookie_store::save_site_groups(
+                &mut self.groups.lock(),
+                site,
+                groups,
+            );
             Ok(())
         })
     }
 
-    fn clear<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<()>> {
-        let site = site.trim().to_ascii_lowercase();
+    fn compare_save_groups<'a>(
+        &'a self,
+        site: &'a str,
+        expected: &'a [LoginGroup],
+        replacement: &'a [LoginGroup],
+    ) -> PlatformFuture<'a, Result<bool>> {
         Box::pin(async move {
-            self.groups.lock().unwrap().remove(&site);
-            Ok(())
+            Ok(crate::platform::cookie_store::compare_save_site_groups(
+                &mut self.groups.lock(),
+                site,
+                expected,
+                replacement,
+            ))
         })
+    }
+
+    fn clear<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<bool>> {
+        let site = site.trim().to_ascii_lowercase();
+        Box::pin(async move { Ok(self.groups.lock().remove(&site).is_some()) })
     }
 
     fn list_groups(&self) -> PlatformFuture<'_, Result<std::collections::BTreeMap<String, Vec<LoginGroup>>>> {
-        Box::pin(async move { Ok(self.groups.lock().unwrap().clone()) })
+        Box::pin(async move { Ok(self.groups.lock().clone()) })
+    }
+
+    fn save_all_groups<'a>(
+        &'a self,
+        groups: &'a BTreeMap<String, Vec<LoginGroup>>,
+    ) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            *self.groups.lock() =
+                crate::platform::cookie_store::replace_site_groups(groups);
+            Ok(())
+        })
+    }
+
+    fn merge_all_groups<'a>(
+        &'a self,
+        groups: &'a BTreeMap<String, Vec<LoginGroup>>,
+    ) -> PlatformFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            Ok(crate::platform::cookie_store::merge_site_groups(
+                &mut self.groups.lock(),
+                groups,
+            ))
+        })
+    }
+
+    fn renew_response_cookies<'a>(
+        &'a self,
+        sent_cookie: &'a str,
+        set_cookie: &'a [String],
+    ) -> PlatformFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            Ok(crate::platform::cookie_store::renew_sent_login(
+                &mut self.groups.lock(),
+                sent_cookie,
+                set_cookie,
+            ))
+        })
     }
 }
 

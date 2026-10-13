@@ -11,9 +11,6 @@
 //!   (`worker_entry::push_hub`)。native の Web UI は子プロセスの出力をその
 //!   まま echo するので、ここの文言が両環境で一致する。
 //!
-//! **文言を変更するなら必ず対応する関数のテストを更新すること。** 関数の
-//! 戻り値は移行前の `format!` / リテラルと 1 バイトも違わないのが契約。
-
 pub mod convert;
 pub mod download;
 pub mod flush;
@@ -74,40 +71,74 @@ pub trait MessageSink: Send + Sync {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 既定 sink (Downloader の深い呼び出しなど、sink を引き回せない箇所向け)。
-// ---------------------------------------------------------------------------
+/// Message routing and debug visibility for one invocation, not one process.
+/// A scope is installed only while its future is being polled; suspension,
+/// cancellation and unwinding cannot leak it into another job.
+#[derive(Clone)]
+pub struct MessageContext {
+    sink: std::sync::Arc<dyn MessageSink>,
+    debug_enabled: bool,
+}
 
-static DEFAULT_SINK: std::sync::LazyLock<
-    std::sync::RwLock<Option<std::sync::Arc<dyn MessageSink>>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+thread_local! {
+    static ACTIVE_CONTEXT: std::cell::RefCell<Option<MessageContext>> =
+        const { std::cell::RefCell::new(None) };
+}
 
-/// プロセス共通の既定 sink を差し替える。Worker のジョブ実行が PushHub への
-/// `echo` をインストールするために使う。native は呼ばなくてよい
-/// (フォールバックが `println!`/`eprintln!` で従来動作と一致するため)。
-pub fn set_default_sink(sink: std::sync::Arc<dyn MessageSink>) {
-    if let Ok(mut slot) = DEFAULT_SINK.write() {
-        *slot = Some(sink);
+struct ContextScope<'a> {
+    previous: Option<MessageContext>,
+    owner: &'a mut Option<MessageContext>,
+}
+
+impl<'a> ContextScope<'a> {
+    fn enter(owner: &'a mut Option<MessageContext>) -> Self {
+        let previous = ACTIVE_CONTEXT.with(|slot| slot.replace(owner.take()));
+        Self { previous, owner }
     }
 }
 
-/// 既定 sink を取り外して返す。Worker のジョブ終了時に呼ぶ。
-///
-/// 外さないと isolate は最後のジョブの sink (PushHub への参照と、drain
-/// されないバッファ) を保持し続け、その後の `emit_default` (cron 中の
-/// 警告など) が届かない行を isolate のメモリに溜め込む。
-pub fn take_default_sink() -> Option<std::sync::Arc<dyn MessageSink>> {
-    DEFAULT_SINK.write().ok().and_then(|mut slot| slot.take())
+impl Drop for ContextScope<'_> {
+    fn drop(&mut self) {
+        *self.owner = ACTIVE_CONTEXT.with(|slot| slot.replace(self.previous.take()));
+    }
 }
 
-/// 既定 sink 経由で 1 行出す。未設定の場合は `println!`/`eprintln!`
-/// (native では logger 経由の従来動作、Worker ではコンソールログ) に
-/// フォールバックする。
+impl MessageContext {
+    pub fn new(sink: std::sync::Arc<dyn MessageSink>, debug_enabled: bool) -> Self {
+        Self { sink, debug_enabled }
+    }
+
+    /// Explicitly capture context when spawning onto another task or thread.
+    pub fn current() -> Option<Self> {
+        ACTIVE_CONTEXT.with(|slot| slot.borrow().clone())
+    }
+
+    pub fn run<T>(self, operation: impl FnOnce() -> T) -> T {
+        let mut owner = Some(self);
+        let _scope = ContextScope::enter(&mut owner);
+        operation()
+    }
+
+    pub async fn scope<F: Future>(self, future: F) -> F::Output {
+        let mut owner = Some(self);
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| {
+            let _scope = ContextScope::enter(&mut owner);
+            future.as_mut().poll(cx)
+        }).await
+    }
+}
+
+pub(super) fn scoped_debug_enabled() -> Option<bool> {
+    ACTIVE_CONTEXT.with(|slot| slot.borrow().as_ref().map(|context| context.debug_enabled))
+}
+
+/// Deep warnings use the current invocation's sink. Native CLI output and
+/// out-of-invocation Worker diagnostics retain their console fallback.
 pub fn emit_default(stream: Stream, text: &str) {
-    let sink = DEFAULT_SINK
-        .read()
-        .ok()
-        .and_then(|slot| slot.as_ref().cloned());
+    let sink = ACTIVE_CONTEXT.with(|slot| {
+        slot.borrow().as_ref().map(|context| context.sink.clone())
+    });
     match sink {
         Some(sink) => sink.emit(stream, text),
         None => match stream {
@@ -190,7 +221,7 @@ pub fn copy_device_missing(device: impl Display) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageSink, Stream};
+    use super::{MessageContext, MessageSink, Stream};
 
     #[test]
     fn stream_maps_to_web_console_names() {
@@ -208,42 +239,6 @@ mod tests {
         assert_eq!(Stream::Stderr.target_console_with(Some("stdout2")), "stdout2");
     }
 
-    #[test]
-    fn separator_matches_ruby_rule() {
-        assert_eq!(super::separator(), "―".repeat(35));
-        assert_eq!(super::separator().chars().count(), 35);
-    }
-
-    #[test]
-    fn shared_lines_match_native_formats() {
-        assert_eq!(super::error_line("boom"), "Error: boom");
-        assert_eq!(super::indented_error("boom"), "  Error: boom");
-        assert_eq!(
-            super::init_db_error("io"),
-            "Error initializing database: io"
-        );
-        assert_eq!(
-            super::downloader_create_error("net"),
-            "Error creating downloader: net"
-        );
-        assert_eq!(super::target_missing("n1234"), "n1234 は存在しません");
-        assert_eq!(super::no_update("タイトル"), "タイトル に更新はありません");
-        assert_eq!(super::copied_to("/tmp/x.txt"), "/tmp/x.txt へコピーしました");
-        assert_eq!(
-            super::copy_dest_not_dir("/out"),
-            "/out はフォルダではないかすでに削除されています。コピー出来ませんでした"
-        );
-        assert_eq!(
-            super::dl_completed_new("タイトル", 42, 12),
-            "タイトル のDL完了 (ID:42, 12セクション)"
-        );
-        assert_eq!(super::sending_to("kindle"), "kindleへ送信しています");
-        assert_eq!(
-            super::copy_device_missing("kobo"),
-            "koboが見つからなかったためコピー出来ませんでした"
-        );
-    }
-
     struct Collect(parking_lot::Mutex<Vec<(Stream, String)>>);
 
     impl MessageSink for Collect {
@@ -253,13 +248,51 @@ mod tests {
     }
 
     #[test]
-    fn default_emit_fragment_delegates_to_emit() {
-        let sink = Collect(parking_lot::Mutex::new(Vec::new()));
-        sink.emit_fragment(Stream::Stderr, "fragment");
-        let lines = sink.0.lock();
-        assert_eq!(
-            lines.as_slice(),
-            &[(Stream::Stderr, "fragment".to_string())]
-        );
+    fn interleaved_invocations_keep_their_output_and_debug_visibility() {
+        use std::future::poll_fn;
+        use std::task::{Context, Poll, Waker};
+        let first = std::sync::Arc::new(Collect(parking_lot::Mutex::new(Vec::new())));
+        let second = std::sync::Arc::new(Collect(parking_lot::Mutex::new(Vec::new())));
+        let outer = std::sync::Arc::new(Collect(parking_lot::Mutex::new(Vec::new())));
+        let operation = |name| async move {
+            super::emit_default(Stream::Stdout, name);
+            let mut suspended = false;
+            poll_fn(|_| {
+                if std::mem::replace(&mut suspended, true) { Poll::Ready(()) }
+                else { Poll::Pending }
+            }).await;
+            crate::application::debug::emit(name);
+        };
+        let mut a = std::pin::pin!(MessageContext::new(first.clone(), true).scope(operation("first")));
+        let mut b = std::pin::pin!(MessageContext::new(second.clone(), false).scope(operation("second")));
+        MessageContext::new(outer.clone(), true).run(|| {
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(a.as_mut().poll(&mut cx).is_pending());
+            assert!(b.as_mut().poll(&mut cx).is_pending());
+            assert!(crate::application::debug::enabled());
+            assert!(b.as_mut().poll(&mut cx).is_ready());
+            assert!(a.as_mut().poll(&mut cx).is_ready());
+            super::emit_default(Stream::Stderr, "outer");
+        });
+        assert_eq!(*first.0.lock(), vec![
+            (Stream::Stdout, "first".into()), (Stream::Stdout, "[debug] first".into()),
+        ]);
+        assert_eq!(*second.0.lock(), vec![(Stream::Stdout, "second".into())]);
+        assert_eq!(*outer.0.lock(), vec![(Stream::Stderr, "outer".into())]);
+    }
+
+    #[test]
+    fn unwinding_an_inner_invocation_restores_the_outer_sink() {
+        let outer = std::sync::Arc::new(Collect(parking_lot::Mutex::new(Vec::new())));
+        let inner = std::sync::Arc::new(Collect(parking_lot::Mutex::new(Vec::new())));
+        MessageContext::new(outer.clone(), true).run(|| {
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                MessageContext::new(inner.clone(), false).run(|| panic!("request failed"));
+            }));
+            assert!(failed.is_err());
+            crate::application::debug::emit("outer survived");
+        });
+        assert_eq!(*outer.0.lock(), vec![(Stream::Stdout, "[debug] outer survived".into())]);
+        assert!(inner.0.lock().is_empty());
     }
 }

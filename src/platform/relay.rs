@@ -9,25 +9,44 @@
 //!
 //! ```text
 //! GET|POST /proxy
-//!   GET : ?url=<URL エンコード>&headers=<base64(JSON オブジェクト)>&redirect=follow|manual
-//!   POST: {"url": "...", "headers": {...}, "redirect": "follow"|"manual"}
+//!   GET : ?url=<URL エンコード>&headers=<base64(JSON オブジェクト)>
+//!   POST: {"url": "...", "headers": {...}}
 //! 認証: X-Proxy-Token: <SORAHOST_PROXY_KEY>
 //! 応答: {"status": 200, "contentType": "...", "location": "...",
-//!        "via": "curl", "body": "<base64>"}
+//!        "setCookie": ["..."], "via": "curl", "body": "<base64>"}
 //! 失敗: {"status": <上流>, "error": "..."} /
 //!       HTTP 403 {"error":"forbidden"} / 500 {"error":"SORAHOST_PROXY_KEY is not set"}
 //! ```
 //!
+//! 踏み台は 1 リクエストにつき上流を 1 回だけ取得し、リダイレクトは辿らない
+//! (`Location` を `location` に載せて返す)。チェーンを辿る責務は呼び出し側
+//! (Worker) にあり、hop ごとの検証と資格情報の剥がしはそちらの共通規則で
+//! 行う。`curl -L` のような無条件追跡は資格情報を私設アドレスへ運びうるため、
+//! 踏み台側には置かない。
+//!
 //! `headers` はサイト定義 (`FetchPolicy::for_site`) が組み立てた
 //! `Accept` / `Accept-Language` / `Sec-Fetch-*` / `Cookie` 等をそのまま転送する
-//! ためのもの。生ソケット経路では URL 長を抑えたいのでクエリ側は base64 に
-//! 畳み、キーはソートして安定化させる。
+//! ためのもの。同じ名前が複数回あるときは値を配列にして順序を保つ
+//! (`{"X": ["a", "b"]}`)。呼び出し側は POST の JSON 本文を使い、
+//! Cookie 等を URL に載せず、配備先の request-line 上限も避ける。
 //!
 //! バイト列と文字列だけを扱う純粋ロジックのためホストでユニットテストできる
 //! (Worker クレートのテストは wasm 専用で実行されない)。外部クレートは
 //! 非 optional の `serde_json` と `url` のみに依存する。
 
-use crate::platform::http::RedirectMode;
+use super::http::{HttpRequest, RedirectMode, is_safe_header_name, is_safe_header_value};
+use super::http1::MAX_HTTP1_HEAD;
+
+/// UTF-8 JSON envelope budget, excluding only the base64 body's characters.
+pub const MAX_RELAY_METADATA: usize = MAX_HTTP1_HEAD * 7;
+
+/// Maximum JSON response body on the relay wire. Raw headers can expand
+/// sixfold under JSON escaping; the remaining block covers the envelope and
+/// diagnostics. The outer HTTP response head is bounded independently.
+pub fn response_wire_limit(decoded_body_limit: usize) -> usize {
+    decoded_body_limit.div_ceil(3).saturating_mul(4)
+        .saturating_add(MAX_RELAY_METADATA)
+}
 
 /// 踏み台への認証ヘッダ名。
 pub const TOKEN_HEADER: &str = "x-proxy-token";
@@ -82,16 +101,14 @@ impl From<RelayError> for crate::error::NarouError {
     }
 }
 
-/// 組み立て済みのリレー呼び出し。トランスポートは GET または POST のどちらを
-/// 使ってもよい (踏み台は同一ペイロードを両方で受け付ける)。
-#[derive(Debug, Clone)]
+/// POST の JSON 本文で送る、組み立て済みのリレー呼び出し。
 pub struct RelayRequest {
-    /// `GET /proxy?...` のフル URL (`base_url` のオリジン + `/proxy`)。
+    /// 踏み台のオリジン + `/proxy`。
     url: String,
     /// `X-Proxy-Token` に入れるトークン。
     token: String,
     /// `POST /proxy` 用の JSON ボディ。
-    post_body: String,
+    body: Vec<u8>,
 }
 
 impl RelayRequest {
@@ -103,14 +120,13 @@ impl RelayRequest {
     /// - `target_url`: 中継してほしい取得先。`http(s)` 以外は踏み台が 400 を
     ///   返すため、ここで弾く。
     /// - `headers`: 取得先に転送するヘッダ (例: `FetchPolicy::headers()`)。
-    ///   CR/LF 等の制御文字を含む値・トークンでない名前は拒否する。
-    /// - `redirect`: `Follow` → `redirect=follow`、`Manual` → `redirect=manual`。
+    ///   同名の値は順序を保ったまま運ぶ (JSON では値の配列になる)。CR/LF 等の
+    ///   制御文字を含む値・RFC トークンでない名前は拒否する。
     pub fn new(
         base_url: &str,
         token: &str,
         target_url: &str,
         headers: &[(String, String)],
-        redirect: RedirectMode,
     ) -> std::result::Result<Self, RelayError> {
         let invalid = |message: String| RelayError::InvalidRequest(message);
 
@@ -141,59 +157,78 @@ impl RelayRequest {
             return Err(invalid("proxy token is empty or unsafe".to_string()));
         }
 
-        // JSON オブジェクトに畳む。serde_json::Map は BTreeMap なのでキー順が
-        // 安定し、同じ入力から常に同じ URL が生成される。
-        let mut header_map = serde_json::Map::new();
+        use std::borrow::Cow;
+        use std::collections::BTreeMap;
+        use std::io::Write;
+
+        #[derive(serde::Serialize)]
+        #[serde(untagged)]
+        enum HeaderValues<'a> {
+            One(&'a str),
+            Many(Vec<&'a str>),
+        }
+        #[derive(serde::Serialize)]
+        struct Payload<'a> {
+            url: &'a str,
+            headers: BTreeMap<Cow<'a, str>, HeaderValues<'a>>,
+        }
+        struct JsonBody(Vec<u8>);
+        impl Write for JsonBody {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0.len().saturating_add(bytes.len()) > MAX_HTTP1_HEAD {
+                    return Err(std::io::Error::other("relay request JSON exceeds 64 KiB"));
+                }
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+
+        let mut header_map = BTreeMap::new();
         for (name, value) in headers {
             if !is_safe_header_name(name) || !is_safe_header_value(value) {
                 return Err(invalid(format!("unsafe header: {name:?}")));
             }
-            header_map.insert(name.clone(), serde_json::Value::String(value.clone()));
+            let name = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                Cow::Owned(name.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(name.as_str())
+            };
+            match header_map.entry(name) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(HeaderValues::One(value.as_str()));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    match entry.get_mut() {
+                        HeaderValues::One(first) => {
+                            let first = *first;
+                            *entry.get_mut() = HeaderValues::Many(vec![first, value.as_str()]);
+                        }
+                        HeaderValues::Many(values) => values.push(value.as_str()),
+                    }
+                }
+            }
         }
-        let headers_value = serde_json::Value::Object(header_map);
-        let headers_json = headers_value.to_string();
-
-        let redirect_mode = match redirect {
-            RedirectMode::Follow => "follow",
-            RedirectMode::Manual => "manual",
-        };
-
-        let post_body = serde_json::json!({
-            "url": target_url,
-            "headers": headers_value,
-            "redirect": redirect_mode,
-        })
-        .to_string();
-
-        let mut query = url::form_urlencoded::Serializer::new(String::new());
-        query.append_pair("url", target_url);
-        // 空オブジェクトを送っても踏み台側の解釈は同じなので省略して URL を
-        // 短く保つ (生ソケット経路では URL 長が効く)。
-        if !headers.is_empty() {
-            query.append_pair("headers", &base64_encode(headers_json.as_bytes()));
-        }
-        query.append_pair("redirect", redirect_mode);
-
+        let mut body = JsonBody(Vec::with_capacity(1024));
+        serde_json::to_writer(&mut body, &Payload { url: target_url, headers: header_map })
+            .map_err(|error| invalid(error.to_string()))?;
         Ok(Self {
-            url: format!("{origin}/proxy?{}", query.finish()),
+            url: format!("{origin}/proxy"),
             token: token.to_string(),
-            post_body,
+            body: body.0,
         })
     }
 
-    /// `GET /proxy?url=...&headers=...&redirect=...` のフル URL。
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// `X-Proxy-Token` ヘッダに入れる値。
-    pub fn token(&self) -> &str {
-        &self.token
-    }
-
-    /// `POST /proxy` に送る JSON ボディ (GET と同じペイロード)。
-    pub fn post_body(&self) -> &str {
-        &self.post_body
+    /// 所有している本文とトークンを移し、1 ホップだけの HTTP 要求にする。
+    pub fn into_request(self) -> HttpRequest {
+        let mut request = HttpRequest::post(self.url, self.body);
+        request.redirect = RedirectMode::Manual;
+        request.trusted_endpoint = true;
+        request.headers = vec![
+            (TOKEN_HEADER.to_string(), self.token),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        request
     }
 }
 
@@ -204,12 +239,60 @@ pub struct RelayResponse {
     pub status: u16,
     /// `contentType`。空文字・欠落は `None`。
     pub content_type: Option<String>,
-    /// `location` (redirect=manual 時の 3xx 応答など)。
+    /// `location` (3xx 応答のリダイレクト先。踏み台は辿らない)。
     pub location: Option<String>,
+    /// `setCookie` の値 (上流が複数返したときは受信順)。
+    ///
+    /// ログインセッションの更新は 1 本も落とせないため、他のヘッダと違って
+    /// 名前つきで運ぶ。
+    pub set_cookie: Vec<String>,
     /// 踏み台がどのクライアントで取ったか (`curl` / `worker-fetch` / 診断情報)。
     pub via: Option<String>,
     /// base64 をデコード済みのレスポンスボディ。
     pub body: Vec<u8>,
+}
+
+/// Strings borrow the wire envelope when JSON needs no unescaping (in
+/// particular the large base64 body). Non-string optional metadata retains
+/// the protocol's existing ignore semantics.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RelayString<'a> {
+    Text(#[serde(borrow)] std::borrow::Cow<'a, str>),
+    Other(serde::de::IgnoredAny),
+}
+
+impl RelayString<'_> {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text.as_ref()),
+            Self::Other(_) => None,
+        }
+    }
+
+    fn into_nonempty_string(self) -> Option<String> {
+        match self {
+            Self::Text(text) if !text.is_empty() => Some(text.into_owned()),
+            _ => None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RelayEnvelope<'a> {
+    status: Option<serde_json::Value>,
+    #[serde(borrow)]
+    body: Option<RelayString<'a>>,
+    #[serde(borrow)]
+    error: Option<RelayString<'a>>,
+    #[serde(rename = "contentType", borrow)]
+    content_type: Option<RelayString<'a>>,
+    #[serde(borrow)]
+    location: Option<RelayString<'a>>,
+    #[serde(rename = "setCookie")]
+    set_cookie: Option<serde_json::Value>,
+    #[serde(borrow)]
+    via: Option<RelayString<'a>>,
 }
 
 impl RelayResponse {
@@ -217,72 +300,76 @@ impl RelayResponse {
     /// した踏み台自身の HTTP ステータスで、エラーの報告にだけ使う。
     ///
     /// `error` フィールドを含む応答は `Rejected`、JSON でない・必須フィールド
-    /// が欠けている応答は `Malformed` を返す。
-    pub fn parse(http_status: u16, bytes: &[u8]) -> std::result::Result<Self, RelayError> {
+    /// が欠けている応答は `Malformed` を返す。`decoded_body_limit` は base64
+    /// デコード前の長さ判定と、実際の復号バイト列の両方に適用する。
+    pub fn parse(
+        http_status: u16,
+        bytes: &[u8],
+        decoded_body_limit: usize,
+    ) -> std::result::Result<Self, RelayError> {
         let malformed = |message: String| RelayError::Malformed(message);
+        if bytes.len() > response_wire_limit(decoded_body_limit) {
+            return Err(malformed("relay response envelope exceeds limit".into()));
+        }
+        if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+            return Err(malformed("response is not a JSON object".into()));
+        }
 
-        let value: serde_json::Value = serde_json::from_slice(bytes)
+        let envelope: RelayEnvelope<'_> = serde_json::from_slice(bytes)
             .map_err(|e| malformed(format!("response is not JSON: {e}")))?;
+        let status = envelope.status.as_ref()
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok());
 
-        if let Some(message) = value.get("error").and_then(|v| v.as_str()) {
+        if let Some(message) = envelope.error.as_ref().and_then(RelayString::as_str) {
+            if bytes.len() > MAX_RELAY_METADATA {
+                return Err(malformed("relay response metadata exceeds limit".into()));
+            }
             return Err(RelayError::Rejected {
                 http_status,
-                upstream_status: value
-                    .get("status")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|s| u16::try_from(s).ok()),
+                upstream_status: status,
                 message: message.to_string(),
             });
         }
 
-        let status = value
-            .get("status")
-            .and_then(|v| v.as_u64())
-            .and_then(|s| u16::try_from(s).ok())
+        let status = status
             .ok_or_else(|| malformed("response has no numeric `status`".to_string()))?;
-        let body64 = value
-            .get("body")
-            .and_then(|v| v.as_str())
+        let body64 = envelope.body.as_ref()
+            .and_then(RelayString::as_str)
             .ok_or_else(|| malformed("response has no base64 `body`".to_string()))?;
+        if bytes.len().saturating_sub(body64.len()) > MAX_RELAY_METADATA {
+            return Err(malformed("relay response metadata exceeds limit".into()));
+        }
 
-        let nonempty_string = |key: &str| {
-            value
-                .get(key)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
+
+        // `setCookie` は文字列の配列。欠落 (古い踏み台) は空、文字列でない
+        // 要素は無視する。
+        let body = base64_decode(body64, decoded_body_limit)?;
+        let set_cookie = match envelope.set_cookie {
+            Some(serde_json::Value::Array(items)) => items.into_iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::String(value) => Some(value),
+                    _ => None,
+                }).collect(),
+            _ => Vec::new(),
         };
 
         Ok(Self {
             status,
-            content_type: nonempty_string("contentType"),
-            location: nonempty_string("location"),
-            via: nonempty_string("via"),
-            body: base64_decode(body64)?,
+            content_type: envelope.content_type.and_then(RelayString::into_nonempty_string),
+            location: envelope.location.and_then(RelayString::into_nonempty_string),
+            set_cookie,
+            via: envelope.via.and_then(RelayString::into_nonempty_string),
+            body,
         })
     }
 }
 
-/// `http_policy` と同じ規則: ヘッダ名は RFC 9110 のトークン相当
-/// (`[A-Za-z0-9_-]`、64 文字まで)。`downloader` は feature-gated で platform
-/// から参照できないため、ここで同じ規則を守る。
-fn is_safe_header_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-}
-
-/// `is_safe_header_value` と同じ規則: 値に ASCII 制御文字 (CR/LF 含む) を
-/// 許さない。
-fn is_safe_header_value(value: &str) -> bool {
-    !value.bytes().any(|byte| byte.is_ascii_control())
-}
-
+#[cfg(test)]
 const B64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+#[cfg(test)]
 /// 標準 base64 (padding あり)。踏み台は `btoa` / `Buffer.toString("base64")`
 /// の出力を返すので、URL セーフ変種ではなくこちらを使う。
 fn base64_encode(input: &[u8]) -> String {
@@ -310,7 +397,7 @@ fn base64_encode(input: &[u8]) -> String {
 
 /// `base64_encode` の逆。`=` は末尾のチャンクの位置 2/3 にだけ許す
 /// (`btoa` 出力の形)。空白・不正文字・壊れたパディングは `Malformed`。
-fn base64_decode(input: &str) -> std::result::Result<Vec<u8>, RelayError> {
+fn base64_decode(input: &str, limit: usize) -> std::result::Result<Vec<u8>, RelayError> {
     let malformed = |message: String| RelayError::Malformed(message);
 
     fn sextet(byte: u8) -> Option<u32> {
@@ -325,19 +412,27 @@ fn base64_decode(input: &str) -> std::result::Result<Vec<u8>, RelayError> {
     }
 
     let bytes = input.as_bytes();
+    if bytes.len() > limit.div_ceil(3).saturating_mul(4) {
+        return Err(malformed("decoded relay body exceeds limit".into()));
+    }
     if !bytes.len().is_multiple_of(4) {
         return Err(malformed(format!(
             "base64 length {} is not a multiple of 4",
             bytes.len()
         )));
     }
-    let chunks: Vec<&[u8]> = bytes.chunks(4).collect();
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for (index, chunk) in chunks.iter().enumerate() {
+    let chunks = bytes.len() / 4;
+    let padding = bytes.iter().rev().take_while(|&&byte| byte == b'=').count();
+    let decoded_len = (chunks * 3).saturating_sub(padding);
+    if decoded_len > limit {
+        return Err(malformed("decoded relay body exceeds limit".into()));
+    }
+    let mut out = Vec::with_capacity(decoded_len);
+    for (index, chunk) in bytes.chunks(4).enumerate() {
         let data_len = chunk.iter().take_while(|&&b| b != b'=').count();
         if data_len < 2
             || !chunk[data_len..].iter().all(|&b| b == b'=')
-            || (data_len < 4 && index + 1 != chunks.len())
+            || (data_len < 4 && index + 1 != chunks)
         {
             return Err(malformed("invalid base64 padding".to_string()));
         }
@@ -360,132 +455,45 @@ fn base64_decode(input: &str) -> std::result::Result<Vec<u8>, RelayError> {
             out.push(acc as u8);
         }
     }
+    if out.len() > limit {
+        return Err(malformed("decoded relay body exceeds limit".into()));
+    }
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     const BASE: &str = "http://172.233.91.23:50071/";
 
-    fn query(url: &str) -> BTreeMap<String, String> {
-        url::Url::parse(url)
-            .unwrap()
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect()
-    }
-
-    fn site_headers() -> Vec<(String, String)> {
-        vec![
-            ("Accept".into(), "text/html,application/xhtml+xml".into()),
-            ("Accept-Language".into(), "ja-JP".into()),
-            ("Sec-Fetch-Mode".into(), "navigate".into()),
-            (
-                "Cookie".into(),
-                "over18=yes; session=a b=%2F".into(),
-            ),
-        ]
-    }
-
-    #[test]
-    fn request_url_round_trips_target_and_headers() {
-        let target = "https://syosetu.org/novel/426898/1.html?x=1&y=%2F";
-        let request =
-            RelayRequest::new(BASE, "secret-token", target, &site_headers(), RedirectMode::Manual)
-                .unwrap();
-
-        assert!(request.url().starts_with("http://172.233.91.23:50071/proxy?"));
-        assert_eq!(request.token(), "secret-token");
-
-        let params = query(request.url());
-        assert_eq!(params["url"], target);
-        assert_eq!(params["redirect"], "manual");
-
-        // 踏み台側の復号 (atob → JSON.parse) と同じ手順で往復させる。
-        let decoded: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(&base64_decode(&params["headers"]).unwrap()).unwrap();
-        assert_eq!(decoded["Accept"], "text/html,application/xhtml+xml");
-        assert_eq!(decoded["Cookie"], "over18=yes; session=a b=%2F");
-        assert_eq!(decoded.len(), 4);
-    }
-
-    #[test]
-    fn request_url_is_stable_regardless_of_header_order() {
-        let mut reversed = site_headers();
-        reversed.reverse();
-        let a = RelayRequest::new(BASE, "t", "https://example.com/", &site_headers(),
-            RedirectMode::Follow)
-            .unwrap();
-        let b = RelayRequest::new(BASE, "t", "https://example.com/", &reversed,
-            RedirectMode::Follow)
-            .unwrap();
-        assert_eq!(a.url(), b.url());
-        assert_eq!(query(a.url())["redirect"], "follow");
-    }
-
-    #[test]
-    fn request_without_headers_omits_the_param() {
-        let request = RelayRequest::new(
-            BASE,
-            "t",
-            "https://example.com/",
-            &[],
-            RedirectMode::Follow,
-        )
-        .unwrap();
-        let params = query(request.url());
-        assert!(!params.contains_key("headers"));
-        // POST 側も同じペイロードを持つ (空オブジェクト)。
-        let body: serde_json::Value = serde_json::from_str(request.post_body()).unwrap();
-        assert_eq!(body["url"], "https://example.com/");
-        assert_eq!(body["headers"], serde_json::json!({}));
-        assert_eq!(body["redirect"], "follow");
-    }
 
     #[test]
     fn request_rejects_unsafe_inputs() {
+        let long_name = "x".repeat(65);
         let bad = [
             vec![("Bad\nName".to_string(), "v".to_string())],
             vec![("bad name".to_string(), "v".to_string())],
             vec![("Ok".to_string(), "v\r\nInjected: x".to_string())],
+            vec![("Ok".to_string(), "v\u{0}".to_string())],
+            vec![(long_name, "v".to_string())],
         ];
         for headers in bad {
             assert!(matches!(
-                RelayRequest::new(BASE, "t", "https://example.com/", &headers, RedirectMode::Follow),
+                RelayRequest::new(BASE, "t", "https://example.com/", &headers),
                 Err(RelayError::InvalidRequest(_))
             ));
         }
         assert!(matches!(
-            RelayRequest::new(
-                BASE,
-                "to\nken",
-                "https://example.com/",
-                &[],
-                RedirectMode::Follow
-            ),
+            RelayRequest::new(BASE, "to\nken", "https://example.com/", &[]),
             Err(RelayError::InvalidRequest(_))
         ));
         assert!(matches!(
-            RelayRequest::new(
-                BASE,
-                "t",
-                "ftp://example.com/",
-                &[],
-                RedirectMode::Follow
-            ),
+            RelayRequest::new(BASE, "t", "ftp://example.com/", &[]),
             Err(RelayError::InvalidRequest(_))
         ));
         assert!(matches!(
-            RelayRequest::new(
-                "file:///etc/passwd",
-                "t",
-                "https://example.com/",
-                &[],
-                RedirectMode::Follow
-            ),
+            RelayRequest::new("file:///etc/passwd", "t", "https://example.com/", &[]),
             Err(RelayError::InvalidRequest(_))
         ));
     }
@@ -497,7 +505,7 @@ mod tests {
             r#"{{"status":200,"contentType":"text/html; charset=UTF-8","via":"curl","body":"{}"}}"#,
             base64_encode(utf8)
         );
-        let parsed = RelayResponse::parse(200, response.as_bytes()).unwrap();
+        let parsed = RelayResponse::parse(200, response.as_bytes(), 1024).unwrap();
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.content_type.as_deref(), Some("text/html; charset=UTF-8"));
         assert_eq!(parsed.via.as_deref(), Some("curl"));
@@ -509,16 +517,54 @@ mod tests {
             r#"{{"status":404,"location":"/other","body":"{}"}}"#,
             base64_encode(&binary)
         );
-        let parsed = RelayResponse::parse(200, response.as_bytes()).unwrap();
+        let parsed = RelayResponse::parse(200, response.as_bytes(), 1024).unwrap();
         assert_eq!(parsed.status, 404);
         assert_eq!(parsed.location.as_deref(), Some("/other"));
         assert_eq!(parsed.body, binary);
     }
 
     #[test]
+    fn response_carries_every_set_cookie_and_tolerates_its_absence() {
+        let response = br#"{"status":302,"contentType":"text/html","location":"/login","setCookie":["a=1; Path=/","b=2"],"body":"QQ=="}"#;
+        let parsed = RelayResponse::parse(200, response, 1024).unwrap();
+        assert_eq!(parsed.status, 302);
+        assert_eq!(parsed.location.as_deref(), Some("/login"));
+        assert_eq!(
+            parsed.set_cookie,
+            vec!["a=1; Path=/".to_string(), "b=2".to_string()]
+        );
+
+        // フィールド欠落 (古い踏み台) と非文字列要素は空/無視。
+        let plain = RelayResponse::parse(200, br#"{"status":200,"body":"QQ=="}"#, 1024).unwrap();
+        assert!(plain.set_cookie.is_empty());
+        let mixed =
+            RelayResponse::parse(200, br#"{"status":200,"setCookie":[1,"x=1"],"body":"QQ=="}"#, 1024)
+                .unwrap();
+        assert_eq!(mixed.set_cookie, vec!["x=1".to_string()]);
+    }
+
+    #[test]
+    fn escaped_body_strings_and_nonstring_optional_metadata_keep_protocol_semantics() {
+        let response = RelayResponse::parse(
+            200,
+            br#"{"status":200,"body":"\u0051Q==","contentType":17,"location":{},"via":[],"setCookie":[{},"sid=fresh",1]}"#,
+            1,
+        ).unwrap();
+        assert_eq!(response.body, b"A");
+        assert!(response.content_type.is_none());
+        assert!(response.location.is_none());
+        assert!(response.via.is_none());
+        assert_eq!(response.set_cookie, vec!["sid=fresh"]);
+        assert!(matches!(
+            RelayResponse::parse(403, br#"{"status":{},"error":"forbidden","body":123}"#, 1),
+            Err(RelayError::Rejected { http_status: 403, upstream_status: None, .. }),
+        ));
+    }
+
+    #[test]
     fn response_errors_are_reported() {
         // 踏み台の拒否。
-        match RelayResponse::parse(403, br#"{"error":"forbidden"}"#) {
+        match RelayResponse::parse(403, br#"{"error":"forbidden"}"#, 1024) {
             Err(RelayError::Rejected {
                 http_status: 403,
                 upstream_status: None,
@@ -530,6 +576,7 @@ mod tests {
         match RelayResponse::parse(
             502,
             br#"{"status":503,"error":"fetch failed: boom"}"#,
+            1024,
         ) {
             Err(RelayError::Rejected {
                 http_status: 502,
@@ -540,7 +587,7 @@ mod tests {
         }
         // JSON でない応答 (Cloudflare のチャレンジ HTML 等)。
         assert!(matches!(
-            RelayResponse::parse(200, b"<html>challenge</html>"),
+            RelayResponse::parse(200, b"<html>challenge</html>", 1024),
             Err(RelayError::Malformed(_))
         ));
         // status 欠落・非数値・body 欠落・body 非文字列。
@@ -551,7 +598,7 @@ mod tests {
             br#"{"status":200,"body":123}"#.as_slice(),
         ] {
             assert!(
-                matches!(RelayResponse::parse(200, bad), Err(RelayError::Malformed(_))),
+                matches!(RelayResponse::parse(200, bad, 1024), Err(RelayError::Malformed(_))),
                 "{bad:?} should be malformed"
             );
         }
@@ -561,20 +608,69 @@ mod tests {
     fn base64_round_trip_and_rejects_garbage() {
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
         assert_eq!(base64_encode(b"he"), "aGU=");
-        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
-        assert_eq!(base64_decode("aGU=").unwrap(), b"he");
-        assert_eq!(base64_decode("").unwrap(), Vec::<u8>::new());
+        assert_eq!(base64_decode("aGVsbG8=", 1024).unwrap(), b"hello");
+        assert_eq!(base64_decode("aGU=", 1024).unwrap(), b"he");
+        assert_eq!(base64_decode("", 1024).unwrap(), Vec::<u8>::new());
 
         for garbage in ["AAA", "A===", "AAAA=AAA", "!!!!", "aGVs bG8=", "aGVsbG8"] {
             assert!(
-                matches!(base64_decode(garbage), Err(RelayError::Malformed(_))),
+                matches!(base64_decode(garbage, 1024), Err(RelayError::Malformed(_))),
                 "{garbage:?} should be malformed"
             );
         }
         // デコード失敗は parse でも Malformed になる。
         assert!(matches!(
-            RelayResponse::parse(200, br#"{"status":200,"body":"!!!"}"#),
+            RelayResponse::parse(200, br#"{"status":200,"body":"!!!"}"#, 1024),
             Err(RelayError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn decoded_body_limit_checks_length_and_padding_before_allocation() {
+        assert!(RelayResponse::parse(200, br#"{"status":200,"body":"QUJDREVG"}"#, 3).is_err());
+        // Three bytes fit the base64 wire length of a two-byte limit, but the
+        // decoded length must still fail rather than rounding the cap upward.
+        assert!(RelayResponse::parse(200, br#"{"status":200,"body":"QUJD"}"#, 2).is_err());
+        assert_eq!(
+            RelayResponse::parse(200, br#"{"status":200,"body":"QUI="}"#, 2).unwrap().body,
+            b"AB",
+        );
+        assert!(RelayResponse::parse(200, br#"{"status":200,"body":"QQ=="}"#, 0).is_err());
+        assert!(RelayResponse::parse(200, br#"{"status":200,"body":""}"#, 0).unwrap().body.is_empty());
+    }
+
+    #[test]
+    fn relay_accepts_exactly_sixteen_mib_of_decoded_bytes() {
+        let limit = 16 * 1024 * 1024;
+        for length in [limit, limit + 1] {
+            let encoded = base64_encode(&vec![b'x'; length]);
+            let wire = format!(r#"{{"status":200,"setCookie":["sid=fresh"],"body":"{encoded}"}}"#);
+            drop(encoded);
+            assert!(wire.len() <= response_wire_limit(limit));
+            let result = RelayResponse::parse(200, wire.as_bytes(), limit);
+            if length == limit {
+                let response = result.unwrap();
+                assert_eq!(response.body.len(), limit);
+                assert!(response.body.iter().all(|&byte| byte == b'x'));
+                assert_eq!(response.set_cookie, vec!["sid=fresh"]);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("exceeds limit"));
+            }
+        }
+    }
+
+    #[test]
+    fn response_metadata_is_bounded_even_when_the_body_is_small() {
+        let envelope_len = r#"{"status":200,"via":"","body":""}"#.len();
+        for length in [MAX_RELAY_METADATA, MAX_RELAY_METADATA + 1] {
+            let via = "x".repeat(length - envelope_len);
+            let wire = format!(r#"{{"status":200,"via":"{via}","body":""}}"#);
+            let result = RelayResponse::parse(200, wire.as_bytes(), 16 * 1024 * 1024);
+            if length == MAX_RELAY_METADATA {
+                assert!(result.unwrap().body.is_empty());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("metadata exceeds limit"));
+            }
+        }
     }
 }

@@ -5,7 +5,7 @@
 //! 載った `SettingsService` を渡すだけ）。cron は次回の設定を読み、
 //! 表示設定の変更は PushHub で既存の画面へ即時通知する。
 
-use narou_rs::application::settings_view::{self, SAVE_MESSAGE};
+use narou_rs::application::settings_view;
 use worker::{console_log, Env, Method, Request, Response};
 
 use crate::webui::metadata;
@@ -74,14 +74,16 @@ pub async fn api_global_setting(mut req: Request, env: Env) -> worker::Result<Re
         }
     }
     match settings_view::apply_save(&settings, &body).await {
-        Ok(effects) => {
-            if effects.contains(&narou_rs::application::SettingsEffect::WebuiConfigChanged) {
+        Ok(result) => {
+            if result.effects.contains(&narou_rs::application::SettingsEffect::WebuiConfigChanged) {
                 let push = crate::push_hub::PushHubClient::new(&env, crate::budget::SubrequestBudget::new());
                 push.broadcast_best_effort(&[
                     crate::push_hub::event("webui.config.reload", serde_json::json!("")),
                 ]).await;
             }
-            Response::from_json(&result_body(true, SAVE_MESSAGE))
+            let body = settings_view::save_response(&result);
+            let status = if body["conflict"] == true { 409 } else { 200 };
+            Response::from_json(&body).map(|response| response.with_status(status))
         }
         Err(error) => {
             let conflict = matches!(&error, narou_rs::application::ApplicationError::Conflict(_));
@@ -133,7 +135,7 @@ fn result_body(success: bool, message: &str) -> serde_json::Value {
 ///   出力・コピー・ファイル名前提)、`concurrency.*` (native コンソールの
 ///   キュー表示整形。Worker は読まない。`concurrency` 自体は Worker でも
 ///   効く — convert ジョブの行を `stdout2` へ分ける)、
-///   `economy` / `no-color` / `color-parser` / `multiple-delimiter` /
+///   `no-color` / `color-parser` / `multiple-delimiter` /
 ///   `time-zone` (CLI・コンソール・native ファイル出力専用)、
 ///   `narou-compat` (D1 固定ストアの切替対象が無い)、
 ///   `self-update.variant` (self-update 経路自体が無い)、
@@ -142,6 +144,7 @@ fn result_body(success: bool, message: &str) -> serde_json::Value {
 ///
 /// 逆に Worker で読まれるため対象外: `download.use-subdirectory` /
 /// `guard-spoiler` / `auto-add-tags` / `update.strong` / `over18` /
+/// `economy` (`nosave_diff` だけが差分キャッシュを制御し、生データは常に保存しない) /
 /// `user-agent` / `download.interval` / `download.wait-steps` /
 /// `update.interval` / `update.sort-by` / `update.auto-schedule*` /
 /// `queue.*` / `webui.*` / `server-max-targets-per-request`
@@ -174,7 +177,8 @@ fn mark_worker_ineffective(view: &mut serde_json::Value) {
         let hidden_secret_namespace = name.starts_with("s3.");
         let (default_value, note, maximum) = match name {
             "concurrency" => (Some(serde_json::json!(true)), Some("Worker のジョブ実行レーン数は変わりません。有効にするとダウンロードと変換のコンソールを分離します。"), None),
-            "convert.keep-txt" => (Some(serde_json::json!(false)), Some("Worker の既定は保存しないです。EPUB ダウンロード時は保存済み本文から生成します。"), None),
+            "convert.keep-txt" => (Some(serde_json::json!(crate::convert::KEEP_CONVERTED_TEXT_DEFAULT)), Some("Worker の既定は保存しないです。EPUB ダウンロード時は保存済み本文から生成します。"), None),
+            "economy" => (None, Some("Worker では nosave_diff が差分キャッシュの保存を制御します。raw データは常に保存せず、cleanup_temp / send_delete は native 専用です。"), None),
             "queue.max-retries" => (None, Some("この Worker の再試行回数は配備上限以下です。"), Some(crate::consumer::CF_CONSUMER_MAX_RETRIES)),
             _ => (None, None, None),
         };
@@ -237,7 +241,6 @@ fn is_worker_ineffective(name: &str) -> bool {
         "convert.no-zip",
         "device",
         "download.choices-of-digest-options",
-        "economy",
         "filename-length-limit",
         "folder",
         "folder-length-limit",
@@ -249,6 +252,7 @@ fn is_worker_ineffective(name: &str) -> bool {
         "self-update.variant",
         "sqlite.mirror-files",
         "time-zone",
+        "update.disabled-author-tracking",
         "update.max-parallel-domains",
     ];
     if name.strip_prefix("default.").or_else(|| name.strip_prefix("force.")) == Some("enable_inspect") {
@@ -271,6 +275,7 @@ mod tests {
             // scheduler / downloader / convert が D1 から読むもの
             "download.interval",
             "download.use-subdirectory",
+            "economy",
             "update.interval",
             "update.sort-by",
             "update.strong",

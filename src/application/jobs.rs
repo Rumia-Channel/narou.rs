@@ -546,6 +546,47 @@ fn is_valid_ncode(value: &str) -> bool {
     (4..=8).contains(&rest.len()) && rest.chars().all(|ch| ch.is_ascii_alphanumeric())
 }
 
+/// Normalize the Web UI's update targets: `--tag=<name>` / `--tag <name>`
+/// become `tag:<name>`, everything else goes through the shared target
+/// validation (`application::webui`). The error strings are the ones the
+/// native handler surfaces, so both runtimes answer identically.
+pub fn normalize_update_targets(
+    targets: &[String],
+    max_targets: usize,
+) -> Result<Vec<String>, String> {
+    if targets.len() > max_targets {
+        return Err("too many targets".to_string());
+    }
+    let mut normalized = Vec::with_capacity(targets.len());
+    let mut i = 0usize;
+    while i < targets.len() {
+        let target = &targets[i];
+        if let Some(tag) = target.strip_prefix("--tag=") {
+            let tag = crate::application::webui::validate_web_tag_name(tag)
+                .map_err(|_| "--tag requires a tag name".to_string())?;
+            normalized.push(format!("tag:{}", tag));
+            i += 1;
+            continue;
+        }
+        if target == "--tag" {
+            let Some(tag) = targets.get(i + 1) else {
+                return Err("--tag requires a tag name".to_string());
+            };
+            let tag = crate::application::webui::validate_web_tag_name(tag)
+                .map_err(|_| "--tag requires a tag name".to_string())?;
+            normalized.push(format!("tag:{}", tag));
+            i += 2;
+            continue;
+        }
+        normalized.push(
+            crate::application::webui::validate_web_target_value(target)
+                .map_err(|_| "invalid target".to_string())?,
+        );
+        i += 1;
+    }
+    Ok(normalized)
+}
+
 // ---------------------------------------------------------------------------
 // Queue protocol types (Phase 8)
 //

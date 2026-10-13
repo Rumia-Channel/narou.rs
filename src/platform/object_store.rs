@@ -4,6 +4,7 @@
 //! `PathBuf`. Native adapters map keys onto the existing `.narou/` and
 //! `小説データ/` layout; Worker adapters can map the same keys onto S3.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -78,21 +79,27 @@ impl GeneratedAssetKey {
     }
 }
 
-/// 拡張子から保存時の `Content-Type` を決める。
+/// 保存用拡張子から `Content-Type` を決める。未知の拡張子は `None`。
 ///
-/// ObjectStore / AssetStore の実装 (D1 / S3) で同じ判断を使うため core に置く。
-pub fn content_type_for_key(key: &ObjectKey) -> Option<&'static str> {
-    match key.as_ref().rsplit('.').next() {
-        Some("yaml") | Some("yml") => Some("application/yaml"),
-        Some("txt") | Some("ini") => Some("text/plain; charset=utf-8"),
-        Some("html") => Some("text/html; charset=utf-8"),
-        Some("epub") => Some("application/epub+zip"),
-        Some("zip") => Some("application/zip"),
-        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
-        Some("png") => Some("image/png"),
-        Some("gif") => Some("image/gif"),
+/// 論理キーと native パスの両方から、割り当てなしで同じ対応表を使う。
+pub fn content_type_for_extension(extension: &str) -> Option<&'static str> {
+    match extension {
+        "yaml" | "yml" => Some("application/yaml"),
+        "txt" | "ini" => Some("text/plain; charset=utf-8"),
+        "html" => Some("text/html; charset=utf-8"),
+        "epub" => Some("application/epub+zip"),
+        "zip" => Some("application/zip"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
         _ => None,
     }
+}
+
+/// 論理キーの拡張子から保存時の `Content-Type` を決める。
+pub fn content_type_for_key(key: &ObjectKey) -> Option<&'static str> {
+    key.as_ref().rsplit('.').next().and_then(content_type_for_extension)
 }
 
 /// A validated prefix used for paginated listing.
@@ -228,6 +235,19 @@ pub fn prefix_upper_bound(prefix: &str) -> String {
     format!("{prefix}\u{10FFFF}")
 }
 
+/// Pure transform invoked inside an adapter's atomic control-object boundary.
+/// `None` leaves the current object untouched. Retries may invoke it again.
+pub type SmallObjectMutator<'data> =
+    dyn FnMut(Option<&[u8]>) -> Result<Option<Cow<'data, [u8]>>> + Send + 'data;
+
+/// A canonical write may succeed even if its optional filesystem mirror fails.
+#[derive(Debug)]
+pub enum ObjectUpdateResult {
+    Committed,
+    ProjectionFailed(NarouError),
+    Conflict,
+}
+
 /// Blob store for bounded control objects.
 ///
 /// `read_small`/`write_small` deliberately make the buffering contract
@@ -247,6 +267,19 @@ pub trait ObjectStore: PlatformService {
         key: &'a ObjectKey,
         data: Vec<u8>,
     ) -> PlatformFuture<'a, Result<()>>;
+
+    /// Atomically read, transform and commit a primary control object.
+    /// Asset-only adapters may reject this capability; never emulate it with
+    /// separate `read_small` and `write_small` calls.
+    fn update_small<'a, 'data: 'a>(
+        &'a self,
+        _key: &'a ObjectKey,
+        _mutate: &'a mut SmallObjectMutator<'data>,
+    ) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
+        Box::pin(async {
+            Err(NarouError::Platform("atomic control-object updates are unsupported by this store".into()))
+        })
+    }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>>;
 
@@ -409,6 +442,12 @@ impl NovelObjectKeys {
         ))
     }
 
+    /// A durable cache-version record, including completed updates with no
+    /// previous sections to archive. It is deliberately not a YAML section.
+    pub fn cached_version_marker(&self, timestamp: &str) -> ObjectKey {
+        self.child(&format!("本文/cache/{timestamp}/.version"))
+    }
+
     fn child(&self, component: &str) -> ObjectKey {
         ObjectKey::new_unchecked(format!("{}/{}", self.prefix.0, component))
     }
@@ -503,14 +542,20 @@ pub fn object_crc32(data: &[u8]) -> u32 {
 /// Compress `data` when it is large enough and brotli actually shrinks it.
 /// Returns the stored bytes plus the encoding marker to persist.
 pub fn compress_object_payload(data: &[u8]) -> (Vec<u8>, ObjectEncoding) {
+    let (stored, encoding) = encode_object_payload(data);
+    (stored.into_owned(), encoding)
+}
+
+/// Keep uncompressed bytes borrowed when the caller already owns the payload.
+pub fn encode_object_payload(data: &[u8]) -> (Cow<'_, [u8]>, ObjectEncoding) {
     if data.len() < COMPRESS_MIN_BYTES {
-        return (data.to_vec(), ObjectEncoding::None);
+        return (Cow::Borrowed(data), ObjectEncoding::None);
     }
     let compressed = brotli_compress(data);
     if compressed.len() < data.len() {
-        (compressed, ObjectEncoding::Brotli)
+        (Cow::Owned(compressed), ObjectEncoding::Brotli)
     } else {
-        (data.to_vec(), ObjectEncoding::None)
+        (Cow::Borrowed(data), ObjectEncoding::None)
     }
 }
 
@@ -526,6 +571,29 @@ pub fn decompress_object_payload(data: &[u8], encoding: ObjectEncoding) -> Resul
             })
         }
     }
+}
+
+/// Decode a bounded control object without copying an uncompressed payload.
+pub fn decode_object_payload_limited(data: &[u8], encoding: ObjectEncoding, limit: usize) -> Result<Cow<'_, [u8]>> {
+    if data.len() > limit {
+        return Err(NarouError::Platform("stored object exceeds the read cap".into()));
+    }
+    let decoded = match encoding {
+        ObjectEncoding::None => return Ok(Cow::Borrowed(data)),
+        ObjectEncoding::Brotli => {
+            use std::io::Read;
+            let mut decoded = Vec::new();
+            brotli::Decompressor::new(data, 4096)
+                .take((limit as u64).saturating_add(1)).read_to_end(&mut decoded)?;
+            decoded
+        }
+        ObjectEncoding::Deflate => miniz_oxide::inflate::decompress_to_vec_with_limit(data, limit)
+            .map_err(|error| NarouError::Platform(format!("invalid or oversized deflate object: {error}")))?,
+    };
+    if decoded.len() > limit {
+        return Err(NarouError::Platform("decoded object exceeds the read cap".into()));
+    }
+    Ok(Cow::Owned(decoded))
 }
 
 /// Verify `data` (uncompressed) against a stored CRC-32.
@@ -637,6 +705,29 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn content_type_extensions_preserve_storage_metadata() {
+        for (extension, expected) in [
+            ("yaml", "application/yaml"),
+            ("yml", "application/yaml"),
+            ("txt", "text/plain; charset=utf-8"),
+            ("ini", "text/plain; charset=utf-8"),
+            ("html", "text/html; charset=utf-8"),
+            ("epub", "application/epub+zip"),
+            ("zip", "application/zip"),
+            ("jpg", "image/jpeg"),
+            ("jpeg", "image/jpeg"),
+            ("png", "image/png"),
+            ("gif", "image/gif"),
+            ("webp", "image/webp"),
+        ] {
+            assert_eq!(content_type_for_extension(extension), Some(expected));
+        }
+        for extension in ["", "unknown", "bin", "YAML", "PNG"] {
+            assert_eq!(content_type_for_extension(extension), None);
+        }
+    }
 
     #[test]
     fn object_key_display_and_validation() {

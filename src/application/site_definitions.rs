@@ -68,6 +68,62 @@ pub trait SiteDefinitionStore: PlatformService {
     fn delete<'a>(&'a self, name: &'a str) -> PlatformFuture<'a, Result<()>>;
 }
 
+/// Compiled URL, timezone and update-capability rules shared by runtime adapters.
+pub struct SiteSettingsSnapshot {
+    source: Arc<Vec<SiteSetting>>,
+    timezones: std::collections::HashMap<String, crate::application::SiteTimezone>,
+}
+
+impl SiteSettingsSnapshot {
+    pub fn new(source: Arc<Vec<SiteSetting>>) -> Self {
+        let timezones = source.iter().map(|setting| {
+            let timezone = match setting.site_timezone() {
+                crate::downloader::SiteTimezone::Named(tz) => crate::application::SiteTimezone::Named(tz),
+                crate::downloader::SiteTimezone::Fixed(offset) => crate::application::SiteTimezone::Fixed(offset),
+            };
+            (setting.domain.clone(), timezone)
+        }).collect();
+        Self { source, timezones }
+    }
+
+    pub fn source(&self) -> &Arc<Vec<SiteSetting>> {
+        &self.source
+    }
+
+    pub fn timezone(&self, domain: &str) -> Option<crate::application::SiteTimezone> {
+        self.timezones.get(domain).copied()
+    }
+}
+
+impl crate::application::SiteDefinitionProvider for SiteSettingsSnapshot {
+    fn resolve_toc_url(&self, url: &str) -> Option<String> {
+        self.source.iter().find(|setting| setting.matches_url(url)).map(|setting| {
+            setting.toc_url_with_url_captures(url).unwrap_or_else(|| setting.toc_url())
+        })
+    }
+
+    fn url_patterns_for_validation(&self) -> Vec<String> {
+        self.source.iter().flat_map(|setting| setting.url_patterns_for_validation()).collect()
+    }
+}
+
+impl crate::application::SiteTimezoneProvider for SiteSettingsSnapshot {
+    fn timezone_for_domain<'a>(
+        &'a self,
+        domain: &'a str,
+    ) -> PlatformFuture<'a, Result<Option<crate::application::SiteTimezone>>> {
+        let timezone = self.timezone(domain);
+        Box::pin(async move { Ok(timezone) })
+    }
+}
+
+impl crate::application::SiteUpdateCapabilityProvider for SiteSettingsSnapshot {
+    fn supports_narou_api(&self, toc_url: &str) -> bool {
+        self.source.iter().find(|setting| setting.matches_url(toc_url))
+            .and_then(|setting| setting.narou_api_url.as_ref()).is_some()
+    }
+}
+
 
 /// 名前を `webnovel/` のファイル名に正規化する。
 ///

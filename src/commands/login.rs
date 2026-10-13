@@ -9,8 +9,11 @@
 
 use narou_rs::error::{NarouError, Result};
 
-use narou_rs::login::{build_export, parse_export};
+use narou_rs::login::{
+    ReorderLoginsError, apply_login_label, apply_login_order, build_export, plan_import,
+};
 use narou_rs::native::cookie_store::InventoryCookieStore;
+use narou_rs::platform::cookie_store::CONCURRENT_EDIT_MESSAGE;
 
 /// Subcommands of `narou login`.
 #[derive(clap::Subcommand, Debug)]
@@ -91,7 +94,7 @@ pub fn cmd_login(action: LoginAction) -> Result<()> {
 }
 
 fn list(store: &InventoryCookieStore) -> Result<()> {
-    let stored = store.groups_by_site()?;
+    let (stored, encrypted) = store.groups_and_encryption()?;
     if stored.is_empty() {
         println!("保存されたログイン情報はありません。");
         println!("  narou_rs_login <サイト> --export <ファイル> で取得し、narou login import <ファイル> で取り込めます。");
@@ -100,7 +103,7 @@ fn list(store: &InventoryCookieStore) -> Result<()> {
     let total: usize = stored.values().map(Vec::len).sum();
     println!("保存されたログイン情報: {} サイト / {total} 件", stored.len());
     for (site, groups) in &stored {
-        let state = if store.is_encrypted(site)? {
+        let state = if encrypted.contains(site) {
             "暗号化済み"
         } else {
             "平文(次回保存時に暗号化)"
@@ -131,22 +134,20 @@ fn import(
     name: Option<&str>,
 ) -> Result<()> {
     let text = read_file(file)?;
-    let mut sites = parse_export(&text, passphrase)?;
-    if let Some(name) = name {
-        narou_rs::login::apply_import_name(&mut sites, name);
-    }
-    if sites.is_empty() {
+    let plan = plan_import(&text, passphrase, name)?;
+    if plan.sites.is_empty() {
         println!("{file} にログイン情報が含まれていません。");
         return Ok(());
     }
-    let logins: usize = sites.values().map(Vec::len).sum();
-    let sites_count = sites.len();
     let stored = if replace {
-        store.replace_groups(&sites)?
+        store.replace_groups(&plan.sites)?
     } else {
-        store.merge_groups(&sites)?
+        store.merge_groups(&plan.sites)?
     };
-    println!("ログイン情報を取り込みました: {logins} 件 / {sites_count} サイト");
+    println!(
+        "ログイン情報を取り込みました: {} 件 / {} サイト",
+        plan.logins, plan.sites_count
+    );
     println!("  保存済み: {stored} サイト ({})", store.key_source()?.describe());
     if replace {
         println!("  取り込みに含まれないサイトの情報は削除されました。");
@@ -199,11 +200,13 @@ fn group_at(
 }
 
 fn rename(store: &InventoryCookieStore, site: &str, index: usize, label: &str) -> Result<()> {
-    let (mut groups, position) = group_at(store, site, index)?;
-    let label = label.trim();
-    groups[position].label = (!label.is_empty()).then(|| label.to_string());
+    let (expected, position) = group_at(store, site, index)?;
+    let mut groups = expected.clone();
+    apply_login_label(&mut groups[position], label);
     let name = groups[position].display_name().to_string();
-    store.save_groups_for(site, &groups)?;
+    if !store.compare_save_groups_for(site, &expected, &groups)? {
+        return Err(NarouError::Login(CONCURRENT_EDIT_MESSAGE.to_string()));
+    }
     println!("{site} の {index} 番目を「{name}」にしました。");
     Ok(())
 }
@@ -232,24 +235,30 @@ fn reorder(store: &InventoryCookieStore, site: &str, order: &str) -> Result<()> 
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    if positions.len() != stored.len() {
-        return Err(NarouError::Login(format!(
-            "並び順は保存済みの {} 件すべてを指定してください: {order}",
-            stored.len()
-        )));
-    }
-    let mut seen = vec![false; stored.len()];
-    let mut reordered = Vec::with_capacity(stored.len());
-    for position in &positions {
-        if seen[position - 1] {
+    let order_indices: Vec<usize> = positions.iter().map(|position| position - 1).collect();
+    let reordered = match apply_login_order(&stored, &order_indices) {
+        Ok(reordered) => reordered,
+        Err(ReorderLoginsError::CountMismatch) => {
+            return Err(NarouError::Login(format!(
+                "並び順は保存済みの {} 件すべてを指定してください: {order}",
+                stored.len()
+            )));
+        }
+        Err(ReorderLoginsError::OutOfRange) => {
+            return Err(NarouError::Login(format!(
+                "並び順は 1〜{} の番号をカンマ区切りで指定してください: {order}",
+                stored.len()
+            )));
+        }
+        Err(ReorderLoginsError::Duplicate) => {
             return Err(NarouError::Login(format!(
                 "同じ番号が複数回指定されています: {order}"
             )));
         }
-        seen[position - 1] = true;
-        reordered.push(stored[position - 1].clone());
+    };
+    if !store.compare_save_groups_for(&site, &stored, &reordered)? {
+        return Err(NarouError::Login(CONCURRENT_EDIT_MESSAGE.to_string()));
     }
-    store.save_groups_for(&site, &reordered)?;
     println!("{site} の試行順を変更しました:");
     for (index, group) in reordered.iter().enumerate() {
         println!("  {}. {}", index + 1, group.display_name());
@@ -263,9 +272,12 @@ fn clear(store: &InventoryCookieStore, site: Option<&str>, index: Option<usize>)
             let site = site.trim().to_ascii_lowercase();
             match index {
                 Some(index) => {
-                    let (mut groups, position) = group_at(store, &site, index)?;
+                    let (expected, position) = group_at(store, &site, index)?;
+                    let mut groups = expected.clone();
                     let removed = groups.remove(position);
-                    store.save_groups_for(&site, &groups)?;
+                    if !store.compare_save_groups_for(&site, &expected, &groups)? {
+                        return Err(NarouError::Login(CONCURRENT_EDIT_MESSAGE.to_string()));
+                    }
                     println!("{site} の「{}」を削除しました。", removed.display_name());
                 }
                 None => {
@@ -297,25 +309,10 @@ fn read_file(path: &str) -> Result<String> {
         .map_err(|error| NarouError::Login(format!("{path} を読み込めません: {error}")))
 }
 
-/// Show which cookies a header carries without printing their values.
-#[cfg(test)]
-fn mask_cookie(cookie: &str) -> String {
-    let pairs = narou_rs::platform::parse_cookie_header(cookie);
-    let length = cookie.chars().count();
-    if pairs.is_empty() {
-        return format!("({length} 文字)");
-    }
-    let names = pairs
-        .iter()
-        .map(|(name, _)| format!("{name}=…"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    format!("{names} ({} 件, {length} 文字)", pairs.len())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use narou_rs::login::parse_export;
     use narou_rs::platform::cookie_store::{HostCookie, LoginGroup};
     use crate::test_support::{legacy_yaml_guard, set_current_dir_for_test};
     use std::collections::BTreeMap;
@@ -348,14 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn masks_cookie_values_but_keeps_the_names() {
-        let masked = mask_cookie("over18=yes; ses=abcdef");
-        assert_eq!(masked, "over18=…; ses=… (2 件, 22 文字)");
-        assert!(!masked.contains("abcdef"));
-        assert_eq!(mask_cookie(""), "(0 文字)");
-    }
-
-    #[test]
     fn import_and_export_round_trip_through_a_passphrase() {
         let _legacy = legacy_yaml_guard();
         let (temp, _guard, store) = library();
@@ -382,7 +371,8 @@ mod tests {
         assert_eq!(stored[0].cookies[0].cookie, "sid=abc");
         assert_eq!(stored[0].display_name(), "本垢");
         assert!(!stored[0].id.is_empty(), "取り込み時に識別子が振られる");
-        assert!(store.is_encrypted("example.com").unwrap());
+        let (_, encrypted) = store.groups_and_encryption().unwrap();
+        assert!(encrypted.contains("example.com"));
 
         let out = temp.path().join("out.yaml");
         let out = out.to_string_lossy().into_owned();

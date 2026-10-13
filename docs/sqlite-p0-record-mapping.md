@@ -52,8 +52,9 @@ SQLite 移行 P0 成果物。列定義は `worker_entry/migrations/0001_core.sql
 ## 実装位置
 
 - スキーマ本体: `src/native/sqlite/migrations/0001..0004.sql` (= worker_entry/migrations から移植)
-- マッピング実装: `src/db/novel_codec.rs` (列定義・bind 値・UPSERT/SELECT SQL を共有) + `src/native/sqlite/{record_map.rs, query.rs, repository.rs}` と `worker_entry/src/d1_repository.rs` の薄いアダプタ
-- SQL 断片: `src/db/sql/upsert.sql` (両ドライバ共用) / `src/native/sqlite/sql/*.sql` (STATUS 式)
+- マッピング実装: `src/db/novel_codec.rs` (列定義・bind 値・UPSERT/SELECT SQL を共有) + `src/db/novel_query.rs` (WHERE / 検索語 / sort / keyset / 件数 / 状態式を共有) + `src/native/sqlite/{record_map.rs, repository.rs}` と `worker_entry/src/d1_repository.rs` の薄いアダプタ (bind 変換とトランザクション/batch だけが固有)
+- SQL 断片: `src/db/sql/{upsert,status_search_expression,status_sort_expression}.sql` (両ドライバ共用)
+- 管理状態の一覧 (app_state ↔ レガシー YAML の対応): `src/db/state_inventory.rs` (`Inventory` / 取込 / `db export-yaml` が共有)
 - dual-run/golden テスト: `src/native/sqlite/repository.rs#tests`, `tests/golden/{records-a.json, library-a/}`
 
 ※この表は P0 時点 (migrations 0001〜0004) の対応表。native 側はその後 `0005`〜`0010` (queue / versions / objects / section_bodies) と `0011` (`novels.requires_login`)、`0012` (`novels.login_session`) が追加されており、ログイン関連列は AGENTS.md「ログインが必要なサイト」節を参照。

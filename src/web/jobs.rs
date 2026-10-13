@@ -9,9 +9,9 @@ use axum::{
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
+use crate::application::webui::{diff, queue_view, tag_views};
 use crate::db::with_database_mut;
-use crate::downloader::types::{CACHE_SAVE_DIR, SECTION_SAVE_DIR, SectionFile};
-use crate::downloader::{Downloader, TargetType};
+use crate::downloader::types::SECTION_SAVE_DIR;
 use crate::queue::{
     JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
     WEBUI_MESSAGE_TEXT_META_KEY, WEBUI_MESSAGE_TYPE_META_KEY, WEBUI_UPDATE_START_MESSAGE_TYPE,
@@ -43,7 +43,7 @@ pub struct DiffListQuery {
     pub target: Option<String>,
 }
 
-use super::{html_escape, tag_color_class, targets_to_strings};
+use super::targets_to_strings;
 
 fn validate_download_targets(targets: &[String], max_targets: usize) -> Result<(), String> {
     if targets.len() > max_targets {
@@ -131,83 +131,20 @@ fn update_job_matches_request(
     legacy_cmd != "update_general_lastup" || update_job_requests_modified(&spec.meta) == update_modified
 }
 
-fn queue_target_fallback_text(target: &str) -> String {
-    target
-        .split('\t')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" / ")
-}
-
-fn describe_update_targets(targets: &[String]) -> String {
-    match targets {
-        [] => "全ての小説".to_string(),
-        [target] => {
-            if let Some(tag) = target.strip_prefix("tag:") {
-                format!("タグ「{}」の小説", tag)
-            } else if target.chars().all(|ch| ch.is_ascii_digit()) {
-                format!("ID {} の小説", target)
-            } else {
-                target.to_string()
-            }
-        }
-        _ => format!("{}件の小説", targets.len()),
-    }
-}
-
+/// native の meta にある開始メッセージを共有実装へ渡すアダプタ。
 fn format_update_queue_target(args: &[String], meta: Option<&Mapping>) -> String {
-    if let Some(message) = meta.and_then(update_start_message) {
-        return message;
-    }
-
-    if args.first().map(String::as_str) == Some("--gl") {
-        return format_general_lastup_queue_target(&args[1..]);
-    }
-
-    let mut force = false;
-    let mut targets = Vec::new();
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if arg == "--force" {
-            force = true;
-            continue;
-        }
-        if arg == "--sort-by" {
-            skip_next = true;
-            continue;
-        }
-        targets.push(arg.clone());
-    }
-
-    let target_text = describe_update_targets(&targets);
-    if force {
-        format!("{}を凍結済みも含めて更新", target_text)
-    } else {
-        format!("{}を更新", target_text)
-    }
-}
-
-fn format_general_lastup_queue_target(args: &[String]) -> String {
-    match args.first().map(String::as_str) {
-        Some("narou") => "なろうAPIで最新話掲載日を確認".to_string(),
-        Some("other") => "その他サイトの最新話掲載日を確認".to_string(),
-        _ => "最新話掲載日を確認".to_string(),
-    }
+    queue_view::format_update_queue_target(args, meta.and_then(update_start_message).as_deref(), None)
 }
 
 fn format_queue_job_target(job: &QueueJob, spec: Option<&QueueExecutionSpec>) -> String {
     let Some(spec) = spec else {
-        return queue_target_fallback_text(&job.target);
+        return queue_view::queue_target_fallback_text(&job.target);
     };
 
     match spec.cmd.as_str() {
-        "update_general_lastup" => format_general_lastup_queue_target(&spec.args),
+        "update_general_lastup" => queue_view::general_lastup_queue_target(&spec.args),
         "update" | "update_by_tag" => format_update_queue_target(&spec.args, Some(&spec.meta)),
-        _ => queue_target_fallback_text(&job.target),
+        _ => queue_view::queue_target_fallback_text(&job.target),
     }
 }
 
@@ -224,8 +161,7 @@ fn job_type_key(job_type: JobType) -> &'static str {
 }
 
 fn format_queue_job_type(job: &QueueJob, spec: Option<&QueueExecutionSpec>) -> String {
-    spec.map(|spec| spec.cmd.clone())
-        .unwrap_or_else(|| job_type_key(job.job_type).to_string())
+    queue_view::queue_type_label(spec.map(|spec| spec.cmd.as_str()), job_type_key(job.job_type))
 }
 
 fn queue_display_target(queue: &PersistentQueue, job: &QueueJob) -> String {
@@ -399,43 +335,21 @@ async fn resolve_existing_id_for_target_with_library(
     state: &AppState,
     target: &str,
 ) -> Option<i64> {
-    match Downloader::get_target_type(target) {
-        TargetType::Id => state
-            .services
-            .library
-            .get(target.parse::<i64>().ok()?.into())
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id),
-        TargetType::Url => {
-            let toc_url = state.services.site_definitions.resolve_toc_url(target)?;
-            state
-                .services
-                .library
-                .find_by_toc_url(&toc_url)
-                .await
-                .ok()
-                .flatten()
-                .map(|record| record.id)
-        }
-        TargetType::Ncode => state
-            .services
-            .library
-            .find_by_ncode(target)
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id),
-        _ => state
-            .services
-            .library
-            .find_by_title(target)
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id),
-    }
+    state
+        .services
+        .library
+        .resolve_target(
+            crate::application::target_lookup::TargetLookupPlan::READ,
+            &std::collections::HashMap::new(),
+            crate::application::target_lookup::UrlSource::Provider(
+                &*state.services.site_definitions,
+            ),
+            target,
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.id)
 }
 
 fn push_update_job_if_needed(
@@ -567,46 +481,50 @@ fn kill_process_tree(pid: u32, push_server: &std::sync::Arc<super::push::PushSer
     }
 }
 
-fn read_sorted_cache_dirs(cache_root: &PathBuf) -> Result<Vec<PathBuf>, String> {
-    let mut list = Vec::new();
-    for entry in std::fs::read_dir(cache_root).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.is_dir() {
-            list.push(path);
+fn cache_version_dirs(archive_root: &std::path::Path, base_dir: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = Vec::new();
+    for name in diff::DIFF_CACHE_DIR_NAMES {
+        let root = base_dir.join(SECTION_SAVE_DIR).join(name);
+        super::reject_symlink_ancestors(&root, archive_root)?;
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        for entry in entries {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            super::reject_symlink_ancestors(&path, archive_root)?;
+            if path.is_dir() {
+                dirs.push(path);
+            }
         }
     }
-    list.sort_by(|a, b| {
-        let a_name = a
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        let b_name = b
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        b_name.cmp(a_name)
-    });
-    Ok(list)
+    Ok(dirs)
 }
 
-fn read_sorted_section_files(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
-    let mut list = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("yaml") {
-            list.push(path);
-        }
+fn native_cache_version_hints(
+    archive_root: &std::path::Path,
+    base_dir: &std::path::Path,
+) -> Result<Vec<diff::CacheVersionHint>, String> {
+    let mut hints = Vec::new();
+    for dir in cache_version_dirs(archive_root, base_dir)? {
+        let Some(version) = dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let enumeration_succeeded = std::fs::read_dir(&dir)
+            .and_then(|entries| {
+                for entry in entries {
+                    entry?;
+                }
+                Ok(())
+            })
+            .is_ok();
+        hints.push(diff::CacheVersionHint {
+            version: version.to_string(),
+            enumeration_succeeded,
+        });
     }
-    list.sort_by_key(|path| {
-        path.file_stem()
-            .and_then(|value| value.to_str())
-            .and_then(|value| value.split_once(' ').map(|(index, _)| index.to_string()))
-            .and_then(|index| index.parse::<usize>().ok())
-            .unwrap_or(0)
-    });
-    Ok(list)
+    Ok(hints)
 }
 
 async fn render_diff_list_html_for_target(state: &AppState, target: &str) -> String {
@@ -625,50 +543,45 @@ async fn render_diff_list_html_for_target(state: &AppState, target: &str) -> Str
     let Ok(base_dir) = super::safe_existing_novel_dir(&archive_root, &record) else {
         return String::new();
     };
-    let cache_root = base_dir.join(SECTION_SAVE_DIR).join(CACHE_SAVE_DIR);
-    let Ok(cache_dirs) = read_sorted_cache_dirs(&cache_root) else {
+    let Some(prefix) = crate::native::object_store::novel_object_prefix(&archive_root, &base_dir)
+    else {
         return String::new();
     };
-    if cache_dirs.is_empty() {
+    let Ok(hints) = native_cache_version_hints(&archive_root, &base_dir) else {
         return String::new();
-    }
+    };
+    let Ok(versions) =
+        diff::read_diff_cache_catalog(state.services.content.object_store(), &prefix, &hints).await
+    else {
+        return String::new();
+    };
+    diff::render_diff_list_html(&versions)
+}
 
-    let mut html = String::new();
-    for (number, cache_dir) in cache_dirs.iter().enumerate() {
-        let version = cache_dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        html.push_str("<div class=\"diff-list-group\">");
-        html.push_str(&format!(
-            "<div class=\"diff-list-version\">{}&nbsp;&nbsp;-{}</div>",
-            html_escape(version),
-            number + 1
-        ));
-        let Ok(section_paths) = read_sorted_section_files(cache_dir) else {
-            html.push_str("</div>");
-            continue;
-        };
-        if section_paths.is_empty() {
-            html.push_str("<div class=\"diff-list-entry\">(最新話のみのアップデート)</div></div>");
-            continue;
-        }
-        for section_path in section_paths {
-            let Ok(content) = std::fs::read_to_string(&section_path) else {
-                continue;
-            };
-            let Ok(section) = serde_yaml::from_str::<SectionFile>(&content) else {
-                continue;
-            };
-            html.push_str(&format!(
-                "<div class=\"diff-list-entry\">第{}部分　{}</div>",
-                html_escape(&section.index),
-                html_escape(section.subtitle.trim_end())
-            ));
-        }
-        html.push_str("</div>");
+#[cfg(test)]
+mod cache_catalog_tests {
+    use super::*;
+    use crate::native::object_store::NativeObjectStore;
+
+    #[test]
+    fn legacy_empty_cache_directory_is_read_without_creating_a_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path();
+        let base = archive.join("site/title");
+        let version_dir = base.join("本文/.cache/2026.10.13@01.02.03");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let objects = NativeObjectStore::from_root(archive.to_path_buf()).unwrap();
+        let prefix = crate::native::object_store::novel_object_prefix(archive, &base).unwrap();
+        let hints = native_cache_version_hints(archive, &base).unwrap();
+        let versions = futures::executor::block_on(
+            diff::read_diff_cache_catalog(&objects, &prefix, &hints),
+        ).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "2026.10.13@01.02.03");
+        assert!(versions[0].only_latest_update);
+        assert!(std::fs::read_dir(&version_dir).unwrap().next().is_none(),
+            "GET-time catalog reads must not create .version or YAML objects");
     }
-    html
 }
 
 fn gif_response() -> Response {
@@ -953,11 +866,13 @@ pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Val
     let running_jobs = state.queue.get_running_tasks();
     let running_count = running_jobs.len();
     let lane_sizes = queue_lane_sizes(state.queue.as_ref());
-    let running_label = match running_jobs.as_slice() {
-        [] => serde_json::Value::Null,
-        [job] => serde_json::Value::String(queue_display_target(state.queue.as_ref(), job)),
-        jobs => serde_json::Value::String(format!("{} 件実行中", jobs.len())),
-    };
+    let running_label = queue_view::queue_running_label(
+        running_count,
+        running_jobs
+            .first()
+            .filter(|_| running_count == 1)
+            .map(|job| queue_display_target(state.queue.as_ref(), job)),
+    );
     Json(serde_json::json!({
         "pending": state.queue.pending_count(),
         "completed": state.queue.completed_count(),
@@ -1010,7 +925,7 @@ fn broadcast_captured_web_output(
         if let Some(json) = routed.strip_prefix(crate::progress::WS_LINE_PREFIX)
             && let Ok(value) = serde_json::from_str::<serde_json::Value>(json)
         {
-            push_server.broadcast_raw(&value);
+            push_server.broadcast_raw(value);
         }
     }
 }
@@ -1418,25 +1333,11 @@ pub async fn api_diff_list(
         };
         let record = state.services.library.get(id.into()).await.ok().flatten();
         let Some(record) = record else {
-            diffs.push(serde_json::json!({
-                "id": id,
-                "title": format!("ID: {}", id),
-                "content": "Novel not found",
-            }));
+            diffs.push(diff::diff_missing_entry(id));
             continue;
         };
-        let content = match state.services.content.diff(id.into()).await {
-            Ok(Some(bytes)) => {
-                String::from_utf8(bytes).unwrap_or_else(|_| "読み取りエラー".to_string())
-            }
-            Ok(None) => "No diff".to_string(),
-            Err(_) => "読み取りエラー".to_string(),
-        };
-        diffs.push(serde_json::json!({
-            "id": id,
-            "title": record.title,
-            "content": content,
-        }));
+        let content = diff::diff_content_label(state.services.content.diff(id.into()).await);
+        diffs.push(diff::diff_list_entry(id, &record.title, &content));
     }
     serde_json::json!({ "diffs": diffs }).into()
 }
@@ -1589,10 +1490,10 @@ pub async fn api_diff_clean(
             Json(ApiResponse {
                 success: output.success,
                 message: if output.success {
-                    format!("Diff cleaned for {}", target)
+                    diff::diff_cleaned_message(&target)
                 } else {
                     log_immediate_command_failure("diff --clean", &output);
-                    "差分の削除に失敗しました".to_string()
+                    diff::DIFF_CLEAN_FAILED.to_string()
                 },
             })
         }
@@ -1600,7 +1501,7 @@ pub async fn api_diff_clean(
             log_web_failure("diff --clean", &e);
             Json(ApiResponse {
                 success: false,
-                message: "差分の削除に失敗しました".to_string(),
+                message: diff::DIFF_CLEAN_FAILED.to_string(),
             })
         }
     }
@@ -1609,7 +1510,7 @@ pub async fn api_diff_clean(
 /// Shared SQLite connection for diff-history endpoints; `None` when the
 /// library still runs on the legacy YAML backend.
 fn diff_history_conn(
-) -> Option<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>> {
+) -> Option<std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>> {
     let narou_dir = crate::db::inventory::Inventory::with_default_root()
         .ok()?
         .root_dir()
@@ -1621,7 +1522,7 @@ fn diff_history_versions(id: i64) -> Vec<serde_json::Value> {
     let Some(conn) = diff_history_conn() else {
         return Vec::new();
     };
-    let guard = conn.lock().expect("sqlite mutex poisoned");
+    let guard = conn.lock();
     match crate::native::sqlite::versions::list_versions(&guard, id) {
         Ok(versions) => versions
             .into_iter()
@@ -1680,8 +1581,8 @@ pub async fn api_diff_show(
         return serde_json::json!({ "success": false, "message": "SQLite backend is not active" })
             .into();
     };
-    let guard = conn.lock().expect("sqlite mutex poisoned");
-    match crate::native::sqlite::versions::version_diff(&guard, version_id) {
+    let guard = conn.lock();
+    match crate::native::sqlite::versions::version_diff(&guard, id, version_id) {
         Ok(Some(diff)) => serde_json::json!({
             "success": true,
             "id": id,
@@ -1970,13 +1871,13 @@ pub async fn get_pending_tasks(State(state): State<AppState>) -> Json<serde_json
     let pending_json: Vec<serde_json::Value> = pending
         .iter()
         .map(|j| {
-            serde_json::json!({
-                "id": j.id,
-                "type": queue_display_type(state.queue.as_ref(), j),
-                "target": j.target,
-                "display_target": queue_display_target(state.queue.as_ref(), j),
-                "created_at": j.created_at,
-            })
+            queue_view::queue_job_payload(
+                &j.id,
+                &queue_display_type(state.queue.as_ref(), j),
+                &j.target,
+                &queue_display_target(state.queue.as_ref(), j),
+                Some(j.created_at),
+            )
         })
         .collect();
 
@@ -1985,13 +1886,13 @@ pub async fn get_pending_tasks(State(state): State<AppState>) -> Json<serde_json
     let running_json: Vec<serde_json::Value> = running
         .iter()
         .map(|job| {
-            serde_json::json!({
-                "id": job.id,
-                "type": queue_display_type(state.queue.as_ref(), job),
-                "target": job.target,
-                "display_target": queue_display_target(state.queue.as_ref(), job),
-                "created_at": job.created_at,
-            })
+            queue_view::queue_job_payload(
+                &job.id,
+                &queue_display_type(state.queue.as_ref(), job),
+                &job.target,
+                &queue_display_target(state.queue.as_ref(), job),
+                Some(job.created_at),
+            )
         })
         .collect();
 
@@ -2201,59 +2102,19 @@ pub async fn api_taginfo(
         body.timestamp,
     );
     let new_tag_color = super::configured_tag_color(&state).await;
-    let mut tag_index: std::collections::HashMap<String, Vec<i64>> =
-        std::collections::HashMap::new();
-    let mut record_tags: std::collections::HashMap<i64, Vec<String>> =
-        std::collections::HashMap::new();
-    for record in &records {
-        record_tags.insert(record.id, record.tags.clone());
-        for tag in &record.tags {
-            tag_index.entry(tag.clone()).or_default().push(record.id);
-        }
-    }
-    let tag_names = tag_index.keys().cloned().collect::<Vec<_>>();
     let tag_colors = state
         .services
         .tag_colors
-        .for_tags(tag_names, new_tag_color.as_deref())
+        .for_tags(tag_views::tag_names(&records), new_tag_color.as_deref())
         .await
         .unwrap_or_default();
-    let mut selected_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for id in selected_ids.iter() {
-        if let Some(tags) = record_tags.get(id) {
-            for tag in tags {
-                *selected_counts.entry(tag.clone()).or_insert(0) += 1;
-            }
-        }
-    }
 
-    let mut sorted_tags: Vec<(&String, &Vec<i64>)> = tag_index.iter().collect();
-    sorted_tags.sort_by(|a, b| a.0.cmp(b.0));
-    let mut tag_info = Vec::with_capacity(sorted_tags.len());
-    for (tag, tag_ids) in sorted_tags {
-        let color = tag_colors.get(tag).map(|c| c.as_str()).unwrap_or("");
-        let class = tag_color_class(color);
-        let escaped_tag = html_escape(tag);
-        let html = format!(
-            "<span class=\"tag-label {}\">{}</span>",
-            class, escaped_tag
-        );
-        let mut entry = serde_json::json!({
-            "tag": tag,
-            "count": selected_counts.get(tag.as_str()).copied().unwrap_or(0),
-            "total_count": tag_ids.len(),
-            "html": html,
-        });
-        if with_exclusion {
-            entry["exclusion_html"] = serde_json::json!(format!(
-                "<span class=\"tag-label {} tag-exclusion\">{}</span>",
-                class, escaped_tag
-            ));
-        }
-        tag_info.push(entry);
-    }
-    Json(serde_json::json!(tag_info))
+    Json(serde_json::json!(tag_views::taginfo_entries(
+        &records,
+        &selected_ids,
+        with_exclusion,
+        &tag_colors,
+    )))
 }
 
 // POST /api/restore_pending_tasks
@@ -2500,14 +2361,14 @@ mod tests {
     use crate::web::sort_state::CurrentSortState;
 
     use super::{
-        broadcast_captured_web_output, build_update_by_tag_queue_payload,
+        build_update_by_tag_queue_payload,
         build_update_general_lastup_meta, build_update_start_message_meta,
         build_webui_update_start_message, encode_convert_job_target, existing_update_job_id,
-        format_general_lastup_queue_target, format_queue_job_type,
+        format_queue_job_type,
         format_update_queue_target, normalize_update_targets, push_update_job_if_needed,
         push_update_job_with_legacy_if_needed, queue_lane_sizes, reboot_args_with_no_browser,
         restorable_tasks_available,
-        sort_records_for_web_update, tag_color_class, validate_diff_number,
+        sort_records_for_web_update, validate_diff_number,
         validate_download_targets, validate_general_lastup_option, web_update_sort_key_for_cli,
     };
 
@@ -2774,22 +2635,6 @@ mod tests {
     }
 
     #[test]
-    fn general_lastup_queue_target_uses_human_readable_labels() {
-        assert_eq!(
-            format_general_lastup_queue_target(&["narou".to_string()]),
-            "なろうAPIで最新話掲載日を確認"
-        );
-        assert_eq!(
-            format_general_lastup_queue_target(&["other".to_string()]),
-            "その他サイトの最新話掲載日を確認"
-        );
-        assert_eq!(
-            format_general_lastup_queue_target(&[]),
-            "最新話掲載日を確認"
-        );
-    }
-
-    #[test]
     fn update_queue_target_prefers_webui_start_message() {
         let meta = build_update_start_message_meta(
             "全ての小説の更新を開始します（3件をID順で処理）".to_string(),
@@ -2800,29 +2645,6 @@ mod tests {
                 Some(&meta)
             ),
             "全ての小説の更新を開始します（3件をID順で処理）"
-        );
-    }
-
-    #[test]
-    fn update_queue_target_describes_tag_and_force_jobs() {
-        assert_eq!(
-            format_update_queue_target(&["tag:modified".to_string()], None),
-            "タグ「modified」の小説を更新"
-        );
-        assert_eq!(
-            format_update_queue_target(
-                &[
-                    "--sort-by".to_string(),
-                    "general_lastup".to_string(),
-                    "tag:modified".to_string(),
-                ],
-                None
-            ),
-            "タグ「modified」の小説を更新"
-        );
-        assert_eq!(
-            format_update_queue_target(&["--force".to_string(), "tag:modified".to_string()], None),
-            "タグ「modified」の小説を凍結済みも含めて更新"
         );
     }
 
@@ -2853,13 +2675,6 @@ mod tests {
             meta.get(Value::String("snapshot_count".to_string())),
             Some(&Value::Number(serde_yaml::Number::from(2)))
         );
-    }
-
-    #[test]
-    fn tag_color_class_uses_existing_webui_tag_classes() {
-        assert_eq!(tag_color_class("green"), "tag-green");
-        assert_eq!(tag_color_class("yellow"), "tag-yellow");
-        assert_eq!(tag_color_class("unknown"), "tag-default");
     }
 
     #[test]
@@ -2923,42 +2738,6 @@ mod tests {
                 "--no-browser".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn broadcast_captured_web_output_wraps_plain_text_as_echo() {
-        let push_server = Arc::new(crate::web::push::PushServer::new());
-        let mut receiver = push_server.channel().subscribe();
-
-        broadcast_captured_web_output(&push_server, b"hello\n", "stdout2");
-
-        let message = receiver.try_recv().unwrap();
-        let value: serde_json::Value = serde_json::from_str(&message).unwrap();
-        assert_eq!(value["type"], "echo");
-        assert_eq!(value["body"], "hello");
-        assert_eq!(value["target_console"], "stdout2");
-    }
-
-    #[test]
-    fn broadcast_captured_web_output_retargets_structured_messages() {
-        let push_server = Arc::new(crate::web::push::PushServer::new());
-        let mut receiver = push_server.channel().subscribe();
-        let line = format!(
-            "{}{}",
-            crate::progress::WS_LINE_PREFIX,
-            serde_json::json!({
-                "type": "progressbar.step",
-                "data": { "topic": "download", "current": 1, "total": 2, "percent": 50.0 }
-            })
-        );
-
-        broadcast_captured_web_output(&push_server, line.as_bytes(), "stdout2");
-
-        let message = receiver.try_recv().unwrap();
-        let value: serde_json::Value = serde_json::from_str(&message).unwrap();
-        assert_eq!(value["type"], "progressbar.step");
-        assert_eq!(value["target_console"], "stdout2");
-        assert_eq!(value["data"]["topic"], "download");
     }
 
     #[test]

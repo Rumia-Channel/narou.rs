@@ -18,6 +18,7 @@
 //!   「解決不能」を表す値はこのパススルー文字列そのもの (native は解決不能を
 //!   エラーにせず、後段のターゲット解決が存在確認で落とす)。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// 別名表を保持している `app_state` 行のスコープ / キー (native の
@@ -62,23 +63,32 @@ pub fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
 
 /// `commands/mod.rs::resolve_alias_target`: 完全一致の別名名だけ解決し、
 /// 無ければ入力をそのまま返す (convert / download / diff 系。小文字化しない)。
-pub fn resolve_alias_target(aliases: &HashMap<String, String>, target: &str) -> String {
-    aliases
-        .get(target)
-        .cloned()
-        .unwrap_or_else(|| target.to_string())
+///
+/// 解決しなかった入力は借用のまま返す (`Cow`) — 呼び出し側の解決パスで
+/// 余分なコピーを作らない。
+pub fn resolve_alias_target<'a>(
+    aliases: &'a HashMap<String, String>,
+    target: &'a str,
+) -> Cow<'a, str> {
+    match aliases.get(target) {
+        Some(alias) => Cow::Borrowed(alias.as_str()),
+        None => Cow::Borrowed(target),
+    }
 }
 
 /// `commands/update.rs::alias_to_target`: convert 側と同じだが、別名が無い
 /// 非数値ターゲットは小文字化してから返す (update 系)。
-pub fn alias_to_target_for_update(aliases: &HashMap<String, String>, target: &str) -> String {
+pub fn alias_to_target_for_update<'a>(
+    aliases: &'a HashMap<String, String>,
+    target: &'a str,
+) -> Cow<'a, str> {
     match aliases.get(target) {
-        Some(alias) => alias.clone(),
+        Some(alias) => Cow::Borrowed(alias.as_str()),
         None => {
             if target.chars().all(|c| c.is_ascii_digit()) {
-                target.to_string()
+                Cow::Borrowed(target)
             } else {
-                target.to_lowercase()
+                Cow::Owned(target.to_lowercase())
             }
         }
     }

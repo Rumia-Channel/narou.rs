@@ -6,7 +6,7 @@
 //! and the six-hour new-arrival marker. Rendering (DataTables `draw`,
 //! JSON, HTTP) stays in the web layer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -14,6 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 use crate::application::error::ApplicationError;
 use crate::application::events::{FreezeStore, SiteTimezone, SiteTimezoneProvider};
 use crate::db::NovelRecord;
+use crate::platform::repository::{FreezeReadMode, record_is_frozen};
 use crate::platform::{
     NovelFilter, NovelQuery, NovelRepository, NovelSort, NovelSortKey, SearchField, SearchTerm,
 };
@@ -42,6 +43,7 @@ pub enum LibrarySortColumn {
     NovelType,
     GeneralAllNo,
     Length,
+    AverageLength,
 }
 
 impl LibrarySortColumn {
@@ -58,6 +60,7 @@ impl LibrarySortColumn {
             Self::NovelType => NovelSortKey::NovelType,
             Self::GeneralAllNo => NovelSortKey::GeneralAllNo,
             Self::Length => NovelSortKey::Length,
+            Self::AverageLength => NovelSortKey::AverageLength,
         }
     }
 }
@@ -190,6 +193,32 @@ impl LibraryService {
             .map_err(ApplicationError::platform)
     }
 
+    /// Resolve a user-facing target (alias / id / URL / ncode / title) through
+    /// the shared ordered plan ([`crate::application::target_lookup`]).
+    ///
+    /// The CLI uses the synchronous mirror (`resolve_target_record_sync`);
+    /// both adapters consume the same [`TargetLookupPlan`], so the update /
+    /// convert / read modes cannot drift apart.
+    ///
+    /// [`TargetLookupPlan`]: crate::application::target_lookup::TargetLookupPlan
+    pub async fn resolve_target(
+        &self,
+        plan: crate::application::target_lookup::TargetLookupPlan,
+        aliases: &HashMap<String, String>,
+        urls: crate::application::target_lookup::UrlSource<'_>,
+        target: &str,
+    ) -> Result<Option<NovelRecord>, ApplicationError> {
+        crate::application::target_lookup::resolve_target_record(
+            plan,
+            aliases,
+            urls,
+            target,
+            &*self.novels,
+        )
+        .await
+        .map_err(ApplicationError::platform)
+    }
+
 
     pub async fn count(&self) -> Result<usize, ApplicationError> {
         self.novels
@@ -307,7 +336,8 @@ impl LibraryService {
                 now,
                 timezone,
             );
-            let is_frozen = record_is_frozen(&record, &frozen_ids);
+            let is_frozen =
+                record_is_frozen(&record, Some(&frozen_ids), FreezeReadMode::InventoryOrTag);
             let display_url = record.display_url().to_string();
             data.push(NovelSummary {
                 id: record.id,
@@ -518,11 +548,6 @@ fn collect_search_tokens(search: Option<&str>) -> Vec<SearchToken> {
 // ---------------------------------------------------------------------------
 // Frozen status, timezone lookup, new-arrival marker.
 // ---------------------------------------------------------------------------
-
-/// True when a record is frozen: in the freeze inventory or tagged `frozen`.
-fn record_is_frozen(record: &NovelRecord, frozen_ids: &HashSet<i64>) -> bool {
-    frozen_ids.contains(&record.id) || record.tags.iter().any(|tag| tag == "frozen")
-}
 
 /// The site domain of a record: the explicit `domain` field, else the
 /// `toc_url` host.

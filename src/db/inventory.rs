@@ -49,24 +49,6 @@ pub struct Inventory {
     state: Option<crate::native::sqlite::state::StateDb>,
 }
 
-/// Names whose raw payloads live in `app_state` instead of files while the
-/// SQLite backend is active.
-#[cfg(feature = "native-runtime")]
-/// Names whose state moves into `.narou/db.sqlite` in SQLite mode.
-///
-/// `global_setting` is deliberately absent: it is not library state. It stays
-/// in `~/.narousetting/global_setting.yaml` in every mode so narou.rb — which
-/// only reads the file — keeps seeing the user's settings.
-const SQLITE_MANAGED_NAMES: &[&str] = &[
-    "freeze",
-    "alias",
-    "tag_colors",
-    "latest_convert",
-    "local_setting",
-    "login_cookie",
-    "author",
-];
-
 struct InventoryCache {
     entries: HashMap<CacheKey, CacheEntry>,
     access_order: Vec<CacheKey>,
@@ -249,18 +231,15 @@ impl Inventory {
         F: FnOnce(D) -> Result<(D, T)>,
     {
         #[cfg(feature = "native-runtime")]
-        if self.state_managed(name) {
-            // File-locking is unnecessary for the SQLite backend: writes are
-            // serialized through the guarded connection (single-writer).
-            let current_raw = self.load_raw(name, scope)?;
-            let current: D = if current_raw.trim().is_empty() {
-                D::default()
-            } else {
-                serde_yaml::from_str(&current_raw)?
-            };
-            let (next, result) = update(current)?;
-            let content = serialize_yaml_content(&next)?;
-            self.save_raw(name, scope, &content)?;
+        if self.state_managed(name)
+            && let Some(state) = &self.state
+        {
+            let (content, result) = state.update_raw(Self::state_scope(scope), name, |raw| {
+                let current = if raw.trim().is_empty() { D::default() } else { serde_yaml::from_str(raw)? };
+                let (next, result) = update(current)?;
+                Ok((serialize_yaml_content(&next)?, result))
+            })?;
+            self.cache.lock().remember(Self::cache_key(name, scope), content, None);
             return Ok(result);
         }
         let path = self.inventory_path(name, scope);
@@ -276,7 +255,7 @@ impl Inventory {
 
     #[cfg(feature = "native-runtime")]
     fn state_managed(&self, name: &str) -> bool {
-        self.state.is_some() && SQLITE_MANAGED_NAMES.contains(&name)
+        self.state.is_some() && crate::db::state_inventory::inventory_managed(name)
     }
 
     #[cfg(feature = "native-runtime")]
@@ -369,7 +348,7 @@ where
         let current = if raw.is_empty() {
             D::default()
         } else {
-            serde_yaml::from_str(&raw)?
+            serde_yaml::from_str(raw)?
         };
         let (updated, result) = update(current)?;
         let content = serialize_yaml_content(&updated)?;
@@ -379,12 +358,14 @@ where
 
 pub(crate) fn with_locked_file_update<T, F>(path: &Path, update: F) -> Result<(String, T)>
 where
-    F: FnOnce(String) -> Result<(String, T)>,
+    F: FnOnce(&str) -> Result<(String, T)>,
 {
     with_exclusive_file_lock(path, || {
         let current = read_optional_yaml_file(path)?;
-        let (new_content, result) = update(current)?;
-        atomic_write_locked(path, &new_content)?;
+        let (new_content, result) = update(&current)?;
+        if new_content != current {
+            atomic_write_locked(path, &new_content)?;
+        }
         Ok((new_content, result))
     })
 }
@@ -402,7 +383,7 @@ pub(crate) fn compare_locked_file_content(path: &Path, expected: &str, replaceme
     })
 }
 
-fn with_exclusive_file_lock<T, F>(path: &Path, operation: F) -> Result<T>
+pub(crate) fn with_exclusive_file_lock<T, F>(path: &Path, operation: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
@@ -425,7 +406,7 @@ where
     result
 }
 
-fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
+pub(crate) fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
     let retries = 20u32;
     let mut last_error = None;
 
@@ -471,7 +452,7 @@ pub(crate) fn serialize_yaml_content<T: Serialize>(data: &T) -> Result<String> {
     Ok(content)
 }
 
-fn read_optional_yaml_file(path: &Path) -> Result<String> {
+pub(crate) fn read_optional_yaml_file(path: &Path) -> Result<String> {
     match fs::metadata(path) {
         Ok(metadata) => {
             if metadata.len() > MAX_YAML_SIZE_BYTES {

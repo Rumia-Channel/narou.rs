@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use super::index_store::IndexStore;
 use super::inventory::{Inventory, InventoryScope};
 use super::novel_record::NovelRecord;
+use super::sort::compare_records_by_key;
 
 use crate::error::Result;
 
@@ -62,7 +63,7 @@ impl Database {
                                             serde_yaml::from_str(&content)?;
                                         let conn = repo.conn_handle();
                                         crate::native::sqlite::bulk::replace_all_records(
-                                            &mut conn.lock().expect("sqlite mutex poisoned"),
+                                            &mut conn.lock(),
                                             &parsed,
                                         )?;
                                     }
@@ -91,7 +92,7 @@ impl Database {
                             (Some(content), None) => {
                                 let conn = repo.conn_handle();
                                 crate::native::sqlite::bulk::load_all_records(
-                                    &conn.lock().expect("sqlite mutex poisoned"),
+                                    &conn.lock(),
                                 )?
                                 .is_empty()
                                     && !content.trim().is_empty()
@@ -103,7 +104,7 @@ impl Database {
                                 serde_yaml::from_str(file_content.as_deref().unwrap_or(""))?;
                             let conn = repo.conn_handle();
                             crate::native::sqlite::bulk::replace_all_records(
-                                &mut conn.lock().expect("sqlite mutex poisoned"),
+                                &mut conn.lock(),
                                 &parsed,
                             )?;
                         }
@@ -176,7 +177,7 @@ impl Database {
         #[cfg(feature = "native-runtime")]
         if let Some(repo) = &self.sqlite {
             let conn = repo.conn_handle();
-            let guard = conn.lock().expect("sqlite mutex poisoned");
+            let guard = conn.lock();
             let status: String = guard
                 .query_row("PRAGMA integrity_check", [], |row| row.get(0))
                 .map_err(crate::native::sqlite::sqlite_error)?;
@@ -194,7 +195,7 @@ impl Database {
         #[cfg(feature = "native-runtime")]
         if let Some(repo) = &self.sqlite {
             let conn = repo.conn_handle();
-            let guard = conn.lock().expect("sqlite mutex poisoned");
+            let guard = conn.lock();
             let issues = crate::native::sqlite::object_store::verify_payload_crc32(&guard)?;
             let lines = issues
                 .into_iter()
@@ -222,7 +223,7 @@ impl Database {
         if let Some(repo) = &self.sqlite {
             let conn = repo.conn_handle();
             let loaded = crate::native::sqlite::bulk::load_all_records(
-                &conn.lock().expect("sqlite mutex poisoned"),
+                &conn.lock(),
             )?;
             self.data = loaded.into_iter().collect();
             if let Some(max_id) = self.data.keys().max().copied() {
@@ -272,7 +273,7 @@ impl Database {
                 .collect();
             let conn = repo.conn_handle();
             crate::native::sqlite::bulk::replace_all_records(
-                &mut conn.lock().expect("sqlite mutex poisoned"),
+                &mut conn.lock(),
                 &normalized,
             )?;
             if self.compat_active() {
@@ -333,7 +334,7 @@ impl Database {
             if let Some(repo) = &self.sqlite {
                 let conn = repo.conn_handle();
                 crate::native::sqlite::bulk::replace_all_records(
-                    &mut conn.lock().expect("sqlite mutex poisoned"),
+                    &mut conn.lock(),
                     &updated,
                 )?;
             }
@@ -480,105 +481,6 @@ impl Database {
     }
 }
 
-/// 任意の 2 レコードを指定キーで比較する。`db::sort_by` と
-/// `web::sort_state::sort_record_ordering` の双方から呼ばれる統一実装。
-/// BUG-9 で導入された `compare_optional` 経由の型付き + None 安定順を採用する。
-pub fn compare_records_by_key(
-    a: &NovelRecord,
-    b: &NovelRecord,
-    key: &str,
-) -> std::cmp::Ordering {
-    match key {
-        "id" => a.id.cmp(&b.id),
-        "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-        "author" => a.author.to_lowercase().cmp(&b.author.to_lowercase()),
-        "last_update" => a.last_update.cmp(&b.last_update),
-        "general_lastup" => compare_optional(a.general_lastup, b.general_lastup),
-        "sitename" => a.sitename.cmp(&b.sitename),
-        "novel_type" => a.novel_type.cmp(&b.novel_type),
-        "length" => compare_optional(a.length, b.length),
-        "last_check_date" => compare_optional(a.last_check_date, b.last_check_date),
-        "tags" => record_tags_key(a).cmp(&record_tags_key(b)),
-        "general_all_no" => compare_optional(a.general_all_no, b.general_all_no),
-        "status" => record_status_key(a).cmp(&record_status_key(b)),
-        "toc_url" => a.toc_url.cmp(&b.toc_url),
-        // `new_arrivals_date` は `commands/update.rs` の挙動 (`Option<DateTime>` を
-        // 直接 `.cmp()` する形) と整合させるため `compare_optional` ではなく
-        // `Option::cmp` を使う。None < Some(...) の標準順序。
-        "new_arrivals_date" => a.new_arrivals_date.cmp(&b.new_arrivals_date),
-        _ => a.id.cmp(&b.id),
-    }
-}
-
-/// `db::sort_by` と `web::sort_state::sort_record_ordering` が受理するソートキーの
-/// 単一の真実源。CLI (`narou list --sort-by`, `narou update --sort-by`) と Web UI の
-/// バリデーションはこの一覧を共有する。`const` として公開しているのは
-/// `web::sort_state::SORT_COLUMN_KEYS` から `pub use` 再エクスポートするため。
-///
-/// **インデックスは `web::sort_state::SORT_COLUMN_LABELS` の並びと完全一致させること**。
-/// 既存の `web::jobs::tests::sort_records_for_web_update_matches_general_lastup_descending`
-/// 等は `column: 2` (= `general_lastup`) に依存しているため、Web UI のカラム順を
-/// 維持する。
-pub const SORT_KEYS: &[&str] = &[
-    "id",                // 0
-    "last_update",       // 1
-    "general_lastup",    // 2
-    "last_check_date",   // 3
-    "title",             // 4
-    "author",            // 5
-    "sitename",          // 6
-    "novel_type",        // 7
-    "tags",              // 8
-    "general_all_no",    // 9
-    "length",            // 10
-    "status",            // 11
-    "toc_url",           // 12
-    "new_arrivals_date", // 13
-];
-
-/// `SORT_KEYS` の関数版。`sort_keys().contains(&key)` のようなメソッドチェインが
-/// 必要になる CLI / テスト側の便宜のために `SORT_KEYS` と並べて公開する。
-pub fn sort_keys() -> &'static [&'static str] {
-    SORT_KEYS
-}
-
-/// 未知のキーを `sort_by` に渡した場合のデフォルト。CLI/Web 双方の検証失敗時に
-/// 同じ挙動を提供するために `sort_keys` と並べて公開する。
-pub fn sort_key_valid(key: &str) -> bool {
-    SORT_KEYS.contains(&key)
-}
-
-pub(crate) fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>) -> std::cmp::Ordering {
-    match (a, b) {
-        (Some(a), Some(b)) => a.cmp(&b),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    }
-}
-
-pub(crate) fn record_tags_key(record: &NovelRecord) -> String {
-    record
-        .tags
-        .iter()
-        .map(|tag| tag.to_lowercase())
-        .collect::<Vec<_>>()
-        .join("\u{0}")
-}
-
-pub(crate) fn record_status_key(record: &NovelRecord) -> String {
-    let mut status = Vec::new();
-    if record.tags.iter().any(|tag| tag == "end") || record.end {
-        status.push("完結");
-    }
-    if record.tags.iter().any(|tag| tag == "404") {
-        status.push("削除");
-    }
-    if record.suspend {
-        status.push("中断");
-    }
-    status.join(", ").to_lowercase()
-}
 
 #[cfg(feature = "native-runtime")]
 fn rename_imported_file(path: &std::path::Path) {
@@ -614,7 +516,7 @@ fn mirror_records_yaml(
 ) -> Result<()> {
     let conn = repo.conn_handle();
     let records = crate::native::sqlite::bulk::load_all_records(
-        &conn.lock().expect("sqlite mutex poisoned"),
+        &conn.lock(),
     )?;
     let content = serde_yaml::to_string(&records)?;
     if let Some(parent) = yaml_path.parent() {
@@ -815,37 +717,6 @@ mod tests {
         assert_eq!(by_length, vec![10, 9, 1]);
     }
 
-    #[test]
-    fn sort_keys_lists_every_supported_key() {
-        let keys = super::sort_keys();
-        // 既存の8キー + 新規6キーがすべて含まれていること。
-        for required in [
-            "id",
-            "title",
-            "author",
-            "last_update",
-            "general_lastup",
-            "sitename",
-            "novel_type",
-            "length",
-            "last_check_date",
-            "tags",
-            "general_all_no",
-            "status",
-            "toc_url",
-            "new_arrivals_date",
-        ] {
-            assert!(
-                keys.contains(&required),
-                "sort_keys must accept {required}, got {keys:?}"
-            );
-        }
-        // sort_key_valid は sort_keys と完全一致する。
-        for key in keys {
-            assert!(super::sort_key_valid(key), "sort_key_valid({key})");
-        }
-        assert!(!super::sort_key_valid("not_a_key"));
-    }
 
     #[test]
     fn sort_by_last_check_date_uses_compare_optional() {

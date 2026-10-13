@@ -1,21 +1,24 @@
 //! rusqlite-backed [`NovelRepository`] and freeze stores.
 //!
-//! SQL semantics mirror the Worker D1 adapter exactly (same WHERE building,
-//! sort expressions, status materialization, sequence allocation) so both
-//! backends stay behaviorally identical.
+//! Every statement comes from `crate::db::novel_query`, the same builder the
+//! Worker D1 adapter uses, so both backends stay behaviorally identical; this
+//! file only supplies the connection handling and the `NovelBind` → driver
+//! conversion.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::{params_from_iter, Connection, Row};
 
 use crate::db::NovelRecord;
-use crate::db::novel_codec::{dedup_tags, fold};
-use crate::error::{NarouError, Result};
-use crate::native::sqlite::query::{
-    build_where, select_sql, sort_direction, sort_expression, STATUS_SORT_EXPRESSION, UPSERT_SQL,
+use crate::db::novel_codec::{dedup_tags, fold, NOVEL_UPSERT_SQL};
+use crate::db::novel_query::{
+    self, select_by_id_sql, select_by_ncode_sql, select_by_title_sql, select_by_toc_url_sql,
+    SqlQuery,
 };
-use crate::native::sqlite::record_map::{record_from_row, record_params};
+use crate::error::{NarouError, Result};
+use crate::native::sqlite::record_map::{query_bind, record_from_row, record_params};
 use crate::platform::{NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository};
 
 /// Shared guarded connection. Every operation runs on a blocking thread; the
@@ -37,7 +40,7 @@ where
     F: FnOnce(&mut Connection) -> T + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let mut guard = conn.lock().expect("sqlite connection mutex poisoned");
+        let mut guard = conn.lock();
         f(&mut guard)
     })
     .await
@@ -94,23 +97,20 @@ pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Res
     dedup_tags(&mut normalized.tags);
     let record = &normalized;
     let params = record_params(record)?;
-    conn.execute(UPSERT_SQL, params_from_iter(params.iter()))
+    conn.execute(NOVEL_UPSERT_SQL, params_from_iter(params.iter()))
         .map_err(super::sqlite_error)?;
-    conn.execute(
-        "DELETE FROM novel_tags WHERE novel_id = ?",
-        [record.id],
-    )
-    .map_err(super::sqlite_error)?;
+    conn.execute(novel_query::DELETE_NOVEL_TAGS_SQL, [record.id])
+        .map_err(super::sqlite_error)?;
     for (position, tag) in record.tags.iter().enumerate() {
         conn.execute(
-            "INSERT INTO novel_tags (novel_id, position, tag, tag_fold) VALUES (?, ?, ?, ?)",
+            novel_query::INSERT_NOVEL_TAG_SQL,
             rusqlite::params![record.id, position as i64, tag, fold(tag)],
         )
         .map_err(super::sqlite_error)?;
     }
     refresh_status_sort(conn, record.id)?;
     conn.execute(
-        "UPDATE novel_id_sequence SET next_id = CASE WHEN next_id < ? THEN ? ELSE next_id END WHERE id = 1",
+        novel_query::BUMP_SEQUENCE_SQL,
         rusqlite::params![record.id.saturating_add(1), record.id.saturating_add(1)],
     )
     .map_err(super::sqlite_error)?;
@@ -118,11 +118,8 @@ pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Res
 }
 
 pub(crate) fn refresh_status_sort(conn: &Connection, id: i64) -> Result<()> {
-    conn.execute(
-        &format!("UPDATE novels AS n SET status_sort = {STATUS_SORT_EXPRESSION} WHERE n.id = ?"),
-        [id],
-    )
-    .map_err(super::sqlite_error)?;
+    conn.execute(&novel_query::refresh_status_sort_sql(), [id])
+        .map_err(super::sqlite_error)?;
     Ok(())
 }
 
@@ -131,8 +128,9 @@ pub(crate) fn refresh_status_sort(conn: &Connection, id: i64) -> Result<()> {
 ///
 /// The payload stays canonical — native reads freeze state through
 /// `Inventory` (see `NativeFreezeStore`) — while the shared status *search*
-/// expression (`sql/status_search_expression.sql`, also used by the Worker D1
-/// adapter where `frozen_novels` *is* the store) queries the table. Without
+/// expression (`crate::db::novel_query::STATUS_SEARCH_EXPRESSION`, also used
+/// by the Worker D1 adapter where `frozen_novels` *is* the store) queries the
+/// table. Without
 /// this projection the table stayed empty and status filtering silently
 /// disagreed with `narou list`.
 ///
@@ -141,7 +139,7 @@ pub(crate) fn refresh_status_sort(conn: &Connection, id: i64) -> Result<()> {
 ///
 /// IDs without a `novels` row are dropped: the table has a foreign key to
 /// `novels`, and the payload may outlive a removed novel.
-pub(crate) fn sync_frozen_novels(conn: &Connection, frozen_ids: &[i64]) -> Result<()> {
+pub(crate) fn sync_frozen_novels(conn: &rusqlite::Transaction<'_>, frozen_ids: &[i64]) -> Result<()> {
     let mut current: Vec<i64> = Vec::new();
     {
         let mut statement = conn
@@ -161,20 +159,19 @@ pub(crate) fn sync_frozen_novels(conn: &Connection, frozen_ids: &[i64]) -> Resul
         return Ok(());
     }
 
-    let tx = conn.unchecked_transaction().map_err(super::sqlite_error)?;
     for id in current_set.difference(&desired) {
-        tx.execute("DELETE FROM frozen_novels WHERE novel_id = ?", [id])
+        conn.execute("DELETE FROM frozen_novels WHERE novel_id = ?", [id])
             .map_err(super::sqlite_error)?;
     }
     for id in desired.difference(&current_set) {
-        tx.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO frozen_novels (novel_id)
              SELECT id FROM novels WHERE id = ?",
             [id],
         )
         .map_err(super::sqlite_error)?;
     }
-    tx.commit().map_err(super::sqlite_error)
+    Ok(())
 }
 
 impl NovelRepository for SqliteNovelRepository {
@@ -182,10 +179,7 @@ impl NovelRepository for SqliteNovelRepository {
         &'a self,
         id: NovelId,
     ) -> crate::platform::PlatformFuture<'a, Result<Option<NovelRecord>>> {
-        Box::pin(self.one(
-            format!("{} WHERE n.id = ? LIMIT 1", select_sql()),
-            vec![rusqlite::types::Value::Integer(id.0)],
-        ))
+        Box::pin(self.one(select_by_id_sql(), vec![rusqlite::types::Value::Integer(id.0)]))
     }
 
     fn find_by_toc_url<'a>(
@@ -193,7 +187,7 @@ impl NovelRepository for SqliteNovelRepository {
         url: &'a str,
     ) -> crate::platform::PlatformFuture<'a, Result<Option<NovelRecord>>> {
         Box::pin(self.one(
-            format!("{} WHERE n.toc_url_fold = ? ORDER BY n.id LIMIT 1", select_sql()),
+            select_by_toc_url_sql(),
             vec![rusqlite::types::Value::Text(fold(url))],
         ))
     }
@@ -203,7 +197,7 @@ impl NovelRepository for SqliteNovelRepository {
         title: &'a str,
     ) -> crate::platform::PlatformFuture<'a, Result<Option<NovelRecord>>> {
         Box::pin(self.one(
-            format!("{} WHERE n.title_fold = ? ORDER BY n.id LIMIT 1", select_sql()),
+            select_by_title_sql(),
             vec![rusqlite::types::Value::Text(fold(title))],
         ))
     }
@@ -214,10 +208,7 @@ impl NovelRepository for SqliteNovelRepository {
     ) -> crate::platform::PlatformFuture<'a, Result<Option<NovelRecord>>> {
         let folded = fold(ncode);
         Box::pin(self.one(
-            format!(
-                "{} WHERE n.ncode_fold = ? OR substr(rtrim(n.toc_url_fold, '/'), -(length(?) + 1)) = '/' || ? ORDER BY n.id LIMIT 1",
-                select_sql()
-            ),
+            select_by_ncode_sql(),
             vec![
                 rusqlite::types::Value::Text(folded.clone()),
                 rusqlite::types::Value::Text(folded.clone()),
@@ -230,11 +221,10 @@ impl NovelRepository for SqliteNovelRepository {
         &'a self,
         filter: &'a NovelFilter,
     ) -> crate::platform::PlatformFuture<'a, Result<u64>> {
-        let built = build_where(filter);
+        let SqlQuery { sql, binds } = novel_query::count_sql(filter, query_bind);
         Box::pin(blocking(self.conn.clone(), move |conn| {
-            let sql = format!("SELECT COUNT(*) FROM novels n {}", built.sql);
             let count: i64 = conn
-                .query_row(&sql, params_from_iter(built.params.iter()), |row| row.get(0))
+                .query_row(&sql, params_from_iter(binds.iter()), |row| row.get(0))
                 .map_err(super::sqlite_error)?;
             u64::try_from(count)
                 .map_err(|_| NarouError::Platform("sqlite count was negative".to_string()))
@@ -245,24 +235,8 @@ impl NovelRepository for SqliteNovelRepository {
         &'a self,
         query: &'a NovelQuery,
     ) -> crate::platform::PlatformFuture<'a, Result<Vec<NovelRecord>>> {
-        let mut built = build_where(&query.filter);
-        built.sql.push_str(" ORDER BY ");
-        built.sql.push_str(sort_expression(query.sort.key));
-        built.sql.push(' ');
-        built.sql.push_str(sort_direction(query.sort.key, query.sort.reverse));
-        built
-            .sql
-            .push_str(if query.sort.reverse { ", n.id DESC" } else { ", n.id ASC" });
-        built.sql.push_str(" LIMIT ? OFFSET ?");
-        built
-            .params
-            .push(rusqlite::types::Value::Integer(query.limit as i64));
-        built
-            .params
-            .push(rusqlite::types::Value::Integer(query.offset as i64));
-        let sql = format!("{} {}", select_sql(), built.sql);
-        let params = built.params;
-        Box::pin(self.many(sql, params))
+        let SqlQuery { sql, binds } = novel_query::query_sql(query, query_bind);
+        Box::pin(self.many(sql, binds))
     }
 
     fn scan_ids<'a>(
@@ -271,20 +245,11 @@ impl NovelRepository for SqliteNovelRepository {
         after_id: Option<NovelId>,
         limit: usize,
     ) -> crate::platform::PlatformFuture<'a, Result<Vec<NovelId>>> {
-        let mut built = build_where(filter);
-        if let Some(after_id) = after_id {
-            built.sql.push_str(" AND n.id > ?");
-            built.params.push(rusqlite::types::Value::Integer(after_id.0));
-        }
-        built.sql.push_str(" ORDER BY n.id ASC LIMIT ?");
-        built
-            .params
-            .push(rusqlite::types::Value::Integer(limit as i64));
-        let sql = format!("SELECT n.id FROM novels n {}", built.sql);
+        let SqlQuery { sql, binds } = novel_query::scan_ids_sql(filter, after_id, limit, query_bind);
         Box::pin(blocking(self.conn.clone(), move |conn| {
             let mut statement = conn.prepare(&sql).map_err(super::sqlite_error)?;
             let mut rows = statement
-                .query(params_from_iter(built.params.iter()))
+                .query(params_from_iter(binds.iter()))
                 .map_err(super::sqlite_error)?;
             let mut ids = Vec::new();
             while let Some(row) = rows.next().map_err(super::sqlite_error)? {
@@ -297,12 +262,10 @@ impl NovelRepository for SqliteNovelRepository {
     fn allocate_id(&self) -> crate::platform::PlatformFuture<'_, Result<NovelId>> {
         Box::pin(blocking(self.conn.clone(), |conn| {
             let tx = conn.transaction().map_err(super::sqlite_error)?;
-            tx.execute("UPDATE novel_id_sequence SET next_id = next_id + 1 WHERE id = 1", [])
+            tx.execute(novel_query::ALLOCATE_STEP_SQL, [])
                 .map_err(super::sqlite_error)?;
             let id: i64 = tx
-                .query_row("SELECT next_id - 1 FROM novel_id_sequence WHERE id = 1", [], |row| {
-                    row.get(0)
-                })
+                .query_row(novel_query::ALLOCATE_READ_SQL, [], |row| row.get(0))
                 .map_err(super::sqlite_error)?;
             tx.commit().map_err(super::sqlite_error)?;
             Ok(NovelId(id))
@@ -322,7 +285,7 @@ impl NovelRepository for SqliteNovelRepository {
                 match mutation {
                     NovelMutation::Upsert(record) => upsert_record_conn(&tx, &record)?,
                     NovelMutation::Remove(id) => {
-                        tx.execute("DELETE FROM novels WHERE id = ?", [id.0])
+                        tx.execute(novel_query::DELETE_NOVEL_SQL, [id.0])
                             .map_err(super::sqlite_error)?;
                     }
                 }
@@ -570,6 +533,55 @@ mod tests {
         );
     }
 
+    /// 状態ソートは SQL 側の materialized 値 (`status_sort` =
+    /// `novel_query::STATUS_SORT_EXPRESSION`) と可搬な比較器 (`db::sort` の
+    /// `status` = `record_status_key`) が同じ順序を返すこと。片方だけ更新すると
+    /// native の `list --sort-by status` と Web/Worker 側の並びがずれる。
+    #[tokio::test]
+    async fn dual_run_status_sort_matches_the_materialized_key() {
+        let sqlite = SqliteNovelRepository::new(crate::native::sqlite::open_in_memory().unwrap());
+        let memory = MemoryNovelRepository::new();
+        // 完結 (tag / end フラグ) ・削除 (404) ・中断 (suspend) の組み合わせを用意する。
+        let variants: [(Vec<&str>, bool, bool); 6] = [
+            (vec!["end"], false, false),
+            (vec!["404"], false, false),
+            (vec!["end", "404"], true, false),
+            (vec![], false, true),
+            (vec!["404"], false, true),
+            (vec![], false, false),
+        ];
+        let mutations: Vec<NovelMutation> = variants
+            .iter()
+            .enumerate()
+            .map(|(index, (tags, end, suspend))| {
+                let mut record = record(
+                    index as i64 + 1,
+                    &format!("status-{index}"),
+                    "作者",
+                    &format!("https://ncode.syosetu.com/n{:06}/", index + 1),
+                    tags,
+                );
+                record.end = *end;
+                record.suspend = *suspend;
+                NovelMutation::Upsert(record)
+            })
+            .collect();
+        sqlite.apply_batch(mutations.clone()).await.unwrap();
+        memory.apply_batch(mutations).await.unwrap();
+
+        for reverse in [false, true] {
+            let query = NovelQuery {
+                filter: NovelFilter::all(),
+                sort: NovelSort { key: NovelSortKey::Status, reverse },
+                offset: 0,
+                limit: 10,
+            };
+            let from_sqlite: Vec<i64> = sqlite.query(&query).await.unwrap().iter().map(|r| r.id).collect();
+            let from_memory: Vec<i64> = memory.query(&query).await.unwrap().iter().map(|r| r.id).collect();
+            assert_eq!(from_sqlite, from_memory, "status sort reverse={reverse}");
+        }
+    }
+
     #[tokio::test]
     async fn allocate_id_is_monotonic_after_upserts() {
         let sqlite = SqliteNovelRepository::new(crate::native::sqlite::open_in_memory().unwrap());
@@ -599,7 +611,7 @@ mod tests {
 
         assert!(sqlite.get(NovelId(9)).await.unwrap().is_none());
         let tags_left: i64 = {
-            let guard = conn.lock().unwrap();
+            let guard = conn.lock();
             guard.query_row("SELECT COUNT(*) FROM novel_tags WHERE novel_id = 9", [], |r| r.get(0)).unwrap()
         };
         assert_eq!(tags_left, 0);
@@ -638,7 +650,7 @@ mod tests {
         assert_eq!(loaded.title, "再登録");
         assert_eq!(loaded.tags, vec!["favorite", "end"]);
         let indexed_tags: Vec<(i64, String)> = {
-            let guard = conn.lock().unwrap();
+            let guard = conn.lock();
             let mut stmt = guard
                 .prepare("SELECT position, tag FROM novel_tags WHERE novel_id = 9 ORDER BY position")
                 .unwrap();

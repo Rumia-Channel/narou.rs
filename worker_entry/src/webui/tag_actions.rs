@@ -13,14 +13,15 @@
 //! `app_state`) がその値そのもの。リクエストが送ってくる `sort_state` /
 //! `timestamp` は native と同じく参照しない (サーバー保存値が常に正)。
 //!
-//! native の `apply_tag_change` は `push_server.broadcast_event` で
-//! `table.reload` / `tag.updateCanvas` を配信するが、Worker には共有
-//! ブロードキャスト層が無い (`websocket.rs` 参照) ので省略する。応答 JSON の
-//! 形・キー名・ステータスコードは native と一致させる。
+//! native の `apply_tag_change` と同じく、変更後に `table.reload` /
+//! `tag.updateCanvas` を PushHub へ配信する (イベントの選択は
+//! `application::webui::mutations` が唯一の定義)。応答 JSON の形・キー名・
+//! ステータスコードは native と一致させる。
 
 use std::collections::HashMap;
 
 use narou_rs::application::web_payloads::ApiResponse;
+use narou_rs::application::webui::mutations::MutationNotice;
 use narou_rs::application::webui::{
     MAX_WEB_TAGS_PER_REQUEST, normalize_web_tag_name, sort_ids_from_records,
     validate_web_tag_name,
@@ -71,7 +72,7 @@ pub async fn handle(mut req: Request, env: worker::Env) -> worker::Result<Respon
     };
 
     match route {
-        Route::EditTag => edit_tag(&runtime, body).await,
+        Route::EditTag => edit_tag(&env, &runtime, body).await,
         Route::ChangeColor => tag_change_color(&runtime, body).await,
     }
 }
@@ -102,15 +103,16 @@ struct EditTagBody {
     timestamp: Option<u64>,
 }
 
-/// native `apply_tag_change` の写し (push 通知を除く)。エラーは呼び出し側で
+/// native `apply_tag_change` の写し。エラーは呼び出し側で
 /// `{"success": false, "error": message}` に写すためメッセージだけ返す。
 async fn apply_tag_change(
+    env: &worker::Env,
     runtime: &WorkerRuntime,
     ids: &[i64],
     action: TagAction,
     tags: Vec<String>,
 ) -> Result<narou_rs::application::TagChangeResult, String> {
-    runtime
+    let result = runtime
         .write_services()
         .novel_actions
         .change_tags(&TagChangeRequest {
@@ -124,7 +126,11 @@ async fn apply_tag_change(
             | ApplicationError::Conflict(message)
             | ApplicationError::NotFound(message)
             | ApplicationError::Platform(message) => message,
-        })
+        })?;
+    // native `src/web/tags.rs::apply_tag_change` と同じく、変更後に一覧と
+    // タグ表示を再読込させる。
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableAndTags).await;
+    Ok(result)
 }
 
 /// native `ensure_all_ids_found` の写し: 存在しない ID が 1 件でもあれば
@@ -159,7 +165,11 @@ async fn sort_ids_for_request(runtime: &WorkerRuntime, ids: &[i64]) -> Vec<i64> 
 /// `states` は `{ "タグ名": 0|1|2 }` (0=削除・1=維持・2=追加)。削除を先に、
 /// 追加を後に適用する順序も native と同じ。応答は常に
 /// `{"success": bool, "error"?: string}` (失敗時も HTTP 200)。
-async fn edit_tag(runtime: &WorkerRuntime, body: serde_json::Value) -> worker::Result<Response> {
+async fn edit_tag(
+    env: &worker::Env,
+    runtime: &WorkerRuntime,
+    body: serde_json::Value,
+) -> worker::Result<Response> {
     let body: EditTagBody = match serde_json::from_value(body) {
         Ok(body) => body,
         Err(_) => return json_error(400, "invalid_request", Some("invalid request body")),
@@ -209,14 +219,14 @@ async fn edit_tag(runtime: &WorkerRuntime, body: serde_json::Value) -> worker::R
     }
 
     if !tags_to_delete.is_empty()
-        && let Err(error) = apply_tag_change(runtime, &ids, TagAction::Remove, tags_to_delete)
+        && let Err(error) = apply_tag_change(env, runtime, &ids, TagAction::Remove, tags_to_delete)
             .await
             .and_then(|result| ensure_all_ids_found(&result).map(|()| result))
     {
         return Response::from_json(&fail_response(error));
     }
     if !tags_to_add.is_empty()
-        && let Err(error) = apply_tag_change(runtime, &ids, TagAction::Add, tags_to_add)
+        && let Err(error) = apply_tag_change(env, runtime, &ids, TagAction::Add, tags_to_add)
             .await
             .and_then(|result| ensure_all_ids_found(&result).map(|()| result))
     {

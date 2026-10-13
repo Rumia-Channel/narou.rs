@@ -57,12 +57,6 @@ jobs:
     if: vars.SORAHOST == 'T'
     runs-on: ubuntu-22.04
     environment: SORAHOST
-    env:
-      # 前段コネクタのバージョン。sorahost/start.sh の CF_TAG / CF_SHA256 と
-      # 揃える (同梱されるバイナリと起動時に参照するタグが一致するように)。
-      CF_TAG: "2026.9.3"
-      CF_SHA256: "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
-      CURL_TAG: "v8.21.0"
     steps:
       - uses: actions/checkout@v5
 
@@ -97,6 +91,8 @@ jobs:
         if: steps.credentials.outputs.configured == 'true'
         run: |
           set -eu
+          pins="$(python3 -c 'import json; tools=json.load(open("scripts/deploy-tools.json")); print(tools["cloudflared_version"], tools["cloudflared_sha256"], tools["curl_version"])')"
+          read -r CF_TAG CF_SHA256 CURL_TAG <<< "$pins"
           bundle="dist/${{ needs.build.outputs.bundle }}"
           root="$(basename "${bundle%.tar.gz}")"
           mkdir -p deploy/app deploy/bin
@@ -104,17 +100,18 @@ jobs:
             "$root/narou_rs" "$root/narou_rs_backup" "$root/webnovel"
           cp sorahost/start.sh deploy/start.sh
           cp sorahost/sorahost.json deploy/sorahost.json
+          cp scripts/deploy-tools.json deploy/bin/deploy-tools.json
           # コンテナには curl が無いので、コネクタ用の cloudflared と、
           # start.sh から使う静的 curl + CA バンドルを CI 側で取得して同梱する
           # (start.sh は $SELF_DIR/bin/ を見る。ハッシュはいずれも検証する)。
           curl -fsSL -o deploy/bin/cloudflared \
-            "https://github.com/cloudflare/cloudflared/releases/download/${{ env.CF_TAG }}/cloudflared-linux-amd64"
-          echo "${{ env.CF_SHA256 }}  deploy/bin/cloudflared" | sha256sum -c -
+            "https://github.com/cloudflare/cloudflared/releases/download/${CF_TAG}/cloudflared-linux-amd64"
+          echo "${CF_SHA256}  deploy/bin/cloudflared" | sha256sum -c -
           chmod +x deploy/bin/cloudflared
           curl -fsSL -o deploy/bin/curl \
-            "https://github.com/moparisthebest/static-curl/releases/download/${{ env.CURL_TAG }}/curl-amd64"
+            "https://github.com/moparisthebest/static-curl/releases/download/${CURL_TAG}/curl-amd64"
           curl -fsSL -o curl-sha256sum.txt \
-            "https://github.com/moparisthebest/static-curl/releases/download/${{ env.CURL_TAG }}/sha256sum.txt"
+            "https://github.com/moparisthebest/static-curl/releases/download/${CURL_TAG}/sha256sum.txt"
           curl -fsSL -o deploy/bin/cacert.pem "https://curl.se/ca/cacert.pem"
           want="$(grep 'curl-amd64' curl-sha256sum.txt | awk '{print tolower($1)}')"
           got="$(sha256sum deploy/bin/curl | awk '{print tolower($1)}')"

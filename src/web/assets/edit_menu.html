@@ -196,7 +196,9 @@
       <textarea id="notepad-area"></textarea>
     </div>
   </div>
-  <script>
+  <script type="module">
+    import { fetchJson } from '/assets/js/core/http.js';
+    import { createNotepadEditor } from '/assets/js/core/notepad.js';
   (function() {
     var STORAGE_KEY = 'context_menu_text';
 
@@ -236,7 +238,8 @@
     }
 
     function loadMenuText() {
-      return localStorage.getItem(STORAGE_KEY) || createDefaultMenuText();
+      var stored = localStorage.getItem(STORAGE_KEY);
+      return stored !== null ? stored : createDefaultMenuText();
     }
 
     function saveMenuText(text) {
@@ -337,7 +340,7 @@
     var notepadArea = document.getElementById('notepad-area');
     var notepadStatus = document.getElementById('notepad-status');
     var notepadStatusTimer = null;
-    var notepadObjectId = null;
+    var notepadEditor = createNotepadEditor(notepadArea);
     function showNotepadStatus(message, isError) {
       notepadStatus.classList.toggle('error', Boolean(isError));
       notepadStatus.textContent = message;
@@ -349,48 +352,7 @@
         }
       }, 2000);
     }
-    function requestJson(url, options) {
-      return fetch(url, options).then(function(response) {
-        if (!response.ok) {
-          throw new Error('HTTP ' + response.status);
-        }
-        return response.json();
-      });
-    }
-    function assertApiSuccess(data, fallbackMessage) {
-      if (!data || data.success === false) {
-        throw new Error((data && data.message) || fallbackMessage);
-      }
-      return data;
-    }
-    function readNotepadPayload(data) {
-      return {
-        text: (data && (data.content || data.text)) || '',
-        objectId: (data && typeof data.object_id === 'string') ? data.object_id : null
-      };
-    }
-    function applyNotepadPayload(data, keepLocalEdits) {
-      var payload = readNotepadPayload(data);
-      var hasLocalEdits = keepLocalEdits
-        && document.activeElement === notepadArea
-        && notepadArea.value !== payload.text;
-      if (!hasLocalEdits) {
-        notepadArea.value = payload.text;
-        notepadObjectId = payload.objectId;
-      }
-      return !hasLocalEdits;
-    }
-    function reloadNotepad(message) {
-      return requestJson('/api/notepad/read').then(function(data) {
-        applyNotepadPayload(data, false);
-        if (message) {
-          showNotepadStatus(message, true);
-        }
-      });
-    }
-    requestJson('/api/notepad/read').then(function(data) {
-      applyNotepadPayload(data, false);
-    }).catch(function(error) {
+    notepadEditor.load().catch(function(error) {
       showNotepadStatus('読み込みに失敗しました: ' + error.message, true);
     });
     function connectNotepadSocket(wsPort) {
@@ -401,19 +363,21 @@
         try {
           var msg = JSON.parse(event.data);
           if (msg.type === 'notepad.change') {
-            var applied = applyNotepadPayload(msg.data, true);
-            if (applied) {
+            var result = notepadEditor.applySnapshot(msg.data);
+            if (result.applied) {
               showNotepadStatus('他の画面の変更を反映しました');
-            } else {
-              showNotepadStatus('他の画面で更新されました。保存時に再読み込みします', true);
+            } else if (result.keptLocalEdits) {
+              showNotepadStatus('サーバのメモ帳が更新されました。入力内容は保持しています', true);
             }
           }
         } catch (_) {}
       };
       ws.onclose = function() { setTimeout(function() { connectNotepadSocket(wsPort); }, 5000); };
     }
-    fetch('/api/webui/config').then(function(r) { return r.json(); }).then(function(data) {
+    fetchJson('/api/webui/config').then(function(data) {
       if (data && data.ws_port) connectNotepadSocket(data.ws_port);
+    }).catch(function(error) {
+      showNotepadStatus('接続設定の読み込みに失敗しました: ' + error.message, true);
     });
     var notepadTimer = null;
     notepadArea.addEventListener('input', function() {
@@ -421,17 +385,10 @@
       notepadStatus.textContent = '';
       notepadStatus.classList.remove('error');
       notepadTimer = setTimeout(function() {
-        requestJson('/api/notepad/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: notepadArea.value, object_id: notepadObjectId })
-        }).then(function(data) {
-          if (data && data.conflict) {
-            return reloadNotepad(data.message || '他の画面で変更されたため再読み込みしました');
-          }
-          data = assertApiSuccess(data, '保存に失敗しました');
-          applyNotepadPayload(data, false);
-          showNotepadStatus(data.message || '保存しました');
+        notepadEditor.save().then(function(result) {
+          if (result.saved) showNotepadStatus(result.dirty
+            ? '前の入力を保存しました。新しい入力は未保存です'
+            : result.data.message || '保存しました');
         }).catch(function(error) {
           showNotepadStatus('保存に失敗しました: ' + error.message, true);
         });

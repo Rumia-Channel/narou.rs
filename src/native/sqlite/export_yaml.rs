@@ -57,6 +57,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 
+use crate::db::state_inventory;
 use crate::error::{NarouError, Result};
 use crate::native::object_store::NativeObjectStore;
 use crate::platform::{
@@ -64,19 +65,6 @@ use crate::platform::{
 };
 
 use super::state::StorageMode;
-
-/// Management states copied verbatim from `app_state` to their legacy files.
-const STATE_FILES: [(&str, &str); 9] = [
-    ("freeze", "freeze.yaml"),
-    ("alias", "alias.yaml"),
-    ("tag_colors", "tag_colors.yaml"),
-    ("login_cookie", "login_cookie.yaml"),
-    ("latest_convert", "latest_convert.yaml"),
-    ("author", "author.yaml"),
-    ("local_setting", "local_setting.yaml"),
-    ("queue", "queue.yaml"),
-    ("notepad", "notepad.txt"),
-];
 
 /// Directory a non-in-place export defaults to (under the library root).
 const DEFAULT_EXPORT_DIR: &str = "narou-yaml-export";
@@ -151,7 +139,9 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
     //    rendered out; a marker pointing at a database that cannot be opened
     //    is a hard error instead of a silently empty bundle.
     if let Some(state) = sqlite_state {
-            for (key, file) in STATE_FILES {
+            // 管理状態の一覧・ファイル名は取込側と同じテーブル
+            // (`crate::db::state_inventory`) を参照する。
+            for (key, file) in state_inventory::import_export_states() {
                 if let Some(payload) = state.get_raw("inv", key)? {
                     std::fs::write(out_dir.join(file), payload)?;
                 }
@@ -473,7 +463,7 @@ mod tests {
         };
         let mirror = NativeObjectStore::from_root(layout.library_archive.clone()).unwrap();
         super::super::object_store::SqliteObjectStore::with_mirror_files(
-            Arc::new(std::sync::Mutex::new(conn)),
+            Arc::new(parking_lot::Mutex::new(conn)),
             mirror,
             false,
         )
@@ -634,7 +624,7 @@ mod tests {
             // Corrupt the stored CRC-32 so the payload fails verification.
             {
                 let conn = store.conn_handle();
-                let guard = conn.lock().expect("sqlite mutex poisoned");
+                let guard = conn.lock();
                 guard
                     .execute(
                         "UPDATE objects SET crc32 = 0 WHERE object_key = ?",
