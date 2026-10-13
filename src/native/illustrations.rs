@@ -18,6 +18,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 
 use crate::error::{NarouError, Result};
+use crate::illustration_store::is_sha256_hex_stem;
 use crate::platform::split_store::ILLUSTRATION_SEGMENT;
 use crate::platform::store_migration::io_windows;
 use crate::platform::{
@@ -449,7 +450,7 @@ fn is_self_referencing_stored_name(
     filename: &str,
 ) -> bool {
     let stem = filename.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(filename);
-    if stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+    if is_sha256_hex_stem(stem) {
         return true;
     }
     stem.strip_prefix('i').is_some_and(|digits| {

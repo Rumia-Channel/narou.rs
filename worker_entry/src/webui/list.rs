@@ -11,19 +11,16 @@
 //! 同じ `narou_rs::application::LibraryService::list`
 //! (`MetadataServices::library`) に委譲するので、行の意味も一致する。
 
-use narou_rs::application::web_payloads::{ListParams, NovelListItem, NovelListResponse};
-use narou_rs::application::{
-    ApplicationError, LibraryListRequest, LibrarySortColumn, LibrarySortOrder,
+use narou_rs::application::web_payloads::{
+    DEFAULT_WEB_PAGE_LENGTH, ListParams, MAX_WEB_PAGE_LENGTH, MAX_WEB_SEARCH_BYTES,
+    NovelListItem, NovelListResponse, combine_search_terms, sort_column_from_index,
 };
+use narou_rs::application::{ApplicationError, LibraryListRequest, LibrarySortOrder};
 use std::collections::HashSet;
 use worker::{Env, Method, Request, Response};
 
 use super::json_error;
 
-/// native `crate::web::MAX_WEB_PAGE_LENGTH` と同じページ長上限。
-const MAX_WEB_PAGE_LENGTH: u64 = 500;
-/// native `crate::web::MAX_WEB_SEARCH_BYTES` と同じ検索語バイト上限。
-const MAX_WEB_SEARCH_BYTES: usize = 4096;
 /// axum `Form` と同じ受理 Content-Type (パラメータ部は無視)。
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 
@@ -77,7 +74,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
         Some(
             params
                 .length
-                .unwrap_or(50)
+                .unwrap_or(DEFAULT_WEB_PAGE_LENGTH)
                 .min(MAX_WEB_PAGE_LENGTH) as usize,
         )
     };
@@ -88,18 +85,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
     }
 
     let search = combine_search_terms(params.filter, params.search_value);
-    let sort_column = match params.order_column.unwrap_or(0) {
-        1 => LibrarySortColumn::LastUpdate,
-        2 => LibrarySortColumn::GeneralLastup,
-        3 => LibrarySortColumn::LastCheckDate,
-        4 => LibrarySortColumn::Title,
-        5 => LibrarySortColumn::Author,
-        6 => LibrarySortColumn::SiteName,
-        7 => LibrarySortColumn::NovelType,
-        9 => LibrarySortColumn::GeneralAllNo,
-        10 => LibrarySortColumn::Length,
-        _ => LibrarySortColumn::Id,
-    };
+    let sort_column = sort_column_from_index(params.order_column);
     let sort_order = if params.order_dir.as_deref() == Some("desc") {
         LibrarySortOrder::Descending
     } else {
@@ -160,19 +146,6 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
         data,
     })?;
     super::metadata::timed_response(response, "list", started_ms)
-}
-
-/// native `combine_search_terms` の写し。
-/// `filter` (列フィルタ) と `search[value]` (全体検索) を空白区切りで AND 連結する。
-fn combine_search_terms(filter: Option<String>, search: Option<String>) -> Option<String> {
-    match (filter, search) {
-        (Some(filter), Some(search)) if !filter.is_empty() && !search.is_empty() => {
-            Some(format!("{filter} {search}"))
-        }
-        (Some(filter), _) if !filter.is_empty() => Some(filter),
-        (_, Some(search)) if !search.is_empty() => Some(search),
-        _ => None,
-    }
 }
 
 /// `serde_urlencoded` (= `form_urlencoded`) と同じ規則で生バイト列から

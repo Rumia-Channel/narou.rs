@@ -3,6 +3,8 @@
  * Loads settings from API, renders tabs/forms, and handles save.
  */
 
+import { fetchJson, postJson, assertApiSuccess } from './core/http.js';
+
 (function() {
   'use strict';
 
@@ -10,6 +12,9 @@
   let activeTab = null;
   let saveInFlight = false;
   let baselineFormData = {};
+  let loginMutationPending = false;
+  let loginListStale = false;
+  let loginReadGeneration = 0;
 
   // ─── Init ──────────────────────────────────────────────
   document.addEventListener('DOMContentLoaded', init);
@@ -134,9 +139,8 @@
       button.addEventListener('click', function() { switchStorageMode(mode, button); });
     };
     try {
-      const resp = await fetch('/api/storage/mode');
-      const data = await resp.json();
-      if (!resp.ok || data.error || data.success === false || !['sqlite', 'yaml'].includes(data.mode)) {
+      const data = await fetchJson('/api/storage/mode');
+      if (data.error || data.success === false || !['sqlite', 'yaml'].includes(data.mode)) {
         throw new Error(data.error?.message || data.message || '保存方式を取得できません');
       }
       const sqlite = data.mode === 'sqlite';
@@ -170,13 +174,8 @@
     if (mode === 'yaml' && !window.confirm('YAML を書き出してから YAML 管理へ戻します。よろしいですか？')) return;
     if (button) button.disabled = true;
     try {
-      const resp = await fetch('/api/storage/mode', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: mode }),
-      });
-      const result = await resp.json();
-      if (!resp.ok || result.success !== true) throw new Error(result.error?.message || result.message || '切り替えに失敗しました');
+      const result = await postJson('/api/storage/mode', { mode: mode });
+      assertApiSuccess(result, '切り替えに失敗しました');
       showToast(result.message || '切り替えました', 'success');
       if (result.reboot) {
         navigateAfterReboot();
@@ -254,7 +253,7 @@
         (typeof setting.max_value === 'number' ? ' max="' + setting.max_value + '"' : '')
       : '';
     return '<input type="' + inputType + '" class="setting-input" data-name="' + escapeAttr(name) +
-           '" value="' + escapeAttr(strVal) + '" placeholder="' + escapeAttr(placeholder) + '"' + numeric + dis + '>';
+           '" aria-label="' + escapeAttr(name) + '" value="' + escapeAttr(strVal) + '" placeholder="' + escapeAttr(placeholder) + '"' + numeric + dis + '>';
   }
 
 
@@ -265,7 +264,7 @@
     const defaultLabel = defaultValue === true ? '未設定 (既定: はい)'
       : defaultValue === false ? '未設定 (既定: いいえ)' : '未設定 (既定を使用)';
 
-    return '<div class="switch-3way">' +
+    return '<div class="switch-3way" role="radiogroup" aria-label="' + escapeAttr(name) + '">' +
            '<input type="radio" id="' + escapeAttr(name) + '-nil" name="' + escapeAttr(name) + '" value="nil"' + nilChecked + dis + '>' +
            '<label for="' + escapeAttr(name) + '-nil">' + defaultLabel + '</label>' +
            '<input type="radio" id="' + escapeAttr(name) + '-off" name="' + escapeAttr(name) + '" value="off"' + offChecked + dis + '>' +
@@ -276,7 +275,7 @@
   }
 
   function renderSelect(name, value, keys, summaries, dis) {
-    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '"' + dis + '>';
+    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" aria-label="' + escapeAttr(name) + '"' + dis + '>';
     const isTheme = (name === 'webui.theme');
     const isNewTagColor = (name === 'webui.new-tag-color');
     if (!isNewTagColor) {
@@ -299,7 +298,7 @@
       selectedItems = value.split(',').map(function(s) { return s.trim(); });
     }
 
-    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" multiple' + dis + '>';
+    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" aria-label="' + escapeAttr(name) + '" multiple' + dis + '>';
     keys.forEach(function(key, index) {
       const selected = selectedItems.includes(key) ? ' selected' : '';
       const label = summaries[index] || key;
@@ -318,7 +317,7 @@
            '<li>・全ての小説に対する置換設定を行うことが出来ます</li>' +
            '<li>・変更を反映させるには再度変換を実行する必要があります</li>' +
            '</ul>' +
-           '<textarea class="replace-textarea" id="replace-content">' + escapeHtml(content) + '</textarea>' +
+           '<textarea class="replace-textarea" id="replace-content" aria-label="全小説対象の置換設定">' + escapeHtml(content) + '</textarea>' +
            '</div></div></div>';
   }
 
@@ -463,26 +462,61 @@
     reader.readAsText(file);
   }
 
-  async function loadLoginHosts() {
+  function setLoginControlsPending() {
+    document.querySelectorAll('#login-hosts button[data-site], #login-import, #login-clear-all').forEach(function(button) {
+      button.disabled = loginMutationPending || loginListStale;
+    });
+    const refresh = document.getElementById('login-refresh');
+    if (refresh) refresh.disabled = loginMutationPending;
+  }
+
+  async function loadLoginHosts({ throwOnError = false } = {}) {
+    if (loginMutationPending && !throwOnError) return;
     const container = document.getElementById('login-hosts');
     if (!container) return;
+    const generation = ++loginReadGeneration;
     try {
-      const resp = await fetch('/api/login');
-      const result = await resp.json();
-      if (!result.success) throw new Error(result.message || '読み込みに失敗しました');
+      const result = await fetchJson('/api/login');
+      assertApiSuccess(result, '読み込みに失敗しました');
+      if (generation !== loginReadGeneration) return;
+      if (!Array.isArray(result?.data?.sites)) throw new Error('ログイン一覧の形式が不正です');
+      loginListStale = false;
       renderLoginHosts(result.data);
     } catch (e) {
+      if (generation !== loginReadGeneration) return;
       container.innerHTML = '<em>読み込みに失敗しました: ' + escapeHtml(e.message) + '</em>';
+      if (throwOnError) throw e;
     }
   }
 
-  // Re-render the list from a mutation response's `data` (same shape as
-  // GET /api/login), refetching when the response carried none.
-  function refreshLoginHosts(data) {
-    if (data && data.sites) {
+  async function refreshLoginHosts(data) {
+    if (Array.isArray(data?.sites)) {
+      ++loginReadGeneration;
+      loginListStale = false;
       renderLoginHosts(data);
     } else {
-      loadLoginHosts();
+      await loadLoginHosts({ throwOnError: true });
+    }
+  }
+
+  async function runLoginMutation(action, fallbackMessage) {
+    if (loginMutationPending || loginListStale) return null;
+    loginMutationPending = true;
+    loginListStale = true;
+    ++loginReadGeneration;
+    setLoginControlsPending();
+    try {
+      const result = await action();
+      assertApiSuccess(result, fallbackMessage);
+      await refreshLoginHosts(result.data);
+      showToast(result.message || 'ログイン情報を更新しました', 'success');
+      return result;
+    } catch (e) {
+      showToast(e.message, 'error');
+      return null;
+    } finally {
+      loginMutationPending = false;
+      setLoginControlsPending();
     }
   }
 
@@ -527,6 +561,7 @@
       if (data.key_source) text += ' 鍵: ' + data.key_source;
       help.textContent = text;
     }
+    setLoginControlsPending();
   }
 
   async function importLoginEnvelope() {
@@ -537,62 +572,41 @@
       showToast('書き出しファイルを選択するか、内容を貼り付けてください', 'error');
       return;
     }
-    try {
-      const resp = await fetch('/api/login/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          envelope: envelope.value,
-          passphrase: passphrase ? passphrase.value || null : null,
-          replace: !!(replace && replace.checked),
-          name: importName() || null,
-        }),
-      });
-      const result = await resp.json();
-      if (!result.success) throw new Error(result.message || '取り込みに失敗しました');
-      showToast(result.message || '取り込みました', 'success');
+    const submitted = {
+      envelope: envelope.value,
+      passphrase: passphrase ? passphrase.value || null : null,
+      replace: !!(replace && replace.checked),
+      name: importName() || null,
+    };
+    const result = await runLoginMutation(() => postJson('/api/login/import', submitted), '取り込みに失敗しました');
+    if (result && envelope.value === submitted.envelope) {
+      const submittedNameStillVisible = importName() === (submitted.name || '');
       envelope.value = '';
-      if (passphrase) passphrase.value = '';
+      if (passphrase && (passphrase.value || null) === submitted.passphrase) passphrase.value = '';
       const fileInput = document.getElementById('login-envelope-file');
       const fileName = document.getElementById('login-file-name');
       if (fileInput) fileInput.value = '';
       if (fileName) fileName.textContent = '';
       const nameInput = document.getElementById('login-import-name');
-      if (nameInput) nameInput.value = '';
-      refreshLoginHosts(result.data);
-    } catch (e) {
-      showToast(e.message, 'error');
+      if (nameInput && submittedNameStillVisible) nameInput.value = '';
     }
   }
 
   async function renameLogin(site, index, current) {
+    if (loginMutationPending || loginListStale) return;
     const input = window.prompt(site + ' の ' + (index + 1) + ' 番目のログインの名前を入力してください。空にすると名前を消します。', current || '');
     if (input === null) return;
-    try {
-      const resp = await fetch('/api/login/rename', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ site: site, index: index, label: input.trim() }),
-      });
-      const result = await resp.json();
-      if (!result.success) throw new Error(result.message || '名前の変更に失敗しました');
-      showToast(result.message || '名前を変更しました', 'success');
-      refreshLoginHosts(result.data);
-    } catch (e) {
-      showToast(e.message, 'error');
-    }
+    await runLoginMutation(
+      () => postJson('/api/login/rename', { site: site, index: index, label: input.trim() }),
+      '名前の変更に失敗しました'
+    );
   }
 
   async function removeLoginEntry(site, index) {
-    try {
-      const resp = await fetch('/api/login/' + encodeURIComponent(site) + '/' + index, { method: 'DELETE' });
-      const result = await resp.json();
-      if (!result.success) throw new Error(result.message || '削除に失敗しました');
-      showToast(result.message || '削除しました', 'success');
-      refreshLoginHosts(result.data);
-    } catch (e) {
-      showToast(e.message, 'error');
-    }
+    await runLoginMutation(
+      () => fetchJson('/api/login/' + encodeURIComponent(site) + '/' + index, { method: 'DELETE' }),
+      '削除に失敗しました'
+    );
   }
 
   async function moveLogin(site, index, direction, total) {
@@ -603,45 +617,28 @@
     const tmp = order[index];
     order[index] = order[swap];
     order[swap] = tmp;
-    try {
-      const resp = await fetch('/api/login/order', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ site: site, order: order }),
-      });
-      const result = await resp.json();
-      if (!result.success) throw new Error(result.message || '並べ替えに失敗しました');
-      showToast(result.message || '並べ替えました', 'success');
-      refreshLoginHosts(result.data);
-    } catch (e) {
-      showToast(e.message, 'error');
-    }
+    await runLoginMutation(
+      () => postJson('/api/login/order', { site: site, order: order }),
+      '並べ替えに失敗しました'
+    );
   }
 
   async function removeLoginSite(site) {
+    if (loginMutationPending || loginListStale) return;
     if (!window.confirm('サイト ' + site + ' のログイン情報をすべて削除します。よろしいですか？')) return;
-    try {
-      const resp = await fetch('/api/login/' + encodeURIComponent(site), { method: 'DELETE' });
-      const result = await resp.json();
-      if (!result.success) throw new Error(result.message || '削除に失敗しました');
-      showToast(result.message || '削除しました', 'success');
-      refreshLoginHosts(result.data);
-    } catch (e) {
-      showToast(e.message, 'error');
-    }
+    await runLoginMutation(
+      () => fetchJson('/api/login/' + encodeURIComponent(site), { method: 'DELETE' }),
+      '削除に失敗しました'
+    );
   }
 
   async function clearAllLogin() {
+    if (loginMutationPending || loginListStale) return;
     if (!window.confirm('保存されているすべてのログイン情報を削除します。よろしいですか？')) return;
-    try {
-      const resp = await fetch('/api/login', { method: 'DELETE' });
-      const result = await resp.json();
-      if (!result.success) throw new Error(result.message || '削除に失敗しました');
-      showToast(result.message || '削除しました', 'success');
-      refreshLoginHosts(result.data);
-    } catch (e) {
-      showToast(e.message, 'error');
-    }
+    await runLoginMutation(
+      () => fetchJson('/api/login', { method: 'DELETE' }),
+      '削除に失敗しました'
+    );
   }
 
   // ─── Events ────────────────────────────────────────────
@@ -658,24 +655,19 @@
     document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
     document.getElementById('btn-save-settings-bottom').addEventListener('click', saveSettings);
 
-    // Toggle label update
-    document.addEventListener('change', function(e) {
-      if (e.target.type === 'checkbox' && e.target.closest('.switch-light')) {
-        const label = e.target.parentElement.querySelector('.switch-label-text');
-        if (label) {
-          label.textContent = e.target.checked ? 'はい' : 'いいえ';
-        }
-      }
-    });
   }
 
   function switchTab(tabId) {
     // Update tab pills
     document.querySelectorAll('#settings-tabs li').forEach(function(li) {
       li.classList.remove('active');
+      li.querySelector('[role="tab"]')?.setAttribute('aria-selected', 'false');
     });
     const targetLink = document.querySelector('#settings-tabs a[data-tab="' + tabId + '"]');
-    if (targetLink) targetLink.parentElement.classList.add('active');
+    if (targetLink) {
+      targetLink.parentElement.classList.add('active');
+      targetLink.setAttribute('aria-selected', 'true');
+    }
 
     // Update panes
     document.querySelectorAll('#settings-tab-content .tab-pane').forEach(function(pane) {
@@ -710,6 +702,25 @@
   }
 
   // ─── Save ──────────────────────────────────────────────
+  function acknowledgeSubmittedValues(body, result) {
+    const saved = result?.settings;
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+      for (const [name, value] of Object.entries(saved)) {
+        if (!Object.hasOwn(body.settings, name)) continue;
+        baselineFormData[name] = body.settings[name];
+        const setting = findSetting(name);
+        if (setting) setting.value = value;
+      }
+      if (Object.hasOwn(saved, 'webui.theme') && Object.hasOwn(body.settings, 'webui.theme')
+          && collectFormData()['webui.theme'] === body.settings['webui.theme']) {
+        applyThemeValue(saved['webui.theme']);
+      }
+    }
+    if (Object.hasOwn(body, 'replace_content') && result && Object.hasOwn(result, 'replace_content')) {
+      settingsData.replace_content = body.replace_content;
+    }
+  }
+
   async function saveSettings() {
     if (saveInFlight) return;
     const current = collectFormData();
@@ -729,7 +740,6 @@
       }
     }
     const body = { settings: settings, expected_settings: expected };
-    const tabToRestore = activeTab || getCurrentTabId();
     const replaceEl = document.getElementById('replace-content');
     if (replaceEl && replaceEl.value !== settingsData.replace_content) {
       body.replace_content = replaceEl.value;
@@ -743,33 +753,30 @@
     try {
       saveInFlight = true;
       setSaveButtonsDisabled(true);
-      const resp = await fetch('/api/global_setting', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      const result = await resp.json();
-      if (!resp.ok) {
-        throw new Error(result?.message || (resp.status === 409
-          ? '別の操作で設定が変更されています。入力内容を控えてから再読み込みしてください'
-          : '設定の保存に失敗しました'));
+      const result = await postJson('/api/global_setting', body);
+      assertApiSuccess(result, '設定の保存に失敗しました');
+      acknowledgeSubmittedValues(body, result);
+      if (Object.keys(settings).some(name => !Object.hasOwn(result.settings || {}, name))
+          || (Object.hasOwn(body, 'replace_content') && !Object.hasOwn(result, 'replace_content'))) {
+        throw new Error('保存済み設定の応答が不正です');
       }
-      if (!result || result.success !== true) {
-        showToast(result?.message || '保存に失敗しました', 'error');
-        return;
-      }
-      if (result.reboot) {
+      const latest = collectFormData();
+      const hasNewEdits = Object.entries(latest).some(([name, value]) => value !== baselineFormData[name])
+        || (replaceEl && replaceEl.value !== settingsData.replace_content);
+      if (result.reboot && !hasNewEdits) {
         navigateAfterReboot();
         return;
       }
-      try {
-        await reloadSettingsView(tabToRestore);
-        showToast(result.message || '設定を保存しました', 'success');
-      } catch (reloadError) {
-        showToast((result.message || '設定を保存しました') + '（画面の再読み込みに失敗しました: ' + reloadError.message + '）', 'error');
-      }
+      showToast((result.message || '設定を保存しました')
+        + (result.reboot && hasNewEdits ? '（新しい入力は未保存です。保存後に再起動してください）' : ''), 'success');
     } catch(e) {
-      showToast('保存に失敗しました: ' + e.message, 'error');
+      acknowledgeSubmittedValues(body, e.data);
+      const prefix = e.data?.partial
+        ? '一部の設定を保存しました。未保存の入力は保持しています。'
+        : '保存に失敗しました: ';
+      showToast(prefix + (e.status === 409
+        ? '別の操作で設定が変更されています。内容を控えてから再読み込みしてください'
+        : e.message), 'error');
     } finally {
       saveInFlight = false;
       setSaveButtonsDisabled(false);
@@ -864,11 +871,7 @@
   }
 
   async function fetchSettingsData() {
-    const resp = await fetch('/api/global_setting');
-    if (!resp.ok) {
-      throw new Error('Failed to load settings');
-    }
-    const data = await resp.json();
+    const data = await fetchJson('/api/global_setting');
     if (data.error || !Array.isArray(data.settings) || !Array.isArray(data.tabs)) {
       throw new Error(data.error || '設定一覧の形式が不正です');
     }

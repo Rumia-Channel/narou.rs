@@ -71,8 +71,7 @@ impl EventSink for PushEventSink {
                 ),
                 "reboot" => self.push_server.broadcast_event("reboot", ""),
                 name => self
-                    .push_server
-                    .broadcast_raw(&serde_json::json!({ "type": name, "data": event.data })),
+                    .push_server.broadcast_raw(serde_json::json!({ "type": name, "data": event.data })),
             }
             Ok(())
         })

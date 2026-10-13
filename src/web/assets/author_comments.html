@@ -73,13 +73,13 @@
       <tbody id="ac-body"></tbody>
     </table>
   </div>
-  <script>
+  <script type="module">
+    import { fetchJson } from '/assets/js/core/http.js';
     (function() {
       var pathParts = window.location.pathname.split('/');
       var novelId = pathParts[2];
 
-      fetch('/api/novels/' + novelId + '/author_comments')
-        .then(function(r) { return r.json(); })
+      fetchJson('/api/novels/' + novelId + '/author_comments')
         .then(function(data) {
           document.getElementById('ac-title').textContent = data.title;
           document.getElementById('ac-stats').innerHTML =

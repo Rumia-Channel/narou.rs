@@ -38,6 +38,17 @@ cargo check -p narou_worker --target wasm32-unknown-unknown
 These verify backend policy, mandatory deployment verification, and sanitized bounded LIST probes.
 They do not run a live migration, Cloudflare deployment, or production S3 request.
 
-`node --test tests/worker_dispatch.test.mjs` verifies the actual GitHub Actions
-job conditions: normal SORAHOST routing stays unchanged, and an explicit manual
-Workers opt-in runs the selected deployment and its prerequisites.
+Shared runtime boundary regressions:
+
+```sh
+cargo test --features lite --test novel_settings_atomic --test worker_object_updates --test http_pacing
+cargo test --features lite --lib application::settings::tests
+cargo test --features lite --lib native::sqlite::content::tests
+```
+
+These cover independent settings writers, canonical-save/mirror-failure acknowledgements,
+full-snapshot D1 compare-and-swap (including equal-CRC collisions), physical redirect pacing,
+integral-float JSON baselines and decoded converted-output storage. The D1 SQL regressions
+run the production statements against SQLite; they do not replace real Workerd verification.
+Run `worker_entry/tests/contract.mjs` against a real `wrangler dev` instance with
+`BASE_URL`, `NAROU_ADMIN_TOKEN` and `CONTRACT_QUEUE=1` for HTTP, queue and replay contracts.

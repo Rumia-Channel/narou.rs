@@ -173,11 +173,12 @@ pub fn materialize_for_conversion(
 /// ための設定)。環境変数 `NAROU_RS_KEEP_TXT=0` でも切れる。
 #[cfg(feature = "native-runtime")]
 pub fn keep_converted_text_file() -> bool {
-    if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
-        let value = value.trim().to_ascii_lowercase();
-        return !matches!(value.as_str(), "0" | "false" | "no" | "off");
-    }
-    crate::compat::load_local_setting_bool_or("convert.keep-txt", true)
+    let local = crate::db::settings::load(crate::setting_core::SettingScope::Local).unwrap_or_default();
+    crate::setting_core::keep_converted_text(
+        &local,
+        std::env::var("NAROU_RS_KEEP_TXT").ok().as_deref(),
+        true,
+    )
 }
 
 /// セクション変換キャッシュを作るか。
@@ -188,8 +189,7 @@ pub fn keep_converted_text_file() -> bool {
 #[cfg(feature = "native-runtime")]
 fn section_cache_enabled() -> bool {
     if let Ok(value) = std::env::var("NAROU_RS_SECTION_CACHE") {
-        let value = value.trim().to_ascii_lowercase();
-        return !matches!(value.as_str(), "0" | "false" | "no" | "off");
+        return crate::setting_core::flag_enabled(&value);
     }
     crate::compat::load_local_setting_bool_or("convert.section-cache", true)
 }
@@ -1112,7 +1112,7 @@ impl NovelConverter {
                     && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
                 {
                     let conn = state.conn();
-                    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+                    let mut guard = conn.lock();
                     let mut sections_map = std::collections::BTreeMap::new();
                     for section in &sections {
                         let body = serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
@@ -1227,7 +1227,7 @@ impl NovelConverter {
                     && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
                 {
                     let conn = state.conn();
-                    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+                    let mut guard = conn.lock();
                     let mut sections_map = std::collections::BTreeMap::new();
                     for section in &sections {
                         let body = serde_yaml::to_string(section).unwrap_or_else(|_| String::new());

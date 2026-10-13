@@ -1,14 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NarouApiResult {
-    #[serde(default)]
-    pub allcount: i64,
-    #[serde(default)]
-    pub data: Vec<NarouApiEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NarouApiEntry {
     #[serde(default)]
     pub ncode: String,

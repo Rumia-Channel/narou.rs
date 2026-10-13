@@ -1,15 +1,14 @@
 //! Per-invocation subrequest accounting (Workers Paid optimization).
 //!
-//! Every `fetch()` issued by this isolate — site downloads and Durable
-//! Object permit calls — counts against the platform's
-//! 1,000-subrequest-per-invocation hard limit. D1, Queue, and
-//! other RPC bindings do not consume subrequests.
+//! Tracks instrumented HTTP and Durable Object requests, not every binding
+//! operation. D1 and Queue requests also count toward Cloudflare's platform
+//! limit; this counter does not claim to account for them.
 //!
-//! [`SubrequestBudget`] is a cheap shared counter cloned into the HTTP
-//! client, the object store, and the rate limiter. [`WorkerBudget`] combines
-//! the counter with the wall-clock deadline so a job yields at a section
-//! boundary *before* the hard limit can abort an in-flight section — the
-//! same contract [`JOB_TIME_BUDGET`] already provides for time.
+//! Workers Paid currently defaults to 10,000 subrequests per invocation,
+//! configurable per Worker: <https://developers.cloudflare.com/workers/platform/limits/#subrequests>.
+//! The 850-request job yield point is an intentionally conservative local
+//! policy, not a hard platform limit. [`WorkerBudget`] combines it with the
+//! wall-clock deadline to yield at section boundaries.
 //!
 //! [`JOB_TIME_BUDGET`]: crate::executor::JOB_TIME_BUDGET
 
@@ -20,12 +19,6 @@ use std::time::Duration;
 use narou_rs::application::JobQueue;
 use narou_rs::downloader::SectionBudget;
 
-/// Hard platform limit: 1,000 subrequests per invocation.
-///
-/// 実行時に強制はしない（超えたらプラットフォーム側が失敗させる）が、
-/// ジョブの予算がこの上限を踏まないことをテストで固定するために置く。
-#[cfg(test)]
-pub const SUBREQUEST_HARD_LIMIT: u64 = 1_000;
 
 /// Soft yield point for one job. Leaves headroom for the ledger writes,
 /// queue ack, and any non-download work sharing the invocation; a section
@@ -195,11 +188,4 @@ mod tests {
         assert_eq!(budget.remaining(3), 0);
     }
 
-    #[test]
-    fn job_budget_stays_below_hard_limit() {
-        // 定数どうしの比較は const ブロックで行う (コンパイル時に検証される)。
-        const {
-            assert!(JOB_SUBREQUEST_BUDGET < SUBREQUEST_HARD_LIMIT);
-        }
-    }
 }

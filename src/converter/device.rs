@@ -37,6 +37,9 @@ use crate::downloader::util::decode_numeric_entities;
 #[cfg(feature = "native-runtime")]
 use crate::error::{NarouError, Result};
 
+#[cfg(feature = "native-runtime")]
+use super::render::cover_image_path;
+
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
@@ -370,7 +373,9 @@ impl OutputManager {
             args.push(OsString::from(device_name));
         }
 
-        if input_txt.parent().is_some_and(has_cover_image) {
+        // Java CLI と同じく、表紙ファイルの実在だけで `-c 0` を渡す
+        // (`enable_illust` は見ない)。
+        if input_txt.parent().and_then(cover_image_path).is_some() {
             args.push(OsString::from("-c"));
             args.push(OsString::from("0"));
         }
@@ -670,18 +675,13 @@ impl OutputManager {
                 }
             }
 
-            for ext in [".jpg", ".png", ".jpeg"] {
-                let cover_name = format!("cover{ext}");
-                let cover_path = input_txt
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(&cover_name);
-                if cover_path.exists() {
-                    zip.start_file(cover_name, options)
-                        .map_err(|e| NarouError::Conversion(e.to_string()))?;
-                    zip.write_all(&std::fs::read(cover_path)?)?;
-                    break;
-                }
+            if let Some(cover_path) =
+                cover_image_path(input_txt.parent().unwrap_or_else(|| Path::new(".")))
+                && let Some(cover_name) = cover_path.file_name().and_then(|name| name.to_str())
+            {
+                zip.start_file(cover_name, options)
+                    .map_err(|e| NarouError::Conversion(e.to_string()))?;
+                zip.write_all(&std::fs::read(&cover_path)?)?;
             }
 
             zip.finish()
@@ -833,12 +833,15 @@ impl OutputManager {
         // 挿絵の取り出しは [`Self::convert_file`] が受け持つ (EPUB を要求する
         // 経路すべてで必要なので、入口 1 箇所に寄せる)。
         // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
+        //
+        // 表紙は Java CLI と同じ条件 (`-c 0` = 表紙ファイルの実在だけ) で決め、
+        // `enable_illust` を見ないため native Web / Worker の `from_settings` は
+        // 使わない。濁点フォントは preset の実体から組む。
         let options = crate::epub_lite::EpubBuildOptions {
             title: context.title.clone(),
             author: context.author.clone(),
             vertical: !self.yokogaki,
-            // Java 経路と同じ条件で `-c 0` (先頭の挿絵を表紙にする) を渡す。
-            cover_from_first_image: input_txt.parent().is_some_and(has_cover_image),
+            cover_from_first_image: input_txt.parent().and_then(cover_image_path).is_some(),
             assets_dir: crate::compat::aozora_assets_dir(),
             kindle: matches!(self.device, Device::Mobi),
             extra_assets: super::dakuten_font::lite_font_assets(self.use_dakuten_font)?,
@@ -1374,6 +1377,8 @@ fn copy_aozora_companion_files(input_txt: &Path, temp_root: &Path) -> Result<()>
         return Ok(());
     };
 
+    // 手書きテキストは任意の `cover.*` を参照し得るため、実在する分をすべて
+    // 運ぶ (表示・`-c 0` の選択は AozoraEpub3 側に任せる)。
     for ext in [".jpg", ".png", ".jpeg"] {
         let name = format!("cover{}", ext);
         let src = src_dir.join(&name);
@@ -1458,13 +1463,6 @@ fn resolved_path_for_aozora(path: &Path) -> PathBuf {
     std::fs::canonicalize(path)
         .map(|resolved| normalize_windows_verbatim_path(&resolved))
         .unwrap_or_else(|_| absolutize_path(path))
-}
-
-#[cfg(feature = "native-runtime")]
-fn has_cover_image(dir: &Path) -> bool {
-    [".jpg", ".png", ".jpeg"]
-        .iter()
-        .any(|ext| dir.join(format!("cover{}", ext)).is_file())
 }
 
 #[cfg(feature = "native-runtime")]

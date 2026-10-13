@@ -5,6 +5,8 @@ use axum::{
 };
 
 
+use crate::application::webui::mutations::{MutationNotice, mutation_events};
+
 use super::AppState;
 use super::sort_state::sort_ids_from_records;
 use super::state::{ApiResponse, EditTagBody, IdPath, TagBody, TagsBody};
@@ -47,8 +49,10 @@ async fn apply_tag_change(
                 (StatusCode::INTERNAL_SERVER_ERROR, message)
             }
         })?;
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
+    // 一覧とタグ表示の両方を再読込させる (イベント選択は native/Worker 共通)。
+    for event in mutation_events(MutationNotice::TableAndTags) {
+        state.push_server.broadcast_raw(event);
+    }
     Ok(result)
 }
 

@@ -191,12 +191,12 @@ pub fn list_versions(conn: &Connection, novel_id: i64) -> Result<Vec<VersionInfo
     Ok(out)
 }
 
-/// Stored unified diff for one version (empty for the initial snapshot).
-pub fn version_diff(conn: &Connection, version_id: i64) -> Result<Option<String>> {
+/// Stored unified diff for a version owned by the requested novel.
+pub fn version_diff(conn: &Connection, novel_id: i64, version_id: i64) -> Result<Option<String>> {
     let mut statement = conn
-        .prepare("SELECT unified_diff, encoding FROM novel_version_diffs WHERE version_id = ?")
+        .prepare("SELECT d.unified_diff, d.encoding FROM novel_version_diffs d JOIN novel_versions v ON v.id = d.version_id WHERE v.id = ? AND v.novel_id = ?")
         .map_err(sqlite_error)?;
-    let mut rows = statement.query([version_id]).map_err(sqlite_error)?;
+    let mut rows = statement.query(params![version_id, novel_id]).map_err(sqlite_error)?;
     match rows.next().map_err(sqlite_error)? {
         Some(row) => {
             let stored: Vec<u8> = row
@@ -366,15 +366,15 @@ mod tests {
     use crate::native::sqlite::content::{load_sections, store_sections};
 
     /// Fresh in-memory schema plus the minimal novel row the version tables'
-    /// foreign key needs. `parking_lot` keeps the guard poisoning-free (the
-    /// production handle keeps its documented `Arc<std::sync::Mutex<_>>`).
+    /// foreign key needs.
     fn test_conn() -> parking_lot::Mutex<Connection> {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         crate::native::sqlite::migrations::apply(&mut conn).unwrap();
         conn.execute(
             "INSERT INTO novels (id, author, author_fold, title, title_fold, file_title, toc_url, toc_url_fold, sitename, sitename_fold, last_update)
-             VALUES (7, 'a', 'a', 't', 't', 'ft', 'https://x/7', 'https://x/7', 's', 's', '2026-01-01T00:00:00Z')",
+             VALUES (7, 'a', 'a', 't', 't', 'ft', 'https://x/7', 'https://x/7', 's', 's', '2026-01-01T00:00:00Z'),
+                    (8, 'a', 'a', 'other', 'other', 'other', 'https://x/8', 'https://x/8', 's', 's', '2026-01-01T00:00:00Z')",
             [],
         )
         .unwrap();
@@ -413,9 +413,11 @@ mod tests {
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].id, second);
         assert_eq!(versions[0].section_count, 261);
-        let diff = version_diff(&guard, second).unwrap().unwrap();
+        let diff = version_diff(&guard, 7, second).unwrap().unwrap();
         assert!(diff.contains("+body: rewritten"), "{diff}");
         assert!(diff.contains("+body: 261"), "{diff}");
+        assert_eq!(version_diff(&guard, 8, second).unwrap(), None);
+        assert_eq!(version_diff(&guard, 7, i64::MAX).unwrap(), None);
 
         // Restore the first snapshot (copy-forward): 260 sections, original body.
         let restored = restore_version(&mut guard, 7, first, false).unwrap();

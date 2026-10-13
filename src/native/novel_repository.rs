@@ -17,7 +17,7 @@
 
 use crate::db::NovelRecord;
 use crate::error::{NarouError, Result};
-use crate::platform::repository::record_matches_filter;
+use crate::platform::repository::{NovelLookup, record_matches_filter};
 use crate::platform::{
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, PlatformFuture,
 };
@@ -323,6 +323,34 @@ impl NovelRepository for NativeNovelRepository {
             })
             .await
         })
+    }
+}
+
+/// Synchronous adapter for `application::target_lookup` (native CLI paths).
+impl NovelLookup for NativeNovelRepository {
+    fn get(&self, id: NovelId) -> Result<Option<NovelRecord>> {
+        self.get_sync(id)
+    }
+
+    fn find_by_toc_url(&self, url: &str) -> Result<Option<NovelRecord>> {
+        self.find_by_toc_url_sync(url)
+    }
+
+    fn find_by_ncode(&self, ncode: &str) -> Result<Option<NovelRecord>> {
+        self.find_by_ncode_sync(ncode)
+    }
+
+    fn find_by_title(&self, title: &str) -> Result<Option<NovelRecord>> {
+        self.find_by_title_sync(title)
+    }
+
+    fn scan_ids(
+        &self,
+        filter: &NovelFilter,
+        after_id: Option<NovelId>,
+        limit: usize,
+    ) -> Result<Vec<NovelId>> {
+        self.scan_ids_sync(filter, after_id, limit)
     }
 }
 

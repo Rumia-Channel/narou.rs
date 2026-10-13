@@ -541,7 +541,7 @@ pub(crate) async fn webui_debug_mode(runtime: &WorkerRuntime) -> bool {
         .await
         .ok()
         .flatten()
-        .and_then(|value| value.as_bool())
+        .and_then(|value| narou_rs::setting_core::setting_bool_value(&value))
         .unwrap_or(false)
 }
 

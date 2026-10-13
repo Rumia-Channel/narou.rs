@@ -435,26 +435,80 @@ fn display_diff_list(context: &NovelContext) -> std::result::Result<(), String> 
     Ok(())
 }
 
-fn clean_diff(context: &NovelContext) -> std::result::Result<(), String> {
-    let cache_root = cache_root_dir(context);
-    print!("{} の", context.record.title);
-    let mut removed = false;
-    if cache_root.exists() {
-        fs::remove_dir_all(&cache_root).map_err(|e| e.to_string())?;
-        removed = true;
+fn remove_empty_diff_directory(path: &Path) -> std::result::Result<bool, String> {
+    let mut entries = fs::read_dir(path).map_err(|error| error.to_string())?;
+    match entries.next() {
+        None => {
+            fs::remove_dir(path).map_err(|error| error.to_string())?;
+            Ok(true)
+        }
+        Some(Ok(_)) => Ok(false),
+        Some(Err(error)) => Err(error.to_string()),
+    }
+}
+
+/// Shared object cleanup plus native I/O for legacy empty cache directories.
+/// Used by --clean and --all-clean, and by the Web action's one CLI invocation.
+fn clean_diff_data(context: &NovelContext) -> std::result::Result<bool, String> {
+    use narou_rs::application::webui::diff::{DIFF_CACHE_DIR_NAMES, plan_diff_cache_clean};
+    use narou_rs::platform::ObjectStore;
+
+    let novel_dir = narou_rs::db::existing_novel_dir_for_record(&context.archive_root, &context.record);
+    let novel_dir = narou_rs::db::paths::ensure_within_archive_root(&novel_dir, &context.archive_root)
+        .map_err(|error| error.to_string())?;
+    let prefix = narou_rs::native::object_store::novel_object_prefix(&context.archive_root, &novel_dir)
+        .ok_or_else(|| "invalid novel storage path".to_string())?;
+    let store = narou_rs::native::object_store::NativeStore::for_current_root()
+        .map_err(|error| error.to_string())?;
+    let plan = futures::executor::block_on(plan_diff_cache_clean(&store, &prefix))
+        .map_err(|error| error.to_string())?;
+    let mut removed = !plan.is_empty();
+    futures::executor::block_on(async {
+        for key in plan {
+            store.delete(&key).await?;
+        }
+        Ok::<_, narou_rs::error::NarouError>(())
+    })
+    .map_err(|error| error.to_string())?;
+
+    for name in DIFF_CACHE_DIR_NAMES {
+        let root = novel_dir.join(SECTION_SAVE_DIR).join(name);
+        let root = narou_rs::db::paths::ensure_within_archive_root(&root, &context.archive_root)
+            .map_err(|error| error.to_string())?;
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        for entry in entries {
+            let dir = entry.map_err(|error| error.to_string())?.path();
+            let dir = narou_rs::db::paths::ensure_within_archive_root(&dir, &context.archive_root)
+                .map_err(|error| error.to_string())?;
+            if !dir.is_dir() {
+                continue;
+            }
+            removed |= remove_empty_diff_directory(&dir)?;
+        }
+        removed |= remove_empty_diff_directory(&root)?;
     }
     // P4b: clearing diffs also clears the SQLite version history (plan §11.3:
     // api_diff_clean == prune all).
     #[cfg(feature = "native-runtime")]
     {
         if let Ok(conn) = version_conn() {
-            let guard = conn.lock().expect("sqlite mutex poisoned");
+            let guard = conn.lock();
             let pruned =
                 narou_rs::native::sqlite::versions::prune_history(&guard, context.record.id, 0)
                     .map_err(|e| e.to_string())?;
             removed = removed || pruned > 0;
         }
     }
+    Ok(removed)
+}
+
+fn clean_diff(context: &NovelContext) -> std::result::Result<(), String> {
+    let removed = clean_diff_data(context)?;
+    print!("{} の", context.record.title);
     if removed {
         println!("差分を削除しました");
     } else {
@@ -486,12 +540,9 @@ fn clean_all_diff() -> std::result::Result<(), String> {
             archive_root: archive_root.clone(),
             record,
         };
-        let cache_root = cache_root_dir(&context);
-        if !cache_root.exists() {
-            continue;
+        if clean_diff_data(&context)? {
+            println!("{} の差分を削除しました", context.record.title);
         }
-        fs::remove_dir_all(&cache_root).map_err(|e| e.to_string())?;
-        println!("{} の差分を削除しました", context.record.title);
     }
 
     Ok(())
@@ -664,7 +715,7 @@ fn bold_yellow(s: &str) -> String {
 
 #[cfg(feature = "native-runtime")]
 fn version_conn()
--> std::result::Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {
+-> std::result::Result<std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>, String> {
     use narou_rs::native::sqlite::state;
     if state::legacy_yaml_active() {
         return Err("SQLiteバックエンドが無効です (NAROU_RS_LEGACY_YAML)".to_string());
@@ -683,7 +734,7 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
     use narou_rs::native::sqlite::versions;
 
     let conn = version_conn()?;
-    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+    let mut guard = conn.lock();
     let novel_id = context.record.id;
 
     if opts.history {
@@ -710,7 +761,7 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
     }
 
     if let Some(version_id) = opts.show {
-        let diff = versions::version_diff(&guard, version_id)
+        let diff = versions::version_diff(&guard, novel_id, version_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("バージョン{version_id}の差分はありません"))?;
         print!("{diff}");

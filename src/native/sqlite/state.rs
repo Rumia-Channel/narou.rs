@@ -3,10 +3,11 @@
 //! One connection (`<root>/.narou/db.sqlite`) backs:
 //! - relational novel records (`Database` persistence),
 //! - small management states previously stored as individual YAML/TXT files
-//!   (`freeze`, `alias`, `tag_colors`, `latest_convert`, `local_setting`,
-//!   `notepad`, `queue`, and the global settings map), stored verbatim in
-//!   `app_state(scope, key, value_yaml)` so every existing parser keeps
-//!   working unchanged.
+//!   (see `crate::db::state_inventory`: `freeze`, `alias`, `tag_colors`,
+//!   `latest_convert`, `local_setting`, `login_cookie`, `author`, `notepad`,
+//!   `queue`), stored verbatim in `app_state(scope, key, value_yaml)` so every
+//!   existing parser keeps working unchanged. The global settings map stays a
+//!   plain file.
 //!
 //! Backward compatibility: when the database is created fresh and the legacy
 //! files exist, they are imported inside one transaction and renamed to
@@ -17,28 +18,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::Connection;
 
+use crate::db::state_inventory;
 use crate::error::{NarouError, Result};
 
 const DB_FILE_NAME: &str = "db.sqlite";
-
-/// `(scope, key, legacy relative path under the narou root)` triples imported
-/// on first run. `legacy` is resolved against `.narou/` unless it starts with
-/// `~/`-style markers handled by the caller.
-const MANAGED_LOCAL: &[(&str, &str)] = &[
-    ("freeze", "freeze.yaml"),
-    ("alias", "alias.yaml"),
-    ("tag_colors", "tag_colors.yaml"),
-    ("login_cookie", "login_cookie.yaml"),
-    ("latest_convert", "latest_convert.yaml"),
-    ("author", "author.yaml"),
-    ("local_setting", "local_setting.yaml"),
-    ("queue", "queue.yaml"),
-    ("notepad", "notepad.txt"),
-];
 
 #[derive(Clone)]
 pub struct StateDb {
@@ -77,18 +65,12 @@ impl StateDb {
         self.conn.clone()
     }
 
-    /// Legacy file path backing an `app_state` entry, if one exists.
-    /// `meta`-scope keys are internal and have no file mapping.
+    /// Legacy file backing an `app_state` entry, when that state has one
+    /// (`crate::db::state_inventory` owns the list). Bookkeeping rows — the
+    /// site-definition import marker, `meta` keys — have no file: they are
+    /// `app_state`-only and never surface as YAML a user could edit.
     fn legacy_path(&self, scope: &str, key: &str) -> Option<PathBuf> {
-        match scope {
-            "inv" => {
-                let ext = if key == "notepad" { "txt" } else { "yaml" };
-                Some(self.narou_dir.join(format!("{key}.{ext}")))
-            }
-            "global" if key == "global_setting" => self.narou_dir.parent()
-                .map(|root| crate::db::inventory::global_setting_dir(root).join("global_setting.yaml")),
-            _ => None,
-        }
+        state_inventory::legacy_path(scope, key, &self.narou_dir)
     }
 
     /// Resolve the `narou-compat` flag. A `local_setting.yaml` file on disk
@@ -103,7 +85,7 @@ impl StateDb {
         if let Some(value) = file_value {
             return value;
         }
-        let conn = self.conn.lock().expect("state db mutex poisoned");
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT value_yaml FROM app_state WHERE scope = 'inv' AND key = 'local_setting'",
             [],
@@ -117,7 +99,7 @@ impl StateDb {
     /// `app_state` read that bypasses the compat file layer. Used by
     /// reconciliation and for `meta` keys.
     pub(crate) fn get_raw_db(&self, scope: &str, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().expect("state db mutex poisoned");
+        let conn = self.conn.lock();
         let mut statement = conn
             .prepare("SELECT value_yaml FROM app_state WHERE scope = ? AND key = ?")
             .map_err(super::sqlite_error)?;
@@ -139,21 +121,21 @@ impl StateDb {
     ///
     /// The freeze payload additionally maintains the relational projection
     /// (`frozen_novels`) so the shared status search expression keeps agreeing
-    /// with the inventory (see [`Self::project_frozen_novels`]).
+    /// with the inventory.
     pub(crate) fn set_raw_db(&self, scope: &str, key: &str, value_yaml: &str) -> Result<()> {
-        {
-            let conn = self.conn.lock().expect("state db mutex poisoned");
-            conn.execute(
-                "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
-                 ON CONFLICT(scope, key) DO UPDATE SET value_yaml = excluded.value_yaml",
-                rusqlite::params![scope, key, value_yaml],
-            )
+        let mut conn = self.conn.lock();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(super::sqlite_error)?;
-        }
+        transaction.execute(
+            "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
+             ON CONFLICT(scope, key) DO UPDATE SET value_json = excluded.value_json, value_yaml = excluded.value_yaml",
+            rusqlite::params![scope, key, value_yaml],
+        ).map_err(super::sqlite_error)?;
         if scope == "inv" && key == "freeze" {
-            self.project_frozen_novels(value_yaml)?;
+            Self::project_frozen_novels(&transaction, value_yaml)?;
         }
-        Ok(())
+        transaction.commit().map_err(super::sqlite_error)
     }
 
     /// Project the freeze payload onto `frozen_novels`.
@@ -161,9 +143,9 @@ impl StateDb {
     /// The payload is authoritative for native reads, but the shared status
     /// expression (`sql/status_search_expression.sql`, which the Worker D1
     /// adapter also uses with `frozen_novels` as its store) queries the table.
-    /// An unparseable payload is skipped rather than fatal: the write already
-    /// succeeded, and the next valid freeze write repairs the projection.
-    fn project_frozen_novels(&self, value_yaml: &str) -> Result<()> {
+    /// An unparseable legacy payload is retained without changing the
+    /// projection; the next valid freeze write repairs it.
+    fn project_frozen_novels(conn: &rusqlite::Transaction<'_>, value_yaml: &str) -> Result<()> {
         let ids = frozen_ids_from_payload(value_yaml);
         let Some(ids) = ids else {
             eprintln!(
@@ -171,8 +153,7 @@ impl StateDb {
             );
             return Ok(());
         };
-        let conn = self.conn.lock().expect("state db mutex poisoned");
-        super::repository::sync_frozen_novels(&conn, &ids)
+        super::repository::sync_frozen_novels(conn, &ids)
     }
 
     /// Re-derive `frozen_novels` from the stored freeze payload.
@@ -182,10 +163,20 @@ impl StateDb {
     /// `database.yaml` has populated `novels`, so that projection has nothing
     /// to attach to, and later launches do not revisit the renamed-away file.
     pub fn resync_frozen_novels(&self) -> Result<()> {
-        if let Some(payload) = self.get_raw_db("inv", "freeze")? {
-            self.project_frozen_novels(&payload)?;
+        use rusqlite::OptionalExtension;
+        let mut conn = self.conn.lock();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(super::sqlite_error)?;
+        let payload = transaction.query_row(
+            "SELECT value_yaml FROM app_state WHERE scope = 'inv' AND key = 'freeze'",
+            [],
+            |row| row.get::<_, String>(0),
+        ).optional().map_err(super::sqlite_error)?;
+        if let Some(payload) = payload {
+            Self::project_frozen_novels(&transaction, &payload)?;
         }
-        Ok(())
+        transaction.commit().map_err(super::sqlite_error)
     }
 
     pub fn get_raw(&self, scope: &str, key: &str) -> Result<Option<String>> {
@@ -197,6 +188,51 @@ impl StateDb {
             return Ok(Some(content));
         }
         self.get_raw_db(scope, key)
+    }
+
+    /// Read, update and project one state under a single writer transaction.
+    /// The closure must not access the database again.
+    pub fn update_raw<T, F>(&self, scope: &str, key: &str, update: F) -> Result<(String, T)>
+    where
+        F: FnOnce(&str) -> Result<(String, T)>,
+    {
+        let path = self.compat_now().then(|| self.legacy_path(scope, key)).flatten();
+        let operation = || {
+            let mut conn = self.conn.lock();
+            let transaction = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(super::sqlite_error)?;
+            let raw = if let Some(path) = &path {
+                crate::db::inventory::read_optional_yaml_file(path)?
+            } else {
+                use rusqlite::OptionalExtension;
+                transaction.query_row(
+                    "SELECT value_yaml FROM app_state WHERE scope = ? AND key = ?",
+                    rusqlite::params![scope, key],
+                    |row| row.get::<_, String>(0),
+                ).optional().map_err(super::sqlite_error)?.unwrap_or_default()
+            };
+            let (content, result) = update(&raw)?;
+            if content != raw {
+                transaction.execute(
+                    "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
+                     ON CONFLICT(scope, key) DO UPDATE SET value_json = excluded.value_json, value_yaml = excluded.value_yaml",
+                    rusqlite::params![scope, key, content],
+                ).map_err(super::sqlite_error)?;
+                if scope == "inv" && key == "freeze" {
+                    Self::project_frozen_novels(&transaction, &content)?;
+                }
+                if let Some(path) = &path {
+                    crate::db::inventory::atomic_write_locked(path, &content)?;
+                }
+            }
+            transaction.commit().map_err(super::sqlite_error)?;
+            Ok((content, result))
+        };
+        match &path {
+            Some(path) => crate::db::inventory::with_exclusive_file_lock(path, operation),
+            None => operation(),
+        }
     }
 
     pub fn set_raw(&self, scope: &str, key: &str, value_yaml: &str) -> Result<()> {
@@ -223,7 +259,7 @@ impl StateDb {
                 Err(error) => return Err(error.into()),
             }
         }
-        let conn = self.conn.lock().expect("state db mutex poisoned");
+        let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM app_state WHERE scope = ? AND key = ?",
             rusqlite::params![scope, key],
@@ -235,7 +271,7 @@ impl StateDb {
 
     /// Every `(key, payload)` pair of one scope, ordered by key.
     pub fn scope_entries(&self, scope: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().expect("state db mutex poisoned");
+        let conn = self.conn.lock();
         let mut statement = conn
             .prepare("SELECT key, value_yaml FROM app_state WHERE scope = ? ORDER BY key")
             .map_err(super::sqlite_error)?;
@@ -252,7 +288,7 @@ impl StateDb {
     }
 
     pub fn is_fresh(&self) -> Result<bool> {
-        let conn = self.conn.lock().expect("state db mutex poisoned");
+        let conn = self.conn.lock();
         let novels: i64 = conn
             .query_row("SELECT COUNT(*) FROM novels", [], |row| row.get(0))
             .map_err(super::sqlite_error)?;
@@ -265,7 +301,7 @@ impl StateDb {
     /// True when no object rows exist yet (first opt-in before the archive
     /// import, or an empty library).
     pub fn objects_empty(&self) -> Result<bool> {
-        let conn = self.conn.lock().expect("state db mutex poisoned");
+        let conn = self.conn.lock();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
             .map_err(super::sqlite_error)?;
@@ -297,10 +333,7 @@ pub enum StorageMode {
 /// SQLite だけで完結する。環境変数 `NAROU_RS_MIRROR_FILES=0` でも切れる。
 pub fn mirror_files_enabled() -> bool {
     match std::env::var("NAROU_RS_MIRROR_FILES") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
+        Ok(value) => crate::setting_core::flag_enabled(&value),
         Err(_) => crate::compat::load_local_setting_bool_or("sqlite.mirror-files", true),
     }
 }
@@ -330,7 +363,7 @@ pub fn active_for(narou_dir: &Path) -> Option<StateDb> {
     if legacy_yaml_active() || read_mode(narou_dir) != StorageMode::Sqlite {
         return None;
     }
-    let mut cache = OPEN_HANDLES.lock().expect("state cache poisoned");
+    let mut cache = OPEN_HANDLES.lock();
     let dir = narou_dir.to_path_buf();
     if let Some(handle) = cache.get(&dir) {
         return Some(handle.clone());
@@ -437,7 +470,7 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
 fn reconcile_managed_files(state: &StateDb) -> Result<()> {
     let compat = state.compat_now();
     let mut imported: Vec<PathBuf> = Vec::new();
-    for (key, file_name) in MANAGED_LOCAL {
+    for (key, file_name) in state_inventory::import_export_states() {
         let path = state.narou_dir.join(file_name);
         let file_content = std::fs::read_to_string(&path).ok();
         if compat {
@@ -451,7 +484,7 @@ fn reconcile_managed_files(state: &StateDb) -> Result<()> {
             }
         } else if let Some(content) = file_content {
             if !content.trim().is_empty() {
-                let payload = if *key == "freeze" {
+                let payload = if key == "freeze" {
                     merge_freeze_payload(state.get_raw_db("inv", key)?.as_deref(), &content)
                 } else {
                     content

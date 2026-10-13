@@ -48,7 +48,7 @@ async fn concurrency_enabled(runtime: &WorkerRuntime) -> bool {
     {
         Ok(local) => local
             .get("concurrency")
-            .and_then(crate::composition::setting_bool)
+            .and_then(narou_rs::setting_core::setting_bool_value)
             .unwrap_or(true),
         // 設定を読めないときは分離側 (既定) に倒す。
         Err(_) => true,
@@ -57,11 +57,8 @@ async fn concurrency_enabled(runtime: &WorkerRuntime) -> bool {
 
 /// `Convert` プランを実行する。対象は単一小説の id のみ。
 ///
-/// コンソール行は native `narou convert <id>` と同じものを出す。download
-/// ジョブと同じく `PushHubSink` を既定 sink としてインストールし (深い
-/// 呼び出しの `emit_default` も同じ経路に乗る)、行自体は共有実装
-/// (`application::convert::emit_convert_item_lines`) が送る。バッファ分は
-/// ジョブの区切りで `drain()` がまとめて PushHub へ流す。
+/// Deep output is scoped to this invocation; the FIFO also delivers ordinary
+/// conversion lines before the job's terminal event.
 pub async fn execute_convert(
     runtime: &WorkerRuntime,
     job: &JobPlan,
@@ -76,14 +73,15 @@ pub async fn execute_convert(
         }
     };
 
-    let push_sink = PushHubSink::install_with_console(push.clone(), console_target(runtime).await);
-    let report = emit_convert_item_lines(push_sink.as_ref(), &job.target.as_str(), target.0, || {
-        convert(runtime, target)
-    })
-    .await;
+    let push_sink = PushHubSink::shared(push.clone(), console_target(runtime).await);
+    let report = narou_rs::application::messages::MessageContext::new(
+        push_sink.clone(), crate::consumer::webui_debug_mode(runtime).await,
+    ).scope(async {
+        emit_convert_item_lines(push_sink.as_ref(), &job.target.as_str(), target.0, || {
+            convert(runtime, target)
+        }).await
+    }).await;
     push_sink.drain().await;
-    // ジョブの sink を isolate から外す (executor と同じ理由)。
-    narou_rs::application::messages::take_default_sink();
 
     match report {
         ConvertItemReport::Converted { .. } => {
@@ -105,15 +103,17 @@ pub async fn execute_convert(
     }
 }
 
-/// `commands::update.rs::set_convert_failure` / `clear_convert_failure` の
-/// Worker 版。失敗してもジョブ結果を変えない (ログだけ残す best-effort)。
+/// 変換失敗フラグの更新 (native `commands::update.rs::set_convert_failure`
+/// / `clear_convert_failure` 相当)。レコード遷移は共有
+/// `novel_actions::mark_convert_failure` が持ち、更新するタイミング
+/// (Converted で解除 / Failed で設定) は native と同じ。
+/// 失敗してもジョブ結果を変えない (ログだけ残す best-effort)。
 async fn set_convert_failure_flag(runtime: &WorkerRuntime, id: narou_rs::platform::NovelId, failed: bool) {
     let result: Result<()> = async {
         let Some(mut record) = runtime.novels.get(id).await? else {
             return Ok(());
         };
-        if record.convert_failure != failed {
-            record.convert_failure = failed;
+        if narou_rs::application::novel_actions::mark_convert_failure(&mut record, failed) {
             runtime
                 .novels
                 .apply_batch(vec![NovelMutation::Upsert(record)])
@@ -223,27 +223,26 @@ pub(crate) async fn keep_converted_text(runtime: &WorkerRuntime) -> bool {
     keep_converted_text_with(&local)
 }
 
+/// Worker の `convert.keep-txt` 既定 (D1 を食わないよう保存しない)。
+/// native のファイル経路と `ConvertService` は `true`。
+pub(crate) const KEEP_CONVERTED_TEXT_DEFAULT: bool = false;
+
 /// 変換済みテキストを保存するか (設定 map 版)。
 ///
 /// 環境変数 `NAROU_RS_KEEP_TXT` (0/false/no/off) が最優先、次に local
-/// 設定 (`convert.keep-txt`)。Worker は D1 を食わないよう **既定 false**
-/// (保存しない)。`download.epub` が保持した設定 map をそのまま渡せる形。
+/// 設定 (`convert.keep-txt`)。解釈は native と共有する
+/// (`narou_rs::setting_core::keep_converted_text`)。Worker は
+/// [`KEEP_CONVERTED_TEXT_DEFAULT`] で保存せず、変換テキストは EPUB の
+/// ダウンロード時に組み立て直す。`download.epub` が保持した設定 map を
+/// そのまま渡せる形。
 pub(crate) fn keep_converted_text_with(
     local: &std::collections::HashMap<String, serde_yaml::Value>,
 ) -> bool {
-    if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
-        let value = value.trim().to_ascii_lowercase();
-        return !matches!(value.as_str(), "0" | "false" | "no" | "off");
-    }
-    match local.get("convert.keep-txt") {
-        Some(serde_yaml::Value::Bool(value)) => *value,
-        Some(serde_yaml::Value::String(value)) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        // 未設定の Worker は保存しない (native は既定 true)。
-        _ => false,
-    }
+    narou_rs::setting_core::keep_converted_text(
+        local,
+        std::env::var("NAROU_RS_KEEP_TXT").ok().as_deref(),
+        KEEP_CONVERTED_TEXT_DEFAULT,
+    )
 }
 
 /// 変換失敗をジョブ結果へ写す。分類は download 経路と同じ共有実装

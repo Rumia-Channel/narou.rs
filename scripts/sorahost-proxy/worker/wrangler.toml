@@ -1,0 +1,8 @@
+name = "narou-relay-local-smoke"
+main = "worker.mjs"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+[dev]
+ip = "127.0.0.1"
+port = 18912

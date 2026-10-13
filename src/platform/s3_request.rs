@@ -11,6 +11,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::error::{NarouError, Result};
+use crate::illustration_store::is_sha256_hex_stem;
 
 use super::object_store::ObjectKey;
 use super::s3_sigv4::{canonical_path, canonical_query};
@@ -71,7 +72,7 @@ impl S3Location {
     /// hex 名でない挿絵は小説ごとの配置を保つ (衝突を避ける)。
     fn illustration_pool_name(filename: &str) -> Option<String> {
         let (stem, ext) = filename.rsplit_once('.')?;
-        if stem.len() != 64 || !stem.chars().all(|c| c.is_ascii_hexdigit()) {
+        if !is_sha256_hex_stem(stem) {
             return None;
         }
         Some(format!("{}.{}", sha256_hex_to_base64url(stem), ext))

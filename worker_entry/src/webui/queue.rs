@@ -48,7 +48,11 @@ pub async fn handle(req: Request, env: worker::Env) -> Result<Response> {
     }
 }
 
-use narou_rs::application::webui::{html_escape, tag_color_class};
+use narou_rs::application::webui::queue_view::{
+    format_update_queue_target, queue_job_payload, queue_running_label, queue_target_fallback_text,
+    queue_type_label,
+};
+use narou_rs::application::webui::tag_views::tag_list_html;
 
 use super::{json_error, query_param};
 use super::metadata::{self, MetadataServices};
@@ -56,7 +60,7 @@ use super::metadata::{self, MetadataServices};
 /// Construct only the D1 session required by ledger reads.
 macro_rules! database_or_503 {
     ($env:expr) => {
-        match metadata::database(&$env) {
+        match metadata::primary_database(&$env) {
             Ok(db) => db,
             Err(error) => {
                 console_log!("D1 composition failed: {error}");
@@ -150,22 +154,11 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         );
     }
 
-    let mut html = String::from(
-        "<div><span class=\"tag-label tag-default tag-reset\" data-tag=\"\">タグ検索を解除</span></div>\
-<div class=\"text-muted\" style=\"font-size:0.8em\">Altキーを押しながらで除外検索</div>",
-    );
-    for tag in &tags {
-        let escaped_tag = html_escape(tag);
-        let class = tag_color_class(
-            tag_colors.get(tag).map(String::as_str).unwrap_or("default"),
-        );
-        html.push_str(&format!(
-            "<div><span class=\"tag-label {}\" data-tag=\"{}\">{}</span> \
-<span class=\"select-color-button\" data-target-tag=\"{}\"><span class=\"tag-label {} tag-fixed-width\">a</span></span></div>",
-            class, escaped_tag, escaped_tag, escaped_tag, class
-        ));
-    }
-    metadata::timed_response(Response::from_html(html)?, "tags", started_ms)
+    metadata::timed_response(
+        Response::from_html(tag_list_html(&tags, &tag_colors))?,
+        "tags",
+        started_ms,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -203,96 +196,36 @@ fn is_pending_status(status: &str) -> bool {
 /// `created_at` is stored as canonical RFC3339; the Web UI expects Unix
 /// seconds (it multiplies by 1000 for `new Date`). Unparseable values map to
 /// JSON null, matching "no timestamp" for the client.
-fn created_at_epoch(created_at: &str) -> serde_json::Value {
-    match chrono::DateTime::parse_from_rfc3339(created_at) {
-        Ok(dt) => json!(dt.timestamp()),
-        Err(_) => serde_json::Value::Null,
-    }
+fn created_at_epoch(created_at: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(created_at)
+        .ok()
+        .map(|dt| dt.timestamp())
 }
 
 fn job_json(row: &ActiveJobRow) -> serde_json::Value {
-    json!({
-        "id": row.job_id.as_str(),
-        "type": display_type(row),
-        "target": row.target.as_str(),
-        "display_target": display_target(row),
-        "created_at": created_at_epoch(&row.created_at),
-    })
+    queue_job_payload(
+        &row.job_id,
+        &display_type(row),
+        &row.target,
+        &display_target(row),
+        created_at_epoch(&row.created_at),
+    )
 }
 
-/// `format_queue_job_type`: the command name when known, else the job type.
-/// The ledger's `kind` column already holds the canonical command string.
-fn display_type(row: &ActiveJobRow) -> &str {
-    &row.kind
+/// 表示用のジョブ種別名。ledger の `kind` がそのまま実行記録のコマンド名
+/// (Worker には legacy cmd が無いので種別の正準名へそのまま写る)。
+fn display_type(row: &ActiveJobRow) -> String {
+    queue_type_label(None, &row.kind)
 }
 
-/// `format_queue_job_target` / `queue_target_fallback_text` parity.
-///
-/// Update jobs describe their effective targets ("ID 3 の小説を更新"); every
-/// other kind falls back to the raw target text with tab-joined components.
+/// `format_queue_job_target` 相当。update だけが対象説明を組み立て、他の種別は
+/// タブ区切りの生ターゲットへフォールバックする (native と同じ選択規則)。
 fn display_target(row: &ActiveJobRow) -> String {
     if row.kind == "update" {
         let options: Vec<String> = serde_json::from_str(&row.options).unwrap_or_default();
-        return format_update_queue_target(&options, &row.target);
+        return format_update_queue_target(&options, None, Some(&row.target));
     }
-    fallback_target_text(&row.target)
-}
-
-/// Native fallback: tab-separated multi-target strings are joined with " / ".
-fn fallback_target_text(target: &str) -> String {
-    target
-        .split('\t')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" / ")
-}
-
-/// `format_update_queue_target`: builds the same label the native queue UI
-/// shows for update jobs. `plan.target` is the effective target list — the
-/// worker stores exactly one normalized target per job, or `*` for
-/// library-wide auto updates.
-fn format_update_queue_target(options: &[String], target: &str) -> String {
-    if options.first().map(String::as_str) == Some("--gl") {
-        return match options.get(1).map(String::as_str) {
-            Some("narou") => "なろうAPIで最新話掲載日を確認".to_string(),
-            Some("other") => "その他サイトの最新話掲載日を確認".to_string(),
-            _ => "最新話掲載日を確認".to_string(),
-        };
-    }
-
-    let force = options.iter().any(|option| option == "--force");
-    let targets: Vec<String> = if target == "*" {
-        Vec::new()
-    } else {
-        target
-            .split('\t')
-            .filter(|part| !part.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-    let target_text = describe_update_targets(&targets);
-    if force {
-        format!("{}を凍結済みも含めて更新", target_text)
-    } else {
-        format!("{}を更新", target_text)
-    }
-}
-
-/// `describe_update_targets` parity.
-fn describe_update_targets(targets: &[String]) -> String {
-    match targets {
-        [] => "全ての小説".to_string(),
-        [target] => {
-            if let Some(tag) = target.strip_prefix("tag:") {
-                format!("タグ「{}」の小説", tag)
-            } else if target.chars().all(|ch| ch.is_ascii_digit()) {
-                format!("ID {} の小説", target)
-            } else {
-                target.to_string()
-            }
-        }
-        _ => format!("{}件の小説", targets.len()),
-    }
+    queue_target_fallback_text(&row.target)
 }
 
 /// One modal snapshot: the FIFO page for `cursor`/`limit` and the
@@ -397,16 +330,14 @@ async fn queue_status(req: Request, env: worker::Env) -> Result<Response> {
             *lane += row.n;
         }
     }
-    let running_label = match running_count {
-        0 => serde_json::Value::Null,
-        1 => {
-            let Some(job) = running.first() else {
-                return json_error(500, "ledger_read_failed", None);
-            };
-            serde_json::Value::String(display_target(job))
-        }
-        n => serde_json::Value::String(format!("{} 件実行中", n)),
-    };
+    let single_running = running.first().map(display_target);
+    if running_count == 1 && single_running.is_none() {
+        return json_error(500, "ledger_read_failed", None);
+    }
+    let running_label = queue_running_label(
+        usize::try_from(running_count).unwrap_or(0),
+        single_running,
+    );
     metadata::timed_response(Response::from_json(&json!({
         "pending": pending_count,
         "completed": completed,

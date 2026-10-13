@@ -202,6 +202,20 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                     .into_bytes(),
             ),
         ),
+        "js/core/notepad.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions("js/core/notepad.js", include_str!("assets/js/core/notepad.js"))
+                    .into_bytes(),
+            ),
+        ),
+        "js/core/sort_state.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions("js/core/sort_state.js", include_str!("assets/js/core/sort_state.js"))
+                    .into_bytes(),
+            ),
+        ),
         "js/core/capabilities.js" => (
             "application/javascript; charset=utf-8",
             Cow::Owned(

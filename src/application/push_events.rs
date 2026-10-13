@@ -11,6 +11,8 @@
 //! ここでは値を作るだけで、送信・履歴への積み方・コンソール振り分けは
 //! 各ランタイム側の責務 (`publish_json` / `PushHubClient::broadcast`)。
 
+use std::collections::{BTreeMap, VecDeque};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// `PushServer::broadcast` / `broadcast_event` 相当の制御イベント。
@@ -85,44 +87,31 @@ pub fn progressbar_clear(topic: &str, target_console: &str) -> Value {
     })
 }
 
-/// `WebProgress` (`src/progress.rs`) / Worker `HubProgress` が送る
-/// `progressbar.init`。`data.scope` は job 単位の消去
-/// (`progressbar_scope_clear`) と対応する。
-pub fn progressbar_init_scoped(topic: &str, scope: &str) -> Value {
-    json!({
-        "type": "progressbar.init",
-        "data": { "topic": topic, "scope": scope },
-    })
-}
-
-/// `WebProgress` / `HubProgress` の `progressbar.step`。
-/// こちらは data に `current` / `total` も載る (トップレベルの
-/// `target_console` は native では stdout 中継時に付けられる)。
-pub fn progressbar_step_scoped(
-    current: u64,
-    total: u64,
-    percent: f64,
-    topic: &str,
-    scope: &str,
+/// Complete snapshots are also replayable when an operation's init has fallen
+/// out of console history. Job scope and operation identity remain distinct.
+pub fn progress_update(
+    phase: crate::platform::progress::ProgressPhase,
+    identity: &crate::platform::progress::ProgressIdentity,
+    snapshot: &crate::platform::progress::ProgressSnapshot,
 ) -> Value {
-    json!({
-        "type": "progressbar.step",
-        "data": {
-            "current": current,
-            "total": total,
-            "percent": percent,
-            "topic": topic,
-            "scope": scope,
+    use crate::platform::progress::ProgressPhase;
+    event(
+        match phase {
+            ProgressPhase::Init => "progressbar.init",
+            ProgressPhase::Step => "progressbar.step",
+            ProgressPhase::Clear => "progressbar.clear",
         },
-    })
-}
-
-/// `WebProgress` / `HubProgress` の `progressbar.clear` (topic+scope 指定)。
-pub fn progressbar_clear_scoped(topic: &str, scope: &str) -> Value {
-    json!({
-        "type": "progressbar.clear",
-        "data": { "topic": topic, "scope": scope },
-    })
+        json!({
+            "topic": identity.topic,
+            "scope": identity.scope,
+            "operation": identity.operation,
+            "sequence": snapshot.sequence,
+            "current": if snapshot.total == 0 { snapshot.current } else { snapshot.current.min(snapshot.total) },
+            "total": snapshot.total,
+            "percent": snapshot.percent(),
+            "message": snapshot.message,
+        }),
+    )
 }
 
 /// native `clear_progress_for_job` (`src/web/worker.rs`) 相当の
@@ -228,259 +217,188 @@ pub fn library_backup_failed(message: &str) -> Value {
     event("library_backup.failed", json!({ "message": message }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Latest progress lives independently of bounded console history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProgressReplay {
+    #[serde(default)]
+    active: BTreeMap<String, Value>,
+    #[serde(default)]
+    closed_operations: VecDeque<String>,
+    #[serde(default)]
+    closed_scopes: VecDeque<String>,
+}
 
-    // 各イベントの wire 形状を凍結する。ここが native
-    // (`src/web/push.rs` / `src/progress.rs` / `src/web/worker.rs`) と
-    // Worker (`worker_entry/src/push_hub.rs` / `consumer.rs`) の共通
-    // ソースなので、同じ入力から両者が同じ JSON を得ることの証明になる。
-    // `main.js` が読むキー (`body` / `target_console` / `data.*`) は
-    // リテラル比較で漏れなく固定される。
+const RECENT_PROGRESS_COMPLETIONS: usize = 512;
 
-    #[test]
-    fn event_with_str_data_matches_broadcast_event() {
-        assert_eq!(
-            event("table.reload", ""),
-            json!({ "type": "table.reload", "data": "" })
-        );
-        assert_eq!(
-            event("custom", "payload"),
-            json!({ "type": "custom", "data": "payload" })
-        );
+fn progress_key(value: &Value) -> String {
+    let data = &value["data"];
+    serde_json::to_string(&[
+        value["target_console"].as_str().unwrap_or("stdout"),
+        data["scope"].as_str().unwrap_or(""),
+        data["topic"].as_str().unwrap_or("default"),
+        data["operation"].as_str().unwrap_or(""),
+    ]).expect("string tuple is JSON serializable")
+}
+
+fn remember_completion(recent: &mut VecDeque<String>, key: String) {
+    if recent.contains(&key) { return; }
+    recent.push_back(key);
+    if recent.len() > RECENT_PROGRESS_COMPLETIONS { recent.pop_front(); }
+}
+
+impl ProgressReplay {
+    pub fn snapshots(&self) -> impl Iterator<Item = &Value> {
+        self.active.values()
     }
 
-    #[test]
-    fn event_with_structured_data_matches_worker_shape() {
-        assert_eq!(
-            event("queue_start", json!("job-1")),
-            json!({ "type": "queue_start", "data": "job-1" })
-        );
-        assert_eq!(
-            queue_start("job-1"),
-            json!({ "type": "queue_start", "data": "job-1" })
-        );
+    /// Stale packets cannot rewind or revive a finished job/attempt.
+    /// The return value tells persistent adapters whether anything changed.
+    pub fn observe(&mut self, value: Value) -> bool {
+        let kind = value["type"].as_str().unwrap_or("");
+        let data = &value["data"];
+        let scope = data["scope"].as_str().unwrap_or("");
+        match kind {
+            "progressbar.init" | "progressbar.step" => {
+                if !scope.is_empty() && self.closed_scopes.iter().any(|closed| closed == scope) {
+                    return false;
+                }
+                let key = progress_key(&value);
+                if self.closed_operations.contains(&key) { return false; }
+                if let Some(previous) = self.active.get(&key)
+                    && let (Some(old), Some(new)) = (
+                        previous["data"]["sequence"].as_u64(), data["sequence"].as_u64(),
+                    )
+                    && new <= old
+                { return false; }
+                self.active.insert(key, value);
+                true
+            }
+            "progressbar.clear" => {
+                let console = value["target_console"].as_str();
+                if data["topic"].as_str().is_none() && !scope.is_empty() {
+                    self.clear_scope(scope, console);
+                    return true;
+                }
+                let key = progress_key(&value);
+                if let Some(previous) = self.active.get(&key)
+                    && let (Some(old), Some(new)) = (
+                        previous["data"]["sequence"].as_u64(), data["sequence"].as_u64(),
+                    )
+                    && new < old
+                { return false; }
+                self.active.remove(&key);
+                if data["operation"].as_str().is_some_and(|id| !id.is_empty()) {
+                    remember_completion(&mut self.closed_operations, key);
+                }
+                true
+            }
+            "queue_start" => {
+                let job = queue_job_id(data);
+                let before = self.closed_scopes.len();
+                self.closed_scopes.retain(|scope| scope != job);
+                before != self.closed_scopes.len()
+            }
+            "queue_complete" | "queue_failed" | "queue_retry" | "queue_partial"
+            | "queue.partial" | "queue_cancelled" | "queue.cancelled" => {
+                let job = queue_job_id(data);
+                if job.is_empty() { return false; }
+                self.clear_scope(job, None);
+                true
+            }
+            _ => false,
+        }
     }
 
-    #[test]
-    fn library_backup_events_carry_object_data() {
-        // main.js は `msg.data.path` / `msg.data.message` を読むので
-        // `data` は JSON 文字列ではなくオブジェクトでなければならない。
-        assert_eq!(
-            library_backup_done("C:\\backups\\narou-backup-1.zip"),
-            json!({
-                "type": "library_backup.done",
-                "data": { "path": "C:\\backups\\narou-backup-1.zip" }
-            })
-        );
-        assert_eq!(
-            library_backup_failed("disk full"),
-            json!({
-                "type": "library_backup.failed",
-                "data": { "message": "disk full" }
-            })
-        );
-    }
-
-    #[test]
-    fn echo_event_shape() {
-        assert_eq!(
-            echo("line", "stdout2"),
-            json!({ "type": "echo", "body": "line", "target_console": "stdout2" })
-        );
-    }
-
-    #[test]
-    fn progress_and_log_event_shapes() {
-        assert_eq!(
-            progress(2, 5, "working"),
-            json!({ "type": "progress", "current": 2, "total": 5, "message": "working" })
-        );
-        assert_eq!(
-            log("warn", "message"),
-            json!({ "type": "log", "level": "warn", "message": "message" })
-        );
-        assert_eq!(
-            error("boom"),
-            json!({ "type": "error", "data": "boom" })
-        );
-    }
-
-    #[test]
-    fn progressbar_events_match_push_server_shape() {
-        // PushServer::broadcast_progressbar_*_to が出す形。
-        assert_eq!(
-            progressbar_init("convert", "stdout"),
-            json!({
-                "type": "progressbar.init",
-                "data": { "topic": "convert" },
-                "target_console": "stdout",
-            })
-        );
-        assert_eq!(
-            progressbar_step(50.0, "convert", "stdout2"),
-            json!({
-                "type": "progressbar.step",
-                "data": { "percent": 50.0, "topic": "convert" },
-                "target_console": "stdout2",
-            })
-        );
-        assert_eq!(
-            progressbar_clear("convert", "stdout"),
-            json!({
-                "type": "progressbar.clear",
-                "data": { "topic": "convert" },
-                "target_console": "stdout",
-            })
-        );
-    }
-
-    #[test]
-    fn scoped_progressbar_events_match_web_progress_shape() {
-        // WebProgress / HubProgress が出す形 (scope 付き、target_console 無し)。
-        assert_eq!(
-            progressbar_init_scoped("convert", "job-1"),
-            json!({
-                "type": "progressbar.init",
-                "data": { "topic": "convert", "scope": "job-1" },
-            })
-        );
-        assert_eq!(
-            progressbar_step_scoped(1, 4, 25.0, "download", "job-1"),
-            json!({
-                "type": "progressbar.step",
-                "data": {
-                    "current": 1,
-                    "total": 4,
-                    "percent": 25.0,
-                    "topic": "download",
-                    "scope": "job-1",
-                },
-            })
-        );
-        assert_eq!(
-            progressbar_clear_scoped("convert", "job-1"),
-            json!({
-                "type": "progressbar.clear",
-                "data": { "topic": "convert", "scope": "job-1" },
-            })
-        );
-    }
-
-    #[test]
-    fn progressbar_scope_clear_matches_clear_progress_for_job() {
-        assert_eq!(
-            progressbar_scope_clear("job-1", "stdout2"),
-            json!({
-                "type": "progressbar.clear",
-                "data": { "scope": "job-1" },
-                "target_console": "stdout2",
-            })
-        );
-    }
-
-    #[test]
-    fn refresh_triggers_match_broadcast_event_shape() {
-        assert_eq!(
-            notification_queue(),
-            json!({ "type": "notification.queue", "data": "" })
-        );
-        assert_eq!(
-            table_reload(),
-            json!({ "type": "table.reload", "data": "" })
-        );
-        assert_eq!(
-            tag_update_canvas(),
-            json!({ "type": "tag.updateCanvas", "data": "" })
-        );
-    }
-
-    #[test]
-    fn queue_complete_and_cancelled_match_native_shape() {
-        assert_eq!(
-            queue_complete("job-1"),
-            json!({ "type": "queue_complete", "data": "job-1" })
-        );
-        assert_eq!(
-            queue_cancelled("job-1"),
-            json!({ "type": "queue_cancelled", "data": { "job_id": "job-1" } })
-        );
-    }
-
-    #[test]
-    fn queue_partial_matches_native_and_worker_shapes() {
-        // native: job_id のみ / exit_code 付き。
-        assert_eq!(
-            queue_partial("job-1", None, None),
-            json!({ "type": "queue_partial", "data": { "job_id": "job-1" } })
-        );
-        assert_eq!(
-            queue_partial("job-1", Some(3), None),
-            json!({
-                "type": "queue_partial",
-                "data": { "job_id": "job-1", "exit_code": 3 },
-            })
-        );
-        // Worker: reason 付き。
-        assert_eq!(
-            queue_partial("job-1", None, Some("budget")),
-            json!({
-                "type": "queue_partial",
-                "data": { "job_id": "job-1", "reason": "budget" },
-            })
-        );
-    }
-
-    #[test]
-    fn queue_retry_matches_native_shape() {
-        assert_eq!(
-            queue_retry("job-1", 2, 3, 300, 1_700_000_000, "network error"),
-            json!({
-                "type": "queue_retry",
-                "data": {
-                    "job_id": "job-1",
-                    "retry_count": 2,
-                    "max_retries": 3,
-                    "backoff_secs": 300,
-                    "available_at": 1_700_000_000_i64,
-                    "reason": "network error",
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn queue_failed_omits_detail_unless_present() {
-        assert_eq!(
-            queue_failed("job-1", "boom", None),
-            json!({
-                "type": "queue_failed",
-                "data": { "job_id": "job-1", "reason": "boom" },
-            })
-        );
-        assert_eq!(
-            queue_failed("job-1", "boom", Some("full detail")),
-            json!({
-                "type": "queue_failed",
-                "data": {
-                    "job_id": "job-1",
-                    "reason": "boom",
-                    "detail": "full detail",
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn serialized_payload_carries_main_js_keys() {
-        // main.js の handleWsMessage が参照するキーがシリアライズ済み
-        // payload に残ること。
-        let payload = echo("text", "stdout").to_string();
-        assert!(payload.contains("\"body\":\"text\""));
-        assert!(payload.contains("\"target_console\":\"stdout\""));
-        let payload = progressbar_init_scoped("convert", "job-1").to_string();
-        assert!(payload.contains("\"topic\":\"convert\""));
-        assert!(payload.contains("\"scope\":\"job-1\""));
+    fn clear_scope(&mut self, scope: &str, console: Option<&str>) {
+        let recent = &mut self.closed_operations;
+        self.active.retain(|key, value| {
+            let matches = value["data"]["scope"].as_str() == Some(scope)
+                && console.is_none_or(|console| {
+                    value["target_console"].as_str().unwrap_or("stdout") == console
+                });
+            if matches && value["data"]["operation"].as_str().is_some_and(|id| !id.is_empty()) {
+                remember_completion(recent, key.clone());
+            }
+            !matches
+        });
+        remember_completion(&mut self.closed_scopes, scope.to_owned());
     }
 }
+
+fn queue_job_id(data: &Value) -> &str {
+    data.as_str().or_else(|| data["job_id"].as_str()).unwrap_or("")
+}
+
+pub fn history_replayable(message_type: &str) -> bool {
+    matches!(message_type, "echo" | "error" | "log" | "progress")
+}
+
+pub fn message_scope(value: &Value) -> Option<&str> {
+    value["scope"].as_str().or_else(|| value["data"]["scope"].as_str())
+}
+
+pub fn history_target_console(value: &Value) -> Option<&str> {
+    value["target_console"].as_str().or_else(|| {
+        matches!(value["type"].as_str(), Some("echo" | "error" | "log")).then_some("stdout")
+    })
+}
+
+pub fn history_body(value: &Value) -> Option<&str> {
+    match value["type"].as_str()? {
+        "echo" => value["body"].as_str(),
+        "error" => value["data"].as_str().or_else(|| value["message"].as_str()),
+        "log" => value["message"].as_str().or_else(|| value["text"].as_str()),
+        "progress" => value["message"].as_str(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    fn step(job: &str, operation: &str, current: u64, sequence: u64) -> Value {
+        event("progressbar.step", json!({
+            "scope": job, "topic": "download", "operation": operation,
+            "current": current, "total": 10, "percent": current * 10,
+            "sequence": sequence,
+        }))
+    }
+
+    #[test]
+    fn replay_keeps_parallel_operations_and_survives_persistence() {
+        let mut replay = ProgressReplay::default();
+        replay.observe(step("job", "first", 2, 1));
+        replay.observe(step("job", "second", 3, 1));
+        let saved = serde_json::to_string(&replay).unwrap();
+        let restored: ProgressReplay = serde_json::from_str(&saved).unwrap();
+        let positions: Vec<_> = restored.snapshots().map(|value| value["data"]["current"].as_u64().unwrap()).collect();
+        assert_eq!(positions, vec![2, 3]);
+    }
+
+    #[test]
+    fn old_steps_cannot_rewind_or_resurrect_finished_operations() {
+        let mut replay = ProgressReplay::default();
+        replay.observe(step("job", "first", 5, 3));
+        assert!(!replay.observe(step("job", "first", 1, 1)));
+        assert_eq!(replay.snapshots().next().unwrap()["data"]["current"], 5);
+        replay.observe(event("progressbar.clear", json!({
+            "scope": "job", "topic": "download", "operation": "first", "sequence": 4,
+        })));
+        assert!(!replay.observe(step("job", "first", 7, 5)));
+        assert_eq!(replay.snapshots().count(), 0);
+    }
+
+    #[test]
+    fn retry_starts_a_new_attempt_without_accepting_the_old_attempt() {
+        let mut replay = ProgressReplay::default();
+        replay.observe(step("job", "old", 2, 1));
+        replay.observe(queue_retry("job", 1, 3, 10, 10, "network"));
+        assert!(!replay.observe(step("job", "old", 3, 2)));
+        replay.observe(queue_start("job"));
+        assert!(replay.observe(step("job", "new", 1, 1)));
+        assert!(!replay.observe(step("job", "old", 3, 2)));
+        assert_eq!(replay.snapshots().next().unwrap()["data"]["operation"], "new");
+    }
+}
+

@@ -258,15 +258,31 @@ impl PersistenceService {
             .await
     }
 
+    /// Return `false` when the previous section no longer exists. Asset moves
+    /// may be idempotent on a missing source; that is not a cached version.
     pub async fn move_section_to_cache(
         &self,
         keys: &NovelObjectKeys,
         timestamp: &str,
         subtitle: &SubtitleInfo,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let source = keys.section(&subtitle.index, &subtitle.file_subtitle);
+        if !self.objects.exists(&source).await? {
+            return Ok(false);
+        }
         let destination = keys.cached_section(timestamp, &subtitle.index, &subtitle.file_subtitle);
-        self.assets.move_or_copy(&source, &destination).await
+        self.assets.move_or_copy(&source, &destination).await?;
+        Ok(true)
+    }
+
+    /// Record a persisted version after its first successful section move, or
+    /// explicitly record an empty version after a completed latest-only update.
+    pub async fn record_cache_version(
+        &self,
+        keys: &NovelObjectKeys,
+        timestamp: &str,
+    ) -> Result<()> {
+        self.objects.write_small(&keys.cached_version_marker(timestamp), Vec::new()).await
     }
 
     /// Write `setting.ini` / `replace.txt` defaults for files that do not yet
@@ -287,21 +303,34 @@ impl PersistenceService {
             None => self.objects.stat(&keys.setting()).await?.is_some(),
         };
         if !setting_exists {
-            self.objects
-                .write_small(&keys.setting(), default_setting_ini().into_bytes())
-                .await?;
+            let content = default_setting_ini();
+            let mut mutate = |current: Option<&[u8]>| {
+                Ok(current.is_none().then_some(std::borrow::Cow::Borrowed(content.as_bytes())))
+            };
+            match self.objects.update_small(&keys.setting(), &mut mutate).await? {
+                crate::platform::ObjectUpdateResult::Committed => {}
+                crate::platform::ObjectUpdateResult::ProjectionFailed(error) => return Err(error),
+                crate::platform::ObjectUpdateResult::Conflict => {
+                    return Err(crate::error::NarouError::Platform("setting.ini initialization conflicted".into()));
+                }
+            }
         }
         let replace_exists = match existing_names {
             Some(names) => names.contains("replace.txt"),
             None => self.objects.stat(&keys.replace()).await?.is_some(),
         };
         if !replace_exists {
-            self.objects
-                .write_small(
-                    &keys.replace(),
-                    default_replace_txt(title, author, toc_url).into_bytes(),
-                )
-                .await?;
+            let content = default_replace_txt(title, author, toc_url);
+            let mut mutate = |current: Option<&[u8]>| {
+                Ok(current.is_none().then_some(std::borrow::Cow::Borrowed(content.as_bytes())))
+            };
+            match self.objects.update_small(&keys.replace(), &mut mutate).await? {
+                crate::platform::ObjectUpdateResult::Committed => {}
+                crate::platform::ObjectUpdateResult::ProjectionFailed(error) => return Err(error),
+                crate::platform::ObjectUpdateResult::Conflict => {
+                    return Err(crate::error::NarouError::Platform("replace.txt initialization conflicted".into()));
+                }
+            }
         }
         Ok(())
     }
@@ -437,6 +466,40 @@ mod tests {
             subupdate: None,
             download_time: None,
         }
+    }
+
+    #[test]
+    fn cache_persistence_distinguishes_missing_sections_and_explicit_empty_versions() {
+        use crate::application::webui::diff::{plan_diff_cache_clean, read_diff_cache_catalog};
+
+        let store = Arc::new(MemoryObjectStore::new());
+        let service = PersistenceService::new(store.clone(), store.clone());
+        let keys = NovelObjectKeys::new("site", "title", false).unwrap();
+        let subtitle = subtitle();
+        futures::executor::block_on(async {
+            assert!(!service.move_section_to_cache(&keys, "missing", &subtitle).await.unwrap());
+            assert!(plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap().is_empty());
+            service.record_cache_version(&keys, "empty").await.unwrap();
+            let empty = read_diff_cache_catalog(store.as_ref(), keys.prefix(), &[]).await.unwrap();
+            assert_eq!(empty.len(), 1);
+            assert_eq!(empty[0].version, "empty");
+            assert!(empty[0].only_latest_update);
+
+            let section = section_file(&subtitle, "previous body");
+            service.save_section(&keys, &subtitle, &section.element).await.unwrap();
+            assert!(service.move_section_to_cache(&keys, "snapshot", &subtitle).await.unwrap());
+            service.record_cache_version(&keys, "snapshot").await.unwrap();
+            assert!(service.load_section(&keys, &subtitle).await.unwrap().is_none());
+            let cached = store.read_small(&keys.cached_section("snapshot", "1", &subtitle.file_subtitle))
+                .await.unwrap().unwrap();
+            assert_eq!(serde_yaml::from_slice::<SectionFile>(&cached).unwrap().element.body, "previous body");
+            let versions = read_diff_cache_catalog(store.as_ref(), keys.prefix(), &[]).await.unwrap();
+            assert_eq!(versions.len(), 2);
+            assert_eq!(versions[0].version, "snapshot");
+            assert!(!versions[0].only_latest_update);
+            assert_eq!(versions[0].entries, vec![("1".to_string(), "第一話".to_string())]);
+            assert!(store.read_small(&keys.cached_version_marker("missing")).await.unwrap().is_none());
+        });
     }
 
     #[test]

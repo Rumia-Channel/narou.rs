@@ -150,7 +150,7 @@ fn open_upgrades_v6_library_without_data_loss() {
 
     // The upgrade path every existing library takes on next launch.
     let conn = narou_rs::native::sqlite::open(&db_path).unwrap();
-    let conn = conn.lock().unwrap();
+    let conn = conn.lock();
 
     let novels: Vec<(i64, String, i64, String, String, i64)> = conn
         .prepare(
@@ -245,7 +245,7 @@ fn open_upgrades_v8_objects_without_losing_db_only_rows() {
     let conn = v8_objects_database(&db_path);
     // A body that exists only in the database (the mirror is disabled).
     let store = narou_rs::native::sqlite::object_store::SqliteObjectStore::with_mirror_files(
-        std::sync::Arc::new(std::sync::Mutex::new(conn)),
+        std::sync::Arc::new(parking_lot::Mutex::new(conn)),
         narou_rs::native::object_store::NativeObjectStore::from_root(archive_root.clone()).unwrap(),
         false,
     );
@@ -258,7 +258,7 @@ fn open_upgrades_v8_objects_without_losing_db_only_rows() {
 
     // The upgrade path every library takes on next launch.
     let conn = narou_rs::native::sqlite::open(&db_path).unwrap();
-    let guard = conn.lock().unwrap();
+    let guard = conn.lock();
     let version: i64 = guard
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();

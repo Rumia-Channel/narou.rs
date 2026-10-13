@@ -49,6 +49,12 @@ pub trait DownloaderSettings: Send + Sync {
         true
     }
 
+    /// Whether prior-section snapshots and completed empty cache versions are
+    /// retained. `economy: nosave_diff` disables both on every runtime.
+    fn save_diff_snapshots(&self) -> bool {
+        true
+    }
+
     /// Whether the novel's `setting.ini` strips bracketed title prefixes
     /// (`enable_strip_title_prefix`). Worker: no converter settings on disk,
     /// so `false`.
@@ -124,6 +130,7 @@ pub struct SnapshotDownloaderSettings {
     local: HashMap<String, bool>,
     over18: Option<bool>,
     section_hash_cache: HashMap<String, HashMap<String, String>>,
+    nosave_diff: bool,
     /// Worker の書き戻し先。`save_section_hash_cache` は同期 API なので
     /// 呼び出し側が非同期で書き戻せるよう、最新のキャッシュをここへ置く。
     /// `None` (= 未配線) のときは従来どおり no-op。
@@ -141,8 +148,22 @@ impl SnapshotDownloaderSettings {
             local,
             over18,
             section_hash_cache,
+            nosave_diff: false,
             pending_section_hash_cache: None,
         }
+    }
+
+    /// Inject the portable diff-retention rule from the local settings row.
+    /// Both native list and legacy comma-separated economy values are accepted.
+    pub fn with_economy(mut self, economy: Option<&serde_yaml::Value>) -> Self {
+        self.nosave_diff = match economy {
+            Some(serde_yaml::Value::Sequence(values)) =>
+                values.iter().any(|value| value.as_str() == Some("nosave_diff")),
+            Some(serde_yaml::Value::String(value)) =>
+                value.split(',').any(|item| item.trim() == "nosave_diff"),
+            _ => false,
+        };
+        self
     }
 
     /// ジョブ終了時に呼び出し側が drain する書き戻しスロットを配線する
@@ -164,6 +185,10 @@ impl DownloaderSettings for SnapshotDownloaderSettings {
     /// Worker は生データを保存しない (`economy` の設定に関わらず常に false)。
     fn save_raw_html(&self) -> bool {
         false
+    }
+
+    fn save_diff_snapshots(&self) -> bool {
+        !self.nosave_diff
     }
 
     fn global_setting_optional_bool(&self, key: &str) -> Option<bool> {
@@ -242,6 +267,12 @@ impl DownloaderSettings for NativeDownloaderSettings {
         !crate::compat::load_local_setting_list("economy")
             .iter()
             .any(|value| value == "nosave_raw")
+    }
+
+    fn save_diff_snapshots(&self) -> bool {
+        !crate::compat::load_local_setting_list("economy")
+            .iter()
+            .any(|value| value == "nosave_diff")
     }
 
     fn strip_title_prefix_for(&self, novel_id: i64, raw_title: &str, author: &str) -> bool {

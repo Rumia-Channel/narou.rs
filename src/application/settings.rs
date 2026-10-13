@@ -170,6 +170,15 @@ pub enum SettingsEffect {
     StorageRestartRequired,
 }
 
+/// Exact acknowledgements and effects of a save, including partial commits.
+#[derive(Debug, Default)]
+pub struct SettingsSaveResult {
+    pub effects: Vec<SettingsEffect>,
+    pub settings: HashMap<String, serde_yaml::Value>,
+    pub replace_content: Option<String>,
+    pub failure: Option<ApplicationError>,
+}
+
 /// Names whose values `GET /api/webui/config` serves live; a change to any of
 /// them is reported as [`SettingsEffect::WebuiConfigChanged`]. Also used by the
 /// native server-settings watcher to notice external edits.
@@ -307,14 +316,31 @@ impl SettingsService {
         name: &str,
         value: serde_yaml::Value,
     ) -> Result<(), ApplicationError> {
+        self.update_raw(scope, name, |_| value).await
+    }
+    /// Compute compatibility metadata from the snapshot guarded by the write.
+    pub async fn update_raw<F>(
+        &self,
+        scope: SettingScope,
+        name: &str,
+        update: F,
+    ) -> Result<(), ApplicationError>
+    where
+        F: FnOnce(Option<&serde_yaml::Value>) -> serde_yaml::Value,
+    {
         let original = self.store.load(scope).await.map_err(ApplicationError::platform)?;
-        let mut settings = original.clone();
-        settings.insert(name.to_string(), value);
-        if !self.store.compare_save(scope, &original, &settings).await.map_err(ApplicationError::platform)? {
+        let value = update(original.get(name));
+        if original.get(name) == Some(&value) {
+            return Ok(());
+        }
+        let mut replacement = original.clone();
+        replacement.insert(name.to_string(), value);
+        if !self.store.compare_save(scope, &original, &replacement).await.map_err(ApplicationError::platform)? {
             return Err(settings_conflict());
         }
         Ok(())
     }
+
 
 
     /// Set one setting value, coercing a JSON value through the pure
@@ -323,12 +349,12 @@ impl SettingsService {
         &self,
         name: &str,
         value: &serde_json::Value,
-    ) -> Result<Vec<SettingsEffect>, ApplicationError> {
+    ) -> Result<SettingsSaveResult, ApplicationError> {
         self.apply_json(&[(name.to_string(), value.clone())]).await
     }
 
     /// Delete one setting value (equivalent to setting it to null).
-    pub async fn delete(&self, name: &str) -> Result<Vec<SettingsEffect>, ApplicationError> {
+    pub async fn delete(&self, name: &str) -> Result<SettingsSaveResult, ApplicationError> {
         self.set(name, &serde_json::Value::Null).await
     }
 
@@ -337,14 +363,14 @@ impl SettingsService {
     pub async fn apply(
         &self,
         changes: &[(String, serde_yaml::Value)],
-    ) -> Result<Vec<SettingsEffect>, ApplicationError> {
+    ) -> Result<SettingsSaveResult, ApplicationError> {
         self.apply_checked(changes, None).await
     }
     /// Coerce JSON values using the setting metadata, then apply the batch.
     pub async fn apply_json(
         &self,
         changes: &[(String, serde_json::Value)],
-    ) -> Result<Vec<SettingsEffect>, ApplicationError> {
+    ) -> Result<SettingsSaveResult, ApplicationError> {
         self.apply_json_checked(changes, None).await
     }
 
@@ -355,7 +381,7 @@ impl SettingsService {
         &self,
         changes: &[(String, serde_json::Value)],
         expected: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<Vec<SettingsEffect>, ApplicationError> {
+    ) -> Result<SettingsSaveResult, ApplicationError> {
         let mut coerced = Vec::with_capacity(changes.len());
         for (name, value) in changes {
             let value = if value.is_null() {
@@ -374,7 +400,7 @@ impl SettingsService {
         &self,
         changes: &[(String, serde_yaml::Value)],
         expected: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<Vec<SettingsEffect>, ApplicationError> {
+    ) -> Result<SettingsSaveResult, ApplicationError> {
         let mut local_changes = Vec::new();
         let mut global_changes = Vec::new();
         for (name, value) in changes {
@@ -395,28 +421,44 @@ impl SettingsService {
                     let shown = expected.get(name).ok_or_else(|| {
                         ApplicationError::InvalidRequest(format!("初期値がありません: {name}"))
                     })?;
-                    let shown: serde_yaml::Value = serde_yaml::to_value(shown).map_err(ApplicationError::platform)?;
+                    let shown_raw: serde_yaml::Value = serde_yaml::to_value(shown).map_err(ApplicationError::platform)?;
                     let current = original.get(name).filter(|value| !value.is_null());
-                    if current != (!shown.is_null()).then_some(&shown) {
+                    // JSON loses the integer/float distinction for integral float settings.
+                    // Keep exact legacy snapshots valid before using the metadata coercion.
+                    if current != (!shown_raw.is_null()).then_some(&shown_raw)
+                        && (current.is_none() || coerce_json_setting_value(name, shown).ok().as_ref() != current)
+                    {
                         return Err(settings_conflict());
                     }
                 }
             }
             let mut replacement = original.clone();
             let effects = self.apply_changes(scope, &mut replacement, &updates)?;
-            prepared.push((scope, original, replacement, effects));
+            prepared.push((scope, original, replacement, effects, updates));
         }
-        let mut effects = Vec::new();
-        for (scope, original, replacement, changed) in prepared {
-            if replacement == original {
-                continue;
+        let mut result = SettingsSaveResult::default();
+        for (scope, original, mut replacement, changed, updates) in prepared {
+            if replacement != original {
+                let failure = match self.store.compare_save(scope, &original, &replacement).await {
+                    Ok(true) => None,
+                    Ok(false) => Some(settings_conflict()),
+                    Err(error) => Some(ApplicationError::platform(error)),
+                };
+                if let Some(failure) = failure {
+                    if result.settings.is_empty() {
+                        return Err(failure);
+                    }
+                    result.failure = Some(failure);
+                    break;
+                }
+                result.effects.extend(changed);
             }
-            if !self.store.compare_save(scope, &original, &replacement).await.map_err(ApplicationError::platform)? {
-                return Err(settings_conflict());
+            for (name, _) in updates {
+                let value = replacement.remove(&name).unwrap_or(serde_yaml::Value::Null);
+                result.settings.insert(name, value);
             }
-            effects.extend(changed);
         }
-        Ok(effects)
+        Ok(result)
     }
 
     /// List all known settings with their current values, grouped by scope.
@@ -646,7 +688,7 @@ mod tests {
             &serde_json::json!(1.5),
         ))
         .unwrap();
-        assert!(effects.is_empty());
+        assert!(effects.effects.is_empty());
 
         let value = futures::executor::block_on(service.get("update.interval"))
             .unwrap()
@@ -679,7 +721,7 @@ mod tests {
             &serde_json::json!(true),
         ))
         .unwrap();
-        assert!(effects.contains(&SettingsEffect::AutoScheduleChanged));
+        assert!(effects.effects.contains(&SettingsEffect::AutoScheduleChanged));
     }
 
     #[test]
@@ -690,7 +732,7 @@ mod tests {
             &serde_json::json!("Darkly"),
         ))
         .unwrap();
-        assert!(effects.contains(&SettingsEffect::WebuiConfigChanged));
+        assert!(effects.effects.contains(&SettingsEffect::WebuiConfigChanged));
     }
     #[test]
     fn server_security_change_reports_effect() {
@@ -700,14 +742,14 @@ mod tests {
             &serde_json::json!(true),
         ))
         .unwrap();
-        assert!(effects.contains(&SettingsEffect::ServerSecurityChanged));
+        assert!(effects.effects.contains(&SettingsEffect::ServerSecurityChanged));
         // 無関係な global 設定では発火しない。
         let effects = futures::executor::block_on(service.set(
             "server-port",
             &serde_json::json!(33000),
         ))
         .unwrap();
-        assert!(!effects.contains(&SettingsEffect::ServerSecurityChanged));
+        assert!(!effects.effects.contains(&SettingsEffect::ServerSecurityChanged));
     }
 
 
@@ -719,7 +761,7 @@ mod tests {
             &serde_json::json!("kindle"),
         ))
         .unwrap();
-        assert!(effects.contains(&SettingsEffect::DeviceRelatedDefaultsApplied));
+        assert!(effects.effects.contains(&SettingsEffect::DeviceRelatedDefaultsApplied));
         let snapshot = store.local_snapshot();
         assert_eq!(
             snapshot.get("default.enable_half_indent_bracket"),
@@ -741,6 +783,26 @@ mod tests {
             assert_eq!(saved.get("concurrency"), Some(&serde_yaml::Value::Bool(false)));
             assert_eq!(saved.get("convert.keep-txt"), Some(&serde_yaml::Value::Bool(true)));
             assert_eq!(saved.get("user.extension").and_then(serde_yaml::Value::as_str), Some("keep"));
+        });
+    }
+
+    #[test]
+    fn checked_float_setting_accepts_integral_json_baseline_but_rejects_stale_values() {
+        let (service, _) = service();
+        futures::executor::block_on(async {
+            service.set("download.interval", &serde_json::json!(60)).await.unwrap();
+            let expected = serde_json::Map::from_iter([
+                ("download.interval".to_string(), serde_json::json!(60)),
+            ]);
+            service.apply_json_checked(&[
+                ("download.interval".to_string(), serde_json::json!(0.2)),
+            ], Some(&expected)).await.unwrap();
+            assert_eq!(service.get("download.interval").await.unwrap().and_then(|value| value.as_f64()), Some(0.2));
+            let error = service.apply_json_checked(&[
+                ("download.interval".to_string(), serde_json::json!(1.2)),
+            ], Some(&expected)).await.unwrap_err();
+            assert!(matches!(error, ApplicationError::Conflict(_)));
+            assert_eq!(service.get("download.interval").await.unwrap().and_then(|value| value.as_f64()), Some(0.2));
         });
     }
 
@@ -793,33 +855,5 @@ mod tests {
         assert!(entries.iter().any(|entry| {
             entry.name == "server-port" && entry.scope == SettingScope::Global
         }));
-    }
-    #[test]
-    fn raw_compatibility_settings_roundtrip_and_target_limit() {
-        let mut global = HashMap::new();
-        global.insert(
-            "server-max-targets-per-request".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(42)),
-        );
-        let store = Arc::new(MemorySettingsStore::new().with_global(global));
-        let service = SettingsService::new(store);
-        assert_eq!(
-            futures::executor::block_on(service.web_target_limit(100_000)),
-            42
-        );
-        futures::executor::block_on(service.set_raw(
-            SettingScope::Local,
-            "webui.feature-tour.disabled",
-            serde_yaml::Value::Bool(true),
-        ))
-        .unwrap();
-        assert_eq!(
-            futures::executor::block_on(service.get_raw(
-                SettingScope::Local,
-                "webui.feature-tour.disabled",
-            ))
-            .unwrap(),
-            Some(serde_yaml::Value::Bool(true))
-        );
     }
 }

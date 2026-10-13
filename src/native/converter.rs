@@ -21,7 +21,7 @@ fn native_http_and_rate_limiter() -> Option<(
     let user_agent = ua_generator::ua::spoof_firefox_ua().to_string();
     let http: Arc<dyn crate::platform::HttpClient> =
         Arc::new(NativeHttpClient::new(&user_agent).ok()?);
-    let rate_limiter: Arc<dyn crate::platform::RateLimiter> = Arc::new(RateLimiter::new(false));
+    let rate_limiter: Arc<dyn crate::platform::RateLimiter> = Arc::new(RateLimiter::new());
     Some((http, rate_limiter))
 }
 

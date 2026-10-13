@@ -1,9 +1,9 @@
 //! Native SQLite storage engine (P1 of the SQLite migration plan).
 //!
-//! SQL semantics mirror the Worker D1 adapter exactly (same WHERE building,
-//! sort expressions, status materialization, sequence allocation). The novel
-//! record codec — column lists, bind values, upsert/select SQL — lives in
-//! `crate::db::novel_codec`, shared with the Worker so they cannot drift.
+//! Statements come from `crate::db::novel_query` and the record codec from
+//! `crate::db::novel_codec` — both shared with the Worker D1 adapter, so the
+//! WHERE/sort/status/sequence rules cannot drift; this module supplies the
+//! connection handling and the driver bind conversions.
 //!
 //! Connection policy: WAL journal, `busy_timeout = 5s`, `foreign_keys = ON`.
 //! Every trait call runs on a blocking thread (`tokio::task::spawn_blocking`)
@@ -17,14 +17,14 @@ pub mod versions;
 pub mod object_store;
 mod migrations;
 pub mod state;
-mod query;
 mod record_map;
 mod repository;
 
 pub use repository::{SqliteFreezeStore, SqliteNovelRepository};
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::Connection;
 
 use crate::error::{NarouError, Result};

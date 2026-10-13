@@ -225,7 +225,10 @@ fn ask_line_height(settings: &std::collections::HashMap<String, serde_yaml::Valu
     println!("1em = 1文字分の高さ");
     println!("行の高さ＝1文字分の高さ＋行間の高さ");
     println!("オススメは 1.8");
-    println!("(未入力で {} を採用)", format_line_height(default));
+    println!(
+        "(未入力で {} を採用)",
+        narou_rs::converter::settings::format_line_height(default)
+    );
 
     loop {
         print!(">");
@@ -299,7 +302,10 @@ fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> 
     )?;
 
     let vertical_font = std::fs::read_to_string(preset_dir.join("vertical_font.css"))?
-        .replace("<%= line_height %>", &format_line_height(line_height));
+        .replace(
+            "<%= line_height %>",
+            &narou_rs::converter::settings::format_line_height(line_height),
+        );
     let vertical_font_path = aozora_dir
         .join("template")
         .join("OPS")
@@ -335,19 +341,6 @@ fn preset_dir() -> Result<PathBuf> {
             )
             .into()
         })
-}
-
-fn format_line_height(line_height: f64) -> String {
-    let mut text = line_height.to_string();
-    if text.contains('.') {
-        while text.ends_with('0') {
-            text.pop();
-        }
-        if text.ends_with('.') {
-            text.pop();
-        }
-    }
-    text
 }
 
 fn normalize_path_string(path: &str) -> String {

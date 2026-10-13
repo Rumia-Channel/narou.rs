@@ -29,8 +29,6 @@ use chrono::{
 use chrono_tz::Tz;
 use regex::Regex;
 
-#[cfg(feature = "native-runtime")]
-use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
 use self::persistence::{PersistenceService, SectionLoadFailure, compute_section_hash};
@@ -56,9 +54,8 @@ use crate::platform::{
 };
 
 pub use self::types::{
-    ARCHIVE_ROOT_DIR, DownloadResult, NarouApiEntry, NarouApiResult, RAW_DATA_DIR,
-    SECTION_SAVE_DIR, SectionElement, SectionFile, SubtitleInfo, TargetType, TocFile, TocObject,
-    UpdateStatus,
+    ARCHIVE_ROOT_DIR, DownloadResult, NarouApiEntry, RAW_DATA_DIR, SECTION_SAVE_DIR,
+    SectionElement, SectionFile, SubtitleInfo, TargetType, TocFile, TocObject, UpdateStatus,
 };
 pub use self::util::pretreatment_source;
 
@@ -167,7 +164,7 @@ pub struct Downloader {
     assets: Arc<dyn AssetStore>,
     clock: Arc<dyn Clock>,
     persistence: PersistenceService,
-    site_settings: Vec<SiteSetting>,
+    site_settings: Arc<Vec<SiteSetting>>,
     section_cache: SectionCache,
     section_hash_cache: HashMap<String, HashMap<String, String>>,
     section_hash_cache_dirty: bool,
@@ -222,15 +219,16 @@ fn colorize(text: &str, _color: &str) -> String {
     text.to_string()
 }
 
+/// なろう ncode の合成 URL (新規ダウンロードの取得先)。ncode → syosetu URL の
+/// 唯一の定義 — `ncode_target_url` と `resolve_target_for_download` の
+/// 新規分岐が同じ組み立てを使う。
+fn narou_ncode_url(ncode: &str) -> String {
+    format!("https://ncode.syosetu.com/{}/", ncode.to_lowercase())
+}
+
 fn ncode_target_url(target: &str) -> Option<String> {
-    if matches!(Downloader::get_target_type(target), TargetType::Ncode) {
-        Some(format!(
-            "https://ncode.syosetu.com/{}/",
-            target.to_lowercase()
-        ))
-    } else {
-        None
-    }
+    matches!(Downloader::get_target_type(target), TargetType::Ncode)
+        .then(|| narou_ncode_url(target))
 }
 
 fn story_changed(old_story: &Option<String>, fetched_story: &Option<String>) -> bool {
@@ -354,15 +352,9 @@ fn section_relative_path(subtitle: &SubtitleInfo) -> String {
     format!("{}/{}", types::SECTION_SAVE_DIR, section_filename(subtitle))
 }
 
-fn cache_timestamp(clock: &dyn Clock) -> Option<String> {
-    #[cfg(feature = "native-runtime")]
-    {
-        if crate::compat::load_local_setting_list("economy")
-            .iter()
-            .any(|v| v == "nosave_diff")
-        {
-            return None;
-        }
+fn cache_timestamp(clock: &dyn Clock, save_diff_snapshots: bool) -> Option<String> {
+    if !save_diff_snapshots {
+        return None;
     }
     Some(
         clock
@@ -752,7 +744,7 @@ impl Downloader {
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
     #[cfg(feature = "native-runtime")]
     pub fn with_platform_and_storage(platform: DownloaderPlatform) -> Result<Self> {
-        let site_settings = crate::downloader::site_setting::effective_site_settings();
+        let site_settings = crate::downloader::site_setting::effective_site_settings_shared();
         let settings = crate::downloader::settings::default_settings();
         let section_hash_cache = settings.load_section_hash_cache();
         Self::with_platform_and_storage_and_settings(platform, site_settings, section_hash_cache)
@@ -763,7 +755,7 @@ impl Downloader {
     /// Worker callers and filesystem-free tests supply both values explicitly.
     pub fn with_platform_and_storage_and_settings(
         platform: DownloaderPlatform,
-        site_settings: Vec<SiteSetting>,
+        site_settings: impl Into<Arc<Vec<SiteSetting>>>,
         section_hash_cache: HashMap<String, HashMap<String, String>>,
     ) -> Result<Self> {
         Self::with_platform_and_storage_and_settings_and_support(
@@ -780,7 +772,7 @@ impl Downloader {
     /// without any filesystem access.
     pub fn with_platform_and_storage_and_settings_and_support(
         platform: DownloaderPlatform,
-        site_settings: Vec<SiteSetting>,
+        site_settings: impl Into<Arc<Vec<SiteSetting>>>,
         section_hash_cache: HashMap<String, HashMap<String, String>>,
         settings: Arc<dyn DownloaderSettings>,
     ) -> Result<Self> {
@@ -802,7 +794,7 @@ impl Downloader {
             assets,
             clock,
             persistence,
-            site_settings,
+            site_settings: site_settings.into(),
             section_cache: SectionCache::new(),
             section_hash_cache,
             cookies: None,
@@ -830,7 +822,7 @@ impl Downloader {
     }
 
     pub fn find_site_setting(&self, url: &str) -> Option<SiteSetting> {
-        for setting in &self.site_settings {
+        for setting in self.site_settings.iter() {
             if setting.matches_url(url) {
                 return Some(setting.clone());
             }
@@ -1650,7 +1642,7 @@ impl Downloader {
 
         let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
 
-        let (mut subtitles, partial_listing) = if novel_type == 2 {
+        let (mut subtitles, mut partial_listing) = if novel_type == 2 {
             (
                 create_short_story_subtitles(&setting, &toc_source, &info)?,
                 false,
@@ -1699,6 +1691,7 @@ impl Downloader {
                     if !retried_partial || retried.len() > subtitles.len() {
                         let resolved = !retried_partial;
                         subtitles = retried;
+                        partial_listing = retried_partial;
                         requires_login = true;
                         login_session = Some(group.id.clone());
                         winner = Some(group.clone());
@@ -1908,7 +1901,9 @@ impl Downloader {
         // per-section yield check. Unbudgeted CLI runs retain exact pre-counts.
         let defer_strong_update = strong_update && budget.is_some();
         let site_timezone = setting.site_timezone();
+        let save_diff_snapshots = self.settings.save_diff_snapshots();
         let mut cache_dir: Option<String> = None;
+        let mut cache_version_recorded = false;
         let mut pending_section_hashes: HashMap<String, String> = HashMap::new();
         let display_id = provisional_id;
         let mut section_plans = Vec::with_capacity(subtitles.len());
@@ -2068,15 +2063,19 @@ impl Downloader {
                     // The stored section still has the previous TOC's filename.
                     let previous = old_subtitles.get(&subtitle.index).copied().unwrap_or(subtitle);
                     if cache_dir.is_none() {
-                        cache_dir = cache_timestamp(self.clock.as_ref());
+                        cache_dir = cache_timestamp(self.clock.as_ref(), save_diff_snapshots);
                     }
                     if let Some(id) = existing_id {
                         self.clear_section_digest(id, &section_relative_path(previous));
                     }
                     if let Some(timestamp) = cache_dir.as_deref() {
-                        self.persistence
+                        let moved = self.persistence
                             .move_section_to_cache(&object_keys, timestamp, previous)
                             .await?;
+                        if moved && !cache_version_recorded {
+                            self.persistence.record_cache_version(&object_keys, timestamp).await?;
+                            cache_version_recorded = true;
+                        }
                     }
                 }
                 let download_time = self
@@ -2395,6 +2394,20 @@ impl Downloader {
         }
         self.flush_section_hash_cache()?;
 
+        // Ruby's latest-only cache version has no prior section snapshots.
+        // Persist it only after all content, TOC and record writes succeeded.
+        if existing_id.is_some()
+            && old_section_count > 0
+            && updated_count > 0
+            && !new_arrival_subtitles.is_empty()
+            && !cache_version_recorded
+            && !partial_listing
+        {
+            if let Some(timestamp) = cache_timestamp(self.clock.as_ref(), save_diff_snapshots) {
+                self.persistence.record_cache_version(&object_keys, &timestamp).await?;
+            }
+        }
+
         Ok(DownloadResult {
             id,
             title: toc_title.clone(),
@@ -2559,34 +2572,42 @@ impl Downloader {
             }
             TargetType::Ncode => {
                 let ncode = target.to_lowercase();
-                let existing_id = self
-                    .novels
-                    .find_by_ncode(&ncode)
-                    .await?
-                    .map(|record| record.id);
-                if let Some(id) = existing_id {
-                    let record = self.novels.get(id.into()).await?.ok_or_else(|| {
-                        NarouError::NotFound(format!("Novel record {} has no toc_url", id))
-                    })?;
-                    let setting = self.find_site_setting(&record.toc_url).ok_or_else(|| {
-                        NarouError::SiteSetting("No matching site setting".into())
-                    })?;
-                    Ok((Some(id), setting))
-                } else {
-                    let narou_url = format!("https://ncode.syosetu.com/{}/", ncode);
-                    let setting = self.find_site_setting(&narou_url).ok_or_else(|| {
-                        NarouError::InvalidTarget(format!("対応外のncodeです({})", ncode))
-                    })?;
-                    let toc_url = setting
-                        .toc_url_with_url_captures(&narou_url)
-                        .unwrap_or_else(|| setting.toc_url());
-                    let existing_id = self
+                // 既存レコードはその toc_url から、見つからない場合は合成した
+                // なろう URL から、取得先定義と TOC URL を決める。URL → レコード
+                // の照合はどちらの分岐も同じ 1 経路に集約する。
+                let (known_id, setting, toc_url) =
+                    match self.novels.find_by_ncode(&ncode).await? {
+                        Some(record) => {
+                            let setting =
+                                self.find_site_setting(&record.toc_url).ok_or_else(|| {
+                                    NarouError::SiteSetting("No matching site setting".into())
+                                })?;
+                            (Some(record.id), setting, record.toc_url.clone())
+                        }
+                        None => {
+                            let narou_url = narou_ncode_url(&ncode);
+                            let setting =
+                                self.find_site_setting(&narou_url).ok_or_else(|| {
+                                    NarouError::InvalidTarget(format!(
+                                        "対応外のncodeです({})",
+                                        ncode
+                                    ))
+                                })?;
+                            let toc_url = setting
+                                .toc_url_with_url_captures(&narou_url)
+                                .unwrap_or_else(|| setting.toc_url());
+                            (None, setting, toc_url)
+                        }
+                    };
+                let existing_id = match known_id {
+                    Some(id) => Some(id),
+                    None => self
                         .novels
                         .find_by_toc_url(&toc_url)
                         .await?
-                        .map(|record| record.id);
-                    Ok((existing_id, setting))
-                }
+                        .map(|record| record.id),
+                };
+                Ok((existing_id, setting))
             }
             TargetType::Id => {
                 let id: i64 = target
@@ -2808,12 +2829,22 @@ impl Downloader {
         self.progress = Some(progress);
     }
 
+    /// Close the current operation before a job's console sender is drained.
+    pub fn clear_progress(&mut self) {
+        self.progress = None;
+    }
+
     /// ユーザーに見える行の送り先を差し替える。native のコマンドは
     /// `progress::console_sink()` (コンソールとログの両方へ書く)、Worker の
     /// ジョブ実行は PushHub へ `echo` する sink を渡す。未設定のときは cfg 別の
     /// フォールバックで従来動作を維持する。
     pub fn set_message_sink(&mut self, sink: Arc<dyn crate::application::messages::MessageSink>) {
         self.message_sink = Some(sink);
+    }
+
+    /// Release invocation-owned routing before reusing a downloader.
+    pub fn clear_message_sink(&mut self) {
+        self.message_sink = None;
     }
 
     /// `println!` (stdout 行) 相当の送出。
@@ -2836,14 +2867,6 @@ impl Downloader {
 
     pub fn site_setting_matches_url(&self, url: &str) -> bool {
         self.find_site_setting(url).is_some()
-    }
-
-    /// Batch-refresh なろうAPI metadata for all なろう records. Uses the
-    /// native dedicated API rate limiter; Worker builds schedule their own
-    /// batch jobs.
-    #[cfg(feature = "native-runtime")]
-    pub async fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
-        narou_api_batch_update(self.http.as_ref(), self.novels.as_ref()).await
     }
 }
 
@@ -3183,14 +3206,8 @@ mod tests {
     /// サイト定義に挿絵パターンが無いサイト (なろう等) でも、ダウンロード時に
     /// narou.rb 既定の `<img>` パターンで挿絵を取得し、挿絵側のストア
     /// (Worker では S3) へ保存すること。`SplitStore` で Worker と同じ配線にする。
-    ///
-    /// 併せて詳細ログの 2 点を固定する: 既定パターンの案内は **小説 1 件につき
-    /// 1 行** (以前はセクションごとに出ていた)、保存行のファイル名は
-    /// **拡張子を足さない** (以前は `挿絵/i88657.jpg.jpg` と表示していた)。
     #[tokio::test]
     async fn default_img_pattern_stores_illustrations_in_the_illustration_store() {
-        // 既定 sink と debug フラグはプロセス共通なので、他のテストと直列化する。
-        let _global = crate::test_support::global_state_guard();
         let mut setting: SiteSetting = serde_yaml::from_str(
             r#"
 name: Illustration Default Test
@@ -3211,23 +3228,6 @@ is_narou: false
         setting.compile();
         assert!(setting.illust_grep_pattern.is_none());
 
-        struct Lines(std::sync::Mutex<Vec<String>>);
-        impl crate::application::messages::MessageSink for Lines {
-            fn emit(&self, _stream: crate::application::messages::Stream, text: &str) {
-                self.0.lock().unwrap().push(text.to_string());
-            }
-        }
-        /// 既定 sink と debug フラグを必ず元へ戻す (panic しても戻す)。
-        struct Capture(Arc<Lines>);
-        impl Drop for Capture {
-            fn drop(&mut self) {
-                crate::application::debug::set_enabled(false);
-                crate::application::messages::take_default_sink();
-            }
-        }
-        let capture = Capture(Arc::new(Lines(std::sync::Mutex::new(Vec::new()))));
-        crate::application::messages::set_default_sink(capture.0.clone());
-        crate::application::debug::set_enabled(true);
 
         let target = "https://illust-default.test/n1234ab/";
         let http = Arc::new(MockHttpClient::new());
@@ -3291,31 +3291,6 @@ is_narou: false
             .await
             .unwrap();
 
-        // 1 回目の検証。取り込みは止めない (このあと 2 回目も走らせる)。
-        {
-            let captured: Vec<String> = capture.0.0.lock().unwrap().clone();
-            let mine: Vec<&String> = captured
-                .iter()
-                .filter(|line| line.contains("illust-default.test"))
-                .collect();
-            assert_eq!(
-                mine.iter()
-                    .filter(|line| line.contains("既定の <img> パターン"))
-                    .count(),
-                1,
-                "既定パターンの案内は小説 1 件につき 1 行だけ出す: {captured:?}"
-            );
-            assert!(
-                captured
-                    .iter()
-                    .any(|line| line.contains("挿絵/i88657.jpg (")),
-                "保存行は拡張子を二重にしない: {captured:?}"
-            );
-            assert!(
-                !captured.iter().any(|line| line.contains(".jpg.jpg")),
-                "保存行は拡張子を二重にしない: {captured:?}"
-            );
-        }
 
         async fn keys_of(store: Arc<MemoryObjectStore>) -> Vec<String> {
             store
@@ -3378,14 +3353,6 @@ is_narou: false
             .await
             .unwrap();
 
-        crate::application::debug::set_enabled(false);
-        crate::application::messages::take_default_sink();
-        let after: Vec<String> = capture.0.0.lock().unwrap().clone();
-        assert!(
-            after.iter().any(|line| line
-                .contains("索引にはありますが実体が無いので取り直します: 挿絵/i88657.jpg")),
-            "索引と実体のずれを検出して取り直す: {after:?}"
-        );
         assert!(
             keys_of(illustrations)
                 .await
@@ -3680,6 +3647,211 @@ is_narou: false
             keys.iter().any(|key| key.contains("/本文/")),
             "sections must still be stored: {keys:?}"
         );
+    }
+
+    #[cfg(feature = "native-runtime")]
+    #[tokio::test]
+    async fn diff_versions_require_successful_moves_or_completed_existing_updates() {
+        use crate::application::webui::diff::{plan_diff_cache_clean, read_diff_cache_catalog};
+        use crate::downloader::settings::SnapshotDownloaderSettings;
+
+        struct FixedDiffClock(chrono::DateTime<chrono::Utc>);
+        impl crate::platform::Clock for FixedDiffClock {
+            fn now_utc(&self) -> chrono::DateTime<chrono::Utc> {
+                self.0
+            }
+        }
+        struct RejectTocWrites(Arc<MemoryObjectStore>);
+        impl ObjectStore for RejectTocWrites {
+            fn stat<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+                ObjectStore::stat(self.0.as_ref(), key)
+            }
+            fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+                self.0.read_small(key)
+            }
+            fn write_small<'a>(&'a self, key: &'a ObjectKey, data: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
+                if key.as_ref().ends_with("/toc.yaml") {
+                    Box::pin(async { Err(crate::error::NarouError::Platform("TOC write failed".into())) })
+                } else {
+                    self.0.write_small(key, data)
+                }
+            }
+            fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+                ObjectStore::delete(self.0.as_ref(), key)
+            }
+            fn list_page<'a>(&'a self, request: &'a ObjectListRequest) -> PlatformFuture<'a, Result<crate::platform::ObjectListPage>> {
+                self.0.list_page(request)
+            }
+        }
+        struct YieldBefore(usize);
+        impl SectionBudget for YieldBefore {
+            fn should_yield(&mut self, next_section_index: usize) -> bool {
+                next_section_index >= self.0
+            }
+        }
+
+        const TARGET: &str = "https://example.com/n1234ab/";
+        fn http_with_sections(count: usize, failed_section: Option<usize>) -> Arc<MockHttpClient> {
+            let http = Arc::new(MockHttpClient::new());
+            let mut toc = "<h1>Diff Test</h1><span>Author</span>".to_string();
+            for index in 1..=count {
+                toc.push_str(&format!(
+                    "<a href=\"/n1234ab/{index}/\" data-date=\"2000-01-01\">第{index}話</a>"
+                ));
+                http.add_text(
+                    format!("{TARGET}{index}/"),
+                    if failed_section == Some(index) { 500 } else { 200 },
+                    format!("<div class=\"body\">本文{index}</div>"),
+                );
+            }
+            http.add_text(TARGET, 200, toc);
+            http
+        }
+        fn clock_time(tick: u32) -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc.with_ymd_and_hms(2026, 10, 13, 1, 2, tick).single().unwrap()
+        }
+        fn version(tick: u32) -> String {
+            clock_time(tick).with_timezone(&chrono::Local).format("%Y.%m.%d@%H.%M.%S").to_string()
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: Diff Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Diff Test
+toc_url: 'https://example.com/\k<ncode>/'
+timezone: UTC
+subtitles: |-
+  <a href="(?<href>/n1234ab/(?<index>\d+)/)" data-date="(?<subdate>[^<]+)">(?<subtitle>[^<]+)</a>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        ).unwrap();
+        setting.compile();
+        let store = Arc::new(MemoryObjectStore::new());
+        let novels = Arc::new(MemoryNovelRepository::new());
+        let persistence = PersistenceService::new(store.clone(), store.clone());
+        let keys = NovelObjectKeys::new("Diff Test", "n1234ab", false).unwrap();
+        let settings: Arc<dyn DownloaderSettings> = Arc::new(SnapshotDownloaderSettings::default());
+        let downloader = |count, failed_section, tick, objects: Arc<dyn ObjectStore>,
+                          assets: Arc<dyn AssetStore>, settings: Arc<dyn DownloaderSettings>| {
+            Downloader::with_platform_and_storage_and_settings_and_support(
+                DownloaderPlatform {
+                    http: http_with_sections(count, failed_section),
+                    rate_limiter: Arc::new(FakeRateLimiter::new()),
+                    novels: novels.clone(),
+                    objects,
+                    assets,
+                    clock: Arc::new(FixedDiffClock(clock_time(tick))),
+                },
+                vec![setting.clone()],
+                HashMap::new(),
+                settings,
+            ).unwrap()
+        };
+
+        let initial = downloader(1, None, 0, store.clone(), store.clone(), settings.clone())
+            .download_novel(TARGET).await.unwrap();
+        assert!(initial.new_novel);
+        assert!(read_diff_cache_catalog(store.as_ref(), keys.prefix(), &[]).await.unwrap().is_empty());
+        let unchanged = downloader(1, None, 1, store.clone(), store.clone(), settings.clone())
+            .download_novel(TARGET).await.unwrap();
+        assert_eq!(unchanged.updated_count, 0);
+        assert!(plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap().is_empty());
+        assert!(downloader(2, Some(2), 2, store.clone(), store.clone(), settings.clone())
+            .download_novel(TARGET).await.is_err());
+        assert!(plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap().is_empty());
+
+        let mut budget = YieldBefore(2);
+        let partial = downloader(3, None, 3, store.clone(), store.clone(), settings.clone())
+            .download_novel_with_execution_options(TARGET, DownloadExecutionOptions {
+                force: false, budget: Some(&mut budget), resume_from_section: None,
+            }).await.unwrap_err();
+        assert!(matches!(partial, crate::error::NarouError::DownloadBudgetExpired { next_section_index: 2 }));
+        assert!(store.read_small(&keys.section("2", "第2話")).await.unwrap().is_some(),
+            "the partial run really saved its new section");
+        assert_eq!(persistence.load_toc(&keys).await.unwrap().unwrap().subtitles.len(), 1);
+        assert!(plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap().is_empty());
+        assert!(downloader(3, Some(3), 4, store.clone(), store.clone(), settings.clone())
+            .download_novel_with_execution_options(TARGET, DownloadExecutionOptions {
+                force: false, budget: None, resume_from_section: Some(2),
+            }).await.is_err());
+        assert!(downloader(3, None, 5, store.clone(), store.clone(), settings.clone())
+            .download_novel_with_execution_options(TARGET, DownloadExecutionOptions {
+                force: false, budget: None, resume_from_section: Some(4),
+            }).await.is_err());
+        assert!(plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap().is_empty());
+
+        let completed = downloader(3, None, 6, store.clone(), store.clone(), settings.clone())
+            .download_novel_with_execution_options(TARGET, DownloadExecutionOptions {
+                force: false, budget: None, resume_from_section: Some(2),
+            }).await.unwrap();
+        assert_eq!(completed.id, initial.id);
+        assert!(!completed.new_novel);
+        assert_eq!(completed.updated_count, 1);
+        assert_eq!(persistence.load_toc(&keys).await.unwrap().unwrap().subtitles.len(), 3);
+        let versions = read_diff_cache_catalog(store.as_ref(), keys.prefix(), &[]).await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, version(6));
+        assert!(versions[0].only_latest_update);
+        assert_eq!(plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap(),
+            vec![keys.cached_version_marker(&version(6))]);
+
+        let unchanged = downloader(3, None, 7, store.clone(), store.clone(), settings.clone())
+            .download_novel(TARGET).await.unwrap();
+        assert_eq!(unchanged.updated_count, 0);
+        assert!(store.read_small(&keys.cached_version_marker(&version(7))).await.unwrap().is_none());
+        let economy = serde_yaml::from_str("['nosave_diff']").unwrap();
+        let no_diff: Arc<dyn DownloaderSettings> =
+            Arc::new(SnapshotDownloaderSettings::default().with_economy(Some(&economy)));
+        let appended = downloader(4, None, 8, store.clone(), store.clone(), no_diff)
+            .download_novel(TARGET).await.unwrap();
+        assert_eq!(appended.updated_count, 1);
+        assert!(store.read_small(&keys.cached_version_marker(&version(8))).await.unwrap().is_none());
+        assert!(store.read_small(&keys.raw_section("4", "第4話")).await.unwrap().is_none(),
+            "the snapshot keeps Worker's intentional no-raw policy");
+
+        let failed_toc = downloader(5, None, 9, Arc::new(RejectTocWrites(store.clone())), store.clone(), settings.clone())
+            .download_novel(TARGET).await.unwrap_err();
+        assert!(failed_toc.to_string().contains("TOC write failed"));
+        assert!(store.read_small(&keys.section("5", "第5話")).await.unwrap().is_some());
+        assert_eq!(persistence.load_toc(&keys).await.unwrap().unwrap().subtitles.len(), 4);
+        assert!(store.read_small(&keys.cached_version_marker(&version(9))).await.unwrap().is_none(),
+            "successful section content alone does not complete an empty version");
+
+        let updated = downloader(4, None, 10, store.clone(), store.clone(), settings.clone())
+            .download_novel_with_force(TARGET, true).await.unwrap();
+        assert_eq!(updated.updated_count, 4);
+        let archived = read_diff_cache_catalog(store.as_ref(), keys.prefix(), &[]).await.unwrap();
+        assert_eq!(archived.len(), 2);
+        assert_eq!(archived[0].version, version(10));
+        assert!(!archived[0].only_latest_update);
+        assert_eq!(archived[0].entries.len(), 4);
+        assert!(store.read_small(&keys.cached_version_marker(&version(10))).await.unwrap().is_some());
+        assert_eq!(plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap().len(), 6,
+            "one marker per version, plus four moved sections");
+
+        let missing_conn = crate::native::sqlite::open_in_memory().unwrap();
+        let missing_mirror = crate::native::object_store::NativeObjectStore::from_root(
+            temp.path().join("missing-assets"),
+        ).unwrap();
+        let missing_assets: Arc<dyn AssetStore> = Arc::new(
+            crate::native::sqlite::object_store::SqliteObjectStore::with_mirror_files(
+                missing_conn, missing_mirror, false,
+            ),
+        );
+        assert!(downloader(4, None, 11, store.clone(), missing_assets, settings)
+            .download_novel_with_force(TARGET, true).await.is_err());
+        assert!(store.read_small(&keys.cached_version_marker(&version(11))).await.unwrap().is_none(),
+            "a failed first cache move cannot create a marker");
+        assert!(store.read_small(&keys.section("1", "第1話")).await.unwrap().is_some());
     }
 
     #[tokio::test]

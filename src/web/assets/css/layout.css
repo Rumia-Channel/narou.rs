@@ -143,6 +143,13 @@
   gap: 0.25em;
   align-items: center;
   justify-content: center;
+  overflow: visible;
+}
+
+.navbar-fixed-bottom .dropdown-menu {
+  position: absolute;
+  top: auto;
+  bottom: 100%;
 }
 
 /* ========== Console ========== */
@@ -172,6 +179,14 @@
   display: none;
 }
 
+.console-col-left,
+.console-col-right {
+  display: flex;
+  flex-direction: column;
+  height: var(--console-height);
+  min-height: 0;
+}
+
 .console {
   background-color: var(--console-bg);
   color: var(--console-text);
@@ -187,18 +202,20 @@
   transition: max-height 0.20s ease;
 }
 
-.console.console-with-progress {
-  padding-bottom: 3.8em;
+.console-panes .console {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
 }
 
 .console.expanded {
-  max-height: 80vh;
+  max-height: var(--console-expanded-height);
 }
 
 /* Stretch both console panes together, including an empty stdout2 pane. */
-.console-panes.expanded .console {
-  min-height: 80vh;
-  max-height: 80vh;
+.console-panes.expanded .console-col-left,
+.console-panes.expanded .console-col-right {
+  height: var(--console-expanded-height);
 }
 
 .console-line {
@@ -235,8 +252,13 @@ hr.console-hr {
   transition: opacity 0.15s;
 }
 
-.console-btn:hover {
+.console-btn:hover,
+.console-btn:focus-visible {
   opacity: 1;
+}
+
+.console-btn:focus-visible {
+  outline: var(--control-focus-width) solid var(--console-text);
 }
 
 /* ========== Control Panel ========== */

@@ -62,13 +62,15 @@
     <textarea id="notepad"></textarea>
     <div class="notepad-status" id="notepad-status"></div>
   </div>
-  <script>
+  <script type="module">
+    import { fetchJson } from '/assets/js/core/http.js';
+    import { createNotepadEditor } from '/assets/js/core/notepad.js';
     (function() {
       var textarea = document.getElementById('notepad');
       var status = document.getElementById('notepad-status');
       var saveTimer = null;
       var statusTimer = null;
-      var notepadObjectId = null;
+      var editor = createNotepadEditor(textarea);
 
       function showStatus(message, isError) {
         status.classList.toggle('error', Boolean(isError));
@@ -82,58 +84,9 @@
         }, 2000);
       }
 
-      function requestJson(url, options) {
-        return fetch(url, options).then(function(response) {
-          if (!response.ok) {
-            throw new Error('HTTP ' + response.status);
-          }
-          return response.json();
-        });
-      }
-
-      function assertApiSuccess(data, fallbackMessage) {
-        if (!data || data.success === false) {
-          throw new Error((data && data.message) || fallbackMessage);
-        }
-        return data;
-      }
-
-      function readNotepadPayload(data) {
-        return {
-          text: (data && (data.text || data.content)) || '',
-          objectId: (data && typeof data.object_id === 'string') ? data.object_id : null
-        };
-      }
-
-      function applyNotepadPayload(data, keepLocalEdits) {
-        var payload = readNotepadPayload(data);
-        var hasLocalEdits = keepLocalEdits
-          && document.activeElement === textarea
-          && textarea.value !== payload.text;
-        if (!hasLocalEdits) {
-          textarea.value = payload.text;
-          notepadObjectId = payload.objectId;
-        }
-        return !hasLocalEdits;
-      }
-
-      function reloadNotepad(message) {
-        return requestJson('/api/notepad/read')
-          .then(function(data) {
-            applyNotepadPayload(data, false);
-            if (message) {
-              showStatus(message, true);
-            }
-          });
-      }
-
-      requestJson('/api/notepad/read')
-        .then(function(data) {
-          applyNotepadPayload(data, false);
-        })
-        .catch(function(error) {
-          showStatus('読み込みに失敗しました: ' + error.message, true);
-        });
+      editor.load().catch(function(error) {
+        showStatus('読み込みに失敗しました: ' + error.message, true);
+      });
 
       function connectWebSocket(wsPort) {
         var url = new URL('/ws', location.href);
@@ -143,11 +96,11 @@
           try {
             var msg = JSON.parse(event.data);
             if (msg.type === 'notepad.change') {
-              var applied = applyNotepadPayload(msg.data, true);
-              if (applied) {
+              var result = editor.applySnapshot(msg.data);
+              if (result.applied) {
                 showStatus('他の画面の変更を反映しました');
-              } else {
-                showStatus('他の画面で更新されました。保存時に再読み込みします', true);
+              } else if (result.keptLocalEdits) {
+                showStatus('サーバのメモ帳が更新されました。入力内容は保持しています', true);
               }
             }
           } catch (_) {}
@@ -155,10 +108,11 @@
         ws.onclose = function() { setTimeout(function() { connectWebSocket(wsPort); }, 5000); };
       }
 
-      fetch('/api/webui/config')
-        .then(function(r) { return r.json(); })
+      fetchJson('/api/webui/config')
         .then(function(data) {
           if (data && data.ws_port) connectWebSocket(data.ws_port);
+        }).catch(function(error) {
+          showStatus('接続設定の読み込みに失敗しました: ' + error.message, true);
         });
 
       textarea.addEventListener('input', function() {
@@ -166,17 +120,10 @@
         status.textContent = '';
         status.classList.remove('error');
         saveTimer = setTimeout(function() {
-          requestJson('/api/notepad/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: textarea.value, object_id: notepadObjectId })
-          }).then(function(data) {
-            if (data && data.conflict) {
-              return reloadNotepad(data.message || '他の画面で変更されたため再読み込みしました');
-            }
-            data = assertApiSuccess(data, '保存に失敗しました');
-            applyNotepadPayload(data, false);
-            showStatus(data.message || '保存しました');
+          editor.save().then(function(result) {
+            if (result.saved) showStatus(result.dirty
+              ? '前の入力を保存しました。新しい入力は未保存です'
+              : result.data.message || '保存しました');
           }).catch(function(error) {
             showStatus('保存に失敗しました: ' + error.message, true);
           });

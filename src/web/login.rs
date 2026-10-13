@@ -11,9 +11,9 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::error::NarouError;
-use crate::login::{apply_import_name, parse_export};
+use crate::login::actions;
 use crate::native::cookie_store::InventoryCookieStore;
-use crate::platform::{LoginGroup, mask_cookie, normalize_cookie_host, parse_cookie_header};
+use crate::platform::cookie_store::login_status_json;
 
 use super::AppState;
 use super::{MAX_WEB_TEXT_INPUT_BYTES, validate_web_text_size};
@@ -72,38 +72,32 @@ pub async fn login_import(
     {
         return Json(serde_json::json!({ "success": false, "message": message }));
     }
-    let mut sites = match parse_export(&body.envelope, body.passphrase.as_deref()) {
-        Ok(sites) => sites,
+    let plan = match actions::plan_import(
+        &body.envelope,
+        body.passphrase.as_deref(),
+        body.name.as_deref(),
+    ) {
+        Ok(plan) => plan,
         Err(error) => return Json(failure(error)),
     };
-    if let Some(name) = body.name.as_deref() {
-        apply_import_name(&mut sites, name);
-    }
-    let logins: usize = sites.values().map(Vec::len).sum();
-    if logins == 0 {
+    if plan.logins == 0 {
         return Json(serde_json::json!({
             "success": false,
-            "message": "書き出しファイルにログイン情報が含まれていません",
+            "message": actions::IMPORT_EMPTY_MESSAGE,
         }));
     }
     let store = match store() {
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let site_count = sites.len();
-    let stored = match if body.replace {
-        store.replace_groups(&sites)
-    } else {
-        store.merge_groups(&sites)
-    } {
-        Ok(stored) => stored,
-        Err(error) => return Json(failure(error)),
-    };
-    Json(serde_json::json!({
-        "success": true,
-        "message": format!("{logins} 件を取り込みました ({site_count} サイト / 保存済み {stored} サイト)"),
-        "data": status_payload().unwrap_or(serde_json::Value::Null),
-    }))
+    match actions::import_logins(&store, &plan, body.replace).await {
+        Ok(message) => Json(serde_json::json!({
+            "success": true,
+            "message": message,
+            "data": status_payload().unwrap_or(serde_json::Value::Null),
+        })),
+        Err(message) => Json(serde_json::json!({ "success": false, "message": message })),
+    }
 }
 
 /// `POST /api/login/rename` — name one login.
@@ -115,28 +109,14 @@ pub async fn login_rename(
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let site = normalize_cookie_host(&body.site);
-    let mut groups = match store.groups_for(&site) {
-        Ok(groups) => groups,
-        Err(error) => return Json(failure(error)),
-    };
-    if body.index >= groups.len() {
-        return Json(serde_json::json!({
-            "success": false,
-            "message": format!("{site} の {} 番目のログイン情報はありません", body.index + 1),
-        }));
+    match actions::rename_login(&store, &body.site, body.index, &body.label).await {
+        Ok(message) => Json(serde_json::json!({
+            "success": true,
+            "message": message,
+            "data": status_payload().unwrap_or(serde_json::Value::Null),
+        })),
+        Err(message) => Json(serde_json::json!({ "success": false, "message": message })),
     }
-    let label = body.label.trim();
-    groups[body.index].label = (!label.is_empty()).then(|| label.to_string());
-    let name = groups[body.index].display_name().to_string();
-    if let Err(error) = store.save_groups_for(&site, &groups) {
-        return Json(failure(error));
-    }
-    Json(serde_json::json!({
-        "success": true,
-        "message": format!("{site} の {} 番目を「{name}」にしました", body.index + 1),
-        "data": status_payload().unwrap_or(serde_json::Value::Null),
-    }))
 }
 
 /// `POST /api/login/order` — reorder a site's logins.
@@ -148,45 +128,14 @@ pub async fn login_order(
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let site = normalize_cookie_host(&body.site);
-    let stored = match store.groups_for(&site) {
-        Ok(stored) => stored,
-        Err(error) => return Json(failure(error)),
-    };
-    let reordered = match reorder_groups(&stored, &body.order) {
-        Ok(reordered) => reordered,
-        Err(message) => {
-            return Json(serde_json::json!({ "success": false, "message": message }));
-        }
-    };
-    if let Err(error) = store.save_groups_for(&site, &reordered) {
-        return Json(failure(error));
+    match actions::reorder_logins(&store, &body.site, &body.order).await {
+        Ok(message) => Json(serde_json::json!({
+            "success": true,
+            "message": message,
+            "data": status_payload().unwrap_or(serde_json::Value::Null),
+        })),
+        Err(message) => Json(serde_json::json!({ "success": false, "message": message })),
     }
-    Json(serde_json::json!({
-        "success": true,
-        "message": format!("{site} の試行順を変更しました"),
-        "data": status_payload().unwrap_or(serde_json::Value::Null),
-    }))
-}
-
-/// 並び順の指定（現在の添字の並び）を検証して適用する。
-fn reorder_groups(
-    stored: &[LoginGroup],
-    order: &[usize],
-) -> std::result::Result<Vec<LoginGroup>, String> {
-    if order.len() != stored.len() {
-        return Err("並び順の指定が保存済みの件数と一致しません".to_string());
-    }
-    let mut seen = vec![false; stored.len()];
-    let mut reordered = Vec::with_capacity(stored.len());
-    for index in order {
-        if *index >= stored.len() || seen[*index] {
-            return Err("並び順の指定が不正です".to_string());
-        }
-        seen[*index] = true;
-        reordered.push(stored[*index].clone());
-    }
-    Ok(reordered)
 }
 
 /// `DELETE /api/login/{site}` — drop one site.
@@ -198,18 +147,13 @@ pub async fn login_clear_site(
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let site = normalize_cookie_host(&site);
-    match store.remove(&site) {
-        Ok(true) => Json(serde_json::json!({
+    match actions::clear_site_logins(&store, &site).await {
+        Ok(message) => Json(serde_json::json!({
             "success": true,
-            "message": format!("{site} のログイン情報を削除しました"),
+            "message": message,
             "data": status_payload().unwrap_or(serde_json::Value::Null),
         })),
-        Ok(false) => Json(serde_json::json!({
-            "success": false,
-            "message": format!("{site} のログイン情報は保存されていません"),
-        })),
-        Err(error) => Json(failure(error)),
+        Err(message) => Json(serde_json::json!({ "success": false, "message": message })),
     }
 }
 
@@ -222,26 +166,14 @@ pub async fn login_clear_group(
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let site = normalize_cookie_host(&site);
-    let mut groups = match store.groups_for(&site) {
-        Ok(groups) => groups,
-        Err(error) => return Json(failure(error)),
-    };
-    if index >= groups.len() {
-        return Json(serde_json::json!({
-            "success": false,
-            "message": format!("{site} の {} 番目のログイン情報はありません", index + 1),
-        }));
+    match actions::clear_login(&store, &site, index).await {
+        Ok(message) => Json(serde_json::json!({
+            "success": true,
+            "message": message,
+            "data": status_payload().unwrap_or(serde_json::Value::Null),
+        })),
+        Err(message) => Json(serde_json::json!({ "success": false, "message": message })),
     }
-    let removed = groups.remove(index);
-    if let Err(error) = store.save_groups_for(&site, &groups) {
-        return Json(failure(error));
-    }
-    Json(serde_json::json!({
-        "success": true,
-        "message": format!("{site} の「{}」を削除しました", removed.display_name()),
-        "data": status_payload().unwrap_or(serde_json::Value::Null),
-    }))
 }
 
 /// `DELETE /api/login` — drop every site.
@@ -250,15 +182,14 @@ pub async fn login_clear_all(State(_state): State<AppState>) -> Json<serde_json:
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let removed = store.groups_by_site().map(|sites| sites.len()).unwrap_or(0);
-    if let Err(error) = store.clear_all() {
-        return Json(failure(error));
+    match actions::clear_all_logins(&store).await {
+        Ok(message) => Json(serde_json::json!({
+            "success": true,
+            "message": message,
+            "data": status_payload().unwrap_or(serde_json::Value::Null),
+        })),
+        Err(message) => Json(serde_json::json!({ "success": false, "message": message })),
     }
-    Json(serde_json::json!({
-        "success": true,
-        "message": format!("ログイン情報をすべて削除しました ({removed} サイト)"),
-        "data": status_payload().unwrap_or(serde_json::Value::Null),
-    }))
 }
 
 fn store() -> Result<InventoryCookieStore, NarouError> {
@@ -268,56 +199,12 @@ fn store() -> Result<InventoryCookieStore, NarouError> {
 /// Stored sites and their logins, with every cookie value masked.
 fn status_payload() -> Result<serde_json::Value, NarouError> {
     let store = store()?;
-    let sites = store.groups_by_site()?;
-    let mut total = 0;
-    let entries = sites
-        .iter()
-        .map(|(site, groups)| {
-            total += groups.len();
-            let logins = groups
-                .iter()
-                .enumerate()
-                .map(|(index, group)| {
-                    let hosts = group
-                        .cookies
-                        .iter()
-                        .map(|entry| {
-                            serde_json::json!({
-                                "host": entry.host,
-                                "cookies": mask_cookie(&entry.cookie),
-                                "names": parse_cookie_header(&entry.cookie)
-                                    .into_iter()
-                                    .map(|(name, _)| name)
-                                    .collect::<Vec<_>>(),
-                                "length": entry.cookie.chars().count(),
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    serde_json::json!({
-                        "index": index,
-                        "id": group.id,
-                        "short_id": group.short_id(),
-                        "label": group.label,
-                        "display_name": group.display_name(),
-                        "hosts": hosts,
-                        "host_count": group.cookies.len(),
-                        "added_at": group.added_at,
-                    })
-                })
-                .collect::<Vec<_>>();
-            serde_json::json!({
-                "site": site,
-                "logins": logins,
-                "encrypted": store.is_encrypted(site).unwrap_or(false),
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(serde_json::json!({
-        "sites": entries,
-        "sites_count": sites.len(),
-        "logins_count": total,
-        "key_source": store.key_source().map(|source| source.describe()).unwrap_or("unknown"),
-    }))
+    let (sites, encrypted) = store.groups_and_encryption()?;
+    let key_source = store
+        .key_source()
+        .map(|source| source.describe())
+        .unwrap_or("unknown");
+    Ok(login_status_json(&sites, &encrypted, key_source))
 }
 
 fn failure(error: NarouError) -> serde_json::Value {

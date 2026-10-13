@@ -67,16 +67,15 @@ impl TagColorStore for NativeTagColorStore {
         })
     }
 
-    fn save<'a>(
+    fn update<'a>(
         &'a self,
-        colors: &'a crate::tag_colors::TagColors,
-    ) -> PlatformFuture<'a, Result<()>> {
+        update: crate::tag_colors::TagColorUpdate,
+    ) -> PlatformFuture<'a, Result<crate::tag_colors::TagColors>> {
         let inventory = Arc::clone(&self.inventory);
-        let colors = colors.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || crate::tag_colors::save_tag_colors(&inventory, &colors))
+            tokio::task::spawn_blocking(move || crate::tag_colors::update_tag_colors(&inventory, update))
                 .await
-                .map_err(|error| NarouError::Platform(format!("tag color save task failed: {error}")))?
+                .map_err(|error| NarouError::Platform(format!("tag color update task failed: {error}")))?
         })
     }
 }
@@ -247,48 +246,29 @@ impl SettingsStore for NativeSettingsStore {
 /// `Arc` の同一性を見て再構築をキャッシュする）。
 #[derive(Clone)]
 pub struct NativeSiteTimezoneProvider {
-    snapshot: Arc<std::sync::RwLock<SiteProviderSnapshot>>,
+    snapshot: Arc<std::sync::RwLock<Arc<crate::application::site_definitions::SiteSettingsSnapshot>>>,
 }
 
-#[derive(Clone)]
-struct SiteProviderSnapshot {
-    source: Arc<Vec<crate::downloader::site_setting::SiteSetting>>,
-    timezones: Arc<HashMap<String, SiteTimezone>>,
-}
 
 impl NativeSiteTimezoneProvider {
     pub fn load() -> Self {
         let source = crate::downloader::site_setting::effective_site_settings_shared();
         Self {
-            snapshot: Arc::new(std::sync::RwLock::new(Self::snapshot_for(source))),
+            snapshot: Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::application::site_definitions::SiteSettingsSnapshot::new(source),
+            ))),
         }
     }
 
-    fn snapshot_for(
-        source: Arc<Vec<crate::downloader::site_setting::SiteSetting>>,
-    ) -> SiteProviderSnapshot {
-        let timezones = source
-            .iter()
-            .map(|setting| {
-                let domain = setting.domain.clone();
-                let timezone = native_timezone(setting.site_timezone());
-                (domain, timezone)
-            })
-            .collect();
-        SiteProviderSnapshot {
-            source,
-            timezones: Arc::new(timezones),
-        }
-    }
 
-    fn snapshot(&self) -> SiteProviderSnapshot {
+    fn snapshot(&self) -> Arc<crate::application::site_definitions::SiteSettingsSnapshot> {
         let source = crate::downloader::site_setting::effective_site_settings_shared();
         if let Ok(snapshot) = self.snapshot.read()
-            && Arc::ptr_eq(&snapshot.source, &source)
+            && Arc::ptr_eq(snapshot.source(), &source)
         {
             return snapshot.clone();
         }
-        let snapshot = Self::snapshot_for(source);
+        let snapshot = Arc::new(crate::application::site_definitions::SiteSettingsSnapshot::new(source));
         if let Ok(mut current) = self.snapshot.write() {
             *current = snapshot.clone();
         }
@@ -300,49 +280,26 @@ impl SiteTimezoneProvider for NativeSiteTimezoneProvider {
         &'a self,
         domain: &'a str,
     ) -> PlatformFuture<'a, Result<Option<SiteTimezone>>> {
-        let timezone = self.snapshot().timezones.get(domain).copied();
+        let timezone = self.snapshot().timezone(domain);
         Box::pin(async move { Ok(timezone) })
     }
 }
 
 impl SiteDefinitionProvider for NativeSiteTimezoneProvider {
     fn resolve_toc_url(&self, url: &str) -> Option<String> {
-        self.snapshot()
-            .source
-            .iter()
-            .find(|setting| setting.matches_url(url))
-            .map(|setting| {
-                setting
-                    .toc_url_with_url_captures(url)
-                    .unwrap_or_else(|| setting.toc_url())
-            })
+        self.snapshot().resolve_toc_url(url)
     }
 
     fn url_patterns_for_validation(&self) -> Vec<String> {
-        self.snapshot()
-            .source
-            .iter()
-            .flat_map(|setting| setting.url_patterns_for_validation())
-            .collect()
+        self.snapshot().url_patterns_for_validation()
     }
 }
 impl crate::application::SiteUpdateCapabilityProvider for NativeSiteTimezoneProvider {
     fn supports_narou_api(&self, toc_url: &str) -> bool {
-        self.snapshot()
-            .source
-            .iter()
-            .find(|setting| setting.matches_url(toc_url))
-            .and_then(|setting| setting.narou_api_url.as_ref())
-            .is_some()
+        crate::application::SiteUpdateCapabilityProvider::supports_narou_api(self.snapshot().as_ref(), toc_url)
     }
 }
 
-fn native_timezone(timezone: crate::downloader::SiteTimezone) -> SiteTimezone {
-    match timezone {
-        crate::downloader::SiteTimezone::Named(tz) => SiteTimezone::Named(tz),
-        crate::downloader::SiteTimezone::Fixed(offset) => SiteTimezone::Fixed(offset),
-    }
-}
 
 /// Native composition root for the application services used by the web
 /// command. Web handlers receive this bundle and never construct native

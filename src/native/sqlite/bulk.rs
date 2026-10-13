@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use rusqlite::Connection;
 
+use crate::db::novel_query::select_sql;
 use crate::db::NovelRecord;
 use crate::error::Result;
 
@@ -22,7 +23,7 @@ const DELETE_CHUNK: usize = 200;
 pub(crate) fn load_all_records(
     conn: &Connection,
 ) -> Result<BTreeMap<i64, NovelRecord>> {
-    let sql = format!("{} ORDER BY n.id", super::query::select_sql());
+    let sql = format!("{} ORDER BY n.id", select_sql());
     let mut statement = conn.prepare(&sql).map_err(sqlite_error)?;
     let mut rows = statement.query([]).map_err(sqlite_error)?;
     let mut map = BTreeMap::new();

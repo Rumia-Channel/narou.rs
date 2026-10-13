@@ -701,7 +701,7 @@ fn is_self_referencing_canonical(store: &IllustrationStore, filename: &str) -> b
     // Hash-named file (64-char hex) is always self-referencing: the converter looks
     // for `挿絵/<hash>.<ext>` on disk during `cached_filename_for_hash` regardless of
     // whether the cache currently has a hash entry, so the file would be reused.
-    if stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+    if is_sha256_hex_stem(stem) {
         return true;
     }
     // mitemin ID-named file is reachable if its stem is a known mitemin ID.
@@ -1054,7 +1054,7 @@ fn is_canonical_illustration_filename(filename: &str) -> bool {
         return false;
     };
     // 64-char hex (SHA-256) or mitemin ID like i12345.
-    (stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit())) || is_mitemin_id(stem)
+    is_sha256_hex_stem(stem) || is_mitemin_id(stem)
 }
 
 #[cfg(feature = "native-runtime")]
@@ -1275,6 +1275,11 @@ pub fn is_remote_illustration_source(source: &str) -> bool {
     source.starts_with("http://") || source.starts_with("https://") || source.starts_with("//")
 }
 
+/// Whether an illustration filename stem is exactly 64 ASCII hexadecimal bytes.
+pub fn is_sha256_hex_stem(stem: &str) -> bool {
+    stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 pub fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1433,6 +1438,30 @@ fn normalize_extension(ext: &str) -> String {
 mod tests {
     use super::*;
     use crate::platform::ObjectStore;
+
+    #[test]
+    fn sha256_hex_stem_requires_exactly_64_ascii_hex_bytes() {
+        for stem in [
+            "0".repeat(64),
+            "0123456789abcdef".repeat(4),
+            "0123456789ABCDEF".repeat(4),
+            "aBcD0123".repeat(8),
+        ] {
+            assert!(is_sha256_hex_stem(&stem), "{stem:?}");
+        }
+        for stem in [
+            String::new(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            format!("{} ", "a".repeat(63)),
+            "é".repeat(32),
+            "ａ".repeat(64),
+            "i12345".to_string(),
+        ] {
+            assert!(!is_sha256_hex_stem(&stem), "{stem:?}");
+        }
+    }
 
     #[test]
     fn store_bytes_uses_mitemin_id_filename_and_hash_table() {

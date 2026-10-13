@@ -22,6 +22,7 @@ pub mod aliases;
 pub mod debug;
 pub mod download_targets;
 pub mod events;
+pub mod target_lookup;
 pub mod convert;
 pub mod messages;
 pub mod site_definitions;

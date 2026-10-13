@@ -28,7 +28,7 @@ fn prepare_library() -> tempfile::TempDir {
 
 fn with_connection<T>(root: &Path, f: impl FnOnce(&rusqlite::Connection) -> T) -> T {
     let conn = narou_rs::native::sqlite::open(&root.join(".narou").join("db.sqlite")).unwrap();
-    let guard = conn.lock().unwrap();
+    let guard = conn.lock();
     f(&guard)
 }
 
@@ -42,10 +42,10 @@ fn frozen_rows(root: &Path) -> Vec<i64> {
     })
 }
 
-/// The shared status search expression reports 凍結 from `frozen_novels` alone,
-/// so this is what `narou list <status filter>` / the Web UI search rely on.
+/// The shared status search expression reports 凍結 from `frozen_novels`
+/// or the legacy `frozen` tag; CLI and Web UI filtering use both.
 fn status_search_frozen(root: &Path, id: i64) -> bool {
-    let expression = include_str!("../src/native/sqlite/sql/status_search_expression.sql");
+    let expression = include_str!("../src/db/sql/status_search_expression.sql");
     with_connection(root, |conn| {
         conn.query_row(
             &format!(
@@ -144,6 +144,29 @@ fn cli_freeze_keeps_other_novels_frozen_across_restarts() {
     assert_eq!(stored_freeze_ids(root), BTreeSet::from([1]));
     assert_eq!(frozen_rows(root), vec![1]);
     assert_eq!(fragments(root).len(), 1);
+}
+
+#[test]
+fn failed_projection_cannot_commit_a_different_freeze_payload() {
+    let temp = prepare_library();
+    let root = temp.path();
+    let _db = Database::with_root(root.to_path_buf()).unwrap();
+    let state = state::active_for(&root.join(".narou")).unwrap();
+    with_connection(root, |conn| {
+        conn.execute("DELETE FROM novel_tags WHERE novel_id = 2 AND tag_fold = 'frozen'", []).unwrap();
+    });
+    state.set_raw("inv", "freeze", "1: true\n").unwrap();
+    with_connection(root, |conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_freeze_projection BEFORE INSERT ON frozen_novels
+             BEGIN SELECT RAISE(ABORT, 'fixture projection failure'); END;",
+        ).unwrap();
+    });
+    assert!(state.set_raw("inv", "freeze", "2: true\n").is_err());
+    assert_eq!(stored_freeze_payload(root).as_deref(), Some("1: true\n"));
+    assert_eq!(frozen_rows(root), vec![1]);
+    assert!(status_search_frozen(root, 1));
+    assert!(!status_search_frozen(root, 2));
 }
 
 #[test]

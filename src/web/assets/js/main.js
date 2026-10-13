@@ -3,6 +3,7 @@
  */
 import { State, El, initElements } from './core/state.js';
 import { fetchJson, postJson } from './core/http.js';
+import { restoreSortState } from './core/sort_state.js';
 import { setCapabilities, applyActionCapabilities, initCapabilityGuard } from './core/capabilities.js';
 import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
@@ -10,7 +11,10 @@ import { initFeatureTour, maybeShowPendingFeatureTour } from './ui/feature_tour.
 import { renderNovelList, renderQueueStatus, renderTagList, showNotification, syncViewChecks } from './ui/render.js';
 import {
   applyNotepadSnapshot,
+  captureThemeRead,
+  applyThemeSnapshot,
   bindActions,
+  clearConsoleHistoryUi,
   handleRegisterParam,
   refreshList,
   refreshQueue,
@@ -95,6 +99,7 @@ async function init() {
   // Load config and sort state from server。
   // 互いに独立なので直列に待たず、1 往復分の待ち時間で済ませる
   // (以前は config の応答を待ってから sort_state を投げていた)。
+  const themeGeneration = captureThemeRead();
   const [config, sortState] = await Promise.all([
     fetchJson('/api/webui/config').catch(() => null),
     fetchJson('/api/sort_state').catch(() => null),
@@ -102,18 +107,12 @@ async function init() {
 
   try {
     if (config) {
-      applyWebConfig(config);
+      applyWebConfig(config, themeGeneration);
     }
   } catch { /* use defaults */ }
 
   try {
-    if (sortState) {
-      const colMap = { 0: 'id', 1: 'last_update', 2: 'general_lastup', 3: 'last_check_date',
-        4: 'title', 5: 'author', 6: 'sitename', 7: 'novel_type', 9: 'general_all_no', 10: 'length' };
-      const col = colMap[sortState.column] || 'last_update';
-      State.sortCol = col;
-      State.sortAsc = sortState.dir === 'asc';
-    }
+    restoreSortState(sortState);
   } catch { /* use defaults */ }
 
   // 一覧の取得を待たずに投げておく (モーダル/通知の表示自体は各関数が
@@ -134,9 +133,10 @@ async function init() {
   // Periodic refresh
   const interval = Math.max(State.pollIntervalSeconds, 10) * 1000;
   setInterval(async () => {
+    const progressRevision = progressStateRevision;
     await Promise.all([refreshListWithUiState(), refreshQueue()]);
     // イベント取りこぼしで残ったバーを、キューが空になった時点で片付ける。
-    clearProgressBarsWhenQueueIdle(State.queueStatus);
+    if (progressRevision === progressStateRevision) clearProgressBarsWhenQueueIdle(State.queueStatus);
     if (isQueueModalOpen()) {
       await refreshQueueDetailed();
     }
@@ -219,13 +219,9 @@ function stripRegisterParamFromUrl() {
   }
 }
 
-function applyWebConfig(config) {
+function applyWebConfig(config, themeGeneration) {
   if (config.theme) {
-    const theme = normalizeTheme(config.theme);
-    State.theme = theme;
-    document.documentElement.dataset.theme = theme === 'default' ? '' : theme;
-    const sel = El.themeSelect;
-    if (sel) sel.value = theme;
+    applyThemeSnapshot(normalizeTheme(config.theme), themeGeneration);
   }
   setCapabilities(config.capabilities);
   if (config.performance_mode) State.performanceMode = config.performance_mode;
@@ -255,10 +251,11 @@ function mirrorConsoleToDevtools(text, targetConsole) {
 }
 
 async function reloadWebConfig() {
+  const themeGeneration = captureThemeRead();
   try {
     const config = await fetchJson('/api/webui/config?fresh=1');
     if (config) {
-      applyWebConfig(config);
+      applyWebConfig(config, themeGeneration);
       applyPerformanceMode();
     }
   } catch { /* keep current config */ }
@@ -297,9 +294,9 @@ function handleWsMessage(msg) {
       break;
     case 'notepad.change':
       if (msg.data) {
-        const result = applyNotepadSnapshot(msg.data, { keepLocalEdits: true });
+        const result = applyNotepadSnapshot(msg.data);
         if (result.keptLocalEdits) {
-          showNotification('他の画面でメモ帳が更新されました。保存時に再読み込みされます', 'warning');
+          showNotification('他の画面でメモ帳が更新されました。入力内容は保持しています', 'warning');
         }
       }
       break;
@@ -307,6 +304,8 @@ function handleWsMessage(msg) {
       appendConsole(msg.body || '', msg.target_console);
       break;
     case 'queue_start':
+      closedProgressScopes.delete(queueEventJobId(msg.data));
+      progressStateRevision++;
       refreshQueue();
       refreshQueueDetailedIfOpen();
       break;
@@ -322,6 +321,7 @@ function handleWsMessage(msg) {
       notifyQueueFailure(msg.data);
       break;
     case 'queue_retry':
+      removeProgressBarsForScope(queueEventJobId(msg.data));
       refreshQueue();
       refreshQueueDetailedIfOpen();
       break;
@@ -357,38 +357,20 @@ function handleWsMessage(msg) {
       rememberRebootReturnTo();
       setTimeout(() => { location.href = '/_rebooting'; }, 500);
       break;
-    case 'console.clear': {
-      const con = document.getElementById('console');
-      if (con) {
-        con.innerHTML = '';
-        setConsolePinned(con, true);
-      }
-      const con2 = document.getElementById('console-stdout2');
-      if (con2) {
-        con2.innerHTML = '';
-        setConsolePinned(con2, true);
-      }
-      clearAllProgressBars();
+    case 'console.clear':
+      clearConsoleHistoryUi();
       break;
-    }
     case 'error':
       appendConsole('[エラー] ' + (msg.data || msg.message || ''));
       break;
     case 'progressbar.init':
-      initProgressBar(msg.data?.topic, msg.target_console, msg.data?.scope);
+      setProgressBar(msg.data || {}, msg.target_console, true);
       break;
     case 'progressbar.step':
-      setProgressBar(
-        msg.data?.percent,
-        msg.data?.current,
-        msg.data?.total,
-        msg.data?.topic,
-        msg.target_console,
-        msg.data?.scope
-      );
+      setProgressBar(msg.data || {}, msg.target_console);
       break;
     case 'progressbar.clear':
-      removeProgressBar(msg.data?.topic, msg.target_console, msg.data?.scope);
+      removeProgressBar(msg.data || {}, msg.target_console);
       break;
     default:
       console.debug('Unknown WS event:', msg);
@@ -595,6 +577,9 @@ function bindConsoleAutoScroll(consoleEl) {
 }
 
 var progressBars = {};
+var closedProgressOperations = new Map();
+var closedProgressScopes = new Map();
+var progressStateRevision = 0;
 
 function getProgressHost(targetConsole) {
   var consoleEl = getConsoleEl(targetConsole);
@@ -611,149 +596,142 @@ function updateProgressHostVisibility(targetConsole) {
   var consoleEl = getConsoleEl(targetConsole);
   var host = consoleEl?.parentElement?.querySelector('.console-progress-host');
   if (!host) return;
-  var hasItems = host.childElementCount > 0;
-  host.classList.toggle('hide', !hasItems);
-  consoleEl.classList.toggle('console-with-progress', hasItems);
+  host.classList.toggle('hide', host.childElementCount === 0);
   syncPinnedConsole(consoleEl);
 }
 
-function progressBarKey(topic, targetConsole, scope) {
-  return (targetConsole || 'stdout') + ':' + (scope || topic || 'default');
+function progressBarKey(data, targetConsole) {
+  return JSON.stringify([
+    targetConsole || 'stdout', data.scope || '', data.topic || 'default', data.operation || '',
+  ]);
 }
 
-/**
- * 同じコンソール・同じ topic の job バーは 1 本だけにする。
- *
- * バーは job id を scope に持つので、scope が変わった古いバーが消し損ねられると
- * 「進捗 0/0 0.0%」が積み重なって見える。新しい init の時点で同じ topic の
- * 古いバーを落としておけば、その状態が画面に残らない。
- *
- * job id を持たないバー (自己アップデート等) は scope が空なので対象外。
- * 別系統のバーを巻き込まないよう、新規バーにも scope があるときだけ動かす。
- */
-function removeTopicProgressBars(topic, targetConsole, keepKey, scope) {
-  if (!scope) return;
-  var target = targetConsole || 'stdout';
-  var wanted = topic || '';
-  Object.keys(progressBars).forEach(function(key) {
-    if (key === keepKey) return;
-    var entry = progressBars[key];
-    if (!entry || !entry.scope) return;
-    if (entry.console !== target || entry.topic !== wanted) return;
-    removeProgressBar(entry.topic, entry.console, entry.scope);
-  });
+function rememberProgressCompletion(entries, key) {
+  entries.delete(key);
+  entries.set(key, true);
+  if (entries.size > 512) entries.delete(entries.keys().next().value);
 }
 
-/**
- * job の終端でスコープ指定のバーを消す (サーバの `progressbar.clear` が
- * 届かなかった場合の保険。通常はサーバ側も同じ scope で clear を送る)。
- */
-function removeProgressBarsForScope(scope) {
+function discardProgressBar(key) {
+  var entry = progressBars[key];
+  if (!entry) return;
+  entry.wrapper.remove();
+  delete progressBars[key];
+  progressStateRevision++;
+  updateProgressHostVisibility(entry.console);
+}
+
+/** A terminal job event closes every operation in that job, never its peers. */
+function removeProgressBarsForScope(scope, targetConsole) {
   if (typeof scope !== 'string' || !scope) return;
+  rememberProgressCompletion(closedProgressScopes, scope);
   Object.keys(progressBars).forEach(function(key) {
     var entry = progressBars[key];
-    if (!entry || entry.scope !== scope) return;
-    removeProgressBar(entry.topic, entry.console, entry.scope);
+    if (entry.scope !== scope || (targetConsole && entry.console !== targetConsole)) return;
+    if (entry.operation) rememberProgressCompletion(closedProgressOperations, key);
+    discardProgressBar(key);
   });
+  progressStateRevision++;
 }
 
-/**
- * キュー終端イベントの payload から job id を取り出す。
- * `queue_complete` は文字列、それ以外は `{ job_id }` 形式。
- */
 function queueEventJobId(data) {
   if (typeof data === 'string') return data;
   if (data && typeof data === 'object' && typeof data.job_id === 'string') return data.job_id;
   return '';
 }
 
-/**
- * キューが空なら job スコープのバーは残っていてはいけない
- * (「完了時に消去」の最後の砦)。自己アップデートのように job id を持たない
- * バー (scope が空) はここでは消さない。
- */
+/** Unknown/partial queue status is not proof that a running job is idle. */
 function clearProgressBarsWhenQueueIdle(queueStatus) {
-  if (!queueStatus) return;
-  var running = Number.isFinite(queueStatus.running_count) ? queueStatus.running_count : 0;
-  var pending = Number.isFinite(queueStatus.pending) ? queueStatus.pending : 0;
-  if (running !== 0 || pending !== 0) return;
+  if (!queueStatus || !Number.isFinite(queueStatus.running_count) || !Number.isFinite(queueStatus.pending)) return;
+  if (queueStatus.running_count !== 0 || queueStatus.pending !== 0) return;
   Object.keys(progressBars).forEach(function(key) {
-    var entry = progressBars[key];
-    if (!entry || !entry.scope) return;
-    removeProgressBar(entry.topic, entry.console, entry.scope);
+    if (progressBars[key].scope) discardProgressBar(key);
   });
 }
 
-/** キュー状態を取り直し、空になったら残っているバーを片付ける。 */
 function refreshQueueAndSyncProgressBars() {
+  var revision = progressStateRevision;
   var pending = refreshQueue();
   if (pending && typeof pending.then === 'function') {
     pending.then(function() {
-      clearProgressBarsWhenQueueIdle(State.queueStatus);
+      if (revision === progressStateRevision) clearProgressBarsWhenQueueIdle(State.queueStatus);
     }, function() {});
   }
 }
 
-function initProgressBar(topic, targetConsole, scope) {
-  var key = progressBarKey(topic, targetConsole, scope);
-  removeProgressBar(topic, targetConsole, scope);
-  removeTopicProgressBars(topic, targetConsole, key, scope);
-  var host = getProgressHost(targetConsole);
-  if (!host) return;
-  var wrapper = document.createElement('div');
-  wrapper.className = 'console-progress-item';
-  var label = document.createElement('div');
-  label.className = 'console-progress-topic';
-  label.textContent = formatProgressLabel(0, 0, 0);
-  wrapper.appendChild(label);
-  var progress = document.createElement('div');
-  progress.className = 'progress';
-  progress.innerHTML = '<div class="progress-bar" style="width:0%"></div>';
-  wrapper.appendChild(progress);
-  host.appendChild(wrapper);
-  progressBars[key] = {
-    wrapper: wrapper,
-    bar: progress.querySelector('.progress-bar'),
-    label: label,
-    topic: topic || '',
-    console: targetConsole || 'stdout',
-    scope: scope || '',
-  };
-  updateProgressHostVisibility(targetConsole);
+function setProgressBar(data, targetConsole, isInit) {
+  var key = progressBarKey(data, targetConsole);
+  if (closedProgressScopes.has(data.scope) || closedProgressOperations.has(key)) return;
+  var entry = progressBars[key];
+  var hasSequence = Number.isSafeInteger(data.sequence) && data.sequence >= 0;
+  if (entry && ((hasSequence && data.sequence <= entry.sequence) || (isInit && !hasSequence))) return;
+  if (!entry) {
+    var host = getProgressHost(targetConsole);
+    if (!host) return;
+    var wrapper = document.createElement('div');
+    wrapper.className = 'console-progress-item';
+    var label = document.createElement('div');
+    label.className = 'console-progress-topic';
+    wrapper.appendChild(label);
+    var progress = document.createElement('div');
+    progress.className = 'progress';
+    progress.setAttribute('role', 'progressbar');
+    progress.setAttribute('aria-valuemin', '0');
+    progress.setAttribute('aria-valuemax', '100');
+    var bar = document.createElement('div');
+    bar.className = 'progress-bar';
+    progress.appendChild(bar);
+    wrapper.appendChild(progress);
+    host.appendChild(wrapper);
+    entry = progressBars[key] = {
+      wrapper: wrapper, progress: progress, bar: bar, label: label,
+      topic: data.topic || 'default', console: targetConsole || 'stdout',
+      scope: data.scope || '', operation: data.operation || '', sequence: -1,
+    };
+    updateProgressHostVisibility(targetConsole);
+  }
+  if (hasSequence) entry.sequence = data.sequence;
+  var total = Number.isFinite(data.total) && data.total > 0 ? data.total : null;
+  var current = Number.isFinite(data.current) ? Math.max(0, data.current) : null;
+  if (total !== null && current !== null) current = Math.min(current, total);
+  var percent = total !== null && current !== null ? current / total * 100
+    : Number.isFinite(data.percent) ? Math.max(0, Math.min(100, data.percent)) : null;
+  var labelText = formatProgressLabel(current, total, percent);
+  if (typeof data.message === 'string' && data.message) labelText = data.message + ' — ' + labelText;
+  entry.label.textContent = labelText;
+  entry.label.title = labelText;
+  entry.progress.setAttribute('aria-valuetext', labelText);
+  entry.progress.setAttribute('aria-label', data.message || entry.topic);
+  entry.bar.classList.toggle('progress-bar-indeterminate', percent === null);
+  entry.bar.style.width = percent === null ? 'var(--progress-indeterminate-width)' : percent + '%';
+  if (percent === null) entry.progress.removeAttribute('aria-valuenow');
+  else entry.progress.setAttribute('aria-valuenow', String(percent));
+  progressStateRevision++;
 }
 
-function setProgressBar(percent, current, total, topic, targetConsole, scope) {
-  var key = progressBarKey(topic, targetConsole, scope);
-  if (!progressBars[key]) initProgressBar(topic, targetConsole, scope);
-  progressBars[key].bar.style.width = (percent || 0) + '%';
-  progressBars[key].label.textContent = formatProgressLabel(current, total, percent);
-}
-
-function removeProgressBar(topic, targetConsole, scope) {
-  var key = progressBarKey(topic, targetConsole, scope);
-  if (!progressBars[key]) return;
-  var wrapper = progressBars[key].wrapper;
-  if (wrapper) wrapper.remove();
-  delete progressBars[key];
-  updateProgressHostVisibility(targetConsole);
+function removeProgressBar(data, targetConsole) {
+  if (data.scope && !data.topic && !data.operation) {
+    removeProgressBarsForScope(data.scope, targetConsole);
+    return;
+  }
+  var key = progressBarKey(data, targetConsole);
+  var entry = progressBars[key];
+  if (entry && Number.isSafeInteger(data.sequence) && data.sequence < entry.sequence) return;
+  if (data.operation) rememberProgressCompletion(closedProgressOperations, key);
+  discardProgressBar(key);
 }
 
 function clearAllProgressBars() {
-  Object.keys(progressBars).forEach(function(key) {
-    var wrapper = progressBars[key].wrapper;
-    if (wrapper) wrapper.remove();
-  });
-  progressBars = {};
-  ['stdout', 'stdout2'].forEach(function(targetConsole) {
-    updateProgressHostVisibility(targetConsole);
-  });
+  Object.keys(progressBars).forEach(discardProgressBar);
+  closedProgressOperations.clear();
+  closedProgressScopes.clear();
+  progressStateRevision++;
 }
 
 function formatProgressLabel(current, total, percent) {
-  var currentValue = Number.isFinite(current) ? current : 0;
-  var totalValue = Number.isFinite(total) ? total : 0;
-  var percentValue = Number.isFinite(percent) ? percent : 0;
-  return '進捗 ' + currentValue + '/' + totalValue + ' ' + percentValue.toFixed(1) + '%';
+  if (percent === null) return current ? '進捗 ' + current + '（全体確認中）' : '進捗（準備中）';
+  var counts = total !== null && current !== null ? current + '/' + total + ' ' : '';
+  return '進捗 ' + counts + percent.toFixed(1) + '%';
 }
 
 function sanitizeConsoleSpanStyle(styleText) {
@@ -854,6 +832,7 @@ var lastLineComplete = true;
 function appendConsole(text, targetConsole) {
   const con = getConsoleEl(targetConsole);
   if (!con) return;
+  State.consoleRevision++;
 
   mirrorConsoleToDevtools(text, targetConsole);
 

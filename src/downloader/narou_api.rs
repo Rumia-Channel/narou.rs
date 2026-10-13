@@ -1,14 +1,14 @@
-#[cfg(feature = "native-runtime")]
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 
 use crate::error::Result;
-#[cfg(feature = "native-runtime")]
-use crate::platform::NovelRepository;
 use crate::platform::{HttpClient, HttpRequest, RateLimitScope, RateLimiter};
 
 use super::http_policy::{ensure_success_response, host_of};
 #[cfg(feature = "native-runtime")]
 use super::rate_limit::RateLimiter as NativeRateLimiter;
+use super::types::NarouApiEntry;
 
 const NAROU_API_DEFAULT_USER_AGENT: &str = "Narou RS";
 const NAROU_API_DEFAULT_INTERVAL_SECS: f64 = 1.0;
@@ -70,171 +70,86 @@ pub async fn fetch_narou_api_json(
     user_agent: &str,
 ) -> Result<String> {
     http.validate_url(url).await?;
-    rate_limiter
-        .acquire(&RateLimitScope::site(host_of(url)))
-        .await?;
+    let scope = RateLimitScope::site(host_of(url));
     let request = HttpRequest::get(url).with_header("User-Agent", user_agent);
-    let response = http.send(request).await?;
+    let response = http.send_paced(
+        request, crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
+    ).await?;
     let response = ensure_success_response(url, response)?;
     Ok(String::from_utf8_lossy(&response.body).into_owned())
 }
 
+/// Parse a Syosetu API JSON response into entries.
+///
+/// The API returns either a flat array whose first element is the `allcount`
+/// metadata (`[{"allcount":N}, {entry}, ...]`) or an object with a `data`
+/// array. Entries without an `ncode` are skipped.
+pub fn parse_narou_api_entries(body: &str) -> Vec<NarouApiEntry> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+
+    match value {
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .filter(|v| v.get("ncode").is_some())
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect(),
+        serde_json::Value::Object(mut map) => {
+            if let Some(data) = map.remove("data") {
+                serde_json::from_value(data).unwrap_or_default()
+            } else if map.get("ncode").is_some() {
+                serde_json::from_value(serde_json::Value::Object(map))
+                    .ok()
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Parse a date/time string from the Syosetu API.
-/// The API returns dates as `"YYYY-MM-DD HH:MM:SS"` (not RFC 3339).
-#[cfg(feature = "native-runtime")]
-fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
+/// The API returns dates as `"YYYY-MM-DD HH:MM:SS"` (not RFC 3339), in JST.
+pub fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
     super::parse_datetime_with_timezone(value, Some("Asia/Tokyo"))
 }
 
-/// Parse Syosetu API JSON response.
-/// The API returns a flat array: `[{"allcount":N}, {entry1}, {entry2}, ...]`.
-#[cfg(feature = "native-runtime")]
-fn parse_api_entries(body: &str) -> Vec<serde_json::Value> {
-    let arr: Vec<serde_json::Value> = match serde_json::from_str(body) {
-        Ok(a) => a,
-        Err(_) => return Vec::new(),
-    };
-    // Skip first element (allcount metadata), return data entries that have ncode
-    arr.into_iter()
-        .skip(1)
-        .filter(|v| v.get("ncode").is_some())
-        .collect()
-}
-
-/// Batch-refresh なろうAPI metadata for all なろう records.
+/// Match the API's entries to the requested `(id, ncode)` chunk.
 ///
-/// Native-only orchestration: it uses the native dedicated API rate limiter
-/// (`download.narou-api.*` settings). Worker builds schedule their own batch
-/// jobs with an injected platform `RateLimiter`; the portable request/parse
-/// helpers (`fetch_narou_api_json` and friends) remain available to both.
-#[cfg(feature = "native-runtime")]
-pub async fn narou_api_batch_update(
-    http: &dyn HttpClient,
-    novels: &dyn NovelRepository,
-) -> Result<(usize, usize)> {
-    // なろう対象の一覧をページング query で一括取得する。scan_ids + get の
-    // N+1 (ID 一覧 → 1 件ずつ get) ではなく、フィルタ済みレコードを直接
-    // ページ取得して `ncode` のないレコードはスキップする。
-    let mut narou_records: Vec<crate::db::novel_record::NovelRecord> = Vec::new();
-    let filter = crate::platform::NovelFilter {
-        is_narou: Some(true),
-        ..Default::default()
-    };
-    const SCAN_PAGE: usize = 500;
-    let mut offset = 0usize;
-    loop {
-        let page = novels
-            .query(&crate::platform::NovelQuery::page(
-                filter.clone(),
-                crate::platform::NovelSort::default(),
-                offset,
-                SCAN_PAGE,
-            ))
-            .await?;
-        let page_len = page.len();
-        narou_records.extend(page.into_iter().filter(|record| record.ncode.is_some()));
-        if page_len < SCAN_PAGE {
-            break;
-        }
-        offset += page_len;
-    }
-    let narou_ids: Vec<(i64, String)> = narou_records
-        .iter()
-        .map(|record| (record.id, record.ncode.clone().unwrap()))
-        .collect();
+/// Returns the `(id, entry)` pairs the API answered for (case-insensitive
+/// ncode match, first match wins) and the ids the API did not answer for, so
+/// the caller can fall back to fetching those novels directly. Fallback ids
+/// are sorted and deduplicated.
+pub fn classify_narou_api_chunk(
+    chunk: &[(i64, String)],
+    entries: &[NarouApiEntry],
+) -> (Vec<(i64, NarouApiEntry)>, Vec<i64>) {
+    let mut updates = Vec::new();
+    let mut fallback_ids = Vec::new();
+    let mut seen_ncodes = HashSet::new();
 
-    if narou_ids.is_empty() {
-        return Ok((0, 0));
-    }
-
-    let api_url = "https://api.syosetu.com/novelapi/api/";
-    let api_user_agent = narou_api_user_agent();
-    let api_rate_limiter = narou_api_rate_limiter();
-    let mut total_updated = 0usize;
-    let mut total_failed = 0usize;
-
-    // Ruby prepends `n-` to the of parameter (api.rb:38).
-    // API field abbreviations: n=ncode, t=title, w=writer, s=story,
-    // nt=novel_type, e=end, ga=general_all_no, gf=general_firstup,
-    // gl=general_lastup, nu=novelupdated_at, l=length
-    for chunk in narou_ids.chunks(50) {
-        let ncodes: Vec<&str> = chunk.iter().map(|(_, nc)| nc.as_str()).collect();
-        let ncode_param = ncodes.join("-");
-
-        let url = format!(
-            "{}?of=n-t-nt-ga-gf-nu-gl-l-w-s-e&out=json&ncode={}",
-            api_url, ncode_param
-        );
-
-        let body = match fetch_narou_api_json(http, &api_rate_limiter, &url, &api_user_agent).await
-        {
-            Ok(b) => b,
-            Err(_) => {
-                total_failed += chunk.len();
-                continue;
-            }
+    for entry in entries {
+        let Some((id, _)) = chunk
+            .iter()
+            .find(|(_, ncode)| ncode.eq_ignore_ascii_case(&entry.ncode))
+        else {
+            continue;
         };
 
-        let entries = parse_api_entries(&body);
-
-        // Apply the whole chunk in one `apply_batch` instead of a get +
-        // per-entry upsert: native saves the YAML once, D1 issues one
-        // transaction per 50-novel chunk.
-        let mut mutations = Vec::new();
-        for entry in &entries {
-            let entry_ncode = entry.get("ncode").and_then(|v| v.as_str()).unwrap_or("");
-
-            if let Some(record) = narou_records
-                .iter()
-                .find(|record| {
-                    record
-                        .ncode
-                        .as_deref()
-                        .is_some_and(|nc| nc.eq_ignore_ascii_case(entry_ncode))
-                })
-                .cloned()
-            {
-                let mut r = record;
-
-                if let Some(s) = entry.get("title").and_then(|v| v.as_str()) {
-                    r.title = s.to_string();
-                }
-                if let Some(s) = entry.get("writer").and_then(|v| v.as_str()) {
-                    r.author = s.to_string();
-                }
-                if let Some(n) = entry.get("end").and_then(|v| v.as_i64()) {
-                    r.end = n == 1;
-                }
-                if let Some(n) = entry.get("general_all_no").and_then(|v| v.as_i64()) {
-                    r.general_all_no = Some(n);
-                }
-                if let Some(n) = entry.get("length").and_then(|v| v.as_i64()) {
-                    r.length = Some(n);
-                }
-
-                if let Some(s) = entry.get("general_firstup").and_then(|v| v.as_str()) {
-                    r.general_firstup = parse_api_datetime(s);
-                }
-                if let Some(s) = entry.get("general_lastup").and_then(|v| v.as_str()) {
-                    r.general_lastup = parse_api_datetime(s);
-                }
-                if let Some(s) = entry.get("novelupdated_at").and_then(|v| v.as_str()) {
-                    r.novelupdated_at = parse_api_datetime(s);
-                }
-
-                if let Some(nt) = entry.get("novel_type").and_then(|v| v.as_i64()) {
-                    r.novel_type = if nt == 2 { 2 } else { 1 };
-                }
-
-                mutations.push(crate::platform::NovelMutation::Upsert(r));
-            }
-        }
-        let updated = mutations.len();
-        if !mutations.is_empty() {
-            novels.apply_batch(mutations).await?;
-        }
-        total_updated += updated;
+        seen_ncodes.insert(entry.ncode.to_ascii_lowercase());
+        updates.push((*id, entry.clone()));
     }
 
-    Ok((total_updated, total_failed))
+    for (id, ncode) in chunk {
+        if !seen_ncodes.contains(&ncode.to_ascii_lowercase()) {
+            fallback_ids.push(*id);
+        }
+    }
+
+    fallback_ids.sort_unstable();
+    fallback_ids.dedup();
+    (updates, fallback_ids)
 }

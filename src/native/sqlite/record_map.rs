@@ -7,11 +7,10 @@ use rusqlite::types::Value;
 use rusqlite::Row;
 
 use crate::db::novel_codec::{
-    self, MAX_EXTRA_FIELDS_BYTES, NOVEL_SELECT_COLUMNS, NovelBind,
+    self, MAX_EXTRA_FIELDS_BYTES, NOVEL_SELECT_COLUMNS, NOVEL_UPSERT_SQL, NovelBind,
 };
 use crate::db::NovelRecord;
 use crate::error::{NarouError, Result};
-use crate::native::sqlite::query::UPSERT_SQL;
 
 fn driver_bind(value: Value, name: &'static str) -> Result<NovelBind> {
     Ok(match value {
@@ -31,7 +30,7 @@ fn driver_bind(value: Value, name: &'static str) -> Result<NovelBind> {
     })
 }
 
-/// Decode one `select_sql()` row. Column names (not positional indices) carry
+/// Decode one `novel_query::select_sql()` row. Column names (not positional indices) carry
 /// each cell to its record field, so the SELECT list cannot silently drift.
 pub(crate) fn record_from_row(row: &Row<'_>) -> Result<NovelRecord> {
     let mut columns = Vec::with_capacity(NOVEL_SELECT_COLUMNS.len());
@@ -44,7 +43,20 @@ pub(crate) fn record_from_row(row: &Row<'_>) -> Result<NovelRecord> {
     novel_codec::record_from_columns(columns, novel_codec::parse_extra_fields)
 }
 
-/// Convert one named bind to a `rusqlite::types::Value`.
+/// Convert one filter bind (`crate::db::novel_query`) to a
+/// `rusqlite::types::Value`.
+///
+/// Filter binds carry no column name, so only record binds below apply the
+/// `login_session` convention; a [`NovelBind::Null`] here is a real SQL NULL.
+pub(crate) fn query_bind(bind: NovelBind) -> Value {
+    match bind {
+        NovelBind::Text(text) => Value::Text(text),
+        NovelBind::Int(int) => Value::Integer(int),
+        NovelBind::Null => Value::Null,
+    }
+}
+
+/// Convert one named record bind to a `rusqlite::types::Value`.
 fn to_sql_value(name: &'static str, bind: &NovelBind) -> Value {
     match bind {
         NovelBind::Text(text) => Value::Text(text.clone()),
@@ -57,12 +69,13 @@ fn to_sql_value(name: &'static str, bind: &NovelBind) -> Value {
     }
 }
 
-/// Encode a record into positional SQL parameters for `UPSERT_SQL`. The order
-/// is derived from the SQL statement itself, not from a hand-maintained list.
+/// Encode a record into positional SQL parameters for `NOVEL_UPSERT_SQL`. The
+/// order is derived from the SQL statement itself, not from a hand-maintained
+/// list.
 pub(crate) fn record_params(record: &NovelRecord) -> Result<Vec<Value>> {
     let binds = novel_codec::novel_binds(record)?;
     novel_codec::check_extra_fields_limit(&binds, MAX_EXTRA_FIELDS_BYTES)?;
-    Ok(novel_codec::ordered_binds(UPSERT_SQL, &binds)?
+    Ok(novel_codec::ordered_binds(NOVEL_UPSERT_SQL, &binds)?
         .into_iter()
         .map(|(name, bind)| to_sql_value(name, bind))
         .collect())

@@ -18,6 +18,7 @@ pub fn compare_records_by_key(a: &NovelRecord, b: &NovelRecord, key: &str) -> Or
         "status" => record_status_key(a).cmp(&record_status_key(b)),
         "toc_url" => a.toc_url.cmp(&b.toc_url),
         "new_arrivals_date" => a.new_arrivals_date.cmp(&b.new_arrivals_date),
+        "average_length" => a.average_length().cmp(&b.average_length()),
         _ => a.id.cmp(&b.id),
     }
 }
@@ -37,6 +38,7 @@ pub const SORT_KEYS: &[&str] = &[
     "status",
     "toc_url",
     "new_arrivals_date",
+    "average_length",
 ];
 
 pub fn sort_keys() -> &'static [&'static str] {

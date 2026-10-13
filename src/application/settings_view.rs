@@ -7,7 +7,7 @@
 //! `setting_info` の純関数だけで、Web フレームワークもファイルシステムも
 //! 持ち込まない。
 
-use crate::application::settings::{SettingEntry, SettingsEffect, SettingsService};
+use crate::application::settings::{SettingEntry, SettingsService};
 use crate::converter::device::Device;
 use crate::setting_core::SettingScope;
 use crate::setting_info::{
@@ -76,6 +76,7 @@ pub const SORT_COLUMN_LABELS: &[&str] = &[
     "状態",           // 11 status
     "URL",            // 12 toc_url
     "新着日",         // 13 new_arrivals_date
+    "平均文字数",     // 14 average_length
 ];
 
 /// ソートキーの日本語ラベル。
@@ -215,7 +216,7 @@ pub fn parse_changes(body: &serde_json::Value) -> Option<Vec<(String, serde_json
 pub async fn apply_save(
     settings: &SettingsService,
     body: &serde_json::Value,
-) -> Result<Vec<SettingsEffect>, crate::application::ApplicationError> {
+) -> Result<crate::application::settings::SettingsSaveResult, crate::application::ApplicationError> {
     use crate::application::ApplicationError;
     let changes = parse_changes(body)
         .ok_or_else(|| ApplicationError::InvalidRequest("settings object required".to_string()))?;
@@ -243,15 +244,36 @@ pub async fn apply_save(
     } else {
         None
     };
-    let effects = settings.apply_json_checked(&changes, expected).await?;
-    if let Some((expected, content)) = replacement {
-        settings.save_replace_content_checked(&expected, content).await?;
+    let mut result = settings.apply_json_checked(&changes, expected).await?;
+    if result.failure.is_none()
+        && let Some((expected, content)) = replacement
+    {
+        match settings.save_replace_content_checked(&expected, content).await {
+            Ok(()) => result.replace_content = Some(content.to_string()),
+            Err(error) => result.failure = Some(error),
+        }
     }
-    Ok(effects)
+    Ok(result)
 }
 
 /// 保存成功時のメッセージ（native / Worker で同じ文言）。
 pub const SAVE_MESSAGE: &str = "設定を保存しました";
+
+/// Acknowledge this save's values, not a subsequent read of mutable settings.
+pub fn save_response(result: &crate::application::settings::SettingsSaveResult) -> serde_json::Value {
+    let conflict = matches!(&result.failure, Some(crate::application::ApplicationError::Conflict(_)));
+    let mut response = serde_json::json!({
+        "success": result.failure.is_none(),
+        "partial": result.failure.is_some() && !result.settings.is_empty(),
+        "conflict": conflict,
+        "message": result.failure.as_ref().map(ToString::to_string).unwrap_or_else(|| SAVE_MESSAGE.to_string()),
+        "settings": result.settings,
+    });
+    if let Some(content) = &result.replace_content {
+        response["replace_content"] = serde_json::json!(content);
+    }
+    response
+}
 
 fn build_setting_entry(
     name: &str,

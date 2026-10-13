@@ -16,9 +16,17 @@
 //
 // 呼び出し (Worker 側):
 //   POST /proxy  { "url": "https://syosetu.org/novel/426898/1.html",
-//                  "headers": { "user-agent": "...", "cookie": "..." },
-//                  "redirect": "follow" | "manual" }
-//   → { "status": 200, "contentType": "text/html; charset=UTF-8", "body": "<base64>" }
+//                  "headers": { "user-agent": "...", "cookie": "..." } }
+//   → { "status": 200, "contentType": "text/html; charset=UTF-8",
+//        "location": "...", "setCookie": ["..."], "body": "<base64>" }
+//
+// 取得は 1 回だけでリダイレクトは辿らない (`Location` を返す)。チェーンを辿る
+// 責務は呼び出し側にあり、hop ごとの検証もそちらが行う。curl -L を無条件に
+// 付けると資格情報を私設アドレスへ運びうるため、ここでは辿らない。
+//
+// 同名ヘッダは値の配列で受け取り (`{"X": ["a", "b"]}`)、受けた順に送る。
+// 応答の Set-Cookie は全部 `setCookie` に載せる (ログインセッションの更新は
+// 1 本も落とせない)。
 //
 // 認証: X-Proxy-Token ヘッダが SORAHOST_PROXY_KEY と一致しない限り 403 を返す。
 // オープンプロキシ化を防ぐため SORAHOST_PROXY_KEY 未設定では起動しない。
@@ -28,9 +36,19 @@ import { execFile } from "node:child_process";
 import { existsSync, copyFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 
+import {
+  MAX_BODY_BYTES,
+  MAX_HEAD_BYTES,
+  MAX_REQUEST_BYTES,
+  assertResponseMetadata,
+  decodeHeaderJson,
+  headerPairs,
+  parseJsonObject,
+  readBoundedBytes,
+  readResponseBytes,
+} from "./worker/protocol.mjs";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.SORAHOST_PROXY_KEY || "";
-const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 30_000;
 const CURL_TIMEOUT_SECS = 30;
 
@@ -60,17 +78,66 @@ if (!TOKEN) {
   process.exit(1);
 }
 
+// IncomingMessage のキャンセルでソケットを破棄せず、400 を返して残りを捨てる。
 const readBody = async (req) => {
-  let body = "";
-  for await (const chunk of req) {
-    body += chunk;
-    if (body.length > 64 * 1024) throw new Error("request too large");
-  }
-  return body;
+  const chunks = req.iterator({ destroyOnReturn: false });
+  const stream = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await chunks.next();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      try {
+        await chunks.return();
+      } finally {
+        req.resume();
+      }
+    },
+  }, { highWaterMark: 0 });
+  return parseJsonObject(await readBoundedBytes(stream, {
+    limit: MAX_REQUEST_BYTES,
+    contentLength: req.headers["content-length"] ?? null,
+    label: "request",
+  }));
 };
 
-/// curl で取得する。`-i` でヘッダも stdout に出すので、最初の空行で分ける。
-const viaCurl = (url, headers, manual) =>
+/// `-i` 出力 (status 行 + ヘッダ + 空行 + 本文) を最後のヘッダブロックと本文に
+/// 分ける。100 Continue や CONNECT 応答が混ざる場合は最後の status 行から
+/// 始まるブロックだけが本体の応答。
+const splitHead = (buffer) => {
+  let offset = 0;
+  for (;;) {
+    const end = buffer.indexOf("\r\n\r\n", offset);
+    if (end < 0) return null;
+    const next = end + 4;
+    if (next > MAX_HEAD_BYTES) return null;
+    if (buffer.subarray(next, next + 5).toString("utf8").startsWith("HTTP/")) {
+      offset = next;
+      continue;
+    }
+    const lines = buffer.subarray(offset, end).toString("utf8").split("\r\n");
+    const status = Number((lines[0].match(/^HTTP\/[\d.]+ (\d{3})/) || [])[1] || 0);
+    const headers = [];
+    for (const line of lines.slice(1)) {
+      const separator = line.indexOf(":");
+      if (separator > 0) {
+        headers.push([line.slice(0, separator).trim(), line.slice(separator + 1).trim()]);
+      }
+    }
+    return { status, headers, body: buffer.subarray(next) };
+  }
+};
+
+const headerValue = (headers, name) =>
+  headers.find(([header]) => header.toLowerCase() === name)?.[1] || "";
+
+/// curl で取得する。リダイレクトは辿らない (呼び出し側が hop ごとに追跡する)。
+const viaCurl = (url, headers) =>
   new Promise((resolve, reject) => {
     const args = [
       "-sS",
@@ -80,47 +147,66 @@ const viaCurl = (url, headers, manual) =>
       "10",
       "--max-time",
       String(CURL_TIMEOUT_SECS),
-      "--max-redirs",
-      manual ? "0" : "5",
       "--max-filesize",
       String(MAX_BODY_BYTES),
     ];
     if (existsSync(BUNDLED_CACERT)) {
       args.push("--cacert", BUNDLED_CACERT);
     }
-    for (const [name, value] of Object.entries(headers)) {
+    for (const [name, value] of headers) {
       args.push("-H", `${name}: ${value}`);
     }
     args.push("--", url);
-    execFile(CURL_BIN, args, { maxBuffer: MAX_BODY_BYTES, encoding: "buffer" }, (error, stdout) => {
-      if (error && !stdout?.length) {
-        return reject(new Error(`curl failed: ${error.message}`));
+    execFile(CURL_BIN, args, {
+      maxBuffer: MAX_HEAD_BYTES + MAX_BODY_BYTES,
+      encoding: "buffer",
+    }, (error, stdout) => {
+      if (error) {
+        // execFile の message は command / headers / stderr を含みうる。
+        // 資格情報や任意長の診断を返さず、有限の分類だけを伝える。
+        let reason = "request failed";
+        if (Number.isSafeInteger(error.code)) reason = `exit ${error.code}`;
+        else if (error.code === "ENOENT") reason = "not installed";
+        else if (error.code === "EACCES") reason = "not executable";
+        else if (error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") reason = "output limit exceeded";
+        else if (error.killed) reason = "terminated";
+        return reject(new Error(`curl failed: ${reason}`));
       }
       const buffer = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout ?? "");
-      const split = buffer.indexOf("\r\n\r\n");
-      if (split < 0) return reject(new Error("curl returned no header block"));
-      const head = buffer.subarray(0, split).toString("utf8");
-      const body = buffer.subarray(split + 4);
-      const status = Number((head.match(/^HTTP\/[\d.]+ (\d{3})/m) || [])[1] || 0);
-      const contentType = (head.match(/^content-type:\s*(.+)$/im) || [])[1]?.trim() || "";
-      const location = (head.match(/^location:\s*(.+)$/im) || [])[1]?.trim() || undefined;
-      resolve({ status, contentType, location, body });
+      const split = splitHead(buffer);
+      if (!split) return reject(new Error("curl returned no header block"));
+      if (split.body.length > MAX_BODY_BYTES) {
+        return reject(new Error(`response too large: ${split.body.length}`));
+      }
+      resolve({
+        status: split.status,
+        contentType: headerValue(split.headers, "content-type"),
+        location: headerValue(split.headers, "location") || undefined,
+        setCookie: split.headers
+          .filter(([name]) => name.toLowerCase() === "set-cookie")
+          .map(([, value]) => value),
+        body: split.body,
+      });
     });
   });
 
 /// curl が無い環境向けの保険。Node の fetch は Cloudflare にチャレンジされ
-/// やすいため、あくまで代替。
-const viaFetch = async (url, headers, manual) => {
+/// やすいため、あくまで代替。curl 経路と同じくリダイレクトは辿らない。
+const viaFetch = async (url, headers) => {
   const response = await fetch(url, {
-    headers,
-    redirect: manual ? "manual" : "follow",
+    headers: headers.map(([name, value]) => [
+      name, Buffer.from(value, "utf8").toString("latin1"),
+    ]),
+    redirect: "manual",
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
-  const body = Buffer.from(await response.arrayBuffer());
+  const bytes = await readResponseBytes(response);
+  const body = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   return {
     status: response.status,
     contentType: response.headers.get("content-type") || "",
     location: response.headers.get("location") || undefined,
+    setCookie: response.headers.getSetCookie ? response.headers.getSetCookie() : [],
     body,
   };
 };
@@ -147,24 +233,23 @@ const handler = async (req, res) => {
   let payload;
   if (req.method === "POST") {
     try {
-      payload = JSON.parse(await readBody(req));
+      payload = await readBody(req);
     } catch (error) {
       return json(400, { error: `bad request: ${error.message}` });
     }
   } else if (req.method === "GET") {
     let headers = {};
     const rawHeaders = requestUrl.searchParams.get("headers");
-    if (rawHeaders) {
+    if (rawHeaders !== null) {
       try {
-        headers = JSON.parse(Buffer.from(rawHeaders, "base64").toString("utf8"));
-      } catch {
-        return json(400, { error: "bad request: headers must be base64 JSON" });
+        headers = decodeHeaderJson(rawHeaders);
+      } catch (error) {
+        return json(400, { error: `bad request: ${error.message}` });
       }
     }
     payload = {
       url: requestUrl.searchParams.get("url") || "",
       headers,
-      redirect: requestUrl.searchParams.get("redirect") || "follow",
     };
   } else {
     return json(405, { error: "method not allowed" });
@@ -175,30 +260,25 @@ const handler = async (req, res) => {
     return json(400, { error: "url must be http(s)" });
   }
 
-  const headers = {};
-  for (const [name, value] of Object.entries(payload.headers || {})) {
-    if (typeof value === "string") headers[name] = value;
-  }
-  const manual = payload.redirect === "manual";
+  const headers = headerPairs(payload.headers);
 
   try {
     let result;
     try {
-      result = await viaCurl(target, headers, manual);
+      result = await viaCurl(target, headers);
     } catch (curlError) {
-      result = await viaFetch(target, headers, manual);
+      result = await viaFetch(target, headers);
       result.via = `fetch (curl unavailable: ${curlError.message})`;
     }
-    if (result.body.length > MAX_BODY_BYTES) {
-      return json(502, { error: `response too large: ${result.body.length}` });
-    }
-    return json(200, {
+    const metadata = {
       status: result.status,
       contentType: result.contentType,
       location: result.location,
+      setCookie: result.setCookie,
       via: result.via,
-      body: result.body.toString("base64"),
-    });
+    };
+    assertResponseMetadata(metadata);
+    return json(200, { ...metadata, body: result.body.toString("base64") });
   } catch (error) {
     return json(502, { error: `fetch failed: ${error.message}` });
   }

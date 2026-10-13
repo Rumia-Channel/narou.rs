@@ -250,7 +250,10 @@ pub fn load_output(conn: &Connection, novel_id: i64, kind: &str) -> Result<Optio
                 .get(1)
                 .map_err(|error| NarouError::Platform(error.to_string()))?;
             let encoding = ObjectEncoding::parse(&encoding)?;
-            Ok(Some(decompress_object_payload(&payload, encoding)?))
+            Ok(Some(match encoding {
+                ObjectEncoding::None => payload,
+                _ => decompress_object_payload(&payload, encoding)?,
+            }))
         }
         None => Ok(None),
     }
@@ -261,9 +264,7 @@ mod tests {
     use super::*;
 
     /// Fresh in-memory schema plus the minimal novel row the section tables'
-    /// foreign key needs. A `parking_lot` mutex gives the tests a guard
-    /// without the poisoning unwrap (the production handle keeps its
-    /// documented `Arc<std::sync::Mutex<Connection>>` type).
+    /// foreign key needs.
     fn test_conn() -> parking_lot::Mutex<Connection> {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
@@ -347,5 +348,17 @@ mod tests {
             .unwrap();
         let error = load_sections(&guard, 7).unwrap_err();
         assert!(error.to_string().contains("CRC"), "{error}");
+    }
+
+    #[test]
+    fn converted_output_returns_decoded_utf8_and_rejects_invalid_encoding() {
+        let conn = test_conn();
+        let guard = conn.lock();
+        let text = "圧縮された変換済み本文を読み出す。\n".repeat(512);
+        store_output(&guard, 7, "converted_text", text.as_bytes()).unwrap();
+        let output = load_output(&guard, 7, "converted_text").unwrap().unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), text);
+        guard.execute("UPDATE novel_outputs SET encoding = 'invalid-codec' WHERE novel_id = 7", []).unwrap();
+        assert!(matches!(load_output(&guard, 7, "converted_text"), Err(NarouError::Platform(_))));
     }
 }

@@ -5,11 +5,14 @@ use std::process::{ChildStderr, ChildStdout, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use serde_yaml::{Number, Value};
 use tokio::task::JoinHandle;
 use crate::application::messages::jobs as job_msgs;
-use crate::application::{JobKind, JobRequest, JobService, Schedule};
+use crate::application::scheduler::{
+    CatchUp, DstGap, WallClockZone, parse_auto_update_schedule,
+};
+use crate::application::{JobKind, JobRequest, JobService, SchedulerService};
 use crate::compat::{
     configure_web_subprocess_command, load_local_setting_bool, load_local_setting_string,
     load_local_setting_value, record_is_frozen,
@@ -23,30 +26,46 @@ use super::push::PushServer;
 use super::sort_state::{current_sort_from_server_setting, normalize_sort_key, sort_column_key};
 
 const AUTO_UPDATE_LAST_RUN_KEY: &str = "update.auto-schedule.last-run";
+
+/// native は DST ギャップを +1 分ずつ繰り上げる (共有既定の `Skip` は使わない)。
+const DST_GAP: DstGap = DstGap::RollForwardMinutes(1);
+
 pub fn start_auto_update_scheduler(
+    scheduler: Arc<SchedulerService>,
     queue: Arc<PersistentQueue>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     push_server: Arc<PushServer>,
 ) -> Option<JoinHandle<()>> {
     let enabled = load_local_setting_bool("update.auto-schedule.enable");
     let schedule_string = load_local_setting_string("update.auto-schedule")?;
-    if !enabled || schedule_string.trim().is_empty() {
-        return None;
-    }
+    let schedule = match parse_auto_update_schedule(enabled, &schedule_string) {
+        Ok(Some(schedule)) => schedule,
+        Ok(None) => return None,
+        Err(message) => {
+            // eprintln 経由でも同じ文言を出す (headless 実行時に stderr へ残す)。
+            eprintln!("{message}");
+            push_server.broadcast_echo(&message, "stdout");
+            return None;
+        }
+    };
 
-    let times = parse_schedule_times(&schedule_string);
-    if times.is_empty() {
-        // eprintln 経由でも同じ文言を出す (headless 実行時に stderr へ残す)。
-        let message = crate::application::messages::jobs::auto_update_schedule_invalid(
-            &schedule_string,
-        );
-        eprintln!("{message}");
-        push_server.broadcast_echo(&message, "stdout");
-        return None;
-    }
-
-    let timezone = load_schedule_timezone(&push_server);
-    let catch_up_run = missed_run_time(&times, load_last_auto_update_run(), Local::now(), timezone);
+    let zone = match load_schedule_timezone(&push_server) {
+        Some(timezone) => WallClockZone::Iana(timezone),
+        None => WallClockZone::Local,
+    };
+    // native の判断材料だけをここに残す: last-run は epoch 秒、DST ギャップは
+    // +1 分丸め、last-run 未記録は catch-up しない (モードで共有層へ渡す)。
+    let policy = scheduler.policy(enabled, schedule, Vec::new());
+    let decision = scheduler.decide_with_modes(
+        &policy,
+        load_last_auto_update_run(),
+        zone,
+        DST_GAP,
+        CatchUp::SingleMissed,
+    );
+    let catch_up_run = decision
+        .missed_run
+        .map(|missed| missed.with_timezone(&Local));
     Some(tokio::spawn(async move {
         if let Some(missed_run) = catch_up_run {
             run_scheduled_auto_update(
@@ -59,7 +78,10 @@ pub fn start_auto_update_scheduler(
         }
 
         loop {
-            let Some(next_run) = calculate_next_run_time(&times, timezone) else {
+            let Some(next_run) = scheduler
+                .next_run(&policy, zone, DST_GAP)
+                .map(|next| next.with_timezone(&Local))
+            else {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 continue;
             };
@@ -97,6 +119,7 @@ fn load_schedule_timezone(push_server: &PushServer) -> Option<chrono_tz::Tz> {
 }
 
 pub fn start_or_restart_auto_update_scheduler(
+    scheduler: Arc<SchedulerService>,
     queue: Arc<PersistentQueue>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     push_server: Arc<PushServer>,
@@ -106,19 +129,10 @@ pub fn start_or_restart_auto_update_scheduler(
         task.abort();
     }
 
-    let task = start_auto_update_scheduler(queue, running_jobs, push_server);
+    let task = start_auto_update_scheduler(scheduler, queue, running_jobs, push_server);
     let started = task.is_some();
     *scheduler_task.lock() = task;
     started
-}
-
-pub fn restart_auto_update_scheduler(
-    queue: Arc<PersistentQueue>,
-    running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
-    push_server: Arc<PushServer>,
-    scheduler_task: &parking_lot::Mutex<Option<JoinHandle<()>>>,
-) -> bool {
-    start_or_restart_auto_update_scheduler(queue, running_jobs, push_server, scheduler_task)
 }
 
 fn run_scheduled_auto_update(
@@ -167,119 +181,13 @@ pub fn stop_auto_update_scheduler(scheduler_task: &parking_lot::Mutex<Option<Joi
     }
 }
 
-fn parse_schedule_times(schedule_string: &str) -> Vec<(u32, u32)> {
-    Schedule::parse(schedule_string).times
-}
-
-fn calculate_next_run_time(
-    times: &[(u32, u32)],
-    timezone: Option<chrono_tz::Tz>,
-) -> Option<chrono::DateTime<Local>> {
-    // タイムゾーン指定時はそのゾーンの壁時計で HHMM を解決し、結果だけを
-    // Local に戻す (sleep/display は Local ベースで統一するため)。
-    match timezone {
-        Some(tz) => {
-            calculate_next_run_time_after(times, Utc::now().with_timezone(&tz))
-                .map(|value| value.with_timezone(&Local))
-        }
-        None => calculate_next_run_time_after(times, Local::now()),
-    }
-}
-
-fn calculate_next_run_time_after<Tz>(
-    times: &[(u32, u32)],
-    after: DateTime<Tz>,
-) -> Option<DateTime<Tz>>
-where
-    Tz: TimeZone,
-    Tz::Offset: Copy,
-{
-    for &(hour, minute) in times {
-        let candidate = local_datetime_in_timezone(
-            &after.timezone(),
-            after.year(),
-            after.month(),
-            after.day(),
-            hour,
-            minute,
-        )?;
-        if candidate > after {
-            return Some(candidate);
-        }
-    }
-
-    let tomorrow = after.date_naive().succ_opt()?;
-    let (hour, minute) = *times.first()?;
-    local_datetime_in_timezone(
-        &after.timezone(),
-        tomorrow.year(),
-        tomorrow.month(),
-        tomorrow.day(),
-        hour,
-        minute,
-    )
-}
-
-fn local_datetime_in_timezone<Tz>(
-    timezone: &Tz,
-    year: i32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-) -> Option<DateTime<Tz>>
-where
-    Tz: TimeZone,
-    Tz::Offset: Copy,
-{
-    let mut candidate = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, 0)?;
-    let start_date = candidate.date();
-    let max_date = start_date.succ_opt()?;
-
-    loop {
-        match timezone.from_local_datetime(&candidate) {
-            LocalResult::Single(value) => return Some(value),
-            LocalResult::Ambiguous(first, _) => return Some(first),
-            LocalResult::None => {
-                candidate = candidate.checked_add_signed(ChronoDuration::minutes(1))?;
-                if candidate.date() > max_date {
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-fn missed_run_time(
-    times: &[(u32, u32)],
-    last_run: Option<DateTime<Local>>,
-    now: DateTime<Local>,
-    timezone: Option<chrono_tz::Tz>,
-) -> Option<DateTime<Local>> {
-    let last_run = last_run?;
-    if last_run >= now {
-        return None;
-    }
-    // `candidate > after` の比較は instant 同士なのでゾーン混在でも安全。
-    // ただし HHMM の壁時計解決自体は after.timezone() で行われるため、
-    // タイムゾーン指定時は last_run をそのゾーンに写してから次回を求める。
-    let missed = match timezone {
-        Some(tz) => {
-            calculate_next_run_time_after(times, last_run.with_timezone(&tz))?
-                .with_timezone(&Local)
-        }
-        None => calculate_next_run_time_after(times, last_run)?,
-    };
-    (missed < now).then_some(missed)
-}
-
-fn load_last_auto_update_run() -> Option<DateTime<Local>> {
+fn load_last_auto_update_run() -> Option<DateTime<Utc>> {
     let timestamp = match load_local_setting_value(AUTO_UPDATE_LAST_RUN_KEY)? {
         Value::Number(value) => value.as_i64()?,
         Value::String(text) => text.parse::<i64>().ok()?,
         _ => return None,
     };
-    Utc.timestamp_opt(timestamp, 0).single().map(|value| value.with_timezone(&Local))
+    Utc.timestamp_opt(timestamp, 0).single()
 }
 
 fn persist_last_auto_update_run(timestamp: DateTime<Local>) -> Result<(), String> {
@@ -653,7 +561,7 @@ fn relay_stdout_line(push_server: &PushServer, text: &str) {
                 super::worker::refresh_db_and_broadcast_table_reload(push_server);
                 return;
             }
-            push_server.broadcast_raw(&message)
+            push_server.broadcast_raw(message)
         }
         Err(_) => auto_update_echo(push_server, text),
     }
@@ -666,15 +574,13 @@ fn auto_update_echo(push_server: &PushServer, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_update_sort_key_from_value, calculate_next_run_time, calculate_next_run_time_after,
-        local_datetime_in_timezone, missed_run_time, parse_schedule_times,
-        queue_auto_update_job_if_needed, split_auto_update_target_ids,
+        auto_update_sort_key_from_value, queue_auto_update_job_if_needed,
+        split_auto_update_target_ids,
     };
     use crate::web::sort_state::SORT_COLUMN_KEYS;
     use crate::db::NovelRecord;
     use crate::queue::{JobType, PersistentQueue, QueueJob};
-    use chrono::{Local, TimeZone, Timelike, Utc};
-    use chrono_tz::America::New_York;
+    use chrono::Utc;
     use parking_lot::Mutex;
     use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -711,18 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_schedule_times_accepts_four_digit_times() {
-        assert_eq!(parse_schedule_times("0930, 2215"), vec![(9, 30), (22, 15)]);
-        assert!(parse_schedule_times("9999").is_empty());
-    }
-
-    #[test]
-    fn calculate_next_run_time_returns_future_time() {
-        let next = calculate_next_run_time(&[(0, 0)], None).unwrap();
-        assert!(next > chrono::Local::now());
-    }
-
-    #[test]
     fn auto_update_sort_key_accepts_all_current_sort_columns() {
         for (index, key) in SORT_COLUMN_KEYS.iter().enumerate() {
             let server_setting: serde_yaml::Value = serde_yaml::from_str(&format!(
@@ -732,36 +626,6 @@ mod tests {
             .unwrap();
             assert_eq!(auto_update_sort_key_from_value(&server_setting), Some(*key));
         }
-    }
-
-    #[test]
-    fn missed_run_time_triggers_single_catch_up_after_downtime() {
-        let last_run = Local.with_ymd_and_hms(2026, 4, 20, 8, 0, 0).single().unwrap();
-        let now = Local.with_ymd_and_hms(2026, 4, 20, 12, 0, 0).single().unwrap();
-        let missed = missed_run_time(&[(9, 0), (18, 0)], Some(last_run), now, None).unwrap();
-
-        assert_eq!(missed.hour(), 9);
-        assert_eq!(missed.minute(), 0);
-    }
-
-    #[test]
-    fn local_datetime_in_timezone_rounds_dst_gap_forward() {
-        let rounded = local_datetime_in_timezone(&New_York, 2024, 3, 10, 2, 30).unwrap();
-
-        assert_eq!(rounded.hour(), 3);
-        assert_eq!(rounded.minute(), 0);
-    }
-
-    #[test]
-    fn calculate_next_run_time_after_uses_rounded_dst_gap() {
-        let before_gap = New_York
-            .with_ymd_and_hms(2024, 3, 10, 1, 45, 0)
-            .single()
-            .unwrap();
-        let next = calculate_next_run_time_after(&[(2, 30)], before_gap).unwrap();
-
-        assert_eq!(next.hour(), 3);
-        assert_eq!(next.minute(), 0);
     }
 
     #[test]

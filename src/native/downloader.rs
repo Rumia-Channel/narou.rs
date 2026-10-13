@@ -63,7 +63,7 @@ impl Downloader {
             Some(cookies) => Arc::new(client.with_cookie_store(cookies)),
             None => Arc::new(client),
         };
-        let rate_limiter = Arc::new(crate::downloader::rate_limit::RateLimiter::new(false));
+        let rate_limiter = Arc::new(crate::downloader::rate_limit::RateLimiter::new());
         let novels = Arc::new(crate::native::novel_repository::NativeNovelRepository::new());
         let stores = crate::native::object_store::NativeStores::for_current_root()?;
         let objects = stores.objects;

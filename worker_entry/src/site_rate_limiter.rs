@@ -1,137 +1,138 @@
-//! Per-site rate limiting Durable Object (Phase 8).
-//!
-//! One DO instance per normalized site key. The Workers runtime serializes
-//! requests to a DO, which makes the permit allocation atomic per site:
-//! read the counter / next-allowed timestamp from [`State`] storage, apply
-//! the same pacing algorithm as the native limiter (interval spacing, with
-//! the なろう wait-steps default of 10 and a 5-second max-step wait), write
-//! back, and return the permit timestamp. The caller awaits
-//! `worker::Delay` until that timestamp.
-//!
-//! No alarm is used: allocation happens synchronously inside `fetch`.
+//! Per-site pacing authority. Settings come from primary D1, not a job's
+//! potentially stale snapshot. The mutex covers external awaits as well as
+//! storage: Durable Object input gates alone do not serialize D1 requests.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::lock::Mutex;
+use narou_rs::application::settings::SettingsStore;
+use narou_rs::platform::rate_limiter::{
+    DownloadPacing, PacingSchedule, PacingState, duration_millis_ceil,
+    setting_update_interval_secs, try_acquire,
+};
+use narou_rs::setting_core::SettingScope;
 use serde::{Deserialize, Serialize};
 use worker::*;
 
-/// Permit request body sent by [`crate::rate_limiter::WorkerRateLimiter`].
+use crate::d1_repository::D1SettingsStore;
+use crate::db_handle::DbHandle;
+
+pub const PACING_REFRESH_TTL_MS: u64 = 30_000;
+const GRANTS_KEY: &str = "pacing_state";
+// A previous Queue invocation cannot retain a reservation beyond its 15-minute
+// wall-clock lifetime. Preserve its fence, but not abandoned reservations for
+// arbitrarily large configured intervals.
+const LEGACY_QUEUE_LIFETIME_MS: u64 = 15 * 60 * 1_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermitRequest {
-    /// Minimum spacing between consecutive requests, in milliseconds.
-    pub interval_ms: u64,
-    /// Every `wait_steps`-th request waits `max_steps_wait_time_ms` instead
-    /// of `interval_ms` (native `delay_after_request` semantics).
-    pub wait_steps: u32,
-    pub max_steps_wait_time_ms: u64,
-    /// Number of permits to allocate in one call. Batching amortizes the
-    /// Durable Object subrequest across many section fetches.
-    #[serde(default = "default_permit_count")]
-    pub count: u32,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PermitRequest {
+    Http { narou: bool, min_interval_ms: u64 },
+    WorkStart,
 }
 
-fn default_permit_count() -> u32 {
-    1
+struct SettingsSnapshot {
+    download: DownloadPacing,
+    update_interval_ms: u64,
+    read_at_ms: u64,
 }
 
-/// Permit response: the epoch-millis timestamps at which the caller may
-/// proceed, one per requested permit in claim order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermitResponse {
-    pub permit_ats_ms: Vec<u64>,
+#[derive(Default)]
+struct Inner {
+    settings: Option<SettingsSnapshot>,
+    grants: Option<PacingState>,
 }
 
-/// Upper bound on one batch; keeps a single caller from monopolizing a
-/// site's near-term slots.
-pub const MAX_PERMIT_BATCH: u32 = 64;
-
-/// Allocate `count` consecutive permit timestamps.
-///
-/// Pure function over the persisted `(counter, next_allowed_at_ms)` state so
-/// the pacing semantics stay identical whether one permit or a batch is
-/// claimed. Returns the timestamps plus the state to write back.
-fn allocate_permits(
-    counter: u64,
-    next_allowed_at_ms: u64,
-    now_ms: u64,
-    interval_ms: u64,
-    wait_steps: u32,
-    max_steps_wait_time_ms: u64,
-    count: u32,
-) -> (Vec<u64>, u64, u64) {
-    let mut counter = counter;
-    let mut next_allowed_at_ms = next_allowed_at_ms;
-    // Idle reset mirrors the native limiter: after a long quiet period
-    // the site's burst counter restarts so the next request goes out
-    // immediately.
-    if next_allowed_at_ms > 0
-        && now_ms > next_allowed_at_ms.saturating_add(max_steps_wait_time_ms)
-    {
-        counter = 0;
-    }
-    let wait_steps = u64::from(wait_steps);
-    let mut permits = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let allowed_at_ms = next_allowed_at_ms.max(now_ms);
-        counter += 1;
-        // Native `delay_after_request`: every `wait_steps`-th request waits
-        // the max-step duration; all others wait the base interval.
-        let delay_ms = if wait_steps > 0
-            && counter.is_multiple_of(wait_steps)
-            && counter >= wait_steps
-        {
-            max_steps_wait_time_ms
-        } else if counter > 0 {
-            interval_ms
-        } else {
-            0
-        };
-        next_allowed_at_ms = allowed_at_ms.saturating_add(delay_ms);
-        permits.push(allowed_at_ms);
-    }
-    (permits, counter, next_allowed_at_ms)
-}
 #[durable_object]
 pub struct SiteRateLimiter {
     state: State,
+    env: Env,
+    inner: Mutex<Inner>,
 }
 
 impl DurableObject for SiteRateLimiter {
-    fn new(state: State, _env: Env) -> Self {
-        Self { state }
+    fn new(state: State, env: Env) -> Self {
+        Self { state, env, inner: Mutex::new(Inner::default()) }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         if req.method() != Method::Post {
             return Response::error("Method Not Allowed", 405);
         }
-        let permit: PermitRequest = req
-            .json()
-            .await
-            .map_err(|error| Error::RustError(format!("invalid permit request: {error}")))?;
-        // `interval_ms == 0` (`download.interval = 0`) は「間隔なし」として
-        // 許容する — native は interval 0 で各要求を即時許可するため。
-        let count = permit.count.clamp(1, MAX_PERMIT_BATCH);
-        let storage = self.state.storage();
+        let permit = match req.json::<PermitRequest>().await {
+            Ok(permit) => permit,
+            Err(_) => return Response::error("Invalid permit request", 400),
+        };
+        let mut inner = self.inner.lock().await;
         let now_ms = js_sys::Date::now() as u64;
-
-        let counter: u64 = storage.get("counter").await?.unwrap_or(0);
-        let next_allowed_at_ms: u64 = storage.get("next_allowed_at_ms").await?.unwrap_or(0);
-
-        let (permits, counter, next_allowed_at_ms) = allocate_permits(
-            counter,
-            next_allowed_at_ms,
-            now_ms,
-            permit.interval_ms,
-            permit.wait_steps,
-            permit.max_steps_wait_time_ms,
-            count,
-        );
-        storage.put("counter", counter).await?;
-        storage
-            .put("next_allowed_at_ms", next_allowed_at_ms)
-            .await?;
-
-        Response::from_json(&PermitResponse {
-            permit_ats_ms: permits,
-        })
+        if inner.settings.as_ref().is_none_or(|snapshot| {
+            now_ms.saturating_sub(snapshot.read_at_ms) >= PACING_REFRESH_TTL_MS
+        }) {
+            let db = DbHandle::primary(Arc::new(self.env.d1("DB")?));
+            let values = D1SettingsStore::for_writes(db).load(SettingScope::Local).await
+                .map_err(|error| Error::RustError(error.to_string()))?;
+            inner.settings = Some(SettingsSnapshot {
+                download: DownloadPacing::from_settings(&values),
+                update_interval_ms: duration_millis_ceil(Duration::from_secs_f64(
+                    setting_update_interval_secs(values.get("update.interval")),
+                )),
+                read_at_ms: now_ms,
+            });
+        }
+        let snapshot = inner.settings.as_ref().expect("loaded pacing settings");
+        let settings_expire_ms = snapshot.read_at_ms.saturating_add(PACING_REFRESH_TTL_MS);
+        let schedule = match permit {
+            PermitRequest::Http { narou, min_interval_ms } => {
+                PacingSchedule::from_scoped(&snapshot.download.for_site(
+                    narou, Some(Duration::from_millis(min_interval_ms)),
+                ))
+            }
+            PermitRequest::WorkStart => PacingSchedule {
+                interval_ms: snapshot.update_interval_ms,
+                wait_steps: 0,
+                max_steps_wait_time_ms: snapshot.update_interval_ms,
+                reset_window_ms: snapshot.update_interval_ms,
+            },
+        };
+        let storage = self.state.storage();
+        let mut grants = if let Some(grants) = inner.grants {
+            grants
+        } else if let Some(encoded) = storage.get::<String>(GRANTS_KEY).await? {
+            serde_json::from_str::<PacingState>(&encoded)
+                .map_err(|error| Error::RustError(format!("invalid stored pacing state: {error}")))?
+        } else {
+            // Old last_permit_ms represented a future reservation, not an
+            // actual grant, so it must never be used for rebasing new policy.
+            let next = storage.get::<Option<u64>>("next_allowed_at_ms").await?.flatten();
+            PacingState {
+                counter: storage.get::<u64>("counter").await?.unwrap_or(0),
+                next_permit_ms: next.map(|next| next.min(
+                    (js_sys::Date::now() as u64).saturating_add(LEGACY_QUEUE_LIFETIME_MS),
+                )),
+                ..PacingState::default()
+            }
+        };
+        let acquired_at_ms = js_sys::Date::now() as u64;
+        let decision = try_acquire(&mut grants, acquired_at_ms, schedule);
+        if inner.grants != Some(grants) {
+            let encoded = serde_json::to_string(&grants)
+                .map_err(|error| Error::RustError(error.to_string()))?;
+            storage.put(GRANTS_KEY, encoded).await?;
+            inner.grants = Some(grants);
+        }
+        let decision = match decision {
+            narou_rs::platform::rate_limiter::PacingDecision::Wait { wait_ms } => {
+                let replied_at_ms = js_sys::Date::now() as u64;
+                // A snapshot may already be 20 seconds old. Wake at its
+                // expiry, not another full TTL after this denied attempt.
+                narou_rs::platform::rate_limiter::PacingDecision::Wait {
+                    wait_ms: wait_ms.saturating_sub(replied_at_ms.saturating_sub(acquired_at_ms))
+                        .min(settings_expire_ms.saturating_sub(replied_at_ms)).max(1),
+                }
+            }
+            granted => granted,
+        };
+        Response::from_json(&decision)
     }
 }

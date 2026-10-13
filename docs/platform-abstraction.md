@@ -516,7 +516,7 @@ Worker (worker_entry)
 ## 共有層（native と Worker で 1 実装）
 
 外部挙動を揃えるため、native 専用層にあったロジックを可搬層 (`src/application/`, `src/login/`, `src/downloader/`) へ
-移し、両ビルドから同じコードを呼ぶ。2026-09-26 時点:
+移し、両ビルドから同じコードを呼ぶ。現行の共有境界:
 
 | 共有モジュール | 共有しているもの |
 |---|---|
@@ -529,6 +529,12 @@ Worker (worker_entry)
 | `application::aliases` | エイリアス解決（表の読み込みだけが native=Inventory / Worker=app_state と異なる） |
 | `platform::*` + `downloader::http_policy` | HTTP の decode/status/redirect ポリシー（アダプタは transport だけを持つ） |
 | `platform::http1` | HTTP/1.1 のリクエスト生成と応答解析（Byte 指向・依存なし）。wasm 専用クレート内のテストは実行されないため可搬層に置き、Worker のソケット transport が使う。native は curl/reqwest があるため未使用 |
+| `HttpClient::send_paced` / `HttpPacing` / `RedirectChain` | リダイレクトの方式・資格情報・リクエスト本文の規則と、実送信ごとのサイト待機。transport の切替でも permit を省略しない |
+| `ObjectStore::update_small` / `application::novel_settings` | 新しい保存値に対する原子的 INI patch と正確な保存 ACK。native FS のロック、SQLite の transaction、D1 の全 raw snapshot CAS はアダプタで実装する |
+| `application::settings` / `setting_core` | 変更項目の初期値照合、型変換、部分保存、device 派生設定。JSON の整数表記と浮動小数設定の比較も同じ規則で扱う |
+| `application::retry_policy` / `application::push_events` | リトライ設定と backoff、ジョブ進捗・終端・設定変更イベントの JSON |
+| `application::messages::MessageContext` / `progress` | future の poll ごとに出力・詳細ログをジョブへ結び、操作 ID と更新番号で並列進捗を分離する |
+| `epub_lite::EpubPreparation` / `EpubBuild` | 入力解釈、逐次 `AssetPlan`、画像処理条件、連番への参照書換え、表紙、メタデータ、CSS / フォント資産と書き出し |
 
 ### Worker の取得段（2026-09-27）
 
@@ -545,12 +551,12 @@ Worker (worker_entry)
 Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト（全アドレスが Cloudflare の
 公開レンジ内にあり、`connect()` 自体が拒否されるもの）のために、外部の取得リレーを 3 段目に持つ。
 
-- プロトコル: `src/platform/relay.rs`（`GET /proxy?url=..&headers=<base64 JSON>` と
-  `X-Proxy-Token`、応答は `{status, contentType, location, body(base64)}`）。純粋な
-  エンコード/デコードのみで、トランスポートは呼び出し側が持つ。
-- 送信は `worker_entry/src/http.rs` の `send_via_relay`。リレーは平文 http なので
-  `platform::http1` の `SocketTarget` + `connect()` で GET する（Worker の `fetch` は
-  `http://` を拒否するため）。サイト定義のヘッダはそのまま転送する。
+- プロトコルは `src/platform/relay.rs`。呼び出し側は `POST /proxy` の JSON 本文で
+  `url` と `headers` を送り、`X-Proxy-Token` で認証する。Cookie 等を URL に載せない。
+  応答の本文・メタデータ・ヘッダ・ステータスを上限と共通規則で検証する。
+- `worker_entry/src/http.rs` のリレー送信は `platform::http1` の `SocketTarget` と
+  `connect()` を使う (Worker の `fetch` は `http://` を拒否するため)。サイト定義の
+  ヘッダはそのまま転送し、返ったリダイレクトは共通の `RedirectChain` で扱う。
 - 設定は Worker secret `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY`。接続先は
   パス込みで渡してよく、`RelayRequest` がオリジンに正規化する (`http` / `https` の
   どちらも可)。未設定ならこの段は無効。
@@ -608,11 +614,14 @@ Worker の `PushHubSink` は行ごとに送信タスク (`spawn_local`) を起�
 | auto-update（スケジューラ） | `自動アップデートが予定されています` / catch-up 実行 | ✅ | ❌ 文言は `messages::jobs::*` に用意済みだが、Worker の planner には投稿点が無い（既知の差分） | 予約・実行 |
 | send / mail / backup | 各種 | ✅ | ❌ Worker では実行不可（サブプロセス・シリアルメール前提） | — |
 
-### 残っている重複（次の候補）
+### 意図的に分ける I/O アダプタ
 
-| 対象 | 現状 | 方針 |
-|---|---|---|
-| ~~**Worker の convert ジョブの出力**~~ | 解消済み。`worker_entry/src/convert.rs` が `PushHubSink::install` で既定 sink を入れ、`application::convert::emit_convert_item_lines` が `Stream::Stdout` で送る（native と同じ経路・同じストリーム） | — |
-| **リトライ方針** | `src/queue.rs`（native）が `queue.max-retries` / `queue.retry-backoff` を解釈し、Worker は `consumer.rs`/`ledger.rs` に独自実装 | 設定の解釈と backoff スケジュールを可搬層へ（未着手） |
-| **push イベントの組み立て** | native `web/push.rs` と Worker `push_hub.rs` が同じ JSON 形をそれぞれ構築 | イベント生成を可搬層へ（未着手） |
-| **引数の袋** | `too_many_arguments` 14 件・`type_complexity` 5 件 | request struct / 型エイリアスへ畳む（未着手） |
+| 境界 | native | Worker | 共通規則 |
+|---|---|---|---|
+| HTTP transport | curl / reqwest / wget と DNS 検証 | Fetch / connect / リレーと egress | URL 構文・リダイレクト・実送信の待機・応答解釈 |
+| 管理・本文・設定の永続化 | Inventory / FS / SQLite | D1 / primary session | typed repository、設定 patch、codec、CAS、保存 ACK |
+| 大きな挿絵 | FS ミラーまたは S3 | S3 または D1 | logical key、bounded AssetStore、画像計画・処理 |
+| ジョブの配送 | PersistentQueue / 子プロセス | Queues / D1 ledger | 計画・retry policy・操作メッセージ・push payload |
+| 外部プロセスとローカル操作 | device / send / mail / folder 等 | capability と 501 で拒否 | 対応状況と UI の実行制限を明示 |
+| ログと画面への配送 | lib の logger / ConsoleSink | PushHubSink / Durable Object | MessageContext、操作 ID、順序、コンソール履歴の表示世代 |
+

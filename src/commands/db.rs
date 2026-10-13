@@ -101,7 +101,7 @@ fn cmd_vacuum() -> narou_rs::error::Result<()> {
             .join(".narou");
         if let Some(state) = narou_rs::native::sqlite::state::active_for(&narou_dir) {
             let conn = state.conn();
-            let guard = conn.lock().expect("sqlite mutex poisoned");
+            let guard = conn.lock();
             guard.execute_batch("VACUUM").map_err(|error| {
                 narou_rs::error::NarouError::Database(format!("VACUUM failed: {error}"))
             })?;

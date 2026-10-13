@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use crate::compat::load_global_setting_value;
 use crate::error::{NarouError, Result};
 
+use super::settings::{format_line_height, line_height_from_value};
+
 const DAKUTEN_CSS_NAME: &str = "vertical_font_with_dakuten.css";
 const NORMAL_CSS_NAME: &str = "vertical_font.css";
 const DAKUTEN_FONT_NAME: &str = "DMincho.ttf";
@@ -37,78 +39,31 @@ fn preset_dir() -> Result<PathBuf> {
         })
 }
 
-fn format_line_height(line_height: f64) -> String {
-    let mut text = line_height.to_string();
-    if text.contains('.') {
-        while text.ends_with('0') {
-            text.pop();
-        }
-        if text.ends_with('.') {
-            text.push('0');
-        }
-    }
-    text
-}
-
-/// `preset/vertical_font_with_dakuten.css` を行高だけ差し替えて返す。
+/// 組み込みエンジンへ渡す濁点フォントのアセット一式 (native: preset の実体)。
 ///
-/// 外部 AozoraEpub3 にはファイルとして流し込む (`activate`) が、組み込み
-/// エンジン (Lite) には同じ内容を EPUB 内のスタイルシートとして渡す。
-pub fn dakuten_css_text() -> Result<String> {
-    let preset = preset_dir()?;
-    let text = std::fs::read_to_string(preset.join(DAKUTEN_CSS_NAME))?;
-    Ok(text.replace(
-        "<%= line_height %>",
-        &format_line_height(current_line_height()),
-    ))
-}
-
-/// `preset/DMincho.ttf` (濁点フォント本体) の中身。
-pub fn dakuten_font_bytes() -> Result<Vec<u8>> {
-    let preset = preset_dir()?;
-    Ok(std::fs::read(preset.join(DAKUTEN_FONT_NAME))?)
-}
-
-/// 本文全体を濁点フォントで組む CSS (組み込みエンジン向けの opt-in)。
-///
-/// `dakuten_css_text()` に本文フォントの指定を足したもの。Reader が EPUB 内の
-/// フォントを使う実装なら、全角スペース等の字形もこのフォントから供給される。
-pub fn body_font_css_text() -> Result<String> {
-    let mut text = dakuten_css_text()?;
-    text.push_str(
-        "\n/* narou: convert.epub-font=always — 本文全体を DMincho で組む */\n\nbody, p {\n\tfont-family: \"DakutenAokinMincho\", serif;\n}\n",
-    );
-    Ok(text)
-}
-
-/// 組み込みエンジンへ渡す濁点フォントのアセット一式。
-///
-/// `lite` feature (組み込み EPUB エンジン) 専用。
-#[cfg(feature = "lite")]
+/// `lite` feature (組み込み EPUB エンジン) 専用。パス・media type・`always` の
+/// 付加 CSS は [`crate::epub_lite::dakuten_font_assets_from`] が唯一の定義で、
+/// ここはバイト源だけを preset の実体にする (preset の更新がすぐ効く)。
 ///
 /// `use_dakuten_font` (テキストに濁点注記があった) か、設定
 /// `convert.epub-font = always` のときだけ返す。
+#[cfg(feature = "lite")]
 pub fn lite_font_assets(use_dakuten_font: bool) -> Result<Vec<aozora_epub3_lite::EpubAsset>> {
-    use aozora_epub3_lite::EpubAsset;
-
-    let always = crate::compat::load_global_setting_string("convert.epub-font")
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("always"));
-    if !use_dakuten_font && !always {
+    let always = crate::epub_lite::epub_font_always(
+        crate::compat::load_global_setting_string("convert.epub-font").as_deref(),
+    );
+    if !crate::epub_lite::needs_dakuten_font(use_dakuten_font, always) {
         return Ok(Vec::new());
     }
-    let css = if always {
-        body_font_css_text()?
-    } else {
-        dakuten_css_text()?
-    };
-    Ok(vec![
-        EpubAsset::new("style/vertical_font.css", "text/css", css.into_bytes()),
-        EpubAsset::new(
-            "fonts/DMincho.ttf",
-            "application/font-sfnt",
-            dakuten_font_bytes()?,
-        ),
-    ])
+    let preset = preset_dir()?;
+    let css_template = std::fs::read_to_string(preset.join(DAKUTEN_CSS_NAME))?;
+    let font = std::fs::read(preset.join(DAKUTEN_FONT_NAME))?;
+    Ok(crate::epub_lite::dakuten_font_assets_from(
+        &css_template,
+        &font,
+        always,
+        current_line_height(),
+    ))
 }
 
 fn dst_css(aozora_dir: &Path) -> PathBuf {
@@ -196,13 +151,7 @@ fn combine_cleanup_errors(
 }
 
 fn current_line_height() -> f64 {
-    load_global_setting_value("line-height")
-        .and_then(|v| match v {
-            serde_yaml::Value::Number(n) => n.as_f64().or_else(|| n.as_i64().map(|i| i as f64)),
-            serde_yaml::Value::String(s) => s.parse::<f64>().ok(),
-            _ => None,
-        })
-        .unwrap_or(1.8)
+    line_height_from_value(load_global_setting_value("line-height").as_ref())
 }
 
 /// preset の濁点用 CSS と DMincho.ttf を AozoraEpub3 配下へ書き込む。

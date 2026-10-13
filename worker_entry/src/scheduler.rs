@@ -9,8 +9,8 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use narou_rs::application::{
-    events::FreezeStore, retry_policy, CheckpointClaim, JobId, JobKind, JobPlan, JobTarget,
-    Schedule, SchedulerCheckpoint, WorkerJobEnvelope,
+    events::FreezeStore, retry_policy, scheduler::parse_auto_update_schedule, CheckpointClaim,
+    JobId, JobKind, JobPlan, JobTarget, SchedulerCheckpoint, WorkerJobEnvelope,
 };
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{NovelFilter, NovelId, NovelQuery, NovelSort, NovelSortKey};
@@ -187,7 +187,11 @@ pub async fn plan_auto_update(runtime: &WorkerRuntime, _probe_generation: u64) -
                 NarouError::Platform(format!("cannot read scheduler settings: {error}"))
             })?
             .into_iter();
-        let enabled = yaml_bool(values.next().flatten());
+        let enabled = values
+            .next()
+            .flatten()
+            .and_then(|value| narou_rs::setting_core::setting_bool_value(&value))
+            .unwrap_or(false);
         let schedule_string = yaml_string(values.next().flatten());
         let schedule = match parse_auto_update_schedule(enabled, &schedule_string) {
             Ok(Some(schedule)) => schedule,
@@ -360,23 +364,6 @@ fn apply_page_dispatch(
     Ok(())
 }
 
-fn parse_auto_update_schedule(
-    enabled: bool,
-    schedule_string: &str,
-) -> std::result::Result<Option<Schedule>, String> {
-    if !enabled || schedule_string.trim().is_empty() {
-        return Ok(None);
-    }
-    let schedule = Schedule::parse(schedule_string);
-    if schedule.is_enabled() {
-        Ok(Some(schedule))
-    } else {
-        Err(narou_rs::application::messages::jobs::auto_update_schedule_invalid(
-            schedule_string,
-        ))
-    }
-}
-
 fn yaml_timezone(value: Option<YamlValue>) -> Result<chrono_tz::Tz> {
     let text = match value {
         Some(YamlValue::String(value)) => value,
@@ -393,16 +380,6 @@ fn yaml_timezone(value: Option<YamlValue>) -> Result<chrono_tz::Tz> {
     })
 }
 
-fn yaml_bool(value: Option<YamlValue>) -> bool {
-    match value {
-        Some(YamlValue::Bool(value)) => value,
-        Some(YamlValue::String(value)) => {
-            matches!(value.as_str(), "true" | "yes" | "on" | "1")
-        }
-        Some(_) | None => false,
-    }
-}
-
 fn yaml_string(value: Option<YamlValue>) -> String {
     match value {
         Some(YamlValue::String(value)) => value,
@@ -414,22 +391,8 @@ fn yaml_string(value: Option<YamlValue>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SchedulerCheckpoint, apply_page_dispatch, parse_auto_update_schedule};
+    use super::{SchedulerCheckpoint, apply_page_dispatch};
     use narou_rs::error::NarouError;
-    #[test]
-    fn auto_update_schedule_requires_enabled_nonempty_valid_value() {
-        assert!(parse_auto_update_schedule(false, "0800").unwrap().is_none());
-        assert!(parse_auto_update_schedule(true, "  ").unwrap().is_none());
-        assert_eq!(
-            parse_auto_update_schedule(true, "not-a-time").unwrap_err(),
-            "自動アップデートスケジューラーの時刻指定が不正です: not-a-time"
-        );
-        assert_eq!(
-            parse_auto_update_schedule(true, "0800").unwrap().unwrap().times,
-            vec![(8, 0)]
-        );
-    }
-
 
     #[test]
     fn failed_page_dispatch_preserves_cursor_for_pending_repair() {

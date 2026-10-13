@@ -46,7 +46,7 @@ use narou_rs::application::{JobKind, JobPlan, JobTarget};
 use narou_rs::db::NovelRecord;
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::downloader::{Downloader, TargetType};
-use narou_rs::platform::{NovelFilter, NovelId};
+use narou_rs::platform::NovelId;
 use serde::Deserialize;
 use serde_json::json;
 use worker::{Env, Method, Request, Response, console_log};
@@ -254,7 +254,7 @@ async fn sorted_update_all_ids(
 /// native `narou_rs::downloader::site_setting::effective_site_settings` 相当。
 /// Worker 側は `bundled_sites::load_site_settings` (bundle + ユーザー定義の
 /// マージ、30s L1 キャッシュ) が同じ役割。
-async fn site_settings(runtime: &WorkerRuntime) -> Vec<SiteSetting> {
+async fn site_settings(runtime: &WorkerRuntime) -> std::sync::Arc<Vec<SiteSetting>> {
     // update/convert 投入のサイト解決と変換オプションに使う (mutation 判断)。
     // bundle + ユーザー定義は primary 直行の更新系ストアで読み、
     // isolate 側の設定キャッシュもバイパスする。
@@ -271,6 +271,7 @@ async fn site_settings(runtime: &WorkerRuntime) -> Vec<SiteSetting> {
 /// `commands/mod.rs::resolve_target_to_id` (convert 用): alias → 数値 id →
 /// URL → ncode → title/ncode の順で既存レコードの id に解決する。
 /// 解決できなければ `None` (native 同様に対象を落とす)。
+/// 探索順と URL fallback の規則は `TargetLookupPlan::CONVERT` が唯一の定義。
 async fn resolve_convert_target_to_id(
     runtime: &WorkerRuntime,
     aliases: &HashMap<String, String>,
@@ -278,184 +279,23 @@ async fn resolve_convert_target_to_id(
     target: &str,
 ) -> Option<i64> {
     let library = &runtime.write_services().library;
-    let target = resolve_alias_target(aliases, target);
-    if let Ok(id) = target.parse::<i64>() {
-        // `narou convert` は `get_sync` で存在確認してから使う。
-        return library
-            .get(NovelId(id))
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id);
-    }
-    match Downloader::get_target_type(&target) {
-        TargetType::Url => {
-            let setting = site_settings.iter().find(|s| s.matches_url(&target))?;
-            let toc_url = setting
-                .toc_url_with_url_captures(&target)
-                .unwrap_or_else(|| setting.toc_url());
-            library
-                .find_by_toc_url(&toc_url)
-                .await
-                .ok()
-                .flatten()
-                .map(|record| record.id)
-        }
-        TargetType::Ncode => library
-            .find_by_ncode(&target)
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id),
-        TargetType::Id => None,
-        TargetType::Other => {
-            if let Some(record) = library.find_by_title(&target).await.ok().flatten() {
-                return Some(record.id);
-            }
-            // なろう式の ncode 判定 (`n\d+[a-z]+`) に当たらない ncode
-            // (Pixiv の `n29204764` / `s16299140` など) はここで拾う。
-            library
-                .find_by_ncode(&target)
-                .await
-                .ok()
-                .flatten()
-                .map(|record| record.id)
-        }
-    }
-}
-
-/// タグ完全一致 (`novel_tags.tag = ?`) の id 列 (native `tag_ids` 相当)。
-/// 全レコードの復号ではなく ID 投影の 1 クエリで読む。
-async fn tag_ids_for(
-    library: &narou_rs::application::LibraryService,
-    tag_name: &str,
-) -> Vec<i64> {
-    let filter = NovelFilter {
-        tag: Some(tag_name.to_string()),
-        ..NovelFilter::default()
-    };
-    ids_from_filter(library, &filter).await
-}
-
-/// 全件の id 列 (id 昇順)。`^tag:` の除外にだけ使う。
-async fn all_novel_ids(library: &narou_rs::application::LibraryService) -> Vec<i64> {
-    ids_from_filter(library, &NovelFilter::all()).await
-}
-
-async fn ids_from_filter(
-    library: &narou_rs::application::LibraryService,
-    filter: &NovelFilter,
-) -> Vec<i64> {
     library
-        .all_ids(filter)
+        .resolve_target(
+            narou_rs::application::target_lookup::TargetLookupPlan::CONVERT,
+            aliases,
+            narou_rs::application::target_lookup::UrlSource::Settings(site_settings),
+            target,
+        )
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|id| id.0)
-        .collect()
+        .ok()
+        .flatten()
+        .map(|record| record.id)
 }
 
-/// `commands/update.rs::expand_tag_targets` の写し。
-///
-/// `tag:` / `^tag:` / 裸のタグ名を、そのタグを持つ既存レコードの id に展開し
-/// 重複を除く。タグに該当が無いときは native 同様、プレフィックスを剥がした
-/// 名前だけを残す (後段の id 解決で落とされる)。数値 id は存在確認済みの
-/// ものだけ残る。
-///
-/// native `commands::update` と同じく ID 投影 (`NovelRepository::scan_ids` の
-/// タグ完全一致フィルタ) で判定する — 全レコードを読む必要はない。
-/// `existing_numeric` は呼び出し側が数値ターゲット分について 1 クエリで
-/// 確定した既存 id 集合 (並べ替えにも使った `records_by_ids` の結果)。
-/// `all_ids` は `^tag:` の除外にだけ要るので遅延して 1 回だけ読む。
-async fn expand_tag_targets(
-    runtime: &WorkerRuntime,
-    targets: &[String],
-    existing_numeric: &HashSet<i64>,
-) -> Vec<String> {
-    let library = &*runtime.write_services().library;
-    let mut tag_cache: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut all_ids: Option<Vec<i64>> = None;
-    let mut expanded = Vec::new();
-    for target in targets {
-        if let Ok(id) = target.parse::<i64>()
-            && existing_numeric.contains(&id)
-        {
-            expanded.push(id.to_string());
-            continue;
-        }
-
-        if let Some(tag_name) = target.strip_prefix("^tag:") {
-            let exclude: HashSet<i64> = {
-                match tag_cache.get(tag_name) {
-                    Some(ids) => ids.clone(),
-                    None => {
-                        let ids = tag_ids_for(library, tag_name).await;
-                        tag_cache.insert(tag_name.to_string(), ids.clone());
-                        ids
-                    }
-                }
-            }
-            .into_iter()
-            .collect();
-            if !exclude.is_empty() {
-                let all = match &all_ids {
-                    Some(ids) => ids.clone(),
-                    None => {
-                        let ids = all_novel_ids(library).await;
-                        all_ids = Some(ids.clone());
-                        ids
-                    }
-                };
-                expanded.extend(
-                    all.iter()
-                        .filter(|id| !exclude.contains(id))
-                        .map(|id| id.to_string()),
-                );
-            } else {
-                expanded.push(tag_name.to_string());
-            }
-        } else if let Some(tag_name) = target.strip_prefix("tag:") {
-            let ids = match tag_cache.get(tag_name) {
-                Some(ids) => ids.clone(),
-                None => {
-                    let ids = tag_ids_for(library, tag_name).await;
-                    tag_cache.insert(tag_name.to_string(), ids.clone());
-                    ids
-                }
-            };
-            if !ids.is_empty() {
-                expanded.extend(ids.iter().map(|id| id.to_string()));
-            } else {
-                expanded.push(tag_name.to_string());
-            }
-        } else {
-            let ids = match tag_cache.get(target) {
-                Some(ids) => ids.clone(),
-                None => {
-                    let ids = tag_ids_for(library, target).await;
-                    tag_cache.insert(target.clone(), ids.clone());
-                    ids
-                }
-            };
-            if !ids.is_empty() {
-                expanded.extend(ids.iter().map(|id| id.to_string()));
-            } else {
-                expanded.push(target.clone());
-            }
-        }
-    }
-
-    // native `expand_tag_targets` 末尾と同じく文字列ベースで重複除去する。
-    let mut seen = HashSet::new();
-    expanded
-        .into_iter()
-        .filter(|target| seen.insert(target.clone()))
-        .collect()
-}
-
-/// `commands/update.rs::resolve_target_to_id` の写し (alias→id→URL→ncode→
-/// title/ncode)。`expand_tag_targets` 後の文字列を既存レコード id にする。
-/// 解決できないターゲットは native 同様に落とす (`unresolved_count`)。
+/// `commands/update.rs::resolve_target_to_id` (update 用): alias→id→URL→ncode→
+/// title/ncode の順で `expand_tag_targets` 後の文字列を既存レコード id に
+/// する。解決できないターゲットは native 同様に落とす (`unresolved_count`)。
+/// 探索順・URL の厳格な captures は `TargetLookupPlan::UPDATE` が唯一の定義。
 async fn resolve_update_target_to_id(
     runtime: &WorkerRuntime,
     aliases: &HashMap<String, String>,
@@ -463,44 +303,17 @@ async fn resolve_update_target_to_id(
     target: &str,
 ) -> Option<i64> {
     let library = &runtime.write_services().library;
-    let target = alias_to_target_for_update(aliases, target);
-    if let Ok(id) = target.parse::<i64>()
-        && library.get(NovelId(id)).await.ok().flatten().is_some()
-    {
-        return Some(id);
-    }
-    match Downloader::get_target_type(&target) {
-        TargetType::Url => {
-            // native `resolve_url_to_id`: `toc_url_with_url_captures` が
-            // 取れなければ落とす (ここだけは `toc_url()` フォールバック無し)。
-            let setting = site_settings.iter().find(|s| s.matches_url(&target))?;
-            let toc_url = setting.toc_url_with_url_captures(&target)?;
-            library
-                .find_by_toc_url(&toc_url)
-                .await
-                .ok()
-                .flatten()
-                .map(|record| record.id)
-        }
-        TargetType::Ncode => library
-            .find_by_ncode(&target)
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id),
-        TargetType::Id => None,
-        TargetType::Other => {
-            if let Some(record) = library.find_by_title(&target).await.ok().flatten() {
-                return Some(record.id);
-            }
-            library
-                .find_by_ncode(&target)
-                .await
-                .ok()
-                .flatten()
-                .map(|record| record.id)
-        }
-    }
+    library
+        .resolve_target(
+            narou_rs::application::target_lookup::TargetLookupPlan::UPDATE,
+            aliases,
+            narou_rs::application::target_lookup::UrlSource::Settings(site_settings),
+            target,
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.id)
 }
 
 /// 別名が無く、存在が確定している数値ターゲットの id。
@@ -542,7 +355,8 @@ async fn api_update(
         super::max_web_targets(runtime),
         load_current_sort_state_for_writes(runtime),
     );
-    let targets = match normalize_update_targets(&raw_targets, max_targets) {
+    let targets =
+        match narou_rs::application::jobs::normalize_update_targets(&raw_targets, max_targets) {
         Ok(targets) => targets,
         Err(message) => return update_failure(&message),
     };
@@ -596,18 +410,25 @@ async fn api_update(
         let existing_numeric: HashSet<i64> =
             records.iter().map(|record| record.id).collect();
         let sorted = sort_numeric_targets_for_state(&sort_state, &records, &targets);
-        let expanded = expand_tag_targets(runtime, &sorted, &existing_numeric).await;
+        let expanded = narou_rs::application::target_lookup::expand_tag_targets(
+            &runtime.write_services().library,
+            &sorted,
+            &existing_numeric,
+            narou_rs::application::target_lookup::TagExpansionVariant::Update,
+        )
+        .await;
         // サイト定義 (オブジェクトストア LIST) は URL 解決でしか要らない:
         // 別名解決後の分類に URL が 1 つも無ければ読まない。分類は解決側と
         // 同じ `alias_to_target_for_update` を通す。
         let needs_sites = expanded.iter().any(|target| {
             matches!(Downloader::get_target_type(&alias_to_target_for_update(&aliases, target)), TargetType::Url)
         });
-        let site_settings = if needs_sites {
-            site_settings(runtime).await
+        let site_snapshot = if needs_sites {
+            Some(site_settings(runtime).await)
         } else {
-            Vec::new()
+            None
         };
+        let site_settings = site_snapshot.as_deref().map(Vec::as_slice).unwrap_or(&[]);
         let mut resolved = Vec::new();
         let mut seen = HashSet::new();
         for target in &expanded {
@@ -743,42 +564,6 @@ fn unresolved_update_message(unresolved: &[String]) -> String {
     format!("更新対象を解決できませんでした: {}", unresolved.join(", "))
 }
 
-/// native `normalize_update_targets` の写し。`--tag=<name>` / `--tag <name>`
-/// を `tag:<name>` に正規化し、それ以外は `validate_web_target_value` で
-/// 検証する (エラー文字列も native と同じ)。
-fn normalize_update_targets(targets: &[String], max_targets: usize) -> Result<Vec<String>, String> {
-    if targets.len() > max_targets {
-        return Err("too many targets".to_string());
-    }
-    let mut normalized = Vec::with_capacity(targets.len());
-    let mut i = 0usize;
-    while i < targets.len() {
-        let target = &targets[i];
-        if let Some(tag) = target.strip_prefix("--tag=") {
-            let tag =
-                validate_web_tag_name(tag).map_err(|_| "--tag requires a tag name".to_string())?;
-            normalized.push(format!("tag:{}", tag));
-            i += 1;
-            continue;
-        }
-        if target == "--tag" {
-            let Some(tag) = targets.get(i + 1) else {
-                return Err("--tag requires a tag name".to_string());
-            };
-            let tag =
-                validate_web_tag_name(tag).map_err(|_| "--tag requires a tag name".to_string())?;
-            normalized.push(format!("tag:{}", tag));
-            i += 2;
-            continue;
-        }
-        normalized.push(
-            validate_web_target_value(target).map_err(|_| "invalid target".to_string())?,
-        );
-        i += 1;
-    }
-    Ok(normalized)
-}
-
 // ---------------------------------------------------------------------------
 // POST /api/convert — native `api_convert`
 // ---------------------------------------------------------------------------
@@ -858,11 +643,12 @@ async fn api_convert(
     let needs_sites = ordered_targets.iter().any(|target| {
         matches!(Downloader::get_target_type(&resolve_alias_target(&aliases, target)), TargetType::Url)
     });
-    let site_settings = if needs_sites {
-        site_settings(runtime).await
+    let site_snapshot = if needs_sites {
+        Some(site_settings(runtime).await)
     } else {
-        Vec::new()
+        None
     };
+    let site_settings = site_snapshot.as_deref().map(Vec::as_slice).unwrap_or(&[]);
 
     // Worker の出力は組み込み EPUB のみ。対応形式は上で検証済みなので、
     // 外部ツール用 device オプションをジョブへ積む必要はない。

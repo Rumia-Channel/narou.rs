@@ -24,14 +24,14 @@ pub struct OutputNamingEnv {
 
 impl OutputNamingEnv {
     /// 保存済みのローカル設定マップから命名に使う値だけを取り出す。
-    /// bool/int の強制変換は native `db::settings::bool_value` /
-    /// `output_filename_length_limit` と同じ規則 (文字列の "true"/"yes"/
-    /// "on"/"1"、数値文字列も受け付ける)。
+    /// bool の解釈は native/Worker 共通の
+    /// [`crate::setting_core::setting_bool_value`] に一本化してある
+    /// (`true`/`yes`/`on`/`1` などの文字列も受け付ける)。
     pub fn from_local_map(map: &HashMap<String, serde_yaml::Value>) -> Self {
         Self {
             filename_to_ncode: map
                 .get("convert.filename-to-ncode")
-                .and_then(yaml_bool)
+                .and_then(crate::setting_core::setting_bool_value)
                 .unwrap_or(false),
             filename_length_limit: map
                 .get("ebook-filename-length-limit")
@@ -45,18 +45,6 @@ impl OutputNamingEnv {
     }
 }
 
-fn yaml_bool(value: &serde_yaml::Value) -> Option<bool> {
-    match value {
-        serde_yaml::Value::Bool(value) => Some(*value),
-        serde_yaml::Value::Number(value) => value.as_i64().map(|value| value != 0),
-        serde_yaml::Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "true" | "yes" | "on" | "1" => Some(true),
-            "false" | "no" | "off" | "0" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    }
-}
 #[cfg(feature = "native-runtime")]
 pub(crate) fn create_output_text_path(
     settings: &NovelSettings,

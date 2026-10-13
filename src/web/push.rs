@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -8,7 +8,7 @@ use axum::{
     Router,
     extract::{
         Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
@@ -17,8 +17,8 @@ use axum::{
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc};
+use serde::Deserialize;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, Instant};
 
@@ -38,37 +38,11 @@ const WS_CLIENT_QUEUE_CAPACITY: usize = 1024;
 const WS_MAX_CONSECUTIVE_FULL_SENDS: usize = 32;
 
 #[derive(Debug, Clone)]
-pub struct BroadcastChannel {
-    pub sender: broadcast::Sender<String>,
-}
-
-impl Default for BroadcastChannel {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BroadcastChannel {
-    pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(4096);
-        Self { sender }
-    }
-
-    pub fn send(&self, message: &str) {
-        let _ = self.sender.send(message.to_string());
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<String> {
-        self.sender.subscribe()
-    }
-}
-
-#[derive(Debug, Clone)]
 struct ClientMessage {
     id: u64,
-    payload: Arc<String>,
-    target_console: Option<String>,
-    scope: Option<String>,
+    payload: Utf8Bytes,
+    target_console: Option<Arc<str>>,
+    scope: Option<Arc<str>>,
     replayed_by_history: bool,
 }
 
@@ -89,17 +63,17 @@ impl ClientHandle {
 
 #[derive(Debug, Clone)]
 struct ConsoleHistoryEntry {
-    id: u64,
     body: Option<String>,
-    target_console: Option<String>,
-    scope: Option<String>,
-    payload: String,
+    target_console: Option<Arc<str>>,
+    scope: Option<Arc<str>>,
+    payload: Utf8Bytes,
 }
 
 #[derive(Debug, Default)]
 struct ConsoleHistoryState {
     next_message_id: u64,
-    entries: Vec<ConsoleHistoryEntry>,
+    entries: VecDeque<ConsoleHistoryEntry>,
+    progress: push_events::ProgressReplay,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -127,7 +101,6 @@ impl From<WsClientQuery> for ClientFilter {
 
 #[derive(Debug)]
 pub struct PushServer {
-    channel: BroadcastChannel,
     clients: DashMap<usize, ClientHandle>,
     connected_clients: AtomicUsize,
     next_client_id: AtomicUsize,
@@ -140,7 +113,6 @@ pub struct PushServer {
 impl PushServer {
     pub fn new() -> Self {
         Self {
-            channel: BroadcastChannel::new(),
             clients: DashMap::new(),
             connected_clients: AtomicUsize::new(0),
             next_client_id: AtomicUsize::new(1),
@@ -154,7 +126,6 @@ impl PushServer {
     #[cfg(test)]
     fn new_with_limits(max_clients: usize, max_history: usize) -> Self {
         Self {
-            channel: BroadcastChannel::new(),
             clients: DashMap::new(),
             connected_clients: AtomicUsize::new(0),
             next_client_id: AtomicUsize::new(1),
@@ -163,10 +134,6 @@ impl PushServer {
             max_clients,
             accepted_domains: parking_lot::RwLock::new(vec!["127.0.0.1".to_string(), "localhost".to_string()]),
         }
-    }
-
-    pub fn channel(&self) -> &BroadcastChannel {
-        &self.channel
     }
 
     /// Replaces the accepted WS origin domain list. `&self` so the
@@ -228,8 +195,8 @@ impl PushServer {
     }
 
     /// Send a pre-built JSON message directly (used by WebProgress interception in worker).
-    pub fn broadcast_raw(&self, value: &serde_json::Value) {
-        self.publish_json(value.clone());
+    pub fn broadcast_raw(&self, value: serde_json::Value) {
+        self.publish_json(value);
     }
 
     pub fn broadcast_progress(&self, current: usize, total: usize, message: &str) {
@@ -269,25 +236,29 @@ impl PushServer {
     }
 
     fn publish_json(&self, value: serde_json::Value) {
-        let payload = value.to_string();
+        let payload = Utf8Bytes::from(value.to_string());
         let target_console = message_target_console(&value);
-        let scope = message_scope(&value);
+        let scope = push_events::message_scope(&value).map(Arc::from);
         let (id, replayed_by_history) = {
             let mut history = self.console_history.lock();
             history.next_message_id += 1;
             let id = history.next_message_id;
-            let replayed_by_history = history_entry_from_value(id, &value, scope.clone(), payload.clone())
-                .map(|entry| {
-                    Self::append_history_locked(&mut history.entries, self.max_history, entry);
-                    true
-                })
-                .unwrap_or(false);
-            (id, replayed_by_history)
+            let replayed_by_history = self.max_history != 0
+                && history_entry_from_value(&value, &target_console, &scope, &payload)
+                    .map(|entry| {
+                        Self::append_history_locked(&mut history.entries, self.max_history, entry);
+                        true
+                    })
+                    .unwrap_or(false);
+            let kind = value["type"].as_str().unwrap_or("");
+            let covered_by_snapshot = replayed_by_history || kind.starts_with("progressbar.")
+                || kind.starts_with("queue_") || kind.starts_with("queue.");
+            history.progress.observe(value);
+            (id, covered_by_snapshot)
         };
-        self.channel.send(&payload);
         self.dispatch_to_clients(ClientMessage {
             id,
-            payload: Arc::new(payload),
+            payload,
             target_console,
             scope,
             replayed_by_history,
@@ -349,7 +320,7 @@ impl PushServer {
         }
     }
 
-    fn history_snapshot(&self) -> Vec<ConsoleHistoryEntry> {
+    fn history_snapshot(&self) -> (Vec<ConsoleHistoryEntry>, u64) {
         let history = self.console_history.lock();
         let mut selected = Vec::new();
         let mut total_bytes = 0usize;
@@ -364,19 +335,27 @@ impl PushServer {
             selected.push(entry.clone());
         }
         selected.reverse();
-        selected
+        for value in history.progress.snapshots() {
+            selected.push(ConsoleHistoryEntry {
+                body: None,
+                target_console: Some(Arc::from(value["target_console"].as_str().unwrap_or("stdout"))),
+                scope: push_events::message_scope(value).map(Arc::from),
+                payload: Utf8Bytes::from(value.to_string()),
+            });
+        }
+        (selected, history.next_message_id)
     }
 
     fn append_history_locked(
-        history: &mut Vec<ConsoleHistoryEntry>,
+        history: &mut VecDeque<ConsoleHistoryEntry>,
         max_history: usize,
         entry: ConsoleHistoryEntry,
     ) {
-        history.push(entry);
-        if history.len() > max_history {
-            let drain_count = history.len() - max_history + 500;
-            history.drain(..drain_count);
+        if max_history == 0 { return; }
+        while history.len() >= max_history {
+            history.pop_front();
         }
+        history.push_back(entry);
     }
 
     fn client_matches_filter(
@@ -415,9 +394,8 @@ impl PushServer {
     pub fn recent_logs(&self, count: usize) -> Vec<String> {
         let history = self.console_history.lock();
         let start = history.entries.len().saturating_sub(count);
-        history.entries[start..]
-            .iter()
-            .map(|entry| entry.body.clone().unwrap_or_else(|| entry.payload.clone()))
+        history.entries.iter().skip(start)
+            .map(|entry| entry.body.clone().unwrap_or_else(|| entry.payload.to_string()))
             .collect()
     }
 }
@@ -425,6 +403,13 @@ impl PushServer {
 impl Default for PushServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl crate::application::messages::MessageSink for PushServer {
+    fn emit(&self, stream: crate::application::messages::Stream, text: &str) {
+        crate::application::messages::MessageSink::emit(&crate::progress::ConsoleSink, stream, text);
+        self.broadcast_echo(text, stream.target_console());
     }
 }
 
@@ -490,8 +475,7 @@ async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>, client_f
         return;
     };
 
-    let history = push_server.history_snapshot();
-    let replayed_history_ids: HashSet<u64> = history.iter().map(|entry| entry.id).collect();
+    let (history, replayed_through) = push_server.history_snapshot();
     let (mut sender, mut receiver) = socket.split();
     let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
     let mut last_activity = Instant::now();
@@ -505,7 +489,7 @@ async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>, client_f
             continue;
         }
         if sender
-            .send(Message::Text(entry.payload.into()))
+            .send(Message::Text(entry.payload))
             .await
             .is_err()
         {
@@ -520,7 +504,7 @@ async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>, client_f
                 let Some(message) = message else {
                     break;
                 };
-                if message.replayed_by_history && replayed_history_ids.contains(&message.id) {
+                if message.replayed_by_history && message.id <= replayed_through {
                     continue;
                 }
                 if !PushServer::client_matches_filter(
@@ -531,7 +515,7 @@ async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>, client_f
                     continue;
                 }
                 if sender
-                    .send(Message::Text((*message.payload).clone().into()))
+                    .send(Message::Text(message.payload))
                     .await
                     .is_err()
                 {
@@ -576,91 +560,33 @@ fn normalize_filter_value(value: Option<String>) -> Option<String> {
     })
 }
 
-fn message_target_console(value: &serde_json::Value) -> Option<String> {
+fn message_target_console(value: &serde_json::Value) -> Option<Arc<str>> {
     value
         .get("target_console")
         .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
+        .map(Arc::from)
 }
 
-fn message_scope(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("scope")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            value
-                .get("data")
-                .and_then(|data| data.get("scope"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .map(ToOwned::to_owned)
-}
 
 fn history_entry_from_value(
-    id: u64,
     value: &serde_json::Value,
-    scope: Option<String>,
-    payload: String,
+    target_console: &Option<Arc<str>>,
+    scope: &Option<Arc<str>>,
+    payload: &Utf8Bytes,
 ) -> Option<ConsoleHistoryEntry> {
     let message_type = value.get("type").and_then(serde_json::Value::as_str)?;
-    if !history_type_replayable(message_type) {
-        return None;
-    }
-    let body = history_body(value, message_type);
-    let target_console = message_target_console(value)
-        .or_else(|| default_history_target_console(message_type).map(ToOwned::to_owned));
+    if !push_events::history_replayable(message_type) { return None; }
+    let body = push_events::history_body(value).map(str::to_owned);
+    let target_console = target_console.clone()
+        .or_else(|| push_events::history_target_console(value).map(Arc::from));
     Some(ConsoleHistoryEntry {
-        id,
         body,
         target_console,
-        scope,
-        payload,
+        scope: scope.clone(),
+        payload: payload.clone(),
     })
 }
 
-fn history_type_replayable(message_type: &str) -> bool {
-    matches!(
-        message_type,
-        "echo"
-            | "error"
-            | "log"
-            | "progress"
-            | "progressbar.init"
-            | "progressbar.step"
-            | "progressbar.clear"
-    )
-}
-
-fn history_body(value: &serde_json::Value, message_type: &str) -> Option<String> {
-    match message_type {
-        "echo" => value
-            .get("body")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
-        "error" => value
-            .get("data")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
-            .map(ToOwned::to_owned),
-        "log" => value
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| value.get("text").and_then(serde_json::Value::as_str))
-            .map(ToOwned::to_owned),
-        "progress" => value
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
-        _ => None,
-    }
-}
-
-fn default_history_target_console(message_type: &str) -> Option<&'static str> {
-    match message_type {
-        "echo" | "error" | "log" => Some("stdout"),
-        _ => None,
-    }
-}
 
 fn origin_to_domain(origin: &str) -> String {
     let trimmed = origin.trim();
@@ -682,6 +608,25 @@ fn origin_to_domain(origin: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflowing_console_history_keeps_latest_messages_and_replay_state() {
+        let server = PushServer::new_with_limits(4, 3);
+        server.broadcast_raw(push_events::progressbar_init("active download", "stdout"));
+        for message in ["old", "first", "second", "latest"] {
+            server.broadcast_echo(message, "stdout");
+        }
+        assert_eq!(server.get_history_for(Some("stdout")), "first\nsecond\nlatest");
+        assert_eq!(server.recent_logs(2), vec!["second", "latest"]);
+        assert_eq!(server.recent_logs(1), vec!["latest"]);
+        server.clear_history();
+        assert_eq!(server.get_history_for(Some("stdout")), "");
+        assert_eq!(server.console_history.lock().progress.snapshots()
+            .map(|value| value["data"]["topic"].as_str()).collect::<Vec<_>>(), vec![Some("active download")]);
+        let disabled = PushServer::new_with_limits(4, 0);
+        disabled.broadcast_echo("not retained", "stdout");
+        assert_eq!(disabled.get_history_for(Some("stdout")), "");
+    }
 
     #[test]
     fn accepts_origin_respects_wildcards() {
@@ -855,75 +800,18 @@ mod tests {
     }
 
     #[test]
-    fn history_snapshot_ids_allow_live_dedup_without_dropping_control_events() {
-        let server = PushServer::new_with_limits(4, 16);
-        let (client_tx, mut client_rx) = mpsc::channel(8);
-        let client_id = server.try_register_client(client_tx).expect("client");
-
-        server.broadcast_echo("history line", "stdout");
-        server.broadcast_raw(&serde_json::json!({ "type": "table.reload" }));
-
-        let history = server.history_snapshot();
-        let history_ids: HashSet<u64> = history.iter().map(|entry| entry.id).collect();
-        let first_live = client_rx.try_recv().expect("history message");
-        let second_live = client_rx.try_recv().expect("control message");
-
-        assert!(first_live.replayed_by_history);
-        assert!(history_ids.contains(&first_live.id));
-        assert_eq!(serde_json::from_str::<serde_json::Value>(first_live.payload.as_str()).unwrap()["type"], "echo");
-
-        assert!(!second_live.replayed_by_history);
-        assert!(!history_ids.contains(&second_live.id));
-        assert_eq!(serde_json::from_str::<serde_json::Value>(second_live.payload.as_str()).unwrap()["type"], "table.reload");
-
-        server.unregister_client(client_id);
-    }
-
-    #[test]
-    fn concurrent_publish_preserves_history_id_order() {
-        let server = Arc::new(PushServer::new_with_limits(4, 512));
-        let start = Arc::new(std::sync::Barrier::new(3));
-
-        let first_server = Arc::clone(&server);
-        let first_start = Arc::clone(&start);
-        let first = std::thread::spawn(move || {
-            first_start.wait();
-            for idx in 0..100 {
-                first_server.broadcast_echo(&format!("first-{idx}"), "stdout");
-            }
-        });
-
-        let second_server = Arc::clone(&server);
-        let second_start = Arc::clone(&start);
-        let second = std::thread::spawn(move || {
-            second_start.wait();
-            for idx in 0..100 {
-                second_server.broadcast_echo(&format!("second-{idx}"), "stdout");
-            }
-        });
-
-        start.wait();
-        first.join().unwrap();
-        second.join().unwrap();
-
-        let history = server.history_snapshot();
-        let history_ids: Vec<u64> = history.iter().map(|entry| entry.id).collect();
-        assert_eq!(history_ids, (1..=200).collect::<Vec<_>>());
-    }
-
-    #[test]
     fn slow_clients_are_dropped_after_consecutive_queue_overflows() {
         let server = PushServer::new_with_limits(4, 16);
         let (client_tx, mut client_rx) = mpsc::channel(1);
         let client_id = server.try_register_client(client_tx).expect("client");
 
-        server.broadcast_raw(&serde_json::json!({ "type": "table.reload" }));
+        server.broadcast_raw(serde_json::json!({ "type": "table.reload" }));
         for _ in 0..(WS_MAX_CONSECUTIVE_FULL_SENDS - 1) {
-            server.broadcast_raw(&serde_json::json!({ "type": "queue.start" }));
+            server.broadcast_raw(serde_json::json!({ "type": "queue.start" }));
         }
         assert_eq!(server.client_count(), 1);
 
-        server.broadcast_raw(&serde_json::json!({ "type": "queue.stop" }));
+        server.broadcast_raw(serde_json::json!({ "type": "queue.stop" }));
         assert_eq!(server.client_count(), 0);
 
         assert_eq!(
@@ -948,50 +836,10 @@ mod tests {
         let client_id = server.try_register_client(client_tx).expect("client");
         drop(client_rx);
 
-        server.broadcast_raw(&serde_json::json!({ "type": "table.reload" }));
+        server.broadcast_raw(serde_json::json!({ "type": "table.reload" }));
         assert_eq!(server.client_count(), 0);
 
         server.unregister_client(client_id);
-    }
-
-    #[test]
-    fn history_snapshot_preserves_message_types_and_structured_progress() {
-        let server = PushServer::new_with_limits(4, 16);
-
-        server.broadcast_error("boom");
-        server.broadcast_log("warn", "careful");
-        server.broadcast_raw(&serde_json::json!({
-            "type": "progressbar.step",
-            "data": { "percent": 42.0, "topic": "convert", "scope": "job-1" },
-            "target_console": "stdout2",
-        }));
-
-        let history = server.history_snapshot();
-        let history_types: Vec<String> = history
-            .iter()
-            .map(|entry| {
-                serde_json::from_str::<serde_json::Value>(&entry.payload).unwrap()["type"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(history_types, vec!["error", "log", "progressbar.step"]);
-        assert_eq!(history[0].body.as_deref(), Some("boom"));
-        assert_eq!(history[1].body.as_deref(), Some("careful"));
-        assert_eq!(history[2].target_console.as_deref(), Some("stdout2"));
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&history[2].payload).unwrap()["type"],
-            "progressbar.step"
-        );
-
-        let recent_logs = server.recent_logs(3);
-        assert_eq!(recent_logs[0], "boom");
-        assert_eq!(recent_logs[1], "careful");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&recent_logs[2]).unwrap()["type"],
-            "progressbar.step"
-        );
     }
 
     #[test]
@@ -1075,82 +923,3 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct StreamingLogEntry {
-    pub timestamp: String,
-    pub level: String,
-    pub message: String,
-}
-
-pub struct StreamingLogger {
-    push_server: Arc<PushServer>,
-    buffer: Mutex<Vec<StreamingLogEntry>>,
-    max_buffer: usize,
-}
-
-impl StreamingLogger {
-    pub fn new(push_server: Arc<PushServer>) -> Self {
-        Self {
-            push_server,
-            buffer: Mutex::new(Vec::new()),
-            max_buffer: 1000,
-        }
-    }
-
-    pub fn log(&self, level: &str, message: &str) {
-        let entry = StreamingLogEntry {
-            timestamp: chrono::Utc::now()
-                .with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap())
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
-            level: level.to_string(),
-            message: message.to_string(),
-        };
-
-        {
-            let mut buf = self.buffer.lock();
-            if buf.len() >= self.max_buffer {
-                let drain_count = buf.len() - self.max_buffer + 100;
-                buf.drain(..drain_count);
-            }
-            buf.push(StreamingLogEntry {
-                timestamp: entry.timestamp,
-                level: entry.level,
-                message: entry.message,
-            });
-        }
-
-        self.push_server.broadcast_log(level, message);
-    }
-
-    pub fn info(&self, message: &str) {
-        self.log("info", message);
-    }
-
-    pub fn warn(&self, message: &str) {
-        self.log("warn", message);
-    }
-
-    pub fn error(&self, message: &str) {
-        self.log("error", message);
-    }
-
-    pub fn recent_logs(&self, count: usize) -> Vec<StreamingLogEntry> {
-        let buf = self.buffer.lock();
-        let start = buf.len().saturating_sub(count);
-        buf[start..].to_vec()
-    }
-
-    pub fn full_history(&self) -> String {
-        let buf = self.buffer.lock();
-        buf.iter()
-            .map(|e| format!("[{}] {}", e.timestamp, e.message))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    pub fn clear_history(&self) {
-        let mut buf = self.buffer.lock();
-        buf.clear();
-    }
-}

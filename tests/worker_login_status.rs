@@ -1,14 +1,12 @@
-//! Pin the Worker login status payload: masked values only, encryption flags
-//! computed from one raw payload read.
+//! Pin the login status payload: masked values only, encryption flags computed
+//! from one raw payload read.
 //!
-//! The Worker crate itself is wasm-only, so the production module is included
-//! here directly (same pattern as `tests/worker_storage_probe.rs`).
-
-#[path = "../worker_entry/src/login/listing.rs"]
-mod listing;
+//! The payload builder lives in `narou_rs::platform::cookie_store`; the native
+//! Web API and the Worker share it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use narou_rs::platform::cookie_store::{encrypted_sites, login_status_json};
 use narou_rs::platform::{HostCookie, LoginGroup};
 
 fn group(site: &str, id: &str, label: Option<&str>, cookies: &[(&str, &str)]) -> LoginGroup {
@@ -45,7 +43,7 @@ fn encryption_flags_follow_the_raw_prefix_of_the_site_key() {
         ("folded.example", group("folded.example", "id3", None, &[("www.folded.example", "session=abc")])),
     ]);
 
-    let flags = listing::encrypted_sites(&raw, &sites);
+    let flags = encrypted_sites(&raw, &sites);
     assert!(flags.contains("example.com"));
     assert!(!flags.contains("plain.example"));
     assert!(!flags.contains("folded.example"));
@@ -63,7 +61,7 @@ fn payload_masks_cookies_and_never_carries_the_stored_value() {
     ]);
     let mut flags = BTreeSet::new();
     flags.insert("example.com".to_string());
-    let payload = listing::status_json(&sites, &flags, "NAROU_RS_LOGIN_KEY");
+    let payload = login_status_json(&sites, &flags, "NAROU_RS_LOGIN_KEY");
 
     assert_eq!(payload["sites_count"], 1);
     assert_eq!(payload["logins_count"], 1);
@@ -90,6 +88,6 @@ fn payload_masks_cookies_and_never_carries_the_stored_value() {
 #[test]
 fn an_unflagged_site_reports_false_not_absent() {
     let sites = sites(&[("example.com", group("example.com", "id", None, &[("example.com", "a=b")]))]);
-    let payload = listing::status_json(&sites, &BTreeSet::new(), "none");
+    let payload = login_status_json(&sites, &BTreeSet::new(), "none");
     assert_eq!(payload["sites"][0]["encrypted"], false);
 }

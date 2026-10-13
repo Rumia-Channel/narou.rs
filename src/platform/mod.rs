@@ -47,6 +47,8 @@ pub use object_store::{
     paginate_object_listing, prefix_upper_bound,
     AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectEncoding,
     ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore,
+    ObjectUpdateResult, SmallObjectMutator,
+    encode_object_payload, decode_object_payload_limited,
     compress_object_payload, content_type_for_key, decompress_object_payload, illustration_key,
     object_crc32, verify_object_crc32,
 };

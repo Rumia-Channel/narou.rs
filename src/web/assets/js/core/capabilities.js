@@ -53,12 +53,16 @@ export function applyActionCapabilities() {
   const history = State.capabilities?.console_history;
   const historyButton = document.getElementById('console-history');
   if (historyButton) {
+    historyButton.disabled = !history?.available;
     historyButton.setAttribute('aria-disabled', history?.available ? 'false' : 'true');
     historyButton.title = history?.available
       ? `保持済みの履歴を取得 (最大 ${history.capacity} 件)` : 'この環境では履歴を取得できません';
   }
   const clearButton = document.getElementById('console-trash');
-  if (clearButton) clearButton.setAttribute('aria-disabled', history?.clear ? 'false' : 'true');
+  if (clearButton) {
+    clearButton.disabled = !history?.clear;
+    clearButton.setAttribute('aria-disabled', history?.clear ? 'false' : 'true');
+  }
 }
 
 export function setCapabilities(capabilities) {

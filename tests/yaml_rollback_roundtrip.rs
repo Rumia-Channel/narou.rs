@@ -153,7 +153,7 @@ fn failed_export_keeps_sqlite_selected() {
     // Corrupt the stored CRC-32 of one object, as a damaged database would be.
     let connection = narou_rs::native::sqlite::open(&root.join(".narou/db.sqlite")).unwrap();
     {
-        let guard = connection.lock().expect("sqlite mutex poisoned");
+        let guard = connection.lock();
         guard
             .execute(
                 "UPDATE objects SET crc32 = crc32 + 1 WHERE object_key = ?",

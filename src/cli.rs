@@ -259,12 +259,8 @@ fn load_local_setting_value(key: &str) -> Option<String> {
 }
 
 fn load_local_setting_bool(key: &str) -> Option<bool> {
-    match load_local_setting_raw_value(key)? {
-        serde_yaml::Value::Bool(v) => Some(v),
-        serde_yaml::Value::Number(v) => v.as_i64().map(|n| n != 0),
-        serde_yaml::Value::String(v) => parse_bool(&v),
-        _ => None,
-    }
+    load_local_setting_raw_value(key)
+        .and_then(|value| narou_rs::setting_core::setting_bool_value(&value))
 }
 
 fn load_local_setting_raw_value(key: &str) -> Option<serde_yaml::Value> {
@@ -337,14 +333,6 @@ fn has_option(args: &[String], short: &str, long: &str) -> bool {
     args.iter()
         .skip(1)
         .any(|arg| arg == short || arg == long || arg.starts_with(&long_prefix))
-}
-
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Some(true),
-        "false" | "no" | "off" | "0" => Some(false),
-        _ => None,
-    }
 }
 
 fn is_terminal_stdin() -> bool {
