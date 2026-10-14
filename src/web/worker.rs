@@ -128,6 +128,7 @@ fn start_queue_worker_for_lane(
                 }
                 continue;
             };
+            workers.push_server.broadcast_raw(narou_rs::application::push_events::queue_start(&job.id));
             let workers_for_run = workers.clone();
             let job_for_run = job.clone();
             let result =

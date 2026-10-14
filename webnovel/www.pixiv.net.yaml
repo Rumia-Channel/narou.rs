@@ -45,7 +45,7 @@ headers:
   Referer: \k<top_url>/
 confirm_over18: no
 append_title_to_folder_name: yes
-version: 1.2
+version: 1.4
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)
@@ -198,6 +198,11 @@ preprocess: |-
         end
         for entry in entries
           emit "Episode;${entry.seriesContentOrder};https://www.pixiv.net/ajax/novel/${entry.id};${entry.createDate};${entry.title}"
+          if entry.tags.is_array
+            for tag in entry.tags
+              emit "tag::${tag}"
+            end
+          end
         end
         if entries.size == 30
           emit "next::/ajax/novel/series_content/${entries.first.seriesId}?limit=30&last_order=${entries.last.seriesContentOrder}&order_by=asc"

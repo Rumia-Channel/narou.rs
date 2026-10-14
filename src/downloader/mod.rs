@@ -647,6 +647,21 @@ fn sanitize_site_tags(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Merge metadata and all TOC pages in first-seen order without duplicating
+/// tag strings or discarding tags that appear only on a later page.
+fn collect_site_tags(info_tags: Option<&str>, page_tags: &[String]) -> Vec<String> {
+    let mut positions = HashMap::new();
+    for source in info_tags.into_iter().chain(page_tags.iter().map(String::as_str)) {
+        for tag in sanitize_site_tags(source) {
+            let position = positions.len();
+            positions.entry(tag).or_insert(position);
+        }
+    }
+    let mut tags: Vec<_> = positions.into_iter().collect();
+    tags.sort_unstable_by_key(|(_, position)| *position);
+    tags.into_iter().map(|(tag, _)| tag).collect()
+}
+
 fn section_timestamp_ymd(download_time: Option<&str>, timezone: SiteTimezone) -> Option<String> {
     download_time.and_then(|value| date_string_to_ymd_with_timezone(value, timezone))
 }
@@ -912,7 +927,7 @@ impl Downloader {
                 })
                 .await
                 .ok()
-                .map(|(subtitles, _partial)| subtitles)
+                .map(|listing| listing.subtitles)
             };
             if let Some(subs) = &subtitles {
                 if novelupdated_at.is_none() {
@@ -1642,11 +1657,12 @@ impl Downloader {
 
         let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
 
-        let (mut subtitles, mut partial_listing) = if novel_type == 2 {
-            (
-                create_short_story_subtitles(&setting, &toc_source, &info)?,
-                false,
-            )
+        let toc::TocListing { mut subtitles, partial: mut partial_listing, tag_sources: mut page_tags } = if novel_type == 2 {
+            toc::TocListing {
+                subtitles: create_short_story_subtitles(&setting, &toc_source, &info)?,
+                partial: false,
+                tag_sources: setting.resolve_info_pattern("tags", &toc_source).into_iter().collect(),
+            }
         } else {
             parse_subtitles_multipage(toc::MultipageTocRequest {
                 http: self.http.as_ref(),
@@ -1673,7 +1689,7 @@ impl Downloader {
                 for group in &groups {
                     setting.cookie = base_cookie.clone();
                     apply_login_cookie(&mut setting, &group.merged_cookie(), &group.cookies);
-                    let Ok((retried, retried_partial)) =
+                    let Ok(toc::TocListing { subtitles: retried, partial: retried_partial, tag_sources: retried_tags }) =
                         parse_subtitles_multipage(toc::MultipageTocRequest {
                             http: self.http.as_ref(),
                             rate_limiter: self.rate_limiter.as_ref(),
@@ -1692,6 +1708,7 @@ impl Downloader {
                         let resolved = !retried_partial;
                         subtitles = retried;
                         partial_listing = retried_partial;
+                        page_tags = retried_tags;
                         requires_login = true;
                         login_session = Some(group.id.clone());
                         winner = Some(group.clone());
@@ -2288,11 +2305,7 @@ impl Downloader {
 
         let auto_add_tags = self.settings.local_setting_bool("auto-add-tags");
         let auto_tags = if auto_add_tags {
-            info.tags
-                .clone()
-                .or_else(|| setting.resolve_info_pattern("tags", &toc_source))
-                .map(|raw_tags| sanitize_site_tags(&raw_tags))
-                .unwrap_or_default()
+            collect_site_tags(info.tags.as_deref(), &page_tags)
         } else {
             Vec::new()
         };

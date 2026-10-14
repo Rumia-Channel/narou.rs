@@ -340,7 +340,6 @@ async fn process_discrete(
                 settle_user_cancel(runtime, push, &job_id, message, error).await?;
                 return Ok(());
             }
-            runtime.enqueue_plan(job.clone()).await?;
             broadcast_terminal_events(
                 push,
                 &job_id,
@@ -354,6 +353,8 @@ async fn process_discrete(
                 table_reload_after_job(runtime).await,
             )
             .await;
+            // Retire the old attempt before dispatch can start its continuation.
+            runtime.enqueue_plan(job.clone()).await?;
             message.ack();
         }
         JobOutcome::Blocked { reason } => {

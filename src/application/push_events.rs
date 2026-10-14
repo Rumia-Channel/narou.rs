@@ -294,9 +294,12 @@ impl ProgressReplay {
             }
             "queue_start" => {
                 let job = queue_job_id(data);
-                let before = self.closed_scopes.len();
+                if job.is_empty() { return false; }
+                let was_closed = self.closed_scopes.iter().any(|scope| scope == job);
+                let had_active = self.active.values().any(|value| value["data"]["scope"].as_str() == Some(job));
+                if had_active { self.clear_scope(job, None); }
                 self.closed_scopes.retain(|scope| scope != job);
-                before != self.closed_scopes.len()
+                had_active || was_closed
             }
             "queue_complete" | "queue_failed" | "queue_retry" | "queue_partial"
             | "queue.partial" | "queue_cancelled" | "queue.cancelled" => {
@@ -400,5 +403,28 @@ mod progress_tests {
         assert!(!replay.observe(step("job", "old", 3, 2)));
         assert_eq!(replay.snapshots().next().unwrap()["data"]["operation"], "new");
     }
+    #[test]
+    fn reclaimed_attempt_retires_abandoned_operations_but_not_other_jobs() {
+        let mut replay = ProgressReplay::default();
+        replay.observe(step("job", "abandoned", 2, 1));
+        replay.observe(step("peer", "parallel", 5, 1));
+        assert!(replay.observe(queue_start("job")));
+        assert!(replay.observe(step("job", "resumed", 3, 1)));
+        assert!(!replay.observe(step("job", "abandoned", 4, 2)));
+        let restored: ProgressReplay = serde_json::from_str(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let operations: Vec<_> = restored.snapshots().map(|value| value["data"]["operation"].as_str().unwrap()).collect();
+        assert_eq!(operations, vec!["resumed", "parallel"]);
+    }
+
+    #[test]
+    fn cancellation_removes_durable_progress_and_rejects_late_updates() {
+        let mut replay = ProgressReplay::default();
+        replay.observe(step("job", "running", 2, 1));
+        replay.observe(queue_cancelled("job"));
+        let mut restored: ProgressReplay = serde_json::from_str(&serde_json::to_string(&replay).unwrap()).unwrap();
+        assert_eq!(restored.snapshots().count(), 0);
+        assert!(!restored.observe(step("job", "running", 3, 2)));
+    }
+
 }
 
