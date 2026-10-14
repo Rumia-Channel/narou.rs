@@ -1135,10 +1135,17 @@ await check("POST /api/global_setting rejects a stale expected value without ove
   assert.equal(stale.body.success, false, `a stale save must not succeed: ${JSON.stringify(stale.body)}`);
   assert.equal(stale.body.conflict, true, `the conflict must be machine readable: ${JSON.stringify(stale.body)}`);
 
-  const after = settingValues(await fetchSettingsView());
-  assert.equal(after.get("webui.theme"), themeWinner, "the stale save must not overwrite the theme");
-  assert.equal(after.get("concurrency"), concurrencyWinner, "the stale save must not overwrite concurrency");
-  assert.equal(after.get("convert.epub-font"), fontSizeWinner, "the stale save must not overwrite the global scope");
+  // GET は replica / 他 isolate の TTL キャッシュを使うため、保存直後でも
+  // 古い値を返せる。primary を読む no-op CAS で、勝者の local/global 値が
+  // どれも上書きされていないことを検証する (違えば 409、同じなら書き込み無し)。
+  const winner = {
+    "webui.theme": themeWinner,
+    concurrency: concurrencyWinner,
+    "convert.epub-font": fontSizeWinner,
+  };
+  const unchanged = await postSettings({ settings: winner, expected_settings: winner });
+  assert.equal(unchanged.status, 200, `the stale save must preserve every winner value: ${JSON.stringify(unchanged.body)}`);
+  assert.equal(unchanged.body.success, true, `the winner snapshot must still match: ${JSON.stringify(unchanged.body)}`);
   } finally {
     await postSettings({
       settings: { "webui.theme": themeBefore, concurrency: concurrencyBefore, "convert.epub-font": fontSizeBefore },
