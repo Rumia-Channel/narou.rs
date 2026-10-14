@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use narou_rs::application::target_lookup::{TargetLookupPlan, UrlSource};
 use narou_rs::compat::yaml_value_to_string;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
-use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::queue::{JobType, PersistentQueue};
 
 pub mod alias;
@@ -31,58 +31,36 @@ pub mod update;
 pub mod version;
 pub mod web;
 
-fn resolve_alias_target(target: &str) -> String {
-    let aliases = narou_rs::db::with_database(|db| {
+/// native `alias.yaml` (Local inventory スコープ) の別名表。
+fn load_alias_map() -> HashMap<String, String> {
+    narou_rs::db::with_database(|db| {
         let values: HashMap<String, serde_yaml::Value> =
             db.inventory().load("alias", InventoryScope::Local)?;
         Ok(narou_rs::application::aliases::alias_map_from_values(
             values,
         ))
     })
-    .unwrap_or_default();
-    narou_rs::application::aliases::resolve_alias_target(&aliases, target)
+    .unwrap_or_default()
 }
 
+
+/// convert / clean / folder / illust / inspect / browser の共通ターゲット解決。
+/// 探索順・URL fallback・title→ncode の規則は
+/// `application::target_lookup::TargetLookupPlan::CONVERT` が唯一の定義。
 fn resolve_target_to_id(target: &str) -> Option<i64> {
-    let target = resolve_alias_target(target);
-    if let Ok(i) = target.parse::<i64>() {
-        return narou_rs::native::novel_repository::NativeNovelRepository::new()
-            .get_sync(i.into())
-            .ok()
-            .flatten()
-            .map(|r| r.id);
-    }
-    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    match Downloader::get_target_type(&target) {
-        TargetType::Url => {
-            let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
-            let setting = site_settings.iter().find(|s| s.matches_url(&target))?;
-            let toc_url = setting
-                .toc_url_with_url_captures(&target)
-                .unwrap_or_else(|| setting.toc_url());
-            novels
-                .find_by_toc_url_sync(&toc_url)
-                .ok()
-                .flatten()
-                .map(|r| r.id)
-        }
-        TargetType::Ncode => novels
-            .find_by_ncode_sync(&target)
-            .ok()
-            .flatten()
-            .map(|r| r.id),
-        TargetType::Id => None,
-        TargetType::Other => novels
-            .find_by_title_sync(&target)
-            .ok()
-            .flatten()
-            .or_else(|| {
-                // なろう式の ncode 判定 (`n\d+[a-z]+`) に当たらない ncode
-                // (Pixiv の `n29204764` / `s16299140` など) はここで拾う。
-                novels.find_by_ncode_sync(&target).ok().flatten()
-            })
-            .map(|r| r.id),
-    }
+    let aliases = load_alias_map();
+    let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
+    let lookup = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    narou_rs::application::target_lookup::resolve_target_record_sync(
+        TargetLookupPlan::CONVERT,
+        &aliases,
+        UrlSource::Settings(&site_settings),
+        target,
+        &lookup,
+    )
+    .ok()
+    .flatten()
+    .map(|record| record.id)
 }
 
 fn latest_convert_target() -> Option<String> {

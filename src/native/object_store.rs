@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::io::Write;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
@@ -16,7 +15,8 @@ use std::sync::Arc;
 
 use crate::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
-    ObjectPrefix, ObjectStore, PlatformFuture, S3Store, SplitStore,
+    ObjectStore, PlatformFuture, S3Store, SplitStore,
+    ObjectUpdateResult, SmallObjectMutator,
 };
 
 pub(crate) const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
@@ -143,7 +143,7 @@ impl NativeObjectStore {
             key: key.clone(),
             size: metadata.len(),
             etag: None,
-            content_type: content_type_for_path(path),
+            content_type: content_type_for_path(path).map(str::to_string),
             last_modified,
         }))
     }
@@ -173,6 +173,48 @@ impl NativeObjectStore {
         let path = self.resolve_path(key)?;
         self.ensure_parent_dir(&path)?;
         atomic_write_bytes(&path, &data)
+    }
+
+    pub(crate) fn update_small_blocking<'data>(
+        &self,
+        key: &ObjectKey,
+        mutate: &mut SmallObjectMutator<'data>,
+    ) -> Result<ObjectUpdateResult> {
+        let path = self.resolve_path(key)?;
+        self.ensure_parent_dir(&path)?;
+        crate::db::inventory::with_exclusive_file_lock(&path, || {
+            let current = self.read_small_blocking(key)?;
+            if let Some(data) = mutate(current.as_deref())? {
+                if data.len() as u64 > MAX_SMALL_OBJECT_BYTES {
+                    return Err(NarouError::Platform(format!("small object exceeds {MAX_SMALL_OBJECT_BYTES} bytes: {key}")));
+                }
+                self.write_bytes_blocking(key, &data)?;
+            }
+            Ok(ObjectUpdateResult::Committed)
+        })
+    }
+
+    pub(crate) fn read_small_blocking(&self, key: &ObjectKey) -> Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        let path = self.resolve_read_path(key)?;
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        if metadata.len() > MAX_SMALL_OBJECT_BYTES {
+            return Err(NarouError::Platform(format!("small object exceeds {MAX_SMALL_OBJECT_BYTES} bytes: {key}")));
+        }
+        let mut data = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_SMALL_OBJECT_BYTES + 1).read_to_end(&mut data)?;
+        if data.len() as u64 > MAX_SMALL_OBJECT_BYTES {
+            return Err(NarouError::Platform(format!("small object exceeds {MAX_SMALL_OBJECT_BYTES} bytes: {key}")));
+        }
+        Ok(Some(data))
     }
 
 
@@ -229,6 +271,16 @@ where
     }
 }
 
+pub(crate) fn run_scoped_blocking<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+        handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    }) {
+        tokio::task::block_in_place(operation)
+    } else {
+        operation()
+    }
+}
+
 pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -249,19 +301,10 @@ pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn content_type_for_path(path: &Path) -> Option<String> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("yaml" | "yml") => Some("application/yaml".to_string()),
-        Some("ini" | "txt") => Some("text/plain; charset=utf-8".to_string()),
-        Some("html") => Some("text/html; charset=utf-8".to_string()),
-        Some("jpg" | "jpeg") => Some("image/jpeg".to_string()),
-        Some("png") => Some("image/png".to_string()),
-        Some("gif") => Some("image/gif".to_string()),
-        Some("webp") => Some("image/webp".to_string()),
-        Some("epub") => Some("application/epub+zip".to_string()),
-        Some("zip") => Some("application/zip".to_string()),
-        _ => None,
-    }
+pub(crate) fn content_type_for_path(path: &Path) -> Option<&'static str> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(crate::platform::object_store::content_type_for_extension)
 }
 
 impl ObjectStore for NativeObjectStore {
@@ -280,40 +323,7 @@ impl ObjectStore for NativeObjectStore {
     fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
         let this = self.clone();
         let key = key.clone();
-        run_blocking(move || {
-            use std::io::Read;
-            let path = this.resolve_read_path(&key)?;
-            // Open first, then fstat the handle: a path-based metadata check
-            // followed by a separate open would race a swap for a larger file.
-            let file = match fs::File::open(&path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(None)
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let metadata = file.metadata()?;
-            if !metadata.is_file() {
-                return Ok(None);
-            }
-            if metadata.len() > MAX_SMALL_OBJECT_BYTES {
-                return Err(NarouError::Platform(format!(
-                    "small object exceeds {} bytes: {key}",
-                    MAX_SMALL_OBJECT_BYTES
-                )));
-            }
-            // Read at most limit+1 so a file that grew between fstat and read
-            // is still rejected instead of silently truncated.
-            let mut data = Vec::with_capacity(metadata.len() as usize);
-            file.take(MAX_SMALL_OBJECT_BYTES + 1).read_to_end(&mut data)?;
-            if data.len() as u64 > MAX_SMALL_OBJECT_BYTES {
-                return Err(NarouError::Platform(format!(
-                    "small object exceeds {} bytes: {key}",
-                    MAX_SMALL_OBJECT_BYTES
-                )));
-            }
-            Ok(Some(data))
-        })
+        run_blocking(move || this.read_small_blocking(&key))
     }
 
     fn write_small<'a>(
@@ -324,6 +334,16 @@ impl ObjectStore for NativeObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || this.write_small_blocking(&key, data))
+    }
+
+    fn update_small<'a, 'data: 'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        mutate: &'a mut SmallObjectMutator<'data>,
+    ) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
+        Box::pin(async move {
+            run_scoped_blocking(|| self.update_small_blocking(key, mutate))
+        })
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
@@ -512,17 +532,38 @@ impl AssetStore for NativeObjectStore {
             if !source.exists() {
                 return Ok(());
             }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            match fs::rename(&source, &destination) {
-                Ok(()) => Ok(()),
-                Err(_) => {
-                    fs::copy(&source, &destination)?;
-                    fs::remove_file(source)?;
-                    Ok(())
+            let owned_version_dir = if crate::application::webui::diff::is_diff_cache_section(&destination_key) {
+                let parent = destination.parent().ok_or_else(|| {
+                    NarouError::Platform("cache section has no version directory".to_string())
+                })?;
+                if let Some(cache_root) = parent.parent() {
+                    fs::create_dir_all(cache_root)?;
                 }
+                // create_dir (not create_dir_all) proves this move owns the
+                // new version directory, even when another writer races it.
+                match fs::create_dir(parent) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && parent.is_dir() => false,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                false
+            };
+            let result = match fs::rename(&source, &destination) {
+                Ok(()) => Ok(()),
+                Err(_) => fs::copy(&source, &destination).and_then(|_| fs::remove_file(&source)),
+            };
+            if result.is_err() && owned_version_dir
+                && let Some(parent) = destination.parent()
+            {
+                // Never recursively delete or remove a directory that
+                // already existed. Nonempty/concurrently written dirs stay.
+                let _ = fs::remove_dir(parent);
             }
+            result.map_err(NarouError::from)
         })
     }
 }
@@ -581,12 +622,16 @@ impl NativeStore {
         let Some(prefix) = logical_key_for_native_path(root, novel_dir) else {
             return Ok(MaterializedNovelFiles::default());
         };
+        let scope = crate::native::materialization::MaterializationScope::acquire(
+            root.parent().unwrap_or(root), novel_dir,
+        )?;
         let paths = store.materialize_into(
             novel_dir,
             &prefix,
             crate::platform::split_store::ILLUSTRATION_SEGMENT,
+            &scope,
         )?;
-        Ok(MaterializedNovelFiles::from_paths(paths))
+        Ok(MaterializedNovelFiles::from_paths(paths, scope))
     }
 
     /// Rebuild a deleted mirror file from the stored object.
@@ -599,6 +644,50 @@ impl NativeStore {
             NativeStore::Sqlite(store) => store.restore_mirror_file(path),
         }
     }
+}
+
+/// Map a novel directory below the archive root to its logical object prefix.
+///
+/// Commands that must reach the same stored objects the downloader wrote
+/// (SQLite mode keeps them in `objects` even when `mirror-files=false` and the
+/// folder was never written) resolve the prefix from the on-disk layout the
+/// record describes, so the logical keys always line up with what
+/// [`NovelObjectKeys`](crate::platform::NovelObjectKeys) would produce.
+pub fn novel_object_prefix(archive_root: &Path, novel_dir: &Path) -> Option<ObjectKey> {
+    logical_key_for_native_path(archive_root, novel_dir)
+}
+
+/// Map any file below the archive root to its logical object key.
+pub fn object_key_for_file(archive_root: &Path, path: &Path) -> Option<ObjectKey> {
+    logical_key_for_native_path(archive_root, path)
+}
+
+/// Whether the active storage backend still holds the novel (`toc.yaml`).
+///
+/// `mirror-files=false` leaves a valid managed novel without any folder under
+/// `小説データ/`; deciding "this record is stale" from `Path::exists` alone
+/// deletes content that only lives in the database. The filesystem store maps
+/// logical keys to the same folder, so YAML mode keeps the previous answer.
+///
+/// Errors are returned instead of folded into `false`: callers delete the
+/// library record when this reports "not stored", so an unreadable store must
+/// never look like proven absence.
+pub fn novel_content_stored(archive_root: &Path, novel_dir: &Path) -> Result<bool> {
+    let prefix = novel_object_prefix(archive_root, novel_dir).ok_or_else(|| {
+        NarouError::Platform(format!(
+            "novel directory is outside the archive root: {}",
+            novel_dir.display()
+        ))
+    })?;
+    let narou_root = archive_root.parent().ok_or_else(|| {
+        NarouError::Platform(format!(
+            "archive root has no library root: {}",
+            archive_root.display()
+        ))
+    })?;
+    let store = NativeStore::for_narou_root(narou_root)?;
+    let toc_key = prefix.join("toc.yaml")?;
+    Ok(futures::executor::block_on(ObjectStore::stat(&store, &toc_key))?.is_some())
 }
 
 /// Ensure a mirror file exists, rebuilding it from storage when the backend
@@ -631,11 +720,12 @@ pub fn ensure_mirror_file(path: &Path) -> bool {
 #[derive(Default)]
 pub struct MaterializedNovelFiles {
     paths: Vec<PathBuf>,
+    _scope: Option<std::sync::Arc<crate::native::materialization::MaterializationScope>>,
 }
 
 impl MaterializedNovelFiles {
-    pub fn from_paths(paths: Vec<PathBuf>) -> Self {
-        Self { paths }
+    pub(crate) fn from_paths(paths: Vec<PathBuf>, scope: std::sync::Arc<crate::native::materialization::MaterializationScope>) -> Self {
+        Self { paths, _scope: Some(scope) }
     }
 
     pub fn paths(&self) -> &[PathBuf] {
@@ -643,13 +733,6 @@ impl MaterializedNovelFiles {
     }
 }
 
-impl Drop for MaterializedNovelFiles {
-    fn drop(&mut self) {
-        for path in &self.paths {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
 
 /// native の保存先ペア。
 ///
@@ -736,10 +819,31 @@ impl ObjectStore for NativeStore {
         }
     }
 
+    fn update_small<'a, 'data: 'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        mutate: &'a mut SmallObjectMutator<'data>,
+    ) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
+        match self {
+            NativeStore::Fs(store) => store.update_small(key, mutate),
+            NativeStore::Sqlite(store) => store.update_small(key, mutate),
+        }
+    }
+
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
         match self {
             NativeStore::Fs(store) => ObjectStore::delete(store, key),
             NativeStore::Sqlite(store) => ObjectStore::delete(store, key),
+        }
+    }
+
+    fn delete_prefix<'a>(
+        &'a self,
+        prefix: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => store.delete_prefix(prefix),
+            NativeStore::Sqlite(store) => store.delete_prefix(prefix),
         }
     }
 
@@ -823,26 +927,8 @@ impl AssetStore for NativeStore {
 /// folder, and a later download then treats the sections as already present
 /// and never rewrites the files the converter reads.
 pub fn delete_prefix_sync(store: &dyn ObjectStore, prefix: &ObjectKey) -> Result<()> {
-    let prefix = ObjectPrefix::from(prefix.clone());
-    let mut cursor: Option<String> = None;
-    loop {
-        let request = ObjectListRequest::new(
-            prefix.clone(),
-            NonZeroUsize::new(100).expect("page size is non-zero"),
-        );
-        let request = match &cursor {
-            Some(cursor) => request.after(cursor.clone()),
-            None => request,
-        };
-        let page = futures::executor::block_on(store.list_page(&request))?;
-        for object in &page.objects {
-            futures::executor::block_on(store.delete(&object.key))?;
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(()),
-        }
-    }
+    futures::executor::block_on(store.delete_prefix(prefix))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -878,6 +964,69 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let _store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
         assert!(ObjectKey::try_new("novels/../escape").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_cache_move_removes_only_its_new_empty_version_directory() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let keys = crate::platform::NovelObjectKeys::new("site", "title", false).unwrap();
+        let source = keys.section("1", "locked");
+        futures::executor::block_on(store.write_small(&source, b"old body".to_vec())).unwrap();
+        let source_path = store.resolve_path(&source).unwrap();
+        for (version, existed) in [("new", false), ("legacy-empty", true)] {
+            let destination = keys.cached_section(version, "1", "locked");
+            let destination_path = store.resolve_path(&destination).unwrap();
+            let version_dir = destination_path.parent().unwrap();
+            if existed {
+                fs::create_dir_all(version_dir).unwrap();
+            }
+            let locked = fs::OpenOptions::new().read(true).share_mode(0).open(&source_path).unwrap();
+            let result = futures::executor::block_on(AssetStore::move_or_copy(&store, &source, &destination));
+            drop(locked);
+            assert!(result.is_err(), "the real rename and copy must fail on the exclusive source handle");
+            assert_eq!(version_dir.exists(), existed, "only the newly owned empty directory is removable");
+            assert_eq!(fs::read(&source_path).unwrap(), b"old body");
+            assert!(!store.resolve_path(&keys.cached_version_marker(version)).unwrap().exists());
+        }
+    }
+
+    /// `mirror-files=false` の有効な作品はフォルダが無くても「保存済み」と
+    /// 判定できること (download/backup の誤削除防止)。
+    #[test]
+    fn novel_content_stored_reads_sqlite_objects_without_mirror() {
+        use crate::native::sqlite::object_store::SqliteObjectStore;
+        use crate::native::sqlite::state;
+
+        let _guard = crate::test_support::global_state_guard();
+        let root = tempfile::tempdir().unwrap();
+        let narou_dir = root.path().join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        state::write_mode(&narou_dir, state::StorageMode::Sqlite).unwrap();
+        let archive_root = root
+            .path()
+            .join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+        let novel_dir = archive_root.join("site").join("title");
+
+        let handle = state::active_for(&narou_dir).expect("sqlite state");
+        let mirror = NativeObjectStore::from_root(archive_root.clone()).unwrap();
+        let store = SqliteObjectStore::with_mirror_files(handle.conn_ref().clone(), mirror, false);
+        let prefix = novel_object_prefix(&archive_root, &novel_dir).unwrap();
+        futures::executor::block_on(store.write_small(
+            &prefix.join("toc.yaml").unwrap(),
+            b"title: test\n".to_vec(),
+        ))
+        .unwrap();
+
+        assert!(!novel_dir.exists(), "mirror disabled must not create files");
+        assert!(novel_content_stored(&archive_root, &novel_dir).unwrap());
+        assert!(!novel_content_stored(
+            &archive_root,
+            &archive_root.join("site").join("missing")
+        ).unwrap());
     }
 
     #[test]

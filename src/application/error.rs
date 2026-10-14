@@ -20,6 +20,8 @@ pub enum ApplicationError {
     NotFound(String),
     /// The request was malformed (bad sort column, invalid pagination, ...).
     InvalidRequest(String),
+    /// A concurrent edit invalidated the caller's saved snapshot.
+    Conflict(String),
 }
 
 impl ApplicationError {
@@ -35,6 +37,7 @@ impl fmt::Display for ApplicationError {
             Self::Platform(message) => write!(f, "platform error: {message}"),
             Self::NotFound(message) => write!(f, "not found: {message}"),
             Self::InvalidRequest(message) => write!(f, "invalid request: {message}"),
+            Self::Conflict(message) => write!(f, "conflict: {message}"),
         }
     }
 }

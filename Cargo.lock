@@ -119,7 +119,7 @@ dependencies = [
 [[package]]
 name = "aozora_epub3_lite"
 version = "0.1.6"
-source = "git+https://github.com/Rumia-Channel/AozoraEpub3_Lite?rev=214aabc#214aabcafd871f830e73266cef887f4d5fe89bf4"
+source = "git+https://github.com/Rumia-Channel/AozoraEpub3_Lite?rev=381c0b17f91946e22d41e5246d3977c706abe82e#381c0b17f91946e22d41e5246d3977c706abe82e"
 dependencies = [
  "encoding_rs",
  "image",
@@ -1845,7 +1845,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "narou_rs"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "aozora_epub3_lite",
  "argon2",
@@ -1907,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "narou_worker"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "base64 0.23.1",
  "brotli",

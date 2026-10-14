@@ -9,6 +9,7 @@
 //! Pure byte-oriented logic with no `worker`, `web_sys`, or `tokio`
 //! dependencies so it can be unit-tested on the host.
 
+use super::http::{HttpMethod, is_safe_header_name, is_safe_header_value};
 use crate::error::{NarouError, Result};
 
 /// Upper bound for a response head (status line + headers).
@@ -83,26 +84,6 @@ impl SocketTarget {
         })
     }
 
-    /// Resolve `Location` against this URL for the next redirect hop.
-    pub fn join(&self, location: &str) -> Result<Self> {
-        // Re-bracket IPv6 literals: the stored host is bare for `connect()`.
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        let base = format!(
-            "{}://{}:{}{}",
-            if self.tls { "https" } else { "http" },
-            host,
-            self.port,
-            self.target
-        );
-        let next = url::Url::parse(&base)
-            .and_then(|base| base.join(location))
-            .map_err(|e| NarouError::Http(format!("invalid redirect location: {e}")))?;
-        Self::parse(next.as_str())
-    }
 }
 
 /// Headers the transport controls; duplicates from the caller would produce
@@ -117,35 +98,41 @@ fn is_transport_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("upgrade")
 }
 
-/// Serialize `GET <target> HTTP/1.1` with `Host`, caller headers and
-/// `Connection: close`.
+/// Serialize the request head with origin-form target, `Host`, caller headers,
+/// an optional body length and `Connection: close`.
 ///
 /// `Connection: close` makes the server's EOF the body terminator when no
 /// length is declared. No `Accept-Encoding` is emitted: the socket path has
 /// no decompressor, and omitting the header is the only portable way to ask
-/// for an identity body. Headers that would corrupt the request line or the
-/// framing (CR/LF inside a value, `Host`/`Connection`/…) are dropped.
-pub fn encode_request(target: &SocketTarget, headers: &[(String, String)]) -> Vec<u8> {
+/// for an identity body. Header names and values are checked with the shared
+/// rules (`platform::http` — RFC token names bounded to
+/// `MAX_HEADER_NAME_BYTES`, no control bytes in values); the
+/// transport-controlled names above are dropped as well.
+pub fn encode_request(target: &SocketTarget, method: HttpMethod, headers: &[(String, String)], body_length: Option<usize>) -> Vec<u8> {
+    use std::io::Write;
     let mut request = Vec::with_capacity(256 + target.authority.len() + target.target.len());
-    request.extend_from_slice(b"GET ");
+    request.extend_from_slice(match method {
+        HttpMethod::Get => b"GET",
+        HttpMethod::Post => b"POST",
+        HttpMethod::Put => b"PUT",
+        HttpMethod::Delete => b"DELETE",
+    });
+    request.push(b' ');
     request.extend_from_slice(target.target.as_bytes());
     request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
     request.extend_from_slice(target.authority.as_bytes());
     request.extend_from_slice(b"\r\n");
     for (name, value) in headers {
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-!#$%&'*+.^_`|~".contains(&b))
-            || value.contains(['\r', '\n'])
-            || is_transport_header(name)
-        {
+        if !is_safe_header_name(name) || !is_safe_header_value(value) || is_transport_header(name) {
             continue;
         }
         request.extend_from_slice(name.as_bytes());
         request.extend_from_slice(b": ");
         request.extend_from_slice(value.as_bytes());
         request.extend_from_slice(b"\r\n");
+    }
+    if let Some(length) = body_length {
+        write!(&mut request, "Content-Length: {length}\r\n").expect("writing to a Vec is infallible");
     }
     request.extend_from_slice(b"Connection: close\r\n\r\n");
     request
@@ -217,56 +204,44 @@ impl Http1ResponseDecoder {
     /// Head / trailer blocks are bounded by [`MAX_HTTP1_HEAD`]; the body by
     /// `body_limit`. Bytes arriving after the response is complete (a next
     /// request's data, or a server sending past `Content-Length`) are dropped.
-    pub fn feed(&mut self, chunk: &[u8]) -> Result<bool> {
-        if matches!(self.stage, Stage::Done) {
-            return Ok(true);
-        }
-        if matches!(self.stage, Stage::Head | Stage::Trailers | Stage::ChunkSize)
-            && self.buf.len() + chunk.len() > MAX_HTTP1_HEAD
-        {
-            return Err(NarouError::Http(
-                "socket response header exceeds limit".to_string(),
-            ));
-        }
-        self.buf.extend_from_slice(chunk);
+    pub fn feed(&mut self, mut input: &[u8]) -> Result<bool> {
         loop {
             match self.stage {
                 Stage::Head => {
-                    let Some(head_end) = find_head_end(&self.buf) else {
+                    if !self.buffer_metadata(&mut input)? {
                         return Ok(false);
-                    };
-                    let head: Vec<u8> = self.buf.drain(..head_end.at).collect();
-                    self.buf.drain(..head_end.skip);
-                    let (status, headers) = parse_head(&head)?;
+                    }
+                    let delimiter_len = if self.buf.ends_with(b"\r\n\r\n") { 4 } else { 2 };
+                    let (status, headers) = parse_head(&self.buf[..self.buf.len() - delimiter_len])?;
+                    self.buf.clear();
                     self.status = status;
                     self.headers = headers;
                     if (100..200).contains(&status) && status != 101 {
-                        // Interim response (100 Continue etc.): discard and
-                        // wait for the real status line.
                         continue;
                     }
-                    self.stage = match (self.framing_for(status), status) {
-                        // 1xx (101), 204 and 304 have no body by definition.
-                        (_, 101 | 204 | 304) => Stage::Done,
-                        (BodyFraming::Fixed(0), _) => Stage::Done,
-                        (BodyFraming::Fixed(remaining), _) => Stage::FixedBody { remaining },
-                        (BodyFraming::Chunked, _) => Stage::ChunkSize,
-                        (BodyFraming::UntilClose, _) => Stage::FixedBody {
-                            // Reuse the take/drain loop with an unbounded
-                            // remainder; `finish` treats UntilClose specially.
-                            remaining: usize::MAX,
-                        },
+                    if matches!(status, 101 | 204 | 304) {
+                        self.stage = Stage::Done;
+                        continue;
+                    }
+                    self.framing = self.framing_for()?;
+                    self.stage = match self.framing {
+                        BodyFraming::Fixed(0) => Stage::Done,
+                        BodyFraming::Fixed(remaining) => {
+                            if remaining > self.body_limit {
+                                return Err(NarouError::Http(
+                                    "socket response body exceeds limit".to_string(),
+                                ));
+                            }
+                            Stage::FixedBody { remaining }
+                        }
+                        BodyFraming::Chunked => Stage::ChunkSize,
+                        BodyFraming::UntilClose => Stage::FixedBody { remaining: usize::MAX },
                     };
-                    self.framing = self.framing_for(status);
                 }
                 Stage::FixedBody { remaining } => {
-                    let take = remaining.min(self.buf.len());
-                    if self.body.len() + take > self.body_limit {
-                        return Err(NarouError::Http(
-                            "socket response body exceeds limit".to_string(),
-                        ));
-                    }
-                    self.body.extend(self.buf.drain(..take));
+                    let take = remaining.min(input.len());
+                    self.append_body(&input[..take])?;
+                    input = &input[take..];
                     let remaining = remaining - take;
                     if remaining == 0 {
                         self.stage = Stage::Done;
@@ -276,11 +251,16 @@ impl Http1ResponseDecoder {
                     }
                 }
                 Stage::ChunkSize => {
-                    let Some(line_end) = find_crlf(&self.buf) else {
+                    if !self.buffer_metadata(&mut input)? {
                         return Ok(false);
-                    };
-                    let line: Vec<u8> = self.buf.drain(..line_end + 2).collect();
-                    let size = parse_chunk_size(&line[..line.len() - 2])?;
+                    }
+                    let size = parse_chunk_size(&self.buf[..self.buf.len() - 2])?;
+                    self.buf.clear();
+                    if size > self.body_limit.saturating_sub(self.body.len()) {
+                        return Err(NarouError::Http(
+                            "socket response body exceeds limit".to_string(),
+                        ));
+                    }
                     self.stage = if size == 0 {
                         Stage::Trailers
                     } else {
@@ -288,13 +268,9 @@ impl Http1ResponseDecoder {
                     };
                 }
                 Stage::ChunkData { remaining } => {
-                    let take = remaining.min(self.buf.len());
-                    if self.body.len() + take > self.body_limit {
-                        return Err(NarouError::Http(
-                            "socket response body exceeds limit".to_string(),
-                        ));
-                    }
-                    self.body.extend(self.buf.drain(..take));
+                    let take = remaining.min(input.len());
+                    self.append_body(&input[..take])?;
+                    input = &input[take..];
                     let remaining = remaining - take;
                     self.stage = if remaining == 0 {
                         Stage::ChunkEnd
@@ -306,42 +282,65 @@ impl Http1ResponseDecoder {
                     }
                 }
                 Stage::ChunkEnd => {
+                    let take = (2 - self.buf.len()).min(input.len());
+                    self.buf.extend_from_slice(&input[..take]);
+                    input = &input[take..];
                     if self.buf.len() < 2 {
                         return Ok(false);
                     }
-                    if &self.buf[..2] != b"\r\n" {
+                    if self.buf != b"\r\n" {
                         return Err(NarouError::Http(
                             "chunk data not followed by CRLF".to_string(),
                         ));
                     }
-                    self.buf.drain(..2);
+                    self.buf.clear();
                     self.stage = Stage::ChunkSize;
                 }
                 Stage::Trailers => {
-                    // Trailer section: field lines then an empty line; an
-                    // empty section is just the bare CRLF after the zero chunk.
-                    let mut consumed = 0;
-                    let mut ended = false;
-                    while let Some(at) = find_crlf(&self.buf[consumed..]) {
-                        if at == 0 {
-                            consumed += 2;
-                            ended = true;
-                            break;
-                        }
-                        consumed += at + 2;
-                    }
-                    self.buf.drain(..consumed);
-                    if !ended {
+                    if !self.buffer_metadata(&mut input)? {
                         return Ok(false);
                     }
+                    self.buf.clear();
                     self.stage = Stage::Done;
                 }
-                Stage::Done => {
-                    self.buf.clear();
-                    return Ok(true);
-                }
+                Stage::Done => return Ok(true),
             }
         }
+    }
+
+    /// Buffer metadata only, stopping at its delimiter before any coalesced
+    /// body bytes. The bounded buffer also covers split delimiters and the
+    /// complete trailer section, rather than resetting the cap per line.
+    fn buffer_metadata(&mut self, input: &mut &[u8]) -> Result<bool> {
+        while let Some((&byte, rest)) = input.split_first() {
+            if self.buf.len() == MAX_HTTP1_HEAD {
+                return Err(NarouError::Http(
+                    "socket response metadata exceeds limit".to_string(),
+                ));
+            }
+            self.buf.push(byte);
+            *input = rest;
+            let complete = match self.stage {
+                Stage::Head => self.buf.ends_with(b"\r\n\r\n") || self.buf.ends_with(b"\n\n"),
+                Stage::ChunkSize => self.buf.ends_with(b"\r\n"),
+                Stage::Trailers => self.buf == b"\r\n" || self.buf.ends_with(b"\r\n\r\n"),
+                _ => unreachable!("only metadata stages buffer metadata"),
+            };
+            if complete {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn append_body(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > self.body_limit.saturating_sub(self.body.len()) {
+            return Err(NarouError::Http(
+                "socket response body exceeds limit".to_string(),
+            ));
+        }
+        self.body.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// Complete the response once `feed` reported `true`.
@@ -384,53 +383,32 @@ impl Http1ResponseDecoder {
         }
     }
 
-    fn framing_for(&self, _status: u16) -> BodyFraming {
-        let chunked = self
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
-            .map(|(_, value)| value.to_ascii_lowercase())
-            .is_some_and(|value| value.split(',').any(|part| part.trim() == "chunked"));
+    fn framing_for(&self) -> Result<BodyFraming> {
+        let chunked = self.headers.iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+            .any(|(_, value)| value.split(',').any(|part| part.trim().eq_ignore_ascii_case("chunked")));
         if chunked {
-            return BodyFraming::Chunked;
+            return Ok(BodyFraming::Chunked);
         }
-        if let Some(length) = self
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        let mut length = None;
+        for (_, value) in self.headers.iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
         {
-            return BodyFraming::Fixed(length);
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(NarouError::Http("invalid socket Content-Length".into()));
+            }
+            let parsed = value.parse::<usize>()
+                .map_err(|_| NarouError::Http("invalid socket Content-Length".into()))?;
+            if length.is_some_and(|previous| previous != parsed) {
+                return Err(NarouError::Http("conflicting socket Content-Length".into()));
+            }
+            length = Some(parsed);
         }
-        BodyFraming::UntilClose
+        Ok(length.map(BodyFraming::Fixed).unwrap_or(BodyFraming::UntilClose))
     }
 }
 
-struct HeadEnd {
-    at: usize,
-    skip: usize,
-}
-
-fn find_head_end(buf: &[u8]) -> Option<HeadEnd> {
-    if let Some(at) = find_subslice(buf, b"\r\n\r\n") {
-        return Some(HeadEnd { at, skip: 4 });
-    }
-    // Tolerate LF-only servers; parsed line-wise so lone \r is still trimmed.
-    find_subslice(buf, b"\n\n").map(|at| HeadEnd { at, skip: 2 })
-}
-
-fn find_crlf(buf: &[u8]) -> Option<usize> {
-    find_subslice(buf, b"\r\n")
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
 
 fn parse_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>)> {
     let text = String::from_utf8_lossy(head);
@@ -512,30 +490,37 @@ mod tests {
     fn request_has_origin_form_and_close() {
         let bytes = encode_request(
             &target("https://example.jp:8443/path/to?q=1&r=2"),
+            HttpMethod::Get,
             &[
                 ("User-Agent".to_string(), "narou/1".to_string()),
                 ("Cookie".to_string(), "a=b".to_string()),
             ],
+            None,
         );
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("GET /path/to?q=1&r=2 HTTP/1.1\r\n"));
         assert!(text.contains("Host: example.jp:8443\r\n"));
-        assert!(text.contains("User-Agent: narou/1\r\n"));
-        assert!(text.contains("Cookie: a=b\r\n"));
         assert!(text.ends_with("Connection: close\r\n\r\n"));
     }
 
     #[test]
     fn request_drops_framing_and_injected_headers() {
+        let long_name = format!("X-{}", "a".repeat(80));
         let bytes = encode_request(
             &target("https://example.jp/"),
+            HttpMethod::Post,
             &[
                 ("Host".to_string(), "evil.jp".to_string()),
                 ("Connection".to_string(), "keep-alive".to_string()),
                 ("Accept-Encoding".to_string(), "gzip".to_string()),
                 ("Content-Length".to_string(), "5".to_string()),
                 ("X-Bad".to_string(), "a\r\nInjected: 1".to_string()),
+                ("Bad Name".to_string(), "value".to_string()),
+                ("X-Nul".to_string(), "value\u{0}".to_string()),
+                (long_name.clone(), "value".to_string()),
+                ("X.Token".to_string(), "kept".to_string()),
             ],
+            Some(2),
         );
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text.matches("Host:").count(), 1);
@@ -543,8 +528,26 @@ mod tests {
         assert!(!text.contains("evil.jp"));
         assert!(!text.contains("gzip"));
         assert!(!text.contains("Injected"));
+        assert!(text.contains("Content-Length: 2\r\n"));
+        assert!(!text.contains("Content-Length: 5\r\n"));
         assert!(!text.contains("keep-alive"));
+        assert!(!text.contains("Bad Name"));
+        assert!(!text.contains(&long_name));
+        assert!(!text.contains("X-Nul"));
+        assert!(text.contains("X.Token: kept\r\n"));
         assert!(text.ends_with("Connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn repeated_response_headers_survive_interim_heads() {
+        let response = decode(
+            b"HTTP/1.1 100 Continue\r\nX-Interim: 1\r\n\r\nHTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.header_values("set-cookie"), vec!["a=1", "b=2"]);
+        assert!(response.header("x-interim").is_none());
+        assert_eq!(response.body, b"ok");
     }
 
     #[test]
@@ -571,15 +574,6 @@ mod tests {
         assert!(SocketTarget::parse("https://").is_err());
     }
 
-    #[test]
-    fn target_join_resolves_relative_location() {
-        let base = target("https://example.jp/a/b?x=1");
-        let next = base.join("../c?y=2").unwrap();
-        assert_eq!(next.target, "/c?y=2");
-        assert_eq!(next.host, "example.jp");
-        let absolute = base.join("https://other.jp/z").unwrap();
-        assert_eq!(absolute.host, "other.jp");
-    }
 
     #[test]
     fn content_length_response() {
@@ -672,6 +666,78 @@ mod tests {
         let mut decoder = Http1ResponseDecoder::new(1024);
         let huge = vec![b'x'; MAX_HTTP1_HEAD + 1];
         assert!(decoder.feed(&huge).is_err());
+    }
+
+    #[test]
+    fn a_head_at_the_metadata_limit_accepts_coalesced_content() {
+        let prefix = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Large: ";
+        let suffix = b"\r\n\r\n";
+        let mut wire = prefix.to_vec();
+        wire.extend(std::iter::repeat_n(
+            b'x', MAX_HTTP1_HEAD - prefix.len() - suffix.len(),
+        ));
+        wire.extend_from_slice(suffix);
+        wire.extend_from_slice(b"ok");
+        let mut decoder = Http1ResponseDecoder::new(2);
+        assert!(decoder.feed(&wire).unwrap());
+        assert_eq!(decoder.into_response().unwrap().body, b"ok");
+    }
+
+    #[test]
+    fn coalesced_head_and_large_body_are_consumed_without_a_metadata_failure() {
+        let body = vec![b'x'; MAX_HTTP1_HEAD + 1024];
+        let mut fixed = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        fixed.extend_from_slice(&body);
+        let mut decoder = Http1ResponseDecoder::new(body.len());
+        assert!(decoder.feed(&fixed).unwrap());
+        assert_eq!(decoder.into_response().unwrap().body, body);
+
+        let mut chunked = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", body.len(),
+        ).into_bytes();
+        chunked.extend_from_slice(&body);
+        chunked.extend_from_slice(b"\r\n0\r\nX-Trailer: fine\r\n\r\n");
+        // Unrelated bytes after the trailer delimiter do not count as metadata.
+        chunked.extend(std::iter::repeat_n(b'z', MAX_HTTP1_HEAD + 1));
+        let mut decoder = Http1ResponseDecoder::new(body.len());
+        assert!(decoder.feed(&chunked).unwrap());
+        assert_eq!(decoder.into_response().unwrap().body, body);
+    }
+
+    #[test]
+    fn completed_and_fragmented_oversized_metadata_is_rejected() {
+        let mut head = b"HTTP/1.1 200 OK\r\nX-Large: ".to_vec();
+        head.extend(std::iter::repeat_n(b'x', MAX_HTTP1_HEAD));
+        head.extend_from_slice(b"\r\n\r\nbody");
+        assert!(Http1ResponseDecoder::new(1024).feed(&head).is_err());
+
+        let mut decoder = Http1ResponseDecoder::new(1024);
+        decoder.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n").unwrap();
+        let line = b"X-Trailer: value\r\n";
+        for _ in 0..MAX_HTTP1_HEAD / line.len() {
+            assert!(!decoder.feed(line).unwrap());
+        }
+        assert!(decoder.feed(line).is_err());
+
+        let mut chunk_size = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;".to_vec();
+        chunk_size.extend(std::iter::repeat_n(b'x', MAX_HTTP1_HEAD));
+        chunk_size.extend_from_slice(b"\r\na\r\n0\r\n\r\n");
+        assert!(Http1ResponseDecoder::new(1024).feed(&chunk_size).is_err());
+    }
+
+    #[test]
+    fn malformed_content_length_never_falls_back_to_a_complete_close_body() {
+        for bytes in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: garbage\r\n\r\nshort".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nshort".as_slice(),
+        ] {
+            assert!(decode(bytes).is_err());
+        }
+        let mut decoder = Http1ResponseDecoder::new(MAX_HTTP1_HEAD * 2);
+        let mut wire = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", MAX_HTTP1_HEAD + 2).into_bytes();
+        wire.extend(std::iter::repeat_n(b'x', MAX_HTTP1_HEAD + 1));
+        assert!(!decoder.feed(&wire).unwrap());
+        assert!(decoder.finish().unwrap_err().to_string().contains("truncated"));
     }
 
     #[test]

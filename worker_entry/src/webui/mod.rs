@@ -65,6 +65,7 @@ pub(crate) fn application_error(
     use narou_rs::application::ApplicationError;
     match error {
         ApplicationError::InvalidRequest(message) => (400, "bad_request", message.clone()),
+        ApplicationError::Conflict(message) => (409, "conflict", message.clone()),
         ApplicationError::NotFound(message) => (404, "not_found", message.clone()),
         ApplicationError::Platform(message) => (500, "internal_error", message.clone()),
     }

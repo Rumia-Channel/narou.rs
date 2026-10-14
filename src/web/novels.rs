@@ -4,9 +4,12 @@ use axum::{
     response::{Json, Response},
 };
 
-use crate::application::{
-    ApplicationError, LibraryListRequest, LibrarySortColumn, LibrarySortOrder,
+use crate::application::web_payloads::{
+    DEFAULT_WEB_PAGE_LENGTH, MAX_WEB_PAGE_LENGTH, MAX_WEB_SEARCH_BYTES, combine_search_terms,
+    sort_column_from_index,
 };
+use crate::application::webui::sanitize_content_disposition;
+use crate::application::{ApplicationError, LibraryListRequest, LibrarySortOrder};
 use crate::db::with_database;
 use crate::error::NarouError;
 
@@ -16,21 +19,12 @@ use super::state::{ApiResponse, IdPath, ListParams, NovelListItem, NovelListResp
 fn map_application_error(error: ApplicationError) -> (StatusCode, String) {
     match error {
         ApplicationError::InvalidRequest(message) => (StatusCode::BAD_REQUEST, message),
+        ApplicationError::Conflict(message) => (StatusCode::CONFLICT, message),
         ApplicationError::NotFound(message) => (StatusCode::NOT_FOUND, message),
         ApplicationError::Platform(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
     }
 }
 
-fn combine_search_terms(filter: Option<String>, search: Option<String>) -> Option<String> {
-    match (filter, search) {
-        (Some(filter), Some(search)) if !filter.is_empty() && !search.is_empty() => {
-            Some(format!("{filter} {search}"))
-        }
-        (Some(filter), _) if !filter.is_empty() => Some(filter),
-        (_, Some(search)) if !search.is_empty() => Some(search),
-        _ => None,
-    }
-}
 pub async fn index() -> &'static str {
     "narou.rs API server"
 }
@@ -71,30 +65,19 @@ async fn api_list_inner(
         Some(
             params
                 .length
-                .unwrap_or(50)
-                .min(super::MAX_WEB_PAGE_LENGTH) as usize,
+                .unwrap_or(DEFAULT_WEB_PAGE_LENGTH)
+                .min(MAX_WEB_PAGE_LENGTH) as usize,
         )
     };
     let total_query_bytes =
         params.filter.as_ref().map_or(0, String::len)
             + params.search_value.as_ref().map_or(0, String::len);
-    if total_query_bytes > super::MAX_WEB_SEARCH_BYTES {
+    if total_query_bytes > MAX_WEB_SEARCH_BYTES {
         return Err((StatusCode::BAD_REQUEST, "search query is too long".to_string()));
     }
 
     let search = combine_search_terms(params.filter, params.search_value);
-    let sort_column = match params.order_column.unwrap_or(0) {
-        1 => LibrarySortColumn::LastUpdate,
-        2 => LibrarySortColumn::GeneralLastup,
-        3 => LibrarySortColumn::LastCheckDate,
-        4 => LibrarySortColumn::Title,
-        5 => LibrarySortColumn::Author,
-        6 => LibrarySortColumn::SiteName,
-        7 => LibrarySortColumn::NovelType,
-        9 => LibrarySortColumn::GeneralAllNo,
-        10 => LibrarySortColumn::Length,
-        _ => LibrarySortColumn::Id,
-    };
+    let sort_column = sort_column_from_index(params.order_column);
     let sort_order = if params.order_dir.as_deref() == Some("desc") {
         LibrarySortOrder::Descending
     } else {
@@ -226,8 +209,11 @@ pub async fn remove_novel(
         .files
         .iter()
         .all(|(_, status)| matches!(status, crate::application::FileDeletionStatus::Deleted));
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
+    for event in crate::application::webui::mutations::mutation_events(
+        crate::application::webui::mutations::MutationNotice::TableAndTags,
+    ) {
+        state.push_server.broadcast_raw(event);
+    }
     Ok(Json(ApiResponse {
         success: files_ok,
         message: if files_ok {
@@ -252,7 +238,11 @@ pub async fn freeze_novel(
         return Err((StatusCode::NOT_FOUND, format!("ID: {}", id)));
     }
     let persisted = result.store_failed.is_empty();
-    state.push_server.broadcast_event("table.reload", "");
+    for event in crate::application::webui::mutations::mutation_events(
+        crate::application::webui::mutations::MutationNotice::TableReload,
+    ) {
+        state.push_server.broadcast_raw(event);
+    }
     Ok(Json(ApiResponse {
         success: persisted,
         message: if persisted {
@@ -277,7 +267,11 @@ pub async fn unfreeze_novel(
         return Err((StatusCode::NOT_FOUND, format!("ID: {}", id)));
     }
     let persisted = result.store_failed.is_empty();
-    state.push_server.broadcast_event("table.reload", "");
+    for event in crate::application::webui::mutations::mutation_events(
+        crate::application::webui::mutations::MutationNotice::TableReload,
+    ) {
+        state.push_server.broadcast_raw(event);
+    }
     Ok(Json(ApiResponse {
         success: persisted,
         message: if persisted {
@@ -312,10 +306,8 @@ pub async fn author_comments(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
         })?;
 
-    let mut comments = Vec::new();
-    let mut introductions_count: usize = 0;
-    let mut postscripts_count: usize = 0;
-
+    let mut sections: Vec<Option<crate::downloader::types::SectionFile>> =
+        Vec::with_capacity(toc.subtitles.len());
     for sub in &toc.subtitles {
         let Some(bytes) = state
             .services
@@ -324,61 +316,19 @@ pub async fn author_comments(
             .await
             .map_err(map_application_error)?
         else {
+            sections.push(None);
             continue;
         };
-        let Ok(sf) = serde_yaml::from_slice::<crate::downloader::types::SectionFile>(&bytes)
-        else {
-            continue;
-        };
-        let data_type = if sf.element.data_type.is_empty() {
-            "text"
-        } else {
-            &sf.element.data_type
-        };
-        let (introduction, postscript) = if data_type == "html" {
-            (
-                crate::downloader::html::to_aozora_strip_decoration(&sf.element.introduction),
-                crate::downloader::html::to_aozora_strip_decoration(&sf.element.postscript),
-            )
-        } else {
-            (
-                sf.element.introduction.clone(),
-                sf.element.postscript.clone(),
-            )
-        };
-
-        if !introduction.is_empty() {
-            introductions_count += 1;
-        }
-        if !postscript.is_empty() {
-            postscripts_count += 1;
-        }
-
-        comments.push(serde_json::json!({
-            "subtitle": sub.subtitle,
-            "introduction": introduction,
-            "postscript": postscript,
-        }));
+        sections.push(serde_yaml::from_slice::<crate::downloader::types::SectionFile>(&bytes).ok());
     }
 
-    let total = toc.subtitles.len() as f64;
-    let introductions_ratio = if total > 0.0 {
-        (introductions_count as f64 / total * 100.0 * 100.0).round() / 100.0
-    } else {
-        0.0
-    };
-    let postscripts_ratio = if total > 0.0 {
-        (postscripts_count as f64 / total * 100.0 * 100.0).round() / 100.0
-    } else {
-        0.0
-    };
-
-    Ok(Json(serde_json::json!({
-        "title": record.title,
-        "introductions_ratio": introductions_ratio,
-        "postscripts_ratio": postscripts_ratio,
-        "comments": comments,
-    })))
+    Ok(Json(
+        crate::application::webui::author_comments::author_comments_payload(
+            &record.title,
+            &toc,
+            &sections,
+        ),
+    ))
 }
 
 pub async fn download_ebook(
@@ -430,7 +380,10 @@ pub async fn download_ebook(
     let file_path = match existing {
         Some(path) => path,
         None => {
-            let (bytes, filename) = generate_epub_on_demand(id, &record, &novel_dir).await?;
+            let context = crate::application::messages::MessageContext::new(
+                state.push_server.clone(), crate::compat::load_local_setting_bool("webui.debug-mode"),
+            );
+            let (bytes, filename) = context.scope(generate_epub_on_demand(id, &record, &novel_dir)).await?;
             return serve_epub_bytes(bytes, &filename);
         }
     };
@@ -488,22 +441,6 @@ pub async fn download_ebook(
     Ok(response)
 }
 
-/// Sanitizes a filename for use in Content-Disposition header.
-/// Replaces quotes and control characters, then wraps in `filename="..."`.
-fn sanitize_content_disposition(filename: &str) -> String {
-    let sanitized: String = filename
-        .chars()
-        .map(|c| {
-            if c == '"' || c.is_ascii_control() {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    format!("attachment; filename=\"{}\"", sanitized)
-}
-
 /// Build an EPUB from the converted 青空文庫 text at request time
 /// (`lite` feature). Reads the same output txt the CLI converter writes and
 /// resolves illustrations from the novel's `挿絵/` directory.
@@ -513,10 +450,6 @@ async fn generate_epub_on_demand(
     record: &crate::db::novel_record::NovelRecord,
     novel_dir: &std::path::Path,
 ) -> Result<(Vec<u8>, String), (StatusCode, String)> {
-    // `webui.debug-mode` なら挿絵の解決状況などを Web コンソールへ流す。
-    crate::application::debug::set_enabled(crate::compat::load_local_setting_bool(
-        "webui.debug-mode",
-    ));
     let inventory = crate::db::inventory::Inventory::with_default_root()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     // Restore inputs before loading native settings (including setting.ini and
@@ -524,10 +457,8 @@ async fn generate_epub_on_demand(
     let _files = crate::native::object_store::NativeStore::for_narou_root(inventory.root_dir())
         .and_then(|store| store.materialize_novel_files(novel_dir))
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let _materialized = crate::native::illustrations::Materialized::new(
-        crate::native::illustrations::materialize(novel_dir).await
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
-    );
+    let _materialized = crate::native::illustrations::materialize(novel_dir).await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     // 保存済み EPUB と同じ命名規則で Content-Disposition 名を決める
     // (変換時の txt basename に `.epub` を付けたもの)。
     // `convert.filename` / `convert.filename-to-ncode` は
@@ -570,14 +501,8 @@ async fn generate_epub_on_demand(
         && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
         && let Some(payload) = {
             let conn = state.conn_ref();
-            conn.lock()
-                .expect("sqlite mutex poisoned")
-                .query_row(
-                    "SELECT payload FROM novel_outputs WHERE novel_id = ? AND kind = 'converted_text'",
-                    rusqlite::params![id],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .ok()
+            crate::native::sqlite::content::load_output(&conn.lock(), id, "converted_text")
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         }
         && !payload.is_empty()
     {
@@ -637,7 +562,9 @@ async fn generate_epub_on_demand(
             let record = record.clone();
             let novel_dir = novel_dir.to_path_buf();
             let settings = settings.clone();
+            let message_context = crate::application::messages::MessageContext::current();
             tokio::task::spawn_blocking(move || {
+                let convert = || {
                 let toc: crate::downloader::TocFile =
                     serde_yaml::from_str(&std::fs::read_to_string(novel_dir.join("toc.yaml"))?)?;
                 let sections = crate::converter::load_sections_from_dir(&novel_dir, &toc.subtitles)?;
@@ -648,12 +575,18 @@ async fn generate_epub_on_demand(
                     Some(user) => crate::converter::NovelConverter::with_user_converter(settings, user),
                     None => crate::converter::NovelConverter::new(settings),
                 };
+                converter.attach_store_illustration_storage(&novel_dir);
                 converter.apply_record_fetch_policy(Some(&record));
                 let toc = crate::downloader::TocObject {
                     title: toc.title, author: toc.author, toc_url: toc.toc_url,
                     story: toc.story, subtitles: toc.subtitles, novel_type: toc.novel_type,
                 };
                 converter.convert_novel(&toc, &sections)
+                };
+                match message_context {
+                    Some(context) => context.run(convert),
+                    None => convert(),
+                }
             })
             .await
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
@@ -678,28 +611,43 @@ async fn generate_epub_on_demand(
         };
         return Err((StatusCode::CONFLICT, message.to_string()));
     }
+    // Conversion can fetch images that were absent from the pre-build snapshot.
+    let _new_images = crate::native::illustrations::materialize(novel_dir).await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
-    let options = crate::epub_lite::EpubBuildOptions {
-        title: record.title.clone(),
-        author: record.author.clone(),
-        vertical: !settings.enable_yokogaki,
-        cover_from_first_image: settings.enable_illust
-            && txt_path.parent().is_some_and(|dir| {
-                [".jpg", ".png", ".jpeg"]
-                    .iter()
-                    .any(|ext| dir.join(format!("cover{ext}")).is_file())
-            }),
-        // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
-        assets_dir: crate::compat::aozora_assets_dir(),
-        kindle: false,
-        extra_assets: crate::converter::dakuten_font::lite_font_assets(false)
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
-        rotate_image: crate::compat::load_local_setting_string("convert.rotate-image")
-            .and_then(|value| crate::converter::settings::ImageRotation::from_setting(&value)),
-    };
+    // 本文の濁点注記の有無で濁点フォント (DMincho) を埋め込む — native CLI
+    // (`file_contains_dakuten_chuki`) と Worker と同じ auto 判定。保存済み EPUB を
+    // 使わないこの経路は、濁点フォントが無いと本文の濁点注記を再現できない。
+    let use_dakuten_font = std::fs::read_to_string(&txt_path)
+        .is_ok_and(|text| crate::epub_lite::text_has_dakuten_marker(&text));
+    // 保存済み設定から組立オプションを組む (縦書き・表紙の規則は native Web /
+    // Worker 共通。表紙候補は cover.{jpg,png,jpeg} の実在で判定する)。
+    let options = crate::epub_lite::EpubBuildOptions::from_settings(
+        crate::epub_lite::EpubSettingsInput {
+            title: &record.title,
+            author: &record.author,
+            settings: &settings,
+            has_images: txt_path
+                .parent()
+                .and_then(crate::converter::render::cover_image_path)
+                .is_some(),
+            // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
+            extra_assets: crate::converter::dakuten_font::lite_font_assets(use_dakuten_font)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+            assets_dir: crate::compat::aozora_assets_dir(),
+            kindle: false,
+            rotate_image: crate::compat::load_local_setting_string("convert.rotate-image")
+                .and_then(|value| crate::converter::settings::ImageRotation::from_setting(&value)),
+        },
+    );
     let build_path = txt_path.clone();
+    let message_context = crate::application::messages::MessageContext::current();
     let build = tokio::task::spawn_blocking(move || {
-        crate::epub_lite::build_book(&build_path, &options)
+        let build = || crate::epub_lite::build_book(&build_path, &options);
+        match message_context {
+            Some(context) => context.run(build),
+            None => build(),
+        }
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?

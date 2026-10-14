@@ -11,6 +11,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::error::{NarouError, Result};
+use crate::illustration_store::is_sha256_hex_stem;
 
 use super::object_store::ObjectKey;
 use super::s3_sigv4::{canonical_path, canonical_query};
@@ -71,7 +72,7 @@ impl S3Location {
     /// hex 名でない挿絵は小説ごとの配置を保つ (衝突を避ける)。
     fn illustration_pool_name(filename: &str) -> Option<String> {
         let (stem, ext) = filename.rsplit_once('.')?;
-        if stem.len() != 64 || !stem.chars().all(|c| c.is_ascii_hexdigit()) {
+        if !is_sha256_hex_stem(stem) {
             return None;
         }
         Some(format!("{}.{}", sha256_hex_to_base64url(stem), ext))
@@ -265,7 +266,7 @@ pub struct S3ListPage {
 /// 必要な要素だけを拾う小さな走査で、外部の XML クレートを持ち込まない。
 /// キーは自分たちの論理キーなので、要素の入れ子より実体参照の復元を重視する。
 pub fn parse_list_objects_v2(xml: &str) -> Result<S3ListPage> {
-    let xml = list_bucket_result_body(xml).ok_or_else(|| {
+    let xml = xml_result_body(xml, "ListBucketResult").ok_or_else(|| {
         NarouError::Platform("ListObjectsV2 response has an invalid ListBucketResult envelope".to_string())
     })?;
     let mut objects = Vec::new();
@@ -319,10 +320,21 @@ pub fn parse_list_objects_v2(xml: &str) -> Result<S3ListPage> {
     })
 }
 
-/// HTTP 200 だけでは一覧の成功としない。外側の要素と閉じタグを確認し、
-/// 本文以外 (HTML / Error / 途中で切れた応答 / 後続の別文書) を拒否する。
-/// 要素の値や属性の意味は既存の小さなパーサーに任せる。
-fn list_bucket_result_body(xml: &str) -> Option<&str> {
+/// A CopyObject HTTP 200 may contain an Error instead of a completed copy.
+/// Require the complete success document and its required result metadata.
+pub(crate) fn copy_object_result_is_complete(xml: &str) -> bool {
+    let Some(body) = xml_result_body(xml, "CopyObjectResult") else {
+        return false;
+    };
+    find_tag(body, "Error").is_none()
+        && element_raw_text(body, "ETag").is_some_and(|value| !value.trim().trim_matches('"').is_empty())
+        && element_raw_text(body, "LastModified")
+            .is_some_and(|value| DateTime::parse_from_rfc3339(value.trim()).is_ok())
+}
+
+/// Validate the complete result document, not just its HTTP status or a tag
+/// found inside an Error, HTML, comment, truncated body or second document.
+fn xml_result_body<'a>(xml: &'a str, expected_root: &str) -> Option<&'a str> {
     let mut xml = xml.strip_prefix('\u{feff}').unwrap_or(xml).trim();
     if let Some(declaration) = xml.strip_prefix("<?xml") {
         if !declaration.starts_with(char::is_whitespace) {
@@ -337,7 +349,7 @@ fn list_bucket_result_body(xml: &str) -> Option<&str> {
         Some((prefix, local)) if !prefix.is_empty() => local,
         _ => root_name,
     };
-    if !xml.starts_with('<') || local_name != "ListBucketResult" {
+    if !xml.starts_with('<') || local_name != expected_root {
         return None;
     }
     if open.ends_with('/') {
@@ -401,6 +413,14 @@ fn find_tag(haystack: &str, tag: &str) -> Option<usize> {
     while let Some(offset) = haystack[search_from..].find('<') {
         let start = search_from + offset;
         let rest = &haystack[start + 1..];
+        if let Some(comment) = rest.strip_prefix("!--") {
+            search_from = start + 4 + comment.find("-->")? + 3;
+            continue;
+        }
+        if let Some(cdata) = rest.strip_prefix("![CDATA[") {
+            search_from = start + 9 + cdata.find("]]>")? + 3;
+            continue;
+        }
         let name_end = rest
             .find(|ch: char| ch == '>' || ch.is_whitespace() || ch == '/')
             .unwrap_or(rest.len());
@@ -458,11 +478,15 @@ fn find_element_close(haystack: &str, tag: &str) -> Option<usize> {
 
 /// `<tag>...</tag>` の中身を実体参照込みで返す。
 pub(crate) fn element_text(xml: &str, tag: &str) -> Option<String> {
+    element_raw_text(xml, tag).map(unescape_xml)
+}
+
+fn element_raw_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let start = find_tag(xml, tag)?;
     let after_open = xml[start..].find('>')? + start + 1;
     let rest = &xml[after_open..];
     let close = find_element_close(rest, tag)?;
-    Some(unescape_xml(&rest[..close]))
+    Some(&rest[..close])
 }
 
 fn unescape_xml(value: &str) -> String {

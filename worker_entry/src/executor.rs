@@ -123,10 +123,39 @@ pub async fn execute_job(
         return JobOutcome::Blocked { reason };
     }
 
-    // `webui.debug-mode` なら、このジョブの間は詳細ログ (挿絵の取り込み判断や
-    // EPUB 組立の内訳など) を Web コンソールへ流す。ジョブごとに 1 回だけ
-    // D1 の設定を読む (convert ジョブもこの経路を通る)。
-    narou_rs::application::debug::set_enabled(crate::consumer::webui_debug_mode(runtime).await);
+    let push_sink = PushHubSink::shared(push.clone(), None);
+    let context = messages::MessageContext::new(
+        push_sink.clone(), crate::consumer::webui_debug_mode(runtime).await,
+    );
+    let outcome = context.scope(async {
+
+    // The execution boundary also accepts raw series plans (persisted ledger
+    // rows and legacy envelopes). Fan out through the same expander as new
+    // requests; the child plans retain per-novel budgets and follow-up convert.
+    let series_result = match downloader.download_target_expander().expand_plan(job).await {
+        Ok(Some(plans)) => {
+            let count = plans.len();
+            Some(runtime.enqueue_batch(&plans).await.map(|_| count))
+        }
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
+    };
+    if let Some(result) = series_result {
+        use narou_rs::application::messages::MessageSink as _;
+        let sink = &push_sink;
+        let outcome = match result {
+            Ok(count) => {
+                sink.emit(messages::Stream::Stdout, &messages::download::series_expanded(job.target.as_str(), count));
+                crate::consumer::notify_queue_changed(push).await;
+                JobOutcome::Succeeded
+            }
+            Err(error) => {
+                sink.emit(messages::Stream::Stdout, &messages::indented_error(&error));
+                classify_result(Err(error), job, job_id, runtime, sink.as_ref()).await
+            }
+        };
+        return outcome;
+    }
 
     let force = job
         .options
@@ -185,19 +214,14 @@ pub async fn execute_job(
         }
     }
 
-    // 進捗バーを PushHub 経由で UI へ (native の WebProgress 相当)。
-    // topic は job kind、scope は job id — consumer が終端で同じ scope の
-    // progressbar.clear を送って消す。
+    // 進捗とコンソールは同じ送信キューに積み、順序を保つ。
+    // operation は実行トークンごとに異なり、再試行の遅延更新と混ざらない。
     downloader.set_progress(Box::new(HubProgress::new(
-        push.clone(),
+        push_sink.clone(),
         job.kind.as_str(),
         job_id.as_str(),
+        execution_token,
     )));
-    // native のコンソール行 = PushHub の echo イベント。Downloader 内の
-    // report_line/report_warn と、sink を引き回せない既定 sink 経路の
-    // 両方へ同じバッファを指す sink をインストールする
-    // (`PushHubSink::install` が既定 sink 登録まで担う — convert ジョブも同じ)。
-    let push_sink = PushHubSink::install(push.clone());
     downloader.set_message_sink(push_sink.clone());
     let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, &runtime.subrequests)
         .with_checkpoints(
@@ -321,10 +345,7 @@ pub async fn execute_job(
     if let Err(error) = runtime.persist_pending_section_hash_cache().await {
         console_log!("job {job_id}: section hash cache write-back failed: {error}");
     }
-    // バッファに積まれた行の送信は全ての emit (上の結果行と
-    // `classify_result` 内の変換案内/失敗行) が終わったジョブの区切りで
-    // まとめて行う。先に drain すると変換系の行が取り残される。
-    let outcome = match result {
+    match result {
         Err(NarouError::DownloadBudgetExpired {
             next_section_index,
         }) => {
@@ -340,12 +361,12 @@ pub async fn execute_job(
             }
         }
         result => classify_result(result, job, job_id, runtime, push_sink.as_ref()).await,
-    };
-    // バッファに積まれた行をジョブの区切りでまとめて送信する。
+    }
+    }).await;
+    // Drain every exit, including expansion, frozen and pacing-error paths.
+    downloader.clear_progress();
+    downloader.clear_message_sink();
     push_sink.drain().await;
-    // ジョブの sink を isolate から外す (残すと以後の emit_default が
-    // 死んだバッファに書き込む)。
-    narou_rs::application::messages::take_default_sink();
     outcome
 }
 
@@ -503,54 +524,34 @@ async fn enqueue_followup_convert(
     if !matches!(job.kind, JobKind::Download | JobKind::Update) {
         return Ok(());
     }
-    // `--no-convert` / `-n` は native と同じく変換を完全に止める。
-    if has_option(&job.options, &["--no-convert", "-n"]) {
-        return Ok(());
-    }
-    let convert = match result.status {
-        UpdateStatus::Ok => {
-            // `--convert-only-new-arrival` / `-a` オプションと
-            // `update.convert-only-new-arrival` 設定は Update の `Ok` にだけ
-            // 効く (native `commands::update` の needs_convert 分岐と同じ)。
-            // Download は native 同様、取得成功なら無条件で変換する。
-            let only_new = job.kind == JobKind::Update
-                && (has_option(&job.options, &["--convert-only-new-arrival", "-a"])
-                    || convert_only_new_arrival_setting(runtime).await);
-            !only_new || result.new_arrivals
+    let no_convert = has_option(&job.options, &["--no-convert", "-n"]);
+    let only_new = !no_convert && result.status == UpdateStatus::Ok
+        && job.kind == JobKind::Update
+        && (has_option(&job.options, &["--convert-only-new-arrival", "-a"])
+            || convert_only_new_arrival_setting(runtime).await);
+    let (convert_failure, missing_cached_text) = if !no_convert && result.status == UpdateStatus::None {
+        match runtime.novels.get(NovelId(result.id)).await {
+            Ok(Some(record)) => (
+                record.convert_failure,
+                !record.convert_failure && missing_converted_text(runtime, &record).await,
+            ),
+            _ => (false, false),
         }
-        // `None` (差分なし) の native 更新パリティは `convert_failure`
-        // フラグが立つときだけ再変換する。加えて「変換テキストが無い」
-        // (ダウンロード直後/前回変換の取りこぼし) も変換する — EPUB
-        // 配信がこのオブジェクトを読むので、無いまま進めない。
-        UpdateStatus::None => {
-            // native `commands::update` の needs_convert: `convert_failure`
-            // フラグが立っていれば再変換し、そのとき
-            // `reconvert_after_failure` の行を出す。
-            let convert = needs_convert_after_unchanged(runtime, NovelId(result.id)).await;
-            if convert {
-                let reconvert = runtime
-                    .novels
-                    .get(NovelId(result.id))
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|record| record.convert_failure)
-                    .unwrap_or(false);
-                if reconvert {
-                    // native は web mode で `colored(..., "yellow")` が
-                    // goldenrod の span になる。同じ出力を共有形で出す
-                    // (`termcolor` は native-runtime 限定なのでここでは
-                    // console 形を使う)。
-                    sink.emit(
-                        messages::Stream::Stdout,
-                        &messages::jobs::console_reconvert_note(),
-                    );
-                }
-            }
-            convert
-        }
-        UpdateStatus::Canceled | UpdateStatus::Failed => false,
+    } else {
+        (false, false)
     };
+    let convert = narou_rs::application::convert::needs_convert_after_download(
+        result.status,
+        no_convert,
+        narou_rs::application::convert::NoConvertScope::Everything,
+        result.new_arrivals,
+        only_new,
+        convert_failure,
+        missing_cached_text,
+    );
+    if convert && convert_failure {
+        sink.emit(messages::Stream::Stdout, &messages::jobs::console_reconvert_note());
+    }
     if !convert {
         return Ok(());
     }
@@ -592,23 +593,16 @@ async fn convert_only_new_arrival_setting(runtime: &WorkerRuntime) -> bool {
         .await
         .ok()
         .flatten()
-        .and_then(|value| value.as_bool())
+        .and_then(|value| narou_rs::setting_core::setting_bool_value(&value))
         .unwrap_or(false)
 }
 
-/// 差分なし (`UpdateStatus::None`) での再変換判定。native はレコードの
-/// `convert_failure` フラグを見る。それに加えて「変換テキストのオブジェクトが
-/// 無い」場合も変換する — 失敗の取りこぼしや手動削除を自己修復し、
-/// `download.epub` の 409 を起こさないため。
-async fn needs_convert_after_unchanged(runtime: &WorkerRuntime, id: NovelId) -> bool {
-    let Ok(Some(record)) = runtime.novels.get(id).await else {
-        // レコードを読めないならキュー自身も読めない可能性が高い。
-        // 保守側に倒さず、後続実行で判定し直す。
-        return false;
-    };
-    if record.convert_failure {
-        return true;
-    }
+/// Only the Worker adapter checks its persisted text cache; the conversion
+/// decision and failure-flag precedence live in the common predicate.
+async fn missing_converted_text(
+    runtime: &WorkerRuntime,
+    record: &narou_rs::db::NovelRecord,
+) -> bool {
     let Ok(keys) = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
     else {
         return false;

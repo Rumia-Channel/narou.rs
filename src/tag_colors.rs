@@ -1,12 +1,10 @@
-use std::collections::HashSet;
-
 use crate::compat;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::error::Result;
 
 pub use crate::application::tag_colors::{
-    ensure_tag_colors_with_default_color, is_valid_new_tag_color_value, is_valid_tag_color,
-    tag_color_names, MemoryTagColorStore, TagColorService, TagColorStore, TagColors,
+    apply_tag_color_update, is_valid_new_tag_color_value, is_valid_tag_color, tag_color_names,
+    MemoryTagColorStore, TagColorService, TagColorStore, TagColorUpdate, TagColors,
     NEW_TAG_COLOR_SETTING, TAG_COLOR_DEFAULT,
 };
 
@@ -16,66 +14,21 @@ pub fn load_tag_colors(inventory: &Inventory) -> Result<TagColors> {
         return Ok(TagColors::default());
     }
 
-    let value: serde_yaml::Value = serde_yaml::from_str(&raw)?;
-    let Some(mapping) = value.as_mapping() else {
-        return Ok(TagColors::default());
-    };
-
-    let mut tag_colors = TagColors::default();
-    for (tag, color) in mapping {
-        let (Some(tag), Some(color)) = (tag.as_str(), color.as_str()) else {
-            continue;
-        };
-        tag_colors.order.push(tag.to_string());
-        tag_colors.colors.insert(tag.to_string(), color.to_string());
-    }
-    Ok(tag_colors)
+    Ok(TagColors::from_yaml_payload(&raw)?)
 }
 
-pub fn save_tag_colors(inventory: &Inventory, tag_colors: &TagColors) -> Result<()> {
-    let mut mapping = serde_yaml::Mapping::new();
-    let mut written = HashSet::new();
-
-    for tag in &tag_colors.order {
-        let Some(color) = tag_colors.colors.get(tag) else {
-            continue;
-        };
-        mapping.insert(
-            serde_yaml::Value::String(tag.clone()),
-            serde_yaml::Value::String(color.clone()),
-        );
-        written.insert(tag.clone());
-    }
-
-    for (tag, color) in &tag_colors.colors {
-        if written.contains(tag) {
-            continue;
-        }
-        mapping.insert(
-            serde_yaml::Value::String(tag.clone()),
-            serde_yaml::Value::String(color.clone()),
-        );
-    }
-
-    inventory.save(
+/// Applies an owned delta while the inventory holds its file lock or SQLite
+/// transaction. Resolve configured colors before calling this function.
+pub fn update_tag_colors(inventory: &Inventory, update: TagColorUpdate) -> Result<TagColors> {
+    inventory.update_yaml::<TagColors, serde_yaml::Value, _>(
         "tag_colors",
         InventoryScope::Local,
-        &serde_yaml::Value::Mapping(mapping),
-    )?;
-    Ok(())
-}
-
-/// Assigns colors to any `tags` not already present in `tag_colors`, using the
-/// user-configured default color (falling back to rotation through the
-/// standard color order when unset or invalid).
-///
-/// # Warning: do not call while holding the `DATABASE` lock
-pub fn ensure_tag_colors<'a>(
-    tag_colors: &mut TagColors,
-    tags: impl IntoIterator<Item = &'a str>,
-) -> bool {
-    let configured_color = configured_new_tag_color();
-    ensure_tag_colors_with_default_color(tag_colors, tags, configured_color.as_deref())
+        move |value| {
+            let mut colors = TagColors::from_yaml_value(&value);
+            apply_tag_color_update(&mut colors, &update);
+            Ok((colors.to_yaml_value(), colors))
+        },
+    )
 }
 
 pub fn configured_new_tag_color() -> Option<String> {
@@ -96,93 +49,17 @@ fn normalize_default_color(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::native::sqlite::state::{self, StorageMode};
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("narou-rs-{}-{}", name, unique))
-    }
-
-    #[test]
-    fn ensure_tag_colors_rotates_in_insertion_order() {
-        let mut tag_colors = TagColors::default();
-        assert!(ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["fav"],
-            None
-        ));
-        assert!(ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["later"],
-            None
-        ));
-        assert!(ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["todo"],
-            None
-        ));
-        assert_eq!(
-            tag_colors.colors.get("fav").map(String::as_str),
-            Some("green")
-        );
-        assert_eq!(
-            tag_colors.colors.get("later").map(String::as_str),
-            Some("yellow")
-        );
-        assert_eq!(
-            tag_colors.colors.get("todo").map(String::as_str),
-            Some("blue")
-        );
-    }
-
-    #[test]
-    fn ensure_tag_colors_uses_configured_default_color() {
-        let mut tag_colors = TagColors::default();
-        assert!(ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["auto", "manual"],
-            Some("white")
-        ));
-        assert_eq!(
-            tag_colors.colors.get("auto").map(String::as_str),
-            Some("white")
-        );
-        assert_eq!(
-            tag_colors.colors.get("manual").map(String::as_str),
-            Some("white")
-        );
-    }
-
-    #[test]
-    fn ensure_tag_colors_falls_back_to_rotation_for_invalid_default_color() {
-        let mut tag_colors = TagColors::default();
-        assert!(ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["fav", "later"],
-            Some("default")
-        ));
-        assert_eq!(
-            tag_colors.colors.get("fav").map(String::as_str),
-            Some("green")
-        );
-        assert_eq!(
-            tag_colors.colors.get("later").map(String::as_str),
-            Some("yellow")
-        );
-    }
-
-    #[test]
-    fn new_tag_color_validation_accepts_default_and_colors() {
-        assert!(is_valid_new_tag_color_value(TAG_COLOR_DEFAULT));
-        for color in tag_color_names() {
-            assert!(is_valid_new_tag_color_value(color));
+    fn library(mode: StorageMode, compat: bool) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let narou_dir = temp.path().join(".narou");
+        fs::create_dir_all(&narou_dir).unwrap();
+        state::write_mode(&narou_dir, mode).unwrap();
+        if compat {
+            fs::write(narou_dir.join("local_setting.yaml"), "narou-compat: true\n").unwrap();
         }
-        assert!(!is_valid_new_tag_color_value(""));
-        assert!(!is_valid_new_tag_color_value("purple"));
+        temp
     }
 
     #[test]
@@ -196,28 +73,10 @@ mod tests {
     }
 
     #[test]
-    fn remove_drops_color_and_order() {
-        let mut tag_colors = TagColors::default();
-        tag_colors.set("fav", "green");
-        tag_colors.remove("fav");
-        assert!(!tag_colors.colors.contains_key("fav"));
-        assert!(!tag_colors.order.iter().any(|tag| tag == "fav"));
-    }
-
-    #[test]
-    fn ensure_tag_colors_with_default_color_inside_with_database_does_not_deadlock() {
-    let _legacy = crate::test_support::legacy_yaml_guard();
-        // Regression test for a576208 / "Add configurable new tag color":
-        // `configured_new_tag_color` reads settings through
-        // `crate::db::with_database`, which uses a non-reentrant
-        // `parking_lot::Mutex`. Calling `ensure_tag_colors` (which internally
-        // calls `configured_new_tag_color`) from inside a `with_database` /
-        // `with_database_mut` closure deadlocks the current thread forever.
-        // Web handlers and `commands::manage` now fetch the configured color
-        // *before* entering the closure and pass it to
-        // `ensure_tag_colors_with_default_color` instead. This test mirrors
-        // that pattern and would hang (rather than fail cleanly) if that
-        // invariant were ever broken again.
+    fn tag_color_update_inside_with_database_does_not_read_settings() {
+        let _legacy = crate::test_support::legacy_yaml_guard();
+        // Configured defaults are read before the database lock. The atomic
+        // persistence callback only decodes, applies the delta, and encodes.
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         fs::create_dir_all(temp.path().join(".narou")).unwrap();
@@ -232,9 +91,15 @@ mod tests {
 
         let new_tag_color = configured_new_tag_color();
         let result = crate::db::with_database(|_db| {
-            let mut tag_colors = TagColors::default();
-            ensure_tag_colors_with_default_color(&mut tag_colors, ["fresh"], new_tag_color.as_deref());
-            Ok(tag_colors.color_for("fresh").map(|color| color.to_string()))
+            let inventory = Inventory::new(temp.path().to_path_buf());
+            let colors = update_tag_colors(
+                &inventory,
+                TagColorUpdate::Ensure {
+                    tags: vec!["fresh".to_string()],
+                    default_color: new_tag_color,
+                },
+            )?;
+            Ok(colors.color_for("fresh").map(str::to_string))
         })
         .unwrap();
 
@@ -244,45 +109,141 @@ mod tests {
     }
 
     #[test]
-    fn load_tag_colors_preserves_unknown_colors() {
-        let root = temp_dir("tag-colors");
-        fs::create_dir_all(root.join(".narou")).unwrap();
-        fs::write(
-            root.join(".narou").join("tag_colors.yaml"),
-            "fav: purple\nlater: green\n",
-        )
-        .unwrap();
+    fn inventory_deltas_use_current_order_not_a_stale_loaded_table() {
+        let _global = crate::test_support::global_state_guard();
+        for (mode, compat) in [
+            (StorageMode::Yaml, false),
+            (StorageMode::Sqlite, false),
+            (StorageMode::Sqlite, true),
+        ] {
+            let temp = library(mode, compat);
+            let reader = Inventory::new(temp.path().to_path_buf());
+            let writer = Inventory::new(temp.path().to_path_buf());
+            update_tag_colors(&writer, TagColorUpdate::Set {
+                tag: "X".to_string(), color: Some("green".to_string()),
+            }).unwrap();
+            let stale = load_tag_colors(&reader).unwrap();
+            assert_eq!(stale.color_for("X"), Some("green"));
+            update_tag_colors(&writer, TagColorUpdate::Set {
+                tag: "X".to_string(), color: Some("red".to_string()),
+            }).unwrap();
+            let colors = update_tag_colors(&reader, TagColorUpdate::Ensure {
+                tags: vec!["X".to_string(), "Y".to_string()], default_color: None,
+            }).unwrap();
+            assert_eq!(colors.color_for("X"), Some("red"));
+            assert_eq!(colors.color_for("Y"), Some("white"));
+            let colors = update_tag_colors(&reader, TagColorUpdate::Ensure {
+                tags: vec!["X".to_string()], default_color: Some("blue".to_string()),
+            }).unwrap();
+            assert_eq!(colors.color_for("X"), Some("red"), "ensure must not overwrite");
 
-        let inventory = Inventory::new(root.clone());
-        let tag_colors = load_tag_colors(&inventory).unwrap();
+            update_tag_colors(&writer, TagColorUpdate::Set {
+                tag: "X".to_string(), color: None,
+            }).unwrap();
+            let colors = update_tag_colors(&reader, TagColorUpdate::Ensure {
+                tags: vec!["Z".to_string()], default_color: None,
+            }).unwrap();
+            assert_eq!(colors.color_for("X"), None, "a stale reader must not resurrect removals");
+            assert_eq!(colors.color_for("Z"), Some("green"));
+            update_tag_colors(&writer, TagColorUpdate::Set {
+                tag: "Z".to_string(), color: None,
+            }).unwrap();
+            let colors = update_tag_colors(&reader, TagColorUpdate::Ensure {
+                tags: vec!["W".to_string()], default_color: None,
+            }).unwrap();
+            assert_eq!(colors.color_for("W"), Some("green"), "rotation uses the remaining last tag");
 
-        assert_eq!(
-            tag_colors.colors.get("fav").map(String::as_str),
-            Some("purple")
-        );
-        assert_eq!(
-            tag_colors.colors.get("later").map(String::as_str),
-            Some("green")
-        );
-
-        fs::remove_dir_all(root).unwrap();
+            let narou_dir = temp.path().join(".narou");
+            let payload = if mode == StorageMode::Sqlite {
+                let conn = rusqlite::Connection::open(narou_dir.join("db.sqlite")).unwrap();
+                conn.query_row(
+                    "SELECT value_yaml FROM app_state WHERE scope = 'inv' AND key = 'tag_colors'",
+                    [], |row| row.get::<_, String>(0),
+                ).unwrap()
+            } else {
+                fs::read_to_string(narou_dir.join("tag_colors.yaml")).unwrap()
+            };
+            if compat {
+                assert_eq!(fs::read_to_string(narou_dir.join("tag_colors.yaml")).unwrap(), payload);
+            } else if mode == StorageMode::Sqlite {
+                assert!(!narou_dir.join("tag_colors.yaml").exists());
+            }
+            let persisted = TagColors::from_yaml_payload(&payload).unwrap();
+            assert_eq!(persisted.order, vec!["Y".to_string(), "W".to_string()]);
+            assert_eq!(persisted.color_for("X"), None);
+            assert_eq!(persisted.color_for("W"), Some("green"));
+        }
     }
 
     #[test]
-    fn save_tag_colors_keeps_unknown_colors() {
-        let root = temp_dir("tag-colors-save");
-        fs::create_dir_all(root.join(".narou")).unwrap();
+    fn native_service_autoassignment_preserves_concurrent_set_and_remove() {
+        let _global = crate::test_support::global_state_guard();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2).enable_all().build().unwrap();
+        for mode in [StorageMode::Yaml, StorageMode::Sqlite] {
+            for manual_color in [Some("red"), None] {
+                let temp = library(mode, false);
+                let store = std::sync::Arc::new(crate::native::application::NativeTagColorStore::new(
+                    std::sync::Arc::new(Inventory::new(temp.path().to_path_buf())),
+                ));
+                let manual = TagColorService::new(store.clone());
+                runtime.block_on(manual.set("X", Some("green"))).unwrap();
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let automatic = TagColorService::new(store.clone());
+                let handle = runtime.handle().clone();
+                let pending = std::thread::spawn(move || {
+                    let tags = std::iter::once_with(move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        "Y".to_string()
+                    });
+                    handle.block_on(automatic.for_tags(tags, None)).unwrap()
+                });
+                entered_rx.recv().unwrap();
+                runtime.block_on(manual.set("X", manual_color)).unwrap();
+                release_tx.send(()).unwrap();
+                let result = pending.join().unwrap();
+                let expected_y = if manual_color.is_some() { "white" } else { "green" };
+                assert_eq!(result.get("X").map(String::as_str), manual_color);
+                assert_eq!(result.get("Y").map(String::as_str), Some(expected_y));
+                let persisted = load_tag_colors(&Inventory::new(temp.path().to_path_buf())).unwrap();
+                assert_eq!(persisted.color_for("X"), manual_color);
+                assert_eq!(persisted.color_for("Y"), Some(expected_y));
+            }
+        }
+    }
 
-        let inventory = Inventory::new(root.clone());
-        let mut tag_colors = TagColors::default();
-        tag_colors.set("fav", "purple");
-        tag_colors.set("later", "green");
-        save_tag_colors(&inventory, &tag_colors).unwrap();
-
-        let raw = fs::read_to_string(root.join(".narou").join("tag_colors.yaml")).unwrap();
-        assert!(raw.contains("fav: purple"));
-        assert!(raw.contains("later: green"));
-
-        fs::remove_dir_all(root).unwrap();
+    #[test]
+    fn concurrent_native_manual_sets_merge_across_inventory_handles() {
+        let _global = crate::test_support::global_state_guard();
+        for (mode, compat) in [
+            (StorageMode::Yaml, false),
+            (StorageMode::Sqlite, false),
+            (StorageMode::Sqlite, true),
+        ] {
+            let temp = library(mode, compat);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(13));
+            let writers = (0..12).map(|index| {
+                let inventory = Inventory::new(temp.path().to_path_buf());
+                assert!(load_tag_colors(&inventory).unwrap().into_map().is_empty());
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    update_tag_colors(&inventory, TagColorUpdate::Set {
+                        tag: format!("tag-{index}"), color: Some("blue".to_string()),
+                    }).unwrap();
+                })
+            }).collect::<Vec<_>>();
+            barrier.wait();
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            let persisted = load_tag_colors(&Inventory::new(temp.path().to_path_buf())).unwrap();
+            assert_eq!(persisted.colors.len(), 12);
+            for index in 0..12 {
+                assert_eq!(persisted.color_for(&format!("tag-{index}")), Some("blue"));
+            }
+        }
     }
 }

@@ -1,4 +1,7 @@
 use axum::{extract::State, http::StatusCode, response::Json};
+
+use crate::application::webui::mutations::{MutationNotice, mutation_events};
+
 use super::AppState;
 use super::sort_state::sort_ids_from_records;
 use super::state::{ApiResponse, BatchIdsBody, TagBody};
@@ -42,6 +45,9 @@ fn map_application_error(error: crate::application::ApplicationError) -> (Status
         crate::application::ApplicationError::InvalidRequest(message) => {
             (StatusCode::BAD_REQUEST, message)
         }
+        crate::application::ApplicationError::Conflict(message) => {
+            (StatusCode::CONFLICT, message)
+        }
         crate::application::ApplicationError::NotFound(message) => {
             (StatusCode::NOT_FOUND, message)
         }
@@ -84,8 +90,9 @@ pub async fn batch_tag(
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let result = apply_tag_change(&state, &ids, crate::application::TagAction::Add, vec![tag]).await?;
     ensure_no_missing(&result.missing)?;
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
+    for event in mutation_events(MutationNotice::TableAndTags) {
+        state.push_server.broadcast_raw(event);
+    }
 
     Ok(Json(ApiResponse {
         success: true,
@@ -109,8 +116,9 @@ pub async fn batch_untag(
     let result =
         apply_tag_change(&state, &ids, crate::application::TagAction::Remove, vec![tag]).await?;
     ensure_no_missing(&result.missing)?;
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
+    for event in mutation_events(MutationNotice::TableAndTags) {
+        state.push_server.broadcast_raw(event);
+    }
 
     Ok(Json(ApiResponse {
         success: true,
@@ -128,7 +136,10 @@ pub async fn batch_freeze(
     let ids = sort_ids_for_request(&state, &body.ids, body.sort_state.as_ref(), body.timestamp).await;
     let result = apply_freeze(&state, &ids, true).await?;
     ensure_no_missing(&result.missing)?;
-    state.push_server.broadcast_event("table.reload", "");
+    // 凍結状態だけが変わる操作は一覧の再読込だけで足りる (native の選択を維持)。
+    for event in mutation_events(MutationNotice::TableReload) {
+        state.push_server.broadcast_raw(event);
+    }
 
     Ok(Json(ApiResponse {
         success: result.store_failed.is_empty(),
@@ -146,7 +157,10 @@ pub async fn batch_unfreeze(
     let ids = sort_ids_for_request(&state, &body.ids, body.sort_state.as_ref(), body.timestamp).await;
     let result = apply_freeze(&state, &ids, false).await?;
     ensure_no_missing(&result.missing)?;
-    state.push_server.broadcast_event("table.reload", "");
+    // 凍結状態だけが変わる操作は一覧の再読込だけで足りる (native の選択を維持)。
+    for event in mutation_events(MutationNotice::TableReload) {
+        state.push_server.broadcast_raw(event);
+    }
 
     Ok(Json(ApiResponse {
         success: result.store_failed.is_empty(),
@@ -177,8 +191,9 @@ pub async fn batch_remove(
         .files
         .iter()
         .all(|(_, status)| matches!(status, crate::application::FileDeletionStatus::Deleted));
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
+    for event in mutation_events(MutationNotice::TableAndTags) {
+        state.push_server.broadcast_raw(event);
+    }
 
     Ok(Json(ApiResponse {
         success: files_ok,
@@ -214,7 +229,10 @@ pub async fn batch_freeze_toggle(
         .await
         .map_err(map_application_error)?;
     ensure_no_missing(&result.missing)?;
-    state.push_server.broadcast_event("table.reload", "");
+    // 凍結状態だけが変わる操作は一覧の再読込だけで足りる (native の選択を維持)。
+    for event in mutation_events(MutationNotice::TableReload) {
+        state.push_server.broadcast_raw(event);
+    }
 
     Ok(Json(serde_json::json!({
         "success": result.store_failed.is_empty(),

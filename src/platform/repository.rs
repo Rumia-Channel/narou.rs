@@ -125,6 +125,7 @@ pub enum NovelSortKey {
     Status,
     TocUrl,
     NewArrivalsDate,
+    AverageLength,
 }
 
 impl NovelSortKey {
@@ -143,6 +144,7 @@ impl NovelSortKey {
         NovelSortKey::Status,
         NovelSortKey::TocUrl,
         NovelSortKey::NewArrivalsDate,
+        NovelSortKey::AverageLength,
     ];
 
     /// Map to the `db::SORT_KEYS` string so the canonical comparator
@@ -164,6 +166,7 @@ impl NovelSortKey {
             NovelSortKey::Status => "status",
             NovelSortKey::TocUrl => "toc_url",
             NovelSortKey::NewArrivalsDate => "new_arrivals_date",
+            NovelSortKey::AverageLength => "average_length",
         }
     }
 
@@ -321,18 +324,74 @@ pub trait NovelRepository: PlatformService {
     ) -> PlatformFuture<'a, crate::error::Result<()>>;
 }
 
+/// Synchronous counterpart of [`NovelRepository`] for native CLI resolution
+/// paths.
+///
+/// Native CLI commands run without an executor and resolve targets through
+/// `NativeNovelRepository`'s `*_sync` methods (which lock the shared YAML
+/// state directly). `application::target_lookup` drives both this port and
+/// the async repository with the same ordered lookup plan.
+pub trait NovelLookup: Send + Sync {
+    /// See [`NovelRepository::get`].
+    fn get(&self, id: NovelId) -> crate::error::Result<Option<NovelRecord>>;
+
+    /// See [`NovelRepository::find_by_toc_url`].
+    fn find_by_toc_url(&self, url: &str) -> crate::error::Result<Option<NovelRecord>>;
+
+    /// See [`NovelRepository::find_by_ncode`] (includes the legacy `toc_url`
+    /// suffix fallback).
+    fn find_by_ncode(&self, ncode: &str) -> crate::error::Result<Option<NovelRecord>>;
+
+    /// See [`NovelRepository::find_by_title`].
+    fn find_by_title(&self, title: &str) -> crate::error::Result<Option<NovelRecord>>;
+
+    /// See [`NovelRepository::scan_ids`].
+    fn scan_ids(
+        &self,
+        filter: &NovelFilter,
+        after_id: Option<NovelId>,
+        limit: usize,
+    ) -> crate::error::Result<Vec<NovelId>>;
+}
+
 // ---------------------------------------------------------------------------
 // Pure matching / sorting helpers shared by native and memory backends.
 // ---------------------------------------------------------------------------
 
-/// True when a record is frozen: either in the freeze inventory (native hint)
-/// or tagged `frozen`. Mirrors `compat::record_is_frozen`.
+/// Which freeze sources a read observes.
+///
+/// Upstream `Narou.novel_frozen?` reads the freeze inventory (native
+/// `freeze.yaml`) only; the Web UI additionally honors the legacy `frozen`
+/// tag. Both modes live here so the difference is an explicit parameter
+/// instead of per-caller drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezeReadMode {
+    /// The freeze store only (`narou list`'s frozen filter, upstream
+    /// `compat::record_is_frozen`).
+    InventoryOnly,
+    /// Freeze store or the legacy `frozen` tag (Web UI, search, `is_frozen`).
+    InventoryOrTag,
+}
+
+/// True when `record` counts as frozen under `mode`.
+pub fn record_is_frozen(
+    record: &NovelRecord,
+    frozen_ids: Option<&HashSet<i64>>,
+    mode: FreezeReadMode,
+) -> bool {
+    let in_store = frozen_ids.is_some_and(|ids| ids.contains(&record.id));
+    match mode {
+        FreezeReadMode::InventoryOnly => in_store,
+        FreezeReadMode::InventoryOrTag => in_store || record.tags.iter().any(|tag| tag == "frozen"),
+    }
+}
+
+/// Section search semantics: freeze store or legacy `frozen` tag.
 pub(crate) fn record_is_frozen_for_search(
     record: &NovelRecord,
     frozen_ids: Option<&HashSet<i64>>,
 ) -> bool {
-    frozen_ids.is_some_and(|ids| ids.contains(&record.id))
-        || record.tags.iter().any(|tag| tag == "frozen")
+    record_is_frozen(record, frozen_ids, FreezeReadMode::InventoryOrTag)
 }
 
 /// Status text used by `Status`/`Any` search terms. Matches the Web UI's

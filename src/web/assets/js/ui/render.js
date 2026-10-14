@@ -4,6 +4,8 @@
  */
 import { State, El, lsSet, persistListState } from '../core/state.js';
 import { fetchJson, postJson } from '../core/http.js';
+import { postSortedJson } from '../core/sort_state.js';
+import { canUseAction, applyActionCapabilities } from '../core/capabilities.js';
 import { showContextMenu, showTagColorMenu } from './context_menu.js';
 
 const TAG_COLOR_MAP = {
@@ -20,6 +22,25 @@ const ANNOTATION_COLOR_TIME_LIMIT_MS = 6 * 60 * 60 * 1000;
 
 let selectionDrag = null;
 let queueDragTaskId = null;
+let storyGeneration = 0;
+let storyOwner = null;
+let storyPopover = null;
+
+function closeStoryPopover() {
+  ++storyGeneration;
+  storyPopover?.remove();
+  storyPopover = null;
+  storyOwner = null;
+}
+
+document.addEventListener('click', event => {
+  if (storyOwner && !storyOwner.contains(event.target) && !storyPopover?.contains(event.target)) {
+    closeStoryPopover();
+  }
+}, true);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeStoryPopover();
+});
 
 function materialIcon(name, extraClass = '') {
   const cls = extraClass
@@ -33,6 +54,7 @@ function materialIcon(name, extraClass = '') {
 export function renderNovelList() {
   const tbody = El.novelListBody;
   if (!tbody) return;
+  closeStoryPopover();
 
   const sorted = getFilteredSortedNovels();
   const pageLength = normalizePageLength(State.pageLength);
@@ -246,7 +268,7 @@ function matchFilterToken(novel, token) {
   ].join(' ');
   // The same identities the server-side search accepts: a pasted page URL, the
   // N-code or numeric id in it, and the record id itself.
-  const pageUrl = target(novel.toc_url).replace(/\/+$/, '');
+  const pageUrl = target(novel.display_url || novel.toc_url).replace(/\/+$/, '');
   const urlSegment = pageUrl.split('/').pop() || '';
   const matchIdentity = (value) => {
     if (!value) return false;
@@ -510,7 +532,7 @@ function createRow(novel, rowIndex) {
 
   // Menu button (opens context menu) — glyphicon-option-horizontal equivalent
   const downloadLink = `<a href="/novels/${encodeURIComponent(String(novel.id))}/download" class="row-action-btn btn-download" title="書籍データをダウンロード">${materialIcon('download', 'icon-only')}</a>`;
-  const folderBtn = `<button class="row-action-btn btn-folder" data-folder-id="${novel.id}" type="button" title="保存先を開く">${materialIcon('folder_open', 'icon-only')}</button>`;
+  const folderBtn = `<button class="row-action-btn btn-folder" data-capability="open_folder" data-folder-id="${novel.id}" type="button" title="保存先を開く">${materialIcon('folder_open', 'icon-only')}</button>`;
   const updateBtn = `<button class="row-action-btn btn-update-action" data-update-id="${novel.id}" type="button" title="凍結済みでも更新">${materialIcon('refresh', 'icon-only')}</button>`;
   const menuBtn = `<button class="row-action-btn btn-menu-icon" data-menu-id="${novel.id}" type="button" title="個別メニュー">${materialIcon('more_horiz', 'icon-only')}</button>`;
 
@@ -565,7 +587,7 @@ function createRow(novel, rowIndex) {
     update.addEventListener('click', async (e) => {
       e.stopPropagation();
       try {
-        const result = await postJson('/api/update', { targets: [String(novel.id)], force: true });
+        const result = await postSortedJson('/api/update', { targets: [String(novel.id)], force: true });
         if (result?.success === false) {
           showNotification(result.message || '更新ジョブを追加できませんでした', 'warning');
         }
@@ -580,30 +602,34 @@ function createRow(novel, rowIndex) {
   if (storyBtn) {
     storyBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      const existing = document.querySelector('.story-popover');
-      if (existing) existing.remove();
-
+      if (storyOwner === storyBtn) {
+        closeStoryPopover();
+        return;
+      }
+      closeStoryPopover();
+      const generation = ++storyGeneration;
+      storyOwner = storyBtn;
+      const pop = document.createElement('div');
+      pop.className = 'story-popover';
+      pop.textContent = '読み込み中...';
+      storyPopover = pop;
+      document.body.appendChild(pop);
+      const rect = storyBtn.getBoundingClientRect();
+      pop.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+      pop.style.left = Math.max(0, rect.left + window.scrollX - 200) + 'px';
       const nid = storyBtn.dataset.storyId;
       try {
         const data = await fetchJson(`/api/story?id=${nid}`);
-        if (!data) return;
-        const pop = document.createElement('div');
-        pop.className = 'story-popover';
+        if (generation !== storyGeneration || storyOwner !== storyBtn || !storyBtn.isConnected) return;
+        if (!data) {
+          closeStoryPopover();
+          return;
+        }
         pop.innerHTML = `<div class="story-popover-title">${esc(data.title || '')}</div>
           <div class="story-popover-body">${renderMultilineHtml(data.story, '(あらすじなし)')}</div>`;
-        document.body.appendChild(pop);
-        const rect = storyBtn.getBoundingClientRect();
-        pop.style.top = (rect.bottom + window.scrollY + 4) + 'px';
-        pop.style.left = Math.max(0, rect.left + window.scrollX - 200) + 'px';
-
-        const dismiss = (ev) => {
-          if (!pop.contains(ev.target) && ev.target !== storyBtn) {
-            pop.remove();
-            document.removeEventListener('click', dismiss);
-          }
-        };
-        setTimeout(() => document.addEventListener('click', dismiss), 0);
-      } catch { /* ignore */ }
+      } catch {
+        if (generation === storyGeneration) closeStoryPopover();
+      }
     });
   }
 
@@ -764,9 +790,9 @@ export function getSelectedIdsInDisplayOrder() {
 }
 
 export function pruneSelectedIdsToCurrentList() {
-  const visibleIds = new Set(getFilteredNovels().map(novel => String(novel.id)));
+  const currentIds = new Set(State.novels.map(novel => String(novel.id)));
   for (const id of [...State.selectedIds]) {
-    if (!visibleIds.has(id)) {
+    if (!currentIds.has(id)) {
       State.selectedIds.delete(id);
     }
   }
@@ -813,6 +839,7 @@ export function updateEnableSelected() {
       el.classList.toggle('disabled', !hasSelection);
     }
   });
+  applyActionCapabilities();
 }
 
 /* ===== Tags ===== */
@@ -967,15 +994,16 @@ function renderTaskItem(task, isRunning, idx, total) {
   if (isRunning) {
     actionBtns = `<button class="queue-task-cancel" data-task-id="${esc(task.id)}" title="中止">${materialIcon('stop', 'icon-only')}</button>`;
   } else {
-    const upBtn = idx > 0
+    const reorder = canUseAction('queue_reorder');
+    const upBtn = reorder && idx > 0
       ? `<button class="queue-task-up" data-task-idx="${idx}" title="上へ">${materialIcon('keyboard_arrow_up', 'icon-only')}</button>`
       : `<button class="queue-task-up" disabled title="上へ">${materialIcon('keyboard_arrow_up', 'icon-only')}</button>`;
-    const downBtn = idx < total - 1
+    const downBtn = reorder && idx < total - 1
       ? `<button class="queue-task-down" data-task-idx="${idx}" title="下へ">${materialIcon('keyboard_arrow_down', 'icon-only')}</button>`
       : `<button class="queue-task-down" disabled title="下へ">${materialIcon('keyboard_arrow_down', 'icon-only')}</button>`;
-    actionBtns = `${upBtn}${downBtn}<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">${materialIcon('delete', 'icon-only')}</button>`;
+    actionBtns = `${reorder ? upBtn + downBtn : ''}<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">${materialIcon('delete', 'icon-only')}</button>`;
   }
-  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}"${isRunning ? '' : ' draggable="true"'}>
+  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}"${!isRunning && canUseAction('queue_reorder') ? ' draggable="true"' : ''}>
     <span class="queue-task-icon">${icon}</span>
     <span class="queue-task-label">${esc(label)}</span>
     <span class="queue-task-target">${esc(task.display_target || task.target || '')}</span>
@@ -1019,10 +1047,12 @@ export function renderQueueDetailed() {
       El.queueModalPendingList.innerHTML = qd.pending.map((t, i) => renderTaskItem(t, false, i, qd.pending.length)).join('');
       El.queueModalPendingList.querySelectorAll('.queue-task-delete').forEach(btn => {
         btn.addEventListener('click', async () => {
-          const taskId = btn.dataset.taskId;
-          await postJson('/api/remove_pending_task', { task_id: taskId });
-          const { refreshQueueDetailed } = await import('./actions.js');
-          await refreshQueueDetailed();
+          const { refreshQueue, refreshQueueDetailed, runGuardedAction } = await import('./actions.js');
+          await runGuardedAction(btn, async () => {
+            const result = await postJson('/api/remove_pending_task', { task_id: btn.dataset.taskId });
+            assertQueueActionSuccess(result, '待機中の処理を削除できませんでした');
+            await Promise.all([refreshQueue(), refreshQueueDetailed()]);
+          }, '待機中の処理を削除できませんでした');
         });
       });
       // Up/down reorder buttons
@@ -1039,9 +1069,11 @@ export function renderQueueDetailed() {
           });
         });
       };
-      wireReorder('.queue-task-up', -1);
-      wireReorder('.queue-task-down', 1);
-      wireQueueDragDrop();
+      if (canUseAction('queue_reorder')) {
+        wireReorder('.queue-task-up', -1);
+        wireReorder('.queue-task-down', 1);
+        wireQueueDragDrop();
+      }
     } else {
       El.queueModalPendingList.textContent = 'なし';
     }
@@ -1180,6 +1212,7 @@ export function syncViewChecks() {
   const containerMain = document.querySelector('.container-main');
   if (containerMain) containerMain.classList.toggle('wide-mode', State.wideMode);
 
+  El.controlPanel?.classList.toggle('hide', !State.buttonsTop);
   // Footer navbar
   if (El.footerNavbar) {
     El.footerNavbar.classList.toggle('hide', !State.buttonsFooter);

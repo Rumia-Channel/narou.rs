@@ -13,14 +13,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::db::inventory::Inventory;
 use crate::error::Result;
+use crate::login::LOGIN_KEY_ENV_VAR;
 use crate::login::crypto::{KEY_LEN, parse_key_base64, random_key};
 
 /// File holding the library login key, inside `.narou`.
 pub const KEY_FILE_NAME: &str = "login.key";
-/// Environment variable overriding the key file (base64; 32 bytes are used as-is,
-/// longer/shorter values from [`crate::login::crypto::MIN_KEY_LEN`] up are SHA-256
-/// expanded, so `openssl rand -base64 24` works).
-pub const KEY_ENV_VAR: &str = "NAROU_RS_LOGIN_KEY";
 
 /// Where a [`LoginKey`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +34,7 @@ impl KeySource {
     /// Operator-facing description.
     pub fn describe(self) -> &'static str {
         match self {
-            KeySource::Environment => "NAROU_RS_LOGIN_KEY",
+            KeySource::Environment => LOGIN_KEY_ENV_VAR,
             KeySource::File => ".narou/login.key",
             KeySource::CreatedFile => ".narou/login.key (created)",
         }
@@ -61,7 +58,7 @@ impl LoginKey {
     /// Read the key from the environment or `path`, creating the file when
     /// neither exists.
     pub fn load_or_create(path: &Path) -> Result<Self> {
-        if let Some(value) = std::env::var_os(KEY_ENV_VAR) {
+        if let Some(value) = std::env::var_os(LOGIN_KEY_ENV_VAR) {
             let value = value.to_string_lossy().into_owned();
             return Ok(Self {
                 bytes: parse_key_base64(&value)?,

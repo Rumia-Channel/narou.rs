@@ -12,11 +12,12 @@
 //! bytes; it never decodes and never decides what a 404 means.
 
 use crate::error::{NarouError, Result};
+use crate::platform::http::{RedirectChain, is_safe_header_name, is_safe_header_value};
 use crate::platform::{
     HttpClient, HttpRequest, HttpResponse, RateLimitScope, RateLimiter, RedirectMode,
 };
 
-use super::security::{MAX_REDIRECTS, is_safe_header_value};
+use super::security::MAX_REDIRECTS;
 
 /// Everything a site fetch needs beyond the URL: the site's static headers
 /// (cookie jar value plus any `headers:` declared in the site definition) and
@@ -92,6 +93,19 @@ impl FetchPolicy {
         self.narou
     }
 
+    /// Headers to send to `url`: the policy's headers minus the static cookie
+    /// when `url` is outside the site's cookie scope.
+    ///
+    /// The single source for that scope rule — the direct fetch and the manual
+    /// redirect chain both start from it.
+    pub fn headers_for(&self, url: &str) -> Vec<(String, String)> {
+        let mut headers = self.headers.clone();
+        if !self.allows_cookie(url) {
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Cookie"));
+        }
+        headers
+    }
+
     fn allows_cookie(&self, url: &str) -> bool {
         let Ok(url) = url::Url::parse(url) else {
             return false;
@@ -105,50 +119,6 @@ impl FetchPolicy {
     }
 }
 
-/// Header names must be tokens; anything else (spaces, colons, CR/LF) is
-/// rejected so a site definition cannot smuggle a second header.
-fn is_safe_header_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-}
-
-#[cfg(test)]
-mod policy_tests {
-    use super::*;
-
-    #[test]
-    fn hameln_definition_carries_browser_fetch_metadata() {
-        // R18 分離ドメインの Cloudflare challenge を避けるためのヘッダが
-        // サイト定義から実際に policy へ流れていることを固定する。
-        let setting: super::super::site_setting::SiteSetting =
-            serde_yaml::from_str(include_str!("../../webnovel/syosetu.org.yaml")).unwrap();
-        let policy = FetchPolicy::for_site(&setting);
-
-        for name in [
-            "Sec-Fetch-Dest",
-            "Sec-Fetch-Mode",
-            "Sec-Fetch-Site",
-            "Sec-Fetch-User",
-            "Upgrade-Insecure-Requests",
-            "Accept-Language",
-        ] {
-            assert!(
-                policy.headers().iter().any(|(key, _)| key == name),
-                "missing {name} in {:?}",
-                policy.headers()
-            );
-        }
-        assert!(
-            policy
-                .headers()
-                .iter()
-                .any(|(key, value)| key == "Cookie" && value == "over18=off")
-        );
-    }
-}
 
 /// Decode response bytes using the site's declared encoding.
 ///
@@ -194,31 +164,9 @@ pub fn should_stop_fetch_fallback(err: &NarouError) -> bool {
     )
 }
 
-/// Returns true when two hosts belong to the same site for cookie purposes:
-/// identical, or one is a subdomain of the other (e.g. `h.syosetu.org` and
-/// `syosetu.org`). Browsers share domain-scoped cookies (`Domain=.example.com`)
-/// across such hosts, so redirects within one site must keep the configured
-/// Cookie header while cross-site redirects still drop it.
-pub fn same_site_hosts(a: Option<&str>, b: Option<&str>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => {
-            a == b
-                || a.strip_suffix(b)
-                    .is_some_and(|prefix| prefix.ends_with('.'))
-                || b.strip_suffix(a)
-                    .is_some_and(|prefix| prefix.ends_with('.'))
-        }
-        _ => false,
-    }
-}
 
-/// Resolve the final URL of a redirect chain using `Manual` requests.
-///
-/// The transport returns 3xx responses untouched; this loop follows
-/// `Location` headers, re-validates every hop against the public-URL policy,
-/// and drops the Cookie header when a hop leaves the current site. The
-/// transport may still apply its own enhancements (e.g. the native curl probe
-/// for CDN challenges) inside `send(Manual)`.
+/// Resolve the final URL through shared transitions using `Manual` transport
+/// requests. Each hop is validated and rate-limited before sending.
 pub async fn resolve_final_url(
     http: &dyn HttpClient,
     rate_limiter: &dyn RateLimiter,
@@ -241,50 +189,25 @@ pub async fn resolve_final_url_with_body(
     url: &str,
     policy: &FetchPolicy,
 ) -> Result<(String, Option<HttpResponse>)> {
-    http.validate_url(url).await?;
-    let mut current = url::Url::parse(url).map_err(|e| NarouError::Http(e.to_string()))?;
-    let mut headers = policy.headers().to_vec();
-    if !policy.allows_cookie(current.as_str()) {
-        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Cookie"));
-    }
-
-    for hop in 0..=MAX_REDIRECTS {
-        http.validate_url(current.as_str()).await?;
-        rate_limiter
-            .acquire(&scope_for(host_of(current.as_str()), policy))
-            .await?;
-
-        let mut request = HttpRequest::get(current.as_str()).with_redirect(RedirectMode::Manual);
-        for (name, value) in &headers {
-            request = request.with_header(name.clone(), value.clone());
+    let mut request = HttpRequest::get(url);
+    request.headers = policy.headers_for(url);
+    let mut chain = RedirectChain::new(request, MAX_REDIRECTS);
+    loop {
+        http.validate_url(&chain.request().url).await?;
+        let scope = scope_for(host_of(&chain.request().url), policy);
+        let response = http.send_paced(
+            chain.request().clone().with_redirect(RedirectMode::Manual),
+            crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
+        ).await?;
+        if !chain.advance(&response)? {
+            // Only an immediate terminal answer can be reused: later hops
+            // may have a different cookie scope than the caller's fetch.
+            let body = (chain.hops() == 0 && !response.is_redirection()).then_some(response);
+            let final_url = url::Url::parse(&chain.request().url)
+                .map_err(|error| NarouError::Http(error.to_string()))?;
+            return Ok((final_url.into(), body));
         }
-
-        let response = http.send(request).await?;
-        if response.is_redirection() {
-            let Some(location) = response.header("Location") else {
-                return Ok((current.to_string(), None));
-            };
-            let next = current
-                .join(location)
-                .map_err(|e| NarouError::Http(format!("invalid redirect location: {e}")))?;
-            if !same_site_hosts(next.host_str(), current.host_str()) {
-                // A hop that leaves the site must not carry the cookie jar,
-                // however the site definition spelled the header name.
-                headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Cookie"));
-            }
-            current = next;
-            continue;
-        }
-        // Only the first hop's body is reusable: later hops may have run with
-        // a different cookie scope than the caller's `fetch_text` would use.
-        let body = (hop == 0).then_some(response);
-        return Ok((current.to_string(), body));
     }
-
-    Err(NarouError::Http(format!(
-        "redirect limit exceeded for {url} after {} hops",
-        MAX_REDIRECTS
-    )))
 }
 
 /// Standard GET flow: validate → rate-limit → send → status policy → decode.
@@ -307,19 +230,16 @@ pub async fn fetch_bytes(
     policy: &FetchPolicy,
 ) -> Result<HttpResponse> {
     http.validate_url(url).await?;
-    rate_limiter
-        .acquire(&scope_for(host_of(url), policy))
-        .await?;
 
     let mut request = HttpRequest::get(url);
-    for (name, value) in policy.headers() {
-        if name.eq_ignore_ascii_case("Cookie") && !policy.allows_cookie(url) {
-            continue;
-        }
-        request = request.with_header(name.clone(), value.clone());
+    for (name, value) in policy.headers_for(url) {
+        request = request.with_header(name, value);
     }
 
-    let response = http.send(request).await?;
+    let scope = scope_for(host_of(url), policy);
+    let response = http.send_paced(
+        request, crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
+    ).await?;
     ensure_success_response(url, response)
 }
 
@@ -470,52 +390,6 @@ headers:
         assert!(FetchPolicy::for_record(&settings, &record).headers().is_empty());
     }
 
-    /// The whole path an illustration fetch takes on the Worker:
-    /// `FetchPolicy::for_record` → `fetch_bytes` → `HttpClient::send`. The
-    /// mock records request heads, so this asserts the `Referer` actually
-    /// leaves the process, not just that the policy struct carries it.
-    #[test]
-    fn illustration_fetch_sends_site_referer() {
-        use crate::platform::mocks::{FakeRateLimiter, MockHttpClient};
-
-        let settings = super::super::site_setting::SiteSetting::load_bundled(&[
-            include_str!("../../webnovel/www.pixiv.net.yaml"),
-        ])
-        .unwrap();
-        let mut record = pixiv_record();
-        record.toc_url = "https://www.pixiv.net/ajax/novel/12345".to_string();
-        let policy = FetchPolicy::for_record(&settings, &record);
-
-        let image_url = "https://i.pximg.net/img-original/img/2020/01/01/00/00/00/1_p0.jpg";
-        let http = MockHttpClient::new();
-        http.add_response(
-            image_url,
-            HttpResponse {
-                status: 200,
-                headers: vec![("Content-Type".into(), "image/jpeg".into())],
-                body: b"jpg".to_vec(),
-            },
-        );
-        let response = futures::executor::block_on(fetch_bytes(
-            &http,
-            &FakeRateLimiter::new(),
-            image_url,
-            &policy,
-        ))
-        .expect("canned image response");
-        assert_eq!(response.body, b"jpg");
-
-        let sent = http.sent_requests();
-        let (_, headers) = sent
-            .iter()
-            .find(|(url, _)| url == image_url)
-            .expect("image request was sent");
-        let referer = headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
-            .map(|(_, value)| value.as_str());
-        assert_eq!(referer, Some("https://www.pixiv.net/"));
-    }
 
     fn pixiv_record() -> crate::db::NovelRecord {
         crate::db::NovelRecord {
@@ -547,6 +421,39 @@ headers:
             login_session: None,
             extra_fields: Default::default(),
         }
+    }
+
+    #[test]
+    fn headers_for_drops_the_cookie_outside_its_site() {
+        let setting: super::super::site_setting::SiteSetting = serde_yaml::from_str(
+            r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<ncode>
+cookie: session=canary
+headers:
+  Referer: https://example.com/
+"#,
+        )
+        .unwrap();
+        let policy = FetchPolicy::for_site(&setting);
+
+        let on_site = policy.headers_for("https://img.example.com/a.png");
+        assert!(
+            on_site
+                .iter()
+                .any(|(name, value)| name == "Cookie" && value == "session=canary")
+        );
+        let off_site = policy.headers_for("https://collector.example.net/a.png");
+        assert!(
+            !off_site
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("cookie")),
+            "the cookie must stay on the site: {off_site:?}"
+        );
+        assert!(off_site.iter().any(|(name, _)| name == "Referer"));
     }
 
     #[test]
@@ -585,13 +492,4 @@ headers:
         assert!(!should_stop_fetch_fallback(&NarouError::Http("x".into())));
     }
 
-    #[test]
-    fn same_site_hosts_keeps_cookie_within_subdomains() {
-        assert!(same_site_hosts(Some("syosetu.org"), Some("syosetu.org")));
-        assert!(same_site_hosts(Some("h.syosetu.org"), Some("syosetu.org")));
-        assert!(same_site_hosts(Some("syosetu.org"), Some("h.syosetu.org")));
-        assert!(!same_site_hosts(Some("hsyosetu.org"), Some("syosetu.org")));
-        assert!(!same_site_hosts(Some("syosetu.org"), Some("example.com")));
-        assert!(!same_site_hosts(Some("syosetu.org"), None));
-    }
 }

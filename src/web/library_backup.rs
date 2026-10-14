@@ -158,16 +158,12 @@ fn spawn_backup_process(state: &AppState, root: PathBuf, output: PathBuf) {
         backup_state.running.store(false, Ordering::Release);
         match result {
             Ok(path) => {
-                push_server.broadcast_raw(
-                    &crate::application::push_events::library_backup_done(
-                        &path.display().to_string(),
-                    ),
-                );
+                push_server.broadcast_raw(crate::application::push_events::library_backup_done(
+                    &path.display().to_string(),
+                ));
             }
             Err(message) => {
-                push_server.broadcast_raw(
-                    &crate::application::push_events::library_backup_failed(&message),
-                );
+                push_server.broadcast_raw(crate::application::push_events::library_backup_failed(&message));
             }
         }
     });

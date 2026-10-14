@@ -4,11 +4,11 @@
 narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウェア）の互換実装をRustで作るプロジェクト。CLI・Web UI・変換出力など、外部から観測できる挙動の narou.rb 互換を目指す。
 
 ## 実装状況
-`COMMANDS.md` が narou.rb 全24コマンドと Rust 拡張 (`db`/`illust`/`login`) 計27コマンドのオプション・挙動・実装状況を管理するマスタードキュメントである。最新の実装状況はそこを参照すること。
+`COMMANDS.md` が narou.rb 全24コマンドと Rust 拡張 (`db`/`illust`/`login`/`author`) 計28コマンドのオプション・挙動・実装状況を管理するマスタードキュメントである。最新の実装状況はそこを参照すること。
 
 | 完了度 | コマンド数 | 内訳 |
 |:------:|:---------:|------|
-| ✅ 完了 | 23 | init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, help, version, log, folder, browser, alias, inspect, csv, trace, db, login |
+| ✅ 完了 | 24 | init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, author, help, version, log, folder, browser, alias, inspect, csv, trace, db, login |
 | 🟡 部分 | 4 | download, update, convert, web |
 | ❌ 未実装 | 0 | — (全コマンド実装済み) |
 
@@ -64,7 +64,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - これらの整形変更は、機能変更に付随して不可避な場合（例: 引数追加で行長が変わる）のみ許容する。
 
 ## グローバル設定の保存先 (2026-09 修正)
-- `~/.narousetting/global_setting.yaml` は**ライブラリ状態ではない**ため、storage-backend が `sqlite` のときもファイルのまま維持する。`SQLITE_MANAGED_NAMES` から `global_setting` を外してあり、SQLite への取込・退避 (`*.imported-*`) は行わない。
+- `~/.narousetting/global_setting.yaml` は**ライブラリ状態ではない**ため、storage-backend が `sqlite` のときもファイルのまま維持する。管理状態の一覧 (`src/db/state_inventory.rs`、旧 `SQLITE_MANAGED_NAMES` / `MANAGED_LOCAL` / `STATE_FILES`) では `global_setting` が `FileOnly` で、SQLite への取込・退避 (`*.imported-*`) は行わない。
 - 理由: narou.rb はこのファイルしか読まないため、退避すると narou.rb 側で `aozoraepub3dir` 等が消える。また SQLite 側の実体は「そのライブラリの `.narou/db.sqlite`」なので、別ライブラリ (YAML モード) からは設定が見えなくなる。
 - 旧ビルドが `app_state(scope='global', key='global_setting')` に残した行は、ファイルが無いときに初回読み出しでファイルへ書き戻し、その行を削除する (一度きりの復旧)。`tests/global_settings_storage.rs` がモード往復と復旧を固定している。
 - ローカル側 (`local_setting` / `freeze` / `alias` / `tag_colors` / `latest_convert` / `login_cookie`) は SQLite モード時も管理対象のまま (YAML モードでは従来どおりファイル)。`narou-compat` の挙動も変更なし。
@@ -365,7 +365,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **EPUB は保存しない**: AozoraEpub3_Lite で、Web UI の DL 要求時に保存済みデータからストリーミング生成する。**Workers では raw HTML などのキャッシュを一切保存しない**（native は従来どおりで `.narou/` 互換に影響なし）。
 - **挿絵の取得はダウンロード時 (2026-10-08 修正)**: 挿絵の実体はダウンロード時に取得して S3 へ書く (Worker の変換は native と違い挿絵をローカライズしない)。取得対象はサイト定義の `illust_grep_pattern`、無ければ **narou.rb `HTML#initialize` の既定 `<img>` パターン** (`src/downloader/mod.rs` の `DEFAULT_ILLUST_GREP_PATTERN`)。なろう / R18なろう / カクヨム / Arcadia はこの経路で挿絵を持つ。既定パターンでは narou.rb `Illustration#scanner` と同じく URL でない注記 (相対パス) は取得せず、挿絵 URL は protocol-relative (`//host/...`) を含めて本文のスキームで解決し、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない。
 - **索引と実体の突き合わせ (自己修復, 2026-10-08 修正)**: `.illustration_cache.yaml` はメタデータなので実体の存在を保証しない (ストアの切替・手動削除・別環境での取得で「索引にあるのに実体が無い」状態になる)。索引が空でないときだけ `<prefix>/挿絵` を 1 回 (最大 1000 件 × 10 ページ) 一覧し、索引が知っているファイル名が無ければ **取り直す** (`PersistenceService::list_illustration_names` → `Downloader::download_illustration`)。一覧に失敗したときは従来どおり索引だけで判断する。debug-mode では `挿絵: 保存済み N 件 / 索引 M 件 (<prefix>)` と `挿絵: 索引にはありますが実体が無いので取り直します: 挿絵/<file> (<url>)` を出すので、S3 と D1 のどちらに実体があるかを切り分けられる。一覧が空を返したときは索引のファイルを `stat` で 1 枚ずつ確認する (`verify_indexed_illustrations`、上限 64 件) ので、LIST が prefix の解釈差で空を返す環境でも取り直しの誤判定をしない。
-- **挿絵のキーは 1 箇所で作る (2026-10-08 修正)**: 挿絵の論理キーは `platform::illustration_key(prefix, filename)` に集約し、**保存側 (`IllustrationStorageService`) と読み出し側 (`NovelObjectKeys::illustration` / `download.epub`) が同じ関数を通る**。片側だけ sanitize するとキーがずれて「保存したのに見つからない」になるため。`download.epub` はストアの一覧に載っていない参照も `keys.illustration()` + `stat` で直接確認してから EPUB を組む (一覧が効かない環境でも実体があれば入る)。1 枚も解決できないときだけ `WARN: EPUB: 挿絵を 1 枚も解決できませんでした (prefix=…)` と「一次ストア (D1) に N 件残っている / どこにも無い」を出す (`report_missing_illustrations`)。
+- **挿絵のキーは 1 箇所で作る (2026-10-08 修正)**: 挿絵の論理キーは `platform::illustration_key(prefix, filename)` に集約し、**保存側 (`IllustrationStorageService`) と読み出し側 (`NovelObjectKeys::illustration` / `download.epub`) が同じ関数を通る**。片側だけ sanitize するとキーがずれて「保存したのに見つからない」になるため。`download.epub` はストアの一覧に載っていない参照も `keys.illustration()` + `stat` で直接確認してから EPUB を組む (一覧が効かない環境でも実体があれば入る)。**挿絵が有効で、本文に参照があり、1 枚も解決できない場合だけ** `WARN: EPUB: 挿絵を 1 枚も解決できませんでした (prefix=…)` と「一次ストア (D1) に N 件残っている / どこにも無い」を出す (`report_missing_illustrations`)。参照なし・挿絵無効は欠落ではない。
 - フェーズ: P0a 足回り (完了) → P0b 署名・S3 アダプタ (完了) → P0c 挿絵を S3 へ (SplitStore + `asset_backend`) → P0d 本文の構造化と移行 (セクション行 + YAML blob からの移行) → P0e 契約テスト + CI デプロイ → P1 取得系 (SSRF port 化・settings 注入・CookieStore・YAML provider) → P2 変換を Worker へ (変換済み本文を列に保存) → P3 Web UI 移植 → P4 運用。
 - 移行期間は `asset_backend`（挿絵）と `content_backend`（本文の blob → 行）を切り替え可能にし、フラグ 1 つで旧経路へ戻せる状態を保つ (D1 側の `objects`/`object_chunks` は移行後も消さない)。
 
@@ -373,9 +373,9 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **実行系**: `worker_entry/src/executor.rs` が queue から受けたジョブを実行し、`consumer.rs` が ack/retry を、`ledger.rs` が試行回数と実行トークンを担う。再試行の解釈 (`queue.max-retries` / `queue.retry-backoff`) は core の `application::retry_policy` が唯一の実装で、native の queue worker と Worker が同じ値を使う。
 - **進捗配信 (PushHub)**: Durable Object `PUSH_HUB` (`worker_entry/src/push_hub.rs`) が WebSocket を保持し、worker からは `POST /api/push/events` の HTTP でイベントを渡す (DO を直接 fetch すると "Cannot reconstruct" になるため HTTP 経由)。Web UI は `/websocket` に接続する。
 - **イベント payload**: ジョブイベントの生成は core の `application::push_events` が唯一の実装で、native の Web UI 経路と Worker が同一の JSON を出す。
-- **コンソール行**: ジョブのコンソール出力は core の `application::messages` が唯一の生成元。Worker 側は `messages::set_default_sink` に `PushHubSink` を挿し、行を積むたびに送信タスク (`spawn_local`) を起動して**その都度**送る (`stream` = `stdout` / `stderr`)。送信タスクは常に 1 本で、順序・取りこぼし・最小送信間隔 (サブリクエスト保護) は core の `application::messages::flush::FlushQueue` が管理する。ジョブ境界の `drain()` は送信タスクの完了を待って残りを送る最後の砦で、ジョブの終端イベントより先にコンソール行を届ける。以前は境界までバッファしていたため、ダウンロードの 1 話ごとの進捗行が DL 完了時にまとめて表示されていた (2026-10-06 修正)
-- **コンソールの分離 (`concurrency`, 2026-10-08 修正)**: `concurrency` は Worker でも設定でき (設定ページの `worker_ineffective` から除外)、convert ジョブの行を native `web::worker::console_target_for_job` と同じ **`stdout2`** へ送る。Worker はジョブが常に並列 (queue の `max_concurrency`) で、native の「`concurrency=false` = 全ジョブを 1 レーンで逐次」に相当する状態が無いため、**Worker の既定は有効**とし、明示的に `concurrency=false` を保存したときだけ 1 コンソールへまとめる (`worker_entry/src/convert.rs` の `concurrency_enabled` と `webui/ui_prefs.rs`)。規則は core の `application::messages::Stream::target_console_with` に置き、Worker は `PushHubSink::install_with_console` で上書きする。DL/update の行は `stdout` のままなので Web UI のデュアルコンソールが native と同じ分け方になる。`concurrency.*` (native コンソールのキュー表示整形) は native 専用のまま。
-- **詳細ログ (`webui.debug-mode`)**: 詳細ログの唯一の入口は core の `application::debug`。ON のときだけ `[debug] …` 行を既定 sink (= Web コンソールの `echo`) へ流し、OFF では何もしない。設定の解釈は `debug::apply_settings` / `enabled_in_settings` (真偽値・`true/yes/on/1`・0 以外の数値) に集約する。有効化する場所は native が `commands::convert` (Web 起動)・Web ジョブ開始・`webui/native` の EPUB 生成、Worker がジョブ開始 (`executor`) と `download.epub`。EPUB のストリーム中はジョブ sink が無いので PushHub へ直接送る (`push_debug_line`)。Web UI (`main.js`) は ON のときだけ Web コンソール行をブラウザの開発者コンソールへも転送する。挿絵は「保存されなかった」「本文の参照が URL のまま」「EPUB の入力に見つからない」のどれでも静かに落ちるため、この詳細ログと `warn_illustration_missing` (常時) で追えるようにしてある
+- **コンソール行**: ジョブのコンソール出力は core の `application::messages` が唯一の生成元。Worker の `MessageContext` は future の poll ごとに `PushHubSink` と詳細ログ設定を束縛し、並列ジョブ間で sink・操作 ID・表示先を共有しない。行を積むたびに送信タスク (`spawn_local`) を起動し、順序・取りこぼし・最小送信間隔は `FlushQueue` が管理する。ジョブ終端より先に `drain()` で残りを送る。
+- **コンソールの分離 (`concurrency`)**: Worker の既定は有効で、明示的に `concurrency=false` を保存したときだけ 1 コンソールへまとめる。convert は native と同じ `stdout2`、DL/update は `stdout`。`MessageContext` がジョブごとの表示先を持ち、共通の `Stream::target_console_with` で解決する。native のレーン制御・Worker の queue 並列実行は配送アダプタに残し、`concurrency.*` の native コンソール整形は Worker では無効。
+- **詳細ログ (`webui.debug-mode`)**: 詳細ログの唯一の入口は core の `application::debug`。ON のときだけ `[debug] …` 行を sink (= Web コンソールの `echo`) へ流し、OFF では何もしない。設定の真偽値解釈は `enabled_in_settings` に集約する。native の CLI は `debug::apply_settings`、Worker のジョブは poll ごとに束縛する `MessageContext` の設定を使い、並列ジョブ間で有効状態を上書きしない。ジョブ外の EPUB 生成は PushHub へ直接送る (`push_debug_line`)。Web UI (`main.js`) は ON のときだけ Web コンソール行をブラウザの開発者コンソールへも転送する。挿絵は「保存されなかった」「本文の参照が URL のまま」「EPUB の入力に見つからない」をこの詳細ログと欠落警告で追う。
 - **共有ヘルパ**: Web UI の入力検証・上限値・ソート状態・HTML ヘルパは core の `application::webui` が唯一の定義で、native の `src/web/**` と `worker_entry/src/webui/**` はそれを再エクスポートして使う。
 - **ローカル検証**: `worker_entry` で `npx wrangler dev --config wrangler.toml` を起動し、`POST /api/download` → `POST /api/convert` を流せば DL から変換まで通る。fetch は手元のマシンから出るため、本番で 403 になるサイトもここでは取得できる (実測: なろう / カクヨム / syosetu.org)。ジョブのコンソール行は `ws://127.0.0.1:8787/ws` に `Authorization: Bearer <NAROU_ADMIN_TOKEN>` で接続すると `echo` イベント (`{"type":"echo","target_console":"stdout","body":"…"}`) として見える。ブラウザは `/login` で管理トークンを Cookie (`narou_api_token`、HttpOnly / SameSite=Lax) に入れれば Bearer 無しで UI 全体を操作できる (fetch / EPUB リンク / WebSocket すべて Cookie が付く)。`.dev.vars` に `NAROU_AUTH_REQUIRED=false` を足すのは、Cookie を経由せず素通しさせたい場合だけ (本番は Access を境界にするときだけ false)。
 - **注意**: ソースを変更すると `wrangler dev` は資産ディレクトリ `public/` の削除に失敗して (Windows の EBUSY) 無言で停止する。変更後は起動し直すこと。
@@ -385,7 +385,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **デプロイ**: `worker_entry/ci/deploy_worker.py` が `NAROU_DEPLOY_TARGET=develop|production` で D1 / Queue を用意し `wrangler.ci.toml` を描画してデプロイし、契約テストを流す。`CLOUDFLARE_API_TOKEN` が必要 (無い環境では手元からデプロイできない)。
 
 ### 最近の追加 (2026-05〜09)
-- **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック
+- **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとに並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1・フォース指定・ドメインが1種類のときは逐次にフォールバック。Web 更新も並列経路を使い、操作 ID ごとの進捗を配信する。
 - **ジョブ自動リトライ** (B): queue worker に exponential backoff 付き自動リトライ（`queue.retry-backoff` 既定 `1m,5m,15m`）を実装
 - **挿絵メンテナンスコマンド** (A): `narou illust <sub>`（`orphan` / `migrate` / `fix-ext` / `rebuild`）を新設し、`.illustration_cache.yaml` 運用の保守ヘルパーを CLI から呼び出せるようにした。削除・改名・移行系はいずれも既定 dry-run
 - **ブックマークレット登録フローの same-origin 復活** (H): Web UI から拡張ブックマークレットを登録する際の手続きを同一オリジン経由に戻し、外部リダイレクトを排除
@@ -402,11 +402,11 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - ※米印変換、全角数字、ルビ、auto_join_line、各種文字変換も完全一致
 
 ### AozoraEpub3_Lite 組み込みエンジン (lite feature, 2026-09)
-- pin: `aozora_epub3_lite` = `214aabc` (v0.1.6)。更新時は `Cargo.toml` の `rev` を書き換えて `cargo update -p aozora_epub3_lite`。`214aabc` は wasm32-unknown-unknown で `SystemTime::now()` が panic していた問題（`dcterms:modified` の生成）を JS 時計で回避した修正を含む (`js-sys` は wasm 限定依存)。
-- 呼び出し側は書き出しを **1 エントリずつ**進められる (`EpubBook::stream_writer(sink)` → `next_entry()` / `write_current(bytes)` / `finish()`)。Worker の `download.epub` はこれと `worker::Response::from_stream` を組み合わせ、完成した EPUB を保持せずチャンクを流す (`ChunkSink` は `narou_rs::epub_lite` が提供)。挿絵は `LazyImageSource` に書き出し直前の 1 枚だけ注入する (構築はパス一覧しか読まないため先読み不要。列挙は 512 枚 / 1 枚 16 MiB で 413)。
+- pin: `aozora_epub3_lite` = `381c0b17f91946e22d41e5246d3977c706abe82e` (v0.1.6)。この revision は wasm の JS 時計対応に加え、I/O 非依存の逐次画像収集 `AssetPlan` を公開する。更新時は Cargo 経由で git revision を指定し、`cargo update -p aozora_epub3_lite` と native / Worker の実出力を検証する。
+- 呼び出し側は書き出しを **1 エントリずつ**進められる (`EpubBook::stream_writer(sink)` → `next_entry()` / `write_current(bytes)` / `finish()`)。Worker の `download.epub` はこれと `worker::Response::from_stream` を組み合わせ、完成した EPUB を保持せずチャンクを流す (`ChunkSink` は `narou_rs::epub_lite` が提供)。画像計画と処理は `EpubPreparation` / `EpubBuild` で native と共有し、`EpubBuild::image` の保存元対応から 1 枚ずつ取得する (列挙は 512 枚 / 1 枚 16 MiB で 413)。
 - 組み立ては Lite CLI (`main.rs::convert_input`) と同じ公開 API を使う。独自実装 (挿絵の連番化・外字フォント収集・UUID 生成) は持たない。
   - `config_for(aozoraepub3dir)` = `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。Java 版と同じ注記表・外字フォント・INI を読む。INI が無ければ `preset/AozoraEpub3.ini` 相当のフラグ。
-  - `build_book(input_txt, options)`: `collect_assets` → `decorate_image_tags` → `rewrite_image_source` → `remove_missing_image_sources` → `remove_image_sources` (自動表紙) → `reflow_image_sections` → `build_metadata` (`urn:uuid:` は Java と同じ `java_name_uuid`) → `build_title_page_markup` → `append_gaiji_assets`。
+  - `build_book(input_txt, options)` は `EpubPreparation` で入力を解釈し、native の `collect_assets` と Worker の逐次 `AssetPlan` の結果を同じ `finish` へ渡す。画像参照・連番・欠落除去・自動表紙・画像ページ配置・メタデータ・外字資産の組み立てを二重実装しない (`urn:uuid:` は Java と同じ `java_name_uuid`)。
   - 挿絵は `EpubBuild::resolve` が書き出し時に 1 枚ずつ読み、`image::process` (余白除去・リサイズ・回転) をかける。寸法だけ事前に読む。
 - narou カスタム注記 (`preset/custom_chuki_tag.txt`, 21 行) は `include_str!` で常に重ねる。`init` がインストール先 `chuki_tag.txt` に書き込む内容と同一なので、同梱資産だけで動く wasm / 未設定時でも `ここから柱` / 前書き / 後書き / 一字下げ 等が効く。
 - `preset/AozoraEpub3.ini` も `include_str!` し、`aozoraepub3dir` が無いときの既定にする (`IniSettings::parse` → `AozoraConfig::from_ini`)。Java 版は常にこの INI (init がインストール先へコピーしたもの) を読むため、外部 AozoraEpub3 が無い環境でも `TitlePage` / `CoverPage` / `SpaceHyphenation` / `DakutenType` などのフラグが一致する。実測: 資産なしでも Java と 419/423 バイト一致。
@@ -489,6 +489,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   `PUT /api/sites/{name}`、`DELETE /api/sites/{name}`。`put` は保存前にコンパイル検証する。
 - 起動時に `native::site_definitions::install_effective_site_settings()` を呼び、同期コードは
   `downloader::site_setting::effective_site_settings()` を使う（未設定ならファイルから読む）。
+  この起動時のスナップショット (`install_runtime_snapshot`) は fetch policy 用なので、下の
+  `effective_runtime()` 側 (version gate 付き) を使う。
 - 実効定義は 2 経路がある。管理 API の表示・保存は `SiteDefinitions::effective()`
   （ユーザー本文をそのまま返す。native `/api/sites` と同一）、fetch policy / Worker の
   ダウンローダ (`bundled_sites::load_site_settings`) は `SiteDefinitions::effective_runtime()`
@@ -701,7 +703,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - Windows タスクトレイ常駐 (`--hide-console`)
 
 ### コマンド実装状況 (詳細は `COMMANDS.md`)
-- ✅ 完了 (23): init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, help, version, log, folder, browser, alias, inspect, csv, trace, db, login
+- ✅ 完了 (24): init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, author, help, version, log, folder, browser, alias, inspect, csv, trace, db, login
 - 🟡 部分 (4): download, update, convert, web
 - ❌ 未実装 (0): 全コマンド何らかの実装あり
 

@@ -36,8 +36,8 @@ use tokio::task::JoinHandle;
 // 可搬の Web UI ヘルパ (バリデーション・ソート状態・上限値) は Worker と共有する
 // ため `crate::application::webui` が唯一の定義。ここでは名前を再エクスポートする。
 pub(crate) use crate::application::webui::{
-    MAX_WEB_TAGS_PER_REQUEST, MAX_WEB_TARGETS_PER_REQUEST, html_escape,
-    normalize_web_device_override, normalize_web_tag_name, tag_color_class, targets_to_strings,
+    MAX_WEB_TAGS_PER_REQUEST, MAX_WEB_TARGETS_PER_REQUEST,
+    normalize_web_device_override, normalize_web_tag_name, targets_to_strings,
     validate_web_tag_name, validate_web_target_value,
 };
 
@@ -61,8 +61,6 @@ pub(crate) const MAX_WEB_CSV_IMPORT_BYTES: usize = 5 * 1024 * 1024;
 pub(crate) const MAX_WEB_CSV_IMPORT_BODY_BYTES: usize =
     2 * MAX_WEB_CSV_IMPORT_BYTES + 4 * 1024;
 pub(crate) const MAX_WEB_LOG_COUNT: usize = 1000;
-pub(crate) const MAX_WEB_PAGE_LENGTH: u64 = 500;
-pub(crate) const MAX_WEB_SEARCH_BYTES: usize = 4096;
 pub const INTERNAL_CONTROL_HEADER: &str = "x-narou-internal-token";
 
 #[derive(Clone)]
@@ -992,7 +990,9 @@ mod tests {
 
     #[tokio::test]
     async fn portless_cross_origin_post_cannot_clear_pending_jobs() {
-        let temporary = tempfile::tempdir_in("target").unwrap();
+        let temporary = tempfile::tempdir_in(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+        ).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut state = test_state();
         state.port = listener.local_addr().unwrap().port();

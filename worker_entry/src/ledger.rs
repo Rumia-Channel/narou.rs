@@ -13,6 +13,7 @@
 //! All SQL is D1 prepared statements with the same conventions as
 //! `d1_repository.rs` (RFC3339 nanosecond TEXT timestamps, bound parameters).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +34,62 @@ use crate::db_handle::DbHandle;
 /// execution guard is shorter than the lease, so a live redelivery is never
 /// allowed to execute concurrently with the original invocation.
 const JOB_LEASE: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
+
+/// Plans per ledger batch round trip. Bounded so one invocation never builds
+/// an unbounded statement vector; the D1 batch and the 100-message Queue
+/// batch both stay at or below this page size.
+const ENQUEUE_CHUNK: usize = 100;
+
+/// Fresh-id retries per chunk before an enqueue is reported as failed. The
+/// only expected retry is an improbable job-id collision; a dedupe race is
+/// resolved by re-reading the key instead of a retry.
+const ENQUEUE_MAX_ATTEMPTS: usize = 3;
+
+/// Active rows for a batch of dedupe keys in one request. The partial unique
+/// index (`worker_jobs_active_dedupe`) keeps at most one active row per key;
+/// should legacy rows violate that, the oldest `(created_at, job_id)` row
+/// wins so repeated calls agree on the same job identity. `json_each` keeps
+/// the key list to a single bind (same pattern as `d1_repository`).
+const ACTIVE_BY_DEDUPE_KEYS_SQL: &str = r#"
+SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
+       lease_until, checkpoint_json, dedupe_key
+FROM worker_jobs
+WHERE status IN ('pending', 'running', 'retryable')
+  AND dedupe_key IN (SELECT value FROM json_each(?))
+ORDER BY created_at ASC, job_id ASC
+"#;
+
+/// Fresh pending rows. `INSERT OR IGNORE` maps a dedupe race or an id
+/// collision to a zero-change statement instead of aborting the whole batch;
+/// the caller re-reads the dedupe key and rebuilds only the ignored rows.
+const INSERT_OR_IGNORE_SQL: &str = r#"
+INSERT OR IGNORE INTO worker_jobs
+    (job_id, kind, target, options, status, dedupe_key, attempts, last_error, created_at, updated_at)
+VALUES (?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?)
+"#;
+
+/// Fold one frozen-skipped job into the terminal `partial` state. The status
+/// guard is what keeps a batch's frozen snapshot from touching a job that is
+/// already executing: a dedupe hit on a running row keeps its status, lease,
+/// token and checkpoint, so the live execution still owns the row (only the
+/// executor's own recheck can settle it).
+const SETTLE_SKIPPED_SQL: &str = r#"
+UPDATE worker_jobs
+SET status = ?, last_error = ?, updated_at = ?,
+    lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+WHERE job_id = ? AND status IN ('pending', 'retryable')
+"#;
+
+/// One plan's outcome from [`D1JobLedger::enqueue_batch`]: the active row that
+/// now owns the plan's dedupe key (freshly inserted or pre-existing) and that
+/// row's status. The payload is the requested plan — the dedupe key fixes
+/// kind, target and effective options, so whoever created the row stored the
+/// same job.
+#[derive(Debug, Clone)]
+pub struct EnqueuedJob {
+    pub queued: QueuedJob,
+    pub status: JobLedgerStatus,
+}
 
 /// D1-backed [`JobQueue`] adapter.
 pub struct D1JobLedger {
@@ -93,49 +150,177 @@ impl D1JobLedger {
         Ok(row)
     }
 
-    /// Find an active row with the same dedupe key.
-    async fn select_active_by_dedupe(&self, dedupe_key: &str) -> Result<Option<JobRow>> {
-        let statement = self.prepare(
-            "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
-                    lease_until, checkpoint_json
-             FROM worker_jobs WHERE dedupe_key = ? AND status IN ('pending', 'running', 'retryable') LIMIT 1",
-            vec![BindValue::Text(dedupe_key.to_string())],
-        )?;
-        let row = statement.first::<JobRow>(None).await.map_err(worker_error)?;
-        Ok(row)
+    /// Active rows for a chunk of dedupe keys, in one request.
+    async fn select_active_by_dedupe_keys(
+        &self,
+        dedupe_keys: &[String],
+    ) -> Result<HashMap<String, JobRow>> {
+        if dedupe_keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let keys = serde_json::to_string(dedupe_keys).map_err(|error| {
+            NarouError::Platform(format!("job dedupe key serialization: {error}"))
+        })?;
+        let statement = self.prepare(ACTIVE_BY_DEDUPE_KEYS_SQL, vec![BindValue::Text(keys)])?;
+        let rows: Vec<JobRow> = statement
+            .all()
+            .await
+            .map_err(worker_error)?
+            .results()
+            .map_err(worker_error)?;
+        let mut active = HashMap::with_capacity(rows.len());
+        for row in rows {
+            // Oldest row wins for a legacy duplicate; the partial unique
+            // index makes this unreachable for rows this ledger wrote.
+            if let Some(key) = row.dedupe_key.clone() {
+                active.entry(key).or_insert(row);
+            }
+        }
+        Ok(active)
     }
 
-    /// Insert a fresh pending row; returns `false` on any uniqueness conflict
-    /// (callers re-read the dedupe row and/or regenerate the id).
-    async fn try_insert(&self, job_id: &JobId, job: &JobPlan, dedupe_key: &str) -> Result<bool> {
-        let now = self.now_rfc3339();
-        let options = serde_json::to_string(&job.options)
-            .map_err(|error| NarouError::Platform(format!("job options serialization: {error}")))?;
-        let statement = self.prepare(
-            "INSERT INTO worker_jobs (job_id, kind, target, options, status, dedupe_key, attempts, last_error, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?)",
+    /// One fresh pending insert statement (id, kind, target, options, dedupe
+    /// key, timestamps). `INSERT OR IGNORE` keeps an id collision or a dedupe
+    /// race from failing the whole batch.
+    fn pending_insert_statement(
+        &self,
+        job_id: &JobId,
+        job: &JobPlan,
+        options: &str,
+        dedupe_key: &str,
+        now: &str,
+    ) -> Result<D1PreparedStatement> {
+        self.prepare(
+            INSERT_OR_IGNORE_SQL,
             vec![
                 BindValue::Text(job_id.as_str().to_string()),
                 BindValue::Text(job.kind.as_str().to_string()),
                 BindValue::Text(job.target.as_str()),
-                BindValue::Text(options),
+                BindValue::Text(options.to_string()),
                 BindValue::Text(dedupe_key.to_string()),
-                BindValue::Text(now.clone()),
-                BindValue::Text(now),
+                BindValue::Text(now.to_string()),
+                BindValue::Text(now.to_string()),
             ],
-        )?;
-        let result = statement.run().await.map_err(worker_error)?;
-        if result.success() {
-            return Ok(true);
+        )
+    }
+
+    /// Enqueue several plans with the same dedupe/insert semantics as the
+    /// single-plan path, but with bounded batch round trips: one active-key
+    /// SELECT per chunk, one INSERT OR IGNORE batch per chunk, and a dedupe
+    /// re-read only for statements that were ignored. Outcomes stay in input
+    /// order, and two plans that share a dedupe key (duplicate targets in one
+    /// request) get the same job id — no double insertion.
+    pub async fn enqueue_batch(&self, jobs: &[JobPlan]) -> Result<Vec<EnqueuedJob>> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
         }
-        let error = result
-            .error()
-            .unwrap_or_else(|| "D1 insert failed".to_string());
-        if error.contains("UNIQUE constraint failed") {
-            Ok(false)
-        } else {
-            Err(NarouError::Platform(format!("D1 job insert failed: {error}")))
+        let mut options = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            options.push(serde_json::to_string(&job.options).map_err(|error| {
+                NarouError::Platform(format!("job options serialization: {error}"))
+            })?);
         }
+        let dedupe_keys: Vec<String> = jobs.iter().map(JobPlan::dedupe_key).collect();
+        let mut outcomes: Vec<Option<EnqueuedJob>> =
+            std::iter::repeat_with(|| None).take(jobs.len()).collect();
+        for start in (0..jobs.len()).step_by(ENQUEUE_CHUNK) {
+            let end = (start + ENQUEUE_CHUNK).min(jobs.len());
+            let existing = self
+                .select_active_by_dedupe_keys(&dedupe_keys[start..end])
+                .await?;
+            let mut pending: Vec<usize> = Vec::new();
+            for index in start..end {
+                match existing.get(&dedupe_keys[index]) {
+                    Some(row) => {
+                        outcomes[index] = Some(EnqueuedJob {
+                            queued: QueuedJob {
+                                job_id: JobId(row.job_id.clone()),
+                                job: jobs[index].clone(),
+                            },
+                            status: JobLedgerStatus::parse(&row.status)?,
+                        });
+                    }
+                    None => pending.push(index),
+                }
+            }
+            for _ in 0..ENQUEUE_MAX_ATTEMPTS {
+                if pending.is_empty() {
+                    break;
+                }
+                let now = self.now_rfc3339();
+                let mut statements = Vec::with_capacity(pending.len());
+                let mut planned: Vec<(usize, JobId)> = Vec::with_capacity(pending.len());
+                for &index in &pending {
+                    let job_id = JobId(Self::new_job_id());
+                    statements.push(self.pending_insert_statement(
+                        &job_id,
+                        &jobs[index],
+                        &options[index],
+                        &dedupe_keys[index],
+                        &now,
+                    )?);
+                    planned.push((index, job_id));
+                }
+                let results = self.db.batch(statements).await.map_err(worker_error)?;
+                ensure_batch_success(&results)?;
+                let mut ignored: Vec<usize> = Vec::new();
+                for (position, (index, job_id)) in planned.iter().enumerate() {
+                    if changed_rows(&results[position])? > 0 {
+                        outcomes[*index] = Some(EnqueuedJob {
+                            queued: QueuedJob {
+                                job_id: job_id.clone(),
+                                job: jobs[*index].clone(),
+                            },
+                            status: JobLedgerStatus::Pending,
+                        });
+                    } else {
+                        ignored.push(*index);
+                    }
+                }
+                if ignored.is_empty() {
+                    pending.clear();
+                    break;
+                }
+                // A zero-change INSERT is either a dedupe race (another
+                // writer won the same key) or an id collision. One re-read
+                // resolves the races; the rest regenerate ids.
+                let retry_keys: Vec<String> =
+                    ignored.iter().map(|index| dedupe_keys[*index].clone()).collect();
+                let winners = self.select_active_by_dedupe_keys(&retry_keys).await?;
+                let mut retry = Vec::new();
+                for index in ignored {
+                    match winners.get(&dedupe_keys[index]) {
+                        Some(row) => {
+                            outcomes[index] = Some(EnqueuedJob {
+                                queued: QueuedJob {
+                                    job_id: JobId(row.job_id.clone()),
+                                    job: jobs[index].clone(),
+                                },
+                                status: JobLedgerStatus::parse(&row.status)?,
+                            });
+                        }
+                        None => retry.push(index),
+                    }
+                }
+                pending = retry;
+            }
+            if let Some(index) = pending.first() {
+                return Err(NarouError::Platform(format!(
+                    "D1 job enqueue failed after {ENQUEUE_MAX_ATTEMPTS} attempts for {} plan(s) \
+                     (first target {:?})",
+                    pending.len(),
+                    jobs[*index].target.as_str(),
+                )));
+            }
+        }
+        outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.ok_or_else(|| {
+                    NarouError::Platform("job enqueue left a plan unresolved".to_string())
+                })
+            })
+            .collect()
     }
 
     /// A fresh, practically-unique job id (timestamp + random hex).
@@ -287,10 +472,7 @@ impl D1JobLedger {
     /// running job leaves it running).
     pub async fn settle_skipped(&self, job_id: &JobId, reason: &str) -> Result<bool> {
         let statement = self.prepare(
-            "UPDATE worker_jobs
-             SET status = ?, last_error = ?, updated_at = ?,
-                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
-             WHERE job_id = ? AND status IN ('pending', 'retryable')",
+            SETTLE_SKIPPED_SQL,
             vec![
                 BindValue::Text(status_str(JobLedgerStatus::Partial).to_string()),
                 BindValue::Text(reason.to_string()),
@@ -337,6 +519,23 @@ impl D1JobLedger {
             .results::<JobIdRow>()
             .map_err(worker_error)?;
         Ok(rows.into_iter().map(|row| row.job_id).collect())
+    }
+
+    /// Number of active rows (`pending` / `retryable` / `running`) in one
+    /// snapshot query. The `webui.table.reload-timing = queue` gate treats
+    /// 0 as "queue drained" — native `queue.active_pending_count() == 0 &&
+    /// running_jobs.is_empty()` over the same active set. A `retryable`
+    /// row whose backoff hold elapsed still counts: it is still queued.
+    pub async fn active_job_count(&self) -> Result<usize> {
+        let statement = self.db.prepare(
+            "SELECT COUNT(*) AS n FROM worker_jobs
+             WHERE status IN ('pending', 'retryable', 'running')",
+        );
+        let count = statement
+            .first::<i64>(Some("n"))
+            .await
+            .map_err(worker_error)?;
+        Ok(usize::try_from(count.unwrap_or(0)).unwrap_or(0))
     }
 
     /// Running job ids whose lease expired (or was never written). These
@@ -427,33 +626,11 @@ impl D1JobLedger {
 impl JobQueue for D1JobLedger {
     fn enqueue<'a>(&'a self, job: JobPlan) -> PlatformFuture<'a, Result<QueuedJob>> {
         Box::pin(async move {
-            let dedupe_key = job.dedupe_key();
-            if let Some(existing) = self.select_active_by_dedupe(&dedupe_key).await? {
-                return Ok(QueuedJob {
-                    job_id: JobId(existing.job_id),
-                    job,
-                });
-            }
-            // Insert with a fresh id; a uniqueness conflict means either the
-            // dedupe key raced in (re-read and return it) or the id collided
-            // (regenerate). Bounded, never silent.
-            for _ in 0..3 {
-                let job_id = JobId(Self::new_job_id());
-                match self.try_insert(&job_id, &job, &dedupe_key).await? {
-                    true => return Ok(QueuedJob { job_id, job }),
-                    false => {
-                        if let Some(existing) = self.select_active_by_dedupe(&dedupe_key).await? {
-                            return Ok(QueuedJob {
-                                job_id: JobId(existing.job_id),
-                                job,
-                            });
-                        }
-                    }
-                }
-            }
-            Err(NarouError::Platform(
-                "D1 job enqueue failed after 3 attempts".to_string(),
-            ))
+            // Shared with the batch path: dedupe lookup + bounded insert
+            // retries. A single action never needs more than one outcome.
+            self.enqueue_batch(std::slice::from_ref(&job))
+                .await
+                .map(|mut jobs| jobs.remove(0).queued)
         })
     }
 
@@ -953,6 +1130,10 @@ struct JobRow {
     updated_at: String,
     lease_until: Option<String>,
     checkpoint_json: Option<String>,
+    /// Only the batch dedupe lookup selects this column; per-id reads leave
+    /// it unset.
+    #[serde(default)]
+    dedupe_key: Option<String>,
 }
 
 impl JobRow {

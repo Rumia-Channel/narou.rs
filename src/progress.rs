@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
@@ -116,18 +115,6 @@ pub fn emit_novel_refresh(id: i64) {
 /// modules never depend on this native-only module.
 pub use crate::platform::ProgressReporter;
 
-pub struct NoProgress;
-
-impl ProgressReporter for NoProgress {
-    fn set_length(&self, _len: u64) {}
-    fn set_position(&self, _pos: u64) {}
-    fn inc(&self, _delta: u64) {}
-    fn set_message(&self, _msg: &str) {}
-    fn finish_with_message(&self, _msg: &str) {}
-    fn println(&self, msg: &str) {
-        eprintln!("{}", msg);
-    }
-}
 
 pub struct CliProgress {
     pb: ProgressBar,
@@ -232,91 +219,74 @@ impl Drop for CliProgress {
     }
 }
 
-/// Progress reporter for web mode — outputs structured lines to stdout
-/// that the web worker intercepts and converts to WebSocket events.
+/// Native stdout transport for the shared Web progress lifecycle.
 pub struct WebProgress {
-    topic: String,
-    scope: String,
-    length: AtomicU64,
-    position: AtomicU64,
+    state: crate::platform::progress::ProgressState,
 }
+
+static PROCESS_INSTANCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    hex::encode(crate::login::crypto::random_bytes::<16>().expect("progress instance entropy"))
+});
 
 impl WebProgress {
     pub fn new(topic: &str) -> Self {
-        let wp = Self {
-            topic: topic.to_string(),
-            scope: current_web_progress_scope(topic),
-            length: AtomicU64::new(0),
-            position: AtomicU64::new(0),
+        let progress = Self {
+            state: crate::platform::progress::ProgressState::new(
+                topic, &current_web_progress_scope(topic), &*PROCESS_INSTANCE,
+            ),
         };
-        wp.send(
-            "progressbar.init",
-            serde_json::json!({ "topic": topic, "scope": wp.scope }),
-        );
-        wp
+        progress.state.init(|phase, identity, snapshot| {
+            progress.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
+        progress
     }
 
-    fn send(&self, event_type: &str, data: serde_json::Value) {
-        let msg = serde_json::json!({ "type": event_type, "data": data });
-        println!("{}{}", WS_LINE_PREFIX, msg);
-    }
-
-    fn emit_step(&self) {
-        let len = self.length.load(Ordering::Relaxed);
-        let pos = self.position.load(Ordering::Relaxed);
-        if len > 0 {
-            let percent = (pos as f64 / len as f64) * 100.0;
-            self.send(
-                "progressbar.step",
-                serde_json::json!({
-                    "current": pos,
-                    "total": len,
-                    "percent": percent,
-                    "topic": self.topic,
-                    "scope": self.scope
-                }),
-            );
-        }
+    fn send(&self, event: serde_json::Value) {
+        use crate::application::messages::{MessageSink, Stream};
+        ConsoleSink.emit(Stream::Stdout, &format!("{WS_LINE_PREFIX}{event}"));
     }
 }
 
 impl ProgressReporter for WebProgress {
     fn set_length(&self, len: u64) {
-        self.length.store(len, Ordering::Relaxed);
+        self.state.set_length(len, |phase, identity, snapshot| {
+            self.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn set_position(&self, pos: u64) {
-        self.position.store(pos, Ordering::Relaxed);
-        self.emit_step();
+        self.state.set_position(pos, |phase, identity, snapshot| {
+            self.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn inc(&self, delta: u64) {
-        self.position.fetch_add(delta, Ordering::Relaxed);
-        self.emit_step();
+        self.state.inc(delta, |phase, identity, snapshot| {
+            self.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
-    fn set_message(&self, _msg: &str) {
-        // Web mode doesn't display message updates (progress bar only)
+    fn set_message(&self, msg: &str) {
+        self.state.set_message(msg, |phase, identity, snapshot| {
+            self.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn finish_with_message(&self, _msg: &str) {
-        self.send(
-            "progressbar.clear",
-            serde_json::json!({ "topic": self.topic, "scope": self.scope }),
-        );
+        self.state.finish(|phase, identity, snapshot| {
+            self.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn println(&self, msg: &str) {
-        println!("{}", msg);
+        use crate::application::messages::{MessageSink, Stream};
+        ConsoleSink.emit(Stream::Stdout, msg);
     }
 }
 
 impl Drop for WebProgress {
     fn drop(&mut self) {
-        self.send(
-            "progressbar.clear",
-            serde_json::json!({ "topic": self.topic, "scope": self.scope }),
-        );
+        self.finish_with_message("");
     }
 }
 
@@ -330,9 +300,8 @@ fn current_web_progress_scope(topic: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{STDOUT_LOCK, WEB_PROGRESS_SCOPE_ENV, current_web_progress_scope};
-    use std::sync::{Arc, Mutex};
-    use std::thread;
+    use super::{WEB_PROGRESS_SCOPE_ENV, current_web_progress_scope};
+    use std::sync::Mutex;
 
     /// 環境変数はプロセス全体で共有されるため、書き換えるテストは直列化する
     /// (並列実行だと片方の `remove_var` がもう片方の `set_var` を消してしまう)。
@@ -357,40 +326,4 @@ mod tests {
         assert_eq!(current_web_progress_scope("convert"), "convert");
     }
 
-    #[test]
-    fn stdout_lock_serializes_workers() {
-        use std::sync::Barrier;
-
-        let barrier = Arc::new(Barrier::new(4));
-        let mut handles = Vec::new();
-
-        for worker_id in 0..4 {
-            let barrier = Arc::clone(&barrier);
-            handles.push(thread::spawn(move || {
-                barrier.wait();
-                let mut out = Vec::new();
-                for k in 0..100 {
-                    let _guard = STDOUT_LOCK.lock();
-                    out.push(format!("worker={worker_id} iter={k}"));
-                }
-                out
-            }));
-        }
-
-        let mut all: Vec<String> = Vec::new();
-        for handle in handles {
-            all.extend(handle.join().expect("worker should finish"));
-        }
-
-        // Each worker emits its lines in a single critical section.
-        // We can verify per-line integrity by ensuring each emitted
-        // line stays intact (no foreign prefix/suffix). All entries
-        // must follow the `worker=N iter=M` shape with N and M intact.
-        for line in &all {
-            assert!(
-                line.starts_with("worker=") && line.contains(" iter="),
-                "interleaved line detected: {line}"
-            );
-        }
-    }
 }

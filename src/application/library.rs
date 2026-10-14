@@ -6,7 +6,7 @@
 //! and the six-hour new-arrival marker. Rendering (DataTables `draw`,
 //! JSON, HTTP) stays in the web layer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -14,6 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 use crate::application::error::ApplicationError;
 use crate::application::events::{FreezeStore, SiteTimezone, SiteTimezoneProvider};
 use crate::db::NovelRecord;
+use crate::platform::repository::{FreezeReadMode, record_is_frozen};
 use crate::platform::{
     NovelFilter, NovelQuery, NovelRepository, NovelSort, NovelSortKey, SearchField, SearchTerm,
 };
@@ -42,6 +43,7 @@ pub enum LibrarySortColumn {
     NovelType,
     GeneralAllNo,
     Length,
+    AverageLength,
 }
 
 impl LibrarySortColumn {
@@ -58,6 +60,7 @@ impl LibrarySortColumn {
             Self::NovelType => NovelSortKey::NovelType,
             Self::GeneralAllNo => NovelSortKey::GeneralAllNo,
             Self::Length => NovelSortKey::Length,
+            Self::AverageLength => NovelSortKey::AverageLength,
         }
     }
 }
@@ -190,6 +193,32 @@ impl LibraryService {
             .map_err(ApplicationError::platform)
     }
 
+    /// Resolve a user-facing target (alias / id / URL / ncode / title) through
+    /// the shared ordered plan ([`crate::application::target_lookup`]).
+    ///
+    /// The CLI uses the synchronous mirror (`resolve_target_record_sync`);
+    /// both adapters consume the same [`TargetLookupPlan`], so the update /
+    /// convert / read modes cannot drift apart.
+    ///
+    /// [`TargetLookupPlan`]: crate::application::target_lookup::TargetLookupPlan
+    pub async fn resolve_target(
+        &self,
+        plan: crate::application::target_lookup::TargetLookupPlan,
+        aliases: &HashMap<String, String>,
+        urls: crate::application::target_lookup::UrlSource<'_>,
+        target: &str,
+    ) -> Result<Option<NovelRecord>, ApplicationError> {
+        crate::application::target_lookup::resolve_target_record(
+            plan,
+            aliases,
+            urls,
+            target,
+            &*self.novels,
+        )
+        .await
+        .map_err(ApplicationError::platform)
+    }
+
 
     pub async fn count(&self) -> Result<usize, ApplicationError> {
         self.novels
@@ -211,6 +240,53 @@ impl LibraryService {
                 NovelSort::by(crate::platform::NovelSortKey::Id),
                 0,
                 usize::MAX,
+            ))
+            .await
+            .map_err(ApplicationError::platform)
+    }
+
+    /// Every id matching `filter`, ascending, as an ID projection.
+    ///
+    /// Handlers that only need ids (tag-target expansion, the
+    /// `/api/novels/all_ids` endpoint) must not decode whole records:
+    /// [`NovelRepository::scan_ids`] selects `id` alone, and the D1 backend
+    /// already paginates/filters at the SQL level. A `usize::MAX` limit is
+    /// the same unbounded form [`Self::records`] uses; callers that need a
+    /// bound should call the repository scan directly.
+    pub async fn all_ids(
+        &self,
+        filter: &NovelFilter,
+    ) -> Result<Vec<crate::platform::NovelId>, ApplicationError> {
+        self.novels
+            .scan_ids(filter, None, usize::MAX)
+            .await
+            .map_err(ApplicationError::platform)
+    }
+
+    /// Records for a bounded id list, ascending by id; unknown ids are
+    /// simply absent.
+    ///
+    /// Batch handlers that reorder or verify an explicit selection
+    /// (`sort_ids_from_records`, existence checks) only look at those ids;
+    /// this is the id-filtered form of [`Self::records`] — one filtered
+    /// query instead of a whole-library scan.
+    pub async fn records_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<NovelRecord>, ApplicationError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = NovelFilter {
+            ids: Some(ids.iter().copied().map(crate::platform::NovelId).collect()),
+            ..NovelFilter::default()
+        };
+        self.novels
+            .query(&NovelQuery::page(
+                filter,
+                NovelSort::by(crate::platform::NovelSortKey::Id),
+                0,
+                ids.len(),
             ))
             .await
             .map_err(ApplicationError::platform)
@@ -260,7 +336,8 @@ impl LibraryService {
                 now,
                 timezone,
             );
-            let is_frozen = record_is_frozen(&record, &frozen_ids);
+            let is_frozen =
+                record_is_frozen(&record, Some(&frozen_ids), FreezeReadMode::InventoryOrTag);
             let display_url = record.display_url().to_string();
             data.push(NovelSummary {
                 id: record.id,
@@ -471,11 +548,6 @@ fn collect_search_tokens(search: Option<&str>) -> Vec<SearchToken> {
 // ---------------------------------------------------------------------------
 // Frozen status, timezone lookup, new-arrival marker.
 // ---------------------------------------------------------------------------
-
-/// True when a record is frozen: in the freeze inventory or tagged `frozen`.
-fn record_is_frozen(record: &NovelRecord, frozen_ids: &HashSet<i64>) -> bool {
-    frozen_ids.contains(&record.id) || record.tags.iter().any(|tag| tag == "frozen")
-}
 
 /// The site domain of a record: the explicit `domain` field, else the
 /// `toc_url` host.
@@ -756,6 +828,56 @@ mod tests {
         assert_eq!(page.data.len(), 2);
         assert_eq!(page.data[0].id, 2);
         assert_eq!(page.data[1].id, 3);
+    }
+
+    #[test]
+    fn records_by_ids_fetches_only_the_selection_in_id_order() {
+        let mut records = Vec::new();
+        for id in 1..=5 {
+            let mut record = sample_record(id);
+            record.title = format!("novel {id}");
+            records.push(record);
+        }
+        let repo = Arc::new(MemoryNovelRepository::from_records(records));
+        let service = service(repo, Arc::new(FakeClock::default()));
+
+        // Batch handlers pass the raw selection: unsorted, possibly repeated
+        // ids and unknown ids must not change the result — the projection is
+        // exactly the selected records, ascending by id.
+        let selected = futures::executor::block_on(service.records_by_ids(&[4, 2, 2, 99])).unwrap();
+        let ids: Vec<i64> = selected.iter().map(|record| record.id).collect();
+        assert_eq!(ids, vec![2, 4]);
+        assert!(
+            futures::executor::block_on(service.records_by_ids(&[]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn all_ids_projects_every_matching_id_without_records() {
+        let mut records = (1..=4).map(sample_record).collect::<Vec<_>>();
+        records[3].tags = vec!["frozen".into()];
+        let repo = Arc::new(MemoryNovelRepository::from_records(records));
+        let service = service(repo, Arc::new(FakeClock::default()));
+
+        let all: std::collections::HashSet<i64> =
+            futures::executor::block_on(service.all_ids(&NovelFilter::all()))
+                .unwrap()
+                .into_iter()
+                .map(|id| id.0)
+                .collect();
+        let expected: std::collections::HashSet<i64> = (1..=4).collect();
+        assert_eq!(all, expected);
+
+        // The exact-match tag filter backs the frozen-tag fallback; it must
+        // return ids only.
+        let frozen = futures::executor::block_on(service.all_ids(&NovelFilter {
+            tag: Some("frozen".to_string()),
+            ..NovelFilter::default()
+        }))
+        .unwrap();
+        assert_eq!(frozen.iter().map(|id| id.0).collect::<Vec<_>>(), vec![4]);
     }
 
     #[test]

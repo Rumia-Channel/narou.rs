@@ -45,7 +45,7 @@ headers:
   Referer: \k<top_url>/
 confirm_over18: no
 append_title_to_folder_name: yes
-version: 1.1
+version: 1.4
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)
@@ -198,6 +198,11 @@ preprocess: |-
         end
         for entry in entries
           emit "Episode;${entry.seriesContentOrder};https://www.pixiv.net/ajax/novel/${entry.id};${entry.createDate};${entry.title}"
+          if entry.tags.is_array
+            for tag in entry.tags
+              emit "tag::${tag}"
+            end
+          end
         end
         if entries.size == 30
           emit "next::/ajax/novel/series_content/${entries.first.seriesId}?limit=30&last_order=${entries.last.seriesContentOrder}&order_by=asc"
@@ -289,8 +294,14 @@ preprocess: |-
             end
           else
             # 本文が無い小説ページ = ログインが要る作品 (R-18 / ログイン限定)。
-            # この目印に一致したら narou 側が保存済み Cookie で 1 回だけ再試行する。
-            emit "login_required::1"
+            # この目印に一致したら narou 側が保存済み Cookie で再試行する。
+            # 作者一覧 (/ajax/user/{id}/profile/all) の応答は作品ページではない
+            # ので出さない: 空の作者や作品を持たない作者が「ログインが必要」に
+            # 化けないようにする (一覧はこの目印が無ければ読めたことになる)。
+            let author_listing = body.novels != null || body.novelSeries != null || body.mangaSeries != null || body.illusts != null || body.manga != null
+            if !author_listing
+              emit "login_required::1"
+            end
           end
         end
       end

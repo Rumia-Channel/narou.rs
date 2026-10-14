@@ -112,7 +112,8 @@
   </div>
   <div id="drop-cover"></div>
 
-  <script>
+  <script type="module">
+    import { fetchJson, postJson, assertApiSuccess } from '/assets/js/core/http.js';
     (function() {
       var consoleEl = document.getElementById('console');
       var overlay = document.getElementById('link-drop-overlay');
@@ -194,8 +195,7 @@
         };
       }
 
-      fetch('/api/webui/config')
-        .then(function(r) { return r.json(); })
+      fetchJson('/api/webui/config')
         .then(function(config) {
           concurrencyEnabled = Boolean(config && config.concurrency_enabled);
           queueCountDivider.hidden = !concurrencyEnabled;
@@ -218,8 +218,7 @@
       }
 
       function refreshQueueCount() {
-        fetch('/api/get_queue_size')
-          .then(function(r) { return r.json(); })
+        fetchJson('/api/get_queue_size')
           .then(function(data) {
             var sizes = Array.isArray(data) ? data : [Number(data && data.total) || 0, 0];
             queueCount.textContent = String(Number(sizes[0]) || 0);
@@ -271,15 +270,9 @@
           var targets = link.trim().split(/[\s\n]+/).filter(Boolean);
           if (targets.length > 0) {
             appendConsole('ダウンロード開始: ' + targets.join(', '));
-            fetch('/api/download', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ targets: targets })
-            })
-              .then(function(response) {
-                if (!response.ok) {
-                  throw new Error('HTTP ' + response.status);
-                }
+            postJson('/api/download', { targets: targets })
+              .then(function(result) {
+                assertApiSuccess(result, 'ダウンロード要求の送信に失敗しました');
                 refreshQueueCount();
               })
               .catch(function(err) {

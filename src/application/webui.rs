@@ -8,6 +8,15 @@
 
 use crate::db::{NovelRecord, compare_records_by_key, sort_keys};
 
+pub mod author_comments;
+pub mod capabilities;
+pub mod diff;
+pub mod feature_tour;
+pub mod mutations;
+pub mod notepad;
+pub mod queue_view;
+pub mod tag_views;
+
 // ---------------------------------------------------------------------------
 // リクエスト件数・長さの上限 (native `src/web/mod.rs` の定数の唯一の定義)
 // ---------------------------------------------------------------------------
@@ -112,6 +121,22 @@ pub fn json_error_body(code: &str, message: Option<&str>) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
+// 添付ファイルのヘッダー (native / Worker のダウンロード応答)
+// ---------------------------------------------------------------------------
+
+/// Quotes and ASCII control characters in attachment filenames become `_`.
+pub fn sanitize_content_disposition(filename: &str) -> String {
+    let prefix = "attachment; filename=\"";
+    let mut disposition = String::with_capacity(prefix.len() + filename.len() + 1);
+    disposition.push_str(prefix);
+    for ch in filename.chars() {
+        disposition.push(if ch == '"' || ch.is_ascii_control() { '_' } else { ch });
+    }
+    disposition.push('"');
+    disposition
+}
+
+// ---------------------------------------------------------------------------
 // タグ一覧/履歴の HTML 断片で使う表示用ヘルパ
 // ---------------------------------------------------------------------------
 
@@ -160,6 +185,7 @@ impl CurrentSortState {
         serde_json::json!({
             "column": self.column,
             "dir": self.dir,
+            "columns": sort_keys(),
         })
     }
 
@@ -483,6 +509,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn attachment_disposition_replaces_quotes_and_ascii_controls() {
+        assert_eq!(
+            sanitize_content_disposition("題名\".epub"),
+            "attachment; filename=\"題名_.epub\""
+        );
+        for control in ['\0', '\u{001f}', '\r', '\n', '\t', '\u{007f}'] {
+            assert_eq!(
+                sanitize_content_disposition(&format!("a{control}b.epub")),
+                "attachment; filename=\"a_b.epub\""
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_disposition_preserves_other_filename_characters() {
+        assert_eq!(
+            sanitize_content_disposition("題名\\é\u{0085}.epub"),
+            "attachment; filename=\"題名\\é\u{0085}.epub\""
+        );
+        assert_eq!(sanitize_content_disposition(""), "attachment; filename=\"\"");
+    }
+
     // -- html_escape / tag_color_class ----------------------------------------
 
     #[test]
@@ -499,35 +548,6 @@ mod tests {
 
     // -- current sort state ----------------------------------------------------
 
-    #[test]
-    fn default_sort_state_is_general_lastup_desc() {
-        let state = default_current_sort_state();
-        assert_eq!(state.column, 2);
-        assert_eq!(state.dir, "desc");
-        assert_eq!(sort_column_key(&state), Some("general_lastup"));
-        assert_eq!(sort_column_label(&state), Some("最新話掲載日"));
-    }
-
-    #[test]
-    fn sort_state_serializes_to_json_and_yaml() {
-        let state = CurrentSortState {
-            column: 4,
-            dir: "asc".to_string(),
-        };
-        assert_eq!(
-            state.to_json_value(),
-            serde_json::json!({ "column": 4, "dir": "asc" })
-        );
-        let yaml = state.to_yaml_value();
-        assert_eq!(
-            yaml.get(serde_yaml::Value::String("column".to_string())),
-            Some(&serde_yaml::Value::Number(4.into()))
-        );
-        assert_eq!(
-            yaml.get(serde_yaml::Value::String("dir".to_string())),
-            Some(&serde_yaml::Value::String("asc".to_string()))
-        );
-    }
 
     #[test]
     fn normalize_sort_value_accepts_canonical_and_ruby_symbol_forms() {

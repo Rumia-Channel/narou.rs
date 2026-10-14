@@ -9,12 +9,25 @@
 // 両方をデプロイして比べる。
 //
 // 呼び出し (Worker 側):
-//   POST /proxy  { "url": "...", "headers": {...}, "redirect": "follow"|"manual" }
-//   → { "status": 200, "contentType": "...", "body": "<base64>" }
+//   POST /proxy  { "url": "...", "headers": {...} }
+//   → { "status": 200, "contentType": "...", "location": "...",
+//        "setCookie": ["..."], "body": "<base64>" }
+//
+// node モードと同じく取得は 1 回だけでリダイレクトは辿らない (`Location` を
+// 返し、追跡は呼び出し側が hop ごとの検証つきで行う)。同名ヘッダは値の配列で
+// 受け取り、受けた順に送る。応答の Set-Cookie は全部 `setCookie` に載せる。
 //
 // 認証: X-Proxy-Token ヘッダが環境変数 SORAHOST_PROXY_KEY と一致しない限り 403。
 
-const MAX_BODY_BYTES = 16 * 1024 * 1024;
+import {
+  MAX_REQUEST_BYTES,
+  assertResponseMetadata,
+  decodeHeaderJson,
+  headerPairs,
+  parseJsonObject,
+  readBoundedBytes,
+  readResponseBytes,
+} from "./protocol.mjs";
 
 const toBase64 = (bytes) => {
   let binary = "";
@@ -24,6 +37,7 @@ const toBase64 = (bytes) => {
   }
   return btoa(binary);
 };
+
 
 export default {
   async fetch(request, env) {
@@ -42,21 +56,27 @@ export default {
     let payload;
     if (request.method === "POST") {
       try {
-        payload = await request.json();
-      } catch {
-        return json(400, { error: "bad request: expected JSON body" });
+        payload = parseJsonObject(await readBoundedBytes(request.body, {
+          limit: MAX_REQUEST_BYTES,
+          contentLength: request.headers.get("content-length"),
+          label: "request",
+          // Sending a 400 must not abort the inbound connection first.
+          cancelOnLimit: false,
+        }));
+      } catch (error) {
+        return json(400, { error: `bad request: ${error.message}` });
       }
     } else if (request.method === "GET") {
       const rawHeaders = url.searchParams.get("headers");
       let headers = {};
-      if (rawHeaders) {
+      if (rawHeaders !== null) {
         try {
-          headers = JSON.parse(atob(rawHeaders));
-        } catch {
-          return json(400, { error: "bad request: headers must be base64 JSON" });
+          headers = decodeHeaderJson(rawHeaders);
+        } catch (error) {
+          return json(400, { error: `bad request: ${error.message}` });
         }
       }
-      payload = { url: url.searchParams.get("url") || "", headers, redirect: url.searchParams.get("redirect") || "follow" };
+      payload = { url: url.searchParams.get("url") || "", headers };
     } else {
       return json(405, { error: "method not allowed" });
     }
@@ -64,27 +84,31 @@ export default {
     const target = String(payload.url || "");
     if (!/^https?:\/\//.test(target)) return json(400, { error: "url must be http(s)" });
 
-    const headers = {};
-    for (const [name, value] of Object.entries(payload.headers || {})) {
-      if (typeof value === "string") headers[name] = value;
-    }
+    const headers = headerPairs(payload.headers);
 
     try {
+      // リダイレクトは辿らない。3xx は `location` 付きでそのまま返す。
       const response = await fetch(target, {
         headers,
-        redirect: payload.redirect === "manual" ? "manual" : "follow",
+        redirect: "manual",
       });
-      const body = new Uint8Array(await response.arrayBuffer());
-      if (body.length > MAX_BODY_BYTES) {
-        return json(502, { error: `response too large: ${body.length}` });
-      }
-      return json(200, {
+      const metadata = {
         status: response.status,
         contentType: response.headers.get("content-type") || "",
         location: response.headers.get("location") || undefined,
+        setCookie: response.headers.getSetCookie
+          ? response.headers.getSetCookie()
+          : response.headers.getAll("Set-Cookie"),
         via: "worker-fetch",
-        body: toBase64(body),
-      });
+      };
+      try {
+        assertResponseMetadata(metadata);
+      } catch (error) {
+        await response.body?.cancel(error).catch(() => {});
+        throw error;
+      }
+      const body = await readResponseBytes(response);
+      return json(200, { ...metadata, body: toBase64(body) });
     } catch (error) {
       return json(502, { error: `fetch failed: ${error.message}` });
     }

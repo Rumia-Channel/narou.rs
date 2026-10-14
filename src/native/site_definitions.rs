@@ -149,14 +149,25 @@ pub async fn site_definition_service() -> Result<SiteDefinitions> {
 /// 内容に変化がなければ再コンパイルはしない。以後の同期コードは
 /// [`crate::downloader::site_setting::effective_site_settings`] を使う。
 pub async fn install_effective_site_settings() -> Result<()> {
+    let store = store_for_current_library().await?;
+    let service = SiteDefinitions::new(shipped_bundle()?, store);
+    install_runtime_snapshot(&service).await
+}
+
+/// fetch policy 用のスナップショットを [`SiteDefinitions`] から確定する。
+///
+/// [`SiteDefinitions::effective_runtime`] を使う: ユーザー定義の `version` が同梱版
+/// より低ければ同梱版が勝つ version gate が掛かり、Worker の
+/// `bundled_sites::load_site_settings` と同じ fetch policy になる。管理表示・
+/// 保存経路 (`/api/sites`、Web UI) は gate 無しの [`SiteDefinitions::effective`]
+/// のままで、ユーザーが書いた本文をそのまま見せる。
+pub(crate) async fn install_runtime_snapshot(service: &SiteDefinitions) -> Result<()> {
     use crate::downloader::site_setting::{
         effective_site_settings_fingerprint_matches,
         install_effective_site_settings_fingerprinted, site_settings_fingerprint,
     };
 
-    let store = store_for_current_library().await?;
-    let service = SiteDefinitions::new(shipped_bundle()?, store);
-    let effective = service.effective().await?;
+    let effective = service.effective_runtime().await?;
     let fingerprint = site_settings_fingerprint(&effective);
     if effective_site_settings_fingerprint_matches(fingerprint) {
         return Ok(());
@@ -177,7 +188,9 @@ async fn import_once(
     store: &Arc<dyn SiteDefinitionStore>,
     folder: &Path,
 ) -> Result<()> {
-    if state.get_raw("inv", IMPORT_MARKER)?.is_some() {
+    // マーカーは `meta` キーと同じ app_state 専用の記帳で、compat モードでも
+    // ファイルには出さない (`state_inventory::legacy_path` が None を返す)。
+    if state.get_raw_db("inv", IMPORT_MARKER)?.is_some() {
         return Ok(());
     }
     if store.list().await?.is_empty() {
@@ -188,14 +201,24 @@ async fn import_once(
             }
         }
     }
-    state.set_raw("inv", IMPORT_MARKER, "true")?;
+    state.set_raw_db("inv", IMPORT_MARKER, "true")?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::site_definitions::{SiteDefinitions, SiteDefinitionOrigin};
+    use crate::application::site_definitions::{SiteDefinitionOrigin, SiteDefinitions};
+    use crate::downloader::site_setting::SiteSetting;
+
+    /// 確定済みスナップショットの `sitename` (未確定なら panic)。
+    fn installed_sitename(domain: &str) -> String {
+        crate::downloader::site_setting::effective_site_settings()
+            .into_iter()
+            .find(|setting| setting.domain == domain)
+            .map(|setting| setting.sitename)
+            .unwrap_or_else(|| panic!("no installed site definition for {domain}"))
+    }
 
     #[test]
     fn fs_store_round_trips_definitions() {
@@ -242,5 +265,69 @@ mod tests {
             assert_eq!(listed[0].origin, SiteDefinitionOrigin::Bundled);
         });
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ランタイム スナップショット (fetch policy 用) は Worker と同じ version gate を
+    /// 掛ける: 同梱版より低い `version` のユーザー定義は無視され、同版以上なら
+    /// キー単位でマージされる。gate 無しの `effective()` を使うと古いユーザー定義が
+    /// 勝ち、native の DL と Worker で挙動が分かれる (回帰)。
+    #[tokio::test]
+    async fn install_runtime_snapshot_applies_the_worker_version_gate() {
+        let _guard = crate::test_support::global_state_guard();
+        let bundled_store =
+            FsSiteDefinitions::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("webnovel"));
+        let mut bundled = Vec::new();
+        for name in bundled_store.list().await.unwrap() {
+            if let Some(yaml) = bundled_store.get(&name).await.unwrap() {
+                bundled.push((name, yaml));
+            }
+        }
+        let (name, bundled_yaml) = bundled.first().cloned().expect("同梱 webnovel/*.yaml");
+        let bundled_setting: SiteSetting = serde_yaml::from_str(&bundled_yaml).unwrap();
+
+        let user_dir = tempfile::tempdir().unwrap();
+        let service = SiteDefinitions::new(
+            bundled,
+            Arc::new(FsSiteDefinitions::new(user_dir.path().to_path_buf())),
+        );
+        let user_yaml = |version: f64, sitename: &str| {
+            let mut value: serde_yaml::Value = serde_yaml::from_str(&bundled_yaml).unwrap();
+            let mapping = value.as_mapping_mut().unwrap();
+            mapping.insert("version".into(), serde_yaml::Value::Number(version.into()));
+            mapping.insert(
+                "sitename".into(),
+                serde_yaml::Value::String(sitename.to_string()),
+            );
+            serde_yaml::to_string(&value).unwrap()
+        };
+
+        // 同梱版より低い version: ユーザー本文は fetch policy に出ない。
+        std::fs::write(
+            user_dir.path().join(&name),
+            user_yaml(bundled_setting.version - 0.5, "低バージョン定義"),
+        )
+        .unwrap();
+        install_runtime_snapshot(&service).await.unwrap();
+        assert_eq!(
+            installed_sitename(&bundled_setting.domain),
+            bundled_setting.sitename
+        );
+
+        // 同梱版より新しい version: キー単位でマージされユーザー本文が勝つ。
+        std::fs::write(
+            user_dir.path().join(&name),
+            user_yaml(bundled_setting.version + 1.0, "高バージョン定義"),
+        )
+        .unwrap();
+        install_runtime_snapshot(&service).await.unwrap();
+        assert_eq!(
+            installed_sitename(&bundled_setting.domain),
+            "高バージョン定義"
+        );
+
+        // 後始末: ファイル由来のスナップショットへ戻す (他テストと共有する状態)。
+        crate::downloader::site_setting::install_effective_site_settings(
+            SiteSetting::load_all().unwrap_or_default(),
+        );
     }
 }

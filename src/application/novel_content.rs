@@ -21,6 +21,10 @@ impl NovelContentService {
         Self { novels, objects }
     }
 
+    pub fn object_store(&self) -> &dyn ObjectStore {
+        self.objects.as_ref()
+    }
+
     pub async fn toc(&self, id: NovelId) -> Result<Option<Vec<u8>>, ApplicationError> {
         let keys = self.keys_for(id).await?;
         self.objects

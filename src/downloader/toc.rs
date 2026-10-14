@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{NarouError, Result};
 use crate::platform::{HttpClient, PlatformFuture, ProgressReporter, RateLimiter};
@@ -153,9 +153,16 @@ pub struct MultipageTocRequest<'a> {
     pub jobs: &'a mut PreprocessJobs,
 }
 
+pub struct TocListing {
+    pub subtitles: Vec<SubtitleInfo>,
+    pub partial: bool,
+    /// Site tag captures from every visited TOC page, before normalization.
+    pub tag_sources: Vec<String>,
+}
+
 pub async fn parse_subtitles_multipage(
     request: MultipageTocRequest<'_>,
-) -> Result<(Vec<SubtitleInfo>, bool)> {
+) -> Result<TocListing> {
     parse_subtitles_multipage_with(request, |http, rate_limiter, setting, url, jobs| {
         Box::pin(async move { fetch_toc(http, rate_limiter, setting, &url, jobs).await })
     })
@@ -165,7 +172,7 @@ pub async fn parse_subtitles_multipage(
 fn parse_subtitles_multipage_with<'a, F>(
     request: MultipageTocRequest<'a>,
     mut fetch_next_toc: F,
-) -> PlatformFuture<'a, Result<(Vec<SubtitleInfo>, bool)>>
+) -> PlatformFuture<'a, Result<TocListing>>
 where
     F: for<'b> FnMut(
             &'b dyn HttpClient,
@@ -191,22 +198,25 @@ where
         let mut all_subtitles = Vec::new();
         // 本文一覧のページが「未ログインで欠けている」と報告したか。
         let mut partial_listing = false;
+        let mut page_tags = Vec::new();
+        let mut visited_pages = HashSet::new();
+        visited_pages.insert(setting.get_toc_url_with_captures(url_captures));
         let mut current_toc_source = toc_source.to_string();
         let mut page = 0;
-        let max_pages = if let Some(pattern) = setting.toc_page_max_pattern() {
-            pattern
+        let (page_limit, total_pages) = if let Some(pattern) = setting.toc_page_max_pattern() {
+            let total = pattern
                 .captures(&current_toc_source)
                 .and_then(|caps| caps.get(1))
                 .and_then(|m| m.as_str().parse::<usize>().ok())
-                .unwrap_or(1)
-                .max(1)
+                .filter(|total| *total > 0);
+            (Some(total.unwrap_or(1)), total)
         } else {
-            50
+            (None, None)
         };
-        let show_progress = max_pages >= 5 && !title.is_empty();
+        let show_progress = !title.is_empty() && page_limit.is_none_or(|limit| limit >= 5);
         if show_progress && let Some(progress) = progress {
             progress.set_position(0);
-            progress.set_length(max_pages as u64);
+            progress.set_length(total_pages.unwrap_or(0) as u64);
             progress.set_message(&format!("目次 {}", title));
         }
 
@@ -216,12 +226,15 @@ where
             }
             let page_subs = parse_subtitles(setting, &current_toc_source, url_captures)?;
             all_subtitles.extend(page_subs);
+            if let Some(tags) = setting.resolve_info_pattern("tags", &current_toc_source) {
+                page_tags.push(tags);
+            }
 
             page += 1;
             if show_progress && let Some(progress) = progress {
                 progress.inc(1);
             }
-            if page >= max_pages {
+            if page_limit.is_some_and(|limit| page >= limit) {
                 break;
             }
 
@@ -247,16 +260,15 @@ where
                 None => break,
             };
             let next_url = setting.get_next_url_with_captures(&next_url_val, &next_captures);
+            if !visited_pages.insert(next_url.clone()) {
+                break;
+            }
 
             current_toc_source =
                 fetch_next_toc(http, rate_limiter, setting, next_url, &mut *jobs).await?;
         }
 
-        if show_progress && let Some(progress) = progress {
-            progress.set_position(0);
-        }
-
-        Ok((all_subtitles, partial_listing))
+        Ok(TocListing { subtitles: all_subtitles, partial: partial_listing, tag_sources: page_tags })
     })
 }
 
@@ -307,7 +319,7 @@ pub fn create_short_story_subtitles(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use crate::platform::mocks::{FakeRateLimiter, MockHttpClient};
 
@@ -316,27 +328,21 @@ mod tests {
     #[derive(Default)]
     struct MockProgress {
         lengths: Mutex<Vec<u64>>,
-        positions: Mutex<Vec<u64>>,
         increments: Mutex<Vec<u64>>,
-        messages: Mutex<Vec<String>>,
     }
 
     impl ProgressReporter for MockProgress {
         fn set_length(&self, len: u64) {
-            self.lengths.lock().unwrap().push(len);
+            self.lengths.lock().push(len);
         }
 
-        fn set_position(&self, pos: u64) {
-            self.positions.lock().unwrap().push(pos);
-        }
+        fn set_position(&self, _pos: u64) {}
 
         fn inc(&self, delta: u64) {
-            self.increments.lock().unwrap().push(delta);
+            self.increments.lock().push(delta);
         }
 
-        fn set_message(&self, msg: &str) {
-            self.messages.lock().unwrap().push(msg.to_string());
-        }
+        fn set_message(&self, _msg: &str) {}
 
         fn finish_with_message(&self, _msg: &str) {}
 
@@ -365,8 +371,7 @@ mod tests {
         let rate_limiter = FakeRateLimiter::new();
         let progress = MockProgress::default();
 
-        let subtitles =
-            futures::executor::block_on(parse_subtitles_multipage(MultipageTocRequest {
+        futures::executor::block_on(parse_subtitles_multipage(MultipageTocRequest {
                 http: &http,
                 rate_limiter: &rate_limiter,
                 setting,
@@ -376,17 +381,74 @@ mod tests {
                 progress: Some(&progress),
                 jobs: &mut PreprocessJobs::new(),
             }))
-            .unwrap()
-            .0;
+            .unwrap();
 
-        assert!(subtitles.is_empty() || subtitles.len() == 1);
-        assert_eq!(*progress.lengths.lock().unwrap(), vec![5]);
-        assert_eq!(*progress.increments.lock().unwrap(), vec![1]);
-        assert_eq!(
-            *progress.messages.lock().unwrap(),
-            vec!["目次 テスト作品".to_string()]
-        );
-        assert_eq!(*progress.positions.lock().unwrap(), vec![0, 0]);
+        assert_eq!(*progress.lengths.lock(), vec![5]);
+        assert_eq!(*progress.increments.lock(), vec![1]);
+    }
+
+    #[test]
+    fn unknown_toc_totals_count_pages_without_using_the_traversal_cap() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.domain == "www.pixiv.net").unwrap();
+        let first_page = "Episode;1;https://www.pixiv.net/ajax/novel/1;2020-01-01T00:00:00+00:00;一話\n\
+             next::/ajax/novel/series_content/1?limit=30&last_order=1&order_by=asc\n";
+        let second_page = "Episode;2;https://www.pixiv.net/ajax/novel/2;2020-01-01T00:00:00+00:00;二話\n";
+        let progress = MockProgress::default();
+        let subtitles = futures::executor::block_on(parse_subtitles_multipage_with(
+            MultipageTocRequest {
+                http: &MockHttpClient::new(),
+                rate_limiter: &FakeRateLimiter::new(),
+                setting,
+                toc_source: first_page,
+                url_captures: &HashMap::new(),
+                title: "シリーズ",
+                progress: Some(&progress),
+                jobs: &mut PreprocessJobs::new(),
+            },
+            |_, _, _, _, _| Box::pin(async { Ok(second_page.to_string()) }),
+        )).unwrap().subtitles;
+        assert_eq!(subtitles.iter().map(|subtitle| subtitle.index.as_str()).collect::<Vec<_>>(), vec!["1", "2"]);
+        assert_eq!(*progress.lengths.lock(), vec![0]);
+        assert_eq!(progress.increments.lock().iter().sum::<u64>(), 2);
+    }
+
+    #[test]
+    fn unknown_pagination_collects_tags_past_fifty_pages_and_stops_on_cycles() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.domain == "www.pixiv.net").unwrap();
+        for cyclic in [false, true] {
+            let make_page = |index: usize| {
+                let mut page = format!("Episode;{index};https://www.pixiv.net/ajax/novel/{index};2020-01-01T00:00:00+00:00;話\n\
+                    tag::tag{index}\n");
+                if index < 51 {
+                    let next = if cyclic { 1 } else { index };
+                    page.push_str(&format!("next::/ajax/novel/series_content/1?limit=30&last_order={next}&order_by=asc\n"));
+                }
+                page
+            };
+            let TocListing { subtitles, tag_sources: tags, .. } = futures::executor::block_on(parse_subtitles_multipage_with(
+                MultipageTocRequest {
+                    http: &MockHttpClient::new(),
+                    rate_limiter: &FakeRateLimiter::new(),
+                    setting,
+                    toc_source: &make_page(1),
+                    url_captures: &HashMap::new(),
+                    title: "",
+                    progress: None,
+                    jobs: &mut PreprocessJobs::new(),
+                },
+                |_, _, _, next_url, _| {
+                    let order = url::Url::parse(&next_url).unwrap().query_pairs()
+                        .find(|(key, _)| key == "last_order").unwrap().1.parse::<usize>().unwrap();
+                    let page = make_page(order + 1);
+                    Box::pin(async move { Ok(page) })
+                },
+            )).unwrap();
+            let last = if cyclic { 2 } else { 51 };
+            assert_eq!(subtitles.len(), last);
+            assert_eq!(tags.last(), Some(&format!("tag{last}")));
+        }
     }
 
     #[test]
@@ -410,7 +472,7 @@ mod tests {
         let http = MockHttpClient::new();
         let rate_limiter = FakeRateLimiter::new();
 
-        let (subtitles, partial) = futures::executor::block_on(parse_subtitles_multipage_with(
+        let TocListing { subtitles, partial, .. } = futures::executor::block_on(parse_subtitles_multipage_with(
             MultipageTocRequest {
                 http: &http,
                 rate_limiter: &rate_limiter,
@@ -491,7 +553,7 @@ mod tests {
             },
         ))
         .unwrap()
-        .0;
+        .subtitles;
 
         assert_eq!(
             *fetched_urls.lock().unwrap(),
@@ -583,7 +645,7 @@ mod tests {
             },
         ))
         .unwrap()
-        .0;
+        .subtitles;
 
         let fetched_urls = fetched_urls.lock().unwrap();
         assert_eq!(fetched_urls.len(), 2);

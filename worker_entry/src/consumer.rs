@@ -44,6 +44,38 @@ pub(crate) async fn notify_queue_changed(push: &PushHubClient) {
     push.broadcast_best_effort(&[notification_queue()]).await;
 }
 
+/// native `should_reload_table_after_job` (`src/web/worker.rs`) の Worker 版。
+///
+/// `webui.table.reload-timing` が `queue` のときだけ、台帳の active 行
+/// (pending / retryable / running) が 0 = キューが掃けたときに table.reload /
+/// tag.updateCanvas を送る。判定材料は primary の台帳スナップショット (D1 の
+/// 実データ) で、フロントが持つ表示状態は見ない。設定を読めない・既定値なら
+/// native と同じ `every` に倒す (毎回更新)。
+///
+/// 呼び出し時点で対象行は既に終端 (または retryable へ遷移済み) なので、
+/// 残り active が 0 なら「この終端でキューが掃けた」ことを意味する。
+pub(crate) async fn table_reload_after_job(runtime: &WorkerRuntime) -> bool {
+    let timing = runtime
+        .write_services()
+        .settings
+        .get("webui.table.reload-timing")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_owned));
+    if timing.as_deref() != Some("queue") {
+        return true;
+    }
+    match runtime.ledger.active_job_count().await {
+        Ok(active) => active == 0,
+        Err(error) => {
+            // 表示用の判定なので、台帳が読めないときは native の既定へ倒す。
+            console_log!("table reload timing check failed: {error}");
+            true
+        }
+    }
+}
+
 /// running 行を中断するときに `webui/queue_actions.rs` が `last_error` へ
 /// 書く理由 (`ledger::cancel_running_job` の tombstone)。
 ///
@@ -261,6 +293,7 @@ async fn process_discrete(
                 push,
                 &job_id,
                 &[event("queue_complete", json!(job_id.as_str()))],
+                table_reload_after_job(runtime).await,
             )
             .await;
             message.ack();
@@ -288,6 +321,7 @@ async fn process_discrete(
                     "queue_partial",
                     json!({ "job_id": job_id.as_str(), "reason": reason }),
                 )],
+                table_reload_after_job(runtime).await,
             )
             .await;
             message.ack();
@@ -306,7 +340,6 @@ async fn process_discrete(
                 settle_user_cancel(runtime, push, &job_id, message, error).await?;
                 return Ok(());
             }
-            runtime.enqueue_plan(job.clone()).await?;
             broadcast_terminal_events(
                 push,
                 &job_id,
@@ -317,8 +350,11 @@ async fn process_discrete(
                         json!({ "job_id": job_id.as_str(), "reason": reason }),
                     ),
                 ],
+                table_reload_after_job(runtime).await,
             )
             .await;
+            // Retire the old attempt before dispatch can start its continuation.
+            runtime.enqueue_plan(job.clone()).await?;
             message.ack();
         }
         JobOutcome::Blocked { reason } => {
@@ -394,6 +430,7 @@ async fn process_discrete(
                                 "reason": first_non_empty_line(&reason),
                             }),
                         )],
+                        table_reload_after_job(runtime).await,
                     )
                     .await;
                     message.retry_with_options(&options);
@@ -442,6 +479,7 @@ async fn settle_user_cancel(
         push,
         job_id,
         &[narou_rs::application::push_events::queue_cancelled(job_id.as_str())],
+        table_reload_after_job(runtime).await,
     )
     .await;
     message.ack();
@@ -480,6 +518,7 @@ pub(crate) async fn broadcast_failure(
             ),
             event("queue_failed", data),
         ],
+        table_reload_after_job(runtime).await,
     )
     .await;
 }
@@ -503,7 +542,7 @@ pub(crate) async fn webui_debug_mode(runtime: &WorkerRuntime) -> bool {
         .await
         .ok()
         .flatten()
-        .and_then(|value| value.as_bool())
+        .and_then(|value| narou_rs::setting_core::setting_bool_value(&value))
         .unwrap_or(false)
 }
 

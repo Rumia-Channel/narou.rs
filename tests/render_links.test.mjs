@@ -57,3 +57,40 @@ test('falls back to TOC URL and omits an absent source link', () => {
   assert.ok(render({ display_url: '', toc_url: 'https://example.com/toc' }).includes('href="https://example.com/toc"'));
   assert.equal(render({}), '');
 });
+
+for (const name of [
+  'parseFilterToken', 'stripFilterQuotes', 'splitOrValues', 'getStatusText',
+  'matchFilterToken', 'splitFilterTerms', 'splitFilterGroups', 'getFilteredNovels',
+  'pruneSelectedIdsToCurrentList',
+]) {
+  vm.runInContext(functionSource(name), context);
+}
+
+test('pasted Pixiv display URL filters the same novel as its source link', () => {
+  const displayUrl = 'https://www.pixiv.net/novel/show.php?id=42';
+  const novel = { id: 9, display_url: displayUrl, toc_url: 'https://www.pixiv.net/ajax/novel/42' };
+  context.State = { novels: [novel], viewFrozen: true, viewNonfrozen: true, filterText: displayUrl };
+  assert.deepEqual(Array.from(context.getFilteredNovels(), item => item.id), [9]);
+  context.State.filterText = 'url:' + displayUrl;
+  assert.deepEqual(Array.from(context.getFilteredNovels(), item => item.id), [9]);
+  context.State.novels = [{ id: 10, toc_url: displayUrl }];
+  assert.deepEqual(Array.from(context.getFilteredNovels(), item => item.id), [10]);
+});
+
+test('selection survives filtering and is pruned only by authoritative removal', () => {
+  context.State = {
+    novels: [{ id: 1, tags: ['shown'] }, { id: 2, tags: ['hidden'] }],
+    selectedIds: new Set(['1', '2', '3']),
+    viewFrozen: true, viewNonfrozen: true, filterText: 'tag:shown',
+  };
+  assert.deepEqual(Array.from(context.getFilteredNovels(), item => item.id), [1]);
+  context.pruneSelectedIdsToCurrentList();
+  assert.deepEqual(Array.from(context.State.selectedIds), ['1', '2']);
+  context.State.filterText = 'tag:no-match';
+  assert.equal(context.getFilteredNovels().length, 0);
+  context.pruneSelectedIdsToCurrentList();
+  assert.deepEqual(Array.from(context.State.selectedIds), ['1', '2']);
+  context.State.novels = [{ id: 2, tags: ['hidden'] }];
+  context.pruneSelectedIdsToCurrentList();
+  assert.deepEqual(Array.from(context.State.selectedIds), ['2']);
+});

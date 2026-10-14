@@ -8,10 +8,11 @@
 //! - `POST /api/login/order` — 1 サイトのログインの試行順を並べ替える。
 //!   native `login_order` と同じく、現在の添字の並び順を受け取る。
 //!
+//! 取り込み・改名・並べ替えの判断と応答メッセージは native と共有する
+//! `narou_rs::login::actions` が持つ。このモジュールはリクエスト本文の解釈と
+//! Worker の応答包みだけを行う。
+//!
 //! native との差異:
-//! - エンベロープの解析・復号 (Argon2id → XChaCha20-Poly1305) は native と同じ
-//!   `narou_rs::login::{parse_export, apply_import_name}` を使うので、暗号化
-//!   エクスポートもエラー文言も native と一致する。
 //! - 保存は `D1CookieStore` (`app_state` の `login_cookie` 行) 経由。値は
 //!   `enc:v1:` で暗号化して書く (native と同じ形式)。復号鍵の secret
 //!   `NAROU_RS_LOGIN_KEY` が無いときは平文で書かず失敗する (fail-closed)。
@@ -19,8 +20,7 @@
 //!   には同等の経路が無いので通知は行わない。
 
 use narou_rs::application::settings_view::{MAX_WEB_TEXT_INPUT_BYTES, validate_web_text_size};
-use narou_rs::login::{apply_import_name, parse_export};
-use narou_rs::platform::{LoginGroup, normalize_cookie_host};
+use narou_rs::login::actions::{self, IMPORT_EMPTY_MESSAGE, plan_import};
 use serde::Deserialize;
 use worker::{Env, Method, Request, Response, console_log};
 
@@ -121,33 +121,25 @@ async fn login_import(req: &mut Request, runtime: &WorkerRuntime) -> worker::Res
     {
         return api_failure(&message);
     }
-    let mut sites = match parse_export(&body.envelope, body.passphrase.as_deref()) {
-        Ok(sites) => sites,
+    let plan = match plan_import(&body.envelope, body.passphrase.as_deref(), body.name.as_deref()) {
+        Ok(plan) => plan,
         Err(error) => return api_failure(&error.to_string()),
     };
-    if let Some(name) = body.name.as_deref() {
-        apply_import_name(&mut sites, name);
-    }
-    let logins: usize = sites.values().map(Vec::len).sum();
-    if logins == 0 {
-        return api_failure("書き出しファイルにログイン情報が含まれていません");
+    if plan.logins == 0 {
+        return api_failure(IMPORT_EMPTY_MESSAGE);
     }
     let store = runtime.cookie_store();
-    let site_count = sites.len();
-    let stored = match if body.replace {
-        store.replace_groups(&sites).await
-    } else {
-        store.merge_groups(&sites).await
-    } {
-        Ok(stored) => stored,
-        Err(error) => return api_failure(&error.to_string()),
-    };
-    let data = status_data(runtime).await;
-    Response::from_json(&serde_json::json!({
-        "success": true,
-        "message": format!("{logins} 件を取り込みました ({site_count} サイト / 保存済み {stored} サイト)"),
-        "data": data,
-    }))
+    match actions::import_logins(store.as_ref(), &plan, body.replace).await {
+        Ok(message) => {
+            let data = status_data(runtime).await;
+            Response::from_json(&serde_json::json!({
+                "success": true,
+                "message": message,
+                "data": data,
+            }))
+        }
+        Err(message) => api_failure(&message),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -160,29 +152,17 @@ async fn login_rename(req: &mut Request, runtime: &WorkerRuntime) -> worker::Res
         Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
     };
     let store = runtime.cookie_store();
-    let site = normalize_cookie_host(&body.site);
-    let mut groups = match store.groups_for(&site).await {
-        Ok(groups) => groups,
-        Err(error) => return api_failure(&error.to_string()),
-    };
-    if body.index >= groups.len() {
-        return api_failure(&format!(
-            "{site} の {} 番目のログイン情報はありません",
-            body.index + 1
-        ));
+    match actions::rename_login(store.as_ref(), &body.site, body.index, &body.label).await {
+        Ok(message) => {
+            let data = status_data(runtime).await;
+            Response::from_json(&serde_json::json!({
+                "success": true,
+                "message": message,
+                "data": data,
+            }))
+        }
+        Err(message) => api_failure(&message),
     }
-    let label = body.label.trim();
-    groups[body.index].label = (!label.is_empty()).then(|| label.to_string());
-    let name = groups[body.index].display_name().to_string();
-    if let Err(error) = store.save_groups_for(&site, &groups).await {
-        return api_failure(&error.to_string());
-    }
-    let data = status_data(runtime).await;
-    Response::from_json(&serde_json::json!({
-        "success": true,
-        "message": format!("{site} の {} 番目を「{name}」にしました", body.index + 1),
-        "data": data,
-    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -195,45 +175,17 @@ async fn login_order(req: &mut Request, runtime: &WorkerRuntime) -> worker::Resu
         Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
     };
     let store = runtime.cookie_store();
-    let site = normalize_cookie_host(&body.site);
-    let stored = match store.groups_for(&site).await {
-        Ok(stored) => stored,
-        Err(error) => return api_failure(&error.to_string()),
-    };
-    let reordered = match reorder_groups(&stored, &body.order) {
-        Ok(reordered) => reordered,
-        Err(message) => return api_failure(&message),
-    };
-    if let Err(error) = store.save_groups_for(&site, &reordered).await {
-        return api_failure(&error.to_string());
-    }
-    let data = status_data(runtime).await;
-    Response::from_json(&serde_json::json!({
-        "success": true,
-        "message": format!("{site} の試行順を変更しました"),
-        "data": data,
-    }))
-}
-
-/// 並び順の指定（現在の添字の並び）を検証して適用する
-/// (native `reorder_groups` と同じ検証とエラーメッセージ)。
-fn reorder_groups(
-    stored: &[LoginGroup],
-    order: &[usize],
-) -> std::result::Result<Vec<LoginGroup>, String> {
-    if order.len() != stored.len() {
-        return Err("並び順の指定が保存済みの件数と一致しません".to_string());
-    }
-    let mut seen = vec![false; stored.len()];
-    let mut reordered = Vec::with_capacity(stored.len());
-    for index in order {
-        if *index >= stored.len() || seen[*index] {
-            return Err("並び順の指定が不正です".to_string());
+    match actions::reorder_logins(store.as_ref(), &body.site, &body.order).await {
+        Ok(message) => {
+            let data = status_data(runtime).await;
+            Response::from_json(&serde_json::json!({
+                "success": true,
+                "message": message,
+                "data": data,
+            }))
         }
-        seen[*index] = true;
-        reordered.push(stored[*index].clone());
+        Err(message) => api_failure(&message),
     }
-    Ok(reordered)
 }
 
 // ---------------------------------------------------------------------------

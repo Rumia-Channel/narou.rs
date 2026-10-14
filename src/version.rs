@@ -21,16 +21,18 @@ pub fn create_version_string() -> String {
     }
 }
 
-pub fn version_json() -> serde_json::Value {
-    serde_json::json!({
-        "version": create_version_string(),
-        "name": NAME,
-        "develop": !commit_version_exists(),
-        "local_build": is_local_build(),
-        "container": is_container_runtime(),
-        "self_update_supported": self_update_unavailable_reason().is_none(),
-        "build_variant": BUILD_VARIANT,
-    })
+/// native の実行時バージョン事実。キー集合と `/api/version/*` の応答形は
+/// `application::web_payloads::VersionInfoPayload` が唯一の定義。
+pub fn version_info() -> crate::application::web_payloads::VersionInfoPayload {
+    crate::application::web_payloads::VersionInfoPayload {
+        version: create_version_string(),
+        name: NAME.to_string(),
+        develop: !commit_version_exists(),
+        local_build: is_local_build(),
+        container: is_container_runtime(),
+        self_update_supported: self_update_unavailable_reason().is_none(),
+        build_variant: BUILD_VARIANT,
+    }
 }
 
 pub fn runtime_description() -> String {
@@ -181,8 +183,8 @@ mod tests {
     }
 
     #[test]
-    fn version_json_contains_name_and_version() {
-        let value = version_json();
+    fn version_info_contains_name_and_version() {
+        let value = version_info().current();
         assert_eq!(value["name"], NAME);
         assert!(value["version"].as_str().unwrap().starts_with(VERSION));
     }

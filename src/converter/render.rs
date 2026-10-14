@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -322,18 +323,29 @@ fn novel_type_text(novel_type: Option<u8>) -> String {
     }
 }
 
+/// 小説ディレクトリ内の表紙画像 (`cover.jpg` → `cover.png` → `cover.jpeg` の
+/// 順で最初に実在するもの)。
+///
+/// 変換時の挿絵注記の挿入・native CLI の `-c 0` 判定・i文庫 ZIP・EPUB の
+/// オンデマンド生成が同じ探索順を使う。
+pub(crate) fn cover_image_path(dir: &Path) -> Option<PathBuf> {
+    [".jpg", ".png", ".jpeg"]
+        .into_iter()
+        .map(|extension| dir.join(format!("cover{extension}")))
+        .find(|path| path.is_file())
+}
+
 fn create_cover_chuki(settings: &NovelSettings) -> String {
-    let archive_path = &settings.archive_path;
-    for ext in &[".jpg", ".png", ".jpeg"] {
-        let cover_path = archive_path.join(format!("cover{}", ext));
-        if cover_path.exists() {
-            return format!(
-                "\u{FF3B}\u{FF03}\u{633F}\u{7D75}\u{FF08}cover{}\u{FF09}\u{5165}\u{308B}\u{FF3D}",
-                ext
-            );
-        }
-    }
-    String::new()
+    let Some(cover_path) = cover_image_path(&settings.archive_path) else {
+        return String::new();
+    };
+    let Some(file_name) = cover_path.file_name().and_then(|name| name.to_str()) else {
+        return String::new();
+    };
+    format!(
+        "\u{FF3B}\u{FF03}\u{633F}\u{7D75}\u{FF08}{}\u{FF09}\u{5165}\u{308B}\u{FF3D}",
+        file_name
+    )
 }
 
 pub(crate) fn insert_cover_chuki_for_textfile(settings: &NovelSettings, text: &str) -> String {

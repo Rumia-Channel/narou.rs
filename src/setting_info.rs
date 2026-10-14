@@ -92,6 +92,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "logging"
         | "update.interval"
         | "update.strong"
+        | "update.disabled-author-tracking"
         | "update.convert-only-new-arrival"
         | "update.sort-by"
         | "update.auto-schedule.enable"
@@ -628,6 +629,10 @@ pub fn setting_variables() -> SettingVariables {
                 VarType::Boolean,
                 "改稿日当日の連続更新でも更新漏れが起きないように、中身もチェックして更新を検知する(やや処理が重くなる)",
             ),
+        ),
+        (
+            "update.disabled-author-tracking",
+            vis(VarType::Boolean, "更新後の追跡作者からの新作品ダウンロードを停止する"),
         ),
         (
             "update.convert-only-new-arrival",

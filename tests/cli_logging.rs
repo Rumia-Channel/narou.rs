@@ -62,3 +62,39 @@ fn sink_and_bin_lines_share_one_log_file() {
         "bin 側の行がログに無い: {text}"
     );
 }
+
+#[test]
+fn backend_warning_during_logger_init_does_not_deadlock_cli() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let narou_dir = root.join(".narou");
+    std::fs::create_dir_all(narou_dir.join("db.sqlite")).unwrap();
+    std::fs::write(narou_dir.join("storage-backend"), "sqlite\n").unwrap();
+    let mut child = Command::new(narou_binary())
+        .arg("version")
+        .current_dir(root)
+        .env("USERPROFILE", root)
+        .env("HOME", root)
+        .env_remove("NAROU_RS_LEGACY_YAML")
+        .env_remove("NAROU_RS_RESTART_CWD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("CLI deadlocked while reporting an unavailable backend");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains(env!("CARGO_PKG_VERSION")));
+}

@@ -90,6 +90,24 @@ pub struct SiteSetting {
     /// pager that links back from looping, so there is no page limit to hit.
     #[serde(default)]
     pub author_next_pattern: Option<String>,
+    /// Template of one *continued* page of an offset-paged author listing
+    /// (なろう小説API の `st` のような開始位置)。`\k<st>` には「ここまでに
+    /// 読んだ作品数 + 1」が入り、`author_url` の capture も使える。1 ページ目は
+    /// `author_api_url`、続きはこのテンプレートで辿る。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_page_url: Option<String>,
+    /// その 1 ページが列挙する作品数。総件数パターンが無い定義では、これに
+    /// 満たないページを終端と見なす。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_page_size: Option<usize>,
+    /// 応答が示す総作品数を `count` capture で読むパターン。総数に達するまで
+    /// ページを進め、達せずに尽きたらエラーにする (欠けた一覧を成功にしない)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_page_total_pattern: Option<String>,
+    /// 受け付ける開始位置の上限 (なろう小説API の `st` は 1〜2000)。超える
+    /// 続きが残っている場合は、途中までの一覧を返さずエラーにする。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_page_max_start: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series_item_url: Option<String>,
     #[serde(default)]
@@ -212,6 +230,8 @@ pub struct SiteSetting {
     pub(super) compiled_author_novel: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_author_next: Option<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_author_page_total: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_author_series_episodes: Option<Regex>,
     #[serde(skip)]
@@ -505,6 +525,10 @@ impl SiteSetting {
             .author_next_pattern
             .as_deref()
             .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
+        self.compiled_author_page_total = self
+            .author_page_total_pattern
+            .as_deref()
+            .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
         self.compiled_author_series_episodes = self
             .author_series_episodes_pattern
             .as_deref()
@@ -734,6 +758,28 @@ impl SiteSetting {
             .name("author_next")
             .map(|matched| crate::downloader::util::decode_html_text(matched.as_str()))
             .filter(|url| !url.is_empty())
+    }
+
+    /// Fetch URL of one continued page of an offset-paged author listing.
+    ///
+    /// `st` is the 1-based start offset: the number of works already read
+    /// plus one, so a listing that pages every 500 works asks for 501 next.
+    pub fn author_page_fetch_url(
+        &self,
+        captures: &HashMap<String, String>,
+        st: usize,
+    ) -> Option<String> {
+        let template = self.author_page_url.as_deref()?;
+        let mut named = captures.clone();
+        named.insert("st".to_string(), st.to_string());
+        Some(self.interpolate_with_captures(template, &named))
+    }
+
+    /// Total number of works the listing says it has (`count` capture).
+    pub fn author_page_total(&self, source: &str) -> Option<usize> {
+        let pattern = self.compiled_author_page_total.as_ref()?;
+        let captures = pattern.captures(source)?;
+        captures.name("count")?.as_str().parse().ok()
     }
 
     /// Captures of `author_url` for a concrete author page.

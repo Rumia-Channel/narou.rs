@@ -18,8 +18,8 @@ use crate::converter::output::create_output_text_filename;
 use crate::converter::settings::NovelSettings;
 use crate::db::NovelRecord;
 use crate::db::inventory::Inventory;
-use crate::downloader::site_setting::SiteSetting;
-use crate::downloader::{Downloader, TargetType, TocObject};
+use crate::downloader::site_setting::effective_site_settings;
+use crate::downloader::TocObject;
 use crate::error::Result;
 
 pub const MAIL_SETTING_FILE: &str = "mail_setting.yaml";
@@ -148,7 +148,7 @@ pub fn load_mail_setting() -> std::result::Result<MailSetting, MailSettingLoadEr
     let raw = std::fs::read_to_string(&path)?;
     let map = parse_symbolic_yaml_map(&raw)?;
 
-    if !yaml_bool(map.get("complete")).unwrap_or(false) {
+    if !map.get("complete").and_then(crate::setting_core::setting_bool_value).unwrap_or(false) {
         return Err(MailSettingLoadError::Incomplete(path));
     }
 
@@ -456,16 +456,24 @@ fn smtp_tls_mode(
     via_options: &HashMap<String, serde_yaml::Value>,
     port: u16,
 ) -> std::result::Result<SmtpTlsMode, String> {
-    if yaml_bool(via_options.get("ssl")).unwrap_or(false)
-        || yaml_bool(via_options.get("tls")).unwrap_or(false)
+    if via_options.get("ssl").and_then(crate::setting_core::setting_bool_value).unwrap_or(false)
+        || via_options.get("tls").and_then(crate::setting_core::setting_bool_value).unwrap_or(false)
         || port == 465
     {
         return Ok(SmtpTlsMode::Wrapper);
     }
-    if yaml_bool(via_options.get("enable_starttls")).unwrap_or(false) {
+    if via_options
+        .get("enable_starttls")
+        .and_then(crate::setting_core::setting_bool_value)
+        .unwrap_or(false)
+    {
         return Ok(SmtpTlsMode::Required);
     }
-    if yaml_bool(via_options.get("enable_starttls_auto")).unwrap_or(true) {
+    if via_options
+        .get("enable_starttls_auto")
+        .and_then(crate::setting_core::setting_bool_value)
+        .unwrap_or(true)
+    {
         if smtp_allow_insecure(via_options) {
             eprintln!("WARN: opportunistic STARTTLS is enabled by explicit opt-in");
             return Ok(SmtpTlsMode::Opportunistic);
@@ -512,7 +520,7 @@ fn smtp_tls(
 }
 
 fn smtp_accept_invalid_certs(via_options: &HashMap<String, serde_yaml::Value>) -> bool {
-    yaml_bool(via_options.get("tls_skip_verify")).unwrap_or(false)
+    via_options.get("tls_skip_verify").and_then(crate::setting_core::setting_bool_value).unwrap_or(false)
         || crate::compat::load_local_setting_bool("mail.smtp.tls_skip_verify")
         || yaml_string(via_options.get("openssl_verify_mode"))
             .map(|mode| {
@@ -525,51 +533,24 @@ fn smtp_accept_invalid_certs(via_options: &HashMap<String, serde_yaml::Value>) -
 }
 
 fn smtp_allow_insecure(via_options: &HashMap<String, serde_yaml::Value>) -> bool {
-    yaml_bool(via_options.get("allow_insecure")).unwrap_or(false)
+    via_options.get("allow_insecure").and_then(crate::setting_core::setting_bool_value).unwrap_or(false)
         || crate::compat::load_local_setting_bool("mail.smtp.allow_insecure")
 }
 
+/// `narou mail` のレコード解決。探索順 (id → URL → ncode → title-only、
+/// 一致した定義ごとに TOC URL を試す) は
+/// `application::target_lookup::TargetLookupPlan::MAIL` が唯一の定義。
 fn resolve_record(target: &str) -> std::result::Result<Option<NovelRecord>, String> {
-    let novels = crate::native::novel_repository::NativeNovelRepository::new();
-    if let Ok(id) = target.parse::<i64>() {
-        let record = novels.get_sync(id.into()).map_err(|e| e.to_string())?;
-        if record.is_some() {
-            return Ok(record);
-        }
-    }
-
-    match Downloader::get_target_type(target) {
-        TargetType::Url => {
-            let site_settings = SiteSetting::load_all().map_err(|e| e.to_string())?;
-            for setting in &site_settings {
-                if setting.matches_url(target) {
-                    let toc_url = setting
-                        .toc_url_with_url_captures(target)
-                        .unwrap_or_else(|| setting.toc_url());
-                    let record = novels
-                        .find_by_toc_url_sync(&toc_url)
-                        .map_err(|e| e.to_string())?;
-                    if record.is_some() {
-                        return Ok(record);
-                    }
-                }
-            }
-            Ok(None)
-        }
-        TargetType::Ncode => {
-            let record = novels
-                .find_by_ncode_sync(target)
-                .map_err(|e| e.to_string())?;
-            Ok(record)
-        }
-        TargetType::Other => {
-            let record = novels
-                .find_by_title_sync(target)
-                .map_err(|e| e.to_string())?;
-            Ok(record)
-        }
-        TargetType::Id => Ok(None),
-    }
+    let lookup = crate::native::novel_repository::NativeNovelRepository::new();
+    let site_settings = effective_site_settings();
+    crate::application::target_lookup::resolve_target_record_sync(
+        crate::application::target_lookup::TargetLookupPlan::MAIL,
+        &HashMap::new(),
+        crate::application::target_lookup::UrlSource::Settings(&site_settings),
+        target,
+        &lookup,
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub fn get_ebook_file_paths(
@@ -644,18 +625,18 @@ fn current_device_ext() -> Option<String> {
     crate::compat::current_device().map(|device| device.ebook_file_ext().to_string())
 }
 
+/// 別名表 (alias.yaml) の完全一致解決を共有実装で行う。未登録の名前は
+/// そのまま返す (小文字化しない) — `hotentry` 判定・`resolve_record` の前に
+/// 適用する順序も従来どおり。
 fn alias_to_target(target: &str) -> String {
-    crate::db::with_database(|db| -> Result<Option<String>> {
-        let aliases: HashMap<String, serde_yaml::Value> = db
+    let aliases = crate::db::with_database(|db| -> Result<HashMap<String, String>> {
+        let values: HashMap<String, serde_yaml::Value> = db
             .inventory()
             .load("alias", crate::db::inventory::InventoryScope::Local)?;
-        Ok(aliases
-            .get(target)
-            .and_then(|v| yaml_value_to_string(Some(v))))
+        Ok(crate::application::aliases::alias_map_from_values(values))
     })
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| target.to_string())
+    .unwrap_or_default();
+    crate::application::aliases::resolve_alias_target(&aliases, target).into_owned()
 }
 
 fn attachment_name(
@@ -829,16 +810,6 @@ fn smtp_auth_mechanisms(value: Option<&serde_yaml::Value>) -> Vec<Mechanism> {
             },
         )
         .collect()
-}
-
-fn yaml_bool(value: Option<&serde_yaml::Value>) -> Option<bool> {
-    let value = value?;
-    match value {
-        serde_yaml::Value::Bool(b) => Some(*b),
-        serde_yaml::Value::String(s) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
-        serde_yaml::Value::Number(n) => Some(n.as_i64().unwrap_or(0) != 0),
-        _ => None,
-    }
 }
 
 fn yaml_u16(value: Option<&serde_yaml::Value>) -> Option<u16> {

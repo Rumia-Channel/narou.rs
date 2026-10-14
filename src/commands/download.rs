@@ -3,6 +3,10 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use narou_rs::application::messages::{self, MessageSink, Stream};
+use narou_rs::application::target_lookup::{
+    TagExpansionVariant, TargetLookupPlan, UrlSource, expand_tag_targets_sync,
+    resolve_target_record_sync,
+};
 use narou_rs::compat::{configure_web_subprocess_command, convert_existing_novel};
 use narou_rs::downloader::{DownloadResult, Downloader, TargetType, UpdateStatus};
 use narou_rs::mail::{
@@ -70,7 +74,7 @@ async fn cmd_download_inner(
     let multi_clone = multi.clone();
     let mut mistook = 0usize;
     let (expanded_targets, series_mistook) =
-        expand_series_targets(&mut downloader, &targets, sink).await;
+        expand_series_targets(&downloader, &targets, sink).await;
     targets = expanded_targets;
     mistook += series_mistook;
 
@@ -192,14 +196,14 @@ async fn cmd_download_inner(
 }
 
 async fn expand_series_targets(
-    downloader: &mut Downloader,
+    downloader: &Downloader,
     targets: &[String],
     sink: &Arc<dyn MessageSink>,
 ) -> (Vec<String>, usize) {
     let mut expanded = Vec::new();
     let mut mistook = 0usize;
     for target in targets {
-        match downloader.expand_series_target(target).await {
+        match downloader.download_target_expander().expand(target).await {
             Ok(Some(items)) => {
                 sink.emit(
                     Stream::Stdout,
@@ -267,95 +271,18 @@ fn valid_target(downloader: &Downloader, target: &str) -> bool {
     let target_type = Downloader::get_target_type(target);
     match target_type {
         TargetType::Ncode => true,
-        TargetType::Url => downloader.site_setting_matches_url(target),
+        TargetType::Url => downloader.site_setting_matches_url(target)
+            || downloader.download_target_expander().recognizes(target),
         _ => false,
     }
 }
 
 pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
-    let mut expanded = Vec::new();
-    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-
-    // tag index 相当: 完全一致タグで絞った ID 一覧 (D1 では novel_tags join)。
-    let tag_ids = |tag_name: &str| -> Vec<i64> {
-        let filter = narou_rs::platform::NovelFilter {
-            tag: Some(tag_name.to_string()),
-            ..Default::default()
-        };
-        novels
-            .scan_ids_sync(&filter, None, usize::MAX)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|id| id.0)
-            .collect()
-    };
-
-    for target in targets {
-        if let Some(tag_name) = target.strip_prefix("tag:") {
-            let ids = tag_ids(tag_name);
-            if ids.is_empty() {
-                expanded.push(tag_name.to_string());
-            } else {
-                for id in ids {
-                    let s = id.to_string();
-                    if !expanded.contains(&s) {
-                        expanded.push(s);
-                    }
-                }
-            }
-        } else if let Some(tag_name) = target.strip_prefix("^tag:") {
-            let exclude_ids: std::collections::HashSet<i64> =
-                tag_ids(tag_name).into_iter().collect();
-            let filter = narou_rs::platform::NovelFilter::all();
-            let all_ids: Vec<i64> = novels
-                .scan_ids_sync(&filter, None, usize::MAX)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|id| id.0)
-                .collect();
-            for id in all_ids {
-                if !exclude_ids.contains(&id) {
-                    let s = id.to_string();
-                    if !expanded.contains(&s) {
-                        expanded.push(s);
-                    }
-                }
-            }
-        } else if let Ok(id) = target.parse::<i64>() {
-            let exists = novels.get_sync(id.into()).ok().flatten().is_some();
-            if exists {
-                if !expanded.contains(&target.clone()) {
-                    expanded.push(target.clone());
-                }
-            } else {
-                let ids = tag_ids(target);
-                if ids.is_empty() {
-                    expanded.push(target.clone());
-                } else {
-                    for id in ids {
-                        let s = id.to_string();
-                        if !expanded.contains(&s) {
-                            expanded.push(s);
-                        }
-                    }
-                }
-            }
-        } else {
-            let ids = tag_ids(target);
-            if ids.is_empty() {
-                expanded.push(target.clone());
-            } else {
-                for id in ids {
-                    let s = id.to_string();
-                    if !expanded.contains(&s) {
-                        expanded.push(s);
-                    }
-                }
-            }
-        }
-    }
-
-    expanded
+    expand_tag_targets_sync(
+        targets,
+        &narou_rs::native::novel_repository::NativeNovelRepository::new(),
+        TagExpansionVariant::Download,
+    )
 }
 
 pub(crate) struct RecordInfo {
@@ -373,58 +300,22 @@ enum ExistingDownloadState {
 }
 
 pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
-    let target = super::resolve_alias_target(target);
-    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let target_type = Downloader::get_target_type(&target);
-    match target_type {
-        TargetType::Id => {
-            if let Ok(id) = target.parse::<i64>() {
-                novels
-                    .get_sync(id.into())
-                    .ok()
-                    .flatten()
-                    .map(|r| RecordInfo {
-                        id: r.id,
-                        title: r.title,
-                        toc_url: r.toc_url,
-                    })
-            } else {
-                None
-            }
-        }
-        TargetType::Url => {
-            let toc_url = resolve_toc_url_from_url(&target)?;
-            novels
-                .find_by_toc_url_sync(&toc_url)
-                .ok()
-                .flatten()
-                .map(|r| RecordInfo {
-                    id: r.id,
-                    title: r.title,
-                    toc_url: r.toc_url,
-                })
-        }
-        TargetType::Ncode => {
-            novels
-                .find_by_ncode_sync(&target)
-                .ok()
-                .flatten()
-                .map(|r| RecordInfo {
-                    id: r.id,
-                    title: r.title,
-                    toc_url: r.toc_url,
-                })
-        }
-        _ => novels
-            .find_by_title_sync(&target)
-            .ok()
-            .flatten()
-            .map(|r| RecordInfo {
-                id: r.id,
-                title: r.title,
-                toc_url: r.toc_url,
-            }),
-    }
+    let aliases = super::load_alias_map();
+    let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
+    resolve_target_record_sync(
+        TargetLookupPlan::DOWNLOAD_CHECK,
+        &aliases,
+        UrlSource::Settings(&site_settings),
+        target,
+        &narou_rs::native::novel_repository::NativeNovelRepository::new(),
+    )
+    .ok()
+    .flatten()
+    .map(|record| RecordInfo {
+        id: record.id,
+        title: record.title,
+        toc_url: record.toc_url,
+    })
 }
 
 /// Whether `target` is already managed.
@@ -438,10 +329,7 @@ pub fn target_is_known(target: &str) -> bool {
     {
         return true;
     }
-    let settings = match narou_rs::downloader::site_setting::SiteSetting::load_all() {
-        Ok(settings) => settings,
-        Err(_) => return false,
-    };
+    let settings = narou_rs::downloader::site_setting::effective_site_settings();
     settings
         .iter()
         .filter(|setting| setting.matches_url(target))
@@ -457,17 +345,10 @@ pub fn target_is_known(target: &str) -> bool {
 }
 
 fn resolve_toc_url_from_url(target: &str) -> Option<String> {
-    let settings = narou_rs::downloader::site_setting::effective_site_settings();
-    for setting in &settings {
-        if setting.matches_url(target) {
-            return Some(
-                setting
-                    .toc_url_with_url_captures(target)
-                    .unwrap_or_else(|| setting.toc_url()),
-            );
-        }
-    }
-    None
+    narou_rs::application::target_lookup::first_matching_toc_url(
+        &narou_rs::downloader::site_setting::effective_site_settings(),
+        target,
+    )
 }
 
 fn inspect_existing_download(
@@ -487,6 +368,17 @@ fn inspect_existing_download(
     let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
     if novel_dir.exists() {
         return Some(ExistingDownloadState::Present(info));
+    }
+    // mirror-files=false の構成では、有効な作品でも保存フォルダが無い。
+    // ストアに本文 (toc.yaml) が残っているなら記録を消してはいけない。
+    // ストアを確認できないときも消さない (誤削除は再取得不能を招く)。
+    match narou_rs::native::object_store::novel_content_stored(&archive_root, &novel_dir) {
+        Ok(true) => return Some(ExistingDownloadState::Present(info)),
+        Ok(false) => {}
+        Err(err) => {
+            sink.emit(Stream::Stderr, &messages::indented_error(err));
+            return Some(ExistingDownloadState::Present(info));
+        }
     }
 
     if let Err(err) = novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(
@@ -669,6 +561,8 @@ fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::commands::download::{ExistingDownloadState, inspect_existing_download};
+
     use super::{EXIT_INTERRUPT, auto_convert_existing_download, parse_confirm_input};
     use narou_rs::downloader::{DownloadResult, UpdateStatus};
     use narou_rs::queue::{JobType, PersistentQueue};
@@ -761,6 +655,96 @@ mod tests {
             snapshot.jobs.front().map(|job| job.target.as_str()),
             Some("3062")
         );
+        *narou_rs::db::DATABASE.lock() = None;
+    }
+
+    /// mirror-files=false の有効な作品は、保存フォルダが無くても
+    /// 「ダウンロード済み」と判定され、記録を消されない。
+    #[test]
+    fn db_only_novel_is_present_without_folder_and_keeps_record() {
+        use narou_rs::application::messages::{MessageSink, Stream};
+        use narou_rs::native::sqlite::state;
+        use narou_rs::platform::{NovelMutation, NovelObjectKeys, ObjectStore};
+
+        struct TestSink;
+        impl MessageSink for TestSink {
+            fn emit(&self, _stream: Stream, _text: &str) {}
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let narou_dir = root.path().join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        state::write_mode(&narou_dir, state::StorageMode::Sqlite).unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(root.path());
+        narou_rs::db::init_database().unwrap();
+
+        let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+        {
+            use chrono::{TimeZone, Utc};
+            novels
+                .apply_batch_sync(vec![NovelMutation::Upsert(narou_rs::db::NovelRecord {
+                    id: 1,
+                    author: "author".to_string(),
+                    title: "DbOnly".to_string(),
+                    file_title: "db-only".to_string(),
+                    toc_url: "https://example.test/1".to_string(),
+                    sitename: "example.test".to_string(),
+                    novel_type: 1,
+                    end: false,
+                    last_update: Utc.with_ymd_and_hms(2026, 4, 20, 0, 0, 0).unwrap(),
+                    new_arrivals_date: None,
+                    use_subdirectory: false,
+                    general_firstup: None,
+                    novelupdated_at: None,
+                    general_lastup: None,
+                    last_mail_date: None,
+                    tags: Vec::new(),
+                    ncode: None,
+                    domain: None,
+                    general_all_no: None,
+                    length: None,
+                    suspend: false,
+                    is_narou: false,
+                    last_check_date: None,
+                    convert_failure: false,
+                    requires_login: false,
+                    login_session: None,
+                    extra_fields: Default::default(),
+                })])
+                .unwrap();
+        }
+
+        let archive_root = root.path().join("小説データ");
+        let keys = NovelObjectKeys::new("example.test", "db-only", false).unwrap();
+        let handle = state::active_for(&narou_dir).expect("sqlite state");
+        let mirror = narou_rs::native::object_store::NativeObjectStore::from_root(
+            archive_root.clone(),
+        )
+        .unwrap();
+        let store = narou_rs::native::sqlite::object_store::SqliteObjectStore::with_mirror_files(
+            handle.conn_ref().clone(),
+            mirror,
+            false,
+        );
+        futures::executor::block_on(store.write_small(
+            &keys.toc(),
+            b"title: DbOnly\nauthor: author\ntoc_url: https://example.test/1\nsubtitles: []\n"
+                .to_vec(),
+        ))
+        .unwrap();
+
+        let sink: std::sync::Arc<dyn MessageSink> = std::sync::Arc::new(TestSink);
+        let inspected = inspect_existing_download("1", &sink);
+        assert!(matches!(
+            inspected,
+            Some(ExistingDownloadState::Present(_))
+        ));
+        let kept = novels
+            .get_sync(1i64.into())
+            .unwrap()
+            .expect("DB-only record must not be deleted");
+        assert_eq!(kept.id, 1);
+
         *narou_rs::db::DATABASE.lock() = None;
     }
 }

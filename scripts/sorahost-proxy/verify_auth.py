@@ -82,8 +82,7 @@ def main() -> int:
     reachable = status is not None
 
     status, body = request(
-        "POST", f"{base}/proxy", token="wrong-token-for-check",
-        payload={"url": PROBE_URL, "redirect": "follow"},
+        "POST", f"{base}/proxy", token="wrong-token-for-check", payload={"url": PROBE_URL}
     )
     if status is None:
         print(f"::warning::/proxy に到達できません ({body[:120]})")
@@ -98,9 +97,7 @@ def main() -> int:
         print("::warning::SORAHOST_PROXY_KEY が未設定のため、合言葉の一致は確認できません")
         return 1 if FAILURES else 0
 
-    status, body = request(
-        "POST", f"{base}/proxy", token=key, payload={"url": PROBE_URL, "redirect": "follow"}
-    )
+    status, body = request("POST", f"{base}/proxy", token=key, payload={"url": PROBE_URL})
     if status is None:
         print(f"::warning::正しいトークンでの確認に到達できません ({body[:120]})")
     elif status == 200:

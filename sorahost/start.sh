@@ -8,6 +8,7 @@
 #   sorahost.json   配備の定義 (PteWorker が読む)
 #   start.sh        このスクリプト。`sorahost.json` の start が呼ぶ
 #   app/            実行ファイル + webnovel/ (配備で入れ替わる)
+#   bin/            同梱ツール + deploy-tools.json (固定バージョンとハッシュ)
 #   library/        narou のデータ (配備に含めない。作品・設定はここだけ)
 #
 # 公開は 2 通り:
@@ -74,9 +75,6 @@ LIB="${NAROU_RS_LIBRARY:-$VOLUME_DIR/narou-library}"
 BIN_DIR="$SELF_DIR/bin"
 TOKEN_FILE="${NAROU_CONNECTOR_TOKEN_FILE:-$VOLUME_DIR/.connector-token}"
 CF_BIN="$BIN_DIR/cloudflared"
-CF_TAG="2026.9.3"
-CF_SHA256="77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
-CF_URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_TAG}/cloudflared-linux-amd64"
 PUBLIC_HOST="${NAROU_PUBLIC_HOST:-}"
 
 # コネクタのトークンを先に解決する。トンネルの有無だけでは利用者認証を
@@ -248,6 +246,29 @@ trap cleanup EXIT
 # トークンは Cloudflare のダッシュボード (Networks → Tunnels) で発行し、.env に置く。
 # (トークン自体は先に解決済み)
 if [ -n "$NAROU_CONNECTOR" ]; then
+  # CI は bin/ に共通マニフェストを同梱する。リポジトリから直接起動する場合も
+  # 同じフラットな ASCII メタデータを読む。JSON の空白・改行の配置には依存しない。
+  DEPLOY_TOOLS="$BIN_DIR/deploy-tools.json"
+  if [ ! -f "$DEPLOY_TOOLS" ]; then
+    DEPLOY_TOOLS="$SELF_DIR/../scripts/deploy-tools.json"
+  fi
+  if [ ! -f "$DEPLOY_TOOLS" ]; then
+    echo "[narou] deploy-tools.json がありません (bin/ に同梱してください)" >&2
+    exit 1
+  fi
+  CF_TAG="$(tr -d '\r\n' < "$DEPLOY_TOOLS" | sed -n 's/.*"cloudflared_version"[[:space:]]*:[[:space:]]*"\([0-9.]*\)".*/\1/p')"
+  CF_SHA256="$(tr -d '\r\n' < "$DEPLOY_TOOLS" | sed -n 's/.*"cloudflared_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p')"
+  case "$CF_TAG" in
+    ''|*[!0-9.]*)
+      echo "[narou] deploy-tools.json の cloudflared_version が不正です" >&2
+      exit 1
+      ;;
+  esac
+  if [ "${#CF_SHA256}" -ne 64 ]; then
+    echo "[narou] deploy-tools.json の cloudflared_sha256 が不正です" >&2
+    exit 1
+  fi
+  CF_URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_TAG}/cloudflared-linux-amd64"
   mkdir -p "$BIN_DIR"
   if [ ! -x "$CF_BIN" ]; then
     echo "[narou] コネクタ (cloudflared) ${CF_TAG} を取得します"

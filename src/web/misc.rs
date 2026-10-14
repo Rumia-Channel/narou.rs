@@ -5,7 +5,12 @@ use axum::{
 };
 use reqwest::header::USER_AGENT;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use crate::application::web_payloads::version_update_available;
+use crate::application::webui::mutations::{MutationNotice, mutation_events};
+use crate::application::webui::notepad::{
+    notepad_conflict_payload, notepad_object_id, notepad_response_value, notepad_saved_payload,
+};
+use crate::application::webui::tag_views::{tag_count_ordering, tag_list_html};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,7 +23,6 @@ use super::sort_state::{
     current_sort_from_server_setting, default_current_sort_state, normalize_current_sort_request,
 };
 use super::state::{ApiResponse, LogsParams};
-use super::{html_escape, tag_color_class};
 
 #[derive(Debug, Deserialize)]
 pub struct TagListParams {
@@ -32,11 +36,11 @@ pub struct HistoryParams {
 }
 
 pub async fn version_current(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    Json(version::version_json())
+    Json(version::version_info().current())
 }
 
 pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let current = version::create_version_string();
+    let info = version::version_info();
     let repo = "Rumia-Channel/narou.rs";
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let client = reqwest::Client::builder()
@@ -55,51 +59,26 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
                 .or_else(|| json["name"].as_str())
                 .map(version::version_core)
                 .unwrap_or_default();
-            let current_plain = version::version_core(&current);
-            let develop = !version::commit_version_exists();
-            let local_build = version::is_local_build();
-            let container = version::is_container_runtime();
-            let self_update_supported = version::self_update_unavailable_reason().is_none();
-            Json(serde_json::json!({
-                "success": true,
-                "current_version": current,
-                "latest_version": latest,
-                "update_available": version_is_newer(&latest, &current_plain),
-                "develop": develop,
-                "local_build": local_build,
-                "container": container,
-                "self_update_supported": self_update_supported,
-                "self_update_unavailable_reason": version::self_update_unavailable_reason(),
-                "build_variant": version::BUILD_VARIANT,
-                "variant_choice_required": crate::native::self_update::variant_choice_required(),
-                "url": json["html_url"].as_str().unwrap_or("https://github.com/Rumia-Channel/narou.rs/releases/latest"),
-            }))
+            let current_plain = version::version_core(&info.version);
+            let update_available = version_update_available(&latest, &current_plain);
+            Json(info.latest(
+                &latest,
+                update_available,
+                json["html_url"]
+                    .as_str()
+                    .unwrap_or("https://github.com/Rumia-Channel/narou.rs/releases/latest"),
+                version::self_update_unavailable_reason(),
+                crate::native::self_update::variant_choice_required(),
+            ))
         }
-        Ok(resp) => Json(serde_json::json!({
-            "success": false,
-            "current_version": current,
-            "message": format!("latest version request failed: {}", resp.status()),
-            "url": "https://github.com/Rumia-Channel/narou.rs/releases/latest",
-        })),
-        Err(e) => Json(serde_json::json!({
-            "success": false,
-            "current_version": current,
-            "message": e.to_string(),
-            "url": "https://github.com/Rumia-Channel/narou.rs/releases/latest",
-        })),
-    }
-}
-
-/// Numeric semver-style comparison: `latest` is an update only when it is
-/// strictly newer than `current`. Falls back to inequality when either side
-/// has no parseable version core.
-fn version_is_newer(latest: &str, current: &str) -> bool {
-    if latest.is_empty() {
-        return false;
-    }
-    match version::version_compare(latest, current) {
-        Some(ord) => ord == std::cmp::Ordering::Greater,
-        None => latest != current,
+        Ok(resp) => Json(info.latest_failure(
+            &format!("latest version request failed: {}", resp.status()),
+            "https://github.com/Rumia-Channel/narou.rs/releases/latest",
+        )),
+        Err(e) => Json(info.latest_failure(
+            &e.to_string(),
+            "https://github.com/Rumia-Channel/narou.rs/releases/latest",
+        )),
     }
 }
 
@@ -143,18 +122,6 @@ fn read_notepad() -> String {
         .unwrap_or_default()
 }
 
-fn write_notepad(content: &str) -> std::io::Result<()> {
-    if let Some(state) = notepad_state() {
-        return state
-            .set_raw("inv", "notepad", content)
-            .map_err(|error| std::io::Error::other(error.to_string()));
-    }
-    let path = notepad_path().map_err(|error| std::io::Error::other(error.to_string()))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, content)
-}
 
 fn read_notepad_content(path: &Path) -> std::io::Result<String> {
     match std::fs::read_to_string(path) {
@@ -165,25 +132,51 @@ fn read_notepad_content(path: &Path) -> std::io::Result<String> {
 }
 
 pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let setting = |name: &'static str| async {
-        state.services.settings.get(name).await.ok().flatten()
+    // 依存の無い設定は 1 回の `get_many` にまとめる (スコープごとに 1 回だけ
+    // ストアを読む)。
+    const CONFIG_NAMES: &[&str] = &[
+        "webui.theme",
+        "webui.performance-mode",
+        "webui.table.reload-timing",
+        "webui.debug-mode",
+        "concurrency",
+    ];
+    let loaded: Vec<Option<serde_yaml::Value>> = state
+        .services
+        .settings
+        .get_many(CONFIG_NAMES)
+        .await
+        .unwrap_or_default();
+    let find = |name: &str| {
+        CONFIG_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+            .and_then(|index| loaded.get(index).cloned().flatten())
     };
     let string_value = |value: Option<serde_yaml::Value>, default: &str| {
         value
             .and_then(|value| value.as_str().map(str::to_owned))
             .unwrap_or_else(|| default.to_string())
     };
-    let theme = string_value(setting("webui.theme").await, "Cerulean");
-    let performance_mode = string_value(setting("webui.performance-mode").await, "auto");
-    let reload_timing = string_value(setting("webui.table.reload-timing").await, "every");
-    let debug_mode = setting("webui.debug-mode")
-        .await
-        .and_then(|value| value.as_bool())
+    let theme = string_value(find("webui.theme"), "Cerulean");
+    let performance_mode = string_value(find("webui.performance-mode"), "auto");
+    let reload_timing = string_value(find("webui.table.reload-timing"), "every");
+    let debug_mode = find("webui.debug-mode")
+        .and_then(|value| crate::setting_core::setting_bool_value(&value))
         .unwrap_or(false);
-    let concurrency_enabled = setting("concurrency")
-        .await
-        .and_then(|value| value.as_bool())
+    let concurrency_enabled = find("concurrency")
+        .and_then(|value| crate::setting_core::setting_bool_value(&value))
         .unwrap_or(false);
+
+    // 能力宣言 (共有定義)。端末一覧だけは実行時の外部ツール検出値を使う。
+    let capabilities = crate::application::webui::capabilities::WebUiCapabilities::native(
+        crate::converter::device::OutputManager::available_devices()
+            .into_iter()
+            .map(|(name, available)| {
+                crate::application::webui::capabilities::DeviceChoice { name: name.into(), available }
+            })
+            .collect(),
+    );
 
     Json(serde_json::json!({
         "theme": theme,
@@ -193,6 +186,14 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
         "ws_port": state.ws_port,
         "port": state.port,
         "concurrency_enabled": concurrency_enabled,
+        // native の注記 (Worker の応答と同じキーを native 値で返す):
+        // `concurrency` は実行レーンの分離、keep-txt の既定 true、
+        // retry の配備上限なし。
+        "concurrency_scope": "lanes",
+        "convert_keep_txt_default": true,
+        "queue_max_retries_limit": serde_json::Value::Null,
+        "capabilities": serde_json::to_value(&capabilities)
+            .expect("capabilities serialization is infallible"),
     }))
 }
 
@@ -209,7 +210,9 @@ pub async fn tag_list(
         }
     }
     let mut list: Vec<(String, usize)> = counts.into_iter().collect();
-    list.sort_by_key(|item| std::cmp::Reverse(item.1));
+    // 件数降順、同数はタグ名の昇順 (Worker の SQL と同じ規則 — 新規タグへの
+    // 色割り当ても並び順に依存するため、両ランタイムで一致させる)。
+    list.sort_by(tag_count_ordering);
     let tags = list.into_iter().map(|(tag, _)| tag).collect::<Vec<_>>();
     let tag_colors = state
         .services
@@ -222,20 +225,7 @@ pub async fn tag_list(
         return Json(serde_json::json!({ "tags": tags, "tag_colors": tag_colors })).into_response();
     }
 
-    let mut html = String::from(
-        "<div><span class=\"tag-label tag-default tag-reset\" data-tag=\"\">タグ検索を解除</span></div>\
-<div class=\"text-muted\" style=\"font-size:0.8em\">Altキーを押しながらで除外検索</div>",
-    );
-    for tag in &tags {
-        let escaped_tag = html_escape(tag);
-        let class = tag_color_class(tag_colors.get(tag).map(String::as_str).unwrap_or("default"));
-        html.push_str(&format!(
-            "<div><span class=\"tag-label {}\" data-tag=\"{}\">{}</span> \
-<span class=\"select-color-button\" data-target-tag=\"{}\"><span class=\"tag-label {} tag-fixed-width\">a</span></span></div>",
-            class, escaped_tag, escaped_tag, escaped_tag, class
-        ));
-    }
-    Html(html).into_response()
+    Html(tag_list_html(&tags, &tag_colors)).into_response()
 }
 
 pub async fn tag_change_color(
@@ -310,88 +300,34 @@ pub async fn notepad_save(
             "message": message,
         }));
     }
-    let state_db = notepad_state();
-    if state_db.is_none() {
-        // Legacy file flow (pre-DB libraries / legacy escape hatch).
-        let path = match notepad_path() {
-            Ok(path) => path,
-            Err(e) => {
-                return Json(serde_json::json!({
-                    "success": false,
-                    "message": e.to_string(),
-                }));
-            }
-        };
-        if let Some(parent) = path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            return Json(serde_json::json!({
-                "success": false,
-                "message": e.to_string(),
-            }));
-        }
-    }
-    let current_content = read_notepad();
-    let current_object_id = notepad_object_id(&current_content);
     let request_object_id = body["object_id"].as_str().unwrap_or("");
-
-    if request_object_id != current_object_id {
-        return Json(serde_json::json!({
-            "success": false,
-            "conflict": true,
-            "message": "他の画面でメモ帳が更新されたため再読み込みしました。内容を確認してからもう一度保存してください",
-            "content": current_content,
-            "text": current_content,
-            "object_id": current_object_id,
-        }));
-    }
-
-    let result = if let Some(ref db) = state_db {
-        db.set_raw("inv", "notepad", content)
-            .map_err(|error| std::io::Error::other(error.to_string()))
-    } else {
-        write_notepad(content)
+    let update = |current: &str| {
+        if request_object_id != notepad_object_id(current) {
+            return Ok((current.to_string(), notepad_conflict_payload(current)));
+        }
+        Ok((content.to_string(), notepad_saved_payload(content)))
     };
-    let object_id = notepad_object_id(content);
-    let response = serde_json::json!({
-        "content": content,
-        "text": content,
-        "object_id": object_id,
-    });
-
+    let result = if let Some(db) = notepad_state() {
+        db.update_raw("inv", "notepad", update)
+    } else {
+        notepad_path().and_then(|path| {
+            crate::db::inventory::with_locked_file_update(&path, update)
+        })
+    };
     match result {
-        Ok(_) => {
-            state.push_server.broadcast_raw(&serde_json::json!({
-                "type": "notepad.change",
-                "data": response.clone(),
-            }));
-            Json(serde_json::json!({
-                "success": true,
-                "message": "Saved",
-                "content": content,
-                "text": content,
-                "object_id": response["object_id"].clone(),
-            }))
+        Ok((_, payload)) => {
+            if payload["success"] == true {
+                for event in mutation_events(MutationNotice::Notepad { content }) {
+                    state.push_server.broadcast_raw(event);
+                }
+            }
+            Json(payload)
         }
         Err(e) => Json(serde_json::json!({
             "success": false,
             "message": e.to_string(),
         })),
     }
-}
-
-fn notepad_object_id(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-fn notepad_response_value(content: &str) -> serde_json::Value {
-    serde_json::json!({
-        "content": content,
-        "text": content,
-        "object_id": notepad_object_id(content),
-    })
 }
 
 pub async fn recent_logs(

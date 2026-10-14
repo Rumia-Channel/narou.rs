@@ -297,24 +297,12 @@ pub fn load_local_setting_string(key: &str) -> Option<String> {
 /// false のときだけ切る」ために使う。
 pub fn load_local_setting_bool_or(key: &str, default: bool) -> bool {
     load_local_setting_value(key)
-        .and_then(|v| match v {
-            serde_yaml::Value::Bool(b) => Some(b),
-            serde_yaml::Value::String(s) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
-            serde_yaml::Value::Number(n) => Some(n.as_i64().unwrap_or(0) != 0),
-            _ => None,
-        })
+        .and_then(|v| crate::setting_core::setting_bool_value(&v))
         .unwrap_or(default)
 }
 
 pub fn load_local_setting_bool(key: &str) -> bool {
-    load_local_setting_value(key)
-        .and_then(|v| match v {
-            serde_yaml::Value::Bool(b) => Some(b),
-            serde_yaml::Value::String(s) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
-            serde_yaml::Value::Number(n) => Some(n.as_i64().unwrap_or(0) != 0),
-            _ => None,
-        })
-        .unwrap_or(false)
+    load_local_setting_bool_or(key, false)
 }
 
 pub fn relay_web_stream_to_console<R: io::Read>(
@@ -492,7 +480,11 @@ fn current_lock_timestamp() -> serde_yaml::Value {
 pub fn record_is_frozen(record: &crate::db::NovelRecord, frozen_ids: &HashSet<i64>) -> bool {
     // upstream の Narou.novel_frozen? は freeze inventory だけを見る。
     // `frozen` という名前のタグは upstream では意味を持たない。
-    frozen_ids.contains(&record.id)
+    crate::platform::repository::record_is_frozen(
+        record,
+        Some(frozen_ids),
+        crate::platform::repository::FreezeReadMode::InventoryOnly,
+    )
 }
 
 pub fn is_frozen_id(id: i64) -> bool {
@@ -543,9 +535,7 @@ pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
             // upstream: `narou tag --add 404` + `narou freeze --on`。
             // freeze 側は freeze.yaml だけを更新するので `frozen` タグは付けない。
             frozen_list.insert(id, serde_yaml::Value::Bool(true));
-            if !updated.tags.iter().any(|tag| tag == "404") {
-                updated.tags.push("404".to_string());
-            }
+            crate::application::novel_actions::mark_not_found(&mut updated);
 
             db.insert(updated.clone());
             Ok((frozen_list, ()))
@@ -715,7 +705,7 @@ pub fn convert_existing_novel(
             } else {
                 NovelConverter::new(settings)
             };
-        converter.set_progress(Box::new(crate::progress::NoProgress));
+        converter.set_progress(Box::new(crate::platform::progress::NoProgress));
 
         let output_path = match device {
             Some(device) => converter

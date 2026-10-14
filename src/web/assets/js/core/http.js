@@ -1,5 +1,5 @@
-export async function fetchJson(url) {
-  const response = await request(url);
+export async function fetchJson(url, options = {}) {
+  const response = await request(url, options);
   return response.json();
 }
 
@@ -20,9 +20,24 @@ export async function request(url, options = {}) {
     if (isAuthenticationRequired(response, envelope)) {
       redirectToLogin();
     }
-    throw new Error(envelope.message || `${response.status} ${response.statusText}`);
+    const error = new Error(envelope.message || `${response.status} ${response.statusText}`);
+    error.status = response.status;
+    error.data = envelope.data;
+    error.code = envelope.code;
+    throw error;
   }
   return response;
+}
+
+export function assertApiSuccess(result, fallbackMessage = "操作に失敗しました") {
+  if (result && typeof result === "object" && result.success === false) {
+    const error = new Error(result.error?.message || result.message
+      || (typeof result.error === "string" ? result.error : "") || fallbackMessage);
+    error.data = result;
+    error.code = result.error?.code || result.code || "";
+    throw error;
+  }
+  return result;
 }
 
 /**
@@ -30,17 +45,18 @@ export async function request(url, options = {}) {
  * Worker は `{error: {code, message}}`、native は平文を返す。
  */
 function parseErrorEnvelope(text) {
-  if (!text) return { code: "", message: "" };
+  if (!text) return { code: "", message: "", data: null };
   try {
     const parsed = JSON.parse(text);
     const error = parsed && parsed.error;
     const code = error && typeof error.code === "string" ? error.code : "";
     const nested = error && typeof error.message === "string" ? error.message : "";
     const top = parsed && typeof parsed.message === "string" ? parsed.message : "";
-    return { code, message: nested || top || text };
+    const plainError = typeof error === "string" ? error : "";
+    return { code, message: nested || top || plainError || text, data: parsed };
   } catch (_) {
     // JSON でない応答 (native の平文エラーなど) はそのまま見せる。
-    return { code: "", message: text };
+    return { code: "", message: text, data: text };
   }
 }
 

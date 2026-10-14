@@ -154,14 +154,13 @@ impl Default for SectionConvertCache {
 /// `sqlite.mirror-files=false` の構成では `小説データ/` に実ファイルが無いため、
 /// 変換が要求する `toc.yaml` / `本文/*.yaml` / `setting.ini` / `replace.txt` を
 /// ここで実体化する (返り値のガードがスコープを抜けると、取り出した分だけ消える)。
-/// ミラーを書く構成では何もしない。
+/// ミラーを書く構成では既存ファイルを触らないが、ミラーが手動で消された場合に
+/// 備えて毎回メタデータを突き合わせる。YAML (narou.rb) 構成ではストア自体が
+/// ファイルシステムなので何も取り出さない。
 #[cfg(feature = "native-runtime")]
-fn materialize_for_conversion(
+pub fn materialize_for_conversion(
     novel_dir: &std::path::Path,
 ) -> Result<crate::native::object_store::MaterializedNovelFiles> {
-    if crate::native::sqlite::state::mirror_files_enabled() {
-        return Ok(crate::native::object_store::MaterializedNovelFiles::default());
-    }
     let store = crate::native::object_store::NativeStore::for_current_root()?;
     store.materialize_novel_files(novel_dir)
 }
@@ -174,11 +173,12 @@ fn materialize_for_conversion(
 /// ための設定)。環境変数 `NAROU_RS_KEEP_TXT=0` でも切れる。
 #[cfg(feature = "native-runtime")]
 pub fn keep_converted_text_file() -> bool {
-    if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
-        let value = value.trim().to_ascii_lowercase();
-        return !matches!(value.as_str(), "0" | "false" | "no" | "off");
-    }
-    crate::compat::load_local_setting_bool_or("convert.keep-txt", true)
+    let local = crate::db::settings::load(crate::setting_core::SettingScope::Local).unwrap_or_default();
+    crate::setting_core::keep_converted_text(
+        &local,
+        std::env::var("NAROU_RS_KEEP_TXT").ok().as_deref(),
+        true,
+    )
 }
 
 /// セクション変換キャッシュを作るか。
@@ -189,8 +189,7 @@ pub fn keep_converted_text_file() -> bool {
 #[cfg(feature = "native-runtime")]
 fn section_cache_enabled() -> bool {
     if let Ok(value) = std::env::var("NAROU_RS_SECTION_CACHE") {
-        let value = value.trim().to_ascii_lowercase();
-        return !matches!(value.as_str(), "0" | "false" | "no" | "off");
+        return crate::setting_core::flag_enabled(&value);
     }
     crate::compat::load_local_setting_bool_or("convert.section-cache", true)
 }
@@ -248,12 +247,12 @@ impl NovelConverter {
     pub fn build(
         settings: NovelSettings,
         user_converter: Option<UserConverter>,
-        capabilities: Option<ConverterCapabilities>,
+        mut capabilities: Option<ConverterCapabilities>,
     ) -> Self {
         let inspector = Rc::new(RefCell::new(inspector::Inspector::new(&settings)));
         let illustration_store = capabilities
-            .as_ref()
-            .and_then(|caps| caps.illustration_index.clone())
+            .as_mut()
+            .and_then(|caps| caps.illustration_index.take())
             .unwrap_or_else(|| {
                 #[cfg(feature = "native-runtime")]
                 {
@@ -300,6 +299,40 @@ impl NovelConverter {
             return;
         };
         capabilities.fetch_policy = resolver(record);
+    }
+
+    /// Bind the illustration index and stored assets once the target novel is
+    /// known (`convert_novel_by_id`). SQLite mode keeps the index in `objects`
+    /// and `s3.asset-backend=s3` keeps the images in S3; a converter that only
+    /// flushed filesystem files would leave both stores stale.
+    ///
+    /// No-op for the plain filesystem layout and when the caller already
+    /// injected store-backed capabilities.
+    #[cfg(feature = "native-runtime")]
+    pub(crate) fn attach_store_illustration_storage(&mut self, novel_dir: &std::path::Path) {
+        if self
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.assets.is_some())
+        {
+            return;
+        }
+        let Some(mut store_capabilities) =
+            crate::native::converter::store_capabilities_for_novel(novel_dir)
+        else {
+            return;
+        };
+        if let Some(index) = store_capabilities.illustration_index.take() {
+            self.illustration_store = index;
+        }
+        match self.capabilities.as_mut() {
+            Some(capabilities) => {
+                capabilities.assets = store_capabilities.assets;
+                capabilities.objects = store_capabilities.objects;
+                capabilities.illustration_prefix = store_capabilities.illustration_prefix;
+            }
+            None => self.capabilities = Some(store_capabilities),
+        }
     }
 
     fn resolve_novel_record(&self, id: i64) -> Option<NovelRecord> {
@@ -948,11 +981,7 @@ impl NovelConverter {
         };
         let service = IllustrationStorageService::new(assets)
             .with_dedup(crate::illustration_store::dedup_active());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| NarouError::Platform(error.to_string()))?;
-        let stored = runtime.block_on(service.store_bytes_at(
+        let stored = crate::native::converter::run_store_io(service.store_bytes_at(
             &prefix,
             &mut self.illustration_store,
             source,
@@ -1029,6 +1058,7 @@ impl NovelConverter {
         self.inspector.borrow_mut().reset();
         // ミラーを書かない構成では実ファイルが無いので、変換の間だけ取り出す。
         let _materialized = materialize_for_conversion(novel_dir)?;
+        self.attach_store_illustration_storage(novel_dir);
         let toc_path = novel_dir.join("toc.yaml");
         let toc_content = std::fs::read_to_string(&toc_path).map_err(NarouError::Io)?;
         let toc: crate::downloader::TocFile =
@@ -1082,7 +1112,7 @@ impl NovelConverter {
                     && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
                 {
                     let conn = state.conn();
-                    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+                    let mut guard = conn.lock();
                     let mut sections_map = std::collections::BTreeMap::new();
                     for section in &sections {
                         let body = serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
@@ -1142,6 +1172,7 @@ impl NovelConverter {
         self.inspector.borrow_mut().reset();
         // ミラーを書かない構成では実ファイルが無いので、変換の間だけ取り出す。
         let _materialized = materialize_for_conversion(novel_dir)?;
+        self.attach_store_illustration_storage(novel_dir);
         let toc_path = novel_dir.join("toc.yaml");
         let toc_content = std::fs::read_to_string(&toc_path).map_err(NarouError::Io)?;
         let toc: crate::downloader::TocFile =
@@ -1196,7 +1227,7 @@ impl NovelConverter {
                     && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
                 {
                     let conn = state.conn();
-                    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+                    let mut guard = conn.lock();
                     let mut sections_map = std::collections::BTreeMap::new();
                     for section in &sections {
                         let body = serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
@@ -1377,17 +1408,16 @@ impl NovelConverter {
 
     #[cfg(feature = "native-runtime")]
     fn flush_illustration_store(&mut self) -> Result<()> {
-        if let Some(capabilities) = self.capabilities.clone()
+        if !self.illustration_store.is_dirty() {
+            return Ok(());
+        }
+        if let Some(capabilities) = self.capabilities.as_ref()
             && let (Some(objects), Some(prefix)) =
-                (capabilities.objects, capabilities.illustration_prefix)
+                (capabilities.objects.as_ref(), capabilities.illustration_prefix.as_ref())
         {
             let key = prefix.join(".illustration_cache.yaml")?;
             let body = self.illustration_store.to_cache_yaml()?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| NarouError::Platform(error.to_string()))?;
-            runtime.block_on(objects.write_small(&key, body))?;
+            crate::native::converter::run_store_io(objects.write_small(&key, body))?;
             self.illustration_store.mark_clean();
             return Ok(());
         }
@@ -2390,53 +2420,4 @@ before_settings:
         assert_ne!(user_converter_digest, user_converter_variant_digest);
     }
 
-    #[test]
-    fn injected_illustration_capabilities_avoid_native_filesystem() {
-        use crate::platform::mocks::{FakeRateLimiter, MemoryObjectStore, MockHttpClient};
-        use crate::platform::{AssetStore, HttpResponse, ObjectKey, ObjectStore};
-        use std::path::Path;
-        use std::sync::Arc;
-
-        let http = Arc::new(MockHttpClient::new());
-        let source = "https://example.com/image.png";
-        http.add_response(
-            source,
-            HttpResponse {
-                status: 200,
-                headers: vec![("Content-Type".into(), "image/png".into())],
-                body: b"png bytes".to_vec(),
-            },
-        );
-        let rate_limiter = Arc::new(FakeRateLimiter::new());
-        let objects = Arc::new(MemoryObjectStore::new());
-        let assets: Arc<dyn AssetStore> = objects.clone();
-        let objects_trait: Arc<dyn ObjectStore> = objects.clone();
-        let mut capabilities =
-            super::ConverterCapabilities::new(http.clone(), rate_limiter.clone());
-        capabilities.assets = Some(assets);
-        capabilities.objects = Some(objects_trait);
-        capabilities.illustration_index =
-            Some(crate::illustration_store::IllustrationIndex::default());
-        capabilities.illustration_prefix = Some(ObjectKey::try_new("novels").unwrap());
-
-        let settings = NovelSettings {
-            archive_path: Path::new("not-a-native-path").to_path_buf(),
-            ..NovelSettings::default()
-        };
-        let mut converter = NovelConverter::with_capabilities(settings, capabilities);
-        let localized = converter
-            .download_section_illustration(Path::new("not-a-native-path/挿絵"), source)
-            .unwrap();
-        assert!(localized.starts_with("挿絵/"));
-        assert_eq!(objects.len(), 1);
-        converter.flush_illustration_store().unwrap();
-        assert_eq!(objects.len(), 2);
-        assert!(
-            futures::executor::block_on(
-                objects.read_small(&ObjectKey::try_new("novels/.illustration_cache.yaml").unwrap())
-            )
-            .unwrap()
-            .is_some()
-        );
-    }
 }

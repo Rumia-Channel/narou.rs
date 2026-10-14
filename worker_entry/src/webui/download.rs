@@ -5,7 +5,8 @@
 //! - body: `{"targets": ["n1234ab" | id | URL | タイトル | 別名, ...], "force"?,
 //!   "mail"?}` (`DownloadBody`)。
 //! - success: HTTP 200 `{"success": true, "results": [{"target", "job_id",
-//!   "status": "queued"}]}` — one entry per input target, in request order.
+//!   "status": "queued"}]}` — one entry per queued novel, grouped in input
+//!   order. Series members retain the original input in `target`.
 //! - validation / enqueue failure: HTTP 200 `{"success": false, "message",
 //!   "results": []}` — the native handler reports every request-level failure
 //!   this way (never a 4xx/5xx for a well-formed request body).
@@ -46,6 +47,7 @@ use narou_rs::application::aliases::{
     ALIAS_INVENTORY_KEY, ALIAS_INVENTORY_SCOPE, parse_alias_map, resolve_alias_target,
 };
 use narou_rs::application::{JobKind, JobPlan, JobTarget};
+use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::platform::NovelId;
 use serde::Deserialize;
 use serde_json::json;
@@ -90,7 +92,11 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     };
 
     // `super::max_web_targets` parity: same setting key, same fallback.
-    let max_targets = super::max_web_targets(&runtime).await;
+    // 件数上限の設定読み取りと別名表の読み込みは独立なので同時に読む。
+    let (max_targets, aliases) = futures::join!(
+        super::max_web_targets(&runtime),
+        load_aliases(&env),
+    );
 
     // `queue_download_jobs` → `validate_download_targets` parity.
     if let Err(message) = validate_download_targets(&body.targets, max_targets) {
@@ -119,7 +125,6 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     // `--mail` は上の 501 で拒否されるので積まない (積っても実行経路に
     // 消費者が無く、送信されない要求を黙って受理することになる)。
 
-    let aliases = load_aliases(&env).await;
     let mut plans = Vec::with_capacity(body.targets.len());
     for target in &body.targets {
         match resolve_plan_target(&runtime, &aliases, target).await {
@@ -133,18 +138,32 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
             Err(message) => return download_failure(&message),
         }
     }
+    let plans = match runtime.expand_download_plans(plans).await {
+        Ok(plans) => plans,
+        Err(error) => return download_failure(&error.to_string()),
+    };
 
     // `push_batch` parity: enqueue through the shared ledger + Queue binding;
     // an enqueue failure reports the error string as the message (native does
-    // `map_err(|e| e.to_string())` into the same response shape).
-    let mut results = Vec::with_capacity(plans.len());
-    for (target, plan) in body.targets.iter().zip(plans.iter()) {
-        let outcome = match runtime.enqueue_plan(plan.clone()).await {
-            Ok(outcome) => outcome,
-            Err(error) => return download_failure(&error.to_string()),
-        };
+    // `map_err(|e| e.to_string())` into the same response shape). 展開後の
+    // 全メンバーを 1 回の bounded batch で投入し、結果は入力順・グループ順の
+    // まま並べる。
+    let mut batch: Vec<JobPlan> = Vec::new();
+    let mut labels: Vec<usize> = Vec::new();
+    for (index, members) in plans.into_iter().enumerate() {
+        for plan in members {
+            labels.push(index);
+            batch.push(plan);
+        }
+    }
+    let outcomes = match runtime.enqueue_batch(&batch).await {
+        Ok(outcomes) => outcomes,
+        Err(error) => return download_failure(&error.to_string()),
+    };
+    let mut results = Vec::with_capacity(batch.len());
+    for (index, outcome) in labels.iter().zip(outcomes) {
         results.push(json!({
-            "target": target,
+            "target": &body.targets[*index],
             "job_id": outcome.job_id,
             "status": "queued",
         }));
@@ -256,21 +275,26 @@ async fn resolve_plan_target(
 
     // `TargetType::Other` parity: the downloader would try title first, then
     // ncode, against the library. Resolve to the record id now since the
-    // ledger cannot store a title target.
+    // ledger cannot store a title target. `validate_target` が正規化できない
+    // id / ncode / URL 形は ledger 行として表現できないので、native の
+    // unresolved target と同じく拒否する。
+    if !matches!(Downloader::get_target_type(effective), TargetType::Other) {
+        return Err("invalid download target".to_string());
+    }
     // enqueue 判断の材料なので primary + キャッシュ無しで読む。
+    // title→ncode の順は `TargetLookupPlan::DOWNLOAD` が唯一の定義
+    // (この経路は Other 専用なので URL 解決は起きない)。
     let library = &runtime.write_services().library;
-    let existing = match library
-        .find_by_title(effective)
+    let existing = library
+        .resolve_target(
+            narou_rs::application::target_lookup::TargetLookupPlan::DOWNLOAD,
+            aliases,
+            narou_rs::application::target_lookup::UrlSource::Settings(&[]),
+            effective,
+        )
         .await
         .map_err(|error| error.to_string())?
-    {
-        Some(record) => Some(record.id),
-        None => library
-            .find_by_ncode(effective)
-            .await
-            .map_err(|error| error.to_string())?
-            .map(|record| record.id),
-    };
+        .map(|record| record.id);
     match existing {
         Some(id) => Ok(JobTarget::Id(NovelId(id))),
         None => Err("invalid download target".to_string()),

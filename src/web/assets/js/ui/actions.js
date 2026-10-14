@@ -3,7 +3,9 @@
  * Mirrors narou.rb's full set of UI interactions.
  */
 import { State, El, lsSet, lsBool } from '../core/state.js';
-import { fetchJson, postJson } from '../core/http.js';
+import { fetchJson, postJson, request, assertApiSuccess } from '../core/http.js';
+import { createNotepadEditor } from '../core/notepad.js';
+import { persistSortState, postSortedJson } from '../core/sort_state.js';
 import { toggleLanguage } from './i18n.js';
 import { openFeatureTour } from './feature_tour.js';
 import {
@@ -29,18 +31,19 @@ const TAG_COLOR_MAP = {
   red: 'tag-red',
   white: 'tag-white',
 };
-const SORT_STATE_COLUMN_INDEX = {
-  id: 0,
-  last_update: 1,
-  general_lastup: 2,
-  last_check_date: 3,
-  title: 4,
-  author: 5,
-  sitename: 6,
-  novel_type: 7,
-  general_all_no: 9,
-  length: 10,
-};
+let notepadEditor = null;
+let notepadOpenGeneration = 0;
+let tagEditorGeneration = 0;
+let tagReadGeneration = 0;
+let tagMutationPending = false;
+let diffGeneration = 0;
+let removeTransaction = null;
+let removePending = false;
+let themeGeneration = 0;
+let themeSaveTail = Promise.resolve();
+let acknowledgedTheme = null;
+let themeReadGeneration = 0;
+let themePendingSaves = 0;
 
 export function bindActions() {
   applyColumnVisibility();
@@ -69,6 +72,8 @@ export function bindActions() {
     El.consoleStdout2?.classList.toggle('expanded');
     State.consoleExpanded = !State.consoleExpanded;
     El.console?.closest('.console-panes')?.classList.toggle('expanded', State.consoleExpanded);
+    El.consoleExpand?.setAttribute('aria-expanded', String(State.consoleExpanded));
+    El.consoleExpand?.setAttribute('aria-label', State.consoleExpanded ? 'コンソールを縮小' : 'コンソールを拡大');
     // Toggle icon
     const expand = El.consoleExpand?.querySelector('.expand-icon');
     const collapse = El.consoleExpand?.querySelector('.collapse-icon');
@@ -83,6 +88,7 @@ export function bindActions() {
   });
 
   El.consoleHistory?.addEventListener('click', async () => {
+    const revision = ++State.consoleRevision;
     try {
       const mainData = await fetchJson('/api/history?format=json');
       assertHistoryPayload(mainData);
@@ -91,6 +97,7 @@ export function bindActions() {
         subData = await fetchJson('/api/history?format=json&stream=stdout2');
         assertHistoryPayload(subData);
       }
+      if (revision !== State.consoleRevision) return;
       if (El.console) {
         replaceConsoleHistory(El.console, mainData.history);
       }
@@ -98,6 +105,7 @@ export function bindActions() {
         replaceConsoleHistory(El.consoleStdout2, subData.history);
       }
     } catch (error) {
+      if (revision !== State.consoleRevision) return;
       showNotification(error.message || '履歴の取得に失敗しました', 'error');
     }
   });
@@ -172,8 +180,7 @@ export function bindActions() {
   on('action-view-toggle-buttons-top', () => {
     State.buttonsTop = !State.buttonsTop;
     lsSet('buttons-top', String(State.buttonsTop));
-    const cp = El.controlPanel;
-    if (cp) cp.classList.toggle('hide', !State.buttonsTop);
+    El.controlPanel?.classList.toggle('hide', !State.buttonsTop);
     syncViewChecks();
   });
 
@@ -263,9 +270,12 @@ export function bindActions() {
 
   on('action-option-about', openAbout);
 
-  on('action-option-shutdown', async () => {
+  on('action-option-shutdown', async (e) => {
     if (!confirm('サーバをシャットダウンしますか？')) return;
-    await postJson('/api/shutdown', {});
+    await runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/shutdown', {});
+      assertApiSuccess(result, 'サーバを停止できませんでした');
+    }, 'サーバを停止できませんでした');
   });
 
   on('action-option-server-reboot', async () => {
@@ -284,22 +294,34 @@ export function bindActions() {
 
   // Theme selection
   El.themeSelect?.addEventListener('change', async () => {
-    const previousTheme = State.theme || 'default';
+    if (acknowledgedTheme === null) acknowledgedTheme = State.theme || 'default';
+    const generation = ++themeGeneration;
+    ++themeReadGeneration;
+    ++themePendingSaves;
     const theme = El.themeSelect.value;
     State.theme = theme;
     lsSet('theme', theme);
     document.documentElement.dataset.theme = theme === 'default' ? '' : theme;
     try {
-      const result = await postJson('/api/global_setting', {
-        settings: { 'webui.theme': theme === 'default' ? null : theme },
+      const save = themeSaveTail.then(async () => {
+        const result = await postJson('/api/global_setting', {
+          settings: { 'webui.theme': theme === 'default' ? null : theme },
+        });
+        assertApiSuccess(result, 'テーマ設定の保存に失敗しました');
+        acknowledgedTheme = theme;
       });
-      assertApiSuccess(result, 'テーマ設定の保存に失敗しました');
+      themeSaveTail = save.catch(() => {});
+      await save;
     } catch (error) {
-      State.theme = previousTheme;
-      lsSet('theme', previousTheme);
-      document.documentElement.dataset.theme = previousTheme === 'default' ? '' : previousTheme;
-      if (El.themeSelect) El.themeSelect.value = previousTheme;
+      if (generation !== themeGeneration) return;
+      State.theme = acknowledgedTheme;
+      lsSet('theme', acknowledgedTheme);
+      document.documentElement.dataset.theme = acknowledgedTheme === 'default' ? '' : acknowledgedTheme;
+      if (El.themeSelect) El.themeSelect.value = acknowledgedTheme;
       showNotification(error.message || 'テーマ設定の保存に失敗しました', 'error');
+    } finally {
+      --themePendingSaves;
+      ++themeReadGeneration;
     }
   });
 
@@ -323,26 +345,15 @@ export function bindActions() {
   });
 
   // --- Notepad modal ---
-  on('notepad-close', () => El.notepadModal?.classList.add('hide'));
+  on('notepad-close', () => closeModal(El.notepadModal));
   on('save-notepad-button', (e) => {
+    const generation = notepadOpenGeneration;
     void runGuardedAction(e.currentTarget, async () => {
-      const text = El.notepad?.value || '';
-      const result = await postJson('/api/notepad/save', {
-        text,
-        content: text,
-        object_id: State.notepadObjectId,
-      });
-      if (result?.conflict) {
-        await reloadNotepadFromServer(
-          result.message || '他の画面で変更されたため、メモ帳を再読み込みしました',
-          'warning'
-        );
-        return null;
-      }
-      assertApiSuccess(result, 'メモ帳の保存に失敗しました');
-      applyNotepadSnapshot(result);
-      El.notepadModal?.classList.add('hide');
-      showNotification(result.message || 'メモ帳を保存しました', 'success');
+      const result = await getNotepadEditor().save();
+      if (!result.dirty && generation === notepadOpenGeneration) closeModal(El.notepadModal);
+      if (result.saved) showNotification(result.dirty
+        ? '前の入力を保存しました。新しい入力は未保存です'
+        : result.data.message || 'メモ帳を保存しました', result.dirty ? 'info' : 'success');
       return result;
     }, 'メモ帳の保存に失敗しました');
   });
@@ -389,16 +400,19 @@ export function bindActions() {
     await startSelfUpdate('gpl');
   });
 
-  on('queue-restore-yes', async () => {
-    El.queueRestoreModal?.classList.add('hide');
-    await postJson('/api/restore_pending_tasks', {});
-    await refreshQueueDetailed();
-  });
-  on('queue-restore-no', async () => {
-    El.queueRestoreModal?.classList.add('hide');
-    await postJson('/api/defer_restore_pending_tasks', {});
-    await refreshQueueDetailed();
-  });
+  for (const [id, endpoint] of [
+    ['queue-restore-yes', '/api/restore_pending_tasks'],
+    ['queue-restore-no', '/api/defer_restore_pending_tasks'],
+  ]) {
+    on(id, (e) => {
+      void runGuardedAction(e.currentTarget, async () => {
+        const result = await postJson(endpoint, {});
+        assertApiSuccess(result, '待機キューの復元操作に失敗しました');
+        closeModal(El.queueRestoreModal);
+        await refreshQueueDetailed();
+      }, '待機キューの復元操作に失敗しました');
+    });
+  }
 
   // --- Column visibility modal ---
   on('colvis-close', () => El.colvisModal?.classList.add('hide'));
@@ -441,7 +455,7 @@ export function bindActions() {
       return;
     }
     void runGuardedAction(triggerEl, async () => {
-      const result = await postJson('/api/download', { targets: [url] });
+      const result = await postSortedJson('/api/download', { targets: [url] });
       assertApiSuccess(result, 'ブックマークレット登録に失敗しました');
       hideRegisterModal();
       showNotification('ブックマークレットから登録しました', 'success');
@@ -449,7 +463,9 @@ export function bindActions() {
   });
 
   // --- Diff modal ---
-  on('diff-close', () => El.diffModal?.classList.add('hide'));
+  on('diff-close', () => closeModal(El.diffModal));
+  on('remove-cancel', () => closeModal(El.removeModal));
+  on('remove-ok', confirmRemove);
 
   // --- Download modal ---
   const downloadModal = document.getElementById('download-modal');
@@ -475,7 +491,7 @@ export function bindActions() {
     if (targets.length === 0) return;
     const mail = document.getElementById('download-mail')?.checked || false;
     void runGuardedAction(triggerEl, async () => {
-      const result = await postJson('/api/download', { targets, mail });
+      const result = await postSortedJson('/api/download', { targets, mail });
       assertApiSuccess(result, 'ダウンロード要求の送信に失敗しました');
       downloadModal?.classList.add('hide');
     }, 'ダウンロード要求の送信に失敗しました');
@@ -510,7 +526,7 @@ export function bindActions() {
     const ids = requireSelectedIds();
     if (!ids) return;
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/download', { targets: ids, force: true });
+      const result = await postSortedJson('/api/download', { targets: ids, force: true });
       assertApiSuccess(result, '強制ダウンロード要求の送信に失敗しました');
     }, '強制ダウンロード要求の送信に失敗しました');
   });
@@ -521,11 +537,10 @@ export function bindActions() {
       const selectedCount = State.selectedIds.size;
       const allSelected = total > 0 && selectedCount >= total;
       const result = (selectedCount > 0 && !allSelected)
-        ? await postJson('/api/update', {
+        ? await postSortedJson('/api/update', {
           targets: [...State.selectedIds],
-          ...currentSortStatePayload(),
         })
-        : await postJson('/api/update', { update_all: true });
+        : await postSortedJson('/api/update', { update_all: true });
       assertApiSuccess(result, 'アップデート要求の送信に失敗しました');
     }, 'アップデート要求の送信に失敗しました');
   });
@@ -545,7 +560,7 @@ export function bindActions() {
   on('gl-update-close', () => document.getElementById('gl-update-modal')?.classList.add('hide'));
   on('gl-update-cancel', () => document.getElementById('gl-update-modal')?.classList.add('hide'));
   const queueGeneralLastupUpdate = async (option, isUpdateModified = false) => {
-    const result = await postJson('/api/update_general_lastup', {
+    const result = await postSortedJson('/api/update_general_lastup', {
       option,
       is_update_modified: isUpdateModified
     });
@@ -609,7 +624,7 @@ export function bindActions() {
 
   on('update-by-tag-close', () => document.getElementById('update-by-tag-modal')?.classList.add('hide'));
   on('update-by-tag-cancel', () => document.getElementById('update-by-tag-modal')?.classList.add('hide'));
-  on('update-by-tag-submit', () => {
+  on('update-by-tag-submit', async (e) => {
     const tags = [];
     const exclusion_tags = [];
     document.querySelectorAll('#update-by-tag-include input[data-tagname]:checked').forEach(cb => {
@@ -622,25 +637,29 @@ export function bindActions() {
       showNotification('タグを選択してください', 'warning');
       return;
     }
-    postJson('/api/update_by_tag', { tags, exclusion_tags, ...currentSortStatePayload() });
-    document.getElementById('update-by-tag-modal')?.classList.add('hide');
+    await runGuardedAction(e.currentTarget, async () => {
+      const result = await postSortedJson('/api/update_by_tag', { tags, exclusion_tags });
+      assertApiSuccess(result, 'タグ指定の更新要求に失敗しました');
+      document.getElementById('update-by-tag-modal')?.classList.add('hide');
+    }, 'タグ指定の更新要求に失敗しました');
   });
 
   on('action-update-view', (e) => {
     const ids = getVisibleIds();
+    if (ids.length === 0) return;
     void runGuardedAction(e.currentTarget, async () => {
       const total = Array.isArray(State.novels) ? State.novels.length : 0;
       const allVisible = total > 0 && ids.length >= total;
       const result = allVisible
-        ? await postJson('/api/update', { update_all: true, ...currentSortStatePayload() })
-        : await postJson('/api/update', { targets: ids, ...currentSortStatePayload() });
+        ? await postSortedJson('/api/update', { update_all: true })
+        : await postSortedJson('/api/update', { targets: ids });
       assertApiSuccess(result, '表示中小説のアップデート要求に失敗しました');
     }, '表示中小説のアップデート要求に失敗しました');
   });
 
   on('action-update-force', (e) => {
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/update', { update_all: true, force: true });
+      const result = await postSortedJson('/api/update', { update_all: true, force: true });
       assertApiSuccess(result, '強制アップデート要求の送信に失敗しました');
     }, '強制アップデート要求の送信に失敗しました');
   });
@@ -659,10 +678,9 @@ export function bindActions() {
 
   on('btn-gl-modified', (e) => {
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/update_by_tag', {
+      const result = await postSortedJson('/api/update_by_tag', {
         tags: ['modified'],
         exclusion_tags: [],
-        ...currentSortStatePayload(),
       });
       assertApiSuccess(result, 'modifiedタグ更新の要求送信に失敗しました');
     }, 'modifiedタグ更新の要求送信に失敗しました');
@@ -672,7 +690,7 @@ export function bindActions() {
     const ids = requireSelectedIds();
     if (!ids) return;
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/send', { targets: ids });
+      const result = await postSortedJson('/api/send', { targets: ids });
       assertApiSuccess(result, '送信要求の送信に失敗しました');
     }, '送信要求の送信に失敗しました');
   });
@@ -701,7 +719,7 @@ export function bindActions() {
     const ids = requireSelectedIds();
     if (!ids) return;
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/convert', { targets: ids, ...currentSortStatePayload() });
+      const result = await postSortedJson('/api/convert', { targets: ids });
       assertApiSuccess(result, '変換要求の送信に失敗しました');
     }, '変換要求の送信に失敗しました');
   });
@@ -731,7 +749,7 @@ export function bindActions() {
     const ids = requireSelectedIds();
     if (!ids) return;
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/backup', { targets: ids });
+      const result = await postSortedJson('/api/backup', { targets: ids });
       assertApiSuccess(result, 'バックアップ要求の送信に失敗しました');
     }, 'バックアップ要求の送信に失敗しました');
   });
@@ -749,7 +767,7 @@ export function bindActions() {
     const ids = requireSelectedIds();
     if (!ids) return;
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/mail', { targets: ids });
+      const result = await postSortedJson('/api/mail', { targets: ids });
       assertApiSuccess(result, 'メール送信要求の送信に失敗しました');
     }, 'メール送信要求の送信に失敗しました');
   });
@@ -787,11 +805,9 @@ export function bindActions() {
       if (State.sortAsc) th.classList.add('sort-asc');
       renderNovelList();
 
-      // Persist sort state to server (single source of truth for actions).
-      const sort_state = currentSortStateFromUI();
-      if (sort_state) {
-        postJson('/api/sort_state', sort_state).catch(() => {});
-      }
+      void persistSortState().catch(error => {
+        showNotification(error.message || '並び順の保存に失敗しました', 'error');
+      });
     });
   });
 
@@ -811,6 +827,7 @@ export function bindActions() {
     selectView: () => selectVisible(),
     selectAll: () => selectAll(),
     selectClear: () => clearSelection(),
+    closeModal,
     refreshAll: () => { refreshList(); refreshQueue(); refreshTags(); },
     toggleWide: () => {
       State.wideMode = !State.wideMode;
@@ -847,14 +864,14 @@ export function bindActions() {
       await postJson('/api/freeze', { ids: [Number(id)] });
       await refreshList();
     },
-    updateSingle: (id) => postJson('/api/update', { targets: [String(id)] }),
-    updateForceSingle: (id) => postJson('/api/update', { targets: [String(id)], force: true }),
-    sendSingle: (id) => postJson('/api/send', { targets: [String(id)] }),
+    updateSingle: (id) => postSortedJson('/api/update', { targets: [String(id)] }),
+    updateForceSingle: (id) => postSortedJson('/api/update', { targets: [String(id)], force: true }),
+    sendSingle: (id) => postSortedJson('/api/send', { targets: [String(id)] }),
     removeSingle: async (id) => {
       showRemoveModal([Number(id)]);
     },
     convertSingle: (id) => runGuardedAction(null, async () => {
-      const result = await postJson('/api/convert', { targets: [String(id)] });
+      const result = await postSortedJson('/api/convert', { targets: [String(id)] });
       assertApiSuccess(result, '変換要求の送信に失敗しました');
     }, '変換要求の送信に失敗しました'),
     inspectSingle: (id) => runGuardedAction(null, async () => {
@@ -862,9 +879,9 @@ export function bindActions() {
       assertApiSuccess(result, '調査状況ログの表示に失敗しました');
     }, '調査状況ログの表示に失敗しました'),
     folderSingle: (id) => openFolderTargets([String(id)]),
-    backupSingle: (id) => postJson('/api/backup', { targets: [String(id)] }),
-    downloadForceSingle: (id) => postJson('/api/download', { targets: [String(id)], force: true }),
-    mailSingle: (id) => postJson('/api/mail', { targets: [String(id)] }),
+    backupSingle: (id) => postSortedJson('/api/backup', { targets: [String(id)] }),
+    downloadForceSingle: (id) => postSortedJson('/api/download', { targets: [String(id)], force: true }),
+    mailSingle: (id) => postSortedJson('/api/mail', { targets: [String(id)] }),
     authorComments: (id) => {
       const popup = window.open(
         '/novels/' + id + '/author_comments',
@@ -876,6 +893,7 @@ export function bindActions() {
     refreshTags: () => refreshTags(),
     tagColorChanged: () => refreshOpenTagEditor(),
     refreshList: () => refreshList(),
+    notifyError: message => showNotification(message, 'error'),
   };
 
   setShortcutHandlers(handlers);
@@ -933,9 +951,14 @@ export function handleRegisterParam(url) {
 /* ===== Helpers ===== */
 
 function on(id, handler) {
-  document.getElementById(id)?.addEventListener('click', (e) => {
+  document.getElementById(id)?.addEventListener('click', async (e) => {
     e.preventDefault();
-    handler(e);
+    try {
+      const result = await handler(e);
+      assertApiSuccess(result, '操作に失敗しました');
+    } catch (error) {
+      showNotification(error.message || '操作に失敗しました', 'error');
+    }
   });
 }
 
@@ -1002,11 +1025,33 @@ export async function runGuardedAction(buttonEl, action, errorMessage) {
   }
 }
 
-function assertApiSuccess(result, fallbackMessage) {
-  if (result && result.success === false) {
-    throw new Error(result.message || fallbackMessage);
+export function captureThemeRead() {
+  return ++themeReadGeneration;
+}
+
+export function applyThemeSnapshot(theme, generation) {
+  if (generation !== themeReadGeneration || themePendingSaves > 0) return;
+  acknowledgedTheme = theme;
+  State.theme = theme;
+  lsSet('theme', theme);
+  document.documentElement.dataset.theme = theme === 'default' ? '' : theme;
+  if (El.themeSelect) El.themeSelect.value = theme;
+}
+
+function closeModal(modal) {
+  if (!modal) return;
+  if (modal === El.removeModal) removeTransaction = null;
+  if (modal === El.tagEditModal) {
+    ++tagEditorGeneration;
+    ++tagReadGeneration;
+    hideTagSuggestions();
   }
-  return result;
+  if (modal === El.diffModal) ++diffGeneration;
+  if (modal === El.notepadModal) {
+    ++notepadOpenGeneration;
+    notepadEditor?.invalidateReads();
+  }
+  modal.classList.add('hide');
 }
 
 function assertHistoryPayload(result) {
@@ -1028,43 +1073,16 @@ function rememberRebootReturnTo() {
   }
 }
 
-function getNotepadText(data) {
-  if (data && typeof data === 'object') {
-    return data.text || data.content || '';
+function getNotepadEditor() {
+  if (!notepadEditor) {
+    notepadEditor = createNotepadEditor(El.notepad);
   }
-  return typeof data === 'string' ? data : '';
+  return notepadEditor;
 }
 
-function getNotepadObjectId(data) {
-  if (!data || typeof data !== 'object') return null;
-  return typeof data.object_id === 'string' ? data.object_id : null;
-}
-
-export function applyNotepadSnapshot(data, options = {}) {
-  const text = getNotepadText(data);
-  const objectId = getNotepadObjectId(data);
-  const keepLocalEdits = options.keepLocalEdits === true
-    && El.notepad instanceof HTMLTextAreaElement
-    && document.activeElement === El.notepad
-    && El.notepad.value !== text;
-
-  if (!keepLocalEdits && El.notepad) {
-    El.notepad.value = text;
-  }
-  if (!keepLocalEdits || !El.notepad || El.notepad.value === text) {
-    State.notepadObjectId = objectId;
-  }
-
-  return { text, objectId, keptLocalEdits: keepLocalEdits };
-}
-
-async function reloadNotepadFromServer(message, type = 'warning') {
-  const data = await fetchJson('/api/notepad/read');
-  applyNotepadSnapshot(data);
-  if (message) {
-    showNotification(message, type);
-  }
-  return data;
+export function applyNotepadSnapshot(data) {
+  if (!El.notepad) return { keptLocalEdits: false };
+  return getNotepadEditor().applySnapshot(data);
 }
 
 function clearRebootReturnTo() {
@@ -1089,7 +1107,8 @@ async function openFolderTargets(ids) {
   }
 }
 
-function clearConsoleHistoryUi() {
+export function clearConsoleHistoryUi() {
+  State.consoleRevision++;
   if (El.console) {
     var lines = El.console.querySelectorAll('.console-line');
     lines.forEach(function(el) { el.remove(); });
@@ -1109,17 +1128,21 @@ function populateFooterPanel() {
   if (!src || !dst || dst.children.length > 0) return;
   const clone = src.cloneNode(true);
   clone.removeAttribute('id');
-  // Remap IDs on cloned elements to avoid duplicate IDs;
-  // use click delegation instead
-  clone.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+  clone.querySelectorAll('[id]').forEach(el => {
+    const originalId = el.id;
+    el.dataset.mainControlId = originalId;
+    el.id = 'footer-' + originalId;
+  });
+  clone.querySelectorAll('[data-dropdown]').forEach(el => {
+    el.dataset.dropdown = 'footer-' + el.dataset.dropdown;
+  });
   while (clone.firstChild) dst.appendChild(clone.firstChild);
 
-  // Delegate clicks from footer panel to main panel buttons by class/text
+  // Footer controls forward actions by captured source ID, never by label.
   dst.addEventListener('click', (e) => {
     const link = e.target.closest('a, button');
-    if (!link) return;
-    // Find the matching element in the main control panel
-    const mainEl = findMainPanelMatch(link);
+    if (!link || link.hasAttribute('data-dropdown')) return;
+    const mainEl = document.getElementById(link.dataset.mainControlId);
     if (mainEl) {
       e.preventDefault();
       mainEl.click();
@@ -1127,19 +1150,6 @@ function populateFooterPanel() {
   });
 }
 
-function findMainPanelMatch(clonedEl) {
-  const src = El.mainControlPanel;
-  if (!src) return null;
-  // Match by original ID attribute (stored as data-orig-id) or by text content
-  const text = clonedEl.textContent.trim();
-  const title = clonedEl.getAttribute('title');
-  const candidates = src.querySelectorAll('a, button');
-  for (const c of candidates) {
-    if (title && c.getAttribute('title') === title) return c;
-    if (c.textContent.trim() === text) return c;
-  }
-  return null;
-}
 
 function getVisibleIds() {
   const rows = El.novelListBody?.querySelectorAll('tr[data-id]') || [];
@@ -1169,29 +1179,46 @@ function requireSelectedIds() {
   return null;
 }
 
-function currentSortStateFromUI() {
-  const column = SORT_STATE_COLUMN_INDEX[State.sortCol];
-  if (column == null) return null;
-  return {
-    column,
-    dir: State.sortAsc ? 'asc' : 'desc',
-  };
-}
-
-// Action endpoints rely on the server-stored sort state as the single
-// source of truth. Only a timestamp is sent so the server can detect
-// stale callers; the actual ordering is taken from /api/sort_state.
-function currentSortStatePayload() {
-  return {
-    timestamp: Date.now(),
-  };
-}
 
 /* ===== Tag editor ===== */
 
+function isCurrentTagEditor(ids, generation = tagEditorGeneration) {
+  return generation === tagEditorGeneration
+    && El.tagEditModal && !El.tagEditModal.classList.contains('hide')
+    && El.tagEditModal.dataset.ids === JSON.stringify(ids);
+}
+
+function setTagEditorPending() {
+  for (const control of [El.addTagButton, El.newTagInput]) {
+    if (control) control.disabled = tagMutationPending;
+  }
+  El.tagEditorCurrent?.querySelectorAll('.tag-remove').forEach(control => {
+    control.disabled = tagMutationPending;
+  });
+}
+
+async function mutateEditorTags(ids, states, fallbackMessage, onSuccess) {
+  if (tagMutationPending || !isCurrentTagEditor(ids)) return;
+  const generation = tagEditorGeneration;
+  tagMutationPending = true;
+  ++tagReadGeneration;
+  setTagEditorPending();
+  try {
+    await applyBulkTagEdit(ids, states, fallbackMessage);
+    if (isCurrentTagEditor(ids, generation)) onSuccess?.();
+    await refreshList();
+    await refreshTags();
+    if (isCurrentTagEditor(ids, generation)) await refreshTagEditor(ids);
+  } catch (error) {
+    showNotification(error.message || fallbackMessage, 'error');
+  } finally {
+    tagMutationPending = false;
+    setTagEditorPending();
+  }
+}
+
 function closeTagEditor() {
-  hideTagSuggestions();
-  El.tagEditModal?.classList.add('hide');
+  closeModal(El.tagEditModal);
 }
 
 async function refreshOpenTagEditor() {
@@ -1205,14 +1232,17 @@ async function refreshOpenTagEditor() {
 }
 
 async function openTagEditor(ids) {
-  const targetIds = ids || requireSelectedIds();
+  const targetIds = [...(ids || requireSelectedIds() || [])];
   if (!targetIds || targetIds.length === 0) return;
+  const generation = ++tagEditorGeneration;
+  ++tagReadGeneration;
 
   El.tagEditModal?.classList.remove('hide');
   El.tagEditModal.dataset.ids = JSON.stringify(targetIds);
   El.tagEditModal.dataset.selectedCount = String(targetIds.length);
   renderTagEditorSummary(targetIds.length, { loading: true });
   renderTagEditorTags(targetIds, []);
+  setTagEditorPending();
 
   if (El.newTagInput) {
     El.newTagInput.value = '';
@@ -1223,6 +1253,7 @@ async function openTagEditor(ids) {
   try {
     await refreshTagEditor(targetIds);
   } catch (error) {
+    if (!isCurrentTagEditor(targetIds, generation)) return;
     renderTagEditorSummary(targetIds.length, { error: true });
     renderTagEditorTags(targetIds, []);
     showNotification(error.message || 'タグ情報の取得に失敗しました', 'error');
@@ -1231,24 +1262,19 @@ async function openTagEditor(ids) {
 
 async function addTagFromInput() {
   const input = El.newTagInput;
-  if (!input) return;
-  const tags = splitTagInput(input.value);
+  if (!input || tagMutationPending) return;
+  const submitted = input.value;
+  const tags = splitTagInput(submitted);
   if (tags.length === 0) return;
 
   const idsJson = El.tagEditModal?.dataset.ids;
   const ids = idsJson ? JSON.parse(idsJson) : [...State.selectedIds];
   const states = Object.fromEntries(tags.map(tag => [tag, 2]));
 
-  try {
-    await applyBulkTagEdit(ids, states, 'タグの追加に失敗しました');
-    input.value = '';
+  await mutateEditorTags(ids, states, 'タグの追加に失敗しました', () => {
+    if (input.value === submitted) input.value = '';
     hideTagSuggestions();
-    await refreshList();
-    await refreshTags();
-    await refreshTagEditor(ids);
-  } catch (error) {
-    showNotification(error.message || 'タグの追加に失敗しました', 'error');
-  }
+  });
 }
 
 function splitTagInput(value) {
@@ -1370,11 +1396,14 @@ function getCurrentEditorTags() {
 }
 
 async function refreshTagEditor(ids) {
+  if (!isCurrentTagEditor(ids)) return;
+  const generation = ++tagReadGeneration;
+  const editorGeneration = tagEditorGeneration;
   const selectionCount = ids.length;
   const taginfo = await postJson('/api/taginfo.json', {
     ids,
-    ...currentSortStatePayload(),
   });
+  if (generation !== tagReadGeneration || !isCurrentTagEditor(ids, editorGeneration)) return;
   const selectedTagInfo = Array.isArray(taginfo)
     ? taginfo.filter(info => Number(info?.count || 0) > 0)
     : [];
@@ -1452,22 +1481,17 @@ function renderTagEditorTags(ids, taginfo) {
       showTagColorMenu(event, info.tag);
     });
 
-    const removeBtn = document.createElement('span');
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
     removeBtn.className = 'tag-remove';
+    removeBtn.disabled = tagMutationPending;
     removeBtn.textContent = '×';
     removeBtn.title =
       selectionCount > 1
         ? `選択中の${selectionCount}件から「${info.tag}」を外す`
         : `「${info.tag}」を外す`;
     removeBtn.addEventListener('click', async () => {
-      try {
-        await applyBulkTagEdit(ids, { [info.tag]: 0 }, 'タグの削除に失敗しました');
-        await refreshList();
-        await refreshTags();
-        await refreshTagEditor(ids);
-      } catch (error) {
-        showNotification(error.message || 'タグの削除に失敗しました', 'error');
-      }
+      await mutateEditorTags(ids, { [info.tag]: 0 }, 'タグの削除に失敗しました');
     });
     chip.appendChild(removeBtn);
     container.appendChild(chip);
@@ -1483,11 +1507,8 @@ async function applyBulkTagEdit(ids, states, fallbackMessage) {
   const result = await postJson('/api/edit_tag', {
     ids,
     states,
-    ...currentSortStatePayload(),
   });
-  if (!result || result.success !== true) {
-    throw new Error(result?.error || result?.message || fallbackMessage);
-  }
+  assertApiSuccess(result, fallbackMessage);
   return result;
 }
 
@@ -1538,11 +1559,13 @@ async function openNotepad() {
     return;
   }
 
+  const generation = ++notepadOpenGeneration;
+  El.notepadModal?.classList.remove('hide');
   try {
-    const data = await fetchJson('/api/notepad/read');
-    applyNotepadSnapshot(data);
-    El.notepadModal?.classList.remove('hide');
+    await getNotepadEditor().load();
+    if (generation !== notepadOpenGeneration) return;
   } catch (error) {
+    if (generation !== notepadOpenGeneration) return;
     showNotification(error.message || 'メモ帳の読み込みに失敗しました', 'error');
   }
 }
@@ -1648,11 +1671,14 @@ async function startSelfUpdate(variant) {
 async function openDiffList(ids) {
   const container = El.diffListContainer;
   if (!container) return;
+  const generation = ++diffGeneration;
+  const targetIds = [...ids];
   container.innerHTML = '<p>読み込み中...</p>';
   El.diffModal?.classList.remove('hide');
 
   try {
-    const data = await postJson('/api/diff_list', { targets: ids });
+    const data = await postJson('/api/diff_list', { targets: targetIds });
+    if (generation !== diffGeneration || El.diffModal?.classList.contains('hide')) return;
     if (data?.error) {
       throw new Error(data.error);
     }
@@ -1687,6 +1713,7 @@ async function openDiffList(ids) {
       container.innerHTML = '<p>差分データがありません</p>';
     }
   } catch (error) {
+    if (generation !== diffGeneration || El.diffModal?.classList.contains('hide')) return;
     container.innerHTML = '<p>' + escHtml(error.message || '差分の取得に失敗しました') + '</p>';
   }
 }
@@ -1705,6 +1732,7 @@ function escAttr(s) {
 
 function showRemoveModal(ids) {
   if (!ids || ids.length === 0) return;
+  closeModal(El.removeModal);
   const numericIds = ids.map(id => Number(id)).filter(id => Number.isFinite(id));
   if (numericIds.length === 0) {
     showNotification('削除対象のIDが不正です', 'error');
@@ -1719,35 +1747,36 @@ function showRemoveModal(ids) {
   El.removeWithFile.checked = false;
   El.removeModal?.classList.remove('hide');
 
-  // One-shot handlers
-  const cleanup = () => {
-    El.removeModal?.classList.add('hide');
-    El.removeOk.removeEventListener('click', onOk);
-    El.removeCancel.removeEventListener('click', onCancel);
-  };
-  const onOk = async () => {
-    await runGuardedAction(El.removeOk, async () => {
-      const withFile = El.removeWithFile.checked;
-      const result = await postJson('/api/novels/remove', {
-        ids: numericIds,
-        with_file: withFile,
-        ...currentSortStatePayload(),
-      });
-      assertApiSuccess(result, '削除に失敗しました');
-      cleanup();
-      await refreshList();
-    }, '削除に失敗しました');
-  };
-  const onCancel = () => cleanup();
-  El.removeOk.addEventListener('click', onOk);
-  El.removeCancel.addEventListener('click', onCancel);
+  removeTransaction = { ids: numericIds };
+  El.removeOk.disabled = removePending;
+}
+
+async function confirmRemove() {
+  const transaction = removeTransaction;
+  if (!transaction || removePending || El.removeModal?.classList.contains('hide')) return;
+  const withFile = El.removeWithFile.checked;
+  removePending = true;
+  El.removeOk.disabled = true;
+  try {
+    const result = await postJson('/api/novels/remove', {
+      ids: transaction.ids,
+      with_file: withFile,
+    });
+    assertApiSuccess(result, '削除に失敗しました');
+    if (removeTransaction === transaction) closeModal(El.removeModal);
+    await refreshList();
+  } catch (error) {
+    showNotification(error.message || '削除に失敗しました', 'error');
+  } finally {
+    removePending = false;
+    El.removeOk.disabled = false;
+  }
 }
 
 /* ===== CSV ===== */
 
 async function downloadCsv() {
-  const resp = await fetch('/api/csv/download');
-  if (!resp.ok) return;
+  const resp = await request('/api/csv/download');
   const blob = await resp.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1906,56 +1935,99 @@ function closeMenuStyleModal() {
 
 /* ===== Data refresh ===== */
 
+const refreshRequests = new Map();
 let listRefreshGeneration = 0;
 
-export async function refreshList() {
-  const generation = ++listRefreshGeneration;
-  try {
-    const resp = await fetchJson('/api/list?all=true');
-    if (generation !== listRefreshGeneration) return;
-    if (resp && Array.isArray(resp.data)) {
-      State.novels = resp.data;
-      State.frozenIds = new Set(
-        resp.data.filter(n => n.frozen).map(n => String(n.id))
-      );
-      pruneSelectedIdsToCurrentList();
-    }
-  } catch { /* ignore */ }
-  if (generation === listRefreshGeneration) renderNovelList();
+function runRefresh(key, action) {
+  const existing = refreshRequests.get(key);
+  if (existing) {
+    existing.dirty = true;
+    return existing.promise;
+  }
+  const work = { dirty: false, promise: null };
+  work.promise = Promise.resolve().then(async () => {
+    let result;
+    do {
+      work.dirty = false;
+      result = await action();
+    } while (work.dirty);
+    return result;
+  }).finally(() => refreshRequests.delete(key));
+  refreshRequests.set(key, work);
+  return work.promise;
+}
+
+export async function refreshList(redraw = true) {
+  ++listRefreshGeneration;
+  return runRefresh('list', async () => {
+    const generation = listRefreshGeneration;
+    try {
+      const resp = await fetchJson('/api/list?all=true');
+      if (generation !== listRefreshGeneration) return;
+      if (resp && Array.isArray(resp.data)) {
+        State.novels = resp.data;
+        State.frozenIds = new Set(resp.data.filter(n => n.frozen).map(n => String(n.id)));
+        pruneSelectedIdsToCurrentList();
+      }
+    } catch { /* keep the last successfully loaded list */ }
+    if (redraw && generation === listRefreshGeneration) renderNovelList();
+  });
 }
 
 export async function refreshQueue() {
-  try {
-    const data = await fetchJson('/api/queue/status');
-    if (data) {
-      State.queueStatus = data;
-      renderQueueStatus();
-      return data;
-    }
-  } catch { /* ignore */ }
-  return null;
+  return runRefresh('queue', async () => {
+    try {
+      const data = await fetchJson('/api/queue/status');
+      if (data) {
+        State.queueStatus = data;
+        renderQueueStatus();
+        return data;
+      }
+    } catch { /* keep the last successfully loaded status */ }
+    return null;
+  });
 }
 
 export async function refreshQueueDetailed() {
-  try {
-    const data = await fetchJson('/api/get_pending_tasks');
-    if (data) {
-      State.queueDetailed = data;
+  return runRefresh('queue-details', async () => {
+    try {
+      const pending = [];
+      const running = [];
+      const cursors = new Set();
+      let cursor = null;
+      let data;
+      do {
+        const query = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
+        data = await fetchJson('/api/get_pending_tasks' + query);
+        if (!data || !Array.isArray(data.pending) || !Array.isArray(data.running)) {
+          throw new Error('待機キューの応答が不正です');
+        }
+        pending.push(...data.pending);
+        running.push(...data.running);
+        cursor = data.next_cursor;
+        if (cursor && cursors.has(cursor)) throw new Error('待機キューのページ取得が進みません');
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      State.queueDetailed = { ...data, pending, running };
       renderQueueDetailed();
+    } catch (error) {
+      showNotification(error.message || '待機キューを取得できませんでした', 'error');
     }
-  } catch { /* ignore */ }
+  });
 }
 
-export async function refreshTags() {
-  try {
-    const data = await fetchJson('/api/tag_list?format=json');
-    if (data) {
-      State.tags = data.tags || [];
-      State.tagColors = data.tag_colors || data.colors || {};
-      renderTagList();
-      renderNovelList();
-    }
-  } catch { /* ignore */ }
+export async function refreshTags(redraw = true) {
+  return runRefresh('tags', async () => {
+    try {
+      const data = await fetchJson('/api/tag_list?format=json');
+      if (data) {
+        State.tags = data.tags || [];
+        State.tagColors = data.tag_colors || data.colors || {};
+        renderTagList();
+        if (redraw) renderNovelList();
+      }
+    } catch { /* keep the last successfully loaded tags */ }
+  });
 }
 
 function replaceConsoleHistory(consoleEl, history) {

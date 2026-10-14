@@ -423,6 +423,39 @@ CI ではなく **PteWorker の `.env`** に置く (§3、ひな形は `sorahost
 - 注意: リレーの配備 (`sorahost-cli deploy`) はプロジェクトの起動コマンドを書き換える。
   同居させるときは常に `SORAHOST_RELAY_START` を設定しておくこと。
 
+### 取得リレーの共通契約と検証
+
+Node 版と Worker 版は `scripts/sorahost-proxy/worker/protocol.mjs` を共有する。
+入力 JSON は UTF-8 の実バイト数で 64 KiB、取得した本文は展開後の実バイト数で
+16 MiB まで受け付ける。応答メタデータは JSON の escape・UTF-8・空の本文欄を
+含めて 448 KiB に制限する。Cookie を含む同名ヘッダの順序を保ち、非 ASCII の
+ヘッダ値は Node の curl / fetch と Worker の fetch で同じ UTF-8 の wire 表現にする。
+
+返すのは最終 HTTP 応答だけ。curl は途中の `100 Continue` を読み飛ばすが、
+fetch が最終応答を返さないランタイムでは 502 にする。本文中の HTTP ヘッダを
+推測して剥がす復旧は行わない。入力ストリームの上限超過は、400 を返す前に
+クライアント接続を中断しない。取得側の上限超過では読み取りを止めて解放する。
+
+GET のヘッダ JSON にもデコード後 64 KiB の上限があるが、base64 化した URL が
+配備先の request-line 上限を越えると Worker 到達前に拒否される。大きな入力は
+POST の JSON 本文で送る。
+
+ローカル Worker は、リポジトリ直下で次のように起動する。トークンは検証専用の値で、
+配備用の資格情報を使わない。
+
+```sh
+npx --yes wrangler@4 dev --config scripts/sorahost-proxy/worker/wrangler.toml \
+  --var SORAHOST_PROXY_KEY:test-key
+```
+
+別ターミナルから次で Node 版と Worker 版の両方を実 HTTP 上流につないで検証できる。
+
+```sh
+RELAY_WORKER_BASE_URL=http://127.0.0.1:18912 RELAY_TEST_TOKEN=test-key \
+  node --test tests/sorahost_relay.test.mjs
+```
+
+
 ## 11. 使えない機能
 
 SORAHOST のコンテナで動かすため、次は動かない (Web UI 側では 501 相当):

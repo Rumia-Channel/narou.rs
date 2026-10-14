@@ -3,6 +3,7 @@
  */
 import { El } from '../core/state.js';
 import { postJson } from '../core/http.js';
+import { markActionCapability } from '../core/capabilities.js';
 
 let contextTarget = null;
 let actionHandlers = {};
@@ -52,6 +53,11 @@ const MENU_COMMAND_HANDLERS = {
   author_comments: () => actionHandlers.authorComments?.(contextTarget),
 };
 
+const COMMAND_CAPABILITIES = {
+  diff: 'diff_history', send: 'send', inspect: 'inspect',
+  folder: 'open_folder', backup: 'backup', mail: 'mail',
+};
+
 export function setContextHandlers(handlers) {
   actionHandlers = handlers;
 }
@@ -74,13 +80,20 @@ export function initContextMenu() {
     menu.classList.add('hide');
   });
 
-  menu.addEventListener('click', (e) => {
+  menu.addEventListener('click', async (e) => {
     const link = e.target.closest('a[data-command]');
     if (!link || !menu.contains(link)) return;
     e.preventDefault();
     menu.classList.add('hide');
     const command = link.dataset.command;
-    MENU_COMMAND_HANDLERS[command]?.();
+    try {
+      const result = await MENU_COMMAND_HANDLERS[command]?.();
+      if (result && (result.success === false || result.error)) {
+        throw new Error(result.error?.message || result.message || '操作に失敗しました');
+      }
+    } catch (error) {
+      actionHandlers.notifyError?.(error.message || '操作に失敗しました');
+    }
   });
 
   window.addEventListener('storage', (e) => {
@@ -206,6 +219,7 @@ function rebuildContextMenu() {
     link.href = '#';
     link.dataset.command = command;
     link.textContent = label;
+    if (COMMAND_CAPABILITIES[command]) markActionCapability(link, COMMAND_CAPABILITIES[command]);
     li.appendChild(link);
     menu.appendChild(li);
   }

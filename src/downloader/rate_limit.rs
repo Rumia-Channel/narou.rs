@@ -4,45 +4,26 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-const DEFAULT_INTERVAL_SECS: f64 = 0.7;
-const STEPS_WAIT_TIME: Duration = Duration::from_secs(5);
-const GLOBAL_HOST_KEY: &str = "__global__";
+use crate::platform::rate_limiter::{
+    DownloadPacing, PacingDecision, PacingSchedule, PacingState, try_acquire,
+};
+use crate::platform::RateLimitScope;
 
-static STATE: LazyLock<Mutex<RateLimitState>> =
-    LazyLock::new(|| Mutex::new(RateLimitState::default()));
+/// ホスト別の許可状態。プロセス内の全 limiter で共有する。
+static STATE: LazyLock<Mutex<HashMap<String, PacingState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[derive(Default)]
-struct RateLimitState {
-    hosts: HashMap<String, HostRateLimitState>,
-}
-
-#[derive(Default)]
-struct HostRateLimitState {
-    counter: u32,
-    last_download: Option<Instant>,
-    next_allowed: Option<Instant>,
-}
+/// native の時計 ([`Instant`]) を許可エンジンの ms へ写す基準。
+static MONOTONIC_BASE: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 pub struct RateLimiter {
-    interval: Duration,
-    wait_steps: u32,
-    max_steps_wait_time: Duration,
+    pacing: DownloadPacing,
 }
 
 impl RateLimiter {
-    pub fn new(is_narou: bool) -> Self {
-        let interval_secs = load_interval_secs();
-        let wait_steps = load_wait_steps(is_narou);
-        Self::from_values(interval_secs, wait_steps)
-    }
-
-    fn from_values(interval_secs: f64, wait_steps: u32) -> Self {
-        let interval = Duration::from_secs_f64(interval_secs.max(0.0));
-        Self {
-            interval,
-            wait_steps,
-            max_steps_wait_time: STEPS_WAIT_TIME.max(interval),
-        }
+    /// `download.interval` / `download.wait-steps` の保存値を読む。
+    pub fn new() -> Self {
+        Self::from_pacing(load_download_pacing())
     }
 
     /// Build a rate limiter with explicit interval/wait-steps, bypassing the
@@ -50,150 +31,65 @@ impl RateLimiter {
     /// Used by code paths (e.g. なろうAPI) that have their own dedicated
     /// rate-limit configuration.
     pub fn with_settings(interval_secs: f64, wait_steps: u32) -> Self {
-        Self::from_values(interval_secs, wait_steps)
+        Self::from_pacing(DownloadPacing::new(
+            Some(interval_secs),
+            Some(i64::from(wait_steps)),
+        ))
     }
 
-    pub fn wait(&self) {
-        self.wait_for_host(GLOBAL_HOST_KEY);
+    fn from_pacing(pacing: DownloadPacing) -> Self {
+        Self { pacing }
     }
 
-    pub fn wait_for_url(&self, url: &str) {
-        self.wait_for_host(&host_key_from_url(url));
-    }
-
-    pub async fn wait_async_for_url(&self, url: &str) {
-        let duration = self.reserve_wait_duration(&host_key_from_url(url));
-        if !duration.is_zero() {
-            tokio::time::sleep(duration).await;
+    /// Grant at the current instant, or return a delay for rechecking.
+    fn try_acquire(&self, scope: &RateLimitScope) -> PacingDecision {
+        let now_ms = monotonic_ms();
+        let schedule = PacingSchedule::from_scoped(&self.pacing.for_scope(scope));
+        let mut hosts = STATE.lock();
+        if let Some(state) = hosts.get_mut(&scope.site) {
+            return try_acquire(state, now_ms, schedule);
         }
-    }
-
-    fn wait_for_host(&self, host: &str) {
-        let duration = self.reserve_wait_duration(host);
-        if !duration.is_zero() {
-            std::thread::sleep(duration);
-        }
-    }
-
-    fn reserve_wait_duration(&self, host: &str) -> Duration {
-        self.reserve_wait_duration_with_steps(host, self.wait_steps, self.interval)
+        let mut state = PacingState::default();
+        let decision = try_acquire(&mut state, now_ms, schedule);
+        hosts.insert(scope.site.clone(), state);
+        decision
     }
 }
 
 impl crate::platform::RateLimiter for RateLimiter {
     fn acquire<'a>(
         &'a self,
-        scope: &'a crate::platform::RateLimitScope,
+        scope: &'a RateLimitScope,
     ) -> futures::future::BoxFuture<'a, crate::error::Result<()>> {
-        let duration = self.reserve_wait_duration_for_scope(scope);
         Box::pin(async move {
-            if !duration.is_zero() {
-                tokio::time::sleep(duration).await;
+            loop {
+                match self.try_acquire(scope) {
+                    PacingDecision::Granted => return Ok(()),
+                    PacingDecision::Wait { wait_ms } => {
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    }
+                }
             }
-            Ok(())
         })
     }
 }
 
-impl RateLimiter {
-    /// Reserve the wait for a scope, applying the なろう wait-steps default
-    /// (10) when the scope is a なろう site. The sync `wait_for_host` keeps
-    /// using the construction-time `wait_steps`; the async trait path is the
-    /// one that knows the per-site narou flag.
-    fn reserve_wait_duration_for_scope(&self, scope: &crate::platform::RateLimitScope) -> Duration {
-        let wait_steps = if scope.narou {
-            normalize_wait_steps(self.wait_steps as i64, true)
-        } else {
-            self.wait_steps
-        };
-        // サイト定義が下限を宣言していれば、全体設定より優先する。
-        let interval = match scope.min_interval {
-            Some(min_interval) => self.interval.max(min_interval),
-            None => self.interval,
-        };
-        self.reserve_wait_duration_with_steps(&scope.site, wait_steps, interval)
-    }
-
-    fn reserve_wait_duration_with_steps(
-        &self,
-        host: &str,
-        wait_steps: u32,
-        interval: Duration,
-    ) -> Duration {
-        let now = Instant::now();
-        let mut state = STATE.lock();
-        let host_state = state.hosts.entry(host.to_string()).or_default();
-
-        let no_pending_slot = host_state
-            .next_allowed
-            .map(|next_allowed| now >= next_allowed)
-            .unwrap_or(true);
-        if let Some(last_download) = host_state.last_download {
-            let elapsed = now
-                .checked_duration_since(last_download)
-                .unwrap_or_default();
-            if elapsed > self.max_steps_wait_time && no_pending_slot {
-                host_state.counter = 0;
-                host_state.last_download = None;
-                host_state.next_allowed = None;
-            }
-        }
-
-        let allowed_at = host_state
-            .next_allowed
-            .map(|next_allowed| next_allowed.max(now))
-            .unwrap_or(now);
-
-        host_state.counter += 1;
-        host_state.last_download = Some(allowed_at);
-        host_state.next_allowed =
-            Some(allowed_at + self.delay_after_request(host_state.counter, wait_steps, interval));
-
-        allowed_at.checked_duration_since(now).unwrap_or_default()
-    }
-
-    fn delay_after_request(&self, counter: u32, wait_steps: u32, interval: Duration) -> Duration {
-        if wait_steps > 0 && counter.is_multiple_of(wait_steps) && counter >= wait_steps {
-            self.max_steps_wait_time.max(interval)
-        } else if counter > 0 {
-            interval
-        } else {
-            Duration::ZERO
-        }
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-fn host_key_from_url(url: &str) -> String {
-    url::Url::parse(url)
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(str::to_string))
-        .unwrap_or_else(|| GLOBAL_HOST_KEY.to_string())
+/// `download.interval` / `download.wait-steps` の保存値を共有規則で展開する。
+fn load_download_pacing() -> DownloadPacing {
+    let values = crate::db::settings::load(crate::setting_core::SettingScope::Local)
+        .unwrap_or_default();
+    DownloadPacing::from_settings(&values)
 }
 
-fn load_interval_secs() -> f64 {
-    crate::compat::load_local_setting_value("download.interval")
-        .and_then(|value| match value {
-            serde_yaml::Value::Number(number) => number.as_f64(),
-            serde_yaml::Value::String(raw) => raw.parse::<f64>().ok(),
-            _ => None,
-        })
-        .unwrap_or(DEFAULT_INTERVAL_SECS)
-        .max(0.0)
-}
-
-fn load_wait_steps(is_narou: bool) -> u32 {
-    let raw_wait_steps = crate::compat::load_local_setting_value("download.wait-steps")
-        .and_then(|value| match value {
-            serde_yaml::Value::Number(number) => number.as_i64(),
-            serde_yaml::Value::String(raw) => raw.parse::<i64>().ok(),
-            _ => None,
-        })
-        .unwrap_or(0);
-    normalize_wait_steps(raw_wait_steps, is_narou)
-}
-
-fn normalize_wait_steps(raw_wait_steps: i64, is_narou: bool) -> u32 {
-    crate::platform::normalize_wait_steps(raw_wait_steps, is_narou)
+/// 許可エンジンの ms (プロセス開始からの経過)。
+fn monotonic_ms() -> u64 {
+    u64::try_from(MONOTONIC_BASE.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -204,84 +100,59 @@ mod tests {
 
     use parking_lot::Mutex;
 
-    use super::{DEFAULT_INTERVAL_SECS, RateLimiter, STATE, normalize_wait_steps};
+    use super::{RateLimiter, STATE};
+    use crate::platform::{DownloadPacing, RateLimitScope};
 
     static TEST_MUTEX: Mutex<()> = parking_lot::const_mutex(());
 
     fn reset_state() {
-        STATE.lock().hosts.clear();
+        STATE.lock().clear();
+    }
+
+    fn limiter_with_interval(interval_secs: f64) -> RateLimiter {
+        RateLimiter::from_pacing(DownloadPacing::new(Some(interval_secs), Some(0)))
+    }
+
+    /// Exercise the same grant/recheck loop without a Tokio runtime.
+    fn acquire_and_wait(limiter: &RateLimiter, scope: &RateLimitScope) {
+        loop {
+            match limiter.try_acquire(scope) {
+                super::PacingDecision::Granted => return,
+                super::PacingDecision::Wait { wait_ms } => {
+                    thread::sleep(Duration::from_millis(wait_ms));
+                }
+            }
+        }
     }
 
     #[test]
     fn site_interval_floor_applies_to_the_scope_only() {
         let _guard = TEST_MUTEX.lock();
         reset_state();
-        let limiter = RateLimiter::from_values(0.7, 0);
-        let pixiv = crate::platform::RateLimitScope::site("interval-floor.example")
-            .with_min_interval(Some(5.0));
-        let other = crate::platform::RateLimitScope::site("interval-floor-other.example");
+        let limiter = limiter_with_interval(0.7);
+        let pixiv = RateLimitScope::site("interval-floor.example").with_min_interval(Some(5.0));
+        let other = RateLimitScope::site("interval-floor-other.example");
 
-        // 1 回目は待たない。2 回目はサイト定義の下限まで待つ。
-        assert!(limiter.reserve_wait_duration_for_scope(&pixiv).is_zero());
-        let second = limiter.reserve_wait_duration_for_scope(&pixiv);
-        // 予約から測定までのわずかな差を見込んで少し緩める。
-        assert!(second >= Duration::from_millis(4950), "got {second:?}");
-        assert!(second < Duration::from_secs(6), "got {second:?}");
-
-        // 下限を宣言していないサイトは従来どおり全体設定の間隔。
-        assert!(limiter.reserve_wait_duration_for_scope(&other).is_zero());
-        let second = limiter.reserve_wait_duration_for_scope(&other);
-        assert!(second >= Duration::from_millis(600), "got {second:?}");
-        assert!(second < Duration::from_secs(1), "got {second:?}");
+        assert_eq!(limiter.try_acquire(&pixiv), super::PacingDecision::Granted);
+        let super::PacingDecision::Wait { wait_ms } = limiter.try_acquire(&pixiv) else {
+            panic!("site floor did not delay the second request");
+        };
+        assert!((4_950..=5_000).contains(&wait_ms), "got {wait_ms}");
+        assert_eq!(limiter.try_acquire(&other), super::PacingDecision::Granted);
+        let super::PacingDecision::Wait { wait_ms } = limiter.try_acquire(&other) else {
+            panic!("global interval did not delay the second request");
+        };
+        assert!((600..=700).contains(&wait_ms), "got {wait_ms}");
     }
 
-    #[test]
-    fn narou_wait_steps_defaults_to_ten() {
-        assert_eq!(normalize_wait_steps(0, true), 10);
-    }
-
-    #[test]
-    fn non_narou_wait_steps_defaults_to_zero() {
-        assert_eq!(normalize_wait_steps(0, false), 0);
-    }
-
-    #[test]
-    fn narou_wait_steps_are_capped_to_ten() {
-        assert_eq!(normalize_wait_steps(50, true), 10);
-    }
-
-    #[test]
-    fn non_narou_wait_steps_are_preserved() {
-        assert_eq!(normalize_wait_steps(50, false), 50);
-    }
-
-    #[test]
-    fn interval_lower_than_zero_is_clamped() {
-        let limiter = RateLimiter::from_values(-1.0, 0);
-        assert_eq!(limiter.interval, std::time::Duration::from_secs(0));
-        assert_eq!(
-            limiter.max_steps_wait_time,
-            std::time::Duration::from_secs(5)
-        );
-    }
-
-    #[test]
-    fn default_interval_uses_ruby_compatible_value() {
-        let limiter = RateLimiter::from_values(DEFAULT_INTERVAL_SECS, 0);
-        assert_eq!(limiter.interval, std::time::Duration::from_millis(700));
-        assert_eq!(
-            limiter.max_steps_wait_time,
-            std::time::Duration::from_secs(5)
-        );
-    }
 
     #[test]
     fn same_host_requests_keep_their_reserved_order() {
         let _guard = TEST_MUTEX.lock();
         reset_state();
 
-        let limiter = Arc::new(RateLimiter::from_values(0.08, 0));
-        limiter.wait_for_host("same.example");
+        let limiter = Arc::new(limiter_with_interval(0.08));
+        acquire_and_wait(&limiter, &RateLimitScope::site("same.example"));
 
         let started = Instant::now();
         let barrier = Arc::new(Barrier::new(3));
@@ -292,7 +163,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                limiter.wait_for_host("same.example");
+                acquire_and_wait(&limiter, &RateLimitScope::site("same.example"));
                 started.elapsed()
             }));
         }
@@ -324,8 +195,8 @@ mod tests {
         let _guard = TEST_MUTEX.lock();
         reset_state();
 
-        let limiter = Arc::new(RateLimiter::from_values(0.08, 0));
-        limiter.wait_for_host("alpha.example");
+        let limiter = Arc::new(limiter_with_interval(0.08));
+        acquire_and_wait(&limiter, &RateLimitScope::site("alpha.example"));
 
         let barrier = Arc::new(Barrier::new(2));
         let sleeping_worker = {
@@ -333,7 +204,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                limiter.wait_for_host("alpha.example");
+                acquire_and_wait(&limiter, &RateLimitScope::site("alpha.example"));
             })
         };
 
@@ -341,7 +212,7 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
 
         let started = Instant::now();
-        limiter.wait_for_host("beta.example");
+        acquire_and_wait(&limiter, &RateLimitScope::site("beta.example"));
         let elapsed = started.elapsed();
 
         assert!(
@@ -367,9 +238,9 @@ mod tests {
 
         // Slow down same-host requests so the parallel worker has
         // a meaningful opportunity to outlive the wait it ignored.
-        let limiter = Arc::new(RateLimiter::from_values(0.12, 0));
+        let limiter = Arc::new(limiter_with_interval(0.12));
         let started = Instant::now();
-        limiter.wait_for_host("alpha.example");
+        acquire_and_wait(&limiter, &RateLimitScope::site("alpha.example"));
         let (alpha_waited, beta_waited, gamma_waited) = {
             let limiter_alpha = Arc::clone(&limiter);
             let limiter_beta = Arc::clone(&limiter);
@@ -382,20 +253,20 @@ mod tests {
 
             let alpha_handle = thread::spawn(move || {
                 barrier_a.wait();
-                limiter_alpha.wait_for_host("alpha.example");
+                acquire_and_wait(&limiter_alpha, &RateLimitScope::site("alpha.example"));
                 // Include thread/barrier startup since the priming request.
                 started.elapsed()
             });
             let beta_handle = thread::spawn(move || {
                 barrier_b.wait();
                 let local = Instant::now();
-                limiter_beta.wait_for_host("beta.example");
+                acquire_and_wait(&limiter_beta, &RateLimitScope::site("beta.example"));
                 local.elapsed()
             });
             let gamma_handle = thread::spawn(move || {
                 barrier_c.wait();
                 let local = Instant::now();
-                limiter_gamma.wait_for_host("gamma.example");
+                acquire_and_wait(&limiter_gamma, &RateLimitScope::site("gamma.example"));
                 local.elapsed()
             });
 
@@ -404,7 +275,7 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
             // Take the priming-host slot again from the main thread
             // so another same-host caller has to wait for it.
-            limiter.wait_for_host("delta.example");
+            acquire_and_wait(&limiter, &RateLimitScope::site("delta.example"));
 
             (
                 alpha_handle.join().expect("alpha"),

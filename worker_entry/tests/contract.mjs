@@ -14,6 +14,9 @@
 // 終端状態になるまで待つ) を行う。ローカルでも `wrangler dev` は queue を
 // 処理するが、環境によっては配送されないので既定では無効にする。
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import http from "node:http";
+import https from "node:https";
 import process from "node:process";
 import test from "node:test";
 
@@ -141,6 +144,224 @@ async function request(path, init = {}) {
 async function errorCode(response) {
   const body = await json(response);
   return body?.error?.code;
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** 設定ページと同じ経路で local/global 設定を保存する。 */
+async function saveSettings(settings) {
+  const response = await request("/api/global_setting", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ settings }),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.success === true, `settings save failed: ${JSON.stringify(body)}`);
+}
+
+/** GET /api/global_setting の view。 */
+async function fetchSettingsView() {
+  return json(await request("/api/global_setting", auth()));
+}
+
+/** 設定ページの (name → value) スナップショット。 */
+function settingValues(view) {
+  const values = new Map();
+  for (const item of view.settings ?? []) {
+    values.set(item.name, item.value);
+  }
+  return values;
+}
+
+/** `/api/global_setting` を素の応答 (status + body) で叩く (失敗応答の検査用)。 */
+async function postSettings(body) {
+  const response = await request("/api/global_setting", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await json(response) };
+}
+
+/** 1 プランを `/api/jobs` で投入し、受理された job_id を返す。 */
+async function enqueuePlan(kind, target) {
+  const response = await request("/api/jobs", {
+    method: "POST",
+    ...auth(),
+    body: JSON.stringify({ kind, targets: [String(target)], options: [] }),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(
+    Array.isArray(body.ids) && body.ids.length === 1,
+    `${kind} must be accepted: ${JSON.stringify(body)}`,
+  );
+  return body.ids[0];
+}
+
+/** ジョブが終端状態 (succeeded / blocked / permanent) になるまで待つ。 */
+async function waitForTerminal(jobId, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let status = "pending";
+  while (Date.now() < deadline) {
+    const body = await json(await request(`/api/jobs/${jobId}`, auth()));
+    status = body.status;
+    if (TERMINAL_STATUSES.has(status)) return status;
+    await delay(500);
+  }
+  throw new Error(`job ${jobId} stayed ${status} for ${timeoutMs}ms`);
+}
+
+/** ジョブが指定 status になるまで待つ。 */
+async function waitForStatus(jobId, expected, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let status = "pending";
+  while (Date.now() < deadline) {
+    const body = await json(await request(`/api/jobs/${jobId}`, auth()));
+    status = body.status;
+    if (status === expected) return;
+    await delay(200);
+  }
+  throw new Error(`job ${jobId} never became ${expected} (last: ${status})`);
+}
+
+/**
+ * 依存なしの最小 WebSocket クライアント (Node の WebSocket はテスト用の
+ * Authorization ヘッダを送れないため、`http` の upgrade を直接使う)。
+ * server → client の text frame だけを JSON として記録する。
+ */
+async function openWebSocket(path = "/ws") {
+  const target = new URL(path, BASE_URL);
+  const transport = target.protocol === "https:" ? https : http;
+  const { socket, head } = await new Promise((resolve, reject) => {
+    const upgrade = transport.request(target, {
+      headers: {
+        Connection: "Upgrade",
+        Upgrade: "websocket",
+        "Sec-WebSocket-Key": crypto.randomBytes(16).toString("base64"),
+        "Sec-WebSocket-Version": "13",
+        ...accessHeaders(),
+        ...(TOKEN ? { authorization: `Bearer ${TOKEN}` } : {}),
+      },
+    });
+    // 101 と同じ TCP セグメントで届いた frame は `head` に入るので捨てない。
+    upgrade.once("upgrade", (_response, socket, head) => resolve({ socket, head }));
+    upgrade.once("response", (response) =>
+      reject(new Error(`ws upgrade rejected: ${response.statusCode}`)),
+    );
+    upgrade.once("error", reject);
+    upgrade.end();
+  });
+  return new WebSocketRecorder(socket, head);
+}
+
+class WebSocketRecorder {
+  constructor(socket, head) {
+    this.socket = socket;
+    this.messages = [];
+    this.buffer = Buffer.alloc(0);
+    socket.on("data", (chunk) => this.ingest(chunk));
+    socket.on("error", () => {});
+    if (head?.length) {
+      this.ingest(head);
+    }
+  }
+
+  ingest(chunk) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    for (;;) {
+      const frame = decodeWsFrame(this.buffer);
+      if (!frame) break;
+      this.buffer = frame.rest;
+      if (frame.opcode === 0x8) {
+        this.socket.end();
+        this.buffer = Buffer.alloc(0);
+        break;
+      }
+      if (frame.opcode === 0x1 && frame.fin) {
+        try {
+          this.messages.push(JSON.parse(frame.payload));
+        } catch {
+          // JSON 以外 (将来のバイナリ等) は無視する。
+        }
+      }
+    }
+  }
+
+  /** 指定位置からのイベント列。 */
+  slice(from) {
+    return this.messages.slice(from);
+  }
+
+  mark() {
+    return this.messages.length;
+  }
+
+  /** 受信済み echo イベントの本文 (marker 指定時は部分一致で絞る)。 */
+  echoBodies(marker = null) {
+    return this.messages
+      .filter((message) => message?.type === "echo" && typeof message.body === "string")
+      .map((message) => message.body)
+      .filter((body) => marker === null || body.includes(marker));
+  }
+
+  close() {
+    this.socket.destroy();
+  }
+}
+
+/** server → client frame (mask なし) を 1 件デコードする。未完なら null。 */
+function decodeWsFrame(buffer) {
+  if (buffer.length < 2) return null;
+  const fin = (buffer[0] & 0x80) !== 0;
+  const opcode = buffer[0] & 0x0f;
+  let length = buffer[1] & 0x7f;
+  let offset = 2;
+  if (length === 126) {
+    if (buffer.length < 4) return null;
+    length = buffer.readUInt16BE(2);
+    offset = 4;
+  } else if (length === 127) {
+    if (buffer.length < 10) return null;
+    length = Number(buffer.readBigUInt64BE(2));
+    offset = 10;
+  }
+  if (buffer.length < offset + length) return null;
+  return {
+    fin,
+    opcode,
+    payload: buffer.subarray(offset, offset + length).toString("utf8"),
+    rest: buffer.subarray(offset + length),
+  };
+}
+
+/** `from` 以降に条件を満たすメッセージが届くまで待つ。 */
+async function waitForEvent(socket, from, predicate, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const hit = socket.slice(from).find(predicate);
+    if (hit) return hit;
+    await delay(100);
+  }
+  throw new Error(
+    `event not observed; received: ${JSON.stringify(socket.slice(from).map((m) => m?.type))}`,
+  );
+}
+
+/** 指定 stream の履歴に marker が現れるまで待つ (配信は終端書き込み直後)。 */
+async function waitForHistory(stream, marker, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = "";
+  while (Date.now() < deadline) {
+    const body = await json(
+      await request(`/api/history?format=json&stream=${stream}`, auth()),
+    );
+    last = body.history;
+    if (last.includes(marker)) return last;
+    await delay(250);
+  }
+  throw new Error(`history for ${stream} never contained ${marker}: ${last.slice(-400)}`);
 }
 
 await check("GET /health/live reports the auth configuration", async () => {
@@ -336,6 +557,20 @@ await check("POST /api/download rejects an unknown target", async () => {
   );
 });
 
+await check("POST /api/download rejects the unsupported mail option", async () => {
+  // --mail の消費者は Worker に無い。成功に見せず 501 + 機械可読コードで拒否する。
+  const response = await request("/api/download", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ targets: ["999999999"], mail: true }),
+  });
+  assert(response.status === 501, `status ${response.status}`);
+  assert(
+    (await errorCode(response)) === "mail_not_supported_on_worker",
+    "the refusal must be machine readable",
+  );
+});
+
 await check("GET /api/notepad/read returns the notepad shape", async () => {
   const response = await request("/api/notepad/read", auth());
   assert(response.status === 200, `status ${response.status}`);
@@ -399,9 +634,11 @@ await check("GET /api/taginfo.json returns an array", async () => {
   assert(Array.isArray(await json(response)), "taginfo must be an array");
 });
 
-await check("GET /api/history returns the empty history", async () => {
-  const response = await request("/api/history", auth());
+await check("GET /api/history returns the JSON history shape", async () => {
+  const response = await request("/api/history?format=json", auth());
   assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(typeof body.history === "string", `history must be a string: ${JSON.stringify(body)}`);
 });
 
 await check("GET /api/version/current.json reports the version", async () => {
@@ -431,6 +668,39 @@ await check("POST /api/convert rejects an invalid target", async () => {
   const body = await json(response);
   assert(body.success === false, `unexpected body: ${JSON.stringify(body).slice(0, 200)}`);
   assert(Array.isArray(body.results) && body.results.length === 0, "results must be empty");
+});
+
+await check("POST /api/convert rejects non-EPUB devices while EPUB is accepted", async () => {
+  // Worker の出力は組み込み EPUB だけ。native 専用端末 (kindle 等) を
+  // 受理して共通出力を返すと、指定どおりの形式を黙って落とすことになる。
+  const rejected = await request("/api/convert", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ targets: ["999999999"], device: "kindle" }),
+  });
+  assert(rejected.status === 200, `status ${rejected.status}`);
+  const rejectedBody = await json(rejected);
+  assert(rejectedBody.success === false, `kindle must be refused: ${JSON.stringify(rejectedBody).slice(0, 200)}`);
+  assert(
+    String(rejectedBody.message).includes("kindle") && String(rejectedBody.message).includes("EPUB"),
+    `the refusal must explain the supported format: ${JSON.stringify(rejectedBody)}`,
+  );
+  assert(
+    Array.isArray(rejectedBody.results) && rejectedBody.results.length === 0,
+    "a refused plan must not queue anything",
+  );
+
+  const accepted = await request("/api/convert", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ targets: ["999999999"], device: "epub" }),
+  });
+  assert(accepted.status === 200, `status ${accepted.status}`);
+  const acceptedBody = await json(accepted);
+  assert(acceptedBody.success === true, `epub must be accepted: ${JSON.stringify(acceptedBody).slice(0, 200)}`);
+  assert(acceptedBody.results.length === 1, `expected one result: ${JSON.stringify(acceptedBody)}`);
+  assert.equal(acceptedBody.results[0].status, "queued");
+  assert.equal(acceptedBody.results[0].device, "epub");
 });
 
 await check("POST /api/update rejects an invalid target", async () => {
@@ -662,6 +932,42 @@ await check("GET /api/webui/config returns the UI configuration", async () => {
   assert(typeof body.concurrency_enabled === "boolean", "concurrency_enabled must be a boolean");
 });
 
+await check("POST /api/global_setting refreshes the fresh config and broadcasts a reload", async () => {
+  // 表示設定 (theme / concurrency) の保存は: (1) キャッシュを迂回した
+  // `?fresh=1` の設定に反映され、(2) `webui.config.reload` を購読者へ送る。
+  const view = await fetchSettingsView();
+  const valueOf = (name) => view.settings.find((item) => item.name === name)?.value ?? null;
+  const themeBefore = valueOf("webui.theme");
+  const concurrencyBefore = valueOf("concurrency");
+  const themeNext = themeBefore === "Cerulean" ? "Superhero" : "Cerulean";
+  const concurrencyNext = !concurrencyBefore;
+
+  const socket = await openWebSocket();
+  try {
+    const mark = socket.mark();
+    const saved = await postSettings({
+      settings: { "webui.theme": themeNext, concurrency: concurrencyNext },
+      expected_settings: { "webui.theme": themeBefore, concurrency: concurrencyBefore },
+    });
+    assert.equal(saved.body.success, true, `display save must succeed: ${JSON.stringify(saved.body)}`);
+    await waitForEvent(socket, mark, (message) => message?.type === "webui.config.reload");
+
+    const fresh = await json(await request("/api/webui/config?fresh=1", auth()));
+    assert.equal(fresh.theme, themeNext, "the fresh config must reflect the saved theme");
+    assert.equal(
+      fresh.concurrency_enabled,
+      concurrencyNext,
+      "the fresh config must reflect the saved concurrency",
+    );
+  } finally {
+    socket.close();
+    await postSettings({
+      settings: { "webui.theme": themeBefore, concurrency: concurrencyBefore },
+      expected_settings: { "webui.theme": themeNext, concurrency: concurrencyNext },
+    });
+  }
+});
+
 await check("GET /api/sort_state returns the current sort", async () => {
   const response = await request("/api/sort_state", auth());
   assert(response.status === 200, `status ${response.status}`);
@@ -779,6 +1085,193 @@ await check("GET /api/global_setting returns the settings page payload", async (
     body.settings.every((item) => typeof item.name === "string" && typeof item.tab === "string"),
     "every setting needs a name and a tab",
   );
+});
+
+await check("POST /api/global_setting rejects a stale expected value without overwriting", async () => {
+  // 最初の保存は「D1 に行が無い」スコープでも通る (画面が見た null が expected)。
+  // 続く古い画面からの保存は conflict で弾かれ、先の勝者を上書きしない。
+  // local スコープ (concurrency / webui.theme) と global スコープ
+  // (convert.epub-font) を同時に変え、どちらの行にも同じ CAS が効くことを見る。
+  const before = settingValues(await fetchSettingsView());
+  const themeBefore = before.get("webui.theme") ?? null;
+  const concurrencyBefore = before.get("concurrency") ?? null;
+  const fontSizeBefore = before.get("convert.epub-font") ?? null;
+  // 再実行でも「最初の保存が必ず値を変える」ように交互の値を選ぶ。
+  const themeWinner = themeBefore === "Darkly" ? "Slate" : "Darkly";
+  const concurrencyWinner = !concurrencyBefore;
+  const fontSizeWinner = fontSizeBefore === "always" ? "auto" : "always";
+
+  try {
+  const first = await postSettings({
+    settings: {
+      "webui.theme": themeWinner,
+      concurrency: concurrencyWinner,
+      "convert.epub-font": fontSizeWinner,
+    },
+    expected_settings: {
+      "webui.theme": themeBefore,
+      concurrency: concurrencyBefore,
+      "convert.epub-font": fontSizeBefore,
+    },
+  });
+  assert.equal(first.status, 200, `status ${first.status}`);
+  assert.equal(first.body.success, true, `first save must succeed: ${JSON.stringify(first.body)}`);
+
+  const stale = await postSettings({
+    settings: {
+      "webui.theme": themeBefore ?? "Readable",
+      concurrency: concurrencyBefore ?? true,
+      "convert.epub-font": fontSizeBefore ?? "auto",
+    },
+    expected_settings: {
+      "webui.theme": themeBefore,
+      concurrency: concurrencyBefore,
+      "convert.epub-font": fontSizeBefore,
+    },
+  });
+  // native と同じ流儀: 競合は HTTP 409。Worker ハンドラの 409 化に合わせる
+  // (それ以前の 200 + success:false ビルドではこの検査は落ちる)。
+  assert.equal(stale.status, 409, `status ${stale.status}`);
+  assert.equal(stale.body.success, false, `a stale save must not succeed: ${JSON.stringify(stale.body)}`);
+  assert.equal(stale.body.conflict, true, `the conflict must be machine readable: ${JSON.stringify(stale.body)}`);
+
+  // GET は replica / 他 isolate の TTL キャッシュを使うため、保存直後でも
+  // 古い値を返せる。primary を読む no-op CAS で、勝者の local/global 値が
+  // どれも上書きされていないことを検証する (違えば 409、同じなら書き込み無し)。
+  const winner = {
+    "webui.theme": themeWinner,
+    concurrency: concurrencyWinner,
+    "convert.epub-font": fontSizeWinner,
+  };
+  const unchanged = await postSettings({ settings: winner, expected_settings: winner });
+  assert.equal(unchanged.status, 200, `the stale save must preserve every winner value: ${JSON.stringify(unchanged.body)}`);
+  assert.equal(unchanged.body.success, true, `the winner snapshot must still match: ${JSON.stringify(unchanged.body)}`);
+  } finally {
+    await postSettings({
+      settings: { "webui.theme": themeBefore, concurrency: concurrencyBefore, "convert.epub-font": fontSizeBefore },
+      expected_settings: { "webui.theme": themeWinner, concurrency: concurrencyWinner, "convert.epub-font": fontSizeWinner },
+    });
+  }
+});
+
+await check("POST /api/global_setting writes only the dirty keys", async () => {
+  // 未変更の設定 (未設定 = nil を含む) は保存で書き換わらない。W1 の
+  // 「触っていない nil の boolean が false に化ける」回帰を固定する。
+  const before = settingValues(await fetchSettingsView());
+  const themeBefore = before.get("webui.theme") ?? null;
+  const concurrencyBefore = before.get("concurrency") ?? null;
+  const themeNext = themeBefore === "United" ? "Readable" : "United";
+  const concurrencyNext = !concurrencyBefore;
+
+  try {
+  const saved = await postSettings({
+    settings: { "webui.theme": themeNext, concurrency: concurrencyNext },
+    expected_settings: { "webui.theme": themeBefore, concurrency: concurrencyBefore },
+  });
+  assert.equal(saved.body.success, true, `dirty save must succeed: ${JSON.stringify(saved.body)}`);
+
+  const after = settingValues(await fetchSettingsView());
+  for (const [name, value] of before) {
+    if (name === "webui.theme" || name === "concurrency") {
+      continue;
+    }
+    assert.deepEqual(
+      after.get(name),
+      value,
+      `${name} must not change when it is not in the request (was ${JSON.stringify(value)})`,
+    );
+  }
+  } finally {
+    await postSettings({
+      settings: { "webui.theme": themeBefore, concurrency: concurrencyBefore },
+      expected_settings: { "webui.theme": themeNext, concurrency: concurrencyNext },
+    });
+  }
+});
+
+await check("POST /api/global_setting rejects settings the worker cannot honor", async () => {
+  const view = await fetchSettingsView();
+  const ineffective = view.settings.filter((item) => item.worker_ineffective === true);
+  assert(ineffective.length > 0, "the worker must mark settings that have no execution path");
+  const logging = view.settings.find((item) => item.name === "logging");
+  assert.equal(logging?.worker_ineffective, true, "logging must be marked worker_ineffective");
+  const target = ineffective[0];
+  const themeName = "webui.theme";
+  const themeBefore = view.settings.find((item) => item.name === themeName)?.value ?? null;
+
+  const rejected = await postSettings({
+    settings: { [target.name]: "1", [themeName]: "Darkly" },
+  });
+  assert.equal(rejected.body.success, false, `an ineffective setting must be refused: ${JSON.stringify(rejected.body)}`);
+  assert(
+    String(rejected.body.message).includes("変更できません"),
+    `the refusal must be machine readable in the message: ${JSON.stringify(rejected.body)}`,
+  );
+  assert(
+    String(rejected.body.message).includes(target.name),
+    `the refusal must name the setting: ${JSON.stringify(rejected.body)}`,
+  );
+
+  // 配備上限 (Cloudflare Queues の max_retries=3) を超える再試行回数も拒否。
+  const tooManyRetries = await postSettings({ settings: { "queue.max-retries": 10 } });
+  assert.equal(tooManyRetries.body.success, false, `max-retries>3 must be refused: ${JSON.stringify(tooManyRetries.body)}`);
+  assert(
+    String(tooManyRetries.body.message).includes("最大 3"),
+    `the refusal must state the cap: ${JSON.stringify(tooManyRetries.body)}`,
+  );
+
+  const after = await fetchSettingsView();
+  const valueOf = (name) => after.settings.find((item) => item.name === name)?.value;
+  assert.deepEqual(valueOf(target.name), target.value, "a rejected setting must keep its stored value");
+  assert.notEqual(valueOf("queue.max-retries"), 10, "the rejected retry count must not be stored");
+  assert.equal(valueOf(themeName), themeBefore, "a rejected request must not write its other settings");
+});
+
+await check("POST /api/global_setting rejects a stale replace_content without writing settings", async () => {
+  const view = await fetchSettingsView();
+  const replaceBefore = view.replace_content ?? "";
+  // 再実行でも「最初の保存が必ず内容を変える」ように交互の値を使う。
+  const firstValue = replaceBefore === "contract-replace-alpha" ? "contract-replace-beta" : "contract-replace-alpha";
+  const staleValue = firstValue === "contract-replace-alpha" ? "contract-replace-beta" : "contract-replace-alpha";
+
+  // 初回は (行が無い状態の) 期待値そのままで保存が通る。
+  const first = await postSettings({
+    settings: {},
+    replace_content: firstValue,
+    expected_replace_content: replaceBefore,
+  });
+  assert.equal(first.body.success, true, `the first replace save must succeed: ${JSON.stringify(first.body)}`);
+
+  // 古い画面: settings の変更も同梱しているが、置換の競合で全体が弾かれる。
+  const victim = "webui.table.reload-timing";
+  const victimBefore = view.settings.find((item) => item.name === victim)?.value ?? null;
+  const victimNext = victimBefore === "queue" ? "every" : "queue";
+  const stale = await postSettings({
+    settings: { [victim]: victimNext },
+    expected_settings: { [victim]: victimBefore },
+    replace_content: staleValue,
+    expected_replace_content: replaceBefore,
+  });
+  // native と同じ流儀: 競合は HTTP 409 (Worker ハンドラの 409 化に合わせる)。
+  assert.equal(stale.status, 409, `status ${stale.status}`);
+  assert.equal(stale.body.success, false, `a stale replace must not succeed: ${JSON.stringify(stale.body)}`);
+  assert.equal(stale.body.conflict, true, `the replace conflict must be machine readable: ${JSON.stringify(stale.body)}`);
+
+  const after = await fetchSettingsView();
+  assert.equal(after.replace_content, firstValue, "the stale replace must not overwrite the winner");
+  assert.equal(
+    after.settings.find((item) => item.name === victim)?.value,
+    victimBefore,
+    "the rejected request must not write its settings either",
+  );
+
+  // 後始末: 元の内容へ戻す。
+  const restored = await postSettings({
+    settings: {},
+    replace_content: replaceBefore,
+    expected_replace_content: firstValue,
+  });
+  assert.equal(restored.body.success, true, `restoring replace_content must succeed: ${JSON.stringify(restored.body)}`);
 });
 
 await check("POST /api/global_setting stores a value", async () => {
@@ -1225,6 +1718,206 @@ if (QUEUE_CHECKS) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     throw new Error(`job stayed ${status} for 60s (queue consumer did not run)`);
+  });
+
+  await check("console history keeps the convert lines per stream and clear empties both", async () => {
+    const prior = settingValues(await fetchSettingsView()).get("concurrency") ?? null;
+    await saveSettings({ concurrency: true });
+    try {
+    // 直前の検査の Convert ジョブ (999999999) の終端 echo が履歴に載るまで
+    // 待ってから消す — 消去後に in-flight の echo が着地する競合を避ける。
+    await waitForHistory("stdout", "999999999");
+
+    // 前回実行の残りを落としてから、専用の Convert ジョブで履歴を作る。
+    const cleared = await json(
+      await request("/api/clear_history", { method: "POST", ...auth() }),
+    );
+    assert(cleared.success === true, `clear must succeed: ${JSON.stringify(cleared)}`);
+    for (const stream of ["stdout", "stdout2"]) {
+      const empty = await json(
+        await request(`/api/history?format=json&stream=${stream}`, auth()),
+      );
+      assert.equal(empty.history, "", `cleared ${stream} history must be empty`);
+    }
+
+    const marker = "999999901";
+    const jobId = await enqueuePlan("Convert", marker);
+    await waitForTerminal(jobId);
+    // Convert 行は concurrency 既定 (有効) で stdout2、終端の失敗 echo は
+    // stdout に出る (native `console_target_for_job` と同じ分離)。
+    const subHistory = await waitForHistory("stdout2", `処理中: ${marker}`);
+    assert(subHistory.includes("変換処理開始"), `stdout2 must hold the convert lines: ${subHistory.slice(-400)}`);
+
+    const main = await json(await request("/api/history?format=json", auth()));
+    assert(main.history.includes(marker), `stdout must hold the terminal failure echo: ${main.history.slice(-400)}`);
+    assert(!main.history.includes("処理中"), `stdout must not receive stdout2 lines: ${main.history.slice(-400)}`);
+
+    // 「すべての履歴を取得」の再読で、まだ上限内の行が消えない。
+    const again = await json(
+      await request("/api/history?format=json&stream=stdout2", auth()),
+    );
+    assert.equal(again.history, subHistory, "re-reading history must not drop earlier lines");
+
+    // format 無しは native と同じ text/plain。
+    const text = await request("/api/history?stream=stdout2", auth());
+    assert(text.status === 200, `status ${text.status}`);
+    assert(
+      text.headers.get("content-type")?.includes("text/plain"),
+      "text history must be plain text",
+    );
+    assert.equal(await text.text(), subHistory, "text history must match the JSON history");
+    } finally {
+      await saveSettings({ concurrency: prior });
+    }
+  });
+
+  await check("a websocket reconnect replays history and cannot revive cleared lines", async () => {
+    // 事前条件: 直前の検査の履歴が残っている。再接続がそれを再生することを
+    // 確かめてから消す (消去後の「再生されない」を意味ある検査にする)。
+    const replaySocket = await openWebSocket();
+    try {
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline && replaySocket.echoBodies("999999901").length === 0) {
+        await delay(100);
+      }
+      assert(
+        replaySocket.echoBodies("999999901").length > 0,
+        `reconnect must replay persisted history: ${JSON.stringify(replaySocket.echoBodies().slice(-3))}`,
+      );
+    } finally {
+      replaySocket.close();
+    }
+
+    const cleared = await json(
+      await request("/api/clear_history", { method: "POST", ...auth() }),
+    );
+    assert(cleared.success === true, `clear must succeed: ${JSON.stringify(cleared)}`);
+    for (const stream of ["stdout", "stdout2"]) {
+      const after = await json(
+        await request(`/api/history?format=json&stream=${stream}`, auth()),
+      );
+      assert.equal(after.history, "", `clear must empty the persisted ${stream} history`);
+    }
+
+    const clearedSocket = await openWebSocket();
+    try {
+      await delay(500);
+      assert.deepEqual(
+        clearedSocket.echoBodies(),
+        [],
+        `a reconnect must not revive cleared lines: ${JSON.stringify(clearedSocket.echoBodies().slice(-3))}`,
+      );
+    } finally {
+      clearedSocket.close();
+    }
+  });
+
+  await check("webui.table.reload-timing gates the terminal table refresh", async () => {
+    // ローカルの queue consumer はメッセージを 1 通ずつ直列に配送する
+    // (max_batch_size=1。max_concurrency はローカルでは効かない) ため、
+    // 「別のジョブが残っている間の終端」は pacing に入る Update の後ろへ速い
+    // Convert を並べて作る: 直列配送では Convert が pending、並行配送では
+    // Update が running のまま残る。どちらでも最後の終端だけがキューを掃くので、
+    // 同じイベント列の順序で契約を検査できる。
+    const view = await json(await request("/api/global_setting", auth()));
+    const currentValue = (name) =>
+      view.settings?.find((item) => item.name === name)?.value ?? null;
+    const previousInterval = currentValue("update.interval");
+    const previousTiming = currentValue("webui.table.reload-timing");
+
+    await request("/api/queue/clear", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...auth().headers },
+      body: "{}",
+    });
+    // pacing (native の下限は 2.5 秒) を確実に観測できる間隔にする。
+    await saveSettings({ "update.interval": 5, "webui.table.reload-timing": "queue" });
+
+    const terminalEvents = (messages, first, second) =>
+      messages.filter(
+        (message) =>
+          message?.type === "queue_failed" &&
+          (message?.data?.job_id === first || message?.data?.job_id === second),
+      );
+    const socket = await openWebSocket();
+    try {
+      // A: このドメインの pacing スロットを消費して終端する (最初の Update は
+      // 待たず、2 通目から update.interval の待ちに入る)。
+      const pacingJobId = await enqueuePlan("Update", 999999911);
+      await waitForTerminal(pacingJobId);
+
+      // queue タイミング: もう 1 つのジョブが pending または running のまま
+      // 先に終端する側では table.reload を送らず、キューが掃けた最後の終端で
+      // だけ送る。progressbar.clear / notification.queue は抑制中も届く。
+      const queueMark = socket.mark();
+      const pacedJobId = await enqueuePlan("Update", 999999912);
+      await waitForStatus(pacedJobId, "running");
+      const convertC = await enqueuePlan("Convert", 999999913);
+      await waitForTerminal(convertC);
+      await waitForTerminal(pacedJobId);
+      await waitForEvent(socket, queueMark, (message) => message?.type === "table.reload");
+      const duringQueue = socket.slice(queueMark);
+      const queueTerminals = terminalEvents(duringQueue, pacedJobId, convertC);
+      assert.equal(
+        queueTerminals.length,
+        2,
+        `both terminals must appear: ${JSON.stringify(duringQueue.map((m) => m?.type))}`,
+      );
+      const beforeLastQueueTerminal = duringQueue.slice(
+        0,
+        duringQueue.lastIndexOf(queueTerminals[1]),
+      );
+      assert(
+        !beforeLastQueueTerminal.some((message) => message?.type === "table.reload"),
+        `queue timing must suppress table.reload until the queue drains: ${JSON.stringify(duringQueue.map((m) => m?.type))}`,
+      );
+      assert(
+        duringQueue.some((message) => message?.type === "table.reload"),
+        `the terminal that drained the queue must send table.reload: ${JSON.stringify(duringQueue.map((m) => m?.type))}`,
+      );
+      assert(
+        beforeLastQueueTerminal.some((message) => message?.type === "notification.queue"),
+        "notification.queue must stay live even when the table reload is suppressed",
+      );
+      assert(
+        beforeLastQueueTerminal.some((message) => message?.type === "progressbar.clear"),
+        "progressbar.clear must stay live even when the table reload is suppressed",
+      );
+
+      // every: 実行中/待機中のジョブが残っていても、各終端が table.reload を送る。
+      await saveSettings({ "webui.table.reload-timing": "every" });
+      const everyMark = socket.mark();
+      const pacedJobE = await enqueuePlan("Update", 999999914);
+      const convertD = await enqueuePlan("Convert", 999999915);
+      await waitForTerminal(pacedJobE);
+      await waitForTerminal(convertD);
+      await waitForEvent(socket, everyMark, (message) => message?.type === "table.reload");
+      const duringEvery = socket.slice(everyMark);
+      const everyTerminals = terminalEvents(duringEvery, pacedJobE, convertD);
+      assert.equal(
+        everyTerminals.length,
+        2,
+        `both terminals must appear: ${JSON.stringify(duringEvery.map((m) => m?.type))}`,
+      );
+      const beforeLastEveryTerminal = duringEvery.slice(
+        0,
+        duringEvery.lastIndexOf(everyTerminals[1]),
+      );
+      assert(
+        beforeLastEveryTerminal.some((message) => message?.type === "table.reload"),
+        `every timing must send table.reload while another job remains: ${JSON.stringify(duringEvery.map((m) => m?.type))}`,
+      );
+      assert(
+        duringEvery.some((message) => message?.type === "tag.updateCanvas"),
+        "every timing must send tag.updateCanvas with the table reload",
+      );
+    } finally {
+      socket.close();
+      await saveSettings({
+        "update.interval": previousInterval,
+        "webui.table.reload-timing": previousTiming,
+      });
+    }
   });
 } else {
   console.log("skip Convert job terminal-state check (set CONTRACT_QUEUE=1 to enable)");

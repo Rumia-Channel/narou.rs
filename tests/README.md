@@ -38,6 +38,43 @@ cargo check -p narou_worker --target wasm32-unknown-unknown
 These verify backend policy, mandatory deployment verification, and sanitized bounded LIST probes.
 They do not run a live migration, Cloudflare deployment, or production S3 request.
 
-`node --test tests/worker_dispatch.test.mjs` verifies the actual GitHub Actions
-job conditions: normal SORAHOST routing stays unchanged, and an explicit manual
-Workers opt-in runs the selected deployment and its prerequisites.
+Shared runtime boundary regressions:
+
+```sh
+cargo test --features lite --test novel_settings_atomic --test worker_object_updates --test http_pacing
+cargo test --features lite --lib application::settings::tests
+cargo test --features lite --lib native::sqlite::content::tests
+```
+
+These cover independent settings writers, canonical-save/mirror-failure acknowledgements,
+full-snapshot D1 compare-and-swap (including equal-CRC collisions), physical redirect pacing,
+integral-float JSON baselines and decoded converted-output storage. The D1 SQL regressions
+run the production statements against SQLite; they do not replace real Workerd verification.
+Run `worker_entry/tests/contract.mjs` against a real `wrangler dev` instance with
+`BASE_URL`, `NAROU_ADMIN_TOKEN` and `CONTRACT_QUEUE=1` for HTTP, queue and replay contracts.
+
+Release data-preservation regressions:
+
+```sh
+cargo test --features lite --test yaml_rollback_roundtrip
+cargo test --features lite --lib platform::s3_store::tests
+```
+
+These cover failed content/metadata/marker publication followed by acknowledged writes
+and reopening, interruption between provenance commit and a second publication,
+bundle exports aimed at the live management directory, preserved external legacy-file edits,
+and S3 copy responses that must not trigger source deletion unless a complete success result is present.
+
+Progress and Pixiv series-tag regressions:
+
+```sh
+node --test tests/progress_bars.test.mjs
+cargo test -p narou_rs --lib progress_tests
+cargo test -p narou_rs --lib downloader::toc::tests
+cargo test -p narou_rs --test pixiv_series_tags
+```
+
+These cover independent attempts and peers, cancellation/reconnect tombstones,
+unknown TOC totals and cyclic pagination, and tag aggregation across a 31-episode
+series. The update case changes only a later-page tag, keeps manual tags, and
+does not download unchanged section bodies.

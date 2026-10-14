@@ -19,11 +19,11 @@
 //! にする (`request_preserves_input_order` / `requested_or_current_sort_state`
 //! の「常にサーバー側を使う」実装に対応)。
 //!
-//! native の `push_server.broadcast_event("table.reload", ...)` は Worker に
-//! broadcast 経路 (WebSocket push) が無いので送れない。フロントは
-//! `postJson` の成功後に `refreshList()` を自前で呼ぶため実害は無い
-//! (`ui/actions.js` の `batchAction` / 削除モーダル参照)。
+//! native `batch.rs` と同じく、変更後に PushHub 経由で他クライアントへ
+//! 再読込イベントを配信する (凍結系は一覧だけ、削除はタグ表示も — 選択は
+//! `application::webui::mutations` が唯一の定義)。
 
+use narou_rs::application::webui::mutations::MutationNotice;
 use narou_rs::application::{ApplicationError, FileDeletionStatus, FreezeRequest, RemoveRequest};
 use narou_rs::platform::NovelId;
 use serde::Deserialize;
@@ -94,10 +94,10 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     };
 
     match route {
-        Route::FreezeToggle => freeze_toggle(&runtime, &body).await,
-        Route::Freeze => batch_freeze(&runtime, &body, true).await,
-        Route::Unfreeze => batch_freeze(&runtime, &body, false).await,
-        Route::Remove => batch_remove(&runtime, &body).await,
+        Route::FreezeToggle => freeze_toggle(&env, &runtime, &body).await,
+        Route::Freeze => batch_freeze(&env, &runtime, &body, true).await,
+        Route::Unfreeze => batch_freeze(&env, &runtime, &body, false).await,
+        Route::Remove => batch_remove(&env, &runtime, &body).await,
     }
 }
 
@@ -127,15 +127,14 @@ fn missing_error(missing: &[NovelId]) -> Option<worker::Result<Response>> {
 /// サーバーソート順に並べ直す。選択外のレコードは捨てる。
 async fn sort_ids_for_request(runtime: &WorkerRuntime, ids: &[i64]) -> Vec<i64> {
     // 並べ替えはこの後の凍結/削除を形作るので、判断材料の読み取りは
-    // 更新系サービス (primary + キャッシュ無し) で行う。
-    let sort_state = load_current_sort_state_for_writes(runtime).await;
-    let records = runtime
-        .write_services()
-        .library
-        .records()
-        .await
-        .unwrap_or_default();
-    sort_ids_from_records(ids, &records, &sort_state)
+    // 更新系サービス (primary + キャッシュ無し) で行う。`sort_ids_from_records`
+    // は選択 id のレコードしか見ないため、全件スキャンではなく選択分だけを
+    // 1 クエリで読み、ソート状態の読み取りとは同時に走らせる。
+    let (records, sort_state) = futures::join!(
+        runtime.write_services().library.records_by_ids(ids),
+        load_current_sort_state_for_writes(runtime),
+    );
+    sort_ids_from_records(ids, &records.unwrap_or_default(), &sort_state)
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +142,7 @@ async fn sort_ids_for_request(runtime: &WorkerRuntime, ids: &[i64]) -> Vec<i64> 
 // ---------------------------------------------------------------------------
 
 async fn freeze_toggle(
+    env: &Env,
     runtime: &WorkerRuntime,
     body: &BatchIdsBody,
 ) -> worker::Result<Response> {
@@ -161,6 +161,8 @@ async fn freeze_toggle(
     if let Some(response) = missing_error(&result.missing) {
         return response;
     }
+    // native `batch_freeze_toggle` と同じく、一覧だけを再読込させる。
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableReload).await;
     Response::from_json(&serde_json::json!({
         "success": result.store_failed.is_empty(),
         "message": "凍結状態を切り替えました",
@@ -175,6 +177,7 @@ async fn freeze_toggle(
 // ---------------------------------------------------------------------------
 
 async fn batch_freeze(
+    env: &Env,
     runtime: &WorkerRuntime,
     body: &BatchIdsBody,
     freeze: bool,
@@ -201,6 +204,8 @@ async fn batch_freeze(
     if let Some(response) = missing_error(&result.missing) {
         return response;
     }
+    // native `batch_freeze` / `batch_unfreeze` と同じく、一覧だけを再読込させる。
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableReload).await;
     let message = if freeze {
         format!("Froze {} novels", ids.len())
     } else {
@@ -213,7 +218,11 @@ async fn batch_freeze(
 // POST /api/novels/remove — native `batch_remove`
 // ---------------------------------------------------------------------------
 
-async fn batch_remove(runtime: &WorkerRuntime, body: &BatchIdsBody) -> worker::Result<Response> {
+async fn batch_remove(
+    env: &Env,
+    runtime: &WorkerRuntime,
+    body: &BatchIdsBody,
+) -> worker::Result<Response> {
     if body.ids.len() > super::max_web_targets(runtime).await {
         return json_error(400, "bad_request", Some("too many ids"));
     }
@@ -237,6 +246,8 @@ async fn batch_remove(runtime: &WorkerRuntime, body: &BatchIdsBody) -> worker::R
     if let Some(response) = missing_error(&result.missing) {
         return response;
     }
+    // native `batch_remove` と同じく、一覧とタグ表示の両方を再読込させる。
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableAndTags).await;
     // native `batch_remove`: ファイル削除が全部成功したかだけを `success` に
     // 載せる。Worker の「ファイル」はオブジェクトストア上のオブジェクト群
     // なので、Deleted 以外 (Unavailable / Failed) はここで失敗として見える。

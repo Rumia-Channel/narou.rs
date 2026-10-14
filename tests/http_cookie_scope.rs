@@ -1,52 +1,158 @@
+#![cfg(feature = "native-runtime")]
+
 use narou_rs::downloader::http_policy::{FetchPolicy, fetch_bytes, resolve_final_url_with_body};
 use narou_rs::downloader::site_setting::SiteSetting;
-use narou_rs::platform::mocks::{FakeRateLimiter, MockHttpClient};
-use narou_rs::platform::HttpResponse;
+use narou_rs::error::Result;
+use narou_rs::native::http::NativeHttpClient;
+use narou_rs::platform::http::validate_http_url_syntax;
+use narou_rs::platform::mocks::FakeRateLimiter;
+use narou_rs::platform::{HttpClient, HttpRequest, HttpResponse, PlatformFuture};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
 
-fn setting() -> SiteSetting {
-    serde_yaml::from_str(r#"
-name: Example
-domain: example.com
-top_url: https://example.com
-toc_url: https://example.com/story
-sitename: Example
-cookie: session=canary
-headers:
-  Referer: https://example.com/
-"#).unwrap()
-}
+/// These servers are trusted loopback infrastructure, not public site URLs.
+/// The actual native transport still executes every request and redirect mode.
+struct LocalHttp(NativeHttpClient);
 
-#[test]
-fn first_request_limits_cookie_to_its_site_but_keeps_image_headers() {
-    let http = MockHttpClient::new();
-    let policy = FetchPolicy::for_site(&setting());
-    for (url, expected_cookie) in [
-        ("https://example.com/story", true),
-        ("https://img.example.com/image.png", true),
-        ("https://collector.example.net/image.png", false),
-        ("https://example.com.attacker.test/image.png", false),
-    ] {
-        http.add_text(url, 200, "image");
-        futures::executor::block_on(fetch_bytes(&http, &FakeRateLimiter::new(), url, &policy)).unwrap();
-        let requests = http.sent_requests();
-        let headers = &requests.last().unwrap().1;
-        assert_eq!(headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("cookie") && value == "session=canary"), expected_cookie, "destination: {url}");
-        assert!(headers.iter().any(|(name, value)| name == "Referer" && value == "https://example.com/"));
+impl LocalHttp {
+    fn new() -> Self {
+        Self(NativeHttpClient::new("transport-regression").unwrap())
     }
 }
 
-#[test]
-fn direct_redirect_resolution_does_not_leak_a_site_cookie_to_an_image_host() {
-    let http = MockHttpClient::new();
-    let image = "https://collector.example.net/image.png";
-    http.add_response(image, HttpResponse {
-        status: 302,
-        headers: vec![("Location".into(), "https://example.com/image.png".into())],
-        body: Vec::new(),
+impl HttpClient for LocalHttp {
+    fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
+        self.0.send(request.with_trusted_endpoint())
+    }
+
+    fn validate_url<'a>(&'a self, url: &'a str) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move { validate_http_url_syntax(url) })
+    }
+}
+
+fn policy() -> FetchPolicy {
+    let setting: SiteSetting = serde_yaml::from_str(r#"
+name: Local test
+sitename: Local test
+domain: 127.0.0.1
+top_url: http://127.0.0.1
+toc_url: http://127.0.0.1/story
+cookie: session=canary
+headers:
+  Referer: https://example.com/
+"#).unwrap();
+    FetchPolicy::for_site(&setting)
+}
+
+fn request_head(stream: &mut TcpStream) -> String {
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let count = stream.read(&mut chunk).unwrap();
+        assert_ne!(count, 0, "request ended before its head");
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            return String::from_utf8(bytes).unwrap();
+        }
+        assert!(bytes.len() <= 64 * 1024);
+    }
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+}
+
+#[tokio::test]
+async fn first_fetch_limits_cookie_scope_but_keeps_noncredential_site_headers() {
+    for (host, authenticated) in [("127.0.0.1", true), ("localhost", false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{host}:{}/image", listener.local_addr().unwrap().port());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let head = request_head(&mut stream);
+            assert_eq!(header(&head, "Referer"), Some("https://example.com/"));
+            let body = if header(&head, "Cookie") == Some("session=canary") {
+                "authenticated"
+            } else {
+                "anonymous"
+            };
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+            ).as_bytes()).unwrap();
+        });
+        let http = LocalHttp::new();
+        let response = fetch_bytes(&http, &FakeRateLimiter::new(), &url, &policy()).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(response.body, if authenticated { b"authenticated".as_slice() } else { b"anonymous".as_slice() });
+    }
+}
+
+#[tokio::test]
+async fn redirect_resolution_strips_credentials_and_never_restores_them_on_return() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let original = format!("http://127.0.0.1:{port}/start");
+    let expected = format!("http://127.0.0.1:{port}/finish");
+    let server = thread::spawn(move || {
+        for hop in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let head = request_head(&mut stream);
+            if hop == 0 {
+                assert_eq!(header(&head, "Cookie"), Some("session=canary"));
+                assert_eq!(header(&head, "Authorization"), Some("Bearer secret"));
+            } else {
+                assert!(header(&head, "Cookie").is_none(), "{head}");
+                assert!(header(&head, "Authorization").is_none(), "{head}");
+            }
+            let response = match hop {
+                0 => format!("HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/between\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                1 => format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{port}/finish\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                _ => "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nanonymous".to_string(),
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+        }
     });
-    http.add_text("https://example.com/image.png", 200, "image");
-    futures::executor::block_on(resolve_final_url_with_body(&http, &FakeRateLimiter::new(), image, &FetchPolicy::for_site(&setting()))).unwrap();
-    for (url, headers) in http.sent_requests() {
-        assert!(!headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("cookie")), "cookie leaked on {url}");
+    let http = LocalHttp::new();
+    let limiter = FakeRateLimiter::new();
+    let (final_url, reusable) = resolve_final_url_with_body(
+        &http, &limiter, &original, &policy().with_header("Authorization", "Bearer secret"),
+    ).await.unwrap();
+    server.join().unwrap();
+    assert_eq!(final_url, expected);
+    assert!(reusable.is_none(), "redirected bodies must not be reused with a different cookie scope");
+    assert_eq!(limiter.acquisition_count(), 3);
+}
+
+#[tokio::test]
+async fn only_an_immediate_content_response_is_reusable_and_304_is_terminal() {
+    for status in [200, 304] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/story", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            request_head(&mut stream);
+            let response = if status == 200 {
+                "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncontent"
+            } else {
+                // A Location on 304 is not a redirect and must not be sent.
+                "HTTP/1.1 304 Not Modified\r\nLocation: http://127.0.0.1:1/unused\r\nConnection: close\r\n\r\n"
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let http = LocalHttp::new();
+        let limiter = FakeRateLimiter::new();
+        let (final_url, reusable) = resolve_final_url_with_body(&http, &limiter, &url, &policy()).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(final_url, url);
+        assert_eq!(limiter.acquisition_count(), 1);
+        if status == 200 {
+            assert_eq!(reusable.unwrap().body, b"content");
+        } else {
+            assert!(reusable.is_none());
+        }
     }
 }

@@ -15,8 +15,6 @@
 
 use worker::{Env, Method, Request, Response, console_log, wasm_bindgen::JsValue};
 
-use crate::composition::WorkerRuntime;
-
 /// 状態取得とバックアップ作成/提案の却下。
 pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
     if let Some(response) = crate::auth_failure(&req, &env).await {
@@ -35,17 +33,19 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
 /// `default_output` を出さないので、こちらも同じキー形に揃える。`running` は
 /// `worker_jobs` の `kind='backup'` で `status='running'` の行数から出す
 /// (Worker の dispatch は backup を常に `blocked` へ落とすので通常 0)。
+///
+/// 読むのは D1 (`metadata::database`) と台帳の 1 集計だけ。認証は `handle` で
+/// 済んでおり、ダウンローダ・S3・レートリミッタ・Queue を組み立てる理由は
+/// 無い — binding の検査は readiness (`/health/ready`) の役割。
 async fn status(env: &Env) -> worker::Result<Response> {
-    // コンポジション全体を組み立てるのは、欠けた binding を native 同様に
-    // 503 で報告するため (D1 だけの軽い経路は作らない)。
-    let _runtime = match WorkerRuntime::build_ui(env).await {
-        Ok(runtime) => runtime,
+    let db = match super::metadata::database(env) {
+        Ok(db) => db,
         Err(error) => {
-            console_log!("service composition failed: {error}");
+            console_log!("D1 composition failed: {error}");
             return Response::error("Service Unavailable", 503);
         }
     };
-    let running = match running_backups(env).await {
+    let running = match running_backups(&db).await {
         Ok(count) => count > 0,
         Err(error) => {
             console_log!("library_backup status query failed: {error}");
@@ -59,8 +59,7 @@ async fn status(env: &Env) -> worker::Result<Response> {
 }
 
 /// 台帳上で実行中の backup ジョブ数。
-async fn running_backups(env: &Env) -> worker::Result<i64> {
-    let db = crate::db_handle::DbHandle::ui(std::sync::Arc::new(env.d1("DB")?));
+async fn running_backups(db: &crate::db_handle::DbHandle) -> worker::Result<i64> {
     let statement = db
         .prepare("SELECT COUNT(*) AS n FROM worker_jobs WHERE kind = ? AND status = 'running'")
         .bind(&[JsValue::from_str("backup")])?;

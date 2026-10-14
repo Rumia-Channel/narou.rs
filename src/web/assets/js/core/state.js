@@ -69,7 +69,6 @@ export const State = {
   frozenIds: new Set(),
   tags: [],
   tagColors: {},
-  notepadObjectId: null,
   queueStatus: { pending: 0, completed: 0, failed: 0, running: null },
   queueDetailed: { pending: [], running: [], pending_count: 0, running_count: 0 },
   queueRestorePrompted: false,
@@ -96,14 +95,14 @@ export const State = {
   // Console
   consoleExpanded: false,
   consoleHistory: [],
+  consoleRevision: 0,
   consolePinned: { main: true, stdout2: true },
   concurrencyEnabled: false,
 
   // Config from server
+  capabilities: null,
   performanceMode: 'auto',
-  tableReloadTiming: 'every',
   debugMode: false,
-  wsPort: null,
   theme: lsGet('theme', 'default'),
   pollIntervalSeconds: 600,
   language: lsGet('language', 'ja'),

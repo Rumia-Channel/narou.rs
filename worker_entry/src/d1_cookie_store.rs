@@ -14,33 +14,30 @@
 //! wasm 上で動く（`getrandom` の `wasm_js` バックエンド）ので、取り込みや
 //! `Set-Cookie` の書き戻しも D1 だけで完結する。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::{NarouError, Result};
-use narou_rs::platform::{
-    CookieStore, DecodedGroups, LoginGroup, ObjectStore, PlatformFuture, assign_group_ids,
-    decode_groups, encode_groups, fold_per_host_lists, site_for_host_with, tidy_groups,
+use narou_rs::login::{KEY_LEN, LOGIN_KEY_ENV_VAR};
+use narou_rs::platform::cookie_store::{
+    CONCURRENT_EDIT_MESSAGE, DecodedCookieMap, INVENTORY_NAME, compare_save_site_groups,
+    decode_cookie_map, encode_cookie_map, merge_site_groups, remove_site_groups,
+    renew_sent_login, replace_site_groups, save_site_groups, sent_login_cookie_target,
 };
+use narou_rs::platform::{CookieStore, LoginGroup, ObjectStore, PlatformFuture};
 use worker::wasm_bindgen::JsValue;
 
 use crate::db_handle::DbHandle;
 
-/// native と同じ inventory 名（`.narou/login_cookie.yaml` 相当）。
-pub const INVENTORY_NAME: &str = "login_cookie";
 /// `InventoryScope::Local` の永続化スコープ（`src/db/inventory.rs`）。
 const INVENTORY_SCOPE: &str = "inv";
-/// 復号鍵の secret 名。native の環境変数と同名にする。
-pub const LOGIN_KEY_SECRET: &str = "NAROU_RS_LOGIN_KEY";
-/// 復号鍵のバイト長（`narou_rs::login::KEY_LEN`）。
-const KEY_LEN: usize = 32;
 
 fn db_error(error: impl std::fmt::Display) -> NarouError {
     NarouError::Platform(format!("D1 {INVENTORY_NAME}: {error}"))
 }
 
 /// `app_state` の 1 行（保存形式の読み出しに使う列だけ）。
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct StateRow {
     #[serde(default)]
     value_yaml: Option<String>,
@@ -48,11 +45,41 @@ struct StateRow {
     value_json: Option<String>,
 }
 
-fn cookie_payload(yaml: Option<String>, json: Option<String>) -> String {
+fn cookie_payload<'a>(yaml: Option<&'a str>, json: Option<&'a str>) -> &'a str {
     match yaml {
         Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml,
-        _ => json.unwrap_or_else(|| "{}".to_string()),
+        _ => json.unwrap_or("{}"),
     }
+}
+
+fn concurrent_edit_error() -> NarouError {
+    NarouError::Login(CONCURRENT_EDIT_MESSAGE.to_string())
+}
+
+fn decode_snapshot(
+    row: &Option<StateRow>,
+    key: Option<&[u8; KEY_LEN]>,
+    settings: &[SiteSetting],
+) -> Result<DecodedCookieMap> {
+    let payload = row.as_ref().map_or("{}", |row| {
+        cookie_payload(row.value_yaml.as_deref(), row.value_json.as_deref())
+    });
+    let raw = if payload.trim().is_empty() || payload.trim() == "{}" {
+        BTreeMap::new()
+    } else {
+        serde_yaml::from_str(payload)
+            .map_err(|_| db_error("malformed stored credential payload"))?
+    };
+    decode_cookie_map(&raw, key, settings)
+}
+
+fn site_snapshots_match(
+    sites: &BTreeMap<String, Vec<LoginGroup>>,
+    expected: &BTreeMap<String, Vec<LoginGroup>>,
+) -> bool {
+    expected.iter().all(|(site, groups)| {
+        sites.get(site).map(Vec::as_slice).unwrap_or_default() == groups.as_slice()
+    })
 }
 
 /// D1 の `app_state` 1 行を介した資格情報ストア。
@@ -97,20 +124,21 @@ impl D1CookieStore {
 
     /// secret（または Secrets Store）から復号鍵を読む。未設定なら平文の行だけを扱う。
     pub async fn key_from_env(env: &worker::Env) -> Option<[u8; KEY_LEN]> {
-        let value = crate::secrets::value(env, LOGIN_KEY_SECRET).await?;
+        let value = crate::secrets::value(env, LOGIN_KEY_ENV_VAR).await?;
         match narou_rs::login::parse_key_base64(&value) {
             Ok(key) => Some(key),
             Err(error) => {
-                worker::console_log!("ignoring malformed {LOGIN_KEY_SECRET}: {error}");
+                worker::console_log!("ignoring malformed {LOGIN_KEY_ENV_VAR}: {error}");
                 None
             }
         }
     }
 
-    /// 保存されている payload（`value_yaml`、無ければ `value_json`）を返す。
-    async fn load_payload(&self) -> Result<String> {
-        let row: Option<StateRow> = self
-            .db
+    /// Both raw columns from PRIMARY are the compare-and-swap token; a
+    /// replica or a decoded/cached map is never a mutation's write source.
+    async fn load_snapshot(&self) -> Result<Option<StateRow>> {
+        self.db
+            .primary_view()
             .prepare("SELECT value_yaml, value_json FROM app_state WHERE scope = ? AND key = ?")
             .bind(&[
                 JsValue::from_str(INVENTORY_SCOPE),
@@ -119,63 +147,57 @@ impl D1CookieStore {
             .map_err(db_error)?
             .first(None)
             .await
-            .map_err(db_error)?;
-        let Some(row) = row else {
-            return Ok("{}".to_string());
-        };
-        // `value_yaml` を正とし、移行前の行 (`value_json` のみ) も読めるようにする。
-        Ok(cookie_payload(row.value_yaml, row.value_json))
+            .map_err(db_error)
     }
 
-    /// 保存されている生の YAML マップ（値は暗号化されたまま）。
-    async fn load_raw(&self) -> Result<BTreeMap<String, String>> {
-        let payload = self.load_payload().await?;
-        if payload.trim() == "{}" || payload.trim().is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        serde_yaml::from_str(&payload).map_err(|error| {
-            NarouError::Platform(format!("malformed {INVENTORY_NAME} payload: {error}"))
-        })
-    }
-
-    async fn save_raw(&self, map: &BTreeMap<String, String>) -> Result<()> {
-        let payload = serde_yaml::to_string(map).map_err(|error| {
-            NarouError::Platform(format!("cannot serialize {INVENTORY_NAME}: {error}"))
-        })?;
-        let result = self
-            .db
-            .prepare(
-                "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, '{}')
-                 ON CONFLICT(scope, key) DO UPDATE SET
-                   value_yaml = excluded.value_yaml, value_json = excluded.value_json",
+    /// Guard presence and BOTH exact raw columns, including NULL. Every
+    /// successful write also clears the old JSON placeholder/fallback.
+    async fn compare_save_payload(
+        &self,
+        expected: &Option<StateRow>,
+        payload: &str,
+    ) -> Result<bool> {
+        let db = self.db.primary_view();
+        let statement = if let Some(row) = expected {
+            db.prepare(
+                "UPDATE app_state SET value_yaml = ?, value_json = '{}'
+                 WHERE scope = ? AND key = ?
+                   AND value_yaml IS ? AND value_json IS ?",
+            )
+            .bind(&[
+                JsValue::from_str(payload),
+                JsValue::from_str(INVENTORY_SCOPE),
+                JsValue::from_str(INVENTORY_NAME),
+                row.value_yaml.as_deref().map(JsValue::from_str).unwrap_or(JsValue::NULL),
+                row.value_json.as_deref().map(JsValue::from_str).unwrap_or(JsValue::NULL),
+            ])
+        } else {
+            db.prepare(
+                "INSERT INTO app_state (scope, key, value_yaml, value_json)
+                 VALUES (?, ?, ?, '{}') ON CONFLICT(scope, key) DO NOTHING",
             )
             .bind(&[
                 JsValue::from_str(INVENTORY_SCOPE),
                 JsValue::from_str(INVENTORY_NAME),
-                JsValue::from_str(&payload),
+                JsValue::from_str(payload),
             ])
-            .map_err(db_error)?
-            .run()
-            .await
-            .map_err(db_error)?;
+        }
+        .map_err(db_error)?;
+        let result = statement.run().await.map_err(db_error)?;
         if !result.success() {
             return Err(db_error(result.error().unwrap_or_else(|| "D1 write failed".to_string())));
         }
-        Ok(())
-    }
-
-    /// そのサイトの保存値が暗号化されているか (診断用)。
-    pub async fn is_encrypted(&self, site: &str) -> Result<bool> {
-        let raw = self.load_raw().await?;
-        Ok(raw
-            .get(&site.trim().to_ascii_lowercase())
-            .is_some_and(|value| narou_rs::login::is_encrypted_at_rest(value)))
+        Ok(result
+            .meta()
+            .map_err(db_error)?
+            .and_then(|meta| meta.changes)
+            .unwrap_or(0) == 1)
     }
 
     /// 復号鍵の出所 (表示用)。
     pub fn key_source(&self) -> &'static str {
         if self.key.is_some() {
-            LOGIN_KEY_SECRET
+            LOGIN_KEY_ENV_VAR
         } else {
             "none"
         }
@@ -192,104 +214,109 @@ impl D1CookieStore {
     /// オブジェクトストアの読み出しに失敗したときだけ同梱定義へ下がる。
     /// 差が出るのは「ユーザー定義が存在する かつ 読み出しが失敗した」場合
     /// のみで、そうならなければ fix 前 (常に同梱定義) と同じ畳みになる。
-    async fn key_site_settings(&self) -> Vec<SiteSetting> {
+    async fn key_site_settings(&self) -> std::sync::Arc<Vec<SiteSetting>> {
         match crate::bundled_sites::load_site_settings(&self.objects).await {
             Ok(settings) => settings,
             Err(_) => crate::bundled_sites::load_bundled_site_settings().unwrap_or_default(),
         }
     }
 
-    /// 全サイトのログインを復号して返す。旧形式はサイト名へ畳んで書き戻す
-    /// (native `InventoryCookieStore::groups`)。
-    async fn groups(&self) -> Result<BTreeMap<String, Vec<LoginGroup>>> {
-        let raw = self.load_raw().await?;
-        if raw.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        // 保存キーが属するサイト。今日のキーはサイト名で、旧ビルドが書いた
-        // ホスト名のキーは実効サイト定義で畳み先を決める (native `site_for_key`)。
-        let site_settings = self.key_site_settings().await;
-        let mut stored: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
-        let mut legacy_per_site: BTreeMap<String, Vec<Vec<LoginGroup>>> = BTreeMap::new();
-        let mut needs_rekey = false;
-        for (key_name, value) in raw {
-            // 暗号文の AAD は書き込み時のキー名 (サイトまたは旧ホスト名)。
-            let plain = match narou_rs::login::decrypt_stored_value(
-                self.key.as_ref(),
-                &key_name,
-                &value,
-            )? {
-                Some(cookie) => cookie,
-                None => value,
-            };
-            let site = site_for_host_with(&site_settings, &key_name);
-            if site != key_name {
-                needs_rekey = true;
+    /// Read-time IDs and legacy folding are published only after their exact
+    /// snapshot commits. A lost CAS discards generated IDs and reloads.
+    async fn load_decoded(&self) -> Result<DecodedCookieMap> {
+        let settings = self.key_site_settings().await;
+        for _ in 0..4 {
+            let row = self.load_snapshot().await?;
+            let decoded = decode_snapshot(&row, self.key.as_ref(), &settings)?;
+            if !decoded.needs_rewrite {
+                return Ok(decoded);
             }
-            let Ok(decoded) = decode_groups(&plain, &site) else {
-                continue;
-            };
-            match decoded {
-                // 版 2 はホストごとに「同じアカウントの並び」を持っていた。
-                DecodedGroups::PerHost(groups) => {
-                    legacy_per_site.entry(site).or_default().push(groups);
-                }
-                DecodedGroups::Current(groups) => {
-                    if !groups.is_empty() {
-                        stored.entry(site).or_default().extend(groups);
-                    }
-                }
+            let payload = self.encode_sites(&decoded.sites)?;
+            if self.compare_save_payload(&row, &payload).await? {
+                return Ok(decoded);
             }
         }
-        for (site, lists) in legacy_per_site {
-            let folded = fold_per_host_lists(lists, &site);
-            stored.entry(site).or_default().extend(folded);
-        }
-        // 同じサイトのログインが複数のキーから来たら 1 つに畳む。
-        let mut tidied: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
-        for (site, groups) in stored {
-            let before = groups.len();
-            let groups = LoginGroup::merge_by_site(groups, &site);
-            if groups.len() != before {
-                // 断片が 1 ログインにまとまった分は書き戻す。
-                needs_rekey = true;
-            }
-            tidied.insert(site, groups);
-        }
-        let mut stored = tidied;
-        if assign_group_ids(&mut stored) {
-            needs_rekey = true;
-        }
-        if needs_rekey {
-            self.save_groups_map(&stored).await?;
-        }
-        Ok(stored)
+        Err(concurrent_edit_error())
     }
 
-    /// サイトごとに暗号化して 1 行に書き戻す (native `save_groups_map`)。
-    async fn save_groups_map(&self, map: &BTreeMap<String, Vec<LoginGroup>>) -> Result<()> {
-        if map.values().all(|groups| groups.is_empty()) {
-            return self.save_raw(&BTreeMap::new()).await;
-        }
-        // 保存値は常に暗号化する (native と同じ形式)。鍵が無ければ平文で
-        // 書かずに失敗させる (fail-closed)。
-        let Some(key) = self.key else {
-            return Err(NarouError::Platform(format!(
-                "{LOGIN_KEY_SECRET} is required to store credentials"
-            )));
+    async fn groups(&self) -> Result<BTreeMap<String, Vec<LoginGroup>>> {
+        Ok(self.load_decoded().await?.sites)
+    }
+
+    /// Sites and at-rest flags always describe a committed snapshot.
+    pub async fn groups_and_encryption(
+        &self,
+    ) -> Result<(BTreeMap<String, Vec<LoginGroup>>, BTreeSet<String>)> {
+        let decoded = self.load_decoded().await?;
+        Ok((decoded.sites, decoded.encrypted))
+    }
+
+    fn encode_sites(&self, sites: &BTreeMap<String, Vec<LoginGroup>>) -> Result<String> {
+        let raw = if sites.values().all(|groups| groups.is_empty()) {
+            BTreeMap::new()
+        } else {
+            let key = self.key.as_ref().ok_or_else(|| {
+                NarouError::Platform(format!(
+                    "{LOGIN_KEY_ENV_VAR} is required to store credentials"
+                ))
+            })?;
+            encode_cookie_map(sites, key)?
         };
-        let mut encrypted = BTreeMap::new();
-        for (site, groups) in map {
-            if groups.is_empty() {
-                continue;
+        serde_yaml::to_string(&raw)
+            .map_err(|_| db_error("cannot serialize stored credential payload"))
+    }
+
+    /// Reapply a site delta at most four times, and only while every targeted
+    /// site's logical snapshot is unchanged. Re-encryption by another site's
+    /// update changes raw ciphertext, but is not a same-site edit.
+    /// `None` means a targeted site changed and must not be overwritten.
+    async fn update_sites<T, S, F>(&self, targets: S, update: F) -> Result<Option<T>>
+    where
+        S: FnOnce(&BTreeMap<String, Vec<LoginGroup>>) -> Vec<String>,
+        F: Fn(&mut BTreeMap<String, Vec<LoginGroup>>) -> Result<(T, bool)>,
+    {
+        let settings = self.key_site_settings().await;
+        let mut targets = Some(targets);
+        let mut expected = None;
+        for _ in 0..4 {
+            let row = self.load_snapshot().await?;
+            let mut decoded = decode_snapshot(&row, self.key.as_ref(), &settings)?;
+            if let Some(expected) = &expected {
+                if !site_snapshots_match(&decoded.sites, expected) {
+                    return Ok(None);
+                }
+            } else {
+                expected = Some(targets.take().expect("first credential snapshot")(&decoded.sites)
+                    .into_iter()
+                    .map(|site| {
+                        let groups = decoded.sites.get(&site).cloned().unwrap_or_default();
+                        (site, groups)
+                    })
+                    .collect());
             }
-            let encoded = encode_groups(groups)?;
-            encrypted.insert(
-                site.clone(),
-                narou_rs::login::encrypt_at_rest(&key, site, &encoded)?,
-            );
+            let (result, changed) = update(&mut decoded.sites)?;
+            if !changed && !decoded.needs_rewrite {
+                return Ok(Some(result));
+            }
+            let payload = self.encode_sites(&decoded.sites)?;
+            if self.compare_save_payload(&row, &payload).await? {
+                return Ok(Some(result));
+            }
         }
-        self.save_raw(&encrypted).await
+        Err(concurrent_edit_error())
+    }
+
+    /// An authoritative replace/clear-all never decrypts or merges old
+    /// credentials. It is one guarded write of the complete replacement.
+    async fn replace_groups_map(&self, groups: &BTreeMap<String, Vec<LoginGroup>>) -> Result<()> {
+        let sites = replace_site_groups(groups);
+        let payload = self.encode_sites(&sites)?;
+        let row = self.load_snapshot().await?;
+        if self.compare_save_payload(&row, &payload).await? {
+            Ok(())
+        } else {
+            Err(concurrent_edit_error())
+        }
     }
 
     /// 保存済みの全サイトと順序つきログイン (native `groups_by_site`)。
@@ -306,75 +333,46 @@ impl D1CookieStore {
     /// 1 サイトのログインを置き換える。空スライスはサイトごと削除
     /// (native `save_groups_for`)。
     pub async fn save_groups_for(&self, site: &str, groups: &[LoginGroup]) -> Result<()> {
-        let mut map = self.groups().await?;
-        let site = site.trim().to_ascii_lowercase();
-        let groups = tidy_groups(groups, &site);
-        if groups.is_empty() {
-            map.remove(&site);
-        } else {
-            map.insert(site, groups);
-        }
-        self.save_groups_map(&map).await
+        self.update_sites(
+            |_| vec![site.trim().to_ascii_lowercase()],
+            |map| {
+                save_site_groups(map, site, groups);
+                Ok(((), true))
+            },
+        )
+        .await?
+        .ok_or_else(concurrent_edit_error)
     }
 
-    /// ログインを取り込み、既にあるサイトには後ろに足す
-    /// (native `merge_groups`)。同じ Cookie のログインは二重に足さない。
-    /// 戻り値は書き込まれたサイト数。
-    pub async fn merge_groups(
+    pub async fn compare_save_groups_for(
         &self,
-        entries: &BTreeMap<String, Vec<LoginGroup>>,
-    ) -> Result<usize> {
-        let mut map = self.groups().await?;
-        for (site, groups) in entries {
-            let site = site.trim().to_ascii_lowercase();
-            let stored = map.entry(site.clone()).or_default();
-            for group in tidy_groups(groups, &site) {
-                if !stored.iter().any(|existing| existing.same_cookies(&group)) {
-                    stored.push(group);
-                }
-            }
-        }
-        map.retain(|_, groups| !groups.is_empty());
-        let written = map.len();
-        self.save_groups_map(&map).await?;
-        Ok(written)
-    }
-
-    /// ログインを取り込み、取り込みに含まれないサイトはすべて消す
-    /// (native `replace_groups`)。戻り値は書き込まれたサイト数。
-    pub async fn replace_groups(
-        &self,
-        entries: &BTreeMap<String, Vec<LoginGroup>>,
-    ) -> Result<usize> {
-        let mut map: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
-        for (site, groups) in entries {
-            let site = site.trim().to_ascii_lowercase();
-            let groups = tidy_groups(groups, &site);
-            if !groups.is_empty() {
-                map.insert(site, groups);
-            }
-        }
-        let written = map.len();
-        self.save_groups_map(&map).await?;
-        Ok(written)
+        site: &str,
+        expected: &[LoginGroup],
+        replacement: &[LoginGroup],
+    ) -> Result<bool> {
+        Ok(self.update_sites(
+            |_| vec![site.trim().to_ascii_lowercase()],
+            |map| {
+                let saved = compare_save_site_groups(map, site, expected, replacement);
+                Ok((saved, saved))
+            },
+        )
+        .await?
+        .unwrap_or(false))
     }
 
     /// 1 サイトのログインをすべて消す (native `remove`)。削除の有無を返す
     /// (無いときは書き込まない)。
     pub async fn remove(&self, site: &str) -> Result<bool> {
-        let mut map = self.groups().await?;
-        let removed = map.remove(&site.trim().to_ascii_lowercase()).is_some();
-        if removed {
-            self.save_groups_map(&map).await?;
-        }
-        Ok(removed)
-    }
-
-    /// すべてのサイトのログインを消す (native `clear_all`)。
-    /// 復号不要 — 行ごと空のマップで上書きするので、壊れた値や鍵なしの
-    /// 状態でも確実に消える。
-    pub async fn clear_all(&self) -> Result<()> {
-        self.save_raw(&BTreeMap::new()).await
+        self.update_sites(
+            |_| vec![site.trim().to_ascii_lowercase()],
+            |map| {
+                let removed = remove_site_groups(map, site);
+                Ok((removed, removed))
+            },
+        )
+        .await?
+        .ok_or_else(concurrent_edit_error)
     }
 }
 
@@ -391,31 +389,159 @@ impl CookieStore for D1CookieStore {
         Box::pin(async move { self.save_groups_for(site, groups).await })
     }
 
-    fn clear<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<()>> {
-        Box::pin(async move {
-            self.remove(site).await?;
-            Ok(())
-        })
+    fn compare_save_groups<'a>(
+        &'a self,
+        site: &'a str,
+        expected: &'a [LoginGroup],
+        replacement: &'a [LoginGroup],
+    ) -> PlatformFuture<'a, Result<bool>> {
+        Box::pin(async move { self.compare_save_groups_for(site, expected, replacement).await })
+    }
+
+    fn clear<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<bool>> {
+        Box::pin(async move { self.remove(site).await })
     }
 
     fn list_groups(&self) -> PlatformFuture<'_, Result<BTreeMap<String, Vec<LoginGroup>>>> {
         Box::pin(self.groups_by_site())
     }
+
+    fn save_all_groups<'a>(
+        &'a self,
+        groups: &'a BTreeMap<String, Vec<LoginGroup>>,
+    ) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move { self.replace_groups_map(groups).await })
+    }
+
+    fn merge_all_groups<'a>(
+        &'a self,
+        groups: &'a BTreeMap<String, Vec<LoginGroup>>,
+    ) -> PlatformFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            self.update_sites(
+                |_| groups.keys().map(|site| site.trim().to_ascii_lowercase()).collect(),
+                |map| Ok((merge_site_groups(map, groups), true)),
+            )
+            .await?
+            .ok_or_else(concurrent_edit_error)
+        })
+    }
+
+    fn renew_response_cookies<'a>(
+        &'a self,
+        sent_cookie: &'a str,
+        set_cookie: &'a [String],
+    ) -> PlatformFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            Ok(self.update_sites(
+                |map| sent_login_cookie_target(map, sent_cookie)
+                    .map(|(site_index, _, _)| vec![
+                        map.keys().nth(site_index).expect("matched stored site").clone(),
+                    ])
+                    .unwrap_or_default(),
+                |map| {
+                    let changed = renew_sent_login(map, sent_cookie, set_cookie);
+                    Ok((changed, changed))
+                },
+            )
+            .await?
+            .unwrap_or(false))
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::cookie_payload;
+    use super::*;
+    use narou_rs::platform::HostCookie;
 
     #[test]
     fn cleared_canonical_cookie_value_cannot_fall_back_to_stale_json() {
         let legacy = cookie_payload(
-            Some("{}".to_string()),
-            Some(r#"{"site":"old-cookie"}"#.to_string()),
+            Some("{}"),
+            Some(r#"{"site":"old-cookie"}"#),
         );
         assert_eq!(legacy, r#"{"site":"old-cookie"}"#);
 
-        let cleared = cookie_payload(Some("{}".to_string()), Some("{}".to_string()));
+        let cleared = cookie_payload(Some("{}"), Some("{}"));
         assert_eq!(cleared, "{}");
+    }
+
+    fn login(site: &str, id: &str, cookie: &str) -> LoginGroup {
+        LoginGroup::new(site, vec![HostCookie {
+            host: site.to_string(), cookie: cookie.to_string(),
+        }]).with_id(id)
+    }
+
+    fn snapshot(raw: &BTreeMap<String, String>) -> Option<StateRow> {
+        Some(StateRow {
+            value_yaml: Some(serde_yaml::to_string(raw).unwrap()),
+            value_json: Some("{}".to_string()),
+        })
+    }
+
+    #[test]
+    fn retry_guard_ignores_other_site_edits_and_fresh_encryption_nonces() {
+        let key = [7; KEY_LEN];
+        let b = login("b.example", "b", "sid=b");
+        let original = BTreeMap::from([
+            ("a.example".to_string(), vec![login("a.example", "a", "sid=a")]),
+            ("b.example".to_string(), vec![b.clone()]),
+        ]);
+        let original_raw = encode_cookie_map(&original, &key).unwrap();
+        let latest = BTreeMap::from([("b.example".to_string(), vec![b.clone()])]);
+        let latest_raw = encode_cookie_map(&latest, &key).unwrap();
+        assert_ne!(original_raw["b.example"], latest_raw["b.example"]);
+        let decoded = decode_snapshot(&snapshot(&latest_raw), Some(&key), &[]).unwrap();
+        let expected = BTreeMap::from([("b.example".to_string(), vec![b.clone()])]);
+        assert!(site_snapshots_match(&decoded.sites, &expected));
+        let mut sites = decoded.sites;
+        let replacement = b.with_label(Some("renamed".to_string()));
+        assert!(compare_save_site_groups(
+            &mut sites, "b.example", &expected["b.example"], &[replacement],
+        ));
+        assert!(!sites.contains_key("a.example"));
+
+        save_site_groups(&mut sites, "b.example", &[
+            login("b.example", "replacement", "sid=replacement"),
+        ]);
+        assert!(!site_snapshots_match(&sites, &expected));
+        assert!(!compare_save_site_groups(
+            &mut sites, "b.example", &expected["b.example"], &[],
+        ));
+        assert_eq!(sites["b.example"][0].id, "replacement");
+    }
+
+    #[test]
+    fn snapshots_decode_native_ciphertext_and_keep_committed_ids() {
+        let key = [7; KEY_LEN];
+        let sites = BTreeMap::from([(
+            "example.com".to_string(), vec![login("example.com", "committed", "sid=secret")],
+        )]);
+        let raw = encode_cookie_map(&sites, &key).unwrap();
+        let row = snapshot(&raw);
+        let decoded = decode_snapshot(&row, Some(&key), &[]).unwrap();
+        assert_eq!(decoded.sites, sites);
+        assert!(!decoded.needs_rewrite);
+        assert!(decoded.encrypted.contains("example.com"));
+        assert!(decode_snapshot(&row, None, &[]).is_err());
+
+        let legacy_columns = Some(StateRow {
+            value_yaml: Some("{}".to_string()),
+            value_json: Some(serde_json::to_string(&raw).unwrap()),
+        });
+        let fallback = decode_snapshot(&legacy_columns, Some(&key), &[]).unwrap();
+        assert_eq!(fallback.sites, decoded.sites);
+    }
+
+    #[test]
+    fn malformed_snapshot_diagnostics_do_not_contain_plaintext_credentials() {
+        let row = Some(StateRow {
+            value_yaml: Some("- private-cookie-value".to_string()),
+            value_json: Some("{}".to_string()),
+        });
+        let message = decode_snapshot(&row, None, &[]).unwrap_err().to_string();
+        assert!(!message.contains("private-cookie-value"));
+        assert!(message.contains("malformed stored credential payload"));
     }
 }

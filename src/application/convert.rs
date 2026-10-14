@@ -16,8 +16,8 @@ use crate::converter::settings::{NovelSettings, parse_replace_patterns};
 use crate::converter::user_converter::UserConverter;
 use crate::converter::{ConverterCapabilities, NovelConverter};
 use crate::db::NovelRecord;
-use crate::downloader::persistence::PersistenceService;
-use crate::downloader::{SectionFile, TocObject};
+use crate::downloader::persistence::{PersistenceService, SectionLoadFailure};
+use crate::downloader::{SectionFile, TocObject, UpdateStatus};
 use crate::error::{NarouError, Result};
 use crate::platform::{AssetStore, NovelObjectKeys, ObjectKey, ObjectStore};
 use crate::setting_core::SettingScope;
@@ -108,6 +108,50 @@ where
     report
 }
 
+/// `--no-convert` の適用範囲は native と Worker で既存差があるため、
+/// 呼び出し側が自分の契約を明示する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoConvertScope {
+    /// `--no-convert` は全ステータスを抑止する (Worker の現行)。
+    Everything,
+    /// `--no-convert` は `Ok` だけを抑止し、`None` の再変換は続行する
+    /// (native の narou.rb 互換動作)。
+    SuccessOnly,
+}
+
+/// 更新/ダウンロード結果から自動変換 (follow-up convert) を積むか。
+///
+/// 各入力は呼び出し側の契約:
+/// - `convert_only_new_arrival` は Update の `Ok` にだけ効く (Download は
+///   取得成功なら `false` を渡す)。
+/// - `convert_failure` は保存済みレコードの `convert_failure` フラグ。
+/// - `missing_cached_text` は Worker の自己修復 (keep-txt 有効で変換済み
+///   テキストが無い) 用の実行時入力。native は存在確認を持たず `false`。
+///
+/// `Failed` / `Canceled` は常に積まない。
+pub fn needs_convert_after_download(
+    status: UpdateStatus,
+    no_convert: bool,
+    no_convert_scope: NoConvertScope,
+    new_arrivals: bool,
+    convert_only_new_arrival: bool,
+    convert_failure: bool,
+    missing_cached_text: bool,
+) -> bool {
+    let no_convert_blocks = match no_convert_scope {
+        NoConvertScope::Everything => no_convert,
+        NoConvertScope::SuccessOnly => no_convert && status == UpdateStatus::Ok,
+    };
+    if no_convert_blocks {
+        return false;
+    }
+    match status {
+        UpdateStatus::Ok => !convert_only_new_arrival || new_arrivals,
+        UpdateStatus::None => convert_failure || missing_cached_text,
+        UpdateStatus::Failed | UpdateStatus::Canceled => false,
+    }
+}
+
 /// 小説 1 件の変換テキストを作って保存する。
 pub struct ConvertService {
     objects: Arc<dyn ObjectStore>,
@@ -166,14 +210,30 @@ impl ConvertService {
             NarouError::Platform(format!("toc がありません: {}", keys.toc().as_ref()))
         })?;
 
-        let mut sections: Vec<SectionFile> = Vec::new();
-        for subtitle in &toc.subtitles {
-            let section_key = keys.section(&subtitle.index, &subtitle.file_subtitle);
-            let Some(section) = persistence.load_section(&keys, subtitle).await? else {
+        // 本文 (目次順) と、小説単位の独立な設定ファイルを同時に読む。
+        // エラーの優先順位は直列だったときの読取順 (本文 → setting.ini →
+        // 置換 → converter.yaml) のままになるよう、join 後にこの順で評価する。
+        let replace_key = keys.replace();
+        let (sections, ini, local_settings, replacement, converter_yaml) = futures::join!(
+            persistence.load_sections_ordered(&keys, &toc.subtitles),
+            self.load_ini(&keys),
+            self.settings.load(SettingScope::Local),
+            self.read_text(&replace_key),
+            async {
+                let converter_key =
+                    ObjectKey::try_new(format!("{}/converter.yaml", keys.prefix().as_ref()))?;
+                self.read_text(&converter_key).await
+            },
+        );
+        let sections: Vec<SectionFile> = match sections {
+            Ok(sections) => sections,
+            Err(SectionLoadFailure::Missing { section_index }) => {
+                let subtitle = &toc.subtitles[section_index];
                 // native の `section file not found: expected '{index}
                 // {file_subtitle}.yaml' in {section_dir}` に対応する。
                 // ObjectStore では見たキー自体が「期待した場所」なので、
                 // ファイル名相当部分は実際に探したキーの末尾を出す。
+                let section_key = keys.section(&subtitle.index, &subtitle.file_subtitle);
                 let key: &str = section_key.as_ref();
                 let filename = key.rsplit('/').next().unwrap_or(key);
                 return Err(NarouError::Io(std::io::Error::new(
@@ -183,9 +243,9 @@ impl ConvertService {
                         keys.prefix().as_ref()
                     ),
                 )));
-            };
-            sections.push(section);
-        }
+            }
+            Err(SectionLoadFailure::Read(error)) => return Err(error),
+        };
         if sections.is_empty() {
             return Err(NarouError::Platform(format!(
                 "本文がありません: {}",
@@ -193,28 +253,22 @@ impl ConvertService {
             )));
         }
 
+        let ini = ini?;
+        let local_settings = local_settings.unwrap_or_default();
         let mut settings = NovelSettings::from_sources(
             Some(record.id),
             &record.title,
             &record.author,
-            &self.load_ini(&keys).await?,
-            &self
-                .settings
-                .load(SettingScope::Local)
-                .await
-                .unwrap_or_default(),
+            &ini,
+            &local_settings,
             false,
             false,
         );
-        if let Some(text) = self.read_text(&keys.replace()).await? {
+        if let Some(text) = replacement? {
             // 小説ごとの replace.txt。全体設定側 (インストール先) は native 専用。
             settings.replace_patterns = parse_replace_patterns(&text);
         }
-        let converter_key = crate::platform::ObjectKey::try_new(format!(
-            "{}/converter.yaml",
-            keys.prefix().as_ref()
-        ))?;
-        let user_converter = match self.read_text(&converter_key).await? {
+        let user_converter = match converter_yaml? {
             Some(yaml) => {
                 UserConverter::from_yaml(&yaml, &settings.title_for_output(&record.title))
             }
@@ -233,7 +287,15 @@ impl ConvertService {
         };
         let text = converter.convert_novel(&toc_object, &sections)?;
         let output = keys.converted_text();
-        let output = if store && self.keep_converted_text().await {
+        // `convert.keep-txt` の解釈は native のファイル経路 (`converter::mod`)
+        // と Worker で共有する (`setting_core::keep_converted_text`)。既定は
+        // native と同じ「保存する」。
+        let keep_text = crate::setting_core::keep_converted_text(
+            &local_settings,
+            std::env::var("NAROU_RS_KEEP_TXT").ok().as_deref(),
+            true,
+        );
+        let output = if store && keep_text {
             self.objects
                 .write_small(&output, text.clone().into_bytes())
                 .await?;
@@ -242,33 +304,6 @@ impl ConvertService {
             None
         };
         Ok(ConvertedNovel { text, output })
-    }
-
-    /// 変換済みテキストを保存するか (`convert.keep-txt`)。
-    ///
-    /// 環境変数 `NAROU_RS_KEEP_TXT` (0/false/no/off) が最優先、次に local
-    /// 設定。未設定は保存する (Worker 側は `worker_entry::convert` が別途
-    /// 既定 false を与えるので、このフォールバックは主に native と共有の
-    /// テスト/ユースケース向け)。
-    async fn keep_converted_text(&self) -> bool {
-        if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
-            let value = value.trim().to_ascii_lowercase();
-            return !matches!(value.as_str(), "0" | "false" | "no" | "off");
-        }
-        match self
-            .settings
-            .load(SettingScope::Local)
-            .await
-            .ok()
-            .and_then(|settings| settings.get("convert.keep-txt").cloned())
-        {
-            Some(serde_yaml::Value::Bool(value)) => value,
-            Some(serde_yaml::Value::String(value)) => !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            ),
-            _ => true,
-        }
     }
 
     async fn load_ini(&self, keys: &NovelObjectKeys) -> Result<IniData> {
@@ -297,6 +332,39 @@ mod tests {
     use crate::downloader::types::{SectionElement, SubtitleInfo, TocFile};
     use crate::platform::mocks::MemoryObjectStore;
     use futures::executor::block_on;
+
+    /// `NAROU_RS_KEEP_TXT` が設定された環境でもテスト結果が変わらないよう、
+    /// テストの間だけ外す。プロセス共通の env を触るため、既存の全体ロックを
+    /// 共有して直列化する。
+    struct KeepTxtEnvGuard {
+        _state: crate::test_support::GlobalStateGuard,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl KeepTxtEnvGuard {
+        fn cleared() -> Self {
+            let state = crate::test_support::global_state_guard();
+            let original = std::env::var_os("NAROU_RS_KEEP_TXT");
+            // SAFETY: 全体ロックを保持している間だけ書き換える。
+            unsafe { std::env::remove_var("NAROU_RS_KEEP_TXT") };
+            Self {
+                _state: state,
+                original,
+            }
+        }
+    }
+
+    impl Drop for KeepTxtEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: 同上。
+            unsafe {
+                match self.original.take() {
+                    Some(value) => std::env::set_var("NAROU_RS_KEEP_TXT", value),
+                    None => std::env::remove_var("NAROU_RS_KEEP_TXT"),
+                }
+            }
+        }
+    }
 
     fn record(id: i64) -> NovelRecord {
         NovelRecord {
@@ -334,6 +402,7 @@ mod tests {
     /// Worker の `JobKind::Convert` はこの経路をそのまま呼ぶ。
     #[test]
     fn assembles_converted_text_from_stored_sections() {
+        let _env = KeepTxtEnvGuard::cleared();
         let store = Arc::new(MemoryObjectStore::new());
         let settings = Arc::new(crate::application::settings::MemorySettingsStore::new());
         let service = ConvertService::new(store.clone(), store.clone(), settings);
@@ -496,20 +565,132 @@ mod tests {
         });
     }
 
+    /// 目次の中間の話が欠落している場合、その話を名指しで失敗し、変換結果は
+    /// 書かない。欠落を補うと本文は目次順に並ぶ (先読みの完了順に依存しない)。
+    #[test]
+    fn fails_when_a_middle_toc_section_body_is_missing_then_keeps_toc_order() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let settings = Arc::new(crate::application::settings::MemorySettingsStore::new());
+        let service = ConvertService::new(store.clone(), store.clone(), settings);
+        let target = record(11);
+        let keys = NovelObjectKeys::new(&target.sitename, &target.file_title, false).unwrap();
+
+        let subtitle = |index: &str| SubtitleInfo {
+            index: index.to_string(),
+            href: format!("https://example.com/novel/11/{index}"),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: format!("第{index}話"),
+            file_subtitle: format!("第{index}話"),
+            subdate: "2026-09-26 00:00:00".to_string(),
+            subupdate: None,
+            download_time: None,
+        };
+        let first = subtitle("1");
+        let missing = subtitle("2");
+        let third = subtitle("3");
+        let toc = TocFile {
+            title: target.title.clone(),
+            author: target.author.clone(),
+            toc_url: target.toc_url.clone(),
+            story: None,
+            subtitles: vec![first.clone(), missing.clone(), third.clone()],
+            novel_type: Some(1),
+        };
+        let section = |subtitle: &SubtitleInfo, body: &str| SectionFile {
+            index: subtitle.index.clone(),
+            href: subtitle.href.clone(),
+            chapter: subtitle.chapter.clone(),
+            subchapter: subtitle.subchapter.clone(),
+            subtitle: subtitle.subtitle.clone(),
+            file_subtitle: subtitle.file_subtitle.clone(),
+            subdate: subtitle.subdate.clone(),
+            subupdate: subtitle.subupdate.clone(),
+            download_time: None,
+            element: SectionElement {
+                data_type: "text".to_string(),
+                introduction: String::new(),
+                postscript: String::new(),
+                body: body.to_string(),
+            },
+        };
+
+        block_on(async {
+            store
+                .write_small(&keys.toc(), serialize_toc(&toc).unwrap().into_bytes())
+                .await
+                .unwrap();
+            // 中間の第 2 話だけ保存しない。
+            let first_section = section(&first, "　みかん。");
+            store
+                .write_small(
+                    &keys.section(&first.index, &first.file_subtitle),
+                    serialize_section(&first_section).unwrap().into_bytes(),
+                )
+                .await
+                .unwrap();
+            let third_section = section(&third, "　ぶどう。");
+            store
+                .write_small(
+                    &keys.section(&third.index, &third.file_subtitle),
+                    serialize_section(&third_section).unwrap().into_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let error = service.convert_and_store(&target).await.unwrap_err();
+            let message = error.to_string();
+            let expected = format!("{} {}.yaml", missing.index, missing.file_subtitle);
+            assert!(
+                message.contains("section file not found"),
+                "expected native-style missing-section error, got: {message}"
+            );
+            assert!(
+                message.contains(&expected),
+                "error should name the middle section file '{expected}', got: {message}"
+            );
+            assert!(
+                store
+                    .read_small(&keys.converted_text())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no output before validation"
+            );
+
+            // 欠落を補うと変換でき、本文は目次順に並ぶ。
+            let missing_section = section(&missing, "　りんご。");
+            store
+                .write_small(
+                    &keys.section(&missing.index, &missing.file_subtitle),
+                    serialize_section(&missing_section).unwrap().into_bytes(),
+                )
+                .await
+                .unwrap();
+            let converted = service.convert_and_store(&target).await.unwrap();
+            let first_at = converted.text.find("みかん").unwrap();
+            let second_at = converted.text.find("りんご").unwrap();
+            let third_at = converted.text.find("ぶどう").unwrap();
+            assert!(
+                first_at < second_at && second_at < third_at,
+                "sections must keep TOC order: {}",
+                converted.text
+            );
+        });
+    }
+
     /// `convert.keep-txt=false` のとき、変換は成功するが `novel.txt`
     /// オブジェクトは書かれない (EPUB は都度再変換で組み立てる構成)。
     #[test]
     fn keeps_no_converted_text_when_keep_txt_is_disabled() {
+        let _env = KeepTxtEnvGuard::cleared();
         let store = Arc::new(MemoryObjectStore::new());
-        let settings = Arc::new(crate::application::settings::MemorySettingsStore::new());
-        block_on(settings.save(
-            SettingScope::Local,
-            &std::collections::HashMap::from([(
+        let settings = Arc::new(crate::application::settings::MemorySettingsStore::new().with_local(
+            std::collections::HashMap::from([(
                 "convert.keep-txt".to_string(),
                 serde_yaml::Value::Bool(false),
             )]),
-        ))
-        .unwrap();
+        ));
         let service = ConvertService::new(store.clone(), store.clone(), settings);
         let target = record(10);
         let keys = NovelObjectKeys::new(&target.sitename, &target.file_title, false).unwrap();
@@ -578,4 +759,120 @@ mod tests {
         });
     }
 
+    /// 自動変換の判定は native/Worker の契約モードを保持する
+    /// (どちらも現行の outward 挙動のまま)。
+    #[test]
+    fn followup_convert_decision_preserves_both_contract_modes() {
+        // `--no-convert`: Worker (Everything) は全ステータス、native
+        // (SuccessOnly) は `Ok` だけを抑止する。
+        for status in [
+            UpdateStatus::Ok,
+            UpdateStatus::None,
+            UpdateStatus::Failed,
+            UpdateStatus::Canceled,
+        ] {
+            assert!(
+                !needs_convert_after_download(
+                    status,
+                    true,
+                    NoConvertScope::Everything,
+                    true,
+                    false,
+                    true,
+                    true,
+                ),
+                "{status:?} with --no-convert must not convert (Everything)"
+            );
+        }
+        assert!(!needs_convert_after_download(
+            UpdateStatus::Ok,
+            true,
+            NoConvertScope::SuccessOnly,
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(needs_convert_after_download(
+            UpdateStatus::None,
+            true,
+            NoConvertScope::SuccessOnly,
+            false,
+            false,
+            true,
+            false,
+        ));
+
+        // `Ok`: `convert_only_new_arrival` は新着が無いときだけ抑止する
+        // (Download は false 固定)。
+        assert!(needs_convert_after_download(
+            UpdateStatus::Ok,
+            false,
+            NoConvertScope::Everything,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!needs_convert_after_download(
+            UpdateStatus::Ok,
+            false,
+            NoConvertScope::Everything,
+            false,
+            true,
+            false,
+            false,
+        ));
+        assert!(needs_convert_after_download(
+            UpdateStatus::Ok,
+            false,
+            NoConvertScope::Everything,
+            true,
+            true,
+            false,
+            false,
+        ));
+
+        // `None`: `convert_failure` と `missing_cached_text` のどちらでも変換する。
+        assert!(!needs_convert_after_download(
+            UpdateStatus::None,
+            false,
+            NoConvertScope::Everything,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(needs_convert_after_download(
+            UpdateStatus::None,
+            false,
+            NoConvertScope::Everything,
+            false,
+            false,
+            true,
+            false,
+        ));
+        assert!(needs_convert_after_download(
+            UpdateStatus::None,
+            false,
+            NoConvertScope::Everything,
+            false,
+            false,
+            false,
+            true,
+        ));
+
+        // `Failed` / `Canceled` は常に変換しない。
+        for status in [UpdateStatus::Failed, UpdateStatus::Canceled] {
+            assert!(!needs_convert_after_download(
+                status,
+                false,
+                NoConvertScope::Everything,
+                true,
+                false,
+                true,
+                true,
+            ));
+        }
+    }
 }

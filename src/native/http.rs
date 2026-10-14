@@ -1,10 +1,10 @@
 //! Native HTTP transport: curl → reqwest → subprocess (curl/wget) tier fallback.
 //!
 //! This is the native implementation of [`HttpClient`]. It owns everything
-//! transport-specific: the two reqwest clients (follow / manual-redirect),
-//! the libcurl handle configuration, the subprocess fallback (curl.exe on
-//! Windows, wget elsewhere), the per-domain tier-failure bookkeeping, and the
-//! CDN curl-probe enhancement used by `resolve_final_url`.
+//! transport-specific: the manual-redirect reqwest client, libcurl handle
+//! configuration, subprocess fallback (curl.exe on Windows, wget elsewhere),
+//! and per-domain tier-failure bookkeeping. The async entry point owns the
+//! shared redirect chain; every concrete transport executes just one hop.
 //!
 //! It never decodes response bytes and never decides what a status code
 //! means — that is `downloader::http_policy`'s job. 404/503 responses are
@@ -12,9 +12,8 @@
 //! `SuspendDownload`; other 4xx/5xx are transport errors that let the tier
 //! fallback try the next transport.
 //!
-//! Rate limiting is *not* part of this transport; the downloader injects a
-//! separate [`RateLimiter`](crate::platform::RateLimiter) and paces requests through
-//! `downloader::http_policy` helpers.
+//! Site admission is injected by `send_paced`. Each redirect or fallback
+//! attempt acquires its own permit; infrastructure `send` remains unpaced.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -27,20 +26,33 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use reqwest::header::{
-    ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION, CONTENT_TYPE, HeaderMap,
-    HeaderValue, LOCATION, USER_AGENT,
+    ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION, HeaderMap, HeaderValue,
 };
 
 use crate::compat::configure_hidden_console_command;
-use crate::downloader::http_policy::same_site_hosts;
 use crate::downloader::security::{
     CONNECT_TIMEOUT_SECS, MAX_REDIRECTS, MAX_RESPONSE_BYTES, READ_TIMEOUT_SECS, TOTAL_TIMEOUT_SECS,
-    is_safe_header_value, validate_public_url,
+    validate_public_url,
 };
 use crate::error::{NarouError, Result};
+use crate::platform::http::{
+    RedirectChain, is_safe_header_name, is_safe_header_value, response_body_limit,
+    validate_http_url_syntax,
+};
+use crate::platform::http1::MAX_HTTP1_HEAD;
 use crate::platform::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 
 const FAIL_THRESHOLD: u8 = 5;
+
+/// Default site-fetch headers, shared by every native transport so the
+/// reqwest default header map, the libcurl handle and both subprocess tools
+/// send the same values.
+const DEFAULT_ACCEPT: &str =
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8";
+const DEFAULT_ACCEPT_LANGUAGE: &str = "ja,en-US;q=0.9,en;q=0.8";
+const DEFAULT_ACCEPT_ENCODING: &str = "gzip, deflate";
+const DEFAULT_ACCEPT_CHARSET: &str = "utf-8";
+const DEFAULT_CONNECTION: &str = "keep-alive";
 
 /// フォールバック段の番号 (試行順は `TierState::order` が決める)。
 const TIER_CURL: usize = 0;
@@ -91,9 +103,8 @@ impl TierState {
     }
 
     fn note_failure(&mut self, domain: &str, tier: usize) {
-        self.failures
-            .entry(domain.to_string())
-            .or_insert([0; TIER_COUNT])[tier] += 1;
+        let failures = self.failures.entry(domain.to_string()).or_insert([0; TIER_COUNT]);
+        failures[tier] = failures[tier].saturating_add(1);
         if self.preferred.get(domain) == Some(&tier) {
             self.preferred.remove(domain);
         }
@@ -108,14 +119,13 @@ impl TierState {
 
 /// Native HTTP transport with the curl → reqwest → subprocess fallback.
 ///
-/// `Clone` is cheap: the two reqwest clients are `Arc`-backed and the
+/// `Clone` is cheap: the reqwest client is `Arc`-backed and the
 /// per-domain tier state is shared through `Arc`, so clones observe the same
 /// fallback bookkeeping (matching the old `HttpFetcher` semantics where one
 /// fetcher served a whole download run).
 #[derive(Clone)]
 pub struct NativeHttpClient {
     client: reqwest::blocking::Client,
-    manual_redirect_client: reqwest::blocking::Client,
     user_agent: String,
     tiers: Arc<Mutex<TierState>>,
     /// Login cookies are only refreshed for hosts that already store one, so a
@@ -145,165 +155,128 @@ impl NativeHttpClient {
     }
 
     fn new_inner(user_agent: &str) -> Result<Self> {
-        let client = build_reqwest_client(user_agent, true)?;
-        let manual_redirect_client = build_reqwest_client(user_agent, false)?;
+        let client = build_reqwest_client(user_agent)?;
 
         Ok(Self {
             client,
-            manual_redirect_client,
             user_agent: user_agent.to_string(),
             tiers: Arc::new(Mutex::new(TierState::default())),
             cookie_store: None,
         })
     }
 
-    /// Persist `Set-Cookie` updates for hosts with a stored login cookie.
-    ///
-    /// Sessions rotate their cookies on most responses; writing them back keeps
-    /// the stored value usable for the next run. Hosts without an entry are
-    /// left alone.
-    async fn persist_set_cookie(&self, response: &HttpResponse, sent_cookie: Option<&str>) {
-        let Some(store) = self.cookie_store.as_ref() else {
-            return;
-        };
-        let values: Vec<String> = response
-            .headers
-            .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
-            .map(|(_, value)| value.clone())
-            .collect();
-        if values.is_empty() {
-            return;
+    /// Validate one outgoing hop before either admission or network I/O.
+    fn validate_hop(request: &HttpRequest) -> Result<()> {
+        if request.trusted_endpoint {
+            validate_http_url_syntax(&request.url)?;
+        } else {
+            validate_public_url(&request.url).map_err(io_error)?;
         }
-        // 送った Cookie を含むホストを持つログインだけを更新する。サイトは
-        // 複数のログインを持てるので、別アカウントのセッションは触らない。
-        let Some(sent) = sent_cookie else {
-            return;
-        };
-        let sent_pairs = crate::platform::parse_cookie_header(sent);
-        if sent_pairs.is_empty() {
-            return;
+        for (name, value) in &request.headers {
+            if !is_safe_header_name(name) || !is_safe_header_value(value) {
+                return Err(io_error("unsafe HTTP header"));
+            }
         }
-        let Ok(all) = store.list_groups().await else {
-            return;
-        };
-        for (site, groups) in all {
-            let mut updated_groups = groups.clone();
-            let mut changed = false;
-            for group in updated_groups.iter_mut() {
-                let Some(host) = group.host_for_sent(&sent_pairs).map(str::to_string) else {
-                    continue;
-                };
-                if let Some(entry) = group.cookies.iter_mut().find(|entry| entry.host == host) {
-                    let updated = crate::platform::apply_set_cookie(&entry.cookie, &values);
-                    if updated != entry.cookie {
-                        entry.cookie = updated;
-                        changed = true;
+        Ok(())
+    }
+
+    async fn send_chain(
+        &self,
+        request: HttpRequest,
+        pacing: Option<crate::platform::http::HttpPacing<'_>>,
+    ) -> Result<HttpResponse> {
+        let mut chain = RedirectChain::new(request, MAX_REDIRECTS);
+        loop {
+            let (returned_chain, validation) = tokio::task::spawn_blocking(move || {
+                let validation = Self::validate_hop(chain.request());
+                (chain, validation)
+            }).await.map_err(|error| NarouError::Http(error.to_string()))?;
+            chain = returned_chain;
+            validation?;
+            let scope = pacing.map(|policy| policy.scope_for(&chain)).transpose()?;
+            let tiered = chain.request().method == HttpMethod::Get && !chain.request().trusted_endpoint;
+            let domain = tiered.then(|| crate::downloader::http_policy::domain_of(&chain.request().url).to_string());
+            let mut order = domain.as_deref().map(|domain| self.tier_order(domain)).unwrap_or_default();
+            // Manual URL resolution retains curl-first CDN compatibility.
+            if tiered && chain.request().redirect == RedirectMode::Manual {
+                order.retain(|&tier| tier != TIER_CURL);
+                order.insert(0, TIER_CURL);
+            }
+            let attempts = if tiered { order.as_slice() } else { &[TIER_REQWEST] };
+            let mut response = None;
+            let mut last_error = None;
+            for &tier in attempts {
+                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                    policy.limiter.acquire(scope).await?;
+                }
+                let worker = self.clone();
+                let (returned_chain, attempt) = tokio::task::spawn_blocking(move || {
+                    let request = chain.request();
+                    let user_agent = request.header("User-Agent").unwrap_or(&worker.user_agent);
+                    let attempt = if !tiered {
+                        worker.send_reqwest_hop(request)
+                    } else {
+                        match tier {
+                            TIER_CURL => worker.fetch_tier_curl(request, user_agent),
+                            TIER_REQWEST => worker.fetch_tier_reqwest(request),
+                            TIER_SUBPROCESS => worker.fetch_tier_subprocess(request, user_agent),
+                            _ => unreachable!("tier index out of range: {tier}"),
+                        }
+                    };
+                    (chain, attempt)
+                }).await.map_err(|error| NarouError::Http(error.to_string()))?;
+                chain = returned_chain;
+                match attempt {
+                    Ok(value) => {
+                        if let Some(domain) = domain.as_deref() { self.tiers.lock().note_success(domain, tier); }
+                        response = Some(value);
+                        break;
+                    }
+                    Err(error) => {
+                        if let Some(domain) = domain.as_deref() { self.tiers.lock().note_failure(domain, tier); }
+                        last_error = Some(error);
                     }
                 }
             }
-            if changed {
-                let _ = store.save_groups(&site, &updated_groups).await;
+            let response = response.ok_or_else(|| last_error.unwrap_or_else(|| {
+                NarouError::NotFound(chain.request().url.clone())
+            }))?;
+            if let Some(store) = self.cookie_store.as_deref() {
+                crate::platform::cookie_store::persist_response_set_cookie(
+                    store, &response, chain.request().header("Cookie"),
+                ).await;
             }
+            if !chain.advance(&response)? { return Ok(response); }
         }
     }
 
-    /// Synchronous entry point used by `send` inside `spawn_blocking`.
-    fn send_blocking(&self, request: &HttpRequest) -> Result<HttpResponse> {
-        if request.trusted_endpoint {
-            return self.send_trusted(request);
-        }
-        match request.method {
-            HttpMethod::Get => match request.redirect {
-                RedirectMode::Follow => self.send_follow(request),
-                RedirectMode::Manual => self.send_manual(request),
-            },
-            HttpMethod::Post => self.send_post(request),
-            HttpMethod::Put | HttpMethod::Delete => self.send_trusted(request),
-        }
-    }
-
-    /// Infrastructure request (object storage endpoint).
-    ///
-    /// The URL comes from the user's own configuration, so the public-address
-    /// check does not apply (a local MinIO is legitimate) and every response
-    /// header is preserved (`ETag` / `Content-Range` are part of the
-    /// object-storage contract). No site fetch tiers: object storage is a plain
-    /// HTTPS API, and the caller chooses whether redirects are followed.
-    fn send_trusted(&self, request: &HttpRequest) -> Result<HttpResponse> {
-        crate::platform::url_policy::validate_url_syntax(&request.url).map_err(io_error)?;
-        let client = match request.redirect {
-            RedirectMode::Follow => &self.client,
-            RedirectMode::Manual => &self.manual_redirect_client,
-        };
+    /// Non-GET and trusted infrastructure use only manual-redirect reqwest.
+    fn send_reqwest_hop(&self, request: &HttpRequest) -> Result<HttpResponse> {
         let mut builder = match request.method {
-            HttpMethod::Get => client.get(&request.url),
-            HttpMethod::Post => client.post(&request.url),
-            HttpMethod::Put => client.put(&request.url),
-            HttpMethod::Delete => client.delete(&request.url),
+            HttpMethod::Get => self.client.get(&request.url),
+            HttpMethod::Post => self.client.post(&request.url),
+            HttpMethod::Put => self.client.put(&request.url),
+            HttpMethod::Delete => self.client.delete(&request.url),
         };
         for (name, value) in &request.headers {
-            if !is_safe_header_value(value) {
-                return Err(io_error("unsafe header value"));
-            }
             builder = builder.header(name, value);
         }
         if let Some(body) = &request.body {
-            builder = builder.body(body.clone());
+            builder = builder.body(reqwest::blocking::Body::sized(
+                SharedRequestBody { body: Arc::clone(body), position: 0 },
+                body.len() as u64,
+            ));
         }
         let response = builder.send().map_err(|e| NarouError::Http(e.to_string()))?;
         let status = response.status().as_u16();
-        let headers: Vec<(String, String)> = response
-            .headers()
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_string(),
-                    value.to_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect();
-        let body = read_response_bytes(response)?;
-        Ok(HttpResponse {
-            status,
-            headers,
-            body,
-        })
+        let headers = response_headers(&response);
+        let trusted_limit = request.trusted_endpoint
+            .then_some(request.trusted_response_body_limit).flatten();
+        let limit = response_body_limit(status, trusted_limit, MAX_RESPONSE_BYTES);
+        let body = read_response_bytes(response, limit)?;
+        Ok(HttpResponse { status, headers, body })
     }
 
-    /// Follow-mode GET: tiered curl → reqwest → subprocess fallback.
-    ///
-    /// A tier that receives a definitive server answer (404/503) returns the
-    /// raw response immediately; the policy layer maps it. Other 4xx/5xx and
-    /// transport failures fall through to the next tier, mirroring the old
-    /// `HttpFetcher::fetch_text` behaviour.
-    fn send_follow(&self, request: &HttpRequest) -> Result<HttpResponse> {
-        let url = &request.url;
-        validate_public_url(url).map_err(io_error)?;
-        let user_agent = request.header("User-Agent").unwrap_or(&self.user_agent);
-        let domain = crate::downloader::http_policy::domain_of(url).to_string();
-        let mut last_error = None;
-        for tier in self.tier_order(&domain) {
-            let attempt = match tier {
-                TIER_CURL => self.fetch_tier_curl(request, user_agent),
-                TIER_REQWEST => self.fetch_tier_reqwest(request, user_agent),
-                TIER_SUBPROCESS => self.fetch_tier_subprocess(request, user_agent),
-                _ => unreachable!("tier index out of range: {tier}"),
-            };
-            match attempt {
-                Ok(response) => {
-                    self.tiers.lock().note_success(&domain, tier);
-                    return Ok(response);
-                }
-                Err(err) => {
-                    self.tiers.lock().note_failure(&domain, tier);
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| NarouError::NotFound(url.to_string())))
-    }
 
     /// このドメインで試す段を、直近成功した段を先頭にした順序で返す。
     ///
@@ -324,88 +297,6 @@ impl NativeHttpClient {
         order
     }
 
-    /// Manual-mode GET: no redirect following; 3xx responses are returned
-    /// as-is so `resolve_final_url` can follow the chain. On 4xx/5xx the
-    /// transport probes the same hop via libcurl: a CDN (e.g. Cloudflare)
-    /// may challenge reqwest while letting curl through, hiding the origin's
-    /// real redirect. A 3xx probe result is returned as a synthetic
-    /// redirect response; otherwise the original response is returned.
-    fn send_manual(&self, request: &HttpRequest) -> Result<HttpResponse> {
-        let url = &request.url;
-        validate_public_url(url).map_err(io_error)?;
-        let user_agent = request.header("User-Agent").unwrap_or(&self.user_agent);
-
-        // libcurl first: Cloudflare-style managed challenges answer curl and
-        // reject reqwest for the same request. A definitive answer (2xx/3xx, or
-        // the 4xx/5xx that the policy layer maps itself) is returned as-is;
-        // anything else falls through so reqwest can still have a turn.
-        match self.fetch_tier_curl_manual(request, user_agent) {
-            Ok(response)
-                if !(400..600).contains(&response.status) || response.status == 404 || response.status == 503 =>
-            {
-                return Ok(response);
-            }
-            Ok(_) | Err(_) => {}
-        }
-
-        let mut req = self.manual_redirect_client.get(url);
-        for (name, value) in &request.headers {
-            if !is_safe_header_value(value) {
-                return Err(io_error("unsafe header value"));
-            }
-            req = req.header(name, value);
-        }
-        if user_agent != self.user_agent {
-            req = req.header(USER_AGENT, user_agent);
-        }
-
-        let response = req.send().map_err(|e| NarouError::Http(e.to_string()))?;
-        let status = response.status().as_u16();
-        if (400..600).contains(&status)
-            && let Ok((code, Some(location))) = self.curl_probe_redirect(request, user_agent)
-                && (300..400).contains(&code)
-            {
-                return Ok(HttpResponse {
-                    status: code as u16,
-                    headers: vec![("Location".into(), location)],
-                    body: Vec::new(),
-                });
-            }
-
-        let headers = content_type_header(content_type_of(&response));
-        let body = read_response_bytes(response)?;
-        Ok(HttpResponse {
-            status,
-            headers,
-            body,
-        })
-    }
-
-    /// POST via the follow client. Used by future API endpoints; the current
-    /// downloader only issues GETs.
-    fn send_post(&self, request: &HttpRequest) -> Result<HttpResponse> {
-        let url = &request.url;
-        validate_public_url(url).map_err(io_error)?;
-        let mut req = self.client.post(url);
-        for (name, value) in &request.headers {
-            if !is_safe_header_value(value) {
-                return Err(io_error("unsafe header value"));
-            }
-            req = req.header(name, value);
-        }
-        if let Some(body) = &request.body {
-            req = req.body(body.clone());
-        }
-        let response = req.send().map_err(|e| NarouError::Http(e.to_string()))?;
-        let status = response.status().as_u16();
-        let headers = content_type_header(content_type_of(&response));
-        let body = read_response_bytes(response)?;
-        Ok(HttpResponse {
-            status,
-            headers,
-            body,
-        })
-    }
 
     fn fetch_tier_curl(
         &self,
@@ -416,7 +307,7 @@ impl NativeHttpClient {
         let mut handle = self.configured_curl_handle(request, user_agent)?;
 
         let mut body = Vec::new();
-        let mut content_type = String::new();
+        let mut head = CurlHeaders::default();
         let mut response_too_large = false;
         let perform_result = {
             let mut transfer = handle.transfer();
@@ -431,11 +322,8 @@ impl NativeHttpClient {
                 })
                 .map_err(|e| io_error(e.to_string()))?;
             transfer
-                .header_function(|header| {
-                    let header = String::from_utf8_lossy(header);
-                    if let Some(value) = header.strip_prefix("Content-Type:") {
-                        content_type = value.trim().to_string();
-                    }
+                .header_function(|line| {
+                    head.feed(line);
                     true
                 })
                 .map_err(|e| io_error(e.to_string()))?;
@@ -452,11 +340,6 @@ impl NativeHttpClient {
         let code = handle
             .response_code()
             .map_err(|e| io_error(e.to_string()))?;
-        if (300..400).contains(&code) {
-            return Err(io_error(format!(
-                "HTTP redirect {code} while fetching {url}"
-            )));
-        }
         if code >= 400 {
             // 404/503 are definitive server answers; return them raw so the
             // policy layer maps them to domain errors. Other 4xx/5xx are
@@ -464,7 +347,7 @@ impl NativeHttpClient {
             if code == 404 || code == 503 {
                 return Ok(HttpResponse {
                     status: code as u16,
-                    headers: content_type_header(content_type),
+                    headers: head.into_headers(),
                     body,
                 });
             }
@@ -473,7 +356,7 @@ impl NativeHttpClient {
 
         Ok(HttpResponse {
             status: code as u16,
-            headers: content_type_header(content_type),
+            headers: head.into_headers(),
             body,
         })
     }
@@ -481,30 +364,13 @@ impl NativeHttpClient {
     fn fetch_tier_reqwest(
         &self,
         request: &HttpRequest,
-        user_agent: &str,
     ) -> Result<HttpResponse> {
-        let url = &request.url;
-        let response = self.send_reqwest(request, user_agent)?;
-        let status = response.status().as_u16();
-        if status == 404 || status == 503 {
-            let headers = content_type_header(content_type_of(&response));
-            let body = read_response_bytes(response)?;
-            return Ok(HttpResponse {
-                status,
-                headers,
-                body,
-            });
+        let response = self.send_reqwest_hop(request)?;
+        let status = response.status;
+        if (400..600).contains(&status) && status != 404 && status != 503 {
+            return Err(io_error(format!("HTTP {status} while fetching {}", request.url)));
         }
-        if !(200..300).contains(&status) {
-            return Err(io_error(format!("HTTP {status} while fetching {url}")));
-        }
-        let headers = content_type_header(content_type_of(&response));
-        let body = read_response_bytes(response)?;
-        Ok(HttpResponse {
-            status,
-            headers,
-            body,
-        })
+        Ok(response)
     }
 
     /// Last-resort subprocess fetch. Windows has no `wget` but ships
@@ -559,9 +425,8 @@ impl NativeHttpClient {
         }))
     }
 
-    /// Run one subprocess fetch tool (`curl` or `wget`) against `url`.
-    /// Both tools are invoked without redirect following and fail on
-    /// non-2xx statuses, matching the historical wget tier semantics.
+    /// Run one subprocess fetch without redirect following. Redirects and
+    /// definitive 404/503 responses are returned intact to the outer chain.
     fn run_fetch_tool(
         &self,
         tool: &str,
@@ -573,7 +438,11 @@ impl NativeHttpClient {
         match tool {
             "curl" => {
                 const STATUS_MARKER: &str = "\n__NAROU_HTTP_STATUS__";
+                // `-D -` writes the response head before the body, so
+                // `Set-Cookie` / `Location` survive the last-resort tier too.
                 cmd.arg("-sS")
+                    .arg("-D")
+                    .arg("-")
                     .arg("--compressed")
                     .arg("--retry")
                     .arg("0")
@@ -588,11 +457,11 @@ impl NativeHttpClient {
                     .arg("-A")
                     .arg(user_agent)
                     .arg("-H")
-                    .arg("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+                    .arg(format!("Accept: {DEFAULT_ACCEPT}"))
                     .arg("-H")
-                    .arg("Accept-Language: ja,en-US;q=0.9,en;q=0.8")
+                    .arg(format!("Accept-Language: {DEFAULT_ACCEPT_LANGUAGE}"))
                     .arg("-H")
-                    .arg("Connection: keep-alive")
+                    .arg(format!("Connection: {DEFAULT_CONNECTION}"))
                     .arg("-w")
                     .arg(format!("{STATUS_MARKER}%{{http_code}}"));
                 for (name, value) in &request.headers {
@@ -607,20 +476,22 @@ impl NativeHttpClient {
                         String::from_utf8_lossy(&output.stderr)
                     )));
                 }
+                // The head dump precedes the body; both belong to the same
+                // response (this tier never follows redirects).
+                let (head, rest) = split_tool_output(&output.stdout)
+                    .ok_or_else(|| io_error(format!("curl response headers missing for {url}")))?;
+                let headers = parse_tool_headers(head);
                 let marker = STATUS_MARKER.as_bytes();
-                let Some(pos) = output
-                    .stdout
-                    .windows(marker.len())
-                    .rposition(|window| window == marker)
+                let Some(pos) = rest.windows(marker.len()).rposition(|window| window == marker)
                 else {
                     return Err(io_error(format!(
                         "curl status marker missing for {url}"
                     )));
                 };
-                let body = &output.stdout[..pos];
-                let status_text = String::from_utf8_lossy(&output.stdout[pos + marker.len()..]);
+                let body = &rest[..pos];
+                let status_text = String::from_utf8_lossy(&rest[pos + marker.len()..]);
                 let status: u16 = status_text.trim().parse().unwrap_or(0);
-                if !(200..300).contains(&status) {
+                if (400..600).contains(&status) && status != 404 && status != 503 {
                     return Err(io_error(format!(
                         "HTTP {status} while fetching {url} via curl"
                     )));
@@ -633,15 +504,20 @@ impl NativeHttpClient {
                 }
                 Ok(HttpResponse {
                     status,
-                    headers: Vec::new(),
+                    headers,
                     body: body.to_vec(),
                 })
             }
             _ => {
                 // `--no-verbose` (not `--quiet`) keeps error messages on stderr
                 // so a failed fetch can be reported with its status, matching
-                // the curl tier's `-sS`.
+                // the curl tier's `-sS`. `--save-headers` preserves
+                // `Set-Cookie` / `Location` here like in the other tiers.
                 cmd.arg("--no-verbose")
+                    .arg("--save-headers")
+                    .arg("--server-response")
+                    .arg("--content-on-error")
+                    .arg("--compression=auto")
                     .arg("--output-document=-")
                     .arg("--tries=1")
                     .arg(format!("--connect-timeout={CONNECT_TIMEOUT_SECS}"))
@@ -649,120 +525,53 @@ impl NativeHttpClient {
                     .arg(format!("--timeout={TOTAL_TIMEOUT_SECS}"))
                     .arg("--max-redirect=0")
                     .arg(format!("--user-agent={user_agent}"))
-                    .arg("--header=Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-                    .arg("--header=Accept-Language: ja,en-US;q=0.9,en;q=0.8")
-                    .arg("--header=Accept-Encoding: gzip, deflate")
-                    .arg("--header=Connection: keep-alive");
+                    .arg(format!("--header=Accept: {DEFAULT_ACCEPT}"))
+                    .arg(format!("--header=Accept-Language: {DEFAULT_ACCEPT_LANGUAGE}"))
+                    .arg(format!("--header=Connection: {DEFAULT_CONNECTION}"));
                 for (name, value) in &request.headers {
                     cmd.arg(format!("--header={name}: {value}"));
                 }
                 cmd.arg("--").arg(url);
                 let output = run_command_with_timeout(cmd, Duration::from_secs(TOTAL_TIMEOUT_SECS))
                     .map_err(NarouError::Io)?;
-                if !output.status.success() {
+                let dumped = split_tool_output(&output.stdout);
+                let (status, headers, body) = if let Some((head, body)) = dumped {
+                    let status = parse_tool_status(head)
+                        .ok_or_else(|| io_error(format!("invalid wget status for {url}")))?;
+                    (status, parse_tool_headers(head), body)
+                } else {
+                    let (status, headers) = parse_wget_response_head(&output.stderr)
+                        .ok_or_else(|| io_error(format!(
+                            "wget fetch failed for {url}: {}", String::from_utf8_lossy(&output.stderr),
+                        )))?;
+                    (status, headers, output.stdout.as_slice())
+                };
+                let definitive = (300..400).contains(&status) || status == 404 || status == 503;
+                // Only wget's HTTP-error exit may return a definitive head.
+                // A read/connection failure must never masquerade as success.
+                if (!output.status.success() && !(output.status.code() == Some(8) && definitive))
+                    || ((400..600).contains(&status) && status != 404 && status != 503)
+                {
                     return Err(io_error(format!(
-                        "wget fetch failed for {url}: {}",
-                        String::from_utf8_lossy(&output.stderr)
+                        "wget fetch failed (HTTP {status}) for {url}: {}",
+                        String::from_utf8_lossy(&output.stderr),
                     )));
                 }
-                if output.stdout.len() > MAX_RESPONSE_BYTES {
+                if body.len() > MAX_RESPONSE_BYTES {
                     return Err(io_error(format!(
                         "response body exceeded {} bytes while fetching {url}",
                         MAX_RESPONSE_BYTES
                     )));
                 }
                 Ok(HttpResponse {
-                    status: 200,
-                    headers: Vec::new(),
-                    body: output.stdout,
+                    status,
+                    headers,
+                    body: body.to_vec(),
                 })
             }
         }
     }
 
-    fn send_reqwest(
-        &self,
-        http_request: &HttpRequest,
-        user_agent: &str,
-    ) -> Result<reqwest::blocking::Response> {
-        for (_, value) in &http_request.headers {
-            if !is_safe_header_value(value) {
-                return Err(io_error("unsafe header value"));
-            }
-        }
-        if http_request.header("Cookie").is_some() {
-            return self.send_reqwest_with_manual_cookie_redirects(http_request, user_agent);
-        }
-
-        let mut request = self.client.get(&http_request.url);
-        for (name, value) in &http_request.headers {
-            request = request.header(name, value);
-        }
-        if user_agent != self.user_agent {
-            request = request.header(USER_AGENT, user_agent);
-        }
-        request.send().map_err(|e| NarouError::Http(e.to_string()))
-    }
-
-    /// Follow redirects manually so the Cookie header can be dropped when a
-    /// hop leaves the current site (see [`same_site_hosts`]).
-    fn send_reqwest_with_manual_cookie_redirects(
-        &self,
-        http_request: &HttpRequest,
-        user_agent: &str,
-    ) -> Result<reqwest::blocking::Response> {
-        let mut current =
-            reqwest::Url::parse(&http_request.url).map_err(|e| io_error(e.to_string()))?;
-        // Non-cookie headers stay as given; the cookie is dropped per hop when
-        // the chain leaves the site.
-        let headers: Vec<(String, String)> = http_request
-            .headers
-            .iter()
-            .filter(|(name, _)| !name.eq_ignore_ascii_case("Cookie"))
-            .cloned()
-            .collect();
-        let mut current_cookie = http_request.header("Cookie").map(str::to_string);
-
-        for _ in 0..=MAX_REDIRECTS {
-            validate_public_url(current.as_str()).map_err(io_error)?;
-            let mut request = self.manual_redirect_client.get(current.clone());
-            for (name, value) in &headers {
-                request = request.header(name, value);
-            }
-            if let Some(cookie) = current_cookie.as_deref() {
-                request = request.header("Cookie", cookie);
-            }
-            if user_agent != self.user_agent {
-                request = request.header(USER_AGENT, user_agent);
-            }
-
-            let response = request
-                .send()
-                .map_err(|e| NarouError::Http(e.to_string()))?;
-            if response.status().is_redirection() {
-                let Some(location) = response.headers().get(LOCATION) else {
-                    return Ok(response);
-                };
-                let location = location
-                    .to_str()
-                    .map_err(|e| io_error(format!("invalid redirect location: {e}")))?;
-                let next = current
-                    .join(location)
-                    .map_err(|e| io_error(e.to_string()))?;
-                if !same_site_hosts(next.host_str(), current.host_str()) {
-                    current_cookie = None;
-                }
-                current = next;
-                continue;
-            }
-            return Ok(response);
-        }
-
-        Err(io_error(format!(
-            "redirect limit exceeded for {} after {} hops",
-            http_request.url, MAX_REDIRECTS
-        )))
-    }
 
     fn configured_curl_handle(
         &self,
@@ -788,20 +597,20 @@ impl NativeHttpClient {
         handle
             .timeout(Duration::from_secs(TOTAL_TIMEOUT_SECS))
             .map_err(|e| io_error(e.to_string()))?;
-        handle.accept_encoding("gzip, deflate").ok();
+        handle.accept_encoding(DEFAULT_ACCEPT_ENCODING).ok();
 
         let mut headers = curl::easy::List::new();
         headers
-            .append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+            .append(&format!("Accept: {DEFAULT_ACCEPT}"))
             .map_err(|e| io_error(e.to_string()))?;
         headers
-            .append("Accept-Language: ja,en-US;q=0.9,en;q=0.8")
+            .append(&format!("Accept-Language: {DEFAULT_ACCEPT_LANGUAGE}"))
             .map_err(|e| io_error(e.to_string()))?;
         headers
-            .append("Accept-Charset: utf-8")
+            .append(&format!("Accept-Charset: {DEFAULT_ACCEPT_CHARSET}"))
             .map_err(|e| io_error(e.to_string()))?;
         headers
-            .append("Connection: keep-alive")
+            .append(&format!("Connection: {DEFAULT_CONNECTION}"))
             .map_err(|e| io_error(e.to_string()))?;
         // Caller headers (Cookie, Referer, …) win over the defaults above.
         for (name, value) in &request.headers {
@@ -818,103 +627,6 @@ impl NativeHttpClient {
         Ok(handle)
     }
 
-    /// Non-following GET via libcurl, returning the response untouched.
-    ///
-    /// `send_manual` prefers this over reqwest: some CDNs (Cloudflare managed
-    /// challenges) answer libcurl and reject reqwest for the same request, and
-    /// the manual path needs the real status/`Location` pair rather than a
-    /// rewritten redirect.
-    fn fetch_tier_curl_manual(
-        &self,
-        request: &HttpRequest,
-        user_agent: &str,
-    ) -> Result<HttpResponse> {
-        let mut handle = self.configured_curl_handle(request, user_agent)?;
-        let mut body = Vec::new();
-        let mut content_type = String::new();
-        let mut location: Option<String> = None;
-        let mut too_large = false;
-        let perform_result = {
-            let mut transfer = handle.transfer();
-            transfer
-                .write_function(|data| {
-                    if body.len() + data.len() > MAX_RESPONSE_BYTES {
-                        too_large = true;
-                        return Ok(0);
-                    }
-                    body.extend_from_slice(data);
-                    Ok(data.len())
-                })
-                .map_err(|e| io_error(e.to_string()))?;
-            transfer
-                .header_function(|header| {
-                    let header = String::from_utf8_lossy(header);
-                    if let Some(value) = header.strip_prefix("Content-Type:") {
-                        content_type = value.trim().to_string();
-                    } else if let Some(value) = header.strip_prefix("Location:") {
-                        location = Some(value.trim().to_string());
-                    }
-                    true
-                })
-                .map_err(|e| io_error(e.to_string()))?;
-            transfer.perform()
-        };
-        if too_large {
-            return Err(io_error(format!(
-                "response body exceeded {MAX_RESPONSE_BYTES} bytes while fetching {}",
-                request.url
-            )));
-        }
-        perform_result.map_err(|e| io_error(e.to_string()))?;
-
-        let code = handle
-            .response_code()
-            .map_err(|e| io_error(e.to_string()))?;
-        let mut headers = content_type_header(content_type);
-        if let Some(location) = location {
-            headers.push(("Location".into(), location));
-        }
-        Ok(HttpResponse {
-            status: code as u16,
-            headers,
-            body,
-        })
-    }
-
-    /// Perform a single non-following GET via libcurl and report the response
-    /// status code plus the redirect target (when the status is 3xx). Used as
-    /// a fallback by `send_manual` when the reqwest hop is blocked (e.g. a
-    /// CDN challenge that passes curl but rejects reqwest), so redirect
-    /// chains can still be observed. The response body is discarded.
-    fn curl_probe_redirect(
-        &self,
-        request: &HttpRequest,
-        user_agent: &str,
-    ) -> Result<(u32, Option<String>)> {
-        let mut handle = self.configured_curl_handle(request, user_agent)?;
-
-        let mut received = 0usize;
-        let perform_result = {
-            let mut transfer = handle.transfer();
-            transfer
-                .write_function(move |data| {
-                    received += data.len();
-                    if received > MAX_RESPONSE_BYTES {
-                        return Ok(0);
-                    }
-                    Ok(data.len())
-                })
-                .map_err(|e| io_error(e.to_string()))?;
-            transfer.perform()
-        };
-        perform_result.map_err(|e| io_error(e.to_string()))?;
-
-        let code = handle
-            .response_code()
-            .map_err(|e| io_error(e.to_string()))?;
-        let redirect = handle.redirect_url().ok().flatten().map(str::to_string);
-        Ok((code, redirect))
-    }
 }
 
 impl HttpClient for NativeHttpClient {
@@ -926,16 +638,15 @@ impl HttpClient for NativeHttpClient {
     }
 
     fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse>> {
-        let this = self.clone();
-        Box::pin(async move {
-            let sent_cookie = request.header("Cookie").map(str::to_string);
-            let worker = this.clone();
-            let response = tokio::task::spawn_blocking(move || worker.send_blocking(&request))
-                .await
-                .map_err(|e| NarouError::Http(e.to_string()))??;
-            this.persist_set_cookie(&response, sent_cookie.as_deref()).await;
-            Ok(response)
-        })
+        Box::pin(self.send_chain(request, None))
+    }
+
+    fn send_paced<'a>(
+        &'a self,
+        request: HttpRequest,
+        pacing: crate::platform::http::HttpPacing<'a>,
+    ) -> BoxFuture<'a, Result<HttpResponse>> {
+        Box::pin(self.send_chain(request, Some(pacing)))
     }
 }
 
@@ -985,51 +696,49 @@ mod tier_state_tests {
     }
 }
 
-fn build_reqwest_client(
-    user_agent: &str,
-    follow_redirects: bool,
-) -> Result<reqwest::blocking::Client> {
-    let redirect_policy = if follow_redirects {
-        reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= MAX_REDIRECTS
-                || validate_public_url(attempt.url().as_str()).is_err() {
-                attempt.stop()
-            } else {
-                attempt.follow()
-            }
-        })
-    } else {
-        reqwest::redirect::Policy::none()
-    };
-
+fn build_reqwest_client(user_agent: &str) -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .user_agent(user_agent)
         .default_headers(default_request_headers())
-        .cookie_store(true)
         .http1_only()
         .gzip(true)
         .brotli(true)
         .deflate(true)
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(TOTAL_TIMEOUT_SECS))
-        .redirect(redirect_policy)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| NarouError::Http(e.to_string()))
 }
 
-fn read_response_bytes(mut response: reqwest::blocking::Response) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
+/// A fresh cursor for each retained-body hop; the payload is never copied.
+struct SharedRequestBody {
+    body: Arc<Vec<u8>>,
+    position: usize,
+}
+
+impl Read for SharedRequestBody {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let count = output.len().min(self.body.len() - self.position);
+        output[..count].copy_from_slice(&self.body[self.position..self.position + count]);
+        self.position += count;
+        Ok(count)
+    }
+}
+
+fn read_response_bytes(mut response: reqwest::blocking::Response, limit: usize) -> Result<Vec<u8>> {
+    if response.content_length().is_some_and(|size| size > limit as u64) {
+        return Err(io_error(format!("response body exceeded {limit} bytes")));
+    }
+    let mut body = Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
     let mut chunk = [0u8; 8192];
     loop {
         let read = response.read(&mut chunk)?;
         if read == 0 {
             break;
         }
-        if body.len() + read > MAX_RESPONSE_BYTES {
-            return Err(io_error(format!(
-                "response body exceeded {} bytes",
-                MAX_RESPONSE_BYTES
-            )));
+        if read > limit.saturating_sub(body.len()) {
+            return Err(io_error(format!("response body exceeded {limit} bytes")));
         }
         body.extend_from_slice(&chunk[..read]);
     }
@@ -1048,24 +757,30 @@ fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Res
         .take()
         .ok_or_else(|| std::io::Error::other("stderr pipe missing"))?;
 
+    let exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (stdout_tx, stdout_rx) = mpsc::channel();
+    let stdout_exceeded = Arc::clone(&exceeded);
     thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        let _ = stdout_tx.send(buf);
+        let result = read_tool_pipe(
+            stdout, MAX_RESPONSE_BYTES + MAX_HTTP1_HEAD + 1024, &stdout_exceeded,
+        );
+        let _ = stdout_tx.send(result);
     });
 
     let (stderr_tx, stderr_rx) = mpsc::channel();
+    let stderr_exceeded = Arc::clone(&exceeded);
     thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stderr);
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        let _ = stderr_tx.send(buf);
+        let result = read_tool_pipe(stderr, MAX_HTTP1_HEAD, &stderr_exceeded);
+        let _ = stderr_tx.send(result);
     });
 
     let started_at = Instant::now();
     let status = loop {
+        if exceeded.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other("subprocess response exceeds limit"));
+        }
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -1082,62 +797,203 @@ fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Res
 
     Ok(Output {
         status,
-        stdout: stdout_rx.recv().unwrap_or_default(),
-        stderr: stderr_rx.recv().unwrap_or_default(),
+        stdout: stdout_rx.recv().map_err(std::io::Error::other)??,
+        stderr: stderr_rx.recv().map_err(std::io::Error::other)??,
     })
+}
+
+fn read_tool_pipe(
+    mut reader: impl Read,
+    limit: usize,
+    exceeded: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if count > limit.saturating_sub(bytes.len()) {
+            exceeded.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(std::io::Error::other("subprocess response exceeds limit"));
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
 }
 
 fn io_error(message: impl Into<String>) -> NarouError {
     std::io::Error::other(message.into()).into()
 }
 
-fn content_type_of(response: &reqwest::blocking::Response) -> String {
-    response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string()
+/// Response head collector for libcurl's `header_function`.
+///
+/// libcurl reports every line it reads, status lines included, so a fresh
+/// status line starts a new head: a 100-continue (or a proxy CONNECT reply)
+/// must not leak its fields into the final response's headers.
+#[derive(Default)]
+struct CurlHeaders {
+    headers: Vec<(String, String)>,
 }
 
-fn content_type_header(content_type: String) -> Vec<(String, String)> {
-    if content_type.is_empty() {
-        Vec::new()
-    } else {
-        vec![("Content-Type".into(), content_type)]
+impl CurlHeaders {
+    fn feed(&mut self, line: &[u8]) {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            return;
+        }
+        if line.starts_with("HTTP/") {
+            self.headers.clear();
+            return;
+        }
+        match line.split_once(':') {
+            Some((name, value)) => {
+                let name = name.trim();
+                if !name.is_empty() {
+                    self.headers
+                        .push((name.to_string(), value.trim().to_string()));
+                }
+            }
+            // Obsolete folded line: append to the previous field's value.
+            None => {
+                if let Some((_, value)) = self.headers.last_mut() {
+                    value.push(' ');
+                    value.push_str(line.trim());
+                }
+            }
+        }
     }
+
+    fn into_headers(self) -> Vec<(String, String)> {
+        self.headers
+    }
+}
+
+/// Every response header of a reqwest response, as received.
+fn response_headers(response: &reqwest::blocking::Response) -> Vec<(String, String)> {
+    response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Split a tool's header dump (`curl -D -` / `wget --save-headers`) into the
+/// final response head and the body.
+///
+/// Both tools write every head they read before the body; a new `HTTP/`
+/// status line starts another block and only the last block belongs to the
+/// response that produced the body. `None` means no syntactically valid head
+/// was found, which must fail the tier rather than leak a head into the body.
+fn split_tool_output(output: &[u8]) -> Option<(&[u8], &[u8])> {
+    let mut start = 0usize;
+    loop {
+        let rest = &output[start..];
+        let (head_end, skip) = find_head_terminator(rest)?;
+        let block = &rest[..head_end];
+        let first_line_end = block
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .unwrap_or(block.len());
+        if !block[..first_line_end].starts_with(b"HTTP/") {
+            return None;
+        }
+        let next = start + head_end + skip;
+        if output[next..].starts_with(b"HTTP/") {
+            start = next;
+            continue;
+        }
+        return Some((block, &output[next..]));
+    }
+}
+
+/// End of a header block and the length of its terminating blank line.
+fn find_head_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
+    if let Some(at) = find_bytes(bytes, b"\r\n\r\n") {
+        return Some((at, 4));
+    }
+    find_bytes(bytes, b"\n\n").map(|at| (at, 2))
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Header fields of a dumped response head (the status line starts the head;
+/// the collector drops it and keeps the fields).
+fn parse_tool_headers(head: &[u8]) -> Vec<(String, String)> {
+    let mut collector = CurlHeaders::default();
+    for line in head.split(|&byte| byte == b'\n') {
+        collector.feed(line);
+    }
+    collector.into_headers()
+}
+
+fn parse_tool_status(head: &[u8]) -> Option<u16> {
+    let first_line = head.split(|&byte| byte == b'\n').next()?;
+    let text = std::str::from_utf8(first_line).ok()?;
+    let mut parts = text.lines().next()?.split_whitespace();
+    parts.next()?.starts_with("HTTP/").then_some(())?;
+    let status = parts.next()?.parse::<u16>().ok()?;
+    (100..600).contains(&status).then_some(status)
+}
+
+/// wget reports redirects/error heads on stderr even when it saves no body.
+fn parse_wget_response_head(stderr: &[u8]) -> Option<(u16, Vec<(String, String)>)> {
+    let text = String::from_utf8_lossy(stderr);
+    let mut status = None;
+    let mut headers = CurlHeaders::default();
+    let mut in_head = false;
+    for line in text.lines() {
+        if !line.starts_with([' ', '\t']) {
+            in_head = false;
+            continue;
+        }
+        let line = line.trim();
+        if line.starts_with("HTTP/") {
+            status = parse_tool_status(line.as_bytes());
+            headers.feed(line.as_bytes());
+            in_head = true;
+        } else if in_head && line.contains(':') {
+            headers.feed(line.as_bytes());
+        }
+    }
+    status.map(|status| (status, headers.into_headers()))
 }
 
 pub fn default_request_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static(
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        ),
-    );
+    headers.insert(ACCEPT, HeaderValue::from_static(DEFAULT_ACCEPT));
     headers.insert(
         ACCEPT_LANGUAGE,
-        HeaderValue::from_static("ja,en-US;q=0.9,en;q=0.8"),
+        HeaderValue::from_static(DEFAULT_ACCEPT_LANGUAGE),
     );
     headers.insert(
         ACCEPT_ENCODING,
-        HeaderValue::from_static("gzip, deflate, br"),
+        HeaderValue::from_static(DEFAULT_ACCEPT_ENCODING),
     );
-    headers.insert(ACCEPT_CHARSET, HeaderValue::from_static("utf-8"));
-    headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+    headers.insert(ACCEPT_CHARSET, HeaderValue::from_static(DEFAULT_ACCEPT_CHARSET));
+    headers.insert(CONNECTION, HeaderValue::from_static(DEFAULT_CONNECTION));
     headers
 }
 
 #[cfg(test)]
 mod tests {
-    use super::NativeHttpClient;
+    use super::{NativeHttpClient, parse_tool_headers, split_tool_output};
     use crate::error::NarouError;
-    use crate::platform::HttpRequest;
+    use crate::platform::{CookieStore, HttpClient, HttpRequest, RedirectMode};
+    use crate::platform::http::RedirectChain;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
     use std::thread;
 
     #[test]
@@ -1164,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn curl_redirect_is_not_returned_as_success() {
+    fn curl_redirect_returns_the_single_hop_status_and_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/redirect", listener.local_addr().unwrap());
 
@@ -1174,54 +1030,25 @@ mod tests {
             let _ = stream.read(&mut request);
             stream
                 .write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
-        });
-
-        let client = NativeHttpClient::new("narou_rs-test").unwrap();
-        let err = client
-            .fetch_tier_curl(
-                &HttpRequest::get(url.clone()).with_header("Cookie", "over18=yes"),
-                "narou_rs-test",
-            )
-            .unwrap_err();
-        server.join().unwrap();
-
-        assert!(err.to_string().contains("HTTP redirect 302"));
-    }
-
-    #[test]
-    fn manual_mode_returns_the_curl_redirect_and_its_location() {
-        // Manual モードは curl ティアを先に使う。3xx をそのまま返し、Location を
-        // 落とさないこと (CDN challenge を curl が通り reqwest が弾かれる hosts
-        // があるため、ここが reqwest 任せだと本文ごと 403 になる)。
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/moved", listener.local_addr().unwrap());
-
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 1024];
-            let _ = stream.read(&mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/private\r\nSet-Cookie: sid=next\r\nSet-Cookie: extra=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .unwrap();
         });
 
         let client = NativeHttpClient::new("narou_rs-test").unwrap();
         let response = client
-            .fetch_tier_curl_manual(&HttpRequest::get(url), "narou_rs-test")
+            .fetch_tier_curl(
+                &HttpRequest::get(url.clone()).with_header("Cookie", "over18=yes"),
+                "narou_rs-test",
+            )
             .unwrap();
         server.join().unwrap();
 
         assert_eq!(response.status, 302);
-        assert_eq!(
-            response.header("Location"),
-            Some("http://127.0.0.1/elsewhere")
-        );
+        assert_eq!(response.header("Location"), Some("http://127.0.0.1/private"));
+        assert_eq!(response.header_values("Set-Cookie"), vec!["sid=next", "extra=1"]);
     }
+
 
     #[test]
     fn curl_503_is_returned_raw_for_policy_mapping() {
@@ -1266,13 +1093,16 @@ mod tests {
     #[test]
     fn subprocess_tier_fetches_200_body() {
         let (url, server) = serve_once(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
         );
         let client = NativeHttpClient::new("narou_rs-test").unwrap();
         match client.fetch_tier_subprocess(&HttpRequest::get(url.clone()), "narou_rs-test") {
             Ok(response) => {
                 assert_eq!(response.status, 200);
                 assert_eq!(response.body, b"hello");
+                // The dumped head must not leak into the body and every
+                // response header (both cookies included) must survive.
+                assert_eq!(response.header_values("set-cookie"), vec!["a=1", "b=2"]);
             }
             // No curl/wget on this machine: nothing to verify.
             Err(err) if err.to_string().contains("no download tool available") => {}
@@ -1282,15 +1112,199 @@ mod tests {
     }
 
     #[test]
-    fn subprocess_tier_treats_non_2xx_as_error() {
+    fn curl_tier_keeps_repeated_response_headers() {
+        let (url, server) = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nSet-Cookie: sid=1; Path=/\r\nSet-Cookie: over18=yes\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        let response = client
+            .fetch_tier_curl(&HttpRequest::get(url.clone()), "narou_rs-test")
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            response.header_values("set-cookie"),
+            vec!["sid=1; Path=/", "over18=yes"]
+        );
+        assert_eq!(
+            response.header("content-type"),
+            Some("text/html; charset=UTF-8")
+        );
+        assert_eq!(response.body, b"ok");
+    }
+
+    #[test]
+    fn tool_output_split_keeps_only_the_final_head() {
+        let output = b"HTTP/1.1 302 Found\r\nLocation: /a\r\n\r\nHTTP/1.1 100 Continue\r\nX-Interim: 1\r\n\r\nHTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 2\r\n\r\nok";
+        let (head, body) = split_tool_output(output).expect("a head block");
+        let headers = parse_tool_headers(head);
+        assert_eq!(body, b"ok");
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a=1", "b=2"]
+        );
+        assert!(!headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("location")));
+        assert!(!headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("x-interim")));
+    }
+
+    #[tokio::test]
+    async fn response_set_cookie_updates_only_the_login_that_was_sent() {
+        let (url, server) = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: sid=fresh; Path=/\r\nSet-Cookie: extra=1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let store = Arc::new(crate::platform::mocks::MemoryCookieStore::new());
+        store
+            .save_groups(
+                "example.com",
+                &[
+                    crate::platform::LoginGroup::new(
+                        "example.com",
+                        vec![crate::platform::HostCookie {
+                            host: "127.0.0.1".to_string(),
+                            cookie: "sid=stale".to_string(),
+                        }],
+                    ),
+                    crate::platform::LoginGroup::new(
+                        "example.com",
+                        vec![crate::platform::HostCookie {
+                            host: "other.example".to_string(),
+                            cookie: "sid=other".to_string(),
+                        }],
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        let request = HttpRequest::get(url.clone()).with_header("Cookie", "sid=stale");
+        let response = client
+            .fetch_tier_curl(&request, "narou_rs-test")
+            .unwrap();
+        server.join().unwrap();
+        crate::platform::cookie_store::persist_response_set_cookie(
+            store.as_ref(),
+            &response,
+            Some("sid=stale"),
+        )
+        .await;
+
+        let stored = store.load_groups("example.com").await.unwrap();
+        assert_eq!(stored[0].cookies[0].cookie, "sid=fresh; extra=1");
+        assert_eq!(
+            stored[1].cookies[0].cookie, "sid=other",
+            "a login that was not sent must not be touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_complete_response_refreshes_the_sent_login_cookie() {
+        let (url, server) = serve_once(
+            b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=wired\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let store = Arc::new(crate::platform::mocks::MemoryCookieStore::new());
+        store
+            .save_groups(
+                "example.com",
+                &[crate::platform::LoginGroup::new(
+                    "example.com",
+                    vec![crate::platform::HostCookie {
+                        host: "127.0.0.1".to_string(),
+                        cookie: "sid=stale".to_string(),
+                    }],
+                )],
+            )
+            .await
+            .unwrap();
+
+        let client = NativeHttpClient::new("narou_rs-test")
+            .unwrap()
+            .with_cookie_store(store.clone());
+        // The test server is loopback-only, so the request rides the trusted
+        // endpoint path (no public-address check); the `Set-Cookie` write-back
+        // is the same call the site paths make.
+        let request = HttpRequest::get(url.clone())
+            .with_header("Cookie", "sid=stale")
+            .with_trusted_endpoint();
+        client.send(request).await.unwrap();
+        server.join().unwrap();
+
+        let stored = store.load_groups("example.com").await.unwrap();
+        assert_eq!(stored[0].cookies[0].cookie, "sid=wired");
+    }
+
+    #[test]
+    fn reqwest_hop_to_a_private_host_is_rejected_before_it_is_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/start");
+        let location = format!("http://localhost:{port}/next");
+        let second_request = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = second_request.clone();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            drop(stream);
+
+            // The next hop must be rejected by validation before any second
+            // connection is attempted.
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => {
+                        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        // Seed the first single hop directly: the shared outer send correctly
+        // rejects this loopback test origin as untrusted. The returned redirect
+        // must still be checked before its next outgoing request.
+        let request = HttpRequest::get(url);
+        let response = client.fetch_tier_reqwest(&request).unwrap();
+        let mut chain = RedirectChain::new(request, 10);
+        assert!(chain.advance(&response).unwrap());
+        let err = NativeHttpClient::validate_hop(chain.request()).unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            !second_request.load(std::sync::atomic::Ordering::SeqCst),
+            "a hop to a private address must be rejected, not sent"
+        );
+        assert!(
+            err.to_string().contains("non-public") || err.to_string().contains("DNS"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn subprocess_tier_returns_a_definitive_404_unchanged() {
         let (url, server) = serve_once(
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
         let client = NativeHttpClient::new("narou_rs-test").unwrap();
         match client.fetch_tier_subprocess(&HttpRequest::get(url.clone()), "narou_rs-test") {
             Err(err) if err.to_string().contains("no download tool available") => {}
-            Err(err) => assert!(err.to_string().contains("404"), "{err}"),
-            Ok(_) => panic!("404 must not succeed"),
+            Err(err) => panic!("subprocess fetch failed: {err}"),
+            Ok(response) => assert_eq!(response.status, 404),
         }
         server.join().unwrap();
     }
@@ -1298,7 +1312,210 @@ mod tests {
     #[tokio::test]
     async fn constructor_is_safe_inside_async_runtime() {
         let client = NativeHttpClient::new("narou_rs-test").unwrap();
-        assert_eq!(client.user_agent, "narou_rs-test");
         drop(client);
+    }
+
+    fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let count = stream.read(&mut chunk).unwrap();
+            assert_ne!(count, 0, "request ended before its head");
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(at) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break at + 4;
+            }
+            assert!(bytes.len() <= super::MAX_HTTP1_HEAD);
+        };
+        let head = String::from_utf8(bytes[..head_end].to_vec()).unwrap();
+        let length = request_header(&head, "Content-Length")
+            .map(|value| value.parse::<usize>().unwrap()).unwrap_or(0);
+        while bytes.len() - head_end < length {
+            let count = stream.read(&mut chunk).unwrap();
+            assert_ne!(count, 0, "request body was truncated");
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        (head, bytes[head_end..head_end + length].to_vec())
+    }
+
+    fn request_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines().filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    }
+
+    #[tokio::test]
+    async fn native_redirects_send_the_correct_method_body_and_body_headers() {
+        for status in [301, 302, 303, 307, 308] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/start", listener.local_addr().unwrap());
+            let payload: Vec<u8> = (0u8..=255).cycle().take(32 * 1024).collect();
+            let expected = payload.clone();
+            let server = thread::spawn(move || {
+                let (mut first, _) = listener.accept().unwrap();
+                let (head, body) = read_request(&mut first);
+                assert!(head.starts_with("POST /start HTTP/1.1"));
+                assert_eq!(body, expected);
+                first.write_all(format!(
+                    "HTTP/1.1 {status} Redirect\r\nLocation: /finish\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ).as_bytes()).unwrap();
+                drop(first);
+                let (mut second, _) = listener.accept().unwrap();
+                let (head, body) = read_request(&mut second);
+                if matches!(status, 301..=303) {
+                    assert!(head.starts_with("GET /finish HTTP/1.1"), "{head}");
+                    assert!(body.is_empty());
+                    assert!(request_header(&head, "Content-Type").is_none());
+                    assert!(request_header(&head, "Content-Encoding").is_none());
+                    assert!(request_header(&head, "Content-Length").is_none());
+                } else {
+                    assert!(head.starts_with("POST /finish HTTP/1.1"), "{head}");
+                    assert_eq!(body, expected);
+                    assert_eq!(request_header(&head, "Content-Type"), Some("application/octet-stream"));
+                }
+                assert_eq!(request_header(&head, "User-Agent"), Some("site-agent"));
+                assert_eq!(head.lines().filter_map(|line| line.split_once(':'))
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("User-Agent")).count(), 1);
+                second.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+            });
+            let client = NativeHttpClient::new("native-default").unwrap();
+            let response = client.send(HttpRequest::post(url, payload)
+                .with_header("Content-Type", "application/octet-stream")
+                .with_header("Content-Encoding", "identity")
+                .with_header("User-Agent", "site-agent")
+                .with_trusted_endpoint()).await.unwrap();
+            server.join().unwrap();
+            assert_eq!(response.body, b"ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_native_send_returns_the_single_redirect_without_another_connection() {
+        let (url, server) = serve_once(
+            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/next\r\nSet-Cookie: sid=next\r\nContent-Length: 4\r\nConnection: close\r\n\r\nwait",
+        );
+        let client = NativeHttpClient::new("native-test").unwrap();
+        let response = client.send(
+            HttpRequest::post(url, b"payload".to_vec())
+                .with_trusted_endpoint().with_redirect(RedirectMode::Manual),
+        ).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(response.status, 307);
+        assert_eq!(response.body, b"wait");
+        assert_eq!(response.header("Location"), Some("http://127.0.0.1:1/next"));
+        assert_eq!(response.header_values("Set-Cookie"), vec!["sid=next"]);
+    }
+
+    #[tokio::test]
+    async fn native_origin_port_change_strips_authorization_but_keeps_the_actual_cookie() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/start", first_listener.local_addr().unwrap());
+        let destination = format!("http://{}/finish", second_listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut first, _) = first_listener.accept().unwrap();
+            let (head, _) = read_request(&mut first);
+            assert_eq!(request_header(&head, "Authorization"), Some("Bearer secret"));
+            first.write_all(format!(
+                "HTTP/1.1 302 Found\r\nLocation: {destination}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ).as_bytes()).unwrap();
+            drop(first);
+            let (mut second, _) = second_listener.accept().unwrap();
+            let (head, _) = read_request(&mut second);
+            assert!(request_header(&head, "Authorization").is_none());
+            assert_eq!(request_header(&head, "Cookie"), Some("sid=stale"));
+            second.write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=fresh\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+        });
+        let store = Arc::new(crate::platform::mocks::MemoryCookieStore::new());
+        store.save_groups("example.com", &[crate::platform::LoginGroup::new(
+            "example.com", vec![crate::platform::HostCookie {
+                host: "127.0.0.1".into(), cookie: "sid=stale".into(),
+            }],
+        )]).await.unwrap();
+        let client = NativeHttpClient::new("native-test").unwrap().with_cookie_store(store.clone());
+        client.send(HttpRequest::get(url)
+            .with_header("Authorization", "Bearer secret")
+            .with_header("Cookie", "sid=stale")
+            .with_trusted_endpoint()).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(store.load_groups("example.com").await.unwrap()[0].cookies[0].cookie, "sid=fresh");
+    }
+
+    #[tokio::test]
+    async fn intermediate_redirect_cookie_is_saved_and_cross_site_cookie_is_not_written_back() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/start");
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let (head, _) = read_request(&mut first);
+            assert_eq!(request_header(&head, "Cookie"), Some("sid=stale"));
+            first.write_all(format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/finish\r\nSet-Cookie: sid=intermediate\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ).as_bytes()).unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().unwrap();
+            let (head, _) = read_request(&mut second);
+            assert!(request_header(&head, "Cookie").is_none());
+            assert!(request_header(&head, "Authorization").is_none());
+            second.write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=foreign\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+        });
+        let store = Arc::new(crate::platform::mocks::MemoryCookieStore::new());
+        store.save_groups("example.com", &[crate::platform::LoginGroup::new(
+            "example.com", vec![crate::platform::HostCookie {
+                host: "127.0.0.1".into(), cookie: "sid=stale".into(),
+            }],
+        )]).await.unwrap();
+        let client = NativeHttpClient::new("native-test").unwrap().with_cookie_store(store.clone());
+        client.send(HttpRequest::get(url)
+            .with_header("Cookie", "sid=stale")
+            .with_header("Authorization", "Bearer secret")
+            .with_trusted_endpoint()).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(store.load_groups("example.com").await.unwrap()[0].cookies[0].cookie, "sid=intermediate");
+    }
+
+    #[tokio::test]
+    async fn trusted_response_truncation_is_an_error_not_a_fallback_response() {
+        let (url, server) = serve_once(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort",
+        );
+        let client = NativeHttpClient::new("native-test").unwrap();
+        assert!(client.send(HttpRequest::get(url).with_trusted_endpoint()).await.is_err());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_site_redirect_rotation_is_sent_and_final_rotation_is_persisted() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let (head, _) = read_request(&mut first);
+            assert_eq!(request_header(&head, "Cookie"), Some("sid=stale"));
+            first.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: /finish\r\nSet-Cookie: sid=intermediate\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ).unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().unwrap();
+            let (head, _) = read_request(&mut second);
+            assert_eq!(request_header(&head, "Cookie"), Some("sid=intermediate"));
+            second.write_all(
+                b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=final\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            ).unwrap();
+        });
+        let store = Arc::new(crate::platform::mocks::MemoryCookieStore::new());
+        store.save_groups("example.com", &[crate::platform::LoginGroup::new(
+            "example.com", vec![crate::platform::HostCookie {
+                host: "127.0.0.1".into(), cookie: "sid=stale".into(),
+            }],
+        )]).await.unwrap();
+        let client = NativeHttpClient::new("native-test").unwrap().with_cookie_store(store.clone());
+        let response = client.send(HttpRequest::get(url)
+            .with_header("Cookie", "sid=stale").with_trusted_endpoint()).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(response.body, b"ok");
+        assert_eq!(store.load_groups("example.com").await.unwrap()[0].cookies[0].cookie, "sid=final");
     }
 }

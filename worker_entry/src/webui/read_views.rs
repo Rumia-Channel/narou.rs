@@ -14,14 +14,14 @@
 //! - `GET /api/notepad/read` / `POST /api/notepad/save` —
 //!   `app_state('inv','notepad')` の生テキスト (native `StateDb::set_raw` と同じく
 //!   `value_yaml` に格納)。`object_id` は本文の SHA-256 hex で競合検知に使う。
-//! - `GET /api/history` / `POST /api/clear_history` — Worker には PushServer の
-//!   コンソール履歴バッファが無い (websocket.rs 参照)。保持する履歴が無いので
-//!   `history` は空を返し、`clear_history` はクリア対象が無い = native の
-//!   クリア済み状態と同じ成功応答になる。
+//! - `GET /api/history` / `POST /api/clear_history` — PushHub DO
+//!   (`push_hub.rs`) が永続化するコンソール履歴を読む / 消す。native
+//!   `console_history` / `clear_history` と同じ受理形 (`stream` 既定
+//!   `stdout`、`format=json`) で、DO が読めないときは空履歴に潰さず 502。
 //! - `GET`/`POST /api/taginfo.json` — タグ情報配列。native は POST のみだが、
 //!   ルート表で GET に割り当てられているため GET (クエリ `ids` 指定) も受理する。
 //! - `GET /api/version/current.json` / `GET /api/version/latest.json` —
-//!   native `version_json` のキー構造を Worker の実値に置き換えたもの。
+//!   キー集合は共有の `VersionInfoPayload`、値は Worker の実値。
 //!   バージョン文字列は `env!("CARGO_PKG_VERSION")` (`narou_worker` の
 //!   パッケージバージョンは narou.rs と揃えてある)。
 //! - `POST /api/inspect` — `調査ログ.txt` は native の `Inspector::save`
@@ -30,34 +30,32 @@
 //!   `not_supported_on_worker` を返す (成功を偽装しない)。
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 
 use narou_rs::application::ApplicationError;
 use narou_rs::application::aliases::resolve_alias_target;
-use narou_rs::downloader::{Downloader, SectionFile, TargetType};
-use narou_rs::platform::{
-    NovelId, NovelObjectKeys, ObjectKey, ObjectListRequest, ObjectPrefix,
-};
+use narou_rs::platform::{NovelId, NovelObjectKeys};
 use serde::Deserialize;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use wasm_bindgen::JsValue;
 use worker::{console_log, Env, Fetch, Headers, Method, Request, RequestInit, Response};
 
 use crate::composition::WorkerRuntime;
 
 use narou_rs::application::settings_view::MAX_WEB_TEXT_INPUT_BYTES;
-use narou_rs::application::webui::{
-    html_escape, tag_color_class, targets_to_strings, validate_web_target_value,
+use narou_rs::application::web_payloads::{VersionInfoPayload, version_update_available};
+use narou_rs::application::webui::diff::{
+    DIFF_CLEAN_FAILED, diff_cleaned_message, diff_content_label, diff_list_entry,
+    diff_missing_entry, plan_diff_cache_clean, read_diff_cache_catalog, render_diff_list_html,
 };
+use narou_rs::application::webui::mutations::MutationNotice;
+use narou_rs::application::webui::notepad::{
+    notepad_conflict_payload, notepad_object_id, notepad_response_value, notepad_saved_payload,
+};
+use narou_rs::application::webui::tag_views::{tag_names, taginfo_entries};
+use narou_rs::application::webui::{targets_to_strings, validate_web_target_value};
 
 use super::{api_response, configured_tag_color, json_error, max_web_targets, query_param};
 
-/// native `SECTION_SAVE_DIR` (`本文`) — セクション/キャッシュが置かれる層。
-const SECTION_SAVE_DIR: &str = "本文";
-/// Worker が書く差分キャッシュ (`NovelObjectKeys::cached_section`) と
-/// native レイアウト由来の移行物 (`cache/`) の双方を対象にする。
-const CACHE_DIR_NAMES: [&str; 2] = [".cache", "cache"];
 /// `app_state` の notepad 行 (native `StateDb` の scope/key と同じ)。
 /// alias 行の scope/key は `narou_rs::application::aliases` が持つ。
 const INVENTORY_SCOPE: &str = "inv";
@@ -69,8 +67,6 @@ const RELEASES_PAGE_URL: &str =
     "https://github.com/Rumia-Channel/narou.rs/releases/latest";
 /// native `narou_rs::version::NAME`。
 const APP_NAME: &str = "narou.rs";
-/// 差分キャッシュのオブジェクト列挙/削除を一度に扱うページ幅。
-const OBJECT_PAGE_LIMIT: usize = 1000;
 
 /// native `src/web/state.rs::TargetsBody` と同じ受理形。
 #[derive(Debug, Deserialize)]
@@ -160,10 +156,13 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         }
     };
 
-    // バージョン系はリポジトリに触れないので runtime 組み立てをスキップする。
+    // バージョン系と履歴系はリポジトリ/D1 サービスに触れないので runtime
+    // 組み立てをスキップする (履歴は PushHub DO だけを読む)。
     match route {
         Route::VersionCurrent => return version_current(),
         Route::VersionLatest => return version_latest().await,
+        Route::History => return console_history(&req, &env).await,
+        Route::ClearHistory => return clear_history(&env).await,
         _ => {}
     }
 
@@ -183,10 +182,9 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         Route::Inspect => inspect(&mut req, &runtime).await,
         Route::NotepadRead => notepad_read(&env).await,
         Route::NotepadSave => notepad_save(&mut req, &env).await,
-        Route::History => console_history(&req),
-        Route::ClearHistory => clear_history(),
         Route::TagInfoGet => taginfo_get(&req, &runtime).await,
         Route::TagInfoPost => taginfo_post(&mut req, &runtime).await,
+        Route::History | Route::ClearHistory => unreachable!(),
         Route::VersionCurrent | Route::VersionLatest => unreachable!(),
     }
 }
@@ -199,6 +197,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
 fn map_application_error(error: ApplicationError) -> worker::Result<Response> {
     let (status, code, message) = match error {
         ApplicationError::InvalidRequest(message) => (400, "bad_request", message),
+        ApplicationError::Conflict(message) => (409, "conflict", message),
         ApplicationError::NotFound(message) => (404, "not_found", message),
         ApplicationError::Platform(message) => (500, "internal_error", message),
     };
@@ -254,57 +253,32 @@ async fn get_story(req: &Request, runtime: &WorkerRuntime) -> worker::Result<Res
 // ---------------------------------------------------------------------------
 
 /// native `resolve_existing_id_for_target_with_library` (`src/web/jobs.rs`) 相当:
-/// `get_target_type` で id / URL / ncode / タイトルの順に既存 ID を引く。
-/// URL 解決は `services.site_definitions.resolve_toc_url` を優先し、
-/// Worker の `EmptySiteDefinitionProvider` ではヒットしないときだけ
-/// 保存済み `toc_url` 完全一致へフォールバックする。
+/// id / URL / ncode / タイトルの順に既存 ID を引く。URL 解決は
+/// `services.site_definitions.resolve_toc_url` を優先し、ヒットしないときだけ
+/// 保存済み `toc_url` 完全一致へフォールバックする — 規則は
+/// `TargetLookupPlan::READ_WITH_RAW_FALLBACK` が唯一の定義。
 async fn resolve_existing_id(runtime: &WorkerRuntime, target: &str) -> Option<i64> {
-    match Downloader::get_target_type(target) {
-        TargetType::Id => runtime
-            .services
-            .library
-            .get(target.parse::<i64>().ok()?.into())
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id),
-        TargetType::Url => {
-            let toc_url = runtime
-                .services
-                .site_definitions
-                .resolve_toc_url(target)
-                .unwrap_or_else(|| target.to_string());
-            runtime
-                .services
-                .library
-                .find_by_toc_url(&toc_url)
-                .await
-                .ok()
-                .flatten()
-                .map(|record| record.id)
-        }
-        TargetType::Ncode => runtime
-            .services
-            .library
-            .find_by_ncode(target)
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id),
-        _ => runtime
-            .services
-            .library
-            .find_by_title(target)
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id),
-    }
+    let library = &runtime.services.library;
+    library
+        .resolve_target(
+            narou_rs::application::target_lookup::TargetLookupPlan::READ_WITH_RAW_FALLBACK,
+            &HashMap::new(),
+            narou_rs::application::target_lookup::UrlSource::Provider(
+                &*runtime.services.site_definitions,
+            ),
+            target,
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.id)
 }
 
 /// `narou diff --clean <target>` がサブプロセス内で通る解決順
 /// (`commands::resolve_target_to_id`): エイリアス → ID → URL → ncode → タイトル
-/// (Other はタイトル→ncode の順でフォールバック)。
+/// (Other はタイトル→ncode の順でフォールバック)。alias と trim は native の
+/// 前段と同じ順でここで適用し、探索は `TargetLookupPlan::ALIAS_APPLIED` が
+/// 唯一の定義。
 async fn resolve_diff_target_id(
     runtime: &WorkerRuntime,
     env: &Env,
@@ -316,115 +290,23 @@ async fn resolve_diff_target_id(
     if effective.is_empty() {
         return None;
     }
-    if let Ok(id) = effective.parse::<i64>() {
-        // diff_clean の削除対象を stale なキャッシュ/replica で確定しない。
-        return runtime
-            .write_services()
-            .library
-            .get(id.into())
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id);
-    }
-    match Downloader::get_target_type(effective) {
-        TargetType::Url => {
-            let toc_url = runtime
-                .write_services()
-                .site_definitions
-                .resolve_toc_url(effective)
-                .unwrap_or_else(|| effective.to_string());
-            runtime
-                .write_services()
-                .library
-                .find_by_toc_url(&toc_url)
-                .await
-                .ok()
-                .flatten()
-                .map(|record| record.id)
-        }
-        TargetType::Ncode => runtime
-            .write_services()
-            .library
-            .find_by_ncode(effective)
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.id),
-        TargetType::Id => None,
-        _ => {
-            let by_title = runtime
-                .write_services()
-                .library
-                .find_by_title(effective)
-                .await
-                .ok()
-                .flatten()
-                .map(|record| record.id);
-            match by_title {
-                Some(id) => Some(id),
-                None => runtime
-                    .write_services()
-                    .library
-                    .find_by_ncode(effective)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|record| record.id),
-            }
-        }
-    }
+    // diff_clean の削除対象を stale なキャッシュ/replica で確定しない
+    // (write_services = primary 直行)。
+    let services = runtime.write_services();
+    services
+        .library
+        .resolve_target(
+            narou_rs::application::target_lookup::TargetLookupPlan::ALIAS_APPLIED,
+            &aliases,
+            narou_rs::application::target_lookup::UrlSource::Provider(&*services.site_definitions),
+            effective,
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.id)
 }
 
-/// `<novel_prefix>/本文/<cache_dir>/<version>/<file>.yaml` という形の
-/// キャッシュキーだけを `(version, file_name)` に展開する。
-/// `novel_prefix` は `NovelObjectKeys::prefix()` (= `novels/<site>/<title>`)。
-fn cached_section_key<'a>(novel_prefix: &str, key: &'a str) -> Option<(&'a str, &'a str)> {
-    let rest = key
-        .strip_prefix(novel_prefix)?
-        .strip_prefix('/')?
-        .strip_prefix(SECTION_SAVE_DIR)?
-        .strip_prefix('/')?;
-    let (cache_dir, rest) = rest.split_once('/')?;
-    if !CACHE_DIR_NAMES.contains(&cache_dir) {
-        return None;
-    }
-    let (version, file_name) = rest.split_once('/')?;
-    if file_name.is_empty() || !file_name.ends_with(".yaml") {
-        return None;
-    }
-    Some((version, file_name))
-}
-
-/// `<novel_prefix>/本文/` 配下の差分キャッシュキーだけを列挙する。
-/// `ObjectStore::list_page` はカーソル分割だが、D1 は全件を返す構造なので
-/// まとめて取得しきる。
-async fn list_cached_section_keys(
-    objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
-    novel_prefix: &str,
-) -> Result<Vec<String>, String> {
-    let sections_prefix = format!("{novel_prefix}/{SECTION_SAVE_DIR}/");
-    let prefix = ObjectPrefix::new(sections_prefix).map_err(|error| error.to_string())?;
-    let mut keys = Vec::new();
-    let mut request =
-        ObjectListRequest::new(prefix, NonZeroUsize::new(OBJECT_PAGE_LIMIT).unwrap());
-    loop {
-        let page = objects
-            .list_page(&request)
-            .await
-            .map_err(|error| error.to_string())?;
-        for meta in &page.objects {
-            if cached_section_key(novel_prefix, meta.key.as_ref()).is_some() {
-                keys.push(meta.key.as_ref().to_string());
-            }
-        }
-        let Some(cursor) = page.next_cursor else {
-            break;
-        };
-        request = request.after(cursor);
-    }
-    Ok(keys)
-}
 
 // ---------------------------------------------------------------------------
 // GET /api/diff_list (native: src/web/jobs.rs:1479 api_diff_list_get +
@@ -434,21 +316,15 @@ async fn list_cached_section_keys(
 async fn diff_list_get(req: &Request, runtime: &WorkerRuntime) -> worker::Result<Response> {
     let url = req.url()?;
     let html = match query_param(&url, "target").as_deref() {
-        Some(target) => render_diff_list_html(runtime, target).await,
+        Some(target) => diff_list_html_for_target(runtime, target).await,
         None => String::new(),
     };
     Response::from_html(html)
 }
 
-/// 差分一覧 1 行分の `(index, file_name, object key)`。
-type VersionSection = (usize, String, String);
-
-/// バージョン 1 件分の `(version, sections)`。
-type VersionGroup = (String, Vec<VersionSection>);
-
-/// native `render_diff_list_html_for_target` の写し。解決失敗・記録なし・
-/// キャッシュ列挙失敗・キャッシュ空は全部空文字列を返す (= native 同様)。
-async fn render_diff_list_html(runtime: &WorkerRuntime, target: &str) -> String {
+/// 解決失敗・記録なし・列挙失敗は native と同じ空文字列。保存済みの
+/// バージョンの分類と本文デコードは共通のカタログに任せる。
+async fn diff_list_html_for_target(runtime: &WorkerRuntime, target: &str) -> String {
     let Some(id) = resolve_existing_id(runtime, target).await else {
         return String::new();
     };
@@ -462,65 +338,12 @@ async fn render_diff_list_html(runtime: &WorkerRuntime, target: &str) -> String 
     ) else {
         return String::new();
     };
-    let prefix = object_keys.prefix().as_ref().to_string();
-    let Ok(mut keys) = list_cached_section_keys(&runtime.objects(), &prefix).await else {
+    let Ok(versions) =
+        read_diff_cache_catalog(runtime.objects().as_ref(), object_keys.prefix(), &[]).await
+    else {
         return String::new();
     };
-    if keys.is_empty() {
-        return String::new();
-    }
-
-    // (version, [(index, file_name, key)]) に畳み込み、version 名の降順に並べる
-    // (native `read_sorted_cache_dirs` の降順と同じ)。
-    let mut versions: HashMap<String, Vec<VersionSection>> = HashMap::new();
-    for key in keys.drain(..) {
-        let Some((version, file_name)) = cached_section_key(&prefix, &key) else {
-            continue;
-        };
-        let index = file_name
-            .split_once(' ')
-            .and_then(|(index, _)| index.parse::<usize>().ok())
-            .unwrap_or(0);
-        versions
-            .entry(version.to_string())
-            .or_default()
-            .push((index, file_name.to_string(), key));
-    }
-    let mut ordered: Vec<VersionGroup> = versions.into_iter().collect();
-    ordered.sort_by(|a, b| b.0.cmp(&a.0));
-
-    let mut html = String::new();
-    for (number, (version, mut sections)) in ordered.into_iter().enumerate() {
-        html.push_str("<div class=\"diff-list-group\">");
-        html.push_str(&format!(
-            "<div class=\"diff-list-version\">{}&nbsp;&nbsp;-{}</div>",
-            html_escape(&version),
-            number + 1
-        ));
-        sections.sort_by_key(|(index, _, _)| *index);
-        if sections.is_empty() {
-            html.push_str("<div class=\"diff-list-entry\">(最新話のみのアップデート)</div></div>");
-            continue;
-        }
-        for (_index, _file_name, key) in sections {
-            let Ok(object_key) = ObjectKey::try_new(key.as_str()) else {
-                continue;
-            };
-            let Ok(Some(bytes)) = runtime.objects().read_small(&object_key).await else {
-                continue;
-            };
-            let Ok(section) = serde_yaml::from_slice::<SectionFile>(&bytes) else {
-                continue;
-            };
-            html.push_str(&format!(
-                "<div class=\"diff-list-entry\">第{}部分　{}</div>",
-                html_escape(&section.index),
-                html_escape(section.subtitle.trim_end())
-            ));
-        }
-        html.push_str("</div>");
-    }
-    html
+    render_diff_list_html(&versions)
 }
 
 // ---------------------------------------------------------------------------
@@ -544,25 +367,11 @@ async fn diff_list_post(req: &mut Request, runtime: &WorkerRuntime) -> worker::R
         };
         let record = runtime.services.library.get(id.into()).await.ok().flatten();
         let Some(record) = record else {
-            diffs.push(json!({
-                "id": id,
-                "title": format!("ID: {}", id),
-                "content": "Novel not found",
-            }));
+            diffs.push(diff_missing_entry(id));
             continue;
         };
-        let content = match runtime.services.content.diff(id.into()).await {
-            Ok(Some(bytes)) => {
-                String::from_utf8(bytes).unwrap_or_else(|_| "読み取りエラー".to_string())
-            }
-            Ok(None) => "No diff".to_string(),
-            Err(_) => "読み取りエラー".to_string(),
-        };
-        diffs.push(json!({
-            "id": id,
-            "title": record.title,
-            "content": content,
-        }));
+        let content = diff_content_label(runtime.services.content.diff(id.into()).await);
+        diffs.push(diff_list_entry(id, &record.title, &content));
     }
     Response::from_json(&json!({ "diffs": diffs }))
 }
@@ -591,34 +400,31 @@ async fn diff_clean(
     };
 
     let Some(id) = resolve_diff_target_id(runtime, env, &target).await else {
-        return api_json_response(false, "差分の削除に失敗しました");
+        return api_json_response(false, DIFF_CLEAN_FAILED);
     };
     // 削除対象の確定と削除そのものを stale なスナップショットへ依存させない
     // (読み取りも primary + キャッシュ無しの更新系で行う)。
     let Ok(Some(record)) = runtime.write_services().library.get(id.into()).await else {
-        return api_json_response(false, "差分の削除に失敗しました");
+        return api_json_response(false, DIFF_CLEAN_FAILED);
     };
     let Ok(keys) = NovelObjectKeys::new(
         &record.sitename,
         &record.file_title,
         record.use_subdirectory,
     ) else {
-        return api_json_response(false, "差分の削除に失敗しました");
+        return api_json_response(false, DIFF_CLEAN_FAILED);
     };
-    let prefix = keys.prefix().as_ref().to_string();
-    let cache_keys = match list_cached_section_keys(&runtime.write_objects(), &prefix).await {
+    let objects = runtime.write_objects();
+    let cache_keys = match plan_diff_cache_clean(objects.as_ref(), keys.prefix()).await {
         Ok(keys) => keys,
-        Err(_) => return api_json_response(false, "差分の削除に失敗しました"),
+        Err(_) => return api_json_response(false, DIFF_CLEAN_FAILED),
     };
     for key in cache_keys {
-        let Ok(object_key) = ObjectKey::try_new(key.as_str()) else {
-            continue;
-        };
-        if runtime.write_objects().delete(&object_key).await.is_err() {
-            return api_json_response(false, "差分の削除に失敗しました");
+        if objects.delete(&key).await.is_err() {
+            return api_json_response(false, DIFF_CLEAN_FAILED);
         }
     }
-    api_json_response(true, format!("Diff cleaned for {}", target))
+    api_json_response(true, diff_cleaned_message(&target))
 }
 
 // ---------------------------------------------------------------------------
@@ -664,13 +470,11 @@ struct NotepadRow {
 }
 
 fn notepad_content(row: NotepadRow) -> String {
-    match row.value_yaml.as_deref() {
-        Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml.to_string(),
-        _ => row
-            .value_json
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_default(),
+    match narou_rs::application::webui::notepad::notepad_content_from_columns(
+        row.value_yaml.as_deref(), row.value_json.as_deref(),
+    ) {
+        std::borrow::Cow::Borrowed(_) => row.value_yaml.unwrap_or_default(),
+        std::borrow::Cow::Owned(content) => content,
     }
 }
 
@@ -776,22 +580,6 @@ async fn write_notepad(
 }
 
 
-/// native `notepad_object_id` の写し: 本文の SHA-256 hex。
-fn notepad_object_id(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// native `notepad_response_value` と同じ形。
-fn notepad_response_value(content: &str) -> serde_json::Value {
-    json!({
-        "content": content,
-        "text": content,
-        "object_id": notepad_object_id(content),
-    })
-}
-
 async fn notepad_read(env: &Env) -> worker::Result<Response> {
     let content = read_notepad(env).await;
     Response::from_json(&notepad_response_value(&content))
@@ -827,50 +615,31 @@ async fn notepad_save(req: &mut Request, env: &Env) -> worker::Result<Response> 
         Ok(row) => row,
         Err(message) => return Response::from_json(&api_response(false, message)),
     };
-    let current_content = current_row
-        .clone()
-        .map(notepad_content)
-        .unwrap_or_default();
+    let current_content = current_row.as_ref()
+        .map(|row| narou_rs::application::webui::notepad::notepad_content_from_columns(
+            row.value_yaml.as_deref(), row.value_json.as_deref(),
+        )).unwrap_or_default();
     let current_object_id = notepad_object_id(&current_content);
     let request_object_id = body["object_id"].as_str().unwrap_or("");
 
     if request_object_id != current_object_id {
-        return Response::from_json(&json!({
-            "success": false,
-            "conflict": true,
-            "message": "他の画面でメモ帳が更新されたため再読み込みしました。内容を確認してからもう一度保存してください",
-            "content": current_content,
-            "text": current_content,
-            "object_id": current_object_id,
-        }));
+        return Response::from_json(&notepad_conflict_payload(&current_content));
     }
 
     // CAS: 「読んだ行のままである」ことを条件に 1 文で書き換える。別
     // isolate の保存が間に入った場合は 0 行適用で負け側になる。
     match write_notepad(&db, &current_row, content).await {
         NotepadSave::Saved => {
-            // native はここで `notepad.change` を PushServer へ broadcast するが、
-            // Worker には同等の経路が無い (websocket.rs 参照)。応答 JSON は同一。
-            Response::from_json(&json!({
-                "success": true,
-                "message": "Saved",
-                "content": content,
-                "text": content,
-                "object_id": notepad_object_id(content),
-            }))
+            // native `notepad_save` と同じく、他のクライアントのメモ帳表示を
+            // 保存後の内容へ更新させる。
+            crate::push_hub::broadcast_mutations(env, MutationNotice::Notepad { content }).await;
+            Response::from_json(&notepad_saved_payload(content))
         }
         NotepadSave::Conflict => {
             // 書き込み競合 — 勝った側の内容を読み返して競合応答に載せる。
             let conflict_row = read_notepad_row(&db).await.ok().flatten();
             let conflict_content = conflict_row.map(notepad_content).unwrap_or_default();
-            Response::from_json(&json!({
-                "success": false,
-                "conflict": true,
-                "message": "他の画面でメモ帳が更新されたため再読み込みしました。内容を確認してからもう一度保存してください",
-                "content": conflict_content,
-                "text": conflict_content,
-                "object_id": notepad_object_id(&conflict_content),
-            }))
+            Response::from_json(&notepad_conflict_payload(&conflict_content))
         }
         NotepadSave::Failed(message) => Response::from_json(&api_response(false, message)),
     }
@@ -881,24 +650,51 @@ async fn notepad_save(req: &mut Request, env: &Env) -> worker::Result<Response> 
 // (native: src/web/misc.rs:429 console_history / :444 clear_history)
 // ---------------------------------------------------------------------------
 
-/// Worker には `PushServer` のコンソール履歴が無い (`websocket.rs` は接続を
-/// 受理するだけで履歴を保持しない)。`stream`/`format` パラメータは受理し、
-/// native の履歴ゼロ状態と同じ形を返す。
-fn console_history(req: &Request) -> worker::Result<Response> {
+/// PushHub DO の履歴を native `console_history` と同じ形で返す。
+///
+/// `stream` (既定 `stdout`) と `format=json` は native と同じ解釈。Worker の
+/// 履歴は DO (`push_hub.rs`) が永続化しており、上限 (`HISTORY_CAPACITY` /
+/// `HISTORY_MAX_BYTES`) を超えた分は古い方から落ちる — 能力の上限は
+/// `/api/webui/config` の `capabilities.console_history` が伝える。
+/// DO が読めないときは空履歴に潰さず 502 を返す。
+async fn console_history(req: &Request, env: &Env) -> worker::Result<Response> {
     let url = req.url()?;
+    let stream = query_param(&url, "stream").unwrap_or_else(|| "stdout".to_string());
+    let history = match crate::push_hub::history_text(env, &stream).await {
+        Ok(history) => history,
+        Err(error) => {
+            console_log!("push hub history failed: {error}");
+            return json_error(
+                502,
+                "push_hub_unavailable",
+                Some("履歴を取得できませんでした"),
+            );
+        }
+    };
     if query_param(&url, "format").as_deref() == Some("json") {
-        return Response::from_json(&json!({ "history": "" }));
+        return Response::from_json(&json!({ "history": history }));
     }
-    Response::ok("").and_then(|response| {
+    Response::ok(history).and_then(|response| {
         let headers = Headers::new();
         headers.set("Content-Type", "text/plain; charset=utf-8")?;
         Ok(response.with_headers(headers))
     })
 }
 
-/// Worker の履歴は常に空なので、native のクリア後と同じ成功応答になる。
-fn clear_history() -> worker::Result<Response> {
-    api_json_response(true, "History cleared")
+/// PushHub DO の履歴 (永続チャンク + 再生バッファ) を実際に消す。
+/// native と同じ成功応答を返し、消去に失敗したときは成功を偽らない。
+async fn clear_history(env: &Env) -> worker::Result<Response> {
+    match crate::push_hub::clear_remote_history(env).await {
+        Ok(()) => api_json_response(true, "History cleared"),
+        Err(error) => {
+            console_log!("push hub clear failed: {error}");
+            json_error(
+                502,
+                "push_hub_unavailable",
+                Some("履歴を消去できませんでした"),
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -916,56 +712,18 @@ async fn taginfo(req_ids: Vec<serde_json::Value>, with_exclusion: bool, runtime:
         .collect();
     let records = runtime.services.library.records().await.unwrap_or_default();
     let new_tag_color = configured_tag_color(runtime).await;
-    let mut tag_index: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut record_tags: HashMap<i64, Vec<String>> = HashMap::new();
-    for record in &records {
-        record_tags.insert(record.id, record.tags.clone());
-        for tag in &record.tags {
-            tag_index.entry(tag.clone()).or_default().push(record.id);
-        }
-    }
-    let tag_names = tag_index.keys().cloned().collect::<Vec<_>>();
-    let tag_colors = runtime
+    let colors = runtime
         .services
         .tag_colors
-        .for_tags(tag_names, new_tag_color.as_deref())
+        .for_tags(tag_names(&records), new_tag_color.as_deref())
         .await
         .unwrap_or_default();
-    let mut selected_counts: HashMap<String, usize> = HashMap::new();
-    for id in selected_ids.iter() {
-        if let Some(tags) = record_tags.get(id) {
-            for tag in tags {
-                *selected_counts.entry(tag.clone()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    let mut sorted_tags: Vec<(&String, &Vec<i64>)> = tag_index.iter().collect();
-    sorted_tags.sort_by(|a, b| a.0.cmp(b.0));
-    let mut tag_info = Vec::with_capacity(sorted_tags.len());
-    for (tag, tag_ids) in sorted_tags {
-        let color = tag_colors.get(tag).map(|c| c.as_str()).unwrap_or("");
-        let class = tag_color_class(color);
-        let escaped_tag = html_escape(tag);
-        let html = format!(
-            "<span class=\"tag-label {}\">{}</span>",
-            class, escaped_tag
-        );
-        let mut entry = json!({
-            "tag": tag,
-            "count": selected_counts.get(tag.as_str()).copied().unwrap_or(0),
-            "total_count": tag_ids.len(),
-            "html": html,
-        });
-        if with_exclusion {
-            entry["exclusion_html"] = json!(format!(
-                "<span class=\"tag-label {} tag-exclusion\">{}</span>",
-                class, escaped_tag
-            ));
-        }
-        tag_info.push(entry);
-    }
-    Response::from_json(&tag_info)
+    Response::from_json(&taginfo_entries(
+        &records,
+        &selected_ids,
+        with_exclusion,
+        &colors,
+    ))
 }
 
 /// GET 分派: `ids` クエリパラメータを `TagInfoBody.ids` と同じ値として扱う。
@@ -1002,31 +760,29 @@ async fn taginfo_post(req: &mut Request, runtime: &WorkerRuntime) -> worker::Res
 /// narou.rs と揃えてある。
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// native `version_json` のキー構造を Worker 値に置き換えたもの。
+/// Worker は常に自動更新不可 (native `version::self_update_unavailable_reason`
+/// に相当する固定文言)。
+const SELF_UPDATE_UNAVAILABLE_REASON: &str =
+    "Cloudflare Workers 環境では自動アップデートできません。wrangler deploy で更新してください";
+
+/// Worker のバージョン事実 (キー集合は共有の [`VersionInfoPayload`])。
 /// Worker には self-update の経路もコンテナ判定の手掛かりも無いので、
 /// 「ランタイム管理されている = 自動更新不可」を `container` / `self_update_*`
 /// で表し、`develop` / `local_build` は偽装しない (false 固定)。
-fn version_current() -> worker::Result<Response> {
-    Response::from_json(&json!({
-        "version": WORKER_VERSION,
-        "name": APP_NAME,
-        "develop": false,
-        "local_build": false,
-        "container": true,
-        "self_update_supported": false,
-        "build_variant": "gpl",
-    }))
+fn worker_version_info() -> VersionInfoPayload {
+    VersionInfoPayload {
+        version: WORKER_VERSION.to_string(),
+        name: APP_NAME.to_string(),
+        develop: false,
+        local_build: false,
+        container: true,
+        self_update_supported: false,
+        build_variant: "gpl",
+    }
 }
 
-/// native `version_is_newer` の写し (worker 側は version core のみ比較)。
-fn version_is_newer(latest: &str, current: &str) -> bool {
-    if latest.is_empty() {
-        return false;
-    }
-    match narou_rs::application::version_compare::version_compare(latest, current) {
-        Some(ord) => ord == std::cmp::Ordering::Greater,
-        None => latest != current,
-    }
+fn version_current() -> worker::Result<Response> {
+    Response::from_json(&worker_version_info().current())
 }
 
 /// GitHub Releases を参照して最新バージョンを返す。ネットワーク失敗も
@@ -1041,6 +797,7 @@ async fn version_latest() -> worker::Result<Response> {
         .map_err(|error| worker::Error::RustError(error.to_string()))?;
     let response = Fetch::Request(request).send().await;
     let url_fallback = RELEASES_PAGE_URL;
+    let info = worker_version_info();
 
     match response {
         Ok(mut resp) if (200..=299).contains(&resp.status_code()) => {
@@ -1052,33 +809,20 @@ async fn version_latest() -> worker::Result<Response> {
                 .map(narou_rs::application::version_compare::version_core)
                 .unwrap_or_default();
             let current_plain = narou_rs::application::version_compare::version_core(WORKER_VERSION);
-            Response::from_json(&json!({
-                "success": true,
-                "current_version": WORKER_VERSION,
-                "latest_version": latest,
-                "update_available": version_is_newer(&latest, &current_plain),
-                "develop": false,
-                "local_build": false,
-                "container": true,
-                "self_update_supported": false,
-                "self_update_unavailable_reason": "Cloudflare Workers 環境では自動アップデートできません。wrangler deploy で更新してください",
-                "build_variant": "gpl",
-                "variant_choice_required": false,
-                "url": json["html_url"].as_str().unwrap_or(url_fallback),
-            }))
+            let update_available = version_update_available(&latest, &current_plain);
+            Response::from_json(&info.latest(
+                &latest,
+                update_available,
+                json["html_url"].as_str().unwrap_or(url_fallback),
+                Some(SELF_UPDATE_UNAVAILABLE_REASON),
+                false,
+            ))
         }
-        Ok(resp) => Response::from_json(&json!({
-            "success": false,
-            "current_version": WORKER_VERSION,
-            "message": format!("latest version request failed: {}", resp.status_code()),
-            "url": url_fallback,
-        })),
-        Err(error) => Response::from_json(&json!({
-            "success": false,
-            "current_version": WORKER_VERSION,
-            "message": error.to_string(),
-            "url": url_fallback,
-        })),
+        Ok(resp) => Response::from_json(&info.latest_failure(
+            &format!("latest version request failed: {}", resp.status_code()),
+            url_fallback,
+        )),
+        Err(error) => Response::from_json(&info.latest_failure(&error.to_string(), url_fallback)),
     }
 }
 

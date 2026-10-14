@@ -22,6 +22,30 @@ pub fn non_external_console_target() -> &'static str {
         "stdout"
     }
 }
+
+/// 起動時に組んだオブジェクトストア (mirror / S3 構成) を組み替えないと
+/// 反映できない設定名。
+///
+/// native Web はプロセス寿命ぶんの `NativeStore` / `SqliteObjectStore` /
+/// `SplitStore` を保持する。ここに挙げた設定をその場で再適用すると、新しい
+/// 設定を読む CLI の子プロセスと古いストアを持つサーバが別の保存先を指す
+/// ため、変更を検知したら再起動を要求する
+/// ([`STORAGE_RESTART_REQUIRED_NOTE`])。
+pub const STORAGE_RESTART_SETTING_NAMES: &[&str] = &[
+    "sqlite.mirror-files",
+    "s3.asset-backend",
+    "s3.endpoint",
+    "s3.bucket",
+    "s3.region",
+    "s3.prefix",
+    "s3.access-key-id",
+    "s3.secret-access-key",
+];
+
+/// 保存先の構成が変わったときの再起動要求メッセージ (コンソール/UI 共通)。
+pub const STORAGE_RESTART_REQUIRED_NOTE: &str =
+    "保存先の構成 (sqlite.mirror-files / s3.*) が変更されました。反映にはサーバの再起動が必要です";
+
 #[derive(Clone)]
 pub struct NativeTagColorStore {
     inventory: Arc<Inventory>,
@@ -43,16 +67,15 @@ impl TagColorStore for NativeTagColorStore {
         })
     }
 
-    fn save<'a>(
+    fn update<'a>(
         &'a self,
-        colors: &'a crate::tag_colors::TagColors,
-    ) -> PlatformFuture<'a, Result<()>> {
+        update: crate::tag_colors::TagColorUpdate,
+    ) -> PlatformFuture<'a, Result<crate::tag_colors::TagColors>> {
         let inventory = Arc::clone(&self.inventory);
-        let colors = colors.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || crate::tag_colors::save_tag_colors(&inventory, &colors))
+            tokio::task::spawn_blocking(move || crate::tag_colors::update_tag_colors(&inventory, update))
                 .await
-                .map_err(|error| NarouError::Platform(format!("tag color save task failed: {error}")))?
+                .map_err(|error| NarouError::Platform(format!("tag color update task failed: {error}")))?
         })
     }
 }
@@ -142,23 +165,40 @@ impl SettingsStore for NativeSettingsStore {
         })
     }
 
-    fn save<'a>(
+    /// Replace the scope only while the stored map still equals `expected`.
+    ///
+    /// The comparison and the write happen in one `update_yaml` pass, so the
+    /// legacy file lock / SQLite single-writer boundary serializes concurrent
+    /// writers. A mismatch returns false and leaves the scope untouched.
+    fn compare_save<'a>(
         &'a self,
         scope: crate::setting_core::SettingScope,
-        settings: &'a HashMap<String, serde_yaml::Value>,
-    ) -> PlatformFuture<'a, Result<()>> {
+        expected: &'a HashMap<String, serde_yaml::Value>,
+        replacement: &'a HashMap<String, serde_yaml::Value>,
+    ) -> PlatformFuture<'a, Result<bool>> {
         let inventory = Arc::clone(&self.inventory);
-        let settings = settings.clone();
+        let expected = expected.clone();
+        let replacement = replacement.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                crate::db::settings::save_with_inventory(&inventory, scope, &settings)
+                let mut conflict = false;
+                let result = crate::db::settings::update_with_inventory(&inventory, scope, |current| {
+                    if *current != expected {
+                        conflict = true;
+                        return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+                    }
+                    *current = replacement;
+                    Ok(true)
+                });
+                if conflict { Ok(false) } else { result }
             })
-                .await
-                .map_err(|error| {
-                    NarouError::Platform(format!("settings save task failed: {error}"))
-                })?
+            .await
+            .map_err(|error| {
+                NarouError::Platform(format!("settings compare_save task failed: {error}"))
+            })?
         })
     }
+
     fn load_replace_content<'a>(
         &'a self,
     ) -> PlatformFuture<'a, Result<String>> {
@@ -174,17 +214,26 @@ impl SettingsStore for NativeSettingsStore {
         })
     }
 
-    fn save_replace_content<'a>(
+    /// Replace the global `replace.txt` only while it still equals `expected`.
+    ///
+    /// Runs under the same process/file write lock as the settings CAS above.
+    /// A mismatch returns false without rewriting or creating the content file.
+    fn compare_save_replace_content<'a>(
         &'a self,
-        content: &'a str,
-    ) -> PlatformFuture<'a, Result<()>> {
+        expected: &'a str,
+        replacement: &'a str,
+    ) -> PlatformFuture<'a, Result<bool>> {
         let path = self.inventory.root_dir().join("replace.txt");
-        let content = content.to_string();
+        let expected = expected.to_string();
+        let replacement = replacement.to_string();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || std::fs::write(path, content))
-                .await
-                .map_err(|error| NarouError::Platform(format!("replace save task failed: {error}")))?
-                .map_err(Into::into)
+            tokio::task::spawn_blocking(move || {
+                crate::db::inventory::compare_locked_file_content(&path, &expected, &replacement)
+            })
+            .await
+            .map_err(|error| {
+                NarouError::Platform(format!("replace compare_save task failed: {error}"))
+            })?
         })
     }
 }
@@ -197,48 +246,29 @@ impl SettingsStore for NativeSettingsStore {
 /// `Arc` の同一性を見て再構築をキャッシュする）。
 #[derive(Clone)]
 pub struct NativeSiteTimezoneProvider {
-    snapshot: Arc<std::sync::RwLock<SiteProviderSnapshot>>,
+    snapshot: Arc<std::sync::RwLock<Arc<crate::application::site_definitions::SiteSettingsSnapshot>>>,
 }
 
-#[derive(Clone)]
-struct SiteProviderSnapshot {
-    source: Arc<Vec<crate::downloader::site_setting::SiteSetting>>,
-    timezones: Arc<HashMap<String, SiteTimezone>>,
-}
 
 impl NativeSiteTimezoneProvider {
     pub fn load() -> Self {
         let source = crate::downloader::site_setting::effective_site_settings_shared();
         Self {
-            snapshot: Arc::new(std::sync::RwLock::new(Self::snapshot_for(source))),
+            snapshot: Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::application::site_definitions::SiteSettingsSnapshot::new(source),
+            ))),
         }
     }
 
-    fn snapshot_for(
-        source: Arc<Vec<crate::downloader::site_setting::SiteSetting>>,
-    ) -> SiteProviderSnapshot {
-        let timezones = source
-            .iter()
-            .map(|setting| {
-                let domain = setting.domain.clone();
-                let timezone = native_timezone(setting.site_timezone());
-                (domain, timezone)
-            })
-            .collect();
-        SiteProviderSnapshot {
-            source,
-            timezones: Arc::new(timezones),
-        }
-    }
 
-    fn snapshot(&self) -> SiteProviderSnapshot {
+    fn snapshot(&self) -> Arc<crate::application::site_definitions::SiteSettingsSnapshot> {
         let source = crate::downloader::site_setting::effective_site_settings_shared();
         if let Ok(snapshot) = self.snapshot.read()
-            && Arc::ptr_eq(&snapshot.source, &source)
+            && Arc::ptr_eq(snapshot.source(), &source)
         {
             return snapshot.clone();
         }
-        let snapshot = Self::snapshot_for(source);
+        let snapshot = Arc::new(crate::application::site_definitions::SiteSettingsSnapshot::new(source));
         if let Ok(mut current) = self.snapshot.write() {
             *current = snapshot.clone();
         }
@@ -250,49 +280,26 @@ impl SiteTimezoneProvider for NativeSiteTimezoneProvider {
         &'a self,
         domain: &'a str,
     ) -> PlatformFuture<'a, Result<Option<SiteTimezone>>> {
-        let timezone = self.snapshot().timezones.get(domain).copied();
+        let timezone = self.snapshot().timezone(domain);
         Box::pin(async move { Ok(timezone) })
     }
 }
 
 impl SiteDefinitionProvider for NativeSiteTimezoneProvider {
     fn resolve_toc_url(&self, url: &str) -> Option<String> {
-        self.snapshot()
-            .source
-            .iter()
-            .find(|setting| setting.matches_url(url))
-            .map(|setting| {
-                setting
-                    .toc_url_with_url_captures(url)
-                    .unwrap_or_else(|| setting.toc_url())
-            })
+        self.snapshot().resolve_toc_url(url)
     }
 
     fn url_patterns_for_validation(&self) -> Vec<String> {
-        self.snapshot()
-            .source
-            .iter()
-            .flat_map(|setting| setting.url_patterns_for_validation())
-            .collect()
+        self.snapshot().url_patterns_for_validation()
     }
 }
 impl crate::application::SiteUpdateCapabilityProvider for NativeSiteTimezoneProvider {
     fn supports_narou_api(&self, toc_url: &str) -> bool {
-        self.snapshot()
-            .source
-            .iter()
-            .find(|setting| setting.matches_url(toc_url))
-            .and_then(|setting| setting.narou_api_url.as_ref())
-            .is_some()
+        crate::application::SiteUpdateCapabilityProvider::supports_narou_api(self.snapshot().as_ref(), toc_url)
     }
 }
 
-fn native_timezone(timezone: crate::downloader::SiteTimezone) -> SiteTimezone {
-    match timezone {
-        crate::downloader::SiteTimezone::Named(tz) => SiteTimezone::Named(tz),
-        crate::downloader::SiteTimezone::Fixed(offset) => SiteTimezone::Fixed(offset),
-    }
-}
 
 /// Native composition root for the application services used by the web
 /// command. Web handlers receive this bundle and never construct native
@@ -377,6 +384,24 @@ impl NativeAppServices {
 mod tests {
     use super::*;
     use crate::downloader::site_setting::{SiteSetting, install_effective_site_settings};
+
+    #[tokio::test]
+    async fn rejected_settings_cas_preserves_raw_yaml_and_absent_replace_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".narou")).unwrap();
+        let path = root.path().join(".narou/local_setting.yaml");
+        let raw = "# preserve this comment\nconcurrency: true # also preserve\n";
+        std::fs::write(&path, raw).unwrap();
+        let store = NativeSettingsStore::new(Arc::new(Inventory::new(root.path().to_path_buf())));
+        assert!(!store.compare_save(
+            crate::setting_core::SettingScope::Local, &HashMap::new(), &HashMap::from([
+                ("concurrency".to_string(), serde_yaml::Value::Bool(false)),
+            ]),
+        ).await.unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        assert!(!store.compare_save_replace_content("stale", "replacement").await.unwrap());
+        assert!(!root.path().join("replace.txt").exists());
+    }
 
     /// サイト定義を差し替えた直後に、タイムゾーン/URL 解決が新しい定義を
     /// 使うこと（`OnceLock` 時代は起動時スナップショットに固定されていた）。

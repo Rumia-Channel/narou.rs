@@ -218,7 +218,11 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
 
     let mut selected = Vec::new();
     for record in &records {
-        let frozen = frozen_ids.contains(&record.id);
+        let frozen = narou_rs::platform::repository::record_is_frozen(
+            record,
+            Some(&frozen_ids),
+            narou_rs::platform::repository::FreezeReadMode::InventoryOnly,
+        );
         if !matches_filters(record, frozen, &filter_words) {
             continue;
         }
@@ -233,16 +237,24 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         selected.push((record.clone(), frozen, plain));
     }
 
-    let colors_changed = if options.show_tags() {
-        tag_colors::ensure_tag_colors(
-            &mut tag_colors,
-            selected
-                .iter()
-                .flat_map(|(record, _, _)| record.tags.iter().map(String::as_str)),
-        )
-    } else {
-        false
-    };
+    if options.show_tags() {
+        tag_colors = match tag_colors::update_tag_colors(
+            &inventory,
+            tag_colors::TagColorUpdate::Ensure {
+                tags: selected
+                    .iter()
+                    .flat_map(|(record, _, _)| record.tags.iter().cloned())
+                    .collect(),
+                default_color: tag_colors::configured_new_tag_color(),
+            },
+        ) {
+            Ok(colors) => colors,
+            Err(err) => {
+                log::report_error(&err.to_string());
+                return 127;
+            }
+        };
+    }
 
     let lines = selected
         .into_iter()
@@ -256,11 +268,6 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
             plain,
         })
         .collect::<Vec<_>>();
-
-    if colors_changed && let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
-        log::report_error(&err.to_string());
-        return 127;
-    }
 
     let limit = options.limit.unwrap_or(lines.len());
     let taken = lines.into_iter().take(limit).collect::<Vec<_>>();
@@ -303,20 +310,47 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
     if let Some(color) = normalize_color(options.color.as_deref()) {
         if tag_colors::is_valid_tag_color(&color) {
             if let Some(tags) = mode.tag_names() {
-                for tag in tags {
-                    explicit_color_changed |=
-                        tag_colors.set_color(tag, &color, options.no_overwrite_color);
+                if options.no_overwrite_color {
+                    let colors = match tag_colors::update_tag_colors(
+                        &inventory,
+                        tag_colors::TagColorUpdate::Ensure {
+                            tags: tags.to_vec(),
+                            default_color: Some(color),
+                        },
+                    ) {
+                        Ok(colors) => colors,
+                        Err(err) => {
+                            log::report_error(&err.to_string());
+                            return 127;
+                        }
+                    };
+                    explicit_color_changed = tags
+                        .iter()
+                        .any(|tag| colors.color_for(tag) != tag_colors.color_for(tag));
+                    tag_colors = colors;
+                } else {
+                    for tag in tags {
+                        let colors = match tag_colors::update_tag_colors(
+                            &inventory,
+                            tag_colors::TagColorUpdate::Set {
+                                tag: tag.clone(),
+                                color: Some(color.clone()),
+                            },
+                        ) {
+                            Ok(colors) => colors,
+                            Err(err) => {
+                                log::report_error(&err.to_string());
+                                return 127;
+                            }
+                        };
+                        explicit_color_changed |= colors.color_for(tag) != tag_colors.color_for(tag);
+                        tag_colors = colors;
+                    }
                 }
             }
         } else {
             eprintln!("{}という色は存在しません。色指定は無視されます", color);
         }
-    }
-
-    if explicit_color_changed && let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors)
-    {
-        log::report_error(&err.to_string());
-        return 127;
     }
 
     if options.targets.is_empty() {
@@ -349,10 +383,10 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         .collect::<Vec<_>>();
 
     let new_tag_color = tag_colors::configured_new_tag_color();
-    let outputs = (|| -> narou_rs::error::Result<(Vec<TagOutput>, bool)> {
+    let outputs = (|| -> narou_rs::error::Result<(Vec<TagOutput>, Vec<String>)> {
         let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
         let mut outputs = Vec::new();
-        let mut auto_color_changed = false;
+        let mut color_tags = Vec::new();
         let mut mutations = Vec::new();
         for item in resolved {
             let (id, title) = match item {
@@ -395,11 +429,7 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             }
 
             if !updated.tags.is_empty() {
-                auto_color_changed |= tag_colors::ensure_tag_colors_with_default_color(
-                    &mut tag_colors,
-                    updated.tags.iter().map(String::as_str),
-                    new_tag_color.as_deref(),
-                );
+                color_tags.extend(updated.tags.iter().cloned());
                 outputs.push(TagOutput::Current(updated.tags.clone()));
             }
 
@@ -410,10 +440,10 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
                 .apply_batch_sync(mutations)
                 .map_err(|err| narou_rs::error::NarouError::Database(err.to_string()))?;
         }
-        Ok((outputs, auto_color_changed))
+        Ok((outputs, color_tags))
     })();
 
-    let (outputs, auto_color_changed) = match outputs {
+    let (outputs, color_tags) = match outputs {
         Ok(result) => result,
         Err(err) => {
             log::report_error(&err.to_string());
@@ -421,9 +451,20 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         }
     };
 
-    if auto_color_changed && let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
-        log::report_error(&err.to_string());
-        return 127;
+    if !color_tags.is_empty() {
+        tag_colors = match tag_colors::update_tag_colors(
+            &inventory,
+            tag_colors::TagColorUpdate::Ensure {
+                tags: color_tags,
+                default_color: new_tag_color,
+            },
+        ) {
+            Ok(colors) => colors,
+            Err(err) => {
+                log::report_error(&err.to_string());
+                return 127;
+            }
+        };
     }
 
     for output in outputs {
@@ -756,12 +797,19 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
             return 127;
         }
     };
-    let changed =
-        tag_colors::ensure_tag_colors(tag_colors, tag_list.iter().map(|(tag, _)| tag.as_str()));
-    if changed && let Err(err) = tag_colors::save_tag_colors(&inventory, tag_colors) {
-        log::report_error(&err.to_string());
-        return 127;
-    }
+    *tag_colors = match tag_colors::update_tag_colors(
+        &inventory,
+        tag_colors::TagColorUpdate::Ensure {
+            tags: tag_list.iter().map(|(tag, _)| tag.clone()).collect(),
+            default_color: tag_colors::configured_new_tag_color(),
+        },
+    ) {
+        Ok(colors) => colors,
+        Err(err) => {
+            log::report_error(&err.to_string());
+            return 127;
+        }
+    };
 
     println!("タグ一覧");
     println!(
@@ -1138,11 +1186,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ListOptions, TagColors, TagOptions, build_tag_mode, matches_filters, matches_grep,
-        remove_novel_by_id, remove_novel_files, resolve_list_sort, resolve_list_sort_key,
+        ListOptions, TagOptions, build_tag_mode, matches_filters, matches_grep, remove_novel_by_id,
+        remove_novel_files, resolve_list_sort, resolve_list_sort_key,
     };
     use narou_rs::db::novel_record::NovelRecord;
-    use narou_rs::tag_colors;
 
     #[test]
     fn remove_without_with_file_only_deletes_toc() {
@@ -1180,30 +1227,6 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, "hotentry は使用禁止ワードです");
-    }
-
-    #[test]
-    fn ensure_tag_colors_rotates_in_insertion_order() {
-        let mut tag_colors = TagColors::default();
-        assert!(tag_colors::ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["fav"],
-            None,
-        ));
-        assert!(tag_colors::ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["later"],
-            None,
-        ));
-        assert!(tag_colors::ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["todo"],
-            None,
-        ));
-
-        assert_eq!(tag_colors.color_for("fav"), Some("green"));
-        assert_eq!(tag_colors.color_for("later"), Some("yellow"));
-        assert_eq!(tag_colors.color_for("todo"), Some("blue"));
     }
 
     #[test]

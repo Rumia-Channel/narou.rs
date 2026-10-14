@@ -5,6 +5,7 @@
 //! compiles the shared regex / preprocess DSL at composition time. There is
 //! no filesystem access at runtime.
 
+use std::sync::Arc;
 use narou_rs::application::site_definitions::{
     ObjectStoreSiteDefinitions, SiteDefinitionStore, SiteDefinitions,
 };
@@ -21,13 +22,13 @@ include!(concat!(env!("OUT_DIR"), "/bundled_sites.rs"));
 /// A bundled YAML that fails to parse is a deployment error: the failure is
 /// cached too, so every caller still sees composition fail (readiness 503)
 /// rather than silently shrinking the site set.
-pub fn load_bundled_site_settings() -> Result<Vec<SiteSetting>> {
+pub fn load_bundled_site_settings() -> Result<Arc<Vec<SiteSetting>>> {
     static SITE_SETTINGS: std::sync::LazyLock<
-        std::result::Result<Vec<SiteSetting>, String>,
+        std::result::Result<Arc<Vec<SiteSetting>>, String>,
     > = std::sync::LazyLock::new(|| {
         let contents: Vec<&str> =
             BUNDLED_SITE_YAML.iter().map(|(_, content)| *content).collect();
-        SiteSetting::load_bundled(&contents).map_err(|error| error.to_string())
+        SiteSetting::load_bundled(&contents).map(Arc::new).map_err(|error| error.to_string())
     });
     match &*SITE_SETTINGS {
         Ok(settings) => Ok(settings.clone()),
@@ -65,7 +66,7 @@ pub fn site_definitions(
 /// 載せる（リクエストごとに D1 を読まない）。
 pub async fn load_site_settings(
     objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
-) -> Result<Vec<SiteSetting>> {
+) -> Result<Arc<Vec<SiteSetting>>> {
     // L1 を最優先で見る。ここで当たればオブジェクトストアの LIST も投げない
     // (以前は LIST → 空なら同梱定義を毎回パース、という順で全リクエストが
     //  D1 往復 + YAML parse + compile を払っていた)。
@@ -78,7 +79,7 @@ pub async fn load_site_settings(
     } else {
         let effective = site_definitions(objects.clone()).effective_runtime().await?;
         let contents: Vec<&str> = effective.iter().map(|(_, yaml)| yaml.as_str()).collect();
-        SiteSetting::load_bundled(&contents)?
+        Arc::new(SiteSetting::load_bundled(&contents)?)
     };
     store_site_settings(&settings);
     Ok(settings)
@@ -89,14 +90,14 @@ pub async fn load_site_settings(
 /// 30 秒 L1 に乗せず常に primary 側のストアを読み直す。
 pub async fn load_site_settings_uncached(
     objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
-) -> Result<Vec<SiteSetting>> {
+) -> Result<Arc<Vec<SiteSetting>>> {
     let store = ObjectStoreSiteDefinitions::new(objects.clone());
     if store.list().await?.is_empty() {
         return load_bundled_site_settings();
     }
     let effective = site_definitions(objects.clone()).effective_runtime().await?;
     let contents: Vec<&str> = effective.iter().map(|(_, yaml)| yaml.as_str()).collect();
-    SiteSetting::load_bundled(&contents)
+    SiteSetting::load_bundled(&contents).map(Arc::new)
 }
 
 /// L1 キャッシュの寿命。書き込みは同じ isolate なら即時、他の isolate は
@@ -104,20 +105,20 @@ pub async fn load_site_settings_uncached(
 const SITE_SETTINGS_TTL_MS: f64 = 30_000.0;
 
 /// L1 キャッシュの中身: `(書き込み時刻 (ms), コンパイル済み定義)`。
-type SiteSettingsCache = Option<(f64, Vec<SiteSetting>)>;
+type SiteSettingsCache = Option<(f64, Arc<Vec<SiteSetting>>)>;
 
 static SITE_SETTINGS_CACHE: std::sync::LazyLock<std::sync::Mutex<SiteSettingsCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
-fn cached_site_settings() -> Option<Vec<SiteSetting>> {
+fn cached_site_settings() -> Option<Arc<Vec<SiteSetting>>> {
     let cache = SITE_SETTINGS_CACHE.lock().ok()?;
     let (stored_at, settings) = cache.as_ref()?;
     (js_sys::Date::now() - stored_at < SITE_SETTINGS_TTL_MS).then(|| settings.clone())
 }
 
-fn store_site_settings(settings: &[SiteSetting]) {
+fn store_site_settings(settings: &Arc<Vec<SiteSetting>>) {
     if let Ok(mut cache) = SITE_SETTINGS_CACHE.lock() {
-        *cache = Some((js_sys::Date::now(), settings.to_vec()));
+        *cache = Some((js_sys::Date::now(), settings.clone()));
     }
 }
 

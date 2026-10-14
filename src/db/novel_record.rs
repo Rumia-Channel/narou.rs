@@ -75,6 +75,13 @@ pub struct NovelRecord {
 impl NovelRecord {
     pub const RAW_TITLE_KEY: &'static str = "raw_title";
 
+    pub fn average_length(&self) -> i64 {
+        match (self.length, self.general_all_no) {
+            (Some(length), Some(episodes)) if length > 0 && episodes > 0 => length / episodes,
+            _ => 0,
+        }
+    }
+
     pub fn raw_title(&self) -> &str {
         self.extra_fields
             .get(Self::RAW_TITLE_KEY)

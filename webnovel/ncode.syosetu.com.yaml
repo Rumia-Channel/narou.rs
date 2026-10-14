@@ -11,6 +11,14 @@ series_item_url: (?:"|')(?<href>(?:https?://\\k<domain>)?/n\d+[a-z]+/?)(?:"|')
 author_url: ^https?://mypage\.syosetu\.com/(?<author_id>\d+)/
 author_novel_pattern: '"ncode":"(?<ncode>[nN]\d+[A-Za-z]+)"'
 author_api_url: https://api.syosetu.com/novelapi/api/?out=json&userid=\k<author_id>&lim=500
+# なろう小説API は 1 回に 500 件まで。それより多い作者は開始位置 `st`
+# (1〜2000) を進めて続きを取る。応答の総件数 (allcount) に達したら終端で、
+# それでも残る場合は API の範囲外としてエラーにする (途中までの一覧を
+# 成功にしない)。
+author_page_url: https://api.syosetu.com/novelapi/api/?out=json&userid=\k<author_id>&lim=500&st=\k<st>
+author_page_size: 500
+author_page_total_pattern: '"allcount":(?<count>\d+)'
+author_page_max_start: 2000
 author_work_url: \k<top_url>/\k<lower:ncode>/
 encoding: UTF-8
 timezone: Asia/Tokyo
@@ -19,7 +27,7 @@ append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: over18=yes
 sitename: *name
-version: 2.4
+version: 2.5
 
 # ------------------------------------------------------------
 # 目次取得設定

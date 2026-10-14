@@ -1,4 +1,23 @@
-# narou.rs 移植状況（2026-10 更新）
+# narou.rs 移植状況
+
+## 現況（v0.4.11）
+
+正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.11へ更新済み。main統合/タグ公開は未実施。
+
+共有化: application use-case、settings/setting_core、download_targets、retry_policy、push_events、MessageContext/progress、HTTP RedirectChain/send_paced、ObjectStore::update_small、EPUB EpubPreparation/EpubBuild。同時INI更新はFS lock/SQLite Immediate/D1 primary full raw snapshot CAS、正準保存後のミラー失敗もACKに反映。CRC衝突を同値扱いしない。Workerの出力/debug/表示先をfuture poll単位に束縛し、operation ID/seqで並列進捗を分離。native Web更新もサイト別並列取得。
+
+待機は物理送信・redirect・transport切替ごと。Worker interval/wait-stepsはsite floorと合成し、待機中は設定snapshotの残TTLまでに再確認。60.0がJSON60になる初期値誤競合も修正。AozoraEpub3_Lite v0.1.6 pin381c0b17f91946e22d41e5246d3977c706abe82e。AssetPlanでI/O非依存の逐次画像収集、native/Workerは同じfinish/layout/処理を利用。上流所有repo developへのno-ff統合/push済み。
+
+検証: v0.4.11 Rust full consumer suite(1124 lib + 111 bin + helpers/integration)、実Workerd HTTP/queue/replay104、Python52、JS progress/refresh/link20成功。CI既定Binaryen130で実Workerを再packageし、V8のmodule受付とWorkerd実取得を確認。workflow source文字列とfake curlのwiringテストは廃止。production SORAHOST shellを実HTTP originで検証(200/204/400/401/403各1回、503は6retry+diagnostic、exit0)。pwsh7.6.6で実Windows ZIPを作成し、本体/updater.exe.new/backup/loginと資産を確認(ローカル署名省略のみ、CI署名必須は維持)。
+
+Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗、UI保存→実permit、wait-steps2の約370ms/5s交互、60→0.2の取得中反映を確認。到着間隔とpermit間隔は混同しない。履歴race、radio/console keyboard、mobile toolbar/dropdown、Worker行内folder capabilityを修正。個別dirty save/clear、notepad autosave/WS同期、取得中の履歴削除でバーを保持、再接続後終端で残留バー0を確認。Native EPUB raw novel_outputsのBrotli UTF8誤認500を実証しload_outputへ合流。Brotli/none/legacy deflateはvalid EPUB、unknown/corruptは500で拒否。Worker streaming EPUB実ZIPも確認。Workerの挿絵警告は参照あり・有効・実体なしだけに限定し、参照なし/欠落/無効の3ケースを実取得し入力を復元。元のDocuments/WebNovelは読取り専用、全ライブラリはrepo targetのRust TempDir controller所有。実Cloudflare配備/Cloud queue並列の検証をこのローカル結果へ含めない。
+
+リモート旧ブランチ7本は未統合作業をno-ffでdevelopへ取り込み後削除済み(a4524f3)。追加修正も機能単位でdevelopへno-ff統合し、GitHubはmain/developだけを維持する運用。既定YAML、SQLite opt-in、global_settingは常に~/.narousettingファイル。native S3はlocal s3.*優先で未設定項目だけS3_*、挿絵だけS3でfail-closed。SORAHOSTはPteWorker公開/PORT loopback/server-ws-port=0/concurrency=true。loginはbrowser helper/export/import、複数名前/順序/UUID session/暗号化。
+
+0.4.11 最終監査で確認したデータ保全の修正: SQLite のインプレース YAML 書き出しは meta の export_file_sha 指紋を原子的なファイル保存より前に記録し、失敗後の未編集の書き出し残骸を再取り込みしない。管理状態だけでなく database.yaml の作品レコードも対象。ユーザーの編集と narou-compat のファイル優先は維持する。S3 COPY は完全な CopyObjectResult と ETag/LastModified を確認できた場合だけ成功し、200 内 Error・破損応答では元オブジェクトを削除しない。実 HTTP の失敗／成功ケースと、書き出し失敗後の正常保存→再オープンを smoke で確認済み。
+指紋は既存の未編集 projection と次回公開予定を最大2件保持し、2回目が公開前に中断しても保護を失わない。指紋更新と公開は同一ファイルロック内。--out が実 .narou を指す場合も対象。最終 workspace 全 target は1342成功/0失敗/1ignored、Clippy 全 feature -D warnings・Rustdoc -D warnings・core/Worker wasm check 成功。Web CSRF 回帰 fixture は並行CWD変更に影響されない絶対パスへ修正し、HTTPの拒否/許可とキュー状態の検証内容は維持した。
+
+## 過去の記録（以下は現況ではない）
 
 最新の正本はリポジトリの `AGENTS.md` と `COMMANDS.md`。古い日付の監査表ではなく、各コマンドの当該節と実装を確認する。
 

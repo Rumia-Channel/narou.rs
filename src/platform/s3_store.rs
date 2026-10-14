@@ -213,6 +213,7 @@ impl S3Store {
         url: &str,
         extra_headers: &[(&str, &str)],
         body: Option<Vec<u8>>,
+        response_limit: Option<usize>,
     ) -> Result<(super::http::HttpResponse, s3_sigv4::SignedHeaders)> {
         let (path, query) = url_target(url);
         let payload_sha256 = s3_sigv4::payload_sha256(body.as_deref().unwrap_or(&[]));
@@ -250,6 +251,9 @@ impl S3Store {
         for (name, value) in extra_headers {
             request = request.with_header(*name, *value);
         }
+        if let Some(limit) = response_limit {
+            request = request.with_trusted_response_body_limit(limit);
+        }
         request = request
             .with_header("x-amz-date", &signed.x_amz_date)
             .with_header("x-amz-content-sha256", &signed.x_amz_content_sha256)
@@ -268,6 +272,7 @@ impl S3Store {
                 HttpMethod::Get,
                 &self.location.object_url(key),
                 &[("range", "bytes=0-0")],
+                None,
                 None,
             )
             .await?;
@@ -302,6 +307,7 @@ impl S3Store {
                 &self.location.object_url(key),
                 &[("range", "bytes=0-0")],
                 None,
+                None,
             )
             .await?;
         // dedup 移行期: pool に無くても旧 `挿絵/` 位置に存在する挿絵を拾う。
@@ -310,6 +316,7 @@ impl S3Store {
                 HttpMethod::Get,
                 &self.location.legacy_object_url(key),
                 &[("range", "bytes=0-0")],
+                None,
                 None,
             )
             .await?
@@ -353,44 +360,22 @@ impl S3Store {
         }))
     }
 
-    async fn read_object(&self, key: &ObjectKey) -> Result<Option<Vec<u8>>> {
-        let (response, _) = self
-            .send(
-                HttpMethod::Get,
-                &self.location.object_url(key),
-                &[],
-                None,
-            )
-            .await?;
-        let (status, body) = status_and_body(response)?;
-        match status {
-            200 => Ok(Some(body)),
-            404 if self.location.has_pool_alternate(key) => {
-                // dedup 移行期: pool に無ければ旧 `挿絵/` 位置から読む。
-                let (response, _) = self
-                    .send(
-                        HttpMethod::Get,
-                        &self.location.legacy_object_url(key),
-                        &[],
-                        None,
-                    )
-                    .await?;
-                let (status, body) = status_and_body(response)?;
-                match status {
-                    200 => Ok(Some(body)),
-                    404 => Ok(None),
-                    status => Err(NarouError::Platform(format!(
-                        "S3 GET {} failed with status {status}",
-                        key.as_ref()
-                    ))),
-                }
-            }
-            404 => Ok(None),
-            status => Err(NarouError::Platform(format!(
-                "S3 GET {} failed with status {status}",
-                key.as_ref()
-            ))),
+    async fn read_object(&self, key: &ObjectKey, limit: Option<usize>) -> Result<Option<Vec<u8>>> {
+        // Read the whole object without Range: intermediaries may rewrite that
+        // optional header. The transport enforces the small-read bound before buffering.
+        let (response, _) = self.send(HttpMethod::Get, &self.location.object_url(key), &[], None, limit).await?;
+        let response = if response.status == 404 && self.location.has_pool_alternate(key) {
+            self.send(HttpMethod::Get, &self.location.legacy_object_url(key), &[], None, limit).await?.0
+        } else { response };
+        let status = response.status;
+        if status == 404 {
+            return Ok(None);
         }
+        if status != 200 {
+            return Err(NarouError::Platform(format!("S3 GET {} failed with status {status}", key.as_ref())));
+        }
+        let (_, body) = status_and_body(response)?;
+        Ok(Some(body))
     }
 
     async fn write_object(&self, key: &ObjectKey, data: Vec<u8>) -> Result<()> {
@@ -408,6 +393,7 @@ impl S3Store {
                 &self.location.object_url(key),
                 &[("content-type", content_type)],
                 Some(data),
+                None,
             )
             .await?;
         let status = response.status;
@@ -430,6 +416,7 @@ impl S3Store {
                 &self.location.legacy_object_url(key),
                 &[],
                 None,
+                None,
             )
             .await?;
         let status = response.status;
@@ -450,7 +437,7 @@ impl S3Store {
             request.limit.get(),
             request.cursor.as_deref(),
         );
-        let (response, signed) = self.send(HttpMethod::Get, &url, &[], None).await?;
+        let (response, signed) = self.send(HttpMethod::Get, &url, &[], None, None).await?;
         let (status, body) = status_and_body(response)?;
         if status != 200 {
             // Response XML can contain credential identifiers and signatures.
@@ -520,18 +507,27 @@ impl S3Store {
                 &self.location.object_url(destination),
                 &[("x-amz-copy-source", copy_source.as_str())],
                 Some(Vec::new()),
+                None,
             )
             .await?;
         let status = response.status;
-        if (200..300).contains(&status) {
-            Ok(())
-        } else {
-            Err(NarouError::Platform(format!(
+        if !(200..300).contains(&status) {
+            return Err(NarouError::Platform(format!(
                 "S3 COPY {} -> {} failed with status {status}",
                 source.as_ref(),
                 destination.as_ref()
-            )))
+            )));
         }
+        if !std::str::from_utf8(&response.body)
+            .is_ok_and(super::s3_request::copy_object_result_is_complete)
+        {
+            return Err(NarouError::Platform(format!(
+                "S3 COPY {} -> {} did not confirm a completed copy",
+                source.as_ref(),
+                destination.as_ref()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -657,7 +653,7 @@ impl ObjectStore for S3Store {
 
     fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
         Box::pin(async move {
-            let Some(data) = self.read_object(key).await? else {
+            let Some(data) = self.read_object(key, Some(SMALL_CAP as usize)).await? else {
                 return Ok(None);
             };
             if data.len() as u64 > SMALL_CAP {
@@ -713,7 +709,7 @@ impl AssetStore for S3Store {
         key: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
         Box::pin(async move {
-            let Some(data) = self.read_object(key).await? else {
+            let Some(data) = self.read_object(key, None).await? else {
                 return Ok(None);
             };
             let stream = futures::stream::once(async move { Ok(data) });
@@ -806,6 +802,52 @@ mod tests {
             headers: vec![("content-type".to_string(), "application/yaml".to_string())],
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn move_preserves_source_when_copy_success_cannot_be_confirmed() {
+        for body in [
+            b"<Error><Code>InternalError</Code><Message>PRIVATE_BODY_SENTINEL</Message></Error>".as_slice(),
+            b"",
+            b"<CopyObjectResult><ETag>etag</ETag>",
+            b"<CopyObjectResult><ETag>etag</ETag></CopyObjectResult>",
+            b"<CopyObjectResult><ETag></ETag><LastModified>2026-10-14T00:00:00Z</LastModified></CopyObjectResult>",
+            b"<CopyObjectResult><ETag>etag</ETag><LastModified>invalid</LastModified></CopyObjectResult>",
+            b"<CopyObjectResult><!--<ETag>etag</ETag><LastModified>2026-10-14T00:00:00Z</LastModified>--></CopyObjectResult>",
+            b"<CopyObjectResult><![CDATA[<ETag>etag</ETag><LastModified>2026-10-14T00:00:00Z</LastModified>]]></CopyObjectResult>",
+            b"<CopyObjectResult><ETag>etag</ETag><LastModified>2026-10-14T00:00:00Z</LastModified><Error/></CopyObjectResult>",
+            b"<CopyObjectResult><ETag>etag</ETag><LastModified>2026-10-14T00:00:00Z</LastModified></CopyObjectResult><Error/>",
+            b"\xff",
+        ] {
+            let http = Arc::new(MockHttpClient::new());
+            let store = store(http.clone());
+            let source = key("novels/site/title/挿絵/old.png");
+            let destination = key("novels/site/title/挿絵/new.png");
+            http.add_response(store.location.object_url(&destination), HttpResponse {
+                status: 200, headers: Vec::new(), body: body.to_vec(),
+            });
+
+            let error = futures::executor::block_on(AssetStore::move_or_copy(&store, &source, &destination))
+                .expect_err("an uncertain copy must not remove its source");
+            assert!(!error.to_string().contains("PRIVATE_BODY_SENTINEL"));
+            assert!(!http.requested_urls().iter().any(|request| request.starts_with("DELETE ")));
+        }
+    }
+
+    #[test]
+    fn move_deletes_source_after_a_complete_copy_result() {
+        let http = Arc::new(MockHttpClient::new());
+        let store = store(http.clone());
+        let source = key("novels/site/title/挿絵/old.png");
+        let destination = key("novels/site/title/挿絵/new.png");
+        let source_url = store.location.object_url(&source);
+        let destination_url = store.location.object_url(&destination);
+        http.add_text(&destination_url, 200,
+            "<?xml version=\"1.0\"?><s3:CopyObjectResult xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\"><s3:LastModified>2026-10-14T00:00:00.000Z</s3:LastModified><s3:ETag>\"opaque-etag\"</s3:ETag></s3:CopyObjectResult>");
+        http.add_response(&source_url, HttpResponse { status: 204, headers: Vec::new(), body: Vec::new() });
+
+        futures::executor::block_on(AssetStore::move_or_copy(&store, &source, &destination)).unwrap();
+        assert_eq!(http.requested_urls(), vec![format!("PUT {destination_url}"), format!("DELETE {source_url}")]);
     }
 
     #[test]
@@ -1207,7 +1249,7 @@ mod tests {
         let url = store.location.list_url(request.prefix.as_ref(), 10, None);
         http.add_text(&url, 403, "<Error><Code>AccessDenied</Code></Error>");
         let (_, signed) =
-            futures::executor::block_on(store.send(HttpMethod::Get, &url, &[], None)).unwrap();
+            futures::executor::block_on(store.send(HttpMethod::Get, &url, &[], None, None)).unwrap();
         let signature = signed.authorization.rsplit_once("Signature=").unwrap().1;
         let bytes = signed
             .string_to_sign

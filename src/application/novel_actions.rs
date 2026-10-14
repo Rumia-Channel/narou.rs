@@ -21,6 +21,8 @@ use std::sync::Arc;
 
 use crate::application::error::ApplicationError;
 use crate::application::events::FreezeStore;
+use crate::db::NovelRecord;
+use crate::platform::repository::{FreezeReadMode, record_is_frozen};
 use crate::platform::{
     NovelId, NovelMutation, NovelObjectKeys, NovelRepository, ObjectListRequest, ObjectPrefix,
     ObjectStore, PlatformFuture,
@@ -461,7 +463,7 @@ impl NovelActionService {
             .await
             .ok()
             .flatten()
-            .is_some_and(|record| record.tags.iter().any(|tag| tag == "frozen"))
+            .is_some_and(|record| record_is_frozen(&record, None, FreezeReadMode::InventoryOrTag))
     }
 
     /// Register `id` as gone upstream (404): freeze it and tag the record
@@ -480,13 +482,12 @@ impl NovelActionService {
         else {
             return Ok(false);
         };
-        if !record.tags.iter().any(|existing| existing == "404") {
-            record.tags.push("404".to_string());
+        if mark_not_found(&mut record) {
+            self.novels
+                .apply_batch(vec![NovelMutation::Upsert(record)])
+                .await
+                .map_err(ApplicationError::platform)?;
         }
-        self.novels
-            .apply_batch(vec![NovelMutation::Upsert(record)])
-            .await
-            .map_err(ApplicationError::platform)?;
         self.freeze_mutations
             .set_frozen(&[id], true)
             .await
@@ -515,27 +516,7 @@ impl NovelActionService {
         else {
             return Ok(false);
         };
-        let mut changed = false;
-        if record.tags.iter().any(|tag| tag == MODIFIED_TAG) {
-            record.tags.retain(|tag| tag != MODIFIED_TAG);
-            changed = true;
-        }
-        if record.last_check_date != Some(now) {
-            record.last_check_date = Some(now);
-            changed = true;
-        }
-        let has_end_tag = record.tags.iter().any(|tag| tag == "end");
-        match (record.end, has_end_tag) {
-            (true, false) => {
-                record.tags.push("end".to_string());
-                changed = true;
-            }
-            (false, true) => {
-                record.tags.retain(|tag| tag != "end");
-                changed = true;
-            }
-            _ => {}
-        }
+        let changed = mark_update_checked(&mut record, now);
         if changed {
             self.novels
                 .apply_batch(vec![NovelMutation::Upsert(record)])
@@ -544,6 +525,70 @@ impl NovelActionService {
         }
         Ok(true)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pure record-state transitions (shared by the async service and the native
+// CLI helpers, which persist one batch per update).
+// ---------------------------------------------------------------------------
+
+/// Post-update record transition (native `remove_modified_tag` /
+/// `update_last_check_date` / `sync_end_tag`, in that order): drop the
+/// `modified` tag, stamp `last_check_date`, and sync the `end` tag with the
+/// record's `end` flag.
+///
+/// Returns whether anything changed; the caller persists once when it did.
+pub fn mark_update_checked(record: &mut NovelRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let mut changed = false;
+    if record.tags.iter().any(|tag| tag == MODIFIED_TAG) {
+        record.tags.retain(|tag| tag != MODIFIED_TAG);
+        changed = true;
+    }
+    if record.last_check_date != Some(now) {
+        record.last_check_date = Some(now);
+        changed = true;
+    }
+    changed |= sync_end_tag(record);
+    changed
+}
+
+/// Synchronize the completion tag without clearing `modified` or changing
+/// the check date (the general-last-update check has already set those).
+pub fn sync_end_tag(record: &mut NovelRecord) -> bool {
+    let has_end_tag = record.tags.iter().any(|tag| tag == "end");
+    match (record.end, has_end_tag) {
+        (true, false) => {
+            record.tags.push("end".to_string());
+            true
+        }
+        (false, true) => {
+            record.tags.retain(|tag| tag != "end");
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Tag `record` as gone upstream (`404`; native `narou tag --add 404`).
+/// Returns whether the tag was added; the freeze-state write stays with the
+/// caller ([`NovelActionService`] or the native compatibility helper).
+pub fn mark_not_found(record: &mut NovelRecord) -> bool {
+    if record.tags.iter().any(|existing| existing == "404") {
+        return false;
+    }
+    record.tags.push("404".to_string());
+    true
+}
+
+/// Set or clear the `convert_failure` flag (native `set_convert_failure` /
+/// `clear_convert_failure`, Worker `set_convert_failure_flag`). Returns
+/// whether the flag changed.
+pub fn mark_convert_failure(record: &mut NovelRecord, failed: bool) -> bool {
+    if record.convert_failure == failed {
+        return false;
+    }
+    record.convert_failure = failed;
+    true
 }
 
 /// Validate and normalize a tag list: trim, drop empties, dedupe (first-seen

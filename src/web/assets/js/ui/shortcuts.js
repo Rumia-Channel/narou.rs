@@ -21,10 +21,25 @@ function isInputFocused() {
 }
 
 function handleKeyDown(e) {
-  // Don't capture when typing in inputs/textareas
-  if (isInputFocused()) return;
-
   const key = e.key.toUpperCase();
+  if (key === 'ESCAPE') {
+    e.preventDefault();
+    const openModal = document.querySelector('.modal-overlay:not(.hide)');
+    if (openModal) {
+      actionHandlers.closeModal?.(openModal);
+      return;
+    }
+    const ctx = El.contextMenu;
+    if (ctx && !ctx.classList.contains('hide')) {
+      ctx.classList.add('hide');
+      return;
+    }
+    actionHandlers.selectClear?.();
+    return;
+  }
+
+  // Don't capture other shortcuts when typing in inputs/textareas.
+  if (isInputFocused()) return;
   const ctrl = e.ctrlKey || e.metaKey;
   const shift = e.shiftKey;
 
@@ -49,24 +64,6 @@ function handleKeyDown(e) {
     return;
   }
 
-  // ESC — clear selection / close modals
-  if (key === 'ESCAPE') {
-    e.preventDefault();
-    // Close any open modal first
-    const openModal = document.querySelector('.modal-overlay:not(.hide)');
-    if (openModal) {
-      openModal.classList.add('hide');
-      return;
-    }
-    // Close context menu
-    const ctx = El.contextMenu;
-    if (ctx && !ctx.classList.contains('hide')) {
-      ctx.classList.add('hide');
-      return;
-    }
-    actionHandlers.selectClear?.();
-    return;
-  }
 
   // F5 — refresh (standard browser behavior, but also refresh list)
   if (key === 'F5') {

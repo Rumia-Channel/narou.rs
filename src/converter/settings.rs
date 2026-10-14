@@ -1044,18 +1044,50 @@ impl ImageRotation {
     }
 }
 
+/// 濁点フォント CSS (`vertical_font.css`) の行高表記。小数末尾の 0 を落とす
+/// (`1.80` → `1.8`、`2.00` → `2.0`)。
+///
+/// `narou init`・外部ツール用 CSS の書き出し (`dakuten_font`)・組み込み
+/// エンジンの濁点フォント資産 (`epub_lite`) が同じ表記を使う。
+pub fn format_line_height(line_height: f64) -> String {
+    let mut text = line_height.to_string();
+    if text.contains('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.push('0');
+        }
+    }
+    text
+}
+
+/// `line-height` 設定の値 (数値 / 数値文字列) を CSS 用の行高にする。
+/// 未設定・不正な値は既定の 1.8 (native / Worker 共通)。
+pub fn line_height_from_value(value: Option<&serde_yaml::Value>) -> f64 {
+    value
+        .and_then(|value| match value {
+            serde_yaml::Value::Number(number) => {
+                number.as_f64().or_else(|| number.as_i64().map(|i| i as f64))
+            }
+            serde_yaml::Value::String(text) => text.parse::<f64>().ok(),
+            _ => None,
+        })
+        .unwrap_or(1.8)
+}
+
 /// `replace.txt` の中身を (置換前, 置換後) の並びにする。
 ///
 /// fs を使わないので Worker でも同じ規則で読める (`replace.txt` は
 /// ObjectStore 上の小説データから読む)。
 pub fn parse_replace_patterns(content: &str) -> Vec<(String, String)> {
     let mut patterns = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with(';') {
+    for line in content.strip_prefix('\u{feff}').unwrap_or(content).lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with(';') {
             continue;
         }
-        if let Some((pattern, replacement)) = trimmed.split_once('\t') {
+        if let Some((pattern, replacement)) = line.split_once('\t') {
             patterns.push((pattern.to_string(), replacement.to_string()));
         }
     }

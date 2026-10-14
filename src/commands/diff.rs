@@ -435,26 +435,80 @@ fn display_diff_list(context: &NovelContext) -> std::result::Result<(), String> 
     Ok(())
 }
 
-fn clean_diff(context: &NovelContext) -> std::result::Result<(), String> {
-    let cache_root = cache_root_dir(context);
-    print!("{} の", context.record.title);
-    let mut removed = false;
-    if cache_root.exists() {
-        fs::remove_dir_all(&cache_root).map_err(|e| e.to_string())?;
-        removed = true;
+fn remove_empty_diff_directory(path: &Path) -> std::result::Result<bool, String> {
+    let mut entries = fs::read_dir(path).map_err(|error| error.to_string())?;
+    match entries.next() {
+        None => {
+            fs::remove_dir(path).map_err(|error| error.to_string())?;
+            Ok(true)
+        }
+        Some(Ok(_)) => Ok(false),
+        Some(Err(error)) => Err(error.to_string()),
+    }
+}
+
+/// Shared object cleanup plus native I/O for legacy empty cache directories.
+/// Used by --clean and --all-clean, and by the Web action's one CLI invocation.
+fn clean_diff_data(context: &NovelContext) -> std::result::Result<bool, String> {
+    use narou_rs::application::webui::diff::{DIFF_CACHE_DIR_NAMES, plan_diff_cache_clean};
+    use narou_rs::platform::ObjectStore;
+
+    let novel_dir = narou_rs::db::existing_novel_dir_for_record(&context.archive_root, &context.record);
+    let novel_dir = narou_rs::db::paths::ensure_within_archive_root(&novel_dir, &context.archive_root)
+        .map_err(|error| error.to_string())?;
+    let prefix = narou_rs::native::object_store::novel_object_prefix(&context.archive_root, &novel_dir)
+        .ok_or_else(|| "invalid novel storage path".to_string())?;
+    let store = narou_rs::native::object_store::NativeStore::for_current_root()
+        .map_err(|error| error.to_string())?;
+    let plan = futures::executor::block_on(plan_diff_cache_clean(&store, &prefix))
+        .map_err(|error| error.to_string())?;
+    let mut removed = !plan.is_empty();
+    futures::executor::block_on(async {
+        for key in plan {
+            store.delete(&key).await?;
+        }
+        Ok::<_, narou_rs::error::NarouError>(())
+    })
+    .map_err(|error| error.to_string())?;
+
+    for name in DIFF_CACHE_DIR_NAMES {
+        let root = novel_dir.join(SECTION_SAVE_DIR).join(name);
+        let root = narou_rs::db::paths::ensure_within_archive_root(&root, &context.archive_root)
+            .map_err(|error| error.to_string())?;
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        for entry in entries {
+            let dir = entry.map_err(|error| error.to_string())?.path();
+            let dir = narou_rs::db::paths::ensure_within_archive_root(&dir, &context.archive_root)
+                .map_err(|error| error.to_string())?;
+            if !dir.is_dir() {
+                continue;
+            }
+            removed |= remove_empty_diff_directory(&dir)?;
+        }
+        removed |= remove_empty_diff_directory(&root)?;
     }
     // P4b: clearing diffs also clears the SQLite version history (plan §11.3:
     // api_diff_clean == prune all).
     #[cfg(feature = "native-runtime")]
     {
         if let Ok(conn) = version_conn() {
-            let guard = conn.lock().expect("sqlite mutex poisoned");
+            let guard = conn.lock();
             let pruned =
                 narou_rs::native::sqlite::versions::prune_history(&guard, context.record.id, 0)
                     .map_err(|e| e.to_string())?;
             removed = removed || pruned > 0;
         }
     }
+    Ok(removed)
+}
+
+fn clean_diff(context: &NovelContext) -> std::result::Result<(), String> {
+    let removed = clean_diff_data(context)?;
+    print!("{} の", context.record.title);
     if removed {
         println!("差分を削除しました");
     } else {
@@ -486,12 +540,9 @@ fn clean_all_diff() -> std::result::Result<(), String> {
             archive_root: archive_root.clone(),
             record,
         };
-        let cache_root = cache_root_dir(&context);
-        if !cache_root.exists() {
-            continue;
+        if clean_diff_data(&context)? {
+            println!("{} の差分を削除しました", context.record.title);
         }
-        fs::remove_dir_all(&cache_root).map_err(|e| e.to_string())?;
-        println!("{} の差分を削除しました", context.record.title);
     }
 
     Ok(())
@@ -664,7 +715,7 @@ fn bold_yellow(s: &str) -> String {
 
 #[cfg(feature = "native-runtime")]
 fn version_conn()
--> std::result::Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {
+-> std::result::Result<std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>, String> {
     use narou_rs::native::sqlite::state;
     if state::legacy_yaml_active() {
         return Err("SQLiteバックエンドが無効です (NAROU_RS_LEGACY_YAML)".to_string());
@@ -683,7 +734,7 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
     use narou_rs::native::sqlite::versions;
 
     let conn = version_conn()?;
-    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+    let mut guard = conn.lock();
     let novel_id = context.record.id;
 
     if opts.history {
@@ -710,7 +761,7 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
     }
 
     if let Some(version_id) = opts.show {
-        let diff = versions::version_diff(&guard, version_id)
+        let diff = versions::version_diff(&guard, novel_id, version_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("バージョン{version_id}の差分はありません"))?;
         print!("{diff}");
@@ -720,7 +771,10 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
     if let Some(version_id) = opts.restore {
         versions::restore_version(&mut guard, novel_id, version_id, false)
             .map_err(|e| e.to_string())?;
-        write_back_working_set(context, &guard)?;
+        let working_set = load_working_set(&guard, novel_id)?;
+        // 書戻しは ObjectStore 経由で同じ接続を掴むため、ロックを解放してから行う。
+        drop(guard);
+        write_back_working_set(context, &working_set)?;
         println!("バージョン{version_id}から復元しました (新しいヘッドとして記録)");
         return Ok(());
     }
@@ -734,7 +788,10 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
         });
         versions::merge_from_version(&mut guard, novel_id, version_id, only.as_deref(), None)
             .map_err(|e| e.to_string())?;
-        write_back_working_set(context, &guard)?;
+        let working_set = load_working_set(&guard, novel_id)?;
+        // 書戻しは ObjectStore 経由で同じ接続を掴むため、ロックを解放してから行う。
+        drop(guard);
+        write_back_working_set(context, &working_set)?;
         println!("バージョン{version_id}からマージしました");
         return Ok(());
     }
@@ -742,30 +799,51 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
     Ok(())
 }
 
-/// Write the mirrored working set back to `本文/*.yaml` after a
-/// restore/merge. The SQLite tables are a mirror; the section files remain
-/// authoritative for conversion, so a version operation that only updates
-/// the mirror would be silently discarded by the next convert.
+#[cfg(feature = "native-runtime")]
+fn load_working_set(
+    conn: &rusqlite::Connection,
+    novel_id: i64,
+) -> std::result::Result<narou_rs::native::sqlite::content::SectionMap, String> {
+    narou_rs::native::sqlite::content::load_sections(conn, novel_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "作業セットがミラーされていません".to_string())
+}
+
+/// Write the mirrored working set back after a restore/merge.
+///
+/// The SQLite tables are a mirror of the version history; the working set
+/// (`本文/*.yaml`) is what conversion, the web reader and the version tooling
+/// observe. In SQLite mode a filesystem-only write is shadowed by the stored
+/// `objects` rows (reads prefer the database), so the update must go through
+/// the same ObjectStore boundary the readers use — which also keeps the
+/// filesystem mirror in sync when it is enabled.
 #[cfg(feature = "native-runtime")]
 fn write_back_working_set(
     context: &NovelContext,
-    conn: &rusqlite::Connection,
+    sections: &narou_rs::native::sqlite::content::SectionMap,
 ) -> std::result::Result<(), String> {
     use narou_rs::downloader::persistence::section_filename;
     use narou_rs::downloader::types::SubtitleInfo;
-
-    let novel_id = context.record.id;
-    let sections = narou_rs::native::sqlite::content::load_sections(conn, novel_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "作業セットがミラーされていません".to_string())?;
+    use narou_rs::platform::{ObjectListRequest, ObjectPrefix, ObjectStore};
 
     let novel_dir =
         narou_rs::db::existing_novel_dir_for_record(&context.archive_root, &context.record);
     let section_dir = novel_dir.join(SECTION_SAVE_DIR);
-    fs::create_dir_all(&section_dir).map_err(|e| e.to_string())?;
+    let store = narou_rs::native::object_store::NativeStore::for_current_root()
+        .map_err(|e| e.to_string())?;
+    let section_prefix = narou_rs::native::object_store::novel_object_prefix(
+        &context.archive_root,
+        &novel_dir,
+    )
+    .map(|prefix| {
+        prefix
+            .join(SECTION_SAVE_DIR)
+            .map_err(|e| e.to_string())
+    })
+    .transpose()?;
 
     let mut expected = std::collections::HashSet::new();
-    for (idx, (subtitle, body_yaml)) in &sections {
+    for (idx, (subtitle, body_yaml)) in sections {
         let section: SectionFile = serde_yaml::from_str(body_yaml).map_err(|e| e.to_string())?;
         let info = SubtitleInfo {
             index: idx.clone(),
@@ -780,26 +858,72 @@ fn write_back_working_set(
         };
         let name = section_filename(&info);
         expected.insert(name.clone());
-        fs::write(section_dir.join(&name), body_yaml).map_err(|e| e.to_string())?;
+        match &section_prefix {
+            Some(prefix) => {
+                let key = prefix.join(&name).map_err(|e| e.to_string())?;
+                futures::executor::block_on(store.write_small(&key, body_yaml.clone().into_bytes()))
+                    .map_err(|e| e.to_string())?;
+            }
+            None => {
+                fs::create_dir_all(&section_dir).map_err(|e| e.to_string())?;
+                fs::write(section_dir.join(&name), body_yaml).map_err(|e| e.to_string())?;
+            }
+        }
     }
 
-    // Remove section files that no longer exist in the working set.
-    for entry in fs::read_dir(&section_dir).map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        let is_yaml = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext == "yaml");
-        if !is_yaml {
-            continue;
+    // Remove section entries that no longer exist in the working set
+    // (renamed subtitles leave the previous file name behind).
+    match &section_prefix {
+        Some(prefix) => {
+            let request = ObjectListRequest::new(
+                ObjectPrefix::new(prefix.as_ref()).map_err(|e| e.to_string())?,
+                std::num::NonZeroUsize::new(512).expect("page size is non-zero"),
+            );
+            let mut cursor: Option<String> = None;
+            loop {
+                let request = match &cursor {
+                    Some(cursor) => request.clone().after(cursor.clone()),
+                    None => request.clone(),
+                };
+                let page = futures::executor::block_on(store.list_page(&request))
+                    .map_err(|e| e.to_string())?;
+                for metadata in &page.objects {
+                    let key = metadata.key.as_ref();
+                    let Some(name) = key.strip_prefix(&format!("{}/", prefix.as_ref())) else {
+                        continue;
+                    };
+                    if name.contains('/') || !name.ends_with(".yaml") || expected.contains(name) {
+                        continue;
+                    }
+                    futures::executor::block_on(store.delete(&metadata.key))
+                        .map_err(|e| e.to_string())?;
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
         }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if !expected.contains(&name) {
-            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        None => {
+            fs::create_dir_all(&section_dir).map_err(|e| e.to_string())?;
+            for entry in fs::read_dir(&section_dir).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                let is_yaml = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext == "yaml");
+                if !is_yaml {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !expected.contains(&name) {
+                    fs::remove_file(&path).map_err(|e| e.to_string())?;
+                }
+            }
         }
     }
     Ok(())
