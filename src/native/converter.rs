@@ -49,7 +49,7 @@ fn native_capabilities() -> Option<ConverterCapabilities> {
 }
 
 /// Capabilities that persist the illustration index and newly fetched images
-/// through the active [`ObjectStore`]/[`AssetStore`] boundary.
+/// through the active [`ObjectStore`]/[`AssetStore`](crate::platform::AssetStore) boundary.
 ///
 /// Returns `None` when the plain filesystem layout is the only storage (YAML
 /// mode without S3), where the legacy `挿絵/` directory scan and
