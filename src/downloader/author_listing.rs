@@ -360,12 +360,9 @@ impl<'a> AuthorListing<'a> {
             // 訪問済みの URL のいずれかで止まる (narou.rb の page 送りと同じ)。
             let mut visited: HashSet<String> = HashSet::new();
             let mut page_number = 1usize;
-            loop {
-                let Some(url) =
-                    setting.author_comic_series_pages_fetch_url(captures, series_id, page_number)
-                else {
-                    break;
-                };
+            while let Some(url) =
+                setting.author_comic_series_pages_fetch_url(captures, series_id, page_number)
+            {
                 if !visited.insert(url.clone()) {
                     break;
                 }

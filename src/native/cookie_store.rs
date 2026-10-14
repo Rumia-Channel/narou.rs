@@ -27,6 +27,9 @@ use crate::platform::cookie_store::{
 };
 use crate::platform::{CookieStore, LoginGroup, PlatformFuture};
 
+/// Ordered site logins and the sites encrypted at rest in the same snapshot.
+pub type LoginGroupsWithEncryption = (BTreeMap<String, Vec<LoginGroup>>, BTreeSet<String>);
+
 #[derive(Clone)]
 pub struct InventoryCookieStore {
     inventory: Arc<Inventory>,
@@ -141,7 +144,7 @@ impl InventoryCookieStore {
     /// flags, from one payload read.
     pub fn groups_and_encryption(
         &self,
-    ) -> Result<(BTreeMap<String, Vec<LoginGroup>>, BTreeSet<String>)> {
+    ) -> Result<LoginGroupsWithEncryption> {
         let decoded = self.load_decoded()?;
         Ok((decoded.sites, decoded.encrypted))
     }

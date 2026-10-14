@@ -142,7 +142,7 @@ pub async fn read_diff_cache_catalog(
     }
     let mut result = Vec::with_capacity(versions.len());
     for (version, mut group) in versions.into_iter().rev() {
-        group.sections.sort_unstable_by(|a, b| a.cmp(b));
+        group.sections.sort_unstable();
         let only_latest_update = group.sections.is_empty() && !group.enumeration_failed;
         let mut entries = Vec::with_capacity(group.sections.len());
         for (_, _, key) in group.sections {

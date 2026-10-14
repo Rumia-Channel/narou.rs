@@ -2402,10 +2402,9 @@ impl Downloader {
             && !new_arrival_subtitles.is_empty()
             && !cache_version_recorded
             && !partial_listing
+            && let Some(timestamp) = cache_timestamp(self.clock.as_ref(), save_diff_snapshots)
         {
-            if let Some(timestamp) = cache_timestamp(self.clock.as_ref(), save_diff_snapshots) {
-                self.persistence.record_cache_version(&object_keys, &timestamp).await?;
-            }
+            self.persistence.record_cache_version(&object_keys, &timestamp).await?;
         }
 
         Ok(DownloadResult {

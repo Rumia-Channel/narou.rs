@@ -24,7 +24,7 @@ pub fn notepad_content_from_columns<'a>(raw: Option<&'a str>, json: Option<&str>
     if raw.map(str::trim).is_none_or(|value| value.is_empty() || value == "{}")
         && let Some(json) = json
         && json.trim_start().starts_with('"')
-        && let Ok(legacy) = serde_json::from_str::<String>(&json)
+        && let Ok(legacy) = serde_json::from_str::<String>(json)
     {
         return Cow::Owned(legacy);
     }
@@ -79,9 +79,9 @@ mod tests {
 
     #[test]
     fn canonical_raw_notes_and_legacy_json_strings_remain_distinct() {
-        assert_eq!(notepad_content_from_columns(Some("{}".into()), Some("{}".into())), "{}");
-        assert_eq!(notepad_content_from_columns(Some(" \t\r\n".into()), Some("{}".into())), " \t\r\n");
-        assert_eq!(notepad_content_from_columns(Some("{}".into()), Some(r#""old note""#.into())), "old note");
+        assert_eq!(notepad_content_from_columns(Some("{}"), Some("{}")), "{}");
+        assert_eq!(notepad_content_from_columns(Some(" \t\r\n"), Some("{}")), " \t\r\n");
+        assert_eq!(notepad_content_from_columns(Some("{}"), Some(r#""old note""#)), "old note");
         assert_eq!(notepad_content_from_columns(Some(""), Some("{}")), "");
     }
 

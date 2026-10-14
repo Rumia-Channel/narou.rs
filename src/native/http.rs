@@ -1363,7 +1363,7 @@ mod tests {
                 drop(first);
                 let (mut second, _) = listener.accept().unwrap();
                 let (head, body) = read_request(&mut second);
-                if matches!(status, 301 | 302 | 303) {
+                if matches!(status, 301..=303) {
                     assert!(head.starts_with("GET /finish HTTP/1.1"), "{head}");
                     assert!(body.is_empty());
                     assert!(request_header(&head, "Content-Type").is_none());

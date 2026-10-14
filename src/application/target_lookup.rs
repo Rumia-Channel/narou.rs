@@ -870,7 +870,7 @@ mod tests {
                 .records
                 .iter()
                 .filter(|r| r.id > after)
-                .filter(|r| tag.map_or(true, |tag| r.tags.iter().any(|t| t == tag)))
+                .filter(|r| tag.is_none_or(|tag| r.tags.iter().any(|t| t == tag)))
                 .map(|r| NovelId(r.id))
                 .collect();
             ids.sort();

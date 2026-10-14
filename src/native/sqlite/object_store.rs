@@ -892,22 +892,22 @@ fn collect_archive_import_entries(
     }
     if !has_entries {
         let novel_dir = current.parent().and_then(Path::parent).and_then(Path::parent);
-        if let Some(novel_dir) = novel_dir {
-            if let (Some(prefix), Some(marker)) = (
+        if let Some(novel_dir) = novel_dir
+            && let (Some(prefix), Some(marker)) = (
                 logical_key_for_native_path(root, novel_dir),
                 logical_key_for_native_path(root, &current.join(".version")),
-            ) {
-                let prefix_depth = prefix.as_ref().split('/').count();
-                if matches!(prefix_depth, 3 | 4)
-                    && prefix.as_ref().starts_with("novels/")
-                    && crate::application::webui::diff::cached_object_parts(
-                        prefix.as_ref(),
-                        marker.as_ref(),
-                    )
-                    .is_some()
-                {
-                    output.push(ArchiveImportEntry::EmptyCacheVersion(marker));
-                }
+            )
+        {
+            let prefix_depth = prefix.as_ref().split('/').count();
+            if matches!(prefix_depth, 3 | 4)
+                && prefix.as_ref().starts_with("novels/")
+                && crate::application::webui::diff::cached_object_parts(
+                    prefix.as_ref(),
+                    marker.as_ref(),
+                )
+                .is_some()
+            {
+                output.push(ArchiveImportEntry::EmptyCacheVersion(marker));
             }
         }
     }

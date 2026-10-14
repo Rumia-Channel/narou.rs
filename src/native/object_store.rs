@@ -556,12 +556,12 @@ impl AssetStore for NativeObjectStore {
                 Ok(()) => Ok(()),
                 Err(_) => fs::copy(&source, &destination).and_then(|_| fs::remove_file(&source)),
             };
-            if result.is_err() && owned_version_dir {
-                if let Some(parent) = destination.parent() {
-                    // Never recursively delete or remove a directory that
-                    // already existed. Nonempty/concurrently written dirs stay.
-                    let _ = fs::remove_dir(parent);
-                }
+            if result.is_err() && owned_version_dir
+                && let Some(parent) = destination.parent()
+            {
+                // Never recursively delete or remove a directory that
+                // already existed. Nonempty/concurrently written dirs stay.
+                let _ = fs::remove_dir(parent);
             }
             result.map_err(NarouError::from)
         })

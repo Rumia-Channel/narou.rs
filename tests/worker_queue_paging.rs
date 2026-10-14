@@ -44,15 +44,14 @@ fn page(
 ) -> Vec<(String, String)> {
     let (created_at, job_id) = cursor.unwrap_or(("", ""));
     let mut statement = conn.prepare(ACTIVE_PAGE_SQL).unwrap();
-    let rows = statement
+    statement
         .query_map(
             rusqlite::params![created_at, created_at, job_id, limit as i64],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(5)?)),
         )
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    rows
+        .unwrap()
 }
 
 fn job_ids(rows: &[(String, String)]) -> Vec<String> {

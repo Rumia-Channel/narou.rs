@@ -571,9 +571,7 @@ impl EpubPreparation {
             options,
             title,
             creator,
-            sections,
-            records,
-            epub_assets,
+            BookContent { sections, records, assets: epub_assets },
             cover,
             Some(title_markup),
         );
@@ -651,6 +649,13 @@ fn build_title_markup(
     }
 }
 
+/// Converted body, chapter records and assets consumed together at assembly.
+struct BookContent {
+    sections: Vec<String>,
+    records: Vec<ChapterRecord>,
+    assets: Vec<EpubAsset>,
+}
+
 /// 組立の仕上げ段 (環境非依存): nav/NCX → metadata → [`EpubBook`] → 表紙。
 ///
 /// 画像の寸法取得だけが入力環境の差で、その結果 (資産と表紙) をここへ渡す。
@@ -660,16 +665,14 @@ fn finish_book(
     options: &EpubBuildOptions,
     title: &str,
     creator: Option<&str>,
-    sections: Vec<String>,
-    records: Vec<ChapterRecord>,
-    epub_assets: Vec<EpubAsset>,
+    content: BookContent,
     cover: Option<(String, Option<(u32, u32)>)>,
     title_markup: Option<TitleMarkup>,
 ) -> EpubBook {
-    let chapters = nav_chapters(records, config);
+    let chapters = nav_chapters(content.records, config);
     // 識別子は Java と同じ `urn:uuid:` (MD5 of `title-creator`)。
     let metadata = build_metadata(title, creator, None, None);
-    let mut book = EpubBook::from_sections(metadata, sections)
+    let mut book = EpubBook::from_sections(metadata, content.sections)
         .with_vertical(options.vertical)
         .with_style(StyleSettings::from_ini(&config.ini))
         .with_toc_page(config.toc_page)
@@ -679,7 +682,7 @@ fn finish_book(
         .with_cover_page(config.cover_page, config.cover_page_toc)
         .with_kindle(options.kindle)
         .with_chapters(chapters)
-        .with_assets(epub_assets);
+        .with_assets(content.assets);
     if let Some(title_markup) = title_markup {
         // 扉ページは `TitlePageWrite=1` かつ `TitlePage=1|2` のときだけ挿入する
         // (Java `bookInfo.insertTitlePage` と同じ)。

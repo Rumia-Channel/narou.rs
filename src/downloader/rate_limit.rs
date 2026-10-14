@@ -137,12 +137,12 @@ mod tests {
         let super::PacingDecision::Wait { wait_ms } = limiter.try_acquire(&pixiv) else {
             panic!("site floor did not delay the second request");
         };
-        assert!(wait_ms >= 4_950 && wait_ms <= 5_000, "got {wait_ms}");
+        assert!((4_950..=5_000).contains(&wait_ms), "got {wait_ms}");
         assert_eq!(limiter.try_acquire(&other), super::PacingDecision::Granted);
         let super::PacingDecision::Wait { wait_ms } = limiter.try_acquire(&other) else {
             panic!("global interval did not delay the second request");
         };
-        assert!(wait_ms >= 600 && wait_ms <= 700, "got {wait_ms}");
+        assert!((600..=700).contains(&wait_ms), "got {wait_ms}");
     }
 
 
