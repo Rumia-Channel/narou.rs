@@ -64,3 +64,17 @@ These cover failed content/metadata/marker publication followed by acknowledged 
 and reopening, interruption between provenance commit and a second publication,
 bundle exports aimed at the live management directory, preserved external legacy-file edits,
 and S3 copy responses that must not trigger source deletion unless a complete success result is present.
+
+Progress and Pixiv series-tag regressions:
+
+```sh
+node --test tests/progress_bars.test.mjs
+cargo test -p narou_rs --lib progress_tests
+cargo test -p narou_rs --lib downloader::toc::tests
+cargo test -p narou_rs --test pixiv_series_tags
+```
+
+These cover independent attempts and peers, cancellation/reconnect tombstones,
+unknown TOC totals and cyclic pagination, and tag aggregation across a 31-episode
+series. The update case changes only a later-page tag, keeps manual tags, and
+does not download unchanged section bodies.

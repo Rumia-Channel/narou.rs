@@ -304,6 +304,7 @@ function handleWsMessage(msg) {
       appendConsole(msg.body || '', msg.target_console);
       break;
     case 'queue_start':
+      removeProgressBarsForScope(queueEventJobId(msg.data));
       closedProgressScopes.delete(queueEventJobId(msg.data));
       progressStateRevision++;
       refreshQueue();
@@ -697,7 +698,7 @@ function setProgressBar(data, targetConsole, isInit) {
   var percent = total !== null && current !== null ? current / total * 100
     : Number.isFinite(data.percent) ? Math.max(0, Math.min(100, data.percent)) : null;
   var labelText = formatProgressLabel(current, total, percent);
-  if (typeof data.message === 'string' && data.message) labelText = data.message + ' — ' + labelText;
+  if (typeof data.message === 'string' && data.message) labelText += ' — ' + data.message;
   entry.label.textContent = labelText;
   entry.label.title = labelText;
   entry.progress.setAttribute('aria-valuetext', labelText);
@@ -729,9 +730,9 @@ function clearAllProgressBars() {
 }
 
 function formatProgressLabel(current, total, percent) {
-  if (percent === null) return current ? '進捗 ' + current + '（全体確認中）' : '進捗（準備中）';
-  var counts = total !== null && current !== null ? current + '/' + total + ' ' : '';
-  return '進捗 ' + counts + percent.toFixed(1) + '%';
+  if (percent === null) return current ? '確認済み ' + current + '（総数未確定）' : '進捗（準備中）';
+  var counts = total !== null && current !== null ? '完了 ' + current + '/' + total + ' ' : '進捗 ';
+  return counts + percent.toFixed(1) + '%';
 }
 
 function sanitizeConsoleSpanStyle(styleText) {

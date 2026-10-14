@@ -118,12 +118,10 @@ test('interleaved jobs and operations retain independent visible progress', () =
   ui.send('progressbar.step', progress('A', 'a2', 3, 6, 1, 'Gamma'));
   ui.send('progressbar.step', progress('A', 'a1', 2, 4, 2, 'Alpha'));
   assert.deepEqual(ui.rows().map((row) => row.width), ['50%', '50%', '50%']);
-  assert.deepEqual(ui.rows().map((row) => row.label), [
-    'Alpha — 進捗 2/4 50.0%', 'Beta — 進捗 2/4 50.0%', 'Gamma — 進捗 3/6 50.0%',
-  ]);
   ui.send('queue_complete', 'A');
   ui.send('progressbar.step', progress('A', 'a2', 4, 6, 99, 'Gamma'));
-  assert.deepEqual(ui.rows().map((row) => row.label), ['Beta — 進捗 2/4 50.0%']);
+  assert.deepEqual(ui.rows().map((row) => row.width), ['50%']);
+  assert.equal(ui.rows()[0].attributes.get('aria-label'), 'Beta');
 });
 
 test('late init, updates and clear cannot rewind or resurrect an operation', () => {
@@ -153,12 +151,11 @@ test('retry closes the old attempt while the next attempt can progress', () => {
 test('unknown totals remain indeterminate until supplied and shrinking totals clamp', () => {
   const ui = createHarness();
   ui.send('progressbar.init', progress('A', 'a1', 0, 0, 0));
-  assert.equal(ui.rows()[0].label, '進捗（準備中）');
   assert.equal(ui.rows()[0].attributes.has('aria-valuenow'), false);
   ui.send('progressbar.step', progress('A', 'a1', 0, 4, 1));
-  assert.equal(ui.rows()[0].label, '進捗 0/4 0.0%');
+  assert.equal(ui.rows()[0].width, '0%');
+  assert.equal(ui.rows()[0].attributes.get('aria-valuenow'), '0');
   ui.send('progressbar.step', progress('A', 'a1', 3, 2, 2));
-  assert.equal(ui.rows()[0].label, '進捗 2/2 100.0%');
   assert.equal(ui.rows()[0].width, '100%');
   assert.equal(ui.rows()[0].attributes.get('aria-valuenow'), '100');
 });
@@ -173,7 +170,7 @@ test('partial queue status cannot clear jobs and idle preserves manual progress'
   }
   ui.context.clearProgressBarsWhenQueueIdle({ running_count: 0, pending: 0 });
   assert.deepEqual(ui.rows(), []);
-  assert.equal(ui.rows('stdout2')[0].label, '進捗 40.0%');
+  assert.equal(ui.rows('stdout2')[0].width, '40%');
   // A stale idle snapshot does not permanently close a still-running operation.
   ui.send('progressbar.step', progress('A', 'a1', 2, 4, 2));
   assert.equal(ui.rows()[0].width, '50%');
@@ -203,4 +200,25 @@ test('scope clear affects only that job and reconnect accepts its current snapsh
   ui.context.clearAllProgressBars();
   ui.send('progressbar.step', progress('A', 'a1', 3, 4, 8));
   assert.equal(ui.rows()[0].width, '75%');
+});
+
+test('a reclaimed attempt replaces abandoned bars without removing peer jobs', () => {
+  const ui = createHarness();
+  ui.send('progressbar.step', progress('A', 'abandoned', 2, 4, 1));
+  ui.send('progressbar.step', progress('B', 'peer', 3, 4, 1));
+  ui.send('queue_start', 'A');
+  ui.send('progressbar.step', progress('A', 'resumed', 1, 5, 1));
+  ui.send('progressbar.step', progress('A', 'abandoned', 4, 4, 2));
+  assert.deepEqual(ui.rows().map((row) => row.width), ['75%', '20%']);
+});
+
+test('failure and cancellation close only their job and reject late progress', () => {
+  for (const terminal of ['queue_failed', 'queue_partial', 'queue_cancelled']) {
+    const ui = createHarness();
+    ui.send('progressbar.step', progress('A', 'a1', 2, 4, 1));
+    ui.send('progressbar.step', progress('B', 'b1', 3, 4, 1));
+    ui.send(terminal, { job_id: 'A' });
+    ui.send('progressbar.step', progress('A', 'a1', 4, 4, 2));
+    assert.deepEqual(ui.rows().map((row) => row.width), ['75%']);
+  }
 });

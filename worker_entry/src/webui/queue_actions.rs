@@ -91,6 +91,18 @@ async fn notify_queue_changed(env: &Env, runtime: &WorkerRuntime) {
     crate::consumer::notify_queue_changed(&push).await;
 }
 
+/// Cancel APIs also close progress for executions that can no longer report
+/// their own terminal event (expired/orphaned invocations).
+async fn notify_running_cancelled(env: &Env, runtime: &WorkerRuntime, job_id: JobId) {
+    let push = crate::push_hub::PushHubClient::new(env, runtime.subrequests.clone());
+    crate::push_hub::broadcast_terminal_events(
+        &push,
+        &job_id,
+        &[narou_rs::application::push_events::queue_cancelled(job_id.as_str())],
+        crate::consumer::table_reload_after_job(runtime).await,
+    ).await;
+}
+
 /// Build the runtime or finish with the native-style 503 error response
 /// (`webui/download.rs` と同じ形)。
 macro_rules! runtime_or_503 {
@@ -165,8 +177,10 @@ async fn cancel(req: Request, env: Env) -> worker::Result<Response> {
     };
     for job_id in running_ids {
         // lease 切れの orphan も tombstone しておくと将来の再配信を止められる。
-        if let Err(error) = runtime.ledger.cancel_running_job(&job_id, REASON_CANCELLED).await {
-            return api_failure(error);
+        match runtime.ledger.cancel_running_job(&job_id, REASON_CANCELLED).await {
+            Ok(true) => notify_running_cancelled(&env, &runtime, JobId(job_id)).await,
+            Ok(false) => {}
+            Err(error) => return api_failure(error),
         }
     }
     // native `api_cancel` は `kill_running_child` の直後に無条件で送る
@@ -199,7 +213,7 @@ async fn cancel_running_task(mut req: Request, env: Env) -> worker::Result<Respo
     {
         // native は kill 成功 (`Ok(true)`) のみで送り、失敗応答には送らない。
         Ok(true) => {
-            notify_queue_changed(&env, &runtime).await;
+            notify_running_cancelled(&env, &runtime, JobId(body.task_id)).await;
             Response::from_json(&json!({ "status": "ok" }))
         }
         Ok(false) => Response::from_json(
