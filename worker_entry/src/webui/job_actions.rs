@@ -437,7 +437,7 @@ async fn api_update(
             let resolved_id = match numeric_target_id(&aliases, &existing_numeric, target) {
                 Some(id) => Some(id),
                 None => {
-                    resolve_update_target_to_id(runtime, &aliases, &site_settings, target).await
+                    resolve_update_target_to_id(runtime, &aliases, site_settings, target).await
                 }
             };
             match resolved_id {
@@ -663,7 +663,7 @@ async fn api_convert(
         let id = match numeric_target_id(&aliases, &existing_numeric, target) {
             Some(id) => Some(id),
             None => {
-                match resolve_convert_target_to_id(runtime, &aliases, &site_settings, target).await
+                match resolve_convert_target_to_id(runtime, &aliases, site_settings, target).await
                 {
                     Some(id) => Some(id),
                     None => target.parse::<i64>().ok(),

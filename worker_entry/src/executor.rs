@@ -345,7 +345,7 @@ pub async fn execute_job(
     if let Err(error) = runtime.persist_pending_section_hash_cache().await {
         console_log!("job {job_id}: section hash cache write-back failed: {error}");
     }
-    let outcome = match result {
+    match result {
         Err(NarouError::DownloadBudgetExpired {
             next_section_index,
         }) => {
@@ -361,8 +361,7 @@ pub async fn execute_job(
             }
         }
         result => classify_result(result, job, job_id, runtime, push_sink.as_ref()).await,
-    };
-    outcome
+    }
     }).await;
     // Drain every exit, including expansion, frozen and pacing-error paths.
     downloader.clear_progress();

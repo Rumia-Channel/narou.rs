@@ -682,9 +682,7 @@ impl PushHub {
                 serde_json::to_string(&guard.as_ref().expect("history loaded").progress)
                     .map_err(|error| Error::RustError(format!("progress history encode: {error}")))?
             };
-            if let Err(error) = self.state.storage().put(PROGRESS_KEY, progress_json).await {
-                if persist_error.is_none() { persist_error = Some(error); }
-            }
+            if let Err(error) = self.state.storage().put(PROGRESS_KEY, progress_json).await && persist_error.is_none() { persist_error = Some(error); }
         }
 
         let sockets = self.state.get_websockets();
