@@ -990,7 +990,9 @@ mod tests {
 
     #[tokio::test]
     async fn portless_cross_origin_post_cannot_clear_pending_jobs() {
-        let temporary = tempfile::tempdir_in("target").unwrap();
+        let temporary = tempfile::tempdir_in(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+        ).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut state = test_state();
         state.port = listener.local_addr().unwrap().port();

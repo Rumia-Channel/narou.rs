@@ -52,3 +52,15 @@ integral-float JSON baselines and decoded converted-output storage. The D1 SQL r
 run the production statements against SQLite; they do not replace real Workerd verification.
 Run `worker_entry/tests/contract.mjs` against a real `wrangler dev` instance with
 `BASE_URL`, `NAROU_ADMIN_TOKEN` and `CONTRACT_QUEUE=1` for HTTP, queue and replay contracts.
+
+Release data-preservation regressions:
+
+```sh
+cargo test --features lite --test yaml_rollback_roundtrip
+cargo test --features lite --lib platform::s3_store::tests
+```
+
+These cover failed content/metadata/marker publication followed by acknowledged writes
+and reopening, interruption between provenance commit and a second publication,
+bundle exports aimed at the live management directory, preserved external legacy-file edits,
+and S3 copy responses that must not trigger source deletion unless a complete success result is present.

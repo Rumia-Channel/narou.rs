@@ -511,15 +511,23 @@ impl S3Store {
             )
             .await?;
         let status = response.status;
-        if (200..300).contains(&status) {
-            Ok(())
-        } else {
-            Err(NarouError::Platform(format!(
+        if !(200..300).contains(&status) {
+            return Err(NarouError::Platform(format!(
                 "S3 COPY {} -> {} failed with status {status}",
                 source.as_ref(),
                 destination.as_ref()
-            )))
+            )));
         }
+        if !std::str::from_utf8(&response.body)
+            .is_ok_and(super::s3_request::copy_object_result_is_complete)
+        {
+            return Err(NarouError::Platform(format!(
+                "S3 COPY {} -> {} did not confirm a completed copy",
+                source.as_ref(),
+                destination.as_ref()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -794,6 +802,52 @@ mod tests {
             headers: vec![("content-type".to_string(), "application/yaml".to_string())],
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn move_preserves_source_when_copy_success_cannot_be_confirmed() {
+        for body in [
+            b"<Error><Code>InternalError</Code><Message>PRIVATE_BODY_SENTINEL</Message></Error>".as_slice(),
+            b"",
+            b"<CopyObjectResult><ETag>etag</ETag>",
+            b"<CopyObjectResult><ETag>etag</ETag></CopyObjectResult>",
+            b"<CopyObjectResult><ETag></ETag><LastModified>2026-10-14T00:00:00Z</LastModified></CopyObjectResult>",
+            b"<CopyObjectResult><ETag>etag</ETag><LastModified>invalid</LastModified></CopyObjectResult>",
+            b"<CopyObjectResult><!--<ETag>etag</ETag><LastModified>2026-10-14T00:00:00Z</LastModified>--></CopyObjectResult>",
+            b"<CopyObjectResult><![CDATA[<ETag>etag</ETag><LastModified>2026-10-14T00:00:00Z</LastModified>]]></CopyObjectResult>",
+            b"<CopyObjectResult><ETag>etag</ETag><LastModified>2026-10-14T00:00:00Z</LastModified><Error/></CopyObjectResult>",
+            b"<CopyObjectResult><ETag>etag</ETag><LastModified>2026-10-14T00:00:00Z</LastModified></CopyObjectResult><Error/>",
+            b"\xff",
+        ] {
+            let http = Arc::new(MockHttpClient::new());
+            let store = store(http.clone());
+            let source = key("novels/site/title/挿絵/old.png");
+            let destination = key("novels/site/title/挿絵/new.png");
+            http.add_response(store.location.object_url(&destination), HttpResponse {
+                status: 200, headers: Vec::new(), body: body.to_vec(),
+            });
+
+            let error = futures::executor::block_on(AssetStore::move_or_copy(&store, &source, &destination))
+                .expect_err("an uncertain copy must not remove its source");
+            assert!(!error.to_string().contains("PRIVATE_BODY_SENTINEL"));
+            assert!(!http.requested_urls().iter().any(|request| request.starts_with("DELETE ")));
+        }
+    }
+
+    #[test]
+    fn move_deletes_source_after_a_complete_copy_result() {
+        let http = Arc::new(MockHttpClient::new());
+        let store = store(http.clone());
+        let source = key("novels/site/title/挿絵/old.png");
+        let destination = key("novels/site/title/挿絵/new.png");
+        let source_url = store.location.object_url(&source);
+        let destination_url = store.location.object_url(&destination);
+        http.add_text(&destination_url, 200,
+            "<?xml version=\"1.0\"?><s3:CopyObjectResult xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\"><s3:LastModified>2026-10-14T00:00:00.000Z</s3:LastModified><s3:ETag>\"opaque-etag\"</s3:ETag></s3:CopyObjectResult>");
+        http.add_response(&source_url, HttpResponse { status: 204, headers: Vec::new(), body: Vec::new() });
+
+        futures::executor::block_on(AssetStore::move_or_copy(&store, &source, &destination)).unwrap();
+        assert_eq!(http.requested_urls(), vec![format!("PUT {destination_url}"), format!("DELETE {source_url}")]);
     }
 
     #[test]
