@@ -140,15 +140,26 @@ fn in_place_export_restores_db_only_content_and_definitions() {
     assert!(root.join(".narou/database.yaml").is_file());
 }
 
-/// A payload that cannot be read must not be reported as a completed cutover:
-/// the export fails and the library stays on SQLite.
+/// Failed rollback projections must not replace writes acknowledged afterwards.
 #[test]
-fn failed_export_keeps_sqlite_selected() {
+fn failed_export_preserves_subsequent_state_and_record_writes() {
     let _guard = LIBRARY_LOCK.lock();
     let (_temp, root) = temp_library();
     let _cwd = CwdGuard::enter(&root);
     let store = db_only_store(&root);
     let keys = seed_novel(&store);
+    let state = state::active_for(&root.join(".narou")).unwrap();
+    state.set_raw("inv", "notepad", "before").unwrap();
+    state.set_raw("inv", "local_setting", "download.interval: 1\n").unwrap();
+    state.set_raw("inv", "alias", "before: 7\n").unwrap();
+    state.set_raw("meta", "database_yaml_sha", "previous-mirror-fingerprint").unwrap();
+    let mut record: narou_rs::db::NovelRecord = serde_yaml::from_str(
+        "id: 7\nauthor: author\ntitle: Before\nfile_title: title\ntoc_url: https://example.com/7/\nsitename: site\nlast_update: 2026-10-14 00:00:00.000000000 +00:00\n",
+    ).unwrap();
+    narou_rs::db::with_database_mut(|db| {
+        db.insert(record.clone());
+        db.save()
+    }).unwrap();
 
     // Corrupt the stored CRC-32 of one object, as a damaged database would be.
     let connection = narou_rs::native::sqlite::open(&root.join(".narou/db.sqlite")).unwrap();
@@ -170,12 +181,84 @@ fn failed_export_keeps_sqlite_selected() {
         StorageMode::Sqlite,
         "a failed export must leave SQLite selected"
     );
-    // The object walk runs in key order and writes before it flips anything:
-    // the objects that sort before the corrupt one (`setting.ini` <
-    // `toc.yaml`) are already on disk, and the marker is untouched.
-    assert!(
-        root.join("小説データ/site/title/setting.ini").is_file(),
-        "content is written before the marker switches"
-    );
-    assert!(root.join(".narou/database.yaml").is_file());
+    state.set_raw("inv", "notepad", "after").unwrap();
+    state.set_raw("inv", "local_setting", "download.interval: 2\n").unwrap();
+    state.set_raw("inv", "alias", "after: 7\n").unwrap();
+    record.title = "After".to_string();
+    narou_rs::db::with_database_mut(|db| {
+        db.insert(record);
+        db.save()
+    }).unwrap();
+
+    let reopened = state::configure(&root.join(".narou")).unwrap();
+    assert_eq!(reopened.get_raw("inv", "notepad").unwrap().as_deref(), Some("after"));
+    assert_eq!(reopened.get_raw("inv", "local_setting").unwrap().as_deref(), Some("download.interval: 2\n"));
+    assert_eq!(reopened.get_raw("inv", "alias").unwrap().as_deref(), Some("after: 7\n"));
+    let db = narou_rs::db::Database::with_root(root).unwrap();
+    assert_eq!(db.get(7).unwrap().title, "After");
+}
+
+#[test]
+fn failed_metadata_or_marker_publish_preserves_later_writes() {
+    let _guard = LIBRARY_LOCK.lock();
+    for conflict in ["notepad.txt", "storage-backend.lock"] {
+        let (_temp, root) = temp_library();
+        let _cwd = CwdGuard::enter(&root);
+        let store = db_only_store(&root);
+        seed_novel(&store);
+        let managed = root.join(".narou");
+        let state = state::active_for(&managed).unwrap();
+        state.set_raw("inv", "alias", "before: 7\n").unwrap();
+        state.set_raw("inv", "notepad", "before").unwrap();
+        let path = managed.join(conflict);
+        if path.is_file() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::create_dir(&path).unwrap();
+
+        narou_rs::native::sqlite::export_yaml::export_yaml(None, true)
+            .expect_err("a conflicting output must prevent cutover");
+        assert_eq!(state::read_mode(&managed), StorageMode::Sqlite);
+        state.set_raw("inv", "alias", "after: 7\n").unwrap();
+        state.set_raw("inv", "notepad", "after").unwrap();
+        let reopened = state::configure(&managed).unwrap();
+        assert_eq!(reopened.get_raw("inv", "alias").unwrap().as_deref(), Some("after: 7\n"), "{conflict}");
+        assert_eq!(reopened.get_raw("inv", "notepad").unwrap().as_deref(), Some("after"), "{conflict}");
+    }
+}
+
+#[test]
+fn edited_failed_export_file_remains_a_legacy_import_source() {
+    let _guard = LIBRARY_LOCK.lock();
+    let (_temp, root) = temp_library();
+    let _cwd = CwdGuard::enter(&root);
+    let store = db_only_store(&root);
+    seed_novel(&store);
+    let managed = root.join(".narou");
+    let state = state::active_for(&managed).unwrap();
+    state.set_raw("inv", "alias", "before: 7\n").unwrap();
+    std::fs::create_dir_all(root.join("小説データ/site/title/toc.yaml")).unwrap();
+    narou_rs::native::sqlite::export_yaml::export_yaml(None, true).unwrap_err();
+
+    std::fs::write(managed.join("alias.yaml"), "edited: 7\n").unwrap();
+    let reopened = state::configure(&managed).unwrap();
+    assert_eq!(reopened.get_raw("inv", "alias").unwrap().as_deref(), Some("edited: 7\n"));
+}
+
+#[test]
+fn bundle_export_into_live_management_directory_does_not_reimport_stale_state() {
+    let _guard = LIBRARY_LOCK.lock();
+    let (_temp, root) = temp_library();
+    let _cwd = CwdGuard::enter(&root);
+    let store = db_only_store(&root);
+    seed_novel(&store);
+    let managed = root.join(".narou");
+    let state = state::active_for(&managed).unwrap();
+    state.set_raw("inv", "notepad", "before").unwrap();
+
+    narou_rs::native::sqlite::export_yaml::export_yaml(Some(managed.clone()), false).unwrap();
+    assert_eq!(state::read_mode(&managed), StorageMode::Sqlite);
+    state.set_raw("inv", "notepad", "after").unwrap();
+    let reopened = state::configure(&managed).unwrap();
+    assert_eq!(reopened.get_raw("inv", "notepad").unwrap().as_deref(), Some("after"));
 }

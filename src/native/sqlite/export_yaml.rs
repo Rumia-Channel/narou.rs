@@ -47,6 +47,10 @@
 //! (CRC-32) or write error aborts the export with the marker left as it was:
 //! a corrupt database, an unreadable object or an unreachable S3 illustration
 //! must not be reported as a completed rollback.
+//! In-place management files are atomically published with their SHA-256
+//! provenance recorded first. SQLite startup retires unchanged export
+//! projections without reimporting them, preserving writes made after a
+//! failed rollback; genuinely edited files remain legacy import sources.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -108,6 +112,9 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
     };
     std::fs::create_dir_all(&out_dir)?;
     let layout = ExportLayout::new(&root, out_dir.clone(), in_place)?;
+    let export_state = sqlite_state.as_ref().filter(|_| {
+        in_place || comparable(&out_dir) == comparable(&narou_dir)
+    });
 
     // 1. database.yaml from live records.
     let records: std::collections::BTreeMap<i64, crate::db::NovelRecord> =
@@ -123,13 +130,13 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
                 .collect())
         })?;
     let yaml = serde_yaml::to_string(&records)?;
-    std::fs::write(out_dir.join("database.yaml"), yaml)?;
+    write_state_file(export_state, &out_dir, "database.yaml", &yaml)?;
 
     // 2. database_index.yaml (derived cache; narou.rb rebuilds it when
     //    absent, but exporting it keeps the bundle complete).
     crate::db::with_database(|db| {
         if let Ok(content) = db.index_yaml() {
-            std::fs::write(out_dir.join("database_index.yaml"), content)?;
+            write_state_file(export_state, &out_dir, "database_index.yaml", &content)?;
         }
         Ok(())
     })?;
@@ -138,20 +145,20 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
     //    already the source of truth, so only the database backend has to be
     //    rendered out; a marker pointing at a database that cannot be opened
     //    is a hard error instead of a silently empty bundle.
-    if let Some(state) = sqlite_state {
+    if let Some(state) = &sqlite_state {
             // 管理状態の一覧・ファイル名は取込側と同じテーブル
             // (`crate::db::state_inventory`) を参照する。
             for (key, file) in state_inventory::import_export_states() {
                 if let Some(payload) = state.get_raw("inv", key)? {
-                    std::fs::write(out_dir.join(file), payload)?;
+                    write_state_file(export_state, &out_dir, file, &payload)?;
                 }
             }
             if let Some(payload) = state.get_raw("global", "global_setting")? {
                 let global_dir = layout.global_setting_dir();
                 std::fs::create_dir_all(&global_dir)?;
-                std::fs::write(global_dir.join("global_setting.yaml"), payload)?;
+                crate::db::inventory::atomic_write(&global_dir.join("global_setting.yaml"), &payload)?;
             }
-            export_objects(&state, &layout).await?;
+            export_objects(state, &layout).await?;
     }
 
     if in_place {
@@ -160,6 +167,21 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
         crate::native::sqlite::state::write_mode(&narou_dir, StorageMode::Yaml)?;
     }
     Ok(out_dir)
+}
+
+fn write_state_file(
+    state: Option<&super::state::StateDb>,
+    directory: &Path,
+    file: &str,
+    content: &str,
+) -> Result<()> {
+    let path = directory.join(file);
+    crate::db::inventory::with_exclusive_file_lock(&path, || {
+        if let Some(state) = state {
+            state.remember_export_file(file, &path, content)?;
+        }
+        crate::db::inventory::atomic_write_locked(&path, content)
+    })
 }
 
 /// Where the exported halves go: the real library (`in_place`) or one bundle
@@ -448,6 +470,22 @@ mod tests {
     use super::*;
     use crate::platform::mocks::MemoryObjectStore;
     use std::sync::Arc;
+
+    #[test]
+    fn interrupted_second_publication_preserves_later_acknowledged_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join(".narou");
+        let state = super::super::state::configure(&managed).unwrap();
+        state.set_raw("inv", "notepad", "before").unwrap();
+        write_state_file(Some(&state), &managed, "notepad.txt", "before").unwrap();
+        state.set_raw("inv", "notepad", "after").unwrap();
+
+        // A second attempt commits its provenance, then stops before replacing
+        // the first projection (process interruption or failed atomic publish).
+        state.remember_export_file("notepad.txt", &managed.join("notepad.txt"), "second").unwrap();
+        let reopened = super::super::state::configure(&managed).unwrap();
+        assert_eq!(reopened.get_raw("inv", "notepad").unwrap().as_deref(), Some("after"));
+    }
 
     fn temp_layout(in_place: bool, dir: &Path) -> ExportLayout {
         let root = dir.join("library");

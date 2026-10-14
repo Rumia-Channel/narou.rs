@@ -258,6 +258,9 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | `vacuum` | VACUUM で容量回収 |
 | `repair-freeze [--dry-run]` | 旧ビルドが残した `freeze.yaml.imported-*` を全て合算し、保存済みの凍結状態に無い ID を凍結へ戻す（和集合のみで、解除はしない）。`--dry-run` は復旧予定の表示のみ。取り込んだファイルは削除しない |
 
+**復帰失敗時のデータ保全**: インプレース書き出しの管理ファイルは、保存前に SQLite へ SHA-256 指紋を記録し、原子的に置換する。`narou-compat=false` では、失敗後に残った未編集の書き出しファイルを次回起動で再取り込みせず、その後に正常保存した SQLite の状態・作品レコードを維持する。ユーザーが編集して指紋が変わった旧形式ファイルの取り込みと、`narou-compat=true` のファイル優先は維持する。
+既存の書き出しファイルと次に公開する内容の指紋を最大 2 件保持し、再試行が保存直前で停止しても前の残骸を再取り込みしない。指紋更新と公開は同じファイルロック内で行う。`--out` が実管理ディレクトリ `.narou` を指す場合も同じ保護を適用する。
+
 **凍結状態の保存先**: YAML 管理では `.narou/freeze.yaml`、SQLite 管理では `app_state('inv','freeze')` で、どちらも Inventory の共通入口 (`Inventory::update_yaml`) を通す。SQLite 側では同じ内容が `frozen_novels` へ投影され、状態の検索 (`status` 検索式) が `narou list` と一致する。`freeze.yaml` の取込は和集合で行うため、残っていた断片ファイルが他の凍結を解除することはない (issue #35)。
 
 **前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, freeze.yaml, alias.yaml, tag_colors.yaml, login_cookie.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。`~/.narousetting/global_setting.yaml` はライブラリ状態ではないため narou-compat/SQLite の有無にかかわらず常にファイルのまま維持され、SQLite への取込・退避は行わない (旧ビルドが `app_state` の global/global_setting に残した行は、ファイルが無いとき初回読み出しでファイルへ書き戻してその行を削除する)
@@ -810,6 +813,8 @@ SQLite のミラー無効時も本文・設定・挿絵を保存先からスコ�
 **Rust 実装**: メンテナンスヘルパー (`find_orphan_illustrations`, `plan_legacy_illustration_migrations` / `apply_legacy_illustration_migrations`, `plan_extension_fixes` / `apply_extension_fixes`, `rebuild_illustration_cache`, `detect_image_extension`) を `src/illustration_store.rs` (crate 側) に集約。`src/commands/illust.rs` は CLI オプション解決と dry-run / `-f` の振り分けに専念し、将来 Web UI から同じ crate 関数を直接呼べる形を維持する。削除系・改名系・移行系はすべて既定 dry-run。`-f` 指定時も本文参照・cache 参照の双方から到達不能 / 移行計画を厳密判定してから実際に変更する (BUG-7/15 と整合)。対象小説の解決は clean と同じく ID / URL / Nコード / タイトル / alias / tag 展開の共通パイプラインを使い、`--all` は凍結済み小説をスキップする。
 
 DB-only ライブラリの `orphan` / `rebuild` / `fix-ext` 等は保存先のデータを取り出して処理し、索引更新・削除・改名をストアへ反映する。壊れた挿絵索引は空として削除を進めず、失敗させる。S3 移行・検証の独立 I/O は最大 4 件、既知の小オブジェクトは見積り 8 MiB の窓で処理し、大きい／サイズ不明の対象は単独で処理する。
+
+S3 の改名同期は HTTP 200 だけでコピー成功としない。完全な `CopyObjectResult` と必須メタデータを確認し、本文内エラー・空／破損／不完全な応答は失敗させる。コピー成功を確認できない場合は旧オブジェクトを削除せず、生の応答本文もエラーへ載せない。
 
 **互換メモ**:
 - ハッシュ名 (`<64-hex>.ext`) と mitemin ID 名 (`iNNNN.ext`) は canonical とみなし、cache の対応表に既に載っていれば自動的に "到達可能" として orphan 判定から除外する

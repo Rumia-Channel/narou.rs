@@ -117,6 +117,54 @@ impl StateDb {
         }
     }
 
+    /// Remember both the pending projection and any existing owned projection
+    /// before publishing. A second interrupted export must not forget the first.
+    pub(crate) fn remember_export_file(&self, file: &str, path: &Path, content: &str) -> Result<()> {
+        use sha2::Digest;
+        use std::io::Read;
+        let key = format!("export_file_sha:{file}");
+        let known: [Option<String>; 2] = self.get_raw_db("meta", &key)?
+            .map(|raw| serde_yaml::from_str(&raw)).transpose()?.unwrap_or_default();
+        let mut previous = None;
+        if known.iter().any(Option::is_some) {
+            let existing = match std::fs::File::open(path) {
+                Ok(file) => Some(file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(mut existing) = existing {
+                let mut digest = sha2::Sha256::new();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let count = existing.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..count]);
+                }
+                let hash = hex::encode(digest.finalize());
+                if known.iter().flatten().any(|expected| *expected == hash) {
+                    previous = Some(hash);
+                }
+            }
+        }
+        let next = hex::encode(sha2::Sha256::digest(content.as_bytes()));
+        if previous.as_ref() == Some(&next) {
+            previous = None;
+        }
+        self.set_raw_db("meta", &key, &serde_yaml::to_string(&[Some(next), previous])?)
+    }
+
+    pub(crate) fn is_export_file(&self, file: &str, content: &str) -> Result<bool> {
+        use sha2::Digest;
+        let Some(raw) = self.get_raw_db("meta", &format!("export_file_sha:{file}"))? else {
+            return Ok(false);
+        };
+        let expected: [Option<String>; 2] = serde_yaml::from_str(&raw)?;
+        let hash = hex::encode(sha2::Sha256::digest(content.as_bytes()));
+        Ok(expected.iter().flatten().any(|expected| *expected == hash))
+    }
+
     /// `app_state` write that bypasses the compat file layer.
     ///
     /// The freeze payload additionally maintains the relational projection
@@ -464,6 +512,8 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
 ///   renamed to `<name>.imported-<unix_ts>` (never deleted). `freeze` is
 ///   imported as a union with the stored payload so a stale fragment file
 ///   cannot unfreeze other novels (see [`merge_freeze_payload`]).
+///   Unchanged rollback projections are retired without importing, so a
+///   failed export cannot overwrite later acknowledged SQLite writes.
 ///
 /// Runs unconditionally (not only on a fresh database) so toggling the flag
 /// in either direction converges on the next launch.
@@ -473,6 +523,13 @@ fn reconcile_managed_files(state: &StateDb) -> Result<()> {
     for (key, file_name) in state_inventory::import_export_states() {
         let path = state.narou_dir.join(file_name);
         let file_content = std::fs::read_to_string(&path).ok();
+        if !compat
+            && let Some(content) = &file_content
+            && state.is_export_file(file_name, content)?
+        {
+            imported.push(path);
+            continue;
+        }
         if compat {
             match file_content {
                 Some(content) => state.set_raw_db("inv", key, &content)?,

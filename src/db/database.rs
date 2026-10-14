@@ -99,7 +99,9 @@ impl Database {
                             }
                             (None, _) => false,
                         };
-                        if should_import {
+                        if should_import
+                            && !state.is_export_file("database.yaml", file_content.as_deref().unwrap_or(""))?
+                        {
                             let parsed: BTreeMap<i64, NovelRecord> =
                                 serde_yaml::from_str(file_content.as_deref().unwrap_or(""))?;
                             let conn = repo.conn_handle();
