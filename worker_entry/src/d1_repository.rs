@@ -294,7 +294,7 @@ impl FreezeMutationStore for D1FreezeStore {
                     vec![BindValue::Int(id.0)],
                 )?);
                 statements.push(bind_statement(
-                    self.db.prepare(&novel_query::refresh_status_sort_sql()),
+                    self.db.prepare(novel_query::refresh_status_sort_sql()),
                     vec![BindValue::Int(id.0)],
                 )?);
             }

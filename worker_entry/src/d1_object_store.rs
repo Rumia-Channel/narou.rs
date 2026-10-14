@@ -163,7 +163,7 @@ impl D1ObjectStore {
             JsValue::from_str(key.as_ref()),
             JsValue::from_f64(data.len() as f64),
             JsValue::from_str(&now),
-            content_type.as_deref().map(JsValue::from_str).unwrap_or(JsValue::NULL),
+            content_type.map(JsValue::from_str).unwrap_or(JsValue::NULL),
             JsValue::from_str(encoding.as_str()),
             JsValue::from_f64(narou_rs::platform::object_crc32(data) as f64),
         ]);
