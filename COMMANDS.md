@@ -754,6 +754,7 @@ narou setting name         # 読み取り
 - 保存方式の読み取りが失敗した場合は不明／失敗として表示し、YAML と推定しない。Worker は D1 固定と表示し、切替操作を出さない。native の実際の方式切替だけが再起動を要求する。
 - Worker の本文・旧本文は、話単位の圧縮 S3 オブジェクトと D1 参照へ移行できる。`GET/POST /api/admin/content-migration` が `plan` / `copy` / `verify` / `cutover` / `purge` / `gc` / `status` を提供し、`scripts/migrate-worker-content.mjs` で CLI から再開可能な移行を実行する（既定は計画のみ、`--apply` で旧 D1 本文の削除まで実行）。本文用 `content_backend` と挿絵用 `asset_backend` は独立し、native の保存方式は変えない。
 - Worker の更新は旧本文を履歴へコピーしてから新本文を保存し、PUT 失敗でも現行本文を維持する。改題された話の旧ファイル名は新本文と目次の保存後に削除する。native の履歴移動は従来どおり。
+- Worker の本文分類はサブディレクトリ内の作品フォルダ名が `本文` でも、`toc.yaml` / `converter.yaml` / `.illustration_cache.yaml` を D1 に維持する。migration 0012 が既存 DB の移行対象ビューと書き込みガードも更新し、本文削除後の EPUB 生成・再起動を実 Worker で確認している。
 
 **不足動作**:
 - narou.rb の HAML/UI と完全一致するレベルの細かな見た目・配置・文言差分の洗い込み

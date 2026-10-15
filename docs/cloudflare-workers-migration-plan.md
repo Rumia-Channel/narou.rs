@@ -69,7 +69,9 @@ S3 の接続設定は挿絵と共通だが、保存先の状態は独立して�
 - 実装は `worker_entry/src/content_store.rs`。既存 `ObjectStore` / `AssetStore` を実装し、
   Downloader・変換・差分履歴・削除は従来の論理キーを使い続ける。native の実装は変更しない。
 - 対象は `本文/<話>.yaml` と `本文/cache/<版>/<話>.yaml`（旧 `.cache` 形式も対象）。
-  タイトルやサイト名に `本文` が含まれても、目次や設定を本文と誤判定しない。版マーカー `.version` は D1 に残す。
+  タイトルやサイト名に `本文` が含まれても、目次や設定を本文と誤判定しない。サブディレクトリありで
+  作品フォルダ自体が `本文` の場合も、`toc.yaml` / `converter.yaml` / `.illustration_cache.yaml` は D1 に残す。
+  Rust の分類と `0012_content_metadata_boundary.sql` の移行対象・書き込みガードで同じ除外を行う。版マーカー `.version` も D1 に残す。
 - 圧縮は共通の Brotli codec。小さくならない場合は非圧縮で保存する。圧縮方式・元サイズ・
   保存サイズ・CRC32・SHA-256 は D1 に保持し、読み出し時に照合する。1 話の上限は 16 MiB。
 - S3 の物理キーは `content/<ランダムな版 ID>.bin`。既存オブジェクトの部分更新はせず、
