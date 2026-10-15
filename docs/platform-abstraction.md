@@ -619,7 +619,7 @@ Worker の `PushHubSink` は行ごとに送信タスク (`spawn_local`) を起�
 | 境界 | native | Worker | 共通規則 |
 |---|---|---|---|
 | HTTP transport | curl / reqwest / wget と DNS 検証 | Fetch / connect / リレーと egress | URL 構文・リダイレクト・実送信の待機・応答解釈 |
-| 管理・本文・設定の永続化 | Inventory / FS / SQLite | D1 / primary session | typed repository、設定 patch、codec、CAS、保存 ACK |
+| 管理・本文・設定の永続化 | Inventory / FS / SQLite | 管理・目次・本文参照は D1、本文・履歴は話単位の圧縮 S3（移行までは旧 D1） | typed repository、設定 patch、codec、CAS、保存 ACK |
 | 大きな挿絵 | FS ミラーまたは S3 | S3 または D1 | logical key、bounded AssetStore、画像計画・処理 |
 | ジョブの配送 | PersistentQueue / 子プロセス | Queues / D1 ledger | 計画・retry policy・操作メッセージ・push payload |
 | 外部プロセスとローカル操作 | device / send / mail / folder 等 | capability と 501 で拒否 | 対応状況と UI の実行制限を明示 |

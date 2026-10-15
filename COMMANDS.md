@@ -752,6 +752,8 @@ narou setting name         # 読み取り
 - Worker の履歴取得・消去は PushHub の永続化履歴に接続し、再接続でも消去済みの行を復活させない。`webui.table.reload-timing` は実際の台帳の待機・実行数でテーブル更新を制御し、進捗・通知は抑止しない。
 - 設定保存は `webui.config.reload` を配信する。UI のテーブル・タグ更新は debounce / single-flight で合流し、古い応答を反映しない。Worker のキュー詳細は cursor で全ページを取得してから表示を交換する（既定 200 件／最大 1000 件、全体の待機・実行数を別に返す）。
 - 保存方式の読み取りが失敗した場合は不明／失敗として表示し、YAML と推定しない。Worker は D1 固定と表示し、切替操作を出さない。native の実際の方式切替だけが再起動を要求する。
+- Worker の本文・旧本文は、話単位の圧縮 S3 オブジェクトと D1 参照へ移行できる。`GET/POST /api/admin/content-migration` が `plan` / `copy` / `verify` / `cutover` / `purge` / `gc` / `status` を提供し、`scripts/migrate-worker-content.mjs` で CLI から再開可能な移行を実行する（既定は計画のみ、`--apply` で旧 D1 本文の削除まで実行）。本文用 `content_backend` と挿絵用 `asset_backend` は独立し、native の保存方式は変えない。
+- Worker の更新は旧本文を履歴へコピーしてから新本文を保存し、PUT 失敗でも現行本文を維持する。改題された話の旧ファイル名は新本文と目次の保存後に削除する。native の履歴移動は従来どおり。
 
 **不足動作**:
 - narou.rb の HAML/UI と完全一致するレベルの細かな見た目・配置・文言差分の洗い込み
@@ -1047,11 +1049,11 @@ S3 の改名同期は HTTP 200 だけでコピー成功としない。完全な 
 ### Worker の挿絵ストア確認
 
 `GET /api/storage/mode` は管理方式 `sqlite` に加え、`metadata_backend=d1`、
-`illustration_backend=d1|s3`、`s3_required` を返す（既存の認証を適用）。
+`illustration_backend=d1|s3`、本文用 `content_backend=d1|migrating|s3`、`content_migration_api`、`s3_required` を返す（既存の認証を適用）。
 `?probe=s3` は選択された S3 に上限 1 件の LIST を行い、`s3_list=ok|failed|not_selected`
 だけを返す。失敗は HTTP 503。キー、保存先設定、プロバイダーのエラー本文は返さない。
 HTTP 200 でも正しい `ListBucketResult` 外側要素を持たない本文は LIST 成功としない。
-CI の S3 必須配備では旧 D1 marker・未設定より S3 指定を優先する。旧 D1 挿絵は移行・削除・代替参照せず、管理と本文は D1 に保持する。設定不備や S3 要求失敗で D1 へ戻さず、配備後の実 LIST 成功も要求する。
+CI の S3 必須配備では旧 D1 marker・未設定より挿絵の S3 指定を優先する。旧 D1 挿絵は移行・削除・代替参照しない。管理・目次・設定は D1、本文・履歴は独立した本文移行の状態に従う。設定不備や S3 要求失敗で D1 へ戻さず、配備後の実 LIST 成功も要求する。
 この確認は LIST 権限・接続の確認であり、挿絵の既存データ移行や GET/PUT の検証ではない。
 
 S3 の存在確認は `GET` + `Range: bytes=0-0` を使う。GET の署名は必須ヘッダのみで、
