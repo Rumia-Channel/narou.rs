@@ -8,6 +8,8 @@
 mod budget;
 mod bundled_sites;
 mod composition;
+mod content_store;
+mod content_migration;
 mod convert;
 mod global_settings;
 mod websocket;
@@ -118,6 +120,7 @@ async fn route(req: Request, env: Env) -> Result<Response> {
         "/api/jobs" => api_jobs(req, env).await,
         "/api/global_setting" => global_settings::api_global_setting(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,
+        "/api/admin/content-migration" => content_migration::handle(req, env).await,
         "/api/library_backup" => webui::library_backup::handle(req, env).await,
         "/api/list" => webui::list::handle(req, env).await,
         "/api/sort_state" => webui::ui_prefs::handle(req, env).await,

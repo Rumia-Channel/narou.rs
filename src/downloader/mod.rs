@@ -1921,6 +1921,8 @@ impl Downloader {
         let save_diff_snapshots = self.settings.save_diff_snapshots();
         let mut cache_dir: Option<String> = None;
         let mut cache_version_recorded = false;
+        #[cfg(not(feature = "native-runtime"))]
+        let mut superseded_section_keys = Vec::new();
         let mut pending_section_hashes: HashMap<String, String> = HashMap::new();
         let display_id = provisional_id;
         let mut section_plans = Vec::with_capacity(subtitles.len());
@@ -2086,10 +2088,10 @@ impl Downloader {
                         self.clear_section_digest(id, &section_relative_path(previous));
                     }
                     if let Some(timestamp) = cache_dir.as_deref() {
-                        let moved = self.persistence
-                            .move_section_to_cache(&object_keys, timestamp, previous)
+                        let cached = self.persistence
+                            .cache_section(&object_keys, timestamp, previous)
                             .await?;
-                        if moved && !cache_version_recorded {
+                        if cached && !cache_version_recorded {
                             self.persistence.record_cache_version(&object_keys, timestamp).await?;
                             cache_version_recorded = true;
                         }
@@ -2133,6 +2135,17 @@ impl Downloader {
                     .get(&subtitle.index)
                     .and_then(|old| old.download_time.clone())
             };
+            #[cfg(not(feature = "native-runtime"))]
+            if (needs_download || resumed_was_tracked)
+                && let Some(previous) = old_subtitles.get(&subtitle.index)
+                && previous.file_subtitle != subtitle.file_subtitle
+            {
+                let previous_key = object_keys.section(&previous.index, &previous.file_subtitle);
+                let current_key = object_keys.section(&subtitle.index, &subtitle.file_subtitle);
+                if previous_key != current_key {
+                    superseded_section_keys.push(previous_key);
+                }
+            }
 
             let mut sub = subtitle.clone();
             sub.download_time = download_time;
@@ -2239,6 +2252,12 @@ impl Downloader {
             novel_type: Some(novel_type),
         };
         self.persistence.save_toc(&object_keys, &toc_file).await?;
+        // Portable history uses copy: retire renamed current keys only after
+        // both the replacement body and its new TOC are durable.
+        #[cfg(not(feature = "native-runtime"))]
+        for key in superseded_section_keys {
+            self.persistence.objects().delete(&key).await?;
+        }
         self.persistence
             .ensure_default_files(
                 &object_keys,
