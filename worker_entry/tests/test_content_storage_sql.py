@@ -47,6 +47,33 @@ class ContentStorageSqlTests(unittest.TestCase):
             self.legacy(key)
         self.assertEqual(bytes(self.db.execute('SELECT data FROM objects WHERE object_key=?', (BODY,)).fetchone()[0]), b'old')
 
+    def test_subdirectory_title_body_preserves_root_metadata_during_migration(self):
+        prefix = 'novels/site/本文/本文'
+        metadata = {f'{prefix}/{name}' for name in ('toc.yaml', 'converter.yaml', '.illustration_cache.yaml')}
+        episodes = {f'{prefix}/本文/1 toc.yaml', f'{prefix}/本文/cache/version/1 toc.yaml', f'{prefix}/本文/.cache/version/1 toc.yaml'}
+        for key in metadata | episodes:
+            self.legacy(key)
+        self.assertEqual({r[0] for r in self.db.execute('SELECT object_key FROM legacy_content_objects')}, episodes)
+        self.mode('migrating')
+        for key in metadata:
+            self.db.execute('UPDATE objects SET data=? WHERE object_key=?', (b'new', key))
+        for index, key in enumerate(sorted(episodes)):
+            self.publish(f'content/subdir-{index}.bin', key=key)
+        self.assertEqual(len(self.db.execute(SQL['CUTOVER']).fetchall()), 1)
+        for key in episodes:
+            self.db.execute('INSERT INTO content_deletions VALUES (?)', (key,))
+            self.db.execute('DELETE FROM objects WHERE object_key=?', (key,))
+            self.db.execute('DELETE FROM content_deletions WHERE object_key=?', (key,))
+        self.assertEqual({r[0] for r in self.db.execute('SELECT object_key FROM objects')}, metadata)
+        listed = self.db.execute(SQL['LIST'], (prefix, prefix+'\U0010ffff', '', 's3', 20)).fetchall()
+        self.assertEqual({r['object_key'] for r in listed}, metadata | episodes)
+        for key in metadata:
+            self.db.execute('DELETE FROM objects WHERE object_key=?', (key,))
+            self.legacy(key)
+        for key in episodes:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.legacy(key)
+
     def test_migration_absent_cas_does_not_replace_new_download(self):
         self.legacy()
         self.mode('migrating')

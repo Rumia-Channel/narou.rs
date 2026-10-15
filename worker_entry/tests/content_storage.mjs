@@ -208,18 +208,19 @@ try {
   writeFileSync(config, toml);
   writeFileSync(join(work, '.dev.vars'), `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${Buffer.alloc(32, 7).toString('base64')}\nS3_ACCESS_KEY_ID=local-test-key\nS3_SECRET_ACCESS_KEY=local-test-secret\n`);
   run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
-  const prefix = 'novels/Storage Smoke/n1234ab 本文保存検証';
+  const prefix = 'novels/Storage Smoke/本文/本文';
   const subtitle = (index, name) => ({ index: String(index), href: `https://example.com/n1234ab/${index}/`, chapter: '', subchapter: '', subtitle: name, file_subtitle: name, subdate: '2026-10-15' });
   const first = subtitle(1, '第一話'); const second = subtitle(2, '第二話');
   const section = (sub, body) => ({ ...sub, element: { data_type: 'html', introduction: '', body: `<p>${body.repeat(100)}</p>`, postscript: '' } });
   const firstKey = `${prefix}/本文/1 第一話.yaml`;
-  sql(`INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,general_all_no,length) VALUES (1,'Author','author','本文保存検証','本文保存検証','n1234ab 本文保存検証','https://example.com/n1234ab/','https://example.com/n1234ab/','Storage Smoke','storage smoke','2026-10-15T00:00:00Z','n1234ab','n1234ab',2,1000); UPDATE novel_id_sequence SET next_id=2;`
+  sql(`INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,general_all_no,length,use_subdirectory) VALUES (1,'Author','author','本文保存検証','本文保存検証','本文','https://example.com/n1234ab/','https://example.com/n1234ab/','Storage Smoke','storage smoke','2026-10-15T00:00:00Z','n1234ab','n1234ab',2,1000,1); UPDATE novel_id_sequence SET next_id=2;`
     + objectInsert(`${prefix}/toc.yaml`, { title: '本文保存検証', author: 'Author', toc_url: 'https://example.com/n1234ab/', story: '', subtitles: [first, second], novel_type: 1 })
     + objectInsert(firstKey, section(first, '初版本文がここにあります。'))
     + objectInsert(`${prefix}/本文/2 第二話.yaml`, section(second, '第二話の本文です。'))
     + objectInsert(`${prefix}/本文/cache/old/1 第一話.yaml`, section(first, '変更前の旧版本文。'))
     + objectInsert(`${prefix}/本文/.cache/legacy/1 点付き旧話.yaml`, section(subtitle(1, '点付き旧話'), '点付きキャッシュの旧本文。'))
-    + objectInsert(`${prefix}/setting.ini`, '') + objectInsert(`${prefix}/replace.txt`, ''));
+    + objectInsert(`${prefix}/setting.ini`, '') + objectInsert(`${prefix}/replace.txt`, '')
+    + objectInsert(`${prefix}/converter.yaml`, {}) + objectInsert(`${prefix}/.illustration_cache.yaml`, {}));
   await start();
   assert.equal((await fetch(`http://127.0.0.1:${port}/api/admin/content-migration`, { headers: { Connection: 'close' } })).status, 401);
   await migrationCli();
@@ -260,6 +261,8 @@ try {
   assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 0);
   assert.equal(scalar('SELECT COUNT(*) FROM content_objects'), 4);
   assert.equal(scalar("SELECT COUNT(*) FROM objects WHERE object_key LIKE '%/toc.yaml'"), 1);
+  assert.equal(scalar(`SELECT COUNT(*) FROM objects WHERE object_key IN (${['toc.yaml', 'converter.yaml', '.illustration_cache.yaml'].map((name) => quote(`${prefix}/${name}`)).join(',')})`), 3, 'subdirectory-layout root metadata must remain in D1 after purge');
+  assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE object_key LIKE '%/toc.yaml' OR object_key LIKE '%/converter.yaml' OR object_key LIKE '%/.illustration_cache.yaml'"), 0);
   const mode = await (await api('/api/storage/mode')).json();
   assert.equal(mode.content_backend, 's3'); assert.equal(mode.illustration_backend, 'd1');
   await stop(); await start(); await epub();

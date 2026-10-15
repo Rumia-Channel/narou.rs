@@ -60,7 +60,9 @@ pub fn is_content_key(key: &ObjectKey) -> bool {
     let value = key.as_ref();
     if !value.starts_with("novels/") || !value.ends_with(".yaml") { return false; }
     let mut tail = value.rsplit('/');
-    tail.next();
+    // A subdirectory-layout novel may itself be named 本文. Its root YAML
+    // metadata must remain in D1; episode filenames include their index.
+    if matches!(tail.next(), Some("toc.yaml" | "converter.yaml" | ".illustration_cache.yaml")) { return false; }
     let parent = tail.next();
     if parent == Some("本文") { return tail.count() >= 3; }
     matches!(tail.next(), Some("cache" | ".cache")) && tail.next() == Some("本文") && tail.count() >= 3
