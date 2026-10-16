@@ -45,10 +45,14 @@ async function request(action) {
 }
 
 try {
-  await request('plan');
+  let report = await request('plan');
   if (apply) {
     for (const phase of ['copy', 'verify', 'cutover', 'purge', 'gc']) {
-      let report;
+      // Re-entering a completed phase would reset the next phase's saved cursor.
+      if ((phase === 'copy' && report.copy_done) ||
+          (phase === 'verify' && report.verify_done) ||
+          (phase === 'cutover' && report.backend === 's3') ||
+          (phase === 'purge' && report.purge_done)) continue;
       do { report = await request(phase); } while (!report.done);
     }
   }

@@ -23,6 +23,7 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 - 自動初期化は既存本文の一括コピー・削除を行わない。管理 API の `plan` / `status` は未設定状態を `d1` と報告する読み取り専用で維持する。旧本文の照合・切替・削除は既存の再開可能な移行処理を使う。
 - 標準 release Wasm（wasm-opt 込み）、Python 74 件（本文 SQL 17 件を含む）、実 Worker の既存本文移行・更新失敗・履歴・EPUB・purge・再起動と HTTP 契約 104 件、作者追跡 6 シナリオが成功。追加で未設定の新規ライブラリ、旧本文あり、S3 必須の明示 d1、S3 設定不正、初回 PUT 失敗と復旧の 5 ケースを隔離 D1 + S3 HTTP fixture で実行した。
 - develop 統合後、`tests/run.mjs --release` で更新した旧 D1 fixture の準備から実 Worker の起動・HTTP 契約 104 件・作者追跡 6 シナリオまで成功し、本文 SQL 17 件も再実行した。Worker の Wasm Clippy `-D warnings` も成功した。
+- 本文移行の保守スクリプトは `copy_done` / `verify_done` / `purge_done` と `backend` を見て完了済み段階を飛ばす。検証途中の再実行でコピーへ戻ってカーソルを消す不具合を、実 Worker の 5 参照・1 件検証済みからの再開で再現した（修正前は検証済みが 6 件へ増える）。修正後は 5 件で完了し、旧 D1 本文削除後の EPUB・全 S3 保存 smoke・HTTP 契約 104 件も成功した。
 
 ## 未リリース: R18 作者の全件列挙と Cookie 範囲
 

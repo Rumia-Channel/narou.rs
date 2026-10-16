@@ -418,6 +418,17 @@ min_interval: 0.01
   await epub();
   console.log('PASS uninitialized legacy libraries retain old EPUB/history while all new bodies go to S3');
 
+  await complete('copy');
+  const partialVerification = await phase('verify');
+  assert.equal(partialVerification.verified, 1);
+  assert.equal(partialVerification.verify_done, false);
+  await migrationCli(true);
+  const resumedMigration = await (await api('/api/admin/content-migration')).json();
+  assert.equal(resumedMigration.verified, scalar('SELECT COUNT(*) FROM content_objects'), 'resuming the CLI must continue verification without recounting completed objects');
+  assert.equal(resumedMigration.remaining_legacy, 0);
+  await epub();
+  console.log('PASS maintenance CLI resumes partial verification without rewinding completed work');
+
   await defaultLibrary('required', { required: true, marker: 'd1' });
   await verifyDefaultDownload();
   const requiredMode = await (await api('/api/storage/mode')).json();
