@@ -44,8 +44,10 @@ impl FetchPolicy {
         }
         headers.extend(setting.header_list());
         headers.retain(|(name, value)| is_safe_header_name(name) && is_safe_header_value(value));
-        let mut cookie_hosts = setting.login_cookie_hosts.clone();
+        let mut cookie_hosts = Vec::with_capacity(1 + setting.cookie_hosts.len() + setting.login_cookie_hosts.len());
         cookie_hosts.push(setting.domain.to_ascii_lowercase());
+        cookie_hosts.extend(setting.cookie_hosts.iter().filter(|host| !host.is_empty()).map(|host| host.to_ascii_lowercase()));
+        cookie_hosts.extend(setting.login_cookie_hosts.iter().cloned());
         Self {
             headers,
             cookie_hosts,
@@ -433,6 +435,9 @@ top_url: https://example.com
 sitename: Example
 toc_url: https://example.com/\k<ncode>
 cookie: session=canary
+cookie_hosts:
+  - AUTHORS.example.net
+  - ""
 headers:
   Referer: https://example.com/
 "#,
@@ -446,14 +451,20 @@ headers:
                 .iter()
                 .any(|(name, value)| name == "Cookie" && value == "session=canary")
         );
-        let off_site = policy.headers_for("https://collector.example.net/a.png");
-        assert!(
-            !off_site
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("cookie")),
-            "the cookie must stay on the site: {off_site:?}"
-        );
-        assert!(off_site.iter().any(|(name, _)| name == "Referer"));
+        let author_site = policy.headers_for("https://authors.example.net/list");
+        assert!(author_site.iter().any(|(name, value)| name == "Cookie" && value == "session=canary"));
+        for url in [
+            "https://collector.example.net/a.png",
+            "https://authors.example.net.attacker.test/a.png",
+            "https://collector.example.net./a.png",
+        ] {
+            let off_site = policy.headers_for(url);
+            assert!(
+                !off_site.iter().any(|(name, _)| name.eq_ignore_ascii_case("cookie")),
+                "the cookie must stay on declared hosts: {url}: {off_site:?}"
+            );
+            assert!(off_site.iter().any(|(name, _)| name == "Referer"));
+        }
     }
 
     #[test]

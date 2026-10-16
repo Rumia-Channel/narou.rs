@@ -17,6 +17,15 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 0.4.11 最終監査で確認したデータ保全の修正: SQLite のインプレース YAML 書き出しは meta の export_file_sha 指紋を原子的なファイル保存より前に記録し、失敗後の未編集の書き出し残骸を再取り込みしない。管理状態だけでなく database.yaml の作品レコードも対象。ユーザーの編集と narou-compat のファイル優先は維持する。S3 COPY は完全な CopyObjectResult と ETag/LastModified を確認できた場合だけ成功し、200 内 Error・破損応答では元オブジェクトを削除しない。実 HTTP の失敗／成功ケースと、書き出し失敗後の正常保存→再オープンを smoke で確認済み。
 指紋は既存の未編集 projection と次回公開予定を最大2件保持し、2回目が公開前に中断しても保護を失わない。指紋更新と公開は同一ファイルロック内。--out が実 .narou を指す場合も対象。最終 workspace 全 target は1342成功/0失敗/1ignored、Clippy 全 feature -D warnings・Rustdoc -D warnings・core/Worker wasm check 成功。Web CSRF 回帰 fixture は並行CWD変更に影響されない絶対パスへ修正し、HTTPの拒否/許可とキュー状態の検証内容は維持した。
 
+## 未リリース: R18 作者の全件列挙と Cookie 範囲
+
+- `SiteSetting::cookie_hosts` に Cookie 送信を許可する追加ホストを YAML で宣言し、共通 `FetchPolicy` が適用する。既定のサイト・保存ログインのホスト範囲は維持し、未宣言の第三者へ Cookie を送らない。R18 専用の Rust 分岐は追加しない。
+- `novel18.syosetu.com.yaml` を 2.5 に更新。作者プロフィールではなく `/mypage/novellist/xid/<x ID>/` を取得し、既存 DSL と `author_next_pattern` でページを辿る。作者用 `xmypage.syosetu.com` を Cookie 許可先に追加した。
+- `x1525cp` のプロフィールは最新 8 作品、全作品一覧は 10 + 2 の 12 作品。Cookie が無い応答で一覧を隠す回帰 fixture を追加し、実 Native CLI の登録・dry-run で全 12 URL を照合した。実作品のダウンロードはしていない。Native の downloader 回帰 172 件が成功。
+- Workers の `over18=false` は明示拒否で `Canceled` / `blocked` になるが、既存の汎用エラーは対話不能と表示する。許可は既存 Web UI「環境設定 → Global」の `over18` へ明示的に保存する。設定変更で既存の blocked ジョブを自動再投入しない。
+- 本番 D1 の読み取り調査では `content_backend` が未設定（= `d1`）、`content_objects` は 0 件で、本文・履歴はまだ旧 D1 に保存されていた。0.4.12 の配備だけでは新規本文も S3 にならない。本文のコピー・切替・削除は未実施で、画像の S3 選択と本文の切替は独立している。
+- 標準 release 設定の Wasm（wasm-opt 含む）を実行し、作者追跡 6 シナリオが成功。明示的な `over18=false` で同じ対象が blocked、Web 設定 API で true にした後は対話なしで取得成功し、単発作者取得は継続登録を作らないことも確認した。実 R18 作者は Worker HTTP API の dry-run でも全 12 URL が Native と一致した。検証プロセスと隔離 D1 は終了時に削除した。
+
 ## v0.4.12: Worker 本文・履歴の S3 保存
 
 - `worker_entry/src/content_store.rs` と `0011_content_objects.sql`。話単位の既存 YAML を共通 codec で圧縮し、S3 の不変な版へ PUT 後に D1 参照を公開する。現行本文と cache / .cache 両形式の履歴が対象。本文ストアの目次・参照読み取りは primary に揃える。CRC32・SHA-256・圧縮前後サイズを検証し、S3 の欠落・破損を旧 D1 への fallback で隠さない。native と挿絵の保存方式は変更しない。
