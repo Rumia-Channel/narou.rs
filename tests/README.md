@@ -96,3 +96,7 @@ After building the Worker, the author smoke can also run independently with
 `node tests/author_tracking.mjs`. Worker author management is exercised through
 the Web UI's HTTP APIs, without a native remote CLI. The local state is removed
 in `finally`; no production D1 or S3 is used.
+
+On Unix, each smoke-test Wrangler runs in its own process group; teardown stops
+the entire npx/Wrangler/workerd group. Windows uses `taskkill /T /F`.
+Successful checks must also exit and release their local fixture state.
