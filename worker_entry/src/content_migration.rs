@@ -165,7 +165,8 @@ async fn run(env: &Env, db: &DbHandle, token: &str, action: &str, limit: usize) 
         match action {
             "copy"=>{
                 if state.copy_done { state.done=true; return Ok(()); }
-                if mode==ContentBackend::D1 {
+                // S3-default initialization may already have selected migrating.
+                if mode==ContentBackend::D1 || state.planned==0 {
                     let counts=inventory(db).await?;
                     state.planned=counts.remaining_legacy; state.planned_bytes=counts.legacy_bytes;
                 }

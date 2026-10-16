@@ -425,6 +425,8 @@ min_interval: 0.01
   await migrationCli(true);
   const resumedMigration = await (await api('/api/admin/content-migration')).json();
   assert.equal(resumedMigration.verified, scalar('SELECT COUNT(*) FROM content_objects'), 'resuming the CLI must continue verification without recounting completed objects');
+  assert.equal(resumedMigration.planned, legacyPlan.planned, 'automatic migrating initialization must retain the legacy inventory count');
+  assert.equal(resumedMigration.planned_bytes, legacyPlan.planned_bytes);
   assert.equal(resumedMigration.remaining_legacy, 0);
   await epub();
   console.log('PASS maintenance CLI resumes partial verification without rewinding completed work');

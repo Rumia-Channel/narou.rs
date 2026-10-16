@@ -24,6 +24,7 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 - 標準 release Wasm（wasm-opt 込み）、Python 74 件（本文 SQL 17 件を含む）、実 Worker の既存本文移行・更新失敗・履歴・EPUB・purge・再起動と HTTP 契約 104 件、作者追跡 6 シナリオが成功。追加で未設定の新規ライブラリ、旧本文あり、S3 必須の明示 d1、S3 設定不正、初回 PUT 失敗と復旧の 5 ケースを隔離 D1 + S3 HTTP fixture で実行した。
 - develop 統合後、`tests/run.mjs --release` で更新した旧 D1 fixture の準備から実 Worker の起動・HTTP 契約 104 件・作者追跡 6 シナリオまで成功し、本文 SQL 17 件も再実行した。Worker の Wasm Clippy `-D warnings` も成功した。
 - 本文移行の保守スクリプトは `copy_done` / `verify_done` / `purge_done` と `backend` を見て完了済み段階を飛ばす。検証途中の再実行でコピーへ戻ってカーソルを消す不具合を、実 Worker の 5 参照・1 件検証済みからの再開で再現した（修正前は検証済みが 6 件へ増える）。修正後は 5 件で完了し、旧 D1 本文削除後の EPUB・全 S3 保存 smoke・HTTP 契約 104 件も成功した。
+- 自動初期化が先に `migrating` を保存した場合も、`copy` は予定件数が未記録なら旧本文の件数・圧縮前サイズを台帳へ記録する。旧本文 4 件と新規 S3 本文 1 件の実 Worker で予定件数が 0 になる失敗を再現し、修正後は予定 4 件・検証済み 5 件を再開・切替後も維持した。標準 release Wasm、Wasm Clippy `-D warnings`、全 S3 保存 smoke、HTTP 契約 104 件が成功した。
 
 ## 未リリース: R18 作者の全件列挙と Cookie 範囲
 
