@@ -771,6 +771,7 @@ narou setting name         # 読み取り
 - 設定保存は `webui.config.reload` を配信する。UI のテーブル・タグ更新は debounce / single-flight で合流し、古い応答を反映しない。Worker のキュー詳細は cursor で全ページを取得してから表示を交換する（既定 200 件／最大 1000 件、全体の待機・実行数を別に返す）。
 - 保存方式の読み取りが失敗した場合は不明／失敗として表示し、YAML と推定しない。Worker は D1 固定と表示し、切替操作を出さない。native の実際の方式切替だけが再起動を要求する。
 - Worker の本文・旧本文は、話単位の圧縮 S3 オブジェクトと D1 参照へ移行できる。`GET/POST /api/admin/content-migration` が `plan` / `copy` / `verify` / `cutover` / `purge` / `gc` / `status` を提供し、`scripts/migrate-worker-content.mjs` で CLI から再開可能な移行を実行する（既定は計画のみ、`--apply` で旧 D1 本文の削除まで実行）。本文用 `content_backend` と挿絵用 `asset_backend` は独立し、native の保存方式は変えない。
+- Worker は本文ストア初期化時、`content_backend` 未設定で旧本文が無ければ `s3`、旧本文・履歴があれば `migrating` を保存し、新しい本文を S3 に置く。明示的な `d1` は S3 必須でない環境だけで維持し、`NAROU_REQUIRE_S3=true` では同じ規則で移行開始する。S3 構成に成功してから状態を原子的に保存し、既存の `migrating` / `s3` を戻さない。一括コピー・照合・旧 D1 本文削除は引き続き管理 API で実行し、`plan` / `status` は読み取りだけである。
 - Worker の更新は旧本文を履歴へコピーしてから新本文を保存し、PUT 失敗でも現行本文を維持する。改題された話の旧ファイル名は新本文と目次の保存後に削除する。native の履歴移動は従来どおり。
 - Worker の本文分類はサブディレクトリ内の作品フォルダ名が `本文` でも、`toc.yaml` / `converter.yaml` / `.illustration_cache.yaml` を D1 に維持する。migration 0012 が既存 DB の移行対象ビューと書き込みガードも更新し、本文削除後の EPUB 生成・再起動を実 Worker で確認している。
 
@@ -1065,14 +1066,14 @@ S3 の改名同期は HTTP 200 だけでコピー成功としない。完全な 
 | `:select` | 選択肢から一つ | `device`: `kindle`, `kobo`, 等 |
 | `:multiple` | 選択肢から複数 (カンマ区切り) | `economy`: `cleanup_temp,send_delete` |
 
-### Worker の挿絵ストア確認
+### Worker の S3 ストア確認
 
 `GET /api/storage/mode` は管理方式 `sqlite` に加え、`metadata_backend=d1`、
 `illustration_backend=d1|s3`、本文用 `content_backend=d1|migrating|s3`、`content_migration_api`、`s3_required` を返す（既存の認証を適用）。
 `?probe=s3` は選択された S3 に上限 1 件の LIST を行い、`s3_list=ok|failed|not_selected`
 だけを返す。失敗は HTTP 503。キー、保存先設定、プロバイダーのエラー本文は返さない。
 HTTP 200 でも正しい `ListBucketResult` 外側要素を持たない本文は LIST 成功としない。
-CI の S3 必須配備では旧 D1 marker・未設定より挿絵の S3 指定を優先する。旧 D1 挿絵は移行・削除・代替参照しない。管理・目次・設定は D1、本文・履歴は独立した本文移行の状態に従う。設定不備や S3 要求失敗で D1 へ戻さず、配備後の実 LIST 成功も要求する。
+CI の S3 必須配備では旧 D1 marker・未設定より挿絵の S3 指定を優先する。旧 D1 挿絵は移行・削除・代替参照しない。本文も初期化時に旧 D1 本文の有無に応じて `migrating` / `s3` へ進め、新規本文を S3 に保存する。管理・目次・設定は D1 に維持する。設定不備や S3 要求失敗で D1 へ戻さず、配備後の実 LIST 成功も要求する。
 この確認は LIST 権限・接続の確認であり、挿絵の既存データ移行や GET/PUT の検証ではない。
 
 S3 の存在確認は `GET` + `Range: bytes=0-0` を使う。GET の署名は必須ヘッダのみで、

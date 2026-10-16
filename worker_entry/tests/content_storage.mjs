@@ -16,7 +16,7 @@ const npx = windows ? 'npx.cmd' : 'npx';
 mkdirSync(join(root, '.wrangler'), { recursive: true });
 const work = mkdtempSync(join(root, '.wrangler', 'content-smoke-'));
 const config = join(work, 'wrangler.toml');
-const persist = join(work, 'state');
+let persist = join(work, 'state');
 const token = 'isolated-content-smoke-token';
 const objects = new Map();
 let failPut = false;
@@ -216,14 +216,15 @@ try {
   const first = subtitle(1, '第一話'); const second = subtitle(2, '第二話');
   const section = (sub, body) => ({ ...sub, element: { data_type: 'html', introduction: '', body: `<p>${body.repeat(100)}</p>`, postscript: '' } });
   const firstKey = `${prefix}/本文/1 第一話.yaml`;
-  sql(`INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,general_all_no,length,use_subdirectory) VALUES (1,'Author','author','本文保存検証','本文保存検証','本文','https://example.com/n1234ab/','https://example.com/n1234ab/','Storage Smoke','storage smoke','2026-10-15T00:00:00Z','n1234ab','n1234ab',2,1000,1); UPDATE novel_id_sequence SET next_id=2;`
+  const legacyFixtureSql = `INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,general_all_no,length,use_subdirectory) VALUES (1,'Author','author','本文保存検証','本文保存検証','本文','https://example.com/n1234ab/','https://example.com/n1234ab/','Storage Smoke','storage smoke','2026-10-15T00:00:00Z','n1234ab','n1234ab',2,1000,1); UPDATE novel_id_sequence SET next_id=2;`
     + objectInsert(`${prefix}/toc.yaml`, { title: '本文保存検証', author: 'Author', toc_url: 'https://example.com/n1234ab/', story: '', subtitles: [first, second], novel_type: 1 })
     + objectInsert(firstKey, section(first, '初版本文がここにあります。'))
     + objectInsert(`${prefix}/本文/2 第二話.yaml`, section(second, '第二話の本文です。'))
     + objectInsert(`${prefix}/本文/cache/old/1 第一話.yaml`, section(first, '変更前の旧版本文。'))
     + objectInsert(`${prefix}/本文/.cache/legacy/1 点付き旧話.yaml`, section(subtitle(1, '点付き旧話'), '点付きキャッシュの旧本文。'))
     + objectInsert(`${prefix}/setting.ini`, '') + objectInsert(`${prefix}/replace.txt`, '')
-    + objectInsert(`${prefix}/converter.yaml`, {}) + objectInsert(`${prefix}/.illustration_cache.yaml`, {}));
+    + objectInsert(`${prefix}/converter.yaml`, {}) + objectInsert(`${prefix}/.illustration_cache.yaml`, {});
+  sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','\"d1\"','d1');" + legacyFixtureSql);
   await start();
   assert.equal((await fetch(`http://127.0.0.1:${port}/api/admin/content-migration`, { headers: { Connection: 'close' } })).status, 401);
   await migrationCli();
@@ -361,6 +362,91 @@ min_interval: 0.01
     const [code] = await once(contract, 'exit');
     assert.equal(code, 0, 'existing Worker HTTP contracts must also pass after S3 cutover');
   }
+
+  async function defaultLibrary(name, { required = false, marker, legacy = false, invalidEndpoint = false } = {}) {
+    await stop();
+    persist = join(work, `default-${name}`);
+    let source = toml.replace('[vars]', `[vars]\nNAROU_REQUIRE_S3 = "${required}"`);
+    if (invalidEndpoint) source = source.replace(/^S3_ENDPOINT = .*$/m, 'S3_ENDPOINT = "not-a-url"');
+    writeFileSync(config, source);
+    run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
+    if (marker !== undefined) sql(`INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend',${quote(JSON.stringify(marker))},${quote(marker)});`);
+    if (legacy) sql(legacyFixtureSql);
+    failPut = false; sourceGeneration = 1; sourceSubtitle = '第一話';
+    await start();
+  }
+  async function installDefaultSource() {
+    const result = await (await api('/api/sites/localhost.yaml', definition, 'PUT')).json();
+    assert(result.success, JSON.stringify(result));
+  }
+  async function verifyDefaultDownload() {
+    await installDefaultSource();
+    await download(target, false);
+    const ref = sql("SELECT object_key,blob_key,encoding,sha256 FROM content_objects WHERE instr(object_key,'/smoke-novel')>0 AND instr(object_key,'/cache/')=0")[0].results[0];
+    const stored = objects.get(`/narou-local/narou/local/${ref.blob_key}`);
+    const bytes = ref.encoding === 'brotli' ? brotliDecompressSync(stored) : stored;
+    assert.equal(createHash('sha256').update(bytes).digest('hex'), ref.sha256);
+    assert(bytes.toString('utf8').includes('初回取得の本文です。'.repeat(100)), 'new default must retain the actual episode in S3');
+    const id = scalar("SELECT id FROM novels WHERE ncode='smoke-novel'");
+    const response = await api(`/api/novels/${id}/download.epub`);
+    assert.equal(response.status, 200, await response.clone().text());
+    assert(epubText(Buffer.from(await response.arrayBuffer())).includes('初回取得の本文です。'));
+    return id;
+  }
+
+  await defaultLibrary('fresh');
+  const freshPlan = await phase('plan');
+  assert.equal(freshPlan.remaining_legacy, 0);
+  assert.equal(scalar("SELECT COUNT(*) FROM app_state WHERE scope='inv' AND key='content_backend'"), 0, 'plan must not initialize a backend');
+  const freshId = await verifyDefaultDownload();
+  assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 0);
+  assert.equal((await (await api('/api/storage/mode')).json()).content_backend, 's3');
+  await stop(); await start();
+  const restarted = await api(`/api/novels/${freshId}/download.epub`);
+  assert.equal(restarted.status, 200, await restarted.clone().text());
+  assert(epubText(Buffer.from(await restarted.arrayBuffer())).includes('初回取得の本文です。'));
+  console.log('PASS fresh uninitialized libraries store episodes in S3 and remain readable after restart');
+
+  await defaultLibrary('legacy', { legacy: true });
+  const legacyPlan = await phase('plan');
+  assert.equal(legacyPlan.backend, 'd1');
+  assert.equal(scalar("SELECT COUNT(*) FROM app_state WHERE scope='inv' AND key='content_backend'"), 0, 'legacy plan must be read-only');
+  await epub();
+  assert.equal((await (await api('/api/storage/mode')).json()).content_backend, 'migrating');
+  await verifyDefaultDownload();
+  assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 4, 'automatic initialization must not delete uncopied old bodies/history');
+  await epub();
+  console.log('PASS uninitialized legacy libraries retain old EPUB/history while all new bodies go to S3');
+
+  await defaultLibrary('required', { required: true, marker: 'd1' });
+  await verifyDefaultDownload();
+  const requiredMode = await (await api('/api/storage/mode')).json();
+  assert.equal(requiredMode.content_backend, 's3');
+  assert.equal(requiredMode.illustration_backend, 's3');
+  assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 0);
+  console.log('PASS required-S3 deployments promote an explicit d1 marker instead of continuing D1 writes');
+
+  await defaultLibrary('invalid-config', { invalidEndpoint: true });
+  const unavailable = await api('/api/storage/mode');
+  assert.equal(unavailable.status, 503);
+  assert.equal((await unavailable.json()).error.code, 'storage_configuration_unavailable');
+  assert.equal(scalar("SELECT COUNT(*) FROM app_state WHERE scope='inv' AND key='content_backend'"), 0, 'invalid S3 configuration must not mutate the marker');
+  assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 0);
+  console.log('PASS invalid S3 configuration fails closed without initializing a misleading backend');
+
+  await defaultLibrary('put-failure');
+  await installDefaultSource();
+  failPut = true;
+  await download(target, false, true);
+  assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 0, 'failed S3 PUT must not store the episode in D1');
+  assert.equal(scalar('SELECT COUNT(*) FROM content_objects'), 0, 'failed S3 PUT cannot publish a reference');
+  assert.equal(JSON.parse(scalar("SELECT value_json FROM app_state WHERE scope='inv' AND key='content_backend'")), 's3');
+  failPut = false;
+  const cleared = await (await api('/api/queue/cancel', {})).json();
+  assert(cleared.success, JSON.stringify(cleared));
+  await verifyDefaultDownload();
+  assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 0);
+  console.log('PASS failed initial PUT never falls back to D1 and the same download recovers on S3');
 } catch (error) {
   console.error(error);
   console.error(logs);

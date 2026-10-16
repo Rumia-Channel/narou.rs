@@ -35,6 +35,57 @@ class ContentStorageSqlTests(unittest.TestCase):
         self.db.execute(SQL['QUEUE_PREVIOUS'], values)
         self.db.execute(SQL['PUBLISH'], values)
         self.db.execute('DELETE FROM content_garbage WHERE blob_key=? AND EXISTS(SELECT 1 FROM content_objects WHERE blob_key=?)', (blob, blob))
+
+    def initialize(self, required=False):
+        return self.db.execute(SQL['INITIALIZE_S3_DEFAULT'], (int(required),)).fetchall()
+
+    def stored_mode(self):
+        return json.loads(self.db.execute("SELECT value_json FROM app_state WHERE scope='inv' AND key='content_backend'").fetchone()[0])
+
+    def test_default_without_bodies_uses_s3_and_keeps_root_metadata(self):
+        metadata = 'novels/site/本文/本文/toc.yaml'
+        self.legacy(metadata)
+        self.initialize()
+        self.assertEqual(self.stored_mode(), 's3')
+        self.assertEqual(bytes(self.db.execute('SELECT data FROM objects WHERE object_key=?', (metadata,)).fetchone()[0]), b'old')
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.legacy()
+
+    def test_default_with_legacy_current_and_histories_preserves_reads_and_guards_writes(self):
+        keys = (BODY, HISTORY, HISTORY.replace('/cache/', '/.cache/'))
+        for key in keys:
+            self.legacy(key)
+        self.initialize()
+        self.assertEqual(self.stored_mode(), 'migrating')
+        self.assertEqual({row[0]: bytes(row[1]) for row in self.db.execute('SELECT object_key,data FROM legacy_content_objects')}, {key: b'old' for key in keys})
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.legacy(BODY.replace('1 第一話', '2 第二話'))
+        self.initialize(required=True)
+        self.assertEqual(self.stored_mode(), 'migrating')
+
+    def test_explicit_d1_optout_is_only_kept_when_s3_is_not_required(self):
+        self.mode('d1')
+        self.initialize()
+        self.assertEqual(self.stored_mode(), 'd1')
+        self.legacy()
+        self.initialize(required=True)
+        self.assertEqual(self.stored_mode(), 'migrating')
+        self.assertEqual(bytes(self.db.execute('SELECT data FROM objects WHERE object_key=?', (BODY,)).fetchone()[0]), b'old')
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.legacy(HISTORY)
+
+    def test_required_s3_promotes_raw_d1_marker_without_legacy_bodies(self):
+        self.db.execute("INSERT INTO app_state(scope,key,value_json) VALUES ('inv','content_backend','d1')")
+        self.initialize(required=True)
+        self.assertEqual(self.stored_mode(), 's3')
+
+    def test_s3_state_does_not_downgrade_when_verified_legacy_is_retained(self):
+        self.legacy()
+        self.mode('s3')
+        self.initialize(required=True)
+        self.assertEqual(self.stored_mode(), 's3')
+        self.assertEqual(bytes(self.db.execute('SELECT data FROM objects WHERE object_key=?', (BODY,)).fetchone()[0]), b'old')
+
     def test_transition_guards_late_legacy_writes_but_not_metadata(self):
         self.legacy()
         self.mode('migrating')
