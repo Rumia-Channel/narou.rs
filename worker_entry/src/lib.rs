@@ -6,6 +6,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 mod budget;
+mod authors;
 mod bundled_sites;
 mod composition;
 mod content_store;
@@ -118,6 +119,7 @@ async fn route(req: Request, env: Env) -> Result<Response> {
         // Cookie の直接登録 (set/add) は廃止: 取り込みとブラウザ取得だけが
         // 登録経路 (native `src/web/mod.rs` と同じルート構成)。
         "/api/jobs" => api_jobs(req, env).await,
+        "/api/authors" | "/api/authors/check" => authors::handle(req, env).await,
         "/api/global_setting" => global_settings::api_global_setting(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,
         "/api/admin/content-migration" => content_migration::handle(req, env).await,
@@ -1319,11 +1321,18 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
             ids.push(outcome.job_id.clone());
         }
     }
+    let author_ids = if request.kind == narou_rs::application::JobKind::Update && !plans.is_empty() {
+        match runtime.enqueue_author_checks(true).await {
+            Ok(jobs) => jobs.into_iter().map(|job| job.job_id).collect::<Vec<_>>(),
+            Err(error) => return Response::error(format!("author check enqueue failed: {error}"), 502),
+        }
+    } else { Vec::new() };
     Response::from_json(&json!({
         "ids": ids,
         "invalid": invalid,
         "duplicates": duplicates,
         "blocked": blocked,
+        "author_ids": author_ids,
     }))
 }
 

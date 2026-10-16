@@ -78,3 +78,21 @@ These cover independent attempts and peers, cancellation/reconnect tombstones,
 unknown TOC totals and cyclic pagination, and tag aggregation across a 31-episode
 series. The update case changes only a later-page tag, keeps manual tags, and
 does not download unchanged section bodies.
+
+## Persistent author tracking
+
+```sh
+python -m unittest discover -s worker_entry/tests -p 'test_author_tracking_sql.py'
+cd worker_entry
+node tests/run.mjs
+```
+
+The Worker runner builds the actual Wasm and assets, runs the HTTP contracts, then
+`tests/author_tracking.mjs` against isolated local D1 and a controlled HTTP author source.
+It covers registration across restart, discovery on empty-library updates and scheduled
+events, known-work exclusion, automatic-disable/manual-check behavior, and removal during
+an in-flight check without deleting novels. One-shot author downloads remain untracked.
+After building the Worker, the author smoke can also run independently. Set
+`NAROU_AUTHOR_CLI` to an absolute native binary path to include real remote CLI
+add/list/check/dry-run/numbered-remove from outside a library. The local state is removed
+in `finally`; no production D1 or S3 is used.

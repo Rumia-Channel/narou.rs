@@ -26,6 +26,7 @@ use crate::platform::{NovelId, PlatformFuture};
 pub enum JobKind {
     Download,
     Update,
+    AuthorCheck,
     Convert,
     AutoUpdate,
     Send,
@@ -39,6 +40,7 @@ impl JobKind {
         match self {
             Self::Download => "download",
             Self::Update => "update",
+            Self::AuthorCheck => "author_check",
             Self::Convert => "convert",
             Self::AutoUpdate => "auto_update",
             Self::Send => "send",
@@ -52,6 +54,7 @@ impl JobKind {
         match value {
             "download" => Some(Self::Download),
             "update" => Some(Self::Update),
+            "author_check" => Some(Self::AuthorCheck),
             "convert" => Some(Self::Convert),
             "auto_update" => Some(Self::AutoUpdate),
             "send" => Some(Self::Send),
@@ -69,7 +72,7 @@ impl JobKind {
     pub fn is_worker_executable(self) -> bool {
         // Convert は保存済みの TOC と本文から変換テキストを組むだけで、
         // 外部プロセスを使わない (`ConvertService`)。
-        matches!(self, Self::Download | Self::Update | Self::Convert)
+        matches!(self, Self::Download | Self::Update | Self::Convert | Self::AuthorCheck)
     }
 }
 

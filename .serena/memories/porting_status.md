@@ -26,6 +26,15 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 - 標準 release 設定の Worker ビルド（wasm-opt 込み）と、native の既存 cache 回帰 1 件も成功。ローカルではコンパイラ並列数を 1 に抑え、native の C archive は LLVM、テストの debug 情報は無効にして検証した（リポジトリ設定の変更なし）。
 - サブディレクトリありで作品フォルダ名が `本文` の場合の目次誤分類を修正。`ContentStore::is_content_key` と `0012_content_metadata_boundary.sql` が `toc.yaml` / `converter.yaml` / `.illustration_cache.yaml` を D1 に残す。SQL の誤分類と、S3 切替後の実 EPUB が TOC 不在で失敗することを failing-before で再現し、修正後は同じ構成で purge・EPUB・再起動・既存 HTTP 契約まで成功。
 
+## 未リリース: 作者の継続追跡・管理
+
+- `application::authors` の `AuthorStore` / `AuthorService` と portable `author` codec を共通境界にした。Native は Inventory の原子更新、Workers は primary D1 `app_state('inv','author')` の全 JSON スナップショット CAS。作者 URL → サイト名だけを保存し、小説の作者表示名とは区別する。
+- Workers の更新 API・Update 投入・定期更新の最終ページから `author_check` を投入し、既存の実効 YAML / Cookie / 待機を使って新作だけを通常 Download ジョブへ流す。登録済み作品は `contains_toc_urls` の bounded primary 索引検索で除外する。小説 0 件でも動作し、自動停止設定は手動チェックを止めない。解除済みジョブと取得中の解除を再確認するが、投入済み通常 Download はキャンセルしない。
+- Native / Workers 共通の「環境設定 → 作者」で登録・一覧・解除・手動確認。`GET/POST/DELETE /api/authors` と `POST /api/authors/check`。Native CLI の 0 番削除を拒否し、`author --server <URL>` でライブラリ外から Workers を操作できる。認証は環境変数の admin / Access token。通常の作者 URL ダウンロードは単発のまま。
+- 実 Worker + 隔離 D1 + 制御した HTTP origin で再起動後の登録、新作の継続取得、既知作品の除外、停止設定、dry-run、手動チェック、実 scheduled handler、取得中の解除、古いジョブのスキップ、全 remote CLI 操作を確認。Firefox で Native / Workers の作者タブから登録・解除し、永続 API 状態を確認した。Worker の取得済み 6 作品は解除後も残る。
+- Native は実 CLI の YAML 登録 → SQLite 移行、CLI / Web 双方向の一覧・解除、空ライブラリの CLI / Web 更新からの作者確認を実行し、WebSocket の実出力も確認。ユーザーの今回の許可により repo 内 TempDir を使用し、検証ライブラリ・プロセス・一時ソースを削除した。本番 D1 / S3 のデータ操作はしていない。
+- 検証: Native 既定全 target 1331 成功、Native + Lite は単一テストスレッドで 1347 成功（どちらも参照 fixture 1 件 ignored）。Lite の並列全件実行はタイムアウトし、原因は未特定。Native + Lite / Worker の Clippy `-D warnings` と標準 release Wasm ビルド、Python 69 件、S3 保存・移行・EPUB の実 smoke と切替後 HTTP 契約 104 件が成功。既存の SQL ファイル複製を byte 比較するテストは削除し、移行後データ保全の実動作テストは維持した。
+
 ## 過去の記録（以下は現況ではない）
 
 最新の正本はリポジトリの `AGENTS.md` と `COMMANDS.md`。古い日付の監査表ではなく、各コマンドの当該節と実装を確認する。

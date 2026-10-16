@@ -596,6 +596,34 @@ impl WorkerRuntime {
         self.write_objects.clone()
     }
 
+    pub fn author_service(&self) -> narou_rs::application::authors::AuthorService {
+        crate::authors::service(self.write_db.clone())
+    }
+
+    pub async fn author_work_urls(&self, url: &str) -> Result<Vec<String>> {
+        let sites = crate::bundled_sites::load_site_settings_uncached(&self.write_objects).await?;
+        let expander = narou_rs::application::download_targets::DownloadTargetExpander::new(
+            self.http.as_ref(), self.rate_limiter.as_ref(), &sites,
+        ).with_cookie_store(Some(&*self.cookie_store));
+        narou_rs::application::authors::new_work_urls(url, &expander, &sites, self.novels.as_ref()).await
+    }
+
+    pub async fn enqueue_author_checks(&self, automatic: bool) -> Result<Vec<DispatchOutcome>> {
+        if automatic {
+            let values = self.write_services.settings.get_many(&["update.disabled-author-tracking"]).await
+                .map_err(|error| NarouError::Platform(error.to_string()))?;
+            if values.first().and_then(Option::as_ref).and_then(narou_rs::setting_core::setting_bool_value).unwrap_or(false) {
+                return Ok(Vec::new());
+            }
+        }
+        let plans = self.author_service().list().await?.into_iter().map(|author| {
+            let target = JobTarget::parse(&author.url).filter(|target| matches!(target, JobTarget::Url(_)))
+                .ok_or_else(|| NarouError::InvalidTarget(format!("登録中の作者 URL が不正です: {}", author.url)))?;
+            Ok(JobPlan { kind: JobKind::AuthorCheck, target, options: Vec::new() })
+        }).collect::<Result<Vec<_>>>()?;
+        self.enqueue_batch(&plans).await
+    }
+
 
     /// Expand before writing any ledger rows, preserving input groups for the
     /// Web UI response. UI composition skips site loading, so load the current
