@@ -252,7 +252,6 @@ fn is_worker_ineffective(name: &str) -> bool {
         "self-update.variant",
         "sqlite.mirror-files",
         "time-zone",
-        "update.disabled-author-tracking",
         "update.max-parallel-domains",
     ];
     if name.strip_prefix("default.").or_else(|| name.strip_prefix("force.")) == Some("enable_inspect") {

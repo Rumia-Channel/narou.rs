@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod authors;
 pub mod sites;
 pub mod feature_tour;
 pub mod frontend;
@@ -575,6 +576,8 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/login", get(login::login_status))
         .route("/api/login", delete(login::login_clear_all))
+        .route("/api/authors", get(authors::list).post(authors::add).delete(authors::remove))
+        .route("/api/authors/check", post(authors::check))
         .route("/api/login/import", post(login::login_import))
         .route("/api/login/rename", post(login::login_rename))
         .route("/api/login/order", post(login::login_order))

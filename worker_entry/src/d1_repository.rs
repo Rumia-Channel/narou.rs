@@ -27,6 +27,12 @@ use crate::db_handle::DbHandle;
 /// `novel_codec::MAX_EXTRA_FIELDS_BYTES`; keep the historical D1 cap.
 const MAX_EXTRA_FIELDS_BYTES: usize = 1_900_000;
 
+pub(crate) const KNOWN_TOC_URLS: &str = r#"
+SELECT CAST(j.key AS INTEGER) AS position,
+       EXISTS(SELECT 1 FROM novels WHERE toc_url_fold=j.value) AS known
+FROM json_each(?1) AS j ORDER BY CAST(j.key AS INTEGER)
+"#;
+
 #[derive(Debug, Clone)]
 pub struct D1NovelRepository {
     db: DbHandle,
@@ -74,6 +80,26 @@ impl NovelRepository for D1NovelRepository {
         let folded = fold(url);
         Box::pin(async move {
             self.one(&select_by_toc_url_sql(), vec![BindValue::Text(folded)]).await
+        })
+    }
+
+    fn contains_toc_urls<'a>(&'a self, urls: &'a [String]) -> PlatformFuture<'a, Result<Vec<bool>>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Membership { position: usize, known: i64 }
+            let db = self.db.primary_view();
+            let mut known = Vec::with_capacity(urls.len());
+            for chunk in urls.chunks(100) {
+                let folded: Vec<String> = chunk.iter().map(|url| fold(url)).collect();
+                let encoded = serde_json::to_string(&folded).map_err(|error| NarouError::Platform(error.to_string()))?;
+                let rows = db.prepare(KNOWN_TOC_URLS).bind(&[encoded.into()]).map_err(worker_error)?
+                    .all().await.map_err(worker_error)?.results::<Membership>().map_err(worker_error)?;
+                if rows.len() != chunk.len() || rows.iter().enumerate().any(|(index, row)| row.position != index) {
+                    return Err(NarouError::Platform("invalid URL membership result".into()));
+                }
+                known.extend(rows.into_iter().map(|row| row.known != 0));
+            }
+            Ok(known)
         })
     }
 

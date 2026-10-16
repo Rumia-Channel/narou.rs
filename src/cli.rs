@@ -38,6 +38,11 @@ pub struct GlobalFlags {
     pub user_agent: Option<String>,
 }
 
+pub fn remote_author_requested(args: &[String]) -> bool {
+    args.first().is_some_and(|arg| arg == "author")
+        && args.iter().take_while(|arg| arg.as_str() != "--").any(|arg| arg == "--server" || arg.starts_with("--server="))
+}
+
 pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
     let mut flags = GlobalFlags {
         no_color: false,
@@ -105,6 +110,7 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
     if !narou_rs::db::narou_root_exists()
         && let Some(name) = args.first()
         && !matches!(name.as_str(), "help" | "version" | "init")
+        && !remote_author_requested(args)
     {
         args[0] = "help".to_string();
     }
@@ -129,7 +135,7 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
         expand_diff_short_number_options(args);
     }
 
-    if !flags.no_color {
+    if !flags.no_color && !remote_author_requested(args) {
         flags.no_color = load_global_no_color();
     }
 
@@ -968,7 +974,11 @@ pub enum Commands {
         more: bool,
     },
     /// Authors whose works are tracked (add/list/remove/check).
+    #[command(after_help = "Examples:\n  narou author add https://mypage.syosetu.com/2842627/\n  narou author list\n  narou author remove 1\n  narou author --server https://worker.example list\n  narou author --server https://worker.example remove 1")]
     Author {
+        /// Manage a remote Worker (NAROU_ADMIN_TOKEN / CF_ACCESS_* credentials).
+        #[arg(long, global = true, value_name = "URL")]
+        server: Option<String>,
         #[command(subcommand)]
         action: crate::commands::author::AuthorAction,
     },

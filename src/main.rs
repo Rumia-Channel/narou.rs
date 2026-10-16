@@ -224,12 +224,12 @@ async fn main() {
 
     install_panic_hook();
 
-    logger::init();
+    if !cli::remote_author_requested(&args) { logger::init(); }
     logger::init_tracing(no_color);
 
     let trace_args = args.clone();
 
-    if !args.is_empty() {
+    if !args.is_empty() && !cli::remote_author_requested(&args) {
         cli::inject_default_args(&mut args);
         cli::inject_command_defaults(&mut args);
     }
@@ -243,7 +243,7 @@ async fn main() {
 
     // 0.4.0 未満からのアップデート後の初回起動では、小説データの
     // 一括バックアップを提案する (web/help/version 等では出さない)。
-    narou_rs::startup_backup::maybe_offer(&args[0]);
+    if !cli::remote_author_requested(&args) { narou_rs::startup_backup::maybe_offer(&args[0]); }
 
     let start = if show_time {
         Some(Instant::now())
@@ -295,6 +295,10 @@ async fn run_command(
     let cli = match Cli::try_parse_from(std::iter::once("narou".to_string()).chain(args)) {
         Ok(cli) => cli,
         Err(e) => {
+            if matches!(e.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
+                logger::without_logging(|| print!("{e}"));
+                return 0;
+            }
             if let Some(message) = cli::parse_error_message(&e) {
                 commands::log::report_error(&message);
                 return 127;
@@ -317,7 +321,7 @@ async fn run_command(
     // サイト定義は保存方式に応じて読み込む（SQLite モードではオブジェクトストア）。
     // 未初期化のディレクトリ (.narou/ が無い) には読み込む対象が無いので、警告を
     // 出さずに飛ばす。init はこの後で .narou/ を作る。
-    if narou_rs::db::narou_root_exists()
+    if !matches!(&cli.command, Commands::Author { server: Some(_), .. }) && narou_rs::db::narou_root_exists()
         && let Err(error) =
             narou_rs::native::site_definitions::install_effective_site_settings().await
     {
@@ -333,7 +337,7 @@ async fn run_command(
             commands::web::run_web_server(port, no_browser, hide_console).await;
             0
         }
-        Commands::Author { action } => match commands::author::cmd_author(action).await {
+        Commands::Author { action, server } => match commands::author::cmd_author(action, server.as_deref()).await {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("{}", e);

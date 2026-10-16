@@ -229,6 +229,7 @@ pub async fn plan_auto_update(runtime: &WorkerRuntime, _probe_generation: u64) -
     })?;
     let done = plan_page(runtime, &mut checkpoint).await?;
     if done {
+        runtime.enqueue_author_checks(true).await?;
         checkpoint = checkpoint.finish(&runtime.now_rfc3339());
     }
     runtime

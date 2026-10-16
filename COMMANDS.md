@@ -270,20 +270,37 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 ### 3.x `author` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
 
-作者ページを登録しておくと、`narou update` の後段で毎回その作者を確認し、**まだ管理していない作品**を通常のダウンロード経路で追加する。
+作者ページを登録しておくと、**まだ管理していない作品**を通常のダウンロード経路で追加する。Native は `narou update` の後段、Workers は更新 API と定期実行から継続して確認する。小説がまだ 0 件のライブラリも対象になる。
 
 | サブコマンド | 内容 |
 |---|---|
 | `add <URL>` | 作者ページを登録。`author_url` に一致するサイト定義が必要 |
 | `list` | 登録済みの作者（サイト / ページ URL） |
-| `remove <URL\|番号>` | `list` の番号か URL で解除 |
-| `check` | いま全作者を確認して新規作品を追加（`update` と同じ処理） |
+| `remove <URL\|番号>` | `list` の 1 始まりの番号か URL で追跡解除。0 は拒否し、取得済み作品は削除しない |
+| `check [--dry-run]` | 全作者を確認。Native は新作を取得し、リモート Workers は確認ジョブを投入する。`--dry-run` は追加予定の URL だけを表示し、取得しない |
 
-**保存形式**: 小説とは別の inventory `author`（SQLite `app_state` / `.narou/author.yaml`）に、**作者ページ URL（ユニーク）→ サイト名** だけを持つ。名前や日時などの帳簿は持たない。
+**保存形式**: 小説とは別の inventory `author`（Native は SQLite `app_state` / `.narou/author.yaml`、Workers は D1 の `app_state(scope='inv', key='author')`）に、**作者ページ URL（ユニーク）→ サイト名** だけを持つ。名前や日時などの帳簿は持たない。登録・解除は Native の Inventory 原子更新、Workers の全スナップショット CAS で保存し、別の登録操作を上書きしない。
 
 **サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧の取得先の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）/ `author_next_pattern`（ページ分けされた一覧の次ページ。ハーメルンで使用。終了は次ページが無いか訪問済みに戻ったとき）。
 
 **共通取得**: `author add/check` も現在の実効サイト定義を使う。作品一覧の取得・認証・シリーズ所属作品の除外は CLI / Worker の単発 URL 展開と共通。offset 型 API は `author_page_url` / `author_page_size` / `author_page_total_pattern` / `author_page_max_start` でページ送りする。なろう API の公式開始位置上限を越える場合や総件数に届かない場合は、途中までの一覧を成功扱いしない。
+
+**Workers の継続追跡**: `/api/update` と Update ジョブの投入、および定期更新の最終ページから、作者ごとの `author_check` ジョブを投入する。実効サイト定義・Cookie・待機ポリシーは単発取得と共通で、登録済み作品は TOC URL の索引で除外する。`update.disabled-author-tracking=true` で自動確認を止められるが、明示的な `check` は実行できる。解除済み作者の古い確認ジョブはスキップし、一覧取得後も登録を再確認する。すでに通常の Download ジョブとして投入された作品は、作者の解除だけではキャンセルしない。
+
+**リモート CLI**: `narou author --server <Worker のベース URL> add|list|remove|check`。ローカルの `.narou/` は不要で、サーバー側の追跡一覧を操作する。認証は環境変数 `NAROU_ADMIN_TOKEN`、Cloudflare Access の service token が必要なら `CF_ACCESS_CLIENT_ID` と `CF_ACCESS_CLIENT_SECRET` の両方を使う。資格情報をコマンド引数へ置かず、ログインページなどへのリダイレクトには追従しない。通常の `check` の成功はジョブ受付であり、取得完了の通知ではない。
+
+```sh
+narou author list
+narou author remove 1
+narou author --server https://worker.example add https://mypage.syosetu.com/2842627/
+narou author --server https://worker.example list
+narou author --server https://worker.example check --dry-run
+narou author --server https://worker.example remove 1
+```
+
+**Web UI / API**: Native・Workers 共通で「環境設定 → 作者」から登録・一覧確認・追跡解除・今すぐ確認ができる。このタブは即時保存で、「設定を保存」は不要。`GET /api/authors` は `{success, authors:[{site,url}]}`、`POST /api/authors` と `DELETE /api/authors` は本文 `{url}`、`POST /api/authors/check` は `{dry_run}` を受け付ける。
+
+**単発取得との区別**: 通常のダウンロード欄や `download` に作者 URL を入れる操作は、その時点の作品一覧の取得だけであり、追跡登録は増やさない。継続追跡には `author add` または作者タブでの登録が必要。
 
 ---
 
