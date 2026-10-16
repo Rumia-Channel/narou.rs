@@ -14,9 +14,6 @@ use narou_rs::error::{NarouError, Result};
 
 use crate::commands::download::{self, DownloadOptions};
 
-#[path = "author_remote.rs"]
-mod remote;
-
 /// Subcommands of `narou author`.
 #[derive(clap::Subcommand, Debug)]
 pub enum AuthorAction {
@@ -41,8 +38,7 @@ pub enum AuthorAction {
 }
 
 /// Run `narou author`.
-pub async fn cmd_author(action: AuthorAction, server: Option<&str>) -> Result<()> {
-    if let Some(server) = server { return remote::run(action, server).await; }
+pub async fn cmd_author(action: AuthorAction) -> Result<()> {
     match action {
         AuthorAction::Add { url } => add(&url),
         AuthorAction::List => list(),

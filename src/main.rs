@@ -224,12 +224,12 @@ async fn main() {
 
     install_panic_hook();
 
-    if !cli::remote_author_requested(&args) { logger::init(); }
+    logger::init();
     logger::init_tracing(no_color);
 
     let trace_args = args.clone();
 
-    if !args.is_empty() && !cli::remote_author_requested(&args) {
+    if !args.is_empty() {
         cli::inject_default_args(&mut args);
         cli::inject_command_defaults(&mut args);
     }
@@ -243,7 +243,7 @@ async fn main() {
 
     // 0.4.0 未満からのアップデート後の初回起動では、小説データの
     // 一括バックアップを提案する (web/help/version 等では出さない)。
-    if !cli::remote_author_requested(&args) { narou_rs::startup_backup::maybe_offer(&args[0]); }
+    narou_rs::startup_backup::maybe_offer(&args[0]);
 
     let start = if show_time {
         Some(Instant::now())
@@ -321,7 +321,7 @@ async fn run_command(
     // サイト定義は保存方式に応じて読み込む（SQLite モードではオブジェクトストア）。
     // 未初期化のディレクトリ (.narou/ が無い) には読み込む対象が無いので、警告を
     // 出さずに飛ばす。init はこの後で .narou/ を作る。
-    if !matches!(&cli.command, Commands::Author { server: Some(_), .. }) && narou_rs::db::narou_root_exists()
+    if narou_rs::db::narou_root_exists()
         && let Err(error) =
             narou_rs::native::site_definitions::install_effective_site_settings().await
     {
@@ -337,7 +337,7 @@ async fn run_command(
             commands::web::run_web_server(port, no_browser, hide_console).await;
             0
         }
-        Commands::Author { action, server } => match commands::author::cmd_author(action, server.as_deref()).await {
+        Commands::Author { action } => match commands::author::cmd_author(action).await {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("{}", e);
