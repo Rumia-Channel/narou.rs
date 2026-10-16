@@ -92,7 +92,7 @@ The Worker runner builds the actual Wasm and assets, runs the HTTP contracts, th
 It covers registration across restart, discovery on empty-library updates and scheduled
 events, known-work exclusion, automatic-disable/manual-check behavior, and removal during
 an in-flight check without deleting novels. One-shot author downloads remain untracked.
-After building the Worker, the author smoke can also run independently. Set
-`NAROU_AUTHOR_CLI` to an absolute native binary path to include real remote CLI
-add/list/check/dry-run/numbered-remove from outside a library. The local state is removed
+After building the Worker, the author smoke can also run independently with
+`node tests/author_tracking.mjs`. Worker author management is exercised through
+the Web UI's HTTP APIs, without a native remote CLI. The local state is removed
 in `finally`; no production D1 or S3 is used.

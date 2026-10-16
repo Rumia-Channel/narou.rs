@@ -521,7 +521,7 @@ Browser ──► Worker (fetch)
 - `/api/update`、汎用 Update ジョブの投入、定期更新の最終ページで登録作者ごとの `author_check` を投入する。小説 0 件でも動作し、`update.disabled-author-tracking=true` のときは自動確認しない。
 - 確認ジョブは実効 YAML・Cookie・サイト待機を既存の作者 URL 展開と共有し、URL 索引で管理済み作品を除外して通常の Download ジョブへ流す。登録解除済みの確認はスキップし、一覧取得後にも登録を再確認する。投入済みの通常 Download ジョブをキャンセルする機能ではない。
 - Native と同じ「環境設定 → 作者」で登録・一覧・解除・手動確認を提供する。API は `GET/POST/DELETE /api/authors` と `POST /api/authors/check`（`dry_run:true` は URL 一覧、false はジョブ受付）。作者を解除しても取得済み作品は消さない。
-- リモート CLI は `narou author --server <URL> add|list|remove|check`。`NAROU_ADMIN_TOKEN` と必要なら Access の `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` を環境変数で渡す。ローカルライブラリは不要。
+- CLI は Native のローカルライブラリ専用であり、Workers へリモート接続する作者 CLI は提供しない。Workers の登録・一覧・解除・手動確認は Web UI とその HTTP API で行う。
 - 通常の `download` への作者 URL 入力は従来どおり単発の作品展開であり、継続追跡への登録は行わない。
 
 ---

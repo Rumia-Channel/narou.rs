@@ -88,12 +88,6 @@ async function stop() {
   if (windows) spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }); else child.kill('SIGTERM');
   await exited; child = undefined;
 }
-async function cli(args, expectedCode = 0) {
-  const outside = join(work, 'remote-client'); mkdirSync(outside, { recursive: true });
-  const processCli = spawn(process.env.NAROU_AUTHOR_CLI, ['author', '--server', `http://127.0.0.1:${port}`, ...args], { cwd: outside, env: { ...process.env, NAROU_ADMIN_TOKEN: token, CF_ACCESS_CLIENT_ID: '', CF_ACCESS_CLIENT_SECRET: '', NAROU_RS_RESTART_CWD: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
-  let output = ''; for (const stream of [processCli.stdout, processCli.stderr]) stream.on('data', (chunk) => { output += chunk; });
-  const [code] = await once(processCli, 'exit'); assert.equal(code, expectedCode, output); return output;
-}
 try {
   server.listen(0, '127.0.0.1'); await once(server, 'listening'); sourcePort = server.address().port;
   ipv6.listen(sourcePort, '::1'); await once(ipv6, 'listening');
@@ -116,10 +110,9 @@ try {
   assert(registered.every((result) => result.changed));
   assert.deepEqual(new Set((await json('/api/authors')).authors.map((author) => author.url)), new Set(extra));
   for (const url of extra) await json('/api/authors', { url }, 'DELETE');
-  if (process.env.NAROU_AUTHOR_CLI) await cli(['add', storedUrl]); else assert.equal((await json('/api/authors', { url: storedUrl })).changed, true);
+  assert.equal((await json('/api/authors', { url: storedUrl })).changed, true);
   assert.equal((await json('/api/authors', { url: storedUrl })).changed, false);
   assert.deepEqual((await json('/api/authors')).authors, [{ site: 'localhost', url: storedUrl }]);
-  if (process.env.NAROU_AUTHOR_CLI) { assert((await cli(['list'])).includes(storedUrl)); await cli(['remove', '0'], 1); }
   await stop(); await start();
   assert.deepEqual((await json('/api/authors')).authors, [{ site: 'localhost', url: storedUrl }]);
   const first = await update(); assert.equal(first.count, 0); assert.equal(first.author_job_ids.length, 1);
@@ -133,13 +126,9 @@ try {
   await setting({ 'update.disabled-author-tracking': true }, { 'update.disabled-author-tracking': null });
   workCount = 4; const hitsBefore = authorHits; const disabled = await update();
   assert.deepEqual(disabled.author_job_ids, []); assert.equal(authorHits, hitsBefore); assert.equal(count('SELECT COUNT(*) FROM novels'), 3);
-  const dry = process.env.NAROU_AUTHOR_CLI ? await cli(['check', '--dry-run']) : (await json('/api/authors/check', { dry_run: true })).urls.join('\n');
-  assert(dry.includes(`/work4/`)); assert.equal(count('SELECT COUNT(*) FROM novels'), 3);
-  if (process.env.NAROU_AUTHOR_CLI) {
-    await cli(['check']); await settled(); await settled();
-  } else {
-    const manual = await json('/api/authors/check', { dry_run: false }); await jobs(manual.job_ids); await settled();
-  }
+  const dry = await json('/api/authors/check', { dry_run: true });
+  assert.deepEqual(dry.urls, [`http://localhost:${sourcePort}/work4/`]); assert.equal(count('SELECT COUNT(*) FROM novels'), 3);
+  const manual = await json('/api/authors/check', { dry_run: false }); await jobs(manual.job_ids); await settled();
   assert.equal(count('SELECT COUNT(*) FROM novels'), 4);
   console.log('PASS auto-disable is supported; dry-run does not download; explicit author check still discovers works');
   await setting({ 'update.disabled-author-tracking': false, 'update.auto-schedule.enable': true, 'update.auto-schedule': '0000', 'update.auto-schedule.timezone': 'UTC' }, { 'update.disabled-author-tracking': true, 'update.auto-schedule.enable': null, 'update.auto-schedule': null, 'update.auto-schedule.timezone': null });
@@ -164,10 +153,6 @@ try {
   console.log('PASS removing an author stops in-flight fan-out and stale queued checks, preserving downloaded novels');
   const one = await json('/api/download', { targets: [`http://localhost:${sourcePort}/authors/8/`] }); await jobs(one.results.map((row) => row.job_id));
   assert.deepEqual((await json('/api/authors')).authors, []); assert.equal(count("SELECT COUNT(*) FROM novels WHERE ncode='oneshot1'"), 1);
-  if (process.env.NAROU_AUTHOR_CLI) {
-    await cli(['add', storedUrl]); await cli(['remove', '1']); assert.deepEqual((await json('/api/authors')).authors, []);
-    console.log('PASS remote CLI add/list/dry-run/remove from outside a native library');
-  }
   console.log('PASS one-shot author downloads do not create tracking registrations');
   if (process.env.AUTHOR_SMOKE_KEEP === '1') {
     console.log(`AUTHOR_WORKER_READY http://127.0.0.1:${port}/settings token=${token} author=${storedUrl}`);
