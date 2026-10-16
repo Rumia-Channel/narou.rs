@@ -89,6 +89,14 @@ run(npx, [
   "wrangler.test.toml",
 ]);
 
+// This runner explicitly exercises legacy D1; content_storage.mjs covers S3 defaults.
+const legacyContentFixture = join(root, ".wrangler", "contract-content-backend.sql");
+writeFileSync(legacyContentFixture, "INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','\"d1\"','d1') ON CONFLICT(scope,key) DO NOTHING;");
+run(npx, [
+  "--yes", "wrangler@4", "d1", "execute", "DB", "--local",
+  "-c", "wrangler.test.toml", "--file", legacyContentFixture,
+]);
+
 // 5. wrangler dev を起動して readiness を待つ。
 const dev = spawn(
   npx,

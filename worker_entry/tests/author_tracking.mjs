@@ -102,7 +102,10 @@ try {
     .replace(/^migrations_dir = "migrations"$/m, `migrations_dir = ${JSON.stringify(join(root, 'migrations').replaceAll('\\', '/'))}`);
   writeFileSync(config, toml);
   writeFileSync(join(work, '.dev.vars'), `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${Buffer.alloc(32, 7).toString('base64')}\nS3_ACCESS_KEY_ID=local-test-key\nS3_SECRET_ACCESS_KEY=local-test-secret\n`);
-  run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]); await start();
+  run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
+  // Author scenarios intentionally use legacy D1, independent of S3-default coverage.
+  sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','\"d1\"','d1');");
+  await start();
   const authorUrl = `http://localhost:${sourcePort}/authors/7/`;
   const storedUrl = authorUrl + '#works';
   const definition = `name: Controlled Author Source\ndomain: localhost\ntop_url: http://localhost:${sourcePort}\nurl: 'http://localhost:${sourcePort}/(?<ncode>(?:work|oneshot)\\d+)/?'\nsitename: Controlled Author Source\nversion: 1.0\nconfirm_over18: no\ntoc_url: 'http://localhost:${sourcePort}/\\k<ncode>/'\nauthor_url: '^http://(?:localhost|authors\\.example):${sourcePort}/authors/(?<user_id>\\d+)/?'\nauthor_api_url: 'http://localhost:${sourcePort}/authors/\\k<user_id>/'\nauthor_novel_pattern: '(?<novel_url>http://localhost:${sourcePort}/(?:work|oneshot)\\d+/)'\ntitle: '<h1>(?<title>.+?)</h1>'\nauthor: '<span class="author">(?<author>.+?)</span>'\nsubtitles: '<a href="(?<href>/(?:work|oneshot)\\d+/(?<index>\\d+)/)">(?<subtitle>.+?)</a>'\nbody_pattern: '<div class="body">(?<body>.+?)</div>'\nmin_interval: 0.01\n`;

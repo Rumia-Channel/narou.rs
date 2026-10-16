@@ -1,5 +1,16 @@
 //! Statements kept explicit so race/rollback conditions can be exercised in SQLite.
 
+pub const INITIALIZE_S3_DEFAULT: &str = r#"
+INSERT INTO app_state(scope,key,value_json,value_yaml)
+SELECT 'inv','content_backend',json_quote(next_backend),next_backend
+FROM (SELECT CASE WHEN EXISTS(SELECT 1 FROM legacy_content_objects)
+                  THEN 'migrating' ELSE 's3' END AS next_backend)
+WHERE 1
+ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,value_yaml=excluded.value_yaml
+WHERE ?1=1 AND app_state.value_json IN ('"d1"','d1')
+RETURNING value_json
+"#;
+
 pub const QUEUE_PREVIOUS: &str = r#"
 INSERT INTO content_garbage(blob_key, not_before)
 SELECT blob_key, ?8 FROM content_objects
