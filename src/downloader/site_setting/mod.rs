@@ -118,6 +118,10 @@ pub struct SiteSetting {
     pub confirm_over18: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
+    /// Additional trusted hosts (and their subdomains) allowed to receive the
+    /// site's Cookie header, e.g. an author page hosted separately from novels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cookie_hosts: Vec<String>,
     /// Runtime-only credential destinations; never written into site YAML.
     #[serde(skip)]
     pub(super) login_cookie_hosts: Vec<String>,

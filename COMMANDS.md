@@ -165,6 +165,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `webnovel/*.yaml` の `series_url` / `series_item_url` に一致するシリーズ URL は、共通の `application::download_targets::DownloadTargetExpander` で個別小説 URL に展開してから通常の download 処理に渡す。小説家になろう、R18 なろう、カクヨムのシリーズ/コレクション URL に対応。CLI の対話入力もシリーズ URL を受理する
 - Worker の `/api/download`（`/api/download_force` を含む）と `/api/jobs` は、全対象のシリーズ・作者 URL 展開が成功してから作品ごとのジョブを登録し、元の `--force` 等を各作品へ引き継ぐ。取得失敗・空シリーズ一覧はエラー。正常に読めた空の作者一覧は追加なし。保存済みジョブ・旧 envelope の実行境界も同じ展開器を使う
 - 作者・ユーザー URL の単発登録と CLI `author` の継続追跡は別機能。`Downloader::author_works` / `AuthorListing` が作品列挙・複数ログインの試行・ページ送り・シリーズ所属作品の除外を共有し、サイト固有の規則は YAML / preprocess DSL に置く。小説・シリーズの URL 判定を優先するため、Pixiv のシリーズを作者一覧として展開しない
+- R18 なろうの作者はプロフィールの最新作だけでなく、`/mypage/novellist/xid/<作者ID>/` の全作品一覧を `author_api_url` から取得し、DSL / `author_next_pattern` で次ページを辿る。単発の一括取得と継続追跡で同じ列挙経路を使う
 - 新規取得したセクションは解析済みの本文・前書き・後書きに加えて raw HTML も `illust_grep_pattern` の検索対象にし、本文として保存しないサイト固有マークアップ内の挿絵を先取り保存する。未更新セクションは従来どおり保存済み section のみを検索する
 - サイト定義に `illust_grep_pattern` が無いサイト (なろう / R18なろう / カクヨム / Arcadia) は narou.rb `HTML#initialize` の既定 `<img>` パターン (`downloader::DEFAULT_ILLUST_GREP_PATTERN`) で挿絵を先取り保存する。既定パターンでは URL でない注記 (相対パス) は対象外にし、挿絵 URL の protocol-relative (`//host/...`) は本文のスキームで解決し、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない (2026-10-08 修正)
 - 索引 (`.illustration_cache.yaml`) が知っている挿絵でも、`<prefix>/挿絵` の一覧に実体が無ければ取り直す (自己修復)。索引が空でないときだけ 1 小説 1 回一覧するので、通常の更新に余分な往復は付かない (2026-10-08 修正)
@@ -178,9 +179,11 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Pixiv のアニメーション挿絵（うごイラ）はフレーム ZIP として取得され、`illustration-animation` feature（native と Worker の両方で有効）で APNG に組み立てて `挿絵/` へ保存する。`zip` は wasm でも動くよう純 Rust の deflate バックエンドに絞ってある
 - サイト定義の `min_interval:` でサイトごとの最低リクエスト間隔 (秒) の下限を宣言でき、該当サイトのレートリミットスコープにだけ適用される
 - サイト定義の `headers:` キーで任意のリクエストヘッダを宣言できる (Pixiv は画像ホスト用に `Referer`、ハーメルン R18 は Cloudflare challenge 回避用に `Sec-Fetch-*` を指定)。値は `\k<...>` 補間され、危険な名前・値は無視される
+- サイト定義の `cookie_hosts:` は、サイトの `domain` とは別に Cookie を送ってよい信頼済みホスト名の配列（各ホストのサブドメインも含む）。R18 なろうは作者用 `xmypage.syosetu.com` を指定する。未指定の第三者ホストには Cookie を送らない
 - リダイレクトを自前で辿るモード (`resolve_final_url`) も curl ティアを先に試す。CDN challenge 下のホストでは reqwest が 403 でも libcurl が 200 を返すことがあるため
 - `preprocess:` DSL は `request(url)` / `fetch_json(url)` で追加取得を要求できる。実行側がサイトの取得ポリシー経由で取得し、定義を再実行する (最大 4 ラウンド)。結果は `fetched["<url>"]`、失敗は null。ジョブは URL 単位で、結果は 1 小説分だけ保持する
 - 保存済みログイン Cookie のフォールバックを実装。TOC 取得がログイン壁 (404 やサイト定義の `login_pattern`) / 部分一覧 (`login_partial_pattern`) に当たったとき `narou login` の資格情報を試行順に試し、成功した資格情報の ID を小説レコードの `login_session` に保存して次回から最初のリクエストで使う。取得側の `narou_rs_login` は親ドメインの Cookie も拾い、サイト全体で使える資格情報として保存する。`update` でも同じ経路を通る
+- Workers は年齢認証を対話で確認できない。成人向け作品の取得を許可する場合は Web UI の「環境設定 → Global」で `over18=true` を保存する。`false` は明示的な拒否であり、設定変更で既に `blocked` になったジョブを自動再開はしない
 - 話ごとの進捗行・章/節の見出し・ログイン再試行・「小説が削除されているか非公開な可能性があります」などのレポート行は、コンソールと同時に `logging` のログファイルへも出力する。narou.rb は `$stdout` への write をすべて `append_log` するため、ログに残らない行があってはならない。並列ドメインワーカー間の行混線は sink 内の排他 (`STDOUT_LOCK`) で防ぐ。原因は `src/logger.rs` が bin と lib の両方にコンパイルされて `LoggerState` が 2 つ存在し、`logger::init()` が bin 側しか初期化していなかったこと。`MessageSink` (`progress::console_sink`) 経由の行は未初期化の lib 側ロガーへ書かれていた。bin は lib のロガーを共有する (2026-10 修正、issue #36)
 
 ---
