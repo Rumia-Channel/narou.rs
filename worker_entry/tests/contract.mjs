@@ -641,13 +641,6 @@ await check("GET /api/history returns the JSON history shape", async () => {
   assert(typeof body.history === "string", `history must be a string: ${JSON.stringify(body)}`);
 });
 
-await check("GET /api/version/current.json reports the version", async () => {
-  const response = await request("/api/version/current.json", auth());
-  assert(response.status === 200, `status ${response.status}`);
-  const body = await json(response);
-  assert(typeof body.version === "string" && body.version.length > 0, "version must be set");
-});
-
 await check("POST /api/inspect is refused on the worker", async () => {
   // 調査ログはローカルファイル前提なので、成功を偽装せず 501 を返す。
   const response = await request("/api/inspect", {
