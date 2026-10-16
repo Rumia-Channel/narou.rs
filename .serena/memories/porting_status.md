@@ -43,6 +43,8 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 - `cargo check -p narou_rs --features lite` が成功。Native + Lite の lib / bin / `cli_compat_boundaries` は計 1255 件成功し、実バイナリの `version --more` が 0.4.12 を表示した。
 - `worker-build --release` で narou_rs / narou_worker 0.4.12 の release Wasm をビルドし、Python の SQL・配備回帰 69 件も成功した。
 - 上記の release Wasm を実行し、隔離 D1 + 制御 HTTP origin による作者追跡 6 シナリオ、S3 本文移行・実圧縮データ・破損/PUT 失敗・改題・履歴・EPUB・purge・再起動・削除の実 smoke、S3 切替後の HTTP 契約 104 件が成功した。本番データの移行は実行していない。
+- Linux CI で HTTP 104 件と作者 6 シナリオが成功した後も検証プロセスが終了しないログを確認した。検証用 Wrangler を Unix では独立プロセスグループで起動し、終了時は npx だけでなく Wrangler/workerd も対象にする実装へ変更した。Windows の `taskkill /T /F` は維持し、変更後も作者・S3 の実 smoke と HTTP 104 件が完走した。
+- 修正後の Linux CI `38852697821` が完走した。Native 通常版・Lite の check/tests、全 feature Clippy、Wasm、ライセンス生成差分、Worker HTTP/作者追跡・S3 lifecycle が成功し、relay と develop Worker への配備も成功した。
 
 ## 過去の記録（以下は現況ではない）
 

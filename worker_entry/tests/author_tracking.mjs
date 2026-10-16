@@ -72,7 +72,7 @@ async function update() {
 async function setting(values, expected) { return json('/api/global_setting', { settings: values, expected }); }
 async function start() {
   logs = '';
-  child = spawn(npx, ['wrangler', 'dev', '--config', config, '--persist-to', persist, '--port', String(port), '--test-scheduled'], { cwd: root, shell: windows, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CI: 'true', WRANGLER_SEND_METRICS: 'false' } });
+  child = spawn(npx, ['wrangler', 'dev', '--config', config, '--persist-to', persist, '--port', String(port), '--test-scheduled'], { cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CI: 'true', WRANGLER_SEND_METRICS: 'false' } });
   for (const stream of [child.stdout, child.stderr]) stream.on('data', (chunk) => { logs = (logs + chunk).slice(-150000); });
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
@@ -85,7 +85,11 @@ async function start() {
 async function stop() {
   if (!child || child.exitCode !== null) return;
   const exited = once(child, 'exit');
-  if (windows) spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }); else child.kill('SIGTERM');
+  if (windows) spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+  else {
+    try { process.kill(-child.pid, 'SIGTERM'); }
+    catch (error) { if (error.code !== 'ESRCH') throw error; }
+  }
   await exited; child = undefined;
 }
 try {

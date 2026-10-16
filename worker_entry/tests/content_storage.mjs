@@ -111,7 +111,7 @@ function objectInsert(key, value) {
 }
 async function start() {
   logs = '';
-  child = spawn(npx, ['wrangler', 'dev', '--config', config, '--persist-to', persist, '--port', String(port)], { cwd: root, shell: windows, stdio: ['ignore', 'pipe', 'pipe'] });
+  child = spawn(npx, ['wrangler', 'dev', '--config', config, '--persist-to', persist, '--port', String(port)], { cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
   for (const stream of [child.stdout, child.stderr]) stream.on('data', (chunk) => { logs = (logs + chunk).slice(-300000); });
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
@@ -125,7 +125,10 @@ async function stop() {
   if (!child || child.exitCode !== null) return;
   const exited = once(child, 'exit');
   if (windows) spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
-  else child.kill('SIGTERM');
+  else {
+    try { process.kill(-child.pid, 'SIGTERM'); }
+    catch (error) { if (error.code !== 'ESRCH') throw error; }
+  }
   await exited;
   child = undefined;
 }
