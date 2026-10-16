@@ -258,9 +258,10 @@ impl PersistenceService {
             .await
     }
 
-    /// Return `false` when the previous section no longer exists. Asset moves
-    /// may be idempotent on a missing source; that is not a cached version.
-    pub async fn move_section_to_cache(
+    /// Cache the previous section. Portable stores retain the current key until
+    /// its replacement commits; native keeps the legacy move behavior.
+    /// Return `false` for a missing source, which is not a cached version.
+    pub async fn cache_section(
         &self,
         keys: &NovelObjectKeys,
         timestamp: &str,
@@ -271,11 +272,14 @@ impl PersistenceService {
             return Ok(false);
         }
         let destination = keys.cached_section(timestamp, &subtitle.index, &subtitle.file_subtitle);
+        #[cfg(feature = "native-runtime")]
         self.assets.move_or_copy(&source, &destination).await?;
+        #[cfg(not(feature = "native-runtime"))]
+        self.assets.copy(&source, &destination).await?;
         Ok(true)
     }
 
-    /// Record a persisted version after its first successful section move, or
+    /// Record a persisted version after its first successfully cached section, or
     /// explicitly record an empty version after a completed latest-only update.
     pub async fn record_cache_version(
         &self,
@@ -477,7 +481,7 @@ mod tests {
         let keys = NovelObjectKeys::new("site", "title", false).unwrap();
         let subtitle = subtitle();
         futures::executor::block_on(async {
-            assert!(!service.move_section_to_cache(&keys, "missing", &subtitle).await.unwrap());
+            assert!(!service.cache_section(&keys, "missing", &subtitle).await.unwrap());
             assert!(plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap().is_empty());
             service.record_cache_version(&keys, "empty").await.unwrap();
             let empty = read_diff_cache_catalog(store.as_ref(), keys.prefix(), &[]).await.unwrap();
@@ -487,9 +491,12 @@ mod tests {
 
             let section = section_file(&subtitle, "previous body");
             service.save_section(&keys, &subtitle, &section.element).await.unwrap();
-            assert!(service.move_section_to_cache(&keys, "snapshot", &subtitle).await.unwrap());
+            assert!(service.cache_section(&keys, "snapshot", &subtitle).await.unwrap());
             service.record_cache_version(&keys, "snapshot").await.unwrap();
+            #[cfg(feature = "native-runtime")]
             assert!(service.load_section(&keys, &subtitle).await.unwrap().is_none());
+            #[cfg(not(feature = "native-runtime"))]
+            assert_eq!(service.load_section(&keys, &subtitle).await.unwrap().unwrap().element.body, "previous body");
             let cached = store.read_small(&keys.cached_section("snapshot", "1", &subtitle.file_subtitle))
                 .await.unwrap().unwrap();
             assert_eq!(serde_yaml::from_slice::<SectionFile>(&cached).unwrap().element.body, "previous body");

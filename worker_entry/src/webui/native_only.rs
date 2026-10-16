@@ -149,6 +149,13 @@ async fn storage_mode(req: &Request, env: &Env) -> worker::Result<Response> {
     };
     let s3 = services.s3_illustrations.as_deref()
         .map(|store| store as &dyn narou_rs::platform::ObjectStore);
-    let (status, payload) = crate::storage_probe::storage_mode_response(s3, required, probe).await;
+    let (status, mut payload) = crate::storage_probe::storage_mode_response(s3, required, probe).await;
+    let db = crate::db_handle::DbHandle::primary(std::sync::Arc::new(env.d1("DB")?));
+    let content = match crate::content_store::backend(&db).await {
+        Ok(content) => content,
+        Err(_) => return json_error(503, "content_storage_configuration_invalid", None),
+    };
+    payload["content_backend"] = serde_json::json!(content);
+    payload["content_migration_api"] = "/api/admin/content-migration".into();
     Ok(Response::from_json(&payload)?.with_status(status))
 }

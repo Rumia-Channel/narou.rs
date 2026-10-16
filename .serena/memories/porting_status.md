@@ -1,8 +1,8 @@
 # narou.rs 移植状況
 
-## 現況（v0.4.11）
+## 現況（v0.4.12）
 
-正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.11へ更新済み。main統合/タグ公開は未実施。
+正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.12へ統一する。公開状態は v0.4.12 の GitHub Release を正とし、リモートの常設ブランチは main / develop だけを維持する。
 
 共有化: application use-case、settings/setting_core、download_targets、retry_policy、push_events、MessageContext/progress、HTTP RedirectChain/send_paced、ObjectStore::update_small、EPUB EpubPreparation/EpubBuild。同時INI更新はFS lock/SQLite Immediate/D1 primary full raw snapshot CAS、正準保存後のミラー失敗もACKに反映。CRC衝突を同値扱いしない。Workerの出力/debug/表示先をfuture poll単位に束縛し、operation ID/seqで並列進捗を分離。native Web更新もサイト別並列取得。
 
@@ -16,6 +16,33 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 
 0.4.11 最終監査で確認したデータ保全の修正: SQLite のインプレース YAML 書き出しは meta の export_file_sha 指紋を原子的なファイル保存より前に記録し、失敗後の未編集の書き出し残骸を再取り込みしない。管理状態だけでなく database.yaml の作品レコードも対象。ユーザーの編集と narou-compat のファイル優先は維持する。S3 COPY は完全な CopyObjectResult と ETag/LastModified を確認できた場合だけ成功し、200 内 Error・破損応答では元オブジェクトを削除しない。実 HTTP の失敗／成功ケースと、書き出し失敗後の正常保存→再オープンを smoke で確認済み。
 指紋は既存の未編集 projection と次回公開予定を最大2件保持し、2回目が公開前に中断しても保護を失わない。指紋更新と公開は同一ファイルロック内。--out が実 .narou を指す場合も対象。最終 workspace 全 target は1342成功/0失敗/1ignored、Clippy 全 feature -D warnings・Rustdoc -D warnings・core/Worker wasm check 成功。Web CSRF 回帰 fixture は並行CWD変更に影響されない絶対パスへ修正し、HTTPの拒否/許可とキュー状態の検証内容は維持した。
+
+## v0.4.12: Worker 本文・履歴の S3 保存
+
+- `worker_entry/src/content_store.rs` と `0011_content_objects.sql`。話単位の既存 YAML を共通 codec で圧縮し、S3 の不変な版へ PUT 後に D1 参照を公開する。現行本文と cache / .cache 両形式の履歴が対象。本文ストアの目次・参照読み取りは primary に揃える。CRC32・SHA-256・圧縮前後サイズを検証し、S3 の欠落・破損を旧 D1 への fallback で隠さない。native と挿絵の保存方式は変更しない。
+- `content_backend=d1→migrating→s3` は `asset_backend` と独立。管理 API `/api/admin/content-migration` の plan/copy/verify/cutover/purge/gc/status と `scripts/migrate-worker-content.mjs`（既定 plan、`--apply` で削除まで）を用意。phase の進捗は D1 に保存し、期限付き lease と SQL ガードで旧書込み・移行競合を拒否する。削除待ちは durable outbox、未完了 PUT は 1 時間保護。
+- Worker の更新は `PersistenceService::cache_section` で履歴をコピーし、新本文 PUT 失敗時も現行参照を残す。改題の旧キーは新本文と新 TOC の保存後に削除する。native は従来の履歴移動を維持。旧 API `move_section_to_cache` は全呼出元を移行して除去した。
+- ローカル Worker + D1 + S3 HTTP fixture で移行・実圧縮バイト・破損／欠落拒否・再起動・実体削除を確認。実取得・強制更新・正確な旧本文保存・差分一覧／消去・EPUB、履歴 COPY 成功後の新本文 PUT 503 でも現行本文と EPUB を維持すること、改題後の旧キー削除も成功。SQL regression 12 件を含む Python 64 件、release Wasm ビルド、Worker wasm Clippy `-D warnings`、切替後の既存 HTTP 契約 104 件が成功。期限切れ PUT の公開・旧 .cache 履歴の取り残し・新本文失敗時の現行参照消失は failing-before/passing-after を確認。本番の Wasabi 移行・本番データの削除は未実施。旧「本文を D1 の列へ展開する」方針は撤回し、AGENTS.md / COMMANDS.md / 設計資料を更新。
+- 標準 release 設定の Worker ビルド（wasm-opt 込み）と、native の既存 cache 回帰 1 件も成功。ローカルではコンパイラ並列数を 1 に抑え、native の C archive は LLVM、テストの debug 情報は無効にして検証した（リポジトリ設定の変更なし）。
+- サブディレクトリありで作品フォルダ名が `本文` の場合の目次誤分類を修正。`ContentStore::is_content_key` と `0012_content_metadata_boundary.sql` が `toc.yaml` / `converter.yaml` / `.illustration_cache.yaml` を D1 に残す。SQL の誤分類と、S3 切替後の実 EPUB が TOC 不在で失敗することを failing-before で再現し、修正後は同じ構成で purge・EPUB・再起動・既存 HTTP 契約まで成功。
+
+## v0.4.12: 作者の継続追跡・管理
+
+- `application::authors` の `AuthorStore` / `AuthorService` と portable `author` codec を共通境界にした。Native は Inventory の原子更新、Workers は primary D1 `app_state('inv','author')` の全 JSON スナップショット CAS。作者 URL → サイト名だけを保存し、小説の作者表示名とは区別する。
+- Workers の更新 API・Update 投入・定期更新の最終ページから `author_check` を投入し、既存の実効 YAML / Cookie / 待機を使って新作だけを通常 Download ジョブへ流す。登録済み作品は `contains_toc_urls` の bounded primary 索引検索で除外する。小説 0 件でも動作し、自動停止設定は手動チェックを止めない。解除済みジョブと取得中の解除を再確認するが、投入済み通常 Download はキャンセルしない。
+- Native / Workers 共通の「環境設定 → 作者」で登録・一覧・解除・手動確認。`GET/POST/DELETE /api/authors` と `POST /api/authors/check`。CLI は Native のローカルライブラリ専用とし、Workers 向けリモート CLI・専用引数・認証処理・初期化例外を撤去した。Native CLI の 0 番削除は引き続き拒否する。通常の作者 URL ダウンロードは単発のまま。
+- 実 Worker + 隔離 D1 + 制御した HTTP origin で再起動後の登録、新作の継続取得、既知作品の除外、停止設定、dry-run、手動チェック、実 scheduled handler、取得中の解除、古いジョブのスキップを HTTP API 経由で確認。Firefox で Native / Workers の作者タブから登録・解除し、永続 API 状態を確認した。Worker の取得済み 6 作品は解除後も残る。
+- Native は実 CLI の YAML 登録 → SQLite 移行、CLI / Web 双方向の一覧・解除、空ライブラリの CLI / Web 更新からの作者確認を実行し、WebSocket の実出力も確認。ユーザーの今回の許可により repo 内 TempDir を使用し、検証ライブラリ・プロセス・一時ソースを削除した。本番 D1 / S3 のデータ操作はしていない。
+- 検証: Native 既定全 target 1331 成功、Native + Lite は単一テストスレッドで 1347 成功（どちらも参照 fixture 1 件 ignored）。Lite の並列全件実行はタイムアウトし、原因は未特定。Native + Lite / Worker の Clippy `-D warnings` と標準 release Wasm ビルド、Python 69 件、S3 保存・移行・EPUB の実 smoke と切替後 HTTP 契約 104 件が成功。既存の SQL ファイル複製を byte 比較するテストは削除し、移行後データ保全の実動作テストは維持した。
+- develop 統合後も実 Worker の作者シナリオと Python 69 件を再実行し成功。Native は現在のソースからテスト実行ファイルをビルドし、作者関連 11 件・既存 DB の移行保全 4 件が成功した。統合後の Eval 経由全件待ちはタイムアウトし完走として数えていない。別の Cargo 実行も C 依存再ビルド中に中断されたため、最後はビルドとテスト実行を分離して確認した。
+- CLI の対象を Native のみに修正後、実 Native バイナリで作者の登録・一覧・番号 0 の拒否・番号指定解除・保存状態を確認し、旧リモート引数は終了コード 127 で拒否され help からも消えた。Native + Lite の bin / CLI 境界回帰 116 件と、HTTP API だけで操作する実 Worker の作者追跡 smoke が成功。Web UI の作者管理・定期追跡・追跡解除後の作品保持は維持し、リモート CLI 専用の実装・初期化分岐・テスト経路を残していない。
+
+## v0.4.12 リリース前検証
+
+- Cargo / Worker / probe lock / ライセンス表示を 0.4.12 に統一し、依存クレートのバージョン・Git revision は維持した。ライセンス文書は CI と同じ cargo-about 0.9.2 で再生成し、直接依存 56 件の表も一致した。
+- `cargo check -p narou_rs --features lite` が成功。Native + Lite の lib / bin / `cli_compat_boundaries` は計 1255 件成功し、実バイナリの `version --more` が 0.4.12 を表示した。
+- `worker-build --release` で narou_rs / narou_worker 0.4.12 の release Wasm をビルドし、Python の SQL・配備回帰 69 件も成功した。
+- 上記の release Wasm を実行し、隔離 D1 + 制御 HTTP origin による作者追跡 6 シナリオ、S3 本文移行・実圧縮データ・破損/PUT 失敗・改題・履歴・EPUB・purge・再起動・削除の実 smoke、S3 切替後の HTTP 契約 104 件が成功した。本番データの移行は実行していない。
 
 ## 過去の記録（以下は現況ではない）
 

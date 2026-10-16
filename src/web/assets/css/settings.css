@@ -487,3 +487,27 @@
 .storage-mode-paths {
   word-break: break-all;
 }
+
+.author-form {
+  display: grid;
+  gap: var(--container-padding);
+}
+
+.author-actions, .author-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--container-padding);
+}
+
+.author-row {
+  justify-content: space-between;
+}
+
+.author-url {
+  overflow-wrap: anywhere;
+}
+
+.author-error {
+  color: var(--danger-color);
+}

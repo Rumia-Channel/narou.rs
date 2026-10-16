@@ -129,6 +129,37 @@ pub async fn execute_job(
     );
     let outcome = context.scope(async {
 
+    if job.kind == JobKind::AuthorCheck {
+        use narou_rs::application::messages::MessageSink as _;
+        let url = match &job.target {
+            JobTarget::Url(url) => url,
+            _ => return JobOutcome::Permanent { reason: "author check requires an author URL".into() },
+        };
+        let result: Result<()> = async {
+            if !runtime.author_service().list().await?.iter().any(|author| JobTarget::parse(&author.url).as_ref() == Some(&job.target)) {
+                push_sink.emit(messages::Stream::Stdout, &messages::author::untracked(url));
+                return Ok(());
+            }
+            push_sink.emit(messages::Stream::Stdout, &messages::author::checking(url));
+            let urls = runtime.author_work_urls(url).await?;
+            // Removal while discovery was running must also stop new fan-out.
+            if !runtime.author_service().list().await?.iter().any(|author| JobTarget::parse(&author.url).as_ref() == Some(&job.target)) {
+                return Ok(());
+            }
+            let plans: Vec<JobPlan> = urls.into_iter().map(|url| JobPlan {
+                kind: JobKind::Download, target: JobTarget::Url(url), options: Vec::new(),
+            }).collect();
+            runtime.enqueue_batch(&plans).await?;
+            push_sink.emit(messages::Stream::Stdout, &messages::author::queued(url, plans.len()));
+            if !plans.is_empty() { crate::consumer::notify_queue_changed(push).await; }
+            Ok(())
+        }.await;
+        return match result {
+            Ok(()) => JobOutcome::Succeeded,
+            Err(error) => classify_result(Err(error), job, job_id, runtime, push_sink.as_ref()).await,
+        };
+    }
+
     // The execution boundary also accepts raw series plans (persisted ledger
     // rows and legacy envelopes). Fan out through the same expander as new
     // requests; the child plans retain per-novel budgets and follow-up convert.

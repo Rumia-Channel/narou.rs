@@ -674,7 +674,18 @@ pub async fn api_update(
             .await
         };
         count = args.len();
-        if count == 0 {
+        let author_only = if count == 0 && is_update_all {
+            let disabled = state.services.settings.get_many(&["update.disabled-author-tracking"]).await;
+            match disabled {
+                Ok(values) if values.first().and_then(Option::as_ref).and_then(crate::setting_core::setting_bool_value).unwrap_or(false) => false,
+                Ok(_) => match crate::author::authors_for_current_root() {
+                    Ok(authors) => !authors.is_empty(),
+                    Err(error) => return Json(serde_json::json!({"success":false,"message":error.to_string(),"count":0})),
+                },
+                Err(error) => return Json(serde_json::json!({"success":false,"message":error.to_string(),"count":0})),
+            }
+        } else { false };
+        if count == 0 && !author_only {
             return serde_json::json!({
                 "success": true,
                 "status": "queued",

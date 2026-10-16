@@ -527,6 +527,8 @@ Worker (worker_entry)
 | `downloader::resolve_user_agent` | UA 解決（native はランダム、Worker は既定ブラウザ UA） |
 | `application::messages` + `MessageSink` | ジョブ実行系コマンドの文言。native は stdout/stderr、Worker は PushHub への `echo` に流す（失敗行は両方 `  Error: …`） |
 | `application::aliases` | エイリアス解決（表の読み込みだけが native=Inventory / Worker=app_state と異なる） |
+| `author` / `application::authors` | URL → サイト名の保存 codec、`AuthorStore` port、登録・一覧・URL 単位の解除、実効 YAML による作者認識と管理済み作品の除外。native は Inventory 原子更新、Worker は primary D1 の全 snapshot CAS |
+| `NovelRepository::contains_toc_urls` | 入力順を保持した管理済み URL 判定。native は共有 DB 索引、D1 は `json_each` と URL 索引による bounded batch を使い、作者確認のために全作品レコードをロードしない |
 | `platform::*` + `downloader::http_policy` | HTTP の decode/status/redirect ポリシー（アダプタは transport だけを持つ） |
 | `platform::http1` | HTTP/1.1 のリクエスト生成と応答解析（Byte 指向・依存なし）。wasm 専用クレート内のテストは実行されないため可搬層に置き、Worker のソケット transport が使う。native は curl/reqwest があるため未使用 |
 | `HttpClient::send_paced` / `HttpPacing` / `RedirectChain` | リダイレクトの方式・資格情報・リクエスト本文の規則と、実送信ごとのサイト待機。transport の切替でも permit を省略しない |
@@ -619,7 +621,7 @@ Worker の `PushHubSink` は行ごとに送信タスク (`spawn_local`) を起�
 | 境界 | native | Worker | 共通規則 |
 |---|---|---|---|
 | HTTP transport | curl / reqwest / wget と DNS 検証 | Fetch / connect / リレーと egress | URL 構文・リダイレクト・実送信の待機・応答解釈 |
-| 管理・本文・設定の永続化 | Inventory / FS / SQLite | D1 / primary session | typed repository、設定 patch、codec、CAS、保存 ACK |
+| 管理・本文・設定の永続化 | Inventory / FS / SQLite | 管理・目次・本文参照は D1、本文・履歴は話単位の圧縮 S3（移行までは旧 D1） | typed repository、設定 patch、codec、CAS、保存 ACK |
 | 大きな挿絵 | FS ミラーまたは S3 | S3 または D1 | logical key、bounded AssetStore、画像計画・処理 |
 | ジョブの配送 | PersistentQueue / 子プロセス | Queues / D1 ledger | 計画・retry policy・操作メッセージ・push payload |
 | 外部プロセスとローカル操作 | device / send / mail / folder 等 | capability と 501 で拒否 | 対応状況と UI の実行制限を明示 |

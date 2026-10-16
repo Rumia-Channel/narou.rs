@@ -189,4 +189,13 @@ try {
   }
 }
 
+// Author tracking needs a fresh library and controlled HTTP source, not the
+// developer's persistent contract-test database.
+if (exitCode === 0) {
+  const authors = spawnSync(process.execPath, [join(here, "author_tracking.mjs")], {
+    cwd: root, stdio: "inherit", env: { ...process.env, AUTHOR_SMOKE_KEEP: "0" },
+  });
+  exitCode = authors.status ?? 1;
+}
+
 process.exit(exitCode);

@@ -471,11 +471,17 @@ async fn api_update(
                 "results": unresolved_results(&unresolved),
             }));
         }
+        let author_jobs = match runtime.enqueue_author_checks(true).await {
+            Ok(jobs) => jobs,
+            Err(error) => return update_failure(&error.to_string()),
+        };
+        if author_jobs.iter().any(|job| job.sent) { notify_queue_changed(env, runtime).await; }
         return Response::from_json(&json!({
             "success": true,
             "status": "queued",
             "count": 0,
             "job_ids": [],
+            "author_job_ids": author_jobs.into_iter().map(|job| job.job_id).collect::<Vec<_>>(),
         }));
     }
 
@@ -517,6 +523,11 @@ async fn api_update(
         }
         job_ids.push(outcome.job_id.clone());
     }
+    let author_jobs = match runtime.enqueue_author_checks(true).await {
+        Ok(jobs) => jobs,
+        Err(error) => return update_failure(&error.to_string()),
+    };
+    queued_any |= author_jobs.iter().any(|job| job.sent);
 
     // native は更新開始案内 ("全ての小説の更新を開始します…" / "更新を開始
     // します…") をキュー投入時に `webui.message_text` メタへ積み、子プロセス
@@ -542,6 +553,7 @@ async fn api_update(
         "status": if queued_any { "queued" } else { "already_queued" },
         "count": count,
         "job_ids": job_ids,
+        "author_job_ids": author_jobs.into_iter().map(|job| job.job_id).collect::<Vec<_>>(),
     });
     if !unresolved.is_empty() {
         response["results"] = serde_json::Value::Array(unresolved_results(&unresolved));

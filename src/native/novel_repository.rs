@@ -191,6 +191,13 @@ impl NovelRepository for NativeNovelRepository {
         })
     }
 
+    fn contains_toc_urls<'a>(&'a self, urls: &'a [String]) -> PlatformFuture<'a, Result<Vec<bool>>> {
+        let urls = urls.to_vec();
+        Box::pin(async move {
+            run_db(move || crate::db::with_database(|db| Ok(urls.iter().map(|url| db.get_by_toc_url(url).is_some()).collect()))).await
+        })
+    }
+
     fn find_by_title<'a>(
         &'a self,
         title: &'a str,
