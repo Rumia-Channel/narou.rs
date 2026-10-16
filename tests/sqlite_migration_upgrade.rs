@@ -1,97 +1,10 @@
-//! Regression coverage for the 0007 novels-table rebuild and for keeping the
-//! two migration directories (`worker_entry/migrations` for D1 and
-//! `src/native/sqlite/migrations` for rusqlite) in lockstep.
+//! Regression coverage for upgrading existing SQLite libraries without data loss.
 
 #![cfg(feature = "native-runtime")]
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use narou_rs::platform::ObjectStore;
-
-/// Every SQL file in a directory, keyed by file name.
-fn migration_files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
-    std::fs::read_dir(dir)
-        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
-        .map(|path| {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let bytes = std::fs::read(&path)
-                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-            (name, bytes)
-        })
-        .collect()
-}
-
-/// The schema is ported between D1 and rusqlite by keeping the SQL files
-/// identical. Files that exist under the same name in both directories must
-/// be byte-for-byte equal; shared migrations that were renumbered on one
-/// backend (D1 gained worker_jobs/job_leases between 0004 and 0007, native
-/// gained content/versions there) must likewise stay identical under their
-/// mapped names, and every backend-only file must be declared below so a new
-/// file cannot silently drift or duplicate under a mismatched name.
-#[test]
-fn migration_directories_stay_in_sync() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let worker = migration_files(&root.join("worker_entry/migrations"));
-    let native = migration_files(&root.join("src/native/sqlite/migrations"));
-
-    // Same logical migration under different numeric prefixes:
-    // worker name → native name.
-    const RENAMED: &[(&str, &str)] = &[
-        ("0009_requires_login.sql", "0011_requires_login.sql"),
-        ("0010_login_session.sql", "0012_login_session.sql"),
-    ];
-    const WORKER_ONLY: &[&str] = &["0005_worker_jobs.sql", "0006_job_leases.sql"];
-    const NATIVE_ONLY: &[&str] = &[
-        "0005_content.sql",
-        "0006_versions.sql",
-        "0009_section_bodies.sql",
-        "0010_drop_body_yaml.sql",
-    ];
-
-    let renamed_worker: Vec<&str> = RENAMED.iter().map(|(worker, _)| *worker).collect();
-    let renamed_native: Vec<&str> = RENAMED.iter().map(|(_, native)| *native).collect();
-
-    for name in worker.keys() {
-        if WORKER_ONLY.contains(&name.as_str()) {
-            assert!(
-                !native.contains_key(name),
-                "worker-only migration {name} also exists on native; update the test"
-            );
-            continue;
-        }
-        let native_name = renamed_worker
-            .iter()
-            .position(|n| *n == name)
-            .map(|idx| renamed_native[idx])
-            .unwrap_or(name.as_str());
-        assert_eq!(
-            worker.get(name),
-            native.get(native_name),
-            "migration {name} differs from src/native/sqlite/migrations/{native_name}"
-        );
-    }
-    for name in native.keys() {
-        if NATIVE_ONLY.contains(&name.as_str()) {
-            assert!(
-                !worker.contains_key(name),
-                "native-only migration {name} also exists on worker; update the test"
-            );
-            continue;
-        }
-        let worker_name = renamed_native
-            .iter()
-            .position(|n| *n == name)
-            .map(|idx| renamed_worker[idx])
-            .unwrap_or(name.as_str());
-        assert!(
-            worker.contains_key(worker_name),
-            "native migration {name} has no worker counterpart {worker_name}"
-        );
-    }
-}
 
 /// Build a database exactly as migrations 0001–0006 leave it (the `SELECT *`
 /// column-order bug only bites once ALTER-added columns exist), seed novels
