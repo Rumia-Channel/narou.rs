@@ -25,6 +25,7 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 - Workers の `over18=false` は明示拒否で `Canceled` / `blocked` になるが、既存の汎用エラーは対話不能と表示する。許可は既存 Web UI「環境設定 → Global」の `over18` へ明示的に保存する。設定変更で既存の blocked ジョブを自動再投入しない。
 - 本番 D1 の読み取り調査では `content_backend` が未設定（= `d1`）、`content_objects` は 0 件で、本文・履歴はまだ旧 D1 に保存されていた。0.4.12 の配備だけでは新規本文も S3 にならない。本文のコピー・切替・削除は未実施で、画像の S3 選択と本文の切替は独立している。
 - 標準 release 設定の Wasm（wasm-opt 含む）を実行し、作者追跡 6 シナリオが成功。明示的な `over18=false` で同じ対象が blocked、Web 設定 API で true にした後は対話なしで取得成功し、単発作者取得は継続登録を作らないことも確認した。実 R18 作者は Worker HTTP API の dry-run でも全 12 URL が Native と一致した。検証プロセスと隔離 D1 は終了時に削除した。
+- 統合 CI で、CLI テストに旧プロフィール取得 URL を固定する assertion が残っていたため、その実装依存の固定だけを削除した。通常版プロフィールを R18 として認識しない境界と小説情報リンクの除外は維持し、取得先の正否は Cookie 付き複数ページの全件列挙回帰で確認する。補正後の Native 全 workspace / all-targets は単一テストスレッドで 1348 件成功、参照 fixture 1 件 ignored。
 
 ## v0.4.12: Worker 本文・履歴の S3 保存
 
