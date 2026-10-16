@@ -772,6 +772,7 @@ narou setting name         # 読み取り
 - 保存方式の読み取りが失敗した場合は不明／失敗として表示し、YAML と推定しない。Worker は D1 固定と表示し、切替操作を出さない。native の実際の方式切替だけが再起動を要求する。
 - Worker の本文・旧本文は、話単位の圧縮 S3 オブジェクトと D1 参照へ移行できる。`GET/POST /api/admin/content-migration` が `plan` / `copy` / `verify` / `cutover` / `purge` / `gc` / `status` を提供し、`scripts/migrate-worker-content.mjs` で CLI から再開可能な移行を実行する（既定は計画のみ、`--apply` で旧 D1 本文の削除まで実行）。本文用 `content_backend` と挿絵用 `asset_backend` は独立し、native の保存方式は変えない。
 - Worker は本文ストア初期化時、`content_backend` 未設定で旧本文が無ければ `s3`、旧本文・履歴があれば `migrating` を保存し、新しい本文を S3 に置く。明示的な `d1` は S3 必須でない環境だけで維持し、`NAROU_REQUIRE_S3=true` では同じ規則で移行開始する。S3 構成に成功してから状態を原子的に保存し、既存の `migrating` / `s3` を戻さない。一括コピー・照合・旧 D1 本文削除は引き続き管理 API で実行し、`plan` / `status` は読み取りだけである。
+- 本文移行の保守スクリプトを再実行すると、コピー・照合・切替・旧本文削除の完了済み段階を飛ばし、未完了の段階から継続する。検証途中のカーソルを先頭へ戻さず、検証済み件数を二重計数しない。
 - Worker の更新は旧本文を履歴へコピーしてから新本文を保存し、PUT 失敗でも現行本文を維持する。改題された話の旧ファイル名は新本文と目次の保存後に削除する。native の履歴移動は従来どおり。
 - Worker の本文分類はサブディレクトリ内の作品フォルダ名が `本文` でも、`toc.yaml` / `converter.yaml` / `.illustration_cache.yaml` を D1 に維持する。migration 0012 が既存 DB の移行対象ビューと書き込みガードも更新し、本文削除後の EPUB 生成・再起動を実 Worker で確認している。
 
