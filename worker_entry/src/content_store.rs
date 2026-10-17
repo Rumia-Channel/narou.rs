@@ -38,21 +38,43 @@ fn error(value: impl std::fmt::Display) -> NarouError {
     NarouError::Platform(format!("content storage: {value}"))
 }
 
-pub async fn backend(db: &DbHandle) -> Result<ContentBackend> {
-    #[derive(Deserialize)]
-    struct Row { value_json: String }
-    let row = db.prepare("SELECT value_json FROM app_state WHERE scope='inv' AND key='content_backend'")
-        .first::<Row>(None).await.map_err(error)?;
-    let Some(row) = row else { return Ok(ContentBackend::D1); };
-    let value = match row.value_json.as_str() {
-        "d1" | "migrating" | "s3" => row.value_json,
-        _ => serde_json::from_str::<String>(&row.value_json).map_err(|_| error("invalid content_backend marker"))?,
+#[derive(Deserialize)]
+struct BackendRow { value_json: String }
+
+fn parse_backend(value: String) -> Result<ContentBackend> {
+    let value = match value.as_str() {
+        "d1" | "migrating" | "s3" => value,
+        _ => serde_json::from_str::<String>(&value).map_err(|_| error("invalid content_backend marker"))?,
     };
     match value.as_str() {
         "d1" => Ok(ContentBackend::D1),
         "migrating" => Ok(ContentBackend::Migrating),
         "s3" => Ok(ContentBackend::S3),
         _ => Err(error("content_backend must be d1, migrating, or s3")),
+    }
+}
+
+/// Distinguish an uninitialized library from an explicit legacy opt-out.
+pub async fn stored_backend(db: &DbHandle) -> Result<Option<ContentBackend>> {
+    let row = db.prepare("SELECT value_json FROM app_state WHERE scope='inv' AND key='content_backend'")
+        .first::<BackendRow>(None).await.map_err(error)?;
+    row.map(|row| parse_backend(row.value_json)).transpose()
+}
+
+/// Report persisted migration state without initializing or modifying it.
+pub async fn backend(db: &DbHandle) -> Result<ContentBackend> {
+    Ok(stored_backend(db).await?.unwrap_or(ContentBackend::D1))
+}
+
+/// Call only after constructing the S3 store successfully. The legacy-content
+/// check and marker transition are one statement, so no old body is stranded.
+pub async fn initialize_s3_default(db: &DbHandle, required: bool) -> Result<ContentBackend> {
+    let row = db.prepare(sql::INITIALIZE_S3_DEFAULT)
+        .bind(&[JsValue::from_f64(if required { 1.0 } else { 0.0 })]).map_err(error)?
+        .first::<BackendRow>(None).await.map_err(error)?;
+    match row {
+        Some(row) => parse_backend(row.value_json),
+        None => backend(db).await,
     }
 }
 

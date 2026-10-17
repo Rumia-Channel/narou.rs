@@ -22,6 +22,7 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
     Emit(Expr),
+    Fail(Expr),
     InsertAtMatch,
 }
 
@@ -30,8 +31,14 @@ pub enum Expr {
     String(Vec<StrPart>),
     Regex(String, String),
     ExtractJson(String, String),
+    Extract(String, String),
     Request(Box<Expr>),
     FetchJson(Box<Expr>),
+    PostForm {
+        url: Box<Expr>,
+        fields: Box<Expr>,
+        headers: Option<Box<Expr>>,
+    },
     Arith(Box<Expr>, ArithOp, Box<Expr>),
     Access(Accessor),
     Chain {

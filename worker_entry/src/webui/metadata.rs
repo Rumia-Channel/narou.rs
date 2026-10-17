@@ -39,10 +39,10 @@ pub(crate) fn settings(env: &Env) -> worker::Result<SettingsService> {
     Ok(SettingsService::new(Arc::new(D1SettingsStore::new(database(env)?))))
 }
 
-/// 更新系ハンドラ用の `SettingsService`。`D1SettingsStore::for_writes` は
+/// 編集画面と更新系ハンドラ用の `SettingsService`。`D1SettingsStore::for_writes` は
 /// `load` で isolate キャッシュを介さず、primary ハンドルへ読みに行くので、
-/// read-modify-write (`set` / `set_raw` / `apply`) が古いスナップショットを
-/// 書き戻さない。
+/// 編集画面の期待値や read-modify-write (`set` / `set_raw` / `apply`) が
+/// 古いスナップショットを使わない。
 pub(crate) fn settings_for_writes(env: &Env) -> worker::Result<SettingsService> {
     Ok(SettingsService::new(Arc::new(D1SettingsStore::for_writes(
         primary_database(env)?,

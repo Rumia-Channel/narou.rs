@@ -95,6 +95,7 @@ the time of this audit.
 | parking_lot | ^0.12 | MIT OR Apache-2.0 |
 | pest | ^2.8 | MIT OR Apache-2.0 |
 | pest_derive | ^2.8 | MIT OR Apache-2.0 |
+| psl | ^2.1.241 | MIT/Apache-2.0 |
 | regex | ^1 | MIT OR Apache-2.0 |
 | reqwest | ^0.13 | MIT OR Apache-2.0 |
 | rusqlite | ^0.40 | MIT |
@@ -131,7 +132,7 @@ dependency).
 
 | License | Used by |
 | --- | ---: |
-| MIT License | 353 |
+| MIT License | 354 |
 | Unicode License v3 | 19 |
 | ISC License | 18 |
 | Apache License 2.0 | 13 |
@@ -1590,7 +1591,7 @@ limitations under the License.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_rs 0.4.12
+- narou_rs 0.4.13
 
 ```text
 BSD 2-Clause License
@@ -1914,7 +1915,7 @@ insights.
 
 Used by:
 - aozora_epub3_lite 0.1.6
-- narou_worker 0.4.12
+- narou_worker 0.4.13
 
 ```text
 GNU GENERAL PUBLIC LICENSE
@@ -6684,6 +6685,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 ### MIT License (`MIT`)
 
 Used by:
+- psl 2.1.241
 - publicsuffix 2.3.0
 
 ```text

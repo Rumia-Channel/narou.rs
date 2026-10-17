@@ -98,6 +98,32 @@ fn load_stored_illustration_index(objects: &dyn ObjectStore, prefix: &crate::pla
     }
 }
 
+/// Read the canonical per-novel INI, not a stale pre-migration mirror.
+pub(crate) fn load_novel_ini(novel_dir: &Path) -> crate::error::Result<crate::converter::ini::IniData> {
+    use crate::converter::ini::IniData;
+    use crate::native::object_store::{NativeStore, logical_key_for_native_path};
+
+    let path = novel_dir.join("setting.ini");
+    let Some(root) = novel_dir.ancestors().find(|root| root.join(".narou").is_dir()) else {
+        return IniData::load_file(&path);
+    };
+    let archive_root = root.join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+    let Some(key) = logical_key_for_native_path(&archive_root, &path) else {
+        return IniData::load_file(&path);
+    };
+    let store = NativeStore::for_narou_root(root)?;
+    if matches!(&store, NativeStore::Fs(_)) {
+        return IniData::load_file(&path);
+    }
+    let Some(bytes) = futures::executor::block_on(store.read_small(&key))? else {
+        return Ok(IniData::new());
+    };
+    let text = String::from_utf8(bytes).map_err(|error| {
+        crate::error::NarouError::Platform(format!("setting.ini is not UTF-8: {error}"))
+    })?;
+    Ok(IniData::load(&text))
+}
+
 /// Drive store I/O from a synchronous converter, including callers already on Tokio.
 /// Borrowed futures move to a scoped thread before entering a separate runtime.
 pub(crate) fn run_store_io<F, T>(future: F) -> crate::error::Result<T>

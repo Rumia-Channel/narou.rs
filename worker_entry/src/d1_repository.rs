@@ -165,21 +165,31 @@ impl NovelRepository for D1NovelRepository {
         })
     }
 
-    fn allocate_id(&self) -> PlatformFuture<'_, Result<NovelId>> {
+    fn allocate_id(&self) -> PlatformFuture<'_, Result<narou_rs::platform::NovelIdReservation>> {
         Box::pin(async move {
-            let update = self.prepare(novel_query::ALLOCATE_STEP_SQL, Vec::new())?;
+            let reserve = self.prepare(novel_query::ALLOCATE_STEP_SQL, Vec::new())?;
+            let bump = self.prepare(novel_query::ALLOCATE_BUMP_SQL, Vec::new())?;
             let select = self.prepare(novel_query::ALLOCATE_READ_SQL, Vec::new())?;
-            let results = self.db.batch(vec![update, select]).await.map_err(worker_error)?;
+            let results = self.db.batch(vec![reserve, bump, select]).await.map_err(worker_error)?;
             ensure_batch_success(&results)?;
             let row: SequenceRow = results
-                .get(1)
-                .ok_or_else(|| NarouError::Platform("D1 sequence returned no result".to_string()))?
+                .get(2)
+                .ok_or_else(|| NarouError::Platform("D1 reservation returned no result".to_string()))?
                 .results()
                 .map_err(worker_error)?
                 .into_iter()
                 .next()
-                .ok_or_else(|| NarouError::Platform("D1 sequence returned no id".to_string()))?;
-            Ok(NovelId(row.id))
+                .ok_or_else(|| NarouError::Platform("D1 reservation returned no id".to_string()))?;
+            Ok(narou_rs::platform::NovelIdReservation::new(NovelId(row.id), row.generation))
+        })
+    }
+
+    fn release_id(&self, reservation: narou_rs::platform::NovelIdReservation) -> PlatformFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let statement = self.prepare(novel_query::RELEASE_ID_SQL,
+                vec![BindValue::Int(reservation.id().0), BindValue::Int(reservation.generation())])?;
+            let result = statement.run().await.map_err(worker_error)?;
+            ensure_batch_success(&[result])
         })
     }
 
@@ -205,6 +215,10 @@ impl NovelRepository for D1NovelRepository {
                         let record = &normalized;
                         let max_id = record.id.saturating_add(1);
                         statements.push(self.prepare(NOVEL_UPSERT_SQL, record_binds(record)?)?);
+                        statements.push(self.prepare(
+                            novel_query::COMMIT_ID_RESERVATION_SQL,
+                            vec![BindValue::Int(record.id)],
+                        )?);
                         statements.push(self.prepare(
                             novel_query::DELETE_NOVEL_TAGS_SQL,
                             vec![BindValue::Int(record.id)],
@@ -702,6 +716,7 @@ struct IdRow {
 #[derive(Debug, Deserialize)]
 struct SequenceRow {
     id: i64,
+    generation: i64,
 }
 #[derive(Debug, Deserialize, Serialize)]
 struct StateRow {

@@ -11,6 +11,8 @@
 //! The transport (native curl/reqwest/wget fallback, Worker Fetch) only moves
 //! bytes; it never decodes and never decides what a 404 means.
 
+
+mod session;
 use crate::error::{NarouError, Result};
 use crate::platform::http::{RedirectChain, is_safe_header_name, is_safe_header_value};
 use crate::platform::{
@@ -32,6 +34,7 @@ pub struct FetchPolicy {
     narou: bool,
     /// Site definition's `min_interval`, applied to the rate-limit scope.
     min_interval: Option<f64>,
+    session: Option<std::sync::Arc<parking_lot::Mutex<session::SessionCookies>>>,
 }
 
 impl FetchPolicy {
@@ -44,13 +47,16 @@ impl FetchPolicy {
         }
         headers.extend(setting.header_list());
         headers.retain(|(name, value)| is_safe_header_name(name) && is_safe_header_value(value));
-        let mut cookie_hosts = setting.login_cookie_hosts.clone();
+        let mut cookie_hosts = Vec::with_capacity(1 + setting.cookie_hosts.len() + setting.login_cookie_hosts.len());
         cookie_hosts.push(setting.domain.to_ascii_lowercase());
+        cookie_hosts.extend(setting.cookie_hosts.iter().filter(|host| !host.is_empty()).map(|host| host.to_ascii_lowercase()));
+        cookie_hosts.extend(setting.login_cookie_hosts.iter().cloned());
         Self {
             headers,
             cookie_hosts,
             narou: setting.is_narou,
             min_interval: setting.min_interval,
+            session: setting.cookie_session.then(|| std::sync::Arc::new(parking_lot::Mutex::new(session::SessionCookies::default()))),
         }
     }
 
@@ -102,6 +108,8 @@ impl FetchPolicy {
         let mut headers = self.headers.clone();
         if !self.allows_cookie(url) {
             headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Cookie"));
+        } else if let Some(session) = &self.session {
+            session.lock().apply(url, &mut headers);
         }
         headers
     }
@@ -116,6 +124,12 @@ impl FetchPolicy {
         self.cookie_hosts.iter().any(|scope| {
             host == scope || host.strip_suffix(scope).is_some_and(|prefix| prefix.ends_with('.'))
         })
+    }
+
+    fn observe_response(&self, url: &str, response: &HttpResponse) {
+        if self.allows_cookie(url) && let Some(session) = &self.session {
+            session.lock().observe(url, response);
+        }
     }
 }
 
@@ -195,10 +209,14 @@ pub async fn resolve_final_url_with_body(
     loop {
         http.validate_url(&chain.request().url).await?;
         let scope = scope_for(host_of(&chain.request().url), policy);
+        let mut request = chain.request().clone().with_redirect(RedirectMode::Manual);
+        if chain.hops() > 0 && policy.allows_cookie(&request.url) && let Some(session) = &policy.session {
+            session.lock().apply(&request.url, &mut request.headers);
+        }
         let response = http.send_paced(
-            chain.request().clone().with_redirect(RedirectMode::Manual),
-            crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
+            request, crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
         ).await?;
+        policy.observe_response(&chain.request().url, &response);
         if !chain.advance(&response)? {
             // Only an immediate terminal answer can be reused: later hops
             // may have a different cookie scope than the caller's fetch.
@@ -229,18 +247,81 @@ pub async fn fetch_bytes(
     url: &str,
     policy: &FetchPolicy,
 ) -> Result<HttpResponse> {
-    http.validate_url(url).await?;
-
     let mut request = HttpRequest::get(url);
-    for (name, value) in policy.headers_for(url) {
-        request = request.with_header(name, value);
-    }
+    request.headers = policy.headers_for(url);
+    send_request(http, rate_limiter, request, policy).await
+}
 
-    let scope = scope_for(host_of(url), policy);
-    let response = http.send_paced(
-        request, crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
-    ).await?;
-    ensure_success_response(url, response)
+/// Fetch an encoded form through the site's credentials and admission policy.
+pub async fn fetch_form_text(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
+    url: &str,
+    body: String,
+    headers: Vec<(String, String)>,
+    policy: &FetchPolicy,
+    encoding: Option<&str>,
+) -> Result<String> {
+    let mut request = HttpRequest::post(url, body);
+    request.headers = policy.headers_for(url);
+    request.headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-type"));
+    request.headers.push(("Content-Type".into(), "application/x-www-form-urlencoded".into()));
+    for (name, value) in headers {
+        if !is_safe_header_name(&name) || !is_safe_header_value(&value)
+            || matches!(name.to_ascii_lowercase().as_str(),
+                "cookie" | "host" | "authorization" | "proxy-authorization"
+                | "content-length" | "content-type" | "transfer-encoding")
+        {
+            return Err(NarouError::SiteSetting("unsafe form request header".into()));
+        }
+        request.headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
+        request.headers.push((name, value));
+    }
+    let response = send_request(http, rate_limiter, request, policy).await?;
+    Ok(decode_with_encoding(&response.body, encoding))
+}
+
+async fn send_request(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
+    request: HttpRequest,
+    policy: &FetchPolicy,
+) -> Result<HttpResponse> {
+    if policy.session.is_none() && request.method == crate::platform::HttpMethod::Get {
+        http.validate_url(&request.url).await?;
+        let scope = scope_for(host_of(&request.url), policy);
+        let url = request.url.clone();
+        let response = http.send_paced(
+            request, crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
+        ).await?;
+        return ensure_success_response(&url, response);
+    }
+    let form_origin = (request.method == crate::platform::HttpMethod::Post)
+        .then(|| url::Url::parse(&request.url).map(|url| url.origin()))
+        .transpose().map_err(|error| NarouError::Http(error.to_string()))?;
+    let mut chain = RedirectChain::new(request, MAX_REDIRECTS);
+    loop {
+        let current = &chain.request().url;
+        http.validate_url(current).await?;
+        if let Some(origin) = &form_origin {
+            let target = url::Url::parse(current).map_err(|error| NarouError::Http(error.to_string()))?;
+            if target.origin() != *origin {
+                return Err(NarouError::Http("form redirect changed origin".into()));
+            }
+        }
+        let mut outgoing = chain.request().clone().with_redirect(RedirectMode::Manual);
+        if chain.hops() > 0 && policy.allows_cookie(current) && let Some(session) = &policy.session {
+            session.lock().apply(current, &mut outgoing.headers);
+        }
+        let scope = scope_for(host_of(current), policy);
+        let response = http.send_paced(
+            outgoing, crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
+        ).await?;
+        policy.observe_response(current, &response);
+        if !chain.advance_parts(response.status, response.header("Location"))? {
+            return ensure_success_response(&chain.request().url, response);
+        }
+    }
 }
 
 fn scope_for(host: String, policy: &FetchPolicy) -> RateLimitScope {
@@ -433,6 +514,9 @@ top_url: https://example.com
 sitename: Example
 toc_url: https://example.com/\k<ncode>
 cookie: session=canary
+cookie_hosts:
+  - AUTHORS.example.net
+  - ""
 headers:
   Referer: https://example.com/
 "#,
@@ -446,14 +530,20 @@ headers:
                 .iter()
                 .any(|(name, value)| name == "Cookie" && value == "session=canary")
         );
-        let off_site = policy.headers_for("https://collector.example.net/a.png");
-        assert!(
-            !off_site
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("cookie")),
-            "the cookie must stay on the site: {off_site:?}"
-        );
-        assert!(off_site.iter().any(|(name, _)| name == "Referer"));
+        let author_site = policy.headers_for("https://authors.example.net/list");
+        assert!(author_site.iter().any(|(name, value)| name == "Cookie" && value == "session=canary"));
+        for url in [
+            "https://collector.example.net/a.png",
+            "https://authors.example.net.attacker.test/a.png",
+            "https://collector.example.net./a.png",
+        ] {
+            let off_site = policy.headers_for(url);
+            assert!(
+                !off_site.iter().any(|(name, _)| name.eq_ignore_ascii_case("cookie")),
+                "the cookie must stay on declared hosts: {url}: {off_site:?}"
+            );
+            assert!(off_site.iter().any(|(name, _)| name == "Referer"));
+        }
     }
 
     #[test]

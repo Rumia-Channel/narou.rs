@@ -282,15 +282,17 @@ pub trait NovelRepository: PlatformService {
         -> PlatformFuture<Result<Vec<NovelRecord>>>;
     fn scan_ids(&self, filter: &NovelFilter, after_id: Option<NovelId>, limit: usize)
         -> PlatformFuture<Result<Vec<NovelId>>>;
-    fn allocate_id(&self) -> PlatformFuture<Result<NovelId>>;
+    fn allocate_id(&self) -> PlatformFuture<Result<NovelIdReservation>>;
+    fn release_id(&self, reservation: NovelIdReservation)
+        -> PlatformFuture<Result<()>>;
     fn apply_batch(&self, mutations: Vec<NovelMutation>)
         -> PlatformFuture<Result<()>>;
 }
 ```
 
 - 表示系は `NovelQuery::page(filter, sort, offset, limit)` を使う。`scan_ids` は `id > after_id ORDER BY id LIMIT n` の keyset pagination で、バックグラウンド一括処理のために使う。
-- `allocate_id` は共有 DB ロック内で単調増加カーソルを予約する。呼び出し側が `max(id) + 1` を計算することは禁止。予約された ID の間隔は許容する。
-- `apply_batch` は複数の upsert/remove を一回の YAML 更新として永続化する。
+- `allocate_id` は ID と世代番号を持つ `NovelIdReservation` を返す。呼び出し側で `max(id) + 1` を計算せず、登録前の失敗・キャンセルでは所有する予約を `release_id` へ渡す。解放済みの未登録 ID だけを再利用し、既存レコードや過去に登録された ID を詰め直さない。世代の違う古い解放要求は無効とし、並行取得中の予約を保護する。
+- `apply_batch` は複数の upsert/remove を一回の保存として永続化し、upsert した ID の予約を確定する。SQLite / D1 はレコード公開と予約の削除を同じ transaction / batch で行う。公開済みか曖昧な失敗でもレコードがある ID は再利用しない。
 - `find_by_title` は IndexStore の完全一致を先に使い、見つからない場合は大文字小文字を無視した完全一致へフォールバックする。`find_by_ncode` は `ncode` と legacy な `toc_url` suffix の双方を受理する。
 - Web の検索トークンは `SearchTerm`（field / negated / OR values）へ変換し、AND 条件として repository へ渡す。任意 predicate や `serde_yaml::Value` 条件は使わない。
 
@@ -302,9 +304,9 @@ pub trait NovelRepository: PlatformService {
 | `RateLimiter` | `src/downloader/rate_limit.rs` | `platform::RateLimiter::acquire` を実装。なろう系の既定 wait-steps も維持 |
 | `NativeNovelRepository` | `src/native/novel_repository.rs` | stateless adapter。`db::DATABASE` 内の単一 `Database` を共有し、YAML を二重ロードしない。async trait は runtime 内で `spawn_blocking`、CLI は `_sync` entry point を使う |
 
-`NativeNovelRepository` の record 操作は `get` / `find_*` / `count` / `query` / `scan_ids` / `allocate_id` / `apply_batch` に限定する。`IndexStore` の toc URL・タイトル索引は既存 `Database` 経由で維持する。`apply_batch` は一回の `database.yaml` 更新と index flush を行い、unknown fields、`raw_title`、nilable bool、日時型をそのまま保存する。
+`NativeNovelRepository` の record 操作は `get` / `find_*` / `count` / `query` / `scan_ids` / `allocate_id` / `release_id` / `apply_batch` に限定する。`IndexStore` の toc URL・タイトル索引は既存 `Database` 経由で維持する。`apply_batch` は一回の `database.yaml` 更新と index flush を行い、unknown fields、`raw_title`、nilable bool、日時型をそのまま保存する。
 
-`Database::next_id` はロード済み最大 ID と現在の予約値の最大値を保持する。`allocate_id` は共有 DB ロック内で cursor を increment して予約するため、並列 task が同じ ID を受け取らない。`refresh` は未コミット予約を巻き戻さない。
+`Database::id_allocator` は共有 DB ロック内で未登録予約・解放済み ID・世代番号・新規 ID の上限を管理する。Memory repository も同じ allocator を使い、`refresh` は有効な予約を保持して登録済み ID だけを除外する。SQLite / D1 adapter は migration 0013 の `novel_id_reservations` と共通 SQL を atomic transaction / batch で更新する。Downloader は登録に至らない結果から予約を解放し、リダイレクト先が既存作品だった場合も未使用の予約を戻す。
 
 **Phase 2 の注意**: `HttpFetcher`（`src/downloader/fetch.rs`）は削除済み。core の downloader は `Arc<dyn HttpClient>`、`Arc<dyn RateLimiter>`、`Arc<dyn NovelRepository>` を注入され、`http_policy` と repository trait 経由でのみ platform 実装へ触れる。
 

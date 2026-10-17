@@ -1,8 +1,12 @@
 # narou.rs 移植状況
 
-## 現況（v0.4.12）
+## 現況（v0.4.13 公開準備）
 
-正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.12へ統一する。公開状態は v0.4.12 の GitHub Release を正とし、リモートの常設ブランチは main / develop だけを維持する。
+正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.13へ統一済み。公開済み GitHub Release は現時点で v0.4.12。ユーザーから v0.4.13 のリリース依頼を受け、main への no-ff 統合・タグ作成・配布物検証を伴う公開作業を進める。リモートの常設ブランチは main / develop だけを維持する。
+
+版数の判断基準は GitHub の公開済み Release。最新公開版 v0.4.12 に対し、ユーザー指定の v0.4.13 を公開する。manifest の版数が先行していても公開済みとは見なさず、公開前の追加機能・修正・ツアーは同じ未リリース版へまとめる。GitHub Release は全配布 ZIP の確認まではドラフトにし、公開完了は GitHub の実データで確認する。
+
+0.4.13 検証: `cargo check --workspace --all-targets --all-features`、Native + Lite のビルドと実 CLI `version --more` の 0.4.13 表示が成功。標準 release Wasm を作り直し、実 Worker の `/api/version/current.json` が 0.4.13、HTTP 契約 103 件・作者追跡 6 シナリオ・全 S3 保存 smoke・Python 74 件が成功した。版数の非空だけを検査する旧 assertion は削除し、実値は使い捨ての API プローブで確認した。cargo-about 0.9.2 で両 notice を生成し、直接依存 56 件の表も一致。root 419 / non-GPL probe 394 の lock graph は自プロジェクトの版数以外に変更が無い。
 
 共有化: application use-case、settings/setting_core、download_targets、retry_policy、push_events、MessageContext/progress、HTTP RedirectChain/send_paced、ObjectStore::update_small、EPUB EpubPreparation/EpubBuild。同時INI更新はFS lock/SQLite Immediate/D1 primary full raw snapshot CAS、正準保存後のミラー失敗もACKに反映。CRC衝突を同値扱いしない。Workerの出力/debug/表示先をfuture poll単位に束縛し、operation ID/seqで並列進捗を分離。native Web更新もサイト別並列取得。
 
@@ -16,6 +20,88 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 
 0.4.11 最終監査で確認したデータ保全の修正: SQLite のインプレース YAML 書き出しは meta の export_file_sha 指紋を原子的なファイル保存より前に記録し、失敗後の未編集の書き出し残骸を再取り込みしない。管理状態だけでなく database.yaml の作品レコードも対象。ユーザーの編集と narou-compat のファイル優先は維持する。S3 COPY は完全な CopyObjectResult と ETag/LastModified を確認できた場合だけ成功し、200 内 Error・破損応答では元オブジェクトを削除しない。実 HTTP の失敗／成功ケースと、書き出し失敗後の正常保存→再オープンを smoke で確認済み。
 指紋は既存の未編集 projection と次回公開予定を最大2件保持し、2回目が公開前に中断しても保護を失わない。指紋更新と公開は同一ファイルロック内。--out が実 .narou を指す場合も対象。最終 workspace 全 target は1342成功/0失敗/1ignored、Clippy 全 feature -D warnings・Rustdoc -D warnings・core/Worker wasm check 成功。Web CSRF 回帰 fixture は並行CWD変更に影響されない絶対パスへ修正し、HTTPの拒否/許可とキュー状態の検証内容は維持した。
+
+## 未リリース: 既存作品の個別変換設定を正準ストアへ統一（issue #37）
+
+- ミラー無効の SQLite ライブラリで、Web UI は正準 INI を更新するが `NovelSettings::load_for_novel_with_options` は移行前の実ファイルを読んでいた。`native::converter::load_novel_ini` に読み出しを揃え、残存ファイルより SQLite の値を優先する。旧ファイルを上書きして整合させず、YAML / ライブラリ外のファイル読み出しは従来どおり。共有コンストラクタの呼出元にも反映され、公開シグネチャや default / force の優先順は変えない。
+- Documents/WebNovel 配下の Rust TempDir に旧ファイルが残る作品と DB のみの作品を用意。実 Web API が新しい題名・著者名を保存しても、修正前は旧作品だけ生成 txt の先頭 2 行が旧設定、新作品は新設定になることを確認した。
+- 修正後は実ブラウザの個別設定画面で題名・著者名を編集・保存し、実 CLI が `[更新した著者] 更新した題名.txt` を生成、本文の先頭も新しい題名・著者名になった。旧 `setting.ini` は元の 2 行のままで、読み出しによる上書きは無い。Firefox と browser broker は起動できず、独立 Chrome DevTools の検証タブで実画面・保存を確認した。検証タブ・サーバ・ライブラリは終了・削除済み。
+- `cli_compat_boundaries` 6 件と settings の既存 7 件が成功。新しい回帰はミラー有効 / 無効、旧ファイルあり / DB のみ、再編集・設定解除、生成本文の題名・著者名・本文、旧ファイル不変と取り出しファイルの後片付けを実 CLI で検証する。版数は未リリース 0.4.13 のまま。
+- 両 issue 修正後の最終検証: `cargo test --workspace --all-targets --all-features` は 1,367 成功 / 参照 fixture 1 ignored、workspace 全 target / 全 feature の Clippy `-D warnings` と Worker wasm32 check が成功した。依存・lock・ライセンス表示の変更は無い。
+
+## 未リリース: clean の長時間走査を修正（issue #38）
+
+- `clean` のストア走査は小説全体の再帰一覧を 512 件ずつ取得し、そのたびに SQLite / 実ファイルの全キーを集め直していた。`NativeStore::list_direct_files_sync` で raw / 本文直下だけを取得し、SQLite は object_key の索引範囲と直下判定を使う。正準 DB と実ファイルのみの孤児を併合し、履歴や挿絵を歩かない。
+- Documents/WebNovel 配下の Rust TempDir に履歴 4,096 件を持つ SQLite ライブラリを作り、実 CLI で修正前は `clean -af` / 個別 clean が各 10 秒の検証期限を超えた。同じプローブで修正後は約 183ms / 162ms で正常終了し、孤児の削除と現行本文の保持を確認した。ユーザー報告の 1 時間待機そのものを計測した結果ではない。
+- `commands::clean` 2 件と `cli_compat_boundaries` 5 件が成功。追加の回帰はミラー有効 / 無効、DB のみ・FS のみの孤児、513 件の履歴、凍結作品、dry-run の不変性を実 CLI と正準オブジェクトの全 snapshot 比較で確認する。版数は未リリース 0.4.13、CI の監視はユーザー指示で issue 対応後へ延期する。
+
+## 未リリース: Worker 設定編集の偽の競合を修正
+
+- develop の配備 run `39035933191` は Worker のビルド・配備・S3 LIST が成功し、smoke の「stale expected value」検査の最初の保存だけ HTTP 409 (82/83 成功) で失敗していた。設定 GET は replica / isolate TTL cache、POST は primary / fresh という不一致が原因。
+- 実 Rust Worker Wasm を 2 isolate + 共有ローカル D1 に載せ、reader のキャッシュを温めて writer から保存すると、新しい編集 GET が旧値を返して初回保存から 409 になることを再現した。`GET /api/global_setting` も既存 `metadata::settings_for_writes` で primary / fresh を使い、一覧・通常の表示設定のキャッシュは変更しない。scope 単位 CAS と本物の stale save の 409 は維持する。
+- 同じ使い捨てプローブで修正後は他 isolate の勝者を取得・初回保存 200・古い画面の保存 409・勝者保持を確認。失敗した既存 HTTP 契約も実ローカル Worker に対して 1 件成功し、契約の勝者検査は no-op POST ではなく編集 GET の現在値で確認するよう更新。標準 `worker-build --release` (wasm-opt 込み) と Worker Wasm Clippy `-D warnings` が成功。
+- ローカル Miniflare の workerd は compatibility date 2026-08-06 までのため、その日付で検証した。PushHub はこの metadata 専用 fixture に接続しておらず配信の検証には数えない。元ライブラリ・資格情報には触れず、Rust TempDir 所有の npm/runtime 領域・使い捨てソースは削除済み。版数は未リリース 0.4.13 のまま。
+
+## 未リリース: 0.4.13 の機能ツアー
+
+- 共通の `application::webui::feature_tour::FEATURE_TOURS` に、アルファポリスの小説・作者一覧対応とカクヨムネクスト対応を追加。無料分、レンタル・契約に応じたログイン Cookie の利用、既存本文の保護を説明し、通常の公開作品へのログインを要求しない。
+- GitHub `/releases/latest` が v0.4.12 を指すことを確認し、ユーザー指定の v0.4.13 を維持。root / Worker manifest、各 lock、ライセンス表示は既に 0.4.13 のため変更しない。未公開版をさらに 0.4.14 へ進めない基準を AGENTS.md に保存した。
+- 実 Native Web UI を Documents/WebNovel 配下の Rust TempDir で起動し、Firefox で両項目と v0.4.13 表示・横溢れなしを確認。旧ツアー既読状態から新項目だけ表示され、既読保存後の次回画面読み込みでは表示されない。全ツアー API には両項目が残る。検証タブ・サーバ・ライブラリ・使い捨てソースは終了・削除済み。実 CLI `version --more` も 0.4.13 (local-build) で正常終了した。
+- `cargo check --workspace --all-targets --all-features`、Native 全 workspace / 全 target / 全 feature の 1,365 成功・参照 fixture 1 ignored、Worker Wasm check が成功。最新ツアーを 0.4.3 に固定した実装依存 assertion は削除し、新版への固定し直しは行わない。既読状態の後退防止・表示対象の版数境界の回帰は維持した。依存・lock・ライセンス表示の変更はない。
+
+## 未リリース: カクヨムネクストのログインと無料分取得
+
+- `webnovel/kakuyomu.jp.yaml` を version 2.6 へ更新。`login_url` は `/auth/login`、`login_partial_pattern` は DSL の中間目次に出る `EmptyEpisode`。保存済みログインを既存の共通経路で試し、改善した資格情報を本文取得と次回更新に使う。サイト固有の Rust 分岐は追加しない。
+- ユーザーの指定に従い、未ログイン・閲覧権なしでも警告付きで無料分を取得する。無料分から、Cookie 保存後の全話への追加取得も可能。通常の公開作品には保存 Cookie を送らない。
+- 共通 downloader は部分一覧に保存済みの ID が欠ける場合、削除・ダイジェスト化・404 凍結とは判定せず `Canceled` で更新を見送る。force でも目次・本文を保持し、閲覧可能 0 話の部分一覧は空の小説として登録しない。ファイル出力名の変更もこの判定後に行う。警告は共通 `application::messages::download` から出す。
+- 本文 URL が作品トップへ戻され、本文枠が無い場合は YAML / DSL の `fail` で止め、空本文をキャッシュ・保存しない。`extract` は既存例と同じく `let` で受け取る（条件式内の直接呼び出しは評価されない）。
+- 指定作品 `2912051601247823656` は匿名の実ページで全 129 話のうち `Episode` 50 / `EmptyEpisode` 79。実 Native CLI で無料 50 話の本文ファイルと目次、レコードの `general_all_no=50`、Lite EPUB 65 エントリを確認し、再更新は変更なし。通常作品 `2912051601856437328` も 2 話の実取得・EPUB 生成が成功。制限された第 51 話は作品トップへ戻り、直接本文を取る経路でもエラーになることを確認した。
+- 実 Edge と `narou_rs_login` がカクヨムのログイン画面を開くことを確認。ユーザーが NEXT 契約アカウントの Cookie を取得した後、実ライブラリ ID:24 (`2912051601247823656`) で匿名の無料 50 話から全 129 話へ取得範囲が増え、本文・EPUB・再更新の変更なしを確認した。資格情報と本文は実ライブラリへ保持する。Edge は Windows の `USERPROFILE` を架空の空ホームへ変えると DevTools 起動に失敗するため、ブラウザは実環境を継承して `--profile` のみ隔離する。
+- `tests/kakuyomu_login.rs` の 6 件で、匿名・権利なしの無料分、資格情報の試行・セッション ID 再利用、無料分からの追加取得、権利失効後の保持（force 含む）、0 話拒否、公開作品への Cookie 非送信、制限画面の空本文化防止を確認。変更前の失敗を確認してから修正した。Native workspace / all-targets / all-features は 1,366 成功・参照 fixture 1 ignored、Native / Worker Wasm Clippy と Rustdoc は `-D warnings` で成功。
+- 実サイト検証は Documents/WebNovel 配下の専用領域と Rust TempDir で行い、元ライブラリの ACL は変更しない。unit suite の `TEMP` / `TMP` は workspace `target` に向ける（通常の TEMP は sandbox 書込み不可、WebNovel 配下だと「未初期化」のテストが祖先の `.narou` を発見してしまう）。コマンド集計は 24 完了 / 4 部分 / 0 未実装を維持する。実 Cloudflare 配備・取得は今回の検証に含めない。
+
+## 未リリース: アルファポリスとログイン Cookie
+
+- `webnovel/www.alphapolis.co.jp.yaml` (version 1.4) を追加・更新。小説トップ・各話 URL を作品トップへ正規化し、`app-cover-data` の配列順で章と閲覧可能な話を読む。未レンタル話は `login_partial_pattern` で検出し、無料公開・レンタル済み分だけを取得する。章名は最初に閲覧できる話へ付け、全話が閲覧不可の章は出力しない。題名・作者・あらすじ・タグ・日時・文字数・完結・R18 判定、本文の CSRF フォーム送信、作者一覧とページ送りは YAML / DSL に置き、サイト専用の Rust 分岐は追加しない。
+- 汎用 DSL に `extract(/.../)` / `post_form(url, fields, headers?)` / `fail` を追加。フォームは同一 origin のみ、資格情報ヘッダ注入は拒否。URL・本文・ヘッダで要求を区別し、結果は 1 回の前処理だけ保持する（257 話の同一 POST 先でも混同・累積しない）。失敗時に途中の source を公開しない。
+- `cookie_session: true` は FetchPolicy 内だけの Cookie を origin・Path・Secure・期限で制限する。保存ログインとは分離。`illust_from_raw: false` は解析済み本文・前後書きだけを走査し、空の reader ページにある UI 画像を取らない。実取得で `data:image` を URL として要求した問題を再現し、本文画像だけの実体・索引保存を回帰で確認した。
+- 指定作品 `166360898/202065994` は実 Native CLI で全 36 話保存・更新なし・青空テキスト 32,556 文字・Lite EPUB 65 エントリとルビを確認。指定作者は 17 URL の集合を照合し、取得済み 1 件を除く 16 件を実 `author check --dry-run` で確認。別作者 `670425836` は 2 ページの 39 作品を列挙。短い作品 `260002762/818069876` も目次 3 話と本文を実取得した。
+- `666146886/441062651` の未レンタル話を含む目次で全体が NotFound になることを匿名・保存 Cookie の両方で再現し、YAML で部分取得へ修正。実 CLI で無料公開 167 話・22 区分を保存し、ユーザーがレンタルした 6巻4話 (`1639957`) を通常の update で追加、合計 168 話・`requires_login=true` と session ID の保存を確認。既存 167 本文はハッシュ不変。青空テキストと Lite EPUB の 22 大見出し・168 話見出しを順序まで照合し、全ナビゲーション先と ZIP CRC が正常 (414 エントリ)。再更新は変更なし、目次と本文 169 ファイルのハッシュ不変。
+- R18 指定作 `528033569/927510111` は新規の匿名 Cookie セッションで HTTP 200、目次 4 話・第 1 話本文 6,175 bytes を取得でき、ログイン必須ではなかった。既存 `over18=false` は取得を拒否してレコードを作らない。未レンタル話が残っても取得範囲を警告して閲覧可能分を保存し、保存済みの話が欠ける部分一覧では更新を見送る。電子書籍特典は未対応。
+- `narou_rs_login` は親ドメイン・作者/トップ URL でもサイトを選択する。末尾 2 ラベルだけでは他の `*.co.jp` まで同じログインへ混入することを failing-before で確認し、`psl` による登録ドメイン判定へ置換。Cookie の収集・サイト名への畳み・親ホスト検索を修正した。新規依存 `psl` と probe lock、直接依存 57 件の表、GPL / 非 GPL notice を同期。
+- 共通 downloader の「prefetched GET のログイン壁で fallback 前に return」「HTTP 200 の壁が残る資格情報を採用」「error_message が無い壁から題名なし・0 話で成功登録」を再現し修正。親ドメインの Cookie、期限切れ→有効な資格情報の選択、本文フォームへの適用、session ID 保存、次回先頭からの利用を回帰で確認。helper の保存後検証も共通 fetch / YAML 前処理へ統一した。
+- 実 Edge のまっさらなプロファイルで `www.alphapolis.co.jp` 4 Cookie + 親ドメイン 1 Cookie を取得し、1 ログイン・2 ホストで暗号化保存、暗号化 version 3 export、実 CLI import/list、保存 Cookie 付き作品取得確認まで成功。Chrome はこの環境で DevTools ポートへ接続できず、Edge を明示指定した。追加検証ではユーザーの実アカウント Cookie でサイトの `login_status=true` とレンタル済み本文の取得を確認。購入・レンタル操作そのものはユーザーが行い、検証プログラムからは実行していない。
+- 先行の使い捨て検証は Documents/WebNovel 配下の専用領域と Rust TempDir を使い、元ライブラリの ACL は維持した。専用領域のブラウザプロファイル・使い捨てソースは削除済み。今回ユーザーが保存したログイン Cookie と、実ライブラリの ID:25 の本文・EPUB は保持している。
+- 今回の Native workspace / all-targets / all-features は分割実行で 1,367 成功（lib 1,135 + bin / integration / examples 232）・参照 fixture 1 ignored。全 target Clippy `-D warnings` と Worker Wasm check が成功。Alpha/NEXT の対象回帰は 14 成功。依存・ライセンスは今回変更なし。コマンド集計は 24 完了 / 4 部分 / 0 未実装を維持する。実 Cloudflare 上の取得・配備はこの結果に含めない。
+
+## 未リリース: DL 失敗時の ID 予約回収
+
+- 新規取得前に進めた ID を失敗時に戻さない問題を、404 の後の成功が ID:1 になる failing-before 回帰で再現。`NovelRepository::allocate_id` を ID + 世代番号の `NovelIdReservation` に変更し、未登録のエラー・キャンセル・保留と、既存作品へ解決された不要な予約を `release_id` で返す。既存作品・過去の欠番は詰め直さない。
+- Native Database / Memory repository は共通 allocator、SQLite / D1 adapter は migration 0013 と共通 SQL を使う。並行予約は一意、古い世代の解放は無効。upsert が予約を確定し、レコードが存在する ID はエラー後も再利用しない。登録済み ID を削除しても過去の予約から復活させない。
+- 実 CLI の YAML / SQLite 両モードで、同一バッチの存在しない作品 → 公開 3 話の作品が ID:0 に登録され、失敗を含む終了コード 1 と、その後の既存 ID 更新を確認。検証は Documents/WebNovel 配下の Rust TempDir で隔離し、元ライブラリや資格情報は変更しない。
+- 実 Miniflare / workerd のローカル D1 で production の予約 SQL と migration 0013 を実行し、16 並行予約の一意性・解放した 8 件だけの再利用・古い解放要求の拒否・登録済み/使用中 ID の保護・手動登録後の採番境界を確認。Worker handler からも同じ状態を読み出せた。実 Cloudflare 配備やリモート D1 での検証ではない。使い捨てソース・npm ツール領域・検証ライブラリは削除済み。
+- Native workspace / all-targets / all-features は 1,366 成功・参照 fixture 1 ignored。新 migration の追加で壊れた「最新版は 12」という実装依存 assertion は削除し、v6 / v8 の実データ保存と失敗時の rollback 回帰は維持した。Native 全 target Clippy と Worker Wasm Clippy は `-D warnings`、Worker Wasm check も成功。依存・ライセンス・版数は変更せず、コマンド集計は 24 完了 / 4 部分 / 0 未実装を維持する。
+
+## 未リリース: Workers の本文を S3 基本にする
+
+- `composition::build_object_stores` は S3 構成成功後に `content_store::initialize_s3_default` を通す。未設定なら旧本文・履歴の存在に応じて `migrating` / `s3` を primary の単一 SQL で保存し、新しい本文は S3 に置く。明示的な `d1` は非必須環境だけに残し、`NAROU_REQUIRE_S3=true` では同じ規則で進める。`migrating` / `s3` は戻さず、失敗を D1 保存で隠さない。Native は変更なし。
+- 自動初期化は既存本文の一括コピー・削除を行わない。管理 API の `plan` / `status` は未設定状態を `d1` と報告する読み取り専用で維持する。旧本文の照合・切替・削除は既存の再開可能な移行処理を使う。
+- 標準 release Wasm（wasm-opt 込み）、Python 74 件（本文 SQL 17 件を含む）、実 Worker の既存本文移行・更新失敗・履歴・EPUB・purge・再起動と HTTP 契約 104 件、作者追跡 6 シナリオが成功。追加で未設定の新規ライブラリ、旧本文あり、S3 必須の明示 d1、S3 設定不正、初回 PUT 失敗と復旧の 5 ケースを隔離 D1 + S3 HTTP fixture で実行した。
+- develop 統合後、`tests/run.mjs --release` で更新した旧 D1 fixture の準備から実 Worker の起動・HTTP 契約 104 件・作者追跡 6 シナリオまで成功し、本文 SQL 17 件も再実行した。Worker の Wasm Clippy `-D warnings` も成功した。
+- 本文移行の保守スクリプトは `copy_done` / `verify_done` / `purge_done` と `backend` を見て完了済み段階を飛ばす。検証途中の再実行でコピーへ戻ってカーソルを消す不具合を、実 Worker の 5 参照・1 件検証済みからの再開で再現した（修正前は検証済みが 6 件へ増える）。修正後は 5 件で完了し、旧 D1 本文削除後の EPUB・全 S3 保存 smoke・HTTP 契約 104 件も成功した。
+- 自動初期化が先に `migrating` を保存した場合も、`copy` は予定件数が未記録なら旧本文の件数・圧縮前サイズを台帳へ記録する。旧本文 4 件と新規 S3 本文 1 件の実 Worker で予定件数が 0 になる失敗を再現し、修正後は予定 4 件・検証済み 5 件を再開・切替後も維持した。標準 release Wasm、Wasm Clippy `-D warnings`、全 S3 保存 smoke、HTTP 契約 104 件が成功した。
+- 本番の本文・履歴 3810 件を全件照合して `s3` へ切替え、旧 D1 本文を 3810 件削除した。残存旧本文・回収待ちは 0。本文は圧縮前 85,618,942 B / S3 保存後 26,284,224 B、D1 実容量は 3,026,944 B。切替後の S3 LIST も成功。SQL export を SQLite に復元し、目次・設定・挿絵索引等 214 オブジェクト、61 作品の全レコード、移行状態以外の 32 状態行が移行前と一致することを確認した。
+- 425 話の本番 EPUB を D1 保存時、併用時、全話 S3 参照時、旧 D1 本文削除後に実取得した。削除後も全 445 XHTML が移行前と byte 一致し、唯一の差は OPF の `dcterms:modified`。移行前後の復元済み DB・EPUB・結果は gitignore 済み `sample/worker-content-backups/` に保持する。保守接続と一時資格情報ディレクトリは終了・削除した。
+
+## 未リリース: R18 作者の全件列挙と Cookie 範囲
+
+- `SiteSetting::cookie_hosts` に Cookie 送信を許可する追加ホストを YAML で宣言し、共通 `FetchPolicy` が適用する。既定のサイト・保存ログインのホスト範囲は維持し、未宣言の第三者へ Cookie を送らない。R18 専用の Rust 分岐は追加しない。
+- `novel18.syosetu.com.yaml` を 2.5 に更新。作者プロフィールではなく `/mypage/novellist/xid/<x ID>/` を取得し、既存 DSL と `author_next_pattern` でページを辿る。作者用 `xmypage.syosetu.com` を Cookie 許可先に追加した。
+- `x1525cp` のプロフィールは最新 8 作品、全作品一覧は 10 + 2 の 12 作品。Cookie が無い応答で一覧を隠す回帰 fixture を追加し、実 Native CLI の登録・dry-run で全 12 URL を照合した。実作品のダウンロードはしていない。Native の downloader 回帰 172 件が成功。
+- Workers の `over18=false` は明示拒否で `Canceled` / `blocked` になるが、既存の汎用エラーは対話不能と表示する。許可は既存 Web UI「環境設定 → Global」の `over18` へ明示的に保存する。設定変更で既存の blocked ジョブを自動再投入しない。
+- 本番移行前の D1 読み取り調査では `content_backend` が未設定（= `d1`）、`content_objects` は 0 件で、本文・履歴は旧 D1 に保存されていた。0.4.12 の配備だけでは新規本文も S3 にならないことを確認した。画像の S3 選択と本文の切替は独立している。
+- 標準 release 設定の Wasm（wasm-opt 含む）を実行し、作者追跡 6 シナリオが成功。明示的な `over18=false` で同じ対象が blocked、Web 設定 API で true にした後は対話なしで取得成功し、単発作者取得は継続登録を作らないことも確認した。実 R18 作者は Worker HTTP API の dry-run でも全 12 URL が Native と一致した。検証プロセスと隔離 D1 は終了時に削除した。
+- 統合 CI で、CLI テストに旧プロフィール取得 URL を固定する assertion が残っていたため、その実装依存の固定だけを削除した。通常版プロフィールを R18 として認識しない境界と小説情報リンクの除外は維持し、取得先の正否は Cookie 付き複数ページの全件列挙回帰で確認する。補正後の Native 全 workspace / all-targets は単一テストスレッドで 1348 件成功、参照 fixture 1 件 ignored。
 
 ## v0.4.12: Worker 本文・履歴の S3 保存
 

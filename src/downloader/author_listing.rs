@@ -629,6 +629,60 @@ mod tests {
     }
 
     #[test]
+    fn r18_author_lists_all_works_from_novel_list_pages() {
+        struct AgeCookieClient(MockHttpClient);
+        impl HttpClient for AgeCookieClient {
+            fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
+                let adult = request.headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("cookie")
+                        && value.split(';').any(|cookie| cookie.trim() == "over18=yes")
+                });
+                if adult {
+                    self.0.send(request)
+                } else {
+                    Box::pin(async {
+                        Ok(HttpResponse {
+                            status: 200,
+                            headers: vec![],
+                            body: "年齢確認が必要です".as_bytes().to_vec(),
+                        })
+                    })
+                }
+            }
+        }
+        let setting = load("novel18.syosetu.com");
+        let page = "https://xmypage.syosetu.com/x1525cp/";
+        let first = "https://xmypage.syosetu.com/mypage/novellist/xid/x1525cp/";
+        let second = "https://xmypage.syosetu.com/mypage/novellist/xid/x1525cp/?xid=671458&all=1&p=2";
+        let http = MockHttpClient::new();
+        http.add_text(page, 200, r#"<a href="https://novel18.syosetu.com/n0001aa/">最新作</a>"#);
+        http.add_text(
+            first,
+            200,
+            r#"<a href="https://novel18.syosetu.com/n0001aa/">作品1</a>
+               <a href="https://novel18.syosetu.com/n0002aa/">作品2</a>
+               <a href="?xid=671458&amp;all=1&amp;p=1" class="c-pager__item" title="1ページ">1</a>
+               <a href="?xid=671458&amp;all=1&amp;p=2" class="c-pager__item" title="次へ">次へ</a>"#,
+        );
+        http.add_text(
+            second,
+            200,
+            r#"<a href="https://novel18.syosetu.com/n0003aa/">作品3</a>
+               <a href="?xid=671458&amp;all=1&amp;p=1" class="c-pager__item" title="前へ">前へ</a>"#,
+        );
+        let http = AgeCookieClient(http);
+        let urls = works(&http, &FakeRateLimiter::new(), &setting, page).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://novel18.syosetu.com/n0001aa/".to_string(),
+                "https://novel18.syosetu.com/n0002aa/".to_string(),
+                "https://novel18.syosetu.com/n0003aa/".to_string(),
+            ],
+        );
+    }
+
+    #[test]
     fn narou_author_api_pages_beyond_the_first_batch_are_followed() {
         // なろう小説API は 1 回に 500 件まで。500 件を超える作者は st を進めて
         // 続きを取り、総件数 (allcount) に達したら終わる。

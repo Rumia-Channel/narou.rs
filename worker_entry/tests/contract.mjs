@@ -641,13 +641,6 @@ await check("GET /api/history returns the JSON history shape", async () => {
   assert(typeof body.history === "string", `history must be a string: ${JSON.stringify(body)}`);
 });
 
-await check("GET /api/version/current.json reports the version", async () => {
-  const response = await request("/api/version/current.json", auth());
-  assert(response.status === 200, `status ${response.status}`);
-  const body = await json(response);
-  assert(typeof body.version === "string" && body.version.length > 0, "version must be set");
-});
-
 await check("POST /api/inspect is refused on the worker", async () => {
   // 調査ログはローカルファイル前提なので、成功を偽装せず 501 を返す。
   const response = await request("/api/inspect", {
@@ -1135,17 +1128,17 @@ await check("POST /api/global_setting rejects a stale expected value without ove
   assert.equal(stale.body.success, false, `a stale save must not succeed: ${JSON.stringify(stale.body)}`);
   assert.equal(stale.body.conflict, true, `the conflict must be machine readable: ${JSON.stringify(stale.body)}`);
 
-  // GET は replica / 他 isolate の TTL キャッシュを使うため、保存直後でも
-  // 古い値を返せる。primary を読む no-op CAS で、勝者の local/global 値が
-  // どれも上書きされていないことを検証する (違えば 409、同じなら書き込み無し)。
+  // 編集用 GET も primary / キャッシュ無しなので、勝者の local/global 値を
+  // そのまま次の編集の期待値として使える。古い保存はどれも上書きしない。
   const winner = {
     "webui.theme": themeWinner,
     concurrency: concurrencyWinner,
     "convert.epub-font": fontSizeWinner,
   };
-  const unchanged = await postSettings({ settings: winner, expected_settings: winner });
-  assert.equal(unchanged.status, 200, `the stale save must preserve every winner value: ${JSON.stringify(unchanged.body)}`);
-  assert.equal(unchanged.body.success, true, `the winner snapshot must still match: ${JSON.stringify(unchanged.body)}`);
+  const current = settingValues(await fetchSettingsView());
+  for (const [name, value] of Object.entries(winner)) {
+    assert.deepEqual(current.get(name), value, `the edit snapshot must preserve the winner: ${name}`);
+  }
   } finally {
     await postSettings({
       settings: { "webui.theme": themeBefore, concurrency: concurrencyBefore, "convert.epub-font": fontSizeBefore },

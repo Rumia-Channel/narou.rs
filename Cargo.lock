@@ -1845,7 +1845,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "narou_rs"
-version = "0.4.12"
+version = "0.4.13"
 dependencies = [
  "aozora_epub3_lite",
  "argon2",
@@ -1879,6 +1879,7 @@ dependencies = [
  "parking_lot",
  "pest",
  "pest_derive",
+ "psl",
  "regex",
  "reqwest",
  "rusqlite",
@@ -1907,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "narou_worker"
-version = "0.4.12"
+version = "0.4.13"
 dependencies = [
  "base64 0.23.1",
  "brotli",
@@ -2380,6 +2381,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "psl"
+version = "2.1.241"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7319b480e204d67e759cad7886178335d26324c7c8573c126cc9dfa7350d064"
+dependencies = [
+ "psl-types",
 ]
 
 [[package]]

@@ -1117,8 +1117,9 @@ impl Downloader {
         // headers, and login-only images need the same cookie jar.
         let illustration_policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
 
-        // Parsed sections may omit site-specific image markup. Search the raw
-        // HTML from this fetch as well, while keeping all persistence logical.
+        // Parsed sections may omit site-specific image markup. Definitions
+        // whose fetched page contains only reader controls can opt out.
+        let raw_html = raw_html.filter(|_| setting.illust_from_raw.unwrap_or(true));
         for source in illustration_sources(section, raw_html) {
             for caps in re.captures_iter(source) {
                 let Some(url_match) = caps.get(1) else {
@@ -1297,19 +1298,45 @@ impl Downloader {
     pub async fn download_novel_with_execution_options(
         &mut self,
         target: &str,
+        options: DownloadExecutionOptions<'_>,
+    ) -> Result<DownloadResult> {
+        // Preprocess job results belong to one novel: a new download starts
+        // with an empty set so nothing leaks between works.
+        self.preprocess_jobs.reset();
+        let (existing_id, setting) = self.resolve_target_for_download(target).await?;
+        let (provisional_id, reservation) = match existing_id {
+            Some(id) => (id, None),
+            None => {
+                let reservation = self.novels.allocate_id().await?;
+                (reservation.id().0, Some(reservation))
+            }
+        };
+        let result = self.download_novel_reserved(
+            target, options, existing_id, setting, provisional_id,
+        ).await;
+        if let Some(reservation) = reservation
+            && !matches!(&result, Ok(download) if download.status == UpdateStatus::Ok && download.id == reservation.id().0)
+            && let Err(release_error) = self.novels.release_id(reservation).await
+        {
+            return Err(match result {
+                Err(error) => NarouError::Platform(format!("{error}; 小説IDの予約を解放できませんでした: {release_error}")),
+                Ok(_) => release_error,
+            });
+        }
+        result
+    }
+
+    async fn download_novel_reserved(
+        &mut self,
+        target: &str,
         mut options: DownloadExecutionOptions<'_>,
+        existing_id: Option<i64>,
+        mut setting: SiteSetting,
+        provisional_id: i64,
     ) -> Result<DownloadResult> {
         let force = options.force;
         let resume_from_section = options.resume_from_section;
         let mut budget = options.budget.take();
-        // Preprocess job results belong to one novel: a new download starts
-        // with an empty set so nothing leaks between works.
-        self.preprocess_jobs.reset();
-        let (existing_id, mut setting) = self.resolve_target_for_download(target).await?;
-        let provisional_id = match existing_id {
-            Some(id) => id,
-            None => self.novels.allocate_id().await?.0,
-        };
 
         let db_toc_url = if let Some(id) = existing_id {
             self.novels
@@ -1449,9 +1476,10 @@ impl Downloader {
                         if let Some(re) = setting.compiled_error_message_pattern()
                             && re.is_match(&body)
                         {
-                            return Err(NarouError::NotFound("Novel deleted or private".into()));
+                            Err(NarouError::NotFound("Novel deleted or private".into()))
+                        } else {
+                            Ok(body)
                         }
-                        Ok(body)
                     }
                     Err(error) => Err(error),
                 }
@@ -1505,7 +1533,7 @@ impl Downloader {
                                 break;
                             }
                         }
-                    } else if retried.is_ok() {
+                    } else if retried.is_ok() && !should_retry_with_login(&setting, &retried) {
                         requires_login = true;
                         login_session = Some(group.id.clone());
                         toc_source = retried;
@@ -1520,6 +1548,9 @@ impl Downloader {
                     apply_login_cookie(&mut setting, &winner.merged_cookie(), &winner.cookies);
                 }
             }
+        }
+        if toc_source.is_ok() && should_retry_with_login(&setting, &toc_source) {
+            toc_source = Err(NarouError::NotFound("Novel deleted or private".into()));
         }
         let toc_source = match toc_source {
             Ok(source) => source,
@@ -1755,10 +1786,6 @@ impl Downloader {
         let object_keys = NovelObjectKeys::new(&sitename, &file_title, use_subdirectory)
             .map_err(|error| NarouError::Platform(error.to_string()))?;
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
-        #[cfg(feature = "native-runtime")]
-        if let Some(existing) = existing_record.as_ref() {
-            crate::title::rename_projected_outputs(&novel_dir, &author, &existing.title, &title)?;
-        }
 
         let old_toc = self
             .persistence
@@ -1774,6 +1801,45 @@ impl Downloader {
         let old_author = old_toc.as_ref().map(|t| t.author.clone());
         let old_story = old_toc.as_ref().and_then(|t| t.story.clone());
         let old_section_count = old_toc.as_ref().map(|t| t.subtitles.len()).unwrap_or(0);
+
+        if partial_listing {
+            let omits_saved = if old_section_count > 0 {
+                let visible: std::collections::HashSet<&str> =
+                    subtitles.iter().map(|subtitle| subtitle.index.as_str()).collect();
+                old_subtitles.keys().any(|index| !visible.contains(index.as_str()))
+            } else {
+                false
+            };
+            if omits_saved || subtitles.is_empty() {
+                self.report_warn(if omits_saved {
+                    messages::download::partial_listing_preserved()
+                } else {
+                    messages::download::no_accessible_sections()
+                });
+                return Ok(DownloadResult {
+                    id: provisional_id,
+                    title: old_title.unwrap_or(title),
+                    author: old_author.unwrap_or(author),
+                    novel_dir,
+                    new_novel: existing_id.is_none(),
+                    new_arrivals: false,
+                    new_arrival_subtitles: Vec::new(),
+                    updated_count: 0,
+                    total_count: old_section_count,
+                    status: UpdateStatus::Canceled,
+                    title_changed: false,
+                    author_changed: false,
+                    story_changed: false,
+                    sections_deleted: false,
+                });
+            }
+            self.report_warn(&messages::download::partial_listing(subtitles.len()));
+        }
+
+        #[cfg(feature = "native-runtime")]
+        if let Some(existing) = existing_record.as_ref() {
+            crate::title::rename_projected_outputs(&novel_dir, &author, &existing.title, &title)?;
+        }
 
         let fetched_story = info.story.clone();
         let digest_story = old_story

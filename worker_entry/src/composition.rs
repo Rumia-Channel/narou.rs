@@ -169,9 +169,9 @@ pub(crate) fn required_s3(env: &Env) -> worker::Result<bool> {
 
 /// オブジェクトの保存先を組み立てる。
 ///
-/// `NAROU_REQUIRE_S3=true` は検証済みの保存先を S3 に解決し、保存済みの
-/// marker・D1 の本文・挿絵の行は変更しない。資格情報が欠けている場合は
-/// 起動を失敗させ、黙って D1 へ落とさない (fail-closed)。
+/// 本文は未設定なら S3 を選び、既存の D1 本文は migrating で保持する。
+/// `NAROU_REQUIRE_S3=true` は挿絵・本文とも S3 を必須とする。
+/// S3 設定に失敗した場合はマーカーを変えず、黙って D1 へ落とさない。
 async fn build_object_stores(
     env: &Env,
     db: &DbHandle,
@@ -184,15 +184,22 @@ async fn build_object_stores(
 )> {
     let required = required_s3(env)?;
     let backend = read_asset_backend(db, fresh).await?.resolve(required);
-    // Content has an independent forward-only transition. Read primary on
-    // composition; SQL guards also reject writes from pre-transition runtimes.
-    let content_backend = crate::content_store::backend(&db.primary_view()).await
+    // Initialize the S3 default only after S3 configuration has been resolved.
+    // Existing D1 bodies stay readable in migrating; new writes use S3.
+    let primary_db = db.primary_view();
+    let content_marker = crate::content_store::stored_backend(&primary_db).await
         .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let content_s3 = required || content_marker != Some(crate::content_store::ContentBackend::D1);
     let d1: Arc<D1ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
-    let s3 = if backend == AssetBackend::S3 || content_backend != crate::content_store::ContentBackend::D1 {
+    let s3 = if backend == AssetBackend::S3 || content_s3 {
         Some(crate::s3_store::store_from_env(env, subrequests).await?)
     } else {
         None
+    };
+    let content_backend = match content_marker {
+        Some(mode) if mode != crate::content_store::ContentBackend::D1 || !required => mode,
+        _ => crate::content_store::initialize_s3_default(&primary_db, required).await
+            .map_err(|error| worker::Error::RustError(error.to_string()))?,
     };
     let s3_handle = if backend == AssetBackend::S3 { s3.clone() } else { None };
     let illustrations: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) = match &s3_handle {

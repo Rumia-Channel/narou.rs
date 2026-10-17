@@ -227,6 +227,26 @@ impl NativeObjectStore {
         atomic_write_bytes(&path, data)
     }
 
+    pub(crate) fn list_direct_files(&self, prefix: &ObjectKey) -> Result<Vec<ObjectKey>> {
+        let dir = self.resolve_prefix_dir(prefix.as_ref())?;
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut keys = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if !path.is_file() {
+                continue;
+            }
+            let safe_path = crate::db::paths::ensure_within_archive_root(&path, &self.root)?;
+            if let Some(key) = logical_key_for_native_path(&self.root, &safe_path) {
+                keys.push(key);
+            }
+        }
+        keys.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        Ok(keys)
+    }
+
     pub(crate) fn recursive_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
         for entry in fs::read_dir(current)? {
             let entry = entry?;
@@ -607,6 +627,15 @@ impl NativeStore {
             .map(|parent| parent.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         Self::for_narou_root(&narou_root)
+    }
+
+    /// List immediate file children without walking histories or illustrations.
+    /// SQLite rows and legacy filesystem-only files are both included.
+    pub fn list_direct_files_sync(&self, prefix: &ObjectKey) -> Result<Vec<ObjectKey>> {
+        match self {
+            Self::Fs(store) => store.list_direct_files(prefix),
+            Self::Sqlite(store) => store.list_direct_files(prefix),
+        }
     }
 
     /// 保存済みオブジェクトを小説ディレクトリへ実ファイルとして取り出す (同期)。

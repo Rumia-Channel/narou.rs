@@ -115,6 +115,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - `main` への統合は、ユーザーが明示的に依頼した場合、またはリリース作業として明確に合意された場合だけ行う。`develop` は削除せず残す。
 - `main` へ統合する前に、`develop` が clean であること、必要なテストが通っていること、バージョン更新や `VERSION.md` の変更履歴などリリースに必要な差分が揃っていることを確認する。
 - **変更履歴は `VERSION.md` に置く**。`README.md` には変更履歴の本文を書かず、`VERSION.md` への参照だけを置く。リリース時は `VERSION.md` の先頭へ新しいバージョンの節を追加し、`README.md` は触らない (バージョン更新そのものは `Cargo.toml` / `worker_entry/Cargo.toml` / `Cargo.lock` / `about-probe/Cargo.lock` / `Third-Party-License*.md` に行う)。
+- **版数の基準は GitHub の公開済み Release とする**。ローカルの `Cargo.toml` や `VERSION.md` に未リリースの次版が書かれていても、それを公開済みとしてさらに版数を進めない。公開前に追加する機能・修正・ツアーは同じ未リリース版へまとめる。ユーザーが版数を指定した場合はその指定を優先する（2026-10-17: 公開済み v0.4.12 に対する次版は v0.4.13）。
 - タグ作成はユーザーがバージョン番号を明示した場合だけ行う。`main` へ統合した後、`main` 上でのみタグ作成を許可する。タグは `main` のリリースコミットを指すようにし、作成後に push する。
 - 実装が一区切りついたら、機能単位で git commit する。無関係な変更をひとつの commit に混ぜず、レビューやロールバックがしやすい粒度に分ける。
 - commit 前には `git diff` / `git status` を確認し、ユーザー由来または別作業由来の変更を混ぜない。意図しない整形差分、改行だけの変更、import 並び替えだけの変更を含めない。
@@ -125,6 +126,18 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **バージョン更新時は必ず `cargo check` を実行し、ビルドが通ることを確認してから commit・push・タグ作成を行う。** `Cargo.toml` のバージョン更新と `cargo check` による `Cargo.lock` 更新は同じ commit に含める。
 - `git reset --hard`、`git checkout --`、強制 push、履歴改変 rebase は、ユーザーが明示的に依頼した場合以外は行わない。
 - ブランチ削除はユーザーが明示的に依頼した場合だけ行う。特に `develop` は残す。
+
+## GitHub issue の調査・返信ルール
+- issue は**本文だけでなく最新の全コメント・追記まで読む**。追加された再現条件、旧版／新版・既存データ／新規データの違い、質問・懸念を整理し、それらを落とさず調査・検証・返信へ反映する。
+- 返信は報告された OS・実行形態・保存方式・利用機能を基準にし、**その環境での理解・対処に必要な情報だけを詳しく書く**。Native / Workers の区別が書かれていなければ Native として扱う。Windows の Native 版の報告に、関係のない Workers の実装・配備、Wasm、D1、別環境向けの CI 結果などを持ち込まない。共通コードを使っていることだけを理由に説明範囲を広げない。
+- 返信前に、同じリポジトリの過去の返信を実際に読み、文体・説明の粒度・利用者への配慮を参考にする。基準例は [issue #35 の返信](https://github.com/Rumia-Channel/narou.rs/issues/35#issuecomment-6052141382) と [issue #36 の返信](https://github.com/Rumia-Channel/narou.rs/issues/36#issuecomment-6093885631)。関連する過去 issue があればその返信も確認し、見出しだけの模倣や機械的なコピペはしない。
+- 利用者への返信は丁寧な日本語で書き、報告へのお礼と対応状況を冒頭で伝える。「修正しました」、コミットリンク、テスト結果の羅列だけで済ませず、報告者が症状と対応内容を理解して試せる説明にする。
+- 原則として「原因」「修正内容」「確認したこと」「お試しいただく際の注意」などの見出しで整理する。必要な内容を過不足なく書き、形式を埋めるための空疎な節や無関係な内部実装の説明は増やさない。
+- 原因は**報告された現象との因果関係**を説明する。「既存作品だけ反映されない」「以前は動いた」などの差がなぜ生じるか、仕様変更なのか不具合なのかを具体的に答える。報告者の追加質問を技術説明の中に埋もれさせず、質問ごとに明確に回答する。
+- 確認したことには再現条件、修正前後の違い、実際に動かした CLI／Web UI、確認した出力・保存状態、回帰テストの範囲を記す。検証用 fixture での結果と報告者の実環境を区別し、未確認の条件・推測・検証限界を隠さない。未実行の検証や未確認の原因を断定しない。
+- データ消失・設定の残存・復旧が関係する場合は、既存データへの影響と、必要な復旧・再実行の具体的な手順を説明する。該当すれば dry-run、バックアップ、不可逆な操作の注意も示し、実証していない手順を案内しない。
+- 修正コミットと、利用者が試すべきバージョンを明示する。`develop` で修正済みでも公開済みとは書かず、未リリースならその旨を伝える。再発時は、この issue へ連絡してほしいことと、切り分けに必要なコマンド・ログ・設定などを具体的に案内し、Cookie・鍵・認証情報は求めない。
+- 投稿直前に、本文・全追記への回答漏れ、根拠と説明の一致、バージョン・公開状況・リンク、利用者が次に行うことを確認する。短い完了報告で打ち切らず、過去の丁寧な返信と同等に、調査結果と利用者向けの案内を揃えてから送信する。
 
 ## サブエージェント運用ルール
 - サブエージェントを使うのは、広範囲の監査、複数の独立トラックへ分解できる実装、並列化メリットが明確な作業に限る。
@@ -362,7 +375,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 ### Cloudflare Workers 移行 (2026-09-26 決定、詳細: docs/cloudflare-workers-migration-plan.md)
 - **ゴール**: Web UI ごと Workers へ移行する。native は CLI と、Workers で代替できない重量処理・ローカル操作のために残す。
 - **重量処理**: Worker 内の AozoraEpub3_Lite (in-process) で完結。外部プロセス前提の機能 (AozoraEpub3 jar / kindlegen / SMTP / 端末送信 / セルフアップデート / `folder` / `browser` 等) は `blocked` / `501` で明示的に拒否し、CF Containers は使わない。
-- **保存 (2026-10-15 変更)**: **管理情報・目次・本文への参照は D1、本文・旧本文・挿絵は S3 互換ストレージ**。本文は `SectionFile` YAML（抽出 HTML・前後書き・話情報）を話単位で共通 Brotli codec に通し、`content/<ランダム版ID>.bin` に保存する。新版の保存成功後だけ D1 `content_objects` の参照を公開し、サイズ・CRC32・SHA-256 を読み出し時に照合する。`ContentStore` は既存の `ObjectStore` / `AssetStore` を実装し、native の保存方式は変更しない。切替は `app_state('inv','content_backend')` の `d1`（未設定の既定）→ `migrating`（新規書込み S3、参照なしだけ旧 D1 読み）→ `s3`（参照のみ）の一方向。`asset_backend` は引き続き挿絵専用。**実装・binding・設定キーは `S3_*` / `s3_*` で統一し、ベンダ名を識別子に使わない**。
+- **保存 (2026-10-16 変更)**: **管理情報・目次・本文への参照は D1、本文・旧本文・挿絵は S3 互換ストレージ**。本文は `SectionFile` YAML（抽出 HTML・前後書き・話情報）を話単位で共通 Brotli codec に通し、`content/<ランダム版ID>.bin` に保存する。新版の保存成功後だけ D1 `content_objects` の参照を公開し、サイズ・CRC32・SHA-256 を読み出し時に照合する。`ContentStore` は既存の `ObjectStore` / `AssetStore` を実装し、native の保存方式は変更しない。切替は `app_state('inv','content_backend')` の `d1`（旧方式）→ `migrating`（新規書込み S3、参照なしだけ旧 D1 読み）→ `s3`（参照のみ）の一方向。`asset_backend` は引き続き挿絵専用。**実装・binding・設定キーは `S3_*` / `s3_*` で統一し、ベンダ名を識別子に使わない**。
+- **本文の既定は S3**: 本文ストア初期化時、`content_backend` が未設定なら旧 D1 本文・履歴が無い場合は `s3`、残る場合は `migrating` を選び、新規本文を S3 に保存する。明示的な `d1` は非必須環境だけで維持し、`NAROU_REQUIRE_S3=true` では同じ規則で進める。S3 構成成功後、旧本文の存在判定と marker 保存を primary の単一 SQL で行い、既存 `migrating` / `s3` を戻さない。一括コピー・照合・削除は引き続き管理 API で行う。`plan` / `status` は初期化せず、未設定を `d1` と報告する読み取り専用である。
 - **S3 必須配備**: develop/production の CI は `NAROU_REQUIRE_S3=true` を渡す。挿絵は旧 `asset_backend=d1` や未設定でも S3 を選び、D1 の旧挿絵を移行・削除・代替参照しない。管理・目次・設定は D1、本文・履歴は独立した `content_backend` に従う。保存済み marker は canonical JSON と既存 raw TEXT の `d1`/`s3` を受け付け、不正値・読み取り失敗は拒否する。S3 の設定/通信失敗でも D1 へ戻さない。認証済み `/api/storage/mode?probe=s3` の実ストア選択と bounded LIST 成功を CI で必須確認し、一般 smoke の省略を成功扱いしない。**例外は前段の Cloudflare Access が答えた 403 だけ** (2026-10-06 決定): custom domain が Access の内側にあり CI に service token が無い場合、CI からは検証しようがないため `::warning::` 付きのスキップとし、ステップサマリも `skipped: blocked before the Worker …; not verified` と表示する (成功扱いにしない)。401 / 503 / 到達不可などの他の失敗は従来どおりジョブを失敗させる。403 を例外にできる根拠は「Worker はこの経路で 403 を返さない」こと (S3 LIST 失敗は `worker_entry/src/storage_probe.rs` が 503、認証失敗は 401)。プローブは urllib 既定の UA が Cloudflare のボット判定に掛かって 403 になっていたため、アプリ本体と同じブラウザ風の `User-Agent` (`ci/deploy_worker.py` の `PROBE_USER_AGENT`) を必ず送る。警告には前段の手掛かり (`cf-mitigated` など) を付けて切り分けられるようにする。配備ジョブの env には `NAROU_REQUIRE_S3: "true"` も置き、smoke (`contract.mjs`) 自身にも同じ `?probe=s3` 検査をさせる — Python プローブが前段の 403 でスキップした場合でも必須確認が残る (2026-10-06 時点の実測: UA 修正後に `S3 backend + LIST: ok`)。
 - **SORAHOST と Workers のホスト名の取り合い (2026-10-06)**: 配備先は Repository variable `SORAHOST` (`T`=SORAHOST / `F`=Workers) で切り替わり、**動いている側がホスト名を持つ**。`T` の間は Workers のジョブが workflow の `if` で止まる。`F` のとき Workers が同じホスト名を使おうとして SORAHOST のコネクタが作った DNS レコードに当たると、wrangler は `externally managed DNS records` (Cloudflare code 100117) で失敗するため、`ci/deploy_worker.py` が `NAROU_DOMAIN_MODE=route` で設定を組み直して `[[routes]] pattern = "<domain>/*"` + `custom_domain = false` として載せ直す (DNS は触らず、そのホスト名の Access はそのまま効く)。`NAROU_SORAHOST=T` のときは逆に奪わず失敗させる。zone の自動判定が効かない環境では `NAROU_ZONE_NAME` を置くと route に `zone_name` を明示する。実装は `ci/render_config.py` の `NAROU_DOMAIN_MODE` (`custom_domain` 既定 / `route`) と `deploy_worker.py` の `DNS_CONFLICT_MARKER` フォールバック。
 - **EPUB は保存しない**: AozoraEpub3_Lite で、Web UI の DL 要求時に保存済みデータからストリーミング生成する。**Workers では raw HTML などのキャッシュを一切保存しない**（native は従来どおりで `.narou/` 互換に影響なし）。

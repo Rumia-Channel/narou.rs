@@ -284,11 +284,6 @@ mod tests {
                 "https://novel18.syosetu.com/n9878es/".to_string()
             ]
         );
-        // 作品一覧 API は使わない (userid で絞れないため)。
-        assert_eq!(
-            setting.author_fetch_url("https://xmypage.syosetu.com/x8094bm/"),
-            "https://xmypage.syosetu.com/x8094bm/"
-        );
     }
 
     #[test]

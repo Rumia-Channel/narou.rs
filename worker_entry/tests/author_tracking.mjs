@@ -52,7 +52,7 @@ async function json(path, body, method) {
   const response = await api(path, body, method); const value = await response.json();
   assert(response.ok && value.success !== false, `${path}: HTTP ${response.status}: ${JSON.stringify(value)}`); return value;
 }
-async function jobs(ids) {
+async function jobs(ids, expected = 'succeeded') {
   for (const id of ids) {
     const deadline = Date.now() + 120000;
     let job;
@@ -61,7 +61,7 @@ async function jobs(ids) {
       if (['succeeded', 'permanent', 'blocked'].includes(job.status)) break;
       await new Promise((resolve) => setTimeout(resolve, 300));
     } while (Date.now() < deadline);
-    assert.equal(job.status, 'succeeded', JSON.stringify(job));
+    assert.equal(job.status, expected, JSON.stringify(job));
   }
 }
 async function settled() { await jobs(sql("SELECT job_id FROM worker_jobs WHERE status IN ('pending','running','retryable') ORDER BY created_at").map((row) => row.job_id)); }
@@ -102,10 +102,13 @@ try {
     .replace(/^migrations_dir = "migrations"$/m, `migrations_dir = ${JSON.stringify(join(root, 'migrations').replaceAll('\\', '/'))}`);
   writeFileSync(config, toml);
   writeFileSync(join(work, '.dev.vars'), `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${Buffer.alloc(32, 7).toString('base64')}\nS3_ACCESS_KEY_ID=local-test-key\nS3_SECRET_ACCESS_KEY=local-test-secret\n`);
-  run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]); await start();
+  run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
+  // Author scenarios intentionally use legacy D1, independent of S3-default coverage.
+  sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','\"d1\"','d1');");
+  await start();
   const authorUrl = `http://localhost:${sourcePort}/authors/7/`;
   const storedUrl = authorUrl + '#works';
-  const definition = `name: Controlled Author Source\ndomain: localhost\ntop_url: http://localhost:${sourcePort}\nurl: 'http://localhost:${sourcePort}/(?<ncode>(?:work|oneshot)\\d+)/?'\nsitename: Controlled Author Source\nversion: 1.0\nconfirm_over18: no\ntoc_url: 'http://localhost:${sourcePort}/\\k<ncode>/'\nauthor_url: '^http://localhost:${sourcePort}/authors/(?<user_id>\\d+)/?'\nauthor_novel_pattern: '(?<novel_url>http://localhost:${sourcePort}/(?:work|oneshot)\\d+/)'\ntitle: '<h1>(?<title>.+?)</h1>'\nauthor: '<span class="author">(?<author>.+?)</span>'\nsubtitles: '<a href="(?<href>/(?:work|oneshot)\\d+/(?<index>\\d+)/)">(?<subtitle>.+?)</a>'\nbody_pattern: '<div class="body">(?<body>.+?)</div>'\nmin_interval: 0.01\n`;
+  const definition = `name: Controlled Author Source\ndomain: localhost\ntop_url: http://localhost:${sourcePort}\nurl: 'http://localhost:${sourcePort}/(?<ncode>(?:work|oneshot)\\d+)/?'\nsitename: Controlled Author Source\nversion: 1.0\nconfirm_over18: no\ntoc_url: 'http://localhost:${sourcePort}/\\k<ncode>/'\nauthor_url: '^http://(?:localhost|authors\\.example):${sourcePort}/authors/(?<user_id>\\d+)/?'\nauthor_api_url: 'http://localhost:${sourcePort}/authors/\\k<user_id>/'\nauthor_novel_pattern: '(?<novel_url>http://localhost:${sourcePort}/(?:work|oneshot)\\d+/)'\ntitle: '<h1>(?<title>.+?)</h1>'\nauthor: '<span class="author">(?<author>.+?)</span>'\nsubtitles: '<a href="(?<href>/(?:work|oneshot)\\d+/(?<index>\\d+)/)">(?<subtitle>.+?)</a>'\nbody_pattern: '<div class="body">(?<body>.+?)</div>'\nmin_interval: 0.01\n`;
   await json('/api/sites/localhost.yaml', definition, 'PUT');
   assert.equal((await fetch(`http://127.0.0.1:${port}/api/authors`, { headers: { Connection: 'close' } })).status, 401);
   assert.equal((await api('/api/authors', { url: `http://localhost:${sourcePort}/work1/` })).status, 400);
@@ -155,9 +158,16 @@ try {
   const skipped = await json('/api/jobs', { kind: 'AuthorCheck', targets: [authorUrl], options: [] }); await jobs(skipped.ids);
   assert.equal(authorHits, afterRemoval, 'removed author check must not fetch even if a stale job is delivered');
   console.log('PASS removing an author stops in-flight fan-out and stale queued checks, preserving downloaded novels');
-  const one = await json('/api/download', { targets: [`http://localhost:${sourcePort}/authors/8/`] }); await jobs(one.results.map((row) => row.job_id));
+  // R18's author host differs from its novel host; expansion must not require them to match.
+  await json('/api/sites/localhost.yaml', definition.replace('confirm_over18: no', 'confirm_over18: yes'), 'PUT');
+  await setting({ over18: false }, { over18: null });
+  const denied = await json('/api/download', { targets: [`http://authors.example:${sourcePort}/authors/8/`] });
+  await jobs(denied.results.map((row) => row.job_id), 'blocked');
+  assert.equal(count("SELECT COUNT(*) FROM novels WHERE ncode='oneshot1'"), 0);
+  await setting({ over18: true }, { over18: false });
+  const one = await json('/api/download', { targets: [`http://authors.example:${sourcePort}/authors/8/`] }); await jobs(one.results.map((row) => row.job_id));
   assert.deepEqual((await json('/api/authors')).authors, []); assert.equal(count("SELECT COUNT(*) FROM novels WHERE ncode='oneshot1'"), 1);
-  console.log('PASS one-shot author downloads do not create tracking registrations');
+  console.log('PASS explicit adult consent unblocks terminal-free downloads; cross-host one-shot authors remain untracked');
   if (process.env.AUTHOR_SMOKE_KEEP === '1') {
     console.log(`AUTHOR_WORKER_READY http://127.0.0.1:${port}/settings token=${token} author=${storedUrl}`);
     process.stdin.resume(); await once(process.stdin, 'data'); process.stdin.pause();
