@@ -19,6 +19,7 @@ pub mod http;
 /// HTTP/1.1 wire codec for transports without an HTTP stack (the Worker's
 /// `connect()` socket fallback). Byte-oriented and platform-neutral.
 pub mod http1;
+pub(crate) mod id_allocator;
 pub mod mocks;
 pub mod object_store;
 pub mod progress;
@@ -60,7 +61,7 @@ pub use rate_limiter::{
 pub use s3_request::{object_size, parse_content_range_size};
 pub use s3_store::{S3Store, S3StoreConfig, MAX_OBJECT_BYTES, SMALL_CAP};
 pub use repository::{
-    NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,
+    NovelFilter, NovelId, NovelIdReservation, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,
     SearchField, SearchTerm, resolve_update_scan_sort,
 };
 pub use split_store::{SplitStore, is_illustration_key};

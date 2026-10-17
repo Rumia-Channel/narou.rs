@@ -58,9 +58,6 @@ impl NativeNovelRepository {
         Self::find_by_ncode_sync_impl(ncode)
     }
 
-    pub fn allocate_id_sync(&self) -> Result<NovelId> {
-        crate::db::with_database_mut(|db| Ok(NovelId::from(db.allocate_id())))
-    }
 
     pub fn apply_batch_sync(&self, mutations: Vec<NovelMutation>) -> Result<()> {
         crate::db::with_database_mut(|db| {
@@ -294,12 +291,18 @@ impl NovelRepository for NativeNovelRepository {
         })
     }
 
-    fn allocate_id(&self) -> PlatformFuture<'_, Result<NovelId>> {
+    fn allocate_id(&self) -> PlatformFuture<'_, Result<crate::platform::NovelIdReservation>> {
         Box::pin(async move {
-            run_db(move || {
-                crate::db::with_database_mut(|db| Ok(NovelId::from(db.allocate_id())))
-            })
-            .await
+            run_db(move || crate::db::with_database_mut(|db| db.allocate_id())).await
+        })
+    }
+
+    fn release_id(&self, reservation: crate::platform::NovelIdReservation) -> PlatformFuture<'_, Result<()>> {
+        Box::pin(async move {
+            run_db(move || crate::db::with_database_mut(|db| {
+                db.release_id(reservation);
+                Ok(())
+            })).await
         })
     }
 
@@ -506,7 +509,8 @@ mod tests {
             futures::future::join_all((0..32).map(|_| {
                 let novels = Arc::clone(&novels);
                 async move {
-                    let id = novels.allocate_id().await.map_err(|err| err.to_string())?;
+                    let reservation = novels.allocate_id().await.map_err(|err| err.to_string())?;
+                    let id = reservation.id();
                     novels
                         .apply_batch(vec![NovelMutation::Upsert(sample_record(id.0))])
                         .await

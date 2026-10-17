@@ -79,6 +79,21 @@ unknown TOC totals and cyclic pagination, and tag aggregation across a 31-episod
 series. The update case changes only a later-page tag, keeps manual tags, and
 does not download unchanged section bodies.
 
+## Download ID reservations
+
+```sh
+cargo test --all-features --test download_new_novel_id
+cargo test --all-features --lib id_allocator::tests
+cargo test --all-features --lib unused_ids_are_reused_without_freeing_live_or_committed_owners
+cargo test --all-features --lib concurrent_allocations_only_reuse_released_unpublished_ids
+```
+
+These cover 404 and age-consent cancellation followed by successful downloads,
+reuse of unpublished IDs, stale-release fencing, imported/committed ID boundaries,
+and concurrent Memory/SQLite reservations. Committed IDs are not reclaimed after removal.
+They use isolated stores and synthetic HTTP, without accessing real sites.
+
+
 ## Persistent author tracking
 
 ```sh

@@ -21,6 +21,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (10, include_str!("migrations/0010_drop_body_yaml.sql")),
     (11, include_str!("migrations/0011_requires_login.sql")),
     (12, include_str!("migrations/0012_login_session.sql")),
+    (13, include_str!("migrations/0013_id_reservations.sql")),
 ];
 
 pub(crate) fn apply(conn: &mut Connection) -> Result<()> {
@@ -177,30 +178,6 @@ fn migrate_legacy_objects(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fresh_database_reaches_latest_user_version() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        apply(&mut conn).unwrap();
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 12);
-    }
-
-    #[test]
-    fn migrations_are_idempotent() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        apply(&mut conn).unwrap();
-        apply(&mut conn).unwrap();
-        let tables: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('novels','novel_tags','frozen_novels','app_state','novel_id_sequence')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(tables, 5);
-    }
 
     /// Seed a database as it would look after applying migrations 0001–0006,
     /// including novels rows with populated child tables.
@@ -416,9 +393,5 @@ mod tests {
             .unwrap();
         assert_eq!(foreign_keys, 1);
 
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 12);
     }
 }

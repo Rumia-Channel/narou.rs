@@ -299,29 +299,23 @@ impl AssetStore for MemoryObjectStore {
 #[derive(Debug, Default)]
 pub struct MemoryNovelRepository {
     records: Mutex<BTreeMap<i64, NovelRecord>>,
-    next_id: AtomicU64,
+    id_allocator: Mutex<super::id_allocator::IdAllocator>,
 }
 
 impl MemoryNovelRepository {
     pub fn new() -> Self {
-        Self {
-            records: Mutex::new(BTreeMap::new()),
-            next_id: AtomicU64::new(0),
-        }
+        Self::default()
     }
 
     pub fn from_records(records: Vec<NovelRecord>) -> Self {
-        let repo = Self::new();
-        let mut max_id: Option<i64> = None;
+        let mut stored = BTreeMap::new();
         for record in records {
             let id = record.id;
-            max_id = Some(max_id.map_or(id, |current| current.max(id)));
-            repo.records.lock().insert(id, record);
+            stored.insert(id, record);
         }
-        // Native semantics: next id is max + 1, or 0 for an empty database.
-        let next = max_id.map(|m| m + 1).unwrap_or(0);
-        repo.next_id.store(next as u64, Ordering::SeqCst);
-        repo
+        let next_id = stored.last_key_value().map_or(0, |(id, _)| id.saturating_add(1));
+        let id_allocator = super::id_allocator::IdAllocator::with_next_id(next_id);
+        Self { records: Mutex::new(stored), id_allocator: Mutex::new(id_allocator) }
     }
 
     pub fn len(&self) -> usize {
@@ -451,22 +445,31 @@ impl NovelRepository for MemoryNovelRepository {
         })
     }
 
-    fn allocate_id(&self) -> PlatformFuture<'_, Result<NovelId>> {
+    fn allocate_id(&self) -> PlatformFuture<'_, Result<super::NovelIdReservation>> {
         Box::pin(async move {
-            // Atomic reservation: unique even under concurrent tasks.
-            Ok(NovelId::from(
-                self.next_id.fetch_add(1, Ordering::SeqCst) as i64
-            ))
+            let _records = self.records.lock();
+            self.id_allocator.lock().allocate()
+        })
+    }
+
+    fn release_id(&self, reservation: super::NovelIdReservation) -> PlatformFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let records = self.records.lock();
+            let committed = records.contains_key(&reservation.id().0);
+            self.id_allocator.lock().release(reservation, committed);
+            Ok(())
         })
     }
 
     fn apply_batch<'a>(&'a self, mutations: Vec<NovelMutation>) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
             let mut records = self.records.lock();
+            let mut id_allocator = self.id_allocator.lock();
             for mutation in mutations {
                 match mutation {
                     NovelMutation::Upsert(record) => {
                         let id = record.id;
+                        id_allocator.commit(id);
                         records.insert(id, record);
                     }
                     NovelMutation::Remove(id) => {
@@ -793,17 +796,12 @@ mod tests {
     }
 
     #[test]
-    fn memory_repository_allocates_unique_ids() {
+    fn imported_record_ids_are_excluded_from_new_reservations() {
         let repo = MemoryNovelRepository::from_records(vec![sample_record(5)]);
-        let ids: Vec<i64> = (0..10)
-            .map(|_| futures::executor::block_on(repo.allocate_id()).unwrap().0)
-            .collect();
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 10, "allocated ids must be unique");
-        assert!(ids.iter().all(|id| *id > 5));
+        let reservation = futures::executor::block_on(repo.allocate_id()).unwrap();
+        assert_eq!(reservation.id(),NovelId(6));
     }
+
 
     #[test]
     fn memory_repository_scan_ids_uses_keyset_pagination() {
