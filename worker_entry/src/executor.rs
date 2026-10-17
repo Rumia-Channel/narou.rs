@@ -59,6 +59,16 @@ pub enum JobOutcome {
     Retryable { reason: String },
 }
 
+impl JobOutcome {
+    pub fn from_error(error: NarouError) -> Self {
+        match classify_failure(&error) {
+            JobFailureClass::Retryable => Self::Retryable { reason: error.to_string() },
+            JobFailureClass::Permanent => Self::Permanent { reason: error.to_string() },
+            JobFailureClass::Blocked => Self::Blocked { reason: error.to_string() },
+        }
+    }
+}
+
 /// Whether a job plan can be executed by this consumer at all.
 pub fn unsupported_reason(job: &JobPlan) -> Option<String> {
     if !job.kind.is_worker_executable() {
@@ -523,17 +533,7 @@ async fn classify_result(
                 }
             }
         },
-        Err(error) => match classify_failure(&error) {
-            JobFailureClass::Retryable => JobOutcome::Retryable {
-                reason: error.to_string(),
-            },
-            JobFailureClass::Permanent => JobOutcome::Permanent {
-                reason: error.to_string(),
-            },
-            JobFailureClass::Blocked => JobOutcome::Blocked {
-                reason: error.to_string(),
-            },
-        },
+        Err(error) => JobOutcome::from_error(error),
     }
 }
 /// ダウンロード成功後の自動変換 (native `commands::{download,update}::auto_convert`

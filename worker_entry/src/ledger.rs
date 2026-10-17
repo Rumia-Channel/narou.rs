@@ -52,7 +52,7 @@ const ENQUEUE_MAX_ATTEMPTS: usize = 3;
 /// the key list to a single bind (same pattern as `d1_repository`).
 const ACTIVE_BY_DEDUPE_KEYS_SQL: &str = r#"
 SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
-       lease_until, checkpoint_json, dedupe_key
+       checkpoint_json, dedupe_key
 FROM worker_jobs
 WHERE status IN ('pending', 'running', 'retryable')
   AND dedupe_key IN (SELECT value FROM json_each(?))
@@ -121,6 +121,10 @@ impl D1JobLedger {
         bind_statement(self.db.prepare(sql), values)
     }
 
+    fn prepare_core(&self, statement: narou_rs::application::worker_ledger::Statement) -> Result<D1PreparedStatement> {
+        self.prepare(&statement.sql, statement.binds.into_iter().map(BindValue::Text).collect())
+    }
+
     fn now_rfc3339(&self) -> String {
         self.clock
             .now_utc()
@@ -142,7 +146,7 @@ impl D1JobLedger {
     async fn select_row(&self, job_id: &str) -> Result<Option<JobRow>> {
         let statement = self.prepare(
             "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
-                    lease_until, checkpoint_json
+                    checkpoint_json
              FROM worker_jobs WHERE job_id = ? LIMIT 1",
             vec![BindValue::Text(job_id.to_string())],
         )?;
@@ -350,19 +354,6 @@ impl D1JobLedger {
         })
     }
 
-    fn busy_retry_after(&self, row: &JobRow) -> Duration {
-        let fallback = Duration::from_secs(60);
-        let Some(lease_until) = row.lease_until.as_deref() else {
-            return fallback;
-        };
-        let Ok(lease_until) = DateTime::parse_from_rfc3339(lease_until) else {
-            return fallback;
-        };
-        let now = self.clock.now_utc();
-        let remaining = lease_until.with_timezone(&Utc) - now;
-        let seconds = remaining.num_seconds().max(0).saturating_add(5);
-        Duration::from_secs(u64::try_from(seconds).unwrap_or(60).max(1))
-    }
 
 
     /// Durably record an envelope that could not be mapped to a job
@@ -418,10 +409,9 @@ impl D1JobLedger {
     // non-canonical status (a custom tombstone would retry-storm the
     // consumer). The only consistent "this job never runs" state is a
     // terminal row, written unconditionally — these are operator actions,
-    // not executor outcomes, so no execution token is required and any live
-    // token/lease/checkpoint is cleared. The tombstoned job drops out of
-    // `pending` and the dedupe index; every later delivery claims it as
-    // `AlreadyTerminal` and acks. `queue/status` counts it under `failed`
+    // not executor outcomes. Pending work loses its token; cancelled running
+    // work retains a draining lease until its invocation stops. Every later
+    // delivery sees `AlreadyTerminal` and acks. `queue/status` counts it under `failed`
     // (the only terminal bucket the Web UI has for non-success rows) —
     // documented in `webui/queue_actions.rs`.
 
@@ -432,7 +422,7 @@ impl D1JobLedger {
         let statement = self.prepare(
             "UPDATE worker_jobs
              SET status = ?, last_error = ?, updated_at = ?,
-                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL, admission_waiting = 0
              WHERE status IN ('pending', 'retryable')",
             vec![
                 BindValue::Text(status_str(JobLedgerStatus::Permanent).to_string()),
@@ -450,7 +440,7 @@ impl D1JobLedger {
         let statement = self.prepare(
             "UPDATE worker_jobs
              SET status = ?, last_error = ?, updated_at = ?,
-                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL, admission_waiting = 0
              WHERE job_id = ? AND status IN ('pending', 'retryable')",
             vec![
                 BindValue::Text(status_str(JobLedgerStatus::Permanent).to_string()),
@@ -483,17 +473,13 @@ impl D1JobLedger {
         Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
     }
 
-    /// Tombstone one running row regardless of its execution lease. The
-    /// in-flight execution (if any) runs to its next boundary but can no
-    /// longer write an outcome — `mark_terminal`, `yield_for_continuation`
-    /// and `record_attempt` all require the execution token that this call
-    /// clears — and every redelivery claims the row as `AlreadyTerminal`
-    /// and acks. `false` when the row is not currently `running`.
+    /// Cancel logically without releasing physical execution ownership. Wasm
+    /// keeps running until its next outcome boundary; successors must wait.
     pub async fn cancel_running_job(&self, job_id: &str, reason: &str) -> Result<bool> {
         let statement = self.prepare(
             "UPDATE worker_jobs
              SET status = ?, last_error = ?, updated_at = ?,
-                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+                 checkpoint_json = NULL
              WHERE job_id = ? AND status = 'running'",
             vec![
                 BindValue::Text(status_str(JobLedgerStatus::Permanent).to_string()),
@@ -501,6 +487,15 @@ impl D1JobLedger {
                 BindValue::Text(self.now_rfc3339()),
                 BindValue::Text(job_id.to_string()),
             ],
+        )?;
+        Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
+    }
+
+    pub async fn finish_cancelled(&self, job_id: &JobId, execution_token: &str) -> Result<bool> {
+        let statement = self.prepare(
+            "UPDATE worker_jobs SET lease_until = NULL, execution_token = NULL
+             WHERE job_id = ? AND status = 'permanent' AND execution_token = ?",
+            vec![BindValue::Text(job_id.as_str().to_string()), BindValue::Text(execution_token.to_string())],
         )?;
         Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
     }
@@ -538,15 +533,10 @@ impl D1JobLedger {
         Ok(usize::try_from(count.unwrap_or(0)).unwrap_or(0))
     }
 
-    /// Running job ids whose lease expired (or was never written). These
-    /// are exactly the rows `claim`'s lease-expiry branch may reclaim — the
-    /// worker analogue of native "restorable" tasks (jobs left `running`
-    /// on disk when the server shut down). Lease timestamps are canonical
-    /// RFC3339 nanos written by this module, so lexicographic comparison
-    /// against `now` is sound.
-    pub async fn stale_running_job_ids(&self) -> Result<Vec<String>> {
+    /// Expired executions eligible for manual recovery, with their queue lane.
+    pub async fn stale_running_jobs(&self) -> Result<Vec<QueuedJobRoute>> {
         let statement = self.prepare(
-            "SELECT job_id FROM worker_jobs
+            "SELECT job_id, kind FROM worker_jobs
              WHERE status = 'running' AND (lease_until IS NULL OR lease_until <= ?)
              ORDER BY created_at ASC, job_id ASC",
             vec![BindValue::Text(self.now_rfc3339())],
@@ -555,9 +545,31 @@ impl D1JobLedger {
             .all()
             .await
             .map_err(worker_error)?
-            .results::<JobIdRow>()
+            .results::<QueuedJobRoute>()
             .map_err(worker_error)?;
-        Ok(rows.into_iter().map(|row| row.job_id).collect())
+        Ok(rows)
+    }
+
+    pub async fn park_for_admission(&self, job_id: &JobId, normalized_target: &str, site_key: Option<&str>) -> Result<()> {
+        let statement = self.prepare_core(narou_rs::application::worker_ledger::park_admission(
+            &self.now_rfc3339(), job_id.as_str(), normalized_target, site_key,
+        ))?;
+        statement.run().await.map_err(worker_error)?;
+        Ok(())
+    }
+
+    pub async fn waiting_jobs(&self) -> Result<Vec<QueuedJobRoute>> {
+        let statement = self.prepare_core(narou_rs::application::worker_ledger::select_waiting(
+            &self.now_rfc3339(), 8,
+        ))?;
+        statement.all().await.map_err(worker_error)?.results().map_err(worker_error)
+    }
+
+    pub async fn mark_waiting_dispatched(&self, job_id: &str) -> Result<bool> {
+        let statement = self.prepare_core(narou_rs::application::worker_ledger::mark_waiting_dispatched(
+            &self.now_rfc3339(), job_id,
+        ))?;
+        Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
     }
 
     /// Active rows whose scheduled progress point passed `stuck_before`
@@ -645,12 +657,10 @@ impl JobQueue for D1JobLedger {
         })
     }
 
-    fn claim<'a>(&'a self, job_id: &'a JobId) -> PlatformFuture<'a, Result<JobClaim>> {
+    fn claim<'a>(&'a self, job_id: &'a JobId, normalized_target: &'a str, site_key: Option<&'a str>) -> PlatformFuture<'a, Result<JobClaim>> {
         Box::pin(async move {
-            // Read the row first: the claim UPDATE needs the candidate's
-            // canonical target to build the per-novel exclusion clause
-            // (`worker_ledger::claim_fresh`), and the fall-through needs the
-            // status anyway.
+            // Preserve the stored target for display, dedupe and checkpoint
+            // identity. Only admission uses the YAML-resolved target.
             let Some(row) = self.select_row(job_id.as_str()).await? else {
                 self.record_rejected(job_id.as_str(), "job id not found in ledger")
                     .await?;
@@ -663,16 +673,6 @@ impl JobQueue for D1JobLedger {
 
             let now = self.now_rfc3339();
             let execution_token = Self::new_execution_token();
-            let claim = |statement: narou_rs::application::worker_ledger::Statement| {
-                self.prepare(
-                    &statement.sql,
-                    statement
-                        .binds
-                        .into_iter()
-                        .map(BindValue::Text)
-                        .collect(),
-                )
-            };
 
             // Fresh claim: pending, or retryable whose backoff hold elapsed.
             // The same statement carries the per-novel exclusion, so two
@@ -680,12 +680,13 @@ impl JobQueue for D1JobLedger {
             // `running` (native `job_conflicts_with_running` parity — here
             // lane-blind because every consumer runs jobs concurrently).
             if status != JobLedgerStatus::Running {
-                let statement = claim(narou_rs::application::worker_ledger::claim_fresh(
+                let statement = self.prepare_core(narou_rs::application::worker_ledger::claim_fresh(
                     &now,
                     &self.lease_until_rfc3339(),
                     &execution_token,
                     job_id.as_str(),
-                    &row.target,
+                    normalized_target,
+                    site_key,
                 ))?;
                 if changed_rows(&statement.run().await.map_err(worker_error)?)? > 0 {
                     let row = self.select_row(job_id.as_str()).await?.ok_or_else(|| {
@@ -693,26 +694,20 @@ impl JobQueue for D1JobLedger {
                     })?;
                     return Self::claimed_from_row(&row, execution_token);
                 }
-                // Lost the race: either another executor claimed first or a
-                // same-novel job is running. `busy_retry_after` reads the
-                // candidate's own lease, which for a backoff-held retryable
-                // row is exactly the remaining hold — the queue redelivers
-                // when the row becomes claimable instead of acking it.
-                return Ok(JobClaim::Busy {
-                    retry_after: self.busy_retry_after(&row),
-                });
+                return Ok(JobClaim::Busy);
             }
 
             // Reclaim: the row is running but its lease expired (crashed or
             // lost invocation). The same exclusion applies so a stale
             // redelivery cannot resurrect a novel that another executor is
             // actively working on.
-            let statement = claim(narou_rs::application::worker_ledger::claim_reclaim(
+            let statement = self.prepare_core(narou_rs::application::worker_ledger::claim_reclaim(
                 &now,
                 &self.lease_until_rfc3339(),
                 &execution_token,
                 job_id.as_str(),
-                &row.target,
+                normalized_target,
+                site_key,
             ))?;
             if changed_rows(&statement.run().await.map_err(worker_error)?)? > 0 {
                 let row = self.select_row(job_id.as_str()).await?.ok_or_else(|| {
@@ -720,9 +715,7 @@ impl JobQueue for D1JobLedger {
                 })?;
                 Self::claimed_from_row(&row, execution_token)
             } else {
-                Ok(JobClaim::Busy {
-                    retry_after: self.busy_retry_after(&row),
-                })
+                Ok(JobClaim::Busy)
             }
         })
     }
@@ -737,18 +730,9 @@ impl JobQueue for D1JobLedger {
             let value = serde_json::to_string(checkpoint).map_err(|error| {
                 NarouError::Platform(format!("execution checkpoint serialization: {error}"))
             })?;
-            let statement = self.prepare(
-                "UPDATE worker_jobs
-                 SET status = 'pending', last_error = NULL, checkpoint_json = ?,
-                     updated_at = ?, lease_until = NULL, execution_token = NULL
-                 WHERE job_id = ? AND status = 'running' AND execution_token = ?",
-                vec![
-                    BindValue::Text(value),
-                    BindValue::Text(self.now_rfc3339()),
-                    BindValue::Text(job_id.as_str().to_string()),
-                    BindValue::Text(execution_token.to_string()),
-                ],
-            )?;
+            let statement = self.prepare_core(narou_rs::application::worker_ledger::yield_execution(
+                &self.now_rfc3339(), job_id.as_str(), execution_token, &value,
+            ))?;
             if changed_rows(&statement.run().await.map_err(worker_error)?)? == 0 {
                 return Err(NarouError::Platform(format!(
                     "execution claim for job {job_id} is no longer valid"
@@ -1128,7 +1112,6 @@ struct JobRow {
     last_error: Option<String>,
     created_at: String,
     updated_at: String,
-    lease_until: Option<String>,
     checkpoint_json: Option<String>,
     /// Only the batch dedupe lookup selects this column; per-id reads leave
     /// it unset.
@@ -1260,6 +1243,12 @@ struct JobIdRow {
     job_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct QueuedJobRoute {
+    pub job_id: String,
+    pub kind: String,
+}
+
 /// One stuck active row selected by
 /// [`narou_rs::application::worker_ledger::select_stuck`] for the cron
 /// reaper. `attempts` is the ledger attempt counter (a `retryable` row
@@ -1267,6 +1256,7 @@ struct JobIdRow {
 #[derive(Debug, Deserialize)]
 pub struct StuckJob {
     pub job_id: String,
+    pub kind: String,
     pub status: String,
     pub attempts: i64,
     pub last_error: Option<String>,

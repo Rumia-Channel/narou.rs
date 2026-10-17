@@ -161,21 +161,27 @@ def main() -> None:
     database_name = f"{base_database}-{target}"
     queue_name = f"{base_queue}-{target}"
     dead_letter_queue = f"{queue_name}-dlq"
+    convert_queue_name = f"{base_queue}-convert-{target}"
+    convert_dead_letter_queue = f"{convert_queue_name}-dlq"
     if any(
         len(name) > MAX_NAME_LENGTH
-        for name in (database_name, queue_name, dead_letter_queue)
+        for name in (database_name, queue_name, dead_letter_queue, convert_queue_name, convert_dead_letter_queue)
     ):
         fail("derived D1 or Queue name exceeds 63 characters")
 
     database_uuid = ensure_database(database_name)
     ensure_queue(queue_name)
     ensure_queue(dead_letter_queue)
+    ensure_queue(convert_queue_name)
+    ensure_queue(convert_dead_letter_queue)
     write_outputs(
         {
             "database_name": database_name,
             "database_id": database_uuid,
             "queue_name": queue_name,
             "dead_letter_queue": dead_letter_queue,
+            "convert_queue_name": convert_queue_name,
+            "convert_dead_letter_queue": convert_dead_letter_queue,
         }
     )
 

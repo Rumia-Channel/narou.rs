@@ -241,6 +241,13 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                     .into_bytes(),
             ),
         ),
+        "js/ui/console_size.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions("js/ui/console_size.js", include_str!("assets/js/ui/console_size.js"))
+                    .into_bytes(),
+            ),
+        ),
         "js/ui/actions.js" => (
             "application/javascript; charset=utf-8",
             Cow::Owned(

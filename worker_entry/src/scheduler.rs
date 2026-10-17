@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, SecondsFormat, Utc};
 use narou_rs::application::{
     events::FreezeStore, retry_policy, scheduler::parse_auto_update_schedule, CheckpointClaim,
-    JobId, JobKind, JobPlan, JobTarget, SchedulerCheckpoint, WorkerJobEnvelope,
+    JobId, JobKind, JobPlan, JobTarget, SchedulerCheckpoint,
 };
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{NovelFilter, NovelId, NovelQuery, NovelSort, NovelSortKey};
@@ -68,6 +68,7 @@ const STUCK_GRACE: chrono::TimeDelta = chrono::TimeDelta::minutes(2);
 /// 再送前の `touch_for_reenqueue` CAS と finalize の CAS が、生存している
 /// 配信 (claim 済み) や並行 cron とのレースを排除する。
 pub async fn reap_stuck_jobs(runtime: &WorkerRuntime, push: &PushHubClient) -> Result<()> {
+    runtime.wake_waiting_jobs().await?;
     let stuck_before =
         (runtime.clock.now_utc() - STUCK_GRACE).to_rfc3339_opts(SecondsFormat::Nanos, true);
     let stuck = runtime
@@ -143,8 +144,7 @@ async fn reap_one(
     {
         return Ok(false);
     }
-    let envelope = WorkerJobEnvelope::v2(JobId(job.job_id.clone()));
-    if let Err(error) = runtime.queue.send(&envelope).await {
+    if let Err(error) = runtime.send_existing_job(&JobId(job.job_id.clone()), &job.kind).await {
         console_warn!("job reaper could not re-send {}: {error}", job.job_id);
         return Ok(false);
     }

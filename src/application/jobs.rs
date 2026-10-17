@@ -215,28 +215,23 @@ pub mod worker_ledger {
         pub binds: Vec<String>,
     }
 
-    /// Build the "fresh" claim: promote a `pending` row, or a `retryable`
-    /// row whose backoff hold (`lease_until`) has elapsed, to `running` —
-    /// but only when no *other* row covering the same novel id is running.
-    ///
-    /// - `now` / `lease_until` / `job_id`: canonical strings
-    /// - `execution_token`: the new claim token
-    /// - `target`: the candidate row's canonical target (for extraction)
-    ///
-    /// Bind order: `updated_at, lease_until, execution_token, job_id, now,
-    /// conflict target…`.
+    /// Claim due work under both per-novel exclusion and optional canonical-site
+    /// exclusion. `site_key` is resolved from effective YAML, never an input host.
     pub fn claim_fresh(
         now: &str,
         lease_until: &str,
         execution_token: &str,
         job_id: &str,
         target: &str,
+        site_key: Option<&str>,
     ) -> Statement {
-        let (clause, conflict) = conflict_clause(target);
+        let (clause, conflict) = conflict_clause(target, now, site_key);
         let mut binds = vec![
             now.to_string(),
             lease_until.to_string(),
             execution_token.to_string(),
+            site_key.unwrap_or_default().to_string(),
+            target.to_string(),
             job_id.to_string(),
             now.to_string(),
         ];
@@ -244,34 +239,32 @@ pub mod worker_ledger {
         Statement {
             sql: format!(
                 "UPDATE worker_jobs \
-                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ? \
-                 WHERE job_id = ? \
-                   AND (status = 'pending' \
-                        OR (status = 'retryable' AND (lease_until IS NULL OR lease_until <= ?)))\
+                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ?, \
+                     site_key = NULLIF(?, ''), normalized_target = ?, admission_waiting = 0 \
+                 WHERE job_id = ? AND status IN ('pending', 'retryable') \
+                   AND (lease_until IS NULL OR lease_until <= ?)\
                  {clause}"
             ),
             binds,
         }
     }
 
-    /// Build the lease-expired reclaim: take over a `running` row whose
-    /// lease elapsed (or was never written), under the same per-novel
-    /// exclusion as [`claim_fresh`].
-    ///
-    /// Bind order: `updated_at, lease_until, execution_token, job_id, now,
-    /// conflict target…`.
+    /// Recover an expired execution under the same admission rules.
     pub fn claim_reclaim(
         now: &str,
         lease_until: &str,
         execution_token: &str,
         job_id: &str,
         target: &str,
+        site_key: Option<&str>,
     ) -> Statement {
-        let (clause, conflict) = conflict_clause(target);
+        let (clause, conflict) = conflict_clause(target, now, site_key);
         let mut binds = vec![
             now.to_string(),
             lease_until.to_string(),
             execution_token.to_string(),
+            site_key.unwrap_or_default().to_string(),
+            target.to_string(),
             job_id.to_string(),
             now.to_string(),
         ];
@@ -279,7 +272,8 @@ pub mod worker_ledger {
         Statement {
             sql: format!(
                 "UPDATE worker_jobs \
-                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ? \
+                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ?, \
+                     site_key = NULLIF(?, ''), normalized_target = ?, admission_waiting = 0 \
                  WHERE job_id = ? AND status = 'running' \
                    AND (lease_until IS NULL OR lease_until <= ?)\
                  {clause}"
@@ -302,8 +296,8 @@ pub mod worker_ledger {
     pub fn select_stuck(stuck_before: &str, limit: usize) -> Statement {
         Statement {
             sql: format!(
-                "SELECT job_id, status, attempts, last_error FROM worker_jobs \
-                 WHERE status IN ('pending', 'running', 'retryable') \
+                "SELECT job_id, status, attempts, last_error, kind FROM worker_jobs \
+                 WHERE status IN ('pending', 'running', 'retryable') AND admission_waiting = 0 \
                    AND COALESCE(lease_until, updated_at) <= ? \
                  ORDER BY COALESCE(lease_until, updated_at) ASC, job_id ASC \
                  LIMIT {limit}"
@@ -312,22 +306,15 @@ pub mod worker_ledger {
         }
     }
 
-    /// CAS used by the reaper right before `queue.send`: bump `updated_at`
-    /// only while the row is still active and still past `stuck_before`.
-    /// `lease_until` is also pinned to `now` — for retryable/running rows
-    /// it has already elapsed (that is why the row is stuck), so writing
-    /// "now" keeps the row claimable while taking it out of the stuck
-    /// set; a `pending` row's fresh lease is already past and `claim`
-    /// ignores it. A live claim (status moved to `running`, or a fresh
-    /// `lease_until` was written) or a concurrent reaper tick (already
-    /// bumped both columns) makes this a no-op, so each stuck episode
-    /// produces at most one fresh envelope and re-sends are throttled by
-    /// the grace period instead of flooding the queue.
+    /// Reserve a recovery delivery and retire an expired running token. Keeping
+    /// it `running` would keep its old site locked while the new envelope waits.
     ///
     /// Bind order: `now`, `now`, `job_id`, `stuck_before`.
     pub fn mark_reenqueue(now: &str, job_id: &str, stuck_before: &str) -> Statement {
         Statement {
-            sql: "UPDATE worker_jobs SET updated_at = ?, lease_until = ? \
+            sql: "UPDATE worker_jobs SET updated_at = ?, lease_until = ?, \
+                      status = CASE WHEN status = 'running' THEN 'pending' ELSE status END, \
+                      execution_token = NULL \
                   WHERE job_id = ? \
                     AND status IN ('pending', 'running', 'retryable') \
                     AND COALESCE(lease_until, updated_at) <= ?"
@@ -373,14 +360,96 @@ pub mod worker_ledger {
         }
     }
 
+    /// Persist admission waiting before acknowledging its physical envelope.
+    /// Neither budget continuations nor contention consume failure attempts.
+    pub fn park_admission(now: &str, job_id: &str, target: &str, site_key: Option<&str>) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs \
+                  SET status = 'pending', site_key = NULLIF(?, ''), normalized_target = ?, admission_waiting = 1, \
+                      updated_at = ?, lease_until = NULL, execution_token = NULL \
+                  WHERE job_id = ? AND admission_waiting = 0 \
+                    AND ((status IN ('pending', 'retryable') AND (lease_until IS NULL OR lease_until <= ?)) \
+                         OR (status = 'running' AND (lease_until IS NULL OR lease_until <= ?)))"
+                .to_string(),
+            binds: vec![site_key.unwrap_or_default().to_string(), target.to_string(), now.to_string(),
+                job_id.to_string(), now.to_string(), now.to_string()],
+        }
+    }
+
+    /// Atomically publish a resumable checkpoint and retire the old token.
+    pub fn yield_execution(now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs \
+                  SET status = 'pending', last_error = NULL, checkpoint_json = ?, \
+                      updated_at = ?, lease_until = NULL, execution_token = NULL, admission_waiting = 0 \
+                  WHERE job_id = ? AND status = 'running' AND execution_token = ?"
+                .to_string(),
+            binds: vec![checkpoint_json.to_string(), now.to_string(), job_id.to_string(), execution_token.to_string()],
+        }
+    }
+
+    // Cancelled invocations cannot be killed by the queue API. Their token and
+    // lease continue excluding successors until the invocation drains or expires.
+    const OWNER: &str = "(other.status = 'running' OR (other.status = 'permanent' \
+        AND other.execution_token IS NOT NULL AND other.lease_until > ?))";
+
+    fn novel_id_expression(target: &str) -> String {
+        format!("CASE WHEN {target} = CAST(CAST({target} AS INTEGER) AS TEXT) \
+            THEN CAST({target} AS INTEGER) ELSE (SELECT id FROM novels \
+            WHERE toc_url_fold = lower({target}) OR ncode_fold = lower({target}) \
+              OR substr(rtrim(toc_url_fold, '/'), -(length({target}) + 1)) = '/' || lower({target}) \
+            ORDER BY id LIMIT 1) END")
+    }
+
+    /// Wake at most one acquisition per free site, plus independently eligible
+    /// converts. The cron also uses this query after a lost completion/dispatch.
+    pub fn select_waiting(now: &str, limit: usize) -> Statement {
+        let candidate_target = "COALESCE(candidate.normalized_target, candidate.target)";
+        let other_target = "COALESCE(other.normalized_target, other.target)";
+        let candidate_id = novel_id_expression(candidate_target);
+        let other_id = novel_id_expression(other_target);
+        Statement {
+            sql: format!(
+                "SELECT job_id, kind FROM ( \
+                   SELECT candidate.job_id, candidate.kind, candidate.created_at, \
+                     ROW_NUMBER() OVER (PARTITION BY candidate.site_key, \
+                       CASE WHEN candidate.site_key IS NULL THEN candidate.job_id ELSE '' END \
+                       ORDER BY candidate.created_at, candidate.job_id) AS site_rank \
+                   FROM worker_jobs AS candidate \
+                   WHERE candidate.admission_waiting = 1 \
+                     AND candidate.status IN ('pending', 'retryable') \
+                     AND (candidate.lease_until IS NULL OR candidate.lease_until <= ?) \
+                     AND NOT EXISTS (SELECT 1 FROM worker_jobs AS other \
+                       WHERE {OWNER} AND other.job_id != candidate.job_id AND ( \
+                         (candidate.site_key IS NOT NULL AND other.kind IN ('download', 'update', 'author_check') \
+                           AND (other.site_key IS NULL OR other.site_key = candidate.site_key)) \
+                         OR other.normalized_target IS NULL \
+                         OR {other_target} = {candidate_target} OR ({candidate_id}) = ({other_id}))) \
+                 ) WHERE site_rank = 1 ORDER BY created_at, job_id LIMIT {limit}"
+            ),
+            binds: vec![now.to_string(), now.to_string()],
+        }
+    }
+
+    /// One waker reserves the delivery; send failure is recovered by select_stuck.
+    pub fn mark_waiting_dispatched(now: &str, job_id: &str) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs SET admission_waiting = 0, updated_at = ? \
+                  WHERE job_id = ? AND admission_waiting = 1 AND status IN ('pending', 'retryable')"
+                .to_string(),
+            binds: vec![now.to_string(), job_id.to_string()],
+        }
+    }
+
     /// Resolve both spellings inside the atomic claim, using the repository's
     /// id / ncode / TOC URL rules. Identical new targets also exclude one
     /// another before a novel record exists.
-    fn conflict_clause(target: &str) -> (String, Vec<String>) {
+    fn conflict_clause(target: &str, now: &str, site_key: Option<&str>) -> (String, Vec<String>) {
         let novel_ids: HashSet<i64> = extract_novel_ids(target);
         let mut ids: Vec<i64> = novel_ids.into_iter().collect();
         ids.sort_unstable();
-        let mut binds = vec![target.to_string()];
+        let other_target = "COALESCE(other.normalized_target, other.target)";
+        let mut binds = vec![now.to_string(), target.to_string()];
         let candidate = if ids.is_empty() {
             let folded = crate::db::novel_codec::fold(target);
             binds.extend([folded.clone(), folded.clone(), folded.clone(), folded]);
@@ -392,15 +461,19 @@ pub mod worker_ledger {
             binds.extend(ids.iter().map(i64::to_string));
             format!("n.id IN ({placeholders})")
         };
+        let site_clause = if let Some(site_key) = site_key {
+            binds.push(site_key.to_string());
+            " OR (other.kind IN ('download', 'update', 'author_check') AND (other.site_key IS NULL OR other.site_key = ?))"
+        } else { "" };
         let clause = format!(
             " AND NOT EXISTS (SELECT 1 FROM worker_jobs AS other \
-             WHERE other.status = 'running' AND other.job_id != worker_jobs.job_id \
-               AND (other.target = ? OR EXISTS (SELECT 1 FROM novels AS n \
-                 WHERE {candidate} AND (CAST(n.id AS TEXT) = other.target \
+             WHERE {OWNER} AND other.job_id != worker_jobs.job_id \
+               AND (other.normalized_target IS NULL OR {other_target} = ? OR EXISTS (SELECT 1 FROM novels AS n \
+                 WHERE {candidate} AND (CAST(n.id AS TEXT) = {other_target} \
                    OR n.id = (SELECT id FROM novels \
-                     WHERE toc_url_fold = lower(other.target) OR ncode_fold = lower(other.target) \
-                       OR substr(rtrim(toc_url_fold, '/'), -(length(other.target) + 1)) \
-                          = '/' || lower(other.target) ORDER BY id LIMIT 1)))))"
+                     WHERE toc_url_fold = lower({other_target}) OR ncode_fold = lower({other_target}) \
+                       OR substr(rtrim(toc_url_fold, '/'), -(length({other_target}) + 1)) \
+                          = '/' || lower({other_target}) ORDER BY id LIMIT 1))) {site_clause}))"
         );
         (clause, binds)
     }
@@ -1123,9 +1196,9 @@ pub enum JobClaim {
     },
     /// The row is terminal and a redelivered message can be acknowledged.
     AlreadyTerminal,
-    /// Another invocation owns a still-valid lease. The message must be
-    /// delayed until that lease expires; it must not be acknowledged.
-    Busy { retry_after: Duration },
+    /// Contention or an unexpired execution/backoff. Persist admission waiting
+    /// (or retain its existing live owner/recovery hold) before acknowledging.
+    Busy,
     /// No ledger row exists for the id carried by the envelope. The adapter
     /// durably records a blocked rejection before returning this outcome.
     Unknown,
@@ -1257,11 +1330,12 @@ pub trait JobQueue: Send + Sync {
         job_id: &'a JobId,
     ) -> PlatformFuture<'a, crate::error::Result<Option<QueuedJobView>>>;
 
-    /// Atomically claim a job for execution.
-    ///
-    /// `Busy` is intentionally distinct from `AlreadyTerminal`: a valid
-    /// running lease must cause redelivery, never an acknowledgement.
-    fn claim<'a>(&'a self, job_id: &'a JobId) -> PlatformFuture<'a, crate::error::Result<JobClaim>>;
+    /// Atomically claim using the YAML-resolved target and optional acquisition
+    /// site, without rewriting the stored plan. Contention must be durably
+    /// parked/recoverable, not spent as a provider retry.
+    fn claim<'a>(
+        &'a self, job_id: &'a JobId, normalized_target: &'a str, site_key: Option<&'a str>,
+    ) -> PlatformFuture<'a, crate::error::Result<JobClaim>>;
 
     /// Persist a budget-yielded checkpoint and release the execution claim.
     ///
@@ -2052,7 +2126,7 @@ mod tests {
     /// exclusion never blocks unrelated novels or non-novel targets.
     #[cfg(feature = "native-runtime")]
     mod claim_sql {
-        use super::super::worker_ledger::{claim_fresh, claim_reclaim};
+        use super::super::worker_ledger::{self, Statement, claim_fresh, claim_reclaim};
         use rusqlite::Connection;
 
         fn db() -> Connection {
@@ -2071,7 +2145,10 @@ mod tests {
                     updated_at TEXT NOT NULL,
                     lease_until TEXT,
                     execution_token TEXT,
-                    checkpoint_json TEXT
+                    checkpoint_json TEXT,
+                    site_key TEXT,
+                    normalized_target TEXT,
+                    admission_waiting INTEGER NOT NULL DEFAULT 0
                 ) STRICT;
                 CREATE TABLE novels (id INTEGER PRIMARY KEY, ncode_fold TEXT, toc_url_fold TEXT NOT NULL);
                 INSERT INTO novels VALUES (42, 'n1234ab', 'https://example.com/n1234ab/');",
@@ -2082,9 +2159,9 @@ mod tests {
 
         fn insert(conn: &Connection, job_id: &str, target: &str, status: &str, lease: Option<&str>) {
             conn.execute(
-                "INSERT INTO worker_jobs (job_id, kind, target, status, dedupe_key, created_at, updated_at, lease_until)
-                 VALUES (?, 'update', ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?)",
-                rusqlite::params![job_id, target, status, format!("{status}:{job_id}"), lease],
+                "INSERT INTO worker_jobs (job_id, kind, target, normalized_target, status, dedupe_key, created_at, updated_at, lease_until)
+                 VALUES (?, 'update', ?, ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?)",
+                rusqlite::params![job_id, target, target, status, format!("{status}:{job_id}"), lease],
             )
             .unwrap();
         }
@@ -2096,6 +2173,17 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+        }
+
+        fn apply(conn: &Connection, statement: Statement) -> usize {
+            conn.execute(&statement.sql, rusqlite::params_from_iter(statement.binds.iter())).unwrap()
+        }
+
+        fn waiting(conn: &Connection) -> Vec<String> {
+            let statement = worker_ledger::select_waiting(NOW, 8);
+            conn.prepare(&statement.sql).unwrap()
+                .query_map(rusqlite::params_from_iter(statement.binds.iter()), |row| row.get(0))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
         }
 
         const NOW: &str = "2026-01-01T00:10:00Z";
@@ -2113,7 +2201,7 @@ mod tests {
             insert(&conn, "j-99", "99", "pending", None);
 
             // The conflicting claim must not flip j-conv to running.
-            let stmt = claim_fresh(NOW, LEASE, "tok-b", "j-conv", "42");
+            let stmt = claim_fresh(NOW, LEASE, "tok-b", "j-conv", "42", None);
             let changed = conn
                 .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
                 .unwrap();
@@ -2121,7 +2209,7 @@ mod tests {
             assert_eq!(status_of(&conn, "j-conv"), "pending");
 
             // The unrelated novel claims normally.
-            let stmt = claim_fresh(NOW, LEASE, "tok-c", "j-99", "99");
+            let stmt = claim_fresh(NOW, LEASE, "tok-c", "j-99", "99", None);
             let changed = conn
                 .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
                 .unwrap();
@@ -2141,7 +2229,7 @@ mod tests {
 
             // Reclaiming j-stale must succeed (its own running row is not a
             // self-conflict).
-            let stmt = claim_reclaim(NOW, LEASE, "tok-r", "j-stale", "7");
+            let stmt = claim_reclaim(NOW, LEASE, "tok-r", "j-stale", "7", None);
             let changed = conn
                 .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
                 .unwrap();
@@ -2149,7 +2237,7 @@ mod tests {
 
             // But a pending job for novel 8 is blocked by j-other.
             insert(&conn, "j-blocked", "8", "pending", None);
-            let stmt = claim_fresh(NOW, LEASE, "tok-x", "j-blocked", "8");
+            let stmt = claim_fresh(NOW, LEASE, "tok-x", "j-blocked", "8", None);
             let changed = conn
                 .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
                 .unwrap();
@@ -2164,7 +2252,7 @@ mod tests {
 
             // Before the hold elapses the row is not claimable even though
             // no conflicting job runs.
-            let stmt = claim_fresh(NOW, LEASE, "tok-e", "j-retry", "42");
+            let stmt = claim_fresh(NOW, LEASE, "tok-e", "j-retry", "42", None);
             let changed = conn
                 .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
                 .unwrap();
@@ -2172,7 +2260,7 @@ mod tests {
             assert_eq!(status_of(&conn, "j-retry"), "retryable");
 
             // At/after the hold the same row claims normally.
-            let stmt = claim_fresh("2026-01-01T00:11:00Z", LEASE, "tok-f", "j-retry", "42");
+            let stmt = claim_fresh("2026-01-01T00:11:00Z", LEASE, "tok-f", "j-retry", "42", None);
             let changed = conn
                 .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
                 .unwrap();
@@ -2180,7 +2268,7 @@ mod tests {
 
             // Legacy retryable rows without a hold remain claimable.
             insert(&conn, "j-legacy", "55", "retryable", None);
-            let stmt = claim_fresh(NOW, LEASE, "tok-g", "j-legacy", "55");
+            let stmt = claim_fresh(NOW, LEASE, "tok-g", "j-legacy", "55", None);
             let changed = conn
                 .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
                 .unwrap();
@@ -2202,7 +2290,7 @@ mod tests {
                         let status = if reclaim { "running" } else { "pending" };
                         insert(&conn, "candidate", target, status, Some("2026-01-01T00:01:00Z"));
                         let claim = if reclaim { claim_reclaim } else { claim_fresh };
-                        let stmt = claim(NOW, LEASE, "token", "candidate", target);
+                        let stmt = claim(NOW, LEASE, "token", "candidate", target, None);
                         let changed = conn.execute(&stmt.sql,
                             rusqlite::params_from_iter(stmt.binds.iter())).unwrap();
                         assert_eq!(changed, i64::from(target == "99") as usize,
@@ -2215,6 +2303,71 @@ mod tests {
         }
 
         #[test]
+        fn yaml_resolved_aliases_exclude_both_directions_without_rewriting_plans() {
+            let canonical = "https://example.com/n1234ab/";
+            let alias = "https://alias.example/book/1234";
+            for (owner_target, owner_key, owner_kind, candidate_target, candidate_key, candidate_kind) in [
+                (alias, canonical, "download", "42", "42", "convert"),
+                ("42", "42", "convert", alias, canonical, "download"),
+            ] {
+                for reclaim in [false, true] {
+                    let conn = db();
+                    insert(&conn, "owner", owner_target, "pending", None);
+                    conn.execute("UPDATE worker_jobs SET kind = ? WHERE job_id = 'owner'", [owner_kind]).unwrap();
+                    let owner_site = (owner_kind == "download").then_some("example.com");
+                    let candidate_site = (candidate_kind == "download").then_some("example.com");
+                    assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "owner-token", "owner", owner_key, owner_site)), 1);
+                    let state = if reclaim { "running" } else { "pending" };
+                    insert(&conn, "candidate", candidate_target, state, Some("2026-01-01T00:01:00Z"));
+                    conn.execute("UPDATE worker_jobs SET kind = ? WHERE job_id = 'candidate'", [candidate_kind]).unwrap();
+                    let claim = if reclaim { claim_reclaim } else { claim_fresh };
+                    assert_eq!(apply(&conn, claim(NOW, LEASE, "candidate-token", "candidate", candidate_key, candidate_site)), 0);
+                    apply(&conn, worker_ledger::park_admission(NOW, "candidate", candidate_key, candidate_site));
+                    assert!(waiting(&conn).is_empty());
+                    let original: String = conn.query_row("SELECT target FROM worker_jobs WHERE job_id = 'owner'", [], |row| row.get(0)).unwrap();
+                    assert_eq!(original, owner_target);
+                    conn.execute("UPDATE worker_jobs SET status = 'succeeded', execution_token = NULL, lease_until = NULL WHERE job_id = 'owner'", []).unwrap();
+                    assert_eq!(waiting(&conn), vec!["candidate"]);
+                    assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "candidate-token", "candidate", candidate_key, candidate_site)), 1);
+                    let original: String = conn.query_row("SELECT target FROM worker_jobs WHERE job_id = 'candidate'", [], |row| row.get(0)).unwrap();
+                    assert_eq!(original, candidate_target);
+                }
+            }
+        }
+
+        #[test]
+        fn canonical_target_exclusion_survives_novel_registration_during_download() {
+            let conn = db();
+            let canonical = "https://example.com/new/";
+            insert(&conn, "download", "https://alias.example/new/", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "download-token", "download", canonical, Some("example.com"))), 1);
+            conn.execute("INSERT INTO novels VALUES (99, 'new', ?)", [canonical]).unwrap();
+            insert(&conn, "convert", "99", "pending", None);
+            conn.execute("UPDATE worker_jobs SET kind = 'convert' WHERE job_id = 'convert'", []).unwrap();
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert", "99", None)), 0);
+            apply(&conn, worker_ledger::park_admission(NOW, "convert", "99", None));
+            assert!(waiting(&conn).is_empty());
+            conn.execute("UPDATE worker_jobs SET status = 'succeeded', execution_token = NULL, lease_until = NULL WHERE job_id = 'download'", []).unwrap();
+            assert_eq!(waiting(&conn), vec!["convert"]);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert", "99", None)), 1);
+        }
+
+        #[test]
+        fn legacy_owner_without_resolved_identity_drains_before_new_conversion() {
+            let conn = db();
+            insert(&conn, "legacy", "https://alias.example/unknown/", "running", Some(LEASE));
+            conn.execute("UPDATE worker_jobs SET normalized_target = NULL WHERE job_id = 'legacy'", []).unwrap();
+            insert(&conn, "convert", "99", "pending", None);
+            conn.execute("UPDATE worker_jobs SET kind = 'convert' WHERE job_id = 'convert'", []).unwrap();
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert", "99", None)), 0);
+            apply(&conn, worker_ledger::park_admission(NOW, "convert", "99", None));
+            assert!(waiting(&conn).is_empty());
+            conn.execute("UPDATE worker_jobs SET status = 'succeeded', lease_until = NULL WHERE job_id = 'legacy'", []).unwrap();
+            assert_eq!(waiting(&conn), vec!["convert"]);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert", "99", None)), 1);
+        }
+
+        #[test]
         fn unregistered_urls_exclude_identical_targets_but_not_other_novels() {
             let conn = db();
             insert(&conn, "new", "https://example.com/new/", "running", Some(LEASE));
@@ -2223,9 +2376,147 @@ mod tests {
                 ("unrelated", "https://example.com/other/", 1),
             ] {
                 insert(&conn, job_id, target, "pending", None);
-                let stmt = claim_fresh(NOW, LEASE, "token", job_id, target);
+                let stmt = claim_fresh(NOW, LEASE, "token", job_id, target, None);
                 assert_eq!(conn.execute(&stmt.sql,
                     rusqlite::params_from_iter(stmt.binds.iter())).unwrap(), expected);
+            }
+        }
+
+        #[test]
+        fn site_admission_serializes_acquisitions_without_blocking_other_sites_or_conversion() {
+            for reclaim in [false, true] {
+                let conn = db();
+                insert(&conn, "owner", "42", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "owner-token", "owner", "42", Some("shared.example"))), 1);
+                let state = if reclaim { "running" } else { "pending" };
+                insert(&conn, "alias", "https://alias.example/new/", state, Some("2026-01-01T00:01:00Z"));
+                conn.execute("UPDATE worker_jobs SET site_key = 'shared.example' WHERE job_id = 'alias'", []).unwrap();
+                let claim = if reclaim { claim_reclaim } else { claim_fresh };
+                assert_eq!(apply(&conn, claim(NOW, LEASE, "alias-token", "alias", "https://alias.example/new/", Some("shared.example"))), 0);
+                insert(&conn, "other-site", "https://other.example/book/", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "other-token", "other-site", "https://other.example/book/", Some("other.example"))), 1);
+                insert(&conn, "convert-other", "99", "pending", None);
+                conn.execute("UPDATE worker_jobs SET kind = 'convert' WHERE job_id = 'convert-other'", []).unwrap();
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert-other", "99", None)), 1);
+                insert(&conn, "convert-same", "n1234ab", "pending", None);
+                conn.execute("UPDATE worker_jobs SET kind = 'convert' WHERE job_id = 'convert-same'", []).unwrap();
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "same-token", "convert-same", "n1234ab", None)), 0);
+            }
+        }
+
+        #[test]
+        fn admission_waiting_preserves_attempts_checkpoint_and_lost_dispatch_recovery() {
+            let conn = db();
+            insert(&conn, "owner", "42", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "owner-token", "owner", "42", Some("shared.example"))), 1);
+            insert(&conn, "waiting", "99", "pending", None);
+            let checkpoint = super::super::WorkerExecutionCheckpoint::planned(
+                super::super::JobId("waiting".into()), Some(crate::platform::NovelId(99)),
+            ).advance(super::super::ExecutionPhase::Fetching, Some(19));
+            let encoded = serde_json::to_string(&checkpoint).unwrap();
+            conn.execute("UPDATE worker_jobs SET attempts = 2, checkpoint_json = ? WHERE job_id = 'waiting'", [&encoded]).unwrap();
+            for _ in 0..5 {
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "waiting-token", "waiting", "99", Some("shared.example"))), 0);
+                apply(&conn, worker_ledger::park_admission(NOW, "waiting", "99", Some("shared.example")));
+                let saved: (i64, String, String) = conn.query_row(
+                    "SELECT attempts, checkpoint_json, status FROM worker_jobs WHERE job_id = 'waiting'",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!(saved, (2, encoded.clone(), "pending".into()));
+                assert!(waiting(&conn).is_empty());
+            }
+            conn.execute("UPDATE worker_jobs SET status = 'succeeded', execution_token = NULL, lease_until = NULL WHERE job_id = 'owner'", []).unwrap();
+            assert_eq!(waiting(&conn), vec!["waiting"]);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "waiting")), 1);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "waiting")), 0);
+            assert!(waiting(&conn).is_empty());
+            // Simulate a lost Queue send after the durable waker reservation.
+            let recovered_at = "2026-01-01T00:14:00Z";
+            assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(recovered_at, "waiting", "2026-01-01T00:12:00Z")), 1);
+            assert_eq!(apply(&conn, claim_fresh(recovered_at, LEASE, "resumed", "waiting", "99", Some("shared.example"))), 1);
+            let saved: (i64, String) = conn.query_row(
+                "SELECT attempts, checkpoint_json FROM worker_jobs WHERE job_id = 'waiting'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(saved, (2, encoded));
+        }
+
+        #[test]
+        fn waker_selects_one_acquisition_per_site_and_respects_cross_lane_novels() {
+            let conn = db();
+            insert(&conn, "owner", "42", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "owner-token", "owner", "42", Some("a.example"))), 1);
+            for (id, target, site) in [
+                ("a1", "7", Some("a.example")), ("a2", "8", Some("a.example")),
+                ("b1", "9", Some("b.example")), ("b2", "10", Some("b.example")),
+                ("c1", "n1234ab", None), ("c2", "99", None),
+            ] {
+                insert(&conn, id, target, "pending", None);
+                if site.is_none() {
+                    conn.execute("UPDATE worker_jobs SET kind = 'convert' WHERE job_id = ?", [id]).unwrap();
+                }
+                assert_eq!(apply(&conn, worker_ledger::park_admission(NOW, id, target, site)), 1);
+            }
+            assert_eq!(waiting(&conn), vec!["b1", "c2"]);
+            conn.execute("UPDATE worker_jobs SET status = 'succeeded', execution_token = NULL, lease_until = NULL WHERE job_id = 'owner'", []).unwrap();
+            assert_eq!(waiting(&conn), vec!["a1", "b1", "c1", "c2"]);
+        }
+
+        #[test]
+        fn cancellation_drains_hold_site_and_novel_but_retry_backoff_does_not() {
+            for (status, lease, owns) in [
+                ("running", LEASE, true),
+                ("permanent", LEASE, true),
+                ("permanent", "2026-01-01T00:01:00Z", false),
+                ("retryable", LEASE, false),
+            ] {
+                let conn = db();
+                insert(&conn, "owner", "42", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "owner-token", "owner", "42", Some("shared.example"))), 1);
+                conn.execute("UPDATE worker_jobs SET status = ?, lease_until = ? WHERE job_id = 'owner'", [status, lease]).unwrap();
+                insert(&conn, "next", "99", "pending", None);
+                insert(&conn, "convert", "n1234ab", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "next-token", "next", "99", Some("shared.example"))), usize::from(!owns));
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert", "n1234ab", None)), usize::from(!owns));
+            }
+        }
+
+        #[test]
+        fn expired_unscoped_owner_is_retired_without_losing_resume_data() {
+            let conn = db();
+            insert(&conn, "old", "42", "running", Some("2026-01-01T00:01:00Z"));
+            conn.execute("UPDATE worker_jobs SET execution_token = 'old-token', checkpoint_json = 'saved', attempts = 2 WHERE job_id = 'old'", []).unwrap();
+            insert(&conn, "new", "99", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "new-token", "new", "99", Some("other.example"))), 0);
+            assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(NOW, "old", "2026-01-01T00:08:00Z")), 1);
+            let saved: (String, i64, String, Option<String>) = conn.query_row(
+                "SELECT status, attempts, checkpoint_json, execution_token FROM worker_jobs WHERE job_id = 'old'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            assert_eq!(saved, ("pending".into(), 2, "saved".into(), None));
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "new-token", "new", "99", Some("other.example"))), 1);
+        }
+
+        #[test]
+        fn repeated_budget_yields_keep_failure_count_and_fence_old_tokens() {
+            let conn = db();
+            insert(&conn, "budget", "42", "pending", None);
+            conn.execute("UPDATE worker_jobs SET attempts = 2 WHERE job_id = 'budget'", []).unwrap();
+            let mut checkpoint = super::super::WorkerExecutionCheckpoint::planned(
+                super::super::JobId("budget".into()), Some(crate::platform::NovelId(42)),
+            );
+            for index in [19, 59, 86, 201] {
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "current-token", "budget", "42", Some("shared.example"))), 1);
+                checkpoint = checkpoint.advance(super::super::ExecutionPhase::Fetching, Some(index));
+                let encoded = serde_json::to_string(&checkpoint).unwrap();
+                assert_eq!(apply(&conn, worker_ledger::yield_execution(NOW, "budget", "stale-token", &encoded)), 0);
+                assert_eq!(status_of(&conn, "budget"), "running");
+                assert_eq!(apply(&conn, worker_ledger::yield_execution(NOW, "budget", "current-token", &encoded)), 1);
+                let saved: (String, i64, String, Option<String>, Option<String>) = conn.query_row(
+                    "SELECT status, attempts, checkpoint_json, execution_token, lease_until FROM worker_jobs WHERE job_id = 'budget'",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                ).unwrap();
+                assert_eq!(saved, ("pending".into(), 2, encoded, None, None));
             }
         }
     }
@@ -2257,7 +2548,8 @@ mod tests {
                     updated_at TEXT NOT NULL,
                     lease_until TEXT,
                     execution_token TEXT,
-                    checkpoint_json TEXT
+                    checkpoint_json TEXT,
+                    admission_waiting INTEGER NOT NULL DEFAULT 0
                 ) STRICT;",
             )
             .unwrap();

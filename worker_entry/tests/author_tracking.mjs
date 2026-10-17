@@ -64,7 +64,15 @@ async function jobs(ids, expected = 'succeeded') {
     assert.equal(job.status, expected, JSON.stringify(job));
   }
 }
-async function settled() { await jobs(sql("SELECT job_id FROM worker_jobs WHERE status IN ('pending','running','retryable') ORDER BY created_at").map((row) => row.job_id)); }
+async function settled() {
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline) {
+    const active = sql("SELECT job_id FROM worker_jobs WHERE status IN ('pending','running','retryable') ORDER BY created_at");
+    if (active.length === 0) return;
+    await jobs(active.map((row) => row.job_id));
+  }
+  throw new Error('author fan-out and follow-up conversions did not settle');
+}
 async function update() {
   const result = await json('/api/update', { update_all: true });
   await jobs([...result.job_ids, ...(result.author_job_ids ?? [])]); await settled(); return result;
@@ -142,7 +150,7 @@ try {
   workCount = 5;
   let cron = await api('/__scheduled?cron=*+*+*+*+*');
   if (cron.status === 404) cron = await api('/cdn-cgi/handler/scheduled?cron=*+*+*+*+*');
-  assert(cron.ok, await cron.text()); await settled(); await settled();
+  assert(cron.ok, await cron.text()); await settled();
   assert.equal(count('SELECT COUNT(*) FROM novels'), 5, 'cron must discover the fifth work');
   console.log('PASS actual scheduled handler checks tracked authors');
   workCount = 6;
@@ -167,6 +175,7 @@ try {
   await setting({ over18: true }, { over18: false });
   const one = await json('/api/download', { targets: [`http://authors.example:${sourcePort}/authors/8/`] }); await jobs(one.results.map((row) => row.job_id));
   assert.deepEqual((await json('/api/authors')).authors, []); assert.equal(count("SELECT COUNT(*) FROM novels WHERE ncode='oneshot1'"), 1);
+  await settled();
   console.log('PASS explicit adult consent unblocks terminal-free downloads; cross-host one-shot authors remain untracked');
   if (process.env.AUTHOR_SMOKE_KEEP === '1') {
     console.log(`AUTHOR_WORKER_READY http://127.0.0.1:${port}/settings token=${token} author=${storedUrl}`);

@@ -86,22 +86,18 @@
 @media (max-width: 30em) {
   :root {
     --btn-font-size: 0.80rem;
+    --console-height: 6rem;
   }
 
   .navbar-brand {
     font-size: 1rem;
-  }
-
-  .console {
-    min-height: 6em;
-    max-height: 6em;
   }
 }
 
 /* Large desktop (>= 75em / ~1200px) */
 @media (min-width: 75em) {
   .navbar-inner {
-    max-width: 80em;
+    max-width: var(--content-max-width);
     margin-left: auto;
     margin-right: auto;
   }
@@ -111,12 +107,16 @@
     margin-left: auto;
     margin-right: auto;
   }
+}
 
-  /* In wide mode, only the novel table expands; console and controls stay constrained */
-  .container-main.wide-mode > #console-container,
-  .container-main.wide-mode > #control-panel {
-    max-width: calc(var(--content-max-width) - 2 * var(--container-padding));
-    margin-left: auto;
-    margin-right: auto;
+/* Above FHD, scale the shared rem-based UI without overriding browser text size. */
+@media (min-width: 120.0625em) {
+  :root {
+    --root-font-size: var(--wide-screen-root-font-size);
+  }
+
+  .navbar-inner,
+  .container-main {
+    max-width: max(var(--content-max-width), var(--wide-screen-content-width));
   }
 }

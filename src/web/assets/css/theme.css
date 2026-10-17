@@ -54,8 +54,15 @@
   /* Console */
   --console-bg: #333;
   --console-text: #fff;
-  --console-height: 10rem;
+  --console-height: clamp(10rem, 18vh, 28rem);
   --console-expanded-height: 80vh;
+  --console-resize-min-height: 6rem;
+  --console-resize-max-height: 80vh;
+  --console-resize-handle-height: 1.5rem;
+  --console-resize-grip-width: 4rem;
+  --console-resize-grip-height: 0.125rem;
+  --console-resize-grip-radius: 0.125rem;
+  --console-resize-outline-offset: 0.125rem;
   --console-progress-max-height: 70%;
   --console-progress-gap: 0.35em;
   --console-progress-padding: 0 0.7em 0.5em;
@@ -140,6 +147,9 @@
   --btn-border-radius: 0.25em;
   --btn-font-size: 1em;
   --table-cell-padding: 0.25rem;
+  --root-font-size: 100%;
+  --wide-screen-root-font-size: clamp(100%, calc(50% + 0.4166667vw), 125%);
+  --wide-screen-content-width: 85vw;
   --base-font-size: 87.5%;
   --base-line-height: 1.45;
   --content-max-width: 104em;

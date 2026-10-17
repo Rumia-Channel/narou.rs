@@ -26,7 +26,7 @@
 //!   のは、実行中の Worker が失われて lease 切れになった `running` 行。
 //!   `claim` の lease 期限分岐が回収できるので、envelope を再送して復元する。
 
-use narou_rs::application::{JobId, WorkerJobEnvelope};
+use narou_rs::application::JobId;
 use serde::Deserialize;
 use serde_json::json;
 use worker::{console_log, Env, Method, Request, Response};
@@ -280,15 +280,14 @@ async fn restore_pending_tasks(req: Request, env: Env) -> worker::Result<Respons
     // なり得る (dedupe は active 行を見るので Ledger 側は防げても Queue 側
     // の順序は汚れる)。配信が消えた行は cron の reaper
     // (`scheduler::reap_stuck_jobs`) が猶予付きで検出して再送・確定する。
-    let stale_ids = match runtime.ledger.stale_running_job_ids().await {
-        Ok(ids) => ids,
+    let stale_jobs = match runtime.ledger.stale_running_jobs().await {
+        Ok(jobs) => jobs,
         Err(error) => {
             return Response::from_json(&json!({ "error": error.to_string() }));
         }
     };
-    for job_id in &stale_ids {
-        let envelope = WorkerJobEnvelope::v2(JobId::from(job_id.clone()));
-        if let Err(error) = runtime.queue.send(&envelope).await {
+    for job in &stale_jobs {
+        if let Err(error) = runtime.send_existing_job(&JobId::from(job.job_id.clone()), &job.kind).await {
             // native parity: 失敗は `{error: <string>}` を 200 で返す。
             return Response::from_json(&json!({
                 "error": format!("queue send failed: {error}"),
@@ -298,7 +297,7 @@ async fn restore_pending_tasks(req: Request, env: Env) -> worker::Result<Respons
     // native `restore_pending_tasks` は `activate_restorable_tasks` の Ok 後に
     // 無条件で送る (失敗応答 `{error}` では送らない — worker も同じ)。
     notify_queue_changed(&env, &runtime).await;
-    Response::from_json(&json!({ "status": "ok", "count": stale_ids.len() }))
+    Response::from_json(&json!({ "status": "ok", "count": stale_jobs.len() }))
 }
 
 // ---------------------------------------------------------------------------
