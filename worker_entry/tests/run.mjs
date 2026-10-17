@@ -35,6 +35,19 @@ function run(command, args, options = {}) {
   }
 }
 
+function stop(child) {
+  if (isWindows) {
+    spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+  } else {
+    // npx owns Wrangler/workerd descendants; stop the complete process group.
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+  }
+}
+
 // 1. ローカル用の secret。既にあれば触らない (開発者の値を壊さない)。
 const devVars = join(root, ".dev.vars");
 if (!existsSync(devVars)) {
@@ -89,7 +102,7 @@ const dev = spawn(
     port,
     "--test-scheduled",
   ],
-  { cwd: root, stdio: "inherit", shell: isWindows },
+  { cwd: root, stdio: "inherit", shell: isWindows, detached: !isWindows },
 );
 
 let exitCode = 1;
@@ -139,7 +152,7 @@ try {
         "--var",
         "NAROU_AUTH_REQUIRED:true",
       ],
-      { cwd: root, stdio: "inherit", shell: isWindows },
+      { cwd: root, stdio: "inherit", shell: isWindows, detached: !isWindows },
     );
     try {
       const unconfiguredBase = "http://127.0.0.1:8788";
@@ -168,25 +181,26 @@ try {
       );
       if ((unconfigured.status ?? 1) !== 0) exitCode = unconfigured.status ?? 1;
     } finally {
-      if (isWindows) {
-        spawnSync("taskkill", ["/pid", String(authPid.pid), "/T", "/F"], { stdio: "ignore" });
-      } else {
-        authPid.kill("SIGTERM");
-      }
+      stop(authPid);
       if (hadVars && existsSync(savedVars)) renameSync(savedVars, devVars);
     }
   }
 } finally {
   if (!keep) {
-    if (isWindows) {
-      spawnSync("taskkill", ["/pid", String(dev.pid), "/T", "/F"], { stdio: "ignore" });
-    } else {
-      dev.kill("SIGTERM");
-    }
+    stop(dev);
     rmSync(testConfig, { force: true });
   } else {
     console.log(`kept wrangler dev (pid ${dev.pid}) and ${testConfig}`);
   }
+}
+
+// Author tracking needs a fresh library and controlled HTTP source, not the
+// developer's persistent contract-test database.
+if (exitCode === 0) {
+  const authors = spawnSync(process.execPath, [join(here, "author_tracking.mjs")], {
+    cwd: root, stdio: "inherit", env: { ...process.env, AUTHOR_SMOKE_KEEP: "0" },
+  });
+  exitCode = authors.status ?? 1;
 }
 
 process.exit(exitCode);

@@ -295,6 +295,10 @@ async fn run_command(
     let cli = match Cli::try_parse_from(std::iter::once("narou".to_string()).chain(args)) {
         Ok(cli) => cli,
         Err(e) => {
+            if matches!(e.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
+                logger::without_logging(|| print!("{e}"));
+                return 0;
+            }
             if let Some(message) = cli::parse_error_message(&e) {
                 commands::log::report_error(&message);
                 return 127;

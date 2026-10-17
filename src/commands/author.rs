@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use narou_rs::author::{self, AuthorRecord};
+use narou_rs::author;
 use narou_rs::downloader::Downloader;
 use narou_rs::error::{NarouError, Result};
 
@@ -57,15 +57,7 @@ fn add(url: &str) -> Result<()> {
     // 規則がストア側にあり、`SiteSetting::load_all()` (ファイル直読み) では
     // 見えない。YAML モードでも `load_all` と同じ定義になる。
     let settings = narou_rs::downloader::site_setting::effective_site_settings();
-    let setting = settings
-        .iter()
-        .find(|setting| setting.matches_author_url(url))
-        .ok_or_else(|| {
-            NarouError::SiteSetting(format!(
-                "{url} を作者ページとして扱うサイト定義がありません (author_url 未定義)"
-            ))
-        })?;
-    let author = AuthorRecord::new(setting.domain.clone(), url);
+    let author = narou_rs::application::authors::author_for_url(url, &settings)?;
     if author::add_author(&author)? {
         println!("作者を登録しました: {} ({})", author.url, author.site);
         println!("  `narou update` のたびに確認し、新しい作品があれば追加します。");
@@ -95,7 +87,7 @@ fn remove(target: &str) -> Result<()> {
     let authors = author::authors_for_current_root()?;
     let url = if let Ok(position) = target.parse::<usize>() {
         authors
-            .get(position.saturating_sub(1))
+            .get(position.checked_sub(1).ok_or_else(|| NarouError::Database(format!("{target} 番目の作者はいません")))?)
             .map(|author| author.url.clone())
             .ok_or_else(|| NarouError::Database(format!("{target} 番目の作者はいません")))?
     } else {
@@ -407,5 +399,16 @@ toc_url: https://custom.example/book/\k<ncode>
                 && author.site == "custom.example"),
             "got {authors:?}"
         );
+    }
+
+    #[test]
+    fn removing_zero_does_not_remove_the_first_tracked_author() {
+        let temp = tempfile::tempdir().unwrap();
+        let _dir = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let author = narou_rs::author::AuthorRecord::new("example.test", "https://example.test/users/1");
+        narou_rs::author::add_author(&author).unwrap();
+        assert!(remove("0").is_err());
+        assert_eq!(narou_rs::author::authors_for_current_root().unwrap(), vec![author]);
     }
 }

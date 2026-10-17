@@ -184,20 +184,30 @@ async fn build_object_stores(
 )> {
     let required = required_s3(env)?;
     let backend = read_asset_backend(db, fresh).await?.resolve(required);
+    // Content has an independent forward-only transition. Read primary on
+    // composition; SQL guards also reject writes from pre-transition runtimes.
+    let content_backend = crate::content_store::backend(&db.primary_view()).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
     let d1: Arc<D1ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
-    let mut s3_handle: Option<Arc<S3Store>> = None;
-    let illustrations: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) =
-        match backend {
-            // S3 が選ばれていて資格情報が欠けている場合は起動を失敗させ、
-            // 黙って D1 へ落とさない (fail-closed)。
-            AssetBackend::S3 => {
-                let store: Arc<S3Store> = crate::s3_store::store_from_env(env, subrequests).await?;
-                s3_handle = Some(store.clone());
-                (store.clone(), store)
-            }
-            AssetBackend::D1 => (d1.clone(), d1.clone()),
-        };
-    let split: Arc<SplitStore> = Arc::new(SplitStore::new((d1.clone(), d1.clone()), illustrations));
+    let s3 = if backend == AssetBackend::S3 || content_backend != crate::content_store::ContentBackend::D1 {
+        Some(crate::s3_store::store_from_env(env, subrequests).await?)
+    } else {
+        None
+    };
+    let s3_handle = if backend == AssetBackend::S3 { s3.clone() } else { None };
+    let illustrations: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) = match &s3_handle {
+        Some(store) => (store.clone(), store.clone()),
+        None => (d1.clone(), d1.clone()),
+    };
+    let primary: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) = match (content_backend, s3) {
+        (crate::content_store::ContentBackend::D1, _) => (d1.clone(), d1),
+        (_, Some(store)) => {
+            let content = Arc::new(crate::content_store::ContentStore::new(db.clone(), store.clone(), store));
+            (content.clone(), content)
+        }
+        _ => return Err(worker::Error::RustError("content S3 storage is unavailable".into())),
+    };
+    let split: Arc<SplitStore> = Arc::new(SplitStore::new(primary, illustrations));
     Ok((split.clone(), split, s3_handle))
 }
 
@@ -584,6 +594,34 @@ impl WorkerRuntime {
     /// read-your-writes と保存先解決はこちらを使う。
     pub fn write_objects(&self) -> Arc<dyn ObjectStore> {
         self.write_objects.clone()
+    }
+
+    pub fn author_service(&self) -> narou_rs::application::authors::AuthorService {
+        crate::authors::service(self.write_db.clone())
+    }
+
+    pub async fn author_work_urls(&self, url: &str) -> Result<Vec<String>> {
+        let sites = crate::bundled_sites::load_site_settings_uncached(&self.write_objects).await?;
+        let expander = narou_rs::application::download_targets::DownloadTargetExpander::new(
+            self.http.as_ref(), self.rate_limiter.as_ref(), &sites,
+        ).with_cookie_store(Some(&*self.cookie_store));
+        narou_rs::application::authors::new_work_urls(url, &expander, &sites, self.novels.as_ref()).await
+    }
+
+    pub async fn enqueue_author_checks(&self, automatic: bool) -> Result<Vec<DispatchOutcome>> {
+        if automatic {
+            let values = self.write_services.settings.get_many(&["update.disabled-author-tracking"]).await
+                .map_err(|error| NarouError::Platform(error.to_string()))?;
+            if values.first().and_then(Option::as_ref).and_then(narou_rs::setting_core::setting_bool_value).unwrap_or(false) {
+                return Ok(Vec::new());
+            }
+        }
+        let plans = self.author_service().list().await?.into_iter().map(|author| {
+            let target = JobTarget::parse(&author.url).filter(|target| matches!(target, JobTarget::Url(_)))
+                .ok_or_else(|| NarouError::InvalidTarget(format!("登録中の作者 URL が不正です: {}", author.url)))?;
+            Ok(JobPlan { kind: JobKind::AuthorCheck, target, options: Vec::new() })
+        }).collect::<Result<Vec<_>>>()?;
+        self.enqueue_batch(&plans).await
     }
 
 

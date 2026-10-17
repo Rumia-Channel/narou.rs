@@ -12,6 +12,7 @@
 //!   まま echo するので、ここの文言が両環境で一致する。
 //!
 pub mod convert;
+pub mod author;
 pub mod download;
 pub mod flush;
 pub mod jobs;

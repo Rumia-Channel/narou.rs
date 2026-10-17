@@ -278,6 +278,16 @@ pub trait NovelRepository: PlatformService {
         url: &'a str,
     ) -> PlatformFuture<'a, crate::error::Result<Option<NovelRecord>>>;
 
+    /// Membership in input order, without copying full novel records.
+    /// Remote stores override this with bounded indexed batch lookups.
+    fn contains_toc_urls<'a>(&'a self, urls: &'a [String]) -> PlatformFuture<'a, crate::error::Result<Vec<bool>>> {
+        Box::pin(async move {
+            let mut known = Vec::with_capacity(urls.len());
+            for url in urls { known.push(self.find_by_toc_url(url).await?.is_some()); }
+            Ok(known)
+        })
+    }
+
     fn find_by_title<'a>(
         &'a self,
         title: &'a str,

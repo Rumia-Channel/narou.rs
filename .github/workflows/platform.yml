@@ -48,6 +48,8 @@ jobs:
           node-version: "22"
       - name: Worker S3 deployment regressions
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_*s3*.py'
+      - name: Worker content publication and migration regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_content_storage_sql.py'
       - name: Web UI source-link escaping regressions
         run: node --test tests/render_links.test.mjs
       - name: Web UI progress bar regressions
@@ -152,6 +154,8 @@ jobs:
           NAROU_ADMIN_TOKEN: contract-token
           # トークンを外した構成で fail-closed も確かめる。
           NAROU_CHECK_UNCONFIGURED: "1"
+      - name: Worker compressed content lifecycle
+        run: node tests/content_storage.mjs
 
   # デプロイはリポジトリの secret を設定したうえで手動実行する。
   # 必要な値 (GitHub の environment = target 名で設定):

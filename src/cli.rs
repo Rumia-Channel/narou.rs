@@ -968,6 +968,7 @@ pub enum Commands {
         more: bool,
     },
     /// Authors whose works are tracked (add/list/remove/check).
+    #[command(after_help = "Examples:\n  narou author add https://mypage.syosetu.com/2842627/\n  narou author list\n  narou author remove 1")]
     Author {
         #[command(subcommand)]
         action: crate::commands::author::AuthorAction,

@@ -2,14 +2,15 @@
 //!
 //! Kept outside the novel database on purpose: an author is a *watch target*,
 //! not a novel, and the only things worth remembering are the site it belongs
-//! to and the author page itself (`site` + `url`, plus bookkeeping for the
-//! list). When `narou update` runs, every entry here is checked and the works
-//! that are not in the library yet are downloaded.
+//! to and the author page itself (`site` + `url`). Update checks these targets
+//! and downloads works that are not in the library yet.
 //!
 //! The store lives in the `author` inventory, so SQLite keeps it in `app_state`
 //! and the legacy backend keeps `.narou/author.yaml`.
 
+#[cfg(feature = "native-runtime")]
 use crate::db::inventory::{Inventory, InventoryScope};
+#[cfg(feature = "native-runtime")]
 use crate::error::Result;
 
 /// Inventory name and legacy file name (`author.yaml`).
@@ -43,15 +44,10 @@ impl AuthorRecord {
     }
 }
 
-/// Every tracked author, ordered by site then URL.
-pub fn load_authors(inventory: &Inventory) -> Result<Vec<AuthorRecord>> {
-    let raw = inventory.load_raw(INVENTORY_NAME, InventoryScope::Local)?;
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let value: serde_yaml::Value = serde_yaml::from_str(&raw)?;
+/// Decode the native inventory / D1 value, including old richer records.
+pub fn authors_from_value(value: &serde_yaml::Value) -> Vec<AuthorRecord> {
     let Some(mapping) = value.as_mapping() else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let mut authors = Vec::new();
     for (key, entry) in mapping {
@@ -74,26 +70,36 @@ pub fn load_authors(inventory: &Inventory) -> Result<Vec<AuthorRecord>> {
             .cmp(&right.site)
             .then_with(|| left.url.cmp(&right.url))
     });
-    Ok(authors)
+    authors
+}
+
+pub fn authors_to_value(authors: &[AuthorRecord]) -> serde_yaml::Value {
+    serde_yaml::Value::Mapping(authors.iter().map(|author| (
+        serde_yaml::Value::String(author.url.clone()),
+        serde_yaml::Value::String(author.site.clone()),
+    )).collect())
+}
+
+/// Every tracked author, ordered by site then URL.
+#[cfg(feature = "native-runtime")]
+pub fn load_authors(inventory: &Inventory) -> Result<Vec<AuthorRecord>> {
+    let raw = inventory.load_raw(INVENTORY_NAME, InventoryScope::Local)?;
+    if raw.trim().is_empty() { return Ok(Vec::new()); }
+    Ok(authors_from_value(&serde_yaml::from_str(&raw)?))
 }
 
 /// Replace the tracked authors.
+#[cfg(feature = "native-runtime")]
 pub fn save_authors(inventory: &Inventory, authors: &[AuthorRecord]) -> Result<()> {
     if authors.is_empty() {
         return inventory.save_raw(INVENTORY_NAME, InventoryScope::Local, "");
     }
-    let mut map = serde_yaml::Mapping::new();
-    for author in authors {
-        map.insert(
-            serde_yaml::Value::String(author.url.clone()),
-            serde_yaml::Value::String(author.site.clone()),
-        );
-    }
-    let text = serde_yaml::to_string(&serde_yaml::Value::Mapping(map))?;
+    let text = serde_yaml::to_string(&authors_to_value(authors))?;
     inventory.save_raw(INVENTORY_NAME, InventoryScope::Local, &text)
 }
 
 /// Convenience: the tracked authors of the current library.
+#[cfg(feature = "native-runtime")]
 pub fn authors_for_current_root() -> Result<Vec<AuthorRecord>> {
     load_authors(&Inventory::with_default_root()?)
 }
@@ -101,31 +107,40 @@ pub fn authors_for_current_root() -> Result<Vec<AuthorRecord>> {
 /// Add `author` unless the same page is already tracked.
 ///
 /// Returns `true` when the list changed.
+#[cfg(feature = "native-runtime")]
 pub fn add_author(author: &AuthorRecord) -> Result<bool> {
-    let inventory = Inventory::with_default_root()?;
-    let mut authors = load_authors(&inventory)?;
-    if authors.iter().any(|existing| existing.same_target(author)) {
-        return Ok(false);
-    }
-    authors.push(author.clone());
-    save_authors(&inventory, &authors)?;
-    Ok(true)
+    add_author_in(&Inventory::with_default_root()?, author)
+}
+
+#[cfg(feature = "native-runtime")]
+pub fn add_author_in(inventory: &Inventory, author: &AuthorRecord) -> Result<bool> {
+    inventory.update_yaml(INVENTORY_NAME, InventoryScope::Local, |mut current: serde_yaml::Value| {
+        let changed = !authors_from_value(&current).iter().any(|entry| entry.same_target(author));
+        if changed {
+            if !current.is_mapping() { current = serde_yaml::Value::Mapping(Default::default()); }
+            current.as_mapping_mut().unwrap().insert(
+                serde_yaml::Value::String(author.url.clone()), serde_yaml::Value::String(author.site.clone()),
+            );
+        }
+        Ok((current, changed))
+    })
 }
 
 /// Drop one tracked author. Returns whether anything was removed.
+#[cfg(feature = "native-runtime")]
 pub fn remove_author(url: &str) -> Result<bool> {
-    let inventory = Inventory::with_default_root()?;
-    let mut authors = load_authors(&inventory)?;
-    let before = authors.len();
-    authors.retain(|author| author.url != url);
-    if authors.len() == before {
-        return Ok(false);
-    }
-    save_authors(&inventory, &authors)?;
-    Ok(true)
+    remove_author_in(&Inventory::with_default_root()?, url)
 }
 
-#[cfg(test)]
+#[cfg(feature = "native-runtime")]
+pub fn remove_author_in(inventory: &Inventory, url: &str) -> Result<bool> {
+    inventory.update_yaml(INVENTORY_NAME, InventoryScope::Local, |mut current: serde_yaml::Value| {
+        let changed = current.as_mapping_mut().is_some_and(|map| map.remove(serde_yaml::Value::String(url.to_string())).is_some());
+        Ok((current, changed))
+    })
+}
+
+#[cfg(all(test, feature = "native-runtime"))]
 mod tests {
     use super::*;
     use crate::test_support::{legacy_yaml_guard, set_current_dir_for_test};

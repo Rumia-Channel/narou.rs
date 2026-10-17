@@ -4,6 +4,7 @@
  */
 
 import { fetchJson, postJson, assertApiSuccess } from './core/http.js';
+import { bindAuthorsPane } from './authors.js';
 
 (function() {
   'use strict';
@@ -62,6 +63,8 @@ import { fetchJson, postJson, assertApiSuccess } from './core/http.js';
         pane.innerHTML = renderReplaceTab();
       } else if (tab.id === 'login') {
         pane.innerHTML = renderLoginTab();
+      } else if (tab.id === 'authors') {
+        pane.replaceChildren();
       } else {
         pane.innerHTML = renderSettingsPanel(tab);
       }
@@ -74,6 +77,7 @@ import { fetchJson, postJson, assertApiSuccess } from './core/http.js';
       if (tab.id === 'login') {
         bindLoginPane(pane);
       }
+      if (tab.id === 'authors') bindAuthorsPane(pane);
     });
   }
 
@@ -677,6 +681,7 @@ import { fetchJson, postJson, assertApiSuccess } from './core/http.js';
     if (targetPane) targetPane.classList.add('active');
     // 一覧は pane が DOM に乗ってから読む (タブを開くたびに最新化する)。
     if (tabId === 'login') loadLoginHosts();
+    if (tabId === 'authors') targetPane?.dispatchEvent(new Event('authors:reload'));
 
     // Remember active tab
     activeTab = tabId;

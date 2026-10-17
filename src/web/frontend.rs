@@ -188,6 +188,10 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                     .into_bytes(),
             ),
         ),
+        "js/authors.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(apply_js_module_versions("js/authors.js", include_str!("assets/js/authors.js")).into_bytes()),
+        ),
         "js/core/state.js" => (
             "application/javascript; charset=utf-8",
             Cow::Owned(
