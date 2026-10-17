@@ -42,7 +42,7 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 - real Wasm / D1 / DO と透明な実 Queue producer observer を使う使い捨てプローブで、4サイトの本文ストリームを全て保持したまま別作品の実変換と `novel.txt` を確認。同一サイトの別hostは5回配送しても待機・ACK・attempts0・originアクセス0。旧レーン転送の両方向、失われた変換配送の実cron回復、同一作品の Update / Convert 排他、別URL Download / 数値ID Convert 排他、実キャンセルAPIとHTTP drain後の後続起動も確認した。Cloudflare 本番の autoscaler を試した結果ではない。
 - 1000話を実取得し、850/851 subrequest の2回の区切り（最終プローブの再開位置411/823）を同一 job ID・attempts0 で続行し、全1000話が各1回の本文取得で揃った。600秒 wall-clock の実待機は行っていない。同じ continuation 経路の checkpoint / token fence を SQL 回帰でも固定し、上限値を上げず、日本語で自動再開を案内する。
 - Native の queue lane と保存方式は変更しない。Worker の Convert 実行は従来どおり数値 ID を要求し、URL Convert の追加対応はしない。変換だけの invocation は Downloader を構築しない。`concurrency` はコンソールの表示先で、Worker の実行枠数を変える設定ではない。
-- 最終の実 Worker で作者追跡6シナリオ、HTTP / Queue / WebSocket / reload 契約103件、全 S3 本文保存・移行・失敗注入・EPUB・再起動 smoke が成功。SQL claim 回帰14件、Python74件、Native workspace と Worker wasm の Clippy `-D warnings`、標準 release Wasm + wasm-opt も成功した。
+- 最終の実 Worker で作者追跡6シナリオ、HTTP / Queue / WebSocket / reload 契約103件、全 S3 本文保存・移行・失敗注入・EPUB・再起動 smoke が成功。Native workspace（lib / bins / integration + Lite）は1,373成功・参照fixture1 ignored。Native / Worker wasm の Clippy `-D warnings`、標準 release Wasm + wasm-opt も成功した。develop への no-ff 統合後も SQL claim 回帰14件と Python74件が成功し、実 repo のビルドドライバを再生成した。検証用3サーバ・Rust TempDir・ソース副本・target junction・使い捨てスクリプトは終了・削除済み。次版の CI 監視はユーザー指示どおり行わない。
 
 
 ## v0.4.13: 既存作品の個別変換設定を正準ストアへ統一（issue #37）
