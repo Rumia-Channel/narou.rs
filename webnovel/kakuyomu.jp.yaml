@@ -17,10 +17,14 @@ author_work_url: \k<top_url>/works/\k<work_id>
 encoding: UTF-8
 timezone: Asia/Tokyo
 confirm_over18: no
+# NEXT の制限された話は目次上で EmptyEpisode になる。
+# 保存済みログインで目次を取り直し、制限が残る場合は閲覧できる無料分だけを取得する。
+login_url: \k<top_url>/auth/login
+login_partial_pattern: '(?m:^EmptyEpisode;\d+;)'
 append_title_to_folder_name: yes
 title_strip_pattern: null
 sitename: *name
-version: 2.5
+version: 2.6
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)
@@ -29,6 +33,14 @@ preprocess: |-
   guard "KakuyomuPreprocessEvalMagicWord"
 
   let json = extract_json(/<script id="__NEXT_DATA__" type="application\/json">(.+?)<\/script>/s)
+
+  # 制限された本文 URL は作品トップへ戻される。空の本文として保存しない。
+  if url != url.gsub(/\/episodes\/\d+/, "")
+    let episode_body = extract(/<div class="widget-episodeBody js-episode-body".*?>(.+?)<\/div>/s)
+    if !episode_body
+      fail "カクヨムの本文を取得できません。ログイン状態とカクヨムネクストの閲覧権限を確認してください"
+    end
+  end
 
   let data = json.props.pageProps.__APOLLO_STATE__
   let work_id = json.query.workId

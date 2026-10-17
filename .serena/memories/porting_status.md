@@ -19,6 +19,17 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 0.4.11 最終監査で確認したデータ保全の修正: SQLite のインプレース YAML 書き出しは meta の export_file_sha 指紋を原子的なファイル保存より前に記録し、失敗後の未編集の書き出し残骸を再取り込みしない。管理状態だけでなく database.yaml の作品レコードも対象。ユーザーの編集と narou-compat のファイル優先は維持する。S3 COPY は完全な CopyObjectResult と ETag/LastModified を確認できた場合だけ成功し、200 内 Error・破損応答では元オブジェクトを削除しない。実 HTTP の失敗／成功ケースと、書き出し失敗後の正常保存→再オープンを smoke で確認済み。
 指紋は既存の未編集 projection と次回公開予定を最大2件保持し、2回目が公開前に中断しても保護を失わない。指紋更新と公開は同一ファイルロック内。--out が実 .narou を指す場合も対象。最終 workspace 全 target は1342成功/0失敗/1ignored、Clippy 全 feature -D warnings・Rustdoc -D warnings・core/Worker wasm check 成功。Web CSRF 回帰 fixture は並行CWD変更に影響されない絶対パスへ修正し、HTTPの拒否/許可とキュー状態の検証内容は維持した。
 
+## 未リリース: カクヨムネクストのログインと無料分取得
+
+- `webnovel/kakuyomu.jp.yaml` を version 2.6 へ更新。`login_url` は `/auth/login`、`login_partial_pattern` は DSL の中間目次に出る `EmptyEpisode`。保存済みログインを既存の共通経路で試し、改善した資格情報を本文取得と次回更新に使う。サイト固有の Rust 分岐は追加しない。
+- ユーザーの指定に従い、未ログイン・閲覧権なしでも警告付きで無料分を取得する。無料分から、Cookie 保存後の全話への追加取得も可能。通常の公開作品には保存 Cookie を送らない。
+- 共通 downloader は部分一覧に保存済みの ID が欠ける場合、削除・ダイジェスト化・404 凍結とは判定せず `Canceled` で更新を見送る。force でも目次・本文を保持し、閲覧可能 0 話の部分一覧は空の小説として登録しない。ファイル出力名の変更もこの判定後に行う。警告は共通 `application::messages::download` から出す。
+- 本文 URL が作品トップへ戻され、本文枠が無い場合は YAML / DSL の `fail` で止め、空本文をキャッシュ・保存しない。`extract` は既存例と同じく `let` で受け取る（条件式内の直接呼び出しは評価されない）。
+- 指定作品 `2912051601247823656` は匿名の実ページで全 129 話のうち `Episode` 50 / `EmptyEpisode` 79。実 Native CLI で無料 50 話の本文ファイルと目次、レコードの `general_all_no=50`、Lite EPUB 65 エントリを確認し、再更新は変更なし。通常作品 `2912051601856437328` も 2 話の実取得・EPUB 生成が成功。制限された第 51 話は作品トップへ戻り、直接本文を取る経路でもエラーになることを確認した。
+- 実 Edge と `narou_rs_login` がカクヨムのログイン画面を開くことを確認。未ログインの新規プロファイルには保存対象の Cookie が無く、失敗して空のログインを登録しない。有効なアカウントへのサインイン、Cookie の実取得・取り込み、契約付き全 129 話の実取得は未検証。Edge は Windows の `USERPROFILE` を架空の空ホームへ変えると DevTools 起動に失敗するため、ブラウザは実環境を継承して `--profile` のみ隔離する。
+- `tests/kakuyomu_login.rs` の 6 件で、匿名・権利なしの無料分、資格情報の試行・セッション ID 再利用、無料分からの追加取得、権利失効後の保持（force 含む）、0 話拒否、公開作品への Cookie 非送信、制限画面の空本文化防止を確認。変更前の失敗を確認してから修正した。Native workspace / all-targets / all-features は 1,366 成功・参照 fixture 1 ignored、Native / Worker Wasm Clippy と Rustdoc は `-D warnings` で成功。
+- 実サイト検証は Documents/WebNovel 配下の専用領域と Rust TempDir で行い、元ライブラリの ACL は変更しない。unit suite の `TEMP` / `TMP` は workspace `target` に向ける（通常の TEMP は sandbox 書込み不可、WebNovel 配下だと「未初期化」のテストが祖先の `.narou` を発見してしまう）。コマンド集計は 24 完了 / 4 部分 / 0 未実装を維持する。実 Cloudflare 配備・取得は今回の検証に含めない。
+
 ## 未リリース: アルファポリスとログイン Cookie
 
 - `webnovel/www.alphapolis.co.jp.yaml` (version 1.3) を追加。小説トップ・各話 URL を作品トップへ正規化し、`app-cover-data` の配列順で章と全話を読む。題名・作者・あらすじ・タグ・日時・文字数・完結・R18 判定、本文の CSRF フォーム送信、作者一覧とページ送りは YAML / DSL に置き、サイト専用の Rust 分岐は追加しない。
