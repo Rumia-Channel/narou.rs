@@ -16,6 +16,7 @@ cpu_ms = 300000
 [vars]
 # 認証は既定で有効。ローカルで外すときだけ false にする。
 NAROU_AUTH_REQUIRED = "true"
+CONVERT_QUEUE_NAME = "narou-jobs-convert-local"
 # S3 互換ストレージ。ローカルは MinIO 等を想定した既定値で、
 # 実際に使うときは `--var` か `.dev.vars` で上書きする。
 S3_ENDPOINT = "http://127.0.0.1:9000"
@@ -53,6 +54,10 @@ migrations_dir = "migrations"
 binding = "NAROU_JOBS"
 queue = "narou-jobs-local"
 
+[[queues.producers]]
+binding = "CONVERT_QUEUE"
+queue = "narou-jobs-convert-local"
+
 # Consumer: D1 ledger で claim し、durable terminal を書いてから ack する。
 # max_retries は ledger の attempt cap 以上にする (Cloudflare は explicit な
 # `retry_with_options` も max_retries に数えるため、実効停止点は ledger 側の
@@ -63,8 +68,16 @@ max_batch_size = 1
 max_retries = 3
 dead_letter_queue = "narou-jobs-local-dlq"
 max_concurrency = 4
-# concurrency > 1 は安全: invocation ごとに runtime と Downloader を作り、
-# D1 ledger の claim は atomic、SiteRateLimiter DO が per-site ペーシングを直列化する。
+# サイト・小説単位の排他は共有 D1 台帳が担当する。
+# SiteRateLimiter DO のリクエスト間隔制御も併用する。
+
+# 変換は取得の4枠と独立させ、同一小説の排他だけを共有台帳で守る。
+[[queues.consumers]]
+queue = "narou-jobs-convert-local"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "narou-jobs-convert-local-dlq"
+max_concurrency = 1
 
 # DLQ の consumer は意図的に作らない。DLQ は運用者が中身を確認するための
 # 退避先で、通常実行が drain / 再投入することはない。

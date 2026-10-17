@@ -62,11 +62,14 @@ def main() -> None:
     database_id = required("NAROU_D1_DATABASE_ID")
     queue_name = required("NAROU_JOB_QUEUE")
     dead_letter_queue = required("NAROU_JOB_DLQ")
+    convert_queue_name = required("NAROU_CONVERT_QUEUE")
+    convert_dead_letter_queue = required("NAROU_CONVERT_DLQ")
 
     suffix = f"-{target}"
     for label, value in (
         ("NAROU_D1_DATABASE_NAME", database_name),
         ("NAROU_JOB_QUEUE", queue_name),
+        ("NAROU_CONVERT_QUEUE", convert_queue_name),
     ):
         if not NAME_PATTERN.fullmatch(value):
             fail(f"{label} must be a lowercase name (a-z, 0-9, -)")
@@ -80,6 +83,12 @@ def main() -> None:
         fail("NAROU_JOB_DLQ must be the job queue name with a -dlq suffix")
     if not NAME_PATTERN.fullmatch(dead_letter_queue) or len(dead_letter_queue) > 63:
         fail("NAROU_JOB_DLQ must be a valid lowercase queue name (max 63 characters)")
+    if convert_dead_letter_queue != f"{convert_queue_name}-dlq":
+        fail("NAROU_CONVERT_DLQ must be the conversion queue name with a -dlq suffix")
+    if not NAME_PATTERN.fullmatch(convert_dead_letter_queue) or len(convert_dead_letter_queue) > 63:
+        fail("NAROU_CONVERT_DLQ must be a valid lowercase queue name (max 63 characters)")
+    if queue_name == convert_queue_name:
+        fail("acquisition and conversion must use different queues")
     try:
         UUID(database_id)
     except ValueError:
@@ -153,6 +162,8 @@ def main() -> None:
         "NAROU_D1_DATABASE_ID": database_id,
         "NAROU_JOB_QUEUE": queue_name,
         "NAROU_JOB_DLQ": dead_letter_queue,
+        "NAROU_CONVERT_QUEUE": convert_queue_name,
+        "NAROU_CONVERT_DLQ": convert_dead_letter_queue,
         "S3_ENDPOINT": endpoint,
         "S3_REGION": region,
         "S3_BUCKET": bucket,

@@ -18,6 +18,7 @@ NAROU_REQUIRE_S3 = "true"
 # Zero Trust (Access) を境界にする場合は CI の `NAROU_AUTH_REQUIRED=false` で
 # Bearer トークン検査を切る (NAROU_ADMIN_TOKEN も不要になる)。
 NAROU_AUTH_REQUIRED = "__NAROU_AUTH_REQUIRED__"
+CONVERT_QUEUE_NAME = "__NAROU_CONVERT_QUEUE__"
 S3_ENDPOINT = "__S3_ENDPOINT__"
 S3_REGION = "__S3_REGION__"
 S3_BUCKET = "__S3_BUCKET__"
@@ -75,12 +76,23 @@ migrations_dir = "migrations"
 binding = "NAROU_JOBS"
 queue = "__NAROU_JOB_QUEUE__"
 
+[[queues.producers]]
+binding = "CONVERT_QUEUE"
+queue = "__NAROU_CONVERT_QUEUE__"
+
 [[queues.consumers]]
 queue = "__NAROU_JOB_QUEUE__"
 max_batch_size = 1
 max_retries = 3
 dead_letter_queue = "__NAROU_JOB_DLQ__"
 max_concurrency = 4
+
+[[queues.consumers]]
+queue = "__NAROU_CONVERT_QUEUE__"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "__NAROU_CONVERT_DLQ__"
+max_concurrency = 1
 
 [[durable_objects.bindings]]
 name = "RATE_LIMITER"

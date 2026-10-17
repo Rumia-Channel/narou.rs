@@ -37,6 +37,8 @@ ENV = {
     "NAROU_D1_DATABASE_ID": "12345678-1234-1234-1234-123456789012",
     "NAROU_JOB_QUEUE": "narou-jobs-develop",
     "NAROU_JOB_DLQ": "narou-jobs-develop-dlq",
+    "NAROU_CONVERT_QUEUE": "narou-jobs-convert-develop",
+    "NAROU_CONVERT_DLQ": "narou-jobs-convert-develop-dlq",
     "NAROU_S3_ENDPOINT": "https://s3.example.invalid",
     "NAROU_S3_REGION": "us-east-1",
     "NAROU_S3_BUCKET": "fake-bucket",
@@ -363,7 +365,7 @@ class DomainFallbackTests(unittest.TestCase):
 class RenderTests(unittest.TestCase):
     def render_template(self, template, target="develop", extra_env=None):
         env = {**ENV, "NAROU_DEPLOY_TARGET": target, "SERVICE_DOMAIN": "production.example.invalid"}
-        for name in ("NAROU_D1_DATABASE_NAME", "NAROU_JOB_QUEUE", "NAROU_JOB_DLQ"):
+        for name in ("NAROU_D1_DATABASE_NAME", "NAROU_JOB_QUEUE", "NAROU_JOB_DLQ", "NAROU_CONVERT_QUEUE", "NAROU_CONVERT_DLQ"):
             env[name] = env[name].replace("develop", target)
         env.update(extra_env or {})
         with tempfile.TemporaryDirectory() as directory, patch.object(render, "WORKER_DIR", Path(directory)), patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()):

@@ -788,6 +788,9 @@ narou setting name         # 読み取り
 - Worker の環境設定 API (`GET /api/global_setting`) は、編集時の `expected_settings` に使う値を primary からキャッシュなしで取得する。別 isolate の保存後に古い値を表示して初回保存から偽の 409 になることを防ぐ。保存側の CAS と本物の同時編集に対する 409 は維持し、通常の一覧・表示設定の読み取りキャッシュは変更しない
 - native / Worker が共通 capability payload を返し、Worker で実行できない CSV・送信・mail・端末操作・調査ログ・キュー並べ替え等は UI から実行できないようにする。直接 API の拒否も通知し、成功として扱わない。
 - Worker の `concurrency` はコンソール分離（既定 true）、`convert.keep-txt` は既定 false、`queue.max-retries` は配備上限 3 と表示・保存検証を一致させる。native 専用の `s3.*` は表示せず、ミラー・話キャッシュ・外部 EPUB エンジン等は無効化し、API からも変更を拒否する。
+- Worker の取得は `NAROU_JOBS`（最大 4）、変換は `CONVERT_QUEUE`（最大 1）に実行枠を分ける。取得枠が埋まっても別作品の変換を開始でき、同じ作品の取得・変換は共通 D1 台帳で排他する。実効 YAML のサイト単位では取得を 1 件に制限し、別ホスト表記・作者確認も同じサイトへ揃える。
+- Worker の排他待ちは待機として永続化して ACK し、失敗回数や provider retry を消費しない。完了・毎分 cron で同じ job ID を再投入し、旧レーンの envelope も正しい Queue へ転送する。作品の別 URL と ID は YAML 解決後の TOC URL で照合し、元の target と再開用 checkpoint は変更しない。
+- Worker の wall-clock / subrequest budget は話の境界で安全に区切る継続処理で、Web コンソールに自動再開を案内する。保存済み本文・次の話の位置を維持して同じ job ID で続行し、失敗回数は増やさない。
 - Worker の履歴取得・消去は PushHub の永続化履歴に接続し、再接続でも消去済みの行を復活させない。`webui.table.reload-timing` は実際の台帳の待機・実行数でテーブル更新を制御し、進捗・通知は抑止しない。
 - 設定保存は `webui.config.reload` を配信する。UI のテーブル・タグ更新は debounce / single-flight で合流し、古い応答を反映しない。Worker のキュー詳細は cursor で全ページを取得してから表示を交換する（既定 200 件／最大 1000 件、全体の待機・実行数を別に返す）。
 - 保存方式の読み取りが失敗した場合は不明／失敗として表示し、YAML と推定しない。Worker は D1 固定と表示し、切替操作を出さない。native の実際の方式切替だけが再起動を要求する。

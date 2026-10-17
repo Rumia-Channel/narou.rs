@@ -157,16 +157,6 @@ jobs:
       - name: Worker compressed content lifecycle
         run: node tests/content_storage.mjs
 
-  # デプロイはリポジトリの secret を設定したうえで手動実行する。
-  # 必要な値 (GitHub の environment = target 名で設定):
-  #   secrets.CLOUDFLARE_API_TOKEN / secrets.CLOUDFLARE_ACCOUNT_ID
-  #   vars/secrets: NAROU_D1_DATABASE_NAME / NAROU_D1_DATABASE_ID /
-  #                 NAROU_JOB_QUEUE / NAROU_JOB_DLQ /
-  #                 NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET
-  #                 (+ production のみ SERVICE_DOMAIN)
-  #   secrets.NAROU_ADMIN_TOKEN (デプロイ後の smoke test で使う。Zero Trust を
-  #                 境界にする場合は NAROU_AUTH_REQUIRED=false で不要になる)
-  # 未設定の間は workflow_dispatch から実行しても失敗するだけで、push では走らない。
   # デプロイ。GitHub Environments は用途で 2 つに分ける:
   #   `Cloudflare` … この 2 ジョブ (develop / production) が使う Workers 用の値
   #     secrets: CLOUDFLARE_ACCOUNT_ID (または CLOUDFLARE_ACCOUT_ID) / CLOUDFLARE_API_TOKEN /
@@ -184,7 +174,8 @@ jobs:
   # 対象は `NAROU_DEPLOY_TARGET` (develop / production) で切り替えるので、
   # target ごとに環境を分けずに同じ環境を共有している (SERVICE_DOMAIN と
   # DEVELOP_DOMAIN は名前が違うため衝突しない)。
-  # D1・Queue は `ci/provision_resources.py` が target 名から導出して冪等に作る。
+  # D1・取得用 Queue・変換用 Queue と各 DLQ は `ci/provision_resources.py` が
+  # target 名から導出して冪等に作る。変換用の binding と物理名も CI が生成する。
   worker-deploy-develop:
     name: Deploy Worker (develop)
     if: >-

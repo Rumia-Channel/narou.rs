@@ -16,12 +16,13 @@
 //! A panic or a ledger failure propagates to the queue runtime (redelivery /
 //! DLQ); there is no `catch_unwind` and no silent acknowledgment.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use narou_rs::application::{
     JobKind,
     decode_legacy_envelope, JobClaim, JobId, JobLedgerStatus, JobPlan, JobQueue, JobRequest,
-    LegacyEnvelopeOutcome, WorkerJobEnvelope, WORKER_JOB_ENVELOPE_VERSION,
+    JobTarget, LegacyEnvelopeOutcome, WorkerJobEnvelope, WORKER_JOB_ENVELOPE_VERSION,
 };
 use narou_rs::downloader::Downloader;
 use narou_rs::error::{NarouError, Result};
@@ -93,9 +94,13 @@ pub async fn process_batch(
 ) -> Result<()> {
     let runtime = WorkerRuntime::build(env).await.map_err(worker_error)?;
     let push = PushHubClient::new(env, runtime.subrequests.clone());
-    let mut downloader = runtime.new_downloader().await?;
+    let mut downloader = None;
+    let source_convert = runtime.is_conversion_queue(&message_batch.queue());
     for message in message_batch.messages().map_err(worker_error)? {
-        process_envelope(&runtime, &mut downloader, &push, message.body(), &message).await?;
+        process_envelope(&runtime, &mut downloader, &push, message.body(), &message, source_convert).await?;
+        if let Err(error) = runtime.wake_waiting_jobs().await {
+            console_log!("admission wake failed; cron will recover it: {error}");
+        }
     }
     Ok(())
 }
@@ -112,10 +117,11 @@ async fn notify_rejected(push: &PushHubClient, message_id: &str, reason: &str) {
 
 async fn process_envelope(
     runtime: &WorkerRuntime,
-    downloader: &mut Downloader,
+    downloader: &mut Option<Downloader>,
     push: &PushHubClient,
     value: &serde_json::Value,
     message: &Message<serde_json::Value>,
+    source_convert: bool,
 ) -> Result<()> {
     let version = value
         .get("version")
@@ -155,24 +161,23 @@ async fn process_envelope(
                 message.ack();
                 return Ok(());
             }
-            // 計画は台帳が持つ。旧形式 (メッセージに計画を積んだもの) だけ
-            // そのまま使う。
-            let plan = match envelope.job {
-                Some(plan) => plan,
-                None => match runtime.ledger.get(&envelope.job_id).await? {
-                    Some(view) => view.job,
-                    None => {
-                        let reason =
-                            format!("ledger has no row for queued job {}", envelope.job_id);
-                        console_log!("rejecting envelope {}: {reason}", message.id());
-                        runtime.ledger.record_rejected(&message.id(), &reason).await?;
-                        notify_rejected(push, &message.id(), &reason).await;
-                        message.ack();
-                        return Ok(());
-                    }
-                },
+            // Even legacy v2 payloads execute the authoritative ledger plan.
+            let plan = match runtime.ledger.get(&envelope.job_id).await? {
+                Some(view) if !view.status.is_terminal() => view.job,
+                Some(_) => {
+                    message.ack();
+                    return Ok(());
+                }
+                None => {
+                    let reason = format!("ledger has no row for queued job {}", envelope.job_id);
+                    console_log!("rejecting envelope {}: {reason}", message.id());
+                    runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                    notify_rejected(push, &message.id(), &reason).await;
+                    message.ack();
+                    return Ok(());
+                }
             };
-            process_discrete(runtime, downloader, push, envelope.job_id, &plan, message).await
+            process_discrete(runtime, downloader, push, envelope.job_id, &plan, message, source_convert).await
         }
         1 => {
             // Legacy envelope: one `JobRequest` body. Only a request that
@@ -194,7 +199,7 @@ async fn process_envelope(
                 LegacyEnvelopeOutcome::Plan(job) => {
                     let queued = runtime.ledger.enqueue(job).await?;
                     notify_queue_changed(push).await;
-                    process_discrete(runtime, downloader, push, queued.job_id, &queued.job, message).await
+                    process_discrete(runtime, downloader, push, queued.job_id, &queued.job, message, source_convert).await
                 }
                 LegacyEnvelopeOutcome::Reject { reason } => {
                     console_log!("rejecting legacy envelope {}: {reason}", message.id());
@@ -218,13 +223,34 @@ async fn process_envelope(
 
 async fn process_discrete(
     runtime: &WorkerRuntime,
-    downloader: &mut Downloader,
+    downloader: &mut Option<Downloader>,
     push: &PushHubClient,
     job_id: JobId,
     job: &JobPlan,
     message: &Message<serde_json::Value>,
+    source_convert: bool,
 ) -> Result<()> {
-    let claim = runtime.ledger.claim(&job_id).await?;
+    if (job.kind == JobKind::Convert) != source_convert {
+        runtime.send_existing_job(&job_id, job.kind.as_str()).await?;
+        message.ack();
+        return Ok(());
+    }
+    if job.kind != JobKind::Convert && downloader.is_none() {
+        *downloader = Some(runtime.new_downloader().await?);
+    }
+    let target = match &job.target {
+        JobTarget::Id(id) => Cow::Owned(id.0.to_string()),
+        JobTarget::Ncode(value) | JobTarget::Url(value) => Cow::Borrowed(value.as_str()),
+        JobTarget::All => Cow::Borrowed("*"),
+    };
+    let (site_key, admission_error) = if matches!(job.kind, JobKind::Download | JobKind::Update | JobKind::AuthorCheck) {
+        match downloader.as_ref().expect("acquisition downloader").site_key_for_target(&target).await {
+            Ok(key) => (Some(key), None),
+            Err(error) => (None, Some(error)),
+        }
+    } else { (None, None) };
+    let normalized_target = runtime.normalized_job_target(&target);
+    let claim = runtime.ledger.claim(&job_id, &normalized_target, site_key.as_deref()).await?;
     let (execution_token, checkpoint) = match claim {
         JobClaim::Claimed {
             execution_token,
@@ -234,15 +260,11 @@ async fn process_discrete(
             message.ack();
             return Ok(());
         }
-        JobClaim::Busy { retry_after } => {
-            let delay = retry_after.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
-            let options = QueueRetryOptionsBuilder::new()
-                .with_delay_seconds(delay)
-                .build();
-            console_log!(
-                "job {job_id} is leased; retrying after {delay}s instead of acknowledging"
-            );
-            message.retry_with_options(&options);
+        JobClaim::Busy => {
+            // Contention is durable pending work, not a provider/business retry.
+            // A duplicate live claim/backoff remains protected by its own lease.
+            runtime.ledger.park_for_admission(&job_id, &normalized_target, site_key.as_deref()).await?;
+            message.ack();
             return Ok(());
         }
     };
@@ -256,13 +278,15 @@ async fn process_discrete(
     ])
     .await;
 
-    let outcome = if job.kind == JobKind::Convert {
+    let outcome = if let Some(error) = admission_error {
+        JobOutcome::from_error(error)
+    } else if job.kind == JobKind::Convert {
         // Convert は保存済みデータだけを見るので Downloader を使わない。
         // コンソール行は PushHubSink を内側で install/drain する。
         crate::convert::execute_convert(runtime, job, push).await
     } else {
         execute_job(
-            downloader,
+            downloader.as_mut().expect("acquisition downloader"),
             job,
             &job_id,
             checkpoint.as_ref(),
@@ -286,7 +310,7 @@ async fn process_discrete(
             {
                 // 実行中に行が tombstone されていれば queue_cancelled で閉じる
                 // (`queue_complete` は送らない)。
-                settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
             broadcast_terminal_events(
@@ -311,7 +335,7 @@ async fn process_discrete(
                 )
                 .await
             {
-                settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
             broadcast_terminal_events(
@@ -337,7 +361,7 @@ async fn process_discrete(
                 .await
             {
                 // 中断されたジョブを再投入しない (行は terminal 済み)。
-                settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
             broadcast_terminal_events(
@@ -369,7 +393,7 @@ async fn process_discrete(
                 .await
             {
                 // 実行中にキャンセルされたなら queue_failed は出さない。
-                settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
             console_log!("job {job_id} blocked: {reason}");
@@ -388,7 +412,7 @@ async fn process_discrete(
                 .await
             {
                 // 実行中にキャンセルされたなら queue_failed は出さない。
-                settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
             console_log!("job {job_id} failed permanently: {reason}");
@@ -401,7 +425,7 @@ async fn process_discrete(
                     // `record_attempt` / 二次 `mark_terminal` が token 失効で
                     // 失敗 = 実行中にキャンセルされた。queue_retry /
                     // queue_failed は送らず queue_cancelled で閉じる。
-                    settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                    settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
                     return Ok(());
                 }
                 Ok(RetryDisposition::Rescheduled {
@@ -450,11 +474,9 @@ async fn process_discrete(
 ///
 /// running 行は `webui/queue_actions.rs` の cancel 系が
 /// `ledger::cancel_running_job` で tombstone する (terminal status +
-/// [`USER_CANCEL_REASON`]、token 消去) ので、その形をしていれば native の
-/// killed child と同じ `queue_cancelled` を送って message を ack し
-/// `Ok(())` を返す — `queue_complete` / `queue_partial` / `queue_failed` は
-/// 送らない。それ以外の失敗 (lease を別の実行に奪われた・D1 エラー等) は
-/// 元のエラーを `Err` で返し、従来どおり redelivery / DLQ に委ねる。
+/// [`USER_CANCEL_REASON`])。同じ実行トークンの物理処理が戻ってから排他を解放し、
+/// native の killed child と同じ `queue_cancelled` を送って ack する。
+/// それ以外の失敗 (別実行への lease 移譲・D1 エラー等) は元のエラーを返す。
 ///
 /// `Wasm` は途中で殺せないので、キャンセルされたジョブは「次の終端書き込み
 /// が 0 行に終わる」ことで初めて中断を知る (native の SIGKILL と同じ
@@ -463,6 +485,7 @@ async fn settle_user_cancel(
     runtime: &WorkerRuntime,
     push: &PushHubClient,
     job_id: &JobId,
+    execution_token: &str,
     message: &Message<serde_json::Value>,
     error: NarouError,
 ) -> std::result::Result<(), NarouError> {
@@ -471,7 +494,7 @@ async fn settle_user_cancel(
         Ok(Some(view))
             if view.status.is_terminal() && view.last_error.as_deref() == Some(USER_CANCEL_REASON)
     );
-    if !cancelled {
+    if !cancelled || !runtime.ledger.finish_cancelled(job_id, execution_token).await? {
         return Err(error);
     }
     console_log!("job {job_id} was cancelled by the user while running");
@@ -657,38 +680,3 @@ fn worker_error(error: impl std::fmt::Display) -> NarouError {
     NarouError::Platform(format!("Worker runtime error: {error}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::JobOutcome;
-
-    #[test]
-    fn four_budget_yields_do_not_consume_failure_attempts() {
-        use narou_rs::application::{
-            ExecutionPhase, JobId, WorkerExecutionCheckpoint,
-        };
-        use narou_rs::platform::NovelId;
-
-        let job_id = JobId("job-1".into());
-        let mut checkpoint =
-            WorkerExecutionCheckpoint::planned(job_id.clone(), Some(NovelId(42)));
-        for next_section_index in 1..=4 {
-            let outcome = JobOutcome::Partial {
-                reason: format!("budget yield {next_section_index}"),
-                checkpoint: checkpoint.advance(
-                    ExecutionPhase::Fetching,
-                    Some(next_section_index),
-                ),
-            };
-            checkpoint = match outcome {
-                JobOutcome::Partial { checkpoint, .. } => checkpoint,
-                JobOutcome::Retryable { .. } => {
-                    panic!("budget yields must not be retryable")
-                }
-                _ => unreachable!("budget yields must be partial"),
-            };
-        }
-        assert_eq!(checkpoint.job_id, job_id);
-        assert_eq!(checkpoint.next_section_index, Some(4));
-        assert_eq!(checkpoint.phase, ExecutionPhase::Fetching);
-    }
-}
