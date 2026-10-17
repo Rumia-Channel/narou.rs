@@ -130,6 +130,28 @@ async fn complete_toc_preserves_array_order_and_own_metadata() {
 }
 
 #[tokio::test]
+async fn partial_toc_attaches_chapters_to_the_first_accessible_episode() {
+    let episode = |id, public, free, rented| json!({
+        "episodeNo":id, "url":format!("/novel/166360898/202065994/episode/{id}"),
+        "mainTitle":format!("話{id}"), "upTime":"2026.10.17 11:12", "isPublic":public,
+        "rental":{"isFree":free,"isOnRental":rented},
+    });
+    let data = json!({"content":{"title":"作品","user":{"name":"作者"}},"isPartialEpisode":false,"chapterEpisodes":[
+        {"title":"第一章","episodes":[episode(70,false,false,false),episode(71,true,false,false),episode(72,false,false,false),episode(73,false,true,false)]},
+        {"title":"閲覧不可の章","episodes":[episode(80,false,false,false),episode(81,false,false,false)]},
+        {"title":"第二章","episodes":[episode(90,false,false,false),episode(91,false,false,true)]},
+        {"title":"終章","episodes":[episode(92,true,false,false),episode(93,true,false,false)]},
+    ]});
+    let setting=site(); let http=MockHttpClient::new();
+    http.add_text(TOP,200,format!(r#"<script id="app-cover-data">{data}</script>"#));
+    let source=fetch_toc(&http,&FakeRateLimiter::new(),&setting,TOP,&mut PreprocessJobs::new()).await.unwrap();
+    let rows=parse_subtitles(&setting,&source,&HashMap::new()).unwrap();
+    assert_eq!(rows.iter().map(|row|row.index.as_str()).collect::<Vec<_>>(),["71","73","91","92","93"]);
+    assert_eq!(rows.iter().map(|row|row.chapter.as_str()).collect::<Vec<_>>(),["第一章","","第二章","終章",""]);
+    assert_eq!(NovelInfo::from_novel_info_source(&setting,&source).raw_captures.get("ga").map(String::as_str),Some("5"));
+}
+
+#[tokio::test]
 async fn distinct_form_bodies_work_beyond_the_novel_job_cache_limit() {
     let setting=site(); let http=ReaderFixture::default(); let limiter=FakeRateLimiter::new();
     let mut jobs=PreprocessJobs::new(); let mut cache=SectionCache::new();
@@ -210,17 +232,26 @@ async fn saved_parent_domain_login_is_selected_and_reused_for_protected_alphapol
             vec![setting],HashMap::new(),Arc::new(SnapshotDownloaderSettings::new(HashMap::new(),Some(false),HashMap::new())),
         ).unwrap();
         let without_login=downloader.download_novel(TOP).await;
-        assert!(match &without_login {
-            Err(_) => true,
-            Ok(result) => matches!(result.status,UpdateStatus::Failed|UpdateStatus::Canceled),
-        },"unauthenticated result for wall={login_wall}, paid={paid}, error_marker={error_marker}: {without_login:?}");
-        assert_eq!(novels.count(&narou_rs::platform::NovelFilter::default()).await.unwrap(),0);
+        if paid {
+            let result=without_login.unwrap();
+            assert_eq!(result.status,UpdateStatus::Ok);
+            let record=novels.find_by_toc_url(TOP).await.unwrap().unwrap();
+            assert_eq!(record.general_all_no,Some(2));
+            assert!(!record.requires_login);
+        } else {
+            assert!(match &without_login {
+                Err(_) => true,
+                Ok(result) => matches!(result.status,UpdateStatus::Failed|UpdateStatus::Canceled),
+            },"unauthenticated result for wall={login_wall}, paid={paid}, error_marker={error_marker}: {without_login:?}");
+            assert_eq!(novels.count(&narou_rs::platform::NovelFilter::default()).await.unwrap(),0);
+        }
         let mut downloader=downloader.with_cookie_store(cookies);
         let result=downloader.download_novel(TOP).await.unwrap();
         assert_eq!(result.status,UpdateStatus::Ok);
         let record=novels.find_by_toc_url(TOP).await.unwrap().unwrap();
         assert!(record.requires_login);
         assert_eq!(record.login_session.as_deref(),Some("account-1"));
+        assert_eq!(record.general_all_no,Some(3));
         let anonymous_before=http.anonymous_toc.load(Ordering::SeqCst);
         let update=downloader.download_novel(TOP).await.unwrap();
         assert_eq!(update.status,UpdateStatus::None);
