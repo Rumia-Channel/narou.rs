@@ -1,10 +1,10 @@
 # narou.rs 移植状況
 
-## 現況（開発版 v0.4.13）
+## 現況（v0.4.13 公開準備）
 
-正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.13へ統一済み。公開済み GitHub Release は v0.4.12 のまま。今回の版数更新では main 統合・タグ・リリース作成を行わず、リモートの常設ブランチは main / develop だけを維持する。
+正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.13へ統一済み。公開済み GitHub Release は現時点で v0.4.12。ユーザーから v0.4.13 のリリース依頼を受け、main への no-ff 統合・タグ作成・配布物検証を伴う公開作業を進める。リモートの常設ブランチは main / develop だけを維持する。
 
-版数の判断基準は GitHub の公開済み Release。2026-10-17 の最新公開版は v0.4.12、準備中の次版は v0.4.13。manifest の版数が先行していても公開済みとは見なさず、公開前の追加機能・修正・ツアーは同じ未リリース版へまとめる。ユーザーの明示した版数を優先する。
+版数の判断基準は GitHub の公開済み Release。最新公開版 v0.4.12 に対し、ユーザー指定の v0.4.13 を公開する。manifest の版数が先行していても公開済みとは見なさず、公開前の追加機能・修正・ツアーは同じ未リリース版へまとめる。GitHub Release は全配布 ZIP の確認まではドラフトにし、公開完了は GitHub の実データで確認する。
 
 0.4.13 検証: `cargo check --workspace --all-targets --all-features`、Native + Lite のビルドと実 CLI `version --more` の 0.4.13 表示が成功。標準 release Wasm を作り直し、実 Worker の `/api/version/current.json` が 0.4.13、HTTP 契約 103 件・作者追跡 6 シナリオ・全 S3 保存 smoke・Python 74 件が成功した。版数の非空だけを検査する旧 assertion は削除し、実値は使い捨ての API プローブで確認した。cargo-about 0.9.2 で両 notice を生成し、直接依存 56 件の表も一致。root 419 / non-GPL probe 394 の lock graph は自プロジェクトの版数以外に変更が無い。
 
