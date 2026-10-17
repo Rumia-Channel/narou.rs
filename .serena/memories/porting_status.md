@@ -4,6 +4,8 @@
 
 正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.13へ統一済み。公開済み GitHub Release は v0.4.12 のまま。今回の版数更新では main 統合・タグ・リリース作成を行わず、リモートの常設ブランチは main / develop だけを維持する。
 
+版数の判断基準は GitHub の公開済み Release。2026-10-17 の最新公開版は v0.4.12、準備中の次版は v0.4.13。manifest の版数が先行していても公開済みとは見なさず、公開前の追加機能・修正・ツアーは同じ未リリース版へまとめる。ユーザーの明示した版数を優先する。
+
 0.4.13 検証: `cargo check --workspace --all-targets --all-features`、Native + Lite のビルドと実 CLI `version --more` の 0.4.13 表示が成功。標準 release Wasm を作り直し、実 Worker の `/api/version/current.json` が 0.4.13、HTTP 契約 103 件・作者追跡 6 シナリオ・全 S3 保存 smoke・Python 74 件が成功した。版数の非空だけを検査する旧 assertion は削除し、実値は使い捨ての API プローブで確認した。cargo-about 0.9.2 で両 notice を生成し、直接依存 56 件の表も一致。root 419 / non-GPL probe 394 の lock graph は自プロジェクトの版数以外に変更が無い。
 
 共有化: application use-case、settings/setting_core、download_targets、retry_policy、push_events、MessageContext/progress、HTTP RedirectChain/send_paced、ObjectStore::update_small、EPUB EpubPreparation/EpubBuild。同時INI更新はFS lock/SQLite Immediate/D1 primary full raw snapshot CAS、正準保存後のミラー失敗もACKに反映。CRC衝突を同値扱いしない。Workerの出力/debug/表示先をfuture poll単位に束縛し、operation ID/seqで並列進捗を分離。native Web更新もサイト別並列取得。
@@ -18,6 +20,13 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 
 0.4.11 最終監査で確認したデータ保全の修正: SQLite のインプレース YAML 書き出しは meta の export_file_sha 指紋を原子的なファイル保存より前に記録し、失敗後の未編集の書き出し残骸を再取り込みしない。管理状態だけでなく database.yaml の作品レコードも対象。ユーザーの編集と narou-compat のファイル優先は維持する。S3 COPY は完全な CopyObjectResult と ETag/LastModified を確認できた場合だけ成功し、200 内 Error・破損応答では元オブジェクトを削除しない。実 HTTP の失敗／成功ケースと、書き出し失敗後の正常保存→再オープンを smoke で確認済み。
 指紋は既存の未編集 projection と次回公開予定を最大2件保持し、2回目が公開前に中断しても保護を失わない。指紋更新と公開は同一ファイルロック内。--out が実 .narou を指す場合も対象。最終 workspace 全 target は1342成功/0失敗/1ignored、Clippy 全 feature -D warnings・Rustdoc -D warnings・core/Worker wasm check 成功。Web CSRF 回帰 fixture は並行CWD変更に影響されない絶対パスへ修正し、HTTPの拒否/許可とキュー状態の検証内容は維持した。
+
+## 未リリース: 0.4.13 の機能ツアー
+
+- 共通の `application::webui::feature_tour::FEATURE_TOURS` に、アルファポリスの小説・作者一覧対応とカクヨムネクスト対応を追加。無料分、レンタル・契約に応じたログイン Cookie の利用、既存本文の保護を説明し、通常の公開作品へのログインを要求しない。
+- GitHub `/releases/latest` が v0.4.12 を指すことを確認し、ユーザー指定の v0.4.13 を維持。root / Worker manifest、各 lock、ライセンス表示は既に 0.4.13 のため変更しない。未公開版をさらに 0.4.14 へ進めない基準を AGENTS.md に保存した。
+- 実 Native Web UI を Documents/WebNovel 配下の Rust TempDir で起動し、Firefox で両項目と v0.4.13 表示・横溢れなしを確認。旧ツアー既読状態から新項目だけ表示され、既読保存後の次回画面読み込みでは表示されない。全ツアー API には両項目が残る。検証タブ・サーバ・ライブラリ・使い捨てソースは終了・削除済み。実 CLI `version --more` も 0.4.13 (local-build) で正常終了した。
+- `cargo check --workspace --all-targets --all-features`、Native 全 workspace / 全 target / 全 feature の 1,365 成功・参照 fixture 1 ignored、Worker Wasm check が成功。最新ツアーを 0.4.3 に固定した実装依存 assertion は削除し、新版への固定し直しは行わない。既読状態の後退防止・表示対象の版数境界の回帰は維持した。依存・lock・ライセンス表示の変更はない。
 
 ## 未リリース: カクヨムネクストのログインと無料分取得
 

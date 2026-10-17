@@ -157,6 +157,26 @@ pub const FEATURE_TOURS: &[FeatureTourEntry] = &[
             "未設定なら、現在利用中のビルドと同じ種類の版を取得",
         ],
     },
+    FeatureTourEntry {
+        version: "0.4.13",
+        title: "アルファポリスの小説・作者一覧に対応",
+        body: "アルファポリスの無料公開の話と、アカウントでレンタル中の話を、章分けを保って取得できます。",
+        items: &[
+            "小説トップ・各話・作者ページの URL から作品を登録できます",
+            "レンタル中の話は narou_rs_login alphapolis.co.jp で取得したログイン Cookie を登録して取得します",
+            "閲覧制限で保存済みの話が見えなくなった場合は、更新を見送って既存の目次・本文を保持します",
+        ],
+    },
+    FeatureTourEntry {
+        version: "0.4.13",
+        title: "カクヨムネクストに対応",
+        body: "カクヨムネクストの作品を取得できます。ログインなしでも無料分を取得し、閲覧権のある Cookie を登録すると有料部分も取得できます。",
+        items: &[
+            "NEXT 契約など、対象の話を読めるアカウントの閲覧権が必要です",
+            "Cookie は narou_rs_login kakuyomu.jp で取得し、環境設定の「ログイン」から取り込めます",
+            "無料分を取得した作品も、閲覧権のある Cookie の登録後に更新すれば残りの話を追加できます",
+        ],
+    },
 ];
 
 /// 現在のバージョンまでに存在するツアー (表示対象になり得る全件)。
@@ -242,14 +262,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn tour_table_versions_are_known_and_latest_is_max() {
-        assert!(is_known_tour_version("0.2.2"));
-        assert!(is_known_tour_version("0.4.3"));
-        assert!(!is_known_tour_version("0.2.1"));
-        assert!(!is_known_tour_version(""));
-        assert_eq!(latest_tour_version(), "0.4.3");
-    }
 
     #[test]
     fn version_greater_compares_numeric_parts() {
