@@ -28,6 +28,12 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 - Native + Lite のビルドと変更 JS の構文確認が成功。Chrome DevTools の隔離タブで実ドラッグ194→574px、再読込で復元、表示メニューのリセット、上下キー、拡大から通常カスタム高さへの遷移を実操作した。100行と4本の進捗 DOMを置いた表示fixtureで、リセット後も内容・同一ノード・scrollTop=100が維持された。FHDは本文14px/幅1456px/高さ194px、WQHDは16.33px/2176px/259px、4Kは17.5px/3264px/389px。390幅でも左右96px・横溢れなし。モバイル emulation はページを再読込するため、DOM fixture の保持とは混同しない。Firefox と共有 browser broker は起動失敗、独立 Chrome DevTools で確認した。
 - 初期化は main.js から呼び、既存のキャッシュ済みエントリポイントも更新されるようにした。最終 Native 配信で更新された main.js とハッシュ付き import を確認し、4K の実画面で上下キー389→414px・表示メニューのリセット389px／保存値解除・横溢れなしを再確認した。Worker は同じ38資産をハッシュ付きで生成する。ライブラリは Documents/WebNovel 内の Rust TempDir controller 所有で、元ライブラリやログイン資格情報は変更しない。
 
+## 未リリース: cargo local-build の GPL 版
+
+- `--gpl` を既存 Options に追加し、本体だけを `--features lite` 付きで release build する。updater / backup / login・updater SHA-256 の埋め込み・資産コピー・`narou/` の再作成は既存経路を共用する。GPL 時は `Third-Party-License.md`、通常時は `Third-Party-License-non-GPL.md` を選び、梱包内ではどちらも `Third-Party-License.md` に揃える。`--locked` / `--target` の転送は維持する。
+- 既存の repo 直下 `narou/` を削除しないよう、Rust TempDir 所有のローカル副本で実 `cargo local-build --gpl --locked` を実行した。全バイナリ・preset・webnovel の梱包と GPL notice の byte 一致を確認し、AozoraEpub3 未設定で梱包本体から Lite を強制して実変換した。出力の Kobo EPUB は CRC 正常・正しい mimetype で、XHTML に保存済みの日本語本文を保持した。引数パーサーや転送だけを固定する恒久テストは追加しない。
+- 続けて同じ副本で実 `cargo local-build --locked` を実行し、通常版の4バイナリと non-GPL notice の byte 一致、梱包本体の起動を確認した。Lite 強制時は組み込みエンジンを含まないエラーを表示し EPUB を生成しないため、直前の GPL feature が残らない。変換コマンド全体の exit0 は既存挙動で変更しない。repo 直下の既存 `narou_rs.exe` の SHA-256 は検証前後で一致した。Cargo helper は28個の narou コマンドには含めず、COMMANDS の完了数は変更しない。
+
 ## 未リリース: Worker のサイト別直列化と変換枠の分離
 
 - `NAROU_JOBS` は取得4枠、`CONVERT_QUEUE` は変換1枠と独立DLQ。`CONVERT_QUEUE_NAME` は物理レーンを識別する。CI の provision / render / deploy、ローカル・develop・production の TOML、cron / 手動再投入 / 旧レーン転送を同じ kind 判定へ揃え、単一 D1 台帳を維持する。新しい secret の手動設定は不要。

@@ -36,7 +36,7 @@ fn run() -> Result<(), String> {
     let updater_hash = sha256_file(&updater_binary)
         .map_err(|err| format!("failed to hash {}: {err}", updater_binary.display()))?;
     build_app_binary(&options, &updater_hash)?;
-    create_local_package(&root, &app_binary, &updater_binary, &backup_binary, &login_binary)?;
+    create_local_package(&root, &app_binary, &updater_binary, &backup_binary, &login_binary, options.gpl)?;
 
     println!("Created {}", root.join("narou").display());
     Ok(())
@@ -44,12 +44,14 @@ fn run() -> Result<(), String> {
 
 struct Options {
     locked: bool,
+    gpl: bool,
     target: Option<String>,
 }
 
 impl Options {
     fn parse(args: impl Iterator<Item = OsString>) -> Result<Self, String> {
         let mut locked = false;
+        let mut gpl = false;
         let mut target = None;
         let mut iter = args.peekable();
         while let Some(arg) = iter.next() {
@@ -58,6 +60,7 @@ impl Options {
                 .map_err(|_| "arguments must be valid UTF-8".to_string())?;
             match arg.as_str() {
                 "--locked" => locked = true,
+                "--gpl" => gpl = true,
                 "--release" => {}
                 "--target" => {
                     let value = iter
@@ -74,13 +77,14 @@ impl Options {
                 other => return Err(format!("unsupported argument: {other}\n\n{}", help_text())),
             }
         }
-        Ok(Self { locked, target })
+        Ok(Self { locked, gpl, target })
     }
 }
 
 fn help_text() -> String {
-    "usage: cargo local-build [--locked] [--target <triple>]\n\
-     Builds release binaries and creates a local narou/ package directory."
+    "usage: cargo local-build [--gpl] [--locked] [--target <triple>]\n\
+     Builds release binaries and creates a local narou/ package directory.\n\
+     --gpl embeds AozoraEpub3_Lite and includes the GPL license notice."
         .to_string()
 }
 
@@ -93,6 +97,9 @@ fn build_release_binary(options: &Options, bin: &str) -> Result<(), String> {
 fn build_app_binary(options: &Options, updater_hash: &str) -> Result<(), String> {
     let mut command = cargo_build_command(options);
     command.args(["--bin", "narou_rs"]);
+    if options.gpl {
+        command.args(["--features", "lite"]);
+    }
     command.env("NAROU_RS_RELEASE_BUILD", "1");
     command.env("NAROU_RS_LOCAL_BUILD", "1");
     command.env("NAROU_RS_UPDATER_SHA256", updater_hash);
@@ -133,6 +140,7 @@ fn create_local_package(
     updater_binary: &Path,
     backup_binary: &Path,
     login_binary: &Path,
+    gpl: bool,
 ) -> Result<(), String> {
     let package_root = root.join("narou");
     if !app_binary.is_file() {
@@ -179,11 +187,12 @@ fn create_local_package(
             copy_file(&source, &package_root.join(file))?;
         }
     }
-    // local-build always builds the default feature set, so the resulting
-    // package is the non-GPL one. Ship the notice that excludes copyleft
-    // (`about-non-gpl.toml` against `about-probe/`), under the same file name
-    // the release archives use.
-    let notice = root.join("Third-Party-License-non-GPL.md");
+    // Match the release archive's notice selection for the chosen variant.
+    let notice = root.join(if gpl {
+        "Third-Party-License.md"
+    } else {
+        "Third-Party-License-non-GPL.md"
+    });
     if notice.is_file() {
         copy_file(&notice, &package_root.join("Third-Party-License.md"))?;
     }
