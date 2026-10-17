@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use super::ast::*;
-use super::jobs::{MAX_PREPROCESS_JOBS, PreprocessJobs};
+use super::jobs::{MAX_PREPROCESS_JOBS, PreprocessJobs, PreprocessRequest};
 
 const PREPROCESS_STEP_BUDGET: usize = 100_000;
 const PREPROCESS_MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
@@ -20,7 +20,7 @@ struct Ctx<'a> {
     /// Results of previously requested URLs, exposed to the DSL as `fetched`.
     jobs: &'a PreprocessJobs,
     /// URLs this run asked for, in request order.
-    requested: Vec<String>,
+    requested: Vec<PreprocessRequest>,
 }
 
 impl<'a> Ctx<'a> {
@@ -57,10 +57,10 @@ impl<'a> Ctx<'a> {
             return Ok(Value::Null);
         }
         if !self.jobs.contains(&url)
-            && !self.requested.contains(&url)
+            && !self.requested.iter().any(|request| request.key() == url)
             && self.requested.len() < MAX_PREPROCESS_JOBS
         {
-            self.requested.push(url.clone());
+            self.requested.push(PreprocessRequest::Json { url: url.clone() });
         }
         Ok(Value::String(url))
     }
@@ -139,6 +139,72 @@ impl<'a> Ctx<'a> {
     }
 }
 
+fn form_pairs(value: Value) -> PreprocessResult<Vec<(String, String)>> {
+    let Value::Array(items) = value else {
+        return Err("preprocess: form fields and headers must be arrays of pairs".into());
+    };
+    if items.len() > MAX_PREPROCESS_JOBS {
+        return Err("preprocess: too many form fields or headers".into());
+    }
+    let scalar = |value| match value {
+        Value::String(value) => Ok(value),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::Bool(value) => Ok(value.to_string()),
+        _ => Err("preprocess: form values must be strings, numbers, or booleans".to_string()),
+    };
+    items.into_iter().map(|item| {
+        let Value::Array(pair) = item else {
+            return Err("preprocess: form entry must be a pair".into());
+        };
+        if pair.len() != 2 {
+            return Err("preprocess: form entry must have two values".into());
+        }
+        let mut values = pair.into_iter();
+        Ok((scalar(values.next().unwrap())?, scalar(values.next().unwrap())?))
+    }).collect()
+}
+
+fn eval_post_form(ctx: &mut Ctx, url: &Expr, fields: &Expr, headers: Option<&Expr>) -> PreprocessResult<Value> {
+    let target = val_to_string(&eval_expr(ctx, url)?);
+    let source = ctx.get("url").and_then(Value::as_str).unwrap_or_default();
+    let origin = url::Url::parse(source).map_err(|_| "preprocess: form source URL is invalid")?;
+    let parsed = url::Url::parse(&target).map_err(|_| "preprocess: form URL is invalid")?;
+    if parsed.origin() != origin.origin()
+        || !crate::downloader::security::is_safe_public_url_syntax(&target)
+        || !parsed.username().is_empty() || parsed.password().is_some()
+    {
+        return Err("preprocess: form requests must stay on the source origin".into());
+    }
+    let fields = form_pairs(eval_expr(ctx, fields)?)?;
+    let headers = match headers {
+        Some(headers) => form_pairs(eval_expr(ctx, headers)?)?,
+        None => Vec::new(),
+    };
+    for (name, value) in &headers {
+        if !crate::platform::http::is_safe_header_name(name)
+            || !crate::platform::http::is_safe_header_value(value)
+            || matches!(name.to_ascii_lowercase().as_str(),
+                "cookie" | "host" | "authorization" | "proxy-authorization"
+                | "content-length" | "content-type" | "transfer-encoding")
+        {
+            return Err("preprocess: unsafe form request header".into());
+        }
+    }
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(fields).finish();
+    validate_string_size(&body)?;
+    let request = PreprocessRequest::form(target, body, headers);
+    if let Some(value) = ctx.jobs.get(request.key()) {
+        return Ok(value.clone());
+    }
+    if !ctx.requested.iter().any(|pending| pending.key() == request.key()) {
+        if ctx.requested.len() >= MAX_PREPROCESS_JOBS {
+            return Err("preprocess: form request limit exceeded".into());
+        }
+        ctx.requested.push(request);
+    }
+    Ok(Value::Null)
+}
+
 fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
     ctx.consume_step()?;
     let value = match expr {
@@ -208,6 +274,7 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
                 ctx.jobs.results().get(&url).cloned().unwrap_or(Value::Null)
             }
         }
+        Expr::PostForm { url, fields, headers } => eval_post_form(ctx, url, fields, headers.as_deref())?,
         Expr::Arith(left, op, right) => {
             let left = eval_expr(ctx, left)?;
             let right = eval_expr(ctx, right)?;
@@ -222,7 +289,7 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
                 _ => Value::Null,
             }
         }
-        Expr::ExtractJson(_, _) | Expr::Regex(_, _) => Value::Null,
+        Expr::ExtractJson(_, _) | Expr::Extract(_, _) | Expr::Regex(_, _) => Value::Null,
     };
     validate_value_limits(&value)?;
     Ok(value)
@@ -490,6 +557,16 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
                 Expr::ExtractJson(pattern, flags) => {
                     eval_extract_json(ctx, pattern, flags, source)?.unwrap_or(Value::Null)
                 }
+                Expr::Extract(pattern, flags) => {
+                    let re = cached_preprocess_regex(pattern, flags)?;
+                    if let Some(captures) = re.captures(source) {
+                        ctx.match_start = captures.get(0).map(|matched| matched.start());
+                        captures.get(1).map(|matched| Value::String(matched.as_str().to_string()))
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }
                 _ => eval_expr(ctx, expr)?,
             };
             ctx.set(var, val)?;
@@ -523,6 +600,11 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
             }
             let val = eval_expr(ctx, expr)?;
             ctx.push_output(val_to_string(&val))?;
+        }
+        Stmt::Fail(message) => {
+            if !matches!(ctx.get("__abort__"), Some(Value::Bool(true))) {
+                return Err(format!("preprocess: {}", val_to_string(&eval_expr(ctx, message)?)));
+            }
         }
         Stmt::InsertAtMatch => {
             if ctx.output.is_empty() {
@@ -573,18 +655,6 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
 }
 
 pub(super) fn run_stmts(
-    stmts: &[Stmt],
-    source: &mut String,
-    jobs: &PreprocessJobs,
-    url: &str,
-) -> super::PreprocessRun {
-    match run_stmts_checked(stmts, source, jobs, url) {
-        Ok(run) => run,
-        Err(err) => panic!("{err}"),
-    }
-}
-
-fn run_stmts_checked(
     stmts: &[Stmt],
     source: &mut String,
     jobs: &PreprocessJobs,
@@ -664,7 +734,7 @@ mod tests {
     use super::*;
 
     fn run(stmts: &[Stmt], source: &mut String) -> Result<(), String> {
-        run_stmts_checked(stmts, source, &PreprocessJobs::new(), "").map(|_| ())
+        run_stmts(stmts, source, &PreprocessJobs::new(), "").map(|_| ())
     }
 
     /// Compile DSL source, run it over `source`, and return the result.
@@ -672,7 +742,7 @@ mod tests {
         let stmts = crate::downloader::preprocess::parser::parse_preprocess(program)
             .unwrap_or_else(|err| panic!("should parse: {err}\n{program}"));
         let mut text = source.to_string();
-        run_stmts_checked(&stmts, &mut text, &PreprocessJobs::new(), "")
+        run_stmts(&stmts, &mut text, &PreprocessJobs::new(), "")
             .unwrap_or_else(|err| panic!("{program}: {err}"));
         text
     }
@@ -791,8 +861,8 @@ mod tests {
                        insert_at_match\n";
         let stmts = crate::downloader::preprocess::parser::parse_preprocess(program).unwrap();
         let mut source = String::new();
-        let run = run_stmts_checked(&stmts, &mut source, &jobs, "").unwrap();
-        assert_eq!(run.requested, vec!["https://example.com/illust/11"]);
+        let run = run_stmts(&stmts, &mut source, &jobs, "").unwrap();
+        assert_eq!(run.requested, vec![PreprocessRequest::Json { url: "https://example.com/illust/11".into() }]);
         assert_eq!(source, "url=");
 
         // The same program with the job settled sees the value.
@@ -802,7 +872,7 @@ mod tests {
             serde_json::json!({"body": [{"urls": {"original": "https://i.example/11.jpg"}}]}),
         );
         let mut source = String::new();
-        let run = run_stmts_checked(&stmts, &mut source, &settled, "").unwrap();
+        let run = run_stmts(&stmts, &mut source, &settled, "").unwrap();
         assert!(
             run.requested.is_empty(),
             "settled jobs are not re-requested"
@@ -820,7 +890,7 @@ mod tests {
         )
         .unwrap();
         let mut source = String::new();
-        let run = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap();
+        let run = run_stmts(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap();
         assert!(run.requested.is_empty(), "{:?}", run.requested);
     }
 
@@ -1300,7 +1370,7 @@ mod tests {
             (PREPROCESS_STEP_BUDGET / 2) + 1
         ];
         let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
+        let err = run_stmts(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
         assert_eq!(err, "preprocess: step budget exceeded");
     }
 
@@ -1315,7 +1385,7 @@ mod tests {
             methods: vec![Method::Join(vec![StrPart::Lit(String::new())])],
         })];
         let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
+        let err = run_stmts(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
         assert_eq!(
             err,
             format!("preprocess: string size limit exceeded ({PREPROCESS_MAX_STRING_BYTES} bytes)")
@@ -1329,7 +1399,7 @@ mod tests {
             expr: Expr::Array(vec![Expr::Null; PREPROCESS_MAX_ARRAY_ITEMS + 1]),
         }];
         let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
+        let err = run_stmts(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
         assert_eq!(
             err,
             format!("preprocess: array size limit exceeded ({PREPROCESS_MAX_ARRAY_ITEMS} items)")

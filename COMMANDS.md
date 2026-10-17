@@ -166,7 +166,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Worker の `/api/download`（`/api/download_force` を含む）と `/api/jobs` は、全対象のシリーズ・作者 URL 展開が成功してから作品ごとのジョブを登録し、元の `--force` 等を各作品へ引き継ぐ。取得失敗・空シリーズ一覧はエラー。正常に読めた空の作者一覧は追加なし。保存済みジョブ・旧 envelope の実行境界も同じ展開器を使う
 - 作者・ユーザー URL の単発登録と CLI `author` の継続追跡は別機能。`Downloader::author_works` / `AuthorListing` が作品列挙・複数ログインの試行・ページ送り・シリーズ所属作品の除外を共有し、サイト固有の規則は YAML / preprocess DSL に置く。小説・シリーズの URL 判定を優先するため、Pixiv のシリーズを作者一覧として展開しない
 - R18 なろうの作者はプロフィールの最新作だけでなく、`/mypage/novellist/xid/<作者ID>/` の全作品一覧を `author_api_url` から取得し、DSL / `author_next_pattern` で次ページを辿る。単発の一括取得と継続追跡で同じ列挙経路を使う
-- 新規取得したセクションは解析済みの本文・前書き・後書きに加えて raw HTML も `illust_grep_pattern` の検索対象にし、本文として保存しないサイト固有マークアップ内の挿絵を先取り保存する。未更新セクションは従来どおり保存済み section のみを検索する
+- 新規取得したセクションは解析済みの本文・前書き・後書きに加え、既定では raw HTML も `illust_grep_pattern` の検索対象にしてサイト固有マークアップ内の挿絵を先取り保存する。取得ページが空の本文枠と UI 画像だけの場合は、サイト定義の `illust_from_raw: false` で解析済み本文・前後書きだけに限定できる（アルファポリスで使用）。未更新セクションは従来どおり保存済み section のみを検索する
 - サイト定義に `illust_grep_pattern` が無いサイト (なろう / R18なろう / カクヨム / Arcadia) は narou.rb `HTML#initialize` の既定 `<img>` パターン (`downloader::DEFAULT_ILLUST_GREP_PATTERN`) で挿絵を先取り保存する。既定パターンでは URL でない注記 (相対パス) は対象外にし、挿絵 URL の protocol-relative (`//host/...`) は本文のスキームで解決し、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない (2026-10-08 修正)
 - 索引 (`.illustration_cache.yaml`) が知っている挿絵でも、`<prefix>/挿絵` の一覧に実体が無ければ取り直す (自己修復)。索引が空でないときだけ 1 小説 1 回一覧するので、通常の更新に余分な往復は付かない (2026-10-08 修正)
 - ハーメルンのタグ抽出は `webnovel/syosetu.org.yaml` の詳細表・目次ページ両方のパターンで行い、短編ページのあらすじ・本文をタグとして取り込まない
@@ -177,11 +177,14 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - なろう式の ncode 判定 (`n\d+[a-z]+`) に当たらない ncode は、タイトル一致が無いときに ncode 一致で解決する (`n29204764` / `s16299140` などを `update` / `convert` の対象に指定できる)
 - Pixiv の挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は DSL の `fetch_json` で画像 URL を解決し (`[uploadedimage:]` は同じ応答から解決)、`illust_grep_pattern` が `挿絵/` へローカライズする。解決できなかった参照は `<!--...-->` の目印だけ残す
 - Pixiv のアニメーション挿絵（うごイラ）はフレーム ZIP として取得され、`illustration-animation` feature（native と Worker の両方で有効）で APNG に組み立てて `挿絵/` へ保存する。`zip` は wasm でも動くよう純 Rust の deflate バックエンドに絞ってある
+- アルファポリス (`webnovel/www.alphapolis.co.jp.yaml`) は小説トップ・各話 URL を作品トップへ正規化し、埋め込み JSON の目次配列順で全話を取得する。章、題名、作者、あらすじ、タグ、更新日時、文字数、完結状態を抽出し、本文は匿名セッションの Cookie と CSRF 付きフォーム POST で取得する。R18 は `over18` の同意に従い、閲覧できない有料話・電子書籍特典や CAPTCHA は不完全な成功扱いにしない。サイト固有の処理はすべて YAML / DSL に置く
 - サイト定義の `min_interval:` でサイトごとの最低リクエスト間隔 (秒) の下限を宣言でき、該当サイトのレートリミットスコープにだけ適用される
 - サイト定義の `headers:` キーで任意のリクエストヘッダを宣言できる (Pixiv は画像ホスト用に `Referer`、ハーメルン R18 は Cloudflare challenge 回避用に `Sec-Fetch-*` を指定)。値は `\k<...>` 補間され、危険な名前・値は無視される
 - サイト定義の `cookie_hosts:` は、サイトの `domain` とは別に Cookie を送ってよい信頼済みホスト名の配列（各ホストのサブドメインも含む）。R18 なろうは作者用 `xmypage.syosetu.com` を指定する。未指定の第三者ホストには Cookie を送らない
+- サイト定義の `cookie_session: true` は取得ポリシー内だけの匿名 Cookie セッションを有効にする。応答の Cookie を同一 origin・Path・Secure・有効期限の範囲で次の送信に使い、保存済みログインへ書き込まない。既定は無効
 - リダイレクトを自前で辿るモード (`resolve_final_url`) も curl ティアを先に試す。CDN challenge 下のホストでは reqwest が 403 でも libcurl が 200 を返すことがあるため
 - `preprocess:` DSL は `request(url)` / `fetch_json(url)` で追加取得を要求できる。実行側がサイトの取得ポリシー経由で取得し、定義を再実行する (最大 4 ラウンド)。結果は `fetched["<url>"]`、失敗は null。ジョブは URL 単位で、結果は 1 小説分だけ保持する
+- `preprocess:` DSL の `extract(/.../)` は最初の capture を文字列として返す。`post_form(url, [[name, value], ...], [[header, value], ...])` は同一 origin へのフォーム POST を要求し、再実行時に本文文字列を返す（未取得は null）。第3引数は省略可能で、Cookie / Authorization 等の注入は拒否する。フォーム結果は1回の前処理だけ保持し、同じ URL でも本文・ヘッダが違う要求を区別する。取得失敗はエラーとなり、`fail "理由"` でも前処理を失敗させられる。失敗時に途中の書き換えを公開しない
 - 保存済みログイン Cookie のフォールバックを実装。TOC 取得がログイン壁 (404 やサイト定義の `login_pattern`) / 部分一覧 (`login_partial_pattern`) に当たったとき `narou login` の資格情報を試行順に試し、成功した資格情報の ID を小説レコードの `login_session` に保存して次回から最初のリクエストで使う。取得側の `narou_rs_login` は親ドメインの Cookie も拾い、サイト全体で使える資格情報として保存する。`update` でも同じ経路を通る
 - Workers は年齢認証を対話で確認できない。成人向け作品の取得を許可する場合は Web UI の「環境設定 → Global」で `over18=true` を保存する。`false` は明示的な拒否であり、設定変更で既に `blocked` になったジョブを自動再開はしない
 - 話ごとの進捗行・章/節の見出し・ログイン再試行・「小説が削除されているか非公開な可能性があります」などのレポート行は、コンソールと同時に `logging` のログファイルへも出力する。narou.rb は `$stdout` への write をすべて `append_log` するため、ログに残らない行があってはならない。並列ドメインワーカー間の行混線は sink 内の排他 (`STDOUT_LOCK`) で防ぐ。原因は `src/logger.rs` が bin と lib の両方にコンパイルされて `LoggerState` が 2 つ存在し、`logger::init()` が bin 側しか初期化していなかったこと。`MessageSink` (`progress::console_sink`) 経由の行は未初期化の lib 側ロガーへ書かれていた。bin は lib のロガーを共有する (2026-10 修正、issue #36)
@@ -284,9 +287,11 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 **保存形式**: 小説とは別の inventory `author`（Native は SQLite `app_state` / `.narou/author.yaml`、Workers は D1 の `app_state(scope='inv', key='author')`）に、**作者ページ URL（ユニーク）→ サイト名** だけを持つ。名前や日時などの帳簿は持たない。登録・解除は Native の Inventory 原子更新、Workers の全スナップショット CAS で保存し、別の登録操作を上書きしない。
 
-**サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧の取得先の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）/ `author_next_pattern`（ページ分けされた一覧の次ページ。ハーメルンで使用。終了は次ページが無いか訪問済みに戻ったとき）。
+**サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧の取得先の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）/ `author_next_pattern`（ページ分けされた一覧の次ページ。ハーメルン・アルファポリス等で使用。終了は次ページが無いか訪問済みに戻ったとき）。
 
 **共通取得**: `author add/check` も現在の実効サイト定義を使う。作品一覧の取得・認証・シリーズ所属作品の除外は CLI / Worker の単発 URL 展開と共通。offset 型 API は `author_page_url` / `author_page_size` / `author_page_total_pattern` / `author_page_max_start` でページ送りする。なろう API の公式開始位置上限を越える場合や総件数に届かない場合は、途中までの一覧を成功扱いしない。
+
+アルファポリスの作者一覧は作品タイトル欄からサイト内の小説だけを列挙する。漫画、外部登録、プロフィール内リンクは除外し、現在ページ直後のページリンクを辿る。単発取得と継続追跡で同じ定義を使う。
 
 **Workers の継続追跡**: `/api/update` と Update ジョブの投入、および定期更新の最終ページから、作者ごとの `author_check` ジョブを投入する。実効サイト定義・Cookie・待機ポリシーは単発取得と共通で、登録済み作品は TOC URL の索引で除外する。`update.disabled-author-tracking=true` で自動確認を止められるが、作者タブの「今すぐ確認」は実行できる。解除済み作者の古い確認ジョブはスキップし、一覧取得後も登録を再確認する。すでに通常の Download ジョブとして投入された作品は、作者の解除だけではキャンセルしない。
 
@@ -319,15 +324,21 @@ narou author remove 1
 
 Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs_login` のブラウザ取得と書き出しファイルの取り込みだけで、利用者は名前と順序を管理する。
 
+**取得用 bin**: `narou_rs_login` は小説・作者・トップページの URL、サイト名、親ドメインも受理し、YAML の `login_url` を開く。アルファポリスは `narou_rs_login alphapolis.co.jp --name 本垢` で取得できる。対象作品 URL を渡した場合の保存後確認も共通の取得・YAML 前処理を通し、HTTP エラーやログイン壁を成功表示しない。
+
 **保存形式**: `login_cookie` inventory (SQLite `app_state` / `.narou/login_cookie.yaml`) に、**1 サイト = 順序つきログイン配列** (`LoginGroup { id, site, label, cookies: [{ host, cookie }], added_at }` の JSON 配列) を `enc:v1:<nonce>:<payload>` として暗号化保存。並び順がそのまま試行順になる。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。在庫のキー (サイト名) を AEAD の associated data に束ねるため別サイトへの流用は不可。旧形式の平文値はそのまま読め (ホスト名で束ねた旧暗号文も可)、次回保存時にサイト単位の新形式へ移行する。
 
 **1 ログイン = 複数ホスト (取り込んだ 1 ファイル = 1 ログイン)**: ブラウザのセッションは `pixiv.net` と `www.pixiv.net` のように複数ホストにまたがるため、取得側はサイトのドメインファミリーを 1 つのログインにまとめて保存する。送信時は `merged_cookie()` が各ホストの Cookie を 1 本の `Cookie:` ヘッダに畳み、名前が衝突したときは具体的なホストを優先する。まとめ先のサイト名はサイト定義 (`webnovel/*.yaml`) のドメインで決め、定義が無ければホストを使う (親ドメインのキーは配下の定義があればそこへ寄せる)。
+
+ドメインファミリーの収集・サイト名への畳み・親ホストの検索は Public Suffix List を使い、`co.jp` のような複数ラベルの suffix を別サイトの共有範囲と誤認しない。アルファポリスの `alphapolis.co.jp` / `www.alphapolis.co.jp` は 1 サイトへまとめ、無関係な `*.co.jp` や suffix 自体は同じログインへ入れない。
 
 旧形式 (版 1 の host→cookie、版 2 のホストごとの一覧) は読み取り時に**ホストごとに並べ直してから 1 ログインへ畳み直す**ので、1 ファイル = 1 セッションのまま入る (版 2 の同じ位置は同じアカウント)。過去にホストごとに分解されたまま保存されたデータも、読み込み時に「ホストが重ならず Cookie 名も衝突しない」ログイン同士を 1 つに畳んで書き戻す。
 
 **セッション ID**: 各ログインに UUID を振り（保存値に含める）、小説レコードは `requires_login` に加えて `login_session`（成功したログインの ID）を持つ。フラグ付きの小説は次回以降その ID のログインを最初のリクエストから送るため、一覧の総当たりをしない。ID の無い旧データはストア読み込み時に採番・保存される。
 
 **試行順の使われ方**: ダウンロード時、ログイン壁 (404 / `login_pattern`) か部分一覧 (`login_partial_pattern`) のときに保存済みを**順に試す**。ログイン壁は成功した時点で、部分一覧は「欠けが消えた／取得話数が増えた」時点で打ち切る。採用したログインはその後の本文取得にも使う。`Set-Cookie` の書き戻しは、その応答で実際に送ったログインだけを更新する (別アカウントのセッションを壊さない)。
+
+ログイン画面を返す初回 GET の再利用も同じ再試行処理へ渡す。HTTP 200 のままログイン壁が残る資格情報は採用せず、資格情報が無い／全件失敗なら題名なし・0 話の小説を作らない。アルファポリスの閲覧不可なレンタル話は YAML がログイン壁として示し、保存 Cookie を試した後も閲覧権が無ければ失敗する。
 
 **データ管理方式 (YAML / SQLite)**: 設定ページの WEB UI タブに「データ管理方式」があり、現在のモード表示・SQLite 管理への移行・YAML 管理への復帰ができる。API は `GET/POST /api/storage/mode` (実装 `src/web/storage.rs`、`narou db export-yaml --in-place` と同じ書き出しを先に行う)。`NAROU_RS_LEGACY_YAML=1` のときは固定され、API は `locked_by_env: true` を返す。
 

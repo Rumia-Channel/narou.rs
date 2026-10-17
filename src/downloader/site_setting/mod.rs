@@ -122,6 +122,10 @@ pub struct SiteSetting {
     /// site's Cookie header, e.g. an author page hosted separately from novels.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cookie_hosts: Vec<String>,
+    /// Reuse response cookies within a single fetch policy (e.g. CSRF forms).
+    /// Anonymous session cookies are never persisted as saved logins.
+    #[serde(default)]
+    pub cookie_session: bool,
     /// Runtime-only credential destinations; never written into site YAML.
     #[serde(skip)]
     pub(super) login_cookie_hosts: Vec<String>,
@@ -189,6 +193,9 @@ pub struct SiteSetting {
     pub illust_current_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub illust_grep_pattern: Option<String>,
+    /// Search fetched page markup as well as parsed content (default: true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub illust_from_raw: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<SiteSettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

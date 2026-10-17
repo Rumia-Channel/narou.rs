@@ -36,6 +36,9 @@ README では、導入方法、基本操作、主な注意点をまとめます�
 + 暁 http://www.akatsuki-novels.com/
 + カクヨム https://kakuyomu.jp/
 + Pixiv https://www.pixiv.net/ （小説・小説シリーズ・イラスト/漫画・漫画シリーズ）
++ アルファポリス https://www.alphapolis.co.jp/ （公開小説・各話 URL・作者一覧）
+
+アルファポリスは作品トップの目次順で取得し、作者一覧のページ送りにも対応します。閲覧できない有料話・電子書籍特典や CAPTCHA は、本文の欠落や認証画面を保存せずエラーにします。R18 作品にも既存の `over18` 設定を適用し、R18 表記だけでログイン必須とは判断しません。
 
 ## セットアップ
 
@@ -259,10 +262,11 @@ narou_rs setting server-basic-auth.require-for-external-bind=false
 
 ログインが必要なサイトの小説は、ブラウザで取得したログイン Cookie を保存してからダウンロードします。Cookie の取得は同梱の `narou_rs_login` が担当し、保存した値は `.narou/login.key` の鍵で暗号化されます。1 サイトに複数のログイン Cookie を保存でき、一覧の順に試行されます。
 
-ブラウザと narou_rs が同じマシンにある場合は、ライブラリのフォルダで次を実行します。
+ブラウザと narou_rs が同じマシンにある場合は、ライブラリのフォルダで利用するサイトを選んで実行します。
 
 ```powershell
 narou_rs_login ncode.syosetu.com
+narou_rs_login alphapolis.co.jp --name 本垢
 ```
 
 Chromium 系ブラウザがログイン URL で開くので、ログインが終わったら Enter を押してください。2 段階認証や CAPTCHA もそのまま通せます。ブラウザが見つからない環境では `--browser <パス>` で指定するか、ブラウザからコピーした Cookie 文字列を直接渡せます。
@@ -319,6 +323,8 @@ narou_rs login clear                                      # すべて削除
 複数のログイン Cookie は一覧の順に試行され、成功した資格情報は小説レコードに記憶されるため、同じ小説の次回以降は最初のリクエストからその Cookie が使われます。
 
 保存した Cookie は、ダウンロード時に 404 またはサイト定義の `login_pattern` に一致するログイン壁が返った場合に自動で使われます。`webnovel/*.yaml` に `login_url` (ログイン用 bin が開く URL) と `login_pattern` (ログイン壁を検出する正規表現) を定義すると、サイトごとの挙動を調整できます。
+
+アルファポリスの Cookie は親ドメインと `www` を同じログインにまとめ、無関係な別の `*.co.jp` は含めません。ログインしても閲覧権のないレンタル話は取得できず、電子書籍特典は未対応です。
 
 ## グローバルオプション
 

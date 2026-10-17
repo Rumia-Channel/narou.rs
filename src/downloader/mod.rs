@@ -1117,8 +1117,9 @@ impl Downloader {
         // headers, and login-only images need the same cookie jar.
         let illustration_policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
 
-        // Parsed sections may omit site-specific image markup. Search the raw
-        // HTML from this fetch as well, while keeping all persistence logical.
+        // Parsed sections may omit site-specific image markup. Definitions
+        // whose fetched page contains only reader controls can opt out.
+        let raw_html = raw_html.filter(|_| setting.illust_from_raw.unwrap_or(true));
         for source in illustration_sources(section, raw_html) {
             for caps in re.captures_iter(source) {
                 let Some(url_match) = caps.get(1) else {
@@ -1449,9 +1450,10 @@ impl Downloader {
                         if let Some(re) = setting.compiled_error_message_pattern()
                             && re.is_match(&body)
                         {
-                            return Err(NarouError::NotFound("Novel deleted or private".into()));
+                            Err(NarouError::NotFound("Novel deleted or private".into()))
+                        } else {
+                            Ok(body)
                         }
-                        Ok(body)
                     }
                     Err(error) => Err(error),
                 }
@@ -1505,7 +1507,7 @@ impl Downloader {
                                 break;
                             }
                         }
-                    } else if retried.is_ok() {
+                    } else if retried.is_ok() && !should_retry_with_login(&setting, &retried) {
                         requires_login = true;
                         login_session = Some(group.id.clone());
                         toc_source = retried;
@@ -1520,6 +1522,9 @@ impl Downloader {
                     apply_login_cookie(&mut setting, &winner.merged_cookie(), &winner.cookies);
                 }
             }
+        }
+        if toc_source.is_ok() && should_retry_with_login(&setting, &toc_source) {
+            toc_source = Err(NarouError::NotFound("Novel deleted or private".into()));
         }
         let toc_source = match toc_source {
             Ok(source) => source,

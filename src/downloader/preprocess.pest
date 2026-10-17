@@ -17,6 +17,7 @@ stmt = {
     | if_stmt
     | for_stmt
     | emit_stmt
+    | fail_stmt
     | insert_stmt
 }
 
@@ -24,6 +25,7 @@ guard_stmt  = { "guard" ~ string }
 let_stmt    = { "let" ~ ident ~ "=" ~ expr }
 set_stmt    = { "set" ~ lvalue ~ "=" ~ expr }
 emit_stmt   = { "emit" ~ expr }
+fail_stmt   = { "fail" ~ expr }
 insert_stmt = { "insert_at_match" }
 
 if_stmt = {
@@ -60,9 +62,11 @@ add_op     = { "+" | "-" }
 primary = _{
     string
     | extract_json_expr
+    | extract_expr
     | call_chain_expr
     | request_expr
     | fetch_json_expr
+    | post_form_expr
     | chain_expr
     | array_chain_expr
     | array_literal
@@ -73,6 +77,7 @@ primary = _{
 
 // --- JSON extraction ---
 extract_json_expr = { "extract_json" ~ "(" ~ regex ~ ")" }
+extract_expr = { "extract" ~ "(" ~ regex ~ ")" }
 
 // --- extra fetch request ---
 // 追加の取得要求。実行は async 側 (サイトの FetchPolicy 経由) が行い、結果は
@@ -80,8 +85,9 @@ extract_json_expr = { "extract_json" ~ "(" ~ regex ~ ")" }
 request_expr = { "request" ~ "(" ~ string ~ ")" }
 // 取得要求と結果参照の糖衣。未解決・失敗なら null を返す。
 fetch_json_expr = { "fetch_json" ~ "(" ~ string ~ ")" }
+post_form_expr = { "post_form" ~ "(" ~ string ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
 // `fetch_json(...).body[0].urls.original` のように呼び出し結果を辿る形。
-call_chain_expr = { (request_expr | fetch_json_expr) ~ chain_part+ }
+call_chain_expr = { (request_expr | fetch_json_expr | post_form_expr) ~ chain_part+ }
 
 // --- accessor + method chain ---
 chain_expr = { ident ~ chain_part* }
