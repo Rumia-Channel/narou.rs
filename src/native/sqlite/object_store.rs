@@ -397,6 +397,30 @@ impl SqliteObjectStore {
         Ok(written)
     }
 
+    pub(crate) fn list_direct_files(&self, prefix: &ObjectKey) -> Result<Vec<ObjectKey>> {
+        let start = format!("{prefix}/");
+        let end = prefix_upper_bound(&start);
+        let mut keys = Vec::new();
+        {
+            let conn = self.conn.lock();
+            let mut statement = conn.prepare(
+                "SELECT object_key FROM objects
+                 WHERE object_key >= ?1 AND object_key < ?2
+                   AND instr(substr(object_key, length(?1) + 1), '/') = 0
+                 ORDER BY object_key",
+            ).map_err(super::sqlite_error)?;
+            let rows = statement.query_map([&start, &end], |row| row.get::<_, String>(0))
+                .map_err(super::sqlite_error)?;
+            for row in rows {
+                keys.push(ObjectKey::try_new(row.map_err(super::sqlite_error)?)?);
+            }
+        }
+        keys.extend(self.mirror.list_direct_files(prefix)?);
+        keys.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        keys.dedup();
+        Ok(keys)
+    }
+
     fn list_blocking(&self, request: &ObjectListRequest) -> Result<ObjectListPage> {
         let mut merged: BTreeMap<String, ObjectMetadata> = BTreeMap::new();
         // Restrict the scan to the prefix's primary-key range (plus the exact

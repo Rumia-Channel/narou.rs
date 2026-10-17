@@ -171,41 +171,25 @@ fn expected_section_stems(toc: &narou_rs::downloader::TocFile) -> HashSet<String
 
 /// ストア上の不要オブジェクト (raw/ と本文/ の直下) を (表示パス, キー) で返す。
 fn collect_store_orphans(
-    store: &dyn narou_rs::platform::ObjectStore,
+    store: &narou_rs::native::object_store::NativeStore,
     prefix: &narou_rs::platform::ObjectKey,
     novel_dir: &Path,
     expected: &HashSet<String>,
 ) -> Result<Vec<(PathBuf, narou_rs::platform::ObjectKey)>, String> {
-    let prefix_text = prefix.as_ref();
-    let child_prefix = format!("{prefix_text}/");
-    let mut cursor: Option<String> = None;
+    let child_prefix = format!("{prefix}/");
     let mut orphans = Vec::new();
-    loop {
-        let request = narou_rs::platform::ObjectListRequest::new(
-            narou_rs::platform::ObjectPrefix::new(prefix_text).map_err(|e| e.to_string())?,
-            std::num::NonZeroUsize::new(512).expect("page size is non-zero"),
-        );
-        let request = match &cursor {
-            Some(next) => request.after(next.clone()),
-            None => request,
-        };
-        let page =
-            futures::executor::block_on(narou_rs::platform::ObjectStore::list_page(store, &request))
-                .map_err(|e| e.to_string())?;
-        for metadata in &page.objects {
-            let key_text = metadata.key.as_ref();
-            let Some(relative) = key_text.strip_prefix(&child_prefix) else {
+    for dir in [RAW_DATA_DIR, SECTION_SAVE_DIR] {
+        let directory = prefix.join(dir).map_err(|e| e.to_string())?;
+        for key in store.list_direct_files_sync(&directory).map_err(|e| e.to_string())? {
+            let Some(relative) = key.as_ref().strip_prefix(&child_prefix) else {
                 continue;
             };
-            let Some((dir, name)) = relative.split_once('/') else {
+            let Some((_, name)) = relative.split_once('/') else {
                 continue;
             };
-            if name.contains('/') {
-                continue;
-            }
             let wanted = match dir {
-                "raw" => matches!(lower_extension(name).as_str(), "html" | "txt"),
-                "本文" => lower_extension(name) == "yaml",
+                RAW_DATA_DIR => matches!(lower_extension(name).as_str(), "html" | "txt"),
+                SECTION_SAVE_DIR => lower_extension(name) == "yaml",
                 _ => false,
             };
             if !wanted {
@@ -218,11 +202,7 @@ fn collect_store_orphans(
                 continue;
             }
             let path = novel_dir.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-            orphans.push((path, metadata.key.clone()));
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
+            orphans.push((path, key));
         }
     }
     Ok(orphans)
@@ -327,14 +307,13 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    /// ストア上だけにある本文/raw の孤児を検出できること
-    /// (mirror-files=false でも clean が空振りしない)。
     #[test]
     fn clean_store_orphans_detect_unreferenced_objects() {
-        use narou_rs::platform::mocks::MemoryObjectStore;
+        use narou_rs::native::object_store::{NativeObjectStore, NativeStore};
         use narou_rs::platform::{ObjectKey, ObjectStore};
 
-        let store = MemoryObjectStore::new();
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeStore::Fs(NativeObjectStore::from_root(temp.path().to_path_buf()).unwrap());
         let prefix = ObjectKey::try_new("novels/site/title").unwrap();
         futures::executor::block_on(async {
             for (key, body) in [

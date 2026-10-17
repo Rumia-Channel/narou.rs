@@ -207,3 +207,81 @@ fn sqlite_db_only_convert_reads_stored_inputs_and_persists_output() {
         .collect::<Result<_, _>>().unwrap();
     assert_eq!(keys_after, keys_before, "failed clean must preserve every stored object");
 }
+
+#[test]
+fn sqlite_clean_all_removes_only_current_orphans_and_skips_frozen_novels() {
+    for mirror_files in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for relative in [".narou", "home/.narousetting", "tmp"] {
+            std::fs::create_dir_all(root.join(relative)).unwrap();
+        }
+        std::fs::write(root.join(".narou/storage-backend"), "sqlite\n").unwrap();
+        std::fs::write(root.join(".narou/local_setting.yaml"),
+            format!("sqlite.mirror-files: {mirror_files}\n")).unwrap();
+        std::fs::write(root.join("home/.narousetting/global_setting.yaml"), "{}\n").unwrap();
+        std::fs::write(root.join(".narou/database.yaml"),
+            "1:\n  id: 1\n  title: 作品\n  author: 著者\n  file_title: 作品\n  toc_url: https://mock.test/1/\n  sitename: mock.test\n  last_update: '2026-10-17T00:00:00Z'\n2:\n  id: 2\n  title: 凍結作品\n  author: 著者\n  file_title: 凍結作品\n  toc_url: https://mock.test/2/\n  sitename: mock.test\n  last_update: '2026-10-17T00:00:00Z'\n").unwrap();
+        std::fs::write(root.join(".narou/freeze.yaml"), "2: '2026-10-17 00:00:00 +09:00'\n").unwrap();
+        let archive = root.join("小説データ");
+        let active = archive.join("mock.test/作品");
+        for title in ["作品", "凍結作品"] {
+            let novel = archive.join("mock.test").join(title);
+            for relative in ["本文/cache/v1", "raw/cache/v1", "挿絵"] {
+                std::fs::create_dir_all(novel.join(relative)).unwrap();
+            }
+            std::fs::write(novel.join("toc.yaml"),
+                "title: 作品\nauthor: 著者\ntoc_url: https://mock.test/1/\nsubtitles:\n- index: '1'\n  href: /1/1/\n  subtitle: keep\n  file_subtitle: keep\n  chapter: ''\n  subchapter: ''\n  subdate: ''\n").unwrap();
+            for (name, body) in [
+                ("本文/1 keep.yaml", "current body"),
+                ("本文/9 orphan.yaml", "orphan body"),
+                ("raw/1 keep.html", "current raw"),
+                ("raw/9 orphan.HTML", "orphan raw"),
+                ("raw/cache/v1/9 orphan.txt", "old raw"),
+                ("挿絵/9 orphan.png", "illustration"),
+            ] {
+                std::fs::write(novel.join(name), body).unwrap();
+            }
+        }
+        for index in 0..513 {
+            std::fs::write(active.join(format!("本文/cache/v1/{index} old.yaml")), "old body").unwrap();
+        }
+        let imported = run_sqlite(root, &["list"]);
+        assert!(imported.status.success(), "{}", String::from_utf8_lossy(&imported.stderr));
+        if mirror_files {
+            std::fs::remove_file(active.join("本文/9 orphan.yaml")).unwrap();
+            std::fs::remove_file(active.join("raw/9 orphan.HTML")).unwrap();
+        } else {
+            std::fs::remove_dir_all(&archive).unwrap();
+        }
+        // Legacy files can appear after import; the database-only orphans above
+        // and this filesystem-only orphan must both be found.
+        std::fs::create_dir_all(active.join("raw")).unwrap();
+        let late = active.join("raw/10 late.txt");
+        std::fs::write(&late, "late orphan").unwrap();
+        let connection = rusqlite::Connection::open(root.join(".narou/db.sqlite")).unwrap();
+        let snapshot = || {
+            connection.prepare("SELECT object_key, data, encoding, size, crc32 FROM objects ORDER BY object_key")
+                .unwrap().query_map([], |row| Ok((
+                    row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?,
+                ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        let before = snapshot();
+        let preview = run_sqlite(root, &["clean", "-afn"]);
+        assert!(preview.status.success(), "{}{}", String::from_utf8_lossy(&preview.stdout), String::from_utf8_lossy(&preview.stderr));
+        assert_eq!(snapshot(), before, "dry-run must not change canonical objects");
+        assert!(late.is_file());
+        let cleaned = run_sqlite(root, &["clean", "-af"]);
+        assert!(cleaned.status.success(), "{}{}", String::from_utf8_lossy(&cleaned.stdout), String::from_utf8_lossy(&cleaned.stderr));
+        let expected: Vec<_> = before.into_iter().filter(|row| {
+            row.0 != "novels/mock.test/作品/本文/9 orphan.yaml"
+                && row.0 != "novels/mock.test/作品/raw/9 orphan.HTML"
+        }).collect();
+        assert_eq!(snapshot(), expected,
+            "current sections, cached versions, illustrations and all frozen-novel objects must remain");
+        assert!(!late.exists());
+        assert!(!active.join("本文/9 orphan.yaml").exists());
+        assert!(!active.join("raw/9 orphan.HTML").exists());
+    }
+}

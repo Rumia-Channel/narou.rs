@@ -829,6 +829,7 @@ SQLite のミラー無効時も本文・設定・挿絵を保存先からスコ�
 **互換メモ**:
 - Ruby版は `raw/*.txt` を対象にするが、Rust 側の保存形式は `raw/*.html` のため両方を orphan 対象に含めた
 - SQLite のミラー無効時も TOC と保存済みキーから孤児を検出し、ObjectStore の不要な本文・raw を削除する。
+- `clean` は `raw/` と `本文/` の直下だけを列挙する。SQLite ではキーの索引範囲を使い、履歴キャッシュ・挿絵の再帰走査やページごとの全件再走査を行わない。DB にだけ残る孤児と、取込後に追加された実ファイルの孤児の両方を対象にし、凍結・dry-run の扱いは維持する（issue #38）。
 - target 解決は ID / URL / Nコード / タイトル / alias / tag 展開を共通パイプラインで処理
 - `sample\\novel` で `clean`, `clean <alias>`, `clean -f`, `clean --all`, `clean --all -f` を実行し、作為的 orphan の検出と削除を確認済み
 
