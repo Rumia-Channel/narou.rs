@@ -16,15 +16,16 @@ over18_pattern: ^alphapolis_r18::1$
 append_title_to_folder_name: yes
 title_strip_pattern: null
 sitename: *name
-version: 1.3
+version: 1.4
 min_interval: 2
 # 元ページの CSRF セッションを本文の POST に引き継ぐ。
 cookie_session: true
 headers:
   X-Requested-With: XMLHttpRequest
 login_url: \\k<top_url>/login
-login_pattern: '<form\b[^>]*id="UserLoginForm"|(?m:^alphapolis_login_required::1$)'
-error_message: '<form\b[^>]*id="UserLoginForm"|(?m:^alphapolis_login_required::1$)'
+login_pattern: '<form\b[^>]*id="UserLoginForm"'
+error_message: '<form\b[^>]*id="UserLoginForm"'
+login_partial_pattern: '(?m:^alphapolis_partial::1$)'
 
 preprocess: |-
   guard "AlphapolisPreprocessed"
@@ -66,23 +67,30 @@ preprocess: |-
       emit "alphapolis_title::${cover.content.title.gsub(/[\r\n]+/, " ")}"
       emit "alphapolis_author::${cover.content.user.name.gsub(/[\r\n]+/, " ")}"
       let count = 0
+      let partial = 0
       for chapter in cover.chapterEpisodes
-        if chapter.title
-          emit "Chapter;${chapter.title.gsub(/[\r\n]+/, " ")}"
-        end
+        let chapter_title = chapter.title
         for episode in chapter.episodes
-          # 未契約の話はログイン壁として再試行し、権利が無ければ失敗させる。
           if !episode.isPublic && !episode.rental.isFree && !episode.rental.isOnRental
-            emit "alphapolis_login_required::1"
+            let partial = 1
+          else
+            # 章の先頭が未レンタルでも、最初に閲覧できる話に章名を付ける。
+            if chapter_title
+              emit "Chapter;${chapter_title.gsub(/[\r\n]+/, " ")}"
+              let chapter_title = null
+            end
+            emit "Episode;${episode.episodeNo};${episode.url};${episode.upTime.replace(".", "-")};${episode.mainTitle.gsub(/[\r\n]+/, " ")}"
+            let count = count + 1
           end
-          emit "Episode;${episode.episodeNo};${episode.url};${episode.upTime.replace(".", "-")};${episode.mainTitle.gsub(/[\r\n]+/, " ")}"
-          let count = count + 1
         end
         if chapter.extraEpisode
           fail "電子書籍の特典話は取得できません"
         end
       end
       emit "alphapolis_count::${count}"
+      if partial
+        emit "alphapolis_partial::1"
+      end
 
       let rating = extract_json(/dataLayer\.push\(\{"gtm_novel_cont_view_array":(\{[^\n]+\})\}\);/)
       if rating.r_rated_flag

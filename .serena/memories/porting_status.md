@@ -32,16 +32,17 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 
 ## 未リリース: アルファポリスとログイン Cookie
 
-- `webnovel/www.alphapolis.co.jp.yaml` (version 1.3) を追加。小説トップ・各話 URL を作品トップへ正規化し、`app-cover-data` の配列順で章と全話を読む。題名・作者・あらすじ・タグ・日時・文字数・完結・R18 判定、本文の CSRF フォーム送信、作者一覧とページ送りは YAML / DSL に置き、サイト専用の Rust 分岐は追加しない。
+- `webnovel/www.alphapolis.co.jp.yaml` (version 1.4) を追加・更新。小説トップ・各話 URL を作品トップへ正規化し、`app-cover-data` の配列順で章と閲覧可能な話を読む。未レンタル話は `login_partial_pattern` で検出し、無料公開・レンタル済み分だけを取得する。章名は最初に閲覧できる話へ付け、全話が閲覧不可の章は出力しない。題名・作者・あらすじ・タグ・日時・文字数・完結・R18 判定、本文の CSRF フォーム送信、作者一覧とページ送りは YAML / DSL に置き、サイト専用の Rust 分岐は追加しない。
 - 汎用 DSL に `extract(/.../)` / `post_form(url, fields, headers?)` / `fail` を追加。フォームは同一 origin のみ、資格情報ヘッダ注入は拒否。URL・本文・ヘッダで要求を区別し、結果は 1 回の前処理だけ保持する（257 話の同一 POST 先でも混同・累積しない）。失敗時に途中の source を公開しない。
 - `cookie_session: true` は FetchPolicy 内だけの Cookie を origin・Path・Secure・期限で制限する。保存ログインとは分離。`illust_from_raw: false` は解析済み本文・前後書きだけを走査し、空の reader ページにある UI 画像を取らない。実取得で `data:image` を URL として要求した問題を再現し、本文画像だけの実体・索引保存を回帰で確認した。
 - 指定作品 `166360898/202065994` は実 Native CLI で全 36 話保存・更新なし・青空テキスト 32,556 文字・Lite EPUB 65 エントリとルビを確認。指定作者は 17 URL の集合を照合し、取得済み 1 件を除く 16 件を実 `author check --dry-run` で確認。別作者 `670425836` は 2 ページの 39 作品を列挙。短い作品 `260002762/818069876` も目次 3 話と本文を実取得した。
-- R18 指定作 `528033569/927510111` は新規の匿名 Cookie セッションで HTTP 200、目次 4 話・第 1 話本文 6,175 bytes を取得でき、ログイン必須ではなかった。既存 `over18=false` は取得を拒否してレコードを作らない。閲覧不可のレンタル話は YAML がログイン壁を出し、保存済みを試しても権利が無ければ失敗する。電子書籍特典は未対応。
+- `666146886/441062651` の未レンタル話を含む目次で全体が NotFound になることを匿名・保存 Cookie の両方で再現し、YAML で部分取得へ修正。実 CLI で無料公開 167 話・22 区分を保存し、ユーザーがレンタルした 6巻4話 (`1639957`) を通常の update で追加、合計 168 話・`requires_login=true` と session ID の保存を確認。既存 167 本文はハッシュ不変。青空テキストと Lite EPUB の 22 大見出し・168 話見出しを順序まで照合し、全ナビゲーション先と ZIP CRC が正常 (414 エントリ)。再更新は変更なし、目次と本文 169 ファイルのハッシュ不変。
+- R18 指定作 `528033569/927510111` は新規の匿名 Cookie セッションで HTTP 200、目次 4 話・第 1 話本文 6,175 bytes を取得でき、ログイン必須ではなかった。既存 `over18=false` は取得を拒否してレコードを作らない。未レンタル話が残っても取得範囲を警告して閲覧可能分を保存し、保存済みの話が欠ける部分一覧では更新を見送る。電子書籍特典は未対応。
 - `narou_rs_login` は親ドメイン・作者/トップ URL でもサイトを選択する。末尾 2 ラベルだけでは他の `*.co.jp` まで同じログインへ混入することを failing-before で確認し、`psl` による登録ドメイン判定へ置換。Cookie の収集・サイト名への畳み・親ホスト検索を修正した。新規依存 `psl` と probe lock、直接依存 57 件の表、GPL / 非 GPL notice を同期。
 - 共通 downloader の「prefetched GET のログイン壁で fallback 前に return」「HTTP 200 の壁が残る資格情報を採用」「error_message が無い壁から題名なし・0 話で成功登録」を再現し修正。親ドメインの Cookie、期限切れ→有効な資格情報の選択、本文フォームへの適用、session ID 保存、次回先頭からの利用を回帰で確認。helper の保存後検証も共通 fetch / YAML 前処理へ統一した。
-- 実 Edge のまっさらなプロファイルで `www.alphapolis.co.jp` 4 Cookie + 親ドメイン 1 Cookie を取得し、1 ログイン・2 ホストで暗号化保存、暗号化 version 3 export、実 CLI import/list、保存 Cookie 付き作品取得確認まで成功。Chrome はこの環境で DevTools ポートへ接続できず、Edge を明示指定した。本人アカウントへのサインインと購入済み本文は未検証。
-- 検証先は Documents/WebNovel 内にユーザー許可の検証専用領域を用意し、その下を Rust TempDir が所有。元ライブラリの ACL は維持し、専用領域だけに workspace sandbox の書込み・Low integrity を付けた。実データ・Cookie・ブラウザプロファイルは検証終了時に削除し、使い捨てソースも除去した。
-- 最終 Native workspace / all-targets / all-features は 1,360 成功・参照 fixture 1 ignored。Native 全 feature と Worker Wasm の Clippy `-D warnings`、Rustdoc `-D warnings`、非 GPL probe check、両 notice 再生成と直接依存表チェックが成功。コマンド集計は 24 完了 / 4 部分 / 0 未実装を維持する。実 Cloudflare 上の取得・配備はこの結果に含めない。
+- 実 Edge のまっさらなプロファイルで `www.alphapolis.co.jp` 4 Cookie + 親ドメイン 1 Cookie を取得し、1 ログイン・2 ホストで暗号化保存、暗号化 version 3 export、実 CLI import/list、保存 Cookie 付き作品取得確認まで成功。Chrome はこの環境で DevTools ポートへ接続できず、Edge を明示指定した。追加検証ではユーザーの実アカウント Cookie でサイトの `login_status=true` とレンタル済み本文の取得を確認。購入・レンタル操作そのものはユーザーが行い、検証プログラムからは実行していない。
+- 先行の使い捨て検証は Documents/WebNovel 配下の専用領域と Rust TempDir を使い、元ライブラリの ACL は維持した。専用領域のブラウザプロファイル・使い捨てソースは削除済み。今回ユーザーが保存したログイン Cookie と、実ライブラリの ID:25 の本文・EPUB は保持している。
+- 今回の Native workspace / all-targets / all-features は分割実行で 1,367 成功（lib 1,135 + bin / integration / examples 232）・参照 fixture 1 ignored。全 target Clippy `-D warnings` と Worker Wasm check が成功。Alpha/NEXT の対象回帰は 14 成功。依存・ライセンスは今回変更なし。コマンド集計は 24 完了 / 4 部分 / 0 未実装を維持する。実 Cloudflare 上の取得・配備はこの結果に含めない。
 
 ## 未リリース: Workers の本文を S3 基本にする
 
