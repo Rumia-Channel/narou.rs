@@ -780,6 +780,7 @@ narou setting name         # 読み取り
 - 一覧 API の `new_arrivals` 判定は `webnovel/*.yaml` の `timezone` に合わせたサイト現地時刻で行い、`domain` 未保存の既存データは `toc_url` のドメインからサイト定義を解決する
 - favicon は data URL で埋め込み、追加 route なしでブラウザ 404 を出さない
 - バージョン別の機能ツアーを `GET /api/feature_tour/pending` / `GET /api/feature_tour/all` / `POST /api/feature_tour/seen` / `POST /api/feature_tour/config` で提供し、アップデート後に新機能を Web UI で告知する。SQLite 管理への移行はツアー経由の opt-in で、`GET/POST /api/storage/mode` がモードの読み書きを担う（CLI 側の保守コマンドは `narou db`）
+- 0.4.13 の機能ツアーはアルファポリスの小説・作者一覧対応とカクヨムネクスト対応を告知する。無料分の取得とレンタル・契約に応じたログイン Cookie の利用、閲覧制限による既存本文の保護を案内し、既読後は自動再表示しない。ツアー定義は Native / Worker 共通
 - 設定画面のデータ管理方式は描画後・保存後の再描画時に取得し、固定環境では切替ボタンを隠す。Workers の保存前読み取りは primary を使い、replica／isolate キャッシュの古い値を書き戻さない。メモ帳は `object_id` 検査に加えて条件付き UPSERT で同時保存を排他し、負けた要求に最新本文を含む競合応答を返す。
 - native / Worker が共通 capability payload を返し、Worker で実行できない CSV・送信・mail・端末操作・調査ログ・キュー並べ替え等は UI から実行できないようにする。直接 API の拒否も通知し、成功として扱わない。
 - Worker の `concurrency` はコンソール分離（既定 true）、`convert.keep-txt` は既定 false、`queue.max-retries` は配備上限 3 と表示・保存検証を一致させる。native 専用の `s3.*` は表示せず、ミラー・話キャッシュ・外部 EPUB エンジン等は無効化し、API からも変更を拒否する。
