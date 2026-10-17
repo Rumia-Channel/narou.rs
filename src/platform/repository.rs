@@ -44,6 +44,32 @@ impl From<NovelId> for i64 {
     }
 }
 
+/// An owned, generation-fenced reservation for an unpublished novel ID.
+///
+/// Publish a record with this ID, or return the reservation through
+/// [`NovelRepository::release_id`]. The generation prevents a delayed release
+/// from freeing the same numeric ID after another download has reserved it.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "Publish the reserved record or release the unused ID reservation"]
+pub struct NovelIdReservation {
+    id: NovelId,
+    generation: i64,
+}
+
+impl NovelIdReservation {
+    pub fn new(id: NovelId, generation: i64) -> Self {
+        Self { id, generation }
+    }
+
+    pub fn id(&self) -> NovelId {
+        self.id
+    }
+
+    pub fn generation(&self) -> i64 {
+        self.generation
+    }
+}
+
 /// Which field a [`SearchTerm`] matches against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchField {
@@ -322,10 +348,16 @@ pub trait NovelRepository: PlatformService {
         limit: usize,
     ) -> PlatformFuture<'a, crate::error::Result<Vec<NovelId>>>;
 
-    /// Atomically reserve a unique novel id. Native keeps the existing
-    /// `max + 1` behaviour under the database lock; D1 uses a sequence
-    /// table / atomic SQL. Gaps in the sequence are fine.
-    fn allocate_id(&self) -> PlatformFuture<'_, crate::error::Result<NovelId>>;
+    /// Atomically reserve a unique novel ID. Unpublished reservations returned
+    /// through `release_id` are reused; committed IDs are never released.
+    fn allocate_id(&self) -> PlatformFuture<'_, crate::error::Result<NovelIdReservation>>;
+
+    /// Return an unused reservation without freeing a committed ID or a newer
+    /// reservation of the same numeric ID. Safe after ambiguous write failures.
+    fn release_id(
+        &self,
+        reservation: NovelIdReservation,
+    ) -> PlatformFuture<'_, crate::error::Result<()>>;
 
     /// Apply several mutations atomically and persist once.
     fn apply_batch<'a>(

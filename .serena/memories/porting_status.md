@@ -26,7 +26,7 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 - 共通 downloader は部分一覧に保存済みの ID が欠ける場合、削除・ダイジェスト化・404 凍結とは判定せず `Canceled` で更新を見送る。force でも目次・本文を保持し、閲覧可能 0 話の部分一覧は空の小説として登録しない。ファイル出力名の変更もこの判定後に行う。警告は共通 `application::messages::download` から出す。
 - 本文 URL が作品トップへ戻され、本文枠が無い場合は YAML / DSL の `fail` で止め、空本文をキャッシュ・保存しない。`extract` は既存例と同じく `let` で受け取る（条件式内の直接呼び出しは評価されない）。
 - 指定作品 `2912051601247823656` は匿名の実ページで全 129 話のうち `Episode` 50 / `EmptyEpisode` 79。実 Native CLI で無料 50 話の本文ファイルと目次、レコードの `general_all_no=50`、Lite EPUB 65 エントリを確認し、再更新は変更なし。通常作品 `2912051601856437328` も 2 話の実取得・EPUB 生成が成功。制限された第 51 話は作品トップへ戻り、直接本文を取る経路でもエラーになることを確認した。
-- 実 Edge と `narou_rs_login` がカクヨムのログイン画面を開くことを確認。未ログインの新規プロファイルには保存対象の Cookie が無く、失敗して空のログインを登録しない。有効なアカウントへのサインイン、Cookie の実取得・取り込み、契約付き全 129 話の実取得は未検証。Edge は Windows の `USERPROFILE` を架空の空ホームへ変えると DevTools 起動に失敗するため、ブラウザは実環境を継承して `--profile` のみ隔離する。
+- 実 Edge と `narou_rs_login` がカクヨムのログイン画面を開くことを確認。ユーザーが NEXT 契約アカウントの Cookie を取得した後、実ライブラリ ID:24 (`2912051601247823656`) で匿名の無料 50 話から全 129 話へ取得範囲が増え、本文・EPUB・再更新の変更なしを確認した。資格情報と本文は実ライブラリへ保持する。Edge は Windows の `USERPROFILE` を架空の空ホームへ変えると DevTools 起動に失敗するため、ブラウザは実環境を継承して `--profile` のみ隔離する。
 - `tests/kakuyomu_login.rs` の 6 件で、匿名・権利なしの無料分、資格情報の試行・セッション ID 再利用、無料分からの追加取得、権利失効後の保持（force 含む）、0 話拒否、公開作品への Cookie 非送信、制限画面の空本文化防止を確認。変更前の失敗を確認してから修正した。Native workspace / all-targets / all-features は 1,366 成功・参照 fixture 1 ignored、Native / Worker Wasm Clippy と Rustdoc は `-D warnings` で成功。
 - 実サイト検証は Documents/WebNovel 配下の専用領域と Rust TempDir で行い、元ライブラリの ACL は変更しない。unit suite の `TEMP` / `TMP` は workspace `target` に向ける（通常の TEMP は sandbox 書込み不可、WebNovel 配下だと「未初期化」のテストが祖先の `.narou` を発見してしまう）。コマンド集計は 24 完了 / 4 部分 / 0 未実装を維持する。実 Cloudflare 配備・取得は今回の検証に含めない。
 
@@ -43,6 +43,14 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 - 実 Edge のまっさらなプロファイルで `www.alphapolis.co.jp` 4 Cookie + 親ドメイン 1 Cookie を取得し、1 ログイン・2 ホストで暗号化保存、暗号化 version 3 export、実 CLI import/list、保存 Cookie 付き作品取得確認まで成功。Chrome はこの環境で DevTools ポートへ接続できず、Edge を明示指定した。追加検証ではユーザーの実アカウント Cookie でサイトの `login_status=true` とレンタル済み本文の取得を確認。購入・レンタル操作そのものはユーザーが行い、検証プログラムからは実行していない。
 - 先行の使い捨て検証は Documents/WebNovel 配下の専用領域と Rust TempDir を使い、元ライブラリの ACL は維持した。専用領域のブラウザプロファイル・使い捨てソースは削除済み。今回ユーザーが保存したログイン Cookie と、実ライブラリの ID:25 の本文・EPUB は保持している。
 - 今回の Native workspace / all-targets / all-features は分割実行で 1,367 成功（lib 1,135 + bin / integration / examples 232）・参照 fixture 1 ignored。全 target Clippy `-D warnings` と Worker Wasm check が成功。Alpha/NEXT の対象回帰は 14 成功。依存・ライセンスは今回変更なし。コマンド集計は 24 完了 / 4 部分 / 0 未実装を維持する。実 Cloudflare 上の取得・配備はこの結果に含めない。
+
+## 未リリース: DL 失敗時の ID 予約回収
+
+- 新規取得前に進めた ID を失敗時に戻さない問題を、404 の後の成功が ID:1 になる failing-before 回帰で再現。`NovelRepository::allocate_id` を ID + 世代番号の `NovelIdReservation` に変更し、未登録のエラー・キャンセル・保留と、既存作品へ解決された不要な予約を `release_id` で返す。既存作品・過去の欠番は詰め直さない。
+- Native Database / Memory repository は共通 allocator、SQLite / D1 adapter は migration 0013 と共通 SQL を使う。並行予約は一意、古い世代の解放は無効。upsert が予約を確定し、レコードが存在する ID はエラー後も再利用しない。登録済み ID を削除しても過去の予約から復活させない。
+- 実 CLI の YAML / SQLite 両モードで、同一バッチの存在しない作品 → 公開 3 話の作品が ID:0 に登録され、失敗を含む終了コード 1 と、その後の既存 ID 更新を確認。検証は Documents/WebNovel 配下の Rust TempDir で隔離し、元ライブラリや資格情報は変更しない。
+- 実 Miniflare / workerd のローカル D1 で production の予約 SQL と migration 0013 を実行し、16 並行予約の一意性・解放した 8 件だけの再利用・古い解放要求の拒否・登録済み/使用中 ID の保護・手動登録後の採番境界を確認。Worker handler からも同じ状態を読み出せた。実 Cloudflare 配備やリモート D1 での検証ではない。使い捨てソース・npm ツール領域・検証ライブラリは削除済み。
+- Native workspace / all-targets / all-features は 1,366 成功・参照 fixture 1 ignored。新 migration の追加で壊れた「最新版は 12」という実装依存 assertion は削除し、v6 / v8 の実データ保存と失敗時の rollback 回帰は維持した。Native 全 target Clippy と Worker Wasm Clippy は `-D warnings`、Worker Wasm check も成功。依存・ライセンス・版数は変更せず、コマンド集計は 24 完了 / 4 部分 / 0 未実装を維持する。
 
 ## 未リリース: Workers の本文を S3 基本にする
 

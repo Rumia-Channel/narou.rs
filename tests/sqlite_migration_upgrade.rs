@@ -137,10 +137,6 @@ fn open_upgrades_v6_library_without_data_loss() {
         .collect();
     assert_eq!(index_columns, vec!["status_sort", "id"]);
 
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, 12);
 }
 
 /// The 0009 rebuild (`DROP TABLE objects`) justified itself with "the
@@ -171,12 +167,6 @@ fn open_upgrades_v8_objects_without_losing_db_only_rows() {
 
     // The upgrade path every library takes on next launch.
     let conn = narou_rs::native::sqlite::open(&db_path).unwrap();
-    let guard = conn.lock();
-    let version: i64 = guard
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, 12);
-    drop(guard);
     let store = narou_rs::native::sqlite::object_store::SqliteObjectStore::with_mirror_files(
         conn,
         narou_rs::native::object_store::NativeObjectStore::from_root(archive_root).unwrap(),

@@ -1298,19 +1298,45 @@ impl Downloader {
     pub async fn download_novel_with_execution_options(
         &mut self,
         target: &str,
+        options: DownloadExecutionOptions<'_>,
+    ) -> Result<DownloadResult> {
+        // Preprocess job results belong to one novel: a new download starts
+        // with an empty set so nothing leaks between works.
+        self.preprocess_jobs.reset();
+        let (existing_id, setting) = self.resolve_target_for_download(target).await?;
+        let (provisional_id, reservation) = match existing_id {
+            Some(id) => (id, None),
+            None => {
+                let reservation = self.novels.allocate_id().await?;
+                (reservation.id().0, Some(reservation))
+            }
+        };
+        let result = self.download_novel_reserved(
+            target, options, existing_id, setting, provisional_id,
+        ).await;
+        if let Some(reservation) = reservation
+            && !matches!(&result, Ok(download) if download.status == UpdateStatus::Ok && download.id == reservation.id().0)
+            && let Err(release_error) = self.novels.release_id(reservation).await
+        {
+            return Err(match result {
+                Err(error) => NarouError::Platform(format!("{error}; 小説IDの予約を解放できませんでした: {release_error}")),
+                Ok(_) => release_error,
+            });
+        }
+        result
+    }
+
+    async fn download_novel_reserved(
+        &mut self,
+        target: &str,
         mut options: DownloadExecutionOptions<'_>,
+        existing_id: Option<i64>,
+        mut setting: SiteSetting,
+        provisional_id: i64,
     ) -> Result<DownloadResult> {
         let force = options.force;
         let resume_from_section = options.resume_from_section;
         let mut budget = options.budget.take();
-        // Preprocess job results belong to one novel: a new download starts
-        // with an empty set so nothing leaks between works.
-        self.preprocess_jobs.reset();
-        let (existing_id, mut setting) = self.resolve_target_for_download(target).await?;
-        let provisional_id = match existing_id {
-            Some(id) => id,
-            None => self.novels.allocate_id().await?.0,
-        };
 
         let db_toc_url = if let Some(id) = existing_id {
             self.novels

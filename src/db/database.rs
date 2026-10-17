@@ -16,7 +16,7 @@ pub struct Database {
     index: IndexStore,
     inventory: Inventory,
     archive_root: PathBuf,
-    next_id: i64,
+    id_allocator: crate::platform::id_allocator::IdAllocator,
     /// SQLite backend (P2). `None` when `NAROU_RS_LEGACY_YAML` is set or the
     /// database directory cannot host `db.sqlite`; then the legacy YAML path
     /// below runs unchanged.
@@ -130,7 +130,7 @@ impl Database {
             index: IndexStore::load(&inventory)?,
             inventory,
             archive_root,
-            next_id: 0,
+            id_allocator: crate::platform::id_allocator::IdAllocator::default(),
             #[cfg(feature = "native-runtime")]
             sqlite,
         };
@@ -228,9 +228,9 @@ impl Database {
                 &conn.lock(),
             )?;
             self.data = loaded.into_iter().collect();
-            if let Some(max_id) = self.data.keys().max().copied() {
-                self.next_id = self.next_id.max(max_id.saturating_add(1));
-            }
+            self.id_allocator.reconcile(
+                self.data.keys().max().copied(), |id| self.data.contains_key(&id),
+            );
             // 索引 (`by_toc_url` / `by_title`) はリレーショナル側の全件から作り直す。
             // `get_by_toc_url` / `find_by_title` は索引しか見ないため、SQLite モードで
             // 退避済みの `database_index.yaml` を引き継ぐと、既に登録済みの URL を
@@ -253,9 +253,9 @@ impl Database {
         } else {
             self.data.clear();
         }
-        if let Some(max_id) = self.data.keys().max().copied() {
-            self.next_id = self.next_id.max(max_id.saturating_add(1));
-        }
+        self.id_allocator.reconcile(
+            self.data.keys().max().copied(), |id| self.data.contains_key(&id),
+        );
         // SQLite モードは上で return するため、ここは YAML モードのみ。
         self.index.reconcile(&self.data);
         Ok(())
@@ -392,7 +392,7 @@ impl Database {
         let id = record.id;
         let toc_url = Some(record.toc_url.clone());
         let title = Some(record.title.clone());
-        self.next_id = self.next_id.max(id.saturating_add(1));
+        self.id_allocator.commit(id);
         self.data.insert(id, record);
         self.index.upsert(id, toc_url.as_deref(), title.as_deref());
     }
@@ -439,16 +439,14 @@ impl Database {
         self.data.values().find(|&record| record.title.to_lowercase() == lower).map(|v| v as _)
     }
 
-    /// Legacy read-only candidate; repository callers must use `allocate_id`.
-    pub fn create_new_id(&self) -> i64 {
-        self.next_id
+    /// Reserve an ID under the shared database lock until record publication.
+    pub fn allocate_id(&mut self) -> Result<crate::platform::NovelIdReservation> {
+        self.id_allocator.allocate()
     }
 
-    /// Reserve the next novel ID while the shared database lock is held.
-    pub fn allocate_id(&mut self) -> i64 {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-        id
+    pub fn release_id(&mut self, reservation: crate::platform::NovelIdReservation) {
+        let committed = self.data.contains_key(&reservation.id().0);
+        self.id_allocator.release(reservation, committed);
     }
 
     pub fn sort_by(&self, key: &str, reverse: bool) -> Vec<&NovelRecord> {
@@ -536,14 +534,6 @@ mod tests {
     use crate::db::novel_record::NovelRecord;
     use chrono::{TimeZone, Utc};
 
-    #[test]
-    fn database_parity_create_new_id_starts_at_zero() {
-        let _global = crate::test_support::global_state_guard();
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
-        let db = Database::with_inventory(Inventory::new(temp.path().to_path_buf())).unwrap();
-        assert_eq!(db.create_new_id(), 0);
-    }
 
     /// SQLite モードでも、開き直した後に toc_url / title で引けること。
     /// 索引をリレーショナル側のデータから作り直さないと、既に登録済みの URL を
@@ -662,7 +652,6 @@ mod tests {
         assert!(saved.contains("id: 0"));
         assert!(saved.contains("custom_flag: true"));
         assert!(saved.contains("answer: 42"));
-        assert_eq!(db.create_new_id(), 1);
     }
 
     #[test]

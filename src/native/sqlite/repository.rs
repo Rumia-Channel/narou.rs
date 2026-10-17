@@ -114,6 +114,8 @@ pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Res
         rusqlite::params![record.id.saturating_add(1), record.id.saturating_add(1)],
     )
     .map_err(super::sqlite_error)?;
+    conn.execute(novel_query::COMMIT_ID_RESERVATION_SQL, [record.id])
+        .map_err(super::sqlite_error)?;
     Ok(())
 }
 
@@ -259,16 +261,26 @@ impl NovelRepository for SqliteNovelRepository {
         }))
     }
 
-    fn allocate_id(&self) -> crate::platform::PlatformFuture<'_, Result<NovelId>> {
+    fn allocate_id(&self) -> crate::platform::PlatformFuture<'_, Result<crate::platform::NovelIdReservation>> {
         Box::pin(blocking(self.conn.clone(), |conn| {
             let tx = conn.transaction().map_err(super::sqlite_error)?;
             tx.execute(novel_query::ALLOCATE_STEP_SQL, [])
                 .map_err(super::sqlite_error)?;
-            let id: i64 = tx
-                .query_row(novel_query::ALLOCATE_READ_SQL, [], |row| row.get(0))
+            tx.execute(novel_query::ALLOCATE_BUMP_SQL, [])
+                .map_err(super::sqlite_error)?;
+            let (id, generation): (i64, i64) = tx
+                .query_row(novel_query::ALLOCATE_READ_SQL, [], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(super::sqlite_error)?;
             tx.commit().map_err(super::sqlite_error)?;
-            Ok(NovelId(id))
+            Ok(crate::platform::NovelIdReservation::new(NovelId(id), generation))
+        }))
+    }
+
+    fn release_id(&self, reservation: crate::platform::NovelIdReservation) -> crate::platform::PlatformFuture<'_, Result<()>> {
+        Box::pin(blocking(self.conn.clone(), move |conn| {
+            conn.execute(novel_query::RELEASE_ID_SQL, [reservation.id().0, reservation.generation()])
+                .map_err(super::sqlite_error)?;
+            Ok(())
         }))
     }
 
@@ -582,18 +594,59 @@ mod tests {
         }
     }
 
+    fn reservation_backends() -> [Arc<dyn NovelRepository>; 2] {
+        [
+            Arc::new(MemoryNovelRepository::new()),
+            Arc::new(SqliteNovelRepository::new(crate::native::sqlite::open_in_memory().unwrap())),
+        ]
+    }
+
     #[tokio::test]
-    async fn allocate_id_is_monotonic_after_upserts() {
-        let sqlite = SqliteNovelRepository::new(crate::native::sqlite::open_in_memory().unwrap());
-        sqlite
-            .apply_batch(vec![NovelMutation::Upsert(record(5, "x", "y", "u5", &[]))])
-            .await
-            .unwrap();
-        assert!(sqlite.get(NovelId(5)).await.unwrap().is_some());
-        let first = sqlite.allocate_id().await.unwrap();
-        let second = sqlite.allocate_id().await.unwrap();
-        assert_eq!(first.0, 6);
-        assert_eq!(second.0, 7);
+    async fn unused_ids_are_reused_without_freeing_live_or_committed_owners() {
+        for repository in reservation_backends() {
+            repository.apply_batch(vec![NovelMutation::Upsert(record(5,"seed","a","seed",&[]))]).await.unwrap();
+            let failed = repository.allocate_id().await.unwrap();
+            let stale = crate::platform::NovelIdReservation::new(failed.id(),failed.generation());
+            let live = repository.allocate_id().await.unwrap();
+            repository.release_id(failed).await.unwrap();
+            let retry = repository.allocate_id().await.unwrap();
+            assert_eq!(retry.id(),NovelId(6));
+            assert_eq!(live.id(),NovelId(7));
+            assert_ne!(retry.generation(),stale.generation());
+            repository.release_id(stale).await.unwrap();
+            assert_eq!(repository.allocate_id().await.unwrap().id(),NovelId(8));
+            let after_commit = crate::platform::NovelIdReservation::new(retry.id(),retry.generation());
+            repository.apply_batch(vec![NovelMutation::Upsert(record(retry.id().0,"registered","a","registered",&[]))]).await.unwrap();
+            repository.release_id(retry).await.unwrap();
+            assert_eq!(repository.get(NovelId(6)).await.unwrap().unwrap().title,"registered");
+            repository.apply_batch(vec![NovelMutation::Remove(NovelId(6))]).await.unwrap();
+            repository.release_id(after_commit).await.unwrap();
+            assert_eq!(repository.allocate_id().await.unwrap().id(),NovelId(9));
+            repository.apply_batch(vec![NovelMutation::Upsert(record(30,"manual","a","manual",&[]))]).await.unwrap();
+            assert_eq!(repository.allocate_id().await.unwrap().id(),NovelId(31));
+            assert_eq!(repository.get(NovelId(5)).await.unwrap().unwrap().title,"seed");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_allocations_only_reuse_released_unpublished_ids() {
+        for repository in reservation_backends() {
+            let reservations = futures::future::try_join_all((0..16).map(|_|repository.allocate_id())).await.unwrap();
+            let ids: std::collections::BTreeSet<_> = reservations.iter().map(|reservation|reservation.id().0).collect();
+            assert_eq!(ids.len(),16,"simultaneous reservations must be distinct");
+            let mut released = std::collections::BTreeSet::new();
+            for reservation in reservations {
+                if reservation.id().0%2==0 {
+                    released.insert(reservation.id().0);
+                    repository.release_id(reservation).await.unwrap();
+                } else {
+                    repository.apply_batch(vec![NovelMutation::Upsert(record(reservation.id().0,"committed","a","committed",&[]))]).await.unwrap();
+                }
+            }
+            let reused = futures::future::try_join_all((0..released.len()).map(|_|repository.allocate_id())).await.unwrap();
+            let ids: std::collections::BTreeSet<_> = reused.iter().map(|reservation|reservation.id().0).collect();
+            assert_eq!(ids,released);
+        }
     }
 
     #[tokio::test]

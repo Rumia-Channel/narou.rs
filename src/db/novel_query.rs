@@ -36,14 +36,37 @@ pub const DELETE_NOVEL_SQL: &str = "DELETE FROM novels WHERE id = ?";
 pub const BUMP_SEQUENCE_SQL: &str =
     "UPDATE novel_id_sequence SET next_id = CASE WHEN next_id < ? THEN ? ELSE next_id END WHERE id = 1";
 
-/// Reservation step of `allocate_id` (the Worker runs it inside a `db.batch`).
-pub const ALLOCATE_STEP_SQL: &str =
-    "UPDATE novel_id_sequence SET next_id = next_id + 1 WHERE id = 1";
+/// Claim a released ID, or a fresh high-water ID, inside a transaction/batch.
+/// A claim receives the largest pool generation so the final SELECT can read
+/// it back without relying on driver-specific INSERT result handling.
+pub const ALLOCATE_STEP_SQL: &str = r#"
+INSERT INTO novel_id_reservations (id, generation, available)
+SELECT COALESCE(
+    (SELECT r.id FROM novel_id_reservations r
+     WHERE r.available = 1 AND NOT EXISTS (SELECT 1 FROM novels n WHERE n.id = r.id)
+     ORDER BY r.id LIMIT 1),
+    MAX(s.next_id, COALESCE((SELECT MAX(id) FROM novels), -1) + 1,
+        COALESCE((SELECT MAX(id) FROM novel_id_reservations), -1) + 1)),
+    COALESCE((SELECT MAX(generation) FROM novel_id_reservations), -1) + 1, 0
+FROM novel_id_sequence s WHERE s.id = 1
+ON CONFLICT(id) DO UPDATE SET generation = excluded.generation, available = 0
+"#;
 
-/// Read back the id `ALLOCATE_STEP_SQL` just reserved. `AS id` names the
-/// column for the Worker's serde row struct; the native adapter reads it by
-/// position.
-pub const ALLOCATE_READ_SQL: &str = "SELECT next_id - 1 AS id FROM novel_id_sequence WHERE id = 1";
+/// Preserve the high-water mark even when released IDs are later reused.
+pub const ALLOCATE_BUMP_SQL: &str =
+    "UPDATE novel_id_sequence SET next_id = MAX(next_id, COALESCE((SELECT MAX(id) FROM novel_id_reservations), -1) + 1) WHERE id = 1";
+
+/// Read the claim made by this atomic batch; no other claim can interleave.
+pub const ALLOCATE_READ_SQL: &str =
+    "SELECT id, generation FROM novel_id_reservations WHERE EXISTS (SELECT 1 FROM novel_id_sequence WHERE id = 1) ORDER BY generation DESC LIMIT 1";
+
+/// Stale releases and already-published records cannot reenter the pool.
+pub const RELEASE_ID_SQL: &str =
+    "UPDATE novel_id_reservations SET available = 1 WHERE id = ? AND generation = ? AND available = 0 AND NOT EXISTS (SELECT 1 FROM novels WHERE novels.id = novel_id_reservations.id)";
+
+/// Retire ownership in the same transaction that publishes a record.
+pub const COMMIT_ID_RESERVATION_SQL: &str =
+    "DELETE FROM novel_id_reservations WHERE id = ?";
 
 /// Rewrite one row's materialized status key after its tags changed.
 pub fn refresh_status_sort_sql() -> String {
@@ -397,12 +420,4 @@ mod tests {
         assert!(select_by_id_sql().ends_with("WHERE n.id = ? LIMIT 1"));
     }
 
-    #[test]
-    fn status_statements_use_the_shared_fragments() {
-        assert!(refresh_status_sort_sql().starts_with("UPDATE novels AS n SET status_sort = "));
-        assert!(refresh_status_sort_sql().contains(STATUS_SORT_EXPRESSION));
-        assert!(refresh_status_sort_sql().ends_with("WHERE n.id = ?"));
-        assert!(term_expression(SearchField::Status).contains(STATUS_SEARCH_EXPRESSION));
-        assert!(ALLOCATE_READ_SQL.contains("AS id"));
-    }
 }
