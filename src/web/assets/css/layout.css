@@ -160,6 +160,8 @@
 .console-panes {
   display: flex;
   gap: 0;
+  min-height: var(--console-resize-min-height);
+  max-height: var(--console-resize-max-height);
 }
 
 .console-col-left {
@@ -183,8 +185,9 @@
 .console-col-right {
   display: flex;
   flex-direction: column;
-  height: var(--console-height);
-  min-height: 0;
+  height: clamp(var(--console-resize-min-height), var(--console-user-height, var(--console-height)), var(--console-resize-max-height));
+  min-height: var(--console-resize-min-height);
+  max-height: var(--console-resize-max-height);
 }
 
 .console {
@@ -216,6 +219,51 @@
 .console-panes.expanded .console-col-left,
 .console-panes.expanded .console-col-right {
   height: var(--console-expanded-height);
+}
+
+.console-resize-handle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--console-resize-handle-height);
+  background-color: var(--console-bg);
+  cursor: ns-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.console-resize-handle::before {
+  content: "";
+  width: var(--console-resize-grip-width);
+  height: var(--console-resize-grip-height);
+  border-radius: var(--console-resize-grip-radius);
+  background-color: var(--console-text);
+  opacity: 0.6;
+}
+
+.console-resize-handle:hover::before,
+.console-resize-handle:focus-visible::before {
+  opacity: 1;
+}
+
+.console-resize-handle:focus-visible {
+  outline: var(--control-focus-width) solid var(--btn-primary-bg);
+  outline-offset: var(--console-resize-outline-offset);
+}
+
+.console-resize-label {
+  position: absolute;
+  width: var(--settings-hidden-control-size);
+  height: var(--settings-hidden-control-size);
+  overflow: hidden;
+  clip-path: inset(var(--settings-hidden-control-clip));
+  white-space: nowrap;
+}
+
+body.console-resizing,
+body.console-resizing * {
+  cursor: ns-resize !important;
+  user-select: none !important;
 }
 
 .console-line {

@@ -61,7 +61,7 @@ export function persistListState() {
   lsSet(LIST_STATE_KEY, JSON.stringify(payload));
 }
 
-export { lsGet, lsSet, lsBool, lsInt };
+export { lsGet, lsSet, lsRemove, lsBool, lsInt };
 
 export const State = {
   novels: [],
@@ -116,6 +116,7 @@ const ELEMENT_IDS = [
   'badge-selecting', 'queue-count', 'queue-count-divider', 'queue-count-convert', 'queue-display', 'queue-sizes',
   'filter-input', 'filter-clear', 'filter-search-icon',
   'console', 'console-stdout2', 'console-col-right',
+  'console-container', 'console-resize-handle',
   'console-cancel', 'console-history',
   'console-trash', 'console-expand', 'console-buttons',
   'main-control-panel', 'footer-control-panel', 'footer-navbar',

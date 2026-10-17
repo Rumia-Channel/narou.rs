@@ -2,7 +2,7 @@
 
 ## 現況（v0.4.13 公開準備）
 
-正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.13へ統一済み。公開済み GitHub Release は現時点で v0.4.12。ユーザーから v0.4.13 のリリース依頼を受け、main への no-ff 統合・タグ作成・配布物検証を伴う公開作業を進める。リモートの常設ブランチは main / develop だけを維持する。
+正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.13へ統一済み。最後に確認した公開済み GitHub Release は v0.4.12。v0.4.13 は main への no-ff 統合・タグ・署名済み16配布物を作成済みだが、追加の Web UI / Workers 修正依頼により Release ID415887473 を下書きのまま保留する。修正はローカル機能ブランチ fix-worker-webui。既存タグの差し替え・強制pushは明示許可を得ていない。GitHub の常設ブランチは main / develop を維持する。
 
 版数の判断基準は GitHub の公開済み Release。最新公開版 v0.4.12 に対し、ユーザー指定の v0.4.13 を公開する。manifest の版数が先行していても公開済みとは見なさず、公開前の追加機能・修正・ツアーは同じ未リリース版へまとめる。GitHub Release は全配布 ZIP の確認まではドラフトにし、公開完了は GitHub の実データで確認する。
 
@@ -20,6 +20,13 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 
 0.4.11 最終監査で確認したデータ保全の修正: SQLite のインプレース YAML 書き出しは meta の export_file_sha 指紋を原子的なファイル保存より前に記録し、失敗後の未編集の書き出し残骸を再取り込みしない。管理状態だけでなく database.yaml の作品レコードも対象。ユーザーの編集と narou-compat のファイル優先は維持する。S3 COPY は完全な CopyObjectResult と ETag/LastModified を確認できた場合だけ成功し、200 内 Error・破損応答では元オブジェクトを削除しない。実 HTTP の失敗／成功ケースと、書き出し失敗後の正常保存→再オープンを smoke で確認済み。
 指紋は既存の未編集 projection と次回公開予定を最大2件保持し、2回目が公開前に中断しても保護を失わない。指紋更新と公開は同一ファイルロック内。--out が実 .narou を指す場合も対象。最終 workspace 全 target は1342成功/0失敗/1ignored、Clippy 全 feature -D warnings・Rustdoc -D warnings・core/Worker wasm check 成功。Web CSRF 回帰 fixture は並行CWD変更に影響されない絶対パスへ修正し、HTTPの拒否/許可とキュー状態の検証内容は維持した。
+
+## 未リリース: Web コンソールの高さ調整と高解像度表示
+
+- 共有 frontend に `console_size.js` を追加。左右ペイン共通の高さを下端ハンドルの Pointer Events と上下キーで変え、vh 単位で既存 localStorage helper に保存する。「表示」の専用リセットと全表示設定リセットは拡大状態も解除するが、ログ・進捗 DOM・過去ログの読書位置を保持する。キャンセル・blur・capture 解放を処理し、CSS から計算した範囲へ制限する。
+- 主因は px 直書きではなく、コンソール10rem、本文104em、ヘッダー80em、文字87.5%の上限。FHD 超では root の相対文字サイズを最大125%へ段階拡大し、メイン幅85vwと初期高さ18vhを使う。幅広モードのコンソールだけを狭くする規則を除去し、phone の初期高さ6remをペイン側へ適用した。
+- Native + Lite のビルドと変更 JS の構文確認が成功。Chrome DevTools の隔離タブで実ドラッグ194→574px、再読込で復元、表示メニューのリセット、上下キー、拡大から通常カスタム高さへの遷移を実操作した。100行と4本の進捗 DOMを置いた表示fixtureで、リセット後も内容・同一ノード・scrollTop=100が維持された。FHDは本文14px/幅1456px/高さ194px、WQHDは16.33px/2176px/259px、4Kは17.5px/3264px/389px。390幅でも左右96px・横溢れなし。モバイル emulation はページを再読込するため、DOM fixture の保持とは混同しない。Firefox と共有 browser broker は起動失敗、独立 Chrome DevTools で確認した。
+- 初期化は main.js から呼び、既存のキャッシュ済みエントリポイントも更新されるようにした。最終統合時に Native / Worker の共有配信も再確認する。ライブラリは Documents/WebNovel 内の Rust TempDir controller 所有で、元ライブラリやログイン資格情報は変更しない。
 
 ## 未リリース: 既存作品の個別変換設定を正準ストアへ統一（issue #37）
 
