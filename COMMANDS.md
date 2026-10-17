@@ -178,6 +178,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Pixiv の挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は DSL の `fetch_json` で画像 URL を解決し (`[uploadedimage:]` は同じ応答から解決)、`illust_grep_pattern` が `挿絵/` へローカライズする。解決できなかった参照は `<!--...-->` の目印だけ残す
 - Pixiv のアニメーション挿絵（うごイラ）はフレーム ZIP として取得され、`illustration-animation` feature（native と Worker の両方で有効）で APNG に組み立てて `挿絵/` へ保存する。`zip` は wasm でも動くよう純 Rust の deflate バックエンドに絞ってある
 - アルファポリス (`webnovel/www.alphapolis.co.jp.yaml`) は小説トップ・各話 URL を作品トップへ正規化し、埋め込み JSON の目次配列順で全話を取得する。章、題名、作者、あらすじ、タグ、更新日時、文字数、完結状態を抽出し、本文は匿名セッションの Cookie と CSRF 付きフォーム POST で取得する。R18 は `over18` の同意に従い、閲覧できない有料話・電子書籍特典や CAPTCHA は不完全な成功扱いにしない。サイト固有の処理はすべて YAML / DSL に置く
+- カクヨムネクスト (`webnovel/kakuyomu.jp.yaml`, version 2.6) は目次の `EmptyEpisode` を `login_partial_pattern` で検出し、保存済みログインを順に試す。制限が残れば取得範囲を警告して無料分だけを取得し、後から閲覧権のある Cookie を保存して更新すると残りも取得できる。採用したセッションは本文取得と次回更新でも使い、通常の公開作品には Cookie を送らない。本文 URL が作品トップ等へ戻され、本文枠が無い場合も DSL で失敗させ、空本文をキャッシュ・保存しない。サイト固有の判定は YAML / DSL に置く
+- 部分一覧に保存済みの話が欠ける場合は、話の削除やダイジェスト化とは判定せず `Canceled` で更新を見送り、目次・本文を保持する（force 時も同じ）。閲覧できる話が 0 件の部分一覧も空の小説として登録しない。この保存境界と警告は全サイト共通の downloader が担う
 - サイト定義の `min_interval:` でサイトごとの最低リクエスト間隔 (秒) の下限を宣言でき、該当サイトのレートリミットスコープにだけ適用される
 - サイト定義の `headers:` キーで任意のリクエストヘッダを宣言できる (Pixiv は画像ホスト用に `Referer`、ハーメルン R18 は Cloudflare challenge 回避用に `Sec-Fetch-*` を指定)。値は `\k<...>` 補間され、危険な名前・値は無視される
 - サイト定義の `cookie_hosts:` は、サイトの `domain` とは別に Cookie を送ってよい信頼済みホスト名の配列（各ホストのサブドメインも含む）。R18 なろうは作者用 `xmypage.syosetu.com` を指定する。未指定の第三者ホストには Cookie を送らない
@@ -325,6 +327,8 @@ narou author remove 1
 Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs_login` のブラウザ取得と書き出しファイルの取り込みだけで、利用者は名前と順序を管理する。
 
 **取得用 bin**: `narou_rs_login` は小説・作者・トップページの URL、サイト名、親ドメインも受理し、YAML の `login_url` を開く。アルファポリスは `narou_rs_login alphapolis.co.jp --name 本垢` で取得できる。対象作品 URL を渡した場合の保存後確認も共通の取得・YAML 前処理を通し、HTTP エラーやログイン壁を成功表示しない。
+
+カクヨムは `narou_rs_login kakuyomu.jp --name NEXT`、または対象作品 URL の指定で `/auth/login` を開く。NEXT の有料部分にはアカウントの閲覧権も必要で、ログイン済みというだけで取得可能とは判定しない。未ログイン・権利なしでは警告付きで無料分を取得し、保存済みの話を欠く部分一覧では更新を見送って既存データを保持する。
 
 **保存形式**: `login_cookie` inventory (SQLite `app_state` / `.narou/login_cookie.yaml`) に、**1 サイト = 順序つきログイン配列** (`LoginGroup { id, site, label, cookies: [{ host, cookie }], added_at }` の JSON 配列) を `enc:v1:<nonce>:<payload>` として暗号化保存。並び順がそのまま試行順になる。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。在庫のキー (サイト名) を AEAD の associated data に束ねるため別サイトへの流用は不可。旧形式の平文値はそのまま読め (ホスト名で束ねた旧暗号文も可)、次回保存時にサイト単位の新形式へ移行する。
 

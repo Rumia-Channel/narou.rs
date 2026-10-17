@@ -1760,10 +1760,6 @@ impl Downloader {
         let object_keys = NovelObjectKeys::new(&sitename, &file_title, use_subdirectory)
             .map_err(|error| NarouError::Platform(error.to_string()))?;
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
-        #[cfg(feature = "native-runtime")]
-        if let Some(existing) = existing_record.as_ref() {
-            crate::title::rename_projected_outputs(&novel_dir, &author, &existing.title, &title)?;
-        }
 
         let old_toc = self
             .persistence
@@ -1779,6 +1775,45 @@ impl Downloader {
         let old_author = old_toc.as_ref().map(|t| t.author.clone());
         let old_story = old_toc.as_ref().and_then(|t| t.story.clone());
         let old_section_count = old_toc.as_ref().map(|t| t.subtitles.len()).unwrap_or(0);
+
+        if partial_listing {
+            let omits_saved = if old_section_count > 0 {
+                let visible: std::collections::HashSet<&str> =
+                    subtitles.iter().map(|subtitle| subtitle.index.as_str()).collect();
+                old_subtitles.keys().any(|index| !visible.contains(index.as_str()))
+            } else {
+                false
+            };
+            if omits_saved || subtitles.is_empty() {
+                self.report_warn(if omits_saved {
+                    messages::download::partial_listing_preserved()
+                } else {
+                    messages::download::no_accessible_sections()
+                });
+                return Ok(DownloadResult {
+                    id: provisional_id,
+                    title: old_title.unwrap_or(title),
+                    author: old_author.unwrap_or(author),
+                    novel_dir,
+                    new_novel: existing_id.is_none(),
+                    new_arrivals: false,
+                    new_arrival_subtitles: Vec::new(),
+                    updated_count: 0,
+                    total_count: old_section_count,
+                    status: UpdateStatus::Canceled,
+                    title_changed: false,
+                    author_changed: false,
+                    story_changed: false,
+                    sections_deleted: false,
+                });
+            }
+            self.report_warn(&messages::download::partial_listing(subtitles.len()));
+        }
+
+        #[cfg(feature = "native-runtime")]
+        if let Some(existing) = existing_record.as_ref() {
+            crate::title::rename_projected_outputs(&novel_dir, &author, &existing.title, &title)?;
+        }
 
         let fetched_story = info.story.clone();
         let digest_story = old_story

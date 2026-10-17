@@ -167,6 +167,21 @@ pub fn login_retry() -> &'static str {
     "ログインが必要な可能性があります。保存済みのログイン情報で再試行します"
 }
 
+/// 閲覧制限付きの部分目次で取得する範囲。
+pub fn partial_listing(available: usize) -> String {
+    format!("閲覧制限があるため、現在閲覧できる {available} 話のみを取得します")
+}
+
+/// 不完全な目次で保存済みの話を削除しない。
+pub fn partial_listing_preserved() -> &'static str {
+    "保存済みの話を含まない部分的な目次のため、既存データを保持して更新を見送ります"
+}
+
+/// 取得できる話が無い部分目次は空の小説として登録しない。
+pub fn no_accessible_sections() -> &'static str {
+    "閲覧できる話が無いため、取得を見送ります"
+}
+
 /// 小説が取得できなかった (削除/非公開)。
 pub fn novel_unavailable() -> &'static str {
     "小説が削除されているか非公開な可能性があります"
