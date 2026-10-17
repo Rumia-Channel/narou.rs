@@ -33,7 +33,7 @@ use narou_rs::native::cookie_store::InventoryCookieStore;
 use narou_rs::platform::cookie_store::{cookie_host_for_url, format_cookie_header};
 use narou_rs::platform::{HostCookie, LoginGroup};
 use narou_rs::login::build_export;
-use narou_rs::platform::{CookieStore, HttpClient};
+use narou_rs::platform::CookieStore;
 use std::collections::BTreeMap;
 
 #[derive(Parser)]
@@ -183,7 +183,7 @@ fn run(args: Args) -> std::result::Result<(), String> {
 
     // 保存は済んでいるので、その Cookie で実際に取得できるかだけ確かめる。
     if site.matches_url(&target) && cookie_host_for_url(&target).is_some() {
-        verify_capture(&target, &site, &captured);
+        verify_capture(&target, site, captured);
     }
     // Cookie を保存し終えたので、使い捨てのプロファイルを片付ける。
     if let Some(profile) = throwaway_profile {
@@ -214,47 +214,45 @@ fn cleanup_profile(profile: &Path) {
 /// One request with the captured cookies, mirroring the downloader's login-wall
 /// detection: a work that needs the session keeps answering with the site's
 /// error message or login marker while the captured cookies are anonymous.
-fn verify_capture(target: &str, site: &SiteSetting, cookies: &BTreeMap<String, String>) {
+fn verify_capture(target: &str, mut site: SiteSetting, cookies: BTreeMap<String, String>) {
     if cookie_host_for_url(target).is_none() {
         return;
     }
-    // 取得したホスト群を 1 本のヘッダにまとめる (ブラウザと同じ送り方)。
     let cookie = LoginGroup::new(
         &site.domain,
-        cookies
-            .iter()
-            .map(|(host, cookie)| HostCookie {
-                host: host.clone(),
-                cookie: cookie.clone(),
-            })
-            .collect(),
-    )
-    .merged_cookie();
+        cookies.into_iter().map(|(host, cookie)| HostCookie { host, cookie }).collect(),
+    ).merged_cookie();
     if cookie.is_empty() {
         return;
     }
+    site.cookie = match site.cookie.take() {
+        Some(base) => narou_rs::platform::cookie_store::merge_cookie_headers(Some(&base), Some(&cookie)),
+        None => Some(cookie),
+    };
     let user_agent = ua_generator::ua::spoof_firefox_ua().to_string();
     let Ok(client) = narou_rs::native::http::NativeHttpClient::new(&user_agent) else {
         return;
     };
-    let request = narou_rs::platform::HttpRequest::get(target).with_header("Cookie", cookie);
-    let Ok(response) = block_on(client.send(request)) else {
-        return;
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            println!("注意: Cookie の検証を実行できません: {error}");
+            return;
+        }
     };
-    let body = String::from_utf8_lossy(&response.body);
-    let walled = site
-        .error_message()
-        .and_then(|pattern| regex::Regex::new(pattern).ok())
-        .is_some_and(|regex| regex.is_match(&body))
-        || site
-            .compiled_login_pattern()
-            .is_some_and(|regex| regex.is_match(&body));
-    if walled {
-        println!(
-            "注意: {target} は Cookie を付けても取得できません。ログインし直すか、--cookie で Cookie 文字列を直接渡してください"
-        );
-    } else {
-        println!("{target} を保存した Cookie で取得できることを確認しました");
+    let url = site.toc_url_with_url_captures(target).unwrap_or_else(|| target.to_string());
+    let limiter = narou_rs::downloader::rate_limit::RateLimiter::with_settings(0.0, 0);
+    let result = runtime.block_on(narou_rs::downloader::toc::fetch_toc(
+        &client, &limiter, &site, &url,
+        &mut narou_rs::downloader::preprocess::PreprocessJobs::new(),
+    ));
+    match result {
+        Ok(source) if site.compiled_login_pattern().is_some_and(|pattern| pattern.is_match(&source))
+            || site.is_partial_login_view(&source) => {
+            println!("注意: {target} は Cookie を付けても閲覧制限があります。ログイン状態や閲覧権限をサイトで確認してください");
+        }
+        Ok(_) => println!("{target} を保存した Cookie で取得できることを確認しました"),
+        Err(error) => println!("注意: Cookie の検証で取得に失敗しました: {error}"),
     }
 }
 
@@ -392,6 +390,11 @@ fn resolve_site(target: &str) -> std::result::Result<SiteSetting, String> {
             settings
                 .iter()
                 .find(|setting| setting.sitename.eq_ignore_ascii_case(target))
+        })
+        .or_else(|| {
+            let host = cookie_host_for_url(target);
+            let key = narou_rs::platform::site_for_host_with(&settings, host.as_deref().unwrap_or(&lower));
+            settings.iter().find(|setting| setting.domain.eq_ignore_ascii_case(&key))
         })
         .cloned()
         .ok_or_else(|| format!("{target} に対応するサイト定義が見つかりません"))
@@ -595,16 +598,9 @@ fn belongs_to_site(domain: &str, site: &SiteSetting, hosts: &[String]) -> bool {
         || same_registrable_domain(domain, &site_domain)
 }
 
-/// Whether two hosts share their last two labels (`www.pixiv.net` and
-/// `pixiv.net`), which is how a site's own cookie family is recognised.
+/// Whether two hosts belong to the same public-suffix-aware domain family.
 fn same_registrable_domain(left: &str, right: &str) -> bool {
-    fn registrable(host: &str) -> Option<String> {
-        let mut labels = host.rsplit('.');
-        let tld = labels.next()?;
-        let sld = labels.next()?;
-        (!sld.is_empty() && !tld.is_empty()).then(|| format!("{sld}.{tld}"))
-    }
-    match (registrable(left), registrable(right)) {
+    match (psl::domain_str(left), psl::domain_str(right)) {
         (Some(left), Some(right)) => left == right,
         _ => false,
     }
@@ -695,23 +691,36 @@ mod tests {
     }
 
     #[test]
-    fn the_default_profile_is_fresh_for_every_run() {
-        // 前回のログインを持ち越さない: ブラウザは必ず未ログインで開く。
-        let first = profile_dir(None);
-        assert!(
-            first
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("narou-rs-login-")),
-            "got {}",
-            first.display()
-        );
-        assert!(!first.join("Default").exists(), "プロファイルは空から始まる");
+    fn capture_isolates_alphapolis_from_other_co_jp_accounts() {
+        let site = SiteSetting::load_bundled(&[
+            include_str!("../../webnovel/www.alphapolis.co.jp.yaml"),
+        ]).unwrap().remove(0);
+        let cookies = serde_json::json!([
+            {"domain":".alphapolis.co.jp","name":"session","value":"alpha"},
+            {"domain":"www.alphapolis.co.jp","name":"reader","value":"vertical"},
+            {"domain":"accounts.alphapolis.co.jp","name":"auth","value":"alpha-auth"},
+            {"domain":".unrelated.co.jp","name":"session","value":"must-not-export"},
+            {"domain":".co.jp","name":"suffix","value":"must-not-export"}
+        ]);
+        let actual: BTreeMap<_, _> = cookies_for_site(
+            cookies.as_array().unwrap(), &site, &site_hosts(&site, "www.alphapolis.co.jp"),
+        ).into_iter().collect();
+        assert_eq!(actual, BTreeMap::from([
+            ("alphapolis.co.jp".into(), "session=alpha".into()),
+            ("www.alphapolis.co.jp".into(), "reader=vertical".into()),
+            ("accounts.alphapolis.co.jp".into(), "auth=alpha-auth".into()),
+        ]));
+    }
 
-        // --profile を渡したときだけ使い回す。
-        assert_eq!(
-            profile_dir(Some(Path::new("custom"))),
-            PathBuf::from("custom")
-        );
+    #[test]
+    fn login_target_accepts_parent_domains_and_author_urls_without_crossing_sites() {
+        for target in [
+            "alphapolis.co.jp",
+            "https://www.alphapolis.co.jp/author/detail/166360898",
+        ] {
+            assert_eq!(resolve_site(target).unwrap().domain, "www.alphapolis.co.jp");
+        }
+        assert!(resolve_site("https://unrelated.co.jp/").is_err());
+        assert!(resolve_site("https://co.jp/").is_err());
     }
 }

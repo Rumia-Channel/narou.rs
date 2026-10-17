@@ -1,0 +1,146 @@
+# 小説・作者一覧の取得規則。本文のフォーム送信も共通 DSL で実行する。
+name: &name アルファポリス
+domain: www.alphapolis.co.jp
+top_url: https://\\k<domain>
+url: ^https?://(?:www\.)?alphapolis\.co\.jp/novel/(?<author_id>\d+)/(?<ncode>\d+)(?:/episode/\d+)?/?(?:[?#].*)?$
+author_url: ^https?://(?:www\.)?alphapolis\.co\.jp/author/detail/(?<author_id>\d+)/?(?:[?#].*)?$
+author_api_url: \\k<top_url>/author/detail/\\k<author_id>
+# 表紙・紹介文のリンク、漫画、外部登録を作品として数えない。
+author_novel_pattern: '<div class="content-title">\s*<h2 class="title">\s*<a href="/novel/(?<author_id>\d+)/(?<novel_id>\d+)"'
+author_work_url: \\k<top_url>/novel/\\k<author_id>/\\k<novel_id>
+author_next_pattern: '<span class="current">\d+</span>\s*<span>\s*<a href="(?<author_next>https?://www\.alphapolis\.co\.jp/author/detail/\d+\?[^\"]+)">\d+</a>'
+encoding: UTF-8
+timezone: Asia/Tokyo
+confirm_over18: no
+over18_pattern: ^alphapolis_r18::1$
+append_title_to_folder_name: yes
+title_strip_pattern: null
+sitename: *name
+version: 1.3
+min_interval: 2
+# 元ページの CSRF セッションを本文の POST に引き継ぐ。
+cookie_session: true
+headers:
+  X-Requested-With: XMLHttpRequest
+login_url: \\k<top_url>/login
+login_pattern: '<form\b[^>]*id="UserLoginForm"|(?m:^alphapolis_login_required::1$)'
+error_message: '<form\b[^>]*id="UserLoginForm"|(?m:^alphapolis_login_required::1$)'
+
+preprocess: |-
+  guard "AlphapolisPreprocessed"
+
+  if url != url.gsub(/\/novel\/\d+\/\d+\/episode\/\d+/, "")
+    let episode = extract(/'episode':\s*(\d+)/)
+    let text = null
+    if episode
+      let token = extract(/'token':\s*'([^']+)'/)
+      let csrf = extract_json(/X-CSRF-TOKEN':\s*("[^"]+")/)
+      if !token || !csrf
+        fail "本文取得に必要なフォーム情報がありません"
+      end
+      let text = post_form("https://www.alphapolis.co.jp/novel/episode_body", [["episode", episode], ["token", token]], [["X-CSRF-TOKEN", csrf], ["Referer", url], ["Origin", "https://www.alphapolis.co.jp"]])
+    else
+      let text = extract(/<div\b[^>]*id="novelBody"[^>]*>(.*?)<\/div>/s)
+    end
+    if text != null
+      if text.empty || text != text.gsub(/g-recaptcha|UserLoginForm|<html\b/i, "")
+        fail "本文を取得できませんでした。追加認証や閲覧制限をサイトで確認してください"
+      end
+      emit "AlphapolisPreprocessed"
+      emit "alphapolis_body::"
+      emit text
+      emit "::alphapolis_body_end"
+      insert_at_match
+    else
+      if !episode
+        fail "本文が見つかりません"
+      end
+    end
+  else
+    let cover = extract_json(/<script\b[^>]*id="app-cover-data"[^>]*>\s*(.+?)\s*<\/script>/s)
+    if cover
+      if cover.isPartialEpisode
+        fail "目次が全話分ではありません"
+      end
+      emit "AlphapolisPreprocessed"
+      emit "alphapolis_title::${cover.content.title.gsub(/[\r\n]+/, " ")}"
+      emit "alphapolis_author::${cover.content.user.name.gsub(/[\r\n]+/, " ")}"
+      let count = 0
+      for chapter in cover.chapterEpisodes
+        if chapter.title
+          emit "Chapter;${chapter.title.gsub(/[\r\n]+/, " ")}"
+        end
+        for episode in chapter.episodes
+          # 未契約の話はログイン壁として再試行し、権利が無ければ失敗させる。
+          if !episode.isPublic && !episode.rental.isFree && !episode.rental.isOnRental
+            emit "alphapolis_login_required::1"
+          end
+          emit "Episode;${episode.episodeNo};${episode.url};${episode.upTime.replace(".", "-")};${episode.mainTitle.gsub(/[\r\n]+/, " ")}"
+          let count = count + 1
+        end
+        if chapter.extraEpisode
+          fail "電子書籍の特典話は取得できません"
+        end
+      end
+      emit "alphapolis_count::${count}"
+
+      let rating = extract_json(/dataLayer\.push\(\{"gtm_novel_cont_view_array":(\{[^\n]+\})\}\);/)
+      if rating.r_rated_flag
+        emit "alphapolis_r18::1"
+      end
+      let state = extract(/p-sidebar-content-info__summary">.*?<span class="c-attribute-tag">\s*(連載中|完結)\s*<\/span>/s)
+      if state
+        emit "alphapolis_state::${state}"
+      end
+      let first = extract(/p-sidebar-content-info__detail-label">\s*初回公開日時\s*<\/span>\s*<span>\s*(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2})/)
+      if first
+        emit "alphapolis_first::${first.replace(".", "-")}"
+      end
+      let updated = extract(/p-sidebar-content-info__detail-label">\s*更新日時\s*<\/span>\s*<span>\s*(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2})/)
+      if updated
+        emit "alphapolis_updated::${updated.replace(".", "-")}"
+      end
+      let length = extract(/p-sidebar-content-info__detail-label">\s*文字数\s*<\/span>\s*<span>\s*([\d,]+)/)
+      if length
+        emit "alphapolis_length::${length.replace(",", "")}"
+      end
+      let tags = extract(/<ul class="c-tags p-content-info__tags">(.*?)<\/ul>/s)
+      if tags
+        emit tags.gsub(/<a\b[^>]*class="c-tag"[^>]*>(.*?)<\/a>/s, "\nalphapolis_tag::$1\n")
+      end
+      insert_at_match
+    end
+  end
+
+toc_url: \\k<top_url>/novel/\\k<author_id>/\\k<ncode>
+subtitles: |-
+  ^(?:Chapter;(?<chapter>[^\n]+)\n)?Episode;(?<index>\d+);(?<href>/novel/\d+/\d+/episode/\d+);(?<subupdate>[^;\n]*);(?<subtitle>[^\n]+)$
+subdate: no
+body_pattern: |-
+  alphapolis_body::
+  (?<body>.+?)
+  ::alphapolis_body_end
+introduction_pattern: null
+postscript_pattern: null
+illust_current_url: \\k<top_url>
+illust_from_raw: false
+illust_grep_pattern: '<img\b[^>]*\ssrc=["''](?<src>(?:https?://|//|/|\.\.?/)[^"'']+)["''][^>]*>'
+
+novel_info_url: \\k<toc_url>
+title: &title ^alphapolis_title::(?<title>[^\n]+)$
+author: &author ^alphapolis_author::(?<author>[^\n]+)$
+story: &story '<div class="p-content-info__abstract">(?<story>.*?)</div>'
+t: *title
+w: *author
+s: *story
+# 「短編」「長編」は長さの分類。短編でも複数話の目次を読む。
+nt: ^alphapolis_state::(?<novel_type>[^\n]+)$
+novel_type_string:
+  連載中: 1
+  完結: 3
+ga: ^alphapolis_count::(?<general_all_no>\d+)$
+gf: ^alphapolis_first::(?<general_firstup>[^\n]+)$
+gl: ^alphapolis_updated::(?<general_lastup>[^\n]+)$
+nu: ^alphapolis_updated::(?<novelupdated_at>[^\n]+)$
+l: ^alphapolis_length::(?<length>\d+)$
+tags: ^alphapolis_tag::(?<tag>[^\n]+)$

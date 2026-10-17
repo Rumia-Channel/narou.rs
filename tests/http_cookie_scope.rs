@@ -156,3 +156,65 @@ async fn only_an_immediate_content_response_is_reusable_and_304_is_terminal() {
         }
     }
 }
+
+#[tokio::test]
+async fn opt_in_session_survives_form_post_but_not_paths_origins_or_expiration() {
+    use narou_rs::downloader::http_policy::fetch_form_text;
+    let setting: SiteSetting = serde_yaml::from_str(r#"
+name: Form session
+sitename: Form session
+domain: 127.0.0.1
+top_url: http://127.0.0.1
+toc_url: http://127.0.0.1/reader
+cookie_session: true
+"#).unwrap();
+    let policy = FetchPolicy::for_site(&setting);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let root = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        for hop in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let head = request_head(&mut stream);
+            let cookie = header(&head, "Cookie");
+            let (status, body, extra) = match hop {
+                0 => (200, "reader", "Set-Cookie: csrf-session=canary; Path=/reader; HttpOnly\r\n"),
+                1 | 3 => (200, if cookie.is_none() { "anonymous" } else { "leaked" }, ""),
+                _ => if head.starts_with("POST /reader/body ")
+                    && cookie == Some("csrf-session=canary")
+                    && header(&head, "X-CSRF-TOKEN") == Some("token")
+                {
+                    (200, "novel-text", "Set-Cookie: csrf-session=; Path=/reader; Max-Age=0\r\n")
+                } else {
+                    (419, "denied", "")
+                },
+            };
+            stream.write_all(format!(
+                "HTTP/1.1 {status} OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+            ).as_bytes()).unwrap();
+        }
+    });
+    let other = TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_url = format!("http://{}/reader/private", other.local_addr().unwrap());
+    let foreign = thread::spawn(move || {
+        let (mut stream, _) = other.accept().unwrap();
+        let head = request_head(&mut stream);
+        let body = if header(&head, "Cookie").is_none() { "anonymous" } else { "leaked" };
+        stream.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+        ).as_bytes()).unwrap();
+    });
+    let http = LocalHttp::new();
+    let limiter = FakeRateLimiter::new();
+    fetch_bytes(&http, &limiter, &format!("{root}/reader/start"), &policy).await.unwrap();
+    let outside = fetch_bytes(&http, &limiter, &format!("{root}/outside"), &policy).await.unwrap();
+    assert_eq!(outside.body, b"anonymous");
+    let outside = fetch_bytes(&http, &limiter, &other_url, &policy).await.unwrap();
+    assert_eq!(outside.body, b"anonymous");
+    let text = fetch_form_text(&http, &limiter, &format!("{root}/reader/body"), "episode=1".into(),
+        vec![("X-CSRF-TOKEN".into(), "token".into())], &policy, Some("UTF-8")).await.unwrap();
+    assert_eq!(text, "novel-text");
+    let expired = fetch_bytes(&http, &limiter, &format!("{root}/reader/check"), &policy).await.unwrap();
+    assert_eq!(expired.body, b"anonymous");
+    server.join().unwrap();
+    foreign.join().unwrap();
+}

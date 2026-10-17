@@ -44,6 +44,7 @@ fn build_stmt(pair: pest::iterators::Pair<Rule>) -> Stmt {
             let expr = build_expr(pair.into_inner().next().unwrap());
             Stmt::Emit(expr)
         }
+        Rule::fail_stmt => Stmt::Fail(build_expr(pair.into_inner().next().unwrap())),
         Rule::insert_stmt => Stmt::InsertAtMatch,
         Rule::if_stmt => {
             let mut inner = pair.into_inner();
@@ -131,6 +132,14 @@ fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
         Rule::fetch_json_expr => {
             Expr::FetchJson(Box::new(build_expr(pair.into_inner().next().unwrap())))
         }
+        Rule::post_form_expr => {
+            let mut inner = pair.into_inner();
+            Expr::PostForm {
+                url: Box::new(build_expr(inner.next().unwrap())),
+                fields: Box::new(build_expr(inner.next().unwrap())),
+                headers: inner.next().map(|value| Box::new(build_expr(value))),
+            }
+        }
         Rule::call_chain_expr => {
             let mut inner = pair.into_inner();
             let base = build_expr(inner.next().unwrap());
@@ -158,6 +167,10 @@ fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
             let regex_pair = inner.next().unwrap();
             let (pat, flags) = build_regex(regex_pair);
             Expr::ExtractJson(pat, flags)
+        }
+        Rule::extract_expr => {
+            let (pattern, flags) = build_regex(pair.into_inner().next().unwrap());
+            Expr::Extract(pattern, flags)
         }
         Rule::chain_expr => {
             let mut inner = pair.into_inner();

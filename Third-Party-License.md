@@ -95,6 +95,7 @@ the time of this audit.
 | parking_lot | ^0.12 | MIT OR Apache-2.0 |
 | pest | ^2.8 | MIT OR Apache-2.0 |
 | pest_derive | ^2.8 | MIT OR Apache-2.0 |
+| psl | ^2.1.241 | MIT/Apache-2.0 |
 | regex | ^1 | MIT OR Apache-2.0 |
 | reqwest | ^0.13 | MIT OR Apache-2.0 |
 | rusqlite | ^0.40 | MIT |
@@ -131,7 +132,7 @@ dependency).
 
 | License | Used by |
 | --- | ---: |
-| MIT License | 353 |
+| MIT License | 354 |
 | Unicode License v3 | 19 |
 | ISC License | 18 |
 | Apache License 2.0 | 13 |
@@ -6684,6 +6685,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 ### MIT License (`MIT`)
 
 Used by:
+- psl 2.1.241
 - publicsuffix 2.3.0
 
 ```text

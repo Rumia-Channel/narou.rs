@@ -273,8 +273,8 @@ impl LegacyCredential {
     }
 }
 
-/// The site a host belongs to: the site definition that covers it, or the
-/// registrable-looking parent domain when no definition matches.
+/// The site a host belongs to: the site definition that covers it, or its
+/// public-suffix-aware registrable domain when no definition matches.
 ///
 /// A parent-domain key (`pixiv.net`) resolves to the definition below it
 /// (`www.pixiv.net`) so one browser session stays in one place.
@@ -287,24 +287,25 @@ pub fn site_for_host(host: &str) -> String {
 }
 
 /// `site_for_host` over a caller-supplied definition list. Empty behaves like
-/// an unloadable set: the registrable-looking parent domain.
+/// an unloadable set: the public-suffix-aware registrable domain.
 pub fn site_for_host_with(
     settings: &[crate::downloader::site_setting::SiteSetting],
     host: &str,
 ) -> String {
     let host = host.trim().to_ascii_lowercase();
+    let registrable_host = psl::domain_str(&host);
     let domain_of = |setting: &crate::downloader::site_setting::SiteSetting| {
         setting.domain.to_ascii_lowercase()
     };
     if settings.is_empty() {
-        return parent_domain(&host);
+        return registrable_host.unwrap_or(&host).to_string();
     }
     // 1. 定義そのもの、その配下、またはその定義が使うホスト。
     if let Some(setting) = settings.iter().find(|setting| {
         let domain = domain_of(setting);
         domain == host
             || host.ends_with(&format!(".{domain}"))
-            || domain.ends_with(&format!(".{host}"))
+            || (registrable_host.is_some() && domain.ends_with(&format!(".{host}")))
             || crate::platform::cookie_host_for_url(&setting.top_url())
                 .is_some_and(|top| top == host || host.ends_with(&format!(".{top}")))
     }) {
@@ -312,27 +313,22 @@ pub fn site_for_host_with(
     }
     // 2. 同じ登録ドメインの兄弟サブドメイン (`accounts.pixiv.net` など)。
     //    定義が 1 つに定まるときだけ寄せる (なろうの ncode / novel18 は別サイト)。
-    let base = parent_domain(&host);
+    let base = registrable_host.unwrap_or(&host);
     let mut siblings = settings
         .iter()
-        .filter(|setting| parent_domain(&domain_of(setting)) == base)
-        .map(domain_of);
+        .map(domain_of)
+        .filter(|domain| parent_domain(domain) == base);
     if let Some(domain) = siblings.next()
         && siblings.next().is_none()
     {
         return domain;
     }
-    base
+    base.to_string()
 }
 
-/// Last two labels: what a host's registrable domain looks like.
-fn parent_domain(host: &str) -> String {
-    let labels: Vec<&str> = host.split('.').collect();
-    if labels.len() > 2 {
-        labels[labels.len() - 2..].join(".")
-    } else {
-        host.to_string()
-    }
+/// The registrable domain, retaining non-domain local host names unchanged.
+fn parent_domain(host: &str) -> &str {
+    psl::domain_str(host).unwrap_or(host)
 }
 
 /// Whether two logins look like two halves of one browser session.
@@ -870,16 +866,15 @@ fn set_cookie_expires_immediately(attributes: &str) -> bool {
 ///
 /// A cookie set for `.example.com` is sent to `example.com` and to every one of
 /// its subdomains, so a lookup for `www.example.com` must also see the entry
-/// stored under `example.com`. Candidates keep at least two labels, so a bare
-/// public suffix is never consulted.
+/// stored under `example.com`. Ancestors stop at the public-suffix-aware
+/// registrable domain, not at a fixed number of labels.
 pub fn cookie_lookup_hosts(host: &str) -> Vec<String> {
     let host = normalize_cookie_host(host);
+    let boundary = parent_domain(&host);
     let mut keys = vec![host.clone()];
     let mut rest = host.as_str();
-    while let Some((_, parent)) = rest.split_once('.') {
-        if parent.split('.').count() < 2 {
-            break;
-        }
+    while rest != boundary {
+        let Some((_, parent)) = rest.split_once('.') else { break };
         keys.push(parent.to_string());
         rest = parent;
     }
@@ -1115,6 +1110,23 @@ mod tests {
         // A bare public suffix is never a candidate.
         assert_eq!(cookie_lookup_hosts("example.com"), vec!["example.com"]);
         assert_eq!(cookie_lookup_hosts("localhost"), vec!["localhost"]);
+    }
+
+    #[test]
+    fn japanese_cookie_families_do_not_cross_the_public_suffix() {
+        let settings = crate::downloader::site_setting::SiteSetting::load_bundled(&[
+            include_str!("../../webnovel/www.alphapolis.co.jp.yaml"),
+        ]).unwrap();
+        for (host, expected) in [
+            ("alphapolis.co.jp", "www.alphapolis.co.jp"),
+            ("accounts.alphapolis.co.jp", "www.alphapolis.co.jp"),
+            ("unrelated.co.jp", "unrelated.co.jp"),
+            ("co.jp", "co.jp"),
+        ] {
+            assert_eq!(site_for_host_with(&settings, host), expected);
+        }
+        assert_eq!(site_for_host_with(&[], "accounts.alphapolis.co.jp"), "alphapolis.co.jp");
+        assert_eq!(cookie_lookup_hosts("www.alphapolis.co.jp"), ["www.alphapolis.co.jp", "alphapolis.co.jp"]);
     }
 
     #[test]

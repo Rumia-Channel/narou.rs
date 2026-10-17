@@ -81,7 +81,8 @@ pub fn pretreatment_source(src: &mut String, _encoding: &str, setting: Option<&S
         && let Some(pipeline) = setting.preprocess_pipeline()
     {
         let jobs = preprocess::PreprocessJobs::new();
-        let run = preprocess::run_preprocess(pipeline, src, &jobs, "");
+        let run = preprocess::run_preprocess(pipeline, src, &jobs, "")
+            .unwrap_or_else(|error| panic!("{error}"));
         if !run.requested.is_empty() {
             tracing::warn!(
                 "preprocess for {} requested {} URL(s) that this path cannot fetch",
@@ -118,7 +119,7 @@ pub async fn pretreatment_source_with_jobs(request: PretreatmentRequest<'_>) -> 
         rate_limiter,
         policy,
         src,
-        encoding: _encoding,
+        encoding,
         setting,
         jobs,
         url,
@@ -133,51 +134,57 @@ pub async fn pretreatment_source_with_jobs(request: PretreatmentRequest<'_>) -> 
     };
 
     let original = src.clone();
-    let mut rounds = 0;
-    loop {
-        let mut working = original.clone();
-        let run = preprocess::run_preprocess(pipeline, &mut working, jobs, url);
-        let pending: Vec<String> = run
-            .requested
-            .into_iter()
-            .filter(|url| !jobs.contains(url))
-            .collect();
-        if pending.is_empty() || rounds >= MAX_PREPROCESS_ROUNDS {
-            if !pending.is_empty() {
-                tracing::warn!(
-                    "preprocess for {} stopped after {} rounds with {} URL(s) unresolved",
-                    setting.name,
-                    MAX_PREPROCESS_ROUNDS,
-                    pending.len()
-                );
-            }
-            *src = working;
-            return Ok(());
-        }
-
-        for url in pending {
-            // A failed request settles as `null`: illustrations are optional and
-            // the definition branches on the result instead of failing the
-            // whole download.
-            let value = match crate::downloader::http_policy::fetch_text(
-                http,
-                rate_limiter,
-                &url,
-                policy,
-                Some("UTF-8"),
-            )
-            .await
-            {
-                Ok(body) => serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
-                Err(err) => {
-                    tracing::debug!("preprocess request failed for {url}: {err}");
-                    serde_json::Value::Null
+    jobs.clear_forms();
+    let result = async {
+        let mut rounds = 0;
+        loop {
+            let mut working = original.clone();
+            let run = preprocess::run_preprocess(pipeline, &mut working, jobs, url)
+                .map_err(crate::error::NarouError::SiteSetting)?;
+            let pending: Vec<_> = run.requested.into_iter()
+                .filter(|request| !jobs.contains(request.key())).collect();
+            if pending.is_empty() || rounds >= MAX_PREPROCESS_ROUNDS {
+                if pending.iter().any(|request| matches!(request, preprocess::PreprocessRequest::Form { .. })) {
+                    return Err(crate::error::NarouError::SiteSetting("preprocess: unresolved form request".into()));
                 }
-            };
-            jobs.insert(url, value);
+                if !pending.is_empty() {
+                    tracing::warn!(
+                        "preprocess for {} stopped after {} rounds with {} URL(s) unresolved",
+                        setting.name, MAX_PREPROCESS_ROUNDS, pending.len()
+                    );
+                }
+                *src = working;
+                return Ok(());
+            }
+            for request in pending {
+                match request {
+                    preprocess::PreprocessRequest::Json { url } => {
+                        // JSON requests are optional (e.g. illustration metadata).
+                        let value = match crate::downloader::http_policy::fetch_text(
+                            http, rate_limiter, &url, policy, Some("UTF-8"),
+                        ).await {
+                            Ok(body) => serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+                            Err(error) => {
+                                tracing::debug!("preprocess request failed for {url}: {error}");
+                                serde_json::Value::Null
+                            }
+                        };
+                        jobs.insert(url, value);
+                    }
+                    preprocess::PreprocessRequest::Form { url, body, headers, key } => {
+                        let text = crate::downloader::http_policy::fetch_form_text(
+                            http, rate_limiter, &url, body, headers, policy, Some(encoding),
+                        ).await?;
+                        jobs.insert_form(key, serde_json::Value::String(text))
+                            .map_err(crate::error::NarouError::SiteSetting)?;
+                    }
+                }
+            }
+            rounds += 1;
         }
-        rounds += 1;
-    }
+    }.await;
+    jobs.clear_forms();
+    result
 }
 
 pub fn decode_numeric_entities(src: &mut String) {

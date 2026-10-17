@@ -9,10 +9,43 @@
 //! the same illustration from many sections resolves it once. Only *settled*
 //! results are kept — a job that has finished leaves the queue immediately, so
 //! nothing long-lived accumulates (which matters on the Worker runtime).
+//!
+//! `post_form` also requests raw text. Its identity includes the URL, encoded
+//! body and headers; these results live for one preprocessing call only.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+/// Fetches retain their full identity: form bodies at one URL are distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreprocessRequest {
+    Json { url: String },
+    Form { url: String, body: String, headers: Vec<(String, String)>, key: String },
+}
+
+impl PreprocessRequest {
+    pub fn form(url: String, body: String, headers: Vec<(String, String)>) -> Self {
+        let mut hash = Sha256::new();
+        for part in std::iter::once(url.as_str()).chain(std::iter::once(body.as_str()))
+            .chain(headers.iter().flat_map(|(name, value)| [name.as_str(), value.as_str()]))
+        {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part.as_bytes());
+        }
+        let key = format!("post-form:{}", hex::encode(hash.finalize()));
+        Self::Form { url, body, headers, key }
+    }
+
+    pub fn url(&self) -> &str {
+        match self { Self::Json { url } | Self::Form { url, .. } => url }
+    }
+
+    pub fn key(&self) -> &str {
+        match self { Self::Json { url } => url, Self::Form { key, .. } => key }
+    }
+}
 
 /// Upper bound on retained results. A definition that keeps requesting new
 /// URLs stops being served once this is reached; the run still completes with
@@ -22,6 +55,8 @@ pub const MAX_PREPROCESS_JOBS: usize = 256;
 #[derive(Debug, Default)]
 pub struct PreprocessJobs {
     fetched: HashMap<String, Value>,
+    /// Raw form responses live only for one preprocessing call, not a novel.
+    forms: HashMap<String, Value>,
 }
 
 impl PreprocessJobs {
@@ -32,10 +67,11 @@ impl PreprocessJobs {
     /// Drop every result, e.g. when a different novel starts downloading.
     pub fn reset(&mut self) {
         self.fetched.clear();
+        self.forms.clear();
     }
 
     pub fn contains(&self, url: &str) -> bool {
-        self.fetched.contains_key(url)
+        self.fetched.contains_key(url) || self.forms.contains_key(url)
     }
 
     /// Resolved results, keyed by URL, as the DSL sees them.
@@ -50,6 +86,22 @@ impl PreprocessJobs {
             return;
         }
         self.fetched.insert(url, value);
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.fetched.get(key).or_else(|| self.forms.get(key))
+    }
+
+    pub fn insert_form(&mut self, key: String, value: Value) -> Result<(), String> {
+        if !self.forms.contains_key(&key) && self.forms.len() >= MAX_PREPROCESS_JOBS {
+            return Err("preprocess: form request limit exceeded".into());
+        }
+        self.forms.insert(key, value);
+        Ok(())
+    }
+
+    pub fn clear_forms(&mut self) {
+        self.forms.clear();
     }
 
     pub fn len(&self) -> usize {
