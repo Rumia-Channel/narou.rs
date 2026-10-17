@@ -21,7 +21,9 @@ pub async fn api_global_setting(mut req: Request, env: Env) -> worker::Result<Re
     }
     let started_ms = js_sys::Date::now();
     if method == Method::Get {
-        let settings = match metadata::settings(&env) {
+        // 編集画面が expected_settings に使う値は、保存側と同じ primary から読む。
+        // replica / 他 isolate の TTL キャッシュだと初回保存から偽の競合になる。
+        let settings = match metadata::settings_for_writes(&env) {
             Ok(settings) => settings,
             Err(error) => {
                 console_log!("service composition failed: {error}");

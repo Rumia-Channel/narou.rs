@@ -21,6 +21,13 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 0.4.11 最終監査で確認したデータ保全の修正: SQLite のインプレース YAML 書き出しは meta の export_file_sha 指紋を原子的なファイル保存より前に記録し、失敗後の未編集の書き出し残骸を再取り込みしない。管理状態だけでなく database.yaml の作品レコードも対象。ユーザーの編集と narou-compat のファイル優先は維持する。S3 COPY は完全な CopyObjectResult と ETag/LastModified を確認できた場合だけ成功し、200 内 Error・破損応答では元オブジェクトを削除しない。実 HTTP の失敗／成功ケースと、書き出し失敗後の正常保存→再オープンを smoke で確認済み。
 指紋は既存の未編集 projection と次回公開予定を最大2件保持し、2回目が公開前に中断しても保護を失わない。指紋更新と公開は同一ファイルロック内。--out が実 .narou を指す場合も対象。最終 workspace 全 target は1342成功/0失敗/1ignored、Clippy 全 feature -D warnings・Rustdoc -D warnings・core/Worker wasm check 成功。Web CSRF 回帰 fixture は並行CWD変更に影響されない絶対パスへ修正し、HTTPの拒否/許可とキュー状態の検証内容は維持した。
 
+## 未リリース: Worker 設定編集の偽の競合を修正
+
+- develop の配備 run `39035933191` は Worker のビルド・配備・S3 LIST が成功し、smoke の「stale expected value」検査の最初の保存だけ HTTP 409 (82/83 成功) で失敗していた。設定 GET は replica / isolate TTL cache、POST は primary / fresh という不一致が原因。
+- 実 Rust Worker Wasm を 2 isolate + 共有ローカル D1 に載せ、reader のキャッシュを温めて writer から保存すると、新しい編集 GET が旧値を返して初回保存から 409 になることを再現した。`GET /api/global_setting` も既存 `metadata::settings_for_writes` で primary / fresh を使い、一覧・通常の表示設定のキャッシュは変更しない。scope 単位 CAS と本物の stale save の 409 は維持する。
+- 同じ使い捨てプローブで修正後は他 isolate の勝者を取得・初回保存 200・古い画面の保存 409・勝者保持を確認。失敗した既存 HTTP 契約も実ローカル Worker に対して 1 件成功し、契約の勝者検査は no-op POST ではなく編集 GET の現在値で確認するよう更新。標準 `worker-build --release` (wasm-opt 込み) と Worker Wasm Clippy `-D warnings` が成功。
+- ローカル Miniflare の workerd は compatibility date 2026-08-06 までのため、その日付で検証した。PushHub はこの metadata 専用 fixture に接続しておらず配信の検証には数えない。元ライブラリ・資格情報には触れず、Rust TempDir 所有の npm/runtime 領域・使い捨てソースは削除済み。版数は未リリース 0.4.13 のまま。
+
 ## 未リリース: 0.4.13 の機能ツアー
 
 - 共通の `application::webui::feature_tour::FEATURE_TOURS` に、アルファポリスの小説・作者一覧対応とカクヨムネクスト対応を追加。無料分、レンタル・契約に応じたログイン Cookie の利用、既存本文の保護を説明し、通常の公開作品へのログインを要求しない。

@@ -782,6 +782,7 @@ narou setting name         # 読み取り
 - バージョン別の機能ツアーを `GET /api/feature_tour/pending` / `GET /api/feature_tour/all` / `POST /api/feature_tour/seen` / `POST /api/feature_tour/config` で提供し、アップデート後に新機能を Web UI で告知する。SQLite 管理への移行はツアー経由の opt-in で、`GET/POST /api/storage/mode` がモードの読み書きを担う（CLI 側の保守コマンドは `narou db`）
 - 0.4.13 の機能ツアーはアルファポリスの小説・作者一覧対応とカクヨムネクスト対応を告知する。無料分の取得とレンタル・契約に応じたログイン Cookie の利用、閲覧制限による既存本文の保護を案内し、既読後は自動再表示しない。ツアー定義は Native / Worker 共通
 - 設定画面のデータ管理方式は描画後・保存後の再描画時に取得し、固定環境では切替ボタンを隠す。Workers の保存前読み取りは primary を使い、replica／isolate キャッシュの古い値を書き戻さない。メモ帳は `object_id` 検査に加えて条件付き UPSERT で同時保存を排他し、負けた要求に最新本文を含む競合応答を返す。
+- Worker の環境設定 API (`GET /api/global_setting`) は、編集時の `expected_settings` に使う値を primary からキャッシュなしで取得する。別 isolate の保存後に古い値を表示して初回保存から偽の 409 になることを防ぐ。保存側の CAS と本物の同時編集に対する 409 は維持し、通常の一覧・表示設定の読み取りキャッシュは変更しない
 - native / Worker が共通 capability payload を返し、Worker で実行できない CSV・送信・mail・端末操作・調査ログ・キュー並べ替え等は UI から実行できないようにする。直接 API の拒否も通知し、成功として扱わない。
 - Worker の `concurrency` はコンソール分離（既定 true）、`convert.keep-txt` は既定 false、`queue.max-retries` は配備上限 3 と表示・保存検証を一致させる。native 専用の `s3.*` は表示せず、ミラー・話キャッシュ・外部 EPUB エンジン等は無効化し、API からも変更を拒否する。
 - Worker の履歴取得・消去は PushHub の永続化履歴に接続し、再接続でも消去済みの行を復活させない。`webui.table.reload-timing` は実際の台帳の待機・実行数でテーブル更新を制御し、進捗・通知は抑止しない。
