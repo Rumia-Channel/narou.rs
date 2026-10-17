@@ -21,6 +21,14 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 0.4.11 最終監査で確認したデータ保全の修正: SQLite のインプレース YAML 書き出しは meta の export_file_sha 指紋を原子的なファイル保存より前に記録し、失敗後の未編集の書き出し残骸を再取り込みしない。管理状態だけでなく database.yaml の作品レコードも対象。ユーザーの編集と narou-compat のファイル優先は維持する。S3 COPY は完全な CopyObjectResult と ETag/LastModified を確認できた場合だけ成功し、200 内 Error・破損応答では元オブジェクトを削除しない。実 HTTP の失敗／成功ケースと、書き出し失敗後の正常保存→再オープンを smoke で確認済み。
 指紋は既存の未編集 projection と次回公開予定を最大2件保持し、2回目が公開前に中断しても保護を失わない。指紋更新と公開は同一ファイルロック内。--out が実 .narou を指す場合も対象。最終 workspace 全 target は1342成功/0失敗/1ignored、Clippy 全 feature -D warnings・Rustdoc -D warnings・core/Worker wasm check 成功。Web CSRF 回帰 fixture は並行CWD変更に影響されない絶対パスへ修正し、HTTPの拒否/許可とキュー状態の検証内容は維持した。
 
+## 未リリース: 既存作品の個別変換設定を正準ストアへ統一（issue #37）
+
+- ミラー無効の SQLite ライブラリで、Web UI は正準 INI を更新するが `NovelSettings::load_for_novel_with_options` は移行前の実ファイルを読んでいた。`native::converter::load_novel_ini` に読み出しを揃え、残存ファイルより SQLite の値を優先する。旧ファイルを上書きして整合させず、YAML / ライブラリ外のファイル読み出しは従来どおり。共有コンストラクタの呼出元にも反映され、公開シグネチャや default / force の優先順は変えない。
+- Documents/WebNovel 配下の Rust TempDir に旧ファイルが残る作品と DB のみの作品を用意。実 Web API が新しい題名・著者名を保存しても、修正前は旧作品だけ生成 txt の先頭 2 行が旧設定、新作品は新設定になることを確認した。
+- 修正後は実ブラウザの個別設定画面で題名・著者名を編集・保存し、実 CLI が `[更新した著者] 更新した題名.txt` を生成、本文の先頭も新しい題名・著者名になった。旧 `setting.ini` は元の 2 行のままで、読み出しによる上書きは無い。Firefox と browser broker は起動できず、独立 Chrome DevTools の検証タブで実画面・保存を確認した。検証タブ・サーバ・ライブラリは終了・削除済み。
+- `cli_compat_boundaries` 6 件と settings の既存 7 件が成功。新しい回帰はミラー有効 / 無効、旧ファイルあり / DB のみ、再編集・設定解除、生成本文の題名・著者名・本文、旧ファイル不変と取り出しファイルの後片付けを実 CLI で検証する。版数は未リリース 0.4.13 のまま。
+- 両 issue 修正後の最終検証: `cargo test --workspace --all-targets --all-features` は 1,367 成功 / 参照 fixture 1 ignored、workspace 全 target / 全 feature の Clippy `-D warnings` と Worker wasm32 check が成功した。依存・lock・ライセンス表示の変更は無い。
+
 ## 未リリース: clean の長時間走査を修正（issue #38）
 
 - `clean` のストア走査は小説全体の再帰一覧を 512 件ずつ取得し、そのたびに SQLite / 実ファイルの全キーを集め直していた。`NativeStore::list_direct_files_sync` で raw / 本文直下だけを取得し、SQLite は object_key の索引範囲と直下判定を使う。正準 DB と実ファイルのみの孤児を併合し、履歴や挿絵を歩かない。

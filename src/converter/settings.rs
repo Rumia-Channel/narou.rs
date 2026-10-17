@@ -199,12 +199,9 @@ impl NovelSettings {
         ignore_force: bool,
         ignore_default: bool,
     ) -> Self {
-        let _original = Self::default();
-
-        let ini_path = archive_path.join("setting.ini");
         let replace_path = archive_path.join("replace.txt");
 
-        let ini = IniData::load_file(&ini_path).unwrap_or_default();
+        let ini = crate::native::converter::load_novel_ini(archive_path).unwrap_or_default();
 
         let data = crate::db::settings::load(SettingScope::Local).unwrap_or_default();
         let mut settings = Self::from_sources(
