@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "narou_rs"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "argon2",
  "axum",
@@ -3271,8 +3271,8 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "ua_generator"
-version = "0.5.83"
-source = "git+https://github.com/spider-rs/ua_generator.git#372fd887c64ca6bfaee7ce5959eb034ae2802af2"
+version = "0.5.86"
+source = "git+https://github.com/spider-rs/ua_generator.git#0f37706daea234585663068d84a9a1aa06e33285"
 dependencies = [
  "dotenvy",
  "fastrand",
