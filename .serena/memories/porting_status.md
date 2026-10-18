@@ -1,6 +1,14 @@
 # narou.rs 移植状況
 
-## 現況（v0.4.14 公開済み・Workers 本番は未反映）
+## 現況（v0.4.15リリース準備）
+
+ユーザーが0.4.15への更新を明示指定。GitHub公開版を実照会した時点ではv0.4.14が最新で、0.4.15は未公開。本体/Worker/両lockを0.4.15へ揃え、ua_generatorを0.5.83（372fd887）から0.5.86（0f37706daea234585663068d84a9a1aa06e33285）へCargo経由で更新済み。Nativeのauto/random UA候補への上流修正であり、明示UAとWorkerの固定Firefox131は変更しない。両noticeはcargo-about0.9.2で再生成し、直接依存57件の手書き表も一致。VERSION.mdの先頭をv0.4.15へ確定した。
+
+cargo check --workspace --all-targets --all-features、Worker wasm32 cargo check、UA選択回帰4件が成功。実CLI --versionは0.4.15 (local-build)。使い捨ての実行例で64回auto UAを生成しFirefoxの収録世代156/157/158と明示UAの優先を確認し、例のソースは削除済み。実サイトの403解消を証明するものではない。既存の公開タグ/配布物は変更せず、v0.4.15の配布物は生成・確認後に公開する。
+
+リレー移行はユーザーの追加指示でmainへno-ff統合し483dcd5をpush済み（その時点は0.4.14のまま・新タグなし）。ユーザーはGitHubのNAROU_RELAY_ENDPOINT等の設定を対処し、Cloud Runの起動成功を報告した。実Worker経由のハーメルン取得・via=curl・Cloud Run出口の国判定は未確認。main pushだけではWorker本番は配備されず、タグまたはproduction手動実行が必要。
+
+## v0.4.14公開とリレー移行の記録
 
 GitHub 最新公開 Release は v0.4.14（2026-10-18 07:00:43 UTC、ID416269164）。`/releases/latest` のタグ・draft=false・配布16ZIPを確認した。ユーザーがこの番号でのタグ作成・公開を明示承認している。main のリリースマージ8e52bb8へタグを作成し、developへもno-ff合流済み（41d58b7）。公開済みタグと配布物は差し替えない。
 
@@ -16,7 +24,7 @@ CIからSORAHOST/run_workersの切替、専用配備workflow、relay-deployとWo
 
 検証: 実Node/ローカルworkerdを実HTTP上流へつないだ既存回帰29件、Rust relay codec9件、配備/DNS回帰26件が成功。Worker wasm32 cargo check成功。新名の設定で手動verify_auth.pyを実行しhealth200・誤認証403・正しい認証で上流200を確認し、直接リレー取得の本文一致・Cookie転送・2つのSet-Cookie保持も観測した。workflow YAML解析ではtargetのみの入力と通常アプリゲートへの依存を確認。新ホストへの実配備の証明ではない。
 
-ユーザーは反映先に「developだけ」を明示選択。mainへの統合・本番配備は今回行わず、既定mainのCI入力表示も次の統合までは旧設定が残る。Cloudflare環境の新名NAROU_RELAY_ENDPOINT/NAROU_RELAY_KEYは照会時点で未登録だったため、旧リレーを継続利用する場合も本体の次回配備前に新名へ設定する必要がある。Secret値は読み出せないので勝手な自動移植はしない。
+当初はユーザーが反映先にdevelopだけを選んだが、その後の明示指示でmainへもno-ff統合・pushした（483dcd5、バージョン/タグは据え置き）。続いてユーザーからCloud Run起動成功とリレー用GitHub Secrets設定済みの報告を受けた。Repository secretsもCIから読め、同名Environment secretがあればそちらが優先する。Secret値は読み出せないため勝手な移植はしない。Worker本番の手動配備とリレー経由の取得成功は未確認。
 
 外部リレーはユーザーの新仕様によりCloud Run Buildpacksの通常Node.js 24 HTTPサービスへ変更。Functions Framework/関数ターゲット/Dockerfile/GHCRは使わず、Developer Connectでdevelopを接続、文脈/scripts/relay、entrypoint/target空欄、npm start=node server.mjs。K_SERVICEでは0.0.0.0、他は127.0.0.1、PORTは尊重する。大阪asia-northeast2、CPU1/512MiB/min0/max1/concurrency1/90秒/request-based。認証キーはSecret ManagerからNAROU_RELAY_KEYへ注入。独立CI方針・Rust codec/with_relay・Worker設定2名とfetch→socket→relayの採用規則は変更しない。手順はdocs/cloud-run-relay.md。
 

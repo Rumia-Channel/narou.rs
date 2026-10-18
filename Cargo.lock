@@ -1845,7 +1845,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "narou_rs"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "aozora_epub3_lite",
  "argon2",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "narou_worker"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "base64 0.23.1",
  "brotli",
@@ -3461,8 +3461,8 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "ua_generator"
-version = "0.5.83"
-source = "git+https://github.com/spider-rs/ua_generator.git#372fd887c64ca6bfaee7ce5959eb034ae2802af2"
+version = "0.5.86"
+source = "git+https://github.com/spider-rs/ua_generator.git#0f37706daea234585663068d84a9a1aa06e33285"
 dependencies = [
  "dotenvy",
  "fastrand",

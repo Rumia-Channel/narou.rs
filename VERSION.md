@@ -3,12 +3,15 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
-## 未リリース
+## v0.4.15 — Cloud Run取得リレー・User-Agent更新
 
+- `ua_generator` を 0.5.83 から 0.5.86 へ更新し、Native の自動・ランダム User-Agent で古いブラウザー世代が候補に残る問題への上流修正を取り込みました。明示的な User-Agent 設定は維持し、Workers の固定 User-Agent は変更しません。
 - CI から SORAHOST 専用の配備・切り替えオプションと、Worker 配備がリレーの再配備を待つ依存を削除しました。Native・Wasm・Worker・ライセンス等の通常の検証は維持します。
 - 外部取得リレーを `scripts/relay/` へ整理し、設定を `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` に統一しました。`/proxy`・`X-Proxy-Token`・応答形式と本体のフォールバックは維持し、リレーの配置先を独立して変更できます。旧設定の自動移行や既存 Secret の削除は行いません。
 - 外部リレーを通常の Node.js 24 HTTP サービスとして Cloud Run Buildpacks / Developer Connect へ配備する構成と日本語手順を追加しました。Cloud Run の PORT と待受に対応し、Functions Framework や Dockerfile、本体 CI への GCP 認証・配備依存は導入しません。
 - 外部リレーに必須のホスト許可リスト、DNS 検証と接続先固定、timing-safe 認証、期限・切断時の中断を追加しました。curl 優先と既存 JSON/base64 契約は維持し、代替 HTTP(S) も同じ安全性検証を通します。Node/curl とローカル Worker の回帰を CI に組み込みました。実 Cloud Run の出口・curl・対象サイトの取得可否は配備後の確認が必要です。
+
+変更一覧は [v0.4.14...v0.4.15](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.14...v0.4.15) を参照してください。
 
 ## v0.4.14 — Workers の取得再開・Pixiv 取得・コンソール表示の改善
 
