@@ -1376,7 +1376,7 @@ limitations under the License.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_rs 0.4.14
+- narou_rs 0.4.15
 
 ```text
 BSD 2-Clause License
@@ -6622,7 +6622,7 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- ua_generator 0.5.83
+- ua_generator 0.5.86
 - block2 0.6.2
 - brotli-decompressor 4.0.3
 - brotli-decompressor 6.0.1

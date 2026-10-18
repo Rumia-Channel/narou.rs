@@ -221,9 +221,11 @@ CPU/メモリ/リクエストだけでなく、インターネットへの転送
 
 ローカルのNode24/Windowsでは、実Node/ローカルworkerdを通す54件とRustリレー9件・HTTP/1.1 codec23件が成功し、Worker wasmチェックも成功しました。実際の`npm start`で8080の公開待受、health200、不正キー403、公開検証先example.comの上流200/本文/`via=curl`、メタデータ宛の拒否、鍵未設定/ポート競合時のexit1を確認しました。
 
+その後、利用者から実サービスの起動成功が報告されています。ただし、以下の実ログ・取得経路・対象サイト応答をこちらで確認したものではありません。
+
 次は**ローカル試験では証明できず、実環境で未検証**です。
 
-- Google Cloud Buildpacksでの実イメージ生成とDeveloper ConnectによるGitHub push後の再配備。
+- Google Cloud Build/Developer Connectの実ログと、GitHub pushからの自動再配備の一連の確認。
 - Google上の実行リビジョンでのcurl起動、CA/TLS、出口IPが日本として扱われるか、対象サイトが取得を許可するか。
 - 実WorkerからCloud RunのHTTPSサービスへの既存socket経路、実データのCookie/本文/画像の取得。
 - 実プロジェクトのIAM、Secret注入、リビジョン切替、スケーリングと請求。
