@@ -14,7 +14,8 @@ try {
 process.stderr.write(`[relay-upload] ${JSON.stringify({ event: 'preload', node: process.version, configured: Boolean(endpoint) })}\n`);
 
 if (endpoint) {
-  channel('http.client.request.start').subscribe(({ request }) => {
+  // start は本文の終端に到達しないと発火しない。早期 408 も created から追う。
+  channel('http.client.request.created').subscribe(({ request }) => {
     if (request.method !== 'POST' || request.getHeader('host') !== endpoint.host || request.path !== endpoint.pathname + endpoint.search) return;
 
     const started = performance.now();
