@@ -8,7 +8,11 @@ Cargo / Worker / 両 lock / 両 notice を0.4.14へ同期し、依存バージ�
 
 ドラフトで生成を待ち、全16ZIPのGitHub SHA-256、CRC、PE/ELF/Mach-O形式、4実行ファイル、commitversion、ライセンス、Pixiv YAML/資産を照合してから公開した。Windowsの署名16件は全Valid、x64通常/GPLの実バイナリは0.4.14。target配下での実行は既存仕様でlocal-build表示になるため、署名済み配布物の検証はソースのtarget外のRust TempDirで実施した。
 
-Workers本番は2026-10-18 07:02 UTCの実APIで0.4.13。タグのPlatform portability実行39103118308はNative/GPL/Wasm/Worker契約/ライセンスが成功したが、前段SORAHOSTリレー配備がHTTP408で失敗し、Worker配備はskip。失敗ジョブだけ再実行しても同じHTTP408だった。詳細な起動原因は未確定で、PteWorkerの起動ログまたはパネル接続が必要。リレーCLIにはリモートログ取得コマンドがなくローカル認証も未設定。ゲートを無視して配備成功とは扱わない。追加D1照会はWrangler認証10000となり最新の取得状態は未確認。
+Workers本番は2026-10-18 07:02 UTCの実APIで0.4.13。タグのPlatform portability実行39103118308はNative/GPL/Wasm/Worker契約/ライセンスが成功したが、SORAHOSTリレー配備のHTTP408でWorker配備がskip。診断用実行39107644985でも、再起動後の07:58 UTCに本文なしのHTTP408が続いた。ユーザー報告ではPteWorkerログは空であり、同じログの提供を再要求しない。
+
+ユーザーがローカルCLIへ認証情報を保存し、PteWorkerを再起動済み。その後のローカル配備は保存されたIP直指定と同じサーバー・ポートのホスト名経由の両方で成功し、health=200、不正認証proxy=403を確認。Cloudflare環境のCI Secretは07:49 UTCにユーザーが更新済みで、同名リポジトリSecretの競合なし。ローカルとCIの差は未確定なので、再起動だけで解決したとは扱わず、秘密値を出さない送信量・応答時間の診断を追加した。Worker配備のゲートは迂回しない。
+
+WranglerのD1照会はproductionのDB UUID指定で成功し、書き込み0件。追跡していた旧ジョブj000001a14cc3660f66881bdbは`cancelled by user via Web UI`で取消済み（05:45 UTC）で、同じtargetの後続ジョブは無かった。ユーザーの取消を勝手に復活させない。最新の本番版数はリレー配備成功後に実APIで確認する。
 
 ## v0.4.13 公開時点の記録（現況ではない）
 
