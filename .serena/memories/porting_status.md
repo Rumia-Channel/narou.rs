@@ -1,10 +1,14 @@
 # narou.rs 移植状況
 
-## 現況（v0.4.14 リリース準備）
+## 現況（v0.4.14 公開済み・Workers 本番は未反映）
 
-2026-10-18、ユーザーが v0.4.14 のタグ作成・公開を明示承認した。基準とした GitHub 最新公開 Release は v0.4.13。Cargo / Worker / 両 lock / 両 license notice を 0.4.14 に更新し、依存バージョン・Git revision は変更していない。VERSION.md の未リリース節を v0.4.14 として確定した。
+GitHub 最新公開 Release は v0.4.14（2026-10-18 07:00:43 UTC、ID416269164）。`/releases/latest` のタグ・draft=false・配布16ZIPを確認した。ユーザーがこの番号でのタグ作成・公開を明示承認している。main のリリースマージ8e52bb8へタグを作成し、developへもno-ff合流済み（41d58b7）。公開済みタグと配布物は差し替えない。
 
-検証: cargo check -p narou_rs、Worker wasm32 cargo check が成功。Native workspace / all-features の lib・bin・integration は1399成功・参照fixture1 ignored。実CLI --version は 0.4.14 (local-build)。cargo-about 0.9.2 で GPL / 非GPL notice を再生成した。main への no-ff 統合・main 上のタグ作成・全配布 ZIP の検証後に公開する。公開・本番配備の完了はまだ主張しない。
+Cargo / Worker / 両 lock / 両 notice を0.4.14へ同期し、依存バージョン・Git revisionは変更なし。VERSION.mdに全未リリース修正を確定。cargo check、Worker wasm32 check、Native workspace/all-featuresのlib/bin/integration1399成功・参照fixture1ignored、実CLIの0.4.14を確認。main統合後も取得/JSON/ログイン/ID回帰26件とbudget回帰4件が成功。cargo-about0.9.2で両noticeを生成した。
+
+ドラフトで生成を待ち、全16ZIPのGitHub SHA-256、CRC、PE/ELF/Mach-O形式、4実行ファイル、commitversion、ライセンス、Pixiv YAML/資産を照合してから公開した。Windowsの署名16件は全Valid、x64通常/GPLの実バイナリは0.4.14。target配下での実行は既存仕様でlocal-build表示になるため、署名済み配布物の検証はソースのtarget外のRust TempDirで実施した。
+
+Workers本番は2026-10-18 07:02 UTCの実APIで0.4.13。タグのPlatform portability実行39103118308はNative/GPL/Wasm/Worker契約/ライセンスが成功したが、前段SORAHOSTリレー配備がHTTP408で失敗し、Worker配備はskip。失敗ジョブだけ再実行しても同じHTTP408だった。詳細な起動原因は未確定で、PteWorkerの起動ログまたはパネル接続が必要。リレーCLIにはリモートログ取得コマンドがなくローカル認証も未設定。ゲートを無視して配備成功とは扱わない。追加D1照会はWrangler認証10000となり最新の取得状態は未確認。
 
 ## v0.4.13 公開時点の記録（現況ではない）
 
