@@ -367,7 +367,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 ### Phase 6-8 Worker backend (2026-08)
 - `narou_rs` の `worker-runtime` feature は `application`、`platform`、portable `db`/`converter::ini` のみを公開する。CLI、Web、native HTTP、filesystem、process、settings adapters は `native-runtime` gate の内側に置く。
 - `worker_entry/` は `workers-rs 0.8.5` の `fetch` / `scheduled` / `queue` eventを公開する。`composition.rs` は D1 の管理・設定・目次アダプタと、本文の圧縮 S3 保存 + D1 参照を担う `ContentStore` を構成する。Worker 固有型を core へ逆流させない。
-- `WorkerHttpClient` は Fetch APIを既存 `HttpClient` traitへ接続する。request/response body上限を強制する。**403 を返した GET は `connect()`（生ソケット）で取り直す**（`platform::http1` の HTTP/1.1 実装）。Cloudflare の `fetch` と `connect()` は出口の IP レンジが異なり（後者は公開レンジ外）、`fetch` だけを弾くサイトがあるため。ソケット側で成功応答が得られたときだけ採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。**全アドレスが Cloudflare の公開レンジ内のサイト（例: ハーメルン）は `connect()` 自体が拒否される**ので、外部踏み台（`scripts/sorahost-proxy/`）が必要。 踏み台は `platform::relay` のプロトコルで呼び出し、送信は `platform::http1` の生ソケット（Worker の `fetch` は `http://` を拒否するため）。設定は Worker secret `SORAHOST_PROXY_ENDPOINT`（接続先。パス込みで可、オリジンに正規化される）と `SORAHOST_PROXY_KEY`（リレーの合言葉。PteWorker の `.env` と同値）。リレー本体 は `scripts/sorahost-proxy/`、配布は `platform.yml` の `relay-deploy` ジョブ（静的 curl と CA バンドルを同梱）で、develop / production の Worker デプロイはその後に直列で実行される。`D1ObjectStore` は logical-key prefix、paged LIST、bounded small read/write、streaming AssetStore を D1 上に実装する。
+- `WorkerHttpClient` は Fetch API を既存 `HttpClient` trait へ接続する。**403 を返した GET は `connect()`（生ソケット）で取り直す**（`platform::http1`）。ソケット側で成功したときだけ採用し、接続拒否・タイムアウト・解析失敗は元の403を保つ。全アドレスが Cloudflare 公開レンジ内のサイト（例: ハーメルン）には、別の出口 IP を持つ外部リレー（`scripts/relay/`）を使う。`platform::relay` の既存プロトコルと生ソケット送信を維持し、設定は Worker secret `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY`。両方が揃ったときだけ有効で、接続先はオリジンに正規化する。リレー自体の配備は本体CIと独立して管理し、Worker配備はリレーの再配備を待たない。
+- `D1ObjectStore` は logical-key prefix、paged LIST、bounded small read/write、streaming AssetStore を D1 上に実装する。
 - `D1NovelRepository` はprepared statements/migrationsでtyped filter/sort、keyset `scan_ids`、atomic sequence allocation、batch mutationをSQL化する。settings、freeze、tag colorsもD1 state/tableへ接続する。
 - `/health/live`、`/health/ready` と認証付き API (`/api/novels*`、`/api/login*`、`/api/sites*`、`/api/jobs*`、`/api/global_setting`、`/api/admin/object-migration`) に加え、Web UI の表示・操作系ルート（`/api/list`、`/api/sort_state`、`/api/webui/config`、`/api/tag_list`、`/api/queue/*`、`/api/feature_tour/*`、`/api/freeze`、`/api/novels/{freeze,unfreeze,remove}`、`/api/edit_tag`、`/api/tag/change_color`、`/api/download`、`/api/convert`、`/api/update*`、`/api/story`、`/api/diff_*`、`/api/notepad/*`、`/api/history`、`/api/taginfo.json`、`/api/version/*.json`）を公開する。実現不能な操作は 501 + 機械可読コード。JSON は core の `application::settings_view` / `web_payloads` / `version_compare` を native と共有する。`NAROU_ADMIN_TOKEN`はconstant-time比較。未知queue envelopeはledgerへ記録して安全にackする (retryしない)。Queue実ジョブ実行 (D1 ledger・bounded retry・checkpoint resume) は Phase 8 で実装済み。
 - Worker production readinessはD1 `DB` bindingと `NAROU_ADMIN_TOKEN` secretを要求する。秘密値はリポジトリへ置かない。
@@ -378,7 +379,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **保存 (2026-10-16 変更)**: **管理情報・目次・本文への参照は D1、本文・旧本文・挿絵は S3 互換ストレージ**。本文は `SectionFile` YAML（抽出 HTML・前後書き・話情報）を話単位で共通 Brotli codec に通し、`content/<ランダム版ID>.bin` に保存する。新版の保存成功後だけ D1 `content_objects` の参照を公開し、サイズ・CRC32・SHA-256 を読み出し時に照合する。`ContentStore` は既存の `ObjectStore` / `AssetStore` を実装し、native の保存方式は変更しない。切替は `app_state('inv','content_backend')` の `d1`（旧方式）→ `migrating`（新規書込み S3、参照なしだけ旧 D1 読み）→ `s3`（参照のみ）の一方向。`asset_backend` は引き続き挿絵専用。**実装・binding・設定キーは `S3_*` / `s3_*` で統一し、ベンダ名を識別子に使わない**。
 - **本文の既定は S3**: 本文ストア初期化時、`content_backend` が未設定なら旧 D1 本文・履歴が無い場合は `s3`、残る場合は `migrating` を選び、新規本文を S3 に保存する。明示的な `d1` は非必須環境だけで維持し、`NAROU_REQUIRE_S3=true` では同じ規則で進める。S3 構成成功後、旧本文の存在判定と marker 保存を primary の単一 SQL で行い、既存 `migrating` / `s3` を戻さない。一括コピー・照合・削除は引き続き管理 API で行う。`plan` / `status` は初期化せず、未設定を `d1` と報告する読み取り専用である。
 - **S3 必須配備**: develop/production の CI は `NAROU_REQUIRE_S3=true` を渡す。挿絵は旧 `asset_backend=d1` や未設定でも S3 を選び、D1 の旧挿絵を移行・削除・代替参照しない。管理・目次・設定は D1、本文・履歴は独立した `content_backend` に従う。保存済み marker は canonical JSON と既存 raw TEXT の `d1`/`s3` を受け付け、不正値・読み取り失敗は拒否する。S3 の設定/通信失敗でも D1 へ戻さない。認証済み `/api/storage/mode?probe=s3` の実ストア選択と bounded LIST 成功を CI で必須確認し、一般 smoke の省略を成功扱いしない。**例外は前段の Cloudflare Access が答えた 403 だけ** (2026-10-06 決定): custom domain が Access の内側にあり CI に service token が無い場合、CI からは検証しようがないため `::warning::` 付きのスキップとし、ステップサマリも `skipped: blocked before the Worker …; not verified` と表示する (成功扱いにしない)。401 / 503 / 到達不可などの他の失敗は従来どおりジョブを失敗させる。403 を例外にできる根拠は「Worker はこの経路で 403 を返さない」こと (S3 LIST 失敗は `worker_entry/src/storage_probe.rs` が 503、認証失敗は 401)。プローブは urllib 既定の UA が Cloudflare のボット判定に掛かって 403 になっていたため、アプリ本体と同じブラウザ風の `User-Agent` (`ci/deploy_worker.py` の `PROBE_USER_AGENT`) を必ず送る。警告には前段の手掛かり (`cf-mitigated` など) を付けて切り分けられるようにする。配備ジョブの env には `NAROU_REQUIRE_S3: "true"` も置き、smoke (`contract.mjs`) 自身にも同じ `?probe=s3` 検査をさせる — Python プローブが前段の 403 でスキップした場合でも必須確認が残る (2026-10-06 時点の実測: UA 修正後に `S3 backend + LIST: ok`)。
-- **SORAHOST と Workers のホスト名の取り合い (2026-10-06)**: 配備先は Repository variable `SORAHOST` (`T`=SORAHOST / `F`=Workers) で切り替わり、**動いている側がホスト名を持つ**。`T` の間は Workers のジョブが workflow の `if` で止まる。`F` のとき Workers が同じホスト名を使おうとして SORAHOST のコネクタが作った DNS レコードに当たると、wrangler は `externally managed DNS records` (Cloudflare code 100117) で失敗するため、`ci/deploy_worker.py` が `NAROU_DOMAIN_MODE=route` で設定を組み直して `[[routes]] pattern = "<domain>/*"` + `custom_domain = false` として載せ直す (DNS は触らず、そのホスト名の Access はそのまま効く)。`NAROU_SORAHOST=T` のときは逆に奪わず失敗させる。zone の自動判定が効かない環境では `NAROU_ZONE_NAME` を置くと route に `zone_name` を明示する。実装は `ci/render_config.py` の `NAROU_DOMAIN_MODE` (`custom_domain` 既定 / `route`) と `deploy_worker.py` の `DNS_CONFLICT_MARKER` フォールバック。
+- **既存DNSレコードとの競合**: wrangler の `externally managed DNS records`（Cloudflare code100117）では、`ci/deploy_worker.py` が `NAROU_DOMAIN_MODE=route` で組み直し、同じホスト名へ `[[routes]] pattern="<domain>/*"` + `custom_domain=false` で載せ直す。DNSは削除せず、Accessもホスト名単位のまま維持する。zoneの自動判定が効かない場合は `NAROU_ZONE_NAME` を指定する。特定ホスティング先の所有権判定や配備先切り替え変数は置かない。
 - **EPUB は保存しない**: AozoraEpub3_Lite で、Web UI の DL 要求時に保存済みデータからストリーミング生成する。**Workers では raw HTML などのキャッシュを一切保存しない**（native は従来どおりで `.narou/` 互換に影響なし）。
 - **挿絵の取得はダウンロード時 (2026-10-08 修正)**: 挿絵の実体はダウンロード時に取得して S3 へ書く (Worker の変換は native と違い挿絵をローカライズしない)。取得対象はサイト定義の `illust_grep_pattern`、無ければ **narou.rb `HTML#initialize` の既定 `<img>` パターン** (`src/downloader/mod.rs` の `DEFAULT_ILLUST_GREP_PATTERN`)。なろう / R18なろう / カクヨム / Arcadia はこの経路で挿絵を持つ。既定パターンでは narou.rb `Illustration#scanner` と同じく URL でない注記 (相対パス) は取得せず、挿絵 URL は protocol-relative (`//host/...`) を含めて本文のスキームで解決し、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない。
 - **索引と実体の突き合わせ (自己修復, 2026-10-08 修正)**: `.illustration_cache.yaml` はメタデータなので実体の存在を保証しない (ストアの切替・手動削除・別環境での取得で「索引にあるのに実体が無い」状態になる)。索引が空でないときだけ `<prefix>/挿絵` を 1 回 (最大 1000 件 × 10 ページ) 一覧し、索引が知っているファイル名が無ければ **取り直す** (`PersistenceService::list_illustration_names` → `Downloader::download_illustration`)。一覧に失敗したときは従来どおり索引だけで判断する。debug-mode では `挿絵: 保存済み N 件 / 索引 M 件 (<prefix>)` と `挿絵: 索引にはありますが実体が無いので取り直します: 挿絵/<file> (<url>)` を出すので、S3 と D1 のどちらに実体があるかを切り分けられる。一覧が空を返したときは索引のファイルを `stat` で 1 枚ずつ確認する (`verify_indexed_illustrations`、上限 64 件) ので、LIST が prefix の解釈差で空を返す環境でも取り直しの誤判定をしない。
@@ -631,29 +632,13 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   保存先が利用者自身の設定値であることを示し、公開アドレス判定を掛けず (ローカル MinIO を許可)、
   応答ヘッダを全部返す (`ETag` / `Content-Range` が保存先の契約)。
 
-### SORAHOST (PteWorker) への配備 (2026-09)
+### 外部リレーの独立運用
 
-- 専用サーバー 1 台で native `narou_rs` を動かす。配備は `sorahost-cli` に任せ、CI の必要値は
-  `SORAHOST_ENDPOINT` / `SORAHOST_TOKEN` の 2 つだけ (`.github/workflows/deploy-sorahost.yml`)。
-  Repository variable `SORAHOST` が `T` のときだけ動き、その間は `platform.yml` の Worker 系
-  ジョブ (wasm / worker / worker-contract / relay-deploy / worker-deploy-*) も skip する。
-- **公開は PteWorker が行う**。アプリはプラットフォームから渡される `PORT` にループバックで
-  束縛する (`sorahost/start.sh`)。cloudflared / SFTP / パネル API を使う実装は 2026-09 に撤去した
-  (任意だった tunnel も不要になったため)。
-- 配置は `sorahost/sorahost.json` (`mode: node` / `start: sh start.sh` /
-  `include: [app, start.sh, sorahost.json]`)。**PteWorker は配備ごとに
-  `/home/container/.sorahost/releases/<日時>-<hash>/` を作り直す**ので、ライブラリは
-  その外 (`$VOLUME_DIR/narou-library`) に置く (`start.sh` が自動で割り出す)。
-- **basic 認証**: 資格情報が空だと narou は素通しにするため、`start.sh` は未設定なら
-  ランダムなパスワードを生成して設定し、コンソールに表示する (起動を止めると PteWorker が
-  デプロイ失敗 422 と見なし、前のリリースを配り続ける — 実測)。
-- **`server-ws-port=0` が必要**: narou.rb の `server-port + 1` は PteWorker が自分の
-  ルータ (workerd) に使う番号と衝突し、プラットフォーム側が `Address already in use`
-  で落ちる。`0` で併設リスナーを切ると本体ポートの `/ws` だけで受ける。
-- 取得リレー (`scripts/sorahost-proxy/`) は**別サーバー**に置くのが既定。同居させるときだけ
-  `NAROU_RELAY=1` + `vars.SORAHOST_RELAY_START=bash start.sh` (そのときプラットフォームの
-  `PORT` はリレーが使い、narou は 8080)。
-- 手順・実測値・注意は `sorahost/README.md`。
+- 本体 CI は Native / GPL / Wasm / Worker / ライセンス等の通常の検証後に Worker を配備する。SORAHOST 専用ジョブ・`SORAHOST` 変数・`run_workers` 入力・リレー配備への `needs` は撤去済みで、再導入しない。
+- 外部取得リレーは `scripts/relay/`。Node + curl 版と fetch ランタイム版があり、`GET|POST /proxy`、`X-Proxy-Token`、JSON/base64 応答を共通契約とする。本体の `platform::relay` と `WorkerHttpClient::with_relay` は維持する。
+- Worker とリレーに同じ `NAROU_RELAY_KEY`、Worker に `NAROU_RELAY_ENDPOINT` を設定する。旧 `SORAHOST_PROXY_*` の別名は受け付けない。公開運用では HTTPS を使い、Node 版の既定待受 `127.0.0.1:${PORT:-3000}` はリバースプロキシで公開する。
+- 本体 CI はホストのプロビジョニングやリレーの配備を行わない。配置後の確認は `python3 scripts/relay/verify_auth.py`、実 HTTP の契約確認は `tests/relay.test.mjs` を使う。詳細は `docs/platform-abstraction.md`。
+- 既存のサービス・Secret・保存済み資格情報はコード変更だけで削除しない。新しい設定を用意する前に、旧設定を勝手に消したり本番の取得を無効化したりしない。旧ホストの手動 native 配置資料は `sorahost/README.md` に残すが、CI とは接続しない。
 
 ### Worker の契約テスト (2026-09)
 

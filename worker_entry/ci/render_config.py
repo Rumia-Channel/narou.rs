@@ -196,8 +196,8 @@ def main() -> None:
         if not HOSTNAME_PATTERN.fullmatch(domain) or "." not in domain:
             fail(f"{domain_var} must be a hostname without a scheme or path")
         # custom domain は Cloudflare に DNS レコードを作らせる (= 既存レコードが
-        # あると "externally managed DNS records" で失敗する)。SORAHOST の
-        # コネクタのように既存レコードがそのホスト名を握っている場合は、
+        # あると "externally managed DNS records" で失敗する)。既存の
+        # フロントエンド等がそのホスト名を握っている場合は、
         # `NAROU_DOMAIN_MODE=route` で Workers の route として載せる — DNS は
         # 触らず、そのホスト名への要求は Workers が前段で受ける (Access も
         # ホスト名単位のまま効く)。

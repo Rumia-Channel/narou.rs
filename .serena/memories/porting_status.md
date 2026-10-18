@@ -8,11 +8,17 @@ Cargo / Worker / 両 lock / 両 notice を0.4.14へ同期し、依存バージ�
 
 ドラフトで生成を待ち、全16ZIPのGitHub SHA-256、CRC、PE/ELF/Mach-O形式、4実行ファイル、commitversion、ライセンス、Pixiv YAML/資産を照合してから公開した。Windowsの署名16件は全Valid、x64通常/GPLの実バイナリは0.4.14。target配下での実行は既存仕様でlocal-build表示になるため、署名済み配布物の検証はソースのtarget外のRust TempDirで実施した。
 
-Workers本番は2026-10-18 07:02 UTCの実APIで0.4.13。タグのPlatform portability実行39103118308はNative/GPL/Wasm/Worker契約/ライセンスが成功したが、SORAHOSTリレー配備のHTTP408でWorker配備がskip。診断用実行39107644985でも、再起動後の07:58 UTCに本文なしのHTTP408が続いた。ユーザー報告ではPteWorkerログは空であり、同じログの提供を再要求しない。
+Workers本番は保護付きservice binding経由の実API（GET200）で0.4.13を確認。公開済み0.4.14は変更しない。SORAHOSTリレー配備失敗で本番反映が止まっていたが、ユーザーの指示でCIの提供元依存を除去する方針へ切り替えた。本番サービスやSecretの切り替え・削除は行っていない。
 
-ユーザーがローカルCLIへ認証情報を保存し、PteWorkerを再起動済み。その後のローカル配備は保存されたIP直指定と同じサーバー・ポートのホスト名経由の両方で成功し、health=200、不正認証proxy=403を確認。Cloudflare環境のCI Secretは07:49 UTCにユーザーが更新済みで、同名リポジトリSecretの競合なし。ローカルとCIの差は未確定なので、再起動だけで解決したとは扱わず、秘密値を出さない送信量・応答時間の診断を追加した。Worker配備のゲートは迂回しない。
+最後の旧CI39112462468は、送信予定2912769 bytesに対しsocket.bytesWritten=131420（ヘッダ等を含み、相手の受信量ではない）で停止し、writableLength=65536・writableFinished=falseのまま約35.3秒で本文なしHTTP408。TCP接続はIPv4で成立していた。ユーザー報告のPteWorkerログは空であり、再要求・無変更リトライはしない。原因をホスティング事業者の障害と断定しない。
 
-WranglerのD1照会はproductionのDB UUID指定で成功し、書き込み0件。追跡していた旧ジョブj000001a14cc3660f66881bdbは`cancelled by user via Web UI`で取消済み（05:45 UTC）で、同じtargetの後続ジョブは無かった。ユーザーの取消を勝手に復活させない。最新の本番版数はリレー配備成功後に実APIで確認する。
+CIからSORAHOST/run_workersの切替、専用配備workflow、relay-deployとWorkerの依存、提供元別DNS所有権判定を削除。Native/GPL/Wasm/Worker/licenseの通常ゲートと一般的なDNS競合時route切替は維持する。外部リレーはscripts/relay/、設定はNAROU_RELAY_ENDPOINT/NAROU_RELAY_KEYに統一し、旧名の別名は置かない。/proxy、X-Proxy-Token、JSON/base64、全Set-Cookie、非follow・上限とRust公開codec/with_relayは維持する。新名のSecretを用意する前に本番の旧リレーを無効化しない。旧ホストの手動native資料は残すがCIから切り離す。
+
+検証: 実Node/ローカルworkerdを実HTTP上流へつないだ既存回帰29件、Rust relay codec9件、配備/DNS回帰26件が成功。Worker wasm32 cargo check成功。新名の設定で手動verify_auth.pyを実行しhealth200・誤認証403・正しい認証で上流200を確認し、直接リレー取得の本文一致・Cookie転送・2つのSet-Cookie保持も観測した。workflow YAML解析ではtargetのみの入力と通常アプリゲートへの依存を確認。新ホストへの実配備の証明ではない。
+
+ユーザーは反映先に「developだけ」を明示選択。mainへの統合・本番配備は今回行わず、既定mainのCI入力表示も次の統合までは旧設定が残る。Cloudflare環境の新名NAROU_RELAY_ENDPOINT/NAROU_RELAY_KEYは照会時点で未登録だったため、旧リレーを継続利用する場合も本体の次回配備前に新名へ設定する必要がある。Secret値は読み出せないので勝手な自動移植はしない。
+
+Wrangler D1のDB UUID指定照会は書き込み0件。旧ジョブj000001a14cc3660f66881bdbはcancelled by user via Web UIで取消済みで、同じtargetの後続ジョブは無かった。取消を勝手に復活させない。旧配備の診断用公開プローブは認証付きGET限定で使用後に停止・削除し、保存済みのローカルログイン資格情報は保持した。
 
 ## v0.4.13 公開時点の記録（現況ではない）
 

@@ -1,7 +1,7 @@
-//! SORAHOST 取得リレー (`scripts/sorahost-proxy/`) のプロトコル・コーデック。
+//! 外部取得リレー (`scripts/relay/`) のプロトコル・コーデック。
 //!
 //! Cloudflare Workers の Fetch API が弾かれるサイト (ハーメルン等) を、
-//! SORAHOST (PteWorker) 上の踏み台から中継取得するためのリクエスト組み立てと
+//! 任意の配置先の踏み台から中継取得するためのリクエスト組み立てと
 //! 応答パースだけを提供する。トランスポート (Fetch / `connect()` 生ソケット)
 //! は呼び出し側が持つ。
 //!
@@ -11,11 +11,11 @@
 //! GET|POST /proxy
 //!   GET : ?url=<URL エンコード>&headers=<base64(JSON オブジェクト)>
 //!   POST: {"url": "...", "headers": {...}}
-//! 認証: X-Proxy-Token: <SORAHOST_PROXY_KEY>
+//! 認証: X-Proxy-Token: <NAROU_RELAY_KEY>
 //! 応答: {"status": 200, "contentType": "...", "location": "...",
 //!        "setCookie": ["..."], "via": "curl", "body": "<base64>"}
 //! 失敗: {"status": <上流>, "error": "..."} /
-//!       HTTP 403 {"error":"forbidden"} / 500 {"error":"SORAHOST_PROXY_KEY is not set"}
+//!       HTTP 403 {"error":"forbidden"} / 500 {"error":"NAROU_RELAY_KEY is not set"}
 //! ```
 //!
 //! 踏み台は 1 リクエストにつき上流を 1 回だけ取得し、リダイレクトは辿らない
@@ -116,7 +116,7 @@ impl RelayRequest {
     ///
     /// - `base_url`: 踏み台のベース URL (`http://<IP>:<port>/`)。オリジン
     ///   (scheme://host:port) だけが使われ、パスがあっても `/proxy` に固定される。
-    /// - `token`: `SORAHOST_PROXY_KEY`。空・制御文字入りは拒否する。
+    /// - `token`: `NAROU_RELAY_KEY`。空・制御文字入りは拒否する。
     /// - `target_url`: 中継してほしい取得先。`http(s)` 以外は踏み台が 400 を
     ///   返すため、ここで弾く。
     /// - `headers`: 取得先に転送するヘッダ (例: `FetchPolicy::headers()`)。

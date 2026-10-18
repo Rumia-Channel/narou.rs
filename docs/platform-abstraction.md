@@ -549,52 +549,60 @@ Worker (worker_entry)
 レンジを弾くサイト（例: CloudFront 配信のカクヨム）でも後者なら 200 が返る。ソケット側で
 2xx/3xx が得られたときだけ採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。
 **全アドレスが Cloudflare の公開レンジ内にあるサイト（例: ハーメルン）は `connect()` 自体が
-ランタイムに拒否される**ため、外部の踏み台（SORAHOST の `scripts/sorahost-proxy/` など）が別途必要。
+ランタイムに拒否される**ため、別の出口 IP を持つ外部の踏み台（`scripts/relay/`）が別途必要。
 
-#### 3 段目: 外部リレー（SORAHOST）
+#### 3 段目: 外部リレー
 
-Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト（全アドレスが Cloudflare の
-公開レンジ内にあり、`connect()` 自体が拒否されるもの）のために、外部の取得リレーを 3 段目に持つ。
+Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト向けに、外部の取得リレーを
+3 段目に持つ。リレーのホスティングと配置・更新は、本体の CI から独立して管理する。
 
-- プロトコルは `src/platform/relay.rs`。呼び出し側は `POST /proxy` の JSON 本文で
-  `url` と `headers` を送り、`X-Proxy-Token` で認証する。Cookie 等を URL に載せない。
-  応答の本文・メタデータ・ヘッダ・ステータスを上限と共通規則で検証する。
-- `worker_entry/src/http.rs` のリレー送信は `platform::http1` の `SocketTarget` と
-  `connect()` を使う (Worker の `fetch` は `http://` を拒否するため)。サイト定義の
-  ヘッダはそのまま転送し、返ったリダイレクトは共通の `RedirectChain` で扱う。
-- 設定は Worker secret `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY`。接続先は
-  パス込みで渡してよく、`RelayRequest` がオリジンに正規化する (`http` / `https` の
-  どちらも可)。未設定ならこの段は無効。
-- リレー本体は `scripts/sorahost-proxy/`（PteWorker のコンテナに curl が無いため、
-  CI が静的 curl と CA バンドルを同梱して配布する）。配布は `platform.yml` の
-  `relay-deploy` ジョブが行い、develop / production のデプロイはその後に直列で走る。
+- プロトコルは `src/platform/relay.rs`。`POST /proxy` の JSON 本文で `url` と `headers` を送り、
+  `X-Proxy-Token` で認証する。GET も受け付けるが、Cookie 等を URL に載せない。
+- `worker_entry/src/http.rs` は既存の `with_relay` と `platform::http1` の生ソケットで送信する。
+  サイト定義のヘッダを転送し、返ったリダイレクトは呼び出し側の共通 `RedirectChain` が検証する。
+- 応答の JSON/base64、全 `Set-Cookie`、ステータス、本文・メタデータの上限は従来どおり。
+  踏み台自身はリダイレクトを追跡せず、本文の途中切れを成功として返さない。
+- Worker の設定は `NAROU_RELAY_ENDPOINT` と `NAROU_RELAY_KEY`。両方が揃ったときだけ有効。
+  接続先は `http` / `https` に対応し、パスを含んでもオリジンに正規化して `/proxy` へ送る。
+  未設定ならリレー段は無効で、取得できないサイトが残り得る。
 
-#### リレーの認証（2026-09-29 確認）
+#### リレーの配置と設定
 
-合言葉は **HTTP ヘッダ 1 本**で、Worker とリレーが同じ値を突き合わせるだけの方式。
+`scripts/relay/server.mjs` は Node.js と curl のある任意の外部サーバーで動かす。
+依存 npm パッケージは無い。`NAROU_RELAY_KEY` を安全に環境へ設定してから起動する:
 
-| 向き | 実装 | 内容 |
-| --- | --- | --- |
-| Worker → リレー | `src/platform/relay.rs` (`TOKEN_HEADER = "x-proxy-token"`) | `GET|POST /proxy` に `X-Proxy-Token: <SORAHOST_PROXY_KEY>` を付ける |
-| リレー (node) | `scripts/sorahost-proxy/server.mjs` | `req.headers["x-proxy-token"] !== process.env.SORAHOST_PROXY_KEY` なら 403。未設定なら起動しない |
-| リレー (worker) | `scripts/sorahost-proxy/worker/worker.mjs` | 同じ比較。未設定なら 500 (`SORAHOST_PROXY_KEY is not set`) |
-| 死活確認 | 両方 | `GET /health` だけは認証なしで 200 `{ok:true}` |
+```sh
+node scripts/relay/server.mjs
+```
 
-- **資格情報は 3 つあり、用途が違う**: `SORAHOST_PROXY_ENDPOINT`（リレーの公開先 =
-  Worker の接続先 = `sorahost-cli` のエンドポイント）、`SORAHOST_PROXY_TOKEN`
-  （`sorahost-cli` のデプロイトークン。`Authorization: Bearer` で `POST <endpoint>/deploy`
-  に送る）、`SORAHOST_PROXY_KEY`（リレーの合言葉 = `X-Proxy-Token`）。前 2 つは
-  Cloudflare environment の secret で、`SORAHOST_PROXY_KEY` は **コンテナの `.env`**
-  （PteWorker の画面）にも同じ値を置く。CLI は環境変数を注入できないため、
-  この二重管理は自動化できない。
-- **合言葉がずれると静かに壊れる**: 403 は `RelayError::Rejected` になり、Worker は
-  元の `fetch` の結果（多くは 403）へ戻る。つまり「一部のサイトだけ取得できない」という
-  形で現れる。そのため `relay-deploy` は配備直後に `scripts/sorahost-proxy/verify_auth.py`
-  を走らせ、①`/health` の到達性 ②**わざと違うトークンで 403**（認証が効いている）
-  ③**正しいトークンで 403/500 にならない**（`.env` と secret が一致）を確かめる。
-  不一致ならこのジョブが落ち、`needs` で Worker のデプロイも止まる。
-- 経路は平文 http でもよいが、その場合 `X-Proxy-Token` は平文で流れる。エンドポイントに
-  `https://` を置けるならそちらを使う（生ソケット経路も TLS を張れる）。
+待受は `127.0.0.1:${PORT:-3000}`。外部からは HTTPS のリバースプロキシを通す。
+curl を実行できない fetch ランタイム向けには `scripts/relay/worker/worker.mjs` もあるが、
+取得可否はそのランタイムと出口 IP に依存する。配置先で実際の対象サイトを確認する。
+
+GitHub の `Cloudflare` 環境には同名の Secret `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` を置く。
+本体 CI はこれらを Worker に渡すだけで、リレーのホスト作成・配備・認証確認は実行しない。
+旧 `SORAHOST_PROXY_*` からの別名参照は無いため、切り替え前に新名へ設定する。
+既存のサービス・Secret・ローカル資格情報は、ソース変更によって自動削除しない。
+
+#### リレーの認証と手動確認
+
+| 向き | 設定・契約 |
+| --- | --- |
+| Worker → リレー | `NAROU_RELAY_ENDPOINT` のオリジンへ `X-Proxy-Token: <NAROU_RELAY_KEY>` を送る |
+| リレー側 | 同じ `NAROU_RELAY_KEY` と照合。不一致は 403。Node 版は鍵未設定なら起動しない |
+| 死活確認 | 鍵を設定して起動したリレーの `GET /health` は認証なしで 200 `{ok:true}` |
+
+合言葉がずれるとリレーは拒否し、Worker は元の取得結果へ戻るため、一部サイトの取得失敗として
+現れる。配置後は接続先と合言葉を環境に設定して手元で確認する:
+
+```sh
+python3 scripts/relay/verify_auth.py
+```
+
+このコマンドは `/health`、誤った合言葉での 403、正しい合言葉での取得を確認する。
+検証用の取得先は `NAROU_RELAY_PROBE_URL`、制限秒数は `NAROU_RELAY_TIMEOUT` で変更できる。
+リレーの実 HTTP 契約は `tests/relay.test.mjs` が Node 版とローカル Worker 版を対象に検証する。
+平文 HTTP では認証・Cookie も平文で流れるため、公開運用では HTTPS を使う。
 
 ### 操作ごとのメッセージ（native CLI / Worker Web コンソール）
 

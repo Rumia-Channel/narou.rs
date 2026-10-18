@@ -58,6 +58,7 @@ __pycache__/
 /worker_entry/wrangler.test.toml
 /worker_entry/.dev.vars
 /scripts/sorahost-proxy/worker/.dev.vars
+/scripts/relay/worker/.dev.vars
 # deploy_worker.py が一時的に作る secret ファイル (終了時に消すが念のため)
 /worker_entry/.deploy-secrets-*.json
 /worker_entry/.provision-output

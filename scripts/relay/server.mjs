@@ -1,18 +1,18 @@
-// SORAHOST (PteWorker) 上で動かす取得プロキシ。
+// 外部サーバー上で動かす取得リレー。
 //
 // 目的: Cloudflare Workers から取得できないサイト (ハーメルン等) を、
-// SORAHOST の出口 IP から取得して中継する。依存パッケージなし。
+// 配置先の出口 IP から取得して中継する。依存パッケージなし。
 //
 // 実測にもとづき curl を主クライアントにする:
 //   同じ回線・同じ UA でも curl は 200、Node の https / fetch(undici) は
 //   403 (Cloudflare のチャレンジ) になる。クライアント実装 (TLS フィンガー
 //   プリント等) が判定に効くため、curl を使う。
 //
-// PteWorker はループバックへのバインドと PORT 環境変数の使用を求めるため、
+// TLS 終端などのリバースプロキシの背後で動かすため、
 // 127.0.0.1:$PORT で待ち受ける。
 //
 // 使い方:
-//   SORAHOST_PROXY_KEY=<長いランダム文字列> node server.mjs
+//   NAROU_RELAY_KEY=<長いランダム文字列> node server.mjs
 //
 // 呼び出し (Worker 側):
 //   POST /proxy  { "url": "https://syosetu.org/novel/426898/1.html",
@@ -28,8 +28,8 @@
 // 応答の Set-Cookie は全部 `setCookie` に載せる (ログインセッションの更新は
 // 1 本も落とせない)。
 //
-// 認証: X-Proxy-Token ヘッダが SORAHOST_PROXY_KEY と一致しない限り 403 を返す。
-// オープンプロキシ化を防ぐため SORAHOST_PROXY_KEY 未設定では起動しない。
+// 認証: X-Proxy-Token ヘッダが NAROU_RELAY_KEY と一致しない限り 403 を返す。
+// オープンプロキシ化を防ぐため NAROU_RELAY_KEY 未設定では起動しない。
 
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
@@ -48,12 +48,11 @@ import {
   readResponseBytes,
 } from "./worker/protocol.mjs";
 const PORT = Number(process.env.PORT || 3000);
-const TOKEN = process.env.SORAHOST_PROXY_KEY || "";
+const TOKEN = process.env.NAROU_RELAY_KEY || "";
 const FETCH_TIMEOUT_MS = 30_000;
 const CURL_TIMEOUT_SECS = 30;
 
-// CI でビルドした静的 curl をデプロイに同梱している場合はそれを使う。
-// (Pterodactyl のコンテナには curl / wget / python3 が入っていないため)
+// 配置先の curl を使う。静的 curl を同梱した場合はそれを優先する。
 const BUNDLED_CURL = "./curl";
 const BUNDLED_CACERT = "./cacert.pem";
 // デプロイ先は読み取り専用で実行ビットも落ちるため、書き込み可能な場所へ
@@ -74,7 +73,7 @@ const prepareCurl = () => {
 const CURL_BIN = prepareCurl();
 
 if (!TOKEN) {
-  console.error("SORAHOST_PROXY_KEY が未設定です。長いランダム文字列を設定してください。");
+  console.error("NAROU_RELAY_KEY が未設定です。長いランダム文字列を設定してください。");
   process.exit(1);
 }
 
@@ -290,5 +289,5 @@ createServer((req, res) => {
     res.end(JSON.stringify({ error: String(error) }));
   });
 }).listen(PORT, "127.0.0.1", () => {
-  console.log(`sorahost proxy listening on 127.0.0.1:${PORT}`);
+  console.log(`narou relay listening on 127.0.0.1:${PORT}`);
 });

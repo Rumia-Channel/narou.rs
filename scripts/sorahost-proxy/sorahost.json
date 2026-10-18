@@ -1,6 +1,0 @@
-{
-  "mode": "node",
-  "framework": "node",
-  "start": "node server.mjs",
-  "include": ["server.mjs", "worker/protocol.mjs", "curl", "cacert.pem"]
-}
