@@ -357,7 +357,8 @@ jobs:
           SORAHOST_TOKEN: ${{ secrets.SORAHOST_PROXY_TOKEN }}
         run: |
           cd build
-          npx --yes sorahost-cli deploy --yes --json
+          # --json は HTTP エラーの detail を省くため、通常表示で応答を残す。
+          npx --yes sorahost-cli deploy --yes --no-color
 
       # 配備したリレーが Worker 側の合言葉を受け付けるかを実際に叩いて確かめる。
       # 合言葉がずれていると Worker からは 403 になり、取得できないサイトが黙って増える。
