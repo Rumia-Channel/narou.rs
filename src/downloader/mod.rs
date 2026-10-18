@@ -1319,6 +1319,7 @@ impl Downloader {
         // Preprocess job results belong to one novel: a new download starts
         // with an empty set so nothing leaks between works.
         self.preprocess_jobs.reset();
+        self.section_cache = section::SectionCache::new();
         let (existing_id, setting) = self.resolve_target_for_download(target).await?;
         let setting = setting.clone();
         let (provisional_id, reservation) = match existing_id {
@@ -1385,7 +1386,9 @@ impl Downloader {
         // Login fallback: a novel already flagged as needing authentication
         // sends the stored cookie from the first request; every other novel
         // stays anonymous until a fetch actually fails.
-        let login_cookie = match existing_id {
+        let mut configured_cookie = setting.cookie.clone();
+        let mut login_session: Option<String> = None;
+        let mut login_cookie = match existing_id {
             Some(id) => {
                 let record = self.novels.get(id.into()).await.ok().flatten();
                 let requires = record.as_ref().is_some_and(|record| record.requires_login);
@@ -1404,6 +1407,7 @@ impl Downloader {
                             return None;
                         }
                         apply_login_cookie(&mut setting, &cookie, &group.cookies);
+                        login_session = Some(group.id.clone());
                         Some(cookie)
                     })
                 } else {
@@ -1413,9 +1417,7 @@ impl Downloader {
             None => None,
         };
         let mut requires_login = login_cookie.is_some();
-        // 採用した資格情報の ID。小説レコードに残して次回の最初の
-        // リクエストで同じセッションを使う。
-        let mut login_session: Option<String> = None;
+        let mut login_site_changed = false;
         let (resolved_toc_url, prefetched_toc) =
             match crate::downloader::http_policy::resolve_final_url_with_body(
                 self.http.as_ref(),
@@ -1427,7 +1429,17 @@ impl Downloader {
             {
                 Ok((final_url, _body)) if final_url != toc_url => {
                     let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
-                    if let Some(final_setting) = self.find_site_setting(&final_url) {
+                    if let Some(mut final_setting) = self.find_site_setting(&final_url) {
+                        configured_cookie = final_setting.cookie.clone();
+                        if final_setting.domain == setting.domain {
+                            final_setting.cookie = setting.cookie.clone();
+                            final_setting.login_cookie_hosts = setting.login_cookie_hosts.clone();
+                        } else {
+                            login_site_changed = true;
+                            login_cookie = None;
+                            login_session = None;
+                            requires_login = false;
+                        }
                         setting = final_setting;
                         (
                             setting
@@ -1517,10 +1529,8 @@ impl Downloader {
         // the user never signed in to behave exactly as before.
         let mut toc_source = toc_source;
         let login_wall = should_retry_with_login(&setting, &toc_source);
-        let partial_view = !login_wall && is_partial_login_view(&setting, &toc_source);
-        if login_cookie.is_none() && (login_wall || partial_view) {
-            // 保存済みの資格情報を順に試す。ログイン壁は成功した時点で、
-            // 部分一覧は「欠けが消えた／話数が増えた」時点で打ち切る。
+        if login_cookie.is_none() && login_wall {
+            // ログイン壁だけ先に解消する。部分一覧の比較は全ページを読んでから行う。
             let groups = self.stored_groups_for(&setting).await;
             if !groups.is_empty() {
                 self.report_line(messages::download::login_retry());
@@ -1529,32 +1539,21 @@ impl Downloader {
                 for group in &groups {
                     setting.cookie = base_cookie.clone();
                     apply_login_cookie(&mut setting, &group.merged_cookie(), &group.cookies);
+                    let mut candidate_jobs = preprocess::PreprocessJobs::new();
                     let retried = fetch_toc(
                         self.http.as_ref(),
                         self.rate_limiter.as_ref(),
                         &setting,
                         &toc_url,
-                        &mut self.preprocess_jobs,
+                        &mut candidate_jobs,
                     )
                     .await;
-                    if partial_view {
-                        if is_improved_toc(&setting, toc_source.as_ref(), retried.as_ref()) {
-                            let resolved = retried
-                                .as_ref()
-                                .is_ok_and(|source| !setting.is_partial_login_view(source));
-                            requires_login = true;
-                            login_session = Some(group.id.clone());
-                            toc_source = retried;
-                            winner = Some(group.clone());
-                            if resolved {
-                                break;
-                            }
-                        }
-                    } else if retried.is_ok() && !should_retry_with_login(&setting, &retried) {
+                    if retried.is_ok() && !should_retry_with_login(&setting, &retried) {
                         requires_login = true;
                         login_session = Some(group.id.clone());
                         toc_source = retried;
                         winner = Some(group.clone());
+                        self.preprocess_jobs = candidate_jobs;
                         break;
                     }
                 }
@@ -1569,7 +1568,7 @@ impl Downloader {
         if toc_source.is_ok() && should_retry_with_login(&setting, &toc_source) {
             toc_source = Err(NarouError::NotFound("Novel deleted or private".into()));
         }
-        let toc_source = match toc_source {
+        let mut toc_source = match toc_source {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
@@ -1672,15 +1671,105 @@ impl Downloader {
             }
         }
 
-        let info = self
+        let mut info = self
             .load_novel_info(&setting, &toc_source, &url_captures, &toc_url)
             .await?;
 
-        let author = info.author.clone().unwrap_or_default();
         let existing_record = match existing_id {
             Some(eid) => self.novels.get(eid.into()).await.ok().flatten(),
             None => None,
         };
+
+        let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
+
+        let toc::TocListing { mut subtitles, partial: mut partial_listing, tag_sources: mut page_tags } = if novel_type == 2 {
+            toc::TocListing {
+                subtitles: create_short_story_subtitles(&setting, &toc_source, &info)?,
+                partial: false,
+                tag_sources: setting.resolve_info_pattern("tags", &toc_source).into_iter().collect(),
+            }
+        } else {
+            parse_subtitles_multipage(toc::MultipageTocRequest {
+                http: self.http.as_ref(),
+                rate_limiter: self.rate_limiter.as_ref(),
+                setting: &setting,
+                toc_source: &toc_source,
+                url_captures: &url_captures,
+                title: info.title.as_deref().unwrap_or_default(),
+                progress: self.progress.as_deref(),
+                jobs: &mut self.preprocess_jobs,
+            })
+            .await?
+        };
+
+        // 目次ページの途中で「一覧が欠けている」と分かった場合 (Pixiv の小説
+        // シリーズは未ログインだと本文一覧が 0 件になる) は、保存済み Cookie で
+        // 取り直し、話数が増えたときだけ採用する。
+        if partial_listing || subtitles.is_empty() {
+            let groups = self.stored_groups_for(&setting).await;
+            if !groups.is_empty() {
+                self.report_line(messages::download::login_retry());
+                let active_cookie = setting.cookie.clone();
+                let active_cookie_hosts = setting.login_cookie_hosts.clone();
+                let base_cookie = configured_cookie.clone();
+                let mut winner: Option<LoginGroup> = None;
+                for group in &groups {
+                    if login_session.as_deref() == Some(group.id.as_str()) {
+                        continue;
+                    }
+                    setting.cookie = base_cookie.clone();
+                    apply_login_cookie(&mut setting, &group.merged_cookie(), &group.cookies);
+                    let mut candidate_jobs = preprocess::PreprocessJobs::new();
+                    let Ok(retried_source) = fetch_toc(
+                        self.http.as_ref(), self.rate_limiter.as_ref(), &setting,
+                        &toc_url, &mut candidate_jobs,
+                    ).await else {
+                        continue;
+                    };
+                    let Ok(toc::TocListing { subtitles: retried, partial: retried_partial, tag_sources: retried_tags }) =
+                        parse_subtitles_multipage(toc::MultipageTocRequest {
+                            http: self.http.as_ref(),
+                            rate_limiter: self.rate_limiter.as_ref(),
+                            setting: &setting,
+                            toc_source: &retried_source,
+                            url_captures: &url_captures,
+                            title: info.title.as_deref().unwrap_or_default(),
+                            progress: self.progress.as_deref(),
+                            jobs: &mut candidate_jobs,
+                        })
+                        .await
+                    else {
+                        continue;
+                    };
+                    if !retried.is_empty()
+                        && ((!retried_partial && partial_listing) || retried.len() > subtitles.len())
+                    {
+                        let resolved = !retried_partial;
+                        subtitles = retried;
+                        partial_listing = retried_partial;
+                        page_tags = retried_tags;
+                        requires_login = true;
+                        login_session = Some(group.id.clone());
+                        winner = Some(group.clone());
+                        self.preprocess_jobs = candidate_jobs;
+                        toc_source = retried_source;
+                        info = self.load_novel_info(&setting, &toc_source, &url_captures, &toc_url).await?;
+                        if resolved {
+                            break;
+                        }
+                    }
+                }
+                setting.cookie = active_cookie;
+                setting.login_cookie_hosts = active_cookie_hosts;
+                if let Some(winner) = &winner {
+                    setting.cookie = base_cookie;
+                    setting.login_cookie_hosts.clear();
+                    apply_login_cookie(&mut setting, &winner.merged_cookie(), &winner.cookies);
+                }
+            }
+        }
+        let author = info.author.clone().unwrap_or_default();
+
         let fetched_raw_title = info.title.clone().unwrap_or_default();
         let raw_title = if fetched_raw_title.is_empty() {
             existing_record
@@ -1702,77 +1791,6 @@ impl Downloader {
                 .as_ref()
                 .is_some_and(NovelRecord::has_raw_title);
         let title = crate::title::project_title(&raw_title, strip_title_prefix);
-
-        let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
-
-        let toc::TocListing { mut subtitles, partial: mut partial_listing, tag_sources: mut page_tags } = if novel_type == 2 {
-            toc::TocListing {
-                subtitles: create_short_story_subtitles(&setting, &toc_source, &info)?,
-                partial: false,
-                tag_sources: setting.resolve_info_pattern("tags", &toc_source).into_iter().collect(),
-            }
-        } else {
-            parse_subtitles_multipage(toc::MultipageTocRequest {
-                http: self.http.as_ref(),
-                rate_limiter: self.rate_limiter.as_ref(),
-                setting: &setting,
-                toc_source: &toc_source,
-                url_captures: &url_captures,
-                title: &title,
-                progress: self.progress.as_deref(),
-                jobs: &mut self.preprocess_jobs,
-            })
-            .await?
-        };
-
-        // 目次ページの途中で「一覧が欠けている」と分かった場合 (Pixiv の小説
-        // シリーズは未ログインだと本文一覧が 0 件になる) は、保存済み Cookie で
-        // 取り直し、話数が増えたときだけ採用する。
-        if partial_listing && login_cookie.is_none() {
-            let groups = self.stored_groups_for(&setting).await;
-            if !groups.is_empty() {
-                self.report_line(messages::download::login_retry());
-                let base_cookie = setting.cookie.clone();
-                let mut winner: Option<LoginGroup> = None;
-                for group in &groups {
-                    setting.cookie = base_cookie.clone();
-                    apply_login_cookie(&mut setting, &group.merged_cookie(), &group.cookies);
-                    let Ok(toc::TocListing { subtitles: retried, partial: retried_partial, tag_sources: retried_tags }) =
-                        parse_subtitles_multipage(toc::MultipageTocRequest {
-                            http: self.http.as_ref(),
-                            rate_limiter: self.rate_limiter.as_ref(),
-                            setting: &setting,
-                            toc_source: &toc_source,
-                            url_captures: &url_captures,
-                            title: &title,
-                            progress: self.progress.as_deref(),
-                            jobs: &mut self.preprocess_jobs,
-                        })
-                        .await
-                    else {
-                        continue;
-                    };
-                    if !retried_partial || retried.len() > subtitles.len() {
-                        let resolved = !retried_partial;
-                        subtitles = retried;
-                        partial_listing = retried_partial;
-                        page_tags = retried_tags;
-                        requires_login = true;
-                        login_session = Some(group.id.clone());
-                        winner = Some(group.clone());
-                        if resolved {
-                            break;
-                        }
-                    }
-                }
-                setting.cookie = base_cookie;
-                setting.login_cookie_hosts.clear();
-                if let Some(winner) = &winner {
-                    apply_login_cookie(&mut setting, &winner.merged_cookie(), &winner.cookies);
-                }
-            }
-        }
-
         let use_subdirectory = self.download_use_subdirectory(existing_record.as_ref());
         let ncode = self
             .extract_ncode(&setting, &toc_source)
@@ -1807,8 +1825,7 @@ impl Downloader {
         let old_toc = self
             .persistence
             .load_toc(&object_keys)
-            .await
-            .unwrap_or(None);
+            .await?;
         let old_subtitles: HashMap<String, &SubtitleInfo> = old_toc
             .as_ref()
             .map(|t| t.subtitles.iter().map(|s| (s.index.clone(), s)).collect())
@@ -1818,8 +1835,40 @@ impl Downloader {
         let old_author = old_toc.as_ref().map(|t| t.author.clone());
         let old_story = old_toc.as_ref().and_then(|t| t.story.clone());
         let old_section_count = old_toc.as_ref().map(|t| t.subtitles.len()).unwrap_or(0);
+        let accessible_section_count = subtitles.len();
 
-        if partial_listing {
+        let mut preserved_indices = std::collections::HashSet::new();
+        if partial_listing && setting.preserve_missing_sections && !subtitles.is_empty()
+            && subtitles.iter().all(|latest| old_subtitles.get(&latest.index)
+                .is_none_or(|old| old.href == latest.href))
+        {
+            let omitted = {
+                let visible: std::collections::HashSet<&str> =
+                    subtitles.iter().map(|subtitle| subtitle.index.as_str()).collect();
+                old_subtitles.values().copied()
+                    .filter(|old| !visible.contains(old.index.as_str())).collect::<Vec<_>>()
+            };
+            if !omitted.is_empty() {
+                for old in omitted {
+                    preserved_indices.insert(old.index.as_str());
+                    subtitles.push(old.clone());
+                }
+                if subtitles.iter().any(|subtitle| subtitle.index.is_empty()
+                    || !subtitle.index.bytes().all(|byte| byte.is_ascii_digit()))
+                {
+                    return Err(NarouError::SiteSetting(
+                        "preserve_missing_sections requires stable numeric section indices".into(),
+                    ));
+                }
+                subtitles.sort_unstable_by(|left, right| {
+                    let left = left.index.trim_start_matches('0');
+                    let right = right.index.trim_start_matches('0');
+                    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+                });
+            }
+        }
+
+        if partial_listing || subtitles.is_empty() {
             let omits_saved = if old_section_count > 0 {
                 let visible: std::collections::HashSet<&str> =
                     subtitles.iter().map(|subtitle| subtitle.index.as_str()).collect();
@@ -1850,7 +1899,7 @@ impl Downloader {
                     sections_deleted: false,
                 });
             }
-            self.report_warn(&messages::download::partial_listing(subtitles.len()));
+            self.report_warn(&messages::download::partial_listing(accessible_section_count));
         }
 
         #[cfg(feature = "native-runtime")]
@@ -1990,6 +2039,7 @@ impl Downloader {
             existed: bool,
             predownloaded: Option<(SectionElement, String)>,
             resumed: Option<SectionFile>,
+            preserved: bool,
         }
 
         let mut updated_count = 0usize;
@@ -2012,7 +2062,15 @@ impl Downloader {
         let mut download_count = 0usize;
         let guard_spoiler = self.settings.local_setting_bool("guard-spoiler");
         for (section_index, subtitle) in subtitles.iter().enumerate() {
-            let resumed = resumed_sections.remove(&section_index);
+            let preserved = preserved_indices.contains(subtitle.index.as_str());
+            let resumed = match resumed_sections.remove(&section_index) {
+                Some(section) => Some(section),
+                None if preserved => Some(self.persistence.load_section(&object_keys, subtitle)
+                    .await?.ok_or_else(|| NarouError::Platform(format!(
+                        "preserved section {} is missing from storage", subtitle.index,
+                    )))?),
+                None => None,
+            };
             let is_new_arrival = resumed.is_none() && !old_subtitles.contains_key(&subtitle.index);
             let existed = existing_sections.contains(&subtitle.index);
             let (needs_download, predownloaded) = if resumed.is_some() {
@@ -2042,6 +2100,7 @@ impl Downloader {
                 existed,
                 predownloaded,
                 resumed,
+                preserved,
             });
         }
 
@@ -2056,235 +2115,239 @@ impl Downloader {
         let mut started_download = false;
         let mut downloaded_index = 0usize;
 
-        for (section_index, (subtitle, mut plan)) in subtitles.iter().zip(section_plans).enumerate() {
-            if section_index >= resume_from
-                && budget
-                    .as_deref_mut()
-                    .is_some_and(|budget| budget.should_yield(section_index))
-            {
-                // 再開時に取得済み挿絵を取り直して次の実行枠まで使い切らないよう、
-                // 本文と一緒に挿絵の URL → 保存先の対応も中断前に確定する。
-                if illustration_store.is_dirty() {
-                    self.persistence
-                        .save_cache(&object_keys, &illustration_store)
-                        .await?;
+        let section_result: Result<()> = async {
+            for (section_index, (subtitle, mut plan)) in subtitles.iter().zip(section_plans).enumerate() {
+                if section_index >= resume_from
+                    && budget
+                        .as_deref_mut()
+                        .is_some_and(|budget| budget.should_yield(section_index))
+                {
+                    return Err(NarouError::DownloadBudgetExpired {
+                        next_section_index: section_index,
+                    });
                 }
-                return Err(NarouError::DownloadBudgetExpired {
-                    next_section_index: section_index,
-                });
-            }
-            if defer_strong_update && !force && plan.resumed.is_none() && plan.needs_download {
-                let (needs_download, predownloaded) = self
-                    .section_needs_download(SectionDecision {
-                        setting: &setting,
-                        latest: subtitle,
-                        old: old_subtitles.get(&subtitle.index).copied(),
-                        existing_id,
-                        keys: &object_keys,
-                        toc_url: &toc_url,
-                        strong_update: true,
-                        timezone: site_timezone,
-                        existed: plan.existed,
-                    })
-                    .await?;
-                plan.needs_download = needs_download;
-                plan.predownloaded = predownloaded;
-                if !needs_download {
-                    download_count -= 1;
-                    if let Some(ref p) = self.progress {
-                        p.set_length(download_count as u64);
+                if defer_strong_update && !force && plan.resumed.is_none() && plan.needs_download {
+                    let (needs_download, predownloaded) = self
+                        .section_needs_download(SectionDecision {
+                            setting: &setting,
+                            latest: subtitle,
+                            old: old_subtitles.get(&subtitle.index).copied(),
+                            existing_id,
+                            keys: &object_keys,
+                            toc_url: &toc_url,
+                            strong_update: true,
+                            timezone: site_timezone,
+                            existed: plan.existed,
+                        })
+                        .await?;
+                    plan.needs_download = needs_download;
+                    plan.predownloaded = predownloaded;
+                    if !needs_download {
+                        download_count -= 1;
+                        if let Some(ref p) = self.progress {
+                            p.set_length(download_count as u64);
+                        }
                     }
                 }
-            }
-            let is_new_arrival = plan.is_new_arrival;
-            let needs_download = plan.needs_download;
-            let resumed_was_tracked = plan.resumed.is_some();
-            // 中断された実行を再開したセクションは、前回の索引保存前に実行が
-            // 終わっている可能性がある (挿絵の実体だけが残り、対応表が無い
-            // 状態)。再開したセクションは取得を省く分だけ挿絵の登録も
-            // 通り過ぎてしまうため、保存済みの本文から索引を作り直す。
-            // 強更新の予定段階で取得しただけの本文も同じ理由でここを通す。
-            // 索引が残っている通常の更新では `download_illustration` が
-            // 取得済みと判断して何もしない。
-            if resumed_was_tracked || (!needs_download && plan.predownloaded.is_some()) {
-                let section = plan
-                    .resumed
-                    .as_ref()
-                    .map(|resumed| &resumed.element)
-                    .or_else(|| plan.predownloaded.as_ref().map(|(section, _)| section));
-                if let Some(section) = section {
+                let is_new_arrival = plan.is_new_arrival;
+                let needs_download = plan.needs_download;
+                let resumed_was_tracked = plan.resumed.is_some();
+                // 中断された実行を再開したセクションは、前回の索引保存前に実行が
+                // 終わっている可能性がある (挿絵の実体だけが残り、対応表が無い
+                // 状態)。再開したセクションは取得を省く分だけ挿絵の登録も
+                // 通り過ぎてしまうため、保存済みの本文から索引を作り直す。
+                // 強更新の予定段階で取得しただけの本文も同じ理由でここを通す。
+                // 索引が残っている通常の更新では `download_illustration` が
+                // 取得済みと判断して何もしない。
+                if !plan.preserved && (resumed_was_tracked || (!needs_download && plan.predownloaded.is_some())) {
+                    let section = plan
+                        .resumed
+                        .as_ref()
+                        .map(|resumed| &resumed.element)
+                        .or_else(|| plan.predownloaded.as_ref().map(|(section, _)| section));
+                    if let Some(section) = section {
+                        self.download_illustration(
+                            &setting,
+                            section,
+                            &object_keys,
+                            &mut illustration_store,
+                            stored_illustrations.as_mut(),
+                            &toc_url,
+                            None,
+                        )
+                        .await?;
+                    }
+                }
+
+                let download_time = if let Some(resumed) = plan.resumed {
+                    resumed.download_time
+                } else if needs_download {
+                    if !started_download {
+                        self.report_line(&colorize(
+                            &messages::download::download_started(display_id, &title),
+                            "green",
+                        ));
+                        started_download = true;
+                    }
+                    if let Some(ref p) = self.progress {
+                        p.set_message(&format!(
+                            "DL {} [{}/{}]",
+                            title,
+                            downloaded_index + 1,
+                            download_count
+                        ));
+                    }
+
+                    if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
+                        self.report_line(&subtitle.chapter);
+                        last_chapter = subtitle.chapter.clone();
+                    }
+                    if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
+                        self.report_line(&subtitle.subchapter);
+                        last_subchapter = subtitle.subchapter.clone();
+                    }
+
+                    let (section, raw_html) = match plan.predownloaded {
+                        Some(downloaded) => downloaded,
+                        None => download_section(
+                            self.http.as_ref(),
+                            self.rate_limiter.as_ref(),
+                            &mut self.section_cache,
+                            &setting,
+                            subtitle,
+                            &toc_url,
+                            &mut self.preprocess_jobs,
+                        )
+                        .await?,
+                    };
+                    let had_existing = plan.existed;
+                    if had_existing {
+                        // The stored section still has the previous TOC's filename.
+                        let previous = old_subtitles.get(&subtitle.index).copied().unwrap_or(subtitle);
+                        if cache_dir.is_none() {
+                            cache_dir = cache_timestamp(self.clock.as_ref(), save_diff_snapshots);
+                        }
+                        if let Some(id) = existing_id {
+                            self.clear_section_digest(id, &section_relative_path(previous));
+                        }
+                        if let Some(timestamp) = cache_dir.as_deref() {
+                            let cached = self.persistence
+                                .cache_section(&object_keys, timestamp, previous)
+                                .await?;
+                            if cached && !cache_version_recorded {
+                                self.persistence.record_cache_version(&object_keys, timestamp).await?;
+                                cache_version_recorded = true;
+                            }
+                        }
+                    }
+                    let download_time = self
+                        .persistence
+                        .save_section(&object_keys, subtitle, &section)
+                        .await?;
+                    let digest = compute_section_hash(&section);
+                    let relative_path = section_relative_path(subtitle);
+                    if let Some(id) = existing_id {
+                        self.store_section_digest(id, &relative_path, &digest);
+                    } else {
+                        pending_section_hashes.insert(relative_path, digest);
+                    }
+                    // 生データの保存は環境で切れる (Worker は常に切る)。
+                    // 挿絵の走査はこの直後、メモリ上の raw_html で行う。
+                    if self.settings.save_raw_html() {
+                        self.persistence
+                            .save_raw(&object_keys, subtitle, &raw_html)
+                            .await?;
+                    }
                     self.download_illustration(
                         &setting,
-                        section,
+                        &section,
                         &object_keys,
                         &mut illustration_store,
                         stored_illustrations.as_mut(),
                         &toc_url,
-                        None,
+                        Some(raw_html.as_str()),
                     )
                     .await?;
-                }
-            }
-
-            let download_time = if let Some(resumed) = plan.resumed {
-                resumed.download_time
-            } else if needs_download {
-                if !started_download {
-                    self.report_line(&colorize(
-                        &messages::download::download_started(display_id, &title),
-                        "green",
-                    ));
-                    started_download = true;
-                }
-                if let Some(ref p) = self.progress {
-                    p.set_message(&format!(
-                        "DL {} [{}/{}]",
-                        title,
-                        downloaded_index + 1,
-                        download_count
-                    ));
-                }
-
-                if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
-                    self.report_line(&subtitle.chapter);
-                    last_chapter = subtitle.chapter.clone();
-                }
-                if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
-                    self.report_line(&subtitle.subchapter);
-                    last_subchapter = subtitle.subchapter.clone();
-                }
-
-                let (section, raw_html) = match plan.predownloaded {
-                    Some(downloaded) => downloaded,
-                    None => download_section(
-                        self.http.as_ref(),
-                        self.rate_limiter.as_ref(),
-                        &mut self.section_cache,
-                        &setting,
-                        subtitle,
-                        &toc_url,
-                        &mut self.preprocess_jobs,
-                    )
-                    .await?,
+                    updated_count += 1;
+                    downloaded_index += 1;
+                    Some(download_time)
+                } else {
+                    // 内容が変わっていない (`needs_download=false`) セクションは
+                    // 保存も取得もしないので、保存時刻は旧 TOC の値を引き継ぐ。
+                    old_subtitles
+                        .get(&subtitle.index)
+                        .and_then(|old| old.download_time.clone())
                 };
-                let had_existing = plan.existed;
-                if had_existing {
-                    // The stored section still has the previous TOC's filename.
-                    let previous = old_subtitles.get(&subtitle.index).copied().unwrap_or(subtitle);
-                    if cache_dir.is_none() {
-                        cache_dir = cache_timestamp(self.clock.as_ref(), save_diff_snapshots);
+                #[cfg(not(feature = "native-runtime"))]
+                if (needs_download || resumed_was_tracked)
+                    && let Some(previous) = old_subtitles.get(&subtitle.index)
+                    && previous.file_subtitle != subtitle.file_subtitle
+                {
+                    let previous_key = object_keys.section(&previous.index, &previous.file_subtitle);
+                    let current_key = object_keys.section(&subtitle.index, &subtitle.file_subtitle);
+                    if previous_key != current_key {
+                        superseded_section_keys.push(previous_key);
                     }
-                    if let Some(id) = existing_id {
-                        self.clear_section_digest(id, &section_relative_path(previous));
+                }
+
+                let mut sub = subtitle.clone();
+                sub.download_time = download_time;
+                if needs_download && is_new_arrival {
+                    new_arrivals = true;
+                    new_arrival_subtitles.push(sub.clone());
+                }
+                final_subtitles.push(sub);
+
+                if needs_download {
+                    let mut line = String::new();
+                    if novel_type == 1 {
+                        // Series: "第{index}部分　" (only if index ≤ 4 digits)
+                        if subtitle.index.len() <= 4 {
+                            line.push_str(&format!("第{}部分　", subtitle.index));
+                        }
+                    } else {
+                        line.push_str("短編　");
                     }
-                    if let Some(timestamp) = cache_dir.as_deref() {
-                        let cached = self.persistence
-                            .cache_section(&object_keys, timestamp, previous)
-                            .await?;
-                        if cached && !cache_version_recorded {
-                            self.persistence.record_cache_version(&object_keys, timestamp).await?;
-                            cache_version_recorded = true;
+                    let printable_subtitle = if guard_spoiler {
+                        mask_spoiler_text(&subtitle.subtitle)
+                    } else {
+                        subtitle.subtitle.clone()
+                    };
+                    line.push_str(&format!(
+                        "{} ({}/{})",
+                        printable_subtitle, downloaded_index, download_count
+                    ));
+                    if needs_download {
+                        if is_new_arrival && (existing_id.is_some() || force) {
+                            line.push_str(&colorize(" (新着)", "magenta"));
+                        } else if !is_new_arrival && force {
+                            line.push_str(" (更新あり)");
                         }
                     }
-                }
-                let download_time = self
-                    .persistence
-                    .save_section(&object_keys, subtitle, &section)
-                    .await?;
-                let digest = compute_section_hash(&section);
-                let relative_path = section_relative_path(subtitle);
-                if let Some(id) = existing_id {
-                    self.store_section_digest(id, &relative_path, &digest);
-                } else {
-                    pending_section_hashes.insert(relative_path, digest);
-                }
-                // 生データの保存は環境で切れる (Worker は常に切る)。
-                // 挿絵の走査はこの直後、メモリ上の raw_html で行う。
-                if self.settings.save_raw_html() {
-                    self.persistence
-                        .save_raw(&object_keys, subtitle, &raw_html)
-                        .await?;
-                }
-                self.download_illustration(
-                    &setting,
-                    &section,
-                    &object_keys,
-                    &mut illustration_store,
-                    stored_illustrations.as_mut(),
-                    &toc_url,
-                    Some(raw_html.as_str()),
-                )
-                .await?;
-                updated_count += 1;
-                downloaded_index += 1;
-                Some(download_time)
-            } else {
-                // 内容が変わっていない (`needs_download=false`) セクションは
-                // 保存も取得もしないので、保存時刻は旧 TOC の値を引き継ぐ。
-                old_subtitles
-                    .get(&subtitle.index)
-                    .and_then(|old| old.download_time.clone())
-            };
-            #[cfg(not(feature = "native-runtime"))]
-            if (needs_download || resumed_was_tracked)
-                && let Some(previous) = old_subtitles.get(&subtitle.index)
-                && previous.file_subtitle != subtitle.file_subtitle
-            {
-                let previous_key = object_keys.section(&previous.index, &previous.file_subtitle);
-                let current_key = object_keys.section(&subtitle.index, &subtitle.file_subtitle);
-                if previous_key != current_key {
-                    superseded_section_keys.push(previous_key);
-                }
-            }
-
-            let mut sub = subtitle.clone();
-            sub.download_time = download_time;
-            if needs_download && is_new_arrival {
-                new_arrivals = true;
-                new_arrival_subtitles.push(sub.clone());
-            }
-            final_subtitles.push(sub);
-
-            if needs_download {
-                let mut line = String::new();
-                if novel_type == 1 {
-                    // Series: "第{index}部分　" (only if index ≤ 4 digits)
-                    if subtitle.index.len() <= 4 {
-                        line.push_str(&format!("第{}部分　", subtitle.index));
-                    }
-                } else {
-                    line.push_str("短編　");
-                }
-                let printable_subtitle = if guard_spoiler {
-                    mask_spoiler_text(&subtitle.subtitle)
-                } else {
-                    subtitle.subtitle.clone()
-                };
-                line.push_str(&format!(
-                    "{} ({}/{})",
-                    printable_subtitle, downloaded_index, download_count
-                ));
-                if needs_download {
-                    if is_new_arrival && (existing_id.is_some() || force) {
-                        line.push_str(&colorize(" (新着)", "magenta"));
-                    } else if !is_new_arrival && force {
-                        line.push_str(" (更新あり)");
+                    self.report_line(&line);
+                    if let Some(ref p) = self.progress {
+                        p.inc(1);
                     }
                 }
-                self.report_line(&line);
-                if let Some(ref p) = self.progress {
-                    p.inc(1);
-                }
             }
-        }
+            Ok(())
+        }.await;
 
         // 挿絵を 1 枚も扱わなかった小説には空の索引を作らない (変化が無ければ
         // 書き戻さない)。
-        if illustration_store.is_dirty() {
-            self.persistence
-                .save_cache(&object_keys, &illustration_store)
-                .await?;
+        let cache_result = if illustration_store.is_dirty() {
+            self.persistence.save_cache(&object_keys, &illustration_store).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = cache_result {
+            if section_result.is_err() {
+                self.report_warn(&messages::indented_error(&error));
+            } else {
+                return Err(error);
+            }
         }
+        section_result?;
 
         if let Some(ref p) = self.progress {
             p.finish_with_message(&format!(
@@ -2457,8 +2520,12 @@ impl Downloader {
                     updated.domain = record.domain.clone();
                     updated.suspend = false;
                     updated.is_narou = record.is_narou;
-                    updated.requires_login |= requires_login;
-                    if login_session.is_some() {
+                    if login_site_changed {
+                        updated.requires_login = requires_login;
+                    } else {
+                        updated.requires_login |= requires_login;
+                    }
+                    if login_site_changed || login_session.is_some() {
                         updated.login_session = login_session.clone();
                     }
                     // 既存の小説をページ URL 指定で取り直したときも控え直す。
@@ -3001,55 +3068,6 @@ fn apply_login_cookie(
     setting.login_cookie_hosts = cookies.iter().map(|entry| entry.host.clone()).collect();
 }
 
-/// Whether a retry after a partial listing is worth keeping.
-///
-/// A signed-in visitor can still see fewer works than a series holds (Pixiv
-/// マイピク restricts some to mutual followers), so the marker disappearing is
-/// not the only success: collecting more sections also counts. A retry that
-/// changes nothing keeps the earlier result.
-/// Whether a work URL names the given id (`?id=123`, `/123/`, …).
-///
-/// Ids are compared as whole tokens so `123` never matches `1234`.
-fn url_mentions_id(url: &str, id: &str) -> bool {
-    if id.is_empty() {
-        return false;
-    }
-    url.split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|token| token == id)
-}
-
-fn is_improved_toc(
-    setting: &SiteSetting,
-    before: std::result::Result<&String, &NarouError>,
-    after: std::result::Result<&String, &NarouError>,
-) -> bool {
-    let (Ok(before), Ok(after)) = (before, after) else {
-        return false;
-    };
-    !setting.is_partial_login_view(after)
-        || count_toc_entries(setting, after) > count_toc_entries(setting, before)
-}
-
-/// Sections a preprocessed TOC source yields, using the definition's own
-/// subtitles pattern.
-fn count_toc_entries(setting: &SiteSetting, source: &str) -> usize {
-    setting
-        .subtitles_pattern()
-        .map_or(0, |pattern| pattern.find_iter(source).count())
-}
-
-/// Whether a *successful* fetch still shows only part of the works.
-///
-/// A definition reports this itself (Pixiv hides R-18 works while answering
-/// HTTP 200), so the request is retried with the stored cookie — but unlike a
-/// login wall, an unimproved retry must not replace the anonymous result.
-fn is_partial_login_view(setting: &SiteSetting, toc_source: &Result<String>) -> bool {
-    match toc_source {
-        Ok(source) => setting.is_partial_login_view(source),
-        Err(_) => false,
-    }
-}
-
 /// A missing page (404) or a login wall served with HTTP 200 both mean the
 /// fetch may need authentication; every other error is a real failure.
 fn should_retry_with_login(setting: &SiteSetting, toc_source: &Result<String>) -> bool {
@@ -3065,7 +3083,6 @@ fn should_retry_with_login(setting: &SiteSetting, toc_source: &Result<String>) -
 #[cfg(test)]
 mod tests {
     use super::novel_info::NovelInfo;
-    use super::url_mentions_id;
     use super::persistence::PersistenceService;
     use super::site_setting::{SiteSetting, SiteSettingValue};
     use super::types::{SectionElement, TocFile};
@@ -5344,10 +5361,6 @@ is_narou: false
         assert_eq!(urls.len(), 7, "got {urls:?}");
         assert!(urls.iter().any(|url| url.ends_with("/ajax/series/329992")));
         assert_eq!(setting.author_comic_series_ids(&html), vec!["329992"]);
-        assert_eq!(
-            setting.author_comic_series_page_ids(r#"{"page":{"series":[{"workId":"138467437","order":5}]}}"#),
-            vec!["138467437"]
-        );
         let mut captures = HashMap::new();
         captures.insert("user_id".to_string(), "6519870".to_string());
         assert_eq!(
@@ -5356,18 +5369,6 @@ is_narou: false
         );
         assert_eq!(setting.author_series_ids(&html), vec!["272850", "551006"]);
 
-        // シリーズの 1 話は content_titles から取り出して作品一覧から除く。
-        let episodes = setting
-            .author_series_episode_ids(r#"{"body":[{"id":"2594847","title":"x","available":true}]}"#);
-        assert_eq!(episodes, vec!["2594847"]);
-        assert!(url_mentions_id(
-            "https://www.pixiv.net/novel/show.php?id=2594847",
-            "2594847"
-        ));
-        assert!(!url_mentions_id(
-            "https://www.pixiv.net/novel/show.php?id=25948471",
-            "2594847"
-        ));
     }
 
     #[test]
@@ -5572,7 +5573,7 @@ is_narou: false
                 format!("https://www.pixiv.net/ajax/illust/{id}"),
                 200,
                 format!(
-                    r#"{{"error":false,"body":{{"id":"{id}","title":"{title}","userName":"作者名","uploadDate":"2026-01-02T03:04:05+09:00"}}}}"#
+                    r#"{{"error":false,"body":{{"id":"{id}","title":"{title}","userName":"作者名","uploadDate":"2026-01-02T03:04:05+09:00","urls":{{"original":"https://i.pximg.net/{id}.png"}}}}}}"#
                 ),
             );
         }
@@ -5692,48 +5693,6 @@ is_narou: false
         );
     }
 
-    #[test]
-    fn pixiv_series_content_emits_episodes_and_follows_a_full_page() {
-        let mut entries = String::new();
-        for order in 1..=30 {
-            if order > 1 {
-                entries.push(',');
-            }
-            entries.push_str(&format!(
-                r#"{{"id":"20{order:06}","title":"第{order}話","seriesContentOrder":{order},"seriesId":"11075024","createDate":"2026-09-21T22:36:52+09:00","updateDate":"2026-09-22T00:12:53+09:00"}}"#
-            ));
-        }
-        let html = run_pixiv_preprocess(&format!(
-            r#"{{"error":false,"message":"","body":{{
-                "thumbnails":{{"novel":[{entries}]}},
-                "page":{{"seriesContents":[{{"id":"20000001","series":{{"id":11075024,"contentOrder":1}}}}]}}}}}}"#
-        ));
-
-        assert!(html.contains(
-            "Episode;1;https://www.pixiv.net/ajax/novel/20000001;2026-09-21T22:36:52+09:00;第1話"
-        ));
-        assert!(html.contains(
-            "Episode;30;https://www.pixiv.net/ajax/novel/20000030;2026-09-21T22:36:52+09:00;第30話"
-        ));
-        assert!(html.contains(
-            "next::/ajax/novel/series_content/11075024?limit=30&last_order=30&order_by=asc"
-        ));
-
-        let setting = pixiv_setting();
-        let mut url_captures = HashMap::new();
-        url_captures.insert("ncode".to_string(), "s11075024".to_string());
-        let subtitles = super::toc::parse_subtitles(setting, &html, &url_captures).unwrap();
-        assert_eq!(subtitles.len(), 30);
-        assert_eq!(subtitles[0].index, "1");
-        assert_eq!(
-            subtitles[0].href,
-            "https://www.pixiv.net/ajax/novel/20000001"
-        );
-        assert_eq!(subtitles[0].subtitle, "第1話");
-        assert_eq!(subtitles[0].subdate, "2026-09-21T22:36:52+09:00");
-        assert_eq!(subtitles[29].index, "30");
-        assert_eq!(subtitles[29].subtitle, "第30話");
-    }
 
     #[test]
     fn pixiv_partial_series_content_page_stops_pagination() {

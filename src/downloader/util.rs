@@ -132,6 +132,7 @@ pub async fn pretreatment_source_with_jobs(request: PretreatmentRequest<'_>) -> 
     let Some(pipeline) = setting.preprocess_pipeline() else {
         return Ok(());
     };
+    jobs.bind_policy(policy, url);
 
     let original = src.clone();
     jobs.clear_forms();
@@ -140,12 +141,23 @@ pub async fn pretreatment_source_with_jobs(request: PretreatmentRequest<'_>) -> 
         loop {
             let mut working = original.clone();
             let run = preprocess::run_preprocess(pipeline, &mut working, jobs, url)
-                .map_err(crate::error::NarouError::SiteSetting)?;
+                .map_err(|error| match error {
+                    preprocess::PreprocessError::Definition(message) => crate::error::NarouError::SiteSetting(message),
+                    preprocess::PreprocessError::RequiredJson(url) => required_json_error(
+                        jobs.failure(&url).cloned().map(crate::error::NarouError::Shared)
+                            .unwrap_or_else(|| crate::error::NarouError::Http(
+                                format!("required JSON response is null while fetching {url}")
+                            )),
+                    ),
+                })?;
             let pending: Vec<_> = run.requested.into_iter()
                 .filter(|request| !jobs.contains(request.key())).collect();
             if pending.is_empty() || rounds >= MAX_PREPROCESS_ROUNDS {
                 if pending.iter().any(|request| matches!(request, preprocess::PreprocessRequest::Form { .. })) {
                     return Err(crate::error::NarouError::SiteSetting("preprocess: unresolved form request".into()));
+                }
+                if pending.iter().any(|request| matches!(request, preprocess::PreprocessRequest::JsonRequired { .. })) {
+                    return Err(crate::error::NarouError::SiteSetting("preprocess: unresolved required JSON request".into()));
                 }
                 if !pending.is_empty() {
                     tracing::warn!(
@@ -159,17 +171,10 @@ pub async fn pretreatment_source_with_jobs(request: PretreatmentRequest<'_>) -> 
             for request in pending {
                 match request {
                     preprocess::PreprocessRequest::Json { url } => {
-                        // JSON requests are optional (e.g. illustration metadata).
-                        let value = match crate::downloader::http_policy::fetch_text(
-                            http, rate_limiter, &url, policy, Some("UTF-8"),
-                        ).await {
-                            Ok(body) => serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
-                            Err(error) => {
-                                tracing::debug!("preprocess request failed for {url}: {error}");
-                                serde_json::Value::Null
-                            }
-                        };
-                        jobs.insert(url, value);
+                        resolve_json_job(http, rate_limiter, policy, jobs, url, None).await?;
+                    }
+                    preprocess::PreprocessRequest::JsonRequired { url, missing_statuses } => {
+                        resolve_json_job(http, rate_limiter, policy, jobs, url, Some(missing_statuses)).await?;
                     }
                     preprocess::PreprocessRequest::Form { url, body, headers, key } => {
                         let text = crate::downloader::http_policy::fetch_form_text(
@@ -185,6 +190,71 @@ pub async fn pretreatment_source_with_jobs(request: PretreatmentRequest<'_>) -> 
     }.await;
     jobs.clear_forms();
     result
+}
+
+fn required_json_error(error: crate::error::NarouError) -> crate::error::NarouError {
+    let mut original = &error;
+    while let crate::error::NarouError::Shared(shared) = original {
+        original = shared.as_ref();
+    }
+    match original {
+        // A failed dependency is not evidence that the whole novel disappeared.
+        crate::error::NarouError::NotFound(url) => crate::error::NarouError::Http(
+            format!("HTTP 404 while fetching required JSON dependency {url}")
+        ),
+        _ => error,
+    }
+}
+
+async fn resolve_json_job(
+    http: &dyn crate::platform::HttpClient,
+    rate_limiter: &dyn crate::platform::RateLimiter,
+    policy: &crate::downloader::http_policy::FetchPolicy,
+    jobs: &mut preprocess::PreprocessJobs,
+    url: String,
+    missing_statuses: Option<Vec<u16>>,
+) -> Result<()> {
+    let response = crate::downloader::http_policy::fetch_json_response(
+        http, rate_limiter, &url, policy,
+    ).await;
+    let (status, value) = match response {
+        Ok(response) => {
+            let status = response.status;
+            let value = crate::downloader::http_policy::ensure_success_response(&url, response)
+                .and_then(|response| {
+                    let source = String::from_utf8(response.body).unwrap_or_else(|error|
+                        String::from_utf8_lossy(error.as_bytes()).into_owned()
+                    );
+                    serde_json::from_str::<serde_json::Value>(&source)
+                        .map(|value| (value, source))
+                        .map_err(|error| crate::error::NarouError::Http(
+                            format!("invalid JSON while fetching {url}: {error}")
+                        ))
+                });
+            (Some(status), value)
+        }
+        Err(error) => (None, Err(error)),
+    };
+    match value {
+        Ok((value, source)) => {
+            if missing_statuses.is_some() && value.is_null() {
+                return Err(crate::error::NarouError::Http(
+                    format!("required JSON response is null while fetching {url}")
+                ));
+            }
+            jobs.insert_json(url, value, source);
+        }
+        Err(error) => {
+            let admitted = status.is_some_and(|status| missing_statuses.as_ref()
+                .is_some_and(|statuses| statuses.contains(&status)));
+            if missing_statuses.is_some() && !admitted {
+                return Err(required_json_error(error));
+            }
+            tracing::debug!("preprocess request failed for {url}: {error}");
+            jobs.insert_failure(url, status, error);
+        }
+    }
+    Ok(())
 }
 
 pub fn decode_numeric_entities(src: &mut String) {

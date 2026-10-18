@@ -132,6 +132,14 @@ fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
         Rule::fetch_json_expr => {
             Expr::FetchJson(Box::new(build_expr(pair.into_inner().next().unwrap())))
         }
+        Rule::required_json_expr => {
+            let mut inner = pair.into_inner();
+            let url = Box::new(build_expr(inner.next().unwrap()));
+            let missing_statuses = inner.next().map(|statuses| {
+                statuses.into_inner().map(|status| status.as_str().parse().unwrap_or(0)).collect()
+            }).unwrap_or_default();
+            Expr::FetchJsonRequired { url, missing_statuses }
+        }
         Rule::post_form_expr => {
             let mut inner = pair.into_inner();
             Expr::PostForm {

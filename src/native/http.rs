@@ -6,11 +6,10 @@
 //! and per-domain tier-failure bookkeeping. The async entry point owns the
 //! shared redirect chain; every concrete transport executes just one hop.
 //!
-//! It never decodes response bytes and never decides what a status code
-//! means — that is `downloader::http_policy`'s job. 404/503 responses are
-//! returned raw so the policy layer maps them to `NotFound` /
-//! `SuspendDownload`; other 4xx/5xx are transport errors that let the tier
-//! fallback try the next transport.
+//! It never decodes response bytes or maps statuses to domain errors — that
+//! is `downloader::http_policy`'s job. 404/503 stop fallback immediately;
+//! other 4xx/5xx let later tiers try, but remain available as raw responses
+//! if no tier returns a successful or definitive response.
 //!
 //! Site admission is injected by `send_paced`. Each redirect or fallback
 //! attempt acquires its own permit; infrastructure `send` remains unpaced.
@@ -59,6 +58,10 @@ const TIER_CURL: usize = 0;
 const TIER_REQWEST: usize = 1;
 const TIER_SUBPROCESS: usize = 2;
 const TIER_COUNT: usize = 3;
+
+fn should_try_next_tier(status: u16) -> bool {
+    (400..600).contains(&status) && status != 404 && status != 503
+}
 
 /// ドメインごとの段の実績。
 ///
@@ -193,54 +196,8 @@ impl NativeHttpClient {
             }).await.map_err(|error| NarouError::Http(error.to_string()))?;
             chain = returned_chain;
             validation?;
-            let scope = pacing.map(|policy| policy.scope_for(&chain)).transpose()?;
-            let tiered = chain.request().method == HttpMethod::Get && !chain.request().trusted_endpoint;
-            let domain = tiered.then(|| crate::downloader::http_policy::domain_of(&chain.request().url).to_string());
-            let mut order = domain.as_deref().map(|domain| self.tier_order(domain)).unwrap_or_default();
-            // Manual URL resolution retains curl-first CDN compatibility.
-            if tiered && chain.request().redirect == RedirectMode::Manual {
-                order.retain(|&tier| tier != TIER_CURL);
-                order.insert(0, TIER_CURL);
-            }
-            let attempts = if tiered { order.as_slice() } else { &[TIER_REQWEST] };
-            let mut response = None;
-            let mut last_error = None;
-            for &tier in attempts {
-                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
-                    policy.limiter.acquire(scope).await?;
-                }
-                let worker = self.clone();
-                let (returned_chain, attempt) = tokio::task::spawn_blocking(move || {
-                    let request = chain.request();
-                    let user_agent = request.header("User-Agent").unwrap_or(&worker.user_agent);
-                    let attempt = if !tiered {
-                        worker.send_reqwest_hop(request)
-                    } else {
-                        match tier {
-                            TIER_CURL => worker.fetch_tier_curl(request, user_agent),
-                            TIER_REQWEST => worker.fetch_tier_reqwest(request),
-                            TIER_SUBPROCESS => worker.fetch_tier_subprocess(request, user_agent),
-                            _ => unreachable!("tier index out of range: {tier}"),
-                        }
-                    };
-                    (chain, attempt)
-                }).await.map_err(|error| NarouError::Http(error.to_string()))?;
-                chain = returned_chain;
-                match attempt {
-                    Ok(value) => {
-                        if let Some(domain) = domain.as_deref() { self.tiers.lock().note_success(domain, tier); }
-                        response = Some(value);
-                        break;
-                    }
-                    Err(error) => {
-                        if let Some(domain) = domain.as_deref() { self.tiers.lock().note_failure(domain, tier); }
-                        last_error = Some(error);
-                    }
-                }
-            }
-            let response = response.ok_or_else(|| last_error.unwrap_or_else(|| {
-                NarouError::NotFound(chain.request().url.clone())
-            }))?;
+            let (returned_chain, response) = self.send_validated_hop(chain, pacing).await?;
+            chain = returned_chain;
             if let Some(store) = self.cookie_store.as_deref() {
                 crate::platform::cookie_store::persist_response_set_cookie(
                     store, &response, chain.request().header("Cookie"),
@@ -248,6 +205,68 @@ impl NativeHttpClient {
             }
             if !chain.advance(&response)? { return Ok(response); }
         }
+    }
+
+    /// Dispatch one already-validated hop without changing its trust policy.
+    async fn send_validated_hop(
+        &self,
+        mut chain: RedirectChain,
+        pacing: Option<crate::platform::http::HttpPacing<'_>>,
+    ) -> Result<(RedirectChain, HttpResponse)> {
+        let scope = pacing.map(|policy| policy.scope_for(&chain)).transpose()?;
+        let tiered = chain.request().method == HttpMethod::Get && !chain.request().trusted_endpoint;
+        let domain = tiered.then(|| crate::downloader::http_policy::domain_of(&chain.request().url).to_string());
+        let mut order = domain.as_deref().map(|domain| self.tier_order(domain)).unwrap_or_default();
+        // Manual URL resolution retains curl-first CDN compatibility.
+        if tiered && chain.request().redirect == RedirectMode::Manual {
+            order.retain(|&tier| tier != TIER_CURL);
+            order.insert(0, TIER_CURL);
+        }
+        let attempts = if tiered { order.as_slice() } else { &[TIER_REQWEST] };
+        let mut response = None;
+        let mut last_error = None;
+        for &tier in attempts {
+            if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                policy.limiter.acquire(scope).await?;
+            }
+            let worker = self.clone();
+            let (returned_chain, attempt) = tokio::task::spawn_blocking(move || {
+                let request = chain.request();
+                let user_agent = request.header("User-Agent").unwrap_or(&worker.user_agent);
+                let attempt = if !tiered {
+                    worker.send_reqwest_hop(request)
+                } else {
+                    match tier {
+                        TIER_CURL => worker.fetch_tier_curl(request, user_agent),
+                        TIER_REQWEST => worker.send_reqwest_hop(request),
+                        TIER_SUBPROCESS => worker.fetch_tier_subprocess(request, user_agent),
+                        _ => unreachable!("tier index out of range: {tier}"),
+                    }
+                };
+                (chain, attempt)
+            }).await.map_err(|error| NarouError::Http(error.to_string()))?;
+            chain = returned_chain;
+            match attempt {
+                Ok(value) => {
+                    if tiered && should_try_next_tier(value.status) {
+                        if let Some(domain) = domain.as_deref() { self.tiers.lock().note_failure(domain, tier); }
+                        response = Some(value);
+                        continue;
+                    }
+                    if let Some(domain) = domain.as_deref() { self.tiers.lock().note_success(domain, tier); }
+                    response = Some(value);
+                    break;
+                }
+                Err(error) => {
+                    if let Some(domain) = domain.as_deref() { self.tiers.lock().note_failure(domain, tier); }
+                    last_error = Some(error);
+                }
+            }
+        }
+        let response = response.ok_or_else(|| last_error.unwrap_or_else(|| {
+            NarouError::NotFound(chain.request().url.clone())
+        }))?;
+        Ok((chain, response))
     }
 
     /// Non-GET and trusted infrastructure use only manual-redirect reqwest.
@@ -340,18 +359,8 @@ impl NativeHttpClient {
         let code = handle
             .response_code()
             .map_err(|e| io_error(e.to_string()))?;
-        if code >= 400 {
-            // 404/503 are definitive server answers; return them raw so the
-            // policy layer maps them to domain errors. Other 4xx/5xx are
-            // transport errors that continue the tier fallback.
-            if code == 404 || code == 503 {
-                return Ok(HttpResponse {
-                    status: code as u16,
-                    headers: head.into_headers(),
-                    body,
-                });
-            }
-            return Err(io_error(format!("HTTP {code} while fetching {url}")));
+        if !(100..600).contains(&code) {
+            return Err(io_error(format!("invalid HTTP status {code} while fetching {url}")));
         }
 
         Ok(HttpResponse {
@@ -361,24 +370,13 @@ impl NativeHttpClient {
         })
     }
 
-    fn fetch_tier_reqwest(
-        &self,
-        request: &HttpRequest,
-    ) -> Result<HttpResponse> {
-        let response = self.send_reqwest_hop(request)?;
-        let status = response.status;
-        if (400..600).contains(&status) && status != 404 && status != 503 {
-            return Err(io_error(format!("HTTP {status} while fetching {}", request.url)));
-        }
-        Ok(response)
-    }
 
     /// Last-resort subprocess fetch. Windows has no `wget` but ships
     /// `curl.exe` since Windows 10, so the candidate order is
     /// platform-dependent: `curl` first on Windows, `wget` first elsewhere.
     /// A tool that is not installed falls through to the next candidate;
-    /// a tool that runs but fails (HTTP error, timeout) is a real transport
-    /// failure and is reported as-is.
+    /// HTTP error responses retain their status while later candidates get
+    /// a chance to succeed; incomplete responses remain transport failures.
     fn fetch_tier_subprocess(
         &self,
         request: &HttpRequest,
@@ -398,9 +396,11 @@ impl NativeHttpClient {
         };
         let mut first_error: Option<NarouError> = None;
         let mut missing: Vec<&str> = Vec::new();
+        let mut response = None;
         for tool in candidates {
             match self.run_fetch_tool(tool, request, user_agent) {
-                Ok(response) => return Ok(response),
+                Ok(value) if should_try_next_tier(value.status) => response = Some(value),
+                Ok(value) => return Ok(value),
                 Err(err) => {
                     let not_found = matches!(
                         &err,
@@ -417,7 +417,7 @@ impl NativeHttpClient {
                 }
             }
         }
-        Err(first_error.unwrap_or_else(|| {
+        response.ok_or_else(|| first_error.unwrap_or_else(|| {
             io_error(format!(
                 "no download tool available (tried: {})",
                 missing.join(", ")
@@ -425,8 +425,8 @@ impl NativeHttpClient {
         }))
     }
 
-    /// Run one subprocess fetch without redirect following. Redirects and
-    /// definitive 404/503 responses are returned intact to the outer chain.
+    /// Run one subprocess fetch without redirect following. Every complete,
+    /// bounded HTTP response is returned intact to the fallback dispatcher.
     fn run_fetch_tool(
         &self,
         tool: &str,
@@ -490,12 +490,9 @@ impl NativeHttpClient {
                 };
                 let body = &rest[..pos];
                 let status_text = String::from_utf8_lossy(&rest[pos + marker.len()..]);
-                let status: u16 = status_text.trim().parse().unwrap_or(0);
-                if (400..600).contains(&status) && status != 404 && status != 503 {
-                    return Err(io_error(format!(
-                        "HTTP {status} while fetching {url} via curl"
-                    )));
-                }
+                let status: u16 = status_text.trim().parse()
+                    .ok().filter(|status| (100..600).contains(status))
+                    .ok_or_else(|| io_error(format!("invalid curl status for {url}")))?;
                 if body.len() > MAX_RESPONSE_BYTES {
                     return Err(io_error(format!(
                         "response body exceeded {} bytes while fetching {url}",
@@ -546,11 +543,10 @@ impl NativeHttpClient {
                         )))?;
                     (status, headers, output.stdout.as_slice())
                 };
-                let definitive = (300..400).contains(&status) || status == 404 || status == 503;
-                // Only wget's HTTP-error exit may return a definitive head.
-                // A read/connection failure must never masquerade as success.
-                if (!output.status.success() && !(output.status.code() == Some(8) && definitive))
-                    || ((400..600).contains(&status) && status != 404 && status != 503)
+                // Exit 8 means an HTTP error, not a truncated transfer.
+                // A read/connection failure must never masquerade as a response.
+                let http_error_exit = output.status.code() == Some(8) && (300..600).contains(&status);
+                if !output.status.success() && !http_error_exit
                 {
                     return Err(io_error(format!(
                         "wget fetch failed (HTTP {status}) for {url}: {}",
@@ -1090,6 +1086,240 @@ mod tests {
         (url, server)
     }
 
+    fn serve_responses(responses: Vec<&'static [u8]>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            for response in responses {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "expected another fallback attempt");
+                            thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                read_request(&mut stream);
+                stream.write_all(response).unwrap();
+            }
+        });
+        (url, server)
+    }
+
+    fn native_tiers_only(url: &str) -> NativeHttpClient {
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        let mut failures = [0; super::TIER_COUNT];
+        failures[super::TIER_SUBPROCESS] = super::FAIL_THRESHOLD;
+        client.tiers.lock().failures.insert(
+            crate::downloader::http_policy::domain_of(url).to_string(), failures,
+        );
+        client
+    }
+
+    #[tokio::test]
+    async fn native_untrusted_get_retains_last_http_response_after_fallback() {
+        for redirect in [RedirectMode::Follow, RedirectMode::Manual] {
+            let (url, server) = serve_responses(vec![
+                b"HTTP/1.1 410 Gone\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfirst",
+                b"HTTP/1.1 410 Gone\r\nSet-Cookie: sid=last\r\nContent-Length: 4\r\nConnection: close\r\n\r\nlast",
+            ]);
+            let client = native_tiers_only(&url);
+            let request = HttpRequest::get(url.clone()).with_redirect(redirect);
+            assert!(!request.trusted_endpoint);
+            // Enter at the post-validation dispatcher, as the loopback fixture
+            // is deliberately not an admissible public site URL.
+            let result = client.send_validated_hop(RedirectChain::new(request, 10), None).await;
+            server.join().unwrap();
+            let (_, response) = result.unwrap();
+            assert_eq!(response.status, 410);
+            assert_eq!(response.body, b"last");
+            assert_eq!(response.header("Set-Cookie"), Some("sid=last"));
+            let tiers = client.tiers.lock();
+            let domain = crate::downloader::http_policy::domain_of(&url);
+            assert_eq!(tiers.failures[domain][super::TIER_CURL], 1);
+            assert_eq!(tiers.failures[domain][super::TIER_REQWEST], 1);
+            assert!(!tiers.preferred.contains_key(domain));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_untrusted_get_prefers_fallback_success() {
+        for redirect in [RedirectMode::Follow, RedirectMode::Manual] {
+            let (url, server) = serve_responses(vec![
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngate",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            ]);
+            let client = native_tiers_only(&url);
+            let domain = crate::downloader::http_policy::domain_of(&url);
+            if redirect == RedirectMode::Manual {
+                // Manual URL resolution must still try curl before a preferred
+                // reqwest tier; the health counters identify the attempted order.
+                client.tiers.lock().note_success(domain, super::TIER_REQWEST);
+            }
+            let request = HttpRequest::get(url.clone()).with_redirect(redirect);
+            let result = client.send_validated_hop(RedirectChain::new(request, 10), None).await;
+            server.join().unwrap();
+            let (_, response) = result.unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, b"ok");
+            let tiers = client.tiers.lock();
+            assert_eq!(tiers.preferred.get(domain), Some(&super::TIER_REQWEST));
+            assert_eq!(tiers.failures[domain][super::TIER_CURL], 1);
+            assert_eq!(tiers.failures[domain][super::TIER_REQWEST], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_untrusted_get_keeps_http_response_when_later_tier_is_truncated() {
+        let (url, server) = serve_responses(vec![
+            b"HTTP/1.1 410 Gone\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngone",
+            b"HTTP/1.1 410 Gone\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort",
+        ]);
+        let client = native_tiers_only(&url);
+        let result = client.send_validated_hop(
+            RedirectChain::new(HttpRequest::get(url.clone()), 10), None,
+        ).await;
+        server.join().unwrap();
+        let (_, response) = result.unwrap();
+        assert_eq!(response.status, 410);
+        assert_eq!(response.body, b"gone", "a truncated later response must not replace the complete one");
+        let tiers = client.tiers.lock();
+        let domain = crate::downloader::http_policy::domain_of(&url);
+        assert_eq!(tiers.failures[domain][super::TIER_CURL], 1);
+        assert_eq!(tiers.failures[domain][super::TIER_REQWEST], 1);
+    }
+
+    #[tokio::test]
+    async fn native_untrusted_get_definitive_status_stops_fallback() {
+        for status in [404, 503] {
+            let response = if status == 404 {
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+            } else {
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+            };
+            let (url, server) = serve_once(response);
+            let client = native_tiers_only(&url);
+            let result = client.send_validated_hop(
+                RedirectChain::new(HttpRequest::get(url.clone()), 10), None,
+            ).await;
+            server.join().unwrap();
+            assert_eq!(result.unwrap().1.status, status);
+            let tiers = client.tiers.lock();
+            let domain = crate::downloader::http_policy::domain_of(&url);
+            assert_eq!(tiers.preferred.get(domain), Some(&super::TIER_CURL));
+            assert_eq!(tiers.failures[domain][super::TIER_CURL], 0);
+            assert_eq!(tiers.failures[domain][super::TIER_REQWEST], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_untrusted_get_still_rejects_loopback_before_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        client.send(HttpRequest::get(url)).await.expect_err("loopback must remain untrusted");
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn native_untrusted_get_rejects_oversized_http_error_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            let mut remaining = super::MAX_RESPONSE_BYTES + 1;
+            stream.write_all(format!(
+                "HTTP/1.1 410 Gone\r\nContent-Length: {remaining}\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).unwrap();
+            let chunk = [b'x'; 8192];
+            while remaining > 0 {
+                let count = remaining.min(chunk.len());
+                if stream.write_all(&chunk[..count]).is_err() { break; }
+                remaining -= count;
+            }
+        });
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        let result = client.send_reqwest_hop(&HttpRequest::get(url));
+        server.join().unwrap();
+        assert!(matches!(result, Err(NarouError::Io(_))));
+    }
+
+    #[test]
+    fn subprocess_tools_and_tier_keep_nondefinitive_http_status() {
+        let mut available = Vec::new();
+        for tool in ["curl", "wget"] {
+            match std::process::Command::new(tool).arg("--version").output() {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("could not probe {tool}: {error}"),
+                Ok(output) => assert!(output.status.success(), "{tool} --version failed"),
+            }
+            available.push(tool);
+            let (url, server) = serve_responses(vec![
+                b"HTTP/1.1 410 Gone\r\nSet-Cookie: sid=gone\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngone",
+            ]);
+            let client = NativeHttpClient::new("narou_rs-test").unwrap();
+            let result = client.run_fetch_tool(tool, &HttpRequest::get(url), "narou_rs-test");
+            server.join().unwrap();
+            let response = result.unwrap();
+            assert_eq!(response.status, 410, "{tool}");
+            assert_eq!(response.body, b"gone", "{tool}");
+            assert_eq!(response.header("Set-Cookie"), Some("sid=gone"), "{tool}");
+        }
+        if available.is_empty() {
+            return;
+        }
+        let (url, server) = serve_responses(vec![
+            b"HTTP/1.1 410 Gone\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngone".as_slice();
+            available.len()
+        ]);
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        let result = client.fetch_tier_subprocess(&HttpRequest::get(url), "narou_rs-test");
+        server.join().unwrap();
+        let response = result.unwrap();
+        assert_eq!(response.status, 410);
+        assert_eq!(response.body, b"gone");
+    }
+
+    #[test]
+    fn native_untrusted_get_tiers_keep_nondefinitive_http_status() {
+        for tier in [super::TIER_CURL, super::TIER_REQWEST] {
+            for status in [403, 410] {
+                let response = if status == 403 {
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull".as_slice()
+                } else {
+                    b"HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull".as_slice()
+                };
+                let (url, server) = serve_once(response);
+                let request = HttpRequest::get(url.clone());
+                assert!(!request.trusted_endpoint);
+                let client = NativeHttpClient::new("narou_rs-test").unwrap();
+                let result = match tier {
+                    super::TIER_CURL => client.fetch_tier_curl(&request, "narou_rs-test"),
+                    super::TIER_REQWEST => client.send_reqwest_hop(&request),
+                    _ => unreachable!(),
+                };
+                server.join().unwrap();
+                let response = result.expect("a complete HTTP error must retain its numeric status");
+                assert_eq!(response.status, status);
+                assert_eq!(response.body, b"null");
+                assert!(matches!(
+                    crate::downloader::http_policy::ensure_success_response(&url, response),
+                    Err(NarouError::Http(message)) if message.contains(&format!("HTTP {status}"))
+                ));
+            }
+        }
+    }
+
     #[test]
     fn subprocess_tier_fetches_200_body() {
         let (url, server) = serve_once(
@@ -1279,7 +1509,7 @@ mod tests {
         // rejects this loopback test origin as untrusted. The returned redirect
         // must still be checked before its next outgoing request.
         let request = HttpRequest::get(url);
-        let response = client.fetch_tier_reqwest(&request).unwrap();
+        let response = client.send_reqwest_hop(&request).unwrap();
         let mut chain = RedirectChain::new(request, 10);
         assert!(chain.advance(&response).unwrap());
         let err = NativeHttpClient::validate_hop(chain.request()).unwrap_err();

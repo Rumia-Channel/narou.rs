@@ -34,6 +34,10 @@ pub enum Expr {
     Extract(String, String),
     Request(Box<Expr>),
     FetchJson(Box<Expr>),
+    FetchJsonRequired {
+        url: Box<Expr>,
+        missing_statuses: Vec<u16>,
+    },
     PostForm {
         url: Box<Expr>,
         fields: Box<Expr>,

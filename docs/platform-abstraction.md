@@ -452,6 +452,7 @@ Worker (worker_entry)
 - Cronはplannerに限定し、D1をbounded pageで走査して個別Update jobをenqueueする。Cron発火時刻をgenerationとして保存せず、D1が管理する論理generationとkeyset cursorをplanner lease付きで再開する。
 - Worker crawlerは実行予算を超える前にsection単位のcheckpointを保存して終了する。次回claim時にcheckpointのjob/novel identityを検証し、保存済みprefixをObjectStoreから復元してHTTP再取得を避ける。prefixが欠損する場合はsection 0から安全に再開する。
 - Budgetによるsection-boundary yieldは失敗retryではない。checkpointをD1へ保存してjobを`pending`へ戻し、同じjobの新しいv2 envelopeをQueueへ送信し、送信成功後に現在messageをackする。正常経路では`attempts`とQueue retry回数を消費しない。送信後ack前のクラッシュは通常の再配信に任せ、lease/dedupeで二重実行を防ぐ。
+- HTTP 等の通常の retryable エラーも最新の話境界を保存してから失敗記録へ進む。境界は 100 話未満でも保持し、非同期の定期保存を回収してから execution token で fenced な最終書込みを await する。予算による yield とは区別し、通常の attempts / retry-backoff を消費する。破損 prefix から再開始するときも旧保存を回収し、位置 0 と同じ実行文脈を以後のダウンローダへ渡す。本文に続いて dirty な挿絵索引も通常エラー時に保存するため、再試行は保存済みデータを再利用できる。
 - `Convert` / `Send` / `Mail` / `Backup` の重いnative処理はWorkerで実行せず、blockedとしてledgerへ記録する。Worker APIは既存read APIと分離し、認証・binding readiness・失敗分類を明示する。
 
 ### Phase 8 運用ポリシー

@@ -65,6 +65,7 @@ primary = _{
     | extract_expr
     | call_chain_expr
     | request_expr
+    | required_json_expr
     | fetch_json_expr
     | post_form_expr
     | chain_expr
@@ -85,9 +86,12 @@ extract_expr = { "extract" ~ "(" ~ regex ~ ")" }
 request_expr = { "request" ~ "(" ~ string ~ ")" }
 // 取得要求と結果参照の糖衣。未解決・失敗なら null を返す。
 fetch_json_expr = { "fetch_json" ~ "(" ~ string ~ ")" }
+// Essential JSON: failures propagate; only explicitly admitted statuses yield null.
+required_json_expr = { "fetch_json_required" ~ "(" ~ string ~ ("," ~ http_status_list)? ~ ")" }
+http_status_list = { "[" ~ (int_lit ~ ("," ~ int_lit)*)? ~ "]" }
 post_form_expr = { "post_form" ~ "(" ~ string ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
 // `fetch_json(...).body[0].urls.original` のように呼び出し結果を辿る形。
-call_chain_expr = { (request_expr | fetch_json_expr | post_form_expr) ~ chain_part+ }
+call_chain_expr = { (request_expr | required_json_expr | fetch_json_expr | post_form_expr) ~ chain_part+ }
 
 // --- accessor + method chain ---
 chain_expr = { ident ~ chain_part* }

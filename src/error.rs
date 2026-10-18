@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -46,6 +48,9 @@ pub enum NarouError {
 
     #[error("Login error: {0}")]
     Login(String),
+
+    #[error(transparent)]
+    Shared(Arc<NarouError>),
 }
 
 pub type Result<T> = std::result::Result<T, NarouError>;
