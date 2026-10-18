@@ -63,8 +63,7 @@ status/lane combinations, empty data, tag ordering/case/Unicode, orphan tags,
 one/multiple running jobs, and a 10,000-job pending queue. They do not compile
 Rust or emulate D1. The Node tests validate the measurement client, not Worker
 behavior. The dedicated PR workflow also type-checks the wasm target and runs
-the existing local-workerd contract suite, without deployment credentials and
-regardless of the SORAHOST deployment switch.
+the existing local-workerd contract suite without deployment credentials.
 
 ## Before/after measurement
 

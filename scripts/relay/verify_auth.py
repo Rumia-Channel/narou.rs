@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""SORAHOST リレーの認証が Worker 側の設定と一致しているかを確かめる。
+"""外部リレーの認証が Worker 側の設定と一致しているかを手動で確かめる。
 
-Worker は踏み台へ `X-Proxy-Token: <SORAHOST_PROXY_KEY>` を付けて `POST /proxy` する。
-リレー側はコンテナの `SORAHOST_PROXY_KEY` (パネルの `.env`) と突き合わせるため、
+Worker は踏み台へ `X-Proxy-Token: <NAROU_RELAY_KEY>` を付けて `POST /proxy` する。
+リレー側は同じ `NAROU_RELAY_KEY` と突き合わせるため、
 **この 2 つがずれると Worker からは 403 になり、元の fetch 結果へ黙って戻る**
 (サイトが取得できない、という形でしか見えない)。ここで配備直後に検出する。
 
@@ -10,16 +10,16 @@ Worker は踏み台へ `X-Proxy-Token: <SORAHOST_PROXY_KEY>` を付けて `POST 
   1. `GET <endpoint>/health` が 200 を返すか (到達性。旧版は 404 がありうる)
   2. `POST <endpoint>/proxy` に**わざと違うトークン**を付けると 403 か
      (403 にならないなら認証が効いていない)
-  3. 正しいトークン (`SORAHOST_PROXY_KEY`) なら 403/500 にならないか
-     (403 = パネルの .env と secret が不一致 / 500 = リレーの .env に鍵が無い)
+  3. 正しいトークン (`NAROU_RELAY_KEY`) なら 403/500 にならないか
+     (403 = リレーと Worker の secret が不一致 / 500 = リレーに鍵が無い)
 
 環境変数:
-  SORAHOST_PROXY_ENDPOINT  リレーの公開先 (Worker の secret と同じ値)
-  SORAHOST_PROXY_KEY       リレーの合言葉 (Worker の secret と同じ値)
+  NAROU_RELAY_ENDPOINT    リレーの公開先 (Worker の secret と同じ値)
+  NAROU_RELAY_KEY         リレーの合言葉 (Worker の secret と同じ値)
 
 任意:
-  SORAHOST_PROXY_PROBE_URL 3 番目で取得する URL (既定 https://example.com/)
-  SORAHOST_PROXY_TIMEOUT   1 リクエストの制限秒数 (既定 30)
+  NAROU_RELAY_PROBE_URL   3 番目で取得する URL (既定 https://example.com/)
+  NAROU_RELAY_TIMEOUT     1 リクエストの制限秒数 (既定 30)
 """
 
 from __future__ import annotations
@@ -31,21 +31,21 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-TIMEOUT = float(os.environ.get("SORAHOST_PROXY_TIMEOUT", "").strip() or 30)
-PROBE_URL = os.environ.get("SORAHOST_PROXY_PROBE_URL", "").strip() or "https://example.com/"
+TIMEOUT = float(os.environ.get("NAROU_RELAY_TIMEOUT", "").strip() or 30)
+PROBE_URL = os.environ.get("NAROU_RELAY_PROBE_URL", "").strip() or "https://example.com/"
 FAILURES: list[str] = []
 
 
 def endpoint_base() -> str:
-    raw = os.environ.get("SORAHOST_PROXY_ENDPOINT", "").strip()
+    raw = os.environ.get("NAROU_RELAY_ENDPOINT", "").strip()
     if not raw:
-        print("error: SORAHOST_PROXY_ENDPOINT が設定されていません", file=sys.stderr)
+        print("error: NAROU_RELAY_ENDPOINT が設定されていません", file=sys.stderr)
         raise SystemExit(1)
     if "://" not in raw:
         raw = f"http://{raw}"
     parts = urllib.parse.urlsplit(raw)
     # Worker 側 (`platform::relay::RelayConfig`) と同じくオリジンだけを使う。
-    # パスは `/proxy` に固定するので、`/_sorahost/...` のような前置きは落とす。
+    # パスは `/proxy` に固定するので、前置きのパスは落とす。
     return f"{parts.scheme}://{parts.netloc}"
 
 
@@ -66,7 +66,7 @@ def request(method: str, url: str, *, token: str | None, payload: dict | None = 
 
 def main() -> int:
     base = endpoint_base()
-    key = os.environ.get("SORAHOST_PROXY_KEY", "").strip()
+    key = os.environ.get("NAROU_RELAY_KEY", "").strip()
     print(f"リレー: {base}")
 
     status, body = request("GET", f"{base}/health", token=None)
@@ -94,7 +94,7 @@ def main() -> int:
         print(f"::warning::不正なトークンで {status}: {body.strip()[:120]}")
 
     if not key:
-        print("::warning::SORAHOST_PROXY_KEY が未設定のため、合言葉の一致は確認できません")
+        print("::warning::NAROU_RELAY_KEY が未設定のため、合言葉の一致は確認できません")
         return 1 if FAILURES else 0
 
     status, body = request("POST", f"{base}/proxy", token=key, payload={"url": PROBE_URL})
@@ -108,10 +108,10 @@ def main() -> int:
         print(f"  正しいトークン: 200 (上流 {upstream}, via={json.loads(body).get('via', '?')})")
     elif status == 403:
         FAILURES.append(
-            "正しいトークンでも 403 (コンテナの SORAHOST_PROXY_KEY と Worker の secret が不一致)"
+            "正しいトークンでも 403 (リレーの NAROU_RELAY_KEY と Worker の secret が不一致)"
         )
     elif status == 500:
-        FAILURES.append("リレーが 500 を返す (コンテナの環境変数 SORAHOST_PROXY_KEY が未設定)")
+        FAILURES.append("リレーが 500 を返す (リレーの環境変数 NAROU_RELAY_KEY が未設定)")
     else:
         FAILURES.append(f"正しいトークンで {status}: {body.strip()[:120]}")
 

@@ -39,10 +39,9 @@ runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカー�
   Secrets Store の `*_SECRET_NAME` を使うか、`wrangler secret put` で別途投入する。
 - `NAROU_AUTH_REQUIRED` / `NAROU_WORKERS_DEV` / `DEVELOP_DOMAIN` /
   `NAROU_S3_PREFIX` / `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` / `NAROU_SMOKE=0`
-- `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY` … 外部の取得リレー（任意）。接続先（例:
-  `http://<IP>:<port>/_sorahost/...`）を `SORAHOST_PROXY_ENDPOINT` に、リレーの合言葉
-  （PteWorker の `.env` に置く `SORAHOST_PROXY_KEY` と同じ値）を `SORAHOST_PROXY_KEY` に入れる。
-  Worker secret (`SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY`) として投入する。
+- `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` … 任意の外部取得リレー。
+  リレーの公開先と `X-Proxy-Token` の合言葉を同名の Worker secret として投入する。
+  リレー自体の配置・更新はこの CI からは行わない。
 - `SERVICE_DOMAIN` / `DEVELOP_DOMAIN` … custom domain。secret を推奨（ログへ出さない）
 - `NAROU_DEPLOY_URL` … smoke の宛先を明示する（既定は domain → workers.dev）
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` … Access の service token。
@@ -81,7 +80,7 @@ PROBE_USER_AGENT = (
 )
 
 # custom domain を付けられないときの wrangler のエラー文言 (Cloudflare error
-# 100117)。SORAHOST のコネクタ等が同じホスト名の DNS レコードを持っていると出る。
+# 100117)。既存のフロントエンド等が同じホスト名の DNS レコードを持っていると出る。
 DNS_CONFLICT_MARKER = "externally managed DNS records"
 
 # Cloudflare Access のログインリダイレクト先。ルートで Worker を受けている
@@ -155,17 +154,6 @@ def mask(value: str) -> None:
 def auth_required() -> bool:
     """Bearer トークン検査が有効か（Zero Trust を境界にする場合は false）。"""
     return os.environ.get("NAROU_AUTH_REQUIRED", "true").strip().lower() != "false"
-
-
-def sorahost_active() -> bool:
-    """配備先が SORAHOST か (Repository variable `SORAHOST=T`)。
-
-    `T` の間は Workers 側のジョブが workflow の `if` で止まるので、ここは
-    「Workers が配備先か」の判定として使う。ドメインの取り合いでは、動いて
-    いる側がホスト名を取る: SORAHOST が配備先なら Workers は DNS レコードを
-    奪わない (route への切替もしない)。
-    """
-    return os.environ.get("NAROU_SORAHOST", "").strip().upper() == "T"
 
 
 def required(name: str) -> str:
@@ -482,9 +470,9 @@ def secret_file(target: str) -> Path | None:
                 f"::notice::{source} is not set; the S3 illustration backend stays fail-closed "
                 f"(set {source} or {store_var})"
             )
-    # SORAHOST の取得リレー（任意）。値があるときだけ Worker secret として渡す。
+    # 外部の取得リレー（任意）。値があるときだけ Worker secret として渡す。
     # 未設定なら Worker 側のリレー段は無効のまま（Cloudflare から取れないサイトが残る）。
-    for name in ("SORAHOST_PROXY_ENDPOINT", "SORAHOST_PROXY_KEY"):
+    for name in ("NAROU_RELAY_ENDPOINT", "NAROU_RELAY_KEY"):
         value = os.environ.get(name, "").strip()
         if value:
             secrets[name] = value
@@ -525,24 +513,16 @@ def deploy(
     smoke の宛先は `smoke_url()` が custom domain から決める。ログ中の任意の
     https URL を拾うと無関係なリンクを掴むので、フォールバックはしない。
 
-    ホスト名の DNS レコードを SORAHOST などの前段が持っている場合、custom
+    ホスト名の DNS レコードを既存のフロントエンド等が持っている場合、custom
     domain は付け替えられない (`externally managed DNS records`)。そのときは
     `NAROU_DOMAIN_MODE=route` で組み直し、同じホスト名に Workers の route と
     して載せ直す (DNS は触らない・Access はホスト名単位のまま)。
     """
     code, log = run_deploy(secrets)
     if code != 0 and DNS_CONFLICT_MARKER in log:
-        if sorahost_active():
-            # SORAHOST が配備先のときは、そのホスト名は SORAHOST のもの。
-            # Workers からは奪わない (workflow の if で通常はここへ来ない)。
-            print(log)
-            fail(
-                "hostname is managed by SORAHOST while SORAHOST=T; "
-                "switch the deployment target or release the hostname first"
-            )
         print(
             "::notice::ホスト名の既存 DNS レコードのため custom domain を route に切り替えます "
-            "(NAROU_DOMAIN_MODE=route; SORAHOST=F なので Workers が受け持ちます)"
+            "(NAROU_DOMAIN_MODE=route)"
         )
         os.environ["NAROU_DOMAIN_MODE"] = "route"
         render(target, resources)

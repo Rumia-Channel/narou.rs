@@ -1,9 +1,8 @@
-# SORAHOST で narou.rs を動かす
+# SORAHOST で narou.rs を手動配置する
 
-SORAHOST (PteWorker の node モード) のコンテナで native 版 `narou_rs` を常駐させる
-手順。**Workers は使わない**。専用サーバー 1 台で完結し、公開は PteWorker が行う (前段に
-Cloudflare のコネクタと Access を置く構成も選べる §2)。CI から配備するのに必要な値は
-**`SORAHOST_ENDPOINT` と `SORAHOST_TOKEN` の 2 つだけ** (§9)。
+この資料は既存の SORAHOST (PteWorker) へ native 版を手動配置する場合の参考です。
+**SORAHOST 専用の CI 配備・切り替えは廃止済み**です。通常の CI は Workers 向けの検証と配備を行い、
+外部取得リレーはホスト非依存の `scripts/relay/` として別途管理します。
 
 ```
 Browser ──https──▶ PteWorker (公開 URL / TLS)
@@ -36,7 +35,7 @@ Linux x86_64 の実行ファイルが必要。手元に Linux が無くてもよ
 
 ### A. GitHub Actions で作る (推奨)
 
-Actions の **Linux build (SORAHOST)** を `workflow_dispatch` で実行し、完了後に
+Actions の **Linux build** を `workflow_dispatch` で実行し、完了後に
 artifact `narou_rs-linux-x86_64` をダウンロードして展開する。中身:
 
 ```
@@ -88,29 +87,15 @@ library/                 初回起動で作られる (.narou / 小説データ /
 TLS と本人確認 (Zero Trust) を前段に置く。直の IP:ポート宛は narou の Host 許可リストで
 弾かれるので、公開経路はトンネルだけになる。
 
-1. GitHub の Environment `SORAHOST` に値を置く (§3.2)
-2. `develop` へ push すると `deploy-sorahost.yml` が `sorahost/ci/provision_connector.py` を実行し、
-   コネクタ / 向き先 (ingress) / DNS /(設定していれば) Access を冪等に作る
-3. Cloudflare の **Networks → Tunnels → 該当のコネクタ → Add a replica** でトークンを確認し、
-   PteWorker の `.env` に `NAROU_CONNECTOR_TOKEN=<トークン>` と `NAROU_PUBLIC_HOST=<公開ホスト名>` を置いて再起動
-4. `https://<公開ホスト名>/` が Access のログインを要求し、`http://<IP>:<PORT>/` が **400** になれば成功
+1. コネクタ・向き先・DNS・Access は Cloudflare 側で用意する（このリポジトリの CI は構築しない）。
+2. コネクタの接続トークンをサーバー直下の `.env` の `NAROU_CONNECTOR_TOKEN` に置き、
+   `NAROU_PUBLIC_HOST=<公開ホスト名>` を設定して再起動する。
+3. `https://<公開ホスト名>/` が Access のログインを要求し、`http://<IP>:<PORT>/` が **400** になれば成功。
 
 - `NAROU_CONNECTOR_TOKEN` は CI では扱わない (公開リポジトリのログに出さないため)。ダッシュボードで
   確認してサーバー直下の `.env` に置く
-- 向き先 (ingress) は `127.0.0.1:<SORAHOST_SERVICE_PORT>` (既定 18080 = PteWorker の `PORT`)。
-  `NAROU_RS_PORT` を変えたら合わせる
-- **トークンの権限 (UI の探し方)**: My Profile → API Tokens → Create Token → Custom token。
-  - アカウント全体のポリシーに次を足して **Edit** (どれでも可。Cloudflare の API リファレンスが
-    3 つ併記している): **`Cloudflare One Connectors`** / **`Cloudflare One Connector: cloudflared`** /
-    **`Cloudflare Tunnel`**(説明が "Grants access to create and delete Cloudflare Tunnels")。
-    似た名前の **`Argo Tunnel (Legacy)`** は旧版なので選ばない
-  - **DNS はゾーン スコープ**なので、ポリシーをもう 1 行足して「ゾーン」→ 対象ドメイン →
-    `DNS: Edit` と `Zone: Read`(ゾーン ID の解決に必要)
-  - Access を使うなら同じアカウント全体のポリシーに **`Access: Apps and Policies: Edit`**
-  - ダッシュボードの表記は Read/Edit、API リファレンスは Read/Write (同じもの)
-- Zero Trust が未有効のアカウントでは Access の作成が 403 で止まる。ダッシュボードで有効化するか、
-  `SORAHOST_ACCESS_EMAIL` / `SORAHOST_ACCESS_DOMAIN` を外して Access なしで進める
-  (その場合は TLS だけが付く)
+- 向き先 (ingress) は narou が実際に待ち受ける `127.0.0.1:<port>`。
+  `NAROU_RS_PORT` を変えたら合わせる。
 - basic 認証は既定で有効のまま。前段の Access に認証を任せて二重にしたくない場合だけ
   `NAROU_ALLOW_NO_PASSWORD=1` を `.env` に置く (トンネルの有無では切らない)
 
@@ -178,7 +163,7 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
 | `NAROU_RS_EPUB_ENGINE` | EPUB エンジン | `lite` / `external` / `auto` (未設定 = auto) | **環境変数が `convert.epub-engine` より優先** |
 | `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` とライブラリの場所 | 通常は未設定 (配備パスから自動) | start.sh |
 | `NAROU_RS_PORT` | 待受ポート | 通常は未設定 (プラットフォームの `PORT` を使う) | start.sh (リレー同居時のみ 8080) |
-| `NAROU_RELAY` / `SORAHOST_PROXY_KEY` | 同じサーバーで取得リレーも動かすときだけ (§10) | `1` / 合言葉 | start.sh |
+| `NAROU_RELAY` / `NAROU_RELAY_KEY` | 同じサーバーで取得リレーも動かすときだけ (§10) | `1` / 合言葉 | start.sh |
 | `NAROU_CONNECTOR_TOKEN` | コネクタ (cloudflared) の接続トークン。置くと起動する (basic 認証は既定で有効のまま) | ダッシュボードの Add a replica の値 | start.sh |
 | `NAROU_PUBLIC_HOST` | 公開ホスト名。置くとその Host 以外を弾く | 例 `narou.example.com` | start.sh |
 | `NAROU_CONNECTOR_TOKEN_FILE` | トークンをファイルで渡す場合のパス | 既定 `$VOLUME_DIR/.connector-token` | start.sh |
@@ -194,24 +179,12 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
   コネクタ (トンネル) は利用者の認証ではないため、basic 認証はコネクタ併用時も有効のままにする。
   検証済みの Cloudflare Access 等に認証を任せる場合だけ `NAROU_ALLOW_NO_PASSWORD=1` を明示する。
 
-### 3.2 GitHub 側に置く値 (CI)
+### 3.2 CI との分離
 
-| 種類 | 名前 | 値 |
-| --- | --- | --- |
-| Repository variable | `SORAHOST` | `T` で SORAHOST 配備が有効になり、Worker 側の CI が止まる (`F` / 未設定で逆) |
-| Environment `SORAHOST` secret | `SORAHOST_ENDPOINT` | PteWorker コンソールの「エンドポイント」 |
-| Environment `SORAHOST` secret | `SORAHOST_TOKEN` | 同「デプロイトークン」(`token rotate` で再発行) |
-| Environment `SORAHOST` secret | `SORAHOST_SMOKE_URL` | 任意。配備後の確認先 (未設定なら配備結果の `url`) |
-| Environment `SORAHOST` secret | `CLOUDFLARE_API_TOKEN` | 任意 (§2-A を使うとき)。権限は §2-A の箇条書きを参照 |
-| Environment `SORAHOST` secret | `CLOUDFLARE_ACCOUNT_ID` | アカウント ID (識別子だが外に見せたくないので secret) |
-| Environment `SORAHOST` secret | `SORAHOST_PUBLIC_HOSTNAME` | 公開ホスト名 (例 `narou.example.com`) |
-| Environment `SORAHOST` secret | `SORAHOST_SERVICE_PORT` | コネクタの向き先 = コンテナ内の待受ポート (既定 18080 = PteWorker の `PORT`) |
-| Environment `SORAHOST` secret | `SORAHOST_CONNECTOR_NAME` | コネクタ名 (既定 `narou-sorahost`) |
-| Environment `SORAHOST` secret | `SORAHOST_ACCESS_EMAIL` | Access で許可するメール (カンマ区切り) |
-| Environment `SORAHOST` secret | `SORAHOST_ACCESS_DOMAIN` | 許可するメールドメイン |
-| Environment `SORAHOST` secret | `SORAHOST_ACCESS_SESSION` | Access のセッション有効期限 (既定 24h) |
+SORAHOST 用の Repository variable・Environment・配備ジョブは現行 CI では使用しません。
+§3.1 の値はサーバー直下の `.env` に置き、配置・更新も手動で行います。
+Workers の配備設定と外部リレーの設定は [プラットフォーム設計](../docs/platform-abstraction.md) を参照してください。
 
-§3.1 の値は CI には置かない (サーバー直下の `.env` に置く)。
 
 ### 3.3 鍵・資格情報の仕様
 
@@ -225,7 +198,7 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
 | `S3_REGION` | 空でない文字列 (署名に必須) | 例 `ap-northeast-1` |
 | `SORAHOST_ENDPOINT` | URL。パス込みでよく、`<endpoint>/deploy` へ送る | PteWorker コンソールの「エンドポイント」 |
 | `SORAHOST_TOKEN` | 不透明な文字列。`Authorization: Bearer` で送る | 同「デプロイトークン」(`token rotate` で再発行) |
-| `SORAHOST_PROXY_KEY` | 空でない文字列。完全一致で照合 (定数時間比較ではない) | `openssl rand -hex 32` など |
+| `NAROU_RELAY_KEY` | 空でない文字列。Worker とリレーに同じ値を設定する | `openssl rand -hex 32` など |
 
 内部形式 (実装が決めているもの。手で作らない):
 
@@ -237,13 +210,12 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
   (AAD `narou.rs/login-export`)
 - 資格情報の ID は UUIDv4 形 (小文字 hex)
 - 鍵を変えると保存済み Cookie は復号できない (取り込み直す)
-- `NAROU_ADMIN_TOKEN` は Worker 用 (SORAHOST=T の間は未使用)。定数時間比較で、未設定なら 500
+- `NAROU_ADMIN_TOKEN` は Worker 用。定数時間比較で、未設定なら 500
   `authentication_not_configured`
 
 Worker 側の CI は別系統の値を使う (Environment `Cloudflare`): `CLOUDFLARE_API_TOKEN` /
-`CLOUDFLARE_ACCOUNT_ID` / `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY` /
-`SORAHOST_PROXY_TOKEN` / `NAROU_S3_*`。**native の `S3_*` と Worker の `NAROU_S3_*` は
-別物**なので混同しないこと (`SORAHOST=T` の間は使われない)。
+`CLOUDFLARE_ACCOUNT_ID` / `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` / `NAROU_S3_*`。
+**native の `S3_*` と Worker の `NAROU_S3_*` は別物**なので混同しないこと。
 
 ## 4. 起動
 
@@ -349,7 +321,7 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 
 ## 8. 更新
 
-`develop` に push する (§9 の CI が配備する) か、手元から:
+Linux バイナリ等を更新し、手元から手動配備する:
 
 ```sh
 cd <sorahost.json があるフォルダー>
@@ -359,40 +331,13 @@ SORAHOST_ENDPOINT=... SORAHOST_TOKEN=... npx sorahost-cli deploy --yes
 配備すると PteWorker が起動し直す。`self-update` は使わない。
 `app/webnovel/*.yaml` を差し替えたときも、配備 (か手動の `restart`) で反映される。
 
-## 9. CI からの自動配備
+## 9. CI の扱い
 
-`develop` へ push する (または Actions の **Deploy SORAHOST** を手で回す) と、
-ビルドから配備まで自動で流れる。**動くのは Repository variable の
-`SORAHOST` が `T` のときだけ** (未設定・`F` なら何もせず終わる)。
-
-`SORAHOST` が `T` の間は **Cloudflare Workers 側の CI も止まる**
-(`.github/workflows/platform.yml` の wasm / worker / worker-contract / relay-deploy /
-worker-deploy-develop / worker-deploy-production が skip)。Worker に戻すときは
-`SORAHOST` を `F` にするか消す (native / native-gpl / license は常に走る)。
-
-流れ:
-
-1. `.github/workflows/build-linux.yml` が Linux バイナリを作る (GitHub ホストの runner)
-2. `deploy/` に `app/` (narou_rs / narou_rs_backup / webnovel) + `start.sh` +
-   `sorahost.json` を集める
-3. `sorahost-cli deploy` で SORAHOST へ送る (`--json` の `url` が公開先)
-4. 公開先を叩いて応答を確認する (basic 認証があるので 401/403 でも「立っている」)
-
-### Environment `SORAHOST` に置く値
-
-| 種別 | 名前 | 用途 |
-| --- | --- | --- |
-| secret | `SORAHOST_ENDPOINT` | PteWorker のコンソールに出るエンドポイント |
-| secret | `SORAHOST_TOKEN` | デプロイトークン (`Authorization: Bearer`) |
-| var | `SORAHOST_SMOKE_URL` | 任意。確認先 (未設定なら配備結果の `url` を使う) |
-
-この 2 つ (と任意の 1 つ) だけ。SFTP も Cloudflare の資格情報も使わない。
-
-> `SORAHOST` 環境に**同名の `SORAHOST` 変数を置かないこと** (Repository variable
-> の判定と混ざる)。
-
-アプリ側の設定 (`NAROU_WEB_PASSWORD` / `S3_*` / `NAROU_RS_ASSET_BACKEND` など) は
-CI ではなく **PteWorker の `.env`** に置く (§3、ひな形は `sorahost/narou.env.example`)。
+SORAHOST への自動配備は提供しません。Linux バンドルの作成は **Linux build** を使えますが、
+その後の配置・更新は手動で行ってください。`develop` への push はこのホストを更新しません。
+通常の `platform.yml` は Native・Wasm・Worker 等を検証して対象の Worker を配備し、
+外部リレーの再配備やホスティング先の切り替え変数には依存しません。
+既存のサービスや Secret を自動削除する処理はありません。
 
 ## 10. Worker の取得リレーと同じサーバーで動かす (任意)
 
@@ -401,31 +346,28 @@ CI ではなく **PteWorker の `.env`** に置く (§3、ひな形は `sorahost
 **1 プロジェクト = 起動コマンド 1 つ** なので、起動コマンドを narou の `start.sh`
 に寄せて、リレーはそこから起動する。
 
-1. サーバー直下の `.env` に `NAROU_RELAY=1` を足す (`SORAHOST_PROXY_KEY` は既にある値のまま)
-2. リレー側の起動コマンドを `bash start.sh` に差し替える。リレーを CI から配備して
-   いる場合は Repository variable `SORAHOST_RELAY_START` = `bash start.sh` を入れる
-   (未設定なら従来どおり `node server.mjs` で、リレーだけが動く)
-3. narou を先に配備してからリレーを配備する (`start.sh` が無いと起動しない)
+1. サーバー直下の `.env` に `NAROU_RELAY=1` と `NAROU_RELAY_KEY` を設定する。
+2. `scripts/relay/server.mjs` と `scripts/relay/worker/protocol.mjs` を `start.sh` の隣に同じ相対構成で配置する。
+3. 手動の配備定義では `start.sh` を起動する（CI からのリレー配備は行わない）。
 4. ログに `取得リレーを起動しました` と `narou` の起動が出ることを確認する
 
 - ポート: リレーがプラットフォームの `PORT` (127.0.0.1)、narou は `NAROU_RS_PORT`
   (既定 8080)。`start.sh` は同居時にプラットフォームの `PORT` を narou へ渡さない
-- リレーの合言葉は Worker secret の `SORAHOST_PROXY_KEY` と**同じ値**にする。ずれると
-  Worker からは 403 になり、取得できないサイトが黙って増える (Worker は元の取得結果へ
-  戻るだけなので表面化しない)。`relay-deploy` ジョブが配備後に
-  `scripts/sorahost-proxy/verify_auth.py` で一致を確認する。手元で確かめるなら:
+- リレーの合言葉は Worker secret の `NAROU_RELAY_KEY` と**同じ値**にする。ずれると
+  Worker からは 403 になり、元の取得結果へ戻るため一部サイトの取得が失敗する。
+  配置後は手元で `scripts/relay/verify_auth.py` を実行して一致を確認する:
 
   ```sh
-  SORAHOST_PROXY_ENDPOINT=https://... SORAHOST_PROXY_KEY=... \
-    python3 scripts/sorahost-proxy/verify_auth.py
+  NAROU_RELAY_ENDPOINT=https://... NAROU_RELAY_KEY=... \
+    python3 scripts/relay/verify_auth.py
   ```
 
-- 注意: リレーの配備 (`sorahost-cli deploy`) はプロジェクトの起動コマンドを書き換える。
-  同居させるときは常に `SORAHOST_RELAY_START` を設定しておくこと。
+- 同居時の配備定義は `start.sh` を起動する設定のまま維持し、
+  `node server.mjs` だけに差し替えないこと。
 
 ### 取得リレーの共通契約と検証
 
-Node 版と Worker 版は `scripts/sorahost-proxy/worker/protocol.mjs` を共有する。
+Node 版と Worker 版は `scripts/relay/worker/protocol.mjs` を共有する。
 入力 JSON は UTF-8 の実バイト数で 64 KiB、取得した本文は展開後の実バイト数で
 16 MiB まで受け付ける。応答メタデータは JSON の escape・UTF-8・空の本文欄を
 含めて 448 KiB に制限する。Cookie を含む同名ヘッダの順序を保ち、非 ASCII の
@@ -444,15 +386,15 @@ POST の JSON 本文で送る。
 配備用の資格情報を使わない。
 
 ```sh
-npx --yes wrangler@4 dev --config scripts/sorahost-proxy/worker/wrangler.toml \
-  --var SORAHOST_PROXY_KEY:test-key
+npx --yes wrangler@4 dev --config scripts/relay/worker/wrangler.toml \
+  --var NAROU_RELAY_KEY:test-key
 ```
 
 別ターミナルから次で Node 版と Worker 版の両方を実 HTTP 上流につないで検証できる。
 
 ```sh
 RELAY_WORKER_BASE_URL=http://127.0.0.1:18912 RELAY_TEST_TOKEN=test-key \
-  node --test tests/sorahost_relay.test.mjs
+  node --test tests/relay.test.mjs
 ```
 
 

@@ -19,7 +19,7 @@ import {
   decodeHeaderJson,
   headerPairs,
   readBoundedBytes,
-} from "../scripts/sorahost-proxy/worker/protocol.mjs";
+} from "../scripts/relay/worker/protocol.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TOKEN = process.env.RELAY_TEST_TOKEN || "test-key";
@@ -159,10 +159,10 @@ const startNativeRelay = async () => {
   const base = `http://127.0.0.1:${port}`;
   const relay = spawn(
     process.execPath,
-    [join(ROOT, "scripts", "sorahost-proxy", "server.mjs")],
+    [join(ROOT, "scripts", "relay", "server.mjs")],
     {
       cwd: ROOT,
-      env: { ...process.env, SORAHOST_PROXY_KEY: TOKEN, PORT: String(port) },
+      env: { ...process.env, NAROU_RELAY_KEY: TOKEN, PORT: String(port) },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );

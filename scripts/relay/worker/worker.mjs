@@ -1,12 +1,11 @@
-// SORAHOST (PteWorker) の worker モード用 取得リレー。
+// fetch ランタイム用の外部取得リレー。
 //
-// node モード (../server.mjs) と同じ `POST /proxy` プロトコルを実装する。
+// Node 版 (../server.mjs) と同じ `POST /proxy` プロトコルを実装する。
 // 違いはクライアント:
 //   node モード : curl を起動して取得 (実測で 200 が取れる)
 //   worker モード: ランタイムの fetch を使う (同一回線の実測では Node の
 //                  fetch は 403 になり、curl は 200 だった)
-// どちらの踏み台がハーメルンを通るかは、SORAHOST の出口 IP 次第なので
-// 両方をデプロイして比べる。
+// 取得可否はランタイムと出口 IP に依存するため、配置先で確認する。
 //
 // 呼び出し (Worker 側):
 //   POST /proxy  { "url": "...", "headers": {...} }
@@ -17,7 +16,7 @@
 // 返し、追跡は呼び出し側が hop ごとの検証つきで行う)。同名ヘッダは値の配列で
 // 受け取り、受けた順に送る。応答の Set-Cookie は全部 `setCookie` に載せる。
 //
-// 認証: X-Proxy-Token ヘッダが環境変数 SORAHOST_PROXY_KEY と一致しない限り 403。
+// 認証: X-Proxy-Token ヘッダが環境変数 NAROU_RELAY_KEY と一致しない限り 403。
 
 import {
   MAX_REQUEST_BYTES,
@@ -45,8 +44,8 @@ export default {
       new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
     const url = new URL(request.url);
-    const token = env?.SORAHOST_PROXY_KEY ?? "";
-    if (!token) return json(500, { error: "SORAHOST_PROXY_KEY is not set" });
+    const token = env?.NAROU_RELAY_KEY ?? "";
+    if (!token) return json(500, { error: "NAROU_RELAY_KEY is not set" });
     if (url.pathname === "/health") return json(200, { ok: true });
     if (url.pathname !== "/proxy") return json(404, { error: "not found" });
     if (request.headers.get("x-proxy-token") !== token) return json(403, { error: "forbidden" });

@@ -24,7 +24,7 @@ pub mod mocks;
 pub mod object_store;
 pub mod progress;
 pub mod rate_limiter;
-/// Codec for the SORAHOST fetch relay (`scripts/sorahost-proxy/`): builds
+/// Codec for an external fetch relay (`scripts/relay/`): builds
 /// `GET|POST /proxy` calls and decodes the JSON response. Transport-neutral.
 pub mod relay;
 pub mod repository;
