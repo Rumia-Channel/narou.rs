@@ -1,0 +1,10 @@
+# ローカルからのソース送信も実行用ファイルだけに限定する。
+*
+!package.json
+!package-lock.json
+!server.mjs
+!security.mjs
+!transport.mjs
+!worker/
+worker/*
+!worker/protocol.mjs

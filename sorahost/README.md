@@ -163,7 +163,7 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
 | `NAROU_RS_EPUB_ENGINE` | EPUB エンジン | `lite` / `external` / `auto` (未設定 = auto) | **環境変数が `convert.epub-engine` より優先** |
 | `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` とライブラリの場所 | 通常は未設定 (配備パスから自動) | start.sh |
 | `NAROU_RS_PORT` | 待受ポート | 通常は未設定 (プラットフォームの `PORT` を使う) | start.sh (リレー同居時のみ 8080) |
-| `NAROU_RELAY` / `NAROU_RELAY_KEY` | 同じサーバーで取得リレーも動かすときだけ (§10) | `1` / 合言葉 | start.sh |
+| `NAROU_RELAY` / `NAROU_RELAY_KEY` / `NAROU_RELAY_ALLOWED_HOSTS` | 同じサーバーで取得リレーも動かすときだけ (§10) | `1` / 合言葉 / 許可ホストのカンマ区切り | start.sh |
 | `NAROU_CONNECTOR_TOKEN` | コネクタ (cloudflared) の接続トークン。置くと起動する (basic 認証は既定で有効のまま) | ダッシュボードの Add a replica の値 | start.sh |
 | `NAROU_PUBLIC_HOST` | 公開ホスト名。置くとその Host 以外を弾く | 例 `narou.example.com` | start.sh |
 | `NAROU_CONNECTOR_TOKEN_FILE` | トークンをファイルで渡す場合のパス | 既定 `$VOLUME_DIR/.connector-token` | start.sh |
@@ -346,8 +346,11 @@ SORAHOST への自動配備は提供しません。Linux バンドルの作成�
 **1 プロジェクト = 起動コマンド 1 つ** なので、起動コマンドを narou の `start.sh`
 に寄せて、リレーはそこから起動する。
 
-1. サーバー直下の `.env` に `NAROU_RELAY=1` と `NAROU_RELAY_KEY` を設定する。
-2. `scripts/relay/server.mjs` と `scripts/relay/worker/protocol.mjs` を `start.sh` の隣に同じ相対構成で配置する。
+新規の外部リレーは [Cloud Run Buildpacks の手順](../docs/cloud-run-relay.md)を参照する。
+以下は既存の手動同居構成向けで、SORAHOST の CI 配備を復活させるものではない。
+
+1. サーバー直下の `.env` に `NAROU_RELAY=1`、`NAROU_RELAY_KEY`、取得先を完全一致で列挙した `NAROU_RELAY_ALLOWED_HOSTS` を設定する。許可リスト未設定では取得しない。
+2. `scripts/relay/server.mjs`・`security.mjs`・`transport.mjs` と `scripts/relay/worker/protocol.mjs` を `start.sh` の隣へ同じ相対構成で配置する。ローカル状態・資格情報・テスト用 fixture は含めない。
 3. 手動の配備定義では `start.sh` を起動する（CI からのリレー配備は行わない）。
 4. ログに `取得リレーを起動しました` と `narou` の起動が出ることを確認する
 
@@ -371,7 +374,7 @@ Node 版と Worker 版は `scripts/relay/worker/protocol.mjs` を共有する。
 入力 JSON は UTF-8 の実バイト数で 64 KiB、取得した本文は展開後の実バイト数で
 16 MiB まで受け付ける。応答メタデータは JSON の escape・UTF-8・空の本文欄を
 含めて 448 KiB に制限する。Cookie を含む同名ヘッダの順序を保ち、非 ASCII の
-ヘッダ値は Node の curl / fetch と Worker の fetch で同じ UTF-8 の wire 表現にする。
+ヘッダ値は Node の curl / HTTP(S) と Worker の fetch で同じ UTF-8 の wire 表現にする。
 
 返すのは最終 HTTP 応答だけ。curl は途中の `100 Continue` を読み飛ばすが、
 fetch が最終応答を返さないランタイムでは 502 にする。本文中の HTTP ヘッダを
@@ -382,19 +385,12 @@ GET のヘッダ JSON にもデコード後 64 KiB の上限があるが、base6
 配備先の request-line 上限を越えると Worker 到達前に拒否される。大きな入力は
 POST の JSON 本文で送る。
 
-ローカル Worker は、リポジトリ直下で次のように起動する。トークンは検証専用の値で、
-配備用の資格情報を使わない。
+Node.js 24・npm・curl がある環境では、次でローカル Worker の起動・終了も含めて検証できる。
+実 HTTP 上流へ接続し、Node/Worker 契約と Node の DNS 固定・SSRF・TLS・中断を確認する。
+検証専用キーと localhost 許可 fixture はテスト内だけにあり、本番環境の制約は緩和しない。
 
 ```sh
-npx --yes wrangler@4 dev --config scripts/relay/worker/wrangler.toml \
-  --var NAROU_RELAY_KEY:test-key
-```
-
-別ターミナルから次で Node 版と Worker 版の両方を実 HTTP 上流につないで検証できる。
-
-```sh
-RELAY_WORKER_BASE_URL=http://127.0.0.1:18912 RELAY_TEST_TOKEN=test-key \
-  node --test tests/relay.test.mjs
+node tests/run-relay.mjs
 ```
 
 
