@@ -1,6 +1,12 @@
 # narou.rs 移植状況
 
-## 現況（v0.4.13 公開済み・次版向け開発）
+## 現況（v0.4.14 リリース準備）
+
+2026-10-18、ユーザーが v0.4.14 のタグ作成・公開を明示承認した。基準とした GitHub 最新公開 Release は v0.4.13。Cargo / Worker / 両 lock / 両 license notice を 0.4.14 に更新し、依存バージョン・Git revision は変更していない。VERSION.md の未リリース節を v0.4.14 として確定した。
+
+検証: cargo check -p narou_rs、Worker wasm32 cargo check が成功。Native workspace / all-features の lib・bin・integration は1399成功・参照fixture1 ignored。実CLI --version は 0.4.14 (local-build)。cargo-about 0.9.2 で GPL / 非GPL notice を再生成した。main への no-ff 統合・main 上のタグ作成・全配布 ZIP の検証後に公開する。公開・本番配備の完了はまだ主張しない。
+
+## v0.4.13 公開時点の記録（現況ではない）
 
 正本はAGENTS.md / COMMANDS.md。narou.rb24コマンド + Rust拡張db/illust/login/authorの計28。既存完了印の集計は24完了/4部分(download/update/convert/web)/未実装0。今回のQAだけでRuby互換の完了印を昇格しない。Cargo/Worker/probe lockとライセンス表示は0.4.13へ統一済み。GitHub の最新公開 Release は v0.4.13（ID415887473、2026-10-17 17:16:07 UTC 公開）。現行の16配布ZIPの SHA-256 が、事前に内容・CRC・対象アーキテクチャ・ライセンスとWindows署名を確認したファイルと一致することも再確認した。公開済みタグ・配布物は変更しない。追加の Web UI / Workers 修正は次版向けとして機能単位で develop へ no-ff 統合する。GitHub の常設ブランチは main / develop を維持する。
 
