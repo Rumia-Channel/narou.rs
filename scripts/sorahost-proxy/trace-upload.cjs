@@ -6,10 +6,12 @@ const { isIP } = require('node:net');
 
 let endpoint;
 try {
-  endpoint = new URL(`${process.env.SORAHOST_ENDPOINT}/deploy`);
+  endpoint = new URL(`${(process.env.SORAHOST_ENDPOINT || '').trim().replace(/\/+$/, '')}/deploy`);
 } catch {
   // CLI 自身が設定エラーを処理する。診断で例外や秘密値を追加しない。
 }
+
+process.stderr.write(`[relay-upload] ${JSON.stringify({ event: 'preload', node: process.version, configured: Boolean(endpoint) })}\n`);
 
 if (endpoint) {
   channel('http.client.request.start').subscribe(({ request }) => {
