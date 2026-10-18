@@ -114,6 +114,13 @@ impl FetchPolicy {
         headers
     }
 
+    /// A configured Cookie is sent to this source; this does not prove access.
+    pub(crate) fn has_cookie_for(&self, url: &str) -> bool {
+        self.allows_cookie(url) && self.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("Cookie") && !value.trim().is_empty()
+        })
+    }
+
     fn allows_cookie(&self, url: &str) -> bool {
         let Ok(url) = url::Url::parse(url) else {
             return false;
@@ -130,6 +137,21 @@ impl FetchPolicy {
         if self.allows_cookie(url) && let Some(session) = &self.session {
             session.lock().observe(url, response);
         }
+    }
+
+    /// Private representation identity; credentials are never exposed or logged.
+    /// Independently created response-cookie sessions must not share cached input.
+    pub(crate) fn cache_context(&self) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        if self.session.is_some() { return None; }
+        let mut digest = Sha256::new();
+        for part in self.headers.iter().flat_map(|(name, value)| [name.as_str(), value.as_str()])
+            .chain(self.cookie_hosts.iter().map(String::as_str))
+        {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part.as_bytes());
+        }
+        Some(digest.finalize().into())
     }
 }
 
@@ -249,7 +271,18 @@ pub async fn fetch_bytes(
 ) -> Result<HttpResponse> {
     let mut request = HttpRequest::get(url);
     request.headers = policy.headers_for(url);
-    send_request(http, rate_limiter, request, policy).await
+    send_request(http, rate_limiter, request, policy, true).await
+}
+
+/// JSON dependencies inspect status separately without bypassing URL, pacing,
+/// redirects, credential scoping or response-cookie handling.
+pub(crate) async fn fetch_json_response(
+    http: &dyn HttpClient, rate_limiter: &dyn RateLimiter,
+    url: &str, policy: &FetchPolicy,
+) -> Result<HttpResponse> {
+    let mut request = HttpRequest::get(url);
+    request.headers = policy.headers_for(url);
+    send_request(http, rate_limiter, request, policy, false).await
 }
 
 /// Fetch an encoded form through the site's credentials and admission policy.
@@ -277,7 +310,7 @@ pub async fn fetch_form_text(
         request.headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
         request.headers.push((name, value));
     }
-    let response = send_request(http, rate_limiter, request, policy).await?;
+    let response = send_request(http, rate_limiter, request, policy, true).await?;
     Ok(decode_with_encoding(&response.body, encoding))
 }
 
@@ -286,6 +319,7 @@ async fn send_request(
     rate_limiter: &dyn RateLimiter,
     request: HttpRequest,
     policy: &FetchPolicy,
+    require_success: bool,
 ) -> Result<HttpResponse> {
     if policy.session.is_none() && request.method == crate::platform::HttpMethod::Get {
         http.validate_url(&request.url).await?;
@@ -294,7 +328,7 @@ async fn send_request(
         let response = http.send_paced(
             request, crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
         ).await?;
-        return ensure_success_response(&url, response);
+        return if require_success { ensure_success_response(&url, response) } else { Ok(response) };
     }
     let form_origin = (request.method == crate::platform::HttpMethod::Post)
         .then(|| url::Url::parse(&request.url).map(|url| url.origin()))
@@ -319,7 +353,7 @@ async fn send_request(
         ).await?;
         policy.observe_response(current, &response);
         if !chain.advance_parts(response.status, response.header("Location"))? {
-            return ensure_success_response(&chain.request().url, response);
+            return if require_success { ensure_success_response(&chain.request().url, response) } else { Ok(response) };
         }
     }
 }

@@ -51,6 +51,7 @@
                 <li class="divider"></li>
                 <li><a href="#" id="action-view-feature-tour"><span class="material-symbols-outlined icon-leading" aria-hidden="true">new_releases</span>新機能ツアーを表示</a></li>
                 <li class="divider"></li>
+                <li><a href="#" id="action-view-reset-console-size" data-i18n="viewResetConsoleSize">コンソールサイズをリセット</a></li>
                 <li><a href="#" id="action-view-reset">表示設定を全てリセット</a></li>
               </ul>
             </li>
@@ -174,6 +175,9 @@
           <div class="console-col-right hide" id="console-col-right">
             <div id="console-stdout2" class="console"></div>
           </div>
+        </div>
+        <div id="console-resize-handle" class="console-resize-handle" role="separator" tabindex="0" aria-orientation="horizontal" aria-controls="console console-stdout2" aria-labelledby="console-resize-label">
+          <span id="console-resize-label" class="console-resize-label" data-i18n="consoleResize">コンソールの高さを調整（ドラッグまたは上下キー）</span>
         </div>
         <div class="console-buttons" id="console-buttons">
           <button type="button" class="console-btn" id="console-cancel" title="処理を中断" aria-label="処理を中断"><span class="material-symbols-outlined icon-only" aria-hidden="true">cancel</span></button>

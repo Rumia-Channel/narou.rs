@@ -146,6 +146,20 @@ async function download(target, force, expectedFailure = false) {
     await new Promise((resolve) => setTimeout(resolve, 500));
   } while (Date.now() < deadline);
   assert.equal(job.status, expectedFailure ? 'retryable' : 'succeeded', JSON.stringify(job));
+  if (!expectedFailure) {
+    // Acquisition success only promises that its follow-up Convert was enqueued.
+    // Drain that lane before changing the source, injecting faults, or restarting.
+    const conversionDeadline = Date.now() + 120000;
+    let conversions;
+    do {
+      conversions = sql("SELECT job_id,status FROM worker_jobs WHERE kind='convert'")[0].results;
+      const failed = conversions.find((row) => ['permanent', 'blocked', 'partial'].includes(row.status));
+      assert(!failed, `follow-up conversion failed: ${JSON.stringify(failed)}`);
+      if (conversions.every((row) => row.status === 'succeeded')) break;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    } while (Date.now() < conversionDeadline);
+    assert(conversions.every((row) => row.status === 'succeeded'), JSON.stringify(conversions));
+  }
   return job;
 }
 async function migrationCli(apply = false) {

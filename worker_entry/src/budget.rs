@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use narou_rs::application::JobQueue;
 use narou_rs::downloader::SectionBudget;
+use narou_rs::error::Result;
 
 
 /// Soft yield point for one job. Leaves headroom for the ledger writes,
@@ -75,12 +76,15 @@ struct CheckpointSink {
     execution_token: String,
     novel_id: Option<narou_rs::platform::NovelId>,
     last_saved_index: u64,
+    latest_boundary: Option<u64>,
+    pending: Vec<futures::channel::oneshot::Receiver<Result<()>>>,
 }
 
 impl CheckpointSink {
-    /// Spawn a detached ledger write for the current section cursor.
-    /// Best-effort: a stale execution token is ignored by the ledger.
+    /// Track every section boundary and periodically spawn a ledger write.
+    /// Completion is retained so a final retry checkpoint can follow all writes.
     fn save(&mut self, next_section_index: u64) {
+        self.latest_boundary = Some(next_section_index);
         if next_section_index < self.last_saved_index + CHECKPOINT_EVERY_SECTIONS {
             return;
         }
@@ -96,8 +100,11 @@ impl CheckpointSink {
         );
         let job_id = self.job_id.clone();
         let token = self.execution_token.clone();
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        self.pending.push(receiver);
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = ledger.save_checkpoint(&job_id, &token, &checkpoint).await;
+            let result = ledger.save_checkpoint(&job_id, &token, &checkpoint).await;
+            let _ = sender.send(result);
         });
     }
 }
@@ -138,8 +145,53 @@ impl<'a> WorkerBudget<'a> {
             execution_token,
             novel_id,
             last_saved_index: 0,
+            latest_boundary: None,
+            pending: Vec::new(),
         });
         self
+    }
+
+    /// Wait for periodic writes before replacing or finalizing the cursor.
+    pub(crate) async fn drain_checkpoint_writes(&mut self) {
+        let Some(sink) = &mut self.sink else {
+            return;
+        };
+        for receiver in sink.pending.drain(..) {
+            match receiver.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => worker::console_log!(
+                    "job {}: periodic checkpoint write failed: {error}",
+                    sink.job_id
+                ),
+                Err(error) => worker::console_log!(
+                    "job {}: periodic checkpoint write canceled: {error}",
+                    sink.job_id
+                ),
+            }
+        }
+    }
+
+    /// Persist the latest completed boundary before recording a retryable error.
+    /// A failure before any boundary preserves the incoming resume checkpoint.
+    pub async fn save_retry_progress(&mut self) -> Result<()> {
+        self.drain_checkpoint_writes().await;
+        let Some(sink) = &self.sink else {
+            return Ok(());
+        };
+        let Some(next_section_index) = sink.latest_boundary else {
+            return Ok(());
+        };
+        let checkpoint = narou_rs::application::WorkerExecutionCheckpoint::planned(
+            sink.job_id.clone(),
+            sink.novel_id,
+        )
+        .advance(
+            narou_rs::application::ExecutionPhase::Fetching,
+            Some(next_section_index),
+        );
+        sink.ledger
+            .save_checkpoint(&sink.job_id, &sink.execution_token, &checkpoint)
+            .await
     }
 
     /// Which limit tripped, for the `Partial` reason string. Returns `None`

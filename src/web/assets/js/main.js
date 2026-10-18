@@ -8,6 +8,7 @@ import { setCapabilities, applyActionCapabilities, initCapabilityGuard } from '.
 import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
 import { initFeatureTour, maybeShowPendingFeatureTour } from './ui/feature_tour.js';
+import { initConsoleSizing } from './ui/console_size.js';
 import { renderNovelList, renderQueueStatus, renderTagList, showNotification, syncViewChecks } from './ui/render.js';
 import {
   applyNotepadSnapshot,
@@ -87,6 +88,7 @@ async function init() {
   initFeatureTour();
   applyI18n();
   bindActions();
+  initConsoleSizing();
   bindConsoleAutoScroll(El.console);
   bindConsoleAutoScroll(El.consoleStdout2);
 

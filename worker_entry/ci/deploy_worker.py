@@ -394,7 +394,10 @@ def provision(target: str) -> dict[str, str]:
         if key:
             values[key.strip()] = value.strip()
     output_file.unlink(missing_ok=True)
-    for key in ("database_name", "database_id", "queue_name", "dead_letter_queue"):
+    for key in (
+        "database_name", "database_id", "queue_name", "dead_letter_queue",
+        "convert_queue_name", "convert_dead_letter_queue",
+    ):
         if not values.get(key):
             fail(f"provisioning did not report {key}")
     return values
@@ -434,6 +437,8 @@ def render(target: str, resources: dict[str, str]) -> str:
     env["NAROU_D1_DATABASE_ID"] = resources["database_id"]
     env["NAROU_JOB_QUEUE"] = resources["queue_name"]
     env["NAROU_JOB_DLQ"] = resources["dead_letter_queue"]
+    env["NAROU_CONVERT_QUEUE"] = resources["convert_queue_name"]
+    env["NAROU_CONVERT_DLQ"] = resources["convert_dead_letter_queue"]
     run([sys.executable, "ci/render_config.py"], env=env)
     return resources["database_name"]
 

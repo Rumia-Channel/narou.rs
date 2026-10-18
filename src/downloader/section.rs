@@ -12,6 +12,7 @@ use super::util::{build_section_url, pretreatment_source_with_jobs};
 pub struct SectionCache {
     cache: HashMap<String, SectionElement>,
     order: VecDeque<String>,
+    context: Option<[u8; 32]>,
 }
 
 impl Default for SectionCache {
@@ -25,6 +26,16 @@ impl SectionCache {
         Self {
             cache: HashMap::new(),
             order: VecDeque::new(),
+            context: None,
+        }
+    }
+
+    fn bind_policy(&mut self, policy: &http_policy::FetchPolicy) {
+        let context = policy.cache_context();
+        if context.is_none() || self.context != context {
+            self.cache.clear();
+            self.order.clear();
+            self.context = context;
         }
     }
 
@@ -60,14 +71,17 @@ pub async fn download_section(
     jobs: &mut PreprocessJobs,
 ) -> Result<(SectionElement, String)> {
     let url = section_cache_key(setting, toc_url, subtitle);
+    let policy = http_policy::FetchPolicy::for_site(setting);
+    jobs.bind_policy(&policy, &url);
+    cache.bind_policy(&policy);
     if let Some(cached) = cache.get(&url) {
         return Ok((cached.clone(), String::new()));
     }
 
-    let policy = http_policy::FetchPolicy::for_site(setting);
-    let mut html_source =
-        http_policy::fetch_text(http, rate_limiter, &url, &policy, Some(setting.encoding()))
-            .await?;
+    let mut html_source = match jobs.json_source(&url) {
+        Some(source) => source,
+        None => http_policy::fetch_text(http, rate_limiter, &url, &policy, Some(setting.encoding())).await?,
+    };
     pretreatment_source_with_jobs(super::util::PretreatmentRequest {
         http,
         rate_limiter,
@@ -79,6 +93,11 @@ pub async fn download_section(
         url: &url,
     })
     .await?;
+    if setting.compiled_error_message_pattern().is_some_and(|pattern| pattern.is_match(&html_source))
+        || setting.compiled_login_pattern().is_some_and(|pattern| pattern.is_match(&html_source))
+    {
+        return Err(crate::error::NarouError::Http(format!("section is unavailable while fetching {url}")));
+    }
     let (element, raw_html) = parse_section_html(setting, html_source)?;
     cache.insert(url, element.clone());
     Ok((element, raw_html))

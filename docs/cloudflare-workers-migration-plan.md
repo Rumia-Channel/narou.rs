@@ -307,7 +307,7 @@ phase と対象を持たない共通カーソル/`done` は移行完了の証明
 
 `worker_entry/ci/deploy_worker.py` が 1 環境分のデプロイを最後まで行う:
 
-1. `ci/provision_resources.py` で D1 と Queue(+DLQ) を冪等に用意（名前は環境名から導出）
+1. `ci/provision_resources.py` で D1・取得用 Queue・変換用 Queue と各 DLQ を冪等に用意（名前は環境名から導出）
 2. `ci/render_config.py` で `wrangler.ci.toml` をレンダリング（未置換プレースホルダは失敗）
 3. `wrangler d1 migrations apply <db> --remote` でリモート D1 を更新
 4. `wrangler deploy --secrets-file <json>` で `NAROU_ADMIN_TOKEN` と `NAROU_RS_LOGIN_KEY` を投入してデプロイ
@@ -444,9 +444,9 @@ phase と対象を持たない共通カーソル/`done` は移行完了の証明
 - **コンソールの分離 (2026-10-08 修正)**: `concurrency` は Worker でも設定でき、convert ジョブの行を
   native の `web::worker::console_target_for_job` と同じ `stdout2` へ送る
   (`application::messages::Stream::target_console_with` + `PushHubSink::install_with_console`)。
-  Worker はジョブが常に並列 (queue の `max_concurrency`) で、native の「`concurrency=false` =
-  全ジョブを 1 レーンで逐次」に相当する状態が無いため **既定は有効**とし、明示的に
-  `concurrency=false` を保存したときだけ 1 コンソールへまとめる (`worker_entry/src/convert.rs` と
+  Worker は取得用・変換用 Queue の実行枠を別々に持ち、同一サイトの取得は D1 の admission で直列化する。
+  native の「`concurrency=false` = 全ジョブを 1 レーンで逐次」に相当する設定ではないため
+  **既定は有効**とし、明示的に `concurrency=false` を保存したときだけ 1 コンソールへまとめる (`worker_entry/src/convert.rs` と
   `webui/ui_prefs.rs`)。DL/update の行は `stdout` のままなので、Web UI のデュアルコンソールが
   native と同じ分け方になる。`concurrency.*` (native コンソールのキュー表示整形) は native 専用の
   まま無効扱い。
@@ -463,7 +463,8 @@ Browser ──► Worker (fetch)
              └── /health/*     … 無認証
                     │
   cron(毎分) ───────┤ scheduled: planner / リース回復
-  Queue ────────────┤ queue:     Download / Update / Convert
+  DL Queue ─────────┤ queue:     Download / Update / AuthorCheck
+  Convert Queue ────┤ queue:     Convert
                     │
               ┌─────┴───────────────────────────┬──────────────┐
               ▼                                 ▼              ▼
@@ -479,13 +480,25 @@ Browser ──► Worker (fetch)
 | 名前 | 種別 | 用途 |
 |---|---|---|
 | `DB` | D1 | メタ・台帳・設定・目次・本文参照 |
-| `NAROU_JOBS` | Queue producer / consumer | ジョブ配送（DLQ は `narou-jobs-<target>-dlq`） |
+| `NAROU_JOBS` | Queue producer / consumer | 取得用 `narou-jobs-<target>`、最大 4 実行（DLQ は同名 + `-dlq`） |
+| `CONVERT_QUEUE` | Queue producer / consumer | 変換用 `narou-jobs-convert-<target>`、最大 1 実行（独立 DLQ は同名 + `-dlq`） |
+| `CONVERT_QUEUE_NAME` | var | 変換用 Queue の物理名。受信レーンの判定に使い、CI が binding と同じ値を生成 |
 | `RATE_LIMITER` | Durable Object | サイト別 permit 採番（既存） |
 | `PUSH_HUB` | Durable Object | `/ws` の接続保持とイベント配信（P3） |
 | `ASSETS` | Assets | frontend 配信（P3、`run_worker_first` で `/api/*` と `/ws` を Worker へ） |
 | `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_PREFIX` | vars | S3 接続先。`S3_PREFIX=narou/{target}` で環境同居 |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | secret | 資格情報。未設定は fail-closed |
 | `NAROU_AUTH_REQUIRED` | var | 認証要否（ローカル・テスト用の逃げ道） |
+
+#### ジョブ実行の排他と再開
+
+- 全レーンで D1 `worker_jobs` を共有する。取得ジョブは実効 YAML の `domain` を `site_key` に解決し、同一サイトの実行を 1 件に制限する。別ホスト表記・作者確認も同じ定義へ揃え、別サイトは最大 4 件、変換は独立 Queue で最大 1 件実行する。`concurrency` は表示先の設定で、この実行枠を変更しない。
+- 同じ作品の取得・変換はレーンを跨いでも排他する。YAML で解決した TOC URL を `normalized_target` に持ち、ID・ncode・別 URL 表記を原子的な claim SQL で照合する。取得中に初めて作品 ID が作られた場合も保護し、元の計画・表示用 target・checkpoint の同一性は書き換えない。
+- 競合は失敗ではなく `admission_waiting=1` の待機として保存して ACK する。provider の retry や業務上の `attempts` は消費しない。終端時・毎分 cron の waker が空いたサイトの待機と独立した変換を同じ job ID で再配送する。配送予約後に送信を失っても既存 reaper で回復する。
+- キュー移行前の未解決な実行中レコードは、安全に同一性を判断できないため終端・lease 回復まで保守的に新規 claim を止める。キャンセルされた実行も、実際の HTTP が終了するまで token / lease を保持し、後続との重複を防ぐ。
+- 旧レーンに残った envelope は台帳の kind を使って正しい Queue へ転送し、送信成功後だけ ACK する。cron と手動の再投入も kind で配送する。Queue のメッセージは従来どおり `{version, job_id}` だけで、計画は台帳を正とする。
+- 600 秒の wall-clock / 850 subrequest の soft budget は話の境界で checkpoint を保存して同じ job ID で続行する。完了した本文は再取得せず、失敗回数にも数えない。Web コンソールでは自動再開として案内し、上限値は引き上げない。
+
 
 ### 3.2 認証
 
@@ -545,7 +558,7 @@ Browser ──► Worker (fetch)
 | 型 | 輸入する内容 |
 |---|---|
 | 環境分離 | `wrangler.<target>.toml` をテンプレート化し、CI が置換して `wrangler.ci.toml` を生成（生成物は gitignore）。置換前に形式検証 |
-| プロビジョニング | D1 と Queue(+DLQ) を list→create→再 list の冪等手順で用意し `GITHUB_OUTPUT` で受け渡す |
+| プロビジョニング | D1・取得用と変換用の Queue・各 DLQ を list→create→再 list の冪等手順で用意し `GITHUB_OUTPUT` で受け渡す |
 | デプロイ | develop=push / production=`v*` タグ + タグが main の祖先かの検証。`needs: [native, worker]`、target 別 `concurrency`、**デプロイ前に `wrangler d1 migrations apply --remote`**、`--secrets-file`、`if: always()` で生成物削除 |
 | アセット | `[assets]` + ハッシュ付きアセット生成（P3） |
 | 契約テスト | `wrangler dev --local` + `node --test tests/*.mjs`。**トークン未設定時に fail-closed になること**も検証。`/cdn-cgi/local/scheduled` で cron を叩ける |

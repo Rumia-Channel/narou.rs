@@ -6,8 +6,9 @@ import { State, El, lsSet, lsBool } from '../core/state.js';
 import { fetchJson, postJson, request, assertApiSuccess } from '../core/http.js';
 import { createNotepadEditor } from '../core/notepad.js';
 import { persistSortState, postSortedJson } from '../core/sort_state.js';
-import { toggleLanguage } from './i18n.js';
+import { toggleLanguage, t } from './i18n.js';
 import { openFeatureTour } from './feature_tour.js';
+import { resetConsoleSize } from './console_size.js';
 import {
   renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed,
   selectVisible, selectAll, clearSelection, getSelectedIdsInDisplayOrder,
@@ -67,19 +68,6 @@ export function bindActions() {
     }
   });
 
-  El.consoleExpand?.addEventListener('click', () => {
-    El.console?.classList.toggle('expanded');
-    El.consoleStdout2?.classList.toggle('expanded');
-    State.consoleExpanded = !State.consoleExpanded;
-    El.console?.closest('.console-panes')?.classList.toggle('expanded', State.consoleExpanded);
-    El.consoleExpand?.setAttribute('aria-expanded', String(State.consoleExpanded));
-    El.consoleExpand?.setAttribute('aria-label', State.consoleExpanded ? 'コンソールを縮小' : 'コンソールを拡大');
-    // Toggle icon
-    const expand = El.consoleExpand?.querySelector('.expand-icon');
-    const collapse = El.consoleExpand?.querySelector('.collapse-icon');
-    if (expand) expand.classList.toggle('hide', State.consoleExpanded);
-    if (collapse) collapse.classList.toggle('hide', !State.consoleExpanded);
-  });
 
   El.consoleCancel?.addEventListener('click', async () => {
     await runGuardedAction(El.consoleCancel, async () => {
@@ -190,7 +178,13 @@ export function bindActions() {
     syncViewChecks();
   });
 
+  on('action-view-reset-console-size', () => {
+    resetConsoleSize();
+    showNotification(t('consoleSizeReset'), 'info');
+  });
+
   on('action-view-reset', () => {
+    resetConsoleSize();
     State.viewFrozen = true;
     State.viewNonfrozen = true;
     State.wideMode = false;

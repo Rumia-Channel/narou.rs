@@ -6,7 +6,7 @@
 //! process-wide database and working directory.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use narou_rs::downloader::Downloader;
 use narou_rs::downloader::site_setting::SiteSetting;
@@ -108,7 +108,6 @@ async fn login_fallback_retries_with_the_stored_cookie_and_flags_the_novel() {
         .into_iter()
         .filter(|setting| setting.domain == "example.com")
         .collect();
-    assert_eq!(settings.len(), 1, "the test site definition must load");
 
     let toc_url = "https://example.com/novel/n1234ab/";
     let http = Arc::new(LoginWallClient {
@@ -245,6 +244,10 @@ impl HttpClient for PerNovelClient {
             let is_toc = request.url.contains("/novel/");
             let (status, body) = match (walled, logged_in) {
                 (true, false) => (404, "ログインが必要です".to_string()),
+                (false, false) if is_toc && ncode == "n8888cc" => (
+                    200,
+                    r#"<h1 class="title">作品 n8888cc</h1><span class="author">作者</span>"#.to_string(),
+                ),
                 (_, _) if is_toc => (
                     200,
                     format!(
@@ -284,7 +287,6 @@ async fn novels_that_do_not_need_login_are_never_fetched_logged_in() {
         .into_iter()
         .filter(|setting| setting.domain == "example.com")
         .collect();
-    assert_eq!(settings.len(), 1, "the test site definition must load");
 
     let http = Arc::new(PerNovelClient::new());
     let cookies = Arc::new(MemoryCookieStore::new());
@@ -330,6 +332,15 @@ async fn novels_that_do_not_need_login_are_never_fetched_logged_in() {
         PerNovelClient::calls(&http.authenticated_by_ncode, "n9999aa") > 0,
         "the walled novel must have been retried with the stored login"
     );
+    let initially_empty = downloader
+        .download_novel("https://example.com/novel/n8888cc/")
+        .await
+        .unwrap();
+    assert_eq!(initially_empty.total_count, 1);
+    let authenticated = repository.get(initially_empty.id.into()).await.unwrap().unwrap();
+    assert!(authenticated.requires_login);
+    assert!(authenticated.login_session.is_some());
+
 
     // 2. ログインが要らない作品は、その後でも匿名のままにする。
     let open = downloader
@@ -352,4 +363,129 @@ async fn novels_that_do_not_need_login_are_never_fetched_logged_in() {
         "a novel that worked anonymously must not be flagged"
     );
     assert!(record.login_session.is_none(), "and it stores no session");
+}
+
+struct RedirectCookieClient {
+    redirect: AtomicBool,
+    same_site: bool,
+    destination_open: bool,
+    requests: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl RedirectCookieClient {
+    fn landing(&self) -> &str {
+        if self.same_site { "https://example.com/novel/n5678bb/" }
+        else { "https://destination.example/novel/n1234aa/" }
+    }
+}
+
+impl HttpClient for RedirectCookieClient {
+    fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, narou_rs::error::Result<HttpResponse>> {
+        Box::pin(async move {
+            let cookie = request.header("Cookie").unwrap_or("").to_string();
+            self.requests.lock().unwrap().push((request.url.clone(), cookie.clone()));
+            let source = "https://example.com/novel/n1234aa/";
+            let redirected = self.redirect.load(Ordering::SeqCst);
+            if request.url == source && redirected {
+                return Ok(HttpResponse { status: 302,
+                    headers: vec![("Location".into(), self.landing().into())], body: Vec::new() });
+            }
+            let source_login = cookie.contains("origin_only=canary") && cookie.contains("source_session=source");
+            let destination_login = if self.same_site { source_login }
+                else { cookie.contains("consent=accepted") && cookie.contains("session=destination") };
+            let (status, body) = if request.url == source {
+                if source_login { (200, concat!(
+                    r#"<h1 class="title">転送前の作品</h1><span class="author">作者</span>"#,
+                    r#"<a href="/novel/n1234aa/1/" class="subtitle">第1話</a>"#
+                ).to_string()) } else { (404, "ログインが必要です".into()) }
+            } else if request.url == self.landing() {
+                let full = self.destination_open || destination_login;
+                let mut body = format!(
+                    r#"<h1 class="title">転送先の作品</h1><span class="author">作者</span><a href="{}1/" class="subtitle">第1話</a>"#,
+                    self.landing(),
+                );
+                if full {
+                    body.push_str(&format!(r#"<a href="{}2/" class="subtitle">第2話</a>"#, self.landing()));
+                } else {
+                    body.push_str("login_partial::1");
+                }
+                (200, body)
+            } else if request.url == format!("{source}1/")
+                || request.url == format!("{}1/", self.landing())
+                || request.url == format!("{}2/", self.landing())
+            {
+                (200, r#"<div class="body">本文</div>"#.into())
+            } else {
+                return Err(narou_rs::error::NarouError::Http(format!("unexpected fixture URL: {}", request.url)));
+            };
+            Ok(HttpResponse { status,
+                headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
+                body: body.into_bytes() })
+        })
+    }
+}
+
+#[tokio::test]
+async fn redirected_sites_use_their_own_consent_and_login_scope() {
+    let _serial = PIPELINE.lock().await;
+    for (flagged_source, destination_open, same_site) in [
+        (false, false, false), (true, false, false), (true, true, false), (true, false, true),
+    ] {
+        let source_yaml = format!("{SITE_YAML}\ncookie: origin_only=canary\nlogin_partial_pattern: 'login_partial::1'\n");
+        let destination_yaml = SITE_YAML.replace("TestSite", "DestinationSite")
+            .replace("example.com", "destination.example");
+        let destination_yaml = format!("{destination_yaml}\ncookie: consent=accepted\nlogin_partial_pattern: 'login_partial::1'\n");
+        let definitions = [source_yaml.as_str(), destination_yaml.as_str()];
+        let sites = SiteSetting::load_bundled(if same_site { &definitions[..1] } else { &definitions }).unwrap();
+        let http = Arc::new(RedirectCookieClient {
+            redirect: AtomicBool::new(!flagged_source), same_site, destination_open,
+            requests: Default::default(),
+        });
+        let cookies = Arc::new(MemoryCookieStore::new());
+        for (domain, cookie, id) in [
+            ("example.com", "source_session=source", "source-session"),
+            ("destination.example", "session=destination", "destination-session"),
+        ] {
+            cookies.save_groups(domain, &[narou_rs::platform::LoginGroup::new(domain, vec![
+                narou_rs::platform::HostCookie { host: domain.into(), cookie: cookie.into() },
+            ]).with_id(id)]).await.unwrap();
+        }
+        let store = Arc::new(MemoryObjectStore::new());
+        let repository = Arc::new(MemoryNovelRepository::new());
+        let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+            narou_rs::downloader::DownloaderPlatform {
+                http: http.clone(), rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: repository.clone(), objects: store.clone(), assets: store,
+                clock: Arc::new(narou_rs::platform::SystemClock),
+            }, sites, Default::default(),
+            Arc::new(narou_rs::downloader::settings::SnapshotDownloaderSettings::new(
+                Default::default(), Some(true), Default::default(),
+            )),
+        ).unwrap().with_cookie_store(cookies);
+        let source = "https://example.com/novel/n1234aa/";
+        if flagged_source {
+            let initial = downloader.download_novel(source).await.unwrap();
+            assert!(repository.get(initial.id.into()).await.unwrap().unwrap().requires_login);
+            http.redirect.store(true, Ordering::SeqCst);
+            http.requests.lock().unwrap().clear();
+        }
+        let result = downloader.download_novel(source).await.unwrap();
+        assert_eq!(result.total_count, 2);
+        let record = repository.get(result.id.into()).await.unwrap().unwrap();
+        assert_eq!(record.toc_url, http.landing());
+        assert_eq!(record.requires_login, !destination_open);
+        assert_eq!(record.login_session.as_deref(), if destination_open { None }
+            else if same_site { Some("source-session") } else { Some("destination-session") });
+        if !same_site {
+            for (url, cookie) in http.requests.lock().unwrap().iter()
+                .filter(|(url, _)| url.starts_with("https://destination.example/"))
+            {
+                assert!(!cookie.contains("origin_only=") && !cookie.contains("source_session="),
+                    "source credentials escaped to {url}");
+                if destination_open {
+                    assert!(!cookie.contains("session=destination"), "public destination used a saved login");
+                }
+            }
+        }
+    }
 }

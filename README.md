@@ -120,10 +120,13 @@ cargo run -- init
 Release と同じ構成の `narou/` フォルダをリポジトリ直下に作る場合は、`cargo local-build` を使います。
 
 ```powershell
-cargo local-build
+cargo local-build         # 通常版
+cargo local-build --gpl   # GPL版（AozoraEpub3_Lite 組込み）
 ```
 
-`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`narou_rs_backup(.exe)`、`narou_rs_login(.exe)`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。`cargo local-build` が作るのは通常版相当のバイナリで、同梱される `Third-Party-License.md` も copyleft を含まない側 (`Third-Party-License-non-GPL.md`) です。GPL 版相当を作りたい場合は `cargo build --release --features lite` を使います。
+`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`narou_rs_backup(.exe)`、`narou_rs_login(.exe)`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
+
+未指定では従来どおり通常版を作り、copyleft を含まない `Third-Party-License-non-GPL.md` を `Third-Party-License.md` として同梱します。`--gpl` を付けると本体を `lite` feature 付きでビルドし、GPL 版の `Third-Party-License.md` を同梱します。どちらも同じ `narou/` を作り直し、`--locked`・`--target <triple>` と併用できます。
 
 作成された `narou/` は Release 版と同じように `Path` に追加し、小説を管理したいフォルダで `narou_rs init` を実行してください。`narou/` の中を作業ディレクトリにはしません。
 

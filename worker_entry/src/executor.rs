@@ -22,7 +22,7 @@ use narou_rs::application::{
     JobTarget, WorkerExecutionCheckpoint,
 };
 use narou_rs::downloader::{
-    DownloadExecutionOptions, DownloadResult, Downloader, UpdateStatus,
+    DownloadExecutionOptions, DownloadResult, Downloader, SectionBudget, UpdateStatus,
 };
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{NovelId, NovelObjectKeys, NovelRepository};
@@ -57,6 +57,16 @@ pub enum JobOutcome {
     Blocked { reason: String },
     Permanent { reason: String },
     Retryable { reason: String },
+}
+
+impl JobOutcome {
+    pub fn from_error(error: NarouError) -> Self {
+        match classify_failure(&error) {
+            JobFailureClass::Retryable => Self::Retryable { reason: error.to_string() },
+            JobFailureClass::Permanent => Self::Permanent { reason: error.to_string() },
+            JobFailureClass::Blocked => Self::Blocked { reason: error.to_string() },
+        }
+    }
 }
 
 /// Whether a job plan can be executed by this consumer at all.
@@ -281,13 +291,23 @@ pub async fn execute_job(
                 "stdout",
             )])
             .await;
-            let mut restart_budget = WorkerBudget::new(JOB_TIME_BUDGET, &runtime.subrequests);
+            budget.drain_checkpoint_writes().await;
+            budget = WorkerBudget::new(JOB_TIME_BUDGET, &runtime.subrequests)
+                .with_checkpoints(
+                    runtime.ledger.clone(),
+                    job_id.clone(),
+                    execution_token.to_string(),
+                    novel_id,
+                );
+            // Even a failure before the restarted section loop must not retain
+            // the corrupt incoming cursor.
+            budget.should_yield(0);
             downloader
                 .download_novel_with_execution_options(
                     &target,
                     DownloadExecutionOptions {
                         force,
-                        budget: Some(&mut restart_budget),
+                        budget: Some(&mut budget),
                         resume_from_section: None,
                     },
                 )
@@ -375,6 +395,15 @@ pub async fn execute_job(
     // (強更新の判定ヒント。失敗は再 DL だけに効くのでログだけ残す)。
     if let Err(error) = runtime.persist_pending_section_hash_cache().await {
         console_log!("job {job_id}: section hash cache write-back failed: {error}");
+    }
+    if let Err(error) = &result
+        && !matches!(error, NarouError::DownloadBudgetExpired { .. })
+        && classify_failure(error) == JobFailureClass::Retryable
+        && let Err(checkpoint_error) = budget.save_retry_progress().await
+    {
+        return JobOutcome::Retryable {
+            reason: format!("{error}; retry progress checkpoint failed: {checkpoint_error}"),
+        };
     }
     match result {
         Err(NarouError::DownloadBudgetExpired {
@@ -523,17 +552,7 @@ async fn classify_result(
                 }
             }
         },
-        Err(error) => match classify_failure(&error) {
-            JobFailureClass::Retryable => JobOutcome::Retryable {
-                reason: error.to_string(),
-            },
-            JobFailureClass::Permanent => JobOutcome::Permanent {
-                reason: error.to_string(),
-            },
-            JobFailureClass::Blocked => JobOutcome::Blocked {
-                reason: error.to_string(),
-            },
-        },
+        Err(error) => JobOutcome::from_error(error),
     }
 }
 /// ダウンロード成功後の自動変換 (native `commands::{download,update}::auto_convert`

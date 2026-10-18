@@ -184,20 +184,24 @@ async function postSettings(body) {
   return { status: response.status, body: await json(response) };
 }
 
-/** 1 プランを `/api/jobs` で投入し、受理された job_id を返す。 */
-async function enqueuePlan(kind, target) {
+/** 複数プランを一括投入し、全行の作成後に配送された job_id を返す。 */
+async function enqueuePlans(kind, targets) {
   const response = await request("/api/jobs", {
     method: "POST",
     ...auth(),
-    body: JSON.stringify({ kind, targets: [String(target)], options: [] }),
+    body: JSON.stringify({ kind, targets: targets.map(String), options: [] }),
   });
   const body = await json(response);
   assert(response.status === 200, `status ${response.status}`);
   assert(
-    Array.isArray(body.ids) && body.ids.length === 1,
+    Array.isArray(body.ids) && body.ids.length === targets.length,
     `${kind} must be accepted: ${JSON.stringify(body)}`,
   );
-  return body.ids[0];
+  return body.ids;
+}
+
+async function enqueuePlan(kind, target) {
+  return (await enqueuePlans(kind, [target]))[0];
 }
 
 /** ジョブが終端状態 (succeeded / blocked / permanent) になるまで待つ。 */
@@ -213,18 +217,6 @@ async function waitForTerminal(jobId, timeoutMs = 60_000) {
   throw new Error(`job ${jobId} stayed ${status} for ${timeoutMs}ms`);
 }
 
-/** ジョブが指定 status になるまで待つ。 */
-async function waitForStatus(jobId, expected, timeoutMs = 15_000) {
-  const deadline = Date.now() + timeoutMs;
-  let status = "pending";
-  while (Date.now() < deadline) {
-    const body = await json(await request(`/api/jobs/${jobId}`, auth()));
-    status = body.status;
-    if (status === expected) return;
-    await delay(200);
-  }
-  throw new Error(`job ${jobId} never became ${expected} (last: ${status})`);
-}
 
 /**
  * 依存なしの最小 WebSocket クライアント (Node の WebSocket はテスト用の
@@ -1806,16 +1798,11 @@ if (QUEUE_CHECKS) {
   });
 
   await check("webui.table.reload-timing gates the terminal table refresh", async () => {
-    // ローカルの queue consumer はメッセージを 1 通ずつ直列に配送する
-    // (max_batch_size=1。max_concurrency はローカルでは効かない) ため、
-    // 「別のジョブが残っている間の終端」は pacing に入る Update の後ろへ速い
-    // Convert を並べて作る: 直列配送では Convert が pending、並行配送では
-    // Update が running のまま残る。どちらでも最後の終端だけがキューを掃くので、
-    // 同じイベント列の順序で契約を検査できる。
+    // 変換専用 consumer は 1 並列。2 行を同じリクエストで先に作り、
+    // 一方の終端時に他方が残っている状態を、取得や pacing に頼らず検査する。
     const view = await json(await request("/api/global_setting", auth()));
     const currentValue = (name) =>
       view.settings?.find((item) => item.name === name)?.value ?? null;
-    const previousInterval = currentValue("update.interval");
     const previousTiming = currentValue("webui.table.reload-timing");
 
     await request("/api/queue/clear", {
@@ -1823,8 +1810,7 @@ if (QUEUE_CHECKS) {
       headers: { "content-type": "application/json", ...auth().headers },
       body: "{}",
     });
-    // pacing (native の下限は 2.5 秒) を確実に観測できる間隔にする。
-    await saveSettings({ "update.interval": 5, "webui.table.reload-timing": "queue" });
+    await saveSettings({ "webui.table.reload-timing": "queue" });
 
     const terminalEvents = (messages, first, second) =>
       messages.filter(
@@ -1834,23 +1820,17 @@ if (QUEUE_CHECKS) {
       );
     const socket = await openWebSocket();
     try {
-      // A: このドメインの pacing スロットを消費して終端する (最初の Update は
-      // 待たず、2 通目から update.interval の待ちに入る)。
-      const pacingJobId = await enqueuePlan("Update", 999999911);
-      await waitForTerminal(pacingJobId);
 
       // queue タイミング: もう 1 つのジョブが pending または running のまま
       // 先に終端する側では table.reload を送らず、キューが掃けた最後の終端で
       // だけ送る。progressbar.clear / notification.queue は抑制中も届く。
       const queueMark = socket.mark();
-      const pacedJobId = await enqueuePlan("Update", 999999912);
-      await waitForStatus(pacedJobId, "running");
-      const convertC = await enqueuePlan("Convert", 999999913);
-      await waitForTerminal(convertC);
-      await waitForTerminal(pacedJobId);
+      const [queueA, queueB] = await enqueuePlans("Convert", [999999912, 999999913]);
+      await waitForTerminal(queueA);
+      await waitForTerminal(queueB);
       await waitForEvent(socket, queueMark, (message) => message?.type === "table.reload");
       const duringQueue = socket.slice(queueMark);
-      const queueTerminals = terminalEvents(duringQueue, pacedJobId, convertC);
+      const queueTerminals = terminalEvents(duringQueue, queueA, queueB);
       assert.equal(
         queueTerminals.length,
         2,
@@ -1880,13 +1860,12 @@ if (QUEUE_CHECKS) {
       // every: 実行中/待機中のジョブが残っていても、各終端が table.reload を送る。
       await saveSettings({ "webui.table.reload-timing": "every" });
       const everyMark = socket.mark();
-      const pacedJobE = await enqueuePlan("Update", 999999914);
-      const convertD = await enqueuePlan("Convert", 999999915);
-      await waitForTerminal(pacedJobE);
-      await waitForTerminal(convertD);
+      const [everyA, everyB] = await enqueuePlans("Convert", [999999914, 999999915]);
+      await waitForTerminal(everyA);
+      await waitForTerminal(everyB);
       await waitForEvent(socket, everyMark, (message) => message?.type === "table.reload");
       const duringEvery = socket.slice(everyMark);
-      const everyTerminals = terminalEvents(duringEvery, pacedJobE, convertD);
+      const everyTerminals = terminalEvents(duringEvery, everyA, everyB);
       assert.equal(
         everyTerminals.length,
         2,
@@ -1907,7 +1886,6 @@ if (QUEUE_CHECKS) {
     } finally {
       socket.close();
       await saveSettings({
-        "update.interval": previousInterval,
         "webui.table.reload-timing": previousTiming,
       });
     }

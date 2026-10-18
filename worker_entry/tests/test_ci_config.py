@@ -28,6 +28,8 @@ class RenderConfigTests(unittest.TestCase):
             "NAROU_D1_DATABASE_ID": "11111111-1111-4111-8111-111111111111",
             "NAROU_JOB_QUEUE": "audit-develop",
             "NAROU_JOB_DLQ": "audit-develop-dlq",
+            "NAROU_CONVERT_QUEUE": "audit-convert-develop",
+            "NAROU_CONVERT_DLQ": "audit-convert-develop-dlq",
             "NAROU_S3_ENDPOINT": "https://s3.example.com",
             "NAROU_S3_REGION": "us-east-1",
             "NAROU_S3_BUCKET": "audit-bucket",

@@ -74,6 +74,10 @@ pub struct SiteSetting {
     /// episodes can be kept out of the author's work list.
     #[serde(default)]
     pub author_series_episodes_pattern: Option<String>,
+    /// Template that turns episode-list captures into an absolute work URL
+    /// when the pattern does not capture `novel_url` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_series_episode_work_url: Option<String>,
     /// URL of one page of a comic series' page list (Pixiv pages `?p=N`).
     ///
     /// `\k<series_id>` and `\k<page>` are available, plus whatever `author_url`
@@ -84,6 +88,10 @@ pub struct SiteSetting {
     /// pages can be kept out of the author's single-artwork list.
     #[serde(default)]
     pub author_comic_series_pages_pattern: Option<String>,
+    /// Template that turns comic page-list captures into an absolute work URL
+    /// when the pattern does not capture `novel_url` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_comic_series_page_work_url: Option<String>,
     /// Pattern whose `author_next` capture is the next page of an author
     /// listing (ハーメルン pages its works). Followed until a page has no next
     /// link or points at one already visited — the visited set is what keeps a
@@ -145,6 +153,9 @@ pub struct SiteSetting {
     /// the list (a retry with the stored cookie may see more).
     #[serde(default)]
     pub login_partial_pattern: Option<SiteSettingValue>,
+    /// Retain cached omitted sections on a nonempty partial TOC; indices must be stable numeric positions.
+    #[serde(default)]
+    pub preserve_missing_sections: bool,
     /// Minimum seconds between requests to this site. Sites that rate-limit
     /// aggressively (Pixiv) declare a floor; `None` uses `download.interval`.
     #[serde(default)]
@@ -711,20 +722,13 @@ impl SiteSetting {
         Some(self.interpolate_with_captures(template, &named))
     }
 
-    /// Episode ids found in a series' episode list.
-    pub fn author_series_episode_ids(&self, source: &str) -> Vec<String> {
-        let Some(pattern) = self.compiled_author_series_episodes.as_ref() else {
-            return Vec::new();
-        };
-        pattern
-            .captures_iter(source)
-            .filter_map(|captures| {
-                captures
-                    .name("novel_id")
-                    .or_else(|| captures.name("ncode"))
-                    .map(|matched| matched.as_str().to_string())
-            })
-            .collect()
+    /// Full work URLs found in a series' episode list.
+    pub fn author_series_episode_urls(&self, source: &str) -> Vec<String> {
+        self.extract_author_member_urls(
+            source,
+            self.compiled_author_series_episodes.as_ref(),
+            self.author_series_episode_work_url.as_deref(),
+        )
     }
 
     /// Comic series the listing asked to check (`author_comic_series::<id>`).
@@ -746,19 +750,43 @@ impl SiteSetting {
         Some(self.interpolate_with_captures(template, &named))
     }
 
-    /// Artwork ids found in one page of a comic series' page list.
-    pub fn author_comic_series_page_ids(&self, source: &str) -> Vec<String> {
-        let Some(pattern) = self.compiled_author_comic_pages.as_ref() else {
+    /// Full artwork URLs found in one page of a comic series' page list.
+    pub fn author_comic_series_page_urls(&self, source: &str) -> Vec<String> {
+        self.extract_author_member_urls(
+            source,
+            self.compiled_author_comic_pages.as_ref(),
+            self.author_comic_series_page_work_url.as_deref(),
+        )
+    }
+
+    fn extract_author_member_urls(
+        &self,
+        source: &str,
+        pattern: Option<&Regex>,
+        template: Option<&str>,
+    ) -> Vec<String> {
+        let Some(pattern) = pattern else {
             return Vec::new();
         };
         pattern
             .captures_iter(source)
             .filter_map(|captures| {
-                captures
-                    .name("novel_id")
-                    .or_else(|| captures.name("ncode"))
-                    .map(|matched| matched.as_str().to_string())
+                if let Some(url) = captures.name("novel_url") {
+                    return Some(crate::downloader::util::decode_html_text(url.as_str()));
+                }
+                let template = template?;
+                let named: HashMap<String, String> = pattern
+                    .capture_names()
+                    .flatten()
+                    .filter_map(|name| {
+                        captures
+                            .name(name)
+                            .map(|value| (name.to_string(), value.as_str().to_string()))
+                    })
+                    .collect();
+                Some(self.interpolate_with_captures(template, &named))
             })
+            .filter(|url| !url.is_empty())
             .collect()
     }
 

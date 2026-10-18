@@ -4,7 +4,7 @@ mod jobs;
 mod parser;
 
 pub use ast::*;
-pub use jobs::{MAX_PREPROCESS_JOBS, PreprocessJobs, PreprocessRequest};
+pub use jobs::{MAX_PREPROCESS_JOBS, PreprocessError, PreprocessJobs, PreprocessRequest};
 
 use super::preprocess::interpreter::run_stmts;
 use super::preprocess::parser::parse_preprocess;
@@ -23,7 +23,7 @@ impl PreprocessPipeline {
     /// Run the definition over `source`, seeing the results of `jobs`.
     /// Returns requests for the caller to execute before rerunning the
     /// definition. A failed run leaves the source unchanged.
-    pub fn execute(&self, source: &mut String, jobs: &PreprocessJobs, url: &str) -> Result<PreprocessRun, String> {
+    pub fn execute(&self, source: &mut String, jobs: &PreprocessJobs, url: &str) -> Result<PreprocessRun, PreprocessError> {
         run_stmts(&self.stmts, source, jobs, url)
     }
 }
@@ -40,7 +40,7 @@ pub fn run_preprocess(
     source: &mut String,
     jobs: &PreprocessJobs,
     url: &str,
-) -> Result<PreprocessRun, String> {
+) -> Result<PreprocessRun, PreprocessError> {
     pipeline.execute(source, jobs, url)
 }
 

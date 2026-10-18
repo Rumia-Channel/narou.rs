@@ -42,6 +42,7 @@ pub struct DispatchOutcome {
 }
 /// Queue producer binding that carries version-2 job envelopes.
 pub const JOB_QUEUE_BINDING: &str = "NAROU_JOBS";
+const CONVERT_QUEUE_BINDING: &str = "CONVERT_QUEUE";
 
 /// ジョブ中に更新された section hash cache の保留分
 /// (`app_state('inv','section_hash_cache')` と同じ `小説 → (section → digest)` の形)。
@@ -74,7 +75,9 @@ pub struct WorkerRuntime {
     pub write_services: AppServices,
     pub ledger: Arc<D1JobLedger>,
     pub checkpoint: D1SchedulerCheckpoint,
-    pub queue: Queue,
+    acquisition_queue: Queue,
+    convert_queue: Queue,
+    convert_queue_name: String,
     pub freeze: Arc<D1FreezeStore>,
     pub novels: Arc<dyn NovelRepository>,
     http: Arc<dyn HttpClient>,
@@ -408,7 +411,12 @@ impl WorkerRuntime {
         // 側がセッションハンドルを使う。
         let ledger = Arc::new(D1JobLedger::new(write_db.clone(), clock.clone()));
         let checkpoint = D1SchedulerCheckpoint::new(write_db.clone());
-        let queue = env.queue(JOB_QUEUE_BINDING)?;
+        let acquisition_queue = env.queue(JOB_QUEUE_BINDING)?;
+        let convert_queue = env.queue(CONVERT_QUEUE_BINDING)?;
+        let convert_queue_name = env.var("CONVERT_QUEUE_NAME")?.to_string();
+        if convert_queue_name.is_empty() {
+            return Err(worker::Error::RustError("CONVERT_QUEUE_NAME is empty".into()));
+        }
 
         let services = services_from(
             novels.clone(),
@@ -433,7 +441,9 @@ impl WorkerRuntime {
             write_services,
             ledger,
             checkpoint,
-            queue,
+            acquisition_queue,
+            convert_queue,
+            convert_queue_name,
             freeze,
             novels: write_novels,
             http,
@@ -486,6 +496,17 @@ impl WorkerRuntime {
             settings,
         )?;
         Ok(downloader.with_cookie_store(self.cookie_store.clone()))
+    }
+
+    /// Use the same effective YAML URL resolution as acquisition. The original
+    /// plan stays unchanged; this key also resolves newly registered novels.
+    pub(crate) fn normalized_job_target<'a>(&self, target: &'a str) -> std::borrow::Cow<'a, str> {
+        if (target.starts_with("https://") || target.starts_with("http://"))
+            && let Some(url) = narou_rs::application::target_lookup::first_matching_toc_url(&self.site_settings, target)
+        {
+            return std::borrow::Cow::Owned(url);
+        }
+        std::borrow::Cow::Borrowed(target)
     }
 
     /// `Downloader` に渡す設定スナップショットを D1 (`app_state`) から組み立てる。
@@ -656,6 +677,32 @@ impl WorkerRuntime {
         Ok(expanded)
     }
 
+    fn queue_for_kind(&self, kind: &str) -> &Queue {
+        if kind == JobKind::Convert.as_str() { &self.convert_queue } else { &self.acquisition_queue }
+    }
+
+    pub fn is_conversion_queue(&self, name: &str) -> bool {
+        name == self.convert_queue_name
+    }
+
+    /// Redispatch the same durable job, including envelopes left in the old queue.
+    pub async fn send_existing_job(&self, job_id: &JobId, kind: &str) -> Result<()> {
+        self.queue_for_kind(kind)
+            .send(WorkerJobEnvelope::v2(job_id.clone()))
+            .await
+            .map_err(|error| NarouError::Platform(format!("queue send failed: {error}")))
+    }
+
+    /// Completion and cron wake durable waiting work without provider retries.
+    pub async fn wake_waiting_jobs(&self) -> Result<()> {
+        for job in self.ledger.waiting_jobs().await? {
+            if self.ledger.mark_waiting_dispatched(&job.job_id).await? {
+                self.send_existing_job(&JobId(job.job_id), &job.kind).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Enqueue one plan through the ledger and Queue binding as one operation.
     /// Pending/retryable rows are sent; a live running row is not duplicated.
     pub async fn enqueue_plan(&self, plan: JobPlan) -> Result<DispatchOutcome> {
@@ -711,7 +758,7 @@ impl WorkerRuntime {
         let frozen = self.frozen_skip_reasons(plans).await;
         let mut results: Vec<std::result::Result<DispatchOutcome, String>> =
             Vec::with_capacity(plans.len());
-        let mut sends: Vec<usize> = Vec::new();
+        let mut sends: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
         for (index, plan) in plans.iter().enumerate() {
             let job_id = enqueued[index].queued.job_id.clone();
             // 凍結小説の除外はここでも行う (native の update/download 拒否と
@@ -733,7 +780,9 @@ impl WorkerRuntime {
                 continue;
             }
             if let Some(reason) = self.blocked_plan_reason(plan, &job_id) {
-                match self.ledger.claim(&job_id).await {
+                let target = plan.target.as_str();
+                let normalized_target = self.normalized_job_target(&target);
+                match self.ledger.claim(&job_id, &normalized_target, None).await {
                     Ok(JobClaim::Claimed { execution_token, .. }) => {
                         if let Err(error) = self
                             .ledger
@@ -750,11 +799,8 @@ impl WorkerRuntime {
                         }
                     }
                     Ok(JobClaim::AlreadyTerminal | JobClaim::Unknown) => {}
-                    Ok(JobClaim::Busy { retry_after }) => {
-                        results.push(Err(format!(
-                            "cannot block a job with a live execution lease; retry after {}s",
-                            retry_after.as_secs()
-                        )));
+                    Ok(JobClaim::Busy) => {
+                        results.push(Err("cannot block a job with a live execution lease".to_string()));
                         continue;
                     }
                     Err(error) => {
@@ -780,7 +826,7 @@ impl WorkerRuntime {
                 }));
                 continue;
             }
-            sends.push(index);
+            sends[usize::from(plan.kind == JobKind::Convert)].push(index);
             results.push(Ok(DispatchOutcome {
                 job_id: job_id.as_str().to_string(),
                 sent: false,
@@ -790,35 +836,38 @@ impl WorkerRuntime {
         // Bounded Queue batches. A failed `send_batch` is retried per message
         // so the failure stays attached to its own plan and the rest of the
         // page (and later chunks) still goes out.
-        for chunk in sends.chunks(QUEUE_SEND_BATCH_SIZE) {
-            let envelopes: Vec<WorkerJobEnvelope> = chunk
-                .iter()
-                .map(|index| WorkerJobEnvelope::v2(enqueued[*index].queued.job_id.clone()))
-                .collect();
-            match self.queue.send_batch(envelopes).await {
-                Ok(()) => {
-                    for index in chunk {
-                        if let Ok(outcome) = &mut results[*index] {
-                            outcome.sent = true;
+        for (kind, indices) in [(JobKind::Download, &sends[0]), (JobKind::Convert, &sends[1])] {
+            let queue = self.queue_for_kind(kind.as_str());
+            for chunk in indices.chunks(QUEUE_SEND_BATCH_SIZE) {
+                let envelopes: Vec<WorkerJobEnvelope> = chunk
+                    .iter()
+                    .map(|index| WorkerJobEnvelope::v2(enqueued[*index].queued.job_id.clone()))
+                    .collect();
+                match queue.send_batch(envelopes).await {
+                    Ok(()) => {
+                        for index in chunk {
+                            if let Ok(outcome) = &mut results[*index] {
+                                outcome.sent = true;
+                            }
                         }
                     }
-                }
-                Err(batch_error) => {
-                    console_log!(
-                        "queue send_batch of {} messages failed ({batch_error}); retrying per message",
-                        chunk.len()
-                    );
-                    for index in chunk {
-                        let envelope =
-                            WorkerJobEnvelope::v2(enqueued[*index].queued.job_id.clone());
-                        match self.queue.send(&envelope).await {
-                            Ok(()) => {
-                                if let Ok(outcome) = &mut results[*index] {
-                                    outcome.sent = true;
+                    Err(batch_error) => {
+                        console_log!(
+                            "queue send_batch of {} messages failed ({batch_error}); retrying per message",
+                            chunk.len()
+                        );
+                        for index in chunk {
+                            let envelope =
+                                WorkerJobEnvelope::v2(enqueued[*index].queued.job_id.clone());
+                            match queue.send(&envelope).await {
+                                Ok(()) => {
+                                    if let Ok(outcome) = &mut results[*index] {
+                                        outcome.sent = true;
+                                    }
                                 }
-                            }
-                            Err(error) => {
-                                results[*index] = Err(format!("queue send failed: {error}"));
+                                Err(error) => {
+                                    results[*index] = Err(format!("queue send failed: {error}"));
+                                }
                             }
                         }
                     }
@@ -1063,8 +1112,7 @@ fn services_from(
 /// Readiness probe: every required binding and configuration must be real.
 ///
 /// - D1 answers `SELECT 1`
-/// - `NAROU_JOBS` queue producer, `RATE_LIMITER` Durable Object namespace,
-///   and the `PUSH_HUB` Durable Object bindings are bound
+/// - acquisition / conversion queue producers, `RATE_LIMITER`, and `PUSH_HUB` are bound
 /// - full composition (bundled site definitions parse and compile)
 ///
 /// Nothing here performs network I/O; a missing binding or config fails
@@ -1085,6 +1133,7 @@ pub async fn check_ready(env: &Env) -> worker::Result<()> {
         }
     }
     env.queue(JOB_QUEUE_BINDING)?;
+    env.queue(CONVERT_QUEUE_BINDING)?;
     env.durable_object("RATE_LIMITER")?;
     env.durable_object("PUSH_HUB")?;
     // Full composition validates bundled sites and all adapters.

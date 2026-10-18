@@ -26,7 +26,7 @@ fn page(first: usize, last: usize, added_tag: bool) -> String {
         })
     }).collect();
     let contents: Vec<_> = (first..=last).map(|order| json!({
-        "id": (20_000_000 + order).to_string(), "series": {"viewableType": 0},
+        "id": (20_000_000 + order).to_string(), "series": {"id": "854898", "viewableType": 0, "contentOrder": order},
     })).collect();
     json!({"body": {"thumbnails": {"novel": entries}, "page": {"seriesContents": contents}}}).to_string()
 }

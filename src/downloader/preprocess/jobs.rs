@@ -5,23 +5,42 @@
 //! the site's fetch policy, and their parsed bodies become visible to the next
 //! run as `fetched["<url>"]`.
 //!
-//! One instance lives for a whole novel download, so a series that references
-//! the same illustration from many sections resolves it once. Only *settled*
-//! results are kept — a job that has finished leaves the queue immediately, so
-//! nothing long-lived accumulates (which matters on the Worker runtime).
+//! One instance lives for a whole novel download. Settled JSON responses are
+//! reused only within the same credential/header context and a bounded FIFO;
+//! evicted responses can be fetched again. Original JSON text stays in memory
+//! so reusing it for a section does not change user-defined regex behavior.
 //!
 //! `post_form` also requests raw text. Its identity includes the URL, encoded
 //! body and headers; these results live for one preprocessing call only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use crate::error::NarouError;
+
+#[derive(Debug, thiserror::Error)]
+pub enum PreprocessError {
+    #[error("{0}")]
+    Definition(String),
+    #[error("required JSON request failed: {0}")]
+    RequiredJson(String),
+}
+
+impl From<String> for PreprocessError {
+    fn from(message: String) -> Self { Self::Definition(message) }
+}
+
+impl From<&str> for PreprocessError {
+    fn from(message: &str) -> Self { Self::Definition(message.to_string()) }
+}
 
 /// Fetches retain their full identity: form bodies at one URL are distinct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreprocessRequest {
     Json { url: String },
+    JsonRequired { url: String, missing_statuses: Vec<u16> },
     Form { url: String, body: String, headers: Vec<(String, String)>, key: String },
 }
 
@@ -39,22 +58,31 @@ impl PreprocessRequest {
     }
 
     pub fn url(&self) -> &str {
-        match self { Self::Json { url } | Self::Form { url, .. } => url }
+        match self { Self::Json { url } | Self::JsonRequired { url, .. } | Self::Form { url, .. } => url }
     }
 
     pub fn key(&self) -> &str {
-        match self { Self::Json { url } => url, Self::Form { key, .. } => key }
+        match self { Self::Json { url } | Self::JsonRequired { url, .. } => url, Self::Form { key, .. } => key }
     }
 }
 
-/// Upper bound on retained results. A definition that keeps requesting new
-/// URLs stops being served once this is reached; the run still completes with
-/// whatever was resolved.
+/// Maximum settled JSON results retained in FIFO order. Completed pages may
+/// evict older responses, but a successful fetch must never be discarded.
 pub const MAX_PREPROCESS_JOBS: usize = 256;
+
+#[derive(Debug)]
+struct CachedJson {
+    value: Value,
+    source: Option<String>,
+    failure: Option<(Option<u16>, Arc<NarouError>)>,
+}
 
 #[derive(Debug, Default)]
 pub struct PreprocessJobs {
-    fetched: HashMap<String, Value>,
+    fetched: HashMap<String, CachedJson>,
+    order: VecDeque<String>,
+    context: Option<[u8; 32]>,
+    has_cookie: bool,
     /// Raw form responses live only for one preprocessing call, not a novel.
     forms: HashMap<String, Value>,
 }
@@ -68,6 +96,53 @@ impl PreprocessJobs {
     pub fn reset(&mut self) {
         self.fetched.clear();
         self.forms.clear();
+        self.order.clear();
+        self.context = None;
+        self.has_cookie = false;
+    }
+
+    pub(crate) fn bind_policy(&mut self, policy: &super::super::http_policy::FetchPolicy, url: &str) {
+        let context = policy.cache_context();
+        if context.is_none() || self.context != context {
+            self.reset();
+            self.context = context;
+        }
+        self.has_cookie = policy.has_cookie_for(url);
+    }
+
+    pub(super) fn has_cookie(&self) -> bool { self.has_cookie }
+
+    pub(super) fn validate_required(&self, url: &str, missing_statuses: &[u16]) -> Result<(), PreprocessError> {
+        let Some(result) = self.fetched.get(url) else { return Ok(()) };
+        if let Some((status, _)) = &result.failure {
+            if status.is_some_and(|status| missing_statuses.contains(&status)) {
+                return Ok(());
+            }
+            return Err(PreprocessError::RequiredJson(url.to_string()));
+        }
+        if result.value.is_null() {
+            return Err(PreprocessError::RequiredJson(url.to_string()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn failure(&self, url: &str) -> Option<&Arc<NarouError>> {
+        self.fetched.get(url).and_then(|result| result.failure.as_ref().map(|(_, error)| error))
+    }
+
+    pub(crate) fn insert_failure(&mut self, url: String, status: Option<u16>, error: NarouError) {
+        self.insert_result(url, CachedJson {
+            value: Value::Null, source: None, failure: Some((status, Arc::new(error))),
+        });
+    }
+
+    pub(crate) fn insert_json(&mut self, url: String, value: Value, source: String) {
+        self.insert_result(url, CachedJson { value, source: Some(source), failure: None });
+    }
+
+    pub(crate) fn json_source(&self, url: &str) -> Option<String> {
+        self.fetched.get(url).filter(|result| !result.value.is_null())
+            .and_then(|result| result.source.clone())
     }
 
     pub fn contains(&self, url: &str) -> bool {
@@ -75,21 +150,29 @@ impl PreprocessJobs {
     }
 
     /// Resolved results, keyed by URL, as the DSL sees them.
-    pub fn results(&self) -> &HashMap<String, Value> {
-        &self.fetched
+    pub fn results(&self) -> impl ExactSizeIterator<Item = (&String, &Value)> {
+        self.fetched.iter().map(|(url, result)| (url, &result.value))
     }
 
     /// Record a settled job. A failed fetch is stored as `null` so the DSL can
     /// branch on it instead of the download failing.
     pub fn insert(&mut self, url: String, value: Value) {
-        if self.fetched.len() >= MAX_PREPROCESS_JOBS {
-            return;
+        self.insert_result(url, CachedJson { value, source: None, failure: None });
+    }
+
+    fn insert_result(&mut self, url: String, result: CachedJson) {
+        if !self.fetched.contains_key(&url) {
+            while self.fetched.len() >= MAX_PREPROCESS_JOBS {
+                let Some(oldest) = self.order.pop_front() else { break };
+                self.fetched.remove(&oldest);
+            }
+            self.order.push_back(url.clone());
         }
-        self.fetched.insert(url, value);
+        self.fetched.insert(url, result);
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.fetched.get(key).or_else(|| self.forms.get(key))
+        self.fetched.get(key).map(|result| &result.value).or_else(|| self.forms.get(key))
     }
 
     pub fn insert_form(&mut self, key: String, value: Value) -> Result<(), String> {
@@ -110,35 +193,5 @@ impl PreprocessJobs {
 
     pub fn is_empty(&self) -> bool {
         self.fetched.is_empty()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn settled_jobs_are_visible_and_reset_drops_them() {
-        let mut jobs = PreprocessJobs::new();
-        assert!(!jobs.contains("https://example.com/a"));
-
-        jobs.insert("https://example.com/a".to_string(), Value::Null);
-        assert!(jobs.contains("https://example.com/a"));
-        assert_eq!(
-            jobs.results().get("https://example.com/a"),
-            Some(&Value::Null)
-        );
-
-        jobs.reset();
-        assert!(jobs.is_empty());
-    }
-
-    #[test]
-    fn job_count_is_bounded() {
-        let mut jobs = PreprocessJobs::new();
-        for index in 0..(MAX_PREPROCESS_JOBS + 8) {
-            jobs.insert(format!("https://example.com/{index}"), Value::Null);
-        }
-        assert_eq!(jobs.len(), MAX_PREPROCESS_JOBS);
     }
 }

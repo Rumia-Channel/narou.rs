@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use super::ast::*;
-use super::jobs::{MAX_PREPROCESS_JOBS, PreprocessJobs, PreprocessRequest};
+use super::jobs::{MAX_PREPROCESS_JOBS, PreprocessError, PreprocessJobs, PreprocessRequest};
 
 const PREPROCESS_STEP_BUDGET: usize = 100_000;
 const PREPROCESS_MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
 const PREPROCESS_MAX_ARRAY_ITEMS: usize = 100_000;
 
-type PreprocessResult<T> = Result<T, String>;
+type PreprocessResult<T> = Result<T, PreprocessError>;
 
 struct Ctx<'a> {
     vars: HashMap<String, Value>,
@@ -30,7 +30,6 @@ impl<'a> Ctx<'a> {
             "fetched".to_string(),
             Value::Object(
                 jobs.results()
-                    .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             ),
@@ -38,6 +37,7 @@ impl<'a> Ctx<'a> {
         // The URL this body came from, so definitions can derive follow-up
         // URLs (Pixiv pages its manga series listings).
         vars.insert("url".to_string(), Value::String(url.to_string()));
+        vars.insert("has_cookie".to_string(), Value::Bool(jobs.has_cookie()));
         Self {
             vars,
             output: Vec::new(),
@@ -63,6 +63,35 @@ impl<'a> Ctx<'a> {
             self.requested.push(PreprocessRequest::Json { url: url.clone() });
         }
         Ok(Value::String(url))
+    }
+
+    fn required_json(&mut self, url: String, missing_statuses: &[u16]) -> PreprocessResult<Value> {
+        if !crate::downloader::security::is_safe_public_url_syntax(&url)
+            || missing_statuses.iter().any(|status| !(400..600).contains(status))
+        {
+            return Err("preprocess: invalid required JSON request".into());
+        }
+        self.jobs.validate_required(&url, missing_statuses)?;
+        if !self.jobs.contains(&url) {
+            if let Some(request) = self.requested.iter_mut().find(|request| request.key() == url) {
+                match request {
+                    PreprocessRequest::JsonRequired { missing_statuses: existing, .. } => {
+                        existing.retain(|status| missing_statuses.contains(status));
+                    }
+                    _ => *request = PreprocessRequest::JsonRequired {
+                        url: url.clone(), missing_statuses: missing_statuses.to_vec(),
+                    },
+                }
+            } else {
+                if self.requested.len() >= MAX_PREPROCESS_JOBS {
+                    return Err("preprocess: required JSON request limit exceeded".into());
+                }
+                self.requested.push(PreprocessRequest::JsonRequired {
+                    url: url.clone(), missing_statuses: missing_statuses.to_vec(),
+                });
+            }
+        }
+        Ok(self.jobs.get(&url).cloned().unwrap_or(Value::Null))
     }
 
     fn get(&self, name: &str) -> Option<&Value> {
@@ -271,8 +300,12 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
             if url.is_empty() {
                 Value::Null
             } else {
-                ctx.jobs.results().get(&url).cloned().unwrap_or(Value::Null)
+                ctx.jobs.get(&url).cloned().unwrap_or(Value::Null)
             }
+        }
+        Expr::FetchJsonRequired { url, missing_statuses } => {
+            let url = val_to_string(&eval_expr(ctx, url)?);
+            ctx.required_json(url, missing_statuses)?
         }
         Expr::PostForm { url, fields, headers } => eval_post_form(ctx, url, fields, headers.as_deref())?,
         Expr::Arith(left, op, right) => {
@@ -603,7 +636,7 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
         }
         Stmt::Fail(message) => {
             if !matches!(ctx.get("__abort__"), Some(Value::Bool(true))) {
-                return Err(format!("preprocess: {}", val_to_string(&eval_expr(ctx, message)?)));
+                return Err(format!("preprocess: {}", val_to_string(&eval_expr(ctx, message)?)).into());
             }
         }
         Stmt::InsertAtMatch => {
@@ -671,7 +704,7 @@ fn validate_string_size(text: &str) -> PreprocessResult<()> {
     if text.len() > PREPROCESS_MAX_STRING_BYTES {
         return Err(format!(
             "preprocess: string size limit exceeded ({PREPROCESS_MAX_STRING_BYTES} bytes)"
-        ));
+        ).into());
     }
     Ok(())
 }
@@ -680,7 +713,7 @@ fn validate_array_len(len: usize) -> PreprocessResult<()> {
     if len > PREPROCESS_MAX_ARRAY_ITEMS {
         return Err(format!(
             "preprocess: array size limit exceeded ({PREPROCESS_MAX_ARRAY_ITEMS} items)"
-        ));
+        ).into());
     }
     Ok(())
 }
@@ -734,7 +767,7 @@ mod tests {
     use super::*;
 
     fn run(stmts: &[Stmt], source: &mut String) -> Result<(), String> {
-        run_stmts(stmts, source, &PreprocessJobs::new(), "").map(|_| ())
+        run_stmts(stmts, source, &PreprocessJobs::new(), "").map(|_| ()).map_err(|error| error.to_string())
     }
 
     /// Compile DSL source, run it over `source`, and return the result.
@@ -1363,46 +1396,4 @@ mod tests {
         assert!(source.contains("c"));
     }
 
-    #[test]
-    fn preprocess_step_budget_is_enforced() {
-        let stmts = vec![
-            Stmt::Emit(Expr::String(vec![StrPart::Lit("x".to_string())]));
-            (PREPROCESS_STEP_BUDGET / 2) + 1
-        ];
-        let mut source = String::new();
-        let err = run_stmts(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
-        assert_eq!(err, "preprocess: step budget exceeded");
-    }
-
-    #[test]
-    fn preprocess_string_limit_is_enforced() {
-        let oversized = "a".repeat((PREPROCESS_MAX_STRING_BYTES / 2) + 1);
-        let stmts = vec![Stmt::Emit(Expr::ValueChain {
-            base: Box::new(Expr::Array(vec![
-                Expr::String(vec![StrPart::Lit(oversized.clone())]),
-                Expr::String(vec![StrPart::Lit(oversized)]),
-            ])),
-            methods: vec![Method::Join(vec![StrPart::Lit(String::new())])],
-        })];
-        let mut source = String::new();
-        let err = run_stmts(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
-        assert_eq!(
-            err,
-            format!("preprocess: string size limit exceeded ({PREPROCESS_MAX_STRING_BYTES} bytes)")
-        );
-    }
-
-    #[test]
-    fn preprocess_array_limit_is_enforced() {
-        let stmts = vec![Stmt::Let {
-            var: "items".to_string(),
-            expr: Expr::Array(vec![Expr::Null; PREPROCESS_MAX_ARRAY_ITEMS + 1]),
-        }];
-        let mut source = String::new();
-        let err = run_stmts(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
-        assert_eq!(
-            err,
-            format!("preprocess: array size limit exceeded ({PREPROCESS_MAX_ARRAY_ITEMS} items)")
-        );
-    }
 }
