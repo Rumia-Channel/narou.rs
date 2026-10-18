@@ -18,6 +18,14 @@ CIからSORAHOST/run_workersの切替、専用配備workflow、relay-deployとWo
 
 ユーザーは反映先に「developだけ」を明示選択。mainへの統合・本番配備は今回行わず、既定mainのCI入力表示も次の統合までは旧設定が残る。Cloudflare環境の新名NAROU_RELAY_ENDPOINT/NAROU_RELAY_KEYは照会時点で未登録だったため、旧リレーを継続利用する場合も本体の次回配備前に新名へ設定する必要がある。Secret値は読み出せないので勝手な自動移植はしない。
 
+外部リレーはユーザーの新仕様によりCloud Run Buildpacksの通常Node.js 24 HTTPサービスへ変更。Functions Framework/関数ターゲット/Dockerfile/GHCRは使わず、Developer Connectでdevelopを接続、文脈/scripts/relay、entrypoint/target空欄、npm start=node server.mjs。K_SERVICEでは0.0.0.0、他は127.0.0.1、PORTは尊重する。大阪asia-northeast2、CPU1/512MiB/min0/max1/concurrency1/90秒/request-based。認証キーはSecret ManagerからNAROU_RELAY_KEYへ注入。独立CI方針・Rust codec/with_relay・Worker設定2名とfetch→socket→relayの採用規則は変更しない。手順はdocs/cloud-run-relay.md。
+
+Nodeリレーは必須のNAROU_RELAY_ALLOWED_HOSTSを完全一致で正規化、全DNS応答の公開IPを検証し、curl --resolve/Node HTTP(S) lookupで固定する。未設定は取得拒否、鍵未設定は起動拒否。curlのHTTP403は通常応答で再試行しない。実行障害時の代替はDNS固定できないglobal fetchでなくNode HTTP(S)を使用しvia=node-http、TLS・非follow・16MiB上限・75秒全体期限・切断キャンセルを維持。curlrc/環境proxyを無効化しヘッダはstdin、stderr/URL/Cookie/認証情報はログへ出さない。localhost fixtureはroot tests/だけに隔離し本番環境変数による例外は無い。
+
+検証: Node/curlと実ローカルworkerdの回帰54件、Rust relay9件/HTTP1 23件、Worker wasm32 cargo checkが成功。npm ciは依存追加なし。実npm startをK_SERVICE付き8080で起動しhealth200/誤認証403/正認証の公開example.com取得200 via=curl/metadata拒否400、verify_auth.py成功を観測。鍵欠落・bind失敗はexit1。ローカルNode24/Windowsの証拠であり、Cloud Build/Developer Connectの実再配備、実ランタイムcurl、出口の日本判定、対象サイト取得、実サービスへのWorker HTTPS socketは未検証。gcloud/Docker無し、GCPプロジェクト/URL/認証情報も未提供のためサービス・Secretは作成していない。
+
+Browser Renderingについて2026-09-27の実測ではハーメルンのHTML APIがAPI200でもJust a moment...、Browser Run/Puppeteerも33秒後challengeのままでcookies空/hasClearance=falseだった。Cookie取得には進めていない。現行公式FAQも常時Bot識別/Cloudflare出口と説明しており、再試行せず過去の失敗をユーザーへ説明した。現在のあらゆるサイト応答が同じと断定はしない。
+
 Wrangler D1のDB UUID指定照会は書き込み0件。旧ジョブj000001a14cc3660f66881bdbはcancelled by user via Web UIで取消済みで、同じtargetの後続ジョブは無かった。取消を勝手に復活させない。旧配備の診断用公開プローブは認証付きGET限定で使用後に停止・削除し、保存済みのローカルログイン資格情報は保持した。
 
 ## v0.4.13 公開時点の記録（現況ではない）

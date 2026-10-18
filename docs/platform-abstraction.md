@@ -566,18 +566,37 @@ Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト向�
   接続先は `http` / `https` に対応し、パスを含んでもオリジンに正規化して `/proxy` へ送る。
   未設定ならリレー段は無効で、取得できないサイトが残り得る。
 
-#### リレーの配置と設定
+#### Cloud Run Buildpacks（採用先）
+
+`scripts/relay/` の通常の Node.js 24 HTTP サービスを Developer Connect / Cloud Build で
+`develop` から配備する。`package.json` の `npm start` が `node server.mjs` を実行し、
+Functions Framework・Dockerfile・GHCR は使わない。ビルド文脈は `/scripts/relay`、
+entrypoint / function target は空欄。詳しい設定値・Secret Manager・検証・停止手順は
+[`cloud-run-relay.md`](cloud-run-relay.md) を参照する。
+
+`K_SERVICE` のある環境は `0.0.0.0:$PORT`、ローカルは従来の loopback で待ち受ける。
+鍵未設定では起動せず、`NAROU_RELAY_ALLOWED_HOSTS` 未設定では外部取得を拒否する。
+許可ホストの全 DNS 応答を検証し、curl の `--resolve` と代替 HTTP(S) の lookup で
+接続先を固定する。代替経路も TLS 検証・非追跡・本文上限を守り、安全性を迂回しない。
+curl の HTTP 403 を実行障害とは扱わず、認証情報や stderr を診断へ載せない。
+全体75秒の期限とクライアント切断で子プロセス・HTTP 接続を中断する。
+
+Cloudflare 本体の配備とは独立し、GitHub Actions に GCP 認証や配備ジョブを追加しない。
+実 Cloud Run の Buildpacks ビルド・再配備・curl・日本の出口判定・対象サイト応答と、
+その URL への Worker HTTPS socket は未検証。ローカル成功をこれらの証明にはしない。
+
+#### 任意の外部サーバー（単体 Node 版）
 
 `scripts/relay/server.mjs` は Node.js と curl のある任意の外部サーバーで動かす。
-依存 npm パッケージは無い。`NAROU_RELAY_KEY` を安全に環境へ設定してから起動する:
+依存 npm パッケージは無い。`NAROU_RELAY_KEY` と取得先の `NAROU_RELAY_ALLOWED_HOSTS` を環境へ設定してから起動する:
 
 ```sh
 node scripts/relay/server.mjs
 ```
 
 待受は `127.0.0.1:${PORT:-3000}`。外部からは HTTPS のリバースプロキシを通す。
-curl を実行できない fetch ランタイム向けには `scripts/relay/worker/worker.mjs` もあるが、
-取得可否はそのランタイムと出口 IP に依存する。配置先で実際の対象サイトを確認する。
+`scripts/relay/worker/worker.mjs` は従来の fetch ランタイム用の契約検証対象として残す。
+Node 版に追加した許可リスト・DNS 固定を備える Cloud Run 配備の代替とはしない。
 
 GitHub の `Cloudflare` 環境には同名の Secret `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` を置く。
 本体 CI はこれらを Worker に渡すだけで、リレーのホスト作成・配備・認証確認は実行しない。
@@ -601,7 +620,10 @@ python3 scripts/relay/verify_auth.py
 
 このコマンドは `/health`、誤った合言葉での 403、正しい合言葉での取得を確認する。
 検証用の取得先は `NAROU_RELAY_PROBE_URL`、制限秒数は `NAROU_RELAY_TIMEOUT` で変更できる。
-リレーの実 HTTP 契約は `tests/relay.test.mjs` が Node 版とローカル Worker 版を対象に検証する。
+`node tests/run-relay.mjs` はローカル workerd の起動・終了も管理し、Node/curl と
+Worker の実 HTTP 契約、許可リスト・DNS・認証・TLS・上限・中断を検証する。
+Node.js 24・npm・curl が必要。外部 npm 依存の追加は不要。
+手動の単体起動は鍵と許可リストを設定して `npm start --prefix scripts/relay` を使う。
 平文 HTTP では認証・Cookie も平文で流れるため、公開運用では HTTPS を使う。
 
 ### 操作ごとのメッセージ（native CLI / Worker Web コンソール）

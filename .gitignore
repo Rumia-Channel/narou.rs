@@ -70,3 +70,6 @@ __pycache__/
 
 # sorahost-cli が保存するデプロイトークン（資格情報を含むため追跡しない）
 .sorahost.json
+
+# Cloud Run リレーのローカル npm 依存
+/scripts/relay/node_modules/
