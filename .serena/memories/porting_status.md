@@ -45,6 +45,16 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 - 最終の実 Worker で作者追跡6シナリオ、HTTP / Queue / WebSocket / reload 契約103件、全 S3 本文保存・移行・失敗注入・EPUB・再起動 smoke が成功。Native workspace（lib / bins / integration + Lite）は1,373成功・参照fixture1 ignored。Native / Worker wasm の Clippy `-D warnings`、標準 release Wasm + wasm-opt も成功した。develop への no-ff 統合後も SQL claim 回帰14件と Python74件が成功し、実 repo のビルドドライバを再生成した。検証用3サーバ・Rust TempDir・ソース副本・target junction・使い捨てスクリプトは終了・削除済み。次版の CI 監視はユーザー指示どおり行わない。
 
 
+## 未リリース: 挿絵を含む Worker 取得の実行枠再開
+
+- `Downloader` は話境界で `DownloadBudgetExpired` を返す前に dirty な `.illustration_cache.yaml` を保存する。本文だけ保存して画像 URL → ファイル名の対応を失い、再開時に同じ画像を取り直して再び実行枠を消費する経路を修正した。旧中断データの索引復元は残し、復元だけで再度予算に達してもその対応表を保存して次の実行へ渡す。
+- 実体一覧も取得開始時の snapshot のままだったため、再開後に新しく保存した画像を本文 / 取得時 HTML の重複参照で二度取っていた。`IllustrationStorageService::store_bytes` が返す成功済み filename を既存の集合へ move し、保存失敗時は追記しない。別の「取得済み」集合やサイト固有分岐は追加しない。
+- 回帰 `budget_resume_keeps_illustrations_without_refetching` は fresh HTTP / section cache で、取得済み画像の再取得による同位置中断と、新しい画像の二重取得をそれぞれ修正前に再現した。修正後は旧画像 0 回・新画像 1 回で続きの本文を保存し、索引の EPUB 参照も解決する。中断時に索引が無いという旧 implementation assertion は削除した。
+- 標準 release Wasm の実 Workerd / ローカル D1・DO / S3 HTTP fixture で、9 話・450 画像を既定 850 soft subrequest budget の話境界（cursor 6）で分割し、同じ job ID・attempts 0・画像各 1 回で完了した。索引だけ欠落させた旧状態も cursor 6 → 6 → 完了へ進み、復元の 1 巡だけ画像を再取得して以後のループを止めた。600 秒 wall-clock の実待機や本番デプロイの検証ではない。
+- 手動 Download と実 cron Update で、公開取得が匿名のまま、404 / 部分一覧が保存ログインへ fallback し、成功した session を次回の最初から使うことを実 Worker で確認した。保存済み年齢同意 true は双方で許可、false は双方で停止し現行本文を保持する。`download.interval=0.15` と YAML 下限 0.3 秒、`download.wait-steps=3` の 5 秒休止も同じ取得経路で確認した。自動更新用の認証・速度の別実装は不要で、Pixiv の 5 秒下限は変更しない。
+- 最終 Native workspace + Lite は 1,373 成功 / 参照 fixture 1 ignored、Native 全 target / Worker Wasm の Clippy `-D warnings` と標準 release Wasm + wasm-opt が成功。本番 D1 は読み取りだけで、該当 Pixiv ジョブの checkpoint 7 と現行本文 7 話を確認した。直前の last_error には別途 Pixiv 追加 API の HTTP 403 も記録されており、この修正で 403 を解消したとは扱わない。CI 監視・本番の設定変更・ジョブ操作は行わない。
+- 最終 Wasm でも認証・速度・年齢拒否と両方の挿絵再開ケースを通し直した。検証状態は Documents/WebNovel 内の Rust TempDir 所有で、元ライブラリは変更しない。実 Workerd は終了し、全検証ディレクトリ・使い捨てソース・専用実行ファイルを削除済み。Cloudflare の一時認証参照も解除し、ユーザーの Wrangler ログインは保持する。
+
 ## v0.4.13: 既存作品の個別変換設定を正準ストアへ統一（issue #37）
 
 - ミラー無効の SQLite ライブラリで、Web UI は正準 INI を更新するが `NovelSettings::load_for_novel_with_options` は移行前の実ファイルを読んでいた。`native::converter::load_novel_ini` に読み出しを揃え、残存ファイルより SQLite の値を優先する。旧ファイルを上書きして整合させず、YAML / ライブラリ外のファイル読み出しは従来どおり。共有コンストラクタの呼出元にも反映され、公開シグネチャや default / force の優先順は変えない。

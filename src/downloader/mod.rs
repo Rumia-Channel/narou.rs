@@ -1095,7 +1095,7 @@ impl Downloader {
     }
 
     /// 挿絵の取得。`stored_illustrations` は索引が知っている実体名の集合で、
-    /// 空の一覧が返ったときに取り直しの要否を判断するために渡す。
+    /// 保存成功した実体も追記し、同じ取得処理内での再取得を防ぐ。
     #[allow(clippy::too_many_arguments)]
     async fn download_illustration(
         &mut self,
@@ -1103,7 +1103,7 @@ impl Downloader {
         section: &SectionElement,
         object_keys: &NovelObjectKeys,
         illustration_store: &mut crate::illustration_store::IllustrationIndex,
-        stored_illustrations: Option<&std::collections::HashSet<String>>,
+        mut stored_illustrations: Option<&mut std::collections::HashSet<String>>,
         toc_url: &str,
         raw_html: Option<&str>,
     ) -> Result<()> {
@@ -1179,6 +1179,7 @@ impl Downloader {
                     });
                 if let Some(filename) = known {
                     let stored = stored_illustrations
+                        .as_deref()
                         .map(|names| names.contains(&filename))
                         .unwrap_or(true);
                     if stored {
@@ -1226,25 +1227,26 @@ impl Downloader {
                             .unwrap_or_else(|| {
                                 crate::illustration_store::guessed_extension_from_url(url)
                             });
-                        if let Err(err) = storage
+                        match storage
                             .store_bytes(object_keys, illustration_store, url, &body, ext)
                             .await
                         {
-                            crate::application::debug::emit_error(format!(
-                                "挿絵の保存に失敗 ({url}): {err}"
-                            ));
-                            self.report_warn(&messages::download::warn_illustration_save(url, err));
-                        } else {
-                            // `filename_for_source` は拡張子込みのファイル名を
-                            // 返すので、ここで `ext` を足さない (以前は
-                            // `挿絵/i88657.jpg.jpg` と二重に出ていた)。
-                            let filename = illustration_store
-                                .filename_for_source(url)
-                                .unwrap_or("(unknown)");
-                            crate::application::debug::emit(format!(
-                                "挿絵を保存しました: {url} → 挿絵/{filename} ({} bytes)",
-                                body.len()
-                            ));
+                            Err(err) => {
+                                crate::application::debug::emit_error(format!(
+                                    "挿絵の保存に失敗 ({url}): {err}"
+                                ));
+                                self.report_warn(&messages::download::warn_illustration_save(url, err));
+                            }
+                            Ok(stored) => {
+                                let filename = stored.filename;
+                                crate::application::debug::emit(format!(
+                                    "挿絵を保存しました: {url} → 挿絵/{filename} ({} bytes)",
+                                    body.len()
+                                ));
+                                if let Some(names) = stored_illustrations.as_deref_mut() {
+                                    names.insert(filename);
+                                }
+                            }
                         }
                     }
                     Err(err) => {
@@ -1919,7 +1921,7 @@ impl Downloader {
         }
         // 索引が空なら突き合わせる相手が無いので一覧は取らない (小説 1 件に
         // つき 1〜2 サブリクエスト増えるため、必要なときだけ)。
-        let stored_illustrations = if illustration_store.source_count() > 0 {
+        let mut stored_illustrations = if illustration_store.source_count() > 0 {
             let names = match self.stored_illustration_names(&object_keys).await {
                 // 一覧が取れて空でなければそれを信じる (通常経路)。
                 Some(names) if !names.is_empty() => Some(names),
@@ -2060,6 +2062,13 @@ impl Downloader {
                     .as_deref_mut()
                     .is_some_and(|budget| budget.should_yield(section_index))
             {
+                // 再開時に取得済み挿絵を取り直して次の実行枠まで使い切らないよう、
+                // 本文と一緒に挿絵の URL → 保存先の対応も中断前に確定する。
+                if illustration_store.is_dirty() {
+                    self.persistence
+                        .save_cache(&object_keys, &illustration_store)
+                        .await?;
+                }
                 return Err(NarouError::DownloadBudgetExpired {
                     next_section_index: section_index,
                 });
@@ -2109,7 +2118,7 @@ impl Downloader {
                         section,
                         &object_keys,
                         &mut illustration_store,
-                        stored_illustrations.as_ref(),
+                        stored_illustrations.as_mut(),
                         &toc_url,
                         None,
                     )
@@ -2201,7 +2210,7 @@ impl Downloader {
                     &section,
                     &object_keys,
                     &mut illustration_store,
-                    stored_illustrations.as_ref(),
+                    stored_illustrations.as_mut(),
                     &toc_url,
                     Some(raw_html.as_str()),
                 )
@@ -4699,11 +4708,9 @@ is_narou: false
 
     }
 
-    /// 中断された実行を再開したセクションでも挿絵の索引を書き戻す。中断時は
-    /// 索引 (`.illustration_cache.yaml`) が未保存なので、再開側で登録し直さないと
-    /// 実体だけが保存先に残り、EPUB の参照が解決できなくなる。
+    /// 中断後の新しい実行枠を、取得済み挿絵の再取得で使い切らずに続行できる。
     #[tokio::test]
-    async fn resumed_download_registers_the_skipped_sections_illustrations_again() {
+    async fn budget_resume_keeps_illustrations_without_refetching() {
         let temp = tempfile::tempdir().unwrap();
         let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
@@ -4747,20 +4754,20 @@ is_narou: false
         let section_1 = "https://example.com/n1234ab/1/";
         let section_2 = "https://example.com/n1234ab/2/";
         let image_url = "https://9496.mitemin.net/userpageimage/viewimage/icode/i83860/";
+        let next_image_url = "https://9496.mitemin.net/userpageimage/viewimage/icode/i83861/";
+        let second_body = r#"本文2<img src="//9496.mitemin.net/userpageimage/viewimagebig/icode/i83861/" />"#;
+        let second_page = format!(r#"<div class="body">{second_body}</div>"#);
         let http = Arc::new(MockHttpClient::new());
-        http.add_text(
-            target,
-            200,
-            r#"<h1>Resume Image Test</h1><span>Author</span>
+        let toc = r#"<h1>Resume Image Test</h1><span>Author</span>
 <a href="/n1234ab/1/">第一話</a>
-<a href="/n1234ab/2/">第二話</a>"#,
-        );
+<a href="/n1234ab/2/">第二話</a>"#;
+        http.add_text(target, 200, toc);
         http.add_text(
             section_1,
             200,
             r#"<div class="body">本文1<img src="//9496.mitemin.net/userpageimage/viewimagebig/icode/i83860/" /></div>"#,
         );
-        http.add_text(section_2, 200, r#"<div class="body">本文2</div>"#);
+        http.add_text(section_2, 200, second_page.as_str());
         let png = base64::engine::general_purpose::STANDARD
             .decode(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3Z5A0AAAAASUVORK5CYII=",
@@ -4771,7 +4778,7 @@ is_narou: false
             HttpResponse {
                 status: 200,
                 headers: vec![("Content-Type".into(), "image/png".into())],
-                body: png,
+                body: png.clone(),
             },
         );
 
@@ -4793,7 +4800,7 @@ is_narou: false
         .unwrap();
         let keys = NovelObjectKeys::new("Resume Image Test", "n1234ab", false).unwrap();
 
-        // 1 回目: 第 1 話 (挿絵つき) の保存直後に中断。索引はまだ書き戻されない。
+        // 第 1 話と挿絵を保存した後、第 2 話の直前で実行枠を使い切る。
         let mut budget = YieldBeforeSection(1);
         let partial = downloader
             .download_novel_with_execution_options(
@@ -4817,27 +4824,67 @@ is_narou: false
                 .is_some(),
             "第 1 話の挿絵は保存されている"
         );
-        assert!(
-            objects
-                .read_small(&keys.illustration_cache())
-                .await
-                .unwrap()
-                .is_none(),
-            "中断時点では索引は未保存"
-        );
 
-        // 2 回目: 第 2 話から再開。索引は中断前に走ったセクションを含めて書き戻す。
+        // 再開した実行枠でも挿絵を取り直すと、再び同じ位置で中断してしまう。
+        struct ImageFetchBudget(Arc<MockHttpClient>, &'static str);
+
+        impl SectionBudget for ImageFetchBudget {
+            fn should_yield(&mut self, _next_section_index: usize) -> bool {
+                self.0.requested_urls().iter().any(|url| url.ends_with(self.1))
+            }
+        }
+
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(target, 200, toc);
+        http.add_text(section_2, 200, second_page);
+        http.add_response(
+            image_url,
+            HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), "image/png".into())],
+                body: png.clone(),
+            },
+        );
+        let mut next_png = png;
+        next_png.push(0);
+        http.add_response(
+            next_image_url,
+            HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), "image/png".into())],
+                body: next_png,
+            },
+        );
+        downloader.http = http.clone();
+        downloader.section_cache = super::section::SectionCache::new();
+        let mut budget = ImageFetchBudget(http.clone(), image_url);
         downloader
             .download_novel_with_execution_options(
                 target,
                 DownloadExecutionOptions {
                     force: false,
-                    budget: None,
+                    budget: Some(&mut budget),
                     resume_from_section: Some(1),
                 },
             )
             .await
             .unwrap();
+        assert!(
+            !http.requested_urls().iter().any(|url| url.ends_with(image_url)),
+            "保存済み挿絵の再取得で再開後の実行枠を消費してはならない"
+        );
+        assert_eq!(
+            http.requested_urls().iter().filter(|url| url.ends_with(next_image_url)).count(),
+            1,
+            "再開後の新しい挿絵も本文と raw HTML の重複で取り直してはならない"
+        );
+        let saved = objects
+            .read_small(&keys.section("2", "第二話"))
+            .await
+            .unwrap()
+            .expect("再開後は次の話まで保存する");
+        let saved: super::types::SectionFile = serde_yaml::from_slice(&saved).unwrap();
+        assert_eq!(saved.element.body, second_body);
         let cache = objects
             .read_small(&keys.illustration_cache())
             .await
@@ -4845,7 +4892,6 @@ is_narou: false
             .expect("再開後は索引が保存される");
         let index: crate::illustration_store::IllustrationIndex =
             serde_yaml::from_slice(&cache).unwrap();
-        assert_eq!(index.source_count(), 1);
         assert_eq!(
             index.filename_for_source(
                 "//9496.mitemin.net/userpageimage/viewimagebig/icode/i83860/"

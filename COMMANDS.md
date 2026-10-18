@@ -170,6 +170,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 新規取得したセクションは解析済みの本文・前書き・後書きに加え、既定では raw HTML も `illust_grep_pattern` の検索対象にしてサイト固有マークアップ内の挿絵を先取り保存する。取得ページが空の本文枠と UI 画像だけの場合は、サイト定義の `illust_from_raw: false` で解析済み本文・前後書きだけに限定できる（アルファポリスで使用）。未更新セクションは従来どおり保存済み section のみを検索する
 - サイト定義に `illust_grep_pattern` が無いサイト (なろう / R18なろう / カクヨム / Arcadia) は narou.rb `HTML#initialize` の既定 `<img>` パターン (`downloader::DEFAULT_ILLUST_GREP_PATTERN`) で挿絵を先取り保存する。既定パターンでは URL でない注記 (相対パス) は対象外にし、挿絵 URL の protocol-relative (`//host/...`) は本文のスキームで解決し、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない (2026-10-08 修正)
 - 索引 (`.illustration_cache.yaml`) が知っている挿絵でも、`<prefix>/挿絵` の一覧に実体が無ければ取り直す (自己修復)。索引が空でないときだけ 1 小説 1 回一覧するので、通常の更新に余分な往復は付かない (2026-10-08 修正)
+- 保存に成功した挿絵は、その取得処理が保持する実体一覧にも直ちに反映する。同じ画像が抽出本文と取得直後の HTML に重複して現れても取り直さず、保存に失敗した画像を「実体あり」とは扱わない。Native / Worker の共通処理で、欠落画像の自己修復は維持する
 - ハーメルンのタグ抽出は `webnovel/syosetu.org.yaml` の詳細表・目次ページ両方のパターンで行い、短編ページのあらすじ・本文をタグとして取り込まない
 - Pixiv (`webnovel/www.pixiv.net.yaml`) は小説 / 小説シリーズ / イラスト・漫画 (`/artworks/A`) / 漫画シリーズ (`/user/U/series/S`) の 4 種を扱い、ncode は `n`/`s`/`a`/`c` + ID。イラストは 1 話・本文がページ画像のみ、漫画シリーズは各作品を 1 話とする連載。取得先 API は `toc_url` の `by_target` (ターゲット URL ごとのテンプレート) で切り替える
 - Pixiv (`webnovel/www.pixiv.net.yaml`) は `/ajax/*` の JSON を `preprocess:` DSL で中間テキスト化して取得する。単体作品 URL (`/novel/show.php?id=N`) は短編 (novel_type 2) として 1 話、シリーズ URL (`/novel/series/S`) は目次 30 話ずつの複数ページ取得で全話を登録する。シリーズの 1 話 URL はその話だけを単体作品として登録する
@@ -249,6 +250,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Ctrl+C 割り込み時はフラグを検知して `アップデートを中断しました` を表示し、終了コード126で終了
 - `--all` は Ruby版に存在しないRust独自オプションだったため削除
 - ログイン Cookie のフォールバックは `download` と共通の downloader 経路を通るため、保存済みの `login` 資格情報によるログイン壁/部分一覧の再取得は update でも動く
+- Worker の手動取得・手動更新・自動更新・中断後の再開は同じ Downloader / CookieStore / FetchPolicy を使う。公開作品には不要な Cookie を送らず、ログイン壁・部分一覧で保存ログインを試し、成功セッションを再利用する。年齢同意 `over18` と `download.interval` / `download.wait-steps` / サイトの `min_interval` も共通に適用し、自動更新だけで同意を許可したり間隔を短縮したりしない。`update.interval` は更新対象の作品開始間隔として追加適用する
 - 失敗した小説は downloader 側が「小説が削除されているか非公開な可能性があります」を出し、コマンド側は行を出さない (Ruby版と同じ)。この行がログに残るので、`n 件のエラーが発生しました` の内訳をログから追える (2026-10 修正、issue #36)
 
 **完了扱いにしない理由 / 不足動作**:
@@ -790,7 +792,7 @@ narou setting name         # 読み取り
 - Worker の `concurrency` はコンソール分離（既定 true）、`convert.keep-txt` は既定 false、`queue.max-retries` は配備上限 3 と表示・保存検証を一致させる。native 専用の `s3.*` は表示せず、ミラー・話キャッシュ・外部 EPUB エンジン等は無効化し、API からも変更を拒否する。
 - Worker の取得は `NAROU_JOBS`（最大 4）、変換は `CONVERT_QUEUE`（最大 1）に実行枠を分ける。取得枠が埋まっても別作品の変換を開始でき、同じ作品の取得・変換は共通 D1 台帳で排他する。実効 YAML のサイト単位では取得を 1 件に制限し、別ホスト表記・作者確認も同じサイトへ揃える。
 - Worker の排他待ちは待機として永続化して ACK し、失敗回数や provider retry を消費しない。完了・毎分 cron で同じ job ID を再投入し、旧レーンの envelope も正しい Queue へ転送する。作品の別 URL と ID は YAML 解決後の TOC URL で照合し、元の target と再開用 checkpoint は変更しない。
-- Worker の wall-clock / subrequest budget は話の境界で安全に区切る継続処理で、Web コンソールに自動再開を案内する。保存済み本文・次の話の位置を維持して同じ job ID で続行し、失敗回数は増やさない。
+- Worker の wall-clock / subrequest budget は話の境界で安全に区切る継続処理で、Web コンソールに自動再開を案内する。保存済み本文・挿絵索引・次の話の位置を維持して同じ job ID で続行し、失敗回数は増やさない。索引未保存の旧中断状態も、復元した索引を中断前に確定して同じ再取得を繰り返さない。
 - Worker の履歴取得・消去は PushHub の永続化履歴に接続し、再接続でも消去済みの行を復活させない。`webui.table.reload-timing` は実際の台帳の待機・実行数でテーブル更新を制御し、進捗・通知は抑止しない。
 - 設定保存は `webui.config.reload` を配信する。UI のテーブル・タグ更新は debounce / single-flight で合流し、古い応答を反映しない。Worker のキュー詳細は cursor で全ページを取得してから表示を交換する（既定 200 件／最大 1000 件、全体の待機・実行数を別に返す）。
 - 保存方式の読み取りが失敗した場合は不明／失敗として表示し、YAML と推定しない。Worker は D1 固定と表示し、切替操作を出さない。native の実際の方式切替だけが再起動を要求する。
