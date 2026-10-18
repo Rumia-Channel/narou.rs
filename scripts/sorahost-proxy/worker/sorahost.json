@@ -1,7 +1,0 @@
-{
-  "mode": "worker",
-  "framework": "worker",
-  "entry": "worker.mjs",
-  "include": ["worker.mjs", "protocol.mjs"],
-  "compatibilityDate": "2026-09-01"
-}

@@ -313,9 +313,9 @@ RELAY_JS="$SELF_DIR/server.mjs"
 if [ "${NAROU_RELAY:-0}" = "1" ]; then
   if [ ! -f "$RELAY_JS" ]; then
     echo "[narou] 警告: NAROU_RELAY=1 ですが $RELAY_JS がありません" >&2
-  elif [ -z "${SORAHOST_PROXY_KEY:-}" ]; then
-    echo "[narou] 警告: SORAHOST_PROXY_KEY が無いためリレーを起動しません" >&2
-    echo "[narou] (Worker 側の SORAHOST_PROXY_KEY と同じ値を .env に置いて下さい)" >&2
+  elif [ -z "${NAROU_RELAY_KEY:-}" ]; then
+    echo "[narou] 警告: NAROU_RELAY_KEY が無いためリレーを起動しません" >&2
+    echo "[narou] (Worker 側の NAROU_RELAY_KEY と同じ値を .env に置いて下さい)" >&2
   else
     node "$RELAY_JS" </dev/null &
     PIDS="$PIDS $!"

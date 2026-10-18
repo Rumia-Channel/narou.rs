@@ -729,8 +729,9 @@ D1 を選んだ可能性がある。raw TEXT `s3` は旧実装でも S3 を選�
 サマリも `skipped`)。401 / 503 / 到達不可は失敗させる。
 LIST は読取のみ・最大1件で、キーや資格情報、プロバイダー本文を応答やログに出さない。
 HTTP200でも正しい ListBucketResult の外側要素が無い応答は成功としない。
-この確認は GET/PUT 権限や既存データの移行完了を証明せず、SORAHOST の署名403解消も主張しない。
+この確認は GET/PUT 権限や既存データの移行完了を証明せず、署名403の解消も主張しない。
 
-`SORAHOST=T` の通常 push は従来通り Workers を配備しない。明示的な
-`workflow_dispatch` で `run_workers=true` を選んだときだけ、wasm/Worker/contract/relay と
-選択した target の配備を実行する。入力の既定は false で、変数・資格情報・権限は変更しない。
+CI の手動配備では `target=develop|production` を選ぶ。ホスティング先による
+Workers 検証の切り替えやリレー自動配備の待ち合わせは行わず、通常のアプリ検証を配備の前提にする。
+外部リレーは任意の `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` を Worker に渡し、
+別途配置・更新する（[リレーの契約と配置](platform-abstraction.md)）。

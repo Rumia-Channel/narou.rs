@@ -324,7 +324,7 @@ class ProbeTests(unittest.TestCase):
 
 
 class DomainFallbackTests(unittest.TestCase):
-    """SORAHOST と Workers のホスト名の取り合い (Cloudflare error 100117)。"""
+    """既存 DNS レコードとの競合時の route 切替 (Cloudflare error 100117)。"""
 
     def setUp(self):
         self.env = patch.dict(os.environ, ENV, clear=True)
@@ -349,18 +349,6 @@ class DomainFallbackTests(unittest.TestCase):
         render.assert_called_once()
         self.assertEqual(os.environ.get("NAROU_DOMAIN_MODE"), "route")
 
-    def test_sorahost_keeps_the_hostname_while_it_is_the_target(self):
-        os.environ["NAROU_SORAHOST"] = "T"
-        with patch.object(
-            deploy, "run_deploy", return_value=(1, "externally managed DNS records")
-        ) as run_deploy, patch.object(deploy, "render") as render, \
-                contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                deploy.deploy(None, "production", {"database_name": "narou-rs"})
-        self.assertEqual(run_deploy.call_count, 1, "SORAHOST が配備先なら奪わない")
-        render.assert_not_called()
-        self.assertNotIn("NAROU_DOMAIN_MODE", os.environ)
-
 
 class RenderTests(unittest.TestCase):
     def render_template(self, template, target="develop", extra_env=None):
@@ -378,7 +366,7 @@ class RenderTests(unittest.TestCase):
             self.render_template('[vars]\nS3_BUCKET = "__S3_BUCKET__"\n')
 
     def test_route_mode_keeps_the_existing_hostname_record(self):
-        # SORAHOST のコネクタが持つ DNS レコードを消さずに Workers を載せる形。
+        # 既存のフロントエンドが持つ DNS レコードを消さずに Workers を載せる形。
         # route ブロックを差し込むプレースホルダは実テンプレートにあるので、
         # 本番テンプレートをそのまま使う。
         rendered = self.render_template(

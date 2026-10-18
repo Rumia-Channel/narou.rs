@@ -1,7 +1,7 @@
-name: Linux build (SORAHOST)
+name: Linux build
 
-# SORAHOST へ置く Linux バイナリを作る。ビルドは GitHub ホストの runner で行い、
-# 生成物は artifact として落とせる (SORAHOST 側ではバイナリを置いて再起動するだけ)。
+# Linux サーバー向けバイナリを GitHub ホストの runner で作る。
+# 生成物は配置先に依存しない artifact として取得できる。
 #
 # なぜ self-hosted runner を使わないか:
 #   - このリポジトリは public で、`platform.yml` に pull_request トリガがある。
@@ -18,12 +18,6 @@ on:
     tags:
       - "v*"
       - "[0-9]*"
-  # deploy-sorahost.yml から呼ぶ (同じ run の artifact をそのまま配備に使う)
-  workflow_call:
-    outputs:
-      bundle:
-        description: "作った tar.gz のファイル名"
-        value: ${{ jobs.build.outputs.bundle }}
 
 permissions:
   contents: read
@@ -32,8 +26,6 @@ jobs:
   build:
     name: narou_rs (linux x86_64, lite/GPL)
     runs-on: ubuntu-22.04
-    outputs:
-      bundle: ${{ steps.package.outputs.bundle }}
     steps:
       - uses: actions/checkout@v5
 
@@ -49,7 +41,6 @@ jobs:
             --bin narou_rs --bin narou_rs_backup --bin narou_rs_login
 
       - name: Assemble the bundle
-        id: package
         run: |
           set -eu
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -62,7 +53,7 @@ jobs:
           cp preset/AozoraEpub3.ini preset/custom_chuki_tag.txt "$dir/preset/"
           cp Third-Party-License.md "$dir/"
           cat > "$dir/README.txt" <<'EOF'
-          SORAHOST 用バンドル (Linux x86_64 / 組み込み EPUB エンジン入り = GPL-3.0-only)。
+          Linux サーバー用バンドル (x86_64 / 組み込み EPUB エンジン入り = GPL-3.0-only)。
 
             narou_rs         本体 (CLI + Web UI)
             narou_rs_backup  バックアップ用ヘルパー
@@ -70,12 +61,11 @@ jobs:
             webnovel/        同梱のサイト定義 (実行ファイルの隣に置くこと)
             preset/          外部 AozoraEpub3 を使う場合の雛形 (組み込みエンジンでは不要)
 
-          配置と起動は sorahost/README.md を参照。
+          初回はライブラリ用のフォルダで narou_rs init、その後 narou_rs web を実行。
           glibc 2.35 (Ubuntu 22.04 / Debian 12) 以降が必要。
           EOF
           tar czf "${dir}.tar.gz" "$dir"
           sha256sum "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
-          echo "bundle=${dir}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:

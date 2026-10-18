@@ -40,8 +40,8 @@ pub struct WorkerHttpClient {
     /// 送信する User-Agent。native の `NativeHttpClient` と同じ役割で、
     /// リクエストが自前の UA を持たないときだけ付ける (サイト別の UA を尊重)。
     user_agent: String,
-    /// 踏み台 (SORAHOST リレー) の接続先と認証トークン。
-    /// `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY` が揃ったときだけ Some。
+    /// 外部リレーの接続先と認証トークン。
+    /// `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` が揃ったときだけ Some。
     relay: Option<RelayConfig>,
 }
 
@@ -85,7 +85,7 @@ impl WorkerHttpClient {
         self
     }
 
-    /// SORAHOST リレー経由の取得段を有効にする。
+    /// 外部リレー経由の取得段を有効にする。
     ///
     /// `base_url` は `http://<IP>:<port>` 形式。スキームが無い値
     /// (`<IP>:<port>` だけの環境変数) は `http://` を補う。末尾の `/` の有無は

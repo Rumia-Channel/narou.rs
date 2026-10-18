@@ -15,19 +15,10 @@ on:
         type: choice
         options: [develop, production]
         default: develop
-      run_workers:
-        description: Run Workers checks and selected deployment even when SORAHOST is enabled
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
-# Worker 系 (wasm / worker / worker-contract / relay-deploy / worker-deploy-*) は
-# Repository variable `SORAHOST` が `T` のとき全部止める。配備先が SORAHOST 側へ
-# 移っている間は通常 Cloudflare Workers を触らない (`deploy-sorahost.yml` が動く)。
-# 手動実行で run_workers=true を明示した場合のみ、選択した Workers 配備を許可する。
-# native / native-gpl / license は配備先に依存しないので常に走る。
 
 env:
   # worker-build のピン。キャッシュのキーにも使う。
@@ -86,7 +77,6 @@ jobs:
 
   wasm:
     name: Portable wasm check
-    if: (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -99,7 +89,6 @@ jobs:
 
   worker:
     name: Worker release artifact
-    if: (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -121,7 +110,6 @@ jobs:
 
   worker-contract:
     name: Worker contract tests (local workerd)
-    if: (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -134,7 +122,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v5
         with:
-          node-version: "22"
+          node-version: "24"
       - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
       # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
       # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
@@ -145,6 +133,8 @@ jobs:
       # CI のレンダリング契約 (Secrets Store の組み合わせ検証) もここで確認する。
       # 認証情報・ネットワーク不要の unittest だけを走らせる。
       - run: python3 -m unittest discover -s tests -p 'test_ci_*.py'
+      - name: HTTP relay contracts (Node/curl and workerd)
+        run: node ../tests/run-relay.mjs
       # tests/run.mjs builds, applies the local D1 migrations, starts
       # `wrangler dev` and runs the contract checks (health, fail-closed auth,
       # library/jobs APIs, and a queue-backed Convert job reaching a terminal
@@ -179,12 +169,10 @@ jobs:
   worker-deploy-develop:
     name: Deploy Worker (develop)
     if: >-
-      (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
-      && ((github.event_name == 'push' && github.ref == 'refs/heads/develop')
-      || (github.event_name == 'workflow_dispatch' && inputs.target == 'develop'))
-    # リレーを先に配布する。Worker はリレー経由でしか取得できないサイトがあるため、
-    # リレーの配布が失敗したら Worker もデプロイしない (壊れた組み合わせを出さない)。
-    needs: [native, native-gpl, wasm, worker, worker-contract, license, relay-deploy]
+      (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+      || (github.event_name == 'workflow_dispatch' && inputs.target == 'develop')
+    # 外部リレーの配置・更新は本体の検証と配備から独立して管理する。
+    needs: [native, native-gpl, wasm, worker, worker-contract, license]
     runs-on: ubuntu-latest
     concurrency:
       group: narou-worker-develop
@@ -202,16 +190,12 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NAROU_DEPLOY_TARGET: develop
-      # 配備先が SORAHOST (T) か Workers (F) か。ドメインの取り合いでは、動いて
-      # いる側がホスト名を持つ: T の間は Workers のジョブ自体が止まり、F の
-      # ときだけ既存の DNS レコードを route として受け取る。
-      NAROU_SORAHOST: ${{ vars.SORAHOST }}
       # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
       DEVELOP_DOMAIN: ${{ secrets.DEVELOP_DOMAIN || vars.DEVELOP_DOMAIN }}
       NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
       NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
-      SORAHOST_PROXY_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
-      SORAHOST_PROXY_KEY: ${{ secrets.SORAHOST_PROXY_KEY }}
+      NAROU_RELAY_ENDPOINT: ${{ secrets.NAROU_RELAY_ENDPOINT }}
+      NAROU_RELAY_KEY: ${{ secrets.NAROU_RELAY_KEY }}
       NAROU_S3_ACCESS_KEY_ID: ${{ secrets.NAROU_S3_ACCESS_KEY_ID }}
       NAROU_S3_SECRET_ACCESS_KEY: ${{ secrets.NAROU_S3_SECRET_ACCESS_KEY }}
       NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
@@ -275,107 +259,12 @@ jobs:
         if: steps.credentials.outputs.configured == 'true'
 
 
-  # SORAHOST の取得リレーを配布する。Worker は同じリレーへ
-  # `X-Proxy-Token: <SORAHOST_PROXY_KEY>` を付けて `POST /proxy` する (403 なら
-  # Worker は元の fetch 結果へ黙って戻るため、合言葉のずれはサイト不取得として現れる)。
-  # 使う資格情報は 3 つで、いずれも Cloudflare environment に置く:
-  #   SORAHOST_PROXY_ENDPOINT … リレーの公開先 (Worker の接続先 / CLI のエンドポイント)
-  #   SORAHOST_PROXY_TOKEN    … sorahost-cli のデプロイトークン (`Authorization: Bearer`)
-  #   SORAHOST_PROXY_KEY      … リレーの合言葉 (コンテナの .env と一致するかを配備後に確認する)
-  # PteWorker のコンテナに curl が無いため静的 curl と CA バンドルを同梱する。
-  relay-deploy:
-    name: Deploy SORAHOST relay
-    if: >-
-      (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
-      && ((github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
-      || (github.event_name == 'workflow_dispatch' && (inputs.target == 'develop' || inputs.target == 'production')))
-    needs: [native, native-gpl, wasm, worker, worker-contract, license]
-    runs-on: ubuntu-latest
-    concurrency:
-      # リレーは PteWorker 1 台を共有するので、develop / production で排他する
-      group: narou-relay
-      cancel-in-progress: false
-    environment:
-      name: Cloudflare
-    steps:
-      - uses: actions/checkout@v5
-
-      # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
-      # `--yes` で走らせるので、無いまま実行すると CLI 側が認証情報不足で落ちる。
-      - name: Check the relay credentials
-        id: credentials
-        env:
-          SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
-          SORAHOST_TOKEN: ${{ secrets.SORAHOST_PROXY_TOKEN }}
-        run: |
-          if [ -z "$SORAHOST_ENDPOINT" ] || [ -z "$SORAHOST_TOKEN" ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::SORAHOST_PROXY_ENDPOINT / SORAHOST_PROXY_TOKEN が未設定のためリレーの配布を省略します"
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Fetch the verified static curl
-        if: steps.credentials.outputs.configured == 'true'
-        run: |
-          mkdir -p build
-          curl_tag="$(python3 -c 'import json; print(json.load(open("scripts/deploy-tools.json"))["curl_version"])')"
-          base="https://github.com/moparisthebest/static-curl/releases/download/$curl_tag"
-          curl -fsSL -o build/curl "$base/curl-amd64"
-          curl -fsSL -o sha256sum.txt "$base/sha256sum.txt"
-          (cd build && grep 'curl-amd64' ../sha256sum.txt | sed 's|\./curl-amd64|curl|' | sha256sum -c -)
-          chmod +x build/curl
-          file build/curl
-      - name: Assemble the deploy bundle
-        if: steps.credentials.outputs.configured == 'true'
-        env:
-          # 同じ SORAHOST で narou 本体も動かす場合 (任意) は `bash start.sh` を
-          # Repository variable `SORAHOST_RELAY_START` に入れる。そのときリレーは
-          # narou 側の start.sh が `NAROU_RELAY=1` のときだけ起動する
-          # (1 プロジェクトに置ける起動コマンドは 1 つ。sorahost/README.md §10)。
-          RELAY_START: ${{ vars.SORAHOST_RELAY_START }}
-        run: |
-          cp /etc/ssl/certs/ca-certificates.crt build/cacert.pem
-          cp scripts/sorahost-proxy/server.mjs build/server.mjs
-          mkdir -p build/worker
-          cp scripts/sorahost-proxy/worker/protocol.mjs build/worker/protocol.mjs
-          chmod +x build/curl
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          manifest = json.loads(Path("scripts/sorahost-proxy/sorahost.json").read_text())
-          if os.environ.get("RELAY_START"):
-              manifest["start"] = os.environ["RELAY_START"]
-          Path("build/sorahost.json").write_text(json.dumps(manifest, indent=2) + "\n")
-          PY
-          ls -la build
-      - name: Deploy to SORAHOST
-        if: steps.credentials.outputs.configured == 'true'
-        env:
-          SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
-          SORAHOST_TOKEN: ${{ secrets.SORAHOST_PROXY_TOKEN }}
-        run: |
-          cd build
-          # --json は HTTP エラーの detail を省くため、通常表示で応答を残す。
-          NODE_OPTIONS="--require=$GITHUB_WORKSPACE/scripts/sorahost-proxy/trace-upload.cjs ${NODE_OPTIONS:-}" npx --yes sorahost-cli deploy --yes --no-color
-
-      # 配備したリレーが Worker 側の合言葉を受け付けるかを実際に叩いて確かめる。
-      # 合言葉がずれていると Worker からは 403 になり、取得できないサイトが黙って増える。
-      - name: Verify the relay authentication
-        if: steps.credentials.outputs.configured == 'true'
-        env:
-          SORAHOST_PROXY_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
-          SORAHOST_PROXY_KEY: ${{ secrets.SORAHOST_PROXY_KEY }}
-        run: python3 scripts/sorahost-proxy/verify_auth.py
-
   worker-deploy-production:
     name: Deploy Worker (production)
     if: >-
-      (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
-      && ((github.event_name == 'push' && github.ref_type == 'tag')
-      || (github.event_name == 'workflow_dispatch' && inputs.target == 'production'))
-    needs: [native, native-gpl, wasm, worker, worker-contract, license, relay-deploy]
+      (github.event_name == 'push' && github.ref_type == 'tag')
+      || (github.event_name == 'workflow_dispatch' && inputs.target == 'production')
+    needs: [native, native-gpl, wasm, worker, worker-contract, license]
     runs-on: ubuntu-latest
     concurrency:
       group: narou-worker-production
@@ -393,14 +282,12 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NAROU_DEPLOY_TARGET: production
-      # 配備先が SORAHOST (T) か Workers (F) か (develop と同じ規則)。
-      NAROU_SORAHOST: ${{ vars.SORAHOST }}
       # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
       SERVICE_DOMAIN: ${{ secrets.SERVICE_DOMAIN || vars.SERVICE_DOMAIN }}
       NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
       NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
-      SORAHOST_PROXY_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
-      SORAHOST_PROXY_KEY: ${{ secrets.SORAHOST_PROXY_KEY }}
+      NAROU_RELAY_ENDPOINT: ${{ secrets.NAROU_RELAY_ENDPOINT }}
+      NAROU_RELAY_KEY: ${{ secrets.NAROU_RELAY_KEY }}
       NAROU_S3_ACCESS_KEY_ID: ${{ secrets.NAROU_S3_ACCESS_KEY_ID }}
       NAROU_S3_SECRET_ACCESS_KEY: ${{ secrets.NAROU_S3_SECRET_ACCESS_KEY }}
       NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}

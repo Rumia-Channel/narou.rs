@@ -13,8 +13,7 @@ on:
 permissions:
   contents: read
 
-# These checks never deploy. Keep them active even when SORAHOST disables the
-# deployment-oriented Worker jobs in platform.yml.
+# These checks validate UI behavior without requiring deployment credentials.
 jobs:
   sql-and-probe:
     runs-on: ubuntu-latest
