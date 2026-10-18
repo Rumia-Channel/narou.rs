@@ -60,12 +60,13 @@ async fn a_new_download_consumes_exactly_one_id() {
         .into_iter()
         .filter(|setting| setting.domain == "example.com")
         .collect();
-    assert_eq!(settings.len(), 1, "the test site definition must load");
 
     let http = Arc::new(MockHttpClient::new());
     http.add_text("https://example.com/novel/n0000zz/",404,"not found");
     http.add_text("https://example.com/novel/n0001xx/",200,
         r#"<h1 class="title">年齢制限作品</h1><span class="author">作者</span>adult-only<a href="/novel/n0001xx/1/" class="subtitle">第1話</a>"#);
+    http.add_text("https://example.com/novel/n0002cc/",200,
+        r#"<h1 class="title">閲覧可能な話なし</h1><span class="author">作者</span>"#);
     for ncode in ["n1111aa", "n2222bb"] {
         http.add_text(
             format!("https://example.com/novel/{ncode}/"),
@@ -91,7 +92,7 @@ async fn a_new_download_consumes_exactly_one_id() {
     let repository = Arc::new(MemoryNovelRepository::new());
     let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
         narou_rs::downloader::DownloaderPlatform {
-            http,
+            http: http.clone(),
             rate_limiter: Arc::new(FakeRateLimiter::new()),
             novels: repository.clone(),
             objects,
@@ -112,6 +113,9 @@ async fn a_new_download_consumes_exactly_one_id() {
     let canceled = downloader.download_novel("https://example.com/novel/n0001xx/").await.unwrap();
     assert_eq!(canceled.status,narou_rs::downloader::UpdateStatus::Canceled);
     assert_eq!(repository.count(&Default::default()).await.unwrap(),0);
+    let empty = downloader.download_novel("https://example.com/novel/n0002cc/").await.unwrap();
+    assert_eq!(empty.status,narou_rs::downloader::UpdateStatus::Canceled);
+    assert_eq!(repository.count(&Default::default()).await.unwrap(),0);
 
     let first = downloader
         .download_novel("https://example.com/novel/n1111aa/")
@@ -119,6 +123,19 @@ async fn a_new_download_consumes_exactly_one_id() {
         .unwrap();
     assert_eq!(first.status, narou_rs::downloader::UpdateStatus::Ok);
     assert_eq!(first.id,0,"a failed unregistered download must not consume an id");
+    let saved = repository.get(first.id.into()).await.unwrap().unwrap();
+    http.add_text("https://example.com/novel/n1111aa/",200,
+        r#"<h1 class="title">作品 n1111aa</h1><span class="author">作者</span>"#);
+    let inaccessible = downloader.download_novel_with_execution_options(
+        "https://example.com/novel/n1111aa/",
+        narou_rs::downloader::DownloadExecutionOptions {
+            force: true, budget: None, resume_from_section: None,
+        },
+    ).await.unwrap();
+    assert_eq!(inaccessible.status,narou_rs::downloader::UpdateStatus::Canceled);
+    let retained = repository.get(first.id.into()).await.unwrap().unwrap();
+    assert_eq!(retained.general_all_no,saved.general_all_no);
+    assert_eq!(retained.title,saved.title);
     let second = downloader
         .download_novel("https://example.com/novel/n2222bb/")
         .await

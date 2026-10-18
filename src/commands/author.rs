@@ -353,10 +353,6 @@ mod tests {
             setting.author_series_episodes_fetch_url(&captures, "272850"),
             Some("https://www.pixiv.net/ajax/novel/series/272850/content_titles".to_string())
         );
-        assert_eq!(
-            setting.author_series_episode_ids(r#"{"body":[{"id":"2594847","title":"x"}]}"#),
-            vec!["2594847"]
-        );
     }
 
     #[test]

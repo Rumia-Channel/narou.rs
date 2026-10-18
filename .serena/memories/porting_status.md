@@ -21,6 +21,18 @@ Web実ブラウザ: native並列2本の独立進捗、Worker TOC+8話の進捗�
 0.4.11 最終監査で確認したデータ保全の修正: SQLite のインプレース YAML 書き出しは meta の export_file_sha 指紋を原子的なファイル保存より前に記録し、失敗後の未編集の書き出し残骸を再取り込みしない。管理状態だけでなく database.yaml の作品レコードも対象。ユーザーの編集と narou-compat のファイル優先は維持する。S3 COPY は完全な CopyObjectResult と ETag/LastModified を確認できた場合だけ成功し、200 内 Error・破損応答では元オブジェクトを削除しない。実 HTTP の失敗／成功ケースと、書き出し失敗後の正常保存→再オープンを smoke で確認済み。
 指紋は既存の未編集 projection と次回公開予定を最大2件保持し、2回目が公開前に中断しても保護を失わない。指紋更新と公開は同一ファイルロック内。--out が実 .narou を指す場合も対象。最終 workspace 全 target は1342成功/0失敗/1ignored、Clippy 全 feature -D warnings・Rustdoc -D warnings・core/Worker wasm check 成功。Web CSRF 回帰 fixture は並行CWD変更に影響されない絶対パスへ修正し、HTTPの拒否/許可とキュー状態の検証内容は維持した。
 
+## 未リリース: Pixiv の閲覧範囲・作者列挙と通常エラーの再開（2026-10-18）
+
+- Pixiv YAML を 1.5 に更新。isMasked / viewableType・明示的な閲覧制限・許可した作品404を区別し、一覧途中で落ちた話も page.total / seriesContents から検出する。候補ログインごとに最初の目次から取り直し、閲覧可能分だけ取得する。公開うごイラの original:null と Cookie の存在だけでは閲覧可否を断定しない。HTTP403は非公開扱いせず元の取得エラーにする。
+- 保存ログイン後も0話なら Canceled とし、新規レコード・本文更新・自動変換を行わずID予約を戻す。Pixiv の preserve_missing_sections:true は非空の可視一覧と、話番号/URLが一致する旧本文を統合する。旧本文・TOCの読み取り失敗や曖昧な対応は成功にしない。forceでも権限を失った保存済み本文を消さない。
+- 必須 fetch_json_required(url,[404]) と任意 fetch_json を分離。同じ資格情報/ヘッダの1小説内で最大256件FIFOを保持し、成功時の元JSONテキスト・値・失敗情報を1エントリに束ねる。本文再利用でキー順や空白を変えず、匿名/A/Bを跨いで共有しない。失敗はArcで保持し、Sharedエラーも元の失敗分類へ委譲する。NativeもHTTP数値状態を失わず既存transport fallbackを維持する。
+- 作者の所属除外は author_series_episode_work_url / author_comic_series_page_work_url またはURL captureを使い、URL完全一致へ切替。数値IDが同じ別種の小説・イラスト・親シリーズを消す url_mentions_id は削除した。作者確認成功は列挙/子ジョブ投入完了であり、子の取得失敗/再開とは別。
+- WorkerBudget は全ての話境界を記憶し、通常のretryableエラーでも100話未満から最終位置をawait保存する。旧周期書込みを回収してtoken fenceを維持し、破損再開の0位置も同じ実行文脈へ渡す。Downloaderは通常エラーでもdirty挿絵索引を保存する。失敗回数・backoff・上限は従来どおり。
+- 転送先で元サイトの設定Cookieを混ぜる経路も修正。別サイトは転送先の同意/保存ログインだけを使い、レコードの古いrequires_login/sessionも消す。同一サイトの選択済みログインは保持する。
+- 検証: Native workspace + Lite の lib/bin/integration は1399成功/参照fixture1ignored。Native全target/allfeatureとWorker wasmのClippy -D warnings、標準release Wasm + wasm-optが成功。追加のNative transport回帰29件も成功した。
+- 実release WasmをWorkerd/隔離D1・DO・制御HTTP/S3 fixtureで実行。全話不可の見送り/ID再利用/自動変換なし、匿名公開分2話→権限付き3話、権限喪失後の旧S3本文保持とEPUBを確認。5話目の403でcursor4と画像4件を保存し、実1秒backoff前の配送を止め、期限後のrunningを観測、既存4話/画像を取り直さず5話を完了した。作者親成功→子retryable→子成功、実scheduled2回の新作追加と既知URL除外まで完走。最終5作品、本文・挿絵ともS3。実MyPixivアカウント権限やCloudflare本番を変更/検証した結果ではない。
+- 本番は読み取りのみ。報告403の応答本文/headersは未保存で原因断定不可。API142766131の現在値はrestrict0/xRestrict1でR18、MyPixiv限定の証拠ではない。該当retryは5分期限後約1.4秒でrunningへ戻ったため、UI不具合を直したとは扱わない。版数はGitHub公開v0.4.13基準の未リリースのまま。CI監視・本番デプロイ/設定変更/ジョブ操作は行わない。
+
 ## 未リリース: Web コンソールの高さ調整と高解像度表示
 
 - 共有 frontend に `console_size.js` を追加。左右ペイン共通の高さを下端ハンドルの Pointer Events と上下キーで変え、vh 単位で既存 localStorage helper に保存する。「表示」の専用リセットと全表示設定リセットは拡大状態も解除するが、ログ・進捗 DOM・過去ログの読書位置を保持する。キャンセル・blur・capture 解放を処理し、CSS から計算した範囲へ制限する。

@@ -782,6 +782,7 @@ pub enum JobFailureClass {
 /// (`Permanent`), never silently retried to success.
 pub fn classify_failure(error: &NarouError) -> JobFailureClass {
     match error {
+        NarouError::Shared(error) => classify_failure(error),
         NarouError::Http(_)
         | NarouError::Io(_)
         | NarouError::Platform(_)

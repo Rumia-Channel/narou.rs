@@ -26,7 +26,7 @@ use super::http_policy::{FetchPolicy, fetch_text};
 use super::preprocess::PreprocessJobs;
 use super::site_setting::SiteSetting;
 use super::util::{PretreatmentRequest, pretreatment_source_with_jobs};
-use super::{apply_login_cookie, url_mentions_id};
+use super::apply_login_cookie;
 
 /// One author page as read from the site definitions.
 pub(crate) struct AuthorListing<'a> {
@@ -294,7 +294,7 @@ impl<'a> AuthorListing<'a> {
         }
         let captures = setting.extract_author_url_captures(page_url).unwrap_or_default();
         let policy = FetchPolicy::for_site(setting);
-        let mut inside: Vec<String> = Vec::new();
+        let mut inside: HashSet<String> = HashSet::new();
         if !series.is_empty() && setting.author_series_episodes_url.is_some() {
             inside.extend(
                 self.series_episodes(setting, &captures, &policy, series)
@@ -307,12 +307,10 @@ impl<'a> AuthorListing<'a> {
                     .await,
             );
         }
-        if !inside.is_empty() {
-            urls.retain(|url| !inside.iter().any(|id| url_mentions_id(url, id)));
-        }
+        urls.retain(|url| !inside.contains(url));
     }
 
-    /// Episode ids of the given series, fetched through the definition.
+    /// Full episode URLs of the given series, fetched through the definition.
     async fn series_episodes(
         &self,
         setting: &SiteSetting,
@@ -336,17 +334,17 @@ impl<'a> AuthorListing<'a> {
             else {
                 continue;
             };
-            for id in setting.author_series_episode_ids(&body) {
-                if !episodes.contains(&id) {
-                    episodes.push(id);
+            for episode_url in setting.author_series_episode_urls(&body) {
+                if !episodes.contains(&episode_url) {
+                    episodes.push(episode_url);
                 }
             }
         }
         episodes
     }
 
-    /// Artwork ids of the given comic series, page by page (Pixiv pages them
-    /// in batches of 12) until a page adds nothing.
+    /// Full artwork URLs of the given comic series, page by page (Pixiv pages
+    /// them in batches of 12) until a page adds nothing.
     async fn comic_series_pages(
         &self,
         setting: &SiteSetting,
@@ -377,14 +375,14 @@ impl<'a> AuthorListing<'a> {
                 else {
                     break;
                 };
-                let ids = setting.author_comic_series_page_ids(&body);
-                if ids.is_empty() {
+                let work_urls = setting.author_comic_series_page_urls(&body);
+                if work_urls.is_empty() {
                     break;
                 }
                 let before = pages.len();
-                for id in ids {
-                    if !pages.contains(&id) {
-                        pages.push(id);
+                for work_url in work_urls {
+                    if !pages.contains(&work_url) {
+                        pages.push(work_url);
                     }
                 }
                 if pages.len() == before {
@@ -885,6 +883,37 @@ toc_url: https://paged-total.example/book/\k<ncode>
             "漫画シリーズ自身は作品、各ページは一覧から除かれる: {urls:?}"
         );
         assert_eq!(http.request_count(), 1 + PAGES + 1);
+    }
+
+    #[test]
+    fn series_exclusion_keeps_other_work_types_with_the_same_id() {
+        let setting = load("www.pixiv.net");
+        let page = "https://www.pixiv.net/users/6519870";
+        let http = MockHttpClient::new();
+        http.add_text(
+            setting.author_fetch_url(page), 200,
+            r#"{"error":false,"body":{"novels":{"42":{},"55":{}},"novelSeries":[{"id":"10"},{"id":"42"}],"mangaSeries":[{"id":"20"}],"illusts":{"42":{},"55":{}},"manga":[]}}"#,
+        );
+        http.add_text(
+            "https://www.pixiv.net/ajax/novel/series/10/content_titles", 200,
+            r#"{"error":false,"body":[{"id":"42"}]}"#,
+        );
+        http.add_text(
+            "https://www.pixiv.net/ajax/series/20?p=1&lang=ja", 200,
+            r#"{"error":false,"body":{"page":{"series":[{"workId":"55","order":1}]}}}"#,
+        );
+        http.add_text(
+            "https://www.pixiv.net/ajax/series/20?p=2&lang=ja", 200,
+            r#"{"error":false,"body":{"page":{"series":[]}}}"#,
+        );
+        let urls = works(&http, &FakeRateLimiter::new(), &setting, page).unwrap();
+        assert_eq!(urls, vec![
+            "https://www.pixiv.net/novel/show.php?id=55",
+            "https://www.pixiv.net/novel/series/10",
+            "https://www.pixiv.net/novel/series/42",
+            "https://www.pixiv.net/ajax/series/20",
+            "https://www.pixiv.net/artworks/42",
+        ]);
     }
 
     #[test]
