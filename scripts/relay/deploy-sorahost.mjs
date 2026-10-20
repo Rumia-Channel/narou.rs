@@ -19,7 +19,6 @@
 // 行い、成功したときだけ切り替えるので、途中で失敗しても前の環境は壊れない。
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
   chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
@@ -27,67 +26,20 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import { downloadUrl, fetchCacert, fetchCurl, readCurlPins, sha256 } from "./fetch-curl.mjs";
 
 const relayDir = dirname(fileURLToPath(import.meta.url));
 export const repoRootDefault = resolve(relayDir, "..", "..");
 
 export const RUNTIME_MANIFEST = "runtime.json";
-export const CURL_ASSET = "curl-amd64";
 export const RUNTIME_SOURCES = ["server.mjs", "env.mjs", "security.mjs", "transport.mjs", "worker/protocol.mjs"];
 const SORAHOST_MANIFEST = "sorahost.json";
 
-const sha256 = (buffer) => createHash("sha256").update(buffer).digest("hex");
 const fileSha256 = (path) => sha256(readFileSync(path));
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 
-const downloadUrl = async (url) => {
-  const response = await fetch(url, { redirect: "follow" });
-  if (!response.ok) throw new Error(`${url} (HTTP ${response.status})`);
-  return Buffer.from(await response.arrayBuffer());
-};
-
-export const readPins = (repoRoot = repoRootDefault) => {
-  const toolsFile = join(repoRoot, "scripts", "deploy-tools.json");
-  let tools;
-  try {
-    tools = readJson(toolsFile);
-  } catch {
-    throw new Error(`${toolsFile} を読めません`);
-  }
-  const version = String(tools.curl_version || "").trim();
-  const hash = String(tools.curl_sha256 || "").trim().toLowerCase();
-  if (!version) throw new Error(`${toolsFile} に curl_version がありません`);
-  if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error(`${toolsFile} に curl_sha256 がありません`);
-  return { version, sha256: hash };
-};
-
-// 公開されている sha256sum.txt の行 (`<hash>  ./curl-amd64`) を読む。
-const publishedChecksum = (text, asset) => {
-  for (const line of String(text).split(/\r?\n/)) {
-    const [hash, name] = line.trim().split(/\s+/);
-    if (!hash || !name) continue;
-    if (name.replace(/^\.\//, "").replace(/^\*/, "") === asset) return hash.toLowerCase();
-  }
-  return "";
-};
-
-const fetchCurl = async ({ pins, download }) => {
-  const base = `https://github.com/moparisthebest/static-curl/releases/download/${pins.version}`;
-  const [asset, sums] = await Promise.all([download(`${base}/${CURL_ASSET}`), download(`${base}/sha256sum.txt`)]);
-  const published = publishedChecksum(String(sums), CURL_ASSET);
-  if (published !== pins.sha256) {
-    throw new Error(`静的 curl の公開ハッシュがピンと一致しません (公開 ${published || "不明"} / ピン ${pins.sha256})`);
-  }
-  const actual = sha256(asset);
-  if (actual !== pins.sha256) throw new Error(`静的 curl のハッシュが一致しません (期待 ${pins.sha256} / 実際 ${actual})`);
-  return asset;
-};
-
-const fetchCacert = async ({ download }) => {
-  const buffer = await download("https://curl.se/ca/cacert.pem");
-  if (!buffer.includes("BEGIN CERTIFICATE")) throw new Error("CA バンドルの内容が不正です");
-  return buffer;
-};
+// ピンは scripts/relay/pins.json (Cloud Run のビルド文脈に含めるため relay 配下)。
+export const readPins = (repoRoot = repoRootDefault) => readCurlPins(join(repoRoot, "scripts", "relay"));
 
 const readRuntimeManifest = (directory) => {
   try {
