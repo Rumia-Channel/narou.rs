@@ -124,14 +124,28 @@ impl WorkerHttpClient {
                 socket_exchange(&target, HttpMethod::Get, headers, None, deadline_ms, MAX_WORKER_HTTP_BODY).await
             }
             HopExchange::Relay(relay) => {
-                let relay_request =
+                let mut relay_request =
                     RelayRequest::new(&relay.base_url, &relay.token, url, headers)?.into_request();
-                let target = SocketTarget::parse(&relay_request.url)?;
-                let wire_response = socket_exchange(
-                    &target, relay_request.method, &relay_request.headers,
-                    relay_request.body.as_deref().map(Vec::as_slice),
-                    deadline_ms, response_wire_limit(MAX_WORKER_HTTP_BODY),
-                ).await?;
+                // Cloudflare の同一ゾーン（Worker の custom domain と同じ
+                // `rumia-ch.uk`）へ生ソケットで送ると、エッジ側でリクエストが
+                // 中継されずリレーのログにも残らないことがある。リレー呼び出しは
+                // 通常の fetch サブリクエストにし、UA も明示する。
+                if relay_request.header("User-Agent").is_none() {
+                    let user_agent = headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or_else(|| {
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0".to_string()
+                        });
+                    relay_request.headers.push(("User-Agent".to_string(), user_agent));
+                }
+                if relay_request.header("Accept").is_none() {
+                    relay_request.headers.push(("Accept".to_string(), "application/json".to_string()));
+                }
+                let wire_response = self
+                    .send_fetch_hop(&relay_request, response_wire_limit(MAX_WORKER_HTTP_BODY))
+                    .await?;
                 let relay_response = RelayResponse::parse(
                     wire_response.status, &wire_response.body, MAX_WORKER_HTTP_BODY,
                 )?;
@@ -154,7 +168,11 @@ impl WorkerHttpClient {
         }
     }
 
-    async fn send_fetch_hop(&self, request: &HttpRequest) -> Result<HttpResponse> {
+    async fn send_fetch_hop(
+        &self,
+        request: &HttpRequest,
+        response_limit: usize,
+    ) -> Result<HttpResponse> {
         let method = match request.method {
             HttpMethod::Get => Method::Get,
             HttpMethod::Post => Method::Post,
@@ -197,7 +215,7 @@ impl WorkerHttpClient {
             headers.push(("set-cookie".to_string(), cookie));
         }
         let limit =
-            narou_rs::platform::http::response_body_limit(status, trusted_limit, MAX_WORKER_HTTP_BODY);
+            narou_rs::platform::http::response_body_limit(status, trusted_limit, response_limit);
         if response
             .headers()
             .get("content-length")
@@ -246,7 +264,7 @@ impl WorkerHttpClient {
                 }
                 // Fetch is always manual. A partial/failed Fetch body returns
                 // an error above; only a complete 403 can start fallback.
-                let fetch_response = self.send_fetch_hop(request).await?;
+                let fetch_response = self.send_fetch_hop(request, MAX_WORKER_HTTP_BODY).await?;
                 let response = if fetch_response.status == 403
                     && request.method == HttpMethod::Get
                     && !request.trusted_endpoint
