@@ -229,6 +229,16 @@ CPU/メモリ/リクエストだけでなく、インターネットへの転送
 
 ハーメルン等を Workers から取得するには **自宅回線で動かすリレー**が必要です。手順と実測値は [home-relay.md](home-relay.md) を参照してください。このリレーは Pixiv など、データセンター回線でも取得できるサイト向けに引き続き利用できます。
 
+## 18. 取得クライアントの切り替え（NAROU_RELAY_FETCH）
+
+既定は `curl,node`（curl で取得し、curl が起動できない場合だけ Node）。Cloudflare が curl を 403 にし wget は通すホスト（例: 共有 IPv4 NAT の格安 VPS）では、`NAROU_RELAY_FETCH=wget,node` で wget 経由にできます。
+
+- 値はカンマ区切りの取得順。実行できない wget は起動時に外れ、起動ログと `/health` の `fetch` に実際の順序が出ます
+- wget は curl の `--resolve` 相当が無いため、127.0.0.1 の使い捨て CONNECT プロキシで検証済み IP へ接続し、TLS の SNI・検証は wget が行います
+- HTTP（非 TLS）の対象は wget では扱わず、次の経路へ進みます
+- 403 などの HTTP 応答は「取得結果」として扱われ、別クライアントでの再試行はしません（1 リクエスト = 上流 1 回の契約を維持）
+- リレーがデータセンター回線のままなら、wget に替えても Cloudflare の challenge は解けません。詳細と手順は [vps-relay.md](vps-relay.md) / [home-relay.md](home-relay.md)
+
 ## 検証済み範囲と未検証事項
 
 ローカルのNode24/Windowsでは、実Node/ローカルworkerdを通す54件とRustリレー9件・HTTP/1.1 codec23件が成功し、Worker wasmチェックも成功しました。実際の`npm start`で8080の公開待受、health200、不正キー403、公開検証先example.comの上流200/本文/`via=curl`、メタデータ宛の拒否、鍵未設定/ポート競合時のexit1を確認しました。
