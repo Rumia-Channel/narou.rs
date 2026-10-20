@@ -1,0 +1,14 @@
+{
+  "mode": "node",
+  "framework": "node",
+  "start": "node server.mjs",
+  "include": [
+    "server.mjs",
+    "env.mjs",
+    "security.mjs",
+    "transport.mjs",
+    "worker/protocol.mjs",
+    "curl",
+    "cacert.pem"
+  ]
+}

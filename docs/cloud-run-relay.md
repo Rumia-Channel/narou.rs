@@ -6,6 +6,8 @@ Cloudflare Workers が直接取得できない場合に限り、Google Cloud Run
 
 対象は `scripts/relay/server.mjs` の通常の Node.js HTTP サーバーです。Dockerfile・GHCR・Functions Framework・関数ターゲットは使いません。Cloud Run の配備は Developer Connect と Cloud Build が行い、Cloudflare 本体の GitHub Actions 配備から独立させます。
 
+**同じコードが SORAHOST (PteWorker) でも動きます。** ホストごとの差（`PORT` か `SERVER_PORT` か、待受アドレス、設定の渡し方、curl の有無）は `scripts/relay/env.mjs` と `scripts/relay/transport.mjs` が吸収するので、配備先を変えてもリレーの実装は分岐しません。PteWorker へは [`sorahost-relay.md`](sorahost-relay.md) の手順で同じ `scripts/relay/` を配備します。
+
 Workers の既存順序は `fetch` → 403 の GET に限り socket → 成功しなければ設定済みの外部リレーです。外部経路の 2xx/3xx だけを採用し、失敗なら元の 403 を維持します。サイト側のアクセス制限・利用規約を尊重し、Challenge の自動操作は行いません。
 
 ## 2. Google Cloud の前提
@@ -44,7 +46,7 @@ GitHub の認証は Developer Connect 側で行います。GCP のサービス�
 
 このディレクトリの `package.json` が Node.js `24.x` と `npm start` → `node server.mjs` を指定します。npm の lock も置きますが、外部 npm 依存はありません。リポジトリ全体や `worker_entry` をビルド文脈にしないでください。
 
-`K_SERVICE` のある Cloud Run 上では `0.0.0.0:$PORT`、ローカルでは `127.0.0.1:${PORT:-3000}` に待ち受けます。コードは Cloud Run が渡した PORT を上書きしません。
+`K_SERVICE` のある Cloud Run 上では `0.0.0.0:$PORT`、ローカルでは `127.0.0.1:${PORT:-3000}` に待ち受けます。コードは Cloud Run が渡した PORT を上書きしません。待受は `NAROU_RELAY_HOST`、ポートは `PORT` → `SERVER_PORT` の順で解決し、設定は `NAROU_RELAY_ENV_FILE` があればその `.env`、無ければ `<モジュールの隣>/.env` → `$HOME/.env` も読みます（環境変数が最優先）。同梱の curl がある場合は書き込み可能な場所へコピーして使い、`NAROU_RELAY_CURL` / `NAROU_RELAY_CACERT` で明示もできます。
 
 localhost 接続を許可する fixture はリポジトリ直下の `tests/` に隔離し、このビルド文脈には含めません。本番用に私設 IP を許可する環境変数はありません。`.gcloudignore` は手元からのソース送信向けで、Developer Connect のビルド文脈設定の代わりにはなりません。
 

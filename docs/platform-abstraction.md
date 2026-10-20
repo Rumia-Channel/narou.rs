@@ -598,6 +598,17 @@ node scripts/relay/server.mjs
 `scripts/relay/worker/worker.mjs` は従来の fetch ランタイム用の契約検証対象として残す。
 Node 版に追加した許可リスト・DNS 固定を備える Cloud Run 配備の代替とはしない。
 
+**配備先ごとの差はコードに持ち込まない。** `scripts/relay/env.mjs` が
+`PORT` → `SERVER_PORT`、`NAROU_RELAY_HOST`（既定は `K_SERVICE` の有無で `0.0.0.0` / `127.0.0.1`）、
+`.env`（`NAROU_RELAY_ENV_FILE` → モジュールの隣 → `$HOME`。既存の環境変数が最優先）を解決し、
+`scripts/relay/transport.mjs` の `resolveCurl` が `NAROU_RELAY_CURL` → 同梱 curl（書き込み可能な場所へ
+コピー + 実行確認）→ PATH の curl の順に選ぶ。Cloud Run は環境変数だけ、PteWorker (SORAHOST) は
+`sorahost.json` に env を渡せないため `/home/container/.env` と同梱 curl を使う。
+SORAHOST への配備は `scripts/relay/deploy-sorahost.mjs` が配備フォルダーを組み立てる
+(ハッシュ検証済みの静的 curl と CA バンドルを同梱する)。手順は [`sorahost-relay.md`](sorahost-relay.md)、
+Cloud Run は [`cloud-run-relay.md`](cloud-run-relay.md) を参照する。
+両ホストの差は `tests/relay-hosting.test.mjs` が固定する。
+
 GitHub の `Cloudflare` 環境には同名の Secret `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` を置く。
 本体 CI はこれらを Worker に渡すだけで、リレーのホスト作成・配備・認証確認は実行しない。
 旧 `SORAHOST_PROXY_*` からの別名参照は無いため、切り替え前に新名へ設定する。
