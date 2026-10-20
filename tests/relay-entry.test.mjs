@@ -23,16 +23,14 @@ const windows = process.platform === "win32";
 
 const copySources = (repoRoot) => {
   mkdirSync(join(repoRoot, "scripts", "relay", "worker"), { recursive: true });
-  for (const file of ["server.mjs", "env.mjs", "security.mjs", "transport.mjs", "deploy-sorahost.mjs"]) {
+  for (const file of ["server.mjs", "env.mjs", "security.mjs", "transport.mjs", "deploy-sorahost.mjs", "fetch-curl.mjs"]) {
     copyFileSync(join(root, "scripts", "relay", file), join(repoRoot, "scripts", "relay", file));
   }
   copyFileSync(join(root, "scripts", "relay", "worker", "protocol.mjs"), join(repoRoot, "scripts", "relay", "worker", "protocol.mjs"));
   copyFileSync(join(root, "relay.js"), join(repoRoot, "relay.js"));
-  writeFileSync(join(repoRoot, "scripts", "deploy-tools.json"), `${JSON.stringify({
+  writeFileSync(join(repoRoot, "scripts", "relay", "pins.json"), `${JSON.stringify({
     curl_version: "test-v1",
     curl_sha256: sha256(FAKE_CURL),
-    cloudflared_version: "test",
-    cloudflared_sha256: "0".repeat(64),
   }, null, 2)}\n`);
 };
 
@@ -235,8 +233,8 @@ test("relay.js reports a preparation failure with a non-zero exit", { timeout: 3
   const repoRoot = cleanRepo();
   try {
     writeFileSync(join(repoRoot, ".env"), `NAROU_RELAY_KEY=${TOKEN}\nNAROU_RELAY_ALLOWED_HOSTS=example.com\n`);
-    // ピンが無い deploy-tools.json は prepareRuntime が拒否する。
-    writeFileSync(join(repoRoot, "scripts", "deploy-tools.json"), '{"curl_version":"test-v1"}\n');
+    // ピンが無い pins.json は prepareRuntime が拒否する。
+    writeFileSync(join(repoRoot, "scripts", "relay", "pins.json"), '{"curl_version":"test-v1"}\n');
     const child = spawn(process.execPath, [join(repoRoot, "relay.js")], {
       cwd: repoRoot,
       stdio: ["ignore", "pipe", "pipe"],

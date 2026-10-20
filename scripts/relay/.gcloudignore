@@ -2,6 +2,10 @@
 *
 !package.json
 !package-lock.json
+!bootstrap.mjs
+!env.mjs
+!fetch-curl.mjs
+!pins.json
 !server.mjs
 !security.mjs
 !transport.mjs

@@ -13,6 +13,7 @@
 - SORAHOST の Node.js プラン（Pterodactyl の汎用 Node.js egg）向けに、同じ配備フォルダーを SFTP で置き、起動コマンドを `node server.mjs` へ差し替える手順を追加しました。既定の起動コマンドは `MAIN_FILE` の判定が引用符で常に偽になり `ts-node` 側へ落ちるため、そのままでは起動しません。この egg は待受に `0.0.0.0` が必要なので `NAROU_RELAY_HOST` を `.env` に設定します。
 - SORAHOST の Node.js egg で **手動アップロード不要**にする起動エントリーポイント `relay.js` を追加しました。MAIN FILE を `relay.js` にして GitHub の自動更新に任せると、起動時に `prepareRuntime` が `/home/container/relay-runtime/` を用意し（コードはリポジトリとハッシュ一致するか確認、静的 curl は `deploy-tools.json` の SHA-256、CA は前回のマニフェストで検証して再利用し、壊れているときだけ再取得）、`server.mjs` を子プロセスで起動して出力転送と SIGTERM/SIGINT 伝播を行います。準備は一時ディレクトリで行い、失敗しても前の実行環境を壊しません。標準起動コマンドが `ts-node --esm` に落ちる問題に備え、`relay.js` は node でも ts-node でも実行できる構文で実装しました。ts-node 10.9.2 + TypeScript 7 では ts-node 自体が起動前に失敗し、これはリポジトリ側で回避できないため、SORAHOST への起動コマンド修正依頼事項として文書化しています。回帰は `tests/relay-entry.test.mjs`。
 - 外部リレーに必須のホスト許可リスト、DNS 検証と接続先固定、timing-safe 認証、期限・切断時の中断を追加しました。curl 優先と既存 JSON/base64 契約は維持し、代替 HTTP(S) も同じ安全性検証を通します。Node/curl とローカル Worker の回帰を CI に組み込みました。実 Cloud Run の出口・curl・対象サイトの取得可否は配備後の確認が必要です。
+- Cloud Run のリレーは `bootstrap.mjs`（`npm start`）を起動エントリーポイントにし、イメージに curl が無い場合は `scripts/relay/pins.json` の SHA-256 で検証した静的 curl と CA バンドルを `/tmp` へ用意してから `server.mjs` を起動するようにしました（用意できなければ Node 実装で続行）。curl のピンは `scripts/relay/pins.json` に集約し、`deploy-sorahost.mjs` と共有しました。回帰は `tests/relay-bootstrap.test.mjs`。
 
 変更一覧は [v0.4.14...v0.4.15](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.14...v0.4.15) を参照してください。
 

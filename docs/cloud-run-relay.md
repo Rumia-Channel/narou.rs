@@ -4,7 +4,7 @@
 
 Cloudflare Workers が直接取得できない場合に限り、Google Cloud Run の出口から HTTP 取得する低頻度の補助サービスです。narou.rs 本体、D1、S3、Queues は Cloudflare 側に残します。
 
-対象は `scripts/relay/server.mjs` の通常の Node.js HTTP サーバーです。Dockerfile・GHCR・Functions Framework・関数ターゲットは使いません。Cloud Run の配備は Developer Connect と Cloud Build が行い、Cloudflare 本体の GitHub Actions 配備から独立させます。
+対象は `scripts/relay/` の通常の Node.js HTTP サーバーです。起動エントリーは `bootstrap.mjs`（`npm start`）で、`server.mjs` を起動する前に curl の有無を確認します。Dockerfile・GHCR・Functions Framework・関数ターゲットは使いません。Cloud Run の配備は Developer Connect と Cloud Build が行い、Cloudflare 本体の GitHub Actions 配備から独立させます。
 
 **同じコードが SORAHOST (PteWorker) でも動きます。** ホストごとの差（`PORT` か `SERVER_PORT` か、待受アドレス、設定の渡し方、curl の有無）は `scripts/relay/env.mjs` と `scripts/relay/transport.mjs` が吸収するので、配備先を変えてもリレーの実装は分岐しません。PteWorker へは [`sorahost-relay.md`](sorahost-relay.md) の手順で同じ `scripts/relay/` を配備します。
 
@@ -44,7 +44,11 @@ GitHub の認証は Developer Connect 側で行います。GCP のサービス�
 
 ビルド方式に **Google Cloud Buildpacks** を選び、ビルドコンテキストは **`/scripts/relay`**、Entrypoint と Function target は **両方空欄**にします。
 
-このディレクトリの `package.json` が Node.js `24.x` と `npm start` → `node server.mjs` を指定します。npm の lock も置きますが、外部 npm 依存はありません。リポジトリ全体や `worker_entry` をビルド文脈にしないでください。
+このディレクトリの `package.json` が Node.js `24.x` と `npm start` → `node bootstrap.mjs` を指定します。npm の lock も置きますが、外部 npm 依存はありません。リポジトリ全体や `worker_entry` をビルド文脈にしないでください。
+
+`bootstrap.mjs` は起動時に PATH の curl を確認し、無ければ **`scripts/relay/pins.json` にピン留めした SHA-256 で検証した静的 curl と CA バンドルを `/tmp` へダウンロード**してから `server.mjs` を起動します（初回・コールドスタートごとに約 6.5 MB）。用意できなかった場合はこれまでどおり Node 実装（`viaPinnedHttp`）で続行し、起動は止めません。`NAROU_RELAY_CURL` / `NAROU_RELAY_CACERT` が設定済み、または curl が PATH にある場合はダウンロードしません。コールドスタートを避けたい場合は最小インスタンス数を 1 にします（課金に注意）。
+
+Google の Node.js ランタイムイメージには curl が入っていないことがあり、その場合はリレーが Node の TLS クライアントを使うため、Cloudflare の bot 判定で 403 になるサイトが出ます。`bootstrap.mjs` はこの差を埋めるためのものです。
 
 `K_SERVICE` のある Cloud Run 上では `0.0.0.0:$PORT`、ローカルでは `127.0.0.1:${PORT:-3000}` に待ち受けます。コードは Cloud Run が渡した PORT を上書きしません。待受は `NAROU_RELAY_HOST`、ポートは `PORT` → `SERVER_PORT` の順で解決し、設定は `NAROU_RELAY_ENV_FILE` があればその `.env`、無ければ `<モジュールの隣>/.env` → `$HOME/.env` も読みます（環境変数が最優先）。同梱の curl がある場合は書き込み可能な場所へコピーして使い、`NAROU_RELAY_CURL` / `NAROU_RELAY_CACERT` で明示もできます。
 
