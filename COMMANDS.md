@@ -102,7 +102,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
 | `illust` | — (Rust 拡張) | ✅ 完了 | `.illustration_cache.yaml` 運用のための `narou illust <sub>`。`orphan`/`migrate`/`fix-ext`/`rebuild` に加え、挿絵を S3 互換ストレージへ写す `s3-push` / 突き合わせる `s3-verify` を実装。削除/改名/移行 (および `s3-push`) は既定 dry-run (`-f` で実行) |
-| `author` | — (Rust 拡張) | ✅ 完了 | 追跡する作者を登録すると (`narou author add <作者ページURL>`)、`narou update` の後段で新しい作品を自動追加する。`add`/`list`/`remove`/`check`。作者ページの認識と作品一覧の取得はサイト定義 (`author_url` / `author_api_url` / `author_novel_pattern` / `author_work_url`) が担う。Pixiv は `preprocess:` の DSL が `author_novel::` / `author_series::` / `author_comic_series::` を emit し、シリーズに属する話/ページは `author_series_episodes_url` / `author_comic_series_pages_url` で除く (作品単位 = 単体小説 + 小説シリーズ + 漫画シリーズ + 単体イラスト・漫画)。`check --dry-run` は追加予定の URL だけを表示 |
+| `author` | — (Rust 拡張) | ✅ 完了 | 追跡する作者を登録すると (`narou author add <作者ページURL>`)、`narou update`（対象省略の一括更新）の後段で新しい作品を自動追加する（個別更新では追跡しない）。`add`/`list`/`remove`/`check`。作者ページの認識と作品一覧の取得はサイト定義 (`author_url` / `author_api_url` / `author_novel_pattern` / `author_work_url`) が担う。Pixiv は `preprocess:` の DSL が `author_novel::` / `author_series::` / `author_comic_series::` を emit し、シリーズに属する話/ページは `author_series_episodes_url` / `author_comic_series_pages_url` で除く (作品単位 = 単体小説 + 小説シリーズ + 漫画シリーズ + 単体イラスト・漫画)。`check --dry-run` は追加予定の URL だけを表示 |
 | `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`rename`/`order`/`clear` を実装。**サイトごとに複数の「名前つきログイン」を試行順つきで保持**し、1 ログインが複数ホストの Cookie を持つ (ブラウザのセッションがホストをまたぐため)。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET /api/login`、`POST /api/login/import\|rename\|order`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}` も対応 |
 | `db` | — (Rust 拡張) | ✅ 完了 | SQLite 管理 DB の保守。`verify` / `export-yaml [--out\|--in-place]` / `vacuum` / `repair-freeze [--dry-run]`。既定は YAML 管理で、SQLite は Web UI 初回ツアーまたは `.narou/storage-backend` マーカーによる opt-in。`repair-freeze` は旧ビルドが残した `freeze.yaml.imported-*` から失われた凍結状態を復旧する |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
@@ -286,7 +286,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 ### 3.x `author` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
 
-作者ページを登録しておくと、**まだ管理していない作品**を通常のダウンロード経路で追加する。Native は `narou update` の後段、Workers は更新 API と定期実行から継続して確認する。小説がまだ 0 件のライブラリも対象になる。
+作者ページを登録しておくと、**まだ管理していない作品**を通常のダウンロード経路で追加する。Native は対象省略の `narou update` の後段、Workers は一括更新 API (`/api/update` の update-all) と定期実行から継続して確認する（個別更新では確認しない）。小説がまだ 0 件のライブラリも対象になる。
 
 | Native CLI | 内容 |
 |---|---|

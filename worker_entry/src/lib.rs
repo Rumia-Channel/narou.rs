@@ -1321,7 +1321,11 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
             ids.push(outcome.job_id.clone());
         }
     }
-    let author_ids = if request.kind == narou_rs::application::JobKind::Update && !plans.is_empty() {
+    // 作者チェックは対象指定なしの一括更新だけ。個別 Update で監視作者全員の
+    // 確認まで投入すると、指定していない取得が走ってしまう。
+    let author_ids = if request.kind == narou_rs::application::JobKind::Update
+        && request.targets.is_empty()
+    {
         match runtime.enqueue_author_checks(true).await {
             Ok(jobs) => jobs.into_iter().map(|job| job.job_id).collect::<Vec<_>>(),
             Err(error) => return Response::error(format!("author check enqueue failed: {error}"), 502),
