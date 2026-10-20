@@ -126,8 +126,9 @@ Cloud Run のサービス詳細に表示される `https://...run.app` のサー
 
 - **`NAROU_RELAY_ENDPOINT`**: 前節の HTTPS サービス URL。
 - **`NAROU_RELAY_KEY`**: Secret Manager に保存したものと同じ認証キー。
+- **`RELAY_DOMAIN`**（任意）: リレーの公開ドメイン（例 `relay.example.com`）。設定すると、本リポジトリの CI は `NAROU_RELAY_ENDPOINT` より優先して `https://<RELAY_DOMAIN>` を Worker secret に入れる（`worker_entry/ci/deploy_worker.py`）。Cloudflare の名前付きトンネルなど、URL を固定して運用するときに使う。
 
-本リポジトリの本体 CI を使う場合は GitHub Environment `Cloudflare` の同名 Secret に登録します。`worker_entry/ci/deploy_worker.py` は既存どおりこれらを Worker に渡すだけで、Google Cloud の配備・認証はしません。独自に Worker を配備する利用者はその Worker 自身へ設定してください。Google のサービスアカウント JSON は不要です。
+本リポジトリの本体 CI を使う場合は GitHub Environment `Cloudflare` の同名 Secret に登録します（`RELAY_DOMAIN` もこの環境）。`worker_entry/ci/deploy_worker.py` は既存どおりこれらを Worker に渡すだけで、Google Cloud の配備・認証はしません。独自に Worker を配備する利用者はその Worker 自身へ設定してください。Google のサービスアカウント JSON は不要です。
 
 両方が揃ったときだけリレーが有効です。切り替え先の認証と取得を検証するまで、既存サービスや Secret を削除しないでください。本体の再配備/更新により設定を反映し、サイト定義・Cookie・取得間隔は従来のダウンロード経路を使います。
 

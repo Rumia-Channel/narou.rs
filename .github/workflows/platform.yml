@@ -192,6 +192,8 @@ jobs:
       NAROU_DEPLOY_TARGET: develop
       # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
       DEVELOP_DOMAIN: ${{ secrets.DEVELOP_DOMAIN || vars.DEVELOP_DOMAIN }}
+      # リレードメイン。設定時は NAROU_RELAY_ENDPOINT より優先して https://<domain> を使う。
+      RELAY_DOMAIN: ${{ secrets.RELAY_DOMAIN || vars.RELAY_DOMAIN }}
       NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
       NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
       NAROU_RELAY_ENDPOINT: ${{ secrets.NAROU_RELAY_ENDPOINT }}
@@ -284,6 +286,8 @@ jobs:
       NAROU_DEPLOY_TARGET: production
       # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
       SERVICE_DOMAIN: ${{ secrets.SERVICE_DOMAIN || vars.SERVICE_DOMAIN }}
+      # リレードメイン。設定時は NAROU_RELAY_ENDPOINT より優先して https://<domain> を使う。
+      RELAY_DOMAIN: ${{ secrets.RELAY_DOMAIN || vars.RELAY_DOMAIN }}
       NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
       NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
       NAROU_RELAY_ENDPOINT: ${{ secrets.NAROU_RELAY_ENDPOINT }}

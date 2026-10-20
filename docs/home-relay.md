@@ -173,7 +173,7 @@ pwsh -File scripts/relay/home-relay.ps1 -NoTunnel
 cloudflared tunnel run narou-relay
 ```
 
-`NAROU_RELAY_ENDPOINT` は `https://relay.example.com` にします。
+`NAROU_RELAY_ENDPOINT` は `https://relay.example.com` にします。本リポジトリの CI を使う場合は、GitHub Environment `CloudFlare` の Secret **`RELAY_DOMAIN`** に `relay.example.com` を設定すれば、`NAROU_RELAY_ENDPOINT` は自動で `https://relay.example.com` になります。
 
 ### 7.2 Cloudflare 以外のトンネル（常用はこちらを推奨）
 

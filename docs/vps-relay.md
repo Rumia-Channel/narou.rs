@@ -121,10 +121,13 @@ cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3000
 cloudflared tunnel login
 cloudflared tunnel create narou-relay
 cloudflared tunnel route dns narou-relay relay.example.com
-cloudflared tunnel run narou-relay
+# 宛先をローカルのリレーにする (config.yml の ingress でもよい)
+cloudflared tunnel run --url http://127.0.0.1:3000 narou-relay
 ```
 
-`NAROU_RELAY_ENDPOINT` は `https://relay.example.com`。名前付きトンネルは URL が固定されます（Worker からの到達性は 6.1 と同じ未検証事項）。
+常駐させる場合は `sudo cloudflared service install`（名前付きトンネルの場合）か systemd のユニットを使ってください。
+
+`RELAY_DOMAIN=relay.example.com` を GitHub Environment `Cloudflare` の Secret に設定すると、Worker の `NAROU_RELAY_ENDPOINT` は自動で `https://relay.example.com` になります（`NAROU_RELAY_ENDPOINT` より優先）。名前付きトンネルは URL が固定されます（Worker からの到達性は 6.1 と同じ未検証事項）。
 
 ## 7. Worker 側
 
@@ -132,8 +135,18 @@ GitHub Secrets を更新して Worker を再配備します。
 
 | Secret | 値 |
 | --- | --- |
-| `NAROU_RELAY_ENDPOINT` | 公開 URL（例 `https://xxxx.trycloudflare.com`） |
+| `RELAY_DOMAIN` | リレーの公開ドメイン（例 `relay.example.com`）。設定時は `NAROU_RELAY_ENDPOINT` より優先 |
+| `NAROU_RELAY_ENDPOINT` | 公開 URL（クイックトンネル等。`RELAY_DOMAIN` を使う場合は不要） |
 | `NAROU_RELAY_KEY` | `.env` の `NAROU_RELAY_KEY` と同じ値 |
+
+設定は本リポジトリの CI を使う場合のみ。`CloudFlare` 環境の Secret として登録します。
+
+```sh
+gh secret set RELAY_DOMAIN --env CloudFlare --body relay.example.com
+gh secret set NAROU_RELAY_KEY --env CloudFlare --body '<.env と同じキー>'
+```
+
+独自に Worker を配備する場合は、その Worker に `NAROU_RELAY_ENDPOINT=https://relay.example.com` と `NAROU_RELAY_KEY` を直接設定します。
 
 Web UI でハーメルンの作品を取得・更新して確認します。リレーが使われたかは、リレーのログに `narou relay wget: ...`（失敗時）が出ないこと、レスポンスの `via`（`wget`）で判断できます。
 
