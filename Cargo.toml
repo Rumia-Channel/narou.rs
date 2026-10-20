@@ -62,6 +62,9 @@ worker-runtime = [
     "dep:base64",
     "dep:chacha20poly1305",
     "dep:getrandom",
+    # Native と同じく `ua_generator` のランダム Firefox UA を使う
+    # (Worker だけ固定 UA にするとサイト側の判定が変わってしまう)。
+    "dep:ua_generator",
 ]
 # Animated illustrations arrive as a frame archive and are assembled into an
 # APNG. The codecs (image: jpeg/png) and the ZIP reader are pure Rust, so the
@@ -91,7 +94,7 @@ dashmap = { version = "6", optional = true }
 futures = "0.3"
 pest = "2.8"
 pest_derive = "2.8"
-ua_generator = { git = "https://github.com/spider-rs/ua_generator.git", version = "0.5", optional = true }
+ua_generator = { git = "https://github.com/spider-rs/ua_generator.git", version = "0.5", optional = true, default-features = false }
 curl = { version = "0.4", features = ["static-ssl"], optional = true }
 indicatif = { version = "0.18", optional = true }
 encoding_rs = "0.8"

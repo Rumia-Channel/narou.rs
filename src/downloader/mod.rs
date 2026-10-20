@@ -531,17 +531,9 @@ pub fn parse_datetime_with_timezone(value: &str, timezone: Option<&str>) -> Opti
     parse_loose_datetime_with_timezone(value, site_timezone(timezone))
 }
 
-/// ブラウザ風の既定 User-Agent。`ua_generator` を持たないビルド (Worker) 用。
-///
-/// 空の User-Agent で送ると多くのサイトが 403 を返すため、どちらのビルドでも
-/// 必ず何かしらの UA を送る (native は `ua_generator` のランダム値)。
-/// Worker は外部リレー経由の取得でもこの値を使うため、Cloudflare が古い版を
-/// 不審扱いしないよう現行の Firefox に合わせて更新する。
-pub const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0";
-
 /// Resolve the CLI/saved user-agent, randomizing the value for `auto`/
-/// `random`. `ua_generator` は native ビルドでのみ使う。
+/// `random`. Native と Worker のどちらも `ua_generator` のランダムな
+/// Firefox UA を使う (保存値・明示指定はそのまま優先する)。
 pub fn resolve_user_agent(user_agent: Option<&str>, saved_user_agent: Option<String>) -> String {
     let is_auto = |ua: &str| {
         let trimmed = ua.trim();
@@ -549,16 +541,7 @@ pub fn resolve_user_agent(user_agent: Option<&str>, saved_user_agent: Option<Str
             || trimmed.eq_ignore_ascii_case("auto")
             || trimmed.eq_ignore_ascii_case("random")
     };
-    let randomized = || -> String {
-        #[cfg(feature = "native-runtime")]
-        {
-            ua_generator::ua::spoof_firefox_ua().to_string()
-        }
-        #[cfg(not(feature = "native-runtime"))]
-        {
-            DEFAULT_USER_AGENT.to_string()
-        }
-    };
+    let randomized = || ua_generator::ua::spoof_firefox_ua().to_string();
     match user_agent {
         Some(ua) if is_auto(ua) => randomized(),
         Some(ua) if !ua.trim().is_empty() => ua.to_string(),
