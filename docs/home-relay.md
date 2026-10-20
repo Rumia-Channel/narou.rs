@@ -24,15 +24,17 @@ Cloud Run / SORAHOST のリレーはデータセンター回線から取得す�
 
 ### 1.1 実際に送られていたリクエスト（2026-10-20 捕捉）
 
-リレー（Worker のヘッダを curl が送る）:
+リレー（Worker のヘッダを curl / wget が送る。VPS リレーは `NAROU_RELAY_FETCH=wget,node`）:
 
 ```text
 Host
-Accept-Encoding: deflate, gzip        ← curl --compressed が追加（配備版は HTTP/2）
+Accept-Encoding: deflate, gzip        ← curl --compressed が追加（curl 経路は HTTP/2）
 Cookie: over18=off
 Accept / Accept-Language / Sec-Fetch-* / Upgrade-Insecure-Requests（サイト定義どおり）
-User-Agent: ... Firefox/131.0         ← Worker が最後に追加（設定が未指定なら DEFAULT_USER_AGENT）
+User-Agent: ... Firefox/157 or 158     ← Worker が追加（ua_generator。native と共通）
 ```
+
+wget 経路では `Accept-Encoding: identity` / `Connection: Keep-Alive` / `Proxy-Connection: Keep-Alive` が付き、HTTP/1.1 になる（curl 経路とはヘッダが異なる）。
 
 ネイティブ（Linux の wget 段）:
 
