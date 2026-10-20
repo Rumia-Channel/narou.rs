@@ -125,14 +125,19 @@ const main = async () => {
       if (result.status !== 0) fail("sorahost-cli deploy が失敗しました");
     } else {
       console.log("");
-      console.log("次の手順:");
+      console.log("次の手順 (PteWorker / sorahost-cli):");
       console.log(`  cd ${directory}`);
       console.log("  npx --yes sorahost-cli deploy");
       console.log("  (または --deploy を付けて実行する)");
       console.log("");
+      console.log("Pterodactyl の Node.js egg (Nano / Micro など) は sorahost-cli を使わない:");
+      console.log("  このフォルダーの中身を SFTP / ファイルマネージャで /home/container へ置き、");
+      console.log("  起動コマンドを `cd /home/container && exec /usr/local/bin/node ./server.mjs` に変える");
+      console.log("");
       console.log("配備後、パネルのファイルマネージャか SFTP で /home/container/.env に置く:");
       console.log("  NAROU_RELAY_KEY=<Worker の NAROU_RELAY_KEY と同じ値>");
       console.log("  NAROU_RELAY_ALLOWED_HOSTS=<取得先ホストを完全一致のカンマ区切りで>");
+      console.log("  NAROU_RELAY_HOST=0.0.0.0   # Node.js egg のときだけ必要");
       console.log("確認: GET <公開 URL>/health → {\"ok\":true} / python3 scripts/relay/verify_auth.py");
     }
     if (temporary && (values.keep || values.deploy)) console.log(`(残したフォルダー: ${directory})`);

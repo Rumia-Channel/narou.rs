@@ -1,4 +1,4 @@
-# SORAHOST (PteWorker) による外部 HTTP 取得リレー
+# SORAHOST による外部 HTTP 取得リレー
 
 ## 1. 目的と対象
 
@@ -6,12 +6,19 @@ Cloudflare Workers が直接取得できないサイトを、SORAHOST の出口 
 **Cloud Run 版と同じ `scripts/relay/` のコードをそのまま配備します。** ホストごとの差は次の 2 点だけで、
 `scripts/relay/env.mjs` と `scripts/relay/transport.mjs` が吸収します。
 
-| 差 | Cloud Run | SORAHOST (PteWorker) |
-| --- | --- | --- |
-| 待受ポート | `PORT`（Cloud Run が注入） | `SERVER_PORT`（実機報告。`PORT` があればそちら） |
-| 待受アドレス | `K_SERVICE` があるので `0.0.0.0` | ループバック（`127.0.0.1`）が要件 |
-| 設定の渡し方 | 環境変数（Secret Manager など） | `sorahost.json` に env を書く項目が無いので `/home/container/.env` |
-| curl | イメージの curl、無ければ Node 実装へフォールバック | コンテナに curl が無いので**同梱した静的 curl** を使う |
+| 差 | Cloud Run | SORAHOST (PteWorker) | SORAHOST (Node.js egg) |
+| --- | --- | --- | --- |
+| 待受ポート | `PORT`（Cloud Run が注入） | `SERVER_PORT`（実機報告。`PORT` があればそちら） | `SERVER_PORT`（Pterodactyl が注入） |
+| 待受アドレス | `K_SERVICE` があるので `0.0.0.0` | ループバック（`127.0.0.1`）が要件 | **`0.0.0.0`**（`NAROU_RELAY_HOST` で指定） |
+| 設定の渡し方 | 環境変数（Secret Manager など） | `sorahost.json` に env を書く項目が無いので `/home/container/.env` | Startup 変数は egg 固定なので `/home/container/.env` |
+| curl | イメージの curl、無ければ Node 実装へフォールバック | コンテナに curl が無いので**同梱した静的 curl** を使う | 同梱した静的 curl を使う（無ければ PATH） |
+
+**SORAHOST の「実行環境 Node.js」には 2 種類あり、配備方法だけが違います。** どちらも同じ
+組み立て済みフォルダーと `.env` を使います。
+
+- **PteWorker**（`sorahost-cli deploy` で配備し、`sorahost.json` の `start` で起動）→ §4.1
+- **Pterodactyl の Node.js egg**（Nano / Micro などの Node.js プラン。パネル/SFTP でファイルを置き、
+  起動コマンドで `node server.mjs` を実行）→ §4.2
 
 リレーは**単体で 1 サーバー**に置きます。narou 本体と同居させる構成（`sorahost/README.md` §10）は
 残していますが、メモリの余裕が無いため既定は別サーバーです。
@@ -58,6 +65,8 @@ server.mjs  env.mjs  security.mjs  transport.mjs  worker/protocol.mjs  sorahost.
 
 ## 4. 配備する
 
+### 4.1 PteWorker（`sorahost-cli`）へ配備する
+
 ```sh
 SORAHOST_ENDPOINT=... SORAHOST_TOKEN=... npx --yes sorahost-cli deploy
 ```
@@ -79,14 +88,42 @@ SORAHOST_ENDPOINT=... SORAHOST_TOKEN=... npx --yes sorahost-cli deploy
   影響しません（鍵と許可リストは `.env` 側にあります）。
 - 起動してすぐ落ちると配備失敗（422）扱いになり、前のリリースが動き続けます。`logs` を確認してください。
 
+### 4.2 Pterodactyl の Node.js egg（Nano / Micro など）へ配備する
+
+`sorahost-cli` は使えません。**組み立て済みフォルダーの中身を `/home/container` へ置き、
+起動コマンドを `node server.mjs` に変えます。**
+
+1. `node scripts/relay/deploy-sorahost.mjs --out .\relay-deploy` でフォルダーを作る
+2. パネルのファイルマネージャか SFTP で、その**中身**を `/home/container` へ置く
+   （`server.mjs` `env.mjs` `security.mjs` `transport.mjs` `worker/protocol.mjs` `curl` `cacert.pem`。
+   `sorahost.json` は PteWorker 用なので不要）
+3. 起動コマンド（Startup）を次の 1 行に差し替える
+
+```bash
+cd /home/container && exec /usr/local/bin/node ./server.mjs
+```
+
+- 元のコマンドの `if [[ "${MAIN_FILE}" == "*.js" ]]` は**引用符のせいで常に偽**になり、`ts-node` 側へ
+  落ちます（`.js` を指定しても `node` では起動しません）。`node` を直接実行する形にしてください。
+- `exec` を付けると停止シグナルが node に直接届きます。
+- git で配る場合だけ、先頭の `git pull` と `npm install` の部分を残して構いません
+  （`/home/container/package.json` が無ければ `npm install` は走りません）。
+- **待受アドレスはこの egg では `0.0.0.0` が必要です**（PteWorker のループバックとは逆）。
+  §5 の `.env` に `NAROU_RELAY_HOST=0.0.0.0` を入れてください。
+- ポートは Pterodactyl が `SERVER_PORT` で渡すので、こちらで指定する必要はありません。
+- 起動コマンドを編集できない場合は `MAIN_FILE=server.mjs` を試すことになります。`ts-node --esm` 経由に
+  なるため動作は保証できません（失敗するなら SORAHOST に起動コマンドの変更を依頼してください）。
+
 ## 5. サーバー側の設定（.env）
 
-`sorahost.json` には環境変数を渡す項目が無く、CLI は `.env` を**必ず除外**します。パネルの
-ファイルマネージャまたは SFTP で **`/home/container/.env`** に置いてください（再デプロイで消えません）。
+`sorahost.json` には環境変数を渡す項目が無く、CLI は `.env` を**必ず除外**します。Pterodactyl の
+Startup 変数も egg 側の名前（`MAIN_FILE` など）に固定されています。パネルのファイルマネージャまたは
+SFTP で **`/home/container/.env`** に置いてください（PteWorker は再デプロイでも消えません）。
 
 ```sh
 NAROU_RELAY_KEY=<Worker の NAROU_RELAY_KEY と同じ値>
 NAROU_RELAY_ALLOWED_HOSTS=syosetu.org,novel18.syosetu.com   # 取得先を完全一致で列挙
+NAROU_RELAY_HOST=0.0.0.0                                    # Node.js egg のときだけ必須
 ```
 
 読み込み順は **環境変数（プラットフォームの値）が最優先**、次に `NAROU_RELAY_ENV_FILE`、
@@ -103,11 +140,14 @@ NAROU_RELAY_ALLOWED_HOSTS=syosetu.org,novel18.syosetu.com   # 取得先を完全
 
 ## 6. 公開と TLS
 
-PteWorker が発行する公開 URL は **平文 HTTP**（`http://<IP>:<port>/`）です。リレーは
+SORAHOST の公開先はどちらの製品も **平文 HTTP**（PteWorker は `http://<IP>:<port>/`、
+Pterodactyl の Node.js egg は割り当て IP:ポートそのもの）です。リレーは
 `X-Proxy-Token` と転送 Cookie を載せるため、**平文のまま公開しないでください**。Cloudflare の
 コネクタ（cloudflared）やリバースプロキシで HTTPS を終端し、その URL を Worker の
 `NAROU_RELAY_ENDPOINT` に設定します。
 
+- Node.js egg の場合は、起動コマンドから `cloudflared tunnel run --token ...` を同居させるか、
+  前段にリバースプロキシを置いてください。
 - リレー用のホスト名には **Cloudflare Access を付けないでください**（Worker はログインできません。
   リレーが受け取るのは `X-Proxy-Token` だけです）。
 - Worker（Cloudflare）から同じゾーンのトンネル ホスト名への `connect()` は経路が問題になりやすいため、
@@ -123,21 +163,22 @@ python3 scripts/relay/verify_auth.py                  # 誤トークン 403 / �
 ```
 
 - リレーが curl を使えているかは、`/proxy` の応答の `via` で分かります（`curl` / `node-http`）。
-  起動ログにも `narou relay listening on 127.0.0.1:<port> (curl: bundled|path|env)` と出ます。
+  起動ログにも `narou relay listening on <host>:<port> (curl: bundled|path|env)` と出ます。
   `curl: path` は同梱 curl を用意できず PATH の curl を試す状態で、それも無ければ Node 実装で取得します。
 - `403` は Worker とリレーの `NAROU_RELAY_KEY` の不一致です。鍵が未設定なら Node 版は起動しません
   （起動ログに `NAROU_RELAY_KEY is required`）。起動後の `500` はリレー内部の異常です。
 
 ## 8. Cloud Run との違い（要点）
 
-| | Cloud Run | SORAHOST (PteWorker) |
-| --- | --- | --- |
-| 配備 | Developer Connect + Cloud Build（`/scripts/relay` がビルド文脈） | `sorahost-cli deploy`（組み立てたフォルダー） |
-| 起動 | Buildpacks の `npm start` | `sorahost.json` の `start` |
-| 常駐 | 最小 0 で休止しうる | 常時起動 |
-| 設定 | 環境変数（Secret Manager） | `/home/container/.env` |
-| curl | イメージの curl | 同梱した静的 curl |
-| TLS | Cloud Run が終端 | 自前（コネクタ / リバースプロキシ） |
+| | Cloud Run | SORAHOST (PteWorker) | SORAHOST (Node.js egg) |
+| --- | --- | --- | --- |
+| 配備 | Developer Connect + Cloud Build（`/scripts/relay` がビルド文脈） | `sorahost-cli deploy`（組み立てたフォルダー） | SFTP / ファイルマネージャ（組み立てたフォルダー） |
+| 起動 | Buildpacks の `npm start` | `sorahost.json` の `start` | Startup コマンドの差し替え |
+| 待受 | `0.0.0.0`（`K_SERVICE`） | ループバック | `0.0.0.0`（`NAROU_RELAY_HOST`） |
+| 常駐 | 最小 0 で休止しうる | 常時起動 | 常時起動 |
+| 設定 | 環境変数（Secret Manager） | `/home/container/.env` | `/home/container/.env` |
+| curl | イメージの curl | 同梱した静的 curl | 同梱した静的 curl |
+| TLS | Cloud Run が終端 | 自前（コネクタ / リバースプロキシ） | 自前（コネクタ / リバースプロキシ） |
 
 同じ理由（出口 IP を Cloudflare 以外に置く）で運用し、**片方だけを配備しても Worker 側の設定は同じ**です。
 `NAROU_RELAY_ENDPOINT` を切り替えれば移行できます。

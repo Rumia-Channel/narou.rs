@@ -10,6 +10,7 @@
 - 外部取得リレーを `scripts/relay/` へ整理し、設定を `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` に統一しました。`/proxy`・`X-Proxy-Token`・応答形式と本体のフォールバックは維持し、リレーの配置先を独立して変更できます。旧設定の自動移行や既存 Secret の削除は行いません。
 - 外部リレーを通常の Node.js 24 HTTP サービスとして Cloud Run Buildpacks / Developer Connect へ配備する構成と日本語手順を追加しました。Cloud Run の PORT と待受に対応し、Functions Framework や Dockerfile、本体 CI への GCP 認証・配備依存は導入しません。
 - 外部リレーを SORAHOST (PteWorker) へ**単体で**配備できるようにし、Cloud Run と同一コードで動かせるようにしました。待受は `PORT` → `SERVER_PORT`、アドレスは `NAROU_RELAY_HOST`（既定は `K_SERVICE` の有無で `0.0.0.0` / ループバック）、設定は環境変数 → `/home/container/.env` の順に解決します。コンテナに curl が無い環境向けに、ハッシュ検証済みの静的 curl と CA を同梱して書き込み可能な場所へコピーしてから使います。`scripts/relay/deploy-sorahost.mjs` が配備フォルダーを組み立て、ホスト差の回帰は `tests/relay-hosting.test.mjs` が固定します。Nano (128 MB) は応答 16 MiB でピーク約 148 MB のため Micro (256 MB) を推奨します。
+- SORAHOST の Node.js プラン（Pterodactyl の汎用 Node.js egg）向けに、同じ配備フォルダーを SFTP で置き、起動コマンドを `node server.mjs` へ差し替える手順を追加しました。既定の起動コマンドは `MAIN_FILE` の判定が引用符で常に偽になり `ts-node` 側へ落ちるため、そのままでは起動しません。この egg は待受に `0.0.0.0` が必要なので `NAROU_RELAY_HOST` を `.env` に設定します。
 - 外部リレーに必須のホスト許可リスト、DNS 検証と接続先固定、timing-safe 認証、期限・切断時の中断を追加しました。curl 優先と既存 JSON/base64 契約は維持し、代替 HTTP(S) も同じ安全性検証を通します。Node/curl とローカル Worker の回帰を CI に組み込みました。実 Cloud Run の出口・curl・対象サイトの取得可否は配備後の確認が必要です。
 
 変更一覧は [v0.4.14...v0.4.15](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.14...v0.4.15) を参照してください。
