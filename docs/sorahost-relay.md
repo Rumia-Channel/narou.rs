@@ -49,7 +49,7 @@ node scripts/relay/deploy-sorahost.mjs --out DIR  # 出力先を固定して残�
 node scripts/relay/deploy-sorahost.mjs --runtime DIR  # 起動用の実行環境を用意 (再利用可)
 ```
 
-このスクリプトは `scripts/deploy-tools.json` のピン（`curl_version`）で
+このスクリプトは `scripts/relay/pins.json` のピン（`curl_version`）で
 [moparisthebest/static-curl](https://github.com/moparisthebest/static-curl) の Linux x86_64 ビルドを取得し、
 配布物の `sha256sum.txt` と**ハッシュを照合**してから、次を 1 つのフォルダーへまとめます（約 6.4 MB）。
 
@@ -113,7 +113,7 @@ Startup の設定:
 3. `relay.js` が `scripts/relay/deploy-sorahost.mjs` の `prepareRuntime` で
    `/home/container/relay-runtime/` を用意する
    - コードはリポジトリと**ハッシュ一致**するか確認する（違えば新しいバージョンへ更新）
-   - 静的 curl は `scripts/deploy-tools.json` の**ピン留めした SHA-256**と一致するものを再利用し、
+   - 静的 curl は `scripts/relay/pins.json` の**ピン留めした SHA-256**と一致するものを再利用し、
      無い・壊れているときだけ再取得する（公開 `sha256sum.txt` との照合も行う）
    - CA バンドルは前回のマニフェストのハッシュで検証して再利用する
    - 準備は一時ディレクトリで行い、**成功したときだけ切り替える**（失敗しても前の環境は壊れない）
