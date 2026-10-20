@@ -56,7 +56,7 @@ try {
   clearTimeout(timer);
   tests = spawn(process.execPath, [
     "--test", "--test-timeout=90000", "tests/relay.test.mjs", "tests/relay-policy.test.mjs", "tests/relay-server.test.mjs",
-    "tests/relay-hosting.test.mjs",
+    "tests/relay-hosting.test.mjs", "tests/relay-entry.test.mjs",
   ], {
     cwd: root, stdio: "inherit", detached: !windows,
     env: { ...process.env, RELAY_WORKER_BASE_URL: `http://127.0.0.1:${port}`, RELAY_TEST_TOKEN: token },

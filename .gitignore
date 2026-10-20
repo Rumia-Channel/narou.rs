@@ -73,3 +73,10 @@ __pycache__/
 
 # Cloud Run リレーのローカル npm 依存
 /scripts/relay/node_modules/
+
+# SORAHOST リレーの実行環境 (relay.js が起動時に生成する。配備物ではない)
+/relay-runtime/
+
+# SORAHOST のサーバー側に置く設定 (秘密鍵を含む)
+/.env
+

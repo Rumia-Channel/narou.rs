@@ -1,5 +1,6 @@
 {
   "curl_version": "v8.21.0",
+  "curl_sha256": "e45ae1805ceb3f816e9768fbbaba05d98a2dc9c5577f66395f37660941d88e19",
   "cloudflared_version": "2026.9.3",
   "cloudflared_sha256": "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
 }
