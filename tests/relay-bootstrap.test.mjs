@@ -140,7 +140,7 @@ test("bootstrap starts server.mjs with the configured curl", { timeout: 60_000 }
     await waitFor(() => output.includes(`listening on 0.0.0.0:${port}`), `待受ログ (${output.slice(-300)})`);
     const health = await fetch(`http://127.0.0.1:${port}/health`);
     assert.equal(health.status, 200);
-    assert.deepEqual(await health.json(), { ok: true });
+    assert.deepEqual(await health.json(), { ok: true, fetch: "curl,node" });
     const denied = await fetch(`http://127.0.0.1:${port}/proxy`, { method: "POST" });
     assert.equal(denied.status, 403);
   } finally {

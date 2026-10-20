@@ -4,6 +4,7 @@ import { chmodSync, copyFileSync, existsSync, readFileSync, rmSync } from "node:
 import http from "node:http";
 import https from "node:https";
 import { isIP } from "node:net";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
@@ -59,6 +60,25 @@ export const resolveCurl = ({ env = process.env, dir = moduleDir, verify = true 
   const cacert = existsSync(join(dir, "cacert.pem")) ? join(dir, "cacert.pem") : null;
   const prepared = prepareBundledCurl(bundled, { verify }) || (runnable(bundled, verify) ? bundled : null);
   return prepared ? { bin: prepared, cacert, source: "bundled" } : { bin: "curl", cacert: null, source: "path" };
+};
+
+/// wget の実行ファイルと CA バンドルを決める。優先順は環境変数 → 同梱 →
+/// PATH の wget。wget は curl の `--resolve` に相当する DNS 固定ができない
+/// ため、実際の接続は startPinnedProxy() が検証済み IP に対して行う。
+/// `available` は起動時の疎通確認結果 (無い場合は取得順から外す)。
+export const resolveWget = ({ env = process.env, dir = moduleDir, verify = true } = {}) => {
+  const cacert = String(env.NAROU_RELAY_CACERT ?? "").trim() || null;
+  const configured = String(env.NAROU_RELAY_WGET ?? "").trim();
+  if (configured) {
+    return { bin: configured, cacert, source: "env", available: runnable(configured, verify) };
+  }
+  const names = process.platform === "win32" ? ["wget.exe", "wget"] : ["wget"];
+  const bundled = names.map((name) => join(dir, name)).find((path) => existsSync(path));
+  if (bundled) {
+    const bundledCacert = existsSync(join(dir, "cacert.pem")) ? join(dir, "cacert.pem") : cacert;
+    return { bin: bundled, cacert: bundledCacert, source: "bundled", available: runnable(bundled, verify) };
+  }
+  return { bin: "wget", cacert, source: "path", available: runnable("wget", verify) };
 };
 
 const messages = {
@@ -168,6 +188,172 @@ export const viaCurl = (target, headers, { curlBin, cacert = null, timeoutMs, si
     });
     child.stdin.end(headers.map(([name, value]) => `${name}: ${value}\r\n`).join(""));
   });
+
+// wget には curl の `--resolve` に相当する接続先固定が無いため、127.0.0.1 に
+// 使い捨ての CONNECT プロキシを立て、検証済み IP へだけトンネルする。
+// TLS の SNI と証明書検証は wget が元のホスト名に対して行う。
+const WGET_UNFORWARDED = new Set([
+  "host", "user-agent", "accept-encoding", "connection", "proxy-connection", "content-length",
+]);
+const WGET_OUTPUT_LIMIT = MAX_HEAD_BYTES + MAX_BODY_BYTES;
+
+const normalizedHost = (value) =>
+  String(value).replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+
+const startPinnedProxy = (target, { signal }) => new Promise((resolve, reject) => {
+  const expectedHost = normalizedHost(target.url.hostname);
+  const expectedPort = Number(target.url.port || (target.url.protocol === "https:" ? 443 : 80));
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => socket.destroy());
+    let head = Buffer.alloc(0);
+    const onData = (chunk) => {
+      head = Buffer.concat([head, chunk]);
+      if (head.length > MAX_HEAD_BYTES) { socket.destroy(); return; }
+      const end = head.indexOf("\r\n\r\n");
+      if (end < 0) return;
+      socket.off("data", onData);
+      const line = head.subarray(0, head.indexOf("\r\n")).toString("latin1");
+      const match = /^CONNECT\s+([^\s]+):(\d+)\s+HTTP\/1\.[01]$/i.exec(line);
+      if (!match || Number(match[2]) !== expectedPort || normalizedHost(match[1]) !== expectedHost) {
+        socket.destroy();
+        return;
+      }
+      const upstream = net.connect({ host: target.address, port: expectedPort });
+      upstream.on("error", () => socket.destroy());
+      socket.on("close", () => upstream.destroy());
+      upstream.once("connect", () => {
+        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        const rest = head.subarray(end + 4);
+        if (rest.length > 0) upstream.write(rest);
+        socket.pipe(upstream);
+        upstream.pipe(socket);
+      });
+    };
+    socket.on("data", onData);
+  });
+  const close = () => {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  };
+  server.on("error", reject);
+  if (signal.aborted) { close(); reject(new RelayTransportError("cancelled")); return; }
+  server.listen(0, "127.0.0.1", () => resolve({
+    port: server.address().port,
+    close: () => {
+      for (const socket of sockets) socket.destroy();
+      server.close();
+    },
+  }));
+});
+
+// wget --save-headers の出力 (応答ヘッド + 本文) を分解する。
+const parseWgetOutput = (buffer) => {
+  const end = buffer.indexOf("\r\n\r\n");
+  if (end < 0 || end > MAX_HEAD_BYTES) throw new RelayTransportError("incomplete");
+  const lines = buffer.subarray(0, end).toString("utf8").split("\r\n");
+  const status = Number((lines[0].match(/^HTTP\/[\d.]+ (\d{3})/) || [])[1]);
+  if (!(status >= 200 && status <= 599)) throw new RelayTransportError("incomplete");
+  const headers = [];
+  for (const line of lines.slice(1)) {
+    const separator = line.indexOf(":");
+    if (separator > 0) headers.push([line.slice(0, separator).trim(), line.slice(separator + 1).trim()]);
+  }
+  const body = buffer.subarray(end + 4);
+  if (body.length > MAX_BODY_BYTES) throw new RelayTransportError("too-large");
+  return {
+    status,
+    contentType: headerValue(headers, "content-type"),
+    location: headerValue(headers, "location") || undefined,
+    setCookie: headers.filter(([name]) => name.toLowerCase() === "set-cookie").map(([, value]) => value),
+    body,
+    via: "wget",
+  };
+};
+
+/// GNU wget 経由の取得。Cloudflare は同じ IP でもクライアント指紋で結果が
+/// 変わることがあるため、curl が 403 になる環境向けの代替経路として使う。
+/// 接続先はローカル CONNECT プロキシが固定し、Wgetrc と環境プロキシは潰す。
+export const viaWget = async (target, headers, { wgetBin, cacert = null, timeoutMs, signal }) => {
+  if (signal.aborted) throw new RelayTransportError("cancelled");
+  // HTTP はプロキシ経由の絶対形式になり TLS 固定の前提が崩れるため、curl/Node に任せる。
+  if (target.url.protocol !== "https:") throw new RelayTransportError("failed");
+  const proxy = await startPinnedProxy(target, { signal });
+  const local = new AbortController();
+  const timer = setTimeout(() => local.abort(), timeoutMs);
+  timer.unref();
+  const combined = AbortSignal.any([signal, local.signal]);
+  let child;
+  let leftover = null;
+  let length = 0;
+  const chunks = [];
+  try {
+    const userAgent = headerValue(headers, "user-agent");
+    const seconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+    const args = [
+      "--no-verbose", "--save-headers", "--content-on-error",
+      "--output-document=-", "--tries=1", "--max-redirect=0",
+      `--connect-timeout=${Math.min(10, seconds)}`,
+      `--read-timeout=${seconds}`, `--timeout=${seconds}`,
+    ];
+    if (cacert) args.push(`--ca-certificate=${cacert}`);
+    if (userAgent) args.push(`--user-agent=${userAgent}`);
+    for (const [name, value] of headers) {
+      if (WGET_UNFORWARDED.has(name.toLowerCase())) continue;
+      args.push(`--header=${name}: ${value}`);
+    }
+    args.push("--", target.url.href);
+    const proxyUrl = `http://127.0.0.1:${proxy.port}`;
+    child = spawn(wgetBin, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      env: {
+        ...process.env,
+        http_proxy: proxyUrl, https_proxy: proxyUrl,
+        HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl,
+        no_proxy: "", NO_PROXY: "",
+        WGETRC: process.platform === "win32" ? "NUL" : "/dev/null",
+      },
+    });
+    return await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callback, value) => { if (settled) return; settled = true; callback(value); };
+      const stop = (reason) => {
+        leftover ||= new RelayTransportError(reason);
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+        finish(reject, leftover);
+      };
+      const onAbort = () => stop(signal.aborted ? "cancelled" : "timed-out");
+      combined.addEventListener("abort", onAbort, { once: true });
+      child.stdout.on("data", (chunk) => {
+        length += chunk.length;
+        if (length > WGET_OUTPUT_LIMIT) return stop("too-large");
+        if (!settled) chunks.push(chunk);
+      });
+      // 診断は捨てる。URL・Cookie・資格情報を含む可能性がある。
+      child.stderr.on("data", () => {});
+      child.on("error", () => stop("not-installed"));
+      child.once("close", (code) => {
+        combined.removeEventListener("abort", onAbort);
+        if (settled) return;
+        if (combined.aborted) return finish(reject, leftover || new RelayTransportError("cancelled"));
+        try {
+          finish(resolve, parseWgetOutput(Buffer.concat(chunks, length)));
+        } catch (error) {
+          finish(reject, error instanceof RelayTransportError
+            ? error
+            : new RelayTransportError(code === 8 ? "failed" : "incomplete"));
+        }
+      });
+    });
+  } finally {
+    clearTimeout(timer);
+    proxy.close();
+    if (child && child.exitCode === null) { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+  }
+};
 
 // global fetch では DNS を固定できないため、代替経路も標準 HTTP(S) の lookup を固定する。
 // TLS は URL の元のホスト名で検証し、プロキシ・リダイレクト・共有接続プールを使わない。
