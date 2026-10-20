@@ -39,9 +39,15 @@ command -v cloudflared
 
 ## 2. リポジトリ
 
+リレーの **wget トランスポートは develop にあります**（main はリリース用でまだ入っていません）。VPS では develop を使ってください。
+
 ```sh
-cd ~/narou.rs 2>/dev/null || git clone --depth 1 https://github.com/Rumia-Channel/narou.rs.git ~/narou.rs
-cd ~/narou.rs && git pull
+cd ~/narou.rs 2>/dev/null || git clone --branch develop --depth 1 https://github.com/Rumia-Channel/narou.rs.git ~/narou.rs
+cd ~/narou.rs
+git fetch origin
+git checkout develop 2>/dev/null || git checkout -b develop origin/develop
+git pull
+git log --oneline -3   # wget トランスポート / この runbook の commit があること
 ```
 
 ## 3. リレーの設定（.env）
@@ -87,6 +93,7 @@ curl -sS http://127.0.0.1:3000/health
 ```
 
 `fetch` が `curl,node` になる場合は `NAROU_RELAY_FETCH` の設定漏れ、または wget が未導入です。
+起動ログが `(curl: path)` で `/health` が `{"ok":true}` だけを返す場合は **main の旧コード**で動いています。§2 に戻って develop へ切り替え、リレーを再起動してください（systemd なら `sudo systemctl restart narou-relay`）。
 
 ## 5. DNS をトンネルへ向ける
 
