@@ -293,6 +293,9 @@ export const viaWget = async (target, headers, { wgetBin, cacert = null, timeout
     const userAgent = headerValue(headers, "user-agent");
     const seconds = Math.max(1, Math.ceil(timeoutMs / 1000));
     const args = [
+      // wgetrc を読ませない。ユーザー設定のプロキシ・ヘッダで経路が変わらないようにする。
+      // (--no-config は Wget 1.16 以降)
+      "--no-config",
       "--no-verbose", "--save-headers", "--content-on-error",
       "--output-document=-", "--tries=1", "--max-redirect=0",
       `--connect-timeout=${Math.min(10, seconds)}`,
@@ -314,7 +317,6 @@ export const viaWget = async (target, headers, { wgetBin, cacert = null, timeout
         http_proxy: proxyUrl, https_proxy: proxyUrl,
         HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl,
         no_proxy: "", NO_PROXY: "",
-        WGETRC: process.platform === "win32" ? "NUL" : "/dev/null",
       },
     });
     return await new Promise((resolve, reject) => {
