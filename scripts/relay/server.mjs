@@ -20,7 +20,7 @@ import {
 } from "./worker/protocol.mjs";
 import { loadEnvFile, resolveHost, resolvePort } from "./env.mjs";
 import { createTargetResolver, normalizeHost, RelayTargetError } from "./security.mjs";
-import { resolveCurl, viaCurl, viaPinnedHttp, RelayTransportError } from "./transport.mjs";
+import { resolveCurl, resolveWget, viaCurl, viaPinnedHttp, viaWget, RelayTransportError } from "./transport.mjs";
 
 const digest = (value) => createHash("sha256").update(value).digest();
 
@@ -90,6 +90,30 @@ const forwardHeaders = (raw, target) => {
   return pairs;
 };
 
+const FETCH_TRANSPORTS = ["curl", "wget", "node"];
+
+// 取得順は環境変数 NAROU_RELAY_FETCH で指定する (既定 curl,node)。
+// Cloudflare が curl を 403 にするが wget は通るホストがあるため、VPS 等では
+// `NAROU_RELAY_FETCH=wget,node` のように wget を先頭にできる。
+export const resolveFetchOrder = (requested, { wget = null, logger = () => {} } = {}) => {
+  const raw = requested == null ? (process.env.NAROU_RELAY_FETCH ?? "") : requested;
+  const text = String(raw ?? "").trim().toLowerCase();
+  const list = (text ? text.split(",") : ["curl", "node"]).map((name) => name.trim()).filter(Boolean);
+  if (list.length === 0) return ["curl", "node"];
+  const order = [];
+  for (const name of list) {
+    if (!FETCH_TRANSPORTS.includes(name)) throw new Error(`invalid NAROU_RELAY_FETCH: ${name}`);
+    if (!order.includes(name)) order.push(name);
+  }
+  const resolved = order.filter((name) => {
+    if (name !== "wget") return true;
+    if (wget && wget.available !== false) return true;
+    logger("wget が見つからないため取得順から外します (NAROU_RELAY_WGET または PATH の wget)");
+    return false;
+  });
+  return resolved.length > 0 ? resolved : ["node"];
+};
+
 // テストは別ディレクトリの fixture から resolver を注入する。本番に私設 IP 許可設定は置かない。
 export const createRelayServer = ({
   token = process.env.NAROU_RELAY_KEY || "",
@@ -98,7 +122,12 @@ export const createRelayServer = ({
   curl,
   curlBin,
   curlCacert = null,
+  wget,
+  wgetBin,
+  wgetCacert = null,
+  fetchOrder,
   curlTimeoutMs = 30_000,
+  wgetTimeoutMs = 30_000,
   fallbackTimeoutMs = 30_000,
   requestTimeoutMs = 75_000,
   logger = (message) => console.warn(message),
@@ -106,8 +135,35 @@ export const createRelayServer = ({
   if (typeof token !== "string" || !token) throw new Error("NAROU_RELAY_KEY is required");
   // curlBin / curlCacert はテストと明示指定用。未指定なら同梱 curl を探す。
   const curlConfig = curl ?? (curlBin ? { bin: curlBin, cacert: curlCacert } : resolveCurl({ env: process.env }));
+  // wget は curl が 403 になる環境向けの代替経路。注入された設定を最優先する。
+  let wgetConfig;
+  if (wget !== undefined) wgetConfig = wget;
+  else if (wgetBin) wgetConfig = { bin: wgetBin, cacert: wgetCacert, source: "env", available: true };
+  else {
+    wgetConfig = resolveWget({ env: process.env });
+    if (wgetCacert) wgetConfig = { ...wgetConfig, cacert: wgetCacert };
+  }
+  const order = resolveFetchOrder(fetchOrder, { wget: wgetConfig, logger });
   const expectedToken = digest(token);
   const resolve = resolveTarget || createTargetResolver(allowedHosts);
+  // 取得順の 1 段を実行する。HTTP 応答が返ればそこで確定し、403 等でも
+  // 次の経路へは進まない (1 リクエスト = 上流 1 回の契約を維持する)。
+  const runFetch = (transport, target, headers, signal) => {
+    switch (transport) {
+      case "curl":
+        return viaCurl(target, headers, {
+          curlBin: curlConfig.bin, cacert: curlConfig.cacert, timeoutMs: curlTimeoutMs, signal,
+        });
+      case "wget":
+        return viaWget(target, headers, {
+          wgetBin: wgetConfig.bin, cacert: wgetConfig.cacert, timeoutMs: wgetTimeoutMs, signal,
+        });
+      case "node":
+        return viaPinnedHttp(target, headers, { timeoutMs: fallbackTimeoutMs, signal });
+      default:
+        return Promise.reject(new RelayTransportError("failed"));
+    }
+  };
   const handler = async (req, res) => {
     const json = (status, value) => {
       if (res.destroyed || res.writableEnded || res.headersSent) return;
@@ -129,7 +185,9 @@ export const createRelayServer = ({
       let requestUrl;
       try { requestUrl = new URL(req.url, "http://localhost"); } catch { return json(400, { error: "invalid request" }); }
       if (requestUrl.pathname === "/health") {
-        return req.method === "GET" ? json(200, { ok: true }) : json(405, { error: "method not allowed" });
+        return req.method === "GET"
+          ? json(200, { ok: true, fetch: order.join(",") })
+          : json(405, { error: "method not allowed" });
       }
       if (requestUrl.pathname !== "/proxy") return json(404, { error: "not found" });
       const supplied = req.headers["x-proxy-token"];
@@ -155,17 +213,20 @@ export const createRelayServer = ({
       const target = await withSignal(resolve(payload.url, { signal: abort.signal }), abort.signal);
       let headers;
       try { headers = forwardHeaders(payload.headers, target.url); } catch { return json(400, { error: "invalid request headers" }); }
-      let result;
-      try {
-        result = await viaCurl(target, headers, {
-          curlBin: curlConfig.bin, cacert: curlConfig.cacert, timeoutMs: curlTimeoutMs, signal: abort.signal,
-        });
-      } catch (error) {
-        if (!(error instanceof RelayTransportError)) throw error;
-        logger(`narou relay curl: ${error.reason}`);
-        if (["cancelled", "too-large", "tls-verification"].includes(error.reason)) throw error;
-        result = await viaPinnedHttp(target, headers, { timeoutMs: fallbackTimeoutMs, signal: abort.signal });
+      let result = null;
+      let lastError = null;
+      for (const transport of order) {
+        try {
+          result = await runFetch(transport, target, headers, abort.signal);
+          break;
+        } catch (error) {
+          if (!(error instanceof RelayTransportError)) throw error;
+          logger(`narou relay ${transport}: ${error.reason}`);
+          if (["cancelled", "too-large", "tls-verification"].includes(error.reason)) throw error;
+          lastError = error;
+        }
       }
+      if (!result) throw lastError || new RelayTransportError("failed");
       const { body, ...metadata } = result;
       try { assertResponseMetadata(metadata); } catch { throw new RelayTransportError("too-large"); }
       return json(200, { ...metadata, body: body.toString("base64") });
@@ -196,6 +257,12 @@ export const createRelayServer = ({
   });
   server.requestTimeout = requestTimeoutMs;
   server.headersTimeout = Math.min(10_000, requestTimeoutMs);
+  server.fetchOrder = order;
+  server.fetchSummary = order.map((name) => {
+    if (name === "curl") return `curl:${curlConfig.source ?? "path"}`;
+    if (name === "wget") return `wget:${wgetConfig?.source ?? "path"}`;
+    return name;
+  }).join(", ");
   return server;
 };
 
@@ -211,13 +278,19 @@ export const startRelay = ({ env = process.env, ...options } = {}) => {
   const host = resolveHost(env);
   const curl = options.curl
     ?? (options.curlBin ? { bin: options.curlBin, cacert: options.curlCacert ?? null, source: "env" } : resolveCurl({ env }));
+  const wget = options.wget
+    ?? (options.wgetBin
+      ? { bin: options.wgetBin, cacert: options.wgetCacert ?? null, source: "env", available: true }
+      : { ...resolveWget({ env }), ...(options.wgetCacert ? { cacert: options.wgetCacert } : {}) });
   const server = createRelayServer({
     token: env.NAROU_RELAY_KEY || "",
     allowedHosts: env.NAROU_RELAY_ALLOWED_HOSTS || "",
     ...options,
     curl,
+    wget,
+    fetchOrder: options.fetchOrder ?? env.NAROU_RELAY_FETCH ?? "",
   });
-  server.listen(port, host, () => console.log(`narou relay listening on ${host}:${server.address().port} (curl: ${curl.source})`));
+  server.listen(port, host, () => console.log(`narou relay listening on ${host}:${server.address().port} (fetch: ${server.fetchSummary})`));
   return server;
 };
 

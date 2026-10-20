@@ -42,6 +42,9 @@ runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカー�
 - `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` … 任意の外部取得リレー。
   リレーの公開先と `X-Proxy-Token` の合言葉を同名の Worker secret として投入する。
   リレー自体の配置・更新はこの CI からは行わない。
+- `RELAY_DOMAIN` … リレーの公開ドメイン（例 `relay.example.com`）。設定時は
+  `NAROU_RELAY_ENDPOINT` ではなく `https://<RELAY_DOMAIN>` を Worker secret に入れる。
+  Cloudflare の名前付きトンネル等で URL が固定されている場合に使う。
 - `SERVICE_DOMAIN` / `DEVELOP_DOMAIN` … custom domain。secret を推奨（ログへ出さない）
 - `NAROU_DEPLOY_URL` … smoke の宛先を明示する（既定は domain → workers.dev）
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` … Access の service token。
@@ -472,12 +475,23 @@ def secret_file(target: str) -> Path | None:
             )
     # 外部の取得リレー（任意）。値があるときだけ Worker secret として渡す。
     # 未設定なら Worker 側のリレー段は無効のまま（Cloudflare から取れないサイトが残る）。
-    for name in ("NAROU_RELAY_ENDPOINT", "NAROU_RELAY_KEY"):
-        value = os.environ.get(name, "").strip()
-        if value:
-            secrets[name] = value
-        else:
-            print(f"::notice::{name} is not set; the relay fallback stays disabled")
+    # RELAY_DOMAIN があれば https://<domain> を公開先として優先する（名前付きトンネル用）。
+    # 公開先とキーは両方揃ったときだけ入れる（片方だけ残して古い値と組み合わさらないように）。
+    relay_domain = os.environ.get("RELAY_DOMAIN", "").strip()
+    relay_endpoint = os.environ.get("NAROU_RELAY_ENDPOINT", "").strip()
+    if relay_domain:
+        relay_endpoint = relay_domain if "://" in relay_domain else f"https://{relay_domain}"
+    relay_key = os.environ.get("NAROU_RELAY_KEY", "").strip()
+    if relay_endpoint and relay_key:
+        secrets["NAROU_RELAY_ENDPOINT"] = relay_endpoint
+        secrets["NAROU_RELAY_KEY"] = relay_key
+    else:
+        missing = []
+        if not relay_endpoint:
+            missing.append("RELAY_DOMAIN / NAROU_RELAY_ENDPOINT")
+        if not relay_key:
+            missing.append("NAROU_RELAY_KEY")
+        print(f"::notice::{', '.join(missing)} is not set; the relay fallback stays disabled")
 
     if not secrets:
         return None

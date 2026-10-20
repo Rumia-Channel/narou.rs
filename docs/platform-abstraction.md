@@ -609,7 +609,7 @@ SORAHOST への配備は `scripts/relay/deploy-sorahost.mjs` が配備フォル�
 Cloud Run は [`cloud-run-relay.md`](cloud-run-relay.md) を参照する。
 両ホストの差は `tests/relay-hosting.test.mjs` が固定する。
 
-GitHub の `Cloudflare` 環境には同名の Secret `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` を置く。
+GitHub の `Cloudflare` 環境には同名の Secret `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` を置く。`RELAY_DOMAIN`（例 `relay.example.com`）を置いた場合は `NAROU_RELAY_ENDPOINT` より優先して `https://<RELAY_DOMAIN>` を Worker secret に使う（`worker_entry/ci/deploy_worker.py`）。
 本体 CI はこれらを Worker に渡すだけで、リレーのホスト作成・配備・認証確認は実行しない。
 旧 `SORAHOST_PROXY_*` からの別名参照は無いため、切り替え前に新名へ設定する。
 既存のサービス・Secret・ローカル資格情報は、ソース変更によって自動削除しない。

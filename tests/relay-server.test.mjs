@@ -1,10 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { createRelayServer, startRelay } from "../scripts/relay/server.mjs";
+import { createRelayServer, resolveFetchOrder, startRelay } from "../scripts/relay/server.mjs";
 import { resolveLocalTarget } from "./relay-fixture.mjs";
 import { key, cert } from "./relay-tls-fixture.mjs";
 
@@ -46,7 +50,7 @@ test("K_SERVICE selects the public Cloud Run listener without overriding PORT", 
       assert.equal(server.address().address, expectedHost);
       const response = await fetch(`http://127.0.0.1:${server.address().port}/health`);
       assert.equal(response.status, 200);
-      assert.deepEqual(await response.json(), { ok: true });
+      assert.deepEqual(await response.json(), { ok: true, fetch: "curl,node" });
     } finally { await close(server); }
   }
 });
@@ -104,6 +108,55 @@ test("a valid curl HTTP403 is not retried using a different backend", async () =
     assert.equal(requests, 1);
   } finally { await f.close(); }
 });
+
+test("fetch order accepts wget and drops it when unavailable", () => {
+  assert.deepEqual(resolveFetchOrder("wget,node", { wget: { available: true } }), ["wget", "node"]);
+  assert.deepEqual(resolveFetchOrder("curl", { wget: { available: true } }), ["curl"]);
+  assert.deepEqual(resolveFetchOrder("", { wget: { available: true } }), ["curl", "node"]);
+  assert.deepEqual(resolveFetchOrder("wget,node", { wget: { available: false } }), ["node"]);
+  assert.throws(() => resolveFetchOrder("bogus"), /invalid NAROU_RELAY_FETCH/);
+});
+
+const hasWget = !spawnSync("wget", ["--version"], { stdio: "ignore", timeout: 5000 }).error;
+
+test("the wget transport fetches HTTPS through the pinned proxy",
+  { skip: hasWget ? false : "wget is not installed" }, async () => {
+    const directory = mkdtempSync(join(tmpdir(), "narou-relay-wget-"));
+    const cacert = join(directory, "relay.invalid.pem");
+    writeFileSync(cacert, cert);
+    const f = await fixture((_req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("wget body");
+    }, {
+      fetchOrder: ["wget"],
+      wget: { bin: "wget", cacert, source: "test", available: true },
+    }, true);
+    try {
+      const response = await post(f.base, f.target, { "user-agent": "relay-test-agent" });
+      assert.equal(response.status, 200);
+      const result = await response.json();
+      assert.equal(result.status, 200);
+      assert.equal(result.via, "wget");
+      assert.equal(Buffer.from(result.body, "base64").toString(), "wget body");
+    } finally {
+      await f.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+test("http targets fall through the wget position to a supported transport",
+  { skip: hasWget ? false : "wget is not installed" }, async () => {
+    const f = await fixture((_req, res) => res.end("node body"), {
+      fetchOrder: ["wget", "node"],
+      wget: { bin: "wget", cacert: null, source: "test", available: true },
+    });
+    try {
+      const result = await (await post(f.base, f.target)).json();
+      assert.equal(result.status, 200);
+      assert.equal(result.via, "node-http");
+      assert.equal(Buffer.from(result.body, "base64").toString(), "node body");
+    } finally { await f.close(); }
+  });
 
 test("curl unavailability uses only the same pinned HTTP destination without leaking diagnostics", async () => {
   const secret = "private-query-cookie-authorization";

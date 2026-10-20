@@ -126,8 +126,9 @@ Cloud Run のサービス詳細に表示される `https://...run.app` のサー
 
 - **`NAROU_RELAY_ENDPOINT`**: 前節の HTTPS サービス URL。
 - **`NAROU_RELAY_KEY`**: Secret Manager に保存したものと同じ認証キー。
+- **`RELAY_DOMAIN`**（任意）: リレーの公開ドメイン（例 `relay.example.com`）。設定すると、本リポジトリの CI は `NAROU_RELAY_ENDPOINT` より優先して `https://<RELAY_DOMAIN>` を Worker secret に入れる（`worker_entry/ci/deploy_worker.py`）。Cloudflare の名前付きトンネルなど、URL を固定して運用するときに使う。
 
-本リポジトリの本体 CI を使う場合は GitHub Environment `Cloudflare` の同名 Secret に登録します。`worker_entry/ci/deploy_worker.py` は既存どおりこれらを Worker に渡すだけで、Google Cloud の配備・認証はしません。独自に Worker を配備する利用者はその Worker 自身へ設定してください。Google のサービスアカウント JSON は不要です。
+本リポジトリの本体 CI を使う場合は GitHub Environment `Cloudflare` の同名 Secret に登録します（`RELAY_DOMAIN` もこの環境）。`worker_entry/ci/deploy_worker.py` は既存どおりこれらを Worker に渡すだけで、Google Cloud の配備・認証はしません。独自に Worker を配備する利用者はその Worker 自身へ設定してください。Google のサービスアカウント JSON は不要です。
 
 両方が揃ったときだけリレーが有効です。切り替え先の認証と取得を検証するまで、既存サービスや Secret を削除しないでください。本体の再配備/更新により設定を反映し、サイト定義・Cookie・取得間隔は従来のダウンロード経路を使います。
 
@@ -222,6 +223,22 @@ CPU/メモリ/リクエストだけでなく、インターネットへの転送
 | `tls-verification` | CA/証明書/ホスト名を確認。検証を無効化して回避しない |
 | 本体が元の403を返す | リレー未設定、リレー障害、上流が2xx/3xx以外の場合を確認 |
 | 前の版へ勝手に戻る/直らない | トリガーと配備元ブランチ、実際に配備されたcommit/リビジョン、Secret版を確認 |
+
+## 17. Cloudflare 保護サイト（ハーメルン等）は取得できない
+
+2026-10-20 の実測では、このリレー（データセンター回線）から `https://syosetu.org/`（ハーメルン）を取得すると、curl・wget・Node の HTTP/1.1／HTTP/2 のいずれでも **HTTP 403 (`cf-mitigated: challenge`)** でした。対照の `https://ncode.syosetu.com/` は正常（302）です。クライアントを変えても結果は変わらないため、Cloudflare は出口 IP を見て managed challenge を返しています。
+
+ハーメルン等を Workers から取得するには **自宅回線で動かすリレー**が必要です。手順と実測値は [home-relay.md](home-relay.md) を参照してください。このリレーは Pixiv など、データセンター回線でも取得できるサイト向けに引き続き利用できます。
+
+## 18. 取得クライアントの切り替え（NAROU_RELAY_FETCH）
+
+既定は `curl,node`（curl で取得し、curl が起動できない場合だけ Node）。Cloudflare が curl を 403 にし wget は通すホスト（例: 共有 IPv4 NAT の格安 VPS）では、`NAROU_RELAY_FETCH=wget,node` で wget 経由にできます。
+
+- 値はカンマ区切りの取得順。実行できない wget は起動時に外れ、起動ログと `/health` の `fetch` に実際の順序が出ます
+- wget は curl の `--resolve` 相当が無いため、127.0.0.1 の使い捨て CONNECT プロキシで検証済み IP へ接続し、TLS の SNI・検証は wget が行います
+- HTTP（非 TLS）の対象は wget では扱わず、次の経路へ進みます
+- 403 などの HTTP 応答は「取得結果」として扱われ、別クライアントでの再試行はしません（1 リクエスト = 上流 1 回の契約を維持）
+- リレーがデータセンター回線のままなら、wget に替えても Cloudflare の challenge は解けません。詳細と手順は [vps-relay.md](vps-relay.md) / [home-relay.md](home-relay.md)
 
 ## 検証済み範囲と未検証事項
 

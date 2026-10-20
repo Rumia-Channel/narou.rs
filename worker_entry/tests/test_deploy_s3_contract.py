@@ -416,5 +416,46 @@ class RenderTests(unittest.TestCase):
                 self.assertIn('binding = "S3_ACCESS_KEY_ID_STORE"', result)
 
 
+class RelaySecretTests(unittest.TestCase):
+    """RELAY_DOMAIN / NAROU_RELAY_ENDPOINT の解決（Worker secret）。"""
+
+    def build(self, env):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {**ENV, **env}, clear=True), \
+                patch.object(deploy, "WORKER_DIR", Path(directory)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            path = deploy.secret_file("develop")
+            self.assertIsNotNone(path)
+            return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_relay_domain_becomes_https_endpoint_and_wins(self):
+        secrets = self.build({
+            "RELAY_DOMAIN": "relay.example.com",
+            "NAROU_RELAY_ENDPOINT": "https://ignored.example.com",
+            "NAROU_RELAY_KEY": "relay-key",
+        })
+        self.assertEqual(secrets["NAROU_RELAY_ENDPOINT"], "https://relay.example.com")
+        self.assertEqual(secrets["NAROU_RELAY_KEY"], "relay-key")
+
+    def test_explicit_endpoint_is_used_without_relay_domain(self):
+        secrets = self.build({
+            "NAROU_RELAY_ENDPOINT": "https://relay.example.com",
+            "NAROU_RELAY_KEY": "relay-key",
+        })
+        self.assertEqual(secrets["NAROU_RELAY_ENDPOINT"], "https://relay.example.com")
+
+    def test_relay_is_disabled_unless_endpoint_and_key_are_both_present(self):
+        cases = (
+            {"RELAY_DOMAIN": "relay.example.com"},
+            {"NAROU_RELAY_KEY": "relay-key"},
+            {},
+        )
+        for env in cases:
+            with self.subTest(env=env):
+                secrets = self.build(env)
+                self.assertNotIn("NAROU_RELAY_ENDPOINT", secrets)
+                self.assertNotIn("NAROU_RELAY_KEY", secrets)
+
+
 if __name__ == "__main__":
     unittest.main()

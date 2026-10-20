@@ -207,7 +207,7 @@ test("relay.js starts server.mjs for the prepared runtime", { timeout: 60_000 },
 
     const health = await fetch(`http://127.0.0.1:${port}/health`);
     assert.equal(health.status, 200);
-    assert.deepEqual(await health.json(), { ok: true });
+    assert.deepEqual(await health.json(), { ok: true, fetch: "curl,node" });
 
     const denied = await fetch(`http://127.0.0.1:${port}/proxy`, { method: "POST" });
     assert.equal(denied.status, 403, "キー無しの /proxy は 403");
