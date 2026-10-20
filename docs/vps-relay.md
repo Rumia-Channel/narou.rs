@@ -1,5 +1,7 @@
 # VPS / Linux でのリレー運用（wget 経路）
 
+このリポジトリの現行デプロイ（`relay.rumia-ch.uk` / `narou-relay-vps`）向けの実運用手順は [`relay.md`](../relay.md) にまとめています。以下は一般的な手順です。
+
 Cloudflare は同じ IP でも**クライアント指紋**で結果を変えることがあります。実測では、格安 VPS の共有 IPv4 NAT 出口から
 
 - curl（HTTP/2）→ **403 `cf-mitigated: challenge`**
