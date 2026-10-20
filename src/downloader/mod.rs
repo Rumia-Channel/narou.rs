@@ -535,8 +535,10 @@ pub fn parse_datetime_with_timezone(value: &str, timezone: Option<&str>) -> Opti
 ///
 /// 空の User-Agent で送ると多くのサイトが 403 を返すため、どちらのビルドでも
 /// 必ず何かしらの UA を送る (native は `ua_generator` のランダム値)。
+/// Worker は外部リレー経由の取得でもこの値を使うため、Cloudflare が古い版を
+/// 不審扱いしないよう現行の Firefox に合わせて更新する。
 pub const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0";
 
 /// Resolve the CLI/saved user-agent, randomizing the value for `auto`/
 /// `random`. `ua_generator` は native ビルドでのみ使う。
