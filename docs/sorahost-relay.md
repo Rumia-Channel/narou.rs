@@ -264,5 +264,10 @@ python3 scripts/relay/verify_auth.py                  # 誤トークン 403 / �
   自前の Worker からのみ・共有鍵認証・許可ホストの完全一致・リダイレクト不追跡ですが、
   **常駐させる前に SORAHOST（Discord）へ用途を確認**しておくのが安全です。
 - 対象サイトのアクセス間隔・利用規約を尊重し、Challenge の自動操作は行いません。
+- **Cloudflare 保護サイト（ハーメルン等）はこのリレーでは取得できません。** 2026-10-20 の実測では、
+  データセンター回線から curl / wget / Node HTTP/1.1 / Node HTTP/2 のいずれでも 403 challenge でした
+  （対照の ncode.syosetu.com は正常）。理由は出口 IP で、クライアントを変えても解消しません。
+  ハーメルンは自宅回線のリレーが必要です。手順と実測値は [home-relay.md](home-relay.md) を参照。
+  SORAHOST のリレーは Pixiv など、データセンター回線でも取得できるサイト向けに維持できます。
 - 停止は PteWorker のコンソールから行えます。撤去するときはサーバーと `.sorahost.json`（配備トークン）を
   別々に整理してください。

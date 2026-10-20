@@ -223,6 +223,12 @@ CPU/メモリ/リクエストだけでなく、インターネットへの転送
 | 本体が元の403を返す | リレー未設定、リレー障害、上流が2xx/3xx以外の場合を確認 |
 | 前の版へ勝手に戻る/直らない | トリガーと配備元ブランチ、実際に配備されたcommit/リビジョン、Secret版を確認 |
 
+## 17. Cloudflare 保護サイト（ハーメルン等）は取得できない
+
+2026-10-20 の実測では、このリレー（データセンター回線）から `https://syosetu.org/`（ハーメルン）を取得すると、curl・wget・Node の HTTP/1.1／HTTP/2 のいずれでも **HTTP 403 (`cf-mitigated: challenge`)** でした。対照の `https://ncode.syosetu.com/` は正常（302）です。クライアントを変えても結果は変わらないため、Cloudflare は出口 IP を見て managed challenge を返しています。
+
+ハーメルン等を Workers から取得するには **自宅回線で動かすリレー**が必要です。手順と実測値は [home-relay.md](home-relay.md) を参照してください。このリレーは Pixiv など、データセンター回線でも取得できるサイト向けに引き続き利用できます。
+
 ## 検証済み範囲と未検証事項
 
 ローカルのNode24/Windowsでは、実Node/ローカルworkerdを通す54件とRustリレー9件・HTTP/1.1 codec23件が成功し、Worker wasmチェックも成功しました。実際の`npm start`で8080の公開待受、health200、不正キー403、公開検証先example.comの上流200/本文/`via=curl`、メタデータ宛の拒否、鍵未設定/ポート競合時のexit1を確認しました。
