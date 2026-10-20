@@ -636,8 +636,10 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 
 - 本体 CI は Native / GPL / Wasm / Worker / ライセンス等の通常の検証後に Worker を配備する。SORAHOST 専用ジョブ・`SORAHOST` 変数・`run_workers` 入力・リレー配備への `needs` は撤去済みで、再導入しない。
 - 外部取得リレーは `scripts/relay/`。Node + curl 版と fetch ランタイム版があり、`GET|POST /proxy`、`X-Proxy-Token`、JSON/base64 応答を共通契約とする。本体の `platform::relay` と `WorkerHttpClient::with_relay` は維持する。
-- Worker とリレーに同じ `NAROU_RELAY_KEY`、Worker に `NAROU_RELAY_ENDPOINT` を設定する。旧 `SORAHOST_PROXY_*` の別名は受け付けない。公開運用では HTTPS を使い、Node 版の既定待受 `127.0.0.1:${PORT:-3000}` はリバースプロキシで公開する。
-- 本体 CI はホストのプロビジョニングやリレーの配備を行わない。配置後の確認は `python3 scripts/relay/verify_auth.py`、実 HTTP の契約確認は `tests/relay.test.mjs` を使う。詳細は `docs/platform-abstraction.md`。
+- **リレーは配備先ごとに分岐させない。** Cloud Run (Buildpacks / `npm start`) と SORAHOST (PteWorker / `sorahost.json` の `start`) は同じ `scripts/relay/` を動かし、差は `env.mjs`(`PORT`→`SERVER_PORT`、`NAROU_RELAY_HOST`、`NAROU_RELAY_ENV_FILE` → モジュールの隣 → `$HOME` の `.env`) と `transport.mjs` の `resolveCurl`(`NAROU_RELAY_CURL` → 同梱 curl を書き込み可能な場所へコピー + 実行確認 → PATH) だけが吸収する。ホスト固有の分岐を `server.mjs` へ足さない。
+- SORAHOST へは単体（Micro 256MB 推奨）で置く。Nano 128MB は 16MiB 応答のピーク約 148MB で収まらない。`node scripts/relay/deploy-sorahost.mjs` がハッシュ検証済みの静的 curl + CA を同梱した配備フォルダーを組み立てる（コンテナに curl が無く、配備先は読み取り専用で実行ビットも落ちるため）。手順は `docs/sorahost-relay.md`、CI からの配備は行わない。
+- Worker とリレーに同じ `NAROU_RELAY_KEY`、Worker に `NAROU_RELAY_ENDPOINT` を設定する。旧 `SORAHOST_PROXY_*` の別名は受け付けない。公開運用では HTTPS を使い、Node 版の既定待受 `127.0.0.1:${PORT:-3000}` はリバースプロキシで公開する。PteWorker の公開 URL は平文 HTTP なので、そのまま公開せず HTTPS を終端する。
+- 本体 CI はホストのプロビジョニングやリレーの配備を行わない。配置後の確認は `python3 scripts/relay/verify_auth.py`、実 HTTP の契約確認は `tests/relay.test.mjs`、ホスト差の回帰は `tests/relay-hosting.test.mjs` を使う。詳細は `docs/platform-abstraction.md`。
 - 既存のサービス・Secret・保存済み資格情報はコード変更だけで削除しない。新しい設定を用意する前に、旧設定を勝手に消したり本番の取得を無効化したりしない。旧ホストの手動 native 配置資料は `sorahost/README.md` に残すが、CI とは接続しない。
 
 ### Worker の契約テスト (2026-09)

@@ -341,13 +341,15 @@ SORAHOST への自動配備は提供しません。Linux バンドルの作成�
 
 ## 10. Worker の取得リレーと同じサーバーで動かす (任意)
 
-既定は **別サーバー** (専用サーバー 1 台で narou だけを動かす)。どうしても同じ
-サーバーへ同居させたい場合だけ、次の手順になる。PteWorker は
-**1 プロジェクト = 起動コマンド 1 つ** なので、起動コマンドを narou の `start.sh`
-に寄せて、リレーはそこから起動する。
+リレーは **単体で 1 サーバー** に置くのが既定になった。専用の Micro (256 MB) を用意し、
+同じ `scripts/relay/` を PteWorker へ配備する手順は
+[**SORAHOST による外部 HTTP 取得リレー**](../docs/sorahost-relay.md) を参照する
+(Cloud Run と共通のコードで、差は `PORT`/`SERVER_PORT`・待受アドレス・`.env`・同梱 curl だけ)。
+Nano (128 MB) は応答 16 MiB でピーク約 148 MB になる実測があるため勧めない。
 
-新規の外部リレーは [Cloud Run Buildpacks の手順](../docs/cloud-run-relay.md)を参照する。
-以下は既存の手動同居構成向けで、SORAHOST の CI 配備を復活させるものではない。
+以下は、どうしても narou と同じサーバーへ同居させたい場合だけの手順である。PteWorker は
+**1 プロジェクト = 起動コマンド 1 つ** なので、起動コマンドを narou の `start.sh`
+に寄せて、リレーはそこから起動する。既存の手動同居構成向けで、SORAHOST の CI 配備を復活させるものではない。
 
 1. サーバー直下の `.env` に `NAROU_RELAY=1`、`NAROU_RELAY_KEY`、取得先を完全一致で列挙した `NAROU_RELAY_ALLOWED_HOSTS` を設定する。許可リスト未設定では取得しない。
 2. `scripts/relay/server.mjs`・`security.mjs`・`transport.mjs` と `scripts/relay/worker/protocol.mjs` を `start.sh` の隣へ同じ相対構成で配置する。ローカル状態・資格情報・テスト用 fixture は含めない。
