@@ -192,6 +192,8 @@ export const createRelayServer = ({
       if (requestUrl.pathname !== "/proxy") return json(404, { error: "not found" });
       const supplied = req.headers["x-proxy-token"];
       if (!timingSafeEqual(expectedToken, digest(typeof supplied === "string" ? supplied : ""))) {
+        // 403 の内訳を VPS のログで切り分けられるようにする (値は出さない)。
+        logger("narou relay proxy: authentication failed (X-Proxy-Token mismatch)");
         return json(403, { error: "forbidden" });
       }
       let payload;
@@ -229,9 +231,14 @@ export const createRelayServer = ({
       if (!result) throw lastError || new RelayTransportError("failed");
       const { body, ...metadata } = result;
       try { assertResponseMetadata(metadata); } catch { throw new RelayTransportError("too-large"); }
+      // 上流の 403 は「リレー自身の認証拒否」と区別できるようログに残す (URL は出さない)。
+      if (result.status === 403) logger("narou relay upstream status 403");
       return json(200, { ...metadata, body: body.toString("base64") });
     } catch (error) {
-      if (error instanceof RelayTargetError) return json(error.status, { error: error.message });
+      if (error instanceof RelayTargetError) {
+        logger(`narou relay target: ${error.message}`);
+        return json(error.status, { error: error.message });
+      }
       if (error instanceof RelayTransportError) {
         logger(`narou relay request: ${error.reason}`);
         return json(502, { error: error.message });
