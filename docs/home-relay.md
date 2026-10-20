@@ -13,13 +13,55 @@ Cloud Run / SORAHOST のリレーはデータセンター回線から取得す�
 | 実行場所 | curl (HTTP/2) | wget | Node fetch (HTTP/1.1) | Node HTTP/2 | 対照: ncode.syosetu.com |
 | --- | --- | --- | --- | --- | --- |
 | GitHub Actions（Azure のデータセンター） | 403 challenge | 403 challenge | 403 challenge | 403 challenge | 302（正常） |
-| 自宅回線 | 200 | 未検証 | 403 challenge | 200 | 302（正常） |
+| 自宅回線 | 200 | 200（ブラウザ UA。既定 UA は 403） | 403 challenge | 200 | 302（正常） |
 
 - データセンター回線では **クライアントを変えても 403**（Cloudflare の判定は出口 IP が主因）
 - 自宅回線ではクライアントによって結果が変わる（Node の HTTP/1.1 は 403、HTTP/2 と OS の curl は 200）
 - したがって「Cloud Run の curl を wget に差し替える」などのクライアント変更では解決しない
+- SORAHOST 上の Native でも取得できなかった（2026-10-20 利用者確認）。Cloud Run / SORAHOST の両方で、クライアントや UA を変えても 403 のまま
 
 補足: Pixiv はデータセンター経由でも取得できることを確認している（第三者プロキシ経由の取得例）。Cloud Run / SORAHOST のリレーは Pixiv 等の用途で引き続き利用できる。ハーメルンだけは自宅回線が必要。
+
+### 1.1 実際に送られていたリクエスト（2026-10-20 捕捉）
+
+リレー（Worker のヘッダを curl が送る）:
+
+```text
+Host
+Accept-Encoding: deflate, gzip        ← curl --compressed が追加（配備版は HTTP/2）
+Cookie: over18=off
+Accept / Accept-Language / Sec-Fetch-* / Upgrade-Insecure-Requests（サイト定義どおり）
+User-Agent: ... Firefox/131.0         ← Worker が最後に追加（設定が未指定なら DEFAULT_USER_AGENT）
+```
+
+ネイティブ（Linux の wget 段）:
+
+```text
+Host
+User-Agent: ... Firefox/157.0 or 158.0   ← ua_generator
+Accept（サイト定義の値）/ Accept-Encoding: gzip / Connection: keep-alive
+Accept-Language / Sec-Fetch-* / Upgrade-Insecure-Requests / Cookie: over18=off
+```
+
+同じ回線（自宅）で UA とクライアントを変えた結果:
+
+| 組み合わせ | 自宅回線 |
+| --- | --- |
+| wget + ブラウザ UA（Firefox 131/158、Chrome 155）+ サイトヘッダ | 200 |
+| wget 既定 UA（`Wget/1.25.0`） | 403 challenge |
+| wget UA のみ（ヘッダ無し） | 403/200 混在 |
+| curl（Schannel） | 200 |
+
+ネイティブと同じヘッダ・UA をデータセンター（GitHub Actions / Azure）から投げた結果:
+
+| 組み合わせ | データセンター |
+| --- | --- |
+| wget + Firefox 131/158 + ネイティブヘッダ | 403 challenge |
+| curl（HTTP/2）+ Firefox 158 + ネイティブヘッダ | 403 challenge |
+| Node HTTP/1.1 / HTTP/2 + Firefox 158 | 403 challenge |
+| 対照: ncode.syosetu.com | 302 |
+
+→ リクエスト内容をネイティブと同一にしても、データセンター回線では 403。**出口 IP が支配的**で、UA やクライアントの修正では解決しない。
 
 ## 2. 準備
 
@@ -133,14 +175,14 @@ cloudflared tunnel run narou-relay
 
 `NAROU_RELAY_ENDPOINT` は `https://relay.example.com` にします。
 
-### 7.2 Cloudflare 以外のトンネル（Worker からの到達確認用）
+### 7.2 Cloudflare 以外のトンネル（常用はこちらを推奨）
 
-Worker はリレーへ生ソケット (`connect()`) で接続します。Cloudflare のドメイン（`trycloudflare.com` / 自分のドメイン）へ Worker から接続できるかは実機で未検証です。Worker 側のログが「リレーに接続できない」形で失敗する場合は、Cloudflare 以外のトンネルを使ってください。
+Worker はリレーへ生ソケット (`connect()`) で接続します。Cloudflare のドメイン（`trycloudflare.com` / 自分のドメイン）へ Worker から接続できるかは実機で未検証です。**常用するなら、最初から Cloudflare 以外のトンネル**を使うのが安全です。
 
-- Tailscale Funnel: `tailscale funnel 3000` → `https://<machine>.<tailnet>.ts.net`
-- ngrok: `ngrok http 3000` → `https://xxxx.ngrok-free.app`
+- Tailscale Funnel: `tailscale funnel 3000` → `https://<machine>.<tailnet>.ts.net`（無料、URL 固定）
+- ngrok: `ngrok http 3000` → `https://xxxx.ngrok-free.app`（無料枠は URL が固定されない場合あり）
 
-いずれも URL はサービス側の仕様に従います（無料枠の URL は固定されない場合があります）。
+Cloudflare Tunnel を使う場合は、まずクイックトンネルで `Worker → リレー` が通るかだけを確認し、通らなければ上記へ切り替えてください。URL はサービス側の仕様に従います。
 
 ### 7.3 Windows の自動起動
 
