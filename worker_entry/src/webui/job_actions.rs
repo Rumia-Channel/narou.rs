@@ -471,9 +471,15 @@ async fn api_update(
                 "results": unresolved_results(&unresolved),
             }));
         }
-        let author_jobs = match runtime.enqueue_author_checks(true).await {
-            Ok(jobs) => jobs,
-            Err(error) => return update_failure(&error.to_string()),
+        // 作者チェックは一括更新 (update-all) のときだけ。個別更新で
+        // 監視作者全員の確認まで走ると、ユーザーが指定していない取得が始まる。
+        let author_jobs = if is_update_all {
+            match runtime.enqueue_author_checks(true).await {
+                Ok(jobs) => jobs,
+                Err(error) => return update_failure(&error.to_string()),
+            }
+        } else {
+            Vec::new()
         };
         if author_jobs.iter().any(|job| job.sent) { notify_queue_changed(env, runtime).await; }
         return Response::from_json(&json!({
@@ -523,9 +529,14 @@ async fn api_update(
         }
         job_ids.push(outcome.job_id.clone());
     }
-    let author_jobs = match runtime.enqueue_author_checks(true).await {
-        Ok(jobs) => jobs,
-        Err(error) => return update_failure(&error.to_string()),
+    // 個別更新では作者チェックを投入しない (一括更新のときだけ)。
+    let author_jobs = if is_update_all {
+        match runtime.enqueue_author_checks(true).await {
+            Ok(jobs) => jobs,
+            Err(error) => return update_failure(&error.to_string()),
+        }
+    } else {
+        Vec::new()
     };
     queued_any |= author_jobs.iter().any(|job| job.sent);
 

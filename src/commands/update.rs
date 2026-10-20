@@ -250,7 +250,11 @@ pub async fn cmd_update(opts: UpdateOptions, sink: &Arc<dyn MessageSink>) {
         }
     }
 
-    mistook += check_authors_after_update(opts.user_agent.as_deref(), interrupted.as_ref()).await;
+    // 作者追跡は一括更新 (対象指定なし) の後だけ。個別更新で全作者を
+    // 確認すると、ユーザーが指定していない取得まで走ってしまう。
+    if is_bulk {
+        mistook += check_authors_after_update(opts.user_agent.as_deref(), interrupted.as_ref()).await;
+    }
 
     if mistook > 0 {
         sink.emit(Stream::Stdout, &messages::update::errors_occurred(mistook));
