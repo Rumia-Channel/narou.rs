@@ -39,15 +39,18 @@ command -v cloudflared
 
 ## 2. リポジトリ
 
-リレーの **wget トランスポートは develop にあります**（main はリリース用でまだ入っていません）。VPS では develop を使ってください。
+リレーの wget トランスポートは **main**（リリースブランチ）に統合済みです。既定ブランチ main を使ってください。`main` が古く `/health` に `fetch` が出ない場合は develop に切り替えます。
 
 ```sh
-cd ~/narou.rs 2>/dev/null || git clone --branch develop --depth 1 https://github.com/Rumia-Channel/narou.rs.git ~/narou.rs
+cd ~/narou.rs 2>/dev/null || git clone --depth 1 https://github.com/Rumia-Channel/narou.rs.git ~/narou.rs
 cd ~/narou.rs
 git fetch origin
-git checkout develop 2>/dev/null || git checkout -b develop origin/develop
 git pull
 git log --oneline -3   # wget トランスポート / この runbook の commit があること
+
+# 古い main の場合は develop を使う:
+# git checkout develop 2>/dev/null || git checkout -b develop origin/develop
+# git pull
 ```
 
 ## 3. リレーの設定（.env）
