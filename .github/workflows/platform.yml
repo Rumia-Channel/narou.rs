@@ -102,7 +102,7 @@ jobs:
       - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
       # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
       # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.cache/worker-build
           key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
@@ -126,7 +126,7 @@ jobs:
       - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
       # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
       # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.cache/worker-build
           key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
@@ -239,7 +239,7 @@ jobs:
       - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
       # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
       # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.cache/worker-build
           key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
@@ -327,7 +327,7 @@ jobs:
       - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
       # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
       # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.cache/worker-build
           key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}

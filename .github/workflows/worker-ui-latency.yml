@@ -40,7 +40,7 @@ jobs:
           node-version: '22'
       - run: cargo check --locked -p narou_worker --target wasm32-unknown-unknown
       - run: cargo install worker-build --version 0.8.5 --locked
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.cache/worker-build
           key: worker-build-${{ runner.os }}-0.8.5
