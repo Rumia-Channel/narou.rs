@@ -1,11 +1,65 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import { isIP } from "node:net";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
 import { createBrotliDecompress, createUnzip } from "node:zlib";
 import { MAX_BODY_BYTES, MAX_HEAD_BYTES, assertResponseMetadata, readBoundedBytes } from "./worker/protocol.mjs";
+
+const moduleDir = dirname(fileURLToPath(import.meta.url));
+
+const runnable = (bin, verify) => {
+  if (!verify) return true;
+  const probe = spawnSync(bin, ["--version"], { stdio: "ignore", timeout: 5000, windowsHide: true });
+  return !probe.error && probe.status === 0;
+};
+
+const usable = (bin, verify) => existsSync(bin) && runnable(bin, verify);
+
+// 配備に同梱した静的 curl (deploy-sorahost.mjs が置く) を書き込み可能な場所へ
+// コピーして実行権限を付ける。PteWorker のコンテナには curl が無く、配備先は
+// 読み取り専用で実行ビットも落ちるため、同梱パスをそのまま実行できない。
+// 既存のファイルは使わず毎回上書きする (差し替えられた実行ファイルを走らせない、
+// シンボリックリンクを辿って別のファイルを壊さない)。
+const prepareBundledCurl = (bundled, { verify }) => {
+  let digest;
+  try {
+    digest = createHash("sha256").update(readFileSync(bundled)).digest("hex").slice(0, 16);
+  } catch {
+    return null;
+  }
+  const target = join(tmpdir(), `narou-relay-curl-${digest}`);
+  try {
+    rmSync(target, { force: true });
+    copyFileSync(bundled, target);
+    chmodSync(target, 0o755);
+  } catch {
+    return null;
+  }
+  return usable(target, verify) ? target : null;
+};
+
+/// curl の実行ファイルと CA バンドルを決める。優先順は環境変数 → 同梱 →
+/// PATH の curl。同梱 curl を使うときだけ同梱の cacert.pem を渡す
+/// (静的ビルドの既定 CA パスはコンテナに無いことがある)。
+export const resolveCurl = ({ env = process.env, dir = moduleDir, verify = true } = {}) => {
+  const configured = String(env.NAROU_RELAY_CURL ?? "").trim();
+  if (configured) {
+    return { bin: configured, cacert: String(env.NAROU_RELAY_CACERT ?? "").trim() || null, source: "env" };
+  }
+  const names = process.platform === "win32" ? ["curl.exe", "curl"] : ["curl"];
+  const bundled = names.map((name) => join(dir, name)).find((path) => existsSync(path));
+  if (!bundled) return { bin: "curl", cacert: null, source: "path" };
+  const cacert = existsSync(join(dir, "cacert.pem")) ? join(dir, "cacert.pem") : null;
+  const prepared = prepareBundledCurl(bundled, { verify }) || (runnable(bundled, verify) ? bundled : null);
+  return prepared ? { bin: prepared, cacert, source: "bundled" } : { bin: "curl", cacert: null, source: "path" };
+};
 
 const messages = {
   "not-installed": "curl is not installed",
@@ -67,7 +121,7 @@ const splitHead = (buffer) => {
   }
 };
 
-export const viaCurl = (target, headers, { curlBin, timeoutMs, signal }) =>
+export const viaCurl = (target, headers, { curlBin, cacert = null, timeoutMs, signal }) =>
   new Promise((resolve, reject) => {
     if (signal.aborted) return reject(new RelayTransportError("cancelled"));
     const args = [
@@ -75,6 +129,7 @@ export const viaCurl = (target, headers, { curlBin, timeoutMs, signal }) =>
       "--connect-timeout", String(Math.min(10, timeoutMs / 1000)),
       "--max-time", String(timeoutMs / 1000), "--max-filesize", String(MAX_BODY_BYTES),
     ];
+    if (cacert) args.push("--cacert", cacert);
     const host = target.url.hostname.replace(/^\[|\]$/g, "");
     if (!isIP(host)) {
       const address = target.family === 6 ? `[${target.address}]` : target.address;

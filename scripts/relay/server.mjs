@@ -1,4 +1,7 @@
-// 外部 HTTP 取得リレー。Cloud Run Buildpacks は npm start でこのサーバーを起動する。
+// 外部 HTTP 取得リレー。Cloud Run (Buildpacks / npm start) と PteWorker
+// (SORAHOST / sorahost.json の start) が同じファイルを動かす。ホストごとの差は
+// env.mjs (PORT・待受・.env) と transport.mjs (curl の解決) だけが吸収する。
+//
 // curl を優先する。同じ回線でも Node の TLS クライアントだけ 403 になる実測がある。
 // 取得先は許可ホスト・公開 DNS を検証して固定し、どの経路でもリダイレクトを追わない。
 // Cookie・Authorization・取得 URL・子プロセスの生の診断はログへ出さない。
@@ -15,8 +18,9 @@ import {
   parseJsonObject,
   readBoundedBytes,
 } from "./worker/protocol.mjs";
+import { loadEnvFile, resolveHost, resolvePort } from "./env.mjs";
 import { createTargetResolver, normalizeHost, RelayTargetError } from "./security.mjs";
-import { viaCurl, viaPinnedHttp, RelayTransportError } from "./transport.mjs";
+import { resolveCurl, viaCurl, viaPinnedHttp, RelayTransportError } from "./transport.mjs";
 
 const digest = (value) => createHash("sha256").update(value).digest();
 
@@ -91,13 +95,17 @@ export const createRelayServer = ({
   token = process.env.NAROU_RELAY_KEY || "",
   allowedHosts = process.env.NAROU_RELAY_ALLOWED_HOSTS || "",
   resolveTarget,
-  curlBin = "curl",
+  curl,
+  curlBin,
+  curlCacert = null,
   curlTimeoutMs = 30_000,
   fallbackTimeoutMs = 30_000,
   requestTimeoutMs = 75_000,
   logger = (message) => console.warn(message),
 } = {}) => {
   if (typeof token !== "string" || !token) throw new Error("NAROU_RELAY_KEY is required");
+  // curlBin / curlCacert はテストと明示指定用。未指定なら同梱 curl を探す。
+  const curlConfig = curl ?? (curlBin ? { bin: curlBin, cacert: curlCacert } : resolveCurl({ env: process.env }));
   const expectedToken = digest(token);
   const resolve = resolveTarget || createTargetResolver(allowedHosts);
   const handler = async (req, res) => {
@@ -149,7 +157,9 @@ export const createRelayServer = ({
       try { headers = forwardHeaders(payload.headers, target.url); } catch { return json(400, { error: "invalid request headers" }); }
       let result;
       try {
-        result = await viaCurl(target, headers, { curlBin, timeoutMs: curlTimeoutMs, signal: abort.signal });
+        result = await viaCurl(target, headers, {
+          curlBin: curlConfig.bin, cacert: curlConfig.cacert, timeoutMs: curlTimeoutMs, signal: abort.signal,
+        });
       } catch (error) {
         if (!(error instanceof RelayTransportError)) throw error;
         logger(`narou relay curl: ${error.reason}`);
@@ -190,15 +200,24 @@ export const createRelayServer = ({
 };
 
 export const startRelay = ({ env = process.env, ...options } = {}) => {
-  const port = Number(env.PORT || 3000);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("invalid PORT");
-  const host = env.K_SERVICE ? "0.0.0.0" : "127.0.0.1";
+  // PteWorker (SORAHOST) は sorahost.json から環境変数を渡せないため .env も読む。
+  // Cloud Run では環境変数だけで完結し、この読み込みは何もしない。
+  const loaded = loadEnvFile({ env });
+  if (loaded) {
+    const applied = loaded.unreadable ? "読み取り失敗" : (loaded.applied.join(", ") || "新しい値なし");
+    console.log(`narou relay: ${loaded.path} を読み込みました (${applied})`);
+  }
+  const port = resolvePort(env);
+  const host = resolveHost(env);
+  const curl = options.curl
+    ?? (options.curlBin ? { bin: options.curlBin, cacert: options.curlCacert ?? null, source: "env" } : resolveCurl({ env }));
   const server = createRelayServer({
     token: env.NAROU_RELAY_KEY || "",
     allowedHosts: env.NAROU_RELAY_ALLOWED_HOSTS || "",
     ...options,
+    curl,
   });
-  server.listen(port, host, () => console.log(`narou relay listening on ${host}:${server.address().port}`));
+  server.listen(port, host, () => console.log(`narou relay listening on ${host}:${server.address().port} (curl: ${curl.source})`));
   return server;
 };
 
