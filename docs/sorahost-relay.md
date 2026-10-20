@@ -46,6 +46,7 @@ Cloudflare Workers が直接取得できないサイトを、SORAHOST の出口 
 node scripts/relay/deploy-sorahost.mjs            # 組み立てて手順を表示
 node scripts/relay/deploy-sorahost.mjs --deploy   # 組み立てて sorahost-cli deploy まで実行
 node scripts/relay/deploy-sorahost.mjs --out DIR  # 出力先を固定して残す
+node scripts/relay/deploy-sorahost.mjs --runtime DIR  # 起動用の実行環境を用意 (再利用可)
 ```
 
 このスクリプトは `scripts/deploy-tools.json` のピン（`curl_version`）で
@@ -88,10 +89,87 @@ SORAHOST_ENDPOINT=... SORAHOST_TOKEN=... npx --yes sorahost-cli deploy
   影響しません（鍵と許可リストは `.env` 側にあります）。
 - 起動してすぐ落ちると配備失敗（422）扱いになり、前のリリースが動き続けます。`logs` を確認してください。
 
-### 4.2 Pterodactyl の Node.js egg（Nano / Micro など）へ配備する
+### 4.2 Pterodactyl の Node.js egg（Nano / Micro など）: 自動更新 + `relay.js`
 
-`sorahost-cli` は使えません。**組み立て済みフォルダーの中身を `/home/container` へ置き、
-起動コマンドを `node server.mjs` に変えます。**
+SORAHOST の Node.js プランは Pterodactyl の Node.js egg で動きます。`sorahost.json` も
+`sorahost-cli` も使いません。**GitHub からの自動更新に任せ、MAIN FILE を `relay.js` にするだけ**で
+起動できます（手動アップロード不要）。
+
+Startup の設定:
+
+| 項目 | 値 |
+| --- | --- |
+| GIT REPO ADDRESS | `https://github.com/Rumia-Channel/narou.rs` |
+| INSTALL BRANCH | `main` |
+| AUTO UPDATE | ON |
+| USER UPLOADED FILES | OFF |
+| MAIN FILE | `relay.js` |
+| DOCKER IMAGE | Nodejs 24 |
+
+起動の流れ:
+
+1. egg が `git clone` / `git pull` で `/home/container` を最新にする（AUTO UPDATE は標準のまま）
+2. 標準の起動コマンドが `relay.js` を実行する
+3. `relay.js` が `scripts/relay/deploy-sorahost.mjs` の `prepareRuntime` で
+   `/home/container/relay-runtime/` を用意する
+   - コードはリポジトリと**ハッシュ一致**するか確認する（違えば新しいバージョンへ更新）
+   - 静的 curl は `scripts/deploy-tools.json` の**ピン留めした SHA-256**と一致するものを再利用し、
+     無い・壊れているときだけ再取得する（公開 `sha256sum.txt` との照合も行う）
+   - CA バンドルは前回のマニフェストのハッシュで検証して再利用する
+   - 準備は一時ディレクトリで行い、**成功したときだけ切り替える**（失敗しても前の環境は壊れない）
+4. `relay-runtime/server.mjs` を子プロセスで起動する。ポートは `SERVER_PORT` / `PORT` をそのまま使う
+5. `SIGTERM` / `SIGINT` を子プロセスへ伝えて終了する。出力はそのままコンソールへ流れる
+
+`relay-runtime/` は `.gitignore` 済みの生成物なので、`git pull` の邪魔をしません。初回だけ静的 curl と
+CA をダウンロードし（約 6.5 MB）、以降の再起動はハッシュ確認だけで済みます。壊れたときは
+`relay-runtime/` を消して再起動すれば作り直します。
+
+手動で同じ準備をする場合:
+
+```sh
+node scripts/relay/deploy-sorahost.mjs --runtime ./relay-runtime   # 用意 + 再利用
+```
+
+#### 起動コマンドの制約（重要）
+
+標準の起動コマンドは次の判定で `.js` を `node` に渡そうとしますが、**右辺が引用符付きのため
+常に偽**になり、必ず `ts-node` 側へ落ちます。
+
+```bash
+if [[ "${MAIN_FILE}" == "*.js" ]]; then /usr/local/bin/node ...; else /usr/local/bin/ts-node --esm ...; fi
+```
+
+そのため `relay.js` は **`node` でも `ts-node` でも実行できる構文**で書いています（静的な
+`import` / `require` を使わず、`async main` の中でだけ動的 `import` する）。実際に
+`node relay.js` と `ts-node --esm /home/container/relay.js`（TypeScript 5.9 + ts-node 10.9.2）の
+両方で起動を確認済みです。
+
+- 待受アドレスはこの egg では **`0.0.0.0`** が必要です（PteWorker のループバックとは逆）。
+  §5 の `.env` に `NAROU_RELAY_HOST=0.0.0.0` を入れてください。未設定なら `relay.js` が警告します。
+- ポートは Pterodactyl が `SERVER_PORT` で渡すので、こちらで指定する必要はありません。
+
+#### 既知の阻害要因: ts-node と TypeScript 7
+
+SORAHOST の Nodejs 24 イメージ（parkervcp/yolks 系）は `npm install -g npm@latest typescript ts-node`
+で作られており、**イメージのビルド時期によっては TypeScript 7 と ts-node 10.9.2 が非互換**になります。
+この場合、ts-node は `relay.js` を読む前に次のエラーで落ちます（`narou relay:` の行が 1 つも出ない）。
+
+```
+TypeError: Cannot read properties of undefined (reading 'fileExists')
+    at readConfig (.../ts-node/dist/configuration.js:91:33)
+```
+
+この状態は**リポジトリ側では回避できません**（ts-node が起動する前の段階で失敗するため）。
+SORAHOST 側への依頼は次のいずれかが最小です。
+
+1. 起動コマンドの判定を直す（`[[ "${MAIN_FILE}" == *.js ]]` にする、または `.js` / `.mjs` を `node` で実行する）
+2. イメージの `typescript` を 5 系に固定する
+
+まず起動ログを見て、上記エラーが出るかどうかを確認してください。
+
+### 4.3 手動でファイルを置く場合（フォールバック）
+
+起動コマンドを編集できず、自動更新も使えない環境向けの手順です。
 
 1. `node scripts/relay/deploy-sorahost.mjs --out .\relay-deploy` でフォルダーを作る
 2. パネルのファイルマネージャか SFTP で、その**中身**を `/home/container` へ置く
@@ -103,14 +181,9 @@ SORAHOST_ENDPOINT=... SORAHOST_TOKEN=... npx --yes sorahost-cli deploy
 cd /home/container && exec /usr/local/bin/node ./server.mjs
 ```
 
-- 元のコマンドの `if [[ "${MAIN_FILE}" == "*.js" ]]` は**引用符のせいで常に偽**になり、`ts-node` 側へ
-  落ちます（`.js` を指定しても `node` では起動しません）。`node` を直接実行する形にしてください。
 - `exec` を付けると停止シグナルが node に直接届きます。
 - git で配る場合だけ、先頭の `git pull` と `npm install` の部分を残して構いません
   （`/home/container/package.json` が無ければ `npm install` は走りません）。
-- **待受アドレスはこの egg では `0.0.0.0` が必要です**（PteWorker のループバックとは逆）。
-  §5 の `.env` に `NAROU_RELAY_HOST=0.0.0.0` を入れてください。
-- ポートは Pterodactyl が `SERVER_PORT` で渡すので、こちらで指定する必要はありません。
 - 起動コマンドを編集できない場合は `MAIN_FILE=server.mjs` を試すことになります。`ts-node --esm` 経由に
   なるため動作は保証できません（失敗するなら SORAHOST に起動コマンドの変更を依頼してください）。
 
@@ -172,12 +245,13 @@ python3 scripts/relay/verify_auth.py                  # 誤トークン 403 / �
 
 | | Cloud Run | SORAHOST (PteWorker) | SORAHOST (Node.js egg) |
 | --- | --- | --- | --- |
-| 配備 | Developer Connect + Cloud Build（`/scripts/relay` がビルド文脈） | `sorahost-cli deploy`（組み立てたフォルダー） | SFTP / ファイルマネージャ（組み立てたフォルダー） |
-| 起動 | Buildpacks の `npm start` | `sorahost.json` の `start` | Startup コマンドの差し替え |
+| 配備 | Developer Connect + Cloud Build（`/scripts/relay` がビルド文脈） | `sorahost-cli deploy`（組み立てたフォルダー） | GitHub clone + AUTO UPDATE（MAIN FILE = `relay.js`） |
+| 起動 | Buildpacks の `npm start` | `sorahost.json` の `start` | `relay.js` → `relay-runtime/server.mjs` |
+| 実行環境の準備 | Buildpacks が npm install | 配備時にフォルダーへ同梱 | `relay.js` が起動時に準備（検証済みは再利用） |
 | 待受 | `0.0.0.0`（`K_SERVICE`） | ループバック | `0.0.0.0`（`NAROU_RELAY_HOST`） |
 | 常駐 | 最小 0 で休止しうる | 常時起動 | 常時起動 |
 | 設定 | 環境変数（Secret Manager） | `/home/container/.env` | `/home/container/.env` |
-| curl | イメージの curl | 同梱した静的 curl | 同梱した静的 curl |
+| curl | イメージの curl | 同梱した静的 curl | 同梱した静的 curl（初回だけ取得） |
 | TLS | Cloud Run が終端 | 自前（コネクタ / リバースプロキシ） | 自前（コネクタ / リバースプロキシ） |
 
 同じ理由（出口 IP を Cloudflare 以外に置く）で運用し、**片方だけを配備しても Worker 側の設定は同じ**です。
