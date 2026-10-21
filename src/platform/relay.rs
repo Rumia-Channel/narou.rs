@@ -30,6 +30,12 @@
 //! (`{"X": ["a", "b"]}`)。呼び出し側は POST の JSON 本文を使い、
 //! Cookie 等を URL に載せず、配備先の request-line 上限も避ける。
 //!
+//! **ヘッダ名の綴り (大文字小文字) はキーとしてそのまま残す。** HTTP/1.1 の
+//! クライアント (wget 等) は受け取った綴りをそのまま送るため、ここで小文字へ
+//! 正規化すると Cloudflare がブラウザ向けヘッダと認識せず managed challenge
+//! (403) を返すサイトがある (2026-10-21 のハーメルン実測)。同名の重複判定は
+//! 大文字小文字を区別せず、最初に現れた綴りを採用する。
+//!
 //! バイト列と文字列だけを扱う純粋ロジックのためホストでユニットテストできる
 //! (Worker クレートのテストは wasm 専用で実行されない)。外部クレートは
 //! 非 optional の `serde_json` と `url` のみに依存する。
@@ -120,8 +126,10 @@ impl RelayRequest {
     /// - `target_url`: 中継してほしい取得先。`http(s)` 以外は踏み台が 400 を
     ///   返すため、ここで弾く。
     /// - `headers`: 取得先に転送するヘッダ (例: `FetchPolicy::headers()`)。
-    ///   同名の値は順序を保ったまま運ぶ (JSON では値の配列になる)。CR/LF 等の
-    ///   制御文字を含む値・RFC トークンでない名前は拒否する。
+    ///   同名の値は順序を保ったまま運ぶ (JSON では値の配列になる)。**ヘッダ名の
+    ///   大文字小文字はそのまま保つ** (HTTP/1.1 のクライアントは与えられた綴りで
+    ///   送るため)。同名は大文字小文字を区別せず束ね、最初に現れた綴りを使う。
+    ///   CR/LF 等の制御文字を含む値・RFC トークンでない名前は拒否する。
     pub fn new(
         base_url: &str,
         token: &str,
@@ -157,20 +165,19 @@ impl RelayRequest {
             return Err(invalid("proxy token is empty or unsafe".to_string()));
         }
 
-        use std::borrow::Cow;
         use std::collections::BTreeMap;
         use std::io::Write;
 
         #[derive(serde::Serialize)]
         #[serde(untagged)]
-        enum HeaderValues<'a> {
-            One(&'a str),
-            Many(Vec<&'a str>),
+        enum HeaderValues {
+            One(String),
+            Many(Vec<String>),
         }
         #[derive(serde::Serialize)]
         struct Payload<'a> {
             url: &'a str,
-            headers: BTreeMap<Cow<'a, str>, HeaderValues<'a>>,
+            headers: BTreeMap<String, HeaderValues>,
         }
         struct JsonBody(Vec<u8>);
         impl Write for JsonBody {
@@ -184,30 +191,31 @@ impl RelayRequest {
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
 
-        let mut header_map = BTreeMap::new();
+        // 同名ヘッダは大文字小文字を区別せず束ねるが、キーには最初に現れた
+        // 綴りを使う。BTreeMap のキー順で JSON が組み上がるため、出力は入力の
+        // 並びに関係なく決定的になる。
+        let mut grouped: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
         for (name, value) in headers {
             if !is_safe_header_name(name) || !is_safe_header_value(value) {
                 return Err(invalid(format!("unsafe header: {name:?}")));
             }
-            let name = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-                Cow::Owned(name.to_ascii_lowercase())
-            } else {
-                Cow::Borrowed(name.as_str())
-            };
-            match header_map.entry(name) {
+            match grouped.entry(name.to_ascii_lowercase()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(HeaderValues::One(value.as_str()));
+                    entry.insert((name.clone(), vec![value.clone()]));
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    match entry.get_mut() {
-                        HeaderValues::One(first) => {
-                            let first = *first;
-                            *entry.get_mut() = HeaderValues::Many(vec![first, value.as_str()]);
-                        }
-                        HeaderValues::Many(values) => values.push(value.as_str()),
-                    }
+                    entry.get_mut().1.push(value.clone());
                 }
             }
+        }
+        let mut header_map = BTreeMap::new();
+        for (_, (name, values)) in grouped {
+            let value = if values.len() == 1 {
+                HeaderValues::One(values.into_iter().next().expect("one value"))
+            } else {
+                HeaderValues::Many(values)
+            };
+            header_map.insert(name, value);
         }
         let mut body = JsonBody(Vec::with_capacity(1024));
         serde_json::to_writer(&mut body, &Payload { url: target_url, headers: header_map })
@@ -672,5 +680,36 @@ mod tests {
                 assert!(result.unwrap_err().to_string().contains("metadata exceeds limit"));
             }
         }
+    }
+
+    #[test]
+    fn request_keeps_header_name_casing_and_merges_case_variants() {
+        // サイト定義の綴り (Browser 相当) をそのまま踏み台へ運ぶ。小文字へ
+        // 正規化すると HTTP/1.1 の wget 経路で Cloudflare が 403 にする。
+        let headers = vec![
+            ("Accept".to_string(), "text/html".to_string()),
+            ("Sec-Fetch-Dest".to_string(), "document".to_string()),
+            ("user-agent".to_string(), "agent".to_string()),
+            ("ACCEPT".to_string(), "application/json".to_string()),
+        ];
+        let request = RelayRequest::new(BASE, "t", "https://example.com/", &headers)
+            .unwrap()
+            .into_request();
+        let payload = request.body.as_deref().expect("relay request body");
+        let body: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        let names: Vec<&str> = body["headers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(names, ["Accept", "Sec-Fetch-Dest", "user-agent"]);
+        // 同名 (大文字小文字違い) は最初の綴りのもとへ順序を保って束ねる。
+        assert_eq!(
+            body["headers"]["Accept"],
+            serde_json::json!(["text/html", "application/json"])
+        );
+        assert_eq!(body["headers"]["Sec-Fetch-Dest"], "document");
+        assert_eq!(body["headers"]["user-agent"], "agent");
     }
 }

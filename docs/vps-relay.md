@@ -160,6 +160,7 @@ Web UI でハーメルンの作品を取得・更新して確認します。リ�
 | 起動ログに wget が無い | `wget --version` を確認。PATH に無ければ `apt-get install wget` |
 | `via=node-http` になる | `NAROU_RELAY_FETCH` に `wget` が入っているか、`wget` が実行可能か |
 | 403 challenge が続く | その IP では wget でも拒否。別の回線（自宅回線など）が必要 |
+| wget は直接 200 なのにリレー経由だけ 403 | リレーへ渡す JSON のヘッダ名が小文字化されていないか。HTTP/1.1 の wget は渡された綴りをそのまま送るため、`Sec-Fetch-*` 等が小文字だと Cloudflare が 403 にすることがある（2026-10-21 修正済み。Worker を更新する。リレー側の変更は不要） |
 | TLS エラー（exit 5） | `ca-certificates` を入れる。VPS の時計ずれも確認 |
 | 接続できない | `ss -ltnp` で 127.0.0.1:3000、cloudflared のログ、DNS/TLS を確認 |
 

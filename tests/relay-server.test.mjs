@@ -109,6 +109,28 @@ test("a valid curl HTTP403 is not retried using a different backend", async () =
   } finally { await f.close(); }
 });
 
+test("forwarded header names keep the caller's casing", async () => {
+  // HTTP/1.1 の上流はヘッダ名の綴りも見る (Cloudflare は小文字化された
+  // Sec-Fetch-* をブラウザ相当と見なさず 403 にすることがある)。リレーは
+  // 受け取った JSON の名前をそのまま転送する。
+  let rawHeaders = [];
+  const f = await fixture((req, res) => {
+    rawHeaders = req.rawHeaders;
+    res.end("ok");
+  });
+  try {
+    const result = await (await post(f.base, f.target, {
+      Accept: "text/html", "Sec-Fetch-Dest": "document", cookie: "over18=off",
+    })).json();
+    assert.equal(result.status, 200);
+    const seen = new Map();
+    for (let i = 0; i < rawHeaders.length; i += 2) seen.set(rawHeaders[i], rawHeaders[i + 1]);
+    assert.equal(seen.get("Accept"), "text/html");
+    assert.equal(seen.get("Sec-Fetch-Dest"), "document");
+    assert.equal(seen.get("cookie"), "over18=off");
+  } finally { await f.close(); }
+});
+
 test("fetch order accepts wget and drops it when unavailable", () => {
   assert.deepEqual(resolveFetchOrder("wget,node", { wget: { available: true } }), ["wget", "node"]);
   assert.deepEqual(resolveFetchOrder("curl", { wget: { available: true } }), ["curl"]);

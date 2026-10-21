@@ -34,7 +34,7 @@ Accept / Accept-Language / Sec-Fetch-* / Upgrade-Insecure-Requests（サイト�
 User-Agent: ... Firefox/157 or 158     ← Worker が追加（ua_generator。native と共通）
 ```
 
-wget 経路では `Accept-Encoding: identity` / `Connection: Keep-Alive` / `Proxy-Connection: Keep-Alive` が付き、HTTP/1.1 になる（curl 経路とはヘッダが異なる）。
+wget 経路では `Accept-Encoding: identity` / `Connection: Keep-Alive` / `Proxy-Connection: Keep-Alive` が付き、HTTP/1.1 になる（curl 経路とはヘッダが異なる）。HTTP/1.1 ではヘッダ名の綴りもそのまま送られるため、リレーはサイト定義の `Sec-Fetch-*` 等の大文字小文字を保つ（小文字化すると Cloudflare が 403 にする。2026-10-21 修正）。
 
 ネイティブ（Linux の wget 段）:
 

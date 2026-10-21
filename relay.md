@@ -228,6 +228,7 @@ sudo systemctl restart narou-relay
 | 403 `{"error":"forbidden"}` | VPS のキーと GitHub の `NAROU_RELAY_KEY` が不一致 |
 | TLS エラー | `ca-certificates`、VPS の時刻（`timedatectl`） |
 | 上流が 403 challenge | その出口 IP が Cloudflare に拒否されている。wget でも通らない場合は別回線（自宅）が必要 |
+| VPS の wget は直接 200 なのにリレー経由だけ 403 challenge | リレー呼び出し JSON のヘッダ名が小文字化されていないか。HTTP/1.1 の wget は渡された綴りをそのまま送るため、`Sec-Fetch-*` 等が小文字だと Cloudflare がブラウザ相当と見なさない。2026-10-21 に `platform::relay` を修正済み。Worker を更新して再配備する（リレー側の変更は不要） |
 | TLS 証明書の不一致 | `relay.rumia-ch.uk` は `*.rumia-ch.uk` の範囲内。それより深い名前（例 `relay.narou.rumia-ch.uk`）は証明書がないため TLS が失敗する |
 
 ## 12. 注意
