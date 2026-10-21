@@ -6,8 +6,11 @@
 > (`relay.md` / `docs/home-relay.md`) を利用してください。
 
 この資料は既存の SORAHOST (PteWorker) へ native 版を手動配置する場合の参考です。
-**SORAHOST 専用の CI 配備・切り替えは廃止済み**です。通常の CI は Workers 向けの検証と配備を行い、
-外部取得リレーはホスト非依存の `scripts/relay/` として別途管理します。
+**SORAHOST 専用の CI 配備・切り替えは廃止済み**です。通常の CI は Workers 向けの検証と配備を行います。
+外部取得リレーは Rust 版 `narou_relay`（ワークスペース crate `relay/`）を別途管理します
+（手順は [`relay.md`](../relay.md) / [`docs/vps-relay.md`](../docs/vps-relay.md) /
+[`docs/home-relay.md`](../docs/home-relay.md)）。旧 Node 版リレーの SORAHOST への配備は
+非推奨（2026-10-21）で、実装は削除済みです。
 
 ```
 Browser ──https──▶ PteWorker (公開 URL / TLS)
@@ -167,8 +170,7 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
 | `NAROU_RS_LEGACY_YAML` | `1` で SQLite をやめ YAML 管理に戻す | 通常は未設定 | 環境変数のみ |
 | `NAROU_RS_EPUB_ENGINE` | EPUB エンジン | `lite` / `external` / `auto` (未設定 = auto) | **環境変数が `convert.epub-engine` より優先** |
 | `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` とライブラリの場所 | 通常は未設定 (配備パスから自動) | start.sh |
-| `NAROU_RS_PORT` | 待受ポート | 通常は未設定 (プラットフォームの `PORT` を使う) | start.sh (リレー同居時のみ 8080) |
-| `NAROU_RELAY` / `NAROU_RELAY_KEY` / `NAROU_RELAY_ALLOWED_HOSTS` | 同じサーバーで取得リレーも動かすときだけ (§10) | `1` / 合言葉 / 許可ホストのカンマ区切り | start.sh |
+| `NAROU_RS_PORT` | 待受ポート | 通常は未設定 (プラットフォームの `PORT` を使う) | start.sh |
 | `NAROU_CONNECTOR_TOKEN` | コネクタ (cloudflared) の接続トークン。置くと起動する (basic 認証は既定で有効のまま) | ダッシュボードの Add a replica の値 | start.sh |
 | `NAROU_PUBLIC_HOST` | 公開ホスト名。置くとその Host 以外を弾く | 例 `narou.example.com` | start.sh |
 | `NAROU_CONNECTOR_TOKEN_FILE` | トークンをファイルで渡す場合のパス | 既定 `$VOLUME_DIR/.connector-token` | start.sh |
@@ -203,7 +205,6 @@ Workers の配備設定と外部リレーの設定は [プラットフォーム�
 | `S3_REGION` | 空でない文字列 (署名に必須) | 例 `ap-northeast-1` |
 | `SORAHOST_ENDPOINT` | URL。パス込みでよく、`<endpoint>/deploy` へ送る | PteWorker コンソールの「エンドポイント」 |
 | `SORAHOST_TOKEN` | 不透明な文字列。`Authorization: Bearer` で送る | 同「デプロイトークン」(`token rotate` で再発行) |
-| `NAROU_RELAY_KEY` | 空でない文字列。Worker とリレーに同じ値を設定する | `openssl rand -hex 32` など |
 
 内部形式 (実装が決めているもの。手で作らない):
 
@@ -309,7 +310,7 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 | SQLite | ディスク backed (ページキャッシュは既定で 2MB 程度) |
 
 `start.sh` は `concurrency=true` を設定する (DL/update と convert/send を別レーンで並行)。
-トンネルやリレーを同居させない構成 (既定) のピークは次のとおり:
+トンネルを同居させない構成 (既定) のピークは次のとおり:
 
 | メモリ割当 | 通常 (2 ジョブが普通サイズ) | スパイク含む最悪ケース |
 | --- | --- | --- |
@@ -344,62 +345,30 @@ SORAHOST への自動配備は提供しません。Linux バンドルの作成�
 外部リレーの再配備やホスティング先の切り替え変数には依存しません。
 既存のサービスや Secret を自動削除する処理はありません。
 
-## 10. Worker の取得リレーと同じサーバーで動かす (任意)
+## 10. 取得リレーとの関係
 
-リレーは **単体で 1 サーバー** に置くのが既定になった。専用の Micro (256 MB) を用意し、
-同じ `scripts/relay/` を PteWorker へ配備する手順は
-[**SORAHOST による外部 HTTP 取得リレー**](../docs/sorahost-relay.md) を参照する
-(Cloud Run と共通のコードで、差は `PORT`/`SERVER_PORT`・待受アドレス・`.env`・同梱 curl だけ)。
-Nano (128 MB) は応答 16 MiB でピーク約 148 MB になる実測があるため勧めない。
+Worker の取得リレーは **別サーバー（VPS または自宅回線）** に置くのが既定です。SORAHOST 上へ
+リレーを同居させる構成は非推奨（2026-10-21）で、Node 版リレー（`scripts/relay/` の
+`server.mjs` / `security.mjs` / `transport.mjs` と `worker/`）は削除しました。現在のリレーは
+Rust バイナリ `narou_relay` です。
 
-以下は、どうしても narou と同じサーバーへ同居させたい場合だけの手順である。PteWorker は
-**1 プロジェクト = 起動コマンド 1 つ** なので、起動コマンドを narou の `start.sh`
-に寄せて、リレーはそこから起動する。既存の手動同居構成向けで、SORAHOST の CI 配備を復活させるものではない。
+- VPS リレー: [`relay.md`](../relay.md)（現行デプロイ `relay.rumia-ch.uk`）/
+  [`docs/vps-relay.md`](../docs/vps-relay.md)（一般手順）
+- 自宅回線リレー: [`docs/home-relay.md`](../docs/home-relay.md) と
+  `scripts/relay/home-relay.ps1`
+- リレーのビルド: `cargo build --release -p narou_relay`
+- リレーと Worker には同じ `NAROU_RELAY_KEY` を設定する。ずれると Worker からは 403 になり、
+  元の取得結果へ戻るため一部サイトの取得が失敗する。配置後は接続先と合言葉を環境に設定して
+  `python3 scripts/relay/verify_auth.py` で一致を確認する
+- リレーのプロトコル（`GET|POST /proxy` + `X-Proxy-Token`、`GET /health`）と安全策
+  （許可ホスト・DNS 検証と接続先固定・非追跡・TLS 検証・上限）は従来どおり。詳細は
+  [`docs/platform-abstraction.md`](../docs/platform-abstraction.md) を参照する
+- リレーのテストは Rust で `cargo test -p narou_relay`（ワークスペース CI は
+  `cargo test --workspace`）
 
-1. サーバー直下の `.env` に `NAROU_RELAY=1`、`NAROU_RELAY_KEY`、取得先を完全一致で列挙した `NAROU_RELAY_ALLOWED_HOSTS` を設定する。許可リスト未設定では取得しない。
-2. `scripts/relay/server.mjs`・`security.mjs`・`transport.mjs` と `scripts/relay/worker/protocol.mjs` を `start.sh` の隣へ同じ相対構成で配置する。ローカル状態・資格情報・テスト用 fixture は含めない。
-3. 手動の配備定義では `start.sh` を起動する（CI からのリレー配備は行わない）。
-4. ログに `取得リレーを起動しました` と `narou` の起動が出ることを確認する
-
-- ポート: リレーがプラットフォームの `PORT` (127.0.0.1)、narou は `NAROU_RS_PORT`
-  (既定 8080)。`start.sh` は同居時にプラットフォームの `PORT` を narou へ渡さない
-- リレーの合言葉は Worker secret の `NAROU_RELAY_KEY` と**同じ値**にする。ずれると
-  Worker からは 403 になり、元の取得結果へ戻るため一部サイトの取得が失敗する。
-  配置後は手元で `scripts/relay/verify_auth.py` を実行して一致を確認する:
-
-  ```sh
-  NAROU_RELAY_ENDPOINT=https://... NAROU_RELAY_KEY=... \
-    python3 scripts/relay/verify_auth.py
-  ```
-
-- 同居時の配備定義は `start.sh` を起動する設定のまま維持し、
-  `node server.mjs` だけに差し替えないこと。
-
-### 取得リレーの共通契約と検証
-
-Node 版と Worker 版は `scripts/relay/worker/protocol.mjs` を共有する。
-入力 JSON は UTF-8 の実バイト数で 64 KiB、取得した本文は展開後の実バイト数で
-16 MiB まで受け付ける。応答メタデータは JSON の escape・UTF-8・空の本文欄を
-含めて 448 KiB に制限する。Cookie を含む同名ヘッダの順序を保ち、非 ASCII の
-ヘッダ値は Node の curl / HTTP(S) と Worker の fetch で同じ UTF-8 の wire 表現にする。
-
-返すのは最終 HTTP 応答だけ。curl は途中の `100 Continue` を読み飛ばすが、
-fetch が最終応答を返さないランタイムでは 502 にする。本文中の HTTP ヘッダを
-推測して剥がす復旧は行わない。入力ストリームの上限超過は、400 を返す前に
-クライアント接続を中断しない。取得側の上限超過では読み取りを止めて解放する。
-
-GET のヘッダ JSON にもデコード後 64 KiB の上限があるが、base64 化した URL が
-配備先の request-line 上限を越えると Worker 到達前に拒否される。大きな入力は
-POST の JSON 本文で送る。
-
-Node.js 24・npm・curl がある環境では、次でローカル Worker の起動・終了も含めて検証できる。
-実 HTTP 上流へ接続し、Node/Worker 契約と Node の DNS 固定・SSRF・TLS・中断を確認する。
-検証専用キーと localhost 許可 fixture はテスト内だけにあり、本番環境の制約は緩和しない。
-
-```sh
-node tests/run-relay.mjs
-```
-
+SORAHOST のコンテナ内でリレーを動かす前提だった `start.sh` の `NAROU_RELAY=1`
+分岐は、旧 Node 版 (`server.mjs`) の削除に合わせて撤去しました。リレーはこの
+ホストに置かないでください。
 
 ## 11. 使えない機能
 
