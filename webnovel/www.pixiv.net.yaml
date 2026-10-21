@@ -47,7 +47,7 @@ headers:
   Referer: \k<top_url>/
 confirm_over18: no
 append_title_to_folder_name: yes
-version: 1.5
+version: 1.6
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)
@@ -206,6 +206,13 @@ preprocess: |-
       if readable
         emit "author::${work.body.userName}"
         emit "Episode;${entry.order};https://www.pixiv.net/ajax/illust/${entry.workId};${work.body.uploadDate};${work.body.title}"
+        # 各話のタグを統合する (小説シリーズの entry.tags と同じ扱い)。
+        # 重複除去と全目次ページの結合は narou 側のタグ収集が行う。
+        if work.body.tags && work.body.tags.tags && work.body.tags.tags.is_array
+          for tag in work.body.tags.tags
+            emit "tag::${tag.tag}"
+          end
+        end
       end
     end
     if body.page.series.size != 0 && body.page.series.last.order != 1
