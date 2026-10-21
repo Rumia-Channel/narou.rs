@@ -246,7 +246,9 @@ sudo systemctl restart narou-relay
   では起動しない。
 - Node の代替経路も同じ CA バンドルで TLS 検証する（未指定時は警告を出す）。
 - SORAHOST の実行環境は、既存の CA バンドルに侵害ルートが含まれていれば作り直す。
-- Rust 依存の `rustls-webpki` は修正版 0.103.16 へ更新（現構成では TLS に未使用だが監査対象）。
+- Rust 依存の `rustls-webpki` は修正版 0.103.16（失効した中間 CA の SPKI を拒否）へ、`rustls` は
+  0.23.46 へ更新（現構成の native TLS は native-tls / OS ストアなので未使用だが監査対象。
+  `webpki-roots` / `webpki-root-certs` は依存に無い）。
 
 VPS の手順:
 
