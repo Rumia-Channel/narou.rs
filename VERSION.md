@@ -3,17 +3,26 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
+## v0.4.16 — リレー取得の安定化・CA侵害対応・Pixiv漫画シリーズのタグ
+
+- SORAHOST と GCP (Cloud Run) へのリレー配備を**非推奨**とし、CI から両ホスト向けのリレー検証・配備を取り除きました。リレーは VPS (`relay.md` / `docs/vps-relay.md`) または自宅回線 (`docs/home-relay.md`) で運用します。既存の配備スクリプト (`scripts/relay/bootstrap.mjs` / `deploy-sorahost.mjs` / `relay.js` / `pins.json`) と手順は参照用に残しますが、新規配備・自動更新はサポートしません。
+- 外部リレーに **wget トランスポート** を追加し、`NAROU_RELAY_FETCH` で取得順（既定 `curl,node`）を `wget,node` のように変更できるようにしました。wget は curl の `--resolve` 相当の DNS 固定ができないため、検証済み IP へ接続する使い捨て CONNECT プロキシで接続先を固定し、TLS の SNI・証明書検証は wget に任せます。wget が見つからない場合は起動時に取得順から外れ、実際の順序は `/health` の `fetch` で確認できます。共有 IPv4 NAT の VPS 向け手順を `docs/vps-relay.md` / `relay.md`、自宅回線向けを `docs/home-relay.md` に追加しました。
+- リレー呼び出しを Worker の通常の fetch サブリクエストへ変更し、Worker の User-Agent を native と同じ `ua_generator` のランダム Firefox UA に揃えました。リレーのエンドポイントは GitHub Secret `RELAY_DOMAIN` から `https://<domain>` として解決し、上流 403 の発生元を切り分けるログも追加しました。
+- リレー経由の取得で、HTTP/1.1 クライアント (wget / curl) に渡す **ヘッダ名の大文字小文字を保持**するようにしました。`Sec-Fetch-*` 等を小文字化すると Cloudflare が 403 を返すサイトがあり、リレー経由の取得だけが失敗していた問題を修正しました。
+- **2026-10-20 の eMudhra 中間 CA 侵害**に対応しました。リレーが取得・同梱する CA バンドルに失効したルート CA (`AAA Certificate Services` / `emSign ECC Root CA - G3` 等) が含まれていないことを SHA-256 指紋で検証し、含まれれば起動を中止します（fail closed）。起動時にも検証し、SORAHOST の既存 runtime は再利用前に CA を再検証、Node の代替経路も同じ CA バンドルで TLS 検証します。Rust の TLS 依存は `rustls-webpki` 0.103.16（失効した中間 CA の SPKI を拒否）と `rustls` 0.23.46 に更新しました。VPS の `ca-certificates` 更新と `NAROU_RELAY_CACERT` の設定手順を追記しています。
+- 作者追跡の自動確認を一括更新の後だけに限定しました。`narou update <ID>` のような個別更新では作者ページを確認せず、対象作品の更新に専念します。
+- Pixiv の **漫画シリーズ**で、シリーズ情報にタグが無く各話の作品情報にだけタグがある場合に、各話のタグを統合して重複除去したうえでレコードのタグにするようにしました（サイト定義 version 1.6）。既存レコードも次回更新時にタグを追記します。
+- GitHub Actions の cache action を v5 へ更新し、Node 24 ランタイムで実行するようにしました。
+
+変更一覧は [v0.4.15...v0.4.16](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.15...v0.4.16) を参照してください。
+
 ## v0.4.15 — Cloud Run取得リレー・User-Agent更新
 
 - `ua_generator` を 0.5.83 から 0.5.86 へ更新し、Native の自動・ランダム User-Agent で古いブラウザー世代が候補に残る問題への上流修正を取り込みました。明示的な User-Agent 設定は維持し、Workers の固定 User-Agent は変更しません。
 - CI から SORAHOST 専用の配備・切り替えオプションと、Worker 配備がリレーの再配備を待つ依存を削除しました。Native・Wasm・Worker・ライセンス等の通常の検証は維持します。
 - 外部取得リレーを `scripts/relay/` へ整理し、設定を `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` に統一しました。`/proxy`・`X-Proxy-Token`・応答形式と本体のフォールバックは維持し、リレーの配置先を独立して変更できます。旧設定の自動移行や既存 Secret の削除は行いません。
 - 外部リレーを通常の Node.js 24 HTTP サービスとして Cloud Run Buildpacks / Developer Connect へ配備する構成と日本語手順を追加しました。Cloud Run の PORT と待受に対応し、Functions Framework や Dockerfile、本体 CI への GCP 認証・配備依存は導入しません。
-- 外部リレーを SORAHOST (PteWorker) へ**単体で**配備できるようにし、Cloud Run と同一コードで動かせるようにしました。待受は `PORT` → `SERVER_PORT`、アドレスは `NAROU_RELAY_HOST`（既定は `K_SERVICE` の有無で `0.0.0.0` / ループバック）、設定は環境変数 → `/home/container/.env` の順に解決します。コンテナに curl が無い環境向けに、ハッシュ検証済みの静的 curl と CA を同梱して書き込み可能な場所へコピーしてから使います。`scripts/relay/deploy-sorahost.mjs` が配備フォルダーを組み立て、ホスト差の回帰は `tests/relay-hosting.test.mjs` が固定します。Nano (128 MB) は応答 16 MiB でピーク約 148 MB のため Micro (256 MB) を推奨します。
-- SORAHOST の Node.js プラン（Pterodactyl の汎用 Node.js egg）向けに、同じ配備フォルダーを SFTP で置き、起動コマンドを `node server.mjs` へ差し替える手順を追加しました。既定の起動コマンドは `MAIN_FILE` の判定が引用符で常に偽になり `ts-node` 側へ落ちるため、そのままでは起動しません。この egg は待受に `0.0.0.0` が必要なので `NAROU_RELAY_HOST` を `.env` に設定します。
-- SORAHOST の Node.js egg で **手動アップロード不要**にする起動エントリーポイント `relay.js` を追加しました。MAIN FILE を `relay.js` にして GitHub の自動更新に任せると、起動時に `prepareRuntime` が `/home/container/relay-runtime/` を用意し（コードはリポジトリとハッシュ一致するか確認、静的 curl は `deploy-tools.json` の SHA-256、CA は前回のマニフェストで検証して再利用し、壊れているときだけ再取得）、`server.mjs` を子プロセスで起動して出力転送と SIGTERM/SIGINT 伝播を行います。準備は一時ディレクトリで行い、失敗しても前の実行環境を壊しません。標準起動コマンドが `ts-node --esm` に落ちる問題に備え、`relay.js` は node でも ts-node でも実行できる構文で実装しました。ts-node 10.9.2 + TypeScript 7 では ts-node 自体が起動前に失敗し、これはリポジトリ側で回避できないため、SORAHOST への起動コマンド修正依頼事項として文書化しています。回帰は `tests/relay-entry.test.mjs`。
 - 外部リレーに必須のホスト許可リスト、DNS 検証と接続先固定、timing-safe 認証、期限・切断時の中断を追加しました。curl 優先と既存 JSON/base64 契約は維持し、代替 HTTP(S) も同じ安全性検証を通します。Node/curl とローカル Worker の回帰を CI に組み込みました。実 Cloud Run の出口・curl・対象サイトの取得可否は配備後の確認が必要です。
-- Cloud Run のリレーは `bootstrap.mjs`（`npm start`）を起動エントリーポイントにし、イメージに curl が無い場合は `scripts/relay/pins.json` の SHA-256 で検証した静的 curl と CA バンドルを `/tmp` へ用意してから `server.mjs` を起動するようにしました（用意できなければ Node 実装で続行）。curl のピンは `scripts/relay/pins.json` に集約し、`deploy-sorahost.mjs` と共有しました。回帰は `tests/relay-bootstrap.test.mjs`。
 
 変更一覧は [v0.4.14...v0.4.15](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.14...v0.4.15) を参照してください。
 
