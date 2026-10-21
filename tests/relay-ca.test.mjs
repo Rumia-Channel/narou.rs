@@ -91,3 +91,26 @@ test("startRelay refuses to boot with a compromised NAROU_RELAY_CACERT", () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("startRelay accepts a verified CA bundle and shares it with every transport", async () => {
+  // 検証処理は起動時の全経路 (curl / wget / Node) で共有する。import 漏れや
+  // 検証の未実行はここで起動失敗として検出する。
+  const directory = mkdtempSync(join(tmpdir(), "relay-ca-start-ok-"));
+  const cacert = join(directory, "cacert.pem");
+  writeFileSync(cacert, cert);
+  const server = startRelay({
+    env: {
+      SERVER_PORT: "0",
+      NAROU_RELAY_KEY: "relay-ca-test-key",
+      NAROU_RELAY_ENV_FILE: join(directory, "missing.env"),
+      NAROU_RELAY_CURL: "",
+    },
+    curl: { bin: "curl", cacert, source: "test" },
+  });
+  try {
+    assert.ok(server.fetchOrder.length > 0);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

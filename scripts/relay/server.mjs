@@ -19,6 +19,7 @@ import {
   readBoundedBytes,
 } from "./worker/protocol.mjs";
 import { loadEnvFile, resolveHost, resolvePort } from "./env.mjs";
+import { verifyCacertFile } from "./fetch-curl.mjs";
 import { createTargetResolver, normalizeHost, RelayTargetError } from "./security.mjs";
 import { resolveCurl, resolveWget, viaCurl, viaPinnedHttp, viaWget, RelayTransportError } from "./transport.mjs";
 
