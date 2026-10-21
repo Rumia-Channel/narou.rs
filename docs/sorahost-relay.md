@@ -54,7 +54,7 @@ node scripts/relay/deploy-sorahost.mjs --runtime DIR  # 起動用の実行環境
 配布物の `sha256sum.txt` と**ハッシュを照合**してから、次を 1 つのフォルダーへまとめます（約 6.4 MB）。
 
 ```
-server.mjs  env.mjs  security.mjs  transport.mjs  worker/protocol.mjs  sorahost.json  curl  cacert.pem
+server.mjs  env.mjs  security.mjs  transport.mjs  fetch-curl.mjs  worker/protocol.mjs  sorahost.json  curl  cacert.pem
 ```
 
 - 同梱するのは、PteWorker のコンテナに **curl / wget / python3 が無い**ためです。さらに配備先は
@@ -62,6 +62,9 @@ server.mjs  env.mjs  security.mjs  transport.mjs  worker/protocol.mjs  sorahost.
   (`$TMPDIR/narou-relay-curl-<ハッシュ>`) へコピーし、実行権限を付けてから使います
   (`--version` で実行確認できたときだけ採用し、失敗したら PATH の curl → Node 実装へ順に落ちます)。
 - 同じ理由で CA バンドルも同梱し、同梱 curl を使うときだけ `--cacert` で渡します。
+  同梱する CA バンドルは curl.se の Mozilla 由来バンドルで、2026-10-20 の eMudhra 中間 CA 侵害で
+  失効したルート（`AAA Certificate Services` / `emSign ECC Root CA - G3` 等）が含まれていないことを
+  SHA-256 指紋で検証します。起動時にも検証し、古いバンドルでは起動しません。
 - `.sorahostignore` は不要です（`include` の外は送られません）。
 
 ## 4. 配備する
@@ -80,7 +83,7 @@ SORAHOST_ENDPOINT=... SORAHOST_TOKEN=... npx --yes sorahost-cli deploy
   "mode": "node",
   "framework": "node",
   "start": "node server.mjs",
-  "include": ["server.mjs", "env.mjs", "security.mjs", "transport.mjs", "worker/protocol.mjs", "curl", "cacert.pem"]
+  "include": ["server.mjs", "env.mjs", "security.mjs", "transport.mjs", "fetch-curl.mjs", "worker/protocol.mjs", "curl", "cacert.pem"]
 }
 ```
 
@@ -115,7 +118,8 @@ Startup の設定:
    - コードはリポジトリと**ハッシュ一致**するか確認する（違えば新しいバージョンへ更新）
    - 静的 curl は `scripts/relay/pins.json` の**ピン留めした SHA-256**と一致するものを再利用し、
      無い・壊れているときだけ再取得する（公開 `sha256sum.txt` との照合も行う）
-   - CA バンドルは前回のマニフェストのハッシュで検証して再利用する
+   - CA バンドルは前回のマニフェストのハッシュで検証して再利用する。さらに侵害された
+     ルート CA が含まれていないことも検証し、古い・汚染されたバンドルは再取得する
    - 準備は一時ディレクトリで行い、**成功したときだけ切り替える**（失敗しても前の環境は壊れない）
 4. `relay-runtime/server.mjs` を子プロセスで起動する。ポートは `SERVER_PORT` / `PORT` をそのまま使う
 5. `SIGTERM` / `SIGINT` を子プロセスへ伝えて終了する。出力はそのままコンソールへ流れる
@@ -173,7 +177,7 @@ SORAHOST 側への依頼は次のいずれかが最小です。
 
 1. `node scripts/relay/deploy-sorahost.mjs --out .\relay-deploy` でフォルダーを作る
 2. パネルのファイルマネージャか SFTP で、その**中身**を `/home/container` へ置く
-   （`server.mjs` `env.mjs` `security.mjs` `transport.mjs` `worker/protocol.mjs` `curl` `cacert.pem`。
+   （`server.mjs` `env.mjs` `security.mjs` `transport.mjs` `fetch-curl.mjs` `worker/protocol.mjs` `curl` `cacert.pem`。
    `sorahost.json` は PteWorker 用なので不要）
 3. 起動コマンド（Startup）を次の 1 行に差し替える
 

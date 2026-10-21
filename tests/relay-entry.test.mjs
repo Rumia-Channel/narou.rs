@@ -13,11 +13,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RUNTIME_MANIFEST, RUNTIME_SOURCES, prepareRuntime } from "../scripts/relay/deploy-sorahost.mjs";
+import { BLOCKED_BUNDLE } from "./relay-blocked-ca-fixture.mjs";
+import { cert } from "./relay-tls-fixture.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TOKEN = "relay-entry-test-key";
 const FAKE_CURL = Buffer.from("#!/bin/sh\necho fake curl\n");
-const FAKE_CA = Buffer.from("-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n");
+const FAKE_CA = Buffer.from(cert);
 const sha256 = (buffer) => createHash("sha256").update(buffer).digest("hex");
 const windows = process.platform === "win32";
 
@@ -273,6 +275,31 @@ test("relay.js fails fast without .env and without a key", { timeout: 30_000 }, 
     assert.equal(code, 1, "非ゼロで終了する");
     assert.match(output, /\.env/);
     assert.equal(existsSync(join(repoRoot, "relay-runtime")), false, "設定不足では実行環境を作らない");
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("a reused runtime with a compromised CA bundle is rebuilt", async () => {
+  const repoRoot = cleanRepo();
+  try {
+    const downloader = fakeDownloader();
+    const first = await prepare(repoRoot, downloader);
+    const runtime = first.runtimeDir;
+    // 前回の配備が侵害ルート入りバンドルを取得していた状況を再現する。
+    // マニフェストのハッシュもそろえ、「ハッシュは一致するが危険」な状態にする。
+    writeFileSync(join(runtime, "cacert.pem"), BLOCKED_BUNDLE);
+    const manifestPath = join(runtime, RUNTIME_MANIFEST);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest.files["cacert.pem"] = sha256(BLOCKED_BUNDLE);
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    const second = await prepare(repoRoot, downloader);
+    assert.equal(second.reused, false, "侵害ルート入りの CA では既存環境を再利用しない");
+    assert.equal(downloader.calls.cacert, 2, "CA バンドルを取り直す");
+    const refreshed = JSON.parse(readFileSync(join(runtime, RUNTIME_MANIFEST), "utf8"));
+    assert.equal(refreshed.files["cacert.pem"], sha256(FAKE_CA));
+    assert.deepEqual(readFileSync(join(runtime, "cacert.pem")), FAKE_CA);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

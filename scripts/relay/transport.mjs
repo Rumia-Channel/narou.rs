@@ -47,19 +47,23 @@ const prepareBundledCurl = (bundled, { verify }) => {
 };
 
 /// curl の実行ファイルと CA バンドルを決める。優先順は環境変数 → 同梱 →
-/// PATH の curl。同梱 curl を使うときだけ同梱の cacert.pem を渡す
-/// (静的ビルドの既定 CA パスはコンテナに無いことがある)。
+/// PATH の curl。CA バンドルは `NAROU_RELAY_CACERT` が最優先で、無ければ
+/// 同梱の cacert.pem を渡す (静的ビルドの既定 CA パスはコンテナに無いことがある)。
+/// 指定した CA バンドルは全経路 (curl / wget / Node) で共有する。
 export const resolveCurl = ({ env = process.env, dir = moduleDir, verify = true } = {}) => {
   const configured = String(env.NAROU_RELAY_CURL ?? "").trim();
+  const envCacert = String(env.NAROU_RELAY_CACERT ?? "").trim() || null;
   if (configured) {
-    return { bin: configured, cacert: String(env.NAROU_RELAY_CACERT ?? "").trim() || null, source: "env" };
+    return { bin: configured, cacert: envCacert, source: "env" };
   }
   const names = process.platform === "win32" ? ["curl.exe", "curl"] : ["curl"];
   const bundled = names.map((name) => join(dir, name)).find((path) => existsSync(path));
-  if (!bundled) return { bin: "curl", cacert: null, source: "path" };
-  const cacert = existsSync(join(dir, "cacert.pem")) ? join(dir, "cacert.pem") : null;
+  if (!bundled) return { bin: "curl", cacert: envCacert, source: "path" };
+  const bundledCacert = existsSync(join(dir, "cacert.pem")) ? join(dir, "cacert.pem") : null;
   const prepared = prepareBundledCurl(bundled, { verify }) || (runnable(bundled, verify) ? bundled : null);
-  return prepared ? { bin: prepared, cacert, source: "bundled" } : { bin: "curl", cacert: null, source: "path" };
+  return prepared
+    ? { bin: prepared, cacert: envCacert || bundledCacert, source: "bundled" }
+    : { bin: "curl", cacert: envCacert, source: "path" };
 };
 
 /// wget の実行ファイルと CA バンドルを決める。優先順は環境変数 → 同梱 →
@@ -85,6 +89,7 @@ const messages = {
   "not-installed": "curl is not installed",
   "not-executable": "curl is not executable",
   "tls-verification": "upstream TLS verification failed",
+  "ca-bundle": "relay CA bundle could not be read",
   "timed-out": "upstream request timed out",
   "cancelled": "request cancelled",
   "too-large": "response too large",
@@ -359,14 +364,24 @@ export const viaWget = async (target, headers, { wgetBin, cacert = null, timeout
 
 // global fetch では DNS を固定できないため、代替経路も標準 HTTP(S) の lookup を固定する。
 // TLS は URL の元のホスト名で検証し、プロキシ・リダイレクト・共有接続プールを使わない。
-export const viaPinnedHttp = async (target, headers, { timeoutMs, signal }) => {
+// `cacert` を渡したときは Node 同梱の既定ストアではなく、その CA バンドルだけで
+// 検証する (侵害されたルート CA を除外したバンドルを全経路で共有するため)。
+export const viaPinnedHttp = async (target, headers, { timeoutMs, signal, cacert = null }) => {
   const local = new AbortController();
   const timeout = setTimeout(() => local.abort(), timeoutMs);
   timeout.unref();
   const combined = AbortSignal.any([signal, local.signal]);
   const secure = target.url.protocol === "https:";
   const client = secure ? https : http;
-  const agent = new client.Agent({ keepAlive: false, proxyEnv: {}, rejectUnauthorized: true });
+  const agentOptions = { keepAlive: false, proxyEnv: {}, rejectUnauthorized: true };
+  if (secure && cacert) {
+    try {
+      agentOptions.ca = readFileSync(cacert);
+    } catch {
+      throw new RelayTransportError("ca-bundle");
+    }
+  }
+  const agent = new client.Agent(agentOptions);
   let request;
   let response;
   let decoder;

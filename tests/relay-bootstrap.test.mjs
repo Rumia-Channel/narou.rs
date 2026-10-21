@@ -12,10 +12,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { prepareCurl } from "../scripts/relay/bootstrap.mjs";
 import { sha256 } from "../scripts/relay/fetch-curl.mjs";
+import { BLOCKED_BUNDLE } from "./relay-blocked-ca-fixture.mjs";
+import { cert } from "./relay-tls-fixture.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const FAKE_CURL = Buffer.from("#!/bin/sh\necho fake curl\n");
-const FAKE_CA = Buffer.from("-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n");
+const FAKE_CA = Buffer.from(cert);
 const PINS = { version: "test-v1", sha256: sha256(FAKE_CURL) };
 const windows = process.platform === "win32";
 
@@ -97,6 +99,20 @@ test("falls back to the Node implementation when the download fails", async () =
   assert.deepEqual(result, { prepared: false, reason: "unavailable" });
   assert.equal(env.NAROU_RELAY_CURL, undefined);
   assert.ok(logs.some((line) => line.includes("Node 実装で続行します")));
+});
+
+test("a CA bundle with a compromised root stops bootstrapping", async () => {
+  const env = {};
+  const base = fakeDownload({ curl: 0, summary: 0, cacert: 0 });
+  await assert.rejects(
+    prepareCurl({
+      env, pins: PINS, commandExists: () => false, log: () => {},
+      download: async (url) => (url.endsWith("cacert.pem") ? BLOCKED_BUNDLE : base(url)),
+    }),
+    (error) => error && error.name === "CompromisedCaError",
+    "Node 実装へ落とさず起動を止める",
+  );
+  assert.equal(env.NAROU_RELAY_CURL, undefined);
 });
 
 test("an invalid pin hash is rejected by fetchCurl", async () => {

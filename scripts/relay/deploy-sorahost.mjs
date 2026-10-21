@@ -26,13 +26,14 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { downloadUrl, fetchCacert, fetchCurl, readCurlPins, sha256 } from "./fetch-curl.mjs";
+import { downloadUrl, fetchCacert, fetchCurl, readCurlPins, sha256, verifyCacertFile } from "./fetch-curl.mjs";
 
 const relayDir = dirname(fileURLToPath(import.meta.url));
 export const repoRootDefault = resolve(relayDir, "..", "..");
 
 export const RUNTIME_MANIFEST = "runtime.json";
-export const RUNTIME_SOURCES = ["server.mjs", "env.mjs", "security.mjs", "transport.mjs", "worker/protocol.mjs"];
+// fetch-curl.mjs は server.mjs が CA バンドルを起動時に検証するために import する。
+export const RUNTIME_SOURCES = ["server.mjs", "env.mjs", "security.mjs", "transport.mjs", "fetch-curl.mjs", "worker/protocol.mjs"];
 const SORAHOST_MANIFEST = "sorahost.json";
 
 const fileSha256 = (path) => sha256(readFileSync(path));
@@ -82,7 +83,17 @@ const checkImports = (directory, entry) => {
 };
 
 // 既存の実行環境がそのまま使えるか。コードはリポジトリと一致し、curl は
-// ピン留めしたハッシュ、CA は前回のマニフェストと一致することを要求する。
+// ピン留めしたハッシュ、CA は前回のマニフェストと一致し、かつ侵害された
+// ルート CA を含まないことを要求する。古い CA バンドルでの再利用はしない。
+const usableCacert = (file) => {
+  try {
+    verifyCacertFile(file);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const inspectRuntime = (directory, { code, pins }) => {
   if (!existsSync(directory)) return false;
   const manifest = readRuntimeManifest(directory);
@@ -96,7 +107,7 @@ const inspectRuntime = (directory, { code, pins }) => {
   const cacert = join(directory, "cacert.pem");
   const cacertHash = manifest.files["cacert.pem"];
   if (typeof cacertHash !== "string" || !existsSync(cacert) || fileSha256(cacert) !== cacertHash) return false;
-  return true;
+  return usableCacert(cacert);
 };
 
 const buildRuntime = async ({ repoRoot, directory, code, pins, download, log, existing, writeManifest = true }) => {
@@ -116,13 +127,15 @@ const buildRuntime = async ({ repoRoot, directory, code, pins, download, log, ex
   }
   chmodSync(join(directory, "curl"), 0o755);
 
-  // CA: 前回のマニフェストでハッシュを確認できれば再利用する。
+  // CA: 前回のマニフェストでハッシュを確認でき、かつ侵害ルートを含まない
+  // 場合だけ再利用する。古い・汚染されたバンドルは再取得する。
   const existingCacert = existing ? join(existing, "cacert.pem") : "";
   const existingManifest = existing ? readRuntimeManifest(existing) : null;
   const reusableCacert = existingCacert && existingManifest
     && typeof existingManifest.files["cacert.pem"] === "string"
     && existsSync(existingCacert)
-    && fileSha256(existingCacert) === existingManifest.files["cacert.pem"];
+    && fileSha256(existingCacert) === existingManifest.files["cacert.pem"]
+    && usableCacert(existingCacert);
   if (reusableCacert) {
     copyFileSync(existingCacert, join(directory, "cacert.pem"));
   } else {

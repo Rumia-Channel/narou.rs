@@ -7,6 +7,7 @@
     "env.mjs",
     "security.mjs",
     "transport.mjs",
+    "fetch-curl.mjs",
     "worker/protocol.mjs",
     "curl",
     "cacert.pem"

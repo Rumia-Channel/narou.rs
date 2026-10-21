@@ -228,8 +228,48 @@ sudo systemctl restart narou-relay
 | 403 `{"error":"forbidden"}` | VPS のキーと GitHub の `NAROU_RELAY_KEY` が不一致 |
 | TLS エラー | `ca-certificates`、VPS の時刻（`timedatectl`） |
 | 上流が 403 challenge | その出口 IP が Cloudflare に拒否されている。wget でも通らない場合は別回線（自宅）が必要 |
+| 起動時に `CA バンドルを検証できません` | `NAROU_RELAY_CACERT` のバンドルが古い（2026-10-20 の eMudhra 中間 CA 侵害で失効したルートを含む）。`ca-certificates` を更新して再起動する（下の「CA バンドルの侵害対応」参照） |
 | VPS の wget は直接 200 なのにリレー経由だけ 403 challenge | リレー呼び出し JSON のヘッダ名が小文字化されていないか。HTTP/1.1 の wget は渡された綴りをそのまま送るため、`Sec-Fetch-*` 等が小文字だと Cloudflare がブラウザ相当と見なさない。2026-10-21 に `platform::relay` を修正済み。Worker を更新して再配備する（リレー側の変更は不要） |
 | TLS 証明書の不一致 | `relay.rumia-ch.uk` は `*.rumia-ch.uk` の範囲内。それより深い名前（例 `relay.narou.rumia-ch.uk`）は証明書がないため TLS が失敗する |
+
+### CA バンドルの侵害対応（2026-10、eMudhra 中間 CA）
+
+2026-10-20 に eMudhra の 8 つの中間 CA の秘密鍵が復元可能だったとして失効しました。侵害された
+中間 CA は `AAA Certificate Services`（Sectigo）と `emSign ECC Root CA - G3` などへ連鎖するため、
+失効情報を扱わないクライアントは任意ホストへの証明書偽造（MITM）を受け入れてしまいます。
+
+このリポジトリの対応:
+
+- `scripts/relay/fetch-curl.mjs` は取得した CA バンドルに侵害ルートが含まれていないことを
+  SHA-256 指紋で検証し、含まれていれば `CompromisedCaError` で起動を止める（fail closed）。
+- 起動時も `NAROU_RELAY_CACERT`（または同梱・取得したバンドル）を検証する。古いバンドルのまま
+  では起動しない。
+- Node の代替経路も同じ CA バンドルで TLS 検証する（未指定時は警告を出す）。
+- SORAHOST の実行環境は、既存の CA バンドルに侵害ルートが含まれていれば作り直す。
+- Rust 依存の `rustls-webpki` は修正版 0.103.16 へ更新（現構成では TLS に未使用だが監査対象）。
+
+VPS の手順:
+
+```sh
+# 1) OS の CA を更新（例: Ubuntu 20260816ubuntu0.24.04.1 / Debian 20260816+nmu1 以降）
+sudo apt-get update && sudo apt-get install --only-upgrade ca-certificates
+# 2) システムバンドルに侵害ルートが残っていないことを確認（0 なら OK）
+grep -c -E 'AAA Certificate Services|emSign ECC Root CA - G3' /etc/ssl/certs/ca-certificates.crt || true
+# 3) リレーを更新し、システムバンドルを明示して再起動
+cd ~/narou.rs && git pull
+printf '\nNAROU_RELAY_CACERT=/etc/ssl/certs/ca-certificates.crt\n' >> scripts/relay/.env
+sudo systemctl restart narou-relay
+```
+
+`NAROU_RELAY_CACERT` を設定すると wget / curl にそのバンドルが渡り、Node 経路も同じバンドルで
+検証します。侵害ルートが残っていれば `narou relay startup failed: ...` で停止します。
+
+- Node.js 同梱の CA は上流の修正待ちの間は古いままです（2026-10-21 時点）。上記の
+  `NAROU_RELAY_CACERT` 指定で回避できます。
+- Cloud Run / SORAHOST のリレーは起動・配備時に curl.se の CA バンドルを取得して検証するため、
+  再起動または再配備で更新されます。
+- Native アプリの TLS は OS の証明書ストア（Windows Schannel / Linux OpenSSL / macOS）を使うため、
+  OS の更新（Windows Update、`ca-certificates` パッケージ等）が必要です。
 
 ## 12. 注意
 
