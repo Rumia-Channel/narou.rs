@@ -133,8 +133,6 @@ jobs:
       # CI のレンダリング契約 (Secrets Store の組み合わせ検証) もここで確認する。
       # 認証情報・ネットワーク不要の unittest だけを走らせる。
       - run: python3 -m unittest discover -s tests -p 'test_ci_*.py'
-      - name: HTTP relay contracts (Node/curl and workerd)
-        run: node ../tests/run-relay.mjs
       # tests/run.mjs builds, applies the local D1 migrations, starts
       # `wrangler dev` and runs the contract checks (health, fail-closed auth,
       # library/jobs APIs, and a queue-backed Convert job reaching a terminal

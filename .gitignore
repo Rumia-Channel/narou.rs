@@ -58,7 +58,6 @@ __pycache__/
 /worker_entry/wrangler.test.toml
 /worker_entry/.dev.vars
 /scripts/sorahost-proxy/worker/.dev.vars
-/scripts/relay/worker/.dev.vars
 # deploy_worker.py が一時的に作る secret ファイル (終了時に消すが念のため)
 /worker_entry/.deploy-secrets-*.json
 /worker_entry/.provision-output
@@ -71,14 +70,8 @@ __pycache__/
 # sorahost-cli が保存するデプロイトークン（資格情報を含むため追跡しない）
 .sorahost.json
 
-# Cloud Run リレーのローカル npm 依存
-/scripts/relay/node_modules/
-
 # 自宅回線リレーの設定 (認証キーを含む)
 /scripts/relay/.env
-
-# SORAHOST リレーの実行環境 (relay.js が起動時に生成する。配備物ではない)
-/relay-runtime/
 
 # SORAHOST のサーバー側に置く設定 (秘密鍵を含む)
 /.env

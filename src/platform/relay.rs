@@ -1,11 +1,11 @@
-//! 外部取得リレー (`scripts/relay/`) のプロトコル・コーデック。
+//! 外部取得リレー (`relay/` crate の `narou_relay`) のプロトコル・コーデック。
 //!
 //! Cloudflare Workers の Fetch API が弾かれるサイト (ハーメルン等) を、
 //! 任意の配置先の踏み台から中継取得するためのリクエスト組み立てと
 //! 応答パースだけを提供する。トランスポート (Fetch / `connect()` 生ソケット)
 //! は呼び出し側が持つ。
 //!
-//! プロトコル (`worker/worker.mjs` と `server.mjs` が受け付ける形):
+//! プロトコル (`relay/src/server.rs` が受け付ける形):
 //!
 //! ```text
 //! GET|POST /proxy
@@ -254,7 +254,7 @@ pub struct RelayResponse {
     /// ログインセッションの更新は 1 本も落とせないため、他のヘッダと違って
     /// 名前つきで運ぶ。
     pub set_cookie: Vec<String>,
-    /// 踏み台がどのクライアントで取ったか (`curl` / `worker-fetch` / 診断情報)。
+    /// 踏み台がどのクライアントで取ったか (`curl` / `wget` / 診断情報)。
     pub via: Option<String>,
     /// base64 をデコード済みのレスポンスボディ。
     pub body: Vec<u8>,
