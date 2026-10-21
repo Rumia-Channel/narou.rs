@@ -1,5 +1,9 @@
 # SORAHOST による外部 HTTP 取得リレー
 
+> **非推奨 (2026-10-21): SORAHOST へのリレー配備は非推奨です。** 新規配備と、CI での
+> ホスト配備検証は行いません。リレーは VPS (`relay.md` / `docs/vps-relay.md`) または
+> 自宅回線 (`docs/home-relay.md`) で運用してください。このページは既存デプロイの参照用です。
+
 ## 1. 目的と対象
 
 Cloudflare Workers が直接取得できないサイトを、SORAHOST の出口 IP から取得するためのリレーです。

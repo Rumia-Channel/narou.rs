@@ -1,3 +1,6 @@
+// **非推奨: SORAHOST / Cloud Run (GCP) へのリレー配備は 2026-10-21 に非推奨。**
+// CI では実行しない (tests/run-relay.mjs から除外)。既存デプロイの参照用。
+//
 // relay.js (SORAHOST の Pterodactyl Node.js egg 用の起動エントリーポイント) の回帰。
 //
 // 実 SORAHOST / 実ネットワークは使わない。静的 curl のダウンロードだけを

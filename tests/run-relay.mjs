@@ -54,9 +54,11 @@ try {
     dev.once("exit", () => reject(new Error("local Worker relay exited before tests finished")));
   });
   clearTimeout(timer);
+  // SORAHOST / Cloud Run (GCP) へのリレー配備は非推奨 (2026-10-21) のため、
+  // ホスト配備向けの relay-hosting / relay-entry / relay-bootstrap は CI で
+  // 実行しない (ファイルは既存デプロイの参照用に残す)。
   tests = spawn(process.execPath, [
     "--test", "--test-timeout=90000", "tests/relay.test.mjs", "tests/relay-policy.test.mjs", "tests/relay-server.test.mjs",
-    "tests/relay-hosting.test.mjs", "tests/relay-entry.test.mjs", "tests/relay-bootstrap.test.mjs",
   ], {
     cwd: root, stdio: "inherit", detached: !windows,
     env: { ...process.env, RELAY_WORKER_BASE_URL: `http://127.0.0.1:${port}`, RELAY_TEST_TOKEN: token },

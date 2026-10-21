@@ -635,6 +635,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 
 ### 外部リレーの独立運用
 
+- **SORAHOST と GCP (Cloud Run) へのリレー配備は非推奨 (2026-10-21)。** 新規配備・CI 検証・自動配備を行わない。リレーは VPS (`relay.md` / `docs/vps-relay.md`) または自宅回線 (`docs/home-relay.md`) で運用する。既存の配備スクリプト (`scripts/relay/bootstrap.mjs` / `deploy-sorahost.mjs` / `relay.js` / `pins.json`) と `docs/cloud-run-relay.md` / `docs/sorahost-relay.md`、`sorahost/` は既存デプロイの参照用に残し、先頭に非推奨の注記を置く。CI の `tests/run-relay.mjs` から hosting / entry / bootstrap のテストを外し、GitHub Actions の orphan「SORAHOST relay」workflow を削除した。再導入しない。
 - 本体 CI は Native / GPL / Wasm / Worker / ライセンス等の通常の検証後に Worker を配備する。SORAHOST 専用ジョブ・`SORAHOST` 変数・`run_workers` 入力・リレー配備への `needs` は撤去済みで、再導入しない。
 - 外部取得リレーは `scripts/relay/`。Node + curl 版と fetch ランタイム版があり、`GET|POST /proxy`、`X-Proxy-Token`、JSON/base64 応答を共通契約とする。本体の `platform::relay` と `WorkerHttpClient::with_relay` は維持する。
 - **リレーは配備先ごとに分岐させない。** Cloud Run (Buildpacks / `npm start`) と SORAHOST (PteWorker / `sorahost.json` の `start`) は同じ `scripts/relay/` を動かし、差は `env.mjs`(`PORT`→`SERVER_PORT`、`NAROU_RELAY_HOST`、`NAROU_RELAY_ENV_FILE` → モジュールの隣 → `$HOME` の `.env`) と `transport.mjs` の `resolveCurl`(`NAROU_RELAY_CURL` → 同梱 curl を書き込み可能な場所へコピー + 実行確認 → PATH)・`resolveWget`(`NAROU_RELAY_WGET` → 同梱 → PATH)・`NAROU_RELAY_FETCH`(取得順。既定 `curl,node`) だけが吸収する。サーバー実装にホスト固有の分岐を足さない。

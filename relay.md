@@ -1,5 +1,8 @@
 # VPS リレー設定手順（relay.rumia-ch.uk）
 
+> **SORAHOST / Cloud Run (GCP) へのリレー配備は非推奨 (2026-10-21)。** 新規配備・CI 検証は行いません。
+> リレーはこの VPS 手順または自宅回線 (`docs/home-relay.md`) で運用してください。
+
 Cloudflare 保護サイト（ハーメルン等）を Workers から取得するための、VPS 上の取得リレーの設定手順です。
 現在の構成と値は次のとおり。
 

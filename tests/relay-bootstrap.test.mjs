@@ -1,3 +1,6 @@
+// **非推奨: SORAHOST / Cloud Run (GCP) へのリレー配備は 2026-10-21 に非推奨。**
+// CI では実行しない (tests/run-relay.mjs から除外)。既存デプロイの参照用。
+//
 // Cloud Run (Buildpacks) の起動エントリーポイント (bootstrap.mjs) の回帰。
 //
 // 実ネットワークは使わない。ダウンロードと commandExists を差し替えて、

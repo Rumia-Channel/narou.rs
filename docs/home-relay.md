@@ -1,5 +1,9 @@
 # 自宅回線リレー（Cloudflare 保護サイト向け）
 
+> **Cloud Run / SORAHOST へのリレー配備は 2026-10-21 に非推奨となりました。** 以下は経緯と
+> 比較の記録です。現在は自宅回線リレー（このページ）または VPS リレー
+> (`relay.md` / `docs/vps-relay.md`) を使ってください。
+
 Cloud Run / SORAHOST のリレーはデータセンター回線から取得するため、Cloudflare の managed challenge 配下にあるサイト（ハーメルン等）では **HTTP 403 (`cf-mitigated: challenge`)** のままになります。同じリレーを自宅回線で動かすと取得できます。このページはその手順です。
 
 - 対象: `webnovel/syosetu.org.yaml`（ハーメルン）など、データセンター IP を拒否するサイト
