@@ -1,5 +1,9 @@
 # 自宅回線リレー（Cloudflare 保護サイト向け）
 
+> **Cloud Run / SORAHOST へのリレー配備は 2026-10-21 に非推奨となりました。** 以下は経緯と
+> 比較の記録です。現在は自宅回線リレー（このページ）または VPS リレー
+> (`relay.md` / `docs/vps-relay.md`) を使ってください。
+
 Cloud Run / SORAHOST のリレーはデータセンター回線から取得するため、Cloudflare の managed challenge 配下にあるサイト（ハーメルン等）では **HTTP 403 (`cf-mitigated: challenge`)** のままになります。同じリレーを自宅回線で動かすと取得できます。このページはその手順です。
 
 - 対象: `webnovel/syosetu.org.yaml`（ハーメルン）など、データセンター IP を拒否するサイト
@@ -202,6 +206,7 @@ pwsh -NoProfile -File <リポジトリ>\scripts\relay\home-relay.ps1
 
 - `/proxy` は `X-Proxy-Token`（`NAROU_RELAY_KEY`）が一致しないと 403。`/health` だけが認証不要
 - リレーは許可ホストのみ取得し、DNS を検証して接続先を固定し、TLS 証明書を検証する。この安全策は他のホストと同じ
+- 2026-10-20 の eMudhra 中間 CA 侵害では、失効したルートを含む CA バンドルでの起動を拒否する。Windows を更新したうえで、必要なら `.env` の `NAROU_RELAY_CACERT` に更新済みの CA バンドルを指定する（Node 同梱の CA は上流の修正待ちの間は古い）
 - `.env` は git 管理外。キーをログ・チャット・スクリーンショットへ出さない。漏れたら新しい値に作り直し、Worker とリレーの両方を更新する
 - 自宅 PC が停止・スリープしている間は Worker から取得できない（既存の fetch 403 にフォールバックするだけで、データは壊れない）
 - リバースプロキシ等で 3000 番ポートを直接インターネットへ公開しない。トンネルを使う

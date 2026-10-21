@@ -47,6 +47,10 @@ NAROU_RELAY_FETCH=wget,node
 - wget が見つからない場合は起動時に取得順から外れ、ログに理由が出る
 - `NAROU_RELAY_KEY` は Worker 側の同名 Secret と完全に一致させる（32 バイト以上のランダム値）
 - 設定は `scripts/relay/env.mjs` が `.env` から読む。値はログへ出ない
+- `NAROU_RELAY_CACERT`（任意）に更新済みの CA バンドルを指定すると、wget / curl / Node の
+  全経路がそのバンドルで TLS を検証する。古いバンドル（2026-10-20 の eMudhra 中間 CA 侵害で
+  失効したルートを含む）では起動しない。Linux なら
+  `NAROU_RELAY_CACERT=/etc/ssl/certs/ca-certificates.crt` を推奨
 
 ## 4. 起動と確認
 
@@ -162,6 +166,7 @@ Web UI でハーメルンの作品を取得・更新して確認します。リ�
 | 403 challenge が続く | その IP では wget でも拒否。別の回線（自宅回線など）が必要 |
 | wget は直接 200 なのにリレー経由だけ 403 | リレーへ渡す JSON のヘッダ名が小文字化されていないか。HTTP/1.1 の wget は渡された綴りをそのまま送るため、`Sec-Fetch-*` 等が小文字だと Cloudflare が 403 にすることがある（2026-10-21 修正済み。Worker を更新する。リレー側の変更は不要） |
 | TLS エラー（exit 5） | `ca-certificates` を入れる。VPS の時計ずれも確認 |
+| 起動時に `CA バンドルを検証できません` | `NAROU_RELAY_CACERT` のバンドルが古い（2026-10-20 の eMudhra 中間 CA 侵害で失効したルートを含む）。`apt-get install --only-upgrade ca-certificates` で更新し、`NAROU_RELAY_CACERT=/etc/ssl/certs/ca-certificates.crt` を設定して再起動する |
 | 接続できない | `ss -ltnp` で 127.0.0.1:3000、cloudflared のログ、DNS/TLS を確認 |
 
 ## 9. セキュリティ

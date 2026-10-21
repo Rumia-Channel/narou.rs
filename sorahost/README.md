@@ -1,5 +1,10 @@
 # SORAHOST で narou.rs を手動配置する
 
+> **非推奨 (2026-10-21): SORAHOST への配備は非推奨です。** SORAHOST 専用の CI 配備・
+> 切り替えは廃止済みで、新規配備・自動更新はサポートしません。この資料は既存配置の参照用です。
+> 通常は Native のローカル実行、または VPS / 自宅回線のリレー
+> (`relay.md` / `docs/home-relay.md`) を利用してください。
+
 この資料は既存の SORAHOST (PteWorker) へ native 版を手動配置する場合の参考です。
 **SORAHOST 専用の CI 配備・切り替えは廃止済み**です。通常の CI は Workers 向けの検証と配備を行い、
 外部取得リレーはホスト非依存の `scripts/relay/` として別途管理します。

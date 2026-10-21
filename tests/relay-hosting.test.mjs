@@ -1,3 +1,6 @@
+// **非推奨: SORAHOST / Cloud Run (GCP) へのリレー配備は 2026-10-21 に非推奨。**
+// CI では実行しない (tests/run-relay.mjs から除外)。既存デプロイの参照用。
+//
 // Cloud Run と PteWorker (SORAHOST) で同じリレーが動くことを固定する回帰。
 // 実 HTTP 取得は relay-server.test.mjs / relay.test.mjs が担当し、ここは
 // ホストごとの差 (PORT/SERVER_PORT・待受アドレス・.env・同梱 curl) だけを見る。

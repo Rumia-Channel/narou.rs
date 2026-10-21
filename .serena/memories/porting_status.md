@@ -1,5 +1,15 @@
 # narou.rs 移植状況
 
+## 現況（v0.4.16 リリース）
+
+ユーザーが v0.4.16 でのリリース（develop 統合・公開）を明示指定。公開済みは v0.4.15（2026-10-18）。本体/Worker/両lock/ライセンス表記を 0.4.16 へ更新し、VERSION.md 先頭に v0.4.16 節を追加した。v0.4.15 節へリリース後に追記されていた SORAHOST / Cloud Run リレー配備の 4 項目は、実際には v0.4.15 に含まれないため v0.4.16 節へ移した。
+
+追加指示: **SORAHOST と GCP (Cloud Run) は非推奨**にして CI からも除去する。配備スクリプト (`bootstrap.mjs` / `deploy-sorahost.mjs` / `relay.js` / `pins.json`)・docs・`sorahost/` は参照用に残し、各先頭へ非推奨の注記を追加。`tests/run-relay.mjs` から relay-hosting / relay-entry / relay-bootstrap を外し、GitHub Actions の orphan workflow「SORAHOST relay」を削除する。テストファイル自体は参照用に残す。
+
+今回の主な内容: SORAHOST / GCP (Cloud Run) リレー配備の非推奨化と CI 除去（リレーは VPS / 自宅回線へ一本化）、wget トランスポートと自宅回線リレー、Worker のリレー呼び出し fetch 化と UA 統一・`RELAY_DOMAIN` 解決、リレー経由 403 のヘッダ名保持修正、eMudhra 中間 CA 侵害対応（CA バンドル指紋検証 + `rustls-webpki` 0.103.16 / `rustls` 0.23.46）、作者追跡の一括更新限定、Pixiv 漫画シリーズの各話タグ統合（YAML 1.6）。
+
+検証: cargo check --workspace --all-targets（ローカルは MSVC cl の D8050 回避のため CC=clang-cl）、relay Node テスト、Pixiv unit 19 / accessibility 13 が成功。push 後の develop CI 成功を確認して main へ no-ff 統合し、main 上で v0.4.16 タグを作成・push する。Release workflow と production Worker 配備を監視し、公開物（16 ZIP）を確認する。
+
 ## 現況（v0.4.15リリース準備）
 
 ユーザーが0.4.15への更新を明示指定。GitHub公開版を実照会した時点ではv0.4.14が最新で、0.4.15は未公開。本体/Worker/両lockを0.4.15へ揃え、ua_generatorを0.5.83（372fd887）から0.5.86（0f37706daea234585663068d84a9a1aa06e33285）へCargo経由で更新済み。Nativeのauto/random UA候補への上流修正であり、明示UAとWorkerの固定Firefox131は変更しない。両noticeはcargo-about0.9.2で再生成し、直接依存57件の手書き表も一致。VERSION.mdの先頭をv0.4.15へ確定した。

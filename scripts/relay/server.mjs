@@ -19,6 +19,7 @@ import {
   readBoundedBytes,
 } from "./worker/protocol.mjs";
 import { loadEnvFile, resolveHost, resolvePort } from "./env.mjs";
+import { verifyCacertFile } from "./fetch-curl.mjs";
 import { createTargetResolver, normalizeHost, RelayTargetError } from "./security.mjs";
 import { resolveCurl, resolveWget, viaCurl, viaPinnedHttp, viaWget, RelayTransportError } from "./transport.mjs";
 
@@ -125,6 +126,8 @@ export const createRelayServer = ({
   wget,
   wgetBin,
   wgetCacert = null,
+  // Node 経路の TLS 検証にも同じ CA バンドルを使う (指定時は既定ストアを置換する)。
+  cacert = null,
   fetchOrder,
   curlTimeoutMs = 30_000,
   wgetTimeoutMs = 30_000,
@@ -159,7 +162,7 @@ export const createRelayServer = ({
           wgetBin: wgetConfig.bin, cacert: wgetConfig.cacert, timeoutMs: wgetTimeoutMs, signal,
         });
       case "node":
-        return viaPinnedHttp(target, headers, { timeoutMs: fallbackTimeoutMs, signal });
+        return viaPinnedHttp(target, headers, { timeoutMs: fallbackTimeoutMs, signal, cacert });
       default:
         return Promise.reject(new RelayTransportError("failed"));
     }
@@ -289,14 +292,32 @@ export const startRelay = ({ env = process.env, ...options } = {}) => {
     ?? (options.wgetBin
       ? { bin: options.wgetBin, cacert: options.wgetCacert ?? null, source: "env", available: true }
       : { ...resolveWget({ env }), ...(options.wgetCacert ? { cacert: options.wgetCacert } : {}) });
+  // curl / wget / Node の全経路で同じ CA バンドルを使う。既知の侵害ルート
+  // (eMudhra 中間 CA 侵害 2026-10) を含むバンドルでは起動しない (fail closed)。
+  // 指定が無い場合だけ各クライアントの既定ストアに任せる。
+  const caBundle = options.cacert
+    ?? (String(env.NAROU_RELAY_CACERT ?? "").trim() || curl.cacert || wget.cacert || null);
+  if (caBundle) {
+    try {
+      verifyCacertFile(caBundle);
+    } catch (error) {
+      throw new Error(`CA バンドルを検証できません: ${error && error.message ? error.message : error}`);
+    }
+  }
   const server = createRelayServer({
     token: env.NAROU_RELAY_KEY || "",
     allowedHosts: env.NAROU_RELAY_ALLOWED_HOSTS || "",
     ...options,
     curl,
     wget,
+    cacert: caBundle,
     fetchOrder: options.fetchOrder ?? env.NAROU_RELAY_FETCH ?? "",
   });
+  // Node 経路は既定の (更新が遅れ得る) バンドルを信頼してしまうため、
+  // 代替経路として残っているときは明示的な CA バンドル設定を促す。
+  if (server.fetchOrder.includes("node") && !caBundle) {
+    console.warn("narou relay: Node 経路の CA バンドルが未設定です。NAROU_RELAY_CACERT に更新済みの CA バンドルを指定してください");
+  }
   server.listen(port, host, () => console.log(`narou relay listening on ${host}:${server.address().port} (fetch: ${server.fetchSummary})`));
   return server;
 };
@@ -307,8 +328,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       console.error("narou relay listener failed");
       process.exitCode = 1;
     });
-  } catch {
-    console.error("narou relay startup failed: check key, allowed hosts and PORT");
+  } catch (error) {
+    console.error(`narou relay startup failed: ${error && error.message ? error.message : "check key, allowed hosts and PORT"}`);
     process.exitCode = 1;
   }
 }

@@ -135,7 +135,7 @@ fn artwork(id: usize, masked: bool) -> Value {
         "createDate": DATE, "uploadDate": DATE, "restrict": if masked { 2 } else { 0 },
         "xRestrict": 0, "seriesNavData": {"seriesId": "91"},
         "urls": {"original": if masked { Value::Null } else { json!(image_url(id)) }},
-        "tags": {"tags": []},
+        "tags": {"tags": [{"tag": "共通タグ"}, {"tag": format!("タグ{}", id - 100)}]},
     }})
 }
 
@@ -322,6 +322,15 @@ async fn logins() -> Arc<MemoryCookieStore> {
 }
 
 fn downloader(http: Arc<ReaderFixture>, novels: Arc<MemoryNovelRepository>, store: Arc<MemoryObjectStore>) -> Downloader {
+    downloader_with_settings(http, novels, store, HashMap::new())
+}
+
+fn downloader_with_settings(
+    http: Arc<ReaderFixture>,
+    novels: Arc<MemoryNovelRepository>,
+    store: Arc<MemoryObjectStore>,
+    local_settings: HashMap<String, bool>,
+) -> Downloader {
     let sites = SiteSetting::load_bundled(&[include_str!("../webnovel/www.pixiv.net.yaml")]).unwrap();
     Downloader::with_platform_and_storage_and_settings_and_support(
         DownloaderPlatform {
@@ -329,7 +338,7 @@ fn downloader(http: Arc<ReaderFixture>, novels: Arc<MemoryNovelRepository>, stor
             objects: store.clone(), assets: store, clock: Arc::new(SystemClock),
         },
         sites, HashMap::new(),
-        Arc::new(SnapshotDownloaderSettings::new(HashMap::new(), Some(false), HashMap::new())),
+        Arc::new(SnapshotDownloaderSettings::new(local_settings, Some(false), HashMap::new())),
     ).unwrap()
 }
 
@@ -750,4 +759,22 @@ async fn masked_or_omitted_middle_chapters_use_listing_fallback_before_private_m
             assert_eq!(http.calls_with_cookie(&metadata_url(102), None), 0);
         }
     }
+}
+
+#[tokio::test]
+async fn comic_series_merges_episode_tags_without_duplicates() {
+    // 漫画シリーズは各話の /ajax/illust/{id} が持つタグを統合する。
+    // 同じタグが複数話にあっても 1 つにまとめ、初出順を保つ。
+    let http = Arc::new(ReaderFixture::new(Visibility::default()));
+    let novels = Arc::new(MemoryNovelRepository::new());
+    let store = Arc::new(MemoryObjectStore::new());
+    let mut downloader = downloader_with_settings(
+        http.clone(), novels.clone(), store.clone(),
+        HashMap::from([("auto-add-tags".to_string(), true)]),
+    );
+    let result = downloader.download_novel(COMIC).await.unwrap();
+    assert_eq!(result.status, UpdateStatus::Ok);
+    let record = novels.get(result.id.into()).await.unwrap().unwrap();
+    assert_eq!(record.tags, vec!["共通タグ", "タグ1", "タグ2", "タグ3"]);
+    assert_saved_comic(&snapshot(store.as_ref()).await, 91, &[(1, 101), (2, 102), (3, 103)]);
 }

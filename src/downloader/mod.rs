@@ -5558,7 +5558,7 @@ is_narou: false
                 format!("https://www.pixiv.net/ajax/illust/{id}"),
                 200,
                 format!(
-                    r#"{{"error":false,"body":{{"id":"{id}","title":"{title}","userName":"作者名","uploadDate":"2026-01-02T03:04:05+09:00","urls":{{"original":"https://i.pximg.net/{id}.png"}}}}}}"#
+                    r#"{{"error":false,"body":{{"id":"{id}","title":"{title}","userName":"作者名","uploadDate":"2026-01-02T03:04:05+09:00","urls":{{"original":"https://i.pximg.net/{id}.png"}},"tags":{{"tags":[{{"tag":"共通タグ"}},{{"tag":"タグ{id}"}}]}}}}}}"#
                 ),
             );
         }
@@ -5593,6 +5593,10 @@ is_narou: false
         assert!(source.contains("general_all_no::21"));
         // 作者は各話ページから拾う
         assert!(source.contains("author::作者名"), "got: {source}");
+        // 漫画シリーズでも各話の作品 API のタグを統合する (重複除去はタグ収集側)。
+        assert!(source.contains("tag::共通タグ"), "got: {source}");
+        assert!(source.contains("tag::タグ139115096"), "got: {source}");
+        assert!(source.contains("tag::タグ139115097"), "got: {source}");
         // 目次は order の昇順で出る
         let first = source
             .find("Episode;19;https://www.pixiv.net/ajax/illust/139115096")

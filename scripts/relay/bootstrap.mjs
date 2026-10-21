@@ -1,3 +1,6 @@
+// **非推奨 (2026-10-21): GCP (Cloud Run) へのリレー配備は非推奨。**
+// 新規配備・CI 検証は行わない。既存デプロイの参照用に残している。
+//
 // Cloud Run (Buildpacks) の起動エントリーポイント。
 //
 // Google の Node.js ランタイムイメージには curl が入っていないことがある。
@@ -17,7 +20,7 @@ import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { fetchCacert, fetchCurl, readCurlPins } from "./fetch-curl.mjs";
+import { fetchCacert, fetchCurl, readCurlPins, CompromisedCaError } from "./fetch-curl.mjs";
 
 const commandExists = (command) => {
   const probe = spawnSync(command, ["--version"], { stdio: "ignore", timeout: 5000, windowsHide: true });
@@ -52,6 +55,10 @@ export const prepareCurl = async ({
     log(`静的 curl ${resolvedPins.version} を用意しました (${curl})`);
     return { prepared: true, reason: "downloaded", curl, cacert };
   } catch (error) {
+    // 侵害されたルート CA を含むバンドルでの続行は、Node 実装でも同じ信頼を
+    // 使うため危険。起動を止めて更新を促す。通信失敗などは従来どおり
+    // Node 実装へフォールバックする。
+    if (error instanceof CompromisedCaError) throw error;
     log(`curl を用意できませんでした (${error && error.message ? error.message : error})。Node 実装で続行します`);
     return { prepared: false, reason: "unavailable" };
   }

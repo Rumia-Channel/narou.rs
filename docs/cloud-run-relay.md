@@ -1,5 +1,9 @@
 # Cloud Run Buildpacks による外部 HTTP 取得リレー
 
+> **非推奨 (2026-10-21): GCP (Cloud Run) へのリレー配備は非推奨です。** 新規配備と、CI での
+> ホスト配備検証は行いません。リレーは VPS (`relay.md` / `docs/vps-relay.md`) または
+> 自宅回線 (`docs/home-relay.md`) で運用してください。このページは既存デプロイの参照用です。
+
 ## 1. 目的と対象
 
 Cloudflare Workers が直接取得できない場合に限り、Google Cloud Run の出口から HTTP 取得する低頻度の補助サービスです。narou.rs 本体、D1、S3、Queues は Cloudflare 側に残します。
@@ -46,7 +50,7 @@ GitHub の認証は Developer Connect 側で行います。GCP のサービス�
 
 このディレクトリの `package.json` が Node.js `24.x` と `npm start` → `node bootstrap.mjs` を指定します。npm の lock も置きますが、外部 npm 依存はありません。リポジトリ全体や `worker_entry` をビルド文脈にしないでください。
 
-`bootstrap.mjs` は起動時に PATH の curl を確認し、無ければ **`scripts/relay/pins.json` にピン留めした SHA-256 で検証した静的 curl と CA バンドルを `/tmp` へダウンロード**してから `server.mjs` を起動します（初回・コールドスタートごとに約 6.5 MB）。用意できなかった場合はこれまでどおり Node 実装（`viaPinnedHttp`）で続行し、起動は止めません。`NAROU_RELAY_CURL` / `NAROU_RELAY_CACERT` が設定済み、または curl が PATH にある場合はダウンロードしません。コールドスタートを避けたい場合は最小インスタンス数を 1 にします（課金に注意）。
+`bootstrap.mjs` は起動時に PATH の curl を確認し、無ければ **`scripts/relay/pins.json` にピン留めした SHA-256 で検証した静的 curl と CA バンドルを `/tmp` へダウンロード**してから `server.mjs` を起動します（初回・コールドスタートごとに約 6.5 MB）。CA バンドルは curl.se の Mozilla 由来バンドルで、2026-10-20 の eMudhra 中間 CA 侵害で失効したルート（`AAA Certificate Services` / `emSign ECC Root CA - G3` 等）が含まれていないことを SHA-256 指紋で検証し、含まれていれば起動を中止します（fail closed）。`server.mjs` は起動時にも `NAROU_RELAY_CACERT`（同梱・取得したバンドルを含む）を同じ基準で検証します。用意できなかった場合はこれまでどおり Node 実装（`viaPinnedHttp`）で続行し、起動は止めません。`NAROU_RELAY_CURL` / `NAROU_RELAY_CACERT` が設定済み、または curl が PATH にある場合はダウンロードしません。コールドスタートを避けたい場合は最小インスタンス数を 1 にします（課金に注意）。
 
 Google の Node.js ランタイムイメージには curl が入っていないことがあり、その場合はリレーが Node の TLS クライアントを使うため、Cloudflare の bot 判定で 403 になるサイトが出ます。`bootstrap.mjs` はこの差を埋めるためのものです。
 

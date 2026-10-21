@@ -240,6 +240,28 @@ for (const backend of ["curl", "node-http"]) {
   });
 }
 
+test("the node transport validates TLS with the supplied CA bundle", { timeout: 5000 }, async () => {
+  // eMudhra 中間 CA 侵害 (2026-10) では、Node 同梱の既定ストアが更新されるまで
+  // 任意ホストの証明書偽造を受け入れてしまう。取得・検証済みの CA バンドルを
+  // Node 経路にも渡し、既定ストアを使わせない。
+  const directory = mkdtempSync(join(tmpdir(), "relay-node-ca-"));
+  const cacert = join(directory, "relay.invalid.pem");
+  writeFileSync(cacert, cert);
+  const f = await fixture((_req, res) => {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("node ca body");
+  }, { curlBin: "missing-relay-test-curl", fetchOrder: ["node"], cacert }, true);
+  try {
+    const result = await (await post(f.base, f.target)).json();
+    assert.equal(result.status, 200);
+    assert.equal(result.via, "node-http");
+    assert.equal(Buffer.from(result.body, "base64").toString(), "node ca body");
+  } finally {
+    await f.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("both backend timeouts close their upstream sockets and return no partial success", { timeout: 5000 }, async () => {
   let requests = 0;
   let closed = 0;

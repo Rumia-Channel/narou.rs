@@ -174,7 +174,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - ハーメルンのタグ抽出は `webnovel/syosetu.org.yaml` の詳細表・目次ページ両方のパターンで行い、短編ページのあらすじ・本文をタグとして取り込まない
 - Pixiv (`webnovel/www.pixiv.net.yaml`) は小説 / 小説シリーズ / イラスト・漫画 (`/artworks/A`) / 漫画シリーズ (`/user/U/series/S`) の 4 種を扱い、ncode は `n`/`s`/`a`/`c` + ID。イラストは 1 話・本文がページ画像のみ、漫画シリーズは各作品を 1 話とする連載。取得先 API は `toc_url` の `by_target` (ターゲット URL ごとのテンプレート) で切り替える
 - Pixiv (`webnovel/www.pixiv.net.yaml`) は `/ajax/*` の JSON を `preprocess:` DSL で中間テキスト化して取得する。単体作品 URL (`/novel/show.php?id=N`) は短編 (novel_type 2) として 1 話、シリーズ URL (`/novel/series/S`) は目次 30 話ずつの複数ページ取得で全話を登録する。シリーズの 1 話 URL はその話だけを単体作品として登録する
-- Pixiv 小説シリーズのタグは、シリーズ自身と全話の目次メタデータから収集する。後続ページや後半の話だけに付いたタグも初出順に重複除去し、`auto-add-tags=true` なら本文を再取得しない更新でも追加する。既存の手動タグは保持する。サイト固有の抽出は YAML (`version: 1.5`)、ページ間の収集・統合は共通 downloader が担う。
+- Pixiv 小説シリーズのタグは、シリーズ自身と全話の目次メタデータから収集する。後続ページや後半の話だけに付いたタグも初出順に重複除去し、`auto-add-tags=true` なら本文を再取得しない更新でも追加する。既存の手動タグは保持する。サイト固有の抽出は YAML (`version: 1.6`)、ページ間の収集・統合は共通 downloader が担う。漫画シリーズはシリーズ情報にタグが無く各話の作品 API (`/ajax/illust/{workId}`) にだけタグがあるため、同じ仕組みで各話のタグを統合する (2026-10-21 修正)。
 - Pixiv の ncode はサイト定義の `ncode:` キーで `n` + 数値 (小説) / `s` + 数値 (小説シリーズ) / `a` + 数値 (イラスト・漫画) / `c` + 数値 (漫画シリーズ) を組み立てる。URL の数値だけでは作品種別をまたいで衝突するため
 - なろう式の ncode 判定 (`n\d+[a-z]+`) に当たらない ncode は、タイトル一致が無いときに ncode 一致で解決する (`n29204764` / `s16299140` などを `update` / `convert` の対象に指定できる)
 - Pixiv の挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は DSL の `fetch_json` で画像 URL を解決し (`[uploadedimage:]` は同じ応答から解決)、`illust_grep_pattern` が `挿絵/` へローカライズする。解決できなかった参照は `<!--...-->` の目印だけ残す
