@@ -26,9 +26,11 @@ pub struct ServerSecurity {
     /// `Authorization` ヘッダと照合する `Basic ...` 文字列。未設定/不完全なら `None`。
     pub basic_auth_header: Option<String>,
     /// HTTP `Host` / `Origin` ヘッダに許可するホスト一覧。
-    /// `reverse_proxy_mode` 時は空 (リクエスト側で forwarded host 判定に切替)。
+    /// `reverse_proxy_mode` でも明示的な許可リストを使う (プロキシ配下の
+    /// 公開ホストは `server-add-accepted-hosts` に追加する)。
     pub allowed_request_hosts: Vec<String>,
-    /// WebSocket の Origin 判定で許可するドメイン一覧。`reverse_proxy_mode` 時は空。
+    /// WebSocket の Origin 判定で許可するドメイン一覧。
+    /// `reverse_proxy_mode` でも明示的な許可リストを使う。
     pub accepted_ws_domains: Vec<String>,
     /// `server-reverse-proxy.enable`。
     pub reverse_proxy_mode: bool,
@@ -119,15 +121,15 @@ fn basic_auth_header_from_settings(global_setting: &HashMap<String, Value>) -> O
 }
 
 /// `server-ws-add-accepted-domains` を既定の許可ドメインに追加した一覧。
-/// reverse proxy モードでは WS 側も forwarded 判定に任せるため空を返す。
+///
+/// reverse proxy モードでも Host 同様に明示的な許可リストを使う
+/// (`server-reverse-proxy.enable` は「外側 Host を許可する」設定ではなく
+/// 許可済みホストの forwarded Origin 判定に使う)。
 fn ws_accepted_domains(
     global_setting: &HashMap<String, Value>,
     host: &str,
-    reverse_proxy_mode: bool,
+    _reverse_proxy_mode: bool,
 ) -> Vec<String> {
-    if reverse_proxy_mode {
-        return Vec::new();
-    }
     let mut accepted_domains = super::default_allowed_request_hosts(host);
     if let Some(extra) = yaml_string(global_setting.get("server-ws-add-accepted-domains")) {
         accepted_domains.extend(
@@ -138,6 +140,8 @@ fn ws_accepted_domains(
                 .map(ToString::to_string),
         );
     }
+    accepted_domains.sort();
+    accepted_domains.dedup();
     accepted_domains
 }
 
@@ -149,11 +153,8 @@ fn ws_accepted_domains(
 fn http_allowed_request_hosts(
     global_setting: &HashMap<String, Value>,
     host: &str,
-    reverse_proxy_mode: bool,
+    _reverse_proxy_mode: bool,
 ) -> Vec<String> {
-    if reverse_proxy_mode {
-        return Vec::new();
-    }
     let mut allowed = super::default_allowed_request_hosts(host);
     if let Some(extra) = yaml_string(global_setting.get("server-add-accepted-hosts")) {
         allowed.extend(parse_extra_allowed_hosts(&extra));
@@ -221,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_proxy_mode_clears_host_lists() {
+    fn reverse_proxy_mode_keeps_host_allow_list() {
         let settings = settings(&[
             ("server-reverse-proxy.enable", Value::Bool(true)),
             (
@@ -231,8 +232,19 @@ mod tests {
         ]);
         let security = ServerSecurity::from_settings(&settings, "127.0.0.1");
         assert!(security.reverse_proxy_mode);
-        assert!(security.allowed_request_hosts.is_empty());
-        assert!(security.accepted_ws_domains.is_empty());
+        assert!(
+            security
+                .allowed_request_hosts
+                .iter()
+                .any(|host| host == "extra.example.com")
+        );
+        assert!(
+            security
+                .allowed_request_hosts
+                .iter()
+                .any(|host| host == "127.0.0.1")
+        );
+        assert!(!security.accepted_ws_domains.is_empty());
     }
 
     #[test]

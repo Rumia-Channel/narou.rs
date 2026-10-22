@@ -64,6 +64,16 @@ pub(crate) const MAX_WEB_CSV_IMPORT_BODY_BYTES: usize =
 pub(crate) const MAX_WEB_LOG_COUNT: usize = 1000;
 pub const INTERNAL_CONTROL_HEADER: &str = "x-narou-internal-token";
 
+/// ブラウザに配るローカル UI トークンの Cookie 名。
+///
+/// loopback バインド時は OS 上どのローカルプロセスからも HTTP ポートへ
+/// 到達できるため、`Host` / `Origin` だけでは別ユーザーからの操作を防げない。
+/// `narou web` 起動時に生成/永続化したトークンを、起動時の URL から一度だけ
+/// ブラウザへ渡して HttpOnly Cookie に変換し、以後の保護 API で照合する。
+pub const UI_AUTH_COOKIE: &str = "narou_ui_token";
+/// 起動時にブラウザへ渡すトークンの query パラメータ名。
+pub const UI_AUTH_QUERY_PARAM: &str = "narou_ui_token";
+
 #[derive(Clone)]
 pub struct AppState {
     pub port: u16,
@@ -76,7 +86,16 @@ pub struct AppState {
     /// Host the listeners were bound to; seeds `default_allowed_request_hosts`
     /// when the security settings are reloaded.
     pub bind_host: Arc<str>,
+    /// CLI / 再起動・終了制御用のトークン。`x-narou-internal-token` ヘッダで送る。
     pub control_token: String,
+    /// loopback ブラウザ UI 用のトークン。Cookie またはヘッダで送る。
+    pub ui_token: String,
+    /// 起動時の URL にだけ載せる一度きりのブートストラップ用チケット。
+    /// Cookie へ変換したら無効化する (ブラウザのプロセス引数から後から
+    /// 読み取られても再利用できない)。
+    pub ui_bootstrap_ticket: String,
+    /// ブートストラップチケットを消費済みか。
+    pub ui_bootstrap_consumed: Arc<AtomicBool>,
     pub queue: Arc<crate::queue::PersistentQueue>,
     pub restore_prompt_pending: Arc<AtomicBool>,
     pub restorable_tasks_available: Arc<AtomicBool>,
@@ -295,8 +314,14 @@ pub(crate) fn request_host_allowed_for_ports(
     else {
         return false;
     };
+    // reverse proxy モードでも Host は許可リストで検証する。プロキシ配下の
+    // 公開ホストは `server-add-accepted-hosts` に明示する。公開ポートは
+    // 内部ポートと一致しないことがあるため、proxy モードだけ port を問わない。
     if state.server_security.read().reverse_proxy_mode {
-        return parse_authority_host_and_port(host, false).is_some();
+        let Some((host, _port)) = parse_authority_host_and_port(host, false) else {
+            return false;
+        };
+        return host_allowed(&host, state);
     }
     authority_matches_state(host, state, expected_ports, false)
 }
@@ -546,6 +571,7 @@ fn is_state_changing_method(method: &Method) -> bool {
 
 pub fn create_router(state: AppState) -> Router {
     let auth_state = state.clone();
+    let local_auth_state = state.clone();
     let guard_state = state.clone();
     Router::new()
         .route("/", get(frontend::index))
@@ -716,10 +742,148 @@ pub fn create_router(state: AppState) -> Router {
             basic_auth_middleware,
         ))
         .layer(middleware::from_fn_with_state(
+            local_auth_state,
+            local_auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
             guard_state,
             request_guard_middleware,
         ))
+        .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state)
+}
+
+/// クリックジャッキング・MIME スニッフィング対策の共通ヘッダ。
+///
+/// `Origin` ガードは同一オリジンからのリクエストを許可するため、外部ページに
+/// iframe で埋め込まれると UI 操作をクリックさせられる。フレーミングを禁止し、
+/// 全レスポンスに nosniff / no-referrer を付ける。
+async fn security_headers_middleware(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::HeaderName::from_static("x-frame-options"),
+        header::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("content-security-policy"),
+        header::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-content-type-options"),
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("referrer-policy"),
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+/// loopback ブラウザ UI 用トークンを要求するか。
+///
+/// 設定 (`server-basic-auth.*` / `server-reverse-proxy.enable`) は稼働中にも
+/// 再適用されるため、固定フラグではなく毎回現在値から判定する。
+pub fn local_ui_auth_required(bind_host: &str, security: &server_security::ServerSecurity) -> bool {
+    matches!(bind_host, "127.0.0.1" | "localhost" | "::1")
+        && !security.reverse_proxy_mode
+        && security.basic_auth_header.is_none()
+}
+
+impl AppState {
+    /// 現在の設定で loopback UI トークンが必要か。
+    pub fn local_ui_auth_required(&self) -> bool {
+        local_ui_auth_required(&self.bind_host, &self.server_security.read())
+    }
+}
+
+/// 起動時 URL のブートストラップチケットを検証して消費する。
+///
+/// チケットはプロセス起動ごとに作り直し、一度 Cookie 化したら無効になる。
+pub(crate) fn consume_ui_bootstrap_ticket(state: &AppState, candidate: &str) -> bool {
+    constant_time_str_eq(candidate, state.ui_bootstrap_ticket.as_str())
+        && !state
+            .ui_bootstrap_consumed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// loopback UI トークンが必要なパスか。
+///
+/// 静的なページと埋め込みアセットはデータを持たないので素通しする。
+/// データを返す API・WebSocket・ダウンロードだけを保護する。
+pub(crate) fn is_ui_auth_protected_path(path: &str) -> bool {
+    if path.starts_with("/assets/") {
+        return false;
+    }
+    if matches!(
+        path,
+        "/"
+            | "/index.html"
+            | "/settings"
+            | "/help"
+            | "/about"
+            | "/bookmarklet"
+            | "/_rebooting"
+            | "/notepad"
+            | "/widget/drag_and_drop"
+            | "/edit_menu"
+    ) {
+        return false;
+    }
+    if let Some(rest) = path.strip_prefix("/novels/") {
+        return !(rest.ends_with("/setting") || rest.ends_with("/author_comments"));
+    }
+    true
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    for pair in cookies.split(';') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if key.trim() == name {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
+/// UI トークン（Cookie または `x-narou-internal-token` ヘッダ）を照合する。
+fn ui_token_matches(headers: &HeaderMap, state: &AppState) -> bool {
+    if let Some(actual) = headers
+        .get(INTERNAL_CONTROL_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        if constant_time_str_eq(actual, state.ui_token.as_str())
+            || constant_time_str_eq(actual, state.control_token.as_str())
+        {
+            return true;
+        }
+    }
+    cookie_value(headers, UI_AUTH_COOKIE)
+        .is_some_and(|actual| constant_time_str_eq(actual, state.ui_token.as_str()))
+}
+
+async fn local_auth_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if !state.local_ui_auth_required() || !is_ui_auth_protected_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    if ui_token_matches(request.headers(), &state) {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        "UI token required — open the URL printed when `narou web` started",
+    )
+        .into_response()
 }
 
 async fn request_guard_middleware(
@@ -839,6 +1003,9 @@ mod tests {
             ),
             bind_host: "127.0.0.1".into(),
             control_token: "control-token".to_string(),
+            ui_token: "ui-token".to_string(),
+            ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
+            ui_bootstrap_consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -870,6 +1037,9 @@ mod tests {
             ),
             bind_host: "127.0.0.1".into(),
             control_token: "control-token".to_string(),
+            ui_token: "ui-token".to_string(),
+            ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
+            ui_bootstrap_consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -1029,7 +1199,7 @@ mod tests {
 
     #[test]
     fn reverse_proxy_mode_accepts_forwarded_same_origin_hosts() {
-        let state = test_state();
+        let state = test_state_with_allowed_hosts(vec!["narou.example.com".to_string()]);
         state.server_security.write().reverse_proxy_mode = true;
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -1037,6 +1207,18 @@ mod tests {
             axum::http::HeaderValue::from_static("narou.example.com:8443"),
         );
         assert!(request_host_allowed(&headers, &state, state.port));
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("rebind.attacker.test:8443"),
+        );
+        assert!(
+            !request_host_allowed(&headers, &state, state.port),
+            "proxy mode must still verify the Host allow-list"
+        );
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("narou.example.com:8443"),
+        );
         headers.insert(
             axum::http::header::ORIGIN,
             axum::http::HeaderValue::from_static("https://narou.example.com:8443"),
@@ -1225,5 +1407,189 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn loopback_ui_token_blocks_api_until_cookie_is_bootstrapped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state = test_state();
+        state.port = listener.local_addr().unwrap().port();
+        {
+            let mut security = state.server_security.write();
+            security.basic_auth_header = None;
+            security.reverse_proxy_mode = false;
+        }
+        let router = super::create_router(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let base = format!("http://127.0.0.1:{}", state.port);
+
+        let unauthorized = client.get(format!("{base}/api/list")).send().await.unwrap();
+        assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let bootstrap = client
+            .get(format!("{base}/?narou_ui_token=bootstrap-ticket"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bootstrap.status(), reqwest::StatusCode::SEE_OTHER);
+        let set_cookie = bootstrap
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(set_cookie.contains("narou_ui_token=ui-token"));
+        assert!(set_cookie.contains("HttpOnly"));
+
+        let authorized = client
+            .get(format!("{base}/api/list"))
+            .header(reqwest::header::COOKIE, "narou_ui_token=ui-token")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(authorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // 同じチケットの再利用は Cookie 化できない。
+        let replay = client
+            .get(format!("{base}/?narou_ui_token=bootstrap-ticket"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), reqwest::StatusCode::OK);
+        assert!(replay.headers().get(reqwest::header::SET_COOKIE).is_none());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn html_responses_deny_framing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state = test_state();
+        state.port = listener.local_addr().unwrap().port();
+        let router = super::create_router(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://127.0.0.1:{}/", state.port))
+            .header("Authorization", "Basic dXNlcjpwYXNz")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-frame-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("DENY")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("frame-ancestors 'none'")
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn ui_token_protects_data_paths_but_not_static_pages() {
+        for public in [
+            "/",
+            "/settings",
+            "/help",
+            "/assets/js/main.js",
+            "/novels/1/setting",
+            "/novels/1/author_comments",
+        ] {
+            assert!(!super::is_ui_auth_protected_path(public), "{public}");
+        }
+        for protected in ["/api/list", "/api/update/start", "/ws", "/novels/1/download"] {
+            assert!(super::is_ui_auth_protected_path(protected), "{protected}");
+        }
+    }
+
+    #[test]
+    fn ui_token_matching_accepts_cookie_and_internal_header_only() {
+        let state = test_state();
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(!super::ui_token_matches(&headers, &state));
+
+        headers.insert(
+            super::INTERNAL_CONTROL_HEADER,
+            axum::http::HeaderValue::from_static("ui-token"),
+        );
+        assert!(super::ui_token_matches(&headers, &state));
+
+        headers.insert(
+            super::INTERNAL_CONTROL_HEADER,
+            axum::http::HeaderValue::from_static("control-token"),
+        );
+        assert!(super::ui_token_matches(&headers, &state));
+
+        headers.insert(
+            super::INTERNAL_CONTROL_HEADER,
+            axum::http::HeaderValue::from_static("wrong"),
+        );
+        assert!(!super::ui_token_matches(&headers, &state));
+
+        let mut cookie_headers = axum::http::HeaderMap::new();
+        cookie_headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("a=b; narou_ui_token=ui-token"),
+        );
+        assert!(super::ui_token_matches(&cookie_headers, &state));
+        cookie_headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("narou_ui_token=wrong"),
+        );
+        assert!(!super::ui_token_matches(&cookie_headers, &state));
+    }
+
+    #[test]
+    fn ui_bootstrap_ticket_is_single_use() {
+        let state = test_state();
+        assert!(!super::consume_ui_bootstrap_ticket(&state, "wrong"));
+        assert!(super::consume_ui_bootstrap_ticket(
+            &state,
+            "bootstrap-ticket"
+        ));
+        assert!(!super::consume_ui_bootstrap_ticket(
+            &state,
+            "bootstrap-ticket"
+        ));
+        // 誤った試行では消費されない。
+        let second = test_state();
+        assert!(!super::consume_ui_bootstrap_ticket(&second, "wrong"));
+        assert!(super::consume_ui_bootstrap_ticket(
+            &second,
+            "bootstrap-ticket"
+        ));
+    }
+
+    #[test]
+    fn local_ui_auth_requires_loopback_without_basic_auth_or_proxy() {
+        let state = test_state();
+        assert!(!state.local_ui_auth_required(), "basic auth is configured");
+        {
+            let mut security = state.server_security.write();
+            security.basic_auth_header = None;
+            security.reverse_proxy_mode = false;
+        }
+        assert!(state.local_ui_auth_required());
+        state.server_security.write().reverse_proxy_mode = true;
+        assert!(!state.local_ui_auth_required());
+        state.server_security.write().reverse_proxy_mode = false;
+        state.server_security.write().basic_auth_header = Some("Basic x".to_string());
+        assert!(!state.local_ui_auth_required());
+        assert!(!super::local_ui_auth_required(
+            "0.0.0.0",
+            &state.server_security.read().clone()
+        ));
     }
 }

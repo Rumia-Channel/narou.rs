@@ -39,7 +39,6 @@ impl SelfUpdateVariant {
 
 #[derive(Debug, Clone, Default)]
 pub struct SelfUpdateRequest {
-    pub asset_url: Option<String>,
     /// Explicit variant choice from the UI. `None` falls back to the saved
     /// `self-update.variant` preference, then to the running build's variant.
     pub variant: Option<SelfUpdateVariant>,

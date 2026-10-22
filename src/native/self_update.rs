@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use reqwest::header::USER_AGENT;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::application::{
     ApplicationEvent, EventSink, SelfUpdateRequest, SelfUpdateResult, SelfUpdateService,
@@ -134,20 +135,17 @@ async fn start_native_update(
     )
     .await;
 
-    let asset_url = match request.asset_url.filter(|url| !url.is_empty()) {
-        Some(url) => url,
-        None => match fetch_asset_url(&asset_name).await {
-            Ok(url) => url,
-            Err(error) => {
-                emit(
-                    &events,
-                    "progressbar.clear",
-                    serde_json::json!({ "topic": PROGRESS_TOPIC }),
-                )
-                .await;
-                return Err(platform_error(format!("リリース取得失敗: {error}")));
-            }
-        },
+    let asset = match fetch_asset_info(&asset_name).await {
+        Ok(asset) => asset,
+        Err(error) => {
+            emit(
+                &events,
+                "progressbar.clear",
+                serde_json::json!({ "topic": PROGRESS_TOPIC }),
+            )
+            .await;
+            return Err(platform_error(format!("リリース取得失敗: {error}")));
+        }
     };
 
     emit(
@@ -161,7 +159,7 @@ async fn start_native_update(
     .await;
 
     let zip_path = install_dir.join(format!("update_download_{asset_name}.tmp"));
-    if let Err(error) = download_to_file(&asset_url, &zip_path, &events).await {
+    if let Err(error) = download_to_file(&asset.url, &zip_path, &asset, &events).await {
         emit(
             &events,
             "progressbar.clear",
@@ -435,7 +433,19 @@ fn build_restart_args(exe_name: &str, hide_console: bool) -> Vec<String> {
     full
 }
 
-async fn fetch_asset_url(asset_name: &str) -> std::result::Result<String, String> {
+/// GitHub Releases から取得した更新 zip の情報。
+///
+/// URL は GitHub API が返した `browser_download_url` だけを使い、
+/// 呼び出し元 (Web API) からの任意 URL 指定は受け付けない。`sha256` は
+/// Release asset の `digest` で、ダウンロード後に照合する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseAsset {
+    url: String,
+    sha256: String,
+    size: Option<u64>,
+}
+
+async fn fetch_asset_info(asset_name: &str) -> std::result::Result<ReleaseAsset, String> {
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -452,25 +462,53 @@ async fn fetch_asset_url(asset_name: &str) -> std::result::Result<String, String
         &response.text().await.map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    pick_asset_url(&json, asset_name).ok_or_else(|| {
-        format!(
-            "アセット {asset_name} が見つかりません (タグ {})",
-            json["tag_name"].as_str().unwrap_or("?")
-        )
-    })
+    let asset = json["assets"]
+        .as_array()
+        .and_then(|assets| assets.iter().find(|asset| asset["name"].as_str() == Some(asset_name)))
+        .ok_or_else(|| {
+            format!(
+                "アセット {asset_name} が見つかりません (タグ {})",
+                json["tag_name"].as_str().unwrap_or("?")
+            )
+        })?;
+    parse_release_asset(asset)
 }
 
-fn pick_asset_url(release_json: &Value, asset_name: &str) -> Option<String> {
-    release_json["assets"].as_array()?.iter().find_map(|asset| {
-        (asset["name"].as_str() == Some(asset_name))
-            .then(|| asset["browser_download_url"].as_str().map(str::to_string))
-            .flatten()
+/// Release asset JSON を検証して更新情報にする。
+///
+/// HTTPS かつ GitHub の配信ホストであること、sha256 digest が必ず存在する
+/// ことを要求する (digest が無い古いリリースは安全側で更新を中止する)。
+fn parse_release_asset(asset: &Value) -> std::result::Result<ReleaseAsset, String> {
+    let url = asset["browser_download_url"]
+        .as_str()
+        .ok_or_else(|| "browser_download_url がありません".to_string())?;
+    let parsed = url::Url::parse(url).map_err(|error| format!("更新 URL が不正です: {error}"))?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+        return Err(format!(
+            "更新 URL は https://github.com/ のリリース資産だけを許可します: {url}"
+        ));
+    }
+    let digest = asset["digest"]
+        .as_str()
+        .ok_or_else(|| "リリース資産に sha256 digest がありません (安全のため自動更新を中止します)".to_string())?;
+    let digest = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("未対応の digest 形式です: {digest}"))?
+        .to_ascii_lowercase();
+    if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!("sha256 digest が不正です: {digest}"));
+    }
+    Ok(ReleaseAsset {
+        url: url.to_string(),
+        sha256: digest,
+        size: asset["size"].as_u64(),
     })
 }
 
 async fn download_to_file(
     url: &str,
     dest: &Path,
+    expected: &ReleaseAsset,
     events: &Arc<dyn EventSink>,
 ) -> std::result::Result<(), String> {
     use tokio::io::AsyncWriteExt;
@@ -487,15 +525,17 @@ async fn download_to_file(
     if !response.status().is_success() {
         return Err(format!("HTTP status {}", response.status()));
     }
-    let total = response.content_length();
+    let total = response.content_length().or(expected.size);
     let mut response = response;
     let mut file = tokio::fs::File::create(dest)
         .await
         .map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
     let mut downloaded = 0u64;
     let mut last_percent = -1i64;
     while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
         file.write_all(&chunk).await.map_err(|error| error.to_string())?;
+        hasher.update(&chunk);
         downloaded += chunk.len() as u64;
         if let Some(total) = total.filter(|total| *total > 0) {
             let percent = (downloaded.saturating_mul(100) / total) as i64;
@@ -515,6 +555,20 @@ async fn download_to_file(
         }
     }
     file.flush().await.map_err(|error| error.to_string())?;
+    let actual = hex::encode(hasher.finalize());
+    if !actual.eq_ignore_ascii_case(&expected.sha256) {
+        return Err(format!(
+            "更新ファイルの sha256 が一致しません (期待 {}, 実際 {})。自動更新を中止しました",
+            expected.sha256, actual
+        ));
+    }
+    if let Some(size) = expected.size
+        && downloaded != size
+    {
+        return Err(format!(
+            "更新ファイルのサイズが一致しません (期待 {size} バイト, 実際 {downloaded} バイト)"
+        ));
+    }
     Ok(())
 }
 
@@ -750,14 +804,56 @@ mod tests {
     }
 
     #[test]
-    fn pick_asset_url_returns_browser_download_url() {
-        let payload = serde_json::json!({
-            "assets": [
-                { "name": "other.zip", "browser_download_url": "https://example.com/other.zip" },
-                { "name": "wanted.zip", "browser_download_url": "https://example.com/wanted.zip" }
-            ]
+    fn parse_release_asset_accepts_https_github_asset_with_sha256_digest() {
+        let digest = "a".repeat(64);
+        let asset = serde_json::json!({
+            "name": "narou_rs_win_x64.zip",
+            "size": 123,
+            "digest": format!("sha256:{digest}"),
+            "browser_download_url": "https://github.com/Rumia-Channel/narou.rs/releases/download/v0.4.16/narou_rs_win_x64.zip"
         });
-        assert_eq!(pick_asset_url(&payload, "wanted.zip"), Some("https://example.com/wanted.zip".to_string()));
-        assert_eq!(pick_asset_url(&payload, "missing.zip"), None);
+        let parsed = parse_release_asset(&asset).unwrap();
+        assert_eq!(parsed.sha256, digest);
+        assert_eq!(parsed.size, Some(123));
+        assert_eq!(
+            parsed.url,
+            "https://github.com/Rumia-Channel/narou.rs/releases/download/v0.4.16/narou_rs_win_x64.zip"
+        );
+    }
+
+    #[test]
+    fn parse_release_asset_rejects_non_https_or_non_github_urls() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        for url in [
+            "http://github.com/Rumia-Channel/narou.rs/releases/download/v1/x.zip",
+            "https://example.com/x.zip",
+            "https://objects.githubusercontent.com/x.zip",
+        ] {
+            let asset = serde_json::json!({
+                "digest": digest,
+                "browser_download_url": url,
+            });
+            assert!(
+                parse_release_asset(&asset).is_err(),
+                "URL should be rejected: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_release_asset_rejects_missing_or_malformed_digest() {
+        let base = "https://github.com/Rumia-Channel/narou.rs/releases/download/v1/x.zip";
+        let missing = serde_json::json!({ "browser_download_url": base });
+        assert!(parse_release_asset(&missing).is_err());
+        let malformed = serde_json::json!({
+            "digest": "sha256:not-hex",
+            "browser_download_url": base,
+        });
+        assert!(parse_release_asset(&malformed).is_err());
+        let unsupported = serde_json::json!({
+            "digest": "md5:deadbeef",
+            "browser_download_url": base,
+        });
+        assert!(parse_release_asset(&unsupported).is_err());
     }
 }

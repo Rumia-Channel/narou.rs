@@ -151,7 +151,15 @@ impl PushServer {
             .filter(|domain| !domain.is_empty())
             .collect();
         *self.accepted_domains.write() = if collected.is_empty() {
-            vec!["*".to_string()]
+            // 空リストを `*` にすると、reverse-proxy モードで Host/Origin が
+            // 事実上無検査になるため、loopback 既定へフォールバックする。
+            // 外部ホスト経由の WS を使う場合は
+            // `server-ws-add-accepted-domains` を明示する。
+            vec![
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+                "::1".to_string(),
+            ]
         } else {
             collected
         };
@@ -414,8 +422,13 @@ impl crate::application::messages::MessageSink for PushServer {
 }
 
 pub fn create_push_router(state: AppState) -> Router {
+    let local_auth_state = state.clone();
     Router::new()
         .route("/ws", get(ws_handler_with_app_state))
+        .layer(axum::middleware::from_fn_with_state(
+            local_auth_state,
+            super::local_auth_middleware,
+        ))
         .with_state(state)
 }
 
@@ -686,6 +699,9 @@ mod tests {
             ),
             bind_host: "localhost".into(),
             control_token: "control-token".to_string(),
+            ui_token: "ui-token".to_string(),
+            ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
+            ui_bootstrap_consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -739,7 +755,7 @@ mod tests {
         std::fs::create_dir_all(&queue_dir).unwrap();
 
         let push_server = PushServer::new();
-        push_server.set_accepted_domains(Vec::<String>::new());
+        push_server.set_accepted_domains(["narou.example.com"]);
         let state = AppState {
             port: 4000,
             ws_port: 4001,
@@ -749,11 +765,14 @@ mod tests {
             )),
             server_security: crate::web::test_server_security(
                 Some("Basic dXNlcjpwYXNz"),
-                vec!["localhost".to_string()],
+                vec!["narou.example.com".to_string()],
                 true,
             ),
             bind_host: "localhost".into(),
             control_token: "control-token".to_string(),
+            ui_token: "ui-token".to_string(),
+            ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
+            ui_bootstrap_consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -780,6 +799,19 @@ mod tests {
             header::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
         );
         assert_eq!(validate_ws_request(&headers, &state), Ok(()));
+
+        headers.insert(
+            header::HOST,
+            header::HeaderValue::from_static("rebind.attacker.test:8443"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("https://rebind.attacker.test:8443"),
+        );
+        assert_eq!(
+            validate_ws_request(&headers, &state),
+            Err(StatusCode::BAD_REQUEST)
+        );
     }
 
     #[test]
@@ -868,6 +900,9 @@ mod tests {
             ),
             bind_host: "localhost".into(),
             control_token: "control-token".to_string(),
+            ui_token: "ui-token".to_string(),
+            ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
+            ui_bootstrap_consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),

@@ -1,9 +1,10 @@
 use axum::{
-    extract::Path,
+    extract::{Path, Query, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
 };
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 include!(concat!(env!("OUT_DIR"), "/web_asset_versions.rs"));
 
@@ -107,8 +108,35 @@ fn relative_module_specifier(from_asset_path: &str, to_asset_path: &str) -> Stri
     }
 }
 
-pub async fn index() -> Html<String> {
-    render_page(include_str!("assets/index.html"))
+/// `/` — 起動 URL の `?narou_ui_token=<token>` を検証し、HttpOnly Cookie に
+/// 変換してからトークン無しの URL へリダイレクトする (loopback UI 認証)。
+///
+/// Cookie 化に成功すると、以後の API/WebSocket/ダウンロードはブラウザが
+/// 自動で送る Cookie で認証される。トークンを URL に残さないため、
+/// アドレスバーや履歴に秘密が残らない。
+pub async fn index(
+    State(state): State<super::AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if state.local_ui_auth_required()
+        && let Some(token) = params.get(super::UI_AUTH_QUERY_PARAM)
+        && super::consume_ui_bootstrap_ticket(&state, token)
+    {
+        let cookie = format!(
+            "{}={}; Path=/; HttpOnly; SameSite=Strict",
+            super::UI_AUTH_COOKIE,
+            state.ui_token
+        );
+        let mut response = Redirect::to("/").into_response();
+        if let Ok(value) = header::HeaderValue::from_str(&cookie) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+        return response;
+    }
+    render_page(include_str!("assets/index.html")).into_response()
 }
 
 pub async fn settings_page() -> Html<String> {
