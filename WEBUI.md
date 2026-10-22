@@ -695,7 +695,7 @@ Web UI 設定画面に出る関連項目: `server-bind` / `server-basic-auth.*` 
 
 `127.0.0.1` / `localhost` / `::1` に bind し、Basic 認証もリバースプロキシも使わない構成では、`narou web` が起動ごとに一度きりのブートストラップ URL をブラウザへ渡します。
 
-- 初回の `GET /?narou_ui_token=<ticket>` だけが受け付けられ、サーバは HttpOnly / SameSite=Strict の `narou_ui_token` Cookie を設定してトークン無しの `/` へリダイレクトします。チケットは一度使うと無効になります。
+- 初回の `GET /?narou_ui_token=<ticket>` だけが受け付けられ、サーバは HttpOnly / SameSite=Strict / 30 日有効の `narou_ui_token` Cookie を設定してトークン無しの `/` へリダイレクトします。チケットは一度使うと無効になります。
 - Cookie の値は `.narou/ui_token`（0600）に永続化されるため、サーバ再起動やセルフアップデート後もブラウザのセッションは維持されます。
 - `/api/*`、`/ws`、`/novels/{id}/download` は Cookie または `x-narou-internal-token` ヘッダを要求します。静的なページと `/assets/*` はトークン不要です。
 - `--no-browser` のときは、起動時に表示される「ブラウザで開く URL」をそのまま開いてください。ベース URL を直接開いた場合、API は 401 を返します。

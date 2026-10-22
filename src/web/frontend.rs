@@ -123,7 +123,7 @@ pub async fn index(
         && super::consume_ui_bootstrap_ticket(&state, token)
     {
         let cookie = format!(
-            "{}={}; Path=/; HttpOnly; SameSite=Strict",
+            "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000",
             super::UI_AUTH_COOKIE,
             state.ui_token
         );
