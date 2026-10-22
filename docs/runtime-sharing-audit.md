@@ -123,7 +123,8 @@ SQLite の保存境界、不要な往復と並行 I/O を修正した。下の�
   `/dev/null` による非対話、native の health / relay / S3 probe 未採用は、
   対応する要求がない限り共通化のためだけに機能追加しない。
 - D1 / SQLite / YAML の I/O、transaction / batch、OS 子プロセス、Worker budget / lease / DO / TTL、
-  raw 非保存・keep-txt の既定差、HTTP 応答上限、native 限定 illustration dedup は意図的な runtime 差として残す。
+  raw 非保存・keep-txt の既定差、HTTP 応答上限は意図的な runtime 差として残す。illustration dedup は
+  2026-10-22 に S3 保存の両 runtime で共通化した。
 - source と既存ドキュメントにもずれがある。現行 `sorahost/start.sh` と配備 workflow には
   cloudflared / connector の処理が残り、native Web に 501 が実装されているという README の記述は確認できない。
   本作業はそれらを撤去・実装する変更ではない。
@@ -351,7 +352,7 @@ native 側は `EmptySiteDefinitionProvider` を踏むため URL が常に解決�
 | `extra_fields` 上限 | `src/db/novel_codec.rs:108` = 64 KiB | `d1_repository.rs:25` = 1.9 MB | 同一レコードで成否が分かれる |
 | Content-Type 表 | `src/native/object_store.rs:260-273`（webp あり） | `src/platform/object_store.rs:84-96`（webp なし、D1/S3 が使用） | `.webp` 挿絵で MIME が違う |
 | 挿絵論理キー | `src/platform/object_store.rs:366-369`（`sanitize_key_component` 経由） | `src/illustration_store.rs:177`（`join` 直） | sanitize が片側のみ |
-| 挿絵 dedup | `src/native/s3.rs:78`（sqlite+s3 で有効） | `worker_entry/src/s3_store.rs:33`（固定 false） | 仕組み自体は `src/platform/s3_store.rs:44` で共有 |
+| 挿絵 dedup | `src/native/s3.rs:78`（S3 保存なら有効） | `worker_entry/src/s3_store.rs:33`（常に有効） | 仕組み自体は `src/platform/s3_store.rs:44` で共有。Worker は admin API で既存オブジェクトを移行 |
 
 ### 2.4 変換 / EPUB / ジョブ
 
@@ -473,7 +474,8 @@ native 側は `EmptySiteDefinitionProvider` を踏むため URL が常に解決�
    コメントは「ここだけ無し」と読めるが、Ruby 版との一致は未確認。
 4. Worker の本文保存を `objects` の YAML blob のままとするか、`AGENTS.md:354` の
    「セクション行と列」へ進めるか（`content_backend` は未実装）。
-5. `worker_entry/src/s3_store.rs:33` の `illustration_dedup: false` は意図的な配備差か暫定か。
+5. ~~`worker_entry/src/s3_store.rs:33` の `illustration_dedup: false` は意図的な配備差か暫定か。~~
+   2026-10-22 に解消: 全作品・漫画の挿絵を S3 の共通プールへ置くため、Worker も常に有効にした。
 6. `LibrarySortColumn` に Tags/Status/TocUrl/NewArrivalsDate が無いことは既知か
    （API は 14 列のうち 10 列しか受けられない）。
 7. native にリレー段を足す実需（native 自身がリレーのホストになりうるため、別踏み台向けの

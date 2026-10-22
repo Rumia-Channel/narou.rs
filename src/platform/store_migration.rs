@@ -18,9 +18,11 @@ use std::sync::Arc;
 use futures::stream::{self, StreamExt};
 
 use super::{
-    AssetStore, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore, is_illustration_key,
+    AssetStore, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore, S3Store,
+    is_illustration_key,
 };
 use crate::error::{NarouError, Result};
+use crate::illustration_store::is_sha256_hex_stem;
 
 /// 1 回の呼び出しで扱う既定件数。
 pub const DEFAULT_LIMIT: usize = 100;
@@ -342,6 +344,135 @@ async fn verify_object(
         (Some(_), None) => Ok(Err(format!("{}: missing in the target", key.as_ref()))),
         (None, _) => Ok(Err(format!("{}: missing in the source", key.as_ref()))),
     }
+}
+
+/// 旧 `挿絵/` 配置の S3 挿絵を共通プールへ移す進捗。
+///
+/// `plan` は件数を数えるだけで書き込まない。`copy` は hex 名の挿絵だけを
+/// 対象に、プールへ書き込んでから旧配置を削除する (旧配置の削除はプールに
+/// 実体があることを確認した後)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IllustrationDedupState {
+    /// 最後に処理した論理キー。次回はこの続きから。
+    pub cursor: Option<String>,
+    /// 対象 (hex 名の旧配置) 件数。
+    pub planned: u64,
+    /// プールへ新たに移した件数。
+    pub migrated: u64,
+    /// 既にプールにあった件数。
+    pub already_pooled: u64,
+    /// hex 名でないため対象外にした件数 (mitemin の iNNN など)。
+    pub skipped_non_hex: u64,
+    pub failed: Vec<String>,
+    pub done: bool,
+}
+
+impl IllustrationDedupState {
+    /// `app_state` などに保存する前に失敗リストを上限で切る。
+    pub fn trim_failures(&mut self, limit: usize) {
+        if self.failed.len() > limit {
+            self.failed.truncate(limit);
+        }
+    }
+
+    fn record_failure(&mut self, message: String) {
+        if self.failed.len() < 100 {
+            self.failed.push(message);
+        }
+    }
+}
+
+/// 旧 `挿絵/` 配置の S3 オブジェクトを、全作品共通の
+/// `illustrations/<base64url(sha256)>.<ext>` プールへ移す 1 ページ分。
+///
+/// `s3` は dedup 有効で構築されている必要がある。`action` は `plan` または
+/// `copy`。`limit` は 1 回で走査する旧配置オブジェクト数で、進捗は `state` に
+/// 残すので呼び出し側が `done` まで繰り返せる。
+///
+/// 対象は hex 名 (`<sha256-hex>.<ext>`) の旧配置だけ。mitemin の `iNNN` 名など
+/// 内容ハッシュでない名前は、index の対応を壊さずには移せないため従来配置を
+/// 保つ (新規取得分は dedup により最初から hex 名になる)。
+pub async fn deduplicate_illustrations_page(
+    s3: &S3Store,
+    action: &str,
+    limit: usize,
+    state: &mut IllustrationDedupState,
+) -> Result<()> {
+    if action != "plan" && action != "copy" {
+        return Err(NarouError::Platform(format!(
+            "unknown illustration dedup action: {action:?}"
+        )));
+    }
+    if state.done {
+        return Ok(());
+    }
+    let limit = limit.clamp(1, MAX_LIMIT);
+    let prefix =
+        ObjectPrefix::new("novels").map_err(|error| NarouError::Platform(error.to_string()))?;
+    let mut scanned = 0usize;
+    while scanned < limit && !state.done {
+        let request = ObjectListRequest::new(
+            prefix.clone(),
+            NonZeroUsize::new(limit - scanned).expect("remaining limit is at least 1"),
+        );
+        let request = match &state.cursor {
+            Some(cursor) => request.after(cursor.clone()),
+            None => request,
+        };
+        let page = s3.list_page(&request).await?;
+        if page.objects.is_empty() {
+            state.done = true;
+            break;
+        }
+        for metadata in &page.objects {
+            if scanned >= limit {
+                break;
+            }
+            scanned += 1;
+            let key = &metadata.key;
+            if !is_illustration_key(key) {
+                continue;
+            }
+            let file = key.as_ref().rsplit('/').next().unwrap_or("");
+            let stem = file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or("");
+            if !is_sha256_hex_stem(stem) {
+                state.skipped_non_hex += 1;
+                continue;
+            }
+            state.planned += 1;
+            if action == "plan" {
+                continue;
+            }
+
+            let already_pooled = s3.pool_exists(key).await?;
+            if already_pooled {
+                state.already_pooled += 1;
+            } else {
+                let Some(stream) = s3.read_stream(key).await? else {
+                    state.record_failure(format!("{}: source object missing", key.as_ref()));
+                    continue;
+                };
+                if let Err(error) = s3.write_stream(key, stream).await {
+                    state.record_failure(format!(
+                        "{}: pool write failed: {error}",
+                        key.as_ref()
+                    ));
+                    continue;
+                }
+                state.migrated += 1;
+            }
+            // プールに実体があることを確認してから旧配置を消す。delete は
+            // dedup 無効時と同じく旧 `挿絵/` の物理キーだけを指す。
+            if let Err(error) = ObjectStore::delete(s3, key).await {
+                state.record_failure(format!("{}: legacy delete failed: {error}", key.as_ref()));
+            }
+        }
+        state.cursor = page.next_cursor.clone();
+        if state.cursor.is_none() {
+            state.done = true;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

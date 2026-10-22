@@ -65,7 +65,9 @@ pub use repository::{
     SearchField, SearchTerm, resolve_update_scan_sort,
 };
 pub use split_store::{SplitStore, is_illustration_key};
-pub use store_migration::{StoreMigrationState, migrate_page};
+pub use store_migration::{
+    IllustrationDedupState, StoreMigrationState, deduplicate_illustrations_page, migrate_page,
+};
 pub use url_policy::{is_safe_public_ip, validate_url_syntax};
 
 /// Target-aware future type used by every async platform trait.
