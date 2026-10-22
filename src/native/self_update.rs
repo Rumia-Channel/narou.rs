@@ -703,7 +703,6 @@ mod tests {
         assert_eq!(
             resolve_variant(&SelfUpdateRequest {
                 variant: Some(SelfUpdateVariant::Standard),
-                ..Default::default()
             }),
             SelfUpdateVariant::Standard
         );

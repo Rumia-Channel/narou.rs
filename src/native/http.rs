@@ -1079,9 +1079,12 @@ mod tests {
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 1024];
-            let _ = stream.read(&mut request);
+            // リクエスト全体を読み切ってから応答する。未読の受信データを残した
+            // まま close すると RST になり、クライアントが応答本文を取り落とす
+            // ことがある (CI で稀に body error になる)。
+            let _ = read_request(&mut stream);
             stream.write_all(response).unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
         });
         (url, server)
     }

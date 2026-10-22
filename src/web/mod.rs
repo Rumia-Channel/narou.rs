@@ -857,12 +857,10 @@ fn ui_token_matches(headers: &HeaderMap, state: &AppState) -> bool {
     if let Some(actual) = headers
         .get(INTERNAL_CONTROL_HEADER)
         .and_then(|value| value.to_str().ok())
+        && (constant_time_str_eq(actual, state.ui_token.as_str())
+            || constant_time_str_eq(actual, state.control_token.as_str()))
     {
-        if constant_time_str_eq(actual, state.ui_token.as_str())
-            || constant_time_str_eq(actual, state.control_token.as_str())
-        {
-            return true;
-        }
+        return true;
     }
     cookie_value(headers, UI_AUTH_COOKIE)
         .is_some_and(|actual| constant_time_str_eq(actual, state.ui_token.as_str()))

@@ -170,7 +170,7 @@ mod tests {
     use crate::converter::{converter_base::TextType, settings::NovelSettings};
 
     /// トークンから「目印」と「終端」を外した数字部分を取り出す。
-    fn token_digits<'a>(token: &'a str, marker: char) -> &'a str {
+    fn token_digits(token: &str, marker: char) -> &str {
         token
             .strip_prefix(marker)
             .and_then(|rest| rest.strip_suffix(STASH_TERMINATOR))
