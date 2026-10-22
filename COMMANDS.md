@@ -236,7 +236,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - カクヨムは各話の `publishedAt` を初回掲載日時、`editedAt`（無い場合は `publishedAt`）を `subupdate` として扱い、本文改稿のみの通常 Update でも対象話を更新する
 - `update.convert-only-new-arrival` 設定対応（YAMLの真偽値/文字列/数値を許容）
 - `last_check_date` 追跡
-- `download.choices-of-digest-options` 設定対応。Ruby版と同じ 1-8 のダイジェスト化選択肢を処理し、キャンセル・凍結・バックアップ・あらすじ表示・ブラウザ起動・保存フォルダ起動・変換を実行
+- `download.choices-of-digest-options` 設定対応。Ruby版と同じ 1-8 のダイジェスト化選択肢を処理し、キャンセル・凍結・バックアップ・あらすじ表示・ブラウザ起動・保存フォルダ起動・変換を実行。4-8 の非終端アクションを指定した後は更新を継続する (暗黙のキャンセルは行わない)
 - ダイジェスト化キャンセル時は `UpdateStatus::Canceled` を返し、`update` / `download` コマンド側でRuby版相当のキャンセル表示と終了コード加算を行う
 - 差分更新時は Ruby版同様 `本文/cache/<timestamp>/` に旧sectionを退避し、差分が無い場合は空cacheディレクトリを削除
 - download/update 共通の差分退避は旧目次のファイル名を参照する。各話の題名変更でも SQLite の旧本文を `本文/cache/` へ保存し、新題名で更新した後の差分なし再更新・章題変更も処理できる（issue #32）。保存先を `diff` が参照する Ruby版互換の `cache/` に統一

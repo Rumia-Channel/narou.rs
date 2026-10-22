@@ -8,6 +8,8 @@
 
 検証: `cargo check --workspace --all-targets`、`cargo test -p narou_rs --lib` (1143) / `--features lite` (1160) / bins / integration、`cargo test -p narou_relay`、Worker wasm check、workspace clippy `-D warnings`、Python deploy tests が成功。loopback UI の実サーバ E2E（未認証 401 → 起動 URL 303+Cookie → Cookie あり 200 → 不正 Cookie 401）も確認済み。develop CI（`9603894`）は Native/wasm/Worker contract/license/deploy develop を含め success。
 
+公開前 issue 対応: #39 旧セクション変換キャッシュ移行の並列競合による Convert IO error、#40 keep-txt=true の novel.txt 重複、#41 ダイジェスト自動選択後の暗黙キャンセル・保存フォルダの Documents 誤表示・CLI 進捗バー、#42 インデント系設定 (E000 マーカーが原因)、#43 Web UI の凍結スキップ誤エラーと「凍結済みでも更新」の選択無視、#44 中断後の novel lock 残留を修正。テストは lib 1154 / lite 1171、bins/integration、convert_parity、cli E2E を確認。issue 修正後の最終 CI を待ってリリースする。
+
 リリース手順: この prepare commit を push して develop CI 成功を確認 → main へ no-ff 統合し annotated `v0.4.17` タグを作成・push → Release workflow と Platform（tag/main, production Worker deploy）を監視 → develop へリリースマージを戻して記録を更新する。
 
 ## 現況（v0.4.16 リリース）

@@ -194,7 +194,7 @@ flowchart TD
 | # | 穴 | 根拠 |
 |---|---|---|
 | 1 | ~~SSRF 検証が DNS 解決を要求~~ → **解決済み**: 構文検証を `platform::url_policy` に分離し、`HttpClient::validate_url` の実装が DNS の有無に応じて判定する（native=解決先まで、worker=構文とアドレスリテラル） | `src/platform/url_policy.rs`, `src/platform/http.rs`, `src/downloader/security.rs`, `worker_entry/src/http.rs` |
-| 2 | ~~Convert が Worker に存在しない~~ → **解決**: `ConvertService`（core）が保存済み TOC と本文から変換テキストを組み、`<prefix>/novel.txt` へ書く。`JobKind::Convert` は worker 実行可能。native の `convert_novel_by_id` が書く固定名ミラーと同じキー | `src/application/convert.rs`, `worker_entry/src/convert.rs`, `src/application/jobs.rs` |
+| 2 | ~~Convert が Worker に存在しない~~ → **解決**: `ConvertService`（core）が保存済み TOC と本文から変換テキストを組み、`<prefix>/novel.txt` へ書く。`JobKind::Convert` は worker 実行可能。native は per-title txt + SQLite `novel_outputs` を使い、固定名ミラーは書かない (issue #40) | `src/application/convert.rs`, `worker_entry/src/convert.rs`, `src/application/jobs.rs` |
 | 3 | ~~CookieStore 未注入~~ → **解決**: `D1CookieStore` の読み書き両方を注入（native と同じ `app_state(inv, login_cookie)`、at-rest 暗号化）。`Set-Cookie` の書き戻しと `/api/login*`（一覧・置き換え・削除）も Worker で動く | `worker_entry/src/d1_cookie_store.rs`, `worker_entry/src/http.rs`, `worker_entry/src/login.rs` |
 | 4 | ~~設定が Worker に届かない~~ → **解決**: `SnapshotDownloaderSettings` に `app_state` の `local`/`global`（`update.strong` / `guard-spoiler` / `auto-add-tags` / `download.use-subdirectory` / `over18`）と `inv` の section hash cache を起動時に読んで注入。書き戻しは同期 API と非同期 D1 の都合で no-op（`over18` は Web UI 側で設定） | `src/downloader/settings.rs`, `worker_entry/src/composition.rs` |
 | 5 | デプロイ設定: `wrangler.<target>.toml` + `ci/render_config.py` は完成。CI の `worker-deploy`（手動トリガー・environment ゲート）に必要な secret/vars を設定すれば動くが、**実アカウントでの実行は未検証** | `worker_entry/wrangler.develop.toml`, `.github/workflows/platform.yml` |
@@ -215,8 +215,9 @@ flowchart TD
 - `ConvertService` (`src/application/convert.rs`) が `<prefix>/toc.yaml` と `本文/*.yaml` を
   ObjectStore から読み、`setting.ini` / `replace.txt` / `converter.yaml`（いずれも ObjectStore 上）と
   `SettingsStore` の `default.*` / `force.*` を適用して `NovelConverter::build` → `convert_novel` を実行し、
-  `<prefix>/novel.txt` に書く。native の `convert_novel_by_id` と同じ固定名ミラーなので `download.epub`
-  がそのまま配信できる（409 が消える）。
+  `<prefix>/novel.txt` に書く。この固定名キーは Worker 自身の `download.epub` が
+  そのまま配信できる（409 が消える）。native は per-title txt + SQLite
+  `novel_outputs` を読むため、同じキーを書く必要はない (issue #40)。
 - 検証: `src/application/convert.rs` のテストが MemoryObjectStore 上で往復（TOC + 本文 →
   `novel.txt`、本文が無ければ失敗）を固定する。
 - 既知の差: 挿絵のローカライズ能力は native の CLI 変換と同じく渡さない（device 側の仕事）。小説ごとの
