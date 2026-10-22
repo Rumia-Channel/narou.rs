@@ -1,6 +1,6 @@
 # narou.rs 移植状況
 
-## 現況（v0.4.17 リリース準備）
+## 現況（v0.4.17 リリース済み / develop 次版）
 
 ユーザーが「更新されたバージョンをセキュリティアップデートとしてバージョンを切って」と明示指定。公開済みは v0.4.16（2026-10-21）、今回の次版は **v0.4.17** とする。本体/Worker/relay/両 lock/ライセンス表記を 0.4.17 へ更新し、VERSION.md 先頭に v0.4.17 節を追加した。
 
@@ -11,6 +11,10 @@
 公開前 issue 対応: #39 旧セクション変換キャッシュ移行の並列競合による Convert IO error、#40 keep-txt=true の novel.txt 重複、#41 ダイジェスト自動選択後の暗黙キャンセル・保存フォルダの Documents 誤表示・CLI 進捗バー、#42 インデント系設定 (E000 マーカーが原因)、#43 Web UI の凍結スキップ誤エラーと「凍結済みでも更新」の選択無視、#44 中断後の novel lock 残留を修正。テストは lib 1154 / lite 1171、bins/integration、convert_parity、cli E2E を確認。issue 修正後の最終 CI を待ってリリースする。
 
 リリース手順: この prepare commit を push して develop CI 成功を確認 → main へ no-ff 統合し annotated `v0.4.17` タグを作成・push → Release workflow と Platform（tag/main, production Worker deploy）を監視 → develop へリリースマージを戻して記録を更新する。
+
+v0.4.17 リリース完了 (2026-10-22): main `a5f79ac` / tag `v0.4.17`。develop CI・tag Platform (production Worker deploy)・Release 16 assets すべて success。issue #39〜#44 の修正を含み、公開後に各 issue へ返信済み (クローズはしていない)。
+
+次の develop 変更 (未リリース): **S3 挿絵の全作品共通 content-addressed プール**。Worker の `illustration_dedup` を常時 true、native も S3 保存なら storage-backend を問わず dedup を有効化。新規挿絵は常に hex 名になり、`illustrations/<base64url(sha256)>.<ext>` に集約。既存の小説別 hex 名は native `narou illust s3-dedup` / Worker `POST /api/admin/illustration-dedup` (`status|plan|copy|reset`) で移行でき、presign はプールに無ければ旧配置へフォールバックする。テストは lib 1156 / lite 1173、Worker contract、clippy、wasm が成功し、develop CI (`51176fe`) も success。
 
 ## 現況（v0.4.16 リリース）
 
