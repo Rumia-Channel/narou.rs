@@ -889,7 +889,7 @@ pub fn setting_variables() -> SettingVariables {
             "download.choices-of-digest-options",
             vis(
                 VarType::String,
-                "ダイジェスト化選択肢が出た場合に自動で項目を選択する",
+                "ダイジェスト化選択肢が出た場合に自動で項目を選択する (カンマ区切り。4-8 の非終端アクションの後は更新を継続)",
             ),
         ),
         (

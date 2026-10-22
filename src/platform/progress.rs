@@ -16,6 +16,12 @@ pub trait ProgressReporter: Send + Sync {
     fn set_message(&self, msg: &str);
     fn finish_with_message(&self, msg: &str);
     fn println(&self, msg: &str);
+
+    /// 対話プロンプトのように、進捗表示と競合させたくない処理を包む。
+    /// 既定はそのまま実行 (Web / テスト用)。CLI 実装は表示を一時停止する。
+    fn with_suspended(&self, action: &mut dyn FnMut()) {
+        action();
+    }
 }
 
 /// Progress reporter that discards all output.

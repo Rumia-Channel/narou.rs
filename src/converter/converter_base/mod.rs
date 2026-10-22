@@ -274,15 +274,6 @@ impl ConverterBase {
                 if !prefix.is_empty() {
                     line = format!("{}{}", prefix, line);
                 }
-                if !line.is_empty()
-                    && !line.starts_with(' ')
-                    && !line.starts_with('\u{3000}')
-                    && !line.starts_with('\t')
-                    && !is_border_symbol(&line)
-                {
-                    let marker_pos = line.bytes().take_while(|&byte| byte == b'\n').count();
-                    line.insert(marker_pos, '\u{E000}');
-                }
             }
 
             before_line_blank = is_blank_line(&line);
@@ -304,7 +295,6 @@ impl ConverterBase {
         if matches!(text_type, TextType::Body | TextType::TextFile) {
             self.half_indent_bracket(&mut data);
             self.auto_indent(&mut data);
-            data = data.replace('\u{E000}', "");
         }
 
         if self.settings.enable_ruby {
