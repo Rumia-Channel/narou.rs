@@ -1,5 +1,15 @@
 # narou.rs 移植状況
 
+## 現況（v0.4.17 リリース準備）
+
+ユーザーが「更新されたバージョンをセキュリティアップデートとしてバージョンを切って」と明示指定。公開済みは v0.4.16（2026-10-21）、今回の次版は **v0.4.17** とする。本体/Worker/relay/両 lock/ライセンス表記を 0.4.17 へ更新し、VERSION.md 先頭に v0.4.17 節を追加した。
+
+今回の主な内容（セキュリティアップデート）: (1) loopback Web UI に起動ごとの一度きりチケット→HttpOnly/SameSite=Strict Cookie (30日) の認証を追加し、`/api/*`・`/ws`・`/novels/{id}/download` を保護（static assets は公開のまま、CLI は `x-narou-internal-token`）。(2) セルフアップデートの `asset_url` 任意指定を廃止し、GitHub Releases asset の SHA-256 digest とサイズを検証（欠落・不一致は fail closed）。(3) reverse proxy モードでも Host 許可リストを維持、クリックジャッキング防止ヘッダ、外部 bind の平文 Basic/認証なし警告。(4) うごイラ ZIP の宣言サイズ・16MiB/フレーム・ヘッダ寸法検証、非リモート `<img>` の小説ディレクトリ内限定、URL stash の可変長トークン化（6,143 件超の消失と約105万件の panic 修正）。(5) login export の 8 文字未満パスフレーズ拒否・Unix 0600・シンボリックリンク非追従、CDP の `--port 0` 自動検出と `DevToolsActivePort`/ws URL 検証、SQLite 0600、backup から `login.key`/`ui_token` 除外。(6) Worker relay は https 必須（loopback のみ http 可）、wrangler を `4.151.3` に固定、CI の `NAROU_ADMIN_TOKEN` は 32 文字以上を要求。
+
+検証: `cargo check --workspace --all-targets`、`cargo test -p narou_rs --lib` (1143) / `--features lite` (1160) / bins / integration、`cargo test -p narou_relay`、Worker wasm check、workspace clippy `-D warnings`、Python deploy tests が成功。loopback UI の実サーバ E2E（未認証 401 → 起動 URL 303+Cookie → Cookie あり 200 → 不正 Cookie 401）も確認済み。develop CI（`9603894`）は Native/wasm/Worker contract/license/deploy develop を含め success。
+
+リリース手順: この prepare commit を push して develop CI 成功を確認 → main へ no-ff 統合し annotated `v0.4.17` タグを作成・push → Release workflow と Platform（tag/main, production Worker deploy）を監視 → develop へリリースマージを戻して記録を更新する。
+
 ## 現況（v0.4.16 リリース）
 
 ユーザーが v0.4.16 でのリリース（develop 統合・公開）を明示指定。公開済みは v0.4.15（2026-10-18）。本体/Worker/両lock/ライセンス表記を 0.4.16 へ更新し、VERSION.md 先頭に v0.4.16 節を追加した。v0.4.15 節へリリース後に追記されていた SORAHOST / Cloud Run リレー配備の 4 項目は、実際には v0.4.15 に含まれないため v0.4.16 節へ移した。

@@ -3,6 +3,19 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
+## v0.4.17 — セキュリティアップデート (Web UI 認証・更新検証・上流コンテンツ保護)
+
+- **loopback Web UI に認証を追加**しました。`127.0.0.1` / `localhost` / `::1` に bind し Basic 認証もリバースプロキシも使わない構成では、`narou web` が起動ごとの一度きり URL チケットをブラウザへ渡し、`/` で 30 日有効の HttpOnly / SameSite=Strict Cookie (`narou_ui_token`) に交換します。`/api/*`・`/ws`・`/novels/{id}/download` はこの Cookie または `x-narou-internal-token` を要求し、別ローカルユーザー/プロセスからの操作・読み取りを防ぎます。トークンは `.narou/ui_token` (0600) に永続化し、サーバ再起動・セルフアップデート後もブラウザのセッションを維持します。
+- **セルフアップデートの信頼性を強化**しました。呼び出し元が任意の `asset_url` を指定できる経路を廃止し、GitHub Releases API が返すリリース資産だけを使用します。ダウンロード後に Release asset の SHA-256 digest とサイズを検証し、欠落・不一致はインストールせず中止します。
+- Web UI の全レスポンスに `X-Frame-Options: DENY` / `Content-Security-Policy: frame-ancestors 'none'` / `X-Content-Type-Options: nosniff` / `Referrer-Policy: no-referrer` を付与し、クリックジャッキングを防ぎます。`server-reverse-proxy.enable=true` でも Host の許可リストを維持するよう変更し、外部公開ホストは `server-add-accepted-hosts` に、WebSocket は `server-ws-add-accepted-domains` に明示する必要があります。外部 bind の Basic 認証が平文 HTTP の場合と、外部 bind で認証が無効な場合は起動時に警告します。
+- **上流コンテンツ由来の OOM を防止**します。うごイラのフレーム ZIP は 1 フレーム 16 MiB の宣言サイズ・読み出し上限と、復号前のヘッダ寸法 (1920×1080) で検証します。EPUB に取り込む非リモート `<img src>` は小説ディレクトリ内の相対パスだけを許可し、`..`・絶対パス・ドライブ/UNC パスを拒否します。変換の URL stash を可変長トークン化し、6,143 件超の URL 消失と約105万件での panic を修正しました。
+- **ログイン情報の保護を強化**しました。`narou login export` / `narou_rs_login --export` は 8 文字未満のパスフレーズを拒否し、Unix では 0600・シンボリックリンク非追従で書き出します (取り込みは旧ファイル互換のため任意長を許可)。`narou_rs_login` のブラウザは空きポートを自動選択し、`DevToolsActivePort` と `/json/version` の WebSocket URL を検証します。SQLite の `db.sqlite` / `-wal` / `-shm` は Unix で 0600 にし、ライブラリバックアップから `.narou/login.key` と `.narou/ui_token` を除外しました。
+- **Worker / relay / CI**: 外部リレーの接続先は https 必須 (ループバックのみ http 可) とし、スキーム省略時の暗黙 `http://` 補完を廃止しました。deploy の wrangler を `4.151.3` に固定し、CI の `NAROU_ADMIN_TOKEN` は 32 文字以上を要求します。
+
+**アップグレード時の注意**: loopback Web UI はベース URL を直接開くと API が 401 になります。`narou web` 起動時に自動で開く URL (`--no-browser` では表示される URL) を使用してください。リバースプロキシ構成では許可ホストの追加設定が必要です。リレーを `http://` またはスキーム省略で設定している場合は `https://` に変更してください。`NAROU_ADMIN_TOKEN` が 32 文字未満の場合は次回デプロイ前にローテーションしてください。短いパスフレーズでの書き出しは拒否されます。
+
+変更一覧は [v0.4.16...v0.4.17](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.16...v0.4.17) を参照してください。
+
 ## v0.4.16 — リレー取得の安定化・CA侵害対応・Pixiv漫画シリーズのタグ
 
 - SORAHOST と GCP (Cloud Run) へのリレー配備を**非推奨**とし、CI から両ホスト向けのリレー検証・配備を取り除きました。リレーは VPS (`relay.md` / `docs/vps-relay.md`) または自宅回線 (`docs/home-relay.md`) で運用します。既存の配備スクリプト (`scripts/relay/bootstrap.mjs` / `deploy-sorahost.mjs` / `relay.js` / `pins.json`) と手順は参照用に残しますが、新規配備・自動更新はサポートしません。
