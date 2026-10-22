@@ -386,8 +386,9 @@ impl WorkerRuntime {
             .map(str::to_owned);
         let user_agent = narou_rs::downloader::resolve_user_agent(None, saved_user_agent);
         // 外部リレーは `NAROU_RELAY_ENDPOINT` と
-        // `NAROU_RELAY_KEY` が揃ったときだけ有効にする。スキーム無しの
-        // `<IP>:<port>` 形式も受け付ける (http.rs の `with_relay` が補完)。
+        // `NAROU_RELAY_KEY` が揃ったときだけ有効にする。公開先は https か、
+        // ループバックの http だけを許可する (http.rs の `with_relay` が検証し、
+        // それ以外は fail closed で無効化する)。
         let relay_base = crate::secrets::value(env, "NAROU_RELAY_ENDPOINT").await;
         let relay_token = crate::secrets::value(env, "NAROU_RELAY_KEY").await;
         let mut http_client =

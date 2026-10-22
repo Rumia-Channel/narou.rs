@@ -32,7 +32,8 @@ ENV = {
     "NAROU_DEPLOY_TARGET": "develop",
     "CLOUDFLARE_ACCOUNT_ID": "fake-account",
     "CLOUDFLARE_API_TOKEN": "fake-cloudflare-token",
-    "NAROU_ADMIN_TOKEN": "fake-admin-token",
+    # require_probe_auth() は CI 側トークンに 32 文字以上を要求する。
+    "NAROU_ADMIN_TOKEN": "fake-admin-token-0123456789abcdef",
     "NAROU_D1_DATABASE_NAME": "narou-rs-develop",
     "NAROU_D1_DATABASE_ID": "12345678-1234-1234-1234-123456789012",
     "NAROU_JOB_QUEUE": "narou-jobs-develop",
@@ -222,7 +223,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(request.full_url, "https://worker.example.invalid/api/storage/mode?probe=s3")
         self.assertEqual(request.get_method(), "GET")
         self.assertIsNone(request.data)
-        self.assertEqual(request.get_header("Authorization"), "Bearer fake-admin-token")
+        self.assertEqual(request.get_header("Authorization"), f"Bearer {ENV['NAROU_ADMIN_TOKEN']}")
         self.assertEqual(request.get_header("Cf-access-client-id"), "fake-access-id")
         self.assertEqual(request.get_header("Cf-access-client-secret"), "fake-access-secret")
         # Cloudflare's bot rules answer 403 to urllib's default user agent while
@@ -273,7 +274,7 @@ class ProbeTests(unittest.TestCase):
         # The edge's own marker is logged for diagnosis (never secrets or bodies).
         self.assertIn("cf-mitigated=challenge", printed)
         self.assertNotIn("worker.example.invalid", printed)
-        self.assertNotIn("fake-admin-token", printed)
+        self.assertNotIn("fake-admin-token-0123456789abcdef", printed)
 
     def test_access_login_redirect_is_treated_as_blocked(self):
         # ルートで Worker を受けるホスト名では、Access が 302 でログインへ

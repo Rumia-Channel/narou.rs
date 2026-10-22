@@ -7,6 +7,7 @@
 //! import never silently trusts a file whose secrecy was assumed.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,12 @@ pub const EXPORT_VERSION_LEGACY: u32 = 1;
 pub const EXPORT_VERSION_PER_HOST: u32 = 2;
 /// `kdf` value written for encrypted envelopes.
 pub const KDF_ARGON2ID: &str = "argon2id";
+
+/// 暗号化 export のパスフレーズに要求する最小文字数。
+///
+/// 総当たりで解ける短いパスフレーズを受け付けないための下限。取り込み側は
+/// 以前に書き出された短いパスフレーズのファイルも読めるよう検査しない。
+const MIN_EXPORT_PASSPHRASE_CHARS: usize = 8;
 
 fn login_error(message: impl Into<String>) -> NarouError {
     NarouError::Login(message.into())
@@ -77,6 +84,7 @@ pub fn build_export(
 ) -> Result<String> {
     let envelope = match passphrase {
         Some(passphrase) => {
+            validate_export_passphrase(passphrase)?;
             let salt: [u8; SALT_LEN] = random_bytes()?;
             let key = derive_key(passphrase, &salt)?;
             let plaintext = serde_json::to_string(sites).map_err(|error| {
@@ -110,6 +118,74 @@ pub fn build_export(
         },
     };
     serde_yaml::to_string(&envelope).map_err(NarouError::from)
+}
+
+/// 暗号化 export のパスフレーズを検査する。
+///
+/// 空・短すぎるパスフレーズは暗号文を総当たりで解けるため、書き出し側では
+/// 受け付けない (日本語のパスフレーズでも数えやすいよう文字数で判定する)。
+/// 取り込み側 ([`parse_export`]) は以前に書き出されたファイルを読めるよう
+/// 長さを検査しない。
+fn validate_export_passphrase(passphrase: &str) -> Result<()> {
+    if passphrase.is_empty() {
+        return Err(login_error(
+            "パスフレーズが空です。8 文字以上のパスフレーズを指定してください。",
+        ));
+    }
+    if passphrase.chars().count() < MIN_EXPORT_PASSPHRASE_CHARS {
+        return Err(login_error(format!(
+            "パスフレーズは {MIN_EXPORT_PASSPHRASE_CHARS} 文字以上で指定してください \
+             (短いパスフレーズは暗号化の強度を保てません)。"
+        )));
+    }
+    Ok(())
+}
+
+/// 書き出しファイルを安全に書く。
+///
+/// 平文でも暗号文でもログイン Cookie が入るため、Unix では最初から owner だけが
+/// 読める 0600 で作成し、既存ファイルも 0600 に締め直す (失敗しても書き込みは
+/// 続ける)。既存のシンボリックリンクは辿らず、通常ファイルだけを置き換える
+/// (リンク先の別ファイルを意図せず切り詰めないため)。Windows にはファイル
+/// モードが無いので権限操作はしない。
+pub fn write_export_file(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(login_error(format!(
+                "{} はシンボリックリンクです。リンク先への意図しない書き込みを防ぐため書き出せません",
+                path.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(login_error(format!(
+                "{} は通常ファイルではないため書き出せません",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 新規作成は最初から 0600 (truncate では既存のモードが残る)。
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 既存ファイルの緩い権限 (例: 0644) も、開いた実体に対して締め直す。
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    file.write_all(text.as_bytes())?;
+    file.flush()?;
+    Ok(())
 }
 
 /// Read an export document back into credentials (trial order).
@@ -309,13 +385,14 @@ mod tests {
 
     #[test]
     fn encrypted_envelope_hides_the_logins_and_needs_the_passphrase() {
-        let text = build_export(&sites(), Some("hunter2"), "2026-09-20T00:00:00+09:00", None)
+        let passphrase = "hunter2-long";
+        let text = build_export(&sites(), Some(passphrase), "2026-09-20T00:00:00+09:00", None)
             .unwrap();
         assert!(text.contains("encrypted: true"));
         assert!(text.contains("kdf: argon2id"));
         assert!(!text.contains("PHPSESSID=abc"));
-        assert_eq!(parse_export(&text, Some("hunter2")).unwrap(), sites());
-        assert!(parse_export(&text, Some("wrong")).is_err());
+        assert_eq!(parse_export(&text, Some(passphrase)).unwrap(), sites());
+        assert!(parse_export(&text, Some("wrong-passphrase")).is_err());
         assert!(parse_export(&text, None).is_err());
     }
 
@@ -400,12 +477,96 @@ mod tests {
 
     #[test]
     fn rejects_unknown_versions_and_damaged_payloads() {
-        let text = build_export(&sites(), Some("hunter2"), "2026-09-20T00:00:00+09:00", None)
+        let text = build_export(&sites(), Some("hunter2-long"), "2026-09-20T00:00:00+09:00", None)
             .unwrap();
         let bumped = text.replace("version: 3", "version: 99");
-        assert!(parse_export(&bumped, Some("hunter2")).is_err());
+        assert!(parse_export(&bumped, Some("hunter2-long")).is_err());
 
         let damaged = text.replace("payload: ", "payload: AAAA");
-        assert!(parse_export(&damaged, Some("hunter2")).is_err());
+        assert!(parse_export(&damaged, Some("hunter2-long")).is_err());
+    }
+
+    #[test]
+    fn export_rejects_empty_and_short_passphrases() {
+        for passphrase in ["", "short", "hunter2"] {
+            assert!(
+                build_export(
+                    &sites(),
+                    Some(passphrase),
+                    "2026-09-20T00:00:00+09:00",
+                    None,
+                )
+                .is_err(),
+                "{passphrase:?} must be rejected for export"
+            );
+        }
+        // 8 文字以上 (日本語は文字数で数える) なら書き出せて、元に戻せる。
+        for passphrase in ["long enough", "合言葉は八文字です"] {
+            let text =
+                build_export(&sites(), Some(passphrase), "2026-09-20T00:00:00+09:00", None)
+                    .unwrap();
+            assert_eq!(parse_export(&text, Some(passphrase)).unwrap(), sites());
+        }
+    }
+
+    #[test]
+    fn import_still_accepts_short_passphrases_from_old_exports() {
+        // 旧版は 8 文字未満のパスフレーズでも書き出せた。取り込み側は長さを
+        // 検査しないので、以前の書き出しファイルを読める。
+        let salt: [u8; SALT_LEN] = random_bytes().unwrap();
+        let key = derive_key("hunter2", &salt).unwrap();
+        let plaintext = serde_json::to_string(&sites()).unwrap();
+        let payload = encrypt_with_key(&key, ENVELOPE_AAD, &plaintext).unwrap();
+        let envelope = CookieEnvelope {
+            version: EXPORT_VERSION,
+            exported_at: "2026-09-20T00:00:00+09:00".to_string(),
+            library: None,
+            encrypted: true,
+            kdf: Some(KDF_ARGON2ID.to_string()),
+            salt: Some(base64_encode(&salt)),
+            payload: Some(payload),
+            sites: BTreeMap::new(),
+            credentials: Vec::new(),
+            cookies: BTreeMap::new(),
+        };
+        let text = serde_yaml::to_string(&envelope).unwrap();
+        assert_eq!(parse_export(&text, Some("hunter2")).unwrap(), sites());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_files_are_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("export.yaml");
+        write_export_file(&path, "version: 3\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "version: 3\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // 既存の緩い権限 (0644) も書き込み時に締め直す。
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_export_file(&path, "overwritten\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "overwritten\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_file_does_not_follow_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.yaml");
+        std::fs::write(&target, "original\n").unwrap();
+        let link = temp.path().join("link.yaml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(write_export_file(&link, "replaced\n").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
     }
 }

@@ -64,6 +64,12 @@ if (!existsSync(devVars)) {
 
 // 2. 実行用の設定。ビルドはこのスクリプトが行うので [build] を外す
 //    (wrangler dev が毎回 release ビルドを走らせないようにするため)。
+//    deploy CI と同じく実行する wrangler は固定バージョンにする。
+const WRANGLER_VERSION = process.env.NAROU_WRANGLER_VERSION || "4.151.3";
+if (!/^\d+\.\d+\.\d+$/.test(WRANGLER_VERSION)) {
+  throw new Error(`NAROU_WRANGLER_VERSION must be exact x.y.z: ${WRANGLER_VERSION}`);
+}
+const WRANGLER_PACKAGE = `wrangler@${WRANGLER_VERSION}`;
 const config = readFileSync(join(root, "wrangler.toml"), "utf8").replace(
   /\[build\][^\[]*/,
   "",
@@ -79,7 +85,7 @@ run("worker-build", release ? ["--release"] : []);
 // 4. ローカル D1 にマイグレーションを適用。
 run(npx, [
   "--yes",
-  "wrangler@4",
+  WRANGLER_PACKAGE,
   "d1",
   "migrations",
   "apply",
@@ -93,7 +99,7 @@ run(npx, [
 const legacyContentFixture = join(root, ".wrangler", "contract-content-backend.sql");
 writeFileSync(legacyContentFixture, "INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','\"d1\"','d1') ON CONFLICT(scope,key) DO NOTHING;");
 run(npx, [
-  "--yes", "wrangler@4", "d1", "execute", "DB", "--local",
+  "--yes", WRANGLER_PACKAGE, "d1", "execute", "DB", "--local",
   "-c", "wrangler.test.toml", "--file", legacyContentFixture,
 ]);
 
@@ -102,7 +108,7 @@ const dev = spawn(
   npx,
   [
     "--yes",
-    "wrangler@4",
+    WRANGLER_PACKAGE,
     "dev",
     "-c",
     "wrangler.test.toml",
@@ -151,7 +157,7 @@ try {
       npx,
       [
         "--yes",
-        "wrangler@4",
+        WRANGLER_PACKAGE,
         "dev",
         "-c",
         "wrangler.test.toml",

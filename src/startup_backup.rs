@@ -10,6 +10,12 @@
 //! 常に現在バージョンへ更新する。
 //! 実際の zip 作成は `narou_rs_backup` 実行ファイルとしても独立しており、
 //! Web UI からはサブプロセスとして起動される。
+//!
+//! ログイン資格情報の鍵 `.narou/login.key` と Web UI のローカル認証トークン
+//! `.narou/ui_token` はバックアップに含めない。在庫 (`.narou/login_cookie.yaml`
+//! / SQLite) には鍵で暗号化した Cookie が入るため、鍵と暗号文を同じ zip に
+//! 載せるとバックアップが平文の資格情報と同じ強さになってしまう。UI トークン
+//! も、別環境でそのまま Web UI に入れてしまわないよう持ち出さない。
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -342,6 +348,8 @@ fn add_directory_to_zip(
 /// - 任意の階層の `backup/` ディレクトリ (小説ごとのバックアップ)
 /// - `.narou/section_convert_cache/` (再生成可能なキャッシュ)
 /// - `.narou/*.lock`, `.narou/server.pid` (実行時の一時ファイル)
+/// - `.narou/login.key` (資格情報の鍵。暗号文と同じ zip に載せない)
+/// - `.narou/ui_token` (Web UI のローカル認証トークン。持ち出さない)
 fn collect_backup_files(
     base_dir: &Path,
     current_dir: &Path,
@@ -386,6 +394,12 @@ fn is_backup_excluded(base_dir: &Path, path: &Path) -> bool {
         if let Some(first) = components.next() {
             let name = first.as_os_str();
             if name == "section_convert_cache" || name == "server.pid" {
+                return true;
+            }
+            // 資格情報の鍵は、暗号化済み Cookie を含む在庫と同じ zip に
+            // 入れない (鍵と暗号文が揃うと平文と同じ強さになる)。Web UI の
+            // ローカル認証トークンもバックアップに持ち出さない。
+            if name == "login.key" || name == "ui_token" {
                 return true;
             }
             // .narou 直下の *.lock のみ除外 (ネストした .lock は残す)
@@ -461,6 +475,24 @@ mod tests {
         assert!(is_backup_excluded(
             base,
             Path::new("/lib/.narou/server.pid")
+        ));
+        // 資格情報の鍵と UI トークンは除外し、鍵以外の .narou/*.yaml は
+        // 従来どおり含める。
+        assert!(is_backup_excluded(
+            base,
+            &base.join(".narou").join("login.key")
+        ));
+        assert!(is_backup_excluded(
+            base,
+            &base.join(".narou").join("ui_token")
+        ));
+        assert!(!is_backup_excluded(
+            base,
+            &base.join(".narou").join("login_cookie.yaml")
+        ));
+        assert!(!is_backup_excluded(
+            base,
+            &base.join(".narou").join("author.yaml")
         ));
         // .narou の通常ファイルは残す
         assert!(!is_backup_excluded(

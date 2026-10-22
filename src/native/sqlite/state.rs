@@ -444,6 +444,40 @@ fn legacy_yaml_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// SQLite のデータベースと `-wal` / `-shm` を所有者だけが読める権限へ締める。
+///
+/// `.narou/db.sqlite` には資格情報 (`login_cookie`) や作者・凍結などの管理
+/// データが平文で入るため、同一ホストの他ユーザーから読めないようにする。
+/// WAL と SHM にも同じ内容が載るので、存在すれば併せて 0600 にする。
+/// Windows には Unix のファイルモードが無いので何もしない。
+///
+/// 権限変更は best effort: 読み取り専用の DB やファイルモードを変えられない
+/// ファイルシステムでも、開けなくしてはいけないので失敗は警告に留める。
+#[cfg(unix)]
+fn restrict_sqlite_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut candidates = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        candidates.push(PathBuf::from(name));
+    }
+    for candidate in candidates {
+        match std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "warning: could not restrict SQLite file permissions for {}: {error}",
+                candidate.display()
+            ),
+        }
+    }
+}
+
+/// Windows には Unix のファイルモードが無いので、権限操作をしない。
+#[cfg(not(unix))]
+fn restrict_sqlite_permissions(_path: &Path) {}
+
 /// 挿絵の重複除去プール (`illustrations/<sha256>`) を使うか。
 ///
 /// SQLite モード (`storage-backend` マーカーが `sqlite` で、`NAROU_RS_LEGACY_YAML`
@@ -471,8 +505,11 @@ pub fn illustration_dedup_enabled() -> bool {
 pub fn configure(narou_dir: &Path) -> Result<StateDb> {
     std::fs::create_dir_all(narou_dir)
         .map_err(|error| NarouError::Platform(format!("sqlite dir: {error}")))?;
-    let mut conn = Connection::open(narou_dir.join(DB_FILE_NAME))
+    let database = narou_dir.join(DB_FILE_NAME);
+    let mut conn = Connection::open(&database)
         .map_err(|error| NarouError::Platform(format!("sqlite open: {error}")))?;
+    // 既存 DB (と前回の WAL/SHM) は開いた直後に締める。
+    restrict_sqlite_permissions(&database);
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(super::sqlite_error)?;
     conn.pragma_update(None, "synchronous", "NORMAL")
@@ -501,6 +538,8 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
             let _ = super::object_store::import_archive_into_objects(state.conn_ref(), &mirror);
         }
     }
+    // migration や初回取込で新しく作られた -wal / -shm もここで締め直す。
+    restrict_sqlite_permissions(&database);
     Ok(state)
 }
 
@@ -612,5 +651,44 @@ fn rename_imported(paths: Vec<PathBuf>) {
         let mut target = path.clone().into_os_string();
         target.push(format!(".imported-{stamp}"));
         let _ = std::fs::rename(&path, PathBuf::from(target));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn sqlite_database_and_sidecars_are_owner_only_on_unix() {
+        let temp = tempfile::tempdir().unwrap();
+        let narou_dir = temp.path().join(".narou");
+        let state = configure(&narou_dir).unwrap();
+        // WAL / SHM を実際に存在させるため 1 回書く。
+        state
+            .set_raw_db("meta", "permission-check", "1\n")
+            .unwrap();
+        for name in [DB_FILE_NAME, "db.sqlite-wal", "db.sqlite-shm"] {
+            let path = narou_dir.join(name);
+            assert!(path.exists(), "{name} should exist");
+            assert_eq!(mode(&path), 0o600, "{name} must be owner-only");
+        }
+        drop(state);
+    }
+
+    #[test]
+    fn permission_restriction_ignores_missing_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("db.sqlite");
+        std::fs::write(&database, b"").unwrap();
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // -wal / -shm が無くてもエラーにせず、ある分だけ締める。
+        restrict_sqlite_permissions(&database);
+        assert_eq!(mode(&database), 0o600);
     }
 }

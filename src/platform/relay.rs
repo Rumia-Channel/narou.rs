@@ -107,6 +107,71 @@ impl From<RelayError> for crate::error::NarouError {
     }
 }
 
+/// 外部リレーのベース URL を検証し、オリジン (`scheme://host[:port]`) に正規化する。
+///
+/// リレー呼び出しは `X-Proxy-Token` と取得先の Cookie を運ぶため、平文の経路に
+/// 載せてはいけない。`https` を必須とし、`http` はループバック
+/// (`127.0.0.1` / `::1` / `localhost`) の踏み台だけに許す。スキームの無い値
+/// (`<IP>:<port>`) は以前 `http://` を補っていたが、意図しない平文接続になる
+/// ため受け付けない (利用者にスキームを明示させる)。資格情報 (`user:pass@`) は
+/// ログや転送に載りうるので拒否する。パス・クエリ・フラグメントは捨てて
+/// origin だけを返す。
+///
+/// エラーメッセージに URL 自体は載せない (資格情報入りの値をログへ流さないため)。
+pub fn normalize_relay_base(raw: &str) -> std::result::Result<String, RelayError> {
+    let invalid = |message: String| RelayError::InvalidRequest(message);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(invalid("relay base URL is empty".to_string()));
+    }
+    // スキーム無しの値を url crate へ渡すと (`example.com:8080` のように)
+    // 先頭をスキームとして解釈しうるため、先に明示的に弾く。
+    let has_scheme = trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        || trimmed
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    if !has_scheme {
+        return Err(invalid(
+            "relay base URL must start with https:// (plain http is allowed only for loopback)"
+                .to_string(),
+        ));
+    }
+    let base = url::Url::parse(trimmed)
+        .map_err(|error| invalid(format!("invalid relay base URL: {error}")))?;
+    if !base.username().is_empty() || base.password().is_some() {
+        return Err(invalid(
+            "relay base URL must not contain credentials".to_string(),
+        ));
+    }
+    // ループバック判定。`localhost` は名前解決の結果に関わらず局所として扱う
+    // (ブラウザと同じ規則)。IPv4 は 127.0.0.0/8、IPv6 は ::1 のみ。
+    let loopback = match base.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    match base.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        "http" => {
+            return Err(invalid(
+                "relay base URL must be https unless the relay is on loopback \
+                 (127.0.0.1, ::1 or localhost): plain http exposes the proxy token and cookies"
+                    .to_string(),
+            ));
+        }
+        _ => return Err(invalid("relay base URL must be http(s)".to_string())),
+    }
+    let origin = base.origin().ascii_serialization();
+    if origin == "null" {
+        return Err(invalid("relay base URL must have a host".to_string()));
+    }
+    Ok(origin)
+}
+
 /// POST の JSON 本文で送る、組み立て済みのリレー呼び出し。
 pub struct RelayRequest {
     /// 踏み台のオリジン + `/proxy`。
@@ -679,6 +744,68 @@ mod tests {
             } else {
                 assert!(result.unwrap_err().to_string().contains("metadata exceeds limit"));
             }
+        }
+    }
+
+    #[test]
+    fn relay_base_requires_https_except_on_loopback() {
+        // 公開先は https だけ。パス・クエリ・フラグメントは origin へ落とす。
+        assert_eq!(
+            normalize_relay_base("https://relay.example.com").unwrap(),
+            "https://relay.example.com"
+        );
+        assert_eq!(
+            normalize_relay_base("  https://relay.example.com:8443/proxy?x=1#frag  ").unwrap(),
+            "https://relay.example.com:8443"
+        );
+        // ループバックの踏み台だけ http を許す (自動ポートの常駐リレー)。
+        for (raw, expected) in [
+            ("http://127.0.0.1:50071/", "http://127.0.0.1:50071"),
+            ("http://127.0.0.1:50071", "http://127.0.0.1:50071"),
+            ("http://localhost:8080/proxy", "http://localhost:8080"),
+            ("http://[::1]:9090", "http://[::1]:9090"),
+            ("https://localhost:8443", "https://localhost:8443"),
+        ] {
+            assert_eq!(normalize_relay_base(raw).unwrap(), expected, "{raw}");
+        }
+        // スキーム無しは補完しない (暗黙の平文接続へのフォールバックを避ける)。
+        for raw in [
+            "127.0.0.1:50071",
+            "relay.example.com",
+            "relay.example.com:443/proxy",
+        ] {
+            assert!(
+                matches!(normalize_relay_base(raw), Err(RelayError::InvalidRequest(_))),
+                "{raw} must be rejected"
+            );
+        }
+        // 公開ホストの平文 http は拒否する。
+        for raw in [
+            "http://relay.example.com",
+            "http://172.233.91.23:50071",
+            "http://localhost.example.com:8080",
+        ] {
+            assert!(
+                matches!(normalize_relay_base(raw), Err(RelayError::InvalidRequest(_))),
+                "{raw} must be rejected"
+            );
+        }
+        // 資格情報はログ・転送に載りうるので拒否する。
+        for raw in [
+            "https://user:pass@relay.example.com",
+            "http://user@127.0.0.1:50071",
+        ] {
+            assert!(
+                matches!(normalize_relay_base(raw), Err(RelayError::InvalidRequest(_))),
+                "{raw} must be rejected"
+            );
+        }
+        // 空・スキーム違い。
+        for raw in ["", "   ", "ftp://relay.example.com", "file:///etc/passwd"] {
+            assert!(
+                matches!(normalize_relay_base(raw), Err(RelayError::InvalidRequest(_))),
+                "{raw} must be rejected"
+            );
         }
     }
 
