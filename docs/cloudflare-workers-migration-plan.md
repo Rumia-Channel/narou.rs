@@ -702,6 +702,11 @@ npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
 - **移行ツール (挿絵)**: `worker_entry/src/object_migration.rs` + `lib.rs` の
   `/api/admin/object-migration`。挿絵だけを D1 から S3 へ写し、`copy` / `verify` / `status` を持つ。
   進捗は `app_state('inv','migrate_illustrations')` のカーソルで再開できる。
+- **挿絵の共通プール (2026-10-22)**: Worker も `illustration_dedup: true` にし、新規挿絵は
+  全作品・漫画で共通の `illustrations/<base64url(sha256)>.<ext>` に置く。既存の
+  小説別 `挿絵/<sha256-hex>.<ext>` は `POST /api/admin/illustration-dedup`
+  (`action: plan|copy|reset|status`) でページ単位にプールへ移行できる。読み出しは
+  プールに無ければ旧配置へフォールバックする。hex 名でない mitemin の `iNNN` は対象外。
 - **未着手 (P0d の残り)**: 本文の行構造化 (「テキスト blob → セクション行」) と raw を書かない経路。
 
 ## S3 必須配備

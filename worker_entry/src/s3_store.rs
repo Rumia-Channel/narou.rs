@@ -28,9 +28,11 @@ pub async fn store_from_env(
         prefix: crate::secrets::value(env, "S3_PREFIX")
             .await
             .unwrap_or_default(),
-        // Worker は native の `storage-backend` マーカー外なので dedup は無効。
-        // (native SQLite+S3 専用の機能)
-        illustration_dedup: false,
+        // 挿絵は全作品・漫画で共通の content-addressed プール
+        // (`illustrations/<b64sha256>.<ext>`) に置き、同じ画像の重複保存を防ぐ。
+        // 読み出しは旧 `挿絵/` 配置へフォールバックするので、移行前の
+        // オブジェクトもそのまま読める。
+        illustration_dedup: true,
         access_key_id: crate::secrets::require(env, "S3_ACCESS_KEY_ID").await?,
         secret_access_key: crate::secrets::require(env, "S3_SECRET_ACCESS_KEY").await?,
     };

@@ -197,96 +197,45 @@ fn run_s3_verify() -> Result<(), String> {
 /// `pool_exists` で確認後、legacy の実オブジェクトを `delete`。
 /// 既定は dry-run (pool へ写さず件数だけ数える)。
 fn run_s3_dedup(force: bool) -> Result<(), String> {
-    if !narou_rs::native::sqlite::state::illustration_dedup_enabled() {
-        return Err(
-            "挿絵の dedup は SQLite モード + S3 保存のときだけ有効です (storage-backend=sqlite と s3.asset-backend=s3)"
-                .to_string(),
-        );
-    }
-    let (_from_objects, _from_assets, to_objects, to_assets) = s3_migration_stores()?;
     let s3 = narou_rs::native::s3::illustration_store()
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "S3 ストアが構成されていません".to_string())?;
+        .ok_or_else(|| {
+            "挿絵の保存先が S3 になっていません (narou setting s3.asset-backend=s3 と S3 の接続情報が必要です)"
+                .to_string()
+        })?;
     let runtime = migration_runtime()?;
-
-    // S3 上の legacy `挿絵/` 実オブジェクトを全小説横断で集める。
-    // list は論理キーを返すので `挿絵` を含むものだけ拾う。
-    let mut cursor: Option<String> = None;
-    let mut migrated = 0usize;
-    let mut already_pooled = 0usize;
-    let mut skipped_non_hex = 0usize;
-    let mut failed = 0usize;
-    let action = if force { "migrating" } else { "would migrate" };
-    loop {
-        let request = narou_rs::platform::ObjectListRequest::new(
-            narou_rs::platform::ObjectPrefix::new("novels").unwrap(),
-            std::num::NonZeroUsize::new(1000).unwrap(),
-        );
-        let request = match &cursor {
-            Some(next) => request.after(next.clone()),
-            None => request,
-        };
-        let page = runtime
-            .block_on(to_objects.list_page(&request))
-            .map_err(|e| e.to_string())?;
-        for meta in &page.objects {
-            let key = &meta.key;
-            if !narou_rs::platform::is_illustration_key(key) {
-                continue;
-            }
-            // hex 名だけが pool へ寄る (非 hex は小説ごとの配置のまま)。
-            let file = key.as_ref().rsplit('/').next().unwrap_or("");
-            let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
-            if !illustration_store::is_sha256_hex_stem(stem) {
-                skipped_non_hex += 1;
-                continue;
-            }
-            if !force {
-                migrated += 1;
-                continue;
-            }
-            // 既に pool にあれば書き換え不要、なければ read→write。
-            let in_pool = runtime.block_on(s3.pool_exists(key)).map_err(|e| e.to_string())?;
-            if in_pool {
-                already_pooled += 1;
-            } else {
-                match runtime.block_on(to_assets.read_stream(key)) {
-                    Ok(Some(stream)) => {
-                        if let Err(error) = runtime.block_on(to_assets.write_stream(key, stream)) {
-                            eprintln!("  {key}: pool write failed: {error}");
-                            failed += 1;
-                            continue;
-                        }
-                        migrated += 1;
-                    }
-                    Ok(None) => {
-                        eprintln!("  {key}: source object missing");
-                        failed += 1;
-                        continue;
-                    }
-                    Err(error) => {
-                        eprintln!("  {key}: source read failed: {error}");
-                        failed += 1;
-                        continue;
-                    }
-                }
-            }
-            // pool 確認後に legacy 実オブジェクトを消す (delete は旧 path)。
-            if let Err(error) = runtime.block_on(to_objects.delete(key)) {
-                eprintln!("  {key}: legacy delete failed: {error}");
-                failed += 1;
-            }
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
+    let mut state = narou_rs::platform::IllustrationDedupState::default();
+    let action = if force { "copy" } else { "plan" };
+    while !state.done {
+        runtime
+            .block_on(narou_rs::platform::deduplicate_illustrations_page(
+                s3.as_ref(),
+                action,
+                narou_rs::platform::store_migration::MAX_LIMIT,
+                &mut state,
+            ))
+            .map_err(|error| error.to_string())?;
     }
 
     if !force {
-        println!("{action}: {migrated} 件 (実行するには --force)");
+        println!(
+            "dedup 予定: {} 件 / 非hexスキップ {} 件 (実行するには --force)",
+            state.planned, state.skipped_non_hex
+        );
     } else {
-        println!("dedup 完了: 移行 {migrated} 件 / 既に pool {already_pooled} 件 / 非hexスキップ {skipped_non_hex} 件 / 失敗 {failed} 件");
+        println!(
+            "dedup 完了: 移行 {} 件 / 既に pool {} 件 / 非hexスキップ {} 件 / 失敗 {} 件",
+            state.migrated,
+            state.already_pooled,
+            state.skipped_non_hex,
+            state.failed.len()
+        );
+    }
+    for entry in state.failed.iter().take(20) {
+        eprintln!("  {entry}");
+    }
+    if state.failed.len() > 20 {
+        eprintln!("  ... 他 {} 件", state.failed.len() - 20);
     }
     Ok(())
 }

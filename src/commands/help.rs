@@ -889,7 +889,7 @@ const ILLUST_HELP: CmdHelp = CmdHelp {
       s3-dedup  旧 挿絵/ 配置の S3 オブジェクトを dedup プールへ移し、
                残ったものを消す。既定は件数だけ数える dry-run。
   ・s3-push / s3-verify / s3-dedup はライブラリ全体が対象です (s3.asset-backend=s3 と
-    S3 の接続情報が必要。<target> は使いません。s3-dedup はさらに SQLite モードが必要)。
+    S3 の接続情報が必要。<target> は使いません)。
   ・<target> を省略した場合、直前に変換した小説が対象になります。
   ・全小説を対象にしたい場合は --all を使います。
   ・削除・改名・移行はいずれも既定で dry-run (-f を付けると実行)。
