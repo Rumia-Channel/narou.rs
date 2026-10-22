@@ -119,12 +119,16 @@ curl -sS http://127.0.0.1:3000/health
 # => {"ok":true,"fetch":"wget,curl"}
 ```
 
-生成したキーで `/proxy` が使えることを確認するには `scripts/relay/verify_auth.py`（`NAROU_RELAY_ENDPOINT=http://127.0.0.1:3000`、`NAROU_RELAY_KEY=...`）を使います。
+生成したキーで `/proxy` が使えることを確認するには `scripts/relay/verify_auth.py` を使います。鍵をコマンドラインやシェル履歴に残さないよう、`read -rsp` で受け取ります。取得確認先は `NAROU_RELAY_PROBE_URL`（未指定なら `NAROU_RELAY_ALLOWED_HOSTS` の先頭ホスト）です。
 
 ```sh
-NAROU_RELAY_ENDPOINT=https://relay.example.com NAROU_RELAY_KEY='<.env と同じキー>' \
-  python3 scripts/relay/verify_auth.py
+export NAROU_RELAY_ENDPOINT=https://relay.example.com
+read -rsp 'NAROU_RELAY_KEY: ' NAROU_RELAY_KEY; export NAROU_RELAY_KEY
+NAROU_RELAY_PROBE_URL=https://syosetu.org/ python3 scripts/relay/verify_auth.py
+unset NAROU_RELAY_KEY
 ```
+
+`verify_auth.py` は fail closed です。到達不能・`/health` が 200 以外・誤トークンが 403 以外・正トークンが 200 以外のいずれかで exit 1 を返し、3xx は追跡しません（`X-Proxy-Token` を別オリジンへ再送しないため）。公開エンドポイントは `https://` のみ受け付け、平文 HTTP は loopback のローカル確認だけ許可します。
 
 > wget 経路は HTTPS の対象だけを扱います。接続先の DNS を検証したうえで **127.0.0.1 の使い捨て CONNECT プロキシ**が検証済み IP へ接続し、TLS の SNI・証明書検証は wget が元のホスト名に対して行います。curl の `--resolve` と同じ「接続先固定」を維持するための仕組みです。HTTP（非 TLS）の対象は curl 経路が扱います。
 
@@ -174,7 +178,7 @@ cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3000
 ```
 
 - 起動のたびに URL が変わります。変更したら GitHub Secrets の `NAROU_RELAY_ENDPOINT` を更新して Worker を再配備
-- Worker はリレーへ**生ソケット (`connect()`) で接続**します。Cloudflare フロントの URL に Worker から到達できるかは**実機で未検証**です。Worker のログが接続失敗になる場合は 6.2 へ
+- Worker はリレーへ**通常の fetch サブリクエスト**で接続します（`NAROU_RELAY_ENDPOINT` のオリジンに `POST /proxy`）。Cloudflare フロントの URL に Worker から到達できるかは**実機で未検証**です。Worker のログが接続失敗になる場合は 6.2 へ
 
 ### 6.2 Cloudflare 以外のトンネル（推奨）
 
@@ -211,7 +215,8 @@ GitHub Secrets を更新して Worker を再配備します。
 
 ```sh
 gh secret set RELAY_DOMAIN --env CloudFlare --body relay.example.com
-gh secret set NAROU_RELAY_KEY --env CloudFlare --body '<.env と同じキー>'
+# 鍵は --body を使わず、プロンプト/標準入力から設定する（シェル履歴・argv に残さない）
+gh secret set NAROU_RELAY_KEY --env CloudFlare
 ```
 
 独自に Worker を配備する場合は、その Worker に `NAROU_RELAY_ENDPOINT=https://relay.example.com` と `NAROU_RELAY_KEY` を直接設定します。

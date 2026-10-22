@@ -79,24 +79,28 @@ git log --oneline -3
 
 ```sh
 cd ~/narou.rs/scripts/relay
-cat > .env <<'EOF'
+install -m 600 /dev/null .env
+${EDITOR:-vi} .env   # 下記の内容を記入する (鍵をコマンドラインや履歴に残さない)
+```
+
+`scripts/relay/.env` の内容:
+
+```ini
 NAROU_RELAY_KEY=ここにキー
 NAROU_RELAY_ALLOWED_HOSTS=syosetu.org,www.syosetu.org,h.syosetu.org
 PORT=3000
 NAROU_RELAY_HOST=127.0.0.1
 NAROU_RELAY_FETCH=wget,curl
-EOF
-chmod 600 .env
 ```
 
 - `NAROU_RELAY_KEY` は **GitHub の `NAROU_RELAY_KEY` と同じ値**にする（GitHub の Secret 値は読み出せないため、手元に無ければ作り直す）
 - キーを作り直す場合:
 
 ```sh
-# VPS
+# 新しい鍵を作る (表示された値はエディタで .env の NAROU_RELAY_KEY に記入する)
 openssl rand -base64 32
-# 自宅 PC（gh 認証済み）
-gh secret set NAROU_RELAY_KEY --body '<上のキー>'
+# 自宅 PC（gh 認証済み）。鍵を引数に載せず、プロンプト/標準入力で設定する
+gh secret set NAROU_RELAY_KEY
 # その後 Worker を再配備（下記 8）
 ```
 
@@ -149,6 +153,7 @@ curl -sS https://relay.rumia-ch.uk/health
 - 502 のまま: リレー（`narou_relay`）が止まっている / cloudflared が止まっている / `route dns` 未実施
 - 403 の JSON `{"error":"forbidden"}` が見える場合はリレーに届いています（キー不一致は Worker 側で発生）
 - `/health` は認証不要、`/proxy` は `X-Proxy-Token` 必須
+- 認証一致の確認: `python3 scripts/relay/verify_auth.py`（`NAROU_RELAY_ENDPOINT=https://relay.rumia-ch.uk`、鍵は `read -rsp` で渡す。fail closed・リダイレクト非追跡。詳細は `docs/vps-relay.md`）
 
 ## 7. 常駐化（systemd）
 
@@ -229,8 +234,8 @@ sudo systemctl status narou-tunnel --no-pager
 ```sh
 # リレードメイン（設定済み）
 gh secret set RELAY_DOMAIN --env CloudFlare --body relay.rumia-ch.uk
-# キーを変更した場合のみ
-gh secret set NAROU_RELAY_KEY --body '<VPS の .env と同じ値>'
+# キーを変更した場合のみ（--body を使わず、プロンプト/標準入力で設定する）
+gh secret set NAROU_RELAY_KEY
 
 # develop Worker の再配備
 gh workflow run platform.yml --ref develop -f target=develop
@@ -309,6 +314,8 @@ sudo systemctl restart narou-relay
 
 `NAROU_RELAY_CACERT` を設定すると curl / wget の両方がそのバンドルで検証します。侵害ルートが
 残っていれば `narou relay startup failed: CA バンドルを検証できません: ...` で停止します。
+未設定の場合は起動時に「侵害されたルート CA の検査は行いません」という警告が出ます（既定ストアの
+安全性は OS / クライアントの更新状況に依存するため）。
 
 - Native アプリの TLS は OS の証明書ストア（Windows Schannel / Linux OpenSSL / macOS）を使うため、
   OS の更新（Windows Update、`ca-certificates` パッケージ等）が必要です。

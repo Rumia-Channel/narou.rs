@@ -91,10 +91,17 @@ Node.js は不要です。初回起動時にバイナリが無ければ `home-re
 Copy-Item scripts/relay/.env.example scripts/relay/.env
 ```
 
+Windows では `.env` のアクセス権を現在のユーザーだけに制限します。
+
+```powershell
+icacls scripts\relay\.env /inheritance:r /grant:r "$($env:USERNAME):F"
+```
+
 ```ini
 # 32 バイト以上のランダム値:
 #   openssl rand -base64 32
-#   PowerShell: [Convert]::ToBase64String([byte[]](1..32 | ForEach-Object { Get-Random -Maximum 256 }))
+#   PowerShell 7: [Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+# (Get-Random / System.Random は暗号学的乱数ではないため鍵に使わない)
 NAROU_RELAY_KEY=ここに生成したキー
 # ハーメルン。R18 側 (h.syosetu.org) も必要なら含める
 NAROU_RELAY_ALLOWED_HOSTS=syosetu.org,www.syosetu.org,h.syosetu.org
@@ -104,6 +111,7 @@ PORT=3000
 - `NAROU_RELAY_ALLOWED_HOSTS` はカンマ区切りの完全一致。`*` や URL は不可（起動エラー）
 - 未設定・空の許可リストでは、認証が正しくても取得を拒否します
 - キーは Worker 側の `NAROU_RELAY_KEY` と完全に同じにする
+- 環境変数 `NAROU_RELAY_KEY` が設定されている場合は `.env` より優先されます。ローテーション直後は起動ログの `を読み込みました (...)` に `NAROU_RELAY_KEY` が含まれるか（＝`.env` の値が使われたか）を確認してください
 - 取得順は既定で `curl,wget`。wget が無ければ起動時に取得順から外れて `/health` の `fetch` から消える
 
 ## 4. 起動する（クイックトンネル）
@@ -204,7 +212,7 @@ cloudflared tunnel run narou-relay
 
 ### 7.2 Cloudflare 以外のトンネル（常用はこちらを推奨）
 
-Worker はリレーへ生ソケット (`connect()`) で接続します。Cloudflare のドメイン（`trycloudflare.com` / 自分のドメイン）へ Worker から接続できるかは実機で未検証です。**常用するなら、最初から Cloudflare 以外のトンネル**を使うのが安全です。
+Worker はリレーへ通常の fetch サブリクエスト（`NAROU_RELAY_ENDPOINT` のオリジンに `POST /proxy`）で接続します。Cloudflare のドメイン（`trycloudflare.com` / 自分のドメイン）へ Worker から接続できるかは実機で未検証です。**常用するなら、最初から Cloudflare 以外のトンネル**を使うのが安全です。
 
 - Tailscale Funnel: `tailscale funnel 3000` → `https://<machine>.<tailnet>.ts.net`（無料、URL 固定）
 - ngrok: `ngrok http 3000` → `https://xxxx.ngrok-free.app`（無料枠は URL が固定されない場合あり）
@@ -230,7 +238,8 @@ pwsh -NoProfile -File <リポジトリ>\scripts\relay\home-relay.ps1
 - TLS は実行環境の curl / wget に委ねる。Windows の curl（Schannel）と wget は既定で OS の証明書ストアを使う
   - 2026-10-20 の eMudhra 中間 CA 侵害では、失効したルートを含む CA バンドルでの起動を拒否する（`relay/src/ca.rs` の SHA-256 指紋デナイリスト）
   - `NAROU_RELAY_CACERT`（任意）を指定すると、curl の `--cacert` / wget の `--ca-certificate` に渡り、クライアント既定の CA ストアを置き換える。指定したバンドルは起動時に検証され、侵害ルートを含めば `narou relay startup failed: CA バンドルを検証できません: ...` で停止する。Windows を更新したうえで、必要な場合だけ指定する
-- `.env` は git 管理外。キーをログ・チャット・スクリーンショットへ出さない。漏れたら新しい値に作り直し、Worker とリレーの両方を更新する
+- `.env` は git 管理外。キーをログ・チャット・スクリーンショットへ出さない。漏れたら新しい値に作り直し、Worker とリレーの両方を更新する。Windows では `.env` の ACL を現在のユーザーだけに制限する（§3）
+- 環境変数 `NAROU_RELAY_KEY` が残っていると `.env` の新しい鍵より優先される。ローテーション後はクリーンなシェルから起動し、起動ログの適用キーを確認する
 - 自宅 PC が停止・スリープしている間は Worker から取得できない（既存の fetch 403 にフォールバックするだけで、データは壊れない）
 - リバースプロキシ等で 3000 番ポートを直接インターネットへ公開しない。トンネルを使う
 

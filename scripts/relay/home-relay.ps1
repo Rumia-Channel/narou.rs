@@ -102,18 +102,22 @@ function Wait-Health {
     for ($i = 0; $i -lt $Attempts; $i++) {
         try {
             $response = Invoke-WebRequest -Uri $Url -TimeoutSec 2 -UseBasicParsing
-            if ($response.StatusCode -eq 200) { return $true }
+            if ($response.StatusCode -eq 200) { return [string]$response.Content }
         } catch {
             # 起動待ち。次の試行へ。
         }
         Start-Sleep -Milliseconds 250
     }
-    return $false
+    return $null
 }
 
 $fileEnv = Read-EnvFile -Path $envFile
 if (-not $env:NAROU_RELAY_KEY -and -not $fileEnv.ContainsKey("NAROU_RELAY_KEY")) {
     throw "NAROU_RELAY_KEY が未設定です。$envFile を作成してください（$($envFile).example を参照）"
+}
+if ($env:NAROU_RELAY_KEY -and $fileEnv.ContainsKey("NAROU_RELAY_KEY") -and
+    $env:NAROU_RELAY_KEY -ne $fileEnv["NAROU_RELAY_KEY"]) {
+    Write-Warning "環境変数 NAROU_RELAY_KEY が .env の値と異なります。環境変数が優先されるため、鍵をローテーションした直後は古い鍵で起動していないか確認してください"
 }
 if (-not $env:NAROU_RELAY_ALLOWED_HOSTS -and -not $fileEnv.ContainsKey("NAROU_RELAY_ALLOWED_HOSTS")) {
     Write-Warning "NAROU_RELAY_ALLOWED_HOSTS が未設定です。取得はすべて 400 で拒否されます"
@@ -124,6 +128,10 @@ $binaryPath = Resolve-RelayBinary -ExplicitPath $BinaryPath -ForceBuild:$Rebuild
 $env:NAROU_RELAY_ENV_FILE = $envFile
 $env:PORT = "$Port"
 if (-not $env:NAROU_RELAY_HOST) { $env:NAROU_RELAY_HOST = "127.0.0.1" }
+$listenHost = $env:NAROU_RELAY_HOST
+if ($listenHost -notin @("127.0.0.1", "::1", "localhost")) {
+    Write-Warning "NAROU_RELAY_HOST=$listenHost のため loopback 以外で待ち受けます。リバースプロキシ/トンネルの外へ直接公開しないでください"
+}
 
 $relay = $null
 $tunnel = $null
@@ -131,14 +139,21 @@ $tunnelLog = Join-Path ([System.IO.Path]::GetTempPath()) ("narou-relay-tunnel-{0
 $tunnelOut = Join-Path ([System.IO.Path]::GetTempPath()) ("narou-relay-tunnel-{0}.out" -f $PID)
 
 try {
-    Write-Host "リレーを起動しています (127.0.0.1:$Port) ..."
+    Write-Host "リレーを起動しています (${listenHost}:$Port) ..."
     $relay = Start-Process -FilePath $binaryPath -WorkingDirectory $repoRoot -PassThru -NoNewWindow
 
-    if (-not (Wait-Health -Url "http://127.0.0.1:$Port/health")) {
+    $healthBody = Wait-Health -Url "http://127.0.0.1:$Port/health"
+    if (-not $healthBody) {
         if ($relay.HasExited) {
             throw "リレーが起動直後に終了しました (終了コード $($relay.ExitCode))。表示された 'narou relay startup failed: ...' と $envFile の NAROU_RELAY_KEY / NAROU_RELAY_ALLOWED_HOSTS (必要なら NAROU_RELAY_FETCH / NAROU_RELAY_CACERT) を確認してください"
         }
         throw "リレーの /health が応答しません (port $Port)"
+    }
+    if ($relay.HasExited) {
+        throw "リレーが起動直後に終了しました (終了コード $($relay.ExitCode))。port $Port が別プロセスに使われている可能性があります"
+    }
+    if ($healthBody -notmatch '"ok"\s*:\s*true') {
+        throw "port $Port の /health が narou_relay の応答ではありません (別プロセスが使用中の可能性)。リレーを起動できていません: $envFile を確認してください"
     }
 
     $publicUrl = ""

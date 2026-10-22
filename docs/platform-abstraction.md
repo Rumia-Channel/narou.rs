@@ -563,8 +563,9 @@ Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト向�
   Cookie 等を URL に載せない。応答は `{status, contentType, location?, setCookie, via, body(base64)}`、
   エラーは `{"error": "..."}`。`GET /health` は認証不要で
   `{"ok":true,"fetch":"curl,wget"}`（実際の解決済み取得順）を返す。
-- `worker_entry/src/http.rs` は既存の `with_relay` と `platform::http1` の生ソケットで送信する。
-  サイト定義のヘッダを転送し、返ったリダイレクトは呼び出し側の共通 `RedirectChain` が検証する。
+- `worker_entry/src/http.rs` は既存の `with_relay` と、Worker の通常の fetch サブリクエスト
+  （`send_fetch_hop`）で送信する。サイト定義のヘッダを転送し、返ったリダイレクトは
+  呼び出し側の共通 `RedirectChain` が検証する。
 - 応答の JSON/base64、全 `Set-Cookie`、ステータス、本文・メタデータの上限は従来どおり。
   踏み台自身はリダイレクトを追跡せず、本文の途中切れを成功として返さない。
 - Worker の設定は `NAROU_RELAY_ENDPOINT` と `NAROU_RELAY_KEY`。両方が揃ったときだけ有効。
@@ -586,6 +587,11 @@ Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト向�
   既定ストアを置換）、起動時の CA バンドル検証は fail closed（`relay/src/ca.rs` の SHA-256 指紋
   デナイリスト）、1 リクエストにつき上流取得 1 回、全体 75 秒の期限とクライアント切断で
   curl / wget の子プロセスを中断。
+- **サーバー側の防御**: 認証は本文読み取りより先に行い、未認証・`/proxy` 以外・不正メソッドは
+  本文を読まずに 4xx で閉じる（75 秒期限まで接続を保持させない）。同時接続数には上限
+  （128）を設け、完了した接続タスクは accept ごとに回収する（`JoinSet` の無制限保持を防ぐ）。
+  wget 経路はローカル CONNECT プロキシのトンネル確立を確認してから応答を採用する。
+  `NAROU_RELAY_CACERT` 未設定時は起動時に、侵害ルート検査が無効である旨を警告する。
 - 外部 npm 依存は無い。ビルドは `cargo build --release -p narou_relay`。
 
 #### デプロイ先
@@ -625,7 +631,11 @@ python3 scripts/relay/verify_auth.py
 ```
 
 このコマンドは `/health`、誤った合言葉での 403、正しい合言葉での取得を確認する。
-検証用の取得先は `NAROU_RELAY_PROBE_URL`、制限秒数は `NAROU_RELAY_TIMEOUT` で変更できる。
+取得先は `NAROU_RELAY_PROBE_URL`（未指定なら `NAROU_RELAY_ALLOWED_HOSTS` の先頭ホスト）、
+制限秒数は `NAROU_RELAY_TIMEOUT` で変更できる。
+到達不能・想定外のステータスは fail closed（exit 1）として扱い、3xx は追跡しない
+（`X-Proxy-Token` を別オリジンへ再送しないため）。公開エンドポイントは `https://` のみ受け付け、
+平文 HTTP は loopback のローカル確認だけ許可する。
 
 リレーのテストは Rust で、`cargo test -p narou_relay`（ワークスペース CI は
 `cargo test --workspace`）が実 HTTP 契約・許可リスト・DNS・認証・TLS・上限・中断を検証する。
