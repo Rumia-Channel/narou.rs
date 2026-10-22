@@ -391,10 +391,60 @@ impl EpubBuild {
             self.input.read_image(&image.source).ok()??
         } else {
             let base = self.input.path().parent()?;
-            std::fs::read(base.join(image.source.replace('\\', "/"))).ok()?
+            read_local_image(base, &image.source)?
         };
         self.process_image(epub_path, data).ok()
     }
+}
+
+/// ローカル入力の挿絵 1 枚を、小説フォルダの外へ出ないことを確かめてから読む。
+///
+/// `source` は上流 HTML の `<img src>` 由来なので、`../` や絶対パスが混じり
+/// 得る。字句的に安全な相対パスだけを受け付け、実在する場合は基準ディレクトリ
+/// の下に収まっていることを canonicalize で確認する。converter 側の検証
+/// (`resolve_section_illustration_source`) と二重に効かせ、symlink/junction で
+/// 外へ飛ばされる取りこぼしにも備える。
+fn read_local_image(base: &Path, source: &str) -> Option<Vec<u8>> {
+    let relative = safe_local_image_path(source)?;
+    // `Path::parent()` はファイル名だけの入力で空になる。CWD 基準の従来動作を保つ。
+    let base = if base.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        base
+    };
+    let candidate = base.join(&relative);
+    let canonical_base = std::fs::canonicalize(base).ok()?;
+    let canonical_candidate = std::fs::canonicalize(&candidate).ok()?;
+    if !canonical_candidate.starts_with(&canonical_base) {
+        return None;
+    }
+    std::fs::read(canonical_candidate).ok()
+}
+
+/// `source` を安全な相対パスへ正規化する。絶対パス・Windows のドライブ/UNC
+/// 接頭辞・`..`・NUL を含むものは `None`。
+fn safe_local_image_path(source: &str) -> Option<PathBuf> {
+    let source = source.trim();
+    if source.is_empty() || source.contains('\0') {
+        return None;
+    }
+    // 区切りを揃えてから、Windows 流の `..\` も含めて判定する。
+    let normalized = source.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return None; // 絶対パス (UNC の `\\server\share` もここへ来る)
+    }
+    if normalized.as_bytes().get(1) == Some(&b':') {
+        return None; // ドライブ接頭辞 (`C:/...` / `C:...`)
+    }
+    let mut path = PathBuf::new();
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            _ => path.push(part),
+        }
+    }
+    (!path.as_os_str().is_empty()).then_some(path)
 }
 
 /// 挿絵として格納できる拡張子か。ObjectStore の一覧から拾うときに使う。
@@ -1121,6 +1171,56 @@ mod tests {
         stream_epub(&build.book, &mut bytes, |path| build.resolve(path)).unwrap();
         let needle = b"item/image/0001.png";
         assert!(bytes.windows(needle.len()).any(|window| window == needle));
+    }
+
+    /// ローカル入力の挿絵は小説フォルダ (入力テキストの親) の中だけを読む。
+    /// 上流 HTML 由来の `../`・絶対パス・ドライブ/UNC 接頭辞は、実在しても
+    /// 読まない (EPUB へ小説フォルダ外のファイルを取り込ませない)。
+    #[test]
+    fn local_image_reads_stay_under_the_base_directory() {
+        let guard = tempfile::tempdir().unwrap();
+        let root = guard.path();
+        let base = root.join("novel");
+        std::fs::create_dir_all(base.join("挿絵")).unwrap();
+        let png = test_png(2, 2);
+        std::fs::write(base.join("挿絵/i1.png"), &png).unwrap();
+        std::fs::write(base.join("cover.jpg"), b"cover").unwrap();
+        // 基準ディレクトリの外にある実在ファイル (読まれてはいけない)。
+        std::fs::write(root.join("secret.png"), b"secret").unwrap();
+
+        assert_eq!(
+            read_local_image(&base, "挿絵/i1.png").as_deref(),
+            Some(&png[..])
+        );
+        assert_eq!(
+            read_local_image(&base, "cover.jpg").as_deref(),
+            Some(&b"cover"[..])
+        );
+        // バックスラッシュ区切りも同じ規則で扱う。
+        assert_eq!(
+            read_local_image(&base, "挿絵\\i1.png").as_deref(),
+            Some(&png[..])
+        );
+
+        for source in [
+            "../secret.png",
+            "..\\secret.png",
+            "挿絵/../../secret.png",
+            "/etc/passwd",
+            "C:/Windows/win.ini",
+            "C:secret.png",
+            "//server/share/x.png",
+            "\\\\server\\share\\x.png",
+            "",
+            "挿絵/\0.png",
+        ] {
+            assert!(
+                read_local_image(&base, source).is_none(),
+                "must not read {source:?}"
+            );
+        }
+        // 存在しない相対パスは従来どおり None。
+        assert!(read_local_image(&base, "挿絵/missing.png").is_none());
     }
 
     #[test]

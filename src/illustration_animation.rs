@@ -64,6 +64,8 @@ fn is_zip(bytes: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy)]
 struct Limits {
     max_frames: usize,
+    /// 1 フレームの展開後バイト数。ZIP の宣言サイズでも読み出し中でも守る。
+    max_frame_bytes: u64,
     max_frame_pixels: u64,
     max_output_bytes: usize,
 }
@@ -77,6 +79,10 @@ struct Limits {
 /// 超過は OOM ではなく明示エラーで止める (呼び出し側はアーカイブをそのまま保存する)。
 const DEFAULT_LIMITS: Limits = Limits {
     max_frames: 512,
+    // 入力アーカイブ全体の転送上限 (16 MiB) を 1 フレームの展開後サイズにも使う。
+    // deflate は数 KB の ZIP から数 GiB を展開できるため、宣言サイズと読み出しの
+    // 両方でこの値を守る。
+    max_frame_bytes: 16 * 1024 * 1024,
     max_frame_pixels: 1920 * 1080,
     max_output_bytes: 56 * 1024 * 1024,
 };
@@ -114,7 +120,7 @@ fn build_apng(archive: &[u8], delays: &[u16], limits: Limits) -> Result<Vec<u8>>
     let mut actl_crc_offset = 0usize;
 
     for name in &names {
-        let Some(frame) = decode_frame(archive, name)? else {
+        let Some(frame) = decode_frame(archive, name, limits)? else {
             continue;
         };
         let (width, height) = (frame.width(), frame.height());
@@ -269,17 +275,65 @@ fn frame_names(archive: &[u8]) -> Result<Vec<String>> {
 }
 
 /// 1 フレームだけ読み出して復号する (アーカイブは毎回開き直す)。
+///
+/// 復号の前に 2 段階で止める。ZIP の宣言サイズと読み出し上限で「数 KB の
+/// deflate エントリが数 GiB に膨らむ」型を、IHDR などのヘッダ寸法で
+/// 「小さい PNG が巨大なキャンバスを宣言する」型を弾く。どちらも OOM ではなく
+/// 明示エラー (`NarouError::Platform`) を返す。
 #[cfg(feature = "illustration-animation")]
-fn decode_frame(archive: &[u8], name: &str) -> Result<Option<image::RgbaImage>> {
+fn decode_frame(archive: &[u8], name: &str, limits: Limits) -> Result<Option<image::RgbaImage>> {
     let cursor = std::io::Cursor::new(archive);
     let mut zip = zip::ZipArchive::new(cursor)
         .map_err(|error| NarouError::Platform(format!("animation archive: {error}")))?;
-    let Ok(mut file) = zip.by_name(name) else {
+    let Ok(file) = zip.by_name(name) else {
         return Ok(None);
     };
+    // 宣言サイズで先に弾く (実際の読み出しは下の take で二重に制限する)。
+    let declared = file.size();
+    if declared > limits.max_frame_bytes {
+        return Err(NarouError::Platform(format!(
+            "animation frame {name} declares {declared} bytes, over the frame limit of {}",
+            limits.max_frame_bytes
+        )));
+    }
     let mut data = Vec::new();
-    file.read_to_end(&mut data)
+    // 宣言サイズが嘘でも上限 +1 バイトしか読まない。
+    file.take(limits.max_frame_bytes.saturating_add(1))
+        .read_to_end(&mut data)
         .map_err(NarouError::Io)?;
+    if data.len() as u64 > limits.max_frame_bytes {
+        return Err(NarouError::Platform(format!(
+            "animation frame {name} expands to over the frame limit of {} bytes",
+            limits.max_frame_bytes
+        )));
+    }
+
+    // 復号する前にヘッダから寸法だけを読む。`image::load_from_memory` は
+    // IHDR の寸法どおりのバッファを確保するため、ここで弾かないと巨大宣言の
+    // PNG 1 枚で isolate のメモリを食い潰す。未対応形式・壊れたフレームは
+    // 従来どおり「復号できないフレーム」として飛ばす (他のフレームで組み立てを
+    // 続ける)。
+    let reader = match image::ImageReader::new(std::io::Cursor::new(&data)).with_guessed_format() {
+        Ok(reader) => reader,
+        Err(error) => {
+            tracing::debug!("animation frame {name} could not be decoded: {error}");
+            return Ok(None);
+        }
+    };
+    let (width, height) = match reader.into_dimensions() {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            tracing::debug!("animation frame {name} could not be decoded: {error}");
+            return Ok(None);
+        }
+    };
+    if u64::from(width).saturating_mul(u64::from(height)) > limits.max_frame_pixels {
+        return Err(NarouError::Platform(format!(
+            "animation frame {name} is {width}x{height}, over the pixel limit of {}",
+            limits.max_frame_pixels
+        )));
+    }
+
     match image::load_from_memory(&data) {
         Ok(decoded) => Ok(Some(decoded.to_rgba8())),
         Err(error) => {
@@ -355,6 +409,33 @@ mod tests {
             writer.finish().unwrap();
         }
         buffer
+    }
+
+    /// シグネチャ + IHDR + 空の IDAT + IEND だけの最小 PNG。
+    /// ヘッダの寸法で復号前に止まることの検証用なので、ピクセルデータは
+    /// 持たせない (`png` の `read_info` は最初の IDAT まで読むため空でも置く)。
+    fn png_with_declared_dimensions(width: u32, height: u32) -> Vec<u8> {
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        // bit depth 8 / colour type 6 (RGBA) / compression / filter / interlace なし
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        for (kind, payload) in [
+            (b"IHDR", ihdr),
+            (b"IDAT", Vec::new()),
+            (b"IEND", Vec::new()),
+        ] {
+            png.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            png.extend_from_slice(kind);
+            png.extend_from_slice(&payload);
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(kind);
+            hasher.update(&payload);
+            png.extend_from_slice(&hasher.finalize().to_be_bytes());
+        }
+        png
     }
 
     /// Walk the chunk stream: `(kind, payload)` pairs, CRC skipped.
@@ -509,6 +590,47 @@ mod tests {
 
         // 既定の上限なら通る。
         assert!(build_apng(&two_frames, &delays, DEFAULT_LIMITS).is_ok());
+    }
+
+    /// 数 KB の ZIP が数 GiB に展開される型 (deflate 爆弾) は、エントリの
+    /// 宣言サイズだけで復号せずに拒否する。
+    #[test]
+    fn declared_frame_bytes_over_the_limit_are_rejected_without_decoding() {
+        let mut archive = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut archive));
+            writer
+                .start_file("000000.png", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            // 20 MiB のゼロ列。deflate では数 KB にしかならない。
+            let zeros = [0u8; 64 * 1024];
+            for _ in 0..320 {
+                writer.write_all(&zeros).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        assert!(
+            (archive.len() as u64) < 1024 * 1024,
+            "the archive itself must stay small: {} bytes",
+            archive.len()
+        );
+
+        let error = build_apng(&archive, &[50], DEFAULT_LIMITS)
+            .expect_err("a frame over the byte limit must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("frame limit"), "{message}");
+    }
+
+    /// 小さい PNG が巨大なキャンバスを宣言する型 (IHDR 爆弾) は、復号で
+    /// バッファを確保する前にヘッダ寸法で拒否する。
+    #[test]
+    fn declared_pixel_count_over_the_limit_is_rejected_before_decoding() {
+        let archive = zip_of(&[("000000.png", png_with_declared_dimensions(50_000, 50_000))]);
+
+        let error = build_apng(&archive, &[50], DEFAULT_LIMITS)
+            .expect_err("a huge declared canvas must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("pixel limit"), "{message}");
     }
 
     #[test]

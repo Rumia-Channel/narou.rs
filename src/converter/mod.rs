@@ -848,7 +848,14 @@ impl NovelConverter {
         source: &str,
     ) -> Option<String> {
         if !is_remote_illustration_source(source) {
-            return Some(source.to_string());
+            // 上流 HTML の `<img src>` はローカル挿絵の参照にもなるが、絶対パスや
+            // `..` を通すと EPUB 書き出し時に小説フォルダ外のファイルを読ませられる。
+            // 安全な相対パスだけを残し、それ以外は挿絵ごと落とす。
+            if is_safe_relative_illustration_source(source) {
+                return Some(source.to_string());
+            }
+            tracing::debug!("安全な相対パスではない挿絵の参照を破棄します: {source:?}");
+            return None;
         }
 
         let has_injected_assets = self
@@ -1432,6 +1439,29 @@ impl NovelConverter {
             .legacy_mut()
             .flush(&self.settings.archive_path)
     }
+}
+
+/// 上流 HTML が持ち込んだローカル挿絵の参照が安全な相対パスかを判定する。
+///
+/// この参照は最終的に EPUB の `<img src>` として小説フォルダ基準で読まれる。
+/// 絶対パス・Windows のドライブ/UNC 接頭辞・`..` を含む参照を許すと、上流の
+/// HTML から小説フォルダ外のファイルを EPUB に取り込ませられるため拒否する。
+/// `挿絵/1.png` や `i123.jpg` のような通常の相対名はそのまま通す。
+#[cfg(feature = "native-runtime")]
+fn is_safe_relative_illustration_source(source: &str) -> bool {
+    let source = source.trim();
+    if source.is_empty() || source.contains('\0') {
+        return false;
+    }
+    // 区切りを揃えてから、Windows 流の `..\` も含めて判定する。
+    let normalized = source.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return false; // 絶対パス (UNC の `\\server\share` もここへ来る)
+    }
+    if normalized.as_bytes().get(1) == Some(&b':') {
+        return false; // ドライブ接頭辞 (`C:/...` / `C:...`)
+    }
+    !normalized.split('/').any(|part| part == "..")
 }
 
 fn target_device_cache_key(device: Option<device::Device>) -> &'static str {
@@ -2193,6 +2223,61 @@ mod tests {
             resolved.body.matches(r#"src="挿絵/i422674.jpg""#).count(),
             2
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 上流 HTML の `<img src>` が絶対パス・ドライブ/UNC 接頭辞・`..` で
+    /// 小説フォルダの外を指しても、ローカル挿絵として採用しない。
+    /// 通常の相対名 (`挿絵/1.png` / `i123.jpg`) は従来どおり残す。
+    #[test]
+    fn localize_section_html_illustrations_drops_unsafe_local_sources() {
+        let root = make_temp_illustration_root();
+        std::fs::create_dir_all(root.join("挿絵")).unwrap();
+
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            ..NovelSettings::default()
+        };
+        let mut section = make_illustration_section();
+        section.element.body = concat!(
+            r#"<p>安全</p><p><img src="挿絵/1.png" alt="safe"></p>"#,
+            r#"<p><img src="i123.jpg"></p>"#,
+            r#"<p><img src="../escape.png"></p>"#,
+            r#"<p><img src="..\escape.png"></p>"#,
+            r#"<p><img src="/etc/x.png"></p>"#,
+            r#"<p><img src="C:/Users/x.png"></p>"#,
+            r#"<p><img src="\\server\share\x.png"></p>"#,
+            r#"<p><img src="挿絵/../../escape.png"></p>"#,
+        )
+        .to_string();
+
+        let mut converter = NovelConverter::new(settings);
+        let resolved = converter.resolve_section_html_illustrations(&section);
+
+        assert!(
+            resolved.body.contains(r#"src="挿絵/1.png""#),
+            "{}",
+            resolved.body
+        );
+        assert!(
+            resolved.body.contains(r#"src="i123.jpg""#),
+            "{}",
+            resolved.body
+        );
+        for unsafe_source in [
+            "escape.png",
+            "/etc/x.png",
+            "C:/Users/x.png",
+            "server\\share",
+            "挿絵/../../",
+        ] {
+            assert!(
+                !resolved.body.contains(unsafe_source),
+                "unsafe local source survived: {unsafe_source} in {}",
+                resolved.body
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
