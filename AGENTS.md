@@ -106,6 +106,14 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **ブラウザプロファイル**: `narou_rs_login` は**毎回まっさらな一時プロファイル**（`%TEMP%/narou-rs-login-<pid>`）でブラウザを開く。前回のログインを持ち越すと、別アカウントで入るためにログアウト→ログインを挟むことになり、その途中でセッションが切れやすい。Cookie を保存・書き出ししたあとプロファイルは削除する（取得に失敗したときは残すので、原因を見たり再試行に使える）。使い回したい場合だけ `--profile <DIR>` を指定する（ブラウザの保存ログインや拡張を使いたいとき）。取得後は対象 URL を 1 回取得し、サイト定義の `error_message` / `login_pattern` に当たる場合は「ログインできていない」と警告する（Python ブリッジの `/dashboard` リダイレクト判定に相当）。
 - 配布物: `narou_rs_login` もリリース zip に同梱する（`scripts/package-release.ps1` の `-LoginBinaryPath`、`.github/workflows/release.yml` の helper build / sign / package、`cargo local-build` のすべてに対応済み）。Windows では他のサブ実行ファイルと同じく署名対象に含める。`scripts/package-release.ps1` は `-Platform win` のとき本体・updater・backup・login の Authenticode 署名を梱包前に検証し、未署名なら失敗する（`-SkipSignatureCheck` は署名できないローカル確認専用で、リリース CI からは指定しない）。
 
+## セキュリティ境界 (2026-10 強化)
+- **Native Web UI の loopback 認証**: `127.0.0.1` / `localhost` / `::1` bind かつ Basic 認証・reverse proxy なしのとき、`narou web` は起動ごとの一度きりチケットを URL に付けてブラウザへ渡し、`/` で HttpOnly / SameSite=Strict の `narou_ui_token` Cookie に交換する。`/api/*`・`/ws`・`/novels/{id}/download` はこの Cookie または `x-narou-internal-token`（`.narou/server.pid` の制御トークン）を要求する。静的なページと `/assets/*` は公開のまま。トークン本体は `.narou/ui_token`（0600）に永続化し、再起動・セルフアップデート後もブラウザのセッションを維持する。`local_ui_auth_required()` は固定フラグではなく現在の `ServerSecurity` から毎回判定する。詳細は `WEBUI.md` §8.1.1。
+- **セルフアップデート**: Web API から更新 URL を指定する経路 (`asset_url`) は廃止した。取得先は GitHub Releases API の `browser_download_url` のみで、Release asset の `sha256` digest とサイズをダウンロード後に照合し、欠落・不一致はインストールせず中止する。`.narou/ui_token` と `.narou/login.key` はライブラリバックアップから除外する。
+- **reverse proxy**: `server-reverse-proxy.enable=true` でも Host の許可リストは維持する。プロキシ配下の公開ホストは `server-add-accepted-hosts` に、WebSocket は `server-ws-add-accepted-domains` に明示する。外部 bind + Basic 認証は平文 HTTP なので、LAN 外公開時は TLS 終端 proxy を使う（起動時に警告）。全レスポンスに `X-Frame-Options: DENY` / `frame-ancestors 'none'` / `nosniff` / `no-referrer` を付ける。
+- **ログイン資格情報**: 書き出し (`login export` / `narou_rs_login --export`) は 8 文字未満のパスフレーズを拒否し、ファイルは Unix 0600・シンボリックリンク非追従で書く (取り込みは旧ファイル互換のため任意長を受け付ける)。`narou_rs_login` のブラウザは `--remote-debugging-port=0` で起動し、`DevToolsActivePort` と `/json/version` の ws URL が起動したプロセスの port/host/path と一致することを確認する。SQLite の `db.sqlite` と `-wal` / `-shm` は Unix で 0600 にする。
+- **Worker / relay**: `NAROU_RELAY_ENDPOINT` は https 必須（ループバックのみ http 可）。スキーム省略の暗黙 `http://` 補完はしない（`platform::relay::normalize_relay_base`、違反は fail closed でリレー無効）。deploy CI の wrangler は固定バージョン (`NAROU_WRANGLER_VERSION`、既定 `4.151.3`) を使い、`NAROU_ADMIN_TOKEN` は CI で 32 文字以上を要求する。
+- **上流コンテンツ**: うごイラのフレーム ZIP は宣言サイズと読み出し上限（16 MiB/フレーム）およびヘッダ寸法で復号前に検証する。EPUB に取り込む非リモート `<img src>` は novel ディレクトリ内の相対パスだけを許可する。
+
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。
 - 作業開始時に対象ブランチが `origin` より遅れている場合は、`git pull` で最新へ追従してから作業を始める。

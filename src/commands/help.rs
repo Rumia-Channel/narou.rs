@@ -939,9 +939,12 @@ const LOGIN_HELP: CmdHelp = CmdHelp {
       clear    1 サイト分、--index で 1 件だけ、引数なしですべて削除
 
   Examples:
-    narou login import login.yaml --passphrase hunter2
+    narou login import login.yaml --passphrase correct-horse-battery
     narou login import login.yaml --replace
-    narou login export login.yaml --passphrase hunter2
+    narou login export login.yaml --passphrase correct-horse-battery
+
+  Notes:
+    書き出し時の --passphrase は 8 文字以上 (空文字・短い値は拒否)。
     narou login list
     narou login set ncode.syosetu.com --cookie \"over18=yes; ses=...\"
     narou login add ncode.syosetu.com --cookie \"over18=yes; ses=...\" --label R18用

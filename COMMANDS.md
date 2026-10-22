@@ -360,6 +360,10 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 
 **書き出し形式**: `version`/`exported_at`/`library`/`encrypted`/`kdf`/`salt`/`payload`/`sites` を持つ YAML エンベロープ (version 3)。`narou_rs_login --export <file>` が生成し、ライブラリ外ではそれが既定の出力になる。version 2 (`credentials:` にホストごとの 1 本) と version 1 (`cookies:` のホスト→Cookie マップ) も読み取り可能。
 
+**書き出しの保護**: `--passphrase` は 8 文字以上を要求し、空文字・短すぎる値では書き出さない (取り込みは旧ファイル互換のため任意長のパスフレーズを受け付ける)。書き出しファイルは Unix では 0600 で作成し、既存のシンボリックリンクは追従しない。
+
+**ブラウザ取得**: `narou_rs_login` は `--remote-debugging-port=0` で起動し、`<profile>/DevToolsActivePort` と `/json/version` の WebSocket URL が起動したブラウザの port/host/path と一致することを確認してから Cookie を取得する (`--port` で固定ポートを明示した場合も port 一致を確認)。
+
 **ヘルプ**: トップレベル一覧と `narou login -h` は実装と同期している。`-h` の `<sub>` 一覧は `list`/`import`/`export`/`rename`/`order`/`clear` を、Examples は `rename`・`order`・`clear --index` を含む主要形を、オプション一覧は `--passphrase`/`--replace`/`--clear-text`/`--name`/`--index` を表示する。
 **Web UI**: 設定ページ「ログイン」タブで一覧 (サイト → 名前つきログイン)・取り込み (名前欄つき。空欄ならファイル名を使用)・名前変更・並べ替え (上下ボタン)・1 件削除・サイト削除・全削除。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET /api/login`、`POST /api/login/import`、`POST /api/login/rename`、`POST /api/login/order`、`DELETE /api/login`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}`。
 
