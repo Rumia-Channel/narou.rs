@@ -14,6 +14,8 @@
 use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -54,6 +56,7 @@ pub async fn via_wget(
     }
     let proxy = PinnedProxy::start(target).await?;
     let proxy_url = format!("http://127.0.0.1:{}", proxy.port);
+    let established = proxy.established_handle();
     let args = build_wget_args(target, headers, options);
     let mut command = tokio::process::Command::new(&options.bin);
     command
@@ -87,7 +90,13 @@ pub async fn via_wget(
         // (RelayTransportError はそのまま传播し、非 RelayTransportError のみ
         // 終了コードで failed/incomplete に振り分ける)。Rust 側の解析失敗は
         // 常に TransportError なので、その理由をそのまま返す。
-        parse_wget_output(&output)
+        let response = parse_wget_output(&output)?;
+        // wget が環境プロキシを無視して直接接続した場合、検証済み IP への
+        // 接続固定が効いていない。応答を成功として返さない。
+        if !established.load(Ordering::SeqCst) {
+            return Err(TransportError::new(TransportErrorKind::Failed));
+        }
+        Ok(response)
     })
     .await;
 
@@ -159,6 +168,8 @@ fn build_wget_args(
 /// abort する。残った接続は `JoinSet` の drop で閉じられる。
 struct PinnedProxy {
     port: u16,
+    /// 検証済みアドレスへの CONNECT トンネルが 1 本以上確立したか。
+    established: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -174,6 +185,8 @@ impl PinnedProxy {
         let expected_host = connect_host(target);
         let expected_port = target_port(target);
         let address = target.address;
+        let established = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&established);
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
@@ -188,6 +201,7 @@ impl PinnedProxy {
                             expected_host.clone(),
                             expected_port,
                             address,
+                            Arc::clone(&flag),
                         ));
                     }
                     joined = connections.join_next(), if !connections.is_empty() => {
@@ -196,7 +210,16 @@ impl PinnedProxy {
                 }
             }
         });
-        Ok(Self { port, task })
+        Ok(Self {
+            port,
+            established,
+            task,
+        })
+    }
+
+    /// トンネル確立フラグの参照。取得開始前に clone して使う。
+    fn established_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.established)
     }
 }
 
@@ -212,6 +235,7 @@ async fn handle_connection(
     expected_host: String,
     expected_port: u16,
     address: IpAddr,
+    established: Arc<AtomicBool>,
 ) {
     let mut head = Vec::new();
     let mut buffer = vec![0u8; CONNECT_BUFFER_BYTES];
@@ -232,6 +256,7 @@ async fn handle_connection(
     if client.write_all(CONNECT_ESTABLISHED).await.is_err() {
         return;
     }
+    established.store(true, Ordering::SeqCst);
     let leftover = &head[end + 4..];
     if !leftover.is_empty() && upstream.write_all(leftover).await.is_err() {
         return;
@@ -719,6 +744,10 @@ mod tests {
             "127.0.0.1",
         );
         let proxy = PinnedProxy::start(&target).await.expect("proxy");
+        assert!(
+            !proxy.established.load(Ordering::SeqCst),
+            "no tunnel may exist before the first CONNECT"
+        );
 
         // 期待しない CONNECT はトンネルせず切断する。
         let mut rejected = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy.port))
@@ -735,6 +764,10 @@ mod tests {
         assert!(
             matches!(outcome, Ok(0) | Err(_)),
             "unexpected rejected read: {outcome:?}"
+        );
+        assert!(
+            !proxy.established.load(Ordering::SeqCst),
+            "a rejected CONNECT must not mark the tunnel as established"
         );
 
         // 期待どおりの CONNECT はトンネルし、バイト列が往復する。
@@ -758,6 +791,10 @@ mod tests {
             response_head.extend_from_slice(&buffer[..read]);
         }
         assert!(response_head.starts_with(b"HTTP/1.1 200"));
+        assert!(
+            proxy.established.load(Ordering::SeqCst),
+            "an authorized CONNECT must mark the tunnel as established"
+        );
         tunneled.write_all(b"tunneled").await.expect("tunnel write");
         let mut echoed = [0u8; 8];
         tunneled.read_exact(&mut echoed).await.expect("tunnel read");

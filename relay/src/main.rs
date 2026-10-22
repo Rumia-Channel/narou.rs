@@ -38,6 +38,15 @@ async fn run() -> Result<(), String> {
     }
     if let Some(path) = &config.cacert {
         ca::verify_cacert_file(path).map_err(|error| format!("CA バンドルを検証できません: {error}"))?;
+    } else {
+        eprintln!(
+            "narou relay: NAROU_RELAY_CACERT が未設定です。侵害されたルート CA の検査は行いません (NAROU_RELAY_CACERT の設定を推奨)"
+        );
+    }
+    if config.token.len() < 32 {
+        eprintln!(
+            "narou relay: NAROU_RELAY_KEY が 32 バイト未満です。ランダムな 32 バイト以上の鍵を推奨します"
+        );
     }
     if config.wget_dropped {
         eprintln!(

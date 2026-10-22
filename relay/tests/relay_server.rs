@@ -576,3 +576,38 @@ async fn health_reports_the_configured_fetch_order() {
     assert_eq!(get_health(curl_only.addr).await.json()["fetch"], "curl");
     curl_only.stop().await;
 }
+
+#[tokio::test]
+async fn unauthenticated_stalled_body_is_rejected_before_it_is_read() {
+    // 認証は本文読み取りより先。Content-Length だけ宣言して本文を送らない
+    // クライアントが 75 秒の期限まで接続を保持できないことを固定する。
+    let relay = TestRelay::start(test_config()).await;
+    let mut client = RawClient::connect(relay.addr).await;
+    client
+        .send_request("POST", "/proxy", &[("Content-Length", "65536")], None)
+        .await;
+    let response = client.read_response_within(Duration::from_secs(2)).await;
+    response.expect_status(403);
+    assert_eq!(response.error_message(), "forbidden");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn health_with_a_declared_body_is_answered_without_waiting_for_it() {
+    // GET /health は本文を読まない。未読本文を keep-alive に残さないよう
+    // 応答で接続を閉じる (読み手は 2 秒以内に応答を得られる)。
+    let relay = TestRelay::start(test_config()).await;
+    let mut client = RawClient::connect(relay.addr).await;
+    client
+        .send_request("GET", "/health", &[("Content-Length", "65536")], None)
+        .await;
+    let response = client.read_response_within(Duration::from_secs(2)).await;
+    response.expect_status(200);
+    assert_eq!(response.json()["ok"], true);
+    assert_eq!(
+        response.header("connection").as_deref(),
+        Some("close"),
+        "an unread declared body must close the connection"
+    );
+    relay.stop().await;
+}

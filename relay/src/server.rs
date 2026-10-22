@@ -37,6 +37,8 @@ use crate::wire::{self, MAX_HEAD_BYTES, MAX_REQUEST_BYTES};
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 応答書き込みの上限時間。読み手が居ない接続でタスクを止めない。
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 同時接続数の上限。未認証クライアントによるソケット・タスク枯渇を防ぐ。
+const MAX_CONNECTIONS: usize = 128;
 /// 停止時に処理中のリクエストを待つ時間。
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
@@ -128,15 +130,25 @@ impl Relay {
         shutdown: CancelToken,
     ) -> io::Result<()> {
         let mut tasks: JoinSet<()> = JoinSet::new();
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
+            // JoinSet は join するまで完了タスクの結果を保持する。accept の
+            // たびに回収しないと、接続数に比例してメモリが増え続ける。
+            while tasks.try_join_next().is_some() {}
             let cancelled = shutdown.wait();
             tokio::select! {
                 _ = cancelled.cancelled() => break,
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _peer)) => {
+                            let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                                // 上限超過。応答を待たせず閉じ、受付自体は継続する。
+                                drop(stream);
+                                continue;
+                            };
                             let relay = Arc::clone(&self);
                             tasks.spawn(async move {
+                                let _permit = permit;
                                 relay.handle_connection(Connection::new(stream)).await;
                             });
                         }
@@ -196,25 +208,69 @@ impl Relay {
                     return;
                 }
             };
-            let deadline = Instant::now() + self.config.request_timeout;
-            let mut close = !request.keep_alive;
-            if request.expect_continue && conn.write_raw(b"HTTP/1.1 100 Continue\r\n\r\n").await.is_err()
-            {
+            let Some(url) = request_url(&request.target) else {
+                conn.finish_error_reply(400, &error_body("invalid request"))
+                    .await;
+                return;
+            };
+            let is_proxy = url.path() == "/proxy";
+            if is_proxy {
+                // 認証は本文読み取りより先に行う (旧 Node 版と同じ順序)。
+                // 認証前に本文を読むと、トークンを知らないクライアントでも
+                // リクエスト期限 (既定 75 秒) まで接続とタスクを保持できてしまう。
+                let supplied = request.joined_header("x-proxy-token");
+                if !token_matches(&self.config.token, &supplied) {
+                    (self.logger)(
+                        "narou relay proxy: authentication failed (X-Proxy-Token mismatch)",
+                    );
+                    conn.finish_error_reply(403, &error_body("forbidden"))
+                        .await;
+                    return;
+                }
+                if !matches!(request.method.as_str(), "GET" | "POST") {
+                    conn.finish_error_reply(405, &error_body("method not allowed"))
+                        .await;
+                    return;
+                }
+            } else if url.path() == "/health" {
+                if request.method != "GET" {
+                    conn.finish_error_reply(405, &error_body("method not allowed"))
+                        .await;
+                    return;
+                }
+            } else {
+                conn.finish_error_reply(404, &error_body("not found"))
+                    .await;
                 return;
             }
-            let body = match conn.read_body(&request, deadline).await {
-                Ok(body) => body,
-                Err(BodyError::Io) => return,
-                Err(BodyError::Timeout) => {
-                    conn.finish_error_reply(502, &error_body("request timed out"))
-                        .await;
+            let deadline = Instant::now() + self.config.request_timeout;
+            // 本文を読むのは認証済みの POST /proxy だけ。GET や /health で
+            // 本文が宣言されている場合は、未読のまま keep-alive すると次の
+            // リクエストと混ざるため、この応答で接続を閉じる。
+            let mut close = !request.keep_alive;
+            let body = if is_proxy && request.method == "POST" {
+                if request.expect_continue
+                    && conn.write_raw(b"HTTP/1.1 100 Continue\r\n\r\n").await.is_err()
+                {
                     return;
                 }
-                Err(BodyError::TooLarge) | Err(BodyError::BadRequest) => {
-                    conn.finish_error_reply(400, &error_body("invalid request"))
-                        .await;
-                    return;
+                match conn.read_body(&request, deadline).await {
+                    Ok(body) => body,
+                    Err(BodyError::Io) => return,
+                    Err(BodyError::Timeout) => {
+                        conn.finish_error_reply(502, &error_body("request timed out"))
+                            .await;
+                        return;
+                    }
+                    Err(BodyError::TooLarge) | Err(BodyError::BadRequest) => {
+                        conn.finish_error_reply(400, &error_body("invalid request"))
+                            .await;
+                        return;
+                    }
                 }
+            } else {
+                close = close || request.expects_body();
+                Vec::new()
             };
             // 期限切れ・クライアント切断では process の future を drop し、
             // 取得中の子プロセスを止める。
@@ -538,6 +594,11 @@ impl Request {
             }
         }
         out
+    }
+
+    /// 本文 (Content-Length > 0 または chunked) が宣言されているか。
+    fn expects_body(&self) -> bool {
+        self.chunked || self.content_length.is_some_and(|length| length > 0)
     }
 }
 
