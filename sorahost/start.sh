@@ -111,13 +111,7 @@ done
 BIN="$APP/narou_rs"
 PIDS=""
 
-# 相乗り (NAROU_RELAY=1) のときはプラットフォームの PORT をリレーが使うので、
-# narou 側は別ポートにする (sorahost/README.md §10)。
-if [ "${NAROU_RELAY:-0}" = "1" ]; then
-  NAROU_PORT="${NAROU_RS_PORT:-8080}"
-else
-  NAROU_PORT="${NAROU_RS_PORT:-${PORT:-8080}}"
-fi
+NAROU_PORT="${NAROU_RS_PORT:-${PORT:-8080}}"
 
 # 配備の経路 (tar / CLI / プラットフォームの展開) で実行ビットが落ちることが
 # あるので、読み込みが済んでいれば自分で付け直す。
@@ -304,22 +298,6 @@ if [ -n "$NAROU_CONNECTOR" ]; then
     ) &
     PIDS="$PIDS $!"
     echo "[narou] 前段のコネクタを起動しました (向き先 127.0.0.1:${NAROU_PORT})"
-  fi
-fi
-
-# --- 取得リレー (任意・Worker の踏み台) ------------------------------------
-# 通常は別サーバーなので何もしない。同じサーバーで動かすときだけ NAROU_RELAY=1。
-RELAY_JS="$SELF_DIR/server.mjs"
-if [ "${NAROU_RELAY:-0}" = "1" ]; then
-  if [ ! -f "$RELAY_JS" ]; then
-    echo "[narou] 警告: NAROU_RELAY=1 ですが $RELAY_JS がありません" >&2
-  elif [ -z "${NAROU_RELAY_KEY:-}" ]; then
-    echo "[narou] 警告: NAROU_RELAY_KEY が無いためリレーを起動しません" >&2
-    echo "[narou] (Worker 側の NAROU_RELAY_KEY と同じ値を .env に置いて下さい)" >&2
-  else
-    node "$RELAY_JS" </dev/null &
-    PIDS="$PIDS $!"
-    echo "[narou] 取得リレーを起動しました (待受は 127.0.0.1:${PORT:-3000} / narou は ${NAROU_PORT})"
   fi
 fi
 

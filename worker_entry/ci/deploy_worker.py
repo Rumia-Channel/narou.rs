@@ -31,6 +31,8 @@ runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカー�
   （ストアの値は読み戻せないため）。ストア専用運用で CI 側に値が無いときは
   認証付きの S3 LIST 検証と smoke を明示 notice 付きで省略し、無認証の
   health 検査と 401 の fail-closed 確認は必ず行う。
+  CI 側に値を置く場合は 32 文字以上 (ASCII) を要求する。既に配備済みの短い
+  トークンはこの検査では失効しないが、次回デプロイ時にローテーションする。
   `NAROU_AUTH_REQUIRED=false`（Zero Trust を境界にする）ときは不要。
 - `NAROU_RS_LOGIN_KEY` … 資格情報の at-rest 鍵（base64 32 バイト）。無い場合は
   平文の行だけを読む。
@@ -39,6 +41,8 @@ runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカー�
   Secrets Store の `*_SECRET_NAME` を使うか、`wrangler secret put` で別途投入する。
 - `NAROU_AUTH_REQUIRED` / `NAROU_WORKERS_DEV` / `DEVELOP_DOMAIN` /
   `NAROU_S3_PREFIX` / `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` / `NAROU_SMOKE=0`
+- `NAROU_WRANGLER_VERSION` … デプロイと D1 migration に使う wrangler の
+  バージョン (`x.y.z` 形式のみ)。既定は [`WRANGLER_VERSION`]。
 - `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` … 任意の外部取得リレー。
   リレーの公開先と `X-Proxy-Token` の合言葉を同名の Worker secret として投入する。
   リレー自体の配置・更新はこの CI からは行わない。
@@ -73,6 +77,19 @@ from typing import NoReturn
 WORKER_DIR = Path(__file__).resolve().parent.parent
 TARGETS = ("develop", "production")
 WORKER_URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+\.workers\.dev")
+
+# デプロイと D1 migration に使う wrangler はバージョンを固定する。
+# `wrangler@4` のような範囲指定だとデプロイのたびに新しい 4.x が入り、
+# wrangler.toml / D1 / secrets の扱いが予告なく変わる (再現性が無く、
+# サプライチェーンの影響も受けやすい)。`NAROU_WRANGLER_VERSION` で
+# 明示的に上げるときだけ上書きする。
+WRANGLER_VERSION = "4.151.3"
+WRANGLER_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
+
+# CI が使う管理 API トークンの最小長。短いトークンは総当たりで破れるため
+# デプロイ時に拒否する (値は Worker の secret として配備される)。
+# Secrets Store 専用で CI 側に値が無い場合は検査できないのでそのまま通す。
+ADMIN_TOKEN_MIN_CHARS = 32
 
 # 配備後の診断 GET に載せる User-Agent。アプリ本体の既定値と同じブラウザ風の
 # 文字列を使う (`src/downloader/mod.rs` の `DEFAULT_USER_AGENT`)。urllib の既定
@@ -166,6 +183,29 @@ def required(name: str) -> str:
     return value
 
 
+def wrangler_version() -> str:
+    """デプロイに使う wrangler のバージョン。
+
+    既定は [`WRANGLER_VERSION`]。`NAROU_WRANGLER_VERSION` で上書きできるが、
+    `x.y.z` の完全一致だけを受け付ける (`4` や `latest` のような範囲指定は
+    再現性が無いので拒否する)。
+    """
+    value = os.environ.get("NAROU_WRANGLER_VERSION", "").strip()
+    if not value:
+        return WRANGLER_VERSION
+    if not WRANGLER_VERSION_PATTERN.fullmatch(value):
+        fail(
+            "NAROU_WRANGLER_VERSION must be an exact x.y.z version "
+            f"(got {value!r}); ranges such as 4 or latest are not pinned"
+        )
+    return value
+
+
+def wrangler_command(*args: str) -> list[str]:
+    """固定バージョンの wrangler を `npx --yes` で実行するコマンド。"""
+    return ["npx", "--yes", f"wrangler@{wrangler_version()}", *args]
+
+
 def admin_token() -> str:
     """CI 側で使える Bearer トークン。Secrets Store の値は API でも読み戻せない。"""
     return os.environ.get("NAROU_ADMIN_TOKEN", "").strip()
@@ -196,6 +236,17 @@ def require_probe_auth() -> None:
         value = os.environ.get(name, "").strip()
         if any(ord(character) < 32 or ord(character) > 126 for character in value):
             fail(f"{name} must be a valid ASCII HTTP header value")
+    # Bearer トークンは総当たりされない長さを要求する (CI 側だけで検査し、
+    # Worker 実行時には持ち込まない)。既に配備済みの短いトークンをこの検証で
+    # 失効させることはないが、次回デプロイ/ローテーション時に 32 文字以上へ
+    # 更新する必要がある。Secrets Store 専用 (CI に値が無い) 場合は検査しない。
+    token = admin_token()
+    if token and len(token) < ADMIN_TOKEN_MIN_CHARS:
+        fail(
+            f"NAROU_ADMIN_TOKEN must be at least {ADMIN_TOKEN_MIN_CHARS} characters "
+            "(existing deployments should rotate to a "
+            f">={ADMIN_TOKEN_MIN_CHARS} character token on the next deploy)"
+        )
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -501,8 +552,11 @@ def secret_file(target: str) -> Path | None:
 
 
 def run_deploy(secrets: Path | None) -> tuple[int, str]:
-    """`wrangler deploy` を実行し `(exit code, log)` を返す (失敗でも落とさない)。"""
-    command = ["npx", "--yes", "wrangler@4", "deploy", "-c", "wrangler.ci.toml"]
+    """`wrangler deploy` を実行し `(exit code, log)` を返す (失敗でも落とさない)。
+
+    wrangler は固定バージョン ([`wrangler_command`]) を使う。
+    """
+    command = wrangler_command("deploy", "-c", "wrangler.ci.toml")
     if secrets is not None:
         command += ["--secrets-file", str(secrets)]
     result = subprocess.run(
@@ -543,7 +597,10 @@ def deploy(
         code, log = run_deploy(secrets)
     print(log)
     if code != 0:
-        fail(f"npx --yes wrangler@4 deploy -c wrangler.ci.toml failed with {code}")
+        fail(
+            f"npx --yes wrangler@{wrangler_version()} deploy -c wrangler.ci.toml "
+            f"failed with {code}"
+        )
     urls = WORKER_URL_PATTERN.findall(log)
     return urls[-1] if urls else None
 
@@ -642,11 +699,9 @@ def main() -> None:
     resources = provision(target)
     database = render(target, resources)
     enable_read_replication(resources)
+    # wrangler はデプロイと同じ固定バージョンで migration を適用する。
     run(
-        [
-            "npx",
-            "--yes",
-            "wrangler@4",
+        wrangler_command(
             "d1",
             "migrations",
             "apply",
@@ -654,7 +709,7 @@ def main() -> None:
             "--remote",
             "-c",
             "wrangler.ci.toml",
-        ]
+        )
     )
 
     secrets = secret_file(target)

@@ -174,7 +174,7 @@ fn export(
         .ok()
         .and_then(|dir| dir.file_name().map(|name| name.to_string_lossy().into_owned()));
     let text = build_export(&sites, passphrase, &exported_at, library.as_deref())?;
-    std::fs::write(file, text)?;
+    narou_rs::login::transfer::write_export_file(std::path::Path::new(file), &text)?;
     println!("ログイン情報を書き出しました: {file} ({logins} 件)");
     if passphrase.is_none() {
         println!("  平文で書き出しました。移動先では速やかに取り込んでください。");
@@ -357,7 +357,7 @@ mod tests {
         )]);
         let exported = build_export(
             &sites,
-            Some("hunter2"),
+            Some("hunter2-long"),
             "2026-09-20T00:00:00+09:00",
             None,
         )
@@ -365,7 +365,7 @@ mod tests {
         std::fs::write(&file, exported).unwrap();
 
         assert!(import(&store, &file, Some("wrong"), false, None).is_err());
-        import(&store, &file, Some("hunter2"), false, None).unwrap();
+        import(&store, &file, Some("hunter2-long"), false, None).unwrap();
         let stored = store.groups_for("example.com").unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].cookies[0].cookie, "sid=abc");
@@ -376,10 +376,10 @@ mod tests {
 
         let out = temp.path().join("out.yaml");
         let out = out.to_string_lossy().into_owned();
-        export(&store, &out, Some("hunter2"), false).unwrap();
+        export(&store, &out, Some("hunter2-long"), false).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(!text.contains("sid=abc"), "the export is encrypted");
-        let exported = parse_export(&text, Some("hunter2")).unwrap();
+        let exported = parse_export(&text, Some("hunter2-long")).unwrap();
         assert_eq!(exported["example.com"][0].cookies[0].cookie, "sid=abc");
         assert_eq!(
             exported["example.com"][0].id, stored[0].id,
@@ -387,7 +387,7 @@ mod tests {
         );
 
         // パスフレーズ無しで読む平文形式。
-        export(&store, &out, Some("hunter2"), true).unwrap();
+        export(&store, &out, Some("hunter2-long"), true).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("sid=abc"));
         let exported = parse_export(&text, None).unwrap();

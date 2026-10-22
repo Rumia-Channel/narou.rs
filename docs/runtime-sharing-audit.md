@@ -81,7 +81,7 @@ SQLite の保存境界、不要な往復と並行 I/O を修正した。下の�
 
 | 優先 | 対象・確認した重複／差 | 主な箇所 | 推奨する既存の受け皿 |
 |---|---|---|---|
-| 高 | 普通の native HTTP tier と relay が `Set-Cookie` を保持しない。更新ループ自体も native / Worker の二重実装 | `src/native/http.rs:165-209,422-505,928-937`、`worker_entry/src/http.rs:106-150,227-253`、`src/platform/relay.rs:201-263` | `platform::http` の応答契約、`platform::cookie_store`。relay の JS 実装も同時変更 |
+| 高 | 普通の native HTTP tier が `Set-Cookie` を保持しない（リレー経路は Rust 版で `setCookie` を運ぶようになり解消。A-7 参照）。更新ループ自体も native / Worker の二重実装 | `src/native/http.rs:165-209,422-505,928-937`、`worker_entry/src/http.rs:106-150,227-253`、`src/platform/relay.rs:201-263` | `platform::http` の応答契約、`platform::cookie_store`。リレー側は `src/platform/relay.rs` / `worker_entry/src/http.rs` で対応済み |
 | 高 | 真偽値の読み取りが `Bool` 限定／`true,false` 限定／`yes,on,1` 対応に分裂。Worker 内でも debug 設定の解釈が違う | `src/db/settings.rs:110-118`、`src/compat.rs:298-317`、`worker_entry/src/composition.rs:243-252`、`consumer.rs:498-508`、`webui/ui_prefs.rs:445-461` | `setting_core` に読み取り規則を置き、未設定と false を区別する |
 | 高 | URL / ID / ncode / タイトルの解決が 5〜6 系統。URL fallback が異なり、Web の `SiteDefinitionProvider` は空実装 | `src/commands/mod.rs:46-87`、`update.rs:494-537`、`src/web/jobs.rs:398-439`、`worker_entry/src/webui/{download,job_actions,read_views}.rs` | `application::library` と既存 `SiteDefinitionProvider`。差を解決モードとして明示 |
 | 高 | native のランタイムサイト定義が `effective()`、Worker が `effective_runtime()` を使用 | `src/native/site_definitions.rs:159-165`、`worker_entry/src/bundled_sites.rs:79-99` | `application::site_definitions` の version gate。古いユーザー定義への影響を確認して切替 |
@@ -103,7 +103,7 @@ SQLite の保存境界、不要な往復と並行 I/O を修正した。下の�
 | 中 | feature tour のテーブルと 3 要素 version 比較がコピーされ、既存の共有比較を使わない | `src/web/feature_tour.rs:20-142,281-337`、`worker_entry/src/webui/ui_prefs.rs:198-320,462-520` | 共通のツアーデータと `application::version_compare` |
 | 中 | `convert.keep-txt` の env / YAML 解釈が 3 実装 | `src/converter/mod.rs:169-182`、`src/application/convert.rs:247-277`、`worker_entry/src/convert.rs:211-243` | `setting_core` / `application::convert`。native=true / Worker=false の既定は保持 |
 | 中 | HTTP ヘッダ名・値の安全述語が複数系統、socket の redirect は各 hop の構文検証を通らない | `src/downloader/http_policy.rs:110-117`、`security.rs:13-15`、`src/platform/{relay,http1}.rs`、`worker_entry/src/http.rs:157-207` | 無条件コンパイルの `platform` のヘッダ規則と `url_policy` |
-| 中 | 同じ relay protocol の Node curl 版と Worker 版で follow が異なる | `scripts/sorahost-proxy/server.mjs:75-108`、`worker/worker.mjs:74-87` | `platform::relay` の契約と共通 redirect 方針。`-L` 追加だけではヘッダ解析が壊れる |
+| 中 | 同じ relay protocol のリレー側（Rust）と Worker 側で follow の扱いが異なる | `relay/src/transport/curl.rs`、`relay/src/transport/wget.rs`（旧 Node 版の `scripts/sorahost-proxy/server.mjs:75-108` / `worker/worker.mjs:74-87` は削除済み） | `platform::relay` の契約と共通 redirect 方針。`-L` 追加だけではヘッダ解析が壊れる |
 | 中 | レート制限の idle reset 基準・閾値・pending 条件が異なる | `src/downloader/rate_limit.rs:120-150`、`worker_entry/src/site_rate_limiter.rs:53-67` | `platform::rate_limiter` の時系列状態機械。時計と permit 保存だけ別 |
 | 中 | 在庫キー、import / export の管理対象名が別テーブル。Cookie 鍵長など公開済み定数も再宣言 | `src/native/sqlite/{state,export_yaml}.rs`、`src/db/inventory.rs`、`worker_entry/src/{d1_cookie_store,composition}.rs` | 用途を保った共通定数・管理対象表。import と rollback export の欠落を防ぐ |
 | 低 | MIME の WebP 対応と 64 桁 hash 判定が複数実装 | `src/native/object_store.rs:252-265`、`src/platform/object_store.rs:84-96`、`s3_request.rs:72-78`、`src/illustration_store.rs:704`、`src/commands/illust.rs:238-241` | `platform::object_store` / 挿絵キーの共通述語 |
@@ -116,8 +116,9 @@ SQLite の保存境界、不要な往復と並行 I/O を修正した。下の�
 
 - SELECT / UPSERT とレコード codec は現在 `src/db/novel_codec.rs` を両 DB driver が使う。
   初回 §2.3 の全面的な未共有という読み方は誤り。残る候補は WHERE / term / sort と状態 SQL 等。
-- 初回 A-8 の「踏み台が redirect を辿る」は Node curl 版では成立しない。
-  `server.mjs` には `-L` がなく、`--max-redirs` だけでは follow しない。Worker relay 版は follow する。
+- 初回 A-8 の「踏み台が redirect を辿る」は旧 Node curl 版では成立しない
+  （`server.mjs` には `-L` がなく、`--max-redirs` だけでは follow しない。これらの Node 実装は削除済み）。
+  Rust 版リレーもリダイレクトを追わず、3xx の `location` を返す（追跡は Worker 側の共通 `RedirectChain`）。
 - SORAHOST の `.env` 読み込み、cwd によるライブラリ指定、loopback 前提の起動認証、
   `/dev/null` による非対話、native の health / relay / S3 probe 未採用は、
   対応する要求がない限り共通化のためだけに機能追加しない。
@@ -256,15 +257,15 @@ native 側の消費者が存在しない。
   タグキャンバスが更新されない（native は更新される）。
 - 共有層の追加は不要。既存クライアントを呼ぶだけ。
 
-### A-7. リレー経路だけ Set-Cookie を落とす
+### A-7. リレー経路の Set-Cookie（2026-10 の Rust リレー移行で解消）
 
-- リレーの応答はプロトコル上 `{status, contentType, location, via, body}` しか運ばず、
-  `worker_entry/src/http.rs:242-248` が `contentType` / `location` だけを組み立てる
-  （`src/platform/relay.rs:200-213`）。
-- socket 経路は全ヘッダを保持する（`src/platform/http1.rs:192`）ので、
-  **リレーに落ちたサイトだけ**ログイン Cookie 更新が起きない。
-- 修正は `platform/relay.rs` / `scripts/sorahost-proxy/server.mjs` /
-  `scripts/sorahost-proxy/worker/worker.mjs` の 3 実装同時変更。
+- 旧 Node 版ではリレーの応答がプロトコル上 `{status, contentType, location, via, body}` しか運ばず、
+  `worker_entry/src/http.rs` が contentType / location だけを組み立てていたため、
+  **リレーに落ちたサイトだけ**ログイン Cookie 更新が起きなかった。
+- 現在のリレーは応答 JSON に `setCookie`（文字列の配列、上流の受信順）を含めて返し、
+  `src/platform/relay.rs:245-256` が受け取って `worker_entry/src/http.rs:156-159` が
+  応答ヘッダへ復元する。旧 Node 実装（`scripts/sorahost-proxy/server.mjs` /
+  `scripts/sorahost-proxy/worker/worker.mjs`）は削除済み。
 
 ### A-8. Worker の socket / relay 経路にリダイレクト先の SSRF 再検証が無い
 
@@ -272,10 +273,11 @@ native 側の消費者が存在しない。
   `src/downloader/http_policy.rs:233`。
 - Worker の socket ホップは再検証なし（`worker_entry/src/http.rs:182-197`。
   `SocketTarget::parse` は scheme/host しか見ない: `src/platform/http1.rs:42-50`）。
-- リレーは踏み台が辿る。踏み台側の検査は `if (!/^https?:\/\//.test(target))`
-  （`scripts/sorahost-proxy/server.mjs:174`）と `--max-redirs 5`（`:84`）のみ。
+- リレーはリダイレクトを追わない（Rust 版 `relay/src/transport/mod.rs` の方針。3xx は
+  `location` として返し、追跡は呼び出し側の共通 `RedirectChain` が行う）ため、踏み台が
+  リダイレクト先へ接続することはない。旧 Node 版の `--max-redirs` 依存の検査は削除済み。
 - Workers の `connect()` は private 宛で失敗するため実害は限定的だが、リレー経由は
-  踏み台ネットワークからの到達になる。
+  踏み台ネットワークからの到達になる（接続先は許可ホスト + DNS 検証済み IP に固定される）。
 
 ### A-9. レート制限ペーシングの idle reset 条件が両実装で違う
 
@@ -392,7 +394,7 @@ native 側は `EmptySiteDefinitionProvider` を踏むため URL が常に解決�
 | 非対話モードが `< /dev/null` | `sorahost/start.sh:25-26,146,312` | native は `stdin().is_terminal()` のみ（23 箇所）。`--yes` / `NAROU_NONINTERACTIVE` が無い |
 | ライブラリ位置・.env を CLI で指定できない | `sorahost/start.sh:34-41,43-68,70-71,139-142` | `NAROU_RS_LIBRARY` / `NAROU_RS_ENV_FILE` 等を Rust 側で読む箇所は **0 件**。`--root` / `--env-file` が無い |
 | 「この環境では効かない機能」の表明が native に無い | worker: `worker_entry/src/webui/native_only.rs:27-107`（501 + 文言） / `worker_entry/src/global_settings.rs:135-206`（約 50 項目の無効設定リスト） | native には相当が無い（`src/web/` に 501 は 0 件）。`sorahost/README.md §11` の「Web UI 側では 501 相当」は**文書だけ**。`JobKind::is_worker_executable`（`src/application/jobs.rs:69-73`）と合わせ、同じ capability 知識が 4 箇所に分散 |
-| `/health` が native に無い | リレー: `scripts/sorahost-proxy/server.mjs:134-136` / Worker: `/health/live` `/health/ready` | SORAHOST の smoke は `/` のステータスだけ（`.github/workflows/deploy-sorahost.yml:179`） |
+| `/health` が native に無い | リレー: Rust 版 `relay/src/server.rs` の `GET /health`（旧 JS リレーの `scripts/sorahost-proxy/server.mjs:134-136` は削除済み） / Worker: `/health/live` `/health/ready` | SORAHOST の smoke は `/` のステータスだけ（`.github/workflows/deploy-sorahost.yml:179`） |
 | S3 必須ゲートが SORAHOST に無い | Worker: `wrangler.*.toml`, `platform.yml:245,420`, `ci/render_config.py:240` | native の `/api/storage/mode` は `mode` しか返さず `probe` 非対応（`src/web/storage.rs:21,29,34`） |
 | ピン・マニフェストの二重管理 | `sorahost/start.sh:77-79` ↔ `.github/workflows/deploy-sorahost.yml:61-65` ↔ `scripts/sorahost-proxy/deploy.ps1:14` | cloudflared の tag/SHA、static curl の版、CA の入手元が 2〜3 箇所。`sorahost.json` も 3 箇所で別内容（`sorahost/README.md:250` の記載は実物と不一致） |
 | develop / production の env ブロック | `.github/workflows/platform.yml:207-247` と `:388-421` | 20 行以上が同一コピー |

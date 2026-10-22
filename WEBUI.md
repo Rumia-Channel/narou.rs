@@ -683,11 +683,24 @@ Rust版では以下のように CSRF ガードと両立する same-origin 方式
 外部公開や別ドメインからの `Host` ヘッダを許可するために、以下の設定キーを併用します。`s` は `setting` サブコマンドの短縮です（`web` は `w` / `we` で呼べます）。
 
 - `server-bind` — LAN 公開時は `0.0.0.0` か LAN IP を指定（既定 `127.0.0.1`）。
-- `server-reverse-proxy.enable` — nginx 等の前段 proxy が付与する外側 Host / Origin を許可（既定 `false`）。`true` の間は固定許可リストではなく外側 Host の構文妥当性だけで判定する。
 - `server-basic-auth.require-for-external-bind` — `0.0.0.0` など外部 bind 時に Basic 認証必須にする narou.rs 独自ガード（既定 `true`）。
+- `server-reverse-proxy.enable` — nginx 等の前段 proxy 経由のアクセスを有効化（既定 `false`）。`true` の間も Host の許可リストは維持されるため、公開ホストを `server-add-accepted-hosts` に、WebSocket を使う場合は `server-ws-add-accepted-domains` に明示してください。Origin は Host と照合され、proxy が付与する外側ホスト名で判定されます。
+- `server-ws-add-accepted-domains` が空の場合、WebSocket の許可ドメインは loopback 既定 (`127.0.0.1` / `localhost` / `::1`) になります。外部ホスト経由で WebSocket を使う場合は明示してください。
+- 外部 bind + Basic 認証は HTTP 平文です。LAN 外へ公開する場合は TLS 終端つきリバースプロキシを使用してください (起動時に警告が出ます)。
 - `server-add-accepted-hosts` — HTTP `Host` ヘッダに追加で許可するホストのリスト（カンマ区切り）。`*.example.com` のような安全なワイルドカードに対応。unsafe なパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視。既定の許可集合は bind host + loopback + 自ホスト名のまま据え置き、追加ホストだけを opt-in で広げる。
 
 Web UI 設定画面に出る関連項目: `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `server-add-accepted-hosts` / `over18`。`server-reverse-proxy.enable` と `server-basic-auth.require-for-external-bind` は hidden のため CLI からのみ変更します。
+
+### 8.1.1 loopback UI トークン
+
+`127.0.0.1` / `localhost` / `::1` に bind し、Basic 認証もリバースプロキシも使わない構成では、`narou web` が起動ごとに一度きりのブートストラップ URL をブラウザへ渡します。
+
+- 初回の `GET /?narou_ui_token=<ticket>` だけが受け付けられ、サーバは HttpOnly / SameSite=Strict / 30 日有効の `narou_ui_token` Cookie を設定してトークン無しの `/` へリダイレクトします。チケットは一度使うと無効になります。
+- Cookie の値は `.narou/ui_token`（0600）に永続化されるため、サーバ再起動やセルフアップデート後もブラウザのセッションは維持されます。
+- `/api/*`、`/ws`、`/novels/{id}/download` は Cookie または `x-narou-internal-token` ヘッダを要求します。静的なページと `/assets/*` はトークン不要です。
+- `--no-browser` のときは、起動時に表示される「ブラウザで開く URL」をそのまま開いてください。ベース URL を直接開いた場合、API は 401 を返します。
+- CLI や外部ツールから API を叩く場合は、`.narou/server.pid`（0600）に書かれた制御トークンを `x-narou-internal-token` ヘッダで送れます。
+- `server-bind` が外部公開、Basic 認証あり、または `server-reverse-proxy.enable=true` の構成では従来どおり Basic 認証 / 前段プロキシに認証を委ね、UI トークンは要求しません。
 
 ### 8.2 セルフアップデートの variant
 
@@ -702,6 +715,7 @@ Global タブの `self-update.variant` セレクトで、アップデート時�
 - CLI からも同じ設定を扱えます: `narou_rs setting self-update.variant=gpl` / `narou_rs setting self-update.variant`（読み取り）/ `narou_rs setting self-update.variant=`（削除）。
 - 0.4.0 以下から更新するときの variant 選択モーダルは、この設定が未設定のときだけ表示されます。設定済みならモーダルは出ず、保存値の variant を取得します。
 - 更新 API（`POST /api/update/start`）に `variant` を付けた場合は、その指定が最優先され、以後の更新のために保存されます。
+- 更新ファイルの取得先は GitHub Releases API が返す `browser_download_url` に固定され、リクエストで任意 URL を指定することはできません。ダウンロード後は Release asset の `sha256` digest とサイズを照合し、一致しない場合はインストールせず中止します。
 
 ### 8.3 ログインタブ
 

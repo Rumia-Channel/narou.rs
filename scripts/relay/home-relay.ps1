@@ -1,17 +1,20 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-  自宅回線で取得リレーを起動し、cloudflared のクイックトンネルで HTTPS 公開する。
+  自宅回線で取得リレー (Rust 版 narou_relay) を起動し、cloudflared のクイックトンネルで HTTPS 公開する。
 
 .DESCRIPTION
   Cloud Run / SORAHOST はデータセンター回線のため、Cloudflare のチャレンジ配下に
   あるサイト (ハーメルン等) を取得できない。自宅回線では取得できることを実測して
   いるため、このスクリプトはその用途向けにリレーとトンネルをまとめて起動する。
-  (Cloud Run / SORAHOST へのリレー配備は 2026-10-21 に非推奨。現在は VPS または
-  自宅回線のリレーを使う。)
+
+  リレーはワークスペース crate `relay/` のバイナリ (`narou_relay`) を実行する。
+  バイナリが無ければ (または -Rebuild 指定時) リポジトリルートで
+  `cargo build --release -p narou_relay` を実行してから起動する。
 
   認証キーと許可ホストは `scripts/relay/.env` (このスクリプトと同じ場所) から
-  server.mjs が読み込む。`.env.example` をコピーして使うこと。
+  リレーが読み込む (このスクリプトが NAROU_RELAY_ENV_FILE で場所を明示する)。
+  `.env.example` をコピーして使うこと。
 
   表示された公開 URL を GitHub Secrets の `NAROU_RELAY_ENDPOINT` に設定し、
   `NAROU_RELAY_KEY` を `.env` と同じ値にする。クイックトンネルの URL は
@@ -25,20 +28,29 @@
 
 .PARAMETER CloudflaredPath
   cloudflared のパス。省略時は PATH と既定のインストール先から探す。
+
+.PARAMETER BinaryPath
+  リレーのバイナリのパス。省略時はリポジトリの `target/release/narou_relay(.exe)`。
+
+.PARAMETER Rebuild
+  既存のバイナリがあっても `cargo build --release -p narou_relay` を実行してから起動する。
 #>
 [CmdletBinding()]
 param(
     [int]$Port = 3000,
     [switch]$NoTunnel,
-    [string]$CloudflaredPath = ""
+    [string]$CloudflaredPath = "",
+    [string]$BinaryPath = "",
+    [switch]$Rebuild
 )
 
 $ErrorActionPreference = "Stop"
 
 $relayDir = $PSScriptRoot
 $repoRoot = Split-Path -Parent (Split-Path -Parent $relayDir)
-$serverScript = Join-Path $relayDir "server.mjs"
 $envFile = Join-Path $relayDir ".env"
+$binaryName = if ($IsWindows) { "narou_relay.exe" } else { "narou_relay" }
+$defaultBinary = Join-Path $repoRoot "target/release/$binaryName"
 
 function Read-EnvFile {
     param([string]$Path)
@@ -54,37 +66,72 @@ function Read-EnvFile {
     return $values
 }
 
+function Resolve-RelayBinary {
+    param([string]$ExplicitPath, [switch]$ForceBuild)
+    if ($ExplicitPath) {
+        if (-not (Test-Path -LiteralPath $ExplicitPath)) {
+            throw "リレーのバイナリが見つかりません: $ExplicitPath"
+        }
+        return (Resolve-Path -LiteralPath $ExplicitPath).Path
+    }
+    if (-not $ForceBuild -and (Test-Path -LiteralPath $defaultBinary)) {
+        return $defaultBinary
+    }
+    $cargo = Get-Command cargo -ErrorAction SilentlyContinue
+    if (-not $cargo) {
+        throw "cargo が見つかりません。Rust ツールチェーンをインストールしてください (https://rustup.rs/)"
+    }
+    Write-Host "リレーをビルドしています (cargo build --release -p narou_relay) ..."
+    Push-Location -LiteralPath $repoRoot
+    try {
+        & $cargo.Source build --release -p narou_relay
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo build --release -p narou_relay が失敗しました (終了コード $LASTEXITCODE)"
+        }
+    } finally {
+        Pop-Location
+    }
+    if (-not (Test-Path -LiteralPath $defaultBinary)) {
+        throw "ビルド後もリレーのバイナリが見つかりません: $defaultBinary"
+    }
+    return $defaultBinary
+}
+
 function Wait-Health {
     param([string]$Url, [int]$Attempts = 80)
     for ($i = 0; $i -lt $Attempts; $i++) {
         try {
             $response = Invoke-WebRequest -Uri $Url -TimeoutSec 2 -UseBasicParsing
-            if ($response.StatusCode -eq 200) { return $true }
+            if ($response.StatusCode -eq 200) { return [string]$response.Content }
         } catch {
             # 起動待ち。次の試行へ。
         }
         Start-Sleep -Milliseconds 250
     }
-    return $false
-}
-
-if (-not (Test-Path -LiteralPath (Get-Command node -ErrorAction SilentlyContinue).Source)) {
-    throw "node が見つかりません。Node.js 24 以上をインストールしてください"
-}
-if (-not (Test-Path -LiteralPath $serverScript)) {
-    throw "リレーの本体が見つかりません: $serverScript"
+    return $null
 }
 
 $fileEnv = Read-EnvFile -Path $envFile
 if (-not $env:NAROU_RELAY_KEY -and -not $fileEnv.ContainsKey("NAROU_RELAY_KEY")) {
     throw "NAROU_RELAY_KEY が未設定です。$envFile を作成してください（$($envFile).example を参照）"
 }
+if ($env:NAROU_RELAY_KEY -and $fileEnv.ContainsKey("NAROU_RELAY_KEY") -and
+    $env:NAROU_RELAY_KEY -ne $fileEnv["NAROU_RELAY_KEY"]) {
+    Write-Warning "環境変数 NAROU_RELAY_KEY が .env の値と異なります。環境変数が優先されるため、鍵をローテーションした直後は古い鍵で起動していないか確認してください"
+}
 if (-not $env:NAROU_RELAY_ALLOWED_HOSTS -and -not $fileEnv.ContainsKey("NAROU_RELAY_ALLOWED_HOSTS")) {
     Write-Warning "NAROU_RELAY_ALLOWED_HOSTS が未設定です。取得はすべて 400 で拒否されます"
 }
 
+$binaryPath = Resolve-RelayBinary -ExplicitPath $BinaryPath -ForceBuild:$Rebuild
+
+$env:NAROU_RELAY_ENV_FILE = $envFile
 $env:PORT = "$Port"
 if (-not $env:NAROU_RELAY_HOST) { $env:NAROU_RELAY_HOST = "127.0.0.1" }
+$listenHost = $env:NAROU_RELAY_HOST
+if ($listenHost -notin @("127.0.0.1", "::1", "localhost")) {
+    Write-Warning "NAROU_RELAY_HOST=$listenHost のため loopback 以外で待ち受けます。リバースプロキシ/トンネルの外へ直接公開しないでください"
+}
 
 $relay = $null
 $tunnel = $null
@@ -92,15 +139,21 @@ $tunnelLog = Join-Path ([System.IO.Path]::GetTempPath()) ("narou-relay-tunnel-{0
 $tunnelOut = Join-Path ([System.IO.Path]::GetTempPath()) ("narou-relay-tunnel-{0}.out" -f $PID)
 
 try {
-    Write-Host "リレーを起動しています (127.0.0.1:$Port) ..."
-    $relay = Start-Process -FilePath (Get-Command node).Source `
-        -ArgumentList "`"$serverScript`"" -WorkingDirectory $repoRoot -PassThru -NoNewWindow
+    Write-Host "リレーを起動しています (${listenHost}:$Port) ..."
+    $relay = Start-Process -FilePath $binaryPath -WorkingDirectory $repoRoot -PassThru -NoNewWindow
 
-    if (-not (Wait-Health -Url "http://127.0.0.1:$Port/health")) {
+    $healthBody = Wait-Health -Url "http://127.0.0.1:$Port/health"
+    if (-not $healthBody) {
         if ($relay.HasExited) {
-            throw "リレーが起動直後に終了しました (終了コード $($relay.ExitCode))。$envFile の NAROU_RELAY_KEY / NAROU_RELAY_ALLOWED_HOSTS を確認してください"
+            throw "リレーが起動直後に終了しました (終了コード $($relay.ExitCode))。表示された 'narou relay startup failed: ...' と $envFile の NAROU_RELAY_KEY / NAROU_RELAY_ALLOWED_HOSTS (必要なら NAROU_RELAY_FETCH / NAROU_RELAY_CACERT) を確認してください"
         }
         throw "リレーの /health が応答しません (port $Port)"
+    }
+    if ($relay.HasExited) {
+        throw "リレーが起動直後に終了しました (終了コード $($relay.ExitCode))。port $Port が別プロセスに使われている可能性があります"
+    }
+    if ($healthBody -notmatch '"ok"\s*:\s*true') {
+        throw "port $Port の /health が narou_relay の応答ではありません (別プロセスが使用中の可能性)。リレーを起動できていません: $envFile を確認してください"
     }
 
     $publicUrl = ""

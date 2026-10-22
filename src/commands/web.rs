@@ -80,7 +80,28 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         );
         std::process::exit(1);
     }
+    if requires_basic_auth_for_bind(&address.host)
+        && server_security.basic_auth_header.is_some()
+        && !server_security.reverse_proxy_mode
+    {
+        eprintln!(
+            "WARN: 外部 bind の Basic 認証は平文 HTTP です。LAN 外へ公開する場合は TLS 終端つきリバースプロキシを使用し、server-reverse-proxy.enable と server-add-accepted-hosts を設定してください"
+        );
+    }
+    if requires_basic_auth_for_bind(&address.host)
+        && server_security.basic_auth_header.is_none()
+    {
+        eprintln!(
+            "WARN: server-bind が外部公開ですが Basic 認証が無効です (server-basic-auth.require-for-external-bind=false)。LAN 内の誰でも Web UI/API を操作できます"
+        );
+    }
+    if server_security.reverse_proxy_mode {
+        eprintln!(
+            "WARN: server-reverse-proxy.enable=true では、公開ホストを server-add-accepted-hosts / server-ws-add-accepted-domains に明示し、前段 proxy で Host を検証してください"
+        );
+    }
     let control_token = generate_control_token();
+    let ui_bootstrap_ticket = generate_control_token();
     let inventory = match Inventory::with_default_root() {
         Ok(inventory) => Arc::new(inventory),
         Err(e) => {
@@ -89,6 +110,13 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         }
     };
     let root_dir = inventory.root_dir().to_path_buf();
+    let ui_token = match load_or_create_ui_token(&root_dir) {
+        Ok(token) => token,
+        Err(e) => {
+            eprintln!("Error: UI トークンを準備できません: {}", e);
+            std::process::exit(1);
+        }
+    };
     let native_services =
         match narou_rs::native::application::NativeAppServices::new(inventory.clone()) {
             Ok(services) => services,
@@ -122,6 +150,9 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         server_security: Arc::new(parking_lot::RwLock::new(server_security)),
         bind_host: Arc::from(address.host.as_str()),
         control_token: control_token.clone(),
+        ui_token: ui_token.clone(),
+        ui_bootstrap_ticket: ui_bootstrap_ticket.clone(),
+        ui_bootstrap_consumed: Arc::new(AtomicBool::new(false)),
         queue: queue.clone(),
         restore_prompt_pending: restore_prompt_pending.clone(),
         restorable_tasks_available: restorable_tasks_available.clone(),
@@ -132,6 +163,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         library_backup: Arc::new(web::library_backup::LibraryBackupState::new()),
     };
     let app = web::create_router(app_state.clone());
+    let local_auth_required = app_state.local_ui_auth_required();
     let ws_app = address
         .ws_port
         .map(|_| web::push::create_push_router(app_state.clone()));
@@ -139,14 +171,24 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         .parse()
         .unwrap();
     let url = format!("http://{}:{}/", display_host(&address.host), address.port);
+    let mut browser_url = url.clone();
+    if local_auth_required {
+        browser_url.push('?');
+        browser_url.push_str(web::UI_AUTH_QUERY_PARAM);
+        browser_url.push('=');
+        browser_url.push_str(&ui_bootstrap_ticket);
+    }
     if !hide_console {
         println!("{}", url);
+        if no_browser && local_auth_required {
+            println!("ブラウザで開く URL: {}", browser_url);
+        }
         println!("サーバを止めるには {}", web_stop_hint(hide_console));
         println!();
     }
 
     if !no_browser {
-        let _ = open::that(&url);
+        let _ = open::that(&browser_url);
     }
 
     let listener = bind_or_shutdown_and_retry(addr, &address.host, address.port, "HTTP").await;
@@ -431,7 +473,83 @@ fn pid_file_path() -> Option<std::path::PathBuf> {
 
 fn write_pid_file(control_token: &str) {
     if let Some(path) = pid_file_path() {
-        let _ = std::fs::write(&path, format!("{} {}", std::process::id(), control_token));
+        let _ = write_private_file(&path, &format!("{} {}", std::process::id(), control_token));
+    }
+}
+
+/// 起動プロセスだけが読めるファイルを書く (Unix は 0600、Windows は
+/// ユーザープロファイルの ACL を継承)。`.narou/` 配下の秘密情報に使う。
+fn write_private_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// loopback ブラウザ UI 用トークンを読む/作る。
+///
+/// サーバ再起動やセルフアップデート後もブラウザの Cookie を維持できるよう、
+/// `.narou/ui_token` に永続化する。既存ファイルが壊れている場合だけ作り直す。
+fn load_or_create_ui_token(root: &std::path::Path) -> std::io::Result<String> {
+    let path = root.join(".narou").join("ui_token");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let token = text.trim();
+        if token.len() >= 32 && token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Ok(token.to_ascii_lowercase());
+        }
+    }
+    let token = generate_control_token();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(token.as_bytes())?;
+            drop(file);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            Ok(token)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let text = std::fs::read_to_string(&path)?;
+            let existing = text.trim();
+            if existing.len() >= 32 && existing.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                Ok(existing.to_ascii_lowercase())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} が不正です", path.display()),
+                ))
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -930,5 +1048,36 @@ mod tests {
         assert_eq!(control_request_host("0.0.0.0"), "127.0.0.1");
         assert_eq!(control_request_host("::"), "::1");
         assert_eq!(control_request_host("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn ui_token_file_is_stable_and_private() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-artifacts")
+            .join(format!("web-ui-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let first = super::load_or_create_ui_token(&root).unwrap();
+        let second = super::load_or_create_ui_token(&root).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(root.join(".narou").join("ui_token").is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join(".narou").join("ui_token"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

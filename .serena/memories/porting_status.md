@@ -1,14 +1,26 @@
 # narou.rs 移植状況
 
+## 現況（v0.4.17 リリース準備）
+
+ユーザーが「更新されたバージョンをセキュリティアップデートとしてバージョンを切って」と明示指定。公開済みは v0.4.16（2026-10-21）、今回の次版は **v0.4.17** とする。本体/Worker/relay/両 lock/ライセンス表記を 0.4.17 へ更新し、VERSION.md 先頭に v0.4.17 節を追加した。
+
+今回の主な内容（セキュリティアップデート）: (1) loopback Web UI に起動ごとの一度きりチケット→HttpOnly/SameSite=Strict Cookie (30日) の認証を追加し、`/api/*`・`/ws`・`/novels/{id}/download` を保護（static assets は公開のまま、CLI は `x-narou-internal-token`）。(2) セルフアップデートの `asset_url` 任意指定を廃止し、GitHub Releases asset の SHA-256 digest とサイズを検証（欠落・不一致は fail closed）。(3) reverse proxy モードでも Host 許可リストを維持、クリックジャッキング防止ヘッダ、外部 bind の平文 Basic/認証なし警告。(4) うごイラ ZIP の宣言サイズ・16MiB/フレーム・ヘッダ寸法検証、非リモート `<img>` の小説ディレクトリ内限定、URL stash の可変長トークン化（6,143 件超の消失と約105万件の panic 修正）。(5) login export の 8 文字未満パスフレーズ拒否・Unix 0600・シンボリックリンク非追従、CDP の `--port 0` 自動検出と `DevToolsActivePort`/ws URL 検証、SQLite 0600、backup から `login.key`/`ui_token` 除外。(6) Worker relay は https 必須（loopback のみ http 可）、wrangler を `4.151.3` に固定、CI の `NAROU_ADMIN_TOKEN` は 32 文字以上を要求。
+
+検証: `cargo check --workspace --all-targets`、`cargo test -p narou_rs --lib` (1143) / `--features lite` (1160) / bins / integration、`cargo test -p narou_relay`、Worker wasm check、workspace clippy `-D warnings`、Python deploy tests が成功。loopback UI の実サーバ E2E（未認証 401 → 起動 URL 303+Cookie → Cookie あり 200 → 不正 Cookie 401）も確認済み。develop CI（`9603894`）は Native/wasm/Worker contract/license/deploy develop を含め success。
+
+公開前 issue 対応: #39 旧セクション変換キャッシュ移行の並列競合による Convert IO error、#40 keep-txt=true の novel.txt 重複、#41 ダイジェスト自動選択後の暗黙キャンセル・保存フォルダの Documents 誤表示・CLI 進捗バー、#42 インデント系設定 (E000 マーカーが原因)、#43 Web UI の凍結スキップ誤エラーと「凍結済みでも更新」の選択無視、#44 中断後の novel lock 残留を修正。テストは lib 1154 / lite 1171、bins/integration、convert_parity、cli E2E を確認。issue 修正後の最終 CI を待ってリリースする。
+
+リリース手順: この prepare commit を push して develop CI 成功を確認 → main へ no-ff 統合し annotated `v0.4.17` タグを作成・push → Release workflow と Platform（tag/main, production Worker deploy）を監視 → develop へリリースマージを戻して記録を更新する。
+
 ## 現況（v0.4.16 リリース）
 
 ユーザーが v0.4.16 でのリリース（develop 統合・公開）を明示指定。公開済みは v0.4.15（2026-10-18）。本体/Worker/両lock/ライセンス表記を 0.4.16 へ更新し、VERSION.md 先頭に v0.4.16 節を追加した。v0.4.15 節へリリース後に追記されていた SORAHOST / Cloud Run リレー配備の 4 項目は、実際には v0.4.15 に含まれないため v0.4.16 節へ移した。
 
-追加指示: **SORAHOST と GCP (Cloud Run) は非推奨**にして CI からも除去する。配備スクリプト (`bootstrap.mjs` / `deploy-sorahost.mjs` / `relay.js` / `pins.json`)・docs・`sorahost/` は参照用に残し、各先頭へ非推奨の注記を追加。`tests/run-relay.mjs` から relay-hosting / relay-entry / relay-bootstrap を外し、GitHub Actions の orphan workflow「SORAHOST relay」を削除する。テストファイル自体は参照用に残す。
+追加指示: **SORAHOST と GCP (Cloud Run) は非推奨**にして CI からも除去する。配備スクリプト (`bootstrap.mjs` / `deploy-sorahost.mjs` / `relay.js` / `pins.json`)・docs・`sorahost/` は参照用に残し、各先頭へ非推奨の注記を追加。`tests/run-relay.mjs` から relay-hosting / relay-entry / relay-bootstrap を外し、GitHub Actions の orphan workflow「SORAHOST relay」を無効化した（REST 削除は 404 のため `gh workflow disable` で disabled_manually。テストファイル自体は参照用に残す）。
 
 今回の主な内容: SORAHOST / GCP (Cloud Run) リレー配備の非推奨化と CI 除去（リレーは VPS / 自宅回線へ一本化）、wget トランスポートと自宅回線リレー、Worker のリレー呼び出し fetch 化と UA 統一・`RELAY_DOMAIN` 解決、リレー経由 403 のヘッダ名保持修正、eMudhra 中間 CA 侵害対応（CA バンドル指紋検証 + `rustls-webpki` 0.103.16 / `rustls` 0.23.46）、作者追跡の一括更新限定、Pixiv 漫画シリーズの各話タグ統合（YAML 1.6）。
 
-検証: cargo check --workspace --all-targets（ローカルは MSVC cl の D8050 回避のため CC=clang-cl）、relay Node テスト、Pixiv unit 19 / accessibility 13 が成功。push 後の develop CI 成功を確認して main へ no-ff 統合し、main 上で v0.4.16 タグを作成・push する。Release workflow と production Worker 配備を監視し、公開物（16 ZIP）を確認する。
+検証: cargo check --workspace --all-targets（ローカルは MSVC cl の D8050 回避のため CC=clang-cl）、relay Node テスト、Pixiv unit 19 / accessibility 13 が成功。push 後の develop CI 成功を確認して main へ no-ff 統合し、`7e87a65` に v0.4.16 タグ（annotated）を作成・push した。Release workflow・Platform（tag/main）・Linux build がすべて成功し、GitHub Release v0.4.16（16 ZIP、latest）を公開、production Worker 配備も成功した。SORAHOST relay workflow は orphan のため REST 削除が 404 で、`gh workflow disable` により disabled_manually にした。develop へリリースマージを戻して push 済み。
 
 ## 現況（v0.4.15リリース準備）
 

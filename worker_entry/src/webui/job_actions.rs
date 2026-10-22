@@ -107,9 +107,6 @@ struct UpdateByTagBody {
 struct UpdateStartBody {
     #[serde(default)]
     #[allow(dead_code)]
-    asset_url: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
     variant: Option<String>,
 }
 

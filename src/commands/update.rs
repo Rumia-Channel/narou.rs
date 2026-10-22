@@ -1503,13 +1503,14 @@ async fn process_novel_for_update(
 
     let frozen = !ctx.opts.force && is_novel_frozen(id);
     if frozen {
-        if ctx.is_bulk {
-            return Ok(0);
+        // 凍結スキップは正常系。Web UI では個別更新でも「エラー」として
+        // 通知されていたため、終了コードへ加算しない (issue #43)。
+        if !ctx.is_bulk {
+            let title = get_novel_title(id);
+            ctx.sink
+                .emit(Stream::Stdout, &messages::update::frozen_id(id, title));
         }
-        let title = get_novel_title(id);
-        ctx.sink
-            .emit(Stream::Stdout, &messages::update::frozen_id(id, title));
-        return Ok(1);
+        return Ok(0);
     }
 
     if let Some(wait_secs) = remaining_update_interval_secs(

@@ -54,7 +54,20 @@ const SECTION_CONVERT_CACHE_DIR_NAME: &str = "section_convert_cache";
 /// ヘッダが無いファイルは旧形式 (生 YAML) として読む。
 #[cfg(feature = "native-runtime")]
 const SECTION_CONVERT_CACHE_MAGIC: &str = "narou-section-cache:v1";
+/// 旧形式キャッシュの移行をプロセス内で直列化する。
+///
+/// 一括更新はドメインごとに並列で変換するため、複数のスレッドが同時に
+/// 旧 `section_convert_cache.yaml` を移行し、後から来た側の `read_to_string`
+/// / `rename` が NotFound になって変換全体を失敗させていた (issue #39)。
+#[cfg(feature = "native-runtime")]
+static LEGACY_SECTION_CACHE_MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v4";
+/// 変換パイプライン自体の出力仕様バージョン。
+///
+/// セクション変換キャッシュのダイジェストに含める。設定に依らない変換結果の
+/// 修正 (issue #42 の行頭字下げなど) では設定シグネチャが変わらないため、
+/// これを上げないと古いキャッシュが使われ続けて修正が反映されない。
+const CONVERTER_PIPELINE_VERSION: &str = "converter-pipeline:v1";
 
 /// I/O capabilities used only by converter-side illustration localization.
 ///
@@ -167,10 +180,10 @@ pub fn materialize_for_conversion(
 
 /// 変換済みテキストを残すか (`convert.keep-txt`、既定 true)。
 ///
-/// false のときは `novel.txt` の固定名ミラーも SQLite の `novel_outputs`
-/// 行も残さず、呼び出し側が変換後の txt を削除する。Web UI のオンデマンド
-/// EPUB は保存済みの本文からその都度変換して組み立てる (二重に持たない
-/// ための設定)。環境変数 `NAROU_RS_KEEP_TXT=0` でも切れる。
+/// false のときは SQLite の `novel_outputs` 行も残さず、呼び出し側が変換後の
+/// txt を削除する。Web UI のオンデマンド EPUB は保存済みの本文からその都度
+/// 変換して組み立てる (二重に持たないための設定)。環境変数
+/// `NAROU_RS_KEEP_TXT=0` でも切れる。
 #[cfg(feature = "native-runtime")]
 pub fn keep_converted_text_file() -> bool {
     let local = crate::db::settings::load(crate::setting_core::SettingScope::Local).unwrap_or_default();
@@ -179,6 +192,25 @@ pub fn keep_converted_text_file() -> bool {
         std::env::var("NAROU_RS_KEEP_TXT").ok().as_deref(),
         true,
     )
+}
+
+/// 旧バージョンが小説ディレクトリへ書いていた固定名ミラー `novel.txt` を消す。
+///
+/// native の変換結果を読むのは per-title の txt と SQLite の `novel_outputs`
+/// だけで、`novel.txt` は ObjectStore 互換を目的にした内部ミラーだった
+/// (issue #40: `convert.keep-txt=true` で同じ内容の txt が 2 つ残っていた)。
+/// 変換出力自体が `novel.txt` という名前になる設定 (`convert.filename`) では
+/// 消さない。
+#[cfg(feature = "native-runtime")]
+fn remove_legacy_converted_text_mirror(novel_dir: &Path, txt_path: &Path) {
+    let output_uses_mirror_name = txt_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("novel.txt"));
+    if output_uses_mirror_name {
+        return;
+    }
+    let _ = std::fs::remove_file(novel_dir.join("novel.txt"));
 }
 
 /// セクション変換キャッシュを作るか。
@@ -694,6 +726,7 @@ impl NovelConverter {
         hasher.update(self.compute_converter_signature().as_bytes());
         hasher.update(target_device_cache_key(self.target_device).as_bytes());
         hasher.update(ILLUSTRATION_LOCALIZATION_VERSION.as_bytes());
+        hasher.update(CONVERTER_PIPELINE_VERSION.as_bytes());
         hex::encode(hasher.finalize())
     }
 
@@ -848,7 +881,14 @@ impl NovelConverter {
         source: &str,
     ) -> Option<String> {
         if !is_remote_illustration_source(source) {
-            return Some(source.to_string());
+            // 上流 HTML の `<img src>` はローカル挿絵の参照にもなるが、絶対パスや
+            // `..` を通すと EPUB 書き出し時に小説フォルダ外のファイルを読ませられる。
+            // 安全な相対パスだけを残し、それ以外は挿絵ごと落とす。
+            if is_safe_relative_illustration_source(source) {
+                return Some(source.to_string());
+            }
+            tracing::debug!("安全な相対パスではない挿絵の参照を破棄します: {source:?}");
+            return None;
         }
 
         let has_injected_assets = self
@@ -1089,20 +1129,19 @@ impl NovelConverter {
             record.as_ref(),
         );
         std::fs::write(&txt_path, &aozora_text)?;
+        // 旧バージョンが書いた固定名ミラー `novel.txt` を片付ける (issue #40)。
+        remove_legacy_converted_text_mirror(novel_dir, &txt_path);
         #[cfg(feature = "native-runtime")]
         {
             self.last_text_path = Some(txt_path.clone());
         }
         #[cfg(feature = "lite")]
         {
-            // Fixed-name mirror so the portable object-store layout (and the
-            // Worker's download-time EPUB) can address the text without the
-            // per-title output naming rules. `convert.keep-txt=false` では
-            // ファイルも DB の `converted_text` も残さない (EPUB は都度変換)。
+            // native は per-title txt と SQLite の `novel_outputs` だけを残す。
+            // ObjectStore 互換の固定名ミラー `<prefix>/novel.txt` は Worker の
+            // `ConvertService` (`application::convert`) が書き、native の読み手は
+            // いない (issue #40: 同じ内容の txt が 2 つ残っていた)。
             let keep_text = keep_converted_text_file();
-            if keep_text {
-                let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
-            }
             if !crate::native::sqlite::state::legacy_yaml_active() {
                 let narou_dir = novel_dir
                     .ancestors()
@@ -1206,16 +1245,18 @@ impl NovelConverter {
             record.as_ref(),
         );
         std::fs::write(&txt_path, &aozora_text)?;
+        // 旧バージョンが書いた固定名ミラー `novel.txt` を片付ける (issue #40)。
+        remove_legacy_converted_text_mirror(novel_dir, &txt_path);
         #[cfg(feature = "native-runtime")]
         {
             self.last_text_path = Some(txt_path.clone());
         }
         #[cfg(feature = "lite")]
         {
+            // native は固定名ミラーを書かない (issue #40)。変換済みテキストは
+            // SQLite `novel_outputs` にだけ残し、`convert.keep-txt=false` では
+            // 行も残さない (EPUB は都度変換)。
             let keep_text = keep_converted_text_file();
-            if keep_text {
-                let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
-            }
             // P4a/P4b mirror: converted text + mirrored working set + version
             // snapshot live in the SQLite backend when active.
             if !crate::native::sqlite::state::legacy_yaml_active() {
@@ -1434,6 +1475,29 @@ impl NovelConverter {
     }
 }
 
+/// 上流 HTML が持ち込んだローカル挿絵の参照が安全な相対パスかを判定する。
+///
+/// この参照は最終的に EPUB の `<img src>` として小説フォルダ基準で読まれる。
+/// 絶対パス・Windows のドライブ/UNC 接頭辞・`..` を含む参照を許すと、上流の
+/// HTML から小説フォルダ外のファイルを EPUB に取り込ませられるため拒否する。
+/// `挿絵/1.png` や `i123.jpg` のような通常の相対名はそのまま通す。
+#[cfg(feature = "native-runtime")]
+fn is_safe_relative_illustration_source(source: &str) -> bool {
+    let source = source.trim();
+    if source.is_empty() || source.contains('\0') {
+        return false;
+    }
+    // 区切りを揃えてから、Windows 流の `..\` も含めて判定する。
+    let normalized = source.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return false; // 絶対パス (UNC の `\\server\share` もここへ来る)
+    }
+    if normalized.as_bytes().get(1) == Some(&b':') {
+        return false; // ドライブ接頭辞 (`C:/...` / `C:...`)
+    }
+    !normalized.split('/').any(|part| part == "..")
+}
+
 fn target_device_cache_key(device: Option<device::Device>) -> &'static str {
     match device {
         Some(device::Device::Text) => "device:text",
@@ -1609,6 +1673,12 @@ fn save_section_convert_bucket(id: &str, bucket: &HashMap<String, CacheEntry>) -
 
 #[cfg(feature = "native-runtime")]
 fn migrate_legacy_section_convert_cache() -> Result<()> {
+    // 並列変換の各スレッドから呼ばれる。ロック無しだと、先に移行したスレッドが
+    // 旧ファイルを rename した直後に別スレッドの read/rename が NotFound になり、
+    // 変換が IO error で失敗する (issue #39)。
+    let _guard = LEGACY_SECTION_CACHE_MIGRATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let legacy_path = crate::db::with_database(|db| {
         Ok(db
             .inventory()
@@ -1620,7 +1690,12 @@ fn migrate_legacy_section_convert_cache() -> Result<()> {
         return Ok(());
     }
 
-    let raw = std::fs::read_to_string(&legacy_path)?;
+    let raw = match std::fs::read_to_string(&legacy_path) {
+        Ok(raw) => raw,
+        // 別プロセスが先に移行した場合。キャッシュは再生成可能なので無視する。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(NarouError::Io(error)),
+    };
     if raw.trim().is_empty() {
         rename_legacy_section_convert_cache(&legacy_path)?;
         return Ok(());
@@ -1638,9 +1713,15 @@ fn rename_legacy_section_convert_cache(path: &Path) -> Result<()> {
     match std::fs::rename(path, &migrated_path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(path)?;
-            Ok(())
+            // 既に移行済みファイルがある環境。旧ファイルを消して完了扱い。
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(NarouError::Io(e)),
+            }
         }
+        // 別プロセスが先に移行した。変換結果には影響しない。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(NarouError::Io(e)),
     }
 }
@@ -1973,6 +2054,63 @@ mod tests {
     }
 
     #[test]
+    fn legacy_section_convert_cache_migration_is_thread_safe() {
+        // 一括更新は複数ドメインを並列変換するため、旧キャッシュ移行が同時に
+        // 走っても IO error にならないことを固定する (issue #39)。
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+
+        let mut legacy = std::collections::HashMap::new();
+        legacy.insert(
+            "1".to_string(),
+            std::collections::HashMap::from([(
+                "本文\\1.yaml".to_string(),
+                make_cache_entry("one"),
+            )]),
+        );
+        std::fs::write(
+            temp.path()
+                .join(".narou")
+                .join("section_convert_cache.yaml"),
+            serde_yaml::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        let results = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| scope.spawn(super::migrate_legacy_section_convert_cache))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            results.iter().all(|result| result.is_ok()),
+            "concurrent migration failed: {results:?}"
+        );
+        assert!(
+            temp.path()
+                .join(".narou")
+                .join("section_convert_cache")
+                .join("1.yaml")
+                .is_file()
+        );
+        assert!(
+            !temp
+                .path()
+                .join(".narou")
+                .join("section_convert_cache.yaml")
+                .exists()
+        );
+
+        *crate::db::DATABASE.lock() = None;
+    }
+
+    #[test]
     fn a_disabled_cache_writes_nothing_and_clears_what_exists() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
@@ -2193,6 +2331,61 @@ mod tests {
             resolved.body.matches(r#"src="挿絵/i422674.jpg""#).count(),
             2
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 上流 HTML の `<img src>` が絶対パス・ドライブ/UNC 接頭辞・`..` で
+    /// 小説フォルダの外を指しても、ローカル挿絵として採用しない。
+    /// 通常の相対名 (`挿絵/1.png` / `i123.jpg`) は従来どおり残す。
+    #[test]
+    fn localize_section_html_illustrations_drops_unsafe_local_sources() {
+        let root = make_temp_illustration_root();
+        std::fs::create_dir_all(root.join("挿絵")).unwrap();
+
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            ..NovelSettings::default()
+        };
+        let mut section = make_illustration_section();
+        section.element.body = concat!(
+            r#"<p>安全</p><p><img src="挿絵/1.png" alt="safe"></p>"#,
+            r#"<p><img src="i123.jpg"></p>"#,
+            r#"<p><img src="../escape.png"></p>"#,
+            r#"<p><img src="..\escape.png"></p>"#,
+            r#"<p><img src="/etc/x.png"></p>"#,
+            r#"<p><img src="C:/Users/x.png"></p>"#,
+            r#"<p><img src="\\server\share\x.png"></p>"#,
+            r#"<p><img src="挿絵/../../escape.png"></p>"#,
+        )
+        .to_string();
+
+        let mut converter = NovelConverter::new(settings);
+        let resolved = converter.resolve_section_html_illustrations(&section);
+
+        assert!(
+            resolved.body.contains(r#"src="挿絵/1.png""#),
+            "{}",
+            resolved.body
+        );
+        assert!(
+            resolved.body.contains(r#"src="i123.jpg""#),
+            "{}",
+            resolved.body
+        );
+        for unsafe_source in [
+            "escape.png",
+            "/etc/x.png",
+            "C:/Users/x.png",
+            "server\\share",
+            "挿絵/../../",
+        ] {
+            assert!(
+                !resolved.body.contains(unsafe_source),
+                "unsafe local source survived: {unsafe_source} in {}",
+                resolved.body
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2420,4 +2613,334 @@ before_settings:
         assert_ne!(user_converter_digest, user_converter_variant_digest);
     }
 
+    /// 本文 1 話だけの小説として変換し、レンダリング後の全文を返す。
+    fn convert_body_text(settings: NovelSettings, body: &str) -> String {
+        let toc = TocObject {
+            title: "タイトル".to_string(),
+            author: "作者".to_string(),
+            toc_url: String::new(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+        let section = SectionFile {
+            index: "1".to_string(),
+            href: "1".to_string(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: "第一話".to_string(),
+            file_subtitle: "第一話".to_string(),
+            subdate: String::new(),
+            subupdate: None,
+            download_time: None,
+            element: SectionElement {
+                data_type: "text".to_string(),
+                introduction: String::new(),
+                postscript: String::new(),
+                body: body.to_string(),
+            },
+        };
+        NovelConverter::new(settings)
+            .convert_novel(&toc, &[section])
+            .unwrap()
+    }
+
+    /// `setting.ini` (小説ごとの設定は `[global]` セクション) と
+    /// `local_setting` の `default.*` / `force.*` から、`cmd_convert` と
+    /// 同じ手順 (`NovelSettings::from_sources`) で設定を組む。
+    fn convert_settings(
+        ini_text: &str,
+        local_settings: &[(&str, serde_yaml::Value)],
+    ) -> NovelSettings {
+        let ini = crate::converter::ini::IniData::load(ini_text);
+        let local_settings: HashMap<String, serde_yaml::Value> = local_settings
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect();
+        NovelSettings::from_sources(
+            Some(1),
+            "タイトル",
+            "作者",
+            &ini,
+            &local_settings,
+            false,
+            false,
+        )
+    }
+
+    /// issue #42: 行頭かぎ括弧への二分アキが既定で付き、`setting.ini` の
+    /// `enable_half_indent_bracket = false` で無効になること。
+    ///
+    /// 以前は行頭処理の内部マーカー (`\u{E000}`) が `half_indent_bracket` /
+    /// `auto_indent` の正規表現を必ず外していたため、設定値に関係なく
+    /// どちらも本文へ反映されなかった。
+    #[test]
+    fn half_indent_bracket_follows_default_and_per_novel_settings() {
+        let body = "「かぎ括弧の行です」\n（丸括弧の行です）\n　字下げ済みの行です。\n　字下げ済みの行です。\n　字下げ済みの行です。";
+
+        let default_text = convert_body_text(convert_settings("", &[]), body);
+        assert!(
+            default_text.contains("［＃二分アキ］「かぎ括弧の行です」"),
+            "既定の enable_half_indent_bracket が効いていない:\n{default_text}"
+        );
+        assert!(
+            default_text.contains("［＃二分アキ］（丸括弧の行です）"),
+            "全角丸括弧の行に二分アキが付いていない:\n{default_text}"
+        );
+
+        let disabled_text = convert_body_text(
+            convert_settings("[global]\nenable_half_indent_bracket = false\n", &[]),
+            body,
+        );
+        assert!(
+            !disabled_text.contains("［＃二分アキ］"),
+            "setting.ini の enable_half_indent_bracket = false が効いていない:\n{disabled_text}"
+        );
+    }
+
+    /// issue #42: `enable_force_indent` が setting.ini (`[global]`) /
+    /// `local_setting` の `default.*` / `force.*` のどの経路でも効くこと。
+    #[test]
+    fn force_indent_applies_from_every_settings_scope() {
+        let body = "　字下げ済みの行です。\n　字下げ済みの行です。\n　字下げ済みの行です。\n字下げのない行です。";
+
+        // 既定 (auto_indent の判定も字下げ率が低いので働かない) では付かない。
+        let unforced = convert_body_text(convert_settings("", &[]), body);
+        assert!(
+            unforced.contains("\n字下げのない行です。"),
+            "enable_force_indent=false で字下げされている:\n{unforced}"
+        );
+
+        let per_novel = convert_body_text(
+            convert_settings("[global]\nenable_force_indent = true\n", &[]),
+            body,
+        );
+        assert!(
+            per_novel.contains("\n　字下げのない行です。"),
+            "setting.ini の enable_force_indent が効いていない:\n{per_novel}"
+        );
+
+        let default_scope = convert_body_text(
+            convert_settings(
+                "",
+                &[(
+                    "default.enable_force_indent",
+                    serde_yaml::Value::Bool(true),
+                )],
+            ),
+            body,
+        );
+        assert!(
+            default_scope.contains("\n　字下げのない行です。"),
+            "local_setting の default.enable_force_indent が効いていない:\n{default_scope}"
+        );
+
+        let force_scope = convert_body_text(
+            convert_settings(
+                "[global]\nenable_force_indent = false\n",
+                &[(
+                    "force.enable_force_indent",
+                    serde_yaml::Value::Bool(true),
+                )],
+            ),
+            body,
+        );
+        assert!(
+            force_scope.contains("\n　字下げのない行です。"),
+            "local_setting の force.enable_force_indent が効いていない:\n{force_scope}"
+        );
+    }
+
+    /// issue #42: 既定で有効な `enable_auto_indent` が本文に効き、
+    /// setting.ini で無効にできること。
+    #[test]
+    fn auto_indent_follows_default_and_per_novel_settings() {
+        let body = "字下げのない行です。\nもう一つの字下げのない行です。\n三つ目の字下げのない行です。";
+
+        let auto_text = convert_body_text(convert_settings("", &[]), body);
+        assert!(
+            auto_text.contains("\n　字下げのない行です。"),
+            "既定の enable_auto_indent が効いていない:\n{auto_text}"
+        );
+
+        let manual_text = convert_body_text(
+            convert_settings("[global]\nenable_auto_indent = false\n", &[]),
+            body,
+        );
+        assert!(
+            manual_text.contains("\n字下げのない行です。"),
+            "{manual_text}"
+        );
+        assert!(
+            !manual_text.contains("\n　字下げのない行です。"),
+            "setting.ini の enable_auto_indent = false が効いていない:\n{manual_text}"
+        );
+    }
+
+    /// `NAROU_RS_KEEP_TXT` をテストの間だけ固定する。
+    ///
+    /// `set_current_dir_for_test` がプロセス全体の状態ロックを保持している
+    /// 間だけ書き換える。
+    #[cfg(feature = "native-runtime")]
+    struct KeepTxtEnvGuard(Option<std::ffi::OsString>);
+
+    #[cfg(feature = "native-runtime")]
+    impl KeepTxtEnvGuard {
+        fn new(value: &str) -> Self {
+            let previous = std::env::var_os("NAROU_RS_KEEP_TXT");
+            // SAFETY: 状態ロックを保持している間だけ環境変数を変更する。
+            unsafe { std::env::set_var("NAROU_RS_KEEP_TXT", value) };
+            Self(previous)
+        }
+    }
+
+    #[cfg(feature = "native-runtime")]
+    impl Drop for KeepTxtEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: 同上。
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("NAROU_RS_KEEP_TXT", value),
+                    None => std::env::remove_var("NAROU_RS_KEEP_TXT"),
+                }
+            }
+        }
+    }
+
+    /// 変換できる最小の小説ディレクトリ (`toc.yaml` + 本文 1 話) を作る。
+    #[cfg(feature = "native-runtime")]
+    fn write_convertible_novel(root: &std::path::Path) -> std::path::PathBuf {
+        let novel_dir = root.join("小説データ").join("site").join("n1234ab");
+        std::fs::create_dir_all(novel_dir.join("本文")).unwrap();
+        let subtitle = crate::downloader::SubtitleInfo {
+            index: "1".to_string(),
+            href: "/1/".to_string(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: "第一話".to_string(),
+            file_subtitle: "第一話".to_string(),
+            subdate: "2026-01-01 00:00:00".to_string(),
+            subupdate: None,
+            download_time: None,
+        };
+        let toc = crate::downloader::TocFile {
+            title: "作品タイトル".to_string(),
+            author: "作者名".to_string(),
+            toc_url: "https://example.com/novel/1".to_string(),
+            story: None,
+            subtitles: vec![subtitle.clone()],
+            novel_type: Some(2),
+        };
+        std::fs::write(
+            novel_dir.join("toc.yaml"),
+            serde_yaml::to_string(&toc).unwrap(),
+        )
+        .unwrap();
+        let section = SectionFile {
+            index: subtitle.index.clone(),
+            href: subtitle.href.clone(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: subtitle.subtitle.clone(),
+            file_subtitle: subtitle.file_subtitle.clone(),
+            subdate: subtitle.subdate.clone(),
+            subupdate: None,
+            download_time: None,
+            element: SectionElement {
+                data_type: "text".to_string(),
+                introduction: String::new(),
+                postscript: String::new(),
+                body: "　本文の一行目。\n　本文の二行目。".to_string(),
+            },
+        };
+        std::fs::write(
+            novel_dir
+                .join("本文")
+                .join(format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle)),
+            serde_yaml::to_string(&section).unwrap(),
+        )
+        .unwrap();
+        novel_dir
+    }
+
+    /// issue #40: `convert.keep-txt=true` の変換は per-title の txt だけを
+    /// 残し、ObjectStore 互換の固定名ミラー `novel.txt` を小説ディレクトリへ
+    /// 重複させないこと。旧バージョンが残したミラーも次の変換で片付ける。
+    #[cfg(feature = "native-runtime")]
+    #[test]
+    fn convert_by_id_leaves_only_the_per_title_text_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let _dir = crate::test_support::set_current_dir_for_test(temp.path());
+        let _keep = KeepTxtEnvGuard::new("1");
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        let novel_dir = write_convertible_novel(temp.path());
+        let settings = NovelSettings::load_for_novel(1, "作品タイトル", "作者名", &novel_dir);
+        let mut converter = NovelConverter::new(settings);
+        let txt_path = converter.convert_novel_by_id(1, &novel_dir).unwrap();
+
+        assert!(std::path::Path::new(&txt_path).is_file(), "{txt_path}");
+        assert_eq!(
+            converter
+                .last_converted_text_path()
+                .map(|path| path.to_path_buf()),
+            Some(std::path::PathBuf::from(&txt_path))
+        );
+        let mirror = novel_dir.join("novel.txt");
+        assert!(
+            !mirror.exists(),
+            "per-title txt 以外に固定名ミラーを残してはいけない: {}",
+            mirror.display()
+        );
+
+        // 旧バージョンが書いた重複ミラーは、次回の変換で消える。
+        std::fs::write(&mirror, std::fs::read(&txt_path).unwrap()).unwrap();
+        let mut converter = NovelConverter::new(NovelSettings::load_for_novel(
+            1,
+            "作品タイトル",
+            "作者名",
+            &novel_dir,
+        ));
+        converter.convert_novel_by_id(1, &novel_dir).unwrap();
+        assert!(
+            !mirror.exists(),
+            "旧バージョンの固定名ミラーが残っている: {}",
+            mirror.display()
+        );
+
+        *crate::db::DATABASE.lock() = None;
+    }
+
+    /// issue #40: `convert.keep-txt=false` では固定名ミラーを作らず、
+    /// 変換済みテキストも保存しないこと (device 出力用の per-title txt は
+    /// 変換時に書き、後始末はコマンド層の既存契約に任せる)。
+    #[cfg(feature = "native-runtime")]
+    #[test]
+    fn convert_by_id_writes_no_converted_text_when_keep_txt_is_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let _dir = crate::test_support::set_current_dir_for_test(temp.path());
+        let _keep = KeepTxtEnvGuard::new("0");
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        std::fs::write(
+            temp.path()
+                .join(".narou")
+                .join("local_setting.yaml"),
+            "convert.keep-txt: false\n",
+        )
+        .unwrap();
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        let novel_dir = write_convertible_novel(temp.path());
+        let settings = NovelSettings::load_for_novel(1, "作品タイトル", "作者名", &novel_dir);
+        let mut converter = NovelConverter::new(settings);
+        let txt_path = converter.convert_novel_by_id(1, &novel_dir).unwrap();
+
+        assert!(std::path::Path::new(&txt_path).is_file(), "{txt_path}");
+        assert!(!novel_dir.join("novel.txt").exists());
+
+        *crate::db::DATABASE.lock() = None;
+    }
 }

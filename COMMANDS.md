@@ -236,7 +236,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - カクヨムは各話の `publishedAt` を初回掲載日時、`editedAt`（無い場合は `publishedAt`）を `subupdate` として扱い、本文改稿のみの通常 Update でも対象話を更新する
 - `update.convert-only-new-arrival` 設定対応（YAMLの真偽値/文字列/数値を許容）
 - `last_check_date` 追跡
-- `download.choices-of-digest-options` 設定対応。Ruby版と同じ 1-8 のダイジェスト化選択肢を処理し、キャンセル・凍結・バックアップ・あらすじ表示・ブラウザ起動・保存フォルダ起動・変換を実行
+- `download.choices-of-digest-options` 設定対応。Ruby版と同じ 1-8 のダイジェスト化選択肢を処理し、キャンセル・凍結・バックアップ・あらすじ表示・ブラウザ起動・保存フォルダ起動・変換を実行。4-8 の非終端アクションを指定した後は更新を継続する (暗黙のキャンセルは行わない)
 - ダイジェスト化キャンセル時は `UpdateStatus::Canceled` を返し、`update` / `download` コマンド側でRuby版相当のキャンセル表示と終了コード加算を行う
 - 差分更新時は Ruby版同様 `本文/cache/<timestamp>/` に旧sectionを退避し、差分が無い場合は空cacheディレクトリを削除
 - download/update 共通の差分退避は旧目次のファイル名を参照する。各話の題名変更でも SQLite の旧本文を `本文/cache/` へ保存し、新題名で更新した後の差分なし再更新・章題変更も処理できる（issue #32）。保存先を `diff` が参照する Ruby版互換の `cache/` に統一
@@ -359,6 +359,10 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 **データ管理方式 (YAML / SQLite)**: 設定ページの WEB UI タブに「データ管理方式」があり、現在のモード表示・SQLite 管理への移行・YAML 管理への復帰ができる。API は `GET/POST /api/storage/mode` (実装 `src/web/storage.rs`、`narou db export-yaml --in-place` と同じ書き出しを先に行う)。`NAROU_RS_LEGACY_YAML=1` のときは固定され、API は `locked_by_env: true` を返す。
 
 **書き出し形式**: `version`/`exported_at`/`library`/`encrypted`/`kdf`/`salt`/`payload`/`sites` を持つ YAML エンベロープ (version 3)。`narou_rs_login --export <file>` が生成し、ライブラリ外ではそれが既定の出力になる。version 2 (`credentials:` にホストごとの 1 本) と version 1 (`cookies:` のホスト→Cookie マップ) も読み取り可能。
+
+**書き出しの保護**: `--passphrase` は 8 文字以上を要求し、空文字・短すぎる値では書き出さない (取り込みは旧ファイル互換のため任意長のパスフレーズを受け付ける)。書き出しファイルは Unix では 0600 で作成し、既存のシンボリックリンクは追従しない。
+
+**ブラウザ取得**: `narou_rs_login` は `--remote-debugging-port=0` で起動し、`<profile>/DevToolsActivePort` と `/json/version` の WebSocket URL が起動したブラウザの port/host/path と一致することを確認してから Cookie を取得する (`--port` で固定ポートを明示した場合も port 一致を確認)。
 
 **ヘルプ**: トップレベル一覧と `narou login -h` は実装と同期している。`-h` の `<sub>` 一覧は `list`/`import`/`export`/`rename`/`order`/`clear` を、Examples は `rename`・`order`・`clear --index` を含む主要形を、オプション一覧は `--passphrase`/`--replace`/`--clear-text`/`--name`/`--index` を表示する。
 **Web UI**: 設定ページ「ログイン」タブで一覧 (サイト → 名前つきログイン)・取り込み (名前欄つき。空欄ならファイル名を使用)・名前変更・並べ替え (上下ボタン)・1 件削除・サイト削除・全削除。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET /api/login`、`POST /api/login/import`、`POST /api/login/rename`、`POST /api/login/order`、`DELETE /api/login`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}`。

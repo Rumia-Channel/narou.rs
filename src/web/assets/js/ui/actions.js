@@ -653,7 +653,15 @@ export function bindActions() {
 
   on('action-update-force', (e) => {
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postSortedJson('/api/update', { update_all: true, force: true });
+      const total = Array.isArray(State.novels) ? State.novels.length : 0;
+      const selectedCount = State.selectedIds.size;
+      const allSelected = total > 0 && selectedCount >= total;
+      const result = (selectedCount > 0 && !allSelected)
+        ? await postSortedJson('/api/update', {
+          targets: [...State.selectedIds],
+          force: true,
+        })
+        : await postSortedJson('/api/update', { update_all: true, force: true });
       assertApiSuccess(result, '強制アップデート要求の送信に失敗しました');
     }, '強制アップデート要求の送信に失敗しました');
   });

@@ -971,12 +971,31 @@ impl Downloader {
 
             let mut auto_choices = crate::compat::load_digest_auto_choices();
 
+            // 進捗バー (CLI) がダイアログ表示を上書きしないよう、選択待ちの
+            // 間だけ描画を止める。Web の ProgressReporter は no-op。
+            let choose = |auto_choices: &mut Option<std::collections::VecDeque<String>>,
+                          message: &str| {
+                let mut selected = None;
+                if let Some(progress) = self.progress.as_deref() {
+                    progress.with_suspended(&mut || {
+                        selected = Some(crate::compat::choose_digest_action_with_auto_choices(
+                            title,
+                            message,
+                            auto_choices,
+                        ));
+                    });
+                }
+                selected.unwrap_or_else(|| {
+                    crate::compat::choose_digest_action_with_auto_choices(
+                        title,
+                        message,
+                        auto_choices,
+                    )
+                })
+            };
+
             loop {
-                match crate::compat::choose_digest_action_with_auto_choices(
-                    title,
-                    &message,
-                    &mut auto_choices,
-                ) {
+                match choose(&mut auto_choices, &message) {
                     crate::compat::DigestChoice::Update => return Ok(false),
                     crate::compat::DigestChoice::Cancel => return Ok(true),
                     crate::compat::DigestChoice::CancelAndFreeze => {

@@ -211,6 +211,16 @@ impl ProgressReporter for CliProgress {
             self.pb.println(msg);
         }
     }
+
+    fn with_suspended(&self, action: &mut dyn FnMut()) {
+        // ダイジェスト選択ダイアログ等の表示中はスピナーがプロンプトを
+        // 上書きしないよう、indicatif の suspend でバー描画を止める。
+        if let Some(ref multi) = self.multi {
+            multi.suspend(action);
+        } else {
+            self.pb.suspend(action);
+        }
+    }
 }
 
 impl Drop for CliProgress {

@@ -549,65 +549,67 @@ Worker (worker_entry)
 レンジを弾くサイト（例: CloudFront 配信のカクヨム）でも後者なら 200 が返る。ソケット側で
 2xx/3xx が得られたときだけ採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。
 **全アドレスが Cloudflare の公開レンジ内にあるサイト（例: ハーメルン）は `connect()` 自体が
-ランタイムに拒否される**ため、別の出口 IP を持つ外部の踏み台（`scripts/relay/`）が別途必要。
+ランタイムに拒否される**ため、別の出口 IP を持つ外部の踏み台（取得リレー）が別途必要。
 
 #### 3 段目: 外部リレー
 
 Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト向けに、外部の取得リレーを
 3 段目に持つ。リレーのホスティングと配置・更新は、本体の CI から独立して管理する。
 
-- プロトコルは `src/platform/relay.rs`。`POST /proxy` の JSON 本文で `url` と `headers` を送り、
-  `X-Proxy-Token` で認証する。GET も受け付けるが、Cookie 等を URL に載せない。
-- `worker_entry/src/http.rs` は既存の `with_relay` と `platform::http1` の生ソケットで送信する。
-  サイト定義のヘッダを転送し、返ったリダイレクトは呼び出し側の共通 `RedirectChain` が検証する。
+- リレーはワークスペース crate **`relay/`** のバイナリ **`narou_relay`**（Rust）。
+  旧 Node 実装 (`scripts/relay/*.mjs` / `relay.js` / `worker/`) は削除した。
+- プロトコルは旧版と同一で、クライアント側は `src/platform/relay.rs`。`POST /proxy` の
+  JSON 本文で `url` と `headers` を送り、`X-Proxy-Token` で認証する。GET も受け付けるが、
+  Cookie 等を URL に載せない。応答は `{status, contentType, location?, setCookie, via, body(base64)}`、
+  エラーは `{"error": "..."}`。`GET /health` は認証不要で
+  `{"ok":true,"fetch":"curl,wget"}`（実際の解決済み取得順）を返す。
+- `worker_entry/src/http.rs` は既存の `with_relay` と、Worker の通常の fetch サブリクエスト
+  （`send_fetch_hop`）で送信する。サイト定義のヘッダを転送し、返ったリダイレクトは
+  呼び出し側の共通 `RedirectChain` が検証する。
 - 応答の JSON/base64、全 `Set-Cookie`、ステータス、本文・メタデータの上限は従来どおり。
   踏み台自身はリダイレクトを追跡せず、本文の途中切れを成功として返さない。
 - Worker の設定は `NAROU_RELAY_ENDPOINT` と `NAROU_RELAY_KEY`。両方が揃ったときだけ有効。
-  接続先は `http` / `https` に対応し、パスを含んでもオリジンに正規化して `/proxy` へ送る。
-  未設定ならリレー段は無効で、取得できないサイトが残り得る。
+  接続先は `https` を必須とし (ループバック `127.0.0.1` / `::1` / `localhost` のみ `http` 可)、
+  スキーム省略は受け付けない。パスを含んでもオリジンに正規化して `/proxy` へ送る。
+  未設定・不正値ならリレー段は無効 (fail closed) で、取得できないサイトが残り得る。
 
-#### Cloud Run Buildpacks（採用先）
+#### リレーのトランスポート
 
-`scripts/relay/` の通常の Node.js 24 HTTP サービスを Developer Connect / Cloud Build で
-`develop` から配備する。`package.json` の `npm start` が `node server.mjs` を実行し、
-Functions Framework・Dockerfile・GHCR は使わない。ビルド文脈は `/scripts/relay`、
-entrypoint / function target は空欄。詳しい設定値・Secret Manager・検証・停止手順は
-[`cloud-run-relay.md`](cloud-run-relay.md) を参照する。
+リレー自身は TLS / HTTP の実装を持たず、**システムの `curl` / `wget`** に委ねる
+（Node の HTTP クライアントによる代替経路と fetch ランタイム版は廃止）。
 
-`K_SERVICE` のある環境は `0.0.0.0:$PORT`、ローカルは従来の loopback で待ち受ける。
-鍵未設定では起動せず、`NAROU_RELAY_ALLOWED_HOSTS` 未設定では外部取得を拒否する。
-許可ホストの全 DNS 応答を検証し、curl の `--resolve` と代替 HTTP(S) の lookup で
-接続先を固定する。代替経路も TLS 検証・非追跡・本文上限を守り、安全性を迂回しない。
-curl の HTTP 403 を実行障害とは扱わず、認証情報や stderr を診断へ載せない。
-全体75秒の期限とクライアント切断で子プロセス・HTTP 接続を中断する。
+- 取得順は `NAROU_RELAY_FETCH`（`curl` / `wget` のカンマ区切り、既定 `curl,wget`）。
+  使えない wget は起動時に外れ、`/health` の `fetch` と起動ログに出る。未知の名前は起動エラー。
+- `curl` は検証済みアドレスへ `--resolve` で接続先を固定する。
+- `wget` は HTTPS のみ。検証済み IP へ接続する使い捨て CONNECT プロキシを 127.0.0.1 に立て、
+  TLS の SNI・証明書検証は wget に任せる（`--resolve` 相当が無いため）。HTTP 対象は curl が扱う。
+- **セキュリティ不変条件**（旧版から維持）: 許可ホストの完全一致のみ、DNS 応答の全アドレス検証と
+  接続先固定、リダイレクトを追わない、TLS は curl / wget が検証（任意の `NAROU_RELAY_CACERT` で
+  既定ストアを置換）、起動時の CA バンドル検証は fail closed（`relay/src/ca.rs` の SHA-256 指紋
+  デナイリスト）、1 リクエストにつき上流取得 1 回、全体 75 秒の期限とクライアント切断で
+  curl / wget の子プロセスを中断。
+- **サーバー側の防御**: 認証は本文読み取りより先に行い、未認証・`/proxy` 以外・不正メソッドは
+  本文を読まずに 4xx で閉じる（75 秒期限まで接続を保持させない）。同時接続数には上限
+  （128）を設け、完了した接続タスクは accept ごとに回収する（`JoinSet` の無制限保持を防ぐ）。
+  wget 経路はローカル CONNECT プロキシのトンネル確立を確認してから応答を採用する。
+  `NAROU_RELAY_CACERT` 未設定時は起動時に、侵害ルート検査が無効である旨を警告する。
+- 外部 npm 依存は無い。ビルドは `cargo build --release -p narou_relay`。
 
-Cloudflare 本体の配備とは独立し、GitHub Actions に GCP 認証や配備ジョブを追加しない。
-実 Cloud Run の Buildpacks ビルド・再配備・curl・日本の出口判定・対象サイト応答と、
-その URL への Worker HTTPS socket は未検証。ローカル成功をこれらの証明にはしない。
+#### デプロイ先
 
-#### 任意の外部サーバー（単体 Node 版）
+- **VPS リレー**: [`relay.md`](../relay.md)（現行デプロイ `relay.rumia-ch.uk`）と
+  [`vps-relay.md`](vps-relay.md)（一般手順）。systemd で `target/release/narou_relay` を常駐させる。
+- **自宅回線リレー**: [`home-relay.md`](home-relay.md) と `scripts/relay/home-relay.ps1`。
+  Windows で `narou_relay` と cloudflared クイックトンネルをまとめて起動する。
+- Cloud Run / SORAHOST へのリレー配備は 2026-10-21 に非推奨として廃止し、配備スクリプト・
+  ドキュメント（`scripts/relay/bootstrap.mjs` / `deploy-sorahost.mjs` / `relay.js` /
+  `docs/cloud-run-relay.md` / `docs/sorahost-relay.md`）も削除した。
+- 本体 CI はリレーのホスト作成・配備・認証確認を行わない。
 
-`scripts/relay/server.mjs` は Node.js と curl のある任意の外部サーバーで動かす。
-依存 npm パッケージは無い。`NAROU_RELAY_KEY` と取得先の `NAROU_RELAY_ALLOWED_HOSTS` を環境へ設定してから起動する:
-
-```sh
-node scripts/relay/server.mjs
-```
-
-待受は `127.0.0.1:${PORT:-3000}`。外部からは HTTPS のリバースプロキシを通す。
-`scripts/relay/worker/worker.mjs` は従来の fetch ランタイム用の契約検証対象として残す。
-Node 版に追加した許可リスト・DNS 固定を備える Cloud Run 配備の代替とはしない。
-
-**配備先ごとの差はコードに持ち込まない。** `scripts/relay/env.mjs` が
-`PORT` → `SERVER_PORT`、`NAROU_RELAY_HOST`（既定は `K_SERVICE` の有無で `0.0.0.0` / `127.0.0.1`）、
-`.env`（`NAROU_RELAY_ENV_FILE` → モジュールの隣 → `$HOME`。既存の環境変数が最優先）を解決し、
-`scripts/relay/transport.mjs` の `resolveCurl` が `NAROU_RELAY_CURL` → 同梱 curl（書き込み可能な場所へ
-コピー + 実行確認）→ PATH の curl の順に選ぶ。Cloud Run は環境変数だけ、PteWorker (SORAHOST) は
-`sorahost.json` に env を渡せないため `/home/container/.env` と同梱 curl を使う。
-SORAHOST への配備は `scripts/relay/deploy-sorahost.mjs` が配備フォルダーを組み立てる
-(ハッシュ検証済みの静的 curl と CA バンドルを同梱する)。手順は [`sorahost-relay.md`](sorahost-relay.md)、
-Cloud Run は [`cloud-run-relay.md`](cloud-run-relay.md) を参照する。
-両ホストの差は `tests/relay-hosting.test.mjs` が固定する。
+**配備先ごとの差はコードに持ち込まない。** 待受と `.env` の解決は `relay/src/config.rs` が
+吸収する（`PORT` → `SERVER_PORT`、`NAROU_RELAY_HOST` の既定は `K_SERVICE` の有無で
+`0.0.0.0` / `127.0.0.1`、`.env` は `NAROU_RELAY_ENV_FILE` → 実行時 CWD → バイナリの隣 →
+`$HOME`。既存の環境変数が最優先）。サーバー実装にホスト固有の分岐は足さない。
 
 GitHub の `Cloudflare` 環境には同名の Secret `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` を置く。`RELAY_DOMAIN`（例 `relay.example.com`）を置いた場合は `NAROU_RELAY_ENDPOINT` より優先して `https://<RELAY_DOMAIN>` を Worker secret に使う（`worker_entry/ci/deploy_worker.py`）。
 本体 CI はこれらを Worker に渡すだけで、リレーのホスト作成・配備・認証確認は実行しない。
@@ -619,8 +621,8 @@ GitHub の `Cloudflare` 環境には同名の Secret `NAROU_RELAY_ENDPOINT` / `N
 | 向き | 設定・契約 |
 | --- | --- |
 | Worker → リレー | `NAROU_RELAY_ENDPOINT` のオリジンへ `X-Proxy-Token: <NAROU_RELAY_KEY>` を送る |
-| リレー側 | 同じ `NAROU_RELAY_KEY` と照合。不一致は 403。Node 版は鍵未設定なら起動しない |
-| 死活確認 | 鍵を設定して起動したリレーの `GET /health` は認証なしで 200 `{ok:true}` |
+| リレー側 | 同じ `NAROU_RELAY_KEY` と照合。不一致は 403。リレーは鍵未設定なら起動しない |
+| 死活確認 | 鍵を設定して起動したリレーの `GET /health` は認証なしで 200 `{"ok":true,"fetch":"<取得順>"}` |
 
 合言葉がずれるとリレーは拒否し、Worker は元の取得結果へ戻るため、一部サイトの取得失敗として
 現れる。配置後は接続先と合言葉を環境に設定して手元で確認する:
@@ -630,11 +632,16 @@ python3 scripts/relay/verify_auth.py
 ```
 
 このコマンドは `/health`、誤った合言葉での 403、正しい合言葉での取得を確認する。
-検証用の取得先は `NAROU_RELAY_PROBE_URL`、制限秒数は `NAROU_RELAY_TIMEOUT` で変更できる。
-`node tests/run-relay.mjs` はローカル workerd の起動・終了も管理し、Node/curl と
-Worker の実 HTTP 契約、許可リスト・DNS・認証・TLS・上限・中断を検証する。
-Node.js 24・npm・curl が必要。外部 npm 依存の追加は不要。
-手動の単体起動は鍵と許可リストを設定して `npm start --prefix scripts/relay` を使う。
+取得先は `NAROU_RELAY_PROBE_URL`（未指定なら `NAROU_RELAY_ALLOWED_HOSTS` の先頭ホスト）、
+制限秒数は `NAROU_RELAY_TIMEOUT` で変更できる。
+到達不能・想定外のステータスは fail closed（exit 1）として扱い、3xx は追跡しない
+（`X-Proxy-Token` を別オリジンへ再送しないため）。公開エンドポイントは `https://` のみ受け付け、
+平文 HTTP は loopback のローカル確認だけ許可する。
+
+リレーのテストは Rust で、`cargo test -p narou_relay`（ワークスペース CI は
+`cargo test --workspace`）が実 HTTP 契約・許可リスト・DNS・認証・TLS・上限・中断を検証する。
+旧 `node tests/run-relay.mjs` と `tests/relay*.mjs` は削除した。
+手動の単体起動は鍵と許可リストを設定して `cargo run --release -p narou_relay` を使う。
 平文 HTTP では認証・Cookie も平文で流れるため、公開運用では HTTPS を使う。
 
 ### 操作ごとのメッセージ（native CLI / Worker Web コンソール）

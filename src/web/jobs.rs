@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -10,6 +11,7 @@ use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
 use crate::application::webui::{diff, queue_view, tag_views};
+use crate::db::inventory::{Inventory, InventoryScope};
 use crate::db::with_database_mut;
 use crate::downloader::types::SECTION_SAVE_DIR;
 use crate::queue::{
@@ -415,6 +417,48 @@ fn restorable_tasks_available(state: &AppState) -> bool {
     state.restorable_tasks_available.load(Ordering::Relaxed) && state.queue.has_restorable_tasks()
 }
 
+/// 中断した子プロセスでは `NovelLockGuard::drop` が走らないため、子が書いた
+/// `.narou/lock.yaml` のエントリだけが残る。`worker::pop_next_job` は新鮮な
+/// ロックを持つ小説のジョブを延期するので、中断したジョブの対象小説だけを
+/// ここで解放する。子が先に正常終了して既に消している場合もあるため冪等。
+fn release_novel_locks(novel_ids: &HashSet<i64>) {
+    if novel_ids.is_empty() {
+        return;
+    }
+    let released = Inventory::with_default_root().and_then(|inventory| {
+        inventory.update_yaml::<(), HashMap<i64, serde_yaml::Value>, _>(
+            "lock",
+            InventoryScope::Local,
+            |mut locked| {
+                for id in novel_ids {
+                    locked.remove(id);
+                }
+                Ok((locked, ()))
+            },
+        )
+    });
+    if let Err(error) = released {
+        log_web_failure("novel lock release", error);
+    }
+}
+
+/// `running_jobs` のうち `job_ids` のジョブが対象にしている小説 ID を集める。
+fn cancelled_novel_ids(
+    running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
+    job_ids: &[String],
+) -> HashSet<i64> {
+    let running = running_jobs.lock();
+    running
+        .iter()
+        .filter(|job| job_ids.contains(&job.id))
+        .flat_map(|job| crate::application::extract_novel_ids(&job.target))
+        .collect()
+}
+
+fn release_cancelled_novel_locks(state: &AppState, job_ids: &[String]) {
+    release_novel_locks(&cancelled_novel_ids(&state.running_jobs, job_ids));
+}
+
 fn kill_running_child(state: &AppState) {
     let jobs: Vec<(String, u32)> = {
         let mut guard = state.running_child_pids.lock();
@@ -422,10 +466,14 @@ fn kill_running_child(state: &AppState) {
         guard.clear();
         values
     };
+    let cancelled_ids: Vec<String> = jobs.iter().map(|(job_id, _)| job_id.clone()).collect();
     for (job_id, pid) in jobs {
         state.cancelled_job_ids.lock().insert(job_id);
         kill_process_tree(pid, &state.push_server);
     }
+    // kill は子の後始末 (`NovelLockGuard::drop`) を走らせない。残ったロックを
+    // 解放しないと同じ小説のジョブが 30 分間延期され続ける。
+    release_cancelled_novel_locks(state, &cancelled_ids);
 }
 
 fn kill_running_child_for_job(state: &AppState, job_id: &str) -> bool {
@@ -466,11 +514,18 @@ fn kill_running_child_for_job(state: &AppState, job_id: &str) -> bool {
     if running_pids.is_empty() {
         return cancelled_pending;
     }
+    let killed_job_ids: Vec<String> = running_pids
+        .iter()
+        .map(|(job_id, _)| job_id.clone())
+        .collect();
     let mut cancelled_job_ids = state.cancelled_job_ids.lock();
     for (running_job_id, pid) in running_pids {
         cancelled_job_ids.insert(running_job_id);
         kill_process_tree(pid, &state.push_server);
     }
+    drop(cancelled_job_ids);
+    // レーン内で kill した子のロックを解放する (子の後始末は走らない)。
+    release_cancelled_novel_locks(state, &killed_job_ids);
     true
 }
 
@@ -2363,7 +2418,9 @@ fn requested_sort_display_string(
 #[cfg(test)]
 mod tests {
     use parking_lot::Mutex;
+    use std::collections::HashSet;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use chrono::{TimeZone, Utc};
     use serde_yaml::{Mapping, Value};
@@ -2374,11 +2431,11 @@ mod tests {
     use super::{
         build_update_by_tag_queue_payload,
         build_update_general_lastup_meta, build_update_start_message_meta,
-        build_webui_update_start_message, encode_convert_job_target, existing_update_job_id,
-        format_queue_job_type,
+        build_webui_update_start_message, cancelled_novel_ids, encode_convert_job_target,
+        existing_update_job_id, format_queue_job_type,
         format_update_queue_target, normalize_update_targets, push_update_job_if_needed,
         push_update_job_with_legacy_if_needed, queue_lane_sizes, reboot_args_with_no_browser,
-        restorable_tasks_available,
+        release_novel_locks, restorable_tasks_available,
         sort_records_for_web_update, validate_diff_number,
         validate_download_targets, validate_general_lastup_option, web_update_sort_key_for_cli,
     };
@@ -2814,6 +2871,9 @@ mod tests {
             ),
             bind_host: "localhost".into(),
             control_token: "control-token".to_string(),
+            ui_token: "ui-token".to_string(),
+            ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
+            ui_bootstrap_consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             queue,
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -2829,5 +2889,86 @@ mod tests {
             .restorable_tasks_available
             .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(!restorable_tasks_available(&state));
+    }
+
+    fn seed_lock_file(dir: &std::path::Path, ids: &[i64]) {
+        std::fs::create_dir_all(dir.join(".narou")).unwrap();
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.9f %:z");
+        let content = ids
+            .iter()
+            .map(|id| format!("{id}: {now}\n"))
+            .collect::<String>();
+        std::fs::write(dir.join(".narou").join("lock.yaml"), content).unwrap();
+    }
+
+    fn sample_queue_job(id: &str, job_type: JobType, target: &str) -> QueueJob {
+        QueueJob {
+            id: id.to_string(),
+            job_type,
+            target: target.to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+            available_at: None,
+        }
+    }
+
+    /// 中断した子プロセスの `NovelLockGuard::drop` は走らないため、その小説は
+    /// `lock.yaml` のエントリが消えるまで 30 分間延期され続ける。解放は対象 ID
+    /// だけを消し、他の小説のロックは残す (二重解放でも冪等)。
+    #[test]
+    fn release_novel_locks_removes_only_cancelled_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+        seed_lock_file(temp.path(), &[12, 99]);
+        let lock_path = temp.path().join(".narou").join("lock.yaml");
+
+        release_novel_locks(&HashSet::from([12]));
+        // 子の後始末と競合しても、同じ ID の二重解放で他のロックを失わない。
+        release_novel_locks(&HashSet::from([12]));
+
+        let locked: std::collections::HashMap<i64, Value> =
+            serde_yaml::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+        assert_eq!(
+            locked.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([99])
+        );
+    }
+
+    /// 解放した小説は `worker::pop_next_job` の延期条件
+    /// (`load_active_locked_ids`) に現れなくなる。
+    #[test]
+    fn released_novel_is_no_longer_treated_as_locked() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+        seed_lock_file(temp.path(), &[12, 99]);
+
+        release_novel_locks(&HashSet::from([12]));
+
+        let active = crate::compat::load_active_locked_ids(Duration::from_secs(30 * 60)).unwrap();
+        assert!(!active.contains(&12), "解放した小説は延期対象から外れる");
+        assert!(active.contains(&99), "他の小説のロックは残す");
+    }
+
+    #[test]
+    fn cancelled_novel_ids_reads_targets_of_cancelled_running_jobs() {
+        let running_jobs = Mutex::new(vec![
+            sample_queue_job("job-1", JobType::Download, "--force\t12"),
+            sample_queue_job("job-2", JobType::Update, "--force\t12\t99"),
+            sample_queue_job("job-3", JobType::Download, "42"),
+        ]);
+
+        assert_eq!(
+            cancelled_novel_ids(&running_jobs, &["job-1".to_string()]),
+            HashSet::from([12])
+        );
+        assert_eq!(
+            cancelled_novel_ids(
+                &running_jobs,
+                &["job-1".to_string(), "job-2".to_string()]
+            ),
+            HashSet::from([12, 99])
+        );
+        assert!(cancelled_novel_ids(&running_jobs, &["missing".to_string()]).is_empty());
     }
 }

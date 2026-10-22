@@ -124,7 +124,7 @@ cp -r assets/aozora C:/path/to/tools/
 - `src/epub_lite.rs`: chuki テーブル7種 + replace.txt を `include_str!` 埋め込みした `embedded_config()`、テキスト→`EpubBook` 組立 (`build_book`)、seek 不要の ZIP data descriptor 書き出し (`stream_epub`)。画像は provider 経由で書き出し時に都度解決 (省メモリ)。単体テスト6件 (+`NAROU_EPUB_SMOKE_TXT` で実データ smoke を opt-in)
 - Worker: `GET /api/novels/:id/download.epub` — ObjectStore 上の `novel.txt` (= 新設 `NovelObjectKeys::converted_text()`) を DL 時に EPUB 化して返す。挿絵は 512 枚 / 64 MiB 上限の prefetch 後にメモリ解決。未生成時は 409
 - Native Web: 既存 `/novels/{id}/download` で EPUB が見つからない場合、`lite` ビルドなら変換済み txt からその場で EPUB 生成して返す
-- Native 変換後、固定名ミラー `novel.txt` を小説ディレクトリへ併せて書き出し (feature `lite` 時)。ObjectStore レイアウト経由で Worker と同じキーで参照できる
+- Native 変換後、固定名ミラー `novel.txt` を小説ディレクトリへ併せて書き出し (feature `lite` 時)。ObjectStore レイアウト経由で Worker と同じキーで参照できる (2026-10-22 に廃止。下の「更新 (2026-10-22)」節を参照)
 - CI: platform.yml に `native-gpl` job (`--features lite` の check/test/build)。release.yml は全8プラットフォームに GPL 版を追加 (`narou_rs_{plat}_{arch}-GPL.zip`)、package-release.ps1 に `-Variant` 引数を追加。タグ push に加え `workflow_dispatch` で任意ブランチから両 variant の zip を生成可能 (dispatch 時は GitHub Release を作成しない)
 
 ### 更新 (2026-09-25): v0.1.4 で濁点フォントを組み込みエンジンでも使う
@@ -170,6 +170,19 @@ Lite 側に資産注入の口が揃ったため、`src/epub_lite.rs` を組み�
   -of -dst out novel.txt`) と **422/423 ファイルがバイト完全一致**。挿絵を 1 枚
   入れた入力でも **425/426 がバイト完全一致**（単ページ画像化・連番・表紙処理まで含む）。
   唯一の差は `dcterms:modified`（Java はローカル時刻に `Z` を付ける、Lite は UTC）
+
+### 更新 (2026-10-22): 変換後の固定名ミラー `novel.txt` を廃止 (issue #40)
+
+- native の変換 (`NovelConverter::convert_novel_by_id`) は per-title の txt と
+  SQLite `novel_outputs` の `converted_text` だけを残し、小説ディレクトリへ
+  固定名ミラー `novel.txt` を書かなくなった。以前は `convert.keep-txt=true`
+  (既定) で同じ内容の txt が 2 つ (`[作者名]タイトル.txt` と `novel.txt`) 残っていた
+- 旧バージョンが残した `novel.txt` は次の変換で削除する。変換出力自体が
+  `novel.txt` という名前になる設定 (`convert.filename`) では消さない
+- ObjectStore の `<prefix>/novel.txt` キーは Worker の `ConvertService`
+  (`src/application/convert.rs`) が書くもので、native は読まない (native Web の
+  DL 時 EPUB は SQLite `novel_outputs`、YAML 構成では per-title の txt を読む)。
+  Worker の `download.epub` と `converted_text` の保存は変更なし
 
 ### 制限
 - Worker の Convert ジョブ自体は引き続き blocked (セクション→テキスト組立の portable 化は後続作業)。DL 時 EPUB は `novel.txt` オブジェクトが存在する場合のみ動作

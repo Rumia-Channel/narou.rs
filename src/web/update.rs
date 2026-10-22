@@ -23,9 +23,6 @@ const PROGRESS_TOPIC: &str = "update";
 
 #[derive(Debug, Deserialize, Default)]
 pub struct UpdateStartBody {
-    /// 任意: 指定すれば独自のアセット URL を使用 (デバッグ用)。
-    #[serde(default)]
-    pub asset_url: Option<String>,
     /// 任意: ダウンロードするリリース variant ("gpl" / "standard")。
     /// 0.4.0 以下からの更新時に UI が選択を求め、ここへ渡す。
     #[serde(default)]
@@ -99,7 +96,6 @@ pub async fn api_update_start(
         .self_update
         .start(
             SelfUpdateRequest {
-                asset_url: body.asset_url,
                 variant: body.variant,
             },
             events,

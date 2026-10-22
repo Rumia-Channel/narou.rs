@@ -51,8 +51,8 @@ struct Args {
     /// 使用する Chromium 系ブラウザのパス
     #[arg(long, value_name = "PATH")]
     browser: Option<PathBuf>,
-    /// ブラウザのリモートデバッグポート
-    #[arg(long, default_value_t = 9222)]
+    /// ブラウザのリモートデバッグポート (0 = ブラウザに空きポートを選ばせる)
+    #[arg(long, default_value_t = 0)]
     port: u16,
     /// ログイン完了を待つ秒数
     #[arg(long, default_value_t = 300)]
@@ -146,7 +146,14 @@ fn run(args: Args) -> std::result::Result<(), String> {
         std::fs::create_dir_all(&profile)
             .map_err(|error| format!("{} を作成できません: {error}", profile.display()))?;
         let mut child = launch_browser(&browser, &login_url, args.port, &profile)?;
-        let captured = match capture_cookies(&mut child, args.port, args.timeout, &site, &hosts) {
+        let captured = match capture_cookies(
+            &mut child,
+            args.port,
+            &profile,
+            args.timeout,
+            &site,
+            &hosts,
+        ) {
             Ok(captured) => captured,
             Err(error) => {
                 let _ = child.kill();
@@ -302,7 +309,8 @@ fn write_export(
         library.as_deref(),
     )
     .map_err(|error| error.to_string())?;
-    std::fs::write(path, text).map_err(|error| format!("{} に書き込めません: {error}", path.display()))?;
+    narou_rs::login::transfer::write_export_file(path, &text)
+        .map_err(|error| format!("{} に書き込めません: {error}", path.display()))?;
 
     let logins: usize = sites.values().map(Vec::len).sum();
     println!(
@@ -421,12 +429,20 @@ fn site_hosts(site: &SiteSetting, target: &str) -> Vec<String> {
 }
 
 /// Launch the browser with remote debugging enabled and the login page open.
+///
+/// `port == 0` lets the browser pick a free port; it reports the choice in
+/// `<profile>/DevToolsActivePort` (see [`wait_for_devtools`]). A reused
+/// `--profile` can carry that file from an earlier run, so it is removed
+/// before the browser starts and only the new browser's value is read.
 fn launch_browser(
     browser: &Path,
     login_url: &str,
     port: u16,
     profile: &Path,
 ) -> std::result::Result<Child, String> {
+    if port == 0 {
+        let _ = std::fs::remove_file(profile.join(DEVTOOLS_ACTIVE_PORT_FILE));
+    }
     Command::new(browser)
         .arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", profile.display()))
@@ -443,11 +459,12 @@ fn launch_browser(
 fn capture_cookies(
     child: &mut Child,
     port: u16,
+    profile: &Path,
     timeout: u64,
     site: &SiteSetting,
     hosts: &[String],
 ) -> std::result::Result<Vec<(String, String)>, String> {
-    let websocket_url = wait_for_devtools(port, Duration::from_secs(30))?;
+    let websocket_url = wait_for_devtools(child, port, profile, Duration::from_secs(30))?;
     let (mut socket, _) = tungstenite::connect(websocket_url.as_str())
         .map_err(|error| format!("DevTools に接続できませんでした: {error}"))?;
 
@@ -497,28 +514,143 @@ fn capture_cookies(
     }
 }
 
+/// ブラウザが自動選択した DevTools ポートを書くファイル名 (`<profile>` 直下)。
+const DEVTOOLS_ACTIVE_PORT_FILE: &str = "DevToolsActivePort";
+/// ブラウザ用 WebSocket のパス接頭辞。ページ用 (`/devtools/page/...`) ではなく、
+/// ブラウザ全体の Cookie を読む Browser エンドポイントに接続する。
+const DEVTOOLS_BROWSER_PATH: &str = "/devtools/browser/";
+
+/// `<profile>/DevToolsActivePort` をパースする。
+///
+/// ブラウザは 1 行目に実際に選んだポート、2 行目にブラウザ用 WebSocket の
+/// パス (`/devtools/browser/...`) を書く。書きかけ・形式違い・ポート 0 などは
+/// `None` を返し、呼び出し側がポーリングを続ける。
+fn parse_devtools_active_port(text: &str) -> Option<(u16, String)> {
+    let mut lines = text.lines().map(str::trim);
+    let port = lines
+        .next()?
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)?;
+    let path = lines.next()?;
+    path.starts_with(DEVTOOLS_BROWSER_PATH)
+        .then(|| (port, path.to_string()))
+}
+
+/// `<profile>/DevToolsActivePort` が示すポート (まだ無ければ None)。
+fn read_devtools_active_port(profile: &Path) -> Option<(u16, String)> {
+    parse_devtools_active_port(
+        &std::fs::read_to_string(profile.join(DEVTOOLS_ACTIVE_PORT_FILE)).ok()?,
+    )
+}
+
+/// `/json/version` の `webSocketDebuggerUrl` を取得する (まだ公開前なら None)。
+fn fetch_devtools_websocket(client: &reqwest::blocking::Client, port: u16) -> Option<String> {
+    let url = format!("http://127.0.0.1:{port}/json/version");
+    let response = client.get(&url).send().ok()?;
+    let body = response.text().ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    value
+        .get("webSocketDebuggerUrl")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// DevTools の WebSocket URL が、起動したブラウザの Browser エンドポイントを
+/// 指しているか検証する。
+///
+/// - ループバックの `ws://` であること (外部ホストや `wss` は掴まない)。
+/// - ポートが期待値 (自動検出したポート / 利用者が指定したポート) と一致する
+///   こと。固定ポートを先に使っている別プロセスが返す URL を掴まないため。
+/// - パスが `/devtools/browser/...` であること (ページ用ではなく Browser 用)。
+/// - 自動検出時は `<profile>/DevToolsActivePort` が示したパスとも一致すること
+///   (残っていた別ブラウザのファイルを掴まないため)。
+fn verify_devtools_websocket(
+    websocket: &str,
+    expected_port: u16,
+    expected_path: Option<&str>,
+) -> std::result::Result<String, String> {
+    let parsed = url::Url::parse(websocket)
+        .map_err(|error| format!("DevTools の WebSocket URL が不正です: {error}"))?;
+    if parsed.scheme() != "ws" {
+        return Err("DevTools の WebSocket URL が ws ではありません".to_string());
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if !loopback {
+        return Err("DevTools の WebSocket がループバックを指していません".to_string());
+    }
+    if parsed.port() != Some(expected_port) {
+        return Err(format!(
+            "DevTools の WebSocket ポートが {expected_port} ではありません"
+        ));
+    }
+    if !parsed.path().starts_with(DEVTOOLS_BROWSER_PATH) {
+        return Err("DevTools の WebSocket パスがブラウザ用ではありません".to_string());
+    }
+    if let Some(expected_path) = expected_path
+        && parsed.path() != expected_path
+    {
+        return Err(format!(
+            "DevTools の WebSocket パスが {} と一致しません",
+            DEVTOOLS_ACTIVE_PORT_FILE
+        ));
+    }
+    Ok(websocket.to_string())
+}
+
 /// Wait for the DevTools endpoint and return its browser websocket URL.
-fn wait_for_devtools(port: u16, timeout: Duration) -> std::result::Result<String, String> {
+///
+/// `port == 0` means the browser picked the port itself: it is read from
+/// `<profile>/DevToolsActivePort` (polled with `timeout`), and the endpoint
+/// reported by `/json/version` must have that same loopback port and path.
+/// An explicit port keeps the old wait behavior, but the returned URL's port
+/// must equal the requested one.
+fn wait_for_devtools(
+    child: &mut Child,
+    port: u16,
+    profile: &Path,
+    timeout: Duration,
+) -> std::result::Result<String, String> {
     let deadline = Instant::now() + timeout;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|error| error.to_string())?;
-    let url = format!("http://127.0.0.1:{port}/json/version");
+    // 自動検出時は DevToolsActivePort の (ポート, パス)。
+    let mut discovered: Option<(u16, String)> = None;
     loop {
-        if let Ok(response) = client.get(&url).send()
-            && let Ok(body) = response.text()
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
-            && let Some(websocket) = value
-                .get("webSocketDebuggerUrl")
-                .and_then(|value| value.as_str())
+        // ブラウザが DevTools を公開する前に終了したら、待ち続けない。
+        if child.try_wait().ok().flatten().is_some() {
+            return Err("ブラウザが DevTools を公開する前に終了しました".to_string());
+        }
+        let endpoint = if port == 0 {
+            if discovered.is_none() {
+                discovered = read_devtools_active_port(profile);
+            }
+            discovered.clone()
+        } else {
+            Some((port, String::new()))
+        };
+        if let Some((effective, active_path)) = endpoint
+            && let Some(websocket) = fetch_devtools_websocket(&client, effective)
         {
-            return Ok(websocket.to_string());
+            let expected_path = (port == 0).then_some(active_path.as_str());
+            return verify_devtools_websocket(&websocket, effective, expected_path);
         }
         if Instant::now() >= deadline {
-            return Err(format!(
-                "ブラウザの DevTools ポート {port} に接続できませんでした"
-            ));
+            return Err(if port == 0 {
+                format!(
+                    "ブラウザの DevTools エンドポイントを特定できませんでした ({} がありません)",
+                    profile.join(DEVTOOLS_ACTIVE_PORT_FILE).display()
+                )
+            } else {
+                format!("ブラウザの DevTools ポート {port} に接続できませんでした")
+            });
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -710,6 +842,61 @@ mod tests {
             ("www.alphapolis.co.jp".into(), "reader=vertical".into()),
             ("accounts.alphapolis.co.jp".into(), "auth=alpha-auth".into()),
         ]));
+    }
+
+    #[test]
+    fn devtools_active_port_is_parsed_from_the_browser_file() {
+        assert_eq!(
+            parse_devtools_active_port("52222\n/devtools/browser/1a2b-3c4d\n"),
+            Some((52222, "/devtools/browser/1a2b-3c4d".to_string()))
+        );
+        // Windows の CRLF と末尾の空行も読める。
+        assert_eq!(
+            parse_devtools_active_port("9222\r\n/devtools/browser/abc\r\n"),
+            Some((9222, "/devtools/browser/abc".to_string()))
+        );
+        // 書きかけ・壊れた内容・ポート 0・ブラウザ用でないパスは None。
+        for text in [
+            "",
+            "\n",
+            "52222",
+            "52222\n",
+            "abc\n/devtools/browser/x",
+            "0\n/devtools/browser/x",
+            "70000\n/devtools/browser/x",
+            "52222\n/devtools/page/x",
+            "52222\n\n",
+        ] {
+            assert_eq!(parse_devtools_active_port(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn devtools_websocket_is_verified_against_the_discovered_endpoint() {
+        let valid = "ws://127.0.0.1:52222/devtools/browser/1a2b";
+        assert_eq!(
+            verify_devtools_websocket(valid, 52222, Some("/devtools/browser/1a2b")).unwrap(),
+            valid
+        );
+        // ポート・パスが自動検出した値と違えば掴まない。
+        assert!(verify_devtools_websocket(valid, 52223, None).is_err());
+        assert!(
+            verify_devtools_websocket(valid, 52222, Some("/devtools/browser/other")).is_err()
+        );
+        for bad in [
+            // ループバック以外 (固定ポートを先に使っている別プロセス対策)。
+            "ws://example.com:52222/devtools/browser/x",
+            "ws://127.0.0.1:52223/devtools/browser/x",
+            // ページ用エンドポイントでは Storage.getCookies を読めない。
+            "ws://127.0.0.1:52222/devtools/page/x",
+            "wss://127.0.0.1:52222/devtools/browser/x",
+            "not a url",
+        ] {
+            assert!(
+                verify_devtools_websocket(bad, 52222, None).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]

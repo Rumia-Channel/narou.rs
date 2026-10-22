@@ -11,7 +11,9 @@ use narou_rs::downloader::security::{
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::http::{RedirectChain, validate_http_url_syntax};
 use narou_rs::platform::http1::{Http1ResponseDecoder, SocketTarget, encode_request};
-use narou_rs::platform::relay::{RelayRequest, RelayResponse, response_wire_limit};
+use narou_rs::platform::relay::{
+    RelayRequest, RelayResponse, normalize_relay_base, response_wire_limit,
+};
 use narou_rs::platform::{
     CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, PlatformFuture,
 };
@@ -54,7 +56,8 @@ enum HopExchange<'a> {
 /// 踏み台リレーの接続情報。
 #[derive(Clone)]
 struct RelayConfig {
-    /// 踏み台のベース URL (`http://<IP>:<port>`)。オリジン部分だけが使われる。
+    /// 踏み台のベース URL (`https://<relay>`。ループバックのみ `http://` 可)。
+    /// `normalize_relay_base` でオリジンに正規化済み。
     base_url: String,
     /// `X-Proxy-Token` に入れる共有トークン。
     token: String,
@@ -87,16 +90,19 @@ impl WorkerHttpClient {
 
     /// 外部リレー経由の取得段を有効にする。
     ///
-    /// `base_url` は `http://<IP>:<port>` 形式。スキームが無い値
-    /// (`<IP>:<port>` だけの環境変数) は `http://` を補う。末尾の `/` の有無は
-    /// `RelayRequest::new` が origin に正規化するため問わない。
+    /// `base_url` は `https://<relay>` (ループバックの踏み台に限り
+    /// `http://127.0.0.1:<port>` など) を要求する。検証は
+    /// [`narou_rs::platform::relay::normalize_relay_base`] が行い、平文の公開先・
+    /// スキーム無し・資格情報入りの値は無効化する (fail closed)。以前は
+    /// スキーム無しに `http://` を補っていたが、Token と Cookie を平文で運ぶ
+    /// 経路になるためやめた。
     pub fn with_relay(mut self, base_url: String, token: String) -> Self {
-        let base_url = if base_url.starts_with("http://") || base_url.starts_with("https://") {
-            base_url
-        } else {
-            format!("http://{base_url}")
-        };
-        self.relay = Some(RelayConfig { base_url, token });
+        match normalize_relay_base(&base_url) {
+            Ok(base_url) => self.relay = Some(RelayConfig { base_url, token }),
+            Err(error) => console_warn!(
+                "NAROU_RELAY_ENDPOINT を無効化しました (リレーは https、またはループバックの http のみ許可): {error}"
+            ),
+        }
         self
     }
 

@@ -543,16 +543,29 @@ pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
         db.save()
     })
 }
+fn absolute_directory_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
 pub fn open_directory(path: &Path, confirm_message: Option<&str>) {
     if let Some(message) = confirm_message
         && !confirm(message, false, false) {
             return;
         }
 
-    let path = path.to_string_lossy().to_string();
+    // 相対パスのまま explorer に渡すと、explorer 側の CWD (多くの場合
+    // Documents) を開いてしまう。必ず絶対パスへ直し、Windows では
+    // `file:///` URL ではなく OS パスをそのまま渡す (issue #41)。
+    let path = absolute_directory_path(path).to_string_lossy().to_string();
     if cfg!(windows) {
         let mut command = std::process::Command::new("explorer");
-        command.arg(format!("file:///{}", path.replace('\\', "/")));
+        command.arg(&path);
         configure_hidden_console_command(&mut command);
         let _ = command.spawn();
     } else if cfg!(target_os = "macos") {
@@ -635,11 +648,26 @@ fn choose_digest_action_inner(
             "1" => return DigestChoice::Update,
             "2" => return DigestChoice::Cancel,
             "3" => return DigestChoice::CancelAndFreeze,
-            "4" => return DigestChoice::Backup,
-            "5" => return DigestChoice::ShowStory,
-            "6" => return DigestChoice::OpenBrowser,
-            "7" => return DigestChoice::OpenFolder,
-            "8" => return DigestChoice::Convert,
+            "4" => {
+                queue_continue_update_after_auto_action(auto_choices);
+                return DigestChoice::Backup;
+            }
+            "5" => {
+                queue_continue_update_after_auto_action(auto_choices);
+                return DigestChoice::ShowStory;
+            }
+            "6" => {
+                queue_continue_update_after_auto_action(auto_choices);
+                return DigestChoice::OpenBrowser;
+            }
+            "7" => {
+                queue_continue_update_after_auto_action(auto_choices);
+                return DigestChoice::OpenFolder;
+            }
+            "8" => {
+                queue_continue_update_after_auto_action(auto_choices);
+                return DigestChoice::Convert;
+            }
             _ => {
                 if auto_choices.is_some() {
                     continue;
@@ -650,6 +678,18 @@ fn choose_digest_action_inner(
                 println!("選択肢の中にありません。もう一度入力して下さい");
             }
         }
+    }
+}
+
+/// 自動入力で非終端アクション (4-8) を実行したあと、選択肢が尽きていれば
+/// 「1: このまま更新する」を次に選ぶ。Ruby 準拠の既定 2 (キャンセル) のままだと、
+/// 「7: 保存フォルダを開く」等を指定したユーザーが意図せず更新をキャンセルされる
+/// (issue #41)。明示的な "2"/"3" が後続にある場合はそれを優先する。
+fn queue_continue_update_after_auto_action(auto_choices: &mut Option<VecDeque<String>>) {
+    if let Some(queue) = auto_choices.as_mut()
+        && queue.is_empty()
+    {
+        queue.push_back("1".to_string());
     }
 }
 
@@ -972,6 +1012,7 @@ fn sanitize_backup_name(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::process::Command;
 
     use crate::db::inventory::Inventory;
@@ -979,7 +1020,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        DigestChoice, NovelLockGuard, canonicalize_aozoraepub3_tool_path,
+        DigestChoice, NovelLockGuard, absolute_directory_path,
+        canonicalize_aozoraepub3_tool_path,
         canonicalize_existing_path, choose_digest_action_with_auto_choices, configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
         record_is_frozen, reroute_web_line_to_console, resolve_auto_convert_devices,
@@ -1066,11 +1108,53 @@ mod tests {
     }
 
     #[test]
+    fn open_directory_path_is_always_absolute() {
+        // explorer へ相対パスを渡すと explorer 側の CWD を開くため、必ず絶対化する。
+        let relative = Path::new("小説データ").join("site").join("title");
+        assert!(absolute_directory_path(&relative).is_absolute());
+        let absolute = std::env::current_dir().unwrap().join("x");
+        assert_eq!(absolute_directory_path(&absolute), absolute);
+    }
+
+    #[test]
     fn parse_digest_auto_choices_splits_comma_separated_values() {
         let queue = parse_digest_auto_choices(Some("8, 4,1")).unwrap();
         assert_eq!(
             queue.into_iter().collect::<Vec<_>>(),
             vec!["8".to_string(), "4".to_string(), "1".to_string()]
+        );
+    }
+
+    #[test]
+    fn digest_auto_choices_continue_update_after_a_non_terminal_action() {
+        // issue #41: 「7: 保存フォルダを開く」だけを自動指定したときに、
+        // その後ろへ暗黙の「2: キャンセル」を足さない。
+        let mut auto_choices = parse_digest_auto_choices(Some("7"));
+        assert_eq!(
+            choose_digest_action_with_auto_choices("title", "message", &mut auto_choices),
+            DigestChoice::OpenFolder
+        );
+        assert_eq!(
+            choose_digest_action_with_auto_choices("title", "message", &mut auto_choices),
+            DigestChoice::Update
+        );
+
+        let mut convert_then_update = parse_digest_auto_choices(Some("8"));
+        assert_eq!(
+            choose_digest_action_with_auto_choices(
+                "title",
+                "message",
+                &mut convert_then_update
+            ),
+            DigestChoice::Convert
+        );
+        assert_eq!(
+            choose_digest_action_with_auto_choices(
+                "title",
+                "message",
+                &mut convert_then_update
+            ),
+            DigestChoice::Update
         );
     }
 
