@@ -222,7 +222,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `-i`/`--ignore-all`: 引数なし時の全更新を無効化
 - 標準入力からのターゲット読み取りに対応。Ruby版同様 `narou tag ... | narou u` や `narou l -t "foo bar" | narou u` のようなパイプ入力を解決
 - ターゲット解決: Ruby版 `tagname_to_ids`/`Downloader.get_data_by_target` 相当に合わせ、ID、URL、Nコード、タイトル、`.narou/alias.yaml` 別名、通常タグ名、`tag:NAME`、`^tag:NAME` を解決
-- 既存小説更新時は Ruby版同様に DB の `toc_url` から `ncode` などのURLキャプチャを復元し、DB上の `sitename` を保存先決定で優先する
+- 既存小説更新時は Ruby版同様に DB の `toc_url` から `ncode` などのURLキャプチャを復元し、登録済みの `sitename` / `file_title` を保存先として維持する。サイト定義の `append_title_to_folder_name` やサイト名が変わっても既存フォルダへ保存し、旧目次を使って話数減少を判定する。通常更新による旧フォルダの自動削除は行わず、個別設定・置換規則・EPUB を保持する（明示的な更新で本文・目次を変更する挙動は維持）
 - サイト/API由来のタイムゾーン表記なし日時は `webnovel/*.yaml` の `timezone`、未指定時は local `time-zone`（既定 `Asia/Tokyo`）で解釈する。DB の YAML には narou.rb 互換の `YYYY-MM-DD HH:MM:SS.nnnnnnnnn +09:00` 形式で保存し、既存 Rust 版の epoch 秒も読み込める。なろう API の `YYYY-MM-DD HH:MM:SS` は JST 扱い
 - あらすじ比較は `<br>`/`<br/>`/`<br />` と改行・行末空白を正規化し、実質同一なら更新扱いにしない
 - 既存小説で実変更が無い場合は `last_update` を保持し、更新確認だけで Web UI の `new-update` 表示が再点灯しないようにする
@@ -278,9 +278,13 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 **復帰失敗時のデータ保全**: インプレース書き出しの管理ファイルは、保存前に SQLite へ SHA-256 指紋を記録し、原子的に置換する。`narou-compat=false` では、失敗後に残った未編集の書き出しファイルを次回起動で再取り込みせず、その後に正常保存した SQLite の状態・作品レコードを維持する。ユーザーが編集して指紋が変わった旧形式ファイルの取り込みと、`narou-compat=true` のファイル優先は維持する。
 既存の書き出しファイルと次に公開する内容の指紋を最大 2 件保持し、再試行が保存直前で停止しても前の残骸を再取り込みしない。指紋更新と公開は同じファイルロック内で行う。`--out` が実管理ディレクトリ `.narou` を指す場合も同じ保護を適用する。
 
+**作品レコードの更新競合対策**: Native SQLite の `update_records` は書き込みトランザクションを開始してから最新レコードを読み、変更と保存を同じ境界で行う。`save()` はプロセス内の古い全件キャッシュを置換保存せず、読み込み以降に明示変更された行・項目だけを最新値へ反映する。別プロセスが追加した作品・別項目・未知項目を保持し、既に削除された行を古い編集で復活させない。同一項目への競合は後の保存が優先される。新規 ID の予約も SQLite の共有予約を使い、使用中 ID を再利用しない。
+
+**保存方式の往復**: YAML 復帰後に編集された `database.yaml` は、SQLite へ再移行する際も取り込む（タグ変更・追加・明示削除を含む）。過去の互換モード用指紋が残っていても、書き出し時の指紋との差を優先する。未編集の書き出しファイルは上記の保全規則どおり再取り込みしない。方式変更は取得・更新等を止めてから行い、変更前のライブラリをバックアップする。
+
 **凍結状態の保存先**: YAML 管理では `.narou/freeze.yaml`、SQLite 管理では `app_state('inv','freeze')` で、どちらも Inventory の共通入口 (`Inventory::update_yaml`) を通す。SQLite 側では同じ内容が `frozen_novels` へ投影され、状態の検索 (`status` 検索式) が `narou list` と一致する。`freeze.yaml` の取込は和集合で行うため、残っていた断片ファイルが他の凍結を解除することはない (issue #35)。
 
-**前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, freeze.yaml, alias.yaml, tag_colors.yaml, login_cookie.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。`~/.narousetting/global_setting.yaml` はライブラリ状態ではないため narou-compat/SQLite の有無にかかわらず常にファイルのまま維持され、SQLite への取込・退避は行わない (旧ビルドが `app_state` の global/global_setting に残した行は、ファイルが無いとき初回読み出しでファイルへ書き戻してその行を削除する)
+**前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, database_index.yaml, freeze.yaml, alias.yaml, author.yaml, tag_colors.yaml, login_cookie.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。`~/.narousetting/global_setting.yaml` はライブラリ状態ではないため narou-compat/SQLite の有無にかかわらず常にファイルのまま維持され、SQLite への取込・退避は行わない (旧ビルドが `app_state` の global/global_setting に残した行は、ファイルが無いとき初回読み出しでファイルへ書き戻してその行を削除する)
 
 ---
 

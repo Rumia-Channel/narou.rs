@@ -1783,10 +1783,6 @@ impl Downloader {
         } else {
             fetched_raw_title
         };
-        #[cfg(feature = "native-runtime")]
-        let previous_novel_dir = existing_record.as_ref().map(|record| {
-            crate::db::existing_novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record)
-        });
         let strip_title_prefix =
             self.settings
                 .strip_title_prefix_for(provisional_id, &raw_title, &author);
@@ -1805,21 +1801,14 @@ impl Downloader {
             setting.append_title_to_folder_name,
             existing_record.as_ref(),
         );
-        let sitename = info
-            .sitename
-            .clone()
-            .or_else(|| {
-                existing_record
-                    .as_ref()
-                    .filter(|r| r.domain.as_deref() == Some(setting.domain.as_str()))
-                    .and_then(|r| {
-                        if r.sitename.is_empty() {
-                            None
-                        } else {
-                            Some(r.sitename.clone())
-                        }
-                    })
-            })
+        // Ruby の sitename/get_file_title と同じく、登録済みの保存先は
+        // サイト定義や取得メタデータが変わっても維持する。保存先を先に
+        // 変えると旧目次が見えず、話数減少・キャンセルを検出できない。
+        let sitename = existing_record
+            .as_ref()
+            .map(|record| record.sitename.clone())
+            .filter(|name| !name.is_empty())
+            .or_else(|| info.sitename.clone())
             .unwrap_or_else(|| setting.sitename.clone());
 
         let object_keys = NovelObjectKeys::new(&sitename, &file_title, use_subdirectory)
@@ -2574,10 +2563,6 @@ impl Downloader {
             new_id
         };
 
-        #[cfg(feature = "native-runtime")]
-        self.remove_migrated_novel_dir(previous_novel_dir.as_deref(), &novel_dir)
-            .await;
-
         if let Some(old_id) = existing_id {
             self.move_section_hash_bucket(old_id, id);
         } else {
@@ -2861,16 +2846,7 @@ impl Downloader {
         if let Some(record) = existing_record
             && !record.file_title.is_empty()
         {
-            if append_title
-                && ncode
-                    .as_deref()
-                    .is_some_and(|ncode| record.file_title.eq_ignore_ascii_case(ncode))
-                && !title.is_empty()
-            {
-                // Recover records created before the correct site/title was known.
-            } else {
-                return record.file_title.clone();
-            }
+            return record.file_title.clone();
         }
 
         if let Some(ncode) = ncode {
@@ -2898,61 +2874,6 @@ impl Downloader {
     ) -> PathBuf {
         let root = PathBuf::from(types::ARCHIVE_ROOT_DIR);
         crate::db::paths::novel_dir_from_components(&root, sitename, file_title, use_subdirectory)
-    }
-
-    /// Remove the previous novel directory after a title change, but only when
-    /// no other record still references it. Native filesystem compatibility;
-    /// Worker builds have no filesystem to migrate.
-    #[cfg(feature = "native-runtime")]
-    async fn remove_migrated_novel_dir(&self, previous: Option<&Path>, current: &Path) {
-        let Some(previous) = previous else {
-            return;
-        };
-        if previous == current || !previous.exists() {
-            return;
-        }
-
-        let filter = crate::platform::NovelFilter::all();
-        let mut after_id = None;
-        let mut still_referenced = false;
-        loop {
-            let ids = match self.novels.scan_ids(&filter, after_id, 256).await {
-                Ok(ids) => ids,
-                Err(_) => {
-                    still_referenced = true;
-                    break;
-                }
-            };
-            if ids.is_empty() {
-                break;
-            }
-            after_id = ids.last().copied();
-            for id in ids {
-                match self.novels.get(id).await {
-                    Ok(Some(record)) => {
-                        if crate::db::novel_dir_for_record(
-                            Path::new(types::ARCHIVE_ROOT_DIR),
-                            &record,
-                        ) == previous
-                        {
-                            still_referenced = true;
-                            break;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(_) => {
-                        still_referenced = true;
-                        break;
-                    }
-                }
-            }
-            if still_referenced {
-                break;
-            }
-        }
-        if !still_referenced {
-            let _ = std::fs::remove_dir_all(previous);
-        }
     }
 
     fn download_use_subdirectory(&self, existing_record: Option<&NovelRecord>) -> bool {
@@ -3111,7 +3032,6 @@ mod tests {
     use base64::Engine;
     use chrono::TimeZone;
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     struct DatabaseGuard(Option<Database>);
@@ -4937,57 +4857,28 @@ is_narou: false
     }
 
     #[test]
-    fn remove_migrated_novel_dir_keeps_previous_dir_when_still_referenced() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
-
-        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
-
-        let db = Database::new().unwrap();
-        let mut db_slot = db::DATABASE.lock();
-        let previous_db = db_slot.take();
-        *db_slot = Some(db);
-        drop(db_slot);
-        let _db_guard = DatabaseGuard(previous_db);
-
-        let downloader = Downloader::with_user_agent(None).unwrap();
-        let timestamp = chrono::Utc::now();
-        let mut previous_record = sample_record(timestamp);
-        previous_record.id = 1;
-        previous_record.sitename = "site".to_string();
-        previous_record.file_title = "old".to_string();
-        let mut referenced_record = sample_record(timestamp);
-        referenced_record.id = 2;
-        referenced_record.sitename = "site".to_string();
-        referenced_record.file_title = "old".to_string();
-        let mut current_record = sample_record(timestamp);
-        current_record.id = 3;
-        current_record.sitename = "site".to_string();
-        current_record.file_title = "new".to_string();
-
-        let previous = db::paths::novel_dir_for_record(
-            &PathBuf::from(super::types::ARCHIVE_ROOT_DIR),
-            &previous_record,
-        );
-        let current = db::paths::novel_dir_for_record(
-            &PathBuf::from(super::types::ARCHIVE_ROOT_DIR),
-            &current_record,
-        );
-        std::fs::create_dir_all(&previous).unwrap();
-        std::fs::create_dir_all(&current).unwrap();
-
-        {
-            let mut db_slot = db::DATABASE.lock();
-            let db = db_slot.as_mut().unwrap();
-            db.insert(previous_record);
-            db.insert(referenced_record);
-            db.insert(current_record);
+    fn existing_record_keeps_file_title_when_site_naming_changes() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let downloader = Downloader::with_platform_and_storage_and_settings(
+            DownloaderPlatform {
+                http: Arc::new(MockHttpClient::new()),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects: store.clone(), assets: store, clock: Arc::new(SystemClock),
+            },
+            Vec::new(), HashMap::new(),
+        ).unwrap();
+        let mut record = sample_record(chrono::DateTime::from_timestamp(0, 0).unwrap());
+        for saved in ["n1234ab", "N1234AB", "保存済みフォルダ"] {
+            record.file_title = saved.to_string();
+            for ncode in [Some("n1234ab".to_string()), Some("n9999zz".to_string()), None] {
+                for append in [false, true] {
+                    for title in ["", "新しい題名"] {
+                        assert_eq!(downloader.compute_file_title(&ncode, title, append, Some(&record)), saved);
+                    }
+                }
+            }
         }
-
-        futures::executor::block_on(
-            downloader.remove_migrated_novel_dir(Some(&previous), &current),
-        );
-        assert!(previous.exists());
     }
 
     #[test]

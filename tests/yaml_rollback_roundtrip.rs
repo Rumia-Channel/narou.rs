@@ -140,6 +140,56 @@ fn in_place_export_restores_db_only_content_and_definitions() {
     assert!(root.join(".narou/database.yaml").is_file());
 }
 
+/// A running Web process can hold a stale Database cache while a CLI process
+/// changes SQLite. Export both records and their index from the authoritative
+/// source, not from that older cache.
+#[test]
+fn export_uses_current_sqlite_records_and_matching_index() {
+    let _guard = LIBRARY_LOCK.lock();
+    for in_place in [false, true] {
+        let (_temp, root) = temp_library();
+        let _cwd = CwdGuard::enter(&root);
+        let _store = db_only_store(&root);
+        let record = |id, title: &str| -> narou_rs::db::NovelRecord {
+            serde_yaml::from_str(&format!(
+                "id: {id}\nauthor: author\ntitle: {title}\nfile_title: title-{id}\ntoc_url: https://example.com/{id}/\nsitename: site\nlast_update: '2026-10-23T00:00:00Z'\n"
+            )).unwrap()
+        };
+        narou_rs::db::with_database_mut(|db| db.update_records(|mut records| {
+            records.insert(1, record(1, "Before"));
+            records.insert(3, record(3, "Removed"));
+            Ok((records, ()))
+        })).unwrap();
+        let mut external = narou_rs::db::Database::with_root(root.clone()).unwrap();
+        external.update_records(|mut records| {
+            records.get_mut(&1).unwrap().title = "After".into();
+            records.insert(2, record(2, "New"));
+            records.remove(&3);
+            Ok((records, ()))
+        }).unwrap();
+        narou_rs::db::with_database(|db| {
+            assert_eq!(db.get(1).unwrap().title, "Before", "fixture must retain a stale server cache");
+            assert!(db.get(2).is_none());
+            assert!(db.get(3).is_some());
+            Ok(())
+        }).unwrap();
+
+        let out = narou_rs::native::sqlite::export_yaml::export_yaml(
+            Some(root.join("bundle")), in_place,
+        ).unwrap();
+        let exported: std::collections::BTreeMap<i64, narou_rs::db::NovelRecord> =
+            serde_yaml::from_slice(&std::fs::read(out.join("database.yaml")).unwrap()).unwrap();
+        assert_eq!(exported[&1].title, "After");
+        assert!(exported.contains_key(&2), "an acknowledged new novel was omitted from export");
+        assert!(!exported.contains_key(&3), "export resurrected an externally removed novel");
+        let index: narou_rs::db::index_store::IndexStoreData =
+            serde_yaml::from_slice(&std::fs::read(out.join("database_index.yaml")).unwrap()).unwrap();
+        assert_eq!(index.meta[&1].title.as_deref(), Some("After"));
+        assert!(index.meta.contains_key(&2));
+        assert!(!index.meta.contains_key(&3));
+    }
+}
+
 /// Failed rollback projections must not replace writes acknowledged afterwards.
 #[test]
 fn failed_export_preserves_subsequent_state_and_record_writes() {

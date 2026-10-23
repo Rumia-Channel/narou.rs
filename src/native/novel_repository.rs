@@ -46,6 +46,26 @@ impl NativeNovelRepository {
         crate::db::with_database(|db| Ok(db.get(id.0).cloned()))
     }
 
+    /// Mutate the authoritative existing row inside the database write transaction.
+    /// Returns false without calling `mutator` if the ID was removed. Unlike
+    /// `Upsert`, this native-only field-editing entry point never creates a row.
+    pub fn update_existing_sync<F>(&self, id: NovelId, mutator: F) -> Result<bool>
+    where
+        F: FnOnce(&mut NovelRecord) -> Result<()>,
+    {
+        crate::db::with_database_mut(|db| {
+            db.update_records(|mut records| {
+                let found = if let Some(record) = records.get_mut(&id.0) {
+                    mutator(record)?;
+                    true
+                } else {
+                    false
+                };
+                Ok((records, found))
+            })
+        })
+    }
+
     pub fn find_by_toc_url_sync(&self, url: &str) -> Result<Option<NovelRecord>> {
         crate::db::with_database(|db| Ok(db.get_by_toc_url(url).cloned()))
     }

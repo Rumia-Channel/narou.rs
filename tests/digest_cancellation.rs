@@ -89,6 +89,16 @@ fn run(root: &Path, proxy: &Proxy, sqlite: bool, web: bool, args: &[&str]) -> Ou
 }
 
 fn library(proxy: &Proxy, sqlite: bool, choice: Option<&str>) -> (tempfile::TempDir, PathBuf) {
+    library_with_layout(proxy, sqlite, choice, "digest", &[])
+}
+
+fn library_with_layout(
+    proxy: &Proxy,
+    sqlite: bool,
+    choice: Option<&str>,
+    file_title: &str,
+    custom_inputs: &[(&str, &str)],
+) -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     for path in [".narou", ".narousetting", "home/.narousetting", "webnovel"] {
@@ -105,9 +115,9 @@ fn library(proxy: &Proxy, sqlite: bool, choice: Option<&str>) -> (tempfile::Temp
     }
     std::fs::write(root.join(".narou/local_setting.yaml"), settings).unwrap();
     std::fs::write(root.join(".narou/database.yaml"), format!(
-        "1:\n  id: 1\n  title: Digest Novel\n  author: Test Author\n  file_title: digest\n  sitename: 8.8.8.8\n  toc_url: {TOC_URL}\n  ncode: n1234ab\n  novel_type: 1\n  general_all_no: 2\n  last_update: '2026-01-01T00:00:00Z'\n  _convert_failure: true\n"
+        "1:\n  id: 1\n  title: Digest Novel\n  author: Test Author\n  file_title: {file_title}\n  sitename: 8.8.8.8\n  toc_url: {TOC_URL}\n  ncode: n1234ab\n  novel_type: 1\n  general_all_no: 2\n  last_update: '2026-01-01T00:00:00Z'\n  _convert_failure: true\n"
     )).unwrap();
-    let novel = root.join("小説データ/8.8.8.8/digest");
+    let novel = root.join("小説データ/8.8.8.8").join(file_title);
     std::fs::create_dir_all(novel.join("本文")).unwrap();
     let mut subtitles = Vec::new();
     for (index, title) in [("1", "第一話"), ("2", "第二話")] {
@@ -128,6 +138,9 @@ fn library(proxy: &Proxy, sqlite: bool, choice: Option<&str>) -> (tempfile::Temp
     };
     std::fs::write(novel.join("toc.yaml"), serde_yaml::to_string(&toc).unwrap()).unwrap();
     std::fs::write(novel.join("saved.epub"), b"previous EPUB must remain byte-for-byte unchanged").unwrap();
+    for (name, content) in custom_inputs {
+        std::fs::write(novel.join(name), content).unwrap();
+    }
     if sqlite { std::fs::write(root.join(".narou/storage-backend"), "sqlite\n").unwrap(); }
     let imported = run(root, proxy, sqlite, false, &["list"]);
     assert!(imported.status.success(), "{}", text(&imported));
@@ -174,6 +187,67 @@ fn digest_cancellation_preserves_content_and_is_not_an_error_in_cli_or_web_mode(
                 let requests = proxy.requests.lock().unwrap();
                 assert!(!requests.is_empty(), "fixture must actually fetch the latest TOC");
                 assert!(requests.iter().all(|line| line.starts_with(&format!("GET {TOC_URL} "))), "canceled update fetched a section: {requests:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn site_folder_naming_changes_preserve_existing_library_data() {
+    let proxy = Proxy::start();
+    let custom_inputs = [
+        ("setting.ini", "enable_auto_indent=false\n"),
+        ("replace.txt", "personal replacement rules\n"),
+        ("converter.yaml", "before: []\n"),
+    ];
+    for sqlite in [false, true] {
+        for web in [false, true] {
+            for operation in ["cancel", "update", "force-download"] {
+                let choice = if operation == "update" { "1" } else { "2" };
+                let (temp, novel) = library_with_layout(
+                    &proxy, sqlite, Some(choice), "n1234ab", &custom_inputs,
+                );
+                // A definition update must not change an existing novel's storage
+                // identity or make its saved two-section TOC disappear.
+                std::fs::write(temp.path().join("webnovel/digest.yaml"),
+                    format!("{}\nappend_title_to_folder_name: true\n",
+                        SITE.replace("sitename: 8.8.8.8", "sitename: Updated Site"))).unwrap();
+                let files = saved_files(&novel);
+                let objects = saved_objects(temp.path(), sqlite);
+                let output = run(temp.path(), &proxy, sqlite, web,
+                    if operation == "force-download" {
+                        &["download", "1", "--force", "--no-convert"]
+                    } else {
+                        &["update", "1", "--no-convert"]
+                    });
+                let log = text(&output);
+                assert!(output.status.success(), "sqlite={sqlite}, web={web}, operation={operation}: {log}");
+                assert!(novel.is_dir(), "existing novel directory was discarded: {log}");
+                assert!(!novel.with_file_name("n1234ab Digest Novel").exists(),
+                    "existing novel was silently relocated: {log}");
+                for (name, content) in custom_inputs {
+                    assert_eq!(std::fs::read(novel.join(name)).unwrap(), content.as_bytes(),
+                        "custom input {name} was replaced: {log}");
+                }
+                assert_eq!(std::fs::read(novel.join("saved.epub")).unwrap(), files[3]);
+                let file_title: String = if sqlite {
+                    rusqlite::Connection::open(temp.path().join(".narou/db.sqlite")).unwrap()
+                        .query_row("SELECT file_title FROM novels WHERE id=1", [], |row| row.get(0)).unwrap()
+                } else {
+                    let records: std::collections::HashMap<i64, narou_rs::db::NovelRecord> =
+                        serde_yaml::from_slice(&std::fs::read(temp.path().join(".narou/database.yaml")).unwrap()).unwrap();
+                    records[&1].file_title.clone()
+                };
+                assert_eq!(file_title, "n1234ab");
+                if operation == "cancel" {
+                    assert!(log.contains("の更新はキャンセルされました"), "{log}");
+                    assert_eq!(saved_files(&novel), files);
+                    assert_eq!(saved_objects(temp.path(), sqlite), objects);
+                } else {
+                    let toc: narou_rs::downloader::TocFile =
+                        serde_yaml::from_slice(&std::fs::read(novel.join("toc.yaml")).unwrap()).unwrap();
+                    assert_eq!(toc.subtitles.len(), 1, "explicit update must still be accepted");
+                }
             }
         }
     }

@@ -1,6 +1,20 @@
 # narou.rs 移植状況
 
-## 現況（v0.4.17 リリース済み / develop 次版）
+## P1 データ保全の修正（2026-10-24、未リリース / `fix-p1-data-preservation`）
+
+release-check 監査と独立レビューで再現したデータ損失系の不具合を修正。修正対象は (1) 更新時の保存フォルダ移行、(2) SQLite メタデータの競合上書き、(3) SQLite↔YAML 往復での編集消失、(4) `narou-compat` 実行中切替での管理状態消失、(5) `update` メタデータ更新の stale 全件 Upsert。
+
+- (1) `src/downloader/mod.rs`: 既存レコードの `file_title` / `sitename` を保存先として常に優先（Ruby `get_file_title` / `sitename` と同じ）。`append_title_to_folder_name` 後付けやサイト名変更で別フォルダへ移り旧 EPUB・個別設定・置換規則・退避話を `remove_dir_all` で消していた経路を削除。通常更新で旧フォルダは自動削除しない。`tests/digest_cancellation.rs` に YAML/SQLite × CLI/Web × キャンセル/更新/`download --force` の保持回帰を追加。
+- (2) `src/db/database.rs` / `src/native/sqlite/bulk.rs`: `update_records` は IMMEDIATE トランザクションを開始してから権威レコードを読み、closure・保存を同一境界で実行。`save()` は永続化済み baseline との項目差分だけを最新行へ適用（別行・未知項目・明示削除を保持し、削除済み行を復活させない、新規 ID 衝突はエラー）。SQLite の `allocate_id` / `release_id` は共有予約 SQL を使い、未公開 ID を別プロセスが再利用しない。`tests/sqlite_record_consistency.rs` 15 件（うち 1 件は親から起動する子プロセス補助）。
+- (3) SQLite 書き出し指紋（`export_file_sha:*`）は成功時に「現在の公開内容」だけへ確定し、`database_yaml_sha` は同一トランザクションで更新。YAML 復帰後の編集は古い互換用 SHA と一致しても取り込み、未編集の書き出し予測だけを再取り込み対象外にする。起動時取り込み・互換ミラー生成も root → YAML → connection の順でロックし、古い YAML スナップショットが新しい SQLite 行を消さない。`src/native/sqlite/export_yaml.rs` は DATABASE ロック保持中に権威レコード＋索引を同じスナップショットから書き出し、グローバル設定と非同期オブジェクト書き出しはロック外。`tests/yaml_rollback_roundtrip.rs` に export 最新性の回帰を追加。
+- (4) `src/native/sqlite/state.rs`: `with_compat_lock`（`.narou/compat-state.lock`）を追加し、`get_raw` / `update_raw` / `set_raw` / `configure` を同じ権威移譲境界に統一。切替時は管理ファイル（freeze/alias/author/tag_colors/login_cookie/latest_convert/local_setting/queue/notepad）と作品レコード・索引を一度に引き継ぎ、公開前に所有権（指紋）を durable に記録、公開は最後にフラグ、失敗時は元ファイルへ復元。無効化時はファイル権威の内容を先に SQLite へ同期するため、中断しても外部編集が巻き戻らない。`database.yaml` / `database_index.yaml` は `app_state('inv')` に入れず、レコード権威として別扱い。`tests/narou_compat_transitions.rs` 11 件（Windows のみ read-only 失敗系を含む）。
+- (5) `src/commands/update.rs` / `src/native/novel_repository.rs`: 既存レコードのメタデータ更新に `update_existing_sync`（権威 `update_records` 内で最新行を変更）を導入し、更新確認・変換失敗フラグ・話数情報・空題名修復の stale 全件 Upsert を置換。作成・明示的全置換の `Upsert` 契約は不変。`update.rs` の bin テスト 7 件を追加。
+
+検証: `cargo test -p narou_rs --features lite --bin narou_rs` 120 件、`sqlite_record_consistency` 14+1 ignored、`narou_compat_transitions` 11 件、`digest_cancellation` 5 件、`yaml_rollback_roundtrip` 6 件、`cargo test --workspace --all-targets --features lite` を確認。ドキュメントは `COMMANDS.md`（update / narou-compat / db / 保存境界）と `VERSION.md` 未リリース節を同期。
+
+残課題（今回の修正外・既知）: `Inventory` のファイルキャッシュは mtime のみで判定するため、同一 mtime の外部書き換えを古い内容として返す可能性（Windows の遅延 mtime 更新で顕在化しうる）。YAML 管理の新規 ID 採番はプロセス内。同一項目の同時変更は後勝ち。`narou-compat` の外部手編集・非協調の narou.rb 書き込みはネイティブロックの対象外。`convert` の device 後付け half-indent 上書き（#42 の残件）や P2 監査項目は未修正。
+
+
 
 ユーザーが「更新されたバージョンをセキュリティアップデートとしてバージョンを切って」と明示指定。公開済みは v0.4.16（2026-10-21）、今回の次版は **v0.4.17** とする。本体/Worker/relay/両 lock/ライセンス表記を 0.4.17 へ更新し、VERSION.md 先頭に v0.4.17 節を追加した。
 
