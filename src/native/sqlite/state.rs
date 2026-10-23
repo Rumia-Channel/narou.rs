@@ -65,6 +65,14 @@ impl StateDb {
         self.conn.clone()
     }
 
+    /// Serialize authority changes with native readers and writers, including
+    /// other processes. Always take this before YAML locks and the connection.
+    pub(crate) fn with_compat_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::db::inventory::with_exclusive_file_lock(
+            &self.narou_dir.join("compat-state"), operation,
+        )
+    }
+
     /// Legacy file backing an `app_state` entry, when that state has one
     /// (`crate::db::state_inventory` owns the list). Bookkeeping rows — the
     /// site-definition import marker, `meta` keys — have no file: they are
@@ -155,6 +163,15 @@ impl StateDb {
         self.set_raw_db("meta", &key, &serde_yaml::to_string(&[Some(next), previous])?)
     }
 
+    /// Finalize a successful projection; prior/intermediate hashes are only
+    /// retained while publication is incomplete. Caller owns any root/file lock.
+    pub(crate) fn finish_export_file(&self, file: &str, content: &str) -> Result<()> {
+        use sha2::Digest;
+        let hash = hex::encode(sha2::Sha256::digest(content.as_bytes()));
+        self.set_raw_db("meta", &format!("export_file_sha:{file}"),
+            &serde_yaml::to_string(&[Some(hash), None])?)
+    }
+
     pub(crate) fn is_export_file(&self, file: &str, content: &str) -> Result<bool> {
         use sha2::Digest;
         let Some(raw) = self.get_raw_db("meta", &format!("export_file_sha:{file}"))? else {
@@ -228,92 +245,234 @@ impl StateDb {
     }
 
     pub fn get_raw(&self, scope: &str, key: &str) -> Result<Option<String>> {
-        // Compat mode: the legacy file is authoritative when present.
+        self.with_compat_lock(|| self.get_raw_unlocked(scope, key))
+    }
+
+    /// Read the current authority while the caller holds `with_compat_lock`.
+    /// Used to keep an export snapshot and its publication in the same lock.
+    pub(crate) fn get_raw_unlocked(&self, scope: &str, key: &str) -> Result<Option<String>> {
         if self.compat_now()
             && let Some(path) = self.legacy_path(scope, key)
-            && let Ok(content) = std::fs::read_to_string(&path)
+            && let Some(content) = read_legacy_file(&path)?
         {
             return Ok(Some(content));
         }
         self.get_raw_db(scope, key)
     }
 
-    /// Read, update and project one state under a single writer transaction.
-    /// The closure must not access the database again.
+    /// Read, update and project the same authoritative snapshot. The closure
+    /// must not access the database again. A flag change also transfers every
+    /// managed state before exposing the new authority to another writer.
     pub fn update_raw<T, F>(&self, scope: &str, key: &str, update: F) -> Result<(String, T)>
     where
         F: FnOnce(&str) -> Result<(String, T)>,
     {
-        let path = self.compat_now().then(|| self.legacy_path(scope, key)).flatten();
-        let operation = || {
-            let mut conn = self.conn.lock();
-            let transaction = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(super::sqlite_error)?;
-            let raw = if let Some(path) = &path {
-                crate::db::inventory::read_optional_yaml_file(path)?
+        self.with_compat_lock(|| {
+            let compat = self.compat_now();
+            let path = self.legacy_path(scope, key);
+            let paths: Vec<PathBuf> = if scope == "inv" && key == "local_setting" {
+                state_inventory::import_export_states().map(|(_, file)| file)
+                    .chain(["database.yaml", "database_index.yaml"])
+                    .map(|file| self.narou_dir.join(file)).collect()
             } else {
-                use rusqlite::OptionalExtension;
-                transaction.query_row(
-                    "SELECT value_yaml FROM app_state WHERE scope = ? AND key = ?",
-                    rusqlite::params![scope, key],
-                    |row| row.get::<_, String>(0),
-                ).optional().map_err(super::sqlite_error)?.unwrap_or_default()
+                path.iter().cloned().collect()
             };
-            let (content, result) = update(&raw)?;
-            if content != raw {
-                transaction.execute(
-                    "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
-                     ON CONFLICT(scope, key) DO UPDATE SET value_json = excluded.value_json, value_yaml = excluded.value_yaml",
-                    rusqlite::params![scope, key, content],
-                ).map_err(super::sqlite_error)?;
-                if scope == "inv" && key == "freeze" {
-                    Self::project_frozen_novels(&transaction, &content)?;
+            with_state_file_locks(&paths, || {
+                let mut conn = self.conn.lock();
+                let transaction = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(super::sqlite_error)?;
+                let file_raw = if compat {
+                    path.as_ref().map(|path| read_legacy_file(path)).transpose()?.flatten()
+                } else {
+                    None
+                };
+                let raw = file_raw.or(read_state_row(&transaction, scope, key)?).unwrap_or_default();
+                let (content, result) = update(&raw)?;
+                let next_compat = if scope == "inv" && key == "local_setting" {
+                    compat_flag_in_yaml(&content).unwrap_or(false)
+                } else {
+                    compat
+                };
+                if compat != next_compat {
+                    let mut mirrors = Vec::new();
+                    for (state_key, file) in state_inventory::import_export_states() {
+                        let path = self.narou_dir.join(file);
+                        let before = read_legacy_file(&path)?;
+                        let stored = read_state_row(&transaction, "inv", state_key)?;
+                        let next = if state_key == "local_setting" {
+                            Some(content.clone())
+                        } else if compat {
+                            before.clone().or(stored)
+                        } else {
+                            stored.or(before.clone())
+                        };
+                        mirrors.push(CompatMirror { key: state_key, file, path, before, next });
+                    }
+                    // Relational records are a separate authority, never an
+                    // Inventory app_state row. Transfer them under the same
+                    // cutover locks, and derive the index from that exact map.
+                    let records_path = self.narou_dir.join("database.yaml");
+                    let records_before = read_legacy_file(&records_path)?;
+                    let mut records = super::bulk::load_all_records(&transaction)?;
+                    // Settings/author CLI adapters can run before Database has
+                    // performed its initial import. Match that constructor's
+                    // provenance decision rather than seeding empty/stale SQL
+                    // over an as-yet authoritative legacy/rollback snapshot.
+                    let pending_import = if !compat && let Some(raw) = &records_before {
+                        use sha2::Digest;
+                        let hash = hex::encode(sha2::Sha256::digest(raw.as_bytes()));
+                        let exported = read_state_row(&transaction, "meta", "export_file_sha:database.yaml")?;
+                        let known: [Option<String>; 2] = exported.as_ref()
+                            .map(|raw| serde_yaml::from_str(raw)).transpose()?.unwrap_or_default();
+                        let owned = known.iter().flatten().any(|known| *known == hash);
+                        let stored_sha = read_state_row(&transaction, "meta", "database_yaml_sha")?;
+                        !raw.trim().is_empty() && !owned && if exported.is_some() {
+                            true
+                        } else if let Some(stored_sha) = stored_sha {
+                            stored_sha != hash
+                        } else {
+                            records.is_empty()
+                        }
+                    } else {
+                        false
+                    };
+                    if (compat || pending_import) && let Some(raw) = &records_before {
+                        records = if raw.trim().is_empty() { BTreeMap::new() }
+                            else { serde_yaml::from_str(raw)? };
+                    }
+                    for (&id, record) in &mut records { record.id = id; }
+                    let records_yaml = serde_yaml::to_string(&records)?;
+                    let mut index = crate::db::index_store::IndexStore::new();
+                    index.reconcile(&records.iter().map(|(&id, record)| (id, record.clone())).collect());
+                    let index_path = self.narou_dir.join("database_index.yaml");
+                    mirrors.push(CompatMirror {
+                        key: "database", file: "database.yaml", path: records_path,
+                        before: records_before, next: Some(records_yaml.clone()),
+                    });
+                    mirrors.push(CompatMirror {
+                        key: "database_index", file: "database_index.yaml", path: index_path.clone(),
+                        before: read_legacy_file(&index_path)?, next: Some(index.to_yaml()?),
+                    });
+                    if compat || pending_import {
+                        super::bulk::replace_records_conn(&transaction, &records)?;
+                    }
+                    use sha2::Digest;
+                    let source_yaml = if compat {
+                        mirrors.iter().find(|mirror| mirror.key == "database")
+                            .and_then(|mirror| mirror.before.as_deref()).unwrap_or(&records_yaml)
+                    } else {
+                        &records_yaml
+                    };
+                    write_state_row(&transaction, "meta", "database_yaml_sha",
+                        &hex::encode(sha2::Sha256::digest(source_yaml.as_bytes())))?;
+                    // Commit ownership BEFORE publishing any file. If seeding
+                    // fails or the process stops, startup must not import an
+                    // unowned partial mirror over later SQLite updates. On
+                    // disable, first durably synchronize the OLD file authority:
+                    // even an interruption after the false flag is published
+                    // cannot discard external author/freeze edits as stale.
+                    for mirror in &mirrors {
+                        remember_transition_file(&transaction, mirror)?;
+                        if (compat || pending_import) && mirror.key != "local_setting" && mirror.inventory_state()
+                            && let Some(payload) = &mirror.next
+                        {
+                            write_state_row(&transaction, "inv", mirror.key, payload)?;
+                        }
+                    }
+                    transaction.commit().map_err(super::sqlite_error)?;
+                    let mut published = Vec::new();
+                    let publication = (|| {
+                        let transaction = conn
+                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                            .map_err(super::sqlite_error)?;
+                        for mirror in &mirrors {
+                            if mirror.inventory_state() && let Some(payload) = &mirror.next {
+                                write_state_row(&transaction, "inv", mirror.key, payload)?;
+                            }
+                        }
+                        // Publish the mode switch last. Other native clients
+                        // remain excluded by compat-state.lock until commit.
+                        for mirror in mirrors.iter().filter(|m| m.key != "local_setting")
+                            .chain(mirrors.iter().filter(|m| m.key == "local_setting"))
+                        {
+                            if (next_compat || mirror.key == "local_setting")
+                                && mirror.next != mirror.before
+                                && let Some(payload) = &mirror.next
+                            {
+                                published.push(mirror);
+                                crate::db::inventory::atomic_write_locked(&mirror.path, payload)?;
+                            }
+                        }
+                        for mirror in &mirrors {
+                            let actual = if next_compat || mirror.key == "local_setting" {
+                                mirror.next.as_ref()
+                            } else {
+                                mirror.before.as_ref()
+                            };
+                            if let Some(actual) = actual {
+                                finish_file_row(&transaction, mirror.file, actual)?;
+                            }
+                        }
+                        transaction.commit().map_err(super::sqlite_error)
+                    })();
+                    if let Err(error) = publication {
+                        restore_compat_files(&published).map_err(|rollback| NarouError::Database(
+                            format!("compatibility transition failed: {error}; restoring files also failed: {rollback}")
+                        ))?;
+                        return Err(error);
+                    }
+                } else {
+                    // Even an unchanged file preimage may be newer than its DB
+                    // mirror; always synchronize the relational consumers.
+                    write_state_row(&transaction, scope, key, &content)?;
+                    if compat && let Some(path) = &path {
+                        crate::db::inventory::atomic_write_locked(path, &content)?;
+                        if let Some(file) = path.file_name().and_then(|file| file.to_str()) {
+                            finish_file_row(&transaction, file, &content)?;
+                        }
+                    }
+                    transaction.commit().map_err(super::sqlite_error)?;
                 }
-                if let Some(path) = &path {
-                    crate::db::inventory::atomic_write_locked(path, &content)?;
-                }
-            }
-            transaction.commit().map_err(super::sqlite_error)?;
-            Ok((content, result))
-        };
-        match &path {
-            Some(path) => crate::db::inventory::with_exclusive_file_lock(path, operation),
-            None => operation(),
-        }
+                Ok((content, result))
+            })
+        })
     }
 
     pub fn set_raw(&self, scope: &str, key: &str, value_yaml: &str) -> Result<()> {
-        // Compat mode: write the legacy file first (authoritative), then
-        // mirror into app_state so DB-side consumers stay in sync.
-        if self.compat_now()
-            && let Some(path) = self.legacy_path(scope, key)
-        {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            crate::db::inventory::atomic_write(&path, value_yaml)?;
-        }
-        self.set_raw_db(scope, key, value_yaml)
+        self.update_raw(scope, key, |_| Ok((value_yaml.to_string(), ())))?;
+        Ok(())
     }
 
     pub fn delete_raw(&self, scope: &str, key: &str) -> Result<()> {
-        if self.compat_now()
-            && let Some(path) = self.legacy_path(scope, key)
-        {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+        if scope == "inv" && key == "local_setting" {
+            // Removing the flag is also a transfer back to SQLite authority.
+            self.set_raw(scope, key, "{}\n")?;
         }
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM app_state WHERE scope = ? AND key = ?",
-            rusqlite::params![scope, key],
-        )
-        .map_err(super::sqlite_error)?;
-        Ok(())
+        self.with_compat_lock(|| {
+            let path = self.legacy_path(scope, key);
+            let paths: Vec<PathBuf> = path.iter().cloned().collect();
+            with_state_file_locks(&paths, || {
+                if self.compat_now() && let Some(path) = &path {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                let mut conn = self.conn.lock();
+                let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(super::sqlite_error)?;
+                transaction.execute(
+                    "DELETE FROM app_state WHERE scope = ? AND key = ?",
+                    rusqlite::params![scope, key],
+                ).map_err(super::sqlite_error)?;
+                if scope == "inv" && key == "freeze" {
+                    Self::project_frozen_novels(&transaction, "{}\n")?;
+                }
+                transaction.commit().map_err(super::sqlite_error)
+            })
+        })
     }
 
 
@@ -360,6 +519,103 @@ impl StateDb {
         &self.conn
     }
 
+}
+
+struct CompatMirror {
+    key: &'static str,
+    file: &'static str,
+    path: PathBuf,
+    before: Option<String>,
+    next: Option<String>,
+}
+
+impl CompatMirror {
+    fn inventory_state(&self) -> bool {
+        !matches!(self.key, "database" | "database_index")
+    }
+}
+
+fn read_legacy_file(path: &Path) -> Result<Option<String>> {
+    match crate::db::inventory::ensure_yaml_size_limit(path) {
+        Ok(()) => {}
+        Err(NarouError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_state_row(conn: &Connection, scope: &str, key: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT value_yaml FROM app_state WHERE scope = ? AND key = ?",
+        rusqlite::params![scope, key], |row| row.get(0),
+    ).optional().map_err(super::sqlite_error)
+}
+
+fn write_state_row(transaction: &rusqlite::Transaction<'_>, scope: &str, key: &str, content: &str) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
+         ON CONFLICT(scope, key) DO UPDATE SET value_json = excluded.value_json, value_yaml = excluded.value_yaml",
+        rusqlite::params![scope, key, content],
+    ).map_err(super::sqlite_error)?;
+    if scope == "inv" && key == "freeze" {
+        StateDb::project_frozen_novels(transaction, content)?;
+    }
+    Ok(())
+}
+
+fn with_state_file_locks<T>(paths: &[PathBuf], operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    if let Some((path, rest)) = paths.split_first() {
+        crate::db::inventory::with_exclusive_file_lock(path, || with_state_file_locks(rest, operation))
+    } else {
+        operation()
+    }
+}
+
+fn remember_transition_file(transaction: &rusqlite::Transaction<'_>, mirror: &CompatMirror) -> Result<()> {
+    use sha2::Digest;
+    let hash = |payload: &String| hex::encode(sha2::Sha256::digest(payload.as_bytes()));
+    let next = mirror.next.as_ref().map(hash);
+    let previous = mirror.before.as_ref().map(hash).filter(|hash| Some(hash) != next.as_ref());
+    write_state_row(transaction, "meta", &format!("export_file_sha:{}", mirror.file),
+        &serde_yaml::to_string(&[next, previous])?)
+}
+
+fn finish_file_row(transaction: &rusqlite::Transaction<'_>, file: &str, content: &str) -> Result<()> {
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(content.as_bytes()));
+    write_state_row(transaction, "meta", &format!("export_file_sha:{file}"),
+        &serde_yaml::to_string(&[Some(hash), None])?)
+}
+
+fn restore_compat_files(published: &[&CompatMirror]) -> Result<()> {
+    let mut first_error = None;
+    for mirror in published.iter().rev() {
+        let restored = (|| {
+            if read_legacy_file(&mirror.path)? == mirror.before {
+                return Ok(());
+            }
+            match &mirror.before {
+                Some(payload) => crate::db::inventory::atomic_write_locked(&mirror.path, payload),
+                None => match std::fs::remove_file(&mirror.path) {
+                    Ok(()) => Ok(crate::compat::fsync_parent_dir(&mirror.path)?),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error.into()),
+                },
+            }
+        })();
+        if let Err(error) = restored {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 static OPEN_HANDLES: LazyLock<Mutex<HashMap<PathBuf, StateDb>>> =
@@ -515,7 +771,11 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
         conn: Arc::new(Mutex::new(conn)),
         narou_dir: narou_dir.to_path_buf(),
     };
-    reconcile_managed_files(&state)?;
+    state.with_compat_lock(|| {
+        let paths: Vec<PathBuf> = state_inventory::import_export_states()
+            .map(|(_, file)| state.narou_dir.join(file)).collect();
+        with_state_file_locks(&paths, || reconcile_managed_files(&state))
+    })?;
     if state.objects_empty()? {
         // One-shot import of the existing 小説データ/ tree so listings and
         // reads are DB-complete from the start. The filesystem mirror keeps
@@ -552,11 +812,28 @@ fn reconcile_managed_files(state: &StateDb) -> Result<()> {
     let mut imported: Vec<PathBuf> = Vec::new();
     for (key, file_name) in state_inventory::import_export_states() {
         let path = state.narou_dir.join(file_name);
-        let file_content = std::fs::read_to_string(&path).ok();
+        // Rollback/export may have been blocked by a directory at this name.
+        // It is not a legacy payload to import. Real-file read errors still
+        // propagate, and compat enable remains strict because it must seed it.
+        if !compat && let Ok(metadata) = std::fs::metadata(&path) && !metadata.is_file() {
+            continue;
+        }
+        let file_content = read_legacy_file(&path)?;
         if !compat
             && let Some(content) = &file_content
             && state.is_export_file(file_name, content)?
         {
+            if key == "local_setting"
+                && let Some(stored) = state.get_raw_db("inv", key)?
+                && compat_flag_in_yaml(&stored) == Some(true)
+            {
+                // A false flag published just before an interrupted commit
+                // still selects SQLite on restart. Preserve newer settings,
+                // but do not let retiring this owned file resurrect DB=true.
+                let mut settings: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(&stored)?;
+                settings.insert(COMPAT_SETTING_KEY.into(), serde_yaml::Value::Bool(false));
+                state.set_raw_db("inv", key, &serde_yaml::to_string(&settings)?)?;
+            }
             imported.push(path);
             continue;
         }
@@ -565,7 +842,7 @@ fn reconcile_managed_files(state: &StateDb) -> Result<()> {
                 Some(content) => state.set_raw_db("inv", key, &content)?,
                 None => {
                     if let Some(payload) = state.get_raw_db("inv", key)? {
-                        crate::db::inventory::atomic_write(&path, &payload)?;
+                        crate::db::inventory::atomic_write_locked(&path, &payload)?;
                     }
                 }
             }
