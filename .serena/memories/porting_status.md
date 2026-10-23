@@ -16,6 +16,12 @@ v0.4.17 リリース完了 (2026-10-22): main `a5f79ac` / tag `v0.4.17`。develo
 
 次の develop 変更 (未リリース): **S3 挿絵の全作品共通 content-addressed プール**。Worker の `illustration_dedup` を常時 true、native も S3 保存なら storage-backend を問わず dedup を有効化。新規挿絵は常に hex 名になり、`illustrations/<base64url(sha256)>.<ext>` に集約。既存の小説別 hex 名は native `narou illust s3-dedup` / Worker `POST /api/admin/illustration-dedup` (`status|plan|copy|reset`) で移行でき、presign はプールに無ければ旧配置へフォールバックする。テストは lib 1156 / lite 1173、Worker contract、clippy、wasm が成功し、develop CI (`51176fe`) も success。
 
+## issue #41 の追加報告への対応（2026-10-23、未リリース）
+
+最新コメントでは v0.4.17 の `7` 自動選択後の暗黙更新により EPUB が 264KB → 97KB へ縮小。4-8 は更新の承認ではないため、選択肢を使い切った後は Ruby と同じ `2`（キャンセル）へ戻し、続行には明示的な `1`（例 `7,1`）を必要とする。キャンセルは正常な見送りとして update/download の失敗件数へ加算しない（Ruby の非0終了からの意図的な差。取得・変換の真の失敗はエラーのまま）。設定の help に 1-8 の内容、安全な既定値と話数減少の注意を記載する。#42 と #39 は別件として混ぜない。既に縮小された出力の自動復旧は行わず、未リリース修正を v0.4.17 に収録済みと案内しない。
+
+検証: 通常版 lib 1158 / bins 124 / 関連 integration 33（新規 digest_cancellation 4 を含む）が成功。新規テストは実バイナリで YAML/SQLite × CLI/Web 子プロセス × 自動選択6通りの24ケースについて、キャンセル時の既存目次・本文・EPUB用出力ファイル・SQLiteオブジェクトのバイト保持と本文リクエストなしを確認。明示1で減少後の目次を採用、明示3の凍結、真のエラーだけ終了コード1、downloadの正常見送りも確認した。Lite lib 1175 / 新規 integration 4、`cargo clippy -p narou_rs --all-targets --features lite -- -D warnings` も成功。ローカルの MSVC cl は以前と同じ D8050 が発生するため、vcvars64.bat + CC/CXX=clang-cl でビルドする。TEMP/TMP は repo の target に設定して TempDir を自動清掃（OS の Temp / Documents では作成拒否。権限診断は NOT_THIS_CLASS、ACL・所有者は変更なし）。公開版への反映・タグ作成は今回行わず、利用者の確認までは issue を Open のまま維持する。
+
 ## 現況（v0.4.16 リリース）
 
 ユーザーが v0.4.16 でのリリース（develop 統合・公開）を明示指定。公開済みは v0.4.15（2026-10-18）。本体/Worker/両lock/ライセンス表記を 0.4.16 へ更新し、VERSION.md 先頭に v0.4.16 節を追加した。v0.4.15 節へリリース後に追記されていた SORAHOST / Cloud Run リレー配備の 4 項目は、実際には v0.4.15 に含まれないため v0.4.16 節へ移した。

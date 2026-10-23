@@ -1591,9 +1591,8 @@ async fn process_novel_for_update(
                     return Ok(new_mistook);
                 }
                 UpdateStatus::Canceled => {
-                    // キャンセル行は `print_status_messages` が
-                    // `emit_download_result_lines` 経由で既に出している。
-                    new_mistook += 1;
+                    // キャンセル行は既に表示済み。安全のための見送りは
+                    // 失敗ではなく、Web UI のエラー通知・再変換も不要 (#41)。
                     return Ok(new_mistook);
                 }
             }
