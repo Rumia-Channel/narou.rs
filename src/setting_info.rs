@@ -889,7 +889,20 @@ pub fn setting_variables() -> SettingVariables {
             "download.choices-of-digest-options",
             vis(
                 VarType::String,
-                "ダイジェスト化選択肢が出た場合に自動で項目を選択する (カンマ区切り。4-8 の非終端アクションの後は更新を継続)",
+                concat!(
+                    "話数の減少を検出したときの操作をカンマ区切りで順に指定します。\n",
+                    "1: このまま更新する（話数減少を受け入れます。既存のEPUBが短くなる可能性があります）\n",
+                    "2: 更新をキャンセル\n",
+                    "3: 更新をキャンセルして小説を凍結する\n",
+                    "4: バックアップを作成する\n",
+                    "5: 最新のあらすじを表示する\n",
+                    "6: 小説ページをブラウザで開く\n",
+                    "7: 保存フォルダを開く\n",
+                    "8: 変換する（保存済みの本文を使用）\n",
+                    "空欄、または選択肢を使い切った場合は 2（キャンセル）になります。",
+                    "未設定の場合はCLIの対話環境では選択を求め、Web UI・非対話環境ではキャンセルします。\n",
+                    "4-8 の操作だけでは更新を続行しません。例: 7 はフォルダ表示後にキャンセル、7,1 は表示後に更新します。"
+                ),
             ),
         ),
         (
@@ -1315,6 +1328,22 @@ mod tests {
             backoff_default.as_str(),
             Some("1m,5m,15m"),
         );
+    }
+
+    #[test]
+    fn digest_choices_help_lists_actions_and_safe_default() {
+        let vars = setting_variables();
+        let info = vars.get("download.choices-of-digest-options").unwrap();
+        for label in [
+            "1: このまま更新する", "2: 更新をキャンセル",
+            "3: 更新をキャンセルして小説を凍結する", "4: バックアップを作成する",
+            "5: 最新のあらすじを表示する", "6: 小説ページをブラウザで開く",
+            "7: 保存フォルダを開く", "8: 変換する",
+            "空欄", "選択肢を使い切った", "7,1", "保存済みの本文",
+        ] {
+            assert!(info.help.contains(label), "missing digest help: {label}");
+        }
+        assert!(!info.help.contains("非終端アクションの後は更新を継続"));
     }
 
     #[test]

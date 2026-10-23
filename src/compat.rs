@@ -648,26 +648,13 @@ fn choose_digest_action_inner(
             "1" => return DigestChoice::Update,
             "2" => return DigestChoice::Cancel,
             "3" => return DigestChoice::CancelAndFreeze,
-            "4" => {
-                queue_continue_update_after_auto_action(auto_choices);
-                return DigestChoice::Backup;
-            }
-            "5" => {
-                queue_continue_update_after_auto_action(auto_choices);
-                return DigestChoice::ShowStory;
-            }
-            "6" => {
-                queue_continue_update_after_auto_action(auto_choices);
-                return DigestChoice::OpenBrowser;
-            }
-            "7" => {
-                queue_continue_update_after_auto_action(auto_choices);
-                return DigestChoice::OpenFolder;
-            }
-            "8" => {
-                queue_continue_update_after_auto_action(auto_choices);
-                return DigestChoice::Convert;
-            }
+            // 閲覧・バックアップ・変換は更新の承認ではない。自動選択を
+            // 使い切ったら既定の 2 で止め、続行には明示的な 1 を必要とする。
+            "4" => return DigestChoice::Backup,
+            "5" => return DigestChoice::ShowStory,
+            "6" => return DigestChoice::OpenBrowser,
+            "7" => return DigestChoice::OpenFolder,
+            "8" => return DigestChoice::Convert,
             _ => {
                 if auto_choices.is_some() {
                     continue;
@@ -678,18 +665,6 @@ fn choose_digest_action_inner(
                 println!("選択肢の中にありません。もう一度入力して下さい");
             }
         }
-    }
-}
-
-/// 自動入力で非終端アクション (4-8) を実行したあと、選択肢が尽きていれば
-/// 「1: このまま更新する」を次に選ぶ。Ruby 準拠の既定 2 (キャンセル) のままだと、
-/// 「7: 保存フォルダを開く」等を指定したユーザーが意図せず更新をキャンセルされる
-/// (issue #41)。明示的な "2"/"3" が後続にある場合はそれを優先する。
-fn queue_continue_update_after_auto_action(auto_choices: &mut Option<VecDeque<String>>) {
-    if let Some(queue) = auto_choices.as_mut()
-        && queue.is_empty()
-    {
-        queue.push_back("1".to_string());
     }
 }
 
@@ -1126,36 +1101,49 @@ mod tests {
     }
 
     #[test]
-    fn digest_auto_choices_continue_update_after_a_non_terminal_action() {
-        // issue #41: 「7: 保存フォルダを開く」だけを自動指定したときに、
-        // その後ろへ暗黙の「2: キャンセル」を足さない。
-        let mut auto_choices = parse_digest_auto_choices(Some("7"));
-        assert_eq!(
-            choose_digest_action_with_auto_choices("title", "message", &mut auto_choices),
-            DigestChoice::OpenFolder
-        );
-        assert_eq!(
-            choose_digest_action_with_auto_choices("title", "message", &mut auto_choices),
-            DigestChoice::Update
-        );
+    fn digest_auto_choices_cancel_after_non_terminal_actions_unless_update_is_explicit() {
+        // issue #41: 閲覧・バックアップだけでは本文の置き換えを承認しない。
+        for (value, action) in [
+            ("4", DigestChoice::Backup),
+            ("5", DigestChoice::ShowStory),
+            ("6", DigestChoice::OpenBrowser),
+            ("7", DigestChoice::OpenFolder),
+            ("8", DigestChoice::Convert),
+        ] {
+            for (suffix, expected) in [
+                ("", DigestChoice::Cancel),
+                (",1", DigestChoice::Update),
+                (",2", DigestChoice::Cancel),
+                (",3", DigestChoice::CancelAndFreeze),
+            ] {
+                let mut choices = parse_digest_auto_choices(Some(&format!("{value}{suffix}")));
+                assert_eq!(
+                    choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                    action
+                );
+                assert_eq!(
+                    choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                    expected
+                );
+            }
+        }
+    }
 
-        let mut convert_then_update = parse_digest_auto_choices(Some("8"));
-        assert_eq!(
-            choose_digest_action_with_auto_choices(
-                "title",
-                "message",
-                &mut convert_then_update
-            ),
-            DigestChoice::Convert
-        );
-        assert_eq!(
-            choose_digest_action_with_auto_choices(
-                "title",
-                "message",
-                &mut convert_then_update
-            ),
-            DigestChoice::Update
-        );
+    #[test]
+    fn empty_and_invalid_digest_auto_choices_cancel_safely() {
+        for value in ["", " , ", "invalid", "0,9", "7,invalid"] {
+            let mut choices = parse_digest_auto_choices(Some(value));
+            if value.starts_with('7') {
+                assert_eq!(
+                    choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                    DigestChoice::OpenFolder
+                );
+            }
+            assert_eq!(
+                choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                DigestChoice::Cancel
+            );
+        }
     }
 
     #[test]
