@@ -56,6 +56,7 @@ pub use object_store::{
 pub use progress::ProgressReporter;
 pub use rate_limiter::{
     DownloadPacing, RateLimitScope, RateLimiter, ScopedPacing, normalize_site_key,
+    site_family,
     normalize_wait_steps,
 };
 pub use s3_request::{object_size, parse_content_range_size};

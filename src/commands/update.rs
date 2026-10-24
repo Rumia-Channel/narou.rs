@@ -1289,28 +1289,12 @@ fn collect_record_domains(target_ids: &[i64]) -> Result<HashMap<i64, String>, St
 /// まとめる。Pixiv の `www` / `accounts` のような別ホストも同じ。
 /// それ以外は登録可能ドメイン相当 (最後の 2〜3 ラベル) でまとめる。
 pub(crate) fn site_family(domain: &str) -> String {
-    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    if domain.is_empty() {
-        return UNKNOWN_DOMAIN_KEY.to_string();
+    let family = narou_rs::platform::site_family(domain);
+    if family.is_empty() {
+        UNKNOWN_DOMAIN_KEY.to_string()
+    } else {
+        family
     }
-    const TWO_LEVEL_SUFFIXES: &[&str] = &[
-        "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "ed.jp", "gr.jp", "lg.jp",
-        "com.au", "co.uk", "org.uk", "co.kr", "com.cn", "com.tw", "co.in",
-    ];
-    let labels: Vec<&str> = domain.split('.').filter(|label| !label.is_empty()).collect();
-    if labels.len() <= 2 {
-        return domain;
-    }
-    let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
-    if TWO_LEVEL_SUFFIXES.contains(&last_two.as_str()) && labels.len() >= 3 {
-        return format!(
-            "{}.{}.{}",
-            labels[labels.len() - 3],
-            labels[labels.len() - 2],
-            labels[labels.len() - 1]
-        );
-    }
-    last_two
 }
 
 /// Group targets by their site family so each group can be processed
