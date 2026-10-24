@@ -17,6 +17,7 @@ pub mod diff;
 pub mod download;
 pub mod folder;
 pub mod help;
+pub mod hidden;
 pub mod illust;
 pub mod init;
 pub mod inspect;

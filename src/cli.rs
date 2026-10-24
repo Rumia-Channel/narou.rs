@@ -879,6 +879,9 @@ pub enum Commands {
         sort_by: Option<String>,
         #[arg(long, hide = true)]
         frozen: bool,
+        /// Also show novels/tags hidden by `narou hidden`.
+        #[arg(long = "show-hidden")]
+        show_hidden: bool,
     },
     Tag {
         #[arg(short = 'a', long = "add")]
@@ -972,6 +975,12 @@ pub enum Commands {
     Author {
         #[command(subcommand)]
         action: crate::commands::author::AuthorAction,
+    },
+    /// Hide novels, tags, authors, or sites from the list.
+    #[command(after_help = "Examples:\n  narou hidden add 123 --tag 秘密\n  narou hidden add --site kakuyomu.jp\n  narou hidden list\n  narou list --show-hidden")]
+    Hidden {
+        #[command(subcommand)]
+        action: crate::commands::hidden::HiddenAction,
     },
     /// Login credentials shared with a browser machine (list/import/export/rename/order/clear).
     Login {

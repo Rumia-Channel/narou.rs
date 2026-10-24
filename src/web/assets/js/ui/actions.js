@@ -122,6 +122,16 @@ export function bindActions() {
     renderNovelList();
   });
 
+  if (El.novelListShowHidden) {
+    El.novelListShowHidden.checked = State.showHidden;
+    El.novelListShowHidden.addEventListener('change', () => {
+      State.showHidden = El.novelListShowHidden.checked;
+      lsSet('show-hidden', String(State.showHidden));
+      State.currentPage = 1;
+      refreshList();
+    });
+  }
+
   // --- View menu ---
   on('action-view-all', () => {
     State.viewFrozen = true;
@@ -862,6 +872,16 @@ export function bindActions() {
     },
     showDiff: (id) => openDiffList([id]),
     tagEditSingle: (id) => openTagEditor([id]),
+    hiddenToggle: async (id) => {
+      const current = await fetchJson('/api/hidden');
+      const novels = Array.isArray(current?.novels) ? current.novels : [];
+      const isHidden = novels.includes(Number(id));
+      await postJson('/api/hidden', {
+        action: isHidden ? 'remove' : 'add',
+        novels: [Number(id)],
+      });
+      await refreshList();
+    },
     freezeToggle: async (id) => {
       await postJson('/api/freeze', { ids: [Number(id)] });
       await refreshList();
@@ -1964,7 +1984,7 @@ export async function refreshList(redraw = true) {
   return runRefresh('list', async () => {
     const generation = listRefreshGeneration;
     try {
-      const resp = await fetchJson('/api/list?all=true');
+      const resp = await fetchJson(`/api/list?all=true${State.showHidden ? '&show_hidden=true' : ''}`);
       if (generation !== listRefreshGeneration) return;
       if (resp && Array.isArray(resp.data)) {
         State.novels = resp.data;

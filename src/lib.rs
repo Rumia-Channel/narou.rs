@@ -21,6 +21,7 @@ pub mod db;
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod downloader;
 pub mod error;
+pub mod hidden;
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod illustration_animation;
 pub mod illustration_store;

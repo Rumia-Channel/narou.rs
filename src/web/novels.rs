@@ -92,6 +92,8 @@ async fn api_list_inner(
             length,
             sort_column,
             sort_order,
+            hidden: Some(crate::native::hidden::load().unwrap_or_default()),
+            include_hidden: params.show_hidden.unwrap_or(false),
         })
         .await
         .map_err(map_application_error)?;

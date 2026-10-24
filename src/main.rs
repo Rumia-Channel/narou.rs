@@ -344,6 +344,13 @@ async fn run_command(
                 1
             }
         },
+        Commands::Hidden { action } => match commands::hidden::cmd_hidden(action) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
         Commands::Download {
             targets,
             force,
@@ -416,7 +423,7 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                 0
             }
         }
-        Commands::Download { .. } | Commands::Update { .. } | Commands::Csv { .. } | Commands::Author { .. } => {
+        Commands::Download { .. } | Commands::Update { .. } | Commands::Csv { .. } | Commands::Author { .. } | Commands::Hidden { .. } => {
             unreachable!()
         }
         Commands::Mail { targets, force } => {
@@ -536,6 +543,7 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             echo,
             sort_by,
             frozen,
+            show_hidden,
         } => commands::manage::cmd_list(commands::manage::ListOptions {
             limit,
             latest,
@@ -551,6 +559,7 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             echo,
             sort_by,
             frozen,
+            show_hidden,
         }),
         Commands::Tag {
             add,

@@ -78,6 +78,7 @@ export const State = {
   // View flags (persisted to localStorage)
   viewFrozen: lsBool('view-frozen', true),
   viewNonfrozen: lsBool('view-nonfrozen', true),
+  showHidden: lsBool('show-hidden', false),
   wideMode: lsBool('wide-mode', false),
   settingNewTab: lsBool('setting-new-tab', false),
   buttonsTop: lsBool('buttons-top', true),
@@ -122,6 +123,7 @@ const ELEMENT_IDS = [
   'main-control-panel', 'footer-control-panel', 'footer-navbar',
   'novel-list-body', 'novel-list', 'novel-list-container',
   'novel-list-length', 'novel-list-info', 'novel-list-pagination-top', 'novel-list-pagination',
+  'novel-list-show-hidden',
   'control-panel',
   'notepad-modal', 'notepad', 'notepad-close', 'save-notepad-button',
   'queue-modal', 'queue-modal-close', 'queue-clear-button', 'queue-reload-button',
