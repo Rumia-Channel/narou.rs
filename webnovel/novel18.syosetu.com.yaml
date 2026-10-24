@@ -2,6 +2,7 @@
 # 小説サイト定義
 name: 小説家になろうR18
 domain: novel18.syosetu.com
+site_family: syosetu.com
 top_url: https://\\k<domain>
 url: https?://\\k<domain>/(?<ncode>n\d+[a-z]+)
 series_url: https?://\\k<domain>/(?<series>x?s\d+[a-z]+)

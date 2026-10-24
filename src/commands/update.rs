@@ -1283,7 +1283,21 @@ fn collect_record_domains(target_ids: &[i64]) -> Result<HashMap<i64, String>, St
     Ok(map)
 }
 
-/// Group targets by their site domain so each group can be processed
+/// ダウンロードを直列化するサイトファミリー。
+///
+/// なろう / なろうR18 / 作者ページ / API は同じ運営なので 1 グループに
+/// まとめる。Pixiv の `www` / `accounts` のような別ホストも同じ。
+/// それ以外は登録可能ドメイン相当 (最後の 2〜3 ラベル) でまとめる。
+pub(crate) fn site_family(domain: &str) -> String {
+    let family = narou_rs::platform::site_family(domain);
+    if family.is_empty() {
+        UNKNOWN_DOMAIN_KEY.to_string()
+    } else {
+        family
+    }
+}
+
+/// Group targets by their site family so each group can be processed
 /// in parallel without affecting per-site etiquette.
 ///
 /// `records` is an iterator of `(id, domain)` tuples where `domain`
@@ -1295,11 +1309,23 @@ where
     I: IntoIterator<Item = (i64, Option<S>)>,
     S: AsRef<str>,
 {
+    // YAML の `site_family` を優先する。定義の無いドメインだけ、共通の
+    // 自動判定 (登録可能ドメイン相当) にフォールバックする。
+    let families: HashMap<String, String> = narou_rs::downloader::site_setting::effective_site_settings()
+        .iter()
+        .map(|setting| (setting.domain.to_ascii_lowercase(), setting.download_site_family()))
+        .collect();
     let mut groups: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     for (id, domain) in records {
         let key = domain
             .as_ref()
-            .map(|s| s.as_ref().to_string())
+            .map(|domain| {
+                let domain = domain.as_ref().trim().to_ascii_lowercase();
+                families
+                    .get(&domain)
+                    .cloned()
+                    .unwrap_or_else(|| site_family(&domain))
+            })
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| UNKNOWN_DOMAIN_KEY.to_string());
         groups.entry(key).or_default().push(id);
@@ -1642,7 +1668,7 @@ mod tests {
         MODIFIED_TAG, UNKNOWN_DOMAIN_KEY, abort_if_interrupted, apply_general_lastup_check_result,
         build_domain_groups, count_general_lastup_narou_targets,
         initial_general_lastup_work_units, load_update_max_parallel_domains,
-        remaining_update_interval_secs, sleep_with_interrupt,
+        remaining_update_interval_secs, site_family, sleep_with_interrupt,
     };
     use chrono::{Duration, TimeZone, Utc};
     use narou_rs::compat::reroute_web_line_to_console;
@@ -2116,11 +2142,11 @@ mod tests {
             by_name.insert(key, ids);
         }
 
-        // Each known domain keeps the input order so behaviour stays
-        // deterministic across runs.
-        assert_eq!(by_name["ncode.syosetu.com"], vec![1, 2]);
-        assert_eq!(by_name["novel18.syosetu.com"], vec![3]);
+        // Narou family (ncode / R18 / author / API) must serialize in
+        // one bucket: they share the same operator and etiquette.
+        assert_eq!(by_name["syosetu.com"], vec![1, 2, 3]);
         assert_eq!(by_name["kakuyomu.jp"], vec![6]);
+        assert!(!by_name.contains_key("novel18.syosetu.com"));
 
         // Unknown-domain records collapse into a single bucket that
         // the serial fallback can drain safely.
@@ -2141,6 +2167,18 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn site_family_collapses_related_hosts_but_not_other_sites() {
+        assert_eq!(site_family("ncode.syosetu.com"), "syosetu.com");
+        assert_eq!(site_family("novel18.syosetu.com"), "syosetu.com");
+        assert_eq!(site_family("xmypage.syosetu.com"), "syosetu.com");
+        assert_eq!(site_family("www.pixiv.net"), "pixiv.net");
+        assert_eq!(site_family("accounts.pixiv.net"), "pixiv.net");
+        assert_eq!(site_family("www.alphapolis.co.jp"), "alphapolis.co.jp");
+        assert_eq!(site_family("kakuyomu.jp"), "kakuyomu.jp");
+        assert_eq!(site_family(""), UNKNOWN_DOMAIN_KEY);
     }
 
     /// When all targets share a single domain, the partition yields

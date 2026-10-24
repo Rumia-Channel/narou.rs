@@ -94,6 +94,37 @@ pub fn normalize_site_key(site: &str) -> Option<String> {
     Some(key)
 }
 
+/// Collapse related hosts into one download family.
+///
+/// なろう / なろうR18 / 作者ページ / API は同じ運営なので、Worker の
+/// per-site admission でも同一キーにまとめる。Pixiv の `www` / `accounts`
+/// のような別ホストも同じ。それ以外は登録可能ドメイン相当
+/// (最後の 2〜3 ラベル) でまとめる。
+pub fn site_family(site: &str) -> String {
+    let domain = site.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return String::new();
+    }
+    const TWO_LEVEL_SUFFIXES: &[&str] = &[
+        "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "ed.jp", "gr.jp", "lg.jp",
+        "com.au", "co.uk", "org.uk", "co.kr", "com.cn", "com.tw", "co.in",
+    ];
+    let labels: Vec<&str> = domain.split('.').filter(|label| !label.is_empty()).collect();
+    if labels.len() <= 2 {
+        return domain;
+    }
+    let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
+    if TWO_LEVEL_SUFFIXES.contains(&last_two.as_str()) && labels.len() >= 3 {
+        return format!(
+            "{}.{}.{}",
+            labels[labels.len() - 3],
+            labels[labels.len() - 2],
+            labels[labels.len() - 1]
+        );
+    }
+    last_two
+}
+
 /// `download.wait-steps` の正規化。なろう系スコープは 0・10 超を 10 に
 /// 丸める (API 制約)、それ以外のサイトは設定値をそのまま使う
 /// (未設定 = 0 = wait-steps 無し)。native (`src/downloader/rate_limit.rs`)
@@ -326,6 +357,17 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.to_string(), "syosetu.com");
+    }
+
+    #[test]
+    fn site_family_groups_narou_and_sibling_hosts() {
+        assert_eq!(site_family("ncode.syosetu.com"), "syosetu.com");
+        assert_eq!(site_family("novel18.syosetu.com"), "syosetu.com");
+        assert_eq!(site_family("xmypage.syosetu.com"), "syosetu.com");
+        assert_eq!(site_family("www.pixiv.net"), "pixiv.net");
+        assert_eq!(site_family("kakuyomu.jp"), "kakuyomu.jp");
+        assert_eq!(site_family("www.alphapolis.co.jp"), "alphapolis.co.jp");
+        assert_eq!(site_family(""), "");
     }
 
     #[test]

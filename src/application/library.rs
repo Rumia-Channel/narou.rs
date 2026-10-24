@@ -87,6 +87,10 @@ pub struct LibraryListRequest {
     pub sort_column: LibrarySortColumn,
     /// Sort direction.
     pub sort_order: LibrarySortOrder,
+    /// 非表示設定。`None` は非表示なし、`Some` は一覧から除外する。
+    pub hidden: Option<crate::hidden::HiddenState>,
+    /// 非表示も表示する (`list --show-hidden` / Web UI のトグル)。
+    pub include_hidden: bool,
 }
 
 /// One row of the library table: the business fields the web list needs.
@@ -302,7 +306,12 @@ impl LibraryService {
         request: &LibraryListRequest,
     ) -> Result<LibraryPage, ApplicationError> {
         let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
-        let filter = self.build_filter_with_ids(request.search.as_deref(), &frozen_ids);
+        let mut filter = self.build_filter_with_ids(request.search.as_deref(), &frozen_ids);
+        if !request.include_hidden
+            && let Some(hidden) = &request.hidden
+        {
+            hidden.apply_to_filter(&mut filter);
+        }
         let sort = NovelSort {
             key: request.sort_column.sort_key(),
             reverse: request.sort_order == LibrarySortOrder::Descending,
@@ -717,6 +726,8 @@ mod tests {
             length,
             sort_column: LibrarySortColumn::Id,
             sort_order: LibrarySortOrder::Ascending,
+            hidden: None,
+            include_hidden: true,
         }
     }
 

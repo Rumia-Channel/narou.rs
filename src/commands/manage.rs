@@ -32,6 +32,8 @@ pub struct ListOptions {
     /// CLI `--sort-by` で指定されたキー。`db::sort_keys()` で検証する。
     pub sort_by: Option<String>,
     pub frozen: bool,
+    /// 非表示設定を無視してすべて表示する。
+    pub show_hidden: bool,
 }
 
 impl ListOptions {
@@ -217,12 +219,28 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
     };
 
     let mut selected = Vec::new();
+    let hidden = if options.show_hidden {
+        narou_rs::hidden::HiddenState::default()
+    } else {
+        narou_rs::native::hidden::load().unwrap_or_default()
+    };
     for record in &records {
         let frozen = narou_rs::platform::repository::record_is_frozen(
             record,
             Some(&frozen_ids),
             narou_rs::platform::repository::FreezeReadMode::InventoryOnly,
         );
+        if !options.show_hidden
+            && hidden.matches(
+                record.id,
+                &record.author,
+                &record.tags,
+                record.domain.as_deref(),
+                &record.sitename,
+            )
+        {
+            continue;
+        }
         if !matches_filters(record, frozen, &filter_words) {
             continue;
         }

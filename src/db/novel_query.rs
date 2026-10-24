@@ -198,6 +198,39 @@ pub fn build_where<B>(filter: &NovelFilter, mut bind: impl FnMut(NovelBind) -> B
         builder.sql.push(')');
         builder.binds.push(bind(NovelBind::Text(json)));
     }
+    if !filter.exclude_ids.is_empty() {
+        let json = serde_json::to_string(&filter.exclude_ids)
+            .expect("serializing integer ids cannot fail");
+        builder.sql.push_str(
+            " AND n.id NOT IN (SELECT CAST(value AS INTEGER) FROM json_each(?))",
+        );
+        builder.binds.push(bind(NovelBind::Text(json)));
+    }
+    if !filter.exclude_tags.is_empty() {
+        builder.sql.push_str(
+            " AND NOT EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag IN (SELECT value FROM json_each(?)))",
+        );
+        builder
+            .binds
+            .push(bind(NovelBind::Text(term_values_json(&filter.exclude_tags))));
+    }
+    if !filter.exclude_authors.is_empty() {
+        builder
+            .sql
+            .push_str(" AND n.author_fold NOT IN (SELECT value FROM json_each(?))");
+        builder.binds.push(bind(NovelBind::Text(term_values_json(
+            &filter.exclude_authors,
+        ))));
+    }
+    if !filter.exclude_sites.is_empty() {
+        builder.sql.push_str(
+            " AND n.sitename_fold NOT IN (SELECT value FROM json_each(?)) \
+             AND COALESCE(n.domain_fold, '') NOT IN (SELECT value FROM json_each(?))",
+        );
+        let json = term_values_json(&filter.exclude_sites);
+        builder.binds.push(bind(NovelBind::Text(json.clone())));
+        builder.binds.push(bind(NovelBind::Text(json)));
+    }
     builder
 }
 
@@ -335,6 +368,7 @@ mod tests {
                 SearchTerm::new(SearchField::Title, true, vec!["b".to_string()]),
             ],
             frozen_ids: None,
+            ..NovelFilter::default()
         }
     }
 
@@ -382,6 +416,24 @@ mod tests {
         let scanned = scan_ids_sql(&filter, None, 10, |bind| bind);
         assert!(!scanned.sql.contains("n.id > ?"));
         assert_eq!(scanned.binds, vec![NovelBind::Int(10)]);
+    }
+
+    #[test]
+    fn hidden_exclusions_render_negated_clauses_and_bind_values() {
+        let filter = NovelFilter {
+            exclude_ids: vec![1, 2],
+            exclude_tags: vec!["秘密".to_string()],
+            exclude_authors: vec!["author".to_string()],
+            exclude_sites: vec!["site".to_string()],
+            ..NovelFilter::default()
+        };
+        let count = count_sql(&filter, |bind| bind);
+        assert!(count.sql.contains("n.id NOT IN (SELECT CAST(value AS INTEGER) FROM json_each(?))"));
+        assert!(count.sql.contains("t.tag IN (SELECT value FROM json_each(?))"));
+        assert!(count.sql.contains("n.author_fold NOT IN (SELECT value FROM json_each(?))"));
+        assert!(count.sql.contains("n.sitename_fold NOT IN (SELECT value FROM json_each(?))"));
+        assert_eq!(count.sql.matches('?').count(), count.binds.len());
+        assert!(count.binds.iter().any(|bind| matches!(bind, NovelBind::Text(json) if json == "[1,2]")));
     }
 
     /// The adapters differ only in the bind conversion: the statement and the

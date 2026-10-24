@@ -27,6 +27,11 @@ fn looks_like_pattern(s: &str) -> bool {
 pub struct SiteSetting {
     pub name: String,
     pub domain: String,
+    /// 並列ダウンロードを直列化するサイト系列。未指定ならドメインから
+    /// `platform::site_family` で自動判定する。なろう系のように複数ドメインを
+    /// 同じ系列として扱うサイトは YAML で明示する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_family: Option<String>,
     #[serde(default)]
     pub scheme: String,
     pub top_url: String,
@@ -466,6 +471,18 @@ pub fn merge_user_definition_yaml(bundled_yaml: &str, user_yaml: &str) -> String
 }
 
 impl SiteSetting {
+    /// この定義の並列DL系列。YAML の `site_family` を優先し、無ければ
+    /// ドメインから自動判定する。
+    pub fn download_site_family(&self) -> String {
+        if let Some(family) = self.site_family.as_deref() {
+            let family = family.trim().to_ascii_lowercase();
+            if !family.is_empty() {
+                return family;
+            }
+        }
+        crate::platform::site_family(&self.domain)
+    }
+
     pub fn load_all() -> Result<Vec<Self>> {
         let mut load_dirs = Vec::new();
 
@@ -1456,5 +1473,31 @@ toc_url: https://example.com/works/\\k<ncode>
         )];
         let user = vec![("broken.com".to_string(), "name: Broken\n".to_string())];
         assert!(SiteSetting::load_bundled_with_user(&bundled, &user).is_err());
+    }
+
+    #[test]
+    fn site_family_prefers_the_yaml_override_and_falls_back_to_domain() {
+        let settings = SiteSetting::load_all().unwrap();
+        let narou = settings
+            .iter()
+            .find(|setting| setting.domain == "ncode.syosetu.com")
+            .expect("narou definition");
+        assert_eq!(narou.download_site_family(), "syosetu.com");
+        let pixiv = settings
+            .iter()
+            .find(|setting| setting.domain == "www.pixiv.net")
+            .expect("pixiv definition");
+        assert_eq!(pixiv.download_site_family(), "pixiv.net");
+        let kakuyomu = settings
+            .iter()
+            .find(|setting| setting.domain == "kakuyomu.jp")
+            .expect("kakuyomu definition");
+        assert_eq!(kakuyomu.download_site_family(), "kakuyomu.jp");
+
+        let custom: SiteSetting = serde_yaml::from_str(
+            "name: Custom\ndomain: novel.custom.example\ntop_url: https://novel.custom.example\nsitename: Custom\ntoc_url: https://novel.custom.example/\\k<url>\nsite_family: custom.example\n",
+        )
+        .unwrap();
+        assert_eq!(custom.download_site_family(), "custom.example");
     }
 }

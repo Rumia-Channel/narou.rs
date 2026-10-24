@@ -91,6 +91,12 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
     } else {
         LibrarySortOrder::Ascending
     };
+    let include_hidden = params.show_hidden.unwrap_or(false);
+    let hidden = if include_hidden {
+        None
+    } else {
+        crate::hidden::load_from_env(env).await.ok()
+    };
     let services = match super::metadata::MetadataServices::new(env) {
         Ok(services) => services,
         Err(error) => {
@@ -106,6 +112,8 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
             length,
             sort_column,
             sort_order,
+            hidden,
+            include_hidden,
         })
         .await
     {
@@ -154,7 +162,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
 ///   バイト復号 (不完全な `%` はリテラル)、UTF-8 は lossy。
 /// - 未知キーは無視、既知キーの重複・型不一致はエラー (= native の 400)。
 fn parse_list_params(raw: &[u8]) -> Result<ListParams, String> {
-    const KNOWN_KEYS: [&str; 8] = [
+    const KNOWN_KEYS: [&str; 9] = [
         "draw",
         "start",
         "length",
@@ -163,6 +171,7 @@ fn parse_list_params(raw: &[u8]) -> Result<ListParams, String> {
         "search[value]",
         "order[0][column]",
         "order[0][dir]",
+        "show_hidden",
     ];
     let mut params = ListParams::default();
     let mut seen = HashSet::new();
@@ -188,6 +197,7 @@ fn parse_list_params(raw: &[u8]) -> Result<ListParams, String> {
             "search[value]" => params.search_value = Some(value),
             "order[0][column]" => params.order_column = Some(parse_u64(&key, &value)?),
             "order[0][dir]" => params.order_dir = Some(value),
+            "show_hidden" => params.show_hidden = Some(parse_bool(&key, &value)?),
             _ => unreachable!("known key guard above"),
         }
     }

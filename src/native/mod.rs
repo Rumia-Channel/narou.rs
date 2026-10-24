@@ -10,6 +10,7 @@ pub mod converter;
 pub mod author_store;
 pub mod cookie_store;
 pub mod downloader;
+pub mod hidden;
 pub mod http;
 pub mod illustrations;
 pub mod login_key;
@@ -21,6 +22,7 @@ pub mod sqlite;
 pub mod application;
 pub mod object_store;
 pub mod s3;
+pub mod transfer;
 pub mod web_actions;
 pub mod self_update;
 

@@ -8,6 +8,7 @@
 mod budget;
 mod authors;
 mod bundled_sites;
+mod hidden;
 mod composition;
 mod content_store;
 mod content_migration;
@@ -35,6 +36,7 @@ mod scheduler;
 mod s3_store;
 mod storage_probe;
 mod site_rate_limiter;
+mod transfer;
 use subtle::ConstantTimeEq;
 use webui::{json_error, query_param};
 
@@ -121,6 +123,9 @@ async fn route(req: Request, env: Env) -> Result<Response> {
         // 登録経路 (native `src/web/mod.rs` と同じルート構成)。
         "/api/jobs" => api_jobs(req, env).await,
         "/api/authors" | "/api/authors/check" => authors::handle(req, env).await,
+        // 可搬アーカイブ (native `src/web/transfer.rs` の `/api/transfer/*`)。
+        "/api/transfer/export" | "/api/transfer/import" => transfer::handle(req, env).await,
+        "/api/hidden" => hidden::handle(req, env).await,
         "/api/global_setting" => global_settings::api_global_setting(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,
         "/api/admin/illustration-dedup" => api_illustration_dedup(req, env).await,
@@ -248,6 +253,8 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
             length,
             sort_column: narou_rs::application::LibrarySortColumn::Id,
             sort_order: narou_rs::application::LibrarySortOrder::Ascending,
+            hidden: None,
+            include_hidden: true,
         })
         .await
         .map_err(|error| Error::RustError(error.to_string()))?;

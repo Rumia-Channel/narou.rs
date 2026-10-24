@@ -24,6 +24,8 @@ use tokio::task::JoinHandle;
 const MAX_FAILURE_DETAIL_LINES: usize = 8;
 const MAX_FAILURE_DETAIL_CHARS: usize = 600;
 const IDLE_EXTERNAL_QUEUE_POLL_SECS: u64 = 30;
+/// 異なるサイトファミリーのダウンロードを同時に走らせる worker 数。
+const PARALLEL_DOWNLOAD_WORKERS: usize = 2;
 /// Detail substrings that mark a job outcome as a *permanent* failure which
 /// must not be retried even when retries remain. Matching is case-insensitive.
 const PERMANENT_FAILURE_KEYWORDS: &[&str] = &[
@@ -93,7 +95,14 @@ pub fn start_queue_workers(
 ) -> Vec<JoinHandle<()>> {
     let job_transition_lock = Arc::new(parking_lot::Mutex::new(()));
     let lanes = if concurrency_enabled {
-        vec![WorkerLane::Default, WorkerLane::Secondary]
+        // 異なるサイトのダウンロードを同時に走らせる。同一サイトファミリーは
+        // pop 時の除外で直列化する (running_jobs の family を参照)。
+        let mut lanes = Vec::new();
+        for _ in 0..PARALLEL_DOWNLOAD_WORKERS {
+            lanes.push(WorkerLane::Default);
+        }
+        lanes.push(WorkerLane::Secondary);
+        lanes
     } else {
         vec![WorkerLane::All]
     };
@@ -114,7 +123,7 @@ fn start_queue_worker_for_lane(
         loop {
             let job = {
                 let _guard = job_transition_lock.lock();
-                let job = pop_next_job(workers.queue.as_ref(), lane);
+                let job = pop_next_job_concurrent(workers.queue.as_ref(), lane, &workers.running_jobs);
                 if let Some(job_ref) = job.as_ref() {
                     register_running_job(&workers.running_jobs, job_ref);
                 }
@@ -250,7 +259,30 @@ fn start_queue_worker_for_lane(
     })
 }
 
+#[cfg(test)]
 fn pop_next_job(queue: &PersistentQueue, lane: WorkerLane) -> Option<QueueJob> {
+    let busy = load_active_locked_ids(LOCK_MAX_AGE).unwrap_or_default();
+    pop_next_job_excluding(queue, lane, &busy, &HashSet::new())
+}
+
+/// 同時実行 worker 用。実行中ジョブのサイトファミリーと小説ロックを見て、
+/// 異なるファミリーだけを pop する。
+fn pop_next_job_concurrent(
+    queue: &PersistentQueue,
+    lane: WorkerLane,
+    running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
+) -> Option<QueueJob> {
+    let busy = load_active_locked_ids(LOCK_MAX_AGE).unwrap_or_default();
+    let families = running_site_families(running_jobs);
+    pop_next_job_excluding(queue, lane, &busy, &families)
+}
+
+fn pop_next_job_excluding(
+    queue: &PersistentQueue,
+    lane: WorkerLane,
+    busy: &HashSet<i64>,
+    busy_families: &HashSet<String>,
+) -> Option<QueueJob> {
     match lane {
         WorkerLane::All => queue.pop(),
         WorkerLane::Default | WorkerLane::Secondary => {
@@ -260,12 +292,68 @@ fn pop_next_job(queue: &PersistentQueue, lane: WorkerLane) -> Option<QueueJob> {
             };
             // 判定は「対象一覧」ではなく、実行中の子が今まさに触っている小説で行う
             // (`lock.yaml`)。全作品更新の最中でも、別の小説の変換は並行できる。
-            let busy = load_active_locked_ids(LOCK_MAX_AGE).unwrap_or_default();
             queue.pop_for_lane_excluding(target_lane, |candidate| {
-                job_conflicts_with_running(candidate, &busy)
+                job_conflicts_with_running(candidate, busy)
+                    || site_family_conflicts(job_site_family(candidate), busy_families)
             })
         }
     }
+}
+
+/// 対象が特定のサイトに紐づかないジョブ (全作品更新など) を表す。
+const UNKNOWN_SITE_FAMILY: &str = "__all_sites__";
+
+fn running_site_families(running_jobs: &parking_lot::Mutex<Vec<QueueJob>>) -> HashSet<String> {
+    running_jobs
+        .lock()
+        .iter()
+        .map(|job| {
+            job_site_family(job).unwrap_or_else(|| UNKNOWN_SITE_FAMILY.to_string())
+        })
+        .collect()
+}
+
+fn site_family_conflicts(candidate: Option<String>, busy: &HashSet<String>) -> bool {
+    if busy.is_empty() {
+        return false;
+    }
+    // 対象が不明なジョブは全サイトに触れ得るため、実行中が 1 つでもあれば待つ。
+    if busy.contains(UNKNOWN_SITE_FAMILY) {
+        return true;
+    }
+    match candidate {
+        Some(family) => busy.contains(&family),
+        None => true,
+    }
+}
+
+fn job_site_family(job: &QueueJob) -> Option<String> {
+    let target = job.target.trim();
+    if target.contains("://")
+        && let Ok(url) = url::Url::parse(target)
+        && let Some(host) = url.host_str()
+    {
+        return Some(site_family_for_domain(host));
+    }
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    for id in extract_novel_ids(target) {
+        if let Ok(Some(record)) = novels.get_sync(id.into())
+            && let Some(domain) = record.domain.as_deref().filter(|domain| !domain.is_empty())
+        {
+            return Some(site_family_for_domain(domain));
+        }
+    }
+    None
+}
+
+fn site_family_for_domain(domain: &str) -> String {
+    let domain = domain.trim().to_ascii_lowercase();
+    let settings = narou_rs::downloader::site_setting::effective_site_settings();
+    settings
+        .iter()
+        .find(|setting| setting.domain.eq_ignore_ascii_case(&domain))
+        .map(|setting| setting.download_site_family())
+        .unwrap_or_else(|| crate::platform::site_family(&domain))
 }
 
 /// How long a `lock.yaml` entry is trusted without being refreshed.
@@ -1082,7 +1170,8 @@ mod tests {
         execution_spec_meta_string, execution_spec_meta_strings, failure_reason,
         is_transient_failure, job_conflicts_with_running, parse_convert_job_target, pop_next_job,
         remember_failure_line, route_structured_web_message, should_retry_job,
-        summarize_failure_details, update_by_tag_update_args,
+        site_family_conflicts, summarize_failure_details, update_by_tag_update_args,
+        UNKNOWN_SITE_FAMILY,
     };
     use crate::application::retry_policy::{parse_backoff_spec, parse_backoff_value};
     use crate::queue::{JobType, PersistentQueue, QueueJob};
@@ -1204,6 +1293,21 @@ mod tests {
     /// A convert for that novel waits, while a convert for another novel pops
     /// immediately — an `update` covering the whole library no longer blocks
     /// every conversion.
+    #[test]
+    fn site_family_exclusion_parallelizes_other_sites_and_serializes_same_site() {
+        let mut busy = HashSet::new();
+        assert!(!site_family_conflicts(Some("kakuyomu.jp".into()), &busy));
+        busy.insert("syosetu.com".to_string());
+        assert!(site_family_conflicts(Some("syosetu.com".into()), &busy));
+        assert!(!site_family_conflicts(Some("kakuyomu.jp".into()), &busy));
+        // An all-library job may touch any site, so it waits for everything.
+        busy.insert(UNKNOWN_SITE_FAMILY.to_string());
+        assert!(site_family_conflicts(Some("kakuyomu.jp".into()), &busy));
+        // A job with no resolved site also waits while anything runs.
+        let busy = HashSet::from(["kakuyomu.jp".to_string()]);
+        assert!(site_family_conflicts(None, &busy));
+    }
+
     #[test]
     fn pop_next_job_defers_only_novels_a_child_holds() {
         let temp = tempfile::tempdir().unwrap();

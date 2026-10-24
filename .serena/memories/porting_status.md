@@ -1,5 +1,9 @@
 # narou.rs 移植状況
 
+## 現況（v0.5.0 実装完了・リリース準備）
+
+0.5.0 の新機能を `feature/v0.5.0` で実装。内容: (1) 非表示設定 (`HiddenState` / inventory `hidden`、作品・タグ・作者・サイト。Native YAML/SQLite・Worker D1、CLI `narou hidden`、`list --show-hidden`、Web API `/api/hidden`、Web UI トグル/右クリック/モーダル)。(2) サイト別並列DL (`SiteSetting.site_family` を YAML 第一優先、なろう系 syosetu.com / Pixiv pixiv.net。Native update の domain groups、Worker の D1 admission site_key、Native Web キューの family 排他)。(3) 小説データ ZIP 転送 (`src/transfer` の wasm-safe コア、Native `narou export/import`、`/api/transfer/*`、Worker ObjectStore 実装、`transfer_wasm`、Web UI の選択ダウンロード/アップロード)。設計は `docs/v0.5.0-architecture.md`、履歴は VERSION.md v0.5.0 節。全 crate を 0.5.0 に更新し、ライセンス通知も再生成。`cargo test --workspace` / clippy `--all-features` / JS 回帰 / Worker wasm / workerd transfer 契約テストが成功。次は develop 統合 → CI → 0.5.0 タグ/Release。
+
 ## 現況（v0.4.19 未リリース変更）
 
 `webnovel/kakuyomu.jp.yaml` に `preserve_missing_sections: true` を追加し、カクヨムネクストの閲覧制限で目次から消えた保存済みの話を保持したまま、閲覧できる新着話だけを更新できるようにした。カクヨムの `index` はエピソード ID (数値) で安定している。既存の `tests/kakuyomu_login.rs` は、購読切れ時に `Canceled` で全体を見送る前提だったため、`preserve_missing_sections` の新挙動 (有料話を保持し、閲覧可能な無料話だけ更新) に合わせて更新。`cargo test --workspace` / clippy 成功。VERSION.md の「未リリース」節に記載。v0.4.18 タグは作成済みなので次回リリースは v0.4.19。

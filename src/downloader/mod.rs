@@ -838,10 +838,10 @@ impl Downloader {
                 .or_else(|| self.site_setting_for_url(target))
                 .or_else(|| self.site_settings.iter().find(|setting| setting.matches_author_url(target)))
                 .ok_or_else(|| NarouError::InvalidTarget(format!("No site setting for URL: {target}")))?;
-            return Ok(setting.domain.to_ascii_lowercase());
+            return Ok(setting.download_site_family());
         }
         let (_, setting) = self.resolve_target_for_download(target).await?;
-        Ok(setting.domain.to_ascii_lowercase())
+        Ok(setting.download_site_family())
     }
 
     async fn load_novel_info(
@@ -3508,7 +3508,7 @@ is_narou: false
             "N1234AB", "43", "https://ncode.syosetu.com/n1234ab/",
             "https://mypage.syosetu.com/2842627/", "https://ncode.syosetu.com/s1234ab/",
         ] {
-            assert_eq!(downloader.site_key_for_target(target).await.unwrap(), "ncode.syosetu.com", "{target}");
+            assert_eq!(downloader.site_key_for_target(target).await.unwrap(), "syosetu.com", "{target}");
         }
         assert!(downloader.site_key_for_target("https://unknown.example/book/").await.is_err());
         assert!(http.requested_urls().is_empty(), "admission must never fetch a site or send cookies");
