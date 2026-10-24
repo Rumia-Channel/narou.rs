@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = "0.23"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 httparse = "1"
 serde_json = "1"
 sha2 = "0.11"

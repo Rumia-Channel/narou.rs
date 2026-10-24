@@ -8,7 +8,7 @@
 
 検証: `cargo check --workspace --all-targets`、`cargo test --workspace`（lib 1179 / bin 122 / 各 integration）、`cargo test --lib --features lite` 1179、`cargo test --bins --features lite` 122、lite integration（EPUB に `.vrtl .half_em_space` と span が入る）、`cargo clippy --workspace --all-targets` が成功。手動 E2E で、組み込みエンジンと外部 AozoraEpub3 1.1.1+ コピーの両方について EPUB へ CSS と span が入ること、古い初期化ライブラリで変換時に CSS が補完されることを確認。`cargo-about 0.9.2` で Third-Party-License 2 ファイルを再生成（version 行のみ差分）。
 
-Brotli CVE-2026-111497 対応: 対象は Google Brotli の C デコーダ 1.0.3〜1.2.0。Cargo.lock に C 版 (`brotli-sys` / `libbrotli`) は無く、curl も brotli 非対応でビルドされる。純 Rust `brotli` 9.0.0 / `brotli-decompressor` 6.0.1 は修正版が無く（brotli 9.0.0 は `~6.0` 固定）、reqwest の `brotli` feature を外して外部応答の展開経路だけを除去した（gzip/deflate/identity は維持）。保存オブジェクトの brotli は自前データのみなので継続。AGENTS のセキュリティ境界と VERSION.md v0.4.18 に記録。
+Brotli CVE-2026-111497 対応: 対象は Google Brotli の C デコーダ 1.0.3〜1.2.0。Cargo.lock に C 版 (`brotli-sys` / `libbrotli`) は無く、curl も brotli 非対応でビルドされる。純 Rust `brotli` 9.0.0 / `brotli-decompressor` 6.0.1 は修正版が無く（brotli 9.0.0 は `~6.0` 固定）、reqwest の `brotli` feature を外して外部応答の展開経路だけを除去した（gzip/deflate/identity は維持）。外部取得リレーも `curl --compressed` をやめ、`Accept-Encoding: gzip, deflate` を明示して gzip/deflate を `flate2` で展開し、`br` は fail closed する。保存オブジェクトの brotli は自前データのみなので継続。AGENTS のセキュリティ境界と VERSION.md v0.4.18 に記録。
 
 リリース手順: この prepare commit を push して develop CI 成功を確認 → main へ no-ff 統合し annotated `v0.4.18` タグを作成・push → Release workflow と Platform（tag/main, production Worker deploy）を監視 → develop へリリースマージを戻して記録を更新する。公開までは未リリースとして扱い、issue 返信で「公開済み」と書かない。
 
