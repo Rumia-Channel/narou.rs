@@ -68,8 +68,11 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
     let mut first_output_dir = None;
     let output_parts = output.map(split_output_name);
     let _ = no_strip;
-    let selected_devices = match resolve_selected_devices(make_zip, sink) {
-        Ok(devices) => devices,
+    let SelectedDevices {
+        devices: selected_devices,
+        explicit_device,
+    } = match resolve_selected_devices(make_zip, sink) {
+        Ok(selected) => selected,
         Err(()) => return,
     };
     let encoding = match normalize_text_file_encoding_name(encoding) {
@@ -140,6 +143,7 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                     ignore_default,
                     ignore_force,
                     selected_device,
+                    explicit_device,
                     output_device,
                     copy_device,
                     create_ibunko_side_epub,
@@ -219,7 +223,7 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
             if let Some(output_filename) = &output_filename {
                 settings.output_filename = output_filename.clone();
             }
-            apply_device_related_settings(&mut settings, selected_device);
+            apply_device_related_settings(&mut settings, selected_device, explicit_device);
             let include_illust = settings.enable_illust;
             let mut converter =
                 if let Some(user_converter) = UserConverter::load_with_title(&novel_dir, &title) {
@@ -371,6 +375,10 @@ struct TextConvertContext<'a> {
     ignore_default: bool,
     ignore_force: bool,
     selected_device: Option<narou_rs::converter::device::Device>,
+    /// 端末を明示指定した変換か (`convert.multi-device` / Web の端末指定 /
+    /// `--make-zip`)。通常の `device` 設定による変換では `default.*` /
+    /// `force.*` / setting.ini の優先順位をそのまま使う (issue #42)。
+    explicit_device: bool,
     output_device: Option<narou_rs::converter::device::Device>,
     copy_device: Option<narou_rs::converter::device::Device>,
     create_ibunko_side_epub: bool,
@@ -390,6 +398,7 @@ fn convert_text_target(ctx: TextConvertContext<'_>) {
         ignore_default,
         ignore_force,
         selected_device,
+        explicit_device,
         output_device,
         copy_device,
         create_ibunko_side_epub,
@@ -423,7 +432,7 @@ fn convert_text_target(ctx: TextConvertContext<'_>) {
     if let Some(output_filename) = output_filename {
         settings.output_filename = output_filename.to_string();
     }
-    apply_device_related_settings(&mut settings, selected_device);
+    apply_device_related_settings(&mut settings, selected_device, explicit_device);
     let include_illust = settings.enable_illust;
 
     let mut converter =
@@ -528,20 +537,40 @@ fn effective_convert_device(
     }
 }
 
+/// 変換で使う端末の一覧と、端末由来の設定を適用するか。
+struct SelectedDevices {
+    devices: Vec<Option<narou_rs::converter::device::Device>>,
+    /// 端末を明示指定した変換か。Ruby 版は `convert.multi-device` のときだけ
+    /// `Device::RELATED_VARIABLES` を適用し、`device` 設定から読んだ通常の
+    /// 変換では `default.*` / `force.*` / setting.ini の優先順位を守る。
+    /// ここを常に true にすると `enable_half_indent_bracket` の利用者設定を
+    /// 端末設定で上書きしてしまう (issue #42)。
+    explicit_device: bool,
+}
+
 fn resolve_selected_devices(
     make_zip: bool,
     sink: &dyn MessageSink,
-) -> std::result::Result<Vec<Option<narou_rs::converter::device::Device>>, ()> {
+) -> std::result::Result<SelectedDevices, ()> {
     if make_zip {
-        return Ok(vec![Some(narou_rs::converter::device::Device::Ibunko)]);
+        return Ok(SelectedDevices {
+            devices: vec![Some(narou_rs::converter::device::Device::Ibunko)],
+            explicit_device: true,
+        });
     }
 
     if let Some(device) = load_web_worker_device_override() {
-        return Ok(vec![device]);
+        return Ok(SelectedDevices {
+            devices: vec![device],
+            explicit_device: true,
+        });
     }
 
     let Some(raw) = narou_rs::compat::load_local_setting_string("convert.multi-device") else {
-        return Ok(vec![narou_rs::compat::current_device()]);
+        return Ok(SelectedDevices {
+            devices: vec![narou_rs::compat::current_device()],
+            explicit_device: false,
+        });
     };
 
     let mut devices = Vec::new();
@@ -573,7 +602,10 @@ fn resolve_selected_devices(
         devices.insert(0, kindle);
     }
 
-    Ok(devices)
+    Ok(SelectedDevices {
+        devices,
+        explicit_device: true,
+    })
 }
 
 fn load_web_worker_device_override() -> Option<Option<narou_rs::converter::device::Device>> {
@@ -615,10 +647,22 @@ fn effective_copy_device(
     }
 }
 
+/// 端末を明示指定した変換 (`convert.multi-device` / Web の端末指定 /
+/// `--make-zip`) にだけ、Ruby 版 `Command::Convert#change_settings` と同じ
+/// 端末由来の設定を適用する。
+///
+/// 通常の変換 (端末設定から選ばれた `device`) では何もしない。`device` を
+/// 変えた時点で `narou setting device=` が `default.enable_half_indent_bracket`
+/// を保存しており、変換時は `force.*` > setting.ini > `default.*` の順で
+/// 解決されるため、ここで上書きすると利用者の設定を無視してしまう。
 fn apply_device_related_settings(
     settings: &mut NovelSettings,
     device: Option<narou_rs::converter::device::Device>,
+    explicit_device: bool,
 ) {
+    if !explicit_device {
+        return;
+    }
     let Some(device) = device else {
         return;
     };
@@ -1017,9 +1061,9 @@ fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_output_filename, decode_text_file_as_utf8, decode_text_file_with_encoding,
-        normalize_text_file_encoding_name, parse_device_name, parse_web_worker_device_name,
-        print_copy_to_result, split_output_name,
+        apply_device_related_settings, build_output_filename, decode_text_file_as_utf8,
+        decode_text_file_with_encoding, normalize_text_file_encoding_name, parse_device_name,
+        parse_web_worker_device_name, print_copy_to_result, split_output_name,
     };
 
     /// 出力を捨てるだけの sink (コピー処理の副作用だけを検証するテスト用)。
@@ -1115,5 +1159,38 @@ mod tests {
         print_copy_to_result(output.to_str().unwrap(), None, 0, &TestSink).unwrap();
 
         assert!(!copy_to.join("novel.txt").exists());
+    }
+
+    /// issue #42: 端末由来の設定は端末を明示した変換でだけ適用する。
+    /// `device` 設定から読んだ通常の変換では、`default.*` / `force.*` /
+    /// setting.ini で解決済みの値を上書きしない。
+    #[test]
+    fn device_related_settings_only_apply_to_explicit_device_conversion() {
+        use narou_rs::converter::device::Device;
+        use narou_rs::converter::settings::NovelSettings;
+
+        let mut settings = NovelSettings::default();
+        settings.enable_half_indent_bracket = true;
+        apply_device_related_settings(&mut settings, Some(Device::Epub), false);
+        assert!(
+            settings.enable_half_indent_bracket,
+            "通常の変換で端末設定が利用者設定を上書きした"
+        );
+
+        let mut settings = NovelSettings::default();
+        settings.enable_half_indent_bracket = true;
+        apply_device_related_settings(&mut settings, Some(Device::Epub), true);
+        assert!(
+            !settings.enable_half_indent_bracket,
+            "端末を明示した EPUB 変換で二分アキが残った"
+        );
+
+        let mut settings = NovelSettings::default();
+        settings.enable_half_indent_bracket = false;
+        apply_device_related_settings(&mut settings, Some(Device::Mobi), true);
+        assert!(
+            settings.enable_half_indent_bracket,
+            "端末を明示した Kindle 変換で二分アキが付かない"
+        );
     }
 }

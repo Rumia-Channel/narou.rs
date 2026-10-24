@@ -418,6 +418,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 - `convert.copy-to` / `convert.copy_to` と `convert.copy-to-grouping` の device/site グルーピングも direct convert へ接続し、`sample\\novel` で `device=epub` + `copy-to-grouping=device,site` のコピー先生成を確認済み
 - `convert.copy-zip-to` も direct convert へ接続し、`sample\\novel` で `--make-zip 3` 実行時に ZIP のコピー出力を確認済み
 - `convert.multi-device` があれば `device` より優先して複数端末へ順に変換する。Ruby版同様 `kindle` を先頭へ寄せ、無効な端末名は警告し、`sample\\novel` で `convert.multi-device: epub,ibunko` により EPUB + ZIP 出力を確認済み
+- 端末由来の設定 (`default.enable_half_indent_bracket`) は `narou setting device=` の変更時に保存し、変換時は Ruby版同様 `force.*` > `setting.ini` > `default.*` > オリジナル設定の順で解決する。変換時に端末関連設定を強制するのは `convert.multi-device` / Web UI の端末指定 / `--make-zip` のように端末を明示した変換だけで、`device` 設定から読んだ通常の変換では利用者の設定を上書きしない (2026-10 修正、issue #42)
 - `--ignore-default` / `--ignore-force` を `NovelSettings::load_for_novel_with_options` に渡し、`default.*` / `force.*` の適用を個別に無効化できるようにした
 - DB 管理小説だけでなくファイルパス指定の textfile 変換も `commands::convert` に接続し、`--enc` による UTF-8 / Shift_JIS / EUC-JP 系のデコードと `enable_enchant_midashi` 推奨 INFO を追加した
 - `report.txt` の互換監査で出た変換差分のうち、ローマ数字変換、分数/日付変換、明示設定時の漢数字+単位変換、`disable_alphabet_word_to_zenkaku`、root `replace.txt` の追加適用、Kindle 向け矢印/ZWS、iBooks 章見出し前 6 改行を実装済み。既存のカクヨム byte-for-byte fixture は維持している
