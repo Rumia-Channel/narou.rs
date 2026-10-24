@@ -5,6 +5,7 @@
 
 ## 未リリース
 
+- **小説データの ZIP ダウンロード / アップロードを追加**しました。`narou export <作品...> [-o file.zip]` と `narou import <file.zip> [--overwrite|--skip]`、Web API `GET /api/transfer/export?ids=...` / `POST /api/transfer/import` を実装しました。ZIP には `manifest.json`（メタデータ・SHA-256）と `toc.yaml`・本文・`setting.ini`・`replace.txt`・`converter.yaml`・挿絵・EPUB が入り、取り込みは `toc_url` で既存作品を判定して新しい ID で追加、または上書き/スキップします。YAML・SQLite・S3 挿絵の各バックエンドは ObjectStore 経由で更新し、古いアーカイブで既存の本文・設定を削らないようにしています。アーカイブ処理は wasm-safe な共通コア (`src/transfer`) に分離し、Native CLI / Web API / Worker / ブラウザ WASM から同じコアを呼ぶ構成です（ブラウザ WASM の UI 接続は次の段階）。
 - **作品・タグ・作者・サイトの非表示設定を追加**しました。`narou hidden add/remove/list/clear` と `narou list --show-hidden`、Web UI の「非表示も表示」トグル・右クリック「非表示 / 表示に戻す」・非表示設定マネージャーで管理できます。タグ非表示はそのタグを持つ作品も一覧から隠し、作者・サイト単位でもまとめて隠せます。保存は在庫の `hidden` キー（Native は `.narou/hidden.yaml` / SQLite `app_state`、Worker は D1 `app_state`）で、更新・変換などの内部処理は非表示作品も対象のままです。
 - **異なるサイトの並列ダウンロードを整理**しました。`narou update` の並列化をサイトファミリー単位に変更し、なろう（`ncode` / `novel18` / 作者ページ / API）は同一グループとして直列、カクヨムと Pixiv のような別サイトは並列のままにしました。
 - **カクヨムの作者・更新の保持機構を強化**しました。カクヨムネクストの閲覧制限で目次から消えた保存済みの話を保持したまま、閲覧できる新着話だけを追加できるよう、カクヨムのサイト定義で `preserve_missing_sections: true` を有効にしました。話の index はカクヨムのエピソード ID（数値）で安定しているため、制限が解けたときに同じ話を二重に追加しません。制限で取得できない状態が続く場合は、従来どおり既存データを保持して更新を見送ります。

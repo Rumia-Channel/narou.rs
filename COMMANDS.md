@@ -1,6 +1,6 @@
 # narou.rs コマンド互換性ドキュメント
 
-narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `db` (SQLite 管理 DB 保守)・`illust` (挿絵メンテナンス)・`login` (ログイン情報管理)・`author` (作者追跡)・`hidden` (非表示設定) を含む 29 コマンドを網羅する。
+narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `db` (SQLite 管理 DB 保守)・`illust` (挿絵メンテナンス)・`login` (ログイン情報管理)・`author` (作者追跡)・`hidden` (非表示設定)・`export`/`import` (小説データ転送) を含む 31 コマンドを網羅する。
 
 ---
 
@@ -104,6 +104,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `illust` | — (Rust 拡張) | ✅ 完了 | `.illustration_cache.yaml` 運用のための `narou illust <sub>`。`orphan`/`migrate`/`fix-ext`/`rebuild` に加え、挿絵を S3 互換ストレージへ写す `s3-push` / 突き合わせる `s3-verify` を実装。削除/改名/移行 (および `s3-push`) は既定 dry-run (`-f` で実行) |
 | `author` | — (Rust 拡張) | ✅ 完了 | 追跡する作者を登録すると (`narou author add <作者ページURL>`)、`narou update`（対象省略の一括更新）の後段で新しい作品を自動追加する（個別更新では追跡しない）。`add`/`list`/`remove`/`check`。作者ページの認識と作品一覧の取得はサイト定義 (`author_url` / `author_api_url` / `author_novel_pattern` / `author_work_url`) が担う。Pixiv は `preprocess:` の DSL が `author_novel::` / `author_series::` / `author_comic_series::` を emit し、シリーズに属する話/ページは `author_series_episodes_url` / `author_comic_series_pages_url` で除く (作品単位 = 単体小説 + 小説シリーズ + 漫画シリーズ + 単体イラスト・漫画)。`check --dry-run` は追加予定の URL だけを表示 |
 | `hidden` | — (Rust 拡張) | ✅ 完了 | 作品・タグ・作者・サイトを一覧から非表示にする。`add`/`remove`/`list`/`clear`。`add 123 --tag 秘密 --author 作者名 --site kakuyomu.jp` のように単位を指定でき、タグ非表示はそのタグを持つ作品も隠す。設定は在庫 `hidden`（Native は `.narou/hidden.yaml` / SQLite `app_state`、Worker は D1 `app_state`）に保存し、`narou list --show-hidden` と Web UI の「非表示も表示」で解除表示できる。更新・変換などの内部処理は非表示作品も対象 |
+| `export` | — (Rust 拡張) | ✅ 完了 | 選択した作品を ZIP に書き出す (`narou export <target>... -o file.zip`)。`toc.yaml`・本文・`setting.ini`・`replace.txt`・`converter.yaml`・挿絵・EPUB を含み、`manifest.json` にメタデータと SHA-256 を記録。DB-only の作品も一時的に実体化して書き出す |
+| `import` | — (Rust 拡張) | ✅ 完了 | `narou export` の ZIP を取り込む (`narou import file.zip [--overwrite|--skip]`)。`toc_url` が一致する既存作品は上書き/スキップ、無い作品は新しい ID で追加。書込みは YAML / SQLite / S3 挿絵の各バックエンドの ObjectStore 経由で行い、古いアーカイブで既存本文を削らない。Web API `GET /api/transfer/export` / `POST /api/transfer/import` も同じ処理 |
 | `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`rename`/`order`/`clear` を実装。**サイトごとに複数の「名前つきログイン」を試行順つきで保持**し、1 ログインが複数ホストの Cookie を持つ (ブラウザのセッションがホストをまたぐため)。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET /api/login`、`POST /api/login/import\|rename\|order`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}` も対応 |
 | `db` | — (Rust 拡張) | ✅ 完了 | SQLite 管理 DB の保守。`verify` / `export-yaml [--out\|--in-place]` / `vacuum` / `repair-freeze [--dry-run]`。既定は YAML 管理で、SQLite は Web UI 初回ツアーまたは `.narou/storage-backend` マーカーによる opt-in。`repair-freeze` は旧ビルドが残した `freeze.yaml.imported-*` から失われた凍結状態を復旧する |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
@@ -328,6 +330,20 @@ narou author remove 1
 **単発取得との区別**: 通常のダウンロード欄や `download` に作者 URL を入れる操作は、その時点の作品一覧の取得だけであり、追跡登録は増やさない。継続追跡には `author add` または作者タブでの登録が必要。
 
 ---
+
+### 3.x-transfer `export` / `import` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
+
+選択した作品の小説データを ZIP で持ち出し、別のライブラリへ取り込む。
+
+| コマンド | 内容 |
+|---|---|
+| `export <target>... [-o FILE]` | 作品を ZIP へ書き出す。target は ID / URL / タイトル / Nコード / alias。省略時は `narou-export-<日時>.zip` |
+| `import <FILE> [--overwrite\|--skip]` | ZIP を取り込む。既定は既存作品をスキップ。`--overwrite` で置換 |
+
+- ZIP: `manifest.json` + `novels/<index>/...`。作品メタデータ（`toc_url` / title / author / sitename / domain / tags / novel_type / ncode）と各ファイルのサイズ・SHA-256 を manifest に記録する。
+- 安全策: パストラバーサル・absolute path・重複パス・サイズ/エントリ上限・zip bomb を共通コアで拒否。上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。`sqlite.mirror-files=false` のライブラリへの import は fail closed。
+- Web API: `GET /api/transfer/export?ids=1,2` は ZIP、`POST /api/transfer/import[?overwrite=true]` は ZIP 本文を受け取り `{success, created, overwritten, skipped, errors}` を返す。既存の Web 認証ミドルウェア配下。
+- 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が同じ build/parse/plan を呼ぶ。
 
 ### 3.x-hidden `hidden` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
 
