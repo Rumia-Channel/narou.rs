@@ -105,6 +105,20 @@ async fn route(req: Request, env: Env) -> Result<Response> {
     {
         return virtual_novels::download_epub(req, env, id).await;
     }
+    if let Some(id) = path
+        .strip_prefix("/api/virtual_novels/")
+        .and_then(|rest| rest.strip_suffix("/order"))
+        .and_then(|id| id.parse::<i64>().ok())
+    {
+        return virtual_novels::handle_order(req, env, id).await;
+    }
+    if req.method() == Method::Delete
+        && let Some(id) = path
+            .strip_prefix("/api/virtual_novels/")
+            .and_then(|id| id.parse::<i64>().ok())
+    {
+        return virtual_novels::handle_remove(req, env, id).await;
+    }
     match path.as_str() {
         "/health/live" => health_payload(&env, "alive").await,
         "/health/ready" => match check_ready(&env).await {

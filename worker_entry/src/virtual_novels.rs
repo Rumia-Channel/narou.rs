@@ -337,7 +337,50 @@ pub async fn download_epub(req: Request, env: Env, id: i64) -> worker::Result<Re
     Response::from_bytes(bytes).map(|response| response.with_headers(headers))
 }
 
-pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {    let runtime = WorkerRuntime::build_ui(&env).await?;
+#[derive(Deserialize)]
+struct OrderBody {
+    members: Vec<i64>,
+}
+
+pub async fn handle_order(mut req: Request, env: Env, id: i64) -> worker::Result<Response> {
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    let runtime = WorkerRuntime::build_ui(&env).await?;
+    let body: OrderBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => {
+            return Ok(Response::from_json(
+                &json!({"success":false,"message":"invalid JSON body"}),
+            )?
+            .with_status(400));
+        }
+    };
+    match reorder(&runtime, id, body.members).await {
+        Ok(()) => Ok(Response::from_json(&json!({"success":true}))?),
+        Err(error) => Ok(Response::from_json(
+            &json!({"success":false,"message":error.to_string()}),
+        )?
+        .with_status(400)),
+    }
+}
+
+pub async fn handle_remove(req: Request, env: Env, id: i64) -> worker::Result<Response> {
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    let runtime = WorkerRuntime::build_ui(&env).await?;
+    match remove(&runtime, id).await {
+        Ok(()) => Ok(Response::from_json(&json!({"success":true}))?),
+        Err(error) => Ok(Response::from_json(
+            &json!({"success":false,"message":error.to_string()}),
+        )?
+        .with_status(400)),
+    }
+}
+
+pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
+    let runtime = WorkerRuntime::build_ui(&env).await?;
     match (req.path().as_str(), req.method()) {
         ("/api/virtual_novels", Method::Get) => {
             let members = match read(runtime.write_db()).await {
