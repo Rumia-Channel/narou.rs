@@ -380,6 +380,33 @@ export function bindActions() {
       showNotification(error.message || '並べ替えに失敗しました', 'error');
     }
   });
+  on('action-option-virtual-convert', async () => {
+    try {
+      const response = await fetch('/api/virtual_novels');
+      const result = await response.json();
+      if (!result.success) throw new Error(result.message || '一覧を取得できません');
+      if (!result.novels.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const menu = result.novels.map((novel) => `${novel.ncode} ${novel.title}`).join('\n');
+      const target = window.prompt(`変換する ncode を入力してください\n${menu}`, result.novels[0].ncode);
+      if (!target) return;
+      const novel = result.novels.find(
+        (item) => item.ncode === target || String(item.id) === target,
+      );
+      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
+      showNotification('変換を開始しました', 'info');
+      const converted = await fetch(`/api/virtual_novels/${novel.id}/convert`, { method: 'POST' });
+      const convertedResult = await converted.json();
+      if (!converted.ok || !convertedResult.success) {
+        throw new Error(convertedResult.message || '変換に失敗しました');
+      }
+      showNotification(`出力しました: ${convertedResult.filename}`, 'info');
+    } catch (error) {
+      showNotification(error.message || '変換に失敗しました', 'error');
+    }
+  });
   on('action-option-virtual-remove', async () => {
     try {
       const response = await fetch('/api/virtual_novels');

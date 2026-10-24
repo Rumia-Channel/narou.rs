@@ -109,6 +109,44 @@ pub async fn api_virtual_order(
     }
 }
 
+pub async fn api_virtual_convert(
+    State(_state): State<AppState>,
+    Path(id): Path<i64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let result = tokio::task::spawn_blocking(move || -> Result<(String, String), String> {
+        let record = NativeNovelRepository::new()
+            .get_sync(NovelId(id))
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("仮想小説 vs_{id} が見つかりません"))?;
+        let members = virtual_novel::load()
+            .map_err(|error| error.to_string())?
+            .get(id)
+            .map(|members| members.to_vec())
+            .ok_or_else(|| format!("仮想小説 vs_{id} のメンバーがありません"))?;
+        let path = virtual_novel::convert_virtual(id, &record, &members, None, false, false)
+            .map_err(|error| error.to_string())?;
+        Ok((
+            core::ncode(id),
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        ))
+    })
+    .await;
+    match result {
+        Ok(Ok((ncode, filename))) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "ncode": ncode, "filename": filename})),
+        ),
+        Ok(Err(message)) => error_response(StatusCode::BAD_REQUEST, message),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "変換処理が中断されました",
+        ),
+    }
+}
+
 pub async fn api_virtual_remove(
     State(_state): State<AppState>,
     Path(id): Path<i64>,

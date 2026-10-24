@@ -257,8 +257,87 @@ async fn remove(runtime: &WorkerRuntime, id: i64) -> Result<()> {
     Ok(())
 }
 
-pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
+/// `/api/virtual_novels/{id}/download.epub` — メンバーを登録順に結合した EPUB。
+pub async fn download_epub(req: Request, env: Env, id: i64) -> worker::Result<Response> {
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
     let runtime = WorkerRuntime::build_ui(&env).await?;
+    let record = match runtime
+        .novels
+        .get(NovelId(id))
+        .await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?
+    {
+        Some(record) => record,
+        None => return Response::error("Not Found", 404),
+    };
+    let members = match read(runtime.write_db()).await {
+        Ok(members) => members,
+        Err(error) => return Response::error(format!("State error: {error}"), 503),
+    };
+    let Some(member_ids) = members.get(id) else {
+        return Response::error("Not Found", 404);
+    };
+    let mut text = format!("{}\n{}\n", record.title, record.author);
+    for member_id in member_ids {
+        let Some(member) = runtime
+            .novels
+            .get(NovelId(*member_id))
+            .await
+            .map_err(|error| worker::Error::RustError(error.to_string()))?
+        else {
+            return Response::error(format!("Member {member_id} not found"), 404);
+        };
+        let converted = match crate::convert::convert_text_only(&runtime, &member).await {
+            Ok(text) => text,
+            Err(error) => return Response::error(format!("Convert failed: {error}"), 409),
+        };
+        text.push_str("［＃改ページ］\n［＃３字下げ］［＃大見出し］");
+        text.push_str(&member.title);
+        text.push_str("［＃大見出し終わり］\n［＃改ページ］\n");
+        text.push_str(&converted);
+    }
+
+    let options = narou_rs::epub_lite::EpubBuildOptions {
+        title: record.title.clone(),
+        author: record.author.clone(),
+        vertical: true,
+        cover_from_first_image: false,
+        assets_dir: None,
+        kindle: false,
+        extra_assets: narou_rs::epub_lite::narou_font_assets(false, false, 1.8),
+        rotate_image: None,
+    };
+    let source = std::sync::Arc::new(narou_rs::epub_lite::EpubTextSource::new(
+        text,
+        Vec::new(),
+    ));
+    let preparation = match narou_rs::epub_lite::prepare_book_from_source(source, &options) {
+        Ok(preparation) => preparation,
+        Err(error) => return Response::error(format!("EPUB preparation failed: {error}"), 500),
+    };
+    let book = match preparation.finish(Vec::new(), None, &options) {
+        Ok(book) => book,
+        Err(error) => return Response::error(format!("EPUB build failed: {error}"), 500),
+    };
+    let sink = narou_rs::epub_lite::ChunkSink::new();
+    if let Err(error) = narou_rs::epub_lite::stream_epub(&book.book, sink.clone(), |_| None) {
+        return Response::error(format!("EPUB write failed: {error}"), 500);
+    }
+    let bytes = sink.take();
+    let filename = format!("{}.epub", record.file_title);
+    let headers = worker::Headers::new();
+    headers.set("Content-Type", "application/epub+zip")?;
+    headers.set(
+        "Content-Disposition",
+        &format!("attachment; filename=\"{}\"", filename.replace('"', "")),
+    )?;
+    headers.set("Cache-Control", "no-store")?;
+    Response::from_bytes(bytes).map(|response| response.with_headers(headers))
+}
+
+pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {    let runtime = WorkerRuntime::build_ui(&env).await?;
     match (req.path().as_str(), req.method()) {
         ("/api/virtual_novels", Method::Get) => {
             let members = match read(runtime.write_db()).await {

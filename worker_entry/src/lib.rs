@@ -98,6 +98,13 @@ fn head_response(response: Response) -> Result<Response> {
 
 async fn route(req: Request, env: Env) -> Result<Response> {
     let path = req.path();
+    if let Some(id) = path
+        .strip_prefix("/api/virtual_novels/")
+        .and_then(|rest| rest.strip_suffix("/download.epub"))
+        .and_then(|id| id.parse::<i64>().ok())
+    {
+        return virtual_novels::download_epub(req, env, id).await;
+    }
     match path.as_str() {
         "/health/live" => health_payload(&env, "alive").await,
         "/health/ready" => match check_ready(&env).await {

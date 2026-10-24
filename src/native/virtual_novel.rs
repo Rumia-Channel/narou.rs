@@ -316,7 +316,7 @@ pub fn convert_virtual(
         toc_url: record.toc_url.clone(),
         story: None,
         subtitles,
-        novel_type: Some(record.novel_type as u8),
+        novel_type: Some(record.novel_type),
     };
     std::fs::write(
         temp.path().join("toc.yaml"),
@@ -378,3 +378,4 @@ fn copy_illustrations(source: &Path, destination: &Path) -> Result<()> {
     }
     Ok(())
 }
+
