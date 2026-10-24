@@ -838,10 +838,10 @@ impl Downloader {
                 .or_else(|| self.site_setting_for_url(target))
                 .or_else(|| self.site_settings.iter().find(|setting| setting.matches_author_url(target)))
                 .ok_or_else(|| NarouError::InvalidTarget(format!("No site setting for URL: {target}")))?;
-            return Ok(crate::platform::site_family(&setting.domain));
+            return Ok(setting.download_site_family());
         }
         let (_, setting) = self.resolve_target_for_download(target).await?;
-        Ok(crate::platform::site_family(&setting.domain))
+        Ok(setting.download_site_family())
     }
 
     async fn load_novel_info(

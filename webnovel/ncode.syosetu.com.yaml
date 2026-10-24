@@ -2,6 +2,7 @@
 # 小説サイト定義
 name: &name 小説家になろう
 domain: ncode.syosetu.com
+site_family: syosetu.com
 top_url: https://\\k<domain>
 url: https?://\\k<domain>/(?<ncode>n\d+[a-z]+)
 series_url: https?://\\k<domain>/(?<series>s\d+[a-z]+)

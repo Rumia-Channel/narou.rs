@@ -1309,11 +1309,23 @@ where
     I: IntoIterator<Item = (i64, Option<S>)>,
     S: AsRef<str>,
 {
+    // YAML の `site_family` を優先する。定義の無いドメインだけ、共通の
+    // 自動判定 (登録可能ドメイン相当) にフォールバックする。
+    let families: HashMap<String, String> = narou_rs::downloader::site_setting::effective_site_settings()
+        .iter()
+        .map(|setting| (setting.domain.to_ascii_lowercase(), setting.download_site_family()))
+        .collect();
     let mut groups: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     for (id, domain) in records {
         let key = domain
             .as_ref()
-            .map(|s| site_family(s.as_ref()))
+            .map(|domain| {
+                let domain = domain.as_ref().trim().to_ascii_lowercase();
+                families
+                    .get(&domain)
+                    .cloned()
+                    .unwrap_or_else(|| site_family(&domain))
+            })
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| UNKNOWN_DOMAIN_KEY.to_string());
         groups.entry(key).or_default().push(id);

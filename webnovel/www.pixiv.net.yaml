@@ -10,6 +10,7 @@ name: &name Pixiv
 sitename: *name
 scheme: https
 domain: www.pixiv.net
+site_family: pixiv.net
 top_url: \\k<scheme>://\\k<domain>
 url:
   # 小説 (単体)
