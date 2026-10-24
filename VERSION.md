@@ -5,6 +5,8 @@
 
 ## v0.5.0 — 非表示設定・サイト別並列DL・小説データの ZIP 転送・バーチャル小説
 
+- **CLI の一括 update で EPUB が生成されない問題を修正**しました（issue #39）。`narou update` の自動変換に渡していた保存先が `小説データ/...` の相対パスで、SQLite の `sqlite.mirror-files=false` 構成では変換前の実体化が archive root と照合できず、`toc.yaml` が見つからないため `Convert error: IO error` になっていました。自動変換と実体化の両方で保存先を絶対パスに正規化します。個別 `narou convert` / Web UI からは元々絶対パスで成功していました。
+
 - **バーチャル小説登録を追加**しました。複数の実小説を `vs_<ID>` という 1 作品として `novels` テーブルに登録し、一覧・検索・タグ・凍結・非表示を通常作品と同じように扱えます。登録時にタイトル・作者・サイト・タグを指定でき、メンバーの登録順は `narou virtual order` で変更できます。仮想小説には `vs_<ID>` タグが付くため、既存の `narou hidden add --tag vs_1` で非表示にできます。メンバー行は仮想小説に属する間は一覧から自動的に除外されます。`narou convert vs_<ID>` の結合 EPUB は次の段階で実装します。
 
 - **小説データの ZIP ダウンロード / アップロードを追加**しました。`narou export <作品...> [-o file.zip]` と `narou import <file.zip> [--overwrite|--skip]`、Web API `GET /api/transfer/export?ids=...` / `POST /api/transfer/import` を実装しました。ZIP には `manifest.json`（メタデータ・SHA-256）と `toc.yaml`・本文・`setting.ini`・`replace.txt`・`converter.yaml`・挿絵・EPUB が入り、取り込みは `toc_url` で既存作品を判定して新しい ID で追加、または上書き/スキップします。YAML・SQLite・S3 挿絵の各バックエンドは ObjectStore 経由で更新し、古いアーカイブで既存の本文・設定を削らないようにしています。アーカイブ処理は wasm-safe な共通コア (`src/transfer`) に分離し、Native CLI / Web API / Worker / ブラウザ WASM から同じコアを呼ぶ構成です（ブラウザ WASM の UI 接続は次の段階）。
