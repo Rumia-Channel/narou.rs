@@ -111,23 +111,62 @@ impl<'a> AuthorListing<'a> {
             setting: setting.clone(),
             listing: self.fetch_listing(setting, page_url, &mut jobs).await,
         };
-        if !is_fully_readable(&best.listing) && !groups.is_empty() {
+        let merge_logins = setting.author_login_merge;
+        if !groups.is_empty() && (merge_logins || !is_fully_readable(&best.listing)) {
+            // 匿名の一覧に見えている分を種にして、ログインごとの一覧を
+            // 足し合わせる (`author_login_merge`)。匿名応答が完全に見えても
+            // ログイン限定作品が欠けるサイト (Pixiv の R-18) のための経路。
+            let mut merged = Listing::default();
+            if let Ok(listing) = &best.listing {
+                merge_listing(&mut merged, listing);
+            }
+            let mut any_readable = false;
+            let mut winner: Option<Attempt> = None;
             for group in &groups {
                 let mut with_login = setting.clone();
                 with_login.cookie = base_cookie.clone();
                 apply_login_cookie(&mut with_login, &group.merged_cookie(), &group.cookies);
                 let listing = self.fetch_listing(&with_login, page_url, &mut jobs).await;
-                let attempt = Attempt {
-                    setting: with_login,
-                    listing,
-                };
-                if better(&attempt.listing, &best.listing) {
-                    let resolved = is_fully_readable(&attempt.listing);
-                    best = attempt;
-                    if resolved {
-                        break;
+                if let Ok(found) = &listing {
+                    if !found.login_walled {
+                        any_readable = true;
+                    }
+                    if merge_logins {
+                        merge_listing(&mut merged, found);
+                        let winner_len = winner
+                            .as_ref()
+                            .and_then(|attempt| attempt.listing.as_ref().ok())
+                            .map_or(0, |listing| listing.urls.len());
+                        if winner.is_none() || found.urls.len() > winner_len {
+                            winner = Some(Attempt {
+                                setting: with_login.clone(),
+                                listing: Ok(found.clone()),
+                            });
+                        }
                     }
                 }
+                if !merge_logins {
+                    let attempt = Attempt {
+                        setting: with_login,
+                        listing,
+                    };
+                    if better(&attempt.listing, &best.listing) {
+                        let resolved = is_fully_readable(&attempt.listing);
+                        best = attempt;
+                        if resolved {
+                            break;
+                        }
+                    }
+                }
+            }
+            if merge_logins
+                && let Some(mut winner) = winner
+            {
+                if any_readable {
+                    merged.login_walled = false;
+                }
+                winner.listing = Ok(merged);
+                best = winner;
             }
         }
 
@@ -403,7 +442,7 @@ struct Attempt {
 }
 
 /// What one listing read produced before series members are excluded.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Listing {
     urls: Vec<String>,
     seen: HashSet<String>,
@@ -414,6 +453,32 @@ struct Listing {
     /// Any page matched `login_partial_pattern` (the definition reports the
     /// listing is incomplete without a stored login).
     partial: bool,
+}
+
+/// Merge one attempt's works into an accumulated listing (`author_login_merge`).
+///
+/// The anonymous listing and every stored login may expose different subsets
+/// (Pixiv hides R-18 works from anonymous requests), so the author's works are
+/// the union. `login_walled` is decided by the caller from the attempts that
+/// were actually readable.
+fn merge_listing(into: &mut Listing, from: &Listing) {
+    for url in &from.urls {
+        if into.seen.insert(url.clone()) {
+            into.urls.push(url.clone());
+        }
+    }
+    for id in &from.series {
+        if !into.series.contains(id) {
+            into.series.push(id.clone());
+        }
+    }
+    for id in &from.comic_series {
+        if !into.comic_series.contains(id) {
+            into.comic_series.push(id.clone());
+        }
+    }
+    into.partial |= from.partial;
+    into.login_walled |= from.login_walled;
 }
 
 /// A page read without a login wall or an incomplete-listing marker.
@@ -1012,13 +1077,177 @@ login_pattern: 'ログインが必要です'
     }
 
     fn login(cookie: &str) -> LoginGroup {
+        login_for("gated.example", cookie)
+    }
+
+    fn login_for(site: &str, cookie: &str) -> LoginGroup {
         LoginGroup::new(
-            "gated.example",
+            site,
             vec![HostCookie {
-                host: "gated.example".to_string(),
+                host: site.to_string(),
                 cookie: cookie.to_string(),
             }],
         )
+    }
+
+    /// Anonymous requests see only `book/1`; a logged-in request also sees
+    /// `book/2` (Pixiv hides R-18 works from anonymous responses the same way).
+    struct MergeAuthorClient {
+        cookies: Mutex<Vec<Option<String>>>,
+    }
+
+    impl HttpClient for MergeAuthorClient {
+        fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
+            Box::pin(async move {
+                let cookie = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, value)| value.clone());
+                self.cookies.lock().push(cookie.clone());
+                let body = if cookie.is_some() {
+                    r#"<a href="https://merge.example/book/1">1</a><a href="https://merge.example/book/2">2</a>"#
+                } else {
+                    r#"<a href="https://merge.example/book/1">1</a>"#
+                };
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![("Content-Type".into(), "text/html".into())],
+                    body: body.as_bytes().to_vec(),
+                })
+            })
+        }
+    }
+
+    const MERGE: &str = r#"
+name: Merge
+domain: merge.example
+top_url: https://merge.example
+url: https://merge\.example/book/(?<ncode>\d+)
+author_url: ^https?://merge\.example/user/(?<author_id>\d+)/?
+author_api_url: https://merge.example/user/\k<author_id>
+author_novel_pattern: '(?<novel_url>https?://merge\.example/book/\d+)'
+author_login_merge: yes
+sitename: Merge
+toc_url: https://merge.example/book/\k<ncode>
+"#;
+
+    #[test]
+    fn author_login_merge_adds_works_visible_only_with_a_login() {
+        let definitions = SiteSetting::load_bundled(&[MERGE]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://merge.example/user/5/";
+        let http = MergeAuthorClient {
+            cookies: Mutex::new(Vec::new()),
+        };
+        let cookies = MemoryCookieStore::new();
+        futures::executor::block_on(
+            cookies.save_groups("merge.example", &[login_for("merge.example", "session=ok")]),
+        )
+        .unwrap();
+
+        let urls = futures::executor::block_on(
+            AuthorListing::new(&http, &FakeRateLimiter::new(), Some(&cookies))
+                .works_for(&[setting], page),
+        )
+        .unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://merge.example/book/1".to_string(),
+                "https://merge.example/book/2".to_string(),
+            ]
+        );
+        let seen = http.cookies.lock().clone();
+        assert_eq!(seen.len(), 2, "匿名 + 保存ログイン: {seen:?}");
+        assert_eq!(seen[0], None);
+        assert_eq!(seen[1].as_deref(), Some("session=ok"));
+    }
+
+    #[test]
+    fn author_login_merge_is_opt_in() {
+        let without_merge = MERGE.replace("author_login_merge: yes", "");
+        let definitions = SiteSetting::load_bundled(&[without_merge.as_str()]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://merge.example/user/5/";
+        let http = MergeAuthorClient {
+            cookies: Mutex::new(Vec::new()),
+        };
+        let cookies = MemoryCookieStore::new();
+        futures::executor::block_on(
+            cookies.save_groups("merge.example", &[login_for("merge.example", "session=ok")]),
+        )
+        .unwrap();
+
+        let urls = futures::executor::block_on(
+            AuthorListing::new(&http, &FakeRateLimiter::new(), Some(&cookies))
+                .works_for(&[setting], page),
+        )
+        .unwrap();
+        assert_eq!(urls, vec!["https://merge.example/book/1".to_string()]);
+        assert_eq!(http.cookies.lock().len(), 1, "匿名一覧が完全ならログインは試さない");
+    }
+
+    /// Anonymous Pixiv responses omit R-18 novels; the saved login sees them.
+    struct PixivAuthorClient {
+        cookies: Mutex<Vec<Option<String>>>,
+    }
+
+    impl HttpClient for PixivAuthorClient {
+        fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
+            Box::pin(async move {
+                let cookie = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, value)| value.clone());
+                self.cookies.lock().push(cookie.clone());
+                let novels = if cookie.is_some() {
+                    r#"{"111":{},"222":{}}"#
+                } else {
+                    r#"{"111":{}}"#
+                };
+                let body = format!(
+                    r#"{{"error":false,"body":{{"novels":{novels},"novelSeries":[],"mangaSeries":[],"illusts":[],"manga":[]}}}}"#
+                );
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![("Content-Type".into(), "application/json".into())],
+                    body: body.into_bytes(),
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn bundled_pixiv_author_listing_merges_r18_works_from_a_stored_login() {
+        let setting = load("www.pixiv.net");
+        assert!(setting.author_login_merge, "Pixiv 定義でマージを有効にする");
+        let page = "https://www.pixiv.net/users/69616058";
+        let http = PixivAuthorClient {
+            cookies: Mutex::new(Vec::new()),
+        };
+        let cookies = MemoryCookieStore::new();
+        futures::executor::block_on(cookies.save_groups(
+            "www.pixiv.net",
+            &[login_for("www.pixiv.net", "PHPSESSID=x")],
+        ))
+        .unwrap();
+
+        let urls = futures::executor::block_on(
+            AuthorListing::new(&http, &FakeRateLimiter::new(), Some(&cookies))
+                .works_for(&[&setting], page),
+        )
+        .unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://www.pixiv.net/novel/show.php?id=111".to_string(),
+                "https://www.pixiv.net/novel/show.php?id=222".to_string(),
+            ],
+            "匿名分とログイン分を統合する: {urls:?}"
+        );
+        assert_eq!(http.cookies.lock().len(), 2);
     }
 
     #[test]

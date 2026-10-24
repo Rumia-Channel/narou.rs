@@ -301,7 +301,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 **保存形式**: 小説とは別の inventory `author`（Native は SQLite `app_state` / `.narou/author.yaml`、Workers は D1 の `app_state(scope='inv', key='author')`）に、**作者ページ URL（ユニーク）→ サイト名** だけを持つ。名前や日時などの帳簿は持たない。登録・解除は Native の Inventory 原子更新、Workers の全スナップショット CAS で保存し、別の登録操作を上書きしない。
 
-**サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧の取得先の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）/ `author_next_pattern`（ページ分けされた一覧の次ページ。ハーメルン・アルファポリス等で使用。終了は次ページが無いか訪問済みに戻ったとき）。
+**サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧の取得先の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）/ `author_next_pattern`（ページ分けされた一覧の次ページ。ハーメルン・アルファポリス等で使用。終了は次ページが無いか訪問済みに戻ったとき）。匿名の一覧が「完全」に見えてもログイン限定作品が欠けるサイト（Pixiv の R-18）は `author_login_merge: yes` を指定し、匿名の一覧と保存済みログインごとの一覧を統合する。
 
 **共通取得**: `author add/check` も現在の実効サイト定義を使う。作品一覧の取得・認証・シリーズ所属作品の除外は CLI / Worker の単発 URL 展開と共通。offset 型 API は `author_page_url` / `author_page_size` / `author_page_total_pattern` / `author_page_max_start` でページ送りする。なろう API の公式開始位置上限を越える場合や総件数に届かない場合は、途中までの一覧を成功扱いしない。
 

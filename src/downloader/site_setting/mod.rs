@@ -116,6 +116,13 @@ pub struct SiteSetting {
     /// 続きが残っている場合は、途中までの一覧を返さずエラーにする。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_page_max_start: Option<usize>,
+    /// 作者一覧の取得時に保存済みログインを必ず試し、匿名の一覧と統合する。
+    ///
+    /// 匿名の応答が「完全な一覧」に見えても、ログインしないと出てこない作品
+    /// (Pixiv の R-18 など) があるサイト用。定義側で `author_login_merge: yes`
+    /// とすると、匿名で読めた分に各ログインで読めた分を足し合わせる。
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
+    pub author_login_merge: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series_item_url: Option<String>,
     #[serde(default)]

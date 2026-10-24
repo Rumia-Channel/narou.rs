@@ -35,6 +35,9 @@ timezone: Asia/Tokyo
 # 各話・各ページは一覧にも混ざるため、content_titles / ?p=N でその分を除く。
 author_url: ^https?://\k<domain>/users/(?<user_id>\d+)
 author_api_url: \k<top_url>/ajax/user/\k<user_id>/profile/all
+# 匿名の一覧は「完全」に見えても、R-18 作品はログインしないと返らない。
+# 保存済みログインを必ず試し、匿名分と統合する (R-18 作者の取りこぼし対策)。
+author_login_merge: yes
 author_series_episodes_url: \k<top_url>/ajax/novel/series/\k<series_id>/content_titles
 author_series_episodes_pattern: '"id":"(?<novel_id>\d+)"'
 author_series_episode_work_url: \k<top_url>/novel/show.php?id=\k<novel_id>
