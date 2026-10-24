@@ -159,6 +159,7 @@ mod tests {
                 "latest_convert",
                 "author",
                 "hidden",
+                "virtual_novel_members",
                 "local_setting",
             ]
         );
@@ -180,6 +181,7 @@ mod tests {
                 "latest_convert",
                 "author",
                 "hidden",
+                "virtual_novel_members",
                 "local_setting",
                 "queue",
                 "notepad",
