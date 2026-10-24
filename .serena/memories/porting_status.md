@@ -1,5 +1,9 @@
 # narou.rs 移植状況
 
+## 現況（v0.4.19 未リリース変更）
+
+`webnovel/kakuyomu.jp.yaml` に `preserve_missing_sections: true` を追加し、カクヨムネクストの閲覧制限で目次から消えた保存済みの話を保持したまま、閲覧できる新着話だけを更新できるようにした。カクヨムの `index` はエピソード ID (数値) で安定している。既存の `tests/kakuyomu_login.rs` は、購読切れ時に `Canceled` で全体を見送る前提だったため、`preserve_missing_sections` の新挙動 (有料話を保持し、閲覧可能な無料話だけ更新) に合わせて更新。`cargo test --workspace` / clippy 成功。VERSION.md の「未リリース」節に記載。v0.4.18 タグは作成済みなので次回リリースは v0.4.19。
+
 ## 現況（v0.4.18 リリース）
 
 v0.4.18 のタグ・Release を進行中に、ユーザーから「Pixiv の作者取得で R-18 などログインが要る作品が取れない」と報告。原因は Pixiv の `/ajax/user/{id}/profile/all` が匿名でも「完全な一覧」に見える JSON を返し、R-18 作品だけを黙って省くこと。`AuthorListing` はログイン壁・部分一覧の印があるときだけ保存済みログインを試すため、匿名一覧が読めるとログインを試さず R-18 作品が欠けていた（実データ `https://www.pixiv.net/users/69616058` で匿名 1 件 / ログイン込み 20 小説 + 1 シリーズ = 21 件を確認）。

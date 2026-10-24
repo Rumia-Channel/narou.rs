@@ -21,6 +21,9 @@ confirm_over18: no
 # 保存済みログインで目次を取り直し、制限が残る場合は閲覧できる無料分だけを取得する。
 login_url: \k<top_url>/auth/login
 login_partial_pattern: '(?m:^EmptyEpisode;\d+;)'
+# 制限で目次から消えた保存済みの話を保持し、閲覧できる新着だけを足す。
+# 話の index はカクヨムのエピソード ID (数値) なので安定している。
+preserve_missing_sections: true
 append_title_to_folder_name: yes
 title_strip_pattern: null
 sitename: *name
