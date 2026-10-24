@@ -109,6 +109,7 @@
                 <span class="caret"></span>
               </a>
               <ul class="dropdown-menu dropdown-menu-right" id="options-menu">
+                <li><a href="#" id="action-option-hidden"><span class="material-symbols-outlined icon-leading" aria-hidden="true">visibility_off</span>非表示設定...</a></li>
                 <li><a href="#" id="action-option-settings"><span class="material-symbols-outlined icon-leading" aria-hidden="true">build</span>環境設定...</a></li>
                 <li class="divider"></li>
                 <li><a href="#" id="action-option-help"><span class="material-symbols-outlined icon-leading" aria-hidden="true">help</span>ヘルプ...</a></li>
@@ -341,6 +342,45 @@
           </div>
           <div class="modal-footer">
             <button class="btn btn-default" id="tag-edit-cancel" type="button">閉じる</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Hidden settings Modal -->
+    <div class="modal-overlay hide" id="hidden-modal">
+      <div class="modal-dialog modal-dialog-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="hidden-close" type="button">&times;</button>
+            <h4 class="modal-title">非表示設定</h4>
+          </div>
+          <div class="modal-body">
+            <p class="hidden-help">非表示にした作品・タグ・作者・サイトは一覧から隠れます。更新・変換などの内部処理は対象のままです。</p>
+            <div class="hidden-section">
+              <h5>作品 (ID)</h5>
+              <div class="hidden-add-row"><input type="text" id="hidden-novel-input" inputmode="numeric" placeholder="作品ID"><button class="btn btn-primary btn-sm" id="hidden-novel-add" type="button">非表示にする</button></div>
+              <div id="hidden-novel-list" class="hidden-list"></div>
+            </div>
+            <div class="hidden-section">
+              <h5>タグ</h5>
+              <div class="hidden-add-row"><input type="text" id="hidden-tag-input" placeholder="タグ名"><button class="btn btn-primary btn-sm" id="hidden-tag-add" type="button">非表示にする</button></div>
+              <div id="hidden-tag-list" class="hidden-list"></div>
+            </div>
+            <div class="hidden-section">
+              <h5>作者</h5>
+              <div class="hidden-add-row"><input type="text" id="hidden-author-input" placeholder="作者名"><button class="btn btn-primary btn-sm" id="hidden-author-add" type="button">非表示にする</button></div>
+              <div id="hidden-author-list" class="hidden-list"></div>
+            </div>
+            <div class="hidden-section">
+              <h5>サイト</h5>
+              <div class="hidden-add-row"><input type="text" id="hidden-site-input" placeholder="ドメインまたはサイト名"><button class="btn btn-primary btn-sm" id="hidden-site-add" type="button">非表示にする</button></div>
+              <div id="hidden-site-list" class="hidden-list"></div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="hidden-all-clear" type="button">すべて解除</button>
+            <button class="btn btn-default" id="hidden-cancel" type="button">閉じる</button>
           </div>
         </div>
       </div>

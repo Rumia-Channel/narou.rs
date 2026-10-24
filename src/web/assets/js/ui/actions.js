@@ -273,6 +273,18 @@ export function bindActions() {
   });
 
   on('action-option-about', openAbout);
+  on('action-option-hidden', openHiddenSettings);
+  on('hidden-close', () => closeModal(document.getElementById('hidden-modal')));
+  on('hidden-cancel', () => closeModal(document.getElementById('hidden-modal')));
+  on('hidden-novel-add', () => addHiddenValue('novels', 'hidden-novel-input'));
+  on('hidden-tag-add', () => addHiddenValue('tags', 'hidden-tag-input'));
+  on('hidden-author-add', () => addHiddenValue('authors', 'hidden-author-input'));
+  on('hidden-site-add', () => addHiddenValue('sites', 'hidden-site-input'));
+  on('hidden-all-clear', async () => {
+    await postJson('/api/hidden', { action: 'clear' });
+    await refreshHiddenSettings();
+    await refreshList();
+  });
 
   on('action-option-shutdown', async (e) => {
     if (!confirm('サーバをシャットダウンしますか？')) return;
@@ -1593,6 +1605,74 @@ async function openNotepad() {
 }
 
 /* ===== About ===== */
+
+async function openHiddenSettings() {
+  const modal = document.getElementById('hidden-modal');
+  if (!modal) return;
+  modal.classList.remove('hide');
+  await refreshHiddenSettings();
+}
+
+async function refreshHiddenSettings() {
+  let data;
+  try {
+    data = await fetchJson('/api/hidden');
+  } catch {
+    return;
+  }
+  const render = (containerId, values, kind) => {
+    const box = document.getElementById(containerId);
+    if (!box) return;
+    box.textContent = '';
+    const list = Array.isArray(values) ? values : [];
+    if (!list.length) {
+      const empty = document.createElement('span');
+      empty.className = 'hidden-empty';
+      empty.textContent = 'なし';
+      box.appendChild(empty);
+      return;
+    }
+    for (const value of list) {
+      const row = document.createElement('span');
+      row.className = 'hidden-item';
+      const label = document.createElement('span');
+      label.textContent = String(value);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'hidden-remove';
+      remove.textContent = '×';
+      remove.title = '表示に戻す';
+      remove.addEventListener('click', async () => {
+        await postJson('/api/hidden', { action: 'remove', [kind]: [kind === 'novels' ? Number(value) : value] });
+        await refreshHiddenSettings();
+        await refreshList();
+      });
+      row.appendChild(label);
+      row.appendChild(remove);
+      box.appendChild(row);
+    }
+  };
+  render('hidden-novel-list', data?.novels, 'novels');
+  render('hidden-tag-list', data?.tags, 'tags');
+  render('hidden-author-list', data?.authors, 'authors');
+  render('hidden-site-list', data?.sites, 'sites');
+}
+
+async function addHiddenValue(kind, inputId) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  const raw = input.value.trim();
+  if (!raw) return;
+  const value = kind === 'novels' ? Number(raw) : raw;
+  if (kind === 'novels' && !Number.isInteger(value)) {
+    showNotification('作品IDを数字で入力してください', 'error');
+    return;
+  }
+  await postJson('/api/hidden', { action: 'add', [kind]: [value] });
+  input.value = '';
+  await refreshHiddenSettings();
+  await refreshList();
+}
 
 async function openAbout() {
   try {
