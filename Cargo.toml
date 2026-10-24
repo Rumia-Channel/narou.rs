@@ -1,5 +1,5 @@
 [workspace]
-members = ["worker_entry", "relay"]
+members = ["worker_entry", "relay", "transfer_wasm"]
 resolver = "3"
 
 [package]

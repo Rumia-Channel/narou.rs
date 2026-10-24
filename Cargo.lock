@@ -1890,6 +1890,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "narou_transfer_wasm"
+version = "0.4.18"
+dependencies = [
+ "base64 0.23.1",
+ "narou_rs",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "narou_worker"
 version = "0.4.18"
 dependencies = [
