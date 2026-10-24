@@ -1813,7 +1813,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "narou_relay"
-version = "0.4.18"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "flate2",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "narou_rs"
-version = "0.4.18"
+version = "0.5.0"
 dependencies = [
  "aozora_epub3_lite",
  "argon2",
@@ -1891,7 +1891,7 @@ dependencies = [
 
 [[package]]
 name = "narou_transfer_wasm"
-version = "0.4.18"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "narou_rs",
@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "narou_worker"
-version = "0.4.18"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "brotli",
