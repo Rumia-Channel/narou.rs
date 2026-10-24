@@ -113,6 +113,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **ログイン資格情報**: 書き出し (`login export` / `narou_rs_login --export`) は 8 文字未満のパスフレーズを拒否し、ファイルは Unix 0600・シンボリックリンク非追従で書く (取り込みは旧ファイル互換のため任意長を受け付ける)。`narou_rs_login` のブラウザは `--remote-debugging-port=0` で起動し、`DevToolsActivePort` と `/json/version` の ws URL が起動したプロセスの port/host/path と一致することを確認する。SQLite の `db.sqlite` と `-wal` / `-shm` は Unix で 0600 にする。
 - **Worker / relay**: `NAROU_RELAY_ENDPOINT` は https 必須（ループバックのみ http 可）。スキーム省略の暗黙 `http://` 補完はしない（`platform::relay::normalize_relay_base`、違反は fail closed でリレー無効）。deploy CI の wrangler は固定バージョン (`NAROU_WRANGLER_VERSION`、既定 `4.151.3`) を使い、`NAROU_ADMIN_TOKEN` は CI で 32 文字以上を要求する。
 - **上流コンテンツ**: うごイラのフレーム ZIP は宣言サイズと読み出し上限（16 MiB/フレーム）およびヘッダ寸法で復号前に検証する。EPUB に取り込む非リモート `<img src>` は novel ディレクトリ内の相対パスだけを許可する。
+- **外部応答の Brotli 展開**: reqwest の `brotli` feature は有効にしない (CVE-2026-111497 は Google Brotli の C 実装 1.0.3〜1.2.0 が対象で C 版はリンクしていないが、pure Rust 実装も修正前と同じデコーダ経路を持つため、外部サイトの応答を展開する経路を落とす)。HTTP 取得は gzip / deflate / identity を使う。保存オブジェクト (`objects` / `section_bodies` など) の brotli 圧縮・伸長は自前データのみなので継続する。2026-10。
 
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。
