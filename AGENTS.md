@@ -115,6 +115,13 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **上流コンテンツ**: うごイラのフレーム ZIP は宣言サイズと読み出し上限（16 MiB/フレーム）およびヘッダ寸法で復号前に検証する。EPUB に取り込む非リモート `<img src>` は novel ディレクトリ内の相対パスだけを許可する。
 - **外部応答の Brotli 展開**: reqwest の `brotli` feature は有効にしない (CVE-2026-111497 は Google Brotli の C 実装 1.0.3〜1.2.0 が対象で C 版はリンクしていないが、pure Rust 実装も修正前と同じデコーダ経路を持つため、外部サイトの応答を展開する経路を落とす)。HTTP 取得は gzip / deflate / identity を使う。保存オブジェクト (`objects` / `section_bodies` など) の brotli 圧縮・伸長は自前データのみなので継続する。外部取得リレーも `curl --compressed` を使わず、`Accept-Encoding: gzip, deflate` を明示して gzip / deflate を Rust (`flate2`) で展開し、`br` は fail closed する (`relay/src/transport/curl.rs`)。2026-10。
 
+## 非表示・並列DL・転送 (v0.5.0)
+
+- **非表示設定**: 在庫 `hidden` に `novels` / `tags` / `authors` / `sites` を持つ (`HiddenState`)。Native は `.narou/hidden.yaml` / SQLite `app_state`、Worker は D1 `app_state`。一覧は `NovelFilter.exclude_*` で除外し、`include_hidden` が true のときだけ非表示も表示する。タグ非表示はそのタグの作品も隠す。更新・変換などの内部列挙は非表示作品も対象。CLI は `narou hidden` / `list --show-hidden`、Web UI は「非表示も表示」・右クリック・非表示設定モーダル。
+- **並列DLの系列**: `SiteSetting.site_family`（YAML）を第一優先し、未指定時は `platform::site_family` がドメインから自動判定する。なろう系は `syosetu.com`、Pixiv は `pixiv.net` を同梱定義に明記。Native `update` の domain groups、Worker の D1 admission `site_key`、Native Web のキュー worker が同じ系列で直列化する。異なる系列は並列。
+- **小説データ転送**: 形式と検証は wasm-safe な `src/transfer`（manifest + `novels/<i>/...`、決定論的 ZIP、パス/サイズ/zip bomb/SHA-256 検証、`plan_import`）。Native は `src/native/transfer`、CLI は `narou export/import`、Native Web は `/api/transfer/*`、Worker は ObjectStore 経由の同 API、ブラウザは `transfer_wasm`。競合は `toc_url`、既定 Skip / `--overwrite` で置換。上書きはアーカイブにあるファイルだけを置換し、既存の余分なファイルを削らない。
+- 設計の全体像は `docs/v0.5.0-architecture.md`。
+
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。
 - 作業開始時に対象ブランチが `origin` より遅れている場合は、`git pull` で最新へ追従してから作業を始める。
