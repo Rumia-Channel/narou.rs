@@ -53,6 +53,7 @@ pub mod tag_colors;
 pub mod termcolor;
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod title;
+pub mod virtual_novel;
 #[cfg(feature = "native-runtime")]
 pub mod updater_promote;
 #[cfg(feature = "native-runtime")]

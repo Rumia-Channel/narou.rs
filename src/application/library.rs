@@ -91,6 +91,8 @@ pub struct LibraryListRequest {
     pub hidden: Option<crate::hidden::HiddenState>,
     /// 非表示も表示する (`list --show-hidden` / Web UI のトグル)。
     pub include_hidden: bool,
+    /// 常に一覧から除外する作品 ID（バーチャル小説のメンバーなど）。
+    pub exclude_ids: Vec<i64>,
 }
 
 /// One row of the library table: the business fields the web list needs.
@@ -312,6 +314,7 @@ impl LibraryService {
         {
             hidden.apply_to_filter(&mut filter);
         }
+        filter.exclude_ids.extend(request.exclude_ids.iter().copied());
         let sort = NovelSort {
             key: request.sort_column.sort_key(),
             reverse: request.sort_order == LibrarySortOrder::Descending,
@@ -728,6 +731,7 @@ mod tests {
             sort_order: LibrarySortOrder::Ascending,
             hidden: None,
             include_hidden: true,
+            exclude_ids: Vec::new(),
         }
     }
 

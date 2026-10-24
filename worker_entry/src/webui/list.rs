@@ -114,6 +114,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
             sort_order,
             hidden,
             include_hidden,
+            exclude_ids: Vec::new(),
         })
         .await
     {

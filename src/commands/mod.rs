@@ -29,6 +29,7 @@ pub mod send;
 pub mod setting;
 pub mod trace;
 pub mod transfer_archive;
+pub mod virtual_novel;
 pub mod update;
 pub mod version;
 pub mod web;

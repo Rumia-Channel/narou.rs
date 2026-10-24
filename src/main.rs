@@ -351,6 +351,13 @@ async fn run_command(
                 1
             }
         },
+        Commands::Virtual { action } => match commands::virtual_novel::cmd_virtual(action) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
         Commands::Download {
             targets,
             force,
@@ -423,7 +430,7 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                 0
             }
         }
-        Commands::Download { .. } | Commands::Update { .. } | Commands::Csv { .. } | Commands::Author { .. } | Commands::Hidden { .. } => {
+        Commands::Download { .. } | Commands::Update { .. } | Commands::Csv { .. } | Commands::Author { .. } | Commands::Hidden { .. } | Commands::Virtual { .. } => {
             unreachable!()
         }
         Commands::Mail { targets, force } => {

@@ -94,6 +94,9 @@ async fn api_list_inner(
             sort_order,
             hidden: Some(crate::native::hidden::load().unwrap_or_default()),
             include_hidden: params.show_hidden.unwrap_or(false),
+            exclude_ids: crate::native::virtual_novel::load()
+                .map(|members| members.all_member_ids().into_iter().collect())
+                .unwrap_or_default(),
         })
         .await
         .map_err(map_application_error)?;

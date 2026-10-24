@@ -982,6 +982,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: crate::commands::hidden::HiddenAction,
     },
+    /// Register several novels as one virtual novel (ncode vs_<ID>).
+    #[command(after_help = "Examples:\n  narou virtual add --title \"XXX\" --author \"作者\" --site カクヨム 1 2 3\n  narou virtual list\n  narou virtual order vs_1 2,1,3")]
+    Virtual {
+        #[command(subcommand)]
+        action: crate::commands::virtual_novel::VirtualAction,
+    },
     /// Login credentials shared with a browser machine (list/import/export/rename/order/clear).
     Login {
         #[command(subcommand)]

@@ -224,7 +224,11 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
     } else {
         narou_rs::native::hidden::load().unwrap_or_default()
     };
+    let virtual_members = super::virtual_novel::hidden_member_ids();
     for record in &records {
+        if virtual_members.contains(&record.id) {
+            continue;
+        }
         let frozen = narou_rs::platform::repository::record_is_frozen(
             record,
             Some(&frozen_ids),

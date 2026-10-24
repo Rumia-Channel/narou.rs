@@ -25,5 +25,6 @@ pub mod s3;
 pub mod transfer;
 pub mod web_actions;
 pub mod self_update;
+pub mod virtual_novel;
 
 pub use application::non_external_console_target;

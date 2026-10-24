@@ -255,6 +255,7 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
             sort_order: narou_rs::application::LibrarySortOrder::Ascending,
             hidden: None,
             include_hidden: true,
+            exclude_ids: Vec::new(),
         })
         .await
         .map_err(|error| Error::RustError(error.to_string()))?;
