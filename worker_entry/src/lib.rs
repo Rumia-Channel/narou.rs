@@ -707,7 +707,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
             settings: &novel_settings,
             has_images: !image_names.is_empty(),
             // バイト源だけが native と異なり、フォント/CSS の規則は共通。
-            extra_assets: narou_rs::epub_lite::dakuten_font_assets(
+            extra_assets: narou_rs::epub_lite::narou_font_assets(
                 narou_rs::epub_lite::text_has_dakuten_marker(&text),
                 narou_rs::epub_lite::epub_font_always(
                     global_map.get("convert.epub-font").and_then(setting_text).as_deref(),

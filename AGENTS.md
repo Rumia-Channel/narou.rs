@@ -175,7 +175,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - 端末上で `narou init` を実行した場合は、Ruby 版と同じく AozoraEpub3 の場所と行の高さを対話式に質問する。非対話環境では入力待ちせず、既存設定がなければスキップする。
 - `narou init -p/--path` は指定先に `AozoraEpub3.jar` がある場合だけ `~/.narousetting/global_setting.yaml` に保存する。`-p :keep` は既存の有効な `aozoraepub3dir` を再利用する。
 - `narou init -l/--line-height` は AozoraEpub3 設定が保存される場合だけ `line-height` として保存し、未指定時は Ruby 版の非対話デフォルトに合わせて `1.8` を使う。
-- 有効な AozoraEpub3 パスを設定した場合は、Ruby 版と同じく `chuki_tag.txt` のカスタム注記追記/置換、`AozoraEpub3.ini` のコピー、`template/OPS/css_custom/vertical_font.css` の行高反映コピーを行う。
+- 有効な AozoraEpub3 パスを設定した場合は、Ruby 版と同じく `chuki_tag.txt` のカスタム注記追記/置換、`AozoraEpub3.ini` のコピー、行高反映済みカスタム CSS のコピーを行う。カスタム CSS の置き場所は AozoraEpub3 のテンプレート構成で変わる: 元祖レイアウト (`template/OPS/css/` がある) は `template/OPS/css_custom/vertical_font.css`、1.1.1 以降の改造版 / 電書協レイアウト (`template/item/style/` がある) は `template/item/style_custom/font.css`（中身は `preset/denshokyo_font.css`）。判定は `converter::dakuten_font::AozoraTemplateKind` が唯一の定義で、`init`・濁点フォント切替・変換時の不足補完・`lite` エンジンへの同梱 CSS がこれに従う。OPS パス固定に戻すと二分アキ (`［＃二分アキ］`)・行高・前書き/後書きの装飾が EPUB に反映されない (issue #42)。
 
 ## Build & Run
 ```powershell

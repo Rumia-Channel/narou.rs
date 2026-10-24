@@ -59,9 +59,17 @@ mod embedded {
     /// 読む (`converter::dakuten_font`) ので、ここは同じ内容の埋め込みコピー —
     /// ファイルシステムの無い wasm (Worker) 向け。
     pub const DAKUTEN_FONT_TTF: &[u8] = include_bytes!("../preset/DMincho.ttf");
-    /// 濁点フォント用スタイルシート (`preset/vertical_font_with_dakuten.css`)。
-    /// 行高は `<%= line_height %>` を展開して使う。
-    pub const DAKUTEN_CSS_TEMPLATE: &str = include_str!("../preset/vertical_font_with_dakuten.css");
+    /// narou カスタム CSS (`preset/denshokyo_font.css` = AozoraEpub3 の
+    /// `template/item/style_custom/font.css` 相当)。行高は
+    /// `<%= line_height %>` を展開して使う。
+    ///
+    /// 組み込みエンジンは電書協レイアウトの EPUB を組むため、この CSS を
+    /// 常に同梱しないと行高・二分アキ (`.half_em_space`)・前書きなどの
+    /// 装飾が一切効かない。
+    pub const CUSTOM_CSS_TEMPLATE: &str = include_str!("../preset/denshokyo_font.css");
+    /// 濁点フォント用スタイルシート (`preset/denshokyo_font_with_dakuten.css`)。
+    pub const DAKUTEN_CSS_TEMPLATE: &str =
+        include_str!("../preset/denshokyo_font_with_dakuten.css");
 }
 
 /// `AozoraConfig` equivalent to running the Lite CLI with its bundled assets
@@ -187,9 +195,10 @@ pub struct EpubBuildOptions {
     /// 呼び出し側が足す EPUB 内アセット。
     ///
     /// 組み込みエンジン (Lite) には外部ツールのような `aozoraepub3dir` への
-    /// ファイル流し込みが無いので、濁点フォント (`style/vertical_font.css` +
-    /// `fonts/DMincho.ttf`) はここで渡す。組立規則は [`dakuten_font_assets`]
-    /// (wasm: 埋め込み) / native `dakuten_font::lite_font_assets` (preset の実体)。
+    /// ファイル流し込みが無いので、narou カスタム CSS (`style/vertical_font.css`)
+    /// と、必要なら濁点フォント (`fonts/DMincho.ttf`) をここで渡す。組立規則は
+    /// [`narou_font_assets`] (wasm: 埋め込み) / native
+    /// `dakuten_font::lite_font_assets` (preset の実体)。
     pub extra_assets: Vec<EpubAsset>,
     /// `convert.rotate-image` の解決値。`None` (未指定) は INI の
     /// `RotateImage` に従う (AozoraEpub3 と同じ挙動)。
@@ -231,9 +240,9 @@ pub struct EpubSettingsInput<'a> {
     pub has_images: bool,
     /// 呼び出し側が組んだ EPUB 資産 ([`EpubBuildOptions::extra_assets`])。
     ///
-    /// 濁点フォントは [`dakuten_font_assets`] (wasm: 埋め込みコピー) か
-    /// native `dakuten_font::lite_font_assets` (preset の実体) で組む —
-    /// バイト源が実行環境の差なので、ここでは決めない。
+    /// narou カスタム CSS / 濁点フォントは [`narou_font_assets`]
+    /// (wasm: 埋め込みコピー) か native `dakuten_font::lite_font_assets`
+    /// (preset の実体) で組む — バイト源が実行環境の差なので、ここでは決めない。
     pub extra_assets: Vec<EpubAsset>,
     /// AozoraEpub3 の資産ディレクトリ。組み込みエンジンだけなら `None`。
     pub assets_dir: Option<PathBuf>,
@@ -277,15 +286,20 @@ pub fn needs_dakuten_font(use_dakuten_font: bool, always: bool) -> bool {
     use_dakuten_font || always
 }
 
-/// 濁点フォント資産一式の組立規則 (パス `style/vertical_font.css` +
-/// `fonts/DMincho.ttf`、media type、`always` の付加 CSS) はここが唯一の持ち主。
+/// narou カスタム CSS (+ 必要なら濁点フォント) の組立規則。
+///
+/// パス `style/vertical_font.css` と `fonts/DMincho.ttf`、media type、
+/// `always` の付加 CSS はここが唯一の持ち主。CSS は **常に** 含める
+/// (行高・二分アキ・前書き/後書きの装飾はこの CSS が無いと効かない)。
+/// 濁点フォント本体は濁点注記があるとき / `convert.epub-font=always` の
+/// ときだけ `font` に `Some` を渡す。
 ///
 /// バイト源 (`css_template` / `font`) だけが実行環境の差で、native は preset の
 /// 実体 (`dakuten_font::lite_font_assets`)、wasm (Worker) は同梱の埋め込み
-/// コピー ([`dakuten_font_assets`]) を渡す。
-pub fn dakuten_font_assets_from(
+/// コピー ([`narou_font_assets`]) を渡す。
+pub fn narou_font_assets_from(
     css_template: &str,
-    font: &[u8],
+    font: Option<&[u8]>,
     always: bool,
     line_height: f64,
 ) -> Vec<EpubAsset> {
@@ -296,38 +310,42 @@ pub fn dakuten_font_assets_from(
     if always {
         css.push_str(ALWAYS_BODY_FONT_CSS);
     }
-    vec![
-        EpubAsset::new("style/vertical_font.css", "text/css", css.into_bytes()),
-        EpubAsset::new("fonts/DMincho.ttf", "application/font-sfnt", font.to_vec()),
-    ]
+    let mut assets = vec![EpubAsset::new(
+        "style/vertical_font.css",
+        "text/css",
+        css.into_bytes(),
+    )];
+    if let Some(font) = font {
+        assets.push(EpubAsset::new(
+            "fonts/DMincho.ttf",
+            "application/font-sfnt",
+            font.to_vec(),
+        ));
+    }
+    assets
 }
 
 /// `convert.epub-font=always` のとき本文全体を DMincho で組む追記 CSS。
 const ALWAYS_BODY_FONT_CSS: &str =
     "\n/* narou: convert.epub-font=always — 本文全体を DMincho で組む */\n\nbody, p {\n\tfont-family: \"DakutenAokinMincho\", serif;\n}\n";
 
-/// 埋め込みコピーで濁点フォント資産を組む (ファイルシステムの無い wasm / 未設定
-/// の native 向け)。
+/// 埋め込みコピーで narou カスタム CSS (+ 濁点フォント) を組む
+/// (ファイルシステムの無い wasm / 未設定の native 向け)。
 ///
 /// - `use_dakuten_font`: 本文に濁点注記がある (auto の対象)。
 /// - `always`: `convert.epub-font=always`。
 /// - `line_height`: CSS の `<%= line_height %>` へ展開する値。
 ///
-/// どちらも偽なら空を返す ([`needs_dakuten_font`])。
-pub fn dakuten_font_assets(
-    use_dakuten_font: bool,
-    always: bool,
-    line_height: f64,
-) -> Vec<EpubAsset> {
-    if !needs_dakuten_font(use_dakuten_font, always) {
-        return Vec::new();
-    }
-    dakuten_font_assets_from(
-        embedded::DAKUTEN_CSS_TEMPLATE,
-        embedded::DAKUTEN_FONT_TTF,
-        always,
-        line_height,
-    )
+/// CSS は常に返し、濁点フォント本体は [`needs_dakuten_font`] のときだけ足す。
+pub fn narou_font_assets(use_dakuten_font: bool, always: bool, line_height: f64) -> Vec<EpubAsset> {
+    let needs_font = needs_dakuten_font(use_dakuten_font, always);
+    let css_template = if needs_font {
+        embedded::DAKUTEN_CSS_TEMPLATE
+    } else {
+        embedded::CUSTOM_CSS_TEMPLATE
+    };
+    let font = needs_font.then_some(embedded::DAKUTEN_FONT_TTF);
+    narou_font_assets_from(css_template, font, always, line_height)
 }
 
 /// 書き出し時に読み出す挿絵。

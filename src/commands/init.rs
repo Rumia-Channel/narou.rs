@@ -301,20 +301,13 @@ fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> 
         aozora_dir.join("AozoraEpub3.ini"),
     )?;
 
-    let vertical_font = std::fs::read_to_string(preset_dir.join("vertical_font.css"))?
-        .replace(
-            "<%= line_height %>",
-            &narou_rs::converter::settings::format_line_height(line_height),
-        );
-    let vertical_font_path = aozora_dir
-        .join("template")
-        .join("OPS")
-        .join("css_custom")
-        .join("vertical_font.css");
-    if let Some(parent) = vertical_font_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(vertical_font_path, vertical_font)?;
+    // AozoraEpub3 はテンプレート配置によってカスタム CSS の書き込み先が変わる。
+    // 1.1.1 以降の改造版 (電書協レイアウト) は `template/item/style_custom/font.css`
+    // でないと CSS (行高・二分アキなど) が EPUB に反映されないため、配置を
+    // 判定して正しいファイルへ書く (issue #42)。
+    let template_kind = narou_rs::converter::dakuten_font::detect_template_kind(&aozora_dir)
+        .unwrap_or(narou_rs::converter::dakuten_font::AozoraTemplateKind::Legacy);
+    narou_rs::converter::dakuten_font::install_normal_css(&aozora_dir, template_kind, line_height)?;
 
     println!("AozoraEpub3 の構成ファイルを書き換えました");
     Ok(())
@@ -398,6 +391,10 @@ mod tests {
         let aozora_dir = temp.path();
         std::fs::write(aozora_dir.join("AozoraEpub3.jar"), "").unwrap();
         std::fs::write(aozora_dir.join("chuki_tag.txt"), "base\n").unwrap();
+        // 元祖レイアウト (template/OPS/css/) の判定マーカー。
+        let legacy_css = aozora_dir.join("template/OPS/css/vertical_font.css");
+        std::fs::create_dir_all(legacy_css.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_css, "base\n").unwrap();
 
         rewrite_aozoraepub3_files(aozora_dir.to_str().unwrap(), 1.8).unwrap();
 
@@ -416,6 +413,38 @@ mod tests {
         )
         .unwrap();
         assert!(vertical.contains("line-height: 1.8em !important;"));
+        assert!(vertical.contains(".half_em_space"));
+    }
+
+    /// 1.1.1 以降の改造版 (電書協レイアウト) ではカスタム CSS を
+    /// `template/item/style_custom/font.css` に置かないと EPUB に反映されない。
+    /// 古い OPS パスへ書くと二分アキが効かないままになる (issue #42)。
+    #[test]
+    fn rewrite_aozoraepub3_files_uses_denshokyo_custom_css_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let aozora_dir = temp.path();
+        std::fs::write(aozora_dir.join("AozoraEpub3.jar"), "").unwrap();
+        std::fs::write(aozora_dir.join("chuki_tag.txt"), "base\n").unwrap();
+        let denshokyo_css = aozora_dir.join("template/item/style/font.css");
+        std::fs::create_dir_all(denshokyo_css.parent().unwrap()).unwrap();
+        std::fs::write(&denshokyo_css, "base\n").unwrap();
+
+        rewrite_aozoraepub3_files(aozora_dir.to_str().unwrap(), 1.7).unwrap();
+
+        let custom =
+            std::fs::read_to_string(aozora_dir.join("template/item/style_custom/font.css"))
+                .unwrap();
+        assert!(custom.contains("line-height: 1.7em !important;"));
+        assert!(
+            custom.contains(".vrtl .half_em_space"),
+            "電書協レイアウト用の二分アキ CSS が無い"
+        );
+        assert!(
+            !aozora_dir
+                .join("template/OPS/css_custom/vertical_font.css")
+                .exists(),
+            "電書協レイアウトで旧 OPS パスへ書いてしまっている"
+        );
     }
 
     #[test]
@@ -451,6 +480,8 @@ mod tests {
         assert!(path.join("AozoraEpub3.ini").exists());
         assert!(path.join("custom_chuki_tag.txt").exists());
         assert!(path.join("vertical_font.css").exists());
+        assert!(path.join("denshokyo_font.css").exists());
+        assert!(path.join("denshokyo_font_with_dakuten.css").exists());
     }
 
     #[test]

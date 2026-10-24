@@ -709,11 +709,12 @@ pub fn convert_existing_novel(
     no_open: bool,
 ) -> std::result::Result<PathBuf, String> {
     let _lock = NovelLockGuard::acquire(Some(id)).map_err(|e| e.to_string())?;
+    let multi_device = load_local_setting_string("convert.multi-device").is_some();
     let devices = resolve_auto_convert_devices()?;
     let mut last_output_path = None;
     for device in devices {
         let mut settings = NovelSettings::load_for_novel(id, title, author, novel_dir);
-        apply_auto_convert_device_settings(&mut settings, device);
+        apply_auto_convert_device_settings(&mut settings, device, multi_device);
         let mut converter =
             if let Some(user_converter) = UserConverter::load_with_title(novel_dir, title) {
                 NovelConverter::with_user_converter(settings, user_converter)
@@ -802,7 +803,22 @@ fn parse_convert_device_name(name: &str) -> Option<Device> {
     }
 }
 
-fn apply_auto_convert_device_settings(settings: &mut NovelSettings, device: Option<Device>) {
+/// ダウンロード/更新後の自動変換で、端末由来の設定を適用する。
+///
+/// Ruby 版 `Command::Convert#change_settings` と同じく、端末を明示した変換
+/// (`convert.multi-device`) のときだけ `Device::RELATED_VARIABLES` を適用する。
+/// 通常の変換 (端末設定から選ばれた `device`) では何もしない — `device` を
+/// 変えた時点で `default.enable_half_indent_bracket` が保存されており、変換時は
+/// `force.*` > setting.ini > `default.*` の順で解決されるため、ここで上書きすると
+/// 利用者の設定を無視してしまう (issue #42)。
+fn apply_auto_convert_device_settings(
+    settings: &mut NovelSettings,
+    device: Option<Device>,
+    explicit_device: bool,
+) {
+    if !explicit_device {
+        return;
+    }
     if matches!(device, Some(Device::Mobi)) {
         settings.enable_half_indent_bracket = true;
     }
@@ -1509,6 +1525,29 @@ mod tests {
         assert_eq!(
             Some(resolved),
             canonicalize_existing_path(temp.path().join("AozoraEpub3.jar"))
+        );
+    }
+
+    /// issue #42: 自動変換でも通常の `device` 設定は利用者の
+    /// `enable_half_indent_bracket` を上書きしない。端末を明示した
+    /// (`convert.multi-device`) 変換のときだけ端末由来の設定を適用する。
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn auto_convert_device_settings_only_apply_to_explicit_devices() {
+        use crate::converter::settings::NovelSettings;
+
+        let mut settings = NovelSettings::default();
+        settings.enable_half_indent_bracket = false;
+        super::apply_auto_convert_device_settings(&mut settings, Some(Device::Mobi), false);
+        assert!(
+            !settings.enable_half_indent_bracket,
+            "通常の自動変換で端末設定が利用者設定を上書きした"
+        );
+
+        super::apply_auto_convert_device_settings(&mut settings, Some(Device::Mobi), true);
+        assert!(
+            settings.enable_half_indent_bracket,
+            "端末を明示した Kindle 変換で二分アキが付かない"
         );
     }
 }
