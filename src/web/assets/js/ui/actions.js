@@ -274,6 +274,41 @@ export function bindActions() {
 
   on('action-option-about', openAbout);
   on('action-option-hidden', openHiddenSettings);
+  on('action-option-export', () => {
+    const ids = getSelectedIdsInDisplayOrder();
+    if (!ids.length) {
+      showNotification('ダウンロードする作品を選択してください', 'error');
+      return;
+    }
+    const anchor = document.createElement('a');
+    anchor.href = `/api/transfer/export?ids=${ids.join(',')}`;
+    anchor.download = 'narou-export.zip';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  });
+  on('action-option-import', () => document.getElementById('transfer-import-file')?.click());
+  document.getElementById('transfer-import-file')?.addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const response = await fetch('/api/transfer/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/zip' },
+        body: file,
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.success) {
+        throw new Error(result?.message || 'アップロードに失敗しました');
+      }
+      const summary = `新規 ${result.created ?? 0} / 上書き ${result.overwritten ?? 0} / スキップ ${result.skipped ?? 0}`;
+      showNotification(summary, 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || 'アップロードに失敗しました', 'error');
+    }
+  });
   on('hidden-close', () => closeModal(document.getElementById('hidden-modal')));
   on('hidden-cancel', () => closeModal(document.getElementById('hidden-modal')));
   on('hidden-novel-add', () => addHiddenValue('novels', 'hidden-novel-input'));
