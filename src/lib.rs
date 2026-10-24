@@ -25,6 +25,10 @@ pub mod hidden;
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod illustration_animation;
 pub mod illustration_store;
+// ZIP は `illustration-animation` が有効なときだけビルドされるため、この
+// cfg が native / Worker (wasm32) の両方で zip が存在する条件と一致する。
+#[cfg(feature = "illustration-animation")]
+pub mod transfer;
 #[cfg(feature = "native-runtime")]
 pub mod logger;
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]

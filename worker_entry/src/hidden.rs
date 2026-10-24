@@ -45,7 +45,7 @@ async fn read(db: &DbHandle) -> Result<HiddenState> {
         .await
         .map_err(db_error)?;
     match row {
-        Some(row) => Ok(serde_json::from_str(&row.value_json)?),
+        Some(row) => serde_json::from_str(&row.value_json).map_err(db_error),
         None => Ok(HiddenState::default()),
     }
 }
@@ -138,22 +138,28 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         return response;
     }
     if !matches!((req.path().as_str(), req.method()), ("/api/hidden", Method::Get | Method::Post)) {
-        return Response::from_json(&json!({"success":false,"message":"Method Not Allowed"}))?
-            .with_status(405);
+        return Ok(Response::from_json(
+            &json!({"success":false,"message":"Method Not Allowed"}),
+        )?
+        .with_status(405));
     }
     let runtime = WorkerRuntime::build_ui(&env).await?;
     if req.method() == Method::Get {
-        return match load(&runtime).await {
-            Ok(state) => Response::from_json(&payload(&state)),
-            Err(error) => Response::from_json(&json!({"success":false,"message":error.to_string()}))?
-                .with_status(503),
-        };
+        return Ok(match load(&runtime).await {
+            Ok(state) => Response::from_json(&payload(&state))?,
+            Err(error) => Response::from_json(
+                &json!({"success":false,"message":error.to_string()}),
+            )?
+            .with_status(503),
+        });
     }
     let body: HiddenRequest = match req.json().await {
         Ok(body) => body,
         Err(_) => {
-            return Response::from_json(&json!({"success":false,"message":"invalid JSON body"}))?
-                .with_status(400);
+            return Ok(Response::from_json(
+                &json!({"success":false,"message":"invalid JSON body"}),
+            )?
+            .with_status(400));
         }
     };
     let action = body.action.as_deref().unwrap_or("add");
@@ -161,8 +167,10 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     let mut state = match read(&db).await {
         Ok(state) => state,
         Err(error) => {
-            return Response::from_json(&json!({"success":false,"message":error.to_string()}))?
-                .with_status(503);
+            return Ok(Response::from_json(
+                &json!({"success":false,"message":error.to_string()}),
+            )?
+            .with_status(503));
         }
     };
     match action {
@@ -197,13 +205,17 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         "clear" => state = HiddenState::default(),
         _ => {
             let error = invalid("unknown hidden action");
-            return Response::from_json(&json!({"success":false,"message":error.to_string()}))?
-                .with_status(400);
+            return Ok(Response::from_json(
+                &json!({"success":false,"message":error.to_string()}),
+            )?
+            .with_status(400));
         }
     }
-    match write(&db, &state).await {
-        Ok(()) => Response::from_json(&payload(&state)),
-        Err(error) => Response::from_json(&json!({"success":false,"message":error.to_string()}))?
-            .with_status(503),
-    }
+    Ok(match write(&db, &state).await {
+        Ok(()) => Response::from_json(&payload(&state))?,
+        Err(error) => Response::from_json(
+            &json!({"success":false,"message":error.to_string()}),
+        )?
+        .with_status(503),
+    })
 }
