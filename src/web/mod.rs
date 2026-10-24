@@ -5,6 +5,7 @@ pub mod feature_tour;
 pub mod frontend;
 pub mod global_settings;
 pub mod hidden;
+pub mod virtual_novels;
 pub mod jobs;
 pub mod library_backup;
 pub mod login;
@@ -607,6 +608,18 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/authors", get(authors::list).post(authors::add).delete(authors::remove))
         .route("/api/authors/check", post(authors::check))
         .route("/api/hidden", get(hidden::api_hidden_get).post(hidden::api_hidden))
+        .route(
+            "/api/virtual_novels",
+            get(virtual_novels::api_virtual_list).post(virtual_novels::api_virtual_create),
+        )
+        .route(
+            "/api/virtual_novels/{id}/order",
+            post(virtual_novels::api_virtual_order),
+        )
+        .route(
+            "/api/virtual_novels/{id}",
+            axum::routing::delete(virtual_novels::api_virtual_remove),
+        )
         .route("/api/login/import", post(login::login_import))
         .route("/api/login/rename", post(login::login_rename))
         .route("/api/login/order", post(login::login_order))

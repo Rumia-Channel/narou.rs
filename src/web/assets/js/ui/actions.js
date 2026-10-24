@@ -309,6 +309,107 @@ export function bindActions() {
       showNotification(error.message || 'アップロードに失敗しました', 'error');
     }
   });
+  on('action-option-virtual-add', async () => {
+    const ids = getSelectedIdsInDisplayOrder();
+    if (!ids.length) {
+      showNotification('まとめる作品を選択してください', 'error');
+      return;
+    }
+    const title = window.prompt('バーチャル小説のタイトル');
+    if (!title) return;
+    const author = window.prompt('作者名', '') ?? '';
+    const sitename = window.prompt('サイト名', '') ?? '';
+    try {
+      const response = await fetch('/api/virtual_novels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, author, sitename, tags: [], members: ids }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || '登録に失敗しました');
+      }
+      showNotification(`バーチャル小説を登録しました: ${result.ncode}`, 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '登録に失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-order', async () => {
+    try {
+      const response = await fetch('/api/virtual_novels');
+      const result = await response.json();
+      if (!result.success) throw new Error(result.message || '一覧を取得できません');
+      if (!result.novels.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const menu = result.novels
+        .map((novel) => `${novel.ncode} ${novel.title} (${novel.members.length}作品)`)
+        .join('\n');
+      const target = window.prompt(`対象の ncode を入力してください\n${menu}`, result.novels[0].ncode);
+      if (!target) return;
+      const novel = result.novels.find(
+        (item) => item.ncode === target || String(item.id) === target,
+      );
+      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
+      const order = window.prompt(
+        `現在の順序 (${novel.members.length}件) をカンマ区切りで入力\n例: 2,1,3`,
+        novel.members.map((_, index) => index + 1).join(','),
+      );
+      if (!order) return;
+      const members = order
+        .split(',')
+        .map((part) => Number.parseInt(part.trim(), 10))
+        .map((position) => novel.members[position - 1]);
+      if (members.some((member) => member == null)) {
+        throw new Error('順序は現在の位置番号で全件指定してください');
+      }
+      const saved = await fetch(`/api/virtual_novels/${novel.id}/order`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ members }),
+      });
+      const savedResult = await saved.json();
+      if (!saved.ok || !savedResult.success) {
+        throw new Error(savedResult.message || '並べ替えに失敗しました');
+      }
+      showNotification('順序を変更しました', 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '並べ替えに失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-remove', async () => {
+    try {
+      const response = await fetch('/api/virtual_novels');
+      const result = await response.json();
+      if (!result.success) throw new Error(result.message || '一覧を取得できません');
+      if (!result.novels.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const menu = result.novels.map((novel) => `${novel.ncode} ${novel.title}`).join('\n');
+      const target = window.prompt(`削除する ncode を入力してください\n${menu}`, result.novels[0].ncode);
+      if (!target) return;
+      const novel = result.novels.find(
+        (item) => item.ncode === target || String(item.id) === target,
+      );
+      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
+      if (!window.confirm(`${novel.ncode} ${novel.title} を削除しますか？（メンバー作品は残ります）`)) {
+        return;
+      }
+      const removed = await fetch(`/api/virtual_novels/${novel.id}`, { method: 'DELETE' });
+      const removedResult = await removed.json();
+      if (!removed.ok || !removedResult.success) {
+        throw new Error(removedResult.message || '削除に失敗しました');
+      }
+      showNotification('バーチャル小説を削除しました', 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '削除に失敗しました', 'error');
+    }
+  });
   on('hidden-close', () => closeModal(document.getElementById('hidden-modal')));
   on('hidden-cancel', () => closeModal(document.getElementById('hidden-modal')));
   on('hidden-novel-add', () => addHiddenValue('novels', 'hidden-novel-input'));

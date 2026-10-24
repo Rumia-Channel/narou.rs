@@ -181,6 +181,78 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                     continue;
                 }
             };
+            if record
+                .ncode
+                .as_deref()
+                .is_some_and(narou_rs::virtual_novel::is_virtual_ncode)
+            {
+                let members = match narou_rs::native::virtual_novel::load() {
+                    Ok(all) => all.get(id).map(|members| members.to_vec()),
+                    Err(err) => {
+                        sink.emit(Stream::Stdout, &messages::indented_error(err));
+                        continue;
+                    }
+                };
+                let Some(members) = members else {
+                    sink.emit(
+                        Stream::Stdout,
+                        &messages::indented_error(narou_rs::error::NarouError::Database(
+                            format!("バーチャル小説 vs_{id} のメンバーがありません"),
+                        )),
+                    );
+                    continue;
+                };
+                let _lock = match narou_rs::compat::NovelLockGuard::acquire(Some(id)) {
+                    Ok(lock) => lock,
+                    Err(err) => {
+                        sink.emit(Stream::Stdout, &messages::indented_error(err));
+                        continue;
+                    }
+                };
+                match narou_rs::native::virtual_novel::convert_virtual(
+                    id,
+                    &record,
+                    &members,
+                    output_device,
+                    no_strip,
+                    verbose,
+                ) {
+                    Ok(path) => {
+                        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                            sink.emit(Stream::Stdout, &messages::convert::output_written(name));
+                        }
+                        if path.to_string_lossy().to_ascii_lowercase().ends_with(".epub") {
+                            sink.emit(
+                                Stream::Stdout,
+                                &bold_colored(messages::convert::epub_written(), "green"),
+                            );
+                        }
+                        if first_output_dir.is_none() {
+                            first_output_dir = path.parent().map(Path::to_path_buf);
+                        }
+                        if let Err(err) = print_copy_to_result(
+                            &path.display().to_string(),
+                            copy_device,
+                            id,
+                            sink,
+                        ) {
+                            sink.emit(Stream::Stdout, &err);
+                        }
+                        completed_count += 1;
+                        sink.emit(
+                            Stream::Stdout,
+                            &messages::convert::completed(index + 1, total_count, target),
+                        );
+                    }
+                    Err(err) => {
+                        sink.emit(
+                            Stream::Stdout,
+                            &messages::convert::item_error(index + 1, total_count, target, err),
+                        );
+                    }
+                }
+                continue;
+            }
             let archive_root =
                 narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
                     .unwrap_or_else(|_| {

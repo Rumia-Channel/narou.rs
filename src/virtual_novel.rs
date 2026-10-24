@@ -41,8 +41,8 @@ pub fn tag(id: i64) -> String {
 
 /// 仮想小説 ID → 登録順のメンバー ID。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct VirtualNovelMembers {
-    #[serde(flatten)]
     pub groups: BTreeMap<i64, Vec<i64>>,
 }
 
@@ -124,6 +124,15 @@ fn validate_members(members: &[i64]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn membership_roundtrips_as_a_bare_yaml_map() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(3, vec![1, 2]).unwrap();
+        let yaml = serde_yaml::to_string(&members).unwrap();
+        let back: VirtualNovelMembers = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.get(3), Some([1, 2].as_slice()));
+    }
 
     #[test]
     fn ncode_roundtrip_and_detection() {
