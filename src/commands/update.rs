@@ -2134,7 +2134,7 @@ mod tests {
         // one bucket: they share the same operator and etiquette.
         assert_eq!(by_name["syosetu.com"], vec![1, 2, 3]);
         assert_eq!(by_name["kakuyomu.jp"], vec![6]);
-        assert!(by_name.get("novel18.syosetu.com").is_none());
+        assert!(!by_name.contains_key("novel18.syosetu.com"));
 
         // Unknown-domain records collapse into a single bucket that
         // the serial fallback can drain safely.

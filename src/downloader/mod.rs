@@ -3508,7 +3508,7 @@ is_narou: false
             "N1234AB", "43", "https://ncode.syosetu.com/n1234ab/",
             "https://mypage.syosetu.com/2842627/", "https://ncode.syosetu.com/s1234ab/",
         ] {
-            assert_eq!(downloader.site_key_for_target(target).await.unwrap(), "ncode.syosetu.com", "{target}");
+            assert_eq!(downloader.site_key_for_target(target).await.unwrap(), "syosetu.com", "{target}");
         }
         assert!(downloader.site_key_for_target("https://unknown.example/book/").await.is_err());
         assert!(http.requested_urls().is_empty(), "admission must never fetch a site or send cookies");
