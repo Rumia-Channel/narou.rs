@@ -1,10 +1,10 @@
 # narou.rs 移植状況
 
-## 現況（v0.4.18 リリース準備）
+## 現況（v0.4.18 リリース）
 
 v0.4.18 のタグ・Release を進行中に、ユーザーから「Pixiv の作者取得で R-18 などログインが要る作品が取れない」と報告。原因は Pixiv の `/ajax/user/{id}/profile/all` が匿名でも「完全な一覧」に見える JSON を返し、R-18 作品だけを黙って省くこと。`AuthorListing` はログイン壁・部分一覧の印があるときだけ保存済みログインを試すため、匿名一覧が読めるとログインを試さず R-18 作品が欠けていた（実データ `https://www.pixiv.net/users/69616058` で匿名 1 件 / ログイン込み 20 小説 + 1 シリーズ = 21 件を確認）。
 
-修正: サイト定義の新キー `author_login_merge: yes`（`SiteSetting.author_login_merge`）を追加し、有効なサイトでは匿名一覧と保存済みログインごとの一覧を URL・シリーズ単位で統合する。匿名が読めてもログインを試し、最も多く読めたログイン設定をシリーズ話一覧の取得に使う。`webnovel/www.pixiv.net.yaml` で有効化。回帰テストは synthetic 定義 + 同梱 Pixiv 定義（匿名 111 / ログイン 111+222）の 2 本。E2E で実 Pixiv の 69616058 が 1 件 → 21 件になることを確認。あわせて Web UI コンソールの追従を修正（scrollTop が動いたときだけピン解除し、進捗バー/スクロールバーの出現・消失では二重 rAF で一番下へ再追従）。version は GitHub tag 基準の指示に従い 0.4.18 のまま。旧 v0.4.18 タグは未公開の Release をキャンセルして削除し、この修正を含む main 統合後に作り直す。
+修正: サイト定義の新キー `author_login_merge: yes`（`SiteSetting.author_login_merge`）を追加し、有効なサイトでは匿名一覧と保存済みログインごとの一覧を URL・シリーズ単位で統合する。匿名が読めてもログインを試し、最も多く読めたログイン設定をシリーズ話一覧の取得に使う。`webnovel/www.pixiv.net.yaml` で有効化。回帰テストは synthetic 定義 + 同梱 Pixiv 定義（匿名 111 / ログイン 111+222）の 2 本。E2E で実 Pixiv の 69616058 が 1 件 → 21 件になることを確認。あわせて Web UI コンソールの追従を修正（scrollTop が動いたときだけピン解除し、進捗バー/スクロールバーの出現・消失では二重 rAF で一番下へ再追従）。version は GitHub tag 基準の指示に従い 0.4.18 のまま。旧 v0.4.18 タグは未公開の Release をキャンセルして削除し、修正を含む main 統合後にタグを作り直して push 済み（コミット `191e74b`）。develop へリリースマージを戻した。Release / Platform（tag, production deploy）を監視中。
 
 ## 現況（v0.4.18 リリース準備）
 
