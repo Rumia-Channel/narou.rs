@@ -1,6 +1,6 @@
 # narou.rs コマンド互換性ドキュメント
 
-narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `db` (SQLite 管理 DB 保守)・`illust` (挿絵メンテナンス)・`login` (ログイン情報管理)・`author` (作者追跡) を含む 28 コマンドを網羅する。
+narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `db` (SQLite 管理 DB 保守)・`illust` (挿絵メンテナンス)・`login` (ログイン情報管理)・`author` (作者追跡)・`hidden` (非表示設定) を含む 29 コマンドを網羅する。
 
 ---
 
@@ -103,6 +103,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
 | `illust` | — (Rust 拡張) | ✅ 完了 | `.illustration_cache.yaml` 運用のための `narou illust <sub>`。`orphan`/`migrate`/`fix-ext`/`rebuild` に加え、挿絵を S3 互換ストレージへ写す `s3-push` / 突き合わせる `s3-verify` を実装。削除/改名/移行 (および `s3-push`) は既定 dry-run (`-f` で実行) |
 | `author` | — (Rust 拡張) | ✅ 完了 | 追跡する作者を登録すると (`narou author add <作者ページURL>`)、`narou update`（対象省略の一括更新）の後段で新しい作品を自動追加する（個別更新では追跡しない）。`add`/`list`/`remove`/`check`。作者ページの認識と作品一覧の取得はサイト定義 (`author_url` / `author_api_url` / `author_novel_pattern` / `author_work_url`) が担う。Pixiv は `preprocess:` の DSL が `author_novel::` / `author_series::` / `author_comic_series::` を emit し、シリーズに属する話/ページは `author_series_episodes_url` / `author_comic_series_pages_url` で除く (作品単位 = 単体小説 + 小説シリーズ + 漫画シリーズ + 単体イラスト・漫画)。`check --dry-run` は追加予定の URL だけを表示 |
+| `hidden` | — (Rust 拡張) | ✅ 完了 | 作品・タグ・作者・サイトを一覧から非表示にする。`add`/`remove`/`list`/`clear`。`add 123 --tag 秘密 --author 作者名 --site kakuyomu.jp` のように単位を指定でき、タグ非表示はそのタグを持つ作品も隠す。設定は在庫 `hidden`（Native は `.narou/hidden.yaml` / SQLite `app_state`、Worker は D1 `app_state`）に保存し、`narou list --show-hidden` と Web UI の「非表示も表示」で解除表示できる。更新・変換などの内部処理は非表示作品も対象 |
 | `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`rename`/`order`/`clear` を実装。**サイトごとに複数の「名前つきログイン」を試行順つきで保持**し、1 ログインが複数ホストの Cookie を持つ (ブラウザのセッションがホストをまたぐため)。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET /api/login`、`POST /api/login/import\|rename\|order`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}` も対応 |
 | `db` | — (Rust 拡張) | ✅ 完了 | SQLite 管理 DB の保守。`verify` / `export-yaml [--out\|--in-place]` / `vacuum` / `repair-freeze [--dry-run]`。既定は YAML 管理で、SQLite は Web UI 初回ツアーまたは `.narou/storage-backend` マーカーによる opt-in。`repair-freeze` は旧ビルドが残した `freeze.yaml.imported-*` から失われた凍結状態を復旧する |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
@@ -327,6 +328,23 @@ narou author remove 1
 **単発取得との区別**: 通常のダウンロード欄や `download` に作者 URL を入れる操作は、その時点の作品一覧の取得だけであり、追跡登録は増やさない。継続追跡には `author add` または作者タブでの登録が必要。
 
 ---
+
+### 3.x-hidden `hidden` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
+
+作品・タグ・作者・サイトを一覧から非表示にする。表示だけを制御し、更新・変換・バックアップなどの内部処理は非表示作品も対象にする。
+
+| Native CLI | 内容 |
+|---|---|
+| `add <target>...` | 作品を非表示にする（ID / URL / タイトル / Nコード / alias） |
+| `add --tag <TAG>` / `--author <AUTHOR>` / `--site <DOMAIN or サイト名>` | タグ・作者・サイトを非表示にする（繰り返し指定可） |
+| `remove ...` | `add` と同じ指定で表示に戻す |
+| `list` | 非表示の作品・タグ・作者・サイトを表示する |
+| `clear` | すべて解除する |
+| `list --show-hidden` | 非表示も含めて作品一覧を表示する |
+
+- 保存は在庫 `hidden`（Native は `.narou/hidden.yaml` / SQLite `app_state('inv','hidden')`、Workers は D1 の `app_state`）。SQL 一覧は `NovelFilter` の除外条件（作品ID / タグ / 作者 fold / サイト fold）で絞り込む。
+- タグ非表示はそのタグを持つ作品も隠す。作者は作品レコードの `author`、サイトは `domain` または `sitename` で照合する。
+- Web UI / Workers API: `GET /api/hidden`、`POST /api/hidden`（`action: add|remove|clear` と `novels` / `tags` / `authors` / `sites`）。Web UI は一覧の「非表示も表示」、作品行の右クリック、オプション →「非表示設定...」から操作する。
 
 ### 3.y `login` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
 ブラウザのある端末とダウンロード実行ホストが別であることを前提にしたログイン情報管理コマンド。取得側は別実行ファイル `narou_rs_login` が担当し、本コマンドは受け入れ・書き出し・一覧・登録・追加・並べ替え・削除を行う。
