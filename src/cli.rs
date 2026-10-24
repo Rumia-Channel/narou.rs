@@ -987,6 +987,28 @@ pub enum Commands {
         #[command(subcommand)]
         action: crate::commands::login::LoginAction,
     },
+    /// Write selected novels to a portable ZIP archive.
+    #[command(after_help = "Examples:\n  narou export 1 2 -o novels.zip\n  narou export n9669bk")]
+    Export {
+        targets: Vec<String>,
+        /// Output ZIP path (default: narou-export-<timestamp>.zip in the CWD).
+        #[arg(short = 'o', long = "output")]
+        output: Option<String>,
+    },
+    /// Import novels from a portable ZIP archive.
+    #[command(
+        after_help = "Examples:\n  narou import novels.zip\n  narou import novels.zip --overwrite"
+    )]
+    Import {
+        /// Archive written by `narou export`.
+        archive: String,
+        /// Replace novels that are already in the library.
+        #[arg(long, conflicts_with = "skip")]
+        overwrite: bool,
+        /// Keep novels that are already in the library (default).
+        #[arg(long, conflicts_with = "overwrite")]
+        skip: bool,
+    },
     Illust {
         #[arg(short = 'f', long)]
         force: bool,

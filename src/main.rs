@@ -463,7 +463,27 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                 127
             }
         },
-        Commands::Convert {
+        Commands::Export { targets, output } => match commands::transfer_archive::cmd_export(
+            &targets,
+            output.as_deref(),
+        ) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
+        Commands::Import {
+            archive,
+            overwrite,
+            skip: _,
+        } => match commands::transfer_archive::cmd_import(&archive, overwrite) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },        Commands::Convert {
             targets,
             output,
             encoding,

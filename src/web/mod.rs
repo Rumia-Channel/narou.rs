@@ -18,6 +18,7 @@ pub mod sort_state;
 pub mod state;
 pub mod storage;
 pub mod tags;
+pub mod transfer;
 pub mod update;
 pub mod worker;
 
@@ -721,6 +722,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/update/start", post(update::api_update_start))
         .route("/api/library_backup", get(library_backup::api_library_backup_status))
         .route("/api/library_backup", post(library_backup::api_library_backup))
+        // Portable archive transfer. The import route needs axum's body limit
+        // raised above the global 2 MiB default; the extractor and the archive
+        // core both enforce `MAX_ARCHIVE_BYTES`.
+        .route("/api/transfer/export", get(transfer::export_novels))
+        .route(
+            "/api/transfer/import",
+            post(transfer::import_archive)
+                .layer(DefaultBodyLimit::max(transfer::MAX_TRANSFER_IMPORT_BODY_BYTES)),
+        )
         .route("/settings", get(frontend::settings_page))
         .route("/help", get(frontend::help_page))
         .route("/about", get(frontend::about_page))
