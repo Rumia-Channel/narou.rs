@@ -470,6 +470,17 @@ impl OutputManager {
                 &working_dir,
             )?)
         } else {
+            // 古い narou_rs で初期化されたライブラリでも、カスタム CSS が
+            // 正しい配置先 (電書協レイアウトは style_custom/font.css) に
+            // 無いと二分アキ・行高が EPUB に反映されない。無い場合だけ
+            // 現在の設定で補完する。書けない環境では従来どおり変換を続ける。
+            if let Err(error) = super::dakuten_font::ensure_normal_css(&working_dir) {
+                tracing::warn!(
+                    dir = %working_dir.display(),
+                    error = %error,
+                    "failed to install narou custom CSS for AozoraEpub3"
+                );
+            }
             None
         };
         // `convert.rotate-image` が指定されていれば、RotateImage を差し替えた

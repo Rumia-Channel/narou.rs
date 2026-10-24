@@ -1,6 +1,32 @@
 # narou.rs 移植状況
 
-## 現況（v0.4.17 リリース準備）
+## 現況（v0.4.18 リリース準備）
+
+ユーザーが「OK だ。バージョンを上げよう」と明示指定。公開済みは v0.4.17（2026-10-22）、今回の次版は **v0.4.18** とする。本体/Worker/relay/両 lock/ライセンス表記を 0.4.18 へ更新し、VERSION.md 先頭の未リリース節を v0.4.18 節へ切り替えた（タイトル: データ保全の修正・二分アキの EPUB 反映・S3 挿絵プール）。
+
+今回の主な内容: (1) P1 データ保全（更新時の保存フォルダ移行で旧 EPUB・設定を消さない、SQLite メタデータの競合上書き防止、SQLite↔YAML 往復で編集を失わない、`narou-compat` 切替の権威移譲、`update` の stale 全件 Upsert 除去）。(2) issue #41 追記対応（ダイジェスト自動選択は使い切り後 `2` キャンセル、続行は `1` 明示。キャンセルは失敗件数・終了コードに含めず、設定画面 help に 1〜8 の説明）。(3) issue #42 の追加修正（通常変換/自動変換で `device` が `enable_half_indent_bracket` を上書きしない、`setting.ini` の有無を値一致でなく存在で判定、AozoraEpub3 のテンプレート配置判定によりカスタム CSS を `template/item/style_custom/font.css` または `template/OPS/css_custom/vertical_font.css` へ配置、既存ライブラリは変換時に不足補完、lite エンジンは narou カスタム CSS を常に同梱）。(4) S3 挿絵の全作品共通 content-addressed プール（`illustrations/<base64url(sha256)>.<ext>`、`narou illust s3-dedup` / Worker `POST /api/admin/illustration-dedup`）。
+
+検証: `cargo check --workspace --all-targets`、`cargo test --workspace`（lib 1179 / bin 122 / 各 integration）、`cargo test --lib --features lite` 1179、`cargo test --bins --features lite` 122、lite integration（EPUB に `.vrtl .half_em_space` と span が入る）、`cargo clippy --workspace --all-targets` が成功。手動 E2E で、組み込みエンジンと外部 AozoraEpub3 1.1.1+ コピーの両方について EPUB へ CSS と span が入ること、古い初期化ライブラリで変換時に CSS が補完されることを確認。`cargo-about 0.9.2` で Third-Party-License 2 ファイルを再生成（version 行のみ差分）。
+
+Brotli CVE-2026-111497 対応: 対象は Google Brotli の C デコーダ 1.0.3〜1.2.0。Cargo.lock に C 版 (`brotli-sys` / `libbrotli`) は無く、curl も brotli 非対応でビルドされる。純 Rust `brotli` 9.0.0 / `brotli-decompressor` 6.0.1 は修正版が無く（brotli 9.0.0 は `~6.0` 固定）、reqwest の `brotli` feature を外して外部応答の展開経路だけを除去した（gzip/deflate/identity は維持）。外部取得リレーも `curl --compressed` をやめ、`Accept-Encoding: gzip, deflate` を明示して gzip/deflate を `flate2` で展開し、`br` は fail closed する。保存オブジェクトの brotli は自前データのみなので継続。AGENTS のセキュリティ境界と VERSION.md v0.4.18 に記録。
+
+リリース手順: この prepare commit を push して develop CI 成功を確認 → main へ no-ff 統合し annotated `v0.4.18` タグを作成・push → Release workflow と Platform（tag/main, production Worker deploy）を監視 → develop へリリースマージを戻して記録を更新する。公開までは未リリースとして扱い、issue 返信で「公開済み」と書かない。
+
+## P1 データ保全の修正（2026-10-24、未リリース / `fix-p1-data-preservation`）
+
+release-check 監査と独立レビューで再現したデータ損失系の不具合を修正。修正対象は (1) 更新時の保存フォルダ移行、(2) SQLite メタデータの競合上書き、(3) SQLite↔YAML 往復での編集消失、(4) `narou-compat` 実行中切替での管理状態消失、(5) `update` メタデータ更新の stale 全件 Upsert。
+
+- (1) `src/downloader/mod.rs`: 既存レコードの `file_title` / `sitename` を保存先として常に優先（Ruby `get_file_title` / `sitename` と同じ）。`append_title_to_folder_name` 後付けやサイト名変更で別フォルダへ移り旧 EPUB・個別設定・置換規則・退避話を `remove_dir_all` で消していた経路を削除。通常更新で旧フォルダは自動削除しない。`tests/digest_cancellation.rs` に YAML/SQLite × CLI/Web × キャンセル/更新/`download --force` の保持回帰を追加。
+- (2) `src/db/database.rs` / `src/native/sqlite/bulk.rs`: `update_records` は IMMEDIATE トランザクションを開始してから権威レコードを読み、closure・保存を同一境界で実行。`save()` は永続化済み baseline との項目差分だけを最新行へ適用（別行・未知項目・明示削除を保持し、削除済み行を復活させない、新規 ID 衝突はエラー）。SQLite の `allocate_id` / `release_id` は共有予約 SQL を使い、未公開 ID を別プロセスが再利用しない。`tests/sqlite_record_consistency.rs` 15 件（うち 1 件は親から起動する子プロセス補助）。
+- (3) SQLite 書き出し指紋（`export_file_sha:*`）は成功時に「現在の公開内容」だけへ確定し、`database_yaml_sha` は同一トランザクションで更新。YAML 復帰後の編集は古い互換用 SHA と一致しても取り込み、未編集の書き出し予測だけを再取り込み対象外にする。起動時取り込み・互換ミラー生成も root → YAML → connection の順でロックし、古い YAML スナップショットが新しい SQLite 行を消さない。`src/native/sqlite/export_yaml.rs` は DATABASE ロック保持中に権威レコード＋索引を同じスナップショットから書き出し、グローバル設定と非同期オブジェクト書き出しはロック外。`tests/yaml_rollback_roundtrip.rs` に export 最新性の回帰を追加。
+- (4) `src/native/sqlite/state.rs`: `with_compat_lock`（`.narou/compat-state.lock`）を追加し、`get_raw` / `update_raw` / `set_raw` / `configure` を同じ権威移譲境界に統一。切替時は管理ファイル（freeze/alias/author/tag_colors/login_cookie/latest_convert/local_setting/queue/notepad）と作品レコード・索引を一度に引き継ぎ、公開前に所有権（指紋）を durable に記録、公開は最後にフラグ、失敗時は元ファイルへ復元。無効化時はファイル権威の内容を先に SQLite へ同期するため、中断しても外部編集が巻き戻らない。`database.yaml` / `database_index.yaml` は `app_state('inv')` に入れず、レコード権威として別扱い。`tests/narou_compat_transitions.rs` 11 件（Windows のみ read-only 失敗系を含む）。
+- (5) `src/commands/update.rs` / `src/native/novel_repository.rs`: 既存レコードのメタデータ更新に `update_existing_sync`（権威 `update_records` 内で最新行を変更）を導入し、更新確認・変換失敗フラグ・話数情報・空題名修復の stale 全件 Upsert を置換。作成・明示的全置換の `Upsert` 契約は不変。`update.rs` の bin テスト 7 件を追加。
+
+検証: `cargo test -p narou_rs --features lite --bin narou_rs` 120 件、`sqlite_record_consistency` 14+1 ignored、`narou_compat_transitions` 11 件、`digest_cancellation` 5 件、`yaml_rollback_roundtrip` 6 件、`cargo test --workspace --all-targets --features lite` を確認。ドキュメントは `COMMANDS.md`（update / narou-compat / db / 保存境界）と `VERSION.md` 未リリース節を同期。
+
+残課題（今回の修正外・既知）: `Inventory` のファイルキャッシュは mtime のみで判定するため、同一 mtime の外部書き換えを古い内容として返す可能性（Windows の遅延 mtime 更新で顕在化しうる）。YAML 管理の新規 ID 採番はプロセス内。同一項目の同時変更は後勝ち。`narou-compat` の外部手編集・非協調の narou.rb 書き込みはネイティブロックの対象外。`convert` の device 後付け half-indent 上書き（#42 の残件）や P2 監査項目は未修正。
+
+
 
 ユーザーが「更新されたバージョンをセキュリティアップデートとしてバージョンを切って」と明示指定。公開済みは v0.4.16（2026-10-21）、今回の次版は **v0.4.17** とする。本体/Worker/relay/両 lock/ライセンス表記を 0.4.17 へ更新し、VERSION.md 先頭に v0.4.17 節を追加した。
 
@@ -11,6 +37,16 @@
 公開前 issue 対応: #39 旧セクション変換キャッシュ移行の並列競合による Convert IO error、#40 keep-txt=true の novel.txt 重複、#41 ダイジェスト自動選択後の暗黙キャンセル・保存フォルダの Documents 誤表示・CLI 進捗バー、#42 インデント系設定 (E000 マーカーが原因)、#43 Web UI の凍結スキップ誤エラーと「凍結済みでも更新」の選択無視、#44 中断後の novel lock 残留を修正。テストは lib 1154 / lite 1171、bins/integration、convert_parity、cli E2E を確認。issue 修正後の最終 CI を待ってリリースする。
 
 リリース手順: この prepare commit を push して develop CI 成功を確認 → main へ no-ff 統合し annotated `v0.4.17` タグを作成・push → Release workflow と Platform（tag/main, production Worker deploy）を監視 → develop へリリースマージを戻して記録を更新する。
+
+v0.4.17 リリース完了 (2026-10-22): main `a5f79ac` / tag `v0.4.17`。develop CI・tag Platform (production Worker deploy)・Release 16 assets すべて success。issue #39〜#44 の修正を含み、公開後に各 issue へ返信済み (クローズはしていない)。
+
+次の develop 変更 (未リリース): **S3 挿絵の全作品共通 content-addressed プール**。Worker の `illustration_dedup` を常時 true、native も S3 保存なら storage-backend を問わず dedup を有効化。新規挿絵は常に hex 名になり、`illustrations/<base64url(sha256)>.<ext>` に集約。既存の小説別 hex 名は native `narou illust s3-dedup` / Worker `POST /api/admin/illustration-dedup` (`status|plan|copy|reset`) で移行でき、presign はプールに無ければ旧配置へフォールバックする。テストは lib 1156 / lite 1173、Worker contract、clippy、wasm が成功し、develop CI (`51176fe`) も success。
+
+## issue #41 の追加報告への対応（2026-10-23、未リリース）
+
+最新コメントでは v0.4.17 の `7` 自動選択後の暗黙更新により EPUB が 264KB → 97KB へ縮小。4-8 は更新の承認ではないため、選択肢を使い切った後は Ruby と同じ `2`（キャンセル）へ戻し、続行には明示的な `1`（例 `7,1`）を必要とする。キャンセルは正常な見送りとして update/download の失敗件数へ加算しない（Ruby の非0終了からの意図的な差。取得・変換の真の失敗はエラーのまま）。設定の help に 1-8 の内容、安全な既定値と話数減少の注意を記載する。#42 と #39 は別件として混ぜない。既に縮小された出力の自動復旧は行わず、未リリース修正を v0.4.17 に収録済みと案内しない。
+
+検証: 通常版 lib 1158 / bins 124 / 関連 integration 33（新規 digest_cancellation 4 を含む）が成功。新規テストは実バイナリで YAML/SQLite × CLI/Web 子プロセス × 自動選択6通りの24ケースについて、キャンセル時の既存目次・本文・EPUB用出力ファイル・SQLiteオブジェクトのバイト保持と本文リクエストなしを確認。明示1で減少後の目次を採用、明示3の凍結、真のエラーだけ終了コード1、downloadの正常見送りも確認した。Lite lib 1175 / 新規 integration 4、`cargo clippy -p narou_rs --all-targets --features lite -- -D warnings` も成功。ローカルの MSVC cl は以前と同じ D8050 が発生するため、vcvars64.bat + CC/CXX=clang-cl でビルドする。TEMP/TMP は repo の target に設定して TempDir を自動清掃（OS の Temp / Documents では作成拒否。権限診断は NOT_THIS_CLASS、ACL・所有者は変更なし）。公開版への反映・タグ作成は今回行わず、利用者の確認までは issue を Open のまま維持する。
 
 ## 現況（v0.4.16 リリース）
 

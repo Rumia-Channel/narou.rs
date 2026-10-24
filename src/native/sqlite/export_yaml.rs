@@ -116,49 +116,63 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
         in_place || comparable(&out_dir) == comparable(&narou_dir)
     });
 
-    // 1. database.yaml from live records.
-    let records: std::collections::BTreeMap<i64, crate::db::NovelRecord> =
-        crate::db::with_database(|db| {
-            Ok(db
-                .all_records()
-                .iter()
-                .map(|(&id, record)| {
-                    let mut normalized = record.clone();
-                    normalized.id = id;
-                    (id, normalized)
-                })
-                .collect())
-        })?;
-    let yaml = serde_yaml::to_string(&records)?;
-    write_state_file(export_state, &out_dir, "database.yaml", &yaml)?;
-
-    // 2. database_index.yaml (derived cache; narou.rb rebuilds it when
-    //    absent, but exporting it keeps the bundle complete).
-    crate::db::with_database(|db| {
-        if let Ok(content) = db.index_yaml() {
-            write_state_file(export_state, &out_dir, "database_index.yaml", &content)?;
-        }
-        Ok(())
-    })?;
-
-    // 3. Management states and managed content. In YAML mode the files are
-    //    already the source of truth, so only the database backend has to be
-    //    rendered out; a marker pointing at a database that cannot be opened
-    //    is a hard error instead of a silently empty bundle.
-    if let Some(state) = &sqlite_state {
-            // 管理状態の一覧・ファイル名は取込側と同じテーブル
-            // (`crate::db::state_inventory`) を参照する。
-            for (key, file) in state_inventory::import_export_states() {
-                if let Some(payload) = state.get_raw("inv", key)? {
-                    write_state_file(export_state, &out_dir, file, &payload)?;
+    // Take DATABASE before the authority lock, matching record mutations.
+    // Keep synchronous metadata reads and publication together: a running Web
+    // process may retain a cache older than another CLI writer's commit.
+    let global_payload = crate::db::with_database(|db| {
+        let publish = || -> Result<Option<String>> {
+            let mut records = if let Some(state) = &sqlite_state {
+                let source = narou_dir.join("database.yaml");
+                let file_raw = if state.compat_now() {
+                    match crate::db::inventory::ensure_yaml_size_limit(&source) {
+                        Ok(()) => Some(std::fs::read_to_string(&source)?),
+                        Err(NarouError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    None
+                };
+                if let Some(raw) = file_raw {
+                    if raw.trim().is_empty() { std::collections::BTreeMap::new() }
+                    else { serde_yaml::from_str(&raw)? }
+                } else {
+                    super::bulk::load_all_records(&state.conn_ref().lock())?
                 }
+            } else {
+                db.all_records().iter().map(|(&id, record)| (id, record.clone())).collect()
+            };
+            for (&id, record) in &mut records { record.id = id; }
+            write_state_file(export_state, &out_dir, "database.yaml", &serde_yaml::to_string(&records)?)?;
+
+            // Derive the index from that same authoritative map, never from
+            // the singleton's independently stale cached index.
+            let mut index = crate::db::index_store::IndexStore::new();
+            index.reconcile(&records.into_iter().collect());
+            write_state_file(export_state, &out_dir, "database_index.yaml", &index.to_yaml()?)?;
+            if let Some(state) = &sqlite_state {
+                for (key, file) in state_inventory::import_export_states() {
+                    if let Some(payload) = state.get_raw_unlocked("inv", key)? {
+                        write_state_file(export_state, &out_dir, file, &payload)?;
+                    }
+                }
+                state.get_raw_db("global", "global_setting")
+            } else {
+                Ok(None)
             }
-            if let Some(payload) = state.get_raw("global", "global_setting")? {
-                let global_dir = layout.global_setting_dir();
-                std::fs::create_dir_all(&global_dir)?;
-                crate::db::inventory::atomic_write(&global_dir.join("global_setting.yaml"), &payload)?;
-            }
-            export_objects(state, &layout).await?;
+        };
+        if let Some(state) = &sqlite_state { state.with_compat_lock(publish) }
+        else { publish() }
+    })?;
+    // Global settings are shared, file-only state; do not hold the library
+    // authority lock while taking their independent file lock.
+    if let Some(payload) = global_payload {
+        let global_dir = layout.global_setting_dir();
+        std::fs::create_dir_all(&global_dir)?;
+        crate::db::inventory::atomic_write(&global_dir.join("global_setting.yaml"), &payload)?;
+    }
+    if let Some(state) = &sqlite_state {
+        // No synchronous authority guard is held across asynchronous object IO.
+        export_objects(state, &layout).await?;
     }
 
     if in_place {
@@ -180,7 +194,11 @@ fn write_state_file(
         if let Some(state) = state {
             state.remember_export_file(file, &path, content)?;
         }
-        crate::db::inventory::atomic_write_locked(&path, content)
+        crate::db::inventory::atomic_write_locked(&path, content)?;
+        if let Some(state) = state {
+            state.finish_export_file(file, content)?;
+        }
+        Ok(())
     })
 }
 

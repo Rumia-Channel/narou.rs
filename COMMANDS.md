@@ -128,7 +128,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--path` | `-p` | string | — | AozoraEpub3 フォルダ指定。`:keep` で既存再利用 |
 | `--line-height` | `-l` | float | 1.8 | 行の高さ (em) |
 
-**Rust 実装**: `src/commands/init.rs`。Ruby版同様、初期化時は `.narou/`・`小説データ/`・ユーザー編集用 `webnovel/` を作成し、`webnovel/*.yaml` を初回コピーする。`.narou/local_setting.yaml` や `queue.yaml` などの inventory ファイルは init 時に eager 生成せず、各機能が必要になった時点で作る。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。2026-04 の FS hardening で `--path` は `./AozoraEpub3` のような相対パスも一度 absolute/canonicalize へ展開してから検証・保存しつつ、UNC・drive-relative・`\\?\` 形式は引き続き拒否する。`:keep` は既存挙動のまま有効な保存済みパスだけを再利用する。
+**Rust 実装**: `src/commands/init.rs`。Ruby版同様、初期化時は `.narou/`・`小説データ/`・ユーザー編集用 `webnovel/` を作成し、`webnovel/*.yaml` を初回コピーする。`.narou/local_setting.yaml` や `queue.yaml` などの inventory ファイルは init 時に eager 生成せず、各機能が必要になった時点で作る。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。AozoraEpub3 が電書協レイアウト (`template/item/style/`) か元祖レイアウト (`template/OPS/css/`) かを判定し、カスタム CSS をそれぞれ `template/item/style_custom/font.css` / `template/OPS/css_custom/vertical_font.css` へ書く (2026-10 修正、issue #42)。2026-04 の FS hardening で `--path` は `./AozoraEpub3` のような相対パスも一度 absolute/canonicalize へ展開してから検証・保存しつつ、UNC・drive-relative・`\\?\` 形式は引き続き拒否する。`:keep` は既存挙動のまま有効な保存済みパスだけを再利用する。
 
 ---
 
@@ -222,7 +222,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `-i`/`--ignore-all`: 引数なし時の全更新を無効化
 - 標準入力からのターゲット読み取りに対応。Ruby版同様 `narou tag ... | narou u` や `narou l -t "foo bar" | narou u` のようなパイプ入力を解決
 - ターゲット解決: Ruby版 `tagname_to_ids`/`Downloader.get_data_by_target` 相当に合わせ、ID、URL、Nコード、タイトル、`.narou/alias.yaml` 別名、通常タグ名、`tag:NAME`、`^tag:NAME` を解決
-- 既存小説更新時は Ruby版同様に DB の `toc_url` から `ncode` などのURLキャプチャを復元し、DB上の `sitename` を保存先決定で優先する
+- 既存小説更新時は Ruby版同様に DB の `toc_url` から `ncode` などのURLキャプチャを復元し、登録済みの `sitename` / `file_title` を保存先として維持する。サイト定義の `append_title_to_folder_name` やサイト名が変わっても既存フォルダへ保存し、旧目次を使って話数減少を判定する。通常更新による旧フォルダの自動削除は行わず、個別設定・置換規則・EPUB を保持する（明示的な更新で本文・目次を変更する挙動は維持）
 - サイト/API由来のタイムゾーン表記なし日時は `webnovel/*.yaml` の `timezone`、未指定時は local `time-zone`（既定 `Asia/Tokyo`）で解釈する。DB の YAML には narou.rb 互換の `YYYY-MM-DD HH:MM:SS.nnnnnnnnn +09:00` 形式で保存し、既存 Rust 版の epoch 秒も読み込める。なろう API の `YYYY-MM-DD HH:MM:SS` は JST 扱い
 - あらすじ比較は `<br>`/`<br/>`/`<br />` と改行・行末空白を正規化し、実質同一なら更新扱いにしない
 - 既存小説で実変更が無い場合は `last_update` を保持し、更新確認だけで Web UI の `new-update` 表示が再点灯しないようにする
@@ -236,8 +236,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - カクヨムは各話の `publishedAt` を初回掲載日時、`editedAt`（無い場合は `publishedAt`）を `subupdate` として扱い、本文改稿のみの通常 Update でも対象話を更新する
 - `update.convert-only-new-arrival` 設定対応（YAMLの真偽値/文字列/数値を許容）
 - `last_check_date` 追跡
-- `download.choices-of-digest-options` 設定対応。Ruby版と同じ 1-8 のダイジェスト化選択肢を処理し、キャンセル・凍結・バックアップ・あらすじ表示・ブラウザ起動・保存フォルダ起動・変換を実行。4-8 の非終端アクションを指定した後は更新を継続する (暗黙のキャンセルは行わない)
-- ダイジェスト化キャンセル時は `UpdateStatus::Canceled` を返し、`update` / `download` コマンド側でRuby版相当のキャンセル表示と終了コード加算を行う
+- `download.choices-of-digest-options` 設定対応。Ruby版と同じ 1-8 のダイジェスト化選択肢をカンマ区切りで順に処理する。設定画面に各番号の内容と安全上の注意を表示。空欄・非対話環境の未設定・選択肢を使い切った場合は Ruby版同様 `2`（キャンセル）とし、4-8 の閲覧・バックアップ・保存済み本文の変換だけでは更新を承認しない。`7` はフォルダ表示後にキャンセル、`7,1` は表示後に明示的に更新する（`1` は話数減少を受け入れるため要注意）。CLI の対話入力・進捗一時停止は維持
+- ダイジェスト化キャンセル時は `UpdateStatus::Canceled` を返し、`update` / `download` コマンド側でキャンセル表示を行う。キャンセルは正常な見送りとして自動変換・後処理をせず、エラー数・終了コードに加算しない（issue #41 の要望に基づき Ruby版の非0終了から意図的に変更）。取得・変換等の実際の失敗は引き続きエラー扱い
 - 差分更新時は Ruby版同様 `本文/cache/<timestamp>/` に旧sectionを退避し、差分が無い場合は空cacheディレクトリを削除
 - download/update 共通の差分退避は旧目次のファイル名を参照する。各話の題名変更でも SQLite の旧本文を `本文/cache/` へ保存し、新題名で更新した後の差分なし再更新・章題変更も処理できる（issue #32）。保存先を `diff` が参照する Ruby版互換の `cache/` に統一
 - `SuspendDownload` 発生時は通常失敗ではなくバッチ全体の中断として扱うように修正
@@ -278,9 +278,13 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 **復帰失敗時のデータ保全**: インプレース書き出しの管理ファイルは、保存前に SQLite へ SHA-256 指紋を記録し、原子的に置換する。`narou-compat=false` では、失敗後に残った未編集の書き出しファイルを次回起動で再取り込みせず、その後に正常保存した SQLite の状態・作品レコードを維持する。ユーザーが編集して指紋が変わった旧形式ファイルの取り込みと、`narou-compat=true` のファイル優先は維持する。
 既存の書き出しファイルと次に公開する内容の指紋を最大 2 件保持し、再試行が保存直前で停止しても前の残骸を再取り込みしない。指紋更新と公開は同じファイルロック内で行う。`--out` が実管理ディレクトリ `.narou` を指す場合も同じ保護を適用する。
 
+**作品レコードの更新競合対策**: Native SQLite の `update_records` は書き込みトランザクションを開始してから最新レコードを読み、変更と保存を同じ境界で行う。`save()` はプロセス内の古い全件キャッシュを置換保存せず、読み込み以降に明示変更された行・項目だけを最新値へ反映する。別プロセスが追加した作品・別項目・未知項目を保持し、既に削除された行を古い編集で復活させない。同一項目への競合は後の保存が優先される。新規 ID の予約も SQLite の共有予約を使い、使用中 ID を再利用しない。
+
+**保存方式の往復**: YAML 復帰後に編集された `database.yaml` は、SQLite へ再移行する際も取り込む（タグ変更・追加・明示削除を含む）。過去の互換モード用指紋が残っていても、書き出し時の指紋との差を優先する。未編集の書き出しファイルは上記の保全規則どおり再取り込みしない。方式変更は取得・更新等を止めてから行い、変更前のライブラリをバックアップする。
+
 **凍結状態の保存先**: YAML 管理では `.narou/freeze.yaml`、SQLite 管理では `app_state('inv','freeze')` で、どちらも Inventory の共通入口 (`Inventory::update_yaml`) を通す。SQLite 側では同じ内容が `frozen_novels` へ投影され、状態の検索 (`status` 検索式) が `narou list` と一致する。`freeze.yaml` の取込は和集合で行うため、残っていた断片ファイルが他の凍結を解除することはない (issue #35)。
 
-**前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, freeze.yaml, alias.yaml, tag_colors.yaml, login_cookie.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。`~/.narousetting/global_setting.yaml` はライブラリ状態ではないため narou-compat/SQLite の有無にかかわらず常にファイルのまま維持され、SQLite への取込・退避は行わない (旧ビルドが `app_state` の global/global_setting に残した行は、ファイルが無いとき初回読み出しでファイルへ書き戻してその行を削除する)
+**前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, database_index.yaml, freeze.yaml, alias.yaml, author.yaml, tag_colors.yaml, login_cookie.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。`~/.narousetting/global_setting.yaml` はライブラリ状態ではないため narou-compat/SQLite の有無にかかわらず常にファイルのまま維持され、SQLite への取込・退避は行わない (旧ビルドが `app_state` の global/global_setting に残した行は、ファイルが無いとき初回読み出しでファイルへ書き戻してその行を削除する)
 
 ---
 
@@ -414,6 +418,8 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 - `convert.copy-to` / `convert.copy_to` と `convert.copy-to-grouping` の device/site グルーピングも direct convert へ接続し、`sample\\novel` で `device=epub` + `copy-to-grouping=device,site` のコピー先生成を確認済み
 - `convert.copy-zip-to` も direct convert へ接続し、`sample\\novel` で `--make-zip 3` 実行時に ZIP のコピー出力を確認済み
 - `convert.multi-device` があれば `device` より優先して複数端末へ順に変換する。Ruby版同様 `kindle` を先頭へ寄せ、無効な端末名は警告し、`sample\\novel` で `convert.multi-device: epub,ibunko` により EPUB + ZIP 出力を確認済み
+- 端末由来の設定 (`default.enable_half_indent_bracket`) は `narou setting device=` の変更時に保存し、変換時は Ruby版同様 `force.*` > `setting.ini` > `default.*` > オリジナル設定の順で解決する。変換時に端末関連設定を強制するのは `convert.multi-device` / Web UI の端末指定 / `--make-zip` のように端末を明示した変換だけで、`device` 設定から読んだ通常の変換では利用者の設定を上書きしない (2026-10 修正、issue #42)
+- カスタム CSS (行高・二分アキ `.half_em_space`・前書き/後書きの装飾) は AozoraEpub3 のテンプレート配置に合わせて配置する。1.1.1 以降の改造版 (電書協レイアウト、`template/item/style/` がある) は `template/item/style_custom/font.css`、元祖レイアウト (`template/OPS/css/` がある) は `template/OPS/css_custom/vertical_font.css` に書く。古いバージョンで初期化済みのライブラリでも、カスタム CSS が無ければ初回変換時に補完する。`lite` feature の組み込みエンジンは同じ CSS を常に EPUB に同梱するため、`enable_half_indent_bracket` が実際に描画される (2026-10 修正、issue #42)
 - `--ignore-default` / `--ignore-force` を `NovelSettings::load_for_novel_with_options` に渡し、`default.*` / `force.*` の適用を個別に無効化できるようにした
 - DB 管理小説だけでなくファイルパス指定の textfile 変換も `commands::convert` に接続し、`--enc` による UTF-8 / Shift_JIS / EUC-JP 系のデコードと `enable_enchant_midashi` 推奨 INFO を追加した
 - `report.txt` の互換監査で出た変換差分のうち、ローマ数字変換、分数/日付変換、明示設定時の漢数字+単位変換、`disable_alphabet_word_to_zenkaku`、root `replace.txt` の追加適用、Kindle 向け矢印/ZWS、iBooks 章見出し前 6 改行を実装済み。既存のカクヨム byte-for-byte fixture は維持している
@@ -429,7 +435,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 - Windows の `\\?\\C:\\...\\AozoraEpub3.jar` 形式パスは Java classpath にそのまま渡すと失敗するため、Ruby版同様に jar の basename を current_dir 基準で渡すよう修正した。`sample\\novel` で `device=epub` 実変換と `--no-epub` 抑止を確認済み
 - Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector や CP932/Windows-31J 未定義文字 (`♠` / `♡` / `♢` / `♣` / `𠮷` など) を含み、Java/AozoraEpub3 側で出力名がずれやすい小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\Users\rumia\Documents\Narou` の n5853lh で EPUB 生成を確認済み
 - AozoraEpub3-JDK21 (1.6.x) は出力ファイルが `-dst` の **実パス** 配下かを検査するため、`-dst` が junction / シンボリックリンク / 8.3 短縮名 を含む形だと、実際には同じ場所でも `java.io.IOException: 出力パスが許可されたディレクトリ外です` で失敗する (検査は出力ファイルが未生成の時点で字句的に正規化したパスと比較されるため)。narou は `-dst` と入力パスを実パスへ解決してから渡す (一時ワークスペース使用時・通常出力時とも)。一時ワークスペースが `%TEMP%` 配下にある場合も同じ理由で失敗していた
-- `lite` feature 有効時は、外部 AozoraEpub3 が見つからない場合に組み込み `epub_lite` エンジンへフォールバックする (設定 `convert.epub-engine` = `auto`/`lite`/`external` で選ぶ。設定ページの「一般」タブからも切替可。1 回だけなら環境変数 `NAROU_RS_EPUB_ENGINE=lite`/`=external` で上書き)（外部ツール (jar / `AozoraEpub3_Lite.exe`) が見つかればそちらを優先する。narou.rb と同じ挙動）。`device=epub` / `kobo` / `reader` / `ibooks` / `mobi` の中間 EPUB 生成を外部ツールなしで行える。**Java 版と同じ資産と組み立て**: `aozoraepub3dir` があれば `chuki_*.txt` (narou カスタム注記込み)・`gaiji/*.ttf`・`AozoraEpub3.ini` を読み、無ければ同梱の `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` で同じフラグを再現する（外字フォントだけは同梱できないので入らない）。Lite の公開パイプライン (`collect_assets` / `decorate_image_tags` / `reflow_image_sections` / `build_title_page_markup` / `append_gaiji_assets` / `build_metadata`) を CLI と同じ順で使う。挿絵は書き出し時に 1 枚ずつ読み、Java と同じ前処理 (余白除去・リサイズ・回転) をかける。実データ検証: `C:\Users\rumia\Documents\WebNovel` の n0421du (401セクション) で Java 版 `AozoraEpub3.jar` の出力と **422/423 ファイルがバイト完全一致**（`aozoraepub3dir` 未設定でも **419/423**）、挿絵入りでも **425/426 がバイト完全一致**。残差は `dcterms:modified` のみ (Java はローカル時刻に `Z`、Lite は UTC) 濁点フォント (`vertical_font_with_dakuten.css` + `DMincho.ttf`) は外部ツールと同じ内容を組み込みエンジンにも渡す。設定 `convert.epub-font` = `auto`(濁点注記のある小説だけ)/`always`(本文全体を DMincho、`U+3000` を描けない Reader 向け) で選ぶ。
+- `lite` feature 有効時は、外部 AozoraEpub3 が見つからない場合に組み込み `epub_lite` エンジンへフォールバックする (設定 `convert.epub-engine` = `auto`/`lite`/`external` で選ぶ。設定ページの「一般」タブからも切替可。1 回だけなら環境変数 `NAROU_RS_EPUB_ENGINE=lite`/`=external` で上書き)（外部ツール (jar / `AozoraEpub3_Lite.exe`) が見つかればそちらを優先する。narou.rb と同じ挙動）。`device=epub` / `kobo` / `reader` / `ibooks` / `mobi` の中間 EPUB 生成を外部ツールなしで行える。**Java 版と同じ資産と組み立て**: `aozoraepub3dir` があれば `chuki_*.txt` (narou カスタム注記込み)・`gaiji/*.ttf`・`AozoraEpub3.ini` を読み、無ければ同梱の `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` で同じフラグを再現する（外字フォントだけは同梱できないので入らない）。Lite の公開パイプライン (`collect_assets` / `decorate_image_tags` / `reflow_image_sections` / `build_title_page_markup` / `append_gaiji_assets` / `build_metadata`) を CLI と同じ順で使う。挿絵は書き出し時に 1 枚ずつ読み、Java と同じ前処理 (余白除去・リサイズ・回転) をかける。実データ検証: `C:\Users\rumia\Documents\WebNovel` の n0421du (401セクション) で Java 版 `AozoraEpub3.jar` の出力と **422/423 ファイルがバイト完全一致**（`aozoraepub3dir` 未設定でも **419/423**）、挿絵入りでも **425/426 がバイト完全一致**。残差は `dcterms:modified` のみ (Java はローカル時刻に `Z`、Lite は UTC) 濁点フォント (`vertical_font_with_dakuten.css` + `DMincho.ttf`) は外部ツールと同じ内容を組み込みエンジンにも渡す。設定 `convert.epub-font` = `auto`(濁点注記のある小説だけ)/`always`(本文全体を DMincho、`U+3000` を描けない Reader 向け) で選ぶ。組み込みエンジンは narou カスタム CSS (`denshokyo_font.css` = 電書協レイアウトの `font.css` 相当) を **常に** EPUB へ同梱する。これが無いと `.half_em_space` (二分アキ)・行高・前書き/後書きの装飾が効かず、`enable_half_indent_bracket` を有効にしても見た目が変わらない (2026-10 修正、issue #42)。
 - 挿絵の自動回転は `convert.rotate-image` (`auto`/`0`/`1`/`2`) で制御する。`auto` (既定) は AozoraEpub3.ini の `RotateImage` に従い、`0` は回転しない、`1`/`2` は横長挿絵を +90°/−90°。組み込みエンジン・外部 `AozoraEpub3_Lite.exe` (`-i` で差し替えた一時 INI を渡す。インストール先の INI は書き換えない)・Worker の `download.epub` に効く。Java 版 `AozoraEpub3.jar` は INI パス指定を持たず、インストール先 INI を書き換える方針ではないため本設定は効かない (jar で同じ挙動にするには AozoraEpub3.ini 側を変更する)
 - Worker のストリーミング EPUB も共通設定から横書き・挿絵の有無・濁点フォント・行高を反映し、CSS / フォント資産を実際に埋め込む。自動表紙は本文順の適切な挿絵を最大 1 枚保持して作り、書き出しで再利用する。変換 API の端末指定は EPUB のみ受理し、非対応端末と個別 `enable_inspect` は明示的に拒否する。
 
@@ -876,7 +882,7 @@ SQLite のミラー無効時も本文・設定・挿絵を保存先からスコ�
 - `s3-push` — 挿絵をローカルから S3 互換ストレージ (Wasabi など) へ写す。既定は件数と容量を数えるだけで、`-f` で実行。**ライブラリ全体が対象** (`<target>` は使わない) で、`s3.asset-backend=s3` と接続情報が必要。
 - S3 LIST の署名エラー診断は、改行表現を正規化して canonical digest と StringToSign 全体を別々に比較する。digest 一致だけで secret の誤りと断定せず、診断改善を 403 の解消とは扱わない。 生の XML 本文は表示せず、許可したエラーコードと任意のサーバー echo の比較結果（一致・不一致・欠落・不正）、公開 AWS サンプルの実行時自己テスト、実効接続先 host/port・標準的な region・native 設定元ラベルを表示する。鍵 ID・署名・資格情報の値やハッシュは表示しない。環境変数ラベルは `.env` と起動時の既存環境を区別しない。 `StringToSignBytes` は各バイト 1〜2 桁の16進数として厳密比較し、LF / CRLF 等を正規化しない。
 - `s3-verify` — ローカルの挿絵と S3 の内容をバイト単位で突き合わせる (書き込みなし)。同じくライブラリ全体が対象。
-- `s3-dedup` — 旧 `挿絵/` 配置の S3 オブジェクトを dedup プール (`illustrations/<base64url(sha256)>.<ext>`) へ移し、残ったものを消す。**SQLite モード + S3 保存のときだけ有効**。既定は件数だけ数える dry-run、`-f` で実行。hex 名でない挿絵は小説ごとの配置を保つ。
+- `s3-dedup` — 旧 `挿絵/` 配置の S3 オブジェクトを dedup プール (`illustrations/<base64url(sha256)>.<ext>`) へ移し、残ったものを消す。**S3 保存なら storage-backend (YAML / SQLite) を問わず有効**。既定は件数だけ数える dry-run、`-f` で実行。hex 名でない挿絵は小説ごとの配置を保つ。Worker は同じ処理を `POST /api/admin/illustration-dedup` で実行する。
 
 **Rust 実装**: メンテナンスヘルパー (`find_orphan_illustrations`, `plan_legacy_illustration_migrations` / `apply_legacy_illustration_migrations`, `plan_extension_fixes` / `apply_extension_fixes`, `rebuild_illustration_cache`, `detect_image_extension`) を `src/illustration_store.rs` (crate 側) に集約。`src/commands/illust.rs` は CLI オプション解決と dry-run / `-f` の振り分けに専念し、将来 Web UI から同じ crate 関数を直接呼べる形を維持する。削除系・改名系・移行系はすべて既定 dry-run。`-f` 指定時も本文参照・cache 参照の双方から到達不能 / 移行計画を厳密判定してから実際に変更する (BUG-7/15 と整合)。対象小説の解決は clean と同じく ID / URL / Nコード / タイトル / alias / tag 展開の共通パイプラインを使い、`--all` は凍結済み小説をスキップする。
 

@@ -280,7 +280,9 @@ impl Inventory {
         };
         match state.get_raw(Self::state_scope(scope), name)? {
             Some(payload) => Ok(Some(payload)),
-            None => Ok(None),
+            // A missing SQLite row is empty managed state, not permission to
+            // resurrect a retired compatibility/export file through the cache.
+            None => Ok(Some(String::new())),
         }
     }
 

@@ -698,7 +698,10 @@ fn build_reqwest_client(user_agent: &str) -> Result<reqwest::blocking::Client> {
         .default_headers(default_request_headers())
         .http1_only()
         .gzip(true)
-        .brotli(true)
+        // Brotli 応答の展開は無効にする。CVE-2026-111497 の対象は Google Brotli の
+        // C 実装 (1.0.3〜1.2.0) で、このプログラムは C 版をリンクしていないが、
+        // 純 Rust 実装も修正前と同じデコーダ経路を持つ。外部サイトの応答を
+        // 展開する必要はなく、gzip / deflate / identity で取得できれば十分。
         .deflate(true)
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(TOTAL_TIMEOUT_SECS))

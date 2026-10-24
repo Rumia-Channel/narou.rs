@@ -168,6 +168,28 @@ impl S3Store {
     /// 直接取らせるために使う。署名が覆うのは host / path / query だけなので、
     /// scheme は設定された endpoint に合わせる (ローカル MinIO は http)。
     pub fn presign_get_url(&self, key: &ObjectKey, expires_secs: u64) -> String {
+        self.presign_storage_url(&self.location.storage_key(key), expires_secs)
+    }
+
+    /// dedup プールに実体があればプールの URL、無ければ旧 `挿絵/` 配置の URL を
+    /// presign する。移行前の実オブジェクトを直接 S3 から配信するときに使う。
+    ///
+    /// `presign_get_url` と違い、pool の存在確認 (GET range) を 1 回行う。
+    pub async fn presign_get_url_prefer_existing(
+        &self,
+        key: &ObjectKey,
+        expires_secs: u64,
+    ) -> Result<String> {
+        if self.location.has_pool_alternate(key) && !self.pool_exists(key).await? {
+            return Ok(self.presign_storage_url(
+                &self.location.legacy_storage_key(key),
+                expires_secs,
+            ));
+        }
+        Ok(self.presign_get_url(key, expires_secs))
+    }
+
+    fn presign_storage_url(&self, storage_key: &str, expires_secs: u64) -> String {
         let credentials = Credentials {
             access_key_id: &self.credentials.access_key_id,
             secret_access_key: &self.credentials.secret_access_key,
@@ -180,7 +202,7 @@ impl S3Store {
             "{}/{}/{}",
             self.location.endpoint_path(),
             self.location.bucket(),
-            self.location.storage_key(key)
+            storage_key
         );
         let url = s3_sigv4::presign_get(
             &self.host,
@@ -1435,5 +1457,102 @@ mod tests {
         );
         let body = "<Error><Code>AccessDenied</Code></Error>";
         assert!(signature_mismatch_hint(body, &signed).is_empty());
+    }
+
+    fn dedup_store(http: Arc<MockHttpClient>) -> S3Store {
+        S3Store::new(
+            S3StoreConfig {
+                endpoint: ENDPOINT.to_string(),
+                bucket: "bucket".to_string(),
+                region: "ap-northeast-1".to_string(),
+                prefix: "narou/test".to_string(),
+                illustration_dedup: true,
+                access_key_id: "AKIAEXAMPLE".to_string(),
+                secret_access_key: "secret".to_string(),
+            },
+            http,
+            Arc::new(SystemClock),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn illustration_dedup_plan_counts_only_hex_named_legacy_objects() {
+        use crate::platform::store_migration::{
+            IllustrationDedupState, deduplicate_illustrations_page,
+        };
+
+        let http = Arc::new(MockHttpClient::new());
+        let store = dedup_store(http.clone());
+        let hex = "1187327c6d0f0b0b19b33ab211a549023aa9a41f359c6d0a827d7bd99f8d5994";
+        let list_url = store.location.list_url("novels", 500, None);
+        http.add_response(
+            list_url,
+            HttpResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/xml".to_string())],
+                body: format!(
+                    "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                     <Contents><Key>narou/test/novels/site/title/挿絵/{hex}.png</Key><Size>10</Size></Contents>\
+                     <Contents><Key>narou/test/novels/site/title/挿絵/i422674.png</Key><Size>10</Size></Contents>\
+                     <Contents><Key>narou/test/novels/site/title/toc.yaml</Key><Size>10</Size></Contents>\
+                     </ListBucketResult>"
+                )
+                .into_bytes(),
+            },
+        );
+
+        let mut state = IllustrationDedupState::default();
+        futures::executor::block_on(deduplicate_illustrations_page(
+            &store, "plan", 500, &mut state,
+        ))
+        .unwrap();
+
+        assert_eq!(state.planned, 1, "hex 名の挿絵だけを数える");
+        assert_eq!(state.skipped_non_hex, 1, "mitemin の iNNN は対象外");
+        assert!(state.done);
+        assert!(state.failed.is_empty());
+    }
+
+    #[test]
+    fn presign_get_url_prefer_existing_falls_back_to_legacy_layout() {
+        let hex = "1187327c6d0f0b0b19b33ab211a549023aa9a41f359c6d0a827d7bd99f8d5994";
+        let key = key(&format!("novels/site/title/挿絵/{hex}.png"));
+
+        let http = Arc::new(MockHttpClient::new());
+        let store = dedup_store(http.clone());
+        http.add_response(
+            store.location.object_url(&key),
+            HttpResponse {
+                status: 404,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        );
+        let url = futures::executor::block_on(
+            store.presign_get_url_prefer_existing(&key, 60),
+        )
+        .unwrap();
+        assert!(url.contains("%E6%8C%BF%E7%B5%B5"), "legacy URL: {url}");
+        assert!(!url.contains("illustrations"), "legacy URL: {url}");
+
+        let http = Arc::new(MockHttpClient::new());
+        let store = dedup_store(http.clone());
+        http.add_response(
+            store.location.object_url(&key),
+            HttpResponse {
+                status: 206,
+                headers: vec![
+                    ("content-range".to_string(), "bytes 0-0/10".to_string()),
+                    ("content-length".to_string(), "1".to_string()),
+                ],
+                body: b"x".to_vec(),
+            },
+        );
+        let url = futures::executor::block_on(
+            store.presign_get_url_prefer_existing(&key, 60),
+        )
+        .unwrap();
+        assert!(url.contains("illustrations"), "pool URL: {url}");
     }
 }

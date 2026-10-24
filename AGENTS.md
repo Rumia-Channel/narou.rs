@@ -113,6 +113,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **ログイン資格情報**: 書き出し (`login export` / `narou_rs_login --export`) は 8 文字未満のパスフレーズを拒否し、ファイルは Unix 0600・シンボリックリンク非追従で書く (取り込みは旧ファイル互換のため任意長を受け付ける)。`narou_rs_login` のブラウザは `--remote-debugging-port=0` で起動し、`DevToolsActivePort` と `/json/version` の ws URL が起動したプロセスの port/host/path と一致することを確認する。SQLite の `db.sqlite` と `-wal` / `-shm` は Unix で 0600 にする。
 - **Worker / relay**: `NAROU_RELAY_ENDPOINT` は https 必須（ループバックのみ http 可）。スキーム省略の暗黙 `http://` 補完はしない（`platform::relay::normalize_relay_base`、違反は fail closed でリレー無効）。deploy CI の wrangler は固定バージョン (`NAROU_WRANGLER_VERSION`、既定 `4.151.3`) を使い、`NAROU_ADMIN_TOKEN` は CI で 32 文字以上を要求する。
 - **上流コンテンツ**: うごイラのフレーム ZIP は宣言サイズと読み出し上限（16 MiB/フレーム）およびヘッダ寸法で復号前に検証する。EPUB に取り込む非リモート `<img src>` は novel ディレクトリ内の相対パスだけを許可する。
+- **外部応答の Brotli 展開**: reqwest の `brotli` feature は有効にしない (CVE-2026-111497 は Google Brotli の C 実装 1.0.3〜1.2.0 が対象で C 版はリンクしていないが、pure Rust 実装も修正前と同じデコーダ経路を持つため、外部サイトの応答を展開する経路を落とす)。HTTP 取得は gzip / deflate / identity を使う。保存オブジェクト (`objects` / `section_bodies` など) の brotli 圧縮・伸長は自前データのみなので継続する。外部取得リレーも `curl --compressed` を使わず、`Accept-Encoding: gzip, deflate` を明示して gzip / deflate を Rust (`flate2`) で展開し、`br` は fail closed する (`relay/src/transport/curl.rs`)。2026-10。
 
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。
@@ -175,7 +176,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - 端末上で `narou init` を実行した場合は、Ruby 版と同じく AozoraEpub3 の場所と行の高さを対話式に質問する。非対話環境では入力待ちせず、既存設定がなければスキップする。
 - `narou init -p/--path` は指定先に `AozoraEpub3.jar` がある場合だけ `~/.narousetting/global_setting.yaml` に保存する。`-p :keep` は既存の有効な `aozoraepub3dir` を再利用する。
 - `narou init -l/--line-height` は AozoraEpub3 設定が保存される場合だけ `line-height` として保存し、未指定時は Ruby 版の非対話デフォルトに合わせて `1.8` を使う。
-- 有効な AozoraEpub3 パスを設定した場合は、Ruby 版と同じく `chuki_tag.txt` のカスタム注記追記/置換、`AozoraEpub3.ini` のコピー、`template/OPS/css_custom/vertical_font.css` の行高反映コピーを行う。
+- 有効な AozoraEpub3 パスを設定した場合は、Ruby 版と同じく `chuki_tag.txt` のカスタム注記追記/置換、`AozoraEpub3.ini` のコピー、行高反映済みカスタム CSS のコピーを行う。カスタム CSS の置き場所は AozoraEpub3 のテンプレート構成で変わる: 元祖レイアウト (`template/OPS/css/` がある) は `template/OPS/css_custom/vertical_font.css`、1.1.1 以降の改造版 / 電書協レイアウト (`template/item/style/` がある) は `template/item/style_custom/font.css`（中身は `preset/denshokyo_font.css`）。判定は `converter::dakuten_font::AozoraTemplateKind` が唯一の定義で、`init`・濁点フォント切替・変換時の不足補完・`lite` エンジンへの同梱 CSS がこれに従う。OPS パス固定に戻すと二分アキ (`［＃二分アキ］`)・行高・前書き/後書きの装飾が EPUB に反映されない (issue #42)。
 
 ## Build & Run
 ```powershell
@@ -579,21 +580,24 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   ローカルから S3 へ写す。`narou illust s3-verify` がバイト単位で突き合わせる。どちらも
   ライブラリ全体が対象で、`s3.asset-backend=s3` と接続情報が必要
   (`platform::store_migration::migrate_page` を共有)。
-- **挿絵のハッシュ dedup** (SQLite + S3 モードで既定 ON、2026-10): `S3Location::with_illustration_dedup` を
+- **挿絵のハッシュ dedup** (S3 保存なら既定 ON、2026-10): `S3Location::with_illustration_dedup` を
   付けると、`挿絵/<sha256-hex>.<ext>` を作品を跨いで `illustrations/<base64url(sha256)>.<ext>` の
   グローバルプールへ寄せる (同じ画像の二重保存を防ぐ)。小説別の配置は `挿絵/` ではなく pool 側が
   正位置になり、`read`/`stat`/`read_stream` はプールに無ければ旧 `挿絵/` 配置へフォールバックする
   (移行前の実オブジェクトをそのまま読める)。`delete` は旧配置だけを指し、pool は消さない
-  (他小説と共有されるため)。mitemin (`iNNN`) 名や hash でない名の挿絵は pool に出ず、
-  小説ごとの `挿絵/` 配置を保つ。dedup ON のとき新規挿絵のファイル名は常に `<sha256>.<ext>`
-  (mitemin 名も pool には出ない。index の `iNNN→hex` 対応で参照は辿れる)。
-  条件は `native::sqlite::state::illustration_dedup_enabled()` = storage-backend=sqlite +
-  `s3.asset-backend=s3` (S3 を実際に使っているときだけ)。Worker 側は `illustration_dedup: false`
-  で固定しており、D1+S3 構成でも小説ごとの `挿絵/` 名を維持する (native 専用機能)。
+  (他作品と共有されるため)。dedup ON のとき新規挿絵のファイル名は常に `<sha256>.<ext>`
+  (mitemin 名も pool に出る。index の `iNNN→hex` 対応で参照は辿れる)。旧来の hex でない名前は
+  小説ごとの `挿絵/` 配置のまま残る。
+  条件は **S3 を実際に使っていること** (`s3.asset-backend=s3`) だけで、storage-backend の
+  YAML / SQLite は問わない。Worker も `illustration_dedup: true` で、全作品・漫画の挿絵が
+  同じプールに入る。native は `native::s3::illustrations_in_s3()`、Worker は常に真
+  (`illustration_store::dedup_active()`)。
 - `narou illust s3-dedup`: 旧 `挿絵/` 配置の S3 オブジェクトを pool へ `copy` し、pool にある
-  ことが確認できたものだけ旧配置を `delete` する (既定 dry-run、`-f` で実行。SQLite+S3 限定)。
-  hex 名でない挿絵は小説ごとの配置を保つため対象外。`s3-push` は dedup ON なら新規 hex 挿絵が
-  そのまま pool に出るので、`s3-dedup` は「dedup を ON にする前に書かれた分」の後処理。
+  ことが確認できたものだけ旧配置を `delete` する (既定 dry-run、`-f` で実行。S3 保存なら
+  YAML / SQLite を問わず使える)。hex 名でない挿絵は小説ごとの配置を保つため対象外。
+  `s3-push` は dedup ON なら新規 hex 挿絵がそのまま pool に出るので、`s3-dedup` は
+  「dedup を ON にする前に書かれた分」の後処理。Worker は同じ処理を
+  `POST /api/admin/illustration-dedup` (`action: status|plan|copy|reset`) でページ単位に実行できる。
 - **SORAHOST は `concurrency=true`**: DL/update と convert/send を別レーンで並行に流す
   (小説単位の排他は `.narou/lock.yaml`)。実測ピークは 2 ジョブ同時で約 120MB (debug) +
   常駐 31MB で、256MB でも通常運用は収まるが、うごイラ組み立て (~56MB) や大きい挿絵入り

@@ -96,6 +96,42 @@ element:
 }
 
 #[test]
+fn setting_ini_value_equal_to_original_default_still_beats_default_scope() {
+    use std::collections::HashMap;
+
+    use narou_rs::converter::ini::IniData;
+
+    let resolve = |ini_text: &str, settings: &[(&str, bool)]| {
+        let ini = IniData::load(ini_text);
+        let map: HashMap<String, serde_yaml::Value> = settings
+            .iter()
+            .map(|(key, value)| (key.to_string(), serde_yaml::Value::Bool(*value)))
+            .collect();
+        NovelSettings::from_sources(Some(1), "title", "author", &ini, &map, false, false)
+            .enable_half_indent_bracket
+    };
+
+    // issue #42: `enable_half_indent_bracket` のオリジナル設定は true なので、
+    // setting.ini に true と明示した場合は default.* = false より優先される。
+    // 以前は「現在値がオリジナル設定と同じか」で ini の有無を判定していたため、
+    // この組み合わせだけ default.* が上書きしていた。
+    assert!(resolve(
+        "enable_half_indent_bracket = true\n",
+        &[("default.enable_half_indent_bracket", false)],
+    ));
+    // 明示された false は default.* = true に勝つ。
+    assert!(!resolve(
+        "enable_half_indent_bracket = false\n",
+        &[("default.enable_half_indent_bracket", true)],
+    ));
+    // force.* は setting.ini より強い。
+    assert!(!resolve(
+        "enable_half_indent_bracket = true\n",
+        &[("force.enable_half_indent_bracket", false)],
+    ));
+}
+
+#[test]
 #[ignore = "requires local, untracked narou.rb reference novels; see tests/README.md"]
 fn kakuyomu_sample_matches_narou_rb_reference_byte_for_byte() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));

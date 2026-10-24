@@ -1244,18 +1244,19 @@ pub fn legacy_basename_from_source(source: &str) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
-/// SQLite+S3 モードで挿絵の重複除去プールを使うか。
+/// S3 保存時に挿絵の重複除去プールを使うか。
 ///
-/// native のみ有効。Worker (D1) は `storage-backend` マーカー外なので常に
-/// 偽を返し、従来どおり小説ごとの `挿絵/` 名を維持する。
+/// native は `s3.asset-backend=s3` のとき (storage-backend の YAML / SQLite を
+/// 問わない)、Worker は常に真。Worker の資産が D1 の構成でも内容ハッシュ名に
+/// しておくことで、後から S3 へ切り替えたときにそのまま共通プールへ載る。
 #[cfg(feature = "native-runtime")]
 pub fn dedup_active() -> bool {
-    crate::native::sqlite::state::illustration_dedup_enabled()
+    crate::native::s3::illustrations_in_s3()
 }
 
 #[cfg(not(feature = "native-runtime"))]
 pub fn dedup_active() -> bool {
-    false
+    true
 }
 
 #[cfg(feature = "native-runtime")]

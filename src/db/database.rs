@@ -13,6 +13,9 @@ const DATABASE_NAME: &str = "database";
 
 pub struct Database {
     data: HashMap<i64, NovelRecord>,
+    /// Last acknowledged SQLite snapshot; save() publishes only local edits.
+    #[cfg(feature = "native-runtime")]
+    persisted: HashMap<i64, NovelRecord>,
     index: IndexStore,
     inventory: Inventory,
     archive_root: PathBuf,
@@ -39,17 +42,18 @@ impl Database {
             let narou_dir = inventory.root_dir().join(".narou");
             match crate::native::sqlite::state::active_for(&narou_dir) {
                 Some(state) => {
+                    let yaml_path = inventory.inventory_path("database", InventoryScope::Local);
+                    state.with_compat_lock(|| crate::db::inventory::with_exclusive_file_lock(&yaml_path, || {
                     let repo =
                         crate::native::sqlite::SqliteNovelRepository::new(state.conn_ref().clone());
-                    let yaml_path =
-                        inventory.inventory_path("database", InventoryScope::Local);
                     let index_path =
                         inventory.inventory_path("database_index", InventoryScope::Local);
-                    let file_content = std::fs::read_to_string(&yaml_path).ok();
-                    let stored_sha = state
-                        .get_raw_db("meta", "database_yaml_sha")
-                        .ok()
-                        .flatten();
+                    let file_content = match std::fs::read_to_string(&yaml_path) {
+                        Ok(content) => Some(content),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(error.into()),
+                    };
+                    let stored_sha = state.get_raw_db("meta", "database_yaml_sha")?;
                     let file_sha = file_content
                         .as_ref()
                         .map(|content| sha256_hex(content.as_bytes()));
@@ -57,34 +61,40 @@ impl Database {
                         // Compat mode: database.yaml is authoritative.
                         match file_content {
                             Some(content) => {
-                                if file_sha.as_deref() != stored_sha.as_deref() {
-                                    if !content.trim().is_empty() {
-                                        let parsed: BTreeMap<i64, NovelRecord> =
-                                            serde_yaml::from_str(&content)?;
-                                        let conn = repo.conn_handle();
-                                        crate::native::sqlite::bulk::replace_all_records(
-                                            &mut conn.lock(),
-                                            &parsed,
-                                        )?;
-                                    }
-                                    let _ = state.set_raw_db(
-                                        "meta",
-                                        "database_yaml_sha",
-                                        &file_sha.clone().unwrap_or_default(),
-                                    );
+                                let edited_projection = state.get_raw_db(
+                                    "meta", "export_file_sha:database.yaml",
+                                )?.is_some() && !state.is_export_file("database.yaml", &content)?;
+                                let conn = repo.conn_handle();
+                                let mut guard = conn.lock();
+                                let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                                    .map_err(crate::native::sqlite::sqlite_error)?;
+                                if (file_sha.as_deref() != stored_sha.as_deref() || edited_projection)
+                                    && !content.trim().is_empty()
+                                {
+                                    let parsed: BTreeMap<i64, NovelRecord> = serde_yaml::from_str(&content)?;
+                                    crate::native::sqlite::bulk::replace_records_conn(&tx, &parsed)?;
                                 }
+                                remember_records_mirror(&tx, &content)?;
+                                tx.commit().map_err(crate::native::sqlite::sqlite_error)?;
                             }
                             None => {
                                 // File deleted externally: recreate it from
                                 // the database so narou.rb still sees the
                                 // library.
-                                mirror_records_yaml(&state, &repo, &yaml_path)?;
+                                mirror_records_yaml(&repo, &yaml_path)?;
                             }
                         }
                     } else {
                         // Non-compat: import the file when it carries data the
                         // DB has not mirrored yet, then retire it.
+                        let exported = state.get_raw_db(
+                            "meta", "export_file_sha:database.yaml",
+                        )?.is_some();
                         let should_import = match (&file_content, &stored_sha) {
+                            // Export provenance takes precedence over an older
+                            // compat mirror SHA, including an intentional revert
+                            // whose bytes happen to match that old mirror.
+                            (Some(content), _) if exported => !content.trim().is_empty(),
                             (Some(content), Some(sha)) => {
                                 file_sha.as_deref() != Some(sha.as_str())
                                     && !content.trim().is_empty()
@@ -93,9 +103,7 @@ impl Database {
                                 let conn = repo.conn_handle();
                                 crate::native::sqlite::bulk::load_all_records(
                                     &conn.lock(),
-                                )?
-                                .is_empty()
-                                    && !content.trim().is_empty()
+                                )?.is_empty() && !content.trim().is_empty()
                             }
                             (None, _) => false,
                         };
@@ -120,13 +128,16 @@ impl Database {
                     // Novel rows exist now, so the freeze projection (skipped or
                     // partial while `novels` was still empty) can be completed.
                     state.resync_frozen_novels()?;
-                    Some(repo)
+                    Ok(Some(repo))
+                    }))?
                 }
                 None => None,
             }
         };
         let mut db = Self {
             data: HashMap::new(),
+            #[cfg(feature = "native-runtime")]
+            persisted: HashMap::new(),
             index: IndexStore::load(&inventory)?,
             inventory,
             archive_root,
@@ -228,6 +239,7 @@ impl Database {
                 &conn.lock(),
             )?;
             self.data = loaded.into_iter().collect();
+            self.persisted = self.data.clone();
             self.id_allocator.reconcile(
                 self.data.keys().max().copied(), |id| self.data.contains_key(&id),
             );
@@ -263,37 +275,52 @@ impl Database {
 
     pub fn save(&mut self) -> Result<()> {
         #[cfg(feature = "native-runtime")]
-        if let Some(repo) = &self.sqlite {
-            let normalized: BTreeMap<i64, NovelRecord> = self
-                .data
-                .iter()
-                .map(|(&id, record)| {
-                    let mut normalized = record.clone();
-                    normalized.id = id;
-                    (id, normalized)
-                })
-                .collect();
-            let conn = repo.conn_handle();
-            crate::native::sqlite::bulk::replace_all_records(
-                &mut conn.lock(),
-                &normalized,
-            )?;
-            if self.compat_active() {
-                let yaml_path = self
-                    .inventory
-                    .inventory_path(DATABASE_NAME, InventoryScope::Local);
-                let content = serde_yaml::to_string(&normalized)?;
-                crate::db::inventory::atomic_write(&yaml_path, &content)?;
-                if let Some(state) = self.state_handle() {
-                    let _ = state.set_raw_db(
-                        "meta",
-                        "database_yaml_sha",
-                        &sha256_hex(content.as_bytes()),
-                    );
+        if self.sqlite.is_some() {
+            let baseline = self.persisted.clone();
+            let edited = self.data.clone();
+            return self.update_records(move |mut current| {
+                for id in baseline.keys() {
+                    if !edited.contains_key(id) {
+                        current.remove(id);
+                    }
                 }
-                self.index.flush(&self.inventory)?;
-            }
-            return Ok(());
+                for (&id, record) in &edited {
+                    let mut record = record.clone();
+                    record.id = id;
+                    let Some(before) = baseline.get(&id) else {
+                        if current.contains_key(&id) {
+                            return Err(crate::error::NarouError::Database(format!(
+                                "Novel ID {id} was registered by another writer; local insert was not saved",
+                            )));
+                        }
+                        current.insert(id, record);
+                        continue;
+                    };
+                    let before = serde_yaml::to_value(before)?;
+                    let after = serde_yaml::to_value(&record)?;
+                    if before == after {
+                        continue;
+                    }
+                    // A stale field edit must not resurrect a deleted novel.
+                    let Some(authoritative) = current.get(&id) else { continue; };
+                    let mut merged = serde_yaml::to_value(authoritative)?;
+                    let before = before.as_mapping().expect("record serializes as a map");
+                    let after = after.as_mapping().expect("record serializes as a map");
+                    let fields = merged.as_mapping_mut().expect("record serializes as a map");
+                    // Flattened unknown fields participate in the same field-level
+                    // delta, so concurrent keys are not overwritten by stale saves.
+                    for key in before.keys().chain(after.keys()) {
+                        if before.get(key) != after.get(key) {
+                            match after.get(key) {
+                                Some(value) => { fields.insert(key.clone(), value.clone()); }
+                                None => { fields.remove(key); }
+                            }
+                        }
+                    }
+                    current.insert(id, serde_yaml::from_value(merged)?);
+                }
+                Ok((current, ()))
+            });
         }
         let content = serde_yaml::to_string(
             &self
@@ -319,46 +346,58 @@ impl Database {
         F: FnOnce(BTreeMap<i64, NovelRecord>) -> Result<(BTreeMap<i64, NovelRecord>, T)>,
     {
         #[cfg(feature = "native-runtime")]
-        if self.sqlite.is_some() {
-            let current: BTreeMap<i64, NovelRecord> = self
-                .data
-                .iter()
-                .map(|(&id, record)| {
-                    let mut normalized = record.clone();
-                    normalized.id = id;
-                    (id, normalized)
-                })
-                .collect();
-            let (mut updated, result) = update(current)?;
-            for (id, record) in updated.iter_mut() {
-                record.id = *id;
-            }
-            if let Some(repo) = &self.sqlite {
-                let conn = repo.conn_handle();
-                crate::native::sqlite::bulk::replace_all_records(
-                    &mut conn.lock(),
-                    &updated,
-                )?;
-            }
-            if self.compat_active() {
-                let yaml_path = self
-                    .inventory
-                    .inventory_path(DATABASE_NAME, InventoryScope::Local);
-                let content = serde_yaml::to_string(&updated)?;
-                crate::db::inventory::atomic_write(&yaml_path, &content)?;
-                if let Some(state) = self.state_handle() {
-                    let _ = state.set_raw_db(
-                        "meta",
-                        "database_yaml_sha",
-                        &sha256_hex(content.as_bytes()),
-                    );
+        if let Some(repo) = &self.sqlite {
+            let state = self.state_handle().ok_or_else(|| crate::error::NarouError::Database(
+                "SQLite state is unavailable during record mutation".into(),
+            ))?;
+            let yaml_path = self.inventory.inventory_path(DATABASE_NAME, InventoryScope::Local);
+            let (updated, result, compat) = state.with_compat_lock(|| {
+                let compat = state.compat_now();
+                let operation = || {
+                    let conn = repo.conn_handle();
+                    let mut guard = conn.lock();
+                    // Acquire the database write lock BEFORE reading. The process
+                    // mutex alone does not exclude separate processes/connections.
+                    let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .map_err(crate::native::sqlite::sqlite_error)?;
+                    let mut current = crate::native::sqlite::bulk::load_all_records(&tx)?;
+                    if compat {
+                        match std::fs::read_to_string(&yaml_path) {
+                            Ok(raw) => {
+                                current = if raw.trim().is_empty() { BTreeMap::new() }
+                                    else { serde_yaml::from_str(&raw)? };
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    for (&id, record) in &mut current { record.id = id; }
+                    let (mut updated, result) = update(current)?;
+                    for (&id, record) in &mut updated { record.id = id; }
+                    crate::native::sqlite::bulk::replace_records_conn(&tx, &updated)?;
+                    if compat {
+                        let content = serde_yaml::to_string(&updated)?;
+                        // The file lock is already held. Failed publication rolls
+                        // back the SQL mutation and does not acknowledge a new SHA.
+                        crate::db::inventory::atomic_write_locked(&yaml_path, &content)?;
+                        remember_records_mirror(&tx, &content)?;
+                    }
+                    tx.commit().map_err(crate::native::sqlite::sqlite_error)?;
+                    Ok((updated, result, compat))
+                };
+                if compat {
+                    crate::db::inventory::with_exclusive_file_lock(&yaml_path, operation)
+                } else {
+                    operation()
                 }
-            }
+            })?;
             self.data = updated.into_iter().collect();
-            // 書き込み後も索引を実データへ追随させる (SQLite モードでは
-            // database_index.yaml を正として使えないため)。
+            self.persisted = self.data.clone();
+            self.id_allocator.reconcile(
+                self.data.keys().max().copied(), |id| self.data.contains_key(&id),
+            );
             self.index.reconcile(&self.data);
-            if self.compat_active() {
+            if compat {
                 self.index.flush(&self.inventory)?;
             }
             return Ok(result);
@@ -439,12 +478,43 @@ impl Database {
         self.data.values().find(|&record| record.title.to_lowercase() == lower).map(|v| v as _)
     }
 
-    /// Reserve an ID under the shared database lock until record publication.
+    /// Reserve an ID until record publication. SQLite ownership is durable
+    /// across processes; YAML retains its existing process-local allocator.
     pub fn allocate_id(&mut self) -> Result<crate::platform::NovelIdReservation> {
+        #[cfg(feature = "native-runtime")]
+        if let Some(repo) = &self.sqlite {
+            let conn = repo.conn_handle();
+            let mut guard = conn.lock();
+            let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(crate::native::sqlite::sqlite_error)?;
+            tx.execute(crate::db::novel_query::ALLOCATE_STEP_SQL, [])
+                .map_err(crate::native::sqlite::sqlite_error)?;
+            tx.execute(crate::db::novel_query::ALLOCATE_BUMP_SQL, [])
+                .map_err(crate::native::sqlite::sqlite_error)?;
+            let (id, generation) = tx.query_row(
+                crate::db::novel_query::ALLOCATE_READ_SQL, [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).map_err(crate::native::sqlite::sqlite_error)?;
+            tx.commit().map_err(crate::native::sqlite::sqlite_error)?;
+            return Ok(crate::platform::NovelIdReservation::new(
+                crate::platform::NovelId(id), generation,
+            ));
+        }
         self.id_allocator.allocate()
     }
 
     pub fn release_id(&mut self, reservation: crate::platform::NovelIdReservation) {
+        #[cfg(feature = "native-runtime")]
+        if let Some(repo) = &self.sqlite {
+            let conn = repo.conn_handle();
+            // The public release seam is infallible. A failed release leaves
+            // ownership reserved (safe leakage), never available to two writers.
+            let _ = conn.lock().execute(
+                crate::db::novel_query::RELEASE_ID_SQL,
+                [reservation.id().0, reservation.generation()],
+            );
+            return;
+        }
         let committed = self.data.contains_key(&reservation.id().0);
         self.id_allocator.release(reservation, committed);
     }
@@ -510,20 +580,38 @@ fn sha256_hex(data: &[u8]) -> String {
 /// SHA-256 in `app_state` so the next open can detect external edits.
 #[cfg(feature = "native-runtime")]
 fn mirror_records_yaml(
-    state: &crate::native::sqlite::state::StateDb,
     repo: &crate::native::sqlite::SqliteNovelRepository,
     yaml_path: &std::path::Path,
 ) -> Result<()> {
     let conn = repo.conn_handle();
-    let records = crate::native::sqlite::bulk::load_all_records(
-        &conn.lock(),
-    )?;
+    let mut guard = conn.lock();
+    let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(crate::native::sqlite::sqlite_error)?;
+    let records = crate::native::sqlite::bulk::load_all_records(&tx)?;
     let content = serde_yaml::to_string(&records)?;
     if let Some(parent) = yaml_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    crate::db::inventory::atomic_write(yaml_path, &content)?;
-    let _ = state.set_raw_db("meta", "database_yaml_sha", &sha256_hex(content.as_bytes()));
+    // Caller holds the root compat lock and database.yaml file lock, so the
+    // authoritative read above cannot race an acknowledged compat mutation.
+    crate::db::inventory::atomic_write_locked(yaml_path, &content)?;
+    remember_records_mirror(&tx, &content)?;
+    tx.commit().map_err(crate::native::sqlite::sqlite_error)
+}
+
+/// A successful ordinary mirror supersedes any interrupted export/cutover
+/// projection. Keep only its actual bytes owned, not historical mirror hashes.
+#[cfg(feature = "native-runtime")]
+fn remember_records_mirror(tx: &rusqlite::Transaction<'_>, content: &str) -> Result<()> {
+    let hash = sha256_hex(content.as_bytes());
+    let provenance = serde_yaml::to_string(&[Some(hash.clone()), None])?;
+    for (key, value) in [("database_yaml_sha", hash), ("export_file_sha:database.yaml", provenance)] {
+        tx.execute(
+            "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES ('meta', ?, '{}', ?)
+             ON CONFLICT(scope, key) DO UPDATE SET value_yaml = excluded.value_yaml",
+            rusqlite::params![key, value],
+        ).map_err(crate::native::sqlite::sqlite_error)?;
+    }
     Ok(())
 }
 

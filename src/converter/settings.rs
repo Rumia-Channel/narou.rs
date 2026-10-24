@@ -176,6 +176,7 @@ impl NovelSettings {
             ignore_force,
             ignore_default,
             settings_map,
+            ini,
         );
         settings.novel_title = if settings.novel_title.is_empty() {
             novel_title.to_string()
@@ -249,7 +250,8 @@ impl NovelSettings {
         };
 
         settings = Self::apply_ini_defaults(&settings, &ini);
-        settings = Self::apply_force_and_default_settings(&settings, ignore_force, ignore_default);
+        settings =
+            Self::apply_force_and_default_settings(&settings, ignore_force, ignore_default, &ini);
 
         if settings.novel_title.is_empty() {
             settings.novel_title = source_name.to_string();
@@ -285,12 +287,17 @@ impl NovelSettings {
     /// `default.*` / `force.*` を適用する (純関数)。
     ///
     /// native は保存済み設定 (`crate::db::settings::load`) を、Worker は D1 から
-    /// 読んだ同じ形のマップを渡す。
+    /// 読んだ同じ形のマップを渡す。`setting.ini` を優先するかは「値が
+    /// オリジナル設定と同じか」ではなく「その項目が書かれているか」で決める
+    /// (Ruby 版 `NovelSetting#load_settings` と同じ)。値の一致で判定すると、
+    /// オリジナル設定と同じ値を明示したときに `default.*` が上書きしてしまう
+    /// (issue #42)。
     pub fn apply_force_and_default_settings_from(
         settings: &Self,
         ignore_force: bool,
         ignore_default: bool,
         data: &HashMap<String, serde_yaml::Value>,
+        ini: &IniData,
     ) -> Self {
         let mut s = settings.clone();
 
@@ -305,14 +312,15 @@ impl NovelSettings {
                 force_settings.insert(rest, value);
             }
         }
+        let ini_settings = Self::load_from_ini(ini);
         let defaults = NovelSettings::default();
         let original_defaults = Self::get_original_defaults(&defaults);
-        for (name, default_val) in &original_defaults {
+        for (name, _default_val) in &original_defaults {
             let ini_key = name;
             if force_settings.contains_key(ini_key) {
                 let ini_val = yaml_value_to_ini(force_settings[ini_key]);
                 Self::apply_single_setting(&mut s, ini_key, &ini_val);
-            } else if s.has_default_setting(ini_key, default_val)
+            } else if !Self::ini_sets_global_value(ini, &ini_settings, ini_key)
                 && let Some(val) = default_settings.get(ini_key)
             {
                 let ini_val = yaml_value_to_ini(val);
@@ -322,21 +330,31 @@ impl NovelSettings {
         s
     }
 
+    /// `setting.ini` の `[global]` に、その設定として解釈できる値が
+    /// 明示されているか。`load_from_ini` は型の合わない値を読み飛ばすので、
+    /// 読み込み後の値と一致することで「明示された値」かどうかを判定する。
+    fn ini_sets_global_value(ini: &IniData, ini_settings: &Self, key: &str) -> bool {
+        ini.get_global(key)
+            .is_some_and(|value| Self::get_setting_as_ini(ini_settings, key) == *value)
+    }
+
     #[cfg(feature = "native-runtime")]
     fn apply_force_and_default_settings(
         settings: &Self,
         ignore_force: bool,
         ignore_default: bool,
+        ini: &IniData,
     ) -> Self {
         let Ok(data) = crate::db::settings::load(SettingScope::Local) else {
             return settings.clone();
         };
-        Self::apply_force_and_default_settings_from(settings, ignore_force, ignore_default, &data)
-    }
-
-    fn has_default_setting(&self, key: &str, default_val: &IniValue) -> bool {
-        let current = Self::get_setting_as_ini(self, key);
-        current == *default_val
+        Self::apply_force_and_default_settings_from(
+            settings,
+            ignore_force,
+            ignore_default,
+            &data,
+            ini,
+        )
     }
 
     fn get_setting_as_ini(s: &Self, key: &str) -> IniValue {

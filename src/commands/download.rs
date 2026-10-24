@@ -159,10 +159,12 @@ async fn cmd_download_inner(
 
                     match dl.status {
                         UpdateStatus::Ok => {}
-                        UpdateStatus::None | UpdateStatus::Failed | UpdateStatus::Canceled => {
+                        UpdateStatus::None | UpdateStatus::Failed => {
                             mistook += 1;
                             break;
                         }
+                        // キャンセルは正常な見送り。変換や後処理は行わない (#41)。
+                        UpdateStatus::Canceled => break,
                     }
 
                     if opts.no_convert {

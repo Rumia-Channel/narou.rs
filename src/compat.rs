@@ -648,26 +648,13 @@ fn choose_digest_action_inner(
             "1" => return DigestChoice::Update,
             "2" => return DigestChoice::Cancel,
             "3" => return DigestChoice::CancelAndFreeze,
-            "4" => {
-                queue_continue_update_after_auto_action(auto_choices);
-                return DigestChoice::Backup;
-            }
-            "5" => {
-                queue_continue_update_after_auto_action(auto_choices);
-                return DigestChoice::ShowStory;
-            }
-            "6" => {
-                queue_continue_update_after_auto_action(auto_choices);
-                return DigestChoice::OpenBrowser;
-            }
-            "7" => {
-                queue_continue_update_after_auto_action(auto_choices);
-                return DigestChoice::OpenFolder;
-            }
-            "8" => {
-                queue_continue_update_after_auto_action(auto_choices);
-                return DigestChoice::Convert;
-            }
+            // 閲覧・バックアップ・変換は更新の承認ではない。自動選択を
+            // 使い切ったら既定の 2 で止め、続行には明示的な 1 を必要とする。
+            "4" => return DigestChoice::Backup,
+            "5" => return DigestChoice::ShowStory,
+            "6" => return DigestChoice::OpenBrowser,
+            "7" => return DigestChoice::OpenFolder,
+            "8" => return DigestChoice::Convert,
             _ => {
                 if auto_choices.is_some() {
                     continue;
@@ -678,18 +665,6 @@ fn choose_digest_action_inner(
                 println!("選択肢の中にありません。もう一度入力して下さい");
             }
         }
-    }
-}
-
-/// 自動入力で非終端アクション (4-8) を実行したあと、選択肢が尽きていれば
-/// 「1: このまま更新する」を次に選ぶ。Ruby 準拠の既定 2 (キャンセル) のままだと、
-/// 「7: 保存フォルダを開く」等を指定したユーザーが意図せず更新をキャンセルされる
-/// (issue #41)。明示的な "2"/"3" が後続にある場合はそれを優先する。
-fn queue_continue_update_after_auto_action(auto_choices: &mut Option<VecDeque<String>>) {
-    if let Some(queue) = auto_choices.as_mut()
-        && queue.is_empty()
-    {
-        queue.push_back("1".to_string());
     }
 }
 
@@ -734,11 +709,12 @@ pub fn convert_existing_novel(
     no_open: bool,
 ) -> std::result::Result<PathBuf, String> {
     let _lock = NovelLockGuard::acquire(Some(id)).map_err(|e| e.to_string())?;
+    let multi_device = load_local_setting_string("convert.multi-device").is_some();
     let devices = resolve_auto_convert_devices()?;
     let mut last_output_path = None;
     for device in devices {
         let mut settings = NovelSettings::load_for_novel(id, title, author, novel_dir);
-        apply_auto_convert_device_settings(&mut settings, device);
+        apply_auto_convert_device_settings(&mut settings, device, multi_device);
         let mut converter =
             if let Some(user_converter) = UserConverter::load_with_title(novel_dir, title) {
                 NovelConverter::with_user_converter(settings, user_converter)
@@ -827,7 +803,22 @@ fn parse_convert_device_name(name: &str) -> Option<Device> {
     }
 }
 
-fn apply_auto_convert_device_settings(settings: &mut NovelSettings, device: Option<Device>) {
+/// ダウンロード/更新後の自動変換で、端末由来の設定を適用する。
+///
+/// Ruby 版 `Command::Convert#change_settings` と同じく、端末を明示した変換
+/// (`convert.multi-device`) のときだけ `Device::RELATED_VARIABLES` を適用する。
+/// 通常の変換 (端末設定から選ばれた `device`) では何もしない — `device` を
+/// 変えた時点で `default.enable_half_indent_bracket` が保存されており、変換時は
+/// `force.*` > setting.ini > `default.*` の順で解決されるため、ここで上書きすると
+/// 利用者の設定を無視してしまう (issue #42)。
+fn apply_auto_convert_device_settings(
+    settings: &mut NovelSettings,
+    device: Option<Device>,
+    explicit_device: bool,
+) {
+    if !explicit_device {
+        return;
+    }
     if matches!(device, Some(Device::Mobi)) {
         settings.enable_half_indent_bracket = true;
     }
@@ -1126,36 +1117,49 @@ mod tests {
     }
 
     #[test]
-    fn digest_auto_choices_continue_update_after_a_non_terminal_action() {
-        // issue #41: 「7: 保存フォルダを開く」だけを自動指定したときに、
-        // その後ろへ暗黙の「2: キャンセル」を足さない。
-        let mut auto_choices = parse_digest_auto_choices(Some("7"));
-        assert_eq!(
-            choose_digest_action_with_auto_choices("title", "message", &mut auto_choices),
-            DigestChoice::OpenFolder
-        );
-        assert_eq!(
-            choose_digest_action_with_auto_choices("title", "message", &mut auto_choices),
-            DigestChoice::Update
-        );
+    fn digest_auto_choices_cancel_after_non_terminal_actions_unless_update_is_explicit() {
+        // issue #41: 閲覧・バックアップだけでは本文の置き換えを承認しない。
+        for (value, action) in [
+            ("4", DigestChoice::Backup),
+            ("5", DigestChoice::ShowStory),
+            ("6", DigestChoice::OpenBrowser),
+            ("7", DigestChoice::OpenFolder),
+            ("8", DigestChoice::Convert),
+        ] {
+            for (suffix, expected) in [
+                ("", DigestChoice::Cancel),
+                (",1", DigestChoice::Update),
+                (",2", DigestChoice::Cancel),
+                (",3", DigestChoice::CancelAndFreeze),
+            ] {
+                let mut choices = parse_digest_auto_choices(Some(&format!("{value}{suffix}")));
+                assert_eq!(
+                    choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                    action
+                );
+                assert_eq!(
+                    choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                    expected
+                );
+            }
+        }
+    }
 
-        let mut convert_then_update = parse_digest_auto_choices(Some("8"));
-        assert_eq!(
-            choose_digest_action_with_auto_choices(
-                "title",
-                "message",
-                &mut convert_then_update
-            ),
-            DigestChoice::Convert
-        );
-        assert_eq!(
-            choose_digest_action_with_auto_choices(
-                "title",
-                "message",
-                &mut convert_then_update
-            ),
-            DigestChoice::Update
-        );
+    #[test]
+    fn empty_and_invalid_digest_auto_choices_cancel_safely() {
+        for value in ["", " , ", "invalid", "0,9", "7,invalid"] {
+            let mut choices = parse_digest_auto_choices(Some(value));
+            if value.starts_with('7') {
+                assert_eq!(
+                    choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                    DigestChoice::OpenFolder
+                );
+            }
+            assert_eq!(
+                choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                DigestChoice::Cancel
+            );
+        }
     }
 
     #[test]
@@ -1521,6 +1525,29 @@ mod tests {
         assert_eq!(
             Some(resolved),
             canonicalize_existing_path(temp.path().join("AozoraEpub3.jar"))
+        );
+    }
+
+    /// issue #42: 自動変換でも通常の `device` 設定は利用者の
+    /// `enable_half_indent_bracket` を上書きしない。端末を明示した
+    /// (`convert.multi-device`) 変換のときだけ端末由来の設定を適用する。
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn auto_convert_device_settings_only_apply_to_explicit_devices() {
+        use crate::converter::settings::NovelSettings;
+
+        let mut settings = NovelSettings::default();
+        settings.enable_half_indent_bracket = false;
+        super::apply_auto_convert_device_settings(&mut settings, Some(Device::Mobi), false);
+        assert!(
+            !settings.enable_half_indent_bracket,
+            "通常の自動変換で端末設定が利用者設定を上書きした"
+        );
+
+        super::apply_auto_convert_device_settings(&mut settings, Some(Device::Mobi), true);
+        assert!(
+            settings.enable_half_indent_bracket,
+            "端末を明示した Kindle 変換で二分アキが付かない"
         );
     }
 }

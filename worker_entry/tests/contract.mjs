@@ -1689,6 +1689,29 @@ await checkWithAuth("POST /api/admin/object-migration requires auth", async () =
   assert((await errorCode(response)) === "authentication_required", "code must be set");
 });
 
+await check("POST /api/admin/illustration-dedup status reports progress", async () => {
+  const response = await request("/api/admin/illustration-dedup", {
+    method: "POST",
+    ...auth(),
+    body: JSON.stringify({ action: "status" }),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.action === "status", `unexpected action: ${JSON.stringify(body)}`);
+  assert(typeof body.planned === "number", "planned must be a number");
+  assert(typeof body.migrated === "number", "migrated must be a number");
+  assert(Array.isArray(body.failed), "failed must be an array");
+});
+
+await checkWithAuth("POST /api/admin/illustration-dedup requires auth", async () => {
+  const response = await request("/api/admin/illustration-dedup", {
+    method: "POST",
+    body: JSON.stringify({ action: "status" }),
+  });
+  assert(response.status === 401, `status ${response.status}`);
+  assert((await errorCode(response)) === "authentication_required", "code must be set");
+});
+
 if (QUEUE_CHECKS) {
   await check("Convert job for a missing novel reaches a terminal state", async () => {
     assert(convertJobId, "the Convert plan was not accepted");

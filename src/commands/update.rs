@@ -540,25 +540,17 @@ fn repair_empty_titles() {
             records.push((r.id, title, author));
         }
     }
-    let mut fixed = false;
     for (id, title, author) in &records {
-        if let Ok(Some(mut r)) = novels.get_sync((*id).into()) {
-            let mut changed = false;
-            if r.title.is_empty() && !title.is_empty() {
-                r.title = title.clone();
-                changed = true;
+        let _ = novels.update_existing_sync((*id).into(), |record| {
+            if record.title.is_empty() && !title.is_empty() {
+                record.title = title.clone();
             }
-            if r.author.is_empty() && !author.is_empty() {
-                r.author = author.clone();
-                changed = true;
+            if record.author.is_empty() && !author.is_empty() {
+                record.author = author.clone();
             }
-            if changed {
-                let _ = novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(r)]);
-                fixed = true;
-            }
-        }
+            Ok(())
+        });
     }
-    let _ = fixed;
 }
 
 fn extract_title_from_file_title(file_title: &str) -> String {
@@ -571,11 +563,10 @@ fn extract_title_from_file_title(file_title: &str) -> String {
 
 fn record_update_check(id: i64) {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    if let Ok(Some(mut record)) = novels.get_sync(id.into())
-        && mark_update_checked(&mut record, Utc::now())
-    {
-        let _ = novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(record)]);
-    }
+    let _ = novels.update_existing_sync(id.into(), |record| {
+        mark_update_checked(record, Utc::now());
+        Ok(())
+    });
     narou_rs::progress::emit_novel_refresh(id);
 }
 
@@ -626,6 +617,25 @@ fn apply_general_lastup_check_result(
     record.last_check_date = Some(now);
 }
 
+fn record_general_lastup_check(
+    id: i64,
+    novelupdated_at: Option<DateTime<Utc>>,
+    general_lastup: Option<DateTime<Utc>>,
+    length: Option<i64>,
+    is_end: Option<bool>,
+    now: DateTime<Utc>,
+    sync_end: bool,
+) {
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let _ = novels.update_existing_sync(id.into(), |record| {
+        apply_general_lastup_check_result(record, novelupdated_at, general_lastup, length, is_end, now);
+        if sync_end {
+            narou_rs::application::novel_actions::sync_end_tag(record);
+        }
+        Ok(())
+    });
+}
+
 #[derive(Default)]
 struct GeneralLastupNarouOutcome {
     fallback_ids: Vec<i64>,
@@ -635,20 +645,18 @@ struct GeneralLastupNarouOutcome {
 
 fn set_convert_failure(id: i64) {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    if let Ok(Some(mut record)) = novels.get_sync(id.into())
-        && mark_convert_failure(&mut record, true)
-    {
-        let _ = novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(record)]);
-    }
+    let _ = novels.update_existing_sync(id.into(), |record| {
+        mark_convert_failure(record, true);
+        Ok(())
+    });
 }
 
 fn clear_convert_failure(id: i64) {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    if let Ok(Some(mut record)) = novels.get_sync(id.into())
-        && mark_convert_failure(&mut record, false)
-    {
-        let _ = novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(record)]);
-    }
+    let _ = novels.update_existing_sync(id.into(), |record| {
+        mark_convert_failure(record, false);
+        Ok(())
+    });
 }
 
 /// `narou update` の 1 件分の結果行。文言・順序・ストリームは Worker の
@@ -1184,19 +1192,15 @@ async fn update_general_lastup_narou(
             outcome.fallback_ids.extend(fallback_ids);
 
             for (id, entry) in updates {
-                let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-                if let Ok(Some(mut r)) = novels.get_sync(id.into()) {
-                    apply_general_lastup_check_result(
-                        &mut r,
-                        parse_api_datetime(&entry.novelupdated_at),
-                        parse_api_datetime(&entry.general_lastup),
-                        Some(entry.length),
-                        None,
-                        Utc::now(),
-                    );
-                    let _ =
-                        novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(r)]);
-                }
+                record_general_lastup_check(
+                    id,
+                    parse_api_datetime(&entry.novelupdated_at),
+                    parse_api_datetime(&entry.general_lastup),
+                    Some(entry.length),
+                    None,
+                    Utc::now(),
+                    false,
+                );
             }
             progress.inc(chunk.len() as u64);
         }
@@ -1230,19 +1234,15 @@ async fn update_general_lastup_other(
             continue;
         };
 
-        let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-        if let Ok(Some(mut r)) = novels.get_sync(id.into()) {
-            apply_general_lastup_check_result(
-                &mut r,
-                novelupdated_at,
-                general_lastup,
-                length,
-                is_end,
-                Utc::now(),
-            );
-            narou_rs::application::novel_actions::sync_end_tag(&mut r);
-            let _ = novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(r)]);
-        }
+        record_general_lastup_check(
+            id,
+            novelupdated_at,
+            general_lastup,
+            length,
+            is_end,
+            Utc::now(),
+            true,
+        );
 
         progress.inc(1);
     }
@@ -1591,9 +1591,8 @@ async fn process_novel_for_update(
                     return Ok(new_mistook);
                 }
                 UpdateStatus::Canceled => {
-                    // キャンセル行は `print_status_messages` が
-                    // `emit_download_result_lines` 経由で既に出している。
-                    new_mistook += 1;
+                    // キャンセル行は既に表示済み。安全のための見送りは
+                    // 失敗ではなく、Web UI のエラー通知・再変換も不要 (#41)。
                     return Ok(new_mistook);
                 }
             }
@@ -1797,6 +1796,190 @@ mod tests {
             requires_login: false,
             login_session: None,
             extra_fields: Default::default(),
+        }
+    }
+
+    struct DatabaseRestore(Option<narou_rs::db::Database>);
+
+    impl Drop for DatabaseRestore {
+        fn drop(&mut self) {
+            *narou_rs::db::DATABASE.lock() = self.0.take();
+        }
+    }
+
+    fn with_stale_command_database(
+        sqlite: bool,
+        deleted: bool,
+        convert_failure: bool,
+        command: impl FnOnce(),
+    ) -> Option<NovelRecord> {
+        let _global = crate::test_support::global_state_guard();
+        let _legacy = (!sqlite).then(crate::test_support::legacy_yaml_guard);
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("update-metadata-")
+            .tempdir_in(target)
+            .unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+        let _database = DatabaseRestore(narou_rs::db::DATABASE.lock().take());
+        std::fs::create_dir(temp.path().join(".narou")).unwrap();
+        if sqlite {
+            std::fs::write(temp.path().join(".narou/storage-backend"), "sqlite").unwrap();
+        }
+        let mut initial = sample_record(Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap());
+        initial.title.clear();
+        initial.author.clear();
+        initial.file_title = "[author] repaired title".into();
+        initial.convert_failure = convert_failure;
+        let mut database = narou_rs::db::Database::with_root(temp.path().to_path_buf()).unwrap();
+        assert_eq!(database.sqlite_integrity().unwrap().is_some(), sqlite);
+        database.update_records(|mut records| {
+            records.insert(initial.id, initial);
+            Ok((records, ()))
+        }).unwrap();
+        *narou_rs::db::DATABASE.lock() = Some(database);
+
+        // This independent writer leaves the process-global command cache stale.
+        let mut writer = narou_rs::db::Database::with_root(temp.path().to_path_buf()).unwrap();
+        writer.update_records(|mut records| {
+            if deleted {
+                records.remove(&1);
+            } else {
+                let current = records.get_mut(&1).unwrap();
+                current.tags = vec!["concurrent tag".into()];
+                current.extra_fields.insert("concurrent_unknown".into(),
+                    serde_yaml::from_str("nested: [one, two]").unwrap());
+                current.last_check_date = Some(current.last_update + Duration::hours(4));
+            }
+            Ok((records, ()))
+        }).unwrap();
+        assert!(narou_rs::db::with_database(|db| Ok(db.get(1).unwrap().tags.is_empty())).unwrap());
+        command();
+        // Reopen rather than refresh the writer: Inventory's mtime cache may
+        // still match a fast atomic replacement on Windows and hide the result.
+        let reader = narou_rs::db::Database::with_root(temp.path().to_path_buf()).unwrap();
+        reader.get(1).cloned()
+    }
+
+    #[test]
+    fn command_metadata_helpers_preserve_concurrent_fields() {
+        let commands: [fn(i64); 3] = [super::record_update_check,
+            super::set_convert_failure, super::clear_convert_failure];
+        for sqlite in [false, true] {
+            for (index, command) in commands.into_iter().enumerate() {
+                let record = with_stale_command_database(sqlite, false, index == 2, || command(1)).unwrap();
+                assert!(record.tags.iter().any(|tag| tag == "concurrent tag"),
+                    "command {index}, sqlite={sqlite}");
+                assert_eq!(record.extra_fields["concurrent_unknown"]["nested"][1].as_str(), Some("two"));
+                if index == 0 {
+                    assert!(record.last_check_date.unwrap() > record.last_update + Duration::hours(4));
+                } else {
+                    assert_eq!(record.convert_failure, index == 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn command_metadata_helpers_do_not_resurrect_deleted_records() {
+        let commands: [fn(i64); 3] = [super::record_update_check,
+            super::set_convert_failure, super::clear_convert_failure];
+        for sqlite in [false, true] {
+            for (index, command) in commands.into_iter().enumerate() {
+                assert!(with_stale_command_database(sqlite, true, index == 2, || command(1)).is_none(),
+                    "command {index}, sqlite={sqlite}");
+            }
+        }
+    }
+
+    #[test]
+    fn command_title_repair_preserves_concurrent_fields_and_deletion() {
+        for sqlite in [false, true] {
+            let record = with_stale_command_database(sqlite, false, false, super::repair_empty_titles).unwrap();
+            assert_eq!(record.title, "repaired title");
+            assert_eq!(record.tags, vec!["concurrent tag"]);
+            assert!(record.extra_fields.contains_key("concurrent_unknown"));
+            assert!(with_stale_command_database(sqlite, true, false, super::repair_empty_titles).is_none());
+        }
+    }
+
+    #[test]
+    fn command_general_lastup_check_uses_current_row_and_preserves_deletion() {
+        let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
+        for sqlite in [false, true] {
+            for sync_end in [false, true] {
+                let command = || super::record_general_lastup_check(
+                    1, Some(last_update + Duration::hours(2)),
+                    Some(last_update + Duration::hours(3)), Some(123), Some(true),
+                    last_update + Duration::hours(5), sync_end,
+                );
+                let record = with_stale_command_database(sqlite, false, false, command).unwrap();
+                assert!(record.tags.iter().any(|tag| tag == "concurrent tag"));
+                assert!(record.extra_fields.contains_key("concurrent_unknown"));
+                // The authoritative last-check is newer than novelupdated_at;
+                // using the stale row would incorrectly add `modified`.
+                assert!(!record.tags.iter().any(|tag| tag == MODIFIED_TAG));
+                assert_eq!(record.tags.iter().any(|tag| tag == "end"), sync_end);
+                assert_eq!(record.last_check_date, Some(last_update + Duration::hours(5)));
+                assert_eq!(record.general_lastup, Some(last_update + Duration::hours(3)));
+                assert_eq!(record.length, Some(123));
+                assert!(record.end);
+                assert!(with_stale_command_database(sqlite, true, false, command).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn command_title_repair_does_not_overwrite_concurrently_filled_title() {
+        for sqlite in [false, true] {
+            let record = with_stale_command_database(sqlite, false, false, || {
+                let mut writer = narou_rs::db::Database::with_root(std::env::current_dir().unwrap()).unwrap();
+                writer.update_records(|mut records| {
+                    records.get_mut(&1).unwrap().title = "concurrent title".into();
+                    Ok((records, ()))
+                }).unwrap();
+                super::repair_empty_titles();
+            }).unwrap();
+            assert_eq!(record.title, "concurrent title");
+            assert_eq!(record.tags, vec!["concurrent tag"]);
+        }
+    }
+
+    #[test]
+    fn native_existing_update_skips_absent_mutator_and_rolls_back_errors() {
+        for sqlite in [false, true] {
+            assert!(with_stale_command_database(sqlite, true, false, || {
+                let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
+                assert!(!repository.update_existing_sync(1.into(), |_| panic!("absent mutator called")).unwrap());
+            }).is_none());
+            let record = with_stale_command_database(sqlite, false, false, || {
+                let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
+                let result = repository.update_existing_sync(1.into(), |record| {
+                    record.tags.clear();
+                    record.extra_fields.clear();
+                    Err(narou_rs::error::NarouError::Database("abort mutation".into()))
+                });
+                assert!(result.is_err());
+            }).unwrap();
+            assert_eq!(record.tags, vec!["concurrent tag"]);
+            assert!(record.extra_fields.contains_key("concurrent_unknown"));
+        }
+    }
+
+    #[test]
+    fn native_upsert_keeps_full_replacement_and_creation_contract() {
+        for sqlite in [false, true] {
+            for deleted in [false, true] {
+                let record = with_stale_command_database(sqlite, deleted, false, || {
+                    let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
+                    let mut replacement = sample_record(Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap());
+                    replacement.tags = vec!["replacement".into()];
+                    repository.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(replacement)]).unwrap();
+                }).unwrap();
+                assert_eq!(record.tags, vec!["replacement"]);
+                assert!(!record.extra_fields.contains_key("concurrent_unknown"));
+            }
         }
     }
 

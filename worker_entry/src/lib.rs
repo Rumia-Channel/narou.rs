@@ -29,6 +29,7 @@ pub mod http;
 mod isolate_cache;
 mod ledger;
 mod object_migration;
+mod illustration_migration;
 mod rate_limiter;
 mod scheduler;
 mod s3_store;
@@ -122,6 +123,7 @@ async fn route(req: Request, env: Env) -> Result<Response> {
         "/api/authors" | "/api/authors/check" => authors::handle(req, env).await,
         "/api/global_setting" => global_settings::api_global_setting(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,
+        "/api/admin/illustration-dedup" => api_illustration_dedup(req, env).await,
         "/api/admin/content-migration" => content_migration::handle(req, env).await,
         "/api/library_backup" => webui::library_backup::handle(req, env).await,
         "/api/list" => webui::list::handle(req, env).await,
@@ -705,7 +707,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
             settings: &novel_settings,
             has_images: !image_names.is_empty(),
             // バイト源だけが native と異なり、フォント/CSS の規則は共通。
-            extra_assets: narou_rs::epub_lite::dakuten_font_assets(
+            extra_assets: narou_rs::epub_lite::narou_font_assets(
                 narou_rs::epub_lite::text_has_dakuten_marker(&text),
                 narou_rs::epub_lite::epub_font_always(
                     global_map.get("convert.epub-font").and_then(setting_text).as_deref(),
@@ -1176,7 +1178,12 @@ async fn api_novel_illustration(req: Request, env: Env, id: i64, name: &str) -> 
 
     if let Some(s3) = services.s3_illustrations.as_ref() {
         // Worker を経由させない。URL の寿命は短くして、共有を避ける。
-        let presigned = s3.presign_get_url(&key, 240);
+        // dedup プールへの移行前オブジェクトでも配信できるよう、プールに
+        // 実体があるかを確認して無ければ旧 `挿絵/` の URL を返す。
+        let presigned = s3
+            .presign_get_url_prefer_existing(&key, 240)
+            .await
+            .map_err(|error| Error::RustError(error.to_string()))?;
         let url = worker::Url::parse(&presigned)
             .map_err(|error| Error::RustError(error.to_string()))?;
         return Response::redirect(url);
@@ -1654,6 +1661,49 @@ async fn api_object_migration(mut req: Request, env: Env) -> Result<Response> {
     match result {
         Ok(report) => Response::from_json(&report),
         Err(error) => Response::error(format!("object migration failed: {error}"), 500),
+    }
+}
+
+/// POST /api/admin/illustration-dedup — 旧 `挿絵/` 配置の hex 名 S3 オブジェクトを
+/// 全作品共通の content-addressed プールへ移す。
+///
+/// body: `{"action": "status" | "plan" | "copy" | "reset", "limit": 100}`。
+/// `plan` は数えるだけで、`copy` はプールへ移してから旧配置を消す。action が
+/// plan↔copy で変わると進捗をリセットする。1 回の呼び出しは `limit` 件で区切り、
+/// 続きは次回呼び出しで再開する。
+async fn api_illustration_dedup(mut req: Request, env: Env) -> Result<Response> {
+    if req.method() != Method::Post {
+        return Response::error("Method Not Allowed", 405);
+    }
+    if let Some(response) = auth_failure(&req, &env).await {
+        return response;
+    }
+
+    #[derive(serde::Deserialize, Default)]
+    struct Request {
+        action: Option<String>,
+        limit: Option<usize>,
+    }
+    let body: Request = req.json().await.unwrap_or_default();
+    let action = body.action.unwrap_or_else(|| "status".to_string());
+    let db = match env.d1("DB") {
+        Ok(db) => crate::db_handle::DbHandle::primary(std::sync::Arc::new(db)),
+        Err(error) => {
+            console_log!("D1 binding missing: {error}");
+            return Response::error("Service unavailable", 503);
+        }
+    };
+    match illustration_migration::run(
+        &env,
+        &db,
+        &action,
+        body.limit.unwrap_or_else(illustration_migration::default_limit),
+        crate::budget::SubrequestBudget::new(),
+    )
+    .await
+    {
+        Ok(report) => Response::from_json(&report),
+        Err(error) => Response::error(format!("illustration dedup failed: {error}"), 500),
     }
 }
 

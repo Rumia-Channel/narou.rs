@@ -41,6 +41,18 @@ pub(crate) fn replace_all_records(
     conn: &mut Connection,
     records: &BTreeMap<i64, NovelRecord>,
 ) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    replace_records_conn(&tx, records)?;
+    tx.commit().map_err(sqlite_error)
+}
+
+/// Persist an authoritative snapshot inside the caller's write transaction.
+/// The caller must acquire that transaction before reading/mutating records.
+pub(crate) fn replace_records_conn(
+    conn: &Connection,
+    records: &BTreeMap<i64, NovelRecord>,
+) -> Result<()> {
     let existing: Vec<i64> = {
         let mut statement = conn
             .prepare("SELECT id FROM novels ORDER BY id")
@@ -53,9 +65,10 @@ pub(crate) fn replace_all_records(
         ids
     };
 
-    let tx = conn.transaction().map_err(sqlite_error)?;
-    for record in records.values() {
-        upsert_record_conn(&tx, record)?;
+    for (&id, record) in records {
+        let mut normalized = record.clone();
+        normalized.id = id;
+        upsert_record_conn(conn, &normalized)?;
     }
     let stale: Vec<i64> = existing
         .into_iter()
@@ -68,14 +81,10 @@ pub(crate) fn replace_all_records(
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!("DELETE FROM novels WHERE id IN ({placeholders})");
-        tx.execute(&sql, rusqlite::params_from_iter(chunk.iter()))
+        conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))
             .map_err(sqlite_error)?;
     }
-    let max_id = records.keys().copied().max().unwrap_or(0);
-    tx.execute(
-        "UPDATE novel_id_sequence SET next_id = ? WHERE id = 1",
-        [max_id.saturating_add(1)],
-    )
-    .map_err(sqlite_error)?;
-    tx.commit().map_err(sqlite_error)
+    // upsert_record_conn only advances the sequence. Never rewind it to the
+    // maximum published ID: higher IDs may belong to live reservations.
+    Ok(())
 }

@@ -28,10 +28,12 @@ const READ_BUFFER_BYTES: usize = 64 * 1024;
 
 /// curl 経由で取得する。
 ///
-/// 引数・出力解釈は旧 Node 版 `viaCurl` と同じ: `-q -sS -i --compressed
-/// --noproxy * --proto =http,https`、ホスト名なら `--resolve host:port:address`
-/// で接続先を固定し、ヘッダは標準入力から `--header @-` で渡す。1xx は
-/// 読み飛ばし、本文は上限つきで読む。
+/// 引数・出力解釈は旧 Node 版 `viaCurl` を踏襲するが、`--compressed` は使わず
+/// `Accept-Encoding: gzip, deflate` を明示して本文を自前で展開する。Brotli は
+/// 要求も展開もしない (CVE-2026-111497 の C 実装をデコード経路に載せないため。
+/// 応答が `br` だった場合は fail closed する)。ホスト名なら
+/// `--resolve host:port:address` で接続先を固定し、ヘッダは標準入力から
+/// `--header @-` で渡す。1xx は読み飛ばし、本文は上限つきで読む。
 pub async fn via_curl(
     target: &Target,
     headers: &[(String, String)],
@@ -51,7 +53,7 @@ pub async fn via_curl(
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let mut guard = KillOnDrop::new(child);
-    let header_bytes = header_block(headers);
+    let header_bytes = header_block(&request_headers(headers));
 
     // `KillOnDrop` が子プロセスを所有したまま、ヘッダの書き込み・stdout の
     // 読み出し・終了待ちをまとめて期限で囲む。期限切れでこの future が
@@ -89,7 +91,6 @@ fn build_curl_args(target: &Target, options: &CurlOptions) -> Vec<OsString> {
         "-q",
         "-sS",
         "-i",
-        "--compressed",
         "--noproxy",
         "*",
         "--proto",
@@ -238,7 +239,11 @@ fn split_head(buffer: &[u8]) -> Result<TransportResponse, TransportError> {
         if body.len() > MAX_BODY_BYTES {
             return Err(too_large());
         }
-        return Ok(build_response(status, &headers, body, "curl"));
+        let body = decode_content_encoding(body, &headers)?;
+        if body.len() > MAX_BODY_BYTES {
+            return Err(too_large());
+        }
+        return Ok(build_response(status, &headers, &body, "curl"));
     }
 }
 
@@ -324,6 +329,54 @@ fn incomplete() -> TransportError {
 
 fn too_large() -> TransportError {
     TransportError::new(TransportErrorKind::TooLarge)
+}
+
+/// 上流へ送るヘッダ。呼び出し元の `Accept-Encoding` を捨て、gzip / deflate だけを
+/// 要求する。Brotli (`br`) を要求しないことで、libcurl が libbrotli で応答を
+/// 展開する経路を通常は通さない (CVE-2026-111497 は Google Brotli の C 実装
+/// 1.0.3〜1.2.0 が対象)。応答がそれでも `br` だった場合は
+/// [`decode_content_encoding`] が fail closed する。
+fn request_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut result: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"))
+        .cloned()
+        .collect();
+    result.push(("Accept-Encoding".to_string(), "gzip, deflate".to_string()));
+    result
+}
+
+/// 応答本文を `Content-Encoding` に従って展開する。
+///
+/// `br` など未対応の符号化は展開せずエラーにする (fail closed)。展開後の
+/// サイズは [`MAX_BODY_BYTES`] で制限し、圧縮爆弾でヒープを食い潰さない。
+fn decode_content_encoding(
+    body: &[u8],
+    headers: &[(String, String)],
+) -> Result<Vec<u8>, TransportError> {
+    let encoding = header_value(headers, "content-encoding")
+        .map(str::trim)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match encoding.as_str() {
+        "" | "identity" => Ok(body.to_vec()),
+        "gzip" | "x-gzip" => decode_bounded(flate2::read::MultiGzDecoder::new(body)),
+        "deflate" => decode_bounded(flate2::read::ZlibDecoder::new(body)),
+        _ => Err(TransportError::new(TransportErrorKind::Failed)),
+    }
+}
+
+fn decode_bounded<R: std::io::Read>(reader: R) -> Result<Vec<u8>, TransportError> {
+    use std::io::Read;
+    let mut output = Vec::new();
+    reader
+        .take((MAX_BODY_BYTES as u64) + 1)
+        .read_to_end(&mut output)
+        .map_err(|_| TransportError::new(TransportErrorKind::Failed))?;
+    if output.len() > MAX_BODY_BYTES {
+        return Err(too_large());
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -443,22 +496,25 @@ mod tests {
     }
 
     #[test]
-    fn base_arguments_match_the_node_construction() {
+    fn base_arguments_request_only_gzip_and_deflate() {
         let target = target("https://relay.invalid:8443/chapter?x=1", "93.184.216.34");
         let args = arg_strings(&target, &options(Duration::from_secs(30)));
-        let base: Vec<&str> = args[..8].iter().map(String::as_str).collect();
+        let base: Vec<&str> = args[..7].iter().map(String::as_str).collect();
         assert_eq!(
             base,
             [
                 "-q",
                 "-sS",
                 "-i",
-                "--compressed",
                 "--noproxy",
                 "*",
                 "--proto",
                 "=http,https"
             ]
+        );
+        assert!(
+            !args.iter().any(|argument| argument == "--compressed"),
+            "--compressed は libcurl に Brotli を展開させるので使わない"
         );
         assert_eq!(value_after(&args, "--max-filesize"), "16777216");
         let tail: Vec<&str> = args[args.len() - 4..].iter().map(String::as_str).collect();
@@ -487,6 +543,48 @@ mod tests {
             b"X-First: one\r\nx-first: two\r\nCookie: sid=1\r\nX-Label: caf\xc3\xa9\r\n".to_vec()
         );
         assert!(header_block(&[]).is_empty());
+    }
+
+    #[test]
+    fn request_headers_force_gzip_and_deflate_only() {
+        let headers = vec![
+            ("accept-encoding".to_string(), "br".to_string()),
+            ("X-Custom".to_string(), "1".to_string()),
+        ];
+        let forced = request_headers(&headers);
+        let encodings: Vec<&str> = forced
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(encodings, ["gzip, deflate"]);
+        assert!(forced.iter().any(|(name, _)| name == "X-Custom"));
+    }
+
+    #[test]
+    fn compressed_body_is_decoded_and_brotli_is_rejected() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"decoded body").expect("gzip write");
+        let compressed = encoder.finish().expect("gzip finish");
+
+        let gzip = vec![("Content-Encoding".to_string(), "gzip".to_string())];
+        assert_eq!(
+            decode_content_encoding(&compressed, &gzip).unwrap(),
+            b"decoded body"
+        );
+
+        let brotli = vec![("Content-Encoding".to_string(), "br".to_string())];
+        let error = decode_content_encoding(b"encoded", &brotli).unwrap_err();
+        assert_eq!(error.kind, TransportErrorKind::Failed);
+
+        let mut output = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
+        output.extend_from_slice(&compressed);
+        let response = split_head(&output).expect("response");
+        assert_eq!(response.body, b"decoded body");
     }
 
     #[test]

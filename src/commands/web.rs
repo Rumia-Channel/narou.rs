@@ -1052,8 +1052,9 @@ mod tests {
 
     #[test]
     fn ui_token_file_is_stable_and_private() {
-        let root = std::env::current_dir()
-            .unwrap()
+        // Other tests change the process-wide cwd, so anchor the artifact
+        // directory to the manifest instead of the current directory.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test-artifacts")
             .join(format!("web-ui-token-{}", std::process::id()));
