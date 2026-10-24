@@ -1,5 +1,15 @@
 # narou.rs 移植状況
 
+## 現況（v0.4.18 リリース準備）
+
+ユーザーが「OK だ。バージョンを上げよう」と明示指定。公開済みは v0.4.17（2026-10-22）、今回の次版は **v0.4.18** とする。本体/Worker/relay/両 lock/ライセンス表記を 0.4.18 へ更新し、VERSION.md 先頭の未リリース節を v0.4.18 節へ切り替えた（タイトル: データ保全の修正・二分アキの EPUB 反映・S3 挿絵プール）。
+
+今回の主な内容: (1) P1 データ保全（更新時の保存フォルダ移行で旧 EPUB・設定を消さない、SQLite メタデータの競合上書き防止、SQLite↔YAML 往復で編集を失わない、`narou-compat` 切替の権威移譲、`update` の stale 全件 Upsert 除去）。(2) issue #41 追記対応（ダイジェスト自動選択は使い切り後 `2` キャンセル、続行は `1` 明示。キャンセルは失敗件数・終了コードに含めず、設定画面 help に 1〜8 の説明）。(3) issue #42 の追加修正（通常変換/自動変換で `device` が `enable_half_indent_bracket` を上書きしない、`setting.ini` の有無を値一致でなく存在で判定、AozoraEpub3 のテンプレート配置判定によりカスタム CSS を `template/item/style_custom/font.css` または `template/OPS/css_custom/vertical_font.css` へ配置、既存ライブラリは変換時に不足補完、lite エンジンは narou カスタム CSS を常に同梱）。(4) S3 挿絵の全作品共通 content-addressed プール（`illustrations/<base64url(sha256)>.<ext>`、`narou illust s3-dedup` / Worker `POST /api/admin/illustration-dedup`）。
+
+検証: `cargo check --workspace --all-targets`、`cargo test --workspace`（lib 1179 / bin 122 / 各 integration）、`cargo test --lib --features lite` 1179、`cargo test --bins --features lite` 122、lite integration（EPUB に `.vrtl .half_em_space` と span が入る）、`cargo clippy --workspace --all-targets` が成功。手動 E2E で、組み込みエンジンと外部 AozoraEpub3 1.1.1+ コピーの両方について EPUB へ CSS と span が入ること、古い初期化ライブラリで変換時に CSS が補完されることを確認。`cargo-about 0.9.2` で Third-Party-License 2 ファイルを再生成（version 行のみ差分）。
+
+リリース手順: この prepare commit を push して develop CI 成功を確認 → main へ no-ff 統合し annotated `v0.4.18` タグを作成・push → Release workflow と Platform（tag/main, production Worker deploy）を監視 → develop へリリースマージを戻して記録を更新する。公開までは未リリースとして扱い、issue 返信で「公開済み」と書かない。
+
 ## P1 データ保全の修正（2026-10-24、未リリース / `fix-p1-data-preservation`）
 
 release-check 監査と独立レビューで再現したデータ損失系の不具合を修正。修正対象は (1) 更新時の保存フォルダ移行、(2) SQLite メタデータの競合上書き、(3) SQLite↔YAML 往復での編集消失、(4) `narou-compat` 実行中切替での管理状態消失、(5) `update` メタデータ更新の stale 全件 Upsert。
