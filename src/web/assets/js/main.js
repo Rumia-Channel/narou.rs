@@ -559,6 +559,27 @@ function isConsolePinned(consoleEl) {
 function scrollConsoleToBottom(consoleEl) {
   if (!consoleEl) return;
   consoleEl.scrollTop = consoleEl.scrollHeight;
+  consoleScrollTops.set(consoleEl, consoleEl.scrollTop);
+}
+
+var consoleScrollTops = new WeakMap();
+var consoleStickFrames = new WeakMap();
+
+// 一番下に張り付いている間は、レイアウト変更で scrollHeight / clientHeight が
+// 変わっても追従する。次のフレームでもう一度合わせるのは、スクロールバーの
+// 出現・進捗バーの表示でブラウザが確定する位置が 1 フレーム遅れるため。
+function scheduleConsoleStick(consoleEl) {
+  if (!consoleEl) return;
+  syncPinnedConsole(consoleEl);
+  var previous = consoleStickFrames.get(consoleEl);
+  if (previous) cancelAnimationFrame(previous);
+  consoleStickFrames.set(consoleEl, requestAnimationFrame(function() {
+    consoleStickFrames.set(consoleEl, requestAnimationFrame(function() {
+      consoleStickFrames.delete(consoleEl);
+      syncPinnedConsole(consoleEl);
+      consoleScrollTops.set(consoleEl, consoleEl.scrollTop);
+    }));
+  }));
 }
 
 function syncPinnedConsole(consoleEl) {
@@ -570,12 +591,22 @@ function syncPinnedConsole(consoleEl) {
 function bindConsoleAutoScroll(consoleEl) {
   if (!consoleEl) return;
   setConsolePinned(consoleEl, true);
+  consoleScrollTops.set(consoleEl, consoleEl.scrollTop);
   consoleEl.addEventListener('scroll', () => {
+    // 高さやスクロールバーの変化だけで発生したスクロール（scrollTop が
+    // 動いていない）では追従を解除しない。利用者が実際に動かしたときだけ
+    // 一番下かどうかでピン留めを更新する。
+    var previous = consoleScrollTops.get(consoleEl);
+    if (previous === undefined) previous = consoleEl.scrollTop;
+    var moved = Math.abs(consoleEl.scrollTop - previous);
+    consoleScrollTops.set(consoleEl, consoleEl.scrollTop);
+    if (moved < 1) return;
     setConsolePinned(consoleEl, isConsoleNearBottom(consoleEl));
   }, { passive: true });
   if (typeof ResizeObserver !== 'undefined') {
-    const observer = new ResizeObserver(() => syncPinnedConsole(consoleEl));
+    const observer = new ResizeObserver(() => scheduleConsoleStick(consoleEl));
     observer.observe(consoleEl);
+    if (consoleEl.parentElement) observer.observe(consoleEl.parentElement);
   }
 }
 
@@ -600,7 +631,7 @@ function updateProgressHostVisibility(targetConsole) {
   var host = consoleEl?.parentElement?.querySelector('.console-progress-host');
   if (!host) return;
   host.classList.toggle('hide', host.childElementCount === 0);
-  syncPinnedConsole(consoleEl);
+  scheduleConsoleStick(consoleEl);
 }
 
 function progressBarKey(data, targetConsole) {
@@ -880,7 +911,7 @@ function appendConsole(text, targetConsole) {
   }
 
   if (shouldStick) {
-    scrollConsoleToBottom(con);
+    scheduleConsoleStick(con);
   }
 }
 

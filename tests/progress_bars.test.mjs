@@ -83,6 +83,7 @@ function createHarness() {
     },
     getConsoleEl: (targetConsole) => (targetConsole === 'stdout2' ? consoles.stdout2 : consoles.stdout),
     syncPinnedConsole: () => {},
+    scheduleConsoleStick: () => {},
     setConsolePinned: () => {},
     State: { concurrencyEnabled: true },
     refreshQueue: () => Promise.resolve(),
