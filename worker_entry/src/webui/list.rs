@@ -97,6 +97,10 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
     } else {
         crate::hidden::load_from_env(env).await.ok()
     };
+    let exclude_ids: Vec<i64> = crate::virtual_novels::load_from_env(env)
+        .await
+        .map(|members| members.all_member_ids().into_iter().collect())
+        .unwrap_or_default();
     let services = match super::metadata::MetadataServices::new(env) {
         Ok(services) => services,
         Err(error) => {
@@ -114,7 +118,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
             sort_order,
             hidden,
             include_hidden,
-            exclude_ids: Vec::new(),
+            exclude_ids,
         })
         .await
     {
