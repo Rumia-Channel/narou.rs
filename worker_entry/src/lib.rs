@@ -36,6 +36,7 @@ mod scheduler;
 mod s3_store;
 mod storage_probe;
 mod site_rate_limiter;
+mod transfer;
 use subtle::ConstantTimeEq;
 use webui::{json_error, query_param};
 
@@ -122,6 +123,8 @@ async fn route(req: Request, env: Env) -> Result<Response> {
         // 登録経路 (native `src/web/mod.rs` と同じルート構成)。
         "/api/jobs" => api_jobs(req, env).await,
         "/api/authors" | "/api/authors/check" => authors::handle(req, env).await,
+        // 可搬アーカイブ (native `src/web/transfer.rs` の `/api/transfer/*`)。
+        "/api/transfer/export" | "/api/transfer/import" => transfer::handle(req, env).await,
         "/api/hidden" => hidden::handle(req, env).await,
         "/api/global_setting" => global_settings::api_global_setting(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,
