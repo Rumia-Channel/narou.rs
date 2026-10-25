@@ -1,6 +1,6 @@
 [package]
 name = "narou_worker"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 publish = false
 # The Worker always enables `narou_rs/worker-runtime`, which implies `lite` and
@@ -35,3 +35,4 @@ subtle = "2.6"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 worker = { version = "0.8", features = ["d1", "queue"] }
+

@@ -914,7 +914,7 @@ async fn report_missing_illustrations(
 }
 
 /// D1 のローカルスコープ設定を読む (fs が無いので `app_state` 経由)。
-async fn load_local_settings_map(env: &Env) -> HashMap<String, serde_yaml::Value> {
+pub(crate) async fn load_local_settings_map(env: &Env) -> HashMap<String, serde_yaml::Value> {
     let Ok(db) = env.d1("DB") else {
         return HashMap::new();
     };
@@ -1007,7 +1007,7 @@ async fn load_novel_settings(
 /// `convert.filename-to-ncode` / `ebook-filename-length-limit`
 /// (`OutputNamingEnv::from_local_map`)。fs が無いので設定は D1 の
 /// `app_state` から読む (呼び出し側が `load_novel_settings` で組む)。
-fn epub_download_filename(
+pub(crate) fn epub_download_filename(
     record: &narou_rs::db::NovelRecord,
     settings: &narou_rs::converter::settings::NovelSettings,
     local_map: &HashMap<String, serde_yaml::Value>,

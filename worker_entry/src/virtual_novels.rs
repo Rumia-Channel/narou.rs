@@ -6,9 +6,10 @@
 
 use chrono::Utc;
 use narou_rs::db::NovelRecord;
+use narou_rs::downloader::types::TocFile;
 use narou_rs::downloader::util::{load_length_limit, sanitize_filename_with_limit};
 use narou_rs::error::{NarouError, Result};
-use narou_rs::platform::{NovelId, NovelMutation};
+use narou_rs::platform::{NovelId, NovelMutation, NovelObjectKeys};
 use narou_rs::virtual_novel::{self as core, VirtualNovelMembers};
 use serde::Deserialize;
 use serde_json::json;
@@ -122,8 +123,19 @@ struct VirtualRequest {
     members: Vec<serde_json::Value>,
 }
 
-async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRecord> {
-    let title = body
+/// メンバーの目次から話数を数える (`general_all_no` が未設定の古いレコード用)。
+async fn count_sections(runtime: &WorkerRuntime, record: &NovelRecord) -> Result<i64> {
+    let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+        .map_err(|error| NarouError::Platform(error.to_string()))?;
+    let Some(bytes) = runtime.objects().read_small(&keys.toc()).await? else {
+        return Ok(0);
+    };
+    let toc: TocFile = serde_yaml::from_slice(&bytes)
+        .map_err(|error| NarouError::Platform(format!("toc.yaml: {error}")))?;
+    Ok(toc.subtitles.len() as i64)
+}
+
+async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRecord> {    let title = body
         .title
         .clone()
         .filter(|title| !title.trim().is_empty())
@@ -137,6 +149,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
     let all = read(runtime.write_db()).await?;
     let mut member_tags: Vec<String> = Vec::new();
     let mut latest_update: Option<chrono::DateTime<Utc>> = None;
+    let mut general_all_no = 0i64;
     for member in &members {
         let record = runtime
             .novels
@@ -164,6 +177,11 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         {
             latest_update = Some(updated);
         }
+        let count = match record.general_all_no {
+            Some(count) if count > 0 => count,
+            _ => count_sections(runtime, &record).await.unwrap_or(0),
+        };
+        general_all_no += count;
     }
     if all
         .groups
@@ -214,7 +232,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         tags,
         ncode: Some(ncode),
         domain: body.domain.clone(),
-        general_all_no: None,
+        general_all_no: (general_all_no > 0).then_some(general_all_no),
         length: None,
         suspend: false,
         is_narou: false,
@@ -342,7 +360,9 @@ pub async fn download_epub(req: Request, env: Env, id: i64) -> worker::Result<Re
         return Response::error(format!("EPUB write failed: {error}"), 500);
     }
     let bytes = sink.take();
-    let filename = format!("{}.epub", record.file_title);
+    let local_map = crate::load_local_settings_map(&env).await;
+    let naming_settings = narou_rs::converter::settings::NovelSettings::default();
+    let filename = crate::epub_download_filename(&record, &naming_settings, &local_map);
     let headers = worker::Headers::new();
     headers.set("Content-Type", "application/epub+zip")?;
     headers.set(
@@ -421,6 +441,18 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
                     .await
                     .map_err(|error| worker::Error::RustError(error.to_string()))?
                 {
+                    let mut member_titles = Vec::with_capacity(member_ids.len());
+                    for member_id in member_ids {
+                        member_titles.push(
+                            runtime
+                                .novels
+                                .get(NovelId(*member_id))
+                                .await
+                                .map_err(|error| worker::Error::RustError(error.to_string()))?
+                                .map(|member| member.title)
+                                .unwrap_or_default(),
+                        );
+                    }
                     novels.push(json!({
                         "id": record.id,
                         "ncode": core::ncode(*id),
@@ -430,6 +462,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
                         "domain": record.domain,
                         "tags": record.tags,
                         "members": member_ids,
+                        "member_titles": member_titles,
                     }));
                 }
             }

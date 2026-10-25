@@ -52,6 +52,17 @@ pub async fn api_virtual_list() -> Json<serde_json::Value> {
                 .iter()
                 .filter_map(|(id, members)| {
                     let record = repository.get_sync(NovelId(*id)).ok().flatten()?;
+                    let member_titles = members
+                        .iter()
+                        .map(|member| {
+                            repository
+                                .get_sync(NovelId(*member))
+                                .ok()
+                                .flatten()
+                                .map(|record| record.title)
+                                .unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>();
                     Some(serde_json::json!({
                         "id": record.id,
                         "ncode": core::ncode(*id),
@@ -61,6 +72,7 @@ pub async fn api_virtual_list() -> Json<serde_json::Value> {
                         "domain": record.domain,
                         "tags": record.tags,
                         "members": members,
+                        "member_titles": member_titles,
                     }))
                 })
                 .collect::<Vec<_>>();

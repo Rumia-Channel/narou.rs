@@ -766,6 +766,26 @@
       </div>
     </div>
 
+    <!-- Virtual Novel Order Modal -->
+    <div class="modal-overlay hide" id="virtual-order-modal">
+      <div class="modal-dialog modal-dialog-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="virtual-order-close" type="button">&times;</button>
+            <h4 class="modal-title">バーチャル小説の登録順</h4>
+          </div>
+          <div class="modal-body">
+            <p class="hidden-help" id="virtual-order-help">メンバーを上から順に EPUB へ結合します。↑ / ↓ ボタンで入れ替えてください。</p>
+            <div id="virtual-order-list" class="hidden-list"></div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="virtual-order-cancel" type="button">キャンセル</button>
+            <button class="btn btn-primary" id="virtual-order-save" type="button">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Notifications (fadeout alerts) -->
     <div id="notification-container" class="notification-container"></div>
 

@@ -353,29 +353,7 @@ export function bindActions() {
         (item) => item.ncode === target || String(item.id) === target,
       );
       if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
-      const order = window.prompt(
-        `現在の順序 (${novel.members.length}件) をカンマ区切りで入力\n例: 2,1,3`,
-        novel.members.map((_, index) => index + 1).join(','),
-      );
-      if (!order) return;
-      const members = order
-        .split(',')
-        .map((part) => Number.parseInt(part.trim(), 10))
-        .map((position) => novel.members[position - 1]);
-      if (members.some((member) => member == null)) {
-        throw new Error('順序は現在の位置番号で全件指定してください');
-      }
-      const saved = await fetch(`/api/virtual_novels/${novel.id}/order`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ members }),
-      });
-      const savedResult = await saved.json();
-      if (!saved.ok || !savedResult.success) {
-        throw new Error(savedResult.message || '並べ替えに失敗しました');
-      }
-      showNotification('順序を変更しました', 'info');
-      await refreshList();
+      openVirtualOrderModal(novel);
     } catch (error) {
       showNotification(error.message || '並べ替えに失敗しました', 'error');
     }
@@ -438,6 +416,9 @@ export function bindActions() {
     }
   });
   on('hidden-close', () => closeModal(document.getElementById('hidden-modal')));
+  on('virtual-order-close', () => closeModal(document.getElementById('virtual-order-modal')));
+  on('virtual-order-cancel', () => closeModal(document.getElementById('virtual-order-modal')));
+  on('virtual-order-save', saveVirtualOrder);
   on('hidden-cancel', () => closeModal(document.getElementById('hidden-modal')));
   on('hidden-novel-add', () => addHiddenValue('novels', 'hidden-novel-input'));
   on('hidden-tag-add', () => addHiddenValue('tags', 'hidden-tag-input'));
@@ -1769,8 +1750,100 @@ async function openNotepad() {
 
 /* ===== About ===== */
 
-async function openHiddenSettings() {
-  const modal = document.getElementById('hidden-modal');
+let virtualOrderState = null;
+
+function openVirtualOrderModal(novel) {
+  virtualOrderState = {
+    id: novel.id,
+    ncode: novel.ncode,
+    members: novel.members.slice(),
+    titles: (novel.member_titles || []).slice(),
+  };
+  const modal = document.getElementById('virtual-order-modal');
+  if (!modal) return;
+  modal.classList.remove('hide');
+  renderVirtualOrderList();
+}
+
+function renderVirtualOrderList() {
+  const list = document.getElementById('virtual-order-list');
+  const state = virtualOrderState;
+  if (!list || !state) return;
+  list.replaceChildren();
+  state.members.forEach((memberId, index) => {
+    const row = document.createElement('div');
+    row.className = 'hidden-item';
+    const label = document.createElement('span');
+    label.className = 'virtual-order-title';
+    const title = state.titles[index] || `ID:${memberId}`;
+    label.textContent = `${index + 1}. ${title} (ID:${memberId})`;
+    row.appendChild(label);
+
+    const up = document.createElement('button');
+    up.type = 'button';
+    up.className = 'btn btn-default btn-sm';
+    up.textContent = '↑';
+    up.title = '上へ';
+    up.disabled = index === 0;
+    up.addEventListener('click', () => {
+      if (index === 0) return;
+      [state.members[index - 1], state.members[index]] = [
+        state.members[index],
+        state.members[index - 1],
+      ];
+      [state.titles[index - 1], state.titles[index]] = [
+        state.titles[index],
+        state.titles[index - 1],
+      ];
+      renderVirtualOrderList();
+    });
+    row.appendChild(up);
+
+    const down = document.createElement('button');
+    down.type = 'button';
+    down.className = 'btn btn-default btn-sm';
+    down.textContent = '↓';
+    down.title = '下へ';
+    down.disabled = index === state.members.length - 1;
+    down.addEventListener('click', () => {
+      if (index === state.members.length - 1) return;
+      [state.members[index + 1], state.members[index]] = [
+        state.members[index],
+        state.members[index + 1],
+      ];
+      [state.titles[index + 1], state.titles[index]] = [
+        state.titles[index],
+        state.titles[index + 1],
+      ];
+      renderVirtualOrderList();
+    });
+    row.appendChild(down);
+    list.appendChild(row);
+  });
+}
+
+async function saveVirtualOrder() {
+  const state = virtualOrderState;
+  if (!state) return;
+  try {
+    const response = await fetch(`/api/virtual_novels/${state.id}/order`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ members: state.members }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || '並べ替えに失敗しました');
+    }
+    closeModal(document.getElementById('virtual-order-modal'));
+    showNotification(`順序を変更しました: ${state.ncode}`, 'info');
+    await refreshList();
+  } catch (error) {
+    showNotification(error.message || '並べ替えに失敗しました', 'error');
+  }
+}
+
+async function openHiddenSettings() {  const modal = document.getElementById('hidden-modal');
   if (!modal) return;
   modal.classList.remove('hide');
   await refreshHiddenSettings();
