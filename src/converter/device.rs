@@ -853,7 +853,7 @@ impl OutputManager {
             author: context.author.clone(),
             vertical: !self.yokogaki,
             cover_from_first_image: input_txt.parent().and_then(cover_image_path).is_some(),
-            assets_dir: crate::compat::aozora_assets_dir(),
+            assets_dir: crate::compat::lite_preset_dir(),
             kindle: matches!(self.device, Device::Mobi),
             extra_assets: super::dakuten_font::lite_font_assets(self.use_dakuten_font)?,
             rotate_image: rotate_image_override(),

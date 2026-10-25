@@ -118,6 +118,12 @@ fn apply_narou_preset_flags(config: &mut AozoraConfig) {
 pub fn config_for(assets_dir: Option<&Path>) -> AozoraConfig {
     let mut config = match assets_dir.filter(|dir| dir.is_dir()) {
         Some(dir) => {
+            // 組み込みエンジン用の `preset/` は AozoraEpub3.ini だけを持ち、
+            // chuki/外字は同梱資産を使う。外部 AozoraEpub3 のディレクトリとは
+            // 読み込み規則を分ける。
+            if dir.file_name().and_then(|name| name.to_str()) == Some("preset") {
+                return config_for_preset_dir(dir);
+            }
             let ini = dir.join("AozoraEpub3.ini");
             let preset = ini.is_file().then_some(ini.as_path());
             match AozoraConfig::load_from_dirs(&[dir], preset) {
@@ -135,6 +141,34 @@ pub fn config_for(assets_dir: Option<&Path>) -> AozoraConfig {
     };
     // インストール先の `chuki_tag.txt` に注入済みの行と同じものが入る。
     config.load_tag_text(embedded::CUSTOM_CHUKI_TAG);
+    config
+}
+
+/// 組み込みエンジンの `preset/AozoraEpub3.ini` を読み、注記表・外字・
+/// カスタム注記は同梱資産で補う。
+///
+/// 外部 AozoraEpub3 の資産ディレクトリをそのまま使うと、`aozoraepub3dir`
+/// の INI が組み込みの挙動を変えてしまい、配布物の `preset/AozoraEpub3.ini`
+/// を編集しても反映されない (issue #45)。組み込みでは `preset/` の INI を
+/// 唯一の設定ファイルとして扱う。
+fn config_for_preset_dir(dir: &Path) -> AozoraConfig {
+    let ini_path = dir.join("AozoraEpub3.ini");
+    let mut config = match std::fs::read_to_string(&ini_path)
+        .ok()
+        .and_then(|text| aozora_epub3_lite::IniSettings::parse(&text).ok())
+    {
+        Some(ini) => AozoraConfig::from_ini(ini),
+        None => embedded_config(),
+    };
+    config.load_tag_text(embedded::CHUKI_TAG);
+    config.load_suffix_text(embedded::CHUKI_TAG_SUF);
+    config.load_utf_text(embedded::CHUKI_UTF);
+    config.load_ivs_text(embedded::CHUKI_IVS);
+    config.load_alt_text(embedded::CHUKI_ALT);
+    config.load_latin_text(embedded::CHUKI_LATIN);
+    let custom = std::fs::read_to_string(dir.join("custom_chuki_tag.txt"))
+        .unwrap_or_else(|_| embedded::CUSTOM_CHUKI_TAG.to_string());
+    config.load_tag_text(&custom);
     config
 }
 
@@ -1347,6 +1381,25 @@ mod tests {
         let embedded = config_for(None);
         assert!(embedded.inline_notes.contains_key("傍点"));
         assert!(embedded.block_inline_tags.contains_key("一字下げ"));
+    }
+
+    /// issue #45: 組み込みエンジンは配布物の `preset/AozoraEpub3.ini` を読み、
+    /// 外部 AozoraEpub3 の `aozoraepub3dir` にある INI とは独立して設定できる。
+    #[test]
+    fn lite_preset_directory_honors_its_own_ini_without_external_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("AozoraEpub3.ini"),
+            "TocPage=0\nLineHeight=2.4\n",
+        )
+        .unwrap();
+        let config = config_for(Some(dir.path()));
+        assert!(!config.toc_page, "preset の TocPage=0 が無視されている");
+        let style = StyleSettings::from_ini(&config.ini);
+        assert_eq!(style.line_height, "2.4");
+        // chuki/外字/カスタム注記は同梱資産から補完される。
+        assert!(config.block_inline_tags.contains_key("一字下げ"));
+        assert!(config.inline_notes.contains_key("傍点"));
     }
 
     /// 1 エントリずつ書き出す経路 (Worker の `download.epub` と同じ手順) が
