@@ -1,6 +1,6 @@
 [package]
 name = "narou_relay"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 license = "BSD-2-Clause"
 description = "narou.rs の外部取得リレー (Cloudflare 保護サイト向け)"

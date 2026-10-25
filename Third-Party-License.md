@@ -133,7 +133,7 @@ dependency).
 | License | Used by |
 | --- | ---: |
 | MIT License | 336 |
-| Unicode License v3 | 19 |
+| Unicode License v3 | 20 |
 | Apache License 2.0 | 11 |
 | BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License | 8 |
 | BSD 2-Clause &quot;Simplified&quot; License | 3 |
@@ -802,7 +802,7 @@ Used by:
 ### Apache License 2.0 (`Apache-2.0`)
 
 Used by:
-- similar 3.2.0
+- similar 3.2.1
 
 ```text
                               Apache License
@@ -1307,7 +1307,7 @@ limitations under the License.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_rs 0.5.0
+- narou_rs 0.5.1
 
 ```text
 BSD 2-Clause License
@@ -1340,8 +1340,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_relay 0.5.0
-- narou_transfer_wasm 0.5.0
+- narou_relay 0.5.1
+- narou_transfer_wasm 0.5.1
 
 ```text
 Copyright (c) <year> <owner> 
@@ -1577,7 +1577,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 - aozora_epub3_lite 0.1.6
-- narou_worker 0.5.0
+- narou_worker 0.5.1
 
 ```text
 GNU GENERAL PUBLIC LICENSE
@@ -2106,9 +2106,9 @@ DEALINGS IN THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- cc 1.8.0
+- cc 1.10.0
 - cfg-if 1.0.5
-- find-msvc-tools 0.1.14
+- find-msvc-tools 0.1.15
 - js-sys 0.3.106
 - openssl-probe 0.1.6
 - openssl-probe 0.2.1
@@ -2156,7 +2156,7 @@ DEALINGS IN THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- libz-sys 1.1.29
+- libz-sys 1.1.30
 
 ```text
 Copyright (c) 2014 Alex Crichton
@@ -2577,7 +2577,7 @@ DEALINGS IN THE SOFTWARE.
 Used by:
 - fs2 0.4.3
 - heck 0.5.0
-- unicode-normalization 0.1.25
+- unicode-normalization 0.1.26
 - unicode-width 0.2.2
 
 ```text
@@ -2702,7 +2702,7 @@ DEALINGS IN THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- schannel 0.1.29
+- schannel 0.1.30
 
 ```text
 Copyright (c) 2015 steffengy
@@ -3144,7 +3144,7 @@ DEALINGS IN THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- equivalent 1.0.2
+- equivalent 1.0.3
 
 ```text
 Copyright (c) 2016--2023
@@ -3276,7 +3276,7 @@ THE SOFTWARE.
 
 Used by:
 - sha1 0.11.0
-- sha2 0.11.0
+- sha2 0.11.1
 
 ```text
 Copyright (c) 2016-2026 The RustCrypto Project Developers
@@ -3904,7 +3904,7 @@ DEALINGS IN THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- smallvec 1.16.3
+- smallvec 1.16.4
 
 ```text
 Copyright (c) 2018 The Servo Project Developers
@@ -4678,7 +4678,7 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- litrs 1.0.0
+- litrs 1.0.1
 
 ```text
 Copyright (c) 2020 Project Developers
@@ -4984,7 +4984,7 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- inout 0.2.2
+- inout 0.2.5
 
 ```text
 Copyright (c) 2022-2025 The RustCrypto Project Developers
@@ -5179,7 +5179,7 @@ THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- deranged 0.5.8
+- deranged 0.5.9
 
 ```text
 Copyright (c) 2024 Jacob Pratt et al.
@@ -5242,7 +5242,7 @@ DEALINGS IN THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- ctutils 0.4.3
+- ctutils 0.4.5
 
 ```text
 Copyright (c) 2025-2026 The RustCrypto Project Developers
@@ -5407,7 +5407,7 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- libc 0.2.190
+- libc 0.2.191
 
 ```text
 Copyright (c) The Rust Project Developers
@@ -5561,7 +5561,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ### MIT License (`MIT`)
 
 Used by:
-- zerocopy 0.8.62
+- zerocopy 0.8.63
 
 ```text
 Copyright 2023 The Fuchsia Authors
@@ -5658,7 +5658,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 ### MIT License (`MIT`)
 
 Used by:
-- psl 2.1.241
+- psl 2.1.245
 - publicsuffix 2.3.0
 
 ```text
@@ -5719,7 +5719,7 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- crc32fast 1.5.2
+- crc32fast 1.5.3
 
 ```text
 MIT License
@@ -6125,7 +6125,7 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- ua_generator 0.5.86
+- ua_generator 0.5.87
 - block2 0.6.2
 - brotli-decompressor 6.0.1
 - chrono-tz-build 0.5.0
@@ -6175,7 +6175,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Used by:
 - tokio-util 0.7.20
-- tokio 1.53.2
+- tokio 1.54.1
 
 ```text
 MIT License
@@ -6438,10 +6438,10 @@ Used by:
 - lazy_static 1.5.1
 - linux-raw-sys 0.12.1
 - once_cell 1.21.4
-- pest 2.9.3
-- pest_derive 2.9.3
-- pest_generator 2.9.3
-- pest_meta 2.9.3
+- pest 2.9.4
+- pest_derive 2.9.4
+- pest_generator 2.9.4
+- pest_meta 2.9.4
 - pin-project-internal 1.1.13
 - pin-project-lite 0.2.17
 - pin-project 1.1.13
@@ -6458,11 +6458,11 @@ Used by:
 - serde_path_to_error 0.1.20
 - serde_yaml 0.9.34+deprecated
 - syn 2.0.119
-- syn 3.0.8
+- syn 3.0.9
 - thiserror-impl 2.0.21
 - thiserror 2.0.21
-- typed-path 0.12.3
-- unicode-ident 1.0.26
+- typed-path 0.12.4
+- unicode-ident 1.0.27
 - unsafe-libyaml 0.2.11
 - wasm-streams 0.7.0
 - zmij 1.0.23
@@ -7057,9 +7057,9 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- async-compression 0.4.50
-- compression-codecs 0.4.45
-- compression-core 0.4.33
+- async-compression 0.4.51
+- compression-codecs 0.4.46
+- compression-core 0.4.34
 
 ```text
 The MIT License (MIT)
@@ -7187,7 +7187,7 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- open 5.4.4
+- open 5.4.5
 
 ```text
 The MIT License (MIT)
@@ -7371,7 +7371,8 @@ DEALINGS IN THE SOFTWARE.
 ### Unicode License v3 (`Unicode-3.0`)
 
 Used by:
-- unicode-ident 1.0.26
+- unicode-ident 1.0.27
+- unicode-normalization 0.1.26
 
 ```text
 UNICODE LICENSE V3
@@ -7419,24 +7420,24 @@ authorization of the copyright holder.
 ### Unicode License v3 (`Unicode-3.0`)
 
 Used by:
-- icu_collections 2.3.0
-- icu_locale_core 2.3.0
-- icu_normalizer 2.3.0
-- icu_normalizer_data 2.3.0
-- icu_properties 2.3.0
-- icu_properties_data 2.3.0
-- icu_provider 2.3.1
+- icu_collections 2.4.0
+- icu_locale_core 2.4.0
+- icu_normalizer 2.4.0
+- icu_normalizer_data 2.4.0
+- icu_properties 2.4.0
+- icu_properties_data 2.4.0
+- icu_provider 2.4.0
 - litemap 0.8.3
 - potential_utf 0.1.6
-- tinystr 0.8.4
+- tinystr 0.8.5
 - writeable 0.6.4
 - yoke-derive 0.8.4
-- yoke 0.8.3
+- yoke 0.8.4
 - zerofrom-derive 0.1.8
 - zerofrom 0.1.8
 - zerotrie 0.2.5
-- zerovec-derive 0.11.6
-- zerovec 0.11.8
+- zerovec-derive 0.11.7
+- zerovec 0.11.9
 
 ```text
 UNICODE LICENSE V3

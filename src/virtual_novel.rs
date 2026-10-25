@@ -121,9 +121,33 @@ fn validate_members(members: &[i64]) -> Result<(), String> {
     Ok(())
 }
 
+/// Web UI が送る数値/数値文字列のメンバー ID を正規化する。
+pub fn parse_member_ids(values: &[serde_json::Value]) -> Result<Vec<i64>, String> {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<i64>().ok()))
+                .ok_or_else(|| "メンバー ID は整数で指定してください".to_string())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_ids_accept_numbers_and_numeric_strings() {
+        let values = vec![
+            serde_json::json!(3),
+            serde_json::json!("4"),
+            serde_json::json!(5),
+        ];
+        assert_eq!(parse_member_ids(&values).unwrap(), vec![3, 4, 5]);
+        assert!(parse_member_ids(&[serde_json::json!("x")]).is_err());
+    }
 
     #[test]
     fn membership_roundtrips_as_a_bare_yaml_map() {

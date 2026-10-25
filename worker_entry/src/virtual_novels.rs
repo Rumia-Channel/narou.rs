@@ -119,7 +119,7 @@ struct VirtualRequest {
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
-    members: Vec<i64>,
+    members: Vec<serde_json::Value>,
 }
 
 async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRecord> {
@@ -128,13 +128,14 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         .clone()
         .filter(|title| !title.trim().is_empty())
         .ok_or_else(|| NarouError::InvalidTarget("タイトルを指定してください".into()))?;
-    if body.members.is_empty() {
+    let members = core::parse_member_ids(&body.members).map_err(NarouError::InvalidTarget)?;
+    if members.is_empty() {
         return Err(NarouError::InvalidTarget(
             "メンバーを指定してください".into(),
         ));
     }
     let all = read(runtime.write_db()).await?;
-    for member in &body.members {
+    for member in &members {
         let record = runtime
             .novels
             .get(NovelId(*member))
@@ -153,7 +154,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
     if all
         .groups
         .values()
-        .any(|members| members.iter().any(|member| body.members.contains(member)))
+        .any(|existing| existing.iter().any(|member| members.contains(member)))
     {
         return Err(NarouError::InvalidTarget(
             "既に別の仮想小説に属している作品があります".into(),
@@ -216,7 +217,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         runtime.write_db(),
         &{
             let mut updated = all;
-            updated.insert(id, body.members.clone()).map_err(|message| {
+            updated.insert(id, members.clone()).map_err(|message| {
                 NarouError::InvalidTarget(message)
             })?;
             updated
@@ -339,7 +340,7 @@ pub async fn download_epub(req: Request, env: Env, id: i64) -> worker::Result<Re
 
 #[derive(Deserialize)]
 struct OrderBody {
-    members: Vec<i64>,
+    members: Vec<serde_json::Value>,
 }
 
 pub async fn handle_order(mut req: Request, env: Env, id: i64) -> worker::Result<Response> {
@@ -356,7 +357,12 @@ pub async fn handle_order(mut req: Request, env: Env, id: i64) -> worker::Result
             .with_status(400));
         }
     };
-    match reorder(&runtime, id, body.members).await {
+    let members = match core::parse_member_ids(&body.members) {
+        Ok(members) => members,
+        Err(message) => return Ok(Response::from_json(&json!({"success":false,"message":message}))?
+            .with_status(400)),
+    };
+    match reorder(&runtime, id, members).await {
         Ok(()) => Ok(Response::from_json(&json!({"success":true}))?),
         Err(error) => Ok(Response::from_json(
             &json!({"success":false,"message":error.to_string()}),
@@ -437,7 +443,16 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
                         )?
                         .with_status(400));
                     };
-                    reorder(&runtime, id, body.members)
+                    let members = match core::parse_member_ids(&body.members) {
+                        Ok(members) => members,
+                        Err(message) => {
+                            return Ok(Response::from_json(
+                                &json!({"success":false,"message":message}),
+                            )?
+                            .with_status(400));
+                        }
+                    };
+                    reorder(&runtime, id, members)
                         .await
                         .map(|()| json!({"success":true}))
                 }

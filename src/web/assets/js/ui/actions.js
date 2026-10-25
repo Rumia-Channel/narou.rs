@@ -323,7 +323,7 @@ export function bindActions() {
       const response = await fetch('/api/virtual_novels', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, author, sitename, tags: [], members: ids }),
+        body: JSON.stringify({ title, author, sitename, tags: [], members: ids.map(Number) }),
       });
       const result = await response.json();
       if (!response.ok || !result.success) {

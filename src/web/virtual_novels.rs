@@ -28,12 +28,12 @@ pub struct CreateVirtualRequest {
     pub domain: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    pub members: Vec<i64>,
+    pub members: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ReorderVirtualRequest {
-    pub members: Vec<i64>,
+    pub members: Vec<serde_json::Value>,
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
@@ -74,13 +74,17 @@ pub async fn api_virtual_create(
     State(_state): State<AppState>,
     Json(body): Json<CreateVirtualRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let members = match core::parse_member_ids(&body.members) {
+        Ok(members) => members,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
     match virtual_novel::create(NewVirtualNovel {
         title: body.title,
         author: body.author,
         sitename: body.sitename,
         domain: body.domain,
         tags: body.tags,
-        members: body.members,
+        members,
     }) {
         Ok(record) => (
             StatusCode::OK,
@@ -100,7 +104,11 @@ pub async fn api_virtual_order(
     Path(id): Path<i64>,
     Json(body): Json<ReorderVirtualRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match virtual_novel::reorder_by_ids(id, body.members) {
+    let members = match core::parse_member_ids(&body.members) {
+        Ok(members) => members,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+    match virtual_novel::reorder_by_ids(id, members) {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"success": true})),
