@@ -362,7 +362,11 @@ impl LibraryService {
                 general_lastup: record.general_lastup,
                 last_check_date: record.last_check_date,
                 new_arrivals_date: record.new_arrivals_date,
-                tags: record.tags,
+                tags: record
+                    .tags
+                    .into_iter()
+                    .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
+                    .collect(),
                 new_arrivals: is_new,
                 frozen: is_frozen,
                 suspend: record.suspend,

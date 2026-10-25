@@ -47,6 +47,8 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
         ));
     }
     let repository = NativeNovelRepository::new();
+    let mut member_tags: Vec<String> = Vec::new();
+    let mut latest_update: Option<chrono::DateTime<Utc>> = None;
     for member in &input.members {
         let record = repository
             .get_sync(NovelId(*member))?
@@ -59,6 +61,18 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
             return Err(NarouError::InvalidTarget(format!(
                 "仮想小説をメンバーにはできません: {member}"
             )));
+        }
+        member_tags.extend(
+            record
+                .tags
+                .iter()
+                .filter(|tag| !virtual_novel::is_internal_tag(tag))
+                .cloned(),
+        );
+        if let Some(updated) = record.general_lastup
+            && latest_update.is_none_or(|current| updated > current)
+        {
+            latest_update = Some(updated);
         }
     }
     if crate::native::virtual_novel::load()?
@@ -80,6 +94,7 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
         .iter()
         .map(|tag| tag.trim().to_string())
         .filter(|tag| !tag.is_empty())
+        .chain(member_tags)
         .collect();
     tags.push(virtual_tag);
     tags.sort();
@@ -113,7 +128,7 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
         use_subdirectory: NativeDownloaderSettings.download_use_subdirectory(),
         general_firstup: None,
         novelupdated_at: None,
-        general_lastup: None,
+        general_lastup: latest_update,
         last_mail_date: None,
         tags,
         ncode: Some(ncode.clone()),

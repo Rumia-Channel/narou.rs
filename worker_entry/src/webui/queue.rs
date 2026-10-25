@@ -140,7 +140,11 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         select_tag_names(&services.db),
     );
     // Preserve the old empty-list fallback on storage errors.
-    let tags = tags.unwrap_or_default();
+    let tags = tags
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|tag| !narou_rs::virtual_novel::is_internal_tag(tag))
+        .collect::<Vec<_>>();
     let tag_colors = services
         .tag_colors
         .for_tags(tags.clone(), new_tag_color.as_deref())

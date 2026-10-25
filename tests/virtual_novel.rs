@@ -15,9 +15,10 @@ fn write_fixture(root: &Path) {
   novel_type: 1
   end: false
   last_update: "2026-01-02T00:00:00Z"
+  general_lastup: "2026-01-01T00:00:00Z"
   general_all_no: 1
   length: 10
-  tags: []
+  tags: ["共通", "その1"]
 2:
   id: 2
   title: "A その2"
@@ -28,9 +29,10 @@ fn write_fixture(root: &Path) {
   novel_type: 1
   end: false
   last_update: "2026-01-02T00:00:00Z"
+  general_lastup: "2026-03-04T00:00:00Z"
   general_all_no: 1
   length: 10
-  tags: []
+  tags: ["共通", "その2"]
 "#;
     std::fs::write(root.join(".narou/database.yaml"), database).unwrap();
 
@@ -79,6 +81,38 @@ fn virtual_novel_registers_hides_members_and_combines_text_in_order() {
         String::from_utf8_lossy(&added.stderr)
     );
     assert!(String::from_utf8_lossy(&added.stdout).contains("vs_3"));
+
+    // Member tags are merged (deduplicated) and the newest member update date
+    // becomes the virtual novel's latest-update date.
+    let database: serde_yaml::Value = serde_yaml::from_str(
+        &std::fs::read_to_string(root.join(".narou/database.yaml")).unwrap(),
+    )
+    .unwrap();
+    let virtual_record = database
+        .as_mapping()
+        .and_then(|mapping| {
+            mapping
+                .iter()
+                .find(|(key, _)| key.as_i64() == Some(3))
+                .map(|(_, value)| value)
+        })
+        .expect("virtual record 3");
+    let tags: Vec<&str> = virtual_record["tags"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .filter_map(|tag| tag.as_str())
+        .collect();
+    assert_eq!(tags.iter().filter(|tag| **tag == "共通").count(), 1);
+    assert!(tags.contains(&"vs_3"));
+    assert!(tags.contains(&"その1") && tags.contains(&"その2"));
+    assert!(
+        virtual_record["general_lastup"]
+            .as_str()
+            .is_some_and(|date| date.contains("2026-03-04")),
+        "virtual general_lastup must be the newest member date: {:?}",
+        virtual_record["general_lastup"]
+    );
 
     // Member rows are hidden from the regular list while they belong to the
     // virtual novel; the virtual row itself is a normal row.

@@ -140,7 +140,11 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
             general_lastup: record.general_lastup.map(|dt| dt.timestamp()),
             last_check_date: record.last_check_date.map(|dt| dt.timestamp()),
             new_arrivals_date: record.new_arrivals_date.map(|dt| dt.timestamp()),
-            tags: record.tags,
+            tags: record
+                .tags
+                .into_iter()
+                .filter(|tag| !narou_rs::virtual_novel::is_internal_tag(tag))
+                .collect(),
             new_arrivals: record.new_arrivals,
             frozen: record.frozen,
             suspend: record.suspend,
