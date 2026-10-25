@@ -3,6 +3,14 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
+## v0.5.1 — バーチャル小説の Web UI 登録修正・新機能ツアー・依存更新
+
+- **Web UI からバーチャル小説を登録すると 400 invalid JSON body になる問題を修正**しました。選択中の作品 ID が文字列で送られていたため、サーバー側の数値 ID と一致せず JSON のデコードに失敗していました。Web UI は数値で送信し、Native / Worker API も数値文字列を受け付けるようにしました。
+- **0.5.0 の新機能ツアーを追加**しました。バーチャル小説、非表示設定、小説データの ZIP 転送、サイト別並列ダウンロードを起動時に案内します。
+- **依存クレートを `cargo update` で更新**しました（0.x.0 更新時の必須作業として AGENTS.md に追記）。
+
+変更一覧は [v0.5.0...v0.5.1](https://github.com/Rumia-Channel/narou.rs/compare/v0.5.0...v0.5.1) を参照してください。
+
 ## v0.5.0 — 非表示設定・サイト別並列DL・小説データの ZIP 転送・バーチャル小説
 
 - **CLI の一括 update で EPUB が生成されない問題を修正**しました（issue #39）。`narou update` の自動変換に渡していた保存先が `小説データ/...` の相対パスで、SQLite の `sqlite.mirror-files=false` 構成では変換前の実体化が archive root と照合できず、`toc.yaml` が見つからないため `Convert error: IO error` になっていました。自動変換と実体化の両方で保存先を絶対パスに正規化します。個別 `narou convert` / Web UI からは元々絶対パスで成功していました。

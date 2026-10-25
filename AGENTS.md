@@ -123,6 +123,14 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **バーチャル小説**: `vs_<ID>` の通常 `novels` 行として登録し、`ncode=vs_<ID>` / タグ `vs_<ID>` を持つ。メンバー順は在庫 `virtual_novel_members`、ダウンロード・更新の対象外。表示一覧ではメンバー行を除外する。`convert vs_<ID>` はメンバーの toc/本文を一時ディレクトリで連結し、各メンバータイトルを章見出しとして 1 EPUB に結合する。CLI は `narou virtual add/list/order/remove`、Web API は `/api/virtual_novels`。
 - 設計の全体像は `docs/v0.5.0-architecture.md`。
 
+## 0.x.0 更新時の必須作業
+
+- **0.x.0（マイナーバージョン）の更新ごとに、必ず次の3つを行う。**
+  1. `cargo clippy --workspace --all-targets --all-features -- -D warnings` とビルドで警告を確認し、警告を解消する。依存更新で新しく出た警告も対象。
+  2. `cargo update` でワークスペースの依存を更新する。`about-probe` も `cargo update --manifest-path about-probe/Cargo.toml` で更新し、両方の `Cargo.lock` を同じコミットに含める。
+  3. 依存更新後に `cargo test --workspace` / clippy / Worker wasm / ライセンス再生成 (`cargo about`) を実行し、結果を確認する。更新で壊れた API はこの時点で直す。
+- パッチ版 (0.5.1 など) でも、依存更新や警告修正が必要なら同じ手順に従う。
+
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。
 - 作業開始時に対象ブランチが `origin` より遅れている場合は、`git pull` で最新へ追従してから作業を始める。

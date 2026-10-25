@@ -177,6 +177,46 @@ pub const FEATURE_TOURS: &[FeatureTourEntry] = &[
             "無料分を取得した作品も、閲覧権のある Cookie の登録後に更新すれば残りの話を追加できます",
         ],
     },
+    FeatureTourEntry {
+        version: "0.5.0",
+        title: "作品をまとめる「バーチャル小説」",
+        body: "「XXX その1」「XXX その2」のような分かれた作品を、1つの作品として一覧に登録できます。実体は各作品のまま、EPUB だけを登録順に結合します。",
+        items: &[
+            "narou virtual add / list / order / remove（Web UI のオプションメニューからも登録・並べ替え・削除）",
+            "ncode は vs_<ID>。仮想小説には vs_<ID> タグが付き、既存の非表示設定で隠せます",
+            "narou convert vs_<ID> でメンバーを登録順に結合した EPUB を出力",
+        ],
+    },
+    FeatureTourEntry {
+        version: "0.5.0",
+        title: "作品・タグ・作者・サイトの非表示設定",
+        body: "一覧に出したくない作品を、作品単位だけでなくタグ・作者・サイト単位でも隠せるようになりました。",
+        items: &[
+            "一覧の「非表示も表示」トグルと、右クリックの「非表示 / 表示に戻す」",
+            "設定の非表示マネージャー、CLI の narou hidden add/remove/list/clear",
+            "タグを非表示にすると、そのタグを持つ作品も一覧から隠れます",
+        ],
+    },
+    FeatureTourEntry {
+        version: "0.5.0",
+        title: "小説データを ZIP で持ち出し・取り込み",
+        body: "選択した作品の toc.yaml・本文・setting.ini・replace.txt・挿絵などを ZIP にまとめ、別のライブラリへ取り込めます。",
+        items: &[
+            "narou export <作品...> -o novels.zip / narou import novels.zip",
+            "Web UI のオプションメニューから選択作品をダウンロード、ZIP をアップロード",
+            "toc_url が同じ作品はスキップまたは上書き。古いアーカイブで既存の本文を削りません",
+        ],
+    },
+    FeatureTourEntry {
+        version: "0.5.0",
+        title: "異なるサイトの並列ダウンロード",
+        body: "なろう・カクヨム・Pixiv などをサイト系列ごとに直列化し、異なる系列は並列に更新できるようになりました。",
+        items: &[
+            "なろう / なろうR18 / 作者ページ / API は同じ系列として直列",
+            "サイト定義の site_family で系列を指定でき、未指定時はドメインから自動判定",
+            "Web UI の個別ダウンロードも異なる系列なら同時に実行",
+        ],
+    },
 ];
 
 /// 現在のバージョンまでに存在するツアー (表示対象になり得る全件)。
