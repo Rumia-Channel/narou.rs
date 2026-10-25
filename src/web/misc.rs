@@ -206,6 +206,9 @@ pub async fn tag_list(
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for record in &records {
         for tag in &record.tags {
+            if crate::virtual_novel::is_internal_tag(tag) {
+                continue;
+            }
             *counts.entry(tag.clone()).or_insert(0) += 1;
         }
     }

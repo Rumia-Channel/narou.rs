@@ -352,6 +352,20 @@ pub async fn download_ebook(
         .map_err(map_application_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("ID: {}", id)))?;
 
+    // 仮想小説は toc を持たないため、DL 前に結合 EPUB を生成する。
+    if record
+        .ncode
+        .as_deref()
+        .is_some_and(crate::virtual_novel::is_virtual_ncode)
+    {
+        let members = crate::native::virtual_novel::load()
+            .ok()
+            .and_then(|all| all.get(id).map(|members| members.to_vec()))
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "virtual members not found".to_string()))?;
+        crate::native::virtual_novel::convert_virtual(id, &record, &members, None, false, false)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
+
     let novel_dir = with_database(|db| {
         super::safe_existing_novel_dir(db.archive_root(), &record)
             .map_err(NarouError::Database)

@@ -39,6 +39,11 @@ pub fn tag(id: i64) -> String {
     ncode(id)
 }
 
+/// UI やタグ一覧に出さない内部タグ (`vs_<ID>`) か。
+pub fn is_internal_tag(tag: &str) -> bool {
+    is_virtual_ncode(tag)
+}
+
 /// 仮想小説 ID → 登録順のメンバー ID。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
@@ -137,6 +142,13 @@ pub fn parse_member_ids(values: &[serde_json::Value]) -> Result<Vec<i64>, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_virtual_tags_are_detected() {
+        assert!(is_internal_tag("vs_672"));
+        assert!(!is_internal_tag("共通"));
+        assert!(!is_internal_tag("vs_"));
+    }
 
     #[test]
     fn member_ids_accept_numbers_and_numeric_strings() {

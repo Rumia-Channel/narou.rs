@@ -242,6 +242,25 @@ pub fn aozora_assets_dir() -> Option<PathBuf> {
     canonicalize_existing_path(PathBuf::from(dir))
 }
 
+/// 組み込みエンジン (AozoraEpub3_Lite) の設定ディレクトリ。
+///
+/// 配布物の exe と同じ場所、または開発時のカレントディレクトリにある
+/// `preset/` を返す。ここには `AozoraEpub3.ini` と
+/// `custom_chuki_tag.txt` が入っており、外部 AozoraEpub3 の
+/// `aozoraepub3dir` とは独立して編集できる (issue #45)。
+pub fn lite_preset_dir() -> Option<PathBuf> {
+    let candidates = [
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|parent| parent.join("preset"))),
+        std::env::current_dir().ok().map(|cwd| cwd.join("preset")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find_map(canonicalize_existing_path)
+}
+
 pub fn resolve_java_command_path() -> Option<PathBuf> {
     if let Some(path) =
         load_global_setting_string_with_aliases(&["java_path", "java-path", "javapath"])
@@ -1555,6 +1574,19 @@ mod tests {
         assert!(
             settings.enable_half_indent_bracket,
             "端末を明示した Kindle 変換で二分アキが付かない"
+        );
+    }
+
+    #[test]
+    fn lite_preset_dir_uses_the_current_directory_preset() {
+        let temp = tempfile::tempdir().unwrap();
+        let preset = temp.path().join("preset");
+        std::fs::create_dir_all(&preset).unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        let found = super::lite_preset_dir().expect("preset directory");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            preset.canonicalize().unwrap()
         );
     }
 }

@@ -511,6 +511,15 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         Ok(None) => return Response::error("Not Found", 404),
         Err(error) => return Response::error(format!("Repository error: {error}"), 500),
     };
+    // 仮想小説は通常の toc を持たないため、メンバーを結合する専用の
+    // EPUB 生成へ回す (Web UI の DL ボタンは /novels/{id}/download を使う)。
+    if record
+        .ncode
+        .as_deref()
+        .is_some_and(narou_rs::virtual_novel::is_virtual_ncode)
+    {
+        return crate::virtual_novels::download_epub(req, env, id).await;
+    }
     let keys = match narou_rs::platform::NovelObjectKeys::new(
         &record.sitename,
         &record.file_title,
