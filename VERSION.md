@@ -7,7 +7,7 @@
 
 - **CLI の一括 update で EPUB が生成されない問題を修正**しました（issue #39）。`narou update` の自動変換に渡していた保存先が `小説データ/...` の相対パスで、SQLite の `sqlite.mirror-files=false` 構成では変換前の実体化が archive root と照合できず、`toc.yaml` が見つからないため `Convert error: IO error` になっていました。自動変換と実体化の両方で保存先を絶対パスに正規化します。個別 `narou convert` / Web UI からは元々絶対パスで成功していました。
 
-- **EPUB エンジン選択でローカル設定が無視される問題を修正**しました（issue #42 追記）。`convert.epub-engine: lite` をローカル設定に書いても、グローバル設定に `aozoraepub3dir` があると外部 AozoraEpub3 が使われていました。エンジン設定はローカル → グローバルの順で解決し、ローカルの `lite` を優先します。なお `enable_half_indent_bracket` / `enable_auto_indent` は narou.rb のオリジナル設定と同じく既定 `true` です（未設定で false にはなりません）。
+- **EPUB エンジン選択でローカル設定が無視される問題を修正**しました（issue #42 追記）。`convert.epub-engine: lite` をローカル設定に書いても、グローバル設定に `aozoraepub3dir` があると外部 AozoraEpub3 が使われていました。エンジン設定はローカル → グローバルの順で解決し、ローカルの `lite` を優先します。あわせて Web UI の設定「default.*」タブに `enable_half_indent_bracket` / `enable_auto_indent` / `enable_force_indent` の 3-way トグル（未設定 / 有効 / 無効）を常時表示しました。未設定時の既定値は narou.rb と同じ `true` / `true` / `false` です。
 
 - **バーチャル小説登録を追加**しました。複数の実小説を `vs_<ID>` という 1 作品として `novels` テーブルに登録し、一覧・検索・タグ・凍結・非表示を通常作品と同じように扱えます。登録時にタイトル・作者・サイト・タグを指定でき、メンバーの登録順は `narou virtual order` と Web UI から変更できます。仮想小説には `vs_<ID>` タグが付くため、既存の `narou hidden add --tag vs_1` で非表示にできます。メンバー行は仮想小説に属する間は一覧から自動的に除外されます。`narou convert vs_<ID>` はメンバーを登録順に 1 つの EPUB へ結合し、各メンバーのタイトルを章見出しとして挿入します。Web API `/api/virtual_novels` と Web UI の登録・並べ替え・削除も追加しました。Worker も同じ登録・一覧・並べ替え・削除 API と、メンバーを結合した EPUB のダウンロード (`/api/virtual_novels/<id>/download.epub`) を持ちます。
 
