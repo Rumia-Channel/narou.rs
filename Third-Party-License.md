@@ -136,8 +136,8 @@ dependency).
 | Unicode License v3 | 19 |
 | Apache License 2.0 | 11 |
 | BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License | 8 |
+| BSD 2-Clause &quot;Simplified&quot; License | 3 |
 | BSD Zero Clause License | 2 |
-| BSD 2-Clause &quot;Simplified&quot; License | 2 |
 | GNU General Public License v3.0 only | 2 |
 | zlib License | 2 |
 
@@ -1307,7 +1307,7 @@ limitations under the License.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_rs 0.4.18
+- narou_rs 0.5.0
 
 ```text
 BSD 2-Clause License
@@ -1340,7 +1340,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_relay 0.4.18
+- narou_relay 0.5.0
+- narou_transfer_wasm 0.5.0
 
 ```text
 Copyright (c) <year> <owner> 
@@ -1576,7 +1577,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 - aozora_epub3_lite 0.1.6
-- narou_worker 0.4.18
+- narou_worker 0.5.0
 
 ```text
 GNU GENERAL PUBLIC LICENSE

@@ -179,11 +179,52 @@ pub async fn load_view(settings: &SettingsService) -> serde_json::Value {
         items.push(item);
     }
 
+    append_missing_indent_toggles(&mut items, &novel_vars);
+
     serde_json::json!({
         "tabs": tabs_json(),
         "settings": items,
         "replace_content": replace_content,
     })
+}
+
+/// issue #42: 未設定でも既定値が効く設定を、設定ファイルに無くても
+/// 「default.*」タブの 3-way トグルとして出す。
+fn append_missing_indent_toggles(
+    items: &mut Vec<serde_json::Value>,
+    novel_vars: &[(&'static str, VarInfo)],
+) {
+    for (name, help) in [
+        (
+            "default.enable_half_indent_bracket",
+            "行頭のかぎ括弧・丸括弧に二分アキを挿入します。未設定時は narou.rb と同じく有効 (true) です。",
+        ),
+        (
+            "default.enable_auto_indent",
+            "行頭字下げを自動で行います。未設定時は narou.rb と同じく有効 (true) です。",
+        ),
+        (
+            "default.enable_force_indent",
+            "行頭字下げを必ず行います (enable_auto_indent より優先)。未設定時は narou.rb と同じく無効 (false) です。",
+        ),
+    ] {
+        if items
+            .iter()
+            .any(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))
+        {
+            continue;
+        }
+        let base_name = name.strip_prefix("default.").unwrap_or(name);
+        let Some((_, info)) = novel_vars.iter().find(|(key, _)| *key == base_name) else {
+            continue;
+        };
+        let mut item = build_setting_entry(name, info, "local", "default", None);
+        item["three_way"] = serde_json::json!(true);
+        item["help"] = serde_json::json!(help);
+        item["requires_restart"] = serde_json::json!(false);
+        item["default_value"] = serde_json::json!(base_name != "enable_force_indent");
+        items.push(item);
+    }
 }
 
 /// メタデータが見つからない設定項目（`setting_info` に無い動的な名前）。
@@ -429,6 +470,45 @@ mod tests {
             settings.get("default.enable_half_indent_bracket"),
             Some(&serde_yaml::Value::Bool(false))
         );
+    }
+
+    #[test]
+    fn indent_toggles_are_always_available_in_default_tab() {
+        let novel_vars = original_setting_var_infos();
+        let mut items = Vec::new();
+        append_missing_indent_toggles(&mut items, &novel_vars);
+        assert_eq!(items.len(), 3, "the three indent toggles must be shown");
+        for item in &items {
+            assert_eq!(item["tab"], "default");
+            assert_eq!(item["three_way"], true);
+            assert_eq!(item["scope"], "local");
+        }
+        // 既に設定ファイルにある項目は重複追加しない。
+        append_missing_indent_toggles(&mut items, &novel_vars);
+        assert_eq!(items.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn load_view_exposes_unset_indent_toggles_with_three_way_state() {
+        use crate::application::settings::{MemorySettingsStore, SettingsService};
+        use std::sync::Arc;
+
+        let service = SettingsService::new(Arc::new(MemorySettingsStore::new()));
+        let view = load_view(&service).await;
+        let settings = view["settings"].as_array().expect("settings array");
+        for name in [
+            "default.enable_half_indent_bracket",
+            "default.enable_auto_indent",
+            "default.enable_force_indent",
+        ] {
+            let item = settings
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap_or_else(|| panic!("{name} must be shown even when unset"));
+            assert_eq!(item["tab"], "default");
+            assert_eq!(item["three_way"], true);
+            assert!(item["value"].is_null(), "unset value must stay null");
+        }
     }
 
     #[test]

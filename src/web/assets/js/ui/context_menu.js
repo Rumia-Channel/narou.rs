@@ -12,7 +12,7 @@ let menuTextCache = null;
 const MENU_TEXT_KEY = 'context_menu_text';
 const MENU_STYLE_KEY = 'menu_style';
 const DEFAULT_COMMANDS = [
-  'setting', 'diff', 'edit_tag', 'divider',
+  'setting', 'diff', 'edit_tag', 'hidden_toggle', 'divider',
   'freeze_toggle', 'update', 'update_force', 'send', 'divider',
   'remove', 'convert', 'inspect', 'divider', 'folder', 'backup', 'download_force',
   'mail', 'author_comments',
@@ -22,6 +22,7 @@ const MENU_ITEMS = [
   { label: '小説の変換設定', command: 'setting' },
   { label: '差分を表示', command: 'diff' },
   { label: 'タグを編集', command: 'edit_tag' },
+  { label: '非表示 / 表示に戻す', command: 'hidden_toggle' },
   { label: '凍結 or 解凍', command: 'freeze_toggle' },
   { label: '更新', command: 'update' },
   { label: '凍結済みでも更新', command: 'update_force' },
@@ -39,6 +40,7 @@ const MENU_COMMAND_HANDLERS = {
   setting: () => actionHandlers.openSetting?.(contextTarget),
   diff: () => actionHandlers.showDiff?.(contextTarget),
   edit_tag: () => actionHandlers.tagEditSingle?.(contextTarget),
+  hidden_toggle: () => actionHandlers.hiddenToggle?.(contextTarget),
   freeze_toggle: () => actionHandlers.freezeToggle?.(contextTarget),
   update: () => actionHandlers.updateSingle?.(contextTarget),
   update_force: () => actionHandlers.updateForceSingle?.(contextTarget),

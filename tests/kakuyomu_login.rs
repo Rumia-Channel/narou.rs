@@ -146,9 +146,16 @@ async fn next_chooses_an_entitled_login_and_reuses_it_without_losing_paid_chapte
     http.subscription_active.store(false, Ordering::SeqCst);
     for force in [false, true] {
         let unavailable = downloader.download_novel_with_force(TOP, force).await.unwrap();
-        assert_eq!(unavailable.status, UpdateStatus::Canceled);
+        // preserve_missing_sections: an expired entitlement keeps the paid
+        // chapters and only the still-accessible free chapter is refreshed.
+        assert!(matches!(unavailable.status, UpdateStatus::None | UpdateStatus::Ok));
+        assert_eq!(unavailable.total_count, 3, "paid chapters must be retained");
         assert!(!unavailable.sections_deleted);
-        assert_eq!(snapshot(store.as_ref()).await, saved, "an expired entitlement must not replace the complete TOC with the free subset");
+        let after = snapshot(store.as_ref()).await;
+        let section_keys = |objects: &BTreeMap<String, Vec<u8>>| {
+            objects.keys().filter(|key| key.contains("/本文/") && !key.contains("/cache/") && key.ends_with(".yaml")).cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(section_keys(&after), section_keys(&saved));
         assert_eq!(novels.get(result.id.into()).await.unwrap().unwrap().general_all_no, Some(3));
     }
 }

@@ -275,6 +275,21 @@ pub(crate) fn logical_key_for_native_path(root: &Path, path: &Path) -> Option<Ob
     }
 }
 
+/// Make a path absolute against the current working directory.
+///
+/// `DownloadResult.novel_dir` is often relative (`小説データ/...`), while the
+/// archive root and object keys are absolute. Materialisation must compare
+/// absolute paths or the novel prefix is never found (issue #39).
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(NarouError::Io)
+    }
+}
+
 pub(crate) fn run_blocking<T, F>(operation: F) -> PlatformFuture<'static, Result<T>>
 where
     T: Send + 'static,
@@ -648,14 +663,19 @@ impl NativeStore {
             return Ok(MaterializedNovelFiles::default());
         };
         let root = store.archive_root();
-        let Some(prefix) = logical_key_for_native_path(root, novel_dir) else {
+        // 呼び出し側は相対パス (`小説データ/...`) を渡すことがある。archive root
+        // は絶対パスなので、`strip_prefix` の前に CWD 基準で絶対化する。これを
+        // 怠ると SQLite のみ (mirror-files=false) の小説で toc.yaml が実体化されず
+        // IO error になる (issue #39)。
+        let novel_dir = absolute_path(novel_dir)?;
+        let Some(prefix) = logical_key_for_native_path(root, &novel_dir) else {
             return Ok(MaterializedNovelFiles::default());
         };
         let scope = crate::native::materialization::MaterializationScope::acquire(
-            root.parent().unwrap_or(root), novel_dir,
+            root.parent().unwrap_or(root), &novel_dir,
         )?;
         let paths = store.materialize_into(
-            novel_dir,
+            &novel_dir,
             &prefix,
             crate::platform::split_store::ILLUSTRATION_SEGMENT,
             &scope,
@@ -964,6 +984,23 @@ pub fn delete_prefix_sync(store: &dyn ObjectStore, prefix: &ObjectKey) -> Result
 mod tests {
     use super::*;
     use crate::platform::ObjectStore;
+
+    #[test]
+    fn relative_novel_dir_becomes_absolute_for_materialization() {
+        let relative = Path::new("小説データ/site/novel");
+        let absolute = absolute_path(relative).unwrap();
+        assert!(absolute.is_absolute());
+        assert_eq!(absolute.file_name().and_then(|name| name.to_str()), Some("novel"));
+    }
+
+    #[test]
+    fn relative_novel_dir_matches_the_absolute_archive_root() {
+        let cwd = std::env::current_dir().unwrap();
+        let root = cwd.join("小説データ");
+        let novel_dir = absolute_path(Path::new("小説データ/site/novel")).unwrap();
+        let key = logical_key_for_native_path(&root, &novel_dir).expect("prefix must resolve");
+        assert_eq!(key.as_ref(), "novels/site/novel");
+    }
 
     #[test]
     fn native_store_maps_logical_novel_keys_to_existing_layout() {

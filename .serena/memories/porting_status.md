@@ -1,10 +1,18 @@
 # narou.rs 移植状況
 
-## 現況（v0.4.18 リリース準備）
+## 現況（v0.5.0 実装完了・リリース準備）
+
+0.5.0 の新機能を `feature/v0.5.0` で実装。内容: (1) 非表示設定 (`HiddenState` / inventory `hidden`、作品・タグ・作者・サイト。Native YAML/SQLite・Worker D1、CLI `narou hidden`、`list --show-hidden`、Web API `/api/hidden`、Web UI トグル/右クリック/モーダル)。(2) サイト別並列DL (`SiteSetting.site_family` を YAML 第一優先、なろう系 syosetu.com / Pixiv pixiv.net。Native update の domain groups、Worker の D1 admission site_key、Native Web キューの family 排他)。(3) 小説データ ZIP 転送 (`src/transfer` の wasm-safe コア、Native `narou export/import`、`/api/transfer/*`、Worker ObjectStore 実装、`transfer_wasm`、Web UI の選択ダウンロード/アップロード)。設計は `docs/v0.5.0-architecture.md`、履歴は VERSION.md v0.5.0 節。全 crate を 0.5.0 に更新し、ライセンス通知も再生成。`cargo test --workspace` / clippy `--all-features` / JS 回帰 / Worker wasm / workerd transfer 契約テストが成功。次は develop 統合 → CI → 0.5.0 タグ/Release。
+
+## 現況（v0.4.19 未リリース変更）
+
+`webnovel/kakuyomu.jp.yaml` に `preserve_missing_sections: true` を追加し、カクヨムネクストの閲覧制限で目次から消えた保存済みの話を保持したまま、閲覧できる新着話だけを更新できるようにした。カクヨムの `index` はエピソード ID (数値) で安定している。既存の `tests/kakuyomu_login.rs` は、購読切れ時に `Canceled` で全体を見送る前提だったため、`preserve_missing_sections` の新挙動 (有料話を保持し、閲覧可能な無料話だけ更新) に合わせて更新。`cargo test --workspace` / clippy 成功。VERSION.md の「未リリース」節に記載。v0.4.18 タグは作成済みなので次回リリースは v0.4.19。
+
+## 現況（v0.4.18 リリース）
 
 v0.4.18 のタグ・Release を進行中に、ユーザーから「Pixiv の作者取得で R-18 などログインが要る作品が取れない」と報告。原因は Pixiv の `/ajax/user/{id}/profile/all` が匿名でも「完全な一覧」に見える JSON を返し、R-18 作品だけを黙って省くこと。`AuthorListing` はログイン壁・部分一覧の印があるときだけ保存済みログインを試すため、匿名一覧が読めるとログインを試さず R-18 作品が欠けていた（実データ `https://www.pixiv.net/users/69616058` で匿名 1 件 / ログイン込み 20 小説 + 1 シリーズ = 21 件を確認）。
 
-修正: サイト定義の新キー `author_login_merge: yes`（`SiteSetting.author_login_merge`）を追加し、有効なサイトでは匿名一覧と保存済みログインごとの一覧を URL・シリーズ単位で統合する。匿名が読めてもログインを試し、最も多く読めたログイン設定をシリーズ話一覧の取得に使う。`webnovel/www.pixiv.net.yaml` で有効化。回帰テストは synthetic 定義 + 同梱 Pixiv 定義（匿名 111 / ログイン 111+222）の 2 本。E2E で実 Pixiv の 69616058 が 1 件 → 21 件になることを確認。あわせて Web UI コンソールの追従を修正（scrollTop が動いたときだけピン解除し、進捗バー/スクロールバーの出現・消失では二重 rAF で一番下へ再追従）。version は GitHub tag 基準の指示に従い 0.4.18 のまま。旧 v0.4.18 タグは未公開の Release をキャンセルして削除し、この修正を含む main 統合後に作り直す。
+修正: サイト定義の新キー `author_login_merge: yes`（`SiteSetting.author_login_merge`）を追加し、有効なサイトでは匿名一覧と保存済みログインごとの一覧を URL・シリーズ単位で統合する。匿名が読めてもログインを試し、最も多く読めたログイン設定をシリーズ話一覧の取得に使う。`webnovel/www.pixiv.net.yaml` で有効化。回帰テストは synthetic 定義 + 同梱 Pixiv 定義（匿名 111 / ログイン 111+222）の 2 本。E2E で実 Pixiv の 69616058 が 1 件 → 21 件になることを確認。あわせて Web UI コンソールの追従を修正（scrollTop が動いたときだけピン解除し、進捗バー/スクロールバーの出現・消失では二重 rAF で一番下へ再追従）。version は GitHub tag 基準の指示に従い 0.4.18 のまま。旧 v0.4.18 タグは未公開の Release をキャンセルして削除し、修正を含む main 統合後にタグを作り直して push 済み（コミット `191e74b`）。develop へリリースマージを戻した。Release / Platform（tag, production deploy）を監視中。
 
 ## 現況（v0.4.18 リリース準備）
 

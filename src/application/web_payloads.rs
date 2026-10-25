@@ -32,6 +32,8 @@ pub struct ListParams {
     pub order_column: Option<u64>,
     #[serde(rename = "order[0][dir]")]
     pub order_dir: Option<String>,
+    /// 非表示設定を無視してすべて表示する。
+    pub show_hidden: Option<bool>,
 }
 
 /// DataTables 形式の一覧応答。

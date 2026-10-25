@@ -115,6 +115,14 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **上流コンテンツ**: うごイラのフレーム ZIP は宣言サイズと読み出し上限（16 MiB/フレーム）およびヘッダ寸法で復号前に検証する。EPUB に取り込む非リモート `<img src>` は novel ディレクトリ内の相対パスだけを許可する。
 - **外部応答の Brotli 展開**: reqwest の `brotli` feature は有効にしない (CVE-2026-111497 は Google Brotli の C 実装 1.0.3〜1.2.0 が対象で C 版はリンクしていないが、pure Rust 実装も修正前と同じデコーダ経路を持つため、外部サイトの応答を展開する経路を落とす)。HTTP 取得は gzip / deflate / identity を使う。保存オブジェクト (`objects` / `section_bodies` など) の brotli 圧縮・伸長は自前データのみなので継続する。外部取得リレーも `curl --compressed` を使わず、`Accept-Encoding: gzip, deflate` を明示して gzip / deflate を Rust (`flate2`) で展開し、`br` は fail closed する (`relay/src/transport/curl.rs`)。2026-10。
 
+## 非表示・並列DL・転送 (v0.5.0)
+
+- **非表示設定**: 在庫 `hidden` に `novels` / `tags` / `authors` / `sites` を持つ (`HiddenState`)。Native は `.narou/hidden.yaml` / SQLite `app_state`、Worker は D1 `app_state`。一覧は `NovelFilter.exclude_*` で除外し、`include_hidden` が true のときだけ非表示も表示する。タグ非表示はそのタグの作品も隠す。更新・変換などの内部列挙は非表示作品も対象。CLI は `narou hidden` / `list --show-hidden`、Web UI は「非表示も表示」・右クリック・非表示設定モーダル。
+- **並列DLの系列**: `SiteSetting.site_family`（YAML）を第一優先し、未指定時は `platform::site_family` がドメインから自動判定する。なろう系は `syosetu.com`、Pixiv は `pixiv.net` を同梱定義に明記。Native `update` の domain groups、Worker の D1 admission `site_key`、Native Web のキュー worker が同じ系列で直列化する。異なる系列は並列。
+- **小説データ転送**: 形式と検証は wasm-safe な `src/transfer`（manifest + `novels/<i>/...`、決定論的 ZIP、パス/サイズ/zip bomb/SHA-256 検証、`plan_import`）。Native は `src/native/transfer`、CLI は `narou export/import`、Native Web は `/api/transfer/*`、Worker は ObjectStore 経由の同 API、ブラウザは `transfer_wasm`。競合は `toc_url`、既定 Skip / `--overwrite` で置換。上書きはアーカイブにあるファイルだけを置換し、既存の余分なファイルを削らない。
+- **バーチャル小説**: `vs_<ID>` の通常 `novels` 行として登録し、`ncode=vs_<ID>` / タグ `vs_<ID>` を持つ。メンバー順は在庫 `virtual_novel_members`、ダウンロード・更新の対象外。表示一覧ではメンバー行を除外する。`convert vs_<ID>` はメンバーの toc/本文を一時ディレクトリで連結し、各メンバータイトルを章見出しとして 1 EPUB に結合する。CLI は `narou virtual add/list/order/remove`、Web API は `/api/virtual_novels`。
+- 設計の全体像は `docs/v0.5.0-architecture.md`。
+
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。
 - 作業開始時に対象ブランチが `origin` より遅れている場合は、`git pull` で最新へ追従してから作業を始める。
@@ -443,7 +451,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - 同梱 `replace.txt` は読み込まない (削除済み)。Java は narou.rb 構成では `replace.txt` を持たない (配布物は `replace_sample.txt`) ため、読み込むと `－`→`―` など不要な文字置換が入り Java とずれる。
 - 残差: 外字フォント (`gaiji/dakuten/*.ttf`) は `aozoraepub3dir` が無いと格納できない。`AozoraConfig::gaiji_fonts` がパス指定のため、同梱資産 (バイト列) からは渡せない。Java は濁点外字に `<span class="glyph u30fc-u309a">` を出すが Lite は素の文字になる (この差は外字を使う小説でのみ発生)。
 - **フォント (濁点フォント / 本文フォント)**: 外部ツールには `DakutenFontGuard` が `aozoraepub3dir/template/OPS/fonts/DMincho.ttf` と `css_custom/vertical_font.css` を流し込んで効かせる。組み込み (Lite) にはその経路が無いので、narou は同じ内容を `EpubBuildOptions::extra_assets` の `style/vertical_font.css` + `fonts/DMincho.ttf` として渡し、crate 側が本文 (`item/xhtml/*.xhtml`) からその CSS をリンクする (組み込み CSS より後ろに置くので同じ詳細度ならこちらが勝つ)。設定 `convert.epub-font` (`auto` / `always`) で選び、`always` は本文全体を `DakutenAokinMincho` で組む — U+3000 (全角スペース) を描けない Reader (超縦書き など) 向けの回避策で、`auto` は従来どおり濁点注記のある小説だけ。
-- **注意**: `aozoraepub3dir` を設定すると CLI は外部ツール (jar / Lite exe) を優先する (narou.rb と同じ)。エンジンは設定 `convert.epub-engine` (global、値: `auto` / `lite` / `external`) で選ぶ。未設定 = `auto` は従来どおり外部があれば外部・無ければ組み込み、`lite` は組み込みを強制 (組み込み入りでビルドされていなければエラー)、`external` は外部を強制する。設定ページの「一般」タブからも切り替えられ、Web UI の変換は子プロセスで走るためその設定がそのまま効く。1 回だけ試すときは環境変数 `NAROU_RS_EPUB_ENGINE=lite|external` (`builtin` / `java` も可) で上書きできる。
+- **注意**: `aozoraepub3dir` を設定すると CLI は外部ツール (jar / Lite exe) を優先する (narou.rb と同じ)。エンジンは設定 `convert.epub-engine` (値: `auto` / `lite` / `external`) で選ぶ。解決順は環境変数 → ローカル設定 → グローバル設定で、ローカルの `lite` はグローバルの `aozoraepub3dir` より優先する (issue #42 追記)。未設定 = `auto` は従来どおり外部があれば外部・無ければ組み込み、`lite` は組み込みを強制 (組み込み入りでビルドされていなければエラー)、`external` は外部を強制する。設定ページの「一般」タブからも切り替えられ、Web UI の変換は子プロセスで走るためその設定がそのまま効く。1 回だけ試すときは環境変数 `NAROU_RS_EPUB_ENGINE=lite|external` (`builtin` / `java` も可) で上書きできる。
 - 実データ検証 (2026-09-15, v0.1.3): `WebNovel` の n0421du (401 セクション) で Java 版と **422/423 ファイルがバイト完全一致**、挿絵入りでも **425/426 がバイト完全一致**（単ページ画像化・連番・表紙処理を含む）。残差は `dcterms:modified` のみ（Java はローカル時刻に `Z`、Lite は UTC。Lite 側の意図的な非再現）。
 - 検証手順は `docs/aozora_lite_evaluation_2026-08-23.md` の「更新 (2026-09-15)」節。
 

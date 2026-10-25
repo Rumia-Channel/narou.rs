@@ -124,6 +124,15 @@ pub struct NovelFilter {
     /// `Status`/`Any` term matching. D1 backends ignore this and join their
     /// freeze table instead.
     pub frozen_ids: Option<HashSet<i64>>,
+    /// 非表示設定 (表示用の一覧だけが設定する)。作品 ID。
+    pub exclude_ids: Vec<i64>,
+    /// 非表示タグ。いずれかを持つ作品を除外する。
+    pub exclude_tags: Vec<String>,
+    /// 非表示作者 (fold 済み)。author_fold が一致する作品を除外する。
+    pub exclude_authors: Vec<String>,
+    /// 非表示サイト (fold 済み)。domain_fold / sitename_fold が一致する
+    /// 作品を除外する。
+    pub exclude_sites: Vec<String>,
 }
 
 impl NovelFilter {
@@ -572,6 +581,31 @@ pub(crate) fn record_matches_filter(record: &NovelRecord, filter: &NovelFilter) 
         )
     {
         return false;
+    }
+    if filter.exclude_ids.contains(&record.id) {
+        return false;
+    }
+    if filter
+        .exclude_tags
+        .iter()
+        .any(|hidden| record.tags.iter().any(|tag| tag == hidden))
+    {
+        return false;
+    }
+    if !filter.exclude_authors.is_empty() {
+        let author = crate::db::novel_codec::fold(&record.author);
+        if filter.exclude_authors.iter().any(|hidden| hidden == &author) {
+            return false;
+        }
+    }
+    if !filter.exclude_sites.is_empty() {
+        let sitename = crate::db::novel_codec::fold(&record.sitename);
+        let domain = record.domain.as_deref().map(crate::db::novel_codec::fold);
+        if filter.exclude_sites.iter().any(|hidden| {
+            hidden == &sitename || domain.as_deref() == Some(hidden.as_str())
+        }) {
+            return false;
+        }
     }
     true
 }

@@ -122,6 +122,16 @@ export function bindActions() {
     renderNovelList();
   });
 
+  if (El.novelListShowHidden) {
+    El.novelListShowHidden.checked = State.showHidden;
+    El.novelListShowHidden.addEventListener('change', () => {
+      State.showHidden = El.novelListShowHidden.checked;
+      lsSet('show-hidden', String(State.showHidden));
+      State.currentPage = 1;
+      refreshList();
+    });
+  }
+
   // --- View menu ---
   on('action-view-all', () => {
     State.viewFrozen = true;
@@ -263,6 +273,181 @@ export function bindActions() {
   });
 
   on('action-option-about', openAbout);
+  on('action-option-hidden', openHiddenSettings);
+  on('action-option-export', () => {
+    const ids = getSelectedIdsInDisplayOrder();
+    if (!ids.length) {
+      showNotification('ダウンロードする作品を選択してください', 'error');
+      return;
+    }
+    const anchor = document.createElement('a');
+    anchor.href = `/api/transfer/export?ids=${ids.join(',')}`;
+    anchor.download = 'narou-export.zip';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  });
+  on('action-option-import', () => document.getElementById('transfer-import-file')?.click());
+  document.getElementById('transfer-import-file')?.addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const response = await fetch('/api/transfer/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/zip' },
+        body: file,
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.success) {
+        throw new Error(result?.message || 'アップロードに失敗しました');
+      }
+      const summary = `新規 ${result.created ?? 0} / 上書き ${result.overwritten ?? 0} / スキップ ${result.skipped ?? 0}`;
+      showNotification(summary, 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || 'アップロードに失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-add', async () => {
+    const ids = getSelectedIdsInDisplayOrder();
+    if (!ids.length) {
+      showNotification('まとめる作品を選択してください', 'error');
+      return;
+    }
+    const title = window.prompt('バーチャル小説のタイトル');
+    if (!title) return;
+    const author = window.prompt('作者名', '') ?? '';
+    const sitename = window.prompt('サイト名', '') ?? '';
+    try {
+      const response = await fetch('/api/virtual_novels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, author, sitename, tags: [], members: ids }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || '登録に失敗しました');
+      }
+      showNotification(`バーチャル小説を登録しました: ${result.ncode}`, 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '登録に失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-order', async () => {
+    try {
+      const response = await fetch('/api/virtual_novels');
+      const result = await response.json();
+      if (!result.success) throw new Error(result.message || '一覧を取得できません');
+      if (!result.novels.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const menu = result.novels
+        .map((novel) => `${novel.ncode} ${novel.title} (${novel.members.length}作品)`)
+        .join('\n');
+      const target = window.prompt(`対象の ncode を入力してください\n${menu}`, result.novels[0].ncode);
+      if (!target) return;
+      const novel = result.novels.find(
+        (item) => item.ncode === target || String(item.id) === target,
+      );
+      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
+      const order = window.prompt(
+        `現在の順序 (${novel.members.length}件) をカンマ区切りで入力\n例: 2,1,3`,
+        novel.members.map((_, index) => index + 1).join(','),
+      );
+      if (!order) return;
+      const members = order
+        .split(',')
+        .map((part) => Number.parseInt(part.trim(), 10))
+        .map((position) => novel.members[position - 1]);
+      if (members.some((member) => member == null)) {
+        throw new Error('順序は現在の位置番号で全件指定してください');
+      }
+      const saved = await fetch(`/api/virtual_novels/${novel.id}/order`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ members }),
+      });
+      const savedResult = await saved.json();
+      if (!saved.ok || !savedResult.success) {
+        throw new Error(savedResult.message || '並べ替えに失敗しました');
+      }
+      showNotification('順序を変更しました', 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '並べ替えに失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-convert', async () => {
+    try {
+      const response = await fetch('/api/virtual_novels');
+      const result = await response.json();
+      if (!result.success) throw new Error(result.message || '一覧を取得できません');
+      if (!result.novels.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const menu = result.novels.map((novel) => `${novel.ncode} ${novel.title}`).join('\n');
+      const target = window.prompt(`変換する ncode を入力してください\n${menu}`, result.novels[0].ncode);
+      if (!target) return;
+      const novel = result.novels.find(
+        (item) => item.ncode === target || String(item.id) === target,
+      );
+      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
+      showNotification('変換を開始しました', 'info');
+      const converted = await fetch(`/api/virtual_novels/${novel.id}/convert`, { method: 'POST' });
+      const convertedResult = await converted.json();
+      if (!converted.ok || !convertedResult.success) {
+        throw new Error(convertedResult.message || '変換に失敗しました');
+      }
+      showNotification(`出力しました: ${convertedResult.filename}`, 'info');
+    } catch (error) {
+      showNotification(error.message || '変換に失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-remove', async () => {
+    try {
+      const response = await fetch('/api/virtual_novels');
+      const result = await response.json();
+      if (!result.success) throw new Error(result.message || '一覧を取得できません');
+      if (!result.novels.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const menu = result.novels.map((novel) => `${novel.ncode} ${novel.title}`).join('\n');
+      const target = window.prompt(`削除する ncode を入力してください\n${menu}`, result.novels[0].ncode);
+      if (!target) return;
+      const novel = result.novels.find(
+        (item) => item.ncode === target || String(item.id) === target,
+      );
+      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
+      if (!window.confirm(`${novel.ncode} ${novel.title} を削除しますか？（メンバー作品は残ります）`)) {
+        return;
+      }
+      const removed = await fetch(`/api/virtual_novels/${novel.id}`, { method: 'DELETE' });
+      const removedResult = await removed.json();
+      if (!removed.ok || !removedResult.success) {
+        throw new Error(removedResult.message || '削除に失敗しました');
+      }
+      showNotification('バーチャル小説を削除しました', 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '削除に失敗しました', 'error');
+    }
+  });
+  on('hidden-close', () => closeModal(document.getElementById('hidden-modal')));
+  on('hidden-cancel', () => closeModal(document.getElementById('hidden-modal')));
+  on('hidden-novel-add', () => addHiddenValue('novels', 'hidden-novel-input'));
+  on('hidden-tag-add', () => addHiddenValue('tags', 'hidden-tag-input'));
+  on('hidden-author-add', () => addHiddenValue('authors', 'hidden-author-input'));
+  on('hidden-site-add', () => addHiddenValue('sites', 'hidden-site-input'));
+  on('hidden-all-clear', async () => {
+    await postJson('/api/hidden', { action: 'clear' });
+    await refreshHiddenSettings();
+    await refreshList();
+  });
 
   on('action-option-shutdown', async (e) => {
     if (!confirm('サーバをシャットダウンしますか？')) return;
@@ -862,6 +1047,16 @@ export function bindActions() {
     },
     showDiff: (id) => openDiffList([id]),
     tagEditSingle: (id) => openTagEditor([id]),
+    hiddenToggle: async (id) => {
+      const current = await fetchJson('/api/hidden');
+      const novels = Array.isArray(current?.novels) ? current.novels : [];
+      const isHidden = novels.includes(Number(id));
+      await postJson('/api/hidden', {
+        action: isHidden ? 'remove' : 'add',
+        novels: [Number(id)],
+      });
+      await refreshList();
+    },
     freezeToggle: async (id) => {
       await postJson('/api/freeze', { ids: [Number(id)] });
       await refreshList();
@@ -1574,6 +1769,74 @@ async function openNotepad() {
 
 /* ===== About ===== */
 
+async function openHiddenSettings() {
+  const modal = document.getElementById('hidden-modal');
+  if (!modal) return;
+  modal.classList.remove('hide');
+  await refreshHiddenSettings();
+}
+
+async function refreshHiddenSettings() {
+  let data;
+  try {
+    data = await fetchJson('/api/hidden');
+  } catch {
+    return;
+  }
+  const render = (containerId, values, kind) => {
+    const box = document.getElementById(containerId);
+    if (!box) return;
+    box.textContent = '';
+    const list = Array.isArray(values) ? values : [];
+    if (!list.length) {
+      const empty = document.createElement('span');
+      empty.className = 'hidden-empty';
+      empty.textContent = 'なし';
+      box.appendChild(empty);
+      return;
+    }
+    for (const value of list) {
+      const row = document.createElement('span');
+      row.className = 'hidden-item';
+      const label = document.createElement('span');
+      label.textContent = String(value);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'hidden-remove';
+      remove.textContent = '×';
+      remove.title = '表示に戻す';
+      remove.addEventListener('click', async () => {
+        await postJson('/api/hidden', { action: 'remove', [kind]: [kind === 'novels' ? Number(value) : value] });
+        await refreshHiddenSettings();
+        await refreshList();
+      });
+      row.appendChild(label);
+      row.appendChild(remove);
+      box.appendChild(row);
+    }
+  };
+  render('hidden-novel-list', data?.novels, 'novels');
+  render('hidden-tag-list', data?.tags, 'tags');
+  render('hidden-author-list', data?.authors, 'authors');
+  render('hidden-site-list', data?.sites, 'sites');
+}
+
+async function addHiddenValue(kind, inputId) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  const raw = input.value.trim();
+  if (!raw) return;
+  const value = kind === 'novels' ? Number(raw) : raw;
+  if (kind === 'novels' && !Number.isInteger(value)) {
+    showNotification('作品IDを数字で入力してください', 'error');
+    return;
+  }
+  await postJson('/api/hidden', { action: 'add', [kind]: [value] });
+  input.value = '';
+  await refreshHiddenSettings();
+  await refreshList();
+}
+
 async function openAbout() {
   try {
     const data = await fetchJson('/api/version/current.json');
@@ -1964,7 +2227,7 @@ export async function refreshList(redraw = true) {
   return runRefresh('list', async () => {
     const generation = listRefreshGeneration;
     try {
-      const resp = await fetchJson('/api/list?all=true');
+      const resp = await fetchJson(`/api/list?all=true${State.showHidden ? '&show_hidden=true' : ''}`);
       if (generation !== listRefreshGeneration) return;
       if (resp && Array.isArray(resp.data)) {
         State.novels = resp.data;

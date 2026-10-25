@@ -1279,3 +1279,58 @@ li.enable-selected.disabled a {
   gap: 0.75em;
   flex-wrap: wrap;
 }
+
+/* ========== Hidden settings modal ========== */
+.table-show-hidden {
+  margin-left: 1em;
+  white-space: nowrap;
+}
+.hidden-help {
+  margin: 0 0 0.75em;
+  font-size: 0.9em;
+  opacity: 0.85;
+}
+.hidden-section {
+  margin-top: 1em;
+}
+.hidden-section h5 {
+  margin: 0 0 0.4em;
+  font-size: 1em;
+}
+.hidden-add-row {
+  display: flex;
+  gap: 0.5em;
+  margin: 0 0 0.5em;
+}
+.hidden-add-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.hidden-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4em;
+  align-items: center;
+}
+.hidden-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2em;
+  padding: 0.15em 0.5em;
+  border: 1px solid var(--border-color, #ccc);
+  border-radius: 0.35em;
+  font-size: 0.9em;
+}
+.hidden-remove {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 1.1em;
+  line-height: 1;
+  padding: 0 0.1em;
+}
+.hidden-empty {
+  font-size: 0.9em;
+  opacity: 0.7;
+}

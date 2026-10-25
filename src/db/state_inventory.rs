@@ -96,6 +96,8 @@ pub(crate) const MANAGED_STATES: &[ManagedState] = &[
     state("login_cookie", "login_cookie.yaml", StateScope::Local, StatePurpose::Inventory),
     state("latest_convert", "latest_convert.yaml", StateScope::Local, StatePurpose::Inventory),
     state("author", "author.yaml", StateScope::Local, StatePurpose::Inventory),
+    state("hidden", "hidden.yaml", StateScope::Local, StatePurpose::Inventory),
+    state("virtual_novel_members", "virtual_novel_members.yaml", StateScope::Local, StatePurpose::Inventory),
     state("local_setting", "local_setting.yaml", StateScope::Local, StatePurpose::Inventory),
     state("queue", "queue.yaml", StateScope::Local, StatePurpose::ImportExport),
     state("notepad", "notepad.txt", StateScope::Local, StatePurpose::ImportExport),
@@ -156,6 +158,8 @@ mod tests {
                 "login_cookie",
                 "latest_convert",
                 "author",
+                "hidden",
+                "virtual_novel_members",
                 "local_setting",
             ]
         );
@@ -176,6 +180,8 @@ mod tests {
                 "login_cookie",
                 "latest_convert",
                 "author",
+                "hidden",
+                "virtual_novel_members",
                 "local_setting",
                 "queue",
                 "notepad",

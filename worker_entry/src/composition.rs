@@ -629,6 +629,12 @@ impl WorkerRuntime {
         crate::authors::service(self.write_db.clone())
     }
 
+    /// 更新系の primary D1 ハンドル。非表示設定など `app_state` を直接
+    /// 読み書きする小さなストア用。
+    pub fn write_db(&self) -> &DbHandle {
+        &self.write_db
+    }
+
     pub async fn author_work_urls(&self, url: &str) -> Result<Vec<String>> {
         let sites = crate::bundled_sites::load_site_settings_uncached(&self.write_objects).await?;
         let expander = narou_rs::application::download_targets::DownloadTargetExpander::new(

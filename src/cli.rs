@@ -879,6 +879,9 @@ pub enum Commands {
         sort_by: Option<String>,
         #[arg(long, hide = true)]
         frozen: bool,
+        /// Also show novels/tags hidden by `narou hidden`.
+        #[arg(long = "show-hidden")]
+        show_hidden: bool,
     },
     Tag {
         #[arg(short = 'a', long = "add")]
@@ -973,10 +976,44 @@ pub enum Commands {
         #[command(subcommand)]
         action: crate::commands::author::AuthorAction,
     },
+    /// Hide novels, tags, authors, or sites from the list.
+    #[command(after_help = "Examples:\n  narou hidden add 123 --tag 秘密\n  narou hidden add --site kakuyomu.jp\n  narou hidden list\n  narou list --show-hidden")]
+    Hidden {
+        #[command(subcommand)]
+        action: crate::commands::hidden::HiddenAction,
+    },
+    /// Register several novels as one virtual novel (ncode vs_<ID>).
+    #[command(after_help = "Examples:\n  narou virtual add --title \"XXX\" --author \"作者\" --site カクヨム 1 2 3\n  narou virtual list\n  narou virtual order vs_1 2,1,3")]
+    Virtual {
+        #[command(subcommand)]
+        action: crate::commands::virtual_novel::VirtualAction,
+    },
     /// Login credentials shared with a browser machine (list/import/export/rename/order/clear).
     Login {
         #[command(subcommand)]
         action: crate::commands::login::LoginAction,
+    },
+    /// Write selected novels to a portable ZIP archive.
+    #[command(after_help = "Examples:\n  narou export 1 2 -o novels.zip\n  narou export n9669bk")]
+    Export {
+        targets: Vec<String>,
+        /// Output ZIP path (default: narou-export-<timestamp>.zip in the CWD).
+        #[arg(short = 'o', long = "output")]
+        output: Option<String>,
+    },
+    /// Import novels from a portable ZIP archive.
+    #[command(
+        after_help = "Examples:\n  narou import novels.zip\n  narou import novels.zip --overwrite"
+    )]
+    Import {
+        /// Archive written by `narou export`.
+        archive: String,
+        /// Replace novels that are already in the library.
+        #[arg(long, conflicts_with = "skip")]
+        overwrite: bool,
+        /// Keep novels that are already in the library (default).
+        #[arg(long, conflicts_with = "overwrite")]
+        skip: bool,
     },
     Illust {
         #[arg(short = 'f', long)]

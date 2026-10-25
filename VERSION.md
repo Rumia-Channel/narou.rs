@@ -3,6 +3,21 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
+## v0.5.0 — 非表示設定・サイト別並列DL・小説データの ZIP 転送・バーチャル小説
+
+- **CLI の一括 update で EPUB が生成されない問題を修正**しました（issue #39）。`narou update` の自動変換に渡していた保存先が `小説データ/...` の相対パスで、SQLite の `sqlite.mirror-files=false` 構成では変換前の実体化が archive root と照合できず、`toc.yaml` が見つからないため `Convert error: IO error` になっていました。自動変換と実体化の両方で保存先を絶対パスに正規化します。個別 `narou convert` / Web UI からは元々絶対パスで成功していました。
+
+- **EPUB エンジン選択でローカル設定が無視される問題を修正**しました（issue #42 追記）。`convert.epub-engine: lite` をローカル設定に書いても、グローバル設定に `aozoraepub3dir` があると外部 AozoraEpub3 が使われていました。エンジン設定はローカル → グローバルの順で解決し、ローカルの `lite` を優先します。あわせて Web UI の設定「default.*」タブに `enable_half_indent_bracket` / `enable_auto_indent` / `enable_force_indent` の 3-way トグル（未設定 / 有効 / 無効）を常時表示しました。未設定時の既定値は narou.rb と同じ `true` / `true` / `false` です。
+
+- **バーチャル小説登録を追加**しました。複数の実小説を `vs_<ID>` という 1 作品として `novels` テーブルに登録し、一覧・検索・タグ・凍結・非表示を通常作品と同じように扱えます。登録時にタイトル・作者・サイト・タグを指定でき、メンバーの登録順は `narou virtual order` と Web UI から変更できます。仮想小説には `vs_<ID>` タグが付くため、既存の `narou hidden add --tag vs_1` で非表示にできます。メンバー行は仮想小説に属する間は一覧から自動的に除外されます。`narou convert vs_<ID>` はメンバーを登録順に 1 つの EPUB へ結合し、各メンバーのタイトルを章見出しとして挿入します。Web API `/api/virtual_novels` と Web UI の登録・並べ替え・削除も追加しました。Worker も同じ登録・一覧・並べ替え・削除 API と、メンバーを結合した EPUB のダウンロード (`/api/virtual_novels/<id>/download.epub`) を持ちます。
+
+- **小説データの ZIP ダウンロード / アップロードを追加**しました。`narou export <作品...> [-o file.zip]` と `narou import <file.zip> [--overwrite|--skip]`、Web API `GET /api/transfer/export?ids=...` / `POST /api/transfer/import` を実装しました。ZIP には `manifest.json`（メタデータ・SHA-256）と `toc.yaml`・本文・`setting.ini`・`replace.txt`・`converter.yaml`・挿絵・EPUB が入り、取り込みは `toc_url` で既存作品を判定して新しい ID で追加、または上書き/スキップします。YAML・SQLite・S3 挿絵の各バックエンドは ObjectStore 経由で更新し、古いアーカイブで既存の本文・設定を削らないようにしています。アーカイブ処理は wasm-safe な共通コア (`src/transfer`) に分離し、Native CLI / Web API / Worker / ブラウザ WASM から同じコアを呼ぶ構成です（ブラウザ WASM の UI 接続は次の段階）。
+- **作品・タグ・作者・サイトの非表示設定を追加**しました。`narou hidden add/remove/list/clear` と `narou list --show-hidden`、Web UI の「非表示も表示」トグル・右クリック「非表示 / 表示に戻す」・非表示設定マネージャーで管理できます。タグ非表示はそのタグを持つ作品も一覧から隠し、作者・サイト単位でもまとめて隠せます。保存は在庫の `hidden` キー（Native は `.narou/hidden.yaml` / SQLite `app_state`、Worker は D1 `app_state`）で、更新・変換などの内部処理は非表示作品も対象のままです。
+- **異なるサイトの並列ダウンロードを整理**しました。`narou update` の並列化をサイトファミリー単位に変更し、なろう（`ncode` / `novel18` / 作者ページ / API）は同一グループとして直列、カクヨムと Pixiv のような別サイトは並列のままにしました。
+- **カクヨムの作者・更新の保持機構を強化**しました。カクヨムネクストの閲覧制限で目次から消えた保存済みの話を保持したまま、閲覧できる新着話だけを追加できるよう、カクヨムのサイト定義で `preserve_missing_sections: true` を有効にしました。話の index はカクヨムのエピソード ID（数値）で安定しているため、制限が解けたときに同じ話を二重に追加しません。制限で取得できない状態が続く場合は、従来どおり既存データを保持して更新を見送ります。
+
+変更一覧は [v0.4.18...v0.5.0](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.18...v0.5.0) を参照してください。
+
 ## v0.4.18 — データ保全の修正・二分アキの EPUB 反映・S3 挿絵プール・Pixiv 作者の R-18 取得
 
 - **話数が減った作品の更新を安全側に修正**しました（issue #41）。`download.choices-of-digest-options` が空欄、または指定した選択肢を使い切った場合は更新をキャンセルし、保存済みの目次・本文・EPUB を保持します。v0.4.17 で追加した「4〜8 の操作の後に暗黙に更新する」動作を取り消しました。更新続行には `1` の明示指定が必要です（例: `7` はフォルダ表示後にキャンセル、`7,1` は表示後に更新）。キャンセルは失敗件数に加算せず、キャンセルのみなら正常終了します。設定画面には 1〜8 の説明と、話数減少を受け入れる際の注意を追加しました。この修正は既に縮小された出力を自動復元するものではありません。

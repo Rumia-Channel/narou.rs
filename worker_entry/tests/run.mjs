@@ -217,4 +217,13 @@ if (exitCode === 0) {
   exitCode = authors.status ?? 1;
 }
 
+// Transfer archives are verified against two isolated databases (export from
+// one, import into a fresh one), so they never touch the persistent state.
+if (exitCode === 0) {
+  const transfer = spawnSync(process.execPath, [join(here, "transfer.mjs")], {
+    cwd: root, stdio: "inherit",
+  });
+  exitCode = transfer.status ?? 1;
+}
+
 process.exit(exitCode);

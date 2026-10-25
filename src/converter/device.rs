@@ -1087,7 +1087,8 @@ fn epub_engine_preference() -> EpubEngine {
     {
         return engine;
     }
-    crate::compat::load_global_setting_string("convert.epub-engine")
+    crate::compat::load_local_setting_string("convert.epub-engine")
+        .or_else(|| crate::compat::load_global_setting_string("convert.epub-engine"))
         .and_then(|value| parse_epub_engine(&value))
         .unwrap_or(EpubEngine::Auto)
 }

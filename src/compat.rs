@@ -709,6 +709,13 @@ pub fn convert_existing_novel(
     no_open: bool,
 ) -> std::result::Result<PathBuf, String> {
     let _lock = NovelLockGuard::acquire(Some(id)).map_err(|e| e.to_string())?;
+    // `DownloadResult.novel_dir` は `小説データ/...` の相対パスで返る。
+    // 変換は SQLite のオブジェクトを一時的に実ファイル化するが、その照合は
+    // 絶対 archive root と `strip_prefix` するため、相対パスのまま渡すと
+    // 実体化されず toc.yaml が見つからない (issue #39)。ここで必ず絶対パスへ
+    // 直してから設定・変換へ渡す。
+    let novel_dir = absolute_directory_path(novel_dir);
+    let novel_dir = novel_dir.as_path();
     let multi_device = load_local_setting_string("convert.multi-device").is_some();
     let devices = resolve_auto_convert_devices()?;
     let mut last_output_path = None;
