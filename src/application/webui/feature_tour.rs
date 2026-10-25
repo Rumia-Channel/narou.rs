@@ -178,7 +178,7 @@ pub const FEATURE_TOURS: &[FeatureTourEntry] = &[
         ],
     },
     FeatureTourEntry {
-        version: "0.5.0",
+        version: "0.5.1",
         title: "作品をまとめる「バーチャル小説」",
         body: "「XXX その1」「XXX その2」のような分かれた作品を、1つの作品として一覧に登録できます。実体は各作品のまま、EPUB だけを登録順に結合します。",
         items: &[
@@ -188,7 +188,7 @@ pub const FEATURE_TOURS: &[FeatureTourEntry] = &[
         ],
     },
     FeatureTourEntry {
-        version: "0.5.0",
+        version: "0.5.1",
         title: "作品・タグ・作者・サイトの非表示設定",
         body: "一覧に出したくない作品を、作品単位だけでなくタグ・作者・サイト単位でも隠せるようになりました。",
         items: &[
@@ -198,7 +198,7 @@ pub const FEATURE_TOURS: &[FeatureTourEntry] = &[
         ],
     },
     FeatureTourEntry {
-        version: "0.5.0",
+        version: "0.5.1",
         title: "小説データを ZIP で持ち出し・取り込み",
         body: "選択した作品の toc.yaml・本文・setting.ini・replace.txt・挿絵などを ZIP にまとめ、別のライブラリへ取り込めます。",
         items: &[
@@ -208,7 +208,7 @@ pub const FEATURE_TOURS: &[FeatureTourEntry] = &[
         ],
     },
     FeatureTourEntry {
-        version: "0.5.0",
+        version: "0.5.1",
         title: "異なるサイトの並列ダウンロード",
         body: "なろう・カクヨム・Pixiv などをサイト系列ごとに直列化し、異なる系列は並列に更新できるようになりました。",
         items: &[
@@ -338,3 +338,4 @@ mod tests {
     }
 
 }
+
