@@ -95,6 +95,46 @@ fn write_managed_novel(root: &Path) -> std::path::PathBuf {
     novel
 }
 
+/// issue #42 (追記): グローバル設定に `aozoraepub3dir` があり、ローカル設定で
+/// `convert.epub-engine: lite` を指定した場合は、ローカルの lite を優先する。
+///
+/// 以前は `convert.epub-engine` をグローバルからしか読んでいなかったため、
+/// 外部 AozoraEpub3 の場所が設定されていると lite 指定が無視されていた。
+#[cfg(feature = "lite")]
+#[test]
+fn local_lite_engine_wins_over_global_aozora_install() {
+    let temp = library();
+    let root = temp.path();
+    std::fs::create_dir_all(root.join("home/.narousetting")).unwrap();
+    let aozora = root.join("AozoraEpub3");
+    std::fs::create_dir_all(&aozora).unwrap();
+    std::fs::write(aozora.join("AozoraEpub3.jar"), b"not a jar").unwrap();
+    std::fs::write(
+        root.join("home/.narousetting/global_setting.yaml"),
+        format!(
+            "aozoraepub3dir: {}\nconvert.epub-engine: external\n",
+            aozora.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".narou/local_setting.yaml"),
+        "device: epub\nconvert.epub-engine: lite\n",
+    )
+    .unwrap();
+    let novel = write_managed_novel(root);
+
+    let output = run(root, &["convert", "1", "--no-open"]);
+    assert_success(&output, "convert 1 (local lite)");
+    assert!(
+        std::fs::read_dir(&novel)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "epub")),
+        "ローカルの convert.epub-engine: lite が外部設定に負けている"
+    );
+}
+
 /// 小説の `setting.ini` にオリジナル設定と同じ値 (`true`) を書いた場合も、
 /// `default.enable_half_indent_bracket: false` より優先されること。
 #[test]
