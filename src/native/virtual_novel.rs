@@ -49,6 +49,7 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
     let repository = NativeNovelRepository::new();
     let mut member_tags: Vec<String> = Vec::new();
     let mut latest_update: Option<chrono::DateTime<Utc>> = None;
+    let mut general_all_no = 0i64;
     for member in &input.members {
         let record = repository
             .get_sync(NovelId(*member))?
@@ -74,6 +75,18 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
         {
             latest_update = Some(updated);
         }
+        let count = match record.general_all_no {
+            Some(count) if count > 0 => count,
+            _ => {
+                let archive_root =
+                    db::with_database(|database| Ok(database.archive_root().to_path_buf()))?;
+                let dir = db::existing_novel_dir_for_record(&archive_root, &record);
+                read_toc(&dir)
+                    .map(|toc| toc.subtitles.len() as i64)
+                    .unwrap_or(0)
+            }
+        };
+        general_all_no += count;
     }
     if crate::native::virtual_novel::load()?
         .groups
@@ -100,12 +113,6 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
     tags.sort();
     tags.dedup();
 
-    let general_all_no = input
-        .members
-        .iter()
-        .filter_map(|member| repository.get_sync(NovelId(*member)).ok().flatten())
-        .filter_map(|record| record.general_all_no)
-        .sum::<i64>();
     let limit = load_length_limit("folder-length-limit", Some(50));
     let file_title = sanitize_filename_with_limit(&input.title, limit);
     let file_title = if file_title.is_empty() {

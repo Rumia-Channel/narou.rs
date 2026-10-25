@@ -16,7 +16,7 @@ fn write_fixture(root: &Path) {
   end: false
   last_update: "2026-01-02T00:00:00Z"
   general_lastup: "2026-01-01T00:00:00Z"
-  general_all_no: 1
+  general_all_no: 0
   length: 10
   tags: ["共通", "その1"]
 2:
@@ -113,6 +113,11 @@ fn virtual_novel_registers_hides_members_and_combines_text_in_order() {
         "virtual general_lastup must be the newest member date: {:?}",
         virtual_record["general_lastup"]
     );
+    assert_eq!(
+        virtual_record["general_all_no"].as_i64(),
+        Some(2),
+        "member section counts must be summed when general_all_no is unset"
+    );
 
     // Member rows are hidden from the regular list while they belong to the
     // virtual novel; the virtual row itself is a normal row.
@@ -150,4 +155,39 @@ fn virtual_novel_registers_hides_members_and_combines_text_in_order() {
     let second = text.find("ＢＯＤＹ－二").expect("second body");
     assert!(first < second, "members must stay in registration order");
     assert!(text.contains("Ａ その１") && text.contains("Ａ その２"));
+}
+
+#[test]
+fn virtual_conversion_uses_ncode_filename_when_enabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture(root);
+    let added = run(
+        root,
+        &[
+            "virtual", "add", "--title", "XXX", "--author", "Author", "--site", "mock.test", "1",
+            "2",
+        ],
+    );
+    assert!(added.status.success());
+    std::fs::write(
+        root.join(".narou/local_setting.yaml"),
+        "convert.filename-to-ncode: true\n",
+    )
+    .unwrap();
+
+    let converted = run(root, &["convert", "vs_3", "--no-epub"]);
+    assert!(
+        converted.status.success(),
+        "convert failed: {}{}",
+        String::from_utf8_lossy(&converted.stdout),
+        String::from_utf8_lossy(&converted.stderr)
+    );
+    let output = root
+        .join("小説データ/mock.test/XXX/narou_rs_vs_3.txt");
+    assert!(
+        output.is_file(),
+        "convert.filename-to-ncode のファイル名になっていない: {}",
+        output.display()
+    );
 }

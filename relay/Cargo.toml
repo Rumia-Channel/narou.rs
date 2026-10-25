@@ -1,6 +1,6 @@
 [package]
 name = "narou_relay"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 license = "BSD-2-Clause"
 description = "narou.rs の外部取得リレー (Cloudflare 保護サイト向け)"
@@ -33,3 +33,4 @@ tokio = { version = "1", features = [
     "time",
 ] }
 url = "2"
+

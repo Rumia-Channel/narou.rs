@@ -1321,6 +1321,18 @@ li.enable-selected.disabled a {
   border-radius: 0.35em;
   font-size: 0.9em;
 }
+#virtual-order-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+}
+#virtual-order-list .hidden-item {
+  display: flex;
+  width: 100%;
+}
+.virtual-order-title {
+  flex: 1;
+}
 .hidden-remove {
   border: 0;
   background: transparent;

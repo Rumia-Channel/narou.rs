@@ -1092,7 +1092,7 @@ limitations under the License.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_rs 0.5.2
+- narou_rs 0.5.3
 
 ```text
 BSD 2-Clause License
@@ -1227,7 +1227,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 - alloc-no-stdlib 3.0.0
-- brotli 9.0.0
+- brotli 9.1.0
 
 ```text
 Copyright (c) 2016 Dropbox, Inc.
@@ -1466,7 +1466,7 @@ DEALINGS IN THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- brotli 9.0.0
+- brotli 9.1.0
 
 ```text
 Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
@@ -5548,7 +5548,7 @@ SOFTWARE.
 Used by:
 - ua_generator 0.5.87
 - block2 0.6.2
-- brotli-decompressor 6.0.1
+- brotli-decompressor 6.2.0
 - chrono-tz-build 0.5.0
 - chrono-tz 0.10.4
 - dispatch2 0.3.1
