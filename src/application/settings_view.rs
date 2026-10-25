@@ -222,6 +222,7 @@ fn append_missing_indent_toggles(
         item["three_way"] = serde_json::json!(true);
         item["help"] = serde_json::json!(help);
         item["requires_restart"] = serde_json::json!(false);
+        item["default_value"] = serde_json::json!(base_name != "enable_force_indent");
         items.push(item);
     }
 }
