@@ -1576,4 +1576,17 @@ mod tests {
             "端末を明示した Kindle 変換で二分アキが付かない"
         );
     }
+
+    #[test]
+    fn lite_preset_dir_uses_the_current_directory_preset() {
+        let temp = tempfile::tempdir().unwrap();
+        let preset = temp.path().join("preset");
+        std::fs::create_dir_all(&preset).unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        let found = super::lite_preset_dir().expect("preset directory");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            preset.canonicalize().unwrap()
+        );
+    }
 }

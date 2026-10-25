@@ -234,3 +234,59 @@ fn lite_epub_includes_half_indent_css_and_markup() {
         "EPUB に二分アキの span が入っていない:\n{xhtml}"
     );
 }
+
+#[cfg(feature = "lite")]
+fn epub_entry_names(novel: &Path) -> Vec<String> {
+    use std::io::Read;
+    let epub = std::fs::read_dir(novel)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "epub"))
+        .expect("EPUB output");
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(epub).unwrap()).unwrap();
+    let mut names = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        names.push(entry.name().to_string());
+    }
+    names.sort();
+    names
+}
+
+/// issue #45: 配布物の `preset/AozoraEpub3.ini` を編集すると、組み込み
+/// エンジンの実際の EPUB 出力が変わること。`TitlePage=0` は扉ページを
+/// 生成しないため、ZIP のエントリ構成で確認できる。
+#[cfg(feature = "lite")]
+#[test]
+fn lite_preset_ini_is_read_by_the_real_binary() {
+    let temp = library();
+    let root = temp.path();
+    std::fs::write(
+        root.join(".narou/local_setting.yaml"),
+        "device: epub\nconvert.epub-engine: lite\n",
+    )
+    .unwrap();
+    let novel = write_managed_novel(root);
+
+    let first = run(root, &["convert", "1", "--no-open"]);
+    assert_success(&first, "convert 1 (no preset)");
+    let without_preset = epub_entry_names(&novel);
+
+    std::fs::create_dir_all(root.join("preset")).unwrap();
+    std::fs::write(
+        root.join("preset/AozoraEpub3.ini"),
+        "TitlePage=0\n",
+    )
+    .unwrap();
+    let second = run(root, &["convert", "1", "--no-open"]);
+    assert_success(&second, "convert 1 (preset TitlePage=0)");
+    let with_preset = epub_entry_names(&novel);
+
+    assert_ne!(
+        without_preset, with_preset,
+        "preset/AozoraEpub3.ini が組み込みエンジンに反映されていない"
+    );
+}
