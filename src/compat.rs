@@ -245,8 +245,9 @@ pub fn aozora_assets_dir() -> Option<PathBuf> {
 /// 組み込みエンジン (AozoraEpub3_Lite) の設定ディレクトリ。
 ///
 /// 配布物の exe と同じ場所、または開発時のカレントディレクトリにある
-/// `preset/` を返す。ここには `AozoraEpub3.ini` と
-/// `custom_chuki_tag.txt` が入っており、外部 AozoraEpub3 の
+/// `preset/` を返す。ここには `AozoraEpub3.ini.default` (同梱の既定値) と
+/// `custom_chuki_tag.txt.default` があり、利用者は同じ名前の `.ini` /
+/// `.txt` (配布物には含まれない) を作って上書きできる。外部 AozoraEpub3 の
 /// `aozoraepub3dir` とは独立して編集できる (issue #45)。
 pub fn lite_preset_dir() -> Option<PathBuf> {
     let candidates = [

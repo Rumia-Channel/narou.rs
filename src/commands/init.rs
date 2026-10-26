@@ -275,7 +275,12 @@ fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> 
     let preset_dir = preset_dir()?;
     let aozora_dir = PathBuf::from(aozora_path);
 
-    let custom_chuki_tag = std::fs::read_to_string(preset_dir.join("custom_chuki_tag.txt"))?;
+    let custom_chuki_tag = narou_rs::preset::read_chuki_tag(&preset_dir).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "narou custom chuki tag not found",
+        )
+    })?;
     let chuki_tag_path = aozora_dir.join("chuki_tag.txt");
     let mut chuki_tag = std::fs::read_to_string(&chuki_tag_path)?;
     let embedded_mark = "### Narou.rb embedded custom chuki ###";
@@ -296,10 +301,18 @@ fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> 
     }
     std::fs::write(&chuki_tag_path, chuki_tag)?;
 
-    std::fs::copy(
-        preset_dir.join("AozoraEpub3.ini"),
-        aozora_dir.join("AozoraEpub3.ini"),
-    )?;
+    // インストール先の INI は「利用者設定 → 同梱の既定値 → 埋め込みの既定値」
+    // の順で決める。利用者設定 (`preset/AozoraEpub3.ini`) は配布物に含まれない
+    // ので、セルフアップデートで編集内容が消えない (issue #45)。
+    let ini_target = aozora_dir.join("AozoraEpub3.ini");
+    match narou_rs::preset::ini_candidates(&preset_dir).first() {
+        Some(source) => {
+            std::fs::copy(source, &ini_target)?;
+        }
+        None => {
+            std::fs::write(&ini_target, narou_rs::preset::DEFAULT_INI)?;
+        }
+    }
 
     // AozoraEpub3 はテンプレート配置によってカスタム CSS の書き込み先が変わる。
     // 1.1.1 以降の改造版 (電書協レイアウト) は `template/item/style_custom/font.css`
@@ -477,8 +490,8 @@ mod tests {
         let path = super::preset_dir().unwrap();
         let expected = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preset");
         assert_eq!(path, expected);
-        assert!(path.join("AozoraEpub3.ini").exists());
-        assert!(path.join("custom_chuki_tag.txt").exists());
+        assert!(path.join("AozoraEpub3.ini.default").exists());
+        assert!(path.join("custom_chuki_tag.txt.default").exists());
         assert!(path.join("vertical_font.css").exists());
         assert!(path.join("denshokyo_font.css").exists());
         assert!(path.join("denshokyo_font_with_dakuten.css").exists());

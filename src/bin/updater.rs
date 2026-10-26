@@ -342,6 +342,26 @@ fn copy_tree_overwrite(
     backups: &mut Vec<BackupEntry>,
     logger: &mut Logger,
 ) -> Result<(), String> {
+    copy_tree_overwrite_inner(src, dst, Path::new(""), backups, logger)
+}
+
+/// 更新で上書きしない利用者設定ファイル (配布物から相対のパス)。
+///
+/// `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` は利用者が
+/// 編集する設定で、配布物には `.default` として同梱する。更新で消えない
+/// ように、既存ファイルがあれば上書きしない (issue #45)。
+const USER_EDITABLE_FILES: &[&str] = &[
+    "preset/AozoraEpub3.ini",
+    "preset/custom_chuki_tag.txt",
+];
+
+fn copy_tree_overwrite_inner(
+    src: &Path,
+    dst: &Path,
+    rel: &Path,
+    backups: &mut Vec<BackupEntry>,
+    logger: &mut Logger,
+) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("ensure dir {dst:?}: {e}"))?;
     let entries = fs::read_dir(src).map_err(|e| format!("read_dir {src:?}: {e}"))?;
     for entry in entries {
@@ -351,9 +371,15 @@ fn copy_tree_overwrite(
             .map_err(|e| format!("file_type {:?}: {e}", entry.path()))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
+        let rel_path = rel.join(entry.file_name());
         if file_type.is_dir() {
-            copy_tree_overwrite(&src_path, &dst_path, backups, logger)?;
+            copy_tree_overwrite_inner(&src_path, &dst_path, &rel_path, backups, logger)?;
         } else if file_type.is_file() {
+            let rel_key = rel_path.to_string_lossy().replace('\\', "/");
+            if USER_EDITABLE_FILES.contains(&rel_key.as_str()) && dst_path.exists() {
+                logger.log(format!("keep user file: {dst_path:?}"));
+                continue;
+            }
             replace_file_with_backup(&src_path, &dst_path, backups, logger)?;
         }
     }
@@ -551,6 +577,42 @@ mod tests {
         assert_eq!(fs::read(dst.join("sub/b.txt")).unwrap(), b"new-b");
         assert_eq!(backups.len(), 1);
         assert!(backups[0].backup.ends_with("a.txt.old"));
+    }
+
+    #[test]
+    fn copy_tree_overwrite_keeps_the_user_preset_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(src.join("preset")).unwrap();
+        fs::create_dir_all(dst.join("preset")).unwrap();
+        fs::write(src.join("preset/AozoraEpub3.ini"), b"shipped").unwrap();
+        fs::write(src.join("preset/custom_chuki_tag.txt"), b"shipped-chuki").unwrap();
+        fs::write(src.join("preset/AozoraEpub3.ini.default"), b"default-ini").unwrap();
+        fs::write(dst.join("preset/AozoraEpub3.ini"), b"user-edit").unwrap();
+
+        let mut backups = Vec::new();
+        let mut logger = Logger { file: None };
+        copy_tree_overwrite(&src, &dst, &mut backups, &mut logger).unwrap();
+
+        assert_eq!(
+            fs::read(dst.join("preset/AozoraEpub3.ini")).unwrap(),
+            b"user-edit",
+            "利用者設定が更新で上書きされている"
+        );
+        assert_eq!(
+            fs::read(dst.join("preset/custom_chuki_tag.txt")).unwrap(),
+            b"shipped-chuki",
+            "存在しない利用者設定は配布物から入れられる"
+        );
+        assert_eq!(
+            fs::read(dst.join("preset/AozoraEpub3.ini.default")).unwrap(),
+            b"default-ini"
+        );
+        assert!(
+            backups.is_empty(),
+            "利用者設定はバックアップもしない: {backups:?}"
+        );
     }
 
     #[test]

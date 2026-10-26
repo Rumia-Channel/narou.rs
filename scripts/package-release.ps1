@@ -132,12 +132,20 @@ function Add-DirectoryToArchive {
         [string]$SourceDir,
 
         [Parameter(Mandatory = $true)]
-        [string]$EntryRoot
+        [string]$EntryRoot,
+
+        # 同梱しないファイル名 (相対パスからのファイル名)。
+        # 利用者が編集する設定ファイルは、セルフアップデートで
+        # 上書きされないよう配布物に入れない (issue #45)。
+        [string[]]$ExcludeFileNames = @()
     )
 
     $resolvedDir = (Resolve-Path -Path $SourceDir).Path
     $files = Get-ChildItem -Path $resolvedDir -Recurse -File
     foreach ($file in $files) {
+        if ($ExcludeFileNames -contains $file.Name) {
+            continue
+        }
         $relative = [System.IO.Path]::GetRelativePath($resolvedDir, $file.FullName)
         $entryPath = Join-Path -Path $EntryRoot -ChildPath $relative
         Add-FileToArchive -Archive $Archive -SourcePath $file.FullName -EntryPath $entryPath
@@ -204,6 +212,10 @@ try {
         -SourcePath $resolvedLoginBinary `
         -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedLoginBinary)))
 
+    # `preset/` の利用者が編集する設定ファイルは同梱しない。編集内容を
+    # 保持するため、複製して既定値 (`.default`) として同梱する。
+    $presetUserFiles = @("AozoraEpub3.ini", "custom_chuki_tag.txt")
+
     foreach ($resourceDir in $ResourceDirectories) {
         if ([string]::IsNullOrWhiteSpace($resourceDir)) {
             continue
@@ -212,10 +224,16 @@ try {
             throw "Required resource directory not found: $resourceDir"
         }
 
+        $exclude = @()
+        if ($resourceDir -eq "preset") {
+            $exclude = $presetUserFiles
+        }
+
         Add-DirectoryToArchive `
             -Archive $archive `
             -SourceDir $resourceDir `
-            -EntryRoot (Join-Path -Path $PackageRoot -ChildPath $resourceDir)
+            -EntryRoot (Join-Path -Path $PackageRoot -ChildPath $resourceDir) `
+            -ExcludeFileNames $exclude
     }
 
     foreach ($extraFile in $ExtraFiles) {

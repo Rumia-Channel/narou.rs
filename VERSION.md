@@ -3,6 +3,14 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
+## v0.5.4 (未リリース) — 組み込みエンジンの設定が更新で消えないよう修正
+
+- **組み込み AozoraEpub3_Lite の設定ファイルを更新で上書きしなくなりました**（issue #45 の続き）。配布物の `preset/AozoraEpub3.ini` は「利用者が編集する設定」と「配布物が持つ既定値」が同じファイル名だったため、セルフアップデートがファイルを置き換えると編集内容が無言で消えていました。
+  - 同梱する既定値を `preset/AozoraEpub3.ini.default` に改名し、利用者が編集する `preset/AozoraEpub3.ini` は配布物に含めないようにしました。これで更新しても編集内容が残り、既存の利用者は編集したファイルを置いたまま更新できます。
+  - narou のカスタム注記 (`preset/custom_chuki_tag.txt`) も同じ方法で分けました (利用者設定 `custom_chuki_tag.txt` / 同梱の既定値 `custom_chuki_tag.txt.default`)。
+  - 設定の解決順は「利用者設定 → 同梱の既定値 → 埋め込みの既定値」です。編集したい場合は `preset/AozoraEpub3.ini.default` を同じフォルダの `AozoraEpub3.ini` にコピーして編集してください。
+  - パッケージ (`scripts/package-release.ps1`) は `preset/` の利用者設定を同梱から除外し、セルフアップデート (`src/bin/updater.rs`) も既存の `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` は上書きしません。
+
 ## v0.5.3 — バーチャル小説の話数・ファイル名・登録順 UI 修正
 
 - **仮想小説の話数が 0 になる問題を修正**しました。メンバーの `general_all_no` が未設定の場合は目次 (`toc.yaml`) から話数を数え、合計を仮想小説へ設定します。
