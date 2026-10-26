@@ -885,7 +885,7 @@ fn add_dc_subject_to_epub(
         let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
         let mut body = Vec::new();
         entry.read_to_end(&mut body).map_err(|e| e.to_string())?;
-        entries.push((entry.name().to_string(), body));
+        entries.push((entry.name().map_err(|e| e.to_string())?.to_string(), body));
     }
 
     let Some(opf_index) = entries

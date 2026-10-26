@@ -103,7 +103,7 @@ mod tests {
     use super::{RateLimiter, STATE};
     use crate::platform::{DownloadPacing, RateLimitScope};
 
-    static TEST_MUTEX: Mutex<()> = parking_lot::const_mutex(());
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     fn reset_state() {
         STATE.lock().clear();

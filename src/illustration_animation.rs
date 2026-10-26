@@ -267,7 +267,11 @@ fn frame_names(archive: &[u8]) -> Result<Vec<String>> {
     let mut zip = zip::ZipArchive::new(cursor)
         .map_err(|error| NarouError::Platform(format!("animation archive: {error}")))?;
     let mut names: Vec<String> = (0..zip.len())
-        .filter_map(|index| zip.by_index(index).ok().map(|file| file.name().to_string()))
+        .filter_map(|index| {
+            zip.by_index(index)
+                .ok()
+                .and_then(|file| file.name().ok().map(|name| name.to_string()))
+        })
         .filter(|name| !name.ends_with('/'))
         .collect();
     names.sort();

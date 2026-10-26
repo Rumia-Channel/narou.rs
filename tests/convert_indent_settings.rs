@@ -212,7 +212,7 @@ fn lite_epub_includes_half_indent_css_and_markup() {
     let mut xhtml = String::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).unwrap();
-        let name = entry.name().to_string();
+        let name = entry.name().unwrap().to_string();
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
         if name.ends_with("style/vertical_font.css") {
@@ -250,7 +250,7 @@ fn epub_entry_names(novel: &Path) -> Vec<String> {
         let mut entry = archive.by_index(index).unwrap();
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
-        names.push(entry.name().to_string());
+        names.push(entry.name().unwrap().to_string());
     }
     names.sort();
     names

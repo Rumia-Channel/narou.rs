@@ -315,7 +315,7 @@ pub(crate) fn parse_archive_with_limits(bytes: &[u8], limits: Limits) -> Result<
 
     for index in 0..archive.len() {
         let file = archive.by_index(index)?;
-        let raw_name = file.name().to_owned();
+        let raw_name = file.name()?.into_owned();
         let is_dir = file.is_dir();
         let size = file.size();
 
@@ -864,7 +864,7 @@ mod tests {
         assert_eq!(first, second);
 
         let mut archive = ZipArchive::new(Cursor::new(&first)).unwrap();
-        assert_eq!(archive.by_index(0).unwrap().name(), MANIFEST_PATH);
+        assert_eq!(archive.by_index(0).unwrap().name().unwrap(), MANIFEST_PATH);
     }
 
     #[test]

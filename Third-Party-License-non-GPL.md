@@ -67,7 +67,7 @@ the time of this audit.
 | argon2 | ^0.6 | MIT OR Apache-2.0 |
 | axum | ^0.8 | MIT |
 | base64 | ^0.23 | MIT OR Apache-2.0 |
-| base64 (build) | ^0.22 | MIT OR Apache-2.0 |
+| base64 (build) | ^0.23 | MIT OR Apache-2.0 |
 | brotli | ^9.0 | BSD-3-Clause AND MIT |
 | chacha20poly1305 | ^0.11 | Apache-2.0 OR MIT |
 | chrono | ^0.4 | MIT OR Apache-2.0 |
@@ -79,7 +79,7 @@ the time of this audit.
 | curl | ^0.4 | MIT |
 | dashmap | ^6 | MIT |
 | encoding_rs | ^0.8 | (Apache-2.0 OR MIT) AND BSD-3-Clause |
-| fancy-regex | ^0.19 | MIT |
+| fancy-regex | ^0.20 | MIT |
 | fs2 | ^0.4 | MIT/Apache-2.0 |
 | futures | ^0.3 | MIT OR Apache-2.0 |
 | getrandom | ^0.4 | MIT OR Apache-2.0 |
@@ -89,16 +89,16 @@ the time of this audit.
 | indicatif | ^0.18 | MIT |
 | lettre | ^0.11 | MIT |
 | libc | ^0.2 | MIT OR Apache-2.0 |
-| mailparse (dev) | ^0.17 | 0BSD |
+| mailparse (dev) | ^0.18 | 0BSD |
 | miniz_oxide | ^0.9 | MIT OR Zlib OR Apache-2.0 |
 | open | ^5 | MIT |
-| parking_lot | ^0.12 | MIT OR Apache-2.0 |
+| parking_lot | ^0.13 | MIT OR Apache-2.0 |
 | pest | ^2.8 | MIT OR Apache-2.0 |
 | pest_derive | ^2.8 | MIT OR Apache-2.0 |
 | psl | ^2.1.241 | MIT/Apache-2.0 |
 | regex | ^1 | MIT OR Apache-2.0 |
 | reqwest | ^0.13 | MIT OR Apache-2.0 |
-| rusqlite | ^0.40 | MIT |
+| rusqlite | ^0.41 | MIT |
 | serde | ^1 | MIT OR Apache-2.0 |
 | serde_json | ^1 | MIT OR Apache-2.0 |
 | serde_yaml | ^0.9 | MIT OR Apache-2.0 |
@@ -113,13 +113,13 @@ the time of this audit.
 | tokio | ^1 | MIT |
 | tracing | ^0.1 | MIT |
 | tracing-subscriber | ^0.3 | MIT |
-| tray-icon (Windows) | ^0.25 | MIT OR Apache-2.0 |
+| tray-icon (Windows) | ^0.26 | MIT OR Apache-2.0 |
 | tungstenite | ^0.30 | MIT OR Apache-2.0 |
 | ua_generator | ^0.5 | MIT |
 | unicode-normalization | ^0.1 | MIT OR Apache-2.0 |
 | url | ^2 | MIT OR Apache-2.0 |
 | windows-sys (Windows) | ^0.61 | MIT OR Apache-2.0 |
-| zip | ^8.5 | MIT |
+| zip | ^9.1 | MIT |
 
 
 ## 4. Cargo dependency license overview
@@ -132,7 +132,7 @@ dependency).
 
 | License | Used by |
 | --- | ---: |
-| MIT License | 311 |
+| MIT License | 314 |
 | Unicode License v3 | 20 |
 | Apache License 2.0 | 7 |
 | BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License | 7 |
@@ -1901,8 +1901,8 @@ DEALINGS IN THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- libsqlite3-sys 0.38.2
-- rusqlite 0.40.2
+- libsqlite3-sys 0.39.1
+- rusqlite 0.41.0
 
 ```text
 Copyright (c) 2014 The rusqlite developers
@@ -2472,7 +2472,10 @@ THE SOFTWARE.
 
 Used by:
 - lock_api 0.4.14
+- lock_api 0.5.0
 - parking_lot 0.12.5
+- parking_lot 0.13.0
+- parking_lot_core 0.10.0
 - parking_lot_core 0.9.12
 - thread_local 1.1.10
 
@@ -5454,8 +5457,8 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- muda 0.20.0
-- tray-icon 0.25.1
+- muda 0.21.2
+- tray-icon 0.26.1
 
 ```text
 MIT License
@@ -5846,7 +5849,7 @@ Used by:
 - syn 3.0.9
 - thiserror-impl 2.0.21
 - thiserror 2.0.21
-- typed-path 0.12.4
+- typed-path 0.13.0
 - unicode-ident 1.0.27
 - unsafe-libyaml 0.2.11
 - zmij 1.0.23
@@ -5947,7 +5950,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ### MIT License (`MIT`)
 
 Used by:
-- fancy-regex 0.19.2
+- fancy-regex 0.20.0
 
 ```text
 The MIT License
@@ -5978,7 +5981,7 @@ THE SOFTWARE.
 
 Used by:
 - tracing-core 0.1.36
-- zip 8.6.0
+- zip 9.1.1
 
 ```text
 The MIT License (MIT)

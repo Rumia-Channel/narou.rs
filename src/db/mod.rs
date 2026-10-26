@@ -35,7 +35,7 @@ use parking_lot::Mutex;
 use crate::error::{NarouError, Result};
 
 #[cfg(feature = "native-runtime")]
-pub static DATABASE: Mutex<Option<Database>> = parking_lot::const_mutex(None);
+pub static DATABASE: Mutex<Option<Database>> = Mutex::new(None);
 
 #[cfg(feature = "native-runtime")]
 pub fn init_database() -> Result<()> {

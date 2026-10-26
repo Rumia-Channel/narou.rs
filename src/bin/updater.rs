@@ -304,7 +304,15 @@ fn extract_zip(zip_path: &Path, dest: &Path, logger: &mut Logger) -> Result<Path
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("zip entry {i}: {e}"))?;
-        let entry_name = entry.name().to_string();
+        let entry_name = match entry.name() {
+            Ok(name) => name.to_string(),
+            Err(error) => {
+                // zip 9 は entry 名が復号できないと Err を返す。名前のない
+                // エントリは展開先を決められないので、不審なエントリと同じく読み飛ばす。
+                logger.log(format!("skip zip entry with undecodable name: {error}"));
+                continue;
+            }
+        };
         let Some(rel) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
             logger.log(format!("skip suspicious zip entry: {entry_name}"));
             continue;
