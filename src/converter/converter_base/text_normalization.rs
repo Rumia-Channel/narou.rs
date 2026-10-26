@@ -68,7 +68,7 @@ impl ConverterBase {
                                     .as_ref()
                                     .map(|inspector| {
                                         inspector
-                                            .borrow_mut()
+                                            .lock()
                                             .validate_joined_inner_brackets(raw, &joined)
                                     })
                                     .unwrap_or(false);
@@ -91,7 +91,7 @@ impl ConverterBase {
             if self.settings.enable_inspect
                 && let Some(ref inspector) = self.inspector
             {
-                inspector.borrow_mut().inspect_invalid_openclose_brackets(
+                inspector.lock().inspect_invalid_openclose_brackets(
                     &transformed,
                     open,
                     close,

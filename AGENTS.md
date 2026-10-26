@@ -453,6 +453,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **なろう**: narou.rb参照データと完全互換確認済み
 - **カクヨム (ID=1177354055617350769)**: **完全互換達成** — 行数完全一致 (25,273/25,273)、行単位 diff 0件。`tests/convert_parity.rs` のローカル参照 fixture で byte-for-byte 確認済み（通常の `cargo test` では ignored。参照データを用意して明示実行する手順は `tests/README.md`）
 - ※米印変換、全角数字、ルビ、auto_join_line、各種文字変換も完全一致
+- **変換の future は `Send`** (2026-10 修正): 調査ログ用に `NovelConverter` が保持する `Inspector` は `Arc<parking_lot::Mutex<Inspector>>` で共有する。`Rc<RefCell<_>>` のままだと `ConvertService::convert_and_store` / `convert_only` の future が非 `Send` になり、並列実行へ渡すと実行時 panic する (clippy `future_not_send` で検出)。非 `Send` の future があるときは `clippy::future_not_send` を ignore するのではなく、型を `Send` にして解消する。
 
 ### AozoraEpub3_Lite 組み込みエンジン (lite feature, 2026-09)
 - pin: `aozora_epub3_lite` = `381c0b17f91946e22d41e5246d3977c706abe82e` (v0.1.6)。この revision は wasm の JS 時計対応に加え、I/O 非依存の逐次画像収集 `AssetPlan` を公開する。更新時は Cargo 経由で git revision を指定し、`cargo update -p aozora_epub3_lite` と native / Worker の実出力を検証する。

@@ -11,13 +11,12 @@ pub mod render;
 pub mod settings;
 pub mod user_converter;
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(feature = "native-runtime")]
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 #[cfg(feature = "native-runtime")]
 use serde::Deserialize;
 use serde::Serialize;
@@ -124,7 +123,7 @@ pub struct NovelConverter {
     #[cfg(feature = "native-runtime")]
     last_text_path: Option<std::path::PathBuf>,
     progress: Option<Box<dyn ProgressReporter>>,
-    inspector: Rc<RefCell<inspector::Inspector>>,
+    inspector: Arc<Mutex<inspector::Inspector>>,
     display_inspector: bool,
     last_inspection_output: Option<String>,
     use_dakuten_font: bool,
@@ -281,7 +280,7 @@ impl NovelConverter {
         user_converter: Option<UserConverter>,
         mut capabilities: Option<ConverterCapabilities>,
     ) -> Self {
-        let inspector = Rc::new(RefCell::new(inspector::Inspector::new(&settings)));
+        let inspector = Arc::new(Mutex::new(inspector::Inspector::new(&settings)));
         let illustration_store = capabilities
             .as_mut()
             .and_then(|caps| caps.illustration_index.take())
@@ -457,7 +456,7 @@ impl NovelConverter {
             } else {
                 chapter.trim().to_string()
             };
-            self.inspector.borrow_mut().set_subtitle(inspect_subtitle);
+            self.inspector.lock().set_subtitle(inspect_subtitle);
 
             let is_html =
                 section.element.data_type != "text" && section.element.data_type != "text/plain";
@@ -617,13 +616,13 @@ impl NovelConverter {
         }
 
         if self.settings.enable_erase_introduction && erased_intro_count > 0 {
-            self.inspector.borrow_mut().info(format!(
+            self.inspector.lock().info(format!(
                 "前書きをすべて削除しました。削除した数は{}個です。",
                 erased_intro_count
             ));
         }
         if self.settings.enable_erase_postscript && erased_post_count > 0 {
-            self.inspector.borrow_mut().info(format!(
+            self.inspector.lock().info(format!(
                 "後書きをすべて削除しました。削除した数は{}個です。",
                 erased_post_count
             ));
@@ -926,7 +925,7 @@ impl NovelConverter {
                     Ok(stored) => {
                         if stored.created {
                             self.inspector
-                                .borrow_mut()
+                                .lock()
                                 .info(format!("挿絵「{}」を保存しました。", stored.filename));
                         }
                         Some(format!("挿絵/{}", stored.filename))
@@ -955,7 +954,7 @@ impl NovelConverter {
                 match crate::illustration_animation::assemble_animation(&url, &bytes) {
                     Some(Ok(apng)) => (apng, "image/png".to_string()),
                     Some(Err(err)) => {
-                        self.inspector.borrow_mut().error(format!(
+                        self.inspector.lock().error(format!(
                             "Illustration#assemble_animation: {url} の組み立てに失敗しました({err})"
                         ));
                         (bytes, content_type)
@@ -964,7 +963,7 @@ impl NovelConverter {
                 }
             }
             Err(err) => {
-                self.inspector.borrow_mut().error(format!(
+                self.inspector.lock().error(format!(
                     "Illustration#download_image: {} を処理中に例外が発生しました({})",
                     url, err
                 ));
@@ -974,7 +973,7 @@ impl NovelConverter {
         let ext = match illustration_extension_from_content_type(&content_type) {
             Some(ext) => ext,
             None => {
-                self.inspector.borrow_mut().error(format!(
+                self.inspector.lock().error(format!(
                     "Illustration#download_image: {} は未対応の画像フォーマットです(content-type: {})",
                     url, content_type
                 ));
@@ -996,7 +995,7 @@ impl NovelConverter {
             Some(stored) => {
                 if stored.created {
                     self.inspector
-                        .borrow_mut()
+                        .lock()
                         .info(format!("挿絵「{}」を保存しました。", stored.filename));
                 }
                 Some(format!("挿絵/{}", stored.filename))
@@ -1038,14 +1037,14 @@ impl NovelConverter {
     #[cfg(feature = "native-runtime")]
     pub fn convert_text_file(&mut self, text: &str) -> Result<String> {
         self.last_inspection_output = None;
-        self.inspector.borrow_mut().reset();
+        self.inspector.lock().reset();
         self.use_dakuten_font = false;
 
         let mut converter = self.make_converter();
         let mut aozora_text = converter.convert(text, converter_base::TextType::TextFile);
         self.use_dakuten_font |= converter.use_dakuten_font;
         if !self.settings.enable_enchant_midashi {
-            self.inspector.borrow_mut().info(
+            self.inspector.lock().info(
                 "テキストファイルの処理を実行しましたが、改行直後の見出し付与は有効になっていません。setting.ini の enable_enchant_midashi を true にすることをお薦めします。".to_string(),
             );
         }
@@ -1095,7 +1094,7 @@ impl NovelConverter {
     #[cfg(feature = "native-runtime")]
     pub fn convert_novel_by_id(&mut self, id: i64, novel_dir: &std::path::Path) -> Result<String> {
         self.last_inspection_output = None;
-        self.inspector.borrow_mut().reset();
+        self.inspector.lock().reset();
         // ミラーを書かない構成では実ファイルが無いので、変換の間だけ取り出す。
         let _materialized = materialize_for_conversion(novel_dir)?;
         self.attach_store_illustration_storage(novel_dir);
@@ -1208,7 +1207,7 @@ impl NovelConverter {
     ) -> Result<PathBuf> {
         self.apply_record_fetch_policy(self.resolve_novel_record(_id).as_ref());
         self.last_inspection_output = None;
-        self.inspector.borrow_mut().reset();
+        self.inspector.lock().reset();
         // ミラーを書かない構成では実ファイルが無いので、変換の間だけ取り出す。
         let _materialized = materialize_for_conversion(novel_dir)?;
         self.attach_store_illustration_storage(novel_dir);
@@ -1339,18 +1338,18 @@ impl NovelConverter {
     fn inspect_converted_text(&mut self, aozora_text: &str) -> Result<()> {
         if self.settings.enable_inspect {
             self.inspector
-                .borrow_mut()
+                .lock()
                 .inspect_end_touten_conditions(aozora_text, self.settings.enable_auto_join_line);
-            self.inspector.borrow_mut().countup_return_in_brackets(
+            self.inspector.lock().countup_return_in_brackets(
                 aozora_text,
                 self.settings.enable_auto_join_in_brackets,
             );
         }
-        self.inspector.borrow().save().map_err(NarouError::Io)?;
+        self.inspector.lock().save().map_err(NarouError::Io)?;
         self.last_inspection_output = if self.display_inspector {
-            self.inspector.borrow().display_text()
+            self.inspector.lock().display_text()
         } else {
-            self.inspector.borrow().summary_text()
+            self.inspector.lock().summary_text()
         };
         Ok(())
     }

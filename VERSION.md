@@ -15,6 +15,11 @@
 - **ログイン資格情報の鍵ファイル (`.narou/login.key`) を作る時から 0600 に** なりました。作成後に権限を締める実装では、その間のファイルが umask 由来（通常 0644）で他ユーザーから読め、鍵が露出すると保存済み Cookie を復号できました。
 - **デプロイ用の秘密ファイル (`worker_entry/.deploy-secrets-*.json`) の扱いを強化**しました。値を GitHub のログマスクに登録し、Unix では 0600 で作成します。
 - **依存クレートを更新しました**（`cargo update`、MSRV 1.99.1 互換のなかでの最新）。`brotli` 9.0.0 → 9.1.0、`brotli-decompressor` 6.0.1 → 6.2.0、`ctutils` 0.4.5 → 0.4.6。`brotli` 9.1.0 は **CVE-2026-111497**（Google Brotli デコーダの範囲外書き込み）に対応する版で、該当しうる入力に正しいエラーコードを返すため、保存オブジェクトの brotli 展開経路も保護されます（外部応答の展開は従来どおり無効のまま）。`about-probe` の `Cargo.lock` と同梱ライセンス (`Third-Party-License.md` / `Third-Party-License-non-GPL.md`) も同時に更新しました。
+- **依存クレートをメジャーバージョンまで更新しました**。`zip` 8.5 → 9.1、`rusqlite` 0.40 → 0.41、`parking_lot` 0.12 → 0.13、`fancy-regex` 0.19 → 0.20、`tray-icon` 0.25 → 0.26、`mailparse` 0.17 → 0.18、ビルド依存の `base64` 0.22 → 0.23。API 差分は次のように吸収しました。
+  - `parking_lot` 0.13 で `const_mutex` が廃止されたため、定数初期化は `Mutex::new` に変更しました。
+  - `zip` 9 はエントリ名を `Result<Cow<str>, ZipError>` で返すようになりました。復号できない名前は「読めない」として扱い、小説データの取り込みはエラー、セルフアップデートの展開は読み飛ばし、リリース資産の検証は中止（fail closed）にしています。
+  - `worker_entry` の `parking_lot` も 0.13 に揃え、依存グラフに `lock_api` 0.4 と 0.5 が混在して `Mutex` の型が食い違わないようにしました。
+- **変換の future が `Send` でない問題を解消しました**。変換コアが調査ログ用に保持していた `Rc<RefCell<Inspector>>` を `Arc<Mutex<Inspector>>` に変更し、`ConvertService` の future が `Send` になりました（clippy の `future_not_send` で検出される非 `Send` future が 0 件）。変換結果（本文テキスト・EPUB・調査ログ）は変更前とバイト単位で一致することを確認済みです。
 
 ## v0.5.3 — バーチャル小説の話数・ファイル名・登録順 UI 修正
 
