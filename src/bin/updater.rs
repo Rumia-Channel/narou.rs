@@ -623,6 +623,185 @@ mod tests {
         );
     }
 
+    /// リリース zip (narou/ をルートに持つ配置) の展開。
+    ///
+    /// zip 9 でエントリ名の返し方が変わり (`Result`)、`enclosed_name()` の
+    /// 判定も厳しくなった。更新の入口なので、ルート検出・展開・
+    /// 展開先外への書き出し防止をここで固定する。
+    #[test]
+    fn extract_zip_expands_the_release_layout_and_blocks_escapes() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("release.zip");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        for name in [
+            "narou/narou_rs.exe",
+            "narou/narou_rs_updater.exe.new",
+            "narou/preset/AozoraEpub3.ini.default",
+            "narou/webnovel/ncode.syosetu.com.yaml",
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(name.as_bytes()).unwrap();
+        }
+        // 展開先に影響するエントリ (相対・絶対・ドライバー付き)。
+        for name in [
+            "../escape.txt",
+            "/absolute.txt",
+            "narou/../../escape.txt",
+            r"C:\escape.txt",
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(b"escape").unwrap();
+        }
+        writer.finish().unwrap();
+
+        let mut logger = Logger { file: None };
+        let root = extract_zip(&zip_path, &dest, &mut logger).unwrap();
+
+        // ルートは narou/ を指す。
+        assert!(root.ends_with("narou"), "unexpected root: {root:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("narou_rs.exe")).unwrap(),
+            "narou/narou_rs.exe"
+        );
+        assert!(root.join("narou_rs_updater.exe.new").is_file());
+        assert!(root.join("preset/AozoraEpub3.ini.default").is_file());
+        assert!(root.join("webnovel/ncode.syosetu.com.yaml").is_file());
+
+        // 展開先の外には何も書かれない。
+        // zip 9 の `enclosed_name` は `..` を拒否し、絶対パスや
+        // ドライブ接頭辞は「先頭で相対化した名前」に落とす。どちらの場合も
+        // 展開先 (dest) の内側に留まることを確認する。
+        let written = list_tree(&dest);
+        assert!(
+            written.iter().all(|path| path.starts_with(dest.to_str().unwrap())),
+            "展開先外にファイルが書かれた: {written:?}"
+        );
+        assert!(
+            !tmp.path().join("escape.txt").exists(),
+            "展開先外に escape.txt が書かれた: {written:?}"
+        );
+        // `..` を含むエントリは読み飛ばされる (相対パスへ正規化されない)。
+        assert!(
+            !written.iter().any(|path| path.contains("..")),
+            "`..` を含むファイルが展開された: {written:?}"
+        );
+    }
+
+    /// ディレクトリ配下のファイル名をすべて集める (テスト用)。
+    fn list_tree(dir: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return names;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                names.extend(list_tree(&path));
+            } else {
+                names.push(path.to_string_lossy().to_string());
+            }
+        }
+        names
+    }
+
+    /// UTF-8 でない名前のエントリは CP437 として復号され、展開先の中に
+    /// 書かれる。
+    ///
+    /// zip 9 の `name()` は UTF-8 で復号できなければ CP437 に落とすため
+    /// 名前が読めないことは実質ない。それでも hostile な名前が展開先外に
+    /// 出ないことを固定する。
+    #[test]
+    fn extract_zip_keeps_non_utf8_names_inside_the_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("nonutf8.zip");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(&zip_path, zip_with_non_utf8_name()).unwrap();
+
+        let mut logger = Logger { file: None };
+        let root = extract_zip(&zip_path, &dest, &mut logger).unwrap();
+
+        // 展開は成功し、ファイルは展開先の中にだけ置かれる。
+        let written = list_tree(&dest);
+        assert!(
+            written.iter().all(|path| path.starts_with(dest.to_str().unwrap())),
+            "展開先外にファイルが書かれた: {written:?}"
+        );
+        assert!(!tmp.path().join("bin").exists());
+        assert!(root.is_dir());
+    }
+
+    /// UTF-8 でない名前のエントリを持つ zip をバイト列で作る。
+    fn zip_with_non_utf8_name() -> Vec<u8> {
+        fn u16le(value: u16, out: &mut Vec<u8>) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        fn u32le(value: u32, out: &mut Vec<u8>) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let name = b"narou/\xff\xfe.bin";
+        let data = b"binary";
+        let crc = crc32fast::hash(data);
+
+        let mut out = Vec::new();
+        // Local file header
+        u32le(0x0403_4b50, &mut out);
+        u16le(10, &mut out); // version needed
+        u16le(0, &mut out); // flags (UTF-8 フラグなし → CP437 で復号される)
+        u16le(0, &mut out); // method: stored
+        u16le(0, &mut out); // time
+        u16le(0, &mut out); // date
+        u32le(crc, &mut out);
+        u32le(data.len() as u32, &mut out);
+        u32le(data.len() as u32, &mut out);
+        u16le(name.len() as u16, &mut out);
+        u16le(0, &mut out); // extra
+        out.extend_from_slice(name);
+        out.extend_from_slice(data);
+
+        let central_offset = out.len();
+        // Central directory header
+        u32le(0x0201_4b50, &mut out);
+        u16le(20, &mut out); // version made by
+        u16le(10, &mut out); // version needed
+        u16le(0, &mut out); // flags (UTF-8 フラグなし)
+        u16le(0, &mut out); // method
+        u16le(0, &mut out); // time
+        u16le(0, &mut out); // date
+        u32le(crc, &mut out);
+        u32le(data.len() as u32, &mut out);
+        u32le(data.len() as u32, &mut out);
+        u16le(name.len() as u16, &mut out);
+        u16le(0, &mut out); // extra
+        u16le(0, &mut out); // comment
+        u16le(0, &mut out); // disk number
+        u16le(0, &mut out); // internal attributes
+        u32le(0, &mut out); // external attributes
+        u32le(0, &mut out); // local header offset
+        out.extend_from_slice(name);
+
+        let central_size = out.len() - central_offset;
+        // End of central directory
+        u32le(0x0605_4b50, &mut out);
+        u16le(0, &mut out); // disk number
+        u16le(0, &mut out); // disk with central directory
+        u16le(1, &mut out); // entries on this disk
+        u16le(1, &mut out); // total entries
+        u32le(central_size as u32, &mut out);
+        u32le(central_offset as u32, &mut out);
+        u16le(0, &mut out); // comment length
+        out
+    }
+
     #[test]
     fn rollback_restores_backups() {
         let tmp = tempfile::tempdir().unwrap();
