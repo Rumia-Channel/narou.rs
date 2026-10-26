@@ -14,6 +14,7 @@
 - **loopback 起動の Web UI で、reverse proxy モードでも UI トークンを要求する**ようにしました。同じ端末の別プロセス（ブラウザ拡張や他のローカルアプリ）は `Host` / `Origin` ヘッダを自由に書けるため、これらは認証の代替になりません。以前は `server-reverse-proxy.enable=true` の場合だけ loopback のトークン要求が外れており、その構成では認証なしで API を操作できました。ブートストラップチケットは使う origin（Host）ごとに 1 回だけ有効なので、reverse proxy 経由の公開ホストと直接アクセスの両方から開けます。起動時にチケット付きの URL を常設表示し、proxy 経由の URL にもチケットを付ける案内を出します。
 - **ログイン資格情報の鍵ファイル (`.narou/login.key`) を作る時から 0600 に** なりました。作成後に権限を締める実装では、その間のファイルが umask 由来（通常 0644）で他ユーザーから読め、鍵が露出すると保存済み Cookie を復号できました。
 - **デプロイ用の秘密ファイル (`worker_entry/.deploy-secrets-*.json`) の扱いを強化**しました。値を GitHub のログマスクに登録し、Unix では 0600 で作成します。
+- **依存クレートを更新しました**（`cargo update`、MSRV 1.99.1 互換のなかでの最新）。`brotli` 9.0.0 → 9.1.0、`brotli-decompressor` 6.0.1 → 6.2.0、`ctutils` 0.4.5 → 0.4.6。`brotli` 9.1.0 は **CVE-2026-111497**（Google Brotli デコーダの範囲外書き込み）に対応する版で、該当しうる入力に正しいエラーコードを返すため、保存オブジェクトの brotli 展開経路も保護されます（外部応答の展開は従来どおり無効のまま）。`about-probe` の `Cargo.lock` と同梱ライセンス (`Third-Party-License.md` / `Third-Party-License-non-GPL.md`) も同時に更新しました。
 
 ## v0.5.3 — バーチャル小説の話数・ファイル名・登録順 UI 修正
 

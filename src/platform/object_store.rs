@@ -740,6 +740,41 @@ mod tests {
         assert!(ObjectKey::try_new(r"C:\escape").is_err());
     }
 
+    /// 壊れた brotli ペイロードは panic ではなくエラーになること。
+    ///
+    /// 保存オブジェクトはデータベースの値から復号されるため、壊れた値や
+    /// 攻撃者が書き込んだ値で本体が落ちないことを固定する。CVE-2026-111497
+    /// (Google Brotli デコーダの範囲外書き込み) に対応する版は、該当しうる
+    /// 入力で正しいエラーコードを返す。
+    #[test]
+    fn corrupt_brotli_payloads_are_rejected_without_panicking() {
+        let payload = "あいうえお".repeat(64);
+        let (stored, encoding) = compress_object_payload(payload.as_bytes());
+        assert_eq!(encoding, ObjectEncoding::Brotli);
+        assert_eq!(
+            decompress_object_payload(&stored, encoding).unwrap(),
+            payload.as_bytes()
+        );
+
+        // 切り詰め・反転・ゼロ埋めはどれもエラーになる。
+        for cut in 1..stored.len() {
+            let truncated = &stored[..stored.len() - cut];
+            assert!(
+                decompress_object_payload(truncated, encoding).is_err(),
+                "cut={cut} で壊れたペイロードが受理された"
+            );
+        }
+        let mut flipped = stored.clone();
+        flipped[0] ^= 0xff;
+        assert!(decompress_object_payload(&flipped, encoding).is_err());
+
+        // 上限つき経路も同じく拒否する (panic しない)。
+        assert!(
+            decode_object_payload_limited(&flipped, encoding, 1024).is_err(),
+            "上限つき経路が壊れたペイロードを受理した"
+        );
+    }
+
     #[test]
     fn novel_keys_preserve_native_layout_components() {
         let keys = NovelObjectKeys::new("site", "n1234ab", true).unwrap();
