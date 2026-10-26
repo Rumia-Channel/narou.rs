@@ -132,7 +132,7 @@ dependency).
 
 | License | Used by |
 | --- | ---: |
-| MIT License | 339 |
+| MIT License | 344 |
 | Unicode License v3 | 20 |
 | Apache License 2.0 | 11 |
 | BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License | 8 |
@@ -1307,7 +1307,7 @@ limitations under the License.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_rs 0.5.3
+- narou_rs 0.5.4
 
 ```text
 BSD 2-Clause License
@@ -1340,8 +1340,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_relay 0.5.3
-- narou_transfer_wasm 0.5.3
+- narou_relay 0.5.4
+- narou_transfer_wasm 0.5.4
 
 ```text
 Copyright (c) <year> <owner> 
@@ -1577,7 +1577,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 - aozora_epub3_lite 0.1.6
-- narou_worker 0.5.3
+- narou_worker 0.5.4
 
 ```text
 GNU GENERAL PUBLIC LICENSE
@@ -6150,7 +6150,12 @@ Used by:
 - windows-registry 0.6.1
 - windows-result 0.4.1
 - windows-strings 0.5.1
+- windows-sys 0.52.0
 - windows-sys 0.61.2
+- windows-targets 0.52.6
+- windows_aarch64_msvc 0.52.6
+- windows_x86_64_gnu 0.52.6
+- windows_x86_64_msvc 0.52.6
 
 ```text
 MIT License
@@ -6597,7 +6602,7 @@ THE SOFTWARE.
 
 Used by:
 - tracing-core 0.1.36
-- zip 9.1.1
+- zip 9.1.2
 
 ```text
 The MIT License (MIT)

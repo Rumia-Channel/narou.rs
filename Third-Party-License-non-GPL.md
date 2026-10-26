@@ -1092,7 +1092,7 @@ limitations under the License.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_rs 0.5.3
+- narou_rs 0.5.4
 
 ```text
 BSD 2-Clause License
@@ -5981,7 +5981,7 @@ THE SOFTWARE.
 
 Used by:
 - tracing-core 0.1.36
-- zip 9.1.1
+- zip 9.1.2
 
 ```text
 The MIT License (MIT)

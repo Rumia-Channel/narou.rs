@@ -3,7 +3,7 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
-## v0.5.4 (未リリース) — 組み込みエンジンの設定が更新で消えないよう修正
+## v0.5.4 — 設定の更新で消えないよう修正・セキュリティ強化・依存更新
 
 - **組み込み AozoraEpub3_Lite の設定ファイルを更新で上書きしなくなりました**（issue #45 の続き）。配布物の `preset/AozoraEpub3.ini` は「利用者が編集する設定」と「配布物が持つ既定値」が同じファイル名だったため、セルフアップデートがファイルを置き換えると編集内容が無言で消えていました。
   - 同梱する既定値を `preset/AozoraEpub3.ini.default` に改名し、利用者が編集する `preset/AozoraEpub3.ini` は配布物に含めないようにしました。これで更新しても編集内容が残り、既存の利用者は編集したファイルを置いたまま更新できます。
@@ -20,6 +20,8 @@
   - `zip` 9 はエントリ名を `Result<Cow<str>, ZipError>` で返すようになりました。復号できない名前は「読めない」として扱い、小説データの取り込みはエラー、セルフアップデートの展開は読み飛ばし、リリース資産の検証は中止（fail closed）にしています。
   - `worker_entry` の `parking_lot` も 0.13 に揃え、依存グラフに `lock_api` 0.4 と 0.5 が混在して `Mutex` の型が食い違わないようにしました。
 - **変換の future が `Send` でない問題を解消しました**。変換コアが調査ログ用に保持していた `Rc<RefCell<Inspector>>` を `Arc<Mutex<Inspector>>` に変更し、`ConvertService` の future が `Send` になりました（clippy の `future_not_send` で検出される非 `Send` future が 0 件）。変換結果（本文テキスト・EPUB・調査ログ）は変更前とバイト単位で一致することを確認済みです。
+
+変更一覧は [v0.5.3...v0.5.4](https://github.com/Rumia-Channel/narou.rs/compare/v0.5.3...v0.5.4) を参照してください。
 
 ## v0.5.3 — バーチャル小説の話数・ファイル名・登録順 UI 修正
 
