@@ -93,12 +93,15 @@ pub struct AppState {
     pub control_token: String,
     /// loopback ブラウザ UI 用のトークン。Cookie またはヘッダで送る。
     pub ui_token: String,
-    /// 起動時の URL にだけ載せる一度きりのブートストラップ用チケット。
-    /// Cookie へ変換したら無効化する (ブラウザのプロセス引数から後から
-    /// 読み取られても再利用できない)。
+    /// 起動時の URL にだけ載せるブートストラップ用チケット。
+    /// Cookie へ変換した origin (Host) では無効になる (使う origin ごとに
+    /// 1 回だけ)。チケットはプロセス起動ごとに作り直される。
     pub ui_bootstrap_ticket: String,
-    /// ブートストラップチケットを消費済みか。
-    pub ui_bootstrap_consumed: Arc<AtomicBool>,
+    /// ブートストラップチケットを消費した origin (Host)。
+    ///
+    /// 直接アクセス (`127.0.0.1`) と reverse proxy 経由の公開ホストの
+    /// 両方から開く構成があるため、使う origin ごとに 1 回ずつに留める。
+    pub ui_bootstrap_hosts: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub queue: Arc<crate::queue::PersistentQueue>,
     pub restore_prompt_pending: Arc<AtomicBool>,
     pub restorable_tasks_available: Arc<AtomicBool>,
@@ -816,9 +819,13 @@ async fn security_headers_middleware(
 ///
 /// 設定 (`server-basic-auth.*` / `server-reverse-proxy.enable`) は稼働中にも
 /// 再適用されるため、固定フラグではなく毎回現在値から判定する。
+///
+/// loopback bind では、reverse proxy モードでも UI トークンを要求する。
+/// loopback のサーバーを守るのは同じ端末の別プロセス (ブラウザ拡張や他の
+/// ローカルアプリ) であり、Host / Origin の検査はヘッダ検査であって認証では
+/// ないため、前段 proxy の存在を前提にトークンを落とさない。
 pub fn local_ui_auth_required(bind_host: &str, security: &server_security::ServerSecurity) -> bool {
     matches!(bind_host, "127.0.0.1" | "localhost" | "::1")
-        && !security.reverse_proxy_mode
         && security.basic_auth_header.is_none()
 }
 
@@ -831,12 +838,22 @@ impl AppState {
 
 /// 起動時 URL のブートストラップチケットを検証して消費する。
 ///
-/// チケットはプロセス起動ごとに作り直し、一度 Cookie 化したら無効になる。
-pub(crate) fn consume_ui_bootstrap_ticket(state: &AppState, candidate: &str) -> bool {
-    constant_time_str_eq(candidate, state.ui_bootstrap_ticket.as_str())
-        && !state
-            .ui_bootstrap_consumed
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+/// チケットはプロセス起動ごとに作り直し、使う origin ごとに 1 回だけ使う。
+///
+/// `host` はリクエストの Host。直接アクセス (`127.0.0.1`) と reverse proxy
+/// 経由の公開ホストの双方で同じチケットを使えるようにし、同じ origin での
+/// 再利用だけを弾く。
+pub(crate) fn consume_ui_bootstrap_ticket(state: &AppState, candidate: &str, host: &str) -> bool {
+    if !constant_time_str_eq(candidate, state.ui_bootstrap_ticket.as_str()) {
+        return false;
+    }
+    let host = host.trim().to_ascii_lowercase();
+    let mut hosts = state.ui_bootstrap_hosts.lock();
+    if hosts.contains(&host) {
+        return false;
+    }
+    hosts.insert(host);
+    true
 }
 
 /// loopback UI トークンが必要なパスか。
@@ -1032,7 +1049,7 @@ mod tests {
             control_token: "control-token".to_string(),
             ui_token: "ui-token".to_string(),
             ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
-            ui_bootstrap_consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ui_bootstrap_hosts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -1066,7 +1083,7 @@ mod tests {
             control_token: "control-token".to_string(),
             ui_token: "ui-token".to_string(),
             ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
-            ui_bootstrap_consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ui_bootstrap_hosts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -1493,6 +1510,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reverse_proxy_mode_on_loopback_still_requires_the_ui_token() {
+        // 同じ端末の別プロセスは Host / Origin を自由に書けるため、これらは
+        // 認証にならない。loopback bind では reverse proxy モードでも
+        // UI トークンを要求する。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state = test_state();
+        state.port = listener.local_addr().unwrap().port();
+        {
+            let mut security = state.server_security.write();
+            security.basic_auth_header = None;
+            security.reverse_proxy_mode = true;
+        }
+        let router = super::create_router(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let base = format!("http://127.0.0.1:{}", state.port);
+
+        let unauthorized = client.get(format!("{base}/api/list")).send().await.unwrap();
+        assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // チケットを使った bootstrap は従来どおり Cookie を返す。
+        let bootstrap = client
+            .get(format!("{base}/?narou_ui_token=bootstrap-ticket"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bootstrap.status(), reqwest::StatusCode::SEE_OTHER);
+        assert!(
+            bootstrap
+                .headers()
+                .get(reqwest::header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .contains("narou_ui_token=ui-token")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn html_responses_deny_framing() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut state = test_state();
@@ -1579,28 +1639,43 @@ mod tests {
     }
 
     #[test]
-    fn ui_bootstrap_ticket_is_single_use() {
+    fn ui_bootstrap_ticket_is_single_use_per_origin() {
         let state = test_state();
-        assert!(!super::consume_ui_bootstrap_ticket(&state, "wrong"));
+        assert!(!super::consume_ui_bootstrap_ticket(&state, "wrong", "127.0.0.1"));
         assert!(super::consume_ui_bootstrap_ticket(
             &state,
-            "bootstrap-ticket"
+            "bootstrap-ticket",
+            "127.0.0.1"
+        ));
+        // 同じ origin での再利用は拒否する。
+        assert!(!super::consume_ui_bootstrap_ticket(
+            &state,
+            "bootstrap-ticket",
+            "127.0.0.1"
+        ));
+        // 別の origin (reverse proxy 経由の公開ホスト) は 1 回だけ使える。
+        assert!(super::consume_ui_bootstrap_ticket(
+            &state,
+            "bootstrap-ticket",
+            "narou.example.com"
         ));
         assert!(!super::consume_ui_bootstrap_ticket(
             &state,
-            "bootstrap-ticket"
+            "bootstrap-ticket",
+            "narou.example.com"
         ));
         // 誤った試行では消費されない。
         let second = test_state();
-        assert!(!super::consume_ui_bootstrap_ticket(&second, "wrong"));
+        assert!(!super::consume_ui_bootstrap_ticket(&second, "wrong", "127.0.0.1"));
         assert!(super::consume_ui_bootstrap_ticket(
             &second,
-            "bootstrap-ticket"
+            "bootstrap-ticket",
+            "127.0.0.1"
         ));
     }
 
     #[test]
-    fn local_ui_auth_requires_loopback_without_basic_auth_or_proxy() {
+    fn local_ui_auth_requires_loopback_without_basic_auth() {
         let state = test_state();
         assert!(!state.local_ui_auth_required(), "basic auth is configured");
         {
@@ -1609,8 +1684,14 @@ mod tests {
             security.reverse_proxy_mode = false;
         }
         assert!(state.local_ui_auth_required());
+        // reverse proxy モードでも loopback ならトークンを要求する。
+        // 同じ端末の別プロセス (ブラウザ拡張など) は Host / Origin を自由に
+        // 書けるため、これらが認証の代わりにはならない。
         state.server_security.write().reverse_proxy_mode = true;
-        assert!(!state.local_ui_auth_required());
+        assert!(
+            state.local_ui_auth_required(),
+            "reverse proxy モードで loopback の UI トークンが外れている"
+        );
         state.server_security.write().reverse_proxy_mode = false;
         state.server_security.write().basic_auth_header = Some("Basic x".to_string());
         assert!(!state.local_ui_auth_required());

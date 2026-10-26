@@ -152,7 +152,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         control_token: control_token.clone(),
         ui_token: ui_token.clone(),
         ui_bootstrap_ticket: ui_bootstrap_ticket.clone(),
-        ui_bootstrap_consumed: Arc::new(AtomicBool::new(false)),
+        ui_bootstrap_hosts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         queue: queue.clone(),
         restore_prompt_pending: restore_prompt_pending.clone(),
         restorable_tasks_available: restorable_tasks_available.clone(),
@@ -180,8 +180,16 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
     }
     if !hide_console {
         println!("{}", url);
-        if no_browser && local_auth_required {
+        if local_auth_required {
+            // チケットは使う origin ごとに 1 回だけ有効。reverse proxy 経由の
+            // 公開ホストで開くときにも必要なので、常に URL ごと見せる。
             println!("ブラウザで開く URL: {}", browser_url);
+            if app_state.server_security.read().reverse_proxy_mode {
+                println!(
+                    "WARN: reverse proxy 経由の公開ホストで開く URL にも {} を付けてください (上の URL と同じチケット値)",
+                    web::UI_AUTH_QUERY_PARAM
+                );
+            }
         }
         println!("サーバを止めるには {}", web_stop_hint(hide_console));
         println!();

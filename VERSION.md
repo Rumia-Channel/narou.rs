@@ -11,6 +11,9 @@
   - 設定の解決順は「利用者設定 → 同梱の既定値 → 埋め込みの既定値」です。編集したい場合は `preset/AozoraEpub3.ini.default` を同じフォルダの `AozoraEpub3.ini` にコピーして編集してください。
   - パッケージ (`scripts/package-release.ps1`) は `preset/` の利用者設定を同梱から除外し、セルフアップデート (`src/bin/updater.rs`) も既存の `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` は上書きしません。
 
+- **loopback 起動の Web UI で、reverse proxy モードでも UI トークンを要求する**ようにしました。同じ端末の別プロセス（ブラウザ拡張や他のローカルアプリ）は `Host` / `Origin` ヘッダを自由に書けるため、これらは認証の代替になりません。以前は `server-reverse-proxy.enable=true` の場合だけ loopback のトークン要求が外れており、その構成では認証なしで API を操作できました。ブートストラップチケットは使う origin（Host）ごとに 1 回だけ有効なので、reverse proxy 経由の公開ホストと直接アクセスの両方から開けます。起動時にチケット付きの URL を常設表示し、proxy 経由の URL にもチケットを付ける案内を出します。
+- **ログイン資格情報の鍵ファイル (`.narou/login.key`) を作る時から 0600 に** なりました。作成後に権限を締める実装では、その間のファイルが umask 由来（通常 0644）で他ユーザーから読め、鍵が露出すると保存済み Cookie を復号できました。
+
 ## v0.5.3 — バーチャル小説の話数・ファイル名・登録順 UI 修正
 
 - **仮想小説の話数が 0 になる問題を修正**しました。メンバーの `general_all_no` が未設定の場合は目次 (`toc.yaml`) から話数を数え、合計を仮想小説へ設定します。

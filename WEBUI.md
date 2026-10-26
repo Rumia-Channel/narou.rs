@@ -693,14 +693,15 @@ Web UI 設定画面に出る関連項目: `server-bind` / `server-basic-auth.*` 
 
 ### 8.1.1 loopback UI トークン
 
-`127.0.0.1` / `localhost` / `::1` に bind し、Basic 認証もリバースプロキシも使わない構成では、`narou web` が起動ごとに一度きりのブートストラップ URL をブラウザへ渡します。
+`127.0.0.1` / `localhost` / `::1` に bind し、Basic 認証を使わない構成では、`narou web` が起動ごとに一度きりのブートストラップ URL をブラウザへ渡します。リバースプロキシモードでも loopback なら同じ要求を行います（同じ端末の別プロセスは `Host` / `Origin` ヘッダを自由に書けるため、これらは認証の代替になりません）。
 
-- 初回の `GET /?narou_ui_token=<ticket>` だけが受け付けられ、サーバは HttpOnly / SameSite=Strict / 30 日有効の `narou_ui_token` Cookie を設定してトークン無しの `/` へリダイレクトします。チケットは一度使うと無効になります。
+- 初回の `GET /?narou_ui_token=<ticket>` だけが受け付けられ、サーバは HttpOnly / SameSite=Strict / 30 日有効の `narou_ui_token` Cookie を設定してトークン無しの `/` へリダイレクトします。チケットは使う origin（`Host`）ごとに一度使うと無効になります（reverse proxy 経由の公開ホストと直接アクセスの両方から開けます）。
 - Cookie の値は `.narou/ui_token`（0600）に永続化されるため、サーバ再起動やセルフアップデート後もブラウザのセッションは維持されます。
 - `/api/*`、`/ws`、`/novels/{id}/download` は Cookie または `x-narou-internal-token` ヘッダを要求します。静的なページと `/assets/*` はトークン不要です。
+- 起動時には「ブラウザで開く URL」（チケット付き）を常設表示します。reverse proxy 経由の公開ホストで開く場合は、同じ URL の `narou_ui_token` パラメータを付けた公開 URL を開いてください。
 - `--no-browser` のときは、起動時に表示される「ブラウザで開く URL」をそのまま開いてください。ベース URL を直接開いた場合、API は 401 を返します。
 - CLI や外部ツールから API を叩く場合は、`.narou/server.pid`（0600）に書かれた制御トークンを `x-narou-internal-token` ヘッダで送れます。
-- `server-bind` が外部公開、Basic 認証あり、または `server-reverse-proxy.enable=true` の構成では従来どおり Basic 認証 / 前段プロキシに認証を委ね、UI トークンは要求しません。
+- `server-bind` が外部公開、または Basic 認証ありの構成では従来どおり Basic 認証に認証を委ね、UI トークンは要求しません。
 
 ### 8.2 セルフアップデートの variant
 

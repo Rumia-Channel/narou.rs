@@ -2873,7 +2873,7 @@ mod tests {
             control_token: "control-token".to_string(),
             ui_token: "ui-token".to_string(),
             ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
-            ui_bootstrap_consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ui_bootstrap_hosts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             queue,
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
