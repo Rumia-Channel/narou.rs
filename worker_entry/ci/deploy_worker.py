@@ -546,8 +546,15 @@ def secret_file(target: str) -> Path | None:
 
     if not secrets:
         return None
+    # 値は GitHub のログマスクに登録する。wrangler の出力に値が入っている場合も
+    # ログには伏せられる (登録は以降の出力に効く)。
+    for value in secrets.values():
+        mask(value)
     path = WORKER_DIR / f".deploy-secrets-{target}.json"
     path.write_text(json.dumps(secrets), encoding="utf-8")
+    # 同ホストの別ユーザーから読まれないよう、秘密ファイルは 0600 にする。
+    if os.name != "nt":
+        os.chmod(path, 0o600)
     return path
 
 

@@ -39,6 +39,8 @@ jobs:
           node-version: "22"
       - name: Worker S3 deployment regressions
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_*s3*.py'
+      - name: Deploy secret handling regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_deploy_secret_masking.py'
       - name: Worker content publication and migration regressions
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_content_storage_sql.py'
       - name: Web UI source-link escaping regressions
