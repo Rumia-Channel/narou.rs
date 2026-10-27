@@ -9,9 +9,11 @@ const source = fs.readFileSync(
   'utf8',
 );
 const start = source.indexOf('var progressBars = {};');
-const end = source.indexOf('function sanitizeConsoleSpanStyle');
+// The console renderer moved to `core/console_html.js`, so the block ends at
+// the console helpers instead of the sanitizer.
+const end = source.indexOf('function appendConsole(');
 assert.ok(start >= 0, 'missing progressBars declaration');
-assert.ok(end > start, 'missing sanitizeConsoleSpanStyle boundary');
+assert.ok(end > start, 'missing progressBars block boundary');
 const block = source.slice(start, end);
 const handlerStart = source.indexOf('function handleWsMessage(');
 const handlerEnd = source.indexOf('\nfunction ', handlerStart + 1);
