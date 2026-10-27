@@ -5,6 +5,7 @@
 
 import { fetchJson, postJson, assertApiSuccess } from './core/http.js';
 import { bindAuthorsPane } from './authors.js';
+import { confirmDialog, promptDialog } from './ui/dialog.js';
 
 (function() {
   'use strict';
@@ -174,8 +175,20 @@ import { bindAuthorsPane } from './authors.js';
 
   async function switchStorageMode(mode, button) {
     if (button && button.disabled) return;
-    if (mode === 'sqlite' && !window.confirm('作品データの管理を SQLite へ移行します。旧 YAML は自動で退避されます。よろしいですか？')) return;
-    if (mode === 'yaml' && !window.confirm('YAML を書き出してから YAML 管理へ戻します。よろしいですか？')) return;
+    const confirmation = mode === 'sqlite'
+      ? {
+        title: 'SQLite 管理へ移行',
+        message: '作品データの管理を SQLite へ移行します。旧 YAML は自動で退避されます。よろしいですか？',
+        okLabel: '移行する',
+      }
+      : mode === 'yaml'
+        ? {
+          title: 'YAML 管理へ戻す',
+          message: 'YAML を書き出してから YAML 管理へ戻します。よろしいですか？',
+          okLabel: '戻す',
+        }
+        : null;
+    if (confirmation && !(await confirmDialog(confirmation))) return;
     if (button) button.disabled = true;
     try {
       const result = await postJson('/api/storage/mode', { mode: mode });
@@ -598,7 +611,13 @@ import { bindAuthorsPane } from './authors.js';
 
   async function renameLogin(site, index, current) {
     if (loginMutationPending || loginListStale) return;
-    const input = window.prompt(site + ' の ' + (index + 1) + ' 番目のログインの名前を入力してください。空にすると名前を消します。', current || '');
+    const input = await promptDialog({
+      title: 'ログイン名の変更',
+      message: site + ' の ' + (index + 1) + ' 番目のログインの名前を入力してください。空にすると名前を消します。',
+      value: current || '',
+      required: false,
+      okLabel: '変更する',
+    });
     if (input === null) return;
     await runLoginMutation(
       () => postJson('/api/login/rename', { site: site, index: index, label: input.trim() }),
@@ -629,7 +648,13 @@ import { bindAuthorsPane } from './authors.js';
 
   async function removeLoginSite(site) {
     if (loginMutationPending || loginListStale) return;
-    if (!window.confirm('サイト ' + site + ' のログイン情報をすべて削除します。よろしいですか？')) return;
+    const ok = await confirmDialog({
+      title: 'ログイン情報の削除',
+      message: 'サイト ' + site + ' のログイン情報をすべて削除します。よろしいですか？',
+      okLabel: '削除する',
+      danger: true,
+    });
+    if (!ok) return;
     await runLoginMutation(
       () => fetchJson('/api/login/' + encodeURIComponent(site), { method: 'DELETE' }),
       '削除に失敗しました'
@@ -638,7 +663,13 @@ import { bindAuthorsPane } from './authors.js';
 
   async function clearAllLogin() {
     if (loginMutationPending || loginListStale) return;
-    if (!window.confirm('保存されているすべてのログイン情報を削除します。よろしいですか？')) return;
+    const ok = await confirmDialog({
+      title: 'ログイン情報の削除',
+      message: '保存されているすべてのログイン情報を削除します。よろしいですか？',
+      okLabel: '削除する',
+      danger: true,
+    });
+    if (!ok) return;
     await runLoginMutation(
       () => fetchJson('/api/login', { method: 'DELETE' }),
       '削除に失敗しました'

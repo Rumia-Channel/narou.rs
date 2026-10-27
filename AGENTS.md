@@ -121,7 +121,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **非表示設定**: 在庫 `hidden` に `novels` / `tags` / `authors` / `sites` を持つ (`HiddenState`)。Native は `.narou/hidden.yaml` / SQLite `app_state`、Worker は D1 `app_state`。一覧は `NovelFilter.exclude_*` で除外し、`include_hidden` が true のときだけ非表示も表示する。タグ非表示はそのタグの作品も隠す。更新・変換などの内部列挙は非表示作品も対象。CLI は `narou hidden` / `list --show-hidden`、Web UI は「非表示も表示」・右クリック・非表示設定モーダル。
 - **並列DLの系列**: `SiteSetting.site_family`（YAML）を第一優先し、未指定時は `platform::site_family` がドメインから自動判定する。なろう系は `syosetu.com`、Pixiv は `pixiv.net` を同梱定義に明記。Native `update` の domain groups、Worker の D1 admission `site_key`、Native Web のキュー worker が同じ系列で直列化する。異なる系列は並列。
 - **小説データ転送**: 形式と検証は wasm-safe な `src/transfer`（manifest + `novels/<i>/...`、決定論的 ZIP、パス/サイズ/zip bomb/SHA-256 検証、`plan_import`）。Native は `src/native/transfer`、CLI は `narou export/import`、Native Web は `/api/transfer/*`、Worker は ObjectStore 経由の同 API、ブラウザは `transfer_wasm`。競合は `toc_url`、既定 Skip / `--overwrite` で置換。上書きはアーカイブにあるファイルだけを置換し、既存の余分なファイルを削らない。
-- **バーチャル小説**: `vs_<ID>` の通常 `novels` 行として登録し、`ncode=vs_<ID>` / タグ `vs_<ID>` を持つ。メンバー順は在庫 `virtual_novel_members`、ダウンロード・更新の対象外。表示一覧ではメンバー行を除外する。`convert vs_<ID>` はメンバーの toc/本文を一時ディレクトリで連結し、各メンバータイトルを章見出しとして 1 EPUB に結合する。CLI は `narou virtual add/list/order/remove`、Web API は `/api/virtual_novels`。
+- **バーチャル小説**: `vs_<ID>` の通常 `novels` 行として登録し、`ncode=vs_<ID>` / タグ `vs_<ID>` を持つ。メンバー順は在庫 `virtual_novel_members`、ダウンロード・更新の対象外。表示一覧ではメンバー行を除外する。`convert vs_<ID>` はメンバーの toc/本文を一時ディレクトリで連結し、各メンバータイトルを章見出しとして 1 EPUB に結合する。CLI は `narou virtual add/append/list/order/remove`、Web API は `/api/virtual_novels` と `POST /api/virtual_novels/{id}/members`。`append` はメンバーを末尾へ追加し、仮想小説のタグ・話数・最新話掲載日を再計算する (native `native::virtual_novel::add_members` / Worker `worker_entry/src/virtual_novels.rs` の `add_members`、検証は core `virtual_novel::VirtualNovelMembers::append`)。Web UI はバーチャル小説を 1 件だけ選択していれば ncode を求めずその作品を対象にし、そうでなければ一覧から選ぶダイアログを出す (`selectedVirtualNovel`)。
 - 設計の全体像は `docs/v0.5.0-architecture.md`。
 
 ## 機能追加・修正時の動作テスト
@@ -757,6 +757,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - キュー並列実行 (concurrency 有効時: primary lane DL/update + secondary lane convert/send)
 - Basic認証、Host/Origin検証、CSRF対策、reverse proxy モード
 - Windows タスクトレイ常駐 (`--hide-console`)
+- **ブラウザ標準の `prompt` / `confirm` / `alert` は使わない**。`src/web/assets/js/ui/dialog.js` の `confirmDialog` / `alertDialog` / `promptDialog` / `formDialog` / `selectDialog` (すべて Promise) を使う。markup は初回表示時に JS が組み立てるので、`index.html` と `settings.html` のどちらからでも import できる。新しい JS モジュールを足したら `src/web/frontend.rs` の asset 配信表 (match arm) にも必ず追加する (Worker は `worker_entry/build_assets.mjs` が `src/web/assets` を丸ごと写すため追加作業は不要)。
 
 ### コマンド実装状況 (詳細は `COMMANDS.md`)
 - ✅ 完了 (24): init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, author, help, version, log, folder, browser, alias, inspect, csv, trace, db, login

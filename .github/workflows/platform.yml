@@ -52,6 +52,8 @@ jobs:
         run: node --test tests/queue_refresh.test.mjs
       - name: Web UI favorite tag regressions
         run: node --test tests/favorite_tags.test.mjs
+      - name: Web UI dialog and virtual novel regressions
+        run: node --test tests/web_dialogs.test.mjs tests/virtual_novel_ui.test.mjs
       - name: Web UI console rendering regressions
         run: node --test tests/console_history.test.mjs tests/console_history_poll.test.mjs tests/websocket_fallback.test.mjs
       - name: Regression - SQLite converter settings (issue 22)

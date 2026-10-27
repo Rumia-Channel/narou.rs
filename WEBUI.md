@@ -361,10 +361,25 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 
 ### 3.5 確認ダイアログ
 
+**Rust版: ✅ 実装済み (`js/ui/dialog.js`)**
+
+ブラウザ標準の `alert` / `confirm` / `prompt` は使わず、ページと同じテーマの
+モーダルで表示する。`index.html` と `settings.html` の両方から使えるよう、
+markup は初回表示時に JS が組み立てる (`#app-dialog`、HTML 側の変更は不要)。
+
 | 機能 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
-| 汎用確認モーダル | bootbox.js カスタム | `#confirm-modal` (HTML) + `confirm()` (JS) | ✅ |
+| 確認 (OK / キャンセル) | bootbox.js カスタム | `confirmDialog()` | ✅ |
+| 通知 (OK のみ) | bootbox.js カスタム | `alertDialog()` | ✅ |
+| 1 行入力 (必須/任意) | — | `promptDialog()` (空欄は入力欄へフォーカスして閉じない) | ✅ |
+| 複数項目の入力 | — | `formDialog()` | ✅ |
+| 一覧からの選択 | — | `selectDialog()` (ラジオ形式、`detail` に補足) | ✅ |
+| キャンセル操作 | — | × / キャンセル / Escape / 背景クリック | ✅ |
 | サーバー主導モーダル | `ping.modal` WebSocket | なし | ❌ |
+
+置き換え済みの箇所: バーチャル小説の登録・操作対象の選択・削除・追加、
+シャットダウン / 再起動 / セルフアップデートの確認、設定ページのデータ管理方式
+切替・ログイン名変更・ログイン情報の削除。
 
 ### 3.6 メモ帳モーダル
 
@@ -426,6 +441,27 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | localStorage永続化 | `update_general_lastup_checked` | 同左 | ✅ |
 | 確認実行 | POST `/api/update_general_lastup` | 同左 | ✅ |
 | 公式サイトリンク | `http://dev.syosetu.com/man/api/` | 同左 | ✅ |
+
+### 3.11 バーチャル小説
+
+**Rust版: ✅ 実装済み (`#action-option-virtual-*` / `#virtual-order-modal`)**
+
+| 機能 | Rust版 | 状態 |
+|------|--------|------|
+| 選択した作品をバーチャル小説にまとめる | `#action-option-virtual-add` → `formDialog` (タイトル / 作者名 / サイト名) | ✅ |
+| 選択した作品を既存のバーチャル小説へ追加 | `#action-option-virtual-append` → `POST /api/virtual_novels/{id}/members` | ✅ |
+| 登録順の変更 | `#action-option-virtual-order` → `#virtual-order-modal` (↑ / ↓) | ✅ |
+| 変換 | `#action-option-virtual-convert` → `POST /api/virtual_novels/{id}/convert` (native) | ✅ |
+| 削除 | `#action-option-virtual-remove` → `DELETE /api/virtual_novels/{id}` | ✅ |
+
+- 操作対象の決め方: 一覧で**バーチャル小説をちょうど 1 件選択**しているときは、
+  その作品を対象にして ncode の入力を求めない。登録が 1 件だけのときも同様。
+  それ以外は `selectDialog` で一覧から選ぶ (以前の ncode 手入力は廃止)。
+- 追加した作品はメンバーとして通常の一覧から隠れ、EPUB には登録順の末尾へ結合
+  される。仮想小説のタグ・話数 (`general_all_no`)・最新話掲載日も再計算される。
+- API: `POST /api/virtual_novels/{id}/members` (native / Worker 共通、body は
+  `{"members": [id, ...]}`)。既に別の仮想小説に属する作品、仮想小説自身、
+  重複は 400 で拒否する。
 
 ---
 

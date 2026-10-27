@@ -47,47 +47,7 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
         ));
     }
     let repository = NativeNovelRepository::new();
-    let mut member_tags: Vec<String> = Vec::new();
-    let mut latest_update: Option<chrono::DateTime<Utc>> = None;
-    let mut general_all_no = 0i64;
-    for member in &input.members {
-        let record = repository
-            .get_sync(NovelId(*member))?
-            .ok_or_else(|| NarouError::Database(format!("作品が見つかりません: {member}")))?;
-        if record
-            .ncode
-            .as_deref()
-            .is_some_and(virtual_novel::is_virtual_ncode)
-        {
-            return Err(NarouError::InvalidTarget(format!(
-                "仮想小説をメンバーにはできません: {member}"
-            )));
-        }
-        member_tags.extend(
-            record
-                .tags
-                .iter()
-                .filter(|tag| !virtual_novel::is_internal_tag(tag))
-                .cloned(),
-        );
-        if let Some(updated) = record.general_lastup
-            && latest_update.is_none_or(|current| updated > current)
-        {
-            latest_update = Some(updated);
-        }
-        let count = match record.general_all_no {
-            Some(count) if count > 0 => count,
-            _ => {
-                let archive_root =
-                    db::with_database(|database| Ok(database.archive_root().to_path_buf()))?;
-                let dir = db::existing_novel_dir_for_record(&archive_root, &record);
-                read_toc(&dir)
-                    .map(|toc| toc.subtitles.len() as i64)
-                    .unwrap_or(0)
-            }
-        };
-        general_all_no += count;
-    }
+    let summary = summarize_members(&input.members)?;
     if crate::native::virtual_novel::load()?
         .groups
         .values()
@@ -107,7 +67,7 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
         .iter()
         .map(|tag| tag.trim().to_string())
         .filter(|tag| !tag.is_empty())
-        .chain(member_tags)
+        .chain(summary.tags)
         .collect();
     tags.push(virtual_tag);
     tags.sort();
@@ -135,12 +95,12 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
         use_subdirectory: NativeDownloaderSettings.download_use_subdirectory(),
         general_firstup: None,
         novelupdated_at: None,
-        general_lastup: latest_update,
+        general_lastup: summary.latest_update,
         last_mail_date: None,
         tags,
         ncode: Some(ncode.clone()),
         domain: input.domain.clone(),
-        general_all_no: (general_all_no > 0).then_some(general_all_no),
+        general_all_no: (summary.general_all_no > 0).then_some(summary.general_all_no),
         length: None,
         suspend: false,
         is_narou: false,
@@ -162,6 +122,112 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
         return Err(error);
     }
     Ok(record)
+}
+
+/// メンバー構成から仮想小説の派生値 (タグ・話数・最新話掲載日) を求める。
+struct MemberSummary {
+    tags: Vec<String>,
+    latest_update: Option<chrono::DateTime<Utc>>,
+    general_all_no: i64,
+}
+
+fn summarize_members(members: &[i64]) -> Result<MemberSummary> {
+    let repository = NativeNovelRepository::new();
+    let mut summary = MemberSummary {
+        tags: Vec::new(),
+        latest_update: None,
+        general_all_no: 0,
+    };
+    for member in members {
+        let record = repository
+            .get_sync(NovelId(*member))?
+            .ok_or_else(|| NarouError::Database(format!("作品が見つかりません: {member}")))?;
+        if record
+            .ncode
+            .as_deref()
+            .is_some_and(virtual_novel::is_virtual_ncode)
+        {
+            return Err(NarouError::InvalidTarget(format!(
+                "仮想小説をメンバーにはできません: {member}"
+            )));
+        }
+        summary.tags.extend(
+            record
+                .tags
+                .iter()
+                .filter(|tag| !virtual_novel::is_internal_tag(tag))
+                .cloned(),
+        );
+        if let Some(updated) = record.general_lastup
+            && summary
+                .latest_update
+                .is_none_or(|current| updated > current)
+        {
+            summary.latest_update = Some(updated);
+        }
+        let count = match record.general_all_no {
+            Some(count) if count > 0 => count,
+            _ => {
+                let archive_root =
+                    db::with_database(|database| Ok(database.archive_root().to_path_buf()))?;
+                let dir = db::existing_novel_dir_for_record(&archive_root, &record);
+                read_toc(&dir)
+                    .map(|toc| toc.subtitles.len() as i64)
+                    .unwrap_or(0)
+            }
+        };
+        summary.general_all_no += count;
+    }
+    Ok(summary)
+}
+
+/// 既存の仮想小説へメンバーを追加する。メンバー行は一覧から隠れ、EPUB は
+/// 登録順の末尾へ結合される。仮想小説のタグ・話数・最新話掲載日も更新する。
+pub fn add_members(id: i64, new_members: Vec<i64>) -> Result<()> {
+    let current = load()?;
+    let mut updated = current.clone();
+    updated
+        .append(id, new_members.clone())
+        .map_err(NarouError::InvalidTarget)?;
+    let merged = updated.get(id).unwrap_or_default().to_vec();
+    let summary = summarize_members(&merged)?;
+
+    let previous = current.get(id).map(<[i64]>::to_vec).unwrap_or_default();
+    update(|all| {
+        all.append(id, new_members.clone())
+            .map_err(NarouError::InvalidTarget)
+    })?;
+    if let Err(error) = refresh_record(id, &summary) {
+        // レコードだけ古いまま残らないよう、メンバー構成も元へ戻す。
+        // `reorder` は同じ集合しか受け付けないので、入れ直して戻す。
+        let _ = update(|all| {
+            all.remove(id);
+            all.insert(id, previous).map_err(NarouError::InvalidTarget)
+        });
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn refresh_record(id: i64, summary: &MemberSummary) -> Result<()> {
+    let repository = NativeNovelRepository::new();
+    let mut record = repository
+        .get_sync(NovelId(id))?
+        .ok_or_else(|| NarouError::Database(format!("仮想小説 vs_{id} が見つかりません")))?;
+    let mut tags: Vec<String> = record
+        .tags
+        .iter()
+        .filter(|tag| !virtual_novel::is_internal_tag(tag))
+        .cloned()
+        .chain(summary.tags.iter().cloned())
+        .collect();
+    tags.push(virtual_novel::tag(id));
+    tags.sort();
+    tags.dedup();
+    record.tags = tags;
+    record.general_all_no = (summary.general_all_no > 0).then_some(summary.general_all_no);
+    record.general_lastup = summary.latest_update;
+    repository.apply_batch_sync(vec![NovelMutation::Upsert(record)])
 }
 
 /// 仮想小説の行とメンバー構成を削除する。実小説は残す。
