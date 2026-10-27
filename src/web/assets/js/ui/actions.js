@@ -1779,14 +1779,32 @@ function renderTagEditorTags(ids, taginfo) {
     chip.dataset.tag = info.tag;
     chip.dataset.presentCount = String(presentCount);
     chip.dataset.selectedCount = String(selectionCount);
-    chip.textContent = info.tag;
 
+    // タグ名の隣に × ボタン、色と ★ はその下の段に並べる (押し間違えないように)。
+    const label = document.createElement('span');
+    label.className = 'tag-edit-text';
+    label.textContent = info.tag;
     if (selectionCount > 1) {
       const count = document.createElement('span');
       count.className = 'tag-edit-count';
       count.textContent = ` ${presentCount}/${selectionCount}`;
-      chip.appendChild(count);
+      label.appendChild(count);
     }
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'tag-remove';
+    removeBtn.disabled = tagMutationPending;
+    removeBtn.textContent = '×';
+    removeBtn.title =
+      selectionCount > 1
+        ? `選択中の${selectionCount}件から「${info.tag}」を外す`
+        : `「${info.tag}」を外す`;
+    removeBtn.addEventListener('click', async () => {
+      await mutateEditorTags(ids, { [info.tag]: 0 }, 'タグの削除に失敗しました');
+    });
+    label.appendChild(removeBtn);
+    chip.appendChild(label);
 
     const colorBtn = document.createElement('button');
     colorBtn.type = 'button';
@@ -1797,7 +1815,6 @@ function renderTagEditorTags(ids, taginfo) {
     colorBtn.addEventListener('click', (event) => {
       showTagColorMenu(event, info.tag);
     });
-    chip.appendChild(colorBtn);
 
     const favoriteBtn = document.createElement('button');
     favoriteBtn.type = 'button';
@@ -1812,24 +1829,16 @@ function renderTagEditorTags(ids, taginfo) {
       event.stopPropagation();
       await toggleFavoriteTag(info.tag);
     });
-    chip.appendChild(favoriteBtn);
+
+    const actions = document.createElement('span');
+    actions.className = 'tag-edit-actions';
+    actions.appendChild(colorBtn);
+    actions.appendChild(favoriteBtn);
+    chip.appendChild(actions);
     chip.addEventListener('contextmenu', (event) => {
       showTagColorMenu(event, info.tag);
     });
 
-    const removeBtn = document.createElement('button');
-    removeBtn.type = 'button';
-    removeBtn.className = 'tag-remove';
-    removeBtn.disabled = tagMutationPending;
-    removeBtn.textContent = '×';
-    removeBtn.title =
-      selectionCount > 1
-        ? `選択中の${selectionCount}件から「${info.tag}」を外す`
-        : `「${info.tag}」を外す`;
-    removeBtn.addEventListener('click', async () => {
-      await mutateEditorTags(ids, { [info.tag]: 0 }, 'タグの削除に失敗しました');
-    });
-    chip.appendChild(removeBtn);
     container.appendChild(chip);
   });
 }
@@ -1856,19 +1865,11 @@ function renderFavoriteTags() {
     const chip = document.createElement('span');
     chip.className = `tag-label ${tagColorClass(tag)} tag-favorite`;
     chip.dataset.tag = tag;
-    chip.textContent = tag;
     chip.title = `「${tag}」を入力欄へ入れる`;
 
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'tag-favorite-add';
-    addBtn.textContent = '追加';
-    addBtn.title = `「${tag}」をタグに追加する`;
-    addBtn.addEventListener('click', async (event) => {
-      event.stopPropagation();
-      await addFavoriteTagToSelection(tag);
-    });
-    chip.appendChild(addBtn);
+    const label = document.createElement('span');
+    label.className = 'tag-edit-text';
+    label.textContent = tag;
 
     const removeBtn = document.createElement('button');
     removeBtn.type = 'button';
@@ -1879,7 +1880,23 @@ function renderFavoriteTags() {
       event.stopPropagation();
       await setFavoriteTags({ action: 'remove', tags: [tag] });
     });
-    chip.appendChild(removeBtn);
+    label.appendChild(removeBtn);
+    chip.appendChild(label);
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'tag-favorite-add';
+    addBtn.textContent = '追加';
+    addBtn.title = `「${tag}」をタグに追加する`;
+    addBtn.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await addFavoriteTagToSelection(tag);
+    });
+
+    const actions = document.createElement('span');
+    actions.className = 'tag-edit-actions';
+    actions.appendChild(addBtn);
+    chip.appendChild(actions);
 
     chip.addEventListener('click', () => {
       if (!El.newTagInput) return;

@@ -332,8 +332,13 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 既存タグ表示 | 色付きバッジ | タグバッジ (×削除ボタン付き) | ✅ |
 | タグ追加 | テキスト入力 | `#new-tag-input` + 追加ボタン | ✅ |
 | タグ削除 | ×ボタン | `.tag-remove` ×ボタン | ✅ |
+| 色の変更 / お気に入り | なし | バッジの 2 段目 (タグ名の下) に `色` と `★ / ☆` のボタン | ✅ |
 | 複数小説一括適用 | あり | あり (selectedIds / single ID) | ✅ |
 | Enter で追加 | あり | あり | ✅ |
+
+バッジはタグ名の上に文字、下に操作ボタン (色 / ★) を並べる 2 段組みで、ボタンも
+1.35em 角に如其して押しやすい大きさにしてある。削除の × だけは色・★ と押し間違えない
+ようにタグ名のすぐ隣 (同じ段) に置いている。お気に入りタグの一覧も同じ形。
 
 ### 3.3 Aboutモーダル
 
@@ -372,7 +377,7 @@ markup は初回表示時に JS が組み立てる (`#app-dialog`、HTML 側の�
 | 確認 (OK / キャンセル) | bootbox.js カスタム | `confirmDialog()` | ✅ |
 | 通知 (OK のみ) | bootbox.js カスタム | `alertDialog()` | ✅ |
 | 1 行入力 (必須/任意) | — | `promptDialog()` (空欄は入力欄へフォーカスして閉じない) | ✅ |
-| 複数項目の入力 | — | `formDialog()` | ✅ |
+| 複数項目の入力 | — | `formDialog()` (候補リスト付きの入力欄も可) | ✅ |
 | 一覧からの選択 | — | `selectDialog()` (ラジオ形式、`detail` に補足) | ✅ |
 | キャンセル操作 | — | × / キャンセル / Escape / 背景クリック | ✅ |
 | サーバー主導モーダル | `ping.modal` WebSocket | なし | ❌ |
@@ -454,6 +459,9 @@ markup は初回表示時に JS が組み立てる (`#app-dialog`、HTML 側の�
 | 変換 | `#action-option-virtual-convert` → `POST /api/virtual_novels/{id}/convert` (native) | ✅ |
 | 削除 | `#action-option-virtual-remove` → `DELETE /api/virtual_novels/{id}` | ✅ |
 
+- バーチャル小説の作者名・サイト名の入力欄は候補リスト付き (入力で絞り込み、↓ / ↑ で
+  候補を動かして Enter またはクリックで入力欄へ入れる)。ブラウザ標準の `datalist` は
+  使わず、同じスタイルの一覧を自前で描画する。
 - 操作対象の決め方: 一覧で**バーチャル小説をちょうど 1 件選択**しているときは、
   その作品を対象にして ncode の入力を求めない。登録が 1 件だけのときも同様。
   それ以外は `selectDialog` で一覧から選ぶ (以前の ncode 手入力は廃止)。
