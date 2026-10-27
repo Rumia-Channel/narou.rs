@@ -169,3 +169,47 @@ test('a failed stream keeps its cursor so no line is skipped', async () => {
   assert.ok(!requested[3].includes('after='), '失敗したストリームはカーソルなし');
   assert.deepEqual(stdout2.state.replaced, ['second console new']);
 });
+
+test('a fetch that resolves after stop does not render', async () => {
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const target = makeTarget('stdout');
+  let release = null;
+  const poller = context.createConsoleHistoryPoller({
+    fetchJson: () => new Promise((resolve) => { release = resolve; }),
+    getTargets: () => [target],
+  });
+
+  const pending = poller.poll();
+  // 取得の途中で接続が切り替わり (stop)、遅れて結果が返る。
+  poller.stop();
+  release({ history: 'late line', id: 5 });
+  await pending;
+
+  assert.deepEqual(target.state.replaced, [], '停止後に届いた結果は描かない');
+  assert.deepEqual(target.state.appended, []);
+});
+
+test('overlapping ticks do not apply the same delta twice', async () => {
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const target = makeTarget('stdout');
+  const requested = [];
+  let release = null;
+  const poller = context.createConsoleHistoryPoller({
+    fetchJson: () => {
+      requested.push('request');
+      return new Promise((resolve) => { release = resolve; });
+    },
+    getTargets: () => [target],
+  });
+
+  const first = poller.poll();
+  // 前の取得が終わらないうちに次の tick が走っても重ねない。
+  const second = poller.poll();
+  assert.equal(requested.length, 1, '取得は重ねない');
+  release({ history: 'line', id: 3 });
+  await first;
+  await second;
+
+  assert.deepEqual(target.state.replaced, ['line']);
+  assert.deepEqual(target.state.appended, []);
+});
