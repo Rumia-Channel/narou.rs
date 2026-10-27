@@ -40,6 +40,7 @@ pub mod version_compare;
 pub mod push_events;
 pub mod web_payloads;
 pub mod tag_colors;
+pub mod favorite_tags;
 pub mod web_actions;
 pub mod webui;
 pub use jobs::{
@@ -71,6 +72,7 @@ pub use web_actions::{
     EmptyWebActionService, WebActionOutput, WebActionService,
 };
 pub use tag_colors::{MemoryTagColorStore, TagColorService, TagColorStore};
+pub use favorite_tags::FavoriteTags;
 pub mod library;
 
 pub use error::ApplicationError;

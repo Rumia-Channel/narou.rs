@@ -8,6 +8,7 @@
 mod budget;
 mod authors;
 mod bundled_sites;
+mod favorite_tags;
 mod hidden;
 mod virtual_novels;
 mod composition;
@@ -148,6 +149,7 @@ async fn route(req: Request, env: Env) -> Result<Response> {
         // 可搬アーカイブ (native `src/web/transfer.rs` の `/api/transfer/*`)。
         "/api/transfer/export" | "/api/transfer/import" => transfer::handle(req, env).await,
         "/api/hidden" => hidden::handle(req, env).await,
+        "/api/favorite_tags" => favorite_tags::handle(req, env).await,
         "/api/virtual_novels" => virtual_novels::handle(req, env).await,
         "/api/global_setting" => global_settings::api_global_setting(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,

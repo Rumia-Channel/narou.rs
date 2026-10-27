@@ -21,6 +21,11 @@
   - `worker_entry` の `parking_lot` も 0.13 に揃え、依存グラフに `lock_api` 0.4 と 0.5 が混在して `Mutex` の型が食い違わないようにしました。
 - **変換の future が `Send` でない問題を解消しました**。変換コアが調査ログ用に保持していた `Rc<RefCell<Inspector>>` を `Arc<Mutex<Inspector>>` に変更し、`ConvertService` の future が `Send` になりました（clippy の `future_not_send` で検出される非 `Send` future が 0 件）。変換結果（本文テキスト・EPUB・調査ログ）は変更前とバイト単位で一致することを確認済みです。
 
+### お気に入りタグ (issue #46)
+
+- **「タグの編集」画面でお気に入りタグを登録できるように** しました（issue #46 の要望）。自動付与されるタグは数百個まで増えるため、検索なしでよく使うタグを選べないという課題への対応です。入力欄の「★」ボタン、または作品に付いているタグの「☆」ボタンで登録し、一覧はタグ編集画面の先頭へ常設表示されます。登録したタグは一覧の「追加」ボタンで選択中の小説へ付けられます。
+- 保存は在庫の `favorite_tags` キー（Native は `.narou/favorite_tags.yaml`、SQLite / Worker は `app_state('inv','favorite_tags')`）で、登録順はそのまま保持されます。タグ色とは独立した設定です。
+
 変更一覧は [v0.5.3...v0.5.4](https://github.com/Rumia-Channel/narou.rs/compare/v0.5.3...v0.5.4) を参照してください。
 
 ## v0.5.3 — バーチャル小説の話数・ファイル名・登録順 UI 修正

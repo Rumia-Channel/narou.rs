@@ -2,6 +2,7 @@ pub mod batch;
 pub mod authors;
 pub mod sites;
 pub mod feature_tour;
+pub mod favorite_tags;
 pub mod frontend;
 pub mod global_settings;
 pub mod hidden;
@@ -611,6 +612,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/authors", get(authors::list).post(authors::add).delete(authors::remove))
         .route("/api/authors/check", post(authors::check))
         .route("/api/hidden", get(hidden::api_hidden_get).post(hidden::api_hidden))
+        .route(
+            "/api/favorite_tags",
+            get(favorite_tags::api_favorite_tags_get).post(favorite_tags::api_favorite_tags),
+        )
         .route(
             "/api/virtual_novels",
             get(virtual_novels::api_virtual_list).post(virtual_novels::api_virtual_create),

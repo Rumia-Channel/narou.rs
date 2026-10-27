@@ -657,6 +657,14 @@ narou setting name         # 読み取り
 - 追加タグの禁止文字 `:;"'><$@&^\\\|%/\`` と禁止語 `hotentry` を Ruby版相当に検証する
 - 編集後は `現在のタグは ... です` を表示し、タグ名/`tag:NAME`/ID/URL/Nコード/タイトル/alias のターゲット解決に対応
 
+**お気に入りタグ (issue #46 の要望、2026-10 追加)**:
+- Web UI の「タグの編集」画面でお気に入りタグを登録し、検索なしで選べるようにする
+- 保存先は在庫の `favorite_tags` キー (Native は `.narou/favorite_tags.yaml` / SQLite `app_state('inv','favorite_tags')`、Worker は D1 の同じキー)。登録順は保持する
+- 共有モデルは `src/application/favorite_tags.rs`、native のストアは `src/native/favorite_tags.rs`、Worker の D1 ストアは `worker_entry/src/favorite_tags.rs`
+- API: `GET /api/favorite_tags` (現在の登録一覧)、`POST /api/favorite_tags` (`action`: `add` / `remove` / `clear`、native は `src/web/favorite_tags.rs`、Worker は `worker_entry/src/favorite_tags.rs`)
+- タグ色とは独立した設定。お気に入りに登録しても色は変わらず、色を変えてもお気に入りは外れない
+- CLI には対応コマンドが無い (Web UI 専用の設定)
+
 ---
 
 ### 9. `remove` — ✅ 完了

@@ -21,6 +21,7 @@ import {
   refreshQueue,
   refreshQueueDetailed,
   refreshTags,
+  refreshFavoriteTags,
 } from './ui/actions.js';
 
 let ws = null;
@@ -124,6 +125,7 @@ async function init() {
 
   // Initial data load
   await Promise.all([refreshListWithUiState(false), refreshQueue(), refreshQueueDetailed(), refreshTags(false)]);
+  void refreshFavoriteTags();
   renderNovelList();
 
   // Sync UI state (check marks, wide mode, footer)
