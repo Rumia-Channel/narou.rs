@@ -3,6 +3,9 @@
  */
 import { State, El, initElements } from './core/state.js';
 import { fetchJson, postJson } from './core/http.js';
+import { renderConsoleLine } from './core/console_html.js';
+import { createConsoleHistoryPoller } from './core/console_history.js';
+import { createResilientWebSocket } from './core/websocket.js';
 import { restoreSortState } from './core/sort_state.js';
 import { setCapabilities, applyActionCapabilities, initCapabilityGuard } from './core/capabilities.js';
 import { applyI18n } from './ui/i18n.js';
@@ -21,9 +24,12 @@ import {
   refreshQueue,
   refreshQueueDetailed,
   refreshTags,
+  refreshFavoriteTags,
+  replaceConsoleHistory,
+  appendConsoleHistory,
 } from './ui/actions.js';
 
-let ws = null;
+let wsConnection = null;
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
 const CONSOLE_BOTTOM_THRESHOLD = 8;
 
@@ -124,6 +130,7 @@ async function init() {
 
   // Initial data load
   await Promise.all([refreshListWithUiState(false), refreshQueue(), refreshQueueDetailed(), refreshTags(false)]);
+  void refreshFavoriteTags();
   renderNovelList();
 
   // Sync UI state (check marks, wide mode, footer)
@@ -149,42 +156,75 @@ function connectWebSocket() {
   const url = new URL('/ws', location.href);
   url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
-  try {
-    ws = new WebSocket(url.toString());
-  } catch {
-    return;
-  }
+  // 接続が失敗するだけでなく、handshake が保留になる (onopen も onclose も
+  // 来ない) 場合も履歴取得へ切り替えるため、接続に時間制限を設けた
+  // WebSocket を使う。
+  wsConnection = createResilientWebSocket({
+    url: url.toString(),
+    createSocket: (target) => new WebSocket(target),
+    onOpen: () => {
+      // 接続が確立したら履歴取得を止める。接続が切れて作り直された
+      // 接続が開いたときも、前の接続が始めた履歴取得を止める。
+      stopConsoleHistoryPolling();
+      const con = document.getElementById('console');
+      if (con) {
+        con.innerHTML = '';
+        setConsolePinned(con, true);
+      }
+      const con2 = document.getElementById('console-stdout2');
+      if (con2) {
+        con2.innerHTML = '';
+        setConsolePinned(con2, true);
+      }
+      clearAllProgressBars();
+    },
+    onMessage: (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        handleWsMessage(msg);
+      } catch {
+        appendConsole(event.data);
+      }
+    },
+    onClose: () => {
+      setTimeout(connectWebSocket, 5000);
+    },
+    onFallbackStart: () => startConsoleHistoryPolling(),
+    onFallbackStop: () => stopConsoleHistoryPolling(),
+  });
+  wsConnection.connect();
+}
 
-  ws.onopen = () => {
+/* ===== WebSocket が使えないときの補完 ===== */
+
+// WebSocket が繋がらないことを一度だけ知らせる (原因が分からないと
+// _STATUS 欄が空のまま原因に気づけないため)。
+function notifyConsoleHistoryFallback() {
+  showNotification(
+    'WebSocket に接続できないため、履歴の取得でコンソールを更新します (server-ws-add-accepted-domains に現在のホストを追加するか、前段 proxy が WebSocket を中継する設定を確認してください)',
+    'warning',
+  );
+}
+
+const consoleHistoryPoller = createConsoleHistoryPoller({
+  fetchJson,
+  notify: notifyConsoleHistoryFallback,
+  getTargets() {
+    const targets = [];
     const con = document.getElementById('console');
-    if (con) {
-      con.innerHTML = '';
-      setConsolePinned(con, true);
-    }
+    if (con) targets.push({ stream: 'stdout', replace: (h) => replaceConsoleHistory(con, h), append: (h) => appendConsoleHistory(con, h) });
     const con2 = document.getElementById('console-stdout2');
-    if (con2) {
-      con2.innerHTML = '';
-      setConsolePinned(con2, true);
-    }
-    clearAllProgressBars();
-  };
+    if (con2) targets.push({ stream: 'stdout2', replace: (h) => replaceConsoleHistory(con2, h), append: (h) => appendConsoleHistory(con2, h) });
+    return targets;
+  },
+});
 
-  ws.onmessage = (event) => {
-    try {
-      const msg = JSON.parse(event.data);
-      handleWsMessage(msg);
-    } catch {
-      appendConsole(event.data);
-    }
-  };
+function startConsoleHistoryPolling() {
+  consoleHistoryPoller.start();
+}
 
-  ws.onclose = () => {
-    setTimeout(connectWebSocket, 5000);
-  };
-
-  ws.onerror = () => {
-    ws?.close();
-  };
+function stopConsoleHistoryPolling() {
+  consoleHistoryPoller.stop();
 }
 
 /**
@@ -768,99 +808,6 @@ function formatProgressLabel(current, total, percent) {
   return counts + percent.toFixed(1) + '%';
 }
 
-function sanitizeConsoleSpanStyle(styleText) {
-  var declarations = String(styleText || '')
-    .split(';')
-    .map(function(part) { return part.trim(); })
-    .filter(Boolean);
-  if (!declarations.length || declarations.length > 2) return '';
-
-  var color = '';
-  var fontWeight = '';
-  for (var i = 0; i < declarations.length; i++) {
-    var separator = declarations[i].indexOf(':');
-    if (separator <= 0) return '';
-    var name = declarations[i].slice(0, separator).trim().toLowerCase();
-    var value = declarations[i].slice(separator + 1).trim();
-    if (name === 'color') {
-      if (!/^[#(),.%\sa-zA-Z0-9-]+$/.test(value)) return '';
-      color = value;
-    } else if (name === 'font-weight') {
-      if (value.toLowerCase() !== 'bold') return '';
-      fontWeight = 'bold';
-    } else {
-      return '';
-    }
-  }
-  if (!color) return '';
-
-  var parts = [];
-  if (fontWeight) parts.push('font-weight:bold');
-  parts.push('color:' + color);
-  return parts.join(';');
-}
-
-function sanitizeConsoleNodes(source, target) {
-  var children = source.childNodes || [];
-  for (var i = 0; i < children.length; i++) {
-    var child = children[i];
-    if (child.nodeType === Node.TEXT_NODE) {
-      target.appendChild(document.createTextNode(child.textContent || ''));
-      continue;
-    }
-    if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'RUBY') {
-      appendConsoleRubyBaseText(child, target);
-      continue;
-    }
-    if (child.nodeType === Node.ELEMENT_NODE && (child.tagName === 'RT' || child.tagName === 'RP')) {
-      continue;
-    }
-    if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'RB') {
-      sanitizeConsoleNodes(child, target);
-      continue;
-    }
-    if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'SPAN') {
-      var style = sanitizeConsoleSpanStyle(child.getAttribute('style') || '');
-      if (!style) {
-        target.appendChild(document.createTextNode(child.textContent || ''));
-        continue;
-      }
-      var span = document.createElement('span');
-      span.setAttribute('style', style);
-      sanitizeConsoleNodes(child, span);
-      target.appendChild(span);
-      continue;
-    }
-    target.appendChild(document.createTextNode(child.textContent || ''));
-  }
-}
-
-function appendConsoleRubyBaseText(source, target) {
-  var rbElements = source.querySelectorAll('rb');
-  if (rbElements.length > 0) {
-    for (var i = 0; i < rbElements.length; i++) {
-      target.appendChild(document.createTextNode(rbElements[i].textContent || ''));
-    }
-    return;
-  }
-
-  var children = source.childNodes || [];
-  for (var i = 0; i < children.length; i++) {
-    var child = children[i];
-    if (child.nodeType === Node.TEXT_NODE) {
-      target.appendChild(document.createTextNode(child.textContent || ''));
-    } else if (child.nodeType === Node.ELEMENT_NODE && child.tagName !== 'RT' && child.tagName !== 'RP') {
-      sanitizeConsoleNodes(child, target);
-    }
-  }
-}
-
-function appendSanitizedConsoleHtml(target, html) {
-  var template = document.createElement('template');
-  template.innerHTML = html;
-  sanitizeConsoleNodes(template.content, target);
-}
-
 var lastLineComplete = true;
 
 function appendConsole(text, targetConsole) {
@@ -883,22 +830,7 @@ function appendConsole(text, targetConsole) {
   if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
 
   for (var i = 0; i < lines.length; i++) {
-    // Ruby web mode sends <hr> for horizontal rules; also detect text HR (U+2015 × 30+)
-    if (lines[i] === '<hr>' || /^―{30,}$/.test(lines[i])) {
-      var hr = document.createElement('hr');
-      hr.className = 'console-line console-hr';
-      con.appendChild(hr);
-    } else {
-      var div = document.createElement('div');
-      div.className = 'console-line';
-      // Allow limited HTML in console output: styled spans and ruby stripped to base text.
-      if (/<(?:span|ruby|rb|rt|rp)[\s>]/i.test(lines[i])) {
-        appendSanitizedConsoleHtml(div, lines[i]);
-      } else {
-        div.textContent = lines[i];
-      }
-      con.appendChild(div);
-    }
+    renderConsoleLine(con, lines[i]);
   }
 
   // Trim old lines (only console-line elements, preserve progress bars)

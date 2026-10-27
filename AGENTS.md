@@ -107,13 +107,14 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - 配布物: `narou_rs_login` もリリース zip に同梱する（`scripts/package-release.ps1` の `-LoginBinaryPath`、`.github/workflows/release.yml` の helper build / sign / package、`cargo local-build` のすべてに対応済み）。Windows では他のサブ実行ファイルと同じく署名対象に含める。`scripts/package-release.ps1` は `-Platform win` のとき本体・updater・backup・login の Authenticode 署名を梱包前に検証し、未署名なら失敗する（`-SkipSignatureCheck` は署名できないローカル確認専用で、リリース CI からは指定しない）。
 
 ## セキュリティ境界 (2026-10 強化)
-- **Native Web UI の loopback 認証**: `127.0.0.1` / `localhost` / `::1` bind かつ Basic 認証・reverse proxy なしのとき、`narou web` は起動ごとの一度きりチケットを URL に付けてブラウザへ渡し、`/` で HttpOnly / SameSite=Strict / 30 日有効の `narou_ui_token` Cookie に交換する。`/api/*`・`/ws`・`/novels/{id}/download` はこの Cookie または `x-narou-internal-token`（`.narou/server.pid` の制御トークン）を要求する。静的なページと `/assets/*` は公開のまま。トークン本体は `.narou/ui_token`（0600）に永続化し、再起動・セルフアップデート後もブラウザのセッションを維持する。`local_ui_auth_required()` は固定フラグではなく現在の `ServerSecurity` から毎回判定する。詳細は `WEBUI.md` §8.1.1。
+- **Native Web UI の loopback 認証**: `127.0.0.1` / `localhost` / `::1` bind かつ Basic 認証なしのとき、`narou web` は起動ごとの一度きりチケットを URL に付けてブラウザへ渡し、`/` で HttpOnly / SameSite=Strict / 30 日有効の `narou_ui_token` Cookie に交換する。`/api/*`・`/ws`・`/novels/{id}/download` はこの Cookie または `x-narou-internal-token`（`.narou/server.pid` の制御トークン）を要求する。静的なページと `/assets/*` は公開のまま。トークン本体は `.narou/ui_token`（0600）に永続化し、再起動・セルフアップデート後もブラウザのセッションを維持する。`local_ui_auth_required()` は固定フラグではなく現在の `ServerSecurity` から毎回判定する。**reverse proxy モードでも loopback ならトークンを要求する**（2026-10 修正）：同じ端末の別プロセスは `Host` / `Origin` を自由に書けるため、これらは認証の代替にならない。チケットは使う origin（Host）ごとに 1 回だけ有効で、reverse proxy 経由の公開ホストと直接アクセスの双方を開ける。詳細は `WEBUI.md` §8.1.1。
 - **セルフアップデート**: Web API から更新 URL を指定する経路 (`asset_url`) は廃止した。取得先は GitHub Releases API の `browser_download_url` のみで、Release asset の `sha256` digest とサイズをダウンロード後に照合し、欠落・不一致はインストールせず中止する。`.narou/ui_token` と `.narou/login.key` はライブラリバックアップから除外する。
 - **reverse proxy**: `server-reverse-proxy.enable=true` でも Host の許可リストは維持する。プロキシ配下の公開ホストは `server-add-accepted-hosts` に、WebSocket は `server-ws-add-accepted-domains` に明示する。外部 bind + Basic 認証は平文 HTTP なので、LAN 外公開時は TLS 終端 proxy を使う（起動時に警告）。全レスポンスに `X-Frame-Options: DENY` / `frame-ancestors 'none'` / `nosniff` / `no-referrer` を付ける。
-- **ログイン資格情報**: 書き出し (`login export` / `narou_rs_login --export`) は 8 文字未満のパスフレーズを拒否し、ファイルは Unix 0600・シンボリックリンク非追従で書く (取り込みは旧ファイル互換のため任意長を受け付ける)。`narou_rs_login` のブラウザは `--remote-debugging-port=0` で起動し、`DevToolsActivePort` と `/json/version` の ws URL が起動したプロセスの port/host/path と一致することを確認する。SQLite の `db.sqlite` と `-wal` / `-shm` は Unix で 0600 にする。
+- **ログイン資格情報**: 書き出し (`login export` / `narou_rs_login --export`) は 8 文字未満のパスフレーズを拒否し、ファイルは Unix 0600・シンボリックリンク非追従で書く (取り込みは旧ファイル互換のため任意長を受け付ける)。ライブラリの鍵 `.narou/login.key` は **作成時から 0600**（`OpenOptionsExt::mode`）で、作成後に chmod する方式の窓を作らない (2026-10 修正)。`narou_rs_login` のブラウザは `--remote-debugging-port=0` で起動し、`DevToolsActivePort` と `/json/version` の ws URL が起動したプロセスの port/host/path と一致することを確認する。SQLite の `db.sqlite` と `-wal` / `-shm` は Unix で 0600 にする。
+- **お気に入りタグ** (issue #46, 2026-10): Web UI の「タグの編集」画面でお気に入りタグを登録し、検索なしで選べるようにする。共有モデルは `src/application/favorite_tags.rs` (native / Worker 共通の保存形式と検証)、native のストアは `src/native/favorite_tags.rs`、Worker の D1 ストアは `worker_entry/src/favorite_tags.rs`、API は `GET/POST /api/favorite_tags` (`action`: `add` / `remove` / `clear`)。保存先は在庫の `favorite_tags` キー (Native は `.narou/favorite_tags.yaml` / SQLite・Worker は `app_state('inv','favorite_tags')`) で登録順を保持する。タグ色とは独立した設定で、どちらも互いを変更しない。
 - **Worker / relay**: `NAROU_RELAY_ENDPOINT` は https 必須（ループバックのみ http 可）。スキーム省略の暗黙 `http://` 補完はしない（`platform::relay::normalize_relay_base`、違反は fail closed でリレー無効）。deploy CI の wrangler は固定バージョン (`NAROU_WRANGLER_VERSION`、既定 `4.151.3`) を使い、`NAROU_ADMIN_TOKEN` は CI で 32 文字以上を要求する。
 - **上流コンテンツ**: うごイラのフレーム ZIP は宣言サイズと読み出し上限（16 MiB/フレーム）およびヘッダ寸法で復号前に検証する。EPUB に取り込む非リモート `<img src>` は novel ディレクトリ内の相対パスだけを許可する。
-- **外部応答の Brotli 展開**: reqwest の `brotli` feature は有効にしない (CVE-2026-111497 は Google Brotli の C 実装 1.0.3〜1.2.0 が対象で C 版はリンクしていないが、pure Rust 実装も修正前と同じデコーダ経路を持つため、外部サイトの応答を展開する経路を落とす)。HTTP 取得は gzip / deflate / identity を使う。保存オブジェクト (`objects` / `section_bodies` など) の brotli 圧縮・伸長は自前データのみなので継続する。外部取得リレーも `curl --compressed` を使わず、`Accept-Encoding: gzip, deflate` を明示して gzip / deflate を Rust (`flate2`) で展開し、`br` は fail closed する (`relay/src/transport/curl.rs`)。2026-10。
+- **外部応答の Brotli 展開**: reqwest の `brotli` feature は有効にしない (CVE-2026-111497 は Google Brotli の C 実装 1.0.3〜1.2.0 が対象で C 版はリンクしていないが、pure Rust 実装も修正前と同じデコーダ経路を持つため、外部サイトの応答を展開する経路を落とす)。HTTP 取得は gzip / deflate / identity を使う。保存オブジェクト (`objects` / `section_bodies` など) の brotli 圧縮・伸長は自前データのみなので継続する (内部経路は `brotli` 9.1.0 / `brotli-decompressor` 6.2.0 を使う。これは CVE-2026-111497 対応版で、該当しうる入力に正しいエラーコードを返す。壊れた brotli ペイロードが panic ではなくエラーになることは `src/platform/object_store.rs` の単体テストで固定する)。外部取得リレーも `curl --compressed` を使わず、`Accept-Encoding: gzip, deflate` を明示して gzip / deflate を Rust (`flate2`) で展開し、`br` は fail closed する (`relay/src/transport/curl.rs`)。2026-10。
 
 ## 非表示・並列DL・転送 (v0.5.0)
 
@@ -130,13 +131,16 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - 追加した不具合修正には、修正前に失敗し修正後に成功する回帰テストを追加する。既存テストが通ることだけで済ませない。
 - テストを実行できなかった場合は、その事実と理由を明示し、完了扱いにしない。
 
-## 0.x.0 更新時の必須作業
+## バージョン更新時の必須作業
 
+- **番号のどの桁を上げるかで必須作業が変わる。** 0.x.0（マイナーバージョン）の更新では依存更新が必須だが、0.0.x（パッチ版。0.5.3 → 0.5.4 など）では必須ではない。
 - **0.x.0（マイナーバージョン）の更新ごとに、必ず次の3つを行う。**
   1. `cargo clippy --workspace --all-targets --all-features -- -D warnings` とビルドで警告を確認し、警告を解消する。依存更新で新しく出た警告も対象。
   2. `cargo update` でワークスペースの依存を更新する。`about-probe` も `cargo update --manifest-path about-probe/Cargo.toml` で更新し、両方の `Cargo.lock` を同じコミットに含める。
   3. 依存更新後に `cargo test --workspace` / clippy / Worker wasm / ライセンス再生成 (`cargo about`) を実行し、結果を確認する。更新で壊れた API はこの時点で直す。
-- パッチ版 (0.5.1 など) でも、依存更新や警告修正が必要なら同じ手順に従う。
+- **0.0.x（パッチ版）では、依存更新 (`cargo update`) とライセンス再生成 (`cargo about`) は必須ではない。** 既存依存のままリリースしてよい。依存を変更した場合に限り、`Cargo.lock` / `about-probe/Cargo.lock` と `Third-Party-License*.md` を同じコミットで更新する。
+- パッチ版でも `cargo clippy --workspace --all-targets --all-features -- -D warnings` と `cargo test --workspace` による確認は行う（依存更新を伴わないなら clippy の警告対応は不要だが、既存の警告がないことを確認する）。
+- 依存更新はリリースとは独立した単位でよい。依存更新だけのコミットをリリースのコミットに混在させない。
 
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。
@@ -453,16 +457,18 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **なろう**: narou.rb参照データと完全互換確認済み
 - **カクヨム (ID=1177354055617350769)**: **完全互換達成** — 行数完全一致 (25,273/25,273)、行単位 diff 0件。`tests/convert_parity.rs` のローカル参照 fixture で byte-for-byte 確認済み（通常の `cargo test` では ignored。参照データを用意して明示実行する手順は `tests/README.md`）
 - ※米印変換、全角数字、ルビ、auto_join_line、各種文字変換も完全一致
+- **変換の future は `Send`** (2026-10 修正): 調査ログ用に `NovelConverter` が保持する `Inspector` は `Arc<parking_lot::Mutex<Inspector>>` で共有する。`Rc<RefCell<_>>` のままだと `ConvertService::convert_and_store` / `convert_only` の future が非 `Send` になり、並列実行へ渡すと実行時 panic する (clippy `future_not_send` で検出)。非 `Send` の future があるときは `clippy::future_not_send` を ignore するのではなく、型を `Send` にして解消する。
 
 ### AozoraEpub3_Lite 組み込みエンジン (lite feature, 2026-09)
 - pin: `aozora_epub3_lite` = `381c0b17f91946e22d41e5246d3977c706abe82e` (v0.1.6)。この revision は wasm の JS 時計対応に加え、I/O 非依存の逐次画像収集 `AssetPlan` を公開する。更新時は Cargo 経由で git revision を指定し、`cargo update -p aozora_epub3_lite` と native / Worker の実出力を検証する。
 - 呼び出し側は書き出しを **1 エントリずつ**進められる (`EpubBook::stream_writer(sink)` → `next_entry()` / `write_current(bytes)` / `finish()`)。Worker の `download.epub` はこれと `worker::Response::from_stream` を組み合わせ、完成した EPUB を保持せずチャンクを流す (`ChunkSink` は `narou_rs::epub_lite` が提供)。画像計画と処理は `EpubPreparation` / `EpubBuild` で native と共有し、`EpubBuild::image` の保存元対応から 1 枚ずつ取得する (列挙は 512 枚 / 1 枚 16 MiB で 413)。
 - 組み立ては Lite CLI (`main.rs::convert_input`) と同じ公開 API を使う。独自実装 (挿絵の連番化・外字フォント収集・UUID 生成) は持たない。
-  - `config_for(aozoraepub3dir)` = `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。Java 版と同じ注記表・外字フォント・INI を読む。INI が無ければ `preset/AozoraEpub3.ini` 相当のフラグ。
+  - `config_for(aozoraepub3dir)` = `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。Java 版と同じ注記表・外字フォント・INI を読む。INI が無ければ `preset/AozoraEpub3.ini.default` 相当のフラグ。
   - `build_book(input_txt, options)` は `EpubPreparation` で入力を解釈し、native の `collect_assets` と Worker の逐次 `AssetPlan` の結果を同じ `finish` へ渡す。画像参照・連番・欠落除去・自動表紙・画像ページ配置・メタデータ・外字資産の組み立てを二重実装しない (`urn:uuid:` は Java と同じ `java_name_uuid`)。
   - 挿絵は `EpubBuild::resolve` が書き出し時に 1 枚ずつ読み、`image::process` (余白除去・リサイズ・回転) をかける。寸法だけ事前に読む。
-- narou カスタム注記 (`preset/custom_chuki_tag.txt`, 21 行) は `include_str!` で常に重ねる。`init` がインストール先 `chuki_tag.txt` に書き込む内容と同一なので、同梱資産だけで動く wasm / 未設定時でも `ここから柱` / 前書き / 後書き / 一字下げ 等が効く。
-- `preset/AozoraEpub3.ini` も `include_str!` し、`aozoraepub3dir` が無いときの既定にする (`IniSettings::parse` → `AozoraConfig::from_ini`)。Java 版は常にこの INI (init がインストール先へコピーしたもの) を読むため、外部 AozoraEpub3 が無い環境でも `TitlePage` / `CoverPage` / `SpaceHyphenation` / `DakutenType` などのフラグが一致する。実測: 資産なしでも Java と 419/423 バイト一致。
+- narou カスタム注記 (`preset/custom_chuki_tag.txt.default`, 21 行) は `include_str!` で常に重ねる。`init` がインストール先 `chuki_tag.txt` に書き込む内容と同一なので、同梱資産だけで動く wasm / 未設定時でも `ここから柱` / 前書き / 後書き / 一字下げ 等が効く。
+- `preset/AozoraEpub3.ini.default` も `include_str!` し、`aozoraepub3dir` が無いときの既定にする (`IniSettings::parse` → `AozoraConfig::from_ini`)。Java 版は常にこの INI (init がインストール先へコピーしたもの) を読むため、外部 AozoraEpub3 が無い環境でも `TitlePage` / `CoverPage` / `SpaceHyphenation` / `DakutenType` などのフラグが一致する。実測: 資産なしでも Java と 419/423 バイト一致。
+- **利用者設定と同梱の既定値は別ファイル (issue #45 の続き, 2026-10)**: `preset/` の設定は「利用者が作る `AozoraEpub3.ini` / `custom_chuki_tag.txt`」と「配布物が持つ `AozoraEpub3.ini.default` / `custom_chuki_tag.txt.default`」に分けた。**利用者設定は配布物に同梱しない** (`scripts/package-release.ps1` が `preset/` から除外する / `.github/workflows/build-linux.yml` も `.default` だけを配置する) ので、どのバージョンのセルフアップデートでも書き換わらない。`src/bin/updater.rs` も `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` は既存があれば上書きしない。実行時の解決順は「利用者設定 → 同梱の既定値 → 埋め込みの既定値」で、共通定義は `src/preset.rs` に置く。
 - 同梱 `replace.txt` は読み込まない (削除済み)。Java は narou.rb 構成では `replace.txt` を持たない (配布物は `replace_sample.txt`) ため、読み込むと `－`→`―` など不要な文字置換が入り Java とずれる。
 - 残差: 外字フォント (`gaiji/dakuten/*.ttf`) は `aozoraepub3dir` が無いと格納できない。`AozoraConfig::gaiji_fonts` がパス指定のため、同梱資産 (バイト列) からは渡せない。Java は濁点外字に `<span class="glyph u30fc-u309a">` を出すが Lite は素の文字になる (この差は外字を使う小説でのみ発生)。
 - **フォント (濁点フォント / 本文フォント)**: 外部ツールには `DakutenFontGuard` が `aozoraepub3dir/template/OPS/fonts/DMincho.ttf` と `css_custom/vertical_font.css` を流し込んで効かせる。組み込み (Lite) にはその経路が無いので、narou は同じ内容を `EpubBuildOptions::extra_assets` の `style/vertical_font.css` + `fonts/DMincho.ttf` として渡し、crate 側が本文 (`item/xhtml/*.xhtml`) からその CSS をリンクする (組み込み CSS より後ろに置くので同じ詳細度ならこちらが勝つ)。設定 `convert.epub-font` (`auto` / `always`) で選び、`always` は本文全体を `DakutenAokinMincho` で組む — U+3000 (全角スペース) を描けない Reader (超縦書き など) 向けの回避策で、`auto` は従来どおり濁点注記のある小説だけ。

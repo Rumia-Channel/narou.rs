@@ -4,6 +4,7 @@
  */
 import { State, El, lsSet, lsBool } from '../core/state.js';
 import { fetchJson, postJson, request, assertApiSuccess } from '../core/http.js';
+import { renderConsoleLine } from '../core/console_html.js';
 import { createNotepadEditor } from '../core/notepad.js';
 import { persistSortState, postSortedJson } from '../core/sort_state.js';
 import { toggleLanguage, t } from './i18n.js';
@@ -522,6 +523,7 @@ export function bindActions() {
   on('tag-edit-close', closeTagEditor);
   on('tag-edit-cancel', closeTagEditor);
   on('add-tag-button', addTagFromInput);
+  on('favorite-tag-button', addFavoriteTagFromInput);
   El.newTagInput?.addEventListener('input', renderTagSuggestions);
   El.newTagInput?.addEventListener('focus', renderTagSuggestions);
   El.newTagInput?.addEventListener('blur', () => {
@@ -1420,6 +1422,7 @@ async function openTagEditor(ids) {
   El.tagEditModal.dataset.selectedCount = String(targetIds.length);
   renderTagEditorSummary(targetIds.length, { loading: true });
   renderTagEditorTags(targetIds, []);
+  renderFavoriteTags();
   setTagEditorPending();
 
   if (El.newTagInput) {
@@ -1465,6 +1468,16 @@ function splitTagInput(value) {
     tags.push(tag);
   }
   return tags;
+}
+
+// 入力欄のタグをお気に入りに登録する (作品への付与はしない)。
+async function addFavoriteTagFromInput() {
+  const input = El.newTagInput;
+  if (!input) return;
+  const tags = splitTagInput(input.value);
+  if (tags.length === 0) return;
+  await setFavoriteTags({ action: 'add', tags });
+  showNotification(`「${tags.join('」「')}」をお気に入りに登録しました`, 'success');
 }
 
 function renderTagSuggestions() {
@@ -1587,6 +1600,7 @@ async function refreshTagEditor(ids) {
     : [];
   renderTagEditorSummary(selectionCount);
   renderTagEditorTags(ids, selectedTagInfo);
+  syncFavoriteStars();
 }
 
 function renderTagEditorSummary(selectionCount, options = {}) {
@@ -1655,6 +1669,21 @@ function renderTagEditorTags(ids, taginfo) {
       showTagColorMenu(event, info.tag);
     });
     chip.appendChild(colorBtn);
+
+    const favoriteBtn = document.createElement('button');
+    favoriteBtn.type = 'button';
+    favoriteBtn.className = 'tag-favorite-edit';
+    const isFavorite = (State.favoriteTags || []).includes(info.tag);
+    favoriteBtn.textContent = isFavorite ? '★' : '☆';
+    favoriteBtn.title = isFavorite
+      ? `「${info.tag}」をお気に入りから外す`
+      : `「${info.tag}」をお気に入りに登録する`;
+    favoriteBtn.setAttribute('aria-label', favoriteBtn.title);
+    favoriteBtn.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await toggleFavoriteTag(info.tag);
+    });
+    chip.appendChild(favoriteBtn);
     chip.addEventListener('contextmenu', (event) => {
       showTagColorMenu(event, info.tag);
     });
@@ -1679,6 +1708,118 @@ function renderTagEditorTags(ids, taginfo) {
 function tagColorClass(tag) {
   const colorName = State.tagColors?.[tag] || 'default';
   return TAG_COLOR_MAP[colorName] || 'tag-default';
+}
+
+/* ===== お気に入りタグ ===== */
+
+// お気に入りタグの一覧を描画する。登録済みのタグは常設表示し、クリックで
+// 入力欄へ入れる。解除ボタンで登録から外す。
+function renderFavoriteTags() {
+  const list = El.tagFavoritesList;
+  const empty = El.tagFavoritesEmpty;
+  if (!list) return;
+  list.textContent = '';
+  const favorites = Array.isArray(State.favoriteTags) ? State.favoriteTags : [];
+  if (empty) {
+    empty.classList.toggle('hide', favorites.length > 0);
+  }
+  favorites.forEach((tag) => {
+    const chip = document.createElement('span');
+    chip.className = `tag-label ${tagColorClass(tag)} tag-favorite`;
+    chip.dataset.tag = tag;
+    chip.textContent = tag;
+    chip.title = `「${tag}」を入力欄へ入れる`;
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'tag-favorite-add';
+    addBtn.textContent = '追加';
+    addBtn.title = `「${tag}」をタグに追加する`;
+    addBtn.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await addFavoriteTagToSelection(tag);
+    });
+    chip.appendChild(addBtn);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'tag-remove';
+    removeBtn.textContent = '×';
+    removeBtn.title = `「${tag}」をお気に入りから外す`;
+    removeBtn.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await setFavoriteTags({ action: 'remove', tags: [tag] });
+    });
+    chip.appendChild(removeBtn);
+
+    chip.addEventListener('click', () => {
+      if (!El.newTagInput) return;
+      El.newTagInput.value = tag;
+      hideTagSuggestions();
+      El.newTagInput.focus();
+    });
+
+    list.appendChild(chip);
+  });
+}
+
+// お気に入りタグの登録 / 解除を切り替える。
+async function toggleFavoriteTag(tag) {
+  const isFavorite = (State.favoriteTags || []).includes(tag);
+  await setFavoriteTags({
+    action: isFavorite ? 'remove' : 'add',
+    tags: [tag],
+  });
+}
+
+// お気に入りの登録状態を更新して一覧を描き直す。
+async function setFavoriteTags(body) {
+  try {
+    const result = await postJson('/api/favorite_tags', body);
+    if (!result || result.success !== true) {
+      showNotification(result?.message || 'お気に入りの更新に失敗しました', 'error');
+      return;
+    }
+    State.favoriteTags = Array.isArray(result.tags) ? result.tags : [];
+    renderFavoriteTags();
+    syncFavoriteStars();
+  } catch (error) {
+    showNotification(error.message || 'お気に入りの更新に失敗しました', 'error');
+  }
+}
+
+// 作品に付いているタグの ★ ボタンをお気に入りの状態に合わせて更新する。
+function syncFavoriteStars() {
+  const favorites = Array.isArray(State.favoriteTags) ? State.favoriteTags : [];
+  El.tagEditorCurrent?.querySelectorAll('.tag-editable[data-tag]').forEach((chip) => {
+    const button = chip.querySelector('.tag-favorite-edit');
+    const tag = chip.dataset.tag;
+    if (!button || !tag) return;
+    const isFavorite = favorites.includes(tag);
+    button.textContent = isFavorite ? '★' : '☆';
+    button.title = isFavorite
+      ? `「${tag}」をお気に入りから外す`
+      : `「${tag}」をお気に入りに登録する`;
+  });
+}
+
+// 選択中の小説へ、お気に入りタグを付ける。
+async function addFavoriteTagToSelection(tag) {
+  const ids = getCurrentEditorTargetIds();
+  if (ids.length === 0) return;
+  await mutateEditorTags(ids, { [tag]: 2 }, 'タグの追加に失敗しました');
+}
+
+// 現在のタグ編集モーダルで対象になっている小説 ID。
+function getCurrentEditorTargetIds() {
+  const idsJson = El.tagEditModal?.dataset.ids;
+  if (idsJson) {
+    try {
+      const ids = JSON.parse(idsJson);
+      if (Array.isArray(ids) && ids.length > 0) return ids;
+    } catch { /* fall through */ }
+  }
+  return [...(State.selectedIds || [])];
 }
 
 async function applyBulkTagEdit(ids, states, fallbackMessage) {
@@ -2368,14 +2509,25 @@ export async function refreshTags(redraw = true) {
   });
 }
 
-function replaceConsoleHistory(consoleEl, history) {
+// お気に入りタグの一覧を取得する (失敗しても操作は続けられる)。
+export async function refreshFavoriteTags() {
+  try {
+    const data = await fetchJson('/api/favorite_tags');
+    if (data && data.success !== false) {
+      State.favoriteTags = Array.isArray(data.tags) ? data.tags : [];
+      renderFavoriteTags();
+    }
+  } catch { /* keep the last successfully loaded favorites */ }
+}
+
+export function replaceConsoleHistory(consoleEl, history) {
   var lines = consoleEl.querySelectorAll('.console-line');
   lines.forEach(function(el) { el.remove(); });
   String(history || '').split('\n').forEach(function(line) {
-    var div = document.createElement('div');
-    div.className = 'console-line';
-    div.textContent = line;
-    consoleEl.appendChild(div);
+    if (line === '') return;
+    // ライブ出力と同じ描画経路を使う。textContent だけだと <span> などの
+    // タグがそのまま見えてしまう (issue #46)。
+    renderConsoleLine(consoleEl, line);
   });
   if (consoleEl.id === 'console-stdout2') {
     State.consolePinned.stdout2 = true;
@@ -2383,4 +2535,23 @@ function replaceConsoleHistory(consoleEl, history) {
     State.consolePinned.main = true;
   }
   consoleEl.scrollTop = consoleEl.scrollHeight;
+}
+
+// 履歴の差分をコンソールへ追記する (WebSocket が使えない環境の補完用)。
+export function appendConsoleHistory(consoleEl, history) {
+  if (!consoleEl) return;
+  var added = false;
+  String(history || '').split('\n').forEach(function(line) {
+    if (line === '') return;
+    renderConsoleLine(consoleEl, line);
+    added = true;
+  });
+  if (added) {
+    if (consoleEl.id === 'console-stdout2') {
+      State.consolePinned.stdout2 = true;
+    } else {
+      State.consolePinned.main = true;
+    }
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
 }

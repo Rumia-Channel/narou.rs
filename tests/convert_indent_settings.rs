@@ -212,7 +212,7 @@ fn lite_epub_includes_half_indent_css_and_markup() {
     let mut xhtml = String::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).unwrap();
-        let name = entry.name().to_string();
+        let name = entry.name().unwrap().to_string();
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
         if name.ends_with("style/vertical_font.css") {
@@ -250,13 +250,13 @@ fn epub_entry_names(novel: &Path) -> Vec<String> {
         let mut entry = archive.by_index(index).unwrap();
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
-        names.push(entry.name().to_string());
+        names.push(entry.name().unwrap().to_string());
     }
     names.sort();
     names
 }
 
-/// issue #45: 配布物の `preset/AozoraEpub3.ini` を編集すると、組み込み
+/// issue #45: 利用者が作る `preset/AozoraEpub3.ini` を置くと、組み込み
 /// エンジンの実際の EPUB 出力が変わること。`TitlePage=0` は扉ページを
 /// 生成しないため、ZIP のエントリ構成で確認できる。
 #[cfg(feature = "lite")]
@@ -288,5 +288,46 @@ fn lite_preset_ini_is_read_by_the_real_binary() {
     assert_ne!(
         without_preset, with_preset,
         "preset/AozoraEpub3.ini が組み込みエンジンに反映されていない"
+    );
+}
+
+/// issue #45: `preset/` の設定は「利用者の設定 (`AozoraEpub3.ini`) → 同梱の
+/// 既定値 (`AozoraEpub3.ini.default`)」の順で解決される。利用者の設定は
+/// 配布物に含まれないため、セルフアップデートで内容が消えない。
+#[cfg(feature = "lite")]
+#[test]
+fn lite_preset_user_ini_wins_over_the_bundled_default_ini() {
+    let temp = library();
+    let root = temp.path();
+    std::fs::write(
+        root.join(".narou/local_setting.yaml"),
+        "device: epub\nconvert.epub-engine: lite\n",
+    )
+    .unwrap();
+    let novel = write_managed_novel(root);
+
+    std::fs::create_dir_all(root.join("preset")).unwrap();
+    // `TitlePageWrite` も指定する (INI の既定値だけでは扉ページが生成されない)。
+    std::fs::write(
+        root.join("preset/AozoraEpub3.ini.default"),
+        "TitlePage=0\nTitlePageWrite=1\n",
+    )
+    .unwrap();
+    let default_run = run(root, &["convert", "1", "--no-open"]);
+    assert_success(&default_run, "convert 1 (bundled default ini)");
+    let with_default = epub_entry_names(&novel);
+
+    std::fs::write(
+        root.join("preset/AozoraEpub3.ini"),
+        "TitlePage=2\nTitlePageWrite=1\n",
+    )
+    .unwrap();
+    let user_run = run(root, &["convert", "1", "--no-open"]);
+    assert_success(&user_run, "convert 1 (user ini)");
+    let with_user = epub_entry_names(&novel);
+
+    assert_ne!(
+        with_default, with_user,
+        "preset/AozoraEpub3.ini が同梱の既定値より優先されていない"
     );
 }

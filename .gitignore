@@ -38,8 +38,10 @@ target
 errors.txt
 
 *.txt
-!preset/custom_chuki_tag.txt
 !assets/aozora_lite/*.txt
+# 利用者が作る設定 (配布物には同梱しない / 開発中のローカル上書き)。
+/preset/AozoraEpub3.ini
+/preset/custom_chuki_tag.txt
 # CocoIndex Code (ccc)
 /.cocoindex_code/
 /dist/

@@ -4,10 +4,9 @@ mod ruby;
 mod stash_rebuild;
 mod text_normalization;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
+use parking_lot::Mutex;
 use regex::Regex;
 
 use super::device::Device;
@@ -20,7 +19,7 @@ static RE_BLANK_LINE_PACK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(^\n)
 pub struct ConverterBase {
     pub settings: NovelSettings,
     pub user_converter: Option<UserConverter>,
-    pub inspector: Option<Rc<RefCell<Inspector>>>,
+    pub inspector: Option<Arc<Mutex<Inspector>>>,
     pub url_stash: Vec<String>,
     pub english_stash: Vec<String>,
     pub illust_stash: Vec<String>,
@@ -81,7 +80,7 @@ impl ConverterBase {
         }
     }
 
-    pub fn with_inspector(settings: NovelSettings, inspector: Rc<RefCell<Inspector>>) -> Self {
+    pub fn with_inspector(settings: NovelSettings, inspector: Arc<Mutex<Inspector>>) -> Self {
         Self {
             settings,
             user_converter: None,
@@ -102,7 +101,7 @@ impl ConverterBase {
     pub fn with_user_converter_and_inspector(
         settings: NovelSettings,
         user_converter: UserConverter,
-        inspector: Rc<RefCell<Inspector>>,
+        inspector: Arc<Mutex<Inspector>>,
     ) -> Self {
         Self {
             settings,

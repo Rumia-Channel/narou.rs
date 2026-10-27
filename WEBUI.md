@@ -277,6 +277,26 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 
 ---
 
+### 2.7.1 お気に入りタグ
+
+**Rust版: ✅ 実装済み (issue #46 の要望)**
+
+自動付与されるタグは数百個まで増えるため、「タグの編集」画面から検索しないと
+よく使うタグを選べない。お気に入りタグを登録すると、タグ編集画面の先頭へ
+常設表示して検索なしで選べる。
+
+- 登録: タグ編集画面の入力欄の「★」ボタン、または作品に付いているタグの「☆」ボタン
+- 解除: お気に入り一覧の「×」ボタン、または「★」ボタンの切り替え
+- お気に入り一覧の「追加」ボタンで、選択中の小説へそのタグを付ける
+- 登録順は保持する (登録した順に並ぶ)
+- 保存先: 在庫の `favorite_tags` キー (Native は `.narou/favorite_tags.yaml` /
+  SQLite `app_state('inv','favorite_tags')`、Worker は D1 の同じキー)
+- タグ色は独立した設定。お気に入りに登録しても色は変わらず、色を変えても
+  お気に入りは外れない
+- API: GET / POST `/api/favorite_tags` (`action`: `add` / `remove` / `clear`)
+
+---
+
 ### 2.8 アラート・通知
 
 | 種類 | Ruby版 | Rust版 | 状態 |
@@ -693,14 +713,15 @@ Web UI 設定画面に出る関連項目: `server-bind` / `server-basic-auth.*` 
 
 ### 8.1.1 loopback UI トークン
 
-`127.0.0.1` / `localhost` / `::1` に bind し、Basic 認証もリバースプロキシも使わない構成では、`narou web` が起動ごとに一度きりのブートストラップ URL をブラウザへ渡します。
+`127.0.0.1` / `localhost` / `::1` に bind し、Basic 認証を使わない構成では、`narou web` が起動ごとに一度きりのブートストラップ URL をブラウザへ渡します。リバースプロキシモードでも loopback なら同じ要求を行います（同じ端末の別プロセスは `Host` / `Origin` ヘッダを自由に書けるため、これらは認証の代替になりません）。
 
-- 初回の `GET /?narou_ui_token=<ticket>` だけが受け付けられ、サーバは HttpOnly / SameSite=Strict / 30 日有効の `narou_ui_token` Cookie を設定してトークン無しの `/` へリダイレクトします。チケットは一度使うと無効になります。
+- 初回の `GET /?narou_ui_token=<ticket>` だけが受け付けられ、サーバは HttpOnly / SameSite=Strict / 30 日有効の `narou_ui_token` Cookie を設定してトークン無しの `/` へリダイレクトします。チケットは使う origin（`Host`）ごとに一度使うと無効になります（reverse proxy 経由の公開ホストと直接アクセスの両方から開けます）。
 - Cookie の値は `.narou/ui_token`（0600）に永続化されるため、サーバ再起動やセルフアップデート後もブラウザのセッションは維持されます。
 - `/api/*`、`/ws`、`/novels/{id}/download` は Cookie または `x-narou-internal-token` ヘッダを要求します。静的なページと `/assets/*` はトークン不要です。
+- 起動時には「ブラウザで開く URL」（チケット付き）を常設表示します。reverse proxy 経由の公開ホストで開く場合は、同じ URL の `narou_ui_token` パラメータを付けた公開 URL を開いてください。
 - `--no-browser` のときは、起動時に表示される「ブラウザで開く URL」をそのまま開いてください。ベース URL を直接開いた場合、API は 401 を返します。
 - CLI や外部ツールから API を叩く場合は、`.narou/server.pid`（0600）に書かれた制御トークンを `x-narou-internal-token` ヘッダで送れます。
-- `server-bind` が外部公開、Basic 認証あり、または `server-reverse-proxy.enable=true` の構成では従来どおり Basic 認証 / 前段プロキシに認証を委ね、UI トークンは要求しません。
+- `server-bind` が外部公開、または Basic 認証ありの構成では従来どおり Basic 認証に認証を委ね、UI トークンは要求しません。
 
 ### 8.2 セルフアップデートの variant
 

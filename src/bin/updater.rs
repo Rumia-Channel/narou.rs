@@ -304,7 +304,15 @@ fn extract_zip(zip_path: &Path, dest: &Path, logger: &mut Logger) -> Result<Path
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("zip entry {i}: {e}"))?;
-        let entry_name = entry.name().to_string();
+        let entry_name = match entry.name() {
+            Ok(name) => name.to_string(),
+            Err(error) => {
+                // zip 9 は entry 名が復号できないと Err を返す。名前のない
+                // エントリは展開先を決められないので、不審なエントリと同じく読み飛ばす。
+                logger.log(format!("skip zip entry with undecodable name: {error}"));
+                continue;
+            }
+        };
         let Some(rel) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
             logger.log(format!("skip suspicious zip entry: {entry_name}"));
             continue;
@@ -342,6 +350,26 @@ fn copy_tree_overwrite(
     backups: &mut Vec<BackupEntry>,
     logger: &mut Logger,
 ) -> Result<(), String> {
+    copy_tree_overwrite_inner(src, dst, Path::new(""), backups, logger)
+}
+
+/// 更新で上書きしない利用者設定ファイル (配布物から相対のパス)。
+///
+/// `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` は利用者が
+/// 編集する設定で、配布物には `.default` として同梱する。更新で消えない
+/// ように、既存ファイルがあれば上書きしない (issue #45)。
+const USER_EDITABLE_FILES: &[&str] = &[
+    "preset/AozoraEpub3.ini",
+    "preset/custom_chuki_tag.txt",
+];
+
+fn copy_tree_overwrite_inner(
+    src: &Path,
+    dst: &Path,
+    rel: &Path,
+    backups: &mut Vec<BackupEntry>,
+    logger: &mut Logger,
+) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("ensure dir {dst:?}: {e}"))?;
     let entries = fs::read_dir(src).map_err(|e| format!("read_dir {src:?}: {e}"))?;
     for entry in entries {
@@ -351,9 +379,15 @@ fn copy_tree_overwrite(
             .map_err(|e| format!("file_type {:?}: {e}", entry.path()))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
+        let rel_path = rel.join(entry.file_name());
         if file_type.is_dir() {
-            copy_tree_overwrite(&src_path, &dst_path, backups, logger)?;
+            copy_tree_overwrite_inner(&src_path, &dst_path, &rel_path, backups, logger)?;
         } else if file_type.is_file() {
+            let rel_key = rel_path.to_string_lossy().replace('\\', "/");
+            if USER_EDITABLE_FILES.contains(&rel_key.as_str()) && dst_path.exists() {
+                logger.log(format!("keep user file: {dst_path:?}"));
+                continue;
+            }
             replace_file_with_backup(&src_path, &dst_path, backups, logger)?;
         }
     }
@@ -551,6 +585,221 @@ mod tests {
         assert_eq!(fs::read(dst.join("sub/b.txt")).unwrap(), b"new-b");
         assert_eq!(backups.len(), 1);
         assert!(backups[0].backup.ends_with("a.txt.old"));
+    }
+
+    #[test]
+    fn copy_tree_overwrite_keeps_the_user_preset_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(src.join("preset")).unwrap();
+        fs::create_dir_all(dst.join("preset")).unwrap();
+        fs::write(src.join("preset/AozoraEpub3.ini"), b"shipped").unwrap();
+        fs::write(src.join("preset/custom_chuki_tag.txt"), b"shipped-chuki").unwrap();
+        fs::write(src.join("preset/AozoraEpub3.ini.default"), b"default-ini").unwrap();
+        fs::write(dst.join("preset/AozoraEpub3.ini"), b"user-edit").unwrap();
+
+        let mut backups = Vec::new();
+        let mut logger = Logger { file: None };
+        copy_tree_overwrite(&src, &dst, &mut backups, &mut logger).unwrap();
+
+        assert_eq!(
+            fs::read(dst.join("preset/AozoraEpub3.ini")).unwrap(),
+            b"user-edit",
+            "利用者設定が更新で上書きされている"
+        );
+        assert_eq!(
+            fs::read(dst.join("preset/custom_chuki_tag.txt")).unwrap(),
+            b"shipped-chuki",
+            "存在しない利用者設定は配布物から入れられる"
+        );
+        assert_eq!(
+            fs::read(dst.join("preset/AozoraEpub3.ini.default")).unwrap(),
+            b"default-ini"
+        );
+        assert!(
+            backups.is_empty(),
+            "利用者設定はバックアップもしない: {backups:?}"
+        );
+    }
+
+    /// リリース zip (narou/ をルートに持つ配置) の展開。
+    ///
+    /// zip 9 でエントリ名の返し方が変わり (`Result`)、`enclosed_name()` の
+    /// 判定も厳しくなった。更新の入口なので、ルート検出・展開・
+    /// 展開先外への書き出し防止をここで固定する。
+    #[test]
+    fn extract_zip_expands_the_release_layout_and_blocks_escapes() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("release.zip");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        for name in [
+            "narou/narou_rs.exe",
+            "narou/narou_rs_updater.exe.new",
+            "narou/preset/AozoraEpub3.ini.default",
+            "narou/webnovel/ncode.syosetu.com.yaml",
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(name.as_bytes()).unwrap();
+        }
+        // 展開先に影響するエントリ (相対・絶対・ドライバー付き)。
+        for name in [
+            "../escape.txt",
+            "/absolute.txt",
+            "narou/../../escape.txt",
+            r"C:\escape.txt",
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(b"escape").unwrap();
+        }
+        writer.finish().unwrap();
+
+        let mut logger = Logger { file: None };
+        let root = extract_zip(&zip_path, &dest, &mut logger).unwrap();
+
+        // ルートは narou/ を指す。
+        assert!(root.ends_with("narou"), "unexpected root: {root:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("narou_rs.exe")).unwrap(),
+            "narou/narou_rs.exe"
+        );
+        assert!(root.join("narou_rs_updater.exe.new").is_file());
+        assert!(root.join("preset/AozoraEpub3.ini.default").is_file());
+        assert!(root.join("webnovel/ncode.syosetu.com.yaml").is_file());
+
+        // 展開先の外には何も書かれない。
+        // zip 9 の `enclosed_name` は `..` を拒否し、絶対パスや
+        // ドライブ接頭辞は「先頭で相対化した名前」に落とす。どちらの場合も
+        // 展開先 (dest) の内側に留まることを確認する。
+        let written = list_tree(&dest);
+        assert!(
+            written.iter().all(|path| path.starts_with(dest.to_str().unwrap())),
+            "展開先外にファイルが書かれた: {written:?}"
+        );
+        assert!(
+            !tmp.path().join("escape.txt").exists(),
+            "展開先外に escape.txt が書かれた: {written:?}"
+        );
+        // `..` を含むエントリは読み飛ばされる (相対パスへ正規化されない)。
+        assert!(
+            !written.iter().any(|path| path.contains("..")),
+            "`..` を含むファイルが展開された: {written:?}"
+        );
+    }
+
+    /// ディレクトリ配下のファイル名をすべて集める (テスト用)。
+    fn list_tree(dir: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return names;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                names.extend(list_tree(&path));
+            } else {
+                names.push(path.to_string_lossy().to_string());
+            }
+        }
+        names
+    }
+
+    /// UTF-8 でない名前のエントリは CP437 として復号され、展開先の中に
+    /// 書かれる。
+    ///
+    /// zip 9 の `name()` は UTF-8 で復号できなければ CP437 に落とすため
+    /// 名前が読めないことは実質ない。それでも hostile な名前が展開先外に
+    /// 出ないことを固定する。
+    #[test]
+    fn extract_zip_keeps_non_utf8_names_inside_the_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("nonutf8.zip");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(&zip_path, zip_with_non_utf8_name()).unwrap();
+
+        let mut logger = Logger { file: None };
+        let root = extract_zip(&zip_path, &dest, &mut logger).unwrap();
+
+        // 展開は成功し、ファイルは展開先の中にだけ置かれる。
+        let written = list_tree(&dest);
+        assert!(
+            written.iter().all(|path| path.starts_with(dest.to_str().unwrap())),
+            "展開先外にファイルが書かれた: {written:?}"
+        );
+        assert!(!tmp.path().join("bin").exists());
+        assert!(root.is_dir());
+    }
+
+    /// UTF-8 でない名前のエントリを持つ zip をバイト列で作る。
+    fn zip_with_non_utf8_name() -> Vec<u8> {
+        fn u16le(value: u16, out: &mut Vec<u8>) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        fn u32le(value: u32, out: &mut Vec<u8>) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let name = b"narou/\xff\xfe.bin";
+        let data = b"binary";
+        let crc = crc32fast::hash(data);
+
+        let mut out = Vec::new();
+        // Local file header
+        u32le(0x0403_4b50, &mut out);
+        u16le(10, &mut out); // version needed
+        u16le(0, &mut out); // flags (UTF-8 フラグなし → CP437 で復号される)
+        u16le(0, &mut out); // method: stored
+        u16le(0, &mut out); // time
+        u16le(0, &mut out); // date
+        u32le(crc, &mut out);
+        u32le(data.len() as u32, &mut out);
+        u32le(data.len() as u32, &mut out);
+        u16le(name.len() as u16, &mut out);
+        u16le(0, &mut out); // extra
+        out.extend_from_slice(name);
+        out.extend_from_slice(data);
+
+        let central_offset = out.len();
+        // Central directory header
+        u32le(0x0201_4b50, &mut out);
+        u16le(20, &mut out); // version made by
+        u16le(10, &mut out); // version needed
+        u16le(0, &mut out); // flags (UTF-8 フラグなし)
+        u16le(0, &mut out); // method
+        u16le(0, &mut out); // time
+        u16le(0, &mut out); // date
+        u32le(crc, &mut out);
+        u32le(data.len() as u32, &mut out);
+        u32le(data.len() as u32, &mut out);
+        u16le(name.len() as u16, &mut out);
+        u16le(0, &mut out); // extra
+        u16le(0, &mut out); // comment
+        u16le(0, &mut out); // disk number
+        u16le(0, &mut out); // internal attributes
+        u32le(0, &mut out); // external attributes
+        u32le(0, &mut out); // local header offset
+        out.extend_from_slice(name);
+
+        let central_size = out.len() - central_offset;
+        // End of central directory
+        u32le(0x0605_4b50, &mut out);
+        u16le(0, &mut out); // disk number
+        u16le(0, &mut out); // disk with central directory
+        u16le(1, &mut out); // entries on this disk
+        u16le(1, &mut out); // total entries
+        u32le(central_size as u32, &mut out);
+        u32le(central_offset as u32, &mut out);
+        u16le(0, &mut out); // comment length
+        out
     }
 
     #[test]

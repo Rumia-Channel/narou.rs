@@ -114,13 +114,24 @@ fn relative_module_specifier(from_asset_path: &str, to_asset_path: &str) -> Stri
 /// Cookie 化に成功すると、以後の API/WebSocket/ダウンロードはブラウザが
 /// 自動で送る Cookie で認証される。トークンを URL に残さないため、
 /// アドレスバーや履歴に秘密が残らない。
+///
+/// チケットは使う origin (Host) ごとに 1 回だけ使える。reverse proxy 経由の
+/// 公開ホストと直接アクセスの両方から開く構成でも、チケットを取り直さずに
+/// それぞれの origin で Cookie を作れる。
+fn host_of(headers: &axum::http::HeaderMap) -> &str {
+    headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+}
 pub async fn index(
     State(state): State<super::AppState>,
     Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     if state.local_ui_auth_required()
         && let Some(token) = params.get(super::UI_AUTH_QUERY_PARAM)
-        && super::consume_ui_bootstrap_ticket(&state, token)
+        && super::consume_ui_bootstrap_ticket(&state, token, host_of(&headers))
     {
         let cookie = format!(
             "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000",
@@ -232,6 +243,36 @@ pub async fn asset(Path(path): Path<String>) -> Response {
             Cow::Owned(
                 apply_js_module_versions("js/core/http.js", include_str!("assets/js/core/http.js"))
                     .into_bytes(),
+            ),
+        ),
+        "js/core/console_html.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions(
+                    "js/core/console_html.js",
+                    include_str!("assets/js/core/console_html.js"),
+                )
+                .into_bytes(),
+            ),
+        ),
+        "js/core/console_history.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions(
+                    "js/core/console_history.js",
+                    include_str!("assets/js/core/console_history.js"),
+                )
+                .into_bytes(),
+            ),
+        ),
+        "js/core/websocket.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions(
+                    "js/core/websocket.js",
+                    include_str!("assets/js/core/websocket.js"),
+                )
+                .into_bytes(),
             ),
         ),
         "js/core/notepad.js" => (

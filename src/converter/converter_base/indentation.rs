@@ -83,7 +83,7 @@ impl ConverterBase {
                     .chars()
                     .take(10)
                     .collect::<String>();
-                inspector.borrow_mut().info(format!(
+                inspector.lock().info(format!(
                     "カタカナのニを漢字の二に修正しました\n≫≫≫ 該当箇所\n...{}...",
                     prefix + matched + &suffix
                 ));

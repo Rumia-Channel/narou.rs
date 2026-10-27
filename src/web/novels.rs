@@ -776,7 +776,7 @@ mod tests {
         let mut xhtml = String::new();
         for index in 0..epub.len() {
             let mut entry = epub.by_index(index).unwrap();
-            let name = entry.name().to_string();
+            let name = entry.name().unwrap().to_string();
             if name.starts_with("item/image/") {
                 let mut data = Vec::new();
                 entry.read_to_end(&mut data).unwrap();

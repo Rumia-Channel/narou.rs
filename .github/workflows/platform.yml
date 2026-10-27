@@ -39,6 +39,8 @@ jobs:
           node-version: "22"
       - name: Worker S3 deployment regressions
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_*s3*.py'
+      - name: Deploy secret handling regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_deploy_secret_masking.py'
       - name: Worker content publication and migration regressions
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_content_storage_sql.py'
       - name: Web UI source-link escaping regressions
@@ -48,6 +50,10 @@ jobs:
       - run: cargo check --workspace --all-targets
       - name: Web UI queue and refresh regressions
         run: node --test tests/queue_refresh.test.mjs
+      - name: Web UI favorite tag regressions
+        run: node --test tests/favorite_tags.test.mjs
+      - name: Web UI console rendering regressions
+        run: node --test tests/console_history.test.mjs tests/console_history_poll.test.mjs tests/websocket_fallback.test.mjs
       - name: Regression - SQLite converter settings (issue 22)
         run: cargo test -p narou_rs --lib converter_reads_sqlite_backed_default_and_force_settings
       - name: Regression - latest list ordering (issue 21)

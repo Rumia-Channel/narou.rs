@@ -50,7 +50,7 @@ jobs:
           cp target/release/narou_rs_backup "$dir/"
           cp target/release/narou_rs_login "$dir/"
           cp webnovel/*.yaml "$dir/webnovel/"
-          cp preset/AozoraEpub3.ini preset/custom_chuki_tag.txt "$dir/preset/"
+          cp preset/AozoraEpub3.ini.default preset/custom_chuki_tag.txt.default "$dir/preset/"
           cp Third-Party-License.md "$dir/"
           cat > "$dir/README.txt" <<'EOF'
           Linux サーバー用バンドル (x86_64 / 組み込み EPUB エンジン入り = GPL-3.0-only)。

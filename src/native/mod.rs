@@ -10,6 +10,7 @@ pub mod converter;
 pub mod author_store;
 pub mod cookie_store;
 pub mod downloader;
+pub mod favorite_tags;
 pub mod hidden;
 pub mod http;
 pub mod illustrations;

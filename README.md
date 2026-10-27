@@ -68,6 +68,8 @@ narou/
 
 `narou_rs` は、実行ファイルの近くにある `webnovel/`、`preset/`、`commitversion` を参照します。これらを分離しないでください。
 
+`preset/` には EPUB 変換の設定が入っています。同梱されているのは既定値 (`AozoraEpub3.ini.default` / `custom_chuki_tag.txt.default`) だけで、利用者が編集する設定は別の名前 (`AozoraEpub3.ini` / `custom_chuki_tag.txt`) で同じフォルダに作ります。編集したいときは既定値をコピーしてください (例: `Copy-Item preset\AozoraEpub3.ini.default preset\AozoraEpub3.ini`)。利用者が作った設定は配布物に含まれないため、セルフアップデートで書き換わらず内容が残ります。設定の優先順は「利用者の設定 → 同梱の既定値」です。
+
 Windows 版の zip に含まれる実行ファイル (`narou_rs.exe`、`narou_rs_updater.exe.new`、`narou_rs_backup.exe`、`narou_rs_login.exe`) は Authenticode 署名済みです。署名のないバイナリは梱包時に検出して失敗するため、リリース zip に未署名の実行ファイルは入りません。
 
 どちらの版も zip の展開後の手順は同じです。`self-update.variant` は今後のセルフアップデートで取得する版を決める設定で、実行中のバイナリは切り替わりません。Web UI の設定画面 (Global タブ) で選ぶか、`narou_rs setting self-update.variant=gpl` または `narou_rs setting self-update.variant=standard` で変更できます。

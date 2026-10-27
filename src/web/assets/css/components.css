@@ -619,6 +619,64 @@ li.enable-selected.disabled a {
   font-size: 0.90em;
 }
 
+.tag-favorites {
+  margin-bottom: 0.80em;
+}
+
+.tag-favorites-title {
+  margin: 0 0 0.40em;
+  color: var(--text-muted);
+  font-size: 0.90em;
+}
+
+.tag-favorites-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.30em;
+  min-height: 1.6em;
+}
+
+.tag-favorite {
+  position: relative;
+  padding-right: var(--tag-edit-padding-right);
+}
+
+.tag-favorite-add {
+  cursor: pointer;
+  border: 0.05em dashed var(--border-color);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.90em;
+  padding: 0.10em 0.45em;
+  opacity: 0.8;
+}
+
+.tag-favorite-add:hover,
+.tag-favorite-add:focus-visible {
+  opacity: 1;
+}
+
+.tag-favorite-edit {
+  position: absolute;
+  right: var(--tag-favorite-edit-right);
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85em;
+  opacity: 0.6;
+}
+
+.tag-favorite-edit:hover,
+.tag-favorite-edit:focus-visible {
+  opacity: 1;
+}
+
 .tag-editable {
   position: relative;
   padding-right: var(--tag-edit-padding-right);

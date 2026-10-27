@@ -225,7 +225,7 @@ mod tests {
             .expect("backup zip exists");
         let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
         let names: Vec<String> = (0..archive.len())
-            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .map(|index| archive.by_index(index).unwrap().name().unwrap().to_string())
             .collect();
         assert!(names.iter().any(|name| name == "toc.yaml"), "{names:?}");
         assert!(names.iter().any(|name| name == "setting.ini"), "{names:?}");

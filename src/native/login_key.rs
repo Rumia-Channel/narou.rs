@@ -78,15 +78,22 @@ impl LoginKey {
         // `create_new` keeps two processes from overwriting each other's key:
         // the loser reads whatever the winner wrote and both agree on it.
         let bytes = random_key()?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Unix では **作る時から** 0600 にする。作成直後に chmod すると、
+        // その間のファイルは umask 由来 (通常 0644) で他ユーザーから読めてしまい、
+        // AEAD の鍵が露出する (鍵が漏れると保存済み Cookie を復号できる)。
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
             Ok(mut file) => {
                 use std::io::Write as _;
                 file.write_all(BASE64.encode(bytes).as_bytes())?;
                 drop(file);
+                // 既存の緩いモード (旧ビルド-created ファイル) も締める。
                 restrict_permissions(path)?;
                 Ok(Self {
                     bytes,
@@ -175,5 +182,34 @@ mod tests {
 
         assert!(LoginKey::load_or_create(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// umask を緩く (0) しても鍵ファイルが 0600 で始まること。
+    ///
+    /// 作成後に chmod する実装だと、宽松な umask の下では 0666 で一瞬だけ
+    /// 読めるファイルになる (鍵が露出すると保存済み Cookie を復号できる)。
+    #[cfg(unix)]
+    #[test]
+    fn the_key_file_is_created_with_owner_only_permissions() {
+        // umask はプロセス全体に影響するので、他のテストと直列化する。
+        let _global = crate::test_support::global_state_guard();
+        let previous = unsafe { libc::umask(0) };
+        let result = std::panic::catch_unwind(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("narou-login-key-mode-{}", std::process::id()));
+            let path = dir.join("login.key");
+            let _ = std::fs::remove_dir_all(&dir);
+
+            LoginKey::load_or_create(&path).unwrap();
+
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            let _ = std::fs::remove_dir_all(&dir);
+            mode
+        });
+        unsafe {
+            libc::umask(previous);
+        }
+        assert_eq!(result.unwrap(), 0o600);
     }
 }

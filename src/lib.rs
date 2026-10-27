@@ -38,6 +38,7 @@ pub mod mail;
 #[cfg(feature = "native-runtime")]
 pub mod native;
 pub mod platform;
+pub mod preset;
 #[cfg(feature = "native-runtime")]
 pub mod progress;
 #[cfg(feature = "native-runtime")]

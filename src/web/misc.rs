@@ -33,6 +33,8 @@ pub struct TagListParams {
 pub struct HistoryParams {
     stream: Option<String>,
     format: Option<String>,
+    /// これより後の履歴行だけ返す (差分取得のカーソル)。
+    after: Option<u64>,
 }
 
 pub async fn version_current(State(_state): State<AppState>) -> Json<serde_json::Value> {
@@ -346,10 +348,23 @@ pub async fn console_history(
     State(state): State<AppState>,
     Query(params): Query<HistoryParams>,
 ) -> Response {
-    let history = state.push_server.get_history_for(params.stream.as_deref());
-    if params.format.as_deref() == Some("json") {
-        return Json(serde_json::json!({ "history": history })).into_response();
+    // `after` があるときは差分だけ返す (WebSocket が使えない環境の補完用)。
+    if let Some(after) = params.after {
+        let (history, cursor) = state
+            .push_server
+            .history_since(params.stream.as_deref(), after);
+        return Json(serde_json::json!({ "history": history, "id": cursor })).into_response();
     }
+    if params.format.as_deref() == Some("json") {
+        // 履歴とカーソルを同じロック内で取得する。別々に取得すると、その隙に
+        // 発行された行が「履歴には無いのにカーソルには含まれる」ことになり、
+        // 以降の差分取得でその行が飛ばされる。
+        let (history, cursor) = state
+            .push_server
+            .history_since(params.stream.as_deref(), 0);
+        return Json(serde_json::json!({ "history": history, "id": cursor })).into_response();
+    }
+    let history = state.push_server.get_history_for(params.stream.as_deref());
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         history,

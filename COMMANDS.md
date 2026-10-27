@@ -470,7 +470,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 - Windows の `\\?\\C:\\...\\AozoraEpub3.jar` 形式パスは Java classpath にそのまま渡すと失敗するため、Ruby版同様に jar の basename を current_dir 基準で渡すよう修正した。`sample\\novel` で `device=epub` 実変換と `--no-epub` 抑止を確認済み
 - Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector や CP932/Windows-31J 未定義文字 (`♠` / `♡` / `♢` / `♣` / `𠮷` など) を含み、Java/AozoraEpub3 側で出力名がずれやすい小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\Users\rumia\Documents\Narou` の n5853lh で EPUB 生成を確認済み
 - AozoraEpub3-JDK21 (1.6.x) は出力ファイルが `-dst` の **実パス** 配下かを検査するため、`-dst` が junction / シンボリックリンク / 8.3 短縮名 を含む形だと、実際には同じ場所でも `java.io.IOException: 出力パスが許可されたディレクトリ外です` で失敗する (検査は出力ファイルが未生成の時点で字句的に正規化したパスと比較されるため)。narou は `-dst` と入力パスを実パスへ解決してから渡す (一時ワークスペース使用時・通常出力時とも)。一時ワークスペースが `%TEMP%` 配下にある場合も同じ理由で失敗していた
-- `lite` feature 有効時は、外部 AozoraEpub3 が見つからない場合に組み込み `epub_lite` エンジンへフォールバックする (設定 `convert.epub-engine` = `auto`/`lite`/`external` で選ぶ。設定ページの「一般」タブからも切替可。1 回だけなら環境変数 `NAROU_RS_EPUB_ENGINE=lite`/`=external` で上書き)（外部ツール (jar / `AozoraEpub3_Lite.exe`) が見つかればそちらを優先する。narou.rb と同じ挙動）。`device=epub` / `kobo` / `reader` / `ibooks` / `mobi` の中間 EPUB 生成を外部ツールなしで行える。**Java 版と同じ資産と組み立て**: `aozoraepub3dir` があれば `chuki_*.txt` (narou カスタム注記込み)・`gaiji/*.ttf`・`AozoraEpub3.ini` を読み、無ければ同梱の `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` で同じフラグを再現する（外字フォントだけは同梱できないので入らない）。Lite の公開パイプライン (`collect_assets` / `decorate_image_tags` / `reflow_image_sections` / `build_title_page_markup` / `append_gaiji_assets` / `build_metadata`) を CLI と同じ順で使う。挿絵は書き出し時に 1 枚ずつ読み、Java と同じ前処理 (余白除去・リサイズ・回転) をかける。実データ検証: `C:\Users\rumia\Documents\WebNovel` の n0421du (401セクション) で Java 版 `AozoraEpub3.jar` の出力と **422/423 ファイルがバイト完全一致**（`aozoraepub3dir` 未設定でも **419/423**）、挿絵入りでも **425/426 がバイト完全一致**。残差は `dcterms:modified` のみ (Java はローカル時刻に `Z`、Lite は UTC) 濁点フォント (`vertical_font_with_dakuten.css` + `DMincho.ttf`) は外部ツールと同じ内容を組み込みエンジンにも渡す。設定 `convert.epub-font` = `auto`(濁点注記のある小説だけ)/`always`(本文全体を DMincho、`U+3000` を描けない Reader 向け) で選ぶ。組み込みエンジンは narou カスタム CSS (`denshokyo_font.css` = 電書協レイアウトの `font.css` 相当) を **常に** EPUB へ同梱する。これが無いと `.half_em_space` (二分アキ)・行高・前書き/後書きの装飾が効かず、`enable_half_indent_bracket` を有効にしても見た目が変わらない (2026-10 修正、issue #42)。
+- `lite` feature 有効時は、外部 AozoraEpub3 が見つからない場合に組み込み `epub_lite` エンジンへフォールバックする (設定 `convert.epub-engine` = `auto`/`lite`/`external` で選ぶ。設定ページの「一般」タブからも切替可。1 回だけなら環境変数 `NAROU_RS_EPUB_ENGINE=lite`/`=external` で上書き)（外部ツール (jar / `AozoraEpub3_Lite.exe`) が見つかればそちらを優先する。narou.rb と同じ挙動）。`device=epub` / `kobo` / `reader` / `ibooks` / `mobi` の中間 EPUB 生成を外部ツールなしで行える。**Java 版と同じ資産と組み立て**: `aozoraepub3dir` があれば `chuki_*.txt` (narou カスタム注記込み)・`gaiji/*.ttf`・`AozoraEpub3.ini` を読み、無ければ同梱の `preset/AozoraEpub3.ini.default` と `preset/custom_chuki_tag.txt.default` で同じフラグを再現する（利用者が `preset/AozoraEpub3.ini` / `preset/custom_chuki_tag.txt` を作っている場合はそちらが優先される。利用者設定は配布物に含まれないためセルフアップデートで消えない）（外字フォントだけは同梱できないので入らない）。Lite の公開パイプライン (`collect_assets` / `decorate_image_tags` / `reflow_image_sections` / `build_title_page_markup` / `append_gaiji_assets` / `build_metadata`) を CLI と同じ順で使う。挿絵は書き出し時に 1 枚ずつ読み、Java と同じ前処理 (余白除去・リサイズ・回転) をかける。実データ検証: `C:\Users\rumia\Documents\WebNovel` の n0421du (401セクション) で Java 版 `AozoraEpub3.jar` の出力と **422/423 ファイルがバイト完全一致**（`aozoraepub3dir` 未設定でも **419/423**）、挿絵入りでも **425/426 がバイト完全一致**。残差は `dcterms:modified` のみ (Java はローカル時刻に `Z`、Lite は UTC) 濁点フォント (`vertical_font_with_dakuten.css` + `DMincho.ttf`) は外部ツールと同じ内容を組み込みエンジンにも渡す。設定 `convert.epub-font` = `auto`(濁点注記のある小説だけ)/`always`(本文全体を DMincho、`U+3000` を描けない Reader 向け) で選ぶ。組み込みエンジンは narou カスタム CSS (`denshokyo_font.css` = 電書協レイアウトの `font.css` 相当) を **常に** EPUB へ同梱する。これが無いと `.half_em_space` (二分アキ)・行高・前書き/後書きの装飾が効かず、`enable_half_indent_bracket` を有効にしても見た目が変わらない (2026-10 修正、issue #42)。
 - 挿絵の自動回転は `convert.rotate-image` (`auto`/`0`/`1`/`2`) で制御する。`auto` (既定) は AozoraEpub3.ini の `RotateImage` に従い、`0` は回転しない、`1`/`2` は横長挿絵を +90°/−90°。組み込みエンジン・外部 `AozoraEpub3_Lite.exe` (`-i` で差し替えた一時 INI を渡す。インストール先の INI は書き換えない)・Worker の `download.epub` に効く。Java 版 `AozoraEpub3.jar` は INI パス指定を持たず、インストール先 INI を書き換える方針ではないため本設定は効かない (jar で同じ挙動にするには AozoraEpub3.ini 側を変更する)
 - Worker のストリーミング EPUB も共通設定から横書き・挿絵の有無・濁点フォント・行高を反映し、CSS / フォント資産を実際に埋め込む。自動表紙は本文順の適切な挿絵を最大 1 枚保持して作り、書き出しで再利用する。変換 API の端末指定は EPUB のみ受理し、非対応端末と個別 `enable_inspect` は明示的に拒否する。
 
@@ -657,6 +657,14 @@ narou setting name         # 読み取り
 - 追加タグの禁止文字 `:;"'><$@&^\\\|%/\`` と禁止語 `hotentry` を Ruby版相当に検証する
 - 編集後は `現在のタグは ... です` を表示し、タグ名/`tag:NAME`/ID/URL/Nコード/タイトル/alias のターゲット解決に対応
 
+**お気に入りタグ (issue #46 の要望、2026-10 追加)**:
+- Web UI の「タグの編集」画面でお気に入りタグを登録し、検索なしで選べるようにする
+- 保存先は在庫の `favorite_tags` キー (Native は `.narou/favorite_tags.yaml` / SQLite `app_state('inv','favorite_tags')`、Worker は D1 の同じキー)。登録順は保持する
+- 共有モデルは `src/application/favorite_tags.rs`、native のストアは `src/native/favorite_tags.rs`、Worker の D1 ストアは `worker_entry/src/favorite_tags.rs`
+- API: `GET /api/favorite_tags` (現在の登録一覧)、`POST /api/favorite_tags` (`action`: `add` / `remove` / `clear`、native は `src/web/favorite_tags.rs`、Worker は `worker_entry/src/favorite_tags.rs`)
+- タグ色とは独立した設定。お気に入りに登録しても色は変わらず、色を変えてもお気に入りは外れない
+- CLI には対応コマンドが無い (Web UI 専用の設定)
+
 ---
 
 ### 9. `remove` — ✅ 完了
@@ -803,6 +811,9 @@ narou setting name         # 読み取り
 - `download.interval` / `download.wait-steps` は実際の HTTP 送信ごとに、サイト定義の `min_interval` とともに適用する。リダイレクトと通信手段の切替も待機を省略せず、Worker では待機中も設定スナップショットの有効期限までに再確認する。
 - グローバル設定は変更項目だけを初期値照合付きで保存する。整数表記になる浮動小数値も設定メタデータで照合し、実際に競合した変更は拒否する。個別 INI の更新はファイル・SQLite・D1 の原子的更新を通し、同時変更された別項目と未知項目を保持する。
 - コンソール履歴の取得応答は表示世代で照合し、履歴削除や新しい行より古い応答で表示を巻き戻さない。コンソール操作と真偽値設定はキーボード操作に対応する。狭い画面の操作バーは折り返し、メニューを操作ボタンの下へ表示する。
+- コンソールのライブ出力と「History」ボタンでの再描画は同じ描画経路を使う（許可要素は `<span>` の色・太字と `<ruby>` の基底テキストだけで、履歴側に生の HTML タグを出さない）。
+- WebSocket が繋がらない環境（前段 proxy が upgrade を中継しない、`server-ws-add-accepted-domains` に現在のホストが無い、握手が保留のまま返らない）では、履歴 API の差分取得（`GET /api/history?format=json&after=<id>`）を 3 秒間隔で行ってコンソールを追い続ける。接続の待ち時間には 5 秒の上限を設け、確立できなければ履歴取得へ切り替え、確立した時点で履歴取得を止める。差分のカーソルはストリーム（`stdout` / `stdout2`）ごとに持ち、取得できたストリームだけを進める。取得は 1 つずつ行い、前の取得が終わる前に重ねない。停止後に届いた結果は描画しない。差分取得に対応しない Worker は全量の置き換えで同じ表示を保つ。
+- WebSocket が繋がらないことを知らせる通知は、履歴取得が 8 秒続いた場合だけ表示する。一時的な切断で再接続できた場合は通知を出さない。
 - Web UI のログコンソールは下端のハンドルをドラッグ、またはフォーカスして上下キーで高さを調整できる。左右のペインは同じ高さを保ち、調整値はブラウザ単位で保存する。「表示 → コンソールサイズをリセット」で初期の高さへ戻し、「表示設定を全てリセット」にも含める。サイズ変更・リセットではログ、進捗表示、過去の行を読んでいる位置を消さない。
 - FHD を超える画面ではブラウザの既定文字サイズを尊重しつつ UI を段階的に拡大し、メイン領域・ヘッダー幅とコンソールの初期高さをビューポートへ追従させる。幅広表示時にコンソールと操作バーだけを旧上限へ制限しない。狭い画面の初期高さ・スクロールと、読み物・ダイアログの可読幅は維持する。
 - 非対応操作は共通 capability で制限し、Worker の一覧内「保存先を開く」ボタンも無効にする。SQLite のオンデマンド EPUB は変換済みテキストの保存 codec を復号して読み、保存異常をキャッシュ欠落として隠さない。

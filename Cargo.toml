@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "narou_rs"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 license = "BSD-2-Clause"
 readme = "README.md"
@@ -89,7 +89,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 open = { version = "5", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true }
-parking_lot = "0.12"
+parking_lot = "0.13"
 dashmap = { version = "6", optional = true }
 futures = "0.3"
 pest = "2.8"
@@ -98,7 +98,7 @@ ua_generator = { git = "https://github.com/spider-rs/ua_generator.git", version 
 curl = { version = "0.4", features = ["static-ssl"], optional = true }
 indicatif = { version = "0.18", optional = true }
 encoding_rs = "0.8"
-zip = { version = "8.5", optional = true, default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.1", optional = true, default-features = false, features = ["deflate-flate2-zlib-rs"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls"], optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 similar = { version = "3.1", optional = true }
@@ -106,7 +106,7 @@ tempfile = { version = "3.27", optional = true }
 shell-words = { version = "1.1", optional = true }
 csv = { version = "1.4", optional = true }
 ctrlc = { version = "3.5", optional = true }
-fancy-regex = "0.19"
+fancy-regex = "0.20"
 socket2 = { version = "0.6", optional = true }
 chrono-tz = { version = "0.10", features = ["case-insensitive"] }
 subtle = "2.6"
@@ -116,7 +116,7 @@ getrandom = { version = "0.4", optional = true }
 fs2 = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 url = "2"
-rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "381c0b17f91946e22d41e5246d3977c706abe82e", optional = true }
 base64 = { version = "0.23", optional = true }
 miniz_oxide = "0.9"
@@ -132,7 +132,7 @@ hmac = "0.13"
 psl = "2.1.241"
 
 [build-dependencies]
-base64 = "0.22"
+base64 = "0.23"
 sha3 = "0.12"
 
 [[bin]]
@@ -161,11 +161,11 @@ path = "src/bin/cargo-local-build.rs"
 required-features = ["native-runtime"]
 
 [target."cfg(windows)".dependencies]
-tray-icon = { version = "0.25", default-features = false }
+tray-icon = { version = "0.26", default-features = false }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
-mailparse = "0.17"
+mailparse = "0.18"
 
 # Worker (wasm) のサイズと起動時間、配布バイナリの実行速度を優先する。
 # native の release ビルドは遅くなるが、CI では native は check/test のみで、

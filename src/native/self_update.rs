@@ -589,8 +589,11 @@ fn validate_zip(path: &Path) -> std::result::Result<(), String> {
     let mut has_updater = false;
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(|error| error.to_string())?;
-        has_exe |= entry.name() == exe_name;
-        has_updater |= entry.name() == updater_name;
+        // zip 9 は entry 名が復号できないと Err を返す。リリース資産の
+        // 名前が壊れていたら更新は続行しない (fail closed)。
+        let name = entry.name().map_err(|error| format!("zip: {error}"))?;
+        has_exe |= name.as_ref() == exe_name;
+        has_updater |= name.as_ref() == updater_name;
     }
     if !has_exe {
         return Err(format!("{exe_name} が含まれていません"));

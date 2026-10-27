@@ -153,8 +153,8 @@ Lite 側に資産注入の口が揃ったため、`src/epub_lite.rs` を組み�
   `cargo update -p aozora_epub3_lite`
 - `config_for(aozoraepub3dir)`: `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。
   Java 版と同じ注記表 (`chuki_*.txt`)・外字フォント (`gaiji/*.ttf`)・INI を読む。
-  INI が無ければ `preset/AozoraEpub3.ini` 相当のフラグを適用
-- `preset/custom_chuki_tag.txt` (21 行) を `include_str!` で常時重ねる。`narou init` が
+  INI が無ければ `preset/AozoraEpub3.ini.default` 相当のフラグを適用
+- `preset/custom_chuki_tag.txt.default` (21 行) を `include_str!` で常時重ねる。`narou init` が
   インストール先 `chuki_tag.txt` へ注入する内容と同一なので、同梱資産だけで動く
   wasm / 未設定時でも `ここから柱` / 前書き / 後書き / 一字下げ 等が効く
 - `build_book(input_txt, options)`: Lite CLI と同じ順で組み立てる —

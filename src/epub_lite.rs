@@ -44,11 +44,11 @@ mod embedded {
     /// narou.rb のカスタム注記 (`ここから柱` / 前書き / 後書き / …)。
     /// `narou init` が同じ行をインストール先 `chuki_tag.txt` へ注入するため、
     /// ここで重ねておけば Java 実行と同じ注記が常に使える。
-    pub const CUSTOM_CHUKI_TAG: &str = include_str!("../preset/custom_chuki_tag.txt");
+    pub const CUSTOM_CHUKI_TAG: &str = crate::preset::DEFAULT_CHUKI_TAG;
     /// `narou init` がインストール先へコピーするプリセット INI。外部 AozoraEpub3 が
     /// 無い環境でも Java 版と同じ変換フラグ (TitlePage / CoverPage /
     /// SpaceHyphenation / DakutenType など) で動かすために読み込む。
-    pub const AOZORA_INI: &str = include_str!("../preset/AozoraEpub3.ini");
+    pub const AOZORA_INI: &str = crate::preset::DEFAULT_INI;
     pub const CHUKI_TAG: &str = include_str!("../assets/aozora_lite/chuki_tag.txt");
     pub const CHUKI_TAG_SUF: &str = include_str!("../assets/aozora_lite/chuki_tag_suf.txt");
     pub const CHUKI_UTF: &str = include_str!("../assets/aozora_lite/chuki_utf.txt");
@@ -73,7 +73,8 @@ mod embedded {
 }
 
 /// `AozoraConfig` equivalent to running the Lite CLI with its bundled assets
-/// plus the narou `AozoraEpub3.ini` chapter/TOC flags (`preset/AozoraEpub3.ini`).
+/// plus the narou `AozoraEpub3.ini` chapter/TOC flags
+/// (`preset/AozoraEpub3.ini.default`).
 ///
 /// Built from strings on every call; cheap relative to text conversion and
 /// keeps the config free of shared mutable state.
@@ -95,7 +96,7 @@ pub fn embedded_config() -> AozoraConfig {
     config
 }
 
-/// narou.rb `preset/AozoraEpub3.ini`: TocPage/NavNest/NcxNest/TitleToc=1,
+/// narou.rb `preset/AozoraEpub3.ini.default`: TocPage/NavNest/NcxNest/TitleToc=1,
 /// ChapterSection empty (off), ChapterH1/H2/H3=1。`narou init` はこの INI を
 /// インストール先へコピーするので、INI がある場合はそちらの値が優先される。
 fn apply_narou_preset_flags(config: &mut AozoraConfig) {
@@ -144,30 +145,34 @@ pub fn config_for(assets_dir: Option<&Path>) -> AozoraConfig {
     config
 }
 
-/// 組み込みエンジンの `preset/AozoraEpub3.ini` を読み、注記表・外字・
-/// カスタム注記は同梱資産で補う。
+/// 組み込みエンジンの `preset/` の設定 (AozoraEpub3.ini・カスタム注記) を
+/// 読み、注記表・外字は同梱資産で補う。
 ///
 /// 外部 AozoraEpub3 の資産ディレクトリをそのまま使うと、`aozoraepub3dir`
-/// の INI が組み込みの挙動を変えてしまい、配布物の `preset/AozoraEpub3.ini`
-/// を編集しても反映されない (issue #45)。組み込みでは `preset/` の INI を
-/// 唯一の設定ファイルとして扱う。
+/// の INI が組み込みの挙動を変えてしまい、配布物の `preset/` を編集しても
+/// 反映されない (issue #45)。組み込みでは `preset/` の設定だけを扱う。
+///
+/// 設定の優先順は「利用者設定 (`preset/AozoraEpub3.ini`) → 同梱の既定値
+/// (`preset/AozoraEpub3.ini.default`) → 埋め込みの既定値」。利用者設定は
+/// 配布物に含まれないので、セルフアップデートで消えない。
 fn config_for_preset_dir(dir: &Path) -> AozoraConfig {
-    let ini_path = dir.join("AozoraEpub3.ini");
-    let mut config = match std::fs::read_to_string(&ini_path)
-        .ok()
-        .and_then(|text| aozora_epub3_lite::IniSettings::parse(&text).ok())
-    {
-        Some(ini) => AozoraConfig::from_ini(ini),
-        None => embedded_config(),
-    };
+    let mut config = crate::preset::ini_candidates(dir)
+        .iter()
+        .find_map(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| aozora_epub3_lite::IniSettings::parse(&text).ok())
+                .map(AozoraConfig::from_ini)
+        })
+        .unwrap_or_else(embedded_config);
     config.load_tag_text(embedded::CHUKI_TAG);
     config.load_suffix_text(embedded::CHUKI_TAG_SUF);
     config.load_utf_text(embedded::CHUKI_UTF);
     config.load_ivs_text(embedded::CHUKI_IVS);
     config.load_alt_text(embedded::CHUKI_ALT);
     config.load_latin_text(embedded::CHUKI_LATIN);
-    let custom = std::fs::read_to_string(dir.join("custom_chuki_tag.txt"))
-        .unwrap_or_else(|_| embedded::CUSTOM_CHUKI_TAG.to_string());
+    let custom = crate::preset::read_chuki_tag(dir)
+        .unwrap_or_else(|| embedded::CUSTOM_CHUKI_TAG.to_string());
     config.load_tag_text(&custom);
     config
 }
@@ -1388,18 +1393,59 @@ mod tests {
     #[test]
     fn lite_preset_directory_honors_its_own_ini_without_external_assets() {
         let dir = tempfile::tempdir().unwrap();
+        let preset = dir.path().join("preset");
+        std::fs::create_dir_all(&preset).unwrap();
         std::fs::write(
-            dir.path().join("AozoraEpub3.ini"),
+            preset.join("AozoraEpub3.ini"),
             "TocPage=0\nLineHeight=2.4\n",
         )
         .unwrap();
-        let config = config_for(Some(dir.path()));
+        let config = config_for(Some(&preset));
         assert!(!config.toc_page, "preset の TocPage=0 が無視されている");
         let style = StyleSettings::from_ini(&config.ini);
         assert_eq!(style.line_height, "2.4");
         // chuki/外字/カスタム注記は同梱資産から補完される。
         assert!(config.block_inline_tags.contains_key("一字下げ"));
         assert!(config.inline_notes.contains_key("傍点"));
+    }
+
+    /// issue #45: `preset/` では利用者の設定 (`AozoraEpub3.ini`) が同梱の
+    /// 既定値 (`AozoraEpub3.ini.default`) より優先される。利用者の設定は
+    /// 配布物に含まれないため、セルフアップデートで消えない。
+    #[test]
+    fn lite_preset_user_ini_wins_over_the_bundled_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let preset = dir.path().join("preset");
+        std::fs::create_dir_all(&preset).unwrap();
+        std::fs::write(preset.join("AozoraEpub3.ini.default"), "TocPage=1\n").unwrap();
+        std::fs::write(preset.join("AozoraEpub3.ini"), "TocPage=0\n").unwrap();
+
+        let config = config_for(Some(&preset));
+        assert!(!config.toc_page, "利用者の設定が優先されていない");
+    }
+
+    /// 利用者の設定が無いときは同梱の既定値を使う。
+    #[test]
+    fn lite_preset_uses_the_bundled_default_when_no_user_ini_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let preset = dir.path().join("preset");
+        std::fs::create_dir_all(&preset).unwrap();
+        std::fs::write(preset.join("AozoraEpub3.ini.default"), "TocPage=0\n").unwrap();
+
+        let config = config_for(Some(&preset));
+        assert!(!config.toc_page, "同梱の既定値が使われていない");
+    }
+
+    /// どちらのファイルも無いときは埋め込みの既定値で動く。
+    #[test]
+    fn lite_preset_falls_back_to_the_embedded_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let preset = dir.path().join("preset");
+        std::fs::create_dir_all(&preset).unwrap();
+
+        let config = config_for(Some(&preset));
+        assert!(config.toc_page, "埋め込みの既定値が使われていない");
+        assert_eq!(config.ini.get("TitlePage"), Some("2"));
     }
 
     /// 1 エントリずつ書き出す経路 (Worker の `download.epub` と同じ手順) が

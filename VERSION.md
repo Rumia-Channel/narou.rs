@@ -3,6 +3,38 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
+## v0.5.4 — 設定の更新で消えないよう修正・セキュリティ強化・依存更新
+
+- **組み込み AozoraEpub3_Lite の設定ファイルを更新で上書きしなくなりました**（issue #45 の続き）。配布物の `preset/AozoraEpub3.ini` は「利用者が編集する設定」と「配布物が持つ既定値」が同じファイル名だったため、セルフアップデートがファイルを置き換えると編集内容が無言で消えていました。
+  - 同梱する既定値を `preset/AozoraEpub3.ini.default` に改名し、利用者が編集する `preset/AozoraEpub3.ini` は配布物に含めないようにしました。これで更新しても編集内容が残り、既存の利用者は編集したファイルを置いたまま更新できます。
+  - narou のカスタム注記 (`preset/custom_chuki_tag.txt`) も同じ方法で分けました (利用者設定 `custom_chuki_tag.txt` / 同梱の既定値 `custom_chuki_tag.txt.default`)。
+  - 設定の解決順は「利用者設定 → 同梱の既定値 → 埋め込みの既定値」です。編集したい場合は `preset/AozoraEpub3.ini.default` を同じフォルダの `AozoraEpub3.ini` にコピーして編集してください。
+  - パッケージ (`scripts/package-release.ps1`) は `preset/` の利用者設定を同梱から除外し、セルフアップデート (`src/bin/updater.rs`) も既存の `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` は上書きしません。
+
+- **loopback 起動の Web UI で、reverse proxy モードでも UI トークンを要求する**ようにしました。同じ端末の別プロセス（ブラウザ拡張や他のローカルアプリ）は `Host` / `Origin` ヘッダを自由に書けるため、これらは認証の代替になりません。以前は `server-reverse-proxy.enable=true` の場合だけ loopback のトークン要求が外れており、その構成では認証なしで API を操作できました。ブートストラップチケットは使う origin（Host）ごとに 1 回だけ有効なので、reverse proxy 経由の公開ホストと直接アクセスの両方から開けます。起動時にチケット付きの URL を常設表示し、proxy 経由の URL にもチケットを付ける案内を出します。
+- **ログイン資格情報の鍵ファイル (`.narou/login.key`) を作る時から 0600 に** なりました。作成後に権限を締める実装では、その間のファイルが umask 由来（通常 0644）で他ユーザーから読め、鍵が露出すると保存済み Cookie を復号できました。
+- **デプロイ用の秘密ファイル (`worker_entry/.deploy-secrets-*.json`) の扱いを強化**しました。値を GitHub のログマスクに登録し、Unix では 0600 で作成します。
+- **依存クレートを更新しました**（`cargo update`、MSRV 1.99.1 互換のなかでの最新）。`brotli` 9.0.0 → 9.1.0、`brotli-decompressor` 6.0.1 → 6.2.0、`ctutils` 0.4.5 → 0.4.6。`brotli` 9.1.0 は **CVE-2026-111497**（Google Brotli デコーダの範囲外書き込み）に対応する版で、該当しうる入力に正しいエラーコードを返すため、保存オブジェクトの brotli 展開経路も保護されます（外部応答の展開は従来どおり無効のまま）。`about-probe` の `Cargo.lock` と同梱ライセンス (`Third-Party-License.md` / `Third-Party-License-non-GPL.md`) も同時に更新しました。
+- **依存クレートをメジャーバージョンまで更新しました**。`zip` 8.5 → 9.1、`rusqlite` 0.40 → 0.41、`parking_lot` 0.12 → 0.13、`fancy-regex` 0.19 → 0.20、`tray-icon` 0.25 → 0.26、`mailparse` 0.17 → 0.18、ビルド依存の `base64` 0.22 → 0.23。API 差分は次のように吸収しました。
+  - `parking_lot` 0.13 で `const_mutex` が廃止されたため、定数初期化は `Mutex::new` に変更しました。
+  - `zip` 9 はエントリ名を `Result<Cow<str>, ZipError>` で返すようになりました。復号できない名前は「読めない」として扱い、小説データの取り込みはエラー、セルフアップデートの展開は読み飛ばし、リリース資産の検証は中止（fail closed）にしています。
+  - `worker_entry` の `parking_lot` も 0.13 に揃え、依存グラフに `lock_api` 0.4 と 0.5 が混在して `Mutex` の型が食い違わないようにしました。
+- **変換の future が `Send` でない問題を解消しました**。変換コアが調査ログ用に保持していた `Rc<RefCell<Inspector>>` を `Arc<Mutex<Inspector>>` に変更し、`ConvertService` の future が `Send` になりました（clippy の `future_not_send` で検出される非 `Send` future が 0 件）。変換結果（本文テキスト・EPUB・調査ログ）は変更前とバイト単位で一致することを確認済みです。
+
+### Web UI のコンソール表示 (issue #46)
+
+- **「History」で表示した内容に HTML タグがそのまま出る問題を修正しました**。履歴の再描画がライブ出力と別の経路 (テキストを貼り付けるだけ) を使っていたため、`<span style="color:#bbb">更新を開始します…</span>` のような行がタグのまま表示されていました。ライブ出力と同じ描画経路 (許可要素は `<span>` の色・太字と `<ruby>` の基底テキストだけ) にそろえ、履歴でもライブでも同じ見た目になります。
+- **WebSocket が繋がらない環境でもコンソールが更新される**ようになりました。前段 reverse proxy が WebSocket の upgrade を中継しない、`server-ws-add-accepted-domains` に現在のホストが入っていない、握手が保留のまま返らない、のいずれの場合も、履歴 API の差分取得 (`GET /api/history?format=json&after=<id>`) を 3 秒間隔で使い、コンソールを追い続けます。接続の待ち時間には上限を設け、一定時間確立できなければ履歴取得へ切り替えます。取得できた場合は接続が確立した時点で履歴取得を止めます。差分取得に対応しない環境 (Workers) は全量の置き換えで同じ表示を保ちます。
+- **WebSocket が繋がらないことを画面上で知らせる**ようにしました。コンソールが空のまま原因が分からない状態を避けるため、`server-ws-add-accepted-domains` の確認と前段 proxy の WebSocket 中継を案内する通知を表示します。一時的な切断で再接続できた場合は通知しません（履歴取得が 8 秒続いた場合だけ通知します）。
+
+### お気に入りタグ (issue #46)
+
+- **「タグの編集」画面でお気に入りタグを登録できるように** しました（issue #46 の要望）。自動付与されるタグは数百個まで増えるため、検索なしでよく使うタグを選べないという課題への対応です。入力欄の「★」ボタン、または作品に付いているタグの「☆」ボタンで登録し、一覧はタグ編集画面の先頭へ常設表示されます。登録したタグは一覧の「追加」ボタンで選択中の小説へ付けられます。
+- 保存は在庫の `favorite_tags` キー（Native は `.narou/favorite_tags.yaml`、SQLite / Worker は `app_state('inv','favorite_tags')`）で、登録順はそのまま保持されます。タグ色とは独立した設定です。
+- **新機能ツアーに追加しました**。0.5.4 の新機能ツアー（起動時に表示される説明)에「お気に入りタグ」の項目が入り、使い方（登録・解除・作品へ付ける）が表示されます。
+
+変更一覧は [v0.5.3...v0.5.4](https://github.com/Rumia-Channel/narou.rs/compare/v0.5.3...v0.5.4) を参照してください。
+
 ## v0.5.3 — バーチャル小説の話数・ファイル名・登録順 UI 修正
 
 - **仮想小説の話数が 0 になる問題を修正**しました。メンバーの `general_all_no` が未設定の場合は目次 (`toc.yaml`) から話数を数え、合計を仮想小説へ設定します。
