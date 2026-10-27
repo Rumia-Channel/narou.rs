@@ -12,6 +12,10 @@
  *   const values = await formDialog({ title: '登録', fields: [{ name, label, required }] });
  *   await alertDialog({ title: '通知', message: '…' });
  *
+ * formDialog のフィールドに `suggestions` を渡すと、入力欄の下に候補リストが
+ * 出る (ブラウザ標準の datalist ではなく自前のリスト)。↓ / ↑ で候補を動かし、
+ * Enter またはクリックで入力欄へ入れる。
+ *
  * いずれもキャンセル (× / キャンセル / Escape / 背景クリック) は null を返す
  * (confirm は false、alert は解決のみ)。
  */
@@ -29,7 +33,10 @@ let okEl = null;
 let active = null;
 let restoreFocusTo = null;
 let optionSequence = 0;
-let datalistSequence = 0;
+let fieldSequence = 0;
+
+/** 候補リストに出す最大件数。 */
+const SUGGESTION_LIMIT = 20;
 
 function createElement(tag, className, text) {
   const element = document.createElement(tag);
@@ -117,7 +124,10 @@ function submitActive() {
 
 function handleKeyDown(event) {
   if (!active) return;
+  const suggestions = event.target ? event.target.appDialogSuggestions : null;
   if (event.key === 'Escape') {
+    // 候補リストが開いているときは、入力欄側でリストを閉じる (ダイアログは閉じない)。
+    if (suggestions && suggestions.open) return;
     event.preventDefault();
     event.stopPropagation();
     closeActive(active.cancelValue);
@@ -126,6 +136,8 @@ function handleKeyDown(event) {
   if (event.key !== 'Enter') return;
   const target = event.target;
   if (target && (target.tagName === 'TEXTAREA' || target.tagName === 'BUTTON')) return;
+  // ↓ / ↑ で候補を選んでいれば、入力欄側でその候補を反映する。
+  if (suggestions && suggestions.activeIndex >= 0) return;
   event.preventDefault();
   submitActive();
 }
@@ -186,32 +198,134 @@ function buildFields(container, fields) {
   container.classList.remove('hide');
   const inputs = [];
   for (const field of fields) {
-    const label = createElement('label', 'app-dialog-field');
+    const wrapper = createElement('div', 'app-dialog-field');
+    const inputId = `app-dialog-field-${++fieldSequence}`;
     if (field.label) {
-      label.appendChild(createElement('span', 'app-dialog-field-label', field.label));
+      const label = createElement('label', 'app-dialog-field-label', field.label);
+      label.setAttribute('for', inputId);
+      wrapper.appendChild(label);
     }
     const input = createElement('input', 'app-dialog-input');
     input.type = 'text';
+    input.id = inputId;
     input.value = field.value || '';
     if (field.placeholder) input.placeholder = field.placeholder;
-    if (Array.isArray(field.suggestions) && field.suggestions.length > 0) {
-      const listId = `app-dialog-suggestions-${++datalistSequence}`;
-      const list = document.createElement('datalist');
-      list.id = listId;
-      for (const suggestion of field.suggestions) {
-        const option = document.createElement('option');
-        option.value = String(suggestion);
-        list.appendChild(option);
-      }
-      input.setAttribute('list', listId);
-      label.appendChild(list);
-    }
     input.addEventListener('input', () => input.classList.remove('app-dialog-input-invalid'));
-    label.appendChild(input);
-    container.appendChild(label);
+    wrapper.appendChild(input);
+    if (Array.isArray(field.suggestions) && field.suggestions.length > 0) {
+      wrapper.appendChild(createSuggestionList(field, input));
+    }
+    container.appendChild(wrapper);
     inputs.push({ field, input });
   }
   return inputs;
+}
+
+/**
+ * 入力欄の候補リスト。
+ *
+ * ブラウザ標準の `datalist` は候補がブラウザ既定の見た目になり、矢印キーでの
+ * 操作もブラウザ依存だったため、同じスタイルの一覧を自前で作る。↓ / ↑ で候補を
+ * 動かし、Enter またはクリックで入力欄へ入れる。
+ */
+function createSuggestionList(field, input) {
+  const list = createElement('div', 'app-dialog-suggestions hide');
+  const state = { items: [], activeIndex: -1, open: false };
+  input.appDialogSuggestions = state;
+
+  const close = () => {
+    state.open = false;
+    state.activeIndex = -1;
+    state.items = [];
+    list.replaceChildren();
+    list.classList.add('hide');
+  };
+
+  const apply = (value) => {
+    input.value = value;
+    close();
+  };
+
+  const highlight = (index) => {
+    const buttons = list.children;
+    for (let i = 0; i < buttons.length; i += 1) {
+      buttons[i].classList.toggle('active', i === index);
+    }
+    state.activeIndex = index;
+    if (index >= 0 && buttons[index] && typeof buttons[index].scrollIntoView === 'function') {
+      buttons[index].scrollIntoView({ block: 'nearest' });
+    }
+  };
+
+  const render = () => {
+    const query = input.value.trim().toLowerCase();
+    const matches = [];
+    for (const suggestion of field.suggestions) {
+      const text = String(suggestion);
+      if (!query || text.toLowerCase().startsWith(query)) matches.push(text);
+      if (matches.length >= SUGGESTION_LIMIT) break;
+    }
+    state.items = matches;
+    state.activeIndex = -1;
+    list.replaceChildren();
+    if (!matches.length) {
+      state.open = false;
+      list.classList.add('hide');
+      return;
+    }
+    for (const text of matches) {
+      const button = createElement('button', 'app-dialog-suggestion', text);
+      button.type = 'button';
+      button.addEventListener('click', () => apply(text));
+      list.appendChild(button);
+    }
+    state.open = true;
+    list.classList.remove('hide');
+  };
+
+  input.addEventListener('input', render);
+  input.addEventListener('focus', render);
+  input.addEventListener('blur', close);
+  // 候補を押した瞬間にフォーカスが外れてもクリックが失われ��いよう、
+  // リスト側の mousedown で既定のフォーカス移動を止める。
+  list.addEventListener('mousedown', (event) => event.preventDefault());
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowDown') {
+      if (!state.items.length) render();
+      if (!state.items.length) return;
+      event.preventDefault();
+      highlight(Math.min(state.activeIndex + 1, state.items.length - 1));
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      if (!state.items.length) return;
+      event.preventDefault();
+      highlight(Math.max(state.activeIndex - 1, 0));
+      return;
+    }
+    if (event.key === 'Enter') {
+      if (state.activeIndex < 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      apply(state.items[state.activeIndex]);
+      return;
+    }
+    if (event.key === 'Escape') {
+      if (!state.open) return;
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+      return;
+    }
+    if (event.key === 'Tab') {
+      if (state.activeIndex >= 0) {
+        apply(state.items[state.activeIndex]);
+      } else {
+        close();
+      }
+    }
+  });
+  return list;
 }
 
 function readFields(inputs) {

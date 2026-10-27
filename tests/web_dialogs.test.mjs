@@ -15,6 +15,8 @@ const uiDir = process.env.NAROU_JS_DIR || fileURLToPath(new URL('../src/web/asse
 function matchesSelector(element, selector) {
   const idMatch = /^#(.+)$/.exec(selector);
   if (idMatch) return element.id === idMatch[1];
+  const classMatch = /^\.([\w-]+)$/.exec(selector);
+  if (classMatch) return element.classList.contains(classMatch[1]);
   const typed = /^([a-z]+)\[type="([a-z]+)"\](:checked)?$/i.exec(selector);
   if (typed) {
     const [, tag, type, checked] = typed;
@@ -66,16 +68,21 @@ function createDom() {
         if (!listeners.has(name)) listeners.set(name, []);
         listeners.get(name).push(handler);
       },
-      dispatch(name) {
+      dispatch(name, extra = {}) {
         const event = {
           target: element,
           key: '',
           preventDefault() {},
           stopPropagation() {},
+          ...extra,
         };
         for (const handler of listeners.get(name) || []) handler(event);
       },
-      focus() { document.activeElement = element; },
+      scrollIntoView() {},
+      focus() {
+        document.activeElement = element;
+        element.dispatch('focus');
+      },
       querySelector(selector) { return findFirst(element, selector); },
       querySelectorAll(selector) { return findAll(element, selector); },
     };
@@ -113,8 +120,11 @@ function createDom() {
       document.keyHandlers = document.keyHandlers.filter((entry) => entry !== handler);
     },
     press(key) {
-      const event = { key, preventDefault() {}, stopPropagation() {} };
+      const target = document.activeElement;
+      const event = { key, target, preventDefault() {}, stopPropagation() {} };
+      // 実際の順序 (capture の document → 対象) に合わせる。
       for (const handler of [...document.keyHandlers]) handler(event);
+      if (target && target.dispatch) target.dispatch('keydown', event);
     },
   };
 
@@ -230,7 +240,7 @@ test('formDialog returns every field and validates required ones', async () => {
   assert.equal(values.author, 'Author');
 });
 
-test('formDialog attaches searchable suggestions to a field', async () => {
+test('formDialog shows a styled candidate list and arrow keys move the selection', async () => {
   const { dom, context } = loadDialog();
   const pending = context.formDialog({
     title: '登録',
@@ -241,12 +251,29 @@ test('formDialog attaches searchable suggestions to a field', async () => {
   });
   const root = () => dom.root();
   const inputs = root().querySelectorAll('input[type="text"]');
-  const listId = inputs[1].getAttribute('list');
-  assert.ok(listId, '候補を持つ入力欄は datalist を参照する');
-  const datalist = root().querySelector('datalist');
-  assert.equal(datalist.id, listId);
-  assert.deepEqual(datalist.children.map((option) => option.value), ['あてきち', '城野白']);
-  assert.equal(inputs[0].getAttribute('list'), null, '候補の無い入力欄には付けない');
+  assert.equal(inputs[1].getAttribute('list'), null, 'ブラウザ標準の datalist は使わない');
+  const list = root().querySelector('.app-dialog-suggestions');
+  assert.ok(list, '候補リストが生成される');
+  assert.equal(list.classList.contains('hide'), true, '最初は閉じている');
+
+  // 入力欄を focusing すると候補が出る。
+  inputs[1].focus();
+  assert.equal(list.classList.contains('hide'), false);
+  assert.deepEqual(list.children.map((button) => button.textContent), ['あてきち', '城野白']);
+
+  // 入力で絞り込む。
+  inputs[1].value = '城';
+  inputs[1].dispatch('input');
+  assert.deepEqual(list.children.map((button) => button.textContent), ['城野白']);
+
+  // ↓ で候補を動かし、Enter で入力欄へ入れる (ダイアログは送信されない)。
+  dom.document.press('ArrowDown');
+  assert.equal(list.children[0].classList.contains('active'), true, '↓ で候補が選択される');
+  dom.document.press('Enter');
+  assert.equal(inputs[1].value, '城野白');
+  assert.equal(list.classList.contains('hide'), true, '候補を反映したらリストを閉じる');
+  assert.equal(root().classList.contains('hide'), false, 'Enter ではダイアログは閉じない');
+
   root().querySelector('#app-dialog-cancel').dispatch('click');
   await pending;
 });

@@ -76,8 +76,9 @@ test('the favorites list renders one chip per registered tag', async () => {
   h.state.favoriteTags = ['小説', 'ゲーム'];
   h.context.renderFavoriteTags();
   assert.equal(h.list.children.length, 2);
-  assert.equal(h.list.children[0].textContent, '小説');
-  assert.equal(h.list.children[1].textContent, 'ゲーム');
+  // チップは「タグ名 (× ボタン)」の段と「追加ボタン」の段の 2 段構成。
+  const names = h.list.children.map((chip) => chip.children[0].textContent);
+  assert.deepEqual(names, ['小説', 'ゲーム']);
   assert.equal(h.empty.classList.contains('hide'), true, '空の表示は隠す');
 });
 
