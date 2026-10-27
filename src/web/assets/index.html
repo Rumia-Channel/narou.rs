@@ -113,6 +113,7 @@
                 <li><a href="#" id="action-option-export"><span class="material-symbols-outlined icon-leading" aria-hidden="true">archive</span>選択した作品をダウンロード...</a></li>
                 <li><a href="#" id="action-option-import"><span class="material-symbols-outlined icon-leading" aria-hidden="true">unarchive</span>小説データをアップロード...</a></li>
                 <li><a href="#" id="action-option-virtual-add"><span class="material-symbols-outlined icon-leading" aria-hidden="true">library_add</span>選択した作品をバーチャル小説にまとめる...</a></li>
+                <li><a href="#" id="action-option-virtual-append"><span class="material-symbols-outlined icon-leading" aria-hidden="true">playlist_add</span>選択した作品をバーチャル小説に追加...</a></li>
                 <li><a href="#" id="action-option-virtual-order"><span class="material-symbols-outlined icon-leading" aria-hidden="true">reorder</span>バーチャル小説の順序を変更...</a></li>
                 <li><a href="#" id="action-option-virtual-convert"><span class="material-symbols-outlined icon-leading" aria-hidden="true">menu_book</span>バーチャル小説を変換...</a></li>
                 <li><a href="#" id="action-option-virtual-remove"><span class="material-symbols-outlined icon-leading" aria-hidden="true">delete</span>バーチャル小説を削除...</a></li>
@@ -614,24 +615,6 @@
           <div class="modal-footer">
             <button class="btn btn-default" id="queue-restore-no" type="button">破棄</button>
             <button class="btn btn-primary" id="queue-restore-yes" type="button">復元</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Confirm Modal (for server-driven confirm dialogs) -->
-    <div class="modal-overlay hide" id="confirm-modal">
-      <div class="modal-dialog modal-dialog-sm">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h4 class="modal-title" id="confirm-title">確認</h4>
-          </div>
-          <div class="modal-body">
-            <p id="confirm-message"></p>
-          </div>
-          <div class="modal-footer">
-            <button class="btn btn-default" id="confirm-cancel" type="button">キャンセル</button>
-            <button class="btn btn-primary" id="confirm-ok" type="button">OK</button>
           </div>
         </div>
       </div>

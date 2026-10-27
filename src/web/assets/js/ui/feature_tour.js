@@ -1,5 +1,6 @@
 import { fetchJson, postJson } from '../core/http.js';
 import { El } from '../core/state.js';
+import { alertDialog } from './dialog.js';
 
 export function initFeatureTour() {
   El.featureTourClose?.addEventListener('click', closeFeatureTour);
@@ -122,10 +123,13 @@ async function chooseStorageMode(mode, button) {
       window.setTimeout(() => { window.location.href = '/_rebooting'; }, 1500);
       return;
     }
-    window.alert(result.message || '設定しました');
+    await alertDialog({ title: 'データ管理方式', message: result.message || '設定しました' });
     window.location.reload();
   } catch (error) {
-    window.alert('設定に失敗しました: ' + error);
+    await alertDialog({
+      title: 'データ管理方式',
+      message: '設定に失敗しました: ' + (error?.message || String(error)),
+    });
     button.disabled = false;
   }
 }

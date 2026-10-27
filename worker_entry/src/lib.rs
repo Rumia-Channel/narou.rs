@@ -113,6 +113,13 @@ async fn route(req: Request, env: Env) -> Result<Response> {
     {
         return virtual_novels::handle_order(req, env, id).await;
     }
+    if let Some(id) = path
+        .strip_prefix("/api/virtual_novels/")
+        .and_then(|rest| rest.strip_suffix("/members"))
+        .and_then(|id| id.parse::<i64>().ok())
+    {
+        return virtual_novels::handle_add_members(req, env, id).await;
+    }
     if req.method() == Method::Delete
         && let Some(id) = path
             .strip_prefix("/api/virtual_novels/")

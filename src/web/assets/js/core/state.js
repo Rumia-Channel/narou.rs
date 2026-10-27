@@ -147,8 +147,6 @@ const ELEMENT_IDS = [
   'library-backup-dismiss', 'library-backup-create',
   'feature-tour-modal', 'feature-tour-close', 'feature-tour-body',
   'feature-tour-disable-auto', 'feature-tour-ok',
-  'confirm-modal', 'confirm-title', 'confirm-message',
-  'confirm-cancel', 'confirm-ok',
   'register-modal', 'register-modal-close', 'register-url',
   'register-cancel', 'register-ok',
   'remove-modal', 'remove-novel-list', 'remove-with-file',

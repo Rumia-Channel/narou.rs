@@ -625,6 +625,10 @@ pub fn create_router(state: AppState) -> Router {
             post(virtual_novels::api_virtual_order),
         )
         .route(
+            "/api/virtual_novels/{id}/members",
+            post(virtual_novels::api_virtual_add_members),
+        )
+        .route(
             "/api/virtual_novels/{id}/convert",
             post(virtual_novels::api_virtual_convert),
         )

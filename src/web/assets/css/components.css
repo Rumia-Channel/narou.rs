@@ -1152,6 +1152,90 @@ li.enable-selected.disabled a {
   max-width: 50rem;
 }
 
+/* ========== In-app dialogs (alert / confirm / prompt / select) ========== */
+.app-dialog-message {
+  margin: 0 0 0.85em;
+  white-space: pre-line;
+}
+
+.app-dialog-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.70em;
+}
+
+.app-dialog-field {
+  display: block;
+}
+
+.app-dialog-field-label {
+  display: block;
+  margin-bottom: 0.25em;
+  font-size: 0.90em;
+  color: var(--text-color);
+}
+
+.app-dialog-input {
+  width: 100%;
+  padding: 0.45em 0.55em;
+  font-size: var(--btn-font-size);
+  color: var(--text-color);
+  background: var(--input-bg);
+  border: 0.05em solid var(--input-border);
+  border-radius: var(--border-radius);
+}
+
+.app-dialog-input:focus {
+  border-color: var(--btn-primary-border);
+  outline: none;
+}
+
+.app-dialog-input-invalid {
+  border-color: var(--danger-color);
+}
+
+.app-dialog-options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+  max-height: 18em;
+  overflow-y: auto;
+}
+
+.app-dialog-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55em;
+  padding: 0.45em 0.60em;
+  border: 0.05em solid var(--border-color);
+  border-radius: var(--border-radius);
+  cursor: pointer;
+}
+
+.app-dialog-option:hover {
+  background: var(--table-hover-bg);
+}
+
+.app-dialog-option input[type="radio"] {
+  margin: 0.20em 0 0;
+}
+
+.app-dialog-option-body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.app-dialog-option-label {
+  color: var(--text-color);
+  word-break: break-word;
+}
+
+.app-dialog-option-detail {
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
 /* ========== Bookmarklet register modal ========== */
 .register-url-wrap {
   margin: 0.6em 0 0;

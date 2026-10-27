@@ -9,6 +9,7 @@ import { createNotepadEditor } from '../core/notepad.js';
 import { persistSortState, postSortedJson } from '../core/sort_state.js';
 import { toggleLanguage, t } from './i18n.js';
 import { openFeatureTour } from './feature_tour.js';
+import { confirmDialog, formDialog, selectDialog } from './dialog.js';
 import { resetConsoleSize } from './console_size.js';
 import {
   renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed,
@@ -46,6 +47,45 @@ let themeSaveTail = Promise.resolve();
 let acknowledgedTheme = null;
 let themeReadGeneration = 0;
 let themePendingSaves = 0;
+
+const VIRTUAL_NCODE_PATTERN = /^vs_\d+$/;
+
+/**
+ * `vs_<ID>` 形式の ncode か。一覧の行がバーチャル小説かどうかの判定に使う。
+ */
+export function isVirtualNcode(ncode) {
+  return typeof ncode === 'string' && VIRTUAL_NCODE_PATTERN.test(ncode);
+}
+
+/**
+ * 一覧で選択されている行からバーチャル小説を取り出す。
+ * 選択中のバーチャル小説がちょうど 1 件のときだけ、その作品を対象として使う。
+ */
+export function selectedVirtualNovel(novels, selectedIds) {
+  if (!selectedIds || typeof selectedIds.has !== 'function') return null;
+  const selected = (Array.isArray(novels) ? novels : []).filter(
+    (novel) => selectedIds.has(String(novel.id)) && isVirtualNcode(novel.ncode),
+  );
+  return selected.length === 1 ? selected[0] : null;
+}
+
+/**
+ * 一覧にある値の重複を除いて並べる (ダイアログの入力候補)。
+ */
+export function uniqueValues(novels, key) {
+  const values = (Array.isArray(novels) ? novels : [])
+    .map((novel) => novel?.[key])
+    .filter((value) => typeof value === 'string' && value.trim() !== '');
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b, 'ja'));
+}
+
+/**
+ * 選択した作品に共通の値。共通でないときは空文字 (入力欄の初期値)。
+ */
+export function sharedValue(novels, key) {
+  const values = uniqueValues(novels, key);
+  return values.length === 1 ? values[0] : '';
+}
 
 export function bindActions() {
   applyColumnVisibility();
@@ -310,21 +350,82 @@ export function bindActions() {
       showNotification(error.message || 'アップロードに失敗しました', 'error');
     }
   });
+  async function fetchVirtualNovels() {
+    const response = await fetch('/api/virtual_novels');
+    const result = await response.json();
+    if (!result.success) throw new Error(result.message || '一覧を取得できません');
+    return Array.isArray(result.novels) ? result.novels : [];
+  }
+
+  /**
+   * 操作対象のバーチャル小説を決める。一覧で仮想小説をちょうど 1 件選択して
+   * いればそれを使い、登録が 1 件だけならそれを使う。どちらでもないときだけ
+   * ダイアログで選ばせる。
+   */
+  async function pickVirtualNovel(virtuals, title) {
+    const selected = selectedVirtualNovel(State.novels, State.selectedIds);
+    if (selected) {
+      const match = virtuals.find((novel) => String(novel.id) === String(selected.id));
+      if (match) return match;
+    }
+    if (virtuals.length === 1) return virtuals[0];
+    const value = await selectDialog({
+      title,
+      message: '対象のバーチャル小説を選択してください。',
+      value: String(virtuals[0].id),
+      options: virtuals.map((novel) => ({
+        value: String(novel.id),
+        label: `${novel.ncode} ${novel.title}`,
+        detail: `${Array.isArray(novel.members) ? novel.members.length : 0} 作品`,
+      })),
+    });
+    if (value === null) return null;
+    return virtuals.find((novel) => String(novel.id) === String(value)) || null;
+  }
+
   on('action-option-virtual-add', async () => {
     const ids = getSelectedIdsInDisplayOrder();
     if (!ids.length) {
       showNotification('まとめる作品を選択してください', 'error');
       return;
     }
-    const title = window.prompt('バーチャル小説のタイトル');
-    if (!title) return;
-    const author = window.prompt('作者名', '') ?? '';
-    const sitename = window.prompt('サイト名', '') ?? '';
+    const selectedNovels = ids
+      .map((id) => State.novels.find((novel) => String(novel.id) === String(id)))
+      .filter(Boolean);
+    const input = await formDialog({
+      title: 'バーチャル小説の登録',
+      message: `選択した ${ids.length} 作品を 1 つの EPUB にまとめます。`,
+      okLabel: '登録',
+      fields: [
+        { name: 'title', label: 'タイトル', required: true },
+        {
+          name: 'author',
+          label: '作者名',
+          value: sharedValue(selectedNovels, 'author'),
+          suggestions: uniqueValues(State.novels, 'author'),
+          placeholder: '候補から選択、または入力',
+        },
+        {
+          name: 'sitename',
+          label: 'サイト名',
+          value: sharedValue(selectedNovels, 'sitename'),
+          suggestions: uniqueValues(State.novels, 'sitename'),
+          placeholder: '候補から選択、または入力',
+        },
+      ],
+    });
+    if (!input) return;
     try {
       const response = await fetch('/api/virtual_novels', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, author, sitename, tags: [], members: ids.map(Number) }),
+        body: JSON.stringify({
+          title: input.title,
+          author: input.author,
+          sitename: input.sitename,
+          tags: [],
+          members: ids.map(Number),
+        }),
       });
       const result = await response.json();
       if (!response.ok || !result.success) {
@@ -336,24 +437,54 @@ export function bindActions() {
       showNotification(error.message || '登録に失敗しました', 'error');
     }
   });
-  on('action-option-virtual-order', async () => {
+  on('action-option-virtual-append', async () => {
+    const memberIds = getSelectedIdsInDisplayOrder().filter((id) => {
+      const novel = State.novels.find((item) => String(item.id) === String(id));
+      return !isVirtualNcode(novel?.ncode);
+    });
+    if (!memberIds.length) {
+      showNotification('追加する作品を選択してください', 'error');
+      return;
+    }
     try {
-      const response = await fetch('/api/virtual_novels');
-      const result = await response.json();
-      if (!result.success) throw new Error(result.message || '一覧を取得できません');
-      if (!result.novels.length) {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
         showNotification('バーチャル小説は登録されていません', 'error');
         return;
       }
-      const menu = result.novels
-        .map((novel) => `${novel.ncode} ${novel.title} (${novel.members.length}作品)`)
-        .join('\n');
-      const target = window.prompt(`対象の ncode を入力してください\n${menu}`, result.novels[0].ncode);
-      if (!target) return;
-      const novel = result.novels.find(
-        (item) => item.ncode === target || String(item.id) === target,
-      );
-      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
+      const novel = await pickVirtualNovel(virtuals, '作品を追加するバーチャル小説');
+      if (!novel) return;
+      const ok = await confirmDialog({
+        title: 'バーチャル小説へ追加',
+        message: `${novel.ncode} ${novel.title} へ ${memberIds.length} 作品を追加します。\n追加した作品は一覧から隠れ、EPUB の末尾へ結合されます。`,
+        okLabel: '追加する',
+      });
+      if (!ok) return;
+      const response = await fetch(`/api/virtual_novels/${novel.id}/members`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ members: memberIds.map(Number) }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || '追加に失敗しました');
+      }
+      showNotification(`バーチャル小説へ追加しました: ${novel.ncode}`, 'info');
+      clearSelection();
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '追加に失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-order', async () => {
+    try {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const novel = await pickVirtualNovel(virtuals, '順序を変更するバーチャル小説');
+      if (!novel) return;
       openVirtualOrderModal(novel);
     } catch (error) {
       showNotification(error.message || '並べ替えに失敗しました', 'error');
@@ -361,20 +492,13 @@ export function bindActions() {
   });
   on('action-option-virtual-convert', async () => {
     try {
-      const response = await fetch('/api/virtual_novels');
-      const result = await response.json();
-      if (!result.success) throw new Error(result.message || '一覧を取得できません');
-      if (!result.novels.length) {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
         showNotification('バーチャル小説は登録されていません', 'error');
         return;
       }
-      const menu = result.novels.map((novel) => `${novel.ncode} ${novel.title}`).join('\n');
-      const target = window.prompt(`変換する ncode を入力してください\n${menu}`, result.novels[0].ncode);
-      if (!target) return;
-      const novel = result.novels.find(
-        (item) => item.ncode === target || String(item.id) === target,
-      );
-      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
+      const novel = await pickVirtualNovel(virtuals, '変換するバーチャル小説');
+      if (!novel) return;
       showNotification('変換を開始しました', 'info');
       const converted = await fetch(`/api/virtual_novels/${novel.id}/convert`, { method: 'POST' });
       const convertedResult = await converted.json();
@@ -388,23 +512,20 @@ export function bindActions() {
   });
   on('action-option-virtual-remove', async () => {
     try {
-      const response = await fetch('/api/virtual_novels');
-      const result = await response.json();
-      if (!result.success) throw new Error(result.message || '一覧を取得できません');
-      if (!result.novels.length) {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
         showNotification('バーチャル小説は登録されていません', 'error');
         return;
       }
-      const menu = result.novels.map((novel) => `${novel.ncode} ${novel.title}`).join('\n');
-      const target = window.prompt(`削除する ncode を入力してください\n${menu}`, result.novels[0].ncode);
-      if (!target) return;
-      const novel = result.novels.find(
-        (item) => item.ncode === target || String(item.id) === target,
-      );
-      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
-      if (!window.confirm(`${novel.ncode} ${novel.title} を削除しますか？（メンバー作品は残ります）`)) {
-        return;
-      }
+      const novel = await pickVirtualNovel(virtuals, '削除するバーチャル小説');
+      if (!novel) return;
+      const ok = await confirmDialog({
+        title: 'バーチャル小説の削除',
+        message: `${novel.ncode} ${novel.title} を削除しますか？\nメンバー作品は一覧へ戻ります。`,
+        okLabel: '削除する',
+        danger: true,
+      });
+      if (!ok) return;
       const removed = await fetch(`/api/virtual_novels/${novel.id}`, { method: 'DELETE' });
       const removedResult = await removed.json();
       if (!removed.ok || !removedResult.success) {
@@ -432,7 +553,13 @@ export function bindActions() {
   });
 
   on('action-option-shutdown', async (e) => {
-    if (!confirm('サーバをシャットダウンしますか？')) return;
+    const ok = await confirmDialog({
+      title: 'サーバのシャットダウン',
+      message: 'サーバをシャットダウンしますか？',
+      okLabel: 'シャットダウン',
+      danger: true,
+    });
+    if (!ok) return;
     await runGuardedAction(e.currentTarget, async () => {
       const result = await postJson('/api/shutdown', {});
       assertApiSuccess(result, 'サーバを停止できませんでした');
@@ -440,7 +567,12 @@ export function bindActions() {
   });
 
   on('action-option-server-reboot', async () => {
-    if (!confirm('サーバを再起動しますか？')) return;
+    const ok = await confirmDialog({
+      title: 'サーバの再起動',
+      message: 'サーバを再起動しますか？',
+      okLabel: '再起動',
+    });
+    if (!ok) return;
     rememberRebootReturnTo();
     try {
       const result = await postJson('/api/reboot', {});
@@ -595,9 +727,6 @@ export function bindActions() {
   on('colvis-reset', () => {
     resetColvisCheckboxesToDefault();
   });
-
-  // --- Confirm modal ---
-  on('confirm-cancel', () => El.confirmModal?.classList.add('hide'));
 
   // --- Bookmarklet register modal ---
   function clearRegisterUrl() {
@@ -2118,7 +2247,12 @@ async function updateLatestVersionInfo() {
 let latestVersionData = null;
 
 async function startSelfUpdate(variant) {
-  if (!confirm('最新バージョンへ更新します。WEBサーバーは一旦停止し、自動的に再起動します。よろしいですか？')) return;
+  const ok = await confirmDialog({
+    title: '最新バージョンへ更新',
+    message: '最新バージョンへ更新します。WEBサーバーは一旦停止し、自動的に再起動します。よろしいですか？',
+    okLabel: '更新する',
+  });
+  if (!ok) return;
   const btn = El.aboutUpdate;
   if (btn) btn.disabled = true;
   if (El.aboutUpdateStatus) {
