@@ -4,6 +4,7 @@
  */
 import { State, El, lsSet, lsBool } from '../core/state.js';
 import { fetchJson, postJson, request, assertApiSuccess } from '../core/http.js';
+import { renderConsoleLine } from '../core/console_html.js';
 import { createNotepadEditor } from '../core/notepad.js';
 import { persistSortState, postSortedJson } from '../core/sort_state.js';
 import { toggleLanguage, t } from './i18n.js';
@@ -2519,14 +2520,14 @@ export async function refreshFavoriteTags() {
   } catch { /* keep the last successfully loaded favorites */ }
 }
 
-function replaceConsoleHistory(consoleEl, history) {
+export function replaceConsoleHistory(consoleEl, history) {
   var lines = consoleEl.querySelectorAll('.console-line');
   lines.forEach(function(el) { el.remove(); });
   String(history || '').split('\n').forEach(function(line) {
-    var div = document.createElement('div');
-    div.className = 'console-line';
-    div.textContent = line;
-    consoleEl.appendChild(div);
+    if (line === '') return;
+    // ライブ出力と同じ描画経路を使う。textContent だけだと <span> などの
+    // タグがそのまま見えてしまう (issue #46)。
+    renderConsoleLine(consoleEl, line);
   });
   if (consoleEl.id === 'console-stdout2') {
     State.consolePinned.stdout2 = true;
@@ -2534,4 +2535,23 @@ function replaceConsoleHistory(consoleEl, history) {
     State.consolePinned.main = true;
   }
   consoleEl.scrollTop = consoleEl.scrollHeight;
+}
+
+// 履歴の差分をコンソールへ追記する (WebSocket が使えない環境の補完用)。
+export function appendConsoleHistory(consoleEl, history) {
+  if (!consoleEl) return;
+  var added = false;
+  String(history || '').split('\n').forEach(function(line) {
+    if (line === '') return;
+    renderConsoleLine(consoleEl, line);
+    added = true;
+  });
+  if (added) {
+    if (consoleEl.id === 'console-stdout2') {
+      State.consolePinned.stdout2 = true;
+    } else {
+      State.consolePinned.main = true;
+    }
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
 }

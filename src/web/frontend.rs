@@ -245,6 +245,26 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                     .into_bytes(),
             ),
         ),
+        "js/core/console_html.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions(
+                    "js/core/console_html.js",
+                    include_str!("assets/js/core/console_html.js"),
+                )
+                .into_bytes(),
+            ),
+        ),
+        "js/core/console_history.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions(
+                    "js/core/console_history.js",
+                    include_str!("assets/js/core/console_history.js"),
+                )
+                .into_bytes(),
+            ),
+        ),
         "js/core/notepad.js" => (
             "application/javascript; charset=utf-8",
             Cow::Owned(

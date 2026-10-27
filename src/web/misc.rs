@@ -33,6 +33,8 @@ pub struct TagListParams {
 pub struct HistoryParams {
     stream: Option<String>,
     format: Option<String>,
+    /// これより後の履歴行だけ返す (差分取得のカーソル)。
+    after: Option<u64>,
 }
 
 pub async fn version_current(State(_state): State<AppState>) -> Json<serde_json::Value> {
@@ -346,9 +348,20 @@ pub async fn console_history(
     State(state): State<AppState>,
     Query(params): Query<HistoryParams>,
 ) -> Response {
+    // `after` があるときは差分だけ返す (WebSocket が使えない環境の補完用)。
+    if let Some(after) = params.after {
+        let (history, cursor) = state
+            .push_server
+            .history_since(params.stream.as_deref(), after);
+        return Json(serde_json::json!({ "history": history, "id": cursor })).into_response();
+    }
     let history = state.push_server.get_history_for(params.stream.as_deref());
     if params.format.as_deref() == Some("json") {
-        return Json(serde_json::json!({ "history": history })).into_response();
+        return Json(serde_json::json!({
+            "history": history,
+            "id": state.push_server.history_cursor(),
+        }))
+        .into_response();
     }
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],

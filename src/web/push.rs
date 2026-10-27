@@ -63,6 +63,8 @@ impl ClientHandle {
 
 #[derive(Debug, Clone)]
 struct ConsoleHistoryEntry {
+    /// 履歴の通し番号。差分取得 (WebSocket が使えない環境の補完) のカーソル。
+    id: u64,
     body: Option<String>,
     target_console: Option<Arc<str>>,
     scope: Option<Arc<str>>,
@@ -252,7 +254,7 @@ impl PushServer {
             history.next_message_id += 1;
             let id = history.next_message_id;
             let replayed_by_history = self.max_history != 0
-                && history_entry_from_value(&value, &target_console, &scope, &payload)
+                && history_entry_from_value(&value, &target_console, &scope, &payload, id)
                     .map(|entry| {
                         Self::append_history_locked(&mut history.entries, self.max_history, entry);
                         true
@@ -345,6 +347,8 @@ impl PushServer {
         selected.reverse();
         for value in history.progress.snapshots() {
             selected.push(ConsoleHistoryEntry {
+                // 進行状況のスナップショットは差分取得の対象外 (カーソルより前)。
+                id: 0,
                 body: None,
                 target_console: Some(Arc::from(value["target_console"].as_str().unwrap_or("stdout"))),
                 scope: push_events::message_scope(value).map(Arc::from),
@@ -392,6 +396,32 @@ impl PushServer {
             .filter_map(|entry| entry.body.as_deref())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// 履歴の通し番号 (最後に発行したメッセージの id)。
+    ///
+    /// WebSocket が使えない環境でも、ブラウザが `?after=<id>` で差分取得を
+    /// 続けてコンソールを追上させるためのカーソル。
+    pub fn history_cursor(&self) -> u64 {
+        self.console_history.lock().next_message_id
+    }
+
+    /// `after` より後の履歴行と、現在までの通し番号を返す。
+    ///
+    /// WebSocket が遮断された環境 (前段 proxy が upgrade を渡さない等) で
+    /// コンソールを追い続けるための差分取得。
+    pub fn history_since(&self, stream: Option<&str>, after: u64) -> (String, u64) {
+        let history = self.console_history.lock();
+        let target_stream = stream.unwrap_or("stdout");
+        let text = history
+            .entries
+            .iter()
+            .filter(|entry| entry.id > after)
+            .filter(|entry| entry.target_console.as_deref() == Some(target_stream))
+            .filter_map(|entry| entry.body.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, history.next_message_id)
     }
 
     pub fn clear_history(&self) {
@@ -586,6 +616,7 @@ fn history_entry_from_value(
     target_console: &Option<Arc<str>>,
     scope: &Option<Arc<str>>,
     payload: &Utf8Bytes,
+    id: u64,
 ) -> Option<ConsoleHistoryEntry> {
     let message_type = value.get("type").and_then(serde_json::Value::as_str)?;
     if !push_events::history_replayable(message_type) { return None; }
@@ -593,6 +624,7 @@ fn history_entry_from_value(
     let target_console = target_console.clone()
         .or_else(|| push_events::history_target_console(value).map(Arc::from));
     Some(ConsoleHistoryEntry {
+        id,
         body,
         target_console,
         scope: scope.clone(),
@@ -639,6 +671,31 @@ mod tests {
         let disabled = PushServer::new_with_limits(4, 0);
         disabled.broadcast_echo("not retained", "stdout");
         assert_eq!(disabled.get_history_for(Some("stdout")), "");
+    }
+
+    /// 差分取得はカーソル以降の行だけを返し、cursor は現在までの通し番号。
+    ///
+    /// WebSocket が使えない環境 (前段 proxy が upgrade を渡さない等) で
+    /// コンソールを追い続けるための経路 (issue #46)。
+    #[test]
+    fn history_since_returns_only_newer_lines() {
+        let server = PushServer::new_with_limits(4, 10);
+        server.broadcast_echo("first", "stdout");
+        let cursor = server.history_cursor();
+        server.broadcast_echo("second", "stdout");
+        server.broadcast_echo("third", "stdout2");
+
+        let (delta, next) = server.history_since(Some("stdout"), cursor);
+        assert_eq!(delta, "second");
+        assert!(next > cursor);
+
+        // 差分取得はストリームごとに独立している。
+        let (other, _) = server.history_since(Some("stdout2"), cursor);
+        assert_eq!(other, "third");
+
+        // カーソル以降が無ければ空 (同じ内容を二重に描かない)。
+        let (none, _) = server.history_since(Some("stdout"), next);
+        assert_eq!(none, "");
     }
 
     #[test]

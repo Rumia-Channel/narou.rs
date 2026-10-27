@@ -52,6 +52,8 @@ jobs:
         run: node --test tests/queue_refresh.test.mjs
       - name: Web UI favorite tag regressions
         run: node --test tests/favorite_tags.test.mjs
+      - name: Web UI console rendering regressions
+        run: node --test tests/console_history.test.mjs tests/console_history_poll.test.mjs
       - name: Regression - SQLite converter settings (issue 22)
         run: cargo test -p narou_rs --lib converter_reads_sqlite_backed_default_and_force_settings
       - name: Regression - latest list ordering (issue 21)
