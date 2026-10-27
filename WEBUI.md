@@ -532,6 +532,16 @@ markup は初回表示時に JS が組み立てる (`#app-dialog`、HTML 側の�
 | `/api/novels/{id}` | DELETE | ✅ |
 | `/api/webui/config` | GET | ✅ |
 
+### 6.1b 小説データの ZIP 転送
+
+| エンドポイント | メソッド | Rust |
+|-------------|--------|------|
+| `/api/transfer/export?ids=1,2` | GET | ✅ (`application/zip`) |
+| `/api/transfer/import?overwrite=true` | POST | ✅ (ZIP 本文、body limit 512 MiB) |
+
+ZIP の書式 (`manifest.json` のスキーマ・検証ルール・衝突規則・挿絵の扱い) は
+[`docs/transfer-archive-format.md`](docs/transfer-archive-format.md) を参照。
+
 ### 6.2 ダウンロード・更新・変換
 
 | エンドポイント | メソッド | Rust |
