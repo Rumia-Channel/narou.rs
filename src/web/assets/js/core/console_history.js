@@ -3,6 +3,9 @@
 // 履歴 API を差分取得してコンソールを追い続ける。native は `id` (通しの
 // 番号) を返すのでカーソル以降の行だけを追加し、返さない環境 (Worker) は
 // 全量を置き換える。
+//
+// カーソルはストリームごとに持つ。共有すると、片方の取得が失敗した
+// ときに、もう片方で未取得の行を飛ばしてしまう。
 
 export const CONSOLE_HISTORY_POLL_MS = 3000;
 
@@ -13,15 +16,15 @@ export function createConsoleHistoryPoller(options) {
   const intervalMs = options.intervalMs || CONSOLE_HISTORY_POLL_MS;
 
   let timer = null;
-  let cursor = null;
+  const cursors = new Map();
   let notified = false;
 
   async function poll() {
     const targets = getTargets() || [];
     if (targets.length === 0) return;
-    let nextCursor = null;
     for (const target of targets) {
-      const query = cursor === null ? '' : `&after=${cursor}`;
+      const cursor = cursors.get(target.stream);
+      const query = cursor === undefined ? '' : `&after=${cursor}`;
       let data = null;
       try {
         data = await fetchJson(
@@ -32,8 +35,9 @@ export function createConsoleHistoryPoller(options) {
       }
       if (!data) continue;
       if (typeof data.id === 'number') {
-        if (nextCursor === null) nextCursor = data.id;
-        if (cursor === null) {
+        // 取得できたストリームのカーソルだけを進める。
+        cursors.set(target.stream, data.id);
+        if (cursor === undefined) {
           // 最初は全量。(次の取得からは差分だけ追記する)
           target.replace(data.history || '');
         } else if (data.history) {
@@ -44,7 +48,6 @@ export function createConsoleHistoryPoller(options) {
         target.replace(data.history || '');
       }
     }
-    if (nextCursor !== null) cursor = nextCursor;
   }
 
   function start() {
@@ -61,7 +64,7 @@ export function createConsoleHistoryPoller(options) {
     if (!timer) return;
     clearInterval(timer);
     timer = null;
-    cursor = null;
+    cursors.clear();
     notified = false;
   }
 

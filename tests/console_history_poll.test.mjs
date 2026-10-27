@@ -16,11 +16,11 @@ function loadModule(file, globals = {}) {
   return context;
 }
 
-function makeTarget() {
+function makeTarget(stream = 'stdout') {
   const state = { replaced: [], appended: [] };
   return {
     state,
-    stream: 'stdout',
+    stream,
     replace(history) { state.replaced.push(history); },
     append(history) { state.appended.push(history); },
   };
@@ -110,4 +110,62 @@ test('a failing request keeps the console content', async () => {
   await poller.poll();
   assert.deepEqual(target.state.replaced, []);
   assert.deepEqual(target.state.appended, []);
+});
+
+test('each stream keeps its own cursor', async () => {
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const stdout = makeTarget('stdout');
+  const stdout2 = makeTarget('stdout2');
+  const requested = [];
+  const poller = context.createConsoleHistoryPoller({
+    fetchJson: async (url) => {
+      requested.push(url);
+      if (url.includes('stream=stdout2')) return { history: 'second console', id: 20 };
+      return { history: 'first console', id: 11 };
+    },
+    getTargets: () => [stdout, stdout2],
+  });
+
+  await poller.poll();
+  assert.match(requested[0], /stream=stdout$/);
+  assert.match(requested[1], /stream=stdout2$/);
+  assert.deepEqual(stdout.state.replaced, ['first console']);
+  assert.deepEqual(stdout2.state.replaced, ['second console']);
+
+  // 2 回目の取得はストリームごとのカーソルを使う。
+  await poller.poll();
+  assert.match(requested[2], /stream=stdout&after=11/);
+  assert.match(requested[3], /stream=stdout2&after=20/);
+});
+
+test('a failed stream keeps its cursor so no line is skipped', async () => {
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const stdout = makeTarget('stdout');
+  const stdout2 = makeTarget('stdout2');
+  const requested = [];
+  let failStdout2 = true;
+  const poller = context.createConsoleHistoryPoller({
+    fetchJson: async (url) => {
+      requested.push(url);
+      if (url.includes('stream=stdout2')) {
+        if (failStdout2) throw new Error('network');
+        return { history: 'second console new', id: 20 };
+      }
+      return { history: 'first console', id: 11 };
+    },
+    getTargets: () => [stdout, stdout2],
+  });
+
+  await poller.poll();
+  assert.deepEqual(stdout.state.replaced, ['first console']);
+  assert.deepEqual(stdout2.state.replaced, [], '取得に失敗したストリームは描かない');
+
+  // 取得に失敗したストリームはカーソルが進んでいないので、
+  // 次の取得で未取得の行が飛ばされない。
+  failStdout2 = false;
+  await poller.poll();
+  assert.match(requested[2], /stream=stdout&after=11/);
+  assert.match(requested[3], /stream=stdout2$/);
+  assert.ok(!requested[3].includes('after='), '失敗したストリームはカーソルなし');
+  assert.deepEqual(stdout2.state.replaced, ['second console new']);
 });

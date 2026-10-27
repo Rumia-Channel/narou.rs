@@ -24,7 +24,7 @@
 ### Web UI のコンソール表示 (issue #46)
 
 - **「History」で表示した内容に HTML タグがそのまま出る問題を修正しました**。履歴の再描画がライブ出力と別の経路 (テキストを貼り付けるだけ) を使っていたため、`<span style="color:#bbb">更新を開始します…</span>` のような行がタグのまま表示されていました。ライブ出力と同じ描画経路 (許可要素は `<span>` の色・太字と `<ruby>` の基底テキストだけ) にそろえ、履歴でもライブでも同じ見た目になります。
-- **WebSocket が繋がらない環境でもコンソールが更新される**ようになりました。前段 reverse proxy が WebSocket の upgrade を中継しない、または `server-ws-add-accepted-domains` に現在のホストが入っていない場合、コンソールに何も表示されない状態でした。履歴 API の差分取得 (`GET /api/history?format=json&after=<id>`) を 3 秒間隔で使い、WebSocket が使えない間はコンソールを追い続けます。差分取得に対応しない環境 (Workers) は全量の置き換えで同じ表示を保ちます。
+- **WebSocket が繋がらない環境でもコンソールが更新される**ようになりました。前段 reverse proxy が WebSocket の upgrade を中継しない、`server-ws-add-accepted-domains` に現在のホストが入っていない、握手が保留のまま返らない、のいずれの場合も、履歴 API の差分取得 (`GET /api/history?format=json&after=<id>`) を 3 秒間隔で使い、コンソールを追い続けます。接続の待ち時間には上限を設け、一定時間確立できなければ履歴取得へ切り替えます。取得できた場合は接続が確立した時点で履歴取得を止めます。差分取得に対応しない環境 (Workers) は全量の置き換えで同じ表示を保ちます。
 - **WebSocket が繋がらないことを画面上で知らせる**ようにしました。コンソールが空のまま原因が分からない状態を避けるため、`server-ws-add-accepted-domains` の確認と前段 proxy の WebSocket 中継を案内する通知を一度だけ表示します。
 
 ### お気に入りタグ (issue #46)

@@ -698,6 +698,27 @@ mod tests {
         assert_eq!(none, "");
     }
 
+    /// 初期スナップショットのカーソルは、返した履歴をすべて覆う。
+    ///
+    /// 履歴とカーソルを別々に取得すると、その隙に発行された行が
+    /// 「履歴には無いのにカーソルには含まれる」になり、以後の差分取得で
+    /// その行が飛ばされる。初期取得は 1 回のロックで揃える。
+    #[test]
+    fn the_initial_snapshot_cursor_covers_the_returned_lines() {
+        let server = PushServer::new_with_limits(4, 10);
+        server.broadcast_echo("first", "stdout");
+        server.broadcast_echo("second", "stdout");
+
+        let (text, cursor) = server.history_since(Some("stdout"), 0);
+        assert_eq!(text, "first\nsecond");
+        assert_eq!(text, server.get_history_for(Some("stdout")));
+
+        // このカーソルで続きを取得すると、残っている行は無い。
+        let (delta, next) = server.history_since(Some("stdout"), cursor);
+        assert_eq!(delta, "", "スナップショットに含まれない行を飛ばさない");
+        assert_eq!(next, cursor);
+    }
+
     #[test]
     fn accepts_origin_respects_wildcards() {
         let server = PushServer::new();

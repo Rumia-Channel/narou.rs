@@ -265,6 +265,16 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                 .into_bytes(),
             ),
         ),
+        "js/core/websocket.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions(
+                    "js/core/websocket.js",
+                    include_str!("assets/js/core/websocket.js"),
+                )
+                .into_bytes(),
+            ),
+        ),
         "js/core/notepad.js" => (
             "application/javascript; charset=utf-8",
             Cow::Owned(

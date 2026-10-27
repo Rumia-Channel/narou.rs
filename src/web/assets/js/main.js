@@ -5,6 +5,7 @@ import { State, El, initElements } from './core/state.js';
 import { fetchJson, postJson } from './core/http.js';
 import { renderConsoleLine } from './core/console_html.js';
 import { createConsoleHistoryPoller } from './core/console_history.js';
+import { createResilientWebSocket } from './core/websocket.js';
 import { restoreSortState } from './core/sort_state.js';
 import { setCapabilities, applyActionCapabilities, initCapabilityGuard } from './core/capabilities.js';
 import { applyI18n } from './ui/i18n.js';
@@ -28,7 +29,7 @@ import {
   appendConsoleHistory,
 } from './ui/actions.js';
 
-let ws = null;
+let wsConnection = null;
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
 const CONSOLE_BOTTOM_THRESHOLD = 8;
 
@@ -155,47 +156,43 @@ function connectWebSocket() {
   const url = new URL('/ws', location.href);
   url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
-  try {
-    ws = new WebSocket(url.toString());
-  } catch {
-    startConsoleHistoryPolling();
-    return;
-  }
-
-  ws.onopen = () => {
-    stopConsoleHistoryPolling();
-    const con = document.getElementById('console');
-    if (con) {
-      con.innerHTML = '';
-      setConsolePinned(con, true);
-    }
-    const con2 = document.getElementById('console-stdout2');
-    if (con2) {
-      con2.innerHTML = '';
-      setConsolePinned(con2, true);
-    }
-    clearAllProgressBars();
-  };
-
-  ws.onmessage = (event) => {
-    try {
-      const msg = JSON.parse(event.data);
-      handleWsMessage(msg);
-    } catch {
-      appendConsole(event.data);
-    }
-  };
-
-  ws.onclose = () => {
-    // WebSocket が使えない環境 (前段 proxy が upgrade を渡さない等) では
-    // 履歴の差分取得でコンソールを追い続ける。
-    startConsoleHistoryPolling();
-    setTimeout(connectWebSocket, 5000);
-  };
-
-  ws.onerror = () => {
-    ws?.close();
-  };
+  // 接続が失敗するだけでなく、handshake が保留になる (onopen も onclose も
+  // 来ない) 場合も履歴取得へ切り替えるため、接続に時間制限を設けた
+  // WebSocket を使う。
+  wsConnection = createResilientWebSocket({
+    url: url.toString(),
+    createSocket: (target) => new WebSocket(target),
+    onOpen: () => {
+      // 接続が確立したら履歴取得を止める。接続が切れて作り直された
+      // 接続が開いたときも、前の接続が始めた履歴取得を止める。
+      stopConsoleHistoryPolling();
+      const con = document.getElementById('console');
+      if (con) {
+        con.innerHTML = '';
+        setConsolePinned(con, true);
+      }
+      const con2 = document.getElementById('console-stdout2');
+      if (con2) {
+        con2.innerHTML = '';
+        setConsolePinned(con2, true);
+      }
+      clearAllProgressBars();
+    },
+    onMessage: (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        handleWsMessage(msg);
+      } catch {
+        appendConsole(event.data);
+      }
+    },
+    onClose: () => {
+      setTimeout(connectWebSocket, 5000);
+    },
+    onFallbackStart: () => startConsoleHistoryPolling(),
+    onFallbackStop: () => stopConsoleHistoryPolling(),
+  });
+  wsConnection.connect();
 }
 
 /* ===== WebSocket が使えないときの補完 ===== */
