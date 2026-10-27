@@ -27,7 +27,7 @@ function makeTarget(stream = 'stdout') {
 }
 
 test('the poller replaces the console with the full history on the first poll', async () => {
-  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, clearTimeout, console });
   const target = makeTarget();
   const requested = [];
   const poller = context.createConsoleHistoryPoller({
@@ -46,7 +46,7 @@ test('the poller replaces the console with the full history on the first poll', 
 });
 
 test('the poller appends only the newer lines after the cursor is known', async () => {
-  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, clearTimeout, console });
   const target = makeTarget();
   const requested = [];
   let cursor = 7;
@@ -67,7 +67,7 @@ test('the poller appends only the newer lines after the cursor is known', async 
 });
 
 test('a response without an id replaces the console (Worker)', async () => {
-  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, clearTimeout, console });
   const target = makeTarget();
   const poller = context.createConsoleHistoryPoller({
     fetchJson: async () => ({ history: 'worker history' }),
@@ -80,8 +80,8 @@ test('a response without an id replaces the console (Worker)', async () => {
   assert.deepEqual(target.state.appended, []);
 });
 
-test('the poller notifies once and stops cleanly', async () => {
-  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+test('the poller notifies once after the delay and stops cleanly', async () => {
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, clearTimeout, console });
   const target = makeTarget();
   let notified = 0;
   const poller = context.createConsoleHistoryPoller({
@@ -89,18 +89,40 @@ test('the poller notifies once and stops cleanly', async () => {
     getTargets: () => [target],
     notify: () => { notified += 1; },
     intervalMs: 100000,
+    notifyDelayMs: 5,
   });
 
   poller.start();
   poller.start();
+  assert.equal(notified, 0, 'すぐには通知しない');
+  await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(notified, 1, '通知は一度だけ');
   assert.equal(poller.isRunning(), true);
   poller.stop();
   assert.equal(poller.isRunning(), false);
 });
 
+test('a reconnect before the delay cancels the notification', async () => {
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, clearTimeout, console });
+  const target = makeTarget();
+  let notified = 0;
+  const poller = context.createConsoleHistoryPoller({
+    fetchJson: async () => ({ history: 'x', id: 1 }),
+    getTargets: () => [target],
+    notify: () => { notified += 1; },
+    intervalMs: 100000,
+    notifyDelayMs: 20,
+  });
+
+  poller.start();
+  // 一時的な切断で、再接続できた場合。
+  poller.stop();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(notified, 0, '再接続できた切断では通知しない');
+});
+
 test('a failing request keeps the console content', async () => {
-  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, clearTimeout, console });
   const target = makeTarget();
   const poller = context.createConsoleHistoryPoller({
     fetchJson: async () => { throw new Error('network'); },
@@ -113,7 +135,7 @@ test('a failing request keeps the console content', async () => {
 });
 
 test('each stream keeps its own cursor', async () => {
-  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, clearTimeout, console });
   const stdout = makeTarget('stdout');
   const stdout2 = makeTarget('stdout2');
   const requested = [];
@@ -139,7 +161,7 @@ test('each stream keeps its own cursor', async () => {
 });
 
 test('a failed stream keeps its cursor so no line is skipped', async () => {
-  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, clearTimeout, console });
   const stdout = makeTarget('stdout');
   const stdout2 = makeTarget('stdout2');
   const requested = [];
@@ -171,7 +193,7 @@ test('a failed stream keeps its cursor so no line is skipped', async () => {
 });
 
 test('a fetch that resolves after stop does not render', async () => {
-  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, clearTimeout, console });
   const target = makeTarget('stdout');
   let release = null;
   const poller = context.createConsoleHistoryPoller({
@@ -190,7 +212,7 @@ test('a fetch that resolves after stop does not render', async () => {
 });
 
 test('overlapping ticks do not apply the same delta twice', async () => {
-  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, console });
+  const context = loadModule('console_history.js', { setInterval, clearInterval, setTimeout, clearTimeout, console });
   const target = makeTarget('stdout');
   const requested = [];
   let release = null;

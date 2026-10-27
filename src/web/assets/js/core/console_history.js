@@ -13,13 +13,23 @@
 
 export const CONSOLE_HISTORY_POLL_MS = 3000;
 
+// 履歴取得がどれくらい続いたら通知するか。WebSocket がこの時間以内に
+// 再接続すれば一時的な切断なので、通知しない。
+export const CONSOLE_HISTORY_NOTIFY_DELAY_MS = 8000;
+
 export function createConsoleHistoryPoller(options) {
   const fetchJson = options.fetchJson;
   const getTargets = options.getTargets;
   const notify = options.notify || function () {};
   const intervalMs = options.intervalMs || CONSOLE_HISTORY_POLL_MS;
+  const notifyDelayMs = options.notifyDelayMs === undefined
+    ? CONSOLE_HISTORY_NOTIFY_DELAY_MS
+    : options.notifyDelayMs;
+  const setTimeoutImpl = options.setTimeoutImpl || setTimeout;
+  const clearTimeoutImpl = options.clearTimeoutImpl || clearTimeout;
 
   let timer = null;
+  let notifyTimer = null;
   let inFlight = false;
   let generation = 0;
   const cursors = new Map();
@@ -68,9 +78,16 @@ export function createConsoleHistoryPoller(options) {
   }
 
   function start() {
-    if (!notified) {
-      notified = true;
-      notify();
+    if (!notifyTimer) {
+      // 通知はすぐには出さない。一時的な切断 (再接続で済むもの) でも
+      // 通知が出るといつもの마다画面が邪魔になるため、一定時間
+      // 履歴取得が続く場合だけ知らせる。再接続したら取り消す。
+      notifyTimer = setTimeoutImpl(() => {
+        notifyTimer = null;
+        if (notified) return;
+        notified = true;
+        notify();
+      }, notifyDelayMs);
     }
     if (timer) return;
     timer = setInterval(poll, intervalMs);
@@ -83,6 +100,10 @@ export function createConsoleHistoryPoller(options) {
     if (timer) {
       clearInterval(timer);
       timer = null;
+    }
+    if (notifyTimer) {
+      clearTimeoutImpl(notifyTimer);
+      notifyTimer = null;
     }
     cursors.clear();
     notified = false;
