@@ -289,11 +289,32 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 - 解除: お気に入り一覧の「×」ボタン、または「★」ボタンの切り替え
 - お気に入り一覧の「追加」ボタンで、選択中の小説へそのタグを付ける
 - 登録順は保持する (登録した順に並ぶ)
+- **並べ替え**: お気に入り一覧のタグはドラッグ＆ドロップで並べ替えられる
+  (2 件以上のときだけドラッグ可)。ドロップ位置はカーソルがチップの左半分なら
+  「前」、右半分なら「後」。並べ替えた順序は保存される
 - 保存先: 在庫の `favorite_tags` キー (Native は `.narou/favorite_tags.yaml` /
   SQLite `app_state('inv','favorite_tags')`、Worker は D1 の同じキー)
 - タグ色は独立した設定。お気に入りに登録しても色は変わらず、色を変えても
   お気に入りは外れない
-- API: GET / POST `/api/favorite_tags` (`action`: `add` / `remove` / `clear`)
+- API: GET / POST `/api/favorite_tags` (`action`: `add` / `remove` / `clear` / `reorder`)
+
+### 2.7.2 タグ一覧の並び順
+
+**Rust版: ✅ 実装済み (issue #46 の要望)**
+
+メインメニューの「タグ」に並んだタグ一覧は、並び順を選べる。設定は
+`webui.tag-sort-order` (Web UI の設定ページ、または `narou setting
+webui.tag-sort-order=...` で変更)。
+
+| 値 | 並び | 備考 |
+|:---|:---|:---|
+| `favorites_first` (既定) | お気に入り優先 | お気に入りタグが先頭。残りは件数降順 → 名前昇順 |
+| `alphabetical` | アルファベット順 | タグ名の昇順 |
+| `count` | 使用件数順 | 件数の降順、同数は名前昇順 |
+| `registered` | 登録順 | 小説のタグの並び順 (初めて付いた順) |
+
+- 並べ替えは保存しないと次の起動で元に戻る (設定なので永続化される)
+- `webui.tag-sort-order` は Worker 側でも同じ設定名を使う
 
 ---
 
