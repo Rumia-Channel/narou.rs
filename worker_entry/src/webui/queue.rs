@@ -73,7 +73,7 @@ macro_rules! database_or_503 {
 // Keep these SQL strings explicit: the SQLite regression tests execute the
 // production queries, including lane/status mappings and the bounded results.
 const TAG_NAMES_SQL: &str = r#"
-SELECT t.tag FROM novel_tags t
+SELECT t.tag, COUNT(*) AS n, MIN(t.novel_id) AS first_novel_id FROM novel_tags t
 INNER JOIN novels n ON n.id = t.novel_id
 GROUP BY t.tag COLLATE BINARY
 ORDER BY COUNT(*) DESC, t.tag COLLATE BINARY ASC
@@ -107,11 +107,13 @@ GROUP BY lane
 #[derive(Debug, Deserialize)]
 struct TagName {
     tag: String,
+    n: i64,
+    first_novel_id: i64,
 }
 
-async fn select_tag_names(db: &DbHandle) -> Result<Vec<String>> {
+async fn select_tag_names(db: &DbHandle) -> Result<Vec<TagName>> {
     let result = db.prepare(TAG_NAMES_SQL).all().await?;
-    Ok(result.results::<TagName>()?.into_iter().map(|row| row.tag).collect())
+    Ok(result.results::<TagName>()?)
 }
 
 async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
@@ -135,14 +137,15 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         .and_then(|url| query_param(&url, "format"));
 
     // Independent reads overlap; never materialize all NovelRecords for tags.
-    let (new_tag_color, tags) = futures::join!(
+    let (new_tag_color, tag_rows) = futures::join!(
         metadata::configured_tag_color(&services.settings),
         select_tag_names(&services.db),
     );
     // Preserve the old empty-list fallback on storage errors.
-    let tags = tags
-        .unwrap_or_default()
-        .into_iter()
+    let tag_rows = tag_rows.unwrap_or_default();
+    let tags = tag_rows
+        .iter()
+        .map(|row| row.tag.clone())
         .filter(|tag| !narou_rs::virtual_novel::is_internal_tag(tag))
         .collect::<Vec<_>>();
     let tag_colors = services
@@ -150,6 +153,36 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         .for_tags(tags.clone(), new_tag_color.as_deref())
         .await
         .unwrap_or_default();
+
+    // 並び順 (お気に入り優先 / アルファベット順 / 件数順 / 登録順) は
+    // native と同じ共有実装で決める。
+    let order = services
+        .settings
+        .get(narou_rs::application::webui::tag_order::TAG_SORT_ORDER_SETTING)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .as_deref()
+        .map(|value| narou_rs::application::webui::tag_order::TagSortOrder::from_setting(Some(value)))
+        .unwrap_or_default();
+    let favorites = crate::favorite_tags::load_with_db(&services.db)
+        .await
+        .map(|state| state.tags)
+        .unwrap_or_default();
+    let mut counts = std::collections::HashMap::new();
+    let mut registered = std::collections::HashMap::new();
+    for row in &tag_rows {
+        counts.insert(row.tag.clone(), row.n.max(0) as usize);
+        registered.insert(row.tag.clone(), row.first_novel_id);
+    }
+    let tags = narou_rs::application::webui::tag_order::sort_tags(
+        order,
+        &tags,
+        &counts,
+        &favorites,
+        &registered,
+    );
 
     if format.as_deref() == Some("json") {
         return metadata::timed_response(

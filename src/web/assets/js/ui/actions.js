@@ -656,6 +656,11 @@ export function bindActions() {
   on('tag-edit-cancel', closeTagEditor);
   on('add-tag-button', addTagFromInput);
   on('favorite-tag-button', addFavoriteTagFromInput);
+  // タグ一覧の並び順 (メインメニューの「タグ」)。
+  El.tagSortOrderSelect?.addEventListener('change', (event) => {
+    void saveTagSortOrder(event.target.value);
+  });
+  syncTagSortOrderSelect();
   El.newTagInput?.addEventListener('input', renderTagSuggestions);
   El.newTagInput?.addEventListener('focus', renderTagSuggestions);
   El.newTagInput?.addEventListener('blur', () => {
@@ -1867,6 +1872,17 @@ function renderFavoriteTags() {
     chip.dataset.tag = tag;
     chip.title = `「${tag}」を入力欄へ入れる`;
 
+    // ドラッグ＆ドロップで並べ替えられるようにする (2 件以上のときだけ)。
+    if (favorites.length > 1) {
+      chip.draggable = true;
+      chip.classList.add('tag-favorite-draggable');
+      chip.addEventListener('dragstart', onFavoriteTagDragStart);
+      chip.addEventListener('dragend', onFavoriteTagDragEnd);
+      chip.addEventListener('dragover', onFavoriteTagDragOver);
+      chip.addEventListener('dragleave', onFavoriteTagDragLeave);
+      chip.addEventListener('drop', onFavoriteTagDrop);
+    }
+
     const label = document.createElement('span');
     label.className = 'tag-edit-text';
     label.textContent = tag;
@@ -1907,6 +1923,120 @@ function renderFavoriteTags() {
 
     list.appendChild(chip);
   });
+}
+
+// ─── お気に入りタグのドラッグ＆ドロップ並べ替え ───
+
+// ドラッグ中のお気に入りタグ (null なら無効)。
+let favoriteTagDragTag = null;
+
+/** ドラッグ中の要素をグレーにして、掴んでいることを示す。 */
+function onFavoriteTagDragStart(event) {
+  const chip = event.currentTarget;
+  favoriteTagDragTag = chip.dataset.tag || null;
+  chip.classList.add('tag-favorite-drag-source');
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    // Firefox はデータなしでは dragstart を认识和しない。
+    event.dataTransfer.setData('text/plain', favoriteTagDragTag || '');
+  }
+}
+
+function onFavoriteTagDragEnd(event) {
+  favoriteTagDragTag = null;
+  event.currentTarget.classList.remove('tag-favorite-drag-source');
+  clearFavoriteTagDropMarks();
+}
+
+function onFavoriteTagDragOver(event) {
+  if (!favoriteTagDragTag) return;
+  // preventDefault がないと drop イベントが発火しない。
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+  clearFavoriteTagDropMarks();
+  const chip = event.currentTarget;
+  if (chip.dataset.tag === favoriteTagDragTag) return;
+  const rect = chip.getBoundingClientRect();
+  const before = event.clientX < rect.left + rect.width / 2;
+  chip.classList.add(before ? 'tag-favorite-drop-before' : 'tag-favorite-drop-after');
+}
+
+function onFavoriteTagDragLeave(event) {
+  event.currentTarget.classList.remove('tag-favorite-drop-before', 'tag-favorite-drop-after');
+}
+
+async function onFavoriteTagDrop(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  const chip = event.currentTarget;
+  const dragged = favoriteTagDragTag;
+  const target = chip.dataset.tag;
+  clearFavoriteTagDropMarks();
+  favoriteTagDragTag = null;
+  if (!dragged || !target || dragged === target) return;
+
+  const order = (Array.isArray(State.favoriteTags) ? State.favoriteTags : []).slice();
+  const from = order.indexOf(dragged);
+  if (from < 0) return;
+  // ドラッグしたタグを取り除く。
+  order.splice(from, 1);
+  const targetIndex = order.indexOf(target);
+  if (targetIndex < 0) return;
+  const rect = chip.getBoundingClientRect();
+  const before = event.clientX < rect.left + rect.width / 2;
+  // カーソルが半分より左なら前、右なら後に挿入する。
+  order.splice(before ? targetIndex : targetIndex + 1, 0, dragged);
+  await setFavoriteTags({ action: 'reorder', tags: order });
+}
+
+function clearFavoriteTagDropMarks() {
+  El.tagFavoritesList?.querySelectorAll('.tag-favorite-drop-before, .tag-favorite-drop-after')
+    .forEach((chip) => chip.classList.remove('tag-favorite-drop-before', 'tag-favorite-drop-after'));
+}
+
+// ─── タグ一覧の並び順 ───
+
+// 並び順の選択肢 (サーバ側の `webui.tag-sort-order` と同じ値)。
+const TAG_SORT_ORDERS = [
+  { value: 'favorites_first', labelKey: 'tagSortOrderFavoritesFirst' },
+  { value: 'alphabetical', labelKey: 'tagSortOrderAlphabetical' },
+  { value: 'count', labelKey: 'tagSortOrderCount' },
+  { value: 'registered', labelKey: 'tagSortOrderRegistered' },
+];
+
+// 並び順のセレクトボックスを現在の設定に合わせる。
+export function syncTagSortOrderSelect() {
+  const select = El.tagSortOrderSelect;
+  if (!select) return;
+  if (select.options.length === 0) {
+    TAG_SORT_ORDERS.forEach((order) => {
+      const option = document.createElement('option');
+      option.value = order.value;
+      option.textContent = t(order.labelKey);
+      select.appendChild(option);
+    });
+  }
+  select.value = State.tagSortOrder || 'favorites_first';
+  const label = select.closest('.tag-sort-order')?.querySelector('label');
+  if (label) label.textContent = t('tagSortOrderLabel');
+}
+
+// 並び順を変えたら保存してタグ一覧を取り直す。
+async function saveTagSortOrder(value) {
+  const previous = State.tagSortOrder;
+  State.tagSortOrder = value;
+  syncTagSortOrderSelect();
+  try {
+    const result = await postJson('/api/global_setting', {
+      settings: { 'webui.tag-sort-order': value },
+    });
+    assertApiSuccess(result, '並び順の保存に失敗しました');
+    await refreshTags();
+  } catch (error) {
+    State.tagSortOrder = previous;
+    syncTagSortOrderSelect();
+    showNotification(error.message || '並び順の保存に失敗しました', 'error');
+  }
 }
 
 // お気に入りタグの登録 / 解除を切り替える。

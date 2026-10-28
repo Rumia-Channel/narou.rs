@@ -154,6 +154,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "webui.table.reload-timing"
         | "webui.performance-mode"
         | "webui.new-tag-color"
+        | "webui.tag-sort-order"
         | "webui.debug-mode" => Some("webui"),
 
         // global → global
@@ -1004,6 +1005,18 @@ pub fn setting_variables() -> SettingVariables {
                 "新規タグに自動割り当てする色。defaultの場合は従来どおりタグ追加順に巡回します",
                 vec![
                     "default", "green", "yellow", "blue", "magenta", "cyan", "red", "white",
+                ],
+            ),
+        ),
+        (
+            "webui.tag-sort-order",
+            sel(
+                "WEB UI のタグ一覧の並び順。favorites_first: お気に入りタグを先頭に、alphabetical: アルファベット順、count: 使用件数順、registered: 登録順",
+                vec![
+                    "favorites_first",
+                    "alphabetical",
+                    "count",
+                    "registered",
                 ],
             ),
         ),

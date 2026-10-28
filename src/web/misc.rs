@@ -10,6 +10,9 @@ use crate::application::webui::mutations::{MutationNotice, mutation_events};
 use crate::application::webui::notepad::{
     notepad_conflict_payload, notepad_object_id, notepad_response_value, notepad_saved_payload,
 };
+use crate::application::webui::tag_order::{
+    TAG_SORT_ORDER_SETTING, TagSortOrder, sort_tags,
+};
 use crate::application::webui::tag_views::{tag_count_ordering, tag_list_html};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -141,6 +144,7 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
         "webui.performance-mode",
         "webui.table.reload-timing",
         "webui.debug-mode",
+        "webui.tag-sort-order",
         "concurrency",
     ];
     let loaded: Vec<Option<serde_yaml::Value>> = state
@@ -169,6 +173,9 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
     let concurrency_enabled = find("concurrency")
         .and_then(|value| crate::setting_core::setting_bool_value(&value))
         .unwrap_or(false);
+    let tag_sort_order = TagSortOrder::from_setting(Some(
+        string_value(find("webui.tag-sort-order"), "favorites_first").as_str(),
+    ));
 
     // 能力宣言 (共有定義)。端末一覧だけは実行時の外部ツール検出値を使う。
     let capabilities = crate::application::webui::capabilities::WebUiCapabilities::native(
@@ -185,6 +192,7 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
         "performance_mode": performance_mode,
         "reload_timing": reload_timing,
         "debug_mode": debug_mode,
+        "tag_sort_order": tag_sort_order.setting_value(),
         "ws_port": state.ws_port,
         "port": state.port,
         "concurrency_enabled": concurrency_enabled,
@@ -218,7 +226,34 @@ pub async fn tag_list(
     // 件数降順、同数はタグ名の昇順 (Worker の SQL と同じ規則 — 新規タグへの
     // 色割り当ても並び順に依存するため、両ランタイムで一致させる)。
     list.sort_by(tag_count_ordering);
-    let tags = list.into_iter().map(|(tag, _)| tag).collect::<Vec<_>>();
+    let count_map: std::collections::HashMap<String, usize> =
+        list.iter().cloned().collect();
+    let default_tags: Vec<String> = list.into_iter().map(|(tag, _)| tag).collect();
+
+    // 並び順 (お気に入り優先 / アルファベット順 / 件数順 / 登録順) と
+    // お気に入りタグの並びは利用者が選べる。
+    let sort_order = TagSortOrder::from_setting(
+        state
+            .services
+            .settings
+            .get(TAG_SORT_ORDER_SETTING)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .as_deref(),
+    );
+    let favorites = crate::native::favorite_tags::load()
+        .map(|state| state.tags)
+        .unwrap_or_default();
+    let registered = registered_tag_order(&records);
+    let tags = sort_tags(
+        sort_order,
+        &default_tags,
+        &count_map,
+        &favorites,
+        &registered,
+    );
     let tag_colors = state
         .services
         .tag_colors
@@ -231,6 +266,32 @@ pub async fn tag_list(
     }
 
     Html(tag_list_html(&tags, &tag_colors)).into_response()
+}
+
+/// タグの登録順: そのタグが付いた小説のうち ID が最小のものを登録順とする。
+///
+/// 小説 ID は登録順に振られるため、これが「タグが初めて使われた順」になる。
+/// タグの並びを「登録順」で見たときに使う。
+fn registered_tag_order(
+    records: &[crate::db::NovelRecord],
+) -> std::collections::HashMap<String, i64> {
+    let mut order: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for record in records {
+        for tag in &record.tags {
+            if crate::virtual_novel::is_internal_tag(tag) {
+                continue;
+            }
+            order
+                .entry(tag.clone())
+                .and_modify(|current| {
+                    if record.id < *current {
+                        *current = record.id;
+                    }
+                })
+                .or_insert(record.id);
+        }
+    }
+    order
 }
 
 pub async fn tag_change_color(

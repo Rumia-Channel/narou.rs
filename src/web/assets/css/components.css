@@ -466,6 +466,24 @@ li.enable-selected.disabled a {
   gap: 0.20em;
 }
 
+/* タグ一覧の並び順のセレクト (メインメニューの「タグ」)。 */
+.tag-sort-order {
+  display: flex;
+  align-items: center;
+  gap: 0.40em;
+  padding: 0.30em 0.60em;
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+.tag-sort-order-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.95em;
+  color: var(--text-color);
+}
+
 /* ========== Status Badges ========== */
 .status-new {
   color: var(--new-arrival-color);
@@ -752,6 +770,23 @@ li.enable-selected.disabled a {
 .tag-favorite-add:hover,
 .tag-favorite-add:focus-visible {
   opacity: 1;
+}
+
+/* お気に入りタグのドラッグ＆ドロップ並べ替え。 */
+.tag-favorites-list .tag-favorite-draggable {
+  cursor: grab;
+}
+
+.tag-favorites-list .tag-favorite-drag-source {
+  opacity: 0.65;
+}
+
+.tag-favorites-list .tag-favorite-drop-before {
+  box-shadow: inset 0 0.15em 0 0 var(--btn-primary-bg);
+}
+
+.tag-favorites-list .tag-favorite-drop-after {
+  box-shadow: inset 0 -0.15em 0 0 var(--btn-primary-bg);
 }
 
 .tag-favorite-edit {

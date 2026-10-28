@@ -27,6 +27,7 @@ import {
   refreshFavoriteTags,
   replaceConsoleHistory,
   appendConsoleHistory,
+  syncTagSortOrderSelect,
 } from './ui/actions.js';
 
 let wsConnection = null;
@@ -269,6 +270,10 @@ function applyWebConfig(config, themeGeneration) {
   if (config.performance_mode) State.performanceMode = config.performance_mode;
   State.debugMode = Boolean(config.debug_mode);
   setConcurrencyEnabled(Boolean(config.concurrency_enabled));
+  if (config.tag_sort_order) {
+    State.tagSortOrder = config.tag_sort_order;
+    syncTagSortOrderSelect();
+  }
 }
 
 function normalizeTheme(theme) {
