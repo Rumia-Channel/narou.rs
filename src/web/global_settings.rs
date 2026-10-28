@@ -15,6 +15,45 @@ pub async fn get_global_settings(
     Json(settings_view::load_view(&state.services.settings).await)
 }
 
+/// POST /api/server_security/reload — `server-*` 設定を即時に再適用する。
+///
+/// `narou setting` で設定を変えたときに、CLI 側からこの API を呼ぶと
+/// サーバ側の許可ホストと WebSocket の Origin 許可リストをすぐ反映する。
+/// 反映までの待ち時間を 30 秒のポーリングに依存させないため。
+///
+/// 内部制御トークン (`x-narou-internal-token`) を要求する — 外部から
+/// 許可ホストを書き換えられないようにするため。
+pub async fn reload_server_security(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !super::internal_control_token_matches(&headers, &state) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "internal control token required",
+            })),
+        );
+    }
+    match state.reload_server_security() {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "message": "server-* 設定を再適用しました",
+            })),
+        ),
+        Err(message) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "message": message,
+            })),
+        ),
+    }
+}
+
 /// POST /api/global_setting — 設定と置換設定の保存
 pub async fn save_global_settings(
     State(state): State<AppState>,
