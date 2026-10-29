@@ -286,7 +286,7 @@ function createSuggestionList(field, input) {
   input.addEventListener('input', render);
   input.addEventListener('focus', render);
   input.addEventListener('blur', close);
-  // 候補を押した瞬間にフォーカスが外れてもクリックが失われ��いよう、
+  // 候補を押した瞬間にフォーカスが外れてもクリックが失われないよう、
   // リスト側の mousedown で既定のフォーカス移動を止める。
   list.addEventListener('mousedown', (event) => event.preventDefault());
   input.addEventListener('keydown', (event) => {

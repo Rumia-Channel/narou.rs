@@ -919,7 +919,7 @@ async fn broadcast_console_note(env: &Env, runtime: &WorkerRuntime, text: &str) 
 
 /// native `src/web/jobs.rs::notify_queue_changed` 相当。受理した投入のあとに
 /// `notification.queue` を送る (native は request 単位で 1 回、`queued` の
-/// ときだけ)。表시更新なので best-effort — 送信失敗でも応答は変えない。
+/// ときだけ)。表示更新なので best-effort — 送信失敗でも応答は変えない。
 async fn notify_queue_changed(env: &Env, runtime: &WorkerRuntime) {
     let push = crate::push_hub::PushHubClient::new(env, runtime.subrequests.clone());
     crate::consumer::notify_queue_changed(&push).await;

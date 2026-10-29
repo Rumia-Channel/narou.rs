@@ -178,7 +178,7 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 | `.illustration_cache.yaml` | ✅ | 取得済み挿絵の索引 (§7) |
 | `raw/*.html` | ✅ | 生 HTML (挿絵の索引を張り直す材料) |
 | `cache/*` | ✅ | 差分退避 |
-| `backup/` | ❌ | `narou backup` が除外するディレクトリと同��� |
+| `backup/` | ❌ | `narou backup` が除外するディレクトリと同じ |
 | `*.lock` / `*.tmp` | ❌ | 実行時の一時ファイル |
 | symlink / リパースポイント | ❌ | 小説ディレクトリの外へ出ないため辿らない |
 

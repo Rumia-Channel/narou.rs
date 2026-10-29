@@ -33,7 +33,7 @@ pub fn parse(content: &str) -> TagSequence {
     serde_yaml::from_str(content).unwrap_or_default()
 }
 
-/// 連番表を YAML にする (在庫の保存形式と 같다 ✓)。
+/// 連番表を YAML にする (在庫の保存形式と同じ ✓)。
 pub fn serialize(sequence: &TagSequence) -> Result<String> {
     crate::db::inventory::serialize_yaml_content(sequence)
 }
