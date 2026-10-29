@@ -666,6 +666,12 @@ narou setting name         # 読み取り
 - タグ色とは独立した設定。お気に入りに登録しても色は変わらず、色を変えてもお気に入りは外れない
 - CLI には対応コマンドが無い (Web UI 専用の設定)
 
+**タグの登録順 (issue #46 の要望、2026-10 追加)**:
+- Web UI のタグ一覧の並び順「登録順」は、各タグが付いた小説のうち ID が最小のものを登録順としていたため、古い小説へ後からタグを付けたときや ID の小さいほうへ後からタグを追加したときには「タグがライブラリへ入った順」と食い違っていた
+- タグごとにグローバルな連番を振り、在庫の `tag_sequence` キー (Native は `.narou/tag_sequence.yaml` / SQLite・Worker は `app_state('inv','tag_sequence')`) へ保存する
+- 既存ライブラリには連番が無いので、最初の書き込みで最小小説 ID → タグ名の順にバックフィルし、以後の新しいタグは登録順の末尾に足す
+- 共有モデルは `src/application/tag_sequence.rs`、native のストアは `src/native/tag_sequence.rs`、Worker の D1 ストアは `worker_entry/src/tag_sequence.rs`。native の書き込み時の更新は `src/db/database.rs`、Worker は `worker_entry/src/d1_repository.rs` で行う
+
 ---
 
 ### 9. `remove` — ✅ 完了

@@ -20,6 +20,11 @@ pub struct Database {
     inventory: Inventory,
     archive_root: PathBuf,
     id_allocator: crate::platform::id_allocator::IdAllocator,
+    /// タグの登録順 (どのタグが先にライブラリへ入ったか) のキャッシュ。
+    /// `None` は未読み込み。書き込みごとに在庫を読み直さないために持つ。
+    tag_sequence: std::cell::RefCell<
+        Option<crate::application::tag_sequence::TagSequence>,
+    >,
     /// SQLite backend (P2). `None` when `NAROU_RS_LEGACY_YAML` is set or the
     /// database directory cannot host `db.sqlite`; then the legacy YAML path
     /// below runs unchanged.
@@ -142,6 +147,7 @@ impl Database {
             inventory,
             archive_root,
             id_allocator: crate::platform::id_allocator::IdAllocator::default(),
+            tag_sequence: std::cell::RefCell::new(None),
             #[cfg(feature = "native-runtime")]
             sqlite,
         };
@@ -322,6 +328,8 @@ impl Database {
                 Ok((current, ()))
             });
         }
+        // 書き込み前のライブラリ (バックフィルの材料) を読む。
+        let before_library = self.persisted_library_tags()?;
         let content = serde_yaml::to_string(
             &self
                 .data
@@ -338,7 +346,32 @@ impl Database {
         if !self.using_sqlite() {
             self.index.flush(&self.inventory)?;
         }
+        // タグの登録順は書き込み後に進める (記録が確定してから)。
+        let written = tags_of_data(&self.data);
+        self.sync_tag_sequence(before_library.as_ref(), &written)?;
         Ok(())
+    }
+
+    /// 保存済みのライブラリのタグを読む。
+    ///
+    /// バックフィル (既存タグの登録順) の材料にする。読めなければ `None`。
+    fn persisted_library_tags(
+        &self,
+    ) -> Result<Option<crate::application::tag_sequence::LibraryTags>> {
+        let raw = self.inventory.load_raw(DATABASE_NAME, InventoryScope::Local)?;
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        let records: BTreeMap<i64, NovelRecord> = match serde_yaml::from_str(&raw) {
+            Ok(records) => records,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(crate::application::tag_sequence::library_tags(
+            records
+                .iter()
+                .map(|(id, record)| (*id, record.tags.as_slice())),
+            |tag| !crate::virtual_novel::is_internal_tag(tag),
+        )))
     }
 
     pub fn update_records<T, F>(&mut self, update: F) -> Result<T>
@@ -351,6 +384,10 @@ impl Database {
                 "SQLite state is unavailable during record mutation".into(),
             ))?;
             let yaml_path = self.inventory.inventory_path(DATABASE_NAME, InventoryScope::Local);
+            // 書き込み前のライブラリ (バックフィルの材料) を作る。
+            let before_library: std::cell::RefCell<
+                Option<crate::application::tag_sequence::LibraryTags>,
+            > = std::cell::RefCell::new(None);
             let (updated, result, compat) = state.with_compat_lock(|| {
                 let compat = state.compat_now();
                 let operation = || {
@@ -372,6 +409,10 @@ impl Database {
                         }
                     }
                     for (&id, record) in &mut current { record.id = id; }
+                    *before_library.borrow_mut() = Some(crate::application::tag_sequence::library_tags(
+                        current.iter().map(|(id, record)| (*id, record.tags.as_slice())),
+                        |tag| !crate::virtual_novel::is_internal_tag(tag),
+                    ));
                     let (mut updated, result) = update(current)?;
                     for (&id, record) in &mut updated { record.id = id; }
                     crate::native::sqlite::bulk::replace_records_conn(&tx, &updated)?;
@@ -391,6 +432,9 @@ impl Database {
                     operation()
                 }
             })?;
+            // タグの登録順は書き込み後に進める (記録が確定してから)。
+            let written = tags_of_records(&updated);
+            self.sync_tag_sequence(before_library.into_inner().as_ref(), &written)?;
             self.data = updated.into_iter().collect();
             self.persisted = self.data.clone();
             self.id_allocator.reconcile(
@@ -402,6 +446,9 @@ impl Database {
             }
             return Ok(result);
         }
+        let before_library: std::cell::RefCell<
+            Option<crate::application::tag_sequence::LibraryTags>,
+        > = std::cell::RefCell::new(None);
         let result = self.inventory.update_yaml(
             DATABASE_NAME,
             InventoryScope::Local,
@@ -409,6 +456,10 @@ impl Database {
                 for (id, record) in current.iter_mut() {
                     record.id = *id;
                 }
+                *before_library.borrow_mut() = Some(crate::application::tag_sequence::library_tags(
+                    current.iter().map(|(id, record)| (*id, record.tags.as_slice())),
+                    |tag| !crate::virtual_novel::is_internal_tag(tag),
+                ));
                 let (mut updated, result) = update(current)?;
                 for (id, record) in updated.iter_mut() {
                     record.id = *id;
@@ -420,7 +471,34 @@ impl Database {
         if !self.using_sqlite() {
             self.index.flush(&self.inventory)?;
         }
+        // タグの登録順は書き込み後に進める (記録が確定してから)。
+        let written = tags_of_data(&self.data);
+        self.sync_tag_sequence(before_library.into_inner().as_ref(), &written)?;
         Ok(result)
+    }
+
+    /// タグの登録順を進める。
+    ///
+    /// `before` は書き込み前のライブラリのタグ (登録順が未初期化のときの
+    /// バックフィルに使う)、`written` は書き込み後の小説に付いたタグ。
+    /// 新しいタグが無ければ在庫を読まない (ダウンロード中は読み直さない)。
+    fn sync_tag_sequence(
+        &self,
+        before: Option<&crate::application::tag_sequence::LibraryTags>,
+        written: &[&str],
+    ) -> Result<()> {
+        if let Some(cached) = self.tag_sequence.borrow().as_ref()
+            && cached.is_initialized()
+        {
+            let known = cached.registered_set();
+            if written.iter().all(|tag| known.contains(tag)) {
+                return Ok(());
+            }
+        }
+        let updated =
+            crate::native::tag_sequence::sync_records(&self.inventory, before, written)?;
+        *self.tag_sequence.borrow_mut() = Some(updated);
+        Ok(())
     }
 
     pub fn get(&self, id: i64) -> Option<&NovelRecord> {
@@ -551,6 +629,30 @@ impl Database {
     }
 }
 
+/// 小説に付いたタグ (小説 ID 順 → 小説内の位置順)。
+///
+/// タグの登録順を進めるとき、新しいタグを判定する材料になる。
+fn tags_of_records(records: &BTreeMap<i64, NovelRecord>) -> Vec<&str> {
+    records
+        .values()
+        .flat_map(|record| record.tags.iter().map(String::as_str))
+        .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
+        .collect()
+}
+
+/// 小説に付いたタグ (小説 ID 順 → 小説内の位置順)。
+///
+/// `data` は ID 順を持たないため、ソートしてから並べる (登録順の決定を
+/// 安定させるため)。
+fn tags_of_data(data: &HashMap<i64, NovelRecord>) -> Vec<&str> {
+    let mut ids: Vec<i64> = data.keys().copied().collect();
+    ids.sort_unstable();
+    ids.iter()
+        .filter_map(|id| data.get(id))
+        .flat_map(|record| record.tags.iter().map(String::as_str))
+        .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
+        .collect()
+}
 
 #[cfg(feature = "native-runtime")]
 fn rename_imported_file(path: &std::path::Path) {

@@ -201,6 +201,28 @@ impl NovelRepository for D1NovelRepository {
             if mutations.is_empty() {
                 return Ok(());
             }
+            // タグの登録順 (どのタグが先にライブラリへ入ったか) を追跡する。
+            // 登録順が未初期化なら、既存ライブラリをバックフィルするために
+            // 書き込み前のタグを先に読む。
+            let sequence = crate::tag_sequence::read(&self.db).await?;
+            let before = if sequence.is_initialized() {
+                None
+            } else {
+                Some(crate::tag_sequence::library_tags(&self.db).await?)
+            };
+            // 書き込み対象的小说のタグ (小説 ID 順)。
+            let mut written: Vec<(i64, Vec<String>)> = Vec::new();
+            for mutation in &mutations {
+                if let NovelMutation::Upsert(record) = mutation {
+                    written.push((record.id, record.tags.clone()));
+                }
+            }
+            written.sort_by_key(|(id, _)| *id);
+            let written: Vec<&str> = written
+                .iter()
+                .flat_map(|(_, tags)| tags.iter().map(String::as_str))
+                .filter(|tag| !narou_rs::virtual_novel::is_internal_tag(tag))
+                .collect();
             let mut statements = Vec::new();
             for mutation in mutations {
                 match mutation {
@@ -252,7 +274,10 @@ impl NovelRepository for D1NovelRepository {
                 }
             }
             let results = self.db.batch(statements).await.map_err(worker_error)?;
-            ensure_batch_success(&results)
+            ensure_batch_success(&results)?;
+            // タグの登録順は書き込み後に進める (記録が確定してから)。
+            crate::tag_sequence::sync_with_db(&self.db, before.as_ref(), &written).await?;
+            Ok(())
         })
     }
 }

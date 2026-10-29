@@ -246,7 +246,16 @@ pub async fn tag_list(
     let favorites = crate::native::favorite_tags::load()
         .map(|state| state.tags)
         .unwrap_or_default();
-    let registered = registered_tag_order(&records);
+    // 「登録順」はタグがライブラリへ入った順 (在庫の `tag_sequence`)。
+    // 記録が無いライブラリは最小小説 ID → タグ名の順。
+    let sequence = crate::native::tag_sequence::load().unwrap_or_default();
+    let library = crate::application::tag_sequence::library_tags(
+        records
+            .iter()
+            .map(|record| (record.id, record.tags.as_slice())),
+        |tag| !crate::virtual_novel::is_internal_tag(tag),
+    );
+    let registered = crate::application::tag_sequence::registered_ranks(&sequence, &library);
     let tags = sort_tags(
         sort_order,
         &default_tags,
@@ -266,32 +275,6 @@ pub async fn tag_list(
     }
 
     Html(tag_list_html(&tags, &tag_colors)).into_response()
-}
-
-/// タグの登録順: そのタグが付いた小説のうち ID が最小のものを登録順とする。
-///
-/// 小説 ID は登録順に振られるため、これが「タグが初めて使われた順」になる。
-/// タグの並びを「登録順」で見たときに使う。
-fn registered_tag_order(
-    records: &[crate::db::NovelRecord],
-) -> std::collections::HashMap<String, i64> {
-    let mut order: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for record in records {
-        for tag in &record.tags {
-            if crate::virtual_novel::is_internal_tag(tag) {
-                continue;
-            }
-            order
-                .entry(tag.clone())
-                .and_modify(|current| {
-                    if record.id < *current {
-                        *current = record.id;
-                    }
-                })
-                .or_insert(record.id);
-        }
-    }
-    order
 }
 
 pub async fn tag_change_color(

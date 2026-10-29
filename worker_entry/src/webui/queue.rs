@@ -171,11 +171,20 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         .map(|state| state.tags)
         .unwrap_or_default();
     let mut counts = std::collections::HashMap::new();
-    let mut registered = std::collections::HashMap::new();
     for row in &tag_rows {
         counts.insert(row.tag.clone(), row.n.max(0) as usize);
-        registered.insert(row.tag.clone(), row.first_novel_id);
     }
+    // 「登録順」はタグがライブラリへ入った順 (app_state の `tag_sequence`)。
+    // 記録が無いライブラリは最小小説 ID → タグ名の順。
+    let sequence = crate::tag_sequence::load_with_db(&services.db)
+        .await
+        .unwrap_or_default();
+    let library: Vec<(String, i64)> = tag_rows
+        .iter()
+        .filter(|row| !narou_rs::virtual_novel::is_internal_tag(&row.tag))
+        .map(|row| (row.tag.clone(), row.first_novel_id))
+        .collect();
+    let registered = narou_rs::application::tag_sequence::registered_ranks(&sequence, &library);
     let tags = narou_rs::application::webui::tag_order::sort_tags(
         order,
         &tags,

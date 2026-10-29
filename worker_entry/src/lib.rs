@@ -10,6 +10,7 @@ mod authors;
 mod bundled_sites;
 mod favorite_tags;
 mod hidden;
+mod tag_sequence;
 mod virtual_novels;
 mod composition;
 mod content_store;

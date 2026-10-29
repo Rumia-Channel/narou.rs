@@ -41,6 +41,7 @@ pub mod push_events;
 pub mod web_payloads;
 pub mod tag_colors;
 pub mod favorite_tags;
+pub mod tag_sequence;
 pub mod web_actions;
 pub mod webui;
 pub use jobs::{
