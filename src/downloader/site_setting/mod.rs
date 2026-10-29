@@ -247,6 +247,9 @@ pub struct SiteSetting {
     pub novel_type_string: Option<HashMap<String, u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<SiteSettingValue>,
+    /// 作品の属性を決める条件。最初に一致した規則を使い、未一致なら小説。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_type_rules: Vec<WorkTypeRule>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preprocess: Option<String>,
@@ -290,6 +293,92 @@ pub struct SiteSetting {
     pub(super) compiled_next_toc: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_toc_page_max: Option<Regex>,
+    /// コンパイル済みの作品属性規則。
+    #[serde(skip)]
+    pub(super) compiled_work_type_rules: Vec<(WorkTypeField, Regex, WorkType)>,
+}
+
+/// サイトが作品属性の判定に使う値。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkTypeField {
+    /// 作品 ID (サイトによっては種別を含む)。
+    Ncode,
+    /// 題名。
+    Title,
+    /// 作者名。
+    Author,
+    /// 作品 URL (レコードの `toc_url`)。
+    Url,
+    /// 種別コード (1 = 連載, 2 = 短編)。完結は別の `end` で管理する。
+    NovelType,
+    /// 話数。
+    EpisodeCount,
+    /// 前処理済みの目次ページ。
+    Source,
+}
+
+impl WorkTypeField {
+    /// 規則が照合する値の取り出し口。
+    fn value<'a>(&self, subjects: &'a WorkTypeSubjects<'a>) -> &'a str {
+        match self {
+            WorkTypeField::Ncode => subjects.ncode,
+            WorkTypeField::Title => subjects.title,
+            WorkTypeField::Author => subjects.author,
+            WorkTypeField::Url => subjects.url,
+            WorkTypeField::NovelType => subjects.novel_type,
+            WorkTypeField::EpisodeCount => subjects.episode_count,
+            WorkTypeField::Source => subjects.source,
+        }
+    }
+}
+
+/// 分類規則が照合する作品情報。
+///
+/// 取得パイプラインが組み立て、規則の `field` で選んだ値を照合する。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorkTypeSubjects<'a> {
+    /// 作品 ID (ncode)。
+    pub ncode: &'a str,
+    /// 題名。
+    pub title: &'a str,
+    /// 作者名。
+    pub author: &'a str,
+    /// 作品 URL。
+    pub url: &'a str,
+    /// 種別コード (1 = 連載, 2 = 短編)。
+    pub novel_type: &'a str,
+    /// 話数。
+    pub episode_count: &'a str,
+    /// 前処理済みの目次ページ。
+    pub source: &'a str,
+}
+
+/// 一致した作品の属性。未指定・未一致時は小説。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkType {
+    Novel,
+    Manga,
+}
+
+impl WorkType {
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Novel => crate::application::attribute_tags::NOVEL_TAG,
+            Self::Manga => crate::application::attribute_tags::MANGA_TAG,
+        }
+    }
+}
+
+/// `field` に選んだ値が `match` に一致すれば `type` を採用する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkTypeRule {
+    #[serde(rename = "match")]
+    pub pattern: String,
+    pub field: WorkTypeField,
+    #[serde(rename = "type")]
+    pub work_type: WorkType,
 }
 
 /// A URL template that may depend on the shape of the target URL.
@@ -617,6 +706,41 @@ impl SiteSetting {
             .toc_page_max
             .as_deref()
             .and_then(|s| Regex::new(s).ok());
+        self.compiled_work_type_rules = self.compile_work_type_rules();
+    }
+
+    fn compile_work_type_rules(&self) -> Vec<(WorkTypeField, Regex, WorkType)> {
+        let mut compiled = Vec::new();
+        for rule in &self.work_type_rules {
+            let pattern = rule.pattern.trim();
+            if pattern.is_empty() || pattern.len() > crate::downloader::security::MAX_YAML_REGEX_PATTERN_LEN {
+                tracing::warn!("invalid work_type_rules pattern for {}: {}", self.name, rule.pattern);
+                continue;
+            }
+            match RegexBuilder::new(pattern)
+                .dot_matches_new_line(true)
+                .multi_line(true)
+                .size_limit(crate::downloader::util::DEFAULT_REGEX_SIZE_LIMIT)
+                .build()
+            {
+                Ok(regex) => compiled.push((rule.field, regex, rule.work_type)),
+                Err(error) => tracing::warn!(
+                    "work_type_rules pattern failed to compile for {}: {} ({error})",
+                    self.name, rule.pattern
+                ),
+            }
+        }
+        compiled
+    }
+
+    /// 最初に一致する分類を使い、定義なし・未一致の場合は小説とする。
+    pub fn work_type_for(&self, subjects: &WorkTypeSubjects<'_>) -> WorkType {
+        self.compiled_work_type_rules.iter()
+            .find_map(|(field, pattern, work_type)| {
+                let value = field.value(subjects);
+                (!value.is_empty() && pattern.is_match(value)).then_some(*work_type)
+            })
+            .unwrap_or(WorkType::Novel)
     }
 
     pub(crate) fn site_timezone(&self) -> super::SiteTimezone {
@@ -1499,5 +1623,61 @@ toc_url: https://example.com/works/\\k<ncode>
         )
         .unwrap();
         assert_eq!(custom.download_site_family(), "custom.example");
+    }
+
+    #[test]
+    fn work_type_rules_use_first_match_and_default_to_novel() {
+        let yaml = r#"
+name: Tagged
+domain: tagged.example
+top_url: https://tagged.example
+sitename: Tagged
+toc_url: https://tagged.example/\k<url>
+work_type_rules:
+  - field: ncode
+    match: '^special'
+    type: novel
+  - field: ncode
+    match: '^[acs]'
+    type: manga
+"#;
+        let settings = SiteSetting::load_bundled(&[yaml]).unwrap();
+        let setting = &settings[0];
+        let classify = |ncode: &str| setting.work_type_for(&WorkTypeSubjects { ncode, ..Default::default() });
+        assert_eq!(classify("a123"), WorkType::Manga);
+        assert_eq!(classify("c456"), WorkType::Manga);
+        assert_eq!(classify("special"), WorkType::Novel);
+        assert_eq!(classify("n123"), WorkType::Novel);
+        assert_eq!(classify(""), WorkType::Novel);
+    }
+
+    #[test]
+    fn work_type_rules_can_use_other_fields_and_preprocessed_source() {
+        for (field, value) in [
+            ("url", "/comic/"), ("novel_type", "2"), ("episode_count", "1"),
+            ("title", "題名"), ("author", "作者"), ("source", "category::comic"),
+        ] {
+            let yaml = format!(
+                "name: Test\ndomain: test.example\ntop_url: https://test.example\nsitename: Test\ntoc_url: https://test.example/\\k<url>\nwork_type_rules:\n  - field: {field}\n    match: '{value}'\n    type: manga\n"
+            );
+            let settings = SiteSetting::load_bundled(&[&yaml]).unwrap();
+            let subjects = WorkTypeSubjects {
+                ncode: "n123", url: "/comic/", novel_type: "2", episode_count: "1",
+                title: "題名", author: "作者", source: "category::comic",
+            };
+            assert_eq!(settings[0].work_type_for(&subjects), WorkType::Manga, "{field}");
+            assert_eq!(settings[0].work_type_for(&WorkTypeSubjects::default()), WorkType::Novel);
+        }
+    }
+
+    #[test]
+    fn the_bundled_pixiv_definition_classifies_all_work_shapes() {
+        let settings = SiteSetting::load_all().unwrap();
+        let pixiv = settings.iter().find(|setting| setting.domain == "www.pixiv.net").unwrap();
+        let classify = |ncode: &str| pixiv.work_type_for(&WorkTypeSubjects { ncode, ..Default::default() });
+        assert_eq!(classify("a140668719"), WorkType::Manga);
+        assert_eq!(classify("c311834"), WorkType::Manga);
+        assert_eq!(classify("n26352975"), WorkType::Novel);
+        assert_eq!(classify("s16299140"), WorkType::Novel);
     }
 }

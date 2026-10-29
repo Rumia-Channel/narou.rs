@@ -39,7 +39,16 @@ pub static DATABASE: Mutex<Option<Database>> = Mutex::new(None);
 
 #[cfg(feature = "native-runtime")]
 pub fn init_database() -> Result<()> {
-    let db = Database::new()?;
+    let mut db = Database::new()?;
+    let sites = crate::downloader::site_setting::effective_site_settings();
+    if db.all_records().values().any(|record| crate::application::attribute_tags::needs_initialization(record, &sites)) {
+        db.update_records(|mut records| {
+            for record in records.values_mut() {
+                crate::application::attribute_tags::initialize_record(record, &sites);
+            }
+            Ok((records, ()))
+        })?;
+    }
     *DATABASE.lock() = Some(db);
     Ok(())
 }

@@ -480,7 +480,7 @@ try {
   assert.equal(record.body.ncode, 'n1234ab');
   assert.equal(record.body.domain, DOMAIN);
   assert.equal(record.body.novel_type, 1);
-  assert.deepEqual(record.body.tags, ['テスト']);
+  assert.deepEqual(record.body.tags, ['テスト', '小説']);
   assert.equal(record.body.general_all_no, 1);
   assert.equal(record.body.use_subdirectory, false);
   console.log('PASS import creates the record and objects; unauthenticated / wrong-type / broken-zip are rejected');
@@ -506,7 +506,7 @@ try {
   assert.equal(exportedNovel.domain, DOMAIN);
   assert.equal(exportedNovel.ncode, 'n1234ab');
   assert.equal(exportedNovel.novel_type, 1);
-  assert.deepEqual(exportedNovel.tags, ['テスト']);
+  assert.deepEqual(exportedNovel.tags, ['テスト', '小説']);
   assert.equal(exportedNovel.subtitle, 'テスト用のあらすじ');
   assert.match(exportedNovel.last_update, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
   assert.equal(exportedNovel.general_lastup, undefined);

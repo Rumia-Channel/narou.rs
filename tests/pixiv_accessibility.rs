@@ -775,6 +775,8 @@ async fn comic_series_merges_episode_tags_without_duplicates() {
     let result = downloader.download_novel(COMIC).await.unwrap();
     assert_eq!(result.status, UpdateStatus::Ok);
     let record = novels.get(result.id.into()).await.unwrap().unwrap();
-    assert_eq!(record.tags, vec!["共通タグ", "タグ1", "タグ2", "タグ3"]);
+    // 漫画シリーズの ncode は `c` で始まるので、サイト定義の分類タグ
+    // (`漫画`) も付く。抽出した各話のタグは初出順に重複なく統合される。
+    assert_eq!(record.tags, vec!["共通タグ", "タグ1", "タグ2", "タグ3", "漫画"]);
     assert_saved_comic(&snapshot(store.as_ref()).await, 91, &[(1, 101), (2, 102), (3, 103)]);
 }

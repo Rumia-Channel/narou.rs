@@ -270,6 +270,17 @@ function applyWebConfig(config, themeGeneration) {
   if (config.performance_mode) State.performanceMode = config.performance_mode;
   State.debugMode = Boolean(config.debug_mode);
   setConcurrencyEnabled(Boolean(config.concurrency_enabled));
+  for (const [key, stateKey, id] of [
+    ['show_novel_attribute', 'showNovelAttribute', 'show-novel-attribute'],
+    ['show_manga_attribute', 'showMangaAttribute', 'show-manga-attribute'],
+  ]) {
+    const checkbox = document.getElementById(id);
+    if (typeof config[key] !== 'boolean' || checkbox?.disabled) continue;
+    State[stateKey] = config[key];
+    if (checkbox) checkbox.checked = config[key];
+  }
+  renderTagList();
+  renderNovelList();
   if (config.tag_sort_order) {
     State.tagSortOrder = config.tag_sort_order;
     syncTagSortOrderSelect();

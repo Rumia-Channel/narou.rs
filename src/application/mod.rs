@@ -20,6 +20,7 @@
 pub mod error;
 pub mod aliases;
 pub mod authors;
+pub mod attribute_tags;
 pub mod debug;
 pub mod download_targets;
 pub mod events;

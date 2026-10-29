@@ -843,9 +843,15 @@ export function updateEnableSelected() {
 }
 
 /* ===== Tags ===== */
+export function attributeTagVisible(tag) {
+  if (tag === '小説') return State.showNovelAttribute;
+  if (tag === '漫画') return State.showMangaAttribute;
+  return true;
+}
+
 
 function renderTags(tags) {
-  return tags.map(tag => {
+  return tags.filter(attributeTagVisible).map(tag => {
     const colorName = State.tagColors[tag] || 'default';
     const cls = TAG_COLOR_MAP[colorName] || 'tag-default';
     return `<span class="tag-label ${cls}" data-tag="${escAttr(tag)}">${esc(tag)}</span>`;
@@ -860,6 +866,7 @@ export function renderTagList() {
   canvas.textContent = '';
 
   for (const tag of State.tags) {
+    if (!attributeTagVisible(tag)) continue;
     const colorName = State.tagColors[tag] || 'default';
     const cls = TAG_COLOR_MAP[colorName] || 'tag-default';
     const span = document.createElement('span');

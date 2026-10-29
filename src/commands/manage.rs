@@ -137,6 +137,16 @@ enum TagOutput {
     Error(String),
 }
 
+fn attribute_visibility() -> (bool, bool) {
+    let settings = narou_rs::db::settings::load(narou_rs::setting_core::SettingScope::Local).unwrap_or_default();
+    let value = |name| settings.get(name).and_then(narou_rs::setting_core::setting_bool_value);
+    (value("tag.show-novel").unwrap_or(false), value("tag.show-manga").unwrap_or(true))
+}
+
+fn visible_tag(tag: &str, visibility: (bool, bool)) -> bool {
+    narou_rs::application::attribute_tags::is_visible(tag, visibility.0, visibility.1)
+}
+
 pub fn cmd_list(options: ListOptions) -> i32 {
     use narou_rs::db;
 
@@ -218,6 +228,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         }
     };
 
+    let visibility = attribute_visibility();
     let mut selected = Vec::new();
     let hidden = if options.show_hidden {
         narou_rs::hidden::HiddenState::default()
@@ -252,11 +263,15 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
             continue;
         }
 
-        let plain = decorate_line(record, options, frozen, &tag_colors, false);
-        if !matches_grep(&plain, &grep_words) {
+        if !grep_words.is_empty()
+            && !matches_grep(&decorate_line(record, options, frozen, &tag_colors, false), &grep_words)
+        {
             continue;
         }
-        selected.push((record.clone(), frozen, plain));
+        let mut displayed_record = record.clone();
+        displayed_record.tags.retain(|tag| visible_tag(tag, visibility));
+        let plain = decorate_line(&displayed_record, options, frozen, &tag_colors, false);
+        selected.push((displayed_record, frozen, plain));
     }
 
     if options.show_tags() {
@@ -312,6 +327,11 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             return 127;
         }
     };
+    if matches!(&mode, TagMode::Add(tags) | TagMode::Delete(tags) if tags.iter().any(|tag| narou_rs::application::attribute_tags::is_attribute_tag(tag))) {
+        log::report_error("属性タグは編集できません");
+        return 127;
+    }
+
 
     let inventory = match Inventory::with_default_root() {
         Ok(inventory) => inventory,
@@ -441,7 +461,7 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
                     outputs.push(TagOutput::Info(format!("{} からタグを外しました", title)));
                 }
                 TagMode::Clear => {
-                    updated.tags.clear();
+                    updated.tags.retain(|tag| narou_rs::application::attribute_tags::is_attribute_tag(tag));
                     outputs.push(TagOutput::Info(format!(
                         "{} のタグをすべて外しました",
                         title
@@ -489,13 +509,14 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         };
     }
 
+    let visibility = attribute_visibility();
     for output in outputs {
         match output {
             TagOutput::Info(message) => println!("{}", message),
-            TagOutput::Current(tags) => println!(
-                "現在のタグは {} です",
-                render_tags(&tags, &tag_colors, " ", true)
-            ),
+            TagOutput::Current(tags) => {
+                let visible: Vec<_> = tags.into_iter().filter(|tag| visible_tag(tag, visibility)).collect();
+                println!("現在のタグは {} です", render_tags(&visible, &tag_colors, " ", true));
+            }
             TagOutput::Error(message) => log::report_error(&message),
         }
     }
@@ -811,6 +832,7 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
             return 127;
         }
     };
+    let visibility = attribute_visibility();
 
     let inventory = match Inventory::with_default_root() {
         Ok(inventory) => inventory,
@@ -838,6 +860,7 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
         "{}",
         tag_list
             .iter()
+            .filter(|(tag, _)| visible_tag(tag, visibility))
             .map(|(tag, count)| render_tag_count(tag, *count, tag_colors))
             .collect::<Vec<_>>()
             .join(" ")

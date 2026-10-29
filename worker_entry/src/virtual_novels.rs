@@ -157,6 +157,9 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
             "既に別の仮想小説に属している作品があります".into(),
         ));
     }
+    if body.tags.iter().any(|tag| narou_rs::application::attribute_tags::is_attribute_tag(tag.trim())) {
+        return Err(NarouError::InvalidTarget("属性タグは編集できません".into()));
+    }
 
     let reservation = runtime.novels.allocate_id().await?;
     let id = reservation.id().0;
@@ -166,11 +169,12 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         .iter()
         .map(|tag| tag.trim().to_string())
         .filter(|tag| !tag.is_empty())
-        .chain(summary.tags)
+        .chain(summary.tags.into_iter().filter(|tag| !narou_rs::application::attribute_tags::is_attribute_tag(tag)))
         .collect();
     tags.push(core::tag(id));
     tags.sort();
     tags.dedup();
+    narou_rs::application::attribute_tags::set_attribute_tag(&mut tags, narou_rs::application::attribute_tags::NOVEL_TAG);
     let limit = load_length_limit("folder-length-limit", Some(50));
     let file_title = sanitize_filename_with_limit(&title, limit);
     let file_title = if file_title.is_empty() {
@@ -291,7 +295,7 @@ async fn refresh_record(runtime: &WorkerRuntime, id: i64, summary: &MemberSummar
         .iter()
         .filter(|tag| !core::is_internal_tag(tag))
         .cloned()
-        .chain(summary.tags.iter().cloned())
+        .chain(summary.tags.iter().filter(|tag| !narou_rs::application::attribute_tags::is_attribute_tag(tag)).cloned())
         .collect();
     tags.push(core::tag(id));
     tags.sort();

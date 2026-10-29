@@ -12,7 +12,7 @@ import { openFeatureTour } from './feature_tour.js';
 import { confirmDialog, formDialog, selectDialog, createSuggestionList } from './dialog.js';
 import { resetConsoleSize } from './console_size.js';
 import {
-  renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed,
+  renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed, attributeTagVisible,
   selectVisible, selectAll, clearSelection, getSelectedIdsInDisplayOrder,
   pruneSelectedIdsToCurrentList, updateEnableSelected,
   syncViewChecks, showNotification,
@@ -54,6 +54,7 @@ const hiddenSuggestionFields = {
 };
 
 const VIRTUAL_NCODE_PATTERN = /^vs_\d+$/;
+const isAttributeTag = (tag) => tag === '小説' || tag === '漫画';
 
 /**
  * `vs_<ID>` 形式の ncode か。一覧の行がバーチャル小説かどうかの判定に使う。
@@ -81,6 +82,7 @@ export function uniqueValues(novels, key) {
   const values = (Array.isArray(novels) ? novels : [])
     .map((novel) => novel?.[key])
     .filter((value) => typeof value === 'string' && value.trim() !== '');
+
   return [...new Set(values)].sort((a, b) => a.localeCompare(b, 'ja'));
 }
 
@@ -264,6 +266,7 @@ export function bindActions() {
     clearHiddenColsPreference();
     applyColumnVisibility();
     syncViewChecks();
+    renderTagList();
     renderNovelList();
     showNotification('表示設定をリセットしました', 'info');
   });
@@ -283,6 +286,34 @@ export function bindActions() {
       await openTagEditor();
     });
   });
+  for (const [id, stateKey, settingKey] of [
+    ['show-novel-attribute', 'showNovelAttribute', 'tag.show-novel'],
+    ['show-manga-attribute', 'showMangaAttribute', 'tag.show-manga'],
+  ]) {
+    const checkbox = document.getElementById(id);
+    if (!checkbox) continue;
+    checkbox.checked = State[stateKey];
+    checkbox.addEventListener('click', event => event.stopPropagation());
+    checkbox.addEventListener('change', async () => {
+      const previous = State[stateKey];
+      checkbox.disabled = true;
+      try {
+        const result = await postJson('/api/global_setting', {
+          settings: { [settingKey]: checkbox.checked },
+        });
+        assertApiSuccess(result, '属性タグの表示設定を保存できませんでした');
+        State[stateKey] = checkbox.checked;
+      } catch (error) {
+        State[stateKey] = previous;
+        checkbox.checked = previous;
+        showNotification(error.message || '属性タグの表示設定を保存できませんでした', 'error');
+      } finally {
+        checkbox.disabled = false;
+        renderTagList();
+        renderNovelList();
+      }
+    });
+  }
 
   // --- Tool menu ---
   on('action-tool-notepad', () => { window.location.href = '/notepad'; });
@@ -1599,6 +1630,10 @@ async function addTagFromInput() {
   const submitted = input.value;
   const tags = splitTagInput(submitted);
   if (tags.length === 0) return;
+  if (tags.some(isAttributeTag)) {
+    showNotification('属性タグは編集できません', 'warning');
+    return;
+  }
 
   const idsJson = El.tagEditModal?.dataset.ids;
   const ids = idsJson ? JSON.parse(idsJson) : [...State.selectedIds];
@@ -1646,7 +1681,7 @@ function renderTagSuggestions() {
 
   const currentTags = getCurrentEditorTags();
   const candidates = State.tags
-    .filter(tag => !currentTags.has(tag))
+    .filter(tag => !currentTags.has(tag) && !isAttributeTag(tag))
     .map(tag => ({ tag, score: tagSuggestionScore(tag, query) }))
     .filter(item => item.score >= 0)
     .sort((a, b) => a.score - b.score || a.tag.localeCompare(b.tag, 'ja'))
@@ -1748,7 +1783,7 @@ async function refreshTagEditor(ids) {
   });
   if (generation !== tagReadGeneration || !isCurrentTagEditor(ids, editorGeneration)) return;
   const selectedTagInfo = Array.isArray(taginfo)
-    ? taginfo.filter(info => Number(info?.count || 0) > 0)
+    ? taginfo.filter(info => Number(info?.count || 0) > 0 && attributeTagVisible(info.tag))
     : [];
   renderTagEditorSummary(selectionCount);
   renderTagEditorTags(ids, selectedTagInfo);
@@ -1812,6 +1847,12 @@ function renderTagEditorTags(ids, taginfo) {
       count.className = 'tag-edit-count';
       count.textContent = ` ${presentCount}/${selectionCount}`;
       label.appendChild(count);
+    }
+    if (isAttributeTag(info.tag)) {
+      label.title = '属性タグは編集できません';
+      chip.appendChild(label);
+      container.appendChild(chip);
+      return;
     }
 
     const removeBtn = document.createElement('button');
@@ -1922,6 +1963,7 @@ function renderFavoriteTags() {
     addBtn.className = 'tag-favorite-add';
     addBtn.textContent = '追加';
     addBtn.title = `「${tag}」をタグに追加する`;
+    addBtn.disabled = isAttributeTag(tag);
     addBtn.addEventListener('click', async (event) => {
       event.stopPropagation();
       await addFavoriteTagToSelection(tag);

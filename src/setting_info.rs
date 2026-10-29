@@ -45,6 +45,8 @@ pub fn default_local_setting_value(name: &str) -> Option<serde_yaml::Value> {
         }
         "time-zone" => Some(serde_yaml::Value::String("Asia/Tokyo".to_string())),
         "user-agent" => Some(serde_yaml::Value::String("auto".to_string())),
+        "tag.show-novel" => Some(serde_yaml::Value::Bool(false)),
+        "tag.show-manga" => Some(serde_yaml::Value::Bool(true)),
         "queue.max-retries" => Some(serde_yaml::Value::Number(serde_yaml::Number::from(3))),
         "queue.retry-backoff" => {
             Some(serde_yaml::Value::String("1m,5m,15m".to_string()))
@@ -114,6 +116,8 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "convert.keep-txt"
         | "sqlite.mirror-files"
         | "auto-add-tags"
+        | "tag.show-novel"
+        | "tag.show-manga"
         | "s3.asset-backend"
         | "s3.endpoint"
         | "s3.bucket"
@@ -998,6 +1002,14 @@ pub fn setting_variables() -> SettingVariables {
                 "パフォーマンスモードを設定。autoの場合は小説数2000件以上で自動的に有効になります",
                 vec!["auto", "on", "off"],
             ),
+        ),
+        (
+            "tag.show-novel",
+            vis(VarType::Boolean, "属性タグ「小説」を CLI と WEB UI に表示する (既定 false)"),
+        ),
+        (
+            "tag.show-manga",
+            vis(VarType::Boolean, "属性タグ「漫画」を CLI と WEB UI に表示する (既定 true)"),
         ),
         (
             "webui.new-tag-color",

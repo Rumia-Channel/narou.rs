@@ -110,6 +110,8 @@ async fn webui_config(req: &Request, env: &Env) -> worker::Result<Response> {
         "webui.performance-mode",
         "webui.table.reload-timing",
         "webui.debug-mode",
+        "tag.show-novel",
+        "tag.show-manga",
         "concurrency",
     ];
     let loaded: Vec<Option<serde_yaml::Value>> = settings
@@ -162,6 +164,8 @@ async fn webui_config(req: &Request, env: &Env) -> worker::Result<Response> {
         "performance_mode": performance_mode,
         "reload_timing": reload_timing,
         "debug_mode": debug_mode,
+        "show_novel_attribute": find("tag.show-novel").and_then(|value| narou_rs::setting_core::setting_bool_value(&value)).unwrap_or(false),
+        "show_manga_attribute": find("tag.show-manga").and_then(|value| narou_rs::setting_core::setting_bool_value(&value)).unwrap_or(true),
         "ws_port": port,
         "port": port,
         "concurrency_enabled": concurrency_enabled,

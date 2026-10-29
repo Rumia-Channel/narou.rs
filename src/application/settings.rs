@@ -187,6 +187,8 @@ pub const LIVE_WEBUI_CONFIG_NAMES: &[&str] = &[
     "webui.table.reload-timing",
     "webui.performance-mode",
     "webui.new-tag-color",
+    "tag.show-novel",
+    "tag.show-manga",
     "webui.debug-mode",
     "concurrency",
 ];

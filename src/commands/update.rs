@@ -2013,7 +2013,7 @@ mod tests {
                     replacement.tags = vec!["replacement".into()];
                     repository.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(replacement)]).unwrap();
                 }).unwrap();
-                assert_eq!(record.tags, vec!["replacement"]);
+                assert_eq!(record.tags, vec!["replacement", "小説"]);
                 assert!(!record.extra_fields.contains_key("concurrent_unknown"));
             }
         }

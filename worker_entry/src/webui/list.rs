@@ -83,6 +83,10 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
     if total_query_bytes > MAX_WEB_SEARCH_BYTES {
         return json_error(400, "invalid_request", Some("search query is too long"));
     }
+    if let Err(error) = super::metadata::initialize_attributes(env).await {
+        worker::console_log!("attribute migration failed: {error}");
+        return json_error(503, "service_unavailable", None);
+    }
 
     let search = combine_search_terms(params.filter, params.search_value);
     let sort_column = sort_column_from_index(params.order_column);

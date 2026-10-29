@@ -145,6 +145,8 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
         "webui.table.reload-timing",
         "webui.debug-mode",
         "webui.tag-sort-order",
+        "tag.show-novel",
+        "tag.show-manga",
         "concurrency",
     ];
     let loaded: Vec<Option<serde_yaml::Value>> = state
@@ -193,6 +195,8 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
         "reload_timing": reload_timing,
         "debug_mode": debug_mode,
         "tag_sort_order": tag_sort_order.setting_value(),
+        "show_novel_attribute": find("tag.show-novel").and_then(|value| crate::setting_core::setting_bool_value(&value)).unwrap_or(false),
+        "show_manga_attribute": find("tag.show-manga").and_then(|value| crate::setting_core::setting_bool_value(&value)).unwrap_or(true),
         "ws_port": state.ws_port,
         "port": state.port,
         "concurrency_enabled": concurrency_enabled,

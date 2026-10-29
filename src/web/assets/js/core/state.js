@@ -81,6 +81,8 @@ export const State = {
   viewFrozen: lsBool('view-frozen', true),
   viewNonfrozen: lsBool('view-nonfrozen', true),
   showHidden: lsBool('show-hidden', false),
+  showNovelAttribute: false,
+  showMangaAttribute: true,
   wideMode: lsBool('wide-mode', false),
   settingNewTab: lsBool('setting-new-tab', false),
   buttonsTop: lsBool('buttons-top', true),

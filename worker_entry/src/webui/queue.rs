@@ -123,6 +123,10 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
+    if let Err(error) = metadata::initialize_attributes(&env).await {
+        console_log!("attribute migration failed: {error}");
+        return Response::error("Service unavailable", 503);
+    }
     let started_ms = js_sys::Date::now();
     let services = match MetadataServices::new(&env) {
         Ok(services) => services,
