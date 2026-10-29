@@ -28,6 +28,9 @@ jobs:
   native:
     name: Native check and tests
     runs-on: ubuntu-latest
+    # 通常は 6 分ほど。ランナーが異常なとき test ステップが数時間止まる
+    # ことがあるので、待ち時間の上限で打ち切る。
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -60,7 +63,9 @@ jobs:
         run: cargo test -p narou_rs --lib converter_reads_sqlite_backed_default_and_force_settings
       - name: Regression - latest list ordering (issue 21)
         run: cargo test -p narou_rs --bin narou_rs list_latest_sorts_newest_first
-      - run: cargo test --workspace --all-targets
+      # 1 つのテストバイナリが失敗しても残りを走らせる。どのバイナリで
+      # 止まったかをログから追えるようにするため。
+      - run: cargo test --workspace --all-targets --no-fail-fast
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Documentation warnings
         run: cargo doc --workspace --all-features --no-deps
@@ -72,6 +77,8 @@ jobs:
   native-gpl:
     name: Native check (lite/GPL)
     runs-on: ubuntu-latest
+    # 通常は 4 分ほど。native ジョブと同じく待ち時間の上限を設ける。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
