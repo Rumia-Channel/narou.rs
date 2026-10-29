@@ -354,8 +354,8 @@ impl Database {
                 // 作品データの保存に失敗を注入する (テスト用 ✓)。
                 let saved = (|| -> Result<()> {
                     crate::native::tag_sequence::notify_record_save_hook()?;
-                    self.inventory
-                        .save_raw(DATABASE_NAME, InventoryScope::Local, &content)?;
+                    crate::db::inventory::atomic_write_locked(&yaml_path, &content)?;
+                    self.inventory.unload(DATABASE_NAME);
                     if !using_sqlite {
                         self.index.flush(&self.inventory)?;
                     }
