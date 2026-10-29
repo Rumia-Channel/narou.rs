@@ -1606,8 +1606,16 @@ li.enable-selected.disabled a {
 }
 .hidden-add-row {
   display: flex;
+  align-items: flex-start;
   gap: 0.5em;
   margin: 0 0 0.5em;
+}
+.hidden-input {
+  flex: 1 1 auto;
+  min-width: var(--hidden-input-min-width);
+}
+.hidden-input input {
+  width: var(--hidden-input-width);
 }
 .hidden-add-row input {
   flex: 1 1 auto;

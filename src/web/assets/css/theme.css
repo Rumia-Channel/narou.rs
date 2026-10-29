@@ -21,6 +21,8 @@
   --settings-hidden-control-size: 0.0625rem;
   --settings-hidden-control-clip: 50%;
   --control-focus-width: 0.125rem;
+  --hidden-input-width: 100%;
+  --hidden-input-min-width: 0;
 
   /* Buttons */
   --btn-primary-bg: #2fa4e7;

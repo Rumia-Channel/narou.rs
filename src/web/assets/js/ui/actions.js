@@ -9,7 +9,7 @@ import { createNotepadEditor } from '../core/notepad.js';
 import { persistSortState, postSortedJson } from '../core/sort_state.js';
 import { toggleLanguage, t } from './i18n.js';
 import { openFeatureTour } from './feature_tour.js';
-import { confirmDialog, formDialog, selectDialog } from './dialog.js';
+import { confirmDialog, formDialog, selectDialog, createSuggestionList } from './dialog.js';
 import { resetConsoleSize } from './console_size.js';
 import {
   renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed,
@@ -47,6 +47,11 @@ let themeSaveTail = Promise.resolve();
 let acknowledgedTheme = null;
 let themeReadGeneration = 0;
 let themePendingSaves = 0;
+const hiddenSuggestionFields = {
+  tags: { suggestions: [] },
+  authors: { suggestions: [] },
+  sites: { suggestions: [] },
+};
 
 const VIRTUAL_NCODE_PATTERN = /^vs_\d+$/;
 
@@ -77,6 +82,15 @@ export function uniqueValues(novels, key) {
     .map((novel) => novel?.[key])
     .filter((value) => typeof value === 'string' && value.trim() !== '');
   return [...new Set(values)].sort((a, b) => a.localeCompare(b, 'ja'));
+}
+
+export function hiddenSuggestions(novels) {
+  return {
+    tags: [...new Set(novels.flatMap(novel => Array.isArray(novel.tags) ? novel.tags : [])
+      .filter(tag => typeof tag === 'string' && tag.trim() && !isVirtualNcode(tag)))].sort((a, b) => a.localeCompare(b, 'ja')),
+    authors: uniqueValues(novels, 'author'),
+    sites: uniqueValues(novels, 'sitename'),
+  };
 }
 
 /**
@@ -537,6 +551,10 @@ export function bindActions() {
       showNotification(error.message || '削除に失敗しました', 'error');
     }
   });
+  for (const [kind, id] of Object.entries({ tags: 'hidden-tag-input', authors: 'hidden-author-input', sites: 'hidden-site-input' })) {
+    const input = document.getElementById(id);
+    if (input && !input.appDialogSuggestions) input.parentElement.appendChild(createSuggestionList(hiddenSuggestionFields[kind], input));
+  }
   on('hidden-close', () => closeModal(document.getElementById('hidden-modal')));
   on('virtual-order-close', () => closeModal(document.getElementById('virtual-order-modal')));
   on('virtual-order-cancel', () => closeModal(document.getElementById('virtual-order-modal')));
@@ -2263,7 +2281,27 @@ async function saveVirtualOrder() {
 async function openHiddenSettings() {  const modal = document.getElementById('hidden-modal');
   if (!modal) return;
   modal.classList.remove('hide');
-  await refreshHiddenSettings();
+  await Promise.all([refreshHiddenSettings(), refreshHiddenSuggestions()]);
+}
+
+async function refreshHiddenSuggestions() {
+  let novels;
+  try {
+    const result = await fetchJson('/api/list?all=true&show_hidden=true');
+    if (!Array.isArray(result?.data)) throw new Error('一覧の形式が不正です');
+    novels = result.data;
+  } catch {
+    showNotification('入力候補の取得に失敗しました', 'error');
+    return;
+  }
+  const suggestions = hiddenSuggestions(novels);
+  for (const kind of Object.keys(hiddenSuggestionFields)) {
+    hiddenSuggestionFields[kind].suggestions = suggestions[kind];
+  }
+  const focused = document.activeElement;
+  if (focused && ['hidden-tag-input', 'hidden-author-input', 'hidden-site-input'].includes(focused.id)) {
+    focused.dispatchEvent(new Event('input', { bubbles: true }));
+  }
 }
 
 async function refreshHiddenSettings() {

@@ -228,7 +228,7 @@ function buildFields(container, fields) {
  * 操作もブラウザ依存だったため、同じスタイルの一覧を自前で作る。↓ / ↑ で候補を
  * 動かし、Enter またはクリックで入力欄へ入れる。
  */
-function createSuggestionList(field, input) {
+export function createSuggestionList(field, input) {
   const list = createElement('div', 'app-dialog-suggestions hide');
   const state = { items: [], activeIndex: -1, open: false };
   input.appDialogSuggestions = state;
