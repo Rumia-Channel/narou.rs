@@ -160,3 +160,62 @@ fn retagging_keeps_the_registration_order() {
         ]
     );
 }
+
+/// 連番表の保存に失敗したら、作品データだけを確定させてはならない。
+///
+/// 連番表の更新は作品と同じ直列化境界の中で行う。別々にすると、連番表の
+/// 書き込みに失敗したときに作品だけが残ってしまう。
+#[test]
+fn a_failed_sequence_write_does_not_commit_the_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let narou_dir = root.join(".narou");
+    std::fs::create_dir_all(&narou_dir).unwrap();
+    // 連番表のファイルを壊して、連番表の読み書きが失敗する状態にする。
+    std::fs::create_dir(narou_dir.join("tag_sequence.yaml")).unwrap();
+
+    let mut db = Database::with_root(root.to_path_buf()).unwrap();
+    let error = db
+        .update_records(|mut current| {
+            current.insert(1, record(1, &["written"]));
+            Ok((current, ()))
+        })
+        .expect_err("連番表の保存に失敗したときは書き込みも失敗する");
+    assert!(
+        !error.to_string().is_empty(),
+        "失敗の理由が分かること"
+    );
+
+    // 作品データは確定していない。
+    let raw = std::fs::read_to_string(narou_dir.join("database.yaml")).unwrap_or_default();
+    assert!(
+        !raw.contains("written"),
+        "作品だけが確定してよいのは連番表の更新と同じ境界の中だけ"
+    );
+}
+
+/// `Database::save()` の直接経路でも、連番表の保存に失敗したら作品を残さない。
+///
+/// `save()` は `update_records()` を通らない別経路なので、両方 individually
+/// 確認する。
+#[test]
+fn a_failed_sequence_write_does_not_commit_the_records_on_save() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let narou_dir = root.join(".narou");
+    std::fs::create_dir_all(&narou_dir).unwrap();
+    // 連番表のファイルを壊して、連番表の読み書きが失敗する状態にする。
+    std::fs::create_dir(narou_dir.join("tag_sequence.yaml")).unwrap();
+
+    let mut db = Database::with_root(root.to_path_buf()).unwrap();
+    db.insert(record(1, &["written"]));
+    db.save()
+        .expect_err("連番表の保存に失敗したときは save() も失敗する");
+
+    // 作品データは確定していない。
+    let raw = std::fs::read_to_string(narou_dir.join("database.yaml")).unwrap_or_default();
+    assert!(
+        !raw.contains("written"),
+        "作品だけが確定してよいのは連番表の更新と同じ境界の中だけ"
+    );
+}

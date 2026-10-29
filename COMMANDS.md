@@ -671,6 +671,7 @@ narou setting name         # 読み取り
 - タグごとにグローバルな連番を振り、在庫の `tag_sequence` キー (Native は `.narou/tag_sequence.yaml` / SQLite・Worker は `app_state('inv','tag_sequence')`) へ保存する
 - 既存ライブラリには連番が無いので、最初の書き込みで最小小説 ID → タグ名の順にバックフィルし、以後の新しいタグは登録順の末尾に足す
 - 共有モデルは `src/application/tag_sequence.rs`、native のストアは `src/native/tag_sequence.rs`、Worker の D1 ストアは `worker_entry/src/tag_sequence.rs`。native の書き込み時の更新は `src/db/database.rs`、Worker は `worker_entry/src/d1_repository.rs` で行う
+- 連番表の更新は作品と同じ直列化境界の中で行う (Native は同じトランザクション / ファイルロック、Worker は同じ D1 batch)。別の境界で更新すると「作品を保存した順」と「連番を振った順」がずれるため、分けては行わない
 
 ---
 

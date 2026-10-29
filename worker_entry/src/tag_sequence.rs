@@ -5,11 +5,16 @@
 //! 内容を YAML でも保存する。
 //!
 //! native の `src/native/tag_sequence.rs` と同じ形式・規則を使う。
+//!
+//! 連番表の更新は **小説の保存と同じ D1 batch** の中に入れる。batch は
+//! 1 トランザクションなので、作品と順序が同時に確定し、片方だけ確定した
+//! 状態にならない。
 
 use narou_rs::application::tag_sequence::{LibraryTags, TagSequence};
 use narou_rs::error::{NarouError, Result};
 use serde::Deserialize;
 use worker::wasm_bindgen::JsValue;
+use worker::D1PreparedStatement;
 
 use crate::db_handle::DbHandle;
 
@@ -22,6 +27,17 @@ WHERE ?3 IS NULL OR EXISTS(SELECT 1 FROM app_state WHERE scope='inv' AND key='ta
 ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,value_yaml=excluded.value_yaml
 WHERE app_state.value_json IS ?3
 RETURNING key
+"#;
+
+/// CAS が外れたときに batch を中断する文。
+///
+/// 連番表が更新されていない (CAS 不一致) 場合に、同じ行へ二重に挿入して
+/// 一意制約違反を起こす。batch は 1 トランザクションなので、作品も
+/// ロールバックされる (作品だけ確定した状態を作らない)。
+const GUARD_SQL: &str = r#"
+INSERT INTO app_state(scope,key,value_json,value_yaml)
+SELECT 'inv','tag_sequence',?1,?2
+WHERE (SELECT value_json FROM app_state WHERE scope='inv' AND key='tag_sequence') IS NOT ?3
 "#;
 
 /// ライブラリに存在するタグと、そのタグが現れる最小小説 ID。
@@ -40,11 +56,6 @@ struct Row {
 }
 
 #[derive(Deserialize)]
-struct KeyRow {
-    key: String,
-}
-
-#[derive(Deserialize)]
 struct TagRow {
     tag: String,
     novel_id: i64,
@@ -54,17 +65,42 @@ fn db_error(value: impl std::fmt::Display) -> NarouError {
     NarouError::Platform(value.to_string())
 }
 
+/// 読み取った連番表と、CAS の比較に使う生の値。
+pub(crate) struct Snapshot {
+    /// 復元した連番表。
+    pub sequence: TagSequence,
+    /// CAS で比較する `value_json` の値。行が無ければ `None`。
+    pub raw_json: Option<String>,
+}
+
 /// タグの登録順を読む。未保存なら空。
 ///
 /// native は `value_yaml` に YAML を書き (`value_json` は `{}`)、Worker は
 /// `value_json` に JSON を書く。どちらの形式でも復元できるようにする。
-pub(crate) async fn read(db: &DbHandle) -> Result<TagSequence> {
+pub(crate) async fn read_snapshot(db: &DbHandle) -> Result<Snapshot> {
     let row = db
         .prepare(SELECT_SQL)
         .first::<Row>(None)
         .await
         .map_err(db_error)?;
-    Ok(row.as_ref().map(decode_row).unwrap_or_default())
+    Ok(match row {
+        Some(row) => Snapshot {
+            sequence: decode_row(&row),
+            raw_json: row.value_json,
+        },
+        None => Snapshot {
+            sequence: TagSequence::default(),
+            raw_json: None,
+        },
+    })
+}
+
+/// D1 ハンドルからタグの登録順を読む。
+///
+/// タグ一覧の表示順 (登録順) で使う。読み取り専用の経路なので UI セッションの
+/// ハンドルでよい。
+pub(crate) async fn load_with_db(db: &DbHandle) -> Result<TagSequence> {
+    Ok(read_snapshot(db).await?.sequence)
 }
 
 /// 保存された行から登録順を復元する。
@@ -81,14 +117,6 @@ fn decode_row(row: &Row) -> TagSequence {
         return sequence;
     }
     TagSequence::default()
-}
-
-/// D1 ハンドルからタグの登録順を読む。
-///
-/// タグ一覧の表示順 (登録順) で使う。読み取り専用の経路なので UI セッションの
-/// ハンドルでよい。
-pub(crate) async fn load_with_db(db: &DbHandle) -> Result<TagSequence> {
-    read(db).await
 }
 
 /// ライブラリに存在するタグ (最小小説 ID 付き) を読む。
@@ -108,57 +136,45 @@ pub(crate) async fn library_tags(db: &DbHandle) -> Result<LibraryTags> {
         .collect())
 }
 
-/// スナップショット CAS で全置換する。競合したら `false`。
-async fn write_if_unchanged(
+/// 連番表を CAS 付きで保存する文を作る。
+pub(crate) fn upsert_statement(
     db: &DbHandle,
     expected: Option<&str>,
     state: &TagSequence,
-) -> Result<bool> {
+) -> Result<D1PreparedStatement> {
     let encoded = serde_json::to_string(state).map_err(db_error)?;
     let yaml = serde_yaml::to_string(state)?;
     let previous = match expected {
         Some(value) => value.to_string().into(),
         None => JsValue::NULL,
     };
-    let rows = db
-        .prepare(SAVE_SQL)
+    db.prepare(SAVE_SQL)
         .bind(&[encoded.into(), yaml.into(), previous])
-        .map_err(db_error)?
-        .all()
-        .await
-        .map_err(db_error)?
-        .results::<KeyRow>()
-        .map_err(db_error)?;
-    Ok(rows.iter().any(|row| row.key == "tag_sequence"))
+        .map_err(db_error)
 }
 
-/// 小説の書き込みでタグの登録順を進める。
-///
-/// `before` は書き込み前のライブラリのタグ (登録順が未初期化のときの
-/// バックフィルに使う)、`written` は書き込み対象の小説に付いたタグ。
-/// 同時更新はスナップショット CAS で検出して再試行する。
-pub(crate) async fn sync_with_db(
+/// CAS が外れたときに batch を中断する文を作る。
+pub(crate) fn guard_statement(
     db: &DbHandle,
+    state: &TagSequence,
+) -> Result<D1PreparedStatement> {
+    let encoded = serde_json::to_string(state).map_err(db_error)?;
+    let yaml = serde_yaml::to_string(state)?;
+    db.prepare(GUARD_SQL)
+        .bind(&[encoded.clone().into(), yaml.into(), encoded.into()])
+        .map_err(db_error)
+}
+
+/// 連番表を進める (次の連番表を返す ✓)。
+///
+/// `before` は書き込み前のライブラリのタグ (連番表が未初期化のときの
+/// バックフィルに使う)、`written` は書き込み対象の小説に付いたタグ。
+pub(crate) fn advance(
+    snapshot: &Snapshot,
     before: Option<&LibraryTags>,
     written: &[&str],
-) -> Result<TagSequence> {
-    for _ in 0..8 {
-        let row = db
-            .prepare(SELECT_SQL)
-            .first::<Row>(None)
-            .await
-            .map_err(db_error)?;
-        let current = row.as_ref().map(decode_row).unwrap_or_default();
-        let mut next = current.clone();
-        if !next.advance(before, written.iter().copied()) {
-            return Ok(current);
-        }
-        // CAS は行の生のスナップショットで比較する (native も value_json が
-        // `{}` なので、復元した値ではなく生の値を比較する)。
-        let expected = row.as_ref().and_then(|row| row.value_json.clone());
-        if write_if_unchanged(db, expected.as_deref(), &next).await? {
-            return Ok(next);
-        }
-    }
-    Err(db_error("タグの登録順が同時に更新されています。再試行してください"))
+) -> TagSequence {
+    let mut next = snapshot.sequence.clone();
+    next.advance(before, written.iter().copied());
+    next
 }

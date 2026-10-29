@@ -20,11 +20,6 @@ pub struct Database {
     inventory: Inventory,
     archive_root: PathBuf,
     id_allocator: crate::platform::id_allocator::IdAllocator,
-    /// タグの登録順 (どのタグが先にライブラリへ入ったか) のキャッシュ。
-    /// `None` は未読み込み。書き込みごとに在庫を読み直さないために持つ。
-    tag_sequence: std::cell::RefCell<
-        Option<crate::application::tag_sequence::TagSequence>,
-    >,
     /// SQLite backend (P2). `None` when `NAROU_RS_LEGACY_YAML` is set or the
     /// database directory cannot host `db.sqlite`; then the legacy YAML path
     /// below runs unchanged.
@@ -147,7 +142,6 @@ impl Database {
             inventory,
             archive_root,
             id_allocator: crate::platform::id_allocator::IdAllocator::default(),
-            tag_sequence: std::cell::RefCell::new(None),
             #[cfg(feature = "native-runtime")]
             sqlite,
         };
@@ -328,8 +322,6 @@ impl Database {
                 Ok((current, ()))
             });
         }
-        // 書き込み前のライブラリ (バックフィルの材料) を読む。
-        let before_library = self.persisted_library_tags()?;
         let content = serde_yaml::to_string(
             &self
                 .data
@@ -341,37 +333,43 @@ impl Database {
                 })
                 .collect::<BTreeMap<_, _>>(),
         )?;
-        self.inventory
-            .save_raw(DATABASE_NAME, InventoryScope::Local, &content)?;
-        if !self.using_sqlite() {
-            self.index.flush(&self.inventory)?;
-        }
-        // タグの登録順は書き込み後に進める (記録が確定してから)。
         let written = tags_of_data(&self.data);
-        self.sync_tag_sequence(before_library.as_ref(), &written)?;
-        Ok(())
-    }
-
-    /// 保存済みのライブラリのタグを読む。
-    ///
-    /// バックフィル (既存タグの登録順) の材料にする。読めなければ `None`。
-    fn persisted_library_tags(
-        &self,
-    ) -> Result<Option<crate::application::tag_sequence::LibraryTags>> {
-        let raw = self.inventory.load_raw(DATABASE_NAME, InventoryScope::Local)?;
-        if raw.trim().is_empty() {
-            return Ok(None);
-        }
-        let records: BTreeMap<i64, NovelRecord> = match serde_yaml::from_str(&raw) {
-            Ok(records) => records,
-            Err(_) => return Ok(None),
-        };
-        Ok(Some(crate::application::tag_sequence::library_tags(
-            records
-                .iter()
-                .map(|(id, record)| (*id, record.tags.as_slice())),
-            |tag| !crate::virtual_novel::is_internal_tag(tag),
-        )))
+        let using_sqlite = self.using_sqlite();
+        let sequence_path = self.inventory.inventory_path("tag_sequence", InventoryScope::Local);
+        let yaml_path = self.inventory.inventory_path(DATABASE_NAME, InventoryScope::Local);
+        // 作品と連番表を同じ直列化境界の中で確定する ✓
+        crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
+            crate::db::inventory::with_exclusive_file_lock(&yaml_path, || {
+                // 事前状態は両方のロックを取ったあとに読む (ロックを取った前の
+                // 状態を使うと、並行した書き込みと食い違う ✗)。
+                let before_library = persisted_library_tags(&self.inventory)?;
+                // 連番表を先に確定する。失敗したら作品を書かない (作品だけ
+                // 確定した状態を作らない ✓)。
+                let previous = write_tag_sequence_file(
+                    &self.inventory,
+                    &sequence_path,
+                    before_library.as_ref(),
+                    &written,
+                )?;
+                // 作品データの保存に失敗を注入する (テスト用 ✓)。
+                let saved = (|| -> Result<()> {
+                    crate::native::tag_sequence::notify_record_save_hook()?;
+                    self.inventory
+                        .save_raw(DATABASE_NAME, InventoryScope::Local, &content)?;
+                    if !using_sqlite {
+                        self.index.flush(&self.inventory)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = saved {
+                    // 作品データが確定しなかったなら、連番表も元に戻す (タグ
+                    // だけ登録された状態を作らない ✓)。
+                    restore_tag_sequence_file(&self.inventory, &sequence_path, &previous)?;
+                    return Err(error);
+                }
+                Ok(())
+            })
+        })
     }
 
     pub fn update_records<T, F>(&mut self, update: F) -> Result<T>
@@ -384,6 +382,9 @@ impl Database {
                 "SQLite state is unavailable during record mutation".into(),
             ))?;
             let yaml_path = self.inventory.inventory_path(DATABASE_NAME, InventoryScope::Local);
+            // 連番表のファイルロックを先に取り、作品との直列化順序を揃える
+            // (他の管理状態のロックは連番表 → database.yaml の順)。
+            let sequence_path = self.inventory.inventory_path("tag_sequence", InventoryScope::Local);
             // 書き込み前のライブラリ (バックフィルの材料) を作る。
             let before_library: std::cell::RefCell<
                 Option<crate::application::tag_sequence::LibraryTags>,
@@ -416,6 +417,32 @@ impl Database {
                     let (mut updated, result) = update(current)?;
                     for (&id, record) in &mut updated { record.id = id; }
                     crate::native::sqlite::bulk::replace_records_conn(&tx, &updated)?;
+                    // 連番表を作品と同じトランザクションで確定する。別の
+                    // トランザクションにすると「作品を保存した順」と「連番を
+                    // 振った順」がずれる。
+                    let written = tags_of_records(&updated);
+                    // 互換モードではファイルが正なので、ファイルから読む。
+                    let current_sequence = if compat {
+                        crate::db::inventory::read_optional_yaml_file(&sequence_path)?
+                    } else {
+                        state
+                            .read_state_row_conn(&tx, "inv", "tag_sequence")?
+                            .unwrap_or_default()
+                    };
+                    let (content, changed) = crate::native::tag_sequence::advance_content(
+                        &current_sequence,
+                        before_library.borrow().as_ref(),
+                        &written,
+                    )?;
+                    if changed {
+                        state.write_state_row_conn(&tx, "inv", "tag_sequence", &content)?;
+                        if compat {
+                            // 互換モードではファイルが正。鏡と SHA を同じ
+                            // トランザクションで更新する。
+                            crate::db::inventory::atomic_write_locked(&sequence_path, &content)?;
+                            state.finish_file_row_conn(&tx, "tag_sequence.yaml", &content)?;
+                        }
+                    }
                     if compat {
                         let content = serde_yaml::to_string(&updated)?;
                         // The file lock is already held. Failed publication rolls
@@ -427,14 +454,13 @@ impl Database {
                     Ok((updated, result, compat))
                 };
                 if compat {
-                    crate::db::inventory::with_exclusive_file_lock(&yaml_path, operation)
+                    crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
+                        crate::db::inventory::with_exclusive_file_lock(&yaml_path, operation)
+                    })
                 } else {
                     operation()
                 }
             })?;
-            // タグの登録順は書き込み後に進める (記録が確定してから)。
-            let written = tags_of_records(&updated);
-            self.sync_tag_sequence(before_library.into_inner().as_ref(), &written)?;
             self.data = updated.into_iter().collect();
             self.persisted = self.data.clone();
             self.id_allocator.reconcile(
@@ -449,56 +475,55 @@ impl Database {
         let before_library: std::cell::RefCell<
             Option<crate::application::tag_sequence::LibraryTags>,
         > = std::cell::RefCell::new(None);
-        let result = self.inventory.update_yaml(
-            DATABASE_NAME,
-            InventoryScope::Local,
-            |mut current: BTreeMap<i64, NovelRecord>| {
-                for (id, record) in current.iter_mut() {
-                    record.id = *id;
-                }
-                *before_library.borrow_mut() = Some(crate::application::tag_sequence::library_tags(
-                    current.iter().map(|(id, record)| (*id, record.tags.as_slice())),
-                    |tag| !crate::virtual_novel::is_internal_tag(tag),
-                ));
-                let (mut updated, result) = update(current)?;
-                for (id, record) in updated.iter_mut() {
-                    record.id = *id;
-                }
-                Ok((updated, result))
-            },
-        )?;
+        let previous_sequence: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+        let sequence_path = self.inventory.inventory_path("tag_sequence", InventoryScope::Local);
+        // 連番表のロックを先に取り、作品の書き込みと同じ直列化境界の中で
+        // 連番表も確定する (別に更新すると順序が作品とずれる)。
+        let result = crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
+            let outcome = self.inventory.update_yaml(
+                DATABASE_NAME,
+                InventoryScope::Local,
+                |mut current: BTreeMap<i64, NovelRecord>| {
+                    for (id, record) in current.iter_mut() {
+                        record.id = *id;
+                    }
+                    *before_library.borrow_mut() =
+                        Some(crate::application::tag_sequence::library_tags(
+                            current.iter().map(|(id, record)| (*id, record.tags.as_slice())),
+                            |tag| !crate::virtual_novel::is_internal_tag(tag),
+                        ));
+                    let (mut updated, result) = update(current)?;
+                    for (id, record) in updated.iter_mut() {
+                        record.id = *id;
+                    }
+                    // 連番表を作品と同じロックの中で確定する ✓
+                    let written = tags_of_records(&updated);
+                    let previous = write_tag_sequence_file(
+                        &self.inventory,
+                        &sequence_path,
+                        before_library.borrow().as_ref(),
+                        &written,
+                    )?;
+                    *previous_sequence.borrow_mut() = Some(previous);
+                    // 作品データの保存に失敗を注入する (テスト用 ✓)。
+                    crate::native::tag_sequence::notify_record_save_hook()?;
+                    Ok((updated, result))
+                },
+            );
+            if outcome.is_err()
+                && let Some(previous) = previous_sequence.borrow().as_ref()
+            {
+                // 作品データが確定しなかったなら、連番表も元に戻す (タグだけ
+                // 登録された状態を作らない ✓)。
+                restore_tag_sequence_file(&self.inventory, &sequence_path, previous)?;
+            }
+            outcome
+        })?;
         self.refresh()?;
         if !self.using_sqlite() {
             self.index.flush(&self.inventory)?;
         }
-        // タグの登録順は書き込み後に進める (記録が確定してから)。
-        let written = tags_of_data(&self.data);
-        self.sync_tag_sequence(before_library.into_inner().as_ref(), &written)?;
         Ok(result)
-    }
-
-    /// タグの登録順を進める。
-    ///
-    /// `before` は書き込み前のライブラリのタグ (登録順が未初期化のときの
-    /// バックフィルに使う)、`written` は書き込み後の小説に付いたタグ。
-    /// 新しいタグが無ければ在庫を読まない (ダウンロード中は読み直さない)。
-    fn sync_tag_sequence(
-        &self,
-        before: Option<&crate::application::tag_sequence::LibraryTags>,
-        written: &[&str],
-    ) -> Result<()> {
-        if let Some(cached) = self.tag_sequence.borrow().as_ref()
-            && cached.is_initialized()
-        {
-            let known = cached.registered_set();
-            if written.iter().all(|tag| known.contains(tag)) {
-                return Ok(());
-            }
-        }
-        let updated =
-            crate::native::tag_sequence::sync_records(&self.inventory, before, written)?;
-        *self.tag_sequence.borrow_mut() = Some(updated);
-        Ok(())
     }
 
     pub fn get(&self, id: i64) -> Option<&NovelRecord> {
@@ -629,6 +654,28 @@ impl Database {
     }
 }
 
+/// 保存済みのライブラリのタグを読む。
+///
+/// バックフィル (既存タグの登録順) の材料にする。読めなければ `None`。
+fn persisted_library_tags(
+    inventory: &Inventory,
+) -> Result<Option<crate::application::tag_sequence::LibraryTags>> {
+    let raw = inventory.load_raw(DATABASE_NAME, InventoryScope::Local)?;
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let records: BTreeMap<i64, NovelRecord> = match serde_yaml::from_str(&raw) {
+        Ok(records) => records,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(crate::application::tag_sequence::library_tags(
+        records
+            .iter()
+            .map(|(id, record)| (*id, record.tags.as_slice())),
+        |tag| !crate::virtual_novel::is_internal_tag(tag),
+    )))
+}
+
 /// 小説に付いたタグ (小説 ID 順 → 小説内の位置順)。
 ///
 /// タグの登録順を進めるとき、新しいタグを判定する材料になる。
@@ -638,6 +685,54 @@ fn tags_of_records(records: &BTreeMap<i64, NovelRecord>) -> Vec<&str> {
         .flat_map(|record| record.tags.iter().map(String::as_str))
         .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
         .collect()
+}
+
+/// 連番表のファイルを更新する。
+///
+/// 呼び出し側が `path` の排他ロックを保持している前提で、記録の保存と同じ
+/// 直列化境界の中で連番表を確定する。`before` は書き込み前のライブラリのタグ
+/// (連番表が未初期化のときのバックフィルに使う)、`written` は書き込み後の
+/// 小説に付いたタグ。
+///
+/// 返り値は直前の内容 (作品データの保存が失敗したときに元へ戻すため ✓)。
+fn write_tag_sequence_file(
+    inventory: &Inventory,
+    path: &Path,
+    before: Option<&crate::application::tag_sequence::LibraryTags>,
+    written: &[&str],
+) -> Result<String> {
+    let current = crate::db::inventory::read_optional_yaml_file(path)?;
+    let (content, changed) =
+        crate::native::tag_sequence::advance_content(&current, before, written)?;
+    if changed {
+        crate::db::inventory::atomic_write_locked(path, &content)?;
+        // 在庫のキャッシュはファイルの更新時刻で検証するが、直接書いた
+        // 場合は読み直さないので明示的に捨てる。
+        inventory.unload("tag_sequence");
+    }
+    Ok(current)
+}
+
+/// 連番表のファイルを直前の内容に戻す。
+///
+/// 作品データの保存に失敗して作品だけが確定しなかったとき、連番表に残った
+/// タグを消して順序のずれを防ぐ (呼び出し側がロックを保持している前提 ✓)。
+fn restore_tag_sequence_file(
+    inventory: &Inventory,
+    path: &Path,
+    previous: &str,
+) -> Result<()> {
+    if previous.trim().is_empty() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        crate::db::inventory::atomic_write_locked(path, previous)?;
+    }
+    inventory.unload("tag_sequence");
+    Ok(())
 }
 
 /// 小説に付いたタグ (小説 ID 順 → 小説内の位置順)。
@@ -1046,6 +1141,208 @@ mod tests {
             .map(|r| r.id)
             .collect::<Vec<_>>();
         assert_eq!(order, vec![1, 2]);
+    }
+
+    /// 2 つの書き込みの割り込み (順序の入れ替わり) を再現しても、連番表は
+    /// 作品を保存した順を保つ。
+    ///
+    /// 連番表の更新が作品の保存と同じ直列化境界 (ロック) の中で行われていないと、
+    /// 1 つ目の書き込みが作品だけ保存して止まっている間に 2 つ目が連番表を進め、
+    /// 登録順が作品と逆順になる。
+    #[test]
+    fn concurrent_writers_keep_the_registration_order() {
+        let _global = crate::test_support::global_state_guard();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let root = temp.path().to_path_buf();
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let first = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                crate::native::tag_sequence::set_advance_hook(move || {
+                    let _ = paused_tx.send(());
+                    let _ = resume_rx.recv();
+                });
+                let mut db = Database::with_root(root).unwrap();
+                db.update_records(|mut records| {
+                    records.insert(1, sample_record(1, None, &["first"]));
+                    Ok((records, ()))
+                })
+                .unwrap();
+            })
+        };
+        // 1 つ目の書き込みは連番表の更新で止まる (ロックを保持したまま ✓)。
+        paused_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let second = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let mut db = Database::with_root(root).unwrap();
+                db.update_records(|mut records| {
+                    records.insert(2, sample_record(2, None, &["second"]));
+                    Ok((records, ()))
+                })
+                .unwrap();
+                let _ = done_tx.send(());
+            })
+        };
+        // 2 つ目の書き込みは直列化境界に入れない (作品だけの保存はしない ✓)。
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "作品だけの保存が先に完了してはいけない"
+        );
+        let _ = resume_tx.send(());
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let inventory = Inventory::new(root);
+        let raw = inventory
+            .load_raw("tag_sequence", InventoryScope::Local)
+            .unwrap();
+        let sequence: crate::application::tag_sequence::TagSequence =
+            serde_yaml::from_str(&raw).unwrap();
+        assert_eq!(
+            sequence.order(),
+            ["first".to_string(), "second".to_string()],
+            "登録順は作品を保存した順を保つ"
+        );
+    }
+
+    /// `Database::save()` の直接経路でも、別の書き込みが割り込めない
+    /// (連番表の更新と作品データが同じ境界の中なので ✓)。
+    #[test]
+    fn concurrent_saves_keep_the_registration_order() {
+        let _global = crate::test_support::global_state_guard();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let root = temp.path().to_path_buf();
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let first = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                crate::native::tag_sequence::set_advance_hook(move || {
+                    let _ = paused_tx.send(());
+                    let _ = resume_rx.recv();
+                });
+                let mut db = Database::with_root(root).unwrap();
+                db.insert(sample_record(1, None, &["first"]));
+                db.save().unwrap();
+            })
+        };
+        paused_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let second = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let mut db = Database::with_root(root).unwrap();
+                db.insert(sample_record(2, None, &["second"]));
+                db.save().unwrap();
+                let _ = done_tx.send(());
+            })
+        };
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "作品だけの保存が先に完了してはいけない"
+        );
+        let _ = resume_tx.send(());
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let inventory = Inventory::new(root);
+        let raw = inventory
+            .load_raw("tag_sequence", InventoryScope::Local)
+            .unwrap();
+        let sequence: crate::application::tag_sequence::TagSequence =
+            serde_yaml::from_str(&raw).unwrap();
+        assert_eq!(
+            sequence.order(),
+            ["first".to_string(), "second".to_string()],
+            "登録順は作品を保存した順を保つ"
+        );
+    }
+
+    /// 作品データの保存に失敗したら、連番表も元に戻어야する。
+    ///
+    /// 連番表を先に確定する実装では、作品データの保存が失敗したときに
+    /// 連番表だけ進んだ状態になる。そのままだと「実際に保存された順」と
+    /// 表示順がずれる (X の保存失敗 → Y の保存成功 → X の保存成功で
+    /// Y→X なのに X→Y と表示される) ので、連番表を巻き戻す。
+    #[test]
+    fn a_failed_record_save_restores_the_registration_order() {
+        let _global = crate::test_support::global_state_guard();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let root = temp.path().to_path_buf();
+
+        // 1 回目の書き込みは作品データの保存で失敗させる。
+        {
+            let root = root.clone();
+            let writer = std::thread::spawn(move || {
+                crate::native::tag_sequence::set_record_save_hook(|| {
+                    Err(crate::error::NarouError::Database("injected".to_string()))
+                });
+                let mut db = Database::with_root(root).unwrap();
+                db.update_records(|mut records| {
+                    records.insert(1, sample_record(1, None, &["x"]));
+                    Ok((records, ()))
+                })
+            });
+            let error = writer.join().unwrap().expect_err("注入した失敗で止まる");
+            assert!(
+                error.to_string().contains("injected"),
+                "注入した失敗が返る: {error}"
+            );
+        }
+
+        // 失敗した分のタグは連番表に残らない。
+        let inventory = Inventory::new(root.clone());
+        let raw = inventory
+            .load_raw("tag_sequence", InventoryScope::Local)
+            .unwrap();
+        assert!(
+            !raw.contains("x"),
+            "作品データが保存されていないタグは連番表に残さない: {raw}"
+        );
+
+        // 以後の保存は通常どおり並ぶ (失敗した分が後から登録される ✓)。
+        let mut db = Database::with_root(root.clone()).unwrap();
+        db.update_records(|mut records| {
+            records.insert(2, sample_record(2, None, &["y"]));
+            Ok((records, ()))
+        })
+        .unwrap();
+        let mut db = Database::with_root(root.clone()).unwrap();
+        db.update_records(|mut records| {
+            records.insert(1, sample_record(1, None, &["x"]));
+            Ok((records, ()))
+        })
+        .unwrap();
+
+        let inventory = Inventory::new(root);
+        let raw = inventory
+            .load_raw("tag_sequence", InventoryScope::Local)
+            .unwrap();
+        let sequence: crate::application::tag_sequence::TagSequence =
+            serde_yaml::from_str(&raw).unwrap();
+        assert_eq!(
+            sequence.order(),
+            ["y".to_string(), "x".to_string()],
+            "保存できた順に並ぶ"
+        );
     }
 
     fn sample_record(id: i64, length: Option<i64>, tags: &[&str]) -> NovelRecord {

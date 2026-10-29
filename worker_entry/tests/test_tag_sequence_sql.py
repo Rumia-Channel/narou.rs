@@ -104,6 +104,26 @@ class TagSequenceSqlTests(unittest.TestCase):
         self.assertEqual(rows[0]["value_json"], "{}")
         self.assertIn("order", rows[0]["value_yaml"])
 
+    def test_the_guard_fails_the_batch_when_the_cas_missed(self):
+        # 連番表が更新されていない (CAS 不一致) ときは、guard 文が同じ行へ
+        # 二重に挿入して一意制約違反を起こす。batch は 1 トランザクションなので
+        # 作品もロールバックされる。
+        self.save('{"order":["a"]}', None)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute(
+                SQL["GUARD_SQL"], ('{"order":["b"]}', '{"order":["b"]}', '{"order":["b"]}')
+            )
+        # 連番表は書き換わらない (guard は失敗するだけ ✓)。
+        self.assertEqual(self.stored()["value_json"], '{"order":["a"]}')
+
+    def test_the_guard_is_quiet_when_the_sequence_was_written(self):
+        self.save('{"order":["a"]}', None)
+        # 更新済みなら guard は何も挿入しない (エラーにならない ✓)。
+        self.db.execute(
+            SQL["GUARD_SQL"], ('{"order":["a"]}', '{"order":["a"]}', '{"order":["a"]}')
+        )
+        self.assertEqual(self.stored()["value_json"], '{"order":["a"]}')
+
 
 if __name__ == "__main__":
     unittest.main()
