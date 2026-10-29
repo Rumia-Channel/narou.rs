@@ -95,16 +95,24 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | # | ID | ラベル | Rust |
 |---|-----|--------|------|
 | 1 | `#action-option-settings` | 環境設定... | ✅ |
+| 2 | `#action-option-hidden` | 非表示設定... | ✅ |
+| 3 | `#action-option-export` | 選択した作品をダウンロード... | ✅ |
+| 4 | `#action-option-import` | 小説データをアップロード... | ✅ |
+| 5 | `#action-option-virtual-add` | 選択した作品をバーチャル小説にまとめる... | ✅ |
+| 6 | `#action-option-virtual-append` | 選択した作品をバーチャル小説に追加... | ✅ |
+| 7 | `#action-option-virtual-order` | バーチャル小説の順序を変更... | ✅ |
+| 8 | `#action-option-virtual-convert` | バーチャル小説を変換... | ✅ |
+| 9 | `#action-option-virtual-remove` | バーチャル小説を削除... | ✅ |
 | — | divider | — | ✅ |
-| 2 | `#action-option-help` | ヘルプ... | ✅ |
-| 3 | `#action-option-about` | Narou.rs について | ✅ (バージョン表示モーダル) |
+| 10 | `#action-option-help` | ヘルプ... | ✅ |
+| 11 | `#action-option-about` | Narou.rs について | ✅ (バージョン表示モーダル) |
 | — | divider | — | ✅ |
-| 4 | `#action-lang-toggle` | Language切替 (日本語 ↔ English) | ✅ (Rust独自) |
+| 12 | `#action-lang-toggle` | Language切替 (日本語 ↔ English) | ✅ (Rust独自) |
 | — | divider | — | ✅ |
-| 5 | `#theme-select` | テーマ選択 (Cerulean/Darkly/Readable/Slate/Superhero/United) | ✅ (セレクトボックス、localStorage永続化) |
+| 13 | `#theme-select` | テーマ選択 (Cerulean/Darkly/Readable/Slate/Superhero/United) | ✅ (セレクトボックス、localStorage永続化) |
 | — | divider | — | ✅ |
-| 6 | `#action-option-server-reboot` | サーバを再起動 | ✅ (確認ダイアログ付き) |
-| 7 | `#action-option-shutdown` | サーバをシャットダウン | ✅ (確認ダイアログ付き) |
+| 14 | `#action-option-server-reboot` | サーバを再起動 | ✅ (確認ダイアログ付き) |
+| 15 | `#action-option-shutdown` | サーバをシャットダウン | ✅ (確認ダイアログ付き) |
 
 #### 2.1.7 キュー表示 (右ナビバー)
 
