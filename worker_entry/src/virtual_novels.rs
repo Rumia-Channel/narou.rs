@@ -4,13 +4,15 @@
 //! 同じ `app_state(scope='inv', key='virtual_novel_members')` に保存する。
 //! `POST /api/virtual_novels` の body は `action: create|order|remove`。
 
+use std::sync::Arc;
+
 use chrono::Utc;
 use narou_rs::db::NovelRecord;
 use narou_rs::downloader::types::TocFile;
 use narou_rs::downloader::util::{load_length_limit, sanitize_filename_with_limit};
 use narou_rs::error::{NarouError, Result};
-use narou_rs::platform::{NovelId, NovelMutation, NovelObjectKeys};
-use narou_rs::virtual_novel::{self as core, VirtualNovelMembers};
+use narou_rs::platform::{NovelId, NovelMutation, NovelObjectKeys, NovelRepository};
+use narou_rs::virtual_novel::{self as core, AttributeComposition, VirtualNovelMembers};
 use serde::Deserialize;
 use serde_json::json;
 use worker::wasm_bindgen::JsValue;
@@ -106,6 +108,108 @@ pub async fn load_from_env(env: &Env) -> Result<VirtualNovelMembers> {
     read(&db).await
 }
 
+async fn composition(db: &DbHandle, members: &[i64]) -> Result<AttributeComposition> {
+    core::validate_members(members).map_err(NarouError::InvalidTarget)?;
+    let repository = crate::d1_repository::D1NovelRepository::new(db.primary_view());
+    let mut result = AttributeComposition::default();
+    for id in members {
+        let record = repository.get(NovelId(*id)).await?
+            .ok_or_else(|| NarouError::NotFound(format!("作品が見つかりません: {id}")))?;
+        if record.ncode.as_deref().is_some_and(core::is_virtual_ncode) {
+            return Err(NarouError::InvalidTarget("仮想小説をメンバーにはできません".into()));
+        }
+        result.add(record.attribute_tag());
+    }
+    Ok(result)
+}
+
+/// Reconcile only virtual rows, keeping a mixed work's stored selection.
+/// Correlated member lookups use the primary-key index; no full library scan.
+pub(crate) async fn reconcile_attributes(db: &DbHandle) -> Result<()> {
+    db.prepare(r#"
+WITH groups AS (
+  SELECT CAST(g.key AS INTEGER) AS id, g.value AS members
+  FROM app_state a, json_each(a.value_json) g
+  WHERE a.scope='inv' AND a.key='virtual_novel_members'
+), classified AS (
+  SELECT g.id, CASE
+    WHEN NOT EXISTS(SELECT 1 FROM json_each(g.members) m JOIN novels n ON n.id=m.value WHERE COALESCE(n.attribute_tag,'小説')<>'漫画') THEN '漫画'
+    WHEN NOT EXISTS(SELECT 1 FROM json_each(g.members) m JOIN novels n ON n.id=m.value WHERE n.attribute_tag='漫画') THEN '小説'
+    ELSE COALESCE(v.attribute_tag,'小説') END AS attribute
+  FROM groups g JOIN novels v ON v.id=g.id
+  WHERE json_array_length(g.members)>0
+    AND NOT EXISTS(SELECT 1 FROM json_each(g.members) m LEFT JOIN novels n ON n.id=m.value WHERE n.id IS NULL)
+)
+UPDATE novels SET attribute_tag=(SELECT attribute FROM classified WHERE classified.id=novels.id)
+WHERE id IN (SELECT id FROM classified)
+  AND attribute_tag IS NOT (SELECT attribute FROM classified WHERE classified.id=novels.id)
+"#).run().await.map_err(db_error)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct AttributeBody { attribute_tag: String }
+
+pub async fn handle_attribute(mut req: Request, env: Env, id: i64) -> worker::Result<Response> {
+    if let Some(response) = crate::auth_failure(&req, &env).await { return response; }
+    if req.method() != Method::Post { return Response::error("Method Not Allowed", 405); }
+    let body: AttributeBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return Ok(Response::from_json(&json!({"success":false,"message":"invalid JSON body"}))?.with_status(400)),
+    };
+    let db = DbHandle::primary(Arc::new(env.d1("DB")?));
+    let result = async {
+        let snapshot = db.prepare(SELECT_SQL).first::<Row>(None).await.map_err(db_error)?
+            .ok_or_else(|| db_error("バーチャル小説は登録されていません"))?.value_json;
+        let groups: VirtualNovelMembers = serde_json::from_str(&snapshot).map_err(db_error)?;
+        let ids = groups.get(id).ok_or_else(|| NarouError::NotFound(format!("仮想小説 vs_{id} は登録されていません")))?;
+        let types = composition(&db, ids).await?;
+        if !types.is_mixed() {
+            return Err(NarouError::InvalidTarget("混在していないバーチャル小説の属性タグは変更できません".into()));
+        }
+        let attribute = types.resolve(Some(&body.attribute_tag), None).map_err(NarouError::InvalidTarget)?;
+        let member_json = serde_json::to_string(ids).map_err(db_error)?;
+        let updated = db.prepare(r#"
+UPDATE novels SET attribute_tag=?1 WHERE id=?2
+AND EXISTS(SELECT 1 FROM app_state WHERE scope='inv' AND key='virtual_novel_members' AND value_json=?3)
+AND EXISTS(SELECT 1 FROM json_each(?4) m JOIN novels n ON n.id=m.value WHERE n.attribute_tag='漫画')
+AND EXISTS(SELECT 1 FROM json_each(?4) m JOIN novels n ON n.id=m.value WHERE COALESCE(n.attribute_tag,'小説')='小説')
+AND NOT EXISTS(SELECT 1 FROM json_each(?4) m LEFT JOIN novels n ON n.id=m.value WHERE n.id IS NULL)
+RETURNING id"#)
+            .bind(&[attribute.into(), (id as f64).into(), snapshot.into(), member_json.into()]).map_err(db_error)?
+            .all().await.map_err(db_error)?.results::<IdRow>().map_err(db_error)?;
+        if updated.is_empty() { return Err(db_error("メンバー構成が変更されました。再試行してください")); }
+        Ok(attribute)
+    }.await;
+    match result {
+        Ok(attribute) => Response::from_json(&json!({"success":true,"id":id,"mixed":true,"attribute_tag":attribute})),
+        Err(error) => Ok(Response::from_json(&json!({"success":false,"message":error.to_string()}))?.with_status(400)),
+    }
+}
+
+#[derive(Deserialize)]
+struct IdRow { #[serde(rename="id")] _id: i64 }
+
+pub async fn handle_classify(mut req: Request, env: Env) -> worker::Result<Response> {
+    if let Some(response) = crate::auth_failure(&req, &env).await { return response; }
+    if req.method() != Method::Post { return Response::error("Method Not Allowed", 405); }
+    let body: OrderBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return Ok(Response::from_json(&json!({"success":false,"message":"invalid JSON body"}))?.with_status(400)),
+    };
+    let db = DbHandle::primary(Arc::new(env.d1("DB")?));
+    let result = async {
+        let members = core::parse_member_ids(&body.members).map_err(NarouError::InvalidTarget)?;
+        let types = composition(&db, &members).await?;
+        let tag = types.resolve(None,None).map_err(NarouError::InvalidTarget)?;
+        Ok::<_,NarouError>((types.is_mixed(),tag))
+    }.await;
+    match result {
+        Ok((mixed,tag)) => Response::from_json(&json!({"success":true,"mixed":mixed,"attribute_tag":tag})),
+        Err(error) => Ok(Response::from_json(&json!({"success":false,"message":error.to_string()}))?.with_status(400)),
+    }
+}
+
 #[derive(Deserialize)]
 struct VirtualRequest {
     action: Option<String>,
@@ -121,6 +225,7 @@ struct VirtualRequest {
     tags: Vec<String>,
     #[serde(default)]
     members: Vec<serde_json::Value>,
+    attribute_tag: Option<String>,
 }
 
 /// メンバーの目次から話数を数える (`general_all_no` が未設定の古いレコード用)。
@@ -161,6 +266,8 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         return Err(NarouError::InvalidTarget("属性タグは編集できません".into()));
     }
 
+    let types = composition(runtime.write_db(), &members).await?;
+    let attribute = types.resolve(body.attribute_tag.as_deref(),None).map_err(NarouError::InvalidTarget)?;
     let reservation = runtime.novels.allocate_id().await?;
     let id = reservation.id().0;
     let ncode = core::ncode(id);
@@ -210,7 +317,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         login_session: None,
         extra_fields: Default::default(),
     };
-    record.set_attribute_tag(narou_rs::application::attribute_tags::NOVEL_TAG);
+    record.set_attribute_tag(attribute);
     runtime
         .novels
         .apply_batch(vec![NovelMutation::Upsert(record.clone())])
@@ -285,7 +392,7 @@ async fn summarize_members(runtime: &WorkerRuntime, members: &[i64]) -> Result<M
 }
 
 async fn refresh_record(runtime: &WorkerRuntime, id: i64, summary: &MemberSummary) -> Result<()> {
-    let mut record = runtime
+    let record = runtime
         .novels
         .get(NovelId(id))
         .await?
@@ -300,13 +407,30 @@ async fn refresh_record(runtime: &WorkerRuntime, id: i64, summary: &MemberSummar
     tags.push(core::tag(id));
     tags.sort();
     tags.dedup();
-    record.tags = tags;
-    record.general_all_no = (summary.general_all_no > 0).then_some(summary.general_all_no);
-    record.general_lastup = summary.latest_update;
-    runtime
-        .novels
-        .apply_batch(vec![NovelMutation::Upsert(record)])
-        .await
+    let db = runtime.write_db();
+    let snapshot = crate::tag_sequence::read_snapshot(db).await?;
+    let before = if snapshot.sequence.is_initialized() { None } else { Some(crate::tag_sequence::library_tags(db).await?) };
+    let written: Vec<&str> = tags.iter().map(String::as_str).filter(|tag| !core::is_internal_tag(tag)).collect();
+    let next = crate::tag_sequence::advance(&snapshot, before.as_ref(), &written);
+    let fold = narou_rs::db::novel_codec::fold;
+    let folded: Vec<String> = tags.iter().map(|tag| fold(tag)).collect();
+    let date = summary.latest_update.map(|date| date.to_rfc3339()).map(JsValue::from).unwrap_or(JsValue::NULL);
+    let mut statements = vec![
+        db.prepare("UPDATE novels SET tags_json=?1,tags_fold=?2,tags_sort=?3,general_all_no=?4,general_lastup=?5 WHERE id=?6 AND tags_json=?7")
+            .bind(&[serde_json::to_string(&tags).map_err(db_error)?.into(),folded.join("\n").into(),folded.join("\u{1f}").into(),
+                if summary.general_all_no>0 {(summary.general_all_no as f64).into()}else{JsValue::NULL},date,(id as f64).into(),
+                serde_json::to_string(&record.tags).map_err(db_error)?.into()]).map_err(db_error)?,
+        db.prepare("INSERT INTO novel_id_sequence(id,next_id) SELECT 1,0 WHERE changes()=0"),
+        db.prepare("DELETE FROM novel_tags WHERE novel_id=?1").bind(&[(id as f64).into()]).map_err(db_error)?,
+    ];
+    for (position,tag) in tags.iter().enumerate() {
+        statements.push(db.prepare("INSERT INTO novel_tags(novel_id,position,tag,tag_fold) VALUES (?1,?2,?3,?4)")
+            .bind(&[(id as f64).into(),(position as f64).into(),tag.clone().into(),fold(tag).into()]).map_err(db_error)?);
+    }
+    statements.push(crate::tag_sequence::upsert_statement(db,snapshot.raw_json.as_deref(),&next)?);
+    statements.push(crate::tag_sequence::guard_statement(db,&next)?);
+    db.batch(statements).await.map_err(db_error)?;
+    Ok(())
 }
 
 /// 既存の仮想小説へメンバーを追加する (native の `add_members` と同じ規則)。
@@ -329,6 +453,7 @@ async fn add_members(runtime: &WorkerRuntime, id: i64, new_members: Vec<i64>) ->
         }
         return Err(error);
     }
+    reconcile_attributes(runtime.write_db()).await?;
     Ok(())
 }
 
@@ -531,6 +656,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
                 }
             };
             let mut novels = Vec::new();
+            reconcile_attributes(runtime.write_db()).await.map_err(|error| worker::Error::RustError(error.to_string()))?;
             for (id, member_ids) in &members.groups {
                 if let Some(record) = runtime
                     .novels
@@ -539,6 +665,8 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
                     .map_err(|error| worker::Error::RustError(error.to_string()))?
                 {
                     let mut member_titles = Vec::with_capacity(member_ids.len());
+                    let classification = composition(runtime.write_db(), member_ids).await.ok();
+                    let mixed = classification.as_ref().is_some_and(AttributeComposition::is_mixed);
                     for member_id in member_ids {
                         member_titles.push(
                             runtime
@@ -560,6 +688,9 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
                         "tags": record.tags,
                         "members": member_ids,
                         "member_titles": member_titles,
+                        "mixed": mixed,
+                        "attribute_tag": record.attribute_tag(),
+                        "attribute_editable": classification.is_some(),
                     }));
                 }
             }

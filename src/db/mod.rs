@@ -50,6 +50,12 @@ pub fn init_database() -> Result<()> {
         })?;
     }
     *DATABASE.lock() = Some(db);
+    // 既存バーチャル小説の属性タグを、メンバーの属性構成に合わせて整合させる。
+    // 混在しているものは保存済みの値を維持し、単一種別なら自動分類の値へ直す。
+    // メンバーが見つからないものは既存値をそのまま残す。
+    if let Err(error) = crate::native::virtual_novel::reconcile_attribute_tags() {
+        tracing::warn!("バーチャル小説の属性タグを整合できません: {error}");
+    }
     Ok(())
 }
 

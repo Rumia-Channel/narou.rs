@@ -10,6 +10,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use crate::application::attribute_tags::{MANGA_TAG, NOVEL_TAG};
+
 /// 仮想小説の ncode 接頭辞。
 pub const VIRTUAL_NCODE_PREFIX: &str = "vs_";
 
@@ -139,7 +141,8 @@ impl VirtualNovelMembers {
     }
 }
 
-fn validate_members(members: &[i64]) -> Result<(), String> {
+/// メンバー ID の妥当性を検証する (登録と同じ条件)。
+pub fn validate_members(members: &[i64]) -> Result<(), String> {
     if members.is_empty() {
         return Err("メンバーを 1 件以上指定してください".to_string());
     }
@@ -166,6 +169,86 @@ pub fn parse_member_ids(values: &[serde_json::Value]) -> Result<Vec<i64>, String
         .collect()
 }
 
+/// 属性タグ (小説 / 漫画) の構成。
+///
+/// バーチャル小説のメンバーは普通の小説行であり、それぞれ `attribute_tag`
+/// を持つ。[`AttributeComposition`] は「メンバーだけなら小説」「漫画だけなら
+/// 漫画」「両方混在している」を表す。混在しているときだけ、利用者が小説 /
+/// 漫画を自分で選べる。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttributeComposition {
+    /// 小説のメンバーが 1 件以上ある。
+    pub has_novel: bool,
+    /// 漫画のメンバーが 1 件以上ある。
+    pub has_manga: bool,
+}
+
+impl AttributeComposition {
+    /// メンバーの属性タグを 1 件加える。
+    ///
+    /// `None` (属性が未設定) は小説として数える。未知の値は無視する。
+    pub fn add(&mut self, tag: Option<&str>) {
+        match tag {
+            None => self.has_novel = true,
+            Some(tag) if tag == NOVEL_TAG => self.has_novel = true,
+            Some(tag) if tag == MANGA_TAG => self.has_manga = true,
+            Some(_) => {}
+        }
+    }
+
+    /// 小説と漫画が混在しているか。
+    pub fn is_mixed(&self) -> bool {
+        self.has_novel && self.has_manga
+    }
+
+    /// 属性を持つメンバーが 1 件もないか。
+    pub fn is_empty(&self) -> bool {
+        !self.has_novel && !self.has_manga
+    }
+
+    /// 求める属性タグを確定する。
+    ///
+    /// * 単一種別 (小説のみ / 漫画のみ) は構成から自動分類する。明示指定が
+    ///   矛盾するときはエラー。
+    /// * 混在しているときは「明示指定 -> 保存済みの値 -> 小説」の順で決める。
+    /// * 属性を持つメンバーが 1 件もないときや、不正な指定はエラー。
+    pub fn resolve(
+        &self,
+        requested: Option<&str>,
+        current: Option<&str>,
+    ) -> Result<&'static str, String> {
+        let requested = match requested {
+            Some(NOVEL_TAG) => Some(NOVEL_TAG),
+            Some(MANGA_TAG) => Some(MANGA_TAG),
+            Some(tag) => return Err(format!("属性タグが不正です: {tag}")),
+            None => None,
+        };
+        let current = match current {
+            Some(NOVEL_TAG) => Some(NOVEL_TAG),
+            Some(MANGA_TAG) => Some(MANGA_TAG),
+            Some(tag) => return Err(format!("属性タグが不正です: {tag}")),
+            None => None,
+        };
+        if self.is_empty() {
+            return Err("属性を持つメンバーがありません".to_string());
+        }
+        if self.is_mixed() {
+            // 混在するときは利用者が選んだ値を優先する。保存済みの値が
+            // あればそれを維持し、無ければ小説を既定にする。
+            return Ok(requested.or(current).unwrap_or(NOVEL_TAG));
+        }
+        let detected = if self.has_novel { NOVEL_TAG } else { MANGA_TAG };
+        if let Some(tag) = requested
+            && tag != detected
+        {
+            return Err(format!(
+                "属性タグはメンバー構成 ({detected}) と一致しません: {tag}"
+            ));
+        }
+        Ok(detected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +269,71 @@ mod tests {
         ];
         assert_eq!(parse_member_ids(&values).unwrap(), vec![3, 4, 5]);
         assert!(parse_member_ids(&[serde_json::json!("x")]).is_err());
+    }
+
+    #[test]
+    fn composition_tracks_novel_and_manga_members() {
+        let mut composition = AttributeComposition::default();
+        assert!(composition.is_empty());
+        composition.add(Some(NOVEL_TAG));
+        assert!(composition.has_novel);
+        assert!(!composition.has_manga);
+        assert!(!composition.is_mixed());
+        composition.add(Some(MANGA_TAG));
+        assert!(composition.is_mixed());
+    }
+
+    #[test]
+    fn composition_treats_missing_attribute_as_novel() {
+        let mut composition = AttributeComposition::default();
+        composition.add(None);
+        assert!(composition.has_novel);
+        assert!(!composition.has_manga);
+    }
+
+    #[test]
+    fn composition_ignores_unknown_attribute_values() {
+        let mut composition = AttributeComposition::default();
+        composition.add(Some("映画"));
+        assert!(composition.is_empty());
+    }
+
+    #[test]
+    fn single_kind_composition_is_detected_automatically() {
+        let mut novel = AttributeComposition::default();
+        novel.add(Some(NOVEL_TAG));
+        assert_eq!(novel.resolve(None, None).unwrap(), NOVEL_TAG);
+        assert_eq!(
+            novel.resolve(None, Some(MANGA_TAG)).unwrap(),
+            NOVEL_TAG,
+            "a single-kind composition must be auto-corrected"
+        );
+        assert!(novel.resolve(Some(MANGA_TAG), None).is_err());
+
+        let mut manga = AttributeComposition::default();
+        manga.add(Some(MANGA_TAG));
+        assert_eq!(manga.resolve(None, None).unwrap(), MANGA_TAG);
+        assert!(manga.resolve(Some(NOVEL_TAG), None).is_err());
+    }
+
+    #[test]
+    fn mixed_composition_prefers_request_then_current_then_novel() {
+        let mut mixed = AttributeComposition::default();
+        mixed.add(Some(NOVEL_TAG));
+        mixed.add(Some(MANGA_TAG));
+        assert_eq!(mixed.resolve(Some(MANGA_TAG), Some(NOVEL_TAG)).unwrap(), MANGA_TAG);
+        assert_eq!(mixed.resolve(None, Some(MANGA_TAG)).unwrap(), MANGA_TAG);
+        assert_eq!(mixed.resolve(None, None).unwrap(), NOVEL_TAG);
+    }
+
+    #[test]
+    fn resolve_rejects_invalid_values_and_empty_compositions() {
+        let mut mixed = AttributeComposition::default();
+        mixed.add(Some(NOVEL_TAG));
+        mixed.add(Some(MANGA_TAG));
+        assert!(mixed.resolve(Some("映画"), None).is_err());
+        assert!(mixed.resolve(None, Some("映画")).is_err());
+        assert!(AttributeComposition::default().resolve(None, None).is_err());
     }
 
     #[test]

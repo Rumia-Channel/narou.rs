@@ -27,6 +27,9 @@ pub enum VirtualAction {
         /// Tags for the virtual novel (repeatable).
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// Attribute tag (小説 / 漫画) for a mixed set of members.
+        #[arg(long = "attribute")]
+        attribute: Option<String>,
         /// Member novels (ID / URL / title / N-code / alias), in order.
         members: Vec<String>,
     },
@@ -43,8 +46,15 @@ pub enum VirtualAction {
     Append {
         /// Virtual novel (`vs_1` or its ID).
         target: String,
-        /// Novels to append (ID / URL / title / N-code / alias).
+        /// Member novels (ID / URL / title / N-code / alias).
         members: Vec<String>,
+    },
+    /// Change the attribute tag (小説 / 漫画) of a mixed virtual novel.
+    Attribute {
+        /// Virtual novel (`vs_1` or its ID).
+        target: String,
+        /// Attribute tag (小説 / 漫画).
+        attribute: String,
     },
     /// Remove a virtual novel. Member novels are kept.
     Remove {
@@ -62,11 +72,13 @@ pub fn cmd_virtual(action: VirtualAction) -> Result<()> {
             site,
             domain,
             tags,
+            attribute,
             members,
-        } => add(&title, &author, &site, domain, &tags, &members),
+        } => add(&title, &author, &site, domain, &tags, attribute, &members),
         VirtualAction::List => list(),
         VirtualAction::Order { target, order } => reorder(&target, &order),
         VirtualAction::Append { target, members } => append(&target, &members),
+        VirtualAction::Attribute { target, attribute } => set_attribute(&target, &attribute),
         VirtualAction::Remove { target } => remove(&target),
     }
 }
@@ -77,6 +89,7 @@ fn add(
     site: &str,
     domain: Option<String>,
     tags: &[String],
+    attribute: Option<String>,
     members: &[String],
 ) -> Result<()> {
     let mut member_ids = Vec::with_capacity(members.len());
@@ -94,6 +107,7 @@ fn add(
         domain,
         tags: tags.to_vec(),
         members: member_ids,
+        attribute,
     })?;
     let ncode = core::ncode(record.id);
     println!("バーチャル小説を登録しました: {ncode} {}", record.title);
@@ -112,15 +126,23 @@ fn list() -> Result<()> {
         return Ok(());
     }
     let repository = NativeNovelRepository::new();
+    // 分類は表示機能の ON / OFF とは独立に保持する。
+    let states = virtual_novel::attribute_states_in(&members);
     for (virtual_id, member_ids) in &members.groups {
         let ncode = core::ncode(*virtual_id);
         let record = repository.get_sync(NovelId(*virtual_id))?.ok_or_else(|| {
             NarouError::Database(format!("仮想小説 {ncode} のレコードがありません"))
         })?;
+        let state = states.get(virtual_id);
+        let attribute = state
+            .map(|state| state.attribute_tag)
+            .unwrap_or(narou_rs::application::attribute_tags::NOVEL_TAG);
+        let mixed = state.map(|state| state.mixed).unwrap_or(false);
         println!(
-            "{ncode}  {}  ({} 作品, 非表示タグ: {})",
+            "{ncode}  {}  ({} 作品, 属性: {attribute}{}, 非表示タグ: {})",
             record.title,
             member_ids.len(),
+            if mixed { " (混合)" } else { "" },
             core::tag(*virtual_id)
         );
         for (position, member) in member_ids.iter().enumerate() {
@@ -131,6 +153,17 @@ fn list() -> Result<()> {
             println!("  {}. ID:{member} {title}", position + 1);
         }
     }
+    Ok(())
+}
+
+/// 混在するバーチャル小説の属性タグを変更する。
+fn set_attribute(target: &str, attribute: &str) -> Result<()> {
+    let virtual_id = resolve_virtual_id(target)?;
+    let state = virtual_novel::set_attribute(virtual_id, attribute)?;
+    println!(
+        "仮想小説 vs_{virtual_id} の属性タグを {} に変更しました",
+        state.attribute_tag
+    );
     Ok(())
 }
 
