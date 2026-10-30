@@ -27,7 +27,7 @@ use crate::db_handle::DbHandle;
 /// D1 tolerates much larger statement payloads than the native store's
 /// `novel_codec::MAX_EXTRA_FIELDS_BYTES`; keep the historical D1 cap.
 const MAX_EXTRA_FIELDS_BYTES: usize = 1_900_000;
-const ATTRIBUTE_MARKER: &str = "work_type_attributes_v1";
+const ATTRIBUTE_MARKER: &str = "work_type_attributes_v2";
 
 pub(crate) const KNOWN_TOC_URLS: &str = r#"
 SELECT CAST(j.key AS INTEGER) AS position,
@@ -110,10 +110,11 @@ impl D1NovelRepository {
             let mut migrated = Vec::with_capacity(rows.len());
             for row in rows {
                 let old_tags = row.tags_json.clone();
+                let old_attribute = row.attribute_tag.clone();
                 let mut record = row.into_record()?;
                 if narou_rs::application::attribute_tags::initialize_record(&mut record, sites) {
                     novel_codec::dedup_tags(&mut record.tags);
-                    migrated.push((record, old_tags));
+                    migrated.push((record, old_tags, old_attribute));
                 }
             }
             if migrated.is_empty() {
@@ -126,16 +127,16 @@ impl D1NovelRepository {
             } else {
                 Some(crate::tag_sequence::library_tags(&self.db).await?)
             };
-            let written: Vec<&str> = migrated.iter().flat_map(|(record, _)| record.tags.iter().map(String::as_str))
+            let written: Vec<&str> = migrated.iter().flat_map(|(record, _, _)| record.tags.iter().map(String::as_str))
                 .filter(|tag| !narou_rs::virtual_novel::is_internal_tag(tag)).collect();
             let next = crate::tag_sequence::advance(&snapshot, before.as_ref(), &written);
             let mut statements = Vec::new();
-            for (record, old_tags) in &migrated {
+            for (record, old_tags, old_attribute) in &migrated {
                 let json = serde_json::to_string(&record.tags).map_err(worker_error)?;
                 let folded: Vec<String> = record.tags.iter().map(|tag| fold(tag)).collect();
                 statements.push(self.prepare(
-                    "UPDATE novels SET tags_json=?2,tags_fold=?3,tags_sort=?4 WHERE id=?1 AND tags_json=?5",
-                    vec![BindValue::Int(record.id), BindValue::Text(json), BindValue::Text(folded.join("\n")), BindValue::Text(folded.join("\u{1f}")), BindValue::Text(old_tags.clone())],
+                    "UPDATE novels SET tags_json=?2,tags_fold=?3,tags_sort=?4,attribute_tag=?5 WHERE id=?1 AND tags_json=?6 AND attribute_tag IS ?7",
+                    vec![BindValue::Int(record.id), BindValue::Text(json), BindValue::Text(folded.join("\n")), BindValue::Text(folded.join("\u{1f}")), BindValue::Text(record.attribute_tag().expect("initialized").to_string()), BindValue::Text(old_tags.clone()), old_attribute.as_ref().map(|tag| BindValue::Text(tag.clone())).unwrap_or(BindValue::Null)],
                 )?);
                 // A stale row aborts the whole batch; retry from the primary.
                 statements.push(self.prepare(
@@ -818,6 +819,8 @@ struct NovelRow {
     requires_login: i64,
     #[serde(default)]
     login_session: Option<String>,
+    #[serde(default)]
+    attribute_tag: Option<String>,
 }
 
 impl NovelRow {
@@ -858,6 +861,7 @@ impl NovelRow {
             ("extra_fields_yaml", NovelBind::Text(self.extra_fields_yaml)),
             ("requires_login", NovelBind::Int(self.requires_login)),
             ("login_session", nullable_text(self.login_session)),
+            ("attribute_tag", nullable_text(self.attribute_tag)),
         ]
     }
 

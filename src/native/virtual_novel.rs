@@ -75,7 +75,6 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
     tags.push(virtual_tag);
     tags.sort();
     tags.dedup();
-    crate::application::attribute_tags::set_attribute_tag(&mut tags, crate::application::attribute_tags::NOVEL_TAG);
 
     let limit = load_length_limit("folder-length-limit", Some(50));
     let file_title = sanitize_filename_with_limit(&input.title, limit);
@@ -85,7 +84,7 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
         file_title
     };
     let now = Utc::now();
-    let record = NovelRecord {
+    let mut record = NovelRecord {
         id,
         author: input.author.clone(),
         title: input.title.clone(),
@@ -114,6 +113,7 @@ pub fn create(input: NewVirtualNovel) -> Result<NovelRecord> {
         login_session: None,
         extra_fields: Default::default(),
     };
+    record.set_attribute_tag(crate::application::attribute_tags::NOVEL_TAG);
 
     repository.apply_batch_sync(vec![NovelMutation::Upsert(record.clone())])?;
     let saved = update(|members| {

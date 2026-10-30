@@ -127,11 +127,14 @@ async fn configured_tags_are_applied_to_new_and_updated_records() {
         .unwrap();
 
     let manga_record = novels.get(manga.id.into()).await.unwrap().unwrap();
-    assert_eq!(manga_record.tags, vec!["漫画"]);
+    assert_eq!(manga_record.attribute_tag(), Some("漫画"));
+    assert!(manga_record.tags.is_empty());
     let comic_record = novels.get(comic.id.into()).await.unwrap().unwrap();
-    assert_eq!(comic_record.tags, vec!["漫画"]);
+    assert_eq!(comic_record.attribute_tag(), Some("漫画"));
+    assert!(comic_record.tags.is_empty());
     let novel_record = novels.get(novel.id.into()).await.unwrap().unwrap();
-    assert_eq!(novel_record.tags, vec!["小説"]);
+    assert_eq!(novel_record.attribute_tag(), Some("小説"));
+    assert!(novel_record.tags.is_empty());
 }
 
 #[tokio::test]
@@ -153,7 +156,8 @@ async fn an_update_keeps_existing_tags_and_does_not_duplicate_them() {
         .await
         .unwrap();
     let mut record = novels.get(first.id.into()).await.unwrap().unwrap();
-    assert_eq!(record.tags, vec!["漫画"]);
+    assert_eq!(record.attribute_tag(), Some("漫画"));
+    assert!(record.tags.is_empty());
     record.tags.push("手動".to_string());
     novels
         .apply_batch(vec![NovelMutation::Upsert(record)])
@@ -166,11 +170,8 @@ async fn an_update_keeps_existing_tags_and_does_not_duplicate_them() {
         .unwrap();
     assert_eq!(updated.id, first.id);
     let record = novels.get(first.id.into()).await.unwrap().unwrap();
-    assert_eq!(
-        record.tags,
-        vec!["漫画", "手動"],
-        "更新ではタグが重複せず、手動タグも残る"
-    );
+    assert_eq!(record.tags, vec!["手動"], "更新では手動タグも残る");
+    assert_eq!(record.attribute_tag(), Some("漫画"));
 }
 
 #[tokio::test]
@@ -205,7 +206,7 @@ preprocess: |-
 
     let first = downloader.download_novel("https://tagged.example/novel/n333/").await.unwrap();
     let mut record = novels.get(first.id.into()).await.unwrap().unwrap();
-    assert_eq!(record.tags, vec!["小説"]);
+    assert_eq!(record.attribute_tag(), Some("小説"));
     record.tags.push("手動".to_string());
     novels.apply_batch(vec![NovelMutation::Upsert(record)]).await.unwrap();
 
@@ -221,5 +222,6 @@ preprocess: |-
     let updated = downloader.download_novel(&first.id.to_string()).await.unwrap();
     assert_eq!(updated.id, first.id);
     let record = novels.get(first.id.into()).await.unwrap().unwrap();
-    assert_eq!(record.tags, vec!["手動", "漫画"]);
+    assert_eq!(record.tags, vec!["手動"]);
+    assert_eq!(record.attribute_tag(), Some("漫画"));
 }

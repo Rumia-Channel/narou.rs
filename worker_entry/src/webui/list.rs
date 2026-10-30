@@ -123,6 +123,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
             hidden,
             include_hidden,
             exclude_ids,
+            attribute_tags_enabled: narou_rs::application::attribute_tags::enabled(&services.settings).await,
         })
         .await
     {

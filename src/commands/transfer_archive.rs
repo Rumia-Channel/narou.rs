@@ -178,8 +178,10 @@ mod transfer_archive_tests {
 
     #[test]
     fn transfer_archive_manifest_metadata_keeps_record_fields() {
+        let mut record = record();
+        record.set_attribute_tag("小説");
         let metadata = archive_novel_from_record(
-            &record(),
+            &record,
             vec![ArchiveFile::new("toc.yaml", b"toc".to_vec())],
             None,
         );
@@ -188,6 +190,9 @@ mod transfer_archive_tests {
         assert_eq!(manuscript.author, "作者");
         assert_eq!(manuscript.domain.as_deref(), Some("example.test"));
         assert_eq!(manuscript.tags, vec!["タグ".to_string()]);
+        // The classification travels in its own field, never inside `tags`.
+        assert_eq!(manuscript.attribute_tag.as_deref(), Some("小説"));
+        assert!(!manuscript.tags.iter().any(|tag| tag == "小説"));
         assert_eq!(manuscript.files[0].path, "toc.yaml");
     }
 

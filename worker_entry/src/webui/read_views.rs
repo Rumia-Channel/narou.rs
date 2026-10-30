@@ -710,7 +710,11 @@ async fn taginfo(req_ids: Vec<serde_json::Value>, with_exclusion: bool, runtime:
             _ => None,
         })
         .collect();
-    let records = runtime.services.library.records().await.unwrap_or_default();
+    let mut records = runtime.services.library.records().await.unwrap_or_default();
+    narou_rs::application::attribute_tags::project(
+        &mut records,
+        narou_rs::application::attribute_tags::enabled(&runtime.services.settings).await,
+    );
     let new_tag_color = configured_tag_color(runtime).await;
     let colors = runtime
         .services

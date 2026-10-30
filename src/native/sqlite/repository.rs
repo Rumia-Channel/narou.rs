@@ -463,6 +463,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attribute_search_is_separate_and_obeys_global_switch() {
+        let sqlite = SqliteNovelRepository::new(crate::native::sqlite::open_in_memory().unwrap());
+        let memory = MemoryNovelRepository::new();
+        let mut manga = record(1, "絵", "作者", "https://example.test/1", &["手動"]);
+        manga.set_attribute_tag("漫画");
+        let mut novel = record(2, "文", "作者", "https://example.test/2", &["手動"]);
+        novel.set_attribute_tag("小説");
+        let writes = vec![NovelMutation::Upsert(manga), NovelMutation::Upsert(novel)];
+        sqlite.apply_batch(writes.clone()).await.unwrap();
+        memory.apply_batch(writes).await.unwrap();
+
+        for enabled in [false, true] {
+            let direct = NovelFilter { tag: Some("漫画".into()), attribute_tags_enabled: enabled, ..Default::default() };
+            let search = NovelFilter {
+                terms: vec![crate::platform::SearchTerm::new(SearchField::Tag, false, vec!["漫画".into()])],
+                attribute_tags_enabled: enabled, ..Default::default()
+            };
+            let any = NovelFilter {
+                terms: vec![crate::platform::SearchTerm::new(SearchField::Any, false, vec!["漫画".into()])],
+                attribute_tags_enabled: enabled, ..Default::default()
+            };
+            let negated = NovelFilter {
+                terms: vec![crate::platform::SearchTerm::new(SearchField::Tag, true, vec!["漫画".into()])],
+                attribute_tags_enabled: enabled, ..Default::default()
+            };
+            let excluded = NovelFilter { exclude_tags: vec!["漫画".into()], attribute_tags_enabled: enabled, ..Default::default() };
+            for (filter, expected) in [(direct, u64::from(enabled)), (search, u64::from(enabled)), (any, u64::from(enabled)), (negated, if enabled { 1 } else { 2 }), (excluded, if enabled { 1 } else { 2 })] {
+                assert_eq!(sqlite.count(&filter).await.unwrap(), expected);
+                assert_eq!(memory.count(&filter).await.unwrap(), expected);
+            }
+        }
+        let stored = sqlite.get(NovelId(1)).await.unwrap().unwrap();
+        assert_eq!(stored.attribute_tag(), Some("漫画"));
+        assert_eq!(stored.tags, vec!["手動"]);
+    }
+
+    #[tokio::test]
     async fn sqlite_search_matches_url_ncode_and_numeric_id() {
         let sqlite = SqliteNovelRepository::new(crate::native::sqlite::open_in_memory().unwrap());
         sqlite

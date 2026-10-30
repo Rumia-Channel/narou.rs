@@ -113,6 +113,8 @@ pub struct NovelFilter {
     pub domain: Option<String>,
     /// Any of the record's tags equals this tag.
     pub tag: Option<String>,
+    /// Include the separately stored classification as a searchable tag.
+    pub attribute_tags_enabled: bool,
     pub ncode: Option<String>,
     pub is_narou: Option<bool>,
     pub suspend: Option<bool>,
@@ -470,18 +472,20 @@ pub(crate) fn record_matches_term(
     record: &NovelRecord,
     term: &SearchTerm,
     frozen: bool,
+    attribute_tags_enabled: bool,
 ) -> bool {
     let title = record.title.to_lowercase();
     let author = record.author.to_lowercase();
     let sitename = record.sitename.to_lowercase();
     let status = record_status_text(record, frozen);
     let tags: Vec<String> = record.tags.iter().map(|tag| tag.to_lowercase()).collect();
+    let attribute = attribute_tags_enabled.then(|| record.attribute_tag()).flatten();
 
     let matched = match term.field {
         SearchField::Tag => term
             .values
             .iter()
-            .any(|value| tags.iter().any(|tag| tag.contains(value))),
+            .any(|value| tags.iter().any(|tag| tag.contains(value)) || attribute.is_some_and(|tag| tag.contains(value))),
         SearchField::Author => term.values.iter().any(|value| author.contains(value)),
         SearchField::Site => term.values.iter().any(|value| sitename.contains(value)),
         SearchField::Title => term.values.iter().any(|value| title.contains(value)),
@@ -492,6 +496,7 @@ pub(crate) fn record_matches_term(
                 || sitename.contains(value)
                 || status.contains(value)
                 || tags.iter().any(|tag| tag.contains(value))
+                || attribute.is_some_and(|tag| tag.contains(value))
                 || record.ncode.as_ref().is_some_and(|ncode| ncode.to_lowercase().contains(value))
                 || (value.contains("://")
                     && record.toc_url.to_lowercase().contains(value.trim_end_matches('/')))
@@ -513,10 +518,11 @@ pub(crate) fn record_matches_terms(
     record: &NovelRecord,
     terms: &[SearchTerm],
     frozen: bool,
+    attribute_tags_enabled: bool,
 ) -> bool {
     terms
         .iter()
-        .all(|term| record_matches_term(record, term, frozen))
+        .all(|term| record_matches_term(record, term, frozen, attribute_tags_enabled))
 }
 
 /// Typed-filter match. Every branch maps to a D1 WHERE clause.
@@ -545,6 +551,7 @@ pub(crate) fn record_matches_filter(record: &NovelRecord, filter: &NovelFilter) 
     }
     if let Some(tag) = &filter.tag
         && !record.tags.iter().any(|record_tag| record_tag == tag)
+        && !(filter.attribute_tags_enabled && record.attribute_tag() == Some(tag))
     {
         return false;
     }
@@ -578,6 +585,7 @@ pub(crate) fn record_matches_filter(record: &NovelRecord, filter: &NovelFilter) 
             record,
             &filter.terms,
             record_is_frozen_for_search(record, filter.frozen_ids.as_ref()),
+            filter.attribute_tags_enabled,
         )
     {
         return false;
@@ -588,7 +596,8 @@ pub(crate) fn record_matches_filter(record: &NovelRecord, filter: &NovelFilter) 
     if filter
         .exclude_tags
         .iter()
-        .any(|hidden| record.tags.iter().any(|tag| tag == hidden))
+        .any(|hidden| record.tags.iter().any(|tag| tag == hidden)
+            || (filter.attribute_tags_enabled && record.attribute_tag() == Some(hidden)))
     {
         return false;
     }
@@ -770,18 +779,18 @@ mod tests {
             false,
             vec!["sf".into(), "mystery".into()],
         )];
-        assert!(record_matches_terms(&record, &terms, false));
+        assert!(record_matches_terms(&record, &terms, false, false));
 
         let negated = vec![SearchTerm::new(
             SearchField::Tag,
             true,
             vec!["mystery".into()],
         )];
-        assert!(record_matches_terms(&record, &negated, false));
+        assert!(record_matches_terms(&record, &negated, false, false));
         assert!(!record_matches_terms(
             &record,
             &[SearchTerm::new(SearchField::Tag, true, vec!["sf".into()])],
-            false
+            false, false
         ));
     }
 
@@ -794,17 +803,17 @@ mod tests {
         assert!(record_matches_terms(
             &record,
             &[SearchTerm::new(SearchField::Status, false, vec!["完結".into()])],
-            false
+            false, false
         ));
         assert!(record_matches_terms(
             &record,
             &[SearchTerm::new(SearchField::Status, false, vec!["凍結".into()])],
-            frozen_ids.contains(&record.id)
+            frozen_ids.contains(&record.id), false
         ));
         assert!(!record_matches_terms(
             &record,
             &[SearchTerm::new(SearchField::Status, false, vec!["凍結".into()])],
-            false
+            false, false
         ));
         assert_eq!(record_status_text(&record, true), "凍結, 完結");
     }

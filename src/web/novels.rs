@@ -97,6 +97,7 @@ async fn api_list_inner(
             exclude_ids: crate::native::virtual_novel::load()
                 .map(|members| members.all_member_ids().into_iter().collect())
                 .unwrap_or_default(),
+            attribute_tags_enabled: crate::application::attribute_tags::enabled(&state.services.settings).await,
         })
         .await
         .map_err(map_application_error)?;

@@ -15,7 +15,7 @@ import {
   renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed, attributeTagVisible,
   selectVisible, selectAll, clearSelection, getSelectedIdsInDisplayOrder,
   pruneSelectedIdsToCurrentList, updateEnableSelected,
-  syncViewChecks, showNotification,
+  syncViewChecks, showNotification, syncAttributeTagControls,
 } from './render.js';
 import { setShortcutHandlers, initShortcuts } from './shortcuts.js';
 import {
@@ -286,6 +286,43 @@ export function bindActions() {
       await openTagEditor();
     });
   });
+  // 属性タグ機能全体の ON/OFF (`tag.attributes-enabled`)。
+  // OFF の間は属性タグを一覧・タグ一覧・検索に出さない (分類の保存は続く)。
+  const attributeMaster = document.getElementById('enable-attribute-tags');
+  if (attributeMaster) {
+    attributeMaster.checked = Boolean(State.attributeTagsEnabled);
+    attributeMaster.addEventListener('click', event => event.stopPropagation());
+    attributeMaster.addEventListener('change', async () => {
+      const previous = State.attributeTagsEnabled;
+      attributeMaster.dataset.saving = '1';
+      attributeMaster.disabled = true;
+      let changed = false;
+      try {
+        const result = await postJson('/api/global_setting', {
+          settings: { 'tag.attributes-enabled': attributeMaster.checked },
+        });
+        assertApiSuccess(result, '属性タグ機能の設定を保存できませんでした');
+        State.attributeTagsEnabled = attributeMaster.checked;
+        changed = State.attributeTagsEnabled !== previous;
+      } catch (error) {
+        State.attributeTagsEnabled = previous;
+        attributeMaster.checked = previous;
+        showNotification(error.message || '属性タグ機能の設定を保存できませんでした', 'error');
+      } finally {
+        delete attributeMaster.dataset.saving;
+        attributeMaster.disabled = false;
+        syncAttributeTagControls();
+        renderTagList();
+        renderNovelList();
+      }
+      // サーバー側でも属性タグ的有無で一覧・タグ一覧・検索が変わるため、
+      // 両方を取り直す。
+      if (changed) {
+        await refreshList();
+        await refreshTags();
+      }
+    });
+  }
   for (const [id, stateKey, settingKey] of [
     ['show-novel-attribute', 'showNovelAttribute', 'tag.show-novel'],
     ['show-manga-attribute', 'showMangaAttribute', 'tag.show-manga'],
@@ -296,6 +333,7 @@ export function bindActions() {
     checkbox.addEventListener('click', event => event.stopPropagation());
     checkbox.addEventListener('change', async () => {
       const previous = State[stateKey];
+      checkbox.dataset.saving = '1';
       checkbox.disabled = true;
       try {
         const result = await postJson('/api/global_setting', {
@@ -308,12 +346,15 @@ export function bindActions() {
         checkbox.checked = previous;
         showNotification(error.message || '属性タグの表示設定を保存できませんでした', 'error');
       } finally {
-        checkbox.disabled = false;
+        delete checkbox.dataset.saving;
+        syncAttributeTagControls();
         renderTagList();
         renderNovelList();
       }
     });
   }
+  // 初期状態 (既定 OFF) でも種別スイッチの無効化状態を反映する。
+  syncAttributeTagControls();
 
   // --- Tool menu ---
   on('action-tool-notepad', () => { window.location.href = '/notepad'; });

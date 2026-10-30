@@ -261,16 +261,12 @@ impl NovelActionService {
                     record.tags.retain(|existing| !tags.contains(existing));
                 }
                 TagAction::Replace => {
-                    if tags.iter().any(|tag| crate::application::attribute_tags::is_attribute_tag(tag) && !record.tags.contains(tag)) {
+                    if tags.iter().any(|tag| crate::application::attribute_tags::is_attribute_tag(tag) && record.attribute_tag() != Some(tag)) {
                         return Err(ApplicationError::InvalidRequest("属性タグは編集できません".into()));
                     }
-                    let mut replacement: Vec<String> = tags.iter()
+                    record.tags = tags.iter()
                         .filter(|tag| !crate::application::attribute_tags::is_attribute_tag(tag))
                         .cloned().collect();
-                    replacement.extend(record.tags.iter()
-                        .filter(|tag| crate::application::attribute_tags::is_attribute_tag(tag))
-                        .cloned());
-                    record.tags = replacement;
                 }
             }
             if record.tags == before {
@@ -784,7 +780,8 @@ mod tests {
     #[test]
     fn attribute_tags_cannot_be_added_or_removed_and_survive_replacement() {
         let mut record = sample_record(1);
-        record.tags = vec!["手動".into(), "漫画".into()];
+        record.tags = vec!["手動".into()];
+        record.set_attribute_tag("漫画");
         let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
         let service = service(repo.clone(), None);
         for (action, tag) in [(TagAction::Add, "小説"), (TagAction::Remove, "漫画")] {
@@ -796,11 +793,13 @@ mod tests {
         let replacement = TagChangeRequest { ids: vec![NovelId(1)], action: TagAction::Replace, tags: vec!["別".into()] };
         futures::executor::block_on(service.change_tags(&replacement)).unwrap();
         let record = futures::executor::block_on(repo.get(NovelId(1))).unwrap().unwrap();
-        assert_eq!(record.tags, vec!["別", "漫画"]);
+        assert_eq!(record.tags, vec!["別"]);
+        assert_eq!(record.attribute_tag(), Some("漫画"));
         let clear = TagChangeRequest { ids: vec![NovelId(1)], action: TagAction::Replace, tags: vec![] };
         futures::executor::block_on(service.change_tags(&clear)).unwrap();
         let record = futures::executor::block_on(repo.get(NovelId(1))).unwrap().unwrap();
-        assert_eq!(record.tags, vec!["漫画"]);
+        assert!(record.tags.is_empty());
+        assert_eq!(record.attribute_tag(), Some("漫画"));
     }
 
     #[test]

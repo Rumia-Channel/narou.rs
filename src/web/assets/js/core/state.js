@@ -83,6 +83,8 @@ export const State = {
   showHidden: lsBool('show-hidden', false),
   showNovelAttribute: false,
   showMangaAttribute: true,
+  // 属性タグ機能全体の ON/OFF (`tag.attributes-enabled`)。
+  attributeTagsEnabled: false,
   wideMode: lsBool('wide-mode', false),
   settingNewTab: lsBool('setting-new-tab', false),
   buttonsTop: lsBool('buttons-top', true),

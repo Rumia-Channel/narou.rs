@@ -151,9 +151,12 @@ pub fn build_where<B>(filter: &NovelFilter, mut bind: impl FnMut(NovelBind) -> B
         builder.binds.push(bind(NovelBind::Text(fold(domain))));
     }
     if let Some(tag) = &filter.tag {
-        builder
-            .sql
-            .push_str(" AND EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = ?)");
+        if filter.attribute_tags_enabled {
+            builder.sql.push_str(" AND (EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = ?) OR n.attribute_tag = ?)");
+            builder.binds.push(bind(NovelBind::Text(tag.clone())));
+        } else {
+            builder.sql.push_str(" AND EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = ?)");
+        }
         builder.binds.push(bind(NovelBind::Text(tag.clone())));
     }
     if let Some(ncode) = &filter.ncode {
@@ -195,6 +198,9 @@ pub fn build_where<B>(filter: &NovelFilter, mut bind: impl FnMut(NovelBind) -> B
             " AND EXISTS (SELECT 1 FROM json_each(?) WHERE "
         });
         builder.sql.push_str(&term_expression(term.field));
+        if filter.attribute_tags_enabled && matches!(term.field, SearchField::Tag | SearchField::Any) {
+            builder.sql.push_str(" OR instr(COALESCE(n.attribute_tag, ''), value) > 0");
+        }
         builder.sql.push(')');
         builder.binds.push(bind(NovelBind::Text(json)));
     }
@@ -213,6 +219,10 @@ pub fn build_where<B>(filter: &NovelFilter, mut bind: impl FnMut(NovelBind) -> B
         builder
             .binds
             .push(bind(NovelBind::Text(term_values_json(&filter.exclude_tags))));
+        if filter.attribute_tags_enabled {
+            builder.sql.push_str(" AND COALESCE(n.attribute_tag, '') NOT IN (SELECT value FROM json_each(?))");
+            builder.binds.push(bind(NovelBind::Text(term_values_json(&filter.exclude_tags))));
+        }
     }
     if !filter.exclude_authors.is_empty() {
         builder

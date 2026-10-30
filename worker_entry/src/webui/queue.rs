@@ -79,6 +79,12 @@ GROUP BY t.tag COLLATE BINARY
 ORDER BY COUNT(*) DESC, t.tag COLLATE BINARY ASC
 "#;
 
+const ATTRIBUTE_NAMES_SQL: &str = r#"
+SELECT attribute_tag AS tag, COUNT(*) AS n, MIN(id) AS first_novel_id
+FROM novels WHERE attribute_tag IS NOT NULL
+GROUP BY attribute_tag COLLATE BINARY
+"#;
+
 const QUEUE_COUNTS_SQL: &str = r#"
 SELECT status,
        CASE WHEN kind IN ('convert', 'send', 'backup', 'mail') THEN 1 ELSE 0 END AS lane,
@@ -146,7 +152,12 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         select_tag_names(&services.db),
     );
     // Preserve the old empty-list fallback on storage errors.
-    let tag_rows = tag_rows.unwrap_or_default();
+    let mut tag_rows = tag_rows.unwrap_or_default();
+    if narou_rs::application::attribute_tags::enabled(&services.settings).await {
+        let result = services.db.prepare(ATTRIBUTE_NAMES_SQL).all().await?;
+        tag_rows.extend(result.results::<TagName>()?);
+        tag_rows.sort_by(|a, b| b.n.cmp(&a.n).then_with(|| a.tag.cmp(&b.tag)));
+    }
     let tags = tag_rows
         .iter()
         .map(|row| row.tag.clone())

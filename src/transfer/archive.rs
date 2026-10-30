@@ -54,6 +54,13 @@ pub struct ArchiveNovel {
     pub domain: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Work-type classification (`小説` / `漫画`).
+    ///
+    /// The classification is metadata, not an ordinary tag, so it is kept out
+    /// of `tags`. Archives written before this field existed carried it in
+    /// `tags`; those are migrated on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribute_tag: Option<String>,
     pub novel_type: u8,
     /// Files belonging to this novel, sorted by path when built.
     #[serde(default)]
@@ -103,8 +110,11 @@ impl ArchiveFile {
 /// A validated archive returned by [`parse_archive`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedArchive {
-    /// Manifest exactly as stored in the archive. File entries carry digests and
-    /// sizes, but [`ArchiveFile::bytes`] is empty; the payloads are in `novels`.
+    /// Manifest as stored in the archive, normalised: the work-type
+    /// classification lives in [`ArchiveNovel::attribute_tag`] and never in
+    /// [`ArchiveNovel::tags`] (see the `attribute` module). File entries carry
+    /// digests and sizes, but [`ArchiveFile::bytes`] is empty; the payloads are
+    /// in `novels`.
     pub manifest: ArchiveManifest,
     /// Decoded novels in manifest order.
     pub novels: Vec<ParsedNovel>,
@@ -190,6 +200,9 @@ pub(crate) fn build_archive_with_limits(
     let mut total_uncompressed = 0u64;
 
     for (novel_index, novel) in normalized.novels.iter_mut().enumerate() {
+        // The classification is metadata, not a tag: keep it out of `tags`
+        // and migrate legacy archives that embedded it there.
+        super::attribute::normalize(novel)?;
         novel.files.sort_by(|a, b| a.path.cmp(&b.path));
         let mut seen_paths = HashSet::new();
         for file in &mut novel.files {
@@ -400,7 +413,7 @@ pub(crate) fn parse_archive_with_limits(bytes: &[u8], limits: Limits) -> Result<
         )));
     }
 
-    let manifest: ArchiveManifest = serde_json::from_slice(&manifest_bytes)?;
+    let mut manifest: ArchiveManifest = serde_json::from_slice(&manifest_bytes)?;
     if manifest.format_version != FORMAT_VERSION {
         return Err(TransferError::UnsupportedVersion(manifest.format_version));
     }
@@ -417,7 +430,10 @@ pub(crate) fn parse_archive_with_limits(bytes: &[u8], limits: Limits) -> Result<
     let mut normalized_paths: Vec<Vec<String>> =
         (0..manifest.novels.len()).map(|_| Vec::new()).collect();
 
-    for (novel_index, novel) in manifest.novels.iter().enumerate() {
+    for (novel_index, novel) in manifest.novels.iter_mut().enumerate() {
+        // Legacy archives carried the classification inside `tags`; migrate it
+        // into `attribute_tag` so every consumer sees the same shape.
+        super::attribute::normalize(novel)?;
         let mut seen_paths = HashSet::new();
         for (position, file) in novel.files.iter().enumerate() {
             let path = validate_relative_path(&file.path)?;
@@ -839,6 +855,90 @@ mod tests {
                 ("toc.txt".into(), "目次".as_bytes().to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn attribute_tag_travels_in_its_own_field() {
+        let mut manifest = manifest_with_files(vec![file("toc.txt", b"toc")]);
+        manifest.novels[0].attribute_tag = Some("漫画".into());
+        let bytes = build_archive(&manifest).unwrap();
+        let parsed = parse_archive(&bytes).unwrap();
+        let novel = &parsed.manifest.novels[0];
+        assert_eq!(novel.attribute_tag.as_deref(), Some("漫画"));
+        // The classification never leaks into the ordinary tag list.
+        assert!(novel.tags.iter().all(|tag| tag != "漫画"));
+    }
+
+    /// A manifest written before `attribute_tag` existed: the classification
+    /// lived inside `tags`.
+    fn legacy_manifest(tags: &[&str]) -> String {
+        serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "novels": [{
+                "toc_url": "https://example.com/n1/",
+                "title": "T",
+                "author": "A",
+                "sitename": "S",
+                "tags": tags,
+                "novel_type": 1,
+                "files": [{ "path": "toc.txt", "size": 3 }],
+            }],
+        })
+        .to_string()
+    }
+
+    fn legacy_archive(tags: &[&str]) -> Vec<u8> {
+        craft_zip(&[
+            (MANIFEST_PATH, legacy_manifest(tags).as_bytes()),
+            ("novels/0/toc.txt", b"toc"),
+        ])
+    }
+
+    #[test]
+    fn legacy_attribute_in_tags_is_migrated_on_read() {
+        let bytes = legacy_archive(&["fantasy", "小説"]);
+        let parsed = parse_archive(&bytes).unwrap();
+        let novel = &parsed.manifest.novels[0];
+        assert_eq!(novel.attribute_tag.as_deref(), Some("小説"));
+        assert_eq!(novel.tags, vec!["fantasy".to_string()]);
+    }
+
+    #[test]
+    fn conflicting_legacy_attributes_are_dropped() {
+        let bytes = legacy_archive(&["小説", "漫画"]);
+        let parsed = parse_archive(&bytes).unwrap();
+        let novel = &parsed.manifest.novels[0];
+        assert_eq!(novel.attribute_tag, None);
+        assert!(novel.tags.is_empty());
+    }
+
+    #[test]
+    fn unknown_attribute_tag_is_rejected() {
+        let mut manifest = manifest_with_files(vec![file("toc.txt", b"toc")]);
+        manifest.novels[0].attribute_tag = Some("ゲーム".into());
+        // Both directions refuse an unknown classification.
+        assert!(matches!(
+            build_archive(&manifest),
+            Err(TransferError::InvalidArchive(_))
+        ));
+        // A hand-written archive is rejected on read as well.
+        let json = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "novels": [{
+                "toc_url": "https://example.com/n1/",
+                "title": "T",
+                "author": "A",
+                "sitename": "S",
+                "attribute_tag": "ゲーム",
+                "novel_type": 1,
+                "files": [{ "path": "toc.txt", "size": 3 }],
+            }],
+        });
+        let bytes = craft_zip(&[(MANIFEST_PATH, json.to_string().as_bytes()), ("novels/0/toc.txt", b"toc")]);
+        assert!(matches!(
+            parse_archive(&bytes),
+            Err(TransferError::InvalidArchive(_))
+        ));
     }
 
     #[test]

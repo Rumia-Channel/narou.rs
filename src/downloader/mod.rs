@@ -2555,7 +2555,7 @@ impl Downloader {
                             updated.tags.push(tag.clone());
                         }
                     }
-                    crate::application::attribute_tags::set_attribute_tag(&mut updated.tags, work_type.tag());
+                    updated.set_attribute_tag(work_type.tag());
                     let merged_id = updated.id;
                     self.novels
                         .apply_batch(vec![NovelMutation::Upsert(updated)])
@@ -2568,7 +2568,7 @@ impl Downloader {
                     let mut rec = record.clone();
                     rec.id = provisional_id;
                     rec.tags = auto_tags.clone();
-                    crate::application::attribute_tags::set_attribute_tag(&mut rec.tags, work_type.tag());
+                    rec.set_attribute_tag(work_type.tag());
                     self.novels
                         .apply_batch(vec![NovelMutation::Upsert(rec)])
                         .await?;
@@ -2584,7 +2584,7 @@ impl Downloader {
             let mut rec = record.clone();
             rec.id = new_id;
             rec.tags = auto_tags;
-            crate::application::attribute_tags::set_attribute_tag(&mut rec.tags, work_type.tag());
+            rec.set_attribute_tag(work_type.tag());
             self.novels
                 .apply_batch(vec![NovelMutation::Upsert(rec)])
                 .await?;

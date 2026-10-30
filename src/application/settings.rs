@@ -189,6 +189,7 @@ pub const LIVE_WEBUI_CONFIG_NAMES: &[&str] = &[
     "webui.new-tag-color",
     "tag.show-novel",
     "tag.show-manga",
+    "tag.attributes-enabled",
     "webui.debug-mode",
     "concurrency",
 ];
