@@ -2063,6 +2063,7 @@ function onFavoriteTagDragOver(event) {
 }
 
 function onFavoriteTagDragLeave(event) {
+  if (event.relatedTarget && event.currentTarget.contains(event.relatedTarget)) return;
   event.currentTarget.classList.remove('tag-favorite-drop-before', 'tag-favorite-drop-after');
 }
 
