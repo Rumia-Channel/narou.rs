@@ -1,7 +1,31 @@
-//! Reserved work-type tags, shared by the downloader and tag-editing APIs.
+//! Work-type classification and its reserved, read-only tag projection.
 
 pub const NOVEL_TAG: &str = "小説";
 pub const MANGA_TAG: &str = "漫画";
+pub const ENABLED_SETTING: &str = "tag.attributes-enabled";
+
+pub async fn enabled(settings: &crate::application::settings::SettingsService) -> bool {
+    settings.get(ENABLED_SETTING).await.ok().flatten()
+        .and_then(|value| crate::setting_core::setting_bool_value(&value))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "native-runtime")]
+pub fn enabled_native() -> bool {
+    crate::db::settings::bool_value(crate::setting_core::SettingScope::Local, ENABLED_SETTING)
+        .unwrap_or(false)
+}
+
+/// Add attributes only to a disposable presentation snapshot, never storage.
+pub fn project(records: &mut [crate::db::NovelRecord], enabled: bool) {
+    if enabled {
+        for record in records {
+            if let Some(tag) = record.attribute_tag().map(str::to_owned) {
+                record.tags.push(tag);
+            }
+        }
+    }
+}
 
 pub fn is_attribute_tag(tag: &str) -> bool {
     matches!(tag, NOVEL_TAG | MANGA_TAG)
@@ -15,29 +39,20 @@ pub fn is_visible(tag: &str, show_novel: bool, show_manga: bool) -> bool {
     }
 }
 
-/// Replace the previous classification without touching ordinary tags.
-pub fn set_attribute_tag(tags: &mut Vec<String>, tag: &str) {
-    debug_assert!(is_attribute_tag(tag));
-    if tags.iter().filter(|value| is_attribute_tag(value)).count() == 1
-        && tags.iter().any(|value| value == tag)
-    {
-        return;
-    }
-    tags.retain(|value| !is_attribute_tag(value));
-    tags.push(tag.to_string());
-}
-
-/// Infer an existing record's type from persisted metadata. A previous
-/// classification must be kept when a rule needs unavailable page content.
+/// Infer an existing record's type from persisted metadata. Preserve a previous
+/// classification when the site or required page content is unavailable.
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub fn initial_tag(
     record: &crate::db::NovelRecord,
     sites: &[crate::downloader::site_setting::SiteSetting],
 ) -> &'static str {
+    if let Some(tag) = record.attribute_tag() {
+        return if tag == MANGA_TAG { MANGA_TAG } else { NOVEL_TAG };
+    }
     use crate::downloader::site_setting::{WorkType, WorkTypeField, WorkTypeSubjects};
     let site = sites.iter().find(|site| site.matches_url(&record.toc_url))
         .or_else(|| sites.iter().find(|site| record.domain.as_deref() == Some(site.domain.as_str())));
-    if site.is_some_and(|site| site.work_type_rules.iter().any(|rule| rule.field == WorkTypeField::Source)) {
+    if site.is_none() || site.is_some_and(|site| site.work_type_rules.iter().any(|rule| rule.field == WorkTypeField::Source)) {
         let mut attributes = record.tags.iter().filter(|tag| is_attribute_tag(tag));
         if let (Some(tag), None) = (attributes.next(), attributes.next()) {
             return if tag == MANGA_TAG { MANGA_TAG } else { NOVEL_TAG };
@@ -64,19 +79,17 @@ pub fn initial_tag(
 }
 
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
-pub fn needs_initialization(record: &crate::db::NovelRecord, sites: &[crate::downloader::site_setting::SiteSetting]) -> bool {
-    let tag = initial_tag(record, sites);
-    record.tags.iter().filter(|value| is_attribute_tag(value)).count() != 1
-        || !record.tags.iter().any(|value| value == tag)
+pub fn needs_initialization(record: &crate::db::NovelRecord, _sites: &[crate::downloader::site_setting::SiteSetting]) -> bool {
+    record.attribute_tag().is_none() || record.tags.iter().any(|tag| is_attribute_tag(tag))
 }
 
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub fn initialize_record(record: &mut crate::db::NovelRecord, sites: &[crate::downloader::site_setting::SiteSetting]) -> bool {
-    let tag = initial_tag(record, sites);
-    if record.tags.iter().filter(|value| is_attribute_tag(value)).count() == 1
-        && record.tags.iter().any(|value| value == tag) {
+    if !needs_initialization(record, sites) {
         return false;
     }
-    set_attribute_tag(&mut record.tags, tag);
+    let tag = initial_tag(record, sites);
+    record.tags.retain(|value| !is_attribute_tag(value));
+    record.set_attribute_tag(tag);
     true
 }

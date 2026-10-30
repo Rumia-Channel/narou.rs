@@ -14,6 +14,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::ser::SerializeMap;
 
 use crate::db::NovelRecord;
 use crate::error::{NarouError, Result};
@@ -25,7 +26,7 @@ pub const NOVEL_UPSERT_SQL: &str = include_str!("sql/upsert.sql");
 
 /// The SELECT statement shared by both drivers. Its column order is
 /// `NOVEL_SELECT_COLUMNS`; both are pinned to each other by tests.
-pub const NOVEL_SELECT_SQL: &str = "SELECT n.id, n.author, n.author_fold, n.title, n.file_title, n.toc_url, n.sitename, n.novel_type, n.end, n.last_update, n.new_arrivals_date, n.use_subdirectory, n.general_firstup, n.novelupdated_at, n.general_lastup, n.last_mail_date, n.tags_json, n.ncode, n.domain, n.general_all_no, n.length, n.suspend, n.is_narou, n.last_check_date, n.convert_failure, n.extra_fields_yaml, n.requires_login, n.login_session FROM novels n";
+pub const NOVEL_SELECT_SQL: &str = "SELECT n.id, n.author, n.author_fold, n.title, n.file_title, n.toc_url, n.sitename, n.novel_type, n.end, n.last_update, n.new_arrivals_date, n.use_subdirectory, n.general_firstup, n.novelupdated_at, n.general_lastup, n.last_mail_date, n.tags_json, n.ncode, n.domain, n.general_all_no, n.length, n.suspend, n.is_narou, n.last_check_date, n.convert_failure, n.extra_fields_yaml, n.requires_login, n.login_session, n.attribute_tag FROM novels n";
 
 /// Columns of the `novels` UPSERT, in the order `NOVEL_UPSERT_SQL` declares
 /// them. This is the single source of truth both drivers' bind lists used to
@@ -67,6 +68,7 @@ pub const NOVEL_COLUMNS: &[&str] = &[
     "extra_fields_bytes",
     "requires_login",
     "login_session",
+    "attribute_tag",
 ];
 
 /// Columns `NOVEL_SELECT_SQL` returns, in row order. Drivers map these names
@@ -100,6 +102,7 @@ pub const NOVEL_SELECT_COLUMNS: &[&str] = &[
     "extra_fields_yaml",
     "requires_login",
     "login_session",
+    "attribute_tag",
 ];
 
 /// Bound on serialized `extra_fields` enforced by the native store. D1
@@ -155,6 +158,20 @@ pub fn parse_optional_time(value: Option<String>) -> Result<Option<DateTime<Utc>
     }
 }
 
+struct SqlExtraFields<'a>(&'a BTreeMap<String, serde_yaml::Value>);
+
+impl serde::Serialize for SqlExtraFields<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut mapping = serializer.serialize_map(Some(self.0.len() - usize::from(self.0.contains_key("attribute_tag"))))?;
+        for (key, value) in self.0 {
+            if key != "attribute_tag" {
+                mapping.serialize_entry(key, value)?;
+            }
+        }
+        mapping.end()
+    }
+}
+
 /// Encode a record into named column values. The returned order is
 /// `NOVEL_COLUMNS`; callers must not rely on it and go through
 /// [`ordered_binds`], which re-derives the order from the actual SQL.
@@ -184,7 +201,7 @@ pub fn novel_binds(record: &NovelRecord) -> Result<Vec<(&'static str, NovelBind)
         .map(|tag| fold(tag))
         .collect::<Vec<_>>()
         .join("\u{1f}");
-    let extra_fields_yaml = serde_yaml::to_string(&record.extra_fields)
+    let extra_fields_yaml = serde_yaml::to_string(&SqlExtraFields(&record.extra_fields))
         .map_err(|error| NarouError::Platform(format!("cannot serialize extra fields: {error}")))?;
     let extra_fields_len = extra_fields_yaml.len() as i64;
 
@@ -235,6 +252,7 @@ pub fn novel_binds(record: &NovelRecord) -> Result<Vec<(&'static str, NovelBind)
             Some(session) => NovelBind::Text(session.clone()),
             None => NovelBind::Null,
         }),
+        ("attribute_tag", record.attribute_tag().map(|tag| NovelBind::Text(tag.to_string())).unwrap_or(NovelBind::Null)),
     ])
 }
 
@@ -521,7 +539,10 @@ where
 
     let tags: Vec<String> = serde_json::from_str(&text_at(&mut map, "tags_json")?)
         .map_err(|error| NarouError::Platform(format!("invalid tags JSON: {error}")))?;
-    let extra_fields = parse_extra_fields(&text_at(&mut map, "extra_fields_yaml")?)?;
+    let mut extra_fields = parse_extra_fields(&text_at(&mut map, "extra_fields_yaml")?)?;
+    if let Some(tag) = opt_text_at(&mut map, "attribute_tag")? {
+        extra_fields.insert("attribute_tag".to_string(), serde_yaml::Value::String(tag));
+    }
     // `#[serde(default)]` on the Worker's row type: a row without the column
     // (old D1 snapshots) reads as 0.
     let requires_login = match map.remove("requires_login") {

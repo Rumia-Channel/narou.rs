@@ -284,6 +284,7 @@ pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
         targets,
         &narou_rs::native::novel_repository::NativeNovelRepository::new(),
         TagExpansionVariant::Download,
+        narou_rs::application::attribute_tags::enabled_native(),
     )
 }
 

@@ -365,7 +365,7 @@ narou_rs download https://kakuyomu.jp/works/2912051601247823656
 
 - 作業ディレクトリ単位で `.narou/` を持つ設計です。`download`、`update`、`convert` などは基本的に初期化済みディレクトリで実行してください。
 - サイトごとの取得・抽出ルールは `webnovel/*.yaml` を使います。ユーザーがこの YAML を編集すると、挙動もそれに追従します。
-- 全作品に編集不可の属性タグ `小説` または `漫画` が 1 つ付きます。サイト定義の `work_type_rules:` と `preprocess:` DSL で判定を変更でき、条件が無い場合は小説です。Pixiv の `a` / `c` は漫画扱い（単体イラスト・うごイラを含む）です。表示は Web UI のタグメニュー、または `narou setting tag.show-novel=true` / `narou setting tag.show-manga=false` で切り替えられます。既定は小説非表示・漫画表示です。定義例と既存データの扱いは [コマンド一覧](COMMANDS.md) を参照してください。
+- 全作品を `小説` または `漫画` に分類し、通常タグと別の項目に保存します。サイト定義の `work_type_rules:` と `preprocess:` DSL で判定を変更でき、条件が無い場合は小説です。Pixiv の `a` / `c` は漫画扱い（単体イラスト・うごイラを含む）です。編集不可の属性タグとして表示・検索する機能は既定 OFF で、Web UI のタグメニューまたは `narou setting tag.attributes-enabled=true` で有効にできます。ON 時の個別表示は `tag.show-novel`（既定 false）と `tag.show-manga`（既定 true）で切り替えます。OFF 中も分類は保持されます。定義例と既存データの扱いは [コマンド一覧](COMMANDS.md) を参照してください。
 - 保存データや設定ファイルは [narou.rb](https://github.com/whiteleaf7/narou) 互換の YAML / ディレクトリ構成を重視しています。
 - Pixiv は本文・目次・作品情報を `/ajax/*` の JSON から取得します (`webnovel/www.pixiv.net.yaml`)。挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は画像 URL を追加 API から解決して `挿絵/` に取り込みます。ログイン限定作品やログインでしか全部見えない作品一覧は、保存したログイン Cookie を順に試して再取得します。
 - Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。うごイラ (フレーム集約 zip) は APNG に組み立てて取り込みます。APNG 化に必要なコーデックは `illustration-animation` feature にあり、native と Worker の両方で有効です（`zip` は wasm でも動くよう純 Rust の deflate バックエンドに絞っています）。R18 作品はログインしていないと一覧に現れないため、含むシリーズは先に `narou_rs_login` で Cookie を保存してください。

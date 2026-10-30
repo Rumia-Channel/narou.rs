@@ -147,6 +147,7 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
         "webui.tag-sort-order",
         "tag.show-novel",
         "tag.show-manga",
+        "tag.attributes-enabled",
         "concurrency",
     ];
     let loaded: Vec<Option<serde_yaml::Value>> = state
@@ -197,6 +198,8 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
         "tag_sort_order": tag_sort_order.setting_value(),
         "show_novel_attribute": find("tag.show-novel").and_then(|value| crate::setting_core::setting_bool_value(&value)).unwrap_or(false),
         "show_manga_attribute": find("tag.show-manga").and_then(|value| crate::setting_core::setting_bool_value(&value)).unwrap_or(true),
+        // 属性タグ機能全体の ON/OFF。OFF の間は個別表示スイッチも効かない。
+        "attribute_tags_enabled": find("tag.attributes-enabled").and_then(|value| crate::setting_core::setting_bool_value(&value)).unwrap_or(false),
         "ws_port": state.ws_port,
         "port": state.port,
         "concurrency_enabled": concurrency_enabled,
@@ -216,7 +219,13 @@ pub async fn tag_list(
     Query(params): Query<TagListParams>,
 ) -> Response {
     let new_tag_color = super::configured_tag_color(&state).await;
-    let records = state.services.library.records().await.unwrap_or_default();
+    let mut records = state.services.library.records().await.unwrap_or_default();
+    // 属性タグは独立した項目として扱い、機能 OFF の間は候補に載せない
+    // (Worker の `ATTRIBUTE_NAMES_SQL` と同じ規則)。
+    crate::application::attribute_tags::project(
+        &mut records,
+        crate::application::attribute_tags::enabled(&state.services.settings).await,
+    );
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for record in &records {
         for tag in &record.tags {

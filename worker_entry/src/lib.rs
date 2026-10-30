@@ -289,6 +289,7 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
             hidden: None,
             include_hidden: true,
             exclude_ids: Vec::new(),
+            attribute_tags_enabled: narou_rs::application::attribute_tags::enabled(&services.settings).await,
         })
         .await
         .map_err(|error| Error::RustError(error.to_string()))?;

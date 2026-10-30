@@ -2085,7 +2085,11 @@ pub async fn api_update_by_tag(
     // Snapshot current matching novel IDs before queuing, then run through the
     // same update worker path used by normal selected-ID updates.
     let server_sort_state = current_web_update_sort_state();
-    let records = state.services.library.records().await.unwrap_or_default();
+    let mut records = state.services.library.records().await.unwrap_or_default();
+    crate::application::attribute_tags::project(
+        &mut records,
+        crate::application::attribute_tags::enabled(&state.services.settings).await,
+    );
     let snapshot_ids: Vec<i64> = {
         let mut matching = records
             .into_iter()
@@ -2160,7 +2164,11 @@ pub async fn api_taginfo(
             _ => None,
         })
         .collect();
-    let records = state.services.library.records().await.unwrap_or_default();
+    let mut records = state.services.library.records().await.unwrap_or_default();
+    crate::application::attribute_tags::project(
+        &mut records,
+        crate::application::attribute_tags::enabled(&state.services.settings).await,
+    );
     let selected_ids = sort_ids_from_records(
         &selected_ids,
         &records,

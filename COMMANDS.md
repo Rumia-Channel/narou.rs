@@ -188,7 +188,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - カクヨムネクスト (`webnovel/kakuyomu.jp.yaml`, version 2.6) は目次の `EmptyEpisode` を `login_partial_pattern` で検出し、保存済みログインを順に試す。制限が残れば取得範囲を警告して無料分だけを取得し、後から閲覧権のある Cookie を保存して更新すると残りも取得できる。採用したセッションは本文取得と次回更新でも使い、通常の公開作品には Cookie を送らない。本文 URL が作品トップ等へ戻され、本文枠が無い場合も DSL で失敗させ、空本文をキャッシュ・保存しない。サイト固有の判定は YAML / DSL に置く
 - 部分一覧に保存済みの話が欠ける場合は、既定では話の削除やダイジェスト化とは判定せず `Canceled` で更新を見送り、目次・本文を保持する（force 時も同じ）。サイト定義の `preserve_missing_sections: true`（Pixiv・カクヨムで有効）は、話番号と URL の同一性を確認できる保存済み本文を保持しながら、閲覧できる話を更新・追加する。対応が曖昧な場合は従来どおり見送る。閲覧できる話が 0 件なら部分一覧の目印の有無によらず保存ログインを試し、それでも 0 件なら登録・本文更新・自動変換をせず、既存データと未使用 ID を保持する。
 - サイト定義の `min_interval:` でサイトごとの最低リクエスト間隔 (秒) の下限を宣言でき、該当サイトのレートリミットスコープにだけ適用される
-- 全作品に属性タグ `小説` / `漫画` のいずれかを 1 つ付ける。サイト定義の `work_type_rules:` に `field`・正規表現 `match`・`type: novel|manga` を指定し、最初に一致した規則を採用する。定義なし・未一致は小説。判定対象は `ncode` / `title` / `author` / `url` (取得用 `toc_url`) / `novel_type` (連載 `1`・短編 `2`) / `episode_count` / `source` (前処理済み最初の目次ページ) から明示する。Pixiv だけは ncode が `a` / `c` なら漫画に分類する（`a` にはイラストとうごイラも含む）。サイト固有の分類処理は `preprocess:` DSL で記述できる。
+- 全作品を `小説` / `漫画` のいずれかに分類し、通常タグとは別の `attribute_tag` に保存する。サイト定義の `work_type_rules:` に `field`・正規表現 `match`・`type: novel|manga` を指定し、最初に一致した規則を採用する。定義なし・未一致は小説。判定対象は `ncode` / `title` / `author` / `url` (取得用 `toc_url`) / `novel_type` (連載 `1`・短編 `2`) / `episode_count` / `source` (前処理済み最初の目次ページ) から明示する。Pixiv だけは ncode が `a` / `c` なら漫画に分類する（`a` にはイラストとうごイラも含む）。サイト固有の分類処理は `preprocess:` DSL で記述できる。
 
   ```yaml
   work_type_rules:
@@ -204,7 +204,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
   ```
 
   この例ではサイトの目次から種別を抽出し、DSL の出力を `source` で照合する。既存作品の初期分類は保存済みの作品情報を使用するため、過去の取得ページが保存されていない `source` 条件は評価できない。既存の属性があれば保持し、無ければいったん小説となり、次回更新で前処理を実行して再分類する。ページ内容が不要な条件は保存済み情報から判定する。
-  分類タグは手動で追加・削除できず、更新時にルールが変われば以前の分類を置き換える。表示は CLI の `narou setting tag.show-novel=true` / `narou setting tag.show-manga=false`、または Web UI の「タグ」→「属性タグの表示」で切り替える（既定は小説 OFF・漫画 ON）。表示設定は検索や保存データを変更しない。
+  分類は手動で追加・削除できず、更新時にルールが変われば以前の分類を置き換える。属性タグ機能は既定 OFF で、`narou setting tag.attributes-enabled=true` または Web UI の「タグ」→「属性タグ機能を使う」で ON にすると検索・表示に使える。OFF 中も分類は保存され、検索・表示には使わない。ON 時の個別表示は `tag.show-novel` / `tag.show-manga` で切り替える（既定は小説非表示・漫画表示）。個別表示の設定は検索や保存データを変更しない。
   既存の通常タグに `小説` / `漫画` があった場合も、この 2 名は属性用に予約されるため、保存済み情報から判定できる条件ではサイト定義に従う属性へ置き換わる。他の通常タグは保持する。
 
 
@@ -591,6 +591,7 @@ narou setting name         # 読み取り
 | `economy` | multiple | 省容量設定 (cleanup_temp/send_delete/nosave_diff/nosave_raw) |
 | `guard-spoiler` | boolean | DL時の話名非表示 |
 | `auto-add-tags` | boolean | サイトタグ自動追加 |
+| `tag.attributes-enabled` | boolean | 属性タグ機能を有効にする。既定 false。OFF 中も分類は保存し、表示・検索には使わない |
 | `tag.show-novel` | boolean | CLI と Web UI で小説属性を表示する。既定 false |
 | `tag.show-manga` | boolean | CLI と Web UI で漫画属性を表示する。既定 true |
 | `time-zone` | string | YAML に timezone がないサイト日時の既定タイムゾーン |

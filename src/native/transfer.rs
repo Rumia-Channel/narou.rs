@@ -431,6 +431,7 @@ pub fn archive_novel_from_record(
         sitename: record.sitename.clone(),
         domain: record.domain.clone(),
         tags: record.tags.clone(),
+        attribute_tag: record.attribute_tag().map(str::to_string),
         novel_type: record.novel_type,
         files,
         ncode: record.ncode.clone(),
@@ -562,6 +563,12 @@ fn create_novel(
         login_session: None,
         extra_fields: Default::default(),
     };
+    // The classification is metadata, not a tag: it travels in its own field.
+    // An archive without one leaves the record to the repository's own
+    // initialization.
+    if let Some(attribute) = metadata.attribute_tag.as_deref() {
+        record.set_attribute_tag(attribute);
+    }
 
     let novel_dir = db::novel_dir_for_record(archive_root, &record);
     if novel_dir.exists() {
@@ -672,6 +679,15 @@ fn overwrite_novel(
         && let Some(lastup) = parse_rfc3339(metadata.general_lastup.as_deref())
     {
         updated.general_lastup = Some(lastup);
+        changed = true;
+    }
+    // The classification is metadata the archive carries explicitly, so an
+    // overwrite restores it. An archive without one leaves the live
+    // classification untouched.
+    if let Some(attribute) = metadata.attribute_tag.as_deref()
+        && updated.attribute_tag() != Some(attribute)
+    {
+        updated.set_attribute_tag(attribute);
         changed = true;
     }
 

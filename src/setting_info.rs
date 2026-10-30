@@ -47,6 +47,7 @@ pub fn default_local_setting_value(name: &str) -> Option<serde_yaml::Value> {
         "user-agent" => Some(serde_yaml::Value::String("auto".to_string())),
         "tag.show-novel" => Some(serde_yaml::Value::Bool(false)),
         "tag.show-manga" => Some(serde_yaml::Value::Bool(true)),
+        "tag.attributes-enabled" => Some(serde_yaml::Value::Bool(false)),
         "queue.max-retries" => Some(serde_yaml::Value::Number(serde_yaml::Number::from(3))),
         "queue.retry-backoff" => {
             Some(serde_yaml::Value::String("1m,5m,15m".to_string()))
@@ -118,6 +119,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "auto-add-tags"
         | "tag.show-novel"
         | "tag.show-manga"
+        | "tag.attributes-enabled"
         | "s3.asset-backend"
         | "s3.endpoint"
         | "s3.bucket"
@@ -1010,6 +1012,13 @@ pub fn setting_variables() -> SettingVariables {
         (
             "tag.show-manga",
             vis(VarType::Boolean, "属性タグ「漫画」を CLI と WEB UI に表示する (既定 true)"),
+        ),
+        (
+            "tag.attributes-enabled",
+            vis(
+                VarType::Boolean,
+                "属性タグ機能を有効にする。OFF の間は分類を保存するだけで、表示・検索には属性タグを使わない (既定 false)",
+            ),
         ),
         (
             "webui.new-tag-color",

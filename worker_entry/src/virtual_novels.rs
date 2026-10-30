@@ -174,7 +174,6 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
     tags.push(core::tag(id));
     tags.sort();
     tags.dedup();
-    narou_rs::application::attribute_tags::set_attribute_tag(&mut tags, narou_rs::application::attribute_tags::NOVEL_TAG);
     let limit = load_length_limit("folder-length-limit", Some(50));
     let file_title = sanitize_filename_with_limit(&title, limit);
     let file_title = if file_title.is_empty() {
@@ -182,7 +181,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
     } else {
         file_title
     };
-    let record = NovelRecord {
+    let mut record = NovelRecord {
         id,
         author: body.author.clone(),
         title: title.clone(),
@@ -211,6 +210,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         login_session: None,
         extra_fields: Default::default(),
     };
+    record.set_attribute_tag(narou_rs::application::attribute_tags::NOVEL_TAG);
     runtime
         .novels
         .apply_batch(vec![NovelMutation::Upsert(record.clone())])

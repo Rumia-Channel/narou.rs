@@ -121,11 +121,20 @@ try {
     INSERT INTO novel_tags(novel_id,position,tag,tag_fold) VALUES (901,0,'漫画','漫画');`);
   await start();
   assert((await api('/api/tag_list?format=json')).ok, 'legacy attribute migration must complete');
-  assert.deepEqual(sql('SELECT ncode,tags_json FROM novels ORDER BY id').map((row) => [row.ncode, JSON.parse(row.tags_json)]), [
-    ['a900', ['漫画']], ['n901', ['小説']],
+  assert.deepEqual(sql('SELECT ncode,tags_json,attribute_tag FROM novels ORDER BY id').map((row) => [row.ncode, JSON.parse(row.tags_json), row.attribute_tag]), [
+    ['a900', [], '漫画'], ['n901', [], '小説'],
   ]);
-  assert.deepEqual(sql('SELECT tag FROM novel_tags ORDER BY novel_id').map((row) => row.tag), ['漫画', '小説']);
+  assert.deepEqual(sql('SELECT tag FROM novel_tags ORDER BY novel_id').map((row) => row.tag), []);
   let viewConfig = await json('/api/webui/config?fresh=1');
+  assert.equal(viewConfig.attribute_tags_enabled, false);
+  assert.deepEqual((await json('/api/tag_list?format=json')).tags, []);
+  assert.equal((await json(`/api/list?filter=${encodeURIComponent('tag:漫画')}`)).records_filtered, 0);
+  await setting({'tag.attributes-enabled': true}, {'tag.attributes-enabled': null});
+  assert((await json('/api/tag_list?format=json')).tags.includes('漫画'));
+  assert.equal((await json(`/api/list?filter=${encodeURIComponent('tag:漫画')}`)).records_filtered, 1);
+  await setting({'tag.attributes-enabled': false}, {'tag.attributes-enabled': true});
+  assert.equal((await json(`/api/list?filter=${encodeURIComponent('tag:漫画')}`)).records_filtered, 0);
+  assert.equal(sql('SELECT attribute_tag FROM novels WHERE id=900')[0].attribute_tag, '漫画');
   assert.equal(viewConfig.show_novel_attribute, false);
   assert.equal(viewConfig.show_manga_attribute, true);
   await setting({'tag.show-novel': true, 'tag.show-manga': false}, {'tag.show-novel': null, 'tag.show-manga': null});
@@ -153,9 +162,11 @@ try {
   assert.deepEqual((await json('/api/authors')).authors, [{ site: 'localhost', url: storedUrl }]);
   const first = await update(); assert.equal(first.count, 0); assert.equal(first.author_job_ids.length, 1);
   assert.deepEqual(sql('SELECT ncode FROM novels ORDER BY ncode').map((row) => row.ncode), ['work1', 'work2']);
-  let tagged = sql('SELECT id, ncode, tags_json FROM novels ORDER BY ncode');
-  assert.deepEqual(JSON.parse(tagged[0].tags_json), ['漫画']);
-  assert.deepEqual(JSON.parse(tagged[1].tags_json), ['小説']);
+  let tagged = sql('SELECT id, ncode, tags_json, attribute_tag FROM novels ORDER BY ncode');
+  assert.deepEqual(JSON.parse(tagged[0].tags_json), []);
+  assert.equal(tagged[0].attribute_tag, '漫画');
+  assert.deepEqual(JSON.parse(tagged[1].tags_json), []);
+  assert.equal(tagged[1].attribute_tag, '小説');
   assert.equal((await api(`/api/novels/${tagged[0].id}/tags/remove`, { tags: ['漫画'] })).status, 400);
   assert.equal((await api(`/api/novels/${tagged[1].id}/tags`, { tags: ['漫画'] })).status, 400);
   await json(`/api/novels/${tagged[1].id}/tags`, { tags: ['手動'] });
@@ -163,9 +174,11 @@ try {
   console.log('PASS author registration persists across restart; empty-library update discovers and downloads works');
   workCount = 3; await update();
   assert.deepEqual(sql('SELECT ncode FROM novels ORDER BY ncode').map((row) => row.ncode), ['work1', 'work2', 'work3']);
-  tagged = sql('SELECT ncode, tags_json FROM novels ORDER BY ncode');
-  assert.deepEqual(JSON.parse(tagged[0].tags_json), ['小説']);
-  assert.deepEqual(JSON.parse(tagged[1].tags_json), ['手動', '漫画']);
+  tagged = sql('SELECT ncode, tags_json, attribute_tag FROM novels ORDER BY ncode');
+  assert.deepEqual(JSON.parse(tagged[0].tags_json), []);
+  assert.equal(tagged[0].attribute_tag, '小説');
+  assert.deepEqual(JSON.parse(tagged[1].tags_json), ['手動']);
+  assert.equal(tagged[1].attribute_tag, '漫画');
   const downloads = count("SELECT COUNT(*) FROM worker_jobs WHERE kind='download'"); await update();
   assert.equal(count("SELECT COUNT(*) FROM worker_jobs WHERE kind='download'"), downloads, 'known works must not create new download jobs');
   console.log('PASS later publications are discovered automatically; known works do not create duplicate downloads');

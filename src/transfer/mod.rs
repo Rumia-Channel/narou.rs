@@ -30,6 +30,7 @@
 //! keeps the module usable on `wasm32-unknown-unknown`.
 
 mod archive;
+mod attribute;
 mod error;
 mod import;
 

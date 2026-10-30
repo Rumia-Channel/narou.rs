@@ -432,6 +432,7 @@ fn expand_tag_targets(targets: &[String]) -> Vec<String> {
         targets,
         &narou_rs::native::novel_repository::NativeNovelRepository::new(),
         TagExpansionVariant::Update,
+        narou_rs::application::attribute_tags::enabled_native(),
     )
 }
 
@@ -2013,7 +2014,8 @@ mod tests {
                     replacement.tags = vec!["replacement".into()];
                     repository.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(replacement)]).unwrap();
                 }).unwrap();
-                assert_eq!(record.tags, vec!["replacement", "小説"]);
+                assert_eq!(record.tags, vec!["replacement"]);
+                assert_eq!(record.attribute_tag(), Some("小説"));
                 assert!(!record.extra_fields.contains_key("concurrent_unknown"));
             }
         }

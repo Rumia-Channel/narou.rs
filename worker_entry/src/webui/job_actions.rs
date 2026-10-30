@@ -412,6 +412,7 @@ async fn api_update(
             &sorted,
             &existing_numeric,
             narou_rs::application::target_lookup::TagExpansionVariant::Update,
+            narou_rs::application::attribute_tags::enabled(&runtime.write_services().settings).await,
         )
         .await;
         // サイト定義 (オブジェクトストア LIST) は URL 解決でしか要らない:
@@ -822,7 +823,11 @@ async fn api_update_by_tag(
         load_current_sort_state_for_writes(runtime),
         runtime.write_services().library.records(),
     );
-    let records = records.unwrap_or_default();
+    let mut records = records.unwrap_or_default();
+    narou_rs::application::attribute_tags::project(
+        &mut records,
+        narou_rs::application::attribute_tags::enabled(&runtime.write_services().settings).await,
+    );
     let snapshot_ids: Vec<i64> = {
         let mut matching = records
             .into_iter()

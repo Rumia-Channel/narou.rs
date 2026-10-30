@@ -844,9 +844,29 @@ export function updateEnableSelected() {
 
 /* ===== Tags ===== */
 export function attributeTagVisible(tag) {
-  if (tag === '小説') return State.showNovelAttribute;
-  if (tag === '漫画') return State.showMangaAttribute;
+  // 属性タグ機能全体が OFF のときは種別スイッチに関係なく属性タグを出さない。
+  if (tag === '小説' || tag === '漫画') {
+    if (!State.attributeTagsEnabled) return false;
+    return tag === '小説' ? State.showNovelAttribute : State.showMangaAttribute;
+  }
   return true;
+}
+
+/**
+ * 属性タグ機能全体のスイッチと種別スイッチの状態を UI に反映する。
+ * 機能 OFF の間は種別スイッチを無効化 (値は保存されたまま保持する)。
+ */
+export function syncAttributeTagControls() {
+  const master = document.getElementById('enable-attribute-tags');
+  if (master && master.dataset.saving !== '1') {
+    master.checked = Boolean(State.attributeTagsEnabled);
+  }
+  const enabled = Boolean(State.attributeTagsEnabled);
+  for (const id of ['show-novel-attribute', 'show-manga-attribute']) {
+    const checkbox = document.getElementById(id);
+    if (!checkbox) continue;
+    checkbox.disabled = !enabled || checkbox.dataset.saving === '1';
+  }
 }
 
 
