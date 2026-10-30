@@ -95,16 +95,26 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | # | ID | ラベル | Rust |
 |---|-----|--------|------|
 | 1 | `#action-option-settings` | 環境設定... | ✅ |
+| 2 | `#action-option-hidden` | 非表示設定... | ✅ |
+| 3 | `#action-option-export` | 選択した作品をダウンロード... | ✅ |
+| 4 | `#action-option-import` | 小説データをアップロード... | ✅ |
+| 5 | `#action-option-virtual-add` | 選択した作品をバーチャル小説にまとめる... | ✅ |
+| 6 | `#action-option-virtual-append` | 選択した作品をバーチャル小説に追加... | ✅ |
+| 7 | `#action-option-virtual-order` | バーチャル小説の順序を変更... | ✅ |
+| 8 | `#action-option-virtual-convert` | バーチャル小説を変換... | ✅ |
+| 9 | `#action-option-virtual-remove` | バーチャル小説を削除... | ✅ |
 | — | divider | — | ✅ |
-| 2 | `#action-option-help` | ヘルプ... | ✅ |
-| 3 | `#action-option-about` | Narou.rs について | ✅ (バージョン表示モーダル) |
+| 10 | `#action-option-help` | ヘルプ... | ✅ |
+| 11 | `#action-option-about` | Narou.rs について | ✅ (バージョン表示モーダル) |
 | — | divider | — | ✅ |
-| 4 | `#action-lang-toggle` | Language切替 (日本語 ↔ English) | ✅ (Rust独自) |
+| 12 | `#action-lang-toggle` | Language切替 (日本語 ↔ English) | ✅ (Rust独自) |
 | — | divider | — | ✅ |
-| 5 | `#theme-select` | テーマ選択 (Cerulean/Darkly/Readable/Slate/Superhero/United) | ✅ (セレクトボックス、localStorage永続化) |
+| 13 | `#theme-select` | テーマ選択 (Cerulean/Darkly/Readable/Slate/Superhero/United) | ✅ (セレクトボックス、localStorage永続化) |
 | — | divider | — | ✅ |
-| 6 | `#action-option-server-reboot` | サーバを再起動 | ✅ (確認ダイアログ付き) |
-| 7 | `#action-option-shutdown` | サーバをシャットダウン | ✅ (確認ダイアログ付き) |
+| 14 | `#action-option-server-reboot` | サーバを再起動 | ✅ (確認ダイアログ付き) |
+| 15 | `#action-option-shutdown` | サーバをシャットダウン | ✅ (確認ダイアログ付き) |
+
+非表示設定のタグ・作者・サイトは、非表示中も含む一覧対象の作品から入力候補を表示する（バーチャル小説のメンバー行は一覧対象外）。候補は入力で絞り込み、クリックまたは矢印キーと Enter で選択できる。手入力も可能。
 
 #### 2.1.7 キュー表示 (右ナビバー)
 
@@ -289,11 +299,51 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 - 解除: お気に入り一覧の「×」ボタン、または「★」ボタンの切り替え
 - お気に入り一覧の「追加」ボタンで、選択中の小説へそのタグを付ける
 - 登録順は保持する (登録した順に並ぶ)
+- **並べ替え**: お気に入り一覧のタグはドラッグ＆ドロップで並べ替えられる
+  (2 件以上のときだけドラッグ可)。ドロップ位置はカーソルがチップの左半分なら
+  「前」、右半分なら「後」。並べ替えた順序は保存される
 - 保存先: 在庫の `favorite_tags` キー (Native は `.narou/favorite_tags.yaml` /
   SQLite `app_state('inv','favorite_tags')`、Worker は D1 の同じキー)
 - タグ色は独立した設定。お気に入りに登録しても色は変わらず、色を変えても
   お気に入りは外れない
-- API: GET / POST `/api/favorite_tags` (`action`: `add` / `remove` / `clear`)
+- API: GET / POST `/api/favorite_tags` (`action`: `add` / `remove` / `clear` / `reorder`)
+
+### 2.7.2 タグ一覧の並び順
+
+**Rust版: ✅ 実装済み (issue #46 の要望)**
+
+メインメニューの「タグ」に並んだタグ一覧は、並び順を選べる。設定は
+`webui.tag-sort-order` (Web UI の設定ページ、または `narou setting
+webui.tag-sort-order=...` で変更)。
+
+| 値 | 並び | 備考 |
+|:---|:---|:---|
+| `favorites_first` (既定) | お気に入り優先 | お気に入りタグが先頭。残りは件数降順 → 名前昇順 |
+| `alphabetical` | アルファベット順 | タグ名の昇順 |
+| `count` | 使用件数順 | 件数の降順、同数は名前昇順 |
+| `registered` | 登録順 | タグがライブラリへ入った順 (初めて付いた順) |
+
+- 並べ替えは保存しないと次の起動で元に戻る (設定なので永続化される)
+- `webui.tag-sort-order` は Worker 側でも同じ設定名を使う
+- **登録順の保存先**: 在庫の `tag_sequence` キー (Native は
+  `.narou/tag_sequence.yaml`、SQLite 管理と Worker は
+  `app_state('inv','tag_sequence')`)。タグごとにグローバルな連番を振り、
+  最初にタグが付いたとき順番が決まります。小説 ID の順ではないため、古い
+  小説へ後からタグを付けても「タグが library へ入った順」が保たれます。
+  既存ライブラリには連番が無いので、最初の書き込みで最小小説 ID → タグ名の
+  順にバックフィルします (以後の新しいタグは登録順の末尾に足ります)。
+- 連番表の更新は作品と同じ直列化境界の中で行います (Native は同じ
+  トランザクション / ファイルロック、Worker は同じ D1 batch)。そのため
+  同時に作品へタグを付けても、並んだ順が保存した順と食い違えません。
+
+### 2.7.3 属性タグ
+
+各作品の `小説` / `漫画` の分類は通常タグと別に保存し、手動で追加・削除できない。
+「タグ」メニューの「属性タグ機能を使う」、または
+`narou setting tag.attributes-enabled=true` で機能を有効にすると表示・検索できる。
+既定は OFF。OFF 中も分類は保持されるが、タグ表示・検索・非表示タグの照合には使わない。
+ON 時の「小説」「漫画」チェックは表示だけを切り替える (既定は小説 OFF・漫画 ON)。
+分類条件と既存データの移行については [コマンド一覧](COMMANDS.md) を参照。
 
 ---
 
@@ -332,8 +382,13 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 既存タグ表示 | 色付きバッジ | タグバッジ (×削除ボタン付き) | ✅ |
 | タグ追加 | テキスト入力 | `#new-tag-input` + 追加ボタン | ✅ |
 | タグ削除 | ×ボタン | `.tag-remove` ×ボタン | ✅ |
+| 色の変更 / お気に入り | なし | バッジの 2 段目 (タグ名の下) に `色` と `★ / ☆` のボタン | ✅ |
 | 複数小説一括適用 | あり | あり (selectedIds / single ID) | ✅ |
 | Enter で追加 | あり | あり | ✅ |
+
+バッジはタグ名の上に文字、下に操作ボタン (色 / ★) を並べる 2 段組みで、ボタンも
+1.35em 角に如其して押しやすい大きさにしてある。削除の × だけは色・★ と押し間違えない
+ようにタグ名のすぐ隣 (同じ段) に置いている。お気に入りタグの一覧も同じ形。
 
 ### 3.3 Aboutモーダル
 
@@ -361,10 +416,25 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 
 ### 3.5 確認ダイアログ
 
+**Rust版: ✅ 実装済み (`js/ui/dialog.js`)**
+
+ブラウザ標準の `alert` / `confirm` / `prompt` は使わず、ページと同じテーマの
+モーダルで表示する。`index.html` と `settings.html` の両方から使えるよう、
+markup は初回表示時に JS が組み立てる (`#app-dialog`、HTML 側の変更は不要)。
+
 | 機能 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
-| 汎用確認モーダル | bootbox.js カスタム | `#confirm-modal` (HTML) + `confirm()` (JS) | ✅ |
+| 確認 (OK / キャンセル) | bootbox.js カスタム | `confirmDialog()` | ✅ |
+| 通知 (OK のみ) | bootbox.js カスタム | `alertDialog()` | ✅ |
+| 1 行入力 (必須/任意) | — | `promptDialog()` (空欄は入力欄へフォーカスして閉じない) | ✅ |
+| 複数項目の入力 | — | `formDialog()` (候補リスト付きの入力欄も可) | ✅ |
+| 一覧からの選択 | — | `selectDialog()` (ラジオ形式、`detail` に補足) | ✅ |
+| キャンセル操作 | — | × / キャンセル / Escape / 背景クリック | ✅ |
 | サーバー主導モーダル | `ping.modal` WebSocket | なし | ❌ |
+
+置き換え済みの箇所: バーチャル小説の登録・操作対象の選択・削除・追加、
+シャットダウン / 再起動 / セルフアップデートの確認、設定ページのデータ管理方式
+切替・ログイン名変更・ログイン情報の削除。
 
 ### 3.6 メモ帳モーダル
 
@@ -427,6 +497,30 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 確認実行 | POST `/api/update_general_lastup` | 同左 | ✅ |
 | 公式サイトリンク | `http://dev.syosetu.com/man/api/` | 同左 | ✅ |
 
+### 3.11 バーチャル小説
+
+**Rust版: ✅ 実装済み (`#action-option-virtual-*` / `#virtual-order-modal`)**
+
+| 機能 | Rust版 | 状態 |
+|------|--------|------|
+| 選択した作品をバーチャル小説にまとめる | `#action-option-virtual-add` → `formDialog` (タイトル / 作者名 / サイト名) | ✅ |
+| 選択した作品を既存のバーチャル小説へ追加 | `#action-option-virtual-append` → `POST /api/virtual_novels/{id}/members` | ✅ |
+| 登録順の変更 | `#action-option-virtual-order` → `#virtual-order-modal` (↑ / ↓) | ✅ |
+| 変換 | `#action-option-virtual-convert` → `POST /api/virtual_novels/{id}/convert` (native) | ✅ |
+| 削除 | `#action-option-virtual-remove` → `DELETE /api/virtual_novels/{id}` | ✅ |
+
+- バーチャル小説の作者名・サイト名の入力欄は候補リスト付き (入力で絞り込み、↓ / ↑ で
+  候補を動かして Enter またはクリックで入力欄へ入れる)。ブラウザ標準の `datalist` は
+  使わず、同じスタイルの一覧を自前で描画する。
+- 操作対象の決め方: 一覧で**バーチャル小説をちょうど 1 件選択**しているときは、
+  その作品を対象にして ncode の入力を求めない。登録が 1 件だけのときも同様。
+  それ以外は `selectDialog` で一覧から選ぶ (以前の ncode 手入力は廃止)。
+- 追加した作品はメンバーとして通常の一覧から隠れ、EPUB には登録順の末尾へ結合
+  される。仮想小説のタグ・話数 (`general_all_no`)・最新話掲載日も再計算される。
+- API: `POST /api/virtual_novels/{id}/members` (native / Worker 共通、body は
+  `{"members": [id, ...]}`)。既に別の仮想小説に属する作品、仮想小説自身、
+  重複は 400 で拒否する。
+
 ---
 
 ## 4. キーボードショートカット
@@ -487,6 +581,16 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/novels/{id}` | GET | ✅ |
 | `/api/novels/{id}` | DELETE | ✅ |
 | `/api/webui/config` | GET | ✅ |
+
+### 6.1b 小説データの ZIP 転送
+
+| エンドポイント | メソッド | Rust |
+|-------------|--------|------|
+| `/api/transfer/export?ids=1,2` | GET | ✅ (`application/zip`) |
+| `/api/transfer/import?overwrite=true` | POST | ✅ (ZIP 本文、body limit 512 MiB) |
+
+ZIP の書式 (`manifest.json` のスキーマ・検証ルール・衝突規則・挿絵の扱い) は
+[`docs/transfer-archive-format.md`](docs/transfer-archive-format.md) を参照。
 
 ### 6.2 ダウンロード・更新・変換
 

@@ -22,6 +22,15 @@ use crate::platform::{
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, PlatformFuture,
 };
 
+fn initialize_attributes(mutations: &mut [NovelMutation]) {
+    let sites = crate::downloader::site_setting::effective_site_settings();
+    for mutation in mutations {
+        if let NovelMutation::Upsert(record) = mutation {
+            crate::application::attribute_tags::initialize_record(record, &sites);
+        }
+    }
+}
+
 /// Native repository. Stateless: every operation locks the shared
 /// [`crate::db::DATABASE`] global for the duration of its (short, blocking)
 /// section.
@@ -79,7 +88,8 @@ impl NativeNovelRepository {
     }
 
 
-    pub fn apply_batch_sync(&self, mutations: Vec<NovelMutation>) -> Result<()> {
+    pub fn apply_batch_sync(&self, mut mutations: Vec<NovelMutation>) -> Result<()> {
+        initialize_attributes(&mut mutations);
         crate::db::with_database_mut(|db| {
             db.update_records(
                 |mut records: std::collections::BTreeMap<i64, NovelRecord>| {
@@ -332,6 +342,8 @@ impl NovelRepository for NativeNovelRepository {
     ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
             run_db(move || {
+                let mut mutations = mutations;
+                initialize_attributes(&mut mutations);
                 crate::db::with_database_mut(|db| {
                     db.update_records(
                         |mut records: std::collections::BTreeMap<i64, NovelRecord>| {

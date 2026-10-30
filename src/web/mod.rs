@@ -359,7 +359,7 @@ pub(crate) fn origin_allowed_for_ports(
     authority_matches_state(origin, state, expected_ports, true)
 }
 
-fn internal_control_token_matches(headers: &HeaderMap, state: &AppState) -> bool {
+pub(crate) fn internal_control_token_matches(headers: &HeaderMap, state: &AppState) -> bool {
     let Some(actual) = headers
         .get(INTERNAL_CONTROL_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -625,6 +625,10 @@ pub fn create_router(state: AppState) -> Router {
             post(virtual_novels::api_virtual_order),
         )
         .route(
+            "/api/virtual_novels/{id}/members",
+            post(virtual_novels::api_virtual_add_members),
+        )
+        .route(
             "/api/virtual_novels/{id}/convert",
             post(virtual_novels::api_virtual_convert),
         )
@@ -693,6 +697,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/global_setting",
             post(global_settings::save_global_settings),
+        )
+        .route(
+            "/api/server_security/reload",
+            post(global_settings::reload_server_security),
         )
         .route("/api/send", post(jobs::api_send))
         .route("/api/inspect", post(jobs::api_inspect))

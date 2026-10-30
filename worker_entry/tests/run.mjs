@@ -145,6 +145,15 @@ try {
   const contract = runContract({ CONTRACT_QUEUE: process.env.CONTRACT_QUEUE ?? "1" });
   exitCode = contract.status ?? 1;
 
+  // タグの登録順 (連番表) は作品と同じ batch で確定する。
+  if (exitCode === 0) {
+    const tagSequence = spawnSync(process.execPath, [join(here, "tag_sequence.mjs")], {
+      cwd: root, stdio: "inherit",
+      env: { ...process.env, BASE_URL: base, NAROU_ADMIN_TOKEN: token },
+    });
+    exitCode = tagSequence.status ?? 1;
+  }
+
   // 7. トークンを外した構成で fail-closed を確かめる（任意・既定 off）。
   if (exitCode === 0 && process.env.NAROU_CHECK_UNCONFIGURED === "1") {
     console.log("checking the unconfigured Worker (no admin token)");

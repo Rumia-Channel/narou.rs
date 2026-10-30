@@ -37,7 +37,7 @@ use crate::platform::{CookieStore, LoginGroup};
 use self::section::{SectionCache, download_section};
 use self::security::is_safe_public_url_syntax;
 use self::settings::DownloaderSettings;
-use self::site_setting::SiteSetting;
+use self::site_setting::{WorkTypeSubjects, SiteSetting};
 use self::toc::{
     create_short_story_subtitles, fetch_toc, parse_subtitles, parse_subtitles_multipage,
 };
@@ -638,6 +638,9 @@ fn collect_site_tags(info_tags: Option<&str>, page_tags: &[String]) -> Vec<Strin
     let mut positions = HashMap::new();
     for source in info_tags.into_iter().chain(page_tags.iter().map(String::as_str)) {
         for tag in sanitize_site_tags(source) {
+            if crate::application::attribute_tags::is_attribute_tag(&tag) {
+                continue;
+            }
             let position = positions.len();
             positions.entry(tag).or_insert(position);
         }
@@ -2389,6 +2392,28 @@ impl Downloader {
             author.clone()
         };
 
+        // Site rules are independent of auto-add-tags and can use the
+        // preprocessed first TOC page as well as persisted metadata.
+        let work_type = if setting.work_type_rules.is_empty() {
+            crate::downloader::site_setting::WorkType::Novel
+        } else {
+            let episode_count = if setting.work_type_rules.iter().any(|rule| rule.field == self::site_setting::WorkTypeField::EpisodeCount) {
+                subtitles.len().to_string()
+            } else { String::new() };
+            let novel_type_code = if setting.work_type_rules.iter().any(|rule| rule.field == self::site_setting::WorkTypeField::NovelType) {
+                novel_type.to_string()
+            } else { String::new() };
+            setting.work_type_for(&WorkTypeSubjects {
+                ncode: ncode.as_deref().unwrap_or_default(),
+                title: &toc_title,
+                author: &toc_author,
+                url: &toc_url,
+                novel_type: &novel_type_code,
+                episode_count: &episode_count,
+                source: &toc_source,
+            })
+        };
+
         let toc_file = TocFile {
             title: toc_title.clone(),
             author: toc_author.clone(),
@@ -2530,6 +2555,7 @@ impl Downloader {
                             updated.tags.push(tag.clone());
                         }
                     }
+                    updated.set_attribute_tag(work_type.tag());
                     let merged_id = updated.id;
                     self.novels
                         .apply_batch(vec![NovelMutation::Upsert(updated)])
@@ -2542,6 +2568,7 @@ impl Downloader {
                     let mut rec = record.clone();
                     rec.id = provisional_id;
                     rec.tags = auto_tags.clone();
+                    rec.set_attribute_tag(work_type.tag());
                     self.novels
                         .apply_batch(vec![NovelMutation::Upsert(rec)])
                         .await?;
@@ -2556,7 +2583,8 @@ impl Downloader {
             let new_id = provisional_id;
             let mut rec = record.clone();
             rec.id = new_id;
-            rec.tags = auto_tags.clone();
+            rec.tags = auto_tags;
+            rec.set_attribute_tag(work_type.tag());
             self.novels
                 .apply_batch(vec![NovelMutation::Upsert(rec)])
                 .await?;

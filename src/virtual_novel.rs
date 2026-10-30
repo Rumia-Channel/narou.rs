@@ -107,6 +107,33 @@ impl VirtualNovelMembers {
         Ok(())
     }
 
+    /// 既存の仮想小説の末尾へメンバーを追加する。
+    ///
+    /// 追加できるのは、まだどの仮想小説にも属していない小説だけ。仮想小説
+    /// 自身がメンバーにならないことはレコード側の検査で弾く。
+    pub fn append(&mut self, virtual_id: i64, new_members: Vec<i64>) -> Result<(), String> {
+        validate_members(&new_members)?;
+        let Some(current) = self.groups.get(&virtual_id).cloned() else {
+            return Err(format!("仮想小説 vs_{virtual_id} は登録されていません"));
+        };
+        for member in &new_members {
+            if current.contains(member) {
+                return Err(format!(
+                    "小説 {member} は既に仮想小説 vs_{virtual_id} に属しています"
+                ));
+            }
+            if let Some(owner) = self.owner_of(*member) {
+                return Err(format!(
+                    "小説 {member} は既に仮想小説 vs_{owner} に属しています"
+                ));
+            }
+        }
+        let mut updated = current;
+        updated.extend(new_members);
+        self.groups.insert(virtual_id, updated);
+        Ok(())
+    }
+
     pub fn remove(&mut self, virtual_id: i64) -> Option<Vec<i64>> {
         self.groups.remove(&virtual_id)
     }
@@ -197,5 +224,35 @@ mod tests {
         assert_eq!(members.get(1), Some([12, 10, 11].as_slice()));
         assert!(members.reorder(1, vec![12, 10]).is_err());
         assert!(members.reorder(1, vec![12, 10, 99]).is_err());
+    }
+
+    #[test]
+    fn append_extends_the_member_list_in_order() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(1, vec![10, 11]).unwrap();
+        members.append(1, vec![12, 13]).unwrap();
+        assert_eq!(members.get(1), Some([10, 11, 12, 13].as_slice()));
+    }
+
+    #[test]
+    fn append_rejects_unknown_duplicate_and_owned_members() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(1, vec![10, 11]).unwrap();
+        members.insert(2, vec![20]).unwrap();
+        assert!(
+            members.append(99, vec![30]).is_err(),
+            "未登録の仮想小説へは追加できない"
+        );
+        assert!(
+            members.append(1, vec![11]).is_err(),
+            "同じ仮想小説のメンバーは追加できない"
+        );
+        assert!(
+            members.append(1, vec![20]).is_err(),
+            "別の仮想小説のメンバーは追加できない"
+        );
+        assert!(members.append(1, vec![]).is_err(), "空の追加はできない");
+        assert!(members.append(1, vec![12, 12]).is_err(), "重複はできない");
+        assert_eq!(members.get(1), Some([10, 11].as_slice()));
     }
 }

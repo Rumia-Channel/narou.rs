@@ -147,42 +147,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         ));
     }
     let all = read(runtime.write_db()).await?;
-    let mut member_tags: Vec<String> = Vec::new();
-    let mut latest_update: Option<chrono::DateTime<Utc>> = None;
-    let mut general_all_no = 0i64;
-    for member in &members {
-        let record = runtime
-            .novels
-            .get(NovelId(*member))
-            .await?
-            .ok_or_else(|| NarouError::Database(format!("作品が見つかりません: {member}")))?;
-        if record
-            .ncode
-            .as_deref()
-            .is_some_and(core::is_virtual_ncode)
-        {
-            return Err(NarouError::InvalidTarget(
-                "仮想小説をメンバーにはできません".into(),
-            ));
-        }
-        member_tags.extend(
-            record
-                .tags
-                .iter()
-                .filter(|tag| !core::is_internal_tag(tag))
-                .cloned(),
-        );
-        if let Some(updated) = record.general_lastup
-            && latest_update.is_none_or(|current| updated > current)
-        {
-            latest_update = Some(updated);
-        }
-        let count = match record.general_all_no {
-            Some(count) if count > 0 => count,
-            _ => count_sections(runtime, &record).await.unwrap_or(0),
-        };
-        general_all_no += count;
-    }
+    let summary = summarize_members(runtime, &members).await?;
     if all
         .groups
         .values()
@@ -191,6 +156,9 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         return Err(NarouError::InvalidTarget(
             "既に別の仮想小説に属している作品があります".into(),
         ));
+    }
+    if body.tags.iter().any(|tag| narou_rs::application::attribute_tags::is_attribute_tag(tag.trim())) {
+        return Err(NarouError::InvalidTarget("属性タグは編集できません".into()));
     }
 
     let reservation = runtime.novels.allocate_id().await?;
@@ -201,7 +169,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         .iter()
         .map(|tag| tag.trim().to_string())
         .filter(|tag| !tag.is_empty())
-        .chain(member_tags)
+        .chain(summary.tags.into_iter().filter(|tag| !narou_rs::application::attribute_tags::is_attribute_tag(tag)))
         .collect();
     tags.push(core::tag(id));
     tags.sort();
@@ -213,7 +181,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
     } else {
         file_title
     };
-    let record = NovelRecord {
+    let mut record = NovelRecord {
         id,
         author: body.author.clone(),
         title: title.clone(),
@@ -227,12 +195,12 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         use_subdirectory: false,
         general_firstup: None,
         novelupdated_at: None,
-        general_lastup: latest_update,
+        general_lastup: summary.latest_update,
         last_mail_date: None,
         tags,
         ncode: Some(ncode),
         domain: body.domain.clone(),
-        general_all_no: (general_all_no > 0).then_some(general_all_no),
+        general_all_no: (summary.general_all_no > 0).then_some(summary.general_all_no),
         length: None,
         suspend: false,
         is_narou: false,
@@ -242,6 +210,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         login_session: None,
         extra_fields: Default::default(),
     };
+    record.set_attribute_tag(narou_rs::application::attribute_tags::NOVEL_TAG);
     runtime
         .novels
         .apply_batch(vec![NovelMutation::Upsert(record.clone())])
@@ -266,6 +235,101 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         return Err(error);
     }
     Ok(record)
+}
+
+/// メンバー構成から仮想小説の派生値 (タグ・話数・最新話掲載日) を求める。
+struct MemberSummary {
+    tags: Vec<String>,
+    latest_update: Option<chrono::DateTime<Utc>>,
+    general_all_no: i64,
+}
+
+async fn summarize_members(runtime: &WorkerRuntime, members: &[i64]) -> Result<MemberSummary> {
+    let mut summary = MemberSummary {
+        tags: Vec::new(),
+        latest_update: None,
+        general_all_no: 0,
+    };
+    for member in members {
+        let record = runtime
+            .novels
+            .get(NovelId(*member))
+            .await?
+            .ok_or_else(|| NarouError::Database(format!("作品が見つかりません: {member}")))?;
+        if record.ncode.as_deref().is_some_and(core::is_virtual_ncode) {
+            return Err(NarouError::InvalidTarget(format!(
+                "仮想小説をメンバーにはできません: {member}"
+            )));
+        }
+        summary.tags.extend(
+            record
+                .tags
+                .iter()
+                .filter(|tag| !core::is_internal_tag(tag))
+                .cloned(),
+        );
+        if let Some(updated) = record.general_lastup
+            && summary
+                .latest_update
+                .is_none_or(|current| updated > current)
+        {
+            summary.latest_update = Some(updated);
+        }
+        let count = match record.general_all_no {
+            Some(count) if count > 0 => count,
+            _ => count_sections(runtime, &record).await.unwrap_or(0),
+        };
+        summary.general_all_no += count;
+    }
+    Ok(summary)
+}
+
+async fn refresh_record(runtime: &WorkerRuntime, id: i64, summary: &MemberSummary) -> Result<()> {
+    let mut record = runtime
+        .novels
+        .get(NovelId(id))
+        .await?
+        .ok_or_else(|| NarouError::Database(format!("仮想小説 vs_{id} が見つかりません")))?;
+    let mut tags: Vec<String> = record
+        .tags
+        .iter()
+        .filter(|tag| !core::is_internal_tag(tag))
+        .cloned()
+        .chain(summary.tags.iter().filter(|tag| !narou_rs::application::attribute_tags::is_attribute_tag(tag)).cloned())
+        .collect();
+    tags.push(core::tag(id));
+    tags.sort();
+    tags.dedup();
+    record.tags = tags;
+    record.general_all_no = (summary.general_all_no > 0).then_some(summary.general_all_no);
+    record.general_lastup = summary.latest_update;
+    runtime
+        .novels
+        .apply_batch(vec![NovelMutation::Upsert(record)])
+        .await
+}
+
+/// 既存の仮想小説へメンバーを追加する (native の `add_members` と同じ規則)。
+async fn add_members(runtime: &WorkerRuntime, id: i64, new_members: Vec<i64>) -> Result<()> {
+    let current = read(runtime.write_db()).await?;
+    let mut updated = current.clone();
+    updated
+        .append(id, new_members.clone())
+        .map_err(NarouError::InvalidTarget)?;
+    let merged = updated.get(id).unwrap_or_default().to_vec();
+    let summary = summarize_members(runtime, &merged).await?;
+    let previous = current.get(id).map(<[i64]>::to_vec).unwrap_or_default();
+    write(runtime.write_db(), &updated).await?;
+    if let Err(error) = refresh_record(runtime, id, &summary).await {
+        // レコードだけ古いまま残らないよう、メンバー構成も元へ戻す。
+        let mut restored = read(runtime.write_db()).await.unwrap_or_default();
+        restored.remove(id);
+        if restored.insert(id, previous).is_ok() {
+            let _ = write(runtime.write_db(), &restored).await;
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn reorder(runtime: &WorkerRuntime, id: i64, ordered: Vec<i64>) -> Result<()> {
@@ -413,6 +477,39 @@ pub async fn handle_remove(req: Request, env: Env, id: i64) -> worker::Result<Re
     let runtime = WorkerRuntime::build_ui(&env).await?;
     match remove(&runtime, id).await {
         Ok(()) => Ok(Response::from_json(&json!({"success":true}))?),
+        Err(error) => Ok(Response::from_json(
+            &json!({"success":false,"message":error.to_string()}),
+        )?
+        .with_status(400)),
+    }
+}
+
+pub async fn handle_add_members(mut req: Request, env: Env, id: i64) -> worker::Result<Response> {
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    let runtime = WorkerRuntime::build_ui(&env).await?;
+    let body: OrderBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => {
+            return Ok(Response::from_json(
+                &json!({"success":false,"message":"invalid JSON body"}),
+            )?
+            .with_status(400));
+        }
+    };
+    let members = match core::parse_member_ids(&body.members) {
+        Ok(members) => members,
+        Err(message) => {
+            return Ok(
+                Response::from_json(&json!({"success":false,"message":message}))?.with_status(400),
+            );
+        }
+    };
+    match add_members(&runtime, id, members).await {
+        Ok(()) => Ok(Response::from_json(
+            &json!({"success":true,"id":id,"ncode":core::ncode(id)}),
+        )?),
         Err(error) => Ok(Response::from_json(
             &json!({"success":false,"message":error.to_string()}),
         )?

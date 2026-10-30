@@ -15,6 +15,7 @@ pub mod feature_tour;
 pub mod mutations;
 pub mod notepad;
 pub mod queue_view;
+pub mod tag_order;
 pub mod tag_views;
 
 // ---------------------------------------------------------------------------

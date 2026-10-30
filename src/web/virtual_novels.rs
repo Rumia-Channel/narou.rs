@@ -36,6 +36,11 @@ pub struct ReorderVirtualRequest {
     pub members: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AddMembersRequest {
+    pub members: Vec<serde_json::Value>,
+}
+
 fn error_response(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     (
         status,
@@ -124,6 +129,28 @@ pub async fn api_virtual_order(
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"success": true})),
+        ),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error.to_string()),
+    }
+}
+
+pub async fn api_virtual_add_members(
+    State(_state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<AddMembersRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let members = match core::parse_member_ids(&body.members) {
+        Ok(members) => members,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+    match virtual_novel::add_members(id, members) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "id": id,
+                "ncode": core::ncode(id),
+            })),
         ),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error.to_string()),
     }

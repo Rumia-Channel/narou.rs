@@ -127,17 +127,22 @@ fn build_curl_args(target: &Target, options: &CurlOptions) -> Vec<OsString> {
     args
 }
 
-/// `headers` を `--header @-` が読む形 (`Name: value\r\n` の連続) にする。
+/// `headers` を `--header @-` が読む形 (`Name: value\n` の連続) にする。
 ///
-/// 大文字小文字と順序はそのまま、値は UTF-8 バイト列として渡す。Node 版と
-/// 同様、最後の 1 行も CRLF で終える。
+/// 大文字小文字と順序はそのまま、値は UTF-8 バイト列として渡す。
+///
+/// 行の終端は CRLF ではなく LF にする。curl の `--header @-` は 8.13 以降
+/// 入力行の `\n` だけを取り除き `\r` を残すため、CRLF で渡すとヘッダ値の
+/// 末尾に CR が残り、上流では `Cookie: sid=1\r` のように解釈される
+/// (curl 8.12 以前と Windows のテキストモードは CR を落とす)。CRLF の
+/// 行区切りは curl 自身が送信時に付けるので、入力側の CR は害があるだけ。
 fn header_block(headers: &[(String, String)]) -> Vec<u8> {
     let mut block = Vec::new();
     for (name, value) in headers {
         block.extend_from_slice(name.as_bytes());
         block.extend_from_slice(b": ");
         block.extend_from_slice(value.as_bytes());
-        block.extend_from_slice(b"\r\n");
+        block.extend_from_slice(b"\n");
     }
     block
 }
@@ -530,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn headers_keep_casing_and_order_and_end_with_crlf() {
+    fn headers_keep_casing_and_order_and_never_carry_a_carriage_return() {
         let headers = vec![
             ("X-First".to_string(), "one".to_string()),
             ("x-first".to_string(), "two".to_string()),
@@ -540,7 +545,11 @@ mod tests {
         let block = header_block(&headers);
         assert_eq!(
             block,
-            b"X-First: one\r\nx-first: two\r\nCookie: sid=1\r\nX-Label: caf\xc3\xa9\r\n".to_vec()
+            b"X-First: one\nx-first: two\nCookie: sid=1\nX-Label: caf\xc3\xa9\n".to_vec()
+        );
+        assert!(
+            !block.contains(&b'\r'),
+            "the header block must not carry CR (curl keeps it in the header value)"
         );
         assert!(header_block(&[]).is_empty());
     }

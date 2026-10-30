@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use narou_rs::application::tag_colors::{TagColorStore, TagColors};
 use narou_rs::application::events::FreezeStore;
@@ -26,6 +27,7 @@ use crate::db_handle::DbHandle;
 /// D1 tolerates much larger statement payloads than the native store's
 /// `novel_codec::MAX_EXTRA_FIELDS_BYTES`; keep the historical D1 cap.
 const MAX_EXTRA_FIELDS_BYTES: usize = 1_900_000;
+const ATTRIBUTE_MARKER: &str = "work_type_attributes_v2";
 
 pub(crate) const KNOWN_TOC_URLS: &str = r#"
 SELECT CAST(j.key AS INTEGER) AS position,
@@ -36,11 +38,17 @@ FROM json_each(?1) AS j ORDER BY CAST(j.key AS INTEGER)
 #[derive(Debug, Clone)]
 pub struct D1NovelRepository {
     db: DbHandle,
+    sites: Arc<Vec<narou_rs::downloader::site_setting::SiteSetting>>,
 }
 
 impl D1NovelRepository {
     pub fn new(db: DbHandle) -> Self {
-        Self { db }
+        Self { db, sites: Arc::new(Vec::new()) }
+    }
+
+    pub fn with_sites(mut self, sites: Arc<Vec<narou_rs::downloader::site_setting::SiteSetting>>) -> Self {
+        self.sites = sites;
+        self
     }
 
     fn prepare(&self, sql: &str, values: Vec<BindValue>) -> Result<D1PreparedStatement> {
@@ -63,6 +71,100 @@ impl D1NovelRepository {
             .await
             .map_err(worker_error)?;
         row.map(NovelRow::into_record).transpose()
+    }
+
+    pub async fn attributes_initialized(&self) -> Result<bool> {
+        Ok(self.prepare(
+            "SELECT value_json FROM app_state WHERE scope='inv' AND key=?1",
+            vec![BindValue::Text(ATTRIBUTE_MARKER.into())],
+        )?.first::<JsonValue>(None).await.map_err(worker_error)?.is_some())
+    }
+
+    /// Backfill old rows without replacing concurrently edited novel metadata.
+    /// The compare-and-swap guard, tag index and sequence share one D1 batch.
+    pub async fn initialize_attributes(
+        &self,
+        sites: &[narou_rs::downloader::site_setting::SiteSetting],
+    ) -> Result<()> {
+        if self.attributes_initialized().await? {
+            return Ok(());
+        }
+        let sql = format!(
+            "{} WHERE n.id > ?1 ORDER BY n.id LIMIT 20",
+            novel_codec::NOVEL_SELECT_SQL
+        );
+        let mut conflicts = 0;
+        let mut after = i64::MIN;
+        loop {
+            let result = self.prepare(&sql, vec![BindValue::Int(after)])?.all().await.map_err(worker_error)?;
+            let rows: Vec<NovelRow> = result.results().map_err(worker_error)?;
+            if rows.is_empty() {
+                let mark = self.prepare(
+                    "INSERT OR IGNORE INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv',?1,'true','true')",
+                    vec![BindValue::Text(ATTRIBUTE_MARKER.into())],
+                )?;
+                ensure_batch_success(&[mark.run().await.map_err(worker_error)?])?;
+                return Ok(());
+            }
+            let last_id = rows.last().expect("nonempty page").id;
+            let mut migrated = Vec::with_capacity(rows.len());
+            for row in rows {
+                let old_tags = row.tags_json.clone();
+                let old_attribute = row.attribute_tag.clone();
+                let mut record = row.into_record()?;
+                if narou_rs::application::attribute_tags::initialize_record(&mut record, sites) {
+                    novel_codec::dedup_tags(&mut record.tags);
+                    migrated.push((record, old_tags, old_attribute));
+                }
+            }
+            if migrated.is_empty() {
+                after = last_id;
+                continue;
+            }
+            let snapshot = crate::tag_sequence::read_snapshot(&self.db).await?;
+            let before = if snapshot.sequence.is_initialized() {
+                None
+            } else {
+                Some(crate::tag_sequence::library_tags(&self.db).await?)
+            };
+            let written: Vec<&str> = migrated.iter().flat_map(|(record, _, _)| record.tags.iter().map(String::as_str))
+                .filter(|tag| !narou_rs::virtual_novel::is_internal_tag(tag)).collect();
+            let next = crate::tag_sequence::advance(&snapshot, before.as_ref(), &written);
+            let mut statements = Vec::new();
+            for (record, old_tags, old_attribute) in &migrated {
+                let json = serde_json::to_string(&record.tags).map_err(worker_error)?;
+                let folded: Vec<String> = record.tags.iter().map(|tag| fold(tag)).collect();
+                statements.push(self.prepare(
+                    "UPDATE novels SET tags_json=?2,tags_fold=?3,tags_sort=?4,attribute_tag=?5 WHERE id=?1 AND tags_json=?6 AND attribute_tag IS ?7",
+                    vec![BindValue::Int(record.id), BindValue::Text(json), BindValue::Text(folded.join("\n")), BindValue::Text(folded.join("\u{1f}")), BindValue::Text(record.attribute_tag().expect("initialized").to_string()), BindValue::Text(old_tags.clone()), old_attribute.as_ref().map(|tag| BindValue::Text(tag.clone())).unwrap_or(BindValue::Null)],
+                )?);
+                // A stale row aborts the whole batch; retry from the primary.
+                statements.push(self.prepare(
+                    "INSERT INTO novel_id_sequence(id,next_id) SELECT 1,0 WHERE changes()=0",
+                    vec![],
+                )?);
+                statements.push(self.prepare(novel_query::DELETE_NOVEL_TAGS_SQL, vec![BindValue::Int(record.id)])?);
+                for (position, tag) in record.tags.iter().enumerate() {
+                    statements.push(self.prepare(novel_query::INSERT_NOVEL_TAG_SQL, vec![
+                        BindValue::Int(record.id), BindValue::Int(position as i64),
+                        BindValue::Text(tag.clone()), BindValue::Text(fold(tag)),
+                    ])?);
+                }
+            }
+            statements.push(crate::tag_sequence::upsert_statement(&self.db, snapshot.raw_json.as_deref(), &next)?);
+            statements.push(crate::tag_sequence::guard_statement(&self.db, &next)?);
+            match self.db.batch(statements).await {
+                Ok(results) => {
+                    ensure_batch_success(&results)?;
+                    after = last_id;
+                    conflicts = 0;
+                }
+                Err(error) => {
+                    conflicts += 1;
+                    if conflicts >= 8 { return Err(worker_error(error)); }
+                }
+            }
+        }
     }
 }
 
@@ -198,61 +300,121 @@ impl NovelRepository for D1NovelRepository {
         mutations: Vec<NovelMutation>,
     ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
+            let mut mutations = mutations;
+            for mutation in &mut mutations {
+                if let NovelMutation::Upsert(record) = mutation {
+                    narou_rs::application::attribute_tags::initialize_record(record, &self.sites);
+                }
+            }
             if mutations.is_empty() {
                 return Ok(());
             }
-            let mut statements = Vec::new();
-            for mutation in mutations {
-                match mutation {
-                    NovelMutation::Upsert(record) => {
-                        // Same contract as the native driver's
-                        // `upsert_record_conn`: registration paths can merge
-                        // default tags with retained ones, so normalize before
-                        // encoding — `novel_tags` is UNIQUE (novel_id, tag)
-                        // and tags_json must agree with the indexed rows.
-                        let mut normalized = record;
-                        novel_codec::dedup_tags(&mut normalized.tags);
-                        let record = &normalized;
-                        let max_id = record.id.saturating_add(1);
-                        statements.push(self.prepare(NOVEL_UPSERT_SQL, record_binds(record)?)?);
-                        statements.push(self.prepare(
-                            novel_query::COMMIT_ID_RESERVATION_SQL,
-                            vec![BindValue::Int(record.id)],
-                        )?);
-                        statements.push(self.prepare(
-                            novel_query::DELETE_NOVEL_TAGS_SQL,
-                            vec![BindValue::Int(record.id)],
-                        )?);
-                        for (position, tag) in record.tags.iter().enumerate() {
+            // 書き込む小説のタグ (小説 ID 順)。
+            let mut written: Vec<(i64, Vec<String>)> = Vec::new();
+            for mutation in &mutations {
+                if let NovelMutation::Upsert(record) = mutation {
+                    written.push((record.id, record.tags.clone()));
+                }
+            }
+            written.sort_by_key(|(id, _)| *id);
+            let written: Vec<&str> = written
+                .iter()
+                .flat_map(|(_, tags)| tags.iter().map(String::as_str))
+                .filter(|tag| !narou_rs::virtual_novel::is_internal_tag(tag))
+                .collect();
+            // タグの登録順 (どのタグが先にライブラリへ入ったか) を追跡する。
+            // 連番表の更新は作品と同じ batch (1 トランザクション) に入れる。
+            // CAS が外れたときは読み直して作り直す (8 回まで ✓)。
+            for _ in 0..8 {
+                let snapshot = crate::tag_sequence::read_snapshot(&self.db).await?;
+                // 登録順が未初期化なら、既存ライブラリをバックフィルするために
+                // 書き込み前のタグを先に読む。
+                let before = if snapshot.sequence.is_initialized() {
+                    None
+                } else {
+                    Some(crate::tag_sequence::library_tags(&self.db).await?)
+                };
+                let next = crate::tag_sequence::advance(&snapshot, before.as_ref(), &written);
+                let mut statements = Vec::new();
+                for mutation in &mutations {
+                    match mutation {
+                        NovelMutation::Upsert(record) => {
+                            // Same contract as the native driver's
+                            // `upsert_record_conn`: registration paths can merge
+                            // default tags with retained ones, so normalize before
+                            // encoding — `novel_tags` is UNIQUE (novel_id, tag)
+                            // and tags_json must agree with the indexed rows.
+                            let mut normalized = record.clone();
+                            novel_codec::dedup_tags(&mut normalized.tags);
+                            let record = &normalized;
+                            let max_id = record.id.saturating_add(1);
+                            statements.push(self.prepare(NOVEL_UPSERT_SQL, record_binds(record)?)?);
                             statements.push(self.prepare(
-                                novel_query::INSERT_NOVEL_TAG_SQL,
-                                vec![
-                                    BindValue::Int(record.id),
-                                    BindValue::Int(position as i64),
-                                    BindValue::Text(tag.clone()),
-                                    BindValue::Text(fold(tag)),
-                                ],
+                                novel_query::COMMIT_ID_RESERVATION_SQL,
+                                vec![BindValue::Int(record.id)],
+                            )?);
+                            statements.push(self.prepare(
+                                novel_query::DELETE_NOVEL_TAGS_SQL,
+                                vec![BindValue::Int(record.id)],
+                            )?);
+                            for (position, tag) in record.tags.iter().enumerate() {
+                                statements.push(self.prepare(
+                                    novel_query::INSERT_NOVEL_TAG_SQL,
+                                    vec![
+                                        BindValue::Int(record.id),
+                                        BindValue::Int(position as i64),
+                                        BindValue::Text(tag.clone()),
+                                        BindValue::Text(fold(tag)),
+                                    ],
+                                )?);
+                            }
+                            statements.push(self.prepare(
+                                &novel_query::refresh_status_sort_sql(),
+                                vec![BindValue::Int(record.id)],
+                            )?);
+                            statements.push(self.prepare(
+                                novel_query::BUMP_SEQUENCE_SQL,
+                                vec![BindValue::Int(max_id), BindValue::Int(max_id)],
                             )?);
                         }
-                        statements.push(self.prepare(
-                            &novel_query::refresh_status_sort_sql(),
-                            vec![BindValue::Int(record.id)],
-                        )?);
-                        statements.push(self.prepare(
-                            novel_query::BUMP_SEQUENCE_SQL,
-                            vec![BindValue::Int(max_id), BindValue::Int(max_id)],
-                        )?);
+                        NovelMutation::Remove(id) => {
+                            statements.push(self.prepare(
+                                novel_query::DELETE_NOVEL_SQL,
+                                vec![BindValue::Int(id.0)],
+                            )?);
+                        }
                     }
-                    NovelMutation::Remove(id) => {
-                        statements.push(self.prepare(
-                            novel_query::DELETE_NOVEL_SQL,
-                            vec![BindValue::Int(id.0)],
-                        )?);
+                }
+                // 連番表の更新を作品と同じ batch に入れる。batch は 1 トランザクション
+                // なので、作品と順序が同時に確定する。CAS が外れたときは guard 文が
+                // 一意制約違反を起こして batch 全体を中断し、作品もロールバックする。
+                statements.push(crate::tag_sequence::upsert_statement(
+                    &self.db,
+                    snapshot.raw_json.as_deref(),
+                    &next,
+                )?);
+                statements.push(crate::tag_sequence::guard_statement(&self.db, &next)?);
+                let outcome = match self.db.batch(statements).await {
+                    Ok(results) => {
+                        ensure_batch_success(&results).map_err(|error| error.to_string())
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
+                match outcome {
+                    Ok(()) => return Ok(()),
+                    Err(message) => {
+                        // 連番表が他の書き込みで変わっていれば CAS 競合
+                        // (読み直して作り直す ✓)。変わっていなければ本来の失敗 ✓。
+                        let current = crate::tag_sequence::read_snapshot(&self.db).await?;
+                        if current.raw_json == snapshot.raw_json {
+                            return Err(NarouError::Platform(message));
+                        }
                     }
                 }
             }
-            let results = self.db.batch(statements).await.map_err(worker_error)?;
-            ensure_batch_success(&results)
+            Err(NarouError::Platform(
+                "タグの登録順が同時に更新されています。再試行してください".to_string(),
+            ))
         })
     }
 }
@@ -657,6 +819,8 @@ struct NovelRow {
     requires_login: i64,
     #[serde(default)]
     login_session: Option<String>,
+    #[serde(default)]
+    attribute_tag: Option<String>,
 }
 
 impl NovelRow {
@@ -697,6 +861,7 @@ impl NovelRow {
             ("extra_fields_yaml", NovelBind::Text(self.extra_fields_yaml)),
             ("requires_login", NovelBind::Int(self.requires_login)),
             ("login_session", nullable_text(self.login_session)),
+            ("attribute_tag", nullable_text(self.attribute_tag)),
         ]
     }
 

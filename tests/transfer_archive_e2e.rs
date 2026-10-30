@@ -169,6 +169,7 @@ fn export_then_import_roundtrips_a_novel_into_a_fresh_library() {
     assert_eq!(metadata.sitename, "ExampleSite");
     assert_eq!(metadata.domain.as_deref(), Some("example.test"));
     assert_eq!(metadata.tags, vec!["タグ"]);
+    assert_eq!(metadata.attribute_tag.as_deref(), Some("小説"));
     assert_eq!(metadata.subtitle.as_deref(), Some("あらすじ"));
 
     // Import into the pristine library.

@@ -295,6 +295,91 @@ fn apply_update_and_remove_download(
     result
 }
 
+/// zip のエントリ名を、展開先から出ない相対パスへ変換する。
+///
+/// `zip::ZipFile::enclosed_name` は Windows で予約デバイス名 (CON, NUL, ...)
+/// を判定するために `stem.split_at(3)` を使う。多バイト文字がバイト境界を
+/// またぐとそこで panic する (zip 9.1.2 / 9.1.3 とも未修正)。リリース zip は
+/// 攻撃者が用意したものかもしれないため、extract が panic すると更新が
+/// 中途半端に止まって本体が壊れる。
+///
+/// そこで同じ規則を自分で実装する:
+/// - 絶対パス・ドライブ接頭辞は「先頭で相対化した名前」に落とす
+/// - `..` は解決して展開先の要素を越えるもの (展開先外) は拒否する
+/// - Windows の予約デバイス名と不正な文字を含む要素は拒否する
+///
+/// どちらの判定も zip の `enclosed_name` と同じ規則で、判定できない
+/// (復号できない) 名前は `None` を返す。
+fn safe_entry_path(name: &str) -> Option<PathBuf> {
+    // Windows の予約デバイス名と、それを含む要素の判定。
+    // `stem.split_at(3)` をしないので文字境界で panic しない。
+    fn is_reserved_device_name(component: &str) -> bool {
+        let stem = component
+            .split(['.', ':'])
+            .next()
+            .unwrap_or(component)
+            .trim_end_matches([' ', '.']);
+        let stem = stem.to_ascii_uppercase();
+        if matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+        ) {
+            return true;
+        }
+        // COM1..COM9 / LPT1..LPT9 (数字は 1 桁だけ)。
+        if let Some(digit) = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT"))
+            && digit.len() == 1
+            && matches!(digit.chars().next(), Some('1'..='9'))
+        {
+            return true;
+        }
+        false
+    }
+
+    // Windows で禁じられた文字・制御文字を含む要素は拒否する。
+    fn is_invalid_component(component: &str) -> bool {
+        component.is_empty()
+            || component.encode_utf16().count() > 255
+            || component.contains(['<', '>', ':', '"', '/', '\\', '|', '?', '*'])
+            || component.chars().any(|c| c.is_ascii_control())
+            || component.ends_with(['.', ' '])
+    }
+
+    let mut out = PathBuf::new();
+    // 追加した要素の数。`..` で戻れるのはここまでだけ。
+    let mut depth = 0usize;
+    for component in name.split(['/', '\\']) {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            // 展開先より上へ出る `..` は拒否する。
+            if depth == 0 {
+                return None;
+            }
+            out.pop();
+            depth -= 1;
+            continue;
+        }
+        // ドライブ接頭辞 (`C:`) は読み飛ばす。
+        if component.len() == 2
+            && component.ends_with(':')
+            && component.as_bytes()[0].is_ascii_alphabetic()
+        {
+            continue;
+        }
+        if is_invalid_component(component) || is_reserved_device_name(component) {
+            return None;
+        }
+        out.push(component);
+        depth += 1;
+    }
+    if out.as_os_str().is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
 /// zip を展開し、`narou/` ディレクトリ (またはトップレベル) を返す。
 fn extract_zip(zip_path: &Path, dest: &Path, logger: &mut Logger) -> Result<PathBuf, String> {
     let file = File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
@@ -313,7 +398,7 @@ fn extract_zip(zip_path: &Path, dest: &Path, logger: &mut Logger) -> Result<Path
                 continue;
             }
         };
-        let Some(rel) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+        let Some(rel) = safe_entry_path(&entry_name) else {
             logger.log(format!("skip suspicious zip entry: {entry_name}"));
             continue;
         };
@@ -331,7 +416,7 @@ fn extract_zip(zip_path: &Path, dest: &Path, logger: &mut Logger) -> Result<Path
         {
             use std::os::unix::fs::PermissionsExt;
             if let Some(mode) = entry.unix_mode() {
-                let _ = fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
+                let _ = fs::set_permissions(&out_path, fs::Permissions::from_mode(mode));
             }
         }
     }
@@ -737,6 +822,81 @@ mod tests {
         );
         assert!(!tmp.path().join("bin").exists());
         assert!(root.is_dir());
+    }
+
+    /// CP437 で復号した名前が `stem.split_at(3)` の境界をまたぐ zip でも
+    /// panic せずに展開できる。
+    ///
+    /// `zip::ZipFile::enclosed_name` は Windows の予約デバイス名判定で
+    /// `stem.split_at(3)` を使い、CP437 復号結果がバイト境界をまたぐと
+    /// panic する (zip 9.1.2 / 9.1.3 とも未修正)。extract が panic すると
+    /// セルフ更新が壊れた状態で止まるため、`safe_entry_path` で判定する。
+    #[test]
+    fn extract_zip_does_not_panic_on_cp437_names_that_straddle_a_char_boundary() {
+        // CP437 の 0xFF 0xFE は `ÿþ` に復号され、2 バイト文字が 3 バイト目をまたぐ。
+        let name = "narou/\u{ff}\u{fe}.bin";
+        let stem = name.rsplit(['/', '\\']).next().unwrap();
+        let stem = stem.split(['.', ':']).next().unwrap();
+        assert!(
+            stem.len() >= 4 && !stem.is_char_boundary(3),
+            "このテストは境界をまたぐ名前を使う前提: {stem:?}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("cp437.zip");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file(name, options).unwrap();
+        std::io::Write::write_all(&mut writer, b"binary").unwrap();
+        writer.finish().unwrap();
+
+        let mut logger = Logger { file: None };
+        // panic せずに展開できる (Rust の panic は unwinding なので、
+        // panic していたらこのテストは失敗する)。
+        let root = extract_zip(&zip_path, &dest, &mut logger).unwrap();
+
+        let written = list_tree(&dest);
+        assert!(
+            written.iter().all(|path| path.starts_with(dest.to_str().unwrap())),
+            "展開先外にファイルが書かれた: {written:?}"
+        );
+        assert!(root.is_dir());
+    }
+
+    /// `safe_entry_path` は zip の `enclosed_name` と同じ規則で判定する。
+    #[test]
+    fn safe_entry_path_rejects_escapes_and_reserved_names() {
+        // 展開先から出ない相対パス。
+        assert_eq!(
+            safe_entry_path("narou/narou_rs.exe"),
+            Some(PathBuf::from("narou").join("narou_rs.exe"))
+        );
+        // 絶対パスとドライブ接頭辞は先頭で相対化する。
+        assert_eq!(
+            safe_entry_path("/absolute.txt"),
+            Some(PathBuf::from("absolute.txt"))
+        );
+        assert_eq!(
+            safe_entry_path(r"C:\escape.txt"),
+            Some(PathBuf::from("escape.txt"))
+        );
+        // 展開先外に出る `..` は拒否する。
+        assert_eq!(safe_entry_path("../escape.txt"), None);
+        assert_eq!(safe_entry_path("narou/../../escape.txt"), None);
+        // 予約デバイス名と不正な文字は拒否する。
+        assert_eq!(safe_entry_path("narou/CON"), None);
+        assert_eq!(safe_entry_path("narou/nul.txt"), None);
+        assert_eq!(safe_entry_path("narou/COM1.log"), None);
+        assert_eq!(safe_entry_path("narou/LPT9.log"), None);
+        assert_eq!(safe_entry_path("narou/a:b"), None);
+        assert_eq!(safe_entry_path("narou/a?b"), None);
+        // 要素が残らない名前は展開先を決められないので拒否する。
+        assert_eq!(safe_entry_path(""), None);
+        assert_eq!(safe_entry_path(".."), None);
     }
 
     /// UTF-8 でない名前のエントリを持つ zip をバイト列で作る。

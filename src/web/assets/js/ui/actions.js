@@ -9,12 +9,13 @@ import { createNotepadEditor } from '../core/notepad.js';
 import { persistSortState, postSortedJson } from '../core/sort_state.js';
 import { toggleLanguage, t } from './i18n.js';
 import { openFeatureTour } from './feature_tour.js';
+import { confirmDialog, formDialog, selectDialog, createSuggestionList } from './dialog.js';
 import { resetConsoleSize } from './console_size.js';
 import {
-  renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed,
+  renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed, attributeTagVisible,
   selectVisible, selectAll, clearSelection, getSelectedIdsInDisplayOrder,
   pruneSelectedIdsToCurrentList, updateEnableSelected,
-  syncViewChecks, showNotification,
+  syncViewChecks, showNotification, syncAttributeTagControls,
 } from './render.js';
 import { setShortcutHandlers, initShortcuts } from './shortcuts.js';
 import {
@@ -46,6 +47,61 @@ let themeSaveTail = Promise.resolve();
 let acknowledgedTheme = null;
 let themeReadGeneration = 0;
 let themePendingSaves = 0;
+const hiddenSuggestionFields = {
+  tags: { suggestions: [] },
+  authors: { suggestions: [] },
+  sites: { suggestions: [] },
+};
+
+const VIRTUAL_NCODE_PATTERN = /^vs_\d+$/;
+const isAttributeTag = (tag) => tag === '小説' || tag === '漫画';
+
+/**
+ * `vs_<ID>` 形式の ncode か。一覧の行がバーチャル小説かどうかの判定に使う。
+ */
+export function isVirtualNcode(ncode) {
+  return typeof ncode === 'string' && VIRTUAL_NCODE_PATTERN.test(ncode);
+}
+
+/**
+ * 一覧で選択されている行からバーチャル小説を取り出す。
+ * 選択中のバーチャル小説がちょうど 1 件のときだけ、その作品を対象として使う。
+ */
+export function selectedVirtualNovel(novels, selectedIds) {
+  if (!selectedIds || typeof selectedIds.has !== 'function') return null;
+  const selected = (Array.isArray(novels) ? novels : []).filter(
+    (novel) => selectedIds.has(String(novel.id)) && isVirtualNcode(novel.ncode),
+  );
+  return selected.length === 1 ? selected[0] : null;
+}
+
+/**
+ * 一覧にある値の重複を除いて並べる (ダイアログの入力候補)。
+ */
+export function uniqueValues(novels, key) {
+  const values = (Array.isArray(novels) ? novels : [])
+    .map((novel) => novel?.[key])
+    .filter((value) => typeof value === 'string' && value.trim() !== '');
+
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b, 'ja'));
+}
+
+export function hiddenSuggestions(novels) {
+  return {
+    tags: [...new Set(novels.flatMap(novel => Array.isArray(novel.tags) ? novel.tags : [])
+      .filter(tag => typeof tag === 'string' && tag.trim() && !isVirtualNcode(tag)))].sort((a, b) => a.localeCompare(b, 'ja')),
+    authors: uniqueValues(novels, 'author'),
+    sites: uniqueValues(novels, 'sitename'),
+  };
+}
+
+/**
+ * 選択した作品に共通の値。共通でないときは空文字 (入力欄の初期値)。
+ */
+export function sharedValue(novels, key) {
+  const values = uniqueValues(novels, key);
+  return values.length === 1 ? values[0] : '';
+}
 
 export function bindActions() {
   applyColumnVisibility();
@@ -210,6 +266,7 @@ export function bindActions() {
     clearHiddenColsPreference();
     applyColumnVisibility();
     syncViewChecks();
+    renderTagList();
     renderNovelList();
     showNotification('表示設定をリセットしました', 'info');
   });
@@ -229,6 +286,75 @@ export function bindActions() {
       await openTagEditor();
     });
   });
+  // 属性タグ機能全体の ON/OFF (`tag.attributes-enabled`)。
+  // OFF の間は属性タグを一覧・タグ一覧・検索に出さない (分類の保存は続く)。
+  const attributeMaster = document.getElementById('enable-attribute-tags');
+  if (attributeMaster) {
+    attributeMaster.checked = Boolean(State.attributeTagsEnabled);
+    attributeMaster.addEventListener('click', event => event.stopPropagation());
+    attributeMaster.addEventListener('change', async () => {
+      const previous = State.attributeTagsEnabled;
+      attributeMaster.dataset.saving = '1';
+      attributeMaster.disabled = true;
+      let changed = false;
+      try {
+        const result = await postJson('/api/global_setting', {
+          settings: { 'tag.attributes-enabled': attributeMaster.checked },
+        });
+        assertApiSuccess(result, '属性タグ機能の設定を保存できませんでした');
+        State.attributeTagsEnabled = attributeMaster.checked;
+        changed = State.attributeTagsEnabled !== previous;
+      } catch (error) {
+        State.attributeTagsEnabled = previous;
+        attributeMaster.checked = previous;
+        showNotification(error.message || '属性タグ機能の設定を保存できませんでした', 'error');
+      } finally {
+        delete attributeMaster.dataset.saving;
+        attributeMaster.disabled = false;
+        syncAttributeTagControls();
+        renderTagList();
+        renderNovelList();
+      }
+      // サーバー側でも属性タグ的有無で一覧・タグ一覧・検索が変わるため、
+      // 両方を取り直す。
+      if (changed) {
+        await refreshList();
+        await refreshTags();
+      }
+    });
+  }
+  for (const [id, stateKey, settingKey] of [
+    ['show-novel-attribute', 'showNovelAttribute', 'tag.show-novel'],
+    ['show-manga-attribute', 'showMangaAttribute', 'tag.show-manga'],
+  ]) {
+    const checkbox = document.getElementById(id);
+    if (!checkbox) continue;
+    checkbox.checked = State[stateKey];
+    checkbox.addEventListener('click', event => event.stopPropagation());
+    checkbox.addEventListener('change', async () => {
+      const previous = State[stateKey];
+      checkbox.dataset.saving = '1';
+      checkbox.disabled = true;
+      try {
+        const result = await postJson('/api/global_setting', {
+          settings: { [settingKey]: checkbox.checked },
+        });
+        assertApiSuccess(result, '属性タグの表示設定を保存できませんでした');
+        State[stateKey] = checkbox.checked;
+      } catch (error) {
+        State[stateKey] = previous;
+        checkbox.checked = previous;
+        showNotification(error.message || '属性タグの表示設定を保存できませんでした', 'error');
+      } finally {
+        delete checkbox.dataset.saving;
+        syncAttributeTagControls();
+        renderTagList();
+        renderNovelList();
+      }
+    });
+  }
+  // 初期状態 (既定 OFF) でも種別スイッチの無効化状態を反映する。
+  syncAttributeTagControls();
 
   // --- Tool menu ---
   on('action-tool-notepad', () => { window.location.href = '/notepad'; });
@@ -310,21 +436,82 @@ export function bindActions() {
       showNotification(error.message || 'アップロードに失敗しました', 'error');
     }
   });
+  async function fetchVirtualNovels() {
+    const response = await fetch('/api/virtual_novels');
+    const result = await response.json();
+    if (!result.success) throw new Error(result.message || '一覧を取得できません');
+    return Array.isArray(result.novels) ? result.novels : [];
+  }
+
+  /**
+   * 操作対象のバーチャル小説を決める。一覧で仮想小説をちょうど 1 件選択して
+   * いればそれを使い、登録が 1 件だけならそれを使う。どちらでもないときだけ
+   * ダイアログで選ばせる。
+   */
+  async function pickVirtualNovel(virtuals, title) {
+    const selected = selectedVirtualNovel(State.novels, State.selectedIds);
+    if (selected) {
+      const match = virtuals.find((novel) => String(novel.id) === String(selected.id));
+      if (match) return match;
+    }
+    if (virtuals.length === 1) return virtuals[0];
+    const value = await selectDialog({
+      title,
+      message: '対象のバーチャル小説を選択してください。',
+      value: String(virtuals[0].id),
+      options: virtuals.map((novel) => ({
+        value: String(novel.id),
+        label: `${novel.ncode} ${novel.title}`,
+        detail: `${Array.isArray(novel.members) ? novel.members.length : 0} 作品`,
+      })),
+    });
+    if (value === null) return null;
+    return virtuals.find((novel) => String(novel.id) === String(value)) || null;
+  }
+
   on('action-option-virtual-add', async () => {
     const ids = getSelectedIdsInDisplayOrder();
     if (!ids.length) {
       showNotification('まとめる作品を選択してください', 'error');
       return;
     }
-    const title = window.prompt('バーチャル小説のタイトル');
-    if (!title) return;
-    const author = window.prompt('作者名', '') ?? '';
-    const sitename = window.prompt('サイト名', '') ?? '';
+    const selectedNovels = ids
+      .map((id) => State.novels.find((novel) => String(novel.id) === String(id)))
+      .filter(Boolean);
+    const input = await formDialog({
+      title: 'バーチャル小説の登録',
+      message: `選択した ${ids.length} 作品を 1 つの EPUB にまとめます。`,
+      okLabel: '登録',
+      fields: [
+        { name: 'title', label: 'タイトル', required: true },
+        {
+          name: 'author',
+          label: '作者名',
+          value: sharedValue(selectedNovels, 'author'),
+          suggestions: uniqueValues(State.novels, 'author'),
+          placeholder: '候補から選択、または入力',
+        },
+        {
+          name: 'sitename',
+          label: 'サイト名',
+          value: sharedValue(selectedNovels, 'sitename'),
+          suggestions: uniqueValues(State.novels, 'sitename'),
+          placeholder: '候補から選択、または入力',
+        },
+      ],
+    });
+    if (!input) return;
     try {
       const response = await fetch('/api/virtual_novels', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, author, sitename, tags: [], members: ids.map(Number) }),
+        body: JSON.stringify({
+          title: input.title,
+          author: input.author,
+          sitename: input.sitename,
+          tags: [],
+          members: ids.map(Number),
+        }),
       });
       const result = await response.json();
       if (!response.ok || !result.success) {
@@ -336,24 +523,54 @@ export function bindActions() {
       showNotification(error.message || '登録に失敗しました', 'error');
     }
   });
-  on('action-option-virtual-order', async () => {
+  on('action-option-virtual-append', async () => {
+    const memberIds = getSelectedIdsInDisplayOrder().filter((id) => {
+      const novel = State.novels.find((item) => String(item.id) === String(id));
+      return !isVirtualNcode(novel?.ncode);
+    });
+    if (!memberIds.length) {
+      showNotification('追加する作品を選択してください', 'error');
+      return;
+    }
     try {
-      const response = await fetch('/api/virtual_novels');
-      const result = await response.json();
-      if (!result.success) throw new Error(result.message || '一覧を取得できません');
-      if (!result.novels.length) {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
         showNotification('バーチャル小説は登録されていません', 'error');
         return;
       }
-      const menu = result.novels
-        .map((novel) => `${novel.ncode} ${novel.title} (${novel.members.length}作品)`)
-        .join('\n');
-      const target = window.prompt(`対象の ncode を入力してください\n${menu}`, result.novels[0].ncode);
-      if (!target) return;
-      const novel = result.novels.find(
-        (item) => item.ncode === target || String(item.id) === target,
-      );
-      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
+      const novel = await pickVirtualNovel(virtuals, '作品を追加するバーチャル小説');
+      if (!novel) return;
+      const ok = await confirmDialog({
+        title: 'バーチャル小説へ追加',
+        message: `${novel.ncode} ${novel.title} へ ${memberIds.length} 作品を追加します。\n追加した作品は一覧から隠れ、EPUB の末尾へ結合されます。`,
+        okLabel: '追加する',
+      });
+      if (!ok) return;
+      const response = await fetch(`/api/virtual_novels/${novel.id}/members`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ members: memberIds.map(Number) }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || '追加に失敗しました');
+      }
+      showNotification(`バーチャル小説へ追加しました: ${novel.ncode}`, 'info');
+      clearSelection();
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '追加に失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-order', async () => {
+    try {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const novel = await pickVirtualNovel(virtuals, '順序を変更するバーチャル小説');
+      if (!novel) return;
       openVirtualOrderModal(novel);
     } catch (error) {
       showNotification(error.message || '並べ替えに失敗しました', 'error');
@@ -361,20 +578,13 @@ export function bindActions() {
   });
   on('action-option-virtual-convert', async () => {
     try {
-      const response = await fetch('/api/virtual_novels');
-      const result = await response.json();
-      if (!result.success) throw new Error(result.message || '一覧を取得できません');
-      if (!result.novels.length) {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
         showNotification('バーチャル小説は登録されていません', 'error');
         return;
       }
-      const menu = result.novels.map((novel) => `${novel.ncode} ${novel.title}`).join('\n');
-      const target = window.prompt(`変換する ncode を入力してください\n${menu}`, result.novels[0].ncode);
-      if (!target) return;
-      const novel = result.novels.find(
-        (item) => item.ncode === target || String(item.id) === target,
-      );
-      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
+      const novel = await pickVirtualNovel(virtuals, '変換するバーチャル小説');
+      if (!novel) return;
       showNotification('変換を開始しました', 'info');
       const converted = await fetch(`/api/virtual_novels/${novel.id}/convert`, { method: 'POST' });
       const convertedResult = await converted.json();
@@ -388,23 +598,20 @@ export function bindActions() {
   });
   on('action-option-virtual-remove', async () => {
     try {
-      const response = await fetch('/api/virtual_novels');
-      const result = await response.json();
-      if (!result.success) throw new Error(result.message || '一覧を取得できません');
-      if (!result.novels.length) {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
         showNotification('バーチャル小説は登録されていません', 'error');
         return;
       }
-      const menu = result.novels.map((novel) => `${novel.ncode} ${novel.title}`).join('\n');
-      const target = window.prompt(`削除する ncode を入力してください\n${menu}`, result.novels[0].ncode);
-      if (!target) return;
-      const novel = result.novels.find(
-        (item) => item.ncode === target || String(item.id) === target,
-      );
-      if (!novel) throw new Error('対象のバーチャル小説が見つかりません');
-      if (!window.confirm(`${novel.ncode} ${novel.title} を削除しますか？（メンバー作品は残ります）`)) {
-        return;
-      }
+      const novel = await pickVirtualNovel(virtuals, '削除するバーチャル小説');
+      if (!novel) return;
+      const ok = await confirmDialog({
+        title: 'バーチャル小説の削除',
+        message: `${novel.ncode} ${novel.title} を削除しますか？\nメンバー作品は一覧へ戻ります。`,
+        okLabel: '削除する',
+        danger: true,
+      });
+      if (!ok) return;
       const removed = await fetch(`/api/virtual_novels/${novel.id}`, { method: 'DELETE' });
       const removedResult = await removed.json();
       if (!removed.ok || !removedResult.success) {
@@ -416,6 +623,10 @@ export function bindActions() {
       showNotification(error.message || '削除に失敗しました', 'error');
     }
   });
+  for (const [kind, id] of Object.entries({ tags: 'hidden-tag-input', authors: 'hidden-author-input', sites: 'hidden-site-input' })) {
+    const input = document.getElementById(id);
+    if (input && !input.appDialogSuggestions) input.parentElement.appendChild(createSuggestionList(hiddenSuggestionFields[kind], input));
+  }
   on('hidden-close', () => closeModal(document.getElementById('hidden-modal')));
   on('virtual-order-close', () => closeModal(document.getElementById('virtual-order-modal')));
   on('virtual-order-cancel', () => closeModal(document.getElementById('virtual-order-modal')));
@@ -432,7 +643,13 @@ export function bindActions() {
   });
 
   on('action-option-shutdown', async (e) => {
-    if (!confirm('サーバをシャットダウンしますか？')) return;
+    const ok = await confirmDialog({
+      title: 'サーバのシャットダウン',
+      message: 'サーバをシャットダウンしますか？',
+      okLabel: 'シャットダウン',
+      danger: true,
+    });
+    if (!ok) return;
     await runGuardedAction(e.currentTarget, async () => {
       const result = await postJson('/api/shutdown', {});
       assertApiSuccess(result, 'サーバを停止できませんでした');
@@ -440,7 +657,12 @@ export function bindActions() {
   });
 
   on('action-option-server-reboot', async () => {
-    if (!confirm('サーバを再起動しますか？')) return;
+    const ok = await confirmDialog({
+      title: 'サーバの再起動',
+      message: 'サーバを再起動しますか？',
+      okLabel: '再起動',
+    });
+    if (!ok) return;
     rememberRebootReturnTo();
     try {
       const result = await postJson('/api/reboot', {});
@@ -524,6 +746,11 @@ export function bindActions() {
   on('tag-edit-cancel', closeTagEditor);
   on('add-tag-button', addTagFromInput);
   on('favorite-tag-button', addFavoriteTagFromInput);
+  // タグ一覧の並び順 (メインメニューの「タグ」)。
+  El.tagSortOrderSelect?.addEventListener('change', (event) => {
+    void saveTagSortOrder(event.target.value);
+  });
+  syncTagSortOrderSelect();
   El.newTagInput?.addEventListener('input', renderTagSuggestions);
   El.newTagInput?.addEventListener('focus', renderTagSuggestions);
   El.newTagInput?.addEventListener('blur', () => {
@@ -595,9 +822,6 @@ export function bindActions() {
   on('colvis-reset', () => {
     resetColvisCheckboxesToDefault();
   });
-
-  // --- Confirm modal ---
-  on('confirm-cancel', () => El.confirmModal?.classList.add('hide'));
 
   // --- Bookmarklet register modal ---
   function clearRegisterUrl() {
@@ -1447,6 +1671,10 @@ async function addTagFromInput() {
   const submitted = input.value;
   const tags = splitTagInput(submitted);
   if (tags.length === 0) return;
+  if (tags.some(isAttributeTag)) {
+    showNotification('属性タグは編集できません', 'warning');
+    return;
+  }
 
   const idsJson = El.tagEditModal?.dataset.ids;
   const ids = idsJson ? JSON.parse(idsJson) : [...State.selectedIds];
@@ -1494,7 +1722,7 @@ function renderTagSuggestions() {
 
   const currentTags = getCurrentEditorTags();
   const candidates = State.tags
-    .filter(tag => !currentTags.has(tag))
+    .filter(tag => !currentTags.has(tag) && !isAttributeTag(tag))
     .map(tag => ({ tag, score: tagSuggestionScore(tag, query) }))
     .filter(item => item.score >= 0)
     .sort((a, b) => a.score - b.score || a.tag.localeCompare(b.tag, 'ja'))
@@ -1596,7 +1824,7 @@ async function refreshTagEditor(ids) {
   });
   if (generation !== tagReadGeneration || !isCurrentTagEditor(ids, editorGeneration)) return;
   const selectedTagInfo = Array.isArray(taginfo)
-    ? taginfo.filter(info => Number(info?.count || 0) > 0)
+    ? taginfo.filter(info => Number(info?.count || 0) > 0 && attributeTagVisible(info.tag))
     : [];
   renderTagEditorSummary(selectionCount);
   renderTagEditorTags(ids, selectedTagInfo);
@@ -1650,14 +1878,38 @@ function renderTagEditorTags(ids, taginfo) {
     chip.dataset.tag = info.tag;
     chip.dataset.presentCount = String(presentCount);
     chip.dataset.selectedCount = String(selectionCount);
-    chip.textContent = info.tag;
 
+    // タグ名の隣に × ボタン、色と ★ はその下の段に並べる (押し間違えないように)。
+    const label = document.createElement('span');
+    label.className = 'tag-edit-text';
+    label.textContent = info.tag;
     if (selectionCount > 1) {
       const count = document.createElement('span');
       count.className = 'tag-edit-count';
       count.textContent = ` ${presentCount}/${selectionCount}`;
-      chip.appendChild(count);
+      label.appendChild(count);
     }
+    if (isAttributeTag(info.tag)) {
+      label.title = '属性タグは編集できません';
+      chip.appendChild(label);
+      container.appendChild(chip);
+      return;
+    }
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'tag-remove';
+    removeBtn.disabled = tagMutationPending;
+    removeBtn.textContent = '×';
+    removeBtn.title =
+      selectionCount > 1
+        ? `選択中の${selectionCount}件から「${info.tag}」を外す`
+        : `「${info.tag}」を外す`;
+    removeBtn.addEventListener('click', async () => {
+      await mutateEditorTags(ids, { [info.tag]: 0 }, 'タグの削除に失敗しました');
+    });
+    label.appendChild(removeBtn);
+    chip.appendChild(label);
 
     const colorBtn = document.createElement('button');
     colorBtn.type = 'button';
@@ -1668,7 +1920,6 @@ function renderTagEditorTags(ids, taginfo) {
     colorBtn.addEventListener('click', (event) => {
       showTagColorMenu(event, info.tag);
     });
-    chip.appendChild(colorBtn);
 
     const favoriteBtn = document.createElement('button');
     favoriteBtn.type = 'button';
@@ -1683,24 +1934,16 @@ function renderTagEditorTags(ids, taginfo) {
       event.stopPropagation();
       await toggleFavoriteTag(info.tag);
     });
-    chip.appendChild(favoriteBtn);
+
+    const actions = document.createElement('span');
+    actions.className = 'tag-edit-actions';
+    actions.appendChild(colorBtn);
+    actions.appendChild(favoriteBtn);
+    chip.appendChild(actions);
     chip.addEventListener('contextmenu', (event) => {
       showTagColorMenu(event, info.tag);
     });
 
-    const removeBtn = document.createElement('button');
-    removeBtn.type = 'button';
-    removeBtn.className = 'tag-remove';
-    removeBtn.disabled = tagMutationPending;
-    removeBtn.textContent = '×';
-    removeBtn.title =
-      selectionCount > 1
-        ? `選択中の${selectionCount}件から「${info.tag}」を外す`
-        : `「${info.tag}」を外す`;
-    removeBtn.addEventListener('click', async () => {
-      await mutateEditorTags(ids, { [info.tag]: 0 }, 'タグの削除に失敗しました');
-    });
-    chip.appendChild(removeBtn);
     container.appendChild(chip);
   });
 }
@@ -1727,19 +1970,22 @@ function renderFavoriteTags() {
     const chip = document.createElement('span');
     chip.className = `tag-label ${tagColorClass(tag)} tag-favorite`;
     chip.dataset.tag = tag;
-    chip.textContent = tag;
     chip.title = `「${tag}」を入力欄へ入れる`;
 
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'tag-favorite-add';
-    addBtn.textContent = '追加';
-    addBtn.title = `「${tag}」をタグに追加する`;
-    addBtn.addEventListener('click', async (event) => {
-      event.stopPropagation();
-      await addFavoriteTagToSelection(tag);
-    });
-    chip.appendChild(addBtn);
+    // ドラッグ＆ドロップで並べ替えられるようにする (2 件以上のときだけ)。
+    if (favorites.length > 1) {
+      chip.draggable = true;
+      chip.classList.add('tag-favorite-draggable');
+      chip.addEventListener('dragstart', onFavoriteTagDragStart);
+      chip.addEventListener('dragend', onFavoriteTagDragEnd);
+      chip.addEventListener('dragover', onFavoriteTagDragOver);
+      chip.addEventListener('dragleave', onFavoriteTagDragLeave);
+      chip.addEventListener('drop', onFavoriteTagDrop);
+    }
+
+    const label = document.createElement('span');
+    label.className = 'tag-edit-text';
+    label.textContent = tag;
 
     const removeBtn = document.createElement('button');
     removeBtn.type = 'button';
@@ -1750,7 +1996,24 @@ function renderFavoriteTags() {
       event.stopPropagation();
       await setFavoriteTags({ action: 'remove', tags: [tag] });
     });
-    chip.appendChild(removeBtn);
+    label.appendChild(removeBtn);
+    chip.appendChild(label);
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'tag-favorite-add';
+    addBtn.textContent = '追加';
+    addBtn.title = `「${tag}」をタグに追加する`;
+    addBtn.disabled = isAttributeTag(tag);
+    addBtn.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await addFavoriteTagToSelection(tag);
+    });
+
+    const actions = document.createElement('span');
+    actions.className = 'tag-edit-actions';
+    actions.appendChild(addBtn);
+    chip.appendChild(actions);
 
     chip.addEventListener('click', () => {
       if (!El.newTagInput) return;
@@ -1761,6 +2024,120 @@ function renderFavoriteTags() {
 
     list.appendChild(chip);
   });
+}
+
+// ─── お気に入りタグのドラッグ＆ドロップ並べ替え ───
+
+// ドラッグ中のお気に入りタグ (null なら無効)。
+let favoriteTagDragTag = null;
+
+/** ドラッグ中の要素をグレーにして、掴んでいることを示す。 */
+function onFavoriteTagDragStart(event) {
+  const chip = event.currentTarget;
+  favoriteTagDragTag = chip.dataset.tag || null;
+  chip.classList.add('tag-favorite-drag-source');
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    // Firefox はデータなしでは dragstart を认识和しない。
+    event.dataTransfer.setData('text/plain', favoriteTagDragTag || '');
+  }
+}
+
+function onFavoriteTagDragEnd(event) {
+  favoriteTagDragTag = null;
+  event.currentTarget.classList.remove('tag-favorite-drag-source');
+  clearFavoriteTagDropMarks();
+}
+
+function onFavoriteTagDragOver(event) {
+  if (!favoriteTagDragTag) return;
+  // preventDefault がないと drop イベントが発火しない。
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+  clearFavoriteTagDropMarks();
+  const chip = event.currentTarget;
+  if (chip.dataset.tag === favoriteTagDragTag) return;
+  const rect = chip.getBoundingClientRect();
+  const before = event.clientX < rect.left + rect.width / 2;
+  chip.classList.add(before ? 'tag-favorite-drop-before' : 'tag-favorite-drop-after');
+}
+
+function onFavoriteTagDragLeave(event) {
+  event.currentTarget.classList.remove('tag-favorite-drop-before', 'tag-favorite-drop-after');
+}
+
+async function onFavoriteTagDrop(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  const chip = event.currentTarget;
+  const dragged = favoriteTagDragTag;
+  const target = chip.dataset.tag;
+  clearFavoriteTagDropMarks();
+  favoriteTagDragTag = null;
+  if (!dragged || !target || dragged === target) return;
+
+  const order = (Array.isArray(State.favoriteTags) ? State.favoriteTags : []).slice();
+  const from = order.indexOf(dragged);
+  if (from < 0) return;
+  // ドラッグしたタグを取り除く。
+  order.splice(from, 1);
+  const targetIndex = order.indexOf(target);
+  if (targetIndex < 0) return;
+  const rect = chip.getBoundingClientRect();
+  const before = event.clientX < rect.left + rect.width / 2;
+  // カーソルが半分より左なら前、右なら後に挿入する。
+  order.splice(before ? targetIndex : targetIndex + 1, 0, dragged);
+  await setFavoriteTags({ action: 'reorder', tags: order });
+}
+
+function clearFavoriteTagDropMarks() {
+  El.tagFavoritesList?.querySelectorAll('.tag-favorite-drop-before, .tag-favorite-drop-after')
+    .forEach((chip) => chip.classList.remove('tag-favorite-drop-before', 'tag-favorite-drop-after'));
+}
+
+// ─── タグ一覧の並び順 ───
+
+// 並び順の選択肢 (サーバ側の `webui.tag-sort-order` と同じ値)。
+const TAG_SORT_ORDERS = [
+  { value: 'favorites_first', labelKey: 'tagSortOrderFavoritesFirst' },
+  { value: 'alphabetical', labelKey: 'tagSortOrderAlphabetical' },
+  { value: 'count', labelKey: 'tagSortOrderCount' },
+  { value: 'registered', labelKey: 'tagSortOrderRegistered' },
+];
+
+// 並び順のセレクトボックスを現在の設定に合わせる。
+export function syncTagSortOrderSelect() {
+  const select = El.tagSortOrderSelect;
+  if (!select) return;
+  if (select.options.length === 0) {
+    TAG_SORT_ORDERS.forEach((order) => {
+      const option = document.createElement('option');
+      option.value = order.value;
+      option.textContent = t(order.labelKey);
+      select.appendChild(option);
+    });
+  }
+  select.value = State.tagSortOrder || 'favorites_first';
+  const label = select.closest('.tag-sort-order')?.querySelector('label');
+  if (label) label.textContent = t('tagSortOrderLabel');
+}
+
+// 並び順を変えたら保存してタグ一覧を取り直す。
+async function saveTagSortOrder(value) {
+  const previous = State.tagSortOrder;
+  State.tagSortOrder = value;
+  syncTagSortOrderSelect();
+  try {
+    const result = await postJson('/api/global_setting', {
+      settings: { 'webui.tag-sort-order': value },
+    });
+    assertApiSuccess(result, '並び順の保存に失敗しました');
+    await refreshTags();
+  } catch (error) {
+    State.tagSortOrder = previous;
+    syncTagSortOrderSelect();
+    showNotification(error.message || '並び順の保存に失敗しました', 'error');
+  }
 }
 
 // お気に入りタグの登録 / 解除を切り替える。
@@ -1987,7 +2364,27 @@ async function saveVirtualOrder() {
 async function openHiddenSettings() {  const modal = document.getElementById('hidden-modal');
   if (!modal) return;
   modal.classList.remove('hide');
-  await refreshHiddenSettings();
+  await Promise.all([refreshHiddenSettings(), refreshHiddenSuggestions()]);
+}
+
+async function refreshHiddenSuggestions() {
+  let novels;
+  try {
+    const result = await fetchJson('/api/list?all=true&show_hidden=true');
+    if (!Array.isArray(result?.data)) throw new Error('一覧の形式が不正です');
+    novels = result.data;
+  } catch {
+    showNotification('入力候補の取得に失敗しました', 'error');
+    return;
+  }
+  const suggestions = hiddenSuggestions(novels);
+  for (const kind of Object.keys(hiddenSuggestionFields)) {
+    hiddenSuggestionFields[kind].suggestions = suggestions[kind];
+  }
+  const focused = document.activeElement;
+  if (focused && ['hidden-tag-input', 'hidden-author-input', 'hidden-site-input'].includes(focused.id)) {
+    focused.dispatchEvent(new Event('input', { bubbles: true }));
+  }
 }
 
 async function refreshHiddenSettings() {
@@ -2118,7 +2515,12 @@ async function updateLatestVersionInfo() {
 let latestVersionData = null;
 
 async function startSelfUpdate(variant) {
-  if (!confirm('最新バージョンへ更新します。WEBサーバーは一旦停止し、自動的に再起動します。よろしいですか？')) return;
+  const ok = await confirmDialog({
+    title: '最新バージョンへ更新',
+    message: '最新バージョンへ更新します。WEBサーバーは一旦停止し、自動的に再起動します。よろしいですか？',
+    okLabel: '更新する',
+  });
+  if (!ok) return;
   const btn = El.aboutUpdate;
   if (btn) btn.disabled = true;
   if (El.aboutUpdateStatus) {

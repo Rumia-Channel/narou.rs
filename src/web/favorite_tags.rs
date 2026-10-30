@@ -17,8 +17,9 @@ use super::AppState;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct FavoriteTagsRequest {
-    /// `add` / `remove` / `clear`。
+    /// `add` / `remove` / `clear` / `reorder`。
     pub action: Option<String>,
+    /// 追加・削除するタグ、または `reorder` のときの並び順。
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -68,6 +69,9 @@ pub async fn api_favorite_tags(
         }
         "clear" => {
             state.clear();
+        }
+        "reorder" => {
+            state.reorder(&tags);
         }
         _ => {}
     });

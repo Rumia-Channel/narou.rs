@@ -12,7 +12,7 @@
 //! のタグ名検証と同じ規則 (`application::webui::validate_web_tag_name`) を
 //! 通す。タグ色とは独立した設定で、片方の色分けは他方に影響しない。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +57,38 @@ impl FavoriteTags {
         let changed = !self.tags.is_empty();
         self.tags.clear();
         changed
+    }
+
+    /// お気に入りタグを並び替える (ドラッグ＆ドロップの並べ替え)。
+    ///
+    /// `order` に含まれるタグだけを並べ替える。`order` に無いタグは
+    /// 元の位置を保ったまま残るので、部分的な並び替えでも他のタグを
+    /// 消さない。`order` に未知のタグが混ざっていても無視する。
+    pub fn reorder(&mut self, order: &[String]) -> bool {
+        let known: HashSet<&str> = self.tags.iter().map(String::as_str).collect();
+        let mut requested: Vec<&str> = Vec::with_capacity(order.len());
+        for tag in order {
+            let tag = tag.as_str();
+            if known.contains(tag) && !requested.contains(&tag) {
+                requested.push(tag);
+            }
+        }
+        if requested.is_empty() {
+            return false;
+        }
+        // `order` に載っているタグが占める位置 (元の並び順) を求め、
+        // その位置に `order` の順に並べ替える。載っていないタグは動かない。
+        let mut slots: Vec<usize> = Vec::with_capacity(requested.len());
+        for (index, tag) in self.tags.iter().enumerate() {
+            if requested.contains(&tag.as_str()) {
+                slots.push(index);
+            }
+        }
+        let before = self.tags.clone();
+        for (slot, tag) in slots.into_iter().zip(requested) {
+            self.tags[slot] = tag.to_string();
+        }
+        before != self.tags
     }
 
     /// 存在しなくなったタグをお気に入りから外す。
@@ -140,6 +172,53 @@ mod tests {
         assert!(favorites.clear());
         assert!(!favorites.clear());
         assert!(favorites.is_empty());
+    }
+
+    #[test]
+    fn reorder_moves_tags_to_the_requested_order() {
+        let mut favorites = FavoriteTags::default();
+        favorites.add("A");
+        favorites.add("B");
+        favorites.add("C");
+        assert!(favorites.reorder(&["C".to_string(), "A".to_string(), "B".to_string()]));
+        assert_eq!(favorites.tags, vec!["C".to_string(), "A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn reorder_keeps_tags_that_are_not_listed() {
+        let mut favorites = FavoriteTags::default();
+        favorites.add("A");
+        favorites.add("B");
+        favorites.add("C");
+        // B は order に無いので元の位置 (2 番目) を保つ。
+        // order に載った A と C は元の位置同士を入れ替える。
+        assert!(favorites.reorder(&["C".to_string(), "A".to_string()]));
+        assert_eq!(favorites.tags, vec!["C".to_string(), "B".to_string(), "A".to_string()]);
+    }
+
+    #[test]
+    fn reorder_ignores_unknown_tags_and_reports_no_change() {
+        let mut favorites = FavoriteTags::default();
+        favorites.add("A");
+        favorites.add("B");
+        assert!(!favorites.reorder(&["未知".to_string()]));
+        assert_eq!(favorites.tags, vec!["A".to_string(), "B".to_string()]);
+        // 同じ順番なら変更なし。
+        assert!(!favorites.reorder(&["A".to_string(), "B".to_string()]));
+        assert_eq!(favorites.tags, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn reorder_preserves_the_other_tags_after_a_full_swap() {
+        let mut favorites = FavoriteTags::default();
+        for tag in ["A", "B", "C", "D"] {
+            favorites.add(tag);
+        }
+        assert!(favorites.reorder(&["D".to_string(), "C".to_string(), "B".to_string(), "A".to_string()]));
+        assert_eq!(
+            favorites.tags,
+            vec!["D".to_string(), "C".to_string(), "B".to_string(), "A".to_string()]
+        );
     }
 
     #[test]

@@ -324,6 +324,13 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                     .into_bytes(),
             ),
         ),
+        "js/ui/dialog.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions("js/ui/dialog.js", include_str!("assets/js/ui/dialog.js"))
+                    .into_bytes(),
+            ),
+        ),
         "js/ui/dropdown.js" => (
             "application/javascript; charset=utf-8",
             Cow::Owned(

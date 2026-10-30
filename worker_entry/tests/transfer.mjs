@@ -169,6 +169,8 @@ const TITLE = '転生したらテストだった';
 const AUTHOR = '作者名';
 const SITENAME = 'Example Site';
 const DOMAIN = 'example.com';
+// 旧形式アーカイブ検証用の別作品 (同じ toc_url だと衝突キーになる)。
+const LEGACY_TOC_URL = 'https://example.com/legacy9999zz/';
 // 1x1 の透過 PNG (挿絵は別ストアへ振り分けられる経路も通す)。
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
@@ -213,21 +215,22 @@ function sectionYaml(index, name, body) {
 }
 
 /// `files` は小説ディレクトリからの相対パス。
-function archiveFor(files) {
+/// `options.legacy` は旧形式 (属性タグが `tags` に埋まっている) の manifest を作る。
+function archiveFor(files, options = {}) {
   const manifest = {
     format_version: 1,
     app_version: '0.5.0',
     exported_at: '2026-10-24T00:00:00Z',
     novels: [
       {
-        toc_url: TOC_URL,
+        toc_url: options.tocUrl ?? TOC_URL,
         title: TITLE,
         author: AUTHOR,
         sitename: SITENAME,
         domain: DOMAIN,
-        tags: ['テスト'],
+        tags: options.legacy ? ['テスト', '小説'] : ['テスト'],
         novel_type: 1,
-        ncode: 'n1234ab',
+        ncode: options.ncode ?? 'n1234ab',
         files: files.map((file) => ({
           path: file.path,
           size: file.data.length,
@@ -480,7 +483,9 @@ try {
   assert.equal(record.body.ncode, 'n1234ab');
   assert.equal(record.body.domain, DOMAIN);
   assert.equal(record.body.novel_type, 1);
+  // 属性タグは通常タグから独立している (保存は extra_fields / attribute_tag)。
   assert.deepEqual(record.body.tags, ['テスト']);
+  assert.equal(record.body.attribute_tag, '小説');
   assert.equal(record.body.general_all_no, 1);
   assert.equal(record.body.use_subdirectory, false);
   console.log('PASS import creates the record and objects; unauthenticated / wrong-type / broken-zip are rejected');
@@ -506,7 +511,9 @@ try {
   assert.equal(exportedNovel.domain, DOMAIN);
   assert.equal(exportedNovel.ncode, 'n1234ab');
   assert.equal(exportedNovel.novel_type, 1);
+  // 属性タグは manifest の独立フィールド (tags には入らない)。
   assert.deepEqual(exportedNovel.tags, ['テスト']);
+  assert.equal(exportedNovel.attribute_tag, '小説');
   assert.equal(exportedNovel.subtitle, 'テスト用のあらすじ');
   assert.match(exportedNovel.last_update, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
   assert.equal(exportedNovel.general_lastup, undefined);
@@ -611,6 +618,23 @@ try {
   const skippedAgain = await b.upload(zipB);
   assert.deepEqual(skippedAgain.body, { success: true, created: 0, overwritten: 0, skipped: 1, errors: [] });
   console.log('PASS importing an existing novel without ?overwrite=true only skips it');
+
+  // --- 旧形式 (属性タグが tags に埋まっているアーカイブ) ----------------------
+  const legacyZip = archiveFor(fixtureA, { legacy: true, tocUrl: LEGACY_TOC_URL, ncode: 'n9999zz' });
+  const legacy = await b.upload(legacyZip);
+  assert.deepEqual(legacy.body, { success: true, created: 1, overwritten: 0, skipped: 0, errors: [] });
+  const legacyList = await b.json('/api/novels');
+  const legacyRow = legacyList.body.data.find((row) => row.toc_url === LEGACY_TOC_URL);
+  assert(legacyRow, '旧形式のアーカイブが取り込まれていない');
+  const legacyRecord = await b.json(`/api/novels/${legacyRow.id}`);
+  // 旧形式の属性タグは tags から取り出され、専用の項目に移る。
+  assert.deepEqual(legacyRecord.body.tags, ['テスト']);
+  assert.equal(legacyRecord.body.attribute_tag, '小説');
+  const legacyExport = await b.exportZip(legacyRow.id);
+  const { manifest: legacyManifest } = manifestOf(legacyExport.bytes);
+  assert.deepEqual(legacyManifest.novels[0].tags, ['テスト']);
+  assert.equal(legacyManifest.novels[0].attribute_tag, '小説');
+  console.log('PASS a legacy archive with the classification inside tags is migrated into attribute_tag');
 
   exitCode = 0;
 } catch (error) {

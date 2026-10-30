@@ -70,6 +70,7 @@ async fn all_episode_tags_are_merged_once_and_refresh_without_body_changes() {
     assert_eq!(first.total_count, 31);
     let mut record = novels.get(first.id.into()).await.unwrap().unwrap();
     assert_eq!(record.tags, vec!["シリーズ", "共通", "前半", "後半"]);
+    assert_eq!(record.attribute_tag(), Some("小説"));
     record.tags.push("手動".to_string());
     novels.apply_batch(vec![NovelMutation::Upsert(record)]).await.unwrap();
 
@@ -79,4 +80,5 @@ async fn all_episode_tags_are_merged_once_and_refresh_without_body_changes() {
     assert_eq!(updated.updated_count, 0, "tag refresh must not need changed section bodies");
     let record = novels.get(first.id.into()).await.unwrap().unwrap();
     assert_eq!(record.tags, vec!["シリーズ", "共通", "前半", "後半", "手動", "追加"]);
+    assert_eq!(record.attribute_tag(), Some("小説"));
 }

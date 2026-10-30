@@ -618,6 +618,7 @@ pub fn expand_tag_targets_sync(
     targets: &[String],
     lookup: &dyn NovelLookup,
     variant: TagExpansionVariant,
+    attribute_tags_enabled: bool,
 ) -> Vec<String> {
     let mut existing_numeric = HashSet::new();
     for target in targets {
@@ -630,7 +631,7 @@ pub fn expand_tag_targets_sync(
     let lookups = tag_expansion_lookups(targets, &existing_numeric);
     let mut tag_ids = HashMap::new();
     for name in &lookups.names {
-        let ids = scan_tag_ids_sync(lookup, name).unwrap_or_default();
+        let ids = scan_tag_ids_sync(lookup, name, attribute_tags_enabled).unwrap_or_default();
         tag_ids.insert(name.clone(), ids);
     }
     let all_ids = if needs_all_ids(targets, &tag_ids, variant) {
@@ -641,9 +642,10 @@ pub fn expand_tag_targets_sync(
     expand_tag_targets_from(targets, &existing_numeric, &tag_ids, &all_ids, variant)
 }
 
-fn scan_tag_ids_sync(lookup: &dyn NovelLookup, tag_name: &str) -> Result<Vec<i64>> {
+fn scan_tag_ids_sync(lookup: &dyn NovelLookup, tag_name: &str, attribute_tags_enabled: bool) -> Result<Vec<i64>> {
     let filter = NovelFilter {
         tag: Some(tag_name.to_string()),
+        attribute_tags_enabled,
         ..NovelFilter::default()
     };
     Ok(lookup
@@ -667,11 +669,12 @@ pub async fn expand_tag_targets(
     targets: &[String],
     existing_numeric: &HashSet<i64>,
     variant: TagExpansionVariant,
+    attribute_tags_enabled: bool,
 ) -> Vec<String> {
     let lookups = tag_expansion_lookups(targets, existing_numeric);
     let mut tag_ids = HashMap::new();
     for name in &lookups.names {
-        tag_ids.insert(name.clone(), scan_tag_ids(library, name).await);
+        tag_ids.insert(name.clone(), scan_tag_ids(library, name, attribute_tags_enabled).await);
     }
     let all_ids = if needs_all_ids(targets, &tag_ids, variant) {
         scan_all_ids(library).await
@@ -681,9 +684,10 @@ pub async fn expand_tag_targets(
     expand_tag_targets_from(targets, existing_numeric, &tag_ids, &all_ids, variant)
 }
 
-async fn scan_tag_ids(library: &LibraryService, tag_name: &str) -> Vec<i64> {
+async fn scan_tag_ids(library: &LibraryService, tag_name: &str, attribute_tags_enabled: bool) -> Vec<i64> {
     let filter = NovelFilter {
         tag: Some(tag_name.to_string()),
+        attribute_tags_enabled,
         ..NovelFilter::default()
     };
     scan_id_projection(library, &filter).await
@@ -1047,7 +1051,7 @@ mod tests {
             .collect();
 
         assert_eq!(
-            expand_tag_targets_sync(&targets, &lookup, TagExpansionVariant::Update),
+            expand_tag_targets_sync(&targets, &lookup, TagExpansionVariant::Update, false),
             vec!["1", "2", "3", "9"]
         );
     }

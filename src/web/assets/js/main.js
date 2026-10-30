@@ -12,7 +12,7 @@ import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
 import { initFeatureTour, maybeShowPendingFeatureTour } from './ui/feature_tour.js';
 import { initConsoleSizing } from './ui/console_size.js';
-import { renderNovelList, renderQueueStatus, renderTagList, showNotification, syncViewChecks } from './ui/render.js';
+import { renderNovelList, renderQueueStatus, renderTagList, showNotification, syncViewChecks, syncAttributeTagControls } from './ui/render.js';
 import {
   applyNotepadSnapshot,
   captureThemeRead,
@@ -27,6 +27,7 @@ import {
   refreshFavoriteTags,
   replaceConsoleHistory,
   appendConsoleHistory,
+  syncTagSortOrderSelect,
 } from './ui/actions.js';
 
 let wsConnection = null;
@@ -269,6 +270,23 @@ function applyWebConfig(config, themeGeneration) {
   if (config.performance_mode) State.performanceMode = config.performance_mode;
   State.debugMode = Boolean(config.debug_mode);
   setConcurrencyEnabled(Boolean(config.concurrency_enabled));
+  for (const [key, stateKey, id] of [
+    ['attribute_tags_enabled', 'attributeTagsEnabled', 'enable-attribute-tags'],
+    ['show_novel_attribute', 'showNovelAttribute', 'show-novel-attribute'],
+    ['show_manga_attribute', 'showMangaAttribute', 'show-manga-attribute'],
+  ]) {
+    const checkbox = document.getElementById(id);
+    if (typeof config[key] !== 'boolean' || checkbox?.dataset.saving === '1') continue;
+    State[stateKey] = config[key];
+    if (checkbox) checkbox.checked = config[key];
+  }
+  syncAttributeTagControls();
+  renderTagList();
+  renderNovelList();
+  if (config.tag_sort_order) {
+    State.tagSortOrder = config.tag_sort_order;
+    syncTagSortOrderSelect();
+  }
 }
 
 function normalizeTheme(theme) {
@@ -294,11 +312,17 @@ function mirrorConsoleToDevtools(text, targetConsole) {
 
 async function reloadWebConfig() {
   const themeGeneration = captureThemeRead();
+  const previousAttributeTagsEnabled = State.attributeTagsEnabled;
   try {
     const config = await fetchJson('/api/webui/config?fresh=1');
     if (config) {
       applyWebConfig(config, themeGeneration);
       applyPerformanceMode();
+      // 属性タグ機能の ON/OFF はサーバー側の一覧・タグ候補にも効くので、
+      // CLI や別タブで変更された場合は取得し直す。
+      if (previousAttributeTagsEnabled !== State.attributeTagsEnabled) {
+        await Promise.all([refreshList(), refreshTags()]);
+      }
     }
   } catch { /* keep current config */ }
 }

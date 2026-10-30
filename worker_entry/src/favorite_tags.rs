@@ -103,7 +103,9 @@ async fn write(db: &DbHandle, state: &FavoriteTags) -> Result<()> {
 
 #[derive(Deserialize, Default)]
 struct FavoriteTagsRequest {
+    /// `add` / `remove` / `clear` / `reorder`。
     action: Option<String>,
+    /// 追加・削除するタグ、または `reorder` のときの並び順。
     #[serde(default)]
     tags: Vec<String>,
 }
@@ -184,6 +186,9 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         "clear" => {
             state.clear();
         }
+        "reorder" => {
+            state.reorder(&tags);
+        }
         _ => {
             return Ok(Response::from_json(
                 &json!({"success":false,"message":"unknown favorite tags action"}),
@@ -202,4 +207,12 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
 
 async fn load(runtime: &WorkerRuntime) -> Result<FavoriteTags> {
     read(runtime.write_db()).await
+}
+
+/// D1 ハンドルからお気に入りタグを読む。
+///
+/// タグ一覧の表示順 (お気に入り優先) で使う。読み取り専用の経路なので
+/// UI セッションのハンドルでよい。
+pub(crate) async fn load_with_db(db: &DbHandle) -> Result<FavoriteTags> {
+    read(db).await
 }

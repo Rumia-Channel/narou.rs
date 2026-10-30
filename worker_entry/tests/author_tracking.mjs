@@ -113,11 +113,41 @@ try {
   run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
   // Author scenarios intentionally use legacy D1, independent of S3-default coverage.
   sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','\"d1\"','d1');");
+  // Old records may lack attributes or contain an ordinary tag named 漫画.
+  // Classify both from effective YAML before indexed tag queries.
+  sql(`INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,tags_json,ncode,ncode_fold,domain,domain_fold)
+    VALUES (900,'A','a','Artwork','artwork','artwork','https://www.pixiv.net/ajax/illust/900','https://www.pixiv.net/ajax/illust/900','Pixiv','pixiv','2026-01-01T00:00:00Z','[]','a900','a900','www.pixiv.net','www.pixiv.net'),
+           (901,'A','a','Novel','novel','novel','https://www.pixiv.net/ajax/novel/901','https://www.pixiv.net/ajax/novel/901','Pixiv','pixiv','2026-01-01T00:00:00Z','["漫画"]','n901','n901','www.pixiv.net','www.pixiv.net');
+    INSERT INTO novel_tags(novel_id,position,tag,tag_fold) VALUES (901,0,'漫画','漫画');`);
   await start();
+  assert((await api('/api/tag_list?format=json')).ok, 'legacy attribute migration must complete');
+  assert.deepEqual(sql('SELECT ncode,tags_json,attribute_tag FROM novels ORDER BY id').map((row) => [row.ncode, JSON.parse(row.tags_json), row.attribute_tag]), [
+    ['a900', [], '漫画'], ['n901', [], '小説'],
+  ]);
+  assert.deepEqual(sql('SELECT tag FROM novel_tags ORDER BY novel_id').map((row) => row.tag), []);
+  let viewConfig = await json('/api/webui/config?fresh=1');
+  assert.equal(viewConfig.attribute_tags_enabled, false);
+  assert.deepEqual((await json('/api/tag_list?format=json')).tags, []);
+  assert.equal((await json(`/api/list?filter=${encodeURIComponent('tag:漫画')}`)).records_filtered, 0);
+  await setting({'tag.attributes-enabled': true}, {'tag.attributes-enabled': null});
+  assert((await json('/api/tag_list?format=json')).tags.includes('漫画'));
+  assert.equal((await json(`/api/list?filter=${encodeURIComponent('tag:漫画')}`)).records_filtered, 1);
+  await setting({'tag.attributes-enabled': false}, {'tag.attributes-enabled': true});
+  assert.equal((await json(`/api/list?filter=${encodeURIComponent('tag:漫画')}`)).records_filtered, 0);
+  assert.equal(sql('SELECT attribute_tag FROM novels WHERE id=900')[0].attribute_tag, '漫画');
+  assert.equal(viewConfig.show_novel_attribute, false);
+  assert.equal(viewConfig.show_manga_attribute, true);
+  await setting({'tag.show-novel': true, 'tag.show-manga': false}, {'tag.show-novel': null, 'tag.show-manga': null});
+  viewConfig = await json('/api/webui/config?fresh=1');
+  assert.equal(viewConfig.show_novel_attribute, true);
+  assert.equal(viewConfig.show_manga_attribute, false);
+  await setting({'tag.show-novel': null, 'tag.show-manga': null}, {'tag.show-novel': true, 'tag.show-manga': false});
+  sql('DELETE FROM novels WHERE id IN (900,901)');
   const authorUrl = `http://localhost:${sourcePort}/authors/7/`;
   const storedUrl = authorUrl + '#works';
   const definition = `name: Controlled Author Source\ndomain: localhost\ntop_url: http://localhost:${sourcePort}\nurl: 'http://localhost:${sourcePort}/(?<ncode>(?:work|oneshot)\\d+)/?'\nsitename: Controlled Author Source\nversion: 1.0\nconfirm_over18: no\ntoc_url: 'http://localhost:${sourcePort}/\\k<ncode>/'\nauthor_url: '^http://(?:localhost|authors\\.example):${sourcePort}/authors/(?<user_id>\\d+)/?'\nauthor_api_url: 'http://localhost:${sourcePort}/authors/\\k<user_id>/'\nauthor_novel_pattern: '(?<novel_url>http://localhost:${sourcePort}/(?:work|oneshot)\\d+/)'\ntitle: '<h1>(?<title>.+?)</h1>'\nauthor: '<span class="author">(?<author>.+?)</span>'\nsubtitles: '<a href="(?<href>/(?:work|oneshot)\\d+/(?<index>\\d+)/)">(?<subtitle>.+?)</a>'\nbody_pattern: '<div class="body">(?<body>.+?)</div>'\nmin_interval: 0.01\n`;
-  await json('/api/sites/localhost.yaml', definition, 'PUT');
+  const workTypeRule = (work) => `\nwork_type_rules:\n  - field: source\n    match: '^category::comic$'\n    type: manga\npreprocess: |-\n  let kind = extract(/<h1>Controlled ([^<]+)<\\/h1>/)\n  if kind == "${work}"\n    emit "\\ncategory::comic\\n"\n    insert_at_match\n  end\n`;
+  await json('/api/sites/localhost.yaml', definition + workTypeRule('work1'), 'PUT');
   assert.equal((await fetch(`http://127.0.0.1:${port}/api/authors`, { headers: { Connection: 'close' } })).status, 401);
   assert.equal((await api('/api/authors', { url: `http://localhost:${sourcePort}/work1/` })).status, 400);
   const extra = [9, 10].map((id) => `http://localhost:${sourcePort}/authors/${id}/`);
@@ -132,9 +162,23 @@ try {
   assert.deepEqual((await json('/api/authors')).authors, [{ site: 'localhost', url: storedUrl }]);
   const first = await update(); assert.equal(first.count, 0); assert.equal(first.author_job_ids.length, 1);
   assert.deepEqual(sql('SELECT ncode FROM novels ORDER BY ncode').map((row) => row.ncode), ['work1', 'work2']);
+  let tagged = sql('SELECT id, ncode, tags_json, attribute_tag FROM novels ORDER BY ncode');
+  assert.deepEqual(JSON.parse(tagged[0].tags_json), []);
+  assert.equal(tagged[0].attribute_tag, '漫画');
+  assert.deepEqual(JSON.parse(tagged[1].tags_json), []);
+  assert.equal(tagged[1].attribute_tag, '小説');
+  assert.equal((await api(`/api/novels/${tagged[0].id}/tags/remove`, { tags: ['漫画'] })).status, 400);
+  assert.equal((await api(`/api/novels/${tagged[1].id}/tags`, { tags: ['漫画'] })).status, 400);
+  await json(`/api/novels/${tagged[1].id}/tags`, { tags: ['手動'] });
+  await json('/api/sites/localhost.yaml', definition + workTypeRule('work2'), 'PUT');
   console.log('PASS author registration persists across restart; empty-library update discovers and downloads works');
   workCount = 3; await update();
   assert.deepEqual(sql('SELECT ncode FROM novels ORDER BY ncode').map((row) => row.ncode), ['work1', 'work2', 'work3']);
+  tagged = sql('SELECT ncode, tags_json, attribute_tag FROM novels ORDER BY ncode');
+  assert.deepEqual(JSON.parse(tagged[0].tags_json), []);
+  assert.equal(tagged[0].attribute_tag, '小説');
+  assert.deepEqual(JSON.parse(tagged[1].tags_json), ['手動']);
+  assert.equal(tagged[1].attribute_tag, '漫画');
   const downloads = count("SELECT COUNT(*) FROM worker_jobs WHERE kind='download'"); await update();
   assert.equal(count("SELECT COUNT(*) FROM worker_jobs WHERE kind='download'"), downloads, 'known works must not create new download jobs');
   console.log('PASS later publications are discovered automatically; known works do not create duplicate downloads');

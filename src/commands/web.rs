@@ -211,7 +211,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
     };
 
     // Write PID file for restart recovery
-    write_pid_file(&control_token);
+    write_pid_file(&control_token, address.port, &address.host);
 
     #[cfg(windows)]
     if hide_console {
@@ -470,18 +470,36 @@ fn create_reusable_listener(addr: SocketAddr) -> io::Result<tokio::net::TcpListe
 
 // --- PID file management ---
 
+/// PID ファイルのパス。
+///
+/// サーバと CLI が同じファイルを見る必要があるため、カレントディレクトリ
+/// ではなく「narou ルート」(`.narou` のある最上位ディレクトリ) 基準で決める。
+/// ライブラリ直下以外の場所から起動しても同じファイルを指す。
 fn pid_file_path() -> Option<std::path::PathBuf> {
-    Some(
-        std::env::current_dir()
-            .ok()?
-            .join(".narou")
-            .join("server.pid"),
-    )
+    let root = narou_rs::logger::find_narou_root()
+        .or_else(|| std::env::current_dir().ok())?;
+    Some(root.join(".narou").join("server.pid"))
 }
 
-fn write_pid_file(control_token: &str) {
+/// PID ファイルに書く内容。
+///
+/// 形式は `<pid> <control_token> <port> <host>`。
+/// port / host も同じファイルに書く。
+/// サーバは自分が実際に待ち受けているポートとホストを書くので、
+/// CLI 側は `server-port` 設定に依存せず稼働中のサーバへ到達できる
+/// (`--port` で起動したときの取りこぼしを防ぐ)。
+fn write_pid_file(control_token: &str, port: u16, host: &str) {
     if let Some(path) = pid_file_path() {
-        let _ = write_private_file(&path, &format!("{} {}", std::process::id(), control_token));
+        let _ = write_private_file(
+            &path,
+            &format!(
+                "{} {} {} {}",
+                std::process::id(),
+                control_token,
+                port,
+                host
+            ),
+        );
     }
 }
 
@@ -576,6 +594,20 @@ fn read_pid_file() -> Option<(u32, Option<String>)> {
     Some((pid, token))
 }
 
+/// PID ファイルから待ち受けポートとホストを読む。
+///
+/// 旧形式 (`<pid> <token>` だけ) なら `None` を返す。
+fn read_pid_file_endpoint() -> Option<(u16, String)> {
+    let path = pid_file_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut parts = content.split_whitespace();
+    let _pid = parts.next()?;
+    let _token = parts.next();
+    let port = parts.next()?.parse::<u16>().ok()?;
+    let host = parts.next().unwrap_or("127.0.0.1").to_string();
+    Some((port, host))
+}
+
 // --- Shutdown strategies ---
 
 /// Best-effort HTTP shutdown of a running narou server.
@@ -614,6 +646,46 @@ fn control_request_host(host: &str) -> &str {
         "::" => "::1",
         _ => host,
     }
+}
+
+/// 稼働中のサーバへ `server-*` 設定の再適用を求める。
+///
+/// `narou setting` で許可ホストや WebSocket の Origin 許可リストを変えた
+/// とき、サーバ側は 30 秒のポーリングで拾うので、その間だけ変更が反映され
+/// ない。CLI 側から再適用の API を呼ぶと即座に反映される。
+///
+/// サーバが動いていない場合は何もしない (設定の保存自体には影響しない)。
+pub(crate) fn notify_running_server_to_reload_security() -> bool {
+    let Some((_, token)) = read_pid_file() else {
+        return false;
+    };
+    // 待ち受けポートとホストはサーバ自身が PID ファイルに記録している。
+    // `server-port` 設定は `--port` で起動したときは反映されないため、
+    // ここでは PID ファイルの値を優先する (旧形式なら設定へ戻る)。
+    let (port, host) = match read_pid_file_endpoint() {
+        Some((port, host)) => (port, host),
+        None => {
+            let Ok(global_setting) = settings_store::load(SettingScope::Global) else {
+                return false;
+            };
+            let Some(port) = global_setting
+                .get("server-port")
+                .and_then(|value| value.as_u64())
+                .and_then(|port| u16::try_from(port).ok())
+            else {
+                return false;
+            };
+            let host = yaml_string(global_setting.get("server-bind"))
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            (port, host)
+        }
+    };
+    send_control_request(
+        &host,
+        port,
+        token.as_deref(),
+        "/api/server_security/reload",
+    )
 }
 
 pub(crate) fn send_control_request(

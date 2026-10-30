@@ -56,6 +56,9 @@ fn cmd_setting_inner(
         settings_store::load_with_inventory(&inv, Scope::Global)?;
 
     let mut error_count = 0u32;
+    // `server-*` 系の値が変わったか (変わったら稼働中のサーバへ再適用を
+    // 伝えてすぐ反映する)。
+    let mut security_changed = false;
 
     for arg in args {
         let (name, value_str) = split_arg(arg);
@@ -115,10 +118,14 @@ fn cmd_setting_inner(
             match cast_value(&name, &value_str) {
                 Ok(casted) => {
                     let display = format_yaml_value(&casted);
+                    let changed = settings.get(&name) != Some(&casted);
                     settings.insert(name.clone(), casted);
                     println!("{} を {} に設定しました", name, display);
                     if name == "device" && matches!(s, Scope::Local) {
                         modify_settings_when_device_changed(settings);
+                    }
+                    if changed && is_server_security_name(&name) {
+                        security_changed = true;
                     }
                 }
                 Err(msg) => {
@@ -132,11 +139,24 @@ fn cmd_setting_inner(
     settings_store::save_with_inventory(&inv, Scope::Local, &local_settings)?;
     settings_store::save_with_inventory(&inv, Scope::Global, &global_settings)?;
 
+    // `server-*` 系の値を変えたときは、稼働中のサーバへ再適用を伝えて
+    // すぐ反映する (ポーリング待ちだと 30 秒も反映されない)。
+    if error_count == 0 && security_changed {
+        super::web::notify_running_server_to_reload_security();
+    }
+
     if error_count > 0 {
         std::process::exit(error_count as i32);
     }
 
     Ok(())
+}
+
+/// `server-*` 系 (許可ホスト / WebSocket Origin / reverse proxy) の設定名か。
+///
+/// これらの値の変更はサーバ側のセキュリティ設定の即時再適用を必要とする。
+fn is_server_security_name(name: &str) -> bool {
+    narou_rs::application::settings::SERVER_SECURITY_NAMES.contains(&name)
 }
 
 fn split_arg(arg: &str) -> (String, Option<String>) {
