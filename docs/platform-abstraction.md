@@ -450,8 +450,8 @@ Worker (worker_entry)
 - `running` leaseの有効期限内に同じjobが再配信された場合は`Busy { retry_after }`として明示的に遅延再配信し、ackしない。DLQはruntimeの運用経路であり、通常consumerが直接drainしない。
 - 同一サイトの取得間隔はサイト単位のDurable Objectへ集約する。DO内でpermit timestampを予約し、caller側が`worker::Delay`で待機する。`SiteRateLimiter`自身はalarmを使用しない。別サイトのpermitは独立して進める。
 - Cronはplannerに限定し、D1をbounded pageで走査して個別Update jobをenqueueする。Cron発火時刻をgenerationとして保存せず、D1が管理する論理generationとkeyset cursorをplanner lease付きで再開する。
-- Worker crawlerは実行予算を超える前にsection単位のcheckpointを保存して終了する。次回claim時にcheckpointのjob/novel identityを検証し、保存済みprefixをObjectStoreから復元してHTTP再取得を避ける。prefixが欠損する場合はsection 0から安全に再開する。
-- Budgetによるsection-boundary yieldは失敗retryではない。checkpointをD1へ保存してjobを`pending`へ戻し、同じjobの新しいv2 envelopeをQueueへ送信し、送信成功後に現在messageをackする。正常経路では`attempts`とQueue retry回数を消費しない。送信後ack前のクラッシュは通常の再配信に任せ、lease/dedupeで二重実行を防ぐ。
+- Worker crawler は話の開始前と未取得画像の直前で実行予算を確認する。画像取得中の中断では挿絵索引を保存し、section 単位の checkpoint は未完了の話を指す。次回 claim 時に checkpoint の job/novel identity を検証し、完了した話の prefix を ObjectStore から復元する。同じ話の保存済み画像は索引で読み飛ばして残りを取得する。prefix が欠損する場合は section 0 から安全に再開する。
+- Budget による話・画像境界の yield は失敗 retry ではない。checkpoint を D1 へ保存して job を `pending` へ戻し、同じ job の新しい v2 envelope を Queue へ送信し、送信成功後に現在 message を ack する。正常経路では `attempts` と Queue retry 回数を消費しない。送信後 ack 前のクラッシュは通常の再配信に任せ、lease/dedupe で二重実行を防ぐ。
 - HTTP 等の通常の retryable エラーも最新の話境界を保存してから失敗記録へ進む。境界は 100 話未満でも保持し、非同期の定期保存を回収してから execution token で fenced な最終書込みを await する。予算による yield とは区別し、通常の attempts / retry-backoff を消費する。破損 prefix から再開始するときも旧保存を回収し、位置 0 と同じ実行文脈を以後のダウンローダへ渡す。本文に続いて dirty な挿絵索引も通常エラー時に保存するため、再試行は保存済みデータを再利用できる。
 - `Convert` / `Send` / `Mail` / `Backup` の重いnative処理はWorkerで実行せず、blockedとしてledgerへ記録する。Worker APIは既存read APIと分離し、認証・binding readiness・失敗分類を明示する。
 
