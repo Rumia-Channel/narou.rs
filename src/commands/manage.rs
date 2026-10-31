@@ -137,6 +137,17 @@ enum TagOutput {
     Error(String),
 }
 
+fn attribute_visibility() -> (bool, bool, bool) {
+    let settings = narou_rs::db::settings::load(narou_rs::setting_core::SettingScope::Local).unwrap_or_default();
+    let value = |name| settings.get(name).and_then(narou_rs::setting_core::setting_bool_value);
+    (value("tag.attributes-enabled").unwrap_or(false), value("tag.show-novel").unwrap_or(false), value("tag.show-manga").unwrap_or(true))
+}
+
+fn visible_tag(tag: &str, visibility: (bool, bool, bool)) -> bool {
+    !narou_rs::application::attribute_tags::is_attribute_tag(tag)
+        || (visibility.0 && narou_rs::application::attribute_tags::is_visible(tag, visibility.1, visibility.2))
+}
+
 pub fn cmd_list(options: ListOptions) -> i32 {
     use narou_rs::db;
 
@@ -218,6 +229,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         }
     };
 
+    let visibility = attribute_visibility();
     let mut selected = Vec::new();
     let hidden = if options.show_hidden {
         narou_rs::hidden::HiddenState::default()
@@ -235,28 +247,34 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
             narou_rs::platform::repository::FreezeReadMode::InventoryOnly,
         );
         if !options.show_hidden
-            && hidden.matches(
+            && (hidden.matches(
                 record.id,
                 &record.author,
                 &record.tags,
                 record.domain.as_deref(),
                 &record.sitename,
-            )
+            ) || (visibility.0 && record.attribute_tag().is_some_and(|tag| hidden.tags.contains(tag))))
         {
             continue;
         }
         if !matches_filters(record, frozen, &filter_words) {
             continue;
         }
-        if !valid_tags(record, &tag_filters) {
+        if !valid_tags(record, &tag_filters, visibility.0) {
             continue;
         }
 
-        let plain = decorate_line(record, options, frozen, &tag_colors, false);
-        if !matches_grep(&plain, &grep_words) {
+        let mut displayed_record = record.clone();
+        if let Some(tag) = record.attribute_tag().filter(|tag| visible_tag(tag, visibility)) {
+            displayed_record.tags.push(tag.to_string());
+        }
+        if !grep_words.is_empty()
+            && !matches_grep(&decorate_line(&displayed_record, options, frozen, &tag_colors, false), &grep_words)
+        {
             continue;
         }
-        selected.push((record.clone(), frozen, plain));
+        let plain = decorate_line(&displayed_record, options, frozen, &tag_colors, false);
+        selected.push((displayed_record, frozen, plain));
     }
 
     if options.show_tags() {
@@ -312,6 +330,11 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             return 127;
         }
     };
+    if matches!(&mode, TagMode::Add(tags) | TagMode::Delete(tags) if tags.iter().any(|tag| narou_rs::application::attribute_tags::is_attribute_tag(tag))) {
+        log::report_error("属性タグは編集できません");
+        return 127;
+    }
+
 
     let inventory = match Inventory::with_default_root() {
         Ok(inventory) => inventory,
@@ -405,6 +428,7 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         .collect::<Vec<_>>();
 
     let new_tag_color = tag_colors::configured_new_tag_color();
+    let visibility = attribute_visibility();
     let outputs = (|| -> narou_rs::error::Result<(Vec<TagOutput>, Vec<String>)> {
         let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
         let mut outputs = Vec::new();
@@ -450,9 +474,13 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
                 TagMode::List => {}
             }
 
-            if !updated.tags.is_empty() {
-                color_tags.extend(updated.tags.iter().cloned());
-                outputs.push(TagOutput::Current(updated.tags.clone()));
+            let mut displayed_tags = updated.tags.clone();
+            if let Some(tag) = updated.attribute_tag().filter(|tag| visible_tag(tag, visibility)) {
+                displayed_tags.push(tag.to_string());
+            }
+            if !displayed_tags.is_empty() {
+                color_tags.extend(displayed_tags.iter().cloned());
+                outputs.push(TagOutput::Current(displayed_tags));
             }
 
             mutations.push(narou_rs::platform::NovelMutation::Upsert(updated));
@@ -492,10 +520,10 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
     for output in outputs {
         match output {
             TagOutput::Info(message) => println!("{}", message),
-            TagOutput::Current(tags) => println!(
-                "現在のタグは {} です",
-                render_tags(&tags, &tag_colors, " ", true)
-            ),
+            TagOutput::Current(tags) => {
+                let visible: Vec<_> = tags.into_iter().filter(|tag| visible_tag(tag, visibility)).collect();
+                println!("現在のタグは {} です", render_tags(&visible, &tag_colors, " ", true));
+            }
             TagOutput::Error(message) => log::report_error(&message),
         }
     }
@@ -556,14 +584,9 @@ fn resolve_list_sort_key(raw: Option<&str>) -> Result<Option<&'static str>, Stri
     }
 }
 
-fn valid_tags(record: &NovelRecord, tags: &[String]) -> bool {
-    if tags.is_empty() {
-        return true;
-    }
-    if record.tags.is_empty() {
-        return false;
-    }
-    tags.iter().all(|tag| record.tags.contains(tag))
+fn valid_tags(record: &NovelRecord, tags: &[String], attributes_enabled: bool) -> bool {
+    tags.iter().all(|tag| record.tags.contains(tag)
+        || (attributes_enabled && record.attribute_tag() == Some(tag)))
 }
 
 fn matches_filters(record: &NovelRecord, frozen: bool, filters: &[String]) -> bool {
@@ -811,6 +834,7 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
             return 127;
         }
     };
+    let visibility = attribute_visibility();
 
     let inventory = match Inventory::with_default_root() {
         Ok(inventory) => inventory,
@@ -838,6 +862,7 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
         "{}",
         tag_list
             .iter()
+            .filter(|(tag, _)| visible_tag(tag, visibility))
             .map(|(tag, count)| render_tag_count(tag, *count, tag_colors))
             .collect::<Vec<_>>()
             .join(" ")
@@ -856,6 +881,7 @@ fn get_tag_list() -> Result<Vec<(String, usize)>, String> {
 
     let mut counts = HashMap::<String, usize>::new();
     let mut order = Vec::<String>::new();
+    let attributes_enabled = attribute_visibility().0;
     for id in ids {
         let Ok(Some(record)) = novels.get_sync(id) else {
             continue;
@@ -865,6 +891,12 @@ fn get_tag_list() -> Result<Vec<(String, usize)>, String> {
                 order.push(tag.clone());
             }
             *counts.entry(tag.clone()).or_insert(0) += 1;
+        }
+        if let Some(tag) = record.attribute_tag().filter(|_| attributes_enabled) {
+            if !counts.contains_key(tag) {
+                order.push(tag.to_string());
+            }
+            *counts.entry(tag.to_string()).or_insert(0) += 1;
         }
     }
 

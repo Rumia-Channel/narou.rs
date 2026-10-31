@@ -23,6 +23,7 @@ pub mod sqlite;
 pub mod application;
 pub mod object_store;
 pub mod s3;
+pub mod tag_sequence;
 pub mod transfer;
 pub mod web_actions;
 pub mod self_update;

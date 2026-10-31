@@ -10,6 +10,7 @@ mod authors;
 mod bundled_sites;
 mod favorite_tags;
 mod hidden;
+mod tag_sequence;
 mod virtual_novels;
 mod composition;
 mod content_store;
@@ -112,6 +113,13 @@ async fn route(req: Request, env: Env) -> Result<Response> {
         .and_then(|id| id.parse::<i64>().ok())
     {
         return virtual_novels::handle_order(req, env, id).await;
+    }
+    if let Some(id) = path
+        .strip_prefix("/api/virtual_novels/")
+        .and_then(|rest| rest.strip_suffix("/members"))
+        .and_then(|id| id.parse::<i64>().ok())
+    {
+        return virtual_novels::handle_add_members(req, env, id).await;
     }
     if req.method() == Method::Delete
         && let Some(id) = path
@@ -281,6 +289,7 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
             hidden: None,
             include_hidden: true,
             exclude_ids: Vec::new(),
+            attribute_tags_enabled: narou_rs::application::attribute_tags::enabled(&services.settings).await,
         })
         .await
         .map_err(|error| Error::RustError(error.to_string()))?;

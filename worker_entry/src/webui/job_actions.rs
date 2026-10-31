@@ -412,6 +412,7 @@ async fn api_update(
             &sorted,
             &existing_numeric,
             narou_rs::application::target_lookup::TagExpansionVariant::Update,
+            narou_rs::application::attribute_tags::enabled(&runtime.write_services().settings).await,
         )
         .await;
         // サイト定義 (オブジェクトストア LIST) は URL 解決でしか要らない:
@@ -822,7 +823,11 @@ async fn api_update_by_tag(
         load_current_sort_state_for_writes(runtime),
         runtime.write_services().library.records(),
     );
-    let records = records.unwrap_or_default();
+    let mut records = records.unwrap_or_default();
+    narou_rs::application::attribute_tags::project(
+        &mut records,
+        narou_rs::application::attribute_tags::enabled(&runtime.write_services().settings).await,
+    );
     let snapshot_ids: Vec<i64> = {
         let mut matching = records
             .into_iter()
@@ -919,7 +924,7 @@ async fn broadcast_console_note(env: &Env, runtime: &WorkerRuntime, text: &str) 
 
 /// native `src/web/jobs.rs::notify_queue_changed` 相当。受理した投入のあとに
 /// `notification.queue` を送る (native は request 単位で 1 回、`queued` の
-/// ときだけ)。表시更新なので best-effort — 送信失敗でも応答は変えない。
+/// ときだけ)。表示更新なので best-effort — 送信失敗でも応答は変えない。
 async fn notify_queue_changed(env: &Env, runtime: &WorkerRuntime) {
     let push = crate::push_hub::PushHubClient::new(env, runtime.subrequests.clone());
     crate::consumer::notify_queue_changed(&push).await;

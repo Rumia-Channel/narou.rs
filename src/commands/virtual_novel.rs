@@ -39,6 +39,13 @@ pub enum VirtualAction {
         /// New order, e.g. `2,1,3` (all members must be listed).
         order: String,
     },
+    /// Add novels to an existing virtual novel (they join at the end, in order).
+    Append {
+        /// Virtual novel (`vs_1` or its ID).
+        target: String,
+        /// Novels to append (ID / URL / title / N-code / alias).
+        members: Vec<String>,
+    },
     /// Remove a virtual novel. Member novels are kept.
     Remove {
         /// Virtual novel (`vs_1` or its ID).
@@ -59,6 +66,7 @@ pub fn cmd_virtual(action: VirtualAction) -> Result<()> {
         } => add(&title, &author, &site, domain, &tags, &members),
         VirtualAction::List => list(),
         VirtualAction::Order { target, order } => reorder(&target, &order),
+        VirtualAction::Append { target, members } => append(&target, &members),
         VirtualAction::Remove { target } => remove(&target),
     }
 }
@@ -139,6 +147,22 @@ fn reorder(target: &str, order: &str) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     virtual_novel::reorder_by_positions(virtual_id, &positions)?;
     println!("仮想小説 vs_{virtual_id} の順序を変更しました");
+    Ok(())
+}
+
+fn append(target: &str, members: &[String]) -> Result<()> {
+    let virtual_id = resolve_virtual_id(target)?;
+    let mut member_ids = Vec::with_capacity(members.len());
+    for member in members {
+        let id = super::resolve_target_to_id(member)
+            .ok_or_else(|| NarouError::Database(format!("作品が見つかりません: {member}")))?;
+        if !member_ids.contains(&id) {
+            member_ids.push(id);
+        }
+    }
+    let added = member_ids.len();
+    virtual_novel::add_members(virtual_id, member_ids)?;
+    println!("仮想小説 vs_{virtual_id} に {added} 作品を追加しました");
     Ok(())
 }
 

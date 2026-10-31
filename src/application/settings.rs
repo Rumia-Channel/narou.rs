@@ -187,6 +187,9 @@ pub const LIVE_WEBUI_CONFIG_NAMES: &[&str] = &[
     "webui.table.reload-timing",
     "webui.performance-mode",
     "webui.new-tag-color",
+    "tag.show-novel",
+    "tag.show-manga",
+    "tag.attributes-enabled",
     "webui.debug-mode",
     "concurrency",
 ];
@@ -610,17 +613,21 @@ pub fn storage_setting_requires_restart(name: &str) -> bool {
 /// `server-*` values that `narou_rs::web::server_security` derives runtime
 /// behaviour from. Changing any of them re-applies the security snapshot
 /// without a restart.
+///
+/// 値が変わったことを検出する設定名の一覧。`narou setting` 側も
+/// 同じ一覧を見て、稼働中のサーバへ再適用を求める。
+pub const SERVER_SECURITY_NAMES: &[&str] = &[
+    "server-basic-auth.enable",
+    "server-basic-auth.user",
+    "server-basic-auth.password",
+    "server-add-accepted-hosts",
+    "server-ws-add-accepted-domains",
+    "server-reverse-proxy.enable",
+];
+
 fn server_security_snapshot(
     settings: &HashMap<String, serde_yaml::Value>,
 ) -> Vec<(String, serde_yaml::Value)> {
-    const SERVER_SECURITY_NAMES: &[&str] = &[
-        "server-basic-auth.enable",
-        "server-basic-auth.user",
-        "server-basic-auth.password",
-        "server-add-accepted-hosts",
-        "server-ws-add-accepted-domains",
-        "server-reverse-proxy.enable",
-    ];
     SERVER_SECURITY_NAMES
         .iter()
         .filter_map(|name| {

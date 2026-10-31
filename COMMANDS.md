@@ -104,7 +104,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `illust` | — (Rust 拡張) | ✅ 完了 | `.illustration_cache.yaml` 運用のための `narou illust <sub>`。`orphan`/`migrate`/`fix-ext`/`rebuild` に加え、挿絵を S3 互換ストレージへ写す `s3-push` / 突き合わせる `s3-verify` を実装。削除/改名/移行 (および `s3-push`) は既定 dry-run (`-f` で実行) |
 | `author` | — (Rust 拡張) | ✅ 完了 | 追跡する作者を登録すると (`narou author add <作者ページURL>`)、`narou update`（対象省略の一括更新）の後段で新しい作品を自動追加する（個別更新では追跡しない）。`add`/`list`/`remove`/`check`。作者ページの認識と作品一覧の取得はサイト定義 (`author_url` / `author_api_url` / `author_novel_pattern` / `author_work_url`) が担う。Pixiv は `preprocess:` の DSL が `author_novel::` / `author_series::` / `author_comic_series::` を emit し、シリーズに属する話/ページは `author_series_episodes_url` / `author_comic_series_pages_url` で除く (作品単位 = 単体小説 + 小説シリーズ + 漫画シリーズ + 単体イラスト・漫画)。`check --dry-run` は追加予定の URL だけを表示 |
 | `hidden` | — (Rust 拡張) | ✅ 完了 | 作品・タグ・作者・サイトを一覧から非表示にする。`add`/`remove`/`list`/`clear`。`add 123 --tag 秘密 --author 作者名 --site kakuyomu.jp` のように単位を指定でき、タグ非表示はそのタグを持つ作品も隠す。設定は在庫 `hidden`（Native は `.narou/hidden.yaml` / SQLite `app_state`、Worker は D1 `app_state`）に保存し、`narou list --show-hidden` と Web UI の「非表示も表示」で解除表示できる。更新・変換などの内部処理は非表示作品も対象 |
-| `virtual` | — (Rust 拡張) | 🟡 部分 | 複数の実小説を `vs_<ID>` の 1 作品として `novels` に登録する。`add`（タイトル・作者・サイト・タグ・メンバー）/`list`/`order`/`remove`、Web API `/api/virtual_novels`、Web UI の登録・並べ替え・削除を実装。仮想小説には `vs_<ID>` タグが付き、hidden tag で非表示にできる。メンバー行は一覧から自動除外。`convert vs_<ID>` はメンバーを登録順に結合した EPUB を出力する。Worker は登録・一覧・並べ替え・削除 API と結合 EPUB ダウンロードに対応 |
+| `virtual` | — (Rust 拡張) | 🟡 部分 | 複数の実小説を `vs_<ID>` の 1 作品として `novels` に登録する。`add`（タイトル・作者・サイト・タグ・メンバー）/`append`（既存の仮想小説へメンバーを追加）/`list`/`order`/`remove`、Web API `/api/virtual_novels`（`POST /{id}/members` で追加）、Web UI の登録・追加・並べ替え・変換・削除を実装。仮想小説には `vs_<ID>` タグが付き、hidden tag で非表示にできる。メンバー行は一覧から自動除外。`convert vs_<ID>` はメンバーを登録順に結合した EPUB を出力する。`append` はタグ・話数・最新話掲載日を再計算し、既に別の仮想小説に属する作品と仮想小説自身は拒否する。Worker は登録・一覧・並べ替え・メンバー追加・削除 API と結合 EPUB ダウンロードに対応 |
 | `export` | — (Rust 拡張) | ✅ 完了 | 選択した作品を ZIP に書き出す (`narou export <target>... -o file.zip`)。`toc.yaml`・本文・`setting.ini`・`replace.txt`・`converter.yaml`・挿絵・EPUB を含み、`manifest.json` にメタデータと SHA-256 を記録。DB-only の作品も一時的に実体化して書き出す |
 | `import` | — (Rust 拡張) | ✅ 完了 | `narou export` の ZIP を取り込む (`narou import file.zip [--overwrite|--skip]`)。`toc_url` が一致する既存作品は上書き/スキップ、無い作品は新しい ID で追加。書込みは YAML / SQLite / S3 挿絵の各バックエンドの ObjectStore 経由で行い、古いアーカイブで既存本文を削らない。Web API `GET /api/transfer/export` / `POST /api/transfer/import` も同じ処理 |
 | `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`rename`/`order`/`clear` を実装。**サイトごとに複数の「名前つきログイン」を試行順つきで保持**し、1 ログインが複数ホストの Cookie を持つ (ブラウザのセッションがホストをまたぐため)。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET /api/login`、`POST /api/login/import\|rename\|order`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}` も対応 |
@@ -188,6 +188,26 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - カクヨムネクスト (`webnovel/kakuyomu.jp.yaml`, version 2.6) は目次の `EmptyEpisode` を `login_partial_pattern` で検出し、保存済みログインを順に試す。制限が残れば取得範囲を警告して無料分だけを取得し、後から閲覧権のある Cookie を保存して更新すると残りも取得できる。採用したセッションは本文取得と次回更新でも使い、通常の公開作品には Cookie を送らない。本文 URL が作品トップ等へ戻され、本文枠が無い場合も DSL で失敗させ、空本文をキャッシュ・保存しない。サイト固有の判定は YAML / DSL に置く
 - 部分一覧に保存済みの話が欠ける場合は、既定では話の削除やダイジェスト化とは判定せず `Canceled` で更新を見送り、目次・本文を保持する（force 時も同じ）。サイト定義の `preserve_missing_sections: true`（Pixiv・カクヨムで有効）は、話番号と URL の同一性を確認できる保存済み本文を保持しながら、閲覧できる話を更新・追加する。対応が曖昧な場合は従来どおり見送る。閲覧できる話が 0 件なら部分一覧の目印の有無によらず保存ログインを試し、それでも 0 件なら登録・本文更新・自動変換をせず、既存データと未使用 ID を保持する。
 - サイト定義の `min_interval:` でサイトごとの最低リクエスト間隔 (秒) の下限を宣言でき、該当サイトのレートリミットスコープにだけ適用される
+- 全作品を `小説` / `漫画` のいずれかに分類し、通常タグとは別の `attribute_tag` に保存する。サイト定義の `work_type_rules:` に `field`・正規表現 `match`・`type: novel|manga` を指定し、最初に一致した規則を採用する。定義なし・未一致は小説。判定対象は `ncode` / `title` / `author` / `url` (取得用 `toc_url`) / `novel_type` (連載 `1`・短編 `2`) / `episode_count` / `source` (前処理済み最初の目次ページ) から明示する。Pixiv だけは ncode が `a` / `c` なら漫画に分類する（`a` にはイラストとうごイラも含む）。サイト固有の分類処理は `preprocess:` DSL で記述できる。
+
+  ```yaml
+  work_type_rules:
+    - field: source
+      match: '^category::comic$'
+      type: manga
+  preprocess: |-
+    let kind = extract(/<meta name="kind" content="([^"]+)">/)
+    if kind == "comic"
+      emit "\ncategory::comic\n"
+      insert_at_match
+    end
+  ```
+
+  この例ではサイトの目次から種別を抽出し、DSL の出力を `source` で照合する。既存作品の初期分類は保存済みの作品情報を使用するため、過去の取得ページが保存されていない `source` 条件は評価できない。既存の属性があれば保持し、無ければいったん小説となり、次回更新で前処理を実行して再分類する。ページ内容が不要な条件は保存済み情報から判定する。
+  分類は手動で追加・削除できず、更新時にルールが変われば以前の分類を置き換える。属性タグ機能は既定 OFF で、`narou setting tag.attributes-enabled=true` または Web UI の「タグ」→「属性タグ機能を使う」で ON にすると検索・表示に使える。OFF 中も分類は保存され、検索・表示には使わない。ON 時の個別表示は `tag.show-novel` / `tag.show-manga` で切り替える（既定は小説非表示・漫画表示）。個別表示の設定は検索や保存データを変更しない。
+  既存の通常タグに `小説` / `漫画` があった場合も、この 2 名は属性用に予約されるため、保存済み情報から判定できる条件ではサイト定義に従う属性へ置き換わる。他の通常タグは保持する。
+
+
 - サイト定義の `headers:` キーで任意のリクエストヘッダを宣言できる (Pixiv は画像ホスト用に `Referer`、ハーメルン R18 は Cloudflare challenge 回避用に `Sec-Fetch-*` を指定)。値は `\k<...>` 補間され、危険な名前・値は無視される
 - サイト定義の `cookie_hosts:` は、サイトの `domain` とは別に Cookie を送ってよい信頼済みホスト名の配列（各ホストのサブドメインも含む）。R18 なろうは作者用 `xmypage.syosetu.com` を指定する。未指定の第三者ホストには Cookie を送らない
 - サイト定義の `cookie_session: true` は取得ポリシー内だけの匿名 Cookie セッションを有効にする。応答の Cookie を同一 origin・Path・Secure・有効期限の範囲で次の送信に使い、保存済みログインへ書き込まない。既定は無効
@@ -261,6 +281,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - ログイン Cookie のフォールバックは `download` と共通の downloader 経路を通るため、保存済みの `login` 資格情報によるログイン壁/部分一覧の再取得は update でも動く
 - Worker の手動取得・手動更新・自動更新・中断後の再開は同じ Downloader / CookieStore / FetchPolicy を使う。公開作品には不要な Cookie を送らず、ログイン壁・部分一覧で保存ログインを試し、成功セッションを再利用する。年齢同意 `over18` と `download.interval` / `download.wait-steps` / サイトの `min_interval` も共通に適用し、自動更新だけで同意を許可したり間隔を短縮したりしない。`update.interval` は更新対象の作品開始間隔として追加適用する
 - 失敗した小説は downloader 側が「小説が削除されているか非公開な可能性があります」を出し、コマンド側は行を出さない (Ruby版と同じ)。この行がログに残るので、`n 件のエラーが発生しました` の内訳をログから追える (2026-10 修正、issue #36)
+- YAML 管理時の `update` 終了処理では、保持済みの `database.yaml` ロックを再取得せずに保存する。再入ロックによって更新が停止する不具合を修正した。
 
 **完了扱いにしない理由 / 不足動作**:
 - Ruby版の詳細表示・hotentry後処理など、周辺出力/イベント処理の細部は追加突合が必要
@@ -345,6 +366,7 @@ narou author remove 1
 - 安全策: パストラバーサル・absolute path・重複パス・サイズ/エントリ上限・zip bomb を共通コアで拒否。上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。`sqlite.mirror-files=false` のライブラリへの import は fail closed。
 - Web API: `GET /api/transfer/export?ids=1,2` は ZIP、`POST /api/transfer/import[?overwrite=true]` は ZIP 本文を受け取り `{success, created, overwritten, skipped, errors}` を返す。既存の Web 認証ミドルウェア配下。
 - 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が同じ build/parse/plan を呼ぶ。
+- **書式 (ZIP の中身) の詳細は [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md)** を参照 (`manifest.json` のスキーマ・検証ルール・衝突規則・同梱するファイル・挿絵の扱い)。
 
 ### 3.x-hidden `hidden` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
 
@@ -569,6 +591,9 @@ narou setting name         # 読み取り
 | `economy` | multiple | 省容量設定 (cleanup_temp/send_delete/nosave_diff/nosave_raw) |
 | `guard-spoiler` | boolean | DL時の話名非表示 |
 | `auto-add-tags` | boolean | サイトタグ自動追加 |
+| `tag.attributes-enabled` | boolean | 属性タグ機能を有効にする。既定 false。OFF 中も分類は保存し、表示・検索には使わない |
+| `tag.show-novel` | boolean | CLI と Web UI で小説属性を表示する。既定 false |
+| `tag.show-manga` | boolean | CLI と Web UI で漫画属性を表示する。既定 true |
 | `time-zone` | string | YAML に timezone がないサイト日時の既定タイムゾーン |
 | `user-agent` | string | カスタム User-Agent |
 | `webui.theme` | select | WebUI テーマ |
@@ -646,12 +671,12 @@ narou setting name         # 読み取り
 | `--add TAGS` | `-a` | string | — | タグ追加 (スペース区切り) | ✅ |
 | `--delete TAGS` | `-d` | string | — | タグ削除 | ✅ |
 | `--color COL` | `-c` | string | auto | タグ色設定 | ✅ |
-| `--clear` | — | flag | false | 全タグクリア | ✅ |
+| `--clear` | — | flag | false | 通常タグをクリア (属性タグは保持) | ✅ |
 | targets | | Vec\<String\> | — | 対象小説 | ✅ |
 
 **Rust 実装**:
 - 引数なしでタグ一覧表示、タグ名のみ指定時は Ruby版同様 `list --tag` 相当の検索へ委譲
-- `--add` / `--delete` はスペース区切り複数タグを処理し、`--clear` は対象小説のタグを全削除する
+- `--add` / `--delete` はスペース区切り複数タグを処理する。属性タグの追加・削除は拒否し、`--clear` でも属性を保持する
 - `--color` は `green/yellow/blue/magenta/cyan/red/white` を受け付け、無効色は Ruby版同様に警告して無視する
 - `tag_colors.yaml` の保存順を保持しつつ、`webui.new-tag-color` 未設定または `default` 時は自動色ローテーション (green→yellow→blue→magenta→cyan→red→white)、色名指定時は新規タグへ固定色を割り当てる
 - 追加タグの禁止文字 `:;"'><$@&^\\\|%/\`` と禁止語 `hotentry` を Ruby版相当に検証する
@@ -664,6 +689,13 @@ narou setting name         # 読み取り
 - API: `GET /api/favorite_tags` (現在の登録一覧)、`POST /api/favorite_tags` (`action`: `add` / `remove` / `clear`、native は `src/web/favorite_tags.rs`、Worker は `worker_entry/src/favorite_tags.rs`)
 - タグ色とは独立した設定。お気に入りに登録しても色は変わらず、色を変えてもお気に入りは外れない
 - CLI には対応コマンドが無い (Web UI 専用の設定)
+
+**タグの登録順 (issue #46 の要望、2026-10 追加)**:
+- Web UI のタグ一覧の並び順「登録順」は、各タグが付いた小説のうち ID が最小のものを登録順としていたため、古い小説へ後からタグを付けたときや ID の小さいほうへ後からタグを追加したときには「タグがライブラリへ入った順」と食い違っていた
+- タグごとにグローバルな連番を振り、在庫の `tag_sequence` キー (Native は `.narou/tag_sequence.yaml` / SQLite・Worker は `app_state('inv','tag_sequence')`) へ保存する
+- 既存ライブラリには連番が無いので、最初の書き込みで最小小説 ID → タグ名の順にバックフィルし、以後の新しいタグは登録順の末尾に足す
+- 共有モデルは `src/application/tag_sequence.rs`、native のストアは `src/native/tag_sequence.rs`、Worker の D1 ストアは `worker_entry/src/tag_sequence.rs`。native の書き込み時の更新は `src/db/database.rs`、Worker は `worker_entry/src/d1_repository.rs` で行う
+- 連番表の更新は作品と同じ直列化境界の中で行う (Native は同じトランザクション / ファイルロック、Worker は同じ D1 batch)。別の境界で更新すると「作品を保存した順」と「連番を振った順」がずれるため、分けては行わない
 
 ---
 

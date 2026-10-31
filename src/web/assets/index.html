@@ -78,9 +78,27 @@
                 <span data-i18n="menuTag">タグ</span> <span class="caret"></span>
               </a>
               <ul class="dropdown-menu dropdown-menu-tags" id="tag-menu">
+                <li>
+                  <div class="tag-sort-order">
+                    <label for="tag-sort-order-select">並び順</label>
+                    <select id="tag-sort-order-select" class="tag-sort-order-select"></select>
+                  </div>
+                </li>
                 <li><div id="tag-list-canvas" class="tag-list-canvas"></div></li>
                 <li class="divider"></li>
                 <li><a href="#" id="action-tag-edit">選択した小説のタグを編集 <span class="shortcut">T</span></a></li>
+                <li>
+                  <div class="tag-sort-order">
+                    <span data-i18n="attributeTagsDisplay">属性タグの表示</span>
+                  </div>
+                  <div class="tag-sort-order">
+                    <label><input type="checkbox" id="enable-attribute-tags"> <span data-i18n="attributeTagsEnabled">属性タグ機能を使う</span></label>
+                  </div>
+                  <div class="tag-sort-order">
+                    <label><input type="checkbox" id="show-novel-attribute"> <span data-i18n="attributeNovel">小説</span></label>
+                    <label><input type="checkbox" id="show-manga-attribute"> <span data-i18n="attributeManga">漫画</span></label>
+                  </div>
+                </li>
               </ul>
             </li>
             <!-- ツール (Tool) -->
@@ -109,15 +127,16 @@
                 <span class="caret"></span>
               </a>
               <ul class="dropdown-menu dropdown-menu-right" id="options-menu">
+                <li><a href="#" id="action-option-settings"><span class="material-symbols-outlined icon-leading" aria-hidden="true">build</span>環境設定...</a></li>
                 <li><a href="#" id="action-option-hidden"><span class="material-symbols-outlined icon-leading" aria-hidden="true">visibility_off</span>非表示設定...</a></li>
                 <li><a href="#" id="action-option-export"><span class="material-symbols-outlined icon-leading" aria-hidden="true">archive</span>選択した作品をダウンロード...</a></li>
                 <li><a href="#" id="action-option-import"><span class="material-symbols-outlined icon-leading" aria-hidden="true">unarchive</span>小説データをアップロード...</a></li>
                 <li><a href="#" id="action-option-virtual-add"><span class="material-symbols-outlined icon-leading" aria-hidden="true">library_add</span>選択した作品をバーチャル小説にまとめる...</a></li>
+                <li><a href="#" id="action-option-virtual-append"><span class="material-symbols-outlined icon-leading" aria-hidden="true">playlist_add</span>選択した作品をバーチャル小説に追加...</a></li>
                 <li><a href="#" id="action-option-virtual-order"><span class="material-symbols-outlined icon-leading" aria-hidden="true">reorder</span>バーチャル小説の順序を変更...</a></li>
                 <li><a href="#" id="action-option-virtual-convert"><span class="material-symbols-outlined icon-leading" aria-hidden="true">menu_book</span>バーチャル小説を変換...</a></li>
                 <li><a href="#" id="action-option-virtual-remove"><span class="material-symbols-outlined icon-leading" aria-hidden="true">delete</span>バーチャル小説を削除...</a></li>
                 <input type="file" id="transfer-import-file" accept=".zip,application/zip" hidden>
-                <li><a href="#" id="action-option-settings"><span class="material-symbols-outlined icon-leading" aria-hidden="true">build</span>環境設定...</a></li>
                 <li class="divider"></li>
                 <li><a href="#" id="action-option-help"><span class="material-symbols-outlined icon-leading" aria-hidden="true">help</span>ヘルプ...</a></li>
                 <li><a href="#" id="action-option-about"><span class="material-symbols-outlined icon-leading" aria-hidden="true">info</span>Narou.rs について</a></li>
@@ -377,17 +396,17 @@
             </div>
             <div class="hidden-section">
               <h5>タグ</h5>
-              <div class="hidden-add-row"><input type="text" id="hidden-tag-input" placeholder="タグ名"><button class="btn btn-primary btn-sm" id="hidden-tag-add" type="button">非表示にする</button></div>
+              <div class="hidden-add-row"><div class="hidden-input"><input type="text" id="hidden-tag-input" placeholder="タグ名"></div><button class="btn btn-primary btn-sm" id="hidden-tag-add" type="button">非表示にする</button></div>
               <div id="hidden-tag-list" class="hidden-list"></div>
             </div>
             <div class="hidden-section">
               <h5>作者</h5>
-              <div class="hidden-add-row"><input type="text" id="hidden-author-input" placeholder="作者名"><button class="btn btn-primary btn-sm" id="hidden-author-add" type="button">非表示にする</button></div>
+              <div class="hidden-add-row"><div class="hidden-input"><input type="text" id="hidden-author-input" placeholder="作者名"></div><button class="btn btn-primary btn-sm" id="hidden-author-add" type="button">非表示にする</button></div>
               <div id="hidden-author-list" class="hidden-list"></div>
             </div>
             <div class="hidden-section">
               <h5>サイト</h5>
-              <div class="hidden-add-row"><input type="text" id="hidden-site-input" placeholder="ドメインまたはサイト名"><button class="btn btn-primary btn-sm" id="hidden-site-add" type="button">非表示にする</button></div>
+              <div class="hidden-add-row"><div class="hidden-input"><input type="text" id="hidden-site-input" placeholder="ドメインまたはサイト名"></div><button class="btn btn-primary btn-sm" id="hidden-site-add" type="button">非表示にする</button></div>
               <div id="hidden-site-list" class="hidden-list"></div>
             </div>
           </div>
@@ -614,24 +633,6 @@
           <div class="modal-footer">
             <button class="btn btn-default" id="queue-restore-no" type="button">破棄</button>
             <button class="btn btn-primary" id="queue-restore-yes" type="button">復元</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Confirm Modal (for server-driven confirm dialogs) -->
-    <div class="modal-overlay hide" id="confirm-modal">
-      <div class="modal-dialog modal-dialog-sm">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h4 class="modal-title" id="confirm-title">確認</h4>
-          </div>
-          <div class="modal-body">
-            <p id="confirm-message"></p>
-          </div>
-          <div class="modal-footer">
-            <button class="btn btn-default" id="confirm-cancel" type="button">キャンセル</button>
-            <button class="btn btn-primary" id="confirm-ok" type="button">OK</button>
           </div>
         </div>
       </div>

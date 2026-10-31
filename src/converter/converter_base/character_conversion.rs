@@ -125,7 +125,7 @@ impl ConverterBase {
         if !self.settings.enable_dakuten_font {
             return text.to_string();
         }
-        // [ぁ-んァ-ヶι] と続く濁点記号 (U+309B 全角濁点 / U+FF9E 半角濁点)。
+        // [ぁ-んァ-ヶ] と続く濁点記号 (U+309B 全角濁点 / U+FF9E 半角濁点)。
         let re = &*RE_DAKUTEN;
         let mut hit = false;
         let result = re

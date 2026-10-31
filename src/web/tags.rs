@@ -231,6 +231,9 @@ pub async fn edit_tag(
             serde_json::Value::String(s) => s.parse::<i64>().unwrap_or(1),
             _ => 1,
         };
+        if matches!(s, 0 | 2) && crate::application::attribute_tags::is_attribute_tag(&tag) {
+            return serde_json::json!({ "success": false, "error": "属性タグは編集できません" }).into();
+        }
         match s {
             0 => tags_to_delete.push(tag),
             2 => tags_to_add.push(tag),

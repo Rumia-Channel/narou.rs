@@ -349,11 +349,6 @@ impl WorkerRuntime {
                 (objects, assets)
             }
         };
-        let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
-        // 更新系リポジトリ。`runtime.novels` は enqueue/frozen 判定の前段
-        // 読み取り (ジョブ経路) と同じく primary 直行にする。
-        let write_novels: Arc<dyn NovelRepository> =
-            Arc::new(D1NovelRepository::new(write_db.clone()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         // 一覧・描画系の凍結集合は isolate キャッシュ込みの読み取り系、
         // `runtime.freeze` (freeze 判定/更新前の読み取り) はキャッシュを
@@ -404,6 +399,11 @@ impl WorkerRuntime {
         );
         let site_settings = crate::bundled_sites::load_site_settings(&write_objects)
             .await.map_err(|error| worker::Error::RustError(error.to_string()))?;
+        crate::webui::metadata::initialize_attributes(env).await?;
+        let novels: Arc<dyn NovelRepository> =
+            Arc::new(D1NovelRepository::new(db.clone()).with_sites(site_settings.clone()));
+        let write_novels: Arc<dyn NovelRepository> =
+            Arc::new(D1NovelRepository::new(write_db.clone()).with_sites(site_settings.clone()));
         let site_rules = Arc::new(
             narou_rs::application::site_definitions::SiteSettingsSnapshot::new(site_settings.clone()),
         );
@@ -1025,14 +1025,15 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     let subrequests = crate::budget::SubrequestBudget::new();
     let (objects, _assets, s3_illustrations) =
         build_object_stores(env, &db, subrequests, false).await?;
-    let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
+    let site_settings = crate::bundled_sites::load_site_settings(&objects).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    crate::webui::metadata::initialize_attributes(env).await?;
+    let novels: Arc<dyn NovelRepository> =
+        Arc::new(D1NovelRepository::new(db.clone()).with_sites(site_settings.clone()));
     let site_rules = Arc::new(
-        narou_rs::application::site_definitions::SiteSettingsSnapshot::new(
-            crate::bundled_sites::load_site_settings(&objects).await
-                .map_err(|error| worker::Error::RustError(error.to_string()))?,
-        ),
+        narou_rs::application::site_definitions::SiteSettingsSnapshot::new(site_settings),
     );
     Ok(ReadServices {
         app: services_from(
@@ -1058,14 +1059,15 @@ pub async fn build_mutation_services(env: &Env) -> worker::Result<AppServices> {
     let subrequests = crate::budget::SubrequestBudget::new();
     let (objects, _assets, _s3_illustrations) =
         build_object_stores(env, &db, subrequests, true).await?;
-    let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::for_writes(db.clone()));
+    let site_settings = crate::bundled_sites::load_site_settings_uncached(&objects).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    crate::webui::metadata::initialize_attributes(env).await?;
+    let novels: Arc<dyn NovelRepository> =
+        Arc::new(D1NovelRepository::new(db.clone()).with_sites(site_settings.clone()));
     let site_rules = Arc::new(
-        narou_rs::application::site_definitions::SiteSettingsSnapshot::new(
-            crate::bundled_sites::load_site_settings_uncached(&objects).await
-                .map_err(|error| worker::Error::RustError(error.to_string()))?,
-        ),
+        narou_rs::application::site_definitions::SiteSettingsSnapshot::new(site_settings),
     );
     Ok(services_from(
         novels,

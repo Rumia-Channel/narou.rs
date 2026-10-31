@@ -93,6 +93,8 @@ pub struct LibraryListRequest {
     pub include_hidden: bool,
     /// 常に一覧から除外する作品 ID（バーチャル小説のメンバーなど）。
     pub exclude_ids: Vec<i64>,
+    /// Whether classifications participate in tag search and listing.
+    pub attribute_tags_enabled: bool,
 }
 
 /// One row of the library table: the business fields the web list needs.
@@ -309,6 +311,7 @@ impl LibraryService {
     ) -> Result<LibraryPage, ApplicationError> {
         let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
         let mut filter = self.build_filter_with_ids(request.search.as_deref(), &frozen_ids);
+        filter.attribute_tags_enabled = request.attribute_tags_enabled;
         if !request.include_hidden
             && let Some(hidden) = &request.hidden
         {
@@ -351,6 +354,13 @@ impl LibraryService {
             let is_frozen =
                 record_is_frozen(&record, Some(&frozen_ids), FreezeReadMode::InventoryOrTag);
             let display_url = record.display_url().to_string();
+            let attribute_tag = request.attribute_tags_enabled.then(|| record.attribute_tag().map(str::to_owned)).flatten();
+            let mut tags: Vec<String> = record.tags.into_iter()
+                .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
+                .collect();
+            if let Some(tag) = attribute_tag {
+                tags.push(tag);
+            }
             data.push(NovelSummary {
                 id: record.id,
                 title: record.title,
@@ -362,11 +372,7 @@ impl LibraryService {
                 general_lastup: record.general_lastup,
                 last_check_date: record.last_check_date,
                 new_arrivals_date: record.new_arrivals_date,
-                tags: record
-                    .tags
-                    .into_iter()
-                    .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
-                    .collect(),
+                tags,
                 new_arrivals: is_new,
                 frozen: is_frozen,
                 suspend: record.suspend,
@@ -736,6 +742,7 @@ mod tests {
             hidden: None,
             include_hidden: true,
             exclude_ids: Vec::new(),
+            attribute_tags_enabled: false,
         }
     }
 

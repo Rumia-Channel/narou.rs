@@ -80,7 +80,7 @@ export function createConsoleHistoryPoller(options) {
   function start() {
     if (!notifyTimer) {
       // 通知はすぐには出さない。一時的な切断 (再接続で済むもの) でも
-      // 通知が出るといつもの마다画面が邪魔になるため、一定時間
+      // 通知が出るたびに画面が邪魔になるため、一定時間
       // 履歴取得が続く場合だけ知らせる。再接続したら取り消す。
       notifyTimer = setTimeoutImpl(() => {
         notifyTimer = null;

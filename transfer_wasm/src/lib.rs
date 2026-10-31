@@ -116,6 +116,7 @@ mod tests {
                 sitename: "example".into(),
                 domain: Some("example.test".into()),
                 tags: vec![],
+                attribute_tag: Some("小説".into()),
                 novel_type: 1,
                 files: vec![],
                 ncode: None,

@@ -133,9 +133,11 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
         .collect();
     let mut all_sorted = all_ids;
     all_sorted.sort_unstable();
+    let attributes_enabled = narou_rs::application::attribute_tags::enabled_native();
     let tag_ids = |tag_name: &str| -> Vec<i64> {
         let filter = narou_rs::platform::NovelFilter {
             tag: Some(tag_name.to_string()),
+            attribute_tags_enabled: attributes_enabled,
             ..Default::default()
         };
         novels

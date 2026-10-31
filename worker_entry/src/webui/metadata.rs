@@ -35,6 +35,21 @@ pub(crate) fn primary_database(env: &Env) -> worker::Result<DbHandle> {
     Ok(DbHandle::primary(Arc::new(env.d1("DB")?)))
 }
 
+/// Backfill legacy classifications before indexed list and tag queries.
+pub(crate) async fn initialize_attributes(env: &Env) -> worker::Result<()> {
+    let db = primary_database(env)?;
+    let repository = D1NovelRepository::new(db.clone());
+    if repository.attributes_initialized().await.map_err(|error| worker::Error::RustError(error.to_string()))? {
+        return Ok(());
+    }
+    let objects: Arc<dyn narou_rs::platform::ObjectStore> =
+        Arc::new(crate::d1_object_store::D1ObjectStore::new(db));
+    let sites = crate::bundled_sites::load_site_settings_uncached(&objects).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    repository.initialize_attributes(&sites).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))
+}
+
 pub(crate) fn settings(env: &Env) -> worker::Result<SettingsService> {
     Ok(SettingsService::new(Arc::new(D1SettingsStore::new(database(env)?))))
 }

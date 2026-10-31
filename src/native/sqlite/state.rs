@@ -519,6 +519,43 @@ impl StateDb {
         &self.conn
     }
 
+    /// 呼び出し側のトランザクション内で管理状態を読む。
+    ///
+    /// 小説の保存と同じトランザクションで連番表も確定したいときに使う
+    /// (別トランザクションにすると、作品と順序の確定がずれる)。
+    pub fn read_state_row_conn(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        scope: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        read_state_row(tx, scope, key)
+    }
+
+    /// 呼び出し側のトランザクション内で管理状態を書く。
+    pub fn write_state_row_conn(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        scope: &str,
+        key: &str,
+        content: &str,
+    ) -> Result<()> {
+        write_state_row(tx, scope, key, content)
+    }
+
+    /// 互換モードの鏡ファイルの SHA を記録する。
+    ///
+    /// 取り込み (`state::configure`) はこの SHA を見て file を取り込むか
+    /// 判断するので、DB と鏡を同じトランザクションで更新する。
+    pub fn finish_file_row_conn(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        file: &str,
+        content: &str,
+    ) -> Result<()> {
+        finish_file_row(tx, file, content)
+    }
+
 }
 
 struct CompatMirror {
