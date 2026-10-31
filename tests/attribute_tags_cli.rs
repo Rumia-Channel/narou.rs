@@ -22,6 +22,8 @@ fn record(id: i64, title: &str) -> NovelRecord {
 fn run(root: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_narou_rs"))
         .current_dir(root).env_remove("NAROU_RS_LEGACY_YAML")
+        .env("USERPROFILE", root.join("home"))
+        .env("HOME", root.join("home"))
         .args(args).output().unwrap()
 }
 
