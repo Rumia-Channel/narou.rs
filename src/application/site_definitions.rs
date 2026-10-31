@@ -68,6 +68,9 @@ pub trait SiteDefinitionStore: PlatformService {
     fn delete<'a>(&'a self, name: &'a str) -> PlatformFuture<'a, Result<()>>;
 }
 
+/// Internal subprocess origin marker; never used for manual update commands.
+pub const AUTOMATIC_UPDATE_ENV: &str = "NAROU_RS_AUTOMATIC_UPDATE";
+
 /// Compiled URL, timezone and update-capability rules shared by runtime adapters.
 pub struct SiteSettingsSnapshot {
     source: Arc<Vec<SiteSetting>>,
@@ -121,6 +124,10 @@ impl crate::application::SiteUpdateCapabilityProvider for SiteSettingsSnapshot {
     fn supports_narou_api(&self, toc_url: &str) -> bool {
         self.source.iter().find(|setting| setting.matches_url(toc_url))
             .and_then(|setting| setting.narou_api_url.as_ref()).is_some()
+    }
+
+    fn allows_automatic_update(&self, record: &crate::db::NovelRecord) -> bool {
+        crate::downloader::site_setting::allows_automatic_update(&self.source, record)
     }
 }
 

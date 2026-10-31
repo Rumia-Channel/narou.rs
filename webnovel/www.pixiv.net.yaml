@@ -51,7 +51,7 @@ headers:
   Referer: \k<top_url>/
 confirm_over18: no
 append_title_to_folder_name: yes
-version: 1.7
+version: 1.8
 
 # ------------------------------------------------------------
 # 作品属性 (未一致は小説)。a は単体イラスト・漫画、c は漫画シリーズ。
@@ -60,6 +60,13 @@ work_type_rules:
   - field: ncode
     match: '^[ac]'
     type: manga
+
+# 単体イラスト・漫画・うごイラは定期更新から除外する。
+# 手動更新・初回取得・作者追跡での追加には適用しない。
+update_rules:
+  - match:
+      ncode: '^a'
+    automatic: skip
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)

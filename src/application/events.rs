@@ -98,6 +98,7 @@ impl SiteDefinitionProvider for EmptySiteDefinitionProvider {
 /// definition storage to application consumers.
 pub trait SiteUpdateCapabilityProvider: Send + Sync {
     fn supports_narou_api(&self, toc_url: &str) -> bool;
+    fn allows_automatic_update(&self, record: &crate::db::NovelRecord) -> bool;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -106,6 +107,10 @@ pub struct EmptySiteUpdateCapabilityProvider;
 impl SiteUpdateCapabilityProvider for EmptySiteUpdateCapabilityProvider {
     fn supports_narou_api(&self, _toc_url: &str) -> bool {
         false
+    }
+
+    fn allows_automatic_update(&self, _record: &crate::db::NovelRecord) -> bool {
+        true
     }
 }
 

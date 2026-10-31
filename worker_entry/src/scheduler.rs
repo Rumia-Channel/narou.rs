@@ -245,17 +245,17 @@ async fn plan_page(
     checkpoint: &mut narou_rs::application::SchedulerCheckpoint,
 ) -> Result<bool> {
     let frozen_ids: HashSet<i64> = runtime.freeze.frozen_ids().await?;
-    let (ids, next_cursor) = scan_page(runtime, checkpoint).await?;
-    if ids.is_empty() {
+    let (records, next_cursor, page_full) = scan_page(runtime, checkpoint).await?;
+    if records.is_empty() && !page_full {
         return Ok(true);
     }
-    let page_full = ids.len() == AUTO_UPDATE_PAGE_SIZE;
-    let plans: Vec<JobPlan> = ids
+    let plans: Vec<JobPlan> = records
         .into_iter()
-        .filter(|id| !frozen_ids.contains(&id.0))
-        .map(|id| JobPlan {
+        .filter(|record| !frozen_ids.contains(&record.id)
+            && narou_rs::downloader::site_setting::allows_automatic_update(runtime.site_settings(), record))
+        .map(|record| JobPlan {
             kind: JobKind::Update,
-            target: JobTarget::Id(id),
+            target: JobTarget::Id(NovelId(record.id)),
             options: Vec::new(),
         })
         .collect();
@@ -269,7 +269,7 @@ async fn plan_page(
     Ok(!page_full)
 }
 
-/// 1 ページ分の対象 ID と次カーソルを返す。
+/// 1 ページ分の作品と、除外前の走査位置・ページ充足状態を返す。
 ///
 /// `update.sort-by` が設定されていれば native `commands::update` と同じ順序
 /// (`sort_update_ids_by_key`: 日付系は新しい順) で `novels.query` を捲る。
@@ -281,7 +281,7 @@ async fn plan_page(
 async fn scan_page(
     runtime: &WorkerRuntime,
     checkpoint: &mut SchedulerCheckpoint,
-) -> Result<(Vec<NovelId>, Option<i64>)> {
+) -> Result<(Vec<narou_rs::db::NovelRecord>, Option<i64>, bool)> {
     let sort = configured_scan_sort(runtime).await;
     let sort_key = sort.map(|sort| sort.key.as_db_key());
     if checkpoint.scan_sort_key.as_deref() != sort_key {
@@ -296,7 +296,17 @@ async fn scan_page(
                 .scan_ids(&NovelFilter::default(), after_id, AUTO_UPDATE_PAGE_SIZE)
                 .await?;
             let next_cursor = ids.last().map(|id| id.0);
-            Ok((ids, next_cursor))
+            let page_full = ids.len() == AUTO_UPDATE_PAGE_SIZE;
+            if ids.is_empty() {
+                return Ok((Vec::new(), next_cursor, false));
+            }
+            let records = runtime.novels.query(&NovelQuery::page(
+                NovelFilter { ids: Some(ids), ..NovelFilter::default() },
+                NovelSort::default(),
+                0,
+                AUTO_UPDATE_PAGE_SIZE,
+            )).await?;
+            Ok((records, next_cursor, page_full))
         }
         Some(sort) => {
             let offset = usize::try_from(checkpoint.cursor.unwrap_or(0).max(0))
@@ -310,12 +320,9 @@ async fn scan_page(
                     AUTO_UPDATE_PAGE_SIZE,
                 ))
                 .await?;
-            let ids: Vec<NovelId> = records
-                .iter()
-                .map(|record| NovelId(record.id))
-                .collect();
-            let next_cursor = i64::try_from(offset + ids.len()).ok();
-            Ok((ids, next_cursor))
+            let next_cursor = i64::try_from(offset + records.len()).ok();
+            let page_full = records.len() == AUTO_UPDATE_PAGE_SIZE;
+            Ok((records, next_cursor, page_full))
         }
     }
 }

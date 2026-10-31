@@ -298,6 +298,10 @@ impl crate::application::SiteUpdateCapabilityProvider for NativeSiteTimezoneProv
     fn supports_narou_api(&self, toc_url: &str) -> bool {
         crate::application::SiteUpdateCapabilityProvider::supports_narou_api(self.snapshot().as_ref(), toc_url)
     }
+
+    fn allows_automatic_update(&self, record: &crate::db::NovelRecord) -> bool {
+        crate::application::SiteUpdateCapabilityProvider::allows_automatic_update(self.snapshot().as_ref(), record)
+    }
 }
 
 
