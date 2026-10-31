@@ -313,6 +313,7 @@ function mirrorConsoleToDevtools(text, targetConsole) {
 async function reloadWebConfig() {
   const themeGeneration = captureThemeRead();
   const previousAttributeTagsEnabled = State.attributeTagsEnabled;
+  const previousTagSortOrder = State.tagSortOrder;
   try {
     const config = await fetchJson('/api/webui/config?fresh=1');
     if (config) {
@@ -322,6 +323,8 @@ async function reloadWebConfig() {
       // CLI や別タブで変更された場合は取得し直す。
       if (previousAttributeTagsEnabled !== State.attributeTagsEnabled) {
         await Promise.all([refreshList(), refreshTags()]);
+      } else if (previousTagSortOrder !== State.tagSortOrder) {
+        await refreshTags();
       }
     }
   } catch { /* keep current config */ }
