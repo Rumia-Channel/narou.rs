@@ -4731,7 +4731,7 @@ is_narou: false
             for invocation in 0..3 {
                 let http = Arc::new(MockHttpClient::new());
                 http.add_text(target, 200, r#"<h1>Image Budget Test</h1><span>Author</span><a href="/n1234ab/1/">第一話</a>"#);
-                http.add_text("https://example.com/n1234ab/1/", 200, &format!("<div class=\"body\">{body}</div>"));
+                http.add_text("https://example.com/n1234ab/1/", 200, format!("<div class=\"body\">{body}</div>"));
                 for (i, url) in image_urls.iter().enumerate() {
                     http.add_response(url, HttpResponse {
                         status: 200,
