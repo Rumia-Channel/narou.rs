@@ -1027,7 +1027,8 @@ async fn update_general_lastup(
 
     let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
 
-    let (narou_novels, other_novels) = partition_novels_by_api_support(&site_settings);
+    let automatic = std::env::var(narou_rs::application::site_definitions::AUTOMATIC_UPDATE_ENV).as_deref() == Ok("1");
+    let (narou_novels, other_novels) = partition_novels_by_api_support(&site_settings, automatic);
     let progress = general_lastup_progress();
     let mut total_work_units =
         initial_general_lastup_work_units(gl_opt, &narou_novels, &other_novels);
@@ -1070,7 +1071,7 @@ async fn update_general_lastup(
 /// `api_url` でグルーピングされた なろうAPI 対象 `(novel_id, ncode)` の一覧。
 type NarouApiTargetMap = HashMap<String, Vec<(i64, String)>>;
 
-fn partition_novels_by_api_support(site_settings: &[SiteSetting]) -> (NarouApiTargetMap, Vec<i64>) {
+fn partition_novels_by_api_support(site_settings: &[SiteSetting], automatic: bool) -> (NarouApiTargetMap, Vec<i64>) {
     let frozen_ids = load_frozen_ids();
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let ids = novels
@@ -1085,6 +1086,9 @@ fn partition_novels_by_api_support(site_settings: &[SiteSetting]) -> (NarouApiTa
             continue;
         }
         let setting = site_settings.iter().find(|s| s.matches_url(&r.toc_url));
+        if automatic && !narou_rs::downloader::site_setting::allows_automatic_update(site_settings, &r) {
+            continue;
+        }
         let ncode = r
             .ncode
             .clone()
@@ -1833,6 +1837,28 @@ mod tests {
             requires_login: false,
             login_session: None,
             extra_fields: Default::default(),
+        }
+    }
+
+    #[test]
+    fn automatic_api_checks_exclude_site_rules_without_changing_manual_checks() {
+        use super::SiteSetting;
+        for sqlite in [false, true] {
+            with_stale_command_database(sqlite, false, false, || {
+                let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+                novels.update_existing_sync(1.into(), |record| {
+                    record.toc_url = "https://ncode.syosetu.com/n0001aa/".into();
+                    record.ncode = Some("n0001aa".into());
+                    Ok(())
+                }).unwrap();
+                let yaml = format!("{}\nupdate_rules:\n  - match: {{ncode: '^n'}}\n    automatic: skip\n",
+                    include_str!("../../webnovel/ncode.syosetu.com.yaml"));
+                let sites = SiteSetting::load_bundled(&[&yaml]).unwrap();
+                let (automatic, _) = super::partition_novels_by_api_support(&sites, true);
+                assert!(automatic.is_empty());
+                let (manual, _) = super::partition_novels_by_api_support(&sites, false);
+                assert!(manual.values().flatten().any(|(id, ncode)| *id == 1 && ncode == "n0001aa"));
+            });
         }
     }
 

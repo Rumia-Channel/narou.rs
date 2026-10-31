@@ -342,23 +342,26 @@ fn collect_auto_update_target_ids(
         &modified_ids,
         &frozen_ids,
         |record| site_updates.supports_narou_api(&record.toc_url),
+        |record| site_updates.allows_automatic_update(record),
     )
 }
 
-fn split_auto_update_target_ids<'a, I, F>(
+fn split_auto_update_target_ids<'a, I, F, G>(
     records: I,
     modified_ids: &std::collections::BTreeSet<i64>,
     frozen_ids: &std::collections::HashSet<i64>,
     mut api_supported: F,
+    mut automatic_allowed: G,
 ) -> (Vec<String>, Vec<String>)
 where
     I: IntoIterator<Item = &'a crate::db::NovelRecord>,
     F: FnMut(&crate::db::NovelRecord) -> bool,
+    G: FnMut(&crate::db::NovelRecord) -> bool,
 {
     let mut modified = Vec::new();
     let mut other = Vec::new();
     for record in records {
-        if record_is_frozen(record, frozen_ids) {
+        if record_is_frozen(record, frozen_ids) || !automatic_allowed(record) {
             continue;
         }
         if modified_ids.contains(&record.id) {
@@ -436,6 +439,7 @@ fn run_update_phase(
         .args(args);
     configure_web_subprocess_command(&mut command);
     command.env(WEB_PROGRESS_SCOPE_ENV, job_id);
+    command.env(crate::application::site_definitions::AUTOMATIC_UPDATE_ENV, "1");
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -683,9 +687,35 @@ mod tests {
         let (modified, other) =
             split_auto_update_target_ids(records.iter(), &modified_ids, &frozen_ids, |record| {
                 record.id == 2
-            });
+            }, |_| true);
 
         assert_eq!(modified, vec!["1".to_string(), "3".to_string()]);
         assert_eq!(other, vec!["5".to_string(), "6".to_string()]);
+    }
+
+    #[test]
+    fn automatic_rules_filter_modified_and_normal_targets_before_update() {
+        let sites = crate::downloader::site_setting::SiteSetting::load_bundled(&[
+            include_str!("../../webnovel/www.pixiv.net.yaml"),
+        ]).unwrap();
+        let mut records = Vec::new();
+        for (id, ncode) in [(1, "a1"), (2, "c2"), (3, "a3"), (4, "n4"), (5, "c5")] {
+            let mut record = sample_record(id, "https://www.pixiv.net/ajax/illust/1", &[]);
+            record.ncode = Some(ncode.into());
+            records.push(record);
+        }
+        let (modified, other) = split_auto_update_target_ids(
+            records.iter(), &BTreeSet::from([1, 2]), &HashSet::from([5]),
+            |_| false,
+            |record| crate::downloader::site_setting::allows_automatic_update(&sites, record),
+        );
+        assert_eq!(modified, ["2"]);
+        assert_eq!(other, ["4"]);
+        let (modified, other) = split_auto_update_target_ids(
+            records.iter().filter(|record| record.ncode.as_deref().unwrap().starts_with('a')),
+            &BTreeSet::from([1]), &HashSet::new(), |_| false,
+            |record| crate::downloader::site_setting::allows_automatic_update(&sites, record),
+        );
+        assert!(modified.is_empty() && other.is_empty());
     }
 }
