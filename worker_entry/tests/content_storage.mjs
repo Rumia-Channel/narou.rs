@@ -22,6 +22,10 @@ const objects = new Map();
 let failPut = false;
 let sourceGeneration = 1;
 let sourceSubtitle = '第一話';
+let sourceImageCount = 0;
+const imageRequests = new Map();
+const imageContinuations = [];
+const imagePng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3Z5A0AAAAASUVORK5CYII=', 'base64');
 let child;
 let logs = '';
 let port;
@@ -32,13 +36,25 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const key = decodeURIComponent(url.pathname);
     if (req.method === 'GET' && key === '/smoke-novel/') {
+      if (sourceImageCount && imageRequests.size > 0) {
+        const checkpoint = scalar("SELECT checkpoint_json FROM worker_jobs WHERE kind='download' AND status='running'");
+        imageContinuations.push({ fetched: imageRequests.size, checkpoint: JSON.parse(checkpoint) });
+      }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`<h1>Controlled Story</h1><span class="author">Storage Author</span><a href="/smoke-novel/1/">${sourceSubtitle}</a>`);
       return;
     }
     if (req.method === 'GET' && key === '/smoke-novel/1/') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(`<div class="body"><p>${(sourceGeneration === 1 ? '初回取得の本文です。' : sourceGeneration === 2 ? '更新後の本文です。' : '失敗する更新の本文です。').repeat(100)}</p></div>`);
+      const images = Array.from({ length: sourceImageCount }, (_, i) => `<img src="http://localhost:${server.address().port}/smoke-image/${i}.png" />`).join('');
+      res.end(`<div class="body"><p>${(sourceGeneration === 1 ? '初回取得の本文です。' : sourceGeneration === 2 ? '更新後の本文です。' : '失敗する更新の本文です。').repeat(100)}</p>${images}</div>`);
+      return;
+    }
+    if (req.method === 'GET' && /^\/smoke-image\/\d+\.png$/.test(key)) {
+      imageRequests.set(key, (imageRequests.get(key) ?? 0) + 1);
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      // Distinct stored bytes, with an unchanged valid one-pixel PNG.
+      res.end(Buffer.concat([imagePng, Buffer.from(key)]));
       return;
     }
     if (req.method === 'GET' && url.searchParams.get('list-type') === '2') {
@@ -474,6 +490,38 @@ min_interval: 0.01
   await verifyDefaultDownload();
   assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 0);
   console.log('PASS failed initial PUT never falls back to D1 and the same download recovers on S3');
+
+  // One episode exceeds the real per-invocation subrequest budget. The Queue
+  // must continue its images, not redownload the saved prefix on every attempt.
+  await defaultLibrary('image-resume', { required: true });
+  await installDefaultSource();
+  sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
+  sourceImageCount = 500;
+  await download(target, false);
+  assert.equal(imageRequests.size, sourceImageCount);
+  assert([...imageRequests.values()].every((count) => count === 1), 'continuations must not fetch any saved image twice');
+  const imageJob = sql("SELECT checkpoint_json,attempts,status FROM worker_jobs WHERE kind='download'")[0].results[0];
+  assert.equal(imageJob.status, 'succeeded');
+  assert.equal(imageJob.attempts, 0, 'budget continuations must not consume error retries');
+  assert(imageContinuations.some(({ fetched, checkpoint }) => fetched > 0 && fetched < sourceImageCount && checkpoint?.next_section_index === 0),
+    'the real queue must resume the same episode after persisting a mid-image-loop checkpoint');
+  const imageIndex = sql("SELECT encoding,hex(data) payload FROM objects WHERE object_key LIKE '%/smoke-novel/.illustration_cache.yaml'")[0].results[0];
+  assert(imageIndex, 'image source mapping must survive the continuation');
+  const encodedIndex = Buffer.from(imageIndex.payload, 'hex');
+  const indexText = (imageIndex.encoding === 'brotli' ? brotliDecompressSync(encodedIndex) : encodedIndex).toString();
+  for (let i = 0; i < sourceImageCount; i++) {
+    assert(indexText.includes(`/smoke-image/${i}.png`), `image ${i} must be recorded in the persisted index`);
+    const image = Buffer.concat([imagePng, Buffer.from(`/smoke-image/${i}.png`)]);
+    const digest = createHash('sha256').update(image).digest();
+    assert.deepEqual(objects.get(`/narou-local/narou/local/illustrations/${digest.toString('base64url')}.png`), image);
+  }
+  const illustratedId = scalar("SELECT id FROM novels WHERE ncode='smoke-novel'");
+  const illustratedEpub = await api(`/api/novels/${illustratedId}/download.epub`);
+  assert.equal(illustratedEpub.status, 200, await illustratedEpub.clone().text());
+  const illustratedText = epubText(Buffer.from(await illustratedEpub.arrayBuffer()));
+  assert.equal((illustratedText.match(/<img\b/g) ?? []).length, sourceImageCount, 'EPUB must retain every image after the continuation');
+  assert(!illustratedText.includes('/smoke-image/'), 'EPUB must use its embedded images, not upstream URLs');
+  console.log('PASS one 500-image episode yields on the real Worker budget, resumes without refetching, and produces an illustrated EPUB');
 } catch (error) {
   console.error(error);
   console.error(logs);
