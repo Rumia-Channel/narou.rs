@@ -40,6 +40,8 @@ pub(crate) async fn initialize_attributes(env: &Env) -> worker::Result<()> {
     let db = primary_database(env)?;
     let repository = D1NovelRepository::new(db.clone());
     if repository.attributes_initialized().await.map_err(|error| worker::Error::RustError(error.to_string()))? {
+        crate::virtual_novels::reconcile_attributes(&db).await
+            .map_err(|error| worker::Error::RustError(error.to_string()))?;
         return Ok(());
     }
     let objects: Arc<dyn narou_rs::platform::ObjectStore> =
@@ -47,6 +49,8 @@ pub(crate) async fn initialize_attributes(env: &Env) -> worker::Result<()> {
     let sites = crate::bundled_sites::load_site_settings_uncached(&objects).await
         .map_err(|error| worker::Error::RustError(error.to_string()))?;
     repository.initialize_attributes(&sites).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    crate::virtual_novels::reconcile_attributes(&primary_database(env)?).await
         .map_err(|error| worker::Error::RustError(error.to_string()))
 }
 

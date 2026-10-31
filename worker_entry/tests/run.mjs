@@ -153,6 +153,13 @@ try {
     });
     exitCode = tagSequence.status ?? 1;
   }
+  if (exitCode === 0) {
+    const attributes = spawnSync(process.execPath, [join(here, "virtual_attributes.mjs")], {
+      cwd: root, stdio: "inherit",
+      env: { ...process.env, BASE_URL: base, NAROU_ADMIN_TOKEN: token },
+    });
+    exitCode = attributes.status ?? 1;
+  }
 
   // 7. トークンを外した構成で fail-closed を確かめる（任意・既定 off）。
   if (exitCode === 0 && process.env.NAROU_CHECK_UNCONFIGURED === "1") {

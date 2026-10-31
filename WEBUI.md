@@ -324,7 +324,10 @@ webui.tag-sort-order=...` で変更)。
 | `registered` | 登録順 | タグがライブラリへ入った順 (初めて付いた順) |
 
 - 並べ替えは保存しないと次の起動で元に戻る (設定なので永続化される)
-- `webui.tag-sort-order` は Worker 側でも同じ設定名を使う
+- `webui.tag-sort-order` は Worker 側でも同じ設定名を使う。Native / Worker とも `/api/webui/config` の `tag_sort_order` で現在の選択を返す。
+- 設定画面で保存すると、変更通知を受けたメイン画面がタグ一覧を取り直して並べ替える。
+  Native の CLI から変更した場合は、既存の 30 秒間隔の監視で検知した後に反映する。
+  メイン画面の再読み込みやサーバーの再起動は不要で、お気に入りの登録内容やタグ色は変えない。
 - **登録順の保存先**: 在庫の `tag_sequence` キー (Native は
   `.narou/tag_sequence.yaml`、SQLite 管理と Worker は
   `app_state('inv','tag_sequence')`)。タグごとにグローバルな連番を振り、

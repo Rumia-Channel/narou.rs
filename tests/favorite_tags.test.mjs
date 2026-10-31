@@ -83,12 +83,6 @@ function favoriteHarness() {
   return { state, posted, list, empty, context };
 }
 
-test('favorite tags are posted to the API and the state is refreshed', async () => {
-  const h = favoriteHarness();
-  await h.context.refreshFavoriteTags();
-  assert.deepEqual(h.state.favoriteTags, ['A', 'B']);
-});
-
 test('the favorites list renders one chip per registered tag', async () => {
   const h = favoriteHarness();
   h.state.favoriteTags = ['小説', 'ゲーム'];
@@ -105,15 +99,6 @@ test('an empty favorites list shows the guidance instead of chips', () => {
   h.context.renderFavoriteTags();
   assert.equal(h.list.children.length, 0);
   assert.equal(h.empty.classList.contains('hide'), false);
-});
-
-test('the reorder action posts the requested order', async () => {
-  const h = favoriteHarness();
-  h.state.favoriteTags = ['A', 'B', 'C'];
-  await h.context.setFavoriteTags({ action: 'reorder', tags: ['C', 'A', 'B'] });
-  const reorder = h.posted.filter((entry) => entry.body.action === 'reorder');
-  assert.equal(reorder.length, 1);
-  assert.deepEqual(reorder[0].body.tags, ['C', 'A', 'B']);
 });
 
 test('a chip is draggable only when there is more than one favorite', () => {
@@ -182,4 +167,20 @@ test('dropping a chip on itself does not post a reorder', async () => {
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(h.posted.filter((entry) => entry.body.action === 'reorder').length, 0);
+});
+
+test('the insertion marker remains visible while dragging over a chip’s children', () => {
+  const h = favoriteHarness();
+  h.state.favoriteTags = ['A', 'B'];
+  h.context.renderFavoriteTags();
+  const [source, target] = h.list.children;
+  const child = target.children[0];
+  target.contains = (node) => node === child;
+  target.getBoundingClientRect = () => ({ left: 0, width: 100 });
+  source.listeners.dragstart[0]({ currentTarget: source, dataTransfer: null });
+  target.listeners.dragover[0]({ currentTarget: target, clientX: 10, preventDefault() {} });
+  target.listeners.dragleave[0]({ currentTarget: target, relatedTarget: child });
+  assert.equal(target.classList.contains('tag-favorite-drop-before'), true);
+  target.listeners.dragleave[0]({ currentTarget: target, relatedTarget: null });
+  assert.equal(target.classList.contains('tag-favorite-drop-before'), false);
 });

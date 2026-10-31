@@ -192,11 +192,16 @@ try {
   console.log('PASS auto-disable is supported; dry-run does not download; explicit author check still discovers works');
   await setting({ 'update.disabled-author-tracking': false, 'update.auto-schedule.enable': true, 'update.auto-schedule': '0000', 'update.auto-schedule.timezone': 'UTC' }, { 'update.disabled-author-tracking': true, 'update.auto-schedule.enable': null, 'update.auto-schedule': null, 'update.auto-schedule.timezone': null });
   workCount = 5;
+  await json('/api/sites/localhost.yaml', definition + workTypeRule('work2')
+    + "\nupdate_rules:\n  - match: {ncode: '^work'}\n    automatic: skip\n", 'PUT');
+  const updatesBeforeCron = count("SELECT COUNT(*) FROM worker_jobs WHERE kind='update'");
   let cron = await api('/__scheduled?cron=*+*+*+*+*');
   if (cron.status === 404) cron = await api('/cdn-cgi/handler/scheduled?cron=*+*+*+*+*');
   assert(cron.ok, await cron.text()); await settled();
   assert.equal(count('SELECT COUNT(*) FROM novels'), 5, 'cron must discover the fifth work');
-  console.log('PASS actual scheduled handler checks tracked authors');
+  assert.equal(count("SELECT COUNT(*) FROM worker_jobs WHERE kind='update'"), updatesBeforeCron,
+    'excluding every existing work must not prevent tracked authors from adding a new work');
+  console.log('PASS actual scheduled handler skips excluded existing works and still downloads new tracked-author publications');
   workCount = 6;
   let release, reached; const wait = new Promise((resolve) => { release = resolve; }); const seen = new Promise((resolve) => { reached = resolve; }); pause = { wait, seen: reached, release };
   const pending = await json('/api/authors/check', { dry_run: false });

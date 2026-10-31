@@ -110,6 +110,7 @@ async fn webui_config(req: &Request, env: &Env) -> worker::Result<Response> {
         "webui.performance-mode",
         "webui.table.reload-timing",
         "webui.debug-mode",
+        "webui.tag-sort-order",
         "tag.show-novel",
         "tag.show-manga",
         "tag.attributes-enabled",
@@ -133,6 +134,9 @@ async fn webui_config(req: &Request, env: &Env) -> worker::Result<Response> {
     let theme = string_value(find("webui.theme"), "Cerulean");
     let performance_mode = string_value(find("webui.performance-mode"), "auto");
     let reload_timing = string_value(find("webui.table.reload-timing"), "every");
+    let tag_sort_order = narou_rs::application::webui::tag_order::TagSortOrder::from_setting(
+        find("webui.tag-sort-order").as_ref().and_then(serde_yaml::Value::as_str),
+    );
     let debug_mode = find("webui.debug-mode")
         .and_then(|value| narou_rs::setting_core::setting_bool_value(&value))
         .unwrap_or(false);
@@ -165,6 +169,7 @@ async fn webui_config(req: &Request, env: &Env) -> worker::Result<Response> {
         "performance_mode": performance_mode,
         "reload_timing": reload_timing,
         "debug_mode": debug_mode,
+        "tag_sort_order": tag_sort_order.setting_value(),
         "show_novel_attribute": find("tag.show-novel").and_then(|value| narou_rs::setting_core::setting_bool_value(&value)).unwrap_or(false),
         "show_manga_attribute": find("tag.show-manga").and_then(|value| narou_rs::setting_core::setting_bool_value(&value)).unwrap_or(true),
         // 属性タグ機能全体の ON/OFF。OFF の間は個別表示スイッチも効かない。

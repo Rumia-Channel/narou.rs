@@ -100,6 +100,15 @@ fn head_response(response: Response) -> Result<Response> {
 
 async fn route(req: Request, env: Env) -> Result<Response> {
     let path = req.path();
+    if path == "/api/virtual_novels/classify" {
+        return virtual_novels::handle_classify(req, env).await;
+    }
+    if let Some(id) = path.strip_prefix("/api/virtual_novels/")
+        .and_then(|rest| rest.strip_suffix("/attribute"))
+        .and_then(|id| id.parse::<i64>().ok())
+    {
+        return virtual_novels::handle_attribute(req, env, id).await;
+    }
     if let Some(id) = path
         .strip_prefix("/api/virtual_novels/")
         .and_then(|rest| rest.strip_suffix("/download.epub"))

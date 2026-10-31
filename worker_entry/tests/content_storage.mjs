@@ -22,6 +22,11 @@ const objects = new Map();
 let failPut = false;
 let sourceGeneration = 1;
 let sourceSubtitle = '第一話';
+let sourceImageCount = 0;
+const imageRequests = new Map();
+const sourceRequests = new Map();
+const imageContinuations = [];
+const imagePng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3Z5A0AAAAASUVORK5CYII=', 'base64');
 let child;
 let logs = '';
 let port;
@@ -31,14 +36,27 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://127.0.0.1');
     const key = decodeURIComponent(url.pathname);
-    if (req.method === 'GET' && key === '/smoke-novel/') {
+    if (req.method === 'GET' && /^\/smoke-(novel|single|series)\/$/.test(key)) {
+      sourceRequests.set(key, (sourceRequests.get(key) ?? 0) + 1);
+      if (sourceImageCount && imageRequests.size > 0) {
+        const checkpoint = scalar("SELECT checkpoint_json FROM worker_jobs WHERE kind='download' AND status='running'");
+        imageContinuations.push({ fetched: imageRequests.size, checkpoint: JSON.parse(checkpoint) });
+      }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(`<h1>Controlled Story</h1><span class="author">Storage Author</span><a href="/smoke-novel/1/">${sourceSubtitle}</a>`);
+      res.end(`<h1>Controlled Story</h1><span class="author">Storage Author</span><a href="${key}1/">${sourceSubtitle}</a>`);
       return;
     }
-    if (req.method === 'GET' && key === '/smoke-novel/1/') {
+    if (req.method === 'GET' && /^\/smoke-(novel|single|series)\/1\/$/.test(key)) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(`<div class="body"><p>${(sourceGeneration === 1 ? '初回取得の本文です。' : sourceGeneration === 2 ? '更新後の本文です。' : '失敗する更新の本文です。').repeat(100)}</p></div>`);
+      const images = Array.from({ length: sourceImageCount }, (_, i) => `<img src="http://localhost:${server.address().port}/smoke-image/${i}.png" />`).join('');
+      res.end(`<div class="body"><p>${(sourceGeneration === 1 ? '初回取得の本文です。' : sourceGeneration === 2 ? '更新後の本文です。' : '失敗する更新の本文です。').repeat(100)}</p>${images}</div>`);
+      return;
+    }
+    if (req.method === 'GET' && /^\/smoke-image\/\d+\.png$/.test(key)) {
+      imageRequests.set(key, (imageRequests.get(key) ?? 0) + 1);
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      // Distinct stored bytes, with an unchanged valid one-pixel PNG.
+      res.end(Buffer.concat([imagePng, Buffer.from(key)]));
       return;
     }
     if (req.method === 'GET' && url.searchParams.get('list-type') === '2') {
@@ -111,7 +129,7 @@ function objectInsert(key, value) {
 }
 async function start() {
   logs = '';
-  child = spawn(npx, ['wrangler', 'dev', '--config', config, '--persist-to', persist, '--port', String(port)], { cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
+  child = spawn(npx, ['wrangler', 'dev', '--test-scheduled', '--config', config, '--persist-to', persist, '--port', String(port)], { cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
   for (const stream of [child.stdout, child.stderr]) stream.on('data', (chunk) => { logs = (logs + chunk).slice(-300000); });
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
@@ -138,10 +156,13 @@ async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
 async function download(target, force, expectedFailure = false) {
   const accepted = await (await api('/api/download', { targets: [target], force })).json();
   assert(accepted.success, JSON.stringify(accepted));
+  return waitForAcquisition(accepted.results[0].job_id, expectedFailure);
+}
+async function waitForAcquisition(jobId, expectedFailure = false) {
   const deadline = Date.now() + 120000;
   let job;
   do {
-    job = await (await api(`/api/jobs/${accepted.results[0].job_id}`)).json();
+    job = await (await api(`/api/jobs/${jobId}`)).json();
     if (['succeeded', 'permanent', 'blocked'].includes(job.status) || (expectedFailure && job.status === 'retryable')) break;
     await new Promise((resolve) => setTimeout(resolve, 500));
   } while (Date.now() < deadline);
@@ -474,6 +495,112 @@ min_interval: 0.01
   await verifyDefaultDownload();
   assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 0);
   console.log('PASS failed initial PUT never falls back to D1 and the same download recovers on S3');
+
+  // One episode exceeds the real per-invocation subrequest budget. The Queue
+  // must continue its images, not redownload the saved prefix on every attempt.
+  await defaultLibrary('image-resume', { required: true });
+  await installDefaultSource();
+  sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
+  sourceImageCount = 500;
+  await download(target, false);
+  assert.equal(imageRequests.size, sourceImageCount);
+  assert([...imageRequests.values()].every((count) => count === 1), 'continuations must not fetch any saved image twice');
+  const imageJob = sql("SELECT checkpoint_json,attempts,status FROM worker_jobs WHERE kind='download'")[0].results[0];
+  assert.equal(imageJob.status, 'succeeded');
+  assert.equal(imageJob.attempts, 0, 'budget continuations must not consume error retries');
+  assert(imageContinuations.some(({ fetched, checkpoint }) => fetched > 0 && fetched < sourceImageCount && checkpoint?.next_section_index === 0),
+    'the real queue must resume the same episode after persisting a mid-image-loop checkpoint');
+  const imageIndex = sql("SELECT encoding,hex(data) payload FROM objects WHERE object_key LIKE '%/smoke-novel/.illustration_cache.yaml'")[0].results[0];
+  assert(imageIndex, 'image source mapping must survive the continuation');
+  const encodedIndex = Buffer.from(imageIndex.payload, 'hex');
+  const indexText = (imageIndex.encoding === 'brotli' ? brotliDecompressSync(encodedIndex) : encodedIndex).toString();
+  for (let i = 0; i < sourceImageCount; i++) {
+    assert(indexText.includes(`/smoke-image/${i}.png`), `image ${i} must be recorded in the persisted index`);
+    const image = Buffer.concat([imagePng, Buffer.from(`/smoke-image/${i}.png`)]);
+    const digest = createHash('sha256').update(image).digest();
+    assert.deepEqual(objects.get(`/narou-local/narou/local/illustrations/${digest.toString('base64url')}.png`), image);
+  }
+  const illustratedId = scalar("SELECT id FROM novels WHERE ncode='smoke-novel'");
+  const illustratedEpub = await api(`/api/novels/${illustratedId}/download.epub`);
+  assert.equal(illustratedEpub.status, 200, await illustratedEpub.clone().text());
+  const illustratedText = epubText(Buffer.from(await illustratedEpub.arrayBuffer()));
+  assert.equal((illustratedText.match(/<img\b/g) ?? []).length, sourceImageCount, 'EPUB must retain every image after the continuation');
+  assert(!illustratedText.includes('/smoke-image/'), 'EPUB must use its embedded images, not upstream URLs');
+  console.log('PASS one 500-image episode yields on the real Worker budget, resumes without refetching, and produces an illustrated EPUB');
+
+  sourceImageCount = 0;
+  await defaultLibrary('automatic-update-rules');
+  const automaticDefinition = definition
+    .replace('(?<ncode>smoke-novel)', '(?<ncode>smoke-(?:novel|single|series))')
+    .replace('(?<href>/smoke-novel/', '(?<href>/smoke-(?:novel|single|series)/')
+    .replace(`toc_url: '${target}'`, "toc_url: '\\\\k<top_url>/\\\\k<ncode>/'")
+    + "\nupdate_rules:\n  - match: {ncode: '^smoke-single$'}\n    automatic: skip\n";
+  assert((await (await api('/api/sites/localhost.yaml', automaticDefinition, 'PUT')).json()).success);
+  const singleTarget = target.replace('/smoke-novel/', '/smoke-single/');
+  const seriesTarget = target.replace('/smoke-novel/', '/smoke-series/');
+  await download(singleTarget, false); // Initial acquisition bypasses automatic policy.
+  const singleId = scalar("SELECT id FROM novels WHERE ncode='smoke-single'");
+  sql(Array.from({ length: 99 }, (_, i) =>
+    `INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,domain)
+     VALUES (${1000 + i},'Writer','writer','A single','a single','single',${quote(`${singleTarget}?copy=${i}`)},${quote(`${singleTarget}?copy=${i}`)},'Controlled Source','controlled source','2026-10-31T00:00:00Z','smoke-single','smoke-single','localhost');`).join('')
+    + 'UPDATE novel_id_sequence SET next_id=2000;');
+  await download(seriesTarget, false);
+  const seriesId = scalar("SELECT id FROM novels WHERE ncode='smoke-series'");
+  assert.equal(seriesId, 2000);
+  const settingsSaved = await (await api('/api/global_setting', { settings: {
+    'update.auto-schedule.enable': true, 'update.auto-schedule': '0000',
+    'update.auto-schedule.timezone': 'UTC', 'update.disabled-author-tracking': true,
+  } })).json();
+  assert(settingsSaved.success, JSON.stringify(settingsSaved));
+  const checkpoint = () => JSON.parse(scalar("SELECT value_json FROM app_state WHERE scope='scheduler' AND key='auto_update'"));
+  const tick = async () => {
+    const response = await api('/__scheduled?cron=*+*+*+*+*');
+    assert.equal(response.status, 200, await response.text());
+  };
+  const expirePlannerLease = () => sql("UPDATE app_state SET value_yaml=json_set(value_json, '$.planner_lease_until', '2000-01-01T00:00:00Z'), value_json=json_set(value_json, '$.planner_lease_until', '2000-01-01T00:00:00Z') WHERE scope='scheduler' AND key='auto_update';");
+  const singleRequests = sourceRequests.get('/smoke-single/');
+  const seriesRequests = sourceRequests.get('/smoke-series/');
+  await tick();
+  assert.equal(checkpoint().cursor, 1098, 'a completely excluded full page must advance its original ID cursor');
+  assert.equal(checkpoint().state, 'running');
+  assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='update'"), 0);
+  assert.equal(sourceRequests.get('/smoke-single/'), singleRequests);
+  expirePlannerLease();
+  await tick();
+  assert.equal(checkpoint().state, 'done');
+  const scheduled = sql("SELECT job_id,target FROM worker_jobs WHERE kind='update'")[0].results;
+  assert.deepEqual(scheduled.map((job) => job.target), [String(seriesId)]);
+  await waitForAcquisition(scheduled[0].job_id);
+  assert.equal(sourceRequests.get('/smoke-single/'), singleRequests);
+  assert(sourceRequests.get('/smoke-series/') > seriesRequests);
+
+  // The sorted-offset scan must also consume all-excluded pages and finish.
+  const skipAll = automaticDefinition.replace("'^smoke-single$'", "'.*'");
+  assert((await (await api('/api/sites/localhost.yaml', skipAll, 'PUT')).json()).success);
+  assert((await (await api('/api/global_setting', { settings: { 'update.sort-by': 'title' } })).json()).success);
+  sql("DELETE FROM app_state WHERE scope='scheduler' AND key='auto_update';");
+  const jobCount = scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='update'");
+  await tick();
+  assert.equal(checkpoint().cursor, 100);
+  assert.equal(checkpoint().state, 'running');
+  expirePlannerLease();
+  await tick();
+  assert.equal(checkpoint().state, 'done');
+  assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='update'"), jobCount);
+
+  assert((await (await api('/api/sites/localhost.yaml', automaticDefinition, 'PUT')).json()).success);
+  sql('DELETE FROM novels WHERE id BETWEEN 1000 AND 1098;');
+  for (const body of [{ targets: [String(singleId)], force: true }, { update_all: true, force: true }]) {
+    const before = sourceRequests.get('/smoke-single/');
+    const accepted = await (await api('/api/update', body)).json();
+    assert(accepted.success, JSON.stringify(accepted));
+    assert.equal(accepted.count, body.update_all ? 2 : 1);
+    for (const jobId of accepted.job_ids) {
+      await waitForAcquisition(jobId);
+    }
+    assert(sourceRequests.get('/smoke-single/') > before, 'explicit individual and bulk updates must still fetch excluded singles');
+  }
+  console.log('PASS site rules skip automatic singles, advance excluded ID/offset pages, hot-reload, and preserve initial/manual acquisition');
 } catch (error) {
   console.error(error);
   console.error(logs);

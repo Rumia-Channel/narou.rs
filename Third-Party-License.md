@@ -1307,7 +1307,7 @@ limitations under the License.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_rs 0.5.5
+- narou_rs 0.5.6
 
 ```text
 BSD 2-Clause License
@@ -1340,8 +1340,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_relay 0.5.5
-- narou_transfer_wasm 0.5.5
+- narou_relay 0.5.6
+- narou_transfer_wasm 0.5.6
 
 ```text
 Copyright (c) <year> <owner> 
@@ -1577,7 +1577,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 - aozora_epub3_lite 0.1.6
-- narou_worker 0.5.5
+- narou_worker 0.5.6
 
 ```text
 GNU GENERAL PUBLIC LICENSE

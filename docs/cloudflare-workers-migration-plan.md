@@ -498,7 +498,7 @@ Browser ──► Worker (fetch)
 - 競合は失敗ではなく `admission_waiting=1` の待機として保存して ACK する。provider の retry や業務上の `attempts` は消費しない。終端時・毎分 cron の waker が空いたサイトの待機と独立した変換を同じ job ID で再配送する。配送予約後に送信を失っても既存 reaper で回復する。
 - キュー移行前の未解決な実行中レコードは、安全に同一性を判断できないため終端・lease 回復まで保守的に新規 claim を止める。キャンセルされた実行も、実際の HTTP が終了するまで token / lease を保持し、後続との重複を防ぐ。
 - 旧レーンに残った envelope は台帳の kind を使って正しい Queue へ転送し、送信成功後だけ ACK する。cron と手動の再投入も kind で配送する。Queue のメッセージは従来どおり `{version, job_id}` だけで、計画は台帳を正とする。
-- 600 秒の wall-clock / 850 subrequest の soft budget は話の境界で checkpoint を保存して同じ job ID で続行する。完了した本文は再取得せず、失敗回数にも数えない。Web コンソールでは自動再開として案内し、上限値は引き上げない。
+- 600 秒の wall-clock / 850 subrequest の soft budget は話の開始前と未取得画像の直前で確認し、checkpoint を保存して同じ job ID で続行する。画像取得中の中断では先に挿絵索引を保存し、checkpoint はその話を指したままにする。再開後は取得済み画像を読み飛ばして残りを取得し、完了した話の本文も再取得しない。失敗回数には数えず、Web コンソールでは自動再開として案内し、上限値・サイトの取得間隔は変更しない。`worker_entry/tests/content_storage.mjs` は実 workerd・D1・S3 fixture で 500 枚入り 1 話の継続実行と EPUB への全画像埋め込みを確認する。
 
 
 ### 3.2 認証

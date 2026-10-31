@@ -2,6 +2,7 @@ mod info_extraction;
 mod interpolate;
 mod loader;
 mod serde_helpers;
+mod update_rules;
 
 use std::collections::HashMap;
 #[cfg(feature = "native-runtime")]
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 pub use serde_helpers::deserialize_yes_no_bool;
+pub use update_rules::{UpdateRule, allows_automatic_update};
 
 fn looks_like_pattern(s: &str) -> bool {
     s.contains("(?<") || s.contains("(?P<")
@@ -250,6 +252,9 @@ pub struct SiteSetting {
     /// 作品の属性を決める条件。最初に一致した規則を使い、未一致なら小説。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub work_type_rules: Vec<WorkTypeRule>,
+    /// Scheduled-update policy; missing or unmatched rules allow automatic updates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub update_rules: Vec<UpdateRule>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preprocess: Option<String>,
@@ -560,6 +565,11 @@ pub fn merge_user_definition_yaml(bundled_yaml: &str, user_yaml: &str) -> String
 }
 
 impl SiteSetting {
+    /// Evaluate metadata rules without fetching the work. Manual updates bypass this policy.
+    pub fn allows_automatic_update(&self, record: &crate::db::NovelRecord) -> bool {
+        self.update_rules.iter().find_map(|rule| rule.decision(record)).unwrap_or(true)
+    }
+
     /// この定義の並列DL系列。YAML の `site_family` を優先し、無ければ
     /// ドメインから自動判定する。
     pub fn download_site_family(&self) -> String {

@@ -481,6 +481,8 @@ li.enable-selected.disabled a {
   min-width: 0;
   font: inherit;
   font-size: 0.95em;
+  background: var(--input-bg);
+  border-color: var(--input-border);
   color: var(--text-color);
 }
 
@@ -782,11 +784,11 @@ li.enable-selected.disabled a {
 }
 
 .tag-favorites-list .tag-favorite-drop-before {
-  box-shadow: inset 0 0.15em 0 0 var(--btn-primary-bg);
+  box-shadow: inset var(--tag-favorite-drop-width) 0 0 var(--text-color), inset calc(var(--tag-favorite-drop-width) * 2) 0 0 var(--body-bg);
 }
 
 .tag-favorites-list .tag-favorite-drop-after {
-  box-shadow: inset 0 -0.15em 0 0 var(--btn-primary-bg);
+  box-shadow: inset calc(-1 * var(--tag-favorite-drop-width)) 0 0 var(--text-color), inset calc(-2 * var(--tag-favorite-drop-width)) 0 0 var(--body-bg);
 }
 
 .tag-favorite-edit {

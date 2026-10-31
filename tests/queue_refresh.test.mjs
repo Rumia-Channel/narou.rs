@@ -99,3 +99,66 @@ test('failure of a queued refresh cannot reauthorize the previous stale payload'
   assert.deepEqual(Array.from(h.state.frozenIds), []);
   assert.equal(h.counts().pruneCount, 0);
 });
+
+function tagConfigHarness() {
+  const state = { tags: ['Zulu', 'Alpha', 'Middle'], tagColors: {}, tagSortOrder: 'count', attributeTagsEnabled: false, performanceMode: 'off' };
+  const canvas = {
+    children: [],
+    set textContent(_) { this.children = []; },
+    appendChild(child) { this.children.push(child); },
+    closest() { return null; },
+  };
+  const document = {
+    body: { classList: { toggle() {} } },
+    addEventListener() {},
+    getElementById() { return null; },
+    createElement() { return { dataset: {}, addEventListener() {} }; },
+  };
+  let config = { tag_sort_order: 'alphabetical', attribute_tags_enabled: false };
+  let tags = ['Alpha', 'Middle', 'Zulu'];
+  let offline = false;
+  const fetchJson = async (url) => {
+    if (url.startsWith('/api/webui/config')) return config;
+    if (url.startsWith('/api/tag_list')) {
+      if (offline) throw new Error('offline');
+      return { tags, tag_colors: {} };
+    }
+    throw new Error(`unexpected request: ${url}`);
+  };
+  const render = loadModule('render.js', { State: state, El: { tagListCanvas: canvas }, document, window: {} });
+  const actions = loadModule('actions.js', {
+    State: state, fetchJson, renderTagList: render.renderTagList, renderNovelList() {},
+  });
+  const main = loadModule('../main.js', {
+    State: state, El: {}, document, fetchJson,
+    refreshTags: actions.refreshTags, refreshList: async () => {},
+    captureThemeRead() {}, setCapabilities() {}, syncAttributeTagControls() {},
+    syncTagSortOrderSelect() {}, renderQueueStatus() {}, renderNovelList() {},
+    renderTagList: render.renderTagList, createConsoleHistoryPoller: () => ({}),
+  });
+  render.renderTagList();
+  return {
+    state,
+    reload: () => main.reloadWebConfig(),
+    displayed: () => canvas.children.map((child) => child.textContent),
+    configure(order, orderedTags) { config = { ...config, tag_sort_order: order }; tags = orderedTags; },
+    offline() { offline = true; },
+  };
+}
+
+test('an open tag menu follows an external order change without reloading the page', async () => {
+  const h = tagConfigHarness();
+  assert.deepEqual(h.displayed(), ['Zulu', 'Alpha', 'Middle']);
+  await h.reload();
+  assert.deepEqual(h.displayed(), ['Alpha', 'Middle', 'Zulu']);
+  h.configure('favorites_first', ['Middle', 'Zulu', 'Alpha']);
+  await h.reload();
+  assert.deepEqual(h.displayed(), ['Middle', 'Zulu', 'Alpha']);
+});
+
+test('a failed tag refresh preserves the visible tags after an order change', async () => {
+  const h = tagConfigHarness();
+  h.offline();
+  await h.reload();
+  assert.deepEqual(h.displayed(), ['Zulu', 'Alpha', 'Middle']);
+});

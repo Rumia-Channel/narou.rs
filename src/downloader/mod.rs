@@ -63,10 +63,11 @@ pub use self::util::pretreatment_source;
 pub(crate) const SECTION_HASH_CACHE_NAME: &str = "section_hash_cache";
 const DEFAULT_SITE_TIMEZONE: &str = "Asia/Tokyo";
 
-/// A platform-neutral budget checked only at safe section boundaries.
+/// A platform-neutral budget checked before sections and uncached images.
 ///
-/// Implementations must be cheap and side-effect free: the downloader calls
-/// this before starting the next section, never while a section is in flight.
+/// The index is the first unfinished section, including a section whose body
+/// is saved but whose images are still being fetched. Implementations must be
+/// cheap; the same index may be checked repeatedly while its images advance.
 pub trait SectionBudget: Send {
     fn should_yield(&mut self, next_section_index: usize) -> bool;
 }
@@ -1113,6 +1114,8 @@ impl Downloader {
         mut stored_illustrations: Option<&mut std::collections::HashSet<String>>,
         toc_url: &str,
         raw_html: Option<&str>,
+        budget: &mut Option<&mut dyn SectionBudget>,
+        section_index: usize,
     ) -> Result<()> {
         // サイト定義がパターンを持たない場合は narou.rb の既定パターンを使う。
         let default_pattern = setting.illust_grep_pattern.is_none();
@@ -1198,6 +1201,13 @@ impl Downloader {
                     crate::application::debug::emit(format!(
                         "挿絵: 索引にはありますが実体が無いので取り直します: 挿絵/{filename} ({url})"
                     ));
+                }
+                // 保存済み画像は予算を消費せず読み飛ばし、未取得画像の直前で
+                // 中断する。索引は呼び出し元が保存し、同じ話の残りから再開する。
+                if budget.as_deref_mut().is_some_and(|budget| budget.should_yield(section_index)) {
+                    return Err(NarouError::DownloadBudgetExpired {
+                        next_section_index: section_index,
+                    });
                 }
 
                 match crate::downloader::http_policy::fetch_bytes(
@@ -2170,6 +2180,8 @@ impl Downloader {
                             stored_illustrations.as_mut(),
                             &toc_url,
                             None,
+                            &mut budget,
+                            section_index,
                         )
                         .await?;
                     }
@@ -2262,6 +2274,8 @@ impl Downloader {
                         stored_illustrations.as_mut(),
                         &toc_url,
                         Some(raw_html.as_str()),
+                        &mut budget,
+                        section_index,
                     )
                     .await?;
                     updated_count += 1;
@@ -4675,6 +4689,97 @@ is_narou: false
             "予算に収まった後続を一度だけ取得する"
         );
 
+    }
+
+    #[tokio::test]
+    async fn budget_resume_advances_within_one_illustrated_section() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let previous_db = db::DATABASE.lock().replace(Database::new().unwrap());
+        let _db_guard = DatabaseGuard(previous_db);
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: Image Budget Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Image Budget Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: '<a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>'
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        ).unwrap();
+        setting.compile();
+        struct ImageBudget(Arc<MockHttpClient>);
+        impl SectionBudget for ImageBudget {
+            fn should_yield(&mut self, _next_section_index: usize) -> bool {
+                self.0.requested_urls().iter().filter(|url| url.contains("/images/")).count() >= 2
+            }
+        }
+        let target = "https://example.com/n1234ab/";
+        let image_urls: Vec<_> = (0..5).map(|i| format!("https://example.com/images/{i}.png")).collect();
+        let body = image_urls.iter().map(|url| format!("<img src=\"{url}\" />")).collect::<String>();
+        let keys = NovelObjectKeys::new("Image Budget Test", "n1234ab", false).unwrap();
+        for force in [false, true] {
+            let store = Arc::new(MemoryObjectStore::new());
+            let novels = Arc::new(MemoryNovelRepository::new());
+            let mut fetched = Vec::new();
+            for invocation in 0..3 {
+                let http = Arc::new(MockHttpClient::new());
+                http.add_text(target, 200, r#"<h1>Image Budget Test</h1><span>Author</span><a href="/n1234ab/1/">第一話</a>"#);
+                http.add_text("https://example.com/n1234ab/1/", 200, format!("<div class=\"body\">{body}</div>"));
+                for (i, url) in image_urls.iter().enumerate() {
+                    http.add_response(url, HttpResponse {
+                        status: 200,
+                        headers: vec![("Content-Type".into(), "image/png".into())],
+                        body: vec![i as u8; 8],
+                    });
+                }
+                let mut downloader = Downloader::with_platform_and_storage_and_settings(
+                    DownloaderPlatform {
+                        http: http.clone(),
+                        rate_limiter: Arc::new(FakeRateLimiter::new()),
+                        novels: novels.clone(),
+                        objects: store.clone(),
+                        assets: store.clone(),
+                        clock: Arc::new(SystemClock),
+                    },
+                    vec![setting.clone()],
+                    HashMap::new(),
+                ).unwrap();
+                let mut budget = ImageBudget(http.clone());
+                let result = downloader.download_novel_with_execution_options(
+                    target,
+                    DownloadExecutionOptions {
+                        force,
+                        budget: Some(&mut budget),
+                        resume_from_section: (invocation > 0).then_some(0),
+                    },
+                ).await;
+                if invocation < 2 {
+                    assert!(matches!(result, Err(crate::error::NarouError::DownloadBudgetExpired { next_section_index: 0 })),
+                        "the unfinished section must yield before its third new image: {result:?}");
+                } else {
+                    assert_eq!(result.unwrap().total_count, 1);
+                }
+                fetched.extend(http.requested_urls().into_iter().filter(|url| url.contains("/images/")));
+                let cache = ObjectStore::read_small(store.as_ref(), &keys.illustration_cache()).await.unwrap().unwrap();
+                let index: crate::illustration_store::IllustrationIndex = serde_yaml::from_slice(&cache).unwrap();
+                let saved = ((invocation + 1) * 2).min(image_urls.len());
+                assert_eq!(index.source_count(), saved, "every yield must durably retain image progress");
+                for (i, url) in image_urls.iter().enumerate().take(saved) {
+                    let filename = index.filename_for_source(url).unwrap();
+                    let bytes = ObjectStore::read_small(store.as_ref(), &keys.illustration(filename).unwrap()).await.unwrap().unwrap();
+                    assert_eq!(bytes, vec![i as u8; 8]);
+                }
+            }
+            let expected: Vec<_> = image_urls.iter().map(|url| format!("GET {url}")).collect();
+            assert_eq!(fetched, expected, "fresh invocations must fetch each image exactly once");
+        }
     }
 
     /// 中断後の新しい実行枠を、取得済み挿絵の再取得で使い切らずに続行できる。

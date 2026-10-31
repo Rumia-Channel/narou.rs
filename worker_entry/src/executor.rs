@@ -32,9 +32,8 @@ use crate::composition::WorkerRuntime;
 use crate::push_hub::{HubProgress, PushHubClient, PushHubSink, echo};
 
 
-/// Bounded wall-clock budget per job. It is checked only before starting the
-/// next section, so a section's fetch and persistence remain atomic from the
-/// worker's point of view.
+/// Bounded wall-clock budget per job. Checked before sections and uncached
+/// images, so a single image-heavy section can span multiple invocations.
 pub const JOB_TIME_BUDGET: Duration = Duration::from_secs(60 * 10);
 
 /// Typed outcome of executing one job.

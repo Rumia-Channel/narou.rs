@@ -75,6 +75,11 @@ export function selectedVirtualNovel(novels, selectedIds) {
   return selected.length === 1 ? selected[0] : null;
 }
 
+const VIRTUAL_ATTRIBUTE_OPTIONS = [
+  { value: '小説', label: '小説' },
+  { value: '漫画', label: '漫画' },
+];
+
 /**
  * 一覧にある値の重複を除いて並べる (ダイアログの入力候補)。
  */
@@ -469,6 +474,36 @@ export function bindActions() {
     return virtuals.find((novel) => String(novel.id) === String(value)) || null;
   }
 
+  /**
+   * 属性を変更するバーチャル小説を決める。一覧で仮想小説をちょうど 1 件
+   * 選択していればそれを使い、それ以外はダイアログで選ばせる。
+   */
+  async function pickAttributeTarget(virtuals) {
+    const selected = selectedVirtualNovel(State.novels, State.selectedIds);
+    if (selected) {
+      const match = virtuals.find((novel) => String(novel.id) === String(selected.id));
+      if (match) return match;
+    }
+    const mixed = virtuals.filter((novel) => novel.mixed);
+    if (!mixed.length) {
+      showNotification('属性を変更できるバーチャル小説がありません (小説と漫画が混在する作品のみ)', 'error');
+      return null;
+    }
+    if (mixed.length === 1) return mixed[0];
+    const value = await selectDialog({
+      title: '属性を変更するバーチャル小説',
+      message: '対象のバーチャル小説を選択してください。',
+      value: String(mixed[0].id),
+      options: mixed.map((novel) => ({
+        value: String(novel.id),
+        label: `${novel.ncode} ${novel.title}`,
+        detail: `${novel.members.length} 作品 / 現在の属性: ${novel.attribute_tag}`,
+      })),
+    });
+    if (value === null) return null;
+    return virtuals.find((novel) => String(novel.id) === String(value)) || null;
+  }
+
   on('action-option-virtual-add', async () => {
     const ids = getSelectedIdsInDisplayOrder();
     if (!ids.length) {
@@ -478,6 +513,21 @@ export function bindActions() {
     const selectedNovels = ids
       .map((id) => State.novels.find((novel) => String(novel.id) === String(id)))
       .filter(Boolean);
+    let classification;
+    try {
+      const response = await fetch('/api/virtual_novels/classify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ members: ids.map(Number) }),
+      });
+      classification = await response.json();
+      if (!response.ok || !classification.success) {
+        throw new Error(classification.message || '分類の判定に失敗しました');
+      }
+    } catch (error) {
+      showNotification(error.message || '分類の判定に失敗しました', 'error');
+      return;
+    }
     const input = await formDialog({
       title: 'バーチャル小説の登録',
       message: `選択した ${ids.length} 作品を 1 つの EPUB にまとめます。`,
@@ -501,6 +551,18 @@ export function bindActions() {
       ],
     });
     if (!input) return;
+    let attributeTag = null;
+    if (classification.mixed) {
+      // 混在するときは利用者に属性を選んでもらう (既定は小説)。
+      const chosen = await selectDialog({
+        title: 'バーチャル小説の属性',
+        message: '小説と漫画が混在しています。属性タグを選択してください。',
+        value: '小説',
+        options: VIRTUAL_ATTRIBUTE_OPTIONS,
+      });
+      if (chosen === null) return;
+      attributeTag = chosen;
+    }
     try {
       const response = await fetch('/api/virtual_novels', {
         method: 'POST',
@@ -511,6 +573,7 @@ export function bindActions() {
           sitename: input.sitename,
           tags: [],
           members: ids.map(Number),
+          ...(attributeTag ? { attribute_tag: attributeTag } : {}),
         }),
       });
       const result = await response.json();
@@ -521,6 +584,44 @@ export function bindActions() {
       await refreshList();
     } catch (error) {
       showNotification(error.message || '登録に失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-attribute', async () => {
+    try {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const novel = await pickAttributeTarget(virtuals);
+      if (!novel) return;
+      if (!novel.mixed) {
+        showNotification(
+          `${novel.ncode} は小説と漫画が混在していないため属性を変更できません`,
+          'error',
+        );
+        return;
+      }
+      const chosen = await selectDialog({
+        title: 'バーチャル小説の属性',
+        message: `${novel.ncode} ${novel.title} の属性タグを選択してください。`,
+        value: isAttributeTag(novel.attribute_tag) ? novel.attribute_tag : '小説',
+        options: VIRTUAL_ATTRIBUTE_OPTIONS,
+      });
+      if (chosen === null) return;
+      const response = await fetch(`/api/virtual_novels/${novel.id}/attribute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ attribute_tag: chosen }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || '属性タグの保存に失敗しました');
+      }
+      showNotification(`属性を変更しました: ${result.attribute_tag || chosen}`, 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '属性の変更に失敗しました', 'error');
     }
   });
   on('action-option-virtual-append', async () => {
@@ -2063,6 +2164,7 @@ function onFavoriteTagDragOver(event) {
 }
 
 function onFavoriteTagDragLeave(event) {
+  if (event.relatedTarget && event.currentTarget.contains(event.relatedTarget)) return;
   event.currentTarget.classList.remove('tag-favorite-drop-before', 'tag-favorite-drop-after');
 }
 

@@ -8,7 +8,7 @@
 //! configurable per Worker: <https://developers.cloudflare.com/workers/platform/limits/#subrequests>.
 //! The 850-request job yield point is an intentionally conservative local
 //! policy, not a hard platform limit. [`WorkerBudget`] combines it with the
-//! wall-clock deadline to yield at section boundaries.
+//! wall-clock deadline to yield before sections and uncached images.
 //!
 //! [`JOB_TIME_BUDGET`]: crate::executor::JOB_TIME_BUDGET
 
@@ -109,11 +109,11 @@ impl CheckpointSink {
     }
 }
 
-/// Section-boundary budget combining wall-clock and subrequest limits.
+/// Budget combining wall-clock and subrequest limits at resumable boundaries.
 ///
-/// `should_yield` is checked only before a section starts, so whichever
-/// limit trips first produces a resumable `Partial` outcome instead of a
-/// hard platform abort.
+/// Checks before sections and uncached images keep long illustrated sections
+/// resumable. The downloader saves the image index before returning `Partial`;
+/// the checkpoint retains the unfinished section rather than skipping its images.
 pub struct WorkerBudget<'a> {
     deadline_ms: f64,
     subrequests: &'a SubrequestBudget,
