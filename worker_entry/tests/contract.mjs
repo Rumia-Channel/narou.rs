@@ -953,6 +953,30 @@ await check("POST /api/global_setting refreshes the fresh config and broadcasts 
   }
 });
 
+await check("changing only the tag order notifies open pages and updates the fresh config", async () => {
+  const view = await fetchSettingsView();
+  const previous = view.settings.find((item) => item.name === "webui.tag-sort-order")?.value ?? null;
+  const next = previous === "alphabetical" ? "count" : "alphabetical";
+  const socket = await openWebSocket();
+  try {
+    const mark = socket.mark();
+    const saved = await postSettings({
+      settings: { "webui.tag-sort-order": next },
+      expected_settings: { "webui.tag-sort-order": previous },
+    });
+    assert.equal(saved.body.success, true, JSON.stringify(saved.body));
+    await waitForEvent(socket, mark, (message) => message?.type === "webui.config.reload");
+    const fresh = await json(await request("/api/webui/config?fresh=1", auth()));
+    assert.equal(fresh.tag_sort_order, next);
+  } finally {
+    socket.close();
+    await postSettings({
+      settings: { "webui.tag-sort-order": previous },
+      expected_settings: { "webui.tag-sort-order": next },
+    });
+  }
+});
+
 await check("GET /api/sort_state returns the current sort", async () => {
   const response = await request("/api/sort_state", auth());
   assert(response.status === 200, `status ${response.status}`);

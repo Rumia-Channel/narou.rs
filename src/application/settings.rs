@@ -187,6 +187,7 @@ pub const LIVE_WEBUI_CONFIG_NAMES: &[&str] = &[
     "webui.table.reload-timing",
     "webui.performance-mode",
     "webui.new-tag-color",
+    "webui.tag-sort-order",
     "tag.show-novel",
     "tag.show-manga",
     "tag.attributes-enabled",
@@ -740,6 +741,24 @@ mod tests {
         ))
         .unwrap();
         assert!(effects.effects.contains(&SettingsEffect::WebuiConfigChanged));
+    }
+
+    #[test]
+    fn tag_order_changes_and_deletion_notify_open_pages() {
+        let (service, _) = service();
+        futures::executor::block_on(async {
+            for order in ["favorites_first", "alphabetical", "count", "registered"] {
+                let result = service.set("webui.tag-sort-order", &serde_json::json!(order)).await.unwrap();
+                assert!(result.effects.contains(&SettingsEffect::WebuiConfigChanged),
+                    "changing the tag order must notify existing pages: {order}");
+                assert_eq!(service.get("webui.tag-sort-order").await.unwrap().unwrap().as_str(), Some(order));
+            }
+            let unchanged = service.set("webui.tag-sort-order", &serde_json::json!("registered")).await.unwrap();
+            assert!(!unchanged.effects.contains(&SettingsEffect::WebuiConfigChanged));
+            let deleted = service.delete("webui.tag-sort-order").await.unwrap();
+            assert!(deleted.effects.contains(&SettingsEffect::WebuiConfigChanged));
+            assert!(service.get("webui.tag-sort-order").await.unwrap().is_none());
+        });
     }
     #[test]
     fn server_security_change_reports_effect() {
