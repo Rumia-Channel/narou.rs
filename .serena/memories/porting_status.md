@@ -1,5 +1,15 @@
 # narou.rs 移植状況
 
+## 現況（2026-11-02、ZIP 転送の進捗・リリース保留）
+
+公開済みの最新は v0.5.7。ユーザーは次の版 v0.5.8 を明示承認したが、本番 Workers の停滞理由を解明してから公開する指示があるため、まだ番号更新・main 統合・タグ作成はしていない。取得完了後からの待機修正は develop の b071647（実装 78ae4d7）へ統合済み。
+
+`fix-transfer-progress` で Web UI の ZIP 転送を変更。共通 `transfer::ArchiveStream` が 1 ファイルずつ ZIP を生成し、Native / Worker の `/api/transfer/export?progress=1` は NDJSON の data / progress / complete / error を返す。従来の ZIP 形式 v1 と progress 無しの API / CLI は維持する。import の progress=1 は送信量・検証・作品数・結果を表示し、キャンセルは取り込み済み作品を巻き戻さない。新しい UI は `src/web/assets/js/ui/transfer.js`、Native の配信表も追加済み。COMMANDS.md / WEBUI.md / VERSION.md 未リリース / ZIP 形式資料を同期。既存実装が全本文と完成 ZIP を一括保持することはソースで確認したが、報告画像そのものの失敗理由を OOM と断定していない。
+
+検証: `cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace`、`cargo check` 成功。実 Native HTTP の 158 作品 export/import、CLI 往復 3 件、共通 transfer 52 件が成功。実 workerd / D1 で 158 作品・本文約77MiB の ZIP 出力と新規取り込み、ハッシュと完了件数を検証。Firefox でも 159 作品（bulk 158 +既存fixture1）の ZIP を実保存し全 bulk ファイルの SHA-256 を照合、別 Worker でアップロード159件スキップ、壊れたZIPのエラー表示、通信中止を確認し、レコード160件を維持した。ライト / Darkly の実モーダルを目視（Darkly は CSS 属性を一時適用）。Documents 配下の手作り Native UI fixture は新規ファイル作成等で AccessDenied になった（lib の IO probe は成功、環境原因は未確定）。Native の正常系は自動 HTTP テストで確認しており、この手作り UI fixture の成功とは混同しない。手作りライブラリ・プローブ・Worker fixture・一時ブラウザタブ・ZIP は清掃した。
+
+本番調査は読み取りだけ。最初に download 20件 pending を観測し、その後 n2023bc の本文141話目までの保存、同作16:17:15Z成功、n9636x の16:30:07Z成功と後続作品への進行を確認。こちらで再投入・消去・配備はしていない。15:53付近〜16:10付近の空白は15分lease+2分graceの回収と整合するが、終了理由は未確定。本番の永続 Observability は未設定、履歴ログAPIはOAuth権限不足で403、D1に履歴イベント/ログ表は無い。GraphQL は当該時間帯に success/clientDisconnected/responseStreamDisconnected を返すのみで、OOMやCPU制限の証拠は得ていない。Wrangler tail 5分では acquisition/convert/毎分cronの成功を観測。これらから停滞トリガーを断定したり、v0.5.8を公開済みと書かない。
+
 ## 現況（v0.5.0 実装完了・リリース準備）
 
 0.5.0 の新機能を `feature/v0.5.0` で実装。内容: (1) 非表示設定 (`HiddenState` / inventory `hidden`、作品・タグ・作者・サイト。Native YAML/SQLite・Worker D1、CLI `narou hidden`、`list --show-hidden`、Web API `/api/hidden`、Web UI トグル/右クリック/モーダル)。(2) サイト別並列DL (`SiteSetting.site_family` を YAML 第一優先、なろう系 syosetu.com / Pixiv pixiv.net。Native update の domain groups、Worker の D1 admission site_key、Native Web キューの family 排他)。(3) 小説データ ZIP 転送 (`src/transfer` の wasm-safe コア、Native `narou export/import`、`/api/transfer/*`、Worker ObjectStore 実装、`transfer_wasm`、Web UI の選択ダウンロード/アップロード)。設計は `docs/v0.5.0-architecture.md`、履歴は VERSION.md v0.5.0 節。全 crate を 0.5.0 に更新し、ライセンス通知も再生成。`cargo test --workspace` / clippy `--all-features` / JS 回帰 / Worker wasm / workerd transfer 契約テストが成功。次は develop 統合 → CI → 0.5.0 タグ/Release。
