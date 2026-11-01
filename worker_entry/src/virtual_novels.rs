@@ -461,7 +461,7 @@ async fn reorder(runtime: &WorkerRuntime, id: i64, ordered: Vec<i64>) -> Result<
     let mut members = read(runtime.write_db()).await?;
     members
         .reorder(id, ordered)
-        .map_err(|message| NarouError::InvalidTarget(message))?;
+        .map_err(NarouError::InvalidTarget)?;
     write(runtime.write_db(), &members).await
 }
 
