@@ -824,6 +824,19 @@ export function bindActions() {
       await refreshQueueDetailed();
     }, 'キューの消去に失敗しました');
   });
+  on('queue-clear-all-button', (e) => {
+    void runGuardedAction(e.currentTarget, async () => {
+      const confirmed = await confirmDialog({
+        title: 'キューをすべてクリア',
+        message: '実行中の処理を中断し、待機中・再試行待ちのジョブをすべて削除します。小説データや取得済みの本文は削除しません。実行中の処理は安全な区切りで中断されます。よろしいですか？',
+        okLabel: 'はい', cancelLabel: 'いいえ', danger: true,
+      });
+      if (!confirmed) return;
+      const result = await postJson('/api/queue/cancel', {});
+      assertApiSuccess(result, 'キューの一括クリアに失敗しました');
+      await Promise.all([refreshQueue(), refreshQueueDetailed()]);
+    }, 'キューの一括クリアに失敗しました');
+  });
   on('queue-reload-button', async () => {
     await refreshQueueDetailed();
   });

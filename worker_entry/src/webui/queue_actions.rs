@@ -37,8 +37,8 @@ use super::json_error;
 
 /// `cancel_pending_task` などが `last_error` に残す理由 (台帳の記録用、
 /// Web UI の失敗理由表示と同じく英語の機械可読文字列)。
-const REASON_REMOVED: &str = "removed from queue by user via Web UI";
-const REASON_QUEUE_CLEARED: &str = "queue cleared by user via Web UI";
+pub(super) const REASON_REMOVED: &str = "removed from queue by user via Web UI";
+pub(super) const REASON_QUEUE_CLEARED: &str = "queue cleared by user via Web UI";
 /// running 行の tombstone 理由。`crate::consumer` はこの文字列を「実行中に
 /// ユーザーがキャンセルした」判定に使う (native の killed child →
 /// `JobOutcome::Cancelled` 相当) ので、真実源は consumer 側に 1 つだけ置く。
@@ -131,8 +131,8 @@ async fn queue_clear(req: Request, env: Env) -> worker::Result<Response> {
     let runtime = runtime_or_503!(env);
 
     // `clear_non_running`: pending (=`pending` + `retryable`) を全部外す;
-    // running は残す。native と同じく、外れた分は実行も履歴にも残らない
-    // (worker 側は `permanent` tombstone → `failed` バケットに出る差分あり)。
+    // running は残す。除去済み行の tombstone は再配信防止に残すが、
+    // キューの集計では失敗として数えない。
     if let Err(error) = runtime.ledger.cancel_all_pending(REASON_QUEUE_CLEARED).await {
         return api_failure(error);
     }

@@ -478,9 +478,9 @@ async fn process_discrete(
 /// native の killed child と同じ `queue_cancelled` を送って ack する。
 /// それ以外の失敗 (別実行への lease 移譲・D1 エラー等) は元のエラーを返す。
 ///
-/// `Wasm` は途中で殺せないので、キャンセルされたジョブは「次の終端書き込み
-/// が 0 行に終わる」ことで初めて中断を知る (native の SIGKILL と同じ
-/// 観測位置)。
+/// `Wasm` 自体を外側から kill せず、取得は話・未取得画像の境界で台帳を
+/// 再確認して中断する。最後の処理との競合も終端書き込みの token/status
+/// guard で検出し、物理処理が戻るまでは所有権を解放しない。
 async fn settle_user_cancel(
     runtime: &WorkerRuntime,
     push: &PushHubClient,

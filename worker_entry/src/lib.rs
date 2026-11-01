@@ -1538,33 +1538,28 @@ async fn api_remove_with_file(mut req: Request, env: Env) -> Result<Response> {
     webui::row_actions::handle(forwarded, env).await
 }
 
-/// POST /api/queue/cancel — native `src/web/jobs.rs::queue_cancel`:
-/// running を中断して pending を消す (=`/api/cancel` の後に
-/// `/api/queue/clear`)。native と同順 (kill → clear) に実行し、
-/// どちらも成功して初めて native と同じ `{"success": true,
-/// "message": "キャンセルしました"}` を返す。
+/// POST /api/queue/cancel — clear waiting work before stopping running work,
+/// so releasing a canceled execution cannot wake the old waiting queue.
 async fn api_queue_cancel(req: Request, env: Env) -> Result<Response> {
-    let mut cancel = webui::queue_actions::handle(
-        forwarded_request(&req, "/api/cancel", None)?,
-        env.clone(),
-    )
-    .await?;
-    if cancel.status_code() != 200 {
-        return Ok(cancel);
-    }
-    let cancel_value: serde_json::Value = cancel.json().await?;
-    if cancel_value.get("success") != Some(&json!(true)) {
-        return Response::from_json(&cancel_value);
-    }
-    let mut clear =
-        webui::queue_actions::handle(forwarded_request(&req, "/api/queue/clear", None)?, env)
-            .await?;
+    let mut clear = webui::queue_actions::handle(
+        forwarded_request(&req, "/api/queue/clear", None)?, env.clone(),
+    ).await?;
     if clear.status_code() != 200 {
         return Ok(clear);
     }
     let clear_value: serde_json::Value = clear.json().await?;
     if clear_value.get("success") != Some(&json!(true)) {
         return Response::from_json(&clear_value);
+    }
+    let mut cancel = webui::queue_actions::handle(
+        forwarded_request(&req, "/api/cancel", None)?, env,
+    ).await?;
+    if cancel.status_code() != 200 {
+        return Ok(cancel);
+    }
+    let cancel_value: serde_json::Value = cancel.json().await?;
+    if cancel_value.get("success") != Some(&json!(true)) {
+        return Response::from_json(&cancel_value);
     }
     // native `queue_cancel` の応答 (= cancel の成功応答と同じ形)。
     Response::from_json(&cancel_value)

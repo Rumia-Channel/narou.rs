@@ -70,13 +70,19 @@ const DEFAULT_SITE_TIMEZONE: &str = "Asia/Tokyo";
 /// cheap; the same index may be checked repeatedly while its images advance.
 pub trait SectionBudget: Send {
     fn should_yield(&mut self, next_section_index: usize) -> bool;
+
+    /// Check execution ownership at a safe boundary. Native budgets do not
+    /// need an external cancellation store.
+    fn check_active(&mut self) -> crate::platform::PlatformFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Execution options for a resumable download.
 ///
 /// `resume_from_section` identifies the first section that still needs
-/// network work. The downloader restores every preceding persisted section
-/// from the object store before fetching anything after that boundary.
+/// network work. Completed metadata is restored without rereading bodies;
+/// older checkpoints and interrupted checkpoint writes fall back to storage.
 pub struct DownloadExecutionOptions<'a> {
     pub force: bool,
     pub budget: Option<&'a mut dyn SectionBudget>,
@@ -1204,10 +1210,13 @@ impl Downloader {
                 }
                 // 保存済み画像は予算を消費せず読み飛ばし、未取得画像の直前で
                 // 中断する。索引は呼び出し元が保存し、同じ話の残りから再開する。
-                if budget.as_deref_mut().is_some_and(|budget| budget.should_yield(section_index)) {
-                    return Err(NarouError::DownloadBudgetExpired {
-                        next_section_index: section_index,
-                    });
+                if let Some(budget) = budget.as_deref_mut() {
+                    budget.check_active().await?;
+                    if budget.should_yield(section_index) {
+                        return Err(NarouError::DownloadBudgetExpired {
+                            next_section_index: section_index,
+                        });
+                    }
                 }
 
                 match crate::downloader::http_policy::fetch_bytes(
@@ -2008,16 +2017,49 @@ impl Downloader {
                 subtitles.len()
             )));
         }
-        // 再開時に復元する既読セクション。直列 1 件ずつの読みをやめ、
-        // PersistenceService 側の窓 (SECTION_READ_WINDOW) で先読みする。
-        // 走査順で最初の失敗の扱いは直列時と同じ。
+        if resume_from == 0 && (budget.is_some() || resume_from_section.is_some()) {
+            // A fresh job must not inherit metadata left by a canceled job,
+            // even if it fails before its first budget checkpoint is saved.
+            self.persistence.clear_download_resume(&object_keys).await?;
+        }
+        let existing_names = self.persistence.list_novel_object_names(&object_keys).await?;
+        let existing_sections = PersistenceService::existing_section_indices(&existing_names);
+        let mut checkpointed_subtitles = if resume_from > 0 {
+            self.persistence.load_download_resume(&object_keys).await?
+        } else {
+            None
+        }.map(|toc| (toc.toc_url, toc.subtitles));
+        if let Some((saved_url, saved)) = &mut checkpointed_subtitles {
+            saved.truncate(resume_from);
+            if saved_url != &toc_url || saved.iter().zip(&subtitles).any(|(saved, latest)| {
+                saved.index != latest.index || saved.href != latest.href
+                    || saved.file_subtitle != latest.file_subtitle
+                    || saved.subdate != latest.subdate || saved.subupdate != latest.subupdate
+            }) {
+                return Err(NarouError::DownloadResumeCorrupt("TOC changed since the download checkpoint".into()));
+            }
+            for (section_index, subtitle) in saved.iter().enumerate() {
+                let key = object_keys.section(&subtitle.index, &subtitle.file_subtitle);
+                let name = &key.as_ref()[object_keys.prefix().as_ref().len() + 1..];
+                if !existing_names.contains(name) {
+                    return Err(NarouError::DownloadResumeCorrupt(format!(
+                        "persisted section {section_index} ({}) is missing", subtitle.index,
+                    )));
+                }
+            }
+        }
+        let checkpointed_subtitles = checkpointed_subtitles.map(|(_, subtitles)| subtitles).unwrap_or_default();
+        let restored_count = checkpointed_subtitles.len();
+        // Old checkpoints and periodic checkpoints ahead of the metadata file
+        // still recover their bodies and illustration mappings once.
         let resumed = match self
             .persistence
-            .load_sections_ordered(&object_keys, &subtitles[..resume_from])
+            .load_sections_ordered(&object_keys, &subtitles[restored_count..resume_from])
             .await
         {
             Ok(sections) => sections,
             Err(SectionLoadFailure::Missing { section_index }) => {
+                let section_index = restored_count + section_index;
                 return Err(NarouError::DownloadResumeCorrupt(format!(
                     "persisted section {section_index} ({}) is missing",
                     subtitles[section_index].index
@@ -2026,16 +2068,8 @@ impl Downloader {
             Err(SectionLoadFailure::Read(error)) => return Err(error),
         };
         let mut resumed_sections: HashMap<usize, SectionFile> =
-            resumed.into_iter().enumerate().collect();
-
-        // One listing pass replaces a per-section existence read. On the
-        // Worker this is the difference between ⌈N/1000⌉ LIST subrequests
-        // and N GETs; on native it avoids N read+parse round trips.
-        let existing_names = self
-            .persistence
-            .list_novel_object_names(&object_keys)
-            .await?;
-        let existing_sections = PersistenceService::existing_section_indices(&existing_names);
+            resumed.into_iter().enumerate().map(|(index, section)| (restored_count + index, section)).collect();
+        let mut checkpointed_subtitles = checkpointed_subtitles.into_iter();
 
         struct SectionPlan {
             is_new_arrival: bool,
@@ -2045,6 +2079,7 @@ impl Downloader {
             existed: bool,
             predownloaded: Option<(SectionElement, String)>,
             resumed: Option<SectionFile>,
+            checkpointed: Option<SubtitleInfo>,
             preserved: bool,
         }
 
@@ -2069,17 +2104,18 @@ impl Downloader {
         let guard_spoiler = self.settings.local_setting_bool("guard-spoiler");
         for (section_index, subtitle) in subtitles.iter().enumerate() {
             let preserved = preserved_indices.contains(subtitle.index.as_str());
+            let checkpointed = checkpointed_subtitles.next();
             let resumed = match resumed_sections.remove(&section_index) {
                 Some(section) => Some(section),
-                None if preserved => Some(self.persistence.load_section(&object_keys, subtitle)
+                None if preserved && checkpointed.is_none() => Some(self.persistence.load_section(&object_keys, subtitle)
                     .await?.ok_or_else(|| NarouError::Platform(format!(
                         "preserved section {} is missing from storage", subtitle.index,
                     )))?),
                 None => None,
             };
-            let is_new_arrival = resumed.is_none() && !old_subtitles.contains_key(&subtitle.index);
+            let is_new_arrival = checkpointed.is_none() && resumed.is_none() && !old_subtitles.contains_key(&subtitle.index);
             let existed = existing_sections.contains(&subtitle.index);
-            let (needs_download, predownloaded) = if resumed.is_some() {
+            let (needs_download, predownloaded) = if checkpointed.is_some() || resumed.is_some() {
                 (false, None)
             } else if force {
                 (true, None)
@@ -2106,6 +2142,7 @@ impl Downloader {
                 existed,
                 predownloaded,
                 resumed,
+                checkpointed,
                 preserved,
             });
         }
@@ -2123,14 +2160,13 @@ impl Downloader {
 
         let section_result: Result<()> = async {
             for (section_index, (subtitle, mut plan)) in subtitles.iter().zip(section_plans).enumerate() {
-                if section_index >= resume_from
-                    && budget
-                        .as_deref_mut()
-                        .is_some_and(|budget| budget.should_yield(section_index))
-                {
-                    return Err(NarouError::DownloadBudgetExpired {
-                        next_section_index: section_index,
-                    });
+                if section_index >= resume_from && let Some(budget) = budget.as_deref_mut() {
+                    budget.check_active().await?;
+                    if budget.should_yield(section_index) {
+                        return Err(NarouError::DownloadBudgetExpired {
+                            next_section_index: section_index,
+                        });
+                    }
                 }
                 if defer_strong_update && !force && plan.resumed.is_none() && plan.needs_download {
                     let (needs_download, predownloaded) = self
@@ -2157,7 +2193,7 @@ impl Downloader {
                 }
                 let is_new_arrival = plan.is_new_arrival;
                 let needs_download = plan.needs_download;
-                let resumed_was_tracked = plan.resumed.is_some();
+                let resumed_was_tracked = plan.resumed.is_some() || plan.checkpointed.is_some();
                 // 中断された実行を再開したセクションは、前回の索引保存前に実行が
                 // 終わっている可能性がある (挿絵の実体だけが残り、対応表が無い
                 // 状態)。再開したセクションは取得を省く分だけ挿絵の登録も
@@ -2187,7 +2223,9 @@ impl Downloader {
                     }
                 }
 
-                let download_time = if let Some(resumed) = plan.resumed {
+                let download_time = if let Some(checkpointed) = plan.checkpointed {
+                    checkpointed.download_time
+                } else if let Some(resumed) = plan.resumed {
                     resumed.download_time
                 } else if needs_download {
                     if !started_download {
@@ -2350,6 +2388,7 @@ impl Downloader {
         } else {
             Ok(())
         };
+        let cache_saved = cache_result.is_ok();
         if let Err(error) = cache_result {
             if section_result.is_err() {
                 self.report_warn(&messages::indented_error(&error));
@@ -2357,7 +2396,18 @@ impl Downloader {
                 return Err(error);
             }
         }
-        section_result?;
+        if let Err(error) = section_result {
+            if cache_saved && matches!(error, NarouError::DownloadBudgetExpired { .. }) {
+                // The image index is durable before metadata allows a future
+                // invocation to skip completed bodies. The unfinished episode
+                // is deliberately absent, including yields inside its images.
+                self.persistence.save_download_resume(&object_keys, &TocFile {
+                    title, author, toc_url, story: None,
+                    subtitles: final_subtitles, novel_type: Some(novel_type),
+                }).await?;
+            }
+            return Err(error);
+        }
 
         if let Some(ref p) = self.progress {
             p.finish_with_message(&format!(
@@ -2625,6 +2675,9 @@ impl Downloader {
             && let Some(timestamp) = cache_timestamp(self.clock.as_ref(), save_diff_snapshots)
         {
             self.persistence.record_cache_version(&object_keys, &timestamp).await?;
+        }
+        if budget.is_some() || resume_from_section.is_some() {
+            self.persistence.clear_download_resume(&object_keys).await?;
         }
 
         Ok(DownloadResult {
@@ -4179,6 +4232,129 @@ is_narou: false
     }
 
     #[tokio::test]
+    async fn long_download_resumes_beyond_the_storage_request_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountedStore {
+            inner: Arc<MemoryObjectStore>,
+            requests: Arc<AtomicUsize>,
+        }
+        impl ObjectStore for CountedStore {
+            fn stat<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+                ObjectStore::stat(self.inner.as_ref(), key)
+            }
+            fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+                if key.as_ref().contains("/本文/") {
+                    self.requests.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.read_small(key)
+            }
+            fn write_small<'a>(&'a self, key: &'a ObjectKey, bytes: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
+                if key.as_ref().contains("/本文/") {
+                    self.requests.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.write_small(key, bytes)
+            }
+            fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+                ObjectStore::delete(self.inner.as_ref(), key)
+            }
+            fn list_page<'a>(&'a self, request: &'a ObjectListRequest) -> PlatformFuture<'a, Result<crate::platform::ObjectListPage>> {
+                self.inner.list_page(request)
+            }
+            fn update_small<'a, 'data: 'a>(&'a self, key: &'a ObjectKey, mutate: &'a mut crate::platform::SmallObjectMutator<'data>) -> PlatformFuture<'a, Result<crate::platform::ObjectUpdateResult>> {
+                self.inner.update_small(key, mutate)
+            }
+        }
+        struct RequestBudget(Arc<AtomicUsize>);
+        impl SectionBudget for RequestBudget {
+            fn should_yield(&mut self, _: usize) -> bool {
+                self.0.load(Ordering::SeqCst) >= 8
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let previous_db = db::DATABASE.lock().replace(Database::new().unwrap());
+        let _db_guard = DatabaseGuard(previous_db);
+        let mut setting: SiteSetting = serde_yaml::from_str(r#"
+name: Long Resume
+domain: example.com
+top_url: https://example.com
+url: 'https://example\.com/(?<ncode>n1234ab)/?'
+sitename: Long Resume
+toc_url: 'https://example.com/\k<ncode>/'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+subtitles: '<a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>'
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+"#).unwrap();
+        setting.compile();
+        let target = "https://example.com/n1234ab/";
+        let http = Arc::new(MockHttpClient::new());
+        let mut toc = "<h1>Long Resume</h1><span>Author</span>".to_string();
+        for index in 1..=32 {
+            toc.push_str(&format!("<a href=\"/n1234ab/{index}/\">第{index}話</a>"));
+            http.add_text(format!("{target}{index}/"), 200, format!("<div class=\"body\">本文{index}</div>"));
+        }
+        http.add_text(target, 200, toc);
+        let inner = Arc::new(MemoryObjectStore::new());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let objects = Arc::new(CountedStore { inner: inner.clone(), requests: requests.clone() });
+        let novels = Arc::new(MemoryNovelRepository::new());
+        let keys = NovelObjectKeys::new("Long Resume", "n1234ab", false).unwrap();
+        let mut next = 0;
+        let mut completed = false;
+        for invocation in 0..5 {
+            requests.store(0, Ordering::SeqCst);
+            let mut budget = RequestBudget(requests.clone());
+            let mut downloader = Downloader::with_platform_and_storage_and_settings(
+                DownloaderPlatform {
+                    http: http.clone(), rate_limiter: Arc::new(FakeRateLimiter::new()),
+                    novels: novels.clone(), objects: objects.clone(), assets: inner.clone(),
+                    clock: Arc::new(SystemClock),
+                },
+                vec![setting.clone()], HashMap::new(),
+            ).unwrap();
+            match downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+                force: false, budget: Some(&mut budget),
+                resume_from_section: (invocation > 0).then_some(next),
+            }).await {
+                Ok(result) => {
+                    assert_eq!(result.total_count, 32);
+                    completed = true;
+                    break;
+                }
+                Err(crate::error::NarouError::DownloadBudgetExpired { next_section_index }) => {
+                    if invocation == 1 {
+                        assert_eq!(next_section_index, next, "legacy prefix recovery must retain its cursor");
+                    } else {
+                        assert!(next_section_index > next, "resume made no progress at section {next}");
+                    }
+                    next = next_section_index;
+                    if invocation == 0 {
+                        // A checkpoint created by the previous version has
+                        // bodies but no compact resume metadata.
+                        ObjectStore::delete(inner.as_ref(), &keys.prefix().join(".download_resume").unwrap()).await.unwrap();
+                    }
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        assert!(completed, "the novel must complete across bounded invocations");
+        let persistence = PersistenceService::new(inner.clone(), inner);
+        let toc = persistence.load_toc(&keys).await.unwrap().unwrap();
+        assert_eq!(toc.subtitles.len(), 32);
+        for subtitle in &toc.subtitles {
+            let section = persistence.load_section(&keys, subtitle).await.unwrap().unwrap();
+            assert_eq!(section.download_time, subtitle.download_time);
+            assert_eq!(section.element.body, format!("本文{}", subtitle.index));
+            let section_url = format!("{target}{}/", subtitle.index);
+            assert_eq!(http.requested_urls().iter().filter(|url| url.ends_with(&section_url)).count(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn resumable_download_reuses_persisted_prefix_without_refetching() {
         let temp = tempfile::tempdir().unwrap();
         let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
@@ -4287,6 +4463,14 @@ is_narou: false
             0
         );
 
+        http.add_text(target, 200, toc.replace("/n1234ab/1/", "/n1234ab/99/"));
+        let changed = downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: false, budget: None, resume_from_section: Some(1),
+        }).await.unwrap_err();
+        assert!(matches!(changed, crate::error::NarouError::DownloadResumeCorrupt(_)),
+            "changed TOC order cannot reuse a completed-prefix checkpoint");
+        http.add_text(target, 200, toc);
+
         downloader
             .download_novel_with_execution_options(
                 target,
@@ -4314,6 +4498,40 @@ is_narou: false
                 .count(),
             1
         );
+
+        // A new forced job can fail after replacing its first body, before a
+        // budget yield. Its retry must not reuse a canceled job's old times.
+        let keys = NovelObjectKeys::new("Resume Test", "n1234ab", false).unwrap();
+        downloader.section_cache = super::section::SectionCache::new();
+        let mut stop = YieldBeforeSection(1);
+        downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: true, budget: Some(&mut stop), resume_from_section: None,
+        }).await.unwrap_err();
+        let mut old = downloader.persistence.load_download_resume(&keys).await.unwrap().unwrap();
+        old.subtitles[0].download_time = Some("2000-01-01 00:00:00.000000 +0000".into());
+        let objects = downloader.persistence.objects().clone();
+        let first_key = keys.section("1", "第1話");
+        let mut first: SectionFile = serde_yaml::from_slice(&objects.read_small(&first_key).await.unwrap().unwrap()).unwrap();
+        first.download_time = old.subtitles[0].download_time.clone();
+        objects.write_small(&first_key, serde_yaml::to_string(&first).unwrap().into_bytes()).await.unwrap();
+        downloader.persistence.save_download_resume(&keys, &old).await.unwrap();
+        http.add_text(section_1, 200, r#"<div class="body">改稿1</div>"#);
+        http.add_text(section_2, 500, "temporary failure");
+        downloader.section_cache = super::section::SectionCache::new();
+        let mut unlimited = YieldBeforeSection(usize::MAX);
+        let failed = downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: true, budget: Some(&mut unlimited), resume_from_section: None,
+        }).await.unwrap_err();
+        assert!(matches!(failed, crate::error::NarouError::Http(_)));
+        http.add_text(section_2, 200, r#"<div class="body">本文2</div>"#);
+        downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: false, budget: None, resume_from_section: Some(1),
+        }).await.unwrap();
+        let toc = downloader.persistence.load_toc(&keys).await.unwrap().unwrap();
+        let first = downloader.persistence.load_section(&keys, &toc.subtitles[0]).await.unwrap().unwrap();
+        assert_eq!(first.element.body, "改稿1");
+        assert_ne!(toc.subtitles[0].download_time, old.subtitles[0].download_time);
+        assert_eq!(toc.subtitles[0].download_time, first.download_time);
     }
 
     /// 再開時のプレフィックスに欠落した話がある場合、その位置を報告して
@@ -4415,6 +4633,21 @@ is_narou: false
             "unexpected partial result: {partial:?}; requests={:?}",
             http.requested_urls()
         );
+
+        let keys = NovelObjectKeys::new("Resume Corrupt Test", "n1234ab", false).unwrap();
+        let first_key = keys.section("1", "第1話");
+        let objects = downloader.persistence.objects().clone();
+        let first_body = objects.read_small(&first_key).await.unwrap().unwrap();
+        objects.delete(&first_key).await.unwrap();
+        let obsolete_key = keys.section("1", "旧題の第1話");
+        objects.write_small(&obsolete_key, first_body.clone()).await.unwrap();
+        let missing = downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: false, budget: None, resume_from_section: Some(1),
+        }).await.unwrap_err();
+        assert!(matches!(missing, crate::error::NarouError::DownloadResumeCorrupt(_)));
+        assert!(missing.to_string().contains("persisted section 0 (1) is missing"));
+        objects.write_small(&first_key, first_body).await.unwrap();
+        objects.delete(&obsolete_key).await.unwrap();
 
         // 2 回目: 第 2 話が欠落したまま 2 話分の復元を要求する。
         let error = downloader
