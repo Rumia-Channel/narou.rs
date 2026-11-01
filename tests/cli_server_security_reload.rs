@@ -57,6 +57,12 @@ fn cli_setting_change_reaches_the_running_server_immediately() {
     let home = temp.path().join("home");
     std::fs::create_dir_all(library.join(".narou")).unwrap();
     std::fs::create_dir_all(home.join(".narousetting")).unwrap();
+    // HTTP だけを検証するため、未確保の port + 1 に別リスナーを作らない。
+    std::fs::write(
+        home.join(".narousetting/global_setting.yaml"),
+        "server-ws-port: 0\n",
+    )
+    .unwrap();
 
     // テスト用のポートは OS に割り当てさせる。
     let port = {
@@ -64,29 +70,35 @@ fn cli_setting_change_reaches_the_running_server_immediately() {
         listener.local_addr().unwrap().port()
     };
 
+    let server_log_path = temp.path().join("server.log");
+    let server_log = std::fs::File::create(&server_log_path).unwrap();
     let mut server = Command::new(narou_binary())
         .args(["web", "--port", &port.to_string(), "--no-browser"])
         .current_dir(&library)
         .env("USERPROFILE", &home)
         .env("HOME", &home)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(server_log.try_clone().unwrap()))
+        .stderr(Stdio::from(server_log))
         .spawn()
         .expect("サーバを起動できる");
 
-    // 起動待ち (ポートが開くまで)。
-    let mut ready = false;
-    for _ in 0..80 {
-        std::thread::sleep(Duration::from_millis(250));
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "サーバが起動しなかった");
-
     let result = std::panic::catch_unwind(|| {
+        // 起動失敗時も子プロセスを終了し、診断ログを残す。
+        let mut ready = false;
+        for _ in 0..80 {
+            std::thread::sleep(Duration::from_millis(250));
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                ready = true;
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "サーバが起動しなかった:\n{}",
+            std::fs::read_to_string(&server_log_path).unwrap_or_default()
+        );
+
         // 許可ホストにワイルドカードだけを入れる。
         let stdout = run_setting(
             &library,
