@@ -19,6 +19,9 @@ use super::types::{SectionElement, SectionFile, SubtitleInfo, TocFile};
 /// セクション本体や設定入力は別に保持されるため、変換全体のメモリ上限ではない。
 pub const SECTION_READ_WINDOW: usize = 4;
 
+// No .yaml suffix: this is transient metadata, never a section/history object.
+const DOWNLOAD_RESUME_FILE: &str = ".download_resume";
+
 /// [`PersistenceService::load_sections_ordered`] の失敗。
 ///
 /// 呼び出し側が文脈に合うエラー文言へ変換する (`convert` と resume で
@@ -94,6 +97,23 @@ impl PersistenceService {
         self.objects
             .write_small(&keys.toc(), serialize_toc(toc)?.into_bytes())
             .await
+    }
+
+    pub(crate) async fn load_download_resume(&self, keys: &NovelObjectKeys) -> Result<Option<TocFile>> {
+        let key = keys.prefix().join(DOWNLOAD_RESUME_FILE)?;
+        self.objects.read_small(&key).await?
+            .map(|bytes| deserialize_toc(&bytes)).transpose()
+    }
+
+    pub(crate) async fn save_download_resume(&self, keys: &NovelObjectKeys, toc: &TocFile) -> Result<()> {
+        self.objects.write_small(
+            &keys.prefix().join(DOWNLOAD_RESUME_FILE)?,
+            serialize_toc(toc)?.into_bytes(),
+        ).await
+    }
+
+    pub(crate) async fn clear_download_resume(&self, keys: &NovelObjectKeys) -> Result<()> {
+        self.objects.delete(&keys.prefix().join(DOWNLOAD_RESUME_FILE)?).await
     }
 
     pub async fn load_section(

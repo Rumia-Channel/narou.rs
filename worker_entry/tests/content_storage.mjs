@@ -26,6 +26,10 @@ let sourceImageCount = 0;
 const imageRequests = new Map();
 const sourceRequests = new Map();
 const imageContinuations = [];
+const longEpisodeCount = 1685;
+const longEpisodeRequests = new Map();
+const longInvocationStarts = [];
+const longEpisodeBody = (index) => `保存された${String.fromCodePoint(0x6000 + index)}の本文です。`;
 const imagePng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3Z5A0AAAAASUVORK5CYII=', 'base64');
 let child;
 let logs = '';
@@ -36,6 +40,26 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://127.0.0.1');
     const key = decodeURIComponent(url.pathname);
+    if (req.method === 'GET' && key === '/smoke-long/') {
+      const page = Number(url.searchParams.get('p') ?? 1);
+      const pageCount = Math.ceil(longEpisodeCount / 100);
+      assert(page >= 1 && page <= pageCount);
+      if (page === 1) longInvocationStarts.push(longEpisodeRequests.size);
+      const links = Array.from({ length: Math.min(100, longEpisodeCount - (page - 1) * 100) },
+        (_, offset) => (page - 1) * 100 + offset + 1)
+        .map((index) => `<a href="/smoke-long/${index}/">第${index}話</a>`).join('');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<h1>Long Story</h1><span class="author">Storage Author</span><pages>${pageCount}</pages>${links}${page < pageCount ? `<next>/smoke-long/?p=${page + 1}</next>` : ''}`);
+      return;
+    }
+    const longEpisode = /^\/smoke-long\/(\d+)\/$/.exec(key);
+    if (req.method === 'GET' && longEpisode) {
+      const index = Number(longEpisode[1]);
+      longEpisodeRequests.set(index, (longEpisodeRequests.get(index) ?? 0) + 1);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<div class="body"><p>${longEpisodeBody(index)}</p></div>`);
+      return;
+    }
     if (req.method === 'GET' && /^\/smoke-(novel|single|series)\/$/.test(key)) {
       sourceRequests.set(key, (sourceRequests.get(key) ?? 0) + 1);
       if (sourceImageCount && imageRequests.size > 0) {
@@ -158,8 +182,8 @@ async function download(target, force, expectedFailure = false) {
   assert(accepted.success, JSON.stringify(accepted));
   return waitForAcquisition(accepted.results[0].job_id, expectedFailure);
 }
-async function waitForAcquisition(jobId, expectedFailure = false) {
-  const deadline = Date.now() + 120000;
+async function waitForAcquisition(jobId, expectedFailure = false, timeoutMs = 120000) {
+  const deadline = Date.now() + timeoutMs;
   let job;
   do {
     job = await (await api(`/api/jobs/${jobId}`)).json();
@@ -170,7 +194,7 @@ async function waitForAcquisition(jobId, expectedFailure = false) {
   if (!expectedFailure) {
     // Acquisition success only promises that its follow-up Convert was enqueued.
     // Drain that lane before changing the source, injecting faults, or restarting.
-    const conversionDeadline = Date.now() + 120000;
+    const conversionDeadline = Date.now() + timeoutMs;
     let conversions;
     do {
       conversions = sql("SELECT job_id,status FROM worker_jobs WHERE kind='convert'")[0].results;
@@ -529,6 +553,31 @@ min_interval: 0.01
   console.log('PASS one 500-image episode yields on the real Worker budget, resumes without refetching, and produces an illustrated EPUB');
 
   sourceImageCount = 0;
+  await defaultLibrary('long-resume', { required: true });
+  const longTarget = target.replace('/smoke-novel/', '/smoke-long/');
+  const longDefinition = definition.replaceAll('smoke-novel', 'smoke-long')
+    + "\ntoc_page_max_pattern: '<pages>(\\d+)</pages>'\nnext_toc: '<next>(?<next_path>[^<]+)</next>'\nnext_url: '\\k<top_url>\\k<next_path>'\n";
+  assert((await (await api('/api/sites/localhost.yaml', longDefinition, 'PUT')).json()).success);
+  sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
+  const longAccepted = await (await api('/api/download', { targets: [longTarget] })).json();
+  assert(longAccepted.success, JSON.stringify(longAccepted));
+  await waitForAcquisition(longAccepted.results[0].job_id, false, 600000);
+  assert.equal(longEpisodeRequests.size, longEpisodeCount);
+  assert([...longEpisodeRequests.values()].every((count) => count === 1), 'completed episodes must never be refetched across continuations');
+  assert(longInvocationStarts.some((saved) => saved > 850), 'a fresh invocation must progress beyond the prefix that exceeds the real request budget');
+  const longJob = sql("SELECT attempts,status FROM worker_jobs WHERE kind='download'")[0].results[0];
+  assert.equal(longJob.status, 'succeeded');
+  assert.equal(longJob.attempts, 0);
+  assert.equal(scalar("SELECT general_all_no FROM novels WHERE ncode='smoke-long'"), longEpisodeCount);
+  assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE object_key LIKE '%/smoke-long/本文/%' AND instr(object_key,'/cache/')=0"), longEpisodeCount);
+  assert.equal(scalar("SELECT COUNT(*) FROM objects WHERE object_key LIKE '%/.download_resume'"), 0, 'completion retires transient resume metadata');
+  const longId = scalar("SELECT id FROM novels WHERE ncode='smoke-long'");
+  const longEpub = await api(`/api/novels/${longId}/download.epub`);
+  assert.equal(longEpub.status, 200, await longEpub.clone().text());
+  const longText = epubText(Buffer.from(await longEpub.arrayBuffer()));
+  for (const index of [1, 771, 850, 1685]) assert(longText.includes(longEpisodeBody(index)), `EPUB must include episode ${index}`);
+  console.log('PASS 1685 episodes / 17 TOC pages cross the real Worker budget, resume without rereading the complete prefix, and produce the complete EPUB');
+
   await defaultLibrary('automatic-update-rules');
   const automaticDefinition = definition
     .replace('(?<ncode>smoke-novel)', '(?<ncode>smoke-(?:novel|single|series))')
