@@ -2,9 +2,10 @@
 
 > `narou export` / `narou import` が使う **小説データ転送アーカイブ** の書式です。
 > 形式そのものは `src/transfer` (プラットフォーム非依存) に実装があり、CLI・Native Web
-> API・Worker・ブラウザ WASM が同じ 3 つの関数を使います。
+> API・Worker・ブラウザ WASM が生成・検証・取り込み計画を共有します。
 
 - 生成: `build_archive(&ArchiveManifest) -> Vec<u8>`
+- 逐次生成: `ArchiveStream<W>` (進捗付き Web 書き出し。1 ファイルずつ ZIP へ書き込む)
 - 検証・展開: `parse_archive(&[u8]) -> ParsedArchive`
 - 取り込み計画: `plan_import(&ParsedArchive, &[ExistingNovel], ConflictPolicy) -> ImportPlan`
 
@@ -24,6 +25,8 @@ novels/1/...
 - `<i>` は **manifest 内の `novels` 配列の位置**。同じ値が作品 ID ではない
   (取り込み先では ID を再採番する)。
 - `<path>` は **小説ディレクトリ基準の相対パス**、`/` 区切り。
+- エントリの物理的な順番は固定しない。逐次生成では `manifest.json` を最後に書き、
+  ZIP の data descriptor を使う。索引の内容と取り込み時の検証規則は同じ。
 
 ## 2. `manifest.json`
 
@@ -62,7 +65,7 @@ novels/1/...
 | `format_version` | 必須 | 現在は `1`。別の値は取り込み側で拒否する (`UnsupportedVersion`) |
 | `app_version` | 任意 | 生成したアプリケーションのバージョン |
 | `exported_at` | 任意 | 生成日時 (RFC 3339) |
-| `novels` | 任意 | 作品の配列 (省略時は空配列。順序は正規化される) |
+| `novels` | 任意 | 作品の配列 (省略時は空配列。位置は ZIP 内の `novels/<i>` と対応する) |
 
 ### 2.2 作品 (`novels[]`) のフィールド
 
@@ -112,7 +115,7 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 
 ## 3. 決定性
 
-同じ入力からは **同じバイト列** になるように作られている。
+バッファ生成 API `build_archive` は、同じ入力から **同じバイト列** を生成する。
 
 - 作品は `(toc_url, title)` で安定ソート (`sort_by` は安定なので完全に等しい作品の
   順序は保つ)。ファイルは `path` でソート。
@@ -121,6 +124,11 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 
 → ハッシュを取り直したいとき、タイムスタンプを固定したいときは、
 **再生成すれば同じ ZIP になる**。
+
+逐次生成 API `ArchiveStream` は作品・ファイルを書き込んだ順に記録し、全作品の本文や
+完成 ZIP をサーバーのメモリに保持しない。`build_archive` と同じ ZIP 形式を使うが、
+エントリ順と data descriptor の有無が異なるため、両 API 間のバイト一致は保証しない。
+どちらも既存の `parse_archive` で読み取れる。
 
 ## 4. 検証 (取り込み時)
 

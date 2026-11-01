@@ -18,6 +18,8 @@
   --input-bg: #fff;
   --input-border: #ccc;
   --border-radius: 0.25em;
+  --transfer-progress-width: 100%;
+  --transfer-progress-height: 1em;
   --settings-hidden-control-size: 0.0625rem;
   --settings-hidden-control-clip: 50%;
   --control-focus-width: 0.125rem;

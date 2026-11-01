@@ -1663,3 +1663,17 @@ li.enable-selected.disabled a {
   font-size: 0.9em;
   opacity: 0.7;
 }
+
+.transfer-progress-bar {
+  width: var(--transfer-progress-width);
+  height: var(--transfer-progress-height);
+  accent-color: var(--btn-primary-bg);
+}
+.transfer-progress-status,
+.transfer-progress-detail {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.transfer-progress-detail {
+  color: var(--text-muted);
+}

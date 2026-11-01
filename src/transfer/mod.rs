@@ -33,6 +33,7 @@ mod archive;
 mod attribute;
 mod error;
 mod import;
+mod stream;
 
 pub use archive::{
     ArchiveFile, ArchiveManifest, ArchiveNovel, ParsedArchive, ParsedNovel, build_archive,
@@ -42,6 +43,7 @@ pub use error::{Result, TransferError};
 pub use import::{
     ConflictPolicy, ExistingNovel, ImportAction, ImportPlan, ImportPlanEntry, plan_import,
 };
+pub use stream::{ArchiveStream, TransferBuffer};
 
 /// Version written to [`ArchiveManifest::format_version`].
 pub const FORMAT_VERSION: u32 = 1;

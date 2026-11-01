@@ -96,7 +96,7 @@ pub fn cmd_import(archive: &str, overwrite: bool) -> Result<()> {
     })?;
 
     println!("{} を読み込んでいます...", path.display());
-    let outcome = transfer::import_archive_bytes(&bytes, conflict_policy(overwrite))?;
+    let outcome = transfer::import_archive_bytes(&bytes, conflict_policy(overwrite), None)?;
 
     println!(
         "新規: {} 件 / 上書き: {} 件 / スキップ: {} 件",
