@@ -500,6 +500,22 @@ impl D1JobLedger {
         Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
     }
 
+    /// A user cancellation retains the token until physical execution stops,
+    /// so both status and token must still match before starting more work.
+    pub(crate) async fn ensure_execution_active(&self, job_id: &JobId, execution_token: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct ActiveExecution { active: u32 }
+        let row = self.prepare(
+            "SELECT EXISTS(SELECT 1 FROM worker_jobs WHERE job_id = ? AND status = 'running' AND execution_token = ?) AS active",
+            vec![BindValue::Text(job_id.as_str().into()), BindValue::Text(execution_token.into())],
+        )?.first::<ActiveExecution>(None).await.map_err(worker_error)?;
+        if row.is_some_and(|row| row.active != 0) {
+            Ok(())
+        } else {
+            Err(NarouError::SuspendDownload("job execution was cancelled or superseded".into()))
+        }
+    }
+
     /// All currently-running job ids (any lease state), FIFO order.
     pub async fn running_job_ids(&self) -> Result<Vec<String>> {
         let statement = self.db.prepare(

@@ -138,6 +138,10 @@ pub async fn execute_job(
     );
     let outcome = context.scope(async {
 
+    if let Err(error) = runtime.ledger.ensure_execution_active(job_id, execution_token).await {
+        return JobOutcome::from_error(error);
+    }
+
     if job.kind == JobKind::AuthorCheck {
         use narou_rs::application::messages::MessageSink as _;
         let url = match &job.target {
@@ -155,6 +159,7 @@ pub async fn execute_job(
             if !runtime.author_service().list().await?.iter().any(|author| JobTarget::parse(&author.url).as_ref() == Some(&job.target)) {
                 return Ok(());
             }
+            runtime.ledger.ensure_execution_active(job_id, execution_token).await?;
             let plans: Vec<JobPlan> = urls.into_iter().map(|url| JobPlan {
                 kind: JobKind::Download, target: JobTarget::Url(url), options: Vec::new(),
             }).collect();
@@ -175,7 +180,10 @@ pub async fn execute_job(
     let series_result = match downloader.download_target_expander().expand_plan(job).await {
         Ok(Some(plans)) => {
             let count = plans.len();
-            Some(runtime.enqueue_batch(&plans).await.map(|_| count))
+            Some(async {
+                runtime.ledger.ensure_execution_active(job_id, execution_token).await?;
+                runtime.enqueue_batch(&plans).await.map(|_| count)
+            }.await)
         }
         Ok(None) => None,
         Err(error) => Some(Err(error)),
@@ -394,6 +402,11 @@ pub async fn execute_job(
     // (強更新の判定ヒント。失敗は再 DL だけに効くのでログだけ残す)。
     if let Err(error) = runtime.persist_pending_section_hash_cache().await {
         console_log!("job {job_id}: section hash cache write-back failed: {error}");
+    }
+    // A cancellation during the last in-flight fetch must not create a new
+    // Convert job (or perform post-update bookkeeping) after acquisition ends.
+    if let Err(error) = runtime.ledger.ensure_execution_active(job_id, execution_token).await {
+        return JobOutcome::from_error(error);
     }
     if let Err(error) = &result
         && !matches!(error, NarouError::DownloadBudgetExpired { .. })

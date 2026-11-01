@@ -86,12 +86,13 @@ GROUP BY attribute_tag COLLATE BINARY
 "#;
 
 const QUEUE_COUNTS_SQL: &str = r#"
-SELECT status,
+SELECT CASE WHEN status = 'permanent' AND last_error = ?1 THEN 'cancelled' ELSE status END AS status,
        CASE WHEN kind IN ('convert', 'send', 'backup', 'mail') THEN 1 ELSE 0 END AS lane,
        COUNT(*) AS n
 FROM worker_jobs
 WHERE status IN ('pending', 'retryable', 'running', 'succeeded', 'partial', 'blocked', 'permanent')
-GROUP BY status, lane
+  AND NOT (status = 'permanent' AND COALESCE(last_error, '') IN (?2, ?3))
+GROUP BY 1, 2
 "#;
 
 // The label needs a target only when exactly one job is running. Read at most
@@ -328,10 +329,14 @@ async fn select_pending_page(
 }
 
 /// Both status queries share one D1 batch/request. Pending job payloads never
-/// cross the JS/Wasm boundary just to count them (at most 14 count rows + 1 job).
+/// cross the JS/Wasm boundary just to count them (at most 16 count rows + 1 job).
 async fn select_queue_status(db: &DbHandle) -> Result<(Vec<StatusCount>, Vec<ActiveJobRow>)> {
     let results = db.batch(vec![
-        db.prepare(QUEUE_COUNTS_SQL),
+        db.prepare(QUEUE_COUNTS_SQL).bind(&[
+            JsValue::from_str(crate::consumer::USER_CANCEL_REASON),
+            JsValue::from_str(super::queue_actions::REASON_QUEUE_CLEARED),
+            JsValue::from_str(super::queue_actions::REASON_REMOVED),
+        ])?,
         db.prepare(FIRST_RUNNING_SQL),
     ]).await?;
     crate::d1_repository::ensure_batch_success(&results)
@@ -372,8 +377,8 @@ async fn queue_status(req: Request, env: worker::Env) -> Result<Response> {
         Ok(snapshot) => snapshot,
         Err(_) => return json_error(500, "ledger_read_failed", None),
     };
-    let (mut pending_count, mut running_count, mut completed, mut partial, mut failed) =
-        (0i64, 0i64, 0i64, 0i64, 0i64);
+    let (mut pending_count, mut running_count, mut completed, mut partial, mut failed, mut cancelled) =
+        (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
     let mut lane_sizes = [0i64; 2];
     for row in &counts {
         match row.status.as_str() {
@@ -382,6 +387,7 @@ async fn queue_status(req: Request, env: worker::Env) -> Result<Response> {
             "succeeded" => completed += row.n,
             "partial" => partial += row.n,
             "permanent" | "blocked" => failed += row.n,
+            "cancelled" => cancelled += row.n,
             _ => {}
         }
         if is_pending_status(&row.status) || row.status == "running" {
@@ -404,7 +410,7 @@ async fn queue_status(req: Request, env: worker::Env) -> Result<Response> {
         "completed": completed,
         "partial": partial,
         "failed": failed,
-        "cancelled": 0,
+        "cancelled": cancelled,
         "running": running_label,
         "running_count": running_count,
         "lane_sizes": lane_sizes,

@@ -70,6 +70,12 @@ const DEFAULT_SITE_TIMEZONE: &str = "Asia/Tokyo";
 /// cheap; the same index may be checked repeatedly while its images advance.
 pub trait SectionBudget: Send {
     fn should_yield(&mut self, next_section_index: usize) -> bool;
+
+    /// Check execution ownership at a safe boundary. Native budgets do not
+    /// need an external cancellation store.
+    fn check_active(&mut self) -> crate::platform::PlatformFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Execution options for a resumable download.
@@ -1204,10 +1210,13 @@ impl Downloader {
                 }
                 // 保存済み画像は予算を消費せず読み飛ばし、未取得画像の直前で
                 // 中断する。索引は呼び出し元が保存し、同じ話の残りから再開する。
-                if budget.as_deref_mut().is_some_and(|budget| budget.should_yield(section_index)) {
-                    return Err(NarouError::DownloadBudgetExpired {
-                        next_section_index: section_index,
-                    });
+                if let Some(budget) = budget.as_deref_mut() {
+                    budget.check_active().await?;
+                    if budget.should_yield(section_index) {
+                        return Err(NarouError::DownloadBudgetExpired {
+                            next_section_index: section_index,
+                        });
+                    }
                 }
 
                 match crate::downloader::http_policy::fetch_bytes(
@@ -2151,14 +2160,13 @@ impl Downloader {
 
         let section_result: Result<()> = async {
             for (section_index, (subtitle, mut plan)) in subtitles.iter().zip(section_plans).enumerate() {
-                if section_index >= resume_from
-                    && budget
-                        .as_deref_mut()
-                        .is_some_and(|budget| budget.should_yield(section_index))
-                {
-                    return Err(NarouError::DownloadBudgetExpired {
-                        next_section_index: section_index,
-                    });
+                if section_index >= resume_from && let Some(budget) = budget.as_deref_mut() {
+                    budget.check_active().await?;
+                    if budget.should_yield(section_index) {
+                        return Err(NarouError::DownloadBudgetExpired {
+                            next_section_index: section_index,
+                        });
+                    }
                 }
                 if defer_strong_update && !force && plan.resumed.is_none() && plan.needs_download {
                     let (needs_download, predownloaded) = self
