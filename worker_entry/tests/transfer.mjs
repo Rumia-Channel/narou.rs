@@ -636,6 +636,75 @@ try {
   assert.equal(legacyManifest.novels[0].attribute_tag, '小説');
   console.log('PASS a legacy archive with the classification inside tags is migrated into attribute_tag');
 
+  // 158 works must not require retaining every uncompressed body in one Worker.
+  const bulkCount = 158;
+  const bulkBody = Buffer.from(`body: ${'x'.repeat(511992)}\n`);
+  const bulkBodyExpression = "CAST('body: ' || replace(hex(zeroblob(255996)), '00', 'xx') || char(10) AS BLOB)";
+  const bulkQueries = [];
+  const bulkIds = [];
+  for (let index = 0; index < bulkCount; index++) {
+    const id = 10000 + index;
+    bulkIds.push(id);
+    const tocUrl = `https://example.com/bulk/${index}/`;
+    const title = `Bulk ${index}`;
+    const prefix = `novels/BulkTransfer/bulk-${index}`;
+    const toc = Buffer.from(`title: ${title}\nauthor: Fixture\ntoc_url: ${tocUrl}\nsubtitles: []\nnovel_type: 1\n`);
+    const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
+    bulkQueries.push(`INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,novel_type,use_subdirectory) VALUES (${id},'Fixture','fixture',${quote(title)},${quote(title.toLowerCase())},'bulk-${index}',${quote(tocUrl)},${quote(tocUrl)},'BulkTransfer','bulktransfer','2026-11-02T00:00:00Z','bulk-${index}','bulk-${index}',1,0);`);
+    bulkQueries.push(`INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (${quote(`${prefix}/toc.yaml`)},${toc.length},'2026-11-02T00:00:00Z','none',${crc32(toc)},X'${toc.toString('hex')}');`);
+    bulkQueries.push(`INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (${quote(`${prefix}/本文/1 話.yaml`)},${bulkBody.length},'2026-11-02T00:00:00Z','none',${crc32(bulkBody)},${bulkBodyExpression});`);
+  }
+  const bulkSeed = join(phaseA.directory, 'bulk-transfer.sql');
+  writeFileSync(bulkSeed, bulkQueries.join('\n'));
+  await stopWorker(workerA);
+  runWrangler(['d1', 'execute', 'DB', '--local', '--file', bulkSeed], phaseA);
+  workerA = await startWorker(phaseA);
+  const bulkClient = client(workerA.base);
+  async function progressResponse(response) {
+    if (response.status !== 200) assert.fail(`HTTP ${response.status}: ${await response.text()}`);
+    assert.match(response.headers.get('content-type'), /application\/x-ndjson/);
+    const decoder = new TextDecoder();
+    let pending = '';
+    const frames = [], chunks = [];
+    for await (const chunk of response.body) {
+      pending += decoder.decode(chunk, { stream: true });
+      let newline;
+      while ((newline = pending.indexOf('\n')) !== -1) {
+        const frame = JSON.parse(pending.slice(0, newline));
+        pending = pending.slice(newline + 1);
+        assert.notEqual(frame.type, 'error', JSON.stringify(frame));
+        if (frame.type === 'data') chunks.push(Buffer.from(frame.data, 'base64'));
+        else frames.push(frame);
+      }
+    }
+    assert.equal(pending.trim(), '');
+    assert.equal(frames.at(-1)?.type, 'complete', 'a closed stream is not a successful transfer');
+    return { frames, bytes: Buffer.concat(chunks) };
+  }
+  const bulkExport = await progressResponse(await bulkClient.request(`/api/transfer/export?progress=1&ids=${bulkIds.join(',')}`));
+  assert.equal(bulkExport.frames.at(-1).bytes, bulkExport.bytes.length);
+  assert(bulkExport.frames.some((frame) => frame.type === 'progress' && frame.completed === bulkCount && frame.total === bulkCount));
+  const { manifest: bulkManifest, entries: bulkEntries } = manifestOf(bulkExport.bytes);
+  assert.equal(bulkManifest.novels.length, bulkCount);
+  for (let index = 0; index < bulkCount; index++) {
+    assert.equal(bulkManifest.novels[index].toc_url, `https://example.com/bulk/${index}/`);
+    assert.deepEqual(bulkEntries.get(`novels/${index}/本文/1 話.yaml`), bulkBody);
+    assert.equal(bulkManifest.novels[index].files.find((file) => file.path === '本文/1 話.yaml').sha256, sha256(bulkBody));
+  }
+  console.log('PASS 158 novels / 77 MiB of bodies stream into one valid ZIP with progress and verified hashes');
+  const streamedImport = await progressResponse(await b.request('/api/transfer/import?progress=1', {
+    method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: bulkExport.bytes,
+  }));
+  assert.deepEqual(streamedImport.frames.at(-1).result, { success: true, created: bulkCount, overwritten: 0, skipped: 0, errors: [] });
+  assert(streamedImport.frames.some((frame) => frame.type === 'progress' && frame.phase === 'import' && frame.completed === bulkCount));
+  const importList = await b.json('/api/novels?limit=1000');
+  assert.equal(importList.body.data.filter((novel) => novel.toc_url.startsWith('https://example.com/bulk/')).length, bulkCount);
+  const missingStream = await bulkClient.request('/api/transfer/export?progress=1&ids=999999999');
+  const missingFrames = (await missingStream.text()).trim().split('\n').map(JSON.parse);
+  assert.equal(missingFrames.at(-1).type, 'error');
+  assert(!missingFrames.some((frame) => frame.type === 'complete'));
+  console.log('PASS streamed import reports all 158 committed works and missing exports fail without a completion marker');
+
   exitCode = 0;
 } catch (error) {
   if (workerA) console.error(workerA.logs().slice(-20000));

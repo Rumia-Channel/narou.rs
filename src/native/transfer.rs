@@ -177,12 +177,68 @@ pub fn export_archive_bytes(ids: &[i64]) -> Result<ExportResult> {
     })
 }
 
+/// Web export: emit bounded ZIP chunks instead of retaining every selected body.
+pub fn export_archive_stream(
+    ids: &[i64], emit: &mut dyn FnMut(serde_json::Value) -> Result<()>,
+) -> Result<()> {
+    let repository = NativeNovelRepository::new();
+    let archive_root = db::with_database(|database| Ok(database.archive_root().to_path_buf()))?;
+    let mut seen = HashSet::new();
+    let ids: Vec<_> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    let sink = crate::transfer::TransferBuffer::default();
+    let mut writer = crate::transfer::ArchiveStream::new(sink.clone(), version::VERSION.into(),
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+    let mut transferred = 0u64;
+    for (completed, id) in ids.iter().enumerate() {
+        let record = repository.get_sync(NovelId(*id))?
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
+        let novel_dir = db::existing_novel_dir_for_record(&archive_root, &record);
+        ensure_exportable(&archive_root, &novel_dir)?;
+        let store = NativeStore::for_current_root()?;
+        let _files = store.materialize_novel_files(&novel_dir)?;
+        let _illustrations = crate::native::illustrations::materialize_blocking(&novel_dir)?;
+        let toc = fs::read(novel_dir.join(TOC_FILE))?;
+        writer.begin_novel(archive_novel_from_record(&record, Vec::new(), parse_toc_story(&toc)))?;
+        collect_files_into(&novel_dir, &novel_dir, &mut |relative, path| {
+            let bytes = fs::read(path)?;
+            writer.add_file(relative, &bytes)?;
+            emit_archive_buffer(&sink, emit, &mut transferred)?;
+            Ok(())
+        })?;
+        emit(serde_json::json!({"type":"progress", "phase":"export",
+            "completed":completed + 1, "total":ids.len(), "title":record.title}))?;
+    }
+    writer.finish()?;
+    emit_archive_buffer(&sink, emit, &mut transferred)?;
+    emit(serde_json::json!({"type":"complete", "filename":"narou-export.zip", "bytes":transferred}))?;
+    Ok(())
+}
+
+fn emit_archive_buffer(
+    sink: &crate::transfer::TransferBuffer,
+    emit: &mut dyn FnMut(serde_json::Value) -> Result<()>, transferred: &mut u64,
+) -> Result<()> {
+    use base64::Engine;
+    let bytes = sink.take();
+    *transferred += bytes.len() as u64;
+    for chunk in bytes.chunks(64 * 1024) {
+        emit(serde_json::json!({"type":"data", "data":base64::engine::general_purpose::STANDARD.encode(chunk)}))?;
+    }
+    Ok(())
+}
+
+/// Reports completed works at novel boundaries; an error stops further imports.
+pub type ImportProgress<'a> = dyn FnMut(usize, usize, &str) -> Result<()> + 'a;
+
 /// Imports `bytes` into the current library.
 ///
 /// `policy` decides what happens to a novel whose `toc_url` already exists.
 /// Malformed archives abort before anything is written; per-novel problems are
 /// reported in [`ImportOutcome::errors`].
-pub fn import_archive_bytes(bytes: &[u8], policy: ConflictPolicy) -> Result<ImportOutcome> {
+pub fn import_archive_bytes(
+    bytes: &[u8], policy: ConflictPolicy,
+    mut progress: Option<&mut ImportProgress<'_>>,
+) -> Result<ImportOutcome> {
     // The archive carries files, so a storage backend that stores nothing on
     // disk cannot represent the result. Refuse instead of publishing records
     // whose body would be missing.
@@ -205,9 +261,12 @@ pub fn import_archive_bytes(bytes: &[u8], policy: ConflictPolicy) -> Result<Impo
     // library as it was before the run, so track what this run already handled.
     let mut handled_urls: HashSet<String> = HashSet::new();
 
-    for entry in &plan.entries {
+    for (position, entry) in plan.entries.iter().enumerate() {
         let novel = &parsed.novels[entry.index];
         let metadata = &parsed.manifest.novels[entry.index];
+        if let Some(report) = progress.as_mut() {
+            report(position, plan.entries.len(), &novel.title)?;
+        }
 
         if !handled_urls.insert(novel.toc_url.clone()) {
             outcome.errors.push(format!(
@@ -239,6 +298,9 @@ pub fn import_archive_bytes(bytes: &[u8], policy: ConflictPolicy) -> Result<Impo
         if let Err(error) = result {
             outcome.errors.push(format!("{}: {error}", describe(novel)));
         }
+    }
+    if let Some(report) = progress.as_mut() {
+        report(plan.entries.len(), plan.entries.len(), "")?;
     }
 
     Ok(outcome)
@@ -298,12 +360,18 @@ fn ensure_exportable(archive_root: &Path, novel_dir: &Path) -> Result<()> {
 /// skipped rather than failing the export of the whole library.
 pub fn collect_novel_files(novel_dir: &Path) -> Result<Vec<ArchiveFile>> {
     let mut files = Vec::new();
-    collect_files_into(novel_dir, novel_dir, &mut files)?;
+    collect_files_into(novel_dir, novel_dir, &mut |relative, path| {
+        files.push(ArchiveFile::new(relative, fs::read(path)?));
+        Ok(())
+    })?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
 }
 
-fn collect_files_into(base: &Path, current: &Path, files: &mut Vec<ArchiveFile>) -> Result<()> {
+fn collect_files_into(
+    base: &Path, current: &Path,
+    collect: &mut dyn FnMut(&str, &Path) -> Result<()>,
+) -> Result<()> {
     let mut entries: Vec<fs::DirEntry> = fs::read_dir(current)?.collect::<std::io::Result<_>>()?;
     entries.sort_by_key(|entry| entry.file_name());
 
@@ -323,7 +391,7 @@ fn collect_files_into(base: &Path, current: &Path, files: &mut Vec<ArchiveFile>)
             continue;
         }
         if file_type.is_dir() {
-            collect_files_into(base, &path, files)?;
+            collect_files_into(base, &path, collect)?;
             continue;
         }
         if !file_type.is_file() {
@@ -338,7 +406,7 @@ fn collect_files_into(base: &Path, current: &Path, files: &mut Vec<ArchiveFile>)
             continue;
         }
 
-        files.push(ArchiveFile::new(relative, fs::read(&path)?));
+        collect(&relative, &path)?;
     }
     Ok(())
 }

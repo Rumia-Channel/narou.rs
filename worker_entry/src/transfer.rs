@@ -65,6 +65,8 @@ use worker::{Env, Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
 
+mod progress;
+
 /// Maximum request body accepted by `POST /api/transfer/import`.
 ///
 /// The archive core enforces the same cap after decode; checking it here keeps
@@ -128,6 +130,9 @@ async fn export(req: Request, env: Env) -> worker::Result<Response> {
         Ok(ids) => ids,
         Err(message) => return export_error(400, message),
     };
+    if flag_value(crate::webui::query_param(&url, "progress").as_deref()) {
+        return progress::export(ids, env).await;
+    }
 
     let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
@@ -390,11 +395,22 @@ async fn import(mut req: Request, env: Env) -> worker::Result<Response> {
             ),
         );
     }
+    if flag_value(crate::webui::query_param(&url, "progress").as_deref()) {
+        return progress::import(body, policy, env);
+    }
+    import_body(body, policy, env, None).await
+}
+
+async fn import_body(
+    body: Vec<u8>, policy: ConflictPolicy, env: Env,
+    mut progress: Option<&mut progress::EventSender>,
+) -> worker::Result<Response> {
 
     let parsed = match parse_archive(&body) {
         Ok(parsed) => parsed,
         Err(error) => return import_error(400, error.to_string()),
     };
+    drop(body);
 
     let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
@@ -468,9 +484,13 @@ async fn import(mut req: Request, env: Env) -> worker::Result<Response> {
     // archive may repeat a toc_url, so track what this run already handled.
     let mut handled_urls: HashSet<String> = HashSet::new();
 
-    for entry in &plan.entries {
+    for (position, entry) in plan.entries.iter().enumerate() {
         let novel = &parsed.novels[entry.index];
         let metadata = &parsed.manifest.novels[entry.index];
+        if let Some(sender) = progress.as_mut() {
+            progress::send_event(sender, serde_json::json!({"type":"progress","phase":"import",
+                "completed":position,"total":plan.entries.len(),"title":novel.title})).await?;
+        }
         if !handled_urls.insert(novel.toc_url.clone()) {
             errors.push(format!(
                 "{}: 同じ toc_url がアーカイブ内で重複しています",
@@ -509,6 +529,10 @@ async fn import(mut req: Request, env: Env) -> worker::Result<Response> {
         if let Err(message) = result {
             errors.push(format!("{}: {message}", describe(novel)));
         }
+    }
+    if let Some(sender) = progress.as_mut() {
+        progress::send_event(sender, serde_json::json!({"type":"progress","phase":"import",
+            "completed":plan.entries.len(),"total":plan.entries.len(),"title":""})).await?;
     }
 
     let success = errors.is_empty();
