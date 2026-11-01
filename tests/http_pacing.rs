@@ -72,3 +72,83 @@ async fn a_redirect_cannot_send_its_next_request_using_the_previous_permit() {
     assert_eq!(received.load(Ordering::SeqCst), 2);
     server.join().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_redirect_body_is_followed_by_a_full_download_interval() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut request = [0u8; 8192];
+        assert!(first.read(&mut request).unwrap() > 0);
+        first.write_all(b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 4\r\nConnection: close\r\n\r\n").unwrap();
+        first.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        first.write_all(b"slow").unwrap();
+        first.flush().unwrap();
+        let completed = std::time::Instant::now();
+        let (mut second, _) = listener.accept().unwrap();
+        let gap = completed.elapsed();
+        second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert!(second.read(&mut request).unwrap() > 0);
+        second.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfinished").unwrap();
+        gap
+    });
+    let client = NativeHttpClient::new("narou-completion-pacing-test").unwrap();
+    let limiter = narou_rs::downloader::rate_limit::RateLimiter::with_settings(0.2, 0);
+    let scope = RateLimitScope::site("127.0.0.1");
+    let mut request = HttpRequest::get(format!("http://127.0.0.1:{port}/slow"));
+    request.trusted_endpoint = true;
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.send_paced(request, HttpPacing { limiter: &limiter, scope: &scope }),
+    ).await.unwrap().unwrap();
+    assert_eq!(response.body, b"finished");
+    let gap = server.join().unwrap();
+    assert!(gap >= Duration::from_millis(195), "completion-to-next-start gap was {gap:?}");
+    println!("response completion -> redirect: {gap:?} (configured 200 ms)");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_body_read_is_followed_by_a_full_download_interval() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut request = [0u8; 8192];
+        assert!(first.read(&mut request).unwrap() > 0);
+        first.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n").unwrap();
+        first.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        first.write_all(b"half").unwrap();
+        drop(first);
+        let completed = std::time::Instant::now();
+        let (mut second, _) = listener.accept().unwrap();
+        let gap = completed.elapsed();
+        second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert!(second.read(&mut request).unwrap() > 0);
+        second.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfinished").unwrap();
+        gap
+    });
+    let client = NativeHttpClient::new("narou-error-completion-pacing-test").unwrap();
+    let limiter = narou_rs::downloader::rate_limit::RateLimiter::with_settings(0.2, 0);
+    let scope = RateLimitScope::site(format!("error-completion-{port}.example"));
+    for index in 0..2 {
+        let mut request = HttpRequest::get(format!("http://127.0.0.1:{port}/{index}"));
+        request.trusted_endpoint = true;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.send_paced(request, HttpPacing { limiter: &limiter, scope: &scope }),
+        ).await.unwrap();
+        if index == 0 {
+            assert!(result.is_err(), "a truncated body must fail");
+        } else {
+            assert_eq!(result.unwrap().body, b"finished");
+        }
+    }
+    let gap = server.join().unwrap();
+    assert!(gap >= Duration::from_millis(195), "error-to-next-start gap was {gap:?}");
+    println!("body failure -> next request: {gap:?} (configured 200 ms)");
+}

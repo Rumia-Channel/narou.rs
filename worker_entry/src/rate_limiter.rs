@@ -63,6 +63,16 @@ impl WorkerRateLimiter {
         }).await
     }
 
+    async fn complete_scope(&self, scope: &RateLimitScope) -> Result<()> {
+        let site = normalize_site_key(&scope.site).ok_or_else(|| {
+            NarouError::Platform("rate-limit site key is empty".to_string())
+        })?;
+        self.acquire_permit(&site, PermitRequest::HttpComplete {
+            narou: scope.narou,
+            min_interval_ms: scope.min_interval.map(duration_millis_ceil).unwrap_or(0),
+        }).await
+    }
+
     pub(crate) async fn acquire_work_start(&self, domain: &str) -> Result<()> {
         let domain = normalize_site_key(domain).ok_or_else(|| {
             NarouError::Platform("update-start domain is empty".to_string())
@@ -74,6 +84,10 @@ impl WorkerRateLimiter {
 impl RateLimiter for WorkerRateLimiter {
     fn acquire<'a>(&'a self, scope: &'a RateLimitScope) -> PlatformFuture<'a, Result<()>> {
         Box::pin(self.acquire_scope(scope))
+    }
+
+    fn complete<'a>(&'a self, scope: &'a RateLimitScope) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(self.complete_scope(scope))
     }
 }
 

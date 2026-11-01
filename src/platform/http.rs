@@ -449,7 +449,9 @@ pub trait HttpClient: Send + Sync {
     ) -> PlatformFuture<'a, crate::error::Result<HttpResponse>> {
         Box::pin(async move {
             pacing.limiter.acquire(pacing.scope).await?;
-            self.send(request).await
+            let result = self.send(request).await;
+            pacing.limiter.complete(pacing.scope).await?;
+            result
         })
     }
 
