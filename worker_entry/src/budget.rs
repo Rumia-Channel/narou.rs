@@ -214,6 +214,15 @@ impl SectionBudget for WorkerBudget<'_> {
         }
         self.exceeded_reason().is_some()
     }
+
+    fn check_active(&mut self) -> narou_rs::platform::PlatformFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if let Some(sink) = &self.sink {
+                sink.ledger.ensure_execution_active(&sink.job_id, &sink.execution_token).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]

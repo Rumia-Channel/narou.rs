@@ -1869,13 +1869,15 @@ pub async fn api_csv_download(State(state): State<AppState>) -> axum::response::
         .into_response()
 }
 
-// POST /api/queue/cancel — cancel all: kill running + clear pending
+// POST /api/queue/cancel — clear waiting work before stopping running work.
 pub async fn queue_cancel(State(state): State<AppState>) -> Json<ApiResponse> {
-    // Kill running subprocess if any
+    // Do not let a worker take the next waiting job as its current child exits.
+    if let Err(error) = state.queue.clear_pending() {
+        return Json(ApiResponse { success: false, message: error.to_string() });
+    }
     kill_running_child(&state);
-
-    // Clear pending tasks from queue
-    let _ = state.queue.clear_pending();
+    state.restore_prompt_pending.store(state.queue.restore_prompt_pending(), Ordering::Relaxed);
+    state.restorable_tasks_available.store(state.queue.has_restorable_tasks(), Ordering::Relaxed);
 
     state.push_server.broadcast_event("notification.queue", "");
     Json(ApiResponse {

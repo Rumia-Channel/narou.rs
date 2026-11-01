@@ -23,6 +23,8 @@ let failPut = false;
 let sourceGeneration = 1;
 let sourceSubtitle = '第一話';
 let sourceImageCount = 0;
+let sourceEpisodeCount = 1;
+let sourcePause = null;
 const imageRequests = new Map();
 const sourceRequests = new Map();
 const imageContinuations = [];
@@ -67,10 +69,13 @@ const server = http.createServer(async (req, res) => {
         imageContinuations.push({ fetched: imageRequests.size, checkpoint: JSON.parse(checkpoint) });
       }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(`<h1>Controlled Story</h1><span class="author">Storage Author</span><a href="${key}1/">${sourceSubtitle}</a>`);
+      const links = Array.from({ length: sourceEpisodeCount }, (_, i) => `<a href="${key}${i + 1}/">${sourceEpisodeCount === 1 ? sourceSubtitle : `第${i + 1}話`}</a>`).join('');
+      res.end(`<h1>Controlled Story</h1><span class="author">Storage Author</span>${links}`);
       return;
     }
-    if (req.method === 'GET' && /^\/smoke-(novel|single|series)\/1\/$/.test(key)) {
+    if (req.method === 'GET' && /^\/smoke-(novel|single|series)\/\d+\/$/.test(key)) {
+      sourceRequests.set(key, (sourceRequests.get(key) ?? 0) + 1);
+      if (sourcePause) await sourcePause(key);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       const images = Array.from({ length: sourceImageCount }, (_, i) => `<img src="http://localhost:${server.address().port}/smoke-image/${i}.png" />`).join('');
       res.end(`<div class="body"><p>${(sourceGeneration === 1 ? '初回取得の本文です。' : sourceGeneration === 2 ? '更新後の本文です。' : '失敗する更新の本文です。').repeat(100)}</p>${images}</div>`);
@@ -78,6 +83,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && /^\/smoke-image\/\d+\.png$/.test(key)) {
       imageRequests.set(key, (imageRequests.get(key) ?? 0) + 1);
+      if (sourcePause) await sourcePause(key);
       res.writeHead(200, { 'Content-Type': 'image/png' });
       // Distinct stored bytes, with an unchanged valid one-pixel PNG.
       res.end(Buffer.concat([imagePng, Buffer.from(key)]));
@@ -432,6 +438,7 @@ min_interval: 0.01
     if (marker !== undefined) sql(`INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend',${quote(JSON.stringify(marker))},${quote(marker)});`);
     if (legacy) sql(legacyFixtureSql);
     failPut = false; sourceGeneration = 1; sourceSubtitle = '第一話';
+    sourceEpisodeCount = 1; sourceImageCount = 0; sourcePause = null;
     await start();
   }
   async function installDefaultSource() {
@@ -551,6 +558,82 @@ min_interval: 0.01
   assert.equal((illustratedText.match(/<img\b/g) ?? []).length, sourceImageCount, 'EPUB must retain every image after the continuation');
   assert(!illustratedText.includes('/smoke-image/'), 'EPUB must use its embedded images, not upstream URLs');
   console.log('PASS one 500-image episode yields on the real Worker budget, resumes without refetching, and produces an illustrated EPUB');
+
+  for (const scenario of [
+    { name: 'cancel-between-episodes', episodes: 3 },
+    { name: 'cancel-final-episode', episodes: 1 },
+    { name: 'cancel-between-images', episodes: 1, images: 3 },
+    { name: 'clear-running-and-waiting', episodes: 3, clearAll: true },
+  ]) {
+    await defaultLibrary(scenario.name, { required: true });
+    await installDefaultSource();
+    sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
+    sourceEpisodeCount = scenario.episodes;
+    sourceImageCount = scenario.images || 0;
+    sourceRequests.clear(); imageRequests.clear();
+    const entered = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    const pausePath = scenario.images ? '/smoke-image/0.png' : '/smoke-novel/1/';
+    sourcePause = async (path) => {
+      if (path !== pausePath) return;
+      sourcePause = null;
+      entered.resolve();
+      await release.promise;
+    };
+    try {
+      const accepted = await (await api('/api/download', { targets: [target] })).json();
+      assert(accepted.success, JSON.stringify(accepted));
+      const jobId = accepted.results[0].job_id;
+      await Promise.race([entered.promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`source gate timed out: ${scenario.name}`)), 30000).unref())]);
+      if (scenario.clearAll) {
+        const waiting = await (await api('/api/download', { targets: [target], force: true })).json();
+        assert(waiting.success, JSON.stringify(waiting));
+        assert.notEqual(waiting.results[0].job_id, jobId);
+        assert(scalar("SELECT COUNT(*) FROM worker_jobs WHERE status IN ('pending','retryable')") > 0);
+      }
+      const cancellation = await (await api(
+        scenario.clearAll ? '/api/queue/cancel' : '/api/cancel_running_task',
+        scenario.clearAll ? {} : { task_id: jobId },
+      )).json();
+      assert(scenario.clearAll ? cancellation.success : cancellation.status === 'ok', JSON.stringify(cancellation));
+      release.resolve();
+      const deadline = Date.now() + 60000;
+      let job;
+      do {
+        job = sql(`SELECT status,last_error,execution_token FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
+        if (job.execution_token === null) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } while (Date.now() < deadline);
+      assert.equal(job.execution_token, null, JSON.stringify(job));
+      assert.equal(job.status, 'permanent');
+      assert.equal(job.last_error, 'cancelled by user via Web UI');
+      assert.equal(sourceRequests.get('/smoke-novel/1/'), 1);
+      assert.equal(sourceRequests.get('/smoke-novel/2/') || 0, 0, 'cancellation must stop subsequent episodes');
+      assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='convert'"), 0, 'a canceled acquisition must not enqueue a new conversion');
+      assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE status IN ('pending','running','retryable')"), 0, 'bulk clearing must not wake the former waiting queue');
+      assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), 1, 'already received body data must be retained');
+      const queueStatus = await (await api('/api/queue/status')).json();
+      assert.equal(queueStatus.failed, 0, 'intentional interruption and cleared waiting work must not appear as failures');
+      assert.equal(queueStatus.cancelled, 1, 'the stopped running execution must be counted as canceled');
+      if (scenario.clearAll) {
+        sql("INSERT INTO worker_jobs(job_id,kind,target,options,status,dedupe_key,attempts,last_error,created_at,updated_at) VALUES ('ordinary-failure','download','unavailable','[]','permanent','ordinary-failure',1,'HTTP 503','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z');");
+        const withFailure = await (await api('/api/queue/status')).json();
+        assert.equal(withFailure.failed, 1, 'unrelated failures must remain visible alongside canceled executions');
+        assert.equal(withFailure.cancelled, 1);
+      }
+      if (scenario.images) {
+        assert.deepEqual([...imageRequests.keys()], ['/smoke-image/0.png'], 'cancellation must stop subsequent images');
+        const index = sql("SELECT encoding,hex(data) payload FROM objects WHERE object_key LIKE '%/.illustration_cache.yaml'")[0].results[0];
+        const bytes = Buffer.from(index.payload, 'hex');
+        const text = (index.encoding === 'brotli' ? brotliDecompressSync(bytes) : bytes).toString();
+        assert(text.includes('/smoke-image/0.png'), 'cancellation must retain the already saved image mapping');
+      }
+      console.log(`PASS ${scenario.name}: no later fetches or follow-up conversion, saved content retained`);
+    } finally {
+      sourcePause = null;
+      release.resolve();
+    }
+  }
 
   sourceImageCount = 0;
   await defaultLibrary('long-resume', { required: true });
