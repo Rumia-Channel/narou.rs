@@ -230,7 +230,7 @@ impl NativeHttpClient {
                 policy.limiter.acquire(scope).await?;
             }
             let worker = self.clone();
-            let (returned_chain, attempt) = tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 let request = chain.request();
                 let user_agent = request.header("User-Agent").unwrap_or(&worker.user_agent);
                 let attempt = if !tiered {
@@ -244,7 +244,11 @@ impl NativeHttpClient {
                     }
                 };
                 (chain, attempt)
-            }).await.map_err(|error| NarouError::Http(error.to_string()))?;
+            }).await.map_err(|error| NarouError::Http(error.to_string()));
+            if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                policy.limiter.complete(scope).await?;
+            }
+            let (returned_chain, attempt) = result?;
             chain = returned_chain;
             match attempt {
                 Ok(value) => {

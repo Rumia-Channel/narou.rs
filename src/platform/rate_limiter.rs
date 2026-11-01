@@ -68,6 +68,15 @@ pub trait RateLimiter: Send + Sync {
         &'a self,
         scope: &'a RateLimitScope,
     ) -> PlatformFuture<'a, crate::error::Result<()>>;
+
+    /// Record the end of a physical request, after its body is consumed or an
+    /// error is returned. The next interval starts here, not at admission.
+    fn complete<'a>(
+        &'a self,
+        _scope: &'a RateLimitScope,
+    ) -> PlatformFuture<'a, crate::error::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Normalize a site key for rate-limit scoping and Durable Object naming.
@@ -240,7 +249,7 @@ impl PacingSchedule {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PacingState {
     pub counter: u64,
-    /// Time of the last actual grant, never a future reservation.
+    /// Last grant, updated to completion time when the physical request ends.
     pub last_permit_ms: Option<u64>,
     /// Earliest next grant; also preserves an imported legacy reservation fence.
     pub next_permit_ms: Option<u64>,
@@ -270,6 +279,15 @@ pub fn try_acquire(
     state.last_permit_ms = Some(now_ms);
     state.next_permit_ms = Some(now_ms.saturating_add(delay_after_grant(state.counter, schedule)));
     PacingDecision::Granted
+}
+
+/// Preserve the request counter but restart its wait after the complete body
+/// or transport error. Work-start admission does not call this function.
+pub fn complete_request(state: &mut PacingState, now_ms: u64) {
+    if let Some(schedule) = state.schedule {
+        state.last_permit_ms = Some(now_ms);
+        state.next_permit_ms = Some(now_ms.saturating_add(delay_after_grant(state.counter, schedule)));
+    }
 }
 
 fn delay_after_grant(counter: u64, schedule: PacingSchedule) -> u64 {
@@ -482,6 +500,32 @@ mod tests {
             }
             assert_eq!(try_acquire(&mut state, now, pace), PacingDecision::Granted);
         }
+    }
+
+    #[test]
+    fn slow_request_preserves_the_full_interval_after_completion() {
+        let mut state = PacingState::default();
+        let pace = schedule(700, 0);
+        assert_eq!(try_acquire(&mut state, 1_000, pace), PacingDecision::Granted);
+        complete_request(&mut state, 10_000);
+        assert_eq!(try_acquire(&mut state, 10_000, pace), PacingDecision::Wait { wait_ms: 700 });
+        assert_eq!(try_acquire(&mut state, 10_699, pace), PacingDecision::Wait { wait_ms: 1 });
+        assert_eq!(try_acquire(&mut state, 10_700, pace), PacingDecision::Granted);
+    }
+
+    #[test]
+    fn periodic_pause_and_changed_settings_rebase_from_persisted_completion() {
+        let mut state = PacingState::default();
+        let pace = schedule(700, 2);
+        assert_eq!(try_acquire(&mut state, 1_000, pace), PacingDecision::Granted);
+        complete_request(&mut state, 2_000);
+        assert_eq!(try_acquire(&mut state, 2_700, pace), PacingDecision::Granted);
+        complete_request(&mut state, 20_000);
+        let encoded = serde_json::to_string(&state).unwrap();
+        let mut restored: PacingState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(try_acquire(&mut restored, 20_000, pace), PacingDecision::Wait { wait_ms: 5_000 });
+        assert_eq!(try_acquire(&mut restored, 21_000, schedule(2_000, 0)), PacingDecision::Wait { wait_ms: 1_000 });
+        assert_eq!(try_acquire(&mut restored, 22_000, schedule(2_000, 0)), PacingDecision::Granted);
     }
 
     #[test]
