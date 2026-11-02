@@ -270,7 +270,11 @@ impl WorkerHttpClient {
                 }
                 // Fetch is always manual. A partial/failed Fetch body returns
                 // an error above; only a complete 403 can start fallback.
-                let fetch_response = self.send_fetch_hop(request, MAX_WORKER_HTTP_BODY).await?;
+                let fetch_result = self.send_fetch_hop(request, MAX_WORKER_HTTP_BODY).await;
+                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                    policy.limiter.complete(scope).await?;
+                }
+                let fetch_response = fetch_result?;
                 let response = if fetch_response.status == 403
                     && request.method == HttpMethod::Get
                     && !request.trusted_endpoint
@@ -279,9 +283,13 @@ impl WorkerHttpClient {
                         policy.limiter.acquire(scope).await?;
                     }
                     let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
-                    match self.exchange_hop(
+                    let socket_result = self.exchange_hop(
                         &HopExchange::Socket, &request.url, &request.headers, deadline_ms,
-                    ).await {
+                    ).await;
+                    if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                        policy.limiter.complete(scope).await?;
+                    }
+                    match socket_result {
                         Ok(response) if response.is_success() || response.is_redirection() => response,
                         socket_result => {
                             let relay_result = match self.relay.as_ref() {
@@ -290,10 +298,14 @@ impl WorkerHttpClient {
                                         policy.limiter.acquire(scope).await?;
                                     }
                                     let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
-                                    self.exchange_hop(
+                                    let result = self.exchange_hop(
                                         &HopExchange::Relay(relay), &request.url,
                                         &request.headers, deadline_ms,
-                                    ).await.map(Some)
+                                    ).await;
+                                    if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                                        policy.limiter.complete(scope).await?;
+                                    }
+                                    result.map(Some)
                                 }
                                 None => Ok(None),
                             };

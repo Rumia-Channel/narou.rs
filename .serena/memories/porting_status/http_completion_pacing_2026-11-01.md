@@ -1,0 +1,11 @@
+# HTTP completion-based pacing (2026-11-01, unreleased)
+
+User reported Worker Kakuyomu 403 and identified pacing measured from request start rather than completion. Same cause existed in Native: shared try_acquire set next_permit_ms at admission, and transports never notified completion. Do not infer Native had the same live 403: only timing was reproduced locally.
+
+Fix: platform::RateLimiter gains complete(scope); shared complete_request shifts the next permit to completion + effective interval/step pause without incrementing counter. Native limiter records monotonic completion; Worker posts HttpComplete to SiteRateLimiter DO, which persists state. All physical attempts (complete response body or transport error), including redirect, native tiers, Worker Fetch/socket/relay fallback, notify completion before another attempt. Failed DO completion notification fails closed. WorkStart/update.interval stays start-based. Settings, site YAML, retry count and 403 classification unchanged.
+
+Proof: tests/http_pacing.rs real delayed-body redirect, 300ms response and 200ms interval, corrected matching-host pre-fix gap 928.2us (failed); post-fix gap 204.7674ms (passed). Truncated body failure -> next request 204.7415ms. HTTP pacing 3/3; http_cookie_scope 4/4; library 1288/1288. Actual release Worker/workerd + local D1/S3 fixture (node tests/content_storage.mjs) passed, slow 650ms body followed by 426.6ms / 415.2ms waits for configured 400ms. Existing full smoke also passed 500-image resume, 1685 episodes/17 TOC pages across real execution budget, cancellation, migration/EPUB.
+
+worker-build --release and native cargo clippy -p narou_rs --lib -- -D warnings passed. Worker clippy --target wasm32-unknown-unknown stopped on unchanged existing warnings: virtual_novels.rs:464 redundant_closure; webui/queue.rs:123 needless_question_mark. No production deployment, release/version bump, live Kakuyomu retry or claim that 403 is resolved. COMMANDS.md, VERSION.md (unreleased), docs/platform-abstraction.md updated.
+
+Local compiler issue: MSVC debug records caused D8050; load vcvars64.bat environment, CARGO_PROFILE_DEV_DEBUG=0 / CARGO_PROFILE_TEST_DEBUG=0, TMP/TEMP=repo target/build-temp allowed native compilation/linking. No dependency changes.

@@ -11,6 +11,7 @@ import { toggleLanguage, t } from './i18n.js';
 import { openFeatureTour } from './feature_tour.js';
 import { confirmDialog, formDialog, selectDialog, createSuggestionList } from './dialog.js';
 import { resetConsoleSize } from './console_size.js';
+import { exportSelectedNovels, importNovelArchive } from './transfer.js';
 import {
   renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed, attributeTagVisible,
   selectVisible, selectAll, clearSelection, getSelectedIdsInDisplayOrder,
@@ -406,40 +407,12 @@ export function bindActions() {
 
   on('action-option-about', openAbout);
   on('action-option-hidden', openHiddenSettings);
-  on('action-option-export', () => {
-    const ids = getSelectedIdsInDisplayOrder();
-    if (!ids.length) {
-      showNotification('ダウンロードする作品を選択してください', 'error');
-      return;
-    }
-    const anchor = document.createElement('a');
-    anchor.href = `/api/transfer/export?ids=${ids.join(',')}`;
-    anchor.download = 'narou-export.zip';
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-  });
+  on('action-option-export', () => exportSelectedNovels(getSelectedIdsInDisplayOrder()));
   on('action-option-import', () => document.getElementById('transfer-import-file')?.click());
   document.getElementById('transfer-import-file')?.addEventListener('change', async (event) => {
     const file = event.target.files?.[0];
     event.target.value = '';
-    if (!file) return;
-    try {
-      const response = await fetch('/api/transfer/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/zip' },
-        body: file,
-      });
-      const result = await response.json().catch(() => null);
-      if (!response.ok || !result?.success) {
-        throw new Error(result?.message || 'アップロードに失敗しました');
-      }
-      const summary = `新規 ${result.created ?? 0} / 上書き ${result.overwritten ?? 0} / スキップ ${result.skipped ?? 0}`;
-      showNotification(summary, 'info');
-      await refreshList();
-    } catch (error) {
-      showNotification(error.message || 'アップロードに失敗しました', 'error');
-    }
+    await importNovelArchive(file, refreshList);
   });
   async function fetchVirtualNovels() {
     const response = await fetch('/api/virtual_novels');

@@ -31,12 +31,14 @@ pub const MAX_TRANSFER_IMPORT_BODY_BYTES: usize = crate::transfer::MAX_ARCHIVE_B
 pub struct ExportParams {
     /// Comma-separated library ids (`ids=1,2,3`).
     pub ids: Option<String>,
+    pub progress: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ImportParams {
     /// `true` replaces novels that already exist instead of skipping them.
     pub overwrite: Option<String>,
+    pub progress: Option<String>,
 }
 
 /// `GET /api/transfer/export?ids=1,2` — download a ZIP of the selected novels.
@@ -48,6 +50,9 @@ pub async fn export_novels(
         Ok(ids) => ids,
         Err(message) => return export_error(StatusCode::BAD_REQUEST, message),
     };
+    if flag_value(params.progress.as_deref()) {
+        return progress_response(move |emit| transfer::export_archive_stream(&ids, emit));
+    }
 
     let exported =
         match tokio::task::spawn_blocking(move || transfer::export_archive_bytes(&ids)).await {
@@ -114,7 +119,20 @@ pub async fn import_archive(
 
     let policy = conflict_policy(flag_value(params.overwrite.as_deref()));
     let bytes = body.to_vec();
-    match tokio::task::spawn_blocking(move || transfer::import_archive_bytes(&bytes, policy)).await
+    if flag_value(params.progress.as_deref()) {
+        return progress_response(move |emit| {
+            emit(serde_json::json!({"type":"progress","phase":"validate","completed":0,"total":0}))?;
+            let mut progress = |completed, total, title: &str| {
+                emit(serde_json::json!({"type":"progress","phase":"import",
+                    "completed":completed,"total":total,"title":title}))
+            };
+            let outcome = transfer::import_archive_bytes(&bytes, policy, Some(&mut progress))?;
+            emit(serde_json::json!({"type":"complete","result":import_payload(
+                outcome.success(), outcome.created, outcome.overwritten, outcome.skipped, outcome.errors,
+            )}))
+        });
+    }
+    match tokio::task::spawn_blocking(move || transfer::import_archive_bytes(&bytes, policy, None)).await
     {
         Ok(Ok(outcome)) => Json(import_payload(
             outcome.success(),
@@ -131,6 +149,36 @@ pub async fn import_archive(
         )
         .into_response(),
     }
+}
+
+type ProgressEmitter<'a> = dyn FnMut(serde_json::Value) -> crate::error::Result<()> + 'a;
+
+fn progress_response(
+    task: impl FnOnce(&mut ProgressEmitter<'_>) -> crate::error::Result<()> + Send + 'static,
+) -> Response {
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
+    tokio::task::spawn_blocking(move || {
+        let mut emit = |value: serde_json::Value| -> crate::error::Result<()> {
+            let mut bytes = serde_json::to_vec(&value).map_err(|error| {
+                crate::error::NarouError::Platform(format!("転送応答を作成できません: {error}"))
+            })?;
+            bytes.push(b'\n');
+            sender.blocking_send(Bytes::from(bytes)).map_err(|_| {
+                crate::error::NarouError::Platform("転送の接続が閉じられました".into())
+            })
+        };
+        if let Err(error) = task(&mut emit) {
+            let _ = emit(serde_json::json!({"type":"error","message":error.to_string()}));
+        }
+    });
+    let stream = futures::stream::unfold(receiver, |mut receiver| async {
+        receiver.recv().await.map(|bytes| (Ok::<_, std::convert::Infallible>(bytes), receiver))
+    });
+    (
+        [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store")],
+        axum::body::Body::from_stream(stream),
+    ).into_response()
 }
 
 fn conflict_policy(overwrite: bool) -> ConflictPolicy {

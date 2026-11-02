@@ -591,9 +591,31 @@ markup は初回表示時に JS が組み立てる (`#app-dialog`、HTML 側の�
 |-------------|--------|------|
 | `/api/transfer/export?ids=1,2` | GET | ✅ (`application/zip`) |
 | `/api/transfer/import?overwrite=true` | POST | ✅ (ZIP 本文、body limit 512 MiB) |
+| `/api/transfer/export?progress=1&ids=1,2` | GET | ✅ (逐次 ZIP データと作品数を NDJSON で返す) |
+| `/api/transfer/import?progress=1&overwrite=true` | POST | ✅ (ZIP 本文、検証・作品数・取り込み結果を NDJSON で返す) |
 
 ZIP の書式 (`manifest.json` のスキーマ・検証ルール・衝突規則・挿絵の扱い) は
 [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md) を参照。
+
+オプションの「選択した作品をダウンロード」「小説データをアップロード」は進捗付き API を使う。
+ダウンロードは選択した複数作品を **1 個の ZIP** にまとめ、作品数と受信量を表示する。
+アップロードは **1 個の ZIP 内の複数作品** が対象で、送信量・検証・取り込み件数を表示する。
+サーバーでの書き出しは 1 ファイルずつ圧縮する。完成した ZIP はブラウザで受信後に保存へ渡すため、
+画面の完了表示は受信完了を意味し、ディスクへの保存結果はブラウザのダウンロード一覧で確認する。
+
+進捗応答は `application/x-ndjson`。各行は次の JSON オブジェクト:
+
+| `type` | 内容 |
+|---|---|
+| `progress` | `phase` (`export` / `validate` / `import`)、`completed`、`total`、処理中の `title` (省略可) |
+| `data` | ZIP の一部を Base64 にした `data` (書き出しのみ) |
+| `complete` | 書き出しは `filename` / ZIP の `bytes`、取り込みは従来の結果オブジェクトを `result` に持つ |
+| `error` | `message`。この後に完了フレームは返さない |
+
+HTTP エラー・エラーフレーム・完了フレームの無い切断は失敗として画面に残す。
+「通信を中止」はクライアントの通信を中止する操作で、取り込み済み作品は保持する。
+取り込みは ZIP 全体の検証後に作品単位で書き込むため、中止後は一覧で結果を確認する。
+`progress` を指定しない従来の ZIP / JSON 応答と CLI は変更しない。
 
 ### 6.2 ダウンロード・更新・変換
 

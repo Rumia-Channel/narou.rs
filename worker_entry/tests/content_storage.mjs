@@ -25,6 +25,8 @@ let sourceSubtitle = '第一話';
 let sourceImageCount = 0;
 let sourceEpisodeCount = 1;
 let sourcePause = null;
+let sourceBodyDelay = 0;
+let sourceTimings = null;
 const imageRequests = new Map();
 const sourceRequests = new Map();
 const imageContinuations = [];
@@ -42,6 +44,11 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://127.0.0.1');
     const key = decodeURIComponent(url.pathname);
+    if (sourceTimings && key.startsWith('/smoke-novel/')) {
+      const timing = { path: key, started: performance.now(), finished: null };
+      sourceTimings.push(timing);
+      res.once('finish', () => { timing.finished = performance.now(); });
+    }
     if (req.method === 'GET' && key === '/smoke-long/') {
       const page = Number(url.searchParams.get('p') ?? 1);
       const pageCount = Math.ceil(longEpisodeCount / 100);
@@ -77,6 +84,10 @@ const server = http.createServer(async (req, res) => {
       sourceRequests.set(key, (sourceRequests.get(key) ?? 0) + 1);
       if (sourcePause) await sourcePause(key);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      if (sourceBodyDelay) {
+        res.flushHeaders();
+        await new Promise((resolve) => setTimeout(resolve, sourceBodyDelay));
+      }
       const images = Array.from({ length: sourceImageCount }, (_, i) => `<img src="http://localhost:${server.address().port}/smoke-image/${i}.png" />`).join('');
       res.end(`<div class="body"><p>${(sourceGeneration === 1 ? '初回取得の本文です。' : sourceGeneration === 2 ? '更新後の本文です。' : '失敗する更新の本文です。').repeat(100)}</p>${images}</div>`);
       return;
@@ -439,6 +450,7 @@ min_interval: 0.01
     if (legacy) sql(legacyFixtureSql);
     failPut = false; sourceGeneration = 1; sourceSubtitle = '第一話';
     sourceEpisodeCount = 1; sourceImageCount = 0; sourcePause = null;
+    sourceBodyDelay = 0; sourceTimings = null;
     await start();
   }
   async function installDefaultSource() {
@@ -458,6 +470,21 @@ min_interval: 0.01
     assert.equal(response.status, 200, await response.clone().text());
     assert(epubText(Buffer.from(await response.arrayBuffer())).includes('初回取得の本文です。'));
     return id;
+  }
+
+  await defaultLibrary('completion-pacing');
+  sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0.4','0.4'),('local','download.wait-steps','0','0');");
+  sourceEpisodeCount = 3; sourceBodyDelay = 650; sourceTimings = [];
+  await installDefaultSource();
+  await download(target, false);
+  const pacedEpisodes = sourceTimings.filter((timing) => /^\/smoke-novel\/\d+\/$/.test(timing.path));
+  assert.deepEqual(pacedEpisodes.map((timing) => timing.path), ['/smoke-novel/1/', '/smoke-novel/2/', '/smoke-novel/3/']);
+  for (let index = 1; index < pacedEpisodes.length; index++) {
+    const previous = pacedEpisodes[index - 1], current = pacedEpisodes[index];
+    assert.notEqual(previous.finished, null);
+    const gap = current.started - previous.finished;
+    assert(gap >= 395, `Worker completion-to-next-start gap was ${gap} ms: ${previous.path} -> ${current.path}`);
+    console.log(`PASS Worker response completion -> next request: ${gap.toFixed(1)} ms (configured 400 ms, body 650 ms)`);
   }
 
   await defaultLibrary('fresh');

@@ -746,7 +746,7 @@ fn is_reserved_device_name(stem: &str) -> bool {
 
 /// Rejects a novel that contains both `a` and `a/b`: extracting such an
 /// archive would require `a` to be a file and a directory at the same time.
-fn reject_file_directory_conflicts<'a>(
+pub(crate) fn reject_file_directory_conflicts<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     novel_index: usize,
 ) -> Result<()> {

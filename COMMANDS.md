@@ -188,6 +188,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - カクヨムネクスト (`webnovel/kakuyomu.jp.yaml`, version 2.6) は目次の `EmptyEpisode` を `login_partial_pattern` で検出し、保存済みログインを順に試す。制限が残れば取得範囲を警告して無料分だけを取得し、後から閲覧権のある Cookie を保存して更新すると残りも取得できる。採用したセッションは本文取得と次回更新でも使い、通常の公開作品には Cookie を送らない。本文 URL が作品トップ等へ戻され、本文枠が無い場合も DSL で失敗させ、空本文をキャッシュ・保存しない。サイト固有の判定は YAML / DSL に置く
 - 部分一覧に保存済みの話が欠ける場合は、既定では話の削除やダイジェスト化とは判定せず `Canceled` で更新を見送り、目次・本文を保持する（force 時も同じ）。サイト定義の `preserve_missing_sections: true`（Pixiv・カクヨムで有効）は、話番号と URL の同一性を確認できる保存済み本文を保持しながら、閲覧できる話を更新・追加する。対応が曖昧な場合は従来どおり見送る。閲覧できる話が 0 件なら部分一覧の目印の有無によらず保存ログインを試し、それでも 0 件なら登録・本文更新・自動変換をせず、既存データと未使用 ID を保持する。
 - サイト定義の `min_interval:` でサイトごとの最低リクエスト間隔 (秒) の下限を宣言でき、該当サイトのレートリミットスコープにだけ適用される
+- HTTP の待機は Native / Worker とも、本文の受信完了または通信失敗から次の取得開始まで確保する。`download.interval`・`min_interval`・`download.wait-steps` の長待機に通信時間を含めず、リダイレクト・通信手段の切替にも適用する。Worker は完了時刻を Durable Object に保存し、ジョブ再開・別作品の取得でも待機状態を引き継ぐ。作品間の `update.interval` は従来の開始基準を維持する。
 - 全作品を `小説` / `漫画` のいずれかに分類し、通常タグとは別の `attribute_tag` に保存する。サイト定義の `work_type_rules:` に `field`・正規表現 `match`・`type: novel|manga` を指定し、最初に一致した規則を採用する。定義なし・未一致は小説。判定対象は `ncode` / `title` / `author` / `url` (取得用 `toc_url`) / `novel_type` (連載 `1`・短編 `2`) / `episode_count` / `source` (前処理済み最初の目次ページ) から明示する。Pixiv だけは ncode が `a` / `c` なら漫画に分類する（`a` にはイラストとうごイラも含む）。サイト固有の分類処理は `preprocess:` DSL で記述できる。
 
   ```yaml
@@ -383,7 +384,9 @@ narou author remove 1
 - ZIP: `manifest.json` + `novels/<index>/...`。作品メタデータ（`toc_url` / title / author / sitename / domain / tags / novel_type / ncode）と各ファイルのサイズ・SHA-256 を manifest に記録する。
 - 安全策: パストラバーサル・absolute path・重複パス・サイズ/エントリ上限・zip bomb を共通コアで拒否。上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。`sqlite.mirror-files=false` のライブラリへの import は fail closed。
 - Web API: `GET /api/transfer/export?ids=1,2` は ZIP、`POST /api/transfer/import[?overwrite=true]` は ZIP 本文を受け取り `{success, created, overwritten, skipped, errors}` を返す。既存の Web 認証ミドルウェア配下。
-- 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が同じ build/parse/plan を呼ぶ。
+- Web UI は両 API の `progress=1` を使い、作品数・転送量・検証／取り込み状況・エラーをモーダル表示する。書き出しは本文を 1 ファイルずつ圧縮・送信し、選択した複数作品を 1 個の ZIP にまとめる。取り込みは ZIP 1 個を選び、その中の複数作品を処理する。
+- 進捗応答は NDJSON (`progress` / `data` / `complete` / `error`)。完了フレームの無い切断を成功扱いせず、ブラウザでの保存完了はダウンロード一覧で確認する。通信中止は取り込み済み作品を巻き戻さない。詳細は `WEBUI.md` §6.1b。
+- 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が生成・検証・取り込み計画を共有する。
 - **書式 (ZIP の中身) の詳細は [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md)** を参照 (`manifest.json` のスキーマ・検証ルール・衝突規則・同梱するファイル・挿絵の扱い)。
 
 ### 3.x-hidden `hidden` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
@@ -859,7 +862,7 @@ narou setting name         # 読み取り
 - 並列取得の進捗は操作 ID と更新番号で分離し、完了・再試行・再接続でも他の進行中操作を上書き／消去しない。Worker の出力・詳細ログもジョブごとの文脈で配信する。
 - 目次の総ページ数が不明な場合は、探索上限を分母にせず不定進捗と確認済みページ数を表示する。総数のないページ送りは次ページが無くなるか既訪問 URL に戻るまで辿り、50 ページで打ち切らない。本文などの確定した進捗は完了件数を作品名より先に表示し、取得中の話番号と区別する。
 - native は毎回の実行開始を通知する。再試行や Worker の lease 回収で開始通知を受けたときは、同じジョブの旧操作だけを破棄して新しい進捗を受理する。Worker の継続実行は前回の終了通知を送ってから再投入し、中断 API 自身も進捗を消去するため、終了通知を送れない orphan のバーを再接続で復活させない。
-- `download.interval` / `download.wait-steps` は実際の HTTP 送信ごとに、サイト定義の `min_interval` とともに適用する。リダイレクトと通信手段の切替も待機を省略せず、Worker では待機中も設定スナップショットの有効期限までに再確認する。
+- `download.interval` / `download.wait-steps` は実際の HTTP 送信ごとに、サイト定義の `min_interval` とともに適用する。本文受信完了・通信失敗から次の送信まで待機を確保し、リダイレクトと通信手段の切替も待機を省略しない。Worker は完了後の状態を Durable Object に保存し、待機中も設定スナップショットの有効期限までに再確認する。
 - グローバル設定は変更項目だけを初期値照合付きで保存する。整数表記になる浮動小数値も設定メタデータで照合し、実際に競合した変更は拒否する。個別 INI の更新はファイル・SQLite・D1 の原子的更新を通し、同時変更された別項目と未知項目を保持する。
 - `webui.tag-sort-order` は設定保存時の `webui.config.reload` と Native の 30 秒 watcher の監視対象に含める。開いているメイン画面は並び順の変更を検知してタグ一覧を再取得し、セレクトの値だけ更新して旧順序を残さない。設定画面・CLI・メインメニューの各経路を Native の YAML / SQLite 管理で確認する（issue #46）。
 - コンソール履歴の取得応答は表示世代で照合し、履歴削除や新しい行より古い応答で表示を巻き戻さない。コンソール操作と真偽値設定はキーボード操作に対応する。狭い画面の操作バーは折り返し、メニューを操作ボタンの下へ表示する。

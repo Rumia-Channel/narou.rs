@@ -9,7 +9,7 @@ use futures::lock::Mutex;
 use narou_rs::application::settings::SettingsStore;
 use narou_rs::platform::rate_limiter::{
     DownloadPacing, PacingSchedule, PacingState, duration_millis_ceil,
-    setting_update_interval_secs, try_acquire,
+    setting_update_interval_secs, try_acquire, complete_request,
 };
 use narou_rs::setting_core::SettingScope;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,7 @@ const LEGACY_QUEUE_LIFETIME_MS: u64 = 15 * 60 * 1_000;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PermitRequest {
     Http { narou: bool, min_interval_ms: u64 },
+    HttpComplete { narou: bool, min_interval_ms: u64 },
     WorkStart,
 }
 
@@ -83,7 +84,8 @@ impl DurableObject for SiteRateLimiter {
         let snapshot = inner.settings.as_ref().expect("loaded pacing settings");
         let settings_expire_ms = snapshot.read_at_ms.saturating_add(PACING_REFRESH_TTL_MS);
         let schedule = match permit {
-            PermitRequest::Http { narou, min_interval_ms } => {
+            PermitRequest::Http { narou, min_interval_ms }
+            | PermitRequest::HttpComplete { narou, min_interval_ms } => {
                 PacingSchedule::from_scoped(&snapshot.download.for_site(
                     narou, Some(Duration::from_millis(min_interval_ms)),
                 ))
@@ -114,7 +116,13 @@ impl DurableObject for SiteRateLimiter {
             }
         };
         let acquired_at_ms = js_sys::Date::now() as u64;
-        let decision = try_acquire(&mut grants, acquired_at_ms, schedule);
+        let decision = if matches!(permit, PermitRequest::HttpComplete { .. }) {
+            grants.schedule = Some(schedule);
+            complete_request(&mut grants, acquired_at_ms);
+            narou_rs::platform::rate_limiter::PacingDecision::Granted
+        } else {
+            try_acquire(&mut grants, acquired_at_ms, schedule)
+        };
         if inner.grants != Some(grants) {
             let encoded = serde_json::to_string(&grants)
                 .map_err(|error| Error::RustError(error.to_string()))?;

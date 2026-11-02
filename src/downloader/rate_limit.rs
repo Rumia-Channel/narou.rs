@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::platform::rate_limiter::{
-    DownloadPacing, PacingDecision, PacingSchedule, PacingState, try_acquire,
+    DownloadPacing, PacingDecision, PacingSchedule, PacingState, try_acquire, complete_request,
 };
 use crate::platform::RateLimitScope;
 
@@ -70,6 +70,18 @@ impl crate::platform::RateLimiter for RateLimiter {
                     }
                 }
             }
+        })
+    }
+
+    fn complete<'a>(
+        &'a self,
+        scope: &'a RateLimitScope,
+    ) -> futures::future::BoxFuture<'a, crate::error::Result<()>> {
+        Box::pin(async move {
+            if let Some(state) = STATE.lock().get_mut(&scope.site) {
+                complete_request(state, monotonic_ms());
+            }
+            Ok(())
         })
     }
 }

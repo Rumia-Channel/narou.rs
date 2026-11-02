@@ -301,7 +301,7 @@ pub trait NovelRepository: PlatformService {
 | 実装 | ファイル | 内容 |
 |---|---|---|
 | `NativeHttpClient` | `src/native/http.rs` | `HttpClient` trait。3-tier（curl→reqwest→wget）・redirect・UA・cookie を維持し、blocking transport は `spawn_blocking` へ隔離 |
-| `RateLimiter` | `src/downloader/rate_limit.rs` | `platform::RateLimiter::acquire` を実装。なろう系の既定 wait-steps も維持 |
+| `RateLimiter` | `src/downloader/rate_limit.rs` | `platform::RateLimiter::acquire` / `complete` を実装。本文受信完了・通信失敗から次の許可まで待機し、なろう系の既定 wait-steps も維持 |
 | `NativeNovelRepository` | `src/native/novel_repository.rs` | stateless adapter。`db::DATABASE` 内の単一 `Database` を共有し、YAML を二重ロードしない。async trait は runtime 内で `spawn_blocking`、CLI は `_sync` entry point を使う |
 
 `NativeNovelRepository` の record 操作は `get` / `find_*` / `count` / `query` / `scan_ids` / `allocate_id` / `release_id` / `apply_batch` に限定する。`IndexStore` の toc URL・タイトル索引は既存 `Database` 経由で維持する。`apply_batch` は一回の `database.yaml` 更新と index flush を行い、unknown fields、`raw_title`、nilable bool、日時型をそのまま保存する。
@@ -448,7 +448,7 @@ Worker (worker_entry)
 - D1のjob ledgerをsource of truthとし、enqueue前にidempotency keyを確定する。`pending` / `running` / `succeeded` / `retryable` / `partial` / `permanent` / `blocked` を永続化し、再配信はledger遷移で冪等化する。
 - Queue consumerは、成功またはledgerへ永続化した恒久失敗・blockedだけをackする。一時失敗はbounded retryへ送り、未知のenvelope version・未対応JobKind・認証必須サイトは成功扱いにしない。
 - `running` leaseの有効期限内に同じjobが再配信された場合は`Busy { retry_after }`として明示的に遅延再配信し、ackしない。DLQはruntimeの運用経路であり、通常consumerが直接drainしない。
-- 同一サイトの取得間隔はサイト単位のDurable Objectへ集約する。DO内でpermit timestampを予約し、caller側が`worker::Delay`で待機する。`SiteRateLimiter`自身はalarmを使用しない。別サイトのpermitは独立して進める。
+- 同一サイトの取得間隔はサイト単位の Durable Object へ集約する。実際の送信前に許可を確認し、本文の受信完了・通信失敗後に `RateLimiter::complete` で次回許可時刻を更新・保存する。caller は `worker::Delay` 後に再確認し、通信時間を待機時間に含めない。`SiteRateLimiter` 自身は alarm を使用しない。別サイトの許可と作品間の開始基準の `update.interval` は独立して進める。
 - Cronはplannerに限定し、D1をbounded pageで走査して個別Update jobをenqueueする。Cron発火時刻をgenerationとして保存せず、D1が管理する論理generationとkeyset cursorをplanner lease付きで再開する。
 - Worker crawler は話の開始前と未取得画像の直前で実行予算を確認する。画像取得中の中断では挿絵索引を保存し、section 単位の checkpoint は未完了の話を指す。次回 claim 時に checkpoint の job/novel identity を検証し、完了した話の prefix を ObjectStore から復元する。同じ話の保存済み画像は索引で読み飛ばして残りを取得する。prefix が欠損する場合は section 0 から安全に再開する。
 - Budget による話・画像境界の yield は失敗 retry ではない。checkpoint を D1 へ保存して job を `pending` へ戻し、同じ job の新しい v2 envelope を Queue へ送信し、送信成功後に現在 message を ack する。正常経路では `attempts` と Queue retry 回数を消費しない。送信後 ack 前のクラッシュは通常の再配信に任せ、lease/dedupe で二重実行を防ぐ。
@@ -475,10 +475,12 @@ Worker (worker_entry)
   に確定する。これにより UI の「待機中」は常に「再試行または終端確定が
   予定されている」状態と一致する。
 - Worker のサイト単位 rate limiter は Durable Object 1 instance をサイトごとに
-  使用する。DO内でpermit timestampを予約し、callerが`worker::Delay`で待機する。
-  `SiteRateLimiter`はalarmを使わない。設定の `download.interval` /
-  `download.wait-steps` は native downloader の既定値として保持し、Worker は
-  DO の permit を crawler の唯一の待機境界として利用する。
+  使用する。`acquire` の許可後、実 HTTP 試行の本文受信完了・失敗で `complete`
+  を通知し、次回許可までの間隔を完了時点から計算する。リダイレクトと
+  Fetch / socket / relay の切替も試行ごとにこの境界を通り、完了通知の保存に
+  失敗した場合は次の送信へ進めない。`SiteRateLimiter` は alarm を使わず、
+  caller が `worker::Delay` 後に再確認する。設定の `download.interval` /
+  `download.wait-steps` とサイトの `min_interval` は native と同じ規則を使う。
 - Worker の `Downloader` は `DownloaderSettings` を Inventory から読めないため、
   `with_platform_and_storage_and_settings` に bundled site definitions と空の
   hash cache を注入する。`download.use-subdirectory`、`guard-spoiler` などの

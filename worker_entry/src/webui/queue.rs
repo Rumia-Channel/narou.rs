@@ -120,7 +120,7 @@ struct TagName {
 
 async fn select_tag_names(db: &DbHandle) -> Result<Vec<TagName>> {
     let result = db.prepare(TAG_NAMES_SQL).all().await?;
-    Ok(result.results::<TagName>()?)
+    result.results::<TagName>()
 }
 
 async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
