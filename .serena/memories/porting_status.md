@@ -1,5 +1,11 @@
 # narou.rs 移植状況
 
+## 現況（v0.5.8 リリース準備）
+
+ユーザーが『バージョンを上げよう』と明示指示したため、原因未確定を明記した上で、承認済みの v0.5.8 の公開を進める。GitHub最新公開版は v0.5.7 と確認済み。clean / originと同じdevelopから `release-0-5-8` を作成し、本体・Worker・relay・transfer_wasmのpackage.versionだけを0.5.8へ変更（依存更新なし）。標準Cargoにset-versionが無いため版数フィールドの手編集を例外として実施。VERSION.mdの未リリース節をv0.5.8へ切替え、停止現象の原因未確定・解消を保証しない旨を明記した。両lockとライセンス表記を同期済み（差分は自作4パッケージの版数だけ、依存更新なし）。cargo check / about-probe check / 両cargo-about生成 / workspace all-targets all-features Clippy -D warnings / cargo test --workspace / Native全bin buildは成功。実binのversion --moreで0.5.8を確認した。Native実HTTPの158作品転送、CLIの書出し・取込みも成功。Worker wasm Clippy -D warnings / worker-build --release（wasm-opt含む）/ 実workerd transfer契約も成功し、158作品・本文77MiBのZIPと全hash、進捗、取込み、異常終了を再確認した。テスト時のMSVC DLLリンク案内とNode既存DEP0190警告は出たが、Clippyゲートとテストは成功。公開はまだこれから。
+
+承認済みの本番診断ログ設定は維持する。配備前のscript-settingsとdeploymentを `sample/worker-diagnostics/production-pre-release-058.json` へ保存した。コード配備後もobservabilityが無効にならないことをAPIで照合し、必要なら承認済み値だけを再適用する。以前の戻し用observability=nullは別ファイルで保持する。原因調査自体を完了扱いにせず、今回のユーザー指示で公開保留を解除したものとして扱う。
+
 ## 現況（2026-11-02、ZIP 転送の進捗・リリース保留）
 
 最新追記（2026-11-02、本番観測とログ保存）: ユーザーは追加認証の質問へ「wrangler で login した」と回答。追加トークンを要求せず、その認証で `wrangler tail` の記録へ進めた。Cloudflare側の保存設定は有効なまま維持するが、保存ログ検索APIの取得成功とは混同しない。`sample/worker-diagnostics/`（gitignore）へ機密情報を落とした実ログを保存。`narou-rs-20261102T125332Z.log` は95秒で83 invocation、`narou-rs-20261102T130112Z.ndjson` は75秒で49 invocation・Queue 1件・非ok 0件。後者の実イベントを全件JSON解析し、ヘッダー/本文を含まずURL query/fragment/userinfoも無いこと、capture_endの件数が一致することを確認した。追加採取 `capture.py --seconds 1500` は終了した（常時収集中ではない）。`narou-rs-20261102T130910Z.ndjson` に25分・1019 invocation・Queue 12件（download 7 / convert 5）を保存し、全件のoutcome=ok・未処理例外なしを確認。D1上のドメインエラーも別途確認し、2件はstatus=blockedだった。Pixivの新規シリーズ733322と689885について、保存済みログインでの再試行後、警告側コンソール `/api/history?format=json&stream=stdout2` に『閲覧できる話が無いため、取得を見送ります』が2件残っていた。主コンソールは『マイピク』『マイピク　森』のキャンセル後に別作品の取得・完了へ進んでいる。これはWorker全体の停止ではなく個別の閲覧可能話0件による見送り。マイピク権限なのか別のアクセス条件なのかまでは未検証で、Cookieを更新すれば必ず直るとは案内しない。global over18はtrue、対象の保存済みnovelレコードは無い。Queueのoutcome=okだけでアプリケーションの成功と見なさないこと。証拠は `capture-summary.json` と `blocked-series-evidence.json`、採取後のD1読取はpending2055/running1で全件pixiv.net。以前の約17分の空白は今回再発しておらず、その原因を確定した扱いにはしない。v0.5.8公開はユーザー判断どおり保留。Cloudflare側の保存設定は有効なまま、クラウド保存ログ検索はOAuth権限不足で未確認だが、Wrangler取得分の実ファイル保存は確認済み。記録器は時間で終了し、Queueの異常outcome/例外を捕まえた場合は記録して早期終了する。
