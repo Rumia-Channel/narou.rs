@@ -2,6 +2,10 @@
 
 ## 現況（2026-11-02、ZIP 転送の進捗・リリース保留）
 
+追加判断: ユーザーは「ログを保存して調査継続」を選択し、原因特定まで公開を保留する方針を再確認した。develop b913080 の CI 41331310090 は全ジョブ成功し、develop Worker 配備も成功。本番へのコード配備は無し。承認に基づき Cloudflare の `PATCH /accounts/{account}/workers/scripts/narou-rs/script-settings` で observability だけを一時変更した。実効値は enabled=true、logs.enabled=true、invocation_logs=true、persist=true、head_sampling_rate=1、redact_query_string=true（traces.enabled=false）。変更前は observability=null。`target/production-observability-before.json` に戻し用の設定を保存し、既存23 bindings・active deployments/code version・logpush・tags・tail_consumers が変わらないことをAPIで確認した。調査終了後は保存した元の observability 値へ戻す（ログ保存は一時的な承認）。既存設定・秘密値・ジョブは削除していない。
+
+保存ログの検索API `POST /workers/observability/telemetry/query` は有効化後も403 Forbiddenで、必要権限は Workers Observability Write。Wrangler OAuth の提供scopeに専用のObservability権限は無く、環境変数 CLOUDFLARE_API_TOKEN も未設定。設定が有効なことと実ログが検索できたことを混同しない。確認用に認証済み本番HTMLページから `/health/live?diagnostic_probe=log-persistence` を取得し200を確認したが、保存されたイベントの取得は追加認証待ち。Firefoxはheadedで、Cloudflareダッシュボードの本番Observability画面を開いたが /login のセキュリティ検証へ遷移している。API token値・Cookie・OAuth値はチャットへ出していない。
+
 公開済みの最新は v0.5.7。ユーザーは次の版 v0.5.8 を明示承認したが、本番 Workers の停滞理由を解明してから公開する指示があるため、まだ番号更新・main 統合・タグ作成はしていない。取得完了後からの待機修正は develop の b071647（実装 78ae4d7）へ統合済み。
 
 `fix-transfer-progress` で Web UI の ZIP 転送を変更。共通 `transfer::ArchiveStream` が 1 ファイルずつ ZIP を生成し、Native / Worker の `/api/transfer/export?progress=1` は NDJSON の data / progress / complete / error を返す。従来の ZIP 形式 v1 と progress 無しの API / CLI は維持する。import の progress=1 は送信量・検証・作品数・結果を表示し、キャンセルは取り込み済み作品を巻き戻さない。新しい UI は `src/web/assets/js/ui/transfer.js`、Native の配信表も追加済み。COMMANDS.md / WEBUI.md / VERSION.md 未リリース / ZIP 形式資料を同期。既存実装が全本文と完成 ZIP を一括保持することはソースで確認したが、報告画像そのものの失敗理由を OOM と断定していない。
