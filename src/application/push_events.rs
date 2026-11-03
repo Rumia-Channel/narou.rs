@@ -251,6 +251,26 @@ impl ProgressReplay {
         self.active.values()
     }
 
+    /// Remove only unchanged snapshots whose jobs were confirmed terminal.
+    /// A new attempt or newer progress received during the status read survives.
+    pub fn discard_terminal_snapshots(
+        &mut self, snapshots: &[Value], terminal_scopes: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let mut changed = false;
+        for snapshot in snapshots {
+            let Some(scope) = snapshot["data"]["scope"].as_str().filter(|scope| !scope.is_empty()) else { continue; };
+            if !terminal_scopes.contains(scope) { continue; }
+            let key = progress_key(snapshot);
+            if self.active.get(&key) != Some(snapshot) { continue; }
+            self.active.remove(&key);
+            if snapshot["data"]["operation"].as_str().is_some_and(|operation| !operation.is_empty()) {
+                remember_completion(&mut self.closed_operations, key);
+            }
+            changed = true;
+        }
+        changed
+    }
+
     /// Stale packets cannot rewind or revive a finished job/attempt.
     /// The return value tells persistent adapters whether anything changed.
     pub fn observe(&mut self, value: Value) -> bool {
@@ -424,6 +444,37 @@ mod progress_tests {
         let mut restored: ProgressReplay = serde_json::from_str(&serde_json::to_string(&replay).unwrap()).unwrap();
         assert_eq!(restored.snapshots().count(), 0);
         assert!(!restored.observe(step("job", "running", 3, 2)));
+    }
+
+    #[test]
+    fn terminal_reconciliation_preserves_peers_manual_progress_and_persistent_fences() {
+        let mut replay = ProgressReplay::default();
+        replay.observe(step("finished", "old", 2, 1));
+        replay.observe(step("running", "peer", 3, 1));
+        replay.observe(event("progressbar.step", json!({"topic":"manual","percent":40})));
+        let snapshots = replay.snapshots().cloned().collect::<Vec<_>>();
+        let terminal = ["finished".to_owned()].into_iter().collect();
+        assert!(replay.discard_terminal_snapshots(&snapshots, &terminal));
+        let mut restored: ProgressReplay = serde_json::from_str(&serde_json::to_string(&replay).unwrap()).unwrap();
+        assert_eq!(restored.snapshots().map(|value| value["data"]["scope"].as_str()).collect::<Vec<_>>(), vec![None, Some("running")]);
+        assert!(!restored.observe(step("finished", "old", 4, 2)));
+        restored.observe(queue_start("finished"));
+        assert!(restored.observe(step("finished", "new", 1, 1)));
+    }
+
+    #[test]
+    fn terminal_reconciliation_cannot_remove_progress_changed_during_status_read() {
+        let mut replay = ProgressReplay::default();
+        replay.observe(step("job", "old", 2, 1));
+        let snapshots = replay.snapshots().cloned().collect::<Vec<_>>();
+        let terminal = ["job".to_owned()].into_iter().collect();
+        replay.observe(step("job", "old", 3, 2));
+        assert!(!replay.discard_terminal_snapshots(&snapshots, &terminal));
+        assert_eq!(replay.snapshots().next().unwrap()["data"]["current"], 3);
+        replay.observe(queue_start("job"));
+        replay.observe(step("job", "new", 1, 1));
+        assert!(!replay.discard_terminal_snapshots(&snapshots, &terminal));
+        assert!(replay.observe(step("job", "new", 2, 2)));
     }
 
 }

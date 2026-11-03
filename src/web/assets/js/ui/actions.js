@@ -2926,6 +2926,12 @@ function runRefresh(key, action) {
   return work.promise;
 }
 
+let queueStatusObserver = null;
+
+export function setQueueStatusObserver(observer) {
+  queueStatusObserver = observer;
+}
+
 export async function refreshList(redraw = true) {
   ++listRefreshGeneration;
   return runRefresh('list', async () => {
@@ -2946,10 +2952,13 @@ export async function refreshList(redraw = true) {
 export async function refreshQueue() {
   return runRefresh('queue', async () => {
     try {
+      const observer = queueStatusObserver;
+      const observation = observer?.before();
       const data = await fetchJson('/api/queue/status');
       if (data) {
         State.queueStatus = data;
         renderQueueStatus();
+        observer?.after(data, observation);
         return data;
       }
     } catch { /* keep the last successfully loaded status */ }
