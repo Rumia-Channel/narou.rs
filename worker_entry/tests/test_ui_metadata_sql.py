@@ -30,28 +30,30 @@ class UiMetadataSqlTests(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
-            CREATE TABLE novels (id INTEGER PRIMARY KEY, title TEXT, extra_fields_json TEXT);
+            CREATE TABLE novels (id INTEGER PRIMARY KEY, title TEXT, extra_fields_json TEXT, attribute_tag TEXT);
             CREATE TABLE novel_tags (
                 novel_id INTEGER NOT NULL, tag TEXT NOT NULL, position INTEGER NOT NULL,
                 UNIQUE(novel_id, tag)
             );
             CREATE TABLE worker_jobs (
                 job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL,
-                options TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
+                options TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, last_error TEXT
             );
             CREATE INDEX jobs_status ON worker_jobs(status);
         """)
 
     def insert_job(self, job_id, kind, status, *, target="1", options="[]", at="2026-10-03T00:00:00Z"):
-        self.db.execute("INSERT INTO worker_jobs VALUES (?, ?, ?, ?, ?, ?)",
+        self.db.execute("INSERT INTO worker_jobs(job_id,kind,target,options,status,created_at) VALUES (?, ?, ?, ?, ?, ?)",
                         (job_id, kind, target, options, status, at))
 
     def query(self, name, params=None):
         self.assertIn(name, SQL, "test must use the production SQL, not a copied query")
         if params is None:
-            # Keyset paging takes an empty cursor (start of the queue) and a
-            # page limit; the other queries take no binds.
-            params = ("", "", "", 1000) if "?" in SQL[name] else ()
+            if name == "QUEUE_COUNTS_SQL":
+                params = ("cancelled by user via Web UI", "queue cleared by user via Web UI",
+                          "removed from queue by user via Web UI")
+            else:
+                params = ("", "", "", 1000) if "?" in SQL[name] else ()
         return [dict(row) for row in self.db.execute(SQL[name], params)]
 
     def test_empty_library_and_queue(self):
@@ -99,7 +101,7 @@ class UiMetadataSqlTests(unittest.TestCase):
         values = {1: ["冒険", "SF", "sf", "", '<script>'], 2: ["冒険", "SF"], 3: ["冒険"]}
         counts = Counter()
         for novel_id, tags in values.items():
-            self.db.execute("INSERT INTO novels VALUES (?, ?, ?)", (novel_id, "not transferred", "x" * 20000))
+            self.db.execute("INSERT INTO novels(id,title,extra_fields_json) VALUES (?, ?, ?)", (novel_id, "not transferred", "x" * 20000))
             for position, tag in enumerate(tags):
                 self.db.execute("INSERT INTO novel_tags VALUES (?, ?, ?)", (novel_id, tag, position))
                 counts[tag] += 1
@@ -107,11 +109,11 @@ class UiMetadataSqlTests(unittest.TestCase):
         self.db.execute("INSERT INTO novel_tags VALUES (999, 'orphan', 0)")
         rows = self.query("TAG_NAMES_SQL")
         self.assertEqual([r["tag"] for r in rows], sorted(counts, key=lambda t: (-counts[t], t)))
-        self.assertTrue(all(set(row) == {"tag"} for row in rows))
+        self.assertEqual({r["tag"]: r["n"] for r in rows}, dict(counts))
 
     def test_large_pending_queue_returns_counts_not_payloads(self):
         count = 10000
-        self.db.executemany("INSERT INTO worker_jobs VALUES (?, 'update', '1', ?, 'pending', '2026-10-03T00:00:00Z')",
+        self.db.executemany("INSERT INTO worker_jobs(job_id,kind,target,options,status,created_at) VALUES (?, 'update', '1', ?, 'pending', '2026-10-03T00:00:00Z')",
                             ((f"job-{i}", '["' + "x" * 512 + '"]') for i in range(count)))
         self.assertEqual(self.query("QUEUE_COUNTS_SQL"), [{"status": "pending", "lane": 0, "n": count}])
         self.assertEqual(self.query("LANE_COUNTS_SQL"), [{"lane": 0, "n": count}])

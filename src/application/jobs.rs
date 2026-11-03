@@ -403,6 +403,8 @@ pub mod worker_ledger {
 
     /// Wake at most one acquisition per free site, plus independently eligible
     /// converts. The cron also uses this query after a lost completion/dispatch.
+    /// Materialize physical owners once: probing the historical permanent rows
+    /// inside every candidate's correlated subquery makes dispatch quadratic.
     pub fn select_waiting(now: &str, limit: usize) -> Statement {
         let candidate_target = "COALESCE(candidate.normalized_target, candidate.target)";
         let other_target = "COALESCE(other.normalized_target, other.target)";
@@ -410,7 +412,10 @@ pub mod worker_ledger {
         let other_id = novel_id_expression(other_target);
         Statement {
             sql: format!(
-                "SELECT job_id, kind FROM ( \
+                "WITH owners AS MATERIALIZED ( \
+                   SELECT other.job_id, other.kind, other.site_key, other.target, other.normalized_target \
+                   FROM worker_jobs AS other WHERE {OWNER} \
+                 ) SELECT job_id, kind FROM ( \
                    SELECT candidate.job_id, candidate.kind, candidate.created_at, \
                      ROW_NUMBER() OVER (PARTITION BY candidate.site_key, \
                        CASE WHEN candidate.site_key IS NULL THEN candidate.job_id ELSE '' END \
@@ -419,8 +424,8 @@ pub mod worker_ledger {
                    WHERE candidate.admission_waiting = 1 \
                      AND candidate.status IN ('pending', 'retryable') \
                      AND (candidate.lease_until IS NULL OR candidate.lease_until <= ?) \
-                     AND NOT EXISTS (SELECT 1 FROM worker_jobs AS other \
-                       WHERE {OWNER} AND other.job_id != candidate.job_id AND ( \
+                     AND NOT EXISTS (SELECT 1 FROM owners AS other \
+                       WHERE other.job_id != candidate.job_id AND ( \
                          (candidate.site_key IS NOT NULL AND other.kind IN ('download', 'update', 'author_check') \
                            AND (other.site_key IS NULL OR other.site_key = candidate.site_key)) \
                          OR other.normalized_target IS NULL \
@@ -2461,6 +2466,35 @@ mod tests {
             assert_eq!(waiting(&conn), vec!["b1", "c2"]);
             conn.execute("UPDATE worker_jobs SET status = 'succeeded', execution_token = NULL, lease_until = NULL WHERE job_id = 'owner'", []).unwrap();
             assert_eq!(waiting(&conn), vec!["a1", "b1", "c1", "c2"]);
+        }
+
+        #[test]
+        fn waiting_dispatch_does_not_rescan_terminal_history_for_every_candidate() {
+            let conn = db();
+            conn.execute_batch(
+                "CREATE INDEX worker_jobs_status_idx ON worker_jobs(status, created_at);
+                 CREATE INDEX worker_jobs_admission_wait_idx ON worker_jobs(site_key, created_at, job_id)
+                     WHERE admission_waiting = 1;
+                 CREATE INDEX worker_jobs_site_owner_idx ON worker_jobs(site_key, kind, status)
+                     WHERE status = 'running' OR (status = 'permanent' AND execution_token IS NOT NULL);
+                 CREATE INDEX worker_jobs_execution_owner_idx ON worker_jobs(status, execution_token, lease_until);
+                 WITH RECURSIVE ids(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM ids WHERE i<30000)
+                 INSERT INTO worker_jobs(job_id,kind,target,status,dedupe_key,created_at,updated_at)
+                 SELECT 'history-'||i,'update','42','permanent','history-'||i,'old','old' FROM ids;
+                 WITH RECURSIVE ids(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM ids WHERE i<1000)
+                 INSERT INTO worker_jobs(job_id,kind,target,normalized_target,status,dedupe_key,
+                     created_at,updated_at,site_key,admission_waiting)
+                 SELECT printf('waiting-%04d',i),'update',CAST(i AS TEXT),CAST(i AS TEXT),
+                     'pending','waiting-'||i,'now','now','shared.example',1 FROM ids;",
+            ).unwrap();
+            let query = worker_ledger::select_waiting(NOW, 8);
+            let mut statement = conn.prepare(&query.sql).unwrap();
+            let jobs = statement.query_map(rusqlite::params_from_iter(query.binds.iter()),
+                |row| row.get::<_, String>(0)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(jobs, vec!["waiting-0001"]);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 100_000, "waiting dispatch used {steps} VM steps");
         }
 
         #[test]

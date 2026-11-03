@@ -89,6 +89,16 @@ impl SqliteNovelRepository {
 
 }
 
+// Snapshot persistence still visits all records, but unchanged rows must not
+// rewrite the novel, tag indexes and derived status on every single-field edit.
+static UPSERT_CHANGED_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let comparisons = crate::db::novel_codec::NOVEL_COLUMNS.iter()
+        .filter(|column| **column != "id")
+        .map(|column| format!("novels.{column} IS NOT excluded.{column}"))
+        .collect::<Vec<_>>().join(" OR ");
+    format!("{NOVEL_UPSERT_SQL} WHERE {comparisons}")
+});
+
 pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Result<()> {
     // A re-registered novel can receive the same tag from multiple sources.
     // Normalize before encoding tags_json/tags_sort as well as novel_tags, so
@@ -97,25 +107,24 @@ pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Res
     dedup_tags(&mut normalized.tags);
     let record = &normalized;
     let params = record_params(record)?;
-    conn.execute(NOVEL_UPSERT_SQL, params_from_iter(params.iter()))
-        .map_err(super::sqlite_error)?;
-    conn.execute(novel_query::DELETE_NOVEL_TAGS_SQL, [record.id])
-        .map_err(super::sqlite_error)?;
-    for (position, tag) in record.tags.iter().enumerate() {
-        conn.execute(
-            novel_query::INSERT_NOVEL_TAG_SQL,
-            rusqlite::params![record.id, position as i64, tag, fold(tag)],
-        )
-        .map_err(super::sqlite_error)?;
+    let changed = conn.prepare_cached(&UPSERT_CHANGED_SQL).map_err(super::sqlite_error)?
+        .execute(params_from_iter(params.iter())).map_err(super::sqlite_error)?;
+    if changed != 0 {
+        conn.prepare_cached(novel_query::DELETE_NOVEL_TAGS_SQL).map_err(super::sqlite_error)?
+            .execute([record.id]).map_err(super::sqlite_error)?;
+        let mut insert = conn.prepare_cached(novel_query::INSERT_NOVEL_TAG_SQL)
+            .map_err(super::sqlite_error)?;
+        for (position, tag) in record.tags.iter().enumerate() {
+            insert.execute(rusqlite::params![record.id, position as i64, tag, fold(tag)])
+                .map_err(super::sqlite_error)?;
+        }
+        refresh_status_sort(conn, record.id)?;
     }
-    refresh_status_sort(conn, record.id)?;
-    conn.execute(
-        novel_query::BUMP_SEQUENCE_SQL,
-        rusqlite::params![record.id.saturating_add(1), record.id.saturating_add(1)],
-    )
-    .map_err(super::sqlite_error)?;
-    conn.execute(novel_query::COMMIT_ID_RESERVATION_SQL, [record.id])
+    conn.prepare_cached(novel_query::BUMP_SEQUENCE_SQL).map_err(super::sqlite_error)?
+        .execute(rusqlite::params![record.id.saturating_add(1), record.id.saturating_add(1)])
         .map_err(super::sqlite_error)?;
+    conn.prepare_cached(novel_query::COMMIT_ID_RESERVATION_SQL).map_err(super::sqlite_error)?
+        .execute([record.id]).map_err(super::sqlite_error)?;
     Ok(())
 }
 
@@ -439,6 +448,58 @@ mod tests {
         sqlite.apply_batch(mutations.clone()).await.unwrap();
         memory.apply_batch(mutations).await.unwrap();
         (sqlite, memory)
+    }
+
+    #[test]
+    fn snapshot_edit_only_writes_changed_records_and_preserves_tag_order() {
+        let conn = crate::native::sqlite::open_in_memory().unwrap();
+        let mut guard = conn.lock();
+        let mut records = (1..=200).map(|id| (id, record(id, "title", "author",
+            &format!("https://example.test/{id}"), &["first", "second"])))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        super::super::bulk::replace_all_records(&mut guard, &records).unwrap();
+        let before = guard.total_changes();
+        records.get_mut(&100).unwrap().tags.reverse();
+        records.get_mut(&100).unwrap().title = "changed".into();
+        records.remove(&101);
+        records.insert(201, record(201, "new", "author", "https://example.test/201", &["new"]));
+        super::super::bulk::replace_all_records(&mut guard, &records).unwrap();
+        let writes = guard.total_changes() - before;
+        assert!(writes < 30, "single snapshot edit rewrote {writes} rows");
+        let stored = super::super::bulk::load_all_records(&guard).unwrap();
+        assert_eq!(stored[&100].title, "changed");
+        assert_eq!(stored[&100].tags, vec!["second", "first"]);
+        assert!(!stored.contains_key(&101));
+        assert_eq!(stored[&201].tags, vec!["new"]);
+        assert_eq!(stored[&99].title, "title");
+    }
+
+    #[test]
+    fn selective_tag_query_seeks_matching_ids_instead_of_scanning_the_library() {
+        let conn = crate::native::sqlite::open_in_memory().unwrap();
+        let guard = conn.lock();
+        guard.execute_batch(
+            "WITH RECURSIVE ids(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM ids WHERE i<30000)
+             INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,
+                 sitename,sitename_fold,last_update)
+             SELECT i,'a','a','t','t','t','url/'||i,'url/'||i,'s','s','now' FROM ids;
+             INSERT INTO novel_tags VALUES (30000,0,'rare','rare'),(1,0,'Rare','rare');
+             UPDATE novels SET attribute_tag='漫画' WHERE id=29999;",
+        ).unwrap();
+        for (tag, attributes, expected) in [
+            ("rare", false, vec![30000]), ("Rare", false, vec![1]),
+            ("漫画", true, vec![29999]), ("漫画", false, vec![]),
+        ] {
+            let filter = NovelFilter { tag: Some(tag.into()), attribute_tags_enabled: attributes,
+                ..NovelFilter::default() };
+            let query = novel_query::scan_ids_sql(&filter, None, 100, query_bind);
+            let mut statement = guard.prepare(&query.sql).unwrap();
+            let ids = statement.query_map(params_from_iter(query.binds.iter()), |row| row.get::<_, i64>(0))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(ids, expected);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 2000, "selective tag query used {steps} VM steps");
+        }
     }
 
     #[tokio::test]

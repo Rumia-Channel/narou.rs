@@ -8,6 +8,7 @@ pub mod inventory;
 pub mod settings;
 pub mod novel_codec;
 pub mod novel_query;
+pub mod object_query;
 #[cfg(feature = "native-runtime")]
 pub(crate) mod state_inventory;
 pub mod novel_record;
