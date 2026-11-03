@@ -488,6 +488,7 @@ impl Drop for HubProgress {
 #[durable_object]
 pub struct PushHub {
     state: State,
+    env: Env,
     /// 直近 [`HISTORY_CAPACITY`] 件・[`HISTORY_MAX_BYTES`] バイトの再生バッファ。
     /// `None` は「未ロード」— 初回アクセスで storage から遅延ロードする
     /// (hibernation / DO 再起動後も履歴が戻る)。
@@ -603,13 +604,48 @@ impl PushHub {
         Ok(())
     }
 
+    /// Repair progress left behind by a lost terminal notification. Query only
+    /// cached scopes by primary key, never the complete job ledger or per step.
+    async fn reconcile_progress(&self) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct TerminalJob { job_id: String }
+        let snapshots = self.history.borrow().as_ref().expect("history loaded")
+            .progress.snapshots().cloned().collect::<Vec<_>>();
+        let mut scopes = snapshots.iter().filter_map(|value| value["data"]["scope"].as_str())
+            .filter(|scope| !scope.is_empty()).collect::<Vec<_>>();
+        scopes.sort_unstable();
+        scopes.dedup();
+        if scopes.is_empty() { return Ok(()); }
+        let db = crate::db_handle::DbHandle::primary(Arc::new(self.env.d1("DB")?));
+        let mut terminal = std::collections::BTreeSet::new();
+        for chunk in scopes.chunks(100) {
+            let encoded = serde_json::to_string(chunk)
+                .map_err(|error| Error::RustError(format!("progress scopes encode: {error}")))?;
+            let rows = db.prepare("SELECT job_id FROM worker_jobs \
+                WHERE job_id IN (SELECT value FROM json_each(?1)) \
+                AND status IN ('succeeded','permanent','blocked')")
+                .bind(&[encoded.into()])?.all().await?.results::<TerminalJob>()?;
+            terminal.extend(rows.into_iter().map(|row| row.job_id));
+        }
+        let changed = self.history.borrow_mut().as_mut().expect("history loaded")
+            .progress.discard_terminal_snapshots(&snapshots, &terminal);
+        if changed {
+            let encoded = serde_json::to_string(&self.history.borrow().as_ref().expect("history loaded").progress)
+                .map_err(|error| Error::RustError(format!("progress history encode: {error}")))?;
+            self.state.storage().put(PROGRESS_KEY, encoded).await?;
+        }
+        Ok(())
+    }
+
     /// `GET` (upgrade) — WebSocket 接続を受け入れ、履歴をリプレイしてから
     /// hibernation 管理へ渡す。
     async fn accept_client(&self) -> Result<Response> {
-        // ロードは accept より前に済ませる。storage 操作の間は DO の入力
-        // ゲートが他のイベントを止め、ロード後は accept + replay まで await
-        // しないので、live イベントが履歴の途中に割り込まない。
+        // Reconcile before accepting: once accepted, history and live events
+        // must not interleave across an await.
         self.ensure_history_loaded().await?;
+        if let Err(error) = self.reconcile_progress().await {
+            console_warn!("push hub: progress reconciliation failed; retaining cached progress: {error}");
+        }
         let pair = WebSocketPair::new()?;
         let server = pair.server;
 
@@ -757,9 +793,10 @@ impl PushHub {
 }
 
 impl DurableObject for PushHub {
-    fn new(state: State, _env: Env) -> Self {
+    fn new(state: State, env: Env) -> Self {
         Self {
             state,
+            env,
             history: RefCell::new(None),
         }
     }
