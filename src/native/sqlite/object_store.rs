@@ -423,23 +423,19 @@ impl SqliteObjectStore {
 
     fn list_blocking(&self, request: &ObjectListRequest) -> Result<ObjectListPage> {
         let mut merged: BTreeMap<String, ObjectMetadata> = BTreeMap::new();
-        // Restrict the scan to the prefix's primary-key range (plus the exact
-        // key) instead of reading the whole table for every page; the
-        // `ObjectPrefix::matches` check below stays as the authority.
-        let base = request.prefix.as_ref().trim_end_matches('/').to_string();
-        let lower = format!("{base}/");
+        // Fetch only this SQL page plus one lookahead row. Merging the first
+        // limit + 1 database keys with filesystem fallbacks preserves DB wins.
+        let base = request.prefix.as_ref().trim_end_matches('/');
+        let lower = if base.is_empty() { String::new() } else { format!("{base}/") };
         let upper = prefix_upper_bound(&lower);
+        let cap = request.limit.get().saturating_add(1).min(i64::MAX as usize) as i64;
         {
             let conn = self.conn.lock();
             let mut statement = conn
-                .prepare(
-                    "SELECT object_key, size, content_type, updated_at FROM objects
-                     WHERE ?1 = '' OR object_key = ?1 OR (object_key >= ?2 AND object_key < ?3)
-                     ORDER BY object_key",
-                )
+                .prepare(crate::db::object_query::LIST_PAGE_SQL)
                 .map_err(super::sqlite_error)?;
             let mut rows = statement
-                .query(rusqlite::params![base, lower, upper])
+                .query(rusqlite::params![base, lower, upper, request.cursor.as_deref().unwrap_or(""), cap])
                 .map_err(super::sqlite_error)?;
             while let Some(row) = rows.next().map_err(super::sqlite_error)? {
                 let key_text: String = row.get(0).map_err(super::sqlite_error)?;
@@ -478,7 +474,9 @@ impl SqliteObjectStore {
                 let Some(key) = logical_key_for_native_path(self.mirror.root(), &path) else {
                     continue;
                 };
-                if !request.prefix.matches(&key) || merged.contains_key(key.as_ref()) {
+                if !request.prefix.matches(&key)
+                    || request.cursor.as_deref().is_some_and(|cursor| key.as_ref() <= cursor)
+                    || merged.contains_key(key.as_ref()) {
                     continue;
                 }
                 if let Some(metadata) = self.mirror.metadata_for_path(&key, &path)? {

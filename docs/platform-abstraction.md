@@ -680,3 +680,51 @@ Worker の `PushHubSink` は行ごとに送信タスク (`spawn_local`) を起�
 | 外部プロセスとローカル操作 | device / send / mail / folder 等 | capability と 501 で拒否 | 対応状況と UI の実行制限を明示 |
 | ログと画面への配送 | lib の logger / ConsoleSink | PushHubSink / Durable Object | MessageContext、操作 ID、順序、コンソール履歴の表示世代 |
 
+## SQL アクセスの調査・最適化（2026-11-03）
+
+### 実測と修正
+
+本番 D1 の Query Insights では、24 時間の読み取り約 60.7 億行のうち約 58.5 億行が
+`worker_ledger::select_waiting` に集中していた（5,768 回、平均約 2.3 秒）。
+管理 API の読み取りも D1 の CPU 超過リセット（7429）で失敗し、Worker tail では
+`asset_backend` の読み取り失敗による Queue invocation の例外を確認した。
+個々のリセットを起こした SQL の実行ログまで結び付いたものではないが、この待機選択が
+主要な負荷源であることは読み取り統計とローカル再現の双方で確認している。
+
+| 経路 | 問題 | 修正・維持する契約 |
+|---|---|---|
+| Worker の待機選択・claim | 各候補の相関サブクエリが過去の permanent 行まで再走査 | 所有者を `AS MATERIALIZED` で一度取得し、`worker_jobs(status,execution_token,lease_until)` で token のない履歴を除外。サイト・作品の排他と中断中の token / lease を維持 |
+| Native / D1 オブジェクト一覧 | 全件取得後にメモリでページを切り出す。Native は任意 prefix の OR で全索引走査 | `db::object_query::LIST_PAGE_SQL` に exact key と子キーの索引範囲・cursor・limit + 1 を集約。DB 優先の FS 統合を維持 |
+| 共通タグ検索・非表示 | 作品ごとの相関タグ照合。既存索引は case-folded タグ用 | タグから ID を選択。`novel_tags(tag,novel_id)` / `novels(attribute_tag,id)` を追加。完全一致と属性有効設定を維持 |
+| Native 作品保存 | 1 件の編集でも全作品とタグを再書き込み | SQL の NULL-safe 比較で未変更 upsert を省略し、タグ・status の再構築も変更行だけに限定。予約確定は省略しない |
+| Native 本文ミラー | 毎変換で全 section link を DELETE / INSERT | 削除した idx だけを除去し、subtitle / body_hash の変わった行だけを UPSERT。本文 dedup と履歴復元の transaction を維持 |
+| Worker 仮想属性 | 複数の参照から同じ分類 CTE を再評価 | 分類 CTE を一度だけ materialize。混合作品の手動属性と欠落メンバー時の値を保持 |
+
+制御したローカル SQLite fixture での計測（VM ステップは約数、D1 の課金行数とは別物）:
+
+| 条件 | 修正前 | 修正後 |
+|---|---:|---:|
+| 終了履歴 30,000 件・待機 1,000 件、待機選択 1 回 | 150,074,000 ステップ | 67,000 ステップ |
+| 他 prefix 30,000 件・対象 1,000 件、後半の 21 件取得 | 284,000 ステップ・1,000 行取得 | 500 ステップ・21 行取得 |
+| 30,000 作品のうち 1 作品だけの完全一致タグ | 360,000 ステップ | 100 ステップ未満 |
+| 2,000 メンバー × 20 仮想小説の属性整合 | 643,000 ステップ | 322,000 ステップ |
+
+Native の索引追加は migration `0015_query_indexes.sql`、Worker は `0016_query_indexes.sql`。
+削除や形式変更ではなく索引の追加で、Native は通常起動時、D1 は配備時の既存 migration 経路で適用する。
+Native の作品スナップショットは全件を読む従来 API のままであり、全件読み取りそのものを
+廃止したわけではない。省くのは変更のない行と索引の再書き込みである。
+
+### 調査したその他の経路と境界
+
+- 単一レコード・設定・凍結・予約: 主キーまたは既存索引による検索と transaction / CAS を維持する。
+- Native 本文 / バージョン: 本文はハッシュ集合を bounded batch で照合し、読み取りは owner key と body hash の JOIN。履歴ヘッドは `(novel_id,id)` 索引を使う。版全体の出力・差分計算は対象版の全本文が必要なので、行数だけを減らして出力を変えない。
+- D1 本文参照 / CAS / 一覧: object key / blob key の索引と、UNION の範囲への条件 pushdown を実行計画で確認。S3 公開の予約・削除許可・照合を省略しない。
+- キューの履歴件数・タグ頻度: 正確な全体集計なので対象集合の走査は残る。直列化されていない別カウンタや、更新を見逃すキャッシュで見かけの負荷を下げない。
+- 部分文字列検索と legacy N コードの URL suffix 照合: 現在の互換検索を維持する。FTS の単語検索や完全一致だけへ置き換えない。
+- GC の `julianday(not_before)` への式索引は採用しない。SQLite は `now` 等を持つ行の更新を非決定的な索引式として拒否し、既存の publication 回帰ケースが失敗した。既存の日時解釈・upload 保護を壊す最適化を入れない。
+
+回帰テストは `application::jobs::tests::claim_sql`、`db::object_query::tests`、
+`native::sqlite::repository::tests`、`native::sqlite::content::tests`、
+`worker_entry/tests/test_sql_access_paths.py`。実 workerd の HTTP / Queue / 仮想属性 /
+作者追跡 / 転送シナリオも実行する。本番のデータ・キューを検証用に書き換えない。
+
