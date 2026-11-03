@@ -118,9 +118,26 @@ pub(crate) fn store_sections_in_tx(
     novel_id: i64,
     sections: &SectionMap,
 ) -> Result<()> {
-    // sections: idx -> (subtitle, body_yaml)
-    tx.execute("DELETE FROM novel_sections WHERE novel_id = ?", [novel_id])
+    // Keep unchanged section links in place. Conversion and history restore
+    // supply full snapshots, but should only write the sections that differ.
+    let stale = {
+        let mut statement = tx.prepare_cached("SELECT idx FROM novel_sections WHERE novel_id = ?")
+            .map_err(sqlite_error)?;
+        let mut rows = statement.query([novel_id]).map_err(sqlite_error)?;
+        let mut stale = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_error)? {
+            let idx: String = row.get(0).map_err(sqlite_error)?;
+            if !sections.contains_key(&idx) {
+                stale.push(idx);
+            }
+        }
+        stale
+    };
+    let mut delete = tx.prepare_cached("DELETE FROM novel_sections WHERE novel_id = ? AND idx = ?")
         .map_err(sqlite_error)?;
+    for idx in stale {
+        delete.execute(params![novel_id, idx]).map_err(sqlite_error)?;
+    }
     let bodies: Vec<&str> = sections
         .values()
         .map(|(_, body)| body.as_str())
@@ -128,7 +145,9 @@ pub(crate) fn store_sections_in_tx(
     let hashes = store_bodies(tx, &bodies)?;
     let mut insert = tx
         .prepare_cached(
-            "INSERT INTO novel_sections (novel_id, idx, subtitle, body_hash) VALUES (?, ?, ?, ?)",
+            "INSERT INTO novel_sections (novel_id, idx, subtitle, body_hash) VALUES (?, ?, ?, ?)
+             ON CONFLICT(novel_id, idx) DO UPDATE SET subtitle=excluded.subtitle, body_hash=excluded.body_hash
+             WHERE novel_sections.subtitle IS NOT excluded.subtitle OR novel_sections.body_hash IS NOT excluded.body_hash",
         )
         .map_err(sqlite_error)?;
     for ((idx, (subtitle, _)), hash) in sections.iter().zip(hashes.iter()) {
@@ -304,6 +323,27 @@ mod tests {
 
         let loaded = load_sections(&guard, 7).unwrap().unwrap();
         assert_eq!(loaded, sections);
+    }
+
+    #[test]
+    fn section_snapshot_only_writes_changed_links_and_keeps_removals() {
+        let conn = test_conn();
+        let mut guard = conn.lock();
+        let mut sections = (1..=450).map(|i| (i.to_string(),
+            (Some(format!("第{i}話")), "body: unchanged\n".to_string())))
+            .collect::<SectionMap>();
+        store_sections(&mut guard, 7, &sections).unwrap();
+        let before = guard.total_changes();
+        sections.get_mut("1").unwrap().0 = None;
+        sections.get_mut("2").unwrap().1 = "body: changed\n".into();
+        sections.remove("3");
+        sections.insert("451".into(), (Some("new".into()), "body: unchanged\n".into()));
+        store_sections(&mut guard, 7, &sections).unwrap();
+        let writes = guard.total_changes() - before;
+        assert!(writes < 10, "section snapshot rewrote {writes} rows");
+        assert_eq!(load_sections(&guard, 7).unwrap().unwrap(), sections);
+        store_sections(&mut guard, 7, &SectionMap::new()).unwrap();
+        assert!(load_sections(&guard, 7).unwrap().is_none());
     }
 
     /// A section whose body row vanished is skipped so the caller can fall

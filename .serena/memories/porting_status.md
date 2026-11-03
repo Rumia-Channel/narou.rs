@@ -1,6 +1,16 @@
 # narou.rs 移植状況
 
-## 現況（v0.5.8 リリース準備）
+## 現況（v0.5.8 公開・本番配備済み）
+
+v0.5.8 を正式公開した: https://github.com/Rumia-Channel/narou.rs/releases/tag/v0.5.8 。main の `7c538ed4105ecc371d96527fbaa02962f8222ba5` を指すタグで、GitHub の Latest、配布 ZIP 16 件、停止原因未確定を明記した日本語リリースノートを確認済み。release-0-5-8 → develop → main → develop はすべて --no-ff で統合し、main / develop / タグ / 作業ブランチを push 済み。準備CI 41461739784、タグの Release 41465195394 / Platform portability 41465195443 / Linux build 41465195290 は成功。main から develop へ戻した後も Native 実HTTP158作品転送1件とCLI転送3件を再実行して成功した。
+
+公開した Windows x64 GPL ZIP を実際に取得し、GitHub のサイズ・SHA-256と一致、同梱 narou_rs / backup / login の3 exeのAuthenticodeがValid、実行結果0.5.8を確認。検証用ZIPと展開物はTemporaryDirectoryで削除済み。本番 narou.rumia-ch.uk は認証済みブラウザでcurrent version=0.5.8、About表示、転送用JS=200、実S3 LIST=ok / illustration_backend=s3を確認。自分の確認タブだけ閉じた。詳細な実測値はローカルの `sample/worker-diagnostics/release-058-verification.json`。
+
+本番のログ設定は配備で変わったため、script-settings APIで承認済みobservabilityだけをPATCHし復元・照合した（bindingsや実コードを再配備していない）。本番version IDは `02d769ec-2504-435b-970c-b6827f5aefe1`、100%。復元後の180秒を `sample/worker-diagnostics/narou-rs-20261102T151150Z.ndjson` に保存し、76 invocationすべてこのversion、Queue21件、非ok・未処理例外0、pacing DO /acquire 38件すべて200を確認。completeも同じ/acquireへHttpCompleteを送るため、URLだけで開始/完了を区別したとは言わない。URL query/fragment/userinfoとheader/body欄が無いことも全件検証済み。outcome okはアプリ上の取得成功と同義ではない。採取は終了してローカル常駐なし、Cloudflareの一時ログ保存設定は調査継続のため維持中。次の本番配備時もこの設定を照合し必要なら再適用する。
+
+残件は公開と区別する。以前の約17分の停止は再発せず原因未確定のまま。また本番Aboutの最新版照会は、公開後もHTTP 200のJSON内に `latest version request failed: 403` がありlatest_versionなし。current版数・S3・転送JSの正常確認と混同せず、最新版照会まで正常と報告しない（今回追加のコード修正はしていない）。
+
+## 履歴（v0.5.8 リリース準備）
 
 ユーザーが『バージョンを上げよう』と明示指示したため、原因未確定を明記した上で、承認済みの v0.5.8 の公開を進める。GitHub最新公開版は v0.5.7 と確認済み。clean / originと同じdevelopから `release-0-5-8` を作成し、本体・Worker・relay・transfer_wasmのpackage.versionだけを0.5.8へ変更（依存更新なし）。標準Cargoにset-versionが無いため版数フィールドの手編集を例外として実施。VERSION.mdの未リリース節をv0.5.8へ切替え、停止現象の原因未確定・解消を保証しない旨を明記した。両lockとライセンス表記を同期済み（差分は自作4パッケージの版数だけ、依存更新なし）。cargo check / about-probe check / 両cargo-about生成 / workspace all-targets all-features Clippy -D warnings / cargo test --workspace / Native全bin buildは成功。実binのversion --moreで0.5.8を確認した。Native実HTTPの158作品転送、CLIの書出し・取込みも成功。Worker wasm Clippy -D warnings / worker-build --release（wasm-opt含む）/ 実workerd transfer契約も成功し、158作品・本文77MiBのZIPと全hash、進捗、取込み、異常終了を再確認した。テスト時のMSVC DLLリンク案内とNode既存DEP0190警告は出たが、Clippyゲートとテストは成功。公開はまだこれから。
 

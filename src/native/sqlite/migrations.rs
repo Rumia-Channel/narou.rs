@@ -23,6 +23,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (12, include_str!("migrations/0012_login_session.sql")),
     (13, include_str!("migrations/0013_id_reservations.sql")),
     (14, include_str!("migrations/0014_attribute_tag.sql")),
+    (15, include_str!("migrations/0015_query_indexes.sql")),
 ];
 
 pub(crate) fn apply(conn: &mut Connection) -> Result<()> {

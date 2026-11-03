@@ -131,7 +131,7 @@ WITH groups AS (
   SELECT CAST(g.key AS INTEGER) AS id, g.value AS members
   FROM app_state a, json_each(a.value_json) g
   WHERE a.scope='inv' AND a.key='virtual_novel_members'
-), classified AS (
+), classified AS MATERIALIZED (
   SELECT g.id, CASE
     WHEN NOT EXISTS(SELECT 1 FROM json_each(g.members) m JOIN novels n ON n.id=m.value WHERE COALESCE(n.attribute_tag,'小説')<>'漫画') THEN '漫画'
     WHEN NOT EXISTS(SELECT 1 FROM json_each(g.members) m JOIN novels n ON n.id=m.value WHERE n.attribute_tag='漫画') THEN '小説'

@@ -395,14 +395,14 @@ pub mod worker_ledger {
 
     fn novel_id_expression(target: &str) -> String {
         format!("CASE WHEN {target} = CAST(CAST({target} AS INTEGER) AS TEXT) \
-            THEN CAST({target} AS INTEGER) ELSE (SELECT id FROM novels \
-            WHERE toc_url_fold = lower({target}) OR ncode_fold = lower({target}) \
-              OR substr(rtrim(toc_url_fold, '/'), -(length({target}) + 1)) = '/' || lower({target}) \
-            ORDER BY id LIMIT 1) END")
+            THEN CAST({target} AS INTEGER) ELSE (SELECT MIN(novel_id) FROM target_lookup \
+            WHERE target = lower({target})) END")
     }
 
     /// Wake at most one acquisition per free site, plus independently eligible
     /// converts. The cron also uses this query after a lost completion/dispatch.
+    /// Materialize physical owners and URL/ncode aliases once: neither terminal
+    /// history nor the novel library may be scanned for every waiting candidate.
     pub fn select_waiting(now: &str, limit: usize) -> Statement {
         let candidate_target = "COALESCE(candidate.normalized_target, candidate.target)";
         let other_target = "COALESCE(other.normalized_target, other.target)";
@@ -410,7 +410,20 @@ pub mod worker_ledger {
         let other_id = novel_id_expression(other_target);
         Statement {
             sql: format!(
-                "SELECT job_id, kind FROM ( \
+                "WITH RECURSIVE url_suffixes(novel_id, target) AS ( \
+                   SELECT id, substr(rtrim(toc_url_fold, '/'), instr(rtrim(toc_url_fold, '/'), '/') + 1) \
+                   FROM novels WHERE instr(rtrim(toc_url_fold, '/'), '/') > 0 \
+                   UNION ALL \
+                   SELECT novel_id, substr(target, instr(target, '/') + 1) FROM url_suffixes \
+                   WHERE instr(target, '/') > 0 \
+                 ), target_lookup AS MATERIALIZED ( \
+                   SELECT toc_url_fold AS target, id AS novel_id FROM novels \
+                   UNION ALL SELECT ncode_fold, id FROM novels WHERE ncode_fold IS NOT NULL \
+                   UNION ALL SELECT target, novel_id FROM url_suffixes \
+                 ), owners AS MATERIALIZED ( \
+                   SELECT other.job_id, other.kind, other.site_key, other.target, other.normalized_target \
+                   FROM worker_jobs AS other WHERE {OWNER} \
+                 ) SELECT job_id, kind FROM ( \
                    SELECT candidate.job_id, candidate.kind, candidate.created_at, \
                      ROW_NUMBER() OVER (PARTITION BY candidate.site_key, \
                        CASE WHEN candidate.site_key IS NULL THEN candidate.job_id ELSE '' END \
@@ -419,8 +432,8 @@ pub mod worker_ledger {
                    WHERE candidate.admission_waiting = 1 \
                      AND candidate.status IN ('pending', 'retryable') \
                      AND (candidate.lease_until IS NULL OR candidate.lease_until <= ?) \
-                     AND NOT EXISTS (SELECT 1 FROM worker_jobs AS other \
-                       WHERE {OWNER} AND other.job_id != candidate.job_id AND ( \
+                     AND NOT EXISTS (SELECT 1 FROM owners AS other \
+                       WHERE other.job_id != candidate.job_id AND ( \
                          (candidate.site_key IS NOT NULL AND other.kind IN ('download', 'update', 'author_check') \
                            AND (other.site_key IS NULL OR other.site_key = candidate.site_key)) \
                          OR other.normalized_target IS NULL \
@@ -2461,6 +2474,88 @@ mod tests {
             assert_eq!(waiting(&conn), vec!["b1", "c2"]);
             conn.execute("UPDATE worker_jobs SET status = 'succeeded', execution_token = NULL, lease_until = NULL WHERE job_id = 'owner'", []).unwrap();
             assert_eq!(waiting(&conn), vec!["a1", "b1", "c1", "c2"]);
+        }
+
+        #[test]
+        fn waiting_dispatch_does_not_rescan_terminal_history_for_every_candidate() {
+            let conn = db();
+            conn.execute_batch(
+                "CREATE INDEX worker_jobs_status_idx ON worker_jobs(status, created_at);
+                 CREATE INDEX worker_jobs_admission_wait_idx ON worker_jobs(site_key, created_at, job_id)
+                     WHERE admission_waiting = 1;
+                 CREATE INDEX worker_jobs_site_owner_idx ON worker_jobs(site_key, kind, status)
+                     WHERE status = 'running' OR (status = 'permanent' AND execution_token IS NOT NULL);
+                 CREATE INDEX worker_jobs_execution_owner_idx ON worker_jobs(status, execution_token, lease_until);
+                 WITH RECURSIVE ids(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM ids WHERE i<30000)
+                 INSERT INTO worker_jobs(job_id,kind,target,status,dedupe_key,created_at,updated_at)
+                 SELECT 'history-'||i,'update','42','permanent','history-'||i,'old','old' FROM ids;
+                 WITH RECURSIVE ids(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM ids WHERE i<1000)
+                 INSERT INTO worker_jobs(job_id,kind,target,normalized_target,status,dedupe_key,
+                     created_at,updated_at,site_key,admission_waiting)
+                 SELECT printf('waiting-%04d',i),'update',CAST(i AS TEXT),CAST(i AS TEXT),
+                     'pending','waiting-'||i,'now','now','shared.example',1 FROM ids;",
+            ).unwrap();
+            let query = worker_ledger::select_waiting(NOW, 8);
+            let mut statement = conn.prepare(&query.sql).unwrap();
+            let jobs = statement.query_map(rusqlite::params_from_iter(query.binds.iter()),
+                |row| row.get::<_, String>(0)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(jobs, vec!["waiting-0001"]);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 100_000, "waiting dispatch used {steps} VM steps");
+        }
+
+        #[test]
+        fn waiting_url_targets_resolve_once_instead_of_scanning_novels_per_candidate() {
+            let conn = db();
+            conn.execute_batch(
+                "CREATE INDEX worker_jobs_status_idx ON worker_jobs(status, created_at);
+                 CREATE INDEX worker_jobs_execution_owner_idx ON worker_jobs(status, execution_token, lease_until);
+                 WITH RECURSIVE ids(i) AS (VALUES(1000) UNION ALL SELECT i+1 FROM ids WHERE i<2999)
+                 INSERT INTO novels SELECT i,NULL,'https://fixture.test/novels/'||i||'/' FROM ids;
+                 INSERT INTO worker_jobs(job_id,kind,target,normalized_target,status,dedupe_key,
+                     created_at,updated_at,site_key,admission_waiting)
+                 SELECT printf('waiting-%04d',id-1000),'update',toc_url_fold,toc_url_fold,
+                     'pending','waiting-'||id,'now','now','fixture.test',1 FROM novels WHERE id>=1000;",
+            ).unwrap();
+            insert(&conn, "owner", "https://fixture.test/novels/1000/", "running", Some(LEASE));
+            conn.execute("UPDATE worker_jobs SET kind='convert' WHERE job_id='owner'", []).unwrap();
+            let query = worker_ledger::select_waiting(NOW, 8);
+            let mut statement = conn.prepare(&query.sql).unwrap();
+            let jobs = statement.query_map(rusqlite::params_from_iter(query.binds.iter()),
+                |row| row.get::<_, String>(0)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(jobs, vec!["waiting-0001"]);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 2_000_000, "URL waiting dispatch used {steps} VM steps");
+        }
+
+        #[test]
+        fn waiting_alias_lookup_preserves_lowest_id_and_arbitrary_url_suffixes() {
+            let conn = db();
+            conn.execute_batch(
+                "INSERT INTO novels VALUES
+                 (6,'https://legacy.test/a/shared///','https://other.test/six/'),
+                 (7,'shared','https://legacy.test/a/shared///'),
+                 (8,'shared','https://legacy.test/other/'),
+                 (9,'https://legacy.test/a/shared///','https://other.test/nine/');",
+            ).unwrap();
+            insert(&conn, "owner", "7", "running", Some(LEASE));
+            conn.execute("UPDATE worker_jobs SET kind='convert' WHERE job_id='owner'", []).unwrap();
+            for (id, target) in [
+                ("a-code","SHARED"), ("b-suffix","a/shared"), ("c-id","7"),
+                ("d-other-id","8"), ("e-collision-id","9"),
+                ("f-trimmed","https://legacy.test/a/shared"),
+                ("g-noncanonical-num","0007"), ("h-missing","https://missing.test/book/"),
+                ("i-exact-collision","https://legacy.test/a/shared///"),
+            ] {
+                insert(&conn, id, target, "pending", None);
+                conn.execute("UPDATE worker_jobs SET kind='convert' WHERE job_id=?", [id]).unwrap();
+                apply(&conn, worker_ledger::park_admission(NOW, id, target, None));
+            }
+            assert_eq!(waiting(&conn), vec!["d-other-id","e-collision-id","f-trimmed","g-noncanonical-num","h-missing","i-exact-collision"]);
+            conn.execute("UPDATE worker_jobs SET target=?1,normalized_target=?1 WHERE job_id='owner'", ["https://legacy.test/a/shared///"]).unwrap();
+            assert_eq!(waiting(&conn), vec!["a-code","b-suffix","c-id","d-other-id","e-collision-id","f-trimmed","g-noncanonical-num","h-missing"]);
         }
 
         #[test]

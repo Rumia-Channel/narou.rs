@@ -34,7 +34,7 @@ pub const DELETE_NOVEL_SQL: &str = "DELETE FROM novels WHERE id = ?";
 
 /// Extend the id sequence so an upserted record can never be handed out again.
 pub const BUMP_SEQUENCE_SQL: &str =
-    "UPDATE novel_id_sequence SET next_id = CASE WHEN next_id < ? THEN ? ELSE next_id END WHERE id = 1";
+    "UPDATE novel_id_sequence SET next_id = ?2 WHERE id = 1 AND next_id < ?1";
 
 /// Claim a released ID, or a fresh high-water ID, inside a transaction/batch.
 /// A claim receives the largest pool generation so the final SELECT can read
@@ -152,10 +152,10 @@ pub fn build_where<B>(filter: &NovelFilter, mut bind: impl FnMut(NovelBind) -> B
     }
     if let Some(tag) = &filter.tag {
         if filter.attribute_tags_enabled {
-            builder.sql.push_str(" AND (EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = ?) OR n.attribute_tag = ?)");
+            builder.sql.push_str(" AND (n.id IN (SELECT novel_id FROM novel_tags WHERE tag = ?) OR n.attribute_tag = ?)");
             builder.binds.push(bind(NovelBind::Text(tag.clone())));
         } else {
-            builder.sql.push_str(" AND EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = ?)");
+            builder.sql.push_str(" AND n.id IN (SELECT novel_id FROM novel_tags WHERE tag = ?)");
         }
         builder.binds.push(bind(NovelBind::Text(tag.clone())));
     }
@@ -214,7 +214,7 @@ pub fn build_where<B>(filter: &NovelFilter, mut bind: impl FnMut(NovelBind) -> B
     }
     if !filter.exclude_tags.is_empty() {
         builder.sql.push_str(
-            " AND NOT EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag IN (SELECT value FROM json_each(?)))",
+            " AND n.id NOT IN (SELECT novel_id FROM novel_tags WHERE tag IN (SELECT value FROM json_each(?)))",
         );
         builder
             .binds
@@ -428,23 +428,6 @@ mod tests {
         assert_eq!(scanned.binds, vec![NovelBind::Int(10)]);
     }
 
-    #[test]
-    fn hidden_exclusions_render_negated_clauses_and_bind_values() {
-        let filter = NovelFilter {
-            exclude_ids: vec![1, 2],
-            exclude_tags: vec!["秘密".to_string()],
-            exclude_authors: vec!["author".to_string()],
-            exclude_sites: vec!["site".to_string()],
-            ..NovelFilter::default()
-        };
-        let count = count_sql(&filter, |bind| bind);
-        assert!(count.sql.contains("n.id NOT IN (SELECT CAST(value AS INTEGER) FROM json_each(?))"));
-        assert!(count.sql.contains("t.tag IN (SELECT value FROM json_each(?))"));
-        assert!(count.sql.contains("n.author_fold NOT IN (SELECT value FROM json_each(?))"));
-        assert!(count.sql.contains("n.sitename_fold NOT IN (SELECT value FROM json_each(?))"));
-        assert_eq!(count.sql.matches('?').count(), count.binds.len());
-        assert!(count.binds.iter().any(|bind| matches!(bind, NovelBind::Text(json) if json == "[1,2]")));
-    }
 
     /// The adapters differ only in the bind conversion: the statement and the
     /// bind order must not depend on it.

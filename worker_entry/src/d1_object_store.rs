@@ -351,41 +351,23 @@ impl D1ObjectStore {
         Ok(())
     }
 
-    /// All keys under `prefix` (inclusive range scan + `matches` filter),
-    /// sorted ascending. D1 returns whole result sets, so pagination is
-    /// applied in memory after the filtered sort.
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, ObjectMetadata)>> {
-        let upper = narou_rs::platform::prefix_upper_bound(prefix);
-        let statement = self.prepare(
-            "SELECT object_key, size, updated_at, content_type FROM objects \
-             WHERE object_key >= ? AND object_key < ? ORDER BY object_key",
-            vec![JsValue::from_str(prefix), JsValue::from_str(&upper)],
-        )?;
-        let rows = statement
-            .all()
-            .await
-            .map_err(worker_error)?
-            .results::<ListRow>()
-            .map_err(worker_error)?;
-        let mut out = Vec::new();
-        for row in rows {
-            let Ok(key) = ObjectKey::try_new(row.object_key.clone()) else {
-                continue;
-            };
-            // `prefix` here is the raw string; use ObjectPrefix::matches for
-            // the boundary check (prefix must end at a '/' boundary).
-            let prefix_ok = narou_rs::platform::ObjectPrefix::new(prefix)
-                .map(|p| p.matches(&key))
-                .unwrap_or(false);
-            if !prefix_ok {
-                continue;
-            }
-            out.push((
-                row.object_key,
-                metadata_from(&key, row.size, &row.updated_at, row.content_type),
-            ));
-        }
-        Ok(out)
+    /// Read one indexed metadata page plus one lookahead row, not the entire
+    /// prefix on every page. Exact-prefix and descendant keys share the same
+    /// boundary/cursor contract as Native SQLite.
+    async fn list_keys(&self, request: &ObjectListRequest) -> Result<Vec<(String, ObjectMetadata)>> {
+        let prefix = request.prefix.as_ref().trim_end_matches('/');
+        let lower = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+        let upper = narou_rs::platform::prefix_upper_bound(&lower);
+        let cap = request.limit.get().saturating_add(1).min(i64::MAX as usize);
+        let rows = self.prepare(
+            narou_rs::db::object_query::LIST_PAGE_SQL,
+            vec![prefix.into(), lower.into(), upper.into(),
+                request.cursor.as_deref().unwrap_or("").into(), JsValue::from_f64(cap as f64)],
+        )?.all().await.map_err(worker_error)?.results::<ListRow>().map_err(worker_error)?;
+        rows.into_iter().map(|row| {
+            let key = ObjectKey::try_new(row.object_key.clone())?;
+            Ok((row.object_key, metadata_from(&key, row.size, &row.updated_at, row.content_type)))
+        }).collect()
     }
 }
 
@@ -442,7 +424,7 @@ impl ObjectStore for D1ObjectStore {
         request: &'a ObjectListRequest,
     ) -> PlatformFuture<'a, Result<ObjectListPage>> {
         Box::pin(async move {
-            let rows = self.list_keys(request.prefix.as_ref()).await?;
+            let rows = self.list_keys(request).await?;
             let (objects, next_cursor) = paginate_object_listing(
                 rows,
                 request.cursor.as_deref(),
