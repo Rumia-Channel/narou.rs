@@ -19,6 +19,8 @@
 
 pub mod error;
 pub mod aliases;
+pub mod api_tokens;
+pub mod external_api;
 pub mod authors;
 pub mod attribute_tags;
 pub mod debug;
@@ -26,6 +28,7 @@ pub mod download_targets;
 pub mod events;
 pub mod target_lookup;
 pub mod convert;
+pub mod mcp;
 pub mod messages;
 pub mod site_definitions;
 pub mod jobs;
@@ -77,6 +80,9 @@ pub use tag_colors::{MemoryTagColorStore, TagColorService, TagColorStore};
 pub use favorite_tags::FavoriteTags;
 pub mod library;
 
+pub use api_tokens::{
+    ApiToken, ApiTokenChange, ApiTokenService, ApiTokenStore, MemoryApiTokenStore,
+};
 pub use error::ApplicationError;
 pub use events::{
     ApplicationEvent, EmptySiteDefinitionProvider, EmptySiteTimezoneProvider,
@@ -112,6 +118,10 @@ pub struct AppServiceDependencies {
     pub site_definitions: Arc<dyn SiteDefinitionProvider>,
     pub self_update: Arc<dyn SelfUpdateService>,
     pub web_actions: Arc<dyn WebActionService>,
+    /// バーチャル小説の所属 (外部 API と MCP が使う)。
+    pub virtual_novels: Arc<dyn external_api::VirtualNovelDirectory>,
+    /// 外部 API の Bearer トークン。
+    pub api_tokens: Arc<dyn ApiTokenStore>,
 }
 
 /// Composition root for platform-neutral application use cases.
@@ -129,10 +139,22 @@ pub struct AppServices {
     pub site_definitions: Arc<dyn SiteDefinitionProvider>,
     pub self_update: Arc<dyn SelfUpdateService>,
     pub web_actions: Arc<dyn WebActionService>,
+    /// 外部公開 API (読み取り専用) と、その上に載る MCP。
+    pub external_api: Arc<external_api::ExternalApiService>,
+    /// 外部 API の Bearer トークン管理。
+    pub api_tokens: Arc<ApiTokenService>,
 }
 
 impl AppServices {
     pub fn new(deps: AppServiceDependencies) -> Self {
+        let api_tokens = Arc::new(ApiTokenService::new(deps.api_tokens.clone()));
+        let external_api = Arc::new(external_api::ExternalApiService::new(
+            deps.library.clone(),
+            deps.content.clone(),
+            deps.settings.clone(),
+            deps.virtual_novels.clone(),
+            api_tokens.clone(),
+        ));
         Self {
             library: deps.library,
             novel_actions: deps.novel_actions,
@@ -145,6 +167,8 @@ impl AppServices {
             site_definitions: deps.site_definitions,
             self_update: deps.self_update,
             web_actions: deps.web_actions,
+            external_api,
+            api_tokens,
         }
     }
 }

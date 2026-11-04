@@ -667,6 +667,13 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                 1
             }
         },
+        Commands::Api { action } => match commands::api::cmd_api(action) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
         Commands::Illust {
             force,
             all,

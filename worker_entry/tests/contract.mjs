@@ -511,6 +511,48 @@ await check("GET /api/novels/:id/download.epub returns 404 for an unknown novel"
   assert(response.status === 404, `status ${response.status}`);
 });
 
+// 外部公開 API (/api/v1) は Bearer トークンで認証する。Access を設定した
+// Worker では Zero Trust が境界なので、Bearer を見ない (その構成では
+// 「トークン無しで 401」という検査が成り立たない)。
+await check("GET /api/v1/novels refuses a request without a valid Bearer token", async () => {
+  if (ACCESS_CLIENT_ID && ACCESS_CLIENT_SECRET) {
+    return;
+  }
+  const anonymous = await fetch(url("/api/v1/novels"));
+  assert.equal(anonymous.status, 401, `status ${anonymous.status}`);
+  const wrong = await request("/api/v1/novels", {
+    headers: { authorization: "Bearer not-a-real-token" },
+  });
+  assert.equal(wrong.status, 401, `status ${wrong.status}`);
+});
+
+await check("a token from /api/external_api/token opens the external API", async () => {
+  const created = await request("/api/external_api/token", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ name: "contract" }),
+  });
+  assert.equal(created.status, 200, `status ${created.status}`);
+  const body = await json(created);
+  const token = body?.token?.token;
+  assert.equal(typeof token, "string");
+  assert(token.length > 0, "the created token must not be empty");
+  try {
+    const listed = await request("/api/v1/novels?limit=1", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(listed.status, 200, `status ${listed.status}`);
+    const payload = await json(listed);
+    assert(Array.isArray(payload?.data), "data must be an array");
+  } finally {
+    const removed = await request(`/api/external_api/token/${encodeURIComponent(body.token.id)}`, {
+      method: "DELETE",
+      headers: auth().headers,
+    });
+    assert.equal(removed.status, 200, `status ${removed.status}`);
+  }
+});
+
 await check("HEAD preserves text and JSON error metadata without a body", async () => {
   for (const [path, status, contentType] of [
     ["/api/novels/999999999/download.epub", 404, "text/plain; charset=utf-8"],

@@ -196,6 +196,7 @@ narou_rs web
 | `login` | ログイン Cookie の取り込み・管理 (Rust 拡張) |
 | `illust` | 挿絵キャッシュのメンテナンス (Rust 拡張) |
 | `db` | SQLite 管理データの保守 (verify / export-yaml / vacuum。Rust 拡張) |
+| `api` | 外部公開 API の Bearer トークン管理 (Rust 拡張) |
 
 コマンドは narou.rb と同じ短縮規則（先頭 1〜2 文字）で呼べます。`w` / `we` は `web`、`s` / `se` は `setting` に解決されます。
 
@@ -262,6 +263,37 @@ narou_rs setting server-basic-auth.require-for-external-bind=false
   ```
   unsafe なワイルドカードパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視されます。
 - このうち Web UI 設定画面 (Global タブ) に出るのは `server-bind`、`server-basic-auth.*`、`server-ws-add-accepted-domains`、`server-add-accepted-hosts` などです。`server-reverse-proxy.enable` と `server-basic-auth.require-for-external-bind` は hidden のままなので、CLI からのみ変更してください。
+
+### 外部公開 API と MCP
+
+外部のツール (表の生成・自動化・LLM) からライブラリの読み取り専用データへ
+アクセスできます。仕様は [`docs/external-api.md`](docs/external-api.md) に
+あります。
+
+```powershell
+# Bearer トークンを作る (表示された値を Authorization ヘッダに載せる)
+narou_rs api create 表生成
+
+# 保存済みトークンの確認・削除
+narou_rs api list
+narou_rs api delete <ID>
+```
+
+```powershell
+# 一覧を取得する (JSON / JSON Lines / XML が選べる)
+curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8888/api/v1/novels?limit=20&format=jsonl"
+curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8888/api/v1/novels/1/toc"
+curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8888/api/v1/novels/1/sections/1"
+```
+
+- 認証は Bearer トークンです (`Authorization: Bearer <token>` または
+  `x-narou-api-token`)。トークンは設定ページの「外部API」タブからも作成・確認・削除できます。
+- `/api/v1` はブラウザの UI トークンとも Basic 認証とも独立しており、
+  トークンだけで読み取り専用データにアクセスできます。
+- MCP (Model Context Protocol) は同じ API の上に載っています。HTTP では
+  `POST /api/v1/mcp`、ローカルでは `narou_rs_mcp` (stdIO) を使います。
+- Cloudflare Workers では Cloudflare Zero Trust の Service Token を優先し
+  ます (Access を設定していない場合は narou の Bearer トークン)。
 
 ### ログインが必要な小説
 

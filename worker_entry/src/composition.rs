@@ -427,6 +427,8 @@ impl WorkerRuntime {
             Arc::new(D1TagColorStore::new(db.clone())),
             clock.clone(),
             site_rules.clone(),
+            db.clone(),
+            env,
         );
         let write_services = services_from(
             write_novels.clone(),
@@ -436,6 +438,8 @@ impl WorkerRuntime {
             Arc::new(D1TagColorStore::new(write_db.clone())),
             clock.clone(),
             site_rules,
+            write_db.clone(),
+            env,
         );
         Ok(Self {
             services,
@@ -1041,9 +1045,11 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
             objects.clone(),
             freeze,
             Arc::new(D1SettingsStore::new(db.clone())),
-            Arc::new(D1TagColorStore::new(db)),
+            Arc::new(D1TagColorStore::new(db.clone())),
             clock,
             site_rules,
+            db.clone(),
+            env,
         ),
         objects,
         s3_illustrations,
@@ -1074,9 +1080,11 @@ pub async fn build_mutation_services(env: &Env) -> worker::Result<AppServices> {
         objects,
         freeze,
         Arc::new(D1SettingsStore::for_writes(db.clone())),
-        Arc::new(D1TagColorStore::new(db)),
+        Arc::new(D1TagColorStore::new(db.clone())),
         clock,
         site_rules,
+        db,
+        env,
     ))
 }
 
@@ -1088,6 +1096,8 @@ fn services_from(
     tag_colors: Arc<D1TagColorStore>,
     clock: Arc<dyn Clock>,
     site_rules: Arc<narou_rs::application::site_definitions::SiteSettingsSnapshot>,
+    db: DbHandle,
+    env: &Env,
 ) -> AppServices {
     let library = Arc::new(narou_rs::application::LibraryService::new(
         novels.clone(),
@@ -1114,6 +1124,8 @@ fn services_from(
         site_definitions: site_rules,
         self_update: Arc::new(NoopSelfUpdateService),
         web_actions: Arc::new(EmptyWebActionService),
+        virtual_novels: Arc::new(crate::virtual_novels::D1VirtualNovelDirectory::new(env)),
+        api_tokens: Arc::new(crate::api_tokens::D1ApiTokenStore::new(db)),
     })
 }
 

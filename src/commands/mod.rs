@@ -6,6 +6,7 @@ use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::queue::{JobType, PersistentQueue};
 
 pub mod alias;
+pub mod api;
 pub mod backup;
 pub mod browser;
 pub mod clean;

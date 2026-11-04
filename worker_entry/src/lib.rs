@@ -6,6 +6,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 mod budget;
+mod api_tokens;
 mod authors;
 mod bundled_sites;
 mod favorite_tags;
@@ -100,6 +101,14 @@ fn head_response(response: Response) -> Result<Response> {
 
 async fn route(req: Request, env: Env) -> Result<Response> {
     let path = req.path();
+    // 外部公開 API (`/api/v1`)。認証は Cloudflare Access / Bearer トークン。
+    if path == "/api/v1" || path.starts_with("/api/v1/") {
+        return webui::external::handle(req, env).await;
+    }
+    // 外部 API の設定 (トークン管理)。管理トークンで保護する。
+    if path == "/api/external_api" || path.starts_with("/api/external_api/") {
+        return webui::external::handle_settings(req, env).await;
+    }
     if path == "/api/virtual_novels/classify" {
         return virtual_novels::handle_classify(req, env).await;
     }
@@ -517,7 +526,15 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
-    let services = match composition::build_read_services(&env).await {
+    build_epub_response(&env, id).await
+}
+
+/// EPUB を生成して返す (認証は呼び出し側)。
+///
+/// 外部公開 API (`/api/v1/novels/{id}/epub`) からも使うため、認証だけを
+/// 呼び出し側に分離している。
+pub(crate) async fn build_epub_response(env: &Env, id: i64) -> Result<Response> {
+    let services = match composition::build_read_services(env).await {
         Ok(services) => services,
         Err(_) => return Response::error("Service unavailable", 503),
     };
@@ -538,7 +555,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         .as_deref()
         .is_some_and(narou_rs::virtual_novel::is_virtual_ncode)
     {
-        return crate::virtual_novels::download_epub(req, env, id).await;
+        return crate::virtual_novels::build_epub_response(env, id).await;
     }
     let keys = match narou_rs::platform::NovelObjectKeys::new(
         &record.sitename,
@@ -549,11 +566,11 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         Err(error) => return Response::error(format!("Invalid key: {error}"), 500),
     };
 
-    let local_map = load_local_settings_map(&env).await;
+    let local_map = load_local_settings_map(env).await;
     // グローバルスコープの変換設定 (`convert.epub-font` / `line-height`)。
-    let global_map = load_global_settings_map(&env).await;
+    let global_map = load_global_settings_map(env).await;
     let push_sink = crate::push_hub::PushHubSink::shared(
-        crate::push_hub::PushHubClient::new(&env, crate::budget::SubrequestBudget::new()),
+        crate::push_hub::PushHubClient::new(env, crate::budget::SubrequestBudget::new()),
         None,
     );
     let debug_enabled = narou_rs::application::debug::enabled_in_settings(&local_map);
@@ -588,7 +605,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     let text_bytes = match stored {
         Some(bytes) => bytes,
         None => {
-            let runtime = match composition::WorkerRuntime::build(&env).await {
+            let runtime = match composition::WorkerRuntime::build(env).await {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     return Response::error(format!("Service unavailable: {error}"), 503);
@@ -751,7 +768,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         // 本文が要求した挿絵の実体が無い。参照なし・挿絵無効では欠落と判定しない:
         // 「挿絵がどこにも無い」のか「一次ストア (D1) に残っている」のかで
         // 対処が変わる (後者は挿絵側ストアへ取り直せば直る)。
-        report_missing_illustrations(&env, &services.objects, &keys, illust_prefix.as_ref()).await;
+        report_missing_illustrations(env, &services.objects, &keys, illust_prefix.as_ref()).await;
     }
     for name in &skipped {
         narou_rs::application::debug::emit(format!("EPUB: 挿絵を除外: {name}"));

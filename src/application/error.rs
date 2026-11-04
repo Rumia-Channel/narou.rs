@@ -29,6 +29,19 @@ impl ApplicationError {
     pub fn platform(error: impl fmt::Display) -> Self {
         Self::Platform(error.to_string())
     }
+
+    /// The message without the kind prefix ([`fmt::Display`] adds one).
+    ///
+    /// The web layer and the MCP tools show this text to the caller, where
+    /// "not found: ..." reads like an internal label.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Platform(message)
+            | Self::NotFound(message)
+            | Self::InvalidRequest(message)
+            | Self::Conflict(message) => message,
+        }
+    }
 }
 
 impl fmt::Display for ApplicationError {

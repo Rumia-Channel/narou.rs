@@ -110,6 +110,7 @@ pub(crate) const MANAGED_STATES: &[ManagedState] = &[
         StatePurpose::Inventory,
     ),
     state("virtual_novel_members", "virtual_novel_members.yaml", StateScope::Local, StatePurpose::Inventory),
+    state("api_tokens", "api_tokens.yaml", StateScope::Local, StatePurpose::Inventory),
     state("local_setting", "local_setting.yaml", StateScope::Local, StatePurpose::Inventory),
     state("queue", "queue.yaml", StateScope::Local, StatePurpose::ImportExport),
     state("notepad", "notepad.txt", StateScope::Local, StatePurpose::ImportExport),
@@ -174,6 +175,7 @@ mod tests {
                 "favorite_tags",
                 "tag_sequence",
                 "virtual_novel_members",
+                "api_tokens",
                 "local_setting",
             ]
         );
@@ -198,6 +200,7 @@ mod tests {
                 "favorite_tags",
                 "tag_sequence",
                 "virtual_novel_members",
+                "api_tokens",
                 "local_setting",
                 "queue",
                 "notepad",

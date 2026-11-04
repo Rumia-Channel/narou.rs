@@ -993,6 +993,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: crate::commands::login::LoginAction,
     },
+    /// Bearer tokens for the external API (list/create/delete/info).
+    #[command(after_help = "Examples:\n  narou api list\n  narou api create 表生成\n  narou api delete <ID>\n  narou api info")]
+    Api {
+        #[command(subcommand)]
+        action: crate::commands::api::ApiAction,
+    },
     /// Write selected novels to a portable ZIP archive.
     #[command(after_help = "Examples:\n  narou export 1 2 -o novels.zip\n  narou export n9669bk")]
     Export {
