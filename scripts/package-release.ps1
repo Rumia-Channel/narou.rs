@@ -10,6 +10,10 @@ param(
 
     [Parameter(Mandatory = $true)]
     [string]$LoginBinaryPath,
+
+    # MCP (stdIO) 用サブ実行ファイル。未指定なら同梱しない。
+    [string]$McpBinaryPath,
+
     [Parameter(Mandatory = $true)]
     [ValidateSet("win", "mac", "linux")]
     [string]$Platform,
@@ -56,6 +60,13 @@ $resolvedBinary = (Resolve-Path -Path $BinaryPath).Path
 $resolvedUpdaterBinary = (Resolve-Path -Path $UpdaterBinaryPath).Path
 $resolvedBackupBinary = (Resolve-Path -Path $BackupBinaryPath).Path
 $resolvedLoginBinary = (Resolve-Path -Path $LoginBinaryPath).Path
+$resolvedMcpBinary = $null
+if (-not [string]::IsNullOrWhiteSpace($McpBinaryPath)) {
+    if (-not (Test-Path -Path $McpBinaryPath -PathType Leaf)) {
+        throw "MCP binary not found: $McpBinaryPath"
+    }
+    $resolvedMcpBinary = (Resolve-Path -Path $McpBinaryPath).Path
+}
 $resolvedOutputDir = (Resolve-Path -Path $OutputDir).Path
 
 # Windows 版は本体とサブ実行ファイルすべてに Authenticode 署名が要る。
@@ -71,12 +82,16 @@ function Assert-WindowsBinarySigned {
 }
 
 if ($Platform -eq "win" -and -not $SkipSignatureCheck) {
-    foreach ($windowsBinary in @(
-            $resolvedBinary,
-            $resolvedUpdaterBinary,
-            $resolvedBackupBinary,
-            $resolvedLoginBinary
-        )) {
+    $windowsBinaries = @(
+        $resolvedBinary,
+        $resolvedUpdaterBinary,
+        $resolvedBackupBinary,
+        $resolvedLoginBinary
+    )
+    if ($resolvedMcpBinary) {
+        $windowsBinaries += $resolvedMcpBinary
+    }
+    foreach ($windowsBinary in $windowsBinaries) {
         Assert-WindowsBinarySigned -Path $windowsBinary
     }
 }
@@ -211,6 +226,14 @@ try {
         -Archive $archive `
         -SourcePath $resolvedLoginBinary `
         -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedLoginBinary)))
+
+    # MCP (stdIO) 用サブ実行ファイル。指定されたときだけ同梱する。
+    if ($resolvedMcpBinary) {
+        Add-FileToArchive `
+            -Archive $archive `
+            -SourcePath $resolvedMcpBinary `
+            -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedMcpBinary)))
+    }
 
     # `preset/` の利用者が編集する設定ファイルは同梱しない。編集内容を
     # 保持するため、複製して既定値 (`.default`) として同梱する。

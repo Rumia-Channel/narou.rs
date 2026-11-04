@@ -705,6 +705,35 @@ HTTP エラー・エラーフレーム・完了フレームの無い切断は失
 | `/api/global_setting` | GET | ✅ |
 | `/api/global_setting` | POST | ✅ |
 
+### 6.8 外部公開 API (読み取り専用)
+
+`/api/v1` は外部のツール (表の生成・自動化・MCP) 用の読み取り専用 API。
+ブラウザの UI トークンとも Basic 認証とも独立しており、Bearer トークン
+だけでアクセスする。仕様は [`docs/external-api.md`](docs/external-api.md) を参照。
+
+| エンドポイント | メソッド | Rust |
+|-------------|--------|------|
+| `/api/v1` | GET | ✅ (案内) |
+| `/api/v1/novels` | GET | ✅ (一覧。`format=json\|jsonl\|xml`) |
+| `/api/v1/novels/{id}` | GET | ✅ |
+| `/api/v1/novels/{id}/toc` | GET | ✅ (バーチャル小説は連結) |
+| `/api/v1/novels/{id}/sections` | GET | ✅ (全話) |
+| `/api/v1/novels/{id}/sections/{key}` | GET | ✅ (1 話の本文) |
+| `/api/v1/novels/{id}/epub` | GET | ✅ (EPUB) |
+| `/api/v1/tags` | GET | ✅ |
+| `/api/v1/mcp` | POST | ✅ (MCP / JSON-RPC 2.0) |
+
+### 6.9 外部 API の設定 (トークン管理)
+
+設定ページの「外部API」タブが使う。ブラウザの UI トークン (または Worker
+の管理トークン) で保護される。
+
+| エンドポイント | メソッド | Rust |
+|-------------|--------|------|
+| `/api/external_api` | GET | ✅ (接続情報・トークン一覧・Access 資格情報) |
+| `/api/external_api/token` | POST | ✅ (トークン作成) |
+| `/api/external_api/token/{id}` | DELETE | ✅ (トークン削除) |
+
 ### 6.7 ユーティリティ
 
 | エンドポイント | メソッド | Rust |

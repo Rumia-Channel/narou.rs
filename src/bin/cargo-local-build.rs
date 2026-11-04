@@ -29,14 +29,24 @@ fn run() -> Result<(), String> {
     let updater_binary = target_release_dir.join(format!("narou_rs_updater{exe_suffix}"));
     let backup_binary = target_release_dir.join(format!("narou_rs_backup{exe_suffix}"));
     let login_binary = target_release_dir.join(format!("narou_rs_login{exe_suffix}"));
+    let mcp_binary = target_release_dir.join(format!("narou_rs_mcp{exe_suffix}"));
 
     build_release_binary(&options, "narou_rs_updater")?;
     build_release_binary(&options, "narou_rs_backup")?;
     build_release_binary(&options, "narou_rs_login")?;
+    build_release_binary(&options, "narou_rs_mcp")?;
     let updater_hash = sha256_file(&updater_binary)
         .map_err(|err| format!("failed to hash {}: {err}", updater_binary.display()))?;
     build_app_binary(&options, &updater_hash)?;
-    create_local_package(&root, &app_binary, &updater_binary, &backup_binary, &login_binary, options.gpl)?;
+    create_local_package(
+        &root,
+        &app_binary,
+        &updater_binary,
+        &backup_binary,
+        &login_binary,
+        &mcp_binary,
+        options.gpl,
+    )?;
 
     println!("Created {}", root.join("narou").display());
     Ok(())
@@ -140,6 +150,7 @@ fn create_local_package(
     updater_binary: &Path,
     backup_binary: &Path,
     login_binary: &Path,
+    mcp_binary: &Path,
     gpl: bool,
 ) -> Result<(), String> {
     let package_root = root.join("narou");
@@ -177,6 +188,13 @@ fn create_local_package(
     copy_file(updater_binary, &package_root.join(updater_name))?;
     copy_file(backup_binary, &package_root.join(file_name(backup_binary)?))?;
     copy_file(login_binary, &package_root.join(file_name(login_binary)?))?;
+    if !mcp_binary.is_file() {
+        return Err(format!(
+            "mcp binary not found: {}",
+            mcp_binary.display()
+        ));
+    }
+    copy_file(mcp_binary, &package_root.join(file_name(mcp_binary)?))?;
 
     for dir in ["webnovel", "preset"] {
         copy_dir_recursive(&root.join(dir), &package_root.join(dir))?;

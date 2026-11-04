@@ -499,6 +499,18 @@ pub fn load() -> Result<VirtualNovelMembers> {
         .unwrap_or_default())
 }
 
+/// 在庫を [`VirtualNovelDirectory`] として使うアダプタ。
+///
+/// 外部 API と MCP はバーチャル小説の所属 (どの作品をまとめているか) を
+/// 読む必要がある。native 側は在庫の `virtual_novel_members` がその実体。
+pub struct NativeVirtualNovelDirectory;
+
+impl crate::application::external_api::VirtualNovelDirectory for NativeVirtualNovelDirectory {
+    fn members(&self) -> crate::platform::PlatformFuture<'_, Result<VirtualNovelMembers>> {
+        Box::pin(async move { load() })
+    }
+}
+
 pub fn save(members: &VirtualNovelMembers) -> Result<()> {
     let inventory = Inventory::with_default_root()?;
     inventory.save("virtual_novel_members", InventoryScope::Local, members)

@@ -58,6 +58,11 @@ pub const TABS: &[(&str, &str, &str)] = &[
         "ブラウザのある端末で取得したログイン情報を取り込みます",
     ),
     ("authors", "作者", "作者の継続追跡と追跡対象の管理"),
+    (
+        "external_api",
+        "外部API",
+        "外部公開 API (/api/v1) の Bearer トークンと接続情報",
+    ),
 ];
 
 /// Web UI の並び順カラムの表示ラベル。`crate::db::sort_keys()` と長さを揃え、

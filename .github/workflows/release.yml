@@ -110,6 +110,19 @@ jobs:
           path: target/${{ matrix.target }}/release/narou_rs_login.exe
           if-no-files-found: error
 
+      - name: Build MCP binary
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_mcp
+
+      - name: Upload unsigned MCP binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-mcp-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/narou_rs_mcp.exe
+          if-no-files-found: error
+
   sign-helpers:
     name: Sign Windows helper binaries
     needs: build-helpers
@@ -136,6 +149,8 @@ jobs:
             unsigned\unsigned-backup-aarch64-pc-windows-msvc\narou_rs_backup.exe
             unsigned\unsigned-login-x86_64-pc-windows-msvc\narou_rs_login.exe
             unsigned\unsigned-login-aarch64-pc-windows-msvc\narou_rs_login.exe
+            unsigned\unsigned-mcp-x86_64-pc-windows-msvc\narou_rs_mcp.exe
+            unsigned\unsigned-mcp-aarch64-pc-windows-msvc\narou_rs_mcp.exe
 
       - name: Upload signed updater (x64)
         uses: actions/upload-artifact@v4
@@ -177,6 +192,20 @@ jobs:
         with:
           name: signed-login-aarch64-pc-windows-msvc
           path: unsigned/unsigned-login-aarch64-pc-windows-msvc/narou_rs_login.exe
+          if-no-files-found: error
+
+      - name: Upload signed MCP binary (x64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-mcp-x86_64-pc-windows-msvc
+          path: unsigned/unsigned-mcp-x86_64-pc-windows-msvc/narou_rs_mcp.exe
+          if-no-files-found: error
+
+      - name: Upload signed MCP binary (ARM64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-mcp-aarch64-pc-windows-msvc
+          path: unsigned/unsigned-mcp-aarch64-pc-windows-msvc/narou_rs_mcp.exe
           if-no-files-found: error
 
   build:
@@ -389,6 +418,19 @@ jobs:
             cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_updater
           }
 
+      - name: Build MCP binary
+        if: matrix.platform != 'win'
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: |
+          if ("${{ matrix.builder }}" -eq "cross") {
+            $env:PKG_CONFIG_ALLOW_CROSS = "1"
+            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs_mcp
+          } else {
+            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_mcp
+          }
+
       - name: Download signed updater
         if: matrix.platform == 'win'
         uses: actions/download-artifact@v4
@@ -450,10 +492,12 @@ jobs:
             $updaterBinary = "narou_rs_updater.exe"
             $backupBinary = "narou_rs_backup.exe"
             $loginBinary = "narou_rs_login.exe"
+            $mcpBinary = "narou_rs_mcp.exe"
           } else {
             $updaterBinary = "narou_rs_updater"
             $backupBinary = "narou_rs_backup"
             $loginBinary = "narou_rs_login"
+            $mcpBinary = "narou_rs_mcp"
           }
           $commitVersion = "${{ github.ref_name }}"
           if ("${{ github.ref_type }}" -ne "tag") {
@@ -464,6 +508,7 @@ jobs:
             -UpdaterBinaryPath "target/${{ matrix.target }}/release/$updaterBinary" `
             -BackupBinaryPath "target/${{ matrix.target }}/release/$backupBinary" `
             -LoginBinaryPath "target/${{ matrix.target }}/release/$loginBinary" `
+            -McpBinaryPath "target/${{ matrix.target }}/release/$mcpBinary" `
             -Platform "${{ matrix.platform }}" `
             -Arch "${{ matrix.arch }}" `
             -PackageRoot "narou" `
@@ -516,6 +561,12 @@ jobs:
           pattern: signed-login-*
           path: signed-login
 
+      - name: Download signed MCP binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: signed-mcp-*
+          path: signed-mcp
+
       - name: Sign Windows binaries (Certum SimplySign)
         uses: Rumia-Channel/windows-certum-signin@main
         with:
@@ -554,6 +605,10 @@ jobs:
             if (-not (Test-Path -Path $login -PathType Leaf)) {
               throw "Signed login binary not found: $login"
             }
+            $mcp = "signed-mcp\signed-mcp-$($t.Target)\narou_rs_mcp.exe"
+            if (-not (Test-Path -Path $mcp -PathType Leaf)) {
+              throw "Signed MCP binary not found: $mcp"
+            }
             foreach ($v in $variants) {
               $suffix = if ($v -eq "") { "" } else { "-$v" }
               $binary = "unsigned\unsigned-main-$($t.Target)$suffix\narou_rs.exe"
@@ -565,6 +620,7 @@ jobs:
                 -UpdaterBinaryPath $updater `
                 -BackupBinaryPath $backup `
                 -LoginBinaryPath $login `
+                -McpBinaryPath $mcp `
                 -Platform "win" `
                 -Arch $t.Arch `
                 -PackageRoot "narou" `

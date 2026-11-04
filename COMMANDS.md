@@ -108,6 +108,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `export` | — (Rust 拡張) | ✅ 完了 | 選択した作品を ZIP に書き出す (`narou export <target>... -o file.zip`)。`toc.yaml`・本文・`setting.ini`・`replace.txt`・`converter.yaml`・挿絵・EPUB を含み、`manifest.json` にメタデータと SHA-256 を記録。DB-only の作品も一時的に実体化して書き出す |
 | `import` | — (Rust 拡張) | ✅ 完了 | `narou export` の ZIP を取り込む (`narou import file.zip [--overwrite|--skip]`)。`toc_url` が一致する既存作品は上書き/スキップ、無い作品は新しい ID で追加。書込みは YAML / SQLite / S3 挿絵の各バックエンドの ObjectStore 経由で行い、古いアーカイブで既存本文を削らない。Web API `GET /api/transfer/export` / `POST /api/transfer/import` も同じ処理 |
 | `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`rename`/`order`/`clear` を実装。**サイトごとに複数の「名前つきログイン」を試行順つきで保持**し、1 ログインが複数ホストの Cookie を持つ (ブラウザのセッションがホストをまたぐため)。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET /api/login`、`POST /api/login/import\|rename\|order`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}` も対応 |
+| `api` | — (Rust 拡張) | ✅ 完了 | 外部公開 API (`/api/v1`) の Bearer トークン管理。`create`/`list`/`delete`/`info`。設定ページの「外部API」タブからも同じ操作ができる。詳細は [`docs/external-api.md`](docs/external-api.md) |
 | `db` | — (Rust 拡張) | ✅ 完了 | SQLite 管理 DB の保守。`verify` / `export-yaml [--out\|--in-place]` / `vacuum` / `repair-freeze [--dry-run]`。既定は YAML 管理で、SQLite は Web UI 初回ツアーまたは `.narou/storage-backend` マーカーによる opt-in。`repair-freeze` は旧ビルドが残した `freeze.yaml.imported-*` から失われた凍結状態を復旧する |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
@@ -450,6 +451,22 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 
 **ヘルプ**: トップレベル一覧と `narou login -h` は実装と同期している。`-h` の `<sub>` 一覧は `list`/`import`/`export`/`rename`/`order`/`clear` を、Examples は `rename`・`order`・`clear --index` を含む主要形を、オプション一覧は `--passphrase`/`--replace`/`--clear-text`/`--name`/`--index` を表示する。
 **Web UI**: 設定ページ「ログイン」タブで一覧 (サイト → 名前つきログイン)・取り込み (名前欄つき。空欄ならファイル名を使用)・名前変更・並べ替え (上下ボタン)・1 件削除・サイト削除・全削除。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET /api/login`、`POST /api/login/import`、`POST /api/login/rename`、`POST /api/login/order`、`DELETE /api/login`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}`。
+
+---
+
+### 3.z `api` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
+外部公開 API (`/api/v1`) に入るための Bearer トークンを管理する。API そのもの (一覧・目次・本文・EPUB・MCP) の仕様は [`docs/external-api.md`](docs/external-api.md) を参照。
+
+| サブコマンド | 内容 |
+|---|---|
+| `create [名前]` | 新しいトークンを作る。作成したトークンを表示する (値はこの時だけ平文で出る) |
+| `list` | 保存済みトークンを名前・ID・指紋・作成日時つきで表示する |
+| `delete <ID>` | トークンを削除する |
+| `info` | 外部 API の URL・認証モード・エンドポイント一覧を表示する |
+
+保存先は在庫 `api_tokens` (Native は `.narou/api_tokens.yaml` / SQLite `app_state`、Worker は D1 `app_state`)。値は平文 (設定の `server-basic-auth.password` と同じ扱い) で、`external-api.require-token` (既定 true) が有効なあいだ Bearer トークンとして照合される。
+
+Cloudflare Workers では Cloudflare Zero Trust の Service Token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) を優先し、その資格情報が secret に入っていれば narou の Bearer トークンは求めない。Access を設定していない Worker では Bearer トークンを要求する。
 
 ---
 

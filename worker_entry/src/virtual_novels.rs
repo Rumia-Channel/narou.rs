@@ -108,6 +108,28 @@ pub async fn load_from_env(env: &Env) -> Result<VirtualNovelMembers> {
     read(&db).await
 }
 
+/// D1 の所属を [`VirtualNovelDirectory`] として使うアダプタ。
+///
+/// 外部公開 API と MCP はバーチャル小説の所属 (どの作品をまとめているか) を
+/// 読む必要がある。Worker 側は D1 の `app_state` がその実体。
+pub struct D1VirtualNovelDirectory {
+    env: Env,
+}
+
+impl D1VirtualNovelDirectory {
+    pub fn new(env: &Env) -> Self {
+        Self { env: env.clone() }
+    }
+}
+
+impl narou_rs::application::external_api::VirtualNovelDirectory for D1VirtualNovelDirectory {
+    fn members(
+        &self,
+    ) -> narou_rs::platform::PlatformFuture<'_, Result<VirtualNovelMembers>> {
+        Box::pin(async move { load_from_env(&self.env).await })
+    }
+}
+
 async fn composition(db: &DbHandle, members: &[i64]) -> Result<AttributeComposition> {
     core::validate_members(members).map_err(NarouError::InvalidTarget)?;
     let repository = crate::d1_repository::D1NovelRepository::new(db.primary_view());
@@ -485,7 +507,15 @@ pub async fn download_epub(req: Request, env: Env, id: i64) -> worker::Result<Re
     if let Some(response) = crate::auth_failure(&req, &env).await {
         return response;
     }
-    let runtime = WorkerRuntime::build_ui(&env).await?;
+    build_epub_response(&env, id).await
+}
+
+/// 結合 EPUB を生成する (認証は呼び出し側)。
+///
+/// 外部公開 API (`/api/v1/novels/{id}/epub`) からも使うため、認証だけを
+/// 呼び出し側に分離している。
+pub async fn build_epub_response(env: &Env, id: i64) -> worker::Result<Response> {
+    let runtime = WorkerRuntime::build_ui(env).await?;
     let record = match runtime
         .novels
         .get(NovelId(id))
@@ -549,7 +579,7 @@ pub async fn download_epub(req: Request, env: Env, id: i64) -> worker::Result<Re
         return Response::error(format!("EPUB write failed: {error}"), 500);
     }
     let bytes = sink.take();
-    let local_map = crate::load_local_settings_map(&env).await;
+    let local_map = crate::load_local_settings_map(env).await;
     let naming_settings = narou_rs::converter::settings::NovelSettings::default();
     let filename = crate::epub_download_filename(&record, &naming_settings, &local_map);
     let headers = worker::Headers::new();

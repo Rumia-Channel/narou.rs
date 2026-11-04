@@ -323,18 +323,9 @@ impl LibraryService {
             reverse: request.sort_order == LibrarySortOrder::Descending,
         };
 
-        let (records_total, records_filtered, records) = futures::future::try_join3(
-            self.novels.count(&NovelFilter::all()),
-            self.novels.count(&filter),
-            self.novels.query(&NovelQuery::page(
-                filter.clone(),
-                sort,
-                request.start,
-                request.length.unwrap_or(usize::MAX),
-            )),
-        )
-        .await
-        .map_err(ApplicationError::platform)?;
+        let (records_total, records_filtered, records) = self
+            .list_records(filter, sort, request.start, request.length)
+            .await?;
 
         let now = self.clock.now_utc();
         let default_timezone = site_timezone(Some(DEFAULT_SITE_TIMEZONE));
@@ -389,6 +380,35 @@ impl LibraryService {
             records_filtered,
             data,
         })
+    }
+
+    /// Fetch one page of records with a caller-built filter.
+    ///
+    /// The external API assembles its own filter (typed conditions, virtual
+    /// novel grouping, hidden state) and needs the raw records rather than
+    /// the web summary rows, so it uses this entry point instead of
+    /// [`Self::list`]. The counts follow the same contract: the unfiltered
+    /// total and the filtered total.
+    pub async fn list_records(
+        &self,
+        filter: NovelFilter,
+        sort: NovelSort,
+        start: usize,
+        length: Option<usize>,
+    ) -> Result<(u64, u64, Vec<NovelRecord>), ApplicationError> {
+        let (records_total, records_filtered, records) = futures::future::try_join3(
+            self.novels.count(&NovelFilter::all()),
+            self.novels.count(&filter),
+            self.novels.query(&NovelQuery::page(
+                filter.clone(),
+                sort,
+                start,
+                length.unwrap_or(usize::MAX),
+            )),
+        )
+        .await
+        .map_err(ApplicationError::platform)?;
+        Ok((records_total, records_filtered, records))
     }
 
     /// Build the typed filter for a search string.
