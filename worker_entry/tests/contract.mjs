@@ -514,7 +514,7 @@ await check("GET /api/novels/:id/download.epub returns 404 for an unknown novel"
 // 外部公開 API (/api/v1) は Bearer トークンで認証する。Access を設定した
 // Worker では Zero Trust が境界なので、Bearer を見ない (その構成では
 // 「トークン無しで 401」という検査が成り立たない)。
-await check("GET /api/v1/novels refuses a request without a valid Bearer token", async () => {
+await checkWithAuth("GET /api/v1/novels refuses a request without a valid Bearer token", async () => {
   if (ACCESS_CLIENT_ID && ACCESS_CLIENT_SECRET) {
     return;
   }
@@ -544,6 +544,13 @@ await check("a token from /api/external_api/token opens the external API", async
     assert.equal(listed.status, 200, `status ${listed.status}`);
     const payload = await json(listed);
     assert(Array.isArray(payload?.data), "data must be an array");
+    // native と同じく `x-narou-api-token` ヘッダでも通る。
+    const viaHeader = await request("/api/v1/novels?limit=1", {
+      headers: { "x-narou-api-token": token },
+    });
+    assert.equal(viaHeader.status, 200, `status ${viaHeader.status}`);
+    const headerPayload = await json(viaHeader);
+    assert(Array.isArray(headerPayload?.data), "data must be an array");
   } finally {
     const removed = await request(`/api/external_api/token/${encodeURIComponent(body.token.id)}`, {
       method: "DELETE",

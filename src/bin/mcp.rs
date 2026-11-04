@@ -5,7 +5,7 @@
 //! 工具として使える。外部公開 API (`/api/v1`) と同じ条件・同じ出力形式
 //! (JSON / JSON Lines / XML) を返す。
 //!
-//! 通信は 1 行 1 JSON の JSON-RPC 2.0 (stdIO 传输)。応答が要らない通知
+//! 通信は 1 行 1 JSON の JSON-RPC 2.0 (stdIO 伝送)。応答が要らない通知
 //! (id なし) には答えない。
 //!
 //! Usage:
@@ -74,7 +74,9 @@ fn run(args: Args) -> Result<(), String> {
     narou_rs::db::init_database().map_err(|error| error.to_string())?;
     let inventory = match &args.root {
         Some(root) => Inventory::new(root.clone()),
-        None => Inventory::with_default_root().map_err(|error| error.to_string())?,
+        None => Inventory::with_default_root().map_err(|error| {
+            format!("{error}\n(ライブラリフォルダは --root で指定できます)")
+        })?,
     };
     let services = NativeAppServices::new(std::sync::Arc::new(inventory))
         .map_err(|error| error.to_string())?;

@@ -1,4 +1,5 @@
 //! Read-only external API over the novel library.
+//! 小説ライブラリに対する読み取り専用の外部 API。
 //!
 //! 外部連携 (表の生成・自動化・MCP) 用の読み取り専用 API。Web UI の
 //! `/api/list` と同じ一覧ロジック (検索・型付き絞り込み・並び替え) を共有し、
@@ -1027,7 +1028,7 @@ fn xml_escape(text: &str) -> String {
     out
 }
 
-/// 目次から 1 行ずつのsections を作る。
+/// 目次からセクションの要素を 1 行ずつ作る。
 fn sections_of(toc: &TocObject, owner: i64) -> Vec<ExternalTocSection> {
     toc.subtitles
         .iter()

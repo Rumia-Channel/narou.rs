@@ -125,24 +125,22 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
         ["novels"] => api_novels(&req, &env, &services.app).await,
         ["tags"] => api_tags(&req, &env, &services.app).await,
         ["mcp"] => api_mcp(req, &env, &services.app).await,
-        ["novels", id] => api_novel(&req, &env, &services.app, parse_id(id)).await,
-        ["novels", id, "toc"] => {
-            api_novel_toc(&req, &env, &services.app, parse_id(id)).await
-        }
-        ["novels", id, "epub"] => api_novel_epub(&env, parse_id(id)).await,
-        ["novels", id, "sections"] => {
-            api_novel_sections(&req, &env, &services.app, parse_id(id)).await
-        }
+        ["novels", id] => api_novel(&req, &env, &services.app, id).await,
+        ["novels", id, "toc"] => api_novel_toc(&req, &env, &services.app, id).await,
+        ["novels", id, "epub"] => api_novel_epub(&env, id).await,
+        ["novels", id, "sections"] => api_novel_sections(&req, &env, &services.app, id).await,
         ["novels", id, "sections", key] => {
-            api_novel_section(&req, &env, &services.app, parse_id(id), key).await
+            api_novel_section(&req, &env, &services.app, id, key).await
         }
         _ => Response::error("Not Found", 404),
     }
 }
 
-/// ID を数値にする。
-fn parse_id(value: &str) -> Option<i64> {
-    value.parse::<i64>().ok()
+/// ID を数値にする (不正なら 400 の JSON)。
+fn parse_id(value: &str) -> worker::Result<i64> {
+    value.parse::<i64>().map_err(|_| {
+        worker::Error::RustError(format!("ID が不正です: {value}"))
+    })
 }
 
 /// 外部 API の認証。
@@ -208,17 +206,22 @@ fn header_value(req: &Request, name: &str) -> Option<String> {
 }
 
 /// Bearer トークンを取り出す。
+///
+/// native と同じく `Authorization: Bearer <token>` と
+/// `x-narou-api-token: <token>` のどちらでも受け取る。
 fn bearer_token(req: &Request) -> Option<String> {
-    let value = header_value(req, "authorization")?;
-    let token = value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))?;
-    let token = token.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
+    if let Some(value) = header_value(req, "authorization") {
+        let token = value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "));
+        if let Some(token) = token {
+            let token = token.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
     }
+    header_value(req, "x-narou-api-token")
 }
 
 /// 一定時間比較。
@@ -289,6 +292,7 @@ async fn api_index(req: &Request) -> worker::Result<Response> {
             { "path": "/api/v1/novels", "description": "一覧 (条件・並び替え・出力形式を選べる)" },
             { "path": "/api/v1/novels/{id}", "description": "作品 1 件の情報" },
             { "path": "/api/v1/novels/{id}/toc", "description": "作品 1 件の目次 (バーチャル小説は連結)" },
+            { "path": "/api/v1/novels/{id}/sections", "description": "作品 1 件の全話の本文" },
             { "path": "/api/v1/novels/{id}/sections/{key}", "description": "作品 1 件の 1 話の本文" },
             { "path": "/api/v1/novels/{id}/epub", "description": "作品 1 件の EPUB" },
             { "path": "/api/v1/tags", "description": "タグの一覧" },
@@ -337,14 +341,15 @@ async fn api_novel(
     req: &Request,
     env: &Env,
     services: &narou_rs::application::AppServices,
-    id: Option<i64>,
+    id: &str,
 ) -> worker::Result<Response> {
     let _ = env;
     if !matches!(req.method(), Method::Get | Method::Head) {
         return Response::error("Method Not Allowed", 405);
     }
-    let Some(id) = id else {
-        return Response::error("Not Found", 404);
+    let id = match parse_id(id) {
+        Ok(id) => id,
+        Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
     match services.external_api.novel(id).await {
         Ok(novel) => {
@@ -371,14 +376,15 @@ async fn api_novel_toc(
     req: &Request,
     env: &Env,
     services: &narou_rs::application::AppServices,
-    id: Option<i64>,
+    id: &str,
 ) -> worker::Result<Response> {
     let _ = env;
     if !matches!(req.method(), Method::Get | Method::Head) {
         return Response::error("Method Not Allowed", 405);
     }
-    let Some(id) = id else {
-        return Response::error("Not Found", 404);
+    let id = match parse_id(id) {
+        Ok(id) => id,
+        Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
     match services.external_api.toc(id).await {
         Ok(toc) => {
@@ -405,14 +411,15 @@ async fn api_novel_sections(
     req: &Request,
     env: &Env,
     services: &narou_rs::application::AppServices,
-    id: Option<i64>,
+    id: &str,
 ) -> worker::Result<Response> {
     let _ = env;
     if !matches!(req.method(), Method::Get | Method::Head) {
         return Response::error("Method Not Allowed", 405);
     }
-    let Some(id) = id else {
-        return Response::error("Not Found", 404);
+    let id = match parse_id(id) {
+        Ok(id) => id,
+        Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
     let toc = match services.external_api.toc(id).await {
         Ok(toc) => toc,
@@ -438,15 +445,16 @@ async fn api_novel_section(
     req: &Request,
     env: &Env,
     services: &narou_rs::application::AppServices,
-    id: Option<i64>,
+    id: &str,
     key: &str,
 ) -> worker::Result<Response> {
     let _ = env;
     if !matches!(req.method(), Method::Get | Method::Head) {
         return Response::error("Method Not Allowed", 405);
     }
-    let Some(id) = id else {
-        return Response::error("Not Found", 404);
+    let id = match parse_id(id) {
+        Ok(id) => id,
+        Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
     let key = percent_decode(key);
     match services.external_api.section(id, &key).await {
@@ -464,9 +472,10 @@ async fn api_novel_section(
 }
 
 /// EPUB。
-async fn api_novel_epub(env: &Env, id: Option<i64>) -> worker::Result<Response> {
-    let Some(id) = id else {
-        return Response::error("Not Found", 404);
+async fn api_novel_epub(env: &Env, id: &str) -> worker::Result<Response> {
+    let id = match parse_id(id) {
+        Ok(id) => id,
+        Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
     crate::build_epub_response(env, id).await
 }

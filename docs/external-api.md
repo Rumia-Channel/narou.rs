@@ -48,7 +48,7 @@ Workers では Access の Service Token は CI で secret として投入する�
 
 | 値 | Content-Type | 形 |
 |---|---|---|
-| `json` (既定) | `application/json` | 1 つの JSON 文档 |
+| `json` (既定) | `application/json` | 1 つの JSON ドキュメント |
 | `jsonl` | `application/x-ndjson` | 1 行 1 レコード |
 | `xml` | `application/xml` | XML |
 
@@ -116,6 +116,7 @@ Workers では Access の Service Token は CI で secret として投入する�
 - EPUB は保存済みのファイルを返し、無ければその場で生成する
   (`lite` ビルド / 外部 AozoraEpub3)。バーチャル小説の ID を渡すと、
   メンバーの目次と本文を結合した EPUB を返す (native と Worker で同じ)。
+  Content-Type は `application/epub+zip`。
 
 ## MCP
 
