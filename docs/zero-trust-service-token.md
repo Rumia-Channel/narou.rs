@@ -62,6 +62,46 @@ Trust (Access) の **Service Token** を必要とする。この token は **手
 - Access を設定していない Worker (secret 未投入) は、narou の Bearer
   トークンを要求する。トークンが 1 件も無ければ通らない (fail closed)。
 
+## 単一ヘッダーで認証する（AI 系のクライアント向け）
+
+MCP クライアントや API 連携サービスなど、**`Authorization` ヘッダしか送れない**
+クライアントのために、Access アプリケーションを「単一ヘッダー」方式に
+そろえる。設定すると、Service Token は 1 枚で渡せる。
+
+```http
+Authorization: {"cf-access-client-id": "<CLIENT ID>", "cf-access-client-secret": "<CLIENT SECRET>"}
+```
+
+### 設定は CI が自動でそろえる
+
+デプロイ (`worker_entry/ci/deploy_worker.py`) が、Service Token を設定して
+いる環境 (`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET`) だけ、対象ドメインの
+Access アプリケーションを確認して、無い或者是
+`read_service_tokens_from_header: "Authorization"` を設定する
+(`worker_entry/ci/enable_access_single_header.py`)。冪等なので、何度走っても
+同じ状態になる。権限が無い・対象が無い場合は警告だけを出して配信は続ける
+(トークンには `Access: Apps and Policies (Write)` が必要)。
+
+手動で設定したいときは同じスクリプトを直接呼べる。
+
+```powershell
+$env:CLOUDFLARE_ACCOUNT_ID = "<account id>"
+$env:CLOUDFLARE_API_TOKEN = "<Access: Apps and Policies (Write) を持つ API token>"
+$env:NAROU_ACCESS_DOMAIN = "narou.rumia-ch.uk"
+python worker_entry/ci/enable_access_single_header.py
+```
+
+ダッシュボードからなら Zero Trust → Access controls → Applications → 対象
+アプリケーション → 設定の「Read service tokens from header」を `Authorization`
+にして保存する。
+
+### Worker 側の受け方
+
+Worker は 2 通りとも受け付ける（`CF-Access-Client-Id` /
+`CF-Access-Client-Secret` のヘッダ対と、上の Authorization の JSON 形式）。
+Access が前段にあるため、ブラウザ用の narou Bearer トークンは Access を
+設定した Worker では不要。
+
 ## 確認
 
 ```powershell

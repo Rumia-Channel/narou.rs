@@ -156,14 +156,25 @@ async fn authorize(
     let client_id = crate::secrets::value(env, ACCESS_CLIENT_ID_SECRET).await;
     let client_secret = crate::secrets::value(env, ACCESS_CLIENT_SECRET_SECRET).await;
     if let (Some(client_id), Some(client_secret)) = (client_id, client_secret) {
-        let presented_id = header_value(req, "CF-Access-Client-Id");
-        let presented_secret = header_value(req, "CF-Access-Client-Secret");
-        let matched = presented_id
-            .as_deref()
-            .is_some_and(|value| constant_time_eq(value, &client_id))
-            && presented_secret
-                .as_deref()
-                .is_some_and(|value| constant_time_eq(value, &client_secret));
+        // Access の「単一ヘッダー」設定 (read_service_tokens_from_header:
+        // Authorization) を有効にした場合、Service Token は
+        // `CF-Access-Client-Id` / `CF-Access-Client-Secret` の組ではなく
+        // Authorization ヘッダに JSON で届く:
+        //   Authorization: {"cf-access-client-id": "…", "cf-access-client-secret": "…"}
+        // AI 系のクライアントは 1 つのヘッダしか送れないため、この形も
+        // 受け付ける。
+        let (presented_id, presented_secret) = match access_token_from_headers(req) {
+            Some(pair) => pair,
+            None => {
+                return Some(json_error(
+                    401,
+                    "authentication_required",
+                    Some("Cloudflare Access の Service Token が不正です"),
+                ));
+            }
+        };
+        let matched = constant_time_eq(&presented_id, &client_id)
+            && constant_time_eq(&presented_secret, &client_secret);
         if matched {
             return None;
         }
@@ -203,6 +214,34 @@ fn header_value(req: &Request, name: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+/// Access の Service Token を取り出す。
+///
+/// 2 通りを受け付ける。
+///
+/// - `CF-Access-Client-Id` / `CF-Access-Client-Secret` のヘッダ対 (既定)
+/// - `Authorization` ヘッダの JSON (Access の「単一ヘッダー」設定で
+///   `read_service_tokens_from_header: Authorization` を有効にした場合)
+fn access_token_from_headers(req: &Request) -> Option<(String, String)> {
+    if let (Some(id), Some(secret)) = (
+        header_value(req, "CF-Access-Client-Id"),
+        header_value(req, "CF-Access-Client-Secret"),
+    ) {
+        return Some((id, secret));
+    }
+    let value = header_value(req, "authorization")?;
+    let parsed: serde_json::Value = serde_json::from_str(value.trim()).ok()?;
+    let id = parsed.get("cf-access-client-id")?.as_str()?.trim().to_string();
+    let secret = parsed
+        .get("cf-access-client-secret")?
+        .as_str()?
+        .trim()
+        .to_string();
+    if id.is_empty() || secret.is_empty() {
+        return None;
+    }
+    Some((id, secret))
 }
 
 /// Bearer トークンを取り出す。

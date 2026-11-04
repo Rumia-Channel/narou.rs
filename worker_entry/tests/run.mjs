@@ -50,13 +50,35 @@ function stop(child) {
 
 // 1. ローカル用の secret。既にあれば触らない (開発者の値を壊さない)。
 const devVars = join(root, ".dev.vars");
+// Access の Service Token 相当の資格情報。Worker 側の検査 (Cloudflare
+// Zero Trust と同じ形式) を契約テストで確かめるために使う。
+const accessClientId = "contract-access-client-id.access";
+const accessClientSecret = "contract-access-client-secret";
 if (!existsSync(devVars)) {
   // 資格情報は at-rest で暗号化されるので、テスト用の鍵も要る (32 バイトの base64)。
   // 32 バイトちょうどでなければ復号鍵として拒否される。
   const loginKey = Buffer.alloc(32, 7).toString("base64");
-  writeFileSync(devVars, `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${loginKey}\n`);
+  writeFileSync(
+    devVars,
+    `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${loginKey}\n` +
+      `NAROU_CF_ACCESS_CLIENT_ID=${accessClientId}\n` +
+      `NAROU_CF_ACCESS_CLIENT_SECRET=${accessClientSecret}\n`,
+  );
   console.log(`wrote ${devVars}`);
 } else {
+  // 開発者の値を壊さないので、Access の項目だけ足す (既にあれば触らない)。
+  const current = readFileSync(devVars, "utf8");
+  const additions = [];
+  if (!current.includes("NAROU_CF_ACCESS_CLIENT_ID=")) {
+    additions.push(`NAROU_CF_ACCESS_CLIENT_ID=${accessClientId}`);
+  }
+  if (!current.includes("NAROU_CF_ACCESS_CLIENT_SECRET=")) {
+    additions.push(`NAROU_CF_ACCESS_CLIENT_SECRET=${accessClientSecret}`);
+  }
+  if (additions.length) {
+    writeFileSync(devVars, `${current.replace(/\n*$/, "\n")}${additions.join("\n")}\n`);
+    console.log(`added the Access test credentials to ${devVars}`);
+  }
   console.log(
     `${devVars} exists; using it as-is (NAROU_ADMIN_TOKEN and NAROU_RS_LOGIN_KEY must be set)`,
   );
@@ -142,7 +164,13 @@ try {
       stdio: "inherit",
       env: { ...process.env, BASE_URL: base, NAROU_ADMIN_TOKEN: token, ...extraEnv },
     });
-  const contract = runContract({ CONTRACT_QUEUE: process.env.CONTRACT_QUEUE ?? "1" });
+  const contract = runContract({
+    CONTRACT_QUEUE: process.env.CONTRACT_QUEUE ?? "1",
+    // Worker 側の Access 検査に掛からないよう、Worker と同じ資格情報を渡す
+    // (ローカルでは .dev.vars に書いたテスト用の値)。
+    CF_ACCESS_CLIENT_ID: accessClientId,
+    CF_ACCESS_CLIENT_SECRET: accessClientSecret,
+  });
   exitCode = contract.status ?? 1;
 
   // タグの登録順 (連番表) は作品と同じ batch で確定する。

@@ -511,13 +511,10 @@ await check("GET /api/novels/:id/download.epub returns 404 for an unknown novel"
   assert(response.status === 404, `status ${response.status}`);
 });
 
-// 外部公開 API (/api/v1) は Bearer トークンで認証する。Access を設定した
-// Worker では Zero Trust が境界なので、Bearer を見ない (その構成では
-// 「トークン無しで 401」という検査が成り立たない)。
-await checkWithAuth("GET /api/v1/novels refuses a request without a valid Bearer token", async () => {
-  if (ACCESS_CLIENT_ID && ACCESS_CLIENT_SECRET) {
-    return;
-  }
+// 外部公開 API (/api/v1) の認証。Access の Service Token を設定した Worker
+// では Zero Trust が境界なので、narou の Bearer トークンは使わない。资格
+// 情報の無い要求は 401 で弾かれる。
+await check("GET /api/v1/novels refuses a request without a valid credential", async () => {
   const anonymous = await fetch(url("/api/v1/novels"));
   assert.equal(anonymous.status, 401, `status ${anonymous.status}`);
   const wrong = await request("/api/v1/novels", {
@@ -526,7 +523,41 @@ await checkWithAuth("GET /api/v1/novels refuses a request without a valid Bearer
   assert.equal(wrong.status, 401, `status ${wrong.status}`);
 });
 
+// Access の Service Token は 2 通りで渡せる:
+// - `CF-Access-Client-Id` / `CF-Access-Client-Secret` のヘッダ対
+// - `Authorization` ヘッダの JSON (Access の read_service_tokens_from_header)
+await check("a Cloudflare Access service token opens the external API", async () => {
+  if (!ACCESS_CLIENT_ID || !ACCESS_CLIENT_SECRET) {
+    return;
+  }
+  const listed = await request("/api/v1/novels?limit=1", {
+    headers: {
+      "CF-Access-Client-Id": ACCESS_CLIENT_ID,
+      "CF-Access-Client-Secret": ACCESS_CLIENT_SECRET,
+    },
+  });
+  assert.equal(listed.status, 200, `status ${listed.status}`);
+  const payload = await json(listed);
+  assert(Array.isArray(payload?.data), "data must be an array");
+
+  const single = await request("/api/v1/novels?limit=1", {
+    headers: {
+      authorization: JSON.stringify({
+        "cf-access-client-id": ACCESS_CLIENT_ID,
+        "cf-access-client-secret": ACCESS_CLIENT_SECRET,
+      }),
+    },
+  });
+  assert.equal(single.status, 200, `status ${single.status}`);
+  const singlePayload = await json(single);
+  assert(Array.isArray(singlePayload?.data), "data must be an array");
+});
+
+// Access を設定していない Worker では narou の Bearer トークンが使える。
 await check("a token from /api/external_api/token opens the external API", async () => {
+  if (ACCESS_CLIENT_ID && ACCESS_CLIENT_SECRET) {
+    return;
+  }
   const created = await request("/api/external_api/token", {
     method: "POST",
     headers: { "content-type": "application/json", ...auth().headers },
