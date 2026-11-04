@@ -467,6 +467,20 @@ async fn serve_epub_file(file_path: &std::path::Path) -> Result<Response, (Statu
     Ok(response)
 }
 
+/// 応答の Content-Type を EPUB として明示する。
+///
+/// WEB UI のダウンロード (`serve_epub_file`) は `application/octet-stream`
+/// のままにする (ブラウザが拡張子で扱うため)。外部公開 API は
+/// `application/epub+zip` を返すので、受け側が Content-Type で EPUB と
+/// 判定できる (Worker 側と同じ)。
+fn as_epub_response(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/epub+zip"),
+    );
+    response
+}
+
 /// EPUB を返す (外部公開 API 用)。
 ///
 /// 保存済みの EPUB があればそれを、無ければ `lite` ビルドではその場で生成
@@ -480,7 +494,7 @@ pub(crate) async fn serve_epub(
     let paths = crate::mail::get_ebook_file_paths(record, novel_dir, ".epub")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if let Some(path) = paths.iter().find(|path| path.exists()) {
-        return serve_epub_file(path).await;
+        return Ok(as_epub_response(serve_epub_file(path).await?));
     }
     // バーチャル小説は toc を持たないため、メンバーの目次と本文を結合した
     // EPUB を作る (Worker の `virtual_novels::build_epub_response` と同じ結果)。
@@ -512,7 +526,7 @@ pub(crate) async fn serve_epub(
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        return serve_epub_file(&generated).await;
+        return Ok(as_epub_response(serve_epub_file(&generated).await?));
     }
     #[cfg(feature = "lite")]
     {
@@ -521,7 +535,7 @@ pub(crate) async fn serve_epub(
             crate::compat::load_local_setting_bool("webui.debug-mode"),
         );
         let (bytes, filename) = context.scope(generate_epub_on_demand(id, record, novel_dir)).await?;
-        serve_epub_bytes(bytes, &filename)
+        Ok(as_epub_response(serve_epub_bytes(bytes, &filename)?))
     }
     #[cfg(not(feature = "lite"))]
     {

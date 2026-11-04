@@ -32,7 +32,7 @@ pub const API_PREFIX: &str = "/api/v1";
 /// Bearer 認証を必須にするかどうかの設定。
 pub use crate::application::external_api::REQUIRE_TOKEN_SETTING;
 
-/// トークンを送るalternative ヘッダ名。
+/// トークンを送る別のヘッダ名。
 pub const TOKEN_HEADER: &str = "x-narou-api-token";
 
 /// 一覧のエンドポイント。
@@ -74,12 +74,15 @@ pub async fn api_novels(
 pub async fn api_novel(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     if let Some(response) = authorize(&state, &headers).await {
         return response;
     }
+    let Some(id) = parse_id(&id) else {
+        return invalid_id(&id);
+    };
     let format = format_of(&params);
     match state.services.external_api.novel(id).await {
         Ok(novel) => {
@@ -100,12 +103,15 @@ pub async fn api_novel(
 pub async fn api_novel_toc(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     if let Some(response) = authorize(&state, &headers).await {
         return response;
     }
+    let Some(id) = parse_id(&id) else {
+        return invalid_id(&id);
+    };
     let format = format_of(&params);
     match state.services.external_api.toc(id).await {
         Ok(toc) => {
@@ -122,16 +128,64 @@ pub async fn api_novel_toc(
     }
 }
 
-/// 作品 1 件の 1 話の本文。
-pub async fn api_novel_section(
+/// 作品 1 件の全話の本文。
+pub async fn api_novel_sections(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, key)): Path<(i64, String)>,
+    Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     if let Some(response) = authorize(&state, &headers).await {
         return response;
     }
+    let Some(id) = parse_id(&id) else {
+        return invalid_id(&id);
+    };
+    let format = format_of(&params);
+    let toc = match state.services.external_api.toc(id).await {
+        Ok(toc) => toc,
+        Err(error) => return application_error(error),
+    };
+    let mut sections = Vec::new();
+    for section in &toc.sections {
+        match state.services.external_api.section(id, &section.key).await {
+            Ok(body) => sections.push(serde_json::to_value(&body).unwrap_or(Value::Null)),
+            // 1 話だけ読めなかった場合は、その話だけを飛ばす (話全体が
+            // 失敗したときの取りこぼしを避ける)。
+            Err(error) => {
+                crate::logger::emit_stderr(
+                    &format!(
+                        "外部 API: 本文を読み込めませんでした ({id} / {}): {error}",
+                        section.key
+                    ),
+                    true,
+                );
+            }
+        }
+    }
+    let document = serde_json::json!({ "id": id, "sections": sections });
+    respond(
+        format,
+        &document,
+        "sections",
+        &[("sections", "section")],
+        None,
+    )
+}
+
+/// 作品 1 件の 1 話の本文。
+pub async fn api_novel_section(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, key)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers).await {
+        return response;
+    }
+    let Some(id) = parse_id(&id) else {
+        return invalid_id(&id);
+    };
     let format = format_of(&params);
     match state.services.external_api.section(id, &key).await {
         Ok(section) => {
@@ -148,11 +202,14 @@ pub async fn api_novel_section(
 pub async fn api_novel_epub(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
 ) -> Response {
     if let Some(response) = authorize(&state, &headers).await {
         return response;
     }
+    let Some(id) = parse_id(&id) else {
+        return invalid_id(&id);
+    };
     let record = match state.services.library.get(NovelId(id)).await {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -242,6 +299,7 @@ pub async fn api_index(State(state): State<AppState>, headers: HeaderMap) -> Res
             { "path": "/api/v1/novels", "description": "一覧 (条件・並び替え・出力形式を選べる)" },
             { "path": "/api/v1/novels/{id}", "description": "作品 1 件の情報" },
             { "path": "/api/v1/novels/{id}/toc", "description": "作品 1 件の目次 (バーチャル小説は連結)" },
+            { "path": "/api/v1/novels/{id}/sections", "description": "作品 1 件の全話の本文" },
             { "path": "/api/v1/novels/{id}/sections/{key}", "description": "作品 1 件の 1 話の本文" },
             { "path": "/api/v1/novels/{id}/epub", "description": "作品 1 件の EPUB" },
             { "path": "/api/v1/tags", "description": "タグの一覧" },
@@ -386,6 +444,20 @@ fn presented_token(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
+}
+
+/// パスの ID を取り出す (不正なら `None`)。
+fn parse_id(id: &str) -> Option<i64> {
+    id.parse::<i64>().ok()
+}
+
+/// 不正な ID の応答 (JSON の 400)。
+fn invalid_id(id: &str) -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        &format!("ID が不正です: {id}"),
+    )
 }
 
 /// クエリパラメータを (キー, 値) の列にする。
@@ -785,6 +857,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // 全話 (目次順) を返す経路。
+        let sections: serde_json::Value = client
+            .get(format!("{base}/api/v1/novels/1/sections"))
+            .header("x-narou-api-token", TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json_value()
+            .await;
+        assert_eq!(sections["id"], 1);
+        assert_eq!(sections["sections"].as_array().unwrap().len(), 1);
+        assert_eq!(sections["sections"][0]["body"], "<p>本文</p>");
+        assert_eq!(sections["sections"][0]["key"], "1:1");
         server.abort();
     }
 

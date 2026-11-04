@@ -1,4 +1,5 @@
 //! Bearer tokens for the external (public) API.
+//! 外部公開 API の Bearer トークン管理モジュール。
 //!
 //! 外部公開 API に入るための Bearer トークンをライブラリに持たせる。トークン
 //! は名前つきで、作成・確認・削除は CLI (`narou api token`) と Web UI
@@ -46,7 +47,7 @@ pub struct ApiTokenInfo {
     pub name: String,
     /// トークン本体。
     pub token: String,
-    /// 先頭 8 文字だけ显示了指紋。
+    /// 先頭 8 文字だけ表示した指紋。
     pub fingerprint: String,
     /// 作成日時。
     pub created_at: String,

@@ -609,6 +609,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/novels/{id}", get(external::api_novel))
         .route("/api/v1/novels/{id}/toc", get(external::api_novel_toc))
         .route(
+            "/api/v1/novels/{id}/sections",
+            get(external::api_novel_sections),
+        )
+        .route(
             "/api/v1/novels/{id}/sections/{key}",
             get(external::api_novel_section),
         )

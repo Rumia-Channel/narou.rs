@@ -1125,7 +1125,9 @@ fn services_from(
         self_update: Arc::new(NoopSelfUpdateService),
         web_actions: Arc::new(EmptyWebActionService),
         virtual_novels: Arc::new(crate::virtual_novels::D1VirtualNovelDirectory::new(env)),
-        api_tokens: Arc::new(crate::api_tokens::D1ApiTokenStore::new(db)),
+        // 書き込み元 (CAS で比べるスナップショット) は stale な replica を
+        // 見ない primary 束縛で読む (作者一覧と同じ扱い)。
+        api_tokens: Arc::new(crate::api_tokens::D1ApiTokenStore::new(db.primary_view())),
     })
 }
 

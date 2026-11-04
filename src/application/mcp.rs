@@ -1,10 +1,11 @@
 //! MCP (Model Context Protocol) server layered on the external API.
+//! 外部 API 上に構築された MCP (Model Context Protocol) サーバー。
 //!
 //! 外部公開 API と同じ読み取り専用データだけを MCP のツールとして出す。
 //! ツールは外部 API の条件 (検索・絞り込み・出力形式) をそのまま引数で受け
 //! 取り、返り値は API と同じ JSON / JSON Lines / XML。
 //!
-//! JSON-RPC 2.0 の実装で、HTTP 传输 (native の `POST /api/v1/mcp` と
+//! JSON-RPC 2.0 の実装で、HTTP 伝送 (native の `POST /api/v1/mcp` と
 //! Worker の同じパス) と stdIO (バイナリ `narou_rs_mcp`) の両方で使う。
 //! 通知 (id なし) には応答しない。
 

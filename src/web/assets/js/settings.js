@@ -465,7 +465,7 @@ import { confirmDialog, promptDialog } from './ui/dialog.js';
   async function deleteExternalApiToken(pane, id) {
     const ok = await confirmDialog({
       title: '確認',
-      message: 'このトークンを削除しますか? -using している外部ツールは認証に失敗します。',
+      message: 'このトークンを削除しますか? 使っている外部ツールは認証に失敗します。',
       danger: true,
     });
     if (!ok) return;
