@@ -506,7 +506,11 @@ async fn api_mcp(
     services: &narou_rs::application::AppServices,
 ) -> worker::Result<Response> {
     if req.method() != Method::Post {
-        return Response::error("Method Not Allowed", 405);
+        return json_error(
+            405,
+            "method_not_allowed",
+            Some("MCP は POST (JSON-RPC 2.0) のみ対応です"),
+        );
     }
     let body = req.bytes().await?;
     let request: Value = match serde_json::from_slice(&body) {

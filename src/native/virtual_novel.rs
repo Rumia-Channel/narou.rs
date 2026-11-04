@@ -499,7 +499,7 @@ pub fn load() -> Result<VirtualNovelMembers> {
         .unwrap_or_default())
 }
 
-/// 在庫を [`VirtualNovelDirectory`] として使うアダプタ。
+/// 在庫を [`VirtualNovelDirectory`](crate::application::external_api::VirtualNovelDirectory) として使うアダプタ。
 ///
 /// 外部 API と MCP はバーチャル小説の所属 (どの作品をまとめているか) を
 /// 読む必要がある。native 側は在庫の `virtual_novel_members` がその実体。
