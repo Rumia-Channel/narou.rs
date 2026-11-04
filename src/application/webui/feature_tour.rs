@@ -228,6 +228,18 @@ pub const FEATURE_TOURS: &[FeatureTourEntry] = &[
         ],
     },
     FeatureTourEntry {
+        version: "0.6.0",
+        title: "外部公開 API と MCP",
+        body: "外部のツール (表の生成・自動化・LLM) からライブラリの読み取り専用データへアクセスできる外部公開 API (/api/v1) を追加しました。同じ読み取り専用データを MCP の tool としても使えます。",
+        items: &[
+            "一覧・目次・本文・EPUB を JSON / JSON Lines / XML で返す (/api/v1)",
+            "条件での絞り込みと、バーチャル小説を「まとめる / 個別に出す / 出さない」の切替",
+            "MCP は POST /api/v1/mcp と、stdIO の narou_rs_mcp で同じ tool を公開",
+            "認証は Bearer トークン。設定ページの「外部API」タブで作成・確認・削除できる",
+            "Cloudflare Workers では Zero Trust の Service Token を優先する",
+        ],
+    },
+    FeatureTourEntry {
         version: "0.5.4",
         title: "Web UI のコンソール表示",
         body: "「History」で表示した内容に HTML タグがそのまま出るのを直し、WebSocket が繋がらない環境でもコンソールが更新されるようにしました。",
