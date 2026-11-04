@@ -22,6 +22,7 @@ import {
   handleRegisterParam,
   refreshList,
   refreshQueue,
+  setQueueStatusObserver,
   refreshQueueDetailed,
   refreshTags,
   refreshFavoriteTags,
@@ -94,6 +95,7 @@ async function init() {
   initDropdowns();
   initFeatureTour();
   applyI18n();
+  initProgressQueueSync();
   bindActions();
   initConsoleSizing();
   bindConsoleAutoScroll(El.console);
@@ -143,10 +145,7 @@ async function init() {
   // Periodic refresh
   const interval = Math.max(State.pollIntervalSeconds, 10) * 1000;
   setInterval(async () => {
-    const progressRevision = progressStateRevision;
     await Promise.all([refreshListWithUiState(), refreshQueue()]);
-    // イベント取りこぼしで残ったバーを、キューが空になった時点で片付ける。
-    if (progressRevision === progressStateRevision) clearProgressBarsWhenQueueIdle(State.queueStatus);
     if (isQueueModalOpen()) {
       await refreshQueueDetailed();
     }
@@ -347,7 +346,7 @@ function handleWsMessage(msg) {
     case 'status':
     case 'queue':
     case 'notification.queue':
-      refreshQueueAndSyncProgressBars();
+      refreshQueue();
       refreshQueueDetailedIfOpen();
       break;
     case 'refresh':
@@ -381,12 +380,12 @@ function handleWsMessage(msg) {
       break;
     case 'queue_complete':
       removeProgressBarsForScope(queueEventJobId(msg.data));
-      refreshQueueAndSyncProgressBars();
+      refreshQueue();
       refreshQueueDetailedIfOpen();
       break;
     case 'queue_failed':
       removeProgressBarsForScope(queueEventJobId(msg.data));
-      refreshQueueAndSyncProgressBars();
+      refreshQueue();
       refreshQueueDetailedIfOpen();
       notifyQueueFailure(msg.data);
       break;
@@ -398,14 +397,14 @@ function handleWsMessage(msg) {
     case 'queue_partial':
     case 'queue.partial':
       removeProgressBarsForScope(queueEventJobId(msg.data));
-      refreshQueueAndSyncProgressBars();
+      refreshQueue();
       refreshQueueDetailed();
       notifyQueuePartial(msg.data);
       break;
     case 'queue_cancelled':
     case 'queue.cancelled':
       removeProgressBarsForScope(queueEventJobId(msg.data));
-      refreshQueueAndSyncProgressBars();
+      refreshQueue();
       refreshQueueDetailed();
       notifyQueueCancelled(msg.data);
       break;
@@ -681,6 +680,7 @@ var progressBars = {};
 var closedProgressOperations = new Map();
 var closedProgressScopes = new Map();
 var progressStateRevision = 0;
+var progressQueueSyncTimer = null;
 
 function getProgressHost(targetConsole) {
   var consoleEl = getConsoleEl(targetConsole);
@@ -750,14 +750,21 @@ function clearProgressBarsWhenQueueIdle(queueStatus) {
   });
 }
 
-function refreshQueueAndSyncProgressBars() {
-  var revision = progressStateRevision;
-  var pending = refreshQueue();
-  if (pending && typeof pending.then === 'function') {
-    pending.then(function() {
-      if (revision === progressStateRevision) clearProgressBarsWhenQueueIdle(State.queueStatus);
-    }, function() {});
-  }
+function initProgressQueueSync() {
+  setQueueStatusObserver({
+    before: () => progressStateRevision,
+    after: (status, revision) => {
+      if (revision === progressStateRevision) clearProgressBarsWhenQueueIdle(status);
+    },
+  });
+}
+
+function scheduleProgressQueueSync() {
+  if (progressQueueSyncTimer !== null) return;
+  progressQueueSyncTimer = setTimeout(function() {
+    progressQueueSyncTimer = null;
+    void refreshQueue();
+  }, 50);
 }
 
 function setProgressBar(data, targetConsole, isInit) {
@@ -790,6 +797,7 @@ function setProgressBar(data, targetConsole, isInit) {
       scope: data.scope || '', operation: data.operation || '', sequence: -1,
     };
     updateProgressHostVisibility(targetConsole);
+    if (entry.scope) scheduleProgressQueueSync();
   }
   if (hasSequence) entry.sequence = data.sequence;
   var total = Number.isFinite(data.total) && data.total > 0 ? data.total : null;
@@ -823,6 +831,8 @@ function removeProgressBar(data, targetConsole) {
 }
 
 function clearAllProgressBars() {
+  clearTimeout(progressQueueSyncTimer);
+  progressQueueSyncTimer = null;
   Object.keys(progressBars).forEach(discardProgressBar);
   closedProgressOperations.clear();
   closedProgressScopes.clear();

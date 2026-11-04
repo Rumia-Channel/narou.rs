@@ -14,6 +14,14 @@ fn format_ruby_time(value: &DateTime<Utc>) -> String {
         .to_string()
 }
 
+/// 現在時刻を narou.rb 互換の書式で文字列にする。
+///
+/// 内部の記録 (トークンの作成時刻など) は既存の作品データと同じ書式に
+/// そろえる。
+pub fn now_string() -> String {
+    format_ruby_time(&Utc::now())
+}
+
 fn parse_ruby_time(value: &str) -> Option<DateTime<Utc>> {
     let value = value.trim();
     if value.is_empty() {

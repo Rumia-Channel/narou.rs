@@ -180,6 +180,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "server-basic-auth.password"
         | "server-ws-add-accepted-domains"
         | "server-add-accepted-hosts"
+        | "external-api.require-token"
         | "self-update.variant"
         | "convert.epub-engine"
         | "convert.epub-font"
@@ -1194,6 +1195,13 @@ pub fn setting_variables() -> SettingVariables {
             invis(
                 VarType::String,
                 "HTTP の Host ヘッダに追加で許可するホストのリスト（カンマ区切り、*.example.com 形式のワイルドカード対応）",
+            ),
+        ),
+        (
+            "external-api.require-token",
+            vis(
+                VarType::Boolean,
+                "外部公開API (/api/v1) の Bearer トークン認証を必須にするかどうか（既定 true）。Cloudflare Zero Trust の内側で使う場合は false にする",
             ),
         ),
         ("over18", invis(VarType::Boolean, "18歳以上かどうか")),

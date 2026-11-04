@@ -18,6 +18,9 @@ const block = source.slice(start, end);
 const handlerStart = source.indexOf('function handleWsMessage(');
 const handlerEnd = source.indexOf('\nfunction ', handlerStart + 1);
 const handler = source.slice(handlerStart, handlerEnd);
+const actionsSource = fs.readFileSync(new URL('../src/web/assets/js/ui/actions.js', import.meta.url), 'utf8');
+const refreshBlock = actionsSource.slice(actionsSource.indexOf('const refreshRequests = new Map();'),
+  actionsSource.indexOf('export async function refreshQueueDetailed()')).replace(/^export /gm, '');
 
 class FakeElement {
   constructor(className = '') {
@@ -71,6 +74,8 @@ class FakeElement {
 }
 
 function createHarness() {
+  const timers = new Map();
+  let nextTimer = 0;
   const consoles = {
     stdout: new FakeElement('console'),
     stdout2: new FakeElement('console'),
@@ -88,16 +93,26 @@ function createHarness() {
     scheduleConsoleStick: () => {},
     setConsolePinned: () => {},
     State: { concurrencyEnabled: true },
-    refreshQueue: () => Promise.resolve(),
+    fetchJson: async () => null,
+    renderQueueStatus: () => {},
+    setTimeout: (callback) => { const id = ++nextTimer; timers.set(id, callback); return id; },
+    clearTimeout: (id) => timers.delete(id),
     refreshQueueDetailedIfOpen: () => {},
     refreshQueueDetailed: () => {},
     notifyQueueFailure: () => {},
     notifyQueuePartial: () => {},
     notifyQueueCancelled: () => {},
   });
-  vm.runInContext(block + '\n' + handler, context);
+  vm.runInContext(refreshBlock + '\n' + block + '\n' + handler, context);
+  if (typeof context.initProgressQueueSync === 'function') context.initProgressQueueSync();
   return {
     context,
+    flush: async () => {
+      const callbacks = [...timers.values()];
+      timers.clear();
+      for (const callback of callbacks) callback();
+      await new Promise(setImmediate);
+    },
     send: (type, data, target_console = 'stdout') => context.handleWsMessage({ type, data, target_console }),
     rows: (consoleName = 'stdout') => {
       const host = consoles[consoleName].parentElement.querySelector('.console-progress-host');
@@ -182,13 +197,13 @@ test('partial queue status cannot clear jobs and idle preserves manual progress'
 test('a delayed idle response cannot remove progress received during the request', async () => {
   const ui = createHarness();
   let resolve;
-  ui.context.refreshQueue = () => new Promise((done) => { resolve = done; });
-  ui.context.State.queueStatus = { running_count: 0, pending: 0 };
+  ui.context.fetchJson = () => new Promise((done) => { resolve = done; });
   ui.send('progressbar.step', progress('A', 'a1', 1, 4, 1));
-  ui.context.refreshQueueAndSyncProgressBars();
-  ui.send('progressbar.step', progress('B', 'b1', 2, 4, 1));
-  resolve();
+  const pending = ui.context.refreshQueue();
   await Promise.resolve();
+  ui.send('progressbar.step', progress('B', 'b1', 2, 4, 1));
+  resolve({ running_count: 0, pending: 0 });
+  await pending;
   assert.equal(ui.rows().length, 2);
 });
 
@@ -224,4 +239,27 @@ test('failure and cancellation close only their job and reject late progress', (
     ui.send('progressbar.step', progress('A', 'a1', 4, 4, 2));
     assert.deepEqual(ui.rows().map((row) => row.width), ['75%']);
   }
+});
+
+test('replayed terminal progress is cleared promptly without waiting for the table poll', async () => {
+  const ui = createHarness();
+  ui.context.fetchJson = async () => ({ running_count: 0, pending: 0 });
+  for (const id of ['A', 'B', 'C', 'D']) ui.send('progressbar.init', progress(id, id, 0, 0, 0));
+  ui.send('progressbar.step', { topic: 'manual', percent: 40 }, 'stdout2');
+  await ui.flush();
+  assert.deepEqual(ui.rows(), []);
+  assert.equal(ui.rows('stdout2')[0].width, '40%');
+});
+
+test('any successful queue refresh clears orphaned bars but unknown or busy status preserves them', async () => {
+  const ui = createHarness();
+  ui.send('progressbar.step', progress('A', 'a1', 1, 4, 1));
+  for (const status of [{}, { pending: 0 }, { running_count: 1, pending: 0 }]) {
+    ui.context.fetchJson = async () => status;
+    await ui.context.refreshQueue();
+    assert.equal(ui.rows()[0].width, '25%');
+  }
+  ui.context.fetchJson = async () => ({ running_count: 0, pending: 0 });
+  await ui.context.refreshQueue();
+  assert.deepEqual(ui.rows(), []);
 });

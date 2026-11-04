@@ -1,37 +1,25 @@
-# Web UI self-update under systemd (issue #23)
+# systemd 環境下での Web UI セルフアップデート（issue #23）
 
-On Linux, an updater spawned from a `narou_rs` systemd service remains in
-that service's cgroup even when it calls `setsid`. With the default
-`KillMode=control-group`, systemd can terminate it when the Web process
-exits. `Restart=always` may additionally start an old binary before the zip
-has been applied.
+Linux 環境において、`narou_rs` の systemd サービスから起動されたアップデータプロセスは、`setsid` を呼び出した場合でも元のサービスの cgroup に留まります。そのため、既定の `KillMode=control-group` が設定されていると、Web プロセスの終了時に systemd によってアップデータごと強制終了される問題がありました。また、`Restart=always` が設定されている場合、zip ファイルの展開完了前に古いバイナリが再起動してしまう可能性もありました。
 
-Recent builds detect a systemd service in `/proc/self/cgroup`. In that case,
-the Web UI asks `systemd-run` to launch the **installed** updater in its own
-transient service. The updater runs without `--restart` (compatible with
-updaters already included in older release ZIPs); on successful completion,
-the transient service calls `systemctl restart <original-unit>` (or
-`systemctl --user restart` for user units). No change to the original
-`Restart=` or `KillMode=` settings is required.
+近年のビルドでは `/proc/self/cgroup` を参照して systemd サービスの配下にあるかを自動検出します。systemd 環境下であることが検出された場合、Web UI は `systemd-run` を利用して**インストール済みのアップデータ**を独立した一時サービス（transient service）として起動します。このアップデータは `--restart` なしで実行され（古いリリース zip に同梱されていたアップデータとも互換性があります）、アップデートが正常に完了した時点で、一時サービス側から `systemctl restart <元のユニット名>`（ユーザーユニットの場合は `systemctl --user restart`）を呼び出してサービスを再起動します。このため、元のユニット設定における `Restart=` や `KillMode=` を変更する必要はありません。
 
-Requirements:
+## 動作要件
 
-- `systemd-run` and `systemctl` must be available.
-- The Web service's user must have permission to start a transient service
-  through the appropriate systemd manager. The transient service must be
-  able to replace files in the installation directory.
-- When `systemd-run` refuses the handoff, the API returns an error and the Web
-  process **does not exit**. Examine `update.log` and the transient unit's
-  journal (unit name `narou-rs-update-<Web-PID>`).
+- `systemd-run` および `systemctl` が利用可能であること。
+- Web サービスを実行するユーザーが、適切な systemd マネージャ経由で一時サービスを起動する権限を持っていること。また、一時サービスがインストール先ディレクトリのファイルを置換できる権限を持っていること。
+- `systemd-run` によるハンドオフが拒否された場合、API はエラーを返し、Web プロセスは**終了しません**。その際は `update.log` および一時ユニットのジャーナル（ユニット名: `narou-rs-update-<WebプロセスのPID>`）を確認してください。
 
-The fix can only take effect after an updated `narou_rs` executable is
-installed. For an existing v0.3.6 installation that cannot self-update, stop
-`narou.service` using `systemctl stop`, install the latest official release
-ZIP's files into `/opt/narou` using your existing deployment procedure,
-ensure `narou_rs_updater.new` is installed as executable
-`narou_rs_updater`, and start the unit again. Keep the Web library's working
-directory and its `.narou/` files intact. Do not replace a running binary
-while the service is active.
+## アップデータの手動更新（初回復旧手順）
 
-This describes the update handoff on Linux only; outside a detected systemd
-service, the existing detached-updater behavior is unchanged.
+この修正は、修正が適用された `narou_rs` 実行バイナリがインストールされた後に有効となります。セルフアップデートが正常に動作しない既存の v0.3.6 等の環境では、以下の手順で手動更新を行ってください。
+
+1. `systemctl stop narou.service`（または対応するサービス名）でサービスを停止します。
+2. 最新の公式リリース zip を展開し、既存のデプロイ手順に沿って `/opt/narou` 等のインストール先へファイルを配置します。
+3. `narou_rs_updater.new` が実行権限を持つ `narou_rs_updater` として配置されていることを確認します。
+4. サービスを再度起動します（`systemctl start narou.service`）。
+
+※ Web ライブラリの作業ディレクトリおよび `.narou/` 配下のファイルはそのまま保持してください。  
+※ サービス実行中に稼働中のバイナリを直接上書きしないでください。
+
+本ドキュメントは Linux の systemd 環境におけるアップデートのハンドオフ動作を説明したものです。systemd サービス外で実行されている環境では、従来のデタッチされたアップデータの挙動がそのまま維持されます。

@@ -3,8 +3,8 @@
 > **SORAHOST / Cloud Run (GCP) へのリレー配備は非推奨 (2026-10-21) で、Node 版リレーは削除しました。**
 > リレーは Rust 版 `narou_relay` をこの VPS 手順または自宅回線 (`docs/home-relay.md`) で運用してください。
 
-Cloudflare 保護サイト（ハーメルン等）を Workers から取得するための、VPS 上の取得リレーの設定手順です。
-リレーはワークスペース crate `relay/` のバイナリ `narou_relay`（Rust）です。現在の構成と値は次のとおり。
+Cloudflare の保護下にあるサイト（ハーメルン等）を Cloudflare Workers から取得するための、VPS 上の取得リレー設定手順です。
+リレー本体はワークスペース crate `relay/` のバイナリ `narou_relay`（Rust 実装）です。現在の構成と設定値は以下の通りです。
 
 | 項目 | 値 |
 | --- | --- |
@@ -51,7 +51,7 @@ command -v cloudflared
 
 - ビルドだけなら Rust ツールチェーンで足りますが、リンカが必要なため `build-essential` を入れます
 - 実行時に curl / wget の両方が使えない場合は、リレーは起動時に fail fast で終了します（同梱 curl はありません）
-- `cloudflared` は未導入なら https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ から導入する
+- `cloudflared` が未導入の場合は公式ドキュメント（https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/）からインストールしてください
 
 ## 2. リポジトリ
 
@@ -263,7 +263,7 @@ gh workflow run platform.yml --ref develop -f target=develop
 cd ~/narou.rs && git pull && cargo build --release -p narou_relay && sudo systemctl restart narou-relay
 ```
 
-ビルドが失敗した場合は、古いバイナリのまま `restart` しない（更新前に `cargo build` の成否を確認する）。
+ビルドが失敗した場合は古いバイナリのまま再起動しないよう、更新前に必ず `cargo build` の成否を確認してください。
 
 ## 11. トラブルシューティング
 
@@ -320,12 +320,11 @@ sudo systemctl restart narou-relay
 - Native アプリの TLS は OS の証明書ストア（Windows Schannel / Linux OpenSSL / macOS）を使うため、
   OS の更新（Windows Update、`ca-certificates` パッケージ等）が必要です。
 
-## 12. 注意
+## 12. 運用上の注意点
 
-- 3000 番ポートを直接インターネットへ公開しない（公開はトンネル経由のみ）
-- `.env` は 600。キーをログ・チャット・コミットへ出さない
-- 旧 `relay.narou.rumia-ch.uk` の DNS レコードは削除してよい
-- VPS の共有 IPv4 NAT が Cloudflare に拒否される場合、wget でも 403 になる。その場合は自宅回線のリレー（`docs/home-relay.md`）を使う
-- 旧 Cloud Run / SORAHOST 向けの配備スクリプト（`bootstrap.mjs` / `deploy-sorahost.mjs` / `relay.js` / `worker/`）と
-  `docs/cloud-run-relay.md` / `docs/sorahost-relay.md` は削除済み。Node.js の導入も不要
-- 関連資料: `docs/vps-relay.md`（一般手順）、`docs/home-relay.md`（自宅回線）
+- 3000 番ポートを直接インターネットへ公開しないでください（外部公開は Cloudflare Tunnel 経由のみとします）。
+- `.env` のパーミッションは 600（所有者のみ読み書き可能）に設定し、認証キーをログ、チャット、Git コミット等へ露出させないでください。
+- 旧 `relay.narou.rumia-ch.uk` の DNS レコードは不要なため削除して問題ありません。
+- VPS の共有 IPv4 NAT 出口が Cloudflare に拒否される場合、wget を用いても 403 となる場合があります。その際は自宅回線を利用したリレー（`docs/home-relay.md`）の利用をご検討ください。
+- 旧 Cloud Run / SORAHOST 向けの配備スクリプト（`bootstrap.mjs` / `deploy-sorahost.mjs` / `relay.js` / `worker/`）および `docs/cloud-run-relay.md` / `docs/sorahost-relay.md` は廃止・削除済みです。Node.js のインストールも不要です。
+- 関連資料: `docs/vps-relay.md`（一般的な VPS 手順）、`docs/home-relay.md`（自宅回線リレー手順）

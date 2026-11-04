@@ -56,6 +56,12 @@ runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカー�
   到達できない (S3 LIST の失敗は Worker が 503 で返し、この経路で 403 は返さない。
   403 は前段で弾かれた印)。その場合は失敗にせず、警告つきのスキップとして報告する
   (ステップサマリも `skipped`)。DNS/TLS エラーは省略しない。
+  この token は Zero Trust のダッシュボードで手動で作り、リポジトリの secret
+  として登録しておく (CI は token を作らない: 権限の広い Cloudflare token で
+  資格情報を自動発行させるのは避けたい)。同じ値が Worker secret
+  (`NAROU_CF_ACCESS_CLIENT_ID` / `NAROU_CF_ACCESS_CLIENT_SECRET`) としても
+  投入されるので、Worker 側の検査と設定ページの「外部API」タブでの表示に
+  使われる (未設定なら Access を設定していないのと同じ扱い)。
 
 ローカルからは実行しない（Cloudflare の資格情報が要る）。CI からのみ呼ぶ。
 """
@@ -524,6 +530,31 @@ def secret_file(target: str) -> Path | None:
                 f"::notice::{source} is not set; the S3 illustration backend stays fail-closed "
                 f"(set {source} or {store_var})"
             )
+    # Cloudflare Access の service token（任意）。Zero Trust の内側で使うとき、
+    # Worker 側の検査と設定ページの「外部API」タブでの表示に使う。値が無い
+    # ときは Access を設定していないのと同じ扱い（narou の Bearer トークンを
+    # 要求する）。token 自体は手動で作り、ここでは受け渡すだけ。
+    access_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
+    access_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET", "").strip()
+    access_in_store = all(
+        os.environ.get(name, "").strip()
+        for name in (
+            "NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME",
+            "NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME",
+        )
+    )
+    if access_id and access_secret:
+        secrets["NAROU_CF_ACCESS_CLIENT_ID"] = access_id
+        secrets["NAROU_CF_ACCESS_CLIENT_SECRET"] = access_secret
+    elif access_in_store:
+        # Secrets Store に置いている場合、値はストアから Worker が読む。
+        pass
+    elif access_id or access_secret:
+        print(
+            "::notice::CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must be supplied "
+            "together; the Worker's Access check and the settings page stay empty"
+        )
+
     # 外部の取得リレー（任意）。値があるときだけ Worker secret として渡す。
     # 未設定なら Worker 側のリレー段は無効のまま（Cloudflare から取れないサイトが残る）。
     # RELAY_DOMAIN があれば https://<domain> を公開先として優先する（名前付きトンネル用）。

@@ -233,6 +233,15 @@ if (exitCode === 0) {
   exitCode = authors.status ?? 1;
 }
 
+// Persisted progress must recover even when a crashed invocation never sent
+// its terminal event; the fixture uses its own DO storage and D1.
+if (exitCode === 0) {
+  const progress = spawnSync(process.execPath, [join(here, "progress_replay.mjs")], {
+    cwd: root, stdio: "inherit",
+  });
+  exitCode = progress.status ?? 1;
+}
+
 // Transfer archives are verified against two isolated databases (export from
 // one, import into a fresh one), so they never touch the persistent state.
 if (exitCode === 0) {

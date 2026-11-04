@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "narou_rs"
-version = "0.5.9"
+version = "0.6.0"
 edition = "2024"
 license = "BSD-2-Clause"
 readme = "README.md"
@@ -153,6 +153,11 @@ required-features = ["native-runtime"]
 [[bin]]
 name = "narou_rs_login"
 path = "src/bin/login.rs"
+required-features = ["native-runtime"]
+
+[[bin]]
+name = "narou_rs_mcp"
+path = "src/bin/mcp.rs"
 required-features = ["native-runtime"]
 
 [[bin]]

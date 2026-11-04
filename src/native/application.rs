@@ -369,6 +369,10 @@ impl NativeAppServices {
                 site_definitions: site_provider.clone(),
                 self_update: Arc::new(crate::native::self_update::NativeSelfUpdateService),
                 web_actions: Arc::new(crate::native::web_actions::NativeWebActionService),
+                virtual_novels: Arc::new(
+                    crate::native::virtual_novel::NativeVirtualNovelDirectory,
+                ),
+                api_tokens: Arc::new(crate::native::api_tokens::NativeApiTokenStore),
             },
         ));
         Ok(Self {

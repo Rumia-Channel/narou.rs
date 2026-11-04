@@ -341,10 +341,6 @@ pub async fn download_ebook(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Response, (StatusCode, String)> {
-    use axum::body::Body;
-    use axum::http::{HeaderValue, header};
-    use tokio::io::AsyncReadExt;
-
     let record = state
         .services
         .library
@@ -416,7 +412,17 @@ pub async fn download_ebook(
         )
     })?;
 
-    let file = tokio::fs::File::open(&file_path)
+    serve_epub_file(&file_path).await
+}
+
+/// 保存済みの EPUB ファイルを返す。
+async fn serve_epub_file(file_path: &std::path::Path) -> Result<Response, (StatusCode, String)> {
+    use axum::body::Body;
+    use axum::http::HeaderValue;
+    use axum::http::header;
+    use tokio::io::AsyncReadExt;
+
+    let file = tokio::fs::File::open(file_path)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let content_length = file
@@ -459,6 +465,83 @@ pub async fn download_ebook(
     }
 
     Ok(response)
+}
+
+/// 応答の Content-Type を EPUB として明示する。
+///
+/// WEB UI のダウンロード (`serve_epub_file`) は `application/octet-stream`
+/// のままにする (ブラウザが拡張子で扱うため)。外部公開 API は
+/// `application/epub+zip` を返すので、受け側が Content-Type で EPUB と
+/// 判定できる (Worker 側と同じ)。
+fn as_epub_response(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/epub+zip"),
+    );
+    response
+}
+
+/// EPUB を返す (外部公開 API 用)。
+///
+/// 保存済みの EPUB があればそれを、無ければ `lite` ビルドではその場で生成
+/// する。端末設定の影響を受けないよう、拡張子は常に `.epub`。
+pub(crate) async fn serve_epub(
+    state: &AppState,
+    id: i64,
+    record: &crate::db::novel_record::NovelRecord,
+    novel_dir: &std::path::Path,
+) -> Result<Response, (StatusCode, String)> {
+    let paths = crate::mail::get_ebook_file_paths(record, novel_dir, ".epub")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if let Some(path) = paths.iter().find(|path| path.exists()) {
+        return Ok(as_epub_response(serve_epub_file(path).await?));
+    }
+    // バーチャル小説は toc を持たないため、メンバーの目次と本文を結合した
+    // EPUB を作る (Worker の `virtual_novels::build_epub_response` と同じ結果)。
+    if record
+        .ncode
+        .as_deref()
+        .is_some_and(crate::virtual_novel::is_virtual_ncode)
+    {
+        let members = crate::native::virtual_novel::load()
+            .ok()
+            .and_then(|all| all.get(id).map(<[i64]>::to_vec))
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "virtual members not found".to_string(),
+                )
+            })?;
+        let owned = record.clone();
+        let generated = tokio::task::spawn_blocking(move || {
+            crate::native::virtual_novel::convert_virtual(
+                id,
+                &owned,
+                &members,
+                Some(crate::converter::device::Device::Epub),
+                false,
+                false,
+            )
+        })
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        return Ok(as_epub_response(serve_epub_file(&generated).await?));
+    }
+    #[cfg(feature = "lite")]
+    {
+        let context = crate::application::messages::MessageContext::new(
+            state.push_server.clone(),
+            crate::compat::load_local_setting_bool("webui.debug-mode"),
+        );
+        let (bytes, filename) = context.scope(generate_epub_on_demand(id, record, novel_dir)).await?;
+        Ok(as_epub_response(serve_epub_bytes(bytes, &filename)?))
+    }
+    #[cfg(not(feature = "lite"))]
+    {
+        let _ = state;
+        Err((StatusCode::NOT_FOUND, format!("Ebook not found for ID={id}")))
+    }
 }
 
 /// Build an EPUB from the converted 青空文庫 text at request time

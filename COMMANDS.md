@@ -108,6 +108,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `export` | — (Rust 拡張) | ✅ 完了 | 選択した作品を ZIP に書き出す (`narou export <target>... -o file.zip`)。`toc.yaml`・本文・`setting.ini`・`replace.txt`・`converter.yaml`・挿絵・EPUB を含み、`manifest.json` にメタデータと SHA-256 を記録。DB-only の作品も一時的に実体化して書き出す |
 | `import` | — (Rust 拡張) | ✅ 完了 | `narou export` の ZIP を取り込む (`narou import file.zip [--overwrite|--skip]`)。`toc_url` が一致する既存作品は上書き/スキップ、無い作品は新しい ID で追加。書込みは YAML / SQLite / S3 挿絵の各バックエンドの ObjectStore 経由で行い、古いアーカイブで既存本文を削らない。Web API `GET /api/transfer/export` / `POST /api/transfer/import` も同じ処理 |
 | `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`rename`/`order`/`clear` を実装。**サイトごとに複数の「名前つきログイン」を試行順つきで保持**し、1 ログインが複数ホストの Cookie を持つ (ブラウザのセッションがホストをまたぐため)。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET /api/login`、`POST /api/login/import\|rename\|order`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}` も対応 |
+| `api` | — (Rust 拡張) | ✅ 完了 | 外部公開 API (`/api/v1`) の Bearer トークン管理。`create`/`list`/`delete`/`info`。設定ページの「外部API」タブからも同じ操作ができる。詳細は [`docs/external-api.md`](docs/external-api.md) |
 | `db` | — (Rust 拡張) | ✅ 完了 | SQLite 管理 DB の保守。`verify` / `export-yaml [--out\|--in-place]` / `vacuum` / `repair-freeze [--dry-run]`。既定は YAML 管理で、SQLite は Web UI 初回ツアーまたは `.narou/storage-backend` マーカーによる opt-in。`repair-freeze` は旧ビルドが残した `freeze.yaml.imported-*` から失われた凍結状態を復旧する |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
@@ -450,6 +451,22 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 
 **ヘルプ**: トップレベル一覧と `narou login -h` は実装と同期している。`-h` の `<sub>` 一覧は `list`/`import`/`export`/`rename`/`order`/`clear` を、Examples は `rename`・`order`・`clear --index` を含む主要形を、オプション一覧は `--passphrase`/`--replace`/`--clear-text`/`--name`/`--index` を表示する。
 **Web UI**: 設定ページ「ログイン」タブで一覧 (サイト → 名前つきログイン)・取り込み (名前欄つき。空欄ならファイル名を使用)・名前変更・並べ替え (上下ボタン)・1 件削除・サイト削除・全削除。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET /api/login`、`POST /api/login/import`、`POST /api/login/rename`、`POST /api/login/order`、`DELETE /api/login`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}`。
+
+---
+
+### 3.z `api` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
+外部公開 API (`/api/v1`) に入るための Bearer トークンを管理する。API そのもの (一覧・目次・本文・EPUB・MCP) の仕様は [`docs/external-api.md`](docs/external-api.md) を参照。
+
+| サブコマンド | 内容 |
+|---|---|
+| `create [名前]` | 新しいトークンを作る。作成したトークンを表示する (値はこの時だけ平文で出る) |
+| `list` | 保存済みトークンを名前・ID・指紋・作成日時つきで表示する |
+| `delete <ID>` | トークンを削除する |
+| `info` | 外部 API の URL・認証モード・エンドポイント一覧を表示する |
+
+保存先は在庫 `api_tokens` (Native は `.narou/api_tokens.yaml` / SQLite `app_state`、Worker は D1 `app_state`)。値は平文 (設定の `server-basic-auth.password` と同じ扱い) で、`external-api.require-token` (既定 true) が有効なあいだ Bearer トークンとして照合される。
+
+Cloudflare Workers では Cloudflare Zero Trust の Service Token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) を優先し、その資格情報が secret に入っていれば narou の Bearer トークンは求めない。Access を設定していない Worker では Bearer トークンを要求する。
 
 ---
 
@@ -921,6 +938,7 @@ narou setting name         # 読み取り
 - 話数の多い作品の再開では、完了済みの話のメタデータを小説配下の `.download_resume` に保存して復元し、本文の全件読み直しで予算を使い切らない。挿絵索引の保存後にだけメタデータを公開し、未完了の話は含めない。旧版・定期チェックポイントが指す未記録部分だけ本文から復元する。目次の変更・保存済み本文の欠落は破損チェックポイントとして扱い、新規ジョブ開始時と完了時には古い再開メタデータを消す。通常の CLI 取得と `toc.yaml` の形式は変更しない。実 workerd・D1・S3 fixture で 1,685 話・目次 17 ページの継続取得と EPUB 出力を検証する。
 - HTTP 403 等の通常の一時エラーでも、100 話ごとの定期保存に届く前から最新の話境界を記憶し、失敗記録の前にチェックポイントと dirty な挿絵索引を保存する。再試行は `queue.retry-backoff` の期限まで待ち、保存済み本文・画像を取り直さず続行する。予算による区切りとは違い、通常エラーの失敗回数と再試行上限は維持する。古い定期保存が最新の位置を上書きしないよう完了を待ち、破損チェックポイントからの再開始は位置 0 に戻す。
 - Worker の履歴取得・消去は PushHub の永続化履歴に接続し、再接続でも消去済みの行を復活させない。`webui.table.reload-timing` は実際の台帳の待機・実行数でテーブル更新を制御し、進捗・通知は抑止しない。
+- Worker の進捗保存は、終端イベントが届かなかったジョブ（実行中の異常終了など）を再接続時に検出して片付ける。保存済み進捗のスコープだけを D1 台帳の主キーで引き、終端済み（`succeeded` / `permanent` / `blocked`）の進捗を削除する。台帳全体や話ごとの走査は行わない。実行中のジョブの進捗・コンソール履歴・保存済み本文は保持する。Web UI はキューが空になった時点で残存バッチを即時に消し、周期更新（既定600秒）までの待ちを残さない。
 - 設定保存は `webui.config.reload` を配信する。UI のテーブル・タグ更新は debounce / single-flight で合流し、古い応答を反映しない。Worker のキュー詳細は cursor で全ページを取得してから表示を交換する（既定 200 件／最大 1000 件、全体の待機・実行数を別に返す）。
 - 保存方式の読み取りが失敗した場合は不明／失敗として表示し、YAML と推定しない。Worker は D1 固定と表示し、切替操作を出さない。native の実際の方式切替だけが再起動を要求する。
 - Worker の本文・旧本文は、話単位の圧縮 S3 オブジェクトと D1 参照へ移行できる。`GET/POST /api/admin/content-migration` が `plan` / `copy` / `verify` / `cutover` / `purge` / `gc` / `status` を提供し、`scripts/migrate-worker-content.mjs` で CLI から再開可能な移行を実行する（既定は計画のみ、`--apply` で旧 D1 本文の削除まで実行）。本文用 `content_backend` と挿絵用 `asset_backend` は独立し、native の保存方式は変えない。

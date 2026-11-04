@@ -66,6 +66,8 @@ import { confirmDialog, promptDialog } from './ui/dialog.js';
         pane.innerHTML = renderLoginTab();
       } else if (tab.id === 'authors') {
         pane.replaceChildren();
+      } else if (tab.id === 'external_api') {
+        pane.innerHTML = renderExternalApiTab();
       } else {
         pane.innerHTML = renderSettingsPanel(tab);
       }
@@ -79,6 +81,7 @@ import { confirmDialog, promptDialog } from './ui/dialog.js';
         bindLoginPane(pane);
       }
       if (tab.id === 'authors') bindAuthorsPane(pane);
+      if (tab.id === 'external_api') bindExternalApiPane(pane);
     });
   }
 
@@ -336,6 +339,146 @@ import { confirmDialog, promptDialog } from './ui/dialog.js';
            '</ul>' +
            '<textarea class="replace-textarea" id="replace-content" aria-label="全小説対象の置換設定">' + escapeHtml(content) + '</textarea>' +
            '</div></div></div>';
+  }
+
+  // ─── External API tab ──────────────────────────────────
+  // 外部公開 API (/api/v1) の Bearer トークンを管理する。作成は CLI
+  // (`narou api create`) からもできるが、ここから作成・確認・削除できる。
+  // Worker では Cloudflare Access の Service Token の資格情報も同じ場所へ
+  // 出す (CI で作成した secret をここで確認するため)。
+  function renderExternalApiTab() {
+    return '<div class="panel-settings">' +
+      '<div class="panel-heading">外部公開 API (/api/v1) の設定</div>' +
+      '<div class="list-group">' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">接続情報</h4>' +
+      '<div id="external-api-info" class="login-hosts"><em>読み込み中…</em></div>' +
+      '</div>' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">Bearer トークン</h4>' +
+      '<div class="setting-help">外部のツールから <code>Authorization: Bearer &lt;トークン&gt;</code> で送ります。値は平文で保存されます。</div>' +
+      '<div id="external-api-tokens" class="login-hosts"><em>読み込み中…</em></div>' +
+      '<div style="margin-top:0.5rem">' +
+      '<button type="button" class="btn btn-primary" id="external-api-token-create">新しいトークンを作る</button> ' +
+      '<button type="button" class="btn btn-default" id="external-api-refresh">再読み込み</button>' +
+      '</div>' +
+      '</div>' +
+      '</div></div>';
+  }
+
+  function bindExternalApiPane(pane) {
+    const create = pane.querySelector('#external-api-token-create');
+    const refresh = pane.querySelector('#external-api-refresh');
+    if (create) create.addEventListener('click', function() { createExternalApiToken(pane); });
+    if (refresh) refresh.addEventListener('click', function() { loadExternalApiInfo(pane); });
+    // 一覧は読み込みのたびに描き直されるので、クリックは親の要素で受ける。
+    pane.addEventListener('click', function(event) {
+      const reveal = event.target.closest('.external-api-token-reveal');
+      if (reveal) {
+        const row = reveal.closest('.login-cred-row');
+        const code = row && row.querySelector('.external-api-token');
+        if (code) {
+          const shown = code.textContent === reveal.dataset.token;
+          code.textContent = shown ? reveal.dataset.fingerprint : reveal.dataset.token;
+          reveal.textContent = shown ? '表示' : '隠す';
+        }
+        return;
+      }
+      const remove = event.target.closest('.external-api-token-delete');
+      if (remove) {
+        deleteExternalApiToken(pane, remove.dataset.id);
+      }
+    });
+    loadExternalApiInfo(pane);
+  }
+
+  async function loadExternalApiInfo(pane) {
+    const infoBox = pane.querySelector('#external-api-info');
+    const tokenBox = pane.querySelector('#external-api-tokens');
+    if (!infoBox || !tokenBox) return;
+    try {
+      const info = await fetchJson('/api/external_api');
+      infoBox.innerHTML = renderExternalApiInfo(info);
+      tokenBox.innerHTML = renderExternalApiTokens(info.tokens || []);
+    } catch (e) {
+      infoBox.innerHTML = '<em>読み込みに失敗しました: ' + escapeHtml(e.message) + '</em>';
+      tokenBox.innerHTML = '';
+    }
+  }
+
+  function renderExternalApiInfo(info) {
+    let html = '';
+    if (info.base_url) {
+      html += '<div>API の URL: <code>' + escapeHtml(info.base_url) + '</code></div>';
+    }
+    html += '<div>Bearer 認証: ' + (info.require_token ? '必須' : '不要 (external-api.require-token=false)') + '</div>';
+    if (info.access_client_id || info.access_client_secret) {
+      html += '<div class="setting-help" style="margin-top:0.5rem">Cloudflare Zero Trust の Service Token (CI で作成)</div>';
+      html += '<div>Client Id: <code>' + escapeHtml(info.access_client_id || '(未設定)') + '</code></div>';
+      html += '<div>Client Secret: <code>' + escapeHtml(info.access_client_secret || '(未設定)') + '</code></div>';
+    }
+    return html;
+  }
+
+  function renderExternalApiTokens(tokens) {
+    if (!tokens.length) {
+      return '<div><em>トークンはありません。</em></div>';
+    }
+    return tokens.map(function(token) {
+      return '<div class="login-cred-row">' +
+        '<div class="login-cred-info">' +
+        '<div class="login-cred-label">' + escapeHtml(token.name) + '</div>' +
+        '<div class="login-cred-added">ID: ' + escapeHtml(token.id) +
+        (token.created_at ? ' · 作成: ' + escapeHtml(token.created_at) : '') + '</div>' +
+        '<div class="login-cred-hosts"><code class="external-api-token">' +
+        escapeHtml(token.fingerprint || token.token) + '</code></div>' +
+        '</div>' +
+        '<span class="login-cred-actions">' +
+        '<button type="button" class="btn btn-default external-api-token-reveal" data-token="' +
+        escapeAttr(token.token) + '" data-fingerprint="' +
+        escapeAttr(token.fingerprint || token.token) + '">表示</button>' +
+        '<button type="button" class="btn btn-default external-api-token-delete" data-id="' +
+        escapeAttr(token.id) + '">削除</button>' +
+        '</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  async function createExternalApiToken(pane) {
+    const name = await promptDialog({
+      title: 'トークンの名前',
+      message: '外部のツールを見分けるための名前です (空でも作れます)。',
+      value: 'token',
+    });
+    if (name === null) return;
+    try {
+      await postJson('/api/external_api/token', { name: name });
+      await loadExternalApiInfo(pane);
+    } catch (e) {
+      await alertDialog({
+        title: 'エラー',
+        message: 'トークンを作れませんでした: ' + e.message,
+      });
+    }
+  }
+
+  async function deleteExternalApiToken(pane, id) {
+    const ok = await confirmDialog({
+      title: '確認',
+      message: 'このトークンを削除しますか? 使っている外部ツールは認証に失敗します。',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const response = await fetch('/api/external_api/token/' + encodeURIComponent(id), { method: 'DELETE' });
+      if (!response.ok) throw new Error(response.status + ' ' + response.statusText);
+      await loadExternalApiInfo(pane);
+    } catch (e) {
+      await alertDialog({
+        title: 'エラー',
+        message: '削除できませんでした: ' + e.message,
+      });
+    }
   }
 
   // ─── Login tab ─────────────────────────────────────────

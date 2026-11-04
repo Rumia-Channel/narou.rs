@@ -118,6 +118,10 @@ const COMMANDS: &[CmdInfo] = &[
         name: "login",
         oneline: "ログイン情報の取り込み・書き出し・管理 (import/export/list/set/add/order/clear)",
     },
+    CmdInfo {
+        name: "api",
+        oneline: "外部公開 API の Bearer トークン管理 (create/list/delete/info)",
+    },
 ];
 
 const HEADER: &str = "Narou.rb ― 小説家になろうダウンローダ＆縦書き用整形スクリプト";
@@ -992,6 +996,22 @@ const LOGIN_HELP: CmdHelp = CmdHelp {
     ],
 };
 
+const API_HELP: CmdHelp = CmdHelp {
+    banner: "<sub> [options]",
+    description: "\
+  ・外部公開 API (/api/v1) に入るための Bearer トークンを管理します
+  ・トークンは「Authorization: Bearer <トークン>」または「x-narou-api-token」ヘッダで送ります
+  ・作成・確認・削除は設定ページの「外部API」タブからも行えます
+  ・仕様は docs/external-api.md を参照してください
+
+  Examples:
+    narou api create 表生成
+    narou api list
+    narou api delete <ID>
+    narou api info",
+    options: &[],
+};
+
 const LOG_HELP: CmdHelp = CmdHelp {
     banner: "[options] [<path>]",
     description: "\
@@ -1133,6 +1153,10 @@ const ALL_COMMAND_HELP: &[CommandHelpEntry] = &[
     CommandHelpEntry {
         name: "login",
         help: &LOGIN_HELP,
+    },
+    CommandHelpEntry {
+        name: "api",
+        help: &API_HELP,
     },
     CommandHelpEntry {
         name: "log",

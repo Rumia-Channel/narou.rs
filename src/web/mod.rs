@@ -1,5 +1,6 @@
 pub mod batch;
 pub mod authors;
+pub mod external;
 pub mod sites;
 pub mod feature_tour;
 pub mod favorite_tags;
@@ -117,8 +118,23 @@ pub struct AppState {
 pub(crate) fn default_app_services(
     novels: Arc<dyn crate::platform::NovelRepository>,
 ) -> Arc<crate::application::AppServices> {
-    let objects: Arc<dyn crate::platform::ObjectStore> =
-        Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+    default_app_services_with(
+        novels,
+        Arc::new(crate::platform::mocks::MemoryObjectStore::new()),
+        Vec::new(),
+        Arc::new(crate::application::external_api::EmptyVirtualNovelDirectory),
+    )
+}
+
+/// テスト用のサービス一式 (オブジェクトストア・トークン・バーチャル小説を
+/// 差し替えられる)。
+#[cfg(test)]
+pub(crate) fn default_app_services_with(
+    novels: Arc<dyn crate::platform::NovelRepository>,
+    objects: Arc<dyn crate::platform::ObjectStore>,
+    tokens: Vec<crate::application::ApiToken>,
+    virtual_novels: Arc<dyn crate::application::external_api::VirtualNovelDirectory>,
+) -> Arc<crate::application::AppServices> {
     let freeze_store: Arc<dyn crate::application::FreezeStore> =
         Arc::new(crate::application::SystemFreezeStore);
     let library = Arc::new(crate::application::LibraryService::new(
@@ -163,6 +179,8 @@ pub(crate) fn default_app_services(
             site_definitions: Arc::new(crate::application::EmptySiteDefinitionProvider),
             self_update: Arc::new(crate::application::NoopSelfUpdateService),
             web_actions: Arc::new(crate::application::EmptyWebActionService),
+            virtual_novels,
+            api_tokens: Arc::new(crate::application::MemoryApiTokenStore::new(tokens)),
         },
     ))
 }
@@ -585,6 +603,32 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ws", get(push::ws_handler_with_app_state))
         .route("/assets/{*path}", get(frontend::asset))
         .route("/api/novels/count", get(novels::novels_count))
+        // 外部公開 API (読み取り専用)。Bearer トークンで認証する。
+        .route("/api/v1", get(external::api_index))
+        .route("/api/v1/novels", get(external::api_novels))
+        .route("/api/v1/novels/{id}", get(external::api_novel))
+        .route("/api/v1/novels/{id}/toc", get(external::api_novel_toc))
+        .route(
+            "/api/v1/novels/{id}/sections",
+            get(external::api_novel_sections),
+        )
+        .route(
+            "/api/v1/novels/{id}/sections/{key}",
+            get(external::api_novel_section),
+        )
+        .route("/api/v1/novels/{id}/epub", get(external::api_novel_epub))
+        .route("/api/v1/tags", get(external::api_tags))
+        .route("/api/v1/mcp", post(external::api_mcp))
+        // 外部 API の設定 (トークン管理)。ブラウザの UI トークンで保護する。
+        .route("/api/external_api", get(external::api_external_api_info))
+        .route(
+            "/api/external_api/token",
+            post(external::api_external_api_token_create),
+        )
+        .route(
+            "/api/external_api/token/{id}",
+            delete(external::api_external_api_token_delete),
+        )
         .route(
             "/api/list",
             get(novels::api_list).post(novels::api_list_post),
@@ -877,12 +921,25 @@ pub(crate) fn consume_ui_bootstrap_ticket(state: &AppState, candidate: &str, hos
     true
 }
 
+/// 外部公開 API のパスか。
+///
+/// `/api/v1` の下はブラウザの UI セッションではなく Bearer トークンで
+/// 認証する。UI トークン・Basic 認証・CSRF 検査の対象から外す。
+pub(crate) fn is_external_api_path(path: &str) -> bool {
+    path == "/api/v1" || path.starts_with("/api/v1/")
+}
+
 /// loopback UI トークンが必要なパスか。
 ///
 /// 静的なページと埋め込みアセットはデータを持たないので素通しする。
 /// データを返す API・WebSocket・ダウンロードだけを保護する。
 pub(crate) fn is_ui_auth_protected_path(path: &str) -> bool {
     if path.starts_with("/assets/") {
+        return false;
+    }
+    // 外部公開 API はブラウザの UI トークンではなく Bearer トークンで
+    // 認証する。
+    if is_external_api_path(path) {
         return false;
     }
     if matches!(
@@ -959,7 +1016,10 @@ async fn request_guard_middleware(
     if !request_host_allowed(request.headers(), &state, state.port) {
         return (StatusCode::BAD_REQUEST, "Invalid Host").into_response();
     }
-    if is_state_changing_method(request.method())
+    // 外部公開 API はトークンをヘッダで受け取るため、ブラウザのセッション
+    // を使った CSRF とは無縁 (カスタムヘッダは CORS の事前承認が要る)。
+    if !is_external_api_path(request.uri().path())
+        && is_state_changing_method(request.method())
         && !internal_control_token_matches(request.headers(), &state)
         && !origin_allowed(request.headers(), &state, state.port)
     {
@@ -973,6 +1033,12 @@ async fn basic_auth_middleware(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
+    // 外部公開 API は Bearer トークンで認証するため、WEB サーバ全体の
+    // Basic 認証とは分離する (外部の機械が UI の資格情報を持たずに
+    // 使える)。
+    if is_external_api_path(request.uri().path()) {
+        return next.run(request).await;
+    }
     let expected = state.server_security.read().basic_auth_header.clone();
     let Some(expected) = expected else {
         return next.run(request).await;
@@ -1050,7 +1116,7 @@ mod tests {
         dir
     }
 
-    fn test_state() -> AppState {
+    pub(super) fn test_state() -> AppState {
         let queue_dir = test_artifact_dir("security-state");
         let push_server = crate::web::push::PushServer::new();
         push_server.set_accepted_domains(["127.0.0.1", "localhost", "*.example.com"]);
@@ -1063,6 +1129,41 @@ mod tests {
             )),
             server_security: super::test_server_security(
                 Some("Basic dXNlcjpwYXNz"),
+                vec!["127.0.0.1".to_string(), "localhost".to_string()],
+                false,
+            ),
+            bind_host: "127.0.0.1".into(),
+            control_token: "control-token".to_string(),
+            ui_token: "ui-token".to_string(),
+            ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
+            ui_bootstrap_hosts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            queue: Arc::new(
+                crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
+            ),
+            restore_prompt_pending: Arc::new(AtomicBool::new(false)),
+            restorable_tasks_available: Arc::new(AtomicBool::new(false)),
+            library_backup: Arc::new(crate::web::library_backup::LibraryBackupState::new()),
+            running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cancelled_job_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// テスト用の状態 (サービス一式を差し替えられる)。
+    pub(super) fn test_state_with_services(
+        services: Arc<crate::application::AppServices>,
+        basic_auth: Option<&str>,
+    ) -> AppState {
+        let queue_dir = test_artifact_dir("external-api-state");
+        let push_server = crate::web::push::PushServer::new();
+        AppState {
+            port: 8080,
+            ws_port: 8081,
+            push_server: Arc::new(push_server),
+            services,
+            server_security: super::test_server_security(
+                basic_auth,
                 vec!["127.0.0.1".to_string(), "localhost".to_string()],
                 false,
             ),

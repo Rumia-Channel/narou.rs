@@ -3,6 +3,27 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
+## v0.6.0 — 外部公開 API と MCP
+
+- **外部公開 API (`/api/v1`) を追加しました**。読み取り専用で、外部のツール (表の生成・自動化) からライブラリのデータを取り出せます。
+  - `GET /api/v1/novels` 一覧。条件での絞り込み (`q` による自由検索、`title` / `author` / `site` / `tag` / `ncode` / `attribute` / `novel_type` / `end` / `suspend` / `frozen`)、並び替え (`sort` / `order`)、ページング (`offset` / `limit`) に対応します。出力形式は `format=json` / `jsonl` / `xml` から選べます。
+  - `GET /api/v1/novels/{id}` 作品 1 件、`GET /api/v1/novels/{id}/toc` 目次、`GET /api/v1/novels/{id}/sections/{key}` 1 話の本文、`GET /api/v1/novels/{id}/sections` 全話、`GET /api/v1/novels/{id}/epub` EPUB、`GET /api/v1/tags` タグ一覧を追加しました。
+  - バーチャル小説の扱いは `virtual=group` (既定。1 行にまとめる) / `expand` (メンバーを個別に出す) / `exclude` (どのバーチャル小説にも入っていない元の小説だけ) から選べます。目次と本文はバーチャル小説の ID でも(member を連結して)取れます。
+- **MCP (Model Context Protocol) を追加しました**。外部公開 API と同じ読み取り専用データを工具として公開します。HTTP では `POST /api/v1/mcp` (JSON-RPC 2.0)、ローカルでは `narou_rs_mcp` (stdIO) を使います。工具は `list_novels` / `get_novel` / `get_novel_toc` / `get_novel_section` / `list_tags` です。
+- **Bearer トークン認証を追加しました**。`Authorization: Bearer <token>` または `x-narou-api-token` ヘッダで送ります。トークンは `narou api create` / `narou api list` / `narou api delete`、または設定ページの「外部API」タブで作成・確認・削除できます。保存先は在庫 `api_tokens` です。
+- **Cloudflare Workers では Cloudflare Zero Trust の Service Token に対応しました**。`CF-Access-Client-Id` / `CF-Access-Client-Secret` ヘッダを Worker の secret (`NAROU_CF_ACCESS_CLIENT_ID` / `NAROU_CF_ACCESS_CLIENT_SECRET`) と照合します。Access を設定している Worker では narou の Bearer トークンを求めません。Access の資格情報は設定ページの「外部API」タブで確認できます (デプロイ時に CI が Worker secret へ渡します)。
+- `/api/v1` はブラウザの UI トークン・Basic 認証・CSRF 検査の対象外で、トークンだけでアクセスできます。仕様は [`docs/external-api.md`](docs/external-api.md) にまとめています。
+- **Cloudflare Zero Trust の資格情報はデプロイ時に Worker secret へ渡ります**。CI が `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` を `NAROU_CF_ACCESS_CLIENT_ID` / `NAROU_CF_ACCESS_CLIENT_SECRET` として投入するので、設定ページの「外部API」タブに表示され、外部ツールへ転記できます。Service Token 自体は Zero Trust ダッシュボードで手動で作り、リポジトリの secret に登録します (CI は作りません)。手順は [`docs/zero-trust-service-token.md`](docs/zero-trust-service-token.md) にまとめています。
+- **新機能ツアーに外部公開 API の項目を追加しました**。0.5.9 からの更新で Tour が 1 件増えます。
+
+- **キュー件数が 0 でも進捗バーが残る状態を修正しました**。Worker は進捗を PushHub（Durable Object）に保存し、WebSocket の再接続時に再生します。取得ジョブが実行中に異常終了すると終端イベントが届かないため、終端済みジョブの進捗が保存されたまま再接続のたびに復活していました。接続時に保存済み進捗のスコープを D1 台帳の主キーで引き、終端済みジョブの進捗だけを削除します。実行中のジョブの進捗・コンソール履歴・保存済み本文は保持します。
+- **Web UI はキューが空になった時点で残存バッチを即時に消します**。周期更新（既定600秒）までの待ち時間をなくし、進捗バーが現れた直後とキュー状態更新の直後に同期します。キュー取得が失敗した場合や、実行中のジョブがある場合には消しません。
+
+変更一覧は [v0.5.9...v0.6.0](https://github.com/Rumia-Channel/narou.rs/compare/v0.5.9...v0.6.0) を参照してください。
+
+- **キュー件数が 0 でも進捗バーが残る状態を修正しました**。Worker は進捗を PushHub（Durable Object）に保存し、WebSocket の再接続時に再生します。取得ジョブが実行中に異常終了すると終端イベントが届かないため、終了済みジョブの進捗が保存されたまま再接続のたびに復活していました。接続時に保存済み進捗のスコープを D1 台帳の主キーで引き、終端済みジョブの進捗だけを削除します。実行中のジョブの進捗・コンソール履歴・保存済み本文は保持します。
+- **Web UI はキューが空になった時点で残存バッチを即時に消します**。周期更新（既定600秒）までの待ち時間をなくし、進捗バーが現れた直後とキュー状態更新の直後に同期します。キュー取得が失敗した場合や、実行中のジョブがある場合には消しません。
+
 ## v0.5.9 — SQLite / D1 の SQL アクセス最適化
 
 - **Worker の待機ジョブ選択で、待機件数 × 過去の終了ジョブ件数の走査が発生する問題を修正しました**。競合判定に使う実行所有者を SQL 内で一度だけ取り出し、status / execution token / lease の索引で実行を持たない終了履歴を除外します。同一サイトの直列化、作品単位の排他、中断した実行の token / lease 保護は維持します。

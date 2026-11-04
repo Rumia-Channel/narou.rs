@@ -238,6 +238,9 @@ jobs:
       # Access の service token (custom domain 越しに smoke を流す場合だけ)。
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
       CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+      # Access の service token を Secrets Store に置く場合は「名前」だけ渡す。
+      NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME: ${{ secrets.NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME || vars.NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME }}
+      NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME: ${{ secrets.NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME || vars.NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -328,6 +331,9 @@ jobs:
       # Access の service token (custom domain 越しに smoke を流す場合だけ)。
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
       CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+      # Access の service token を Secrets Store に置く場合は「名前」だけ渡す。
+      NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME: ${{ secrets.NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME || vars.NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME }}
+      NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME: ${{ secrets.NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME || vars.NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
