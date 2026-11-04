@@ -801,15 +801,15 @@ def main() -> None:
     if target_url is None:
         fail("Mandatory S3 verification needs a deployment URL; configure NAROU_DEPLOY_URL or a deployment domain")
     s3_status = verify_s3(target_url)
+    # smoke の前に Access のポリシーをそろえる。単一ヘッダー方式
+    # (read_service_tokens_from_header) を有効にしておかないと、smoke が
+    # Authorization ヘッダの資格情報で通せない。
+    enable_access_single_header(target)
     smoke_result: bool | None = None
     if os.environ.get("NAROU_SMOKE", "1") == "0":
         pass
     else:
         smoke_result = smoke(target_url)
-    # smoke の前に Access のポリシーをそろえる。単一ヘッダー方式
-    # (read_service_tokens_from_header) は smoke の資格情報を渡す経路に
-    # 影響するので、先に整えてから smoke を通す。
-    enable_access_single_header(target)
     summary(target, target_url, smoke_result, hidden_url=hidden_url, s3_status=s3_status)
     if smoke_result is False:
         fail("smoke test failed against the deployment")
