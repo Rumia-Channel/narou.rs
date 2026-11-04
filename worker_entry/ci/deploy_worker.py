@@ -536,9 +536,19 @@ def secret_file(target: str) -> Path | None:
     # 要求する）。token 自体は手動で作り、ここでは受け渡すだけ。
     access_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
     access_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET", "").strip()
+    access_in_store = all(
+        os.environ.get(name, "").strip()
+        for name in (
+            "NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME",
+            "NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME",
+        )
+    )
     if access_id and access_secret:
         secrets["NAROU_CF_ACCESS_CLIENT_ID"] = access_id
         secrets["NAROU_CF_ACCESS_CLIENT_SECRET"] = access_secret
+    elif access_in_store:
+        # Secrets Store に置いている場合、値はストアから Worker が読む。
+        pass
     elif access_id or access_secret:
         print(
             "::notice::CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must be supplied "

@@ -123,7 +123,22 @@ def main() -> None:
         "NAROU_ADMIN_TOKEN": optional("NAROU_ADMIN_TOKEN_SECRET_NAME", "").strip(),
         "NAROU_RS_LOGIN_KEY": optional("NAROU_RS_LOGIN_KEY_SECRET_NAME", "").strip(),
     }
-    store_consumers = s3_store_mode or any(token_secrets.values())
+    # Zero Trust (Cloudflare Access) の Service Token も Secrets Store に
+    # 置ける (任意)。Worker は `NAROU_CF_ACCESS_CLIENT_ID` を読むので、
+    # バインディングは `NAROU_CF_ACCESS_CLIENT_ID_STORE` になる。
+    access_secrets = {
+        "NAROU_CF_ACCESS_CLIENT_ID": optional(
+            "NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME", ""
+        ).strip(),
+        "NAROU_CF_ACCESS_CLIENT_SECRET": optional(
+            "NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME", ""
+        ).strip(),
+    }
+    store_consumers = (
+        s3_store_mode
+        or any(token_secrets.values())
+        or any(access_secrets.values())
+    )
     if store_consumers and not secret_store_id:
         fail("NAROU_SECRETS_STORE_ID is required for Secrets Store bindings")
     if secret_store_id:
@@ -139,6 +154,9 @@ def main() -> None:
         if value and not SECRET_NAME_PATTERN.fullmatch(value):
             fail(f"{label} has an invalid Secrets Store name")
     for label, value in token_secrets.items():
+        if value and not SECRET_NAME_PATTERN.fullmatch(value):
+            fail(f"{label}_SECRET_NAME has an invalid Secrets Store name")
+    for label, value in access_secrets.items():
         if value and not SECRET_NAME_PATTERN.fullmatch(value):
             fail(f"{label}_SECRET_NAME has an invalid Secrets Store name")
     if s3_store_mode:
@@ -183,6 +201,14 @@ def main() -> None:
                 ("S3_BUCKET_STORE", s3_secret_names["S3_BUCKET_SECRET_NAME"]),
                 ("NAROU_ADMIN_TOKEN_STORE", token_secrets["NAROU_ADMIN_TOKEN"]),
                 ("NAROU_RS_LOGIN_KEY_STORE", token_secrets["NAROU_RS_LOGIN_KEY"]),
+                (
+                    "NAROU_CF_ACCESS_CLIENT_ID_STORE",
+                    access_secrets["NAROU_CF_ACCESS_CLIENT_ID"],
+                ),
+                (
+                    "NAROU_CF_ACCESS_CLIENT_SECRET_STORE",
+                    access_secrets["NAROU_CF_ACCESS_CLIENT_SECRET"],
+                ),
             )
             if name
         )
