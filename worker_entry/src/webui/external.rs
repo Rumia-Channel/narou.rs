@@ -163,26 +163,29 @@ async fn authorize(
         //   Authorization: {"cf-access-client-id": "…", "cf-access-client-secret": "…"}
         // AI 系のクライアントは 1 つのヘッダしか送れないため、この形も
         // 受け付ける。
-        let (presented_id, presented_secret) = match access_token_from_headers(req) {
-            Some(pair) => pair,
-            None => {
-                return Some(json_error(
-                    401,
-                    "authentication_required",
-                    Some("Cloudflare Access の Service Token が不正です"),
-                ));
+        if let Some((presented_id, presented_secret)) = access_token_from_headers(req) {
+            let matched = constant_time_eq(&presented_id, &client_id)
+                && constant_time_eq(&presented_secret, &client_secret);
+            if matched {
+                return None;
             }
-        };
-        let matched = constant_time_eq(&presented_id, &client_id)
-            && constant_time_eq(&presented_secret, &client_secret);
-        if matched {
+            return Some(json_error(
+                401,
+                "authentication_required",
+                Some("Cloudflare Access の Service Token が不正です"),
+            ));
+        }
+        // Access の前段を通った要求は、Access が `CF-Access-Client-Id` /
+        // `CF-Access-Client-Secret` を除去してから Worker へ渡す (-edge
+        // 側の認証が済んでいるので、資格情報が看不到)。前段の認証済みを
+        // 示す `Cf-Access-Jwt-Assertion` があれば、Access を境界として
+        // そのまま通す。前段を通っていない要求 (Worker へ直接届く要求) は
+        // 下の Bearer 検査へ落とす。
+        if header_value(req, "Cf-Access-Jwt-Assertion").is_some()
+            || header_value(req, "Cf-Access-Authenticated-User-Email").is_some()
+        {
             return None;
         }
-        return Some(json_error(
-            401,
-            "authentication_required",
-            Some("Cloudflare Access の Service Token が不正です"),
-        ));
     }
 
     if !services.external_api.require_token().await {

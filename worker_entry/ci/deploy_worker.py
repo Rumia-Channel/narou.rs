@@ -806,12 +806,13 @@ def main() -> None:
         pass
     else:
         smoke_result = smoke(target_url)
+    # smoke の前に Access のポリシーをそろえる。単一ヘッダー方式
+    # (read_service_tokens_from_header) は smoke の資格情報を渡す経路に
+    # 影響するので、先に整えてから smoke を通す。
+    enable_access_single_header(target)
     summary(target, target_url, smoke_result, hidden_url=hidden_url, s3_status=s3_status)
     if smoke_result is False:
         fail("smoke test failed against the deployment")
-    # smoke の後に Access のポリシーをそろえる（Access の挙動が変わっても
-    # smoke は既に通っている）。
-    enable_access_single_header(target)
 
 
 if __name__ == "__main__":

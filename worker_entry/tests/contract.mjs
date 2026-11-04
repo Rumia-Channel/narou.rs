@@ -517,18 +517,26 @@ await check("GET /api/novels/:id/download.epub returns 404 for an unknown novel"
 await check("GET /api/v1/novels refuses a request without a valid credential", async () => {
   // `request()` は Access の前段を通すために資格情報を足すので、ここは
   // 素の `fetch` で「資格情報無し」の要求を投げる。
-  const anonymous = await fetch(url("/api/v1/novels"));
-  const anonymousBody = await anonymous.text();
-  assert.equal(
-    anonymous.status,
-    401,
-    `status ${anonymous.status} body ${anonymousBody.slice(0, 200)}`,
-  );
-  const wrong = await fetch(url("/api/v1/novels"), {
-    headers: { authorization: "Bearer not-a-real-token" },
-  });
-  const wrongBody = await wrong.text();
-  assert.equal(wrong.status, 401, `status ${wrong.status} body ${wrongBody.slice(0, 200)}`);
+  // Access の前段がある環境では要求が Worker に届かず、ログイン画面
+  // (200) が返る。どちらの環境でも「ライブラリを読めない」ことを確かめる。
+  for (const init of [
+    undefined,
+    { headers: { authorization: "Bearer not-a-real-token" } },
+  ]) {
+    const response = await fetch(url("/api/v1/novels"), init);
+    const body = await response.text();
+    let payload = null;
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      // ログイン画面の HTML
+    }
+    assert(
+      response.status !== 200 || !Array.isArray(payload?.data),
+      `the library must not be readable without a credential: status ${response.status} ` +
+        `body ${body.slice(0, 200)}`,
+    );
+  }
 });
 
 // Access の Service Token は 2 通りで渡せる:
