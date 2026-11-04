@@ -515,12 +515,20 @@ await check("GET /api/novels/:id/download.epub returns 404 for an unknown novel"
 // では Zero Trust が境界なので、narou の Bearer トークンは使わない。资格
 // 情報の無い要求は 401 で弾かれる。
 await check("GET /api/v1/novels refuses a request without a valid credential", async () => {
+  // `request()` は Access の前段を通すために資格情報を足すので、ここは
+  // 素の `fetch` で「資格情報無し」の要求を投げる。
   const anonymous = await fetch(url("/api/v1/novels"));
-  assert.equal(anonymous.status, 401, `status ${anonymous.status}`);
-  const wrong = await request("/api/v1/novels", {
+  const anonymousBody = await anonymous.text();
+  assert.equal(
+    anonymous.status,
+    401,
+    `status ${anonymous.status} body ${anonymousBody.slice(0, 200)}`,
+  );
+  const wrong = await fetch(url("/api/v1/novels"), {
     headers: { authorization: "Bearer not-a-real-token" },
   });
-  assert.equal(wrong.status, 401, `status ${wrong.status}`);
+  const wrongBody = await wrong.text();
+  assert.equal(wrong.status, 401, `status ${wrong.status} body ${wrongBody.slice(0, 200)}`);
 });
 
 // Access の Service Token は 2 通りで渡せる:
@@ -530,17 +538,21 @@ await check("a Cloudflare Access service token opens the external API", async ()
   if (!ACCESS_CLIENT_ID || !ACCESS_CLIENT_SECRET) {
     return;
   }
-  const listed = await request("/api/v1/novels?limit=1", {
+  // 素の `fetch` を使う: `request()` は Access の資格情報を足すので、同じ
+  // ヘッダが 2 つ（小文字と大文字）居ると値が連結されて照合に失敗する。
+  const listed = await fetch(url("/api/v1/novels?limit=1"), {
     headers: {
-      "CF-Access-Client-Id": ACCESS_CLIENT_ID,
-      "CF-Access-Client-Secret": ACCESS_CLIENT_SECRET,
+      "cf-access-client-id": ACCESS_CLIENT_ID,
+      "cf-access-client-secret": ACCESS_CLIENT_SECRET,
     },
   });
-  assert.equal(listed.status, 200, `status ${listed.status}`);
-  const payload = await json(listed);
+  const listedBody = await listed.text();
+  assert.equal(listed.status, 200, `status ${listed.status} body ${listedBody.slice(0, 200)}`);
+  const payload = JSON.parse(listedBody);
   assert(Array.isArray(payload?.data), "data must be an array");
 
-  const single = await request("/api/v1/novels?limit=1", {
+  // 単一ヘッダー方式 (read_service_tokens_from_header: Authorization)。
+  const single = await fetch(url("/api/v1/novels?limit=1"), {
     headers: {
       authorization: JSON.stringify({
         "cf-access-client-id": ACCESS_CLIENT_ID,
@@ -548,8 +560,9 @@ await check("a Cloudflare Access service token opens the external API", async ()
       }),
     },
   });
-  assert.equal(single.status, 200, `status ${single.status}`);
-  const singlePayload = await json(single);
+  const singleBody = await single.text();
+  assert.equal(single.status, 200, `status ${single.status} body ${singleBody.slice(0, 200)}`);
+  const singlePayload = JSON.parse(singleBody);
   assert(Array.isArray(singlePayload?.data), "data must be an array");
 });
 
