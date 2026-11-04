@@ -1,54 +1,31 @@
-# Worker UI latency: first remediation
+# Worker UI レイテンシ改善: 第1フェーズ対応
 
-## Scope
+## 1. 対象範囲
 
-This change targets ordinary interactive requests, not EPUB/image generation:
-`/api/list`, `/api/global_setting`, `/api/tag_list`, `/api/queue/status`,
-`/api/get_queue_size`, and `/api/get_pending_tasks`.
+本改修は EPUB や画像生成ではなく、以下の一般的なインタラクティブ API リクエストのレイテンシ改善を対象としています。
+- `/api/list`
+- `/api/global_setting`
+- `/api/tag_list`
+- `/api/queue/status`
+- `/api/get_queue_size`
+- `/api/get_pending_tasks`
 
-The baseline is develop commit `af60d395da1dd66705abce31b11e711dce326d7e`.
-There is no production latency, memory, or CPU measurement in this change.
+基準リビジョンは develop ブランチのコミット `af60d395da1dd66705abce31b11e711dce326d7e` です。なお、本変更自体には本番環境でのレイテンシ・メモリ・CPU 測定値は含まれていません。
 
-## Changes
+## 2. 主な変更点
 
-- D1-only composition replaces `WorkerRuntime::build_ui` on these paths. It
-  does not load S3 configuration, login credentials, HTTP/relay settings or
-  downloader/rate-limiter/queue services. The original authentication check
-  still runs first. Full infrastructure validation remains in readiness and
-  in routes that actually use those dependencies.
-- Global settings continue to use `SettingsService` and `D1SettingsStore` for
-  reads and writes, including the existing validation and cache invalidation.
-- Mutation pre-reads use primary-only services and bypass isolate settings,
-  freeze and tag-color caches; read-only GETs retain replica sessions and caches.
-  This prevents stale replica/cache snapshots from being written back. Notepad
-  saves additionally use a conditional primary UPSERT: competing saves with
-  the same `object_id` produce one success and one conflict. General settings
-  remain scope-level read-modify-write, not an atomic multi-request transaction.
-- Library lists continue to use `LibraryService::list`, preserving search,
-  sort, pagination, frozen/new markers, and the JSON payload. The legacy
-  `all=true` behavior is deliberately not changed by this performance fix.
-- Tags are aggregated from `novel_tags` in SQL rather than deserializing every
-  full novel. Frequency order is preserved; ties, previously dependent on a
-  HashMap iteration order, now use deterministic binary tag order. Orphan tags
-  are excluded by a join to `novels`. Existing HTML escaping, color allocation
-  and empty-list fallback behavior remain.
-- Queue status uses one D1 batch containing a grouped count and at most one
-  running job (needed only for the single-job label). Results are bounded to
-  at most 14 count rows plus one job regardless of the pending queue size.
-  This bounds data returned to the Worker, NOT SQLite's rows scanned.
-- Queue size returns at most two lane counts. Detailed pending-task listings
-  still return their actual rows as required by the API, without unrelated
-  runtime initialization.
-- Successful list/tag/queue-status/queue-size/global-settings GET responses add
-  a `Server-Timing` metric. It measures post-authentication handler wall time,
-  including I/O, and is neither CPU time nor D1 SQL execution time. No SQL,
-  titles, cookies, tokens or other request data are placed in this header.
+- **D1 専用構成への切り替え**: 上記のエンドポイントでは `WorkerRuntime::build_ui` の代わりに D1 専用の軽量構成を使用します。これにより、S3 設定、ログイン資格情報、HTTP/リレー設定、ダウンローダー、レートリミッター、キューサービスの初期化を行いません（初回の認証チェックは従来通り最優先で実行されます）。インフラ全体の接続性検証は readiness チェックおよびそれらの依存関係を実際に利用するルートでのみ行われます。
+- **グローバル設定の読み書き**: 既存の検証やキャッシュ無効化を含め、読み取り・書き込みともに引き続き `SettingsService` および `D1SettingsStore` を使用します。
+- **更新前読み取りの最適化**: 書き込み（mutation）前の読み取りには primary 専用サービスを使用し、アイソレート設定や凍結・タグ色キャッシュをバイパスします。一方、読み取り専用の GET リクエストではレプリカセッションとキャッシュを保持します。これにより、古いレプリカやキャッシュのスナップショットが書き戻されるのを防止します。メモ帳（Notepad）の保存には条件付き primary UPSERT を導入し、同一 `object_id` に対する競合保存が発生した場合は 1 件が成功し、もう 1 件は conflict となります。全般設定は複数リクエストにまたがるアトミックトランザクションではなく、スコープ単位の read-modify-write を維持します。
+- **小説リストの取得**: 検索、ソート、ページネーション、凍結/新着マーカー、JSON ペイロード形式を維持したまま、引き続き `LibraryService::list` を使用します。従来の `all=true` の挙動は本パフォーマンス修正では意図的に変更していません。
+- **タグ集計の効率化**: 全小説データをデシリアライズする代わりに、SQL 内で `novel_tags` から集計します。出現頻度順は保持され、同順位の場合は従来の HashMap の走査順依存から決定論的なバイナリ順に変更されました。孤立したタグ（orphan tags）は `novels` との JOIN により除外されます。既存の HTML エスケープ、カラー割り当て、空リスト時のフォールバック動作はそのまま維持されます。
+- **キュー状態取得の軽量化**: キュー状態（Queue status）は、グループ化された集計カウントと最大 1 件の実行中ジョブ（単一ジョブラベルにのみ必要）を含む 1 つの D1 バッチで取得します。待機キューのサイズに関わらず、結果は最大 14 行の集計行 + 1 件のジョブに制限されます。これは Worker に返されるデータ量の上限であり、SQLite がスキャンする行数の上限ではありません。
+- **キューサイズ取得**: キューサイズは最大 2 レーンのカウントのみを返します。詳細な保留タスク一覧（pending-task）は API 仕様通り実際の行を返しますが、不要なランタイム初期化は行いません。
+- **Server-Timing ヘッダーの追加**: リスト、タグ、キュー状態、キューサイズ、グローバル設定の GET 応答が成功した際、`Server-Timing` メトリックを追加します。これは I/O を含む認証後のハンドラー実経過時間（wall time）を計測するものであり、CPU 時間や D1 の SQL 実行時間そのものではありません。また、このヘッダーに SQL、タイトル、Cookie、トークンなどのリクエストデータが含まれることはありません。
 
-No new response cache, schema migration, dependency, secret, storage-backend
-switch or deployment is introduced. S3/Queue misconfiguration no longer makes
-D1-only metadata unavailable; that dependency isolation is intentional.
+※ 新たなレスポンスキャッシュ、スキーママイグレーション、外部依存、secret、ストレージバックエンドの切り替え、デプロイ設定は導入していません。S3 や Queue の設定不備があっても D1 専用のメタデータには影響しないよう、依存関係の分離を意図的に行っています。
 
-## Regression checks
+## 3. 回帰テスト
 
 ```sh
 python -m unittest discover -s worker_entry/tests -p 'test_ui_*.py' -v
@@ -57,59 +34,37 @@ cargo check --locked -p narou_worker --target wasm32-unknown-unknown
 cd worker_entry && node tests/run.mjs --release
 ```
 
-The Python tests execute SQL extracted from the production Rust source against
-an in-memory SQLite schema covering the referenced columns. They test all
-status/lane combinations, empty data, tag ordering/case/Unicode, orphan tags,
-one/multiple running jobs, and a 10,000-job pending queue. They do not compile
-Rust or emulate D1. The Node tests validate the measurement client, not Worker
-behavior. The dedicated PR workflow also type-checks the wasm target and runs
-the existing local-workerd contract suite without deployment credentials.
+- Python テストは、本番の Rust ソースから抽出した SQL をインメモリ SQLite スキーマに対して実行し、参照列を検証します。すべてのステータス/レーンの組み合わせ、空データ、タグの並び順・大文字小文字・Unicode、孤立タグ、1件/複数件の実行中ジョブ、10,000 件の保留キューをテストします（Rust のコンパイルや D1 のエミュレーションは行いません）。
+- Node テストは計測クライアントの検証であり、Worker 自体の挙動テストではありません。
+- 専用の PR ワークフローでは、wasm ターゲットの型チェックと、デプロイ資格情報不要のローカル workerd 契約テストスイートも実行されます。
 
-## Before/after measurement
+## 4. 改善前後の計測方法
 
-Use the same client location, dataset, Cloudflare configuration and activity
-level on both revisions. Obtain production credentials through normal secret
-handling, not command-line arguments or checked-in files.
+両方のリビジョンで、同一のクライアント環境・データセット・Cloudflare 設定・負荷状況で計測してください。本番の資格情報はコマンドライン引数やコミット対象ファイルではなく、環境変数等の適切な方法で取得してください。
 
 ```sh
-# NAROU_ADMIN_TOKEN is read from the environment.
-# For Access, set both CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET too.
+# NAROU_ADMIN_TOKEN は環境変数から読み込まれます。
+# Access を利用している場合は CF_ACCESS_CLIENT_ID と CF_ACCESS_CLIENT_SECRET も設定してください。
 node worker_entry/tests/ui_latency.mjs --base https://YOUR-WORKER \
   --samples 10 --output before.json
-# Repeat after deploying the candidate to an explicitly selected test target.
+
+# 改善候補版を明示的に指定したテスト環境へデプロイした後に再計測します。
 node worker_entry/tests/ui_latency.mjs --base https://YOUR-TEST-WORKER \
   --samples 10 --output after.json
 ```
 
-Only sequential GETs are sent. There is no job enqueue, settings POST or
-concurrency load test. These are normal endpoint accesses, including any
-existing lazy tag-color initialization. The output records timing and response
-size, not response bodies or credentials. Existing output files are not
-replaced. Redirects and unexpected JSON shapes are errors, preventing an
-Access/login HTML page from being mistaken for a fast successful API call.
+- 直列の GET リクエストのみを送信します（ジョブの追加、設定の POST、並行負荷テストなどは含みません）。これらは遅延初期化されるタグカラー処理などを含む通常のエンドポイントアクセスです。
+- 出力結果にはレスポンス本文や認証情報は含めず、所要時間とレスポンスサイズのみを記録します。既存の出力ファイルは上書きされません。
+- リダイレクトや予期しない JSON 形式はエラーとして扱われます（Access やログインの HTML ページを誤って高速な API 成功と誤認することを防止します）。
+- `headers_ms` はクライアントがヘッダーを受信するまでの時間を計測し、`total_ms` はレスポンス本文の読み込み完了までを含みます。初回リクエストは反復リクエストと分けて報告されますが、いずれもコールドアイソレートまたはウォームアイソレートの利用を保証するものではありません。わずか 10 サンプルの P95 はノイズが大きくなりやすいため注意してください。
+- `--pause-ms 31000` を指定すると、既存の 30 秒キャッシュ TTL を超えるリクエストを比較するのに役立ちますが、アイソレートの破棄を強制するものではありません。同一の比較の中でアイドル時とジョブ実行中のトラフィックを混在させないでください。
+- 測定結果は Workers の CPU 時間・実経過時間・エラーログと突き合わせて分析してください。D1 の `meta.duration` / `meta.timings.sql_duration_ms` はネットワーク時間を含みません。レイテンシが高い場合は、認証・設定の待機時間、D1 クエリ時間、読み取り行数、リトライ回数、提供リージョン、primary/replica の状態を調査してください。Workers のクロックは I/O 境界でのみ進むため、同期的な Wasm コードのベンチマークに `Date.now()` 単体を使用しないでください。
 
-`headers_ms` measures the client time to receive headers, and `total_ms` includes
-reading the response body. First requests are reported separately from repeated
-requests; neither is guaranteed to use a cold or warm isolate. P95 from only ten
-samples is noisy. `--pause-ms 31000` can help compare requests beyond the existing
-30-second cache TTL, but does not force isolate eviction. Avoid mixing idle and
-active-job traffic in one comparison.
+### 参考リンク
+- [Cloudflare D1: Client API](https://developers.cloudflare.com/d1/worker-api/d1-database/)
+- [Cloudflare D1: Return Object](https://developers.cloudflare.com/d1/worker-api/return-object/)
+- [Cloudflare Workers: Performance API](https://developers.cloudflare.com/workers/runtime-apis/performance/)
 
-Correlate results with Workers CPU/wall time and errors. D1 `meta.duration` /
-`meta.timings.sql_duration_ms` exclude network time. If latency remains high,
-inspect authentication/settings waits, D1 query duration, rows read, attempts,
-served region and primary/replica status. Workers' clocks advance at I/O
-boundaries; do not use `Date.now()` alone to benchmark synchronous Wasm code.
+## 5. 本改修の対象外（今後の課題）
 
-References:
-- https://developers.cloudflare.com/d1/worker-api/d1-database/
-- https://developers.cloudflare.com/d1/worker-api/return-object/
-- https://developers.cloudflare.com/workers/runtime-apis/performance/
-
-## Not addressed here
-
-Full-text/EPUB streaming, animation memory, D1 object-store keyset pagination,
-full-record library projections, duplicate unfiltered counts, frontend request
-coalescing, bookmarks between requests, and heavy-job isolation remain separate
-work. No reduction in production milliseconds or memory is claimed until
-measured. Merge/deployment should follow successful wasm and contract checks.
+本文や EPUB のストリーミング、アニメーション処理のメモリ消費、D1 オブジェクトストアの keyset ページネーション、全レコード投影の削減、重複する非フィルタ件数カウント、フロントエンドのリクエスト合流（coalescing）、リクエスト間のしおり保持、重いジョブの分離などは本改修には含まれません。実測による検証が行われるまで、本番環境でのミリ秒単位の短縮やメモリ削減を保証するものではありません。

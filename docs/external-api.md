@@ -1,7 +1,6 @@
 # 外部公開 API と MCP
 
-外部のツール (表の生成・自動化・LLM) からライブラリの読み取り専用データへ
-アクセスするための API と、その上に載る MCP サーバーを説明する。
+外部のツール (表生成・自動化・LLM など) からライブラリの読み取り専用データへアクセスするための API と、その上位で動作する MCP サーバーについて説明します。
 
 - HTTP API: `/api/v1` (native の `narou web` と Workers の両方で動く)
 - MCP: `POST /api/v1/mcp` (HTTP) と `narou_rs_mcp` (stdIO)
@@ -10,18 +9,15 @@
 
 外部 → [Cloudflare Zero Trust] → [Bearer トークン] → API / MCP
 
-| 层 | どこで使うか | 条件 |
+| レイヤー | 利用環境 | 条件 |
 |---|---|---|
 | Cloudflare Zero Trust (Access) の Service Token | Cloudflare Workers だけ | `CF-Access-Client-Id` と `CF-Access-Client-Secret` ヘッダが Worker の secret (`NAROU_CF_ACCESS_CLIENT_ID` / `NAROU_CF_ACCESS_CLIENT_SECRET`) と一致する |
 | narou の Bearer トークン | native (VPS を含む) | `Authorization: Bearer <token>` または `x-narou-api-token: <token>` が保存済みトークンに一致する |
 
-- **Zero Trust の内側にある場合** (Workers に Access の資格情報を設定した
-  とき) は、Service Token の照合だけで通り、narou の Bearer トークンは
-  求めない。
-- **Access を設定していない場合** は narou の Bearer トークンを求める。
-- どちらでも **`external-api.require-token=false`** にすると Bearer トークン
-  の検査を省く (Access の内側で使う場合)。
-- トークンが 1 件も無い状態では Bearer トークンは当然通らない (fail closed)。
+- **Zero Trust の内側にある場合** (Workers に Access の資格情報を設定した場合): Service Token の検証のみで認証を通過し、narou の Bearer トークンは不要です。
+- **Access を設定していない場合**: narou の Bearer トークンによる認証が必要です。
+- いずれの環境でも **`external-api.require-token=false`** を設定することで、Bearer トークンの検査を省略できます (Access の保護下で利用する場合など)。
+- トークンが 1 件も登録されていない状態では、Bearer 認証はすべて拒否されます (fail-closed)。
 
 ### トークンの作成と確認
 
@@ -31,16 +27,11 @@
 - 保存先: 在庫 `api_tokens` (Native は `.narou/api_tokens.yaml` / SQLite
   `app_state`、Worker は D1 `app_state`)
 
-トークン本体は**平文**で保存する (`server-basic-auth.password` と同じ扱い)。
-「あとから確認できる」ことを優先した結果で、値は `narou api list` や
-設定ページで確認できる。 잃った場合は作り直す。
+トークン本体は**平文**で保存されます (`server-basic-auth.password` と同様の扱い)。これは後から値を確認できる利便性を優先した仕様であり、トークンは `narou api list` や設定ページからいつでも確認可能です。紛失した場合は再作成してください。
 
 ### Cloudflare Access の資格情報を Web UI で確認する
 
-Workers では Access の Service Token は CI で secret として投入する。Web UI
-の「外部API」タブは、その secret (`NAROU_CF_ACCESS_CLIENT_ID` /
-`NAROU_CF_ACCESS_CLIENT_SECRET`) の値をそのまま表示するので、外部ツールへ
-転記できる。native にはこの項目はない。
+Workers 環境では Access の Service Token は CI 経由で secret として登録されます。Web UI の「外部API」タブには、その secret (`NAROU_CF_ACCESS_CLIENT_ID` / `NAROU_CF_ACCESS_CLIENT_SECRET`) の値が表示されるため、外部ツールへ簡単にコピー＆ペーストできます (※ native 環境にはこの項目はありません)。
 
 ## 出力形式
 

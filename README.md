@@ -68,9 +68,9 @@ narou/
 
 `narou_rs` は、実行ファイルの近くにある `webnovel/`、`preset/`、`commitversion` を参照します。これらを分離しないでください。
 
-`preset/` には EPUB 変換の設定が入っています。同梱されているのは既定値 (`AozoraEpub3.ini.default` / `custom_chuki_tag.txt.default`) だけで、利用者が編集する設定は別の名前 (`AozoraEpub3.ini` / `custom_chuki_tag.txt`) で同じフォルダに作ります。編集したいときは既定値をコピーしてください (例: `Copy-Item preset\AozoraEpub3.ini.default preset\AozoraEpub3.ini`)。利用者が作った設定は配布物に含まれないため、セルフアップデートで書き換わらず内容が残ります。設定の優先順は「利用者の設定 → 同梱の既定値」です。
+`preset/` には EPUB 変換の設定が入っています。同梱されているのは既定値 (`AozoraEpub3.ini.default` / `custom_chuki_tag.txt.default`) だけで、利用者が編集する設定は別の名前 (`AozoraEpub3.ini` / `custom_chuki_tag.txt`) で同じフォルダに作ります。編集したいときは既定値をコピーしてください (例: `Copy-Item preset\AozoraEpub3.ini.default preset\AozoraEpub3.ini`)。利用者が作った設定は配布物に含まれないため、セルフアップデートで書き換わらず内容が残ります。設定の優先順位は「ユーザー設定 → 同梱の既定値」です。
 
-Windows 版の zip に含まれる実行ファイル (`narou_rs.exe`、`narou_rs_updater.exe.new`、`narou_rs_backup.exe`、`narou_rs_login.exe`) は Authenticode 署名済みです。署名のないバイナリは梱包時に検出して失敗するため、リリース zip に未署名の実行ファイルは入りません。
+Windows 版の zip に含まれる実行ファイル (`narou_rs.exe`、`narou_rs_updater.exe.new`、`narou_rs_backup.exe`、`narou_rs_login.exe`) は Authenticode 署名済みです。署名のないバイナリはパッケージング時に検出して処理を中断するため、リリース zip に未署名の実行ファイルが含まれることはありません。
 
 どちらの版も zip の展開後の手順は同じです。`self-update.variant` は今後のセルフアップデートで取得する版を決める設定で、実行中のバイナリは切り替わりません。Web UI の設定画面 (Global タブ) で選ぶか、`narou_rs setting self-update.variant=gpl` または `narou_rs setting self-update.variant=standard` で変更できます。
 
@@ -128,9 +128,9 @@ cargo local-build --gpl   # GPL版（AozoraEpub3_Lite 組込み）
 
 `cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`narou_rs_backup(.exe)`、`narou_rs_login(.exe)`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
 
-未指定では従来どおり通常版を作り、copyleft を含まない `Third-Party-License-non-GPL.md` を `Third-Party-License.md` として同梱します。`--gpl` を付けると本体を `lite` feature 付きでビルドし、GPL 版の `Third-Party-License.md` を同梱します。どちらも同じ `narou/` を作り直し、`--locked`・`--target <triple>` と併用できます。
+未指定の場合は従来どおり通常版をビルドし、コピーレフト条項を含まない `Third-Party-License-non-GPL.md` を `Third-Party-License.md` として同梱します。`--gpl` を指定すると本体を `lite` feature 付きでビルドし、GPL 版の `Third-Party-License.md` を同梱します。いずれの場合も同じ `narou/` フォルダを再生成し、`--locked` や `--target <triple>` と併用可能です。
 
-作成された `narou/` は Release 版と同じように `Path` に追加し、小説を管理したいフォルダで `narou_rs init` を実行してください。`narou/` の中を作業ディレクトリにはしません。
+作成された `narou/` は Release 版と同様に `Path` に追加し、小説を管理したいフォルダで `narou_rs init` を実行してください（※ `narou/` の中を作業ディレクトリにはしないでください）。
 
 初期化時に AozoraEpub3 の場所も指定する場合は、次のように実行します。
 
@@ -266,9 +266,7 @@ narou_rs setting server-basic-auth.require-for-external-bind=false
 
 ### 外部公開 API と MCP
 
-外部のツール (表の生成・自動化・LLM) からライブラリの読み取り専用データへ
-アクセスできます。仕様は [`docs/external-api.md`](docs/external-api.md) に
-あります。
+外部のツール (表の生成・自動化・LLM) からライブラリの読み取り専用データへアクセスできます。仕様の詳細は [`docs/external-api.md`](docs/external-api.md) を参照してください。
 
 ```powershell
 # Bearer トークンを作る (表示された値を Authorization ヘッダに載せる)
@@ -286,14 +284,10 @@ curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8888/api/v1/novels/1/t
 curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8888/api/v1/novels/1/sections/1"
 ```
 
-- 認証は Bearer トークンです (`Authorization: Bearer <token>` または
-  `x-narou-api-token`)。トークンは設定ページの「外部API」タブからも作成・確認・削除できます。
-- `/api/v1` はブラウザの UI トークンとも Basic 認証とも独立しており、
-  トークンだけで読み取り専用データにアクセスできます。
-- MCP (Model Context Protocol) は同じ API の上に載っています。HTTP では
-  `POST /api/v1/mcp`、ローカルでは `narou_rs_mcp` (stdIO) を使います。
-- Cloudflare Workers では Cloudflare Zero Trust の Service Token を優先し
-  ます (Access を設定していない場合は narou の Bearer トークン)。
+- 認証には Bearer トークンを使用します (`Authorization: Bearer <token>` または `x-narou-api-token`)。トークンは設定ページの「外部API」タブからも作成・確認・削除できます。
+- `/api/v1` はブラウザの UI トークンや Basic 認証から独立しており、トークンのみで読み取り専用データにアクセス可能です。
+- MCP (Model Context Protocol) は同じ API の上で動作します。HTTP 経由では `POST /api/v1/mcp`、ローカル環境では `narou_rs_mcp` (stdIO) を使用します。
+- Cloudflare Workers 環境では Cloudflare Zero Trust の Service Token が優先されます (Access を設定していない場合は narou の Bearer トークンを使用)。
 
 ### ログインが必要な小説
 
@@ -306,7 +300,7 @@ narou_rs_login ncode.syosetu.com
 narou_rs_login alphapolis.co.jp --name 本垢
 ```
 
-Chromium 系ブラウザがログイン URL で開くので、ログインが終わったら Enter を押してください。2 段階認証や CAPTCHA もそのまま通せます。ブラウザが見つからない環境では `--browser <パス>` で指定するか、ブラウザからコピーした Cookie 文字列を直接渡せます。
+Chromium 系ブラウザがログイン URL で開くので、ログインが完了したら Enter キーを押してください。2 段階認証や CAPTCHA もそのままブラウザ上で通過できます。ブラウザが見つからない環境では `--browser <パス>` で指定するか、ブラウザからコピーした Cookie 文字列を直接渡せます。
 
 ```powershell
 narou_rs_login ncode.syosetu.com --browser "C:\path\to\chrome.exe"
@@ -355,13 +349,13 @@ narou_rs login clear <サイト> --index 1                    # そのサイト�
 narou_rs login clear                                      # すべて削除
 ```
 
-本体の `login set` / `login add` は廃止しました。登録には `narou_rs_login` または書き出しファイルの取り込みを使ってください。
+※ 本体の `login set` / `login add` コマンドは廃止されました。資格情報の登録には `narou_rs_login` または書き出しファイルの取り込み機能をご利用ください。
 
 複数のログイン Cookie は一覧の順に試行され、成功した資格情報は小説レコードに記憶されるため、同じ小説の次回以降は最初のリクエストからその Cookie が使われます。
 
 保存した Cookie は、ダウンロード時に 404 またはサイト定義の `login_pattern` に一致するログイン壁が返った場合に自動で使われます。`webnovel/*.yaml` に `login_url` (ログイン用 bin が開く URL) と `login_pattern` (ログイン壁を検出する正規表現) を定義すると、サイトごとの挙動を調整できます。
 
-アルファポリスの Cookie は親ドメインと `www` を同じログインにまとめ、無関係な別の `*.co.jp` は含めません。未レンタル話がある場合は保存済みログインを試し、閲覧可能な話が増えたときに採用します。権利が増えなくても無料公開分を取得でき、後からレンタルした話は `narou_rs update <登録ID>` で追加できます。権利失効等で保存済みの話が目次から欠けた場合は、既存データを保持して更新を見送ります。電子書籍特典は未対応です。
+アルファポリスの Cookie は親ドメインと `www` を同一のログインとしてまとめ、無関係な他の `*.co.jp` ドメインは含めません。未レンタル話が含まれる場合は保存済みのログインを試行し、閲覧可能な話数が増加した場合に採用します。閲覧権が付与されていない場合でも無料公開分は取得可能で、後からレンタルした話は `narou_rs update <登録ID>` で追加取得できます。権利失効などで保存済みの話が目次から欠落した場合は、既存データを保護して更新を見送ります。※ 電子書籍特典には未対応です。
 
 #### カクヨムネクスト
 
@@ -400,7 +394,7 @@ narou_rs download https://kakuyomu.jp/works/2912051601247823656
 - 全作品を `小説` または `漫画` に分類し、通常タグと別の項目に保存します。サイト定義の `work_type_rules:` と `preprocess:` DSL で判定を変更でき、条件が無い場合は小説です。Pixiv の `a` / `c` は漫画扱い（単体イラスト・うごイラを含む）です。編集不可の属性タグとして表示・検索する機能は既定 OFF で、Web UI のタグメニューまたは `narou setting tag.attributes-enabled=true` で有効にできます。ON 時の個別表示は `tag.show-novel`（既定 false）と `tag.show-manga`（既定 true）で切り替えます。OFF 中も分類は保持されます。定義例と既存データの扱いは [コマンド一覧](COMMANDS.md) を参照してください。
 - 保存データや設定ファイルは [narou.rb](https://github.com/whiteleaf7/narou) 互換の YAML / ディレクトリ構成を重視しています。
 - Pixiv は本文・目次・作品情報を `/ajax/*` の JSON から取得します (`webnovel/www.pixiv.net.yaml`)。挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は画像 URL を追加 API から解決して `挿絵/` に取り込みます。ログイン限定作品やログインでしか全部見えない作品一覧は、保存したログイン Cookie を順に試して再取得します。
-- Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。うごイラ (フレーム集約 zip) は APNG に組み立てて取り込みます。APNG 化に必要なコーデックは `illustration-animation` feature にあり、native と Worker の両方で有効です（`zip` は wasm でも動くよう純 Rust の deflate バックエンドに絞っています）。R18 作品はログインしていないと一覧に現れないため、含むシリーズは先に `narou_rs_login` で Cookie を保存してください。
+- Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。うごイラ (フレーム集約 zip) は APNG に組み立てて取り込みます。APNG 化に必要なコーデックは `illustration-animation` feature にあり、native と Worker の両方で有効です（`zip` は wasm でも動くよう純 Rust の deflate バックエンドに絞っています）。R18 作品はログインしていないと一覧に表示されないため、R18 作品を含むシリーズは事前に `narou_rs_login` で Cookie を保存してください。
 - 変換結果は青空文庫向け整形を基準にし、設定や device 指定に応じて追加出力を行います。
 - `update` は `general_lastup`、差分 cache、strong update、freeze などの挙動を持ちます。
 - `web` は localhost 利用を基本にしています。非 loopback で公開する場合は認証設定を行ってください。
@@ -412,7 +406,7 @@ narou_rs download https://kakuyomu.jp/works/2912051601247823656
 - `webnovel/*.yaml` を Rust 側のハードコードより優先する方針です。サイト追従が必要な場合は、まず YAML の更新を検討してください。
 - 配布物を移動するときは、実行ファイルだけでなく `webnovel/` と `preset/` も一緒に配置してください。
 - `send`、`mail`、AozoraEpub3 連携は、端末や SMTP の実環境設定が前提です。
-- `mail` 機能と Kindle / Kobo などの実機送信は、開発者の手元に端末が無いため十分な実地確認ができていません。動作確認や不具合報告、再現情報、修正提案に協力してもらえると助かります。
+- `mail` 機能と Kindle / Kobo などの実機送信は、開発者の手元に実機端末がないため十分な実地確認ができていません。動作確認や不具合報告、再現情報、修正提案にご協力いただけますと幸いです。
 - 管理データの保存形式は既定で従来どおりの YAML / ファイル構成です。SQLite 管理はオプトインで、Web UI の初回ツアーか `.narou/storage-backend` (`sqlite` / `yaml`) で切り替えます。`narou_rs db verify` / `export-yaml` / `vacuum` で SQLite 側を保守できます。
 - 新機能ツアーは Web UI 起動時に、まだ見ていないバージョンの項目だけを表示します。表示メニューの「新機能ツアーを表示」から全項目を再表示でき、「以降新機能ツアーは表示しない」で自動表示を止められます。既読バージョンと表示設定はライブラリのローカル設定に保存されます。
 
