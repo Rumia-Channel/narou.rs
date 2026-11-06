@@ -368,6 +368,7 @@ mod tests {
                 subdate: "2024-01-01".into(),
                 subupdate: None,
                 download_time: None,
+                download_revision: 0,
             }],
             novel_type: None,
         };

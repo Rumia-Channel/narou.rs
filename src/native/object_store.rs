@@ -1227,6 +1227,7 @@ mod tests {
             subdate: String::new(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         };
         let loaded = futures::executor::block_on(
             store.read_small(&keys.section(&subtitle.index, &subtitle.file_subtitle)),

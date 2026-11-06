@@ -855,6 +855,7 @@ fn write_back_working_set(
             subdate: section.subdate.clone(),
             subupdate: section.subupdate.clone(),
             download_time: section.download_time.clone(),
+            download_revision: section.download_revision,
         };
         let name = section_filename(&info);
         expected.insert(name.clone());

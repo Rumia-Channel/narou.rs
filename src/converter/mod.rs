@@ -1897,6 +1897,7 @@ mod tests {
                 body: r#"<p>前</p><p><a href="//29644.mitemin.net/i422674/" target="_blank"><img src="//29644.mitemin.net/userpageimage/viewimagebig/icode/i422674/" alt="挿絵(By みてみん)" border="0" /></a></p><p>後</p>"#
                     .to_string(),
             },
+            download_revision: 0,
         }
     }
 
@@ -1917,6 +1918,7 @@ mod tests {
                 postscript: "後書き".to_string(),
                 body: "本文".to_string(),
             },
+            download_revision: 0,
         }
     }
 
@@ -1938,6 +1940,7 @@ mod tests {
                 body: "<p>おじいちゃんが錬金術師(あるけみすと)さんだったの、ちゃんとわかるもん</p>"
                     .to_string(),
             },
+            download_revision: 0,
         }
     }
 
@@ -1959,6 +1962,7 @@ mod tests {
                 body: "<p>おじいちゃんが<ruby>錬金術師<rt>あるけみすと</rt></ruby>さんだった</p>"
                     .to_string(),
             },
+            download_revision: 0,
         }
     }
 
@@ -2637,6 +2641,7 @@ before_settings:
                 postscript: String::new(),
                 body: body.to_string(),
             },
+            download_revision: 0,
         };
         NovelConverter::new(settings)
             .convert_novel(&toc, &[section], None)
@@ -2820,6 +2825,7 @@ before_settings:
             subdate: "2026-01-01 00:00:00".to_string(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         };
         let toc = crate::downloader::TocFile {
             title: "作品タイトル".to_string(),
@@ -2850,6 +2856,7 @@ before_settings:
                 postscript: String::new(),
                 body: "　本文の一行目。\n　本文の二行目。".to_string(),
             },
+            download_revision: 0,
         };
         std::fs::write(
             novel_dir

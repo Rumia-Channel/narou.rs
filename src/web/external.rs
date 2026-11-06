@@ -594,6 +594,7 @@ mod tests {
                 subdate: "2026-01-01".to_string(),
                 subupdate: None,
                 download_time: None,
+                download_revision: 0,
             }],
             novel_type: Some(0),
         };
@@ -616,6 +617,7 @@ mod tests {
                 postscript: String::new(),
                 body: "<p>本文</p>".to_string(),
             },
+            download_revision: 0,
         };
         let section_bytes = serde_yaml::to_string(&section).unwrap().into_bytes();
         futures::executor::block_on(

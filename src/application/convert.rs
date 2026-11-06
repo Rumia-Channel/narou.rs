@@ -429,6 +429,7 @@ mod tests {
             subdate: "2026-09-26 00:00:00".to_string(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         };
         let toc = TocFile {
             title: target.title.clone(),
@@ -454,6 +455,7 @@ mod tests {
                 postscript: String::new(),
                 body: "　本文の一行目。\n　本文の二行目。".to_string(),
             },
+            download_revision: 0,
         };
 
         block_on(async {
@@ -511,6 +513,7 @@ mod tests {
             subdate: "2026-09-26 00:00:00".to_string(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         };
         let first = subtitle("1");
         let missing = subtitle("2");
@@ -538,6 +541,7 @@ mod tests {
                 postscript: String::new(),
                 body: "　一話だけ本文がある。".to_string(),
             },
+            download_revision: 0,
         };
 
         block_on(async {
@@ -595,6 +599,7 @@ mod tests {
             subdate: "2026-09-26 00:00:00".to_string(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         };
         let first = subtitle("1");
         let missing = subtitle("2");
@@ -623,6 +628,7 @@ mod tests {
                 postscript: String::new(),
                 body: body.to_string(),
             },
+            download_revision: 0,
         };
 
         block_on(async {
@@ -715,6 +721,7 @@ mod tests {
             subdate: "2026-09-26 00:00:00".into(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         };
         let toc = TocFile {
             title: target.title.clone(),
@@ -740,6 +747,7 @@ mod tests {
                 postscript: String::new(),
                 body: "　本文。".to_string(),
             },
+            download_revision: 0,
         };
 
         block_on(async {

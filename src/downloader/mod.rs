@@ -1444,12 +1444,13 @@ impl Downloader {
         };
         let mut requires_login = login_cookie.is_some();
         let mut login_site_changed = false;
+        let probe_policy = crate::downloader::http_policy::FetchPolicy::for_site(&setting);
         let (resolved_toc_url, prefetched_toc) =
             match crate::downloader::http_policy::resolve_final_url_with_body(
                 self.http.as_ref(),
                 self.rate_limiter.as_ref(),
                 &toc_url,
-                &crate::downloader::http_policy::FetchPolicy::for_site(&setting),
+                &probe_policy,
             )
             .await
             {
@@ -1513,13 +1514,11 @@ impl Downloader {
                         // The redirect probe already spent the GET, so run the
                         // definition (and any requests it makes) here rather
                         // than re-fetching the same URL through `fetch_toc`.
-                        let policy =
-                            crate::downloader::http_policy::FetchPolicy::for_site(&setting);
                         crate::downloader::util::pretreatment_source_with_jobs(
                             crate::downloader::util::PretreatmentRequest {
                                 http: self.http.as_ref(),
                                 rate_limiter: self.rate_limiter.as_ref(),
-                                policy: &policy,
+                                policy: &probe_policy,
                                 src: &mut body,
                                 encoding: setting.encoding(),
                                 setting: Some(&setting),
@@ -2113,7 +2112,7 @@ impl Downloader {
                     )))?),
                 None => None,
             };
-            let is_new_arrival = checkpointed.is_none() && resumed.is_none() && !old_subtitles.contains_key(&subtitle.index);
+            let is_new_arrival = !old_subtitles.contains_key(&subtitle.index);
             let existed = existing_sections.contains(&subtitle.index);
             let (needs_download, predownloaded) = if checkpointed.is_some() || resumed.is_some() {
                 (false, None)
@@ -2223,10 +2222,12 @@ impl Downloader {
                     }
                 }
 
-                let download_time = if let Some(checkpointed) = plan.checkpointed {
-                    checkpointed.download_time
+                let previous = old_subtitles.get(&subtitle.index).copied();
+                let previous_revision = previous.map_or(1, |old| old.download_revision.max(1));
+                let (download_time, download_revision) = if let Some(checkpointed) = plan.checkpointed {
+                    (checkpointed.download_time, checkpointed.download_revision)
                 } else if let Some(resumed) = plan.resumed {
-                    resumed.download_time
+                    (resumed.download_time, resumed.download_revision)
                 } else if needs_download {
                     if !started_download {
                         self.report_line(&colorize(
@@ -2269,7 +2270,7 @@ impl Downloader {
                     let had_existing = plan.existed;
                     if had_existing {
                         // The stored section still has the previous TOC's filename.
-                        let previous = old_subtitles.get(&subtitle.index).copied().unwrap_or(subtitle);
+                        let previous = previous.unwrap_or(subtitle);
                         if cache_dir.is_none() {
                             cache_dir = cache_timestamp(self.clock.as_ref(), save_diff_snapshots);
                         }
@@ -2286,9 +2287,12 @@ impl Downloader {
                             }
                         }
                     }
+                    // A revision identifies a successful body write, not wall
+                    // time: a frozen/adjusted clock must not hide a resumed edit.
+                    let revision = previous_revision.wrapping_add(1).max(2);
                     let download_time = self
                         .persistence
-                        .save_section(&object_keys, subtitle, &section)
+                        .save_section(&object_keys, subtitle, &section, revision)
                         .await?;
                     let digest = compute_section_hash(&section);
                     let relative_path = section_relative_path(subtitle);
@@ -2316,15 +2320,12 @@ impl Downloader {
                         section_index,
                     )
                     .await?;
-                    updated_count += 1;
                     downloaded_index += 1;
-                    Some(download_time)
+                    (Some(download_time), revision)
                 } else {
                     // 内容が変わっていない (`needs_download=false`) セクションは
                     // 保存も取得もしないので、保存時刻は旧 TOC の値を引き継ぐ。
-                    old_subtitles
-                        .get(&subtitle.index)
-                        .and_then(|old| old.download_time.clone())
+                    (previous.and_then(|old| old.download_time.clone()), previous_revision)
                 };
                 #[cfg(not(feature = "native-runtime"))]
                 if (needs_download || resumed_was_tracked)
@@ -2340,7 +2341,22 @@ impl Downloader {
 
                 let mut sub = subtitle.clone();
                 sub.download_time = download_time;
-                if needs_download && is_new_arrival {
+                sub.download_revision = download_revision.max(1);
+                // A completed prefix still belongs to this update, not to the
+                // last committed TOC. Unchanged/preserved prefix entries do not.
+                let changed = needs_download || (resumed_was_tracked && !plan.preserved
+                    && previous.is_none_or(|old| {
+                        // An old checkpoint without a generation cannot prove
+                        // it was unchanged. Count it once, then retain baseline
+                        // 1 in the TOC; unchanged legacy bodies need no rewrite.
+                        (download_revision == 0 && old.download_revision == 0)
+                            || old.download_revision.max(1) != sub.download_revision
+                            || old.download_time != sub.download_time
+                    }));
+                if changed {
+                    updated_count += 1;
+                }
+                if changed && is_new_arrival {
                     new_arrivals = true;
                     new_arrival_subtitles.push(sub.clone());
                 }
@@ -3702,7 +3718,7 @@ is_narou: false
         };
         persistence.save_toc(&keys, &toc).await.unwrap();
         persistence
-            .save_section(&keys, &subtitles[0], &element)
+            .save_section(&keys, &subtitles[0], &element, 2)
             .await
             .unwrap();
         persistence
@@ -3992,7 +4008,7 @@ is_narou: false
             }).await.unwrap();
         assert_eq!(completed.id, initial.id);
         assert!(!completed.new_novel);
-        assert_eq!(completed.updated_count, 1);
+        assert_eq!(completed.updated_count, 2);
         assert_eq!(persistence.load_toc(&keys).await.unwrap().unwrap().subtitles.len(), 3);
         let versions = read_diff_cache_catalog(store.as_ref(), keys.prefix(), &[]).await.unwrap();
         assert_eq!(versions.len(), 1);
@@ -4376,6 +4392,13 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
             }
         }
 
+        struct FixedClock;
+        impl crate::platform::Clock for FixedClock {
+            fn now_utc(&self) -> chrono::DateTime<chrono::Utc> {
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+            }
+        }
+
         let mut setting: SiteSetting = serde_yaml::from_str(
             r#"
 name: Resume Test
@@ -4385,7 +4408,7 @@ url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
 sitename: Resume Test
 toc_url: 'https://example.com/\k<ncode>/'
 subtitles: |-
-  <a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>
+  <a href="(?<href>/n1234ab/(?<index>\d+)/)" data-date="(?<subdate>[^"]+)">(?<subtitle>[^<]+)</a>
 body_pattern: '<div class="body">(?<body>.+?)</div>'
 title: '<h1>(?<title>[^<]+)</h1>'
 author: '<span>(?<author>[^<]+)</span>'
@@ -4401,8 +4424,8 @@ is_narou: false
         let section_2 = "https://example.com/n1234ab/2/";
         let toc = r#"
 <h1>Resume Test</h1><span>Author</span>
-<a href="/n1234ab/1/">第1話</a>
-<a href="/n1234ab/2/">第2話</a>
+<a href="/n1234ab/1/" data-date="2000-01-01">第1話</a>
+<a href="/n1234ab/2/" data-date="2000-01-01">第2話</a>
 "#;
         let http = Arc::new(MockHttpClient::new());
         http.add_text(toc_url, 200, toc);
@@ -4418,7 +4441,7 @@ is_narou: false
                 novels: Arc::new(MemoryNovelRepository::new()),
                 objects,
                 assets,
-                clock: Arc::new(SystemClock),
+                clock: Arc::new(FixedClock),
             },
             vec![setting],
             HashMap::new(),
@@ -4471,7 +4494,7 @@ is_narou: false
             "changed TOC order cannot reuse a completed-prefix checkpoint");
         http.add_text(target, 200, toc);
 
-        downloader
+        let completed = downloader
             .download_novel_with_execution_options(
                 target,
                 DownloadExecutionOptions {
@@ -4482,6 +4505,8 @@ is_narou: false
             )
             .await
             .unwrap();
+        assert_eq!(completed.updated_count, 2);
+        assert_eq!(completed.new_arrival_subtitles.iter().map(|section| section.index.as_str()).collect::<Vec<_>>(), ["1", "2"]);
         let requests = http.requested_urls();
         assert_eq!(
             requests
@@ -4499,9 +4524,65 @@ is_narou: false
             1
         );
 
+        // Unchanged legacy data acquires a baseline in TOC/checkpoint metadata,
+        // without rewriting the stored bodies or becoming a spurious update.
+        let keys = NovelObjectKeys::new("Resume Test", "n1234ab", false).unwrap();
+        let objects = downloader.persistence.objects().clone();
+        let mut legacy_toc = downloader.persistence.load_toc(&keys).await.unwrap().unwrap();
+        for subtitle in &mut legacy_toc.subtitles {
+            subtitle.download_revision = 0;
+            let mut section = downloader.persistence.load_section(&keys, subtitle).await.unwrap().unwrap();
+            section.download_revision = 0;
+            objects.write_small(&keys.section(&subtitle.index, &subtitle.file_subtitle),
+                serde_yaml::to_string(&section).unwrap().into_bytes()).await.unwrap();
+        }
+        downloader.persistence.save_toc(&keys, &legacy_toc).await.unwrap();
+
+        let mut unchanged_budget = YieldBeforeSection(1);
+        let interrupted = downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: false, budget: Some(&mut unchanged_budget), resume_from_section: None,
+        }).await.unwrap_err();
+        assert!(matches!(interrupted, crate::error::NarouError::DownloadBudgetExpired { .. }));
+        let unchanged = downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: false, budget: None, resume_from_section: Some(1),
+        }).await.unwrap();
+        assert_eq!(unchanged.status, crate::downloader::UpdateStatus::None);
+        assert_eq!(unchanged.updated_count, 0);
+        assert!(!unchanged.new_arrivals);
+        assert!(unchanged.new_arrival_subtitles.is_empty());
+
+        // A checkpoint written by an old binary has no change identity. An
+        // ambiguous prefix is counted once, even when its clock did not move.
+        downloader.persistence.save_toc(&keys, &legacy_toc).await.unwrap();
+        let mut legacy_checkpoint = legacy_toc.clone();
+        legacy_checkpoint.subtitles.truncate(1);
+        downloader.persistence.save_download_resume(&keys, &legacy_checkpoint).await.unwrap();
+        let mut legacy_section = downloader.persistence.load_section(&keys, &legacy_toc.subtitles[0]).await.unwrap().unwrap();
+        legacy_section.element.body = "旧版で保存した改稿".into();
+        objects.write_small(&keys.section("1", "第1話"),
+            serde_yaml::to_string(&legacy_section).unwrap().into_bytes()).await.unwrap();
+        let recovered = downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: false, budget: None, resume_from_section: Some(1),
+        }).await.unwrap();
+        assert_eq!(recovered.status, crate::downloader::UpdateStatus::Ok);
+        assert_eq!(recovered.updated_count, 1);
+
+        // A later metadata-less recovery can still identify the unchanged old
+        // body from the committed baseline; it must not convert on every run.
+        let mut stop = YieldBeforeSection(1);
+        downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: false, budget: Some(&mut stop), resume_from_section: None,
+        }).await.unwrap_err();
+        downloader.persistence.clear_download_resume(&keys).await.unwrap();
+        let unchanged = downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: false, budget: None, resume_from_section: Some(1),
+        }).await.unwrap();
+        assert_eq!(unchanged.status, crate::downloader::UpdateStatus::None);
+        assert_eq!(unchanged.updated_count, 0);
+        assert_eq!(http.requested_urls().iter().filter(|url| url.ends_with(section_1) || url.ends_with(section_2)).count(), 2);
+
         // A new forced job can fail after replacing its first body, before a
         // budget yield. Its retry must not reuse a canceled job's old times.
-        let keys = NovelObjectKeys::new("Resume Test", "n1234ab", false).unwrap();
         downloader.section_cache = super::section::SectionCache::new();
         let mut stop = YieldBeforeSection(1);
         downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
@@ -4509,7 +4590,6 @@ is_narou: false
         }).await.unwrap_err();
         let mut old = downloader.persistence.load_download_resume(&keys).await.unwrap().unwrap();
         old.subtitles[0].download_time = Some("2000-01-01 00:00:00.000000 +0000".into());
-        let objects = downloader.persistence.objects().clone();
         let first_key = keys.section("1", "第1話");
         let mut first: SectionFile = serde_yaml::from_slice(&objects.read_small(&first_key).await.unwrap().unwrap()).unwrap();
         first.download_time = old.subtitles[0].download_time.clone();
@@ -4524,9 +4604,11 @@ is_narou: false
         }).await.unwrap_err();
         assert!(matches!(failed, crate::error::NarouError::Http(_)));
         http.add_text(section_2, 200, r#"<div class="body">本文2</div>"#);
-        downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+        let retried = downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
             force: false, budget: None, resume_from_section: Some(1),
         }).await.unwrap();
+        assert_eq!(retried.status, crate::downloader::UpdateStatus::Ok);
+        assert_eq!(retried.updated_count, 1, "a changed prefix with an unchanged tail still requires conversion");
         let toc = downloader.persistence.load_toc(&keys).await.unwrap().unwrap();
         let first = downloader.persistence.load_section(&keys, &toc.subtitles[0]).await.unwrap().unwrap();
         assert_eq!(first.element.body, "改稿1");
@@ -4910,7 +4992,7 @@ is_narou: false
             .await
             .unwrap();
         assert_eq!(partial.status, crate::downloader::types::UpdateStatus::Ok);
-        assert_eq!(partial.updated_count, 1);
+        assert_eq!(partial.updated_count, 2);
         assert_eq!(
             http.requested_urls().iter().filter(|url| url.ends_with(section_1)).count(),
             1,

@@ -130,6 +130,7 @@ pub fn parse_subtitles(
             subdate,
             subupdate,
             download_time: None,
+            download_revision: 0,
         });
 
         if full_match.end() == 0 {
@@ -314,6 +315,7 @@ pub fn create_short_story_subtitles(
         subdate,
         subupdate,
         download_time: None,
+        download_revision: 0,
     }])
 }
 

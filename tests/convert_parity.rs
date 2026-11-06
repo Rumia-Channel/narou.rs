@@ -22,6 +22,7 @@ fn story_html_is_converted_before_text_pipeline() {
             subdate: String::new(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         }],
         novel_type: Some(1),
     };
@@ -35,6 +36,7 @@ fn story_html_is_converted_before_text_pipeline() {
         subdate: String::new(),
         subupdate: None,
         download_time: None,
+        download_revision: 0,
         element: SectionElement {
             data_type: "text".to_string(),
             introduction: String::new(),

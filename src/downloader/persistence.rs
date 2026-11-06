@@ -169,6 +169,7 @@ impl PersistenceService {
         keys: &NovelObjectKeys,
         subtitle: &SubtitleInfo,
         section: &SectionElement,
+        download_revision: u64,
     ) -> Result<String> {
         let download_time = self
             .clock
@@ -186,6 +187,7 @@ impl PersistenceService {
             subupdate: subtitle.subupdate.clone(),
             download_time: Some(download_time.clone()),
             element: section.clone(),
+            download_revision,
         };
         self.objects
             .write_small(
@@ -489,6 +491,7 @@ mod tests {
             subdate: "2026-08-01".to_string(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         }
     }
 
@@ -510,7 +513,7 @@ mod tests {
             assert!(empty[0].only_latest_update);
 
             let section = section_file(&subtitle, "previous body");
-            service.save_section(&keys, &subtitle, &section.element).await.unwrap();
+            service.save_section(&keys, &subtitle, &section.element, 2).await.unwrap();
             assert!(service.cache_section(&keys, "snapshot", &subtitle).await.unwrap());
             service.record_cache_version(&keys, "snapshot").await.unwrap();
             #[cfg(feature = "native-runtime")]
@@ -551,7 +554,7 @@ mod tests {
 
         futures::executor::block_on(async {
             let time = service
-                .save_section(&keys, &subtitle, &section)
+                .save_section(&keys, &subtitle, &section, 2)
                 .await
                 .unwrap();
             assert_eq!(time, "2026-08-09 01:02:03.000000 +0000");
@@ -612,6 +615,7 @@ mod tests {
             subdate: "2026-08-01".to_string(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         }
     }
 
@@ -632,6 +636,7 @@ mod tests {
                 postscript: String::new(),
                 body: body.to_string(),
             },
+            download_revision: subtitle.download_revision,
         }
     }
 

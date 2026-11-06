@@ -126,6 +126,7 @@ fn library_with_layout(
             chapter: String::new(), subchapter: String::new(), subtitle: title.into(),
             file_subtitle: title.into(), subdate: "2026-01-01 00:00:00".into(),
             subupdate: None, download_time: Some("2026-01-01 00:00:00 +0900".into()),
+            download_revision: 0,
         };
         let mut section = serde_yaml::to_value(&subtitle).unwrap();
         section["element"] = serde_yaml::from_str("data_type: text\nbody: 保存済みの本文\nintroduction: ''\npostscript: ''\n").unwrap();
