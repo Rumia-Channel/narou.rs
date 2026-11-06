@@ -466,6 +466,8 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 
 保存先は在庫 `api_tokens` (Native は `.narou/api_tokens.yaml` / SQLite `app_state`、Worker は D1 `app_state`)。値は平文 (設定の `server-basic-auth.password` と同じ扱い) で、`external-api.require-token` (既定 true) が有効なあいだ Bearer トークンとして照合される。
 
+一覧のページ処理と目次・本文の識別子は HTTP / stdIO MCP の共通サービスで解釈する。通常作品の本文キーは話番号、仮想作品は `メンバーID:話番号`。HTTP の `limit=all&offset=N` は N 件目以降を返し、全話取得は本文を欠落・破損のまま成功させない。入力・欠落・競合・内部障害の応答は Native／Workers で共通化している。
+
 Cloudflare Workers では Cloudflare Zero Trust の Service Token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) を優先し、その資格情報が secret に入っていれば narou の Bearer トークンは求めない。Access を設定していない Worker では Bearer トークンを要求する。
 
 ---

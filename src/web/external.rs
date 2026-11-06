@@ -20,7 +20,7 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use crate::application::external_api::{
-    render, ExternalListRequest, OutputFormat, RenderOptions,
+    parse_format, render, ExternalListRequest, OutputFormat, RenderOptions,
 };
 use crate::application::mcp::McpServer;
 use crate::platform::NovelId;
@@ -57,13 +57,13 @@ pub async fn api_novels(
     {
         Ok(list) => {
             let document = list.to_json();
-            let items = list.to_jsonl_items();
             respond(
                 request.format,
                 &document,
                 "novels",
                 &[("data", "novel"), ("tags", "tag"), ("members", "member")],
-                Some(&items),
+                "novel",
+                document.get("data").and_then(Value::as_array).map(Vec::as_slice),
             )
         }
         Err(error) => application_error(error),
@@ -83,7 +83,10 @@ pub async fn api_novel(
     let Some(id) = parse_id(&id) else {
         return invalid_id(&id);
     };
-    let format = format_of(&params);
+    let format = match format_of(&params) {
+        Ok(format) => format,
+        Err(response) => return response,
+    };
     match state.services.external_api.novel(id).await {
         Ok(novel) => {
             let document = serde_json::to_value(&novel).unwrap_or(Value::Null);
@@ -92,6 +95,7 @@ pub async fn api_novel(
                 &document,
                 "novel",
                 &[("tags", "tag"), ("members", "member")],
+                "novel",
                 None,
             )
         }
@@ -112,7 +116,10 @@ pub async fn api_novel_toc(
     let Some(id) = parse_id(&id) else {
         return invalid_id(&id);
     };
-    let format = format_of(&params);
+    let format = match format_of(&params) {
+        Ok(format) => format,
+        Err(response) => return response,
+    };
     match state.services.external_api.toc(id).await {
         Ok(toc) => {
             let document = serde_json::to_value(&toc).unwrap_or(Value::Null);
@@ -121,6 +128,7 @@ pub async fn api_novel_toc(
                 &document,
                 "toc",
                 &[("sections", "section"), ("members", "member")],
+                "section",
                 None,
             )
         }
@@ -141,35 +149,23 @@ pub async fn api_novel_sections(
     let Some(id) = parse_id(&id) else {
         return invalid_id(&id);
     };
-    let format = format_of(&params);
-    let toc = match state.services.external_api.toc(id).await {
-        Ok(toc) => toc,
+    let format = match format_of(&params) {
+        Ok(format) => format,
+        Err(response) => return response,
+    };
+    // 目次は所有者ごとに 1 回だけ読む (話ごとに目次を読み直さない)。
+    let sections = match state.services.external_api.sections(id).await {
+        Ok(sections) => sections,
         Err(error) => return application_error(error),
     };
-    let mut sections = Vec::new();
-    for section in &toc.sections {
-        match state.services.external_api.section(id, &section.key).await {
-            Ok(body) => sections.push(serde_json::to_value(&body).unwrap_or(Value::Null)),
-            // 1 話だけ読めなかった場合は、その話だけを飛ばす (話全体が
-            // 失敗したときの取りこぼしを避ける)。
-            Err(error) => {
-                crate::logger::emit_stderr(
-                    &format!(
-                        "外部 API: 本文を読み込めませんでした ({id} / {}): {error}",
-                        section.key
-                    ),
-                    true,
-                );
-            }
-        }
-    }
-    let document = serde_json::json!({ "id": id, "sections": sections });
+    let document = serde_json::to_value(&sections).unwrap_or(Value::Null);
     respond(
         format,
         &document,
         "sections",
         &[("sections", "section")],
-        None,
+        "section",
+        document.get("sections").and_then(Value::as_array).map(Vec::as_slice),
     )
 }
 
@@ -186,11 +182,14 @@ pub async fn api_novel_section(
     let Some(id) = parse_id(&id) else {
         return invalid_id(&id);
     };
-    let format = format_of(&params);
+    let format = match format_of(&params) {
+        Ok(format) => format,
+        Err(response) => return response,
+    };
     match state.services.external_api.section(id, &key).await {
         Ok(section) => {
             let document = serde_json::to_value(&section).unwrap_or(Value::Null);
-            respond(format, &document, "section", &[], None)
+            respond(format, &document, "section", &[], "section", None)
         }
         Err(error) => application_error(error),
     }
@@ -248,11 +247,15 @@ pub async fn api_tags(
     if let Some(response) = authorize(&state, &headers).await {
         return response;
     }
-    let format = format_of(&params);
+    let format = match format_of(&params) {
+        Ok(format) => format,
+        Err(response) => return response,
+    };
     match state.services.external_api.tags().await {
         Ok(tags) => {
             let document = serde_json::to_value(&tags).unwrap_or(Value::Null);
-            respond(format, &document, "tags", &[], None)
+            // タグ一覧は 1 件ずつ並べる (JSON Lines も XML も 1 タグ = 1 要素)。
+            respond(format, &document, "tags", &[], "tag", document.as_array().map(Vec::as_slice))
         }
         Err(error) => application_error(error),
     }
@@ -426,16 +429,12 @@ fn presented_token(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
+        && let Some((scheme, token)) = value.trim().split_once(' ')
+        && scheme.eq_ignore_ascii_case("bearer")
     {
-        let trimmed = value.trim();
-        let token = trimmed
-            .strip_prefix("Bearer ")
-            .or_else(|| trimmed.strip_prefix("bearer "));
-        if let Some(token) = token {
-            let token = token.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
+        let token = token.trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
         }
     }
     headers
@@ -468,12 +467,14 @@ fn pairs(params: &HashMap<String, String>) -> Vec<(String, String)> {
         .collect()
 }
 
-/// 出力形式を取り出す。
-fn format_of(params: &HashMap<String, String>) -> OutputFormat {
-    params
-        .get("format")
-        .and_then(|value| OutputFormat::parse(value))
-        .unwrap_or_default()
+/// 出力形式を取り出す (不正なら 400 のメッセージを返す)。
+///
+/// 一覧以外でも同じ規則を使う (不正な形式を黙って JSON へ落とさない)。
+fn format_of(params: &HashMap<String, String>) -> Result<OutputFormat, Response> {
+    match params.get("format") {
+        Some(value) => parse_format(value).map_err(|error| error_response(StatusCode::BAD_REQUEST, "bad_request", error.message())),
+        None => Ok(OutputFormat::default()),
+    }
 }
 
 /// 応答を組み立てる。
@@ -482,6 +483,7 @@ fn respond(
     document: &Value,
     root: &str,
     array_names: &[(&str, &str)],
+    xml_item: &str,
     jsonl_items: Option<&[Value]>,
 ) -> Response {
     let body = render(
@@ -490,6 +492,7 @@ fn respond(
             format,
             root,
             array_names,
+            xml_item,
             jsonl_items,
         },
     );
@@ -507,21 +510,8 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
 
 /// アプリケーションエラーを HTTP 応答にする。
 fn application_error(error: crate::application::error::ApplicationError) -> Response {
-    use crate::application::error::ApplicationError;
-    match error {
-        ApplicationError::InvalidRequest(message) => {
-            error_response(StatusCode::BAD_REQUEST, "bad_request", &message)
-        }
-        ApplicationError::NotFound(message) => {
-            error_response(StatusCode::NOT_FOUND, "not_found", &message)
-        }
-        ApplicationError::Conflict(message) => {
-            error_response(StatusCode::CONFLICT, "conflict", &message)
-        }
-        ApplicationError::Platform(message) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", &message)
-        }
-    }
+    let (status, code) = crate::application::external_api::http_error(&error);
+    error_response(StatusCode::from_u16(status).expect("valid application error status"), code, error.message())
 }
 
 
@@ -636,11 +626,19 @@ mod tests {
 
     /// テスト用の状態を作る。
     fn build_state(records: Vec<NovelRecord>, members: VirtualNovelMembers) -> AppState {
-        let novels = Arc::new(MemoryNovelRepository::from_records(records));
         let objects: Arc<dyn narou_rs::platform::ObjectStore> = Arc::new(MemoryObjectStore::new());
         for record in ["通常", "メンバー"].iter() {
             seed_objects(&objects, record);
         }
+        build_state_with_objects(records, members, objects)
+    }
+
+    fn build_state_with_objects(
+        records: Vec<NovelRecord>,
+        members: VirtualNovelMembers,
+        objects: Arc<dyn narou_rs::platform::ObjectStore>,
+    ) -> AppState {
+        let novels = Arc::new(MemoryNovelRepository::from_records(records));
         let tokens = vec![ApiToken {
             id: "token-1".to_string(),
             name: "test".to_string(),
@@ -712,6 +710,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+
+        // 認証方式の大文字小文字は区別しない。
+        let lower = client
+            .get(format!("{base}/api/v1/novels"))
+            .header("Authorization", format!("bearer {TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(lower.status(), reqwest::StatusCode::OK);
         server.abort();
     }
 
@@ -839,6 +846,9 @@ mod tests {
             .json_value().await;
         assert_eq!(toc["sections"][0]["index"], "1");
         assert_eq!(toc["sections"][0]["subtitle"], "第一話");
+        // 通常作品の話の識別子は話番号だけ (バーチャル小説は
+        // `メンバーID:話番号`)。
+        assert_eq!(toc["sections"][0]["key"], "1");
 
         let section: serde_json::Value = client
             .get(format!("{base}/api/v1/novels/1/sections/1"))
@@ -870,7 +880,8 @@ mod tests {
         assert_eq!(sections["id"], 1);
         assert_eq!(sections["sections"].as_array().unwrap().len(), 1);
         assert_eq!(sections["sections"][0]["body"], "<p>本文</p>");
-        assert_eq!(sections["sections"][0]["key"], "1:1");
+        // 通常作品の話の識別子は話番号だけ。
+        assert_eq!(sections["sections"][0]["key"], "1");
         server.abort();
     }
 
@@ -922,6 +933,193 @@ mod tests {
             .json_value().await;
         let text = call["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("通常"), "{text}");
+        server.abort();
+    }
+
+    /// バーチャル小説の目次はメンバーの目次を連結し、識別子は
+    /// `メンバーID:話番号` になる (通常作品の話番号だけと区別する)。
+    #[tokio::test]
+    async fn the_virtual_novel_sections_use_a_member_prefixed_key() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(9, vec![1, 2]).unwrap();
+        let mut virtual_record = record(9, "まとめ", "まとめ");
+        virtual_record.ncode = Some("vs_9".to_string());
+        let records = vec![
+            record(1, "通常", "通常"),
+            record(2, "メンバー", "メンバー"),
+            virtual_record,
+        ];
+        let state = build_state(records, members);
+        let (base, server) = serve(state).await;
+        let client = client();
+
+        let toc: serde_json::Value = client
+            .get(format!("{base}/api/v1/novels/9/toc"))
+            .header("x-narou-api-token", TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json_value().await;
+        let keys: Vec<&str> = toc["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|section| section["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["1:1", "2:1"]);
+
+        // 識別子のとおりですべての本文が引ける。
+        let section: serde_json::Value = client
+            .get(format!("{base}/api/v1/novels/9/sections/2:1"))
+            .header("x-narou-api-token", TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json_value().await;
+        assert_eq!(section["body"], "<p>本文</p>");
+        assert_eq!(section["member_id"], 2);
+
+        // メンバー数 2 のバーチャル小説では話番号だけでは特定できない。
+        let ambiguous = client
+            .get(format!("{base}/api/v1/novels/9/sections/1"))
+            .header("x-narou-api-token", TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ambiguous.status(), reqwest::StatusCode::NOT_FOUND);
+        server.abort();
+    }
+
+    /// タグ一覧は JSON Lines でも XML でも 1 タグ = 1 要素にする。
+    #[tokio::test]
+    async fn the_tags_are_served_as_one_record_per_line_and_one_xml_root() {
+        let state = build_state(vec![record(1, "通常", "通常")], VirtualNovelMembers::default());
+        let (base, server) = serve(state).await;
+        let client = client();
+
+        let jsonl = client
+            .get(format!("{base}/api/v1/tags?format=jsonl"))
+            .header("x-narou-api-token", TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let body = jsonl.text().await.unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["name"], "共通");
+        assert_eq!(parsed["count"], 1);
+
+        let xml = client
+            .get(format!("{base}/api/v1/tags?format=xml"))
+            .header("x-narou-api-token", TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let body = xml.text().await.unwrap();
+        // XML 文書としてルート要素は 1 つだけ。
+        assert_eq!(body.matches("<tags>").count(), 1);
+        assert_eq!(body.matches("<tag>").count(), 1);
+        assert!(body.contains("<name>共通</name>"), "{body}");
+        server.abort();
+    }
+
+    /// 不正な形式は一覧以外でも 400 にする (黙って JSON へ落とさない)。
+    #[tokio::test]
+    async fn an_unknown_format_is_rejected_on_every_endpoint() {
+        let state = build_state(vec![record(1, "通常", "通常")], VirtualNovelMembers::default());
+        let (base, server) = serve(state).await;
+        let client = client();
+
+        for path in [
+            "/api/v1/novels?format=yaml",
+            "/api/v1/novels/1?format=yaml",
+            "/api/v1/novels/1/toc?format=yaml",
+            "/api/v1/novels/1/sections?format=yaml",
+            "/api/v1/novels/1/sections/1?format=yaml",
+            "/api/v1/tags?format=yaml",
+        ] {
+            let response = client
+                .get(format!("{base}{path}"))
+                .header("x-narou-api-token", TOKEN)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{path}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_novels_are_not_internal_errors() {
+        let state = build_state(Vec::new(), VirtualNovelMembers::default());
+        let (base, server) = serve(state).await;
+        let client = client();
+        for suffix in ["", "/toc", "/sections", "/sections/1"] {
+            let response = client.get(format!("{base}/api/v1/novels/999999999{suffix}"))
+                .header("x-narou-api-token", TOKEN).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{suffix}");
+            assert_eq!(response.json_value().await["error"]["code"], "not_found");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn all_sections_rejects_missing_or_corrupt_bodies() {
+        let objects: Arc<dyn narou_rs::platform::ObjectStore> = Arc::new(MemoryObjectStore::new());
+        seed_objects(&objects, "通常");
+        let state = build_state_with_objects(
+            vec![record(1, "通常", "通常")], VirtualNovelMembers::default(), objects.clone(),
+        );
+        let (base, server) = serve(state).await;
+        let client = client();
+        let keys = NovelObjectKeys::new("site", "通常", false).unwrap();
+        let body_key = keys.section("1", "第一話");
+        for (body, expected) in [
+            (None, reqwest::StatusCode::NOT_FOUND),
+            (Some(b"[broken".to_vec()), reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            match body {
+                None => { objects.delete(&body_key).await.unwrap(); }
+                Some(bytes) => objects.write_small(&body_key, bytes).await.unwrap(),
+            }
+            for format in ["json", "jsonl", "xml"] {
+                let response = client.get(format!("{base}/api/v1/novels/1/sections?format={format}"))
+                    .header("x-narou-api-token", TOKEN).send().await.unwrap();
+                assert_eq!(response.status(), expected, "{format}: incomplete books must not succeed");
+            }
+        }
+        server.abort();
+    }
+
+    /// 無制限 (`limit=all`) と開始位置の組合せで、続きが返る (落ちない)。
+    #[tokio::test]
+    async fn an_unbounded_list_starts_at_the_requested_offset() {
+        let records = vec![record(1, "一", "通常"), record(2, "二", "メンバー")];
+        let state = build_state(records, VirtualNovelMembers::default());
+        let (base, server) = serve(state).await;
+        let client = client();
+
+        let response = client
+            .get(format!("{base}/api/v1/novels?limit=all&offset=1"))
+            .header("x-narou-api-token", TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let document: serde_json::Value = response.json_value().await;
+        assert_eq!(document["records_filtered"], 2);
+        let titles: Vec<&str> = document["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(titles, vec!["二"]);
         server.abort();
     }
 }

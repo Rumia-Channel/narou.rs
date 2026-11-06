@@ -630,6 +630,26 @@ pub(crate) fn compare_records_by_sort_key(
     crate::db::compare_records_by_key(a, b, key.as_db_key())
 }
 
+/// Select a page from an in-memory snapshot without cloning discarded records.
+pub(crate) fn query_records<'a>(
+    records: impl Iterator<Item = &'a NovelRecord>,
+    query: &NovelQuery,
+) -> Vec<NovelRecord> {
+    if query.limit == 0 {
+        return Vec::new();
+    }
+    let mut records: Vec<_> = records
+        .filter(|record| record_matches_filter(record, &query.filter))
+        .collect();
+    records.sort_unstable_by(|a, b| {
+        compare_records_by_sort_key(a, b, query.sort.key).then_with(|| a.id.cmp(&b.id))
+    });
+    if query.sort.reverse {
+        records.reverse();
+    }
+    records.into_iter().skip(query.offset).take(query.limit).cloned().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

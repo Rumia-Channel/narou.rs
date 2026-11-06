@@ -112,22 +112,7 @@ impl NativeNovelRepository {
 
     pub fn query_sync(&self, query: &NovelQuery) -> Result<Vec<NovelRecord>> {
         crate::db::with_database(|db| {
-            let mut records: Vec<NovelRecord> = db
-                .all_records()
-                .values()
-                .filter(|r| record_matches_filter(r, &query.filter))
-                .cloned()
-                .collect();
-            records.sort_by(|a, b| {
-                crate::db::compare_records_by_key(a, b, query.sort.key.as_db_key())
-                    .then_with(|| a.id.cmp(&b.id))
-            });
-            if query.sort.reverse {
-                records.reverse();
-            }
-            let start = query.offset.min(records.len());
-            let end = (start + query.limit).min(records.len());
-            Ok(records[start..end].to_vec())
+            Ok(crate::platform::repository::query_records(db.all_records().values(), query))
         })
     }
 
@@ -269,27 +254,7 @@ impl NovelRepository for NativeNovelRepository {
     ) -> PlatformFuture<'a, Result<Vec<NovelRecord>>> {
         let query = query.clone();
         Box::pin(async move {
-            run_db(move || {
-                crate::db::with_database(|db| {
-                    let mut records: Vec<NovelRecord> = db
-                        .all_records()
-                        .values()
-                        .filter(|r| record_matches_filter(r, &query.filter))
-                        .cloned()
-                        .collect();
-                    records.sort_by(|a, b| {
-                        crate::db::compare_records_by_key(a, b, query.sort.key.as_db_key())
-                            .then_with(|| a.id.cmp(&b.id))
-                    });
-                    if query.sort.reverse {
-                        records.reverse();
-                    }
-                    let start = query.offset.min(records.len());
-                    let end = (start + query.limit).min(records.len());
-                    Ok(records[start..end].to_vec())
-                })
-            })
-            .await
+            run_db(move || NativeNovelRepository.query_sync(&query)).await
         })
     }
 

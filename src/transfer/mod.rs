@@ -33,6 +33,7 @@ mod archive;
 mod attribute;
 mod error;
 mod import;
+mod request;
 mod stream;
 
 pub use archive::{
@@ -43,6 +44,7 @@ pub use error::{Result, TransferError};
 pub use import::{
     ConflictPolicy, ExistingNovel, ImportAction, ImportPlan, ImportPlanEntry, plan_import,
 };
+pub use request::{flag_value, import_payload, is_zip_content_type, parse_ids};
 pub use stream::{ArchiveStream, TransferBuffer};
 
 /// Version written to [`ArchiveManifest::format_version`].

@@ -15,7 +15,7 @@
 //! 設定していない Worker では narou の Bearer トークンを要求する。
 
 use narou_rs::application::external_api::{
-    render, ExternalListRequest, OutputFormat, RenderOptions,
+    parse_format, render, ExternalListRequest, OutputFormat, RenderOptions,
 };
 use narou_rs::application::mcp::McpServer;
 use serde_json::{json, Value};
@@ -27,6 +27,11 @@ use super::json_error;
 pub const ACCESS_CLIENT_ID_SECRET: &str = "NAROU_CF_ACCESS_CLIENT_ID";
 /// Cloudflare Access の Service Token の Client Secret を入れる secret 名。
 pub const ACCESS_CLIENT_SECRET_SECRET: &str = "NAROU_CF_ACCESS_CLIENT_SECRET";
+
+fn application_error(error: narou_rs::application::ApplicationError) -> worker::Result<Response> {
+    let (status, code) = narou_rs::application::external_api::http_error(&error);
+    json_error(status, code, Some(error.message()))
+}
 
 /// 外部公開 API の設定 (トークン管理)。
 ///
@@ -250,17 +255,16 @@ fn access_token_from_headers(req: &Request) -> Option<(String, String)> {
 /// Bearer トークンを取り出す。
 ///
 /// native と同じく `Authorization: Bearer <token>` と
-/// `x-narou-api-token: <token>` のどちらでも受け取る。
+/// `x-narou-api-token: <token>` のどちらでも受け取る。認証方式の
+/// 大文字小文字は区別しない (RFC 7235)。
 fn bearer_token(req: &Request) -> Option<String> {
-    if let Some(value) = header_value(req, "authorization") {
-        let token = value
-            .strip_prefix("Bearer ")
-            .or_else(|| value.strip_prefix("bearer "));
-        if let Some(token) = token {
-            let token = token.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
+    if let Some(value) = header_value(req, "authorization")
+        && let Some((scheme, token)) = value.trim().split_once(' ')
+        && scheme.eq_ignore_ascii_case("bearer")
+    {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
         }
     }
     header_value(req, "x-narou-api-token")
@@ -288,15 +292,24 @@ fn query_pairs(req: &Request) -> Vec<(String, String)> {
         .collect()
 }
 
-/// 出力形式を取り出す。
-fn format_of(req: &Request) -> OutputFormat {
+/// 出力形式を取り出す (不正なら 400 の JSON)。
+///
+/// native と同じく、不正な形式を黙って JSON へ落とさない。
+fn format_of(req: &Request) -> std::result::Result<OutputFormat, worker::Result<Response>> {
     let Ok(url) = req.url() else {
-        return OutputFormat::default();
+        return Ok(OutputFormat::default());
     };
-    url.query_pairs()
+    let value = url
+        .query_pairs()
         .find(|(key, _)| key == "format")
-        .and_then(|(_, value)| OutputFormat::parse(&value))
-        .unwrap_or_default()
+        .map(|(_, value)| value.into_owned());
+    match value {
+        Some(value) => match parse_format(&value) {
+            Ok(format) => Ok(format),
+            Err(error) => Err(json_error(400, "bad_request", Some(error.message()))),
+        },
+        None => Ok(OutputFormat::default()),
+    }
 }
 
 /// 応答を組み立てる。
@@ -305,6 +318,7 @@ fn respond(
     document: &Value,
     root: &str,
     array_names: &[(&str, &str)],
+    xml_item: &str,
     jsonl_items: Option<&[Value]>,
 ) -> worker::Result<Response> {
     let body = render(
@@ -313,6 +327,7 @@ fn respond(
             format,
             root,
             array_names,
+            xml_item,
             jsonl_items,
         },
     );
@@ -365,16 +380,16 @@ async fn api_novels(
     match services.external_api.list(&request, hidden).await {
         Ok(list) => {
             let document = list.to_json();
-            let items = list.to_jsonl_items();
             respond(
                 request.format,
                 &document,
                 "novels",
                 &[("data", "novel"), ("tags", "tag"), ("members", "member")],
-                Some(&items),
+                "novel",
+                document.get("data").and_then(Value::as_array).map(Vec::as_slice),
             )
         }
-        Err(error) => json_error(500, "internal_error", Some(error.message())),
+        Err(error) => application_error(error),
     }
 }
 
@@ -393,23 +408,23 @@ async fn api_novel(
         Ok(id) => id,
         Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
+    let format = match format_of(req) {
+        Ok(format) => format,
+        Err(response) => return response,
+    };
     match services.external_api.novel(id).await {
         Ok(novel) => {
             let document = serde_json::to_value(&novel).unwrap_or(Value::Null);
             respond(
-                format_of(req),
+                format,
                 &document,
                 "novel",
                 &[("tags", "tag"), ("members", "member")],
+                "novel",
                 None,
             )
         }
-        Err(error) => match error {
-            narou_rs::application::ApplicationError::NotFound(message) => {
-                json_error(404, "not_found", Some(&message))
-            }
-            _ => json_error(500, "internal_error", Some(error.message())),
-        },
+        Err(error) => application_error(error),
     }
 }
 
@@ -428,23 +443,23 @@ async fn api_novel_toc(
         Ok(id) => id,
         Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
+    let format = match format_of(req) {
+        Ok(format) => format,
+        Err(response) => return response,
+    };
     match services.external_api.toc(id).await {
         Ok(toc) => {
             let document = serde_json::to_value(&toc).unwrap_or(Value::Null);
             respond(
-                format_of(req),
+                format,
                 &document,
                 "toc",
                 &[("sections", "section"), ("members", "member")],
+                "section",
                 None,
             )
         }
-        Err(error) => match error {
-            narou_rs::application::ApplicationError::NotFound(message) => {
-                json_error(404, "not_found", Some(&message))
-            }
-            _ => json_error(500, "internal_error", Some(error.message())),
-        },
+        Err(error) => application_error(error),
     }
 }
 
@@ -463,23 +478,24 @@ async fn api_novel_sections(
         Ok(id) => id,
         Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
-    let toc = match services.external_api.toc(id).await {
-        Ok(toc) => toc,
-        Err(error) => {
-            return json_error(500, "internal_error", Some(error.message()));
-        }
+    let format = match format_of(req) {
+        Ok(format) => format,
+        Err(response) => return response,
     };
-    let mut sections = Vec::new();
-    for section in &toc.sections {
-        match services.external_api.section(id, &section.key).await {
-            Ok(body) => sections.push(serde_json::to_value(&body).unwrap_or(Value::Null)),
-            Err(error) => {
-                worker::console_log!("external api: section read failed: {error}");
-            }
-        }
-    }
-    let document = json!({ "id": id, "sections": sections });
-    respond(format_of(req), &document, "sections", &[("sections", "section")], None)
+    // 目次は所有者ごとに 1 回だけ読む (話ごとに目次を読み直さない)。
+    let sections = match services.external_api.sections(id).await {
+        Ok(sections) => sections,
+        Err(error) => return application_error(error),
+    };
+    let document = serde_json::to_value(&sections).unwrap_or(Value::Null);
+    respond(
+        format,
+        &document,
+        "sections",
+        &[("sections", "section")],
+        "section",
+        document.get("sections").and_then(Value::as_array).map(Vec::as_slice),
+    )
 }
 
 /// 1 話の本文。
@@ -499,17 +515,16 @@ async fn api_novel_section(
         Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
     let key = percent_decode(key);
+    let format = match format_of(req) {
+        Ok(format) => format,
+        Err(response) => return response,
+    };
     match services.external_api.section(id, &key).await {
         Ok(section) => {
             let document = serde_json::to_value(&section).unwrap_or(Value::Null);
-            respond(format_of(req), &document, "section", &[], None)
+            respond(format, &document, "section", &[], "section", None)
         }
-        Err(error) => match error {
-            narou_rs::application::ApplicationError::NotFound(message) => {
-                json_error(404, "not_found", Some(&message))
-            }
-            _ => json_error(500, "internal_error", Some(error.message())),
-        },
+        Err(error) => application_error(error),
     }
 }
 
@@ -532,12 +547,17 @@ async fn api_tags(
     if !matches!(req.method(), Method::Get | Method::Head) {
         return Response::error("Method Not Allowed", 405);
     }
+    let format = match format_of(req) {
+        Ok(format) => format,
+        Err(response) => return response,
+    };
     match services.external_api.tags().await {
         Ok(tags) => {
             let document = serde_json::to_value(&tags).unwrap_or(Value::Null);
-            respond(format_of(req), &document, "tags", &[], None)
+            // タグ一覧は 1 件ずつ並べる (JSON Lines も XML も 1 タグ = 1 要素)。
+            respond(format, &document, "tags", &[], "tag", document.as_array().map(Vec::as_slice))
         }
-        Err(error) => json_error(500, "internal_error", Some(error.message())),
+        Err(error) => application_error(error),
     }
 }
 
@@ -570,7 +590,8 @@ async fn api_mcp(
     let server = McpServer::new(services.external_api.clone());
     match server.handle(&request, hidden).await {
         Some(response) => Ok(Response::from_json(&response)?),
-        None => Ok(Response::from_json(&json!({}))?.with_status(202)),
+        // 通知 (id なし) には応答しない。native と同じく 202 を返す。
+        None => Ok(Response::from_bytes(Vec::new())?.with_status(202)),
     }
 }
 
