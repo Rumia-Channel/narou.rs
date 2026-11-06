@@ -502,6 +502,44 @@ Browser ──► Worker (fetch)
 - 600 秒の wall-clock / 850 subrequest の soft budget は話の開始前と未取得画像の直前で確認し、checkpoint を保存して同じ job ID で続行する。画像取得中の中断では先に挿絵索引を保存し、checkpoint はその話を指したままにする。再開後は取得済み画像を読み飛ばして残りを取得し、完了した話の本文も再取得しない。失敗回数には数えず、Web コンソールでは自動再開として案内し、上限値・サイトの取得間隔は変更しない。`worker_entry/tests/content_storage.mjs` は実 workerd・D1・S3 fixture で 500 枚入り 1 話の継続実行と EPUB への全画像埋め込みを確認する。
 - 完了済みの話は、本文・挿絵の保存後にメタデータだけを `<novel-prefix>/.download_resume` へ保存する。再開はこの目次と既存オブジェクト一覧を使い、過去の全本文を S3 から GET しない。拡張子を `.yaml` にしないことで、作品フォルダ名が `本文` の場合も本文・履歴・S3 移行対象に混ぜず D1 の管理情報として保存する。旧版のチェックポイント、または定期 checkpoint がメタデータより先に進んだ部分だけ本文から復元する。目次の識別子・URL・ファイル名・更新日が変わった場合や保存済みの話が欠けた場合は既存の破損チェックポイント回復へ渡す。新規取得の位置 0 と正常完了時はメタデータを削除する。`content_storage.mjs` は 1,685 話・目次 17 ページで予算を跨いでも各話を 1 回だけ取得し、EPUB に先頭・中間・最終話が残ることも検証する。
 
+#### D1 読み取り負荷 (2026-11-06 調査)
+
+Cloudflare Analytics の UTC `2026-10-21T00:00:00Z`〜`2026-11-06T06:15:42Z` で、
+アカウント全体の読み取りは 17,707,818,826 行、本番 `narou-rs-production` は
+17,703,563,903 行 (99.976%) だった。`rowsRead` は返却件数ではなく走査行数である。
+調査は Analytics・SELECT・EXPLAIN のみで、本番のデータ・スキーマ・配備は変更していない。
+
+直近17日の Query Insights では旧待機 SQL が 16,081,641,532 行を占めていた。
+直近24時間では仮想属性再計算 395,679,788 行、待機再開 51,407,103 行、
+キュー件数集計 14,674,935 行が上位だった。これらは上記の期間集計と時間窓が異なる。
+
+- キュー表示は migration `0017_worker_job_counts.sql` の `worker_job_counts` を使う。
+  台帳の INSERT / UPDATE / DELETE トリガーで状態・レーン・中断理由区分の件数を
+  同じトランザクションで保持する。任意のエラー文で集計行を増やさず、heartbeat /
+  checkpoint / 同じ区分への更新では集計を書き直さない。旧 Worker の書き込みにも適用される。
+  完了履歴は削除しない。配備時は通常の CI と同じく migration → Worker の順にする。
+- D1 の `meta.changes` はトリガーの変更も含む。真偽判定 (`> 0`) は従来どおり使えるが、
+  一括消去件数は同じ batch の `SELECT changes()` で台帳自身の変更数だけを返す。
+- ローカル workerd / D1 に終了履歴 30,000 件を追加した計測では、キュー状態の SQL は
+  60,235 行 → 5 行の読み取りになり、状態・レーンごとの件数は一致した。
+  これはローカル fixture の結果であり、修正版配備後の本番負荷とは区別する。
+- 仮想属性整合は `json_each(members) CROSS JOIN novels ON novels.id=member` で
+  結合順を固定する。属性索引を起点に無関係な漫画全件を読む計画を防ぎ、キャッシュや
+  TTL で更新を遅らせない。本番の読み取り専用の分類 SELECT で 57,879 行 → 356 行、
+  21 グループの結果一致を確認した (UPDATE 文の配備後測定ではない)。
+- admission の作品同一性は migration `0018_novel_target_aliases.sql` の
+  `novel_target_aliases(target, novel_id)` で引く。正確な URL・ncode・slash 区切り suffix
+  を初回だけ backfill し、作品の INSERT / 識別子 UPDATE / DELETE トリガーで同期する。
+  一般のタイトル・本文更新では索引を書き直さない。最低 ID 優先・旧 URL 表記の意味を
+  保ち、待機選択と claim の両方から全作品走査を除く。
+  ローカル workerd の 2,279 作品・1,196 待機ジョブでは同じ再開候補に対して
+  57,448 行 → 8,375 行。SQLite の無関係な 30,000 作品を追加した単一候補の回帰では
+  5,940,400 → 200 VM steps。VM steps は D1 の課金行数とは別の指標である。
+
+再測定は `wrangler d1 insights narou-rs-production --time-period 1d --sort-type sum --sort-by reads --limit 20 --json`。
+期間別・DB 別の総量は [D1 Analytics](https://developers.cloudflare.com/d1/observability/metrics-analytics/) の
+`d1AnalyticsAdaptiveGroups` で集計し、旧版と修正版の SQL を混同しない。
+
 
 ### 3.2 認証
 

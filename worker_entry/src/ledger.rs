@@ -430,7 +430,17 @@ impl D1JobLedger {
                 BindValue::Text(self.now_rfc3339()),
             ],
         )?;
-        changed_rows(&statement.run().await.map_err(worker_error)?)
+        // D1 meta.changes includes the counter triggers. SQLite changes()
+        // counts only the ledger rows; read it in the same atomic batch.
+        #[derive(Deserialize)]
+        struct Count { n: usize }
+        let results = self.db.batch(vec![statement, self.db.prepare("SELECT changes() AS n")])
+            .await.map_err(worker_error)?;
+        ensure_batch_success(&results)?;
+        results.get(1).ok_or_else(|| worker_error("missing cancellation count"))?
+            .results::<Count>().map_err(worker_error)?
+            .into_iter().next().map(|row| row.n)
+            .ok_or_else(|| worker_error("missing cancellation count"))
     }
 
     /// Tombstone one pending / retryable row; `false` when no such row

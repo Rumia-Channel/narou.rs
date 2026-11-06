@@ -71,6 +71,73 @@ class SqlAccessPathTests(unittest.TestCase):
         self.assertEqual(actual, {**{3000+i: '漫画' for i in range(20)},
             4000: '漫画', 4001: '小説', 4002: '漫画'})
 
+    def test_virtual_classification_ignores_unrelated_manga_and_reflects_member_changes(self):
+        self.novel(1, None)
+        self.novel(2, '小説')
+        self.novel(3, '漫画')
+        for i in range(10, 10010):
+            self.novel(i, '漫画')
+        groups = {'20001': [1, 2], '20002': [3], '20003': [1, 3],
+                  '20004': [99999], '20005': []}
+        for key in groups:
+            self.novel(int(key), '小説' if key in ('20002', '20003') else '漫画')
+        self.db.execute("INSERT INTO app_state(scope,key,value_json) VALUES ('inv','virtual_novel_members',?)",
+                        (json.dumps(groups),))
+        self.bounded(CLASSIFY_SQL, (), 10000)
+        self.assertEqual(dict(self.db.execute('SELECT id,attribute_tag FROM novels WHERE id>=20001')),
+                         {20001: '小説', 20002: '漫画', 20003: '小説', 20004: '漫画', 20005: '漫画'})
+        # No cached classification may hide changes made by another invocation.
+        self.db.execute("UPDATE novels SET attribute_tag='漫画' WHERE id=1")
+        self.novel(99999, '小説')
+        self.bounded(CLASSIFY_SQL, (), 10000)
+        self.assertEqual(dict(self.db.execute('SELECT id,attribute_tag FROM novels WHERE id BETWEEN 20001 AND 20005')),
+                         {20001: '小説', 20002: '漫画', 20003: '漫画', 20004: '小説', 20005: '漫画'})
+
+    def test_admission_aliases_follow_identity_changes_and_rollback(self):
+        self.novel(1, '小説')
+        self.novel(2, '漫画')
+        self.db.execute("UPDATE novels SET ncode_fold='shared',toc_url_fold='https://example.test/a/shared///' WHERE id=1")
+        self.db.execute("UPDATE novels SET ncode_fold='shared',toc_url_fold='https://example.test/b/shared/' WHERE id=2")
+        def lookup(target):
+            return self.db.execute("SELECT MIN(novel_id) FROM novel_target_aliases WHERE target=?", (target,)).fetchone()[0]
+        self.assertEqual(lookup('shared'), 1)
+        self.assertEqual(lookup('a/shared'), 1)
+        self.assertEqual(lookup('https://example.test/a/shared///'), 1)
+        self.assertIsNone(lookup('https://example.test/a/shared'))
+        self.db.execute("UPDATE novels SET ncode_fold='new',toc_url_fold='https://example.test/new/' WHERE id=1")
+        self.assertEqual(lookup('shared'), 2)
+        self.assertIsNone(lookup('a/shared'))
+        self.assertEqual(lookup('new'), 1)
+        self.db.execute("SAVEPOINT removed")
+        self.db.execute("DELETE FROM novels WHERE id=2")
+        self.assertIsNone(lookup('shared'))
+        self.db.execute("ROLLBACK TO removed")
+        self.db.execute("RELEASE removed")
+        self.assertEqual(lookup('shared'), 2)
+        self.db.execute("UPDATE novels SET id=4 WHERE id=1")
+        self.assertEqual(lookup('new'), 4)
+        changes = self.db.total_changes
+        self.db.execute("UPDATE novels SET title='renamed',toc_url_fold=toc_url_fold WHERE id=4")
+        self.assertEqual(self.db.total_changes - changes, 1)
+        self.db.execute("DELETE FROM novels WHERE id=4")
+        self.assertIsNone(lookup('new'))
+
+    def test_admission_alias_backfill_keeps_collisions_and_literal_url_suffixes(self):
+        self.novel(1, '小説')
+        self.novel(2, '小説')
+        self.db.execute("UPDATE novels SET ncode_fold='https://example.test/a/b/',toc_url_fold='plain' WHERE id=1")
+        self.db.execute("UPDATE novels SET ncode_fold='',toc_url_fold='https://example.test/a/b/' WHERE id=2")
+        self.db.executescript("""
+            DROP TRIGGER novel_target_aliases_insert;
+            DROP TRIGGER novel_target_aliases_update;
+            DROP TRIGGER novel_target_aliases_delete;
+            DROP TABLE novel_target_aliases;
+        """)
+        self.db.executescript((ROOT / 'worker_entry/migrations/0018_novel_target_aliases.sql').read_text(encoding='utf-8'))
+        self.assertEqual(self.db.execute("SELECT target,novel_id FROM novel_target_aliases ORDER BY target,novel_id").fetchall(),
+                         [('', 2), ('/example.test/a/b', 2), ('a/b', 2), ('b', 2), ('example.test/a/b', 2),
+                          ('https://example.test/a/b/', 1), ('https://example.test/a/b/', 2), ('plain', 1)])
+
 
 if __name__ == '__main__':
     unittest.main()

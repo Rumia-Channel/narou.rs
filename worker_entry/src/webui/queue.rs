@@ -86,13 +86,9 @@ GROUP BY attribute_tag COLLATE BINARY
 "#;
 
 const QUEUE_COUNTS_SQL: &str = r#"
-SELECT CASE WHEN status = 'permanent' AND last_error = ?1 THEN 'cancelled' ELSE status END AS status,
-       CASE WHEN kind IN ('convert', 'send', 'backup', 'mail') THEN 1 ELSE 0 END AS lane,
-       COUNT(*) AS n
-FROM worker_jobs
-WHERE status IN ('pending', 'retryable', 'running', 'succeeded', 'partial', 'blocked', 'permanent')
-  AND NOT (status = 'permanent' AND COALESCE(last_error, '') IN (?2, ?3))
-GROUP BY 1, 2
+SELECT CASE WHEN reason = 1 THEN 'cancelled' ELSE status END AS status, lane, n
+FROM worker_job_counts
+WHERE reason <> 2 AND n > 0
 "#;
 
 // The label needs a target only when exactly one job is running. Read at most
@@ -104,10 +100,9 @@ ORDER BY created_at ASC, job_id ASC LIMIT 1
 "#;
 
 const LANE_COUNTS_SQL: &str = r#"
-SELECT CASE WHEN kind IN ('convert', 'send', 'backup', 'mail') THEN 1 ELSE 0 END AS lane,
-       COUNT(*) AS n
-FROM worker_jobs
-WHERE status IN ('pending', 'retryable', 'running')
+SELECT lane, SUM(n) AS n
+FROM worker_job_counts
+WHERE status IN ('pending', 'retryable', 'running') AND n > 0
 GROUP BY lane
 "#;
 
@@ -332,11 +327,7 @@ async fn select_pending_page(
 /// cross the JS/Wasm boundary just to count them (at most 16 count rows + 1 job).
 async fn select_queue_status(db: &DbHandle) -> Result<(Vec<StatusCount>, Vec<ActiveJobRow>)> {
     let results = db.batch(vec![
-        db.prepare(QUEUE_COUNTS_SQL).bind(&[
-            JsValue::from_str(crate::consumer::USER_CANCEL_REASON),
-            JsValue::from_str(super::queue_actions::REASON_QUEUE_CLEARED),
-            JsValue::from_str(super::queue_actions::REASON_REMOVED),
-        ])?,
+        db.prepare(QUEUE_COUNTS_SQL),
         db.prepare(FIRST_RUNNING_SQL),
     ]).await?;
     crate::d1_repository::ensure_batch_success(&results)
