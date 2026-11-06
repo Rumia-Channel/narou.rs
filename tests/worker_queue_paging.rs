@@ -22,16 +22,18 @@ fn connection() -> rusqlite::Connection {
             target TEXT NOT NULL,
             options TEXT NOT NULL,
             status TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            last_error TEXT
         );",
     )
     .unwrap();
+    conn.execute_batch(include_str!("../worker_entry/migrations/0017_worker_job_counts.sql")).unwrap();
     conn
 }
 
 fn insert(conn: &rusqlite::Connection, job_id: &str, status: &str, created_at: &str) {
     conn.execute(
-        "INSERT INTO worker_jobs VALUES (?1, 'update', '1', '[]', ?2, ?3)",
+        "INSERT INTO worker_jobs VALUES (?1, 'update', '1', '[]', ?2, ?3, NULL)",
         rusqlite::params![job_id, status, created_at],
     )
     .unwrap();

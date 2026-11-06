@@ -211,15 +211,20 @@ async function waitForAcquisition(jobId, expectedFailure = false, timeoutMs = 12
   if (!expectedFailure) {
     // Acquisition success only promises that its follow-up Convert was enqueued.
     // Drain that lane before changing the source, injecting faults, or restarting.
+    // Do not open a second workerd against the live SQLite file while Convert
+    // is writing it. The HTTP snapshot observes the same runtime without a
+    // competing local D1 session; keep the terminal ledger assertion below.
     const conversionDeadline = Date.now() + timeoutMs;
-    let conversions;
+    let queue;
     do {
-      conversions = sql("SELECT job_id,status FROM worker_jobs WHERE kind='convert'")[0].results;
-      const failed = conversions.find((row) => ['permanent', 'blocked', 'partial'].includes(row.status));
-      assert(!failed, `follow-up conversion failed: ${JSON.stringify(failed)}`);
-      if (conversions.every((row) => row.status === 'succeeded')) break;
+      const response = await api('/api/queue/status');
+      assert.equal(response.status, 200, await response.clone().text());
+      queue = await response.json();
+      if (queue.lane_sizes[1] === 0) break;
       await new Promise((resolve) => setTimeout(resolve, 300));
     } while (Date.now() < conversionDeadline);
+    assert.equal(queue.lane_sizes[1], 0, JSON.stringify(queue));
+    const conversions = sql("SELECT job_id,status FROM worker_jobs WHERE kind='convert'")[0].results;
     assert(conversions.every((row) => row.status === 'succeeded'), JSON.stringify(conversions));
   }
   return job;

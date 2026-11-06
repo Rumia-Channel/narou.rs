@@ -395,14 +395,14 @@ pub mod worker_ledger {
 
     fn novel_id_expression(target: &str) -> String {
         format!("CASE WHEN {target} = CAST(CAST({target} AS INTEGER) AS TEXT) \
-            THEN CAST({target} AS INTEGER) ELSE (SELECT MIN(novel_id) FROM target_lookup \
+            THEN CAST({target} AS INTEGER) ELSE (SELECT MIN(novel_id) FROM novel_target_aliases \
             WHERE target = lower({target})) END")
     }
 
     /// Wake at most one acquisition per free site, plus independently eligible
     /// converts. The cron also uses this query after a lost completion/dispatch.
-    /// Materialize physical owners and URL/ncode aliases once: neither terminal
-    /// history nor the novel library may be scanned for every waiting candidate.
+    /// Physical owners are materialized once; URL/ncode/suffix identities use
+    /// the transactionally maintained alias index, not a per-wakeup library scan.
     pub fn select_waiting(now: &str, limit: usize) -> Statement {
         let candidate_target = "COALESCE(candidate.normalized_target, candidate.target)";
         let other_target = "COALESCE(other.normalized_target, other.target)";
@@ -410,17 +410,7 @@ pub mod worker_ledger {
         let other_id = novel_id_expression(other_target);
         Statement {
             sql: format!(
-                "WITH RECURSIVE url_suffixes(novel_id, target) AS ( \
-                   SELECT id, substr(rtrim(toc_url_fold, '/'), instr(rtrim(toc_url_fold, '/'), '/') + 1) \
-                   FROM novels WHERE instr(rtrim(toc_url_fold, '/'), '/') > 0 \
-                   UNION ALL \
-                   SELECT novel_id, substr(target, instr(target, '/') + 1) FROM url_suffixes \
-                   WHERE instr(target, '/') > 0 \
-                 ), target_lookup AS MATERIALIZED ( \
-                   SELECT toc_url_fold AS target, id AS novel_id FROM novels \
-                   UNION ALL SELECT ncode_fold, id FROM novels WHERE ncode_fold IS NOT NULL \
-                   UNION ALL SELECT target, novel_id FROM url_suffixes \
-                 ), owners AS MATERIALIZED ( \
+                "WITH owners AS MATERIALIZED ( \
                    SELECT other.job_id, other.kind, other.site_key, other.target, other.normalized_target \
                    FROM worker_jobs AS other WHERE {OWNER} \
                  ) SELECT job_id, kind FROM ( \
@@ -465,10 +455,8 @@ pub mod worker_ledger {
         let mut binds = vec![now.to_string(), target.to_string()];
         let candidate = if ids.is_empty() {
             let folded = crate::db::novel_codec::fold(target);
-            binds.extend([folded.clone(), folded.clone(), folded.clone(), folded]);
-            "n.id = (SELECT id FROM novels WHERE toc_url_fold = ? OR ncode_fold = ?
-                OR substr(rtrim(toc_url_fold, '/'), -(length(?) + 1)) = '/' || ?
-                ORDER BY id LIMIT 1)".to_string()
+            binds.push(folded);
+            "n.id = (SELECT MIN(novel_id) FROM novel_target_aliases WHERE target = ?)".to_string()
         } else {
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             binds.extend(ids.iter().map(i64::to_string));
@@ -483,10 +471,8 @@ pub mod worker_ledger {
              WHERE {OWNER} AND other.job_id != worker_jobs.job_id \
                AND (other.normalized_target IS NULL OR {other_target} = ? OR EXISTS (SELECT 1 FROM novels AS n \
                  WHERE {candidate} AND (CAST(n.id AS TEXT) = {other_target} \
-                   OR n.id = (SELECT id FROM novels \
-                     WHERE toc_url_fold = lower({other_target}) OR ncode_fold = lower({other_target}) \
-                       OR substr(rtrim(toc_url_fold, '/'), -(length({other_target}) + 1)) \
-                          = '/' || lower({other_target}) ORDER BY id LIMIT 1))) {site_clause}))"
+                   OR n.id = (SELECT MIN(novel_id) FROM novel_target_aliases \
+                     WHERE target = lower({other_target})))) {site_clause}))"
         );
         (clause, binds)
     }
@@ -2168,6 +2154,7 @@ mod tests {
                 INSERT INTO novels VALUES (42, 'n1234ab', 'https://example.com/n1234ab/');",
             )
             .unwrap();
+            conn.execute_batch(include_str!("../../worker_entry/migrations/0018_novel_target_aliases.sql")).unwrap();
             conn
         }
 
@@ -2556,6 +2543,32 @@ mod tests {
             assert_eq!(waiting(&conn), vec!["d-other-id","e-collision-id","f-trimmed","g-noncanonical-num","h-missing","i-exact-collision"]);
             conn.execute("UPDATE worker_jobs SET target=?1,normalized_target=?1 WHERE job_id='owner'", ["https://legacy.test/a/shared///"]).unwrap();
             assert_eq!(waiting(&conn), vec!["a-code","b-suffix","c-id","d-other-id","e-collision-id","f-trimmed","g-noncanonical-num","h-missing"]);
+        }
+
+        #[test]
+        fn admission_alias_probes_do_not_scan_unrelated_novels() {
+            let conn = db();
+            conn.execute_batch(
+                "WITH RECURSIVE ids(i) AS (VALUES(1000) UNION ALL SELECT i+1 FROM ids WHERE i<30999)
+                 INSERT INTO novels SELECT i,NULL,'https://fixture.test/novels/'||i||'/' FROM ids;"
+            ).unwrap();
+            insert(&conn, "owner", "https://example.com/n1234ab/", "running", Some(LEASE));
+            conn.execute("UPDATE worker_jobs SET kind='convert' WHERE job_id='owner'", []).unwrap();
+            insert(&conn, "next", "https://new.test/book/", "pending", None);
+            apply(&conn, worker_ledger::park_admission(NOW, "next", "https://new.test/book/", Some("new.test")));
+            let query = worker_ledger::select_waiting(NOW, 8);
+            let mut statement = conn.prepare(&query.sql).unwrap();
+            let jobs = statement.query_map(rusqlite::params_from_iter(query.binds.iter()),
+                |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(jobs, vec!["next"]);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 1000, "waiting alias probes used {steps} VM steps");
+
+            let claim = claim_fresh(NOW, LEASE, "next-token", "next", "https://new.test/book/", None);
+            let mut statement = conn.prepare(&claim.sql).unwrap();
+            assert_eq!(statement.execute(rusqlite::params_from_iter(claim.binds.iter())).unwrap(), 1);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 1000, "claim alias probes used {steps} VM steps");
         }
 
         #[test]

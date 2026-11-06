@@ -65,10 +65,10 @@ LIMIT ?
 /// queue just to show a count.
 pub const ACTIVE_TOTALS_SQL: &str = r#"
 SELECT CASE WHEN status IN ('pending', 'retryable') THEN 0 ELSE 1 END AS lane,
-       COUNT(*) AS n
-FROM worker_jobs
-WHERE status IN ('pending', 'retryable', 'running')
-GROUP BY lane
+       SUM(n) AS n
+FROM worker_job_counts
+WHERE status IN ('pending', 'retryable', 'running') AND n > 0
+GROUP BY 1
 "#;
 
 #[cfg(test)]

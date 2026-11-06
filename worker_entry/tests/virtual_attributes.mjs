@@ -50,6 +50,15 @@ try {
   await api(`/api/virtual_novels/${mixedId}/attribute`,{attribute_tag:'漫画'});
   await api('/api/list?all=true');
   assert.equal((await api('/api/virtual_novels')).data.novels.find(n=>n.id===mixedId).attribute_tag,'漫画');
+  // A member update from another invocation is visible immediately, without
+  // an isolate cache expiry; returning to mixed keeps the last chosen value.
+  await api(`/api/virtual_novels/${mixedId}/attribute`,{attribute_tag:'小説'});
+  sql(`UPDATE novels SET attribute_tag='漫画' WHERE id=${ids[0]}`);
+  await api('/api/list?all=true');
+  assert.equal((await api('/api/virtual_novels')).data.novels.find(n=>n.id===mixedId).attribute_tag,'漫画');
+  sql(`UPDATE novels SET attribute_tag='小説' WHERE id=${ids[0]}`);
+  await api('/api/list?all=true');
+  assert.equal((await api('/api/virtual_novels')).data.novels.find(n=>n.id===mixedId).attribute_tag,'漫画');
   await fetch(base + `/api/virtual_novels/${r.data.id}`,{method:'DELETE',headers:{Authorization:`Bearer ${process.env.NAROU_ADMIN_TOKEN || 'local-contract-token'}`}});
   assert.equal((await api(`/api/virtual_novels/${mixedId}/members`,{members:[ids[2]]})).status,200);
   const appended = (await api('/api/virtual_novels')).data.novels.find(n=>n.id===mixedId);

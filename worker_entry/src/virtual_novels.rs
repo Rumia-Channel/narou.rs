@@ -146,7 +146,8 @@ async fn composition(db: &DbHandle, members: &[i64]) -> Result<AttributeComposit
 }
 
 /// Reconcile only virtual rows, keeping a mixed work's stored selection.
-/// Correlated member lookups use the primary-key index; no full library scan.
+/// CROSS JOIN keeps members on the outside of the primary-key probes; otherwise
+/// the attribute index can make SQLite scan every manga for each group.
 pub(crate) async fn reconcile_attributes(db: &DbHandle) -> Result<()> {
     db.prepare(r#"
 WITH groups AS (
@@ -155,8 +156,8 @@ WITH groups AS (
   WHERE a.scope='inv' AND a.key='virtual_novel_members'
 ), classified AS MATERIALIZED (
   SELECT g.id, CASE
-    WHEN NOT EXISTS(SELECT 1 FROM json_each(g.members) m JOIN novels n ON n.id=m.value WHERE COALESCE(n.attribute_tag,'小説')<>'漫画') THEN '漫画'
-    WHEN NOT EXISTS(SELECT 1 FROM json_each(g.members) m JOIN novels n ON n.id=m.value WHERE n.attribute_tag='漫画') THEN '小説'
+    WHEN NOT EXISTS(SELECT 1 FROM json_each(g.members) m CROSS JOIN novels n ON n.id=m.value WHERE COALESCE(n.attribute_tag,'小説')<>'漫画') THEN '漫画'
+    WHEN NOT EXISTS(SELECT 1 FROM json_each(g.members) m CROSS JOIN novels n ON n.id=m.value WHERE n.attribute_tag='漫画') THEN '小説'
     ELSE COALESCE(v.attribute_tag,'小説') END AS attribute
   FROM groups g JOIN novels v ON v.id=g.id
   WHERE json_array_length(g.members)>0
