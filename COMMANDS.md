@@ -1024,6 +1024,7 @@ SQLite のミラー無効時も本文・設定・挿絵・raw・履歴・生成�
 - S3 LIST の署名エラー診断は、改行表現を正規化して canonical digest と StringToSign 全体を別々に比較する。digest 一致だけで secret の誤りと断定せず、診断改善を 403 の解消とは扱わない。 生の XML 本文は表示せず、許可したエラーコードと任意のサーバー echo の比較結果（一致・不一致・欠落・不正）、公開 AWS サンプルの実行時自己テスト、実効接続先 host/port・標準的な region・native 設定元ラベルを表示する。鍵 ID・署名・資格情報の値やハッシュは表示しない。環境変数ラベルは `.env` と起動時の既存環境を区別しない。 `StringToSignBytes` は各バイト 1〜2 桁の16進数として厳密比較し、LF / CRLF 等を正規化しない。
 - `s3-verify` — ローカルの挿絵と S3 の内容をバイト単位で突き合わせる (書き込みなし)。同じくライブラリ全体が対象。
 - `s3-dedup` — 旧 `挿絵/` 配置の S3 オブジェクトを dedup プール (`illustrations/<base64url(sha256)>.<ext>`) へ移し、残ったものを消す。**S3 保存なら storage-backend (YAML / SQLite) を問わず有効**。既定は件数だけ数える dry-run、`-f` で実行。hex 名でない挿絵は小説ごとの配置を保つ。Worker は同じ処理を `POST /api/admin/illustration-dedup` で実行する。
+- S3 の各処理は CLI の非同期ディスパッチから直接実行する。既存ランタイム内で別の Tokio ランタイムを起動して panic する経路は使用しない。dry-run の非書き込みと、移行後のバイト照合を実バイナリで検証する。
 
 **Rust 実装**: メンテナンスヘルパー (`find_orphan_illustrations`, `plan_legacy_illustration_migrations` / `apply_legacy_illustration_migrations`, `plan_extension_fixes` / `apply_extension_fixes`, `rebuild_illustration_cache`, `detect_image_extension`) を `src/illustration_store.rs` (crate 側) に集約。`src/commands/illust.rs` は CLI オプション解決と dry-run / `-f` の振り分けに専念し、将来 Web UI から同じ crate 関数を直接呼べる形を維持する。削除系・改名系・移行系はすべて既定 dry-run。`-f` 指定時も本文参照・cache 参照の双方から到達不能 / 移行計画を厳密判定してから実際に変更する (BUG-7/15 と整合)。対象小説の解決は clean と同じく ID / URL / Nコード / タイトル / alias / tag 展開の共通パイプラインを使い、`--all` は凍結済み小説をスキップする。
 

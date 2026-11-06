@@ -413,6 +413,29 @@ async fn run_command(
             // CSV 取り込みは download コマンド経由で取得するため非同期側で処理する。
             commands::csv::cmd_csv(output.as_deref(), import.as_deref()).await
         }
+        Commands::Illust {
+            force,
+            all,
+            sub,
+            targets,
+        } => match sub {
+            Some(resolved) => {
+                let sub = match resolved {
+                    cli::IllustSubcommand::Orphan => IllustSubcommand::Orphan,
+                    cli::IllustSubcommand::Migrate => IllustSubcommand::Migrate,
+                    cli::IllustSubcommand::FixExt => IllustSubcommand::FixExt,
+                    cli::IllustSubcommand::Rebuild => IllustSubcommand::Rebuild,
+                    cli::IllustSubcommand::S3Push => IllustSubcommand::S3Push,
+                    cli::IllustSubcommand::S3Verify => IllustSubcommand::S3Verify,
+                    cli::IllustSubcommand::S3Dedup => IllustSubcommand::S3Dedup,
+                };
+                commands::illust::cmd_illust(sub, &targets, force, all).await
+            }
+            None => {
+                commands::help::display_command_help("illust");
+                0
+            }
+        },
         other => run_sync_command(other, trace_args, backtrace),
     }
 }
@@ -430,7 +453,7 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                 0
             }
         }
-        Commands::Download { .. } | Commands::Update { .. } | Commands::Csv { .. } | Commands::Author { .. } | Commands::Hidden { .. } | Commands::Virtual { .. } => {
+        Commands::Download { .. } | Commands::Update { .. } | Commands::Csv { .. } | Commands::Author { .. } | Commands::Hidden { .. } | Commands::Virtual { .. } | Commands::Illust { .. } => {
             unreachable!()
         }
         Commands::Mail { targets, force } => {
@@ -672,29 +695,6 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             Err(e) => {
                 eprintln!("{}", e);
                 1
-            }
-        },
-        Commands::Illust {
-            force,
-            all,
-            sub,
-            targets,
-        } => match sub {
-            Some(resolved) => {
-                let sub = match resolved {
-                    cli::IllustSubcommand::Orphan => IllustSubcommand::Orphan,
-                    cli::IllustSubcommand::Migrate => IllustSubcommand::Migrate,
-                    cli::IllustSubcommand::FixExt => IllustSubcommand::FixExt,
-                    cli::IllustSubcommand::Rebuild => IllustSubcommand::Rebuild,
-                    cli::IllustSubcommand::S3Push => IllustSubcommand::S3Push,
-                    cli::IllustSubcommand::S3Verify => IllustSubcommand::S3Verify,
-                    cli::IllustSubcommand::S3Dedup => IllustSubcommand::S3Dedup,
-                };
-                commands::illust::cmd_illust(sub, &targets, force, all)
-            }
-            None => {
-                commands::help::display_command_help("illust");
-                0
             }
         },
         Commands::Web { .. } => unreachable!(),

@@ -135,3 +135,111 @@ fn stat_and_read_survive_range_header_changes_in_transit() {
         }
     });
 }
+
+#[cfg(feature = "native-runtime")]
+#[test]
+fn illustration_migration_cli_preserves_bytes_and_dry_run_boundaries() {
+    use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
+    use axum::response::IntoResponse;
+    use std::process::Command;
+    use std::sync::Mutex;
+
+    struct Server {
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() { let _ = stop.send(()); }
+            if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        }
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let stored = Arc::new(Mutex::new(None::<Vec<u8>>));
+    let server_stored = stored.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let _server = Server {
+        stop: Some(stop),
+        thread: Some(std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let app = axum::Router::new().fallback(axum::routing::any(
+                    move |method: Method, uri: Uri, headers: HeaderMap, body: axum::body::Bytes| {
+                        let stored = server_stored.clone();
+                        async move {
+                            if method == Method::GET && uri.path() == "/bucket" {
+                                let contents = stored.lock().unwrap().as_ref().map(|bytes| format!(
+                                    "<Contents><Key>fixture/novels/site/title/挿絵/001.png</Key><Size>{}</Size></Contents>",
+                                    bytes.len(),
+                                )).unwrap_or_default();
+                                return ([(header::CONTENT_TYPE, "application/xml")], format!(
+                                    "<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>",
+                                )).into_response();
+                            }
+                            let mut expected = url::Url::parse("http://localhost").unwrap();
+                            expected.set_path("/bucket/fixture/novels/site/title/挿絵/001.png");
+                            if uri.path() != expected.path() {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                            if method == Method::PUT {
+                                *stored.lock().unwrap() = Some(body.to_vec());
+                                return StatusCode::OK.into_response();
+                            }
+                            if method == Method::GET {
+                                let Some(bytes) = stored.lock().unwrap().clone() else {
+                                    return StatusCode::NOT_FOUND.into_response();
+                                };
+                                if headers.contains_key(header::RANGE) {
+                                    return (
+                                        StatusCode::PARTIAL_CONTENT,
+                                        [(header::CONTENT_RANGE, format!("bytes 0-0/{}", bytes.len()))],
+                                        bytes[..1].to_vec(),
+                                    ).into_response();
+                                }
+                                return bytes.into_response();
+                            }
+                            StatusCode::METHOD_NOT_ALLOWED.into_response()
+                        }
+                    },
+                ));
+                axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                    .with_graceful_shutdown(async { let _ = stopped.await; })
+                    .await.unwrap();
+            });
+        })),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir(root.join(".narou")).unwrap();
+    std::fs::write(root.join(".narou/database.yaml"), "{}\n").unwrap();
+    std::fs::write(root.join(".narou/local_setting.yaml"), format!(
+        "s3.asset-backend: s3\ns3.endpoint: http://{address}\ns3.bucket: bucket\ns3.prefix: fixture\ns3.region: us-east-1\ns3.access-key-id: fixture\ns3.secret-access-key: fixture-secret\n",
+    )).unwrap();
+    let image = root.join("小説データ/site/title/挿絵/001.png");
+    std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+    let expected = b"stored illustration bytes";
+    std::fs::write(&image, expected).unwrap();
+    let run = |arguments: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_narou_rs"))
+            .current_dir(root)
+            .env_clear()
+            .envs(std::env::vars().filter(|(name, _)| [
+                "PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "COMSPEC", "PATHEXT", "SYSTEMDRIVE",
+            ].iter().any(|allowed| name.eq_ignore_ascii_case(allowed))))
+            .env("HOME", root)
+            .env("USERPROFILE", root)
+            .env("NAROU_RS_LEGACY_YAML", "1")
+            .arg("illust").args(arguments).output().unwrap();
+        assert!(output.status.success(), "{arguments:?}: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    };
+    run(&["s3-push"]);
+    assert!(stored.lock().unwrap().is_none(), "dry run must not publish an object");
+    run(&["s3-push", "-f"]);
+    assert_eq!(stored.lock().unwrap().as_deref(), Some(expected.as_slice()));
+    run(&["s3-verify"]);
+    run(&["s3-dedup"]);
+    run(&["s3-dedup", "-f"]);
+    assert_eq!(stored.lock().unwrap().as_deref(), Some(expected.as_slice()), "non-hash image names must not be deleted by dedup");
+    assert_eq!(std::fs::read(image).unwrap(), expected);
+}
