@@ -461,7 +461,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 |---|---|
 | `create [名前]` | 新しいトークンを作る。作成したトークンを表示する (値はこの時だけ平文で出る) |
 | `list` | 保存済みトークンを名前・ID・指紋・作成日時つきで表示する |
-| `delete <ID>` | トークンを削除する |
+| `delete <ID>` | トークンを削除する。`-` や `--` から始まる ID も、そのまま指定できる |
 | `info` | 外部 API の URL・認証モード・エンドポイント一覧を表示する |
 
 保存先は在庫 `api_tokens` (Native は `.narou/api_tokens.yaml` / SQLite `app_state`、Worker は D1 `app_state`)。値は平文 (設定の `server-basic-auth.password` と同じ扱い) で、`external-api.require-token` (既定 true) が有効なあいだ Bearer トークンとして照合される。

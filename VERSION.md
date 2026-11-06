@@ -3,17 +3,20 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
-## v0.6.1 — 本番 D1 の SQL 最適化
+## v0.6.2 — 本番 D1 の SQL 最適化
+
+v0.6.1 は公開前の検証で中止したため、SQL 最適化と下記の CLI 修正を本版にまとめています。
 
 - **Worker のキュー件数表示で、終了済みジョブの全履歴を読み直さなくなりました**。D1 の集計表をジョブの追加・状態遷移・削除と同じトランザクションで更新します。中断・待機消去・失敗・レーン別の件数は従来どおりで、履歴は削除しません。新しい Worker の配備前に migration `0017_worker_job_counts.sql` が必要です。
 - **仮想小説の属性再計算をメンバー ID 起点の検索に修正しました**。属性索引から無関係な漫画作品まで走査する実行計画を防ぎます。混在時の選択・欠けたメンバーの扱い・変更の即時反映は維持します。
 - **待機再開・実行開始の作品照合は永続索引を使います**。URL・N コード・URL suffix の対応表を毎回全作品から組み立てず、作品の追加・識別子変更・削除と同時に更新します。複数一致時の最小 ID と、サイト・作品・中断後の実行の排他は維持します。migration `0018_novel_target_aliases.sql` が必要です。
 - **Cloudflare Access の Service Token を `Authorization` ヘッダ 1 つでも渡せるようにしました**。従来のヘッダ対も引き続き使えます。配備時には、設定済みの Service Token に対応する Access アプリケーションの単一ヘッダー設定を smoke 検証より先に適用します。
 - **Worker の MCP エンドポイントへ POST 以外でアクセスした場合、405 の JSON エラーを返すよう修正しました**。
+- **CLI のトークン削除で、`-` や `--` から始まる ID をオプションとして誤認する不具合を修正しました**。生成される Base64URL の ID をそのまま `narou api delete <ID>` へ渡せます。保存形式や既存の ID は変更しません。
 
 Cloudflare Workers のリリース配備では、検証成功後に migration `0017_worker_job_counts.sql`・`0018_novel_target_aliases.sql` を本番 D1 へ自動適用し、その成功後に新しい Worker を配備します。migration が失敗した場合は配備を中止します。既存の作品・本文・ジョブ履歴を削除する処理はありません。手動配備でも同じ順序で適用してください。
 
-変更一覧は [v0.6.0...v0.6.1](https://github.com/Rumia-Channel/narou.rs/compare/v0.6.0...v0.6.1) を参照してください。
+変更一覧は [v0.6.0...v0.6.2](https://github.com/Rumia-Channel/narou.rs/compare/v0.6.0...v0.6.2) を参照してください。
 
 ## v0.6.0 — 外部公開 API と MCP
 

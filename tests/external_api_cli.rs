@@ -84,7 +84,8 @@ fn library(sqlite: bool) {
     let deleted = run(root, &["api", "delete", &id]);
     assert!(
         deleted.status.success(),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        stdout(&deleted),
         String::from_utf8_lossy(&deleted.stderr)
     );
     assert!(stdout(&deleted).contains("削除しました"), "{}", stdout(&deleted));
@@ -100,6 +101,57 @@ fn api_tokens_are_managed_in_yaml_mode() {
 #[test]
 fn api_tokens_are_managed_in_sqlite_mode() {
     library(true);
+}
+
+#[test]
+fn deleting_hyphen_prefixed_token_ids_keeps_other_tokens() {
+    use narou_rs::application::api_tokens::ApiToken;
+
+    let ids = ["-AAAAAAAAAAAAAAAAAAAAA", "--AAAAAAAAAAAAAAAAAAAA", "kept"];
+    for sqlite in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        if sqlite {
+            std::fs::write(root.join(".narou/storage-backend"), "sqlite").unwrap();
+        }
+        let tokens: Vec<_> = ids.iter().map(|id| ApiToken {
+            id: (*id).to_string(),
+            name: "fixture".to_string(),
+            token: format!("nrt_fixture_{id}"),
+            created_at: "2026-11-06 00:00:00 +0000".to_string(),
+        }).collect();
+        std::fs::write(
+            root.join(".narou/api_tokens.yaml"),
+            serde_yaml::to_string(&tokens).unwrap(),
+        ).unwrap();
+
+        for (index, id) in ids[..2].iter().enumerate() {
+            let deleted = run(root, &["api", "delete", id]);
+            assert!(
+                deleted.status.success(),
+                "sqlite={sqlite}, id={id}, stdout: {}\nstderr: {}",
+                stdout(&deleted),
+                String::from_utf8_lossy(&deleted.stderr),
+            );
+            let stored: String = if sqlite {
+                let connection = rusqlite::Connection::open(root.join(".narou/db.sqlite")).unwrap();
+                connection.query_row(
+                    "SELECT value_yaml FROM app_state WHERE scope='inv' AND key='api_tokens'",
+                    [],
+                    |row| row.get(0),
+                ).unwrap()
+            } else {
+                std::fs::read_to_string(root.join(".narou/api_tokens.yaml")).unwrap()
+            };
+            let remaining: Vec<ApiToken> = serde_yaml::from_str(&stored).unwrap();
+            assert_eq!(
+                remaining.iter().map(|token| token.id.as_str()).collect::<Vec<_>>(),
+                ids[index + 1..],
+                "sqlite={sqlite}, deleted={id}",
+            );
+        }
+    }
 }
 
 /// The stdIO MCP server answers the same JSON-RPC requests as the HTTP

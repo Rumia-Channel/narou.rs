@@ -21,6 +21,7 @@ pub enum ApiAction {
     /// トークンを削除する。
     Delete {
         /// 削除するトークンの ID (`narou api list` で確認できる)。
+        #[arg(allow_hyphen_values = true)]
         id: String,
     },
     /// 外部 API の情報 (認証の有効・無効とエンドポイント) を表示する。
