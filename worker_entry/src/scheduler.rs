@@ -115,7 +115,7 @@ async fn reap_one(
     max_retries: u32,
 ) -> Result<bool> {
     let attempts = u32::try_from(job.attempts).unwrap_or(u32::MAX);
-    if job.status == "retryable" && attempts >= max_retries {
+    if job.status == "retryable" && attempts > max_retries {
         let reason = format!(
             "retries exhausted after {attempts} attempts and the scheduled \
              redelivery was lost (dead-lettered): {}",

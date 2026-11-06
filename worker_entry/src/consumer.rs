@@ -377,8 +377,9 @@ async fn process_discrete(
                 table_reload_after_job(runtime).await,
             )
             .await;
-            // Retire the old attempt before dispatch can start its continuation.
-            runtime.enqueue_plan(job.clone()).await?;
+            // Preserve the yielded row's checkpoint, attempts, and cancellation
+            // tombstone even if the queue was cleared during notification.
+            runtime.send_existing_job(&job_id, job.kind.as_str()).await?;
             message.ack();
         }
         JobOutcome::Blocked { reason } => {

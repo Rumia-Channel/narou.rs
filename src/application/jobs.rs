@@ -329,10 +329,10 @@ pub mod worker_ledger {
     }
 
     /// CAS used by the reaper to close a `retryable` row that has already
-    /// spent its retry budget (`attempts >= min_attempts`) but whose
-    /// scheduled redelivery never arrived. Re-enqueueing such a row would
-    /// only produce an execution that immediately exhausts retries, so the
-    /// honest terminal state is `permanent` with the delivery-loss reason
+    /// spent its retry budget (`attempts > max_retries`) but whose scheduled
+    /// redelivery never arrived. `attempts` counts failures, including the
+    /// initial execution; equality still leaves the final retry eligible.
+    /// The terminal state is `permanent` with the delivery-loss reason
     /// recorded in `last_error`.
     ///
     /// Bind order: `reason`, `now`, `job_id`, `stuck_before`.
@@ -341,14 +341,14 @@ pub mod worker_ledger {
         now: &str,
         job_id: &str,
         stuck_before: &str,
-        min_attempts: u32,
+        max_retries: u32,
     ) -> Statement {
         Statement {
             sql: format!(
                 "UPDATE worker_jobs \
                  SET status = 'permanent', last_error = ?, updated_at = ?, \
                      lease_until = NULL, execution_token = NULL, checkpoint_json = NULL \
-                 WHERE job_id = ? AND status = 'retryable' AND attempts >= {min_attempts} \
+                 WHERE job_id = ? AND status = 'retryable' AND attempts > {max_retries} \
                    AND COALESCE(lease_until, updated_at) <= ?"
             ),
             binds: vec![
@@ -2715,6 +2715,27 @@ mod tests {
         const NOW: &str = "2026-01-01T00:10:00Z";
 
         #[test]
+        fn the_last_allowed_retry_remains_eligible_for_redelivery() {
+            for max_retries in [0, 3] {
+                for failures in 0..=max_retries + 1 {
+                    let conn = db();
+                    insert(&conn, "boundary", "retryable", i64::from(failures),
+                        "2026-01-01T00:00:00Z", Some("2026-01-01T00:01:00Z"));
+                    let stmt = finalize_stuck("exhausted", NOW, "boundary", STUCK_BEFORE, max_retries);
+                    let changed = conn.execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter())).unwrap();
+                    let exhausted = failures > max_retries;
+                    assert_eq!(changed, usize::from(exhausted),
+                        "failures={failures}, allowed retries={max_retries}");
+                    if !exhausted {
+                        let stmt = mark_reenqueue(NOW, "boundary", STUCK_BEFORE);
+                        assert_eq!(conn.execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter())).unwrap(), 1);
+                        assert_eq!(row_of(&conn, "boundary").0, "retryable");
+                    }
+                }
+            }
+        }
+
+        #[test]
         fn lost_retryable_redelivery_is_requeued_then_finalized() {
             let conn = db();
             // 403 失敗 → record_attempt が attempts=1, lease=backoff 終了済み。
@@ -2748,13 +2769,13 @@ mod tests {
             // 検出対象からも外れる (次の猶予までは再送しない)。
             assert!(stuck_ids(&conn, STUCK_BEFORE).is_empty());
 
-            // リトライ枠を使い切った行 (attempts >= max_retries=3) は
+            // 初回 + 3 回のリトライがすべて失敗した行 (attempts=4) は
             // permanent に確定する。
             insert(
                 &conn,
                 "j-spent",
                 "retryable",
-                3,
+                4,
                 "2026-01-01T00:00:00Z",
                 Some("2026-01-01T00:01:00Z"),
             );
@@ -2850,7 +2871,7 @@ mod tests {
                 &conn,
                 "j-claimed",
                 "running",
-                3,
+                4,
                 "2026-01-01T00:09:00Z",
                 Some("2026-01-01T00:25:00Z"),
             );
