@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -58,12 +57,10 @@ pub async fn materialize(novel_dir: &Path) -> Result<Materialized> {
 ///
 /// - ウィンドウ: 一覧メタデータのサイズから `io_windows` が決める。大きい
 ///   オブジェクトは幅 1 になり、前後と重ならない。
-/// - 公開: 書き込みは一意な一時名で行い、rename で final 名へ移す。生成途中の
-///   ファイルが final 名で見えないので、競合する読み手や別プロセスが部分
-///   ファイルを完成品と誤認しない。rename が既存ファイルと衝突したら相手の
-///   完成品を優先し、自分の一時ファイルだけを捨てる。
+/// - 公開: 一意な一時名へ書き、既存ファイルを上書きせずに final 名へ移す。
+///   生成途中のファイルを完成品として見せず、競合した書き手の完成品を優先する。
 /// - 片付け: この関数が公開したファイルだけが `Materialized` に入る。途中の
-///   エラーやキャンセルでは、公開済みはガードが、書き込み中は `StagedFile` が
+///   エラーやキャンセルでは、公開済みはガードが、書き込み中は `NamedTempFile` が
 ///   それぞれ自分が作ったものだけを消す。
 async fn materialize_from_stores(
     objects: &dyn ObjectStore,
@@ -94,26 +91,26 @@ async fn materialize_from_stores(
             for (key, _) in slice {
                 pending.push(stage_one(assets, key, local_dir));
             }
-            let results: Vec<Result<Option<(PathBuf, StagedFile)>>> = futures::stream::iter(pending)
+            let results: Vec<Result<Option<(PathBuf, tempfile::NamedTempFile)>>> = futures::stream::iter(pending)
                 .buffered(window.width())
                 .collect()
                 .await;
             // ここから先は await を挟まずに公開する (キャンセルが公開と登録を
             // 分断しない)。公開したパスはすぐガードへ登録し、公開できなかった
-            // 一時ファイルは StagedFile の Drop が片付ける。
+            // 一時ファイルは NamedTempFile の Drop が片付ける。
             let mut failure: Option<NarouError> = None;
             for result in results {
                 match result {
-                    Ok(Some((path, mut staged))) => match staged.publish(&path) {
-                        Ok(true) => {
+                    Ok(Some((path, staged))) => match staged.persist_noclobber(&path) {
+                        Ok(_) => {
                             materialized._scope.as_ref().unwrap().register(&path);
                             materialized.paths.push(path);
                         }
                         // 競合した書き手の完成品をそのまま使う。
-                        Ok(false) => {}
+                        Err(error) if path.is_file() => drop(error),
                         Err(error) => {
                             if failure.is_none() {
-                                failure = Some(error);
+                                failure = Some(error.error.into());
                             }
                         }
                     },
@@ -137,14 +134,14 @@ async fn materialize_from_stores(
     Ok(materialized)
 }
 
-/// 1 つの挿絵を一時名で書き終える。公開 (rename) は収集側が行う。
+/// 1 つの挿絵を一時名で書き終える。上書きしない公開は収集側が行う。
 ///
 /// `Ok(None)` は既にローカルにあるか、ストアに無い場合 (何も作っていない)。
 async fn stage_one(
     assets: &dyn AssetStore,
     key: &ObjectKey,
     local_dir: &Path,
-) -> Result<Option<(PathBuf, StagedFile)>> {
+) -> Result<Option<(PathBuf, tempfile::NamedTempFile)>> {
     let Some(filename) = key.as_ref().rsplit('/').next() else {
         return Ok(None);
     };
@@ -159,106 +156,18 @@ async fn stage_one(
         return Ok(None);
     };
     std::fs::create_dir_all(local_dir)?;
-    let staged = StagedFile::new(temp_path_for(&path));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(staged.path())?;
+    let mut staged = tempfile::Builder::new().suffix(".tmp").tempfile_in(local_dir)?;
     while let Some(chunk) = stream.next().await {
-        file.write_all(&chunk?)?;
+        staged.write_all(&chunk?)?;
     }
-    file.flush()?;
-    drop(file);
+    staged.flush()?;
     Ok(Some((path, staged)))
 }
 
-/// プロセスごとに一度だけ決まる一時名のサフィックス。
-///
-/// プロセス間の衝突と、pid 再利用で古い一時ファイルとぶつかる事故を避ける。
-static TEMP_SEED: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-    use std::hash::{BuildHasher, Hasher};
-    std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish()
-});
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// `挿絵/` に置く一時ファイル名。
-///
-/// 拡張子を `.tmp` にするので、拡張子で挿絵を判定するスキャンには載らない。
-fn temp_path_for(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("illustration");
-    let seed = *TEMP_SEED;
-    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    path.with_file_name(format!("{name}.{seed:016x}{seq:016x}.tmp"))
-}
-
-/// まだ公開していない一時ファイル。Drop は自分が作ったこのパスだけを消す。
-struct StagedFile {
-    path: PathBuf,
-    published: bool,
-}
-
-impl StagedFile {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            published: false,
-        }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// rename で `destination` へ公開する。
-    ///
-    /// 既に競合した書き手の完成品があれば `Ok(false)` を返し、自分の一時
-    /// ファイルは Drop が片付ける (相手の完成品は一切触らない)。公開した
-    /// 場合は `Ok(true)` で、以後 Drop は何もしない。
-    fn publish(&mut self, destination: &Path) -> Result<bool> {
-        match std::fs::rename(&self.path, destination) {
-            Ok(()) => {
-                self.published = true;
-                Ok(true)
-            }
-            Err(error) => {
-                if destination.is_file() {
-                    Ok(false)
-                } else {
-                    Err(error.into())
-                }
-            }
-        }
-    }
-}
-
-impl Drop for StagedFile {
-    fn drop(&mut self) {
-        if !self.published {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
 
 /// 同期文脈 (converter) から [`materialize`] を呼ぶ。
 pub fn materialize_blocking(novel_dir: &Path) -> Result<Materialized> {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return std::thread::scope(|scope| {
-            let worker = std::thread::Builder::new()
-                .spawn_scoped(scope, || materialize_blocking(novel_dir))
-                .map_err(|error| crate::error::NarouError::Platform(error.to_string()))?;
-            worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-        });
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| crate::error::NarouError::Platform(error.to_string()))?;
-    runtime.block_on(materialize(novel_dir))
+    crate::native::materialization::block_on(materialize(novel_dir))
 }
 
 /// ストア上だけにある挿絵の一覧 (孤児判定つき)。
@@ -498,7 +407,8 @@ mod tests {
 
     struct FailingAssets<'a> {
         store: &'a MemoryObjectStore,
-        fail_key: ObjectKey,
+        fail_key: Option<ObjectKey>,
+        arriving_file: Option<PathBuf>,
     }
 
     impl AssetStore for FailingAssets<'_> {
@@ -513,7 +423,7 @@ mod tests {
             &'a self,
             key: &'a ObjectKey,
         ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
-            if key == &self.fail_key {
+            if self.fail_key.as_ref() == Some(key) {
                 Box::pin(async {
                     let stream: AssetStream = Box::pin(futures::stream::iter(vec![
                         Ok(b"partial".to_vec()),
@@ -522,7 +432,14 @@ mod tests {
                     Ok(Some(stream))
                 })
             } else {
-                self.store.read_stream(key)
+                Box::pin(async move {
+                    let stream = self.store.read_stream(key).await?;
+                    if let Some(path) = &self.arriving_file {
+                        std::fs::create_dir_all(path.parent().unwrap())?;
+                        std::fs::write(path, b"another writer's image")?;
+                    }
+                    Ok(stream)
+                })
             }
         }
 
@@ -574,8 +491,9 @@ mod tests {
                 }
                 let assets = FailingAssets {
                     store: &store,
-                    fail_key: ObjectKey::try_new(format!("novels/site/title/挿絵/{fail_name}"))
-                        .unwrap(),
+                    fail_key: Some(ObjectKey::try_new(format!("novels/site/title/挿絵/{fail_name}"))
+                        .unwrap()),
+                    arriving_file: None,
                 };
                 let result =
                     materialize_from_stores(&store, &assets, prefix.clone(), &local_dir,
@@ -610,30 +528,27 @@ mod tests {
         });
     }
 
-    /// 公開 (rename) したファイルは Drop が消さず、一時ファイルも残らないこと。
     #[test]
-    fn staged_publish_disarms_cleanup_and_removes_the_temp() {
-        let dir = tempfile::tempdir().unwrap();
-        let destination = dir.path().join("0001.jpg");
-        let temp = dir.path().join("0001.jpg.0123456789abcdef.tmp");
-        std::fs::write(&temp, b"complete image").unwrap();
-        let mut staged = StagedFile::new(temp.clone());
-        assert!(staged.publish(&destination).unwrap(), "rename must publish");
-        drop(staged);
-        assert_eq!(std::fs::read(&destination).unwrap(), b"complete image");
-        assert!(!temp.exists(), "the temp name must not survive publish");
+    fn materialization_preserves_an_image_created_during_its_read() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let local_dir = dir.path().join("挿絵");
+            let destination = local_dir.join("1.png");
+            let store = MemoryObjectStore::new();
+            let key = ObjectKey::try_new("novels/site/title/挿絵/1.png").unwrap();
+            store.write_small(&key, b"downloaded image".to_vec()).await.unwrap();
+            let assets = FailingAssets {
+                store: &store, fail_key: None, arriving_file: Some(destination.clone()),
+            };
+            let guard = materialize_from_stores(
+                &store, &assets, ObjectPrefix::new("novels/site/title/挿絵").unwrap(), &local_dir,
+                crate::native::materialization::MaterializationScope::acquire(dir.path(), dir.path()).unwrap(),
+            ).await.unwrap();
+            let published = std::fs::read(&destination).unwrap();
+            drop(guard);
+            assert_eq!(published, b"another writer's image");
+            assert_eq!(std::fs::read(&destination).unwrap(), b"another writer's image");
+        });
     }
 
-    /// 未公開の一時ファイルだけを Drop が消し、他のファイルに触らないこと。
-    #[test]
-    fn staged_drop_removes_only_its_own_temp() {
-        let dir = tempfile::tempdir().unwrap();
-        let sibling = dir.path().join("0002.png");
-        std::fs::write(&sibling, b"other image").unwrap();
-        let temp = dir.path().join("0001.jpg.fedcba9876543210.tmp");
-        std::fs::write(&temp, b"partial image").unwrap();
-        drop(StagedFile::new(temp.clone()));
-        assert!(!temp.exists(), "the unpublished temp must be removed");
-        assert_eq!(std::fs::read(&sibling).unwrap(), b"other image");
-    }
 }

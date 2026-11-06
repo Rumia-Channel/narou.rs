@@ -285,7 +285,7 @@ impl ConvertService {
             subtitles: toc.subtitles.clone(),
             novel_type: toc.novel_type,
         };
-        let text = converter.convert_novel(&toc_object, &sections)?;
+        let text = converter.convert_novel(&toc_object, &sections, Some(record))?;
         let output = keys.converted_text();
         // `convert.keep-txt` の解釈は native のファイル経路 (`converter::mod`)
         // と Worker で共有する (`setting_core::keep_converted_text`)。既定は
@@ -404,9 +404,18 @@ mod tests {
     fn assembles_converted_text_from_stored_sections() {
         let _env = KeepTxtEnvGuard::cleared();
         let store = Arc::new(MemoryObjectStore::new());
-        let settings = Arc::new(crate::application::settings::MemorySettingsStore::new());
+        let settings = Arc::new(crate::application::settings::MemorySettingsStore::new().with_local(
+            std::collections::HashMap::from([
+                ("force.enable_add_date_to_title".into(), serde_yaml::Value::Bool(true)),
+                ("force.enable_add_end_to_title".into(), serde_yaml::Value::Bool(true)),
+                ("force.title_date_target".into(), serde_yaml::Value::String("general_lastup".into())),
+                ("force.title_date_format".into(), serde_yaml::Value::String(" [$ns/%Y-%m-%d]".into())),
+            ]),
+        ));
         let service = ConvertService::new(store.clone(), store.clone(), settings);
-        let target = record(7);
+        let mut target = record(7);
+        target.tags.push("end".into());
+        target.general_lastup = Some("2001-02-03T00:00:00Z".parse().unwrap());
         let keys =
             NovelObjectKeys::new(&target.sitename, &target.file_title, false).unwrap();
 
@@ -462,6 +471,7 @@ mod tests {
             let converted = service.convert_and_store(&target).await.unwrap();
             assert_eq!(converted.output, Some(keys.converted_text()));
             let text = &converted.text;
+            assert_eq!(text.lines().next(), Some("テスト小説 [example/2001-02-03] (完結)"));
             assert!(text.contains("本文の一行目。"), "{text}");
             assert!(text.contains("第一話"), "{text}");
 

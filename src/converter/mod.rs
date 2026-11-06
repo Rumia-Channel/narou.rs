@@ -174,7 +174,7 @@ pub fn materialize_for_conversion(
     novel_dir: &std::path::Path,
 ) -> Result<crate::native::object_store::MaterializedNovelFiles> {
     let store = crate::native::object_store::NativeStore::for_current_root()?;
-    store.materialize_novel_files(novel_dir)
+    store.materialize_conversion_inputs(novel_dir)
 }
 
 /// 変換済みテキストを残すか (`convert.keep-txt`、既定 true)。
@@ -404,15 +404,16 @@ impl NovelConverter {
         self.last_text_path.as_deref()
     }
 
-    pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile]) -> Result<String> {
-        self.convert_novel_with_id(None, toc, sections)
+    pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile], record: Option<&NovelRecord>) -> Result<String> {
+        self.convert_novel_inner(None, toc, sections, record)
     }
 
-    pub fn convert_novel_with_id(
+    fn convert_novel_inner(
         &mut self,
         novel_id: Option<i64>,
         toc: &TocObject,
         sections: &[SectionFile],
+        record: Option<&NovelRecord>,
     ) -> Result<String> {
         self.use_dakuten_font = false;
         let mut erased_intro_count = 0usize;
@@ -628,8 +629,6 @@ impl NovelConverter {
             ));
         }
 
-        let record = novel_id.and_then(|id| self.resolve_novel_record(id));
-
         self.flush_illustration_store()?;
 
         Ok(render::render_novel_text(
@@ -637,7 +636,7 @@ impl NovelConverter {
             toc,
             &converted_story,
             &converted_sections,
-            record.as_ref(),
+            record,
             self.target_device,
         ))
     }
@@ -658,7 +657,7 @@ impl NovelConverter {
             subtitles: subtitles.to_vec(),
             novel_type: toc.novel_type,
         };
-        let aozora_text = self.convert_novel(&empty_toc, &sections)?;
+        let aozora_text = self.convert_novel(&empty_toc, &sections, None)?;
         Ok(strip_book_header_and_footer(&aozora_text))
     }
 
@@ -1118,7 +1117,7 @@ impl NovelConverter {
         let record = self.resolve_novel_record(id);
         self.apply_record_fetch_policy(record.as_ref());
 
-        let aozora_text = self.convert_novel_with_id(Some(id), &toc_object, &sections)?;
+        let aozora_text = self.convert_novel_inner(Some(id), &toc_object, &sections, record.as_ref())?;
         self.flush_section_convert_cache()?;
         let txt_path = output::create_output_text_path(
             &self.settings,
@@ -1205,7 +1204,8 @@ impl NovelConverter {
         no_strip: bool,
         verbose: bool,
     ) -> Result<PathBuf> {
-        self.apply_record_fetch_policy(self.resolve_novel_record(_id).as_ref());
+        let record = self.resolve_novel_record(_id);
+        self.apply_record_fetch_policy(record.as_ref());
         self.last_inspection_output = None;
         self.inspector.lock().reset();
         // ミラーを書かない構成では実ファイルが無いので、変換の間だけ取り出す。
@@ -1228,11 +1228,10 @@ impl NovelConverter {
         self.display_header(_id, &toc_object.title);
 
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
-        let record = self.resolve_novel_record(_id);
 
         let previous_device = self.target_device;
         self.target_device = Some(device);
-        let converted = self.convert_novel_with_id(Some(_id), &toc_object, &sections);
+        let converted = self.convert_novel_inner(Some(_id), &toc_object, &sections, record.as_ref());
         self.target_device = previous_device;
         let aozora_text = converted?;
         self.flush_section_convert_cache()?;
@@ -2410,7 +2409,7 @@ mod tests {
         };
         let mut converter = NovelConverter::new(settings);
         let text = converter
-            .convert_novel(&toc, &[make_illustration_section()])
+            .convert_novel(&toc, &[make_illustration_section()], None)
             .unwrap();
 
         assert!(
@@ -2435,7 +2434,7 @@ mod tests {
         };
         let mut converter = NovelConverter::new(NovelSettings::default());
         let text = converter
-            .convert_novel(&toc, &[make_parenthesized_kana_html_section()])
+            .convert_novel(&toc, &[make_parenthesized_kana_html_section()], None)
             .unwrap();
 
         assert!(
@@ -2458,7 +2457,7 @@ mod tests {
         };
         let mut converter = NovelConverter::new(NovelSettings::default());
         let text = converter
-            .convert_novel(&toc, &[make_explicit_ruby_html_section()])
+            .convert_novel(&toc, &[make_explicit_ruby_html_section()], None)
             .unwrap();
 
         assert!(
@@ -2478,7 +2477,7 @@ mod tests {
             novel_type: Some(1),
         };
         let mut converter = NovelConverter::new(NovelSettings::default());
-        let text = converter.convert_novel(&toc, &[]).unwrap();
+        let text = converter.convert_novel(&toc, &[], None).unwrap();
 
         assert!(text.contains("香笛 春風（かふえ はるかぜ）"), "{text}");
         assert!(!text.contains("春風｜"), "{text}");
@@ -2497,7 +2496,7 @@ mod tests {
         };
         let mut converter = NovelConverter::new(NovelSettings::default());
         let text = converter
-            .convert_novel(&toc, &[make_parenthesized_kana_text_section()])
+            .convert_novel(&toc, &[make_parenthesized_kana_text_section()], None)
             .unwrap();
 
         assert!(text.contains("「あるけみすと」"), "{text}");
@@ -2640,7 +2639,7 @@ before_settings:
             },
         };
         NovelConverter::new(settings)
-            .convert_novel(&toc, &[section])
+            .convert_novel(&toc, &[section], None)
             .unwrap()
     }
 

@@ -16,7 +16,7 @@ pub mod hidden;
 pub mod http;
 pub mod illustrations;
 pub mod login_key;
-pub(crate) mod materialization;
+pub mod materialization;
 pub mod legacy_persistence;
 pub mod novel_repository;
 pub mod site_definitions;

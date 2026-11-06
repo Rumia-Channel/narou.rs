@@ -385,6 +385,7 @@ narou author remove 1
 | `import <FILE> [--overwrite\|--skip]` | ZIP を取り込む。既定は既存作品をスキップ。`--overwrite` で置換 |
 
 - ZIP: `manifest.json` + `novels/<index>/...`。作品メタデータ（`toc_url` / title / author / sitename / domain / tags / novel_type / ncode）と各ファイルのサイズ・SHA-256 を manifest に記録する。
+- Native の書き出しは専用の一時ディレクトリへ完全な保存内容を取得する。SQLite のミラー無効時も raw・履歴・生成物・利用者ファイルを含め、S3 の挿絵も同梱する。実行中の変換先へ一時復元せず、その生成物を後片付けで削除しない。
 - 安全策: パストラバーサル・absolute path・重複パス・サイズ/エントリ上限・zip bomb を共通コアで拒否。上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。`sqlite.mirror-files=false` のライブラリへの import は fail closed。
 - Web API: `GET /api/transfer/export?ids=1,2` は ZIP、`POST /api/transfer/import[?overwrite=true]` は ZIP 本文を受け取り `{success, created, overwritten, skipped, errors}` を返す。既存の Web 認証ミドルウェア配下。
 - Web UI は両 API の `progress=1` を使い、作品数・転送量・検証／取り込み状況・エラーをモーダル表示する。書き出しは本文を 1 ファイルずつ圧縮・送信し、選択した複数作品を 1 個の ZIP にまとめる。取り込みは ZIP 1 個を選び、その中の複数作品を処理する。
@@ -497,10 +498,12 @@ Cloudflare Workers では Cloudflare Zero Trust の Service Token (`CF-Access-Cl
 
 **Rust 実装メモ**:
 - HTML の `&nbsp;` は narou.rb と同じ通常スペースへ復元する（本文・前書き・後書き・あらすじの合成入力で回帰確認）。
-- `sqlite.mirror-files=false` の一時取り出しは全ページを走査し、4,096 件を超えるオブジェクトも後片付けの対象にする。既存の実ファイルと挿絵は変更しない。
+- 作品レコードを Native／Worker 共通の変換入口へ渡し、完結タグ・掲載日・サイト名を使う題名展開をオンデマンド変換でも反映する。
+- `sqlite.mirror-files=false` の変換用取り出しは全ページを走査するが、目次・本文・設定・挿絵索引・表紙だけを対象にする。4,096 件を超えても取りこぼさず、生成物・履歴を一時ファイルとして所有しない。既存の実ファイルは変更しない。
 - CLI も `setting.ini` / `replace.txt` を取り出してから個別設定を読み、挿絵索引を実効 ObjectStore に保存する。ミラー有効時の復元ファイルは残し、無効時の取り出しファイルだけ最後の利用者が解放した時点で消す。挿絵を含む同期 I/O は既存 Tokio 文脈でも二重 runtime にしない。
 - 個別 `setting.ini` は Native CLI / Web の変換子プロセスでも実効 ObjectStore から読み、SQLite 移行前の実ファイルが残っていても正準保存値を優先する。`novel_title` / `novel_author` を含む再編集・設定解除を反映し、読み出しのために既存ファイルを上書き・削除しない。YAML 管理とライブラリ外の読み出しは従来どおり（issue #37）。
 - 挿絵の一時取り出しが途中で失敗した場合も、新規作成した完全／不完全ファイルを片付け、再試行時に不完全な画像を再利用しない。
+- 挿絵の公開は既存ファイルを上書きしない方法で行い、取得中に別処理が作った画像は削除対象にしない。Native Web の保存済みテキストも要求専用の一時ファイルへ読み、名前付きテキストの SQLite オブジェクトだけが残る構成に対応する。
 - 半角カナは Ruby版 NKF 相当の対応表と濁点・半濁点合成で全角化し、ルビの読みも `ﾛｰﾙﾌﾟﾚｲﾝｸﾞｹﾞｰﾑ` → `ロールプレイングゲーム` と変換する。半角句読点にも対応し、全角英数字や互換文字は変更しない（issue #31）
 - `-o/--output` を direct convert に接続し、フォルダ部分を無視して保存先小説フォルダ配下へ出力する。複数 target 時は Ruby版同様 `basename (n).ext` を付ける
 - `-i/--inspect` を clap / `main.rs` / `commands::convert` に接続し、`local_setting.yaml` の `convert.inspect=true` も Ruby版同様に direct convert の既定値として注入する
@@ -971,7 +974,7 @@ narou setting name         # 読み取り
 
 **Rust 実装**: `src/commands/backup.rs` で Ruby 版同様に複数 target を順に処理し、`backup/` 直下へ ZIP を保存する。バックアップ名はタイトルを Ruby 版同様に整形して 180 バイトで切り詰める。
 
-SQLite のミラー無効時も本文・設定・挿絵を保存先からスコープ付きで取り出して ZIP に入れる。フォルダが無いだけで登録を削除しない。
+SQLite のミラー無効時も本文・設定・挿絵・raw・履歴・生成物・利用者ファイルを専用の一時ディレクトリへ取得して ZIP に入れる。変換先の実ファイルを後片付けで消さず、フォルダが無いだけで登録を削除しない。
 
 ---
 
@@ -1012,7 +1015,7 @@ SQLite のミラー無効時も本文・設定・挿絵を保存先からスコ�
 - `orphan` — `.illustration_cache.yaml` の `sources`/`mitemin_ids`/`hashes` と `raw/*.html` の `<img src>` の双方から到達不能な `挿絵/*` を列挙。既定 dry-run、`-f` で削除。
 - `migrate` — レガシー名 (`<話数>-<連番>.ext` / URL basename) をハッシュ名へ一括移行し、ソースマップも更新。非 mitemin も対象。
 - `fix-ext` — マジックバイト判定 (JPEG/PNG/GIF/WEBP/BMP) で拡張子を実体に合わせて改名。
-- `rebuild` — `挿絵/` + `raw/*.html` から `.illustration_cache.yaml` を再構築し永続化。
+- `rebuild` — `挿絵/` + `raw/*.html` から `.illustration_cache.yaml` を再構築し永続化。SQLite のミラー無効時も専用の一時ディレクトリで保存済み raw と挿絵を読み、索引だけを元の保存先へ反映する。
 - `s3-push` — 挿絵をローカルから S3 互換ストレージ (Wasabi など) へ写す。既定は件数と容量を数えるだけで、`-f` で実行。**ライブラリ全体が対象** (`<target>` は使わない) で、`s3.asset-backend=s3` と接続情報が必要。
 - S3 LIST の署名エラー診断は、改行表現を正規化して canonical digest と StringToSign 全体を別々に比較する。digest 一致だけで secret の誤りと断定せず、診断改善を 403 の解消とは扱わない。 生の XML 本文は表示せず、許可したエラーコードと任意のサーバー echo の比較結果（一致・不一致・欠落・不正）、公開 AWS サンプルの実行時自己テスト、実効接続先 host/port・標準的な region・native 設定元ラベルを表示する。鍵 ID・署名・資格情報の値やハッシュは表示しない。環境変数ラベルは `.env` と起動時の既存環境を区別しない。 `StringToSignBytes` は各バイト 1〜2 桁の16進数として厳密比較し、LF / CRLF 等を正規化しない。
 - `s3-verify` — ローカルの挿絵と S3 の内容をバイト単位で突き合わせる (書き込みなし)。同じくライブラリ全体が対象。

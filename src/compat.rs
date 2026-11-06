@@ -701,7 +701,7 @@ pub fn choose_digest_action(title: &str, message: &str) -> DigestChoice {
     choose_digest_action_inner(title, message, &mut auto_choices)
 }
 
-pub fn create_backup(novel_dir: &Path, title: &str) -> Result<String> {
+pub fn create_backup(source_dir: &Path, novel_dir: &Path, title: &str) -> Result<String> {
     let backup_dir = novel_dir.join("backup");
     fs::create_dir_all(&backup_dir)?;
     let backup_name = format!(
@@ -715,7 +715,7 @@ pub fn create_backup(novel_dir: &Path, title: &str) -> Result<String> {
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
-    add_directory_to_zip(&mut zip, novel_dir, novel_dir, options)?;
+    add_directory_to_zip(&mut zip, source_dir, source_dir, options)?;
     zip.finish()
         .map_err(|e| NarouError::Conversion(e.to_string()))?;
     Ok(backup_name)

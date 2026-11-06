@@ -338,12 +338,11 @@ impl SqliteObjectStore {
     /// 変換がファイルパスを要求するときに使う。既にあるファイルは触らない。
     /// ミラー無効時だけスコープに登録し、使い終わったら消す。ミラー有効時は
     /// 削除されたミラーの復元として残す。
-    /// `skip_segment` をパス要素に持つキー (挿絵など) は対象外。
+    /// 目次・本文・変換設定だけを対象にし、生成物や履歴は取り出さない。
     pub(crate) fn materialize_into(
         &self,
         novel_dir: &Path,
         prefix: &ObjectKey,
-        skip_segment: &str,
         scope: &crate::native::materialization::MaterializationScope,
     ) -> Result<Vec<PathBuf>> {
         let mut request = ObjectListRequest::new(
@@ -355,14 +354,12 @@ impl SqliteObjectStore {
             let page = self.list_blocking(&request)?;
             for metadata in &page.objects {
                 let key = metadata.key.as_ref();
-                if key.split('/').any(|segment| segment == skip_segment) {
+                let Some(relative) = key.strip_prefix(prefix.as_ref()).and_then(|rest| rest.strip_prefix('/')) else {
                     continue;
-                }
-                let relative = key
-                    .strip_prefix(prefix.as_ref())
-                    .map(|rest| rest.trim_start_matches('/'))
-                    .unwrap_or_default();
-                if relative.is_empty() {
+                };
+                let input = matches!(relative, "toc.yaml" | "setting.ini" | "replace.txt" | "converter.yaml" | ".illustration_cache.yaml" | "cover.jpg" | "cover.png" | "cover.jpeg")
+                    || relative.strip_prefix("本文/").is_some_and(|name| !name.contains('/') && name.ends_with(".yaml"));
+                if !input {
                     continue;
                 }
                 let path = novel_dir.join(relative);
@@ -1337,7 +1334,7 @@ mod tests {
         let prefix = ObjectKey::try_new("novels/site/title").unwrap();
         let novel_dir = dir.path().join("site/title");
         let scope = crate::native::materialization::MaterializationScope::acquire(dir.path(), &novel_dir).unwrap();
-        let written = store.materialize_into(&novel_dir, &prefix, "挿絵", &scope).unwrap();
+        let written = store.materialize_into(&novel_dir, &prefix, &scope).unwrap();
         assert_eq!(written, vec![mirrored.clone()]);
         assert!(mirrored.is_file());
         drop(scope);
@@ -1368,7 +1365,7 @@ mod tests {
         std::fs::write(&existing_path, b"keep local").unwrap();
 
         let scope = crate::native::materialization::MaterializationScope::acquire(dir.path(), &novel_dir).unwrap();
-        let written = store.materialize_into(&novel_dir, &prefix, "挿絵", &scope).unwrap();
+        let written = store.materialize_into(&novel_dir, &prefix, &scope).unwrap();
         let body_path = novel_dir.join("本文/1 body.yaml");
         assert_eq!(written, vec![body_path.clone()]);
         assert_eq!(std::fs::read(&body_path).unwrap(), b"body");
@@ -1377,6 +1374,35 @@ mod tests {
         drop(guard);
         assert!(!body_path.exists());
         assert_eq!(std::fs::read(&existing_path).unwrap(), b"keep local");
+    }
+
+    #[test]
+    fn materialized_inputs_do_not_own_new_conversion_outputs() {
+        let (dir, mut store) = temp_store();
+        store.mirror_files = false;
+        let prefix = ObjectKey::try_new("novels/site/title").unwrap();
+        for relative in [
+            "toc.yaml", "本文/1 body.yaml", "setting.ini", "replace.txt",
+            "converter.yaml", ".illustration_cache.yaml", "novel.txt", "Book.epub", "cover.png",
+        ] {
+            let key = ObjectKey::try_new(format!("{prefix}/{relative}")).unwrap();
+            store.write_blocking(&key, b"stored").unwrap();
+        }
+        let novel_dir = dir.path().join("site/title");
+        let scope = crate::native::materialization::MaterializationScope::acquire(dir.path(), &novel_dir).unwrap();
+        let written = store.materialize_into(&novel_dir, &prefix, &scope).unwrap();
+        for relative in ["toc.yaml", "本文/1 body.yaml", "setting.ini", "replace.txt", "converter.yaml", ".illustration_cache.yaml", "cover.png"] {
+            assert_eq!(std::fs::read(novel_dir.join(relative)).unwrap(), b"stored");
+        }
+        for output in ["novel.txt", "Book.epub"] {
+            std::fs::write(novel_dir.join(output), b"new conversion output").unwrap();
+        }
+        drop(crate::native::object_store::MaterializedNovelFiles::from_paths(written, scope));
+        for output in ["novel.txt", "Book.epub"] {
+            assert_eq!(std::fs::read(novel_dir.join(output)).unwrap(), b"new conversion output");
+        }
+        assert!(!novel_dir.join("toc.yaml").exists());
+        assert!(!novel_dir.join("本文/1 body.yaml").exists());
     }
 
     #[test]

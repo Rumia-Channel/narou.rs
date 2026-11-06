@@ -578,25 +578,19 @@ fn run_rebuild(archive_path: &Path) -> Result<(), String> {
 
 /// 実体がストアにだけある構成の索引再構築。
 ///
-/// ストアから本文 (`raw/*.html` を含む) と挿絵を取り出し、既存の FS 再構築
-/// ロジックで索引を組み直してストアへ書き戻す。取り出したファイルは
-/// ガードが片付けるので、ローカルには残さない。
+/// raw HTML と挿絵を含む私有スナップショットで既存の FS 再構築を実行し、
+/// 索引だけを元のストアへ書き戻す。実ディレクトリの生成物には触らない。
 fn run_rebuild_via_store(archive_path: &Path) -> Result<(), String> {
     let inventory = narou_rs::db::inventory::Inventory::with_default_root()
         .map_err(|e| e.to_string())?;
     let archive_root = inventory
         .root_dir()
         .join(narou_rs::downloader::ARCHIVE_ROOT_DIR);
-    let store = narou_rs::native::object_store::NativeStore::for_narou_root(inventory.root_dir())
+    let snapshot = narou_rs::native::materialization::snapshot(archive_path)
         .map_err(|e| e.to_string())?;
-    let _files = store
-        .materialize_novel_files(archive_path)
+    let count = illustration_store::rebuild_illustration_cache(snapshot.path())
         .map_err(|e| e.to_string())?;
-    let _illustrations = narou_rs::native::illustrations::materialize_blocking(archive_path)
-        .map_err(|e| e.to_string())?;
-    let count =
-        illustration_store::rebuild_illustration_cache(archive_path).map_err(|e| e.to_string())?;
-    let cache = illustration_store::cache_path(archive_path);
+    let cache = illustration_store::cache_path(snapshot.path());
     let body = match std::fs::read(&cache) {
         Ok(body) => body,
         // エントリ 0 件では flush がファイルを書かない (空の索引を表す)。
@@ -615,13 +609,6 @@ fn run_rebuild_via_store(archive_path: &Path) -> Result<(), String> {
         body,
     ))
     .map_err(|e| e.to_string())?;
-    let narou_dir = inventory.root_dir().join(".narou");
-    if narou_rs::native::sqlite::state::active_for(&narou_dir).is_some()
-        && !narou_rs::native::sqlite::state::mirror_files_enabled()
-    {
-        // mirror-files=false では索引はストアにだけ置く。
-        let _ = std::fs::remove_file(&cache);
-    }
     println!("  cache 再構築完了: {} エントリ (ストア保存)", count);
     Ok(())
 }

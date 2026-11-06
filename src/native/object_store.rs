@@ -263,11 +263,16 @@ impl NativeObjectStore {
 }
 
 pub(crate) fn logical_key_for_native_path(root: &Path, path: &Path) -> Option<ObjectKey> {
-    let relative = path
-        .strip_prefix(root)
-        .ok()?
-        .to_string_lossy()
-        .replace('\\', "/");
+    let canonical_root;
+    let canonical_path;
+    let relative = match path.strip_prefix(root) {
+        Ok(relative) => relative,
+        Err(_) => {
+            canonical_root = crate::db::paths::ensure_within_archive_root(root, root).ok()?;
+            canonical_path = crate::db::paths::ensure_within_archive_root(path, root).ok()?;
+            canonical_path.strip_prefix(&canonical_root).ok()?
+        }
+    }.to_string_lossy().replace('\\', "/");
     if let Some(object_relative) = relative.strip_prefix(".objects/") {
         ObjectKey::try_new(object_relative.to_string()).ok()
     } else {
@@ -658,7 +663,7 @@ impl NativeStore {
     /// ミラーを書かない構成 (`sqlite.mirror-files=false`) で、変換がファイルを
     /// 要求するときに使う。ファイル保存の構成では実体があるので何もしない。
     /// 返り値のガードがスコープを抜けると、取り出したファイルだけを消す。
-    pub fn materialize_novel_files(&self, novel_dir: &Path) -> Result<MaterializedNovelFiles> {
+    pub fn materialize_conversion_inputs(&self, novel_dir: &Path) -> Result<MaterializedNovelFiles> {
         let NativeStore::Sqlite(store) = self else {
             return Ok(MaterializedNovelFiles::default());
         };
@@ -677,7 +682,6 @@ impl NativeStore {
         let paths = store.materialize_into(
             &novel_dir,
             &prefix,
-            crate::platform::split_store::ILLUSTRATION_SEGMENT,
             &scope,
         )?;
         Ok(MaterializedNovelFiles::from_paths(paths, scope))
@@ -1230,6 +1234,30 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(loaded, b"legacy");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_store_lists_through_a_case_aliased_root() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("ArchiveRoot")).unwrap();
+        let root = temp.path().join("archiveroot");
+        let store = NativeObjectStore::from_root(root.clone()).unwrap();
+        let key = ObjectKey::try_new("webnovel/example.yaml").unwrap();
+        futures::executor::block_on(async {
+            store.write_small(&key, b"name: custom".to_vec()).await.unwrap();
+            let request = ObjectListRequest::new(
+                crate::platform::ObjectPrefix::new("webnovel").unwrap(),
+                std::num::NonZeroUsize::new(10).unwrap(),
+            );
+            let page = store.list_page(&request).await.unwrap();
+            assert_eq!(page.objects.iter().map(|object| &object.key).collect::<Vec<_>>(), [&key]);
+            let physical = store.resolve_path(&key).unwrap();
+            assert_eq!(logical_key_for_native_path(&root, &physical), Some(key.clone()));
+            let configured_path = root.join(".objects/webnovel/example.yaml");
+            assert_eq!(logical_key_for_native_path(store.root(), &configured_path), Some(key.clone()));
+            assert_eq!(store.read_small(&key).await.unwrap().unwrap(), b"name: custom");
+        });
     }
 
     #[test]

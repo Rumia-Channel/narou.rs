@@ -1015,7 +1015,7 @@ impl Downloader {
                         return Ok(true);
                     }
                     crate::compat::DigestChoice::Backup => {
-                        let backup_name = crate::compat::create_backup(novel_dir, title)?;
+                        let backup_name = crate::compat::create_backup(novel_dir, novel_dir, title)?;
                         self.report_line(&messages::download::backup_created(backup_name));
                     }
                     crate::compat::DigestChoice::ShowStory => {

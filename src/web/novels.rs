@@ -558,7 +558,7 @@ async fn generate_epub_on_demand(
     // Restore inputs before loading native settings (including setting.ini and
     // the per-novel/global replace.txt), and images before localizing HTML.
     let _files = crate::native::object_store::NativeStore::for_narou_root(inventory.root_dir())
-        .and_then(|store| store.materialize_novel_files(novel_dir))
+        .and_then(|store| store.materialize_conversion_inputs(novel_dir))
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let _materialized = crate::native::illustrations::materialize(novel_dir).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -646,16 +646,27 @@ async fn generate_epub_on_demand(
     // 変換する。build_book はファイルを要求するため、材料を novel_dir へ
     // 取り出し、組み立てた txt は消えるガードとして書き出す。
     let (txt_path, _text_guard) = if let Some(toc_object) = &toc_object {
-        (
-            crate::converter::output::create_output_text_path(
-                &settings,
-                id,
-                novel_dir,
-                toc_object,
-                Some(record),
-            ),
-            None,
-        )
+        let path = crate::converter::output::create_output_text_path(
+            &settings, id, novel_dir, toc_object, Some(record),
+        );
+        if path.is_file() {
+            (path, None)
+        } else {
+            let root = inventory.root_dir().join(crate::downloader::ARCHIVE_ROOT_DIR);
+            let key = crate::native::object_store::object_key_for_file(&root, &path)
+                .ok_or_else(|| (StatusCode::CONFLICT, "Converted text is outside the archive".to_string()))?;
+            let store = crate::native::object_store::NativeStore::for_narou_root(inventory.root_dir())
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            let temporary = tempfile::Builder::new().prefix(".narou-epub-").suffix(".txt")
+                .tempfile_in(novel_dir)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            if !crate::native::materialization::copy_asset(&store, &key, temporary.path()).await
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            {
+                return Err((StatusCode::CONFLICT, "Converted text not found: run convert first".to_string()));
+            }
+            (temporary.path().to_path_buf(), Some(temporary))
+        }
     } else {
         let text = if let Some(payload) = cached_text {
             // `converted_text` contains UTF-8 text, never EPUB bytes.
@@ -684,7 +695,7 @@ async fn generate_epub_on_demand(
                     title: toc.title, author: toc.author, toc_url: toc.toc_url,
                     story: toc.story, subtitles: toc.subtitles, novel_type: toc.novel_type,
                 };
-                converter.convert_novel(&toc, &sections)
+                converter.convert_novel(&toc, &sections, Some(&record))
                 };
                 match message_context {
                     Some(context) => context.run(convert),
@@ -904,5 +915,65 @@ mod tests {
         assert!(!dir.join("novel.txt").exists());
         assert!(!std::fs::read_dir(&dir).unwrap().any(|entry|
             entry.unwrap().path().extension().is_some_and(|extension| extension == "txt")));
+    }
+
+    #[cfg(feature = "lite")]
+    #[test]
+    fn on_demand_epub_reads_sqlite_only_named_text_and_cover() {
+        use std::io::{Cursor, Read};
+        use crate::platform::ObjectStore;
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir(temp.path().join(".narou")).unwrap();
+        std::fs::write(temp.path().join(".narou/storage-backend"), "sqlite").unwrap();
+        std::fs::write(temp.path().join(".narou/local_setting.yaml"),
+            "sqlite.mirror-files: false\nconvert.keep-txt: true\n").unwrap();
+        let dir = temp.path().join("小説データ/audit/stored-text");
+        let record: crate::db::NovelRecord = serde_yaml::from_str(
+            "id: 990002\ntitle: 保管済みテキスト\nauthor: author\nfile_title: stored-text\nsitename: audit\ntoc_url: https://example.com/stored-text\nnovel_type: 2\nlast_update: 2026-01-01T00:00:00Z\n").unwrap();
+        let toc = crate::downloader::TocObject {
+            title: record.title.clone(), author: record.author.clone(), toc_url: record.toc_url.clone(),
+            story: None, subtitles: Vec::new(), novel_type: Some(2),
+        };
+        let store = crate::native::object_store::NativeStore::for_narou_root(temp.path()).unwrap();
+        let settings = crate::converter::settings::NovelSettings::load_for_novel(
+            record.id, &record.title, &record.author, &dir,
+        );
+        let text_path = crate::converter::output::create_output_text_path(
+            &settings, record.id, &dir, &toc, Some(&record),
+        );
+        let root = temp.path().join("小説データ");
+        let text_key = crate::native::object_store::object_key_for_file(&root, &text_path).unwrap();
+        let keys = crate::platform::NovelObjectKeys::new("audit", "stored-text", false).unwrap();
+        let mut cover = Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(3, 3, image::Rgba([0, 0, 255, 255]))
+            .write_to(&mut cover, image::ImageFormat::Png).unwrap();
+        let cover = cover.into_inner();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            store.write_small(&keys.toc(), serde_yaml::to_string(&toc).unwrap().into_bytes()).await.unwrap();
+            store.write_small(&keys.prefix().join("cover.png").unwrap(), cover.clone()).await.unwrap();
+            store.write_small(&text_key,
+                "保管済みテキスト\nauthor\n\n保存済み本文フォールバック。\n［＃挿絵（cover.png）入る］\n".as_bytes().to_vec()).await.unwrap();
+        });
+        assert!(!text_path.exists());
+        let (bytes, _) = runtime.block_on(super::generate_epub_on_demand(record.id, &record, &dir)).unwrap();
+        let mut epub = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut found_text = false;
+        let mut found_cover = false;
+        for index in 0..epub.len() {
+            let mut entry = epub.by_index(index).unwrap();
+            let name = entry.name().unwrap().to_string();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            found_cover |= name.starts_with("item/image/") && bytes == cover;
+            found_text |= name.ends_with(".xhtml") &&
+                String::from_utf8_lossy(&bytes).contains("保存済み本文フォールバック。");
+        }
+        assert!(found_text, "the stored text, not a fresh conversion, must supply the body");
+        assert!(found_cover, "the SQLite-only cover must be included");
+        for path in [text_path, dir.join("toc.yaml"), dir.join("cover.png")] {
+            assert!(!path.exists(), "request-owned files must be removed: {}", path.display());
+        }
     }
 }

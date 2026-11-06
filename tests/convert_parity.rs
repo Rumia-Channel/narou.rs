@@ -44,7 +44,7 @@ fn story_html_is_converted_before_text_pipeline() {
     }];
 
     let mut converter = NovelConverter::new(NovelSettings::default());
-    let output = converter.convert_novel(&toc, &sections).unwrap();
+    let output = converter.convert_novel(&toc, &sections, None).unwrap();
 
     assert!(!output.contains("<br"));
     assert!(!output.contains("ｂｒ"));
@@ -85,10 +85,10 @@ element:
     literal_section.element.postscript = section.element.postscript.replace("&nbsp;", " ");
 
     let encoded = NovelConverter::new(NovelSettings::default())
-        .convert_novel(&toc, &[section])
+        .convert_novel(&toc, &[section], None)
         .unwrap();
     let literal = NovelConverter::new(NovelSettings::default())
-        .convert_novel(&literal_toc, &[literal_section])
+        .convert_novel(&literal_toc, &[literal_section], None)
         .unwrap();
     assert_eq!(encoded.as_bytes(), literal.as_bytes());
     assert!(!encoded.contains('\u{00A0}'));
@@ -223,7 +223,7 @@ fn convert_sample_to_string(converter: &mut NovelConverter, novel_dir: &Path) ->
         })
         .collect::<Vec<_>>();
 
-    converter.convert_novel(&toc_object, &sections).unwrap()
+    converter.convert_novel(&toc_object, &sections, None).unwrap()
 }
 
 fn find_reference_output(root: &Path) -> Option<PathBuf> {

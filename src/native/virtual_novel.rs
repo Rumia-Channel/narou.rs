@@ -574,7 +574,7 @@ pub fn convert_virtual(
                 ))
             })?;
         let member_dir = db::existing_novel_dir_for_record(&archive_root, &member);
-        _materialized.push(store.materialize_novel_files(&member_dir)?);
+        _materialized.push(store.materialize_conversion_inputs(&member_dir)?);
         let toc = read_toc(&member_dir)?;
         copy_illustrations(&member_dir.join("挿絵"), &temp.path().join("挿絵"))?;
 
