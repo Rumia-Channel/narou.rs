@@ -105,3 +105,19 @@ Worker ランナーは実際の Wasm とアセットをビルドして HTTP 契�
 Worker をビルドした後であれば、`node tests/author_tracking.mjs` 単体で作者追跡のスモークテストを実行することも可能です。Worker 側の作者管理は Web UI の HTTP API 経由で実行され、ネイティブのリモート CLI は不要です。ローカル状態は `finally` で自動削除され、本番の D1 や S3 は一切使用しません。
 
 ※ Unix 環境では、スモークテストの各 Wrangler は独立したプロセスグループで実行され、終了時に npx/Wrangler/workerd グループ全体が停止します。Windows 環境では `taskkill /T /F` を使用します。正常に終了したテストはプロセスを確実に停止し、ローカルのフィクスチャ状態を解放します。
+
+## 9. タグ・お気に入り・ライブ設定の回帰テスト
+
+```sh
+node --test tests/*.test.mjs
+cargo test --features lite --lib application::favorite_tags
+cargo test --features lite --lib application::webui::config
+cargo test --features lite --test tag_order_http --test cli_server_security_reload
+node worker_entry/tests/run.mjs --release
+```
+
+Native の HTTP テストは `TempDir` 内の YAML / SQLite ライブラリを実バイナリで開き、旧配列形式・数値文字列のタグ・新旧 ID の混在・全並び順の往復・表示順に依存しない色割当・破損在庫の保全を確認する。CLI の設定変更は実 WebSocket の握手で wildcard / IP の許可・取り消しを確認する。
+
+フロントエンドは実モジュールの要求順序・応答の逆転・保存中の別画面変更・再接続の再取得・アクセシビリティ上の操作状態を検証する。ブラウザでの操作確認はこれらとは別に行う。
+
+Worker ランナーは `.wrangler/contract-*` に設定・資格情報・D1 を隔離し、開発用 `.dev.vars` と `.wrangler/state` を変更しない。`tag_sequence.mjs` は同じローカル D1 に一時トリガーを置き、既存行の CAS 競合と初回 INSERT の競合を確実に発生させ、競合相手の追加が残ることを確認する。旧形式・破損状態・同時追加・並び順の往復も実 HTTP 経由で検証する。SQL を使う `virtual_attributes.mjs` も同じ隔離先を受け取り、単体で開発用 DB を推測しない。`--keep` 指定時を除き、失敗時も所有する子プロセスと状態を削除する。

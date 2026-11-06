@@ -30,12 +30,14 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         return response;
     }
     let path = req.path();
+    if req.method() == Method::Get && path == "/api/webui/config" {
+        return webui_config(&req, &env).await;
+    }
     // 対象パスとメソッドの組を先に検証する (native のルート定義と同じく、
     // パスはあるがメソッドが違う場合は 405)。
     enum Route {
         GetSortState,
         SaveSortState,
-        WebuiConfig,
         FeatureTourPending,
         FeatureTourAll,
         FeatureTourSeen,
@@ -44,7 +46,6 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     let route = match (req.method(), path.as_str()) {
         (Method::Get, "/api/sort_state") => Route::GetSortState,
         (Method::Post, "/api/sort_state") => Route::SaveSortState,
-        (Method::Get, "/api/webui/config") => Route::WebuiConfig,
         (Method::Get, "/api/feature_tour/pending") => Route::FeatureTourPending,
         (Method::Get, "/api/feature_tour/all") => Route::FeatureTourAll,
         (Method::Post, "/api/feature_tour/seen") => Route::FeatureTourSeen,
@@ -74,7 +75,6 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     match route {
         Route::GetSortState => get_sort_state(&runtime).await,
         Route::SaveSortState => save_sort_state(&mut req, &runtime).await,
-        Route::WebuiConfig => webui_config(&req, &env).await,
         Route::FeatureTourPending => feature_tour_pending(&runtime).await,
         Route::FeatureTourAll => feature_tour_all(&runtime).await,
         Route::FeatureTourSeen => feature_tour_seen(&mut req, &runtime).await,
@@ -103,48 +103,6 @@ async fn webui_config(req: &Request, env: &Env) -> worker::Result<Response> {
     let Ok(settings) = settings else {
         return json_error(503, "service_unavailable", None);
     };
-    // 依存の無い設定は 1 回の `get_many` にまとめる (スコープごとに 1 回だけ
-    // ストアを読む)。
-    const CONFIG_NAMES: &[&str] = &[
-        "webui.theme",
-        "webui.performance-mode",
-        "webui.table.reload-timing",
-        "webui.debug-mode",
-        "webui.tag-sort-order",
-        "tag.show-novel",
-        "tag.show-manga",
-        "tag.attributes-enabled",
-        "concurrency",
-    ];
-    let loaded: Vec<Option<serde_yaml::Value>> = settings
-        .get_many(CONFIG_NAMES)
-        .await
-        .unwrap_or_default();
-    let find = |name: &str| {
-        CONFIG_NAMES
-            .iter()
-            .position(|candidate| *candidate == name)
-            .and_then(|index| loaded.get(index).cloned().flatten())
-    };
-    let string_value = |value: Option<serde_yaml::Value>, default: &str| {
-        value
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_else(|| default.to_string())
-    };
-    let theme = string_value(find("webui.theme"), "Cerulean");
-    let performance_mode = string_value(find("webui.performance-mode"), "auto");
-    let reload_timing = string_value(find("webui.table.reload-timing"), "every");
-    let tag_sort_order = narou_rs::application::webui::tag_order::TagSortOrder::from_setting(
-        find("webui.tag-sort-order").as_ref().and_then(serde_yaml::Value::as_str),
-    );
-    let debug_mode = find("webui.debug-mode")
-        .and_then(|value| narou_rs::setting_core::setting_bool_value(&value))
-        .unwrap_or(false);
-    // Worker のジョブは常に並列なので既定は有効 (native の `concurrency=true` と
-    // 同じ 2 ペイン表示)。明示的に false を保存したときだけ 1 ペインに戻す。
-    let concurrency_enabled = find("concurrency")
-        .and_then(|value| narou_rs::setting_core::setting_bool_value(&value))
-        .unwrap_or(true);
 
     // native は HTTP/WS サーバーの待受ポートを返す。Worker では `/ws` も同じ
     // オリジンに同居するので、リクエストの実効ポート (明示ポートまたは
@@ -164,28 +122,17 @@ async fn webui_config(req: &Request, env: &Env) -> worker::Result<Response> {
         max_bytes: crate::push_hub::HISTORY_MAX_BYTES,
     });
 
-    Response::from_json(&serde_json::json!({
-        "theme": theme,
-        "performance_mode": performance_mode,
-        "reload_timing": reload_timing,
-        "debug_mode": debug_mode,
-        "tag_sort_order": tag_sort_order.setting_value(),
-        "show_novel_attribute": find("tag.show-novel").and_then(|value| narou_rs::setting_core::setting_bool_value(&value)).unwrap_or(false),
-        "show_manga_attribute": find("tag.show-manga").and_then(|value| narou_rs::setting_core::setting_bool_value(&value)).unwrap_or(true),
-        // 属性タグ機能全体の ON/OFF。OFF の間は個別表示スイッチも効かない。
-        "attribute_tags_enabled": find("tag.attributes-enabled").and_then(|value| narou_rs::setting_core::setting_bool_value(&value)).unwrap_or(false),
-        "ws_port": port,
-        "port": port,
-        "concurrency_enabled": concurrency_enabled,
-        // Worker 固有の注記 (native の応答にも同じキーを native 値で入れる):
-        // `concurrency` は実行レーンではなくコンソール分離のみ、`convert.keep-txt`
-        // の既定は false、`queue.max-retries` は配備上限で clamp される。
-        "concurrency_scope": "console",
-        "convert_keep_txt_default": crate::convert::KEEP_CONVERTED_TEXT_DEFAULT,
-        "queue_max_retries_limit": crate::consumer::CF_CONSUMER_MAX_RETRIES,
-        "capabilities": serde_json::to_value(&capabilities)
-            .expect("capabilities serialization is infallible"),
-    }))
+    let context = narou_rs::application::webui::config::ConfigContext {
+        capabilities,
+        port,
+        ws_port: port,
+        convert_keep_txt_default: crate::convert::KEEP_CONVERTED_TEXT_DEFAULT,
+        queue_max_retries_limit: Some(crate::consumer::CF_CONSUMER_MAX_RETRIES),
+    };
+    match narou_rs::application::webui::config::load(&settings, context).await {
+        Ok(config) => Response::from_json(&config),
+        Err(_) => json_error(503, "service_unavailable", None),
+    }
 }
 
 // ---------------------------------------------------------------------------

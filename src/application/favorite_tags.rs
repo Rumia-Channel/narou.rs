@@ -20,10 +20,82 @@ use serde::{Deserialize, Serialize};
 ///
 /// 保存形式は `tags:` を持つマッピング (native の YAML / Worker の JSON)。
 /// 読み込みは配列形式も受け付ける (旧データ互換)。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct FavoriteTags {
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for FavoriteTags {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Mapping { tags: Vec<String> },
+            Sequence(Vec<String>),
+            Empty(()),
+        }
+        let tags = match Stored::deserialize(deserializer)? {
+            Stored::Mapping { tags } | Stored::Sequence(tags) => tags,
+            Stored::Empty(()) => return Ok(Self::default()),
+        };
+        let mut state = Self::default();
+        for tag in tags {
+            state.add(&tag);
+        }
+        Ok(state)
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct FavoriteTagsRequest {
+    pub action: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+pub enum FavoriteTagsMutation {
+    Add(Vec<String>),
+    Remove(Vec<String>),
+    Clear,
+    Reorder(Vec<String>),
+}
+
+impl FavoriteTagsRequest {
+    pub fn validate(self) -> Result<FavoriteTagsMutation, String> {
+        let action = self.action.as_deref().unwrap_or("add");
+        if !matches!(action, "add" | "remove" | "clear" | "reorder") {
+            return Err("unknown favorite tags action".to_string());
+        }
+        let tags = self.tags.iter()
+            .map(|tag| crate::application::webui::validate_web_tag_name(tag))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(match action {
+            "remove" => FavoriteTagsMutation::Remove(tags),
+            "clear" => FavoriteTagsMutation::Clear,
+            "reorder" => FavoriteTagsMutation::Reorder(tags),
+            _ => FavoriteTagsMutation::Add(tags),
+        })
+    }
+}
+
+impl FavoriteTagsMutation {
+    pub fn apply(&self, state: &mut FavoriteTags) -> bool {
+        match self {
+            Self::Add(tags) => {
+                let mut changed = false;
+                for tag in tags { changed |= state.add(tag); }
+                changed
+            }
+            Self::Remove(tags) => {
+                let mut changed = false;
+                for tag in tags { changed |= state.remove(tag); }
+                changed
+            }
+            Self::Clear => state.clear(),
+            Self::Reorder(tags) => state.reorder(tags),
+        }
+    }
 }
 
 impl FavoriteTags {
@@ -101,48 +173,8 @@ impl FavoriteTags {
         before != self.tags.len()
     }
 
-    /// 保存された YAML 値 (マッピング形式) を読む。
-    ///
-    /// 旧形式 (`tags:` を持つマッピング) も新しい形式 (配列) も読む。
-    pub fn from_yaml_value(value: &serde_yaml::Value) -> Self {
-        let mut favorites = Self::default();
-        match value {
-            serde_yaml::Value::Sequence(items) => {
-                for item in items {
-                    if let Some(tag) = item.as_str() {
-                        favorites.add(tag);
-                    }
-                }
-            }
-            serde_yaml::Value::Mapping(mapping) => {
-                if let Some(items) = mapping.get(serde_yaml::Value::String("tags".to_string()))
-                    && let Some(items) = items.as_sequence()
-                {
-                    for item in items {
-                        if let Some(tag) = item.as_str() {
-                            favorites.add(tag);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        favorites
-    }
-
-    /// 保存用の YAML 値 (`tags:` を持つマッピング)。
-    pub fn to_yaml_value(&self) -> serde_yaml::Value {
-        let mut mapping = serde_yaml::Mapping::new();
-        mapping.insert(
-            serde_yaml::Value::String("tags".to_string()),
-            serde_yaml::Value::Sequence(
-                self.tags
-                    .iter()
-                    .map(|tag| serde_yaml::Value::String(tag.clone()))
-                    .collect(),
-            ),
-        );
-        serde_yaml::Value::Mapping(mapping)
+    pub fn payload(&self) -> serde_json::Value {
+        serde_json::json!({"success": true, "tags": self.tags})
     }
 }
 
@@ -232,19 +264,35 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_through_yaml() {
-        let mut favorites = FavoriteTags::default();
-        favorites.add("A");
-        favorites.add("B");
-        let payload = favorites.to_yaml_value();
-        assert_eq!(FavoriteTags::from_yaml_value(&payload), favorites);
+    fn legacy_and_current_formats_preserve_numeric_names_and_order() {
+        for source in [
+            "- '1023'\n- Zulu\n- '2'\n- Zulu\n",
+            "tags: ['1023', Zulu, '2', Zulu]\n",
+        ] {
+            let mut favorites: FavoriteTags = serde_yaml::from_str(source).unwrap();
+            assert_eq!(favorites.tags, ["1023", "Zulu", "2"]);
+            favorites.add("New");
+            let saved = serde_yaml::to_string(&favorites).unwrap();
+            assert_eq!(serde_yaml::from_str::<FavoriteTags>(&saved).unwrap(), favorites);
+            let json = serde_json::to_string(&favorites).unwrap();
+            assert_eq!(serde_json::from_str::<FavoriteTags>(&json).unwrap(), favorites);
+        }
     }
 
     #[test]
-    fn reads_the_legacy_mapping_shape() {
-        let value: serde_yaml::Value =
-            serde_yaml::from_str("tags:\n  - A\n  - B\n").unwrap();
-        let favorites = FavoriteTags::from_yaml_value(&value);
-        assert_eq!(favorites.tags, vec!["A".to_string(), "B".to_string()]);
+    fn malformed_favorites_are_not_replaced_with_an_empty_state() {
+        for source in ["tags: invalid", "unexpected: [A]", "- {tag: A}"] {
+            assert!(serde_yaml::from_str::<FavoriteTags>(source).is_err());
+        }
+        let legacy: FavoriteTags = serde_json::from_str(r#"["1023","Zulu","2"]"#).unwrap();
+        assert_eq!(legacy.tags, ["1023", "Zulu", "2"]);
+    }
+
+    #[test]
+    fn invalid_actions_and_tags_do_not_reach_mutation() {
+        for source in [r#"{"action":"unknown","tags":["New"]}"#, r#"{"tags":["-invalid"]}"#] {
+            let request: FavoriteTagsRequest = serde_json::from_str(source).unwrap();
+            assert!(request.validate().is_err());
+        }
     }
 }

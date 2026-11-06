@@ -48,6 +48,16 @@ let themeSaveTail = Promise.resolve();
 let acknowledgedTheme = null;
 let themeReadGeneration = 0;
 let themePendingSaves = 0;
+let tagSortGeneration = 0;
+let tagSortReadGeneration = 0;
+let tagSortRefreshRequired = false;
+let tagSortPendingSaves = 0;
+let tagSortSaveTail = Promise.resolve();
+let acknowledgedTagSortOrder = null;
+let favoriteReadGeneration = 0;
+let favoriteSaveTail = Promise.resolve();
+let favoritePendingSaves = 0;
+let favoriteRefreshRequired = false;
 const hiddenSuggestionFields = {
   tags: { suggestions: [] },
   authors: { suggestions: [] },
@@ -1791,8 +1801,9 @@ async function addFavoriteTagFromInput() {
   if (!input) return;
   const tags = splitTagInput(input.value);
   if (tags.length === 0) return;
-  await setFavoriteTags({ action: 'add', tags });
-  showNotification(`「${tags.join('」「')}」をお気に入りに登録しました`, 'success');
+  if (await setFavoriteTags({ action: 'add', tags })) {
+    showNotification(`「${tags.join('」「')}」をお気に入りに登録しました`, 'success');
+  }
 }
 
 function renderTagSuggestions() {
@@ -2209,47 +2220,101 @@ export function syncTagSortOrderSelect() {
   const label = select.closest('.tag-sort-order')?.querySelector('label');
   if (label) label.textContent = t('tagSortOrderLabel');
 }
+export function captureTagSortRead() {
+  if (tagSortPendingSaves) tagSortRefreshRequired = true;
+  return { writes: tagSortGeneration, reads: ++tagSortReadGeneration };
+}
+
+export function applyTagSortOrder(value, generation = captureTagSortRead()) {
+  if (tagSortPendingSaves) {
+    tagSortRefreshRequired = true;
+    return;
+  }
+  if (generation.writes !== tagSortGeneration || generation.reads !== tagSortReadGeneration) return;
+  tagSortRefreshRequired = false;
+  acknowledgedTagSortOrder = value;
+  State.tagSortOrder = value;
+  syncTagSortOrderSelect();
+}
+
 
 // 並び順を変えたら保存してタグ一覧を取り直す。
 async function saveTagSortOrder(value) {
-  const previous = State.tagSortOrder;
+  const generation = ++tagSortGeneration;
+  if (acknowledgedTagSortOrder === null) acknowledgedTagSortOrder = State.tagSortOrder;
+  tagSortPendingSaves++;
   State.tagSortOrder = value;
   syncTagSortOrderSelect();
-  try {
+  const save = tagSortSaveTail.catch(() => {}).then(async () => {
     const result = await postJson('/api/global_setting', {
       settings: { 'webui.tag-sort-order': value },
     });
     assertApiSuccess(result, '並び順の保存に失敗しました');
-    await refreshTags();
+    acknowledgedTagSortOrder = value;
+  });
+  tagSortSaveTail = save;
+  try {
+    await save;
   } catch (error) {
-    State.tagSortOrder = previous;
-    syncTagSortOrderSelect();
     showNotification(error.message || '並び順の保存に失敗しました', 'error');
+  } finally {
+    tagSortPendingSaves--;
+    if (generation === tagSortGeneration) {
+      State.tagSortOrder = acknowledgedTagSortOrder;
+      syncTagSortOrderSelect();
+      if (tagSortRefreshRequired) {
+        const read = captureTagSortRead();
+        try {
+          const config = await fetchJson('/api/webui/config?fresh=1');
+          if (config?.tag_sort_order) applyTagSortOrder(config.tag_sort_order, read);
+        } catch { /* preserve the acknowledged value; the next invalidation retries */ }
+      }
+      await refreshTags();
+    }
   }
 }
 
 // お気に入りタグの登録 / 解除を切り替える。
 async function toggleFavoriteTag(tag) {
-  const isFavorite = (State.favoriteTags || []).includes(tag);
-  await setFavoriteTags({
-    action: isFavorite ? 'remove' : 'add',
+  await setFavoriteTags(() => ({
+    action: (State.favoriteTags || []).includes(tag) ? 'remove' : 'add',
     tags: [tag],
-  });
+  }));
 }
 
 // お気に入りの登録状態を更新して一覧を描き直す。
-async function setFavoriteTags(body) {
+function setFavoriteTags(request) {
+  favoritePendingSaves++;
+  const mutation = favoriteSaveTail.then(() => saveFavoriteTags(
+    typeof request === 'function' ? request() : request,
+  )).finally(async () => {
+    favoritePendingSaves--;
+    if (!favoritePendingSaves && favoriteRefreshRequired) {
+      favoriteRefreshRequired = false;
+      await refreshFavoriteTags();
+    }
+  });
+  favoriteSaveTail = mutation.catch(() => false);
+  return mutation;
+}
+
+async function saveFavoriteTags(body) {
+  ++favoriteReadGeneration;
   try {
     const result = await postJson('/api/favorite_tags', body);
-    if (!result || result.success !== true) {
+    if (!result || result.success !== true || !Array.isArray(result.tags)) {
       showNotification(result?.message || 'お気に入りの更新に失敗しました', 'error');
-      return;
+      return false;
     }
-    State.favoriteTags = Array.isArray(result.tags) ? result.tags : [];
+    ++favoriteReadGeneration;
+    State.favoriteTags = result.tags;
     renderFavoriteTags();
     syncFavoriteStars();
+    await refreshTags();
+    return true;
   } catch (error) {
     showNotification(error.message || 'お気に入りの更新に失敗しました', 'error');
+    return false;
   }
 }
 
@@ -2265,6 +2330,7 @@ function syncFavoriteStars() {
     button.title = isFavorite
       ? `「${tag}」をお気に入りから外す`
       : `「${tag}」をお気に入りに登録する`;
+    button.setAttribute('aria-label', button.title);
   });
 }
 
@@ -2906,6 +2972,7 @@ function closeMenuStyleModal() {
 
 const refreshRequests = new Map();
 let listRefreshGeneration = 0;
+let tagListGeneration = 0;
 
 function runRefresh(key, action) {
   const existing = refreshRequests.get(key);
@@ -2995,11 +3062,14 @@ export async function refreshQueueDetailed() {
 }
 
 export async function refreshTags(redraw = true) {
+  ++tagListGeneration;
   return runRefresh('tags', async () => {
+    const generation = tagListGeneration;
     try {
       const data = await fetchJson('/api/tag_list?format=json');
-      if (data) {
-        State.tags = data.tags || [];
+      if (generation !== tagListGeneration) return;
+      if (data && Array.isArray(data.tags)) {
+        State.tags = data.tags;
         State.tagColors = data.tag_colors || data.colors || {};
         renderTagList();
         if (redraw) renderNovelList();
@@ -3010,11 +3080,18 @@ export async function refreshTags(redraw = true) {
 
 // お気に入りタグの一覧を取得する (失敗しても操作は続けられる)。
 export async function refreshFavoriteTags() {
+  if (favoritePendingSaves) {
+    favoriteRefreshRequired = true;
+    return;
+  }
+  const generation = ++favoriteReadGeneration;
   try {
     const data = await fetchJson('/api/favorite_tags');
-    if (data && data.success !== false) {
-      State.favoriteTags = Array.isArray(data.tags) ? data.tags : [];
+    if (generation !== favoriteReadGeneration) return;
+    if (data && data.success !== false && Array.isArray(data.tags)) {
+      State.favoriteTags = data.tags;
       renderFavoriteTags();
+      syncFavoriteStars();
     }
   } catch { /* keep the last successfully loaded favorites */ }
 }

@@ -28,10 +28,14 @@ import {
   refreshFavoriteTags,
   replaceConsoleHistory,
   appendConsoleHistory,
-  syncTagSortOrderSelect,
+  captureTagSortRead,
+  applyTagSortOrder,
 } from './ui/actions.js';
 
 let wsConnection = null;
+let controlStateMayBeStale = false;
+let webConfigReadGeneration = 0;
+let pendingControlRefresh = false;
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
 const CONSOLE_BOTTOM_THRESHOLD = 8;
 
@@ -58,23 +62,29 @@ async function refreshListWithUiState(redraw = true) {
 
 let pendingListRefresh = false;
 let pendingTagRefresh = false;
+let pendingFavoriteRefresh = false;
 let refreshTimer = null;
 
-function scheduleTableRefresh(includeList) {
+function scheduleTableRefresh(includeList, includeFavorites = false) {
   pendingListRefresh ||= includeList;
   pendingTagRefresh = true;
+  pendingFavoriteRefresh ||= includeFavorites;
   if (refreshTimer !== null) return;
   refreshTimer = setTimeout(async () => {
     const reloadList = pendingListRefresh;
     const reloadTags = pendingTagRefresh;
-    pendingListRefresh = pendingTagRefresh = false;
+    const reloadFavorites = pendingFavoriteRefresh;
+    pendingListRefresh = pendingTagRefresh = pendingFavoriteRefresh = false;
     await Promise.all([
       reloadList ? refreshListWithUiState(false) : null,
       reloadTags ? refreshTags(false) : null,
+      reloadFavorites ? refreshFavoriteTags() : null,
     ]);
     renderNovelList();
     refreshTimer = null;
-    if (pendingListRefresh || pendingTagRefresh) scheduleTableRefresh(pendingListRefresh);
+    if (pendingListRefresh || pendingTagRefresh || pendingFavoriteRefresh) {
+      scheduleTableRefresh(pendingListRefresh, pendingFavoriteRefresh);
+    }
   }, 50);
 }
 
@@ -111,14 +121,16 @@ async function init() {
   // 互いに独立なので直列に待たず、1 往復分の待ち時間で済ませる
   // (以前は config の応答を待ってから sort_state を投げていた)。
   const themeGeneration = captureThemeRead();
+  const tagSortGeneration = captureTagSortRead();
+  const configGeneration = ++webConfigReadGeneration;
   const [config, sortState] = await Promise.all([
     fetchJson('/api/webui/config').catch(() => null),
     fetchJson('/api/sort_state').catch(() => null),
   ]);
 
   try {
-    if (config) {
-      applyWebConfig(config, themeGeneration);
+    if (config && configGeneration === webConfigReadGeneration) {
+      applyWebConfig(config, themeGeneration, tagSortGeneration);
     }
   } catch { /* use defaults */ }
 
@@ -141,6 +153,9 @@ async function init() {
 
   // WebSocket
   connectWebSocket();
+  window.addEventListener('focus', () => {
+    if (wsConnection?.isFallbackActive()) void reloadWebConfig(true);
+  });
 
   // Periodic refresh
   const interval = Math.max(State.pollIntervalSeconds, 10) * 1000;
@@ -166,6 +181,10 @@ function connectWebSocket() {
       // 接続が確立したら履歴取得を止める。接続が切れて作り直された
       // 接続が開いたときも、前の接続が始めた履歴取得を止める。
       stopConsoleHistoryPolling();
+      if (controlStateMayBeStale) {
+        controlStateMayBeStale = false;
+        void reloadWebConfig(true);
+      }
       const con = document.getElementById('console');
       if (con) {
         con.innerHTML = '';
@@ -187,9 +206,13 @@ function connectWebSocket() {
       }
     },
     onClose: () => {
+      controlStateMayBeStale = true;
       setTimeout(connectWebSocket, 5000);
     },
-    onFallbackStart: () => startConsoleHistoryPolling(),
+    onFallbackStart: () => {
+      controlStateMayBeStale = true;
+      startConsoleHistoryPolling();
+    },
     onFallbackStop: () => stopConsoleHistoryPolling(),
   });
   wsConnection.connect();
@@ -261,7 +284,7 @@ function stripRegisterParamFromUrl() {
   }
 }
 
-function applyWebConfig(config, themeGeneration) {
+function applyWebConfig(config, themeGeneration, tagSortGeneration) {
   if (config.theme) {
     applyThemeSnapshot(normalizeTheme(config.theme), themeGeneration);
   }
@@ -283,8 +306,7 @@ function applyWebConfig(config, themeGeneration) {
   renderTagList();
   renderNovelList();
   if (config.tag_sort_order) {
-    State.tagSortOrder = config.tag_sort_order;
-    syncTagSortOrderSelect();
+    applyTagSortOrder(config.tag_sort_order, tagSortGeneration);
   }
 }
 
@@ -309,24 +331,30 @@ function mirrorConsoleToDevtools(text, targetConsole) {
   }
 }
 
-async function reloadWebConfig() {
+async function reloadWebConfig(refreshControls = false) {
+  pendingControlRefresh ||= refreshControls;
   const themeGeneration = captureThemeRead();
+  const tagSortGeneration = captureTagSortRead();
+  const generation = ++webConfigReadGeneration;
   const previousAttributeTagsEnabled = State.attributeTagsEnabled;
   const previousTagSortOrder = State.tagSortOrder;
   try {
     const config = await fetchJson('/api/webui/config?fresh=1');
+    if (generation !== webConfigReadGeneration) return;
     if (config) {
-      applyWebConfig(config, themeGeneration);
+      applyWebConfig(config, themeGeneration, tagSortGeneration);
       applyPerformanceMode();
-      // 属性タグ機能の ON/OFF はサーバー側の一覧・タグ候補にも効くので、
-      // CLI や別タブで変更された場合は取得し直す。
-      if (previousAttributeTagsEnabled !== State.attributeTagsEnabled) {
-        await Promise.all([refreshList(), refreshTags()]);
-      } else if (previousTagSortOrder !== State.tagSortOrder) {
-        await refreshTags();
-      }
     }
   } catch { /* keep current config */ }
+  if (generation !== webConfigReadGeneration) return;
+  const attributesChanged = previousAttributeTagsEnabled !== State.attributeTagsEnabled;
+  const refreshAll = pendingControlRefresh;
+  pendingControlRefresh = false;
+  await Promise.all([
+    attributesChanged ? refreshList() : null,
+    refreshAll || attributesChanged || previousTagSortOrder !== State.tagSortOrder ? refreshTags() : null,
+    refreshAll ? refreshFavoriteTags() : null,
+  ]);
 }
 
 function setConcurrencyEnabled(enabled) {
@@ -359,6 +387,9 @@ function handleWsMessage(msg) {
       break;
     case 'webui.config.reload':
       reloadWebConfig();
+      break;
+    case 'favorite_tags.reload':
+      scheduleTableRefresh(false, true);
       break;
     case 'notepad.change':
       if (msg.data) {

@@ -726,8 +726,11 @@ narou setting name         # 読み取り
 - Web UI の「タグの編集」画面でお気に入りタグを登録し、検索なしで選べるようにする
 - 保存先は在庫の `favorite_tags` キー (Native は `.narou/favorite_tags.yaml` / SQLite `app_state('inv','favorite_tags')`、Worker は D1 の同じキー)。登録順は保持する
 - 共有モデルは `src/application/favorite_tags.rs`、native のストアは `src/native/favorite_tags.rs`、Worker の D1 ストアは `worker_entry/src/favorite_tags.rs`
-- API: `GET /api/favorite_tags` (現在の登録一覧)、`POST /api/favorite_tags` (`action`: `add` / `remove` / `clear`、native は `src/web/favorite_tags.rs`、Worker は `worker_entry/src/favorite_tags.rs`)
+- API: `GET /api/favorite_tags` (現在の登録一覧)、`POST /api/favorite_tags` (`action`: `add` / `remove` / `clear` / `reorder`、native は `src/web/favorite_tags.rs`、Worker は `worker_entry/src/favorite_tags.rs`)。`reorder` は指定された既知タグの位置同士だけを入れ替え、未指定タグの位置を保持する
 - タグ色とは独立した設定。お気に入りに登録しても色は変わらず、色を変えてもお気に入りは外れない
+- 保存形式・要求の検証・操作の適用は共有モデルに集約する。旧形式のタグ配列と `{tags: [...]}` を読み、数字だけのタグ名も文字列として保持する。未知の `action` は 400、壊れた在庫は 503 とし、空の一覧で上書きしない
+- Worker の同時更新は読み取った raw snapshot に対して CAS を行い、競合時は最新状態へ同じ操作を再適用する。Native の Inventory 更新も含め、別操作で登録されたタグを失わない
+- 変更時は `favorite_tags.reload` で各画面へ通知する。ブラウザ内の保存は操作順に直列化し、保存中に届いた別画面の変更通知も最後に再取得する。お気に入り優先表示はこの登録リストの順であり、小説の ID 順ではない
 - CLI には対応コマンドが無い (Web UI 専用の設定)
 
 **タグの登録順 (issue #46 の要望、2026-10 追加)**:
@@ -884,6 +887,8 @@ narou setting name         # 読み取り
 - `download.interval` / `download.wait-steps` は実際の HTTP 送信ごとに、サイト定義の `min_interval` とともに適用する。本文受信完了・通信失敗から次の送信まで待機を確保し、リダイレクトと通信手段の切替も待機を省略しない。Worker は完了後の状態を Durable Object に保存し、待機中も設定スナップショットの有効期限までに再確認する。
 - グローバル設定は変更項目だけを初期値照合付きで保存する。整数表記になる浮動小数値も設定メタデータで照合し、実際に競合した変更は拒否する。個別 INI の更新はファイル・SQLite・D1 の原子的更新を通し、同時変更された別項目と未知項目を保持する。
 - `webui.tag-sort-order` は設定保存時の `webui.config.reload` と Native の 30 秒 watcher の監視対象に含める。開いているメイン画面は並び順の変更を検知してタグ一覧を再取得し、セレクトの値だけ更新して旧順序を残さない。設定画面・CLI・メインメニューの各経路を Native の YAML / SQLite 管理で確認する（issue #46）。
+- タグの並び順・お気に入りの連続操作は操作順に保存し、古い取得応答を破棄する。通信・保存状態の異常では最後に表示できた一覧を保持し、保存失敗を成功として通知しない。再接続と WebSocket 不通時のフォーカス復帰で設定・お気に入り・タグを再同期する（新しい定期ポーリングは追加しない）
+- Web UI 設定とタグ一覧用設定の解釈は `application::webui::config` を共有し、Native／Worker 固有の capability・並列コンソール・テキスト保存の既定値は維持する。新しいタグの色は表示用の並び替え前の共通順序で割り当てるため、お気に入りや表示順の変更で色を変えない
 - コンソール履歴の取得応答は表示世代で照合し、履歴削除や新しい行より古い応答で表示を巻き戻さない。コンソール操作と真偽値設定はキーボード操作に対応する。狭い画面の操作バーは折り返し、メニューを操作ボタンの下へ表示する。
 - コンソールのライブ出力と「History」ボタンでの再描画は同じ描画経路を使う（許可要素は `<span>` の色・太字と `<ruby>` の基底テキストだけで、履歴側に生の HTML タグを出さない）。
 - WebSocket が繋がらない環境（前段 proxy が upgrade を中継しない、`server-ws-add-accepted-domains` に現在のホストが無い、握手が保留のまま返らない）では、履歴 API の差分取得（`GET /api/history?format=json&after=<id>`）を 3 秒間隔で行ってコンソールを追い続ける。接続の待ち時間には 5 秒の上限を設け、確立できなければ履歴取得へ切り替え、確立した時点で履歴取得を止める。差分のカーソルはストリーム（`stdout` / `stdout2`）ごとに持ち、取得できたストリームだけを進める。取得は 1 つずつ行い、前の取得が終わる前に重ねない。停止後に届いた結果は描画しない。差分取得に対応しない Worker は全量の置き換えで同じ表示を保つ。
