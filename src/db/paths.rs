@@ -110,13 +110,19 @@ pub fn ensure_within_archive_root(path: &Path, root: &Path) -> Result<PathBuf> {
     let absolute_root = absolute_normalized_path(root)?;
     let canonical_root = canonical_existing_path(root)?;
     let absolute_path = absolute_normalized_path(path)?;
-    if !absolute_path.starts_with(&absolute_root) {
+    let lexical_root = if absolute_path.starts_with(&absolute_root) {
+        &absolute_root
+    } else if absolute_path.starts_with(&canonical_root) {
+        // Callers may pass the canonical path returned by an earlier check.
+        // Keep component and reparse-point checks; do not case-fold paths.
+        &canonical_root
+    } else {
         return Err(NarouError::Database(format!(
             "path escapes archive root: {}",
             path.display()
         )));
-    }
-    reject_escaping_reparse_points(&absolute_path, &absolute_root, &canonical_root)?;
+    };
+    reject_escaping_reparse_points(&absolute_path, lexical_root, &canonical_root)?;
     if absolute_path.exists() {
         let canonical_path = canonical_existing_path(&absolute_path)?;
         if !canonical_path.starts_with(&canonical_root) {
@@ -364,6 +370,23 @@ mod tests {
 
         assert!(resolved.is_absolute());
         assert!(resolved.starts_with(&canonical_root));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_paths_remain_valid_under_a_case_aliased_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("ArchiveRoot")).unwrap();
+        let root = temp.path().join("archiveroot");
+        for existing in [false, true] {
+            let candidate = root.join("novel").join("toc.yaml");
+            if existing {
+                std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+                std::fs::write(&candidate, b"title: fixture").unwrap();
+            }
+            let canonical = ensure_within_archive_root(&candidate, &root).unwrap();
+            assert_eq!(ensure_within_archive_root(&canonical, &root).unwrap(), canonical);
+        }
     }
 
     #[test]

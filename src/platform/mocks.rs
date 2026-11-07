@@ -399,25 +399,8 @@ impl NovelRepository for MemoryNovelRepository {
     }
 
     fn query<'a>(&'a self, query: &'a NovelQuery) -> PlatformFuture<'a, Result<Vec<NovelRecord>>> {
-        let query = query.clone();
         Box::pin(async move {
-            let mut records: Vec<NovelRecord> = self
-                .records
-                .lock()
-                .values()
-                .filter(|r| crate::platform::repository::record_matches_filter(r, &query.filter))
-                .cloned()
-                .collect();
-            records.sort_by(|a, b| {
-                crate::platform::repository::compare_records_by_sort_key(a, b, query.sort.key)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
-            if query.sort.reverse {
-                records.reverse();
-            }
-            let start = query.offset.min(records.len());
-            let end = (start + query.limit).min(records.len());
-            Ok(records[start..end].to_vec())
+            Ok(crate::platform::repository::query_records(self.records.lock().values(), query))
         })
     }
 

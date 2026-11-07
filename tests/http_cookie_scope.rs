@@ -218,3 +218,110 @@ cookie_session: true
     server.join().unwrap();
     foreign.join().unwrap();
 }
+
+#[tokio::test]
+async fn downloader_reuses_the_probe_session_for_yaml_form_requests() {
+    use narou_rs::downloader::{Downloader, DownloaderPlatform};
+    use narou_rs::downloader::settings::WorkerDownloaderSettings;
+    use narou_rs::platform::mocks::{MemoryNovelRepository, MemoryObjectStore};
+    use narou_rs::platform::{NovelObjectKeys, NovelRepository, ObjectStore, SystemClock};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    struct FixtureHttp { inner: LocalHttp, port: u16 }
+    impl HttpClient for FixtureHttp {
+        fn send<'a>(&'a self, mut request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
+            let path = request.url.strip_prefix("http://example.com").unwrap();
+            request.url = format!("http://127.0.0.1:{}{path}", self.port);
+            self.inner.send(request)
+        }
+        fn validate_url<'a>(&'a self, url: &'a str) -> PlatformFuture<'a, Result<()>> {
+            self.inner.validate_url(url)
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let finished = Arc::new(AtomicBool::new(false));
+    let server_finished = finished.clone();
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !server_finished.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            let request = request_head(&mut stream);
+            let (status, body, extra) = if request.starts_with("GET /n1234ab/ ") {
+                (200, "form shell", "Set-Cookie: csrf-session=canary; Path=/; HttpOnly\r\n")
+            } else if request.starts_with("POST /reader/toc ") {
+                if header(&request, "Cookie") == Some("csrf-session=canary") {
+                    (200, r#"<h1>Session book</h1><span>Author</span><a href="/n1234ab/1/">First</a>"#, "")
+                } else {
+                    (419, "session missing", "")
+                }
+            } else if request.starts_with("GET /n1234ab/1/ ") {
+                (200, r#"<div class="body">Saved body</div>"#, "")
+            } else {
+                (404, "unknown request", "")
+            };
+            stream.write_all(format!(
+                "HTTP/1.1 {status} OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+            ).as_bytes()).unwrap();
+        }
+    });
+    let setting = SiteSetting::load_bundled(&[r#"
+name: Session fixture
+sitename: Session fixture
+domain: example.com
+top_url: http://example.com
+url: 'http://example\.com/(?<ncode>n\d+[a-z]+)/?'
+toc_url: 'http://example.com/\k<ncode>/'
+cookie_session: true
+subtitles: '<a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+preprocess: |-
+  guard "Preprocessed"
+  if url == "http://example.com/n1234ab/"
+    let toc = post_form("http://example.com/reader/toc", [["token", "canary"]])
+    if toc != null
+      emit "Preprocessed"
+      emit toc
+      insert_at_match
+    end
+  end
+"#]).unwrap().remove(0);
+
+    let novels = Arc::new(MemoryNovelRepository::new());
+    let objects = Arc::new(MemoryObjectStore::new());
+    let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+        DownloaderPlatform {
+            http: Arc::new(FixtureHttp { inner: LocalHttp::new(), port }),
+            rate_limiter: Arc::new(FakeRateLimiter::new()),
+            novels: novels.clone(), objects: objects.clone(), assets: objects.clone(),
+            clock: Arc::new(SystemClock),
+        },
+        vec![setting], Default::default(), Arc::new(WorkerDownloaderSettings),
+    ).unwrap();
+    let result = downloader.download_novel_with_execution_options("http://example.com/n1234ab/",
+        narou_rs::downloader::DownloadExecutionOptions {
+            force: false, budget: None, resume_from_section: None,
+        },
+    ).await;
+    finished.store(true, Ordering::Release);
+    server.join().unwrap();
+    result.unwrap();
+    let record = novels.find_by_toc_url("http://example.com/n1234ab/").await.unwrap().unwrap();
+    assert_eq!(record.title, "Session book");
+    let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).unwrap();
+    let section = objects.read_small(&keys.section("1", "First")).await.unwrap().unwrap();
+    let section: serde_yaml::Value = serde_yaml::from_slice(&section).unwrap();
+    assert_eq!(section["element"]["body"].as_str(), Some("Saved body"));
+}

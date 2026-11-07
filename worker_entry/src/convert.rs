@@ -4,15 +4,10 @@
 //! 書く。native の `convert_novel_by_id` が書く固定名ミラーと同じキーなので、
 //! 続けて `download.epub` がそのまま配信できる（外部プロセスは使わない）。
 
-use std::sync::Arc;
-
 use narou_rs::application::convert::{
     ConvertItemReport, ConvertService, ConvertedNovel, emit_convert_item_lines,
 };
 use narou_rs::application::jobs::{JobFailureClass, JobPlan, JobTarget, classify_failure};
-use narou_rs::converter::ConverterCapabilities;
-use narou_rs::downloader::http_policy::FetchPolicy;
-use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::NovelMutation;
 use worker::console_log;
@@ -142,13 +137,24 @@ async fn convert(
         return Ok(None);
     };
 
-    let service = convert_service(runtime, &record);
+    let service = ConvertService::new(runtime.objects(), runtime.assets(), runtime.settings_store());
     // `convert.keep-txt=false` では変換済みテキストを保存しない
     // (EPUB のダウンロード時に組み立て直す。CPU と引き換えに D1 を節約する)。
-    let converted = if keep_converted_text(runtime).await {
+    let keep_text = keep_converted_text(runtime).await;
+    let converted = if record.ncode.as_deref().is_some_and(narou_rs::virtual_novel::is_virtual_ncode) {
+        let persistence = narou_rs::downloader::persistence::PersistenceService::new(
+            runtime.objects(), runtime.assets(),
+        );
+        let book = crate::virtual_novels::load_book(
+            runtime.write_db(), &record, runtime.novels.as_ref(), &persistence,
+        ).await?;
+        service.convert_prepared(&record, book.toc, book.sections, keep_text).await?
+    } else if keep_text {
         service.convert_and_store(&record).await?
     } else {
-        let converted = service.convert_only(&record).await?;
+        service.convert_only(&record).await?
+    };
+    if !keep_text {
         // 以前に変換済みテキストが残っていれば掃除する
         // (`convert.keep-txt=false` は何も保存しない構成)。
         if let Ok(keys) = narou_rs::platform::NovelObjectKeys::new(
@@ -158,55 +164,10 @@ async fn convert(
         ) {
             let _ = runtime.objects().delete(&keys.converted_text()).await;
         }
-        converted
-    };
+    }
     Ok(Some(converted))
 }
 
-/// 変換テキストだけを組み立てる (保存しない)。
-///
-/// 変換済みテキストを保存しない構成で、EPUB のダウンロード時に使う。
-pub(crate) async fn convert_text_only(
-    runtime: &WorkerRuntime,
-    record: &narou_rs::db::NovelRecord,
-) -> Result<String> {
-    let service = convert_service(runtime, record);
-    service
-        .convert_only(record)
-        .await
-        .map(|converted| converted.text)
-}
-
-/// 1 小説ぶんの ConverterCapabilities を組む。
-///
-/// native の CLI 変換と同じく、挿絵のローカライズ能力は渡さない
-/// (`native::converter::native_capabilities` も assets/objects を None にする)。
-/// 挿絵を取るリクエストはサイト定義のヘッダが要る (i.pximg.net は Referer
-/// 無しを 403 で弾く)。`fetch_policy` は対象小説のサイトのもの、
-/// `fetch_policy_resolver` は native と同じ レコード→サイト定義→policy
-/// 解決 (`FetchPolicy::for_record`) で、小説ごとの切替に対応する。
-fn convert_service(runtime: &WorkerRuntime, record: &narou_rs::db::NovelRecord) -> ConvertService {
-    let site_settings: Arc<[SiteSetting]> = runtime.site_settings().into();
-    let capabilities = ConverterCapabilities {
-        http: runtime.http_client(),
-        rate_limiter: runtime.rate_limiter(),
-        fetch_policy: FetchPolicy::for_record(&site_settings, record),
-        assets: None,
-        objects: None,
-        illustration_index: None,
-        illustration_prefix: None,
-        novel_record_resolver: None,
-        fetch_policy_resolver: Some(Arc::new(move |record| {
-            FetchPolicy::for_record(&site_settings, record)
-        })),
-    };
-    ConvertService::new(
-        runtime.objects(),
-        runtime.assets(),
-        runtime.settings_store(),
-    )
-    .with_capabilities(capabilities)
-}
 
 /// 変換済みテキストを保存するか (`convert.keep-txt`)。
 ///

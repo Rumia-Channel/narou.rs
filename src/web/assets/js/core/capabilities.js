@@ -35,7 +35,7 @@ export function markActionCapability(element, action) {
   }
   element.dataset.capabilityBlocked = String(!supported);
   if (!supported) {
-    if (!element.dataset.capabilityTitle) element.dataset.capabilityTitle = element.title || '';
+    if (element.dataset.capabilityTitle === undefined) element.dataset.capabilityTitle = element.title || '';
     element.title = 'この環境では利用できません';
     if (element.type === 'checkbox') element.checked = false;
   } else if (element.dataset.capabilityTitle !== undefined) {

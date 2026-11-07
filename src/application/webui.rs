@@ -10,6 +10,7 @@ use crate::db::{NovelRecord, compare_records_by_key, sort_keys};
 
 pub mod author_comments;
 pub mod capabilities;
+pub mod config;
 pub mod diff;
 pub mod feature_tour;
 pub mod mutations;

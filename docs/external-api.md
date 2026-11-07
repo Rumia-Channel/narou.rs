@@ -47,6 +47,9 @@ Workers 環境では Access の Service Token は CI 経由で secret として�
 `records_filtered` / `offset` / `limit` / `data`)。`jsonl` は 1 行 1
 作品、`xml` は `<novels>` の下に `<novel>` が並ぶ。
 
+未知の `format` はどのデータ取得エンドポイントでも 400 になる。
+タグ一覧の `jsonl` は 1 行 1 タグ、配列の `xml` は必ず 1 つのルート要素に包む。
+
 ## エンドポイント
 
 | メソッド | パス | 内容 |
@@ -61,9 +64,11 @@ Workers 環境では Access の Service Token は CI 経由で secret として�
 | GET | `/api/v1/tags` | タグと使用数 |
 | POST | `/api/v1/mcp` | MCP (JSON-RPC 2.0) |
 
-エラーは `{"error": {"code": "...", "message": "..."}}` で返す
-(`authentication_required` / `bad_request` / `not_found` /
-`internal_error`)。
+エラーは出力形式に関係なく `{"error": {"code": "...", "message": "..."}}`
+で返す。入力不正は 400 (`bad_request`)、作品・目次・本文の欠落は
+404 (`not_found`)、状態競合は 409 (`conflict`)、保存データの破損や
+ストレージ障害は 500 (`internal_error`)。未認証は 401
+(`authentication_required`)。Native／Workers で同じ対応を使う。
 
 ## 一覧の絞り込み
 
@@ -82,7 +87,7 @@ Workers 環境では Access の Service Token は CI 経由で secret として�
 | `virtual` | バーチャル小説の扱い (下記) |
 | `sort` | 並び順 (`id` / `last_update` / `general_lastup` / `title` / `author` / `sitename` / `length` / `general_all_no` など) |
 | `order` | `asc` (既定) / `desc` |
-| `offset` | 開始位置 (既定 0) |
+| `offset` | 0 以上の開始位置 (既定 0)。`limit=all` と併用でき、末尾以降は空の一覧 |
 | `limit` | 件数上限 (既定 100、上限 10000)。`limit=all` または `limit=0` で無制限 |
 
 ### バーチャル小説の扱い
@@ -104,9 +109,14 @@ Workers 環境では Access の Service Token は CI 経由で secret として�
   `メンバーID:話番号` (`"12:3"`)。
 - 本文は `body` (HTML) / `introduction` / `postscript` / `data_type` を返す。
   変換済みの青空文庫テキストではない。
-- EPUB は保存済みのファイルを返し、無ければその場で生成する
-  (`lite` ビルド / 外部 AozoraEpub3)。バーチャル小説の ID を渡すと、
-  メンバーの目次と本文を結合した EPUB を返す (native と Worker で同じ)。
+- 全話取得は目次にある本文をすべて読み出せた場合だけ成功する。
+  1 話でも欠落・破損していれば上記のエラーを返し、欠けた話を飛ばした
+  部分的な本文を 200 として返さない。
+- 通常作品の EPUB は native では保存済みのファイルを返し、無ければその場で
+  生成する (`lite` ビルド / 外部 AozoraEpub3)。Worker は都度生成する。
+  バーチャル小説は native・Worker とも、現在のメンバーの目次・本文・挿絵を
+  登録順に結合し、仮想小説自身の変換設定で毎回生成する。保存済みの結合 EPUB
+  でメンバー変更を隠さないため、通常作品のファイルキャッシュは使わない。
   Content-Type は `application/epub+zip`。
 
 ## MCP

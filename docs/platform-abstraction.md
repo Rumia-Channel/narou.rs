@@ -452,6 +452,7 @@ Worker (worker_entry)
 - Cronはplannerに限定し、D1をbounded pageで走査して個別Update jobをenqueueする。Cron発火時刻をgenerationとして保存せず、D1が管理する論理generationとkeyset cursorをplanner lease付きで再開する。
 - Worker crawler は話の開始前と未取得画像の直前で実行予算を確認する。画像取得中の中断では挿絵索引を保存し、section 単位の checkpoint は未完了の話を指す。次回 claim 時に checkpoint の job/novel identity を検証し、完了した話の prefix を ObjectStore から復元する。同じ話の保存済み画像は索引で読み飛ばして残りを取得する。prefix が欠損する場合は section 0 から安全に再開する。
 - Budget による話・画像境界の yield は失敗 retry ではない。checkpoint を D1 へ保存して job を `pending` へ戻し、同じ job の新しい v2 envelope を Queue へ送信し、送信成功後に現在 message を ack する。正常経路では `attempts` と Queue retry 回数を消費しない。送信後 ack 前のクラッシュは通常の再配信に任せ、lease/dedupe で二重実行を防ぐ。
+- 継続通知の送信は既存 job ID の envelope 再送だけとし、台帳への新規 enqueue は行わない。yield の記録と送信の間に clear/cancel が入っても tombstone を保持し、別 ID の実行を作らない。滞留回収は `attempts > max_retries` だけを上限超過と扱い、初回を含む失敗回数と追加 retry の回数を混同しない。
 - HTTP 等の通常の retryable エラーも最新の話境界を保存してから失敗記録へ進む。境界は 100 話未満でも保持し、非同期の定期保存を回収してから execution token で fenced な最終書込みを await する。予算による yield とは区別し、通常の attempts / retry-backoff を消費する。破損 prefix から再開始するときも旧保存を回収し、位置 0 と同じ実行文脈を以後のダウンローダへ渡す。本文に続いて dirty な挿絵索引も通常エラー時に保存するため、再試行は保存済みデータを再利用できる。
 - `Convert` / `Send` / `Mail` / `Backup` の重いnative処理はWorkerで実行せず、blockedとしてledgerへ記録する。Worker APIは既存read APIと分離し、認証・binding readiness・失敗分類を明示する。
 

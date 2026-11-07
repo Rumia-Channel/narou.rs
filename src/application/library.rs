@@ -396,19 +396,30 @@ impl LibraryService {
         start: usize,
         length: Option<usize>,
     ) -> Result<(u64, u64, Vec<NovelRecord>), ApplicationError> {
-        let (records_total, records_filtered, records) = futures::future::try_join3(
-            self.novels.count(&NovelFilter::all()),
-            self.novels.count(&filter),
-            self.novels.query(&NovelQuery::page(
-                filter.clone(),
-                sort,
-                start,
-                length.unwrap_or(usize::MAX),
-            )),
-        )
-        .await
-        .map_err(ApplicationError::platform)?;
-        Ok((records_total, records_filtered, records))
+        let unrestricted = filter.is_unrestricted();
+        let query = NovelQuery::page(filter.clone(), sort, start, length.unwrap_or(usize::MAX));
+        let records = self.novels.query(&query);
+        if start == 0 && length.is_none() {
+            if unrestricted {
+                let records = records.await.map_err(ApplicationError::platform)?;
+                let count = records.len() as u64;
+                return Ok((count, count, records));
+            }
+            let (total, records) = futures::future::try_join(
+                self.novels.count(&NovelFilter::all()), records,
+            ).await.map_err(ApplicationError::platform)?;
+            return Ok((total, records.len() as u64, records));
+        }
+        if unrestricted {
+            let (count, records) = futures::future::try_join(
+                self.novels.count(&NovelFilter::all()), records,
+            ).await.map_err(ApplicationError::platform)?;
+            return Ok((count, count, records));
+        }
+        let (total, filtered, records) = futures::future::try_join3(
+            self.novels.count(&NovelFilter::all()), self.novels.count(&filter), records,
+        ).await.map_err(ApplicationError::platform)?;
+        Ok((total, filtered, records))
     }
 
     /// Build the typed filter for a search string.
@@ -868,12 +879,39 @@ mod tests {
         let repo = Arc::new(MemoryNovelRepository::from_records(records));
         let service = service(repo, Arc::new(FakeClock::default()));
 
-        let page = futures::executor::block_on(service.list(&request(None, 1, Some(2)))).unwrap();
-        assert_eq!(page.records_total, 5);
-        assert_eq!(page.records_filtered, 5);
-        assert_eq!(page.data.len(), 2);
-        assert_eq!(page.data[0].id, 2);
-        assert_eq!(page.data[1].id, 3);
+        for (start, length, expected) in [
+            (1, Some(2), vec![2, 3]), (0, None, vec![1, 2, 3, 4, 5]),
+            (1, None, vec![2, 3, 4, 5]), (0, Some(0), vec![]), (usize::MAX, None, vec![]),
+        ] {
+            let page = futures::executor::block_on(service.list(&request(None, start, length))).unwrap();
+            assert_eq!(page.records_total, 5);
+            assert_eq!(page.records_filtered, 5);
+            assert_eq!(page.data.iter().map(|record| record.id).collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test]
+    fn list_record_totals_do_not_ignore_selectors_or_hidden_members() {
+        let service = service(
+            Arc::new(MemoryNovelRepository::from_records((1..=5).map(sample_record).collect())),
+            Arc::new(FakeClock::default()),
+        );
+        for (filter, expected) in [
+            (NovelFilter { ids: Some(Vec::new()), ..Default::default() }, vec![]),
+            (NovelFilter { exclude_ids: vec![1, 3], ..Default::default() }, vec![2, 4, 5]),
+            (NovelFilter { exclude_authors: vec!["author".into()], ..Default::default() }, vec![]),
+            (NovelFilter { keyword: Some("missing".into()), ..Default::default() }, vec![]),
+        ] {
+            for length in [None, Some(10), Some(0)] {
+                let (total, filtered, records) = futures::executor::block_on(service.list_records(
+                    filter.clone(), NovelSort::default(), 0, length,
+                )).unwrap();
+                assert_eq!(total, 5);
+                assert_eq!(filtered, expected.len() as u64);
+                let ids: Vec<_> = records.iter().map(|record| record.id).collect();
+                if length == Some(0) { assert!(ids.is_empty()); } else { assert_eq!(ids, expected); }
+            }
+        }
     }
 
     #[test]

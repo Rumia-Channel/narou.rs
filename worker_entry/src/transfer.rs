@@ -59,7 +59,8 @@ use narou_rs::platform::{
 };
 use narou_rs::transfer::{
     ArchiveFile, ArchiveManifest, ArchiveNovel, ConflictPolicy, ExistingNovel, FORMAT_VERSION,
-    ImportAction, MAX_ARCHIVE_BYTES, ParsedNovel, build_archive, parse_archive, plan_import,
+    ImportAction, MAX_ARCHIVE_BYTES, ParsedNovel, build_archive, flag_value, import_payload,
+    is_zip_content_type, parse_archive, parse_ids, plan_import,
 };
 use worker::{Env, Method, Request, Response, console_log};
 
@@ -346,7 +347,7 @@ async fn import(mut req: Request, env: Env) -> worker::Result<Response> {
     if let Some(response) = crate::auth_failure(&req, &env).await {
         return response;
     }
-    if !is_zip_content_type(&req) {
+    if !request_is_zip(&req) {
         return import_error(
             415,
             "Content-Type は application/zip を指定してください".to_string(),
@@ -1040,66 +1041,12 @@ fn is_excluded_file_name(path: &str) -> bool {
 // request parsing / responses
 // ---------------------------------------------------------------------------
 
-/// Parses `ids=1,2,3`. An omitted or empty value is rejected: exporting the
-/// whole library by accident is not a useful default for a download endpoint.
-fn parse_ids(value: Option<&str>) -> Result<Vec<i64>, String> {
-    let Some(value) = value else {
-        return Err("ids を指定してください (例: /api/transfer/export?ids=1,2)".to_string());
-    };
-    let mut ids = Vec::new();
-    for part in value.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let id = part
-            .parse::<i64>()
-            .map_err(|_| format!("不正な ID です: {part:?}"))?;
-        if id < 0 {
-            return Err(format!("不正な ID です: {part:?}"));
-        }
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-    }
-    if ids.is_empty() {
-        return Err("ids を指定してください (例: /api/transfer/export?ids=1,2)".to_string());
-    }
-    Ok(ids)
-}
-
-fn flag_value(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim),
-        Some("1" | "true" | "TRUE" | "True" | "yes" | "on")
-    )
-}
-
-/// Accepted upload media types (native parity).
-fn is_zip_content_type(req: &Request) -> bool {
+/// リクエストの `Content-Type` が ZIP として受け付けるメディア型か。
+fn request_is_zip(req: &Request) -> bool {
     let Ok(Some(value)) = req.headers().get("content-type") else {
         return false;
     };
-    let value = value.split(';').next().unwrap_or("").trim();
-    value.eq_ignore_ascii_case("application/zip")
-        || value.eq_ignore_ascii_case("application/x-zip-compressed")
-        || value.eq_ignore_ascii_case("application/octet-stream")
-}
-
-fn import_payload(
-    success: bool,
-    created: usize,
-    overwritten: usize,
-    skipped: usize,
-    errors: Vec<String>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "success": success,
-        "created": created,
-        "overwritten": overwritten,
-        "skipped": skipped,
-        "errors": errors,
-    })
+    is_zip_content_type(&value)
 }
 
 fn import_error(status: u16, message: String) -> worker::Result<Response> {
@@ -1144,16 +1091,6 @@ mod tests {
         assert_eq!(extract_ncode("https://example.com/1234ab/"), None);
         assert_eq!(extract_ncode("https://example.com/n1234/"), None);
         assert_eq!(extract_ncode("https://example.com/n1234abx1/"), None);
-    }
-
-    #[test]
-    fn parse_ids_rejects_empty_and_negative_values() {
-        assert_eq!(parse_ids(Some("1,2, 3")).unwrap(), vec![1, 2, 3]);
-        assert_eq!(parse_ids(Some("2,2")).unwrap(), vec![2]);
-        assert!(parse_ids(None).is_err());
-        assert!(parse_ids(Some("")).is_err());
-        assert!(parse_ids(Some("1,x")).is_err());
-        assert!(parse_ids(Some("-1")).is_err());
     }
 
     #[test]

@@ -49,8 +49,8 @@ use crate::downloader::site_setting;
 use crate::downloader::types::TocFile;
 use crate::downloader::util::{load_length_limit, sanitize_filename_with_limit};
 use crate::error::{NarouError, Result};
+use crate::native::materialization::block_on;
 use crate::native::novel_repository::NativeNovelRepository;
-use crate::native::object_store::NativeStore;
 use crate::platform::{AssetStream, NovelFilter, NovelId, NovelMutation, ObjectKey};
 use crate::transfer::{
     ArchiveFile, ArchiveManifest, ArchiveNovel, ConflictPolicy, ExistingNovel, FORMAT_VERSION,
@@ -132,16 +132,8 @@ pub fn export_archive_bytes(ids: &[i64]) -> Result<ExportResult> {
         let novel_dir = db::existing_novel_dir_for_record(&archive_root, &record);
         ensure_exportable(&archive_root, &novel_dir)?;
 
-        // DB-only storage has no files on disk: materialise the stored objects
-        // for the duration of the read. The guards remove only what they wrote.
-        let store = NativeStore::for_current_root()?;
-        let materialized_files = store.materialize_novel_files(&novel_dir)?;
-        let materialized_illustrations =
-            crate::native::illustrations::materialize_blocking(&novel_dir)?;
-
-        let files = collect_novel_files(&novel_dir)?;
-        drop(materialized_illustrations);
-        drop(materialized_files);
+        let snapshot = crate::native::materialization::snapshot(&novel_dir)?;
+        let files = collect_novel_files(snapshot.path())?;
 
         if !files.iter().any(|file| file.path == TOC_FILE) {
             return Err(NarouError::NotFound(format!(
@@ -194,12 +186,10 @@ pub fn export_archive_stream(
             .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
         let novel_dir = db::existing_novel_dir_for_record(&archive_root, &record);
         ensure_exportable(&archive_root, &novel_dir)?;
-        let store = NativeStore::for_current_root()?;
-        let _files = store.materialize_novel_files(&novel_dir)?;
-        let _illustrations = crate::native::illustrations::materialize_blocking(&novel_dir)?;
-        let toc = fs::read(novel_dir.join(TOC_FILE))?;
+        let snapshot = crate::native::materialization::snapshot(&novel_dir)?;
+        let toc = fs::read(snapshot.path().join(TOC_FILE))?;
         writer.begin_novel(archive_novel_from_record(&record, Vec::new(), parse_toc_story(&toc)))?;
-        collect_files_into(&novel_dir, &novel_dir, &mut |relative, path| {
+        collect_files_into(snapshot.path(), snapshot.path(), &mut |relative, path| {
             let bytes = fs::read(path)?;
             writer.add_file(relative, &bytes)?;
             emit_archive_buffer(&sink, emit, &mut transferred)?;
@@ -848,7 +838,7 @@ fn write_novel_files(
         writes.push((key, bytes.clone()));
     }
 
-    block_on_transfer(async move {
+    block_on(async move {
         for (key, bytes) in writes {
             let stream: AssetStream = Box::pin(futures::stream::once(async move { Ok(bytes) }));
             stores.assets.write_stream(&key, stream).await?;
@@ -866,39 +856,6 @@ fn safe_join(base: &Path, relative: &str) -> Result<PathBuf> {
     Ok(base.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)))
 }
 
-/// Drives an object-store write from synchronous CLI/Web code.
-///
-/// The store futures use `tokio::fs`/`spawn_blocking`, which need a runtime.
-/// Inside one (the Web API runs the import on `spawn_blocking`) a fresh runtime
-/// is built on a scoped thread, mirroring
-/// [`crate::native::illustrations::materialize_blocking`]; the CLI has no
-/// runtime and builds one directly.
-fn block_on_transfer<F>(future: F) -> Result<()>
-where
-    F: std::future::Future<Output = Result<()>> + Send,
-{
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .spawn_scoped(scope, move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| NarouError::Platform(error.to_string()))?;
-                    runtime.block_on(future)
-                })
-                .map_err(|error| NarouError::Platform(error.to_string()))?
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-        })
-    } else {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| NarouError::Platform(error.to_string()))?;
-        runtime.block_on(future)
-    }
-}
 
 /// Best-effort cleanup of a partially written new novel directory.
 ///
@@ -913,7 +870,7 @@ fn remove_written_files(archive_root: &Path, novel_dir: &Path, files: &[(String,
             crate::native::object_store::object_key_for_file(archive_root, &target)
         })
         .collect();
-    let _ = block_on_transfer(async move {
+    let _ = block_on(async move {
         let stores = crate::native::object_store::NativeStores::for_current_root()?;
         for key in keys {
             stores.objects.delete(&key).await?;

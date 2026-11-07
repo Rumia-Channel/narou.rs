@@ -244,6 +244,7 @@ async fn sorted_update_all_ids(
         .records()
         .await
         .unwrap_or_default();
+    records.retain(|record| !narou_rs::virtual_novel::is_virtual_record(record));
     sort_records(&mut records, sort_state);
     records.into_iter().map(|record| record.id).collect()
 }
@@ -290,15 +291,15 @@ async fn resolve_convert_target_to_id(
 }
 
 /// `commands/update.rs::resolve_target_to_id` (update 用): alias→id→URL→ncode→
-/// title/ncode の順で `expand_tag_targets` 後の文字列を既存レコード id に
-/// する。解決できないターゲットは native 同様に落とす (`unresolved_count`)。
+/// title/ncode の順で `expand_tag_targets` 後の文字列を既存レコードに
+/// する。ID と作品種別を同時に使い、見つからない対象は `unresolved_count` へ残す。
 /// 探索順・URL の厳格な captures は `TargetLookupPlan::UPDATE` が唯一の定義。
-async fn resolve_update_target_to_id(
+async fn resolve_update_target(
     runtime: &WorkerRuntime,
     aliases: &HashMap<String, String>,
     site_settings: &[SiteSetting],
     target: &str,
-) -> Option<i64> {
+) -> Option<narou_rs::db::NovelRecord> {
     let library = &runtime.write_services().library;
     library
         .resolve_target(
@@ -310,14 +311,12 @@ async fn resolve_update_target_to_id(
         .await
         .ok()
         .flatten()
-        .map(|record| record.id)
 }
 
 /// 別名が無く、存在が確定している数値ターゲットの id。
 ///
-/// `resolve_update_target_to_id` / `resolve_convert_target_to_id` の数値分岐は
-/// 「別名解決 → `library.get` → 存在すれば Some(id)」なので、その存在が
-/// 事前の 1 クエリ (`records_by_ids`) で分かっている場合は `get` を省ける。
+/// 通常の解決の数値分岐は「別名解決 → `library.get`」なので、存在が事前の
+/// 1 クエリ (`records_by_ids`) で分かっている場合は `get` を省ける。
 /// 別名があるときは native 同様エイリアス先を解決するため `None` を返し、
 /// 通常の解決に落とす。
 fn numeric_target_id(
@@ -406,6 +405,10 @@ async fn api_update(
         );
         let existing_numeric: HashSet<i64> =
             records.iter().map(|record| record.id).collect();
+        let virtual_numeric: HashSet<i64> = records.iter()
+            .filter(|record| narou_rs::virtual_novel::is_virtual_record(record))
+            .map(|record| record.id)
+            .collect();
         let sorted = sort_numeric_targets_for_state(&sort_state, &records, &targets);
         let expanded = narou_rs::application::target_lookup::expand_tag_targets(
             &runtime.write_services().library,
@@ -430,22 +433,22 @@ async fn api_update(
         let mut resolved = Vec::new();
         let mut seen = HashSet::new();
         for target in &expanded {
-            // 別名が無く、存在が確定している数値 id は解決クエリを省く
-            // (`resolve_update_target_to_id` の数値分岐と同じ結果)。
-            let resolved_id = match numeric_target_id(&aliases, &existing_numeric, target) {
-                Some(id) => Some(id),
-                None => {
-                    resolve_update_target_to_id(runtime, &aliases, site_settings, target).await
-                }
+            // Numeric metadata is already loaded; other forms return their
+            // resolved record so virtual exclusion needs no second lookup.
+            let candidate = match numeric_target_id(&aliases, &existing_numeric, target) {
+                Some(id) => Some((id, virtual_numeric.contains(&id))),
+                None => resolve_update_target(runtime, &aliases, site_settings, target).await
+                    .map(|record| (record.id, narou_rs::virtual_novel::is_virtual_record(&record))),
             };
-            match resolved_id {
-                Some(id) => {
+            match candidate {
+                Some((id, false)) => {
                     // 同一 id への重複解決は native 同様 1 ジョブに束ねる
                     // (落とさない・未解決でもない)。
                     if seen.insert(id) {
                         resolved.push(id);
                     }
                 }
+                Some((_, true)) => {}
                 None => unresolved.push(target.clone()),
             }
         }
@@ -831,6 +834,7 @@ async fn api_update_by_tag(
     let snapshot_ids: Vec<i64> = {
         let mut matching = records
             .into_iter()
+            .filter(|record| !narou_rs::virtual_novel::is_virtual_record(record))
             .filter(|record| {
                 let include = tags
                     .iter()

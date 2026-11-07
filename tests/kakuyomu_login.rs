@@ -233,7 +233,7 @@ async fn a_next_work_page_returned_instead_of_a_reader_is_not_cached_as_an_empty
     let setting = site();
     let subtitle = SubtitleInfo { index: "7".into(), href: format!("/works/{WORK}/episodes/7"),
         chapter: String::new(), subchapter: String::new(), subtitle: "制限された話".into(),
-        file_subtitle: "制限された話".into(), subdate: String::new(), subupdate: None, download_time: None };
+        file_subtitle: "制限された話".into(), subdate: String::new(), subupdate: None, download_time: None, download_revision: 0 };
     let mut cache = SectionCache::new();
     let result = download_section(&ReaderFixture::new(true), &FakeRateLimiter::new(), &mut cache,
         &setting, &subtitle, TOP, &mut PreprocessJobs::new()).await;

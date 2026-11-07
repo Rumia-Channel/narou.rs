@@ -4,12 +4,13 @@
 //   node tests/run.mjs --release  # CI と同じ release build
 //   node tests/run.mjs --keep     # 終了後も wrangler dev を残す
 //
-// 生成物は gitignore 済み:
-//   .dev.vars           … ローカル用の NAROU_ADMIN_TOKEN (無ければ作る)
-//   wrangler.test.toml  … wrangler.toml から [build] を外した実行用設定
-//   .wrangler/state     … ローカルの D1 (miniflare SQLite)
+// 実行ごとに .wrangler/contract-* に設定・合成資格情報・D1 を隔離する。
+// 開発用 .dev.vars と .wrangler/state は読み書きしない。
+// --keep を指定しない限り、失敗時もプロセスと隔離ディレクトリを削除する。
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
+import { createServer } from "node:http";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
@@ -35,7 +36,9 @@ function run(command, args, options = {}) {
   }
 }
 
-function stop(child) {
+async function stop(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit");
   if (isWindows) {
     spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
   } else {
@@ -46,43 +49,27 @@ function stop(child) {
       if (error.code !== "ESRCH") throw error;
     }
   }
+  await exited;
 }
 
-// 1. ローカル用の secret。既にあれば触らない (開発者の値を壊さない)。
-const devVars = join(root, ".dev.vars");
-// Access の Service Token 相当の資格情報。Worker 側の検査 (Cloudflare
-// Zero Trust と同じ形式) を契約テストで確かめるために使う。
+mkdirSync(join(root, ".wrangler"), { recursive: true });
+const work = mkdtempSync(join(root, ".wrangler", "contract-"));
+const persist = join(work, "state");
+const testConfig = join(work, "wrangler.toml");
+let dev;
+let exitCode = 1;
+try {
+// 1. 開発者の資格情報を読まず、隔離した設定だけに合成値を置く。
+const devVars = join(work, ".dev.vars");
 const accessClientId = "contract-access-client-id.access";
 const accessClientSecret = "contract-access-client-secret";
-if (!existsSync(devVars)) {
-  // 資格情報は at-rest で暗号化されるので、テスト用の鍵も要る (32 バイトの base64)。
-  // 32 バイトちょうどでなければ復号鍵として拒否される。
-  const loginKey = Buffer.alloc(32, 7).toString("base64");
-  writeFileSync(
-    devVars,
-    `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${loginKey}\n` +
-      `NAROU_CF_ACCESS_CLIENT_ID=${accessClientId}\n` +
-      `NAROU_CF_ACCESS_CLIENT_SECRET=${accessClientSecret}\n`,
-  );
-  console.log(`wrote ${devVars}`);
-} else {
-  // 開発者の値を壊さないので、Access の項目だけ足す (既にあれば触らない)。
-  const current = readFileSync(devVars, "utf8");
-  const additions = [];
-  if (!current.includes("NAROU_CF_ACCESS_CLIENT_ID=")) {
-    additions.push(`NAROU_CF_ACCESS_CLIENT_ID=${accessClientId}`);
-  }
-  if (!current.includes("NAROU_CF_ACCESS_CLIENT_SECRET=")) {
-    additions.push(`NAROU_CF_ACCESS_CLIENT_SECRET=${accessClientSecret}`);
-  }
-  if (additions.length) {
-    writeFileSync(devVars, `${current.replace(/\n*$/, "\n")}${additions.join("\n")}\n`);
-    console.log(`added the Access test credentials to ${devVars}`);
-  }
-  console.log(
-    `${devVars} exists; using it as-is (NAROU_ADMIN_TOKEN and NAROU_RS_LOGIN_KEY must be set)`,
-  );
-}
+const loginKey = Buffer.alloc(32, 7).toString("base64");
+writeFileSync(
+  devVars,
+  `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${loginKey}\n` +
+    `NAROU_CF_ACCESS_CLIENT_ID=${accessClientId}\n` +
+    `NAROU_CF_ACCESS_CLIENT_SECRET=${accessClientSecret}\n`,
+);
 
 // 2. 実行用の設定。ビルドはこのスクリプトが行うので [build] を外す
 //    (wrangler dev が毎回 release ビルドを走らせないようにするため)。
@@ -92,11 +79,11 @@ if (!/^\d+\.\d+\.\d+$/.test(WRANGLER_VERSION)) {
   throw new Error(`NAROU_WRANGLER_VERSION must be exact x.y.z: ${WRANGLER_VERSION}`);
 }
 const WRANGLER_PACKAGE = `wrangler@${WRANGLER_VERSION}`;
-const config = readFileSync(join(root, "wrangler.toml"), "utf8").replace(
-  /\[build\][^\[]*/,
-  "",
-);
-const testConfig = join(root, "wrangler.test.toml");
+const config = readFileSync(join(root, "wrangler.toml"), "utf8")
+  .replace(/\[build\][^\[]*/, "")
+  .replace(/^main = .*$/m, `main = ${JSON.stringify(join(here, "virtual_race_worker.mjs").replaceAll("\\", "/"))}`)
+  .replace(/^directory = .*$/m, `directory = ${JSON.stringify(join(root, "public").replaceAll("\\", "/"))}`)
+  .replace(/^migrations_dir = .*$/m, `migrations_dir = ${JSON.stringify(join(root, "migrations").replaceAll("\\", "/"))}`);
 writeFileSync(testConfig, config);
 console.log(`wrote ${testConfig}`);
 
@@ -114,26 +101,30 @@ run(npx, [
   "DB",
   "--local",
   "-c",
-  "wrangler.test.toml",
+  testConfig,
+  "--persist-to",
+  persist,
 ]);
 
 // This runner explicitly exercises legacy D1; content_storage.mjs covers S3 defaults.
-const legacyContentFixture = join(root, ".wrangler", "contract-content-backend.sql");
+const legacyContentFixture = join(work, "contract-content-backend.sql");
 writeFileSync(legacyContentFixture, "INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','\"d1\"','d1') ON CONFLICT(scope,key) DO NOTHING;");
 run(npx, [
   "--yes", WRANGLER_PACKAGE, "d1", "execute", "DB", "--local",
-  "-c", "wrangler.test.toml", "--file", legacyContentFixture,
+  "-c", testConfig, "--persist-to", persist, "--file", legacyContentFixture,
 ]);
 
 // 5. wrangler dev を起動して readiness を待つ。
-const dev = spawn(
+dev = spawn(
   npx,
   [
     "--yes",
     WRANGLER_PACKAGE,
     "dev",
     "-c",
-    "wrangler.test.toml",
+    testConfig,
+    "--persist-to",
+    persist,
     "--port",
     port,
     "--test-scheduled",
@@ -141,8 +132,6 @@ const dev = spawn(
   { cwd: root, stdio: "inherit", shell: isWindows, detached: !isWindows },
 );
 
-let exitCode = 1;
-try {
   const base = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + 120_000;
   for (;;) {
@@ -177,26 +166,38 @@ try {
   if (exitCode === 0) {
     const tagSequence = spawnSync(process.execPath, [join(here, "tag_sequence.mjs")], {
       cwd: root, stdio: "inherit",
-      env: { ...process.env, BASE_URL: base, NAROU_ADMIN_TOKEN: token },
+      env: {
+        ...process.env, BASE_URL: base, NAROU_ADMIN_TOKEN: token,
+        NAROU_TEST_CONFIG: testConfig, NAROU_TEST_PERSIST: persist,
+        NAROU_WRANGLER_VERSION: WRANGLER_VERSION,
+      },
     });
     exitCode = tagSequence.status ?? 1;
   }
-  if (exitCode === 0) {
-    const attributes = spawnSync(process.execPath, [join(here, "virtual_attributes.mjs")], {
+  for (const name of ["virtual_attributes.mjs", "virtual_membership.mjs", "virtual_updates.mjs"]) {
+    if (exitCode !== 0) break;
+    const virtual = spawnSync(process.execPath, [join(here, name)], {
       cwd: root, stdio: "inherit",
-      env: { ...process.env, BASE_URL: base, NAROU_ADMIN_TOKEN: token },
+      env: {
+        ...process.env, BASE_URL: base, NAROU_ADMIN_TOKEN: token,
+        NAROU_TEST_CONFIG: testConfig, NAROU_TEST_PERSIST: persist,
+        NAROU_WRANGLER_VERSION: WRANGLER_VERSION,
+      },
     });
-    exitCode = attributes.status ?? 1;
+    exitCode = virtual.status ?? 1;
   }
 
   // 7. トークンを外した構成で fail-closed を確かめる（任意・既定 off）。
   if (exitCode === 0 && process.env.NAROU_CHECK_UNCONFIGURED === "1") {
     console.log("checking the unconfigured Worker (no admin token)");
-    // `.dev.vars` の secret を読ませないため、起動の間だけ退避する
-    // （起動済みの 1 台目はメモリ上の値を保つので影響しない）。
-    const savedVars = join(root, ".dev.vars.saved");
-    const hadVars = existsSync(devVars);
-    if (hadVars) renameSync(devVars, savedVars);
+    const probe = createServer().listen(0, "127.0.0.1");
+    await once(probe, "listening");
+    const authPort = String(probe.address().port);
+    await new Promise(resolve => probe.close(resolve));
+    const authRoot = join(work, "unconfigured");
+    mkdirSync(authRoot);
+    const authConfig = join(authRoot, "wrangler.toml");
+    writeFileSync(authConfig, readFileSync(testConfig));
     const authPid = spawn(
       npx,
       [
@@ -204,16 +205,18 @@ try {
         WRANGLER_PACKAGE,
         "dev",
         "-c",
-        "wrangler.test.toml",
+        authConfig,
+        "--persist-to",
+        persist,
         "--port",
-        "8788",
+        authPort,
         "--var",
         "NAROU_AUTH_REQUIRED:true",
       ],
       { cwd: root, stdio: "inherit", shell: isWindows, detached: !isWindows },
     );
     try {
-      const unconfiguredBase = "http://127.0.0.1:8788";
+      const unconfiguredBase = `http://127.0.0.1:${authPort}`;
       const deadline = Date.now() + 120_000;
       for (;;) {
         try {
@@ -239,16 +242,15 @@ try {
       );
       if ((unconfigured.status ?? 1) !== 0) exitCode = unconfigured.status ?? 1;
     } finally {
-      stop(authPid);
-      if (hadVars && existsSync(savedVars)) renameSync(savedVars, devVars);
+      await stop(authPid);
     }
   }
 } finally {
-  if (!keep) {
-    stop(dev);
-    rmSync(testConfig, { force: true });
+  if (!keep || !dev) {
+    await stop(dev);
+    rmSync(work, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   } else {
-    console.log(`kept wrangler dev (pid ${dev.pid}) and ${testConfig}`);
+    console.log(`kept wrangler dev (pid ${dev.pid}) and isolated state at ${work}`);
   }
 }
 

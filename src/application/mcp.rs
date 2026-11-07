@@ -118,7 +118,6 @@ impl McpServer {
                     .await
                     .map_err(|error| error.message().to_string())?;
                 let document = list.to_json();
-                let items = list.to_jsonl_items();
                 Ok(render(
                     &document,
                     &RenderOptions {
@@ -129,7 +128,8 @@ impl McpServer {
                             ("tags", "tag"),
                             ("members", "member"),
                         ],
-                        jsonl_items: Some(&items),
+                        xml_item: "novel",
+                        jsonl_items: document.get("data").and_then(Value::as_array).map(Vec::as_slice),
                     },
                 ))
             }
@@ -148,6 +148,7 @@ impl McpServer {
                         format: OutputFormat::Json,
                         root: "novel",
                         array_names: &[("tags", "tag"), ("members", "member")],
+                        xml_item: "novel",
                         jsonl_items: None,
                     },
                 ))
@@ -167,6 +168,7 @@ impl McpServer {
                         format: OutputFormat::Json,
                         root: "toc",
                         array_names: &[("sections", "section"), ("members", "member")],
+                        xml_item: "section",
                         jsonl_items: None,
                     },
                 ))
@@ -191,6 +193,7 @@ impl McpServer {
                         format: OutputFormat::Json,
                         root: "section",
                         array_names: &[],
+                        xml_item: "section",
                         jsonl_items: None,
                     },
                 ))
@@ -209,6 +212,7 @@ impl McpServer {
                         format: OutputFormat::Json,
                         root: "tags",
                         array_names: &[],
+                        xml_item: "tag",
                         jsonl_items: None,
                     },
                 ))
@@ -314,10 +318,14 @@ fn tool_error(message: String) -> Value {
 }
 
 /// ツールの引数をクエリパラメータと同じ形にする。
+///
+/// `null` の引数は「指定なし」として落とす (未指定の値を渡すと
+/// 「数値です: 」のようなエラーになる)。
 fn argument_pairs(arguments: &Value) -> Vec<(String, String)> {
     match arguments.as_object() {
         Some(map) => map
             .iter()
+            .filter(|(_, value)| !value.is_null())
             .map(|(key, value)| (key.clone(), argument_value(value)))
             .collect(),
         None => Vec::new(),

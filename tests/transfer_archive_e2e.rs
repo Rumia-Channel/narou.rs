@@ -269,6 +269,18 @@ fn sqlite_library_import_updates_stored_rows() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     create_source_library(&source);
+    let source_dir = source.join("小説データ/ExampleSite/example-title");
+    let extra_files = [
+        ("raw/1.html", "<p>元の HTML</p>"),
+        ("本文/cache/revision/old.yaml", "旧版本文"),
+        ("book.epub", "既存の生成物"),
+        ("notes.txt", "利用者の追加ファイル"),
+    ];
+    for (relative, content) in extra_files {
+        let path = source_dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
 
     let zip_first = temp.path().join("first.zip");
     let zip_first_arg = zip_first.to_string_lossy().to_string();
@@ -323,6 +335,38 @@ fn sqlite_library_import_updates_stored_rows() {
     // Delete the mirror body so the rollback bundle can only come from the
     // stored row. A stale row would render the first archive's body.
     std::fs::remove_file(novel_dir.join(SECTION_FILE)).unwrap();
+    for (relative, _) in extra_files {
+        std::fs::remove_file(novel_dir.join(relative)).unwrap();
+    }
+    assert_success(
+        &run(&target, &target, &["setting", "sqlite.mirror-files=false"]),
+        "disable filesystem mirrors",
+    );
+    let id: i64 = rusqlite::Connection::open(target.join(".narou/db.sqlite")).unwrap()
+        .query_row("SELECT id FROM novels WHERE toc_url=?1", [TOC_URL], |row| row.get(0)).unwrap();
+    let complete_zip = temp.path().join("complete.zip");
+    assert_success(
+        &run(&target, &target, &["export", &id.to_string(), "-o", complete_zip.to_str().unwrap()]),
+        "export SQLite-only files",
+    );
+    let mut exported = zip::ZipArchive::new(std::fs::File::open(&complete_zip).unwrap()).unwrap();
+    for (relative, content) in extra_files {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut exported.by_name(&format!("novels/0/{relative}")).unwrap(), &mut bytes,
+        ).unwrap();
+        assert_eq!(bytes, content.as_bytes(), "{relative}");
+        assert!(!novel_dir.join(relative).exists(), "export must not restore live outputs: {relative}");
+    }
+    assert_success(&run(&target, &target, &["backup", &id.to_string()]), "backup SQLite-only files");
+    let backup = std::fs::read_dir(novel_dir.join("backup")).unwrap().next().unwrap().unwrap().path();
+    let mut backup = zip::ZipArchive::new(std::fs::File::open(backup).unwrap()).unwrap();
+    for (relative, content) in extra_files {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut backup.by_name(relative).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, content.as_bytes(), "{relative}");
+        assert!(!novel_dir.join(relative).exists(), "backup must not restore live outputs: {relative}");
+    }
 
     let bundle = temp.path().join("bundle");
     let bundle_arg = bundle.to_string_lossy().to_string();

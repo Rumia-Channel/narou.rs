@@ -15,8 +15,7 @@ pub fn load() -> Result<FavoriteTags> {
     if raw.trim().is_empty() {
         return Ok(FavoriteTags::default());
     }
-    let value: serde_yaml::Value = serde_yaml::from_str(&raw)?;
-    Ok(FavoriteTags::from_yaml_value(&value))
+    Ok(serde_yaml::from_str(&raw)?)
 }
 
 /// 現在のライブラリへお気に入りタグを保存する。

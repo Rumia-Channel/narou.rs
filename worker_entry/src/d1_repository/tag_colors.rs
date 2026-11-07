@@ -72,6 +72,10 @@ impl TagColorSnapshot {
         }
     }
 
+    pub(crate) fn needs_write(&self, changed: bool) -> bool {
+        changed || self.canonical.is_none() || self.legacy.is_some()
+    }
+
     pub(crate) fn into_update_binds(self, value_yaml: String) -> Vec<NovelBind> {
         let mut binds = Vec::with_capacity(7);
         binds.push(NovelBind::Text(value_yaml));

@@ -10,7 +10,6 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::native::novel_repository::NativeNovelRepository;
 use crate::native::virtual_novel::{self, NewVirtualNovel};
 use crate::platform::NovelId;
 use crate::virtual_novel as core;
@@ -61,59 +60,16 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> (StatusCode
     )
 }
 
-pub async fn api_virtual_list() -> Json<serde_json::Value> {
-    let repository = NativeNovelRepository::new();
-    match virtual_novel::load() {
-        Ok(groups) => {
-            // 分類は表示機能の ON / OFF とは独立に返す。
-            let states = virtual_novel::attribute_states_in(&groups);
-            let novels = groups
-                .groups
-                .iter()
-                .filter_map(|(id, member_ids)| {
-                    let record = repository.get_sync(NovelId(*id)).ok().flatten()?;
-                    let member_titles = member_ids
-                        .iter()
-                        .map(|member| {
-                            repository
-                                .get_sync(NovelId(*member))
-                                .ok()
-                                .flatten()
-                                .map(|record| record.title)
-                                .unwrap_or_default()
-                        })
-                        .collect::<Vec<_>>();
-                    // 分類を確定できない作品 (欠落したメンバーなど) は保存済みの
-                    // 値をそのまま返し、属性は編集できないものとする。
-                    let (mixed, attribute_tag) = match states.get(id) {
-                        Some(state) => (state.mixed, state.attribute_tag.to_string()),
-                        None => (
-                            false,
-                            record
-                                .attribute_tag()
-                                .unwrap_or(crate::application::attribute_tags::NOVEL_TAG)
-                                .to_string(),
-                        ),
-                    };
-                    Some(serde_json::json!({
-                        "id": record.id,
-                        "ncode": core::ncode(*id),
-                        "title": record.title,
-                        "author": record.author,
-                        "sitename": record.sitename,
-                        "domain": record.domain,
-                        "tags": record.tags,
-                        "members": member_ids,
-                        "member_titles": member_titles,
-                        "mixed": mixed,
-                        "attribute_tag": attribute_tag,
-                        "attribute_editable": states.contains_key(id),
-                    }))
-                })
-                .collect::<Vec<_>>();
-            Json(serde_json::json!({"success": true, "novels": novels}))
-        }
-        Err(error) => Json(serde_json::json!({"success": false, "message": error.to_string()})),
+pub async fn api_virtual_list() -> (StatusCode, Json<serde_json::Value>) {
+    let result = virtual_novel::load().and_then(|groups| {
+        let sites = crate::downloader::site_setting::effective_site_settings();
+        crate::db::with_database(|database| {
+            Ok(crate::application::virtual_book::list_entries(&groups, &sites, |id| database.get(id)))
+        })
+    });
+    match result {
+        Ok(novels) => (StatusCode::OK, Json(serde_json::json!({"success": true, "novels": novels}))),
+        Err(error) => error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
     }
 }
 
@@ -238,40 +194,29 @@ pub async fn api_virtual_add_members(
 }
 
 pub async fn api_virtual_convert(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let result = tokio::task::spawn_blocking(move || -> Result<(String, String), String> {
-        let record = NativeNovelRepository::new()
-            .get_sync(NovelId(id))
+    let result = async {
+        let record = state.services.library.get(NovelId(id)).await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("仮想小説 vs_{id} が見つかりません"))?;
-        let members = virtual_novel::load()
-            .map_err(|error| error.to_string())?
-            .get(id)
-            .map(|members| members.to_vec())
-            .ok_or_else(|| format!("仮想小説 vs_{id} のメンバーがありません"))?;
-        let path = virtual_novel::convert_virtual(id, &record, &members, None, false, false)
-            .map_err(|error| error.to_string())?;
-        Ok((
+        let path = super::novels::generate_virtual_epub(record).await
+            .map_err(|(_, message)| message)?;
+        Ok::<_, String>((
             core::ncode(id),
             path.file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()
                 .to_string(),
         ))
-    })
-    .await;
+    }.await;
     match result {
-        Ok(Ok((ncode, filename))) => (
+        Ok((ncode, filename)) => (
             StatusCode::OK,
             Json(serde_json::json!({"success": true, "ncode": ncode, "filename": filename})),
         ),
-        Ok(Err(message)) => error_response(StatusCode::BAD_REQUEST, message),
-        Err(_) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "変換処理が中断されました",
-        ),
+        Err(message) => error_response(StatusCode::BAD_REQUEST, message),
     }
 }
 
@@ -498,6 +443,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_corrupt_membership_list_is_unavailable() {
+        use axum::response::IntoResponse;
+
+        let _global = crate::test_support::global_state_guard();
+        let _legacy = crate::test_support::legacy_yaml_guard();
+        let (temp, _cwd_guard, _db_guard) = isolated_library();
+        std::fs::write(temp.path().join(".narou/virtual_novel_members.yaml"), "5: [3,").unwrap();
+
+        let response = api_virtual_list().await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["success"], false);
+        assert!(body.get("novels").is_none());
+    }
+
+    #[tokio::test]
     async fn the_list_keeps_the_stored_attribute_when_the_classification_fails() {
         let _global = crate::test_support::global_state_guard();
         let _legacy = crate::test_support::legacy_yaml_guard();
@@ -526,10 +488,12 @@ mod tests {
             let mut members = crate::native::virtual_novel::load().unwrap();
             members.remove(record.id);
             members.insert(record.id, vec![99]).unwrap();
-            crate::native::virtual_novel::save(&members).unwrap();
+            crate::db::inventory::Inventory::with_default_root().unwrap()
+                .save("virtual_novel_members", crate::db::inventory::InventoryScope::Local, &members).unwrap();
         }
 
-        let body = api_virtual_list().await .0;
+        let (status, body) = api_virtual_list().await;
+        assert_eq!(status, StatusCode::OK);
         let novels = body["novels"].as_array().unwrap();
         let entry = novels
             .iter()

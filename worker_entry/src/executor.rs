@@ -114,6 +114,14 @@ fn resume_section_for_checkpoint(
     }
 }
 
+/// Claimed execution state and metadata already read for update admission.
+pub struct JobExecution<'a> {
+    pub job_id: &'a JobId,
+    pub execution_token: &'a str,
+    pub checkpoint: Option<&'a WorkerExecutionCheckpoint>,
+    pub update_record: Option<&'a narou_rs::db::NovelRecord>,
+}
+
 /// Execute one job and classify the outcome.
 ///
 /// `downloader` is owned by the caller for the duration of a queue batch —
@@ -122,12 +130,11 @@ fn resume_section_for_checkpoint(
 pub async fn execute_job(
     downloader: &mut Downloader,
     job: &JobPlan,
-    job_id: &JobId,
-    checkpoint: Option<&WorkerExecutionCheckpoint>,
+    execution: JobExecution<'_>,
     runtime: &WorkerRuntime,
-    execution_token: &str,
     push: &PushHubClient,
 ) -> JobOutcome {
+    let JobExecution { job_id, execution_token, checkpoint, update_record } = execution;
     if let Some(reason) = unsupported_reason(job) {
         return JobOutcome::Blocked { reason };
     }
@@ -220,11 +227,16 @@ pub async fn execute_job(
             Err(reason) => return JobOutcome::Permanent { reason },
         };
 
-    // 最後の防波堤: 投入側 (job_actions / スケジューラ) での除外が漏れても、
-    // `--force` 無しの Download/Update は凍結中の小説を触らない。
-    // native の `commands::{update,download}` の凍結拒否と同じ規則で、単発
-    // ジョブは native と同じ通知行を出して終了する。
-    if !force && matches!(job.kind, JobKind::Download | JobKind::Update) {
+    if !force && job.kind == JobKind::Update && let Some(record) = update_record
+        && runtime.write_services().novel_actions.is_frozen(NovelId(record.id)).await
+    {
+        let line = messages::update::frozen_id(record.id, &record.title);
+        console_log!("job {job_id} skipped: {line}");
+        push.broadcast_best_effort(&[echo(&line, "stdout")]).await;
+        return JobOutcome::Skipped { reason: line };
+    }
+    // Download resolves its stored record after series/author expansion.
+    if !force && job.kind == JobKind::Download {
         match resolve_novel_id(runtime.novels.as_ref(), &job.target).await {
             Some(id) if runtime.write_services().novel_actions.is_frozen(id).await => {
                 let title = runtime
@@ -235,10 +247,7 @@ pub async fn execute_job(
                     .flatten()
                     .map(|record| record.title)
                     .unwrap_or_default();
-                let line = match job.kind {
-                    JobKind::Update => messages::update::frozen_id(id.0, title),
-                    _ => messages::download::frozen_abort(title),
-                };
+                let line = messages::download::frozen_abort(title);
                 console_log!("job {job_id} skipped: {line}");
                 push.broadcast_best_effort(&[echo(&line, "stdout")]).await;
                 // native の単発 frozen 経路は子プロセスを mistook=1 で終了
@@ -250,17 +259,14 @@ pub async fn execute_job(
             _ => {}
         }
     }
-
-    // native `update.interval`: 同じドメインの作品開始を一定時間空ける。
-    // 凍結で読み飛ばす作品は native 同様に間隔を消費しない (frozen 判定の後)。
     if job.kind == JobKind::Update {
-        let domain = update_domain(runtime, &job.target).await;
-        if let Err(error) = runtime.pace_update_start(&domain).await {
-            return JobOutcome::Retryable {
-                reason: format!("update start pacing failed: {error}"),
-            };
+        let domain = update_record.and_then(|record| record.domain.as_deref())
+            .filter(|domain| !domain.is_empty()).unwrap_or("__unknown__");
+        if let Err(error) = runtime.pace_update_start(domain).await {
+            return JobOutcome::Retryable { reason: format!("update start pacing failed: {error}") };
         }
     }
+
 
     // 進捗とコンソールは同じ送信キューに積み、順序を保つ。
     // operation は実行トークンごとに異なり、再試行の遅延更新と混ざらない。
@@ -442,26 +448,6 @@ pub async fn execute_job(
     outcome
 }
 
-/// native `commands::update` の `UNKNOWN_DOMAIN_KEY` と同じ見出し語。ドメインを
-/// 持たないレコード (取得直後など) は 1 つのバケットにまとめて直列化する。
-const UNKNOWN_DOMAIN_KEY: &str = "__unknown__";
-
-/// `update.interval` を数えるためのドメイン。native `collect_record_domains`
-/// と同じく `record.domain` を使い、空・未解決は共通バケットへ寄せる。
-async fn update_domain(runtime: &WorkerRuntime, target: &JobTarget) -> String {
-    let Some(id) = resolve_novel_id(runtime.novels.as_ref(), target).await else {
-        return UNKNOWN_DOMAIN_KEY.to_string();
-    };
-    runtime
-        .novels
-        .get(id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|record| record.domain)
-        .filter(|domain| !domain.is_empty())
-        .unwrap_or_else(|| UNKNOWN_DOMAIN_KEY.to_string())
-}
 
 /// Resolve a job target to a stored novel id (native `get_data_by_target`
 /// parity for the freeze check): `Id` is direct, `Ncode`/`Url` resolve

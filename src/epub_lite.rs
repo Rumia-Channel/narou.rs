@@ -28,6 +28,7 @@ use aozora_epub3_lite::pipeline::{append_gaiji_assets, plan_assets};
 
 use crate::converter::settings::{ImageRotation, NovelSettings};
 use crate::error::{NarouError, Result};
+use crate::illustration_refs::collect;
 
 /// ライブラリ利用側 (Worker など) が入力源を実装するために使う。
 pub use aozora_epub3_lite::{FileSource, InputError};
@@ -623,7 +624,7 @@ impl EpubPreparation {
             .collect::<Vec<_>>();
         let references = image_references(&text);
         if input.has_source() && !config.no_illust {
-            let unresolved = illustration_references(&text)
+            let unresolved = collect(&text)
                 .into_iter()
                 .filter(|reference| !resolved_references.contains(reference))
                 .collect::<Vec<_>>();
@@ -875,100 +876,6 @@ fn report_illustration_resolution(unresolved: &[String], resolved: usize) {
     for reference in unresolved {
         debug::emit(format!("挿絵: 本文の参照が入力に見つかりません: {reference}"));
     }
-}
-
-/// 本文が参照している挿絵の一覧 (重複なし)。詳細ログ・診断用。
-///
-/// Lite の `image_references` はパス区切りを正規化するため `https://…` の
-/// ような URL を参照として認識しない (空セグメントを弾く)。Worker の本文は
-/// 取得元 URL のままなので、URL も参照として拾う。
-pub fn illustration_references(text: &str) -> Vec<String> {
-    let mut references = Vec::new();
-    for caps in note_pattern().captures_iter(text) {
-        push_reference(&mut references, &caps[1]);
-    }
-    for caps in image_pattern().captures_iter(text) {
-        push_reference(&mut references, &caps[2]);
-    }
-    references
-}
-
-/// 挿絵注記 (`［＃挿絵（PATH、説明）入る］`) の PATH を捕まえる。
-fn note_pattern() -> &'static regex::Regex {
-    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    PATTERN.get_or_init(|| {
-        regex::Regex::new(r"［＃挿絵（([^、）]+)(?:、[^）]*)?）入る］")
-            .expect("illustration note pattern is valid")
-    })
-}
-
-/// 生の `<img src="…">` を捕まえる (1: src= まで, 2: 値, 3: 閉じ引用符)。
-fn image_pattern() -> &'static regex::Regex {
-    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    PATTERN.get_or_init(|| {
-        regex::Regex::new(r#"(?i)(<img[^>]+src=["'])([^"']+)(["'])"#)
-            .expect("illustration img pattern is valid")
-    })
-}
-
-fn push_reference(references: &mut Vec<String>, reference: &str) {
-    let reference = reference.trim();
-    if !reference.is_empty() && !references.iter().any(|known| known == reference) {
-        references.push(reference.to_string());
-    }
-}
-
-/// 本文の挿絵参照を、保存済みの名前 (`挿絵/<file>`) へ寄せる。
-///
-/// Worker の変換は native と違い挿絵をローカライズしないため、本文には
-/// サイト上の URL がそのまま残る。ダウンロード時に保存した実体は
-/// `.illustration_cache.yaml` (取得元 → ファイル名) が知っているので、EPUB を
-/// 組む前にここで参照を差し替える。`resolve` が `None` を返した参照は元の
-/// まま残し、戻り値の 2 番目に (重複なしで) 集める。
-///
-/// 置換は注記 (`［＃挿絵（X、説明）入る］`) と生の `src="X"` の両方の書き方を
-/// 見る。注記では説明文をそのまま残す。
-pub fn rewrite_illustration_references(
-    text: &str,
-    resolve: impl Fn(&str) -> Option<String>,
-) -> (String, Vec<String>) {
-    let mut unresolved: Vec<String> = Vec::new();
-    let mut rewritten = String::with_capacity(text.len());
-    let mut last = 0;
-    for caps in note_pattern().captures_iter(text) {
-        let whole = caps.get(0).expect("whole match");
-        let path_match = caps.get(1).expect("path group");
-        let reference = path_match.as_str().trim();
-        let Some(localized) = resolve(reference) else {
-            push_reference(&mut unresolved, reference);
-            continue;
-        };
-        rewritten.push_str(&text[last..whole.start()]);
-        rewritten.push_str(&text[whole.start()..path_match.start()]);
-        rewritten.push_str(&localized);
-        rewritten.push_str(&text[path_match.end()..whole.end()]);
-        last = whole.end();
-    }
-    rewritten.push_str(&text[last..]);
-
-    let rewritten = image_pattern()
-        .replace_all(&rewritten, |caps: &regex::Captures| {
-            let reference = caps.get(2).expect("source group").as_str().trim();
-            match resolve(reference) {
-                Some(localized) => format!(
-                    "{}{}{}",
-                    caps.get(1).expect("prefix group").as_str(),
-                    localized,
-                    caps.get(3).expect("quote group").as_str()
-                ),
-                None => {
-                    push_reference(&mut unresolved, reference);
-                    caps.get(0).expect("whole match").as_str().to_string()
-                }
-            }
-        })
-        .into_owned();
-    (rewritten, unresolved)
 }
 
 /// 非同期画像 I/O を持つランタイム向けに、本文と共通レイアウトの準備を行う。
@@ -1278,47 +1185,6 @@ mod tests {
         }
         // 存在しない相対パスは従来どおり None。
         assert!(read_local_image(&base, "挿絵/missing.png").is_none());
-    }
-
-    #[test]
-    fn rewrites_illustration_references_to_stored_names() {
-        // Worker の本文は取得元 URL のままなので、保存済みの名前へ寄せる。
-        let text = format!("{SAMPLE}\n　挿絵。［＃挿絵（https://example.invalid/a.png）入る］\n");
-        let (rewritten, unresolved) = rewrite_illustration_references(&text, |reference| {
-            (reference == "https://example.invalid/a.png").then(|| "挿絵/0001.png".to_string())
-        });
-        assert!(
-            rewritten.contains("［＃挿絵（挿絵/0001.png）入る］"),
-            "{rewritten}"
-        );
-        assert!(!rewritten.contains("example.invalid"), "{rewritten}");
-        assert!(unresolved.is_empty());
-    }
-
-    #[test]
-    fn keeps_unresolved_references_and_reports_each_once() {
-        let text = format!(
-            "{SAMPLE}\n［＃挿絵（https://example.invalid/a.png）入る］\n\
-             ［＃挿絵（https://example.invalid/a.png）入る］\n［＃挿絵（挿絵/local.png）入る］\n"
-        );
-        let (rewritten, unresolved) = rewrite_illustration_references(&text, |_| None);
-        assert_eq!(rewritten, text, "解決できない参照は書き換えない");
-        assert_eq!(
-            unresolved,
-            vec![
-                "https://example.invalid/a.png".to_string(),
-                "挿絵/local.png".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn rewrites_raw_img_sources_too() {
-        let text = format!("{SAMPLE}\n<img src=\"https://example.invalid/b.jpg\" alt=\"x\">\n");
-        let (rewritten, unresolved) =
-            rewrite_illustration_references(&text, |_| Some("挿絵/b.jpg".to_string()));
-        assert!(rewritten.contains(r#"src="挿絵/b.jpg""#), "{rewritten}");
-        assert!(unresolved.is_empty());
     }
 
     #[test]

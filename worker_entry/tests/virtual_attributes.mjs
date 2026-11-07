@@ -2,16 +2,21 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 const base = process.env.BASE_URL || 'http://127.0.0.1:8787';
 if (!/^http:\/\/(127\.0\.0\.1|localhost):/.test(base)) throw new Error('Local Worker required');
-const config = process.env.VIRTUAL_TEST_CONFIG || 'wrangler.test.toml';
+const config = process.env.NAROU_TEST_CONFIG;
+const persist = process.env.NAROU_TEST_PERSIST;
+assert(config && persist, 'Run through tests/run.mjs with its isolated D1 fixture');
 function sql(command) {
-  const dir = mkdtempSync('.wrangler/virtual-attributes-');
+  const dir = mkdtempSync(join(dirname(config), 'virtual-attributes-'));
   try {
     const file = join(dir, 'fixture.sql');
     writeFileSync(file,command);
-    const r = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['--yes', 'wrangler@4.151.3', 'd1', 'execute', 'DB', '--local', '-c', config, '--file', file], { shell: process.platform === 'win32', encoding: 'utf8' });
+    const r = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', [
+      '--yes', `wrangler@${process.env.NAROU_WRANGLER_VERSION || '4.151.3'}`,
+      'd1', 'execute', 'DB', '--local', '-c', config, '--persist-to', persist, '--file', file,
+    ], { shell: process.platform === 'win32', encoding: 'utf8' });
     assert.equal(r.status, 0, r.stdout + r.stderr);
   } finally { rmSync(dir,{recursive:true,force:true}); }
 }

@@ -11,7 +11,7 @@
 //! native (`src/web/misc.rs`) と Worker (`worker_entry/src/webui/`) は同じ
 //! 並び順の規則を使うため、判定と並び替えはこの共有モジュールに置く。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// タグ一覧の表示順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -23,7 +23,7 @@ pub enum TagSortOrder {
     Alphabetical,
     /// タグの出現件数の降順、同数はタグ名の昇順。
     Count,
-    /// タグの登録順 (タグが付いた最初の小説の ID 順、同数はタグ名の昇順)。
+    /// 保存済みのタグ連番順。未記録のライブラリは最小作品 ID とタグ名で補う。
     Registered,
 }
 
@@ -80,7 +80,7 @@ pub type TagCount = (String, usize);
 ///
 /// `tags` は元の並び順 (件数順) のタグ名、`counts` はタグ名ごとの出現件数、
 /// `favorites` はお気に入りタグ (登録順)、`registered` はタグ名ごとの登録順
-/// (タグが付いた最初の小説の ID)。
+/// (保存済みの連番。未記録分は最小作品 ID とタグ名で補う)。
 ///
 /// - `FavoritesFirst`: お気に入りタグをお気に入り順で先頭に置き、その後に
 ///   その他のタグを元の並び順で並べる。
@@ -100,13 +100,14 @@ pub fn sort_tags(
     match order {
         TagSortOrder::FavoritesFirst => {
             let mut result = Vec::with_capacity(tags.len());
+            let mut remaining: HashSet<&str> = tags.iter().map(String::as_str).collect();
             for favorite in favorites {
-                if tags.iter().any(|tag| tag == favorite) {
+                if remaining.remove(favorite.as_str()) {
                     result.push(favorite.clone());
                 }
             }
             for tag in tags {
-                if !favorites.iter().any(|favorite| favorite == tag) {
+                if remaining.remove(tag.as_str()) {
                     result.push(tag.clone());
                 }
             }

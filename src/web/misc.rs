@@ -11,7 +11,7 @@ use crate::application::webui::notepad::{
     notepad_conflict_payload, notepad_object_id, notepad_response_value, notepad_saved_payload,
 };
 use crate::application::webui::tag_order::{
-    TAG_SORT_ORDER_SETTING, TagSortOrder, sort_tags,
+    TagSortOrder, sort_tags,
 };
 use crate::application::webui::tag_views::{tag_count_ordering, tag_list_html};
 use std::io::ErrorKind;
@@ -136,49 +136,7 @@ fn read_notepad_content(path: &Path) -> std::io::Result<String> {
     }
 }
 
-pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Value> {
-    // 依存の無い設定は 1 回の `get_many` にまとめる (スコープごとに 1 回だけ
-    // ストアを読む)。
-    const CONFIG_NAMES: &[&str] = &[
-        "webui.theme",
-        "webui.performance-mode",
-        "webui.table.reload-timing",
-        "webui.debug-mode",
-        "webui.tag-sort-order",
-        "tag.show-novel",
-        "tag.show-manga",
-        "tag.attributes-enabled",
-        "concurrency",
-    ];
-    let loaded: Vec<Option<serde_yaml::Value>> = state
-        .services
-        .settings
-        .get_many(CONFIG_NAMES)
-        .await
-        .unwrap_or_default();
-    let find = |name: &str| {
-        CONFIG_NAMES
-            .iter()
-            .position(|candidate| *candidate == name)
-            .and_then(|index| loaded.get(index).cloned().flatten())
-    };
-    let string_value = |value: Option<serde_yaml::Value>, default: &str| {
-        value
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_else(|| default.to_string())
-    };
-    let theme = string_value(find("webui.theme"), "Cerulean");
-    let performance_mode = string_value(find("webui.performance-mode"), "auto");
-    let reload_timing = string_value(find("webui.table.reload-timing"), "every");
-    let debug_mode = find("webui.debug-mode")
-        .and_then(|value| crate::setting_core::setting_bool_value(&value))
-        .unwrap_or(false);
-    let concurrency_enabled = find("concurrency")
-        .and_then(|value| crate::setting_core::setting_bool_value(&value))
-        .unwrap_or(false);
-    let tag_sort_order = TagSortOrder::from_setting(Some(
-        string_value(find("webui.tag-sort-order"), "favorites_first").as_str(),
-    ));
+pub async fn webui_config(State(state): State<AppState>) -> Response {
 
     // 能力宣言 (共有定義)。端末一覧だけは実行時の外部ツール検出値を使う。
     let capabilities = crate::application::webui::capabilities::WebUiCapabilities::native(
@@ -190,41 +148,43 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
             .collect(),
     );
 
-    Json(serde_json::json!({
-        "theme": theme,
-        "performance_mode": performance_mode,
-        "reload_timing": reload_timing,
-        "debug_mode": debug_mode,
-        "tag_sort_order": tag_sort_order.setting_value(),
-        "show_novel_attribute": find("tag.show-novel").and_then(|value| crate::setting_core::setting_bool_value(&value)).unwrap_or(false),
-        "show_manga_attribute": find("tag.show-manga").and_then(|value| crate::setting_core::setting_bool_value(&value)).unwrap_or(true),
-        // 属性タグ機能全体の ON/OFF。OFF の間は個別表示スイッチも効かない。
-        "attribute_tags_enabled": find("tag.attributes-enabled").and_then(|value| crate::setting_core::setting_bool_value(&value)).unwrap_or(false),
-        "ws_port": state.ws_port,
-        "port": state.port,
-        "concurrency_enabled": concurrency_enabled,
-        // native の注記 (Worker の応答と同じキーを native 値で返す):
-        // `concurrency` は実行レーンの分離、keep-txt の既定 true、
-        // retry の配備上限なし。
-        "concurrency_scope": "lanes",
-        "convert_keep_txt_default": true,
-        "queue_max_retries_limit": serde_json::Value::Null,
-        "capabilities": serde_json::to_value(&capabilities)
-            .expect("capabilities serialization is infallible"),
-    }))
+    let context = crate::application::webui::config::ConfigContext {
+        capabilities,
+        port: Some(state.port),
+        ws_port: Some(state.ws_port),
+        convert_keep_txt_default: true,
+        queue_max_retries_limit: None,
+    };
+    match crate::application::webui::config::load(&state.services.settings, context).await {
+        Ok(config) => Json(config).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"success": false, "message": "設定を読み込めませんでした"})),
+        ).into_response(),
+    }
 }
 
 pub async fn tag_list(
     State(state): State<AppState>,
     Query(params): Query<TagListParams>,
 ) -> Response {
-    let new_tag_color = super::configured_tag_color(&state).await;
-    let mut records = state.services.library.records().await.unwrap_or_default();
+    let unavailable = || (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"success": false, "message": "タグ一覧を読み込めませんでした"})),
+    ).into_response();
+    let config = match crate::application::webui::config::load_tag_list(&state.services.settings).await {
+        Ok(config) => config,
+        Err(_) => return unavailable(),
+    };
+    let mut records = match state.services.library.records().await {
+        Ok(records) => records,
+        Err(_) => return unavailable(),
+    };
     // 属性タグは独立した項目として扱い、機能 OFF の間は候補に載せない
     // (Worker の `ATTRIBUTE_NAMES_SQL` と同じ規則)。
     crate::application::attribute_tags::project(
         &mut records,
-        crate::application::attribute_tags::enabled(&state.services.settings).await,
+        config.attribute_tags_enabled,
     );
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for record in &records {
@@ -245,30 +205,28 @@ pub async fn tag_list(
 
     // 並び順 (お気に入り優先 / アルファベット順 / 件数順 / 登録順) と
     // お気に入りタグの並びは利用者が選べる。
-    let sort_order = TagSortOrder::from_setting(
-        state
-            .services
-            .settings
-            .get(TAG_SORT_ORDER_SETTING)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|value| value.as_str().map(str::to_string))
-            .as_deref(),
-    );
-    let favorites = crate::native::favorite_tags::load()
-        .map(|state| state.tags)
-        .unwrap_or_default();
-    // 「登録順」はタグがライブラリへ入った順 (在庫の `tag_sequence`)。
-    // 記録が無いライブラリは最小小説 ID → タグ名の順。
-    let sequence = crate::native::tag_sequence::load().unwrap_or_default();
-    let library = crate::application::tag_sequence::library_tags(
-        records
-            .iter()
-            .map(|record| (record.id, record.tags.as_slice())),
-        |tag| !crate::virtual_novel::is_internal_tag(tag),
-    );
-    let registered = crate::application::tag_sequence::registered_ranks(&sequence, &library);
+    let sort_order = config.sort_order;
+    let favorites = if sort_order == TagSortOrder::FavoritesFirst {
+        match crate::native::favorite_tags::load() {
+            Ok(state) => state.tags,
+            Err(_) => return unavailable(),
+        }
+    } else {
+        Vec::new()
+    };
+    let registered = if sort_order == TagSortOrder::Registered {
+        let sequence = match crate::native::tag_sequence::load() {
+            Ok(sequence) => sequence,
+            Err(_) => return unavailable(),
+        };
+        let library = crate::application::tag_sequence::library_tags(
+            records.iter().map(|record| (record.id, record.tags.as_slice())),
+            |tag| !crate::virtual_novel::is_internal_tag(tag),
+        );
+        crate::application::tag_sequence::registered_ranks(&sequence, &library)
+    } else {
+        std::collections::HashMap::new()
+    };
     let tags = sort_tags(
         sort_order,
         &default_tags,
@@ -276,12 +234,12 @@ pub async fn tag_list(
         &favorites,
         &registered,
     );
-    let tag_colors = state
-        .services
-        .tag_colors
-        .for_tags(tags.clone(), new_tag_color.as_deref())
-        .await
-        .unwrap_or_default();
+    let tag_colors = match state.services.tag_colors
+        .for_tags(default_tags, config.new_tag_color.as_deref()).await
+    {
+        Ok(colors) => colors,
+        Err(_) => return unavailable(),
+    };
 
     if params.format.as_deref() == Some("json") {
         return Json(serde_json::json!({ "tags": tags, "tag_colors": tag_colors })).into_response();

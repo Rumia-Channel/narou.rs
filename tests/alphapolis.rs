@@ -54,7 +54,7 @@ fn cover_html(paid: bool, r18: bool, rented: bool) -> String {
 fn subtitle(id: usize) -> SubtitleInfo {
     SubtitleInfo { index:id.to_string(), href:format!("/novel/166360898/202065994/episode/{id}"),
         chapter:String::new(), subchapter:String::new(), subtitle:"話".into(), file_subtitle:"話".into(),
-        subdate:String::new(), subupdate:None, download_time:None }
+        subdate:String::new(), subupdate:None, download_time:None, download_revision:0 }
 }
 
 #[derive(Default)]

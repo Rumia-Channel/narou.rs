@@ -272,6 +272,7 @@ mod tests {
                 postscript: String::new(),
                 body: "本文".to_string(),
             },
+            download_revision: 0,
         })
         .unwrap()
         .into_bytes()

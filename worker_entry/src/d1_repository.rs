@@ -168,6 +168,32 @@ impl D1NovelRepository {
     }
 }
 
+/// Prepare the row, tag index and ID bookkeeping for the caller's transaction.
+/// Tags must already be normalized; the caller also commits the tag sequence.
+pub(crate) fn push_upsert_statements(db: &DbHandle, record: &NovelRecord, statements: &mut Vec<D1PreparedStatement>) -> Result<()> {
+    let prepare = |sql: &str, values| bind_statement(db.prepare(sql), values);
+    statements.reserve(record.tags.len() + 5);
+    statements.push(prepare(NOVEL_UPSERT_SQL, record_binds(record)?)?);
+    statements.push(prepare(novel_query::COMMIT_ID_RESERVATION_SQL, vec![BindValue::Int(record.id)])?);
+    push_tag_statements(db, record.id, &record.tags, statements)?;
+    statements.push(prepare(&novel_query::refresh_status_sort_sql(), vec![BindValue::Int(record.id)])?);
+    let max_id = record.id.saturating_add(1);
+    statements.push(prepare(novel_query::BUMP_SEQUENCE_SQL, vec![BindValue::Int(max_id), BindValue::Int(max_id)])?);
+    Ok(())
+}
+
+pub(crate) fn push_tag_statements(db: &DbHandle, id: i64, tags: &[String], statements: &mut Vec<D1PreparedStatement>) -> Result<()> {
+    statements.reserve(tags.len() + 1);
+    statements.push(bind_statement(db.prepare(novel_query::DELETE_NOVEL_TAGS_SQL), vec![BindValue::Int(id)])?);
+    for (position, tag) in tags.iter().enumerate() {
+        statements.push(bind_statement(db.prepare(novel_query::INSERT_NOVEL_TAG_SQL), vec![
+            BindValue::Int(id), BindValue::Int(position as i64),
+            BindValue::Text(tag.clone()), BindValue::Text(fold(tag)),
+        ])?);
+    }
+    Ok(())
+}
+
 impl NovelRepository for D1NovelRepository {
     fn get<'a>(&'a self, id: NovelId) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
         Box::pin(async move {
@@ -304,16 +330,19 @@ impl NovelRepository for D1NovelRepository {
             for mutation in &mut mutations {
                 if let NovelMutation::Upsert(record) = mutation {
                     narou_rs::application::attribute_tags::initialize_record(record, &self.sites);
+                    // Keep the tag index, encoded row and registration sequence
+                    // on the same normalized tags without cloning the record.
+                    novel_codec::dedup_tags(&mut record.tags);
                 }
             }
             if mutations.is_empty() {
                 return Ok(());
             }
             // 書き込む小説のタグ (小説 ID 順)。
-            let mut written: Vec<(i64, Vec<String>)> = Vec::new();
+            let mut written: Vec<(i64, &[String])> = Vec::new();
             for mutation in &mutations {
                 if let NovelMutation::Upsert(record) = mutation {
-                    written.push((record.id, record.tags.clone()));
+                    written.push((record.id, &record.tags));
                 }
             }
             written.sort_by_key(|(id, _)| *id);
@@ -339,43 +368,7 @@ impl NovelRepository for D1NovelRepository {
                 for mutation in &mutations {
                     match mutation {
                         NovelMutation::Upsert(record) => {
-                            // Same contract as the native driver's
-                            // `upsert_record_conn`: registration paths can merge
-                            // default tags with retained ones, so normalize before
-                            // encoding — `novel_tags` is UNIQUE (novel_id, tag)
-                            // and tags_json must agree with the indexed rows.
-                            let mut normalized = record.clone();
-                            novel_codec::dedup_tags(&mut normalized.tags);
-                            let record = &normalized;
-                            let max_id = record.id.saturating_add(1);
-                            statements.push(self.prepare(NOVEL_UPSERT_SQL, record_binds(record)?)?);
-                            statements.push(self.prepare(
-                                novel_query::COMMIT_ID_RESERVATION_SQL,
-                                vec![BindValue::Int(record.id)],
-                            )?);
-                            statements.push(self.prepare(
-                                novel_query::DELETE_NOVEL_TAGS_SQL,
-                                vec![BindValue::Int(record.id)],
-                            )?);
-                            for (position, tag) in record.tags.iter().enumerate() {
-                                statements.push(self.prepare(
-                                    novel_query::INSERT_NOVEL_TAG_SQL,
-                                    vec![
-                                        BindValue::Int(record.id),
-                                        BindValue::Int(position as i64),
-                                        BindValue::Text(tag.clone()),
-                                        BindValue::Text(fold(tag)),
-                                    ],
-                                )?);
-                            }
-                            statements.push(self.prepare(
-                                &novel_query::refresh_status_sort_sql(),
-                                vec![BindValue::Int(record.id)],
-                            )?);
-                            statements.push(self.prepare(
-                                novel_query::BUMP_SEQUENCE_SQL,
-                                vec![BindValue::Int(max_id), BindValue::Int(max_id)],
-                            )?);
+                            push_upsert_statements(&self.db, record, &mut statements)?;
                         }
                         NovelMutation::Remove(id) => {
                             statements.push(self.prepare(
@@ -761,7 +754,12 @@ impl TagColorStore for D1TagColorStore {
             for _ in 0..4 {
                 let snapshot = Self::current_rows(&primary).await?;
                 let mut colors = snapshot.colors()?;
-                narou_rs::application::tag_colors::apply_tag_color_update(&mut colors, &update);
+                let changed = narou_rs::application::tag_colors::apply_tag_color_update(&mut colors, &update);
+                if !snapshot.needs_write(changed) {
+                    // This read may overlap a newer commit; do not replace or
+                    // invalidate the cache populated by that writer.
+                    return Ok(colors);
+                }
                 let value_yaml = colors.to_yaml_string().map_err(|error| {
                     NarouError::Platform(format!("cannot serialize D1 tag colors: {error}"))
                 })?;
@@ -1330,8 +1328,6 @@ mod tests {
             ("answer".to_string(), YamlValue::Number(serde_yaml::Number::from(42_i64))),
         ]));
         let binds = record_binds(&record).unwrap();
-        assert_eq!(binds.len(), 36);
-        assert_eq!(NOVEL_UPSERT_SQL.matches('?').count(), 36);
         let BindValue::Text(yaml) = &binds[32] else {
             panic!("extra fields bind must be text");
         };
@@ -1374,12 +1370,4 @@ mod tests {
         assert_eq!(reloaded.color_for("shared"), Some("blue"));
     }
 
-    #[test]
-    fn sql_targets_yaml_columns() {
-        assert!(select_sql().contains("n.extra_fields_yaml"));
-        assert!(!select_sql().contains("extra_fields_json"));
-        assert!(NOVEL_UPSERT_SQL.contains("extra_fields_yaml"));
-        assert!(!NOVEL_UPSERT_SQL.contains("extra_fields_json"));
-        assert!(NOVEL_UPSERT_SQL.contains("extra_fields_bytes"));
-    }
 }

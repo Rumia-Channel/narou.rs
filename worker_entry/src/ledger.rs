@@ -1278,7 +1278,7 @@ pub struct QueuedJobRoute {
 /// One stuck active row selected by
 /// [`narou_rs::application::worker_ledger::select_stuck`] for the cron
 /// reaper. `attempts` is the ledger attempt counter (a `retryable` row
-/// with `attempts >= max_retries` has spent its retry budget).
+/// with `attempts > max_retries` has spent its retry budget).
 #[derive(Debug, Deserialize)]
 pub struct StuckJob {
     pub job_id: String,

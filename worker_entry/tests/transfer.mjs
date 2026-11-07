@@ -24,7 +24,7 @@ import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { inflateRawSync } from 'node:zlib';
+import { deflateSync, inflateSync, inflateRawSync } from 'node:zlib';
 import process from 'node:process';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -177,6 +177,42 @@ const PNG = Buffer.from(
   'base64',
 );
 
+function solidPng(rgb) {
+  const chunk = (name, data) => {
+    const type = Buffer.from(name);
+    const size = Buffer.alloc(4), crc = Buffer.alloc(4);
+    size.writeUInt32BE(data.length);
+    crc.writeUInt32BE(crc32(Buffer.concat([type, data])));
+    return Buffer.concat([size, type, data, crc]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(64, 0); header.writeUInt32BE(96, 4);
+  header[8] = 8; header[9] = 2;
+  const row = Buffer.alloc(1 + 64 * 3);
+  row.fill(Buffer.from(rgb), 1);
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk('IHDR', header), chunk('IDAT', deflateSync(Buffer.concat(Array(96).fill(row)))),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function firstPngPixel(bytes) {
+  assert.deepEqual(bytes.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  assert.equal(bytes[24], 8);
+  assert([2, 6].includes(bytes[25]), 'the solid-color fixture must remain RGB or RGBA');
+  const chunks = [];
+  for (let offset = 8; offset + 12 <= bytes.length;) {
+    const size = bytes.readUInt32BE(offset);
+    if (bytes.toString('ascii', offset + 4, offset + 8) === 'IDAT') chunks.push(bytes.subarray(offset + 8, offset + 8 + size));
+    offset += size + 12;
+  }
+  const pixels = inflateSync(Buffer.concat(chunks));
+  assert(pixels[0] <= 4);
+  // Every PNG row filter predicts zero for the first pixel of the first row.
+  return [...pixels.subarray(1, 4)];
+}
+
 function tocYaml(story, subtitles) {
   const lines = ['---', `toc_url: ${TOC_URL}`, `title: ${TITLE}`, `author: ${AUTHOR}`, 'story: |-', `  ${story}`, 'subtitles:'];
   for (const subtitle of subtitles) {
@@ -224,7 +260,7 @@ function archiveFor(files, options = {}) {
     novels: [
       {
         toc_url: options.tocUrl ?? TOC_URL,
-        title: TITLE,
+        title: options.title ?? TITLE,
         author: AUTHOR,
         sitename: SITENAME,
         domain: DOMAIN,
@@ -704,6 +740,51 @@ try {
   assert.equal(missingFrames.at(-1).type, 'error');
   assert(!missingFrames.some((frame) => frame.type === 'complete'));
   console.log('PASS streamed import reports all 158 committed works and missing exports fail without a completion marker');
+
+  const colors = [[240, 0, 0], [0, 0, 240]];
+  const memberTitles = ['赤い作品', '青い作品'];
+  const memberUrls = memberTitles.map((_, index) => `https://example.com/virtual-image-${index}/`);
+  for (const [index, color] of colors.entries()) {
+    const files = [
+      { path: 'toc.yaml', data: Buffer.from(tocYaml('結合に混ぜない個別あらすじ', [{ index: '1', name: '第一話' }])) },
+      { path: firstSectionPath, data: Buffer.from(sectionYaml('1', '第一話', `${memberTitles[index]}の本文。［＃挿絵（挿絵/001.png）入る］`)) },
+      { path: '挿絵/001.png', data: solidPng(color) },
+    ];
+    const imported = await b.upload(archiveFor(files, { tocUrl: memberUrls[index], ncode: `virtual-image-${index}`, title: memberTitles[index] }));
+    assert.equal(imported.response.status, 200, JSON.stringify(imported.body));
+    assert.equal(imported.body.created, 1);
+  }
+  const withImages = (await b.json('/api/novels?limit=1000')).body.data;
+  const members = memberUrls.map(url => withImages.find(record => record.toc_url === url).id);
+  const post = body => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const virtual = await b.json('/api/virtual_novels', post({ title: '画像結合検証', author: '検証作者', members }));
+  assert.equal(virtual.response.status, 200, JSON.stringify(virtual.body));
+  const virtualId = virtual.body.id;
+  const savedLayout = await b.json(`/api/settings/${virtualId}`, post({ settings: [{ name: 'enable_yokogaki', value: true }] }));
+  assert.equal(savedLayout.response.status, 200, JSON.stringify(savedLayout.body));
+  assert.equal((await b.request(`/api/virtual_novels/${members[0]}/download.epub`)).status, 404);
+  const combined = await b.request(`/api/virtual_novels/${virtualId}/download.epub`);
+  assert.equal(combined.status, 200, combined.status === 200 ? '' : await combined.text());
+  const book = readZip(Buffer.from(await combined.arrayBuffer()));
+  const pixels = [...book].filter(([name]) => name.startsWith('item/image/')).map(([, bytes]) => firstPngPixel(bytes));
+  assert.deepEqual(new Set(pixels.map(rgb => rgb.join(','))), new Set(colors.map(rgb => rgb.join(','))), 'both same-named member images must survive');
+  const packageText = [...book].find(([name]) => name.endsWith('.opf'))[1].toString();
+  assert.match(packageText, /page-progression-direction="ltr"/);
+  const xhtml = [...book].filter(([name]) => name.endsWith('.xhtml')).map(([, bytes]) => bytes.toString()).join('\n');
+  for (const title of memberTitles) assert(xhtml.includes(`${title}の本文`), xhtml);
+  assert(!xhtml.includes('結合に混ぜない個別あらすじ'), 'member books must not be concatenated with their individual front matter');
+  const queued = await b.json('/api/convert', post({ targets: [String(virtualId)], device: 'epub' }));
+  assert.equal(queued.response.status, 200, JSON.stringify(queued.body));
+  const jobId = queued.body.results[0].job_id;
+  let outcome;
+  const deadline = Date.now() + 60000;
+  do {
+    outcome = (await b.json(`/api/jobs/${jobId}`)).body;
+    if (!['pending', 'running'].includes(outcome.status)) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  assert.equal(outcome.status, 'succeeded', JSON.stringify(outcome));
+  console.log('PASS virtual EPUB preserves member pixels, one book structure, target layout, and queued conversion');
 
   exitCode = 0;
 } catch (error) {

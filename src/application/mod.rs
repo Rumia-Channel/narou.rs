@@ -28,6 +28,7 @@ pub mod download_targets;
 pub mod events;
 pub mod target_lookup;
 pub mod convert;
+pub mod virtual_book;
 pub mod mcp;
 pub mod messages;
 pub mod site_definitions;
