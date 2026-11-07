@@ -115,24 +115,17 @@ impl VirtualNovelMembers {
     /// 自身がメンバーにならないことはレコード側の検査で弾く。
     pub fn append(&mut self, virtual_id: i64, new_members: Vec<i64>) -> Result<(), String> {
         validate_members(&new_members)?;
-        let Some(current) = self.groups.get(&virtual_id).cloned() else {
+        if !self.groups.contains_key(&virtual_id) {
             return Err(format!("仮想小説 vs_{virtual_id} は登録されていません"));
-        };
+        }
         for member in &new_members {
-            if current.contains(member) {
-                return Err(format!(
-                    "小説 {member} は既に仮想小説 vs_{virtual_id} に属しています"
-                ));
-            }
             if let Some(owner) = self.owner_of(*member) {
                 return Err(format!(
                     "小説 {member} は既に仮想小説 vs_{owner} に属しています"
                 ));
             }
         }
-        let mut updated = current;
-        updated.extend(new_members);
-        self.groups.insert(virtual_id, updated);
+        self.groups.get_mut(&virtual_id).expect("validated virtual novel").extend(new_members);
         Ok(())
     }
 
@@ -167,6 +160,48 @@ pub fn parse_member_ids(values: &[serde_json::Value]) -> Result<Vec<i64>, String
                 .ok_or_else(|| "メンバー ID は整数で指定してください".to_string())
         })
         .collect()
+}
+
+/// Derived metadata shared by Native and Worker membership mutations.
+#[derive(Default)]
+pub struct MemberSummary {
+    pub tags: Vec<String>,
+    pub latest_update: Option<chrono::DateTime<chrono::Utc>>,
+    pub general_all_no: i64,
+    pub composition: AttributeComposition,
+}
+
+impl MemberSummary {
+    pub fn add(&mut self, record: &crate::db::NovelRecord, count: i64, attribute: Option<&str>) {
+        self.tags.extend(record.tags.iter().filter(|tag| !is_internal_tag(tag)).cloned());
+        self.composition.add(attribute);
+        if let Some(updated) = record.general_lastup
+            && self.latest_update.is_none_or(|current| updated > current)
+        {
+            self.latest_update = Some(updated);
+        }
+        self.general_all_no += count;
+    }
+
+    pub fn merged_tags(&self, id: i64, existing: &[String]) -> Vec<String> {
+        let mut tags: Vec<String> = existing.iter()
+            .filter(|tag| !is_internal_tag(tag))
+            .chain(self.tags.iter().filter(|tag| !crate::application::attribute_tags::is_attribute_tag(tag)))
+            .cloned().collect();
+        tags.push(tag(id));
+        tags.sort();
+        tags.dedup();
+        tags
+    }
+
+    pub fn refresh(&self, record: &mut crate::db::NovelRecord) -> Result<(), String> {
+        let attribute = self.composition.resolve(None, record.attribute_tag())?;
+        record.tags = self.merged_tags(record.id, &record.tags);
+        record.general_all_no = (self.general_all_no > 0).then_some(self.general_all_no);
+        record.general_lastup = self.latest_update;
+        record.set_attribute_tag(attribute);
+        Ok(())
+    }
 }
 
 /// 属性タグ (小説 / 漫画) の構成。

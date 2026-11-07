@@ -334,56 +334,63 @@ impl Database {
                 .collect::<BTreeMap<_, _>>(),
         )?;
         let written = tags_of_data(&self.data);
-        let using_sqlite = self.using_sqlite();
         let sequence_path = self.inventory.inventory_path("tag_sequence", InventoryScope::Local);
         let yaml_path = self.inventory.inventory_path(DATABASE_NAME, InventoryScope::Local);
         // 作品と連番表を同じ直列化境界の中で確定する ✓
         crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
             crate::db::inventory::with_exclusive_file_lock(&yaml_path, || {
-                // 事前状態は両方のロックを取ったあとに読む (ロックを取った前の
-                // 状態を使うと、並行した書き込みと食い違う ✗)。
-                let before_library = persisted_library_tags(&self.inventory)?;
-                // 連番表を先に確定する。失敗したら作品を書かない (作品だけ
-                // 確定した状態を作らない ✓)。
-                let previous = write_tag_sequence_file(
-                    &self.inventory,
-                    &sequence_path,
-                    before_library.as_ref(),
-                    &written,
-                )?;
-                // 作品データの保存に失敗を注入する (テスト用 ✓)。
-                let saved = (|| -> Result<()> {
+                LockedFileUpdates::run(&self.inventory, |files| {
+                    let before_library = persisted_library_tags(&self.inventory)?;
+                    let (sequence, changed) = crate::native::tag_sequence::advance_content(
+                        files.original(&sequence_path)?.unwrap_or_default(),
+                        before_library.as_ref(), &written,
+                    )?;
+                    if changed { files.write(&sequence_path, &sequence)?; }
                     crate::native::tag_sequence::notify_record_save_hook()?;
-                    crate::db::inventory::atomic_write_locked(&yaml_path, &content)?;
-                    self.inventory.unload(DATABASE_NAME);
-                    if !using_sqlite {
-                        self.index.flush(&self.inventory)?;
-                    }
+                    files.write(&yaml_path, &content)?;
                     Ok(())
-                })();
-                if let Err(error) = saved {
-                    // 作品データが確定しなかったなら、連番表も元に戻す (タグ
-                    // だけ登録された状態を作らない ✓)。
-                    restore_tag_sequence_file(&self.inventory, &sequence_path, &previous)?;
-                    return Err(error);
-                }
-                Ok(())
+                })
             })
-        })
+        })?;
+        self.index.flush(&self.inventory)
     }
 
     pub fn update_records<T, F>(&mut self, update: F) -> Result<T>
     where
         F: FnOnce(BTreeMap<i64, NovelRecord>) -> Result<(BTreeMap<i64, NovelRecord>, T)>,
     {
+        self.update_records_inner(false, |records, _| {
+            let (records, result) = update(records)?;
+            Ok((records, crate::virtual_novel::VirtualNovelMembers::default(), result))
+        })
+    }
+
+    /// Publish virtual membership, parent metadata and tag registration together.
+    pub(crate) fn update_virtual_records<T, F>(&mut self, update: F) -> Result<T>
+    where
+        F: FnOnce(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers)
+            -> Result<(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers, T)>,
+    {
+        self.update_records_inner(true, update)
+    }
+
+    fn update_records_inner<T, F>(&mut self, update_members: bool, update: F) -> Result<T>
+    where
+        F: FnOnce(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers)
+            -> Result<(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers, T)>,
+    {
+        let members_path = update_members.then(|| self.inventory.inventory_path("virtual_novel_members", InventoryScope::Local));
+        let parse_members = |raw: Option<&str>| -> Result<crate::virtual_novel::VirtualNovelMembers> {
+            let raw = raw.unwrap_or_default();
+            if raw.trim().is_empty() { Ok(Default::default()) } else { Ok(serde_yaml::from_str(raw)?) }
+        };
         #[cfg(feature = "native-runtime")]
         if let Some(repo) = &self.sqlite {
             let state = self.state_handle().ok_or_else(|| crate::error::NarouError::Database(
                 "SQLite state is unavailable during record mutation".into(),
             ))?;
             let yaml_path = self.inventory.inventory_path(DATABASE_NAME, InventoryScope::Local);
-            // 連番表のファイルロックを先に取り、作品との直列化順序を揃える
-            // (他の管理状態のロックは連番表 → database.yaml の順)。
+            // Lock order: compat -> tag sequence -> membership -> database.
             let sequence_path = self.inventory.inventory_path("tag_sequence", InventoryScope::Local);
             // 書き込み前のライブラリ (バックフィルの材料) を作る。
             let before_library: std::cell::RefCell<
@@ -391,7 +398,7 @@ impl Database {
             > = std::cell::RefCell::new(None);
             let (updated, result, compat) = state.with_compat_lock(|| {
                 let compat = state.compat_now();
-                let operation = || {
+                let operation = || LockedFileUpdates::run(&self.inventory, |files| {
                     let conn = repo.conn_handle();
                     let mut guard = conn.lock();
                     // Acquire the database write lock BEFORE reading. The process
@@ -400,13 +407,9 @@ impl Database {
                         .map_err(crate::native::sqlite::sqlite_error)?;
                     let mut current = crate::native::sqlite::bulk::load_all_records(&tx)?;
                     if compat {
-                        match std::fs::read_to_string(&yaml_path) {
-                            Ok(raw) => {
-                                current = if raw.trim().is_empty() { BTreeMap::new() }
-                                    else { serde_yaml::from_str(&raw)? };
-                            }
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(error) => return Err(error.into()),
+                        if let Some(raw) = files.original(&yaml_path)? {
+                            current = if raw.trim().is_empty() { BTreeMap::new() }
+                                else { serde_yaml::from_str(raw)? };
                         }
                     }
                     for (&id, record) in &mut current { record.id = id; }
@@ -414,20 +417,26 @@ impl Database {
                         current.iter().map(|(id, record)| (*id, record.tags.as_slice())),
                         |tag| !crate::virtual_novel::is_internal_tag(tag),
                     ));
-                    let (mut updated, result) = update(current)?;
+                    let member_yaml = if update_members {
+                        state.read_state_row_conn(&tx, "inv", "virtual_novel_members")?
+                    } else { None };
+                    let members = if let Some(path) = members_path.as_deref() {
+                        let file = if compat { files.original(path)? } else { None };
+                        parse_members(file.or(member_yaml.as_deref()))?
+                    } else { Default::default() };
+                    let (mut updated, members, result) = update(current, members)?;
                     for (&id, record) in &mut updated { record.id = id; }
                     crate::native::sqlite::bulk::replace_records_conn(&tx, &updated)?;
                     // 連番表を作品と同じトランザクションで確定する。別の
                     // トランザクションにすると「作品を保存した順」と「連番を
                     // 振った順」がずれる。
                     let written = tags_of_records(&updated);
-                    // 互換モードではファイルが正なので、ファイルから読む。
-                    let current_sequence = if compat {
-                        crate::db::inventory::read_optional_yaml_file(&sequence_path)?
-                    } else {
-                        state
-                            .read_state_row_conn(&tx, "inv", "tag_sequence")?
-                            .unwrap_or_default()
+                    // A present compatibility file is authoritative, including
+                    // an explicit empty file. A missing mirror retains SQL state.
+                    let sequence_file = if compat { files.original(&sequence_path)? } else { None };
+                    let current_sequence = match sequence_file {
+                        Some(raw) => std::borrow::Cow::Borrowed(raw),
+                        None => std::borrow::Cow::Owned(state.read_state_row_conn(&tx, "inv", "tag_sequence")?.unwrap_or_default()),
                     };
                     let (content, changed) = crate::native::tag_sequence::advance_content(
                         &current_sequence,
@@ -439,23 +448,39 @@ impl Database {
                         if compat {
                             // 互換モードではファイルが正。鏡と SHA を同じ
                             // トランザクションで更新する。
-                            crate::db::inventory::atomic_write_locked(&sequence_path, &content)?;
+                            files.write(&sequence_path, &content)?;
                             state.finish_file_row_conn(&tx, "tag_sequence.yaml", &content)?;
+                        }
+                    }
+                    if let Some(path) = members_path.as_deref() {
+                        let content = crate::db::inventory::serialize_yaml_content(&members)?;
+                        let changed = member_yaml.as_deref() != Some(content.as_str());
+                        if changed {
+                            state.write_state_row_conn(&tx, "inv", "virtual_novel_members", &content)?;
+                        }
+                        if compat {
+                            let published = files.write(path, &content)?;
+                            if published || changed {
+                                state.finish_file_row_conn(&tx, "virtual_novel_members.yaml", &content)?;
+                            }
                         }
                     }
                     if compat {
                         let content = serde_yaml::to_string(&updated)?;
                         // The file lock is already held. Failed publication rolls
                         // back the SQL mutation and does not acknowledge a new SHA.
-                        crate::db::inventory::atomic_write_locked(&yaml_path, &content)?;
+                        files.write(&yaml_path, &content)?;
                         remember_records_mirror(&tx, &content)?;
                     }
                     tx.commit().map_err(crate::native::sqlite::sqlite_error)?;
                     Ok((updated, result, compat))
-                };
+                });
                 if compat {
                     crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
-                        crate::db::inventory::with_exclusive_file_lock(&yaml_path, operation)
+                        let publish = || crate::db::inventory::with_exclusive_file_lock(&yaml_path, operation);
+                        if let Some(path) = members_path.as_deref() {
+                            crate::db::inventory::with_exclusive_file_lock(path, publish)
+                        } else { publish() }
                     })
                 } else {
                     operation()
@@ -475,15 +500,16 @@ impl Database {
         let before_library: std::cell::RefCell<
             Option<crate::application::tag_sequence::LibraryTags>,
         > = std::cell::RefCell::new(None);
-        let previous_sequence: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
         let sequence_path = self.inventory.inventory_path("tag_sequence", InventoryScope::Local);
+        let yaml_path = self.inventory.inventory_path(DATABASE_NAME, InventoryScope::Local);
         // 連番表のロックを先に取り、作品の書き込みと同じ直列化境界の中で
         // 連番表も確定する (別に更新すると順序が作品とずれる)。
         let result = crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
-            let outcome = self.inventory.update_yaml(
-                DATABASE_NAME,
-                InventoryScope::Local,
-                |mut current: BTreeMap<i64, NovelRecord>| {
+            let operation = || crate::db::inventory::with_exclusive_file_lock(&yaml_path, || {
+                LockedFileUpdates::run(&self.inventory, |files| {
+                    let raw = files.original(&yaml_path)?.unwrap_or_default();
+                    let mut current: BTreeMap<i64, NovelRecord> =
+                        if raw.is_empty() { BTreeMap::new() } else { serde_yaml::from_str(raw)? };
                     for (id, record) in current.iter_mut() {
                         record.id = *id;
                     }
@@ -492,32 +518,30 @@ impl Database {
                             current.iter().map(|(id, record)| (*id, record.tags.as_slice())),
                             |tag| !crate::virtual_novel::is_internal_tag(tag),
                         ));
-                    let (mut updated, result) = update(current)?;
+                    let members = if let Some(path) = members_path.as_deref() {
+                        parse_members(files.original(path)?)?
+                    } else { Default::default() };
+                    let (mut updated, members, result) = update(current, members)?;
                     for (id, record) in updated.iter_mut() {
                         record.id = *id;
                     }
-                    // 連番表を作品と同じロックの中で確定する ✓
                     let written = tags_of_records(&updated);
-                    let previous = write_tag_sequence_file(
-                        &self.inventory,
-                        &sequence_path,
-                        before_library.borrow().as_ref(),
-                        &written,
+                    let (content, changed) = crate::native::tag_sequence::advance_content(
+                        files.original(&sequence_path)?.unwrap_or_default(),
+                        before_library.borrow().as_ref(), &written,
                     )?;
-                    *previous_sequence.borrow_mut() = Some(previous);
-                    // 作品データの保存に失敗を注入する (テスト用 ✓)。
+                    if changed { files.write(&sequence_path, &content)?; }
+                    if let Some(path) = members_path.as_deref() {
+                        files.write(path, &crate::db::inventory::serialize_yaml_content(&members)?)?;
+                    }
                     crate::native::tag_sequence::notify_record_save_hook()?;
-                    Ok((updated, result))
-                },
-            );
-            if outcome.is_err()
-                && let Some(previous) = previous_sequence.borrow().as_ref()
-            {
-                // 作品データが確定しなかったなら、連番表も元に戻す (タグだけ
-                // 登録された状態を作らない ✓)。
-                restore_tag_sequence_file(&self.inventory, &sequence_path, previous)?;
-            }
-            outcome
+                    files.write(&yaml_path, &crate::db::inventory::serialize_yaml_content(&updated)?)?;
+                    Ok(result)
+                })
+            });
+            if let Some(path) = members_path.as_deref() {
+                crate::db::inventory::with_exclusive_file_lock(path, operation)
+            } else { operation() }
         })?;
         self.refresh()?;
         if !self.using_sqlite() {
@@ -654,6 +678,85 @@ impl Database {
     }
 }
 
+/// Restore already-published YAML projections when a later write/commit fails.
+/// Callers retain every file lock through publication and rollback. This is not
+/// a crash-atomic multi-file filesystem transaction.
+#[derive(Default)]
+struct LockedFileUpdates<'a> {
+    files: Vec<FileUpdate<'a>>,
+}
+
+struct FileUpdate<'a> {
+    path: &'a Path,
+    original: Option<String>,
+    written: bool,
+}
+
+impl<'a> LockedFileUpdates<'a> {
+    fn run<T>(inventory: &Inventory, operation: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let mut files = Self::default();
+        let result = operation(&mut files);
+        files.finish(inventory, result)
+    }
+
+    fn entry(&mut self, path: &'a Path) -> Result<&mut FileUpdate<'a>> {
+        let index = match self.files.iter().position(|entry| entry.path == path) {
+            Some(index) => index,
+            None => {
+                let original = match crate::db::inventory::ensure_yaml_size_limit(path) {
+                    Err(crate::error::NarouError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    result => {
+                        result?;
+                        Some(std::fs::read_to_string(path)?)
+                    }
+                };
+                self.files.push(FileUpdate { path, original, written: false });
+                self.files.len() - 1
+            }
+        };
+        Ok(&mut self.files[index])
+    }
+
+    fn original(&mut self, path: &'a Path) -> Result<Option<&str>> {
+        Ok(self.entry(path)?.original.as_deref())
+    }
+
+    fn write(&mut self, path: &'a Path, content: &str) -> Result<bool> {
+        let entry = self.entry(path)?;
+        if entry.original.as_deref() == Some(content) { return Ok(false); }
+        // Rename may succeed before directory synchronization returns an error.
+        entry.written = true;
+        crate::db::inventory::atomic_write_locked(path, content)?;
+        Ok(true)
+    }
+
+    fn finish<T>(self, inventory: &Inventory, result: Result<T>) -> Result<T> {
+        let mut failures = Vec::new();
+        for entry in self.files.into_iter().rev().filter(|entry| entry.written) {
+            if let Some(name) = entry.path.file_stem().and_then(|name| name.to_str()) {
+                inventory.unload(name);
+            }
+            if result.is_err() {
+                let restored = match entry.original {
+                    Some(content) => crate::db::inventory::atomic_write_locked(entry.path, &content),
+                    None => match std::fs::remove_file(entry.path) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(error.into()),
+                    },
+                };
+                if let Err(error) = restored { failures.push(format!("{}: {error}", entry.path.display())); }
+            }
+        }
+        match result {
+            Err(error) if !failures.is_empty() => Err(crate::error::NarouError::Database(
+                format!("{error}; YAML rollback failed: {}", failures.join("; ")),
+            )),
+            result => result,
+        }
+    }
+}
+
 /// 保存済みのライブラリのタグを読む。
 ///
 /// バックフィル (既存タグの登録順) の材料にする。読めなければ `None`。
@@ -687,53 +790,6 @@ fn tags_of_records(records: &BTreeMap<i64, NovelRecord>) -> Vec<&str> {
         .collect()
 }
 
-/// 連番表のファイルを更新する。
-///
-/// 呼び出し側が `path` の排他ロックを保持している前提で、記録の保存と同じ
-/// 直列化境界の中で連番表を確定する。`before` は書き込み前のライブラリのタグ
-/// (連番表が未初期化のときのバックフィルに使う)、`written` は書き込み後の
-/// 小説に付いたタグ。
-///
-/// 返り値は直前の内容 (作品データの保存が失敗したときに元へ戻すため ✓)。
-fn write_tag_sequence_file(
-    inventory: &Inventory,
-    path: &Path,
-    before: Option<&crate::application::tag_sequence::LibraryTags>,
-    written: &[&str],
-) -> Result<String> {
-    let current = crate::db::inventory::read_optional_yaml_file(path)?;
-    let (content, changed) =
-        crate::native::tag_sequence::advance_content(&current, before, written)?;
-    if changed {
-        crate::db::inventory::atomic_write_locked(path, &content)?;
-        // 在庫のキャッシュはファイルの更新時刻で検証するが、直接書いた
-        // 場合は読み直さないので明示的に捨てる。
-        inventory.unload("tag_sequence");
-    }
-    Ok(current)
-}
-
-/// 連番表のファイルを直前の内容に戻す。
-///
-/// 作品データの保存に失敗して作品だけが確定しなかったとき、連番表に残った
-/// タグを消して順序のずれを防ぐ (呼び出し側がロックを保持している前提 ✓)。
-fn restore_tag_sequence_file(
-    inventory: &Inventory,
-    path: &Path,
-    previous: &str,
-) -> Result<()> {
-    if previous.trim().is_empty() {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    } else {
-        crate::db::inventory::atomic_write_locked(path, previous)?;
-    }
-    inventory.unload("tag_sequence");
-    Ok(())
-}
 
 /// 小説に付いたタグ (小説 ID 順 → 小説内の位置順)。
 ///
@@ -1343,6 +1399,193 @@ mod tests {
             ["y".to_string(), "x".to_string()],
             "保存できた順に並ぶ"
         );
+    }
+
+    fn seed_virtual_records(db: &mut Database) {
+        db.update_virtual_records(|mut records, mut members| {
+            records.insert(1, sample_record(1, None, &["member"]));
+            records.insert(2, sample_record(2, None, &["member"]));
+            let mut parent = sample_record(3, None, &["initial", "vs_3"]);
+            parent.ncode = Some("vs_3".into());
+            parent.general_all_no = Some(1);
+            records.insert(3, parent);
+            members.insert(3, vec![1]).unwrap();
+            Ok((records, members, ()))
+        }).unwrap();
+    }
+
+    #[test]
+    fn a_failed_virtual_record_save_restores_membership_and_tag_order() {
+        let _global = crate::test_support::global_state_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        let mut db = Database::with_root(root.clone()).unwrap();
+        seed_virtual_records(&mut db);
+        let before = ["database.yaml", "virtual_novel_members.yaml", "tag_sequence.yaml"].map(|name| {
+            let path = root.join(".narou").join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        });
+        let writer_root = root.clone();
+        std::thread::spawn(move || {
+            let mut db = Database::with_root(writer_root).unwrap();
+            crate::native::tag_sequence::set_record_save_hook(|| {
+                Err(crate::error::NarouError::Database("injected publication failure".into()))
+            });
+            db.update_virtual_records(|mut records, mut members| {
+                members.append(3, vec![2]).unwrap();
+                let parent = records.get_mut(&3).unwrap();
+                parent.general_all_no = Some(2);
+                parent.tags.push("unpublished".into());
+                Ok((records, members, ()))
+            }).expect_err("the injected record publication must fail");
+        }).join().unwrap();
+        for (path, bytes) in before {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+        let reopened = Database::with_root(root).unwrap();
+        assert_eq!(reopened.get(3).unwrap().general_all_no, Some(1));
+    }
+
+    #[test]
+    fn a_failed_virtual_commit_restores_compatibility_files() {
+        let _global = crate::test_support::global_state_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        crate::native::sqlite::state::write_mode(&root.join(".narou"), crate::native::sqlite::state::StorageMode::Sqlite).unwrap();
+        let mut db = Database::with_root(root.clone()).unwrap();
+        let state = db.state_handle().unwrap();
+        state.set_raw("inv", "local_setting", "narou-compat: true\n").unwrap();
+        seed_virtual_records(&mut db);
+        let before = ["database.yaml", "virtual_novel_members.yaml", "tag_sequence.yaml"].map(|name| {
+            let path = root.join(".narou").join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        });
+        state.conn_ref().lock().execute_batch(
+            "CREATE TABLE deferred_virtual_failure(novel_id INTEGER REFERENCES novels(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER fail_virtual_commit AFTER UPDATE OF general_all_no ON novels WHEN NEW.id=3
+             BEGIN INSERT INTO deferred_virtual_failure(novel_id) VALUES(999); END;"
+        ).unwrap();
+        db.update_virtual_records(|mut records, mut members| {
+            members.append(3, vec![2]).unwrap();
+            let parent = records.get_mut(&3).unwrap();
+            parent.general_all_no = Some(2);
+            parent.tags.push("unpublished".into());
+            Ok((records, members, ()))
+        }).expect_err("the deferred foreign key must reject commit");
+        for (path, bytes) in before {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+        let (raw, count): (String, i64) = state.conn_ref().lock().query_row(
+            "SELECT a.value_yaml,n.general_all_no FROM app_state a,novels n WHERE a.scope='inv' AND a.key='virtual_novel_members' AND n.id=3",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let members: crate::virtual_novel::VirtualNovelMembers = serde_yaml::from_str(&raw).unwrap();
+        assert_eq!(members.get(3), Some([1].as_slice()));
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn virtual_membership_uses_sqlite_when_its_compatibility_file_is_missing() {
+        let _global = crate::test_support::global_state_guard();
+        for explicit_empty in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().to_path_buf();
+            crate::native::sqlite::state::write_mode(&root.join(".narou"), crate::native::sqlite::state::StorageMode::Sqlite).unwrap();
+            let mut db = Database::with_root(root.clone()).unwrap();
+            let state = db.state_handle().unwrap();
+            state.set_raw("inv", "local_setting", "narou-compat: true\n").unwrap();
+            seed_virtual_records(&mut db);
+            let path = root.join(".narou/virtual_novel_members.yaml");
+            if explicit_empty { std::fs::write(&path, "").unwrap(); }
+            else { std::fs::remove_file(&path).unwrap(); }
+            db.update_virtual_records(|mut records, mut members| {
+                let mut parent = sample_record(4, None, &["vs_4"]);
+                parent.ncode = Some("vs_4".into());
+                records.insert(4, parent);
+                members.insert(4, vec![2]).unwrap();
+                Ok((records, members, ()))
+            }).unwrap();
+            let members: crate::virtual_novel::VirtualNovelMembers =
+                serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(members.get(3), (!explicit_empty).then_some([1].as_slice()));
+            assert_eq!(members.get(4), Some([2].as_slice()));
+            assert!(db.get(3).is_some() && db.get(4).is_some());
+        }
+    }
+
+    #[test]
+    fn virtual_publication_sync_failures_restore_every_published_file() {
+        let _global = crate::test_support::global_state_guard();
+        for sqlite_compat in [false, true] {
+            for failed_name in ["database.yaml", "virtual_novel_members.yaml", "tag_sequence.yaml"] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().to_path_buf();
+                std::fs::create_dir_all(root.join(".narou")).unwrap();
+                if sqlite_compat {
+                    crate::native::sqlite::state::write_mode(&root.join(".narou"), crate::native::sqlite::state::StorageMode::Sqlite).unwrap();
+                }
+                let mut db = Database::with_root(root.clone()).unwrap();
+                if sqlite_compat {
+                    db.state_handle().unwrap().set_raw("inv", "local_setting", "narou-compat: true\n").unwrap();
+                }
+                seed_virtual_records(&mut db);
+                let before = ["database.yaml", "virtual_novel_members.yaml", "tag_sequence.yaml"].map(|name| {
+                    let path = root.join(".narou").join(name);
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                });
+                let writer_root = root.clone();
+                std::thread::spawn(move || {
+                    let mut db = Database::with_root(writer_root.clone()).unwrap();
+                    crate::db::inventory::fail_after_publication(writer_root.join(".narou").join(failed_name));
+                    let error = db.update_virtual_records(|mut records, mut members| {
+                        members.append(3, vec![2]).unwrap();
+                        let parent = records.get_mut(&3).unwrap();
+                        parent.general_all_no = Some(2);
+                        parent.tags.push("unpublished".into());
+                        Ok((records, members, ()))
+                    }).unwrap_err();
+                    assert!(error.to_string().contains("injected post-publication"));
+                }).join().unwrap();
+                for (path, bytes) in before {
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes, "sqlite={sqlite_compat}: {}", path.display());
+                }
+                assert_eq!(Database::with_root(root).unwrap().get(3).unwrap().general_all_no, Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn record_save_sync_failures_restore_records_and_tag_order() {
+        let _global = crate::test_support::global_state_guard();
+        for failed_name in ["database.yaml", "tag_sequence.yaml"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().to_path_buf();
+            std::fs::create_dir_all(root.join(".narou")).unwrap();
+            let mut db = Database::with_root(root.clone()).unwrap();
+            seed_virtual_records(&mut db);
+            let before = ["database.yaml", "tag_sequence.yaml"].map(|name| {
+                let path = root.join(".narou").join(name);
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            });
+            let writer_root = root.clone();
+            std::thread::spawn(move || {
+                let mut db = Database::with_root(writer_root.clone()).unwrap();
+                let record = db.data.get_mut(&1).unwrap();
+                record.title = "unpublished title".into();
+                record.tags.push("unpublished tag".into());
+                crate::db::inventory::fail_after_publication(writer_root.join(".narou").join(failed_name));
+                assert!(db.save().unwrap_err().to_string().contains("injected post-publication"));
+            }).join().unwrap();
+            for (path, bytes) in before {
+                assert_eq!(std::fs::read(&path).unwrap(), bytes, "{}", path.display());
+            }
+            assert_eq!(Database::with_root(root).unwrap().get(1).unwrap().title, "title 1");
+        }
     }
 
     fn sample_record(id: i64, length: Option<i64>, tags: &[&str]) -> NovelRecord {

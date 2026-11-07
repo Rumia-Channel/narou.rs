@@ -53,17 +53,19 @@ fn write_fixture(root: &Path) {
     }
 }
 
-fn run(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_narou_rs"))
-        .args(args)
-        .current_dir(root)
+fn command(root: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_narou_rs"));
+    command.current_dir(root)
         .env("HOME", root)
         .env("USERPROFILE", root)
         .env("NAROU_RS_LEGACY_YAML", "1")
         .env("NAROU_RS_ASSET_BACKEND", "local")
-        .env_remove("NAROU_RS_EPUB_ENGINE")
-        .output()
-        .expect("run narou_rs")
+        .env_remove("NAROU_RS_EPUB_ENGINE");
+    command
+}
+
+fn run(root: &Path, args: &[&str]) -> std::process::Output {
+    command(root).args(args).output().expect("run narou_rs")
 }
 
 #[test]
@@ -474,4 +476,43 @@ fn appending_members_extends_the_virtual_novel_and_refreshes_its_record() {
     let second_body = text.find("ＢＯＤＹ－二").expect("second body");
     let third_body = text.find("ＢＯＤＹ－三").expect("third body");
     assert!(second_body < third_body, "the appended member must be last");
+}
+
+#[test]
+fn failed_sqlite_virtual_removal_preserves_membership_and_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture(root);
+    std::fs::write(root.join(".narou/storage-backend"), "sqlite").unwrap();
+    let added = command(root).env_remove("NAROU_RS_LEGACY_YAML")
+        .args(["virtual", "add", "--title", "Atomic", "1"]).output().unwrap();
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let connection = rusqlite::Connection::open(root.join(".narou/db.sqlite")).unwrap();
+    let before: String = connection.query_row(
+        "SELECT value_yaml FROM app_state WHERE scope='inv' AND key='virtual_novel_members'",
+        [], |row| row.get(0),
+    ).unwrap();
+    connection.execute_batch(
+        "CREATE TRIGGER fail_virtual_remove BEFORE DELETE ON novels WHEN OLD.id=3 BEGIN SELECT RAISE(ABORT,'virtual deletion fixture'); END;"
+    ).unwrap();
+    let removed = command(root).env_remove("NAROU_RS_LEGACY_YAML")
+        .args(["virtual", "remove", "vs_3"]).output().unwrap();
+    assert!(!removed.status.success());
+    let after: String = connection.query_row(
+        "SELECT value_yaml FROM app_state WHERE scope='inv' AND key='virtual_novel_members'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(after, before, "a failed removal must not detach the surviving parent");
+    let ids: Vec<i64> = connection.prepare("SELECT id FROM novels ORDER BY id").unwrap()
+        .query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(ids, [1, 2, 3]);
+}
+
+#[test]
+fn corrupt_membership_is_not_reported_as_an_empty_library() {
+    let temp = tempfile::tempdir().unwrap();
+    write_fixture(temp.path());
+    std::fs::write(temp.path().join(".narou/virtual_novel_members.yaml"), "3: [1,").unwrap();
+    let listed = run(temp.path(), &["virtual", "list"]);
+    assert!(!listed.status.success(), "corrupt membership must be reported, not silently hidden");
 }

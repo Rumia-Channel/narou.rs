@@ -81,7 +81,7 @@ if (!/^\d+\.\d+\.\d+$/.test(WRANGLER_VERSION)) {
 const WRANGLER_PACKAGE = `wrangler@${WRANGLER_VERSION}`;
 const config = readFileSync(join(root, "wrangler.toml"), "utf8")
   .replace(/\[build\][^\[]*/, "")
-  .replace(/^main = .*$/m, `main = ${JSON.stringify(join(root, "build/worker/shim.mjs").replaceAll("\\", "/"))}`)
+  .replace(/^main = .*$/m, `main = ${JSON.stringify(join(here, "virtual_race_worker.mjs").replaceAll("\\", "/"))}`)
   .replace(/^directory = .*$/m, `directory = ${JSON.stringify(join(root, "public").replaceAll("\\", "/"))}`)
   .replace(/^migrations_dir = .*$/m, `migrations_dir = ${JSON.stringify(join(root, "migrations").replaceAll("\\", "/"))}`);
 writeFileSync(testConfig, config);
@@ -174,8 +174,9 @@ dev = spawn(
     });
     exitCode = tagSequence.status ?? 1;
   }
-  if (exitCode === 0) {
-    const attributes = spawnSync(process.execPath, [join(here, "virtual_attributes.mjs")], {
+  for (const name of ["virtual_attributes.mjs", "virtual_membership.mjs"]) {
+    if (exitCode !== 0) break;
+    const virtual = spawnSync(process.execPath, [join(here, name)], {
       cwd: root, stdio: "inherit",
       env: {
         ...process.env, BASE_URL: base, NAROU_ADMIN_TOKEN: token,
@@ -183,7 +184,7 @@ dev = spawn(
         NAROU_WRANGLER_VERSION: WRANGLER_VERSION,
       },
     });
-    exitCode = attributes.status ?? 1;
+    exitCode = virtual.status ?? 1;
   }
 
   // 7. トークンを外した構成で fail-closed を確かめる（任意・既定 off）。

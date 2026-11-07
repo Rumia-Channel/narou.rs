@@ -61,7 +61,7 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> (StatusCode
     )
 }
 
-pub async fn api_virtual_list() -> Json<serde_json::Value> {
+pub async fn api_virtual_list() -> (StatusCode, Json<serde_json::Value>) {
     let repository = NativeNovelRepository::new();
     match virtual_novel::load() {
         Ok(groups) => {
@@ -111,9 +111,9 @@ pub async fn api_virtual_list() -> Json<serde_json::Value> {
                     }))
                 })
                 .collect::<Vec<_>>();
-            Json(serde_json::json!({"success": true, "novels": novels}))
+            (StatusCode::OK, Json(serde_json::json!({"success": true, "novels": novels})))
         }
-        Err(error) => Json(serde_json::json!({"success": false, "message": error.to_string()})),
+        Err(error) => error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
     }
 }
 
@@ -487,6 +487,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_corrupt_membership_list_is_unavailable() {
+        use axum::response::IntoResponse;
+
+        let _global = crate::test_support::global_state_guard();
+        let _legacy = crate::test_support::legacy_yaml_guard();
+        let (temp, _cwd_guard, _db_guard) = isolated_library();
+        std::fs::write(temp.path().join(".narou/virtual_novel_members.yaml"), "5: [3,").unwrap();
+
+        let response = api_virtual_list().await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["success"], false);
+        assert!(body.get("novels").is_none());
+    }
+
+    #[tokio::test]
     async fn the_list_keeps_the_stored_attribute_when_the_classification_fails() {
         let _global = crate::test_support::global_state_guard();
         let _legacy = crate::test_support::legacy_yaml_guard();
@@ -515,10 +532,12 @@ mod tests {
             let mut members = crate::native::virtual_novel::load().unwrap();
             members.remove(record.id);
             members.insert(record.id, vec![99]).unwrap();
-            crate::native::virtual_novel::save(&members).unwrap();
+            crate::db::inventory::Inventory::with_default_root().unwrap()
+                .save("virtual_novel_members", crate::db::inventory::InventoryScope::Local, &members).unwrap();
         }
 
-        let body = api_virtual_list().await .0;
+        let (status, body) = api_virtual_list().await;
+        assert_eq!(status, StatusCode::OK);
         let novels = body["novels"].as_array().unwrap();
         let entry = novels
             .iter()

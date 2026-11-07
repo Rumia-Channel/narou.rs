@@ -12,12 +12,14 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import process from 'node:process';
-import { spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const BASE_URL = process.env.BASE_URL ?? 'http://127.0.0.1:8787';
 const TOKEN = process.env.NAROU_ADMIN_TOKEN ?? 'local-contract-token';
+const execFileAsync = promisify(execFile);
 
 function auth() {
   return { Authorization: `Bearer ${TOKEN}` };
@@ -317,28 +319,28 @@ if (process.env.NAROU_TEST_CONFIG && process.env.NAROU_TEST_PERSIST) {
   const persist = process.env.NAROU_TEST_PERSIST;
   const queryFile = join(dirname(config), 'favorite-fixture.sql');
   const quote = value => `'${value.replaceAll("'", "''")}'`;
-  function sql(command) {
+  // Keep the HTTP client's event loop running while Wrangler prepares SQL.
+  async function sql(command) {
     writeFileSync(queryFile, command);
-    const result = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', [
+    const result = await execFileAsync(process.platform === 'win32' ? 'npx.cmd' : 'npx', [
       '--yes', `wrangler@${process.env.NAROU_WRANGLER_VERSION || '4.151.3'}`,
       'd1', 'execute', 'DB', '--local', '--config', config,
       '--persist-to', persist, '--file', queryFile, '--json',
     ], { encoding: 'utf8', shell: process.platform === 'win32' });
-    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
     return JSON.parse(result.stdout.slice(result.stdout.indexOf('[\n')));
   }
-  const replace = raw => sql(`INSERT INTO app_state(scope,key,value_json,value_yaml)
+  const replace = async raw => (await sql(`INSERT INTO app_state(scope,key,value_json,value_yaml)
     VALUES ('inv','favorite_tags',${quote(raw)},${quote(raw)})
-    ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,value_yaml=excluded.value_yaml;`);
+    ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,value_yaml=excluded.value_yaml;`));
   const original = JSON.stringify({ tags: favoriteState.tags });
   try {
-    replace(JSON.stringify([firstTag, '1023', '2']));
+    (await replace(JSON.stringify([firstTag, '1023', '2'])));
     assert.deepEqual(await favoriteMutation({ action: 'add', tags: [secondTag] }),
       [firstTag, '1023', '2', secondTag]);
     console.log('PASS a legacy D1 favorite array supports read-modify-write');
 
     const corrupt = '{"tags":"not-a-list"}';
-    replace(corrupt);
+    (await replace(corrupt));
     await setTagOrder('favorites_first');
     for (const path of ['/api/favorite_tags', '/api/tag_list?format=json']) {
       assert.equal((await request(path, { headers: auth() })).status, 503, path);
@@ -348,40 +350,40 @@ if (process.env.NAROU_TEST_CONFIG && process.env.NAROU_TEST_PERSIST) {
       body: JSON.stringify({ action: 'add', tags: [batchTag] }),
     });
     assert.equal(mutation.status, 503);
-    assert.equal(sql("SELECT value_json FROM app_state WHERE scope='inv' AND key='favorite_tags'")[0].results[0].value_json, corrupt);
+    assert.equal((await sql("SELECT value_json FROM app_state WHERE scope='inv' AND key='favorite_tags'"))[0].results[0].value_json, corrupt);
     console.log('PASS malformed D1 favorites are reported without being erased');
 
     const initial = JSON.stringify({ tags: [firstTag] });
     const competing = JSON.stringify({ tags: [firstTag, secondTag] });
-    replace(initial);
-    sql(`CREATE TRIGGER favorite_update_conflict BEFORE UPDATE OF value_json ON app_state
+    (await replace(initial));
+    (await sql(`CREATE TRIGGER favorite_update_conflict BEFORE UPDATE OF value_json ON app_state
       WHEN OLD.scope='inv' AND OLD.key='favorite_tags' AND OLD.value_json=${quote(initial)}
         AND NEW.value_json<>${quote(competing)}
       BEGIN
         UPDATE app_state SET value_json=${quote(competing)}, value_yaml=${quote(competing)}
           WHERE scope='inv' AND key='favorite_tags';
         SELECT RAISE(IGNORE);
-      END;`);
+      END;`));
     assert.deepEqual(await favoriteMutation({ action: 'add', tags: [batchTag] }),
       [firstTag, secondTag, batchTag]);
-    sql('DROP TRIGGER favorite_update_conflict;');
+    (await sql('DROP TRIGGER favorite_update_conflict;'));
     console.log('PASS a forced CAS conflict preserves the intervening addition');
 
-    sql("DELETE FROM app_state WHERE scope='inv' AND key='favorite_tags';");
+    (await sql("DELETE FROM app_state WHERE scope='inv' AND key='favorite_tags';"));
     const firstInsert = JSON.stringify({ tags: [secondTag] });
-    sql(`CREATE TRIGGER favorite_insert_conflict BEFORE INSERT ON app_state
+    (await sql(`CREATE TRIGGER favorite_insert_conflict BEFORE INSERT ON app_state
       WHEN NEW.scope='inv' AND NEW.key='favorite_tags' AND NEW.value_json<>${quote(firstInsert)}
         AND NOT EXISTS(SELECT 1 FROM app_state WHERE scope='inv' AND key='favorite_tags')
       BEGIN
         INSERT INTO app_state(scope,key,value_json,value_yaml)
           VALUES ('inv','favorite_tags',${quote(firstInsert)},${quote(firstInsert)});
         SELECT RAISE(IGNORE);
-      END;`);
+      END;`));
     assert.deepEqual(await favoriteMutation({ action: 'add', tags: [batchTag] }), [secondTag, batchTag]);
     console.log('PASS a competing first insert is preserved on retry');
   } finally {
-    sql('DROP TRIGGER IF EXISTS favorite_update_conflict; DROP TRIGGER IF EXISTS favorite_insert_conflict;');
-    replace(original);
+    (await sql('DROP TRIGGER IF EXISTS favorite_update_conflict; DROP TRIGGER IF EXISTS favorite_insert_conflict;'));
+    (await replace(original));
     rmSync(queryFile, { force: true });
     await setTagOrder('registered');
   }
