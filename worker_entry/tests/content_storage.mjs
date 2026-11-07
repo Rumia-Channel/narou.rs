@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { brotliDecompressSync, inflateRawSync } from 'node:zlib';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
 
@@ -30,6 +30,8 @@ let sourceTimings = null;
 const imageRequests = new Map();
 const sourceRequests = new Map();
 const imageContinuations = [];
+let yieldBarrier = null;
+let deliveryWitness = null;
 const longEpisodeCount = 1685;
 const longEpisodeRequests = new Map();
 const longInvocationStarts = [];
@@ -44,6 +46,24 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://127.0.0.1');
     const key = decodeURIComponent(url.pathname);
+    if (req.method === 'POST' && key === '/_fixture/yield') {
+      const gate = yieldBarrier;
+      if (gate) {
+        gate.entered.resolve();
+        await gate.release.promise;
+      }
+      res.end('released'); return;
+    }
+    if (req.method === 'POST' && key === '/_fixture/delivery') {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const ids = JSON.parse(Buffer.concat(chunks).toString()).ids;
+      if (deliveryWitness) {
+        deliveryWitness.ids.push(...ids);
+        if (deliveryWitness.ids.length >= 2) deliveryWitness.completed.resolve();
+      }
+      res.end('recorded'); return;
+    }
     if (sourceTimings && key.startsWith('/smoke-novel/')) {
       const timing = { path: key, started: performance.now(), finished: null };
       sourceTimings.push(timing);
@@ -444,10 +464,11 @@ min_interval: 0.01
     assert.equal(code, 0, 'existing Worker HTTP contracts must also pass after S3 cutover');
   }
 
-  async function defaultLibrary(name, { required = false, marker, legacy = false, invalidEndpoint = false } = {}) {
+  async function defaultLibrary(name, { required = false, marker, legacy = false, invalidEndpoint = false, entrypoint } = {}) {
     await stop();
     persist = join(work, `default-${name}`);
     let source = toml.replace('[vars]', `[vars]\nNAROU_REQUIRE_S3 = "${required}"`);
+    if (entrypoint) source = source.replace(/^main = .*$/m, `main = ${JSON.stringify(entrypoint.replaceAll('\\', '/'))}`);
     if (invalidEndpoint) source = source.replace(/^S3_ENDPOINT = .*$/m, 'S3_ENDPOINT = "not-a-url"');
     writeFileSync(config, source);
     run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
@@ -590,6 +611,78 @@ min_interval: 0.01
   assert.equal((illustratedText.match(/<img\b/g) ?? []).length, sourceImageCount, 'EPUB must retain every image after the continuation');
   assert(!illustratedText.includes('/smoke-image/'), 'EPUB must use its embedded images, not upstream URLs');
   console.log('PASS one 500-image episode yields on the real Worker budget, resumes without refetching, and produces an illustrated EPUB');
+
+  // Hold the actual Durable Object notification after the ledger has yielded,
+  // without adding hooks to Rust production code. The queue wrapper witnesses
+  // completed deliveries, so absence of resurrection is not a sleep assertion.
+  const wrapper = join(work, 'continuation-wrapper.mjs');
+  const production = JSON.stringify(relative(work, join(root, 'build/worker/shim.mjs')).replaceAll('\\', '/'));
+  writeFileSync(wrapper, `
+import Entry, { PushHub as ProductionPushHub } from ${production};
+export * from ${production};
+const hasPartial = value => value && typeof value === 'object'
+  && (value.type === 'queue_partial' || Object.values(value).some(hasPartial));
+export class PushHub extends ProductionPushHub {
+  async fetch(request, ...rest) {
+    if (request.method === 'POST' && new URL(request.url).pathname === '/broadcast'
+        && hasPartial(await request.clone().json())) {
+      await fetch('http://127.0.0.1:${s3Port}/_fixture/yield', { method: 'POST' });
+    }
+    return super.fetch(request, ...rest);
+  }
+}
+export default class extends Entry {
+  async queue(batch, ...rest) {
+    await super.queue(batch, ...rest);
+    await fetch('http://127.0.0.1:${s3Port}/_fixture/delivery', {
+      method: 'POST', body: JSON.stringify({ ids: batch.messages.map(message => message.body.job_id) }),
+    });
+  }
+}
+`);
+  await defaultLibrary('clear-after-yield', { required: true, entrypoint: wrapper });
+  await installDefaultSource();
+  sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
+  sourceImageCount = 500;
+  sourceRequests.clear(); imageRequests.clear();
+  const gate = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
+  const witness = { ids: [], completed: Promise.withResolvers() };
+  yieldBarrier = gate; deliveryWitness = witness;
+  const bounded = (promise, label) => Promise.race([
+    promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out`)), 180000).unref()),
+  ]);
+  try {
+    const accepted = await (await api('/api/download', { targets: [target] })).json();
+    assert(accepted.success, JSON.stringify(accepted));
+    const jobId = accepted.results[0].job_id;
+    await bounded(gate.entered.promise, 'post-yield notification');
+    const pending = await (await api(`/api/jobs/${jobId}`)).json();
+    assert.equal(pending.status, 'pending');
+    assert(scalar(`SELECT checkpoint_json IS NOT NULL FROM worker_jobs WHERE job_id=${quote(jobId)}`));
+    const cleared = await (await api('/api/queue/clear', {})).json();
+    assert(cleared.success, JSON.stringify(cleared));
+    const cancelled = await (await api(`/api/jobs/${jobId}`)).json();
+    assert.equal(cancelled.status, 'permanent');
+    const received = [...sourceRequests.entries()];
+    const images = [...imageRequests.entries()];
+    gate.release.resolve();
+    await bounded(witness.completed.promise, 'continuation delivery completion');
+    assert(witness.ids.every((id) => id === jobId), JSON.stringify(witness.ids));
+    assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='download'"), 1,
+      'clearing a yielded acquisition must not create a new job identity');
+    assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='convert'"), 0);
+    const after = await (await api(`/api/jobs/${jobId}`)).json();
+    assert.equal(after.status, cancelled.status);
+    assert.equal(after.last_error, cancelled.last_error);
+    assert.equal(after.attempts, cancelled.attempts);
+    assert.deepEqual([...sourceRequests.entries()], received, 'canceled continuation cannot fetch another episode or TOC');
+    assert.deepEqual([...imageRequests.entries()], images, 'canceled continuation cannot fetch another image');
+    assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), 1);
+    console.log('PASS clearing after budget yield retains the tombstone, original identity, and saved content');
+  } finally {
+    gate.release.resolve();
+    yieldBarrier = null; deliveryWitness = null;
+  }
 
   for (const scenario of [
     { name: 'cancel-between-episodes', episodes: 3 },

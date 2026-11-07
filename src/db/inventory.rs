@@ -408,6 +408,16 @@ where
     result
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_PUBLICATION: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_after_publication(path: PathBuf) {
+    FAIL_AFTER_PUBLICATION.with(|slot| *slot.borrow_mut() = Some(path));
+}
+
 pub(crate) fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
     let retries = 20u32;
     let mut last_error = None;
@@ -420,6 +430,10 @@ pub(crate) fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
 
         match fs::rename(&tmp_path, path) {
             Ok(_) => {
+                #[cfg(test)]
+                if FAIL_AFTER_PUBLICATION.with(|slot| slot.borrow_mut().take_if(|expected| expected == path).is_some()) {
+                    return Err(std::io::Error::other("injected post-publication sync failure").into());
+                }
                 crate::compat::fsync_parent_dir(path)?;
                 return Ok(());
             }

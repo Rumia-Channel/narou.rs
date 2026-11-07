@@ -159,6 +159,7 @@ mod tests {
             subdate: String::new(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         }
     }
 

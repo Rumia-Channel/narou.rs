@@ -53,12 +53,36 @@ fn write_fixture(root: &Path) {
     }
 }
 
+fn command(root: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_narou_rs"));
+    command.current_dir(root)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("NAROU_RS_LEGACY_YAML", "1")
+        .env("NAROU_RS_ASSET_BACKEND", "local")
+        .env_remove("NAROU_RS_EPUB_ENGINE");
+    command
+}
+
 fn run(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_narou_rs"))
-        .args(args)
-        .current_dir(root)
-        .output()
-        .expect("run narou_rs")
+    command(root).args(args).output().expect("run narou_rs")
+}
+
+#[test]
+fn updating_a_virtual_parent_preserves_records_and_succeeds_without_a_site() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture(root);
+    let added = run(root, &["virtual", "add", "--title", "Combined", "1", "2"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let path = root.join(".narou/database.yaml");
+    let before: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for target in ["3", "vs_3"] {
+        let updated = run(root, &["update", "--force", target]);
+        assert!(updated.status.success(), "{}", String::from_utf8_lossy(&updated.stderr));
+        let after: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after, before, "virtual update must not mutate the parent or members");
+    }
 }
 
 #[test]
@@ -190,6 +214,147 @@ fn virtual_conversion_uses_ncode_filename_when_enabled() {
         "convert.filename-to-ncode のファイル名になっていない: {}",
         output.display()
     );
+}
+
+#[cfg(feature = "lite")]
+#[test]
+fn combined_epub_preserves_each_members_images_and_virtual_settings() {
+    use std::collections::BTreeSet;
+    use std::io::Read;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture(root);
+    std::fs::write(
+        root.join(".narou/local_setting.yaml"),
+        "convert.epub-engine: lite\ndevice: epub\n",
+    ).unwrap();
+    let colors = [[240, 0, 0], [0, 0, 240]];
+    for (number, color) in (1..=2).zip(colors) {
+        let dir = root.join("小説データ/mock.test").join(format!("[Author] A その{number}"));
+        std::fs::create_dir_all(dir.join("挿絵")).unwrap();
+        image::RgbImage::from_pixel(64, 96, image::Rgb(color))
+            .save(dir.join("挿絵/001.png")).unwrap();
+        let section_path = dir.join(format!("本文/1 第{number}話.yaml"));
+        let mut section: narou_rs::downloader::SectionFile =
+            serde_yaml::from_str(&std::fs::read_to_string(&section_path).unwrap()).unwrap();
+        section.element.body.push_str("\n［＃挿絵（挿絵/001.png）入る］\n");
+        std::fs::write(section_path, serde_yaml::to_string(&section).unwrap()).unwrap();
+    }
+    let added = run(root, &[
+        "virtual", "add", "--title", "XXX", "--author", "Author", "--site", "mock.test", "1", "2",
+    ]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let combined_dir = root.join("小説データ/mock.test/XXX");
+    std::fs::create_dir_all(&combined_dir).unwrap();
+    std::fs::write(combined_dir.join("setting.ini"), "enable_yokogaki=true\n").unwrap();
+
+    let converted = run(root, &["convert", "vs_3"]);
+    assert!(converted.status.success(), "{}{}", String::from_utf8_lossy(&converted.stdout), String::from_utf8_lossy(&converted.stderr));
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(
+        combined_dir.join("[Author] XXX.epub"),
+    ).unwrap()).unwrap();
+    let mut embedded_colors = BTreeSet::new();
+    let mut package = String::new();
+    let mut text = String::new();
+    for position in 0..archive.len() {
+        let mut entry = archive.by_index(position).unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        let name = entry.name().unwrap();
+        if name.starts_with("item/image/") {
+            let pixels = image::load_from_memory(&bytes).unwrap().to_rgb8();
+            embedded_colors.insert(pixels.get_pixel(0, 0).0);
+        } else if name.ends_with(".opf") {
+            package = String::from_utf8(bytes).unwrap();
+        } else if name.ends_with(".xhtml") {
+            text.push_str(&String::from_utf8(bytes).unwrap());
+        }
+    }
+    assert_eq!(embedded_colors, BTreeSet::from(colors), "same-named images must retain both members' pixels");
+    assert!(package.contains("page-progression-direction=\"ltr\""), "{package}");
+    assert!(text.contains("ＢＯＤＹ－一") && text.contains("ＢＯＤＹ－二"), "{text}");
+}
+
+#[cfg(feature = "lite")]
+#[test]
+fn web_virtual_downloads_generate_epub_and_refresh_changed_members() {
+    use std::io::{Cursor, Read};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn text(bytes: &[u8]) -> String {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut text = String::new();
+        for position in 0..archive.len() {
+            let mut entry = archive.by_index(position).unwrap();
+            if entry.name().unwrap().ends_with(".xhtml") {
+                entry.read_to_string(&mut text).unwrap();
+            }
+        }
+        text
+    }
+    fn epub(response: reqwest::blocking::Response) -> Vec<u8> {
+        let status = response.status();
+        let bytes = response.bytes().unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        bytes.to_vec()
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture(root);
+    std::fs::write(root.join(".narou/local_setting.yaml"), "convert.epub-engine: lite\ndevice: epub\n").unwrap();
+    let configured = run(root, &["setting", "external-api.require-token=false", "server-ws-port=0"]);
+    assert!(configured.status.success(), "{}", String::from_utf8_lossy(&configured.stderr));
+    let added = run(root, &["virtual", "add", "--title", "XXX", "--author", "Author", "--site", "mock.test", "1", "2"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let log_path = root.join("server.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let _server = Server(Command::new(env!("CARGO_BIN_EXE_narou_rs"))
+        .args(["web", "--port", &port.to_string(), "--no-browser"])
+        .current_dir(root)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("NAROU_RS_LEGACY_YAML", "1")
+        .env("NAROU_RS_ASSET_BACKEND", "local")
+        .env_remove("NAROU_RS_EPUB_ENGINE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn().unwrap());
+    let client = reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(30)).build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !client.get(&base).send().is_ok_and(|response| response.status().is_success()) {
+        assert!(Instant::now() < deadline, "{}", std::fs::read_to_string(&log_path).unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let cookie = format!("narou_ui_token={}", std::fs::read_to_string(root.join(".narou/ui_token")).unwrap().trim());
+    let first = epub(client.get(format!("{base}/novels/3/download")).header("Cookie", &cookie).send().unwrap());
+    let first_text = text(&first);
+    assert!(first_text.contains("ＢＯＤＹ－一") && first_text.contains("ＢＯＤＹ－二"), "{first_text}");
+    let section_path = root.join("小説データ/mock.test/[Author] A その1/本文/1 第1話.yaml");
+    let mut section: narou_rs::downloader::SectionFile =
+        serde_yaml::from_str(&std::fs::read_to_string(&section_path).unwrap()).unwrap();
+    section.element.body.push_str("\nUPDATED 本文\n");
+    std::fs::write(section_path, serde_yaml::to_string(&section).unwrap()).unwrap();
+    let updated = epub(client.get(format!("{base}/api/v1/novels/3/epub")).send().unwrap());
+    assert!(text(&updated).contains("ＵＰＤＡＴＥＤ"), "a saved virtual EPUB must not conceal member changes");
+    std::fs::remove_file(root.join("小説データ/mock.test/XXX/[Author] XXX.epub")).unwrap();
+    let converted = client.post(format!("{base}/api/virtual_novels/3/convert"))
+        .header("Cookie", &cookie).header("Origin", &base).send().unwrap();
+    assert_eq!(converted.status(), reqwest::StatusCode::OK);
+    let result: serde_json::Value = serde_json::from_slice(&converted.bytes().unwrap()).unwrap();
+    assert_eq!(result["filename"], "[Author] XXX.epub");
+    assert!(text(&std::fs::read(root.join("小説データ/mock.test/XXX/[Author] XXX.epub")).unwrap()).contains("ＵＰＤＡＴＥＤ"));
 }
 
 /// 既存のフィクスチャへ小説を 1 件足す (仮想小説のメンバー追加テスト用)。
@@ -328,4 +493,43 @@ fn appending_members_extends_the_virtual_novel_and_refreshes_its_record() {
     let second_body = text.find("ＢＯＤＹ－二").expect("second body");
     let third_body = text.find("ＢＯＤＹ－三").expect("third body");
     assert!(second_body < third_body, "the appended member must be last");
+}
+
+#[test]
+fn failed_sqlite_virtual_removal_preserves_membership_and_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture(root);
+    std::fs::write(root.join(".narou/storage-backend"), "sqlite").unwrap();
+    let added = command(root).env_remove("NAROU_RS_LEGACY_YAML")
+        .args(["virtual", "add", "--title", "Atomic", "1"]).output().unwrap();
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let connection = rusqlite::Connection::open(root.join(".narou/db.sqlite")).unwrap();
+    let before: String = connection.query_row(
+        "SELECT value_yaml FROM app_state WHERE scope='inv' AND key='virtual_novel_members'",
+        [], |row| row.get(0),
+    ).unwrap();
+    connection.execute_batch(
+        "CREATE TRIGGER fail_virtual_remove BEFORE DELETE ON novels WHEN OLD.id=3 BEGIN SELECT RAISE(ABORT,'virtual deletion fixture'); END;"
+    ).unwrap();
+    let removed = command(root).env_remove("NAROU_RS_LEGACY_YAML")
+        .args(["virtual", "remove", "vs_3"]).output().unwrap();
+    assert!(!removed.status.success());
+    let after: String = connection.query_row(
+        "SELECT value_yaml FROM app_state WHERE scope='inv' AND key='virtual_novel_members'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(after, before, "a failed removal must not detach the surviving parent");
+    let ids: Vec<i64> = connection.prepare("SELECT id FROM novels ORDER BY id").unwrap()
+        .query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(ids, [1, 2, 3]);
+}
+
+#[test]
+fn corrupt_membership_is_not_reported_as_an_empty_library() {
+    let temp = tempfile::tempdir().unwrap();
+    write_fixture(temp.path());
+    std::fs::write(temp.path().join(".narou/virtual_novel_members.yaml"), "3: [1,").unwrap();
+    let listed = run(temp.path(), &["virtual", "list"]);
+    assert!(!listed.status.success(), "corrupt membership must be reported, not silently hidden");
 }

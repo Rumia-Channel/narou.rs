@@ -1534,10 +1534,7 @@ async fn process_novel_for_update(
     // 仮想小説は実体を持たないので更新しない。
     if let Ok(Some(record)) =
         narou_rs::native::novel_repository::NativeNovelRepository::new().get_sync(id.into())
-        && record
-            .ncode
-            .as_deref()
-            .is_some_and(narou_rs::virtual_novel::is_virtual_ncode)
+        && narou_rs::virtual_novel::is_virtual_record(&record)
     {
         return Ok(0);
     }

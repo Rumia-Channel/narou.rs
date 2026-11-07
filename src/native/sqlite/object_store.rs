@@ -52,6 +52,7 @@ pub struct SqliteObjectStore {
     /// 実ファイルのミラーを書くか (`sqlite.mirror-files=false` で無効)。
     /// 無効時は読み書きが SQLite だけで完結する。
     mirror_files: bool,
+    prefer_existing_files: bool,
 }
 
 impl SqliteObjectStore {
@@ -80,7 +81,15 @@ impl SqliteObjectStore {
             conn,
             mirror,
             mirror_files,
+            prefer_existing_files: false,
         }
+    }
+
+    /// Conversion inputs preserve user-edited files without restoring DB blobs
+    /// into the live library. Normal storage reads remain database-first.
+    pub(crate) fn prefer_existing_files(mut self) -> Self {
+        self.prefer_existing_files = true;
+        self
     }
 
     fn now_rfc3339() -> String {
@@ -338,12 +347,11 @@ impl SqliteObjectStore {
     /// 変換がファイルパスを要求するときに使う。既にあるファイルは触らない。
     /// ミラー無効時だけスコープに登録し、使い終わったら消す。ミラー有効時は
     /// 削除されたミラーの復元として残す。
-    /// `skip_segment` をパス要素に持つキー (挿絵など) は対象外。
+    /// 目次・本文・変換設定だけを対象にし、生成物や履歴は取り出さない。
     pub(crate) fn materialize_into(
         &self,
         novel_dir: &Path,
         prefix: &ObjectKey,
-        skip_segment: &str,
         scope: &crate::native::materialization::MaterializationScope,
     ) -> Result<Vec<PathBuf>> {
         let mut request = ObjectListRequest::new(
@@ -355,14 +363,12 @@ impl SqliteObjectStore {
             let page = self.list_blocking(&request)?;
             for metadata in &page.objects {
                 let key = metadata.key.as_ref();
-                if key.split('/').any(|segment| segment == skip_segment) {
+                let Some(relative) = key.strip_prefix(prefix.as_ref()).and_then(|rest| rest.strip_prefix('/')) else {
                     continue;
-                }
-                let relative = key
-                    .strip_prefix(prefix.as_ref())
-                    .map(|rest| rest.trim_start_matches('/'))
-                    .unwrap_or_default();
-                if relative.is_empty() {
+                };
+                let input = matches!(relative, "toc.yaml" | "setting.ini" | "replace.txt" | "converter.yaml" | ".illustration_cache.yaml" | "cover.jpg" | "cover.png" | "cover.jpeg")
+                    || relative.strip_prefix("本文/").is_some_and(|name| !name.contains('/') && name.ends_with(".yaml"));
+                if !input {
                     continue;
                 }
                 let path = novel_dir.join(relative);
@@ -667,8 +673,15 @@ impl ObjectStore for SqliteObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || {
+            if this.prefer_existing_files {
+                let path = this.mirror.resolve_read_path(&key)?;
+                if let Some(metadata) = this.mirror.metadata_for_path(&key, &path)? {
+                    return Ok(Some(metadata));
+                }
+            }
             match this.stat_blocking(&key)? {
                 Some(metadata) => Ok(Some(metadata)),
+                None if this.prefer_existing_files => Ok(None),
                 // Pre-import or store-bypassed files still resolve via FS.
                 None => {
                     let path = this.mirror.resolve_read_path(&key)?;
@@ -682,8 +695,14 @@ impl ObjectStore for SqliteObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || {
+            if this.prefer_existing_files
+                && let Some(data) = this.mirror.read_small_blocking(&key)?
+            {
+                return Ok(Some(data));
+            }
             match this.read_blocking(&key, Some(crate::native::object_store::MAX_SMALL_OBJECT_BYTES))? {
                 Some(data) => Ok(Some(data)),
+                None if this.prefer_existing_files => Ok(None),
                 None => this.mirror.read_small_blocking(&key),
             }
         })
@@ -758,12 +777,18 @@ impl AssetStore for SqliteObjectStore {
         let this = self.clone();
         let key = key.clone();
         Box::pin(async move {
+            if this.prefer_existing_files
+                && let Some(stream) = AssetStore::read_stream(&this.mirror, &key).await?
+            {
+                return Ok(Some(stream));
+            }
             let data = run_blocking({
                 let this = this.clone();
                 let key = key.clone();
                 move || -> Result<Option<Vec<u8>>> {
                     match this.read_blocking(&key, None)? {
                         Some(data) => Ok(Some(data)),
+                        None if this.prefer_existing_files => Ok(None),
                         None => {
                             let path = this.mirror.resolve_read_path(&key)?;
                             match std::fs::read(&path) {
@@ -1337,7 +1362,7 @@ mod tests {
         let prefix = ObjectKey::try_new("novels/site/title").unwrap();
         let novel_dir = dir.path().join("site/title");
         let scope = crate::native::materialization::MaterializationScope::acquire(dir.path(), &novel_dir).unwrap();
-        let written = store.materialize_into(&novel_dir, &prefix, "挿絵", &scope).unwrap();
+        let written = store.materialize_into(&novel_dir, &prefix, &scope).unwrap();
         assert_eq!(written, vec![mirrored.clone()]);
         assert!(mirrored.is_file());
         drop(scope);
@@ -1368,7 +1393,7 @@ mod tests {
         std::fs::write(&existing_path, b"keep local").unwrap();
 
         let scope = crate::native::materialization::MaterializationScope::acquire(dir.path(), &novel_dir).unwrap();
-        let written = store.materialize_into(&novel_dir, &prefix, "挿絵", &scope).unwrap();
+        let written = store.materialize_into(&novel_dir, &prefix, &scope).unwrap();
         let body_path = novel_dir.join("本文/1 body.yaml");
         assert_eq!(written, vec![body_path.clone()]);
         assert_eq!(std::fs::read(&body_path).unwrap(), b"body");
@@ -1377,6 +1402,35 @@ mod tests {
         drop(guard);
         assert!(!body_path.exists());
         assert_eq!(std::fs::read(&existing_path).unwrap(), b"keep local");
+    }
+
+    #[test]
+    fn materialized_inputs_do_not_own_new_conversion_outputs() {
+        let (dir, mut store) = temp_store();
+        store.mirror_files = false;
+        let prefix = ObjectKey::try_new("novels/site/title").unwrap();
+        for relative in [
+            "toc.yaml", "本文/1 body.yaml", "setting.ini", "replace.txt",
+            "converter.yaml", ".illustration_cache.yaml", "novel.txt", "Book.epub", "cover.png",
+        ] {
+            let key = ObjectKey::try_new(format!("{prefix}/{relative}")).unwrap();
+            store.write_blocking(&key, b"stored").unwrap();
+        }
+        let novel_dir = dir.path().join("site/title");
+        let scope = crate::native::materialization::MaterializationScope::acquire(dir.path(), &novel_dir).unwrap();
+        let written = store.materialize_into(&novel_dir, &prefix, &scope).unwrap();
+        for relative in ["toc.yaml", "本文/1 body.yaml", "setting.ini", "replace.txt", "converter.yaml", ".illustration_cache.yaml", "cover.png"] {
+            assert_eq!(std::fs::read(novel_dir.join(relative)).unwrap(), b"stored");
+        }
+        for output in ["novel.txt", "Book.epub"] {
+            std::fs::write(novel_dir.join(output), b"new conversion output").unwrap();
+        }
+        drop(crate::native::object_store::MaterializedNovelFiles::from_paths(written, scope));
+        for output in ["novel.txt", "Book.epub"] {
+            assert_eq!(std::fs::read(novel_dir.join(output)).unwrap(), b"new conversion output");
+        }
+        assert!(!novel_dir.join("toc.yaml").exists());
+        assert!(!novel_dir.join("本文/1 body.yaml").exists());
     }
 
     #[test]
@@ -1649,6 +1703,21 @@ mod tests {
                 "novels/site/title/本文/2 第二話.yaml".to_string(),
             ]
         );
+        let input = store.clone().prefer_existing_files();
+        assert_eq!(futures::executor::block_on(input.read_small(&managed)).unwrap().unwrap(), b"stale");
+        assert_eq!(futures::executor::block_on(ObjectStore::stat(&input, &managed)).unwrap().unwrap().size, 5);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let bytes = runtime.block_on(async {
+            let mut stream = input.read_stream(&managed).await.unwrap().unwrap();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                bytes.extend(chunk.unwrap());
+            }
+            bytes
+        });
+        assert_eq!(bytes, b"stale");
+        std::fs::remove_file(managed_path).unwrap();
+        assert_eq!(futures::executor::block_on(input.read_small(&managed)).unwrap().unwrap(), b"stored");
     }
 
     /// When the filesystem copy cannot be removed, the delete fails and the

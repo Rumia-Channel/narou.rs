@@ -12,9 +12,14 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import process from 'node:process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { writeFileSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const BASE_URL = process.env.BASE_URL ?? 'http://127.0.0.1:8787';
 const TOKEN = process.env.NAROU_ADMIN_TOKEN ?? 'local-contract-token';
+const execFileAsync = promisify(execFile);
 
 function auth() {
   return { Authorization: `Bearer ${TOKEN}` };
@@ -234,23 +239,152 @@ for (let index = 3; index < 7; index += 1) {
   const tag = `順序テスト${stamp}-${index}`;
   parallel.push({ tag, zip: archiveFor(`https://example.com/order-${stamp}-${index}/`, tag, index, stamp) });
 }
-const results = await Promise.all(parallel.map((entry) => importArchive(entry.zip)));
-assert.equal(results.length, parallel.length);
+await Promise.all(parallel.map((entry) => importArchive(entry.zip)));
 
 tags = await tagList();
 for (const entry of parallel) {
   assert(tags.includes(entry.tag), `a concurrently imported tag is missing: ${entry.tag}`);
 }
-const positions = parallel.map((entry) => tags.indexOf(entry.tag));
-assert(
-  positions.every((position) => position >= 0),
-  `a concurrently imported tag is missing: ${JSON.stringify(tags)}`,
-);
 console.log('PASS concurrent imports keep the registration order consistent');
 
 // 連続标签 (まとめて 1 回で取り込む) でも、連番表は順番を保つ。
 const batchTag = `順序テスト${stamp}-batch`;
 await importArchive(archiveFor(`https://example.com/order-${stamp}-batch/`, batchTag, 9, stamp));
 tags = await tagList();
-assert(tags.includes(batchTag), `the imported tag is missing: ${JSON.stringify(tags)}`);
+assert(tags.indexOf(batchTag) > Math.max(...parallel.map(entry => tags.indexOf(entry.tag))),
+  `a later tag must follow every completed import: ${JSON.stringify(tags)}`);
 console.log('PASS a later import is appended to the registration order');
+
+async function favoriteMutation(body) {
+  const response = await request('/api/favorite_tags', {
+    method: 'POST', headers: { 'content-type': 'application/json', ...auth() },
+    body: JSON.stringify(body),
+  });
+  const result = await json(response);
+  assert.equal(response.status, 200, JSON.stringify(result));
+  assert.equal(result.success, true, JSON.stringify(result));
+  return result.tags;
+}
+
+async function setTagOrder(order) {
+  const response = await request('/api/global_setting', {
+    method: 'POST', headers: { 'content-type': 'application/json', ...auth() },
+    body: JSON.stringify({ settings: { 'webui.tag-sort-order': order } }),
+  });
+  const result = await json(response);
+  assert.equal(response.status, 200, JSON.stringify(result));
+  assert.equal(result.success, true, JSON.stringify(result));
+}
+
+const favorites = await favoriteMutation({ action: 'add', tags: [firstTag, secondTag] });
+await favoriteMutation({
+  action: 'reorder',
+  tags: [secondTag, firstTag, ...favorites.filter(tag => tag !== firstTag && tag !== secondTag)],
+});
+for (const order of ['favorites_first', 'alphabetical', 'favorites_first', 'alphabetical']) {
+  await setTagOrder(order);
+  tags = await tagList();
+  if (order === 'favorites_first') {
+    assert.deepEqual(tags.slice(0, 2), [secondTag, firstTag]);
+  } else {
+    assert(tags.indexOf(firstTag) < tags.indexOf(secondTag), JSON.stringify(tags));
+  }
+}
+console.log('PASS favorite changes and alphabetical round trips update the tag list');
+
+const concurrentFavorites = parallel.map(entry => entry.tag);
+await Promise.all(concurrentFavorites.map(tag => favoriteMutation({ action: 'add', tags: [tag] })));
+const favoriteResponse = await request('/api/favorite_tags', { headers: auth() });
+const favoriteState = await json(favoriteResponse);
+assert.equal(favoriteResponse.status, 200);
+for (const tag of concurrentFavorites) {
+  assert(favoriteState.tags.includes(tag), `a concurrent favorite addition was lost: ${tag}`);
+}
+console.log('PASS concurrent favorite additions are reapplied after CAS conflicts');
+
+const rejected = await request('/api/favorite_tags', {
+  method: 'POST', headers: { 'content-type': 'application/json', ...auth() },
+  body: JSON.stringify({ action: 'unknown', tags: [batchTag] }),
+});
+assert.equal(rejected.status, 400);
+assert.deepEqual(await json(await request('/api/favorite_tags', { headers: auth() })), favoriteState);
+await setTagOrder('registered');
+console.log('PASS an invalid favorite action leaves the saved state unchanged');
+
+// Only the isolated local runner exposes its dedicated database. Force real
+// snapshot conflicts with SQLite triggers; scheduling alone need not overlap.
+if (process.env.NAROU_TEST_CONFIG && process.env.NAROU_TEST_PERSIST) {
+  assert(['127.0.0.1', 'localhost'].includes(new URL(BASE_URL).hostname));
+  const config = process.env.NAROU_TEST_CONFIG;
+  const persist = process.env.NAROU_TEST_PERSIST;
+  const queryFile = join(dirname(config), 'favorite-fixture.sql');
+  const quote = value => `'${value.replaceAll("'", "''")}'`;
+  // Keep the HTTP client's event loop running while Wrangler prepares SQL.
+  async function sql(command) {
+    writeFileSync(queryFile, command);
+    const result = await execFileAsync(process.platform === 'win32' ? 'npx.cmd' : 'npx', [
+      '--yes', `wrangler@${process.env.NAROU_WRANGLER_VERSION || '4.151.3'}`,
+      'd1', 'execute', 'DB', '--local', '--config', config,
+      '--persist-to', persist, '--file', queryFile, '--json',
+    ], { encoding: 'utf8', shell: process.platform === 'win32' });
+    return JSON.parse(result.stdout.slice(result.stdout.indexOf('[\n')));
+  }
+  const replace = async raw => (await sql(`INSERT INTO app_state(scope,key,value_json,value_yaml)
+    VALUES ('inv','favorite_tags',${quote(raw)},${quote(raw)})
+    ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,value_yaml=excluded.value_yaml;`));
+  const original = JSON.stringify({ tags: favoriteState.tags });
+  try {
+    (await replace(JSON.stringify([firstTag, '1023', '2'])));
+    assert.deepEqual(await favoriteMutation({ action: 'add', tags: [secondTag] }),
+      [firstTag, '1023', '2', secondTag]);
+    console.log('PASS a legacy D1 favorite array supports read-modify-write');
+
+    const corrupt = '{"tags":"not-a-list"}';
+    (await replace(corrupt));
+    await setTagOrder('favorites_first');
+    for (const path of ['/api/favorite_tags', '/api/tag_list?format=json']) {
+      assert.equal((await request(path, { headers: auth() })).status, 503, path);
+    }
+    const mutation = await request('/api/favorite_tags', {
+      method: 'POST', headers: { 'content-type': 'application/json', ...auth() },
+      body: JSON.stringify({ action: 'add', tags: [batchTag] }),
+    });
+    assert.equal(mutation.status, 503);
+    assert.equal((await sql("SELECT value_json FROM app_state WHERE scope='inv' AND key='favorite_tags'"))[0].results[0].value_json, corrupt);
+    console.log('PASS malformed D1 favorites are reported without being erased');
+
+    const initial = JSON.stringify({ tags: [firstTag] });
+    const competing = JSON.stringify({ tags: [firstTag, secondTag] });
+    (await replace(initial));
+    (await sql(`CREATE TRIGGER favorite_update_conflict BEFORE UPDATE OF value_json ON app_state
+      WHEN OLD.scope='inv' AND OLD.key='favorite_tags' AND OLD.value_json=${quote(initial)}
+        AND NEW.value_json<>${quote(competing)}
+      BEGIN
+        UPDATE app_state SET value_json=${quote(competing)}, value_yaml=${quote(competing)}
+          WHERE scope='inv' AND key='favorite_tags';
+        SELECT RAISE(IGNORE);
+      END;`));
+    assert.deepEqual(await favoriteMutation({ action: 'add', tags: [batchTag] }),
+      [firstTag, secondTag, batchTag]);
+    (await sql('DROP TRIGGER favorite_update_conflict;'));
+    console.log('PASS a forced CAS conflict preserves the intervening addition');
+
+    (await sql("DELETE FROM app_state WHERE scope='inv' AND key='favorite_tags';"));
+    const firstInsert = JSON.stringify({ tags: [secondTag] });
+    (await sql(`CREATE TRIGGER favorite_insert_conflict BEFORE INSERT ON app_state
+      WHEN NEW.scope='inv' AND NEW.key='favorite_tags' AND NEW.value_json<>${quote(firstInsert)}
+        AND NOT EXISTS(SELECT 1 FROM app_state WHERE scope='inv' AND key='favorite_tags')
+      BEGIN
+        INSERT INTO app_state(scope,key,value_json,value_yaml)
+          VALUES ('inv','favorite_tags',${quote(firstInsert)},${quote(firstInsert)});
+        SELECT RAISE(IGNORE);
+      END;`));
+    assert.deepEqual(await favoriteMutation({ action: 'add', tags: [batchTag] }), [secondTag, batchTag]);
+    console.log('PASS a competing first insert is preserved on retry');
+  } finally {
+    (await sql('DROP TRIGGER IF EXISTS favorite_update_conflict; DROP TRIGGER IF EXISTS favorite_insert_conflict;'));
+    (await replace(original));
+    rmSync(queryFile, { force: true });
+    await setTagOrder('registered');
+  }
+}

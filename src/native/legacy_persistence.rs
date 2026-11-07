@@ -77,6 +77,7 @@ pub fn save_section_file(
         subupdate: subtitle.subupdate.clone(),
         download_time: Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string()),
         element: section.clone(),
+        download_revision: subtitle.download_revision,
     };
     let content = crate::downloader::persistence::serialize_section(&file_data)?;
     crate::db::inventory::atomic_write(&path, &content)?;

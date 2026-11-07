@@ -28,8 +28,8 @@ pub enum IllustSubcommand {
 ///
 /// `force` switches from dry-run to actually mutating the filesystem.
 /// `all` iterates over every novel; otherwise `targets` is resolved.
-pub fn cmd_illust(sub: IllustSubcommand, targets: &[String], force: bool, all: bool) -> i32 {
-    match cmd_illust_inner(sub, targets, force, all) {
+pub async fn cmd_illust(sub: IllustSubcommand, targets: &[String], force: bool, all: bool) -> i32 {
+    match cmd_illust_inner(sub, targets, force, all).await {
         Ok(()) => 0,
         Err(err) => {
             log::report_error(&err);
@@ -38,7 +38,7 @@ pub fn cmd_illust(sub: IllustSubcommand, targets: &[String], force: bool, all: b
     }
 }
 
-fn cmd_illust_inner(
+async fn cmd_illust_inner(
     sub: IllustSubcommand,
     targets: &[String],
     force: bool,
@@ -48,9 +48,9 @@ fn cmd_illust_inner(
 
     // S3 への移行・突き合わせ・dedup は小説単位ではなくライブラリ全体の操作。
     match sub {
-        IllustSubcommand::S3Push => return run_s3_push(force),
-        IllustSubcommand::S3Verify => return run_s3_verify(),
-        IllustSubcommand::S3Dedup => return run_s3_dedup(force),
+        IllustSubcommand::S3Push => return run_s3_push(force).await,
+        IllustSubcommand::S3Verify => return run_s3_verify().await,
+        IllustSubcommand::S3Dedup => return run_s3_dedup(force).await,
         _ => {}
     }
 
@@ -118,13 +118,6 @@ fn s3_migration_stores() -> Result<
     Ok((from_objects, from_assets, to_objects, to_assets))
 }
 
-fn migration_runtime() -> Result<tokio::runtime::Runtime, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())
-}
-
 fn report_migration_failures(state: &StoreMigrationState) {
     if state.failed.is_empty() {
         return;
@@ -139,23 +132,20 @@ fn report_migration_failures(state: &StoreMigrationState) {
 }
 
 /// 挿絵をローカルから S3 へ写す。既定は数えるだけで、`--force` で実行する。
-fn run_s3_push(force: bool) -> Result<(), String> {
+async fn run_s3_push(force: bool) -> Result<(), String> {
     let (from_objects, from_assets, to_objects, to_assets) = s3_migration_stores()?;
     let action = if force { "copy" } else { "plan" };
-    let runtime = migration_runtime()?;
     let mut state = StoreMigrationState::default();
     while !state.done {
-        runtime
-            .block_on(narou_rs::platform::migrate_page(
-                &from_objects,
-                &from_assets,
-                &to_assets,
-                &to_objects,
-                action,
-                narou_rs::platform::store_migration::DEFAULT_LIMIT,
-                &mut state,
-            ))
-            .map_err(|error| error.to_string())?;
+        narou_rs::platform::migrate_page(
+            &from_objects,
+            &from_assets,
+            &to_assets,
+            &to_objects,
+            action,
+            narou_rs::platform::store_migration::DEFAULT_LIMIT,
+            &mut state,
+        ).await.map_err(|error| error.to_string())?;
     }
     if force {
         println!("S3 へ写しました: {} 件", state.copied);
@@ -170,22 +160,19 @@ fn run_s3_push(force: bool) -> Result<(), String> {
 }
 
 /// ローカルと S3 の挿絵をバイト単位で突き合わせる (書き込みはしない)。
-fn run_s3_verify() -> Result<(), String> {
+async fn run_s3_verify() -> Result<(), String> {
     let (from_objects, from_assets, to_objects, to_assets) = s3_migration_stores()?;
-    let runtime = migration_runtime()?;
     let mut state = StoreMigrationState::default();
     while !state.done {
-        runtime
-            .block_on(narou_rs::platform::migrate_page(
-                &from_objects,
-                &from_assets,
-                &to_assets,
-                &to_objects,
-                "verify",
-                narou_rs::platform::store_migration::DEFAULT_LIMIT,
-                &mut state,
-            ))
-            .map_err(|error| error.to_string())?;
+        narou_rs::platform::migrate_page(
+            &from_objects,
+            &from_assets,
+            &to_assets,
+            &to_objects,
+            "verify",
+            narou_rs::platform::store_migration::DEFAULT_LIMIT,
+            &mut state,
+        ).await.map_err(|error| error.to_string())?;
     }
     println!("一致: {} 件", state.verified);
     report_migration_failures(&state);
@@ -196,25 +183,22 @@ fn run_s3_verify() -> Result<(), String> {
 /// 手順: 全小説の `挿絵/` を LIST → hex 名のものを pool へ `copy` →
 /// `pool_exists` で確認後、legacy の実オブジェクトを `delete`。
 /// 既定は dry-run (pool へ写さず件数だけ数える)。
-fn run_s3_dedup(force: bool) -> Result<(), String> {
+async fn run_s3_dedup(force: bool) -> Result<(), String> {
     let s3 = narou_rs::native::s3::illustration_store()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| {
             "挿絵の保存先が S3 になっていません (narou setting s3.asset-backend=s3 と S3 の接続情報が必要です)"
                 .to_string()
         })?;
-    let runtime = migration_runtime()?;
     let mut state = narou_rs::platform::IllustrationDedupState::default();
     let action = if force { "copy" } else { "plan" };
     while !state.done {
-        runtime
-            .block_on(narou_rs::platform::deduplicate_illustrations_page(
-                s3.as_ref(),
-                action,
-                narou_rs::platform::store_migration::MAX_LIMIT,
-                &mut state,
-            ))
-            .map_err(|error| error.to_string())?;
+        narou_rs::platform::deduplicate_illustrations_page(
+            s3.as_ref(),
+            action,
+            narou_rs::platform::store_migration::MAX_LIMIT,
+            &mut state,
+        ).await.map_err(|error| error.to_string())?;
     }
 
     if !force {
@@ -578,25 +562,19 @@ fn run_rebuild(archive_path: &Path) -> Result<(), String> {
 
 /// 実体がストアにだけある構成の索引再構築。
 ///
-/// ストアから本文 (`raw/*.html` を含む) と挿絵を取り出し、既存の FS 再構築
-/// ロジックで索引を組み直してストアへ書き戻す。取り出したファイルは
-/// ガードが片付けるので、ローカルには残さない。
+/// raw HTML と挿絵を含む私有スナップショットで既存の FS 再構築を実行し、
+/// 索引だけを元のストアへ書き戻す。実ディレクトリの生成物には触らない。
 fn run_rebuild_via_store(archive_path: &Path) -> Result<(), String> {
     let inventory = narou_rs::db::inventory::Inventory::with_default_root()
         .map_err(|e| e.to_string())?;
     let archive_root = inventory
         .root_dir()
         .join(narou_rs::downloader::ARCHIVE_ROOT_DIR);
-    let store = narou_rs::native::object_store::NativeStore::for_narou_root(inventory.root_dir())
+    let snapshot = narou_rs::native::materialization::snapshot(archive_path)
         .map_err(|e| e.to_string())?;
-    let _files = store
-        .materialize_novel_files(archive_path)
+    let count = illustration_store::rebuild_illustration_cache(snapshot.path())
         .map_err(|e| e.to_string())?;
-    let _illustrations = narou_rs::native::illustrations::materialize_blocking(archive_path)
-        .map_err(|e| e.to_string())?;
-    let count =
-        illustration_store::rebuild_illustration_cache(archive_path).map_err(|e| e.to_string())?;
-    let cache = illustration_store::cache_path(archive_path);
+    let cache = illustration_store::cache_path(snapshot.path());
     let body = match std::fs::read(&cache) {
         Ok(body) => body,
         // エントリ 0 件では flush がファイルを書かない (空の索引を表す)。
@@ -615,13 +593,6 @@ fn run_rebuild_via_store(archive_path: &Path) -> Result<(), String> {
         body,
     ))
     .map_err(|e| e.to_string())?;
-    let narou_dir = inventory.root_dir().join(".narou");
-    if narou_rs::native::sqlite::state::active_for(&narou_dir).is_some()
-        && !narou_rs::native::sqlite::state::mirror_files_enabled()
-    {
-        // mirror-files=false では索引はストアにだけ置く。
-        let _ = std::fs::remove_file(&cache);
-    }
     println!("  cache 再構築完了: {} エントリ (ストア保存)", count);
     Ok(())
 }

@@ -48,7 +48,10 @@ fn snapshot(conn: &Connection) -> TagColorSnapshot {
 
 fn commit(conn: &mut Connection, snapshot: TagColorSnapshot, update: &TagColorUpdate) -> Option<TagColors> {
     let mut colors = snapshot.colors().unwrap();
-    apply_tag_color_update(&mut colors, update);
+    let changed = apply_tag_color_update(&mut colors, update);
+    if !snapshot.needs_write(changed) {
+        return Some(colors);
+    }
     let binds = snapshot.into_update_binds(colors.to_yaml_string().unwrap()).into_iter()
         .map(|bind| match bind {
             NovelBind::Text(value) => rusqlite::types::Value::Text(value),
@@ -94,12 +97,21 @@ fn absent_rows_insert_an_ordered_table_and_no_overwrite_ensure_is_idempotent() {
     assert_eq!(colors.color_for("a"), Some("green"));
     assert_eq!(colors.color_for("b"), Some("yellow"));
     assert_eq!(order(&colors), vec!["a", "b"]);
+    let before = raw(&conn, "inv", "tag_colors");
+    let writes = conn.total_changes();
     let colors = commit_current(&mut conn, &ensure(&["a", "b"], Some("red")));
     assert_eq!(colors.color_for("a"), Some("green"));
     assert_eq!(colors.color_for("b"), Some("yellow"));
     let (yaml, json) = raw(&conn, "inv", "tag_colors").unwrap();
     assert_eq!(json.as_deref(), Some("{}"));
     assert_eq!(order(&TagColors::from_yaml_payload(&yaml.unwrap()).unwrap()), vec!["a", "b"]);
+    assert_eq!(conn.total_changes(), writes, "an existing color read must not publish the table again");
+    assert_eq!(raw(&conn, "inv", "tag_colors"), before);
+    for update in [set("a", Some("green")), set("absent", None)] {
+        commit_current(&mut conn, &update);
+        assert_eq!(conn.total_changes(), writes);
+        assert_eq!(raw(&conn, "inv", "tag_colors"), before);
+    }
 }
 
 #[test]
@@ -126,6 +138,21 @@ fn legacy_only_and_noop_deltas_still_canonicalize_with_a_successful_cas() {
     assert_eq!(colors.color_for("X"), Some("red"));
     assert!(raw(&conn, "inv", "tag_colors").is_some());
     assert_eq!(raw(&conn, "tag_colors", "colors"), None);
+}
+
+#[test]
+fn unchanged_colors_still_merge_and_remove_a_legacy_row() {
+    let mut conn = connection();
+    insert(&conn, "inv", "tag_colors", Some("X: red\n"), Some("{}"));
+    insert(&conn, "tag_colors", "colors", Some("X: green\n"), Some("{}"));
+    let stale = snapshot(&conn);
+    conn.execute("UPDATE app_state SET value_yaml='X: blue\n' WHERE scope='tag_colors'", []).unwrap();
+    assert!(commit(&mut conn, stale, &ensure(&["X"], None)).is_none());
+    assert!(raw(&conn, "tag_colors", "colors").is_some());
+    let colors = commit_current(&mut conn, &ensure(&["X"], None));
+    assert_eq!(colors.color_for("X"), Some("red"));
+    assert_eq!(raw(&conn, "tag_colors", "colors"), None);
+    assert_eq!(snapshot(&conn).colors().unwrap().color_for("X"), Some("red"));
 }
 
 #[test]

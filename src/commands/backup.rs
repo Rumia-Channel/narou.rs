@@ -91,18 +91,15 @@ pub fn cmd_backup(targets: &[String]) -> Result<()> {
             }
         }
 
-        // DB/S3 にだけ実体がある構成では、zip を組む間だけ本文・設定・挿絵を
-        // 取り出す。この時点から失敗してもライブラリの記録は変更しない
-        // (ガードが取り出した分を片付けてからエラーを返す)。
-        let store = narou_rs::native::object_store::NativeStore::for_current_root()?;
-        let _materialized_files = store.materialize_novel_files(&novel_dir)?;
-        let _materialized_illustrations = narou_rs::native::illustrations::materialize_blocking(&novel_dir)?;
+        // Read all stored files in a private directory, never in a converter's
+        // live output directory. A failed snapshot does not change the record.
+        let snapshot = narou_rs::native::materialization::snapshot(&novel_dir)?;
 
         println!("ID:{}　{}", data.id, data.title);
         print!("バックアップを作成しています");
         let _ = io::stdout().flush();
         let spinner = Spinner::start();
-        let backup_name = compat::create_backup(&novel_dir, &record.title)?;
+        let backup_name = compat::create_backup(snapshot.path(), &novel_dir, &record.title)?;
         drop(spinner);
         println!();
         println!("{} を作成しました", backup_name);

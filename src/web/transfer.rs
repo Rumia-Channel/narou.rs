@@ -17,7 +17,9 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::native::transfer;
-use crate::transfer::ConflictPolicy;
+use crate::transfer::{
+    flag_value, import_payload, is_zip_content_type, parse_ids, ConflictPolicy,
+};
 
 use super::AppState;
 
@@ -97,7 +99,7 @@ pub async fn import_archive(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !is_zip_content_type(&headers) {
+    if !request_is_zip(&headers) {
         return import_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "Content-Type は application/zip を指定してください".to_string(),
@@ -189,68 +191,15 @@ fn conflict_policy(overwrite: bool) -> ConflictPolicy {
     }
 }
 
-/// Parses `ids=1,2,3`. An omitted or empty value is rejected: exporting the
-/// whole library by accident is not a useful default for a download endpoint.
-fn parse_ids(value: Option<&str>) -> Result<Vec<i64>, String> {
-    let Some(value) = value else {
-        return Err("ids を指定してください (例: /api/transfer/export?ids=1,2)".to_string());
-    };
-    let mut ids = Vec::new();
-    for part in value.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let id = part
-            .parse::<i64>()
-            .map_err(|_| format!("不正な ID です: {part:?}"))?;
-        if id < 0 {
-            return Err(format!("不正な ID です: {part:?}"));
-        }
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-    }
-    if ids.is_empty() {
-        return Err("ids を指定してください (例: /api/transfer/export?ids=1,2)".to_string());
-    }
-    Ok(ids)
-}
-
-fn flag_value(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim),
-        Some("1" | "true" | "TRUE" | "True" | "yes" | "on")
-    )
-}
-
-fn is_zip_content_type(headers: &HeaderMap) -> bool {
+/// リクエストの `Content-Type` が ZIP として受け付けるメディア型か。
+fn request_is_zip(headers: &HeaderMap) -> bool {
     let Some(value) = headers.get(header::CONTENT_TYPE) else {
         return false;
     };
     let Ok(value) = value.to_str() else {
         return false;
     };
-    let value = value.split(';').next().unwrap_or("").trim();
-    value.eq_ignore_ascii_case("application/zip")
-        || value.eq_ignore_ascii_case("application/x-zip-compressed")
-        || value.eq_ignore_ascii_case("application/octet-stream")
-}
-
-fn import_payload(
-    success: bool,
-    created: usize,
-    overwritten: usize,
-    skipped: usize,
-    errors: Vec<String>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "success": success,
-        "created": created,
-        "overwritten": overwritten,
-        "skipped": skipped,
-        "errors": errors,
-    })
+    is_zip_content_type(value)
 }
 
 fn import_error(status: StatusCode, message: String) -> Response {
@@ -269,31 +218,23 @@ fn export_error(status: StatusCode, message: String) -> Response {
 mod tests {
     use super::*;
 
+    /// リクエストの `Content-Type` 判定は共有の規則を使う。
     #[test]
-    fn transfer_archive_export_ids_parse_comma_separated() {
-        assert_eq!(parse_ids(Some("1,2, 3")).unwrap(), vec![1, 2, 3]);
-        assert_eq!(parse_ids(Some("2,2")).unwrap(), vec![2]);
-        assert!(parse_ids(None).is_err());
-        assert!(parse_ids(Some("")).is_err());
-        assert!(parse_ids(Some("1,x")).is_err());
-        assert!(parse_ids(Some("-1")).is_err());
-    }
+    fn transfer_archive_import_requires_a_zip_media_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/zip"),
+        );
+        assert!(request_is_zip(&headers));
 
-    #[test]
-    fn transfer_archive_overwrite_flag_accepts_true_like_values() {
-        assert!(flag_value(Some("true")));
-        assert!(flag_value(Some("1")));
-        assert!(!flag_value(Some("false")));
-        assert!(!flag_value(None));
-    }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert!(!request_is_zip(&headers));
 
-    #[test]
-    fn transfer_archive_import_payload_has_the_documented_shape() {
-        let payload = import_payload(true, 1, 2, 3, Vec::new());
-        assert_eq!(payload["success"], true);
-        assert_eq!(payload["created"], 1);
-        assert_eq!(payload["overwritten"], 2);
-        assert_eq!(payload["skipped"], 3);
-        assert_eq!(payload["errors"], serde_json::json!([]));
+        assert!(!request_is_zip(&HeaderMap::new()));
     }
 }

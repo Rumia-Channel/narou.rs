@@ -603,6 +603,29 @@ await check("a token from /api/external_api/token opens the external API", async
     assert.equal(viaHeader.status, 200, `status ${viaHeader.status}`);
     const headerPayload = await json(viaHeader);
     assert(Array.isArray(headerPayload?.data), "data must be an array");
+    const lowerCase = await request("/api/v1/novels?limit=1", {
+      headers: { authorization: `bearer ${token}` },
+    });
+    assert.equal(lowerCase.status, 200);
+    for (const suffix of ["", "/toc", "/sections", "/sections/1"]) {
+      const missing = await request(`/api/v1/novels/999999999${suffix}`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      assert.equal(missing.status, 404, suffix);
+      assert.equal((await json(missing)).error.code, "not_found");
+    }
+    for (const path of [
+      "/api/v1/novels?format=yaml", "/api/v1/tags?format=yaml",
+      "/api/v1/novels/999999999?format=yaml",
+      "/api/v1/novels/999999999/toc?format=yaml",
+      "/api/v1/novels/999999999/sections?format=yaml",
+      "/api/v1/novels/999999999/sections/1?format=yaml",
+      "/api/v1/novels?offset=-1", "/api/v1/novels?novel_type=256",
+    ]) {
+      const invalid = await request(path, { headers: { authorization: `Bearer ${token}` } });
+      assert.equal(invalid.status, 400, path);
+      assert.equal((await json(invalid)).error.code, "bad_request");
+    }
   } finally {
     const removed = await request(`/api/external_api/token/${encodeURIComponent(body.token.id)}`, {
       method: "DELETE",

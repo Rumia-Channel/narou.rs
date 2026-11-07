@@ -53,6 +53,7 @@ use narou_rs::application::webui::queue_view::{
     queue_type_label,
 };
 use narou_rs::application::webui::tag_views::tag_list_html;
+use narou_rs::application::webui::tag_order::{TagSortOrder, sort_tags};
 
 use super::{json_error, query_param};
 use super::metadata::{self, MetadataServices};
@@ -72,9 +73,10 @@ macro_rules! database_or_503 {
 
 // Keep these SQL strings explicit: the SQLite regression tests execute the
 // production queries, including lane/status mappings and the bounded results.
+// D1 enforces novel_tags -> novels ON DELETE CASCADE; the covering tag index
+// therefore suffices without a second row lookup for every tag assignment.
 const TAG_NAMES_SQL: &str = r#"
 SELECT t.tag, COUNT(*) AS n, MIN(t.novel_id) AS first_novel_id FROM novel_tags t
-INNER JOIN novels n ON n.id = t.novel_id
 GROUP BY t.tag COLLATE BINARY
 ORDER BY COUNT(*) DESC, t.tag COLLATE BINARY ASC
 "#;
@@ -143,13 +145,15 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         .and_then(|url| query_param(&url, "format"));
 
     // Independent reads overlap; never materialize all NovelRecords for tags.
-    let (new_tag_color, tag_rows) = futures::join!(
-        metadata::configured_tag_color(&services.settings),
+    let (config, tag_rows) = futures::join!(
+        narou_rs::application::webui::config::load_tag_list(&services.settings),
         select_tag_names(&services.db),
     );
-    // Preserve the old empty-list fallback on storage errors.
-    let mut tag_rows = tag_rows.unwrap_or_default();
-    if narou_rs::application::attribute_tags::enabled(&services.settings).await {
+    let (config, mut tag_rows) = match (config, tag_rows) {
+        (Ok(config), Ok(rows)) => (config, rows),
+        _ => return Response::error("Service unavailable", 503),
+    };
+    if config.attribute_tags_enabled {
         let result = services.db.prepare(ATTRIBUTE_NAMES_SQL).all().await?;
         tag_rows.extend(result.results::<TagName>()?);
         tag_rows.sort_by(|a, b| b.n.cmp(&a.n).then_with(|| a.tag.cmp(&b.tag)));
@@ -159,44 +163,43 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         .map(|row| row.tag.clone())
         .filter(|tag| !narou_rs::virtual_novel::is_internal_tag(tag))
         .collect::<Vec<_>>();
-    let tag_colors = services
-        .tag_colors
-        .for_tags(tags.clone(), new_tag_color.as_deref())
-        .await
-        .unwrap_or_default();
+    let tag_colors = match services.tag_colors
+        .for_tags(tags.clone(), config.new_tag_color.as_deref()).await
+    {
+        Ok(colors) => colors,
+        Err(_) => return Response::error("Service unavailable", 503),
+    };
 
     // 並び順 (お気に入り優先 / アルファベット順 / 件数順 / 登録順) は
     // native と同じ共有実装で決める。
-    let order = services
-        .settings
-        .get(narou_rs::application::webui::tag_order::TAG_SORT_ORDER_SETTING)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .as_deref()
-        .map(|value| narou_rs::application::webui::tag_order::TagSortOrder::from_setting(Some(value)))
-        .unwrap_or_default();
-    let favorites = crate::favorite_tags::load_with_db(&services.db)
-        .await
-        .map(|state| state.tags)
-        .unwrap_or_default();
+    let order = config.sort_order;
+    let favorites = if order == TagSortOrder::FavoritesFirst {
+        match crate::favorite_tags::load_with_db(&services.db).await {
+            Ok(state) => state.tags,
+            Err(_) => return Response::error("Service unavailable", 503),
+        }
+    } else {
+        Vec::new()
+    };
     let mut counts = std::collections::HashMap::new();
     for row in &tag_rows {
         counts.insert(row.tag.clone(), row.n.max(0) as usize);
     }
-    // 「登録順」はタグがライブラリへ入った順 (app_state の `tag_sequence`)。
-    // 記録が無いライブラリは最小小説 ID → タグ名の順。
-    let sequence = crate::tag_sequence::load_with_db(&services.db)
-        .await
-        .unwrap_or_default();
-    let library: Vec<(String, i64)> = tag_rows
-        .iter()
-        .filter(|row| !narou_rs::virtual_novel::is_internal_tag(&row.tag))
-        .map(|row| (row.tag.clone(), row.first_novel_id))
-        .collect();
-    let registered = narou_rs::application::tag_sequence::registered_ranks(&sequence, &library);
-    let tags = narou_rs::application::webui::tag_order::sort_tags(
+    let registered = if order == TagSortOrder::Registered {
+        let sequence = match crate::tag_sequence::load_with_db(&services.db).await {
+            Ok(sequence) => sequence,
+            Err(_) => return Response::error("Service unavailable", 503),
+        };
+        let library: Vec<(String, i64)> = tag_rows
+            .iter()
+            .filter(|row| !narou_rs::virtual_novel::is_internal_tag(&row.tag))
+            .map(|row| (row.tag.clone(), row.first_novel_id))
+            .collect();
+        narou_rs::application::tag_sequence::registered_ranks(&sequence, &library)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let tags = sort_tags(
         order,
         &tags,
         &counts,

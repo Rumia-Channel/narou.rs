@@ -7,15 +7,15 @@
 //! native の `src/web/favorite_tags.rs` と同じ JSON 形・検証規則・
 //! ステータスコードを返す。
 
-use narou_rs::application::favorite_tags::FavoriteTags;
-use narou_rs::application::webui::validate_web_tag_name;
+use std::sync::Arc;
+
+use narou_rs::application::favorite_tags::{FavoriteTags, FavoriteTagsMutation, FavoriteTagsRequest};
 use narou_rs::error::{NarouError, Result};
 use serde::Deserialize;
 use serde_json::json;
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Method, Request, Response};
 
-use crate::composition::WorkerRuntime;
 use crate::db_handle::DbHandle;
 
 const SELECT_SQL: &str =
@@ -55,67 +55,31 @@ async fn read(db: &DbHandle) -> Result<FavoriteTags> {
     }
 }
 
-/// 全置換。同時更新はスナップショット CAS で検出して再試行する。
-async fn write(db: &DbHandle, state: &FavoriteTags) -> Result<()> {
-    let encoded = serde_json::to_string(state).map_err(db_error)?;
-    let yaml = serde_yaml::to_string(state)?;
+/// 変更を最新スナップショットへ適用し、競合時は読み直してから再適用する。
+async fn update(db: &DbHandle, mutation: &FavoriteTagsMutation) -> Result<(FavoriteTags, bool)> {
     for _ in 0..8 {
-        let Some(row) = db
-            .prepare(SELECT_SQL)
-            .first::<Row>(None)
-            .await
-            .map_err(db_error)?
-        else {
-            // 行が無い = まだ誰も保存していない。INSERT の CAS は ?3 IS NULL。
-            let rows = db
-                .prepare(SAVE_SQL)
-                .bind(&[encoded.clone().into(), yaml.clone().into(), JsValue::NULL])
-                .map_err(db_error)?
-                .all()
-                .await
-                .map_err(db_error)?
-                .results::<KeyRow>()
-                .map_err(db_error)?;
-            if rows.iter().any(|row| row.key == "favorite_tags") {
-                return Ok(());
-            }
-            continue;
+        let row = db.prepare(SELECT_SQL).first::<Row>(None).await.map_err(db_error)?;
+        let mut state: FavoriteTags = match &row {
+            Some(row) => serde_json::from_str(&row.value_json).map_err(db_error)?,
+            None => FavoriteTags::default(),
         };
-        let rows = db
-            .prepare(SAVE_SQL)
-            .bind(&[
-                encoded.clone().into(),
-                yaml.clone().into(),
-                row.value_json.clone().into(),
-            ])
-            .map_err(db_error)?
-            .all()
-            .await
-            .map_err(db_error)?
-            .results::<KeyRow>()
-            .map_err(db_error)?;
+        if !mutation.apply(&mut state) {
+            return Ok((state, false));
+        }
+        let encoded = serde_json::to_string(&state).map_err(db_error)?;
+        let yaml = serde_yaml::to_string(&state)?;
+        let expected = row.map_or(JsValue::NULL, |row| row.value_json.into());
+        let rows = db.prepare(SAVE_SQL)
+            .bind(&[encoded.into(), yaml.into(), expected]).map_err(db_error)?
+            .all().await.map_err(db_error)?
+            .results::<KeyRow>().map_err(db_error)?;
         if rows.iter().any(|row| row.key == "favorite_tags") {
-            return Ok(());
+            return Ok((state, true));
         }
     }
     Err(db_error("お気に入りタグが同時に更新されています。再試行してください"))
 }
 
-#[derive(Deserialize, Default)]
-struct FavoriteTagsRequest {
-    /// `add` / `remove` / `clear` / `reorder`。
-    action: Option<String>,
-    /// 追加・削除するタグ、または `reorder` のときの並び順。
-    #[serde(default)]
-    tags: Vec<String>,
-}
-
-fn payload(state: &FavoriteTags) -> serde_json::Value {
-    json!({
-        "success": true,
-        "tags": state.tags,
-    })
-}
 
 pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     if let Some(response) = crate::auth_failure(&req, &env).await {
@@ -130,10 +94,10 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         )?
         .with_status(405));
     }
-    let runtime = WorkerRuntime::build_ui(&env).await?;
+    let db = DbHandle::primary(Arc::new(env.d1("DB")?));
     if req.method() == Method::Get {
-        return Ok(match load(&runtime).await {
-            Ok(state) => Response::from_json(&payload(&state))?,
+        return Ok(match read(&db).await {
+            Ok(state) => Response::from_json(&state.payload())?,
             Err(error) => Response::from_json(
                 &json!({"success":false,"message":error.to_string()}),
             )?
@@ -149,55 +113,22 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
             .with_status(400));
         }
     };
-    let action = body.action.as_deref().unwrap_or("add");
-    let mut tags = Vec::new();
-    for tag in &body.tags {
-        match validate_web_tag_name(tag) {
-            Ok(tag) => tags.push(tag),
-            Err(message) => {
-                return Ok(Response::from_json(
-                    &json!({"success":false,"message":message}),
-                )?
-                .with_status(400));
-            }
-        }
-    }
-    let db = runtime.write_db().clone();
-    let mut state = match read(&db).await {
-        Ok(state) => state,
-        Err(error) => {
-            return Ok(Response::from_json(
-                &json!({"success":false,"message":error.to_string()}),
-            )?
-            .with_status(503));
-        }
+    let mutation = match body.validate() {
+        Ok(mutation) => mutation,
+        Err(message) => return Ok(Response::from_json(
+            &json!({"success":false,"message":message}),
+        )?.with_status(400)),
     };
-    match action {
-        "add" => {
-            for tag in &tags {
-                state.add(tag);
+    Ok(match update(&db, &mutation).await {
+        Ok((state, changed)) => {
+            if changed {
+                let push = crate::push_hub::PushHubClient::new(&env, crate::budget::SubrequestBudget::new());
+                push.broadcast_best_effort(&[
+                    narou_rs::application::push_events::event("favorite_tags.reload", ""),
+                ]).await;
             }
+            Response::from_json(&state.payload())?
         }
-        "remove" => {
-            for tag in &tags {
-                state.remove(tag);
-            }
-        }
-        "clear" => {
-            state.clear();
-        }
-        "reorder" => {
-            state.reorder(&tags);
-        }
-        _ => {
-            return Ok(Response::from_json(
-                &json!({"success":false,"message":"unknown favorite tags action"}),
-            )?
-            .with_status(400));
-        }
-    }
-    Ok(match write(&db, &state).await {
-        Ok(()) => Response::from_json(&payload(&state))?,
         Err(error) => Response::from_json(
             &json!({"success":false,"message":error.to_string()}),
         )?
@@ -205,14 +136,11 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     })
 }
 
-async fn load(runtime: &WorkerRuntime) -> Result<FavoriteTags> {
-    read(runtime.write_db()).await
-}
 
 /// D1 ハンドルからお気に入りタグを読む。
 ///
-/// タグ一覧の表示順 (お気に入り優先) で使う。読み取り専用の経路なので
-/// UI セッションのハンドルでよい。
+/// お気に入りの変更直後の再描画で古い replica の順序へ戻さないため、
+/// この小さな状態行は primary から読む。
 pub(crate) async fn load_with_db(db: &DbHandle) -> Result<FavoriteTags> {
-    read(db).await
+    read(&db.primary_view()).await
 }

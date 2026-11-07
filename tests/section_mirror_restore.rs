@@ -27,6 +27,7 @@ fn subtitle() -> SubtitleInfo {
         subdate: "2026-01-01 00:00:00".to_string(),
         subupdate: None,
         download_time: None,
+        download_revision: 0,
     }
 }
 
@@ -47,6 +48,7 @@ fn section() -> SectionFile {
             postscript: String::new(),
             body: "本文".to_string(),
         },
+        download_revision: 0,
     }
 }
 

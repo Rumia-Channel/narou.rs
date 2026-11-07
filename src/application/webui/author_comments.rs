@@ -90,6 +90,7 @@ mod tests {
             subdate: String::new(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         }
     }
 
@@ -110,6 +111,7 @@ mod tests {
                 postscript: postscript.to_string(),
                 body: String::new(),
             },
+            download_revision: 0,
         }
     }
 
