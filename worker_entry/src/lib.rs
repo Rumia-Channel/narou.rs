@@ -1395,7 +1395,24 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
             return Response::error("Service unavailable", 503);
         }
     };
-    let planned = runtime.services.jobs.plan(&request);
+    let planned = if request.kind == narou_rs::application::JobKind::Update && request.targets.is_empty() {
+        let records = match runtime.write_services().library.records().await {
+            Ok(records) => records,
+            Err(error) => return Response::error(format!("update target selection failed: {error}"), 503),
+        };
+        narou_rs::application::jobs::JobPlanResult {
+            plans: records.into_iter()
+                .filter(|record| !narou_rs::virtual_novel::is_virtual_record(record))
+                .map(|record| narou_rs::application::JobPlan {
+                    kind: request.kind,
+                    target: narou_rs::application::JobTarget::Id(narou_rs::platform::NovelId(record.id)),
+                    options: request.options.clone(),
+                }).collect(),
+            ..Default::default()
+        }
+    } else {
+        runtime.services.jobs.plan(&request)
+    };
     let invalid = planned.invalid.clone();
     let duplicates = planned.duplicates.clone();
     let plans = match runtime.expand_download_plans(planned.plans).await {

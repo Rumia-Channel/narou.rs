@@ -27,6 +27,11 @@ pub fn is_virtual_ncode(ncode: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+/// Virtual parents are stored novels, but never upstream download/update targets.
+pub fn is_virtual_record(record: &crate::db::NovelRecord) -> bool {
+    record.ncode.as_deref().is_some_and(is_virtual_ncode)
+}
+
 /// `vs_<数字>` から ID を取り出す。
 pub fn id_from_ncode(ncode: &str) -> Option<i64> {
     ncode

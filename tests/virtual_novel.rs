@@ -69,6 +69,23 @@ fn run(root: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn updating_a_virtual_parent_preserves_records_and_succeeds_without_a_site() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture(root);
+    let added = run(root, &["virtual", "add", "--title", "Combined", "1", "2"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let path = root.join(".narou/database.yaml");
+    let before: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for target in ["3", "vs_3"] {
+        let updated = run(root, &["update", "--force", target]);
+        assert!(updated.status.success(), "{}", String::from_utf8_lossy(&updated.stderr));
+        let after: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after, before, "virtual update must not mutate the parent or members");
+    }
+}
+
+#[test]
 fn virtual_novel_registers_hides_members_and_combines_text_in_order() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

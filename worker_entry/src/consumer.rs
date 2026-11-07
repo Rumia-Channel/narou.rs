@@ -221,6 +221,19 @@ async fn process_envelope(
     }
 }
 
+async fn load_update_record(
+    runtime: &WorkerRuntime,
+    target: &JobTarget,
+) -> Result<Option<narou_rs::db::NovelRecord>> {
+    match target {
+        JobTarget::Id(id) => runtime.novels.get(*id).await,
+        JobTarget::Ncode(ncode) => runtime.novels.find_by_ncode(ncode).await,
+        JobTarget::Url(url) => runtime.novels.find_by_toc_url(url).await,
+        JobTarget::All => Ok(None),
+    }
+}
+
+
 async fn process_discrete(
     runtime: &WorkerRuntime,
     downloader: &mut Option<Downloader>,
@@ -235,7 +248,14 @@ async fn process_discrete(
         message.ack();
         return Ok(());
     }
-    if job.kind != JobKind::Convert && downloader.is_none() {
+    let (update_record, record_error) = if job.kind == JobKind::Update {
+        match load_update_record(runtime, &job.target).await {
+            Ok(record) => (record, None),
+            Err(error) => (None, Some(error)),
+        }
+    } else { (None, None) };
+    let virtual_update = update_record.as_ref().is_some_and(narou_rs::virtual_novel::is_virtual_record);
+    if record_error.is_none() && job.kind != JobKind::Convert && !virtual_update && downloader.is_none() {
         *downloader = Some(runtime.new_downloader().await?);
     }
     let target = match &job.target {
@@ -243,8 +263,10 @@ async fn process_discrete(
         JobTarget::Ncode(value) | JobTarget::Url(value) => Cow::Borrowed(value.as_str()),
         JobTarget::All => Cow::Borrowed("*"),
     };
-    let (site_key, admission_error) = if matches!(job.kind, JobKind::Download | JobKind::Update | JobKind::AuthorCheck) {
-        match downloader.as_ref().expect("acquisition downloader").site_key_for_target(&target).await {
+    let (site_key, admission_error) = if let Some(error) = record_error {
+        (None, Some(error))
+    } else if !virtual_update && matches!(job.kind, JobKind::Download | JobKind::Update | JobKind::AuthorCheck) {
+        match downloader.as_ref().expect("acquisition downloader").site_key_for_target(&target, update_record.as_ref()).await {
             Ok(key) => (Some(key), None),
             Err(error) => (None, Some(error)),
         }
@@ -278,7 +300,11 @@ async fn process_discrete(
     ])
     .await;
 
-    let outcome = if let Some(error) = admission_error {
+    let outcome = if virtual_update {
+        // Old queued plans and the generic jobs API use the same successful
+        // no-op as native update: no site lookup, pacing or upstream request.
+        JobOutcome::Succeeded
+    } else if let Some(error) = admission_error {
         JobOutcome::from_error(error)
     } else if job.kind == JobKind::Convert {
         // Convert は保存済みデータだけを見るので Downloader を使わない。
@@ -288,10 +314,11 @@ async fn process_discrete(
         execute_job(
             downloader.as_mut().expect("acquisition downloader"),
             job,
-            &job_id,
-            checkpoint.as_ref(),
+            crate::executor::JobExecution {
+                job_id: &job_id, checkpoint: checkpoint.as_ref(),
+                execution_token: &execution_token, update_record: update_record.as_ref(),
+            },
             runtime,
-            &execution_token,
             push,
         )
         .await

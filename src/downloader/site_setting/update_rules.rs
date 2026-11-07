@@ -7,6 +7,9 @@ use serde::ser::SerializeMap;
 use crate::db::NovelRecord;
 /// Resolve saved works using page/API URL first, retaining domain-only legacy records.
 pub fn allows_automatic_update(sites: &[super::SiteSetting], record: &NovelRecord) -> bool {
+    if crate::virtual_novel::is_virtual_record(record) {
+        return false;
+    }
     let display_url = record.display_url();
     sites.iter()
         .find(|site| site.matches_url(&record.toc_url)
@@ -81,6 +84,15 @@ mod tests {
         let mut record: NovelRecord = serde_yaml::from_str("id: 1\nauthor: Writer\ntitle: Picture\nfile_title: Picture\ntoc_url: https://images.example/ajax/1\nsitename: Images\nnovel_type: 2\nlast_update: '2026-10-31T00:00:00Z'\n").unwrap();
         record.ncode = ncode.map(str::to_string);
         record
+    }
+
+    #[test]
+    fn automatic_updates_exclude_virtual_identity_not_member_tags() {
+        assert!(!allows_automatic_update(&[], &record(Some("vs_1"))));
+        let mut member = record(None);
+        member.tags.push("vs_1".into());
+        assert!(allows_automatic_update(&[], &member));
+        assert!(allows_automatic_update(&[], &record(Some("vs_not_numeric"))));
     }
 
     #[test]

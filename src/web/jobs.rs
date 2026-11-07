@@ -204,6 +204,7 @@ fn current_web_update_sort_key_for_cli() -> Option<&'static str> {
 }
 
 fn sorted_update_all_ids(mut records: Vec<crate::db::NovelRecord>) -> Vec<String> {
+    records.retain(|record| !crate::virtual_novel::is_virtual_record(record));
     let sort_state = current_web_update_sort_state();
     sort_records_for_web_update(&mut records, &sort_state);
     records.into_iter().map(|record| record.id.to_string()).collect()
@@ -2095,6 +2096,7 @@ pub async fn api_update_by_tag(
     let snapshot_ids: Vec<i64> = {
         let mut matching = records
             .into_iter()
+            .filter(|record| !crate::virtual_novel::is_virtual_record(record))
             .filter(|record| {
                 let include = tags
                     .iter()
@@ -2480,6 +2482,18 @@ mod tests {
             login_session: None,
             extra_fields: Default::default(),
         }
+    }
+
+    #[test]
+    fn update_all_keeps_real_members_but_excludes_virtual_parents() {
+        let mut member = sample_record(1, 0);
+        member.tags.push("vs_2".into());
+        let mut parent = sample_record(2, 0);
+        parent.ncode = Some("vs_2".into());
+        let mut ordinary = sample_record(3, 0);
+        ordinary.ncode = Some("vs_not_numeric".into());
+        let ids = super::sorted_update_all_ids(vec![member, parent, ordinary]);
+        assert_eq!(ids.into_iter().collect::<HashSet<_>>(), HashSet::from(["1".into(), "3".into()]));
     }
 
     #[test]

@@ -839,16 +839,33 @@ impl Downloader {
         self.site_settings.iter().find(|setting| setting.matches_url(url))
     }
 
+    fn site_setting_for_stored_target(&self, record: &NovelRecord, target_type: TargetType) -> Result<&SiteSetting> {
+        match target_type {
+            TargetType::Id => self.site_setting_for_url(&record.toc_url).or_else(|| {
+                Self::ageauth_redirect_target(&record.toc_url)
+                    .and_then(|url| self.site_setting_for_url(&url))
+            }).ok_or_else(|| NarouError::NotFound(format!("Novel not found for ID: {}", record.id))),
+            _ => self.site_setting_for_url(&record.toc_url)
+                .ok_or_else(|| NarouError::SiteSetting("No matching site setting".into())),
+        }
+    }
+
     /// Admission identity follows the effective YAML definition, not an alias host.
     /// Resolving this key performs no HTTP requests and does not clone the DSL.
-    pub async fn site_key_for_target(&self, target: &str) -> Result<String> {
-        if matches!(Self::get_target_type(target), TargetType::Url) {
+    pub async fn site_key_for_target(&self, target: &str, known_record: Option<&NovelRecord>) -> Result<String> {
+        let target_type = Self::get_target_type(target);
+        if matches!(target_type, TargetType::Url) {
             let setting = self.site_settings.iter()
                 .find(|setting| setting.matches_series_url(target))
                 .or_else(|| self.site_setting_for_url(target))
                 .or_else(|| self.site_settings.iter().find(|setting| setting.matches_author_url(target)))
                 .ok_or_else(|| NarouError::InvalidTarget(format!("No site setting for URL: {target}")))?;
             return Ok(setting.download_site_family());
+        }
+        // Callers may reuse metadata already resolved for this target. URLs
+        // and free-text targets retain their original resolution precedence.
+        if let Some(record) = known_record && matches!(target_type, TargetType::Id | TargetType::Ncode) {
+            return Ok(self.site_setting_for_stored_target(record, target_type)?.download_site_family());
         }
         let (_, setting) = self.resolve_target_for_download(target).await?;
         Ok(setting.download_site_family())
@@ -2866,11 +2883,8 @@ impl Downloader {
                 let (known_id, setting, toc_url) =
                     match self.novels.find_by_ncode(&ncode).await? {
                         Some(record) => {
-                            let setting =
-                                self.site_setting_for_url(&record.toc_url).ok_or_else(|| {
-                                    NarouError::SiteSetting("No matching site setting".into())
-                                })?;
-                            (Some(record.id), setting, record.toc_url.clone())
+                            let setting = self.site_setting_for_stored_target(&record, TargetType::Ncode)?;
+                            (Some(record.id), setting, record.toc_url)
                         }
                         None => {
                             let narou_url = narou_ncode_url(&ncode);
@@ -2901,15 +2915,10 @@ impl Downloader {
                 let id: i64 = target
                     .parse()
                     .map_err(|_| NarouError::InvalidTarget(target.to_string()))?;
-                let setting = self.novels.get(id.into()).await?.and_then(|record| {
-                    self.site_setting_for_url(&record.toc_url).or_else(|| {
-                        Self::ageauth_redirect_target(&record.toc_url)
-                            .and_then(|url| self.site_setting_for_url(&url))
-                    })
-                });
-                let setting = setting.ok_or_else(|| {
+                let record = self.novels.get(id.into()).await?.ok_or_else(|| {
                     NarouError::NotFound(format!("Novel not found for ID: {}", id))
                 })?;
+                let setting = self.site_setting_for_stored_target(&record, TargetType::Id)?;
                 Ok((Some(id), setting))
             }
             TargetType::Other => {
@@ -3613,16 +3622,38 @@ is_narou: false
             "https://syosetu.org/novel/123456/", "https://h.syosetu.org/novel/123456/",
             "https://novel.syosetu.org/123456/", "https://syosetu.org/user/267675/", "42",
         ] {
-            assert_eq!(downloader.site_key_for_target(target).await.unwrap(), "syosetu.org", "{target}");
+            assert_eq!(downloader.site_key_for_target(target, None).await.unwrap(), "syosetu.org", "{target}");
         }
         for target in [
             "N1234AB", "43", "https://ncode.syosetu.com/n1234ab/",
             "https://mypage.syosetu.com/2842627/", "https://ncode.syosetu.com/s1234ab/",
         ] {
-            assert_eq!(downloader.site_key_for_target(target).await.unwrap(), "syosetu.com", "{target}");
+            assert_eq!(downloader.site_key_for_target(target, None).await.unwrap(), "syosetu.com", "{target}");
         }
-        assert!(downloader.site_key_for_target("https://unknown.example/book/").await.is_err());
+        assert!(downloader.site_key_for_target("https://unknown.example/book/", None).await.is_err());
         assert!(http.requested_urls().is_empty(), "admission must never fetch a site or send cookies");
+    }
+
+    #[tokio::test]
+    async fn admission_reuses_metadata_without_changing_ageauth_target_precedence() {
+        let sites = SiteSetting::load_bundled(&[include_str!("../../webnovel/ncode.syosetu.com.yaml")]).unwrap();
+        let mut record = sample_record(chrono::DateTime::from_timestamp(0, 0).unwrap());
+        record.id = 42;
+        record.ncode = Some("n1234ab".into());
+        record.toc_url = "https://nl.syosetu.com/redirect/ageauth/?url=https%3A%2F%2Fncode.syosetu.com%2Fn1234ab%2F".into();
+        let store = Arc::new(MemoryObjectStore::new());
+        let downloader = Downloader::with_platform_and_storage_and_settings(
+            DownloaderPlatform {
+                http: Arc::new(MockHttpClient::new()), rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::from_records(vec![record.clone()])),
+                objects: store.clone(), assets: store, clock: Arc::new(SystemClock),
+            },
+            sites, HashMap::new(),
+        ).unwrap();
+        for known in [None, Some(&record)] {
+            assert_eq!(downloader.site_key_for_target("42", known).await.unwrap(), "syosetu.com");
+            assert!(matches!(downloader.site_key_for_target("N1234AB", known).await, Err(crate::error::NarouError::SiteSetting(_))));
+        }
     }
 
     #[test]
