@@ -649,6 +649,13 @@ impl NativeStore {
         Self::for_narou_root(&narou_root)
     }
 
+    pub(crate) fn prefer_existing_files(self) -> Self {
+        match self {
+            Self::Sqlite(store) => Self::Sqlite(store.prefer_existing_files()),
+            store => store,
+        }
+    }
+
     /// List immediate file children without walking histories or illustrations.
     /// SQLite rows and legacy filesystem-only files are both included.
     pub fn list_direct_files_sync(&self, prefix: &ObjectKey) -> Result<Vec<ObjectKey>> {

@@ -316,6 +316,10 @@ impl NovelConverter {
         }
     }
 
+    pub(crate) fn into_settings(self) -> NovelSettings {
+        self.settings
+    }
+
     /// Site headers/cookie for illustration downloads, replaced whenever the
     /// converter learns which novel (and therefore which site) it is handling.
     #[cfg(feature = "native-runtime")]

@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 
@@ -17,12 +18,12 @@ use crate::db::inventory::{Inventory, InventoryScope};
 use crate::db::NovelRecord;
 use crate::downloader::settings::{DownloaderSettings, NativeDownloaderSettings};
 use crate::downloader::site_setting::SiteSetting;
-use crate::downloader::types::{SectionFile, SubtitleInfo, TocFile};
+use crate::downloader::types::TocFile;
 use crate::downloader::util::{load_length_limit, sanitize_filename_with_limit};
 use crate::error::{NarouError, Result};
 use crate::native::novel_repository::NativeNovelRepository;
-use crate::native::object_store::NativeStore;
-use crate::platform::{NovelId, NovelMutation};
+use crate::native::object_store::{NativeObjectStore, NativeStore, NativeStores};
+use crate::platform::{NovelId, NovelMutation, NovelObjectKeys, ObjectStore};
 use crate::virtual_novel::{self, AttributeComposition, VirtualNovelMembers};
 
 /// 仮想小説の属性分類 (小説 / 漫画)。
@@ -559,74 +560,38 @@ pub fn convert_virtual(
         .map_err(NarouError::Io)?;
     std::fs::create_dir_all(temp.path().join("本文")).map_err(NarouError::Io)?;
 
-    // 各メンバーの実ファイルを変換の間だけ実体化する。
-    let store = NativeStore::for_current_root()?;
-    let mut _materialized = Vec::new();
-    let mut subtitles: Vec<SubtitleInfo> = Vec::new();
-    let mut sequence = 0usize;
-
-    for member_id in members {
-        let member = repository
-            .get_sync(NovelId(*member_id))?
-            .ok_or_else(|| {
-                NarouError::Platform(format!(
-                    "バーチャル小説のメンバー ID {member_id} が見つかりません"
-                ))
-            })?;
-        let member_dir = db::existing_novel_dir_for_record(&archive_root, &member);
-        _materialized.push(store.materialize_conversion_inputs(&member_dir)?);
-        let toc = read_toc(&member_dir)?;
-        copy_illustrations(&member_dir.join("挿絵"), &temp.path().join("挿絵"))?;
-
-        for (position, subtitle) in toc.subtitles.iter().enumerate() {
-            let section_path = resolve_section_path(&member_dir, subtitle).ok_or_else(|| {
-                NarouError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "本文が見つかりません: ID:{member_id} {}",
-                        subtitle.file_subtitle
-                    ),
-                ))
-            })?;
-            let mut section: SectionFile =
-                serde_yaml::from_str(&std::fs::read_to_string(&section_path).map_err(NarouError::Io)?)
-                    .map_err(NarouError::Yaml)?;
-            sequence += 1;
-            let index = sequence.to_string();
-            section.index = index.clone();
-            section.href.clone_from(&subtitle.href);
-            section.chapter = if position == 0 {
-                member.title.clone()
-            } else {
-                String::new()
-            };
-            section.subchapter.clear();
-            let filename = format!("{} {}.yaml", index, section.file_subtitle);
-            std::fs::write(
-                temp.path().join("本文").join(filename),
-                serde_yaml::to_string(&section).map_err(NarouError::Yaml)?,
-            )
-            .map_err(NarouError::Io)?;
-
-            let mut merged = subtitle.clone();
-            merged.index = index;
-            merged.chapter = section.chapter.clone();
-            merged.subchapter.clear();
-            subtitles.push(merged);
+    let objects = Arc::new(NativeStore::for_current_root()?.prefer_existing_files());
+    let stores = NativeStores::for_current_root()?;
+    let local = NativeObjectStore::from_root(archive_root.clone())?;
+    let persistence = crate::downloader::persistence::PersistenceService::new(
+        objects.clone(), stores.assets.clone(),
+    );
+    let book = crate::native::materialization::block_on(async {
+        let book = crate::application::virtual_book::load(record, members, &repository, &persistence).await?;
+        for (name, key) in &book.illustrations {
+            let destination = temp.path().join(name);
+            if !crate::native::materialization::copy_asset(&local, key, &destination).await? {
+                crate::native::materialization::copy_asset(stores.assets.as_ref(), key, &destination).await?;
+            }
         }
+        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        for name in ["setting.ini", "replace.txt", "converter.yaml", "cover.jpg", "cover.png", "cover.jpeg"] {
+            if let Some(bytes) = objects.read_small(&keys.prefix().join(name)?).await? {
+                std::fs::write(temp.path().join(name), bytes)?;
+            }
+        }
+        Ok(book)
+    })?;
+    for section in book.sections {
+        let filename = format!("{} {}.yaml", section.index, section.file_subtitle);
+        std::fs::write(
+            temp.path().join("本文").join(filename),
+            serde_yaml::to_string(&section).map_err(NarouError::Yaml)?,
+        )?;
     }
-
-    let toc = TocFile {
-        title: record.title.clone(),
-        author: record.author.clone(),
-        toc_url: record.toc_url.clone(),
-        story: None,
-        subtitles,
-        novel_type: Some(record.novel_type),
-    };
     std::fs::write(
         temp.path().join("toc.yaml"),
-        serde_yaml::to_string(&toc).map_err(NarouError::Yaml)?,
+        serde_yaml::to_string(&book.toc).map_err(NarouError::Yaml)?,
     )
     .map_err(NarouError::Io)?;
 
@@ -657,31 +622,5 @@ pub fn convert_virtual(
 fn read_toc(novel_dir: &Path) -> Result<TocFile> {
     let content = std::fs::read_to_string(novel_dir.join("toc.yaml")).map_err(NarouError::Io)?;
     serde_yaml::from_str(&content).map_err(NarouError::Yaml)
-}
-
-fn resolve_section_path(novel_dir: &Path, subtitle: &SubtitleInfo) -> Option<PathBuf> {
-    crate::native::legacy_persistence::resolve_section_file_path(
-        &novel_dir.join(crate::downloader::SECTION_SAVE_DIR),
-        subtitle,
-    )
-}
-
-fn copy_illustrations(source: &Path, destination: &Path) -> Result<()> {
-    if !source.is_dir() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(destination).map_err(NarouError::Io)?;
-    for entry in std::fs::read_dir(source).map_err(NarouError::Io)? {
-        let entry = entry.map_err(NarouError::Io)?;
-        let path = entry.path();
-        if path.is_file() {
-            let name = entry.file_name();
-            std::fs::copy(&path, destination.join(name)).map_err(NarouError::Io)?;
-        } else if path.is_dir() {
-            let name = entry.file_name();
-            copy_illustrations(&path, &destination.join(name))?;
-        }
-    }
-    Ok(())
 }
 

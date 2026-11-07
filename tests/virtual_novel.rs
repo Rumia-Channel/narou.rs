@@ -57,6 +57,11 @@ fn run(root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_narou_rs"))
         .args(args)
         .current_dir(root)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("NAROU_RS_LEGACY_YAML", "1")
+        .env("NAROU_RS_ASSET_BACKEND", "local")
+        .env_remove("NAROU_RS_EPUB_ENGINE")
         .output()
         .expect("run narou_rs")
 }
@@ -190,6 +195,147 @@ fn virtual_conversion_uses_ncode_filename_when_enabled() {
         "convert.filename-to-ncode のファイル名になっていない: {}",
         output.display()
     );
+}
+
+#[cfg(feature = "lite")]
+#[test]
+fn combined_epub_preserves_each_members_images_and_virtual_settings() {
+    use std::collections::BTreeSet;
+    use std::io::Read;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture(root);
+    std::fs::write(
+        root.join(".narou/local_setting.yaml"),
+        "convert.epub-engine: lite\ndevice: epub\n",
+    ).unwrap();
+    let colors = [[240, 0, 0], [0, 0, 240]];
+    for (number, color) in (1..=2).zip(colors) {
+        let dir = root.join("小説データ/mock.test").join(format!("[Author] A その{number}"));
+        std::fs::create_dir_all(dir.join("挿絵")).unwrap();
+        image::RgbImage::from_pixel(64, 96, image::Rgb(color))
+            .save(dir.join("挿絵/001.png")).unwrap();
+        let section_path = dir.join(format!("本文/1 第{number}話.yaml"));
+        let mut section: narou_rs::downloader::SectionFile =
+            serde_yaml::from_str(&std::fs::read_to_string(&section_path).unwrap()).unwrap();
+        section.element.body.push_str("\n［＃挿絵（挿絵/001.png）入る］\n");
+        std::fs::write(section_path, serde_yaml::to_string(&section).unwrap()).unwrap();
+    }
+    let added = run(root, &[
+        "virtual", "add", "--title", "XXX", "--author", "Author", "--site", "mock.test", "1", "2",
+    ]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let combined_dir = root.join("小説データ/mock.test/XXX");
+    std::fs::create_dir_all(&combined_dir).unwrap();
+    std::fs::write(combined_dir.join("setting.ini"), "enable_yokogaki=true\n").unwrap();
+
+    let converted = run(root, &["convert", "vs_3"]);
+    assert!(converted.status.success(), "{}{}", String::from_utf8_lossy(&converted.stdout), String::from_utf8_lossy(&converted.stderr));
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(
+        combined_dir.join("[Author] XXX.epub"),
+    ).unwrap()).unwrap();
+    let mut embedded_colors = BTreeSet::new();
+    let mut package = String::new();
+    let mut text = String::new();
+    for position in 0..archive.len() {
+        let mut entry = archive.by_index(position).unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        let name = entry.name().unwrap();
+        if name.starts_with("item/image/") {
+            let pixels = image::load_from_memory(&bytes).unwrap().to_rgb8();
+            embedded_colors.insert(pixels.get_pixel(0, 0).0);
+        } else if name.ends_with(".opf") {
+            package = String::from_utf8(bytes).unwrap();
+        } else if name.ends_with(".xhtml") {
+            text.push_str(&String::from_utf8(bytes).unwrap());
+        }
+    }
+    assert_eq!(embedded_colors, BTreeSet::from(colors), "same-named images must retain both members' pixels");
+    assert!(package.contains("page-progression-direction=\"ltr\""), "{package}");
+    assert!(text.contains("ＢＯＤＹ－一") && text.contains("ＢＯＤＹ－二"), "{text}");
+}
+
+#[cfg(feature = "lite")]
+#[test]
+fn web_virtual_downloads_generate_epub_and_refresh_changed_members() {
+    use std::io::{Cursor, Read};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn text(bytes: &[u8]) -> String {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut text = String::new();
+        for position in 0..archive.len() {
+            let mut entry = archive.by_index(position).unwrap();
+            if entry.name().unwrap().ends_with(".xhtml") {
+                entry.read_to_string(&mut text).unwrap();
+            }
+        }
+        text
+    }
+    fn epub(response: reqwest::blocking::Response) -> Vec<u8> {
+        let status = response.status();
+        let bytes = response.bytes().unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        bytes.to_vec()
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture(root);
+    std::fs::write(root.join(".narou/local_setting.yaml"), "convert.epub-engine: lite\ndevice: epub\n").unwrap();
+    let configured = run(root, &["setting", "external-api.require-token=false", "server-ws-port=0"]);
+    assert!(configured.status.success(), "{}", String::from_utf8_lossy(&configured.stderr));
+    let added = run(root, &["virtual", "add", "--title", "XXX", "--author", "Author", "--site", "mock.test", "1", "2"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let log_path = root.join("server.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let _server = Server(Command::new(env!("CARGO_BIN_EXE_narou_rs"))
+        .args(["web", "--port", &port.to_string(), "--no-browser"])
+        .current_dir(root)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("NAROU_RS_LEGACY_YAML", "1")
+        .env("NAROU_RS_ASSET_BACKEND", "local")
+        .env_remove("NAROU_RS_EPUB_ENGINE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn().unwrap());
+    let client = reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(30)).build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !client.get(&base).send().is_ok_and(|response| response.status().is_success()) {
+        assert!(Instant::now() < deadline, "{}", std::fs::read_to_string(&log_path).unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let cookie = format!("narou_ui_token={}", std::fs::read_to_string(root.join(".narou/ui_token")).unwrap().trim());
+    let first = epub(client.get(format!("{base}/novels/3/download")).header("Cookie", &cookie).send().unwrap());
+    let first_text = text(&first);
+    assert!(first_text.contains("ＢＯＤＹ－一") && first_text.contains("ＢＯＤＹ－二"), "{first_text}");
+    let section_path = root.join("小説データ/mock.test/[Author] A その1/本文/1 第1話.yaml");
+    let mut section: narou_rs::downloader::SectionFile =
+        serde_yaml::from_str(&std::fs::read_to_string(&section_path).unwrap()).unwrap();
+    section.element.body.push_str("\nUPDATED 本文\n");
+    std::fs::write(section_path, serde_yaml::to_string(&section).unwrap()).unwrap();
+    let updated = epub(client.get(format!("{base}/api/v1/novels/3/epub")).send().unwrap());
+    assert!(text(&updated).contains("ＵＰＤＡＴＥＤ"), "a saved virtual EPUB must not conceal member changes");
+    std::fs::remove_file(root.join("小説データ/mock.test/XXX/[Author] XXX.epub")).unwrap();
+    let converted = client.post(format!("{base}/api/virtual_novels/3/convert"))
+        .header("Cookie", &cookie).header("Origin", &base).send().unwrap();
+    assert_eq!(converted.status(), reqwest::StatusCode::OK);
+    let result: serde_json::Value = serde_json::from_slice(&converted.bytes().unwrap()).unwrap();
+    assert_eq!(result["filename"], "[Author] XXX.epub");
+    assert!(text(&std::fs::read(root.join("小説データ/mock.test/XXX/[Author] XXX.epub")).unwrap()).contains("ＵＰＤＡＴＥＤ"));
 }
 
 /// 既存のフィクスチャへ小説を 1 件足す (仮想小説のメンバー追加テスト用)。

@@ -52,6 +52,7 @@ pub struct SqliteObjectStore {
     /// 実ファイルのミラーを書くか (`sqlite.mirror-files=false` で無効)。
     /// 無効時は読み書きが SQLite だけで完結する。
     mirror_files: bool,
+    prefer_existing_files: bool,
 }
 
 impl SqliteObjectStore {
@@ -80,7 +81,15 @@ impl SqliteObjectStore {
             conn,
             mirror,
             mirror_files,
+            prefer_existing_files: false,
         }
+    }
+
+    /// Conversion inputs preserve user-edited files without restoring DB blobs
+    /// into the live library. Normal storage reads remain database-first.
+    pub(crate) fn prefer_existing_files(mut self) -> Self {
+        self.prefer_existing_files = true;
+        self
     }
 
     fn now_rfc3339() -> String {
@@ -664,8 +673,15 @@ impl ObjectStore for SqliteObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || {
+            if this.prefer_existing_files {
+                let path = this.mirror.resolve_read_path(&key)?;
+                if let Some(metadata) = this.mirror.metadata_for_path(&key, &path)? {
+                    return Ok(Some(metadata));
+                }
+            }
             match this.stat_blocking(&key)? {
                 Some(metadata) => Ok(Some(metadata)),
+                None if this.prefer_existing_files => Ok(None),
                 // Pre-import or store-bypassed files still resolve via FS.
                 None => {
                     let path = this.mirror.resolve_read_path(&key)?;
@@ -679,8 +695,14 @@ impl ObjectStore for SqliteObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || {
+            if this.prefer_existing_files
+                && let Some(data) = this.mirror.read_small_blocking(&key)?
+            {
+                return Ok(Some(data));
+            }
             match this.read_blocking(&key, Some(crate::native::object_store::MAX_SMALL_OBJECT_BYTES))? {
                 Some(data) => Ok(Some(data)),
+                None if this.prefer_existing_files => Ok(None),
                 None => this.mirror.read_small_blocking(&key),
             }
         })
@@ -755,12 +777,18 @@ impl AssetStore for SqliteObjectStore {
         let this = self.clone();
         let key = key.clone();
         Box::pin(async move {
+            if this.prefer_existing_files
+                && let Some(stream) = AssetStore::read_stream(&this.mirror, &key).await?
+            {
+                return Ok(Some(stream));
+            }
             let data = run_blocking({
                 let this = this.clone();
                 let key = key.clone();
                 move || -> Result<Option<Vec<u8>>> {
                     match this.read_blocking(&key, None)? {
                         Some(data) => Ok(Some(data)),
+                        None if this.prefer_existing_files => Ok(None),
                         None => {
                             let path = this.mirror.resolve_read_path(&key)?;
                             match std::fs::read(&path) {
@@ -1675,6 +1703,21 @@ mod tests {
                 "novels/site/title/本文/2 第二話.yaml".to_string(),
             ]
         );
+        let input = store.clone().prefer_existing_files();
+        assert_eq!(futures::executor::block_on(input.read_small(&managed)).unwrap().unwrap(), b"stale");
+        assert_eq!(futures::executor::block_on(ObjectStore::stat(&input, &managed)).unwrap().unwrap().size, 5);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let bytes = runtime.block_on(async {
+            let mut stream = input.read_stream(&managed).await.unwrap().unwrap();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                bytes.extend(chunk.unwrap());
+            }
+            bytes
+        });
+        assert_eq!(bytes, b"stale");
+        std::fs::remove_file(managed_path).unwrap();
+        assert_eq!(futures::executor::block_on(input.read_small(&managed)).unwrap().unwrap(), b"stored");
     }
 
     /// When the filesystem copy cannot be removed, the delete fails and the

@@ -534,7 +534,7 @@ async fn api_novel_epub(env: &Env, id: &str) -> worker::Result<Response> {
         Ok(id) => id,
         Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
-    crate::build_epub_response(env, id).await
+    crate::build_epub_response(env, id, false).await
 }
 
 /// タグ一覧。

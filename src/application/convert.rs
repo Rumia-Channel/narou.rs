@@ -17,7 +17,7 @@ use crate::converter::user_converter::UserConverter;
 use crate::converter::{ConverterCapabilities, NovelConverter};
 use crate::db::NovelRecord;
 use crate::downloader::persistence::{PersistenceService, SectionLoadFailure};
-use crate::downloader::{SectionFile, TocObject, UpdateStatus};
+use crate::downloader::{SectionFile, TocFile, TocObject, UpdateStatus};
 use crate::error::{NarouError, Result};
 use crate::platform::{AssetStore, NovelObjectKeys, ObjectKey, ObjectStore};
 use crate::setting_core::SettingScope;
@@ -30,6 +30,7 @@ use super::settings::SettingsStore;
 pub struct ConvertedNovel {
     pub text: String,
     pub output: Option<ObjectKey>,
+    pub settings: NovelSettings,
 }
 
 /// 1 件の変換結果。native `cmd_convert` の per-target 分岐
@@ -188,7 +189,7 @@ impl ConvertService {
     /// 目次にあるのに本文が無い話はエラーで止める (不完全な novel.txt を
     /// 成功として書かない)。
     pub async fn convert_and_store(&self, record: &NovelRecord) -> Result<ConvertedNovel> {
-        self.convert_inner(record, true).await
+        self.convert_inner(record, true, None).await
     }
 
     /// 変換だけを行う (`convert_and_store` と同じだが、結果を保存しない)。
@@ -196,26 +197,43 @@ impl ConvertService {
     /// 変換済みテキストを保存しない構成 (`convert.keep-txt=false`) で、
     /// 必要になった時点で組み立て直すために使う。
     pub async fn convert_only(&self, record: &NovelRecord) -> Result<ConvertedNovel> {
-        self.convert_inner(record, false).await
+        self.convert_inner(record, false, None).await
     }
 
-    async fn convert_inner(&self, record: &NovelRecord, store: bool) -> Result<ConvertedNovel> {
+    /// Convert an assembled book with the target novel's settings, replacements
+    /// and metadata, without rereading its member sections.
+    pub async fn convert_prepared(
+        &self,
+        record: &NovelRecord,
+        toc: TocFile,
+        sections: Vec<SectionFile>,
+        store: bool,
+    ) -> Result<ConvertedNovel> {
+        self.convert_inner(record, store, Some((toc, sections))).await
+    }
+
+    async fn convert_inner(
+        &self,
+        record: &NovelRecord,
+        store: bool,
+        source: Option<(TocFile, Vec<SectionFile>)>,
+    ) -> Result<ConvertedNovel> {
         let keys = NovelObjectKeys::new(
             &record.sitename,
             &record.file_title,
             record.use_subdirectory,
         )?;
-        let persistence = PersistenceService::new(self.objects.clone(), self.assets.clone());
-        let toc = persistence.load_toc(&keys).await?.ok_or_else(|| {
-            NarouError::Platform(format!("toc がありません: {}", keys.toc().as_ref()))
-        })?;
-
-        // 本文 (目次順) と、小説単位の独立な設定ファイルを同時に読む。
+        // 目次・本文と、小説単位の独立な設定ファイルを同時に読む。
         // エラーの優先順位は直列だったときの読取順 (本文 → setting.ini →
         // 置換 → converter.yaml) のままになるよう、join 後にこの順で評価する。
         let replace_key = keys.replace();
-        let (sections, ini, local_settings, replacement, converter_yaml) = futures::join!(
-            persistence.load_sections_ordered(&keys, &toc.subtitles),
+        let (source, ini, local_settings, replacement, converter_yaml) = futures::join!(
+            async {
+                match source {
+                    Some(source) => Ok(source),
+                    None => self.load_source(&keys).await,
+                }
+            },
             self.load_ini(&keys),
             self.settings.load(SettingScope::Local),
             self.read_text(&replace_key),
@@ -225,27 +243,7 @@ impl ConvertService {
                 self.read_text(&converter_key).await
             },
         );
-        let sections: Vec<SectionFile> = match sections {
-            Ok(sections) => sections,
-            Err(SectionLoadFailure::Missing { section_index }) => {
-                let subtitle = &toc.subtitles[section_index];
-                // native の `section file not found: expected '{index}
-                // {file_subtitle}.yaml' in {section_dir}` に対応する。
-                // ObjectStore では見たキー自体が「期待した場所」なので、
-                // ファイル名相当部分は実際に探したキーの末尾を出す。
-                let section_key = keys.section(&subtitle.index, &subtitle.file_subtitle);
-                let key: &str = section_key.as_ref();
-                let filename = key.rsplit('/').next().unwrap_or(key);
-                return Err(NarouError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "section file not found: expected '{filename}' in {}/本文",
-                        keys.prefix().as_ref()
-                    ),
-                )));
-            }
-            Err(SectionLoadFailure::Read(error)) => return Err(error),
-        };
+        let (toc, sections) = source?;
         if sections.is_empty() {
             return Err(NarouError::Platform(format!(
                 "本文がありません: {}",
@@ -278,11 +276,11 @@ impl ConvertService {
         let mut converter =
             NovelConverter::build(settings, user_converter, self.capabilities.clone());
         let toc_object = TocObject {
-            title: toc.title.clone(),
-            author: toc.author.clone(),
-            toc_url: toc.toc_url.clone(),
-            story: toc.story.clone(),
-            subtitles: toc.subtitles.clone(),
+            title: toc.title,
+            author: toc.author,
+            toc_url: toc.toc_url,
+            story: toc.story,
+            subtitles: toc.subtitles,
             novel_type: toc.novel_type,
         };
         let text = converter.convert_novel(&toc_object, &sections, Some(record))?;
@@ -303,7 +301,32 @@ impl ConvertService {
         } else {
             None
         };
-        Ok(ConvertedNovel { text, output })
+        Ok(ConvertedNovel { text, output, settings: converter.into_settings() })
+    }
+
+    async fn load_source(&self, keys: &NovelObjectKeys) -> Result<(TocFile, Vec<SectionFile>)> {
+        let persistence = PersistenceService::new(self.objects.clone(), self.assets.clone());
+        let toc = persistence.load_toc(keys).await?.ok_or_else(|| {
+            NarouError::Platform(format!("toc がありません: {}", keys.toc().as_ref()))
+        })?;
+        let sections = match persistence.load_sections_ordered(keys, &toc.subtitles).await {
+            Ok(sections) => sections,
+            Err(SectionLoadFailure::Missing { section_index }) => {
+                let subtitle = &toc.subtitles[section_index];
+                let section_key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+                let key: &str = section_key.as_ref();
+                let filename = key.rsplit('/').next().unwrap_or(key);
+                return Err(NarouError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "section file not found: expected '{filename}' in {}/本文",
+                        keys.prefix().as_ref()
+                    ),
+                )));
+            }
+            Err(SectionLoadFailure::Read(error)) => return Err(error),
+        };
+        Ok((toc, sections))
     }
 
     async fn load_ini(&self, keys: &NovelObjectKeys) -> Result<IniData> {

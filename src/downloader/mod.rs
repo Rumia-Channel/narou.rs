@@ -5287,10 +5287,9 @@ is_narou: false
             ),
             Some("i83860.png")
         );
-        #[cfg(feature = "lite")]
         {
-            let (_, unresolved) = crate::epub_lite::rewrite_illustration_references(
-                "［＃挿絵（//9496.mitemin.net/userpageimage/viewimagebig/icode/i83860/）入る］",
+            let (_, unresolved) = crate::illustration_refs::rewrite(
+                "［＃挿絵（//9496.mitemin.net/userpageimage/viewimagebig/icode/i83860/）入る］".into(),
                 |url| {
                     index
                         .filename_for_source(url)

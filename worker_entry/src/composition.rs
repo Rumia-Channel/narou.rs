@@ -15,7 +15,7 @@ use narou_rs::downloader::settings::{DownloaderSettings, SnapshotDownloaderSetti
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
-    AssetStore, Clock, HttpClient, NovelFilter, NovelRepository, ObjectStore, RateLimiter, S3Store,
+    AssetStore, Clock, HttpClient, NovelFilter, NovelRepository, ObjectStore, S3Store,
     SplitStore, SystemClock,
 };
 use narou_rs::setting_core::SettingScope;
@@ -590,15 +590,6 @@ impl WorkerRuntime {
         &self.site_settings
     }
 
-    /// 変換 (`ConvertService`) と HTTP 系が共有する平台能力。
-    pub fn http_client(&self) -> Arc<dyn HttpClient> {
-        self.http.clone()
-    }
-
-    pub fn rate_limiter(&self) -> Arc<dyn RateLimiter> {
-        self.rate_limiter.clone()
-    }
-
     /// native `commands::update` の `update.interval` を、同じドメインの Update
     /// ジョブの開始間隔として適用する。native は update コマンドのプロセス内で
     /// 数えるが、Worker ではジョブが別 isolate で走りうるので、サイト別 DO と
@@ -1013,6 +1004,10 @@ impl WorkerRuntime {
 pub struct ReadServices {
     pub app: AppServices,
     pub objects: Arc<dyn ObjectStore>,
+    pub assets: Arc<dyn AssetStore>,
+    pub novels: Arc<dyn NovelRepository>,
+    pub conversion: narou_rs::application::convert::ConvertService,
+    pub db: DbHandle,
     /// 挿絵を S3 に置く構成のときだけ入る（presigned URL を作るのに使う）。
     pub s3_illustrations: Option<Arc<S3Store>>,
 }
@@ -1027,7 +1022,7 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     // セッション、失敗時は primary) で組み立てる。
     let db = DbHandle::ui(Arc::new(env.d1("DB")?));
     let subrequests = crate::budget::SubrequestBudget::new();
-    let (objects, _assets, s3_illustrations) =
+    let (objects, assets, s3_illustrations) =
         build_object_stores(env, &db, subrequests, false).await?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
@@ -1039,12 +1034,16 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     let site_rules = Arc::new(
         narou_rs::application::site_definitions::SiteSettingsSnapshot::new(site_settings),
     );
+    let settings = Arc::new(D1SettingsStore::new(db.clone()));
+    let conversion = narou_rs::application::convert::ConvertService::new(
+        objects.clone(), assets.clone(), settings.clone(),
+    );
     Ok(ReadServices {
         app: services_from(
-            novels,
+            novels.clone(),
             objects.clone(),
             freeze,
-            Arc::new(D1SettingsStore::new(db.clone())),
+            settings,
             Arc::new(D1TagColorStore::new(db.clone())),
             clock,
             site_rules,
@@ -1052,6 +1051,10 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
             env,
         ),
         objects,
+        assets,
+        novels,
+        conversion,
+        db,
         s3_illustrations,
     })
 }

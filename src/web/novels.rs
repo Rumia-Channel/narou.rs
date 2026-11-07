@@ -355,12 +355,8 @@ pub async fn download_ebook(
         .as_deref()
         .is_some_and(crate::virtual_novel::is_virtual_ncode)
     {
-        let members = crate::native::virtual_novel::load()
-            .ok()
-            .and_then(|all| all.get(id).map(|members| members.to_vec()))
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "virtual members not found".to_string()))?;
-        crate::native::virtual_novel::convert_virtual(id, &record, &members, None, false, false)
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let generated = generate_virtual_epub(record).await?;
+        return serve_epub_file(&generated).await;
     }
 
     let novel_dir = with_database(|db| {
@@ -413,6 +409,22 @@ pub async fn download_ebook(
     })?;
 
     serve_epub_file(&file_path).await
+}
+
+pub(crate) async fn generate_virtual_epub(
+    record: crate::db::NovelRecord,
+) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    tokio::task::spawn_blocking(move || {
+        let all = crate::native::virtual_novel::load()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let members = all.get(record.id)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "virtual members not found".to_string()))?;
+        crate::native::virtual_novel::convert_virtual(
+            record.id, &record, members, Some(crate::converter::device::Device::Epub), false, false,
+        ).map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+    })
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
 }
 
 /// 保存済みの EPUB ファイルを返す。
@@ -491,42 +503,20 @@ pub(crate) async fn serve_epub(
     record: &crate::db::novel_record::NovelRecord,
     novel_dir: &std::path::Path,
 ) -> Result<Response, (StatusCode, String)> {
-    let paths = crate::mail::get_ebook_file_paths(record, novel_dir, ".epub")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    if let Some(path) = paths.iter().find(|path| path.exists()) {
-        return Ok(as_epub_response(serve_epub_file(path).await?));
-    }
-    // バーチャル小説は toc を持たないため、メンバーの目次と本文を結合した
-    // EPUB を作る (Worker の `virtual_novels::build_epub_response` と同じ結果)。
+    // A saved virtual EPUB cannot validate changes to its members or settings.
+    // Rebuild from current member inputs, as the UI download does.
     if record
         .ncode
         .as_deref()
         .is_some_and(crate::virtual_novel::is_virtual_ncode)
     {
-        let members = crate::native::virtual_novel::load()
-            .ok()
-            .and_then(|all| all.get(id).map(<[i64]>::to_vec))
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    "virtual members not found".to_string(),
-                )
-            })?;
-        let owned = record.clone();
-        let generated = tokio::task::spawn_blocking(move || {
-            crate::native::virtual_novel::convert_virtual(
-                id,
-                &owned,
-                &members,
-                Some(crate::converter::device::Device::Epub),
-                false,
-                false,
-            )
-        })
-        .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let generated = generate_virtual_epub(record.clone()).await?;
         return Ok(as_epub_response(serve_epub_file(&generated).await?));
+    }
+    let paths = crate::mail::get_ebook_file_paths(record, novel_dir, ".epub")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if let Some(path) = paths.iter().find(|path| path.exists()) {
+        return Ok(as_epub_response(serve_epub_file(path).await?));
     }
     #[cfg(feature = "lite")]
     {
