@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "narou_rs"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "aozora_epub3_lite",
  "argon2",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "narou_worker"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "base64 0.23.1",
  "brotli",
