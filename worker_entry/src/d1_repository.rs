@@ -754,7 +754,12 @@ impl TagColorStore for D1TagColorStore {
             for _ in 0..4 {
                 let snapshot = Self::current_rows(&primary).await?;
                 let mut colors = snapshot.colors()?;
-                narou_rs::application::tag_colors::apply_tag_color_update(&mut colors, &update);
+                let changed = narou_rs::application::tag_colors::apply_tag_color_update(&mut colors, &update);
+                if !snapshot.needs_write(changed) {
+                    // This read may overlap a newer commit; do not replace or
+                    // invalidate the cache populated by that writer.
+                    return Ok(colors);
+                }
                 let value_yaml = colors.to_yaml_string().map_err(|error| {
                     NarouError::Platform(format!("cannot serialize D1 tag colors: {error}"))
                 })?;

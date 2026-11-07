@@ -94,7 +94,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションと `webui.new-tag-color` 既定色まで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
-| `web` | ✅ | 🟡 部分 | API / queue worker (自動リトライ含む) / auto-scheduler に加え、pure JS / pure CSS の分割 frontend、JP/EN 切替、theme/performance/reload 設定反映、「ログイン」設定タブ、`self-update.variant` によるセルフアップデート variant 選択、バージョン別機能ツアー (`/api/feature_tour/*`)、SQLite 移行の opt-in (`/api/storage/mode`) までは実装済み。frontend は全件取得+client-side 描画のため narou.rb 細部 parity は継続中 |
+| `web` | ✅ | 🟡 部分 | API / queue worker (自動リトライ含む) / auto-scheduler に加え、pure JS / pure CSS の分割 frontend、JP/EN 切替、theme/performance/reload 設定反映、「ログイン」設定タブ、`self-update.variant` によるセルフアップデート variant 選択、バージョン別機能ツアー (`/api/feature_tour/*`)、SQLite 移行の opt-in (`/api/storage/mode`) までは実装済み。一覧件数と仮想小説一覧を Native／Worker 共通化し、全件取得時の重複 COUNT・仮想小説の個別メタデータ取得・タグ色の同値再保存を除去（キャッシュ期間は変更なし、実測は `docs/v0.5.0-architecture.md`）。frontend は全件取得+client-side 描画のため narou.rb 細部 parity は継続中 |
 | `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた。`self-update.variant` / `narou-compat` など Rust 拡張変数も管理する |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |

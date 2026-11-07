@@ -11,7 +11,7 @@ use narou_rs::db::NovelRecord;
 use narou_rs::downloader::types::TocFile;
 use narou_rs::downloader::util::{load_length_limit, sanitize_filename_with_limit};
 use narou_rs::error::{NarouError, Result};
-use narou_rs::platform::{NovelId, NovelObjectKeys, NovelRepository};
+use narou_rs::platform::{NovelObjectKeys, NovelRepository};
 use narou_rs::virtual_novel::{self as core, AttributeComposition, VirtualNovelMembers};
 use serde::Deserialize;
 use serde_json::json;
@@ -566,45 +566,12 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
                     .with_status(503));
                 }
             };
-            let mut novels = Vec::new();
-            reconcile_attributes(runtime.write_db()).await.map_err(|error| worker::Error::RustError(error.to_string()))?;
-            for (id, member_ids) in &members.groups {
-                if let Some(record) = runtime
-                    .novels
-                    .get(NovelId(*id))
-                    .await
-                    .map_err(|error| worker::Error::RustError(error.to_string()))?
-                {
-                    let mut member_titles = Vec::with_capacity(member_ids.len());
-                    let classification = composition(runtime.write_db(), member_ids).await.ok();
-                    let mixed = classification.as_ref().is_some_and(AttributeComposition::is_mixed);
-                    for member_id in member_ids {
-                        member_titles.push(
-                            runtime
-                                .novels
-                                .get(NovelId(*member_id))
-                                .await
-                                .map_err(|error| worker::Error::RustError(error.to_string()))?
-                                .map(|member| member.title)
-                                .unwrap_or_default(),
-                        );
-                    }
-                    novels.push(json!({
-                        "id": record.id,
-                        "ncode": core::ncode(*id),
-                        "title": record.title,
-                        "author": record.author,
-                        "sitename": record.sitename,
-                        "domain": record.domain,
-                        "tags": record.tags,
-                        "members": member_ids,
-                        "member_titles": member_titles,
-                        "mixed": mixed,
-                        "attribute_tag": record.attribute_tag(),
-                        "attribute_editable": classification.is_some(),
-                    }));
-                }
-            }
+            // build_ui already reconciled attributes. Read the records from
+            // primary too, so the response cannot undo that with replica lag.
+            let repository = crate::d1_repository::D1NovelRepository::new(runtime.write_db().clone());
+            let novels = narou_rs::application::virtual_book::load_listing(
+                &repository, &members, runtime.site_settings(),
+            ).await.map_err(|error| worker::Error::RustError(error.to_string()))?;
             Ok(Response::from_json(
                 &json!({"success":true,"novels":novels}),
             )?)

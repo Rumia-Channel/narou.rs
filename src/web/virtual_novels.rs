@@ -10,7 +10,6 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::native::novel_repository::NativeNovelRepository;
 use crate::native::virtual_novel::{self, NewVirtualNovel};
 use crate::platform::NovelId;
 use crate::virtual_novel as core;
@@ -62,57 +61,14 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> (StatusCode
 }
 
 pub async fn api_virtual_list() -> (StatusCode, Json<serde_json::Value>) {
-    let repository = NativeNovelRepository::new();
-    match virtual_novel::load() {
-        Ok(groups) => {
-            // 分類は表示機能の ON / OFF とは独立に返す。
-            let states = virtual_novel::attribute_states_in(&groups);
-            let novels = groups
-                .groups
-                .iter()
-                .filter_map(|(id, member_ids)| {
-                    let record = repository.get_sync(NovelId(*id)).ok().flatten()?;
-                    let member_titles = member_ids
-                        .iter()
-                        .map(|member| {
-                            repository
-                                .get_sync(NovelId(*member))
-                                .ok()
-                                .flatten()
-                                .map(|record| record.title)
-                                .unwrap_or_default()
-                        })
-                        .collect::<Vec<_>>();
-                    // 分類を確定できない作品 (欠落したメンバーなど) は保存済みの
-                    // 値をそのまま返し、属性は編集できないものとする。
-                    let (mixed, attribute_tag) = match states.get(id) {
-                        Some(state) => (state.mixed, state.attribute_tag.to_string()),
-                        None => (
-                            false,
-                            record
-                                .attribute_tag()
-                                .unwrap_or(crate::application::attribute_tags::NOVEL_TAG)
-                                .to_string(),
-                        ),
-                    };
-                    Some(serde_json::json!({
-                        "id": record.id,
-                        "ncode": core::ncode(*id),
-                        "title": record.title,
-                        "author": record.author,
-                        "sitename": record.sitename,
-                        "domain": record.domain,
-                        "tags": record.tags,
-                        "members": member_ids,
-                        "member_titles": member_titles,
-                        "mixed": mixed,
-                        "attribute_tag": attribute_tag,
-                        "attribute_editable": states.contains_key(id),
-                    }))
-                })
-                .collect::<Vec<_>>();
-            (StatusCode::OK, Json(serde_json::json!({"success": true, "novels": novels})))
-        }
+    let result = virtual_novel::load().and_then(|groups| {
+        let sites = crate::downloader::site_setting::effective_site_settings();
+        crate::db::with_database(|database| {
+            Ok(crate::application::virtual_book::list_entries(&groups, &sites, |id| database.get(id)))
+        })
+    });
+    match result {
+        Ok(novels) => (StatusCode::OK, Json(serde_json::json!({"success": true, "novels": novels}))),
         Err(error) => error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
     }
 }

@@ -73,9 +73,10 @@ macro_rules! database_or_503 {
 
 // Keep these SQL strings explicit: the SQLite regression tests execute the
 // production queries, including lane/status mappings and the bounded results.
+// D1 enforces novel_tags -> novels ON DELETE CASCADE; the covering tag index
+// therefore suffices without a second row lookup for every tag assignment.
 const TAG_NAMES_SQL: &str = r#"
 SELECT t.tag, COUNT(*) AS n, MIN(t.novel_id) AS first_novel_id FROM novel_tags t
-INNER JOIN novels n ON n.id = t.novel_id
 GROUP BY t.tag COLLATE BINARY
 ORDER BY COUNT(*) DESC, t.tag COLLATE BINARY ASC
 "#;

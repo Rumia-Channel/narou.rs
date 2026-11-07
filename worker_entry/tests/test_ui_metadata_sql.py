@@ -31,9 +31,11 @@ class UiMetadataSqlTests(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
+            PRAGMA foreign_keys=ON;
             CREATE TABLE novels (id INTEGER PRIMARY KEY, title TEXT, extra_fields_json TEXT, attribute_tag TEXT);
             CREATE TABLE novel_tags (
-                novel_id INTEGER NOT NULL, tag TEXT NOT NULL, position INTEGER NOT NULL,
+                novel_id INTEGER NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
+                tag TEXT NOT NULL, position INTEGER NOT NULL,
                 UNIQUE(novel_id, tag)
             );
             CREATE TABLE worker_jobs (
@@ -95,7 +97,7 @@ class UiMetadataSqlTests(unittest.TestCase):
         row, = self.query("FIRST_RUNNING_SQL")
         self.assertEqual((row["kind"], row["target"], row["options"]), ("update", "42", '["--force"]'))
 
-    def test_tag_frequency_unicode_case_empty_tag_and_orphan(self):
+    def test_tag_frequency_unicode_case_empty_tag_and_cascade(self):
         values = {1: ["冒険", "SF", "sf", "", '<script>'], 2: ["冒険", "SF"], 3: ["冒険"]}
         counts = Counter()
         for novel_id, tags in values.items():
@@ -103,11 +105,16 @@ class UiMetadataSqlTests(unittest.TestCase):
             for position, tag in enumerate(tags):
                 self.db.execute("INSERT INTO novel_tags VALUES (?, ?, ?)", (novel_id, tag, position))
                 counts[tag] += 1
-        # A broken imported orphan must not become a tag from a nonexistent novel.
-        self.db.execute("INSERT INTO novel_tags VALUES (999, 'orphan', 0)")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("INSERT INTO novel_tags VALUES (999, 'orphan', 0)")
         rows = self.query("TAG_NAMES_SQL")
         self.assertEqual([r["tag"] for r in rows], sorted(counts, key=lambda t: (-counts[t], t)))
         self.assertEqual({r["tag"]: r["n"] for r in rows}, dict(counts))
+        self.assertEqual({r["tag"]: r["first_novel_id"] for r in rows}, {tag: 1 for tag in counts})
+        self.db.execute("DELETE FROM novels WHERE id=1")
+        rows = self.query("TAG_NAMES_SQL")
+        self.assertEqual({r["tag"]: r["n"] for r in rows}, {"冒険": 2, "SF": 1})
+        self.assertEqual({r["tag"]: r["first_novel_id"] for r in rows}, {"冒険": 2, "SF": 2})
 
     def test_large_pending_queue_returns_counts_not_payloads(self):
         count = 10000

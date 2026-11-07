@@ -18,6 +18,7 @@ class SqlAccessPathTests(unittest.TestCase):
         self.addCleanup(self.db.close)
         for migration in sorted((ROOT / 'worker_entry/migrations').glob('*.sql')):
             self.db.executescript(migration.read_text(encoding='utf-8'))
+        self.db.execute('PRAGMA foreign_keys=ON')
 
     def bounded(self, sql, params, max_steps):
         ticks = 0
@@ -36,6 +37,14 @@ class SqlAccessPathTests(unittest.TestCase):
             toc_url,toc_url_fold,sitename,sitename_fold,last_update,attribute_tag)
             VALUES (?,'a','a','t','t','t',?,?,'s','s','now',?)""",
             (novel_id, f'url/{novel_id}', f'url/{novel_id}', attribute))
+
+    def test_tag_rows_cannot_outlive_their_novel_in_the_migrated_schema(self):
+        self.novel(1, '小説')
+        self.db.execute("INSERT INTO novel_tags(novel_id,position,tag,tag_fold) VALUES(1,0,'tag','tag')")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("INSERT INTO novel_tags(novel_id,position,tag,tag_fold) VALUES(99,0,'orphan','orphan')")
+        self.db.execute('DELETE FROM novels WHERE id=1')
+        self.assertEqual(self.db.execute('SELECT tag FROM novel_tags').fetchall(), [])
 
     def test_object_pages_seek_and_keep_exact_unicode_and_sibling_boundaries(self):
         self.db.executemany("INSERT INTO objects(object_key,size,updated_at) VALUES (?,1,'now')",

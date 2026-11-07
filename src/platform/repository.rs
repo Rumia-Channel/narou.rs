@@ -141,6 +141,20 @@ impl NovelFilter {
     pub fn all() -> Self {
         Self::default()
     }
+
+    /// Context alone (freeze IDs or attribute projection) does not select rows.
+    pub fn is_unrestricted(&self) -> bool {
+        let Self {
+            ids, keyword, site, domain, tag, ncode, is_narou, suspend, novel_type, end,
+            terms, exclude_ids, exclude_tags, exclude_authors, exclude_sites,
+            frozen_ids: _, attribute_tags_enabled: _,
+        } = self;
+        ids.is_none() && keyword.is_none() && site.is_none() && domain.is_none()
+            && tag.is_none() && ncode.is_none() && is_narou.is_none() && suspend.is_none()
+            && novel_type.is_none() && end.is_none() && terms.is_empty()
+            && exclude_ids.is_empty() && exclude_tags.is_empty()
+            && exclude_authors.is_empty() && exclude_sites.is_empty()
+    }
 }
 
 /// Typed sort key. CLI/Web string keys are converted at the boundary via
