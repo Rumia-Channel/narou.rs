@@ -406,11 +406,9 @@ impl Database {
                     let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                         .map_err(crate::native::sqlite::sqlite_error)?;
                     let mut current = crate::native::sqlite::bulk::load_all_records(&tx)?;
-                    if compat {
-                        if let Some(raw) = files.original(&yaml_path)? {
-                            current = if raw.trim().is_empty() { BTreeMap::new() }
-                                else { serde_yaml::from_str(raw)? };
-                        }
+                    if compat && let Some(raw) = files.original(&yaml_path)? {
+                        current = if raw.trim().is_empty() { BTreeMap::new() }
+                            else { serde_yaml::from_str(raw)? };
                     }
                     for (&id, record) in &mut current { record.id = id; }
                     *before_library.borrow_mut() = Some(crate::application::tag_sequence::library_tags(

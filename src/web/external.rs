@@ -85,7 +85,7 @@ pub async fn api_novel(
     };
     let format = match format_of(&params) {
         Ok(format) => format,
-        Err(response) => return response,
+        Err(error) => return application_error(error),
     };
     match state.services.external_api.novel(id).await {
         Ok(novel) => {
@@ -118,7 +118,7 @@ pub async fn api_novel_toc(
     };
     let format = match format_of(&params) {
         Ok(format) => format,
-        Err(response) => return response,
+        Err(error) => return application_error(error),
     };
     match state.services.external_api.toc(id).await {
         Ok(toc) => {
@@ -151,7 +151,7 @@ pub async fn api_novel_sections(
     };
     let format = match format_of(&params) {
         Ok(format) => format,
-        Err(response) => return response,
+        Err(error) => return application_error(error),
     };
     // 目次は所有者ごとに 1 回だけ読む (話ごとに目次を読み直さない)。
     let sections = match state.services.external_api.sections(id).await {
@@ -184,7 +184,7 @@ pub async fn api_novel_section(
     };
     let format = match format_of(&params) {
         Ok(format) => format,
-        Err(response) => return response,
+        Err(error) => return application_error(error),
     };
     match state.services.external_api.section(id, &key).await {
         Ok(section) => {
@@ -249,7 +249,7 @@ pub async fn api_tags(
     }
     let format = match format_of(&params) {
         Ok(format) => format,
-        Err(response) => return response,
+        Err(error) => return application_error(error),
     };
     match state.services.external_api.tags().await {
         Ok(tags) => {
@@ -470,9 +470,9 @@ fn pairs(params: &HashMap<String, String>) -> Vec<(String, String)> {
 /// 出力形式を取り出す (不正なら 400 のメッセージを返す)。
 ///
 /// 一覧以外でも同じ規則を使う (不正な形式を黙って JSON へ落とさない)。
-fn format_of(params: &HashMap<String, String>) -> Result<OutputFormat, Response> {
+fn format_of(params: &HashMap<String, String>) -> Result<OutputFormat, crate::application::error::ApplicationError> {
     match params.get("format") {
-        Some(value) => parse_format(value).map_err(|error| error_response(StatusCode::BAD_REQUEST, "bad_request", error.message())),
+        Some(value) => parse_format(value),
         None => Ok(OutputFormat::default()),
     }
 }
