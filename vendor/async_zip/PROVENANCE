@@ -1,0 +1,17 @@
+Source: async_zip 0.0.19, crates.io published package.
+Upstream: https://github.com/Majored/rs-async-zip
+Published source revision: fc12a737bb75731b36807af5ee3411623e551c69
+License: MIT; original LICENSE and .cargo_vcs_info.json retained.
+
+Local correction: src/base/write/entry_stream.rs returns compressed and
+uncompressed sizes in the correct order when force_no_zip64 is enabled.
+The upstream tuple was reversed, corrupting central-directory records and
+data descriptors for compressed streamed entries.
+
+Regression coverage lives in narou_rs transfer streaming tests and uses an
+independent ZIP reader plus direct central-directory/data-descriptor checks.
+
+Local resource accounting: ZipFileWriter exposes retained record count,
+capacity, record size, and fallible exact reservation. Callers can admit
+central-directory metadata (including old/new allocation overlap) before
+growing it; entry payload streaming and archive semantics are unchanged.

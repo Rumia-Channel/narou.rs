@@ -16,7 +16,7 @@ mod session;
 use crate::error::{NarouError, Result};
 use crate::platform::http::{RedirectChain, is_safe_header_name, is_safe_header_value};
 use crate::platform::{
-    HttpClient, HttpRequest, HttpResponse, RateLimitScope, RateLimiter, RedirectMode,
+    HttpClient, HttpRequest, HttpResponse, HttpStreamResponse, RateLimitScope, RateLimiter, RedirectMode,
 };
 
 use super::security::MAX_REDIRECTS;
@@ -135,7 +135,7 @@ impl FetchPolicy {
 
     fn observe_response(&self, url: &str, response: &HttpResponse) {
         if self.allows_cookie(url) && let Some(session) = &self.session {
-            session.lock().observe(url, response);
+            session.lock().observe(url, &response.headers);
         }
     }
 
@@ -181,14 +181,8 @@ pub fn decode_with_encoding(bytes: &[u8], encoding: Option<&str>) -> String {
 /// - 503 → `SuspendDownload` (rate limited)
 /// - other 4xx/5xx → `Http` with the status
 pub fn ensure_success_response(url: &str, response: HttpResponse) -> Result<HttpResponse> {
-    match response.status {
-        404 => Err(NarouError::NotFound(url.to_string())),
-        503 => Err(NarouError::SuspendDownload("Rate limited (503)".into())),
-        status if !(200..300).contains(&status) => Err(NarouError::Http(format!(
-            "HTTP {status} while fetching {url}"
-        ))),
-        _ => Ok(response),
-    }
+    ensure_success_status(url, response.status)?;
+    Ok(response)
 }
 
 /// True when a fetch error should stop the tier fallback instead of trying
@@ -272,6 +266,59 @@ pub async fn fetch_bytes(
     let mut request = HttpRequest::get(url);
     request.headers = policy.headers_for(url);
     send_request(http, rate_limiter, request, policy, true).await
+}
+
+/// Pull-driven binary GET with the same site headers, redirect transitions,
+/// response cookies, URL validation and physical-attempt pacing as text fetches.
+pub async fn fetch_stream(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
+    url: &str,
+    policy: &FetchPolicy,
+) -> Result<HttpStreamResponse> {
+    let mut request = HttpRequest::get(url);
+    request.headers = policy.headers_for(url);
+    if policy.session.is_none() {
+        http.validate_url(url).await?;
+        let scope = scope_for(host_of(url), policy);
+        let response = http.send_stream_paced(
+            request, crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
+        ).await?;
+        ensure_success_status(url, response.status)?;
+        return Ok(response);
+    }
+    let mut chain = RedirectChain::new(request, MAX_REDIRECTS);
+    loop {
+        let current = &chain.request().url;
+        http.validate_url(current).await?;
+        let mut outgoing = chain.request().clone().with_redirect(RedirectMode::Manual);
+        if chain.hops() > 0 && policy.allows_cookie(current) && let Some(session) = &policy.session {
+            session.lock().apply(current, &mut outgoing.headers);
+        }
+        let scope = scope_for(host_of(current), policy);
+        let response = http.send_stream_paced(
+            outgoing, crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
+        ).await?;
+        if policy.allows_cookie(current) && let Some(session) = &policy.session {
+            session.lock().observe(current, &response.headers);
+        }
+        if !chain.advance_parts(response.status, response.header("Location"))? {
+            ensure_success_status(&chain.request().url, response.status)?;
+            return Ok(response);
+        }
+        // Dropping an unused redirect body cancels it instead of buffering it.
+    }
+}
+
+fn ensure_success_status(url: &str, status: u16) -> Result<()> {
+    match status {
+        404 => Err(NarouError::NotFound(url.to_string())),
+        503 => Err(NarouError::SuspendDownload("Rate limited (503)".into())),
+        status if !(200..300).contains(&status) => Err(NarouError::Http(format!(
+            "HTTP {status} while fetching {url}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// JSON dependencies inspect status separately without bypassing URL, pacing,
@@ -616,4 +663,137 @@ headers:
         assert!(!should_stop_fetch_fallback(&NarouError::Http("x".into())));
     }
 
+    struct StreamOnlyHttp {
+        sent: parking_lot::Mutex<Vec<HttpRequest>>,
+        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl StreamOnlyHttp {
+        fn new() -> Self {
+            Self {
+                sent: Default::default(),
+                polls: Default::default(),
+                dropped: Default::default(),
+            }
+        }
+    }
+
+    struct PullBody {
+        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl futures::Stream for PullBody {
+        type Item = Result<Vec<u8>>;
+        fn poll_next(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+            use std::sync::atomic::Ordering;
+            let item = match self.polls.fetch_add(1, Ordering::SeqCst) {
+                0 => Some(Ok(b"first chunk".to_vec())),
+                1 => Some(Err(NarouError::Http("connection interrupted".into()))),
+                _ => None,
+            };
+            std::task::Poll::Ready(item)
+        }
+    }
+
+    impl Drop for PullBody {
+        fn drop(&mut self) {
+            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl HttpClient for StreamOnlyHttp {
+        fn send<'a>(&'a self, _request: HttpRequest) -> crate::platform::PlatformFuture<'a, Result<HttpResponse>> {
+            panic!("binary fetch must never use buffered send");
+        }
+        fn send_stream<'a>(&'a self, request: HttpRequest) -> crate::platform::PlatformFuture<'a, Result<HttpStreamResponse>> {
+            Box::pin(async move {
+                let url = request.url.clone();
+                self.sent.lock().push(request);
+                let (status, headers) = match url.as_str() {
+                    "https://example.com/start" => (302, vec![
+                        ("Location".into(), "/next".into()),
+                        ("Set-Cookie".into(), "session=updated; Path=/".into()),
+                    ]),
+                    "https://example.com/next" => (302, vec![("Location".into(), "https://cdn.example.net/image".into())]),
+                    "https://example.com/unsafe" => (302, vec![("Location".into(), "http://127.0.0.1/private".into())]),
+                    "https://example.com/missing" => (404, Vec::new()),
+                    "https://example.com/limited" => (503, Vec::new()),
+                    _ => (200, vec![("Content-Type".into(), "image/png".into())]),
+                };
+                let body: crate::platform::AssetStream = if status == 302 {
+                    Box::pin(futures::stream::empty())
+                } else {
+                    Box::pin(PullBody { polls: self.polls.clone(), dropped: self.dropped.clone() })
+                };
+                Ok(HttpStreamResponse { status, url, headers, body })
+            })
+        }
+    }
+
+    fn session_policy() -> FetchPolicy {
+        FetchPolicy {
+            headers: vec![
+                ("Cookie".into(), "session=initial".into()),
+                ("Referer".into(), "https://example.com/".into()),
+            ],
+            cookie_hosts: vec!["example.com".into()],
+            session: Some(std::sync::Arc::new(parking_lot::Mutex::new(session::SessionCookies::default()))),
+            ..FetchPolicy::default()
+        }
+    }
+
+    #[test]
+    fn streamed_fetch_is_pull_driven_and_preserves_redirect_cookie_and_pacing_policy() {
+        futures::executor::block_on(async {
+            use futures::StreamExt;
+            use std::sync::atomic::Ordering;
+            let http = StreamOnlyHttp::new();
+            let limiter = crate::platform::mocks::FakeRateLimiter::new();
+            let mut response = fetch_stream(&http, &limiter, "https://example.com/start", &session_policy()).await.unwrap();
+            assert_eq!(response.url, "https://cdn.example.net/image");
+            assert_eq!(response.header("content-type"), Some("image/png"));
+            assert_eq!(http.polls.load(Ordering::SeqCst), 0);
+            assert_eq!(limiter.acquisition_count(), 3);
+            {
+                let requests = http.sent.lock();
+                assert!(requests.iter().all(|request| request.redirect == RedirectMode::Manual));
+                assert!(requests[1].headers.iter().any(|(name, value)| name == "Cookie" && value == "session=updated"));
+                assert!(!requests[2].headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("Cookie")));
+                assert!(requests[2].headers.iter().any(|(name, _)| name == "Referer"));
+            }
+            assert_eq!(response.body.next().await.unwrap().unwrap(), b"first chunk");
+            assert!(response.body.next().await.unwrap().is_err(), "an interrupted binary stream is not EOF");
+            drop(response);
+            assert!(http.dropped.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn streamed_fetch_rejects_unsafe_redirects_before_sending_and_does_not_read_errors() {
+        futures::executor::block_on(async {
+            use std::sync::atomic::Ordering;
+            let http = StreamOnlyHttp::new();
+            let limiter = crate::platform::mocks::FakeRateLimiter::new();
+            assert!(fetch_stream(&http, &limiter, "https://example.com/unsafe", &session_policy()).await.is_err());
+            assert_eq!(http.sent.lock().len(), 1);
+            assert!(matches!(fetch_stream(&http, &limiter, "https://example.com/missing", &FetchPolicy::default()).await, Err(NarouError::NotFound(_))));
+            assert!(matches!(fetch_stream(&http, &limiter, "https://example.com/limited", &FetchPolicy::default()).await, Err(NarouError::SuspendDownload(_))));
+            assert_eq!(http.polls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn dropping_streamed_response_stops_reads_without_draining() {
+        futures::executor::block_on(async {
+            use std::sync::atomic::Ordering;
+            let http = StreamOnlyHttp::new();
+            let limiter = crate::platform::mocks::FakeRateLimiter::new();
+            let response = fetch_stream(&http, &limiter, "https://example.com/image", &FetchPolicy::default()).await.unwrap();
+            drop(response);
+            assert_eq!(http.polls.load(Ordering::SeqCst), 0);
+            assert!(http.dropped.load(Ordering::SeqCst));
+        });
+    }
 }

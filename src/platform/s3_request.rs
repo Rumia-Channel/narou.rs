@@ -334,7 +334,7 @@ pub(crate) fn copy_object_result_is_complete(xml: &str) -> bool {
 
 /// Validate the complete result document, not just its HTTP status or a tag
 /// found inside an Error, HTML, comment, truncated body or second document.
-fn xml_result_body<'a>(xml: &'a str, expected_root: &str) -> Option<&'a str> {
+pub(crate) fn xml_result_body<'a>(xml: &'a str, expected_root: &str) -> Option<&'a str> {
     let mut xml = xml.strip_prefix('\u{feff}').unwrap_or(xml).trim();
     if let Some(declaration) = xml.strip_prefix("<?xml") {
         if !declaration.starts_with(char::is_whitespace) {
@@ -408,7 +408,7 @@ fn xml_tag_end(xml: &str) -> Option<usize> {
 }
 
 /// `<Contents>` 開始タグの位置を返す (名前空間接頭辞つきも許容)。
-fn find_tag(haystack: &str, tag: &str) -> Option<usize> {
+pub(crate) fn find_tag(haystack: &str, tag: &str) -> Option<usize> {
     let mut search_from = 0usize;
     while let Some(offset) = haystack[search_from..].find('<') {
         let start = search_from + offset;
@@ -435,7 +435,7 @@ fn find_tag(haystack: &str, tag: &str) -> Option<usize> {
 }
 
 /// `<tag>` の開始位置から `</tag>` の直前までの長さを返す (入れ子は 1 段だけ数える)。
-fn find_close(haystack: &str, tag: &str) -> Option<usize> {
+pub(crate) fn find_close(haystack: &str, tag: &str) -> Option<usize> {
     let open_end = haystack.find('>')?;
     let mut depth = 1usize;
     let mut cursor = open_end + 1;

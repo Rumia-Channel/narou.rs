@@ -57,7 +57,6 @@ pub fn cmd_export(targets: &[String], output: Option<&str>) -> Result<()> {
     }
 
     println!("書き出し対象を収集しています...");
-    let exported = transfer::export_archive_bytes(&ids)?;
 
     let path = output
         .map(PathBuf::from)
@@ -68,9 +67,13 @@ pub fn cmd_export(targets: &[String], output: Option<&str>) -> Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, &exported.bytes)?;
+    let directory = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    let novels = transfer::export_archive_to(&ids, temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path).map_err(|error| NarouError::Io(error.error))?;
 
-    for novel in &exported.novels {
+    for novel in &novels {
         println!(
             "ID:{}　{} ({} ファイル)",
             novel.id, novel.title, novel.file_count
@@ -78,7 +81,7 @@ pub fn cmd_export(targets: &[String], output: Option<&str>) -> Result<()> {
     }
     println!(
         "{} 件の小説を {} に書き出しました",
-        exported.novels.len(),
+        novels.len(),
         path.display()
     );
     Ok(())
@@ -88,7 +91,7 @@ pub fn cmd_import(archive: &str, overwrite: bool) -> Result<()> {
     narou_rs::db::init_database()?;
 
     let path = Path::new(archive);
-    let bytes = std::fs::read(path).map_err(|error| {
+    let file = std::fs::File::open(path).map_err(|error| {
         NarouError::Io(std::io::Error::new(
             error.kind(),
             format!("{} を読み込めません: {error}", path.display()),
@@ -96,7 +99,7 @@ pub fn cmd_import(archive: &str, overwrite: bool) -> Result<()> {
     })?;
 
     println!("{} を読み込んでいます...", path.display());
-    let outcome = transfer::import_archive_bytes(&bytes, conflict_policy(overwrite), None)?;
+    let outcome = transfer::import_archive_reader(file, conflict_policy(overwrite), None, None)?;
 
     println!(
         "新規: {} 件 / 上書き: {} 件 / スキップ: {} 件",
@@ -171,7 +174,7 @@ mod transfer_archive_tests {
         std::fs::write(novel_dir.join("backup/old.zip"), b"zip").unwrap();
 
         let files = collect_novel_files(&novel_dir).unwrap();
-        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        let paths: Vec<&str> = files.iter().map(|file| file.0.as_str()).collect();
         assert_eq!(paths, vec!["toc.yaml", "本文/1 第一話.yaml"]);
         assert!(!is_archivable_relative_path("../escape"));
     }

@@ -89,6 +89,17 @@ impl HttpClient for ReaderFixture {
             Ok(HttpResponse { status: 200, headers: Vec::new(), body: body.into_bytes() })
         })
     }
+
+    fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, narou_rs::error::Result<narou_rs::platform::HttpStreamResponse>> {
+        let url = request.url.clone();
+        Box::pin(async move {
+            let response = self.send(request).await?;
+            Ok(narou_rs::platform::HttpStreamResponse {
+                status: response.status, url, headers: response.headers,
+                body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
+            })
+        })
+    }
 }
 
 async fn logins(values: &[&str]) -> Arc<MemoryCookieStore> {

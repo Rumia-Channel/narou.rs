@@ -166,6 +166,79 @@ async function consumeEvents(response, onEvent) {
   }
 }
 
+async function downloadSink(controller) {
+  const { signal } = controller;
+  if (typeof window.showSaveFilePicker === 'function') {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: 'narou-export.zip',
+      types: [{ description: 'ZIP archive', accept: { 'application/zip': ['.zip'] } }],
+    });
+    return handle.createWritable();
+  }
+  // Firefox has no File System Access API. A scoped service worker hands the
+  // stream to the browser's download manager, with one pull/chunk in flight.
+  const script = new URL('./transfer-download-sw.js', import.meta.url);
+  const registration = await navigator.serviceWorker.register(script, { scope: new URL('./', script).pathname });
+  let worker = registration.active;
+  if (!worker) {
+    worker = registration.installing || registration.waiting;
+    await new Promise((resolve, reject) => {
+      const changed = () => {
+        if (worker.state === 'activated') { worker.removeEventListener('statechange', changed); resolve(); }
+        else if (worker.state === 'redundant') { worker.removeEventListener('statechange', changed); reject(new Error('ダウンロードの準備に失敗しました。')); }
+      };
+      worker.addEventListener('statechange', changed); changed();
+    });
+  }
+  if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+  const channel = new MessageChannel();
+  const token = crypto.randomUUID();
+  let demand = false, failure, readyResolve, readyReject, writeResolve, writeReject, closeResolve, closeReject;
+  const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+  const frame = document.createElement('iframe');
+  frame.hidden = true;
+  const dispose = () => { signal.removeEventListener('abort', cancelled); frame.remove(); channel.port1.close(); };
+  const fail = (error) => {
+    failure = error; readyReject(error); writeReject?.(error); closeReject?.(error); dispose();
+    controller.abort();
+  };
+  const cancelled = () => {
+    channel.port1.postMessage({ type: 'abort', message: 'Download cancelled' });
+    fail(new DOMException('Aborted', 'AbortError'));
+  };
+  signal.addEventListener('abort', cancelled, { once: true });
+  channel.port1.onmessage = ({ data }) => {
+    if (data.type === 'ready') readyResolve();
+    else if (data.type === 'pull') { demand = true; writeResolve?.(); writeResolve = null; writeReject = null; }
+    else if (data.type === 'closed') { closeResolve?.(); dispose(); }
+    else if (data.type === 'error') fail(new Error(data.message));
+  };
+  worker.postMessage({ type: 'transfer-download', token }, [channel.port2]);
+  await ready;
+  frame.src = new URL(`./transfer-download/${token}`, script).href;
+  document.body.append(frame);
+  return {
+    async write(bytes) {
+      if (failure) throw failure;
+      if (!demand) await new Promise((resolve, reject) => { writeResolve = resolve; writeReject = reject; });
+      if (failure) throw failure;
+      demand = false;
+      // The decoder owns exactly this chunk; transfer it instead of copying.
+      channel.port1.postMessage({ type: 'chunk', bytes: bytes.buffer }, [bytes.buffer]);
+    },
+    async close() {
+      if (failure) throw failure;
+      const closed = new Promise((resolve, reject) => { closeResolve = resolve; closeReject = reject; });
+      channel.port1.postMessage({ type: 'end' });
+      await closed;
+    },
+    async abort(reason) {
+      channel.port1.postMessage({ type: 'abort', message: String(reason || 'Download cancelled') });
+      dispose();
+    },
+  };
+}
+
 export async function exportSelectedNovels(ids) {
   if (!ids.length) { showNotification('ダウンロードする作品を選択してください', 'error'); return; }
   const screen = progressScreen('小説データのダウンロード');
@@ -174,38 +247,37 @@ export async function exportSelectedNovels(ids) {
   screen.cancelWith(() => controller.abort());
   screen.phase(`選択した ${ids.length.toLocaleString()} 作品の書き出しを開始しています…`);
   let size = 0;
-  const chunks = [];
+  let sink;
   try {
+    sink = await downloadSink(controller);
     const response = await fetch(`/api/transfer/export?progress=1&ids=${ids.map(encodeURIComponent).join(',')}`, {
       signal: controller.signal,
     });
-    const complete = await consumeEvents(response, (frame) => {
+    const complete = await consumeEvents(response, async (frame) => {
       if (frame.type === 'progress') screen.update(frame);
       else if (frame.type === 'data') {
         if (typeof frame.data !== 'string') throw new Error('不正な ZIP データを受信しました。');
         const binary = atob(frame.data);
+        if (binary.length > 64 * 1024) throw new Error('ZIP チャンクが上限を超えています。');
         const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
         size += bytes.length;
         if (size > MAX_ARCHIVE_BYTES) throw new Error('ZIP が上限の 512 MiB を超えています。');
-        chunks.push(bytes);
+        await sink.write(bytes);
         screen.bytes(size);
       }
     });
     if (!Number.isSafeInteger(complete.bytes) || complete.bytes !== size || !size) {
       throw new Error('ZIP の受信サイズが完了応答と一致しません。');
     }
-    const blob = new Blob(chunks, { type: 'application/zip' });
-    chunks.length = 0;
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url; anchor.download = 'narou-export.zip';
-    document.body.append(anchor); anchor.click(); anchor.remove();
-    // Revoking immediately can race the browser's download handoff.
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    await sink.close();
+    sink = null;
     screen.done('ZIP の受信が完了しました。ブラウザのダウンロード一覧で保存結果をご確認ください。');
   } catch (error) {
     screen.done(error.name === 'AbortError' ? 'ダウンロードの通信を中止しました。' : `ダウンロードに失敗しました。\n${error.message}`, true);
-  } finally { chunks.length = 0; }
+  } finally {
+    controller.abort();
+    if (sink) { try { await sink.abort('Transfer failed'); } catch { /* Already cancelled. */ } }
+  }
 }
 
 export async function importNovelArchive(file, onImported) {
@@ -215,57 +287,29 @@ export async function importNovelArchive(file, onImported) {
   if (file.size > MAX_ARCHIVE_BYTES) {
     screen.done('ZIP が上限の 512 MiB を超えています。', true); return;
   }
-  const xhr = new XMLHttpRequest();
-  let offset = 0, pending = '', complete = null, protocolError = null;
-  const consume = () => {
-    if (protocolError) return;
-    try {
-      pending += xhr.responseText.slice(offset); offset = xhr.responseText.length;
-      let newline;
-      while ((newline = pending.indexOf('\n')) !== -1) {
-        const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
-        if (!line.trim()) continue;
-        if (line.length > MAX_FRAME_CHARS) throw new Error('取り込み応答が大きすぎます。');
-        const frame = JSON.parse(line);
-        if (frame.type === 'error') throw new Error(frame.message || '取り込みに失敗しました。');
-        if (complete) throw new Error('完了後に不正な取り込み応答を受信しました。');
-        if (frame.type === 'progress') screen.update(frame);
-        else if (frame.type === 'complete') complete = frame;
-      }
-      if (pending.length > MAX_FRAME_CHARS) throw new Error('取り込み応答が大きすぎます。');
-    } catch (error) { protocolError = error; }
-  };
-  screen.cancelWith(() => xhr.abort());
-  screen.phase(`${file.name} を送信しています…`);
-  await new Promise((resolve) => {
-    xhr.open('POST', '/api/transfer/import?progress=1');
-    xhr.setRequestHeader('Content-Type', 'application/zip');
-    xhr.upload.onprogress = (event) => screen.bytes(event.loaded, event.lengthComputable ? event.total : file.size, true);
-    xhr.upload.onload = () => screen.phase('送信が完了しました。ZIP の検証・取り込みを待っています…');
-    xhr.onprogress = () => { if (xhr.status === 200) consume(); };
-    xhr.onload = async () => {
-      try {
-        if (xhr.status !== 200) throw new Error(failureMessage(xhr, xhr.responseText));
-        if (!xhr.getResponseHeader('content-type')?.includes('application/x-ndjson')) {
-          throw new Error('サーバーが進捗付き取り込みに対応していません。サーバーを更新してください。');
-        }
-        consume();
-        if (protocolError) throw protocolError;
-        if (!complete || pending.trim()) throw new Error('取り込みが完了する前に接続が切れました。');
-        const result = complete.result;
-        if (!result || !Array.isArray(result.errors)) throw new Error('取り込み結果の形式が不正です。');
-        const summary = `新規 ${result.created ?? 0} / 上書き ${result.overwritten ?? 0} / スキップ ${result.skipped ?? 0}`;
-        screen.done(result.success ? `取り込みが完了しました。${summary}`
-          : `一部の取り込みに失敗しました。${summary}\n${result.errors.join('\n')}`, !result.success);
-        if (onImported) {
-          try { await onImported(); }
-          catch (error) { showNotification(`取り込み結果は確定しましたが、一覧を更新できませんでした。\n${error.message}`, 'error'); }
-        }
-      } catch (error) { screen.done(`アップロード・取り込みに失敗しました。\n${error.message}`, true); }
-      finally { resolve(); }
-    };
-    xhr.onerror = () => { screen.done('アップロード中に通信が切断されました。取り込み済みの作品を確認してください。', true); resolve(); };
-    xhr.onabort = () => { screen.done('通信を中止しました。サーバー側で取り込みが完了した作品は保持されます。', true); resolve(); };
-    xhr.send(file);
-  });
+  const controller = new AbortController();
+  screen.cancelWith(() => controller.abort());
+  screen.phase(`${file.name} を送信・検証しています…`);
+  try {
+    // File is streamed by fetch; never copy it into an ArrayBuffer or WASM.
+    const response = await fetch('/api/transfer/import?progress=1', {
+      method: 'POST', headers: { 'Content-Type': 'application/zip' },
+      body: file, signal: controller.signal,
+    });
+    const complete = await consumeEvents(response, (frame) => {
+      if (frame.type === 'progress') screen.update(frame);
+    });
+    const result = complete.result;
+    if (!result || !Array.isArray(result.errors)) throw new Error('取り込み結果の形式が不正です。');
+    const summary = `新規 ${result.created ?? 0} / 上書き ${result.overwritten ?? 0} / スキップ ${result.skipped ?? 0}`;
+    screen.done(result.success ? `取り込みが完了しました。${summary}`
+      : `一部の取り込みに失敗しました。${summary}\n${result.errors.join('\n')}`, !result.success);
+    if (onImported) {
+      try { await onImported(); }
+      catch (error) { showNotification(`取り込み結果は確定しましたが、一覧を更新できませんでした。\n${error.message}`, 'error'); }
+    }
+  } catch (error) {
+    screen.done(error.name === 'AbortError' ? '通信を中止しました。取り込み済みの作品は保持されます。'
+      : `アップロード・取り込みに失敗しました。\n${error.message}`, true);
+  } finally { controller.abort(); }
 }

@@ -20,13 +20,11 @@ pub(crate) struct ConvertedSection {
     pub postscript: String,
 }
 
-pub(crate) fn render_novel_text(
+pub(crate) fn render_novel_header(
     settings: &NovelSettings,
     toc: &TocObject,
     story: &str,
-    sections: &[ConvertedSection],
     record: Option<&NovelRecord>,
-    device: Option<Device>,
 ) -> String {
     let mut output = String::new();
 
@@ -68,8 +66,18 @@ pub(crate) fn render_novel_text(
     }
 
     output.push('\n');
+    output
+}
 
-    for section in sections {
+pub(crate) fn render_novel_section(
+    settings: &NovelSettings,
+    toc: &TocObject,
+    section: &ConvertedSection,
+    device: Option<Device>,
+) -> String {
+    let mut output = String::new();
+    let title = settings.title_for_output(&toc.title);
+
         output.push_str("\u{FF3B}\u{FF03}\u{6539}\u{30DA}\u{30FC}\u{30B8}\u{FF3D}\n");
 
         if !section.chapter.is_empty() {
@@ -170,12 +178,33 @@ pub(crate) fn render_novel_text(
         if !output.ends_with('\n') {
             output.push('\n');
         }
-    }
+    output
+}
+
+pub(crate) fn render_novel_footer(settings: &NovelSettings) -> String {
+    let mut output = String::new();
 
     if settings.enable_display_end_of_book {
         output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{5730}\u{4ED8}\u{304D}\u{FF3D}\u{FF3B}\u{FF03}\u{5C0F}\u{66F8}\u{304D}\u{FF3D}\u{FF08}\u{672C}\u{3092}\u{8AAD}\u{307F}\u{7D42}\u{308F}\u{308A}\u{307E}\u{3057}\u{305F}\u{FF09}\u{FF3B}\u{FF03}\u{5C0F}\u{66F8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5730}\u{4ED8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
     }
 
+    output
+}
+
+#[cfg(test)]
+pub(crate) fn render_novel_text(
+    settings: &NovelSettings,
+    toc: &TocObject,
+    story: &str,
+    sections: &[ConvertedSection],
+    record: Option<&NovelRecord>,
+    device: Option<Device>,
+) -> String {
+    let mut output = render_novel_header(settings, toc, story, record);
+    for section in sections {
+        output.push_str(&render_novel_section(settings, toc, section, device));
+    }
+    output.push_str(&render_novel_footer(settings));
     output
 }
 
@@ -452,6 +481,48 @@ mod tests {
     use crate::converter::device::Device;
     use crate::db::NovelRecord;
     use crate::{converter::settings::NovelSettings, downloader::TocObject};
+
+    #[test]
+    fn incremental_regions_preserve_the_complete_native_template() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = NovelSettings {
+            archive_path: directory.path().to_path_buf(),
+            enable_add_date_to_title: false,
+            enable_display_end_of_book: true,
+            ..NovelSettings::default()
+        };
+        let toc = TocObject {
+            title: "作品".into(), author: "作者".into(), toc_url: "https://example.test/".into(),
+            story: None, subtitles: Vec::new(), novel_type: Some(1),
+        };
+        let section = ConvertedSection {
+            chapter: "章".into(), subchapter: "節".into(), subtitle: "題".into(),
+            introduction: "前\n".into(), body: "本文\n\n".into(), postscript: "後\n".into(),
+        };
+        assert_eq!(
+            super::render_novel_header(&settings, &toc, "あらすじ", None),
+            concat!(
+                "作品\n作者\n\n［＃区切り線］\nあらすじ：\nあらすじ\n\n掲載ページ:\n",
+                "<a href=\"https://example.test/\">https://example.test/</a>\n［＃区切り線］\n\n",
+            ),
+        );
+        assert_eq!(
+            super::render_novel_section(&settings, &toc, &section, None),
+            concat!(
+                "［＃改ページ］\n［＃ページの左右中央］\n",
+                "［＃ここから柱］作品［＃ここで柱終わり］\n",
+                "［＃３字下げ］［＃大見出し］章［＃大見出し終わり］\n［＃改ページ］\n",
+                "［＃１字下げ］［＃１段階大きな文字］節［＃大きな文字終わり］\n\n",
+                "［＃３字下げ］［＃中見出し］題［＃中見出し終わり］\n\n\n",
+                "［＃ここから前書き］\n前\n［＃ここで前書き終わり］\n\n\n",
+                "本文［＃ここから後書き］\n後\n［＃ここで後書き終わり］\n",
+            ),
+        );
+        assert_eq!(
+            super::render_novel_footer(&settings),
+            "\n［＃ここから地付き］［＃小書き］（本を読み終わりました）［＃小書き終わり］［＃ここで地付き終わり］\n",
+        );
+    }
 
     fn sample_record() -> NovelRecord {
         NovelRecord {

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ParsedArchive, ParsedNovel};
+use super::{ArchiveManifest, ParsedArchive};
 
 /// How an existing novel (same `toc_url`) should be handled.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -12,6 +12,17 @@ pub enum ConflictPolicy {
     Skip,
     /// Replace the library copy with the archive entry.
     Overwrite,
+}
+
+impl ConflictPolicy {
+    /// Decide from one URL lookup without retaining a whole-library index.
+    pub fn action(self, exists: bool) -> ImportAction {
+        if !exists { return ImportAction::Create; }
+        match self {
+            Self::Skip => ImportAction::Skip,
+            Self::Overwrite => ImportAction::Overwrite,
+        }
+    }
 }
 
 /// Action selected for one archived novel.
@@ -70,6 +81,15 @@ pub fn plan_import(
     existing: &[ExistingNovel],
     conflict: ConflictPolicy,
 ) -> ImportPlan {
+    plan_manifest(&parsed.manifest, existing, conflict)
+}
+
+/// Plan from validated metadata without loading any file bodies.
+pub fn plan_manifest(
+    manifest: &ArchiveManifest,
+    existing: &[ExistingNovel],
+    conflict: ConflictPolicy,
+) -> ImportPlan {
     let mut existing_by_url: HashMap<&str, &ExistingNovel> = HashMap::with_capacity(existing.len());
     for novel in existing {
         // The first entry for a toc_url wins; a duplicated library index must
@@ -79,10 +99,11 @@ pub fn plan_import(
             .or_insert(novel);
     }
 
-    let entries = parsed
+    let entries = manifest
         .novels
         .iter()
-        .map(|novel| plan_entry(novel.index, novel, &existing_by_url, conflict))
+        .enumerate()
+        .map(|(index, novel)| plan_entry(index, &novel.toc_url, &novel.title, &existing_by_url, conflict))
         .collect();
 
     ImportPlan { entries }
@@ -90,30 +111,28 @@ pub fn plan_import(
 
 fn plan_entry(
     index: usize,
-    novel: &ParsedNovel,
+    toc_url: &str,
+    title: &str,
     existing_by_url: &HashMap<&str, &ExistingNovel>,
     conflict: ConflictPolicy,
 ) -> ImportPlanEntry {
-    let Some(existing) = existing_by_url.get(novel.toc_url.as_str()) else {
+    let Some(existing) = existing_by_url.get(toc_url) else {
         return ImportPlanEntry {
             index,
-            action: ImportAction::Create,
+            action: conflict.action(false),
             reason: "not present in the library".into(),
         };
     };
 
-    let reason = if existing.title == novel.title {
+    let reason = if existing.title == title {
         format!("already in the library as {:?}", existing.title)
     } else {
         format!(
             "already in the library as {:?} (archive title is {:?})",
-            existing.title, novel.title
+            existing.title, title
         )
     };
-    let action = match conflict {
-        ConflictPolicy::Skip => ImportAction::Skip,
-        ConflictPolicy::Overwrite => ImportAction::Overwrite,
-    };
+    let action = conflict.action(true);
     ImportPlanEntry {
         index,
         action,
@@ -124,7 +143,7 @@ fn plan_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transfer::ArchiveManifest;
+    use crate::transfer::{ArchiveManifest, ParsedNovel};
 
     fn parsed(toc_urls: &[(&str, &str)]) -> ParsedArchive {
         let manifest = ArchiveManifest {

@@ -26,6 +26,10 @@ impl HttpClient for LocalHttp {
         self.0.send(request.with_trusted_endpoint())
     }
 
+    fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<narou_rs::platform::HttpStreamResponse>> {
+        self.0.send_stream(request.with_trusted_endpoint())
+    }
+
     fn validate_url<'a>(&'a self, url: &'a str) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move { validate_http_url_syntax(url) })
     }
@@ -233,6 +237,16 @@ async fn downloader_reuses_the_probe_session_for_yaml_form_requests() {
             let path = request.url.strip_prefix("http://example.com").unwrap();
             request.url = format!("http://127.0.0.1:{}{path}", self.port);
             self.inner.send(request)
+        }
+        fn send_stream<'a>(&'a self, mut request: HttpRequest) -> PlatformFuture<'a, Result<narou_rs::platform::HttpStreamResponse>> {
+            let path = request.url.strip_prefix("http://example.com").unwrap();
+            let mapped = format!("http://127.0.0.1:{}{path}", self.port);
+            let original = std::mem::replace(&mut request.url, mapped);
+            Box::pin(async move {
+                let mut response = self.inner.send_stream(request).await?;
+                response.url = original;
+                Ok(response)
+            })
         }
         fn validate_url<'a>(&'a self, url: &'a str) -> PlatformFuture<'a, Result<()>> {
             self.inner.validate_url(url)

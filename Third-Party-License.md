@@ -63,8 +63,10 @@ the time of this audit.
 
 | Dependency | Version req | License |
 | --- | --- | --- |
-| aozora_epub3_lite (`lite` feature only) | git (see `assets/aozora_lite/LICENSE.md`) | GPL-3.0-only |
+| aozora_epub3_lite (`lite` feature only) | ^0.1.6 | GPL-3.0-only |
 | argon2 | ^0.6 | MIT OR Apache-2.0 |
+| async-compression | ^0.4 | MIT OR Apache-2.0 |
+| async_zip | ^0.0.19 | MIT |
 | axum | ^0.8 | MIT |
 | base64 | ^0.23 | MIT OR Apache-2.0 |
 | base64 (build) | ^0.23 | MIT OR Apache-2.0 |
@@ -83,9 +85,11 @@ the time of this audit.
 | fs2 | ^0.4 | MIT/Apache-2.0 |
 | futures | ^0.3 | MIT OR Apache-2.0 |
 | getrandom | ^0.4 | MIT OR Apache-2.0 |
+| gif | ^0.14 | MIT OR Apache-2.0 |
 | hex | ^0.4 | MIT OR Apache-2.0 |
 | hmac | ^0.13 | MIT OR Apache-2.0 |
 | image | ^0.25 | MIT OR Apache-2.0 |
+| image-webp | ^0.2.4 | MIT OR Apache-2.0 |
 | indicatif | ^0.18 | MIT |
 | lettre | ^0.11 | MIT |
 | libc | ^0.2 | MIT OR Apache-2.0 |
@@ -95,6 +99,7 @@ the time of this audit.
 | parking_lot | ^0.13 | MIT OR Apache-2.0 |
 | pest | ^2.8 | MIT OR Apache-2.0 |
 | pest_derive | ^2.8 | MIT OR Apache-2.0 |
+| png | ^0.18 | MIT OR Apache-2.0 |
 | psl | ^2.1.241 | MIT/Apache-2.0 |
 | regex | ^1 | MIT OR Apache-2.0 |
 | reqwest | ^0.13 | MIT OR Apache-2.0 |
@@ -132,7 +137,7 @@ dependency).
 
 | License | Used by |
 | --- | ---: |
-| MIT License | 342 |
+| MIT License | 351 |
 | Unicode License v3 | 20 |
 | Apache License 2.0 | 12 |
 | BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License | 8 |
@@ -2082,6 +2087,7 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 
 Used by:
 - atomic-waker 1.1.2
+- futures-lite 2.6.1
 
 ```text
 ===============================================================================
@@ -2763,6 +2769,40 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
+- either 1.19.0
+
+```text
+Copyright (c) 2015
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ```
 
@@ -4000,6 +4040,40 @@ Used by:
 
 ```text
 Copyright (c) 2017-2020 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
+- array-init 2.1.0
+
+```text
+Copyright (c) 2017-2020 The array-init developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -6190,6 +6264,36 @@ DEALINGS IN THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
+- owo-colors 4.4.0
+
+```text
+MIT License
+
+Copyright (c) 2020 - present The owo-colors Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
 - cfg_aliases 0.2.2
 
 ```text
@@ -6202,6 +6306,37 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
+- async_zip 0.0.19
+
+```text
+MIT License
+
+Copyright (c) 2021 Harry
+Copyright (c) 2023 Cognite AS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ```
 
@@ -6392,6 +6527,8 @@ SOFTWARE.
 
 Used by:
 - ua_generator 0.5.88
+- binrw 0.15.2
+- binrw_derive 0.15.2
 - block2 0.6.2
 - brotli-decompressor 6.2.0
 - chrono-tz-build 0.5.0
@@ -6601,8 +6738,8 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- fdeflate 0.3.7
 - image-webp 0.2.4
+- fdeflate 0.3.7
 - image 0.25.10
 
 ```text
@@ -6700,10 +6837,12 @@ Used by:
 - ctrlc 3.5.2
 - displaydoc 0.2.7
 - fastrand 2.5.0
+- futures-lite 2.6.1
 - itoa 1.0.18
 - lazy_static 1.5.1
 - linux-raw-sys 0.12.1
 - once_cell 1.21.4
+- parking 2.2.1
 - pest 2.9.5
 - pest_derive 2.9.5
 - pest_generator 2.9.5

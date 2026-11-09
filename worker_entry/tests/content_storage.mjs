@@ -9,6 +9,8 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'nod
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
+import { createS3MultipartFixture } from './s3_multipart_fixture.mjs';
+import { animationFixture, verifyPng, isAnimation, storedZip } from './animation_fixture.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
@@ -20,9 +22,12 @@ let persist = join(work, 'state');
 const token = 'isolated-content-smoke-token';
 const objects = new Map();
 let failPut = false;
+const multipart = createS3MultipartFixture({ objects, failPut: () => failPut });
 let sourceGeneration = 1;
 let sourceSubtitle = '第一話';
 let sourceImageCount = 0;
+let sourceAnimation = null;
+let sourceStaticImage = null;
 let sourceEpisodeCount = 1;
 let sourcePause = null;
 let sourceBodyDelay = 0;
@@ -109,7 +114,9 @@ const server = http.createServer(async (req, res) => {
         await new Promise((resolve) => setTimeout(resolve, sourceBodyDelay));
       }
       const images = Array.from({ length: sourceImageCount }, (_, i) => `<img src="http://localhost:${server.address().port}/smoke-image/${i}.png" />`).join('');
-      res.end(`<div class="body"><p>${(sourceGeneration === 1 ? '初回取得の本文です。' : sourceGeneration === 2 ? '更新後の本文です。' : '失敗する更新の本文です。').repeat(100)}</p>${images}</div>`);
+      const animation = sourceAnimation ? `<img src="http://localhost:${server.address().port}/smoke-animation/frames.zip?ugoira=${sourceAnimation.delays.join(',')}" />` : '';
+      const largeImage = sourceStaticImage ? `<img src="http://localhost:${server.address().port}/smoke-large.png" />` : '';
+      res.end(`<div class="body"><p>${(sourceGeneration === 1 ? '初回取得の本文です。' : sourceGeneration === 2 ? '更新後の本文です。' : '失敗する更新の本文です。').repeat(100)}</p>${images}${animation}${largeImage}</div>`);
       return;
     }
     if (req.method === 'GET' && /^\/smoke-image\/\d+\.png$/.test(key)) {
@@ -120,6 +127,15 @@ const server = http.createServer(async (req, res) => {
       res.end(Buffer.concat([imagePng, Buffer.from(key)]));
       return;
     }
+    if (req.method === 'GET' && key === '/smoke-animation/frames.zip' && sourceAnimation) {
+      res.writeHead(200, { 'content-type': 'application/zip', 'content-length': sourceAnimation.bytes.length });
+      res.end(sourceAnimation.bytes); return;
+    }
+    if (req.method === 'GET' && key === '/smoke-large.png' && sourceStaticImage) {
+      res.writeHead(200, { 'content-type': 'image/png', 'content-length': sourceStaticImage.bytes.length });
+      res.end(sourceStaticImage.bytes); return;
+    }
+    if (await multipart.handle(req, res, url, key)) return;
     if (req.method === 'GET' && url.searchParams.get('list-type') === '2') {
       const prefix = url.searchParams.get('prefix') ?? '';
       const bucket = key.replace(/\/$/, '');
@@ -138,7 +154,9 @@ const server = http.createServer(async (req, res) => {
         const source = decodeURIComponent(req.headers['x-amz-copy-source']);
         const bytes = objects.get(source.startsWith('/') ? source : `/${source}`);
         if (!bytes) { res.writeHead(404); res.end('<Error><Code>NoSuchKey</Code></Error>'); return; }
+        if (!multipart.checkConditions(req, res, key)) return;
         objects.set(key, Buffer.from(bytes));
+        multipart.etags.delete(key);
         res.setHeader('content-type', 'application/xml');
         res.end(`<CopyObjectResult><LastModified>2026-10-15T00:00:00Z</LastModified><ETag>${xml(etag(bytes))}</ETag></CopyObjectResult>`);
         return;
@@ -147,17 +165,15 @@ const server = http.createServer(async (req, res) => {
       let length = 0;
       for await (const chunk of req) { length += chunk.length; assert(length <= 16 * 1024 * 1024); chunks.push(chunk); }
       const bytes = Buffer.concat(chunks);
+      if (!multipart.checkConditions(req, res, key)) return;
+      multipart.etags.delete(key);
       objects.set(key, bytes); res.setHeader('etag', etag(bytes)); res.end(); return;
     }
-    if (req.method === 'DELETE') { objects.delete(key); res.writeHead(204); res.end(); return; }
-    const bytes = objects.get(key);
-    if (!bytes) { res.writeHead(404); res.end('<Error><Code>NoSuchKey</Code></Error>'); return; }
-    res.setHeader('etag', etag(bytes));
-    if (req.headers.range) {
-      res.writeHead(206, { 'content-range': `bytes 0-0/${bytes.length}`, 'content-length': 1 });
-      res.end(bytes.subarray(0, 1)); return;
+    if (req.method === 'DELETE') {
+      if (!multipart.checkConditions(req, res, key)) return;
+      objects.delete(key); multipart.etags.delete(key); res.writeHead(204); res.end(); return;
     }
-    res.setHeader('content-length', bytes.length); res.end(req.method === 'HEAD' ? undefined : bytes);
+    res.writeHead(404); res.end('<Error><Code>NoSuchKey</Code></Error>');
   } catch (error) { res.writeHead(500); res.end(String(error)); }
 });
 const sourceServer = http.createServer(server.listeners('request')[0]);
@@ -271,7 +287,7 @@ async function complete(action) {
   for (let count = 0; count < 100; count++) { const report = await phase(action); if (report.done) return report; }
   throw new Error(`phase ${action} did not finish`);
 }
-function epubText(bytes) {
+function epubText(bytes, visitEntry) {
   let end = bytes.length - 22;
   while (end >= 0 && bytes.readUInt32LE(end) !== 0x06054b50) end--;
   assert(end >= 0, 'EPUB must contain a ZIP central directory');
@@ -284,7 +300,11 @@ function epubText(bytes) {
     const local = bytes.readUInt32LE(cursor + 42);
     const dataStart = local + 30 + bytes.readUInt16LE(local + 26) + bytes.readUInt16LE(local + 28);
     const data = bytes.subarray(dataStart, dataStart + bytes.readUInt32LE(cursor + 20));
-    if (name.endsWith('.xhtml')) texts.push((bytes.readUInt16LE(cursor + 10) === 8 ? inflateRawSync(data) : data).toString());
+    if (name.endsWith('.xhtml') || visitEntry) {
+      const decoded = bytes.readUInt16LE(cursor + 10) === 8 ? inflateRawSync(data) : data;
+      if (name.endsWith('.xhtml')) texts.push(decoded.toString());
+      if (visitEntry) visitEntry(name, decoded);
+    }
     cursor += 46 + nameLength + bytes.readUInt16LE(cursor + 30) + bytes.readUInt16LE(cursor + 32);
   }
   return texts.join('\n');
@@ -388,6 +408,10 @@ subtitles: '<a href="(?<href>/smoke-novel/(?<index>\\d+)/)">(?<subtitle>.+?)</a>
 body_pattern: '<div class="body">(?<body>.+?)</div>'
 min_interval: 0.01
 `;
+  const multiTargetDefinition = definition
+    .replace('(?<ncode>smoke-novel)', '(?<ncode>smoke-(?:novel|single|series))')
+    .replace('(?<href>/smoke-novel/', '(?<href>/smoke-(?:novel|single|series)/')
+    .replace(`toc_url: '${target}'`, "toc_url: '\\k<top_url>/\\k<ncode>/'");
   const savedSite = await (await api('/api/sites/localhost.yaml', definition, 'PUT')).json();
   assert(savedSite.success, JSON.stringify(savedSite));
   let originalEpisode;
@@ -429,10 +453,16 @@ min_interval: 0.01
   failPut = true; sourceGeneration = 3;
   await download(target, true, true);
   assert.equal(scalar(`SELECT COUNT(*) FROM content_objects WHERE object_key=${quote(stable.object_key)} AND blob_key=${quote(stable.blob_key)}`), 1, 'a failed replacement PUT must preserve the previous current body');
+  // EPUB preparation now stages text/XHTML instead of retaining a whole book.
+  // A continuing S3 write outage must fail closed, without discarding the old
+  // episode; once writes recover the exact previous content remains readable.
+  const unavailableEpub = await api(`/api/novels/${downloadedId}/download.epub`);
+  assert.equal(unavailableEpub.status, 500, await unavailableEpub.text());
+  failPut = false;
   const unchanged = await api(`/api/novels/${downloadedId}/download.epub`);
-  assert.equal(unchanged.status, 200);
+  assert.equal(unchanged.status, 200, unchanged.status === 200 ? '' : await unchanged.text());
   assert(epubText(Buffer.from(await unchanged.arrayBuffer())).includes('更新後の本文です。'));
-  failPut = false; sourceGeneration = 2;
+  sourceGeneration = 2;
   console.log('PASS failed replacement PUT preserves the current episode and readable EPUB');
   const cancelled = await (await api('/api/queue/cancel', {})).json();
   assert(cancelled.success, JSON.stringify(cancelled));
@@ -479,8 +509,8 @@ min_interval: 0.01
     sourceBodyDelay = 0; sourceTimings = null;
     await start();
   }
-  async function installDefaultSource() {
-    const result = await (await api('/api/sites/localhost.yaml', definition, 'PUT')).json();
+  async function installDefaultSource(siteDefinition = definition) {
+    const result = await (await api('/api/sites/localhost.yaml', siteDefinition, 'PUT')).json();
     assert(result.success, JSON.stringify(result));
   }
   async function verifyDefaultDownload() {
@@ -611,6 +641,202 @@ min_interval: 0.01
   assert.equal((illustratedText.match(/<img\b/g) ?? []).length, sourceImageCount, 'EPUB must retain every image after the continuation');
   assert(!illustratedText.includes('/smoke-image/'), 'EPUB must use its embedded images, not upstream URLs');
   console.log('PASS one 500-image episode yields on the real Worker budget, resumes without refetching, and produces an illustrated EPUB');
+
+  {
+    const memoryWrapper = join(work, 'memory-wrapper.mjs');
+    const modulePath = JSON.stringify(relative(work, join(root, 'build/worker/shim.mjs')).replaceAll('\\', '/'));
+    writeFileSync(memoryWrapper, `
+const OriginalInstance = WebAssembly.Instance;
+let memory, highWater = 0, instances = 0;
+const sample = () => {
+  highWater = Math.max(highWater, memory?.buffer.byteLength ?? 0);
+  return { wasmBytes: memory?.buffer.byteLength ?? 0, highWater, instances };
+};
+WebAssembly.Instance = class extends OriginalInstance {
+  constructor(...args) {
+    super(...args);
+    sample(); memory = this.exports.memory; instances++;
+  }
+};
+const Production = await import(${modulePath});
+export const PushHub = Production.PushHub;
+export const SiteRateLimiter = Production.SiteRateLimiter;
+export default class extends Production.default {
+  async fetch(request, ...rest) {
+    if (new URL(request.url).pathname === '/_fixture/memory') return Response.json(sample());
+    return super.fetch(request, ...rest);
+  }
+}
+`);
+    await defaultLibrary('animation-stream', { required: true, entrypoint: memoryWrapper });
+    await installDefaultSource(multiTargetDefinition);
+    sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
+    sourceImageCount = 0;
+    const animation = animationFixture();
+    assert(animation.bytes.length < 16 * 1024 * 1024, 'source fixture stays within the existing upstream ZIP limit');
+    sourceAnimation = animation;
+    const completedBefore = multipart.completed.length;
+    await download(target, false, false);
+    const animationId = scalar("SELECT id FROM novels WHERE ncode='smoke-novel'");
+    const saved = [...objects].filter(([key, bytes]) => key.includes('/illustrations/') && isAnimation(bytes));
+    assert.equal(saved.length, 1, 'one source animation must have one published pooled asset');
+    const [animationKey, animationBytes] = saved[0];
+    assert(animationBytes.length > 16 * 1024 * 1024, 'fixture must exercise the formerly unsupported large-asset path');
+    verifyPng(animationBytes, animation);
+    const digest = createHash('sha256').update(animationBytes).digest('base64url');
+    assert(animationKey.endsWith(`/illustrations/${digest}.png`), 'pool name must hash the exact complete animation');
+    assert.equal(multipart.uploads.size, 0, 'completed downloads must not leave unfinished multipart uploads');
+    for (const upload of multipart.completed.slice(completedBefore)) {
+      assert(!objects.has(upload.key), 'temporary uploaded objects must be removed after publication');
+    }
+
+    const response = await api(`/api/novels/${animationId}/download.epub`);
+    assert.equal(response.status, 200, response.status === 200 ? undefined : await response.text());
+    const busy = await api(`/api/novels/${animationId}/download.epub`);
+    assert.equal(busy.status, 503, 'the in-flight EPUB must retain its isolate memory reservation');
+    assert(busy.headers.get('retry-after'), 'capacity refusal must tell the client when to retry');
+    await busy.body.cancel();
+    const reader = response.body.getReader();
+    const chunks = [];
+    for (let count = 0;; count++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      chunks.push(Buffer.from(value));
+      if (count % 8 === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const imageReferences = new Set();
+    const animatedImages = new Set();
+    const text = epubText(Buffer.concat(chunks), (name, bytes) => {
+      if (name.endsWith('.xhtml')) {
+        for (const [, source] of bytes.toString().matchAll(/<(?:img|image)\b[^>]*\b(?:src|(?:xlink:)?href)="([^"]+)"/g)) {
+          imageReferences.add(new URL(source, `https://epub.invalid/${name}`).pathname.slice(1));
+        }
+      }
+      if (isAnimation(bytes)) {
+        verifyPng(bytes, animation);
+        animatedImages.add(name);
+      }
+    });
+    assert(text.includes('初回取得の本文です。'));
+    // Auto-cover may move the illustration out of the body; either location
+    // must reference the complete animation, not a static poster or a missing file.
+    assert.equal(imageReferences.size, 1, JSON.stringify({ references: [...imageReferences], animations: [...animatedImages] }));
+    for (const image of imageReferences) assert(animatedImages.has(image), 'the displayed image must retain every animation frame');
+    const upstreamClosed = Promise.withResolvers();
+    let stalledResponse;
+    multipart.beforeReadBody = async (_req, res, key, bytes) => {
+      if (!key.includes('/.narou-staging/') || !isAnimation(bytes)) return false;
+      assert.equal(stalledResponse, undefined, 'only the EPUB image stream may reach the cancellation gate');
+      stalledResponse = res;
+      res.once('close', () => upstreamClosed.resolve());
+      // Never send EOF: releasing admission by silently finishing the book
+      // would not prove cancellation. The upstream request must be aborted.
+      res.write(bytes.subarray(0, 8 * 1024 * 1024));
+      await upstreamClosed.promise;
+      return true;
+    };
+    try {
+      const cancelled = await fetch(`http://127.0.0.1:${port}/api/novels/${animationId}/download.epub`, {
+        headers: { Authorization: `Bearer ${token}`, Connection: 'close' }, signal: AbortSignal.timeout(15000),
+      });
+      assert.equal(cancelled.status, 200, 'completed streaming must release the memory reservation');
+      const cancelledReader = cancelled.body.getReader();
+      let cancelBytes = 0;
+      while (cancelBytes < 4 * 1024 * 1024) {
+        const { value, done } = await cancelledReader.read();
+        assert(!done, 'cancel must occur while the large image is still being delivered');
+        cancelBytes += value.length;
+      }
+      assert(stalledResponse, 'the upstream image must be paused before EOF');
+      await cancelledReader.cancel();
+      let deadline;
+      try {
+        // Local cancel() is not an acknowledgement from the remote Worker.
+        await Promise.race([upstreamClosed.promise, new Promise((_, reject) => {
+          deadline = setTimeout(() => reject(new Error('EPUB cancellation did not abort the upstream body')), 5000);
+        })]);
+      } finally { clearTimeout(deadline); }
+      assert.equal(stalledResponse.writableEnded, false, 'cancellation must not drain the remaining image');
+    } finally {
+      multipart.beforeReadBody = null;
+      stalledResponse?.destroy();
+    }
+    const afterCancel = await api(`/api/novels/${animationId}/download.epub`);
+    assert.equal(afterCancel.status, 200, 'client cancellation must release the memory reservation');
+    await afterCancel.body.cancel();
+    sourceAnimation = null;
+    const memory = await (await api('/_fixture/memory')).json();
+    assert.equal(memory.instances, 1, 'the successful animation path must not recover from a Wasm trap');
+    assert(memory.highWater < 96 * 1024 * 1024, `Wasm high-water must leave space for the JS heap: ${JSON.stringify(memory)}`);
+    console.log(`Worker animation Wasm memory high-water: ${memory.highWater} bytes (JS heap excluded)`);
+    console.log('PASS large64-frame animation streams through multipart storage and EPUB with alpha/timing intact; EOF/cancel releases admission');
+
+    const color = [13, 37, 193, 127];
+    const expectedPixels = createHash('sha256');
+    const expectedRow = Buffer.alloc(658 * 4, Buffer.from(color));
+    for (let y = 0; y < 658; y++) expectedPixels.update(expectedRow);
+    const expectedCover = { animated: false, width: 658, height: 658, frameCount: 1, digests: [expectedPixels.digest('hex')] };
+    for (const [size, indexedNoise, slug] of [[4096, true, 'smoke-single'], [6000, false, 'smoke-series']]) {
+      sourceStaticImage = animationFixture({ frameCount: 1, width: size, height: size, solidColor: color, archive: false, indexedNoise });
+      assert(sourceStaticImage.bytes.length < 16 * 1024 * 1024, 'large PNG stays within the former encoded-size limit');
+      await download(new URL(`/${slug}/`, target).href, false, false);
+      const largeId = scalar(`SELECT id FROM novels WHERE ncode='${slug}'`);
+      const largeEpub = await api(`/api/novels/${largeId}/download.epub`);
+      assert.equal(largeEpub.status, 200, largeEpub.status === 200 ? undefined : await largeEpub.text());
+      const coverPaths = new Set();
+      const entries = new Map();
+      epubText(Buffer.from(await largeEpub.arrayBuffer()), (name, bytes) => {
+        if (name.endsWith('.png')) entries.set(name, bytes);
+        if (name.endsWith('/cover.xhtml')) {
+          for (const [, source] of bytes.toString().matchAll(/(?:src|xlink:href)="([^"]+)"/g)) {
+            coverPaths.add(new URL(source, `https://epub.invalid/${name}`).pathname.slice(1));
+          }
+        }
+      });
+      assert.equal(coverPaths.size, 1, 'the first illustration must produce a real cover');
+      for (const path of coverPaths) {
+        assert(entries.has(path), `missing cover image ${path}`);
+        verifyPng(entries.get(path), expectedCover);
+      }
+      sourceStaticImage = null;
+      const largeMemory = await (await api('/_fixture/memory')).json();
+      assert.equal(largeMemory.instances, 1, 'large-image resizing must not trap and restart Wasm');
+      assert(largeMemory.highWater < 112 * 1024 * 1024, `PNG resize must leave room for the JS heap: ${JSON.stringify(largeMemory)}`);
+      console.log(`PASS ${size}² PNG becomes a pixel/alpha-exact658² cover; Wasm high-water=${largeMemory.highWater} bytes (JS heap excluded)`);
+    }
+
+    const transferId = scalar("SELECT id FROM novels WHERE ncode='smoke-series'");
+    const exported = await api(`/api/transfer/export?progress=1&ids=${transferId}`);
+    assert.equal(exported.status, 200);
+    const exportEvents = (await exported.text()).trim().split('\n').map(line => JSON.parse(line));
+    assert(!exportEvents.some(event => event.type === 'error'), JSON.stringify(exportEvents));
+    const exportedZip = Buffer.concat(exportEvents.filter(event => event.type === 'data').map(event => Buffer.from(event.data, 'base64')));
+    assert.equal(exportEvents.at(-1).type, 'complete');
+    assert.equal(exportEvents.at(-1).bytes, exportedZip.length);
+    const importedEntries = [];
+    epubText(exportedZip, (name, bytes) => {
+      if (name === 'manifest.json') {
+        const manifest = JSON.stringify(JSON.parse(bytes.toString()));
+        // Small legal JSON, but materializing five million Value nodes exceeds
+        // the entire isolate. Unknown extension fields must be streamed past.
+        bytes = Buffer.from(`${manifest.slice(0, -1)},"ignored":[${'0,'.repeat(4_999_999)}0]}`);
+      }
+      importedEntries.push([name, bytes]);
+    });
+    const imported = await fetch(`http://127.0.0.1:${port}/api/transfer/import?progress=1`, {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/zip', Connection: 'close' },
+      body: storedZip(importedEntries),
+    });
+    assert.equal(imported.status, 200, imported.status === 200 ? undefined : await imported.text());
+    const importEvents = (await imported.text()).trim().split('\n').map(line => JSON.parse(line));
+    assert(!importEvents.some(event => event.type === 'error'), JSON.stringify(importEvents));
+    assert.equal(importEvents.at(-1).type, 'complete');
+    assert.deepEqual(importEvents.at(-1).result, { success: true, created: 0, overwritten: 0, skipped: 1, errors: [] });
+    const transferMemory = await (await api('/_fixture/memory')).json();
+    assert.equal(transferMemory.instances, 1, 'ignored manifest values must not trap Wasm');
+    assert(transferMemory.highWater < 112 * 1024 * 1024, `manifest decoding must remain bounded: ${JSON.stringify(transferMemory)}`);
+    console.log(`PASS streamed import ignores five million extension values without materializing them; Wasm high-water=${transferMemory.highWater}`);
+  }
 
   // Hold the actual Durable Object notification after the ledger has yielded,
   // without adding hooks to Rust production code. The queue wrapper witnesses
@@ -787,10 +1013,7 @@ export default class extends Entry {
   console.log('PASS 1685 episodes / 17 TOC pages cross the real Worker budget, resume without rereading the complete prefix, and produce the complete EPUB');
 
   await defaultLibrary('automatic-update-rules');
-  const automaticDefinition = definition
-    .replace('(?<ncode>smoke-novel)', '(?<ncode>smoke-(?:novel|single|series))')
-    .replace('(?<href>/smoke-novel/', '(?<href>/smoke-(?:novel|single|series)/')
-    .replace(`toc_url: '${target}'`, "toc_url: '\\\\k<top_url>/\\\\k<ncode>/'")
+  const automaticDefinition = multiTargetDefinition
     + "\nupdate_rules:\n  - match: {ncode: '^smoke-single$'}\n    automatic: skip\n";
   assert((await (await api('/api/sites/localhost.yaml', automaticDefinition, 'PUT')).json()).success);
   const singleTarget = target.replace('/smoke-novel/', '/smoke-single/');

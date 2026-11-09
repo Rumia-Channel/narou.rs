@@ -37,6 +37,9 @@ use crate::native::object_store::{
     NativeObjectStore, content_type_for_path, logical_key_for_native_path, run_blocking, run_scoped_blocking,
 };
 
+#[path = "asset_stream.rs"]
+mod asset_stream;
+
 /// Payloads at or below this size are stored inline in `objects.data`;
 /// larger payloads are chunked into `object_chunks` rows of this size.
 /// 512 KiB keeps every statement and row comfortably under D1's limits.
@@ -53,6 +56,7 @@ pub struct SqliteObjectStore {
     /// 無効時は読み書きが SQLite だけで完結する。
     mirror_files: bool,
     prefer_existing_files: bool,
+    stage_leases: Arc<crate::platform::staging::StageLeaseCache>,
 }
 
 impl SqliteObjectStore {
@@ -82,6 +86,7 @@ impl SqliteObjectStore {
             mirror,
             mirror_files,
             prefer_existing_files: false,
+            stage_leases: Arc::new(crate::platform::staging::StageLeaseCache::default()),
         }
     }
 
@@ -330,16 +335,29 @@ impl SqliteObjectStore {
     /// narou.rb after a YAML rollback.
     fn delete_both(&self, key: &ObjectKey) -> Result<()> {
         self.remove_file_copy(key)?;
-        self.delete_blocking(key)
+        self.delete_blocking(key)?;
+        self.stage_leases.forget(key);
+        Ok(())
     }
 
     fn copy_blocking(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
-        match self.read_blocking(source, None)? {
-            Some(data) => self.write_blocking(destination, &data),
-            None => Err(NarouError::Platform(format!(
-                "copy source not found: {source}"
-            ))),
-        }
+        if source == destination { return Ok(()); }
+        self.renew_stage_progress(source)?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(super::sqlite_error)?;
+        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM objects WHERE object_key=?)",
+            [source.as_ref()], |row| row.get(0)).map_err(super::sqlite_error)?;
+        if !exists { return Err(NarouError::NotFound(source.to_string())); }
+        tx.execute("DELETE FROM object_chunks WHERE object_key=?", [destination.as_ref()]).map_err(super::sqlite_error)?;
+        tx.execute("INSERT INTO objects(object_key,size,updated_at,content_type,encoding,crc32,data)
+            SELECT ?,size,?, ?,encoding,crc32,data FROM objects WHERE object_key=?
+            ON CONFLICT(object_key) DO UPDATE SET size=excluded.size,updated_at=excluded.updated_at,
+            content_type=excluded.content_type,encoding=excluded.encoding,crc32=excluded.crc32,data=excluded.data",
+            rusqlite::params![destination.as_ref(), Self::now_rfc3339(),
+                content_type_for_path(Path::new(destination.as_ref())), source.as_ref()]).map_err(super::sqlite_error)?;
+        tx.execute("INSERT INTO object_chunks(object_key,seq,data) SELECT ?,seq,data FROM object_chunks WHERE object_key=?",
+            rusqlite::params![destination.as_ref(), source.as_ref()]).map_err(super::sqlite_error)?;
+        tx.commit().map_err(super::sqlite_error)
     }
 
     /// 保存済みオブジェクトを小説ディレクトリへ実ファイルとして取り出す (同期)。
@@ -774,70 +792,28 @@ impl AssetStore for SqliteObjectStore {
         &'a self,
         key: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
-        let this = self.clone();
-        let key = key.clone();
+        Box::pin(self.read_asset(key))
+    }
+
+    fn read_range<'a>(
+        &'a self, key: &'a ObjectKey, range: std::ops::Range<u64>,
+    ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(self.read_asset_range(key, range))
+    }
+
+    fn stage_stream<'a>(&'a self, stream: AssetStream) -> PlatformFuture<'a, Result<crate::platform::StagedAsset>> {
         Box::pin(async move {
-            if this.prefer_existing_files
-                && let Some(stream) = AssetStore::read_stream(&this.mirror, &key).await?
-            {
-                return Ok(Some(stream));
-            }
-            let data = run_blocking({
-                let this = this.clone();
-                let key = key.clone();
-                move || -> Result<Option<Vec<u8>>> {
-                    match this.read_blocking(&key, None)? {
-                        Some(data) => Ok(Some(data)),
-                        None if this.prefer_existing_files => Ok(None),
-                        None => {
-                            let path = this.mirror.resolve_read_path(&key)?;
-                            match std::fs::read(&path) {
-                                Ok(data) => Ok(Some(data)),
-                                Err(error)
-                                    if error.kind() == std::io::ErrorKind::NotFound =>
-                                {
-                                    Ok(None)
-                                }
-                                Err(error) => Err(error.into()),
-                            }
-                        }
-                    }
-                }
-            })
-            .await?;
-            let Some(data) = data else {
-                return Ok(None);
-            };
-            let stream: AssetStream = Box::pin(futures::stream::iter(
-                data.chunks(64 * 1024)
-                    .map(|chunk| Ok(chunk.to_vec()))
-                    .collect::<Vec<_>>(),
-            ));
-            Ok(Some(stream))
+            self.cleanup_asset_stages().await?;
+            crate::platform::staging::stage(self, stream).await
         })
     }
 
     fn write_stream<'a>(
         &'a self,
         key: &'a ObjectKey,
-        mut stream: AssetStream,
+        stream: AssetStream,
     ) -> PlatformFuture<'a, Result<()>> {
-        let this = self.clone();
-        let key = key.clone();
-        Box::pin(async move {
-            let mut data = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                data.extend_from_slice(&chunk?);
-            }
-            run_blocking(move || {
-                this.write_blocking(&key, &data)?;
-                if this.mirror_files {
-                    this.mirror.write_bytes_blocking(&key, &data)?;
-                }
-                Ok(())
-            })
-            .await
-        })
+        Box::pin(self.write_asset(key, stream))
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
@@ -849,19 +825,15 @@ impl AssetStore for SqliteObjectStore {
         source: &'a ObjectKey,
         destination: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<()>> {
-        let this = self.clone();
-        let source = source.clone();
-        let destination = destination.clone();
-        run_blocking(move || {
-            this.copy_blocking(&source, &destination)?;
-            if !this.mirror_files {
-                return Ok(());
-            }
-            let source_path = this.mirror.resolve_path(&source)?;
-            let destination_path = this.mirror.resolve_path(&destination)?;
-            if source_path.exists() {
-                this.mirror.ensure_parent_dir(&destination_path)?;
-                std::fs::copy(&source_path, &destination_path)?;
+        Box::pin(async move {
+            let this = self.clone();
+            let source = source.clone();
+            let destination_key = destination.clone();
+            run_blocking(move || this.copy_blocking(&source, &destination_key)).await?;
+            if self.mirror_files {
+                let stream = self.read_asset(destination).await?
+                    .ok_or_else(|| NarouError::NotFound(destination.to_string()))?;
+                self.mirror.write_stream(destination, stream).await?;
             }
             Ok(())
         })
@@ -876,6 +848,7 @@ impl AssetStore for SqliteObjectStore {
         let source = source.clone();
         let destination = destination.clone();
         run_blocking(move || {
+            if source == destination { return Ok(()); }
             this.copy_blocking(&source, &destination)?;
             // The moved-away source must stop being readable from either copy;
             // with the mirror on the file itself moves (falling back to
@@ -1272,6 +1245,111 @@ mod tests {
     use super::*;
     use crate::platform::ObjectPrefix;
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn streamed_sqlite_assets_roundtrip_without_a_tokio_runtime() {
+        use futures::StreamExt;
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        for mirror_files in [false, true] {
+            let (_dir, mut store) = temp_store();
+            store.mirror_files = mirror_files;
+            store.prefer_existing_files = mirror_files;
+            futures::executor::block_on(async {
+                let size = crate::platform::staging::ASSET_CHUNK_BYTES;
+                let stage = store.stage_stream(Box::pin(futures::stream::iter([
+                    Ok(vec![3; size]), Ok(vec![5; 19]),
+                ]))).await.unwrap();
+                assert_eq!(stage.size, size as u64 + 19);
+                let key = ObjectKey::try_new("sync/copied.bin").unwrap();
+                AssetStore::copy(&store, &stage.key, &key).await.unwrap();
+                let bytes = store.read_range(&key, size as u64 - 3..size as u64 + 8).await.unwrap().unwrap();
+                assert_eq!(bytes, [vec![3; 3], vec![5; 8]].concat());
+                let mut stream = store.read_stream(&key).await.unwrap().unwrap();
+                let mut bytes = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.unwrap();
+                    assert!(chunk.len() <= size);
+                    bytes.extend_from_slice(&chunk);
+                }
+                assert_eq!(&bytes[..size], vec![3; size]);
+                assert_eq!(&bytes[size..], &[5; 19]);
+                AssetStore::delete(&store, &stage.key).await.unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn stage_progress_renews_expiry_without_invalidating_the_read_snapshot() {
+        use futures::StreamExt;
+        let (_dir, mut store) = temp_store();
+        store.mirror_files = false;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let length = crate::platform::staging::ASSET_CHUNK_BYTES * 2;
+            let stage = store.stage_stream(Box::pin(futures::stream::once(async move { Ok(vec![7; length]) }))).await.unwrap();
+            let expired = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+            store.conn.lock().execute("UPDATE objects SET updated_at=? WHERE object_key=?",
+                rusqlite::params![expired, stage.key.as_ref()]).unwrap();
+            store.stage_leases.forget(&stage.key);
+            let mut stream = store.read_stream(&stage.key).await.unwrap().unwrap();
+            let mut read = stream.next().await.unwrap().unwrap().len();
+            store.cleanup_asset_stages().await.unwrap();
+            assert!(AssetStore::stat(&store, &stage.key).await.unwrap().is_some());
+            while let Some(chunk) = stream.next().await { read += chunk.unwrap().len(); }
+            assert_eq!(read, length);
+            AssetStore::delete(&store, &stage.key).await.unwrap();
+            assert!(store.renew_stage_progress(&stage.key).is_err());
+            assert!(AssetStore::stat(&store, &stage.key).await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn streamed_assets_are_chunked_seekable_and_atomic_on_error() {
+        let (_dir, mut store) = temp_store();
+        store.mirror_files = false;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let key = ObjectKey::try_new("generated/large.bin").unwrap();
+            let input: AssetStream = Box::pin(futures::stream::iter(
+                (0..40).map(|index| Ok(vec![index as u8; 64 * 1024]))));
+            store.write_stream(&key, input).await.unwrap();
+            let range = store.read_range(&key, (512 * 1024 - 8)..(512 * 1024 + 8)).await.unwrap().unwrap();
+            assert_eq!(range, [vec![7; 8], vec![8; 8]].concat());
+            let failure: AssetStream = Box::pin(futures::stream::iter(vec![
+                Ok(vec![99; 64 * 1024]), Err(NarouError::Platform("source interrupted".into())),
+            ]));
+            assert!(store.write_stream(&key, failure).await.is_err());
+            assert_eq!(store.read_range(&key, 0..4).await.unwrap().unwrap(), vec![0; 4]);
+            let mut stream = store.read_stream(&key).await.unwrap().unwrap();
+            let mut size = 0;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.unwrap();
+                assert!(chunk.len() <= 64 * 1024);
+                size += chunk.len();
+            }
+            assert_eq!(size, 40 * 64 * 1024);
+        });
+    }
+
+    #[test]
+    fn streamed_legacy_compression_detects_corruption_at_eof() {
+        let (_dir, mut store) = temp_store();
+        store.mirror_files = false;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let key = ObjectKey::try_new("novels/site/title/本文/1 test.yaml").unwrap();
+            store.write_small(&key, vec![b'x'; 200_000]).await.unwrap();
+            let mut stream = store.read_stream(&key).await.unwrap().unwrap();
+            let mut count = 0;
+            while let Some(chunk) = stream.next().await { count += chunk.unwrap().len(); }
+            assert_eq!(count, 200_000);
+            store.conn.lock().execute("UPDATE objects SET crc32=0 WHERE object_key=?", [key.as_ref()]).unwrap();
+            let mut stream = store.read_stream(&key).await.unwrap().unwrap();
+            let mut failed = false;
+            while let Some(chunk) = stream.next().await { if chunk.is_err() { failed = true; break; } }
+            assert!(failed, "corruption must not become successful EOF");
+        });
+    }
 
     #[test]
     fn db_only_cache_catalog_survives_missing_files_and_corrupt_sections() {

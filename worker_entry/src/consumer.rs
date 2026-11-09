@@ -92,14 +92,75 @@ pub async fn process_batch(
     message_batch: MessageBatch<serde_json::Value>,
     env: &Env,
 ) -> Result<()> {
+    let Some(_memory_permit) = crate::memory_budget::try_heavy() else {
+        // No runtime/site compilation, downloader, or site lease while waiting.
+        // Park in D1 and ack: physical queue retries must not spend business
+        // attempts (nor fall into the DLQ merely because the isolate is busy).
+        let ledger = crate::ledger::D1JobLedger::new(
+            crate::db_handle::DbHandle::primary(std::sync::Arc::new(env.d1("DB").map_err(worker_error)?)),
+            std::sync::Arc::new(narou_rs::platform::SystemClock),
+        );
+        for message in message_batch.messages().map_err(worker_error)? {
+            defer_capacity(&ledger, &message).await?;
+            message.ack();
+        }
+        return Ok(());
+    };
     let runtime = WorkerRuntime::build(env).await.map_err(worker_error)?;
     let push = PushHubClient::new(env, runtime.subrequests.clone());
-    let mut downloader = None;
     let source_convert = runtime.is_conversion_queue(&message_batch.queue());
     for message in message_batch.messages().map_err(worker_error)? {
+        // A batch never accumulates section caches from previous novels.
+        let mut downloader = None;
         process_envelope(&runtime, &mut downloader, &push, message.body(), &message, source_convert).await?;
         if let Err(error) = runtime.wake_waiting_jobs().await {
             console_log!("admission wake failed; cron will recover it: {error}");
+        }
+    }
+    Ok(())
+}
+
+async fn defer_capacity(ledger: &crate::ledger::D1JobLedger, message: &Message<serde_json::Value>) -> Result<()> {
+    let value = message.body();
+    let id = match value.get("version").and_then(serde_json::Value::as_u64) {
+        Some(version) if version == u64::from(WORKER_JOB_ENVELOPE_VERSION) => {
+            match serde_json::from_value::<WorkerJobEnvelope>(value.clone()) {
+                Ok(envelope) if narou_rs::application::envelope_bytes(&envelope)
+                    .is_ok_and(|bytes| bytes <= narou_rs::application::job_limits::MAX_ENVELOPE_BYTES) => Some(envelope.job_id),
+                Ok(_) => {
+                    ledger.record_rejected(&message.id(), "envelope exceeds queue payload limit").await?;
+                    None
+                }
+                Err(error) => {
+                    ledger.record_rejected(&message.id(), &format!("malformed v2 envelope: {error}")).await?;
+                    None
+                }
+            }
+        }
+        Some(1) => {
+            let request = serde_json::from_value::<JobRequest>(value.get("job").cloned().unwrap_or_default());
+            match request.map(|request| decode_legacy_envelope(&request)) {
+                Ok(LegacyEnvelopeOutcome::Plan(plan)) => Some(ledger.enqueue(plan).await?.job_id),
+                Ok(LegacyEnvelopeOutcome::Reject { reason }) => {
+                    ledger.record_rejected(&message.id(), &reason).await?;
+                    None
+                }
+                Err(error) => {
+                    ledger.record_rejected(&message.id(), &format!("malformed v1 envelope: {error}")).await?;
+                    None
+                }
+            }
+        }
+        _ => {
+            ledger.record_rejected(&message.id(), "unsupported envelope version").await?;
+            None
+        }
+    };
+    if let Some(id) = id {
+        if ledger.get(&id).await?.is_some() {
+            ledger.park_for_capacity(&id).await?;
+        } else {
+            ledger.record_rejected(&message.id(), &format!("ledger has no row for queued job {id}")).await?;
         }
     }
     Ok(())
@@ -256,7 +317,7 @@ async fn process_discrete(
     } else { (None, None) };
     let virtual_update = update_record.as_ref().is_some_and(narou_rs::virtual_novel::is_virtual_record);
     if record_error.is_none() && job.kind != JobKind::Convert && !virtual_update && downloader.is_none() {
-        *downloader = Some(runtime.new_downloader().await?);
+        *downloader = Some(runtime.new_downloader(&job.target).await?);
     }
     let target = match &job.target {
         JobTarget::Id(id) => Cow::Owned(id.0.to_string()),

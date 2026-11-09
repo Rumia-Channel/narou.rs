@@ -21,27 +21,29 @@ fn build_standard_regex(pattern: &str) -> std::result::Result<regex::Regex, rege
         .build()
 }
 
-fn fancy_regex_allowed(pattern: &str, source: &str, key: &str) -> bool {
-    if pattern.len() > MAX_YAML_REGEX_PATTERN_LEN {
-        crate::application::messages::emit_default(
-            crate::application::messages::Stream::Stderr,
-            &crate::application::messages::download::warn_fancy_pattern_large(key),
-        );
-        return false;
+#[derive(Debug)]
+enum InfoDiagnostic { PatternTooLarge, InputTooLarge }
+
+impl InfoDiagnostic {
+    async fn emit(self, key: &str) {
+        use crate::application::messages::{self, Stream};
+        let message = match self {
+            Self::PatternTooLarge => messages::download::warn_fancy_pattern_large(key),
+            Self::InputTooLarge => messages::download::warn_fancy_input_large(key),
+        };
+        messages::emit_default_async(Stream::Stderr, &message).await;
     }
-    if source.len() > MAX_REGEX_INPUT_LEN {
-        crate::application::messages::emit_default(
-            crate::application::messages::Stream::Stderr,
-            &crate::application::messages::download::warn_fancy_input_large(key),
-        );
-        return false;
-    }
-    true
+}
+
+fn fancy_regex_allowed(pattern: &str, source: &str) -> Result<(), InfoDiagnostic> {
+    if pattern.len() > MAX_YAML_REGEX_PATTERN_LEN { return Err(InfoDiagnostic::PatternTooLarge); }
+    if source.len() > MAX_REGEX_INPUT_LEN { return Err(InfoDiagnostic::InputTooLarge); }
+    Ok(())
 }
 
 /// Try matching with the standard regex crate first; fall back to fancy-regex
 /// for patterns that use lookahead/lookbehind (unsupported by the regex crate).
-fn try_regex_captures(pattern: &str, source: &str, key: &str) -> Option<String> {
+fn try_regex_captures(pattern: &str, source: &str, key: &str) -> Result<Option<String>, InfoDiagnostic> {
     let re = build_standard_regex(pattern);
 
     if let Ok(re) = re {
@@ -50,20 +52,18 @@ fn try_regex_captures(pattern: &str, source: &str, key: &str) -> Option<String> 
                 if capture_name_matches_key(key, name)
                     && let Some(m) = caps.name(name)
                 {
-                    return Some(decode_html_text(m.as_str()));
+                    return Ok(Some(decode_html_text(m.as_str())));
                 }
             }
             if let Some(m) = caps.get(1) {
-                return Some(decode_html_text(m.as_str()));
+                return Ok(Some(decode_html_text(m.as_str())));
             }
         }
-        return None;
+        return Ok(None);
     }
 
     // Fallback to fancy-regex for lookahead/lookbehind patterns
-    if !fancy_regex_allowed(pattern, source, key) {
-        return None;
-    }
+    fancy_regex_allowed(pattern, source)?;
     let fre = fancy_regex::RegexBuilder::new(pattern)
         .dot_matches_new_line(true)
         .multi_line(true)
@@ -75,17 +75,17 @@ fn try_regex_captures(pattern: &str, source: &str, key: &str) -> Option<String> 
             if capture_name_matches_key(key, name)
                 && let Some(m) = caps.name(name)
             {
-                return Some(decode_html_text(m.as_str()));
+                return Ok(Some(decode_html_text(m.as_str())));
             }
         }
         if let Some(m) = caps.get(1) {
-            return Some(decode_html_text(m.as_str()));
+            return Ok(Some(decode_html_text(m.as_str())));
         }
     }
-    None
+    Ok(None)
 }
 
-fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String> {
+fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Result<Vec<String>, InfoDiagnostic> {
     let re = build_standard_regex(pattern);
 
     if let Ok(re) = re {
@@ -105,12 +105,10 @@ fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String>
                 values.push(decode_html_text(m.as_str()));
             }
         }
-        return values;
+        return Ok(values);
     }
 
-    if !fancy_regex_allowed(pattern, source, key) {
-        return Vec::new();
-    }
+    fancy_regex_allowed(pattern, source)?;
     let fre = fancy_regex::RegexBuilder::new(pattern)
         .dot_matches_new_line(true)
         .multi_line(true)
@@ -135,64 +133,22 @@ fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String>
                 values.push(decode_html_text(m.as_str()));
             }
         }
-        return values;
+        return Ok(values);
     }
 
-    Vec::new()
+    Ok(Vec::new())
 }
 
 impl SiteSetting {
-    pub fn resolve_info_pattern(&self, key: &str, source: &str) -> Option<String> {
-        let value = match key {
-            "t" => self.t.as_ref().or(self.title.as_ref()),
-            "w" => self.w.as_ref().or(self.author.as_ref()),
-            "s" => self.s.as_ref().or(self.story.as_ref()),
-            "nt" => self.nt.as_ref(),
-            "ga" => self.ga.as_ref(),
-            "gf" => self.gf.as_ref(),
-            "nu" => self.nu.as_ref(),
-            "gl" => self.gl.as_ref(),
-            "l" => self.l.as_ref(),
-            "tags" => self.tags.as_ref(),
-            "sitename" => self.sitename_pattern.as_ref(),
-            "ncode" => self.ncode.as_ref(),
-            _ => return None,
-        };
-
-        let value = value?;
-
-        let entries: Vec<SiteSettingEntry> = match value {
-            SiteSettingValue::Single(s) => vec![SiteSettingEntry::Plain(s.clone())],
-            SiteSettingValue::Multiple(entries) => entries.clone(),
-        };
-
-        for entry in &entries {
-            let pattern = match entry {
-                SiteSettingEntry::Plain(s) => s.as_str(),
-                SiteSettingEntry::Eval { .. } => {
-                    continue;
-                }
-            };
-
-            let resolved = self.interpolate(pattern);
-            if key == "tags" {
-                let values = try_regex_captures_all(&resolved, source, key);
-                if !values.is_empty() {
-                    return Some(values.join("\n"));
-                }
-            }
-            if let Some(v) = try_regex_captures(&resolved, source, key) {
-                return Some(v);
-            }
-        }
-        None
+    pub async fn resolve_info_pattern(&self, key: &str, source: &str) -> Option<String> {
+        self.resolve_info_pattern_with_captures(key, source, &HashMap::new()).await
     }
 
-    pub fn multi_match(&self, source: &str, keys: &[&str]) -> HashMap<String, String> {
+    pub async fn multi_match(&self, source: &str, keys: &[&str]) -> HashMap<String, String> {
         let mut match_values: HashMap<String, String> = HashMap::new();
 
         for key in keys {
-            if let Some(value) = self.resolve_info_pattern_with_captures(key, source, &match_values)
+            if let Some(value) = self.resolve_info_pattern_with_captures(key, source, &match_values).await
             {
                 match_values.insert(key.to_string(), value);
             }
@@ -201,7 +157,7 @@ impl SiteSetting {
         match_values
     }
 
-    fn resolve_info_pattern_with_captures(
+    async fn resolve_info_pattern_with_captures(
         &self,
         key: &str,
         source: &str,
@@ -228,27 +184,27 @@ impl SiteSetting {
 
         let value = value?;
 
-        let entries: Vec<SiteSettingEntry> = match value {
-            SiteSettingValue::Single(s) => vec![SiteSettingEntry::Plain(s.clone())],
-            SiteSettingValue::Multiple(entries) => entries.clone(),
-        };
-
-        for entry in &entries {
-            let pattern = match entry {
-                SiteSettingEntry::Plain(s) => s.as_str(),
-                SiteSettingEntry::Eval { .. } => {
-                    continue;
-                }
-            };
+        let single = match value { SiteSettingValue::Single(value) => Some(value.as_str()), _ => None };
+        let entries = match value { SiteSettingValue::Multiple(entries) => entries.as_slice(), _ => &[] };
+        let patterns = single.into_iter().chain(entries.iter().filter_map(|entry| match entry {
+            SiteSettingEntry::Plain(value) => Some(value.as_str()),
+            SiteSettingEntry::Eval { .. } => None,
+        }));
+        // Each pure regex step returns at most one diagnostic. Await it before
+        // evaluating the next user-defined pattern; never buffer a warning list.
+        for pattern in patterns {
             let resolved = self.interpolate_with_captures(pattern, prev_captures);
             if key == "tags" {
-                let values = try_regex_captures_all(&resolved, source, key);
-                if !values.is_empty() {
-                    return Some(values.join("\n"));
+                match try_regex_captures_all(&resolved, source, key) {
+                    Ok(values) if !values.is_empty() => return Some(values.join("\n")),
+                    Ok(_) => {}
+                    Err(diagnostic) => diagnostic.emit(key).await,
                 }
             }
-            if let Some(v) = try_regex_captures(&resolved, source, key) {
-                return Some(v);
+            match try_regex_captures(&resolved, source, key) {
+                Ok(Some(value)) => return Some(value),
+                Ok(None) => {}
+                Err(diagnostic) => diagnostic.emit(key).await,
             }
         }
         None
@@ -304,7 +260,7 @@ mod tests {
 
         let source = "<dt class=\"p-infotop-data__title\">キーワード</dt>\n<dd class=\"p-infotop-data__value\">\nR15&nbsp;残酷な描写あり&nbsp;近未来 シムワールド 無敵\n</dd>";
 
-        let result = try_regex_captures(pattern, source, "tags");
+        let result = try_regex_captures(pattern, source, "tags").unwrap();
         assert!(
             result.is_some(),
             "tags regex should match via fancy-regex fallback"
@@ -321,12 +277,12 @@ mod tests {
     fn test_multiline_tag_capture_collects_all_matches() {
         let pattern = "^tag::(?<tag>.+?)$";
         let source = "tag::tag-a\ntag::tag-b\ntag::tag-c";
-        let result = try_regex_captures_all(pattern, source, "tags");
+        let result = try_regex_captures_all(pattern, source, "tags").unwrap();
         assert_eq!(result, vec!["tag-a", "tag-b", "tag-c"]);
     }
 
-    #[test]
-    fn multi_match_decodes_html_entities_in_story_capture() {
+    #[tokio::test]
+    async fn multi_match_decodes_html_entities_in_story_capture() {
         let settings = SiteSetting::load_all().unwrap();
         let setting = settings
             .iter()
@@ -337,7 +293,7 @@ mod tests {
 <dd class="p-infotop-data__value">&quot;氷の令嬢&quot; &amp; 隣人 &#39;test&#39;</dd>
 "#;
 
-        let values = setting.multi_match(html, &["s"]);
+        let values = setting.multi_match(html, &["s"]).await;
 
         assert_eq!(
             values.get("s").map(String::as_str),

@@ -34,6 +34,15 @@ pub enum TransferError {
     #[error("zip error: {0}")]
     Zip(#[from] zip::result::ZipError),
 
+    #[error("zip error: {0}")]
+    AsyncZip(#[from] async_zip::error::ZipError),
+
+    #[error("archive I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("archive storage error: {0}")]
+    Storage(String),
+
     /// The manifest is not valid JSON or does not match the schema.
     #[error("manifest JSON error: {0}")]
     Serde(#[from] serde_json::Error),

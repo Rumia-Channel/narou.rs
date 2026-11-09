@@ -58,7 +58,7 @@ impl NovelInfo {
         jobs: &mut super::preprocess::PreprocessJobs,
     ) -> Result<Self> {
         let Some(novel_info_url) = &setting.novel_info_url else {
-            return Ok(Self::from_toc_source(setting, toc_source));
+            return Ok(Self::from_toc_source(setting, toc_source).await);
         };
         let mut captures = url_captures.clone();
         captures.insert("__target_url".to_string(), toc_url.to_string());
@@ -69,7 +69,7 @@ impl NovelInfo {
             // The TOC fetch already ran `pretreatment_source`; parsing it with
             // the novel-info rules is identical to re-fetching the same URL
             // and pre-treating it again.
-            return Ok(Self::from_novel_info_source(setting, toc_source));
+            return Ok(Self::from_novel_info_source(setting, toc_source).await);
         }
         let policy = http_policy::FetchPolicy::for_site(setting);
         match http_policy::fetch_text(
@@ -95,18 +95,18 @@ impl NovelInfo {
                     },
                 )
                 .await?;
-                Ok(Self::from_novel_info_source(setting, &body))
+                Ok(Self::from_novel_info_source(setting, &body).await)
             }
-            Err(_) => Ok(Self::from_toc_source(setting, toc_source)),
+            Err(_) => Ok(Self::from_toc_source(setting, toc_source).await),
         }
     }
 
-    pub fn from_novel_info_source(setting: &SiteSetting, source: &str) -> Self {
+    pub async fn from_novel_info_source(setting: &SiteSetting, source: &str) -> Self {
         let mut info = Self::empty();
         let keys = [
             "t", "w", "s", "nt", "ga", "gf", "nu", "gl", "l", "tags", "sitename",
         ];
-        info.raw_captures = setting.multi_match(source, &keys);
+        info.raw_captures = setting.multi_match(source, &keys).await;
         if info.raw_captures.is_empty() {
             return info;
         }
@@ -145,10 +145,10 @@ impl NovelInfo {
         info
     }
 
-    pub fn from_toc_source(setting: &SiteSetting, toc_source: &str) -> Self {
+    pub async fn from_toc_source(setting: &SiteSetting, toc_source: &str) -> Self {
         let mut info = Self::empty();
         let keys = ["title", "author", "story", "tags"];
-        info.raw_captures = setting.multi_match(toc_source, &keys);
+        info.raw_captures = setting.multi_match(toc_source, &keys).await;
         info.title = info.raw_captures.get("title").cloned();
         info.author = info.raw_captures.get("author").cloned();
         info.story = info.raw_captures.get("story").cloned();

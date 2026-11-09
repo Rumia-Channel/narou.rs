@@ -180,6 +180,9 @@ pub struct Http1ResponseDecoder {
     framing: BodyFraming,
     stage: Stage,
     body: Vec<u8>,
+    body_received: usize,
+    head_taken: bool,
+    body_taken: bool,
     body_limit: usize,
 }
 
@@ -195,6 +198,9 @@ impl Http1ResponseDecoder {
             framing: BodyFraming::UntilClose,
             stage: Stage::Head,
             body: Vec::new(),
+            body_received: 0,
+            head_taken: false,
+            body_taken: false,
             body_limit,
         }
     }
@@ -256,7 +262,7 @@ impl Http1ResponseDecoder {
                     }
                     let size = parse_chunk_size(&self.buf[..self.buf.len() - 2])?;
                     self.buf.clear();
-                    if size > self.body_limit.saturating_sub(self.body.len()) {
+                    if size > self.body_limit.saturating_sub(self.body_received) {
                         return Err(NarouError::Http(
                             "socket response body exceeds limit".to_string(),
                         ));
@@ -334,17 +340,53 @@ impl Http1ResponseDecoder {
     }
 
     fn append_body(&mut self, bytes: &[u8]) -> Result<()> {
-        if bytes.len() > self.body_limit.saturating_sub(self.body.len()) {
+        if bytes.len() > self.body_limit.saturating_sub(self.body_received) {
             return Err(NarouError::Http(
                 "socket response body exceeds limit".to_string(),
             ));
         }
         self.body.extend_from_slice(bytes);
+        self.body_received += bytes.len();
         Ok(())
+    }
+
+    /// Transfer the final response head once; provisional 1xx heads are hidden.
+    pub fn response_head(&mut self) -> Option<(u16, Vec<(String, String)>)> {
+        if self.head_taken || matches!(self.stage, Stage::Head) {
+            return None;
+        }
+        self.head_taken = true;
+        Some((self.status, std::mem::take(&mut self.headers)))
+    }
+
+    /// Drain available body bytes without resetting the cumulative size limit.
+    pub fn take_body(&mut self) -> Vec<u8> {
+        self.body_taken |= !self.body.is_empty();
+        std::mem::take(&mut self.body)
+    }
+
+    /// Validate EOF independently from ownership of streamed headers/body.
+    pub fn finish_stream(&mut self) -> Result<()> {
+        match self.stage {
+            Stage::Done => Ok(()),
+            Stage::Head => Err(NarouError::Http(
+                "socket response ended before headers completed".to_string(),
+            )),
+            Stage::FixedBody { .. } if matches!(self.framing, BodyFraming::UntilClose) => {
+                self.stage = Stage::Done;
+                Ok(())
+            }
+            _ => Err(NarouError::Http(
+                "socket response body truncated by connection close".to_string(),
+            )),
+        }
     }
 
     /// Complete the response once `feed` reported `true`.
     pub fn into_response(self) -> Result<crate::platform::http::HttpResponse> {
+        if self.head_taken || self.body_taken {
+            return Err(NarouError::Http("socket response was already streamed".into()));
+        }
         if !matches!(self.stage, Stage::Done) {
             return Err(NarouError::Http(
                 "socket response is incomplete".to_string(),
@@ -362,25 +404,9 @@ impl Http1ResponseDecoder {
     /// A `Content-Length`/`chunked` body cut short is an explicit error — a
     /// truncated section must not be stored as complete. A `Connection:
     /// close` body ends at EOF by definition.
-    pub fn finish(self) -> Result<crate::platform::http::HttpResponse> {
-        match self.stage {
-            Stage::Done => self.into_response(),
-            // EOF mid-head: nothing parseable was received.
-            Stage::Head => Err(NarouError::Http(
-                "socket response ended before headers completed".to_string(),
-            )),
-            Stage::FixedBody { .. } if matches!(self.framing, BodyFraming::UntilClose) => {
-                // until-close bodies are complete at EOF whatever remains.
-                Ok(crate::platform::http::HttpResponse {
-                    status: self.status,
-                    headers: self.headers,
-                    body: self.body,
-                })
-            }
-            _ => Err(NarouError::Http(
-                "socket response body truncated by connection close".to_string(),
-            )),
-        }
+    pub fn finish(mut self) -> Result<crate::platform::http::HttpResponse> {
+        self.finish_stream()?;
+        self.into_response()
     }
 
     fn framing_for(&self) -> Result<BodyFraming> {
@@ -765,5 +791,49 @@ mod tests {
     fn invalid_status_line_is_an_error() {
         assert!(decode(b"garbage\r\n\r\nbody").is_err());
         assert!(decode(b"HTTP/1.1 xyz Bad\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn draining_preserves_cumulative_limits_for_close_and_chunked_bodies() {
+        for (head, first, overflow) in [
+            (&b"HTTP/1.1 200 OK\r\n\r\n"[..], &b"abc"[..], &b"def"[..]),
+            (&b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"[..], &b"3\r\nabc\r\n"[..], &b"3\r\ndef\r\n"[..]),
+        ] {
+            let mut decoder = Http1ResponseDecoder::new(5);
+            decoder.feed(head).unwrap();
+            decoder.feed(first).unwrap();
+            assert_eq!(decoder.take_body(), b"abc");
+            assert!(decoder.feed(overflow).is_err());
+        }
+    }
+
+    #[test]
+    fn streaming_head_skips_provisional_headers_and_transfers_cookies_once() {
+        let mut decoder = Http1ResponseDecoder::new(5);
+        decoder.feed(b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n").unwrap();
+        assert!(decoder.response_head().is_none());
+        decoder.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nab").unwrap();
+        let (status, headers) = decoder.response_head().unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie")).map(|(_, value)| value.as_str()).collect::<Vec<_>>(), ["a=1", "b=2"]);
+        assert!(decoder.response_head().is_none());
+        assert_eq!(decoder.take_body(), b"ab");
+        assert!(decoder.feed(b"cde").unwrap());
+        assert_eq!(decoder.take_body(), b"cde");
+        decoder.finish_stream().unwrap();
+        assert!(decoder.into_response().is_err());
+    }
+
+    #[test]
+    fn draining_does_not_make_truncated_frames_complete() {
+        for wire in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabc"[..],
+        ] {
+            let mut decoder = Http1ResponseDecoder::new(5);
+            decoder.feed(wire).unwrap();
+            assert_eq!(decoder.take_body(), b"abc");
+            assert!(decoder.finish_stream().is_err());
+        }
     }
 }

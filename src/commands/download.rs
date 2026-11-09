@@ -453,14 +453,13 @@ fn is_novel_frozen(target: &str) -> bool {
 
 /// `narou download` の 1 件分の結果行。文言・順序・ストリームは Worker の
 /// ジョブ経路 (`worker_entry::executor`) と揃える共有実装
-/// (`application::emit_download_result_lines`) に寄せる。
+/// (`application::download_result_line`) に寄せる。
 fn print_download_status(dl: &narou_rs::downloader::DownloadResult, sink: &Arc<dyn MessageSink>) {
-    narou_rs::application::emit_download_result_lines(
-        sink.as_ref(),
-        narou_rs::application::JobKind::Download,
-        dl,
-        None,
-    );
+    if let Some(line) = narou_rs::application::download_result_line(
+        narou_rs::application::JobKind::Download, dl, None,
+    ) {
+        sink.emit(Stream::Stdout, &line);
+    }
 }
 
 fn after_process(target: &str, opts: &DownloadOptions, sink: &Arc<dyn MessageSink>) {

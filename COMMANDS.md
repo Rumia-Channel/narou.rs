@@ -223,6 +223,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - リダイレクトでサイト定義が変わった場合は、転送先の定義にある同意 Cookie と転送先の保存ログインだけを使い、元サイトの Cookie・セッション ID・ログイン要否を引き継がない。同一サイト内の転送では選択済みログインを維持する。
 - Workers は年齢認証を対話で確認できない。成人向け作品の取得を許可する場合は Web UI の「環境設定 → Global」で `over18=true` を保存する。`false` は明示的な拒否であり、設定変更で既に `blocked` になったジョブを自動再開はしない
 - 話ごとの進捗行・章/節の見出し・ログイン再試行・「小説が削除されているか非公開な可能性があります」などのレポート行は、コンソールと同時に `logging` のログファイルへも出力する。narou.rb は `$stdout` への write をすべて `append_log` するため、ログに残らない行があってはならない。並列ドメインワーカー間の行混線は sink 内の排他 (`STDOUT_LOCK`) で防ぐ。原因は `src/logger.rs` が bin と lib の両方にコンパイルされて `LoggerState` が 2 つ存在し、`logger::init()` が bin 側しか初期化していなかったこと。`MessageSink` (`progress::console_sink`) 経由の行は未初期化の lib 側ロガーへ書かれていた。bin は lib のロガーを共有する (2026-10 修正、issue #36)
+- 大きな挿絵・アニメーション ZIP は有界チャンクで非公開 stage へ保存し、APNG を 1 フレームずつ生成する。完成 APNG を全量保持せず、保存・長さ・ハッシュの検証後に挿絵索引へ公開する。画素・透過・フレーム・表示時間を省略せず、失敗した途中出力を取得済みとして残さない。
 
 ---
 
@@ -388,10 +389,12 @@ narou author remove 1
 
 - ZIP: `manifest.json` + `novels/<index>/...`。作品メタデータ（`toc_url` / title / author / sitename / domain / tags / novel_type / ncode）と各ファイルのサイズ・SHA-256 を manifest に記録する。
 - Native の書き出しは専用の一時ディレクトリへ完全な保存内容を取得する。SQLite のミラー無効時も raw・履歴・生成物・利用者ファイルを含め、S3 の挿絵も同梱する。実行中の変換先へ一時復元せず、その生成物を後片付けで削除しない。
+- 本文は 1 ファイルの内部もチャンクで圧縮・保存し、ZIP 全体や全展開ファイルをメモリへ集めない。取り込みは全エントリを非公開 stage へ検証してから適用する。形式上限は維持し、Worker / WASM では manifest・ZIP 索引等に別途 24 MiB の割当予算を適用する。
 - 安全策: パストラバーサル・absolute path・重複パス・サイズ/エントリ上限・zip bomb を共通コアで拒否。上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。`sqlite.mirror-files=false` のライブラリへの import は fail closed。
 - Web API: `GET /api/transfer/export?ids=1,2` は ZIP、`POST /api/transfer/import[?overwrite=true]` は ZIP 本文を受け取り `{success, created, overwritten, skipped, errors}` を返す。既存の Web 認証ミドルウェア配下。
 - Web UI は両 API の `progress=1` を使い、作品数・転送量・検証／取り込み状況・エラーをモーダル表示する。書き出しは本文を 1 ファイルずつ圧縮・送信し、選択した複数作品を 1 個の ZIP にまとめる。取り込みは ZIP 1 個を選び、その中の複数作品を処理する。
 - 進捗応答は NDJSON (`progress` / `data` / `complete` / `error`)。完了フレームの無い切断を成功扱いせず、ブラウザでの保存完了はダウンロード一覧で確認する。通信中止は取り込み済み作品を巻き戻さない。詳細は `WEBUI.md` §6.1b。
+- ブラウザ保存は File System Access または Service Worker の pull 型ストリームを使い、全量 `Blob` 化へフォールバックしない。保存先の書き込みを待って次のチャンクを受け取り、明示的な完了通知前の切断・キャンセルを成功扱いしない。
 - 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が生成・検証・取り込み計画を共有する。
 - **書式 (ZIP の中身) の詳細は [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md)** を参照 (`manifest.json` のスキーマ・検証ルール・衝突規則・同梱するファイル・挿絵の扱い)。
 
@@ -541,7 +544,7 @@ Cloudflare Workers では Cloudflare Zero Trust の Service Token (`CF-Access-Cl
 - AozoraEpub3-JDK21 (1.6.x) は出力ファイルが `-dst` の **実パス** 配下かを検査するため、`-dst` が junction / シンボリックリンク / 8.3 短縮名 を含む形だと、実際には同じ場所でも `java.io.IOException: 出力パスが許可されたディレクトリ外です` で失敗する (検査は出力ファイルが未生成の時点で字句的に正規化したパスと比較されるため)。narou は `-dst` と入力パスを実パスへ解決してから渡す (一時ワークスペース使用時・通常出力時とも)。一時ワークスペースが `%TEMP%` 配下にある場合も同じ理由で失敗していた
 - `lite` feature 有効時は、外部 AozoraEpub3 が見つからない場合に組み込み `epub_lite` エンジンへフォールバックする (設定 `convert.epub-engine` = `auto`/`lite`/`external` で選ぶ。設定ページの「一般」タブからも切替可。1 回だけなら環境変数 `NAROU_RS_EPUB_ENGINE=lite`/`=external` で上書き)（外部ツール (jar / `AozoraEpub3_Lite.exe`) が見つかればそちらを優先する。narou.rb と同じ挙動）。`device=epub` / `kobo` / `reader` / `ibooks` / `mobi` の中間 EPUB 生成を外部ツールなしで行える。**Java 版と同じ資産と組み立て**: `aozoraepub3dir` があれば `chuki_*.txt` (narou カスタム注記込み)・`gaiji/*.ttf`・`AozoraEpub3.ini` を読み、無ければ同梱の `preset/AozoraEpub3.ini.default` と `preset/custom_chuki_tag.txt.default` で同じフラグを再現する（利用者が `preset/AozoraEpub3.ini` / `preset/custom_chuki_tag.txt` を作っている場合はそちらが優先される。利用者設定は配布物に含まれないためセルフアップデートで消えない）（外字フォントだけは同梱できないので入らない）。Lite の公開パイプライン (`collect_assets` / `decorate_image_tags` / `reflow_image_sections` / `build_title_page_markup` / `append_gaiji_assets` / `build_metadata`) を CLI と同じ順で使う。挿絵は書き出し時に 1 枚ずつ読み、Java と同じ前処理 (余白除去・リサイズ・回転) をかける。実データ検証: `C:\Users\rumia\Documents\WebNovel` の n0421du (401セクション) で Java 版 `AozoraEpub3.jar` の出力と **422/423 ファイルがバイト完全一致**（`aozoraepub3dir` 未設定でも **419/423**）、挿絵入りでも **425/426 がバイト完全一致**。残差は `dcterms:modified` のみ (Java はローカル時刻に `Z`、Lite は UTC) 濁点フォント (`vertical_font_with_dakuten.css` + `DMincho.ttf`) は外部ツールと同じ内容を組み込みエンジンにも渡す。設定 `convert.epub-font` = `auto`(濁点注記のある小説だけ)/`always`(本文全体を DMincho、`U+3000` を描けない Reader 向け) で選ぶ。組み込みエンジンは narou カスタム CSS (`denshokyo_font.css` = 電書協レイアウトの `font.css` 相当) を **常に** EPUB へ同梱する。これが無いと `.half_em_space` (二分アキ)・行高・前書き/後書きの装飾が効かず、`enable_half_indent_bracket` を有効にしても見た目が変わらない (2026-10 修正、issue #42)。
 - 挿絵の自動回転は `convert.rotate-image` (`auto`/`0`/`1`/`2`) で制御する。`auto` (既定) は AozoraEpub3.ini の `RotateImage` に従い、`0` は回転しない、`1`/`2` は横長挿絵を +90°/−90°。組み込みエンジン・外部 `AozoraEpub3_Lite.exe` (`-i` で差し替えた一時 INI を渡す。インストール先の INI は書き換えない)・Worker の `download.epub` に効く。Java 版 `AozoraEpub3.jar` は INI パス指定を持たず、インストール先 INI を書き換える方針ではないため本設定は効かない (jar で同じ挙動にするには AozoraEpub3.ini 側を変更する)
-- Worker のストリーミング EPUB も共通設定から横書き・挿絵の有無・濁点フォント・行高を反映し、CSS / フォント資産を実際に埋め込む。自動表紙は本文順の適切な挿絵を最大 1 枚保持して作り、書き出しで再利用する。変換 API の端末指定は EPUB のみ受理し、非対応端末と個別 `enable_inspect` は明示的に拒否する。
+- Worker のストリーミング EPUB も共通設定から横書き・挿絵の有無・濁点フォント・行高を反映し、CSS / フォント資産を実際に埋め込む。本文・XHTML・画像は immutable stage から順に供給し、完成 EPUB・全話本文・全画像を保持しない。自動表紙も処理結果を stage に固定して書き出しで再利用する。変換 API の端末指定は EPUB のみ受理し、非対応端末と個別 `enable_inspect` は明示的に拒否する。
 
 **注**: EPUB/MOBI 生成は AozoraEpub3 (Java 版 `AozoraEpub3.jar`、または Rust 製代替 [AozoraEpub3_Lite](https://github.com/Rumia-Channel/AozoraEpub3_Lite)) と kindlegen への依存がある。`aozoraepub3dir` 設定は jar を優先し、無ければ `AozoraEpub3_Lite.exe` / `AozoraEpub3.exe` バイナリを受理する (`canonicalize_aozoraepub3_tool_path`)。詳細は `docs/aozora_lite_evaluation_2026-08-23.md`。
 
@@ -943,6 +946,7 @@ narou setting name         # 読み取り
 - Worker の `concurrency` はコンソール分離（既定 true）、`convert.keep-txt` は既定 false、`queue.max-retries` は配備上限 3 と表示・保存検証を一致させる。native 専用の `s3.*` は表示せず、ミラー・話キャッシュ・外部 EPUB エンジン等は無効化し、API からも変更を拒否する。
 - Worker の取得は `NAROU_JOBS`（最大 4）、変換は `CONVERT_QUEUE`（最大 1）に実行枠を分ける。取得枠が埋まっても別作品の変換を開始でき、同じ作品の取得・変換は共通 D1 台帳で排他する。実効 YAML のサイト単位では取得を 1 件に制限し、別ホスト表記・作者確認も同じサイトへ揃える。
 - Worker の排他待ちは待機として永続化して ACK し、失敗回数や provider retry を消費しない。完了・毎分 cron で同じ job ID を再投入し、旧レーンの envelope も正しい Queue へ転送する。作品の別 URL と ID は YAML 解決後の TOC URL で照合し、元の target と再開用 checkpoint は変更しない。
+- 同じ isolate 内ではダウンロード・変換・EPUB・転送等の重い処理を 1 件に制限する。HTTP の容量待ちは `503 memory_capacity` と `Retry-After: 5`、Queue は実行 lease と試行回数を消費する前の延期とする。応答 stream の完了・失敗・キャンセルまで枠を保持する。別 isolate の実行と D1 のサイト・作品排他は維持する。
 - Worker の待機ジョブ選択は、実行中または中断後の lease を保持する所有者を SQL 内で一度だけ取り出し、待機ジョブごとに過去の終了履歴を走査しない。同一サイト・同一作品の競合判定と 1 サイトにつき 1 件の再開規則は維持する。
 - 待機選択と atomic claim の URL / N コード照合は migration `0018_novel_target_aliases.sql` の永続索引 `novel_target_aliases` を使い、再開のたびに全作品の対応表を作り直さない。索引は作品と同じトランザクションで更新し、複数一致時の最小 ID・従来の URL suffix・数値 ID の解釈と未登録 URL の排他は維持する。
 - Worker の手動中断は、話・未取得画像の開始前に台帳の status と execution token を確認して後続の取得を止める。通信中の本文・画像は保存が終わる場合があるが、挿絵索引も保持し、取得後の自動変換や作者・シリーズの追加ジョブ投入前にも状態を再確認する。実際の処理が戻るまで token / lease は保持する。手動中断は `cancelled`、消去・削除した待機ジョブは集計対象外とし、`failed` を増やさない。通常の失敗は引き続き `failed` に含める。
@@ -954,6 +958,7 @@ narou setting name         # 読み取り
 - 更新件数と新着一覧は再開前に保存した部分も含める。`toc.yaml` の各話と本文 YAML に省略可能な `download_revision` を持ち、同じ時刻内の改稿も区別する。省略・0 は旧形式、1 は変更のない旧本文の基準、2 以上は保存世代で、大小ではなく一致／不一致を使う。旧本文を世代追加だけのために書き直さず、判別できない旧再開状態は一度の更新扱いにして変換漏れを防ぐ。通常の未更新作品は更新なしのままで、判定用の追加 SQL 読み取りは行わない。
 - HTTP 403 等の通常の一時エラーでも、100 話ごとの定期保存に届く前から最新の話境界を記憶し、失敗記録の前にチェックポイントと dirty な挿絵索引を保存する。再試行は `queue.retry-backoff` の期限まで待ち、保存済み本文・画像を取り直さず続行する。予算による区切りとは違い、通常エラーの失敗回数と再試行上限は維持する。古い定期保存が最新の位置を上書きしないよう完了を待ち、破損チェックポイントからの再開始は位置 0 に戻す。
 - 滞留ジョブの回収も初回の失敗と再試行回数を区別する。`attempts` が `queue.max-retries` と同数のときは最後の再試行を許可し、それを超えたときだけ失敗確定する。通常の再試行判定と同じ境界を使う。
+- OOM / trap 等で通常の失敗保存に到達しなかった実行は、独立した `recovery_attempts` を回収時に増やす。永続チェックポイントが進んだときだけ回復予算をリセットし、上限到達時は終了してサイト枠を後続へ渡す。migration `0019_bounded_runtime.sql` を Worker 更新前に適用する。単に lease が切れるたび同じジョブを無限に再投入しない。
 - Worker の履歴取得・消去は PushHub の永続化履歴に接続し、再接続でも消去済みの行を復活させない。`webui.table.reload-timing` は実際の台帳の待機・実行数でテーブル更新を制御し、進捗・通知は抑止しない。
 - Worker の進捗保存は、終端イベントが届かなかったジョブ（実行中の異常終了など）を再接続時に検出して片付ける。保存済み進捗のスコープだけを D1 台帳の主キーで引き、終端済み（`succeeded` / `permanent` / `blocked`）の進捗を削除する。台帳全体や話ごとの走査は行わない。実行中のジョブの進捗・コンソール履歴・保存済み本文は保持する。Web UI はキューが空になった時点で残存バッチを即時に消し、周期更新（既定600秒）までの待ちを残さない。
 - 設定保存は `webui.config.reload` を配信する。UI のテーブル・タグ更新は debounce / single-flight で合流し、古い応答を反映しない。Worker のキュー詳細は cursor で全ページを取得してから表示を交換する（既定 200 件／最大 1000 件、全体の待機・実行数を別に返す）。

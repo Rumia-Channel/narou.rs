@@ -28,7 +28,12 @@ use aozora_epub3_lite::pipeline::{append_gaiji_assets, plan_assets};
 
 use crate::converter::settings::{ImageRotation, NovelSettings};
 use crate::error::{NarouError, Result};
+#[cfg(feature = "native-runtime")]
 use crate::illustration_refs::collect;
+
+#[path = "epub_lite_stream.rs"]
+mod streaming;
+pub use streaming::{ImageScratch, StreamingBuild, StreamingPreparation, image_metadata, prepare_image};
 
 /// ライブラリ利用側 (Worker など) が入力源を実装するために使う。
 pub use aozora_epub3_lite::{FileSource, InputError};
@@ -545,6 +550,7 @@ impl EpubPreparation {
     fn from_input(input: Input, options: &EpubBuildOptions) -> Result<Self> {
         let mut config = config_for(options.assets_dir.as_deref());
         apply_rotate_image(&mut config, options.rotate_image);
+        config.vertical = options.vertical;
         let Some(entry) = input.text_entries().first() else {
             return Err(NarouError::Conversion(
                 "変換済みテキストが空です".to_string(),
@@ -623,6 +629,7 @@ impl EpubPreparation {
             .flat_map(|asset| asset.references.iter().cloned())
             .collect::<Vec<_>>();
         let references = image_references(&text);
+        #[cfg(feature = "native-runtime")]
         if input.has_source() && !config.no_illust {
             let unresolved = collect(&text)
                 .into_iter()
@@ -849,6 +856,7 @@ pub fn build_book(input_txt: &Path, options: &EpubBuildOptions) -> Result<EpubBu
     build_from_input(input, options)
 }
 
+#[cfg(feature = "native-runtime")]
 /// 挿絵参照の解決結果を報告する。
 ///
 /// 本文が参照している挿絵が入力に無い場合、EPUB からその挿絵が落ちる —
@@ -944,15 +952,12 @@ pub fn stream_epub<W: Write>(
         .map_err(|error| NarouError::Conversion(format!("EPUB書き出しに失敗しました: {error}")))
 }
 
-/// EPUB 書き出しのシンク。1 エントリ分のバイト列を溜め、書き出し側が
-/// エントリを書き終えるたびに [`ChunkSink::take`] で引き取る。
-///
-/// `Clone` しても同じバッファを共有するので、`EpubStreamWriter` に渡した
-/// clone が書いた内容を呼び出し側のハンドルから読める (Worker の応答のように
-/// チャンクを 1 つずつ外へ流す用途を想定)。
+/// Synchronous output from one bounded ZIP write. The asynchronous caller drains
+/// this sink after each chunk and entry boundary, before reading more input.
+/// ZIP directory metadata is emitted by `finish`; asset payloads never accumulate.
 #[derive(Clone, Default)]
 pub struct ChunkSink {
-    buffer: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl ChunkSink {
@@ -962,13 +967,13 @@ impl ChunkSink {
 
     /// 溜まっているバイト列を取り出してバッファを空にする。
     pub fn take(&self) -> Vec<u8> {
-        std::mem::take(&mut *self.buffer.borrow_mut())
+        std::mem::take(&mut *self.buffer.lock().expect("EPUB sink lock poisoned"))
     }
 }
 
 impl Write for ChunkSink {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.buffer.borrow_mut().extend_from_slice(bytes);
+        self.buffer.lock().map_err(|_| std::io::Error::other("EPUB sink lock poisoned"))?.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -1328,7 +1333,7 @@ mod tests {
         stream_epub(&build.book, &mut batch, |path| build.resolve(path)).unwrap();
 
         let sink = ChunkSink::new();
-        let mut writer = build.book.stream_writer(sink.clone()).unwrap();
+        let mut writer = build.book.clone().stream_writer(sink.clone()).unwrap();
         let mut streamed = Vec::new();
         let mut chunks = 0;
         while let Some(info) = writer.next_entry() {
@@ -1384,7 +1389,7 @@ mod tests {
         assert!(build.resolve("image/0001.png").is_none());
 
         let sink = ChunkSink::new();
-        let mut writer = build.book.stream_writer(sink.clone()).unwrap();
+        let mut writer = build.book.clone().stream_writer(sink.clone()).unwrap();
         let mut streamed = Vec::new();
         while let Some(info) = writer.next_entry() {
             let bytes = info.asset_path.as_deref().map(|path| {

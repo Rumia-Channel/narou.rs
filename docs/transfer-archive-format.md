@@ -4,10 +4,10 @@
 > 形式そのものは `src/transfer` (プラットフォーム非依存) に実装があり、CLI・Native Web
 > API・Worker・ブラウザ WASM が生成・検証・取り込み計画を共有します。
 
-- 生成: `build_archive(&ArchiveManifest) -> Vec<u8>`
-- 逐次生成: `ArchiveStream<W>` (進捗付き Web 書き出し。1 ファイルずつ ZIP へ書き込む)
-- 検証・展開: `parse_archive(&[u8]) -> ParsedArchive`
-- 取り込み計画: `plan_import(&ParsedArchive, &[ExistingNovel], ConflictPolicy) -> ImportPlan`
+- 本番の逐次生成: `ArchiveStream<W>` / `AsyncArchiveStream<W>` (1 ファイルを有界チャンクで圧縮)
+- 本番の検証・一時保存: `StagedArchive` / `validate_archive` (全検証が済むまで既存データを変更しない)
+- 取り込み計画: `plan_manifest` (検証済み manifest と既存作品から決定)
+- 明示的な全量 utility: `build_archive` / `parse_archive` / `plan_import` (fixture 等向け。本番の転送経路では使わない)
 
 ## 1. 全体構造
 
@@ -90,12 +90,12 @@ novels/1/...
 | フィールド | 必須 | 意味 |
 |---|---|---|
 | `path` | 必須 | 小説ディレクトリ基準の相対パス (`/` 区切り) |
-| `size` | 任意 | 非圧縮サイズ。**生成時に `build_archive` が埋める** |
-| `sha256` | 任意 | 内容ハッシュ (64 桁 hex)。**生成時に `build_archive` が埋める** |
+| `size` | 任意 | 非圧縮サイズ。生成側が読みながら計算する |
+| `sha256` | 任意 | 内容ハッシュ (64 桁 hex)。生成側が読みながら計算する |
 
-生成側は `size` / `sha256` を空のまま渡してよく、組み込みの `build_archive` が計算して
-manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を正しく入れないと
-`parse_archive` の検証で弾かれる (未指定なら検証は省略される)。
+逐次生成側は各ファイルを読みながら `size` / `sha256` を計算し、最後に manifest を書き込む。
+手書きの ZIP に値がある場合は、全検証経路で実データと突き合わせる
+(未指定ならその照合は省略される)。サイズ上限・CRC・パス等の検査は省略しない。
 
 ### 2.4 属性タグ (作品種別の分類)
 
@@ -125,14 +125,14 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 → ハッシュを取り直したいとき、タイムスタンプを固定したいときは、
 **再生成すれば同じ ZIP になる**。
 
-逐次生成 API `ArchiveStream` は作品・ファイルを書き込んだ順に記録し、全作品の本文や
-完成 ZIP をサーバーのメモリに保持しない。`build_archive` と同じ ZIP 形式を使うが、
-エントリ順と data descriptor の有無が異なるため、両 API 間のバイト一致は保証しない。
-どちらも既存の `parse_archive` で読み取れる。
+逐次生成 API `ArchiveStream` / `AsyncArchiveStream` は作品・ファイルを書き込んだ順に記録し、
+1 ファイルの全内容も完成 ZIP もサーバーのメモリに保持しない。ZIP 索引と manifest の
+メタデータは保持する。エントリ順・圧縮器・data descriptor の有無が異なるため、
+whole-value utility とのバイト一致は保証しない。同じ形式・検証規則で読み取れる。
 
 ## 4. 検証 (取り込み時)
 
-`parse_archive` は次のすべてを検査する。1 つでも欠ければ取り込みは **何も書かず** 中止する。
+取り込み時は次のすべてを検査する。1 つでも欠ければ既存データを変更せず中止し、非公開の一時データを回収する。
 
 ### 4.1 サイズ・個数の上限
 
@@ -147,6 +147,12 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 
 展開は `take` で上限付き読み出しなので、zip bomb (展開サイズが ZIP の何倍もあるもの) は
 上限で止まる。
+
+Worker / ブラウザ WASM には、形式上限とは別に **24 MiB の転送メタデータ割当予算**がある。
+manifest の保持値・ZIP 索引・重複パス判定の領域について、要素数ではなく capacity、
+割当の管理領域、再確保中の旧新領域を含めて確保前に判定する。
+未知の JSON 項目は構文検証しながら読み飛ばし、`serde_json::Value` に全量展開しない。
+Native の形式上限は従来どおりで、この Wasm 用の割当予算は適用しない。
 
 ### 4.2 パスの安全性
 
@@ -248,7 +254,42 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 | `GET /api/transfer/export?ids=1,2` | Native Web API の書き出し (`application/zip`) |
 | `POST /api/transfer/import[?overwrite=true]` | Native Web API の取り込み (本文の body limit 512 MiB) |
 | Worker の `/api/transfer/*` | 同じ形式 (D1 + S3 バックエンド) |
-| `transfer_wasm` | ブラウザ側の `buildZip` / `parseZip` (同じコア) |
+| `transfer_wasm` | 下記の `build_zip` / `parse_zip` / `plan_zip`。ZIP / manifest / 既存ライブラリ全体の JS 配列・文字列を要求しない |
+
+### 8.1 独立 WASM API
+
+すべて `Promise<void>` を返す。読み書きの各コールバックを `await` し、
+出力先が待っている間は入力を先読みしない。チャンク上限は 64 KiB。
+入力は処理中に変化しないファイル・オブジェクトを使う。
+
+- `build_zip(read_manifest, manifest_size, read_chunk, write_chunk)`:
+  `read_manifest(offset, length)` は manifest JSON の指定範囲を、
+  `read_chunk(novel_index, path, offset, length)` は各ファイルの指定範囲を
+  `Uint8Array` で返す。`write_chunk(bytes)` に ZIP を順次渡す。
+- `parse_zip(read_range, size, write_chunk)`:
+  `read_range(offset, length)` から ZIP を検証し、**全エントリの検証成功後だけ**
+  `write_chunk(bytes)` へ UTF-8 の manifest JSON を順次渡す。
+  作品一覧を二重に含むラッパー JSON や、完成済み JSON 文字列は返さない。
+- `plan_zip(read_range, size, has_novel, overwrite, write_chunk)`:
+  同じ完全検証後、`has_novel(index, toc_url)` に URL の存在を問い合わせる
+  (`Promise<boolean>`)。結果は `{"index":0,"action":"Skip"}` のような
+  UTF-8 JSONL で順次渡す。`action` は `Create` / `Skip` / `Overwrite`。
+  既存作品全件の JSON は受け取らない。
+
+チャンク境界は JSON の文字・行境界とは限らない。呼び出し側も `Blob` や文字列へ
+全量連結せず、ファイルや増分パーサーへ流す。取り込みのメタデータには前述の
+24 MiB の割り当て予算を適用し、文字列の JSON エスケープ展開も逐次出力する。
+
+実 WASM の回帰テスト（対応する `wasm-bindgen` CLI が必要）:
+
+```sh
+cargo build --manifest-path transfer_wasm/Cargo.toml --target wasm32-unknown-unknown --release
+wasm-bindgen target/wasm32-unknown-unknown/release/narou_transfer_wasm.wasm --target nodejs --out-dir target/transfer-wasm-smoke
+node transfer_wasm/tests/streaming.mjs target/transfer-wasm-smoke/narou_transfer_wasm.js
+```
+
+入力の停止、SHA/サイズ、競合方針、後半の破損時に出力しないこと、および
+6 MiB の文字列が約 36 MiB の JSON へ展開されても全量コピーしないことを検証する。
 
 ## 9. バージョン
 

@@ -12,6 +12,7 @@
 //! リクエストごとに `get` しても実害は小さい。
 
 use std::sync::LazyLock;
+use wasm_bindgen::JsCast;
 
 use worker::{Env, Result};
 
@@ -23,15 +24,40 @@ use worker::{Env, Result};
 const SECRET_TTL_MS: f64 = 30_000.0;
 
 static RESOLVED: LazyLock<crate::isolate_cache::TtlMap<Option<String>>> =
-    LazyLock::new(|| crate::isolate_cache::TtlMap::new(SECRET_TTL_MS));
+    LazyLock::new(|| crate::isolate_cache::TtlMap::new(SECRET_TTL_MS, 64 * 1024, |value| {
+        value.as_ref().map_or(0, String::capacity)
+    }));
+
+thread_local! {
+    // Weak keys do not retain deployment environments. Credentials from a
+    // second Env (tests, rotated bindings, service contexts) never share a key.
+    static ENV_IDS: js_sys::WeakMap = js_sys::WeakMap::new();
+    static NEXT_ENV_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+fn cache_key(env: &Env, name: &str) -> String {
+    let id = ENV_IDS.with(|ids| {
+        let object = env.unchecked_ref::<js_sys::Object>();
+        if let Some(id) = ids.get(object).as_f64() { return id as u64; }
+        let id = NEXT_ENV_ID.with(|next| {
+            let id = next.get();
+            next.set(id + 1);
+            id
+        });
+        ids.set(object, &wasm_bindgen::JsValue::from_f64(id as f64));
+        id
+    });
+    format!("{id}/{name}")
+}
 
 /// `<NAME>_STORE` → `NAME`(var) → `NAME`(secret) の順に解決する。
 pub async fn value(env: &Env, name: &str) -> Option<String> {
-    if let Some(cached) = RESOLVED.get(name) {
+    let key = cache_key(env, name);
+    if let Some(cached) = RESOLVED.get(&key) {
         return cached;
     }
     let resolved = resolve(env, name).await;
-    RESOLVED.put(name, resolved.clone());
+    RESOLVED.put(key, resolved.clone());
     resolved
 }
 

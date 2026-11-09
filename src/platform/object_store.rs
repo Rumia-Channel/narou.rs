@@ -339,6 +339,22 @@ pub trait AssetStore: PlatformService {
         stream: AssetStream,
     ) -> PlatformFuture<'a, Result<()>>;
 
+    /// Read an exclusive-end range of at most 64 KiB. Missing objects are
+    /// distinct from short or inconsistent reads, which are errors.
+    fn read_range<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        range: std::ops::Range<u64>,
+    ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>>;
+
+    /// Write a private immutable temporary object and hash it in the same pass.
+    fn stage_stream<'a>(
+        &'a self,
+        stream: AssetStream,
+    ) -> PlatformFuture<'a, Result<super::staging::StagedAsset>> {
+        Box::pin(super::staging::stage(self, stream))
+    }
+
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>>;
 
     fn copy<'a>(

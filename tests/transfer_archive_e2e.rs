@@ -387,3 +387,46 @@ fn sqlite_library_import_updates_stored_rows() {
     assert!(database.contains(TOC_URL), "{database}");
     assert!(database.contains(TITLE), "{database}");
 }
+
+#[test]
+fn large_binary_entry_roundtrips_through_file_streaming_cli() {
+    use std::io::{Read, Write};
+    use sha2::{Digest, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    create_source_library(&source);
+    std::fs::create_dir_all(target.join(".narou")).unwrap();
+    let images = source.join("小説データ/ExampleSite/example-title/挿絵");
+    std::fs::create_dir_all(&images).unwrap();
+    let mut file = std::fs::File::create(images.join("large.bin")).unwrap();
+    let mut expected = Sha256::new();
+    let mut random = 0x12345678u32;
+    let mut chunk = [0u8; 64 * 1024];
+    for _ in 0..(17 * 1024 / 64) {
+        for byte in &mut chunk {
+            random ^= random << 13; random ^= random >> 17; random ^= random << 5;
+            *byte = random as u8;
+        }
+        expected.update(chunk);
+        file.write_all(&chunk).unwrap();
+    }
+    drop(file);
+    let zip = temp.path().join("large.zip");
+    let zip_arg = zip.to_string_lossy().to_string();
+    assert_success(&run(&source, &source, &["export", "3", "-o", &zip_arg]), "large export");
+    assert!(std::fs::metadata(&zip).unwrap().len() > 16 * 1024 * 1024);
+    assert_success(&run(&target, &target, &["import", &zip_arg]), "large import");
+    let restored = find_file(&target.join("小説データ"), "large.bin").unwrap();
+    let mut restored = std::fs::File::open(restored).unwrap();
+    let mut actual = Sha256::new();
+    let mut size = 0usize;
+    loop {
+        let count = restored.read(&mut chunk).unwrap();
+        if count == 0 { break; }
+        actual.update(&chunk[..count]);
+        size += count;
+    }
+    assert_eq!(size, 17 * 1024 * 1024);
+    assert_eq!(actual.finalize(), expected.finalize());
+}

@@ -662,7 +662,7 @@ fn clear_convert_failure(id: i64) {
 
 /// `narou update` の 1 件分の結果行。文言・順序・ストリームは Worker の
 /// ジョブ経路 (`worker_entry::executor`) と揃える共有実装
-/// (`application::emit_download_result_lines`) に寄せる。
+/// (`application::download_result_line`) に寄せる。
 ///
 /// `canceled_title` は `DownloadResult.title` が空のとき (新規小説の中断など)
 /// のタイトル代替 — 呼び出し側が `get_novel_title` で解決した値を渡す。
@@ -672,12 +672,11 @@ fn print_status_messages(
     sink: &Arc<dyn MessageSink>,
     canceled_title: Option<&str>,
 ) {
-    narou_rs::application::emit_download_result_lines(
-        sink.as_ref(),
-        narou_rs::application::JobKind::Update,
-        dl,
-        canceled_title,
-    );
+    if let Some(line) = narou_rs::application::download_result_line(
+        narou_rs::application::JobKind::Update, dl, canceled_title,
+    ) {
+        sink.emit(Stream::Stdout, &line);
+    }
 }
 
 fn auto_convert(dl: &DownloadResult, no_open: bool) -> Result<(), String> {

@@ -40,6 +40,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -51,10 +53,10 @@ use crate::downloader::util::{load_length_limit, sanitize_filename_with_limit};
 use crate::error::{NarouError, Result};
 use crate::native::materialization::block_on;
 use crate::native::novel_repository::NativeNovelRepository;
-use crate::platform::{AssetStream, NovelFilter, NovelId, NovelMutation, ObjectKey};
+use crate::platform::{AssetStore, AssetStream, NovelId, NovelMutation, ObjectKey, StagedAsset};
 use crate::transfer::{
-    ArchiveFile, ArchiveManifest, ArchiveNovel, ConflictPolicy, ExistingNovel, FORMAT_VERSION,
-    ImportAction, ParsedNovel, build_archive, parse_archive, plan_import,
+    ArchiveFile, ArchiveNovel, ConflictPolicy, ExistingNovel, ImportAction, StagedNovel,
+    StagedArchive, bounded_asset_stream, plan_manifest, MAX_ARCHIVE_BYTES,
 };
 use crate::version;
 
@@ -67,15 +69,6 @@ const EXCLUDED_TOP_LEVEL_DIRS: &[&str] = &["backup"];
 
 /// The single file every novel directory must contain for a transfer.
 const TOC_FILE: &str = "toc.yaml";
-
-/// Result of a successful export.
-#[derive(Debug, Clone)]
-pub struct ExportResult {
-    /// ZIP bytes produced by [`build_archive`].
-    pub bytes: Vec<u8>,
-    /// One entry per novel actually included, in argument order.
-    pub novels: Vec<ExportedNovelInfo>,
-}
 
 /// Summary of one exported novel (used for CLI output).
 #[derive(Debug, Clone)]
@@ -104,130 +97,82 @@ impl ImportOutcome {
     }
 }
 
-/// Builds one ZIP archive for `ids`.
-///
-/// Duplicate ids are exported once. Unknown ids abort the whole export before
-/// any bytes are returned; nothing in the library is modified.
-pub fn export_archive_bytes(ids: &[i64]) -> Result<ExportResult> {
-    if ids.is_empty() {
-        return Err(NarouError::InvalidTarget(
-            "書き出す小説が指定されていません".to_string(),
-        ));
-    }
-
-    let repository = NativeNovelRepository::new();
-    let archive_root = db::with_database(|database| Ok(database.archive_root().to_path_buf()))?;
-
-    let mut seen = HashSet::new();
-    let mut novels = Vec::new();
-    let mut info = Vec::new();
-
-    for &id in ids {
-        if !seen.insert(id) {
-            continue;
-        }
-        let record = repository
-            .get_sync(NovelId(id))?
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
-        let novel_dir = db::existing_novel_dir_for_record(&archive_root, &record);
-        ensure_exportable(&archive_root, &novel_dir)?;
-
-        let snapshot = crate::native::materialization::snapshot(&novel_dir)?;
-        let files = collect_novel_files(snapshot.path())?;
-
-        if !files.iter().any(|file| file.path == TOC_FILE) {
-            return Err(NarouError::NotFound(format!(
-                "{} に {TOC_FILE} がありません",
-                novel_dir.display()
-            )));
-        }
-
-        let subtitle = files
-            .iter()
-            .find(|file| file.path == TOC_FILE)
-            .and_then(|file| parse_toc_story(&file.bytes));
-
-        info.push(ExportedNovelInfo {
-            id,
-            title: record.title.clone(),
-            file_count: files.len(),
-        });
-        novels.push(archive_novel_from_record(&record, files, subtitle));
-    }
-
-    let manifest = ArchiveManifest {
-        format_version: FORMAT_VERSION,
-        app_version: Some(version::VERSION.to_string()),
-        exported_at: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-        novels,
-    };
-    let bytes = build_archive(&manifest)?;
-
-    Ok(ExportResult {
-        bytes,
-        novels: info,
-    })
+/// Stream a complete archive to an explicitly chosen native sink.
+pub fn export_archive_to(ids: &[i64], sink: &mut dyn Write) -> Result<Vec<ExportedNovelInfo>> {
+    export_to(ids, sink, &mut |_, _, _| Ok(()))
 }
 
-/// Web export: emit bounded ZIP chunks instead of retaining every selected body.
-pub fn export_archive_stream(
-    ids: &[i64], emit: &mut dyn FnMut(serde_json::Value) -> Result<()>,
-) -> Result<()> {
+fn export_to(
+    ids: &[i64], sink: &mut dyn Write, report: &mut ImportProgress<'_>,
+) -> Result<Vec<ExportedNovelInfo>> {
+    if ids.is_empty() { return Err(NarouError::InvalidTarget("書き出す小説が指定されていません".into())); }
     let repository = NativeNovelRepository::new();
     let archive_root = db::with_database(|database| Ok(database.archive_root().to_path_buf()))?;
     let mut seen = HashSet::new();
     let ids: Vec<_> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
-    let sink = crate::transfer::TransferBuffer::default();
-    let mut writer = crate::transfer::ArchiveStream::new(sink.clone(), version::VERSION.into(),
+    // Resolve all requested records before the first output byte.
+    let records = ids.iter().map(|id| repository.get_sync(NovelId(*id))?
+        .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))).collect::<Result<Vec<_>>>()?;
+    let mut writer = crate::transfer::ArchiveStream::new(sink, version::VERSION.into(),
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
-    let mut transferred = 0u64;
-    for (completed, id) in ids.iter().enumerate() {
-        let record = repository.get_sync(NovelId(*id))?
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
-        let novel_dir = db::existing_novel_dir_for_record(&archive_root, &record);
+    let mut info = Vec::new();
+    for (completed, record) in records.iter().enumerate() {
+        let novel_dir = db::existing_novel_dir_for_record(&archive_root, record);
         ensure_exportable(&archive_root, &novel_dir)?;
         let snapshot = crate::native::materialization::snapshot(&novel_dir)?;
-        let toc = fs::read(snapshot.path().join(TOC_FILE))?;
-        writer.begin_novel(archive_novel_from_record(&record, Vec::new(), parse_toc_story(&toc)))?;
-        collect_files_into(snapshot.path(), snapshot.path(), &mut |relative, path| {
-            let bytes = fs::read(path)?;
-            writer.add_file(relative, &bytes)?;
-            emit_archive_buffer(&sink, emit, &mut transferred)?;
-            Ok(())
-        })?;
-        emit(serde_json::json!({"type":"progress", "phase":"export",
-            "completed":completed + 1, "total":ids.len(), "title":record.title}))?;
+        let toc: Option<TocFile> = serde_yaml::from_reader(fs::File::open(snapshot.path().join(TOC_FILE))?).ok();
+        writer.begin_novel(archive_novel_from_record(record, Vec::new(), toc.and_then(|toc| toc.story).filter(|story| !story.trim().is_empty())))?;
+        let mut file_count = 0;
+        for (relative, path) in collect_novel_files(snapshot.path())? {
+            writer.add_reader(&relative, &mut fs::File::open(path)?)?;
+            file_count += 1;
+        }
+        info.push(ExportedNovelInfo { id: record.id, title: record.title.clone(), file_count });
+        report(completed + 1, ids.len(), &record.title)?;
     }
     writer.finish()?;
-    emit_archive_buffer(&sink, emit, &mut transferred)?;
-    emit(serde_json::json!({"type":"complete", "filename":"narou-export.zip", "bytes":transferred}))?;
-    Ok(())
+    Ok(info)
 }
 
-fn emit_archive_buffer(
-    sink: &crate::transfer::TransferBuffer,
-    emit: &mut dyn FnMut(serde_json::Value) -> Result<()>, transferred: &mut u64,
+/// The same byte stream encoded as bounded progress frames for the Web UI.
+pub fn export_archive_stream(
+    ids: &[i64], emit: &mut dyn FnMut(serde_json::Value) -> Result<()>,
 ) -> Result<()> {
     use base64::Engine;
-    let bytes = sink.take();
-    *transferred += bytes.len() as u64;
-    for chunk in bytes.chunks(64 * 1024) {
-        emit(serde_json::json!({"type":"data", "data":base64::engine::general_purpose::STANDARD.encode(chunk)}))?;
+    let shared = std::cell::RefCell::new(emit);
+    let transferred = std::cell::Cell::new(0u64);
+    struct Sink<F>(F);
+    impl<F: FnMut(&[u8]) -> std::io::Result<()>> Write for Sink<F> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { (self.0)(bytes)?; Ok(bytes.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
+    let sink = Sink(|bytes: &[u8]| {
+        for chunk in bytes.chunks(64 * 1024) {
+            shared.borrow_mut()(serde_json::json!({"type":"data",
+                "data":base64::engine::general_purpose::STANDARD.encode(chunk)}))
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            transferred.set(transferred.get() + chunk.len() as u64);
+        }
+        Ok(())
+    });
+    let mut sink = std::io::BufWriter::with_capacity(64 * 1024, sink);
+    export_to(ids, &mut sink, &mut |completed, total, title| {
+        shared.borrow_mut()(serde_json::json!({"type":"progress","phase":"export",
+            "completed":completed,"total":total,"title":title}))
+    })?;
+    sink.flush()?;
+    shared.borrow_mut()(serde_json::json!({"type":"complete","filename":"narou-export.zip","bytes":transferred.get()}))?;
     Ok(())
 }
 
 /// Reports completed works at novel boundaries; an error stops further imports.
 pub type ImportProgress<'a> = dyn FnMut(usize, usize, &str) -> Result<()> + 'a;
 
-/// Imports `bytes` into the current library.
-///
-/// `policy` decides what happens to a novel whose `toc_url` already exists.
-/// Malformed archives abort before anything is written; per-novel problems are
-/// reported in [`ImportOutcome::errors`].
-pub fn import_archive_bytes(
-    bytes: &[u8], policy: ConflictPolicy,
-    mut progress: Option<&mut ImportProgress<'_>>,
+/// Receive into an unpublished durable stage, then validate every entry before
+/// applying the conflict plan. The reader is never collected into one Vec.
+pub fn import_archive_reader<R: Read + Send + 'static>(
+    reader: R, policy: ConflictPolicy, mut progress: Option<&mut ImportProgress<'_>>,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> Result<ImportOutcome> {
     // The archive carries files, so a storage backend that stores nothing on
     // disk cannot represent the result. Refuse instead of publishing records
@@ -240,10 +185,30 @@ pub fn import_archive_bytes(
         ));
     }
 
-    let parsed = parse_archive(bytes)?;
+    let stores = crate::native::object_store::NativeStores::for_current_root()?;
+    let assets = stores.assets;
+    let mut cleanup = StageCleanup { assets: assets.clone(), keys: Vec::new() };
+    let source = block_on(async {
+        let cancel = cancelled.clone();
+        let stream: AssetStream = Box::pin(futures::stream::try_unfold((reader, cancel), |(mut reader, cancel)| async move {
+            if cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(NarouError::Platform("transfer cancelled".into()));
+            }
+            let mut bytes = vec![0; 64 * 1024];
+            let count = reader.read(&mut bytes)?;
+            if count == 0 { return Ok(None); }
+            bytes.truncate(count);
+            Ok(Some((bytes, (reader, cancel))))
+        }));
+        assets.stage_stream(bounded_asset_stream(stream, MAX_ARCHIVE_BYTES)).await
+    })?;
+    cleanup.keys.push(source.key.clone());
+    let parsed = block_on(async {
+        StagedArchive::read(assets.clone(), &source, &mut cleanup.keys, cancelled.clone()).await.map_err(NarouError::from)
+    })?;
     let repository = NativeNovelRepository::new();
-    let (existing, records_by_url) = load_library_index(&repository)?;
-    let plan = plan_import(&parsed, &existing, policy);
+    let (existing, records_by_url) = load_library_index(&repository, &parsed.novels)?;
+    let plan = plan_manifest(&parsed.manifest, &existing, policy);
     let archive_root = db::with_database(|database| Ok(database.archive_root().to_path_buf()))?;
 
     let mut outcome = ImportOutcome::default();
@@ -252,6 +217,9 @@ pub fn import_archive_bytes(
     let mut handled_urls: HashSet<String> = HashSet::new();
 
     for (position, entry) in plan.entries.iter().enumerate() {
+        if cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(NarouError::Platform("transfer cancelled".into()));
+        }
         let novel = &parsed.novels[entry.index];
         let metadata = &parsed.manifest.novels[entry.index];
         if let Some(report) = progress.as_mut() {
@@ -271,7 +239,7 @@ pub fn import_archive_bytes(
                 outcome.skipped += 1;
                 continue;
             }
-            ImportAction::Create => create_novel(&repository, &archive_root, metadata, novel)
+            ImportAction::Create => create_novel(&repository, &archive_root, metadata, novel, assets.as_ref())
                 .map(|_| outcome.created += 1),
             ImportAction::Overwrite => {
                 let record = records_by_url.get(&novel.toc_url).ok_or_else(|| {
@@ -279,7 +247,7 @@ pub fn import_archive_bytes(
                 });
                 record
                     .and_then(|record| {
-                        overwrite_novel(&repository, &archive_root, record, metadata, novel)
+                        overwrite_novel(&repository, &archive_root, record, metadata, novel, assets.as_ref())
                     })
                     .map(|_| outcome.overwritten += 1)
             }
@@ -296,7 +264,7 @@ pub fn import_archive_bytes(
     Ok(outcome)
 }
 
-fn describe(novel: &ParsedNovel) -> String {
+fn describe(novel: &StagedNovel) -> String {
     if novel.title.is_empty() {
         novel.toc_url.clone()
     } else {
@@ -304,15 +272,16 @@ fn describe(novel: &ParsedNovel) -> String {
     }
 }
 
-/// Loads the conflict index (all novels) plus a `toc_url -> record` map.
+/// Resolve only archive URLs; importing does not clone the entire library.
 fn load_library_index(
     repository: &NativeNovelRepository,
+    novels: &[StagedNovel],
 ) -> Result<(Vec<ExistingNovel>, HashMap<String, NovelRecord>)> {
-    let ids = repository.scan_ids_sync(&NovelFilter::default(), None, usize::MAX)?;
-    let mut existing = Vec::with_capacity(ids.len());
-    let mut by_url = HashMap::with_capacity(ids.len());
-    for id in ids {
-        let Some(record) = repository.get_sync(id)? else {
+    let mut existing = Vec::with_capacity(novels.len());
+    let mut by_url = HashMap::with_capacity(novels.len());
+    for novel in novels {
+        if by_url.contains_key(&novel.toc_url) { continue; }
+        let Some(record) = repository.find_by_toc_url_sync(&novel.toc_url)? else {
             continue;
         };
         // The first record wins, matching `plan_import`'s rule.
@@ -343,18 +312,18 @@ fn ensure_exportable(archive_root: &Path, novel_dir: &Path) -> Result<()> {
     }
 }
 
-/// Collects every regular file below `novel_dir` as archive entries.
+/// Lists regular archiveable files without reading their bodies.
 ///
 /// Paths are relative to `novel_dir` and always use `/`. Files that the archive
 /// format cannot represent (Windows-reserved names, control characters, …) are
 /// skipped rather than failing the export of the whole library.
-pub fn collect_novel_files(novel_dir: &Path) -> Result<Vec<ArchiveFile>> {
+pub fn collect_novel_files(novel_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     let mut files = Vec::new();
     collect_files_into(novel_dir, novel_dir, &mut |relative, path| {
-        files.push(ArchiveFile::new(relative, fs::read(path)?));
+        files.push((relative.to_owned(), path.to_path_buf()));
         Ok(())
     })?;
-    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
 }
 
@@ -468,11 +437,6 @@ fn is_reserved_device_name(stem: &str) -> bool {
         && stem.as_bytes()[3].is_ascii_digit())
 }
 
-fn parse_toc_story(bytes: &[u8]) -> Option<String> {
-    let toc: TocFile = serde_yaml::from_slice(bytes).ok()?;
-    toc.story.filter(|story| !story.trim().is_empty())
-}
-
 /// Builds the manifest metadata for one record.
 ///
 /// `files` are the collected novel files; `subtitle` is the story/catchphrase
@@ -518,7 +482,8 @@ fn create_novel(
     repository: &NativeNovelRepository,
     archive_root: &Path,
     metadata: &ArchiveNovel,
-    novel: &ParsedNovel,
+    novel: &StagedNovel,
+    assets: &dyn AssetStore,
 ) -> Result<i64> {
     // Authoritative duplicate check: the plan ran against a snapshot, and the
     // index `find_by_toc_url` uses can lag behind `database.yaml`.
@@ -540,7 +505,7 @@ fn create_novel(
         )));
     }
 
-    let toc = parse_archive_toc(&novel.files);
+    let toc = parse_archive_toc(assets, &novel.files)?;
     let title = toc
         .as_ref()
         .map(|toc| toc.title.clone())
@@ -667,7 +632,8 @@ fn overwrite_novel(
     archive_root: &Path,
     record: &NovelRecord,
     metadata: &ArchiveNovel,
-    novel: &ParsedNovel,
+    novel: &StagedNovel,
+    assets: &dyn AssetStore,
 ) -> Result<()> {
     let novel_dir = db::existing_novel_dir_for_record(archive_root, record);
     if !novel_dir.exists() {
@@ -679,12 +645,12 @@ fn overwrite_novel(
         )));
     }
 
+    let toc = parse_archive_toc(assets, &novel.files)?;
     write_novel_files(archive_root, &novel_dir, &novel.files, true)?;
 
     // Only fill fields the live record does not have. Changing title/author of
     // a managed novel is the downloader's job, and changing sitename/file_title
     // would move the folder out from under the files just written.
-    let toc = parse_archive_toc(&novel.files);
     let toc_title = toc
         .as_ref()
         .map(|toc| toc.title.clone())
@@ -755,11 +721,17 @@ fn overwrite_novel(
     Ok(())
 }
 
-fn parse_archive_toc(files: &[(String, Vec<u8>)]) -> Option<TocFile> {
-    files
-        .iter()
-        .find(|(path, _)| path == TOC_FILE)
-        .and_then(|(_, bytes)| serde_yaml::from_slice::<TocFile>(bytes).ok())
+fn parse_archive_toc(assets: &dyn AssetStore, files: &[(String, StagedAsset)]) -> Result<Option<TocFile>> {
+    let Some((_, asset)) = files.iter().find(|(path, _)| path == TOC_FILE) else { return Ok(None); };
+    block_on(async {
+        use futures::StreamExt;
+        let mut stream = assets.read_stream(&asset.key).await?
+            .ok_or_else(|| NarouError::NotFound(asset.key.to_string()))?;
+        // toc.yaml is metadata, never a novel body or a binary asset.
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await { bytes.extend_from_slice(&chunk?); }
+        Ok(serde_yaml::from_slice(&bytes).ok())
+    })
 }
 
 fn find_site_setting(url: &str) -> Option<site_setting::SiteSetting> {
@@ -818,12 +790,11 @@ fn derive_file_title(ncode: Option<&str>, title: &str, append_title: bool) -> St
 fn write_novel_files(
     archive_root: &Path,
     novel_dir: &Path,
-    files: &[(String, Vec<u8>)],
+    files: &[(String, StagedAsset)],
     overwrite: bool,
 ) -> Result<()> {
     let stores = crate::native::object_store::NativeStores::for_current_root()?;
-    let mut writes = Vec::with_capacity(files.len());
-    for (relative, bytes) in files {
+    for (relative, asset) in files {
         let target = safe_join(novel_dir, relative)?;
         if !overwrite && target.exists() {
             return Err(NarouError::Platform(format!(
@@ -835,16 +806,9 @@ fn write_novel_files(
             .ok_or_else(|| {
                 NarouError::Platform(format!("保存先キーを作れません: {}", target.display()))
             })?;
-        writes.push((key, bytes.clone()));
+        block_on(async { stores.assets.copy(&asset.key, &key).await })?;
     }
-
-    block_on(async move {
-        for (key, bytes) in writes {
-            let stream: AssetStream = Box::pin(futures::stream::once(async move { Ok(bytes) }));
-            stores.assets.write_stream(&key, stream).await?;
-        }
-        Ok(())
-    })
+    Ok(())
 }
 
 fn safe_join(base: &Path, relative: &str) -> Result<PathBuf> {
@@ -862,7 +826,7 @@ fn safe_join(base: &Path, relative: &str) -> Result<PathBuf> {
 /// Deletes the stored rows/objects first (so readers cannot see a row whose
 /// body is about to disappear), then prunes the empty directories the import
 /// created. A concurrent writer's files are never touched.
-fn remove_written_files(archive_root: &Path, novel_dir: &Path, files: &[(String, Vec<u8>)]) {
+fn remove_written_files(archive_root: &Path, novel_dir: &Path, files: &[(String, StagedAsset)]) {
     let keys: Vec<ObjectKey> = files
         .iter()
         .filter_map(|(relative, _)| {
@@ -915,6 +879,18 @@ fn prune_empty_directories(directory: &Path) {
         }
     }
     let _ = fs::remove_dir(directory);
+}
+
+struct StageCleanup { assets: Arc<dyn AssetStore>, keys: Vec<ObjectKey> }
+impl Drop for StageCleanup {
+    fn drop(&mut self) {
+        let assets = self.assets.clone();
+        let keys = std::mem::take(&mut self.keys);
+        let _ = block_on(async move {
+            for key in keys { let _ = assets.delete(&key).await; }
+            Ok(())
+        });
+    }
 }
 
 #[cfg(test)]
@@ -997,7 +973,7 @@ mod transfer_archive_tests {
         fs::write(novel_dir.join("backup").join("old.zip"), b"zip").unwrap();
 
         let files = collect_novel_files(&novel_dir).unwrap();
-        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        let paths: Vec<&str> = files.iter().map(|file| file.0.as_str()).collect();
         assert_eq!(
             paths,
             vec![
@@ -1014,8 +990,8 @@ mod transfer_archive_tests {
         assert_eq!(
             files
                 .iter()
-                .find(|file| file.path == "toc.yaml")
-                .map(|file| file.bytes.clone()),
+                .find(|file| file.0 == "toc.yaml")
+                .map(|file| fs::read(&file.1).unwrap()),
             Some(b"toc".to_vec())
         );
     }

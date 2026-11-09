@@ -42,7 +42,10 @@ pub fn validate(value: &str) -> std::result::Result<(), String> {
     if is_attribute_tag(value) {
         Ok(())
     } else {
-        Err(format!("unknown attribute tag {value:?}"))
+        // Diagnostics must not re-serialize an attacker-sized metadata string.
+        let mut end = value.len().min(128);
+        while !value.is_char_boundary(end) { end -= 1; }
+        Err(format!("unknown attribute tag {:?}{}", &value[..end], if end < value.len() { "..." } else { "" }))
     }
 }
 
@@ -93,5 +96,13 @@ mod tests {
         assert!(validate("小説").is_ok());
         assert!(validate("漫画").is_ok());
         assert!(validate("ゲーム").is_err());
+    }
+
+    #[test]
+    fn invalid_large_attribute_has_a_bounded_diagnostic() {
+        let value = "\\\0".repeat(512 * 1024);
+        let error = validate(&value).unwrap_err();
+        assert!(error.len() < 1024);
+        assert!(error.ends_with("..."));
     }
 }

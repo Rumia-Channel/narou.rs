@@ -754,11 +754,13 @@ pub(crate) fn reject_file_directory_conflicts<'a>(
     if paths.len() < 2 {
         return Ok(());
     }
-    let folded: HashSet<String> = paths.iter().map(|path| path.to_lowercase()).collect();
+    let folded: HashSet<[u8; 32]> = paths.iter()
+        .map(|path| Sha256::digest(path.to_lowercase().as_bytes()).into()).collect();
     for path in paths {
         for (slash, _) in path.match_indices('/') {
             let prefix = &path[..slash];
-            if folded.contains(&prefix.to_lowercase()) {
+            let folded_prefix: [u8; 32] = Sha256::digest(prefix.to_lowercase().as_bytes()).into();
+            if folded.contains(&folded_prefix) {
                 return Err(TransferError::InvalidArchive(format!(
                     "novel {novel_index} file {prefix:?} is also used as a directory"
                 )));

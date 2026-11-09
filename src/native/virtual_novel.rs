@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
+use futures::StreamExt;
 
 use crate::converter::NovelConverter;
 use crate::converter::device::Device;
@@ -406,8 +407,16 @@ pub fn convert_virtual(
     let persistence = crate::downloader::persistence::PersistenceService::new(
         objects.clone(), stores.assets.clone(),
     );
-    let book = crate::native::materialization::block_on(async {
-        let book = crate::application::virtual_book::load(record, members, &repository, &persistence).await?;
+    let toc = crate::native::materialization::block_on(async {
+        let mut book = crate::application::virtual_book::load(record, members, &repository, &persistence).await?;
+        while let Some(section) = book.sections.next().await {
+            let section = section?;
+            let filename = format!("{} {}.yaml", section.index, section.file_subtitle);
+            std::fs::write(
+                temp.path().join("本文").join(filename),
+                serde_yaml::to_string(&section).map_err(NarouError::Yaml)?,
+            )?;
+        }
         for (name, key) in &book.illustrations {
             let destination = temp.path().join(name);
             if !crate::native::materialization::copy_asset(&local, key, &destination).await? {
@@ -420,18 +429,11 @@ pub fn convert_virtual(
                 std::fs::write(temp.path().join(name), bytes)?;
             }
         }
-        Ok(book)
+        Ok(book.toc)
     })?;
-    for section in book.sections {
-        let filename = format!("{} {}.yaml", section.index, section.file_subtitle);
-        std::fs::write(
-            temp.path().join("本文").join(filename),
-            serde_yaml::to_string(&section).map_err(NarouError::Yaml)?,
-        )?;
-    }
     std::fs::write(
         temp.path().join("toc.yaml"),
-        serde_yaml::to_string(&book.toc).map_err(NarouError::Yaml)?,
+        serde_yaml::to_string(&toc).map_err(NarouError::Yaml)?,
     )
     .map_err(NarouError::Io)?;
 

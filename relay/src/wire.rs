@@ -20,6 +20,8 @@ pub const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// 上流ヘッダは JSON エスケープで最大 6 倍に膨らむため、ヘッダ上限の 6 倍に
 /// 封筒のぶんを足した予算を Worker 側と共有する。
 pub const MAX_METADATA_BYTES: usize = 6 * MAX_HEAD_BYTES + 64 * 1024;
+/// Metadata-first framing negotiated through the request's `Accept` header.
+pub const STREAM_CONTENT_TYPE: &str = "application/vnd.narou.relay.v1+octet-stream";
 /// curl / wget の子プロセスから受け取る出力 (`-i` / `--save-headers` の
 /// ヘッダ + 本文) の上限。
 pub const MAX_TRANSPORT_OUTPUT: usize = MAX_HEAD_BYTES + MAX_BODY_BYTES;
@@ -252,6 +254,48 @@ pub fn encode_response(metadata: &ResponseMetadata, body: &[u8]) -> Result<Vec<u
         return Err(WireError::ResponseTooLarge);
     }
     Ok(bytes)
+}
+
+/// Encode only the bounded stream prelude; the body is written separately.
+pub fn encode_stream_prefix(metadata: &ResponseMetadata, body_length: usize) -> Result<Vec<u8>, WireError> {
+    use std::io::Write;
+    if body_length > MAX_BODY_BYTES {
+        return Err(WireError::ResponseTooLarge);
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StreamMetadata<'a> {
+        status: u16,
+        content_type: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        location: Option<&'a str>,
+        set_cookie: &'a [String],
+        via: &'a str,
+        body_length: usize,
+    }
+    struct Prefix(Vec<u8>);
+    impl Write for Prefix {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > (MAX_METADATA_BYTES + 8).saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("relay metadata exceeds limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut prefix = Prefix(Vec::from(&b"NRS1\0\0\0\0"[..]));
+    serde_json::to_writer(&mut prefix, &StreamMetadata {
+        status: metadata.status,
+        content_type: &metadata.content_type,
+        location: metadata.location.as_deref(),
+        set_cookie: &metadata.set_cookie,
+        via: metadata.via,
+        body_length,
+    }).map_err(|_| WireError::ResponseTooLarge)?;
+    let length = (prefix.0.len() - 8) as u32;
+    prefix.0[4..8].copy_from_slice(&length.to_be_bytes());
+    Ok(prefix.0)
 }
 
 #[cfg(test)]

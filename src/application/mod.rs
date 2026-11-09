@@ -54,7 +54,7 @@ pub use jobs::{
     JobLedgerStatus, JobPlan, JobPlanResult, JobQueue, JobRequest, JobService, JobTarget,
     LegacyEnvelopeOutcome, QueuedJob, QueuedJobView, SchedulerCheckpoint, UpdateScanPage,
     WorkerExecutionCheckpoint, WorkerJobEnvelope, WORKER_JOB_ENVELOPE_VERSION, classify_failure,
-    decode_legacy_envelope, emit_download_result_lines, envelope_bytes, extract_novel_ids,
+    decode_legacy_envelope, download_result_line, envelope_bytes, extract_novel_ids,
     job_limits, validate_request_limits, worker_ledger,
 };
 pub use novel_actions::{

@@ -1,5 +1,6 @@
 [workspace]
 members = ["worker_entry", "relay", "transfer_wasm"]
+exclude = ["vendor/image-webp", "vendor/async_zip"]
 resolver = "3"
 
 [package]
@@ -50,7 +51,7 @@ native-runtime = [
 # `lite`: embed AozoraEpub3_Lite (GPL-3.0-only) as the in-process EPUB
 # engine. Binaries built with this feature are distributed under GPL-3.0;
 # see assets/aozora_lite/LICENSE.md. The Worker runtime enables it always.
-lite = ["dep:aozora_epub3_lite"]
+lite = ["dep:aozora_epub3_lite", "dep:image", "dep:gif", "dep:png", "dep:image-webp"]
 # At-rest credential decryption and encrypted-export import are needed on the
 # Worker too (credentials and envelopes may be written by a native library).
 # Argon2id, the AEAD stack and `getrandom` are all pure Rust, so they join this
@@ -117,7 +118,7 @@ fs2 = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 url = "2"
 rusqlite = { version = "0.41", features = ["bundled"], optional = true }
-aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "381c0b17f91946e22d41e5246d3977c706abe82e", optional = true }
+aozora_epub3_lite = { optional = true, version = "0.1.6", git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "cf234f569298f60a2f149d16ebb0643a3ba8fe01" }
 base64 = { version = "0.23", optional = true }
 miniz_oxide = "0.9"
 brotli = "9.0"
@@ -130,6 +131,11 @@ argon2 = { version = "0.6", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 hmac = "0.13"
 psl = "2.1.241"
+async_zip = { version = "0.0.19", default-features = false, features = ["deflate"], path = "vendor/async_zip" }
+async-compression = { version = "0.4", default-features = false, features = ["futures-io", "brotli", "deflate"] }
+gif = { version = "0.14", optional = true }
+png = { version = "0.18", optional = true }
+image-webp = { version = "0.2.4", path = "vendor/image-webp", optional = true }
 
 [build-dependencies]
 base64 = "0.23"
@@ -179,3 +185,5 @@ mailparse = "0.18"
 lto = true
 codegen-units = 1
 
+[patch.crates-io]
+image-webp = { path = "vendor/image-webp" }

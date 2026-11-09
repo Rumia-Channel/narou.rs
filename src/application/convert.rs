@@ -1,25 +1,29 @@
 //! 変換テキストの組み立て（fs を使わない）。
 //!
-//! 保存済みの `toc.yaml` と `本文/*.yaml` を ObjectStore から読み、同じ
-//! ObjectStore の `<prefix>/novel.txt` へ変換結果を書く。native の
-//! `convert_novel_by_id` が書く固定名ミラーと同じキーなので、Worker の
-//! EPUB 応答（`download.epub`）がそのまま入力にできる。
+//! 保存済みの `toc.yaml` と `本文/*.yaml` を目次順に読み、一話ずつ変換する。
+//! 完成するまで非公開の immutable asset に書き、EPUB のメタデータ走査と
+//! 出力走査は同じ内容を再生する。`novel.txt` の公開は検証済み EOF の後だけ。
 //!
 //! 小説単位の入力（`setting.ini` / `replace.txt` / `converter.yaml`）も
 //! ObjectStore から読む。`default.*` / `force.*` は `SettingsStore`
 //! (native=Inventory, Worker=D1) から読んだ値を適用する。
 
 use std::sync::Arc;
+use futures::StreamExt;
+use sha2::{Digest, Sha256};
 
 use crate::converter::ini::IniData;
 use crate::converter::settings::{NovelSettings, parse_replace_patterns};
 use crate::converter::user_converter::UserConverter;
 use crate::converter::{ConverterCapabilities, NovelConverter};
 use crate::db::NovelRecord;
-use crate::downloader::persistence::{PersistenceService, SectionLoadFailure};
-use crate::downloader::{SectionFile, TocFile, TocObject, UpdateStatus};
+use crate::downloader::persistence::PersistenceService;
+pub use crate::downloader::persistence::SectionStream;
+#[cfg(test)]
+use crate::downloader::SectionFile;
+use crate::downloader::{TocFile, TocObject, UpdateStatus};
 use crate::error::{NarouError, Result};
-use crate::platform::{AssetStore, NovelObjectKeys, ObjectKey, ObjectStore};
+use crate::platform::{AssetStore, AssetStream, NovelObjectKeys, ObjectKey, ObjectStore, StagedAsset};
 use crate::setting_core::SettingScope;
 
 use super::messages::{self, MessageSink, Stream};
@@ -28,9 +32,156 @@ use super::settings::SettingsStore;
 /// 変換結果。`output` は実際に保存した場合だけ、そのオブジェクトキーを持つ。
 #[derive(Debug)]
 pub struct ConvertedNovel {
-    pub text: String,
+    pub source: ConvertedText,
     pub output: Option<ObjectKey>,
     pub settings: NovelSettings,
+}
+
+/// Immutable, replayable converted text. The caller deletes the staging object
+/// after its last pass; abandoned requests are covered by the store's expiry
+/// journal. No body bytes are retained by this handle.
+#[derive(Clone)]
+pub struct ConvertedText {
+    pub key: ObjectKey,
+    pub size: u64,
+    pub sha256: String,
+    assets: Arc<dyn AssetStore>,
+}
+
+impl std::fmt::Debug for ConvertedText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ConvertedText")
+            .field("key", &self.key)
+            .field("size", &self.size)
+            .field("sha256", &self.sha256)
+            .finish()
+    }
+}
+
+impl ConvertedText {
+    fn from_stage(assets: Arc<dyn AssetStore>, stage: StagedAsset) -> Self {
+        Self { key: stage.key, size: stage.size, sha256: stage.sha256, assets }
+    }
+
+    /// Freeze a cached `novel.txt` using a single streamed read, not a second
+    /// read of its mutable key during the EPUB output pass.
+    pub async fn from_stored(
+        assets: Arc<dyn AssetStore>,
+        key: ObjectKey,
+    ) -> Result<Option<Self>> {
+        let Some(stream) = assets.read_stream(&key).await? else {
+            return Ok(None);
+        };
+        let stage = assets.stage_stream(stream).await?;
+        Ok(Some(Self::from_stage(assets, stage)))
+    }
+
+    /// Every replay verifies the immutable reference through EOF. A truncated
+    /// or corrupt stage is an error, including after earlier chunks were read.
+    pub async fn read_stream(&self) -> Result<AssetStream> {
+        let stream = self.assets.read_stream(&self.key).await?.ok_or_else(|| {
+            NarouError::Platform(format!("converted text snapshot disappeared: {}", self.key))
+        })?;
+        let mut expected_hash = [0u8; 32];
+        hex::decode_to_slice(&self.sha256, &mut expected_hash).map_err(|error| {
+            NarouError::Platform(format!("invalid converted text snapshot digest: {error}"))
+        })?;
+        Ok(Box::pin(futures::stream::try_unfold(
+            (stream, Sha256::new(), 0u64, self.size, expected_hash),
+            |(mut stream, mut hash, read, expected_size, expected_hash)| async move {
+                match stream.next().await {
+                    Some(chunk) => {
+                        let chunk = chunk?;
+                        let read = read.checked_add(chunk.len() as u64).ok_or_else(|| {
+                            NarouError::Platform("converted text snapshot length overflow".into())
+                        })?;
+                        if read > expected_size {
+                            return Err(NarouError::Platform("converted text snapshot grew during replay".into()));
+                        }
+                        hash.update(&chunk);
+                        Ok(Some((chunk, (stream, hash, read, expected_size, expected_hash))))
+                    }
+                    None => {
+                        if read != expected_size {
+                            return Err(NarouError::Platform("converted text snapshot truncated during replay".into()));
+                        }
+                        if <[u8; 32]>::from(hash.finalize()) != expected_hash {
+                            return Err(NarouError::Platform("converted text snapshot checksum mismatch".into()));
+                        }
+                        Ok(None)
+                    }
+                }
+            },
+        )))
+    }
+
+    pub async fn cleanup(&self) -> Result<()> {
+        self.assets.delete(&self.key).await
+    }
+}
+
+const CONVERTED_TEXT_CHUNK_BYTES: usize = 64 * 1024;
+
+struct RenderStreamState {
+    converter: NovelConverter,
+    render: Option<crate::converter::NovelRenderState>,
+    toc: TocObject,
+    sections: SectionStream,
+    pending: std::vec::IntoIter<u8>,
+    emitted: usize,
+}
+
+async fn rendered_sections_stream(
+    mut converter: NovelConverter,
+    toc: TocObject,
+    sections: SectionStream,
+    record: &NovelRecord,
+) -> AssetStream {
+    let (render, header) = converter.begin_novel(None, &toc, toc.subtitles.len(), Some(record));
+    converter.flush_progress().await;
+    Box::pin(futures::stream::try_unfold(
+        RenderStreamState {
+            converter, render: Some(render), toc, sections,
+            pending: header.into_bytes().into_iter(), emitted: 0,
+        },
+        |mut state| async move {
+            loop {
+                if !state.pending.as_slice().is_empty() {
+                    let chunk = state.pending.by_ref().take(CONVERTED_TEXT_CHUNK_BYTES).collect();
+                    if state.pending.as_slice().is_empty() {
+                        state.pending = Vec::new().into_iter();
+                    }
+                    return Ok(Some((chunk, state)));
+                }
+                let Some(render) = state.render.as_mut() else {
+                    return Ok(None);
+                };
+                messages::ready().await;
+                match state.sections.next().await {
+                    Some(section) => {
+                        let section = section?;
+                        if state.emitted >= state.toc.subtitles.len() {
+                            return Err(NarouError::Platform("too many sections in conversion source".into()));
+                        }
+                        let text = state.converter.render_section(render, &state.toc, &section)?;
+                        state.converter.flush_progress().await;
+                        state.pending = text.into_bytes().into_iter();
+                        state.emitted += 1;
+                    }
+                    None => {
+                        if state.emitted != state.toc.subtitles.len() {
+                            return Err(NarouError::Platform("incomplete conversion source".into()));
+                        }
+                        let text = state.converter.finish_novel(
+                            state.render.take().expect("unfinished render"), &state.toc,
+                        )?;
+                        state.converter.flush_progress().await;
+                        state.pending = text.into_bytes().into_iter();
+                    }
+                }
+            }
+        },
+    ))
 }
 
 /// 1 件の変換結果。native `cmd_convert` の per-target 分岐
@@ -65,24 +216,31 @@ where
 {
     const INDEX: usize = 1;
     const TOTAL: usize = 1;
-    sink.emit(
+    sink.emit_async(
         Stream::Stdout,
         &messages::convert::convert_started(TOTAL),
-    );
-    sink.emit(
+    ).await;
+    sink.emit_async(
         Stream::Stdout,
         &messages::convert::processing(INDEX, TOTAL, target),
-    );
-    let (completed, report) = match run().await {
+    ).await;
+    let result = match run().await {
+        Ok(Some(converted)) => match converted.source.cleanup().await {
+            Ok(()) => Ok(Some(converted)),
+            Err(error) => Err(error),
+        },
+        other => other,
+    };
+    let (completed, report) = match result {
         Ok(Some(converted)) => {
             if let Some(output) = &converted.output {
                 let filename = output.as_ref().rsplit('/').next().unwrap_or(output.as_ref());
-                sink.emit(Stream::Stdout, &messages::convert::output_written(filename));
+                sink.emit_async(Stream::Stdout, &messages::convert::output_written(filename)).await;
             }
-            sink.emit(
+            sink.emit_async(
                 Stream::Stdout,
                 &messages::convert::completed(INDEX, TOTAL, target),
-            );
+            ).await;
             (
                 1,
                 ConvertItemReport::Converted {
@@ -91,21 +249,21 @@ where
             )
         }
         Ok(None) => {
-            sink.emit(Stream::Stdout, &messages::convert::id_missing(id));
+            sink.emit_async(Stream::Stdout, &messages::convert::id_missing(id)).await;
             (0, ConvertItemReport::Missing)
         }
         Err(error) => {
-            sink.emit(
+            sink.emit_async(
                 Stream::Stdout,
                 &messages::convert::item_error(INDEX, TOTAL, target, &error),
-            );
+            ).await;
             (0, ConvertItemReport::Failed { error })
         }
     };
-    sink.emit(
+    sink.emit_async(
         Stream::Stdout,
         &messages::convert::convert_finished(completed, TOTAL),
-    );
+    ).await;
     report
 }
 
@@ -185,9 +343,8 @@ impl ConvertService {
     /// 戻り値の `output` は native の出力ファイルパス相当 (表示名は末尾の
     /// `novel.txt`) で、コンソールの `{name} を出力しました` 行が使う。
     ///
-    /// 本文は目次順に全話読む。native `load_sections_from_dir` と同じく、
-    /// 目次にあるのに本文が無い話はエラーで止める (不完全な novel.txt を
-    /// 成功として書かない)。
+    /// 本文は一話ずつ読み、世代と内容ハッシュを検証してから公開する。
+    /// 目次にある本文が欠ける場合は既存の出力を変更しない。
     pub async fn convert_and_store(&self, record: &NovelRecord) -> Result<ConvertedNovel> {
         self.convert_inner(record, true, None).await
     }
@@ -200,13 +357,13 @@ impl ConvertService {
         self.convert_inner(record, false, None).await
     }
 
-    /// Convert an assembled book with the target novel's settings, replacements
-    /// and metadata, without rereading its member sections.
-    pub async fn convert_prepared(
+    /// Convert an owned, ordered source (including virtual-book members).
+    /// The source must report generation/hash changes as errors before EOF.
+    pub async fn convert_source(
         &self,
         record: &NovelRecord,
         toc: TocFile,
-        sections: Vec<SectionFile>,
+        sections: SectionStream,
         store: bool,
     ) -> Result<ConvertedNovel> {
         self.convert_inner(record, store, Some((toc, sections))).await
@@ -216,7 +373,7 @@ impl ConvertService {
         &self,
         record: &NovelRecord,
         store: bool,
-        source: Option<(TocFile, Vec<SectionFile>)>,
+        source: Option<(TocFile, SectionStream)>,
     ) -> Result<ConvertedNovel> {
         let keys = NovelObjectKeys::new(
             &record.sitename,
@@ -243,15 +400,26 @@ impl ConvertService {
                 self.read_text(&converter_key).await
             },
         );
-        let (toc, sections) = source?;
-        if sections.is_empty() {
+        let (toc, mut sections) = source?;
+        if toc.subtitles.is_empty() {
             return Err(NarouError::Platform(format!(
                 "本文がありません: {}",
                 keys.prefix().as_ref()
             )));
         }
 
-        let ini = ini?;
+        let inputs = (|| Ok::<_, NarouError>((ini?, replacement?, converter_yaml?)))();
+        let (ini, replacement, converter_yaml) = match inputs {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                // Preserve source-before-settings error precedence without
+                // eagerly retaining all source sections on the successful path.
+                while let Some(section) = sections.next().await {
+                    section?;
+                }
+                return Err(error);
+            }
+        };
         let local_settings = local_settings.unwrap_or_default();
         let mut settings = NovelSettings::from_sources(
             Some(record.id),
@@ -262,18 +430,19 @@ impl ConvertService {
             false,
             false,
         );
-        if let Some(text) = replacement? {
+        if let Some(text) = replacement {
             // 小説ごとの replace.txt。全体設定側 (インストール先) は native 専用。
             settings.replace_patterns = parse_replace_patterns(&text);
         }
-        let user_converter = match converter_yaml? {
+        let user_converter = match converter_yaml {
             Some(yaml) => {
                 UserConverter::from_yaml(&yaml, &settings.title_for_output(&record.title))
             }
             None => None,
         };
 
-        let mut converter =
+        let result_settings = settings.clone();
+        let converter =
             NovelConverter::build(settings, user_converter, self.capabilities.clone());
         let toc_object = TocObject {
             title: toc.title,
@@ -283,7 +452,9 @@ impl ConvertService {
             subtitles: toc.subtitles,
             novel_type: toc.novel_type,
         };
-        let text = converter.convert_novel(&toc_object, &sections, Some(record))?;
+        let stream = rendered_sections_stream(converter, toc_object, sections, record).await;
+        let stage = self.assets.stage_stream(stream).await?;
+        let source = ConvertedText::from_stage(self.assets.clone(), stage);
         let output = keys.converted_text();
         // `convert.keep-txt` の解釈は native のファイル経路 (`converter::mod`)
         // と Worker で共有する (`setting_core::keep_converted_text`)。既定は
@@ -294,38 +465,23 @@ impl ConvertService {
             true,
         );
         let output = if store && keep_text {
-            self.objects
-                .write_small(&output, text.clone().into_bytes())
-                .await?;
+            if let Err(error) = self.assets.copy(&source.key, &output).await {
+                let _ = source.cleanup().await;
+                return Err(error);
+            }
             Some(output)
         } else {
             None
         };
-        Ok(ConvertedNovel { text, output, settings: converter.into_settings() })
+        Ok(ConvertedNovel { source, output, settings: result_settings })
     }
 
-    async fn load_source(&self, keys: &NovelObjectKeys) -> Result<(TocFile, Vec<SectionFile>)> {
+    async fn load_source(&self, keys: &NovelObjectKeys) -> Result<(TocFile, SectionStream)> {
         let persistence = PersistenceService::new(self.objects.clone(), self.assets.clone());
         let toc = persistence.load_toc(keys).await?.ok_or_else(|| {
             NarouError::Platform(format!("toc がありません: {}", keys.toc().as_ref()))
         })?;
-        let sections = match persistence.load_sections_ordered(keys, &toc.subtitles).await {
-            Ok(sections) => sections,
-            Err(SectionLoadFailure::Missing { section_index }) => {
-                let subtitle = &toc.subtitles[section_index];
-                let section_key = keys.section(&subtitle.index, &subtitle.file_subtitle);
-                let key: &str = section_key.as_ref();
-                let filename = key.rsplit('/').next().unwrap_or(key);
-                return Err(NarouError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "section file not found: expected '{filename}' in {}/本文",
-                        keys.prefix().as_ref()
-                    ),
-                )));
-            }
-            Err(SectionLoadFailure::Read(error)) => return Err(error),
-        };
+        let sections = persistence.stream_sections_snapshot(keys.clone(), toc.clone());
         Ok((toc, sections))
     }
 
@@ -355,6 +511,15 @@ mod tests {
     use crate::downloader::types::{SectionElement, SubtitleInfo, TocFile};
     use crate::platform::mocks::MemoryObjectStore;
     use futures::executor::block_on;
+
+    async fn collected_text(source: &ConvertedText) -> String {
+        let mut stream = source.read_stream().await.unwrap();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend(chunk.unwrap());
+        }
+        String::from_utf8(bytes).unwrap()
+    }
 
     /// `NAROU_RS_KEEP_TXT` が設定された環境でもテスト結果が変わらないよう、
     /// テストの間だけ外す。プロセス共通の env を触るため、既存の全体ロックを
@@ -387,6 +552,184 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn streaming_fixture(count: usize, body: &str) -> (TocFile, Vec<SectionFile>) {
+        let mut subtitles = Vec::new();
+        let mut sections = Vec::new();
+        for index in 1..=count {
+            let subtitle = SubtitleInfo {
+                index: index.to_string(), href: format!("https://example.test/{index}"),
+                chapter: if index == 1 { "章".into() } else { String::new() },
+                subchapter: "節".into(), subtitle: format!("第{index}話"),
+                file_subtitle: format!("第{index}話"), subdate: String::new(),
+                subupdate: None, download_time: None, download_revision: 0,
+            };
+            sections.push(SectionFile {
+                index: subtitle.index.clone(), href: subtitle.href.clone(),
+                chapter: subtitle.chapter.clone(), subchapter: subtitle.subchapter.clone(),
+                subtitle: subtitle.subtitle.clone(), file_subtitle: subtitle.file_subtitle.clone(),
+                subdate: String::new(), subupdate: None, download_time: None, download_revision: 0,
+                element: SectionElement {
+                    data_type: "text".into(), introduction: "前書き".into(),
+                    body: body.into(), postscript: "後書き".into(),
+                },
+            });
+            subtitles.push(subtitle);
+        }
+        (TocFile {
+            title: "作品".into(), author: "作者".into(), toc_url: "https://example.test/".into(),
+            story: Some("あらすじ".into()), subtitles, novel_type: Some(1),
+        }, sections)
+    }
+
+    fn toc_object(toc: TocFile) -> TocObject {
+        TocObject {
+            title: toc.title, author: toc.author, toc_url: toc.toc_url,
+            story: toc.story, subtitles: toc.subtitles, novel_type: toc.novel_type,
+        }
+    }
+
+    #[test]
+    fn section_render_stream_obeys_backpressure_and_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = reads.clone();
+        let (toc, sections) = streaming_fixture(3, &"あ".repeat(50_000));
+        let source: SectionStream = Box::pin(futures::stream::iter(sections).map(move |section| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(section)
+        }));
+        let converter = NovelConverter::build(NovelSettings {
+            enable_inspect: false, ..NovelSettings::default()
+        }, None, None);
+        block_on(async {
+            let mut stream = rendered_sections_stream(converter, toc_object(toc), source, &record(1)).await;
+            let header = stream.next().await.unwrap().unwrap();
+            assert!(header.len() <= CONVERTED_TEXT_CHUNK_BYTES);
+            assert_eq!(reads.load(Ordering::SeqCst), 0);
+            for _ in 0..2 {
+                let chunk = stream.next().await.unwrap().unwrap();
+                assert!(chunk.len() <= CONVERTED_TEXT_CHUNK_BYTES);
+                assert_eq!(reads.load(Ordering::SeqCst), 1);
+            }
+            drop(stream);
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn streamed_conversion_preserves_complete_section_regex_and_native_bytes() {
+        let body = format!(
+            "{}跨ぎ開始\n跨ぎ終わり\n漢字《かんじ》",
+            "あ".repeat((CONVERTED_TEXT_CHUNK_BYTES - 7) / 3),
+        );
+        let (toc, sections) = streaming_fixture(2, &body);
+        let user = UserConverter::from_yaml(
+            "before:\n  - pattern: '跨ぎ開始\\n跨ぎ終わり'\n    replacement: '境界を越える'\n    text_type: [body]\n",
+            &toc.title,
+        ).unwrap();
+        let target = record(1);
+        for style in ["default", "simple", "plain"] {
+            let settings = NovelSettings {
+                author_comment_style: style.into(), enable_inspect: false,
+                enable_auto_join_line: false, ..NovelSettings::default()
+            };
+            let toc = toc_object(toc.clone());
+            let expected = NovelConverter::build(settings.clone(), Some(user.clone()), None)
+                .convert_novel(&toc, &sections, Some(&target)).unwrap();
+            let source: SectionStream = Box::pin(futures::stream::iter(
+                sections.clone().into_iter().map(Ok),
+            ));
+            let stream = rendered_sections_stream(
+                NovelConverter::build(settings, Some(user.clone()), None), toc, source, &target,
+            );
+            let actual = block_on(async {
+                let mut stream = stream.await;
+                let mut bytes = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.unwrap();
+                    assert!(chunk.len() <= CONVERTED_TEXT_CHUNK_BYTES);
+                    bytes.extend(chunk);
+                }
+                String::from_utf8(bytes).unwrap()
+            });
+            assert_eq!(actual, expected, "author comment style {style}");
+            assert!(actual.contains("境界を越える"));
+            assert!(!actual.contains("跨ぎ開始"));
+            assert!(actual.contains("漢字《かんじ》"));
+            assert!(actual.contains("前書き") && actual.contains("後書き"));
+        }
+    }
+
+    #[test]
+    fn cached_text_snapshot_is_immutable_replayable_and_explicitly_cleaned() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let key = ObjectKey::try_new("novels/site/book/novel.txt").unwrap();
+        block_on(async {
+            store.write_small(&key, b"first generation".to_vec()).await.unwrap();
+            let source = ConvertedText::from_stored(store.clone(), key.clone()).await.unwrap().unwrap();
+            store.write_small(&key, b"second generation".to_vec()).await.unwrap();
+            assert_eq!(collected_text(&source).await, "first generation");
+            assert_eq!(collected_text(&source).await, "first generation");
+            assert_eq!(source.size, 16);
+            source.cleanup().await.unwrap();
+            assert!(AssetStore::stat(store.as_ref(), &source.key).await.unwrap().is_none());
+            assert_eq!(store.read_small(&key).await.unwrap().unwrap(), b"second generation");
+        });
+    }
+
+    #[test]
+    fn snapshot_replay_rejects_corruption_and_truncation_at_eof() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let key = ObjectKey::try_new("novels/site/book/novel.txt").unwrap();
+        block_on(async {
+            store.write_small(&key, b"snapshot".to_vec()).await.unwrap();
+            let source = ConvertedText::from_stored(store.clone(), key).await.unwrap().unwrap();
+            for (bytes, message) in [
+                (&b"tampered"[..], "checksum mismatch"),
+                (&b"short"[..], "truncated"),
+            ] {
+                store.write_small(&source.key, bytes.to_vec()).await.unwrap();
+                let mut stream = source.read_stream().await.unwrap();
+                let mut failed = false;
+                while let Some(chunk) = stream.next().await {
+                    if let Err(error) = chunk {
+                        assert!(error.to_string().contains(message), "{error}");
+                        failed = true;
+                        break;
+                    }
+                }
+                assert!(failed, "corruption must not become successful EOF");
+                assert!(stream.next().await.is_none());
+            }
+            source.cleanup().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn failed_section_stream_does_not_replace_existing_output() {
+        let _env = KeepTxtEnvGuard::cleared();
+        let store = Arc::new(MemoryObjectStore::new());
+        let service = ConvertService::new(
+            store.clone(), store.clone(),
+            Arc::new(crate::application::settings::MemorySettingsStore::new()),
+        );
+        let target = record(1);
+        let keys = NovelObjectKeys::new(&target.sitename, &target.file_title, false).unwrap();
+        let (toc, mut sections) = streaming_fixture(2, "本文");
+        let source: SectionStream = Box::pin(futures::stream::iter([
+            Ok(sections.remove(0)), Err(NarouError::Platform("source generation changed".into())),
+        ]));
+        block_on(async {
+            store.write_small(&keys.converted_text(), b"previous output".to_vec()).await.unwrap();
+            let error = service.convert_source(&target, toc, source, true).await.unwrap_err();
+            assert!(error.to_string().contains("source generation changed"));
+            assert_eq!(
+                store.read_small(&keys.converted_text()).await.unwrap().unwrap(),
+                b"previous output",
+            );
+        });
     }
 
     fn record(id: i64) -> NovelRecord {
@@ -495,7 +838,7 @@ mod tests {
                 .unwrap();
             let converted = service.convert_and_store(&target).await.unwrap();
             assert_eq!(converted.output, Some(keys.converted_text()));
-            let text = &converted.text;
+            let text = collected_text(&converted.source).await;
             assert_eq!(text.lines().next(), Some("テスト小説 [example/2001-02-03] (完結)"));
             assert!(text.contains("本文の一行目。"), "{text}");
             assert!(text.contains("第一話"), "{text}");
@@ -707,13 +1050,14 @@ mod tests {
                 .await
                 .unwrap();
             let converted = service.convert_and_store(&target).await.unwrap();
-            let first_at = converted.text.find("みかん").unwrap();
-            let second_at = converted.text.find("りんご").unwrap();
-            let third_at = converted.text.find("ぶどう").unwrap();
+            let text = collected_text(&converted.source).await;
+            let first_at = text.find("みかん").unwrap();
+            let second_at = text.find("りんご").unwrap();
+            let third_at = text.find("ぶどう").unwrap();
             assert!(
                 first_at < second_at && second_at < third_at,
                 "sections must keep TOC order: {}",
-                converted.text
+                text
             );
         });
     }
@@ -787,7 +1131,8 @@ mod tests {
                 .unwrap();
 
             let converted = service.convert_and_store(&target).await.unwrap();
-            assert!(converted.text.contains("本文。"), "{}", converted.text);
+            let text = collected_text(&converted.source).await;
+            assert!(text.contains("本文。"), "{text}");
             assert!(converted.output.is_none());
             assert!(
                 store

@@ -44,8 +44,7 @@ pub struct DispatchOutcome {
 pub const JOB_QUEUE_BINDING: &str = "NAROU_JOBS";
 const CONVERT_QUEUE_BINDING: &str = "CONVERT_QUEUE";
 
-/// ジョブ中に更新された section hash cache の保留分
-/// (`app_state('inv','section_hash_cache')` と同じ `小説 → (section → digest)` の形)。
+/// Only the current job's novel hashes await persistence; never a library snapshot.
 pub type PendingSectionHashCache =
     Arc<parking_lot::Mutex<Option<HashMap<String, HashMap<String, String>>>>>;
 
@@ -92,11 +91,8 @@ pub struct WorkerRuntime {
     write_objects: Arc<dyn ObjectStore>,
     pub clock: Arc<dyn Clock>,
     site_settings: Arc<Vec<SiteSetting>>,
-    /// D1 ハンドル（資格情報ストアと設定スナップショットが使う）。UI 経路は
-    /// `first-unconstrained` セッション、ジョブ経路は primary 直行になる。
-    db: DbHandle,
     /// 更新系の D1 ハンドル。常に primary 直行 — read replica の遅延中に
-    /// 書き込み判断の読み取りを行わせない。ジョブ経路では `db` と同じ値。
+    /// 書き込み判断の読み取りを行わせない。
     write_db: DbHandle,
     /// 保存済みログイン資格情報。Downloader・HTTP クライアント・管理 API が
     /// 同じ実体を共有する。`D1CookieStore` は読み取り自体が旧形式の畳み直し
@@ -105,10 +101,8 @@ pub struct WorkerRuntime {
     /// Shared subrequest counter for this invocation; the executor reads it
     /// at section boundaries via `WorkerBudget`.
     pub subrequests: crate::budget::SubrequestBudget,
-    /// ダウンロード中に更新された section hash cache の書き戻し窓口。
-    /// `SnapshotDownloaderSettings::save_section_hash_cache` (同期) がここへ
-    /// 置き、ジョブ終了時に [`Self::persist_pending_section_hash_cache`] が
-    /// D1 (`app_state('inv','section_hash_cache')`) へ flush する。
+    stage_store: Option<Arc<S3Store>>,
+    /// Invocation-local hashes, flushed to per-novel D1 rows after the job.
     pub pending_section_hash_cache: PendingSectionHashCache,
 }
 
@@ -127,7 +121,7 @@ enum CompositionProfile {
 /// (`/api/storage/mode` は 501 で Worker からは書き換わらないが、手動 SQL
 /// などで切り替えた直後のずれを最小化する)。
 static ASSET_BACKEND_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<AssetBackend>> =
-    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(5_000.0));
+    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(5_000.0, 1024, |_| 16));
 
 /// 挿絵の保存先を読む。D1 の TEXT は JSON を含む文字列なので明示的に
 /// decode する。旧構成の raw TEXT `d1` / `s3` も明示的に受け付ける。
@@ -170,6 +164,13 @@ pub(crate) fn required_s3(env: &Env) -> worker::Result<bool> {
         .map_err(|error| worker::Error::RustError(error.to_string()))
 }
 
+struct WorkerObjectStores {
+    objects: Arc<dyn ObjectStore>,
+    assets: Arc<dyn AssetStore>,
+    s3_illustrations: Option<Arc<S3Store>>,
+    stage_store: Option<Arc<S3Store>>,
+}
+
 /// オブジェクトの保存先を組み立てる。
 ///
 /// 本文は未設定なら S3 を選び、既存の D1 本文は migrating で保持する。
@@ -180,11 +181,7 @@ async fn build_object_stores(
     db: &DbHandle,
     subrequests: crate::budget::SubrequestBudget,
     fresh: bool,
-) -> worker::Result<(
-    Arc<dyn ObjectStore>,
-    Arc<dyn AssetStore>,
-    Option<Arc<S3Store>>,
-)> {
+) -> worker::Result<WorkerObjectStores> {
     let required = required_s3(env)?;
     let backend = read_asset_backend(db, fresh).await?.resolve(required);
     // Initialize the S3 default only after S3 configuration has been resolved.
@@ -209,6 +206,7 @@ async fn build_object_stores(
         Some(store) => (store.clone(), store.clone()),
         None => (d1.clone(), d1.clone()),
     };
+    let stage_store = s3.clone();
     let primary: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) = match (content_backend, s3) {
         (crate::content_store::ContentBackend::D1, _) => (d1.clone(), d1),
         (_, Some(store)) => {
@@ -217,85 +215,56 @@ async fn build_object_stores(
         }
         _ => return Err(worker::Error::RustError("content S3 storage is unavailable".into())),
     };
-    let split: Arc<SplitStore> = Arc::new(SplitStore::new(primary, illustrations));
-    Ok((split.clone(), split, s3_handle))
+    let mut split = SplitStore::new(primary, illustrations);
+    if let Some(store) = &stage_store {
+        split = split.with_staging((store.clone(), store.clone()));
+    }
+    let split = Arc::new(split);
+    Ok(WorkerObjectStores {
+        objects: split.clone(),
+        assets: split,
+        s3_illustrations: s3_handle,
+        stage_store,
+    })
 }
 
-/// `app_state(scope='inv', key='section_hash_cache')` を読む。
-///
-/// native が Inventory に保存する強更新用ハッシュキャッシュ
-/// (`SECTION_HASH_CACHE_NAME`) と同じキー名。`Downloader` の起動時
-/// スナップショットとして渡すだけなので、行が無い・値が壊れている場合は
-/// 空 map にする（キャッシュは fail-open で良い）。
-/// isolate ごとの section hash cache。ダウンロードが書き換えても、
-/// 同じ値を使い続けても支障が無い (強更新の判定ヒント) ため TTL で十分。
+/// Hash hints are loaded by novel id, with a bounded immutable warm cache.
+type SectionHashes = HashMap<String, String>;
 static SECTION_HASH_CACHE: std::sync::LazyLock<
-    crate::isolate_cache::TtlMap<HashMap<String, HashMap<String, String>>>,
-> = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+    crate::isolate_cache::TtlMap<Arc<SectionHashes>>,
+> = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(
+    30_000.0, 1024 * 1024, |hashes| {
+        hashes.capacity() * (std::mem::size_of::<(String, String)>() + 16)
+            + hashes.iter().map(|(key, value)| key.capacity() + value.capacity()).sum::<usize>()
+    },
+));
 
-async fn load_section_hash_cache(db: &DbHandle) -> HashMap<String, HashMap<String, String>> {
-    if let Some(cached) = SECTION_HASH_CACHE.get("section_hash_cache") {
-        return cached;
+async fn load_section_hash_cache(db: &DbHandle, id: i64) -> Result<HashMap<String, SectionHashes>> {
+    let key = id.to_string();
+    if let Some(cached) = SECTION_HASH_CACHE.get(&key) {
+        return Ok(HashMap::from([(key, (*cached).clone())]));
     }
-    let row: Option<(Option<String>, Option<String>)> = db
-        .prepare(
-            "SELECT value_yaml, value_json FROM app_state WHERE scope = 'inv' AND key = 'section_hash_cache'",
-        )
-        .first(None)
-        .await
-        .unwrap_or_default();
-    let Some((yaml, json)) = row else {
-        return HashMap::new();
-    };
-    let payload = yaml.filter(|value| !value.trim().is_empty()).or(json);
-    let resolved: HashMap<String, HashMap<String, String>> = payload
-        .and_then(|value| serde_yaml::from_str(&value).ok())
-        .unwrap_or_default();
-    SECTION_HASH_CACHE.put("section_hash_cache", resolved.clone());
-    resolved
+    let value = db.prepare("SELECT digests_json FROM novel_section_hashes WHERE novel_id = ?")
+        .bind(&[wasm_bindgen::JsValue::from_str(&key)])
+        .map_err(|error| NarouError::Platform(error.to_string()))?
+        .first::<String>(Some("digests_json")).await
+        .map_err(|error| NarouError::Platform(error.to_string()))?;
+    let hashes: SectionHashes = value.and_then(|value| serde_json::from_str(&value).ok()).unwrap_or_default();
+    SECTION_HASH_CACHE.put(key.clone(), Arc::new(hashes.clone()));
+    Ok(HashMap::from([(key, hashes)]))
 }
 
-
-/// ダウンロードで更新された section hash cache を `app_state` へ書き戻す。
-///
-/// `SnapshotDownloaderSettings` は同期 trait なので直接 D1 を書けず、代わりに
-/// 最新のキャッシュを pending スロットへ置く。ここでは pending 値を、保存済みの
-/// 行 (読みは `load_section_hash_cache` と同じ fail-open 規則) に小説ごと
-/// マージしてから上書きする — 1 冊だけ更新したジョブが他冊のハッシュを消さない
-/// ようにするため。書き戻した値で isolate キャッシュも更新する。
-async fn persist_section_hash_cache(
-    db: &DbHandle,
-    pending: HashMap<String, HashMap<String, String>>,
-) -> Result<()> {
-    let mut merged = load_section_hash_cache(db).await;
-    for (novel_id, digests) in pending {
-        merged.insert(novel_id, digests);
+async fn persist_section_hash_cache(db: &DbHandle, pending: HashMap<String, SectionHashes>) -> Result<()> {
+    for (id, hashes) in pending {
+        let json = serde_json::to_string(&hashes).map_err(|error| NarouError::Platform(error.to_string()))?;
+        db.prepare(
+            "INSERT INTO novel_section_hashes (novel_id, digests_json) VALUES (?, ?)
+             ON CONFLICT(novel_id) DO UPDATE SET digests_json = excluded.digests_json",
+        ).bind(&[wasm_bindgen::JsValue::from_str(&id), wasm_bindgen::JsValue::from_str(&json)])
+            .map_err(|error| NarouError::Platform(error.to_string()))?
+            .run().await.map_err(|error| NarouError::Platform(error.to_string()))?;
+        SECTION_HASH_CACHE.put(id, Arc::new(hashes));
     }
-    let value_yaml = serde_yaml::to_string(&merged).map_err(|error| {
-        narou_rs::error::NarouError::Platform(format!(
-            "section hash cache YAML serialization: {error}"
-        ))
-    })?;
-    let value_json = serde_json::to_string(&merged).map_err(|error| {
-        narou_rs::error::NarouError::Platform(format!(
-            "section hash cache JSON serialization: {error}"
-        ))
-    })?;
-    db.prepare(
-        "INSERT INTO app_state (scope, key, value_yaml, value_json)
-         VALUES ('inv', 'section_hash_cache', ?, ?)
-         ON CONFLICT (scope, key) DO UPDATE SET
-           value_yaml = excluded.value_yaml, value_json = excluded.value_json",
-    )
-    .bind(&[
-        wasm_bindgen::JsValue::from_str(&value_yaml),
-        wasm_bindgen::JsValue::from_str(&value_json),
-    ])
-    .map_err(|error| narou_rs::error::NarouError::Platform(format!("{error}")))?
-    .run()
-    .await
-    .map_err(|error| narou_rs::error::NarouError::Platform(format!("{error}")))?;
-    SECTION_HASH_CACHE.put("section_hash_cache", merged);
     Ok(())
 }
 
@@ -317,12 +286,8 @@ impl WorkerRuntime {
     /// セッション生成に失敗した場合 (`wrangler dev` のローカル D1 など
     /// セッション API 未対応の環境) は primary にフォールバックする。
     ///
-    /// UI ハンドラはサイト定義のコンパイル済み設定を必要としないため、
-    /// ダウンローダ専用の重い読み込み (`load_site_settings` のオブジェクト
-    /// ストア LIST、`load_section_hash_cache`) は行わない。`site_settings`
-    /// は空になり、`new_downloader` は job 経路 (`build`) 専用。
-    /// (旧ホストキーを畳む `D1CookieStore` は必要なときだけ同じ
-    ///  `load_site_settings` を遅延呼び出しする。ビルド時には読まない。)
+    /// UI composition reuses the bounded compiled-site cache. Section hashes
+    /// are fetched only when `new_downloader` resolves its one target novel.
     pub async fn build_ui(env: &Env) -> worker::Result<Self> {
         let db = DbHandle::ui(Arc::new(env.d1("DB")?));
         let write_db = DbHandle::primary(Arc::new(env.d1("DB")?));
@@ -339,12 +304,13 @@ impl WorkerRuntime {
         profile: CompositionProfile,
     ) -> worker::Result<Self> {
         let subrequests = crate::budget::SubrequestBudget::new();
-        let (write_objects, write_assets, _s3_illustrations_write) =
-            build_object_stores(env, &write_db, subrequests.clone(), true).await?;
+        let WorkerObjectStores {
+            objects: write_objects, assets: write_assets, stage_store, ..
+        } = build_object_stores(env, &write_db, subrequests.clone(), true).await?;
         let (objects, assets) = match profile {
             CompositionProfile::Job => (write_objects.clone(), write_assets),
             CompositionProfile::Ui => {
-                let (objects, assets, _) =
+                let WorkerObjectStores { objects, assets, .. } =
                     build_object_stores(env, &db, subrequests.clone(), false).await?;
                 (objects, assets)
             }
@@ -427,7 +393,7 @@ impl WorkerRuntime {
             Arc::new(D1TagColorStore::new(db.clone())),
             clock.clone(),
             site_rules.clone(),
-            db.clone(),
+            db,
             env,
         );
         let write_services = services_from(
@@ -457,9 +423,9 @@ impl WorkerRuntime {
             assets,
             write_objects,
             subrequests,
+            stage_store,
             clock,
             site_settings,
-            db,
             write_db,
             cookie_store,
             pending_section_hash_cache: Arc::new(parking_lot::Mutex::new(None)),
@@ -480,13 +446,22 @@ impl WorkerRuntime {
     /// settings are a per-invocation snapshot of `app_state`: local scope
     /// (`update.strong` / `guard-spoiler` / `auto-add-tags` /
     /// `download.use-subdirectory` / `economy`), global scope (`over18`), and the
-    /// `inv`-scope section hash cache. Unset booleans and age confirmation keep
+    /// selected novel's section hashes. Unset booleans and age confirmation keep
     /// native's `false` / `None` defaults; `None` leaves the confirmation path
     /// intact and the executor reports `Blocked`. Diff snapshots are saved
     /// unless economy contains `nosave_diff`; raw HTML stays unsaved on Worker.
-    pub async fn new_downloader(&self) -> Result<Downloader> {
+    pub async fn new_downloader(&self, target: &JobTarget) -> Result<Downloader> {
+        let record = match target {
+            JobTarget::Id(id) => self.novels.get(*id).await?,
+            JobTarget::Ncode(ncode) => self.novels.find_by_ncode(ncode).await?,
+            JobTarget::Url(url) => self.novels.find_by_toc_url(url).await?,
+            JobTarget::All => None,
+        };
+        let section_hash_cache = match record {
+            Some(record) => load_section_hash_cache(&self.write_db, record.id).await?,
+            None => HashMap::new(),
+        };
         let settings = self.downloader_settings().await?;
-        let section_hash_cache = settings.load_section_hash_cache();
         let downloader = Downloader::with_platform_and_storage_and_settings_and_support(
             narou_rs::downloader::DownloaderPlatform {
                 http: self.http.clone(),
@@ -542,33 +517,29 @@ impl WorkerRuntime {
         let over18 = global_values
             .get("over18")
             .and_then(narou_rs::setting_core::setting_bool_value);
-        let section_hash_cache = load_section_hash_cache(&self.db).await;
         Ok(Arc::new(
-            SnapshotDownloaderSettings::new(local, over18, section_hash_cache)
+            SnapshotDownloaderSettings::new(local, over18, HashMap::new())
                 .with_economy(local_values.get("economy"))
                 .with_pending_section_hash_save(self.pending_section_hash_cache.clone()),
         ))
     }
 
-    /// ダウンロードで更新された section hash cache があれば D1 へ書き戻す。
-    ///
-    /// `Downloader::flush_section_hash_cache` は `save_section_hash_cache`
-    /// (同期) 経由で `pending_section_hash_cache` に置くだけなので、ジョブ
-    /// 1 件ごとの区切りでここを呼んで `app_state('inv','section_hash_cache')`
-    /// を永続化する (`update.strong` のヒット率が native と揃う)。
-    /// 保存するのは「最新スナップショット」なので、未配線・未更新なら何もしない。
-    /// 書き戻しは判定ヒントの延長で、失敗しても呼び出し側でログだけ残す。
+    /// Flush this invocation's current-novel hints without reading other books.
     pub async fn persist_pending_section_hash_cache(&self) -> Result<()> {
         let pending = self.pending_section_hash_cache.lock().take();
         let Some(pending) = pending else {
             return Ok(());
         };
-        // マージ元はキャッシュ値ではなく最新の行とする。キャッシュ済み
-        // スナップショットを起点にすると、他 isolate が書き込んだ冊の
-        // ハッシュを古い map で消してしまう (読み取り系のキャッシュ更新は
-        // `load_section_hash_cache` 側の通常経路に任せる)。
-        SECTION_HASH_CACHE.invalidate("section_hash_cache");
+        // Each novel owns an independent row: no library-wide read/merge/write.
         persist_section_hash_cache(&self.write_db, pending).await
+    }
+
+    pub(crate) async fn collect_expired_assets(&self) -> Result<()> {
+        D1ObjectStore::new(self.write_db.clone()).collect_expired_stages(16).await?;
+        if let Some(store) = &self.stage_store {
+            store.collect_expired_stages(16).await?;
+        }
+        Ok(())
     }
 
     /// 管理 API 用の具体ハンドル（診断用メソッドを持つ）。
@@ -1022,7 +993,7 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     // セッション、失敗時は primary) で組み立てる。
     let db = DbHandle::ui(Arc::new(env.d1("DB")?));
     let subrequests = crate::budget::SubrequestBudget::new();
-    let (objects, assets, s3_illustrations) =
+    let WorkerObjectStores { objects, assets, s3_illustrations, .. } =
         build_object_stores(env, &db, subrequests, false).await?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
@@ -1066,7 +1037,7 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
 pub async fn build_mutation_services(env: &Env) -> worker::Result<AppServices> {
     let db = DbHandle::primary(Arc::new(env.d1("DB")?));
     let subrequests = crate::budget::SubrequestBudget::new();
-    let (objects, _assets, _s3_illustrations) =
+    let WorkerObjectStores { objects, .. } =
         build_object_stores(env, &db, subrequests, true).await?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::for_writes(db.clone()));

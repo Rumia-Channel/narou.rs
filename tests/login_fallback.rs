@@ -88,6 +88,17 @@ impl HttpClient for LoginWallClient {
             })
         })
     }
+
+    fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, narou_rs::error::Result<narou_rs::platform::HttpStreamResponse>> {
+        let url = request.url.clone();
+        Box::pin(async move {
+            let response = self.send(request).await?;
+            Ok(narou_rs::platform::HttpStreamResponse {
+                status: response.status, url, headers: response.headers,
+                body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
+            })
+        })
+    }
 }
 
 #[tokio::test]
@@ -267,6 +278,17 @@ impl HttpClient for PerNovelClient {
             })
         })
     }
+
+    fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, narou_rs::error::Result<narou_rs::platform::HttpStreamResponse>> {
+        let url = request.url.clone();
+        Box::pin(async move {
+            let response = self.send(request).await?;
+            Ok(narou_rs::platform::HttpStreamResponse {
+                status: response.status, url, headers: response.headers,
+                body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
+            })
+        })
+    }
 }
 
 /// The unit is the novel: a work that fetches anonymously must never carry a
@@ -421,6 +443,17 @@ impl HttpClient for RedirectCookieClient {
             Ok(HttpResponse { status,
                 headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
                 body: body.into_bytes() })
+        })
+    }
+
+    fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, narou_rs::error::Result<narou_rs::platform::HttpStreamResponse>> {
+        let url = request.url.clone();
+        Box::pin(async move {
+            let response = self.send(request).await?;
+            Ok(narou_rs::platform::HttpStreamResponse {
+                status: response.status, url, headers: response.headers,
+                body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
+            })
         })
     }
 }

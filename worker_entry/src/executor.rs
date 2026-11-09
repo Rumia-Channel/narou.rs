@@ -143,6 +143,7 @@ pub async fn execute_job(
     let context = messages::MessageContext::new(
         push_sink.clone(), crate::consumer::webui_debug_mode(runtime).await,
     );
+    push_sink.run(async {
     let outcome = context.scope(async {
 
     if let Err(error) = runtime.ledger.ensure_execution_active(job_id, execution_token).await {
@@ -157,10 +158,10 @@ pub async fn execute_job(
         };
         let result: Result<()> = async {
             if !runtime.author_service().list().await?.iter().any(|author| JobTarget::parse(&author.url).as_ref() == Some(&job.target)) {
-                push_sink.emit(messages::Stream::Stdout, &messages::author::untracked(url));
+                push_sink.emit_async(messages::Stream::Stdout, &messages::author::untracked(url)).await;
                 return Ok(());
             }
-            push_sink.emit(messages::Stream::Stdout, &messages::author::checking(url));
+            push_sink.emit_async(messages::Stream::Stdout, &messages::author::checking(url)).await;
             let urls = runtime.author_work_urls(url).await?;
             // Removal while discovery was running must also stop new fan-out.
             if !runtime.author_service().list().await?.iter().any(|author| JobTarget::parse(&author.url).as_ref() == Some(&job.target)) {
@@ -171,7 +172,7 @@ pub async fn execute_job(
                 kind: JobKind::Download, target: JobTarget::Url(url), options: Vec::new(),
             }).collect();
             runtime.enqueue_batch(&plans).await?;
-            push_sink.emit(messages::Stream::Stdout, &messages::author::queued(url, plans.len()));
+            push_sink.emit_async(messages::Stream::Stdout, &messages::author::queued(url, plans.len())).await;
             if !plans.is_empty() { crate::consumer::notify_queue_changed(push).await; }
             Ok(())
         }.await;
@@ -200,12 +201,12 @@ pub async fn execute_job(
         let sink = &push_sink;
         let outcome = match result {
             Ok(count) => {
-                sink.emit(messages::Stream::Stdout, &messages::download::series_expanded(job.target.as_str(), count));
+                sink.emit_async(messages::Stream::Stdout, &messages::download::series_expanded(job.target.as_str(), count)).await;
                 crate::consumer::notify_queue_changed(push).await;
                 JobOutcome::Succeeded
             }
             Err(error) => {
-                sink.emit(messages::Stream::Stdout, &messages::indented_error(&error));
+                sink.emit_async(messages::Stream::Stdout, &messages::indented_error(&error)).await;
                 classify_result(Err(error), job, job_id, runtime, sink.as_ref()).await
             }
         };
@@ -270,12 +271,14 @@ pub async fn execute_job(
 
     // 進捗とコンソールは同じ送信キューに積み、順序を保つ。
     // operation は実行トークンごとに異なり、再試行の遅延更新と混ざらない。
-    downloader.set_progress(Box::new(HubProgress::new(
+    let progress = HubProgress::new(
         push_sink.clone(),
         job.kind.as_str(),
         job_id.as_str(),
         execution_token,
-    )));
+    );
+    narou_rs::platform::ProgressReporter::flush(&progress).await;
+    downloader.set_progress(Box::new(progress));
     downloader.set_message_sink(push_sink.clone());
     let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, &runtime.subrequests)
         .with_checkpoints(
@@ -329,7 +332,7 @@ pub async fn execute_job(
         other => other,
     };
     // 1 件分の結果行は native `commands::{download,update}` と同じ文言を
-    // 共有実装 (`emit_download_result_lines`) で出す。エラー系も native と
+    // 共有実装 (`download_result_line`) で出す。エラー系も native と
     // 同じ行を使う (download は `  {error}`、update は `ID:{id} {title} の
     // 更新は失敗しました` + debug-mode 時の `  Error detail: {error}`)。
     // 予算切れは下の Partial 分岐が理由を説明するので除く。
@@ -353,12 +356,10 @@ pub async fn execute_job(
             } else {
                 String::new()
             };
-            narou_rs::application::emit_download_result_lines(
-                push_sink.as_ref(),
-                job.kind,
-                result,
-                Some(&canceled_title),
-            );
+            if let Some(line) = narou_rs::application::download_result_line(job.kind, result, Some(&canceled_title)) {
+                use narou_rs::application::messages::MessageSink as _;
+                push_sink.emit_async(messages::Stream::Stdout, &line).await;
+            }
         }
         Err(error) if !matches!(error, NarouError::DownloadBudgetExpired { .. }) => {
             // ネイティブはエラーも stdout に出す (`error()` -> `$stdout.error`)。
@@ -394,12 +395,12 @@ pub async fn execute_job(
                 }
                 (_, _) => messages::indented_error(error),
             };
-            push_sink.emit(messages::Stream::Stdout, &line);
+            push_sink.emit_async(messages::Stream::Stdout, &line).await;
             if job.kind == JobKind::Update && crate::consumer::webui_debug_mode(runtime).await {
-                push_sink.emit(
+                push_sink.emit_async(
                     messages::Stream::Stdout,
                     &messages::update::error_detail(error),
-                );
+                ).await;
             }
         }
         _ => {}
@@ -442,10 +443,10 @@ pub async fn execute_job(
     }
     }).await;
     // Drain every exit, including expansion, frozen and pacing-error paths.
-    downloader.clear_progress();
+    downloader.clear_progress().await;
     downloader.clear_message_sink();
-    push_sink.drain().await;
     outcome
+    }).await
 }
 
 
@@ -513,10 +514,10 @@ async fn classify_result(
                     // 通知する (`commands::{download,update}` の
                     // `convert_error_line` emit) ので、ここでも同じ行を出す。
                     Err(reason) => {
-                        sink.emit(
+                        sink.emit_async(
                             messages::Stream::Stdout,
                             &messages::download::convert_error_line(&reason),
-                        );
+                        ).await;
                         JobOutcome::Retryable { reason }
                     }
                 }
@@ -598,7 +599,7 @@ async fn enqueue_followup_convert(
         missing_cached_text,
     );
     if convert && convert_failure {
-        sink.emit(messages::Stream::Stdout, &messages::jobs::console_reconvert_note());
+        sink.emit_async(messages::Stream::Stdout, &messages::jobs::console_reconvert_note()).await;
     }
     if !convert {
         return Ok(());

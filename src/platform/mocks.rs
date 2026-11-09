@@ -27,6 +27,7 @@ use crate::platform::{
 #[derive(Debug, Default)]
 pub struct MockHttpClient {
     responses: Mutex<BTreeMap<String, HttpResponse>>,
+    method_responses: Mutex<BTreeMap<(String, String), HttpResponse>>,
     requests: Mutex<Vec<String>>,
     /// Full request heads (url + headers) so tests can assert what was sent.
     sent: Mutex<Vec<RequestHead>>,
@@ -45,6 +46,11 @@ impl MockHttpClient {
     /// Register a canned response for an exact URL.
     pub fn add_response(&self, url: impl Into<String>, response: HttpResponse) {
         self.responses.lock().insert(url.into(), response);
+    }
+
+    /// Register a response for one method without replacing other URL fixtures.
+    pub fn add_method_response(&self, method: HttpMethod, url: impl Into<String>, response: HttpResponse) {
+        self.method_responses.lock().insert((method_name(method).into(), url.into()), response);
     }
 
     /// Register a text response for an exact URL.
@@ -89,11 +95,28 @@ impl HttpClient for MockHttpClient {
             self.requests
                 .lock()
                 .push(format!("{} {}", method_name(request.method), request.url));
+            if let Some(response) = self.method_responses.lock()
+                .get(&(method_name(request.method).to_string(), request.url.clone())).cloned() {
+                return Ok(response);
+            }
             self.responses
                 .lock()
                 .get(&request.url)
                 .cloned()
                 .ok_or_else(|| NarouError::Http(format!("no canned response for {}", request.url)))
+        })
+    }
+
+    fn send_stream<'a>(
+        &'a self, request: HttpRequest,
+    ) -> PlatformFuture<'a, Result<crate::platform::http::HttpStreamResponse>> {
+        Box::pin(async move {
+            let url = request.url.clone();
+            let response = self.send(request).await?;
+            Ok(crate::platform::http::HttpStreamResponse {
+                status: response.status, url, headers: response.headers,
+                body: crate::platform::staging::owned_bytes_stream(response.body),
+            })
         })
     }
 }
@@ -110,7 +133,7 @@ fn method_name(method: HttpMethod) -> &'static str {
 /// In-memory object store. Keys are plain strings.
 #[derive(Debug, Default)]
 pub struct MemoryObjectStore {
-    objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    objects: Mutex<BTreeMap<String, std::sync::Arc<Vec<u8>>>>,
 }
 
 impl MemoryObjectStore {
@@ -145,7 +168,7 @@ impl ObjectStore for MemoryObjectStore {
     }
 
     fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
-        Box::pin(async move { Ok(self.objects.lock().get(key.as_ref()).cloned()) })
+        Box::pin(async move { Ok(self.objects.lock().get(key.as_ref()).map(|data| data.as_ref().clone())) })
     }
 
     fn write_small<'a>(
@@ -154,7 +177,7 @@ impl ObjectStore for MemoryObjectStore {
         data: Vec<u8>,
     ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
-            self.objects.lock().insert(key.as_ref().to_string(), data);
+            self.objects.lock().insert(key.as_ref().to_string(), std::sync::Arc::new(data));
             Ok(())
         })
     }
@@ -166,8 +189,8 @@ impl ObjectStore for MemoryObjectStore {
     ) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
         Box::pin(async move {
             let mut objects = self.objects.lock();
-            if let Some(data) = mutate(objects.get(key.as_ref()).map(Vec::as_slice))? {
-                objects.insert(key.as_ref().to_string(), data.into_owned());
+            if let Some(data) = mutate(objects.get(key.as_ref()).map(|data| data.as_slice()))? {
+                objects.insert(key.as_ref().to_string(), std::sync::Arc::new(data.into_owned()));
             }
             Ok(ObjectUpdateResult::Committed)
         })
@@ -229,13 +252,27 @@ impl AssetStore for MemoryObjectStore {
             let Some(bytes) = self.objects.lock().get(key.as_ref()).cloned() else {
                 return Ok(None);
             };
-            let stream: crate::platform::AssetStream = Box::pin(futures::stream::iter(
-                bytes
-                    .chunks(64 * 1024)
-                    .map(|chunk| Ok(chunk.to_vec()))
-                    .collect::<Vec<_>>(),
+            let stream: crate::platform::AssetStream = Box::pin(futures::stream::unfold(
+                (bytes, 0usize), |(bytes, offset)| async move {
+                    if offset == bytes.len() { return None; }
+                    let end = (offset + crate::platform::staging::ASSET_CHUNK_BYTES).min(bytes.len());
+                    Some((Ok(bytes[offset..end].to_vec()), (bytes, end)))
+                },
             ));
             Ok(Some(stream))
+        })
+    }
+
+    fn read_range<'a>(
+        &'a self, key: &'a ObjectKey, range: std::ops::Range<u64>,
+    ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(async move {
+            crate::platform::staging::validate_range(&range)?;
+            let objects = self.objects.lock();
+            let Some(bytes) = objects.get(key.as_ref()) else { return Ok(None); };
+            let start = usize::try_from(range.start).map_err(|_| NarouError::Platform("range overflow".into()))?;
+            let end = usize::try_from(range.end).map_err(|_| NarouError::Platform("range overflow".into()))?;
+            Ok(Some(bytes.get(start..end).ok_or_else(|| NarouError::Platform("asset range exceeds object".into()))?.to_vec()))
         })
     }
 
@@ -250,7 +287,7 @@ impl AssetStore for MemoryObjectStore {
             while let Some(chunk) = stream.next().await {
                 data.extend(chunk?);
             }
-            self.objects.lock().insert(key.as_ref().to_string(), data);
+            self.objects.lock().insert(key.as_ref().to_string(), std::sync::Arc::new(data));
             Ok(())
         })
     }

@@ -216,9 +216,9 @@ where
         };
         let show_progress = !title.is_empty() && page_limit.is_none_or(|limit| limit >= 5);
         if show_progress && let Some(progress) = progress {
-            progress.set_position(0);
-            progress.set_length(total_pages.unwrap_or(0) as u64);
-            progress.set_message(&format!("目次 {}", title));
+            progress.set_position_async(0).await;
+            progress.set_length_async(total_pages.unwrap_or(0) as u64).await;
+            progress.set_message_async(&format!("目次 {}", title)).await;
         }
 
         loop {
@@ -227,13 +227,13 @@ where
             }
             let page_subs = parse_subtitles(setting, &current_toc_source, url_captures)?;
             all_subtitles.extend(page_subs);
-            if let Some(tags) = setting.resolve_info_pattern("tags", &current_toc_source) {
+            if let Some(tags) = setting.resolve_info_pattern("tags", &current_toc_source).await {
                 page_tags.push(tags);
             }
 
             page += 1;
             if show_progress && let Some(progress) = progress {
-                progress.inc(1);
+                progress.inc_async(1).await;
             }
             if page_limit.is_some_and(|limit| page >= limit) {
                 break;
@@ -273,16 +273,15 @@ where
     })
 }
 
-pub fn create_short_story_subtitles(
+pub async fn create_short_story_subtitles(
     setting: &SiteSetting,
     toc_source: &str,
     info: &NovelInfo,
 ) -> Result<Vec<SubtitleInfo>> {
-    let title = info
-        .title
-        .clone()
-        .or_else(|| setting.resolve_info_pattern("t", toc_source))
-        .unwrap_or_else(|| "短編".to_string());
+    let title = match &info.title {
+        Some(title) => title.clone(),
+        None => setting.resolve_info_pattern("t", toc_source).await.unwrap_or_else(|| "短編".to_string()),
+    };
     let subdate = info.raw_captures.get("gf").cloned().unwrap_or_default();
     let subupdate = info
         .raw_captures

@@ -43,6 +43,9 @@ use crate::platform::{HttpClient, HttpMethod, HttpRequest, HttpResponse, Redirec
 
 const FAIL_THRESHOLD: u8 = 5;
 
+#[path = "http_stream.rs"]
+mod streaming;
+
 /// Default site-fetch headers, shared by every native transport so the
 /// reqwest default header map, the libcurl handle and both subprocess tools
 /// send the same values.
@@ -639,6 +642,18 @@ impl HttpClient for NativeHttpClient {
 
     fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse>> {
         Box::pin(self.send_chain(request, None))
+    }
+
+    fn send_stream<'a>(
+        &'a self, request: HttpRequest,
+    ) -> BoxFuture<'a, Result<crate::platform::http::HttpStreamResponse>> {
+        self.send_stream_chain(request, None)
+    }
+
+    fn send_stream_paced<'a>(
+        &'a self, request: HttpRequest, pacing: crate::platform::http::HttpPacing<'a>,
+    ) -> BoxFuture<'a, Result<crate::platform::http::HttpStreamResponse>> {
+        self.send_stream_chain(request, Some(pacing))
     }
 
     fn send_paced<'a>(

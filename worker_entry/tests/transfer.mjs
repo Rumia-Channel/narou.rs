@@ -650,6 +650,20 @@ try {
   assert.deepEqual(afterEntries.get('novels/0/挿絵/001.png'), PNG);
   console.log('PASS overwrite replaces archived files, keeps the id/folder and leaves absent files alone');
 
+  // A late corrupt entry must not publish the valid replacement entries read
+  // before it. Rebuild CRC-correct ZIP records but leave the declared SHA bad.
+  const corruptEntries = readZip(zipB);
+  const corruptManifest = JSON.parse(corruptEntries.get('manifest.json'));
+  corruptManifest.novels[0].files.at(-1).sha256 = '0'.repeat(64);
+  corruptEntries.set('manifest.json', Buffer.from(JSON.stringify(corruptManifest)));
+  const corruptOverwrite = await b.upload(buildZip([...corruptEntries].map(([name, data]) => ({ name, data }))), '?overwrite=true');
+  assert.equal(corruptOverwrite.response.status, 400);
+  const afterCorruption = readZip((await b.exportZip(idB)).bytes);
+  for (const [path, bytes] of afterEntries) {
+    if (path !== 'manifest.json') assert.deepEqual(afterCorruption.get(path), bytes, `${path}: corrupt import must not mutate live data`);
+  }
+  console.log('PASS late archive corruption leaves every existing file unchanged');
+
   // overwrite なしの再取り込みは skip (上書きしない)。
   const skippedAgain = await b.upload(zipB);
   assert.deepEqual(skippedAgain.body, { success: true, created: 0, overwritten: 0, skipped: 1, errors: [] });
@@ -785,6 +799,37 @@ try {
   } while (Date.now() < deadline);
   assert.equal(outcome.status, 'succeeded', JSON.stringify(outcome));
   console.log('PASS virtual EPUB preserves member pixels, one book structure, target layout, and queued conversion');
+
+  // Exercise one file and one ZIP above the old 16 MiB small-object ceiling.
+  // Client fixture allocations are outside the Worker; production routes must
+  // receive, stage, validate, export and re-import these bodies incrementally.
+  const large = Buffer.alloc(17 * 1024 * 1024);
+  let random = 0x12345678;
+  for (let index = 0; index < large.length; index++) {
+    random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
+    large[index] = random & 255;
+  }
+  const largeFiles = [
+    { path: 'toc.yaml', data: Buffer.from(tocYaml('大きな挿絵', [])) },
+    { path: '挿絵/large.bin', data: large },
+  ];
+  const largeImport = await b.upload(archiveFor(largeFiles, { tocUrl: 'https://example.com/large-transfer/', ncode: 'large-transfer' }));
+  assert.equal(largeImport.body.created, 1, JSON.stringify(largeImport.body));
+  const largeId = (await b.json('/api/novels?limit=1000')).body.data.find(record => record.toc_url === 'https://example.com/large-transfer/').id;
+  const largeExport = await progressResponse(await b.request(`/api/transfer/export?progress=1&ids=${largeId}`));
+  assert(largeExport.bytes.length > 16 * 1024 * 1024);
+  assert.equal(sha256(readZip(largeExport.bytes).get('novels/0/挿絵/large.bin')), sha256(large));
+  const largeRoundtrip = await bulkClient.upload(largeExport.bytes);
+  assert.equal(largeRoundtrip.body.created, 1, JSON.stringify(largeRoundtrip.body));
+  // Cancelling a body releases the isolate-local heavy permit. A subsequent
+  // request must not remain busy merely because the client stopped pulling.
+  const cancelledExport = await b.request(`/api/transfer/export?progress=1&ids=${largeId}`);
+  const cancelledReader = cancelledExport.body.getReader();
+  await cancelledReader.read();
+  await cancelledReader.cancel('contract cancellation');
+  const resumed = await b.exportZip(largeId);
+  assert.equal(sha256(readZip(resumed.bytes).get('novels/0/挿絵/large.bin')), sha256(large));
+  console.log('PASS large per-entry transfer and cancelled-stream admission cleanup');
 
   exitCode = 0;
 } catch (error) {

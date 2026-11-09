@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::platform::cookie_store::{format_cookie_header, parse_cookie_header};
-use crate::platform::http::{HttpResponse, is_safe_header_name, is_safe_header_value};
+use crate::platform::http::{is_safe_header_name, is_safe_header_value};
 
 const MAX_SESSION_COOKIES: usize = 128;
 const MAX_COOKIE_BYTES: usize = 4096;
@@ -23,13 +23,13 @@ pub(super) struct SessionCookies {
 }
 
 impl SessionCookies {
-    pub(super) fn observe(&mut self, source: &str, response: &HttpResponse) {
+    pub(super) fn observe(&mut self, source: &str, headers: &[(String, String)]) {
         let Ok(url) = url::Url::parse(source) else { return };
         let Some(host) = url.host_str() else { return };
         let origin = url.origin().ascii_serialization();
         let now = Utc::now();
         self.cookies.retain(|cookie| cookie.expires.is_none_or(|expires| expires > now));
-        for (_, header) in response.headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie")) {
+        for (_, header) in headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie")) {
             if header.len() > MAX_COOKIE_BYTES || !is_safe_header_value(header) { continue; }
             let mut parts = header.split(';');
             let Some((name, value)) = parts.next().and_then(|part| part.split_once('=')) else { continue };

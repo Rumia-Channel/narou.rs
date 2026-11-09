@@ -136,8 +136,8 @@ async fn queue_clear(req: Request, env: Env) -> worker::Result<Response> {
     if let Err(error) = runtime.ledger.cancel_all_pending(REASON_QUEUE_CLEARED).await {
         return api_failure(error);
     }
-    let running_count = match runtime.ledger.running_job_ids().await {
-        Ok(ids) => ids.len(),
+    let running_count = match runtime.ledger.running_job_count().await {
+        Ok(count) => count,
         Err(_) => return json_error(500, "ledger_read_failed", None),
     };
     // native `queue_clear` は `clear_non_running` の Ok 分岐で送る。台帳を読む
@@ -171,16 +171,21 @@ async fn cancel(req: Request, env: Env) -> worker::Result<Response> {
     // 不能にする。native はパイプライン上の共有プロセスを殺すので lane 単位
     // だったが、worker の各ジョブは独立した実行なので関連ジョブを道連れに
     // する必要はない — ここは native 同様「全 running」を対象にする。
-    let running_ids = match runtime.ledger.running_job_ids().await {
-        Ok(ids) => ids,
-        Err(_) => return json_error(500, "ledger_read_failed", None),
-    };
-    for job_id in running_ids {
-        // lease 切れの orphan も tombstone しておくと将来の再配信を止められる。
-        match runtime.ledger.cancel_running_job(&job_id, REASON_CANCELLED).await {
-            Ok(true) => notify_running_cancelled(&env, &runtime, JobId(job_id)).await,
-            Ok(false) => {}
-            Err(error) => return api_failure(error),
+    let before = runtime.now_rfc3339();
+    let mut after = String::new();
+    loop {
+        let running_ids = match runtime.ledger.running_job_ids(&after, &before).await {
+            Ok(ids) => ids,
+            Err(_) => return json_error(500, "ledger_read_failed", None),
+        };
+        if running_ids.is_empty() { break; }
+        for job_id in running_ids {
+            after.clone_from(&job_id);
+            match runtime.ledger.cancel_running_job(&job_id, REASON_CANCELLED).await {
+                Ok(true) => notify_running_cancelled(&env, &runtime, JobId(job_id)).await,
+                Ok(false) => {}
+                Err(error) => return api_failure(error),
+            }
         }
     }
     // native `api_cancel` は `kill_running_child` の直後に無条件で送る
@@ -280,24 +285,36 @@ async fn restore_pending_tasks(req: Request, env: Env) -> worker::Result<Respons
     // なり得る (dedupe は active 行を見るので Ledger 側は防げても Queue 側
     // の順序は汚れる)。配信が消えた行は cron の reaper
     // (`scheduler::reap_stuck_jobs`) が猶予付きで検出して再送・確定する。
-    let stale_jobs = match runtime.ledger.stale_running_jobs().await {
-        Ok(jobs) => jobs,
-        Err(error) => {
-            return Response::from_json(&json!({ "error": error.to_string() }));
-        }
-    };
-    for job in &stale_jobs {
-        if let Err(error) = runtime.send_existing_job(&JobId::from(job.job_id.clone()), &job.kind).await {
-            // native parity: 失敗は `{error: <string>}` を 200 で返す。
-            return Response::from_json(&json!({
-                "error": format!("queue send failed: {error}"),
-            }));
+    let before = runtime.now_rfc3339();
+    let mut after = String::new();
+    let mut count = 0usize;
+    loop {
+        let stale_jobs = match runtime.ledger.stale_running_jobs(&after, &before).await {
+            Ok(jobs) => jobs,
+            Err(error) => return Response::from_json(&json!({ "error": error.to_string() })),
+        };
+        if stale_jobs.is_empty() { break; }
+        for job in stale_jobs {
+            after.clone_from(&job.job_id);
+            let recovered = async {
+                if runtime.ledger.finalize_stuck(&job.job_id, &before, u32::MAX, "execution recovery exhausted without checkpoint progress").await? {
+                    return Ok::<bool, narou_rs::error::NarouError>(false);
+                }
+                if !runtime.ledger.touch_for_reenqueue(&job.job_id, &before).await? { return Ok(false); }
+                runtime.send_existing_job(&JobId::from(job.job_id), &job.kind).await?;
+                Ok(true)
+            }.await;
+            match recovered {
+                Ok(true) => count += 1,
+                Ok(false) => {}
+                Err(error) => return Response::from_json(&json!({ "error": error.to_string() })),
+            }
         }
     }
     // native `restore_pending_tasks` は `activate_restorable_tasks` の Ok 後に
     // 無条件で送る (失敗応答 `{error}` では送らない — worker も同じ)。
     notify_queue_changed(&env, &runtime).await;
-    Response::from_json(&json!({ "status": "ok", "count": stale_jobs.len() }))
+    Response::from_json(&json!({ "status": "ok", "count": count }))
 }
 
 // ---------------------------------------------------------------------------

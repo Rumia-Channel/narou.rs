@@ -398,6 +398,37 @@ impl HttpResponse {
     }
 }
 
+/// Owned response metadata plus a pull-driven body. Dropping the body cancels
+/// its upstream transport; no borrowed request/client must outlive it.
+pub struct HttpStreamResponse {
+    pub status: u16,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: super::object_store::AssetStream,
+}
+
+impl std::fmt::Debug for HttpStreamResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HttpStreamResponse")
+            .field("status", &self.status).field("url", &self.url)
+            .field("headers", &self.headers).finish_non_exhaustive()
+    }
+}
+
+impl HttpStreamResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub fn is_success(&self) -> bool { (200..300).contains(&self.status) }
+    pub fn is_redirection(&self) -> bool { (300..400).contains(&self.status) }
+
+    pub fn head(&self) -> HttpResponse {
+        HttpResponse { status: self.status, headers: self.headers.clone(), body: Vec::new() }
+    }
+}
+
 /// Borrowed site admission policy. Transport retries use the target scope,
 /// including when the actual connection goes through a configured relay.
 #[derive(Clone, Copy)]
@@ -440,6 +471,24 @@ pub trait HttpClient: Send + Sync {
         request: HttpRequest,
     ) -> PlatformFuture<'a, crate::error::Result<HttpResponse>>;
 
+    fn send_stream<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> PlatformFuture<'a, Result<HttpStreamResponse>>;
+
+    fn send_stream_paced<'a>(
+        &'a self,
+        request: HttpRequest,
+        pacing: HttpPacing<'a>,
+    ) -> PlatformFuture<'a, Result<HttpStreamResponse>> {
+        Box::pin(async move {
+            pacing.limiter.acquire(pacing.scope).await?;
+            let result = self.send_stream(request).await;
+            pacing.limiter.complete(pacing.scope).await?;
+            result
+        })
+    }
+
     /// Site requests acquire once per physical network attempt. Transports
     /// with redirects or fallback tiers must override this single-hop default.
     fn send_paced<'a>(
@@ -480,6 +529,16 @@ impl<T: HttpClient + ?Sized> HttpClient for &T {
         request: HttpRequest,
     ) -> PlatformFuture<'a, crate::error::Result<HttpResponse>> {
         (*self).send(request)
+    }
+
+    fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpStreamResponse>> {
+        (*self).send_stream(request)
+    }
+
+    fn send_stream_paced<'a>(
+        &'a self, request: HttpRequest, pacing: HttpPacing<'a>,
+    ) -> PlatformFuture<'a, Result<HttpStreamResponse>> {
+        (*self).send_stream_paced(request, pacing)
     }
 
     fn send_paced<'a>(

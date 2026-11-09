@@ -11,6 +11,7 @@ pub mod render;
 pub mod settings;
 pub mod user_converter;
 
+#[cfg(feature = "native-runtime")]
 use std::collections::HashMap;
 #[cfg(feature = "native-runtime")]
 use std::path::{Path, PathBuf};
@@ -19,7 +20,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 #[cfg(feature = "native-runtime")]
 use serde::Deserialize;
+#[cfg(feature = "native-runtime")]
 use serde::Serialize;
+#[cfg(feature = "native-runtime")]
 use sha2::{Digest, Sha256};
 
 use settings::NovelSettings;
@@ -28,14 +31,16 @@ use user_converter::UserConverter;
 use crate::db::NovelRecord;
 #[cfg(feature = "native-runtime")]
 use crate::downloader::SectionElement;
-use crate::downloader::{SECTION_SAVE_DIR, SectionFile, TocObject};
+#[cfg(feature = "native-runtime")]
+use crate::downloader::SECTION_SAVE_DIR;
+use crate::downloader::{SectionFile, TocObject};
 #[cfg(feature = "native-runtime")]
 use crate::error::NarouError;
 use crate::error::Result;
 use crate::illustration_store::IllustrationIndex;
 #[cfg(feature = "native-runtime")]
 use crate::illustration_store::{
-    IllustrationStorageService, IllustrationStore, StoredIllustration,
+    IllustrationStorageService, IllustrationStore,
     find_saved_illustration_filename, illustration_extension_from_content_type,
     is_remote_illustration_source, legacy_basename_from_source, normalize_illustration_url,
 };
@@ -60,12 +65,14 @@ const SECTION_CONVERT_CACHE_MAGIC: &str = "narou-section-cache:v1";
 /// / `rename` が NotFound になって変換全体を失敗させていた (issue #39)。
 #[cfg(feature = "native-runtime")]
 static LEGACY_SECTION_CACHE_MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(feature = "native-runtime")]
 const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v4";
 /// 変換パイプライン自体の出力仕様バージョン。
 ///
 /// セクション変換キャッシュのダイジェストに含める。設定に依らない変換結果の
 /// 修正 (issue #42 の行頭字下げなど) では設定シグネチャが変わらないため、
 /// これを上げないと古いキャッシュが使われ続けて修正が反映されない。
+#[cfg(feature = "native-runtime")]
 const CONVERTER_PIPELINE_VERSION: &str = "converter-pipeline:v1";
 
 /// I/O capabilities used only by converter-side illustration localization.
@@ -116,7 +123,6 @@ impl ConverterCapabilities {
 pub struct NovelConverter {
     settings: NovelSettings,
     user_converter: Option<UserConverter>,
-    section_cache: HashMap<String, render::ConvertedSection>,
     #[cfg(feature = "native-runtime")]
     section_convert_cache: SectionConvertCache,
     /// 直近の変換で書いた txt のパス (`convert.keep-txt=false` の後始末用)。
@@ -130,6 +136,17 @@ pub struct NovelConverter {
     illustration_store: IllustrationIndex,
     capabilities: Option<ConverterCapabilities>,
     target_device: Option<device::Device>,
+}
+
+/// Metadata retained between complete section conversions. Text transformations
+/// still receive the same chapter/intro/body/postscript units as native.
+pub(crate) struct NovelRenderState {
+    #[cfg(feature = "native-runtime")]
+    novel_id: Option<i64>,
+    total: usize,
+    converted: usize,
+    erased_intro_count: usize,
+    erased_post_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +242,7 @@ fn section_cache_enabled() -> bool {
     crate::compat::load_local_setting_bool_or("convert.section-cache", true)
 }
 
+#[cfg(feature = "native-runtime")]
 #[derive(Serialize)]
 struct CacheSettingsSignature<'a> {
     enable_yokogaki: bool,
@@ -300,7 +318,6 @@ impl NovelConverter {
         Self {
             settings,
             user_converter,
-            section_cache: HashMap::new(),
             #[cfg(feature = "native-runtime")]
             section_convert_cache: SectionConvertCache::default(),
             #[cfg(feature = "native-runtime")]
@@ -316,9 +333,6 @@ impl NovelConverter {
         }
     }
 
-    pub(crate) fn into_settings(self) -> NovelSettings {
-        self.settings
-    }
 
     /// Site headers/cookie for illustration downloads, replaced whenever the
     /// converter learns which novel (and therefore which site) it is handling.
@@ -393,6 +407,12 @@ impl NovelConverter {
         self.progress = Some(progress);
     }
 
+    pub(crate) async fn flush_progress(&self) {
+        if let Some(progress) = &self.progress {
+            progress.flush().await;
+        }
+    }
+
     pub fn set_display_inspector(&mut self, display_inspector: bool) {
         self.display_inspector = display_inspector;
     }
@@ -408,10 +428,14 @@ impl NovelConverter {
         self.last_text_path.as_deref()
     }
 
+    /// Explicit native whole-value consumer. Worker callers use the incremental
+    /// begin/section/finish pipeline through `ConvertService`.
+    #[cfg(any(feature = "native-runtime", test))]
     pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile], record: Option<&NovelRecord>) -> Result<String> {
         self.convert_novel_inner(None, toc, sections, record)
     }
 
+    #[cfg(any(feature = "native-runtime", test))]
     fn convert_novel_inner(
         &mut self,
         novel_id: Option<i64>,
@@ -419,11 +443,24 @@ impl NovelConverter {
         sections: &[SectionFile],
         record: Option<&NovelRecord>,
     ) -> Result<String> {
+        let (mut state, mut text) = self.begin_novel(novel_id, toc, sections.len(), record);
+        for section in sections {
+            text.push_str(&self.render_section(&mut state, toc, section)?);
+        }
+        text.push_str(&self.finish_novel(state, toc)?);
+        Ok(text)
+    }
+
+    pub(crate) fn begin_novel(
+        &mut self,
+        _novel_id: Option<i64>,
+        toc: &TocObject,
+        total: usize,
+        record: Option<&NovelRecord>,
+    ) -> (NovelRenderState, String) {
         self.use_dakuten_font = false;
-        let mut erased_intro_count = 0usize;
-        let mut erased_post_count = 0usize;
         let mut converted_story = String::new();
-        if let Some(ref story) = toc.story
+        if let Some(story) = &toc.story
             && !story.is_empty()
         {
             let mut converter =
@@ -432,55 +469,64 @@ impl NovelConverter {
             converted_story = converter.convert(&story_text, converter_base::TextType::Story);
             self.use_dakuten_font |= converter.use_dakuten_font;
         }
-
-        let mut converted_sections = Vec::new();
-        let total = sections.len() as u64;
-
-        if let Some(ref p) = self.progress {
-            p.set_length(total);
-            p.set_message(&format!("Convert {}", toc.title));
+        if let Some(progress) = &self.progress {
+            progress.set_length(total as u64);
+            progress.set_message(&format!("Convert {}", toc.title));
         }
+        let state = NovelRenderState {
+            #[cfg(feature = "native-runtime")]
+            novel_id: _novel_id,
+            total,
+            converted: 0,
+            erased_intro_count: 0,
+            erased_post_count: 0,
+        };
+        (state, render::render_novel_header(&self.settings, toc, &converted_story, record))
+    }
 
-        for (i, section) in sections.iter().enumerate() {
-            if let Some(ref p) = self.progress {
-                p.set_message(&format!(
-                    "Convert {} [{}/{}]",
-                    toc.title,
-                    i + 1,
-                    sections.len()
-                ));
+    pub(crate) fn render_section(
+        &mut self,
+        state: &mut NovelRenderState,
+        toc: &TocObject,
+        section: &SectionFile,
+    ) -> Result<String> {
+        if let Some(progress) = &self.progress {
+            progress.set_message(&format!(
+                "Convert {} [{}/{}]", toc.title, state.converted + 1, state.total,
+            ));
+        }
+        // The Worker has no inspect-log consumer; do not retain diagnostic
+        // snippets from every previously emitted section.
+        #[cfg(not(feature = "native-runtime"))]
+        self.inspector.lock().reset();
+        let chapter = &section.chapter;
+        let subtitle = &section.subtitle;
+        let inspect_subtitle = if !subtitle.trim().is_empty() {
+            subtitle.trim()
+        } else if !section.subchapter.trim().is_empty() {
+            section.subchapter.trim()
+        } else {
+            chapter.trim()
+        };
+        self.inspector.lock().set_subtitle(inspect_subtitle);
+        let is_html =
+            section.element.data_type != "text" && section.element.data_type != "text/plain";
+        let resolved_element = {
+            #[cfg(feature = "native-runtime")]
+            {
+                if is_html && self.settings.enable_illust {
+                    std::borrow::Cow::Owned(self.resolve_section_html_illustrations(section)?)
+                } else {
+                    std::borrow::Cow::Borrowed(&section.element)
+                }
             }
-
-            let chapter = section.chapter.clone();
-            let subchapter = section.subchapter.clone();
-            let subtitle = section.subtitle.clone();
-            let inspect_subtitle = if !subtitle.trim().is_empty() {
-                subtitle.trim().to_string()
-            } else if !subchapter.trim().is_empty() {
-                subchapter.trim().to_string()
-            } else {
-                chapter.trim().to_string()
-            };
-            self.inspector.lock().set_subtitle(inspect_subtitle);
-
-            let is_html =
-                section.element.data_type != "text" && section.element.data_type != "text/plain";
-            let resolved_element = {
-                #[cfg(feature = "native-runtime")]
-                {
-                    if is_html && self.settings.enable_illust {
-                        self.resolve_section_html_illustrations(section)
-                    } else {
-                        section.element.clone()
-                    }
-                }
-                #[cfg(not(feature = "native-runtime"))]
-                {
-                    section.element.clone()
-                }
-            };
-            // Hash the actual conversion input as well as the original section.
-            // A failed image fetch must not pin an imageless cache entry after recovery.
+            #[cfg(not(feature = "native-runtime"))]
+            {
+                std::borrow::Cow::Borrowed(&section.element)
+            }
+        };
+        #[cfg(feature = "native-runtime")]
+        let digest = {
             let mut digest = self.compute_digest(section);
             if is_html && self.settings.enable_illust {
                 let mut hasher = Sha256::new();
@@ -492,157 +538,105 @@ impl NovelConverter {
                 hasher.update(resolved_element.postscript.as_bytes());
                 digest = hex::encode(hasher.finalize());
             }
-
-            if let Some(cached) = self.section_cache.get(&digest) {
-                converted_sections.push(cached.clone());
-                if let Some(ref p) = self.progress {
-                    p.inc(1);
-                }
-                continue;
+            digest
+        };
+        #[cfg(feature = "native-runtime")]
+        if let Some((cached, dakuten)) =
+            self.fetch_cached_section(state.novel_id, &section.index, &digest)
+        {
+            self.use_dakuten_font |= dakuten;
+            state.converted += 1;
+            if let Some(progress) = &self.progress {
+                progress.inc(1);
             }
-
-            if let Some((cached, dakuten)) =
-                self.fetch_cached_section(novel_id, &section.index, &digest)
-            {
-                self.section_cache.insert(digest.clone(), cached.clone());
-                self.use_dakuten_font |= dakuten;
-                converted_sections.push(cached);
-                if let Some(ref p) = self.progress {
-                    p.inc(1);
-                }
-                continue;
-            }
-
-            let mut converter = self.make_converter_for_section(section);
-
-            let mut batch_inputs = Vec::new();
-
-            if !chapter.is_empty() {
-                batch_inputs.push((chapter.clone(), converter_base::TextType::Chapter));
-            }
-            if !subtitle.is_empty() {
-                batch_inputs.push((subtitle.clone(), converter_base::TextType::Subtitle));
-            }
-
-            let intro_text = if self.settings.enable_erase_introduction {
-                if !resolved_element.introduction.is_empty() {
-                    erased_intro_count += 1;
-                }
-                String::new()
-            } else if is_html && !resolved_element.introduction.is_empty() {
-                crate::downloader::html::to_aozora(&resolved_element.introduction)
-            } else {
-                resolved_element.introduction.clone()
-            };
-            let body_text = if is_html && !resolved_element.body.is_empty() {
-                crate::downloader::html::to_aozora(&resolved_element.body)
-            } else {
-                resolved_element.body.clone()
-            };
-            let post_text = if self.settings.enable_erase_postscript {
-                if !resolved_element.postscript.is_empty() {
-                    erased_post_count += 1;
-                }
-                String::new()
-            } else if is_html && !resolved_element.postscript.is_empty() {
-                crate::downloader::html::to_aozora(&resolved_element.postscript)
-            } else {
-                resolved_element.postscript.clone()
-            };
-            let has_intro = !intro_text.is_empty();
-            let has_post = !post_text.is_empty();
-
-            if has_intro {
-                batch_inputs.push((intro_text.clone(), converter_base::TextType::Introduction));
-            }
-            batch_inputs.push((body_text, converter_base::TextType::Body));
-            if has_post {
-                batch_inputs.push((post_text.clone(), converter_base::TextType::Postscript));
-            }
-
-            let results = converter.convert_multi(&batch_inputs);
-            let section_dakuten = converter.use_dakuten_font;
-            self.use_dakuten_font |= section_dakuten;
-
-            let mut ri = 0;
-            let conv_chapter = if !chapter.is_empty() {
-                let r = results[ri].clone();
-                ri += 1;
-                r
-            } else {
-                String::new()
-            };
-            let conv_subtitle = if !subtitle.is_empty() {
-                let r = results[ri].clone();
-                ri += 1;
-                r
-            } else {
-                String::new()
-            };
-            let conv_intro = if has_intro {
-                let r = results[ri].clone();
-                ri += 1;
-                r
-            } else {
-                String::new()
-            };
-            let conv_body = results[ri].clone();
-            ri += 1;
-            let conv_post = if has_post {
-                results[ri].clone()
-            } else {
-                String::new()
-            };
-
-            let cs = render::ConvertedSection {
-                chapter: conv_chapter,
-                subchapter: subchapter.clone(),
-                subtitle: conv_subtitle,
-                introduction: conv_intro,
-                body: conv_body,
-                postscript: conv_post,
-            };
-
-            self.section_cache.insert(digest.clone(), cs.clone());
-            self.store_cached_section(novel_id, &section.index, &digest, &cs, section_dakuten);
-
-            converted_sections.push(cs);
-            if let Some(ref p) = self.progress {
-                p.inc(1);
-            }
+            return Ok(render::render_novel_section(&self.settings, toc, &cached, self.target_device));
         }
 
-        if let Some(ref p) = self.progress {
-            p.finish_with_message(&format!(
-                "Convert {} done ({} sections)",
-                toc.title,
-                sections.len()
+        let mut converter = self.make_converter_for_section(section);
+        let mut batch_inputs = Vec::with_capacity(5);
+        if !chapter.is_empty() {
+            batch_inputs.push((chapter.clone(), converter_base::TextType::Chapter));
+        }
+        if !subtitle.is_empty() {
+            batch_inputs.push((subtitle.clone(), converter_base::TextType::Subtitle));
+        }
+        let intro_text = if self.settings.enable_erase_introduction {
+            if !resolved_element.introduction.is_empty() {
+                state.erased_intro_count += 1;
+            }
+            String::new()
+        } else if is_html && !resolved_element.introduction.is_empty() {
+            crate::downloader::html::to_aozora(&resolved_element.introduction)
+        } else {
+            resolved_element.introduction.clone()
+        };
+        let body_text = if is_html && !resolved_element.body.is_empty() {
+            crate::downloader::html::to_aozora(&resolved_element.body)
+        } else {
+            resolved_element.body.clone()
+        };
+        let post_text = if self.settings.enable_erase_postscript {
+            if !resolved_element.postscript.is_empty() {
+                state.erased_post_count += 1;
+            }
+            String::new()
+        } else if is_html && !resolved_element.postscript.is_empty() {
+            crate::downloader::html::to_aozora(&resolved_element.postscript)
+        } else {
+            resolved_element.postscript.clone()
+        };
+        let has_intro = !intro_text.is_empty();
+        let has_post = !post_text.is_empty();
+        if has_intro {
+            batch_inputs.push((intro_text, converter_base::TextType::Introduction));
+        }
+        batch_inputs.push((body_text, converter_base::TextType::Body));
+        if has_post {
+            batch_inputs.push((post_text, converter_base::TextType::Postscript));
+        }
+        let mut results = converter.convert_multi(&batch_inputs).into_iter();
+        let section_dakuten = converter.use_dakuten_font;
+        self.use_dakuten_font |= section_dakuten;
+        let converted = render::ConvertedSection {
+            chapter: if chapter.is_empty() { String::new() } else { results.next().unwrap() },
+            subchapter: section.subchapter.clone(),
+            subtitle: if subtitle.is_empty() { String::new() } else { results.next().unwrap() },
+            introduction: if has_intro { results.next().unwrap() } else { String::new() },
+            body: results.next().unwrap(),
+            postscript: if has_post { results.next().unwrap() } else { String::new() },
+        };
+        #[cfg(feature = "native-runtime")]
+        self.store_cached_section(state.novel_id, &section.index, &digest, &converted, section_dakuten);
+        state.converted += 1;
+        if let Some(progress) = &self.progress {
+            progress.inc(1);
+        }
+        Ok(render::render_novel_section(&self.settings, toc, &converted, self.target_device))
+    }
+
+    pub(crate) fn finish_novel(
+        &mut self,
+        state: NovelRenderState,
+        toc: &TocObject,
+    ) -> Result<String> {
+        if let Some(progress) = &self.progress {
+            progress.finish_with_message(&format!(
+                "Convert {} done ({} sections)", toc.title, state.converted,
             ));
         }
-
-        if self.settings.enable_erase_introduction && erased_intro_count > 0 {
+        if self.settings.enable_erase_introduction && state.erased_intro_count > 0 {
             self.inspector.lock().info(format!(
-                "前書きをすべて削除しました。削除した数は{}個です。",
-                erased_intro_count
+                "前書きをすべて削除しました。削除した数は{}個です。", state.erased_intro_count,
             ));
         }
-        if self.settings.enable_erase_postscript && erased_post_count > 0 {
+        if self.settings.enable_erase_postscript && state.erased_post_count > 0 {
             self.inspector.lock().info(format!(
-                "後書きをすべて削除しました。削除した数は{}個です。",
-                erased_post_count
+                "後書きをすべて削除しました。削除した数は{}個です。", state.erased_post_count,
             ));
         }
-
+        #[cfg(feature = "native-runtime")]
         self.flush_illustration_store()?;
-
-        Ok(render::render_novel_text(
-            &self.settings,
-            toc,
-            &converted_story,
-            &converted_sections,
-            record,
-            self.target_device,
-        ))
+        Ok(render::render_novel_footer(&self.settings))
     }
 
     #[cfg(feature = "native-runtime")]
@@ -697,6 +691,7 @@ impl NovelConverter {
         ))
     }
 
+    #[cfg(feature = "native-runtime")]
     fn compute_digest(&self, section: &SectionFile) -> String {
         let mut hasher = Sha256::new();
         hasher.update(Self::section_cache_relative_path(section).as_bytes());
@@ -721,6 +716,7 @@ impl NovelConverter {
         )
     }
 
+    #[cfg(feature = "native-runtime")]
     fn compute_conversion_context_signature(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.compute_settings_signature().as_bytes());
@@ -732,6 +728,7 @@ impl NovelConverter {
         hex::encode(hasher.finalize())
     }
 
+    #[cfg(feature = "native-runtime")]
     fn compute_settings_signature(&self) -> String {
         let mut hasher = Sha256::new();
         let settings_signature = CacheSettingsSignature {
@@ -790,6 +787,7 @@ impl NovelConverter {
         hex::encode(hasher.finalize())
     }
 
+    #[cfg(feature = "native-runtime")]
     fn compute_replace_signature(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(
@@ -799,6 +797,7 @@ impl NovelConverter {
         hex::encode(hasher.finalize())
     }
 
+    #[cfg(feature = "native-runtime")]
     fn compute_converter_signature(&self) -> String {
         if let Some(ref uc) = self.user_converter {
             uc.signature()
@@ -809,6 +808,7 @@ impl NovelConverter {
         }
     }
 
+    #[cfg(feature = "native-runtime")]
     fn section_cache_relative_path(section: &SectionFile) -> String {
         format!(
             "{}\\{} {}.yaml",
@@ -822,30 +822,30 @@ impl NovelConverter {
     fn resolve_section_html_illustrations(
         &mut self,
         section: &crate::downloader::SectionFile,
-    ) -> SectionElement {
+    ) -> Result<SectionElement> {
         let illust_dir = self.settings.archive_path.join("挿絵");
         let mut illust_count = 0usize;
-        SectionElement {
+        Ok(SectionElement {
             data_type: section.element.data_type.clone(),
             body: self.resolve_html_img_sources(
                 &section.element.body,
                 &illust_dir,
                 &section.index,
                 &mut illust_count,
-            ),
+            )?,
             introduction: self.resolve_html_img_sources(
                 &section.element.introduction,
                 &illust_dir,
                 &section.index,
                 &mut illust_count,
-            ),
+            )?,
             postscript: self.resolve_html_img_sources(
                 &section.element.postscript,
                 &illust_dir,
                 &section.index,
                 &mut illust_count,
-            ),
-        }
+            )?,
+        })
     }
 
     #[cfg(feature = "native-runtime")]
@@ -855,23 +855,26 @@ impl NovelConverter {
         illust_dir: &Path,
         section_index: &str,
         illust_count: &mut usize,
-    ) -> String {
+    ) -> Result<String> {
         let re = regex::Regex::new(r#"(?i)(<img[^>]+src=["'])([^"']+)(["'][^>]*>)"#).unwrap();
-        re.replace_all(html, |caps: &regex::Captures| {
-            let source = caps[2].to_string();
+        let mut output = String::with_capacity(html.len());
+        let mut previous = 0;
+        for captures in re.captures_iter(html) {
+            let matched = captures.get(0).expect("complete image match");
+            output.push_str(&html[previous..matched.start()]);
             let resolved = self.resolve_section_illustration_source(
-                illust_dir,
-                section_index,
-                *illust_count,
-                &source,
-            );
+                illust_dir, section_index, *illust_count, &captures[2],
+            )?;
             *illust_count += 1;
-            match resolved {
-                Some(localized) => format!("{}{}{}", &caps[1], localized, &caps[3]),
-                None => String::new(),
+            if let Some(localized) = resolved {
+                output.push_str(&captures[1]);
+                output.push_str(&localized);
+                output.push_str(&captures[3]);
             }
-        })
-        .to_string()
+            previous = matched.end();
+        }
+        output.push_str(&html[previous..]);
+        Ok(output)
     }
 
     #[cfg(feature = "native-runtime")]
@@ -881,16 +884,16 @@ impl NovelConverter {
         section_index: &str,
         illust_index: usize,
         source: &str,
-    ) -> Option<String> {
+    ) -> Result<Option<String>> {
         if !is_remote_illustration_source(source) {
             // 上流 HTML の `<img src>` はローカル挿絵の参照にもなるが、絶対パスや
             // `..` を通すと EPUB 書き出し時に小説フォルダ外のファイルを読ませられる。
             // 安全な相対パスだけを残し、それ以外は挿絵ごと落とす。
             if is_safe_relative_illustration_source(source) {
-                return Some(source.to_string());
+                return Ok(Some(source.to_string()));
             }
             tracing::debug!("安全な相対パスではない挿絵の参照を破棄します: {source:?}");
-            return None;
+            return Ok(None);
         }
 
         let has_injected_assets = self
@@ -913,14 +916,14 @@ impl NovelConverter {
                 .cached_filename_for_source(source, illust_dir)
         };
         if let Some(filename) = cached_filename {
-            return Some(format!("挿絵/{}", filename));
+            return Ok(Some(format!("挿絵/{}", filename)));
         }
 
         if !has_injected_assets {
             let basename = legacy_basename_from_source(source)
                 .unwrap_or_else(|| format!("{}-{}", section_index, illust_index));
             if let Some(filename) = find_saved_illustration_filename(illust_dir, &basename) {
-                return match self
+                return Ok(match self
                     .illustration_store
                     .legacy_mut()
                     .store_existing_file(illust_dir, source, &filename)
@@ -934,7 +937,7 @@ impl NovelConverter {
                         Some(format!("挿絵/{}", stored.filename))
                     }
                     Err(_) => Some(format!("挿絵/{}", filename)),
-                };
+                });
             }
         }
 
@@ -942,100 +945,59 @@ impl NovelConverter {
     }
 
     #[cfg(feature = "native-runtime")]
-    fn download_section_illustration(&mut self, illust_dir: &Path, source: &str) -> Option<String> {
+    fn download_section_illustration(&mut self, illust_dir: &Path, source: &str) -> Result<Option<String>> {
         let url = normalize_illustration_url(source);
-        let capabilities = self.capabilities.clone()?;
-        let (bytes, content_type) = match fetch_illustration_bytes(
-            capabilities.http.clone(),
-            capabilities.rate_limiter.clone(),
-            capabilities.fetch_policy.clone(),
-            url.clone(),
-        ) {
-            Ok((bytes, content_type)) => {
-                // Animated works arrive as a frame archive; the site
-                // definition declares the frame timings on the URL.
-                match crate::illustration_animation::assemble_animation(&url, &bytes) {
-                    Some(Ok(apng)) => (apng, "image/png".to_string()),
-                    Some(Err(err)) => {
-                        self.inspector.lock().error(format!(
-                            "Illustration#assemble_animation: {url} の組み立てに失敗しました({err})"
-                        ));
-                        (bytes, content_type)
-                    }
-                    None => (bytes, content_type),
-                }
-            }
-            Err(err) => {
-                self.inspector.lock().error(format!(
-                    "Illustration#download_image: {} を処理中に例外が発生しました({})",
-                    url, err
-                ));
-                return None;
-            }
+        let Some(capabilities) = self.capabilities.clone() else {
+            return Ok(None);
         };
-        let ext = match illustration_extension_from_content_type(&content_type) {
-            Some(ext) => ext,
+        let (assets, prefix) = match capabilities.assets {
+            Some(assets) => {
+                let prefix = capabilities.illustration_prefix.ok_or_else(|| {
+                    NarouError::Platform("illustration asset store has no novel prefix".into())
+                })?;
+                (assets, prefix)
+            }
             None => {
-                self.inspector.lock().error(format!(
-                    "Illustration#download_image: {} は未対応の画像フォーマットです(content-type: {})",
-                    url, content_type
-                ));
-                return None;
+                let root = illust_dir.parent().ok_or_else(|| {
+                    NarouError::Platform("illustration directory has no parent".into())
+                })?;
+                let assets: Arc<dyn AssetStore> = Arc::new(
+                    crate::native::object_store::NativeObjectStore::from_root(root.to_path_buf())?,
+                );
+                (assets, ObjectKey::try_new("novels")?)
             }
-        };
-
-        let stored = if capabilities.assets.is_some() {
-            self.store_illustration_with_capabilities(&capabilities, source, &bytes, ext)
-                .ok()
-                .flatten()
-        } else {
-            self.illustration_store
-                .legacy_mut()
-                .store_bytes(illust_dir, source, &bytes, ext)
-                .ok()
-        };
-        match stored {
-            Some(stored) => {
-                if stored.created {
-                    self.inspector
-                        .lock()
-                        .info(format!("挿絵「{}」を保存しました。", stored.filename));
-                }
-                Some(format!("挿絵/{}", stored.filename))
-            }
-            None => None,
-        }
-    }
-
-    #[cfg(feature = "native-runtime")]
-    fn store_illustration_with_capabilities(
-        &mut self,
-        capabilities: &ConverterCapabilities,
-        source: &str,
-        bytes: &[u8],
-        ext: &str,
-    ) -> Result<Option<StoredIllustration>> {
-        let Some(assets) = capabilities.assets.clone() else {
-            return Ok(None);
-        };
-        let Some(prefix) = capabilities.illustration_prefix.clone() else {
-            return Ok(None);
         };
         let service = IllustrationStorageService::new(assets)
             .with_dedup(crate::illustration_store::dedup_active());
-        let stored = crate::native::converter::run_store_io(service.store_bytes_at(
-            &prefix,
-            &mut self.illustration_store,
-            source,
-            bytes,
-            ext,
-        ))?;
-        Ok(Some(stored))
+        // The transport and every body read share one live runtime. Returning
+        // an HTTP stream from a short-lived runtime would strand its I/O.
+        let stored = crate::native::converter::run_store_io(async {
+            let response = crate::downloader::http_policy::fetch_stream(
+                capabilities.http.as_ref(),
+                capabilities.rate_limiter.as_ref(),
+                &url,
+                &capabilities.fetch_policy,
+            ).await?;
+            let content_type = response.header("Content-Type").unwrap_or("");
+            let ext = if crate::illustration_animation::has_frame_delays(&url) {
+                "png"
+            } else {
+                illustration_extension_from_content_type(content_type).ok_or_else(|| {
+                    NarouError::Platform(format!(
+                        "unsupported illustration content-type {content_type}: {url}",
+                    ))
+                })?
+            };
+            service.store_stream_at(
+                &prefix, &mut self.illustration_store, source, response.body, ext,
+            ).await
+        })?;
+        if stored.created {
+            self.inspector.lock().info(format!("挿絵「{}」を保存しました。", stored.filename));
+        }
+        Ok(Some(format!("挿絵/{}", stored.filename)))
     }
 
-    pub fn clear_cache(&mut self) {
-        self.section_cache.clear();
-    }
 
     #[cfg(feature = "native-runtime")]
     pub fn convert_text_file(&mut self, text: &str) -> Result<String> {
@@ -1420,34 +1382,6 @@ impl NovelConverter {
         self.section_convert_cache.flush()
     }
 
-    /// Worker にはセクション変換キャッシュも挿絵ローカライズも無いので、
-    /// 参照・保存・flush を no-op にする (常に再変換し、結果は保存済みの
-    /// セクションとテキストが正)。
-    #[cfg(not(feature = "native-runtime"))]
-    fn fetch_cached_section(
-        &mut self,
-        _novel_id: Option<i64>,
-        _section_key: &str,
-        _digest: &str,
-    ) -> Option<(render::ConvertedSection, bool)> {
-        None
-    }
-
-    #[cfg(not(feature = "native-runtime"))]
-    fn store_cached_section(
-        &mut self,
-        _novel_id: Option<i64>,
-        _section_key: &str,
-        _digest: &str,
-        _converted_section: &render::ConvertedSection,
-        _use_dakuten_font: bool,
-    ) {
-    }
-
-    #[cfg(not(feature = "native-runtime"))]
-    fn flush_illustration_store(&mut self) -> Result<()> {
-        Ok(())
-    }
 
     #[cfg(feature = "native-runtime")]
     fn flush_illustration_store(&mut self) -> Result<()> {
@@ -1500,6 +1434,7 @@ fn is_safe_relative_illustration_source(source: &str) -> bool {
     !normalized.split('/').any(|part| part == "..")
 }
 
+#[cfg(feature = "native-runtime")]
 fn target_device_cache_key(device: Option<device::Device>) -> &'static str {
     match device {
         Some(device::Device::Text) => "device:text",
@@ -1826,32 +1761,6 @@ fn find_saved_section_illustration_filename(
     find_saved_illustration_filename(illust_dir, &basename)
 }
 
-#[cfg(feature = "native-runtime")]
-fn fetch_illustration_bytes(
-    http: Arc<dyn HttpClient>,
-    rate_limiter: Arc<dyn RateLimiter>,
-    policy: crate::downloader::http_policy::FetchPolicy,
-    url: String,
-) -> std::result::Result<(Vec<u8>, String), String> {
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())?;
-        let response = runtime
-            .block_on(crate::downloader::http_policy::fetch_bytes(
-                http.as_ref(),
-                rate_limiter.as_ref(),
-                &url,
-                &policy,
-            ))
-            .map_err(|error| error.to_string())?;
-        let content_type = response.header("Content-Type").unwrap_or("").to_string();
-        Ok((response.body, content_type))
-    })
-    .join()
-    .map_err(|_| "illustration fetch thread panicked".to_string())?
-}
 
 #[cfg(test)]
 mod tests {
@@ -2275,7 +2184,7 @@ mod tests {
         };
         let section = make_illustration_section();
         let mut converter = NovelConverter::new(settings);
-        let resolved = converter.resolve_section_html_illustrations(&section);
+        let resolved = converter.resolve_section_html_illustrations(&section).unwrap();
         assert!(resolved.body.contains(r#"src="挿絵/i422674.png""#));
         assert_eq!(
             converter
@@ -2331,7 +2240,7 @@ mod tests {
         let mut section = make_illustration_section();
         section.element.body = format!("{}{}", section.element.body, section.element.body);
         let mut converter = NovelConverter::new(settings);
-        let resolved = converter.resolve_section_html_illustrations(&section);
+        let resolved = converter.resolve_section_html_illustrations(&section).unwrap();
 
         assert_eq!(
             resolved.body.matches(r#"src="挿絵/i422674.jpg""#).count(),
@@ -2367,7 +2276,7 @@ mod tests {
         .to_string();
 
         let mut converter = NovelConverter::new(settings);
-        let resolved = converter.resolve_section_html_illustrations(&section);
+        let resolved = converter.resolve_section_html_illustrations(&section).unwrap();
 
         assert!(
             resolved.body.contains(r#"src="挿絵/1.png""#),

@@ -23,6 +23,9 @@ use crate::db_handle::DbHandle;
 
 pub(crate) mod update;
 
+#[path = "d1_asset_stream.rs"]
+mod asset_stream;
+
 fn blob_view(value: &JsValue) -> worker::js_sys::Uint8Array {
     value.dyn_ref::<worker::js_sys::Uint8Array>().cloned()
         .unwrap_or_else(|| worker::js_sys::Uint8Array::new(value))
@@ -57,14 +60,6 @@ fn worker_error(error: impl std::fmt::Display) -> NarouError {
     NarouError::Platform(format!("Worker storage error: {error}"))
 }
 
-fn js_value_to_bytes(value: &JsValue) -> Result<Vec<u8>> {
-    if value.is_null() || value.is_undefined() {
-        return Ok(Vec::new());
-    }
-    // D1 returns BLOB columns as ArrayBuffer; Uint8Array::new accepts both
-    // ArrayBuffer and typed-array views.
-    Ok(blob_view(value).to_vec())
-}
 
 fn js_value_to_string(value: &JsValue) -> Option<String> {
     value.as_string()
@@ -105,11 +100,12 @@ fn metadata_from(key: &ObjectKey, size: i64, updated_at: &str, content_type: Opt
 #[derive(Clone)]
 pub struct D1ObjectStore {
     db: DbHandle,
+    stage_leases: std::sync::Arc<narou_rs::platform::staging::StageLeaseCache>,
 }
 
 impl D1ObjectStore {
     pub fn new(db: DbHandle) -> Self {
-        Self { db }
+        Self { db, stage_leases: std::sync::Arc::new(narou_rs::platform::staging::StageLeaseCache::default()) }
     }
 
     fn prepare(&self, sql: &str, values: Vec<JsValue>) -> Result<D1PreparedStatement> {
@@ -286,45 +282,6 @@ impl D1ObjectStore {
             .map_err(worker_error)?;
         Ok(row.map(|row| metadata_from(key, row.size, &row.updated_at, row.content_type)))
     }
-    async fn read_all(&self, key: &ObjectKey) -> Result<Option<Vec<u8>>> {
-        // raw_js_value keeps BLOB columns as ArrayBuffer; the typed-row
-        // `first::<T>` path cannot deserialize them.
-        let statement = self.prepare(
-            "SELECT data, size, encoding, crc32 FROM objects WHERE object_key = ?",
-            vec![JsValue::from_str(key.as_ref())],
-        )?;
-        let rows = statement.raw_js_value().await.map_err(worker_error)?;
-        let Some(row) = rows.into_iter().next() else {
-            return Ok(None);
-        };
-        let columns = worker::js_sys::Array::from(&row);
-        let inline = js_value_to_bytes(&columns.get(0))?;
-        let size = js_value_to_i64(&columns.get(1));
-        let encoding = js_value_to_string(&columns.get(2)).unwrap_or_else(|| "none".into());
-        let crc32 = js_value_to_i64(&columns.get(3)) as u32;
-        let encoding = narou_rs::platform::ObjectEncoding::parse(&encoding)?;
-        let stored = if !inline.is_empty() || size == 0 {
-            inline
-        } else {
-            let chunk_rows = self
-                .prepare(
-                    "SELECT data FROM object_chunks WHERE object_key = ? ORDER BY seq",
-                    vec![JsValue::from_str(key.as_ref())],
-                )?
-                .raw_js_value()
-                .await
-                .map_err(worker_error)?;
-            let mut stored = Vec::new();
-            for chunk_row in chunk_rows {
-                let cols = worker::js_sys::Array::from(&chunk_row);
-                stored.extend_from_slice(&js_value_to_bytes(&cols.get(0))?);
-            }
-            stored
-        };
-        let data = narou_rs::platform::decompress_object_payload(&stored, encoding)?;
-        narou_rs::platform::verify_object_crc32(&data, crc32)?;
-        Ok(Some(data))
-    }
 
     async fn write_all(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
         let mut statements = Vec::with_capacity(2 + data.len().div_ceil(CHUNK_SIZE));
@@ -348,6 +305,7 @@ impl D1ObjectStore {
         // D1 のバッチは 1 文ずつ成否を確認しないと失敗を握りつぶす。
         let results = self.db.batch(statements).await.map_err(worker_error)?;
         crate::d1_repository::ensure_batch_success(&results)?;
+        self.stage_leases.forget(key);
         Ok(())
     }
 
@@ -452,12 +410,19 @@ impl AssetStore for D1ObjectStore {
         &'a self,
         key: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        Box::pin(self.read_asset(key))
+    }
+
+    fn read_range<'a>(
+        &'a self, key: &'a ObjectKey, range: std::ops::Range<u64>,
+    ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(self.read_asset_range(key, range))
+    }
+
+    fn stage_stream<'a>(&'a self, stream: AssetStream) -> PlatformFuture<'a, Result<narou_rs::platform::StagedAsset>> {
         Box::pin(async move {
-            let Some(data) = self.read_all(key).await? else {
-                return Ok(None);
-            };
-            let stream = futures::stream::once(async move { Ok(data) });
-            Ok(Some(Box::pin(stream) as AssetStream))
+            self.collect_expired_stages(16).await?;
+            narou_rs::platform::staging::stage(self, stream).await
         })
     }
 
@@ -466,16 +431,7 @@ impl AssetStore for D1ObjectStore {
         key: &'a ObjectKey,
         stream: AssetStream,
     ) -> PlatformFuture<'a, Result<()>> {
-        Box::pin(async move {
-            use futures::StreamExt;
-            let mut stream = stream;
-            let mut data = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                data.extend_from_slice(&chunk);
-            }
-            self.write_all(key, &data).await
-        })
+        Box::pin(self.write_asset(key, stream))
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
@@ -487,12 +443,7 @@ impl AssetStore for D1ObjectStore {
         source: &'a ObjectKey,
         destination: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<()>> {
-        Box::pin(async move {
-            if let Some(data) = self.read_all(source).await? {
-                self.write_all(destination, &data).await?;
-            }
-            Ok(())
-        })
+        Box::pin(self.copy_asset(source, destination, false))
     }
 
     fn move_or_copy<'a>(
@@ -500,12 +451,6 @@ impl AssetStore for D1ObjectStore {
         source: &'a ObjectKey,
         destination: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<()>> {
-        Box::pin(async move {
-            if let Some(data) = self.read_all(source).await? {
-                self.write_all(destination, &data).await?;
-                self.delete_all(source).await?;
-            }
-            Ok(())
-        })
+        Box::pin(self.copy_asset(source, destination, true))
     }
 }

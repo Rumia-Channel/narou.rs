@@ -7,9 +7,9 @@ use narou_rs::platform::{ObjectEncoding, decode_object_payload_limited, verify_o
 // BLOB only once, even if a legacy object retained unused chunk rows.
 pub(crate) const READ_SQL: &str =
     "SELECT o.size, o.updated_at, o.content_type, o.encoding, o.crc32,
-       CASE WHEN ROW_NUMBER() OVER (ORDER BY c.seq) = 1 THEN o.data ELSE NULL END,
+       CASE WHEN o.size <= 16777216 AND ROW_NUMBER() OVER (ORDER BY c.seq) = 1 THEN o.data ELSE NULL END,
        c.seq, c.data
-     FROM objects o LEFT JOIN object_chunks c ON c.object_key = o.object_key
+     FROM objects o LEFT JOIN object_chunks c ON c.object_key = o.object_key AND o.size <= 16777216
      WHERE o.object_key = ? ORDER BY c.seq";
 
 // D1 batch is one transaction. Resetting this private guard before its CAS

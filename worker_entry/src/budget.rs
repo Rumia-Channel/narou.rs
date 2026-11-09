@@ -77,35 +77,26 @@ struct CheckpointSink {
     novel_id: Option<narou_rs::platform::NovelId>,
     last_saved_index: u64,
     latest_boundary: Option<u64>,
-    pending: Vec<futures::channel::oneshot::Receiver<Result<()>>>,
 }
 
 impl CheckpointSink {
-    /// Track every section boundary and periodically spawn a ledger write.
-    /// Completion is retained so a final retry checkpoint can follow all writes.
+    /// Only remember the latest boundary. Persistence is awaited at the next
+    /// async boundary, never spawned into an unbounded receiver/task backlog.
     fn save(&mut self, next_section_index: u64) {
         self.latest_boundary = Some(next_section_index);
-        if next_section_index < self.last_saved_index + CHECKPOINT_EVERY_SECTIONS {
-            return;
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        let Some(next) = self.latest_boundary else { return Ok(()) };
+        if next < self.last_saved_index.saturating_add(CHECKPOINT_EVERY_SECTIONS) {
+            return Ok(());
         }
-        self.last_saved_index = next_section_index;
-        let ledger = self.ledger.clone();
         let checkpoint = narou_rs::application::WorkerExecutionCheckpoint::planned(
-            self.job_id.clone(),
-            self.novel_id,
-        )
-        .advance(
-            narou_rs::application::ExecutionPhase::Fetching,
-            Some(next_section_index),
-        );
-        let job_id = self.job_id.clone();
-        let token = self.execution_token.clone();
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        self.pending.push(receiver);
-        wasm_bindgen_futures::spawn_local(async move {
-            let result = ledger.save_checkpoint(&job_id, &token, &checkpoint).await;
-            let _ = sender.send(result);
-        });
+            self.job_id.clone(), self.novel_id,
+        ).advance(narou_rs::application::ExecutionPhase::Fetching, Some(next));
+        self.ledger.save_checkpoint(&self.job_id, &self.execution_token, &checkpoint).await?;
+        self.last_saved_index = next;
+        Ok(())
     }
 }
 
@@ -146,7 +137,6 @@ impl<'a> WorkerBudget<'a> {
             novel_id,
             last_saved_index: 0,
             latest_boundary: None,
-            pending: Vec::new(),
         });
         self
     }
@@ -156,18 +146,8 @@ impl<'a> WorkerBudget<'a> {
         let Some(sink) = &mut self.sink else {
             return;
         };
-        for receiver in sink.pending.drain(..) {
-            match receiver.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => worker::console_log!(
-                    "job {}: periodic checkpoint write failed: {error}",
-                    sink.job_id
-                ),
-                Err(error) => worker::console_log!(
-                    "job {}: periodic checkpoint write canceled: {error}",
-                    sink.job_id
-                ),
-            }
+        if let Err(error) = sink.flush().await {
+            worker::console_log!("job {}: periodic checkpoint write failed: {error}", sink.job_id);
         }
     }
 
@@ -217,7 +197,9 @@ impl SectionBudget for WorkerBudget<'_> {
 
     fn check_active(&mut self) -> narou_rs::platform::PlatformFuture<'_, Result<()>> {
         Box::pin(async move {
-            if let Some(sink) = &self.sink {
+            narou_rs::application::messages::ready().await;
+            if let Some(sink) = &mut self.sink {
+                sink.flush().await?;
                 sink.ledger.ensure_execution_active(&sink.job_id, &sink.execution_token).await?;
             }
             Ok(())

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::Result;
-use crate::platform::{AssetStore, AssetStream, NovelObjectKeys, ObjectKey};
+use crate::platform::{AssetStore, AssetStream, NovelObjectKeys, ObjectKey, StagedAsset};
 
 #[cfg(feature = "native-runtime")]
 const CACHE_FILE_NAME: &str = ".illustration_cache.yaml";
@@ -159,79 +159,93 @@ impl IllustrationStorageService {
         self
     }
 
-    pub async fn store_bytes(
+    /// Stage the source, assemble declared animations without collecting their
+    /// output, then publish the verified content hash only after promotion.
+    pub async fn store_stream(
         &self,
         keys: &NovelObjectKeys,
         index: &mut IllustrationIndex,
         source: &str,
-        bytes: &[u8],
+        stream: AssetStream,
         ext: &str,
     ) -> Result<StoredIllustration> {
-        self.store_bytes_at(keys.prefix(), index, source, bytes, ext)
-            .await
+        self.store_stream_at(keys.prefix(), index, source, stream, ext).await
     }
-    pub async fn store_bytes_at(
+
+    pub async fn store_stream_at(
         &self,
         prefix: &ObjectKey,
         index: &mut IllustrationIndex,
         source: &str,
-        bytes: &[u8],
+        stream: AssetStream,
         ext: &str,
     ) -> Result<StoredIllustration> {
-        let hash = hash_bytes(bytes);
+        let input = self.assets.stage_stream(stream).await?;
+        let result = async {
+            match crate::illustration_animation::assemble_animation_stream(
+                source, self.assets.clone(), &input,
+            ).await? {
+                Some(animation) => {
+                    let output = self.assets.stage_stream(animation).await?;
+                    let result = self.promote(prefix, index, source, &output, "png").await;
+                    self.remove_stage(&output).await;
+                    result
+                }
+                None => self.promote(prefix, index, source, &input, ext).await,
+            }
+        }.await;
+        self.remove_stage(&input).await;
+        result
+    }
+
+    async fn remove_stage(&self, stage: &StagedAsset) {
+        if let Err(error) = self.assets.delete(&stage.key).await {
+            // Stages are durably registered for expiry before upload. An
+            // isolate cancellation or failed immediate delete is reclaimable.
+            tracing::warn!(key = %stage.key, %error, "illustration stage cleanup deferred");
+        }
+    }
+
+    async fn promote(
+        &self,
+        prefix: &ObjectKey,
+        index: &mut IllustrationIndex,
+        source: &str,
+        stage: &StagedAsset,
+        ext: &str,
+    ) -> Result<StoredIllustration> {
+        let hash = &stage.sha256;
         let normalized_ext = normalize_extension(ext);
         let id = mitemin_illustration_id(source);
-        let filename = id
-            .as_deref()
-            .and_then(|id| index.filename_for_mitemin_id(id))
-            .or_else(|| index.filename_for_source(source))
-            .or_else(|| index.filename_for_hash(&hash))
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                // dedup では新規名を内容ハッシュに揃えて S3 pool へ出せる
-                // 形にする。従来は mitemin の iNNN 名を優先していた。
-                let basename = if self.dedup {
-                    hash.as_str()
-                } else {
-                    id.as_deref().unwrap_or(&hash)
-                };
-                format!("{basename}.{normalized_ext}")
-            });
-        // キーは保存側・読み出し側で同じ関数を通す (`NovelObjectKeys::illustration`
-        // と同じ `platform::illustration_key`)。ここで独自に組み立てない。
-        let key = crate::platform::illustration_key(prefix, &filename)?;
-        let known_mapping = id
-            .as_deref()
-            .and_then(|id| index.filename_for_mitemin_id(id))
-            .or_else(|| index.filename_for_source(source))
-            .or_else(|| index.filename_for_hash(&hash))
-            .is_some();
-        let created = if known_mapping {
-            if self.assets.stat(&key).await?.is_some() {
-                false
-            } else {
-                let body = bytes.to_vec();
-                let stream: AssetStream = Box::pin(futures::stream::once(async move { Ok(body) }));
-                self.assets.write_stream(&key, stream).await?;
-                true
-            }
+        // A deduplicated pool key must describe these bytes, never an older
+        // URL-to-filename mapping whose content may have changed.
+        let filename = if self.dedup {
+            index.filename_for_hash(hash)
+                .filter(|filename| filename.rsplit_once('.').is_some_and(|(stem, _)| stem == hash))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{hash}.{normalized_ext}"))
         } else {
-            let body = bytes.to_vec();
-            let stream: AssetStream = Box::pin(futures::stream::once(async move { Ok(body) }));
-            self.assets.write_stream(&key, stream).await?;
+            id.as_deref()
+                .and_then(|id| index.filename_for_mitemin_id(id))
+                .or_else(|| index.filename_for_source(source))
+                .or_else(|| index.filename_for_hash(hash))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}.{normalized_ext}", id.as_deref().unwrap_or(hash)))
+        };
+        let key = crate::platform::illustration_key(prefix, &filename)?;
+        let matching_hash = index.filename_for_hash(hash) == Some(filename.as_str());
+        let created = if matching_hash && self.assets.stat(&key).await?.is_some() {
+            false
+        } else {
+            self.assets.copy(&stage.key, &key).await?;
             true
         };
-
         if let Some(id) = id {
-            index.remember_mitemin(source, &id, &hash, &filename);
+            index.remember_mitemin(source, &id, hash, &filename);
         } else {
-            index.remember_hash_source(source, &hash, &filename);
+            index.remember_hash_source(source, hash, &filename);
         }
-        Ok(StoredIllustration {
-            filename,
-            hash,
-            created,
-        })
+        Ok(StoredIllustration { filename, hash: hash.clone(), created })
     }
 }
 
@@ -1812,19 +1826,19 @@ mod tests {
 
         futures::executor::block_on(async {
             let first = service
-                .store_bytes(&keys, &mut index, source, bytes, "png")
+                .store_stream(&keys, &mut index, source, test_stream(bytes), "png")
                 .await
                 .unwrap();
             assert!(first.created);
             let second = service
-                .store_bytes(&keys, &mut index, source, bytes, "png")
+                .store_stream(&keys, &mut index, source, test_stream(bytes), "png")
                 .await
                 .unwrap();
             assert!(!second.created);
             let key = keys.illustration(&first.filename).unwrap();
             AssetStore::delete(assets.as_ref(), &key).await.unwrap();
             let repaired = service
-                .store_bytes(&keys, &mut index, source, bytes, "png")
+                .store_stream(&keys, &mut index, source, test_stream(bytes), "png")
                 .await
                 .unwrap();
             assert!(repaired.created);
@@ -1836,6 +1850,174 @@ mod tests {
                     .unwrap(),
                 bytes
             );
+        });
+    }
+
+    fn test_stream(bytes: &[u8]) -> AssetStream {
+        let body = bytes.to_vec();
+        Box::pin(futures::stream::once(async move { Ok(body) }))
+    }
+
+    #[test]
+    fn failed_input_does_not_publish_an_index_or_leave_a_stage() {
+        futures::executor::block_on(async {
+            let assets = Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+            let service = IllustrationStorageService::new(assets.clone()).with_dedup(true);
+            let keys = NovelObjectKeys::new("site", "broken", true).unwrap();
+            let mut index = IllustrationIndex::default();
+            let input: AssetStream = Box::pin(futures::stream::iter([
+                Ok(b"partial image".to_vec()),
+                Err(crate::error::NarouError::Platform("source disconnected".into())),
+            ]));
+            assert!(service.store_stream(&keys, &mut index, "https://e.test/a.png", input, "png").await.is_err());
+            assert!(index.filenames().is_empty());
+            assert!(!index.is_dirty());
+            assert!(assets.is_empty());
+        });
+    }
+
+    #[test]
+    fn changed_source_uses_its_new_content_hash_without_overwriting_old_pool_bytes() {
+        futures::executor::block_on(async {
+            let assets = Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+            let service = IllustrationStorageService::new(assets.clone()).with_dedup(true);
+            let keys = NovelObjectKeys::new("site", "changed", true).unwrap();
+            let mut index = IllustrationIndex::default();
+            let source = "https://e.test/a.png";
+            let old = service.store_stream(&keys, &mut index, source, test_stream(b"old"), "png").await.unwrap();
+            let new = service.store_stream(&keys, &mut index, source, test_stream(b"new"), "png").await.unwrap();
+            assert_ne!(old.filename, new.filename);
+            assert_eq!(new.hash, hash_bytes(b"new"));
+            assert_eq!(index.filename_for_source(source), Some(new.filename.as_str()));
+            assert_eq!(ObjectStore::read_small(assets.as_ref(), &keys.illustration(&old.filename).unwrap()).await.unwrap().unwrap(), b"old");
+            assert_eq!(assets.len(), 2, "completed input stages are removed");
+        });
+    }
+
+    #[derive(Default)]
+    struct FailingPromotion {
+        inner: crate::platform::mocks::MemoryObjectStore,
+        fail_output: bool,
+        stages: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AssetStore for FailingPromotion {
+        fn stat<'a>(&'a self, key: &'a ObjectKey) -> crate::platform::PlatformFuture<'a, Result<Option<crate::platform::ObjectMetadata>>> {
+            AssetStore::stat(&self.inner, key)
+        }
+        fn read_stream<'a>(&'a self, key: &'a ObjectKey) -> crate::platform::PlatformFuture<'a, Result<Option<AssetStream>>> {
+            AssetStore::read_stream(&self.inner, key)
+        }
+        fn read_range<'a>(&'a self, key: &'a ObjectKey, range: std::ops::Range<u64>) -> crate::platform::PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+            AssetStore::read_range(&self.inner, key, range)
+        }
+        fn write_stream<'a>(&'a self, key: &'a ObjectKey, stream: AssetStream) -> crate::platform::PlatformFuture<'a, Result<()>> {
+            AssetStore::write_stream(&self.inner, key, stream)
+        }
+        fn stage_stream<'a>(&'a self, stream: AssetStream) -> crate::platform::PlatformFuture<'a, Result<StagedAsset>> {
+            use futures::StreamExt;
+            let stream = if self.fail_output && self.stages.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                Box::pin(stream.take(1).chain(futures::stream::once(async {
+                    Err(crate::error::NarouError::Platform("output disconnected".into()))
+                }))) as AssetStream
+            } else {
+                stream
+            };
+            AssetStore::stage_stream(&self.inner, stream)
+        }
+        fn delete<'a>(&'a self, key: &'a ObjectKey) -> crate::platform::PlatformFuture<'a, Result<()>> {
+            AssetStore::delete(&self.inner, key)
+        }
+        fn copy<'a>(&'a self, _source: &'a ObjectKey, _destination: &'a ObjectKey) -> crate::platform::PlatformFuture<'a, Result<()>> {
+            Box::pin(async { Err(crate::error::NarouError::Platform("promotion failed".into())) })
+        }
+        fn move_or_copy<'a>(&'a self, source: &'a ObjectKey, destination: &'a ObjectKey) -> crate::platform::PlatformFuture<'a, Result<()>> {
+            self.copy(source, destination)
+        }
+    }
+
+    #[test]
+    fn failed_promotion_keeps_the_previous_index_and_removes_source_stage() {
+        futures::executor::block_on(async {
+            let assets = Arc::new(FailingPromotion::default());
+            let service = IllustrationStorageService::new(assets.clone()).with_dedup(true);
+            let keys = NovelObjectKeys::new("site", "copy-error", true).unwrap();
+            let source = "https://e.test/a.png";
+            let mut index = IllustrationIndex::default();
+            index.remember_hash_source(source, "old", "old.png");
+            index.mark_clean();
+            assert!(service.store_stream(&keys, &mut index, source, test_stream(b"new"), "png").await.is_err());
+            assert_eq!(index.filename_for_source(source), Some("old.png"));
+            assert!(!index.is_dirty());
+            assert!(assets.inner.is_empty());
+        });
+    }
+
+    #[cfg(feature = "illustration-animation")]
+    #[test]
+    fn corrupt_animation_never_publishes_the_source_zip_as_an_image() {
+        futures::executor::block_on(async {
+            let assets = Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+            let service = IllustrationStorageService::new(assets.clone());
+            let keys = NovelObjectKeys::new("site", "broken-zip", true).unwrap();
+            let mut index = IllustrationIndex::default();
+            assert!(service.store_stream(&keys, &mut index, "https://e.test/a.zip?ugoira=50", test_stream(b"PK\x03\x04broken"), "jpg").await.is_err());
+            assert!(index.filenames().is_empty());
+            assert!(assets.is_empty());
+        });
+    }
+
+    #[cfg(feature = "illustration-animation")]
+    fn test_frame_archive() -> Vec<u8> {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..2 {
+            let frame = image::RgbaImage::from_pixel(2, 2, image::Rgba([index, 10, 20, 128]));
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(frame).write_to(&mut png, image::ImageFormat::Png).unwrap();
+            writer.start_file(format!("{index}.png"), zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all(png.get_ref()).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[cfg(feature = "illustration-animation")]
+    #[test]
+    fn failed_animation_output_keeps_index_unpublished_and_cleans_source() {
+        futures::executor::block_on(async {
+            let assets = Arc::new(FailingPromotion { fail_output: true, ..Default::default() });
+            let service = IllustrationStorageService::new(assets.clone());
+            let keys = NovelObjectKeys::new("site", "output-error", true).unwrap();
+            let mut index = IllustrationIndex::default();
+            let error = service.store_stream(
+                &keys, &mut index, "https://e.test/a.zip?ugoira=50",
+                test_stream(&test_frame_archive()), "jpg",
+            ).await.unwrap_err();
+            assert!(error.to_string().contains("output disconnected"));
+            assert!(!index.is_dirty());
+            assert!(index.filenames().is_empty());
+            assert!(assets.inner.is_empty());
+        });
+    }
+
+    #[cfg(feature = "illustration-animation")]
+    #[test]
+    fn completed_animation_hashes_output_promotes_png_and_removes_both_stages() {
+        futures::executor::block_on(async {
+            let assets = Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+            let service = IllustrationStorageService::new(assets.clone()).with_dedup(true);
+            let keys = NovelObjectKeys::new("site", "animation", true).unwrap();
+            let source = "https://e.test/a.zip?ugoira=50";
+            let mut index = IllustrationIndex::default();
+            let archive = test_frame_archive();
+            let stored = service.store_stream(&keys, &mut index, source, test_stream(&archive), "jpg").await.unwrap();
+            let png = ObjectStore::read_small(assets.as_ref(), &keys.illustration(&stored.filename).unwrap()).await.unwrap().unwrap();
+            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            assert_eq!(stored.hash, hash_bytes(&png));
+            assert_ne!(stored.hash, hash_bytes(&archive));
+            assert_eq!(stored.filename, format!("{}.png", stored.hash));
+            assert_eq!(index.filename_for_source(source), Some(stored.filename.as_str()));
+            assert_eq!(assets.len(), 1);
         });
     }
 

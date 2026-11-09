@@ -298,6 +298,23 @@ impl Relay {
                 }
                 Reply::Upstream(response) => {
                     let metadata = response.metadata();
+                    if request.joined_header("accept").split(',')
+                        .any(|value| value.trim().eq_ignore_ascii_case(wire::STREAM_CONTENT_TYPE))
+                    {
+                        let prefix = match wire::encode_stream_prefix(&metadata, response.body.len()) {
+                            Ok(prefix) => prefix,
+                            Err(_) => {
+                                (self.logger)("narou relay request: too-large");
+                                let _ = conn.reply_json(502, &error_body("response too large"), true).await;
+                                return;
+                            }
+                        };
+                        if conn.reply_stream(&prefix, &response.body, close).await.is_err() {
+                            return;
+                        }
+                        if close { return; }
+                        continue;
+                    }
                     let body = match wire::encode_response(&metadata, &response.body) {
                         Ok(body) => body,
                         Err(_) => {
@@ -864,6 +881,21 @@ impl Connection {
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
+    }
+
+    async fn reply_stream(&mut self, prefix: &[u8], body: &[u8], close: bool) -> io::Result<()> {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: {}\r\n\r\n",
+            wire::STREAM_CONTENT_TYPE,
+            prefix.len() + body.len(),
+            if close { "close" } else { "keep-alive" },
+        );
+        tokio::time::timeout(WRITE_TIMEOUT, async {
+            self.stream.write_all(head.as_bytes()).await?;
+            self.stream.write_all(prefix).await?;
+            self.stream.write_all(body).await?;
+            self.stream.flush().await
+        }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
     }
 
     /// 早期エラー (ヘッダ・本文の読み出し前後) への応答を書いて接続を閉じる。

@@ -1,0 +1,8 @@
+image-webp 0.2.4
+Upstream: https://github.com/image-rs/image-webp
+Published crate: https://crates.io/crates/image-webp/0.2.4
+Source commit: 08b57d473c90148dd4b37a075df365afc3dfcc2b
+Source: unmodified published crate source copied from the Cargo registry before applying the local bounded-memory codec patch.
+Licensing: MIT OR Apache-2.0; original LICENSE-MIT and LICENSE-APACHE retained.
+
+Local modifications: enforce WebPDecoder::set_memory_limit across decoder working allocations, including lossless entropy and transform buffers, VP8 partitions and frame planes, alpha decoding, metadata reads, and retained animation canvases. Use checked sizes and fallible reservations; preserve public decoder APIs. Add owned RGB/RGBA pull-based lossless encoding with a counted encoding plan, bounded chunks, raw VP8L access, capacity-based budgets, and no complete compressed-frame buffer. Existing WebPEncoder APIs use the same encoding engine. Regression tests exercise allocation limits and pixel/frame/metadata/timing preservation.

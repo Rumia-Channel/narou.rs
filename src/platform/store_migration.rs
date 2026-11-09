@@ -839,6 +839,10 @@ mod tests {
             AssetStore::stat(&self.inner, key)
         }
 
+        fn read_range<'a>(&'a self, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+            AssetStore::read_range(&self.inner, key, range)
+        }
+
         fn read_stream<'a>(
             &'a self,
             key: &'a ObjectKey,
@@ -904,6 +908,10 @@ mod tests {
             key: &'a ObjectKey,
         ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
             AssetStore::stat(self.inner.as_ref(), key)
+        }
+
+        fn read_range<'a>(&'a self, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+            AssetStore::read_range(self.inner.as_ref(), key, range)
         }
 
         fn read_stream<'a>(

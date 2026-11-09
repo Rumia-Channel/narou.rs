@@ -7,8 +7,8 @@
 //! URL は path-style (`{endpoint}/{bucket}/{key}`)。バケット名の DNS 互換性に
 //! 依存せず、MinIO のようなローカル実装でも同じ経路で動く。
 //!
-//! 大きいオブジェクトは [`MAX_OBJECT_BYTES`] まで一括で読み書きする
-//! (multipart は未実装)。上限を超えるものは黙って切り捨てず失敗させる。
+//! Large assets use 8 MiB multipart uploads and owned response streams.
+//! Private staging reservations survive cancellation for scheduled reclamation.
 
 use std::sync::Arc;
 
@@ -23,9 +23,12 @@ use super::s3_sigv4::{self, Credentials, RequestToSign};
 use crate::error::{NarouError, Result};
 use crate::platform::PlatformFuture;
 
+#[path = "s3_stream.rs"]
+mod streaming;
+
 /// `read_small` / `write_small` の上限。
 pub const SMALL_CAP: u64 = 16 * 1024 * 1024;
-/// 1 オブジェクトの上限。これを超えるものは streaming 対応まで扱わない。
+/// Buffered PUT bound; multipart assets do not inherit this control-object cap.
 pub const MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// S3 への接続情報。値は呼び出し側 (設定 / 環境変数 / Secret) が解決する。
@@ -95,6 +98,7 @@ pub struct S3Store {
     http: Arc<dyn HttpClient>,
     clock: Arc<dyn Clock>,
     credential_sources: Option<(&'static str, &'static str)>,
+    stage_leases: Arc<super::staging::StageLeaseCache>,
 }
 
 impl S3Store {
@@ -126,6 +130,7 @@ impl S3Store {
             http,
             clock,
             credential_sources: None,
+            stage_leases: Arc::new(super::staging::StageLeaseCache::default()),
         })
     }
 
@@ -286,33 +291,10 @@ impl S3Store {
     /// dedup プール (`illustrations/<b64>`) にだけオブジェクトがあるか。
     /// legacy `挿絵/` fallback は付けない (移行判定に使う)。
     async fn pool_stat(&self, key: &ObjectKey) -> Result<Option<u64>> {
-        if !self.location.has_pool_alternate(key) {
-            return Ok(None);
-        }
-        let (response, _) = self
-            .send(
-                HttpMethod::Get,
-                &self.location.object_url(key),
-                &[("range", "bytes=0-0")],
-                None,
-                None,
-            )
-            .await?;
-        let status = response.status;
-        if status == 404 {
-            return Ok(None);
-        }
-        if !matches!(status, 200 | 206) {
-            return Err(NarouError::Platform(format!(
-                "S3 GET {} failed with status {status}",
-                key.as_ref()
-            )));
-        }
-        Ok(super::object_size(
-            status,
-            response.header("content-range"),
-            response.header("content-length"),
-        ))
+        if !self.location.has_pool_alternate(key) { return Ok(None); }
+        let response = self.stream_get(&self.location.object_url(key), &[("range", "bytes=0-0")]).await?;
+        if response.status == 404 { return Ok(None); }
+        streaming::metadata_size(&response).map(Some)
     }
 
     /// dedup プールにそのキーが存在するか (移行判定用)。
@@ -321,50 +303,10 @@ impl S3Store {
     }
 
     async fn stat_object(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>> {
-        // `HEAD` はエッジで 403 になる S3 互換サービスがあるため、
-        // `GET` + `Range: bytes=0-0` でメタデータだけ読む。
-        let (response, _) = self
-            .send(
-                HttpMethod::Get,
-                &self.location.object_url(key),
-                &[("range", "bytes=0-0")],
-                None,
-                None,
-            )
-            .await?;
-        // dedup 移行期: pool に無くても旧 `挿絵/` 位置に存在する挿絵を拾う。
-        let response = if response.status == 404 && self.location.has_pool_alternate(key) {
-            self.send(
-                HttpMethod::Get,
-                &self.location.legacy_object_url(key),
-                &[("range", "bytes=0-0")],
-                None,
-                None,
-            )
-            .await?
-            .0
-        } else {
-            response
-        };
-        let status = response.status;
-        if status == 404 {
-            return Ok(None);
-        }
-        if !matches!(status, 200 | 206) {
-            return Err(NarouError::Platform(format!(
-                "S3 GET {} failed with status {status}",
-                key.as_ref()
-            )));
-        }
-        let content_range = response.header("content-range").map(str::to_string);
-        let content_length = response.header("content-length").map(str::to_string);
-        let size = super::object_size(status, content_range.as_deref(), content_length.as_deref())
-            .ok_or_else(|| {
-                NarouError::Platform(format!(
-                    "S3 GET {} returned no size (content-range={content_range:?})",
-                    key.as_ref()
-                ))
-            })?;
+        self.renew_stage_progress(key).await?;
+        let response = self.stream_get_object(key, &[("range", "bytes=0-0")]).await?;
+        if response.status == 404 { return Ok(None); }
+        let size = streaming::metadata_size(&response)?;
         let etag = response
             .header("etag")
             .map(|value| value.trim_matches('"').to_string());
@@ -429,7 +371,7 @@ impl S3Store {
         }
     }
 
-    async fn delete_object(&self, key: &ObjectKey) -> Result<()> {
+    async fn delete_object_raw(&self, key: &ObjectKey) -> Result<()> {
         let (response, _) = self
             .send(
                 HttpMethod::Delete,
@@ -451,6 +393,11 @@ impl S3Store {
                 key.as_ref()
             )))
         }
+    }
+
+    async fn delete_object(&self, key: &ObjectKey) -> Result<()> {
+        self.delete_object_raw(key).await?;
+        self.delete_stage_record(key).await
     }
 
     async fn list_objects(&self, request: &ObjectListRequest) -> Result<ObjectListPage> {
@@ -522,14 +469,25 @@ impl S3Store {
     }
 
     async fn copy_object(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
-        let copy_source = self.location.copy_source(source);
+        if source == destination { return Ok(()); }
+        let metadata = self.stat_object(source).await?
+            .ok_or_else(|| NarouError::NotFound(source.to_string()))?;
+        let copy_source = if self.location.has_pool_alternate(source) && !self.pool_exists(source).await? {
+            format!("/{}/{}", self.location.bucket(),
+                s3_sigv4::canonical_path(&self.location.legacy_storage_key(source)).trim_start_matches('/'))
+        } else { self.location.copy_source(source) };
+        let content_type = content_type_for_key(destination).unwrap_or("application/octet-stream");
+        let etag = metadata.etag.as_ref().map(|value| format!("\"{value}\""));
+        let mut copy_headers = vec![("x-amz-copy-source", copy_source.as_str()),
+            ("x-amz-metadata-directive", "REPLACE"), ("content-type", content_type)];
+        if let Some(etag) = etag.as_deref() { copy_headers.push(("x-amz-copy-source-if-match", etag)); }
         let (response, _) = self
             .send(
                 HttpMethod::Put,
                 &self.location.object_url(destination),
-                &[("x-amz-copy-source", copy_source.as_str())],
+                &copy_headers,
                 Some(Vec::new()),
-                None,
+                Some(1024 * 1024),
             )
             .await?;
         let status = response.status;
@@ -548,6 +506,11 @@ impl S3Store {
                 source.as_ref(),
                 destination.as_ref()
             )));
+        }
+        let copied = self.stat_object(destination).await?
+            .ok_or_else(|| NarouError::Platform("S3 copied object is missing".into()))?;
+        if copied.size != metadata.size {
+            return Err(NarouError::Platform("S3 copied object length mismatch".into()));
         }
         Ok(())
     }
@@ -730,13 +693,13 @@ impl AssetStore for S3Store {
         &'a self,
         key: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
-        Box::pin(async move {
-            let Some(data) = self.read_object(key, None).await? else {
-                return Ok(None);
-            };
-            let stream = futures::stream::once(async move { Ok(data) });
-            Ok(Some(Box::pin(stream) as AssetStream))
-        })
+        Box::pin(self.stream_read(key))
+    }
+
+    fn read_range<'a>(
+        &'a self, key: &'a ObjectKey, range: std::ops::Range<u64>,
+    ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(self.range_read(key, range))
     }
 
     fn write_stream<'a>(
@@ -744,23 +707,7 @@ impl AssetStore for S3Store {
         key: &'a ObjectKey,
         stream: AssetStream,
     ) -> PlatformFuture<'a, Result<()>> {
-        Box::pin(async move {
-            use futures::StreamExt;
-            let mut stream = stream;
-            let mut data = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                data.extend_from_slice(&chunk);
-                if data.len() as u64 > MAX_OBJECT_BYTES {
-                    return Err(NarouError::Platform(format!(
-                        "S3 PUT {} exceeds the {} byte limit",
-                        key.as_ref(),
-                        MAX_OBJECT_BYTES
-                    )));
-                }
-            }
-            self.write_object(key, data).await
-        })
+        Box::pin(self.multipart_write(key, stream))
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
@@ -782,6 +729,7 @@ impl AssetStore for S3Store {
         destination: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
+            if source == destination { return Ok(()); }
             self.copy_object(source, destination).await?;
             self.delete_object(source).await
         })
@@ -826,6 +774,13 @@ mod tests {
         }
     }
 
+    fn range_metadata(size: u64) -> HttpResponse {
+        HttpResponse { status: 206, headers: vec![
+            ("content-range".into(), format!("bytes 0-0/{size}")),
+            ("etag".into(), "\"source-etag\"".into()),
+        ], body: vec![0] }
+    }
+
     #[test]
     fn move_preserves_source_when_copy_success_cannot_be_confirmed() {
         for body in [
@@ -845,6 +800,7 @@ mod tests {
             let store = store(http.clone());
             let source = key("novels/site/title/挿絵/old.png");
             let destination = key("novels/site/title/挿絵/new.png");
+            http.add_method_response(HttpMethod::Get, store.location.object_url(&source), range_metadata(3));
             http.add_response(store.location.object_url(&destination), HttpResponse {
                 status: 200, headers: Vec::new(), body: body.to_vec(),
             });
@@ -867,9 +823,12 @@ mod tests {
         http.add_text(&destination_url, 200,
             "<?xml version=\"1.0\"?><s3:CopyObjectResult xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\"><s3:LastModified>2026-10-14T00:00:00.000Z</s3:LastModified><s3:ETag>\"opaque-etag\"</s3:ETag></s3:CopyObjectResult>");
         http.add_response(&source_url, HttpResponse { status: 204, headers: Vec::new(), body: Vec::new() });
+        http.add_method_response(HttpMethod::Get, &source_url, range_metadata(3));
+        http.add_method_response(HttpMethod::Get, &destination_url, range_metadata(3));
 
         futures::executor::block_on(AssetStore::move_or_copy(&store, &source, &destination)).unwrap();
-        assert_eq!(http.requested_urls(), vec![format!("PUT {destination_url}"), format!("DELETE {source_url}")]);
+        assert_eq!(http.requested_urls(), vec![format!("GET {source_url}"), format!("PUT {destination_url}"),
+            format!("GET {destination_url}"), format!("DELETE {source_url}")]);
     }
 
     #[test]
