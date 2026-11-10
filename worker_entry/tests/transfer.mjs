@@ -333,7 +333,7 @@ function preparePhase(name) {
   mkdirSync(directory, { recursive: true });
   let toml = readFileSync(join(root, 'wrangler.toml'), 'utf8').replace(/\[build\][^\[]*/, '');
   toml = toml
-    .replace(/^main = .*$/m, `main = ${JSON.stringify(join(root, 'build', 'worker', 'shim.mjs').replaceAll('\\', '/'))}`)
+    .replace(/^main = .*$/m, `main = ${JSON.stringify(join(root, 'tests', 'transfer_failure_worker.mjs').replaceAll('\\', '/'))}`)
     .replace(/^directory = "public"$/m, `directory = ${JSON.stringify(join(root, 'public').replaceAll('\\', '/'))}`)
     .replace(/^migrations_dir = "migrations"$/m, `migrations_dir = ${JSON.stringify(join(root, 'migrations').replaceAll('\\', '/'))}`);
   const config = join(directory, 'wrangler.toml');
@@ -525,6 +525,23 @@ try {
   assert.equal(record.body.general_all_no, 1);
   assert.equal(record.body.use_subdirectory, false);
   console.log('PASS import creates the record and objects; unauthenticated / wrong-type / broken-zip are rejected');
+
+  for (const [fault, ncode] of [['lookup', 'n9981zz'], ['delete', 'n9982zz']]) {
+    const failed = await a.json('/api/transfer/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/zip', 'x-narou-test-cleanup-fault': fault },
+      body: archiveFor(fixtureA, { tocUrl: `https://ncode.syosetu.com/${ncode}/`, ncode }),
+      signal: AbortSignal.timeout(15000),
+    });
+    assert.equal(failed.response.status, 200, JSON.stringify(failed.body));
+    assert.equal(failed.body.success, false);
+    assert.equal(failed.body.created, 0);
+    assert.equal(failed.response.headers.get('x-test-cleanup-lookups'), '1', 'failed cleanup must not respawn itself');
+    assert.equal(failed.response.headers.get('x-test-cleanup-deletes'), fault === 'delete' ? '1' : '0');
+    const remaining = await a.json('/api/novels');
+    assert.deepEqual(remaining.body.data.map(record => record.toc_url), [TOC_URL], 'failed publication must not expose a new novel');
+  }
+  console.log('PASS failed import cleanup is bounded when lookup or deletion fails; existing novels remain usable');
 
   // 同じ ZIP の再取り込みは skip。
   const skipped = await a.upload(zipA);

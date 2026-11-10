@@ -1015,11 +1015,13 @@ struct CreateCleanup {
 
 impl CreateCleanup {
     async fn finish(&mut self) {
-        let Some(reservation) = self.reservation.as_ref() else { return; };
+        // Disarm before the first await: failure or cancellation must not let
+        // Drop recursively spawn another cleanup task.
+        let Some(reservation) = self.reservation.take() else { return; };
         // A cancelled/failed publication may have committed before its reply
         // disappeared. Never delete files belonging to that committed record.
         match self.novels.get(reservation.id()).await {
-            Ok(Some(_)) => { self.reservation = None; self.keys.clear(); return; }
+            Ok(Some(_)) => { self.keys.clear(); return; }
             Err(error) => { console_log!("transfer create cleanup lookup: {error}"); return; }
             Ok(None) => {}
         }
@@ -1030,10 +1032,8 @@ impl CreateCleanup {
             }
             self.keys.pop();
         }
-        if let Some(reservation) = self.reservation.take() {
-            if let Err(error) = self.novels.release_id(reservation).await {
-                console_log!("transfer create reservation cleanup: {error}");
-            }
+        if let Err(error) = self.novels.release_id(reservation).await {
+            console_log!("transfer create reservation cleanup: {error}");
         }
     }
 }

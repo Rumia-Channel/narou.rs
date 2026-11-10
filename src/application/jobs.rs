@@ -412,16 +412,65 @@ pub mod worker_ledger {
         }
     }
 
-    /// Atomically publish a resumable checkpoint and retire the old token.
+    /// Publish the durable high watermark and retire the old execution token.
     pub fn yield_execution(now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str) -> Statement {
+        checkpoint_statement(now, job_id, execution_token, checkpoint_json, true)
+    }
+
+    /// Publish the same high watermark without releasing execution ownership.
+    pub fn save_checkpoint(now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str) -> Statement {
+        checkpoint_statement(now, job_id, execution_token, checkpoint_json, false)
+    }
+
+    fn checkpoint_statement(
+        now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str, release: bool,
+    ) -> Statement {
+        // The checkpoint itself is the high watermark: replay cannot replace it
+        // with a lower cursor and then earn a fresh recovery budget by catching up.
+        // A job id identifies one generation; a new token is not a new generation.
+        // Resolving an unknown novel id is allowed, but changing a known target is
+        // not. Fetching/persisting share the same section coordinate, so changing
+        // phase/metadata alone is not progress; finishing is a one-way advance.
+        let release = if release {
+            "status = 'pending', last_error = NULL, lease_until = NULL, \
+             execution_token = NULL, admission_waiting = 0,"
+        } else { "" };
         Statement {
-            sql: "UPDATE worker_jobs \
-                  SET status = 'pending', last_error = NULL, \
-                      recovery_attempts = CASE WHEN checkpoint_json IS NOT ? THEN 0 ELSE recovery_attempts END, \
-                      checkpoint_json = ?, updated_at = ?, lease_until = NULL, execution_token = NULL, admission_waiting = 0 \
-                  WHERE job_id = ? AND status = 'running' AND execution_token = ?"
-                .to_string(),
-            binds: vec![checkpoint_json.to_string(), checkpoint_json.to_string(), now.to_string(), job_id.to_string(), execution_token.to_string()],
+            sql: format!(
+                "WITH positions AS ( \
+                   SELECT checkpoint_json IS NULL AS initial, \
+                     json_extract(checkpoint_json, '$.job_id') AS old_job, \
+                     json_extract(checkpoint_json, '$.novel_id') AS old_novel, \
+                     json_extract(checkpoint_json, '$.phase') AS old_phase, \
+                     json_extract(checkpoint_json, '$.next_section_index') AS old_cursor, \
+                     json_extract(?1, '$.job_id') AS new_job, \
+                     json_extract(?1, '$.novel_id') AS new_novel, \
+                     json_extract(?1, '$.phase') AS new_phase, \
+                     json_extract(?1, '$.next_section_index') AS new_cursor \
+                   FROM worker_jobs WHERE job_id = ?3 AND status = 'running' AND execution_token = ?4 \
+                 ), compatible AS ( \
+                   SELECT *, new_job = ?3 \
+                     AND (new_novel IS NULL OR typeof(new_novel) = 'integer') \
+                     AND ((new_phase IN ('planned', 'finished') AND new_cursor IS NULL) \
+                       OR (new_phase IN ('fetching', 'persisting', 'finished') \
+                         AND typeof(new_cursor) = 'integer' AND new_cursor >= 0)) \
+                     AND (initial OR (old_job = ?3 \
+                       AND (old_novel IS NULL OR old_novel IS new_novel) \
+                       AND ((old_phase = 'planned' AND old_cursor IS NULL) \
+                         OR (old_phase IN ('fetching', 'persisting') \
+                           AND typeof(old_cursor) = 'integer' AND old_cursor >= 0)))) AS valid \
+                   FROM positions \
+                 ), progress AS MATERIALIZED ( \
+                   SELECT valid AND initial AS initialize, valid AND (new_phase = 'finished' \
+                     OR (new_phase IN ('fetching', 'persisting') \
+                       AND new_cursor > COALESCE(old_cursor, 0))) AS advanced FROM compatible \
+                 ) UPDATE worker_jobs SET {release} \
+                   recovery_attempts = CASE WHEN (SELECT advanced FROM progress) THEN 0 ELSE recovery_attempts END, \
+                   checkpoint_json = CASE WHEN (SELECT initialize OR advanced FROM progress) THEN ?1 ELSE checkpoint_json END, \
+                   updated_at = ?2 \
+                 WHERE job_id = ?3 AND status = 'running' AND execution_token = ?4"
+            ),
+            binds: vec![checkpoint_json.to_string(), now.to_string(), job_id.to_string(), execution_token.to_string()],
         }
     }
 
@@ -472,12 +521,15 @@ pub mod worker_ledger {
     }
 
     /// One waker reserves the delivery; send failure is recovered by select_stuck.
+    /// Clear only a due hold, so the reaper grants this dispatch a fresh grace
+    /// period without shortening backoff or overwriting a concurrent claim.
     pub fn mark_waiting_dispatched(now: &str, job_id: &str) -> Statement {
         Statement {
-            sql: "UPDATE worker_jobs SET admission_waiting = 0, updated_at = ? \
-                  WHERE job_id = ? AND admission_waiting = 1 AND status IN ('pending', 'retryable')"
+            sql: "UPDATE worker_jobs SET admission_waiting = 0, updated_at = ?, lease_until = NULL \
+                  WHERE job_id = ? AND admission_waiting = 1 AND status IN ('pending', 'retryable') \
+                    AND (lease_until IS NULL OR lease_until <= ?)"
                 .to_string(),
-            binds: vec![now.to_string(), job_id.to_string()],
+            binds: vec![now.to_string(), job_id.to_string(), now.to_string()],
         }
     }
 
@@ -1977,6 +2029,8 @@ mod tests {
     #[cfg(feature = "native-runtime")]
     mod claim_sql {
         use super::super::worker_ledger::{self, Statement, claim_fresh, claim_reclaim};
+        use super::super::{ExecutionPhase, JobId, WorkerExecutionCheckpoint};
+        use crate::platform::NovelId;
         use rusqlite::Connection;
 
         fn db() -> Connection {
@@ -2479,29 +2533,176 @@ mod tests {
             }
         }
 
-        #[test]
-        fn repeated_crashes_close_without_business_attempts_and_progress_resets_recovery() {
-            let conn = db();
-            insert(&conn, "crash", "42", "running", Some("2026-01-01T00:01:00Z"));
-            for n in 0..worker_ledger::MAX_RECOVERY_ATTEMPTS {
-                let now = format!("2026-01-01T00:{:02}:00Z", 10 + n);
-                assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(&now, "crash", &now)), 1);
-            }
-            let closed = worker_ledger::finalize_stuck("crashed", "2026-01-01T00:20:00Z", "crash", "2026-01-01T00:20:00Z", 3);
-            assert_eq!(apply(&conn, closed), 1);
-            assert_eq!(status_of(&conn, "crash"), "permanent");
-            let attempts: i64 = conn.query_row("SELECT attempts FROM worker_jobs WHERE job_id='crash'", [], |row| row.get(0)).unwrap();
-            assert_eq!(attempts, 0);
+        fn checkpoint_json(job_id: &str, novel_id: Option<i64>, phase: ExecutionPhase, cursor: Option<u64>) -> String {
+            serde_json::to_string(
+                &WorkerExecutionCheckpoint::planned(JobId(job_id.into()), novel_id.map(NovelId))
+                    .advance(phase, cursor),
+            ).unwrap()
+        }
 
-            insert(&conn, "progress", "99", "pending", None);
-            conn.execute("UPDATE worker_jobs SET recovery_attempts=2 WHERE job_id='progress'", []).unwrap();
-            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "progress", "99", None)), 1);
-            assert_eq!(apply(&conn, worker_ledger::yield_execution(NOW, "progress", "token", "advanced")), 1);
-            let saved: (i64, i64, String) = conn.query_row(
-                "SELECT attempts,recovery_attempts,checkpoint_json FROM worker_jobs WHERE job_id='progress'", [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            ).unwrap();
-            assert_eq!(saved, (0, 0, "advanced".into()));
+        fn recovery_checkpoint(conn: &Connection, job_id: &str) -> (u32, Option<String>) {
+            conn.query_row(
+                "SELECT recovery_attempts, checkpoint_json FROM worker_jobs WHERE job_id = ?",
+                [job_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        }
+
+        fn stuck(conn: &Connection, before: &str) -> Vec<String> {
+            let statement = worker_ledger::select_stuck(before, 50);
+            conn.prepare(&statement.sql).unwrap()
+                .query_map(rusqlite::params_from_iter(statement.binds.iter()), |row| row.get(0))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        }
+
+        #[test]
+        fn checkpoint_replay_keeps_high_watermark_until_real_progress() {
+            for release in [false, true] {
+                let publish = if release { worker_ledger::yield_execution } else { worker_ledger::save_checkpoint };
+                let conn = db();
+                insert(&conn, "replay", "42", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "replay", "42", None)), 1);
+                let watermark = checkpoint_json("replay", Some(42), ExecutionPhase::Fetching, Some(200));
+                assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "replay", "token", &watermark)), 1);
+                conn.execute("UPDATE worker_jobs SET attempts = 2, recovery_attempts = 2 WHERE job_id = 'replay'", []).unwrap();
+                for cursor in [100, 200, 0, 199, 200, 201] {
+                    let encoded = checkpoint_json("replay", Some(42), ExecutionPhase::Fetching, Some(cursor));
+                    assert_eq!(apply(&conn, publish(NOW, "replay", "stale-token", &encoded)), 0);
+                    assert_eq!(recovery_checkpoint(&conn, "replay"), (2, Some(watermark.clone())));
+                    assert_eq!(apply(&conn, publish(NOW, "replay", "token", &encoded)), 1);
+                    let expected = if cursor > 200 { (0, Some(encoded)) } else { (2, Some(watermark.clone())) };
+                    assert_eq!(recovery_checkpoint(&conn, "replay"), expected);
+                    let ownership: (i64, Option<String>, Option<String>) = conn.query_row(
+                        "SELECT attempts, execution_token, lease_until FROM worker_jobs WHERE job_id = 'replay'",
+                        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    ).unwrap();
+                    if release {
+                        assert_eq!(status_of(&conn, "replay"), "pending");
+                        assert_eq!(ownership, (2, None, None));
+                        assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "replay", "42", None)), 1);
+                    } else {
+                        assert_eq!(status_of(&conn, "replay"), "running");
+                        assert_eq!(ownership, (2, Some("token".into()), Some(LEASE.into())));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn checkpoint_identity_shape_and_phase_changes_do_not_launder_recovery() {
+            for release in [false, true] {
+                let publish = if release { worker_ledger::yield_execution } else { worker_ledger::save_checkpoint };
+                let conn = db();
+                insert(&conn, "progress", "42", "pending", None);
+                conn.execute("UPDATE worker_jobs SET recovery_attempts = 2", []).unwrap();
+                let planned = checkpoint_json("progress", None, ExecutionPhase::Planned, None);
+                let unresolved = checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(200));
+                let resolved = checkpoint_json("progress", Some(42), ExecutionPhase::Fetching, Some(201));
+                let persisted = checkpoint_json("progress", Some(42), ExecutionPhase::Persisting, Some(202));
+                let finished = checkpoint_json("progress", Some(42), ExecutionPhase::Finished, None);
+                let mut metadata: serde_json::Value = serde_json::from_str(&unresolved).unwrap();
+                metadata["novel_id"] = serde_json::json!(42);
+                metadata["phase"] = serde_json::json!("persisting");
+                metadata["annotation"] = serde_json::json!("changed without new durable sections");
+                let malformed_cursor = r#"{"job_id":"progress","novel_id":null,"phase":"fetching","next_section_index":"300"}"#;
+                let unknown_shape = r#"{"job_id":"progress","novel_id":null,"phase":"other","next_section_index":300}"#;
+                let cases = [
+                    (planned.clone(), false, planned.clone()),
+                    (checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(0)), false, planned.clone()),
+                    (unresolved.clone(), true, unresolved.clone()),
+                    (serde_json::to_string_pretty(&metadata).unwrap(), false, unresolved.clone()),
+                    (checkpoint_json("other-generation", None, ExecutionPhase::Fetching, Some(300)), false, unresolved.clone()),
+                    (malformed_cursor.into(), false, unresolved.clone()),
+                    (unknown_shape.into(), false, unresolved.clone()),
+                    (planned, false, unresolved),
+                    (resolved.clone(), true, resolved.clone()),
+                    (checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(300)), false, resolved.clone()),
+                    (checkpoint_json("progress", Some(99), ExecutionPhase::Fetching, Some(300)), false, resolved),
+                    (persisted.clone(), true, persisted),
+                    (finished.clone(), true, finished.clone()),
+                    (checkpoint_json("progress", Some(42), ExecutionPhase::Fetching, Some(300)), false, finished.clone()),
+                    (finished.clone(), false, finished),
+                ];
+                for (encoded, advances, expected) in cases {
+                    if status_of(&conn, "progress") == "pending" {
+                        assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "progress", "42", None)), 1);
+                    }
+                    conn.execute("UPDATE worker_jobs SET recovery_attempts = 2", []).unwrap();
+                    assert_eq!(apply(&conn, publish(NOW, "progress", "token", &encoded)), 1);
+                    assert_eq!(recovery_checkpoint(&conn, "progress"),
+                        (if advances { 0 } else { 2 }, Some(expected)), "release={release}, checkpoint={encoded}");
+                }
+            }
+        }
+
+        #[test]
+        fn repeated_crashes_after_replay_exhaust_recovery_and_release_family() {
+            let conn = db();
+            let expired = "2026-01-01T00:01:00Z";
+            insert(&conn, "crash", "42", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+            let watermark = checkpoint_json("crash", Some(42), ExecutionPhase::Fetching, Some(200));
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "crash", "token", &watermark)), 1);
+            insert(&conn, "successor", "99", "pending", None);
+            assert_eq!(apply(&conn, worker_ledger::park_admission(NOW, "successor", "99", Some("shared.example"))), 1);
+            for recovery in 0..=worker_ledger::MAX_RECOVERY_ATTEMPTS {
+                assert!(waiting(&conn).is_empty(), "the live owner still excludes its family");
+                // A fresh WorkerBudget replays both periodic boundaries before
+                // crashing at the same durable section, even after a budget yield.
+                for cursor in [100, 200] {
+                    let replay = checkpoint_json("crash", Some(42), ExecutionPhase::Fetching, Some(cursor));
+                    assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "crash", "token", &replay)), 1);
+                    assert_eq!(recovery_checkpoint(&conn, "crash"), (recovery, Some(watermark.clone())));
+                }
+                let replay = checkpoint_json("crash", Some(42), ExecutionPhase::Fetching, Some(100));
+                assert_eq!(apply(&conn, worker_ledger::yield_execution(NOW, "crash", "token", &replay)), 1);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+                assert_eq!(recovery_checkpoint(&conn, "crash"), (recovery, Some(watermark.clone())));
+                conn.execute("UPDATE worker_jobs SET lease_until = ? WHERE job_id = 'crash'", [expired]).unwrap();
+                let exhausted = recovery == worker_ledger::MAX_RECOVERY_ATTEMPTS;
+                assert_eq!(apply(&conn, worker_ledger::finalize_stuck("crashed", NOW, "crash", NOW, 0)), usize::from(exhausted));
+                if exhausted { break; }
+                if recovery % 2 == 0 {
+                    assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(NOW, "crash", NOW)), 1);
+                    assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+                } else {
+                    assert_eq!(apply(&conn, claim_reclaim(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+                }
+                assert_eq!(recovery_checkpoint(&conn, "crash"), (recovery + 1, Some(watermark.clone())));
+            }
+            assert_eq!(status_of(&conn, "crash"), "permanent");
+            assert_eq!(recovery_checkpoint(&conn, "crash"), (worker_ledger::MAX_RECOVERY_ATTEMPTS, None));
+            let attempts: i64 = conn.query_row("SELECT attempts FROM worker_jobs WHERE job_id = 'crash'", [], |row| row.get(0)).unwrap();
+            assert_eq!(attempts, 0);
+            assert_eq!(waiting(&conn), vec!["successor"]);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "successor")), 1);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "successor-token", "successor", "99", Some("shared.example"))), 1);
+            assert_eq!(recovery_checkpoint(&conn, "successor"), (0, None));
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "late-token", "crash", "42", Some("shared.example"))), 0);
+        }
+
+        #[test]
+        fn capacity_redispatch_replaces_expired_hold_with_dispatch_grace() {
+            for status in ["pending", "retryable"] {
+                let conn = db();
+                insert(&conn, "capacity", "42", status, Some("2026-01-01T00:01:00Z"));
+                conn.execute("UPDATE worker_jobs SET attempts = 2, recovery_attempts = 3", []).unwrap();
+                assert_eq!(apply(&conn, worker_ledger::park_capacity(NOW, "capacity")), 1);
+                assert_eq!(waiting(&conn), vec!["capacity"]);
+                assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "capacity")), 1);
+                assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "capacity")), 0);
+                let state: (i64, i64, Option<String>, String) = conn.query_row(
+                    "SELECT attempts, recovery_attempts, lease_until, updated_at FROM worker_jobs",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                ).unwrap();
+                assert_eq!(state, (2, 3, None, NOW.into()));
+                // wake_waiting_jobs precedes reaping in the same cron tick.
+                let cutoff = "2026-01-01T00:08:00Z";
+                assert!(stuck(&conn, cutoff).is_empty());
+                assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(NOW, "capacity", cutoff)), 0);
+                assert_eq!(apply(&conn, worker_ledger::finalize_stuck("lost", NOW, "capacity", cutoff, 0)), 0);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "capacity", "42", None)), 1);
+                assert_eq!(recovery_checkpoint(&conn, "capacity"), (3, None));
+            }
         }
 
         #[test]
@@ -2522,6 +2723,27 @@ mod tests {
             assert_eq!(apply(&conn, worker_ledger::park_capacity(NOW, "owner")), 0);
             let lease: String = conn.query_row("SELECT lease_until FROM worker_jobs WHERE job_id='backoff'", [], |row| row.get(0)).unwrap();
             assert_eq!(lease, LEASE);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "backoff")), 0);
+            assert_eq!(waiting(&conn), vec!["pending"]);
+            // A delivery can claim between selection and the waker's CAS.
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "claimed", "pending", "42", None)), 1);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "pending")), 0);
+            let ownership: (String, String) = conn.query_row(
+                "SELECT execution_token, lease_until FROM worker_jobs WHERE job_id = 'pending'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(ownership, ("claimed".into(), LEASE.into()));
+            let held: (String, i64, i64) = conn.query_row(
+                "SELECT lease_until, recovery_attempts, admission_waiting FROM worker_jobs WHERE job_id = 'backoff'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(held, (LEASE.into(), 1, 1));
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(LEASE, "backoff")), 1);
+            let released: (Option<String>, i64, i64) = conn.query_row(
+                "SELECT lease_until, recovery_attempts, admission_waiting FROM worker_jobs WHERE job_id = 'backoff'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(released, (None, 1, 0));
             assert_eq!(status_of(&conn, "owner"), "running");
         }
 
