@@ -218,6 +218,10 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - `narou init -l/--line-height` は AozoraEpub3 設定が保存される場合だけ `line-height` として保存し、未指定時は Ruby 版の非対話デフォルトに合わせて `1.8` を使う。
 - 有効な AozoraEpub3 パスを設定した場合は、Ruby 版と同じく `chuki_tag.txt` のカスタム注記追記/置換、`AozoraEpub3.ini` のコピー、行高反映済みカスタム CSS のコピーを行う。カスタム CSS の置き場所は AozoraEpub3 のテンプレート構成で変わる: 元祖レイアウト (`template/OPS/css/` がある) は `template/OPS/css_custom/vertical_font.css`、1.1.1 以降の改造版 / 電書協レイアウト (`template/item/style/` がある) は `template/item/style_custom/font.css`（中身は `preset/denshokyo_font.css`）。判定は `converter::dakuten_font::AozoraTemplateKind` が唯一の定義で、`init`・濁点フォント切替・変換時の不足補完・`lite` エンジンへの同梱 CSS がこれに従う。OPS パス固定に戻すと二分アキ (`［＃二分アキ］`)・行高・前書き/後書きの装飾が EPUB に反映されない (issue #42)。
 
+## ドキュメントのパス表記
+- 文書にはユーザーの PC 固有の絶対パス、実際の一時ディレクトリ名、作業ごとの一時配置パスを記載しない。
+- リポジトリ相対パス、ホームからの相対パス、または `<relay-root>` / `<検証用ライブラリ>` などの概念的なパスだけを使う。実環境の配置は設定やサービス定義から確認し、文書へ転記しない。
+
 ## Build & Run
 ```powershell
 cargo build              # Build (edition 2024)
@@ -229,7 +233,7 @@ cargo check              # Type-check
 **重要**: `cargo run` は `.narou/` を持つ初期化済みライブラリをCWDとして実行する必要がある（例: `sample/novel/`、gitignore 済みのローカル用ディレクトリ）。
 
 ## 検証用ライブラリ
-- 動作確認は **`C:\Users\rumia\Documents\WebNovel`** で行う。実データ入りの narou ライブラリ（なろう / カクヨム / ノクターンの 9 作品、`webnovel/*.yaml` も同梱版を配置済み）で、ユーザーが「中のデータの削除も含めて完全に自由にしていい」と許可している。検証用に小説を追加・削除してよい。
+- 動作確認は **ユーザーホームからの相対位置 `Documents/WebNovel` にある検証用ライブラリ** で行う。実データ入りの narou ライブラリ（なろう / カクヨム / ノクターンの 9 作品、`webnovel/*.yaml` も同梱版を配置済み）で、ユーザーが「中のデータの削除も含めて完全に自由にしていい」と許可している。検証用に小説を追加・削除してよい。
 - `%TEMP%` に検証用ライブラリを作らない（過去に 100 個・685MB の残骸を出した）。テストや検証が一時ディレクトリを作るときは `tempfile::TempDir` を使い、panic しても残さない（手動削除は panic で飛ぶ）。
 
 ## Edition 2024 注意事項
