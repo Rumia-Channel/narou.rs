@@ -60,6 +60,17 @@ pub(crate) async fn build_epub_response(env: &Env, id: i64, virtual_only: bool) 
         let index = if is_virtual { None } else { load_illustration_index(&services.objects, &keys).await.map(Arc::new) };
         let illust_prefix = narou_rs::platform::ObjectPrefix::new(format!("{}/挿絵", keys.prefix().as_ref())).map_err(stream_error)?;
         let mut names = Vec::new();
+        let mut cover_image = None;
+        if settings.enable_illust {
+            for filename in narou_rs::converter::render::COVER_IMAGE_NAMES {
+                let key = keys.prefix().join(filename).map_err(stream_error)?;
+                if services.assets.stat(&key).await.map_err(stream_error)?.is_some() {
+                    cover_image = Some(filename);
+                    names.push(filename.to_owned());
+                    break;
+                }
+            }
+        }
         if !is_virtual {
             let mut request = narou_rs::platform::ObjectListRequest::new(illust_prefix.clone(), 100.try_into().unwrap());
             loop {
@@ -75,12 +86,11 @@ pub(crate) async fn build_epub_response(env: &Env, id: i64, virtual_only: bool) 
         }
         let mut options = epub_lite::EpubBuildOptions::from_settings(epub_lite::EpubSettingsInput {
             title: &record.title, author: &record.author, settings: &settings,
-            // The asset plan decides whether a referenced cover actually exists.
-            has_images: true, extra_assets: Vec::new(), assets_dir: None, kindle: false,
+            has_cover_image: cover_image.is_some(), extra_assets: Vec::new(), assets_dir: None, kindle: false,
             rotate_image: local_map.get("convert.rotate-image").and_then(setting_text)
                 .and_then(|value| narou_rs::converter::settings::ImageRotation::from_setting(&value)),
         });
-        let mut preparation = StreamingPreparation::scan(&source, &options, Vec::new(), index).await.map_err(stream_error)?;
+        let mut preparation = StreamingPreparation::scan(&source, &options, Vec::new(), index, cover_image).await.map_err(stream_error)?;
         for reference in preparation.references() {
             if names.iter().any(|name| name == reference) || !reference.starts_with("挿絵/") { continue; }
             let key = epub_image_key(&keys, &illustration_sources, reference).map_err(stream_error)?;

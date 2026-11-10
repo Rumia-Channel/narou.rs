@@ -186,9 +186,9 @@ function solidPng(rgb) {
     return Buffer.concat([size, type, data, crc]);
   };
   const header = Buffer.alloc(13);
-  header.writeUInt32BE(64, 0); header.writeUInt32BE(96, 4);
+  header.writeUInt32BE(96, 0); header.writeUInt32BE(96, 4);
   header[8] = 8; header[9] = 2;
-  const row = Buffer.alloc(1 + 64 * 3);
+  const row = Buffer.alloc(1 + 96 * 3);
   row.fill(Buffer.from(rgb), 1);
   return Buffer.concat([
     Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
@@ -797,10 +797,12 @@ try {
   const combined = await b.request(`/api/virtual_novels/${virtualId}/download.epub`);
   assert.equal(combined.status, 200, combined.status === 200 ? '' : await combined.text());
   const book = readZip(Buffer.from(await combined.arrayBuffer()));
+  assert(!book.has('item/xhtml/cover.xhtml'), 'the first member illustration must stay in the virtual book body');
   const pixels = [...book].filter(([name]) => name.startsWith('item/image/')).map(([, bytes]) => firstPngPixel(bytes));
   assert.deepEqual(new Set(pixels.map(rgb => rgb.join(','))), new Set(colors.map(rgb => rgb.join(','))), 'both same-named member images must survive');
   const packageText = [...book].find(([name]) => name.endsWith('.opf'))[1].toString();
   assert.match(packageText, /page-progression-direction="ltr"/);
+  assert.doesNotMatch(packageText, /\bcover-image\b/, 'a virtual book needs its own explicit cover');
   const xhtml = [...book].filter(([name]) => name.endsWith('.xhtml')).map(([, bytes]) => bytes.toString()).join('\n');
   for (const title of memberTitles) assert(xhtml.includes(`${title}の本文`), xhtml);
   assert(!xhtml.includes('結合に混ぜない個別あらすじ'), 'member books must not be concatenated with their individual front matter');

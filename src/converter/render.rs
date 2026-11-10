@@ -352,15 +352,18 @@ fn novel_type_text(novel_type: Option<u8>) -> String {
     }
 }
 
+/// Ruby 互換の表紙ファイル名と優先順。保存先に依存せず同じ候補を使う。
+pub const COVER_IMAGE_NAMES: [&str; 3] = ["cover.jpg", "cover.png", "cover.jpeg"];
+
 /// 小説ディレクトリ内の表紙画像 (`cover.jpg` → `cover.png` → `cover.jpeg` の
 /// 順で最初に実在するもの)。
 ///
 /// 変換時の挿絵注記の挿入・native CLI の `-c 0` 判定・i文庫 ZIP・EPUB の
 /// オンデマンド生成が同じ探索順を使う。
 pub(crate) fn cover_image_path(dir: &Path) -> Option<PathBuf> {
-    [".jpg", ".png", ".jpeg"]
+    COVER_IMAGE_NAMES
         .into_iter()
-        .map(|extension| dir.join(format!("cover{extension}")))
+        .map(|name| dir.join(name))
         .find(|path| path.is_file())
 }
 

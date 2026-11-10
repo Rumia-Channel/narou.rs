@@ -54,6 +54,7 @@ pub struct StreamingPreparation {
     references: Vec<String>,
     index: Option<Arc<IllustrationIndex>>,
     cover_setting: Option<&'static str>,
+    explicit_cover: bool,
     pub uses_dakuten: bool,
 }
 
@@ -63,6 +64,7 @@ impl StreamingPreparation {
         options: &EpubBuildOptions,
         image_names: Vec<String>,
         index: Option<Arc<IllustrationIndex>>,
+        mut cover_image: Option<&str>,
     ) -> Result<Self> {
         let mut config = config_for(options.assets_dir.as_deref());
         apply_rotate_image(&mut config, options.rotate_image);
@@ -70,6 +72,7 @@ impl StreamingPreparation {
         config.image_alt_map.clear();
         let mut metadata = aozora_epub3_lite::metadata::MetadataScanner::new(TitleType::TitleAuthor, false);
         let mut lines = text_lines(source).await?;
+        let explicit_cover = cover_image.is_some();
         let mut references = Vec::new();
         let mut uses_dakuten = false;
         while let Some(line) = lines.next().await {
@@ -78,14 +81,26 @@ impl StreamingPreparation {
             collect_image_alts(&line, &mut config);
             uses_dakuten |= text_has_dakuten_marker(&line);
             if !config.no_illust {
-                references.extend(image_reference_occurrences(&line));
+                for reference in image_reference_occurrences(&line) {
+                    // Native inserts a cover annotation before the body. Match
+                    // that asset order without rewriting the staged text, and
+                    // do not duplicate a cover already present in cached text.
+                    if let Some(cover) = cover_image.take() && reference != cover {
+                        references.push(cover.to_owned());
+                    }
+                    references.push(reference);
+                }
             }
+        }
+        if !config.no_illust && let Some(cover) = cover_image {
+            references.push(cover.to_owned());
         }
         let input = Input::from_source(Arc::new(EpubTextSource::new(String::new(), image_names)))
             .map_err(conversion_error)?;
         Ok(Self {
             input, config, detected: metadata.finish(), references, index,
-            cover_setting: options.cover_from_first_image.then_some("0"), uses_dakuten,
+            cover_setting: (!explicit_cover && options.cover_from_first_image).then_some("0"),
+            explicit_cover, uses_dakuten,
         })
     }
 
@@ -110,10 +125,21 @@ impl StreamingPreparation {
         self,
         source: &ConvertedText,
         store: Arc<dyn AssetStore>,
-        assets: Vec<CollectedAsset>,
-        cover: Option<String>,
+        mut assets: Vec<CollectedAsset>,
+        mut cover: Option<String>,
         options: &EpubBuildOptions,
     ) -> Result<StreamingBuild> {
+        if self.explicit_cover {
+            // Select the named cover itself, even if it is smaller than the
+            // automatic-cover threshold. Never fall through to a body image.
+            cover = None;
+            if let Some(reference) = self.references.first()
+                && let Some(asset) = assets.iter_mut().find(|asset| asset.references.contains(reference))
+            {
+                asset.is_cover = true;
+                cover = Some(asset.asset.path.clone());
+            }
+        }
         for reference in &self.references {
             if !assets.iter().any(|asset| asset.references.contains(reference)) {
                 crate::application::messages::emit_default_async(
@@ -421,7 +447,7 @@ mod tests {
             let store = Arc::new(MemoryObjectStore::new());
             let source = source(store.clone(), text.into()).await;
             let options = options();
-            let preparation = StreamingPreparation::scan(&source, &options, Vec::new(), None).await.unwrap();
+            let preparation = StreamingPreparation::scan(&source, &options, Vec::new(), None, None).await.unwrap();
             let (assets, cover) = preparation.asset_plan().unwrap().finish(|_| unreachable!()).unwrap();
             let build = preparation.finish(&source, store.clone(), assets, cover, &options).await.unwrap();
             let original = super::super::prepare_book_from_source(
@@ -438,6 +464,38 @@ mod tests {
     }
 
     #[test]
+    fn explicit_cover_preserves_body_images_for_fresh_and_cached_text() {
+        futures::executor::block_on(async {
+            for (cover_name, cached_cover) in [(None, false), (Some("cover.png"), false), (Some("cover.png"), true)] {
+                let store = Arc::new(MemoryObjectStore::new());
+                let header = if cached_cover { "［＃挿絵（cover.png）入る］\n" } else { "" };
+                let text = format!("題名\n著者\n{header}\n本文。\n［＃挿絵（挿絵/body.png）入る］\n末尾。\n");
+                let source = source(store.clone(), text).await;
+                let options = EpubBuildOptions { cover_from_first_image: cover_name.is_some(), ..options() };
+                let preparation = StreamingPreparation::scan(
+                    &source, &options, vec!["cover.png".into(), "挿絵/body.png".into()], None, cover_name,
+                ).await.unwrap();
+                let (assets, cover) = preparation.asset_plan().unwrap().finish(|request| {
+                    let size = if request.source == "cover.png" { 32 } else { 128 };
+                    Ok(Some(aozora_epub3_lite::pipeline::ImageDimensions { width: size, height: size }))
+                }).unwrap();
+                let body_path = assets.iter().find(|asset| asset.source == "挿絵/body.png").unwrap().asset.path.clone();
+                let explicit_path = assets.iter().find(|asset| asset.source == "cover.png").map(|asset| asset.asset.path.clone());
+                let build = preparation.finish(&source, store.clone(), assets, cover, &options).await.unwrap();
+                assert_eq!(build.book.cover_asset, explicit_path);
+                let body = fragments(store.as_ref(), &build).await.join("\n");
+                assert!(body.contains(&format!("../{body_path}")), "the body illustration must remain in the body");
+                assert!(body.contains("本文。") && body.contains("末尾。"));
+                if let Some(path) = explicit_path {
+                    assert!(!body.contains(&format!("../{path}")), "only the explicit cover belongs outside the body");
+                }
+                source.cleanup().await.unwrap();
+                store.delete(&build.fragments.key).await.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn long_book_keeps_every_section_without_retaining_xhtml_bodies() {
         futures::executor::block_on(async {
             let store = Arc::new(MemoryObjectStore::new());
@@ -447,7 +505,7 @@ mod tests {
             }
             let source = source(store.clone(), text).await;
             let options = options();
-            let preparation = StreamingPreparation::scan(&source, &options, Vec::new(), None).await.unwrap();
+            let preparation = StreamingPreparation::scan(&source, &options, Vec::new(), None, None).await.unwrap();
             let (assets, cover) = preparation.asset_plan().unwrap().finish(|_| unreachable!()).unwrap();
             let build = preparation.finish(&source, store.clone(), assets, cover, &options).await.unwrap();
             assert!(build.ranges.len() >= 300);

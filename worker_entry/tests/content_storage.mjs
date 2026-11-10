@@ -723,6 +723,8 @@ export default class extends Production.default {
     const imageReferences = new Set();
     const animatedImages = new Set();
     const text = epubText(Buffer.concat(chunks), (name, bytes) => {
+      assert(!name.endsWith('/cover.xhtml'), 'a body illustration must not become an unspecified cover');
+      if (name.endsWith('.opf')) assert.doesNotMatch(bytes.toString(), /\bcover-image\b/);
       if (name.endsWith('.xhtml')) {
         for (const [, source] of bytes.toString().matchAll(/<(?:img|image)\b[^>]*\b(?:src|(?:xlink:)?href)="([^"]+)"/g)) {
           imageReferences.add(new URL(source, `https://epub.invalid/${name}`).pathname.slice(1));
@@ -734,8 +736,6 @@ export default class extends Production.default {
       }
     });
     assert(text.includes('初回取得の本文です。'));
-    // Auto-cover may move the illustration out of the body; either location
-    // must reference the complete animation, not a static poster or a missing file.
     assert.equal(imageReferences.size, 1, JSON.stringify({ references: [...imageReferences], animations: [...animatedImages] }));
     for (const image of imageReferences) assert(animatedImages.has(image), 'the displayed image must retain every animation frame');
     const upstreamClosed = Promise.withResolvers();
@@ -797,11 +797,39 @@ export default class extends Production.default {
       assert(sourceStaticImage.bytes.length < 16 * 1024 * 1024, 'large PNG stays within the former encoded-size limit');
       await download(new URL(`/${slug}/`, target).href, false, false);
       const largeId = scalar(`SELECT id FROM novels WHERE ncode='${slug}'`);
+      // Import the explicit cover through the production streaming boundary;
+      // exercise chunked storage without embedding large blobs in SQL.
+      const coverExport = await api(`/api/transfer/export?ids=${largeId}`);
+      assert.equal(coverExport.status, 200);
+      const coverEntries = [];
+      let coverManifest;
+      epubText(Buffer.from(await coverExport.arrayBuffer()), (name, bytes) => {
+        if (name === 'manifest.json') coverManifest = JSON.parse(bytes.toString());
+        else coverEntries.push([name, bytes]);
+      });
+      coverManifest.novels[0].files.push({
+        path: 'cover.png', size: sourceStaticImage.bytes.length,
+        sha256: createHash('sha256').update(sourceStaticImage.bytes).digest('hex'),
+      });
+      coverEntries.unshift(['manifest.json', Buffer.from(JSON.stringify(coverManifest))]);
+      coverEntries.push(['novels/0/cover.png', sourceStaticImage.bytes]);
+      const coverImport = await fetch(`http://127.0.0.1:${port}/api/transfer/import?overwrite=true`, {
+        method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/zip', Connection: 'close' },
+        body: storedZip(coverEntries),
+      });
+      assert.equal(coverImport.status, 200, coverImport.status === 200 ? undefined : await coverImport.text());
+      assert.deepEqual(await coverImport.json(), { success: true, created: 0, overwritten: 1, skipped: 0, errors: [] });
       const largeEpub = await api(`/api/novels/${largeId}/download.epub`);
       assert.equal(largeEpub.status, 200, largeEpub.status === 200 ? undefined : await largeEpub.text());
       const coverPaths = new Set();
+      const bodyPaths = new Set();
       const entries = new Map();
       epubText(Buffer.from(await largeEpub.arrayBuffer()), (name, bytes) => {
+        if (name.endsWith('.xhtml') && !name.endsWith('/cover.xhtml')) {
+          for (const [, source] of bytes.toString().matchAll(/<(?:img|image)\b[^>]*\b(?:src|(?:xlink:)?href)="([^"]+)"/g)) {
+            bodyPaths.add(new URL(source, `https://epub.invalid/${name}`).pathname.slice(1));
+          }
+        }
         if (name.endsWith('.png')) entries.set(name, bytes);
         if (name.endsWith('/cover.xhtml')) {
           for (const [, source] of bytes.toString().matchAll(/(?:src|xlink:href)="([^"]+)"/g)) {
@@ -809,10 +837,12 @@ export default class extends Production.default {
           }
         }
       });
-      assert.equal(coverPaths.size, 1, 'the first illustration must produce a real cover');
+      assert.equal(coverPaths.size, 1, 'the explicit cover.png must produce a real cover');
+      assert.equal(bodyPaths.size, 1, 'the first body illustration must remain in the body');
       for (const path of coverPaths) {
         assert(entries.has(path), `missing cover image ${path}`);
         verifyPng(entries.get(path), expectedCover);
+        assert(!bodyPaths.has(path), 'the explicit cover must not replace the body image');
       }
       sourceStaticImage = null;
       const largeMemory = await (await api('/_fixture/memory')).json();

@@ -274,15 +274,13 @@ pub struct EpubSettingsInput<'a> {
     pub author: &'a str,
     /// per-novel 設定 (`enable_yokogaki` = 横書き、`enable_illust` = 挿絵)。
     pub settings: &'a NovelSettings,
-    /// 表紙に使える挿絵 (表紙候補) があるか。
+    /// 明示的な `cover.jpg` / `cover.png` / `cover.jpeg` があるか。
     ///
-    /// 判定の規則は保存構成ごとに違う: native Web は `cover.{jpg,png,jpeg}`
-    /// の実在 (`converter::render::cover_image_path`)、Worker は挿絵の実体を
-    /// 一覧から拾った結果。[`EpubBuildOptions::from_settings`] はこの値に
-    /// `enable_illust` を掛けたものを表紙条件にする。native CLI は Java の
-    /// `-c 0` と同じく `cover.{jpg,png,jpeg}` の実在だけで決め `enable_illust`
-    /// を見ないため、この組み立てを使わない。
-    pub has_images: bool,
+    /// 本文の挿絵が存在するだけでは true にしない。native は表紙注記を本文の
+    /// 先頭へ挿入し、Worker は同じ表紙を画像計画の先頭へ渡す。
+    /// この組み立てでは `enable_illust` も必要。native CLI は Java の
+    /// `-c 0` と同じく表紙の実在だけで決めるため、この組み立てを使わない。
+    pub has_cover_image: bool,
     /// 呼び出し側が組んだ EPUB 資産 ([`EpubBuildOptions::extra_assets`])。
     ///
     /// narou カスタム CSS / 濁点フォントは [`narou_font_assets`]
@@ -302,15 +300,15 @@ impl EpubBuildOptions {
     ///
     /// - 書字方向は per-novel `enable_yokogaki` (横書き指定) の否定。縦書きの
     ///   小説を勝手に横組みにしない / 横書き指定を縦組みにしない。
-    /// - 表紙は `enable_illust` かつ表紙候補があるときだけ
-    ///   ([`EpubSettingsInput::has_images`] の判定は構成ごとに違う)。
+    /// - 表紙は `enable_illust` かつ明示的な表紙ファイルがあるときだけ
+    ///   ([`EpubSettingsInput::has_cover_image`])。
     /// - 濁点フォントは [`EpubSettingsInput::extra_assets`] のとおり。
     pub fn from_settings(input: EpubSettingsInput<'_>) -> Self {
         Self {
             title: input.title.to_string(),
             author: input.author.to_string(),
             vertical: !input.settings.enable_yokogaki,
-            cover_from_first_image: input.settings.enable_illust && input.has_images,
+            cover_from_first_image: input.settings.enable_illust && input.has_cover_image,
             assets_dir: input.assets_dir,
             kindle: input.kindle,
             extra_assets: input.extra_assets,
