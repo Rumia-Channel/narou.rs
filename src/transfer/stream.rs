@@ -107,8 +107,11 @@ impl<W: Write> ArchiveStream<W> {
         if let Some(novel) = self.manifest.novels.last() {
             let index = self.manifest.novels.len() - 1;
             reject_file_directory_conflicts(novel.files.iter().map(|file| file.path.as_str()), index)?;
-            if !novel.files.iter().any(|file| file.path == "toc.yaml") {
+            if novel.virtual_members.is_none() && !novel.files.iter().any(|file| file.path == "toc.yaml") {
                 return Err(TransferError::InvalidArchive(format!("{} に toc.yaml がありません", novel.title)));
+            }
+            if novel.virtual_members.is_some() && novel.files.iter().any(|file| !super::is_virtual_input_file(&file.path)) {
+                return Err(TransferError::InvalidArchive("virtual parent contains non-input files".into()));
             }
         }
         Ok(())
@@ -116,6 +119,7 @@ impl<W: Write> ArchiveStream<W> {
 
     pub fn finish(mut self) -> Result<()> {
         self.end_novel()?;
+        super::structure::validate(&self.manifest)?;
         // Count without allocating a second manifest, then serialize directly
         // into the compressor. Even the directory is written to the sink.
         let mut counter = CountingWriter(0);

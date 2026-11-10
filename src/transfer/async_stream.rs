@@ -88,7 +88,7 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
     }
 
     fn with_manifest(writer: W, mut manifest: ArchiveManifest, limit: usize) -> Result<Self> {
-        if manifest.format_version != FORMAT_VERSION { return Err(TransferError::UnsupportedVersion(manifest.format_version)); }
+        super::structure::version(manifest.format_version)?;
         if manifest.novels.len() > MAX_NOVELS { return Err(TransferError::TooLarge("too many novels".into())); }
         let files = manifest.novels.iter().try_fold(1usize, |count, novel| count.checked_add(novel.files.len()))
             .ok_or_else(allocation_limit)?;
@@ -100,6 +100,8 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
         for novel in &mut manifest.novels { super::attribute::normalize(novel)?; }
         memory.used = 0;
         memory.adopt_manifest(&manifest)?;
+        super::structure::validate_with_budget(&manifest, &mut memory)?;
+        manifest.format_version = FORMAT_VERSION;
         Ok(Self { writer: ZipFileWriter::new(LimitedWriter { inner: writer, written: 0 }).force_no_zip64(),
             manifest, paths: PathIndex::default(), memory, files: 1, uncompressed: 0 })
     }
@@ -203,8 +205,11 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
                 }
             }
         }
-        if !novel.files.iter().any(|file| file.path == "toc.yaml") {
+        if novel.virtual_members.is_none() && !novel.files.iter().any(|file| file.path == "toc.yaml") {
             return Err(TransferError::InvalidArchive(format!("novel {index} に toc.yaml がありません")));
+        }
+        if novel.virtual_members.is_some() && novel.files.iter().any(|file| !super::is_virtual_input_file(&file.path)) {
+            return Err(TransferError::InvalidArchive("virtual parent contains non-input files".into()));
         }
         Ok(())
     }
@@ -249,6 +254,7 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
 
     pub async fn finish(mut self) -> Result<()> {
         if let Some(index) = self.manifest.novels.len().checked_sub(1) { self.end_novel(index)?; }
+        super::structure::validate_with_budget(&self.manifest, &mut self.memory)?;
         let mut count = super::stream::CountingWriter(0);
         serde_json::to_writer(&mut count, &self.manifest)?;
         if count.0 > MAX_MANIFEST_BYTES || self.uncompressed.saturating_add(count.0) > MAX_TOTAL_UNCOMPRESSED_BYTES {

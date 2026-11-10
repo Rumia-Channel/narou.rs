@@ -255,7 +255,8 @@ impl<R: AsyncRead + Unpin> Json<R> {
         let mut novel = ArchiveNovel::default();
         let mut seen = 0u16;
         let fields: &[&[u8]] = &[b"toc_url", b"title", b"author", b"sitename", b"domain", b"tags",
-            b"attribute_tag", b"novel_type", b"files", b"ncode", b"subtitle", b"general_lastup", b"last_update"];
+            b"attribute_tag", b"novel_type", b"files", b"ncode", b"subtitle", b"general_lastup", b"last_update",
+            b"virtual_members"];
         while let Some(name) = self.member(&mut members, fields).await? {
             match name.as_bytes() {
                 b"toc_url" => { mark(&mut seen, 0)?; novel.toc_url = self.string().await?; }
@@ -287,6 +288,22 @@ impl<R: AsyncRead + Unpin> Json<R> {
                         if *file_count >= MAX_ENTRIES { return Err(TransferError::TooLarge("too many files".into())); }
                         self.memory.reserve(&mut novel.files, 1)?;
                         novel.files.push(self.file().await?);
+                    }
+                }
+                b"virtual_members" => {
+                    mark(&mut seen, 13)?;
+                    if self.peek().await? == Some(b'n') {
+                        self.literal(b"null").await?;
+                    } else {
+                        self.expect(b'[').await?;
+                        let mut values = Vec::new();
+                        let mut first = true;
+                        while self.item(&mut first, b']').await? {
+                            if values.len() >= MAX_NOVELS { return Err(TransferError::TooLarge("too many virtual members".into())); }
+                            self.memory.reserve(&mut values, 1)?;
+                            values.push(self.string().await?);
+                        }
+                        novel.virtual_members = Some(values);
                     }
                 }
                 _ => self.skip_value().await?,
@@ -464,6 +481,8 @@ mod tests {
                 r#"{"format_version":1,"very_long_unrecognized_field_name":[[],{}],"\u0061pp_version":"ok"}"#.into(),
                 r#"[1]"#.into(),
                 r#"[1,null,null,[["u","t","a","s",null,[],null,1,[["toc.yaml",null,4]]]]]"#.into(),
+                r#"{"format_version":2,"novels":[{"toc_url":"https://narou.rs/virtual/0123456789abcdef0123456789abcdef","title":"parent","author":"a","sitename":"s","novel_type":0,"virtual_members":["https://e/second/","https://e/first/"]}]}"#.into(),
+                r#"{"format_version":1,"novels":[{"toc_url":"u","title":"t","author":"a","sitename":"s","novel_type":1,"virtual_members":null}]}"#.into(),
             ];
             for bytes in valid {
                 let expected: ArchiveManifest = serde_json::from_slice(bytes.as_bytes()).unwrap();
@@ -494,6 +513,8 @@ mod tests {
                 r#"{"format_version":1,"novels":[{"toc_url":"u","title":"t","author":"a","sitename":"s","novel_type":256}]}"#,
                 r#"{"format_version":1,"novels":[{"toc_url":"u","title":"t","author":"a","sitename":"s","novel_type":1,"files":[{"path":"a","size":null,"size":null}]}]}"#,
                 r#"{"format_version":1,"novels":[{"toc_url":"u","title":"t","author":"a","sitename":"s","novel_type":1,"files":[{"path":"a","size":18446744073709551616}]}]}"#,
+                r#"{"format_version":2,"novels":[{"toc_url":"u","title":"t","author":"a","sitename":"s","novel_type":0,"virtual_members":[],"virtual_members":[]}]}"#,
+                r#"{"format_version":2,"novels":[{"toc_url":"u","title":"t","author":"a","sitename":"s","novel_type":0,"virtual_members":[1]}]}"#,
             ];
             for bytes in invalid {
                 assert!(serde_json::from_slice::<ArchiveManifest>(bytes.as_bytes()).is_err(), "reference accepted {bytes}");
@@ -544,6 +565,8 @@ mod tests {
             assert!(matches!(read_with_budget(futures::io::Cursor::new(bytes), 32).await, Err(TransferError::TooLarge(_))));
             let tags = br#"{"format_version":1,"novels":[{"toc_url":"","title":"","author":"","sitename":"","novel_type":1,"tags":["","","","","","","","","","","","","","","",""]}]}"#;
             assert!(matches!(read_with_budget(futures::io::Cursor::new(tags), std::mem::size_of::<ArchiveNovel>() + 128).await, Err(TransferError::TooLarge(_))));
+            let members = br#"{"format_version":2,"novels":[{"toc_url":"","title":"","author":"","sitename":"","novel_type":0,"virtual_members":["","","","","","","","","","","","","","","",""]}]}"#;
+            assert!(matches!(read_with_budget(futures::io::Cursor::new(members), std::mem::size_of::<ArchiveNovel>() + 128).await, Err(TransferError::TooLarge(_))));
         });
     }
 

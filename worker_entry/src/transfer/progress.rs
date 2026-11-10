@@ -82,7 +82,7 @@ pub(super) async fn send_event(sender: &mut EventSender, event: Value) -> worker
 }
 
 pub(super) fn export(
-    assets: Arc<dyn AssetStore>, novels: Vec<(NovelRecord, Vec<(String, ObjectKey, u64)>)>,
+    assets: Arc<dyn AssetStore>, novels: Vec<ExportNovel>,
     permit: crate::memory_budget::MemoryPermit, events: bool,
 ) -> worker::Result<Response> {
     let exported_at = Utc::now();
@@ -97,7 +97,8 @@ pub(super) fn export(
             let mut writer = AsyncArchiveStream::new(sink, env!("CARGO_PKG_VERSION").into(),
                 exported_at.to_rfc3339_opts(SecondsFormat::Secs, true)).map_err(worker_error)?;
             let total = novels.len();
-            for (completed, (record, files)) in novels.into_iter().enumerate() {
+            for (completed, novel) in novels.into_iter().enumerate() {
+                let ExportNovel { mut metadata, files } = novel;
                 let mut toc = match files.iter().find(|(path, _, _)| path == TOC_FILE) {
                     Some((_, key, size)) => {
                         if *size > MAX_TOC_METADATA_BYTES {
@@ -118,10 +119,12 @@ pub(super) fn export(
                     }
                     None => None,
                 };
-                let subtitle = toc.as_deref().and_then(parse_toc_story);
-                writer.begin_novel(archive_novel_from_record(&record, Vec::new(), subtitle)).map_err(worker_error)?;
+                // A virtual parent has no table of contents and no subtitle.
+                metadata.subtitle = toc.as_deref().and_then(parse_toc_story);
+                let title = metadata.title.clone();
+                writer.begin_novel(metadata).map_err(worker_error)?;
                 if events { send_event(&mut sender, json!({"type":"progress","phase":"export",
-                    "completed":completed,"total":total,"title":record.title})).await?; }
+                    "completed":completed,"total":total,"title":title})).await?; }
                 for (relative, key, _) in files {
                     if relative == TOC_FILE {
                         let mut reader = futures::io::Cursor::new(toc.take().expect("listed TOC was read"));
@@ -135,7 +138,7 @@ pub(super) fn export(
                     writer.add_reader(&relative, &mut reader).await.map_err(worker_error)?;
                 }
                 if events { send_event(&mut sender, json!({"type":"progress","phase":"export",
-                    "completed":completed + 1,"total":total,"title":record.title})).await?; }
+                    "completed":completed + 1,"total":total,"title":title})).await?; }
             }
             writer.finish().await.map_err(worker_error)?;
             if events { send_event(&mut sender, json!({"type":"complete","filename":filename,"bytes":bytes.get()})).await?; }

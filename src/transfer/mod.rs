@@ -26,7 +26,7 @@
 //! novel in the manifest.
 //!
 //! Streaming writers preserve caller order and use fixed ZIP timestamps.
-//! The whole-value builder sorts novels by `toc_url`/title and files by path.
+//! The whole-value builder puts members before parents, then sorts by URL/title.
 //! Both codecs use portable Deflate and the same manifest/integrity contract.
 
 mod archive;
@@ -40,6 +40,7 @@ mod staged;
 mod manifest_json;
 mod memory;
 mod manifest_write;
+mod structure;
 
 pub use archive::{
     ArchiveFile, ArchiveManifest, ArchiveNovel, ParsedArchive, ParsedNovel, build_archive,
@@ -55,9 +56,10 @@ pub use async_stream::AsyncArchiveStream;
 pub use staged::{StagedArchive, StagedNovel, bounded_asset_stream, validate_archive};
 pub use manifest_json::read_manifest;
 pub use manifest_write::write as write_manifest_json;
+pub use structure::{VIRTUAL_INPUT_FILES, is_virtual_input_file};
 
 /// Version written to [`ArchiveManifest::format_version`].
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Root manifest entry name.
 pub const MANIFEST_PATH: &str = "manifest.json";

@@ -43,6 +43,14 @@ pub async fn write<W: AsyncWrite + Unpin>(writer: &mut W, manifest: &ArchiveMani
             ("general_lastup", novel.general_lastup.as_deref()), ("last_update", novel.last_update.as_deref())] {
             optional(writer, name, value).await?;
         }
+        if let Some(members) = &novel.virtual_members {
+            writer.write_all(b",\"virtual_members\":[").await?;
+            for (position, url) in members.iter().enumerate() {
+                if position != 0 { writer.write_all(b",").await?; }
+                string(writer, url).await?;
+            }
+            writer.write_all(b"]").await?;
+        }
         writer.write_all(b"}").await?;
     }
     writer.write_all(b"]}").await?;
@@ -112,6 +120,7 @@ mod tests {
                     novel_type: u8::MAX, ncode: Some("n".into()), subtitle: Some("s".into()),
                     general_lastup: Some("g".into()), last_update: Some("l".into()),
                     files: vec![ArchiveFile { path: "toc.yaml".into(), size: Some(u64::MAX), sha256: Some("hash".into()), bytes: vec![1] }],
+                    virtual_members: Some(vec!["https://example.test/日本語?x=\"quoted\"".into()]),
                 }, ArchiveNovel::default()], ..Default::default()
             };
             let mut output = futures::io::Cursor::new(Vec::new());

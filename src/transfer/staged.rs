@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::platform::{AssetReader, AssetStore, AssetStream, ObjectKey, StagedAsset};
 use super::archive::{reject_file_directory_conflicts, validate_relative_path};
-use super::{ArchiveManifest, FORMAT_VERSION, MANIFEST_PATH, MAX_ARCHIVE_BYTES,
+use super::{ArchiveManifest, MANIFEST_PATH, MAX_ARCHIVE_BYTES,
     MAX_ENTRIES, MAX_FILE_BYTES, MAX_MANIFEST_BYTES, MAX_NOVELS, MAX_TOTAL_UNCOMPRESSED_BYTES,
     Result, TransferError};
 
@@ -136,7 +136,7 @@ async fn index_archive<R: AsyncBufRead + AsyncSeek + Unpin>(reader: R) -> Result
         drop(seen);
         let index = manifest_entry.ok_or_else(|| TransferError::InvalidArchive("manifest.json is missing".into()))?;
         let mut manifest = super::read_manifest(archive.file(index).await?).await?;
-        if manifest.format_version != FORMAT_VERSION { return Err(TransferError::UnsupportedVersion(manifest.format_version)); }
+        super::structure::validate(&manifest)?;
         if manifest.novels.len() > MAX_NOVELS { return Err(TransferError::TooLarge("too many novels".into())); }
         let mut matches = Vec::new();
         let mut files = 1usize;

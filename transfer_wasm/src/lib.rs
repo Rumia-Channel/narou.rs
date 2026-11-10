@@ -51,7 +51,9 @@ pub async fn plan_zip(read_range: Function, size: f64, has_novel: Function, over
     let manifest = parse(read_range, size).await?;
     let conflict = if overwrite { ConflictPolicy::Overwrite } else { ConflictPolicy::Skip };
     let mut sink = BufWriter::with_capacity(64 * 1024, CallbackWriter { callback: write_chunk, pending: None });
-    for (index, novel) in manifest.novels.iter().enumerate() {
+    for (index, novel) in manifest.novels.iter().enumerate().filter(|(_, novel)| novel.virtual_members.is_none())
+        .chain(manifest.novels.iter().enumerate().filter(|(_, novel)| novel.virtual_members.is_some()))
+    {
         let value = has_novel.call2(&JsValue::NULL, &JsValue::from_f64(index as f64), &JsValue::from_str(&novel.toc_url))?;
         let exists = JsFuture::from(Promise::resolve(&value)).await?
             .as_bool().ok_or_else(|| js_error("has_novel must return a boolean"))?;

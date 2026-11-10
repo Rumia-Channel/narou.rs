@@ -22,6 +22,15 @@
 //! * Overwrite preserves record IDs, folder names and files absent from the
 //!   archive. New records are published only after their files are durable.
 //!
+//! # Virtual groups
+//!
+//! A selected virtual parent expands into its ordinary members; the members
+//! are written once and the parent descriptor carries their URLs in
+//! registration order. The parent itself owns no body: only its per-novel
+//! inputs (settings, replacement rules, converter options, cover) travel.
+//! Import restores the ordinary members first and publishes the parent with
+//! the destination IDs, so a group never points at a foreign library.
+//!
 //! The shared 512 MiB archive and 256 MiB file limits apply; binary files do
 //! not travel through the 16 MiB small-object API.
 //!
@@ -42,9 +51,10 @@ use narou_rs::platform::{
 };
 use narou_rs::transfer::{
     ArchiveFile, ArchiveNovel, ConflictPolicy, ExistingNovel, StagedArchive, StagedNovel,
-    ImportAction, MAX_ARCHIVE_BYTES, MAX_FILE_BYTES, flag_value, import_payload,
-    is_zip_content_type, parse_ids, plan_manifest, bounded_asset_stream,
+    ImportAction, MAX_ARCHIVE_BYTES, MAX_FILE_BYTES, VIRTUAL_INPUT_FILES, flag_value,
+    import_payload, is_zip_content_type, parse_ids, plan_manifest, bounded_asset_stream,
 };
+use narou_rs::virtual_novel as virtual_core;
 use worker::{Env, Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
@@ -121,29 +131,195 @@ async fn export(req: Request, env: Env) -> worker::Result<Response> {
             return export_error(503, "Service unavailable".into());
         }
     };
-    let objects = runtime.write_objects();
-    let mut novels = Vec::new();
-    for id in ids {
-        let record = match runtime.novels.get(NovelId(id)).await {
-            Ok(Some(record)) => record,
-            Ok(None) => return progress::export_error(events, 404, format!("ID: {id} が見つかりません")),
-            Err(error) => return progress::export_error(events, 500, format!("ID: {id}: {error}")),
-        };
-        let keys = match NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory) {
-            Ok(keys) => keys,
-            Err(error) => return progress::export_error(events, 400, error.to_string()),
-        };
-        let files = match collect_novel_files(objects.as_ref(), &keys).await {
-            Ok(files) => files,
-            Err(message) => return progress::export_error(events, 400, message),
-        };
-        if !files.iter().any(|(path, _, _)| path == TOC_FILE) {
-            return progress::export_error(events, 404, format!("ID: {id} に {TOC_FILE} がありません"));
-        }
-        novels.push((record, files));
-    }
+    let novels = match collect_export_novels(&runtime, &ids).await {
+        Ok(novels) => novels,
+        Err((status, message)) => return progress::export_error(events, status, message),
+    };
     progress::export(runtime.assets(), novels, permit, events)
 }
+
+/// One novel inside the export stream: manifest metadata plus stored objects.
+pub(super) struct ExportNovel {
+    /// Manifest metadata; the streaming writer fills the file list itself.
+    pub(super) metadata: ArchiveNovel,
+    /// Stored objects as `(relative path, key, size)`.
+    pub(super) files: Vec<(String, ObjectKey, u64)>,
+}
+
+/// Builds the export list: ordinary works first, then the virtual parents.
+///
+/// A selected virtual parent expands into its ordinary members; a member that
+/// is selected as well is stored once. The membership order travels in
+/// `virtual_members`, so the archive order stays "members before parents".
+async fn collect_export_novels(
+    runtime: &WorkerRuntime,
+    ids: &[i64],
+) -> Result<Vec<ExportNovel>, (u16, String)> {
+    let objects = runtime.write_objects();
+    let membership = crate::virtual_novels::load_membership(runtime.write_db())
+        .await
+        .map_err(|error| (500, format!("バーチャル小説のメンバー構成を読み込めません: {error}")))?;
+
+    let mut ordinary: Vec<NovelRecord> = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    // A parent keeps the ordered member URLs only; the member records move
+    // into the ordinary list so no record is stored twice.
+    let mut parents: Vec<(NovelRecord, Vec<String>)> = Vec::new();
+
+    for id in ids {
+        let record = runtime
+            .novels
+            .get(NovelId(*id))
+            .await
+            .map_err(|error| (500, format!("ID: {id}: {error}")))?
+            .ok_or((404, format!("ID: {id} が見つかりません")))?;
+        let Some(member_ids) = membership.get(record.id) else {
+            if virtual_core::is_virtual_record(&record) {
+                return Err((404, format!("ID: {id} のバーチャル小説にメンバーがありません")));
+            }
+            if seen.insert(record.id) {
+                ordinary.push(record);
+            }
+            continue;
+        };
+        let mut member_urls = Vec::with_capacity(member_ids.len());
+        for member_id in member_ids {
+            let member = runtime
+                .novels
+                .get(NovelId(*member_id))
+                .await
+                .map_err(|error| (500, format!("ID: {id}: メンバー ID:{member_id}: {error}")))?
+                .ok_or((404, format!("ID: {id}: メンバー ID:{member_id} が見つかりません")))?;
+            if virtual_core::is_virtual_record(&member) {
+                return Err((400, format!("ID: {id}: メンバー ID:{member_id} はバーチャル小説です")));
+            }
+            member_urls.push(member.toc_url.clone());
+            if seen.insert(member.id) {
+                ordinary.push(member);
+            }
+        }
+        parents.push((record, member_urls));
+    }
+
+    let mut novels = Vec::with_capacity(ordinary.len() + parents.len());
+    for record in ordinary {
+        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+            .map_err(|error| (400, error.to_string()))?;
+        let files = collect_novel_files(objects.as_ref(), &keys)
+            .await
+            .map_err(|message| (400, message))?;
+        if !files.iter().any(|(path, _, _)| path == TOC_FILE) {
+            return Err((404, format!("ID: {} に {TOC_FILE} がありません", record.id)));
+        }
+        novels.push(ExportNovel {
+            metadata: archive_novel_from_record(&record, Vec::new(), None),
+            files,
+        });
+    }
+    for (record, member_urls) in parents {
+        // The parent's own identity travels as a portable URL, so another
+        // library can address the same group without the local ID.
+        let toc_url = portable_toc_url(runtime, &record)
+            .await
+            .map_err(|message| (500, message))?;
+        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+            .map_err(|error| (400, error.to_string()))?;
+        // A parent has no body of its own: only the shared input files are
+        // stat'ed, so unrelated content never enters the archive.
+        let files = collect_virtual_inputs(objects.as_ref(), &keys)
+            .await
+            .map_err(|message| (400, message))?;
+        novels.push(ExportNovel {
+            metadata: archive_virtual_from_record(&record, &toc_url, member_urls),
+            files,
+        });
+    }
+    Ok(novels)
+}
+
+/// Collects a virtual parent's own portable inputs.
+///
+/// Only the six shared input files are stat'ed. A parent keeps no body, so
+/// listing the whole prefix would read content that never travels.
+async fn collect_virtual_inputs(
+    store: &dyn ObjectStore,
+    keys: &NovelObjectKeys,
+) -> Result<Vec<(String, ObjectKey, u64)>, String> {
+    let mut files = Vec::new();
+    for name in VIRTUAL_INPUT_FILES {
+        let key = object_key_for(keys, name)?;
+        let Some(metadata) = store
+            .stat(&key)
+            .await
+            .map_err(|error| format!("保存先を確認できません: {error}"))?
+        else {
+            continue;
+        };
+        if metadata.size > MAX_FILE_BYTES {
+            return Err(format!("{name}: ファイルが上限 {MAX_FILE_BYTES} bytes を超えています"));
+        }
+        files.push((name.to_string(), key, metadata.size));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
+}
+
+/// Older virtual records carry a library-local URL (`.../virtual/vs_<ID>`)
+/// that collides across libraries. The first export persists one portable
+/// identity in the source record; concurrent exports converge on the same
+/// winner and unrelated columns are left untouched.
+async fn portable_toc_url(runtime: &WorkerRuntime, record: &NovelRecord) -> Result<String, String> {
+    let mut current = record.toc_url.clone();
+    for _ in 0..8 {
+        if virtual_core::is_portable_toc_url(&current) {
+            return Ok(current);
+        }
+        let candidate = virtual_core::new_toc_url()
+            .map_err(|error| format!("バーチャル小説の保存先 URL を作れません: {error}"))?;
+        let updated = runtime
+            .write_db()
+            .prepare(
+                "UPDATE novels SET toc_url=?1, toc_url_fold=?2 \
+                 WHERE id=?3 AND toc_url_fold=?4 AND ncode GLOB 'vs_[0-9]*' \
+                 AND substr(ncode,4) NOT GLOB '*[^0-9]*' RETURNING toc_url",
+            )
+            .bind(&[
+                candidate.clone().into(),
+                narou_rs::db::novel_codec::fold(&candidate).into(),
+                (record.id as f64).into(),
+                narou_rs::db::novel_codec::fold(&current).into(),
+            ])
+            .map_err(|error| format!("バーチャル小説の保存先 URL を保存できません: {error}"))?
+            .all()
+            .await
+            .map_err(|error| format!("バーチャル小説の保存先 URL を保存できません: {error}"))?
+            .results::<TocUrlRow>()
+            .map_err(|error| format!("バーチャル小説の保存先 URL を保存できません: {error}"))?;
+        if let Some(row) = updated.into_iter().next() {
+            return Ok(row.toc_url);
+        }
+        // Another writer stored an identity first: its value is the shared one.
+        let row = runtime
+            .write_db()
+            .prepare("SELECT toc_url FROM novels WHERE id=?1")
+            .bind(&[(record.id as f64).into()])
+            .map_err(|error| format!("バーチャル小説の保存先 URL を読み込めません: {error}"))?
+            .first::<TocUrlRow>(None)
+            .await
+            .map_err(|error| format!("バーチャル小説の保存先 URL を読み込めません: {error}"))?;
+        current = row
+            .map(|row| row.toc_url)
+            .ok_or_else(|| format!("ID:{} が見つかりません", record.id))?;
+    }
+    Err(format!("ID:{} のバーチャル小説の保存先 URL を更新できません", record.id))
+}
+
+/// One `toc_url` column of the novels table.
+#[derive(serde::Deserialize)]
+struct TocUrlRow {
+    toc_url: String,
+}
+
 
 /// Collects one novel's stored objects as archive entries (relative paths).
 ///
@@ -273,6 +449,40 @@ fn archive_novel_from_record(
         subtitle,
         general_lastup: record.general_lastup.map(rfc3339),
         last_update: Some(rfc3339(record.last_update)),
+        virtual_members: None,
+    }
+}
+
+/// Builds the manifest metadata for one virtual parent.
+///
+/// A parent is a grouping structure, not a work: it carries no ncode, no
+/// library-local tag and no body. Its members travel as ordinary URLs in
+/// registration order.
+fn archive_virtual_from_record(
+    record: &NovelRecord,
+    toc_url: &str,
+    members: Vec<String>,
+) -> ArchiveNovel {
+    ArchiveNovel {
+        toc_url: toc_url.to_string(),
+        title: record.title.clone(),
+        author: record.author.clone(),
+        sitename: record.sitename.clone(),
+        domain: record.domain.clone(),
+        tags: record
+            .tags
+            .iter()
+            .filter(|tag| !virtual_core::is_internal_tag(tag))
+            .cloned()
+            .collect(),
+        attribute_tag: record.attribute_tag().map(str::to_string),
+        novel_type: record.novel_type,
+        files: Vec::new(),
+        ncode: None,
+        subtitle: None,
+        general_lastup: record.general_lastup.map(rfc3339),
+        last_update: Some(rfc3339(record.last_update)),
+        virtual_members: Some(members),
     }
 }
 
@@ -414,10 +624,10 @@ async fn import_validated(
         match runtime.novels.find_by_toc_url(url).await {
             Ok(Some(record)) => {
                 records_by_url
-                    .entry(record.toc_url.clone())
+                    .entry(url.clone())
                     .or_insert_with(|| record.clone());
                 existing.push(ExistingNovel {
-                    toc_url: record.toc_url,
+                    toc_url: url.clone(),
                     title: record.title,
                 });
             }
@@ -446,14 +656,23 @@ async fn import_validated(
     // The plan was computed against the library before the run; a single
     // archive may repeat a toc_url, so track what this run already handled.
     let mut handled_urls: HashSet<String> = HashSet::new();
+    // Archive member URL -> the destination record ID of an imported member.
+    // A parent is published with these IDs, never with the source ones.
+    let mut destinations: HashMap<String, i64> = HashMap::new();
 
-    for (position, entry) in plan.entries.iter().enumerate() {
+    // The plan is already ordered: ordinary members first, then the parents
+    // that reference them.
+    let total = plan.entries.len();
+    let mut position = 0usize;
+    for entry in plan.entries.iter() {
         let novel = &parsed.novels[entry.index];
         let metadata = &parsed.manifest.novels[entry.index];
+        let is_parent = metadata.virtual_members.is_some();
         if let Some(sender) = progress.as_mut() {
             progress::send_event(sender, serde_json::json!({"type":"progress","phase":"import",
-                "completed":position,"total":plan.entries.len(),"title":novel.title})).await?;
+                "completed":position,"total":total,"title":novel.title})).await?;
         }
+        position += 1;
         if !handled_urls.insert(novel.toc_url.clone()) {
             errors.push(format!(
                 "{}: 同じ toc_url がアーカイブ内で重複しています",
@@ -461,10 +680,49 @@ async fn import_validated(
             ));
             continue;
         }
+        // A virtual parent and an ordinary work never replace each other.
+        if let Some(record) = records_by_url.get(&novel.toc_url)
+            && is_parent != virtual_core::is_virtual_record(record)
+        {
+            errors.push(format!(
+                "{}: ライブラリにある作品と種類が違います",
+                describe(novel)
+            ));
+            continue;
+        }
         let result = match entry.action {
             ImportAction::Skip => {
                 skipped += 1;
+                // An existing member still maps to its destination ID, so a
+                // parent can reference a member this run did not import.
+                if let Some(record) = records_by_url.get(&novel.toc_url) {
+                    destinations.insert(novel.toc_url.clone(), record.id);
+                }
                 continue;
+            }
+            ImportAction::Create if is_parent => {
+                let member_ids = match member_destinations(metadata, &destinations) {
+                    Ok(ids) => ids,
+                    Err(message) => {
+                        errors.push(format!("{}: {message}", describe(novel)));
+                        continue;
+                    }
+                };
+                create_virtual_parent(
+                    &runtime,
+                    objects.as_ref(),
+                    metadata,
+                    novel,
+                    &member_ids,
+                    &local,
+                    now,
+                    assets.as_ref(),
+                )
+                .await
+                .map(|id| {
+                    created += 1;
+                    destinations.insert(novel.toc_url.clone(), id);
+                })
             }
             ImportAction::Create => create_novel(
                 &runtime,
@@ -476,7 +734,39 @@ async fn import_validated(
                 assets.as_ref(),
             )
             .await
-            .map(|_| created += 1),
+            .map(|id| {
+                created += 1;
+                destinations.insert(novel.toc_url.clone(), id);
+            }),
+            ImportAction::Overwrite if is_parent => {
+                let Some(record) = records_by_url.get(&novel.toc_url) else {
+                    errors.push(format!(
+                        "{}: ライブラリにありません",
+                        describe(novel)
+                    ));
+                    continue;
+                };
+                let member_ids = match member_destinations(metadata, &destinations) {
+                    Ok(ids) => ids,
+                    Err(message) => {
+                        errors.push(format!("{}: {message}", describe(novel)));
+                        continue;
+                    }
+                };
+                overwrite_virtual_parent(
+                    &runtime,
+                    record,
+                    metadata,
+                    novel,
+                    &member_ids,
+                    assets.as_ref(),
+                )
+                .await
+                .map(|_| {
+                    overwritten += 1;
+                    destinations.insert(novel.toc_url.clone(), record.id);
+                })
+            }
             ImportAction::Overwrite => {
                 let Some(record) = records_by_url.get(&novel.toc_url) else {
                     errors.push(format!(
@@ -487,7 +777,10 @@ async fn import_validated(
                 };
                 overwrite_novel(objects.as_ref(), &runtime, record, metadata, novel, assets.as_ref())
                     .await
-                    .map(|_| overwritten += 1)
+                    .map(|_| {
+                        overwritten += 1;
+                        destinations.insert(novel.toc_url.clone(), record.id);
+                    })
             }
         };
         if let Err(message) = result {
@@ -496,7 +789,7 @@ async fn import_validated(
     }
     if let Some(sender) = progress.as_mut() {
         progress::send_event(sender, serde_json::json!({"type":"progress","phase":"import",
-            "completed":plan.entries.len(),"total":plan.entries.len(),"title":""})).await?;
+            "completed":total,"total":total,"title":""})).await?;
     }
 
     let success = errors.is_empty();
@@ -507,6 +800,32 @@ async fn import_validated(
         skipped,
         errors,
     ))
+}
+
+/// Maps a parent's member references to destination record IDs.
+///
+/// A member that this run did not import blocks the parent: a group is never
+/// published with a missing member.
+fn member_destinations(
+    metadata: &ArchiveNovel,
+    destinations: &HashMap<String, i64>,
+) -> Result<Vec<i64>, String> {
+    let members = metadata
+        .virtual_members
+        .as_ref()
+        .ok_or_else(|| "バーチャル小説のメンバー構成がありません".to_string())?;
+    let mut ids = Vec::with_capacity(members.len());
+    for url in members {
+        match destinations.get(url) {
+            Some(id) => ids.push(*id),
+            None => {
+                return Err(format!(
+                    "メンバー {url} が取り込まれていないため公開しません"
+                ));
+            }
+        }
+    }
+    Ok(ids)
 }
 
 fn describe(novel: &StagedNovel) -> String {
@@ -790,6 +1109,205 @@ async fn overwrite_novel(
             .map_err(|error| format!("レコードを保存できません: {error}"))?;
     }
     Ok(())
+}
+
+/// Creates a new virtual parent from one archive entry.
+///
+/// The parent owns no body: only its per-novel inputs (settings, replacement
+/// rules, converter options and cover) are stored. The record and the
+/// membership are published in one transaction, so a failed member never
+/// leaves a visible group behind.
+async fn create_virtual_parent(
+    runtime: &WorkerRuntime,
+    objects: &dyn ObjectStore,
+    metadata: &ArchiveNovel,
+    novel: &StagedNovel,
+    member_ids: &[i64],
+    local: &HashMap<String, serde_yaml::Value>,
+    now: DateTime<Utc>,
+    assets: &dyn AssetStore,
+) -> Result<i64, String> {
+    if !virtual_core::is_portable_toc_url(&novel.toc_url) {
+        return Err("バーチャル小説の保存先 URL が移植できません".to_string());
+    }
+    // Authoritative duplicate check: the plan ran against an earlier snapshot.
+    match runtime.novels.find_by_toc_url(&novel.toc_url).await {
+        Ok(Some(existing)) => {
+            return Err(format!("既に ID:{} として登録されています", existing.id));
+        }
+        Ok(None) => {}
+        Err(error) => return Err(format!("重複を確認できません: {error}")),
+    }
+    let title = metadata.title.trim();
+    if title.is_empty() {
+        return Err("アーカイブに作品名がありません".to_string());
+    }
+    // The record needs a non-empty sitename because it names the key prefix.
+    let sitename = metadata
+        .sitename
+        .trim()
+        .to_string();
+    let sitename = if sitename.is_empty() {
+        host_of(&novel.toc_url).unwrap_or_else(|| "narou.rs".to_string())
+    } else {
+        sitename
+    };
+    let use_subdirectory = download_use_subdirectory(local);
+    // The folder name is derived from the new local ID, so a group with the
+    // same title never shares a folder with an existing one.
+    let reservation = runtime
+        .novels
+        .allocate_id()
+        .await
+        .map_err(|error| format!("ID を確保できません: {error}"))?;
+    let id = reservation.id().0;
+    // The cleanup owns the reservation from here on: every fallible step
+    // below releases it, and only the files this run wrote are deleted.
+    let mut cleanup = CreateCleanup {
+        assets: runtime.assets(), novels: runtime.novels.clone(),
+        reservation: Some(reservation), keys: Vec::new(),
+    };
+    let ncode = virtual_core::ncode(id);
+    let file_title = ncode.clone();
+    let keys = match NovelObjectKeys::new(&sitename, &file_title, use_subdirectory) {
+        Ok(keys) => keys,
+        Err(error) => {
+            cleanup.finish().await;
+            return Err(format!("保存先キーを作れません: {error}"));
+        }
+    };
+    let occupied = match prefix_has_objects(objects, &keys).await {
+        Ok(occupied) => occupied,
+        Err(message) => {
+            cleanup.finish().await;
+            return Err(message);
+        }
+    };
+    if occupied {
+        cleanup.finish().await;
+        return Err(format!(
+            "保存先 {} は既に使われています。管理外の保存先は上書きしません",
+            keys.prefix()
+        ));
+    }
+
+    let mut record = NovelRecord {
+        id,
+        author: metadata.author.clone(),
+        title: metadata.title.clone(),
+        file_title,
+        // The archive's identity is kept; the local ncode is new.
+        toc_url: novel.toc_url.clone(),
+        sitename,
+        novel_type: metadata.novel_type,
+        end: true,
+        last_update: now,
+        new_arrivals_date: None,
+        use_subdirectory,
+        general_firstup: None,
+        novelupdated_at: None,
+        general_lastup: None,
+        last_mail_date: None,
+        tags: metadata
+            .tags
+            .iter()
+            .filter(|tag| !virtual_core::is_internal_tag(tag))
+            .cloned()
+            .collect(),
+        ncode: Some(ncode),
+        domain: metadata.domain.clone(),
+        general_all_no: None,
+        length: None,
+        suspend: false,
+        is_narou: false,
+        last_check_date: None,
+        convert_failure: false,
+        requires_login: false,
+        login_session: None,
+        extra_fields: Default::default(),
+    };
+    // The classification travels as metadata; a mixed group keeps the value
+    // the archive carries.
+    if let Some(attribute) = metadata.attribute_tag.as_deref() {
+        record.set_attribute_tag(attribute);
+    }
+    // The member summary fills the counts, the date and the tag composition.
+    let summary = match crate::virtual_novels::summarize_members(runtime, member_ids).await {
+        Ok(summary) => summary,
+        Err(error) => {
+            cleanup.finish().await;
+            return Err(format!("メンバーを集計できません: {error}"));
+        }
+    };
+    if let Err(error) = summary.refresh(&mut record) {
+        cleanup.finish().await;
+        return Err(format!("メンバー構成を反映できません: {error}"));
+    }
+    // Members without an update date keep the date the archive carries.
+    if record.general_lastup.is_none() {
+        record.general_lastup = parse_rfc3339(metadata.general_lastup.as_deref());
+    }
+
+    // The destination keys are registered only now: the prefix was free and
+    // the cleanup deletes exactly the objects this run writes.
+    let destinations = match novel
+        .files
+        .iter()
+        .map(|(path, _)| object_key_for(&keys, path))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(destinations) => destinations,
+        Err(message) => {
+            cleanup.finish().await;
+            return Err(message);
+        }
+    };
+    cleanup.keys = destinations;
+    if let Err(message) = write_novel_files(assets, &keys, &novel.files).await {
+        cleanup.finish().await;
+        return Err(message);
+    }
+    // The record and the membership are one transaction: the group becomes
+    // visible only with its members.
+    if let Err(error) =
+        crate::virtual_novels::publish_virtual_parent(runtime, &record, member_ids).await
+    {
+        cleanup.finish().await;
+        return Err(format!("バーチャル小説を登録できません: {error}"));
+    }
+    cleanup.reservation = None;
+    Ok(id)
+}
+
+/// Replaces an existing virtual parent with the archive's structure.
+///
+/// The record ID and the folder stay; the membership order, the supplied
+/// per-novel inputs and the derived metadata are replaced. Files that the
+/// archive does not carry are left alone.
+async fn overwrite_virtual_parent(
+    runtime: &WorkerRuntime,
+    record: &NovelRecord,
+    metadata: &ArchiveNovel,
+    novel: &StagedNovel,
+    member_ids: &[i64],
+    assets: &dyn AssetStore,
+) -> Result<(), String> {
+    if !virtual_core::is_virtual_record(record) {
+        return Err("既存の記録はバーチャル小説ではありません".to_string());
+    }
+    let keys = NovelObjectKeys::new(
+        &record.sitename,
+        &record.file_title,
+        record.use_subdirectory,
+    )
+    .map_err(|error| format!("保存先キーを作れません: {error}"))?;
+    // Only the archived inputs are replaced; other files stay untouched.
+    write_novel_files(assets, &keys, &novel.files).await?;
+    // The membership and the derived metadata are replaced in one CAS batch:
+    // the live row is re-read there and only the archived fields are merged.
+    crate::virtual_novels::replace_virtual_members(runtime, record.id, metadata, member_ids)
+        .await
+        .map_err(|error| format!("バーチャル小説を更新できません: {error}"))
 }
 
 /// Publish already-validated entries. Create owns a cancellation cleanup guard;

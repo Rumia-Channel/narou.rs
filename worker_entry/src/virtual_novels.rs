@@ -12,11 +12,12 @@ use narou_rs::downloader::types::TocFile;
 use narou_rs::downloader::util::{load_length_limit, sanitize_filename_with_limit};
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{NovelObjectKeys, NovelRepository};
+use narou_rs::transfer::ArchiveNovel;
 use narou_rs::virtual_novel::{self as core, AttributeComposition, VirtualNovelMembers};
 use serde::Deserialize;
 use serde_json::json;
 use worker::wasm_bindgen::JsValue;
-use worker::{Env, Method, Request, Response};
+use worker::{D1PreparedStatement, Env, Method, Request, Response};
 
 use crate::composition::WorkerRuntime;
 use crate::db_handle::DbHandle;
@@ -52,7 +53,34 @@ enum MembershipMutation<'a> {
     Create { record: &'a NovelRecord, members: &'a [i64] },
     Append { id: i64, members: &'a [i64] },
     Reorder { id: i64, ordered: &'a [i64] },
+    /// Replace the whole membership of an existing group (import overwrite).
+    Replace { id: i64, metadata: &'a ArchiveNovel, members: &'a [i64] },
     Remove(i64),
+}
+
+/// Guard for a new parent: the id and the portable identity must be free and
+/// every member must still exist as an ordinary work.
+///
+/// The insert collides with the single sequence row, so the whole batch is
+/// aborted: a publication never replaces an existing record.
+fn guard_new_parent(
+    db: &DbHandle,
+    record: &NovelRecord,
+    member_ids: &[i64],
+) -> Result<D1PreparedStatement> {
+    let members = serde_json::to_string(member_ids).map_err(db_error)?;
+    Ok(db.prepare(
+        "INSERT INTO novel_id_sequence(id,next_id) SELECT 1,0 WHERE \
+EXISTS(SELECT 1 FROM novels WHERE id=?1) \
+OR EXISTS(SELECT 1 FROM novels WHERE toc_url_fold=?2) \
+OR EXISTS(SELECT 1 FROM json_each(?3) m LEFT JOIN novels n ON n.id=m.value WHERE n.id IS NULL) \
+OR EXISTS(SELECT 1 FROM json_each(?3) m JOIN novels n ON n.id=m.value \
+WHERE n.ncode GLOB 'vs_[0-9]*' AND substr(n.ncode,4) NOT GLOB '*[^0-9]*')",
+    ).bind(&[
+        (record.id as f64).into(),
+        narou_rs::db::novel_codec::fold(&record.toc_url).into(),
+        members.into(),
+    ]).map_err(db_error)?)
 }
 
 fn db_error(value: impl std::fmt::Display) -> NarouError {
@@ -90,6 +118,10 @@ async fn mutate_membership(runtime: &WorkerRuntime, mutation: MembershipMutation
         let written_tags: Option<std::borrow::Cow<'_, [String]>> = match mutation {
             MembershipMutation::Create { record, members: added } => {
                 members.insert(record.id, added.to_vec()).map_err(NarouError::InvalidTarget)?;
+                // The id and the portable identity must be free and every
+                // member must still be an ordinary work: the guard aborts the
+                // batch, so the publication never replaces a record.
+                statements.push(guard_new_parent(db, record, added)?);
                 crate::d1_repository::push_upsert_statements(db, record, &mut statements)?;
                 Some(std::borrow::Cow::Borrowed(&record.tags))
             }
@@ -130,6 +162,91 @@ AND EXISTS(SELECT 1 FROM json_each(?10) m CROSS JOIN novels n ON n.id=m.value WH
             MembershipMutation::Reorder { id, ordered } => {
                 members.reorder(id, ordered.to_vec()).map_err(NarouError::InvalidTarget)?;
                 None
+            }
+            MembershipMutation::Replace { id, metadata, members: replacement } => {
+                core::validate_members(replacement).map_err(NarouError::InvalidTarget)?;
+                if !members.groups.contains_key(&id) {
+                    return Err(NarouError::NotFound(format!("バーチャル小説 vs_{id} は登録されていません")));
+                }
+                // A member belongs to at most one group.
+                for member in replacement {
+                    if let Some(owner) = members.owner_of(*member) && owner != id {
+                        return Err(NarouError::InvalidTarget(format!(
+                            "小説 {member} は既にバーチャル小説 vs_{owner} に属しています"
+                        )));
+                    }
+                }
+                members.groups.insert(id, replacement.to_vec());
+                let member_ids = members.get(id).expect("validated virtual novel");
+                let summary = summarize_members(runtime, member_ids).await?;
+                // The live parent on the primary: the import planned against an
+                // older snapshot, and a concurrent writer must not be erased.
+                let parent = parent_snapshot(db, id).await?
+                    .ok_or_else(|| NarouError::NotFound(format!("バーチャル小説 vs_{id} が見つかりません")))?;
+                let mut existing: Vec<String> = serde_json::from_str(&parent.tags_json).map_err(db_error)?;
+                existing.extend(metadata.tags.iter().filter(|tag| !core::is_internal_tag(tag)).cloned());
+                let tags = summary.merged_tags(id, &existing);
+                // The archived classification wins for a mixed group; a single
+                // kind is always derived from the members.
+                let requested = metadata
+                    .attribute_tag
+                    .as_deref()
+                    .or(parent.attribute_tag.as_deref());
+                let attribute = summary
+                    .composition
+                    .resolve(None, requested)
+                    .map_err(NarouError::InvalidTarget)?;
+                let folded: Vec<String> = tags
+                    .iter()
+                    .map(|tag| narou_rs::db::novel_codec::fold(tag))
+                    .collect();
+                let date = summary
+                    .latest_update
+                    .or_else(|| metadata.general_lastup.as_deref()
+                        .and_then(|date| chrono::DateTime::parse_from_rfc3339(date).ok())
+                        .map(|date| date.with_timezone(&Utc)))
+                    .map(|date| date.to_rfc3339())
+                    .map(JsValue::from)
+                    .unwrap_or(JsValue::NULL);
+                let member_json = serde_json::to_string(member_ids).map_err(db_error)?;
+                // One guarded statement writes the derived metadata and the
+                // fields an overwrite may fill, and verifies the member set
+                // inside the same transaction.
+                statements.push(db.prepare(
+                    r#"UPDATE novels SET tags_json=?1,tags_fold=?2,tags_sort=?3,general_all_no=?4,general_lastup=?5,attribute_tag=?6,
+title=CASE WHEN trim(title)='' THEN ?7 ELSE title END,
+title_fold=CASE WHEN trim(title)='' THEN ?16 ELSE title_fold END,
+author=CASE WHEN trim(author)='' THEN ?8 ELSE author END,
+author_fold=CASE WHEN trim(author)='' THEN ?17 ELSE author_fold END,
+domain=COALESCE(domain,?9),domain_fold=CASE WHEN domain IS NULL THEN ?18 ELSE domain_fold END
+WHERE id=?10 AND tags_json=?11 AND attribute_tag IS ?12
+AND ncode GLOB 'vs_[0-9]*' AND substr(ncode,4) NOT GLOB '*[^0-9]*'
+AND NOT EXISTS(SELECT 1 FROM json_each(?13) m LEFT JOIN novels n ON n.id=m.value WHERE n.id IS NULL)
+AND NOT EXISTS(SELECT 1 FROM json_each(?13) m JOIN novels n ON n.id=m.value WHERE n.ncode GLOB 'vs_[0-9]*' AND substr(n.ncode,4) NOT GLOB '*[^0-9]*')
+AND EXISTS(SELECT 1 FROM json_each(?13) m CROSS JOIN novels n ON n.id=m.value WHERE COALESCE(n.attribute_tag,'小説')='小説')=?14
+AND EXISTS(SELECT 1 FROM json_each(?13) m CROSS JOIN novels n ON n.id=m.value WHERE n.attribute_tag='漫画')=?15"#
+                ).bind(&[
+                    serde_json::to_string(&tags).map_err(db_error)?.into(), folded.join("\n").into(), folded.join("\u{1f}").into(),
+                    if summary.general_all_no > 0 { (summary.general_all_no as f64).into() } else { JsValue::NULL },
+                    date, attribute.into(),
+                    metadata.title.as_str().into(), metadata.author.as_str().into(),
+                    metadata.domain.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+                    (id as f64).into(), parent.tags_json.as_str().into(),
+                    parent.attribute_tag.as_deref().map(JsValue::from).unwrap_or(JsValue::NULL),
+                    member_json.into(),
+                    (u8::from(summary.composition.has_novel) as f64).into(),
+                    (u8::from(summary.composition.has_manga) as f64).into(),
+                    narou_rs::db::novel_codec::fold(&metadata.title).into(),
+                    narou_rs::db::novel_codec::fold(&metadata.author).into(),
+                    metadata.domain.as_deref().map(narou_rs::db::novel_codec::fold).map(JsValue::from).unwrap_or(JsValue::NULL),
+                ]).map_err(db_error)?);
+                // The guarded update must have matched: the guard statement
+                // aborts the batch when it did not.
+                statements.push(db.prepare("INSERT INTO novel_id_sequence(id,next_id) SELECT 1,0 WHERE changes()=0"));
+                crate::d1_repository::push_tag_statements(db, id, &tags, &mut statements)?;
+                guarded_parent = Some((id, parent));
+                guarded_composition = Some((member_ids, summary.composition));
+                Some(std::borrow::Cow::Owned(tags))
             }
             MembershipMutation::Remove(id) => {
                 if members.remove(id).is_none() {
@@ -196,6 +313,31 @@ AND EXISTS(SELECT 1 FROM json_each(?10) m CROSS JOIN novels n ON n.id=m.value WH
 pub async fn load_from_env(env: &Env) -> Result<VirtualNovelMembers> {
     let db = DbHandle::primary(std::sync::Arc::new(env.d1("DB").map_err(db_error)?));
     read(&db).await
+}
+
+/// 転送経路がメンバー構成を読むための入口。
+pub(crate) async fn load_membership(db: &DbHandle) -> Result<VirtualNovelMembers> {
+    read(db).await
+}
+
+/// 新規のバーチャル小説を公開する (レコードと所属は 1 つのトランザクション)。
+pub(crate) async fn publish_virtual_parent(
+    runtime: &WorkerRuntime,
+    record: &NovelRecord,
+    members: &[i64],
+) -> Result<()> {
+    mutate_membership(runtime, MembershipMutation::Create { record, members }).await
+}
+
+/// 既存のバーチャル小説の所属と派生メタデータを置き換える。
+/// live 行を読み直して、アーカイブが担う項目だけを反映する。
+pub(crate) async fn replace_virtual_members(
+    runtime: &WorkerRuntime,
+    id: i64,
+    metadata: &ArchiveNovel,
+    members: &[i64],
+) -> Result<()> {
+    mutate_membership(runtime, MembershipMutation::Replace { id, metadata, members }).await
 }
 
 /// D1 の所属を [`VirtualNovelDirectory`] として使うアダプタ。
@@ -390,7 +532,9 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         author: body.author,
         title,
         file_title,
-        toc_url: format!("https://narou.rs/virtual/{ncode}"),
+        // The transfer identity is portable: it addresses the same group in
+        // another library, unlike the library-local `vs_<ID>` ncode.
+        toc_url: core::new_toc_url()?,
         sitename: body.sitename,
         novel_type: 0,
         end: true,
@@ -422,7 +566,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
     Ok(record)
 }
 
-async fn summarize_members(runtime: &WorkerRuntime, members: &[i64]) -> Result<core::MemberSummary> {
+pub(crate) async fn summarize_members(runtime: &WorkerRuntime, members: &[i64]) -> Result<core::MemberSummary> {
     core::validate_members(members).map_err(NarouError::InvalidTarget)?;
     // Mutation retries must not reuse a possibly stale read-replica snapshot.
     let repository = crate::d1_repository::D1NovelRepository::new(runtime.write_db().clone());

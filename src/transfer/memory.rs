@@ -87,6 +87,10 @@ impl MetadataBudget {
         }
         self.charge(Self::allocation::<String>(novel.tags.capacity())?)?;
         for tag in &novel.tags { self.charge(Self::allocation::<u8>(tag.capacity())?)?; }
+        if let Some(members) = &novel.virtual_members {
+            self.charge(Self::allocation::<String>(members.capacity())?)?;
+            for url in members { self.charge(Self::allocation::<u8>(url.capacity())?)?; }
+        }
         self.charge(Self::allocation::<super::ArchiveFile>(novel.files.capacity())?)?;
         for file in &novel.files {
             self.charge(Self::allocation::<u8>(file.path.capacity())?)?;

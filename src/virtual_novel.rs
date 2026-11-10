@@ -15,6 +15,24 @@ use crate::application::attribute_tags::{MANGA_TAG, NOVEL_TAG};
 /// 仮想小説の ncode 接頭辞。
 pub const VIRTUAL_NCODE_PREFIX: &str = "vs_";
 
+/// Portable identity is independent of the library-local `vs_<ID>` ncode.
+pub fn is_portable_toc_url(url: &str) -> bool {
+    url.strip_prefix("https://narou.rs/virtual/").is_some_and(|identity| {
+        identity.len() == 32 && identity.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+/// Issue a persistent transfer identity without leaking a library-local ID.
+#[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
+pub fn new_toc_url() -> crate::error::Result<String> {
+    let identity: [u8; 16] = crate::login::random_bytes()?;
+    let mut encoded = [0u8; 32];
+    hex::encode_to_slice(identity, &mut encoded).expect("fixed hex output length");
+    let mut url = String::with_capacity("https://narou.rs/virtual/".len() + encoded.len());
+    url.push_str("https://narou.rs/virtual/");
+    url.push_str(std::str::from_utf8(&encoded).expect("hex is ASCII"));
+    Ok(url)
+}
 /// 仮想小説 ID から ncode を作る。
 pub fn ncode(id: i64) -> String {
     format!("{VIRTUAL_NCODE_PREFIX}{id}")
@@ -38,7 +56,7 @@ pub fn id_from_ncode(ncode: &str) -> Option<i64> {
         .strip_prefix(VIRTUAL_NCODE_PREFIX)?
         .parse::<i64>()
         .ok()
-        .filter(|id| *id > 0)
+        .filter(|id| *id >= 0)
 }
 
 /// 仮想小説に必ず付与するタグ。
@@ -144,8 +162,8 @@ pub fn validate_members(members: &[i64]) -> Result<(), String> {
     if members.is_empty() {
         return Err("メンバーを 1 件以上指定してください".to_string());
     }
-    if members.iter().any(|id| *id <= 0) {
-        return Err("メンバー ID は正の整数で指定してください".to_string());
+    if members.iter().any(|id| *id < 0) {
+        return Err("メンバー ID は 0 以上の整数で指定してください".to_string());
     }
     let unique: BTreeSet<i64> = members.iter().copied().collect();
     if unique.len() != members.len() {
@@ -312,6 +330,17 @@ mod tests {
     }
 
     #[test]
+    fn zero_id_members_follow_the_native_repository_id_domain() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(2, vec![0, 1]).unwrap();
+        members.reorder(2, vec![1, 0]).unwrap();
+        assert_eq!(members.get(2), Some([1, 0].as_slice()));
+        assert_eq!(members.owner_of(0), Some(2));
+        assert!(members.append(2, vec![0]).is_err());
+        assert!(validate_members(&[-1]).is_err());
+    }
+
+    #[test]
     fn composition_tracks_novel_and_manga_members() {
         let mut composition = AttributeComposition::default();
         assert!(composition.is_empty());
@@ -389,9 +418,24 @@ mod tests {
     fn ncode_roundtrip_and_detection() {
         assert_eq!(ncode(12), "vs_12");
         assert_eq!(id_from_ncode("vs_12"), Some(12));
+        assert_eq!(id_from_ncode("vs_0"), Some(0));
         assert!(is_virtual_ncode("vs_1"));
         assert!(!is_virtual_ncode("vs_"));
         assert!(!is_virtual_ncode("n1234ab"));
+    }
+
+    #[test]
+    fn portable_identity_rejects_local_ids_and_noncanonical_urls() {
+        assert!(is_portable_toc_url("https://narou.rs/virtual/0123456789abcdef0123456789abcdef"));
+        for url in [
+            "https://narou.rs/virtual/vs_1",
+            "http://narou.rs/virtual/0123456789abcdef0123456789abcdef",
+            "https://narou.rs/virtual/0123456789ABCDEF0123456789ABCDEF",
+            "https://narou.rs/virtual/0123456789abcdef0123456789abcdef?x=1",
+            "https://narou.rs/virtual/0123456789abcdef0123456789abcdef/",
+        ] {
+            assert!(!is_portable_toc_url(url), "{url}");
+        }
     }
 
     #[test]

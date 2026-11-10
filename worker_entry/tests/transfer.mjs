@@ -214,11 +214,16 @@ function firstPngPixel(bytes) {
 }
 
 function tocYaml(story, subtitles) {
-  const lines = ['---', `toc_url: ${TOC_URL}`, `title: ${TITLE}`, `author: ${AUTHOR}`, 'story: |-', `  ${story}`, 'subtitles:'];
+  return tocYamlFor(TOC_URL, TITLE, story, subtitles);
+}
+
+/// 指定 URL / 作品名の目次 YAML。
+function tocYamlFor(tocUrl, title, story, subtitles) {
+  const lines = ['---', `toc_url: ${tocUrl}`, `title: ${title}`, `author: ${AUTHOR}`, 'story: |-', `  ${story}`, 'subtitles:'];
   for (const subtitle of subtitles) {
     lines.push(
       `- index: '${subtitle.index}'`,
-      `  href: ${TOC_URL}${subtitle.index}/`,
+      `  href: ${tocUrl}${subtitle.index}/`,
       "  chapter: ''",
       "  subchapter: ''",
       `  subtitle: ${subtitle.name}`,
@@ -231,10 +236,15 @@ function tocYaml(story, subtitles) {
 }
 
 function sectionYaml(index, name, body) {
+  return sectionYamlFor(TOC_URL, index, name, body);
+}
+
+/// 指定 URL の本文 YAML。
+function sectionYamlFor(tocUrl, index, name, body) {
   return [
     '---',
     `index: '${index}'`,
-    `href: ${TOC_URL}${index}/`,
+    `href: ${tocUrl}${index}/`,
     "chapter: ''",
     "subchapter: ''",
     `subtitle: ${name}`,
@@ -312,6 +322,63 @@ const fixtureB = [
 const zipB = archiveFor(fixtureB);
 
 // ---------------------------------------------------------------------------
+// 虚拟小说（分组）的归档 fixture
+// ---------------------------------------------------------------------------
+
+// 分组父作品的标题 / 表紙 / 保存先 ( 通常作品とは別の保存先を持つ )。
+const GROUP_TITLE = 'TransferVirtualGroup';
+const GROUP_COVER = solidPng([12, 34, 56]);
+const GROUP_PREFIX = `novels/${SITENAME}/${GROUP_TITLE}`;
+
+/// 通常の作品記述子。
+function ordinaryDescriptor({ tocUrl, title, ncode, story, body, files = [] }) {
+  return {
+    toc_url: tocUrl,
+    title,
+    ncode,
+    files: [
+      { path: 'toc.yaml', data: Buffer.from(tocYamlFor(tocUrl, title, story, [{ index: '1', name: '第一話' }])) },
+      { path: '本文/1 第一話.yaml', data: Buffer.from(sectionYamlFor(tocUrl, '1', '第一話', body)) },
+      ...files,
+    ],
+  };
+}
+
+/// 归档記述子から manifest と ZIP を作る。
+/// `virtual_members` を持つ作品だけが format 2 (分组) として書き出される。
+function archiveFrom(descriptors) {
+  const manifest = {
+    format_version: descriptors.some((descriptor) => descriptor.virtual_members) ? 2 : 1,
+    app_version: '0.6.3',
+    exported_at: '2026-11-10T00:00:00Z',
+    novels: descriptors.map((descriptor) => ({
+      toc_url: descriptor.toc_url,
+      title: descriptor.title,
+      author: descriptor.author ?? AUTHOR,
+      sitename: descriptor.sitename ?? SITENAME,
+      domain: descriptor.domain ?? DOMAIN,
+      tags: descriptor.tags ?? ['テスト'],
+      attribute_tag: descriptor.attribute_tag ?? '小説',
+      novel_type: descriptor.novel_type ?? 1,
+      ...(descriptor.ncode === undefined ? {} : { ncode: descriptor.ncode }),
+      ...(descriptor.virtual_members === undefined ? {} : { virtual_members: descriptor.virtual_members }),
+      files: descriptor.files.map((file) => ({
+        path: file.path,
+        size: file.data.length,
+        sha256: sha256(file.data),
+      })),
+    })),
+  };
+  const entries = [{ name: 'manifest.json', data: JSON.stringify(manifest) }];
+  descriptors.forEach((descriptor, index) => {
+    for (const file of descriptor.files) {
+      entries.push({ name: `novels/${index}/${file.path}`, data: file.data });
+    }
+  });
+  return { zip: buildZip(entries), manifest };
+}
+
+// ---------------------------------------------------------------------------
 // Worker の起動 / 停止
 // ---------------------------------------------------------------------------
 
@@ -328,7 +395,7 @@ function runWrangler(args, phase) {
   return result.stdout;
 }
 
-function preparePhase(name) {
+function preparePhase(name, extraSql = '') {
   const directory = join(work, name);
   mkdirSync(directory, { recursive: true });
   let toml = readFileSync(join(root, 'wrangler.toml'), 'utf8').replace(/\[build\][^\[]*/, '');
@@ -349,6 +416,11 @@ function preparePhase(name) {
     `INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','"d1"','d1') ON CONFLICT(scope,key) DO NOTHING;`,
   );
   runWrangler(['d1', 'execute', 'DB', '--local', '--file', seed], phase);
+  if (extraSql) {
+    const extra = join(directory, 'extra-seed.sql');
+    writeFileSync(extra, extraSql);
+    runWrangler(['d1', 'execute', 'DB', '--local', '--file', extra], phase);
+  }
   return phase;
 }
 
@@ -464,8 +536,12 @@ function filesFrom(manifest, index = 0) {
 
 let phaseA;
 let phaseB;
+let phaseC;
+let phaseD;
 let workerA;
 let workerB;
+let workerC;
+let workerD;
 let exitCode = 1;
 try {
   // --- DB A: import → export ------------------------------------------------
@@ -554,7 +630,8 @@ try {
   assert.match(exportedA.response.headers.get('content-disposition') ?? '', /^attachment; filename="narou-export-\d{14}\.zip"$/);
 
   const { entries: zipEntries, manifest: exportedManifest } = manifestOf(exportedA.bytes);
-  assert.equal(exportedManifest.format_version, 1);
+  // 書き出しは format 2 ( 旧形式 1 の読み込みは引き続き可能 )。
+  assert.equal(exportedManifest.format_version, 2);
   assert.equal(exportedManifest.novels.length, 1);
   const exportedNovel = exportedManifest.novels[0];
   assert.equal(exportedNovel.toc_url, TOC_URL);
@@ -608,7 +685,8 @@ try {
   workerA = undefined;
 
   // --- DB B: 別 DB へ取り込み、同じ ZIP が再現できる -----------------------
-  phaseB = preparePhase('b');
+  // 分组父作品の表紙は保存先に置かれる ( 設定如同 )。
+  phaseB = preparePhase('b', `INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES ('${GROUP_PREFIX}/cover.png',${GROUP_COVER.length},'2026-11-10T00:00:00Z','none',${crc32(GROUP_COVER)},X'${GROUP_COVER.toString('hex')}');`);
   workerB = await startWorker(phaseB);
   console.log(`worker B ready on ${workerB.base}`);
   const b = client(workerB.base);
@@ -819,6 +897,245 @@ try {
   assert.equal(outcome.status, 'succeeded', JSON.stringify(outcome));
   console.log('PASS virtual EPUB preserves member pixels, one book structure, target layout, and queued conversion');
 
+  // --- バーチャル小説の構成とメンバーを別ライブラリへ転送 -------------------
+  // 本文は通常作品、親は構成・変換設定・明示的な表紙を保持する。
+  const groupTitle = GROUP_TITLE;
+  const groupCover = GROUP_COVER;
+  const vmemberOne = { tocUrl: 'https://example.com/vmember-1/', title: 'VirtualMemberOne', ncode: 'vmember1', body: '第一の作品の本文。' };
+  const vmemberTwo = { tocUrl: 'https://example.com/vmember-2/', title: 'VirtualMemberTwo', ncode: 'vmember2', body: '第二の作品の本文。' };
+  for (const member of [vmemberOne, vmemberTwo]) {
+    const { zip } = archiveFrom([ordinaryDescriptor({
+      tocUrl: member.tocUrl, title: member.title, ncode: member.ncode,
+      story: `${member.title}のあらすじ`, body: member.body,
+    })]);
+    const imported = await b.upload(zip);
+    assert.equal(imported.response.status, 200, JSON.stringify(imported.body));
+    assert.equal(imported.body.created, 1, JSON.stringify(imported.body));
+  }
+  const virtualList = await b.json('/api/novels?limit=1000');
+  const memberIds = [vmemberOne, vmemberTwo].map((member) => {
+    const row = virtualList.body.data.find((record) => record.toc_url === member.tocUrl);
+    assert(row, `missing member ${member.tocUrl}`);
+    return row.id;
+  });
+  const group = await b.json('/api/virtual_novels', post({
+    title: groupTitle, author: 'グループ作者', sitename: SITENAME, members: memberIds,
+  }));
+  assert.equal(group.response.status, 200, JSON.stringify(group.body));
+  const groupId = group.body.id;
+  const groupRecord = await b.json(`/api/novels/${groupId}`);
+  assert.match(groupRecord.body.toc_url, /^https:\/\/narou\.rs\/virtual\/[0-9a-f]{32}$/, 'a new group uses a portable identity');
+  assert.equal(groupRecord.body.ncode, `vs_${groupId}`);
+  const groupSettings = await b.json(`/api/settings/${groupId}`, post({ settings: [{ name: 'enable_yokogaki', value: true }] }));
+  assert.equal(groupSettings.response.status, 200, JSON.stringify(groupSettings.body));
+  console.log('PASS a new virtual group registers with a portable identity and per-novel settings');
+
+  // 親だけを書き出すと、メンバーが自動的に展開される。
+  const groupExport = await b.exportZip(groupId);
+  const { entries: groupEntries, manifest: groupManifest } = manifestOf(groupExport.bytes);
+  assert.equal(groupManifest.format_version, 2);
+  assert.equal(groupManifest.novels.length, 3, 'the parent expands into its two members');
+  assert.equal(groupManifest.novels[0].virtual_members, undefined);
+  assert.equal(groupManifest.novels[1].virtual_members, undefined);
+  const parentNovel = groupManifest.novels[2];
+  assert.deepEqual(parentNovel.virtual_members, [vmemberOne.tocUrl, vmemberTwo.tocUrl], 'the membership order travels with the parent');
+  assert.equal(parentNovel.ncode, undefined, 'a parent carries no library-local ncode');
+  assert.equal(parentNovel.toc_url, groupRecord.body.toc_url);
+  assert(!parentNovel.tags.some((tag) => tag.startsWith('vs_')), 'the internal tag never travels');
+  assert.deepEqual(parentNovel.files.map((file) => file.path), ['cover.png', 'setting.ini']);
+  assert.deepEqual(groupEntries.get('novels/2/cover.png'), groupCover);
+  assert(groupEntries.get('novels/2/setting.ini').toString('utf8').includes('enable_yokogaki'));
+  // 選択されたメンバーも 1 度だけ書かれる。
+  const dedupExport = await b.exportZip(`${groupId},${memberIds[0]}`);
+  const { manifest: dedupManifest } = manifestOf(dedupExport.bytes);
+  assert.equal(dedupManifest.novels.length, 3, 'a member that is also selected is stored once');
+  console.log('PASS exporting a selected group writes the members once and the parent descriptor with its order');
+
+  // --- 別ライブラリへ取り込む (衝突 / 順序 / 設定 / 表紙 / EPUB) --------------
+  phaseC = preparePhase('c');
+  workerC = await startWorker(phaseC);
+  const c = client(workerC.base);
+  // 同じ作品名のグループが既にあるライブラリを用意する (保存先の衝突)。
+  const otherMember = { tocUrl: 'https://example.com/vmember-9/', title: 'VirtualMemberNine', ncode: 'vmember9' };
+  const otherImport = await c.upload(archiveFrom([ordinaryDescriptor({
+    tocUrl: otherMember.tocUrl, title: otherMember.title, ncode: otherMember.ncode,
+    story: 'Ninth story', body: 'VirtualMemberNineの本文。',
+  })]).zip);
+  assert.equal(otherImport.body.created, 1, JSON.stringify(otherImport.body));
+  const otherRow = (await c.json('/api/novels?limit=1000')).body.data.find((row) => row.toc_url === otherMember.tocUrl);
+  const sameTitle = await c.json('/api/virtual_novels', post({
+    title: groupTitle, author: '既存グループ', sitename: SITENAME, members: [otherRow.id],
+  }));
+  assert.equal(sameTitle.response.status, 200, JSON.stringify(sameTitle.body));
+  const sameTitleRow = (await c.json(`/api/novels/${sameTitle.body.id}`)).body;
+
+  // 取り込み先に既にいるメンバーは skip されても、親はその ID を引き継ぐ。
+  const existingMember = await c.upload(archiveFrom([ordinaryDescriptor({
+    tocUrl: vmemberOne.tocUrl, title: vmemberOne.title, ncode: vmemberOne.ncode,
+    story: `${vmemberOne.title}のあらすじ`, body: vmemberOne.body,
+  })]).zip);
+  assert.equal(existingMember.body.created, 1, JSON.stringify(existingMember.body));
+
+  const importedGroup = await c.upload(groupExport.bytes);
+  assert.deepEqual(importedGroup.body, { success: true, created: 2, overwritten: 0, skipped: 1, errors: [] });
+  const cList = (await c.json('/api/novels?limit=1000')).body.data;
+  const cMembers = [vmemberOne, vmemberTwo].map((member) => cList.find((row) => row.toc_url === member.tocUrl).id);
+  const cParentRow = cList.find((row) => row.toc_url === groupRecord.body.toc_url);
+  assert(cParentRow, 'the parent was imported');
+  const cParent = (await c.json(`/api/novels/${cParentRow.id}`)).body;
+  assert.equal(cParent.ncode, `vs_${cParent.id}`, 'the parent gets a destination-local ncode');
+  assert.notEqual(cParent.file_title, sameTitleRow.file_title, 'the imported group must not share the folder of an existing same-title group');
+  const cGroups = (await c.json('/api/virtual_novels')).body.novels;
+  const cGroup = cGroups.find((row) => row.id === cParent.id);
+  assert.deepEqual(cGroup.members, cMembers, 'the membership order survives the reallocated ids');
+  assert.deepEqual(cGroups.find((row) => row.id === sameTitle.body.id).members, [otherRow.id], 'the existing group is untouched');
+  console.log('PASS a fresh library imports the group after its members and keeps the order under new ids');
+
+  // 取り込み直後の父作品: 設定と表紙がそのまま保存されている。
+  const cParentExport = await c.exportZip(cParent.id);
+  const { entries: cParentEntries, manifest: cParentManifest } = manifestOf(cParentExport.bytes);
+  const cParentNovel = cParentManifest.novels.find((novel) => novel.toc_url === groupRecord.body.toc_url);
+  const cParentIndex = cParentManifest.novels.indexOf(cParentNovel);
+  assert.deepEqual(cParentNovel.files.map((file) => file.path), ['cover.png', 'setting.ini']);
+  assert.deepEqual(cParentEntries.get(`novels/${cParentIndex}/cover.png`), groupCover);
+  assert.deepEqual(cParentEntries.get(`novels/${cParentIndex}/setting.ini`), groupEntries.get('novels/2/setting.ini'));
+  console.log('PASS the imported group keeps its settings and cover bytes');
+
+  // 結合 EPUB: UI の実経路で両メンバーの本文が登録順に現れる。
+  const epub = await c.request(`/novels/${cParent.id}/download`);
+  assert.equal(epub.status, 200, epub.status === 200 ? '' : await epub.text());
+  const importedBook = readZip(Buffer.from(await epub.arrayBuffer()));
+  const importedXhtml = [...importedBook].filter(([name]) => name.endsWith('.xhtml')).map(([, bytes]) => bytes.toString()).join('\n');
+  assert(importedXhtml.includes(vmemberOne.body), importedXhtml);
+  assert(importedXhtml.includes(vmemberTwo.body), importedXhtml);
+  assert(importedXhtml.indexOf(vmemberOne.body) < importedXhtml.indexOf(vmemberTwo.body), 'the members keep their order');
+  console.log('PASS the imported group renders one EPUB through the UI route');
+
+  // 同じアーカイブの再取り込みは skip。
+  const repeated = await c.upload(groupExport.bytes);
+  assert.deepEqual(repeated.body, { success: true, created: 0, overwritten: 0, skipped: 3, errors: [] });
+  console.log('PASS importing the same group archive again skips every entry');
+
+  // 上書き: メンバー順が入れ替わっても保存先 ID とフォルダは変わらない。
+  const reversedArchive = archiveFrom([
+    ordinaryDescriptor({
+      tocUrl: vmemberOne.tocUrl, title: vmemberOne.title, ncode: vmemberOne.ncode,
+      story: `${vmemberOne.title}のあらすじ`, body: vmemberOne.body,
+    }),
+    ordinaryDescriptor({
+      tocUrl: vmemberTwo.tocUrl, title: vmemberTwo.title, ncode: vmemberTwo.ncode,
+      story: `${vmemberTwo.title}のあらすじ`, body: vmemberTwo.body,
+    }),
+    {
+      toc_url: groupRecord.body.toc_url, title: groupTitle, files: [],
+      virtual_members: [vmemberTwo.tocUrl, vmemberOne.tocUrl],
+    },
+  ]);
+  const reversedImport = await c.upload(reversedArchive.zip, '?overwrite=true');
+  assert.deepEqual(reversedImport.body, { success: true, created: 0, overwritten: 3, skipped: 0, errors: [] });
+  const reversedGroup = (await c.json('/api/virtual_novels')).body.novels.find((row) => row.id === cParent.id);
+  assert.deepEqual(reversedGroup.members, [cMembers[1], cMembers[0]], 'the overwrite replaces the membership order');
+  const reversedParent = (await c.json(`/api/novels/${cParent.id}`)).body;
+  assert.equal(reversedParent.file_title, cParent.file_title, 'the folder of the group is preserved');
+  assert.equal(reversedParent.toc_url, groupRecord.body.toc_url, 'the portable identity is preserved');
+  console.log('PASS overwriting a group replaces the membership order and keeps its identity and folder');
+
+  // --- 壊れたメンバー参照は公開前に拒否される ------------------------------
+  const brokenGraphs = [
+    ['missing member', ['https://example.com/missing-member/']],
+    ['self reference', ['https://narou.rs/virtual/11111111111111111111111111111111']],
+  ];
+  for (const [label, refs] of brokenGraphs) {
+    const broken = archiveFrom([
+      ordinaryDescriptor({
+        tocUrl: 'https://example.com/broken-member/', title: 'BrokenMember', ncode: 'broken1',
+        story: 'broken', body: 'broken',
+      }),
+      {
+        toc_url: 'https://narou.rs/virtual/11111111111111111111111111111111',
+        title: 'BrokenGroup', files: [], virtual_members: refs,
+      },
+    ]);
+    const refused = await c.upload(broken.zip);
+    assert.equal(refused.response.status, 400, `${label}: ${JSON.stringify(refused.body)}`);
+    const afterRefusal = (await c.json('/api/novels?limit=1000')).body.data;
+    assert(!afterRefusal.some((row) => row.toc_url === 'https://example.com/broken-member/'), `${label}: nothing may be imported`);
+  }
+  // 入れ子の親 (親がメンバーを参照) も拒否される。
+  const nested = archiveFrom([
+    ordinaryDescriptor({
+      tocUrl: 'https://example.com/nested-member/', title: 'NestedMember', ncode: 'nested1',
+      story: 'nested', body: 'nested',
+    }),
+    {
+      toc_url: 'https://narou.rs/virtual/22222222222222222222222222222222',
+      title: 'InnerGroup', files: [], virtual_members: ['https://example.com/nested-member/'],
+    },
+    {
+      toc_url: 'https://narou.rs/virtual/33333333333333333333333333333333',
+      title: 'OuterGroup', files: [], virtual_members: ['https://narou.rs/virtual/22222222222222222222222222222222'],
+    },
+  ]);
+  assert.equal((await c.upload(nested.zip)).response.status, 400);
+  console.log('PASS malformed member graphs are refused before anything is imported');
+
+  // --- メンバーの保存に失敗したら親も公開されない --------------------------
+  const blocked = await c.upload(archiveFrom([
+    // ncode / 保存先が既存作品と衝突する。
+    ordinaryDescriptor({
+      tocUrl: 'https://example.com/collide/', title: 'CollideMember', ncode: 'vmember1',
+      story: 'collide', body: 'CollideMemberの本文。',
+    }),
+    ordinaryDescriptor({
+      tocUrl: 'https://example.com/healthy-member/', title: 'HealthyMember', ncode: 'vmember3',
+      story: 'healthy', body: 'HealthyMemberの本文。',
+    }),
+    {
+      toc_url: 'https://narou.rs/virtual/44444444444444444444444444444444',
+      title: 'BlockedGroup', files: [],
+      virtual_members: ['https://example.com/collide/', 'https://example.com/healthy-member/'],
+    },
+  ]).zip);
+  assert.equal(blocked.response.status, 200, JSON.stringify(blocked.body));
+  assert.equal(blocked.body.success, false);
+  assert.equal(blocked.body.created, 1, 'the healthy member is still imported');
+  const blockedList = (await c.json('/api/novels?limit=1000')).body.data;
+  assert(!blockedList.some((row) => row.toc_url === 'https://narou.rs/virtual/44444444444444444444444444444444'), 'the parent must not be published');
+  assert(!(await c.json('/api/virtual_novels')).body.novels.some((row) => row.title === 'BlockedGroup'));
+  console.log('PASS a failed member blocks the publication of its parent');
+
+  // --- 旧 ID のバーチャル小説 ( 移植可能な ID への移行 ) --------------------
+  // ライブラリローカルな URL (`/virtual/vs_<ID>`) だけを持つ旧グループ。
+  const legacyRows = [
+    { id: 901, title: 'LegacyMemberOne', fileTitle: 'legacymember1', tocUrl: 'https://example.com/legacy-1/' },
+    { id: 902, title: 'LegacyMemberTwo', fileTitle: 'legacymember2', tocUrl: 'https://example.com/legacy-2/' },
+  ];
+  const legacySeed = [];
+  const sqlQuote = (value) => `'${String(value).replaceAll("'", "''")}'`;
+  for (const row of legacyRows) {
+    const toc = Buffer.from(`title: ${row.title}\nauthor: Fixture\ntoc_url: ${row.tocUrl}\nsubtitles: []\nnovel_type: 1\n`);
+    const prefix = `novels/Legacy Site/${row.fileTitle}`;
+    legacySeed.push(`INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,novel_type,use_subdirectory) VALUES (${row.id},'Fixture','fixture',${sqlQuote(row.title)},${sqlQuote(row.title.toLowerCase())},${sqlQuote(row.fileTitle)},${sqlQuote(row.tocUrl)},${sqlQuote(row.tocUrl)},'Legacy Site','legacy site','2026-11-10T00:00:00Z',${sqlQuote(row.fileTitle)},${sqlQuote(row.fileTitle)},1,0);`);
+    legacySeed.push(`INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (${sqlQuote(`${prefix}/toc.yaml`)},${toc.length},'2026-11-10T00:00:00Z','none',${crc32(toc)},X'${toc.toString('hex')}');`);
+  }
+  legacySeed.push("INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,novel_type,use_subdirectory) VALUES (900,'Fixture','fixture','LegacyGroup','legacygroup','LegacyGroup','https://narou.rs/virtual/vs_900','https://narou.rs/virtual/vs_900','Legacy Site','legacy site','2026-11-10T00:00:00Z','vs_900','vs_900',0,0);");
+  legacySeed.push("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','virtual_novel_members','{\"900\":[901,902]}','{\"900\":[901,902]}');");
+  phaseD = preparePhase('d', legacySeed.join('\n'));
+  workerD = await startWorker(phaseD);
+  const d = client(workerD.base);
+  const legacyGroupExport = await d.exportZip(900);
+  const { manifest: legacyGroupManifest } = manifestOf(legacyGroupExport.bytes);
+  assert.equal(legacyGroupManifest.novels.length, 3, 'the legacy group expands into its members');
+  const legacyParent = legacyGroupManifest.novels[2];
+  assert.match(legacyParent.toc_url, /^https:\/\/narou\.rs\/virtual\/[0-9a-f]{32}$/, 'the first export persists a portable identity');
+  assert.deepEqual(legacyParent.virtual_members, ['https://example.com/legacy-1/', 'https://example.com/legacy-2/']);
+  const legacyGroupRow = await d.json('/api/novels/900');
+  assert.equal(legacyGroupRow.body.toc_url, legacyParent.toc_url, 'the source record keeps the portable identity');
+  const legacyExportAgain = await d.exportZip(900);
+  const { manifest: legacyAgain } = manifestOf(legacyExportAgain.bytes);
+  assert.equal(legacyAgain.novels[2].toc_url, legacyParent.toc_url, 'later exports reuse the same identity');
+  console.log('PASS the first export of an older group persists one portable identity and reuses it');
+
   // Exercise one file and one ZIP above the old 16 MiB small-object ceiling.
   // Client fixture allocations are outside the Worker; production routes must
   // receive, stage, validate, export and re-import these bodies incrementally.
@@ -854,10 +1171,14 @@ try {
 } catch (error) {
   if (workerA) console.error(workerA.logs().slice(-20000));
   if (workerB) console.error(workerB.logs().slice(-20000));
+  if (workerC) console.error(workerC.logs().slice(-20000));
+  if (workerD) console.error(workerD.logs().slice(-20000));
   console.error(error);
 } finally {
   await stopWorker(workerA);
   await stopWorker(workerB);
+  await stopWorker(workerC);
+  await stopWorker(workerD);
   rmSync(work, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 }
 

@@ -117,6 +117,56 @@ try {
   assert.equal(published, 0, 'late invalid entry must fail before any metadata output');
   await close(corrupt);
 
+  // A parent may appear first in incoming metadata, but its import decisions
+  // must follow both members. References are URLs, not source-library IDs.
+  const parentSettings = Buffer.from('enable_yokogaki=true\n');
+  const grouped = {
+    format_version: 2,
+    novels: [{
+      toc_url: 'https://narou.rs/virtual/0123456789abcdef0123456789abcdef',
+      title: '結合する作品', author: 'Tester', sitename: 'Group', novel_type: 0,
+      virtual_members: [source.novels[1].toc_url, source.novels[0].toc_url],
+      files: [{ path: 'setting.ini', size: parentSettings.length }],
+    }, ...source.novels],
+  };
+  const groupedMetadataPath = join(work, 'grouped-manifest.json');
+  await writeFile(groupedMetadataPath, JSON.stringify(grouped));
+  const groupedMetadata = await file(groupedMetadataPath, 'r');
+  const groupedZipPath = join(work, 'grouped.zip');
+  const groupedZip = await file(groupedZipPath, 'w');
+  await wasm.build_zip(ranges(groupedMetadata), (await groupedMetadata.stat()).size,
+    async (index, path, offset, length) => {
+      assert.equal(path, index === 0 ? 'setting.ini' : 'toc.yaml');
+      assert(index >= 0 && index <= 2);
+      return (index === 0 ? parentSettings : body).subarray(offset, offset + length);
+    }, outputChunks(bytes => writeAll(groupedZip, bytes)));
+  await close(groupedZip); await close(groupedMetadata);
+  const groupedArchive = await file(groupedZipPath, 'r');
+  const groupedSize = (await groupedArchive.stat()).size;
+  const groupedChunks = [];
+  await wasm.parse_zip(ranges(groupedArchive), groupedSize, outputChunks(bytes => groupedChunks.push(Buffer.from(bytes))));
+  const groupedParsed = JSON.parse(Buffer.concat(groupedChunks).toString('utf8'));
+  assert.deepEqual(groupedParsed.novels[0].virtual_members, grouped.novels[0].virtual_members);
+  assert.equal(groupedParsed.novels[0].files[0].sha256, createHash('sha256').update(parentSettings).digest('hex'));
+  const groupedDecisions = [], lookupOrder = [];
+  await wasm.plan_zip(ranges(groupedArchive), groupedSize, async (index, url) => {
+    lookupOrder.push(index); assert.equal(url, grouped.novels[index].toc_url); return index === 2;
+  }, false, outputChunks(bytes => groupedDecisions.push(Buffer.from(bytes))));
+  assert.deepEqual(lookupOrder, [1, 2, 0]);
+  assert.deepEqual(Buffer.concat(groupedDecisions).toString('utf8').trim().split('\n').map(JSON.parse),
+    [{ index: 1, action: 'Create' }, { index: 2, action: 'Skip' }, { index: 0, action: 'Create' }]);
+  await close(groupedArchive);
+
+  grouped.novels[0].virtual_members.push('https://example.test/missing/');
+  const invalidMetadataPath = join(work, 'missing-member.json');
+  await writeFile(invalidMetadataPath, JSON.stringify(grouped));
+  const invalidMetadata = await file(invalidMetadataPath, 'r');
+  let invalidWrites = 0;
+  await assert.rejects(wasm.build_zip(ranges(invalidMetadata), (await invalidMetadata.stat()).size, readBody,
+    async () => { invalidWrites += 1; }));
+  assert.equal(invalidWrites, 0, 'missing member must be rejected before ZIP output');
+  await close(invalidMetadata);
+
   // Six MiB of escaped NULs serialize to 36 MiB. The former duplicated Value
   // trees + whole JSON String + JS return copy exceeded the Worker heap budget.
   parsed.novels.length = 1; parsed.novels[0].title = '';
@@ -148,7 +198,7 @@ try {
   assert(heapBytes < 64 * 1024 * 1024, `metadata serialization amplified Wasm heap to ${heapBytes}`);
   console.log(JSON.stringify({ result: 'PASS', wasm_heap_bytes: heapBytes, metadata_bytes: emitted,
     max_read_chunk: maximumRead, max_write_chunk: maximumWrite,
-    checks: ['backpressure', 'SHA/size roundtrip', 'skip/overwrite/create', 'validation before output', 'escaped metadata without whole JSON copies'] }));
+    checks: ['backpressure', 'SHA/size roundtrip', 'skip/overwrite/create', 'virtual members before parent with ordered URLs', 'invalid virtual graph before output', 'validation before output', 'escaped metadata without whole JSON copies'] }));
 } finally {
   await Promise.allSettled([...handles].map(value => value.close()));
   await rm(work, { recursive: true, force: true });

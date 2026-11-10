@@ -26,7 +26,7 @@ pub struct ArchiveManifest {
     /// Caller-provided export timestamp (RFC 3339 or similar), if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exported_at: Option<String>,
-    /// Selected novels, in manifest order. Entry paths use this index.
+    /// Selected works and expanded members; ZIP entry paths use this index.
     #[serde(default)]
     pub novels: Vec<ArchiveNovel>,
 }
@@ -77,6 +77,9 @@ pub struct ArchiveNovel {
     /// Last local update time, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_update: Option<String>,
+    /// Ordered ordinary-member URLs for a virtual parent; never library IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_members: Option<Vec<String>>,
 }
 
 /// One file belonging to a novel.
@@ -160,8 +163,8 @@ const MAX_PATH_COMPONENT_CHARS: usize = 255;
 
 /// Builds a deterministic ZIP archive from `manifest`.
 ///
-/// Novels are sorted by `(toc_url, title)` and files by `path`; timestamps are
-/// fixed at the ZIP epoch. File sizes and SHA-256 digests are computed and
+/// Ordinary works precede virtual parents; both sets sort by URL/title. Files
+/// sort by path; ZIP timestamps are fixed. Sizes and SHA-256 are computed and
 /// written into `manifest.json`, so callers do not have to fill them in.
 ///
 /// Paths are validated before anything is written. The archive is rejected if
@@ -175,9 +178,7 @@ pub(crate) fn build_archive_with_limits(
     manifest: &ArchiveManifest,
     limits: Limits,
 ) -> Result<Vec<u8>> {
-    if manifest.format_version != FORMAT_VERSION {
-        return Err(TransferError::UnsupportedVersion(manifest.format_version));
-    }
+    super::structure::validate(manifest)?;
     if manifest.novels.len() > limits.max_novels {
         return Err(TransferError::TooLarge(format!(
             "{} novels, limit {}",
@@ -191,8 +192,8 @@ pub(crate) fn build_archive_with_limits(
     // collection order. `sort_by` is stable, so fully equal novels keep their
     // relative order.
     normalized.novels.sort_by(|a, b| {
-        a.toc_url
-            .cmp(&b.toc_url)
+        a.virtual_members.is_some().cmp(&b.virtual_members.is_some())
+            .then_with(|| a.toc_url.cmp(&b.toc_url))
             .then_with(|| a.title.cmp(&b.title))
     });
 
@@ -414,9 +415,7 @@ pub(crate) fn parse_archive_with_limits(bytes: &[u8], limits: Limits) -> Result<
     }
 
     let mut manifest: ArchiveManifest = serde_json::from_slice(&manifest_bytes)?;
-    if manifest.format_version != FORMAT_VERSION {
-        return Err(TransferError::UnsupportedVersion(manifest.format_version));
-    }
+    super::structure::validate(&manifest)?;
     if manifest.novels.len() > limits.max_novels {
         return Err(TransferError::TooLarge(format!(
             "{} novels, limit {}",

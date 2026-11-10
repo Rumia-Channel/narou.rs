@@ -103,6 +103,8 @@ pub fn plan_manifest(
         .novels
         .iter()
         .enumerate()
+        .filter(|(_, novel)| novel.virtual_members.is_none())
+        .chain(manifest.novels.iter().enumerate().filter(|(_, novel)| novel.virtual_members.is_some()))
         .map(|(index, novel)| plan_entry(index, &novel.toc_url, &novel.title, &existing_by_url, conflict))
         .collect();
 

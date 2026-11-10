@@ -53,7 +53,7 @@ use crate::downloader::util::{load_length_limit, sanitize_filename_with_limit};
 use crate::error::{NarouError, Result};
 use crate::native::materialization::block_on;
 use crate::native::novel_repository::NativeNovelRepository;
-use crate::platform::{AssetStore, AssetStream, NovelId, NovelMutation, ObjectKey, StagedAsset};
+use crate::platform::{AssetStore, AssetStream, NovelId, NovelMutation, NovelObjectKeys, ObjectKey, StagedAsset};
 use crate::transfer::{
     ArchiveFile, ArchiveNovel, ConflictPolicy, ExistingNovel, ImportAction, StagedNovel,
     StagedArchive, bounded_asset_stream, plan_manifest, MAX_ARCHIVE_BYTES,
@@ -110,13 +110,48 @@ fn export_to(
     let archive_root = db::with_database(|database| Ok(database.archive_root().to_path_buf()))?;
     let mut seen = HashSet::new();
     let ids: Vec<_> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
-    // Resolve all requested records before the first output byte.
-    let records = ids.iter().map(|id| repository.get_sync(NovelId(*id))?
-        .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))).collect::<Result<Vec<_>>>()?;
+    // A selected virtual parent expands into its ordinary members; a member
+    // that is selected as well is stored once.
+    let membership = crate::native::virtual_novel::load()?;
+    let mut ordinary: Vec<NovelRecord> = Vec::new();
+    // A parent keeps only the member URLs it references; the member rows
+    // themselves belong to the ordinary list.
+    let mut parents: Vec<(NovelRecord, Vec<String>)> = Vec::new();
+    let mut expanded: HashSet<i64> = HashSet::new();
+    for id in &ids {
+        let record = repository.get_sync(NovelId(*id))?
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
+        let Some(member_ids) = membership.get(record.id) else {
+            if crate::virtual_novel::is_virtual_record(&record) {
+                return Err(NarouError::NotFound(format!(
+                    "ID: {id} のバーチャル小説にメンバーがありません"
+                )));
+            }
+            if expanded.insert(record.id) { ordinary.push(record); }
+            continue;
+        };
+        let mut urls = Vec::with_capacity(member_ids.len());
+        for member_id in member_ids {
+            let member = repository.get_sync(NovelId(*member_id))?
+                .ok_or_else(|| NarouError::NotFound(format!(
+                    "ID: {id}: メンバー ID:{member_id} が見つかりません"
+                )))?;
+            if crate::virtual_novel::is_virtual_record(&member) {
+                return Err(NarouError::InvalidTarget(format!(
+                    "ID: {id}: メンバー ID:{member_id} はバーチャル小説です"
+                )));
+            }
+            urls.push(member.toc_url.clone());
+            if expanded.insert(member.id) { ordinary.push(member); }
+        }
+        parents.push((record, urls));
+    }
     let mut writer = crate::transfer::ArchiveStream::new(sink, version::VERSION.into(),
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
     let mut info = Vec::new();
-    for (completed, record) in records.iter().enumerate() {
+    let total = ordinary.len() + parents.len();
+    // Ordinary works come first: a virtual parent only references them.
+    for record in &ordinary {
         let novel_dir = db::existing_novel_dir_for_record(&archive_root, record);
         ensure_exportable(&archive_root, &novel_dir)?;
         let snapshot = crate::native::materialization::snapshot(&novel_dir)?;
@@ -128,10 +163,54 @@ fn export_to(
             file_count += 1;
         }
         info.push(ExportedNovelInfo { id: record.id, title: record.title.clone(), file_count });
-        report(completed + 1, ids.len(), &record.title)?;
+        report(info.len(), total, &record.title)?;
+    }
+    for (record, members) in parents {
+        // The parent's own identity travels as a portable URL, so another
+        // library can address the same group without the local ID.
+        let toc_url = crate::native::virtual_novel::ensure_portable_identity(record.id)?;
+        // The inputs are copied into a private directory first: the stored
+        // bytes are streamed, so a large cover never lands in memory.
+        let (temporary, files) = collect_virtual_input_files(&record)?;
+        writer.begin_novel(archive_virtual_from_record(&record, &toc_url, members))?;
+        for (relative, path) in &files {
+            writer.add_reader(relative, &mut fs::File::open(path)?)?;
+        }
+        info.push(ExportedNovelInfo { id: record.id, title: record.title.clone(), file_count: files.len() });
+        report(info.len(), total, &record.title)?;
+        drop(temporary);
     }
     writer.finish()?;
     Ok(info)
+}
+
+/// Materializes the per-novel inputs of a virtual parent.
+///
+/// A parent owns no body: its members keep the text. Only the settings, the
+/// replacement rules, the converter options and the cover travel with it.
+/// Each input is copied into a private directory, so the archive reads it as a
+/// stream instead of holding the whole file in memory.
+fn collect_virtual_input_files(
+    record: &NovelRecord,
+) -> Result<(tempfile::TempDir, Vec<(String, PathBuf)>)> {
+    let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+    let store = crate::native::object_store::NativeStore::for_current_root()?.prefer_existing_files();
+    let inventory = crate::db::inventory::Inventory::with_default_root()?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".narou-virtual-input-")
+        .tempdir_in(inventory.root_dir())
+        .map_err(NarouError::Io)?;
+    let mut files = Vec::new();
+    for name in crate::transfer::VIRTUAL_INPUT_FILES {
+        let key = keys.prefix().join(name)?;
+        let destination = temporary.path().join(name);
+        let copied = block_on(async {
+            crate::native::materialization::copy_asset(&store, &key, &destination).await
+        })?;
+        if !copied { continue; }
+        files.push((name.to_string(), destination));
+    }
+    Ok((temporary, files))
 }
 
 /// The same byte stream encoded as bounded progress frames for the Web UI.
@@ -215,15 +294,22 @@ pub fn import_archive_reader<R: Read + Send + 'static>(
     // A single archive may repeat a toc_url; the plan is computed against the
     // library as it was before the run, so track what this run already handled.
     let mut handled_urls: HashSet<String> = HashSet::new();
+    // Archive member URL -> the destination record ID of an imported member.
+    // A parent is published with these IDs, never with the source ones.
+    let mut destinations: HashMap<String, i64> = HashMap::new();
 
+    // The core plan already lists the ordinary members before the parents that
+    // reference them, whatever order the manifest used.
+    let total = plan.entries.len();
     for (position, entry) in plan.entries.iter().enumerate() {
         if cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Err(NarouError::Platform("transfer cancelled".into()));
         }
         let novel = &parsed.novels[entry.index];
         let metadata = &parsed.manifest.novels[entry.index];
+        let is_parent = metadata.virtual_members.is_some();
         if let Some(report) = progress.as_mut() {
-            report(position, plan.entries.len(), &novel.title)?;
+            report(position, total, &novel.title)?;
         }
 
         if !handled_urls.insert(novel.toc_url.clone()) {
@@ -234,22 +320,76 @@ pub fn import_archive_reader<R: Read + Send + 'static>(
             continue;
         }
 
+        // A virtual parent and an ordinary work never replace each other.
+        if let Some(record) = records_by_url.get(&novel.toc_url)
+            && is_parent != crate::virtual_novel::is_virtual_record(record)
+        {
+            outcome.errors.push(format!(
+                "{}: ライブラリにある作品と種類が違います",
+                describe(novel)
+            ));
+            continue;
+        }
+
         let result = match entry.action {
             ImportAction::Skip => {
                 outcome.skipped += 1;
+                // An existing member still maps to its destination ID, so a
+                // parent can reference a member this run did not import.
+                if let Some(record) = records_by_url.get(&novel.toc_url) {
+                    destinations.insert(novel.toc_url.clone(), record.id);
+                }
                 continue;
             }
-            ImportAction::Create => create_novel(&repository, &archive_root, metadata, novel, assets.as_ref())
-                .map(|_| outcome.created += 1),
-            ImportAction::Overwrite => {
-                let record = records_by_url.get(&novel.toc_url).ok_or_else(|| {
-                    NarouError::NotFound(format!("{} はライブラリにありません", novel.toc_url))
-                });
-                record
-                    .and_then(|record| {
-                        overwrite_novel(&repository, &archive_root, record, metadata, novel, assets.as_ref())
+            ImportAction::Create if is_parent => {
+                let member_ids = match member_destinations(metadata, &destinations) {
+                    Ok(ids) => ids,
+                    Err(message) => {
+                        outcome.errors.push(format!("{}: {message}", describe(novel)));
+                        continue;
+                    }
+                };
+                create_virtual_parent(&archive_root, metadata, novel, &member_ids)
+                    .map(|id| {
+                        outcome.created += 1;
+                        destinations.insert(novel.toc_url.clone(), id);
                     })
-                    .map(|_| outcome.overwritten += 1)
+            }
+            ImportAction::Create => create_novel(&repository, &archive_root, metadata, novel, assets.as_ref())
+                .map(|id| {
+                    outcome.created += 1;
+                    destinations.insert(novel.toc_url.clone(), id);
+                }),
+            ImportAction::Overwrite if is_parent => {
+                let Some(record) = records_by_url.get(&novel.toc_url) else {
+                    outcome.errors.push(format!("{}: ライブラリにありません", describe(novel)));
+                    continue;
+                };
+                let member_ids = match member_destinations(metadata, &destinations) {
+                    Ok(ids) => ids,
+                    Err(message) => {
+                        outcome.errors.push(format!("{}: {message}", describe(novel)));
+                        continue;
+                    }
+                };
+                let id = record.id;
+                overwrite_virtual_parent(&archive_root, record, metadata, novel, &member_ids)
+                    .map(|_| {
+                        outcome.overwritten += 1;
+                        destinations.insert(novel.toc_url.clone(), id);
+                    })
+            }
+            ImportAction::Overwrite => {
+                let Some(record) = records_by_url.get(&novel.toc_url) else {
+                    outcome.errors.push(format!("{}: ライブラリにありません", describe(novel)));
+                    continue;
+                };
+                let id = record.id;
+                overwrite_novel(&repository, &archive_root, record, metadata, novel, assets.as_ref())
+                    .map(|_| {
+                        outcome.overwritten += 1;
+                        destinations.insert(novel.toc_url.clone(), id);
+                    })
             }
         };
 
@@ -258,10 +398,34 @@ pub fn import_archive_reader<R: Read + Send + 'static>(
         }
     }
     if let Some(report) = progress.as_mut() {
-        report(plan.entries.len(), plan.entries.len(), "")?;
+        report(total, total, "")?;
     }
 
     Ok(outcome)
+}
+
+/// Maps a parent's member references to destination record IDs.
+///
+/// A member that this run did not import blocks the parent: a group is never
+/// published with a missing member.
+fn member_destinations(
+    metadata: &ArchiveNovel,
+    destinations: &HashMap<String, i64>,
+) -> std::result::Result<Vec<i64>, String> {
+    let members = metadata
+        .virtual_members
+        .as_ref()
+        .ok_or_else(|| "バーチャル小説のメンバー構成がありません".to_string())?;
+    let mut ids = Vec::with_capacity(members.len());
+    for url in members {
+        match destinations.get(url) {
+            Some(id) => ids.push(*id),
+            None => {
+                return Err(format!("メンバー {url} が取り込まれていないため公開しません"));
+            }
+        }
+    }
+    Ok(ids)
 }
 
 fn describe(novel: &StagedNovel) -> String {
@@ -460,6 +624,39 @@ pub fn archive_novel_from_record(
         subtitle,
         general_lastup: record.general_lastup.map(rfc3339),
         last_update: Some(rfc3339(record.last_update)),
+        virtual_members: None,
+    }
+}
+
+/// Builds the manifest metadata for one virtual parent.
+///
+/// The parent's own identity is the portable URL. The membership travels as
+/// the members' `toc_url` in registration order, never as library IDs, and
+/// the library-local ncode and internal tag stay behind.
+fn archive_virtual_from_record(
+    record: &NovelRecord,
+    toc_url: &str,
+    members: Vec<String>,
+) -> ArchiveNovel {
+    ArchiveNovel {
+        toc_url: toc_url.to_string(),
+        title: record.title.clone(),
+        author: record.author.clone(),
+        sitename: record.sitename.clone(),
+        domain: record.domain.clone(),
+        tags: record.tags.iter()
+            .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
+            .cloned()
+            .collect(),
+        attribute_tag: record.attribute_tag().map(str::to_string),
+        novel_type: record.novel_type,
+        files: Vec::new(),
+        // A parent has no ncode of its own: the ncode is library-local.
+        ncode: None,
+        subtitle: None,
+        general_lastup: record.general_lastup.map(rfc3339),
+        last_update: Some(rfc3339(record.last_update)),
+        virtual_members: Some(members),
     }
 }
 
@@ -719,6 +916,169 @@ fn overwrite_novel(
         repository.apply_batch_sync(vec![NovelMutation::Upsert(updated)])?;
     }
     Ok(())
+}
+
+/// Creates a new virtual parent from one archive entry.
+///
+/// The parent owns no body: only its per-novel inputs are stored. The files
+/// become durable first, then the record and the membership are published in
+/// one database update, so a failed member never leaves a visible group.
+fn create_virtual_parent(
+    archive_root: &Path,
+    metadata: &ArchiveNovel,
+    novel: &StagedNovel,
+    member_ids: &[i64],
+) -> Result<i64> {
+    if !crate::virtual_novel::is_portable_toc_url(&novel.toc_url) {
+        return Err(NarouError::Platform(
+            "バーチャル小説の保存先 URL が移植できません".into(),
+        ));
+    }
+    // Authoritative duplicate check: the plan ran against a snapshot.
+    let duplicate = db::with_database(|database| {
+        Ok(database
+            .all_records()
+            .values()
+            .find(|record| record.toc_url == novel.toc_url)
+            .map(|record| record.id))
+    })?;
+    if let Some(existing) = duplicate {
+        return Err(NarouError::Platform(format!(
+            "既に ID:{existing} として登録されています"
+        )));
+    }
+    let title = metadata.title.trim().to_string();
+    if title.is_empty() {
+        return Err(NarouError::Platform("アーカイブに作品名がありません".into()));
+    }
+    // The record needs a non-empty sitename because it names the key prefix.
+    let sitename = metadata.sitename.trim().to_string();
+    let sitename = if sitename.is_empty() {
+        host_of(&novel.toc_url).unwrap_or_else(|| "narou.rs".to_string())
+    } else {
+        sitename
+    };
+    let use_subdirectory = NativeDownloaderSettings.download_use_subdirectory();
+    let reservation = db::with_database_mut(|database| database.allocate_id())?;
+    let id = reservation.id().0;
+    let ncode = crate::virtual_novel::ncode(id);
+    // The folder name is derived from the new local ID, so a group with the
+    // same title never shares a folder with an existing one.
+    let file_title = ncode.clone();
+    let mut record = NovelRecord {
+        id,
+        author: metadata.author.clone(),
+        title,
+        file_title,
+        // The archive's identity is kept; the local ncode is new.
+        toc_url: novel.toc_url.clone(),
+        sitename,
+        novel_type: metadata.novel_type,
+        end: true,
+        last_update: Utc::now(),
+        new_arrivals_date: None,
+        use_subdirectory,
+        general_firstup: None,
+        novelupdated_at: None,
+        general_lastup: None,
+        last_mail_date: None,
+        tags: metadata
+            .tags
+            .iter()
+            .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
+            .cloned()
+            .collect(),
+        ncode: Some(ncode),
+        domain: metadata.domain.clone(),
+        general_all_no: None,
+        length: None,
+        suspend: false,
+        is_narou: false,
+        last_check_date: None,
+        convert_failure: false,
+        requires_login: false,
+        login_session: None,
+        extra_fields: Default::default(),
+    };
+    // The classification travels as metadata; a mixed group keeps the value
+    // the archive carries.
+    if let Some(attribute) = metadata.attribute_tag.as_deref() {
+        record.set_attribute_tag(attribute);
+    }
+
+    let novel_dir = db::novel_dir_for_record(archive_root, &record);
+    if novel_dir.exists() {
+        let _ = db::with_database_mut(|database| {
+            database.release_id(reservation);
+            Ok::<(), NarouError>(())
+        });
+        return Err(NarouError::Platform(format!(
+            "保存先 {} が既に存在します。管理外のフォルダは上書きしません",
+            novel_dir.display()
+        )));
+    }
+
+    // The inputs become durable before the group is published.
+    if let Err(error) = write_novel_files(archive_root, &novel_dir, &novel.files, false) {
+        remove_written_files(archive_root, &novel_dir, &novel.files);
+        let _ = db::with_database_mut(|database| {
+            database.release_id(reservation);
+            Ok::<(), NarouError>(())
+        });
+        return Err(error);
+    }
+    // The record and the membership are one update: the group becomes visible
+    // only together with its members.
+    if let Err(error) = crate::native::virtual_novel::publish_imported_parent(
+        record,
+        member_ids.to_vec(),
+        parse_rfc3339(metadata.general_lastup.as_deref()),
+    ) {
+        remove_written_files(archive_root, &novel_dir, &novel.files);
+        let _ = db::with_database_mut(|database| {
+            database.release_id(reservation);
+            Ok::<(), NarouError>(())
+        });
+        return Err(error);
+    }
+    Ok(id)
+}
+
+/// Replaces an existing virtual parent with the archive's structure.
+///
+/// The record ID and the folder stay; the membership order, the supplied
+/// per-novel inputs and the derived metadata are replaced. Files that the
+/// archive does not carry are left alone.
+fn overwrite_virtual_parent(
+    archive_root: &Path,
+    record: &NovelRecord,
+    metadata: &ArchiveNovel,
+    novel: &StagedNovel,
+    member_ids: &[i64],
+) -> Result<()> {
+    if !crate::virtual_novel::is_virtual_record(record) {
+        return Err(NarouError::Platform(
+            "ライブラリにある作品はバーチャル小説ではなくなっています".into(),
+        ));
+    }
+    let novel_dir = db::existing_novel_dir_for_record(archive_root, record);
+    // Only the archived inputs are replaced; other files stay untouched.
+    write_novel_files(archive_root, &novel_dir, &novel.files, true)?;
+
+    // The live row is read again inside the write boundary, so a field that
+    // changed meanwhile is kept and only the archived metadata is applied.
+    crate::native::virtual_novel::replace_imported_parent(
+        record.id,
+        &crate::native::virtual_novel::ImportedParentMetadata {
+            author: metadata.author.clone(),
+            title: metadata.title.clone(),
+            domain: metadata.domain.clone(),
+            tags: metadata.tags.clone(),
+            attribute_tag: metadata.attribute_tag.clone(),
+            general_lastup: parse_rfc3339(metadata.general_lastup.as_deref()),
+        },
+        member_ids.to_vec(),
+    )
 }
 
 fn parse_archive_toc(assets: &dyn AssetStore, files: &[(String, StagedAsset)]) -> Result<Option<TocFile>> {

@@ -112,7 +112,7 @@ pub async fn api_virtual_classify(
         Ok(members) => members,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
-    // 登録と同じ条件で検証する (空 / 非正 / 重複 を弾く)。
+    // 登録と同じ条件で検証する (空 / 負数 / 重複 を弾く)。
     if let Err(message) = core::validate_members(&members) {
         return error_response(StatusCode::BAD_REQUEST, message);
     }
