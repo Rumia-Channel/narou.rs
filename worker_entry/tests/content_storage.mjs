@@ -690,6 +690,22 @@ export default class extends Production.default {
       assert(!objects.has(upload.key), 'temporary uploaded objects must be removed after publication');
     }
 
+    const exportedAnimation = await api(`/api/transfer/export?ids=${animationId}`);
+    assert.equal(exportedAnimation.status, 200);
+    const animationHash = createHash('sha256').update(animationBytes).digest('hex');
+    const imagePath = `挿絵/${animationHash}.png`;
+    let archivedAnimation, animationManifest;
+    epubText(Buffer.from(await exportedAnimation.arrayBuffer()), (name, bytes) => {
+      if (name === `novels/0/${imagePath}`) archivedAnimation = bytes;
+      if (name === 'manifest.json') animationManifest = JSON.parse(bytes.toString());
+    });
+    assert(archivedAnimation, 'a pool-only illustration must be included even when the novel-prefix LIST is empty');
+    assert.deepEqual(archivedAnimation, animationBytes, 'the exported image must retain every original animation byte');
+    assert.deepEqual(animationManifest.novels[0].files.find(file => file.path === imagePath), {
+      path: imagePath, size: animationBytes.length, sha256: animationHash,
+    });
+    console.log('PASS S3 pool-only animation is exported with exact bytes, size and SHA-256');
+
     const response = await api(`/api/novels/${animationId}/download.epub`);
     assert.equal(response.status, 200, response.status === 200 ? undefined : await response.text());
     const busy = await api(`/api/novels/${animationId}/download.epub`);

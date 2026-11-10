@@ -35,6 +35,7 @@ use narou_rs::db::NovelRecord;
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::downloader::types::TocFile;
 use narou_rs::downloader::util::{load_length_limit, sanitize_filename_with_limit};
+use narou_rs::illustration_store::IllustrationIndex;
 use narou_rs::platform::{
     NovelId, NovelMutation, NovelObjectKeys, ObjectKey, ObjectListRequest, ObjectPrefix,
     ObjectStore, AssetStore, AssetStream, StagedAsset,
@@ -162,6 +163,7 @@ async fn collect_novel_files(
     let illustrations = ObjectPrefix::new(format!("{}/挿絵", prefix.as_ref()))
         .map_err(|error| format!("挿絵のプレフィックスを作れません: {error}"))?;
     list_prefix(store, illustrations.as_ref(), &mut listed).await?;
+    collect_indexed_illustrations(store, keys, &mut listed).await?;
 
     let root = format!("{}/", prefix.as_ref());
     let mut files = Vec::new();
@@ -184,6 +186,36 @@ async fn collect_novel_files(
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
+}
+
+/// Deduplicated S3 images live outside the novel prefix. Resolve the index's
+/// logical keys through the store, which also preserves legacy-file fallback.
+async fn collect_indexed_illustrations(
+    store: &dyn ObjectStore,
+    keys: &NovelObjectKeys,
+    listed: &mut BTreeMap<String, u64>,
+) -> Result<(), String> {
+    let filenames = match store.read_small(&keys.illustration_cache()).await
+        .map_err(|error| format!("挿絵の索引を取得できません: {error}"))?
+    {
+        Some(bytes) => {
+            let index: IllustrationIndex = serde_yaml::from_slice(&bytes)
+                .map_err(|error| format!("挿絵の索引を解析できません: {error}"))?;
+            index.filenames()
+        }
+        None => return Ok(()),
+    };
+    // Release the decoded index before awaiting storage; only unique filenames
+    // survive. Binary payloads remain on the existing streaming export path.
+    for filename in filenames {
+        let key = keys.illustration(&filename).map_err(|error| error.to_string())?;
+        if let Some(metadata) = store.stat(&key).await
+            .map_err(|error| format!("挿絵の保存状態を確認できません: {error}"))?
+        {
+            listed.insert(key.as_ref().to_string(), metadata.size);
+        }
+    }
+    Ok(())
 }
 
 /// Lists every key below `prefix` and records its size.
