@@ -477,46 +477,6 @@ def enable_read_replication(resources: dict[str, str]) -> None:
         )
 
 
-def enable_access_single_header(target: str) -> None:
-    """Access アプリケーションを「単一ヘッダー」方式にそろえる（冪等）。
-
-    AI 系のクライアントは `Authorization` ヘッダしか送れないことがあるため、
-    Access の `read_service_tokens_from_header` を `Authorization` にする。
-    Service Token を設定している環境 (CF_ACCESS_CLIENT_ID /
-    CF_ACCESS_CLIENT_SECRET) でだけ試す。
-
-    失敗してもデプロイは止めない: 権限不足で配信が止まるより、警告を残して
-    配信を続ける方が安全（冪等なので次回も試される）。
-    """
-    if not (os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
-            and os.environ.get("CF_ACCESS_CLIENT_SECRET", "").strip()):
-        return
-    domain = os.environ.get(
-        {"develop": "DEVELOP_DOMAIN", "production": "SERVICE_DOMAIN"}[target], ""
-    ).strip()
-    if not domain:
-        print(
-            "::notice::custom domain が未設定のため Access の単一ヘッダー設定を確認できません"
-        )
-        return
-    env = os.environ.copy()
-    env["NAROU_ACCESS_DOMAIN"] = domain
-    result = subprocess.run(
-        [sys.executable, "ci/enable_access_single_header.py"],
-        cwd=WORKER_DIR,
-        check=False,
-        text=True,
-        encoding="utf-8",
-        env=env,
-    )
-    if result.returncode != 0:
-        print(
-            "::warning::Access の単一ヘッダー設定を確認できませんでした "
-            "(CLOUDFLARE_API_TOKEN に Access: Apps and Policies (Write) が必要です)。"
-            "デプロイは続行します。"
-        )
-
-
 def render(target: str, resources: dict[str, str]) -> str:
     """`wrangler.ci.toml` を作り、D1 のデータベース名を返す。"""
     env = dict(os.environ)
@@ -801,10 +761,6 @@ def main() -> None:
     if target_url is None:
         fail("Mandatory S3 verification needs a deployment URL; configure NAROU_DEPLOY_URL or a deployment domain")
     s3_status = verify_s3(target_url)
-    # smoke の前に Access のポリシーをそろえる。単一ヘッダー方式
-    # (read_service_tokens_from_header) を有効にしておかないと、smoke が
-    # Authorization ヘッダの資格情報で通せない。
-    enable_access_single_header(target)
     smoke_result: bool | None = None
     if os.environ.get("NAROU_SMOKE", "1") == "0":
         pass

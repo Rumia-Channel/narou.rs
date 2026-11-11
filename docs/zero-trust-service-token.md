@@ -72,17 +72,15 @@ MCP クライアントや API 連携サービスなど、**`Authorization` ヘ�
 Authorization: {"cf-access-client-id": "<CLIENT ID>", "cf-access-client-secret": "<CLIENT SECRET>"}
 ```
 
-### 設定は CI が自動でそろえる
+### 設定は運用者が明示的に行う
 
-デプロイ (`worker_entry/ci/deploy_worker.py`) が、Service Token を設定して
-いる環境 (`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET`) だけ、対象ドメインの
-Access アプリケーションを確認して、無い或者是
-`read_service_tokens_from_header: "Authorization"` を設定する
-(`worker_entry/ci/enable_access_single_header.py`)。冪等なので、何度走っても
-同じ状態になる。権限が無い・対象が無い場合は警告だけを出して配信は続ける
-(トークンには `Access: Apps and Policies (Write)` が必要)。
+CI は Access アプリケーション・ポリシー・認証ヘッダー設定を変更しない。
+既存アプリの別クライアントを壊さないため、単一ヘッダー方式への変更も自動では行わない。
+必要な場合だけ、運用者が `worker_entry/ci/enable_access_single_header.py` を直接呼ぶ
+（`Access: Apps and Policies (Write)` が必要）。
 
-手動で設定したいときは同じスクリプトを直接呼べる。
+本番が既存 DNS と Worker Route を使う構成では、GitHub Actions のリポジトリ変数
+`NAROU_DOMAIN_MODE=route` を設定する。既存 Route のまま配備し、custom domain への切替を試さない。
 
 ```powershell
 $env:CLOUDFLARE_ACCOUNT_ID = "<account id>"
