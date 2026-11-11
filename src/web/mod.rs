@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod authors;
 pub mod external;
+pub mod read_api;
 pub mod sites;
 pub mod feature_tour;
 pub mod favorite_tags;
@@ -598,6 +599,7 @@ pub fn create_router(state: AppState) -> Router {
     let auth_state = state.clone();
     let local_auth_state = state.clone();
     let guard_state = state.clone();
+    let cors_state = state.clone();
     Router::new()
         .route("/", get(frontend::index))
         .route("/ws", get(push::ws_handler_with_app_state))
@@ -619,6 +621,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/novels/{id}/epub", get(external::api_novel_epub))
         .route("/api/v1/tags", get(external::api_tags))
         .route("/api/v1/mcp", post(external::api_mcp))
+        // 既存 UI セッションで読むブラウザ連携。管理・更新 API は公開しない。
+        .route("/api/read/v1/novels", get(read_api::novels))
+        .route("/api/read/v1/novels/{id}", get(read_api::novel))
+        .route("/api/read/v1/novels/{id}/epub", get(read_api::epub))
+        .route("/api/read/v1/favorite-tags", get(favorite_tags::api_favorite_tags_get))
         // 外部 API の設定 (トークン管理)。ブラウザの UI トークンで保護する。
         .route("/api/external_api", get(external::api_external_api_info))
         .route(
@@ -842,6 +849,7 @@ pub fn create_router(state: AppState) -> Router {
             local_auth_state,
             local_auth_middleware,
         ))
+        .layer(middleware::from_fn_with_state(cors_state, read_api::cors))
         .layer(middleware::from_fn_with_state(
             guard_state,
             request_guard_middleware,

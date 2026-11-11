@@ -107,6 +107,9 @@ async fn route(req: Request, env: Env) -> Result<Response> {
     if path == "/api/v1" || path.starts_with("/api/v1/") {
         return webui::external::handle(req, env).await;
     }
+    if narou_rs::application::read_api::is_read_path(&path) {
+        return webui::read_api::handle(req, env).await;
+    }
     // 外部 API の設定 (トークン管理)。管理トークンで保護する。
     if path == "/api/external_api" || path.starts_with("/api/external_api/") {
         return webui::external::handle_settings(req, env).await;
@@ -1418,9 +1421,13 @@ async fn auth_state(req: &Request, env: &Env) -> AuthState {
         return AuthState::Allowed;
     }
     // ブラウザは HttpOnly Cookie でトークンを運ぶ (migration plan §3.2)。
-    // Cookie は自動で付く資格情報なので、同一オリジン検査を併せて要求する
-    // (SameSite=Lax と二重の CSRF 対策)。
-    if cookie_matches(req, &secret) && same_origin(req) {
+    // 通常 UI は同一オリジンのまま。読み取り API だけは、そのハンドラが
+    // 許可元 Origin を検証した後に既存 Cookie 認証へ進む。
+    if cookie_matches(req, &secret)
+        && (same_origin(req)
+            || (matches!(req.method(), Method::Get | Method::Head)
+                && narou_rs::application::read_api::is_read_path(&req.path())))
+    {
         return AuthState::Allowed;
     }
     AuthState::Required
