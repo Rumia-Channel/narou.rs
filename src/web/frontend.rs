@@ -331,6 +331,10 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                     .into_bytes(),
             ),
         ),
+        "js/ui/transfer-download-sw.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Borrowed(include_bytes!("assets/js/ui/transfer-download-sw.js")),
+        ),
         "js/ui/dialog.js" => (
             "application/javascript; charset=utf-8",
             Cow::Owned(

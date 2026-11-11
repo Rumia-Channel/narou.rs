@@ -65,8 +65,31 @@ impl Stream {
 /// `emit_fragment` は `print!` 相当の改行なし断片 (対話プロンプト等)。
 /// 部分行を扱えない環境向けに既定では行として送る。
 pub trait MessageSink: Send + Sync {
-    fn emit(&self, stream: Stream, text: &str);
+    #[cfg(feature = "native-runtime")]
+    fn emit(&self, stream: Stream, text: &str) {
+        match stream {
+            Stream::Stdout => println!("{text}"),
+            Stream::Stderr => eprintln!("{text}"),
+        }
+    }
 
+    /// Async producers must await capacity before emitting another output unit.
+    fn poll_ready(&self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        std::task::Poll::Ready(())
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn emit_async<'a>(&'a self, stream: Stream, text: &'a str) -> crate::platform::PlatformFuture<'a, ()> {
+        Box::pin(async move {
+            std::future::poll_fn(|cx| self.poll_ready(cx)).await;
+            self.emit(stream, text);
+        })
+    }
+
+    #[cfg(not(feature = "native-runtime"))]
+    fn emit_async<'a>(&'a self, stream: Stream, text: &'a str) -> crate::platform::PlatformFuture<'a, ()>;
+
+    #[cfg(feature = "native-runtime")]
     fn emit_fragment(&self, stream: Stream, text: &str) {
         self.emit(stream, text);
     }
@@ -136,6 +159,7 @@ pub(super) fn scoped_debug_enabled() -> Option<bool> {
 
 /// Deep warnings use the current invocation's sink. Native CLI output and
 /// out-of-invocation Worker diagnostics retain their console fallback.
+#[cfg(feature = "native-runtime")]
 pub fn emit_default(stream: Stream, text: &str) {
     let sink = ACTIVE_CONTEXT.with(|slot| {
         slot.borrow().as_ref().map(|context| context.sink.clone())
@@ -146,6 +170,27 @@ pub fn emit_default(stream: Stream, text: &str) {
             Stream::Stdout => println!("{text}"),
             Stream::Stderr => eprintln!("{text}"),
         },
+    }
+}
+
+/// Cooperative output boundary for section/image producers and synchronous
+/// progress callbacks. The sink is captured from this invocation, never global.
+pub async fn ready() {
+    let sink = ACTIVE_CONTEXT.with(|slot| slot.borrow().as_ref().map(|context| context.sink.clone()));
+    if let Some(sink) = sink {
+        std::future::poll_fn(|cx| sink.poll_ready(cx)).await;
+    }
+}
+
+pub async fn emit_default_async(stream: Stream, text: &str) {
+    let sink = ACTIVE_CONTEXT.with(|slot| slot.borrow().as_ref().map(|context| context.sink.clone()));
+    if let Some(sink) = sink {
+        sink.emit_async(stream, text).await;
+    } else {
+        match stream {
+            Stream::Stdout => println!("{text}"),
+            Stream::Stderr => eprintln!("{text}"),
+        }
     }
 }
 
@@ -220,7 +265,7 @@ pub fn copy_device_missing(device: impl Display) -> String {
     format!("{device}が見つからなかったためコピー出来ませんでした")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-runtime"))]
 mod tests {
     use super::{MessageContext, MessageSink, Stream};
 

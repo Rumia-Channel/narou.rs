@@ -1,5 +1,6 @@
 mod setting_override;
 
+#[cfg(feature = "native-runtime")]
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -59,6 +60,7 @@ struct CompiledReplaceRule {
 }
 
 impl UserConverter {
+    #[cfg(feature = "native-runtime")]
     pub fn load(archive_path: &Path) -> Option<Self> {
         let yaml_path = archive_path.join("converter.yaml");
         if !yaml_path.exists() {

@@ -1,13 +1,13 @@
-# 小説 ZIP 転送形式 (`format_version: 1`)
+# 小説 ZIP 転送形式 (`format_version: 2`、通常作品の旧形式 `1` も読み取り可)
 
 > `narou export` / `narou import` が使う **小説データ転送アーカイブ** の書式です。
 > 形式そのものは `src/transfer` (プラットフォーム非依存) に実装があり、CLI・Native Web
 > API・Worker・ブラウザ WASM が生成・検証・取り込み計画を共有します。
 
-- 生成: `build_archive(&ArchiveManifest) -> Vec<u8>`
-- 逐次生成: `ArchiveStream<W>` (進捗付き Web 書き出し。1 ファイルずつ ZIP へ書き込む)
-- 検証・展開: `parse_archive(&[u8]) -> ParsedArchive`
-- 取り込み計画: `plan_import(&ParsedArchive, &[ExistingNovel], ConflictPolicy) -> ImportPlan`
+- 本番の逐次生成: `ArchiveStream<W>` / `AsyncArchiveStream<W>` (1 ファイルを有界チャンクで圧縮)
+- 本番の検証・一時保存: `StagedArchive` / `validate_archive` (全検証が済むまで既存データを変更しない)
+- 取り込み計画: `plan_manifest` (検証済み manifest と既存作品から決定)
+- 明示的な全量 utility: `build_archive` / `parse_archive` / `plan_import` (fixture 等向け。本番の転送経路では使わない)
 
 ## 1. 全体構造
 
@@ -32,7 +32,7 @@ novels/1/...
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "app_version": "0.5.4",
   "exported_at": "2026-10-27T12:34:56Z",
   "novels": [
@@ -62,7 +62,7 @@ novels/1/...
 
 | フィールド | 必須 | 意味 |
 |---|---|---|
-| `format_version` | 必須 | 現在は `1`。別の値は取り込み側で拒否する (`UnsupportedVersion`) |
+| `format_version` | 必須 | 現在は `2`。通常作品の旧形式 `1` も受け付ける。それ以外は `UnsupportedVersion` |
 | `app_version` | 任意 | 生成したアプリケーションのバージョン |
 | `exported_at` | 任意 | 生成日時 (RFC 3339) |
 | `novels` | 任意 | 作品の配列 (省略時は空配列。位置は ZIP 内の `novels/<i>` と対応する) |
@@ -71,7 +71,7 @@ novels/1/...
 
 | フィールド | 必須 | 意味 |
 |---|---|---|
-| `toc_url` | 必須 | **衝突キー**。完全一致で同一作品とみなす (§5) |
+| `toc_url` | 必須 | **衝突キー**。完全一致で同一作品とみなす (§5)。バーチャル小説はライブラリ ID を含まない永続的な識別 URL (§2.5) |
 | `title` | 必須 | 作品名 |
 | `author` | 必須 | 作者名 |
 | `sitename` | 必須 | サイト名 (一覧の「サイト名」列) |
@@ -83,19 +83,20 @@ novels/1/...
 | `subtitle` | 任意 | あらすじ (`toc.yaml` の `story`) |
 | `general_lastup` | 任意 | 最新話掲載日 |
 | `last_update` | 任意 | 最終更新日時 |
-| `files` | 任意 | 作品に属するファイル (§2.3)。省略時は空配列 (取り込みは `toc.yaml` を要求するため実質必須) |
+| `files` | 任意 | 作品に属するファイル (§2.3)。通常作品は `toc.yaml` が必要。バーチャル小説は自身の変換設定・明示的な表紙だけ (§2.5) |
+| `virtual_members` | 任意 | バーチャル小説のメンバーの `toc_url` を結合順に並べた配列。通常作品では省略 (§2.5) |
 
 ### 2.3 ファイル (`files[]`) のフィールド
 
 | フィールド | 必須 | 意味 |
 |---|---|---|
 | `path` | 必須 | 小説ディレクトリ基準の相対パス (`/` 区切り) |
-| `size` | 任意 | 非圧縮サイズ。**生成時に `build_archive` が埋める** |
-| `sha256` | 任意 | 内容ハッシュ (64 桁 hex)。**生成時に `build_archive` が埋める** |
+| `size` | 任意 | 非圧縮サイズ。生成側が読みながら計算する |
+| `sha256` | 任意 | 内容ハッシュ (64 桁 hex)。生成側が読みながら計算する |
 
-生成側は `size` / `sha256` を空のまま渡してよく、組み込みの `build_archive` が計算して
-manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を正しく入れないと
-`parse_archive` の検証で弾かれる (未指定なら検証は省略される)。
+逐次生成側は各ファイルを読みながら `size` / `sha256` を計算し、最後に manifest を書き込む。
+手書きの ZIP に値がある場合は、全検証経路で実データと突き合わせる
+(未指定ならその照合は省略される)。サイズ上限・CRC・パス等の検査は省略しない。
 
 ### 2.4 属性タグ (作品種別の分類)
 
@@ -113,26 +114,38 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 - 書き出し (`build_archive`) も同じ正規化を行うので、`tags` に属性名が残る
   アーカイブは生成されない。
 
+### 2.5 バーチャル小説
+
+- バーチャル小説だけを選択しても、メンバーの実データを自動的に同梱する。個別選択と親経由で重複選択したメンバーは 1 回だけ格納する。既存の所属規則と同じく、1 メンバーを複数の親へ所属させる構成は拒否する。
+- 通常作品の本文・挿絵を先に書き、最後に親のメタデータと `virtual_members` を書く。メンバーの本文を親へ複製・連結した ZIP は作らない。
+- `virtual_members` は空でない配列で、順序が結合順。同じアーカイブ内の通常作品の `toc_url` だけを参照する。参照先の欠落・重複・曖昧な URL・自己参照・バーチャル小説の入れ子は、既存データを変更する前に拒否する。
+- 親自身のファイルは `setting.ini` / `replace.txt` / `converter.yaml` / `cover.jpg` / `cover.png` / `cover.jpeg` だけ。親の `toc.yaml` は不要で、本文・挿絵は各メンバーが保持する。
+- 親の `toc_url` は `https://narou.rs/virtual/<32桁の小文字hex乱数>`。新規作成時に発行し、転送後も保持する。旧親のローカル ID 付き URL は、最初の書き出し時に一度だけこの形式へ保存し直す。同じ番号の別ライブラリの親と衝突させない。
+- 親の元の `ncode` と内部タグ `vs_<ID>` は移さない。取り込み先で新しい ID を採番し、その ID から再生成する。タイトル・作者・通常タグ・属性・親の変換設定・明示的な表紙を保持する。
+- 取り込みは通常作品を先に復元し、Create / Overwrite / Skip で得た取り込み先 ID に参照を置き換えてから親を登録する。失敗したメンバーに依存する親は公開しない。既に復元できた通常作品は保持する。
+- 親のレコードとメンバー構成は、Native の同じ在庫更新境界、Worker の同じ D1 CAS トランザクションで公開する。Overwrite は親の ID・保存先を維持し、構成順と同梱された設定を復元する。Skip は既存の親を変更しない。
+- 親の話数・最新掲載日・単一種別の属性は復元したメンバーから集計する。混在時はアーカイブの属性選択を保持する。親の通常タグは既存・アーカイブ・メンバーの和集合とし、同時に追加されたタグを消さない。
+- この構造は形式 `2` のみ。構成を持たず `vs_<ID>` だけを持つ旧アーカイブは、壊れた親として登録せず拒否する。形式 `1` の通常作品は従来どおり読み取れる。
+
 ## 3. 決定性
 
 バッファ生成 API `build_archive` は、同じ入力から **同じバイト列** を生成する。
 
-- 作品は `(toc_url, title)` で安定ソート (`sort_by` は安定なので完全に等しい作品の
-  順序は保つ)。ファイルは `path` でソート。
+- 作品は通常作品 → バーチャル親の順に分け、それぞれ `(toc_url, title)` で安定ソートする。ファイルは `path` でソートし、`virtual_members` の結合順は変えない。
 - ZIP のタイムスタンプは固定 (`zip::DateTime::default()` = ZIP epoch)。
 - 圧縮は Deflate、バックエンドは pure Rust の `zlib-rs` (wasm32 でも動く)。
 
 → ハッシュを取り直したいとき、タイムスタンプを固定したいときは、
 **再生成すれば同じ ZIP になる**。
 
-逐次生成 API `ArchiveStream` は作品・ファイルを書き込んだ順に記録し、全作品の本文や
-完成 ZIP をサーバーのメモリに保持しない。`build_archive` と同じ ZIP 形式を使うが、
-エントリ順と data descriptor の有無が異なるため、両 API 間のバイト一致は保証しない。
-どちらも既存の `parse_archive` で読み取れる。
+逐次生成 API `ArchiveStream` / `AsyncArchiveStream` は作品・ファイルを書き込んだ順に記録し、
+1 ファイルの全内容も完成 ZIP もサーバーのメモリに保持しない。ZIP 索引と manifest の
+メタデータは保持する。エントリ順・圧縮器・data descriptor の有無が異なるため、
+whole-value utility とのバイト一致は保証しない。同じ形式・検証規則で読み取れる。
 
 ## 4. 検証 (取り込み時)
 
-`parse_archive` は次のすべてを検査する。1 つでも欠ければ取り込みは **何も書かず** 中止する。
+取り込み時は次のすべてを検査する。1 つでも欠ければ既存データを変更せず中止し、非公開の一時データを回収する。
 
 ### 4.1 サイズ・個数の上限
 
@@ -147,6 +160,12 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 
 展開は `take` で上限付き読み出しなので、zip bomb (展開サイズが ZIP の何倍もあるもの) は
 上限で止まる。
+
+Worker / ブラウザ WASM には、形式上限とは別に **24 MiB の転送メタデータ割当予算**がある。
+manifest の保持値・ZIP 索引・重複パス判定の領域について、要素数ではなく capacity、
+割当の管理領域、再確保中の旧新領域を含めて確保前に判定する。
+未知の JSON 項目は構文検証しながら読み飛ばし、`serde_json::Value` に全量展開しない。
+Native の形式上限は従来どおりで、この Wasm 用の割当予算は適用しない。
 
 ### 4.2 パスの安全性
 
@@ -188,9 +207,11 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 | ある | `Skip` (既定) | スキップ (既存は触らない) |
 | ある | `Overwrite` | **Overwrite**: 既存の ID とフォルダを保持し、**アーカイブに含まれるファイルだけ**置換する |
 
+- Worker の Create が失敗・中断したときは、レコードが未公開であることを確認してから作成途中のファイルを削除する。公開状況の照会や削除自体に失敗した場合はエラーを記録し、後始末タスクを無限に再起動しない。公開済みか判断できない状態ではファイルを保全するため、作成途中のデータが残る場合がある。
+
 - Overwrite では、**アーカイブに無いファイルは残る** (変換履歴・新しい話・利用者の
   編集を消さない)。メタデータは、既存レコードが空の項目だけ埋める。
-- 例外は **属性タグ** (`attribute_tag`) だけ: アーカイブが分類を持っていれば
+- 通常作品の例外は **属性タグ** (`attribute_tag`): アーカイブが分類を持っていれば
   取り込み先の分類をそれで置き換える (アーカイブ側が正)。アーカイブに分類が
   無い場合、既存レコードの分類はそのままにする。
 - 新規作成時、アーカイブに `attribute_tag` が無ければ分類は付けない。
@@ -208,7 +229,7 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 
 | 対象 | 同梱 | 備考 |
 |---|---|---|
-| `toc.yaml` | ✅ | **必須**。無い作品はその場でエラー (取り込みにも必要) |
+| `toc.yaml` | ✅ | **通常作品は必須**。バーチャル小説は構成情報を持ち、親自身の目次は不要 (§2.5) |
 | `本文/*.yaml` | ✅ | |
 | `setting.ini` / `replace.txt` / `converter.yaml` | ✅ | |
 | `挿絵/*` | ✅ | S3 バックエンドのときは一時実体化して収集する |
@@ -232,6 +253,9 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
   **S3 バックエンドなら S3 プールへルーティング**される (ローカルなら `挿絵/` へ)。
 - `.illustration_cache.yaml` は「取得済み挿絵の索引」(source URL / mitemin ID / hash →
   ローカルファイル名)。ZIP に同梱されるので、取り込み先でも索引が復元される。
+- Worker の書き出しは作品フォルダの一覧に加え、索引内のファイル名を共通の
+  挿絵論理キーへ解決して実体を確認する。S3 の共有プールにだけある画像も
+  `挿絵/<ファイル名>` として同梱し、旧作品別配置への読み取り互換を維持する。
 - 外部ツールで作られた挿絵には索引の行が無い。`narou illust orphan` の到達可能判定は
   索引と `raw/*.html` から辿れるものだけを「到達可能」とし、それ以外は孤立扱いにする。
   索引に載せるには、ファイル名を `i<数字>.<ext>` (mitemin 形式) か `<sha256>.<ext>`
@@ -248,14 +272,47 @@ manifest に書き込む。手書きで ZIP を作る場合は、この 2 個を
 | `GET /api/transfer/export?ids=1,2` | Native Web API の書き出し (`application/zip`) |
 | `POST /api/transfer/import[?overwrite=true]` | Native Web API の取り込み (本文の body limit 512 MiB) |
 | Worker の `/api/transfer/*` | 同じ形式 (D1 + S3 バックエンド) |
-| `transfer_wasm` | ブラウザ側の `buildZip` / `parseZip` (同じコア) |
+| `transfer_wasm` | 下記の `build_zip` / `parse_zip` / `plan_zip`。ZIP / manifest / 既存ライブラリ全体の JS 配列・文字列を要求しない |
+
+### 8.1 独立 WASM API
+
+すべて `Promise<void>` を返す。読み書きの各コールバックを `await` し、
+出力先が待っている間は入力を先読みしない。チャンク上限は 64 KiB。
+入力は処理中に変化しないファイル・オブジェクトを使う。
+
+- `build_zip(read_manifest, manifest_size, read_chunk, write_chunk)`:
+  `read_manifest(offset, length)` は manifest JSON の指定範囲を、
+  `read_chunk(novel_index, path, offset, length)` は各ファイルの指定範囲を
+  `Uint8Array` で返す。`write_chunk(bytes)` に ZIP を順次渡す。
+- `parse_zip(read_range, size, write_chunk)`:
+  `read_range(offset, length)` から ZIP を検証し、**全エントリの検証成功後だけ**
+  `write_chunk(bytes)` へ UTF-8 の manifest JSON を順次渡す。
+  作品一覧を二重に含むラッパー JSON や、完成済み JSON 文字列は返さない。
+- `plan_zip(read_range, size, has_novel, overwrite, write_chunk)`:
+  同じ完全検証後、`has_novel(index, toc_url)` に URL の存在を問い合わせる
+  (`Promise<boolean>`)。通常作品 → バーチャル親の順に、元の manifest の `index` を保った
+  UTF-8 JSONL を順次渡す。形式は `{"index":0,"action":"Skip"}`、`action` は `Create` / `Skip` / `Overwrite`。
+  既存作品全件の JSON は受け取らない。
+
+チャンク境界は JSON の文字・行境界とは限らない。呼び出し側も `Blob` や文字列へ
+全量連結せず、ファイルや増分パーサーへ流す。取り込みのメタデータには前述の
+24 MiB の割り当て予算を適用し、文字列の JSON エスケープ展開も逐次出力する。
+
+実 WASM の回帰テスト（対応する `wasm-bindgen` CLI が必要）:
+
+```sh
+cargo build --manifest-path transfer_wasm/Cargo.toml --target wasm32-unknown-unknown --release
+wasm-bindgen target/wasm32-unknown-unknown/release/narou_transfer_wasm.wasm --target nodejs --out-dir target/transfer-wasm-smoke
+node transfer_wasm/tests/streaming.mjs target/transfer-wasm-smoke/narou_transfer_wasm.js
+```
+
+入力の停止、SHA/サイズ、競合方針、後半の破損時に出力しないこと、および
+6 MiB の文字列が約 36 MiB の JSON へ展開されても全量コピーしないことを検証する。
 
 ## 9. バージョン
 
-- `format_version` は **1**。別の値のアーカイブは取り込み側で拒否する
-  (`UnsupportedVersion`)。将来フィールドを追加するときは、**後方互換な追加**に留める
-  (manifest の任意フィールドはそのまま無視される)。
-- `attribute_tag` (§2.4) は後方互換な追加として `format_version: 1` のまま
-  導入した。旧形式のアーカイブは `tags` からの移行で読み取れる (§2.4)。
+- 書き出しは `format_version: 2`。構成情報を理解しない旧リーダーが親を通常作品として誤登録しないよう、バーチャル小説の導入時に形式を更新した。
+- 形式 `1` の通常作品は引き続き読み取れる。`attribute_tag` (§2.4) のない旧アーカイブは `tags` からの移行で読み取れる。
+- `1` / `2` 以外は `UnsupportedVersion` として拒否する。
 - 取り込み側は「manifest に無いものは壊さない」を原則にしている (古いアーカイブで
   新しいネタが失われない)。

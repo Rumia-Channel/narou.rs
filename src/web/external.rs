@@ -282,7 +282,7 @@ pub async fn api_mcp(
         }
     };
     let hidden = crate::native::hidden::load().unwrap_or_default();
-    let server = McpServer::new(state.services.external_api.clone());
+    let server = McpServer::new(&state.services.external_api);
     match server.handle(&request, Some(hidden)).await {
         Some(response) => Json(response).into_response(),
         None => StatusCode::ACCEPTED.into_response(),

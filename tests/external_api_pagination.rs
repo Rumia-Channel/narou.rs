@@ -103,7 +103,7 @@ fn an_unbounded_external_list_starts_at_the_requested_offset() {
 
     let inventory = Arc::new(Inventory::new(root.clone()));
     let services = NativeAppServices::new(inventory).unwrap();
-    let api = services.services.external_api.clone();
+    let api = &services.services.external_api;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

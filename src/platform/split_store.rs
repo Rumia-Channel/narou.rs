@@ -43,6 +43,13 @@ pub fn is_illustration_key(key: &ObjectKey) -> bool {
     extension.is_some_and(|extension| ILLUSTRATION_EXTENSIONS.contains(&extension.as_str()))
 }
 
+/// Reserved staging and generated outputs always belong to the large tier.
+pub fn is_large_asset_key(key: &ObjectKey) -> bool {
+    is_illustration_key(key)
+        || super::staging::is_staging_key(key)
+        || key.as_ref().starts_with("generated/")
+}
+
 /// 挿絵ディレクトリを指す一覧プレフィックスか。
 ///
 /// 一覧は `<小説プレフィックス>/挿絵` の形だけを挿絵側へ回す。小説ディレクトリ
@@ -51,7 +58,8 @@ pub fn is_illustration_key(key: &ObjectKey) -> bool {
 fn is_illustration_prefix(prefix: &ObjectPrefix) -> bool {
     let trimmed = prefix.as_ref().trim_end_matches('/');
     // dedup プール (`illustrations/` 以下) も挿絵側へ回す。
-    if trimmed.starts_with("illustrations/") {
+    if trimmed.starts_with("illustrations/") || trimmed.starts_with(super::staging::STAGING_PREFIX.trim_end_matches('/'))
+        || trimmed.starts_with("generated/") {
         return true;
     }
     let segments: Vec<&str> = trimmed.split('/').collect();
@@ -72,6 +80,7 @@ struct StorePair {
 pub struct SplitStore {
     primary: StorePair,
     illustrations: StorePair,
+    staging: StorePair,
 }
 
 impl SplitStore {
@@ -80,6 +89,7 @@ impl SplitStore {
         illustrations: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>),
     ) -> Self {
         Self {
+            staging: StorePair { objects: illustrations.0.clone(), assets: illustrations.1.clone() },
             primary: StorePair {
                 objects: primary.0,
                 assets: primary.1,
@@ -91,6 +101,12 @@ impl SplitStore {
         }
     }
 
+    /// Staging can use S3 even when illustrations intentionally remain in D1.
+    pub fn with_staging(mut self, stores: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>)) -> Self {
+        self.staging = StorePair { objects: stores.0, assets: stores.1 };
+        self
+    }
+
     /// 振り分け無し（両方を同じ実装にする）。
     pub fn single(objects: Arc<dyn ObjectStore>, assets: Arc<dyn AssetStore>) -> Self {
         let pair = (objects, assets);
@@ -98,7 +114,9 @@ impl SplitStore {
     }
 
     fn pair_for(&self, key: &ObjectKey) -> &StorePair {
-        if is_illustration_key(key) {
+        if super::staging::is_staging_key(key) {
+            &self.staging
+        } else if is_large_asset_key(key) {
             &self.illustrations
         } else {
             &self.primary
@@ -106,7 +124,9 @@ impl SplitStore {
     }
 
     fn pair_for_prefix(&self, prefix: &ObjectPrefix) -> &StorePair {
-        if is_illustration_prefix(prefix) {
+        if prefix.as_ref().starts_with(super::staging::STAGING_PREFIX.trim_end_matches('/')) {
+            &self.staging
+        } else if is_illustration_prefix(prefix) {
             &self.illustrations
         } else {
             &self.primary
@@ -178,6 +198,16 @@ impl AssetStore for SplitStore {
         self.pair_for(key).assets.read_stream(key)
     }
 
+    fn read_range<'a>(
+        &'a self, key: &'a ObjectKey, range: std::ops::Range<u64>,
+    ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        self.pair_for(key).assets.read_range(key, range)
+    }
+
+    fn stage_stream<'a>(&'a self, stream: AssetStream) -> PlatformFuture<'a, Result<super::staging::StagedAsset>> {
+        self.staging.assets.stage_stream(stream)
+    }
+
     fn write_stream<'a>(
         &'a self,
         key: &'a ObjectKey,
@@ -195,17 +225,16 @@ impl AssetStore for SplitStore {
         source: &'a ObjectKey,
         destination: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<()>> {
-        // 片方だけ挿絵という交差コピーは経路が決まらないので拒否する。
-        if is_illustration_key(source) != is_illustration_key(destination) {
-            return Box::pin(async move {
-                Err(NarouError::Platform(format!(
-                    "cross-store copy is not supported: {} -> {}",
-                    source.as_ref(),
-                    destination.as_ref()
-                )))
-            });
+        let source_store = &self.pair_for(source).assets;
+        let destination_store = &self.pair_for(destination).assets;
+        if Arc::ptr_eq(source_store, destination_store) {
+            return source_store.copy(source, destination);
         }
-        self.pair_for(source).assets.copy(source, destination)
+        Box::pin(async move {
+            let stream = source_store.read_stream(source).await?
+                .ok_or_else(|| NarouError::NotFound(source.to_string()))?;
+            destination_store.write_stream(destination, stream).await
+        })
     }
 
     fn move_or_copy<'a>(
@@ -213,18 +242,10 @@ impl AssetStore for SplitStore {
         source: &'a ObjectKey,
         destination: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<()>> {
-        if is_illustration_key(source) != is_illustration_key(destination) {
-            return Box::pin(async move {
-                Err(NarouError::Platform(format!(
-                    "cross-store move is not supported: {} -> {}",
-                    source.as_ref(),
-                    destination.as_ref()
-                )))
-            });
-        }
-        self.pair_for(source)
-            .assets
-            .move_or_copy(source, destination)
+        Box::pin(async move {
+            AssetStore::copy(self, source, destination).await?;
+            AssetStore::delete(self, source).await
+        })
     }
 }
 
@@ -331,8 +352,34 @@ mod tests {
             assert_eq!(page.objects.len(), 1);
             assert_eq!(page.objects[0].key, section);
 
-            // ストアをまたぐコピーは経路が決まらないので明示的に失敗させる。
-            assert!(store.copy(&section, &picture).await.is_err());
+            // Cross-tier publication streams to the destination adapter.
+            store.copy(&section, &picture).await.unwrap();
+            assert_eq!(illustrations.read_small(&picture).await.unwrap().unwrap(), b"section");
+        });
+    }
+
+    #[test]
+    fn reserved_stages_use_the_explicit_large_tier_and_publish_cross_store() {
+        futures::executor::block_on(async {
+            let primary = Arc::new(MemoryObjectStore::new());
+            let illustrations = Arc::new(MemoryObjectStore::new());
+            let stages = Arc::new(MemoryObjectStore::new());
+            let store = SplitStore::new((primary.clone(), primary.clone()),
+                (illustrations.clone(), illustrations.clone()))
+                .with_staging((stages.clone(), stages.clone()));
+            let stage = store.stage_stream(Box::pin(futures::stream::iter([
+                Ok(b"abc".to_vec()), Ok(b"def".to_vec()),
+            ]))).await.unwrap();
+            assert_eq!(stage.size, 6);
+            assert_eq!(stage.sha256, "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721");
+            assert!(primary.is_empty());
+            assert!(illustrations.is_empty());
+            assert_eq!(store.read_range(&stage.key, 2..5).await.unwrap().unwrap(), b"cde");
+            let destination = key("novels/site/title/novel.txt");
+            store.copy(&stage.key, &destination).await.unwrap();
+            assert_eq!(primary.read_small(&destination).await.unwrap().unwrap(), b"abcdef");
+            AssetStore::delete(&store, &stage.key).await.unwrap();
+            assert!(stages.is_empty());
         });
     }
 }

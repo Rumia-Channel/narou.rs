@@ -218,6 +218,10 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - `narou init -l/--line-height` は AozoraEpub3 設定が保存される場合だけ `line-height` として保存し、未指定時は Ruby 版の非対話デフォルトに合わせて `1.8` を使う。
 - 有効な AozoraEpub3 パスを設定した場合は、Ruby 版と同じく `chuki_tag.txt` のカスタム注記追記/置換、`AozoraEpub3.ini` のコピー、行高反映済みカスタム CSS のコピーを行う。カスタム CSS の置き場所は AozoraEpub3 のテンプレート構成で変わる: 元祖レイアウト (`template/OPS/css/` がある) は `template/OPS/css_custom/vertical_font.css`、1.1.1 以降の改造版 / 電書協レイアウト (`template/item/style/` がある) は `template/item/style_custom/font.css`（中身は `preset/denshokyo_font.css`）。判定は `converter::dakuten_font::AozoraTemplateKind` が唯一の定義で、`init`・濁点フォント切替・変換時の不足補完・`lite` エンジンへの同梱 CSS がこれに従う。OPS パス固定に戻すと二分アキ (`［＃二分アキ］`)・行高・前書き/後書きの装飾が EPUB に反映されない (issue #42)。
 
+## ドキュメントのパス表記
+- 文書にはユーザーの PC 固有の絶対パス、実際の一時ディレクトリ名、作業ごとの一時配置パスを記載しない。
+- リポジトリ相対パス、ホームからの相対パス、または `<relay-root>` / `<検証用ライブラリ>` などの概念的なパスだけを使う。実環境の配置は設定やサービス定義から確認し、文書へ転記しない。
+
 ## Build & Run
 ```powershell
 cargo build              # Build (edition 2024)
@@ -229,7 +233,7 @@ cargo check              # Type-check
 **重要**: `cargo run` は `.narou/` を持つ初期化済みライブラリをCWDとして実行する必要がある（例: `sample/novel/`、gitignore 済みのローカル用ディレクトリ）。
 
 ## 検証用ライブラリ
-- 動作確認は **`C:\Users\rumia\Documents\WebNovel`** で行う。実データ入りの narou ライブラリ（なろう / カクヨム / ノクターンの 9 作品、`webnovel/*.yaml` も同梱版を配置済み）で、ユーザーが「中のデータの削除も含めて完全に自由にしていい」と許可している。検証用に小説を追加・削除してよい。
+- 動作確認は **ユーザーホームからの相対位置 `Documents/WebNovel` にある検証用ライブラリ** で行う。実データ入りの narou ライブラリ（なろう / カクヨム / ノクターンの 9 作品、`webnovel/*.yaml` も同梱版を配置済み）で、ユーザーが「中のデータの削除も含めて完全に自由にしていい」と許可している。検証用に小説を追加・削除してよい。
 - `%TEMP%` に検証用ライブラリを作らない（過去に 100 個・685MB の残骸を出した）。テストや検証が一時ディレクトリを作るときは `tempfile::TempDir` を使い、panic しても残さない（手動削除は panic で飛ぶ）。
 
 ## Edition 2024 注意事項
@@ -392,7 +396,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **Phase 1 完了**: `src/platform/` に traits（HttpClient / Clock / RateLimiter / ObjectStore / NovelRepository）+ テスト用 mock（MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter / SystemClock）を導入。
 - `NarouError::Http` は `reqwest::Error` の直接 `#[from]` をやめ String 化。`Platform(String)` variant 追加。core から reqwest 型が error 経由で漏れるのを防止。
 - **Phase 2 完了**: downloader を trait 利用へ全面移行。
-  - `HttpClient::send` / `RateLimiter::acquire` は boxed future の async trait（`Send`）。`HttpRequest` は所有型 + `RedirectMode`（Follow/Manual）、`HttpResponse` は bytes のみ。
+  - `HttpClient::send` / `RateLimiter::acquire` は boxed future の async trait（`Send`）。`HttpRequest` は所有型 + `RedirectMode`（Follow/Manual）。小さな制御応答は `HttpResponse`、大きなバイナリは `send_stream` / `HttpStreamResponse` の有界 pull stream を使い、既定実装で全量バッファへ退行させない。
   - `src/downloader/fetch.rs`（HttpFetcher）は削除。transport は `src/native/http.rs` の `NativeHttpClient`（curl→reqwest→wget tier fallback、`tokio::task::spawn_blocking` で隔離）。
   - デコード・ステータス→ドメインエラー変換・リダイレクト解決は `src/downloader/http_policy.rs`（プラットフォーム中立）に集約。
   - Downloader は `Arc<dyn HttpClient>` + `Arc<dyn RateLimiter>` + `Arc<dyn NovelRepository>` を保持。`with_platform(http, rate_limiter, novels)` で注入し、`with_user_agent` は native 実装を組み立てる。
@@ -442,11 +446,19 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **目次を本文として移さない**: サブディレクトリありの `NovelObjectKeys::new("site", "本文", true)` は `novels/site/本文/本文/toc.yaml` を作る。親が `本文` でも `toc.yaml` / `converter.yaml` / `.illustration_cache.yaml` は本文ではなく D1 メタデータ。`ContentStore::is_content_key` と migration `0012_content_metadata_boundary.sql` のビュー・書き込みガードで同じ除外を行い、S3 へのコピー・旧本文の purge の対象にしない。`content_storage.mjs` はこの構成で切替・purge・EPUB・再起動を確認する。
 - **Worker の更新失敗で現行本文を失わない**: `PersistenceService::cache_section` は portable ビルドでは `AssetStore::copy`、native では従来の `move_or_copy` を使う。履歴保存が成功した後でも新本文の PUT は失敗し得るため、Worker で先に現行参照を消してはならない。改題で論理キーが変わった話は、新本文と新 TOC の保存が済んだ後だけ旧キーを削除する（budget 再開済みの話も対象）。`worker_entry/tests/content_storage.mjs` は COPY 成功後の PUT 503 と、旧本文の EPUB 配信・改題後の旧キー削除を実 Worker で確認する。
 
+### Workers の有界ストリーム処理 (2026-11)
+- 詳細は `docs/platform-abstraction.md` の「Workers の有界ストリーム処理」。HTTP・S3・転送 ZIP・APNG・本文変換・EPUB を有界チャンクで接続する。本文は 1 話、アニメーションは必要な 1 フレーム / canvas まで。作品・アニメーション・ZIP 全体の `Vec` / `String` / `Blob` を Worker の本番経路へ戻さない。
+- 変換テキスト・XHTML・途中画像は immutable stage に退避し、成功した実体だけ公開する。通常チャンク 64 KiB、Range キャッシュは 64 KiB × 2、S3 multipart は 8 MiB × 1。stage は使用中に lease を延長し、異常終了分は 24 時間の無活動後に journal / D1 から回収する。
+- EPUB 生成にも一時保存先への書き込みが必要。S3 の書き込み停止中は失敗させ、全量メモリ保持へ戻さない。失敗した更新でも現行本文を残し、復旧後に再生成できることを検証する。
+- `memory_budget::MemoryPermit` が重い処理を isolate ごとに 1 件へ制限し、HTTP 応答の EOF / error / cancel まで所有する。空きがない HTTP は `503 memory_capacity` と `Retry-After`、Queue は lease / 試行回数を消費する前に延期する。isolate キャッシュは件数だけでなく byte weight でも制限する。
+- OOM / trap で通常のエラー保存へ到達しない場合は、migration `0019_bounded_runtime.sql` の `recovery_attempts` を回収時に加算する。永続チェックポイントが進んだときだけ回復予算を戻し、上限到達時に終端化して後続のサイト枠を解放する。
+- リレー経由のバイナリは `NRS1` の生バイナリ応答を使う。旧 JSON/Base64 へ全量フォールバックしないため、配備順は **リレー → D1 migration → Worker**。本番のロック解除や配備はコード修正だけでは実行しない。
+
 ### Worker のジョブ実行・進捗配信・コンソール (2026-09)
 - **実行系**: `worker_entry/src/executor.rs` が queue から受けたジョブを実行し、`consumer.rs` が ack/retry を、`ledger.rs` が試行回数と実行トークンを担う。再試行の解釈 (`queue.max-retries` / `queue.retry-backoff`) は core の `application::retry_policy` が唯一の実装で、native の queue worker と Worker が同じ値を使う。
 - **進捗配信 (PushHub)**: Durable Object `PUSH_HUB` (`worker_entry/src/push_hub.rs`) が WebSocket を保持し、worker からは `POST /api/push/events` の HTTP でイベントを渡す (DO を直接 fetch すると "Cannot reconstruct" になるため HTTP 経由)。Web UI は `/websocket` に接続する。
 - **イベント payload**: ジョブイベントの生成は core の `application::push_events` が唯一の実装で、native の Web UI 経路と Worker が同一の JSON を出す。
-- **コンソール行**: ジョブのコンソール出力は core の `application::messages` が唯一の生成元。Worker の `MessageContext` は future の poll ごとに `PushHubSink` と詳細ログ設定を束縛し、並列ジョブ間で sink・操作 ID・表示先を共有しない。行を積むたびに送信タスク (`spawn_local`) を起動し、順序・取りこぼし・最小送信間隔は `FlushQueue` が管理する。ジョブ終端より先に `drain()` で残りを送る。
+- **コンソール行**: ジョブのコンソール出力は core の `application::messages` が唯一の生成元。Worker の `MessageContext` は future の poll ごとに `PushHubSink` と詳細ログ設定を束縛し、並列ジョブ間で sink・操作 ID・表示先を共有しない。`PushHubSink::run` が生成側と 1 つの送信側を同じ invocation 内で poll し、空き容量が十分な間は行ごとの送信待ちをしない。`FlushQueue` は待機中と送信中を合わせて byte 上限を守り、空きが少ないときだけ生成側へ backpressure をかける。終端前には残りを送り切り、中断時は両 future を破棄する。detached `spawn_local` タスクを残さない。
 - **コンソールの分離 (`concurrency`)**: Worker の既定は有効で、明示的に `concurrency=false` を保存したときだけ 1 コンソールへまとめる。convert は native と同じ `stdout2`、DL/update は `stdout`。`MessageContext` がジョブごとの表示先を持ち、共通の `Stream::target_console_with` で解決する。native のレーン制御・Worker の queue 並列実行は配送アダプタに残し、`concurrency.*` の native コンソール整形は Worker では無効。
 - **詳細ログ (`webui.debug-mode`)**: 詳細ログの唯一の入口は core の `application::debug`。ON のときだけ `[debug] …` 行を sink (= Web コンソールの `echo`) へ流し、OFF では何もしない。設定の真偽値解釈は `enabled_in_settings` に集約する。native の CLI は `debug::apply_settings`、Worker のジョブは poll ごとに束縛する `MessageContext` の設定を使い、並列ジョブ間で有効状態を上書きしない。ジョブ外の EPUB 生成は PushHub へ直接送る (`push_debug_line`)。Web UI (`main.js`) は ON のときだけ Web コンソール行をブラウザの開発者コンソールへも転送する。挿絵は「保存されなかった」「本文の参照が URL のまま」「EPUB の入力に見つからない」をこの詳細ログと欠落警告で追う。
 - **共有ヘルパ**: Web UI の入力検証・上限値・ソート状態・HTML ヘルパは core の `application::webui` が唯一の定義で、native の `src/web/**` と `worker_entry/src/webui/**` はそれを再エクスポートして使う。
@@ -476,8 +488,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **変換の future は `Send`** (2026-10 修正): 調査ログ用に `NovelConverter` が保持する `Inspector` は `Arc<parking_lot::Mutex<Inspector>>` で共有する。`Rc<RefCell<_>>` のままだと `ConvertService::convert_and_store` / `convert_only` の future が非 `Send` になり、並列実行へ渡すと実行時 panic する (clippy `future_not_send` で検出)。非 `Send` の future があるときは `clippy::future_not_send` を ignore するのではなく、型を `Send` にして解消する。
 
 ### AozoraEpub3_Lite 組み込みエンジン (lite feature, 2026-09)
-- pin: `aozora_epub3_lite` = `381c0b17f91946e22d41e5246d3977c706abe82e` (v0.1.6)。この revision は wasm の JS 時計対応に加え、I/O 非依存の逐次画像収集 `AssetPlan` を公開する。更新時は Cargo 経由で git revision を指定し、`cargo update -p aozora_epub3_lite` と native / Worker の実出力を検証する。
-- 呼び出し側は書き出しを **1 エントリずつ**進められる (`EpubBook::stream_writer(sink)` → `next_entry()` / `write_current(bytes)` / `finish()`)。Worker の `download.epub` はこれと `worker::Response::from_stream` を組み合わせ、完成した EPUB を保持せずチャンクを流す (`ChunkSink` は `narou_rs::epub_lite` が提供)。画像計画と処理は `EpubPreparation` / `EpubBuild` で native と共有し、`EpubBuild::image` の保存元対応から 1 枚ずつ取得する (列挙は 512 枚 / 1 枚 16 MiB で 413)。
+- pin: `aozora_epub3_lite` = `cf234f569298f60a2f149d16ebb0643a3ba8fe01` (v0.1.6)。immutable source・エントリ逐次書き出し・有界画像変換に対応。更新時は Cargo 経由で git revision を指定し、`cargo update -p aozora_epub3_lite` と native / Worker の実出力を検証する。
+- Worker の `download.epub` は `worker_entry/src/epub_stream.rs` → `src/epub_lite_stream.rs` を通り、変換テキスト・XHTML を stage から読み、完成した EPUB や画像エントリ全体を保持せずチャンクを流す。Lite の文法・画像計画を Native と共有し、画像の透過・16 bit・アニメーションの全フレームと表示時間を維持する。画像 codec の作業領域は事前に見積もり、巨大 PNG は行単位で処理する。
 - 組み立ては Lite CLI (`main.rs::convert_input`) と同じ公開 API を使う。独自実装 (挿絵の連番化・外字フォント収集・UUID 生成) は持たない。
   - `config_for(aozoraepub3dir)` = `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。Java 版と同じ注記表・外字フォント・INI を読む。INI が無ければ `preset/AozoraEpub3.ini.default` 相当のフラグ。
   - `build_book(input_txt, options)` は `EpubPreparation` で入力を解釈し、native の `collect_assets` と Worker の逐次 `AssetPlan` の結果を同じ `finish` へ渡す。画像参照・連番・欠落除去・自動表紙・画像ページ配置・メタデータ・外字資産の組み立てを二重実装しない (`urn:uuid:` は Java と同じ `java_name_uuid`)。
@@ -593,9 +605,9 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 
 - 保存先の実装は core の `src/platform/s3_store.rs` 1 つで、native と Worker が同じコードを使う
   (Worker 側の `worker_entry/src/s3_store.rs` は環境から接続情報を読んで組み立てるだけ)。
-  path-style URL、SigV4 署名と presigned GET、stat は `GET` + `Range`。1 オブジェクトの上限は
-  64 MiB、`read_small`/`write_small` は 16 MiB (multipart は未実装で、上限超過は黙って
-  切り捨てず失敗させる)。
+  path-style URL、SigV4 署名と presigned GET、stat は `GET` + `Range`。`read_small` /
+  `write_small` は 16 MiB、バッファ済み PUT の上限は 64 MiB。`AssetStore` は 8 MiB
+  part を 1 個ずつ送る multipart と、有界 Range 読み取り・immutable stage を使う。
 - S3 LIST エラーは資格情報を含み得る XML 本文の先頭を表示しない。エラーコードは固定の許可リスト、任意の SignatureProvided / AWSAccessKeyId / StringToSignBytes はメモリ内比較のカテゴリだけを出す。欠落・重複・不正形式は原因を断定しない。署名失敗時だけ公開 AWS fixture の自己テストを初回実行・キャッシュする。実効 host/port は URL から userinfo/path/query を除去し、非標準 region は伏せる。native 資格情報の設定元は既存の解決時にラベルだけ捕捉し、優先順位・値の正規化を変えない。
 - **署名は URL から導出する** (2026-10): `S3Store::send` は渡された URL から
   `path`/`query` を切り出して署名する (呼び出し側が canonical 値を別途渡すと

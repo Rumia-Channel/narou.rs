@@ -6,13 +6,19 @@
 Cloudflare の保護下にあるサイト（ハーメルン等）を Cloudflare Workers から取得するための、VPS 上の取得リレー設定手順です。
 リレー本体はワークスペース crate `relay/` のバイナリ `narou_relay`（Rust 実装）です。現在の構成と設定値は以下の通りです。
 
+以下の `<relay-root>` は配置先、`<relay-user>` は実行ユーザー、`<relay-home>` はそのホーム、`<systemd-unit-dir>` は unit の保存先、`<cloudflared-bin>` は cloudflared の実行ファイルを表します。山括弧の項目は環境に合わせて置換してください。現行サービスの配置先は `systemctl show narou-relay.service -p ExecStart -p WorkingDirectory` で確認し、端末固有の絶対パスや一時配置パスを文書へ転記しません。
+
 | 項目 | 値 |
 | --- | --- |
 | 公開 URL | `https://relay.rumia-ch.uk` |
 | Cloudflare Tunnel | `narou-relay-vps`（ID `ec95cf93-f801-49a2-9a2a-019385e1d0ea`） |
-| リレー本体 | `~/narou.rs/target/release/narou_relay`（`cargo build --release -p narou_relay`、`NAROU_RELAY_FETCH=wget,curl`） |
+| リレー本体 | `<relay-root>/bin/narou_relay`（commit `d157b80` の Linux x86_64 musl 静的バイナリ、`NAROU_RELAY_FETCH=wget,curl`） |
 | 待受 | `127.0.0.1:3000` |
 | Worker 側 | GitHub Environment `CloudFlare` の Secret `RELAY_DOMAIN=relay.rumia-ch.uk`（`NAROU_RELAY_KEY` は VPS の `.env` と一致） |
+
+2026-11-10 に、実機で残っていた Node/npm 版を停止し、旧サービス定義を自動起動されない私有バックアップへ退避しました。残存 Node プロセス・PM2・cron・別のユーザーサービスがないことを確認し、`narou-relay.service` は Rust のみを起動する定義へ置換しています。認証鍵・許可ホスト・トンネルは維持しています。
+
+設定は `<relay-root>/runtime/.env` で管理します。旧定義は起動経路から外した保全用バックアップとして扱い、復元・再起動しません。公開経路で認証拒否、従来 JSON と `NRS1` バイナリ応答、ハーメルン HTTP 200 と Cookie の引き継ぎを確認しています。
 
 ```text
 Worker ──HTTPS──> relay.rumia-ch.uk (Cloudflare) ──tunnel──> cloudflared ──> 127.0.0.1:3000 (narou_relay) ──wget──> 対象サイト
@@ -160,7 +166,7 @@ curl -sS https://relay.rumia-ch.uk/health
 ### 7.1 リレー
 
 ```sh
-sudo tee /etc/systemd/system/narou-relay.service >/dev/null <<'EOF'
+sudo tee "<systemd-unit-dir>/narou-relay.service" >/dev/null <<'EOF'
 [Unit]
 Description=narou relay
 After=network-online.target
@@ -168,9 +174,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/narou.rs/scripts/relay
-ExecStart=/home/ubuntu/narou.rs/target/release/narou_relay
+User=<relay-user>
+WorkingDirectory=<relay-root>/runtime
+ExecStart=<relay-root>/bin/narou_relay
 Restart=always
 RestartSec=5
 
@@ -183,8 +189,8 @@ curl -sS http://127.0.0.1:3000/health
 journalctl -u narou-relay -n 20 --no-pager
 ```
 
-- `WorkingDirectory` を `scripts/relay` にすると、そこにある `.env` がそのまま読まれる
-- バイナリは `cargo build --release -p narou_relay` の出力（`target/release/narou_relay`）を直接指す。ビルド後に再起動する
+- `WorkingDirectory` の `.env` が読まれる。現行配置の認証鍵・許可ホストはそのまま維持する
+- VPS 内でビルドするか、別のビルド環境で作った Linux バイナリを配置する（第10節）。実行時に Rust ツールチェーンは不要
 - 手動で起動した `narou_relay` は停止してから行う（`Ctrl+C`）
 
 ### 7.2 cloudflared（名前付きトンネル）
@@ -193,14 +199,14 @@ journalctl -u narou-relay -n 20 --no-pager
 
 ```yaml
 tunnel: narou-relay-vps
-credentials-file: /home/ubuntu/.cloudflared/ec95cf93-f801-49a2-9a2a-019385e1d0ea.json
+credentials-file: <relay-home>/.cloudflared/<tunnel-id>.json
 ingress:
   - hostname: relay.rumia-ch.uk
     service: http://127.0.0.1:3000
   - service: http_status:404
 ```
 
-systemd ユニット（`/etc/systemd/system/narou-tunnel.service`）:
+systemd ユニット（`<systemd-unit-dir>/narou-tunnel.service`）:
 
 ```ini
 [Unit]
@@ -210,9 +216,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-Environment=HOME=/home/ubuntu
-ExecStart=/usr/bin/cloudflared --no-autoupdate --config /home/ubuntu/.cloudflared/config.yml tunnel run narou-relay-vps
+User=<relay-user>
+Environment=HOME=<relay-home>
+ExecStart=<cloudflared-bin> --no-autoupdate --config <relay-home>/.cloudflared/config.yml tunnel run narou-relay-vps
 Restart=always
 RestartSec=5
 
@@ -242,7 +248,7 @@ gh workflow run platform.yml --ref develop -f target=develop
 ```
 
 - `RELAY_DOMAIN` があると `NAROU_RELAY_ENDPOINT=https://relay.rumia-ch.uk` が自動で使われる（`NAROU_RELAY_ENDPOINT` より優先）
-- production Worker は main からの配備。反映には main への統合（リリースまたは指示）が必要
+- production Worker の自動配備はリリースタグの push が起点。main への統合だけでは配備されない。手動配備は `target=production` を指定する
 
 ## 9. 動作確認（Worker）
 
@@ -259,11 +265,19 @@ gh workflow run platform.yml --ref develop -f target=develop
 
 ## 10. 更新
 
+VPS 内の Rust 環境でも更新用バイナリをビルドできます。ただしメモリの小さい VPS では稼働中サービスとの競合を避け、別の Linux / WSL 等でのビルドを推奨します。実行にツールチェーンは不要で、検証済みバイナリをそのまま利用できます。以下は別環境からも持ち込める静的バイナリの作成例です。
+
 ```sh
-cd ~/narou.rs && git pull && cargo build --release -p narou_relay && sudo systemctl restart narou-relay
+# ビルド環境（対象コミットを取得済みのリポジトリ）
+rustup target add x86_64-unknown-linux-musl
+RUSTFLAGS='-C linker=rust-lld -C linker-flavor=ld.lld' \
+  cargo build --locked --release --target x86_64-unknown-linux-musl -p narou_relay --bin narou_relay
+sha256sum target/x86_64-unknown-linux-musl/release/narou_relay
 ```
 
-ビルドが失敗した場合は古いバイナリのまま再起動しないよう、更新前に必ず `cargo build` の成否を確認してください。
+生成物を VPS へ転送し、SHA-256 の一致と別の loopback ポートでの認証・JSON・`NRS1` 応答を確認してから、現行 unit の `ExecStart` が指すバイナリを置換して `sudo systemctl restart narou-relay` を実行します。設定の認証鍵と許可ホストは変更しません。ビルド・検証に失敗した場合は配備しません。
+
+Rust 版の停止が必要な場合は `sudo systemctl disable --now narou-relay.service` を使います。障害時も旧 Node/npm 版へは戻しません。
 
 ## 11. トラブルシューティング
 

@@ -108,6 +108,17 @@ $('div#novelBody').load('{BODY}', {{'episode': {id}, 'token': 'public-token'}});
             Ok(HttpResponse {status, headers, body:text.into_bytes()})
         })
     }
+
+    fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<narou_rs::platform::HttpStreamResponse>> {
+        let url = request.url.clone();
+        Box::pin(async move {
+            let response = self.send(request).await?;
+            Ok(narou_rs::platform::HttpStreamResponse {
+                status: response.status, url, headers: response.headers,
+                body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
+            })
+        })
+    }
 }
 
 #[tokio::test]
@@ -118,7 +129,7 @@ async fn complete_toc_preserves_array_order_and_own_metadata() {
     assert_eq!(rows.iter().map(|row| row.index.as_str()).collect::<Vec<_>>(), ["99","7","5"]);
     assert_eq!(rows.iter().map(|row| row.chapter.as_str()).collect::<Vec<_>>(), ["","第一章",""]);
     assert_eq!(rows[1].subdate, "2026-10-17 11:12");
-    let info=NovelInfo::from_novel_info_source(&setting, &source);
+    let info=NovelInfo::from_novel_info_source(&setting, &source).await;
     assert_eq!(info.title.as_deref(), Some("作品の題名"));
     assert_eq!(info.author.as_deref(), Some("作者"));
     assert_eq!(info.tags.as_deref(), Some("本人のタグ"));
@@ -148,7 +159,7 @@ async fn partial_toc_attaches_chapters_to_the_first_accessible_episode() {
     let rows=parse_subtitles(&setting,&source,&HashMap::new()).unwrap();
     assert_eq!(rows.iter().map(|row|row.index.as_str()).collect::<Vec<_>>(),["71","73","91","92","93"]);
     assert_eq!(rows.iter().map(|row|row.chapter.as_str()).collect::<Vec<_>>(),["第一章","","第二章","終章",""]);
-    assert_eq!(NovelInfo::from_novel_info_source(&setting,&source).raw_captures.get("ga").map(String::as_str),Some("5"));
+    assert_eq!(NovelInfo::from_novel_info_source(&setting,&source).await.raw_captures.get("ga").map(String::as_str),Some("5"));
 }
 
 #[tokio::test]

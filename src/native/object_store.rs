@@ -21,6 +21,42 @@ use crate::platform::{
 
 pub(crate) const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 
+pub(crate) fn collect_expired_stage_files(root: &Path) -> Result<()> {
+    let entries = match fs::read_dir(root.join(".objects").join(".narou-staging")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() { continue; }
+        let file = match fs::OpenOptions::new().read(true).write(true).open(entry.path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = fs2::FileExt::try_lock_exclusive(&file) {
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() { continue; }
+            return Err(error.into());
+        }
+        if file.metadata()?.modified()?.elapsed().unwrap_or_default().as_secs()
+            > crate::platform::staging::STAGE_TTL_SECONDS as u64 {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn renew_stage_file(file: &fs::File, key: &ObjectKey, cache: &crate::platform::staging::StageLeaseCache) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    if cache.needs_renewal(key, now) {
+        file.set_modified(std::time::SystemTime::now())?;
+        cache.renewed(key, now);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct NativeObjectStore {
     root: PathBuf,
@@ -28,6 +64,7 @@ pub struct NativeObjectStore {
     /// an existing path still costs a syscall per ancestor; section writes
     /// repeat the same `本文/` parent hundreds of times per novel.
     created_dirs: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<PathBuf>>>,
+    stage_leases: Arc<crate::platform::staging::StageLeaseCache>,
 }
 
 impl NativeObjectStore {
@@ -40,6 +77,7 @@ impl NativeObjectStore {
         fs::create_dir_all(&root)?;
         Ok(Self {
             root,
+            stage_leases: Arc::new(crate::platform::staging::StageLeaseCache::default()),
             created_dirs: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashSet::new(),
             )),
@@ -456,34 +494,83 @@ impl AssetStore for NativeObjectStore {
         let this = self.clone();
         let key = key.clone();
         Box::pin(async move {
-            let path = run_blocking(move || {
-                let path = this.resolve_read_path(&key)?;
-                match fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => Ok(Some(path)),
-                    Ok(_) => Ok(None),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(error) => Err(error.into()),
-                }
-            })
-            .await?;
-            let Some(path) = path else {
-                return Ok(None);
-            };
-            let file = tokio::fs::File::open(path).await?;
-            let stream: AssetStream =
-                Box::pin(futures::stream::unfold(file, |mut file| async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut chunk = vec![0_u8; 64 * 1024];
-                    match file.read(&mut chunk).await {
-                        Ok(0) => None,
-                        Ok(size) => {
-                            chunk.truncate(size);
-                            Some((Ok(chunk), file))
-                        }
-                        Err(error) => Some((Err(NarouError::Io(error)), file)),
+            let opened = run_blocking({
+                let this = this.clone();
+                let key = key.clone();
+                move || {
+                    let staging = crate::platform::staging::is_staging_key(&key);
+                    let file = match fs::OpenOptions::new().read(true).write(staging).open(this.resolve_read_path(&key)?) {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                        Err(error) => return Err(error.into()),
+                    };
+                    if !file.metadata()?.is_file() { return Ok(None); }
+                    if staging {
+                        fs2::FileExt::lock_shared(&file)?;
+                        renew_stage_file(&file, &key, &this.stage_leases)?;
                     }
-                }));
+                    let expected = file.metadata()?.len();
+                    Ok(Some((file, staging, expected)))
+                }
+            }).await?;
+            let Some((file, staging, expected)) = opened else { return Ok(None); };
+            let cache = this.stage_leases.clone();
+            let stream: AssetStream = Box::pin(futures::stream::try_unfold(
+                (file, 0u64, key, cache), move |(mut file, position, key, cache)| run_blocking(move || {
+                    use std::io::Read;
+                    let mut chunk = vec![0_u8; 64 * 1024];
+                    let length = file.read(&mut chunk)?;
+                    if length == 0 {
+                        if position != expected { return Err(NarouError::Platform("asset file was truncated".into())); }
+                        return Ok(None);
+                    }
+                    if staging {
+                        renew_stage_file(&file, &key, &cache)?;
+                    }
+                    let next = position.checked_add(length as u64).filter(|&value| value <= expected)
+                        .ok_or_else(|| NarouError::Platform("asset file changed while reading".into()))?;
+                    chunk.truncate(length);
+                    Ok(Some((chunk, (file, next, key, cache))))
+                }),
+            ));
             Ok(Some(stream))
+        })
+    }
+
+    fn read_range<'a>(
+        &'a self, key: &'a ObjectKey, range: std::ops::Range<u64>,
+    ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        let this = self.clone();
+        let key = key.clone();
+        run_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let length = crate::platform::staging::validate_range(&range)?;
+            let path = this.resolve_read_path(&key)?;
+            let staging = crate::platform::staging::is_staging_key(&key);
+            let mut file = match fs::OpenOptions::new().read(true).write(staging).open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            if staging {
+                fs2::FileExt::lock_shared(&file)?;
+                renew_stage_file(&file, &key, &this.stage_leases)?;
+            }
+            if range.end > file.metadata()?.len() {
+                return Err(NarouError::Platform("asset range exceeds object".into()));
+            }
+            file.seek(SeekFrom::Start(range.start))?;
+            let mut bytes = vec![0; length];
+            file.read_exact(&mut bytes)?;
+            Ok(Some(bytes))
+        })
+    }
+
+    fn stage_stream<'a>(&'a self, stream: AssetStream) -> PlatformFuture<'a, Result<crate::platform::staging::StagedAsset>> {
+        Box::pin(async move {
+            let this = self.clone();
+            run_blocking(move || collect_expired_stage_files(&this.root)).await?;
+            crate::platform::staging::stage(self, stream).await
         })
     }
 
@@ -514,20 +601,24 @@ impl AssetStore for NativeObjectStore {
                 }
             })
             .await?;
-            let temporary = run_blocking(move || {
-                tempfile::Builder::new().prefix(".narou-asset-").tempfile_in(parent)
-                    .map_err(NarouError::Io)
+            let mut temporary = run_blocking(move || {
+                let temporary = tempfile::Builder::new().prefix(".narou-asset-").tempfile_in(parent)?;
+                // Windows byte-range locks permit writes through the locking
+                // handle only. Keep that handle for all spool I/O.
+                fs2::FileExt::lock_exclusive(temporary.as_file())?;
+                Ok(temporary)
             }).await?;
-            let mut file = tokio::fs::File::from_std(temporary.reopen()?);
             while let Some(chunk) = stream.next().await {
-                use tokio::io::AsyncWriteExt;
-                file.write_all(&chunk?).await?;
+                let chunk = chunk?;
+                temporary = run_blocking(move || {
+                    temporary.as_file_mut().write_all(&chunk)?;
+                    Ok(temporary)
+                }).await?;
             }
-            file.sync_all().await?;
-            // Same rationale as atomic_write_bytes: rename already replaces
-            // the destination atomically; removing first only opens a gap.
-            drop(file);
+            // Complete the writes and sync the same handle before publication.
+            // No Tokio file buffer or detached pending write survives this point.
             run_blocking(move || {
+                temporary.as_file().sync_all()?;
                 temporary.persist(path).map_err(|error| NarouError::Io(error.error))?;
                 Ok(())
             }).await?;
@@ -548,12 +639,22 @@ impl AssetStore for NativeObjectStore {
         let source = source.clone();
         let destination = destination.clone();
         run_blocking(move || {
-            let source = this.resolve_read_path(&source)?;
+            let source_path = this.resolve_read_path(&source)?;
             let destination = this.resolve_path(&destination)?;
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(source, destination)?;
+            let parent = destination.parent().ok_or_else(|| NarouError::Platform("copy destination has no parent".into()))?;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            let staging = crate::platform::staging::is_staging_key(&source);
+            let mut input = fs::OpenOptions::new().read(true).write(staging).open(source_path)?;
+            if staging {
+                fs2::FileExt::lock_shared(&input)?;
+                renew_stage_file(&input, &source, &this.stage_leases)?;
+            }
+            std::io::copy(&mut input, temporary.as_file_mut())?;
+            temporary.as_file().sync_all()?;
+            temporary.persist(destination).map_err(|error| NarouError::Io(error.error))?;
             Ok(())
         })
     }
@@ -939,6 +1040,22 @@ impl AssetStore for NativeStore {
         }
     }
 
+    fn read_range<'a>(
+        &'a self, key: &'a ObjectKey, range: std::ops::Range<u64>,
+    ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        match self {
+            NativeStore::Fs(store) => store.read_range(key, range),
+            NativeStore::Sqlite(store) => store.read_range(key, range),
+        }
+    }
+
+    fn stage_stream<'a>(&'a self, stream: AssetStream) -> PlatformFuture<'a, Result<crate::platform::staging::StagedAsset>> {
+        match self {
+            NativeStore::Fs(store) => store.stage_stream(stream),
+            NativeStore::Sqlite(store) => store.stage_stream(stream),
+        }
+    }
+
     fn write_stream<'a>(
         &'a self,
         key: &'a ObjectKey,
@@ -995,6 +1112,51 @@ pub fn delete_prefix_sync(store: &dyn ObjectStore, prefix: &ObjectKey) -> Result
 mod tests {
     use super::*;
     use crate::platform::ObjectStore;
+
+    #[test]
+    fn streamed_files_roundtrip_without_a_tokio_runtime() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        futures::executor::block_on(async {
+            let size = crate::platform::staging::ASSET_CHUNK_BYTES;
+            let source = futures::stream::iter([Ok(vec![3; size]), Ok(vec![5; 19])]);
+            let stage = store.stage_stream(Box::pin(source)).await.unwrap();
+            assert_eq!(stage.size, size as u64 + 19);
+            let bytes = store.read_range(&stage.key, size as u64 - 3..size as u64 + 8).await.unwrap().unwrap();
+            assert_eq!(bytes, [vec![3; 3], vec![5; 8]].concat());
+            let mut stream = store.read_stream(&stage.key).await.unwrap().unwrap();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.unwrap();
+                assert!(chunk.len() <= size);
+                bytes.extend_from_slice(&chunk);
+            }
+            assert_eq!(&bytes[..size], vec![3; size]);
+            assert_eq!(&bytes[size..], &[5; 19]);
+            AssetStore::delete(&store, &stage.key).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn active_stage_read_holds_cleanup_lease_until_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let stage = store.stage_stream(Box::pin(futures::stream::once(async { Ok(vec![9; 1024]) }))).await.unwrap();
+            let stream = store.read_stream(&stage.key).await.unwrap().unwrap();
+            let path = store.resolve_path(&stage.key).unwrap();
+            let expired = std::time::SystemTime::now() - std::time::Duration::from_secs(
+                crate::platform::staging::STAGE_TTL_SECONDS as u64 * 2);
+            fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(expired).unwrap();
+            collect_expired_stage_files(root.path()).unwrap();
+            assert!(path.exists(), "a live reader must retain its stage beyond creation TTL");
+            drop(stream);
+            collect_expired_stage_files(root.path()).unwrap();
+            assert!(!path.exists(), "dropping the reader releases the cleanup lease");
+        });
+    }
 
     #[test]
     fn relative_novel_dir_becomes_absolute_for_materialization() {

@@ -30,8 +30,10 @@ mod d1_cookie_store;
 mod d1_object_store;
 mod d1_repository;
 mod executor;
+mod epub_stream;
 pub mod http;
 mod isolate_cache;
+mod memory_budget;
 mod ledger;
 mod object_migration;
 mod illustration_migration;
@@ -516,12 +518,10 @@ async fn api_novel_get(_req: Request, env: Env, id: i64) -> Result<Response> {
     Response::from_json(&value)
 }
 
-/// GET /api/novels/:id/download.epub — build the EPUB from the stored
-/// converted text (`novel.txt` object) at download time and stream it as the
-/// response body: dimensions are read one illustration at a time before the
-/// response, then pixels are read and processed right before their entry is
-/// written. Every chunk leaves as soon as it is produced; neither the finished
-/// archive nor the image set is ever held in memory.
+/// GET /api/novels/:id/download.epub — prepare immutable text/image snapshots,
+/// rendering one section and transforming one frame at a time. The response
+/// pulls bounded ZIP chunks; its heavy-memory permit and temporary assets live
+/// until EOF, failure or cancellation.
 async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Response> {
     if let Some(response) = auth_failure(&req, &env).await {
         return response;
@@ -534,376 +534,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
 /// 外部公開 API (`/api/v1/novels/{id}/epub`) からも使うため、認証だけを
 /// 呼び出し側に分離している。
 pub(crate) async fn build_epub_response(env: &Env, id: i64, virtual_only: bool) -> Result<Response> {
-    let services = match composition::build_read_services(env).await {
-        Ok(services) => services,
-        Err(_) => return Response::error("Service unavailable", 503),
-    };
-    let record = match services
-        .app
-        .library
-        .get(narou_rs::platform::NovelId(id))
-        .await
-    {
-        Ok(Some(record)) => record,
-        Ok(None) => return Response::error("Not Found", 404),
-        Err(error) => return Response::error(format!("Repository error: {error}"), 500),
-    };
-    let is_virtual = record.ncode.as_deref().is_some_and(narou_rs::virtual_novel::is_virtual_ncode);
-    if virtual_only && !is_virtual {
-        return Response::error("Not Found", 404);
-    }
-    let keys = match narou_rs::platform::NovelObjectKeys::new(
-        &record.sitename,
-        &record.file_title,
-        record.use_subdirectory,
-    ) {
-        Ok(keys) => keys,
-        Err(error) => return Response::error(format!("Invalid key: {error}"), 500),
-    };
-
-    let local_map = load_local_settings_map(env).await;
-    // グローバルスコープの変換設定 (`convert.epub-font` / `line-height`)。
-    let global_map = load_global_settings_map(env).await;
-    let push_sink = crate::push_hub::PushHubSink::shared(
-        crate::push_hub::PushHubClient::new(env, crate::budget::SubrequestBudget::new()),
-        None,
-    );
-    let debug_enabled = narou_rs::application::debug::enabled_in_settings(&local_map);
-    let context = narou_rs::application::messages::MessageContext::new(push_sink.clone(), debug_enabled);
-    let response = context.scope(async {
-    narou_rs::application::debug::emit(format!(
-        "EPUB: 生成開始 (id={id}, keep-txt={})",
-        crate::convert::keep_converted_text_with(&local_map)
-    ));
-    let text_key = keys.converted_text();
-    // `convert.keep-txt=false` (既定) では変換済みテキストを保存しない構成
-    // なので、残っていても読まずに本文から組み立て直す。
-    let stored = if !is_virtual && crate::convert::keep_converted_text_with(&local_map) {
-        match services.objects.read_small(&text_key).await {
-            Ok(found) => found,
-            Err(error) => {
-                return Response::error(format!("Object store error: {error}"), 500);
-            }
-        }
-    } else {
-        None
-    };
-    let mut illustration_sources = std::collections::BTreeMap::new();
-    let (text, novel_settings) = match stored {
-        Some(bytes) => {
-            let settings = match load_novel_settings(&services.objects, &record, &keys, &local_map).await {
-                Ok(settings) => settings,
-                Err(error) => return Response::error(format!("Settings error: {error}"), 500),
-            };
-            let text = match String::from_utf8(bytes) {
-                Ok(text) => text,
-                Err(_) => return Response::error("Stored text is not valid UTF-8", 500),
-            };
-            (text, settings)
-        }
-        None => {
-            let converted = if is_virtual {
-                let persistence = narou_rs::downloader::persistence::PersistenceService::new(
-                    services.objects.clone(), services.assets.clone(),
-                );
-                let book = match crate::virtual_novels::load_book(
-                    &services.db.primary_view(), &record, services.novels.as_ref(), &persistence,
-                ).await {
-                    Ok(book) => book,
-                    Err(narou_rs::error::NarouError::NotFound(error)) => return Response::error(error, 404),
-                    Err(error) => return Response::error(format!("Convert failed: {error}"), 409),
-                };
-                illustration_sources = book.illustrations;
-                services.conversion.convert_prepared(&record, book.toc, book.sections, false).await
-            } else {
-                services.conversion.convert_only(&record).await
-            };
-            match converted {
-                Ok(converted) => (converted.text, converted.settings),
-                Err(error) => return Response::error(format!("Convert failed: {error}"), 409),
-            }
-        }
-    };
-    let filename = epub_download_filename(&record, &novel_settings, &local_map);
-
-    // Worker の変換は native と違って挿絵をローカライズしないので、本文には
-    // 取得元 URL がそのまま残る。ダウンロード時に保存した実体は
-    // `.illustration_cache.yaml` (取得元 → ファイル名) が知っているため、
-    // ここで参照を `挿絵/<file>` へ寄せてから EPUB を組む。
-    let index = if is_virtual { None } else { load_illustration_index(&services.objects, &keys).await };
-    let (text, unresolved) = match index.as_ref() {
-        Some(index) => narou_rs::illustration_refs::rewrite(text, |reference| {
-            // 既にローカルな `挿絵/<file>` はそのまま使う (対応表には無い)。
-            if reference.starts_with("挿絵/") {
-                return Some(reference.to_string());
-            }
-            index
-                .filename_for_source(reference)
-                .map(str::to_string)
-                .or_else(|| {
-                    narou_rs::illustration_store::mitemin_illustration_id(reference)
-                        .and_then(|id| index.filename_for_mitemin_id(&id).map(str::to_string))
-                })
-                .map(|filename| format!("挿絵/{filename}"))
-        }),
-        None => (text, Vec::new()),
-    };
-    let image_references = narou_rs::illustration_refs::collect(&text);
-    if narou_rs::application::debug::enabled() {
-        let unresolved = if index.is_some() { &unresolved } else { &image_references };
-        narou_rs::application::debug::emit(format!(
-            "EPUB: 挿絵索引 {} / 本文の挿絵参照 {} 件 (未解決 {} 件)",
-            match index.as_ref() {
-                Some(index) => format!("{} エントリ", index.source_count()),
-                None => "なし".to_string(),
-            },
-            image_references.len(),
-            unresolved.len()
-        ));
-        for reference in unresolved {
-            narou_rs::application::debug::emit(format!("EPUB: 未解決の挿絵参照: {reference}"));
-        }
-    }
-
-    // 挿絵は名前とサイズだけを列挙し、寸法取得と書き出しで 1 枚ずつ読む。
-    // 列挙した名前が本文の参照と同じ形 (`挿絵/foo.jpg`) でないと Lite は解決
-    // できないので、小説のプレフィックスは付けない。
-    const MAX_IMAGES: usize = 512;
-    let Ok(illust_prefix) = narou_rs::platform::ObjectPrefix::new(format!(
-        "{}/挿絵",
-        keys.prefix().as_ref()
-    )) else {
-        return Response::error("Invalid illustration prefix", 500);
-    };
-    let mut image_names: Vec<String> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-    let mut cursor = None;
-    if !is_virtual {
-        loop {
-            let mut request =
-                narou_rs::platform::ObjectListRequest::new(illust_prefix.clone(), 100.try_into().unwrap());
-            request.cursor = cursor.take();
-            let page = match services.objects.list_page(&request).await {
-                Ok(page) => page,
-                Err(error) => {
-                    return Response::error(format!("Object store error: {error}"), 500);
-                }
-            };
-            for meta in page.objects {
-                let name = meta.key.as_ref().rsplit('/').next().unwrap_or_default().to_string();
-                if !narou_rs::epub_lite::is_supported_image(&name) {
-                    skipped.push(format!("{name} (画像として扱えない拡張子)"));
-                    continue;
-                }
-                if image_names.len() >= MAX_IMAGES {
-                    return Response::error(
-                        format!("Illustrations exceed the Worker budget ({MAX_IMAGES} images)"),
-                        413,
-                    );
-                }
-                if meta.size > MAX_IMAGE_BYTES {
-                    return Response::error(
-                        format!(
-                            "Illustration {name} exceeds the {} MiB read limit",
-                            MAX_IMAGE_BYTES / 1024 / 1024
-                        ),
-                        413,
-                    );
-                }
-                image_names.push(format!("挿絵/{name}"));
-            }
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-    }
-
-    // 一覧に載っていない参照は、共通のキー生成 (`NovelObjectKeys::illustration`)
-    // — 保存側と同じ関数 — で直接 stat して拾う。挿絵の保存はできているのに
-    // ストアの LIST が返らない環境でも、実体があれば EPUB に入る
-    // (本文の参照順に足すので、表紙も本文の先頭の挿絵のまま)。
-    let has_image_references = !image_references.is_empty();
-    for reference in image_references {
-        if image_names.iter().any(|name| name == &reference) {
-            continue;
-        }
-        let Some(name) = reference.strip_prefix("挿絵/") else {
-            continue;
-        };
-        let Ok(key) = epub_image_key(&keys, &illustration_sources, &reference) else {
-            continue;
-        };
-        match services.objects.stat(&key).await {
-            Ok(Some(meta)) => {
-                if image_names.len() >= MAX_IMAGES {
-                    return Response::error(
-                        format!("Illustrations exceed the Worker budget ({MAX_IMAGES} images)"),
-                        413,
-                    );
-                }
-                if meta.size > MAX_IMAGE_BYTES {
-                    return Response::error(
-                        format!("Illustration {name} exceeds the {} MiB read limit", MAX_IMAGE_BYTES / 1024 / 1024),
-                        413,
-                    );
-                }
-                narou_rs::application::debug::emit(format!(
-                    "EPUB: 挿絵を一覧に依らず直接確認しました: {reference}"
-                ));
-                image_names.push(reference);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return Response::error(format!("Object store error: {error}"), 500);
-            }
-        }
-    }
-
-    narou_rs::application::debug::emit(format!(
-        "EPUB: 挿絵一覧 {} 件 (除外 {} 件) prefix={}",
-        image_names.len(),
-        skipped.len(),
-        illust_prefix.as_ref()
-    ));
-    if novel_settings.enable_illust && has_image_references && image_names.is_empty() {
-        // 本文が要求した挿絵の実体が無い。参照なし・挿絵無効では欠落と判定しない:
-        // 「挿絵がどこにも無い」のか「一次ストア (D1) に残っている」のかで
-        // 対処が変わる (後者は挿絵側ストアへ取り直せば直る)。
-        report_missing_illustrations(env, &services.objects, &keys, illust_prefix.as_ref(), is_virtual).await;
-    }
-    for name in &skipped {
-        narou_rs::application::debug::emit(format!("EPUB: 挿絵を除外: {name}"));
-    }
-
-    // 保存済み設定から組立オプションを組む (`vertical: true` 固定にしない):
-    // 書字方向は per-novel `enable_yokogaki`、表紙は `enable_illust`、濁点
-    // フォントは本文の濁点注記 (`convert.epub-font=auto`) か `always` に従う。
-    let options = narou_rs::epub_lite::EpubBuildOptions::from_settings(
-        narou_rs::epub_lite::EpubSettingsInput {
-            title: &record.title,
-            author: &record.author,
-            settings: &novel_settings,
-            has_images: !image_names.is_empty(),
-            // バイト源だけが native と異なり、フォント/CSS の規則は共通。
-            extra_assets: narou_rs::epub_lite::narou_font_assets(
-                narou_rs::epub_lite::text_has_dakuten_marker(&text),
-                narou_rs::epub_lite::epub_font_always(
-                    global_map.get("convert.epub-font").and_then(setting_text).as_deref(),
-                ),
-                narou_rs::converter::settings::line_height_from_value(global_map.get("line-height")),
-            ),
-            assets_dir: None,
-            kindle: false,
-            // 未指定は INI 準拠。寸法取得後に共通レイアウトが回転角を決める。
-            rotate_image: local_map
-                .get("convert.rotate-image")
-                .and_then(setting_text)
-                .and_then(|value| narou_rs::converter::settings::ImageRotation::from_setting(&value)),
-        },
-    );
-    let source = std::sync::Arc::new(narou_rs::epub_lite::EpubTextSource::new(
-        text,
-        image_names,
-    ));
-    let preparation = match narou_rs::epub_lite::prepare_book_from_source(source, &options) {
-        Ok(preparation) => preparation,
-        Err(error) => return Response::error(format!("EPUB build failed: {error}"), 500),
-    };
-    let mut plan = match preparation.asset_plan() {
-        Ok(plan) => plan,
-        Err(error) => return Response::error(format!("EPUB image planning failed: {error}"), 500),
-    };
-    loop {
-        let request = match plan.next_request() {
-            Ok(Some(request)) => request,
-            Ok(None) => break,
-            Err(error) => {
-                return Response::error(format!("EPUB image planning failed: {error}"), 500);
-            }
-        };
-        let key = match epub_image_key(&keys, &illustration_sources, request.source) {
-            Ok(key) => key,
-            Err(error) => return Response::error(format!("Invalid image key: {error}"), 500),
-        };
-        let bytes = match services.objects.read_small(&key).await {
-            Ok(Some(bytes)) if bytes.len() <= MAX_IMAGE_BYTES as usize => bytes,
-            Ok(Some(_)) => {
-                return Response::error(
-                    format!(
-                        "Illustration {} exceeds the {} MiB read limit",
-                        request.source,
-                        MAX_IMAGE_BYTES / 1024 / 1024
-                    ),
-                    413,
-                );
-            }
-            Ok(None) => {
-                return Response::error(
-                    format!("EPUB image metadata missing: {}", request.source),
-                    500,
-                );
-            }
-            Err(error) => return Response::error(format!("Object store error: {error}"), 500),
-        };
-        let dimensions = narou_rs::epub_lite::image_dimensions(&bytes, request.media_type);
-        drop(bytes);
-        if let Err(error) = plan.provide_dimensions(dimensions) {
-            return Response::error(format!("EPUB image planning failed: {error}"), 500);
-        }
-    }
-    let (assets, cover) = match plan.complete() {
-        Ok(collected) => collected,
-        Err(error) => return Response::error(format!("EPUB image planning failed: {error}"), 500),
-    };
-    let build = match preparation.finish(assets, cover, &options) {
-        Ok(build) => build,
-        Err(error) => return Response::error(format!("EPUB build failed: {error}"), 500),
-    };
-    let sink = narou_rs::epub_lite::ChunkSink::new();
-    let writer = match build.book.stream_writer(sink.clone()) {
-        Ok(writer) => writer,
-        Err(error) => return Response::error(format!("EPUB write failed: {error}"), 500),
-    };
-    let state = EpubStreamState {
-        writer: Some(writer),
-        sink,
-        build,
-        objects: services.objects.clone(),
-        keys,
-        illustration_sources,
-        context: narou_rs::application::messages::MessageContext::new(push_sink.clone(), debug_enabled),
-        messages: push_sink.clone(),
-    };
-    let stream = futures::stream::unfold(state, |mut state| {
-        let context = state.context.clone();
-        context.scope(async move {
-            let next = state.next_chunk().await;
-            if next.is_err() {
-                state.writer = None;
-            }
-            if state.writer.is_none() {
-                state.messages.drain().await;
-            }
-            match next {
-                Ok(Some(chunk)) => Some((Ok(chunk), state)),
-                Ok(None) => None,
-                Err(error) => Some((Err(error), state)),
-            }
-        })
-    });
-
-    worker::ResponseBuilder::new()
-        .with_header("Content-Type", "application/epub+zip")?
-        .with_header("Cache-Control", "no-store")?
-        .with_header(
-            "Content-Disposition",
-            &sanitize_content_disposition(&filename),
-        )?
-        .from_stream(stream)
-    }).await;
-    push_sink.drain().await;
-    response
+    epub_stream::build_epub_response(env, id, virtual_only).await
 }
 
 /// 挿絵の一覧が 0 件だったときに、切り分けの材料を Web コンソールへ出す。
@@ -919,7 +550,7 @@ async fn report_missing_illustrations(
     illust_prefix: &str,
     virtual_book: bool,
 ) {
-    let mut leftovers: Vec<String> = Vec::new();
+    let mut leftovers = 0usize;
     let probe = if virtual_book {
         None
     } else {
@@ -935,19 +566,18 @@ async fn report_missing_illustrations(
     {
         for metadata in page.objects {
             if let Some((_, name)) = metadata.key.as_ref().rsplit_once("/挿絵/") {
-                leftovers.push(name.to_string());
+                leftovers += 1;
+                narou_rs::application::debug::emit_async(format!("EPUB: 一次ストアに残る挿絵: {name}")).await;
             }
         }
     }
     let detail = if virtual_book {
         "WARN: EPUB: メンバーの本文にある挿絵を保存先から読み出せません。各メンバーの挿絵と保存先の設定を確認してください".to_string()
-    } else if leftovers.is_empty() {
+    } else if leftovers == 0 {
         "WARN: EPUB: 一覧でも直接確認でも挿絵が見つからず、一次ストア (D1) にもありません。保存先の設定 (asset_backend) と実際の保存先がずれている可能性があります".to_string()
     } else {
         format!(
-            "WARN: EPUB: 一覧でも直接確認でも見つからず、一次ストア (D1) に挿絵 {} 件残っています ({}). 挿絵側ストア (S3) へ取り直す必要があります (Web UI の「更新」または narou update)",
-            leftovers.len(),
-            leftovers.join(", ")
+            "WARN: EPUB: 一覧でも直接確認でも見つからず、一次ストア (D1) に挿絵 {leftovers} 件残っています。挿絵側ストア (S3) へ取り直す必要があります (Web UI の「更新」または narou update)"
         )
     };
     let push = crate::push_hub::PushHubClient::new(env, crate::budget::SubrequestBudget::new());
@@ -982,18 +612,18 @@ async fn load_illustration_index(
     let bytes = match objects.read_small(&keys.illustration_cache()).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
-            narou_rs::application::debug::emit("EPUB: 挿絵索引 (.illustration_cache.yaml) がありません");
+            narou_rs::application::debug::emit_async("EPUB: 挿絵索引 (.illustration_cache.yaml) がありません").await;
             return None;
         }
         Err(error) => {
-            narou_rs::application::debug::emit_error(format!("挿絵索引を読めません: {error}"));
+            narou_rs::application::debug::emit_error_async(format!("挿絵索引を読めません: {error}")).await;
             return None;
         }
     };
     match serde_yaml::from_slice(&bytes) {
         Ok(index) => Some(index),
         Err(error) => {
-            narou_rs::application::debug::emit_error(format!("挿絵索引を解釈できません: {error}"));
+            narou_rs::application::debug::emit_error_async(format!("挿絵索引を解釈できません: {error}")).await;
             None
         }
     }
@@ -1095,82 +725,7 @@ fn epub_image_key<'a>(
     }
 }
 
-const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 
-
-/// 1 エントリずつ書き出しながら応答へ流すための状態。
-struct EpubStreamState {
-    writer: Option<narou_rs::epub_lite::EpubStreamWriter<narou_rs::epub_lite::ChunkSink>>,
-    sink: narou_rs::epub_lite::ChunkSink,
-    build: narou_rs::epub_lite::EpubBuild,
-    objects: std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
-    keys: narou_rs::platform::NovelObjectKeys,
-    illustration_sources: std::collections::BTreeMap<String, narou_rs::platform::ObjectKey>,
-    context: narou_rs::application::messages::MessageContext,
-    messages: std::sync::Arc<crate::push_hub::PushHubSink>,
-}
-
-impl EpubStreamState {
-    async fn next_chunk(&mut self) -> worker::Result<Option<Vec<u8>>> {
-        loop {
-            let Some(writer) = self.writer.as_ref() else {
-                return Ok(None);
-            };
-            let info = match writer.next_entry() {
-                Some(info) => info,
-                None => {
-                    let writer = self.writer.take().expect("writer is present");
-                    writer.finish().map_err(stream_error)?;
-                    let tail = self.sink.take();
-                    return Ok((!tail.is_empty()).then_some(tail));
-                }
-            };
-            let bytes = match info.asset_path.as_deref() {
-                Some(path) => {
-                    let image = self.build.image(path).ok_or_else(|| {
-                        stream_error(format!("unexpected EPUB asset path: {path}"))
-                    })?;
-                    let key = epub_image_key(&self.keys, &self.illustration_sources, &image.source).map_err(stream_error)?;
-                    let raw = self
-                        .objects
-                        .read_small(&key)
-                        .await
-                        .map_err(stream_error)?
-                        .ok_or_else(|| {
-                            narou_rs::application::debug::emit(format!(
-                                "EPUB: 挿絵が見つかりません: {key}"
-                            ));
-                            stream_error(format!("missing {}", image.source))
-                        })?;
-                    if raw.len() > MAX_IMAGE_BYTES as usize {
-                        return Err(stream_error(format!(
-                            "Illustration {} exceeds the {} MiB read limit",
-                            image.source,
-                            MAX_IMAGE_BYTES / 1024 / 1024
-                        )));
-                    }
-                    narou_rs::application::debug::emit(format!(
-                        "EPUB: 挿絵 {} を読み込み ({} bytes)",
-                        image.source,
-                        raw.len()
-                    ));
-                    Some(self.build.process_image(path, raw).map_err(stream_error)?)
-                }
-                None => None,
-            };
-            self.writer
-                .as_mut()
-                .expect("writer is present")
-                .write_current(bytes.as_deref())
-                .map_err(stream_error)?;
-            drop(bytes);
-            let chunk = self.sink.take();
-            if !chunk.is_empty() {
-                return Ok(Some(chunk));
-            }
-        }
-    }
-}
 
 /// 無認証で返す health 応答。認証の要否と設定状況を機械可読で載せる
 /// (CLI / Web UI / 監視が、トークン未設定とトークン不一致を区別できる)。

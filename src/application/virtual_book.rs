@@ -1,20 +1,40 @@
 //! Virtual-book listings, ordered inputs and collision-free member assets.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::application::convert::SectionStream;
+use sha2::{Digest, Sha256};
 
 use crate::db::NovelRecord;
-use crate::downloader::persistence::{PersistenceService, SectionLoadFailure};
-use crate::downloader::{SectionFile, TocFile};
+use crate::downloader::persistence::{PersistenceService, deserialize_section, deserialize_toc};
+use crate::downloader::TocFile;
 use crate::error::{NarouError, Result};
 use crate::illustration_store::{IllustrationIndex, is_remote_illustration_source};
 use crate::platform::{NovelFilter, NovelId, NovelObjectKeys, NovelQuery, NovelRepository, NovelSort, ObjectKey};
 use crate::virtual_novel::{AttributeComposition, VirtualNovelMembers};
 
+
 pub struct VirtualBook {
     pub toc: TocFile,
-    pub sections: Vec<SectionFile>,
+    /// Pull-driven, hash-pinned member references; no member body is retained.
+    pub sections: SectionStream,
     /// A book-local image name -> the original member's stored object.
     pub illustrations: BTreeMap<String, ObjectKey>,
+}
+
+struct SectionReference {
+    key: ObjectKey,
+    sha256: [u8; 32],
+    index: String,
+    href: String,
+    chapter: String,
+    aliases: Arc<BTreeMap<String, String>>,
+}
+
+struct TocReference {
+    key: ObjectKey,
+    sha256: [u8; 32],
 }
 
 /// Bound each result page instead of fetching each member separately.
@@ -134,58 +154,104 @@ pub async fn load(
     }
     let records = load_member_records(repository, members).await?;
     let mut subtitles = Vec::new();
-    let mut sections = Vec::new();
+    let mut references = Vec::new();
+    let mut tocs = Vec::new();
     let mut sources: BTreeMap<ObjectKey, String> = BTreeMap::new();
     for id in members {
         let member = &records[id];
         let keys = NovelObjectKeys::new(&member.sitename, &member.file_title, member.use_subdirectory)?;
-        let toc = persistence.load_toc(&keys).await?
-            .ok_or_else(|| NarouError::NotFound(keys.toc().to_string()))?;
-        let (loaded, index) = futures::join!(
-            persistence.load_sections_ordered(&keys, &toc.subtitles),
-            persistence.load_cache(&keys),
-        );
-        let loaded = match loaded {
-            Ok(sections) => sections,
-            Err(SectionLoadFailure::Missing { section_index }) => {
-                let subtitle = &toc.subtitles[section_index];
-                return Err(NarouError::NotFound(keys.section(&subtitle.index, &subtitle.file_subtitle).to_string()));
+        let toc_key = keys.toc();
+        let toc_bytes = persistence.objects().read_small(&toc_key).await?
+            .ok_or_else(|| NarouError::NotFound(toc_key.to_string()))?;
+        let toc = deserialize_toc(&toc_bytes)?;
+        tocs.push(TocReference { key: toc_key, sha256: Sha256::digest(&toc_bytes).into() });
+        drop(toc_bytes);
+        let image_index = persistence.load_cache(&keys).await?;
+        let mut aliases = BTreeMap::new();
+        let member_start = references.len();
+        for (position, mut subtitle) in toc.subtitles.into_iter().enumerate() {
+            let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+            let bytes = persistence.objects().read_small(&key).await?
+                .ok_or_else(|| NarouError::NotFound(key.to_string()))?;
+            let sha256 = Sha256::digest(&bytes).into();
+            let section = deserialize_section(&bytes)?;
+            if section.download_revision.max(1) != subtitle.download_revision.max(1)
+                || subtitle.download_time.as_ref().is_some_and(|time| section.download_time.as_ref() != Some(time))
+            {
+                return Err(NarouError::Conversion(format!("変換中に入力が更新されました: {key}")));
             }
-            Err(SectionLoadFailure::Read(error)) => return Err(error),
-        };
-        let index = index?;
-        for (position, (mut subtitle, mut section)) in toc.subtitles.into_iter().zip(loaded).enumerate() {
-            let sequence = (sections.len() + 1).to_string();
-            section.index.clone_from(&sequence);
-            section.href.clone_from(&subtitle.href);
-            section.chapter = if position == 0 { member.title.clone() } else { String::new() };
-            section.subchapter.clear();
-            subtitle.index = sequence;
-            subtitle.chapter.clone_from(&section.chapter);
-            subtitle.subchapter.clear();
-            for text in [&mut section.element.introduction, &mut section.element.body, &mut section.element.postscript] {
-                let (rewritten, _) = crate::illustration_refs::rewrite(std::mem::take(text), |reference| {
-                    let key = image_key(&keys, index.as_ref(), reference)?;
+            drop(bytes);
+            // This discovery pass retains only references. The output pass must
+            // read exactly these revisions, not whatever is current by then.
+            for text in [&section.element.introduction, &section.element.body, &section.element.postscript] {
+                for reference in crate::illustration_refs::collect(text) {
+                    let Some(key) = image_key(&keys, image_index.as_ref(), &reference) else { continue };
                     let ordinal = sources.len();
-                    match sources.entry(key) {
-                        std::collections::btree_map::Entry::Occupied(entry) => Some(entry.get().clone()),
+                    let alias = match sources.entry(key) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
                         std::collections::btree_map::Entry::Vacant(entry) => {
-                            let (_, extension) = entry.key().as_ref().rsplit_once('.')?;
+                            let Some((_, extension)) = entry.key().as_ref().rsplit_once('.') else { continue };
                             if !extension.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-                                return None;
+                                continue;
                             }
                             let alias = format!("挿絵/v{id}-{ordinal}.{extension}");
                             entry.insert(alias.clone());
-                            Some(alias)
+                            alias
                         }
-                    }
+                    };
+                    aliases.insert(reference, alias);
+                }
+            }
+            let sequence = (references.len() + 1).to_string();
+            subtitle.index.clone_from(&sequence);
+            subtitle.chapter = if position == 0 { member.title.clone() } else { String::new() };
+            subtitle.subchapter.clear();
+            references.push(SectionReference {
+                key,
+                sha256,
+                index: sequence,
+                href: subtitle.href.clone(),
+                chapter: subtitle.chapter.clone(),
+                aliases: Arc::default(),
+            });
+            subtitles.push(subtitle);
+        }
+        let aliases = Arc::new(aliases);
+        for reference in &mut references[member_start..] {
+            reference.aliases = aliases.clone();
+        }
+    }
+    let objects = persistence.objects().clone();
+    let sections = Box::pin(futures::stream::try_unfold(
+        (references.into_iter(), tocs, objects),
+        |(mut references, tocs, objects)| async move {
+            let Some(reference) = references.next() else {
+                // A changed table of contents invalidates the whole staged
+                // conversion; no partially old/new virtual book is published.
+                for toc in tocs {
+                    let bytes = objects.read_small(&toc.key).await?
+                        .ok_or_else(|| NarouError::NotFound(toc.key.to_string()))?;
+                    verify_revision(&toc.key, &bytes, &toc.sha256)?;
+                }
+                return Ok(None);
+            };
+            let bytes = objects.read_small(&reference.key).await?
+                .ok_or_else(|| NarouError::NotFound(reference.key.to_string()))?;
+            verify_revision(&reference.key, &bytes, &reference.sha256)?;
+            let mut section = deserialize_section(&bytes)?;
+            section.index = reference.index;
+            section.href = reference.href;
+            section.chapter = reference.chapter;
+            section.subchapter.clear();
+            for text in [&mut section.element.introduction, &mut section.element.body, &mut section.element.postscript] {
+                let (rewritten, _) = crate::illustration_refs::rewrite(std::mem::take(text), |value| {
+                    reference.aliases.get(value).cloned()
                 });
                 *text = rewritten;
             }
-            subtitles.push(subtitle);
-            sections.push(section);
-        }
-    }
+            Ok(Some((section, (references, tocs, objects))))
+        },
+    ));
     Ok(VirtualBook {
         toc: TocFile {
             title: record.title.clone(),
@@ -198,6 +264,14 @@ pub async fn load(
         sections,
         illustrations: sources.into_iter().map(|(key, name)| (name, key)).collect(),
     })
+}
+
+fn verify_revision(key: &ObjectKey, bytes: &[u8], expected: &[u8; 32]) -> Result<()> {
+    let actual: [u8; 32] = Sha256::digest(bytes).into();
+    if actual != *expected {
+        return Err(NarouError::Conversion(format!("変換中に入力が更新されました: {key}")));
+    }
+    Ok(())
 }
 
 fn image_key(keys: &NovelObjectKeys, index: Option<&IllustrationIndex>, reference: &str) -> Option<ObjectKey> {
@@ -266,5 +340,80 @@ mod tests {
         assert_eq!(list[0]["member_titles"], serde_json::json!(["Book 100", "", "Book 1"]));
         assert_eq!(list[0]["attribute_tag"], "漫画");
         assert_eq!(list[0]["attribute_editable"], false);
+    }
+
+    async fn save_member(store: &Arc<crate::platform::mocks::MemoryObjectStore>, member: &NovelRecord, text: &str) -> (NovelObjectKeys, TocFile) {
+        let keys = NovelObjectKeys::new(&member.sitename, &member.file_title, member.use_subdirectory).unwrap();
+        let subtitle = crate::downloader::SubtitleInfo {
+            index: "1".into(), href: format!("https://fixture.test/{}/1", member.id),
+            chapter: "old chapter".into(), subchapter: "old subchapter".into(),
+            subtitle: "episode".into(), file_subtitle: "episode".into(),
+            subdate: "2026-01-01".into(), subupdate: None, download_time: None, download_revision: 1,
+        };
+        let mut toc = TocFile {
+            title: member.title.clone(), author: member.author.clone(), toc_url: member.toc_url.clone(),
+            story: None, subtitles: vec![subtitle], novel_type: Some(1),
+        };
+        let persistence = PersistenceService::new(store.clone(), store.clone());
+        let element = crate::downloader::SectionElement {
+            data_type: "text".into(),
+            introduction: "member introduction".into(), body: text.into(), postscript: "member postscript".into(),
+        };
+        let time = persistence.save_section(&keys, &toc.subtitles[0], &element, 1).await.unwrap();
+        toc.subtitles[0].download_time = Some(time);
+        persistence.save_toc(&keys, &toc).await.unwrap();
+        (keys, toc)
+    }
+
+    #[test]
+    fn virtual_sections_replay_in_member_order_without_copying_member_bodies() {
+        use futures::StreamExt;
+        futures::executor::block_on(async {
+            let store = Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+            let one = record(1, "小説");
+            let two = record(2, "小説");
+            save_member(&store, &one, "first body").await;
+            save_member(&store, &two, "second body").await;
+            let repository = MemoryNovelRepository::from_records(vec![one, two]);
+            let persistence = PersistenceService::new(store.clone(), store);
+            let mut book = load(&record(9, "小説"), &[2, 1], &repository, &persistence).await.unwrap();
+            let first = book.sections.next().await.unwrap().unwrap();
+            assert_eq!((first.index.as_str(), first.chapter.as_str(), first.element.body.as_str()), ("1", "Book 2", "second body"));
+            assert_eq!(first.element.introduction, "member introduction");
+            assert_eq!(first.element.postscript, "member postscript");
+            assert!(first.subchapter.is_empty());
+            let second = book.sections.next().await.unwrap().unwrap();
+            assert_eq!((second.index.as_str(), second.chapter.as_str(), second.element.body.as_str()), ("2", "Book 1", "first body"));
+            assert!(book.sections.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn virtual_member_revision_change_is_an_error_not_mixed_content() {
+        use futures::StreamExt;
+        use crate::platform::ObjectStore;
+        futures::executor::block_on(async {
+            let store = Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+            let member = record(1, "小説");
+            let (keys, toc) = save_member(&store, &member, "original").await;
+            let repository = MemoryNovelRepository::from_records(vec![member]);
+            let persistence = PersistenceService::new(store.clone(), store.clone());
+            let mut book = load(&record(9, "小説"), &[1], &repository, &persistence).await.unwrap();
+            let key = keys.section("1", "episode");
+            let bytes = store.read_small(&key).await.unwrap().unwrap();
+            let mut section = deserialize_section(&bytes).unwrap();
+            // Even a writer that forgot to bump download_revision cannot cause
+            // a mixed response: the prepared reference pins actual content.
+            section.element.body = "replacement".into();
+            store.write_small(&key, crate::downloader::persistence::serialize_section(&section).unwrap().into_bytes()).await.unwrap();
+            assert!(book.sections.next().await.unwrap().is_err());
+
+            let mut book = load(&record(9, "小説"), &[1], &repository, &persistence).await.unwrap();
+            assert!(book.sections.next().await.unwrap().is_ok());
+            let mut changed_toc = toc;
+            changed_toc.title = "new generation".into();
+            persistence.save_toc(&keys, &changed_toc).await.unwrap();
+            assert!(book.sections.next().await.unwrap().is_err());
+        });
     }
 }

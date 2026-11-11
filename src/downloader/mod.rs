@@ -293,15 +293,15 @@ fn over18_access_decision(
     }
 }
 
-fn toc_title_for_type_inference(
+async fn toc_title_for_type_inference(
     setting: &SiteSetting,
     toc_source: &str,
     info: &NovelInfo,
 ) -> String {
-    info.title
-        .clone()
-        .or_else(|| setting.resolve_info_pattern("t", toc_source))
-        .unwrap_or_default()
+    match &info.title {
+        Some(title) => title.clone(),
+        None => setting.resolve_info_pattern("t", toc_source).await.unwrap_or_default(),
+    }
 }
 
 fn toc_subtitles_imply_series(
@@ -324,13 +324,13 @@ fn toc_subtitles_imply_series(
     })
 }
 
-fn resolve_novel_type(
+async fn resolve_novel_type(
     setting: &SiteSetting,
     toc_source: &str,
     url_captures: &HashMap<String, String>,
     info: &NovelInfo,
 ) -> (u8, bool) {
-    let title = toc_title_for_type_inference(setting, toc_source, info);
+    let title = toc_title_for_type_inference(setting, toc_source, info).await;
     let toc_implies_series = toc_subtitles_imply_series(setting, toc_source, url_captures, &title);
 
     if let Some(nt) = info.novel_type {
@@ -340,7 +340,7 @@ fn resolve_novel_type(
         return (nt, info.end.unwrap_or(false));
     }
 
-    if let Some(text) = setting.resolve_info_pattern("nt", toc_source) {
+    if let Some(text) = setting.resolve_info_pattern("nt", toc_source).await {
         let resolved = setting.get_novel_type_from_string(&text);
         if resolved.0 == 2 && toc_implies_series {
             return (1u8, false);
@@ -719,9 +719,9 @@ async fn verify_illustration_files(
             }
             Ok(None) => {}
             Err(error) => {
-                crate::application::debug::emit_error(format!(
+                crate::application::debug::emit_error_async(format!(
                     "挿絵: 実体の確認に失敗 ({error})"
-                ));
+                )).await;
                 return None;
             }
         }
@@ -928,7 +928,7 @@ impl Downloader {
             .await?;
 
         let (novel_type, inferred_is_end) =
-            resolve_novel_type(&setting, &toc_source, &url_captures, &info);
+            resolve_novel_type(&setting, &toc_source, &url_captures, &info).await;
         let is_end = Some(inferred_is_end);
 
         // Ruby: get_general_lastup / get_novelupdated_at fall back to subtitle dates
@@ -938,7 +938,7 @@ impl Downloader {
         if novelupdated_at.is_none() || general_lastup.is_none() {
             let site_timezone = setting.site_timezone();
             let subtitles = if novel_type == 2 {
-                create_short_story_subtitles(&setting, &toc_source, &info).ok()
+                create_short_story_subtitles(&setting, &toc_source, &info).await.ok()
             } else {
                 let title = info.title.as_deref().unwrap_or("");
                 parse_subtitles_multipage(toc::MultipageTocRequest {
@@ -1033,11 +1033,11 @@ impl Downloader {
                     }
                     crate::compat::DigestChoice::Backup => {
                         let backup_name = crate::compat::create_backup(novel_dir, novel_dir, title)?;
-                        self.report_line(&messages::download::backup_created(backup_name));
+                        self.report_line(&messages::download::backup_created(backup_name)).await;
                     }
                     crate::compat::DigestChoice::ShowStory => {
-                        self.report_line(messages::download::story_label());
-                        self.report_line(latest_story);
+                        self.report_line(messages::download::story_label()).await;
+                        self.report_line(latest_story).await;
                     }
                     crate::compat::DigestChoice::OpenBrowser => {
                         crate::compat::open_browser(toc_url);
@@ -1169,6 +1169,7 @@ impl Downloader {
         let raw_html = raw_html.filter(|_| setting.illust_from_raw.unwrap_or(true));
         for source in illustration_sources(section, raw_html) {
             for caps in re.captures_iter(source) {
+                messages::ready().await;
                 let Some(url_match) = caps.get(1) else {
                     continue;
                 };
@@ -1193,7 +1194,7 @@ impl Downloader {
                 );
                 let url = resolved.as_str();
                 if self.http.validate_url(url).await.is_err() {
-                    self.report_warn(&messages::download::warn_unsafe_illustration_url(url));
+                    self.report_warn(&messages::download::warn_unsafe_illustration_url(url)).await;
                     continue;
                 }
 
@@ -1216,14 +1217,14 @@ impl Downloader {
                         .map(|names| names.contains(&filename))
                         .unwrap_or(true);
                     if stored {
-                        crate::application::debug::emit(format!(
+                        crate::application::debug::emit_async(format!(
                             "挿絵: 取得済みのため再取得しません: {url}"
-                        ));
+                        )).await;
                         continue;
                     }
-                    crate::application::debug::emit(format!(
+                    crate::application::debug::emit_async(format!(
                         "挿絵: 索引にはありますが実体が無いので取り直します: 挿絵/{filename} ({url})"
-                    ));
+                    )).await;
                 }
                 // 保存済み画像は予算を消費せず読み飛ばし、未取得画像の直前で
                 // 中断する。索引は呼び出し元が保存し、同じ話の残りから再開する。
@@ -1236,7 +1237,7 @@ impl Downloader {
                     }
                 }
 
-                match crate::downloader::http_policy::fetch_bytes(
+                match crate::downloader::http_policy::fetch_stream(
                     self.http.as_ref(),
                     self.rate_limiter.as_ref(),
                     url,
@@ -1247,22 +1248,9 @@ impl Downloader {
                     Ok(response) => {
                         let content_type =
                             response.header("Content-Type").unwrap_or("").to_string();
-                        // Animated works arrive as a frame archive; the site
-                        // definition declares the frame timings on the URL.
-                        let (body, content_type) =
-                            match crate::illustration_animation::assemble_animation(
-                                url,
-                                &response.body,
-                            ) {
-                                Some(Ok(apng)) => (apng, "image/png".to_string()),
-                                Some(Err(err)) => {
-                                    self.report_warn(&messages::download::warn_animation_assemble(
-                                        url, err,
-                                    ));
-                                    (response.body.clone(), content_type)
-                                }
-                                None => (response.body.clone(), content_type),
-                            };
+                        // The storage service stages the input, validates all
+                        // frames before streaming APNG output, and publishes
+                        // the index only after the hashed object is complete.
                         let ext =
                             crate::illustration_store::illustration_extension_from_content_type(
                                 &content_type,
@@ -1271,21 +1259,20 @@ impl Downloader {
                                 crate::illustration_store::guessed_extension_from_url(url)
                             });
                         match storage
-                            .store_bytes(object_keys, illustration_store, url, &body, ext)
+                            .store_stream(object_keys, illustration_store, url, response.body, ext)
                             .await
                         {
                             Err(err) => {
-                                crate::application::debug::emit_error(format!(
+                                crate::application::debug::emit_error_async(format!(
                                     "挿絵の保存に失敗 ({url}): {err}"
-                                ));
-                                self.report_warn(&messages::download::warn_illustration_save(url, err));
+                                )).await;
+                                self.report_warn(&messages::download::warn_illustration_save(url, err)).await;
                             }
                             Ok(stored) => {
                                 let filename = stored.filename;
-                                crate::application::debug::emit(format!(
-                                    "挿絵を保存しました: {url} → 挿絵/{filename} ({} bytes)",
-                                    body.len()
-                                ));
+                                crate::application::debug::emit_async(format!(
+                                    "挿絵を保存しました: {url} → 挿絵/{filename}"
+                                )).await;
                                 if let Some(names) = stored_illustrations.as_deref_mut() {
                                     names.insert(filename);
                                 }
@@ -1293,10 +1280,10 @@ impl Downloader {
                         }
                     }
                     Err(err) => {
-                        crate::application::debug::emit_error(format!(
+                        crate::application::debug::emit_error_async(format!(
                             "挿絵の取得に失敗 ({url}): {err}"
-                        ));
-                        self.report_warn(&messages::download::warn_illustration_download(url, err));
+                        )).await;
+                        self.report_warn(&messages::download::warn_illustration_download(url, err)).await;
                     }
                 }
             }
@@ -1575,7 +1562,7 @@ impl Downloader {
             // ログイン壁だけ先に解消する。部分一覧の比較は全ページを読んでから行う。
             let groups = self.stored_groups_for(&setting).await;
             if !groups.is_empty() {
-                self.report_line(messages::download::login_retry());
+                self.report_line(messages::download::login_retry()).await;
                 let base_cookie = setting.cookie.clone();
                 let mut winner: Option<LoginGroup> = None;
                 for group in &groups {
@@ -1614,7 +1601,7 @@ impl Downloader {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
-                self.report_line(messages::download::novel_unavailable());
+                self.report_line(messages::download::novel_unavailable()).await;
                 #[cfg(feature = "native-runtime")]
                 {
                     let _ = crate::compat::mark_not_found_and_freeze(id);
@@ -1662,7 +1649,7 @@ impl Downloader {
             }
             Err(err) => return Err(err),
         };
-        let toc_preview_info = NovelInfo::from_toc_source(&setting, &toc_source);
+        let toc_preview_info = NovelInfo::from_toc_source(&setting, &toc_source).await;
         match over18_access_decision(
             &setting,
             &toc_source,
@@ -1722,13 +1709,13 @@ impl Downloader {
             None => None,
         };
 
-        let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
+        let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info).await;
 
         let toc::TocListing { mut subtitles, partial: mut partial_listing, tag_sources: mut page_tags } = if novel_type == 2 {
             toc::TocListing {
-                subtitles: create_short_story_subtitles(&setting, &toc_source, &info)?,
+                subtitles: create_short_story_subtitles(&setting, &toc_source, &info).await?,
                 partial: false,
-                tag_sources: setting.resolve_info_pattern("tags", &toc_source).into_iter().collect(),
+                tag_sources: setting.resolve_info_pattern("tags", &toc_source).await.into_iter().collect(),
             }
         } else {
             parse_subtitles_multipage(toc::MultipageTocRequest {
@@ -1750,7 +1737,7 @@ impl Downloader {
         if partial_listing || subtitles.is_empty() {
             let groups = self.stored_groups_for(&setting).await;
             if !groups.is_empty() {
-                self.report_line(messages::download::login_retry());
+                self.report_line(messages::download::login_retry()).await;
                 let active_cookie = setting.cookie.clone();
                 let active_cookie_hosts = setting.login_cookie_hosts.clone();
                 let base_cookie = configured_cookie.clone();
@@ -1831,7 +1818,7 @@ impl Downloader {
         let title = crate::title::project_title(&raw_title, strip_title_prefix);
         let use_subdirectory = self.download_use_subdirectory(existing_record.as_ref());
         let ncode = self
-            .extract_ncode(&setting, &toc_source)
+            .extract_ncode(&setting, &toc_source).await
             .or_else(|| url_captures.get("ncode").cloned());
         let file_title = self.compute_file_title(
             &ncode,
@@ -1912,7 +1899,7 @@ impl Downloader {
                     messages::download::partial_listing_preserved()
                 } else {
                     messages::download::no_accessible_sections()
-                });
+                }).await;
                 return Ok(DownloadResult {
                     id: provisional_id,
                     title: old_title.unwrap_or(title),
@@ -1930,7 +1917,7 @@ impl Downloader {
                     sections_deleted: false,
                 });
             }
-            self.report_warn(&messages::download::partial_listing(accessible_section_count));
+            self.report_warn(&messages::download::partial_listing(accessible_section_count)).await;
         }
 
         #[cfg(feature = "native-runtime")]
@@ -1994,10 +1981,10 @@ impl Downloader {
         if setting.illust_grep_pattern.is_none() {
             // 既定パターンは本文の `<img>` 全部に当たるため、セクションごとでは
             // なく小説 1 件につき 1 行だけ出す (24 話で 24 行出していた)。
-            crate::application::debug::emit(format!(
+            crate::application::debug::emit_async(format!(
                 "挿絵: サイト定義に illust_grep_pattern が無いので既定の <img> パターンで取得します ({})",
                 setting.domain
-            ));
+            )).await;
         }
         // 索引が空なら突き合わせる相手が無いので一覧は取らない (小説 1 件に
         // つき 1〜2 サブリクエスト増えるため、必要なときだけ)。
@@ -2014,12 +2001,12 @@ impl Downloader {
                 }
             };
             if crate::application::debug::enabled() {
-                crate::application::debug::emit(format!(
+                crate::application::debug::emit_async(format!(
                     "挿絵: 保存済み {} 件 / 索引 {} 件 ({})",
                     names.as_ref().map(|names| names.len()).unwrap_or(0),
                     illustration_store.source_count(),
                     object_keys.prefix().as_ref(),
-                ));
+                )).await;
             }
             names
         } else {
@@ -2066,25 +2053,6 @@ impl Downloader {
         }
         let checkpointed_subtitles = checkpointed_subtitles.map(|(_, subtitles)| subtitles).unwrap_or_default();
         let restored_count = checkpointed_subtitles.len();
-        // Old checkpoints and periodic checkpoints ahead of the metadata file
-        // still recover their bodies and illustration mappings once.
-        let resumed = match self
-            .persistence
-            .load_sections_ordered(&object_keys, &subtitles[restored_count..resume_from])
-            .await
-        {
-            Ok(sections) => sections,
-            Err(SectionLoadFailure::Missing { section_index }) => {
-                let section_index = restored_count + section_index;
-                return Err(NarouError::DownloadResumeCorrupt(format!(
-                    "persisted section {section_index} ({}) is missing",
-                    subtitles[section_index].index
-                )));
-            }
-            Err(SectionLoadFailure::Read(error)) => return Err(error),
-        };
-        let mut resumed_sections: HashMap<usize, SectionFile> =
-            resumed.into_iter().enumerate().map(|(index, section)| (restored_count + index, section)).collect();
         let mut checkpointed_subtitles = checkpointed_subtitles.into_iter();
 
         struct SectionPlan {
@@ -2094,7 +2062,8 @@ impl Downloader {
             /// name). Drives the cache move without a second read.
             existed: bool,
             predownloaded: Option<(SectionElement, String)>,
-            resumed: Option<SectionFile>,
+            /// Restore this body lazily when its execution turn is reached.
+            resumed: bool,
             checkpointed: Option<SubtitleInfo>,
             preserved: bool,
         }
@@ -2104,9 +2073,10 @@ impl Downloader {
         let mut new_arrival_subtitles = Vec::new();
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
         let strong_update = self.settings.local_setting_bool("update.strong");
-        // Budgeted strong-update comparisons must fetch only after the
-        // per-section yield check. Unbudgeted CLI runs retain exact pre-counts.
-        let defer_strong_update = strong_update && budget.is_some();
+        // Budgeted comparisons and legacy-prefix recovery fetch only in
+        // execution order. A corrupt resumed prefix must fail before fetching
+        // any tail section, including an unbudgeted strong-update comparison.
+        let defer_strong_update = strong_update && (budget.is_some() || restored_count < resume_from);
         let site_timezone = setting.site_timezone();
         let save_diff_snapshots = self.settings.save_diff_snapshots();
         let mut cache_dir: Option<String> = None;
@@ -2121,17 +2091,11 @@ impl Downloader {
         for (section_index, subtitle) in subtitles.iter().enumerate() {
             let preserved = preserved_indices.contains(subtitle.index.as_str());
             let checkpointed = checkpointed_subtitles.next();
-            let resumed = match resumed_sections.remove(&section_index) {
-                Some(section) => Some(section),
-                None if preserved && checkpointed.is_none() => Some(self.persistence.load_section(&object_keys, subtitle)
-                    .await?.ok_or_else(|| NarouError::Platform(format!(
-                        "preserved section {} is missing from storage", subtitle.index,
-                    )))?),
-                None => None,
-            };
+            let resumed = (restored_count..resume_from).contains(&section_index)
+                || (preserved && checkpointed.is_none());
             let is_new_arrival = !old_subtitles.contains_key(&subtitle.index);
             let existed = existing_sections.contains(&subtitle.index);
-            let (needs_download, predownloaded) = if checkpointed.is_some() || resumed.is_some() {
+            let (needs_download, predownloaded) = if checkpointed.is_some() || resumed {
                 (false, None)
             } else if force {
                 (true, None)
@@ -2164,15 +2128,24 @@ impl Downloader {
         }
 
         if let Some(ref p) = self.progress {
-            p.set_position(0);
-            p.set_length(download_count as u64);
-            p.set_message(&format!("DL {}", title));
+            p.set_position_async(0).await;
+            p.set_length_async(download_count as u64).await;
+            p.set_message_async(&format!("DL {}", title)).await;
         }
 
         let mut last_chapter = String::new();
         let mut last_subchapter = String::new();
         let mut started_download = false;
         let mut downloaded_index = 0usize;
+
+        // Resumed plans retain no bodies. Consume the ordered bounded reader
+        // directly, without collecting the prefix before section execution.
+        use futures::StreamExt as _;
+        let resume_persistence = self.persistence.clone();
+        let resumed_sections = resume_persistence.stream_sections_ordered(
+            &object_keys, &subtitles[restored_count..resume_from],
+        );
+        futures::pin_mut!(resumed_sections);
 
         let section_result: Result<()> = async {
             for (section_index, (subtitle, mut plan)) in subtitles.iter().zip(section_plans).enumerate() {
@@ -2184,7 +2157,30 @@ impl Downloader {
                         });
                     }
                 }
-                if defer_strong_update && !force && plan.resumed.is_none() && plan.needs_download {
+                let resumed = if (restored_count..resume_from).contains(&section_index) {
+                    match resumed_sections.next().await {
+                        Some(Ok(section)) => Some(section),
+                        Some(Err(SectionLoadFailure::Missing { section_index })) => {
+                            let section_index = restored_count + section_index;
+                            return Err(NarouError::DownloadResumeCorrupt(format!(
+                                "persisted section {section_index} ({}) is missing",
+                                subtitles[section_index].index,
+                            )));
+                        }
+                        Some(Err(SectionLoadFailure::Read(error))) => return Err(error),
+                        None => return Err(NarouError::DownloadResumeCorrupt(format!(
+                            "persisted section {section_index} ({}) is missing", subtitle.index,
+                        ))),
+                    }
+                } else if plan.resumed {
+                    Some(self.persistence.load_section(&object_keys, subtitle)
+                        .await?.ok_or_else(|| NarouError::Platform(format!(
+                            "preserved section {} is missing from storage", subtitle.index,
+                        )))?)
+                } else {
+                    None
+                };
+                if defer_strong_update && !force && !plan.resumed && plan.needs_download {
                     let (needs_download, predownloaded) = self
                         .section_needs_download(SectionDecision {
                             setting: &setting,
@@ -2203,13 +2199,13 @@ impl Downloader {
                     if !needs_download {
                         download_count -= 1;
                         if let Some(ref p) = self.progress {
-                            p.set_length(download_count as u64);
+                            p.set_length_async(download_count as u64).await;
                         }
                     }
                 }
                 let is_new_arrival = plan.is_new_arrival;
                 let needs_download = plan.needs_download;
-                let resumed_was_tracked = plan.resumed.is_some() || plan.checkpointed.is_some();
+                let resumed_was_tracked = plan.resumed || plan.checkpointed.is_some();
                 // 中断された実行を再開したセクションは、前回の索引保存前に実行が
                 // 終わっている可能性がある (挿絵の実体だけが残り、対応表が無い
                 // 状態)。再開したセクションは取得を省く分だけ挿絵の登録も
@@ -2218,8 +2214,7 @@ impl Downloader {
                 // 索引が残っている通常の更新では `download_illustration` が
                 // 取得済みと判断して何もしない。
                 if !plan.preserved && (resumed_was_tracked || (!needs_download && plan.predownloaded.is_some())) {
-                    let section = plan
-                        .resumed
+                    let section = resumed
                         .as_ref()
                         .map(|resumed| &resumed.element)
                         .or_else(|| plan.predownloaded.as_ref().map(|(section, _)| section));
@@ -2243,31 +2238,31 @@ impl Downloader {
                 let previous_revision = previous.map_or(1, |old| old.download_revision.max(1));
                 let (download_time, download_revision) = if let Some(checkpointed) = plan.checkpointed {
                     (checkpointed.download_time, checkpointed.download_revision)
-                } else if let Some(resumed) = plan.resumed {
+                } else if let Some(resumed) = resumed {
                     (resumed.download_time, resumed.download_revision)
                 } else if needs_download {
                     if !started_download {
                         self.report_line(&colorize(
                             &messages::download::download_started(display_id, &title),
                             "green",
-                        ));
+                        )).await;
                         started_download = true;
                     }
                     if let Some(ref p) = self.progress {
-                        p.set_message(&format!(
+                        p.set_message_async(&format!(
                             "DL {} [{}/{}]",
                             title,
                             downloaded_index + 1,
                             download_count
-                        ));
+                        )).await;
                     }
 
                     if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
-                        self.report_line(&subtitle.chapter);
+                        self.report_line(&subtitle.chapter).await;
                         last_chapter = subtitle.chapter.clone();
                     }
                     if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
-                        self.report_line(&subtitle.subchapter);
+                        self.report_line(&subtitle.subchapter).await;
                         last_subchapter = subtitle.subchapter.clone();
                     }
 
@@ -2405,9 +2400,9 @@ impl Downloader {
                             line.push_str(" (更新あり)");
                         }
                     }
-                    self.report_line(&line);
+                    self.report_line(&line).await;
                     if let Some(ref p) = self.progress {
-                        p.inc(1);
+                        p.inc_async(1).await;
                     }
                 }
             }
@@ -2424,7 +2419,7 @@ impl Downloader {
         let cache_saved = cache_result.is_ok();
         if let Err(error) = cache_result {
             if section_result.is_err() {
-                self.report_warn(&messages::indented_error(&error));
+                self.report_warn(&messages::indented_error(&error)).await;
             } else {
                 return Err(error);
             }
@@ -2443,12 +2438,12 @@ impl Downloader {
         }
 
         if let Some(ref p) = self.progress {
-            p.finish_with_message(&format!(
+            p.finish_with_message_async(&format!(
                 "DL {} done ({}/{})",
                 title,
                 updated_count,
                 subtitles.len()
-            ));
+            )).await;
         }
 
         let db_title = existing_record
@@ -2946,14 +2941,17 @@ impl Downloader {
         }
     }
 
-    fn extract_ncode(&self, setting: &SiteSetting, toc_source: &str) -> Option<String> {
+    async fn extract_ncode(&self, setting: &SiteSetting, toc_source: &str) -> Option<String> {
         let url_pattern = {
             let re = regex::Regex::new(r"(?i)[/?](n\d+[a-z]+)").ok()?;
             re.captures(&setting.toc_url())
                 .and_then(|c| c.get(1))
                 .map(|m| m.as_str().to_lowercase())
         };
-        url_pattern.or_else(|| setting.resolve_info_pattern("ncode", toc_source))
+        match url_pattern {
+            Some(value) => Some(value),
+            None => setting.resolve_info_pattern("ncode", toc_source).await,
+        }
     }
 
     fn compute_file_title(
@@ -3063,8 +3061,10 @@ impl Downloader {
     }
 
     /// Close the current operation before a job's console sender is drained.
-    pub fn clear_progress(&mut self) {
-        self.progress = None;
+    pub async fn clear_progress(&mut self) {
+        if let Some(progress) = self.progress.take() {
+            progress.finish_with_message_async("").await;
+        }
     }
 
     /// ユーザーに見える行の送り先を差し替える。native のコマンドは
@@ -3081,19 +3081,19 @@ impl Downloader {
     }
 
     /// `println!` (stdout 行) 相当の送出。
-    fn report_line(&self, line: &str) {
+    async fn report_line(&self, line: &str) {
         use crate::application::messages::Stream;
         match &self.message_sink {
-            Some(sink) => sink.emit(Stream::Stdout, line),
+            Some(sink) => sink.emit_async(Stream::Stdout, line).await,
             None => default_report_line(line),
         }
     }
 
     /// `eprintln!` (stderr 行) 相当の送出。
-    fn report_warn(&self, line: &str) {
+    async fn report_warn(&self, line: &str) {
         use crate::application::messages::Stream;
         match &self.message_sink {
-            Some(sink) => sink.emit(Stream::Stderr, line),
+            Some(sink) => sink.emit_async(Stream::Stderr, line).await,
             None => default_report_warn(line),
         }
     }
@@ -3277,6 +3277,10 @@ mod tests {
             key: &'a ObjectKey,
         ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
             AssetStore::read_stream(&self.inner, key)
+        }
+
+        fn read_range<'a>(&'a self, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+            AssetStore::read_range(&self.inner, key, range)
         }
 
         fn write_stream<'a>(
@@ -4389,7 +4393,7 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
             }
         }
         assert!(completed, "the novel must complete across bounded invocations");
-        let persistence = PersistenceService::new(inner.clone(), inner);
+        let persistence = PersistenceService::new(inner.clone(), inner.clone());
         let toc = persistence.load_toc(&keys).await.unwrap().unwrap();
         assert_eq!(toc.subtitles.len(), 32);
         for subtitle in &toc.subtitles {
@@ -4399,6 +4403,46 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
             let section_url = format!("{target}{}/", subtitle.index);
             assert_eq!(http.requested_urls().iter().filter(|url| url.ends_with(&section_url)).count(), 1);
         }
+
+        // A legacy checkpoint has no compact metadata. Recovery must begin
+        // processing its first body before reading the entire stored prefix.
+        // Stopping at its first image also drops the bounded prefetch window.
+        struct StopAtFirstImage {
+            reads: Arc<AtomicUsize>,
+            checked: bool,
+        }
+        impl SectionBudget for StopAtFirstImage {
+            fn should_yield(&mut self, section_index: usize) -> bool {
+                assert_eq!(section_index, 0);
+                assert!(self.reads.load(Ordering::SeqCst) <= 4,
+                    "resume must not collect all eight prefix bodies before processing one");
+                self.checked = true;
+                true
+            }
+        }
+        let first = &toc.subtitles[0];
+        let mut section = persistence.load_section(&keys, first).await.unwrap().unwrap();
+        section.element.body.push_str(r#"<img src="https://example.com/resume-image.png">"#);
+        inner.write_small(
+            &keys.section(&first.index, &first.file_subtitle),
+            serde_yaml::to_string(&section).unwrap().into_bytes(),
+        ).await.unwrap();
+        requests.store(0, Ordering::SeqCst);
+        let mut stop = StopAtFirstImage { reads: requests.clone(), checked: false };
+        let mut downloader = Downloader::with_platform_and_storage_and_settings(
+            DownloaderPlatform {
+                http: http.clone(), rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: novels.clone(), objects: objects.clone(), assets: inner.clone(),
+                clock: Arc::new(SystemClock),
+            },
+            vec![setting], HashMap::new(),
+        ).unwrap();
+        let stopped = downloader.download_novel_with_execution_options(target, DownloadExecutionOptions {
+            force: false, budget: Some(&mut stop), resume_from_section: Some(8),
+        }).await.unwrap_err();
+        assert!(stop.checked, "the first restored body must reach illustration recovery");
+        assert!(matches!(stopped, crate::error::NarouError::DownloadBudgetExpired { next_section_index: 0 }));
+        assert!(requests.load(Ordering::SeqCst) <= 4, "canceling recovery stops further source reads");
     }
 
     #[tokio::test]
@@ -5553,7 +5597,7 @@ is_narou: false
             sitename: None,
             raw_captures: raw_captures.clone(),
         };
-        let subtitles = super::toc::create_short_story_subtitles(setting, "", &info).unwrap();
+        let subtitles = futures::executor::block_on(super::toc::create_short_story_subtitles(setting, "", &info)).unwrap();
         assert_eq!(subtitles[0].subdate, "2024-01-02 03:04");
         assert_eq!(subtitles[0].subupdate.as_deref(), Some("2024-01-05 06:07"));
 
@@ -5562,7 +5606,7 @@ is_narou: false
             raw_captures,
             ..info
         };
-        let subtitles = super::toc::create_short_story_subtitles(setting, "", &info).unwrap();
+        let subtitles = futures::executor::block_on(super::toc::create_short_story_subtitles(setting, "", &info)).unwrap();
         assert_eq!(subtitles[0].subupdate.as_deref(), Some("2024-01-02 03:04"));
     }
 
@@ -5637,7 +5681,7 @@ is_narou: false
         assert!(html.contains("introduction::intro<br>body"));
         assert!(html.contains("tag::tag-a"));
         assert!(html.contains("tag::tag-b"));
-        let tags = setting.resolve_info_pattern("tags", &html).unwrap();
+        let tags = futures::executor::block_on(setting.resolve_info_pattern("tags", &html)).unwrap();
         assert_eq!(super::sanitize_site_tags(&tags), vec!["tag-a", "tag-b"]);
         assert!(html.contains("Chapter;1;10;第一章"));
         assert!(!html.contains("Chapter;1;10;;第一章"));
@@ -6113,7 +6157,7 @@ is_narou: false
         let mut url_captures = HashMap::new();
         url_captures.insert("work_id".to_string(), "29204764".to_string());
         let (novel_type, _) =
-            super::resolve_novel_type(setting, &html, &url_captures, &pixiv_info(&html));
+            futures::executor::block_on(super::resolve_novel_type(setting, &html, &url_captures, &pixiv_info(&html)));
         assert_eq!(novel_type, 2);
 
         // 本文は Aozora へ渡せる HTML へ変換される (素の改行は to_aozora が落とす)
@@ -6298,7 +6342,7 @@ is_narou: false
     }
 
     fn pixiv_info(html: &str) -> super::novel_info::NovelInfo {
-        super::novel_info::NovelInfo::from_novel_info_source(pixiv_setting(), html)
+        futures::executor::block_on(super::novel_info::NovelInfo::from_novel_info_source(pixiv_setting(), html))
     }
 
     fn setting_body(html: &str) -> String {
@@ -6354,7 +6398,7 @@ is_narou: false
 
         let html = "<h1 class=\"p-infotop-title\">\n<a href=\"/n7534il/\">テスト小説タイトル</a>\n</h1>\n<dt class=\"p-infotop-data__title\">掲載サイト</dt>\n<dd class=\"p-infotop-data__value\">ノクターンノベルズ(夜の恋愛)</dd>\n<dt class=\"p-infotop-data__title\">作者名</dt>\n<dd class=\"p-infotop-data__value\"><a href=\"/mypage/top/view/id/12345/\">テスト作者</a></dd>";
 
-        let info = NovelInfo::from_novel_info_source(setting, html);
+        let info = futures::executor::block_on(NovelInfo::from_novel_info_source(setting, html));
 
         assert_eq!(info.title.as_deref(), Some("テスト小説タイトル"));
         assert_eq!(info.author.as_deref(), Some("テスト作者"));
@@ -6373,7 +6417,7 @@ is_narou: false
 <tr><td class="label">最新投稿</td><td>2026年04月17日(金) 07:00</td><td class="label">総文字数</td><td>3,666,651文字</td></tr>
 "#;
 
-        let info = NovelInfo::from_novel_info_source(setting, html);
+        let info = futures::executor::block_on(NovelInfo::from_novel_info_source(setting, html));
 
         assert_eq!(
             info.title.as_deref(),
@@ -6409,7 +6453,7 @@ is_narou: false
 <tr><td class="label">掲載開始</td><td>2020年08月01日(土) 00:33</td></tr>
 "#;
 
-        let tags = setting.resolve_info_pattern("tags", html).unwrap();
+        let tags = futures::executor::block_on(setting.resolve_info_pattern("tags", html)).unwrap();
 
         assert_eq!(
             super::sanitize_site_tags(&tags),
@@ -6441,10 +6485,8 @@ is_narou: false
 <div class="ss">本文に含めてはいけないあらすじ</div>
 "##;
 
-        let short_story_tags = setting
-            .resolve_info_pattern("tags", short_story_html)
-            .unwrap();
-        let series_tags = setting.resolve_info_pattern("tags", series_html).unwrap();
+        let short_story_tags = futures::executor::block_on(setting.resolve_info_pattern("tags", short_story_html)).unwrap();
+        let series_tags = futures::executor::block_on(setting.resolve_info_pattern("tags", series_html)).unwrap();
 
         assert_eq!(
             super::sanitize_site_tags(&short_story_tags),
@@ -6526,7 +6568,7 @@ is_narou: false
 </div>
 "#;
 
-        let info = NovelInfo::from_toc_source(setting, html);
+        let info = futures::executor::block_on(NovelInfo::from_toc_source(setting, html));
 
         assert_eq!(
             info.title.as_deref(),
@@ -6579,7 +6621,7 @@ is_narou: false
             raw_captures: HashMap::new(),
         };
 
-        let (novel_type, is_end) = resolve_novel_type(setting, toc_source, &HashMap::new(), &info);
+        let (novel_type, is_end) = futures::executor::block_on(resolve_novel_type(setting, toc_source, &HashMap::new(), &info));
 
         assert_eq!(novel_type, 1);
         assert!(!is_end);
@@ -6609,7 +6651,7 @@ is_narou: false
             raw_captures: HashMap::new(),
         };
 
-        let (novel_type, is_end) = resolve_novel_type(setting, toc_source, &HashMap::new(), &info);
+        let (novel_type, is_end) = futures::executor::block_on(resolve_novel_type(setting, toc_source, &HashMap::new(), &info));
 
         assert_eq!(novel_type, 2);
         assert!(!is_end);
@@ -6645,7 +6687,7 @@ is_narou: false
 </html>
 "#;
 
-        let info = NovelInfo::from_toc_source(setting, html);
+        let info = futures::executor::block_on(NovelInfo::from_toc_source(setting, html));
 
         assert_eq!(
             info.title.as_deref(),

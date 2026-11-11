@@ -25,12 +25,11 @@ use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, cons
 
 use crate::budget::SubrequestBudget;
 
-/// 1 レスポンスの上限。
-///
-/// Workers の 128 MiB 予算のうち、取得したバイト列に許す枠。実データのうごイラは
-/// zip 4.3 MiB (19 フレーム 1920×1080) で、挿絵も数 MB なので 16 MiB で足りる。
-/// 大きいのは「入力」ではなく APNG の出力側で、そちらは
-/// `illustration_animation` の上限 (40 MiB) で別に制限している。
+#[path = "http_stream.rs"]
+mod streaming;
+
+/// Bound for intentionally buffered HTML/JSON and multipart request parts.
+/// `send_stream` does not impose this incidental cap on binary assets.
 pub const MAX_WORKER_HTTP_BODY: usize = 16 * 1024 * 1024;
 
 
@@ -364,6 +363,18 @@ impl HttpClient for WorkerHttpClient {
 
     fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
         self.send_inner(request, None)
+    }
+
+    fn send_stream<'a>(
+        &'a self, request: HttpRequest,
+    ) -> PlatformFuture<'a, Result<narou_rs::platform::http::HttpStreamResponse>> {
+        self.send_stream_inner(request, None)
+    }
+
+    fn send_stream_paced<'a>(
+        &'a self, request: HttpRequest, pacing: narou_rs::platform::http::HttpPacing<'a>,
+    ) -> PlatformFuture<'a, Result<narou_rs::platform::http::HttpStreamResponse>> {
+        self.send_stream_inner(request, Some(pacing))
     }
 
     fn send_paced<'a>(

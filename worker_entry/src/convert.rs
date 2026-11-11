@@ -69,14 +69,13 @@ pub async fn execute_convert(
     };
 
     let push_sink = PushHubSink::shared(push.clone(), console_target(runtime).await);
-    let report = narou_rs::application::messages::MessageContext::new(
+    let report = push_sink.run(narou_rs::application::messages::MessageContext::new(
         push_sink.clone(), crate::consumer::webui_debug_mode(runtime).await,
     ).scope(async {
         emit_convert_item_lines(push_sink.as_ref(), &job.target.as_str(), target.0, || {
             convert(runtime, target)
         }).await
-    }).await;
-    push_sink.drain().await;
+    })).await;
 
     match report {
         ConvertItemReport::Converted { .. } => {
@@ -148,7 +147,7 @@ async fn convert(
         let book = crate::virtual_novels::load_book(
             runtime.write_db(), &record, runtime.novels.as_ref(), &persistence,
         ).await?;
-        service.convert_prepared(&record, book.toc, book.sections, keep_text).await?
+        service.convert_source(&record, book.toc, book.sections, keep_text).await?
     } else if keep_text {
         service.convert_and_store(&record).await?
     } else {

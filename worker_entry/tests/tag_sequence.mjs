@@ -186,15 +186,24 @@ function archiveFor(tocUrl, tag, index, stamp) {
 }
 
 async function importArchive(zip) {
-  const response = await request('/api/transfer/import', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/zip', ...auth() },
-    body: zip,
-  });
-  const body = await json(response);
-  assert.equal(response.status, 200, `import failed: ${JSON.stringify(body)}`);
-  assert.equal(body.success, true, `import failed: ${JSON.stringify(body)}`);
-  return body;
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    const response = await request('/api/transfer/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/zip', ...auth() },
+      body: zip,
+    });
+    const body = await json(response);
+    if (response.status === 503 && body.error === 'memory_capacity' && Date.now() < deadline) {
+      const delay = Number(response.headers.get('Retry-After'));
+      assert.ok(Number.isFinite(delay) && delay > 0 && delay <= 10, 'capacity response must give a bounded retry delay');
+      await new Promise(resolve => setTimeout(resolve, delay * 1000));
+      continue;
+    }
+    assert.equal(response.status, 200, `import failed: ${JSON.stringify(body)}`);
+    assert.equal(body.success, true, `import failed: ${JSON.stringify(body)}`);
+    return body;
+  }
 }
 
 async function tagList() {

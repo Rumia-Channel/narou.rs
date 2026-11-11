@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 narou_rs = { path = "..", default-features = false, features = ["worker-runtime"] }
 wasm-bindgen = "0.2"
-serde_json = "1"
-serde = { version = "1", features = ["derive"] }
-base64 = "0.23"
+futures = "0.3.34"
+js-sys = "0.3.107"
+wasm-bindgen-futures = "0.4.80"
 

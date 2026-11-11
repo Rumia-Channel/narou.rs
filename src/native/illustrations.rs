@@ -419,6 +419,10 @@ mod tests {
             AssetStore::stat(self.store, key)
         }
 
+        fn read_range<'a>(&'a self, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+            AssetStore::read_range(self.store, key, range)
+        }
+
         fn read_stream<'a>(
             &'a self,
             key: &'a ObjectKey,

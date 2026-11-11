@@ -442,15 +442,15 @@ impl D1FreezeStore {
 /// isolate ごとの凍結 ID キャッシュ。一覧の描画や検索のたびに読んでいた
 /// ため (1 回 = D1 往復 1 回)、書き込み側 (`set_frozen`) で即時無効化し、
 /// 他の isolate は TTL で追従する。
-static FROZEN_IDS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<HashSet<i64>>> =
-    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+static FROZEN_IDS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<Arc<HashSet<i64>>>> =
+    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0, 256 * 1024, |ids| ids.capacity() * 24));
 
 impl FreezeStore for D1FreezeStore {
     fn frozen_ids<'a>(&'a self) -> PlatformFuture<'a, Result<HashSet<i64>>> {
         let fresh_reads = self.fresh_reads;
         Box::pin(async move {
             if !fresh_reads && let Some(cached) = FROZEN_IDS_CACHE.get("frozen") {
-                return Ok(cached);
+                return Ok((*cached).clone());
             }
             let rows: Vec<IdRow> = self
                 .db
@@ -461,7 +461,7 @@ impl FreezeStore for D1FreezeStore {
                 .results()
                 .map_err(worker_error)?;
             let ids: HashSet<i64> = rows.into_iter().map(|row| row.id).collect();
-            FROZEN_IDS_CACHE.put("frozen", ids.clone());
+            FROZEN_IDS_CACHE.put("frozen", Arc::new(ids.clone()));
             Ok(ids)
         })
     }
@@ -509,10 +509,26 @@ impl FreezeMutationStore for D1FreezeStore {
 /// isolate は TTL で追従する。
 static SETTINGS_CACHE: std::sync::LazyLock<
     crate::isolate_cache::TtlMap<std::sync::Arc<HashMap<String, YamlValue>>>,
-> = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+> = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0, 512 * 1024, |values| {
+    values.capacity() * (std::mem::size_of::<(String, YamlValue)>() + 16)
+        + values.iter().map(|(key, value)| key.capacity() + yaml_heap_bytes(value)).sum::<usize>()
+}));
 const GLOBAL_REPLACE_SCOPE: &str = "global_replace";
 const GLOBAL_REPLACE_KEY: &str = "replace.txt";
 const TAG_COLORS_CACHE_KEY: &str = "inv/tag_colors";
+
+fn yaml_heap_bytes(value: &YamlValue) -> usize {
+    match value {
+        YamlValue::String(value) => value.capacity(),
+        YamlValue::Sequence(values) => values.capacity() * std::mem::size_of::<YamlValue>()
+            + values.iter().map(yaml_heap_bytes).sum::<usize>(),
+        YamlValue::Mapping(values) => values.len() * (std::mem::size_of::<(YamlValue, YamlValue)>() + 64)
+            + values.iter().map(|(key, value)| yaml_heap_bytes(key) + yaml_heap_bytes(value)).sum::<usize>(),
+        YamlValue::Tagged(value) => std::mem::size_of_val(value.as_ref())
+            + value.tag.to_string().len() + yaml_heap_bytes(&value.value),
+        _ => 0,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct D1SettingsStore {
@@ -725,22 +741,22 @@ impl D1TagColorStore {
 }
 
 /// isolate ごとのタグ色キャッシュ (`TagColorStore::load` 参照)。
-static TAG_COLORS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<TagColors>> =
-    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+static TAG_COLORS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<Arc<TagColors>>> =
+    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0, 256 * 1024, |colors| colors.heap_bytes()));
 
 impl TagColorStore for D1TagColorStore {
     fn load<'a>(&'a self) -> PlatformFuture<'a, Result<TagColors>> {
         Box::pin(async move {
             if let Some(cached) = TAG_COLORS_CACHE.get(TAG_COLORS_CACHE_KEY) {
-                return Ok(cached);
+                return Ok((*cached).clone());
             }
             let colors = Self::current_rows(&self.db).await?.colors()?;
             // A primary update may have populated the cache while this
             // read-only replica request was in flight.
             if let Some(cached) = TAG_COLORS_CACHE.get(TAG_COLORS_CACHE_KEY) {
-                return Ok(cached);
+                return Ok((*cached).clone());
             }
-            TAG_COLORS_CACHE.put(TAG_COLORS_CACHE_KEY, colors.clone());
+            TAG_COLORS_CACHE.put(TAG_COLORS_CACHE_KEY, Arc::new(colors.clone()));
             Ok(colors)
         })
     }
@@ -775,7 +791,7 @@ impl TagColorStore for D1TagColorStore {
                 })?;
                 if !cas_result.results::<JsonValue>().map_err(worker_error)?.is_empty() {
                     TAG_COLORS_CACHE.invalidate(TAG_COLORS_CACHE_KEY);
-                    TAG_COLORS_CACHE.put(TAG_COLORS_CACHE_KEY, colors.clone());
+                    TAG_COLORS_CACHE.put(TAG_COLORS_CACHE_KEY, Arc::new(colors.clone()));
                     return Ok(colors);
                 }
             }

@@ -6,7 +6,7 @@
 //! normalization, deduplication, and validation. It deliberately contains
 //! no queue, process, or async-execution APIs — the queue layer consumes
 //! [`JobPlan`] values and does the actual work. The one exception is
-//! [`emit_download_result_lines`]: the per-novel console report both the
+//! [`download_result_line`]: the per-novel console report both the
 //! native commands and the worker executor must print identically, so the
 //! wording dispatch lives here next to [`JobKind`].
 
@@ -16,7 +16,7 @@ use std::time::Duration;
 use chrono::DateTime;
 
 use crate::application::error::ApplicationError;
-use crate::application::messages::{self, MessageSink, Stream};
+use crate::application::messages;
 use crate::downloader::{DownloadResult, UpdateStatus};
 use crate::error::NarouError;
 use crate::platform::{NovelId, PlatformFuture};
@@ -215,6 +215,10 @@ pub mod worker_ledger {
         pub binds: Vec<String>,
     }
 
+    /// Lost deliveries/executions may recover three times without progress.
+    /// This is deliberately independent of provider/business retry attempts.
+    pub const MAX_RECOVERY_ATTEMPTS: u32 = 3;
+
     /// Claim due work under both per-novel exclusion and optional canonical-site
     /// exclusion. `site_key` is resolved from effective YAML, never an input host.
     pub fn claim_fresh(
@@ -242,7 +246,7 @@ pub mod worker_ledger {
                  SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ?, \
                      site_key = NULLIF(?, ''), normalized_target = ?, admission_waiting = 0 \
                  WHERE job_id = ? AND status IN ('pending', 'retryable') \
-                   AND (lease_until IS NULL OR lease_until <= ?)\
+                   AND (lease_until IS NULL OR lease_until <= ?) AND recovery_attempts <= {MAX_RECOVERY_ATTEMPTS} \
                  {clause}"
             ),
             binds,
@@ -273,9 +277,10 @@ pub mod worker_ledger {
             sql: format!(
                 "UPDATE worker_jobs \
                  SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ?, \
-                     site_key = NULLIF(?, ''), normalized_target = ?, admission_waiting = 0 \
+                     site_key = NULLIF(?, ''), normalized_target = ?, admission_waiting = 0, \
+                     recovery_attempts = recovery_attempts + 1 \
                  WHERE job_id = ? AND status = 'running' \
-                   AND (lease_until IS NULL OR lease_until <= ?)\
+                   AND (lease_until IS NULL OR lease_until <= ?) AND recovery_attempts < {MAX_RECOVERY_ATTEMPTS} \
                  {clause}"
             ),
             binds,
@@ -296,13 +301,33 @@ pub mod worker_ledger {
     pub fn select_stuck(stuck_before: &str, limit: usize) -> Statement {
         Statement {
             sql: format!(
-                "SELECT job_id, status, attempts, last_error, kind FROM worker_jobs \
+                "SELECT job_id, status, attempts, recovery_attempts, last_error, kind FROM worker_jobs \
                  WHERE status IN ('pending', 'running', 'retryable') AND admission_waiting = 0 \
                    AND COALESCE(lease_until, updated_at) <= ? \
                  ORDER BY COALESCE(lease_until, updated_at) ASC, job_id ASC \
                  LIMIT {limit}"
             ),
             binds: vec![stuck_before.to_string()],
+        }
+    }
+
+    /// Keyset pages remain bounded while earlier rows are cancelled or retired.
+    pub fn select_running(after: &str, before: &str) -> Statement {
+        Statement {
+            sql: "SELECT job_id FROM worker_jobs \
+                  WHERE status = 'running' AND job_id > ? AND created_at <= ? \
+                  ORDER BY job_id LIMIT 50".to_string(),
+            binds: vec![after.to_string(), before.to_string()],
+        }
+    }
+
+    pub fn select_stale_running(after: &str, before: &str) -> Statement {
+        Statement {
+            sql: "SELECT job_id, kind FROM worker_jobs \
+                  WHERE status = 'running' AND job_id > ? AND created_at <= ? \
+                    AND (lease_until IS NULL OR lease_until <= ?) \
+                  ORDER BY job_id LIMIT 50".to_string(),
+            binds: vec![after.to_string(), before.to_string(), before.to_string()],
         }
     }
 
@@ -314,7 +339,7 @@ pub mod worker_ledger {
         Statement {
             sql: "UPDATE worker_jobs SET updated_at = ?, lease_until = ?, \
                       status = CASE WHEN status = 'running' THEN 'pending' ELSE status END, \
-                      execution_token = NULL \
+                      execution_token = NULL, recovery_attempts = recovery_attempts + 1 \
                   WHERE job_id = ? \
                     AND status IN ('pending', 'running', 'retryable') \
                     AND COALESCE(lease_until, updated_at) <= ?"
@@ -347,8 +372,9 @@ pub mod worker_ledger {
             sql: format!(
                 "UPDATE worker_jobs \
                  SET status = 'permanent', last_error = ?, updated_at = ?, \
-                     lease_until = NULL, execution_token = NULL, checkpoint_json = NULL \
-                 WHERE job_id = ? AND status = 'retryable' AND attempts > {max_retries} \
+                     lease_until = NULL, execution_token = NULL, checkpoint_json = NULL, admission_waiting = 0 \
+                 WHERE job_id = ? AND status IN ('pending', 'running', 'retryable') \
+                   AND ((status = 'retryable' AND attempts > {max_retries}) OR recovery_attempts >= {MAX_RECOVERY_ATTEMPTS}) \
                    AND COALESCE(lease_until, updated_at) <= ?"
             ),
             binds: vec![
@@ -366,7 +392,8 @@ pub mod worker_ledger {
         Statement {
             sql: "UPDATE worker_jobs \
                   SET status = 'pending', site_key = NULLIF(?, ''), normalized_target = ?, admission_waiting = 1, \
-                      updated_at = ?, lease_until = NULL, execution_token = NULL \
+                      updated_at = ?, lease_until = NULL, execution_token = NULL, \
+                      recovery_attempts = recovery_attempts + CASE WHEN status = 'running' THEN 1 ELSE 0 END \
                   WHERE job_id = ? AND admission_waiting = 0 \
                     AND ((status IN ('pending', 'retryable') AND (lease_until IS NULL OR lease_until <= ?)) \
                          OR (status = 'running' AND (lease_until IS NULL OR lease_until <= ?)))"
@@ -376,22 +403,81 @@ pub mod worker_ledger {
         }
     }
 
-    /// Atomically publish a resumable checkpoint and retire the old token.
-    pub fn yield_execution(now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str) -> Statement {
+    /// Isolate capacity has no relationship to business failures or site leases.
+    pub fn park_capacity(now: &str, job_id: &str) -> Statement {
         Statement {
-            sql: "UPDATE worker_jobs \
-                  SET status = 'pending', last_error = NULL, checkpoint_json = ?, \
-                      updated_at = ?, lease_until = NULL, execution_token = NULL, admission_waiting = 0 \
-                  WHERE job_id = ? AND status = 'running' AND execution_token = ?"
-                .to_string(),
+            sql: "UPDATE worker_jobs SET admission_waiting = 1, updated_at = ? \
+                  WHERE job_id = ? AND status IN ('pending', 'retryable')".to_string(),
+            binds: vec![now.to_string(), job_id.to_string()],
+        }
+    }
+
+    /// Publish the durable high watermark and retire the old execution token.
+    pub fn yield_execution(now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str) -> Statement {
+        checkpoint_statement(now, job_id, execution_token, checkpoint_json, true)
+    }
+
+    /// Publish the same high watermark without releasing execution ownership.
+    pub fn save_checkpoint(now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str) -> Statement {
+        checkpoint_statement(now, job_id, execution_token, checkpoint_json, false)
+    }
+
+    fn checkpoint_statement(
+        now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str, release: bool,
+    ) -> Statement {
+        // The checkpoint itself is the high watermark: replay cannot replace it
+        // with a lower cursor and then earn a fresh recovery budget by catching up.
+        // A job id identifies one generation; a new token is not a new generation.
+        // Resolving an unknown novel id is allowed, but changing a known target is
+        // not. Fetching/persisting share the same section coordinate, so changing
+        // phase/metadata alone is not progress; finishing is a one-way advance.
+        let release = if release {
+            "status = 'pending', last_error = NULL, lease_until = NULL, \
+             execution_token = NULL, admission_waiting = 0,"
+        } else { "" };
+        Statement {
+            sql: format!(
+                "WITH positions AS ( \
+                   SELECT checkpoint_json IS NULL AS initial, \
+                     json_extract(checkpoint_json, '$.job_id') AS old_job, \
+                     json_extract(checkpoint_json, '$.novel_id') AS old_novel, \
+                     json_extract(checkpoint_json, '$.phase') AS old_phase, \
+                     json_extract(checkpoint_json, '$.next_section_index') AS old_cursor, \
+                     json_extract(?1, '$.job_id') AS new_job, \
+                     json_extract(?1, '$.novel_id') AS new_novel, \
+                     json_extract(?1, '$.phase') AS new_phase, \
+                     json_extract(?1, '$.next_section_index') AS new_cursor \
+                   FROM worker_jobs WHERE job_id = ?3 AND status = 'running' AND execution_token = ?4 \
+                 ), compatible AS ( \
+                   SELECT *, new_job = ?3 \
+                     AND (new_novel IS NULL OR typeof(new_novel) = 'integer') \
+                     AND ((new_phase IN ('planned', 'finished') AND new_cursor IS NULL) \
+                       OR (new_phase IN ('fetching', 'persisting', 'finished') \
+                         AND typeof(new_cursor) = 'integer' AND new_cursor >= 0)) \
+                     AND (initial OR (old_job = ?3 \
+                       AND (old_novel IS NULL OR old_novel IS new_novel) \
+                       AND ((old_phase = 'planned' AND old_cursor IS NULL) \
+                         OR (old_phase IN ('fetching', 'persisting') \
+                           AND typeof(old_cursor) = 'integer' AND old_cursor >= 0)))) AS valid \
+                   FROM positions \
+                 ), progress AS MATERIALIZED ( \
+                   SELECT valid AND initial AS initialize, valid AND (new_phase = 'finished' \
+                     OR (new_phase IN ('fetching', 'persisting') \
+                       AND new_cursor > COALESCE(old_cursor, 0))) AS advanced FROM compatible \
+                 ) UPDATE worker_jobs SET {release} \
+                   recovery_attempts = CASE WHEN (SELECT advanced FROM progress) THEN 0 ELSE recovery_attempts END, \
+                   checkpoint_json = CASE WHEN (SELECT initialize OR advanced FROM progress) THEN ?1 ELSE checkpoint_json END, \
+                   updated_at = ?2 \
+                 WHERE job_id = ?3 AND status = 'running' AND execution_token = ?4"
+            ),
             binds: vec![checkpoint_json.to_string(), now.to_string(), job_id.to_string(), execution_token.to_string()],
         }
     }
 
     // Cancelled invocations cannot be killed by the queue API. Their token and
     // lease continue excluding successors until the invocation drains or expires.
-    const OWNER: &str = "(other.status = 'running' OR (other.status = 'permanent' \
-        AND other.execution_token IS NOT NULL AND other.lease_until > ?))";
+    const OWNER: &str = "(other.lease_until > ? AND (other.status = 'running' \
+        OR (other.status = 'permanent' AND other.execution_token IS NOT NULL)))";
 
     fn novel_id_expression(target: &str) -> String {
         format!("CASE WHEN {target} = CAST(CAST({target} AS INTEGER) AS TEXT) \
@@ -435,12 +521,15 @@ pub mod worker_ledger {
     }
 
     /// One waker reserves the delivery; send failure is recovered by select_stuck.
+    /// Clear only a due hold, so the reaper grants this dispatch a fresh grace
+    /// period without shortening backoff or overwriting a concurrent claim.
     pub fn mark_waiting_dispatched(now: &str, job_id: &str) -> Statement {
         Statement {
-            sql: "UPDATE worker_jobs SET admission_waiting = 0, updated_at = ? \
-                  WHERE job_id = ? AND admission_waiting = 1 AND status IN ('pending', 'retryable')"
+            sql: "UPDATE worker_jobs SET admission_waiting = 0, updated_at = ?, lease_until = NULL \
+                  WHERE job_id = ? AND admission_waiting = 1 AND status IN ('pending', 'retryable') \
+                    AND (lease_until IS NULL OR lease_until <= ?)"
                 .to_string(),
-            binds: vec![now.to_string(), job_id.to_string()],
+            binds: vec![now.to_string(), job_id.to_string(), now.to_string()],
         }
     }
 
@@ -821,96 +910,38 @@ pub fn classify_failure(error: &NarouError) -> JobFailureClass {
 /// レコードから引き直すので、呼び出し側で同じ解決を済ませて渡す。
 /// `Download` やタイトルが空にならない呼び出しでは `None` でよい
 /// (`result.title` が使われる)。
-pub fn emit_download_result_lines(
-    sink: &dyn MessageSink,
+pub fn download_result_line(
     kind: JobKind,
     result: &DownloadResult,
     canceled_title: Option<&str>,
-) {
+) -> Option<String> {
     match result.status {
+        UpdateStatus::Ok if result.new_novel => Some(messages::dl_completed_new(&result.title, result.id, result.total_count)),
+        UpdateStatus::Ok if kind == JobKind::Update => {
+            if result.sections_deleted { Some(messages::update::sections_deleted(result.id, &result.title)) }
+            else if result.updated_count > 0 { Some(messages::update::update_completed(&result.title)) }
+            else if result.title_changed { Some(messages::update::title_changed(result.id, &result.title)) }
+            else if result.story_changed { Some(messages::update::story_changed(result.id, &result.title)) }
+            else if result.author_changed { Some(messages::update::author_changed(result.id, &result.title)) }
+            else { None }
+        }
         UpdateStatus::Ok => {
-            if result.new_novel {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::dl_completed_new(&result.title, result.id, result.total_count),
-                );
-            } else {
-                match kind {
-                    JobKind::Update => {
-                        if result.sections_deleted {
-                            sink.emit(
-                                Stream::Stdout,
-                                &messages::update::sections_deleted(result.id, &result.title),
-                            );
-                        } else if result.updated_count > 0 {
-                            sink.emit(
-                                Stream::Stdout,
-                                &messages::update::update_completed(&result.title),
-                            );
-                        } else if result.title_changed {
-                            sink.emit(
-                                Stream::Stdout,
-                                &messages::update::title_changed(result.id, &result.title),
-                            );
-                        } else if result.story_changed {
-                            sink.emit(
-                                Stream::Stdout,
-                                &messages::update::story_changed(result.id, &result.title),
-                            );
-                        } else if result.author_changed {
-                            sink.emit(
-                                Stream::Stdout,
-                                &messages::update::author_changed(result.id, &result.title),
-                            );
-                        }
-                    }
-                    _ => {
-                        if result.updated_count > 0 {
-                            sink.emit(
-                                Stream::Stdout,
-                                &messages::download::update_completed(
-                                    &result.title,
-                                    result.id,
-                                    result.updated_count,
-                                    result.total_count,
-                                ),
-                            );
-                        } else if result.title_changed {
-                            sink.emit(
-                                Stream::Stdout,
-                                &messages::download::title_changed(result.id, &result.title),
-                            );
-                        } else if result.story_changed {
-                            sink.emit(
-                                Stream::Stdout,
-                                &messages::download::story_changed(result.id, &result.title),
-                            );
-                        } else if result.author_changed {
-                            sink.emit(
-                                Stream::Stdout,
-                                &messages::download::author_changed(result.id, &result.title),
-                            );
-                        }
-                    }
-                }
-            }
+            if result.updated_count > 0 {
+                Some(messages::download::update_completed(&result.title, result.id, result.updated_count, result.total_count))
+            } else if result.title_changed { Some(messages::download::title_changed(result.id, &result.title)) }
+            else if result.story_changed { Some(messages::download::story_changed(result.id, &result.title)) }
+            else if result.author_changed { Some(messages::download::author_changed(result.id, &result.title)) }
+            else { None }
         }
-        UpdateStatus::None => {
-            sink.emit(Stream::Stdout, &messages::no_update(&result.title));
-        }
+        UpdateStatus::None => Some(messages::no_update(&result.title)),
         UpdateStatus::Canceled => {
-            let title = if result.title.is_empty() {
-                canceled_title.unwrap_or_default()
-            } else {
-                result.title.as_str()
-            };
-            let line = match kind {
+            let title = if result.title.is_empty() { canceled_title.unwrap_or_default() } else { &result.title };
+            Some(match kind {
                 JobKind::Update => messages::update::update_canceled(result.id, title),
                 _ => messages::download::update_canceled(result.id, title),
-            };
-            sink.emit(Stream::Stdout, &line);
+            })
         }
-        UpdateStatus::Failed => {}
+        UpdateStatus::Failed => None,
     }
 }
 
@@ -1427,135 +1458,6 @@ mod tests {
         assert!(result.invalid.is_empty());
     }
 
-    /// `emit_download_result_lines` が native の `print_download_status`
-    /// (`narou download`) / `print_status_messages` (`narou update`) と同じ
-    /// 行を同じ順序で出すことを固定する。文言そのもののテストは
-    /// `messages` 側にあり、ここでは分岐・順序・ストリームだけを見る。
-    struct Lines(parking_lot::Mutex<Vec<(Stream, String)>>);
-
-    impl Lines {
-        fn new() -> Self {
-            Self(parking_lot::Mutex::new(Vec::new()))
-        }
-        fn emitted(&self) -> Vec<(Stream, String)> {
-            self.0.lock().clone()
-        }
-    }
-
-    impl MessageSink for Lines {
-        fn emit(&self, stream: Stream, text: &str) {
-            self.0.lock().push((stream, text.to_string()));
-        }
-    }
-
-    fn download_result(status: UpdateStatus) -> DownloadResult {
-        DownloadResult {
-            id: 42,
-            title: "タイトル".into(),
-            author: "作者".into(),
-            novel_dir: std::path::PathBuf::new(),
-            new_novel: false,
-            new_arrivals: false,
-            new_arrival_subtitles: Vec::new(),
-            updated_count: 0,
-            total_count: 10,
-            status,
-            title_changed: false,
-            author_changed: false,
-            story_changed: false,
-            sections_deleted: false,
-        }
-    }
-
-    #[test]
-    fn emit_download_result_lines_matches_command_wording() {
-        // `narou update` の完了行は件数を出さない。
-        let mut result = download_result(UpdateStatus::Ok);
-        result.updated_count = 2;
-        let sink = Lines::new();
-        emit_download_result_lines(&sink, JobKind::Update, &result, None);
-        assert_eq!(
-            sink.emitted(),
-            [(Stream::Stdout, "タイトル の更新が完了しました".to_string())]
-        );
-
-        // `narou download` の完了行は更新件数を出す。
-        let sink = Lines::new();
-        emit_download_result_lines(&sink, JobKind::Download, &result, None);
-        assert_eq!(
-            sink.emitted(),
-            [(
-                Stream::Stdout,
-                "タイトル の更新完了 (ID:42, 2/10話更新)".to_string()
-            )]
-        );
-
-        // `sections_deleted` は update だけが報告する (download は
-        // updated_count > 0 のまま完了行を出す)。
-        result.sections_deleted = true;
-        let sink = Lines::new();
-        emit_download_result_lines(&sink, JobKind::Update, &result, None);
-        assert_eq!(
-            sink.emitted(),
-            [(
-                Stream::Stdout,
-                "ID:42　タイトル は一部の話が削除されています".to_string()
-            )]
-        );
-        let sink = Lines::new();
-        emit_download_result_lines(&sink, JobKind::Download, &result, None);
-        assert_eq!(
-            sink.emitted(),
-            [(
-                Stream::Stdout,
-                "タイトル の更新完了 (ID:42, 2/10話更新)".to_string()
-            )]
-        );
-
-        // キャンセル行も両コマンドで区切りが違う (update=全角 / download=半角)。
-        // update は title が空のとき呼び出し側が解決したタイトルを使う。
-        result = download_result(UpdateStatus::Canceled);
-        result.title.clear();
-        let sink = Lines::new();
-        emit_download_result_lines(&sink, JobKind::Update, &result, Some("復帰タイトル"));
-        assert_eq!(
-            sink.emitted(),
-            [(
-                Stream::Stdout,
-                "ID:42　復帰タイトル の更新はキャンセルされました".to_string()
-            )]
-        );
-        result.title = "タイトル".into();
-        let sink = Lines::new();
-        emit_download_result_lines(&sink, JobKind::Download, &result, None);
-        assert_eq!(
-            sink.emitted(),
-            [(
-                Stream::Stdout,
-                "ID:42 タイトル の更新はキャンセルされました".to_string()
-            )]
-        );
-
-        // Failed (downloader が novel_unavailable を済ませる) と新規 DL は
-        // どちらも kind に依らない。
-        let result = download_result(UpdateStatus::Failed);
-        let sink = Lines::new();
-        emit_download_result_lines(&sink, JobKind::Update, &result, None);
-        assert!(sink.emitted().is_empty());
-
-        let mut result = download_result(UpdateStatus::Ok);
-        result.new_novel = true;
-        result.total_count = 3;
-        let sink = Lines::new();
-        emit_download_result_lines(&sink, JobKind::Update, &result, None);
-        assert_eq!(
-            sink.emitted(),
-            [(
-                Stream::Stdout,
-                "タイトル のDL完了 (ID:42, 3セクション)".to_string()
-            )]
-        );
-    }
     #[test]
     fn plan_normalizes_ncodes_and_deduplicates_case_insensitively() {
         let result = service().plan(&JobRequest {
@@ -2127,6 +2029,8 @@ mod tests {
     #[cfg(feature = "native-runtime")]
     mod claim_sql {
         use super::super::worker_ledger::{self, Statement, claim_fresh, claim_reclaim};
+        use super::super::{ExecutionPhase, JobId, WorkerExecutionCheckpoint};
+        use crate::platform::NovelId;
         use rusqlite::Connection;
 
         fn db() -> Connection {
@@ -2140,6 +2044,7 @@ mod tests {
                     status TEXT NOT NULL DEFAULT 'pending',
                     dedupe_key TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    recovery_attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -2596,14 +2501,13 @@ mod tests {
             insert(&conn, "old", "42", "running", Some("2026-01-01T00:01:00Z"));
             conn.execute("UPDATE worker_jobs SET execution_token = 'old-token', checkpoint_json = 'saved', attempts = 2 WHERE job_id = 'old'", []).unwrap();
             insert(&conn, "new", "99", "pending", None);
-            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "new-token", "new", "99", Some("other.example"))), 0);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "new-token", "new", "99", Some("other.example"))), 1);
             assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(NOW, "old", "2026-01-01T00:08:00Z")), 1);
             let saved: (String, i64, String, Option<String>) = conn.query_row(
                 "SELECT status, attempts, checkpoint_json, execution_token FROM worker_jobs WHERE job_id = 'old'",
                 [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             ).unwrap();
             assert_eq!(saved, ("pending".into(), 2, "saved".into(), None));
-            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "new-token", "new", "99", Some("other.example"))), 1);
         }
 
         #[test]
@@ -2627,6 +2531,261 @@ mod tests {
                 ).unwrap();
                 assert_eq!(saved, ("pending".into(), 2, encoded, None, None));
             }
+        }
+
+        fn checkpoint_json(job_id: &str, novel_id: Option<i64>, phase: ExecutionPhase, cursor: Option<u64>) -> String {
+            serde_json::to_string(
+                &WorkerExecutionCheckpoint::planned(JobId(job_id.into()), novel_id.map(NovelId))
+                    .advance(phase, cursor),
+            ).unwrap()
+        }
+
+        fn recovery_checkpoint(conn: &Connection, job_id: &str) -> (u32, Option<String>) {
+            conn.query_row(
+                "SELECT recovery_attempts, checkpoint_json FROM worker_jobs WHERE job_id = ?",
+                [job_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        }
+
+        fn stuck(conn: &Connection, before: &str) -> Vec<String> {
+            let statement = worker_ledger::select_stuck(before, 50);
+            conn.prepare(&statement.sql).unwrap()
+                .query_map(rusqlite::params_from_iter(statement.binds.iter()), |row| row.get(0))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        }
+
+        #[test]
+        fn checkpoint_replay_keeps_high_watermark_until_real_progress() {
+            for release in [false, true] {
+                let publish = if release { worker_ledger::yield_execution } else { worker_ledger::save_checkpoint };
+                let conn = db();
+                insert(&conn, "replay", "42", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "replay", "42", None)), 1);
+                let watermark = checkpoint_json("replay", Some(42), ExecutionPhase::Fetching, Some(200));
+                assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "replay", "token", &watermark)), 1);
+                conn.execute("UPDATE worker_jobs SET attempts = 2, recovery_attempts = 2 WHERE job_id = 'replay'", []).unwrap();
+                for cursor in [100, 200, 0, 199, 200, 201] {
+                    let encoded = checkpoint_json("replay", Some(42), ExecutionPhase::Fetching, Some(cursor));
+                    assert_eq!(apply(&conn, publish(NOW, "replay", "stale-token", &encoded)), 0);
+                    assert_eq!(recovery_checkpoint(&conn, "replay"), (2, Some(watermark.clone())));
+                    assert_eq!(apply(&conn, publish(NOW, "replay", "token", &encoded)), 1);
+                    let expected = if cursor > 200 { (0, Some(encoded)) } else { (2, Some(watermark.clone())) };
+                    assert_eq!(recovery_checkpoint(&conn, "replay"), expected);
+                    let ownership: (i64, Option<String>, Option<String>) = conn.query_row(
+                        "SELECT attempts, execution_token, lease_until FROM worker_jobs WHERE job_id = 'replay'",
+                        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    ).unwrap();
+                    if release {
+                        assert_eq!(status_of(&conn, "replay"), "pending");
+                        assert_eq!(ownership, (2, None, None));
+                        assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "replay", "42", None)), 1);
+                    } else {
+                        assert_eq!(status_of(&conn, "replay"), "running");
+                        assert_eq!(ownership, (2, Some("token".into()), Some(LEASE.into())));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn checkpoint_identity_shape_and_phase_changes_do_not_launder_recovery() {
+            for release in [false, true] {
+                let publish = if release { worker_ledger::yield_execution } else { worker_ledger::save_checkpoint };
+                let conn = db();
+                insert(&conn, "progress", "42", "pending", None);
+                conn.execute("UPDATE worker_jobs SET recovery_attempts = 2", []).unwrap();
+                let planned = checkpoint_json("progress", None, ExecutionPhase::Planned, None);
+                let unresolved = checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(200));
+                let resolved = checkpoint_json("progress", Some(42), ExecutionPhase::Fetching, Some(201));
+                let persisted = checkpoint_json("progress", Some(42), ExecutionPhase::Persisting, Some(202));
+                let finished = checkpoint_json("progress", Some(42), ExecutionPhase::Finished, None);
+                let mut metadata: serde_json::Value = serde_json::from_str(&unresolved).unwrap();
+                metadata["novel_id"] = serde_json::json!(42);
+                metadata["phase"] = serde_json::json!("persisting");
+                metadata["annotation"] = serde_json::json!("changed without new durable sections");
+                let malformed_cursor = r#"{"job_id":"progress","novel_id":null,"phase":"fetching","next_section_index":"300"}"#;
+                let unknown_shape = r#"{"job_id":"progress","novel_id":null,"phase":"other","next_section_index":300}"#;
+                let cases = [
+                    (planned.clone(), false, planned.clone()),
+                    (checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(0)), false, planned.clone()),
+                    (unresolved.clone(), true, unresolved.clone()),
+                    (serde_json::to_string_pretty(&metadata).unwrap(), false, unresolved.clone()),
+                    (checkpoint_json("other-generation", None, ExecutionPhase::Fetching, Some(300)), false, unresolved.clone()),
+                    (malformed_cursor.into(), false, unresolved.clone()),
+                    (unknown_shape.into(), false, unresolved.clone()),
+                    (planned, false, unresolved),
+                    (resolved.clone(), true, resolved.clone()),
+                    (checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(300)), false, resolved.clone()),
+                    (checkpoint_json("progress", Some(99), ExecutionPhase::Fetching, Some(300)), false, resolved),
+                    (persisted.clone(), true, persisted),
+                    (finished.clone(), true, finished.clone()),
+                    (checkpoint_json("progress", Some(42), ExecutionPhase::Fetching, Some(300)), false, finished.clone()),
+                    (finished.clone(), false, finished),
+                ];
+                for (encoded, advances, expected) in cases {
+                    if status_of(&conn, "progress") == "pending" {
+                        assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "progress", "42", None)), 1);
+                    }
+                    conn.execute("UPDATE worker_jobs SET recovery_attempts = 2", []).unwrap();
+                    assert_eq!(apply(&conn, publish(NOW, "progress", "token", &encoded)), 1);
+                    assert_eq!(recovery_checkpoint(&conn, "progress"),
+                        (if advances { 0 } else { 2 }, Some(expected)), "release={release}, checkpoint={encoded}");
+                }
+            }
+        }
+
+        #[test]
+        fn repeated_crashes_after_replay_exhaust_recovery_and_release_family() {
+            let conn = db();
+            let expired = "2026-01-01T00:01:00Z";
+            insert(&conn, "crash", "42", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+            let watermark = checkpoint_json("crash", Some(42), ExecutionPhase::Fetching, Some(200));
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "crash", "token", &watermark)), 1);
+            insert(&conn, "successor", "99", "pending", None);
+            assert_eq!(apply(&conn, worker_ledger::park_admission(NOW, "successor", "99", Some("shared.example"))), 1);
+            for recovery in 0..=worker_ledger::MAX_RECOVERY_ATTEMPTS {
+                assert!(waiting(&conn).is_empty(), "the live owner still excludes its family");
+                // A fresh WorkerBudget replays both periodic boundaries before
+                // crashing at the same durable section, even after a budget yield.
+                for cursor in [100, 200] {
+                    let replay = checkpoint_json("crash", Some(42), ExecutionPhase::Fetching, Some(cursor));
+                    assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "crash", "token", &replay)), 1);
+                    assert_eq!(recovery_checkpoint(&conn, "crash"), (recovery, Some(watermark.clone())));
+                }
+                let replay = checkpoint_json("crash", Some(42), ExecutionPhase::Fetching, Some(100));
+                assert_eq!(apply(&conn, worker_ledger::yield_execution(NOW, "crash", "token", &replay)), 1);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+                assert_eq!(recovery_checkpoint(&conn, "crash"), (recovery, Some(watermark.clone())));
+                conn.execute("UPDATE worker_jobs SET lease_until = ? WHERE job_id = 'crash'", [expired]).unwrap();
+                let exhausted = recovery == worker_ledger::MAX_RECOVERY_ATTEMPTS;
+                assert_eq!(apply(&conn, worker_ledger::finalize_stuck("crashed", NOW, "crash", NOW, 0)), usize::from(exhausted));
+                if exhausted { break; }
+                if recovery % 2 == 0 {
+                    assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(NOW, "crash", NOW)), 1);
+                    assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+                } else {
+                    assert_eq!(apply(&conn, claim_reclaim(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+                }
+                assert_eq!(recovery_checkpoint(&conn, "crash"), (recovery + 1, Some(watermark.clone())));
+            }
+            assert_eq!(status_of(&conn, "crash"), "permanent");
+            assert_eq!(recovery_checkpoint(&conn, "crash"), (worker_ledger::MAX_RECOVERY_ATTEMPTS, None));
+            let attempts: i64 = conn.query_row("SELECT attempts FROM worker_jobs WHERE job_id = 'crash'", [], |row| row.get(0)).unwrap();
+            assert_eq!(attempts, 0);
+            assert_eq!(waiting(&conn), vec!["successor"]);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "successor")), 1);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "successor-token", "successor", "99", Some("shared.example"))), 1);
+            assert_eq!(recovery_checkpoint(&conn, "successor"), (0, None));
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "late-token", "crash", "42", Some("shared.example"))), 0);
+        }
+
+        #[test]
+        fn capacity_redispatch_replaces_expired_hold_with_dispatch_grace() {
+            for status in ["pending", "retryable"] {
+                let conn = db();
+                insert(&conn, "capacity", "42", status, Some("2026-01-01T00:01:00Z"));
+                conn.execute("UPDATE worker_jobs SET attempts = 2, recovery_attempts = 3", []).unwrap();
+                assert_eq!(apply(&conn, worker_ledger::park_capacity(NOW, "capacity")), 1);
+                assert_eq!(waiting(&conn), vec!["capacity"]);
+                assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "capacity")), 1);
+                assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "capacity")), 0);
+                let state: (i64, i64, Option<String>, String) = conn.query_row(
+                    "SELECT attempts, recovery_attempts, lease_until, updated_at FROM worker_jobs",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                ).unwrap();
+                assert_eq!(state, (2, 3, None, NOW.into()));
+                // wake_waiting_jobs precedes reaping in the same cron tick.
+                let cutoff = "2026-01-01T00:08:00Z";
+                assert!(stuck(&conn, cutoff).is_empty());
+                assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(NOW, "capacity", cutoff)), 0);
+                assert_eq!(apply(&conn, worker_ledger::finalize_stuck("lost", NOW, "capacity", cutoff, 0)), 0);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "capacity", "42", None)), 1);
+                assert_eq!(recovery_checkpoint(&conn, "capacity"), (3, None));
+            }
+        }
+
+        #[test]
+        fn capacity_deferral_preserves_retry_budget_backoff_and_live_owners() {
+            let conn = db();
+            insert(&conn, "pending", "42", "pending", None);
+            insert(&conn, "backoff", "99", "retryable", Some(LEASE));
+            insert(&conn, "owner", "8", "running", Some(LEASE));
+            conn.execute("UPDATE worker_jobs SET attempts=2,recovery_attempts=1", []).unwrap();
+            for id in ["pending", "backoff"] {
+                assert_eq!(apply(&conn, worker_ledger::park_capacity(NOW, id)), 1);
+                let state: (i64, i64, i64) = conn.query_row(
+                    "SELECT attempts,recovery_attempts,admission_waiting FROM worker_jobs WHERE job_id=?", [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!(state, (2, 1, 1));
+            }
+            assert_eq!(apply(&conn, worker_ledger::park_capacity(NOW, "owner")), 0);
+            let lease: String = conn.query_row("SELECT lease_until FROM worker_jobs WHERE job_id='backoff'", [], |row| row.get(0)).unwrap();
+            assert_eq!(lease, LEASE);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "backoff")), 0);
+            assert_eq!(waiting(&conn), vec!["pending"]);
+            // A delivery can claim between selection and the waker's CAS.
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "claimed", "pending", "42", None)), 1);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "pending")), 0);
+            let ownership: (String, String) = conn.query_row(
+                "SELECT execution_token, lease_until FROM worker_jobs WHERE job_id = 'pending'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(ownership, ("claimed".into(), LEASE.into()));
+            let held: (String, i64, i64) = conn.query_row(
+                "SELECT lease_until, recovery_attempts, admission_waiting FROM worker_jobs WHERE job_id = 'backoff'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(held, (LEASE.into(), 1, 1));
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(LEASE, "backoff")), 1);
+            let released: (Option<String>, i64, i64) = conn.query_row(
+                "SELECT lease_until, recovery_attempts, admission_waiting FROM worker_jobs WHERE job_id = 'backoff'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(released, (None, 1, 0));
+            assert_eq!(status_of(&conn, "owner"), "running");
+        }
+
+        #[test]
+        fn running_keyset_pages_preserve_cutoff_while_prior_rows_are_retired() {
+            let conn = db();
+            for index in 0..130 {
+                insert(&conn, &format!("job-{index:03}"), "42", "running", None);
+            }
+            insert(&conn, "live", "99", "running", Some(LEASE));
+            insert(&conn, "new", "8", "running", None);
+            conn.execute("UPDATE worker_jobs SET created_at=? WHERE job_id='new'", [LEASE]).unwrap();
+            let page = |statement: Statement| -> Vec<String> {
+                conn.prepare(&statement.sql).unwrap()
+                    .query_map(rusqlite::params_from_iter(statement.binds.iter()), |row| row.get(0))
+                    .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            };
+            let mut after = String::new();
+            let mut seen = 0;
+            loop {
+                let ids = page(worker_ledger::select_running(&after, NOW));
+                if ids.is_empty() { break; }
+                assert!(ids.len() <= 50);
+                after = ids.last().unwrap().clone();
+                seen += ids.len();
+            }
+            assert_eq!(seen, 131);
+            after.clear();
+            seen = 0;
+            loop {
+                let ids = page(worker_ledger::select_stale_running(&after, NOW));
+                if ids.is_empty() { break; }
+                assert!(ids.len() <= 50);
+                after = ids.last().unwrap().clone();
+                seen += ids.len();
+                for id in ids {
+                    conn.execute("UPDATE worker_jobs SET status='pending' WHERE job_id=?", [id]).unwrap();
+                }
+            }
+            assert_eq!(seen, 130);
+            assert_eq!(status_of(&conn, "live"), "running");
+            assert_eq!(status_of(&conn, "new"), "running");
         }
     }
 
@@ -2652,6 +2811,7 @@ mod tests {
                     status TEXT NOT NULL DEFAULT 'pending',
                     dedupe_key TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    recovery_attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,

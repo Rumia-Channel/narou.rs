@@ -13,6 +13,8 @@
 //!
 //! See `docs/platform-abstraction.md` for the full design.
 
+pub mod asset_codec;
+pub mod asset_reader;
 pub mod clock;
 pub mod cookie_store;
 pub mod http;
@@ -33,9 +35,12 @@ pub mod s3_request;
 pub mod s3_sigv4;
 pub mod s3_store;
 pub mod split_store;
+pub mod staging;
 pub mod store_migration;
 pub mod url_policy;
 
+pub use asset_reader::AssetReader;
+pub use staging::StagedAsset;
 pub use clock::{Clock, SystemClock};
 pub use cookie_store::{
     CookieStore, DecodedGroups, HostCookie, LoginGroup, apply_set_cookie, cookie_host_for_url,
@@ -43,7 +48,7 @@ pub use cookie_store::{
     tidy_groups, assign_group_ids, encode_groups, format_cookie_header, mask_cookie,
     merge_cookie_headers, merge_stored_cookies, normalize_cookie_host, parse_cookie_header,
 };
-pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
+pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, HttpStreamResponse, RedirectMode};
 pub use object_store::{
     paginate_object_listing, prefix_upper_bound,
     AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectEncoding,
@@ -86,8 +91,8 @@ pub type PlatformFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
 /// Marker for services that live on the platform side of the abstraction.
 ///
 /// On native, services are shared across threads (`Send + Sync`, required by
-/// `tokio::spawn` and the axum `State`); on `wasm32` every type is `Send`
-/// automatically, so no bound is needed.
+/// `tokio::spawn` and the axum `State`). Worker JS bindings stay within their
+/// isolate and may be neither `Send` nor `Sync`, so `wasm32` has no bound.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait PlatformService: Send + Sync {}
 

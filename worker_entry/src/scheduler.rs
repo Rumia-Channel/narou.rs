@@ -27,9 +27,16 @@ pub const AUTO_UPDATE_PAGE_SIZE: usize = 100;
 /// Cron is only a probe. The persisted checkpoint owns the logical
 /// generation and cursor, so every minute does not reset an in-flight run.
 pub async fn run_scheduled_plan(event: ScheduledEvent, env: &Env) -> Result<()> {
+    let Some(_memory_permit) = crate::memory_budget::try_heavy() else {
+        // A later cron tick resumes durable cursors; no work is lost.
+        return Ok(());
+    };
     let runtime = WorkerRuntime::build(env).await.map_err(|error| {
         NarouError::Platform(format!("Worker runtime error: {error}"))
     })?;
+    if let Err(error) = runtime.collect_expired_assets().await {
+        console_warn!("asset staging reaper failed: {error}");
+    }
     // DLQ 行きで取り残された行の回収は auto-update の有無と無関係に毎分走らせる。
     // 失敗しても planner は続行する (次の tick で再試行される)。
     let push = PushHubClient::new(env, runtime.subrequests.clone());
@@ -115,11 +122,13 @@ async fn reap_one(
     max_retries: u32,
 ) -> Result<bool> {
     let attempts = u32::try_from(job.attempts).unwrap_or(u32::MAX);
-    if job.status == "retryable" && attempts > max_retries {
+    let recoveries = u32::try_from(job.recovery_attempts).unwrap_or(u32::MAX);
+    if (job.status == "retryable" && attempts > max_retries)
+        || recoveries >= narou_rs::application::worker_ledger::MAX_RECOVERY_ATTEMPTS
+    {
         let reason = format!(
-            "retries exhausted after {attempts} attempts and the scheduled \
-             redelivery was lost (dead-lettered): {}",
-            job.last_error.as_deref().unwrap_or("unknown error")
+            "recovery exhausted after {attempts} business failures and {recoveries} lost deliveries/executions: {}",
+            job.last_error.as_deref().unwrap_or("no durable checkpoint progress")
         );
         if !runtime
             .ledger

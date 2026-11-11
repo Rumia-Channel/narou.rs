@@ -712,6 +712,17 @@ mod tests {
                     })
                 }
             }
+
+            fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<crate::platform::HttpStreamResponse>> {
+                let url = request.url.clone();
+                Box::pin(async move {
+                    let response = self.send(request).await?;
+                    Ok(crate::platform::HttpStreamResponse {
+                        status: response.status, url, headers: response.headers,
+                        body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
+                    })
+                })
+            }
         }
         let setting = load("novel18.syosetu.com");
         let page = "https://xmypage.syosetu.com/x1525cp/";
@@ -1066,6 +1077,17 @@ login_pattern: 'ログインが必要です'
                 })
             })
         }
+
+        fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<crate::platform::HttpStreamResponse>> {
+            let url = request.url.clone();
+            Box::pin(async move {
+                let response = self.send(request).await?;
+                Ok(crate::platform::HttpStreamResponse {
+                    status: response.status, url, headers: response.headers,
+                    body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
+                })
+            })
+        }
     }
 
     fn gated_client() -> GatedAuthorClient {
@@ -1114,6 +1136,17 @@ login_pattern: 'ログインが必要です'
                     status: 200,
                     headers: vec![("Content-Type".into(), "text/html".into())],
                     body: body.as_bytes().to_vec(),
+                })
+            })
+        }
+
+        fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<crate::platform::HttpStreamResponse>> {
+            let url = request.url.clone();
+            Box::pin(async move {
+                let response = self.send(request).await?;
+                Ok(crate::platform::HttpStreamResponse {
+                    status: response.status, url, headers: response.headers,
+                    body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
                 })
             })
         }
@@ -1214,6 +1247,17 @@ toc_url: https://merge.example/book/\k<ncode>
                     status: 200,
                     headers: vec![("Content-Type".into(), "application/json".into())],
                     body: body.into_bytes(),
+                })
+            })
+        }
+
+        fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<crate::platform::HttpStreamResponse>> {
+            let url = request.url.clone();
+            Box::pin(async move {
+                let response = self.send(request).await?;
+                Ok(crate::platform::HttpStreamResponse {
+                    status: response.status, url, headers: response.headers,
+                    body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
                 })
             })
         }

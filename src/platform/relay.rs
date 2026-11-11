@@ -40,6 +40,10 @@
 //! (Worker クレートのテストは wasm 専用で実行されない)。外部クレートは
 //! 非 optional の `serde_json` と `url` のみに依存する。
 
+#[path = "relay_stream.rs"]
+mod streaming;
+pub use streaming::{STREAM_CONTENT_TYPE, decode_relay_stream};
+
 use super::http::{HttpRequest, RedirectMode, is_safe_header_name, is_safe_header_value};
 use super::http1::MAX_HTTP1_HEAD;
 
@@ -301,6 +305,13 @@ impl RelayRequest {
             (TOKEN_HEADER.to_string(), self.token),
             ("Content-Type".to_string(), "application/json".to_string()),
         ];
+        request
+    }
+
+    /// Negotiate metadata-first binary framing for bounded asset downloads.
+    pub fn into_stream_request(self) -> HttpRequest {
+        let mut request = self.into_request();
+        request.headers.push(("Accept".to_owned(), STREAM_CONTENT_TYPE.to_owned()));
         request
     }
 }

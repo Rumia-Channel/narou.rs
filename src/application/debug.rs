@@ -36,6 +36,7 @@ pub fn enabled() -> bool {
 }
 
 /// 詳細ログを 1 行流す (無効なら何もしない)。`stdout` 側へ出す。
+#[cfg(feature = "native-runtime")]
 pub fn emit(message: impl std::fmt::Display) {
     if !enabled() {
         return;
@@ -44,8 +45,28 @@ pub fn emit(message: impl std::fmt::Display) {
 }
 
 /// 失敗の詳細を 1 行流す (無効なら何もしない)。
+#[cfg(feature = "native-runtime")]
 pub fn emit_error(message: impl std::fmt::Display) {
     emit(format_args!("Error: {message}"));
+}
+
+/// Worker diagnostics await their invocation's output capacity.
+pub fn emit_async(message: impl std::fmt::Display) -> impl Future<Output = ()> + 'static {
+    let line = enabled().then(|| format!("{PREFIX} {message}"));
+    async move {
+        if let Some(line) = line {
+            messages::emit_default_async(Stream::Stdout, &line).await;
+        }
+    }
+}
+
+pub fn emit_error_async(message: impl std::fmt::Display) -> impl Future<Output = ()> + 'static {
+    let line = enabled().then(|| format!("{PREFIX} Error: {message}"));
+    async move {
+        if let Some(line) = line {
+            messages::emit_default_async(Stream::Stdout, &line).await;
+        }
+    }
 }
 
 /// local 設定マップから `webui.debug-mode` を読んで反映する。

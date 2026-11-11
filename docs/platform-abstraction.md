@@ -654,11 +654,10 @@ Worker は `PushHubSink` 経由で Web コンソールの `#console` へ流す�
 `Stream::Stdout`**（native がエラーを stdout に出しているのに合わせる。Web UI は `target_console`
 が `stdout` 以外だと 2 番目のコンソールへ回すため）。
 
-Worker の `PushHubSink` は行ごとに送信タスク (`spawn_local`) を起動して**その場で**送る（順序・
-取りこぼし・最小送信間隔は `messages::flush::FlushQueue` が管理する）。ジョブ境界の `drain()` は
-送信タスクを待って残りを送る最後の砦で、ジョブの終端イベントより先にコンソール行を届ける
-（2026-10-06 修正: 以前は境界までバッファしていたため、DL の 1 話ごとの進捗が完了時にまとめて
-表示されていた）。
+Worker の重い処理から出す進捗は、容量制限付きの送信処理を `await` して順序を保つ。
+行ごとに独立した `spawn_local` を増やす方式は使わず、受信側が遅ければ生産側も待つ。
+ジョブ境界の `drain()` は残りを送り、ジョブの終端イベントより先にコンソール行を届ける。
+行を捨てたり、完了まで全件を蓄積したりして容量を抑える方式にはしない。
 
 | 操作 | メッセージ（例） | native | Worker | タイミング |
 |---|---|---|---|---|
@@ -758,3 +757,152 @@ API 復旧・配備後の継続負荷は未確認。検証コピーの結果と�
 `worker_entry/tests/test_sql_access_paths.py`。実 workerd の HTTP / Queue / 仮想属性 /
 作者追跡 / 転送シナリオも実行する。本番のデータ・キューを検証用に書き換えない。
 
+## Workers の有界ストリーム処理
+
+### 所有権・保存・公開
+
+HTTP の `send_stream` と `AssetStore` の `read_stream` / `read_range` / `stage_stream` を
+大きなデータの入口にする。`read_small` は設定・目次等の制御データ専用で、画像・完成 ZIP・
+完成 EPUB を読み込む代替経路にはしない。`AssetReader` は immutable な stage を Range で読み、
+ZIP の索引参照とフレームの順次復号を両立させる。
+
+本文の `read_range` は要求した範囲と一致する 206 を必須とし、Range を無視した
+200 応答を全量読み込む代替処理はしない。一方、サイズ照会の `stat` はヘッダだけを使い、
+200 の Content-Length または 206 の Content-Range の総サイズを読む。プロキシが
+Range を変更してもサイズ照会を壊さず、200 の本文も一切読み出さない。
+
+```mermaid
+flowchart LR
+  HTTP[HTTP チャンク] --> Stage[非公開 stage]
+  Stage --> Decode[1 話・1 フレーム・1 行の処理]
+  Decode --> Output[出力チャンク]
+  Output --> Store[S3 順次 multipart]
+  Store --> Verify[長さ・ハッシュ・保存結果の照合]
+  Verify --> Publish[索引・参照の公開]
+  Output --> Client[HTTP / ブラウザの pull]
+  Stage --> GC[期限付き回収]
+```
+
+S3 は 1 part の保存完了を待って次を読み、multipart 完了応答が HTTP 200 でも XML の
+`Error` なら失敗とする。コピーの応答・送信元の版・保存先も照合してから公開する。
+切断・エラーでは upload を中断し、強制終了で実行できない後片付けは
+`.narou-stage-journal/` の期限付き記録から回収する。更新・回収は条件付き要求で競合を判定し、
+回収中の予約を古い処理が復活させない。D1 の stage も lease と CAS で同じ境界を持つ。
+
+### 常駐させる単位
+
+| 対象 | 単位・上限 |
+|---|---|
+| 通常のデータチャンク | 64 KiB |
+| Range reader | 整列した 64 KiB 窓を 2 個。ZIP 索引と本文の往復で毎回取り直さない |
+| S3 multipart | 8 MiB / part、同時送信 1 part |
+| stage の失効 | 24 時間の無活動。進行中は lease を更新 |
+| isolate の重い処理 | 1 件。応答 stream の EOF / error / cancel まで所有 |
+| Wasm の転送メタデータ | 24 MiB の割当予算。容量・管理領域・再確保時の旧新領域を含めて判定 |
+| Wasm の画像処理 | codec の作業領域を事前に見積もり、96 MiB の予算内へ制限 |
+
+これらは各処理の制御値であり、Worker の RSS や JS heap の実測値ではない。
+画像 codec の予算は 128 MiB 全部を使わず、ランタイム・I/O 用の余地を残すためのもの。
+形式上の ZIP 上限は変更せず、Wasm では別途メタデータの割当を拒否できる。
+上限超過を内容の間引き・縮小・切り捨てで成功に変えない。
+
+本文変換は 1 話ずつ読み、変換済みテキスト・XHTML を immutable stage へ送る。
+再読時は本文の世代・ハッシュと最終目次を確認し、更新中の異なる版を混ぜない。
+バーチャル小説もメンバー本文を蓄積しない。Lite の ZIP 計画は名前・参照を持ち、
+XHTML と画像をエントリの書き出し時に供給する。
+このため EPUB の GET でも一時保存先への書き込みが必要になる。S3 の書き込みが
+停止している間は生成を失敗させ、全量メモリ保持や旧データへの差し替えで隠さない。
+失敗した更新が現行本文を消さないことと、保存先の復旧後にその本文から EPUB を
+再生成できることを実 Worker で検証する。
+
+APNG は ZIP を stage に置き、1 フレームずつ復号・符号化する。EPUB の非インタレース PNG は
+行単位の復号・リサイズを使い、元画像全体とリサイズ中間画像を持たない。
+他の codec やアニメーション合成は 1 フレーム / canvas が必要な場合がある。
+これは全アニメーションの保持とは区別し、必要な作業領域を確保前に判定する。
+透過・16 bit PNG・フレーム数・表示時間・ループ情報を容量対策で省略しない。
+
+### 同時実行・キャッシュ・異常終了
+
+`memory_budget::MemoryPermit` は isolate 内の作業所有権で、HTTP 容量待ちは
+`503` / `memory_capacity` / `Retry-After: 5` を返す。Queue は実行 lease と通常の試行回数を
+消費する前に延期する。サイト・作品単位の D1 排他とは別であり、別 isolate の処理まで
+グローバルに 1 件へ減らすものではない。
+クライアントの `cancel()` 完了は、サーバーが切断を受け取ったことの確認ではない。
+切断伝播中の別要求は 503 になり得る。時間切れだけで許可を解放して旧処理と
+併走させず、stream の破棄で解放する。回帰検証では上流画像を EOF 前に停止し、
+実際に上流接続が中断された後に次の要求を受け付けることを確認する。
+
+isolate キャッシュは件数だけでなく byte weight で制限し、共有値は `Arc` で参照する。
+本文ハッシュのヒントは全ライブラリ分をロードせず、小説 ID ごとの
+`novel_section_hashes` から読む。移行不能な旧値を migration で無条件に消さない。
+
+コンソール・進捗は待機中と送信中を合わせて 256 KiB の FIFO に載せ、
+`PushHubSink::run` が生成側と単一の送信側を同じ invocation 内で poll する。
+空きが十分な間は取得を進め、送信側だけが最小間隔を待って複数イベントをまとめる。
+1 行ごとに間隔待ちをすると取得まで遅くなるため、生成側が待つのは空きが少ないときだけ。
+通常の行は捨てず、置換可能な進捗だけを統合する。上限より長い単独行は先行分を送り切って
+直接送る。終端前は残りを送り切り、キャンセルでは両 future を破棄する。
+長編 fixture は 1,685 話を既存の 10 分以内という条件で確認し、待ち時間の延長では回避しない。
+
+OOM / trap / 実行喪失では通常のエラー保存に到達しないため、`attempts` だけで再試行を制御しない。
+migration `0019_bounded_runtime.sql` の `recovery_attempts` を回収時に進め、
+永続化したチェックポイントが過去の到達位置を超えたときだけ回復予算を戻す。
+途中までの再実行で cursor を巻き戻さず、同じ位置までの再到達や phase・metadata だけの変更では回数をリセットしない。
+上限到達は終端へ移し、サイトの枠を後続へ解放する。回収・待機再投入・消去はページ単位で行う。
+容量待ちを再配信するときは期限切れ lease を除き、更新した時刻から配送猶予を数える。
+未到来の retry backoff と、すでに別実行が取得した lease は変更しない。
+
+### 配備と明示的に残す境界
+
+リレーを使う場合は **リレー更新 → D1 migration → Worker 更新** の順にする。
+新 Worker は `Accept: application/vnd.narou.relay.v1+octet-stream` を要求し、
+`NRS1`・長さ付き JSON メタデータ・生の本文を読む。旧リレーの JSON/Base64 応答を
+全量復号するフォールバックは持たず、更新が必要なエラーを返す。
+既存クライアント用のリレー JSON 契約は維持する。
+
+Native の外部変換ツール向け String / ファイル API、テスト等向けの明示的な
+whole-value 転送 utility は残るが、Worker の大きな本文・画像・アーカイブ経路では使わない。
+リレープロセスの上流取得には従来の 16 MiB 有界バッファが残るため、
+リレー Native 側まで完全に無バッファ化したという意味ではない。
+
+### 測定と回帰検証
+
+64 枚の 1000×1000 JPEG を含む ZIP（7,761,763 bytes）から APNG を生成する
+Native コンポーネント測定では、要求中の生存 allocation のピークが次のように変わった。
+入力の SHA-256 は `b10805d1555950eed5047b72c8c3adc655a821d74389e13d4cf1d33ee1c03c6a`。
+
+| 指標 | 旧処理 | ストリーム処理 |
+|---|---:|---:|
+| 要求中 allocation のピーク | 110.9 MiB | 14.8 MiB |
+
+削減率は 86.6%。これは **Worker 全体のメモリ使用量や RSS ではない**。
+生成物は 44,036,067 bytes で、保持せず 770 チャンクへ流した。
+旧版 release / 新版 debug で測定したため、処理時間の比較には使わない。
+
+再現可能な回帰検証は `worker_entry` でビルド後、以下を実行する。
+`content_storage.mjs` は実 workerd・ローカル D1・S3 HTTP fixture を使う。
+Wasm の線形メモリと JS heap は別なので、線形メモリの測定値を
+Worker 全体のピークとして扱わない。
+
+```sh
+worker-build --release
+node tests/content_storage.mjs
+node tests/runtime_recovery.mjs
+node tests/transfer.mjs
+```
+
+Native の S3 互換性と転送経路は、リポジトリルートで次のように確認する。
+
+```sh
+cargo test -p narou_rs --features lite --test s3_range_transport --test transfer_archive_e2e
+cargo test -p narou_rs --features lite --lib platform::s3_
+```
+
+実 workerd の 64 フレーム・512×512 RGBA fixture と 4096×4096 / 6000×6000 PNG では、
+取得・S3 multipart 保存・EPUB 配信・EOF・上流を停止した状態での中断を通した。
+さらに 500 万個の未知の manifest 項目を読み飛ばす取り込みを同じ isolate で行い、
+Wasm 線形メモリの最高値は 38,010,880 bytes（36.25 MiB）だった。
+全フレームの画素・透明度・再生時間、静止画の縮小後の画素・透明度、EPUB 内の参照を
+照合している。JS heap はこの数値に含まない。
+転送 wasm 単体では、6 MiB の NUL を含む題名を約 36 MiB の JSON として逐次出力し、
+線形メモリ 18,350,080 bytes（17.5 MiB）、入出力チャンク最大 64 KiB で完走した。

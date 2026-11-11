@@ -17,6 +17,8 @@ use worker::wasm_bindgen::{JsCast, JsValue};
 use crate::{db_handle::DbHandle, d1_object_store::D1ObjectStore};
 
 pub(crate) mod sql;
+#[path = "content_asset_stream.rs"]
+mod asset_stream;
 const CAP: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -80,6 +82,7 @@ pub async fn initialize_s3_default(db: &DbHandle, required: bool) -> Result<Cont
 
 pub fn is_content_key(key: &ObjectKey) -> bool {
     let value = key.as_ref();
+    if value.starts_with("novels/") && value.ends_with("/novel.txt") { return true; }
     if !value.starts_with("novels/") || !value.ends_with(".yaml") { return false; }
     let mut tail = value.rsplit('/');
     // A subdirectory-layout novel may itself be named 本文. Its root YAML
@@ -342,12 +345,13 @@ impl ContentStore {
 impl ObjectStore for ContentStore {
     fn stat<'a>(&'a self,key:&'a ObjectKey) -> PlatformFuture<'a,Result<Option<ObjectMetadata>>> {
         Box::pin(async move {
+            if asset_stream::is_private_or_generated(key) { return self.remote.stat(key).await; }
             if is_content_key(key) {
                 let primary = self;
                 if let Some(row)=primary.reference(key).await? {
                     return MetadataRow { object_key:row.object_key,size:row.size,updated_at:row.updated_at,content_type:row.content_type }.metadata().map(Some);
                 }
-                if backend(&primary.db).await? == ContentBackend::S3 { return Ok(None); }
+                if backend(&primary.db).await? == ContentBackend::S3 && !key.as_ref().ends_with("/novel.txt") { return Ok(None); }
                 return ObjectStore::stat(primary.legacy.as_ref(),key).await;
             }
             ObjectStore::stat(self.legacy.as_ref(),key).await
@@ -355,10 +359,11 @@ impl ObjectStore for ContentStore {
     }
     fn read_small<'a>(&'a self,key:&'a ObjectKey) -> PlatformFuture<'a,Result<Option<Vec<u8>>>> {
         Box::pin(async move {
+            if asset_stream::is_private_or_generated(key) { return self.remote.read_small(key).await; }
             if is_content_key(key) {
                 let primary = self;
                 if let Some(row)=primary.reference(key).await? { return primary.read_reference(&row).await.map(Some); }
-                if backend(&primary.db).await? == ContentBackend::S3 { return Ok(None); }
+                if backend(&primary.db).await? == ContentBackend::S3 && !key.as_ref().ends_with("/novel.txt") { return Ok(None); }
                 return primary.legacy.read_small(key).await;
             }
             self.legacy.read_small(key).await
@@ -366,6 +371,7 @@ impl ObjectStore for ContentStore {
     }
     fn write_small<'a>(&'a self,key:&'a ObjectKey,data:Vec<u8>) -> PlatformFuture<'a,Result<()>> {
         Box::pin(async move {
+            if asset_stream::is_private_or_generated(key) { return self.remote.write_small(key, data).await; }
             if !is_content_key(key) { return self.legacy.write_small(key,data).await; }
             let primary=self;
             if backend(&primary.db).await? == ContentBackend::D1 { return primary.legacy.write_small(key,data).await; }
@@ -393,6 +399,7 @@ impl ObjectStore for ContentStore {
     }
     fn delete<'a>(&'a self,key:&'a ObjectKey) -> PlatformFuture<'a,Result<()>> {
         Box::pin(async move {
+            if asset_stream::is_private_or_generated(key) { return self.remote_assets.delete(key).await; }
             if !is_content_key(key) { return ObjectStore::delete(self.legacy.as_ref(),key).await; }
             let primary=self;
             if backend(&primary.db).await? == ContentBackend::D1 { return ObjectStore::delete(primary.legacy.as_ref(),key).await; }
@@ -421,20 +428,18 @@ impl ObjectStore for ContentStore {
 impl AssetStore for ContentStore {
     fn stat<'a>(&'a self,key:&'a ObjectKey) -> PlatformFuture<'a,Result<Option<ObjectMetadata>>> { ObjectStore::stat(self,key) }
     fn read_stream<'a>(&'a self,key:&'a ObjectKey) -> PlatformFuture<'a,Result<Option<AssetStream>>> {
-        Box::pin(async move {
-            if !is_content_key(key) { return self.legacy.read_stream(key).await; }
-            Ok(self.read_small(key).await?.map(|data| Box::pin(futures::stream::once(async move { Ok(data) })) as AssetStream))
-        })
+        Box::pin(self.read_content_stream(key))
     }
-    fn write_stream<'a>(&'a self,key:&'a ObjectKey,mut stream:AssetStream) -> PlatformFuture<'a,Result<()>> {
-        Box::pin(async move {
-            if !is_content_key(key) { return self.legacy.write_stream(key,stream).await; }
-            let mut data=Vec::new();
-            while let Some(chunk)=stream.next().await { let chunk=chunk?; if data.len().saturating_add(chunk.len())>CAP { return Err(error("episode exceeds stream cap")); } data.extend_from_slice(&chunk); }
-            self.write_small(key,data).await
-        })
+    fn read_range<'a>(&'a self,key:&'a ObjectKey,range:std::ops::Range<u64>) -> PlatformFuture<'a,Result<Option<Vec<u8>>>> {
+        Box::pin(self.read_content_range(key,range))
+    }
+    fn stage_stream<'a>(&'a self,stream:AssetStream) -> PlatformFuture<'a,Result<narou_rs::platform::StagedAsset>> {
+        self.remote_assets.stage_stream(stream)
+    }
+    fn write_stream<'a>(&'a self,key:&'a ObjectKey,stream:AssetStream) -> PlatformFuture<'a,Result<()>> {
+        Box::pin(self.write_content_stream(key,stream))
     }
     fn delete<'a>(&'a self,key:&'a ObjectKey) -> PlatformFuture<'a,Result<()>> { ObjectStore::delete(self,key) }
-    fn copy<'a>(&'a self,source:&'a ObjectKey,destination:&'a ObjectKey) -> PlatformFuture<'a,Result<()>> { Box::pin(async move { self.transfer(source,destination,false).await }) }
-    fn move_or_copy<'a>(&'a self,source:&'a ObjectKey,destination:&'a ObjectKey) -> PlatformFuture<'a,Result<()>> { Box::pin(async move { self.transfer(source,destination,true).await }) }
+    fn copy<'a>(&'a self,source:&'a ObjectKey,destination:&'a ObjectKey) -> PlatformFuture<'a,Result<()>> { Box::pin(self.copy_content_asset(source,destination,false)) }
+    fn move_or_copy<'a>(&'a self,source:&'a ObjectKey,destination:&'a ObjectKey) -> PlatformFuture<'a,Result<()>> { Box::pin(self.copy_content_asset(source,destination,true)) }
 }

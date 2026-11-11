@@ -66,7 +66,7 @@ pub async fn handle_settings(req: Request, env: Env) -> worker::Result<Response>
             Ok(info) => info,
             Err(error) => return json_error(500, "internal_error", Some(error.message())),
         };
-        return Ok(Response::from_json(&info)?);
+        return Response::from_json(&info);
     }
     if path == "/api/external_api/token" && method == Method::Post {
         let mut req = req;
@@ -341,7 +341,7 @@ fn respond(
 /// API の案内。
 async fn api_index(req: &Request) -> worker::Result<Response> {
     let _ = req;
-    Ok(Response::from_json(&json!({
+    Response::from_json(&json!({
         "name": "narou.rs external API",
         "version": env!("CARGO_PKG_VERSION"),
         "authentication": "Bearer",
@@ -356,7 +356,7 @@ async fn api_index(req: &Request) -> worker::Result<Response> {
             { "path": "/api/v1/mcp", "description": "MCP (JSON-RPC 2.0) の窓口" }
         ],
         "formats": ["json", "jsonl", "xml"]
-    }))?)
+    }))
 }
 
 /// 一覧。
@@ -587,7 +587,7 @@ async fn api_mcp(
         }
     };
     let hidden = crate::hidden::load_from_env(env).await.ok();
-    let server = McpServer::new(services.external_api.clone());
+    let server = McpServer::new(&services.external_api);
     match server.handle(&request, hidden).await {
         Some(response) => Ok(Response::from_json(&response)?),
         // 通知 (id なし) には応答しない。native と同じく 202 を返す。

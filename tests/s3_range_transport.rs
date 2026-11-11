@@ -116,6 +116,17 @@ fn stat_and_read_survive_range_header_changes_in_transit() {
                 })
             })
         }
+
+        fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, narou_rs::error::Result<narou_rs::platform::HttpStreamResponse>> {
+            let url = request.url.clone();
+            Box::pin(async move {
+                let response = self.send(request).await?;
+                Ok(narou_rs::platform::HttpStreamResponse {
+                    status: response.status, url, headers: response.headers,
+                    body: Box::pin(futures::stream::once(async { panic!("stat must not read the response body, including a full 200 response") })),
+                })
+            })
+        }
     }
 
     let image = key("novels/小説家になろう/n9364bq 設定集/挿絵/i83860.jpg");
@@ -143,6 +154,20 @@ fn illustration_migration_cli_preserves_bytes_and_dry_run_boundaries() {
     use axum::response::IntoResponse;
     use std::process::Command;
     use std::sync::Mutex;
+    use std::collections::BTreeMap;
+
+    fn decoded_path(value: &str) -> String {
+        let mut input = value.bytes();
+        let mut output = Vec::with_capacity(value.len());
+        while let Some(byte) = input.next() {
+            if byte == b'%' {
+                let hex = [input.next().unwrap(), input.next().unwrap()];
+                output.push(u8::from_str_radix(std::str::from_utf8(&hex).unwrap(), 16).unwrap());
+            } else { output.push(byte); }
+        }
+        String::from_utf8(output).unwrap()
+    }
+    fn etag(bytes: &[u8]) -> String { format!("\"{:08x}\"", crc32fast::hash(bytes)) }
 
     struct Server {
         stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -157,7 +182,7 @@ fn illustration_migration_cli_preserves_bytes_and_dry_run_boundaries() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
-    let stored = Arc::new(Mutex::new(None::<Vec<u8>>));
+    let stored = Arc::new(Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
     let server_stored = stored.clone();
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let _server = Server {
@@ -168,36 +193,57 @@ fn illustration_migration_cli_preserves_bytes_and_dry_run_boundaries() {
                     move |method: Method, uri: Uri, headers: HeaderMap, body: axum::body::Bytes| {
                         let stored = server_stored.clone();
                         async move {
-                            if method == Method::GET && uri.path() == "/bucket" {
-                                let contents = stored.lock().unwrap().as_ref().map(|bytes| format!(
-                                    "<Contents><Key>fixture/novels/site/title/挿絵/001.png</Key><Size>{}</Size></Contents>",
-                                    bytes.len(),
-                                )).unwrap_or_default();
+                            let path = decoded_path(uri.path());
+                            let query: BTreeMap<_, _> = url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).into_owned().collect();
+                            let mut stored = stored.lock().unwrap();
+                            if method == Method::GET && path == "/bucket" {
+                                let prefix = format!("/bucket/{}", query.get("prefix").map(String::as_str).unwrap_or(""));
+                                let contents = stored.iter().filter(|(key, _)| key.starts_with(&prefix))
+                                    .map(|(key, bytes)| format!("<Contents><Key>{}</Key><Size>{}</Size></Contents>", &key["/bucket/".len()..], bytes.len()))
+                                    .collect::<String>();
                                 return ([(header::CONTENT_TYPE, "application/xml")], format!(
                                     "<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>",
                                 )).into_response();
                             }
-                            let mut expected = url::Url::parse("http://localhost").unwrap();
-                            expected.set_path("/bucket/fixture/novels/site/title/挿絵/001.png");
-                            if uri.path() != expected.path() {
-                                return StatusCode::NOT_FOUND.into_response();
+                            let current = stored.get(&path);
+                            if headers.get(header::IF_MATCH).is_some_and(|value| current.is_none_or(|bytes| value.as_bytes() != etag(bytes).as_bytes()))
+                                || (headers.get(header::IF_NONE_MATCH).is_some_and(|value| value == "*") && current.is_some()) {
+                                return StatusCode::PRECONDITION_FAILED.into_response();
                             }
                             if method == Method::PUT {
-                                *stored.lock().unwrap() = Some(body.to_vec());
-                                return StatusCode::OK.into_response();
+                                let bytes = if let Some(source) = headers.get("x-amz-copy-source") {
+                                    let Some(bytes) = stored.get(&decoded_path(source.to_str().unwrap())).cloned() else {
+                                        return StatusCode::NOT_FOUND.into_response();
+                                    };
+                                    bytes
+                                } else { body.to_vec() };
+                                let digest = etag(&bytes);
+                                stored.insert(path, bytes);
+                                if headers.contains_key("x-amz-copy-source") {
+                                    return ([(header::CONTENT_TYPE, "application/xml")],
+                                        format!("<CopyObjectResult><LastModified>2026-10-15T00:00:00Z</LastModified><ETag>{digest}</ETag></CopyObjectResult>")).into_response();
+                                }
+                                return ([(header::ETAG, digest)], "").into_response();
+                            }
+                            if method == Method::DELETE {
+                                stored.remove(&path);
+                                return StatusCode::NO_CONTENT.into_response();
                             }
                             if method == Method::GET {
-                                let Some(bytes) = stored.lock().unwrap().clone() else {
-                                    return StatusCode::NOT_FOUND.into_response();
-                                };
-                                if headers.contains_key(header::RANGE) {
-                                    return (
-                                        StatusCode::PARTIAL_CONTENT,
-                                        [(header::CONTENT_RANGE, format!("bytes 0-0/{}", bytes.len()))],
-                                        bytes[..1].to_vec(),
-                                    ).into_response();
+                                let Some(bytes) = stored.get(&path) else { return StatusCode::NOT_FOUND.into_response(); };
+                                if let Some(range) = headers.get(header::RANGE) {
+                                    let (start, end) = range.to_str().unwrap().strip_prefix("bytes=").unwrap().split_once('-').unwrap();
+                                    let start: usize = start.parse().unwrap();
+                                    let end: usize = end.parse().unwrap();
+                                    if start > end || end >= bytes.len() {
+                                        return (StatusCode::RANGE_NOT_SATISFIABLE, [(header::CONTENT_RANGE, format!("bytes */{}", bytes.len()))]).into_response();
+                                    }
+                                    return (StatusCode::PARTIAL_CONTENT, [
+                                        (header::CONTENT_RANGE, format!("bytes {start}-{end}/{}", bytes.len())),
+                                        (header::ETAG, etag(bytes)),
+                                    ], bytes[start..=end].to_vec()).into_response();
                                 }
-                                return bytes.into_response();
+                                return ([(header::ETAG, etag(bytes))], bytes.clone()).into_response();
                             }
                             StatusCode::METHOD_NOT_ALLOWED.into_response()
                         }
@@ -234,12 +280,13 @@ fn illustration_migration_cli_preserves_bytes_and_dry_run_boundaries() {
         assert!(output.status.success(), "{arguments:?}: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     };
     run(&["s3-push"]);
-    assert!(stored.lock().unwrap().is_none(), "dry run must not publish an object");
+    assert!(stored.lock().unwrap().is_empty(), "dry run must not publish an object");
     run(&["s3-push", "-f"]);
-    assert_eq!(stored.lock().unwrap().as_deref(), Some(expected.as_slice()));
+    let remote_image = "/bucket/fixture/novels/site/title/挿絵/001.png";
+    assert_eq!(stored.lock().unwrap().get(remote_image).map(Vec::as_slice), Some(expected.as_slice()));
     run(&["s3-verify"]);
     run(&["s3-dedup"]);
     run(&["s3-dedup", "-f"]);
-    assert_eq!(stored.lock().unwrap().as_deref(), Some(expected.as_slice()), "non-hash image names must not be deleted by dedup");
+    assert_eq!(stored.lock().unwrap().get(remote_image).map(Vec::as_slice), Some(expected.as_slice()), "non-hash image names must not be deleted by dedup");
     assert_eq!(std::fs::read(image).unwrap(), expected);
 }

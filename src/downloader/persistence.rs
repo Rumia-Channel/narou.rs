@@ -14,15 +14,23 @@ use super::types::{SectionElement, SectionFile, SubtitleInfo, TocFile};
 
 /// 本文セクションを先読みする件数。
 ///
-/// 1 件ずつ直列に待つのをやめ、最初の失敗まで最大この件数を並行に読む。
-/// 先読みの出力バッファは `read_small` の上限 × 窓の件数まで。デコード後の
-/// セクション本体や設定入力は別に保持されるため、変換全体のメモリ上限ではない。
-pub const SECTION_READ_WINDOW: usize = 4;
+/// Native は最大 4 件を並行に読む。Worker はデコード済みの本文を
+/// 複数保持しないよう 1 件に固定し、消費側の pull を次の読み取り境界にする。
+pub const SECTION_READ_WINDOW: usize = if cfg!(target_arch = "wasm32") { 1 } else { 4 };
+
+/// An owned, ordered section source. Only the section currently requested by
+/// the consumer is decoded; dropping it cancels the remaining reads.
+#[cfg(not(target_arch = "wasm32"))]
+pub type SectionStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<SectionFile>> + Send + 'static>>;
+#[cfg(target_arch = "wasm32")]
+pub type SectionStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<SectionFile>> + 'static>>;
 
 // No .yaml suffix: this is transient metadata, never a section/history object.
 const DOWNLOAD_RESUME_FILE: &str = ".download_resume";
 
-/// [`PersistenceService::load_sections_ordered`] の失敗。
+/// [`PersistenceService::stream_sections_ordered`] の失敗。
 ///
 /// 呼び出し側が文脈に合うエラー文言へ変換する (`convert` と resume で
 /// 「欠落」の扱いが異なるため、ここではどちらなのかだけを伝える)。
@@ -131,6 +139,72 @@ impl PersistenceService {
         Ok(Some(deserialize_section(&bytes)?))
     }
 
+    /// Pin conversion to the supplied TOC generation without retaining bodies.
+    ///
+    /// Current downloads publish section revisions before the replacement TOC.
+    /// Reject those in-flight bodies rather than combining generations. Legacy
+    /// inputs have no revision token, so retain only their hashes and recheck
+    /// them before successful EOF. The consumer must not publish a partial
+    /// result before EOF (conversion uses an unpublished staged asset).
+    pub fn stream_sections_snapshot(&self, keys: NovelObjectKeys, toc: TocFile) -> SectionStream {
+        let persistence = self.clone();
+        let expected_toc = serialize_toc(&toc).map(|text| Sha256::digest(text.as_bytes()).to_vec());
+        Box::pin(futures::stream::try_unfold(
+            (persistence, keys, toc, expected_toc, 0usize, Vec::new()),
+            |(persistence, keys, toc, expected_toc, position, mut fingerprints)| async move {
+                let expected_toc = expected_toc?;
+                if let Some(subtitle) = toc.subtitles.get(position) {
+                    let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+                    let bytes = persistence.objects.read_small(&key).await?.ok_or_else(|| {
+                        let filename = key.as_ref().rsplit('/').next().unwrap_or(key.as_ref());
+                        NarouError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "section file not found: expected '{filename}' in {}/本文",
+                                keys.prefix().as_ref(),
+                            ),
+                        ))
+                    })?;
+                    let section = deserialize_section(&bytes)?;
+                    if section.download_revision.max(1) != subtitle.download_revision.max(1)
+                        || subtitle.download_time.as_ref().is_some_and(|expected| {
+                            section.download_time.as_ref() != Some(expected)
+                        })
+                    {
+                        return Err(NarouError::Platform(format!(
+                            "section generation changed during conversion: {key}",
+                        )));
+                    }
+                    fingerprints.push((key, <[u8; 32]>::from(Sha256::digest(&bytes))));
+                    return Ok(Some((section, (
+                        persistence, keys, toc, Ok(expected_toc), position + 1, fingerprints,
+                    ))));
+                }
+                for (key, expected) in fingerprints {
+                    let bytes = persistence.objects.read_small(&key).await?.ok_or_else(|| {
+                        NarouError::Platform(format!("section disappeared during conversion: {key}"))
+                    })?;
+                    if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected {
+                        return Err(NarouError::Platform(format!(
+                            "section changed during conversion: {key}",
+                        )));
+                    }
+                }
+                let current = persistence.load_toc(&keys).await?.ok_or_else(|| {
+                    NarouError::Platform(format!("toc disappeared during conversion: {}", keys.toc()))
+                })?;
+                if Sha256::digest(serialize_toc(&current)?.as_bytes()).as_slice()
+                    != expected_toc.as_slice()
+                {
+                    return Err(NarouError::Platform(format!(
+                        "toc changed during conversion: {}", keys.toc(),
+                    )));
+                }
+                Ok(None)
+            },
+        ))
+    }
+
     /// 本文セクションを最大 [`SECTION_READ_WINDOW`] 件の並行読みで取得し、
     /// 入力と同じ順で返す。
     ///
@@ -138,30 +212,31 @@ impl PersistenceService {
     /// 同じで、走査順で最初の失敗 (`Missing` または `Read`) を返す。先に
     /// 読み終えた後続があっても、返る順序と「最初の失敗」の意味は変わらない。
     /// 最初の失敗より先 (窓の分だけ) を先読みしていた読み込みは破棄される。
-    pub async fn load_sections_ordered(
-        &self,
-        keys: &NovelObjectKeys,
-        subtitles: &[SubtitleInfo],
-    ) -> std::result::Result<Vec<SectionFile>, SectionLoadFailure> {
-        let mut remaining = subtitles.iter();
-        let mut pending = futures::stream::FuturesOrdered::new();
-        for subtitle in remaining.by_ref().take(SECTION_READ_WINDOW) {
-            pending.push_back(self.load_section(keys, subtitle));
-        }
-        let mut sections = Vec::with_capacity(subtitles.len());
-        let mut section_index = 0;
-        while let Some(result) = pending.next().await {
-            match result {
-                Ok(Some(section)) => sections.push(section),
-                Ok(None) => return Err(SectionLoadFailure::Missing { section_index }),
-                Err(error) => return Err(SectionLoadFailure::Read(error)),
+    pub fn stream_sections_ordered<'a>(
+        &'a self,
+        keys: &'a NovelObjectKeys,
+        subtitles: &'a [SubtitleInfo],
+    ) -> impl futures::Stream<Item = std::result::Result<SectionFile, SectionLoadFailure>> + 'a {
+        // The queued work owns its ordinal. All source borrows are captured at
+        // this stream's lifetime, rather than passed through an iterator's
+        // reference-valued mapper into a nested opaque async future.
+        let pending = futures::stream::iter(
+            (0..subtitles.len()).map(move |section_index| async move {
+                match self.load_section(keys, &subtitles[section_index]).await {
+                    Ok(Some(section)) => Ok(section),
+                    Ok(None) => Err(SectionLoadFailure::Missing { section_index }),
+                    Err(error) => Err(SectionLoadFailure::Read(error)),
+                }
+            }),
+        ).buffered(SECTION_READ_WINDOW);
+        // try_unfold drops the pending window on the first ordered error; no
+        // further input is read even if a caller polls again after that error.
+        futures::stream::try_unfold(pending, |mut pending| async move {
+            match pending.next().await {
+                Some(section) => Ok(Some((section?, pending))),
+                None => Ok(None),
             }
-            section_index += 1;
-            if let Some(subtitle) = remaining.next() {
-                pending.push_back(self.load_section(keys, subtitle));
-            }
-        }
-        Ok(sections)
+        })
     }
 
     pub async fn save_section(
@@ -393,9 +468,9 @@ impl PersistenceService {
                     }
                 }
                 Err(error) => {
-                    crate::application::debug::emit_error(format!(
+                    crate::application::debug::emit_error_async(format!(
                         "挿絵: 保存済みの一覧を取れません ({error})"
-                    ));
+                    )).await;
                     return None;
                 }
             }
@@ -471,6 +546,7 @@ mod tests {
     };
     use chrono::{DateTime, Utc};
     use std::sync::Arc;
+    use futures::TryStreamExt;
 
     struct FixedClock(DateTime<Utc>);
 
@@ -617,6 +693,56 @@ mod tests {
             download_time: None,
             download_revision: 0,
         }
+    }
+
+    #[test]
+    fn section_snapshot_rejects_body_changes_before_successful_eof() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let service = PersistenceService::new(store.clone(), store.clone());
+        let keys = NovelObjectKeys::new("site", "book", false).unwrap();
+        let subtitle = subtitle();
+        let toc = TocFile {
+            title: "title".into(), author: "author".into(), toc_url: "https://example.test/".into(),
+            story: None, subtitles: vec![subtitle.clone()], novel_type: Some(1),
+        };
+        futures::executor::block_on(async {
+            service.save_toc(&keys, &toc).await.unwrap();
+            let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+            store.write_small(&key, serialize_section(&section_file(&subtitle, "old")).unwrap().into_bytes())
+                .await.unwrap();
+            let mut stream = service.stream_sections_snapshot(keys, toc);
+            assert_eq!(stream.next().await.unwrap().unwrap().element.body, "old");
+            // Even a legacy/manual rewrite without a revision bump is detected.
+            store.write_small(&key, serialize_section(&section_file(&subtitle, "new")).unwrap().into_bytes())
+                .await.unwrap();
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("section changed during conversion"));
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn section_snapshot_rejects_uncommitted_download_generation() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let service = PersistenceService::new(store.clone(), store.clone());
+        let keys = NovelObjectKeys::new("site", "book", false).unwrap();
+        let subtitle = subtitle();
+        let toc = TocFile {
+            title: "title".into(), author: "author".into(), toc_url: "https://example.test/".into(),
+            story: None, subtitles: vec![subtitle.clone()], novel_type: Some(1),
+        };
+        futures::executor::block_on(async {
+            service.save_toc(&keys, &toc).await.unwrap();
+            let mut section = section_file(&subtitle, "new generation");
+            section.download_revision = 2;
+            store.write_small(
+                &keys.section(&subtitle.index, &subtitle.file_subtitle),
+                serialize_section(&section).unwrap().into_bytes(),
+            ).await.unwrap();
+            let mut stream = service.stream_sections_snapshot(keys, toc);
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("section generation changed"));
+        });
     }
 
     fn section_file(subtitle: &SubtitleInfo, body: &str) -> SectionFile {
@@ -778,8 +904,9 @@ mod tests {
 
     /// 後続が先に読み終えても返す順は入力順のまま、同時読み込みは窓の
     /// 件数までに収まる。
+
     #[test]
-    fn load_sections_ordered_prefetches_out_of_order_with_a_bounded_window() {
+    fn stream_sections_ordered_prefetches_out_of_order_with_a_bounded_window() {
         let keys = NovelObjectKeys::new("example.test", "n1234ab", true).unwrap();
         let subtitles: Vec<SubtitleInfo> = ["1", "2", "3", "4", "5", "6"]
             .iter()
@@ -831,7 +958,7 @@ mod tests {
         });
 
         let sections =
-            futures::executor::block_on(service.load_sections_ordered(&keys, &subtitles)).unwrap();
+            futures::executor::block_on(service.stream_sections_ordered(&keys, &subtitles).try_collect::<Vec<_>>()).unwrap();
         releaser.join().unwrap();
 
         assert_eq!(
@@ -870,7 +997,7 @@ mod tests {
 
     /// 走査順で最初の失敗 (欠落 or 読み込みエラー) だけを返す。
     #[test]
-    fn load_sections_ordered_reports_the_first_failure_in_input_order() {
+    fn stream_sections_ordered_reports_the_first_failure_in_input_order() {
         let store = Arc::new(MemoryObjectStore::new());
         let service = PersistenceService::new(store.clone(), store.clone());
         let keys = NovelObjectKeys::new("example.test", "n1234ab", true).unwrap();
@@ -900,7 +1027,7 @@ mod tests {
             .await
             .unwrap();
         });
-        match futures::executor::block_on(service.load_sections_ordered(&keys, &subtitles)) {
+        match futures::executor::block_on(service.stream_sections_ordered(&keys, &subtitles).try_collect::<Vec<_>>()) {
             Err(SectionLoadFailure::Missing { section_index }) => assert_eq!(section_index, 1),
             Err(SectionLoadFailure::Read(error)) => {
                 panic!("欠落が先に報告されるべき: {error}")
@@ -916,7 +1043,7 @@ mod tests {
             b"not: [valid yaml".to_vec(),
         ))
         .unwrap();
-        match futures::executor::block_on(service.load_sections_ordered(&keys, &subtitles)) {
+        match futures::executor::block_on(service.stream_sections_ordered(&keys, &subtitles).try_collect::<Vec<_>>()) {
             Err(SectionLoadFailure::Read(_)) => {}
             Err(SectionLoadFailure::Missing { section_index }) => {
                 panic!("読み込みエラーが先に報告されるべき: missing {section_index}")
@@ -927,7 +1054,7 @@ mod tests {
 
     /// 最初の失敗で打ち切り、先読みは窓の件数を超えない。
     #[test]
-    fn load_sections_ordered_stops_reading_after_the_first_failure() {
+    fn stream_sections_ordered_stops_reading_after_the_first_failure() {
         let keys = NovelObjectKeys::new("example.test", "n1234ab", true).unwrap();
         let subtitles: Vec<SubtitleInfo> = ["1", "2", "3", "4", "5", "6"]
             .iter()
@@ -957,7 +1084,7 @@ mod tests {
             }
         });
 
-        let failure = futures::executor::block_on(service.load_sections_ordered(&keys, &subtitles))
+        let failure = futures::executor::block_on(service.stream_sections_ordered(&keys, &subtitles).try_collect::<Vec<_>>())
             .unwrap_err();
         releaser.join().unwrap();
 

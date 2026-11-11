@@ -57,32 +57,29 @@ pub fn site_definitions(
     )
 }
 
-/// Downloader に渡す実効定義を組み立てる。
-///
-/// ユーザー定義が無ければ bundle のキャッシュ済み結果をそのまま返す
-/// （isolate ごとに 1 回の parse + compile で済む）。1 件でもあれば
-/// [`SiteDefinitions::effective_runtime`]（native の `SiteSetting::load_all()`
-/// と同じ version gate）でマージして読み直し、結果を **L1 に TTL 付きで**
-/// 載せる（リクエストごとに D1 を読まない）。
+/// Snapshot user YAML for 30 seconds, not its potentially large compiled regex
+/// state. The immutable deployment bundle remains compiled once per isolate;
+/// user definitions compile into invocation-owned `Arc`s and die with it.
 pub async fn load_site_settings(
     objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
 ) -> Result<Arc<Vec<SiteSetting>>> {
-    // L1 を最優先で見る。ここで当たればオブジェクトストアの LIST も投げない
-    // (以前は LIST → 空なら同梱定義を毎回パース、という順で全リクエストが
-    //  D1 往復 + YAML parse + compile を払っていた)。
-    if let Some(cached) = cached_site_settings() {
-        return Ok(cached);
-    }
-    let store = ObjectStoreSiteDefinitions::new(objects.clone());
-    let settings = if store.list().await?.is_empty() {
-        load_bundled_site_settings()?
+    let definitions = if let Some(cached) = SITE_SETTINGS_CACHE.get("effective") {
+        cached
     } else {
-        let effective = site_definitions(objects.clone()).effective_runtime().await?;
-        let contents: Vec<&str> = effective.iter().map(|(_, yaml)| yaml.as_str()).collect();
-        Arc::new(SiteSetting::load_bundled(&contents)?)
+        let store = ObjectStoreSiteDefinitions::new(objects.clone());
+        let definitions = Arc::new(if store.list().await?.is_empty() {
+            Vec::new()
+        } else {
+            site_definitions(objects.clone()).effective_runtime().await?
+        });
+        SITE_SETTINGS_CACHE.put("effective", definitions.clone());
+        definitions
     };
-    store_site_settings(&settings);
-    Ok(settings)
+    if definitions.is_empty() {
+        return load_bundled_site_settings();
+    }
+    let contents: Vec<&str> = definitions.iter().map(|(_, yaml)| yaml.as_str()).collect();
+    SiteSetting::load_bundled(&contents).map(Arc::new)
 }
 
 /// 更新系ハンドラ向けの非キャッシュ版。キュー投入 / convert のターゲット
@@ -104,27 +101,18 @@ pub async fn load_site_settings_uncached(
 /// この時間で追従する (サイト定義は頻繁に変わらないので十分)。
 const SITE_SETTINGS_TTL_MS: f64 = 30_000.0;
 
-/// L1 キャッシュの中身: `(書き込み時刻 (ms), コンパイル済み定義)`。
-type SiteSettingsCache = Option<(f64, Arc<Vec<SiteSetting>>)>;
+type CachedSiteDefinitions = Arc<Vec<(String, String)>>;
 
-static SITE_SETTINGS_CACHE: std::sync::LazyLock<std::sync::Mutex<SiteSettingsCache>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-
-fn cached_site_settings() -> Option<Arc<Vec<SiteSetting>>> {
-    let cache = SITE_SETTINGS_CACHE.lock().ok()?;
-    let (stored_at, settings) = cache.as_ref()?;
-    (js_sys::Date::now() - stored_at < SITE_SETTINGS_TTL_MS).then(|| settings.clone())
-}
-
-fn store_site_settings(settings: &Arc<Vec<SiteSetting>>) {
-    if let Ok(mut cache) = SITE_SETTINGS_CACHE.lock() {
-        *cache = Some((js_sys::Date::now(), settings.clone()));
-    }
-}
+static SITE_SETTINGS_CACHE: std::sync::LazyLock<
+    crate::isolate_cache::TtlMap<CachedSiteDefinitions>,
+> = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(
+    SITE_SETTINGS_TTL_MS, 512 * 1024, |definitions| {
+        definitions.capacity() * std::mem::size_of::<(String, String)>()
+            + definitions.iter().map(|(name, yaml)| name.capacity() + yaml.capacity()).sum::<usize>()
+    },
+));
 
 /// サイト定義を書き換えた直後に呼ぶ (同じ isolate のキャッシュを落とす)。
 pub fn invalidate_site_settings() {
-    if let Ok(mut cache) = SITE_SETTINGS_CACHE.lock() {
-        *cache = None;
-    }
+    SITE_SETTINGS_CACHE.invalidate("effective");
 }

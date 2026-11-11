@@ -46,6 +46,10 @@ jobs:
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_deploy_secret_masking.py'
       - name: Worker content publication and migration regressions
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_content_storage_sql.py'
+      - name: Worker bounded runtime regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_bounded_runtime_sql.py'
+      - name: Web UI streamed transfer regressions
+        run: node --test tests/transfer_streaming.test.mjs
       - name: Web UI source-link escaping regressions
         run: node --test tests/render_links.test.mjs
       - name: Web UI progress bar regressions
@@ -101,6 +105,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p narou_rs --target wasm32-unknown-unknown --no-default-features --features worker-runtime
       - run: cargo check -p narou_worker --target wasm32-unknown-unknown
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Build and exercise the standalone streaming WASM API
+        run: |
+          cargo build --manifest-path transfer_wasm/Cargo.toml --target wasm32-unknown-unknown --release
+          version=$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("Cargo.lock", "rb"))["package"] if p["name"] == "wasm-bindgen"))')
+          cargo install wasm-bindgen-cli --version "$version" --locked
+          wasm-bindgen target/wasm32-unknown-unknown/release/narou_transfer_wasm.wasm --target nodejs --out-dir target/transfer-wasm-smoke
+          node transfer_wasm/tests/streaming.mjs target/transfer-wasm-smoke/narou_transfer_wasm.js
 
   worker:
     name: Worker release artifact
@@ -159,6 +173,8 @@ jobs:
           NAROU_CHECK_UNCONFIGURED: "1"
       - name: Worker compressed content lifecycle
         run: node tests/content_storage.mjs
+      - name: Worker abrupt termination and checkpoint recovery
+        run: node tests/runtime_recovery.mjs
 
   # デプロイ。GitHub Environments は用途で 2 つに分ける:
   #   `Cloudflare` … この 2 ジョブ (develop / production) が使う Workers 用の値

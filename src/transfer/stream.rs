@@ -1,7 +1,7 @@
-//! Incremental ZIP output. File bodies are released after each entry; only the
-//! manifest and ZIP directory remain resident until the archive is finished.
+//! Incremental ZIP output. Bodies are read and written in 64 KiB chunks; only
+//! manifest metadata and the ZIP directory remain resident until completion.
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Write};
 
 use sha2::{Digest, Sha256};
 use zip::write::{SimpleFileOptions, StreamWriter};
@@ -11,22 +11,6 @@ use super::{ArchiveFile, ArchiveManifest, ArchiveNovel, FORMAT_VERSION, MANIFEST
     MAX_ARCHIVE_BYTES, MAX_ENTRIES, MAX_FILE_BYTES, MAX_MANIFEST_BYTES, MAX_NOVELS,
     MAX_TOTAL_UNCOMPRESSED_BYTES, Result, TransferError};
 use super::archive::{reject_file_directory_conflicts, validate_relative_path};
-/// One-entry output buffer, drained by the transport before reading another file.
-#[derive(Clone, Default)]
-pub struct TransferBuffer(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
-
-impl TransferBuffer {
-    pub fn take(&self) -> Vec<u8> { std::mem::take(&mut *self.0.lock()) }
-}
-
-impl Write for TransferBuffer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-}
-
 
 struct LimitedWriter<W> {
     inner: W,
@@ -48,7 +32,7 @@ impl<W: Write> Write for LimitedWriter<W> {
 pub struct ArchiveStream<W: Write> {
     writer: ZipWriter<StreamWriter<LimitedWriter<W>>>,
     manifest: ArchiveManifest,
-    paths: HashSet<String>,
+    paths: HashSet<[u8; 32]>,
     files: usize,
     uncompressed: u64,
 }
@@ -82,25 +66,39 @@ impl<W: Write> ArchiveStream<W> {
     }
 
     pub fn add_file(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+        self.add_reader(path, &mut std::io::Cursor::new(bytes))
+    }
+
+    /// Copy one entry without retaining its body. The destination's `Write`
+    /// implementation provides backpressure and cancellation.
+    pub fn add_reader(&mut self, path: &str, reader: &mut dyn Read) -> Result<()> {
         let path = validate_relative_path(path)?;
         let index = self.manifest.novels.len().checked_sub(1)
             .ok_or_else(|| TransferError::InvalidArchive("作品が指定されていません".into()))?;
-        if !self.paths.insert(path.to_lowercase()) {
+        if !self.paths.insert(Sha256::digest(path.to_lowercase().as_bytes()).into()) {
             return Err(TransferError::InvalidArchive(format!("duplicate file path {path:?}")));
         }
-        if bytes.len() as u64 > MAX_FILE_BYTES {
-            return Err(TransferError::TooLarge(format!("{path}: ファイルが上限を超えています")));
-        }
         self.files += 1;
-        self.uncompressed = self.uncompressed.saturating_add(bytes.len() as u64);
-        if self.files > MAX_ENTRIES || self.uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
-            return Err(TransferError::TooLarge("転送データの件数・展開後サイズが上限を超えています".into()));
+        if self.files > MAX_ENTRIES {
+            return Err(TransferError::TooLarge("転送データの件数が上限を超えています".into()));
         }
-        let sha256 = hex::encode(Sha256::digest(bytes));
         self.writer.start_file(format!("novels/{index}/{path}"), options())?;
-        self.writer.write_all(bytes).map_err(zip_io)?;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut hash = Sha256::new();
+        let mut size = 0u64;
+        loop {
+            let count = reader.read(&mut buffer).map_err(zip_io)?;
+            if count == 0 { break; }
+            size += count as u64;
+            self.uncompressed += count as u64;
+            if size > MAX_FILE_BYTES || self.uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
+                return Err(TransferError::TooLarge(format!("{path}: 展開後サイズが上限を超えています")));
+            }
+            hash.update(&buffer[..count]);
+            self.writer.write_all(&buffer[..count]).map_err(zip_io)?;
+        }
         self.manifest.novels[index].files.push(ArchiveFile {
-            path, bytes: Vec::new(), sha256: Some(sha256), size: Some(bytes.len() as u64),
+            path, bytes: Vec::new(), sha256: Some(hex::encode(hash.finalize())), size: Some(size),
         });
         Ok(())
     }
@@ -109,8 +107,11 @@ impl<W: Write> ArchiveStream<W> {
         if let Some(novel) = self.manifest.novels.last() {
             let index = self.manifest.novels.len() - 1;
             reject_file_directory_conflicts(novel.files.iter().map(|file| file.path.as_str()), index)?;
-            if !novel.files.iter().any(|file| file.path == "toc.yaml") {
+            if novel.virtual_members.is_none() && !novel.files.iter().any(|file| file.path == "toc.yaml") {
                 return Err(TransferError::InvalidArchive(format!("{} に toc.yaml がありません", novel.title)));
+            }
+            if novel.virtual_members.is_some() && novel.files.iter().any(|file| !super::is_virtual_input_file(&file.path)) {
+                return Err(TransferError::InvalidArchive("virtual parent contains non-input files".into()));
             }
         }
         Ok(())
@@ -118,16 +119,31 @@ impl<W: Write> ArchiveStream<W> {
 
     pub fn finish(mut self) -> Result<()> {
         self.end_novel()?;
-        let bytes = serde_json::to_vec(&self.manifest)?;
-        if bytes.len() as u64 > MAX_MANIFEST_BYTES
-            || self.uncompressed.saturating_add(bytes.len() as u64) > MAX_TOTAL_UNCOMPRESSED_BYTES {
+        super::structure::validate(&self.manifest)?;
+        // Count without allocating a second manifest, then serialize directly
+        // into the compressor. Even the directory is written to the sink.
+        let mut counter = CountingWriter(0);
+        serde_json::to_writer(&mut counter, &self.manifest)?;
+        if counter.0 > MAX_MANIFEST_BYTES
+            || self.uncompressed.saturating_add(counter.0) > MAX_TOTAL_UNCOMPRESSED_BYTES {
             return Err(TransferError::TooLarge("manifest を含む転送データが上限を超えています".into()));
         }
         self.writer.start_file(MANIFEST_PATH, options())?;
-        self.writer.write_all(&bytes).map_err(zip_io)?;
+        serde_json::to_writer(&mut self.writer, &self.manifest)?;
         self.writer.finish()?;
         Ok(())
     }
+}
+
+pub(super) struct CountingWriter(pub u64);
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("manifest size overflow"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
 fn options() -> SimpleFileOptions {

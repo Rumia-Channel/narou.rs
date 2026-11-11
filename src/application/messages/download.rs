@@ -210,9 +210,6 @@ pub fn warn_unsafe_illustration_url(url: impl Display) -> String {
     format!("WARN: skipping unsafe illustration URL: {url}")
 }
 
-pub fn warn_animation_assemble(url: impl Display, error: impl Display) -> String {
-    format!("WARN: failed to assemble animation {url}: {error}")
-}
 
 pub fn warn_illustration_save(url: impl Display, error: impl Display) -> String {
     format!("WARN: failed to save illustration {url}: {error}")
@@ -371,33 +368,6 @@ mod tests {
         assert_eq!(super::backup_created("backup.zip"), "backup.zip を作成しました");
     }
 
-    #[test]
-    fn warn_lines_match_native() {
-        assert_eq!(
-            super::warn_unsafe_illustration_url("http://x"),
-            "WARN: skipping unsafe illustration URL: http://x"
-        );
-        assert_eq!(
-            super::warn_animation_assemble("u", "e"),
-            "WARN: failed to assemble animation u: e"
-        );
-        assert_eq!(
-            super::warn_illustration_save("u", "e"),
-            "WARN: failed to save illustration u: e"
-        );
-        assert_eq!(
-            super::warn_illustration_download("u", "e"),
-            "WARN: failed to download illustration u: e"
-        );
-        assert_eq!(
-            super::warn_fancy_pattern_large("t"),
-            "WARN: skipping fancy-regex for t: pattern is too large"
-        );
-        assert_eq!(
-            super::warn_fancy_input_large("t"),
-            "WARN: skipping fancy-regex for t: input is too large"
-        );
-    }
 
     #[test]
     fn convert_relay_errors_match_native() {

@@ -15,7 +15,43 @@ pub trait ProgressReporter: Send + Sync {
     fn inc(&self, delta: u64);
     fn set_message(&self, msg: &str);
     fn finish_with_message(&self, msg: &str);
-    fn println(&self, msg: &str);
+    #[cfg(feature = "native-runtime")]
+    fn println(&self, msg: &str) { eprintln!("{msg}"); }
+
+    /// Async transports flush their finite current-state snapshot here. The
+    /// synchronous setters above must not enqueue transport work on Workers.
+    fn flush(&self) -> crate::platform::PlatformFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
+    fn set_length_async(&self, len: u64) -> crate::platform::PlatformFuture<'_, ()> {
+        self.set_length(len);
+        self.flush()
+    }
+    fn set_position_async(&self, pos: u64) -> crate::platform::PlatformFuture<'_, ()> {
+        self.set_position(pos);
+        self.flush()
+    }
+    fn inc_async(&self, delta: u64) -> crate::platform::PlatformFuture<'_, ()> {
+        self.inc(delta);
+        self.flush()
+    }
+    fn set_message_async(&self, msg: &str) -> crate::platform::PlatformFuture<'_, ()> {
+        self.set_message(msg);
+        self.flush()
+    }
+    fn finish_with_message_async(&self, msg: &str) -> crate::platform::PlatformFuture<'_, ()> {
+        self.finish_with_message(msg);
+        self.flush()
+    }
+    fn println_async<'a>(&'a self, msg: &'a str) -> crate::platform::PlatformFuture<'a, ()> {
+        Box::pin(async move {
+            #[cfg(feature = "native-runtime")]
+            self.println(msg);
+            #[cfg(not(feature = "native-runtime"))]
+            eprintln!("{msg}");
+        })
+    }
 
     /// 対話プロンプトのように、進捗表示と競合させたくない処理を包む。
     /// 既定はそのまま実行 (Web / テスト用)。CLI 実装は表示を一時停止する。
@@ -33,6 +69,7 @@ impl ProgressReporter for NoProgress {
     fn inc(&self, _delta: u64) {}
     fn set_message(&self, _msg: &str) {}
     fn finish_with_message(&self, _msg: &str) {}
+    #[cfg(feature = "native-runtime")]
     fn println(&self, msg: &str) {
         eprintln!("{}", msg);
     }

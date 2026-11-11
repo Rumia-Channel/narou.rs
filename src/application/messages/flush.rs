@@ -1,106 +1,128 @@
-//! 同期 `emit` を非同期送信へ橋渡しする FIFO バッファ。
-//!
-//! Worker の Web コンソールは 1 行ごとに PushHub へ POST するが、
-//! [`MessageSink::emit`](super::MessageSink::emit) は同期 API なので送信は
-//! 起動済みタスクが担う。そのとき守るべき性質をここへ閉じ込める:
-//!
-//! - **順序**: 送信タスクは常に 1 本。`take` は積まれた順にまとめて返す。
-//! - **取りこぼしなし**: 送信が終わって idle に戻す瞬間に積まれた行は、
-//!   自分でもう一周するか、その `push` に新しいタスクを起動させる
-//!   ([`FlushQueue::finish`] の戻り値が「続けるべきか」を表す)。
-//! - **間引き**: 連続 emit で 1 行 1 送信にならないよう、送信直後だけ
-//!   最小間隔を空ける ([`FlushQueue::wait_ms`])。最初の 1 通は待たないので
-//!   進捗の初動は遅れない。
-//!
-//! Worker 側 (`worker_entry::push_hub`) は spawn と実際の送信だけを書く。
+//! Invocation-owned, byte-bounded FIFO. Async producers await capacity; only
+//! explicitly replaceable progress snapshots may coalesce. Console/terminal
+//! events retain order. Bytes remain charged while a batch is in flight.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker};
 
-/// 送信の最小間隔 (ms)。ダウンロードの進捗行は 1 話ごとに届くので、この
-/// 程度で十分まとまり、かつ 1 通あたりのサブリクエストを抑えられる。
 pub const DEFAULT_MIN_INTERVAL_MS: u64 = 150;
+pub const DEFAULT_MAX_BYTES: usize = 256 * 1024;
 
-/// 同期送出と非同期送信のあいだに置くバッファ。
+#[derive(Debug)]
+struct State<T> {
+    items: VecDeque<(T, usize)>,
+    bytes: usize,
+    in_flight_bytes: usize,
+    last_send_ms: u64,
+    producer: Option<Waker>,
+    consumer: Option<Waker>,
+}
+
+/// One invocation has one producer, and at most one sender.
 #[derive(Debug)]
 pub struct FlushQueue<T> {
-    items: Mutex<Vec<T>>,
-    /// 送信タスクが動いているか (true の間は新しいタスクを起動しない)。
-    sending: AtomicBool,
-    /// 直近で送信を始めた時刻 (ms)。0 = まだ送っていない。
-    last_send_ms: AtomicU64,
+    state: Mutex<State<T>>,
     min_interval_ms: u64,
+    max_bytes: usize,
+    measure: fn(&T) -> usize,
+    replaces: fn(&T, &T) -> bool,
 }
 
 impl<T> FlushQueue<T> {
-    pub fn new(min_interval_ms: u64) -> Self {
+    pub fn new(min_interval_ms: u64, max_bytes: usize, measure: fn(&T) -> usize, replaces: fn(&T, &T) -> bool) -> Self {
         Self {
-            items: Mutex::new(Vec::new()),
-            sending: AtomicBool::new(false),
-            last_send_ms: AtomicU64::new(0),
-            min_interval_ms,
+            state: Mutex::new(State {
+                items: VecDeque::new(), bytes: 0, in_flight_bytes: 0,
+                last_send_ms: 0, producer: None, consumer: None,
+            }),
+            min_interval_ms, max_bytes, measure, replaces,
         }
     }
 
-    /// 1 件積む。戻り値が true のとき、呼び出し側は送信タスクを起動する
-    /// (false は「既にタスクが動いている」か「バッファが壊れている」)。
-    pub fn push(&self, item: T) -> bool {
-        match self.items.lock() {
-            Ok(mut items) => items.push(item),
-            Err(_) => return false,
-        }
-        self.sending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    /// Oversized individual events must be delivered directly under backpressure.
+    pub fn fits(&self, item: &T) -> bool {
+        (self.measure)(item).saturating_add(std::mem::size_of::<(T, usize)>()) <= self.max_bytes
     }
 
-    /// 積まれている分を FIFO で取り出す。空なら `None`。
+    /// Rejected ownership stays with the producer, which must await capacity.
+    pub fn try_push(&self, item: T) -> Result<(), T> {
+        let bytes = (self.measure)(&item).saturating_add(std::mem::size_of::<(T, usize)>());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let replace = state.items.iter().rposition(|(old, _)| (self.replaces)(old, &item));
+        let removed = replace.map_or(0, |index| state.items[index].1);
+        if state.bytes.saturating_sub(removed).saturating_add(bytes) > self.max_bytes {
+            return Err(item);
+        }
+        if let Some(index) = replace { state.items.remove(index); }
+        state.bytes = state.bytes - removed + bytes;
+        state.items.push_back((item, bytes));
+        let consumer = state.consumer.take();
+        drop(state);
+        if let Some(consumer) = consumer { consumer.wake(); }
+        Ok(())
+    }
+
+    pub fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.bytes <= self.max_bytes / 2 {
+            Poll::Ready(())
+        } else {
+            state.producer = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    /// Wait for an actual release after a failed `try_push`, even if below the
+    /// ordinary low-water mark. The producer retains only its single item.
+    pub fn poll_empty(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.bytes == 0 { Poll::Ready(()) }
+        else {
+            state.producer = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    pub fn poll_pending(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.items.is_empty() { Poll::Ready(()) }
+        else {
+            state.consumer = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
     pub fn take(&self) -> Option<Vec<T>> {
-        let mut items = self.items.lock().ok()?;
-        if items.is_empty() {
-            return None;
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.items.is_empty() || state.in_flight_bytes != 0 { return None; }
+        let mut batch = Vec::with_capacity(state.items.len().min(64));
+        while batch.len() < 64 && state.in_flight_bytes < 64 * 1024 {
+            let Some((item, bytes)) = state.items.pop_front() else { break };
+            state.in_flight_bytes += bytes;
+            batch.push(item);
         }
-        Some(std::mem::take(&mut *items))
+        Some(batch)
     }
 
-    /// 送信が終わったことを記録する。まだ積まれていて自分が続けるべきなら
-    /// true を返す (呼び出し側は送信ループをもう一周する)。
     pub fn finish(&self) -> bool {
-        self.sending.store(false, Ordering::Release);
-        if !self.is_pending() {
-            return false;
-        }
-        self.sending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        let (more, producer) = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.bytes -= state.in_flight_bytes;
+            state.in_flight_bytes = 0;
+            (!state.items.is_empty(), state.producer.take())
+        };
+        if let Some(producer) = producer { producer.wake(); }
+        more
     }
 
-    /// まだ送っていない行が残っているか。
-    pub fn is_pending(&self) -> bool {
-        self.items
-            .lock()
-            .map(|items| !items.is_empty())
-            .unwrap_or(false)
-    }
-
-    /// 送信タスクが動いているか (テストと診断用)。
-    pub fn is_sending(&self) -> bool {
-        self.sending.load(Ordering::Acquire)
-    }
-
-    /// 送信を始めた時刻を記録する (間引きの基準)。
     pub fn mark_sent(&self, now_ms: u64) {
-        self.last_send_ms.store(now_ms, Ordering::Relaxed);
+        self.state.lock().unwrap_or_else(|error| error.into_inner()).last_send_ms = now_ms;
     }
 
-    /// 次の送信まで待つべき時間 (ms)。0 ならすぐ送ってよい。
     pub fn wait_ms(&self, now_ms: u64) -> u64 {
-        let last = self.last_send_ms.load(Ordering::Relaxed);
-        if last == 0 {
-            return 0;
-        }
-        self.min_interval_ms
-            .saturating_sub(now_ms.saturating_sub(last))
+        let last = self.state.lock().unwrap_or_else(|error| error.into_inner()).last_send_ms;
+        if last == 0 { 0 } else { self.min_interval_ms.saturating_sub(now_ms.saturating_sub(last)) }
     }
 }
 
@@ -108,72 +130,71 @@ impl<T> FlushQueue<T> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_first_push_starts_one_sender_and_a_burst_is_coalesced() {
-        let queue = FlushQueue::new(DEFAULT_MIN_INTERVAL_MS);
-        assert!(queue.push(1), "idle からの push は送信タスクを起動する");
-        assert!(!queue.push(2), "送信中の push は新しいタスクを起動しない");
-        assert!(!queue.push(3));
-
-        assert_eq!(queue.take(), Some(vec![1, 2, 3]), "積んだ順にまとめて送る");
-        assert_eq!(queue.take(), None, "空になったら送るものは無い");
+    fn queue(capacity: usize) -> FlushQueue<String> {
+        FlushQueue::new(150, capacity, String::capacity, |_, _| false)
     }
 
     #[test]
-    fn pushes_during_a_send_are_picked_up_by_the_same_task() {
-        let queue = FlushQueue::new(0);
-        assert!(queue.push(1));
-        assert_eq!(queue.take(), Some(vec![1])); // 送信開始
-
-        assert!(!queue.push(2), "送信中の push はタスクを増やさない");
-        // 送信完了 → 残りがあるので同じタスクがもう一周する。
-        assert!(queue.finish());
-        assert_eq!(queue.take(), Some(vec![2]));
-        assert!(!queue.finish(), "空になったらタスクは終了する");
-        assert!(!queue.is_sending());
-    }
-
-    #[test]
-    fn a_push_after_the_final_take_starts_a_new_sender() {
-        let queue = FlushQueue::new(0);
-        assert!(queue.push(1));
-        assert_eq!(queue.take(), Some(vec![1]));
+    fn in_flight_bytes_apply_backpressure_without_dropping_console_lines() {
+        let queue = queue(256);
+        queue.try_push("first".repeat(20)).unwrap();
+        let first = queue.take().unwrap();
+        let next = "second".repeat(20);
+        assert_eq!(queue.try_push(next.clone()), Err(next.clone()));
         assert!(!queue.finish());
-        assert!(!queue.is_sending());
-
-        // idle に戻ったあとの行は新しいタスクが送る (取りこぼさない)。
-        assert!(queue.push(2));
-        assert_eq!(queue.take(), Some(vec![2]));
+        queue.try_push(next.clone()).unwrap();
+        assert_eq!(first, vec!["first".repeat(20)]);
+        assert_eq!(queue.take(), Some(vec![next]));
         assert!(!queue.finish());
     }
 
     #[test]
-    fn order_is_kept_across_batches() {
-        let queue = FlushQueue::new(0);
-        assert!(queue.push("a"));
-        assert_eq!(queue.take(), Some(vec!["a"]));
-        assert!(!queue.push("b"));
-        assert!(queue.finish());
-        assert_eq!(queue.take(), Some(vec!["b"]));
+    fn only_matching_replaceable_progress_is_coalesced() {
+        let queue = FlushQueue::new(0, 512, |s: &String| s.capacity(), |a, b| a.starts_with("step:") && b.starts_with("step:"));
+        queue.try_push("step:1".into()).unwrap();
+        queue.try_push("console".into()).unwrap();
+        queue.try_push("step:2".into()).unwrap();
+        queue.try_push("terminal".into()).unwrap();
+        assert_eq!(queue.take(), Some(vec!["console".into(), "step:2".into(), "terminal".into()]));
         assert!(!queue.finish());
     }
 
     #[test]
-    fn the_throttle_only_applies_after_a_send() {
-        let queue: FlushQueue<u8> = FlushQueue::new(DEFAULT_MIN_INTERVAL_MS);
-        assert_eq!(queue.wait_ms(1_000), 0, "未送信なら待たない");
-
-        queue.mark_sent(1_000);
-        assert_eq!(queue.wait_ms(1_000), DEFAULT_MIN_INTERVAL_MS);
-        assert_eq!(queue.wait_ms(1_100), DEFAULT_MIN_INTERVAL_MS - 100);
-        assert_eq!(queue.wait_ms(1_150), 0);
-        assert_eq!(queue.wait_ms(2_000), 0, "間隔を過ぎたら待たない");
+    fn batches_are_single_flight_and_throttled() {
+        let queue = queue(4096);
+        queue.try_push("a".into()).unwrap();
+        queue.try_push("b".into()).unwrap();
+        assert_eq!(queue.wait_ms(1000), 0);
+        queue.mark_sent(1000);
+        assert_eq!(queue.wait_ms(1100), 50);
+        assert_eq!(queue.take(), Some(vec!["a".into(), "b".into()]));
+        assert!(queue.take().is_none(), "a second batch cannot bypass an in-flight batch");
+        assert!(!queue.finish());
+        queue.try_push("c".into()).unwrap();
     }
 
     #[test]
-    fn interval_zero_never_waits() {
-        let queue: FlushQueue<u8> = FlushQueue::new(0);
-        queue.mark_sent(500);
-        assert_eq!(queue.wait_ms(500), 0);
+    fn queued_output_wakes_the_invocation_owned_sender() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::task::Wake;
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+        }
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let queue = queue(4096);
+        assert!(queue.poll_pending(&mut cx).is_pending());
+        queue.try_push("first".into()).unwrap();
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        assert!(queue.poll_pending(&mut cx).is_ready());
+        assert_eq!(queue.take(), Some(vec!["first".into()]));
+        assert!(!queue.finish());
+        assert!(queue.poll_pending(&mut cx).is_pending());
+        queue.try_push("second".into()).unwrap();
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
+        assert_eq!(queue.take(), Some(vec!["second".into()]));
+        assert!(!queue.finish());
     }
 }

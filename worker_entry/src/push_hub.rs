@@ -63,9 +63,6 @@ const CHUNK_KEY_PREFIX: &str = "h:";
 const PROGRESS_KEY: &str = "progress";
 /// 1 POST で受け付けるイベント数の上限 (高々数件を想定した安全弁)。
 const MAX_EVENTS_PER_POST: usize = 64;
-/// Drain waits for the sole sender; it never steals a pending batch and races
-/// a terminal event ahead of an in-flight progress update.
-const DRAIN_POLL_MS: u64 = 10;
 
 /// 履歴チャンクの storage キー。
 fn chunk_key(seq: u64) -> String {
@@ -319,14 +316,9 @@ fn event_batches<'a>(events: &'a [Value]) -> impl Iterator<Item = &'a [Value]> +
 /// ユーザーに見える行を PushHub の `echo` イベントへ流す
 /// [`narou_rs::application::messages::MessageSink`] 実装。
 ///
-/// `emit` は同期 API なので、行はバッファへ積んでから送信タスク
-/// (`wasm_bindgen_futures::spawn_local`) を起動する。タスクは常に 1 本で、
-/// 積まれた行をまとめて 1 POST にしつつ、送信のたびに最小間隔だけ間引く
-/// ([`messages::flush::FlushQueue`] が順序・取りこぼし・間隔を管理する)。
-///
-/// 以前はジョブの区切りでだけ `drain()` していたため、ダウンロードの
-/// 1 話ごとの進捗行が完了時にまとめて出ていた。ジョブ境界の `drain()` は
-/// 残りの送信を保証する最後の砦として残す。
+/// The invocation polls its producer and one sender together. Producers wait
+/// for byte capacity, not for each send interval; queued and in-flight bytes
+/// stay charged. No detached sender survives completion or cancellation.
 ///
 /// Each invocation owns its queue; concurrent events never share a current sink.
 /// `target_console` は [`Stream::target_console`](narou_rs::application::messages::Stream::target_console)
@@ -347,6 +339,9 @@ impl PushHubSink {
             client,
             queue: Arc::new(messages::flush::FlushQueue::new(
                 messages::flush::DEFAULT_MIN_INTERVAL_MS,
+                messages::flush::DEFAULT_MAX_BYTES,
+                event_memory,
+                replaces_progress,
             )),
             console,
         }
@@ -357,43 +352,97 @@ impl PushHubSink {
         Arc::new(Self::new(client, console))
     }
 
-    pub(crate) fn publish(&self, mut event: Value) {
+    /// Drain output before returning the producer's result, while letting the
+    /// producer advance during batched sends. Dropping this future drops both.
+    pub async fn run<F: Future>(&self, producer: F) -> F::Output {
+        use std::task::Poll;
+        let mut producer = std::pin::pin!(producer);
+        let mut sender = std::pin::pin!(async {
+            loop {
+                std::future::poll_fn(|cx| self.queue.poll_pending(cx)).await;
+                self.send_pending().await;
+            }
+        });
+        let mut output = None;
+        std::future::poll_fn(|cx| {
+            if output.is_none() && let Poll::Ready(value) = producer.as_mut().poll(cx) {
+                output = Some(value);
+            }
+            let _ = sender.as_mut().poll(cx);
+            if output.is_some() && self.queue.poll_empty(cx).is_ready() {
+                Poll::Ready(output.take().unwrap())
+            } else {
+                Poll::Pending
+            }
+        }).await
+    }
+
+    pub(crate) async fn publish(&self, mut event: Value) {
         if event["type"].as_str().is_some_and(|kind| kind.starts_with("progressbar.")) {
             event["target_console"] = Value::from(self.console.unwrap_or("stdout"));
         }
-        if self.queue.push(event) { self.spawn_sender(); }
+        // One unusually long console line is delivered directly after its
+        // predecessors, never queued behind other lines or split/lost.
+        if !self.queue.fits(&event) {
+            self.drain().await;
+            self.client.broadcast_best_effort(std::slice::from_ref(&event)).await;
+            return;
+        }
+        loop {
+            match self.queue.try_push(event) {
+                Ok(()) => return,
+                Err(returned) => event = returned,
+            }
+            std::future::poll_fn(|cx| self.queue.poll_empty(cx)).await;
+        }
     }
 
     /// Console lines and progress share one ordered, batched sender.
-    fn spawn_sender(&self) {
-        let client = self.client.clone();
-        let queue = Arc::clone(&self.queue);
-        wasm_bindgen_futures::spawn_local(async move {
-            loop {
-                let wait = queue.wait_ms(now_ms());
-                if wait > 0 {
-                    worker::Delay::from(std::time::Duration::from_millis(wait)).await;
-                }
-                if let Some(events) = queue.take() {
-                    client.broadcast_best_effort(&events).await;
-                    queue.mark_sent(now_ms());
-                }
-                if !queue.finish() { break; }
+    async fn send_pending(&self) {
+        loop {
+            let wait = self.queue.wait_ms(now_ms());
+            if wait > 0 {
+                worker::Delay::from(std::time::Duration::from_millis(wait)).await;
             }
-        });
+            if let Some(events) = self.queue.take() {
+                self.client.broadcast_best_effort(&events).await;
+                self.queue.mark_sent(now_ms());
+            }
+            if !self.queue.finish() { break; }
+        }
     }
 
-    pub async fn drain(&self) {
-        while self.queue.is_sending() {
-            worker::Delay::from(std::time::Duration::from_millis(DRAIN_POLL_MS)).await;
-        }
+    async fn drain(&self) {
+        std::future::poll_fn(|cx| self.queue.poll_empty(cx)).await;
     }
 }
 
 impl narou_rs::application::messages::MessageSink for PushHubSink {
-    fn emit(&self, stream: narou_rs::application::messages::Stream, text: &str) {
-        self.publish(echo(text, stream.target_console_with(self.console)));
+    fn poll_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        self.queue.poll_ready(cx)
     }
+
+    fn emit_async<'a>(&'a self, stream: messages::Stream, text: &'a str) -> narou_rs::platform::PlatformFuture<'a, ()> {
+        Box::pin(self.publish(echo(text, stream.target_console_with(self.console))))
+    }
+}
+
+fn event_memory(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.capacity().saturating_mul(8),
+        Value::Array(values) => values.capacity() * std::mem::size_of::<Value>()
+            + values.iter().map(event_memory).sum::<usize>(),
+        Value::Object(values) => values.len() * 128
+            + values.iter().map(|(key, value)| key.capacity() * 8 + event_memory(value)).sum::<usize>(),
+        _ => 32,
+    }
+}
+
+fn replaces_progress(old: &Value, new: &Value) -> bool {
+    old["type"] == "progressbar.step" && new["type"] == "progressbar.step"
+        && old["data"]["operation"] == new["data"]["operation"]
+        && old["data"]["scope"] == new["data"]["scope"]
+        && old["target_console"] == new["target_console"]
 }
 
 /// `js_sys::Date::now()` のミリ秒 (間引きの基準にだけ使う単調ではない時計)。
@@ -429,6 +478,7 @@ mod tests {
 pub(crate) struct HubProgress {
     sink: Arc<PushHubSink>,
     state: narou_rs::platform::progress::ProgressState,
+    pending: std::sync::Mutex<[Option<Value>; 3]>,
 }
 
 impl HubProgress {
@@ -436,54 +486,69 @@ impl HubProgress {
         let progress = Self {
             sink,
             state: narou_rs::platform::progress::ProgressState::new(topic, scope, execution_token),
+            pending: std::sync::Mutex::new([None, None, None]),
         };
         progress.state.init(|phase, identity, snapshot| {
-            progress.sink.publish(push_events::progress_update(phase, identity, snapshot));
+            progress.remember(phase, push_events::progress_update(phase, identity, snapshot));
         });
         progress
+    }
+
+    fn remember(&self, phase: narou_rs::platform::progress::ProgressPhase, event: Value) {
+        use narou_rs::platform::progress::ProgressPhase;
+        let index = match phase { ProgressPhase::Init => 0, ProgressPhase::Step => 1, ProgressPhase::Clear => 2 };
+        // Only the current replaceable step is overwritten. Init and clear each
+        // occur once in ProgressState, never a variable-length callback backlog.
+        self.pending.lock().unwrap_or_else(|error| error.into_inner())[index] = Some(event);
     }
 }
 
 impl ProgressReporter for HubProgress {
     fn set_length(&self, len: u64) {
         self.state.set_length(len, |phase, identity, snapshot| {
-            self.sink.publish(push_events::progress_update(phase, identity, snapshot));
+            self.remember(phase, push_events::progress_update(phase, identity, snapshot));
         });
     }
 
     fn set_position(&self, pos: u64) {
         self.state.set_position(pos, |phase, identity, snapshot| {
-            self.sink.publish(push_events::progress_update(phase, identity, snapshot));
+            self.remember(phase, push_events::progress_update(phase, identity, snapshot));
         });
     }
 
     fn inc(&self, delta: u64) {
         self.state.inc(delta, |phase, identity, snapshot| {
-            self.sink.publish(push_events::progress_update(phase, identity, snapshot));
+            self.remember(phase, push_events::progress_update(phase, identity, snapshot));
         });
     }
 
     fn set_message(&self, msg: &str) {
         self.state.set_message(msg, |phase, identity, snapshot| {
-            self.sink.publish(push_events::progress_update(phase, identity, snapshot));
+            self.remember(phase, push_events::progress_update(phase, identity, snapshot));
         });
     }
 
     fn finish_with_message(&self, _msg: &str) {
         self.state.finish(|phase, identity, snapshot| {
-            self.sink.publish(push_events::progress_update(phase, identity, snapshot));
+            self.remember(phase, push_events::progress_update(phase, identity, snapshot));
         });
     }
 
-    fn println(&self, msg: &str) {
+    fn flush(&self) -> narou_rs::platform::PlatformFuture<'_, ()> {
+        Box::pin(async move {
+            for index in 0..3 {
+                let event = self.pending.lock().unwrap_or_else(|error| error.into_inner())[index].take();
+                if let Some(event) = event { self.sink.publish(event).await; }
+            }
+        })
+    }
+
+    fn println_async<'a>(&'a self, msg: &'a str) -> narou_rs::platform::PlatformFuture<'a, ()> {
         use narou_rs::application::messages::{MessageSink, Stream};
-        self.sink.emit(Stream::Stdout, msg);
+        self.sink.emit_async(Stream::Stdout, msg)
     }
 }
 
-impl Drop for HubProgress {
-    fn drop(&mut self) { self.finish_with_message(""); }
-}
 
 #[durable_object]
 pub struct PushHub {

@@ -28,6 +28,14 @@ pub enum TagColorUpdate {
 }
 
 impl TagColors {
+    /// Retained heap size for bounded immutable runtime caches.
+    pub fn heap_bytes(&self) -> usize {
+        self.order.capacity() * std::mem::size_of::<String>()
+            + self.order.iter().map(String::capacity).sum::<usize>()
+            + self.colors.capacity() * (std::mem::size_of::<(String, String)>() + 16)
+            + self.colors.iter().map(|(key, value)| key.capacity() + value.capacity()).sum::<usize>()
+    }
+
     pub fn into_map(self) -> HashMap<String, String> {
         self.colors
     }

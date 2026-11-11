@@ -554,6 +554,49 @@ async fn a_full_16_mib_binary_body_round_trips() {
 }
 
 #[tokio::test]
+async fn negotiated_binary_stream_preserves_metadata_and_full_body() {
+    let upstream = Upstream::start(|_| Action::Response {
+        status: 200,
+        headers: vec![
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            ("Set-Cookie".to_string(), "first=1; Path=/".to_string()),
+            ("Set-Cookie".to_string(), "second=2; Path=/".to_string()),
+        ],
+        body: max_binary(),
+    }).await;
+    let relay = TestRelay::start(test_config()).await;
+    let request = serde_json::to_vec(&json!({
+        "url": upstream.target("/binary-stream"),
+        "headers": {}
+    })).unwrap();
+    let response = request_once(
+        relay.addr,
+        "POST",
+        "/proxy",
+        &[
+            ("X-Proxy-Token", TOKEN),
+            ("Content-Type", "application/json"),
+            ("Accept", narou_relay::wire::STREAM_CONTENT_TYPE),
+        ],
+        Some(&request),
+    ).await;
+    response.expect_status(200);
+    assert_eq!(response.header("content-type").as_deref(), Some(narou_relay::wire::STREAM_CONTENT_TYPE));
+    assert_eq!(&response.body[..4], b"NRS1");
+    let metadata_len = u32::from_be_bytes(response.body[4..8].try_into().unwrap()) as usize;
+    let metadata: serde_json::Value = serde_json::from_slice(&response.body[8..8 + metadata_len]).unwrap();
+    assert_eq!(metadata["status"], 200);
+    assert_eq!(metadata["contentType"], "application/octet-stream");
+    assert_eq!(metadata["via"], "curl");
+    assert_eq!(metadata["setCookie"], json!(["first=1; Path=/", "second=2; Path=/"]));
+    assert_eq!(metadata["bodyLength"], MAX_BODY_BYTES);
+    assert_eq!(&response.body[8 + metadata_len..], max_binary().as_slice());
+    assert_eq!(upstream.seen.count_path("/binary-stream"), 1);
+    relay.stop().await;
+    upstream.stop().await;
+}
+
+#[tokio::test]
 async fn a_compressed_upstream_body_is_returned_decoded() {
     let upstream = Upstream::start(|_| Action::Gzip {
         body: compressed_body(),

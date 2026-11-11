@@ -731,7 +731,7 @@ async fn generate_epub_on_demand(
             title: &record.title,
             author: &record.author,
             settings: &settings,
-            has_images: txt_path
+            has_cover_image: txt_path
                 .parent()
                 .and_then(crate::converter::render::cover_image_path)
                 .is_some(),

@@ -28,7 +28,12 @@ use aozora_epub3_lite::pipeline::{append_gaiji_assets, plan_assets};
 
 use crate::converter::settings::{ImageRotation, NovelSettings};
 use crate::error::{NarouError, Result};
+#[cfg(feature = "native-runtime")]
 use crate::illustration_refs::collect;
+
+#[path = "epub_lite_stream.rs"]
+mod streaming;
+pub use streaming::{ImageScratch, StreamingBuild, StreamingPreparation, image_metadata, prepare_image};
 
 /// ライブラリ利用側 (Worker など) が入力源を実装するために使う。
 pub use aozora_epub3_lite::{FileSource, InputError};
@@ -269,15 +274,13 @@ pub struct EpubSettingsInput<'a> {
     pub author: &'a str,
     /// per-novel 設定 (`enable_yokogaki` = 横書き、`enable_illust` = 挿絵)。
     pub settings: &'a NovelSettings,
-    /// 表紙に使える挿絵 (表紙候補) があるか。
+    /// 明示的な `cover.jpg` / `cover.png` / `cover.jpeg` があるか。
     ///
-    /// 判定の規則は保存構成ごとに違う: native Web は `cover.{jpg,png,jpeg}`
-    /// の実在 (`converter::render::cover_image_path`)、Worker は挿絵の実体を
-    /// 一覧から拾った結果。[`EpubBuildOptions::from_settings`] はこの値に
-    /// `enable_illust` を掛けたものを表紙条件にする。native CLI は Java の
-    /// `-c 0` と同じく `cover.{jpg,png,jpeg}` の実在だけで決め `enable_illust`
-    /// を見ないため、この組み立てを使わない。
-    pub has_images: bool,
+    /// 本文の挿絵が存在するだけでは true にしない。native は表紙注記を本文の
+    /// 先頭へ挿入し、Worker は同じ表紙を画像計画の先頭へ渡す。
+    /// この組み立てでは `enable_illust` も必要。native CLI は Java の
+    /// `-c 0` と同じく表紙の実在だけで決めるため、この組み立てを使わない。
+    pub has_cover_image: bool,
     /// 呼び出し側が組んだ EPUB 資産 ([`EpubBuildOptions::extra_assets`])。
     ///
     /// narou カスタム CSS / 濁点フォントは [`narou_font_assets`]
@@ -297,15 +300,15 @@ impl EpubBuildOptions {
     ///
     /// - 書字方向は per-novel `enable_yokogaki` (横書き指定) の否定。縦書きの
     ///   小説を勝手に横組みにしない / 横書き指定を縦組みにしない。
-    /// - 表紙は `enable_illust` かつ表紙候補があるときだけ
-    ///   ([`EpubSettingsInput::has_images`] の判定は構成ごとに違う)。
+    /// - 表紙は `enable_illust` かつ明示的な表紙ファイルがあるときだけ
+    ///   ([`EpubSettingsInput::has_cover_image`])。
     /// - 濁点フォントは [`EpubSettingsInput::extra_assets`] のとおり。
     pub fn from_settings(input: EpubSettingsInput<'_>) -> Self {
         Self {
             title: input.title.to_string(),
             author: input.author.to_string(),
             vertical: !input.settings.enable_yokogaki,
-            cover_from_first_image: input.settings.enable_illust && input.has_images,
+            cover_from_first_image: input.settings.enable_illust && input.has_cover_image,
             assets_dir: input.assets_dir,
             kindle: input.kindle,
             extra_assets: input.extra_assets,
@@ -545,6 +548,7 @@ impl EpubPreparation {
     fn from_input(input: Input, options: &EpubBuildOptions) -> Result<Self> {
         let mut config = config_for(options.assets_dir.as_deref());
         apply_rotate_image(&mut config, options.rotate_image);
+        config.vertical = options.vertical;
         let Some(entry) = input.text_entries().first() else {
             return Err(NarouError::Conversion(
                 "変換済みテキストが空です".to_string(),
@@ -623,6 +627,7 @@ impl EpubPreparation {
             .flat_map(|asset| asset.references.iter().cloned())
             .collect::<Vec<_>>();
         let references = image_references(&text);
+        #[cfg(feature = "native-runtime")]
         if input.has_source() && !config.no_illust {
             let unresolved = collect(&text)
                 .into_iter()
@@ -849,6 +854,7 @@ pub fn build_book(input_txt: &Path, options: &EpubBuildOptions) -> Result<EpubBu
     build_from_input(input, options)
 }
 
+#[cfg(feature = "native-runtime")]
 /// 挿絵参照の解決結果を報告する。
 ///
 /// 本文が参照している挿絵が入力に無い場合、EPUB からその挿絵が落ちる —
@@ -944,15 +950,12 @@ pub fn stream_epub<W: Write>(
         .map_err(|error| NarouError::Conversion(format!("EPUB書き出しに失敗しました: {error}")))
 }
 
-/// EPUB 書き出しのシンク。1 エントリ分のバイト列を溜め、書き出し側が
-/// エントリを書き終えるたびに [`ChunkSink::take`] で引き取る。
-///
-/// `Clone` しても同じバッファを共有するので、`EpubStreamWriter` に渡した
-/// clone が書いた内容を呼び出し側のハンドルから読める (Worker の応答のように
-/// チャンクを 1 つずつ外へ流す用途を想定)。
+/// Synchronous output from one bounded ZIP write. The asynchronous caller drains
+/// this sink after each chunk and entry boundary, before reading more input.
+/// ZIP directory metadata is emitted by `finish`; asset payloads never accumulate.
 #[derive(Clone, Default)]
 pub struct ChunkSink {
-    buffer: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl ChunkSink {
@@ -962,13 +965,13 @@ impl ChunkSink {
 
     /// 溜まっているバイト列を取り出してバッファを空にする。
     pub fn take(&self) -> Vec<u8> {
-        std::mem::take(&mut *self.buffer.borrow_mut())
+        std::mem::take(&mut *self.buffer.lock().expect("EPUB sink lock poisoned"))
     }
 }
 
 impl Write for ChunkSink {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.buffer.borrow_mut().extend_from_slice(bytes);
+        self.buffer.lock().map_err(|_| std::io::Error::other("EPUB sink lock poisoned"))?.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -1328,7 +1331,7 @@ mod tests {
         stream_epub(&build.book, &mut batch, |path| build.resolve(path)).unwrap();
 
         let sink = ChunkSink::new();
-        let mut writer = build.book.stream_writer(sink.clone()).unwrap();
+        let mut writer = build.book.clone().stream_writer(sink.clone()).unwrap();
         let mut streamed = Vec::new();
         let mut chunks = 0;
         while let Some(info) = writer.next_entry() {
@@ -1384,7 +1387,7 @@ mod tests {
         assert!(build.resolve("image/0001.png").is_none());
 
         let sink = ChunkSink::new();
-        let mut writer = build.book.stream_writer(sink.clone()).unwrap();
+        let mut writer = build.book.clone().stream_writer(sink.clone()).unwrap();
         let mut streamed = Vec::new();
         while let Some(info) = writer.next_entry() {
             let bytes = info.asset_path.as_deref().map(|path| {

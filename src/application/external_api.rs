@@ -352,7 +352,7 @@ pub struct ExternalApiService {
     content: Arc<NovelContentService>,
     settings: Arc<SettingsService>,
     virtual_novels: Arc<dyn VirtualNovelDirectory>,
-    api_tokens: Arc<ApiTokenService>,
+    api_tokens: ApiTokenService,
 }
 
 impl ExternalApiService {
@@ -361,7 +361,7 @@ impl ExternalApiService {
         content: Arc<NovelContentService>,
         settings: Arc<SettingsService>,
         virtual_novels: Arc<dyn VirtualNovelDirectory>,
-        api_tokens: Arc<ApiTokenService>,
+        api_tokens: ApiTokenService,
     ) -> Self {
         Self {
             library,
