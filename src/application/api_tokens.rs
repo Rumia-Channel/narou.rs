@@ -87,6 +87,9 @@ pub trait ApiTokenStore: PlatformService {
 }
 
 /// トークンの管理サービス。
+///
+/// Clones share the store, not a snapshot of its tokens.
+#[derive(Clone)]
 pub struct ApiTokenService {
     store: Arc<dyn ApiTokenStore>,
 }

@@ -91,8 +91,8 @@ pub type PlatformFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
 /// Marker for services that live on the platform side of the abstraction.
 ///
 /// On native, services are shared across threads (`Send + Sync`, required by
-/// `tokio::spawn` and the axum `State`); on `wasm32` every type is `Send`
-/// automatically, so no bound is needed.
+/// `tokio::spawn` and the axum `State`). Worker JS bindings stay within their
+/// isolate and may be neither `Send` nor `Sync`, so `wasm32` has no bound.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait PlatformService: Send + Sync {}
 

@@ -385,28 +385,28 @@ impl WorkerRuntime {
             return Err(worker::Error::RustError("CONVERT_QUEUE_NAME is empty".into()));
         }
 
-        let services = services_from(
-            novels.clone(),
-            objects.clone(),
-            read_freeze,
-            Arc::new(D1SettingsStore::new(db.clone())),
-            Arc::new(D1TagColorStore::new(db.clone())),
-            clock.clone(),
-            site_rules.clone(),
+        let services = services_from(ServiceDependencies {
+            novels: novels.clone(),
+            objects: objects.clone(),
+            freeze: read_freeze,
+            settings: Arc::new(D1SettingsStore::new(db.clone())),
+            tag_colors: Arc::new(D1TagColorStore::new(db.clone())),
+            clock: clock.clone(),
+            site_rules: site_rules.clone(),
             db,
             env,
-        );
-        let write_services = services_from(
-            write_novels.clone(),
-            write_objects.clone(),
-            freeze.clone(),
-            Arc::new(D1SettingsStore::for_writes(write_db.clone())),
-            Arc::new(D1TagColorStore::new(write_db.clone())),
-            clock.clone(),
+        });
+        let write_services = services_from(ServiceDependencies {
+            novels: write_novels.clone(),
+            objects: write_objects.clone(),
+            freeze: freeze.clone(),
+            settings: Arc::new(D1SettingsStore::for_writes(write_db.clone())),
+            tag_colors: Arc::new(D1TagColorStore::new(write_db.clone())),
+            clock: clock.clone(),
             site_rules,
-            write_db.clone(),
+            db: write_db.clone(),
             env,
-        );
+        });
         Ok(Self {
             services,
             write_services,
@@ -1010,17 +1010,17 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
         objects.clone(), assets.clone(), settings.clone(),
     );
     Ok(ReadServices {
-        app: services_from(
-            novels.clone(),
-            objects.clone(),
+        app: services_from(ServiceDependencies {
+            novels: novels.clone(),
+            objects: objects.clone(),
             freeze,
             settings,
-            Arc::new(D1TagColorStore::new(db.clone())),
+            tag_colors: Arc::new(D1TagColorStore::new(db.clone())),
             clock,
             site_rules,
-            db.clone(),
+            db: db.clone(),
             env,
-        ),
+        }),
         objects,
         assets,
         novels,
@@ -1049,20 +1049,20 @@ pub async fn build_mutation_services(env: &Env) -> worker::Result<AppServices> {
     let site_rules = Arc::new(
         narou_rs::application::site_definitions::SiteSettingsSnapshot::new(site_settings),
     );
-    Ok(services_from(
+    Ok(services_from(ServiceDependencies {
         novels,
         objects,
         freeze,
-        Arc::new(D1SettingsStore::for_writes(db.clone())),
-        Arc::new(D1TagColorStore::new(db.clone())),
+        settings: Arc::new(D1SettingsStore::for_writes(db.clone())),
+        tag_colors: Arc::new(D1TagColorStore::new(db.clone())),
         clock,
         site_rules,
         db,
         env,
-    ))
+    }))
 }
 
-fn services_from(
+struct ServiceDependencies<'a> {
     novels: Arc<dyn NovelRepository>,
     objects: Arc<dyn ObjectStore>,
     freeze: Arc<D1FreezeStore>,
@@ -1071,8 +1071,13 @@ fn services_from(
     clock: Arc<dyn Clock>,
     site_rules: Arc<narou_rs::application::site_definitions::SiteSettingsSnapshot>,
     db: DbHandle,
-    env: &Env,
-) -> AppServices {
+    env: &'a Env,
+}
+
+fn services_from(deps: ServiceDependencies<'_>) -> AppServices {
+    let ServiceDependencies {
+        novels, objects, freeze, settings, tag_colors, clock, site_rules, db, env,
+    } = deps;
     let library = Arc::new(narou_rs::application::LibraryService::new(
         novels.clone(),
         clock.clone(),

@@ -101,8 +101,10 @@ pub async fn load_site_settings_uncached(
 /// この時間で追従する (サイト定義は頻繁に変わらないので十分)。
 const SITE_SETTINGS_TTL_MS: f64 = 30_000.0;
 
+type CachedSiteDefinitions = Arc<Vec<(String, String)>>;
+
 static SITE_SETTINGS_CACHE: std::sync::LazyLock<
-    crate::isolate_cache::TtlMap<Arc<Vec<(String, String)>>>,
+    crate::isolate_cache::TtlMap<CachedSiteDefinitions>,
 > = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(
     SITE_SETTINGS_TTL_MS, 512 * 1024, |definitions| {
         definitions.capacity() * std::mem::size_of::<(String, String)>()

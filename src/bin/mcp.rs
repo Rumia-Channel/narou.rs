@@ -80,7 +80,7 @@ fn run(args: Args) -> Result<(), String> {
     };
     let services = NativeAppServices::new(std::sync::Arc::new(inventory))
         .map_err(|error| error.to_string())?;
-    let server = McpServer::new(services.services.external_api.clone());
+    let server = McpServer::new(&services.services.external_api);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

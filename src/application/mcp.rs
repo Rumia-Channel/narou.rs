@@ -9,8 +9,6 @@
 //! Worker の同じパス) と stdIO (バイナリ `narou_rs_mcp`) の両方で使う。
 //! 通知 (id なし) には応答しない。
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 
 use crate::application::external_api::{
@@ -31,12 +29,14 @@ mod error_code {
 }
 
 /// 外部 API を工具として公開する MCP サーバー。
-pub struct McpServer {
-    api: Arc<ExternalApiService>,
+///
+/// The application owns the service; MCP only borrows it for request handling.
+pub struct McpServer<'a> {
+    api: &'a ExternalApiService,
 }
 
-impl McpServer {
-    pub fn new(api: Arc<ExternalApiService>) -> Self {
+impl<'a> McpServer<'a> {
+    pub fn new(api: &'a ExternalApiService) -> Self {
         Self { api }
     }
 

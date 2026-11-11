@@ -141,21 +141,21 @@ pub struct AppServices {
     pub self_update: Arc<dyn SelfUpdateService>,
     pub web_actions: Arc<dyn WebActionService>,
     /// 外部公開 API (読み取り専用) と、その上に載る MCP。
-    pub external_api: Arc<external_api::ExternalApiService>,
+    pub external_api: external_api::ExternalApiService,
     /// 外部 API の Bearer トークン管理。
-    pub api_tokens: Arc<ApiTokenService>,
+    pub api_tokens: ApiTokenService,
 }
 
 impl AppServices {
     pub fn new(deps: AppServiceDependencies) -> Self {
-        let api_tokens = Arc::new(ApiTokenService::new(deps.api_tokens.clone()));
-        let external_api = Arc::new(external_api::ExternalApiService::new(
+        let api_tokens = ApiTokenService::new(deps.api_tokens);
+        let external_api = external_api::ExternalApiService::new(
             deps.library.clone(),
             deps.content.clone(),
             deps.settings.clone(),
             deps.virtual_novels.clone(),
             api_tokens.clone(),
-        ));
+        );
         Self {
             library: deps.library,
             novel_actions: deps.novel_actions,

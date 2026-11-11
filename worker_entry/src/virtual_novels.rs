@@ -69,7 +69,7 @@ fn guard_new_parent(
     member_ids: &[i64],
 ) -> Result<D1PreparedStatement> {
     let members = serde_json::to_string(member_ids).map_err(db_error)?;
-    Ok(db.prepare(
+    db.prepare(
         "INSERT INTO novel_id_sequence(id,next_id) SELECT 1,0 WHERE \
 EXISTS(SELECT 1 FROM novels WHERE id=?1) \
 OR EXISTS(SELECT 1 FROM novels WHERE toc_url_fold=?2) \
@@ -80,7 +80,7 @@ WHERE n.ncode GLOB 'vs_[0-9]*' AND substr(n.ncode,4) NOT GLOB '*[^0-9]*')",
         (record.id as f64).into(),
         narou_rs::db::novel_codec::fold(&record.toc_url).into(),
         members.into(),
-    ]).map_err(db_error)?)
+    ]).map_err(db_error)
 }
 
 fn db_error(value: impl std::fmt::Display) -> NarouError {

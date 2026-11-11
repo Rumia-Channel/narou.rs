@@ -41,20 +41,19 @@ fn fetch_stream(body: worker::ResponseBody, limit: Option<u64>, expected: Option
     let reader = FetchReader { reader, pending: None, offset: 0, finished: false };
     Ok(Box::pin(futures::stream::try_unfold((reader, 0u64), move |(mut state, total)| async move {
         loop {
-            if let Some(chunk) = state.pending.as_ref() {
-                if state.offset < chunk.length() {
-                    let end = state.offset.saturating_add(ASSET_CHUNK_BYTES as u32).min(chunk.length());
-                    let length = (end - state.offset) as usize;
-                    let next = total.checked_add(length as u64).ok_or_else(|| NarouError::Http("Fetch body length overflow".into()))?;
-                    if limit.is_some_and(|limit| next > limit) || expected.is_some_and(|length| next > length) {
-                        return Err(NarouError::Http("Fetch body exceeds declared limit".into()));
-                    }
-                    let mut bytes = vec![0; length];
-                    chunk.subarray(state.offset, end).copy_to(&mut bytes);
-                    state.offset = end;
-                    if end == chunk.length() { state.pending = None; state.offset = 0; }
-                    return Ok(Some((bytes, (state, next))));
+            if let Some(chunk) = state.pending.as_ref()
+                && state.offset < chunk.length() {
+                let end = state.offset.saturating_add(ASSET_CHUNK_BYTES as u32).min(chunk.length());
+                let length = (end - state.offset) as usize;
+                let next = total.checked_add(length as u64).ok_or_else(|| NarouError::Http("Fetch body length overflow".into()))?;
+                if limit.is_some_and(|limit| next > limit) || expected.is_some_and(|length| next > length) {
+                    return Err(NarouError::Http("Fetch body exceeds declared limit".into()));
                 }
+                let mut bytes = vec![0; length];
+                chunk.subarray(state.offset, end).copy_to(&mut bytes);
+                state.offset = end;
+                if end == chunk.length() { state.pending = None; state.offset = 0; }
+                return Ok(Some((bytes, (state, next))));
             }
             let value = with_timeout(JsFuture::from(state.reader.read()).map(|value| value.map_err(js_error)),
                 READ_TIMEOUT_SECS as f64 * 1_000.0, "Fetch body read").await?;

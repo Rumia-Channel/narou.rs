@@ -663,8 +663,7 @@ async fn import_validated(
     // The plan is already ordered: ordinary members first, then the parents
     // that reference them.
     let total = plan.entries.len();
-    let mut position = 0usize;
-    for entry in plan.entries.iter() {
+    for (position, entry) in plan.entries.iter().enumerate() {
         let novel = &parsed.novels[entry.index];
         let metadata = &parsed.manifest.novels[entry.index];
         let is_parent = metadata.virtual_members.is_some();
@@ -672,7 +671,6 @@ async fn import_validated(
             progress::send_event(sender, serde_json::json!({"type":"progress","phase":"import",
                 "completed":position,"total":total,"title":novel.title})).await?;
         }
-        position += 1;
         if !handled_urls.insert(novel.toc_url.clone()) {
             errors.push(format!(
                 "{}: 同じ toc_url がアーカイブ内で重複しています",
@@ -716,7 +714,6 @@ async fn import_validated(
                     &member_ids,
                     &local,
                     now,
-                    assets.as_ref(),
                 )
                 .await
                 .map(|id| {
@@ -1125,7 +1122,6 @@ async fn create_virtual_parent(
     member_ids: &[i64],
     local: &HashMap<String, serde_yaml::Value>,
     now: DateTime<Utc>,
-    assets: &dyn AssetStore,
 ) -> Result<i64, String> {
     if !virtual_core::is_portable_toc_url(&novel.toc_url) {
         return Err("バーチャル小説の保存先 URL が移植できません".to_string());
@@ -1263,7 +1259,7 @@ async fn create_virtual_parent(
         }
     };
     cleanup.keys = destinations;
-    if let Err(message) = write_novel_files(assets, &keys, &novel.files).await {
+    if let Err(message) = write_novel_files(cleanup.assets.as_ref(), &keys, &novel.files).await {
         cleanup.finish().await;
         return Err(message);
     }
