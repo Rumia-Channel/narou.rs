@@ -409,6 +409,50 @@ async function loginCookie() {
   return setCookie.split(";")[0];
 }
 
+if (IS_LOCAL) await checkWithAuth("browser read API uses the existing user cookie and revokes cross-origin access immediately", async () => {
+  const key = "external-api.allowed-origins";
+  const previous = settingValues(await fetchSettingsView()).get(key) ?? null;
+  const origin = "https://reader.example";
+  try {
+    await saveSettings({ [key]: origin });
+    const cookie = await loginCookie();
+    // Deliberately use plain fetch: a browser does not possess Access service credentials.
+    for (const path of ["/novels?limit=1", "/novels/1", "/novels/1/epub", "/favorite-tags"]) {
+      const denied = await fetch(url(`/api/read/v1${path}`), { headers: { origin } });
+      assert.equal(denied.status, 401);
+      assert.equal(denied.headers.get("access-control-allow-origin"), origin);
+      await denied.body?.cancel();
+    }
+    const allowed = await fetch(url("/api/read/v1/novels?limit=1"), { headers: { origin, cookie } });
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.headers.get("access-control-allow-credentials"), "true");
+    assert.equal(allowed.headers.get("cache-control"), "no-store");
+    await allowed.body?.cancel();
+    const admin = await fetch(url("/api/global_setting"), { headers: { origin, cookie } });
+    assert.equal(admin.status, 401);
+    await admin.body?.cancel();
+    const foreign = await fetch(url("/api/read/v1/novels"), { headers: { origin: "https://attacker.example", cookie } });
+    assert.equal(foreign.status, 403);
+    assert.equal(foreign.headers.get("access-control-allow-origin"), null);
+    await foreign.body?.cancel();
+    const preflight = await fetch(url("/api/read/v1/novels/1/epub"), {
+      method: "OPTIONS", headers: { origin, "access-control-request-method": "GET", "access-control-request-headers": "Range" },
+    });
+    assert.equal(preflight.status, 204);
+    const credentials = await fetch(url("/api/read/v1/novels"), {
+      method: "OPTIONS", headers: { origin, "access-control-request-method": "GET", "access-control-request-headers": "Authorization" },
+    });
+    assert.equal(credentials.status, 403);
+    await credentials.body?.cancel();
+    await saveSettings({ [key]: "" });
+    const revoked = await fetch(url("/api/read/v1/novels"), { headers: { origin, cookie } });
+    assert.equal(revoked.status, 403);
+    await revoked.body?.cancel();
+  } finally {
+    await saveSettings({ [key]: previous });
+  }
+});
+
 await checkWithAuth("POST /api/auth/login rejects a wrong token", async () => {
   const response = await request("/api/auth/login", {
     method: "POST",

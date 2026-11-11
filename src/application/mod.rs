@@ -21,6 +21,7 @@ pub mod error;
 pub mod aliases;
 pub mod api_tokens;
 pub mod external_api;
+pub mod read_api;
 pub mod authors;
 pub mod attribute_tags;
 pub mod debug;

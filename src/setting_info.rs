@@ -181,6 +181,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "server-ws-add-accepted-domains"
         | "server-add-accepted-hosts"
         | "external-api.require-token"
+        | "external-api.allowed-origins"
         | "self-update.variant"
         | "convert.epub-engine"
         | "convert.epub-font"
@@ -1202,6 +1203,13 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::Boolean,
                 "外部公開API (/api/v1) の Bearer トークン認証を必須にするかどうか（既定 true）。Cloudflare Zero Trust の内側で使う場合は false にする",
+            ),
+        ),
+        (
+            "external-api.allowed-origins",
+            vis(
+                VarType::String,
+                "既存 UI 認証を使う読み取り API (/api/read/v1) のブラウザ連携元 Origin（カンマ区切り、完全一致、ワイルドカード不可）。空ならクロスオリジン通信を許可しない",
             ),
         ),
         ("over18", invis(VarType::Boolean, "18歳以上かどうか")),

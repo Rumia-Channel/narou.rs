@@ -3,6 +3,7 @@
 外部のツール (表生成・自動化・LLM など) からライブラリの読み取り専用データへアクセスするための API と、その上位で動作する MCP サーバーについて説明します。
 
 - HTTP API: `/api/v1` (native の `narou web` と Workers の両方で動く)
+- ブラウザ連携: `/api/read/v1`（既存の Web UI / Access ユーザー認証を利用）
 - MCP: `POST /api/v1/mcp` (HTTP) と `narou_rs_mcp` (stdIO)
 
 ## 認証の連鎖
@@ -32,6 +33,41 @@
 ### Cloudflare Access の資格情報を Web UI で確認する
 
 Workers 環境では Access の Service Token は CI 経由で secret として登録されます。Web UI の「外部API」タブには、その secret (`NAROU_CF_ACCESS_CLIENT_ID` / `NAROU_CF_ACCESS_CLIENT_SECRET`) の値が表示されるため、外部ツールへ簡単にコピー＆ペーストできます (※ native 環境にはこの項目はありません)。
+
+## 既存のユーザー認証で読むブラウザ API
+
+`/api/read/v1` は `/api/v1` の外部ツール用トークン認証とは別の読み取り専用入口です。
+Native は既存の UI Cookie / Basic 認証、Worker は既存の UI 認証
+（Access が境界ならそのユーザーセッション）をそのまま使います。
+新しいトークン発行・Access アプリ・ポリシーの追加は不要です。
+
+| メソッド | パス | 内容 |
+|---|---|---|
+| GET / HEAD | `/api/read/v1/novels` | 一覧（`limit=all`、検索・並び順は既存 API と共通、JSON 固定） |
+| GET / HEAD | `/api/read/v1/novels/{id}` | 作品情報（JSON） |
+| GET / HEAD | `/api/read/v1/novels/{id}/epub` | 既存の EPUB 配信・オンデマンド生成 |
+| GET / HEAD | `/api/read/v1/favorite-tags` | お気に入りタグ（`success` と `tags`） |
+
+クロスオリジン連携はグローバル設定 `external-api.allowed-origins` が空なら拒否します。
+許可する Origin をカンマ区切りで指定してください
+（例: `https://dantalian.rumia-ch.uk,http://127.0.0.1:8080`）。
+scheme・host・port が一致する Origin だけを許可し、`*` や `null` は許可しません。
+設定は narou.rs の既存グローバル設定画面 / API から変更でき、Worker の判定は
+isolate キャッシュや read replica を介さず primary の最新設定を読みます。
+
+ブラウザは narou.rs を一度開いて既存のログインを済ませ、`credentials: "include"`、
+`cache: "no-store"`、`referrerPolicy: "no-referrer"` で直接取得します。
+長期トークン・Service Token・独自の認証ヘッダーを連携先へ渡してはいけません。
+Cookie の SameSite / 第三者 Cookie 制限はブラウザのまま適用されます。
+Native の SameSite=Strict Cookie を使う場合は同じ site に配置してください。
+
+許可済み Origin の CORS 応答には credentials と `Vary: Origin` を付けます。
+preflight は GET / HEAD と `Range` だけを許可し、管理・更新 API は公開しません。
+実際の GET / HEAD では既存のユーザー認証が必要です。
+Access 側の OPTIONS 設定は変更しません。連携クライアントは独自ヘッダーを付けず、
+EPUB の単一範囲 `Range: bytes=0-0` または通常 GET を使います。
+応答は `Cache-Control: no-store` です。
+
 
 ## 出力形式
 

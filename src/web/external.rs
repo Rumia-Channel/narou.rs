@@ -685,6 +685,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_api_reuses_ui_session_and_rejects_untrusted_origins() {
+        let state = build_state(vec![record(1, "通常", "通常")], VirtualNovelMembers::default());
+        let origin = "https://books.example";
+        state.services.settings.set(
+            narou_rs::application::read_api::ALLOWED_ORIGINS_SETTING,
+            &serde_json::json!(origin),
+        ).await.unwrap();
+        let cookie = format!("{}={}", crate::web::UI_AUTH_COOKIE, state.ui_token);
+        let (base, server) = serve(state).await;
+        let client = client();
+        let endpoint = format!("{base}/api/read/v1/novels?limit=all");
+        let denied = client.get(&endpoint).header("Origin", origin)
+            .bearer_auth(TOKEN).send().await.unwrap();
+        assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(denied.headers()["access-control-allow-origin"], origin);
+        let allowed = client.get(&endpoint).header("Origin", origin)
+            .header("Cookie", &cookie).send().await.unwrap();
+        assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+        assert_eq!(allowed.headers()["access-control-allow-credentials"], "true");
+        assert_eq!(allowed.headers()["cache-control"], "no-store");
+        let body = allowed.json_value().await;
+        assert_eq!(body["data"][0]["author"], "作者");
+        assert_eq!(body["data"][0]["title"], "通常");
+        let foreign = client.get(&endpoint).header("Origin", "https://attacker.example")
+            .header("Cookie", &cookie).send().await.unwrap();
+        assert_eq!(foreign.status(), reqwest::StatusCode::FORBIDDEN);
+        assert!(foreign.headers().get("access-control-allow-origin").is_none());
+        let preflight = client.request(reqwest::Method::OPTIONS, &endpoint)
+            .header("Origin", origin).header("Access-Control-Request-Method", "GET")
+            .header("Access-Control-Request-Headers", "Range").send().await.unwrap();
+        assert_eq!(preflight.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(preflight.headers()["access-control-allow-methods"], "GET, HEAD");
+        let credentials = client.request(reqwest::Method::OPTIONS, &endpoint)
+            .header("Origin", origin).header("Access-Control-Request-Method", "GET")
+            .header("Access-Control-Request-Headers", "Authorization").send().await.unwrap();
+        assert_eq!(credentials.status(), reqwest::StatusCode::FORBIDDEN);
+        let write = client.post(&endpoint).header("Cookie", &cookie).send().await.unwrap();
+        assert!(matches!(write.status(), reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::METHOD_NOT_ALLOWED));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn the_list_needs_a_bearer_token() {
         let state = build_state(vec![record(1, "通常", "通常")], VirtualNovelMembers::default());
         let (base, server) = serve(state).await;
