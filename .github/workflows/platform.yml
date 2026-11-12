@@ -173,6 +173,8 @@ jobs:
           NAROU_CHECK_UNCONFIGURED: "1"
       - name: Worker compressed content lifecycle
         run: node tests/content_storage.mjs
+      - name: Worker delivery and update isolation
+        run: node tests/read_worker.mjs
       - name: Worker abrupt termination and checkpoint recovery
         run: node tests/runtime_recovery.mjs
 

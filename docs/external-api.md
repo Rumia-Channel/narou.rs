@@ -6,6 +6,38 @@
 - ブラウザ連携: `/api/read/v1`（既存の Web UI / Access ユーザー認証を利用）
 - MCP: `POST /api/v1/mcp` (HTTP) と `narou_rs_mcp` (stdIO)
 
+## Workers の配信用 Worker
+
+Workers の配備は、管理・更新用の既存 Worker と、同じ名前に `-reader` を付けた
+配信用 Worker に分けます。同じ D1 と S3 を参照し、作品データの複製・同期はしません。
+Native の API と EPUB 生成経路は変更しません。
+
+| Worker | 担当 |
+|---|---|
+| 管理・更新用 (`NAROU_WORKER_ROLE=writer`) | download / update / convert、設定・タグ・作品の変更、Queue、定期更新 |
+| 配信用 (`NAROU_WORKER_ROLE=reader`) | `/api/v1`、`/api/read/v1`、作品情報・挿絵の取得、通常作品・バーチャル小説の EPUB 生成 |
+
+同じ公開ホストの対象パスを Cloudflare の Route で配信用 Worker へ直接振り分けるため、
+連携ソフトの URL・Cookie・Bearer トークン・Access の設定は変更不要です。
+Web UI の `/novels/{id}/download`、既存の `/api/novels/{id}/download.epub`、
+`/api/virtual_novels/{id}/download.epub` も対象です。Route はパスの途中の ID だけを
+ワイルドカードにできないため、同じプレフィックスにある編集要求は
+`NAROU_WRITER` Service Binding 経由で管理側へ転送します。認証・本文はそのまま引き継ぎ、
+配信側で編集ハンドラを実行しません。トークンの発行・削除も管理側のままです。
+
+配信側では作品・設定・保存方式マーカーの書き換えや旧データの補完を行いません。
+ただし EPUB の有界ストリーム生成には、非公開 stage と
+`.narou-stage-journal/` への書き込み・削除が必要です。この一時領域だけを許可し、
+作品の保存先への書き込みは拒否します。途中終了で残った一時データは、
+管理側の既存の期限付き回収が扱います。D1 の binding 自体に読み取り専用権限を
+設定するものではなく、配信ルートと保存アダプタで処理を制限します。
+
+Cloudflare Workers のメモリ上限は [1 isolate あたり 128 MB](https://developers.cloudflare.com/workers/platform/limits/#memory)
+で、同じ isolate の同時要求・JavaScript・Wasm の割当を合わせた値です。
+Worker の分離は更新と配信のメモリ・重い処理の実行枠を切り離しますが、
+EPUB 単体の上限を増やしたり、共有 D1 / S3 の競合までなくしたりするものではありません。
+配備手順は [`cloudflare-workers-migration-plan.md` §2.2.8](cloudflare-workers-migration-plan.md#228-ci-からのデプロイ-p0e-2026-09-26-実装) を参照してください。
+
 ## 認証の連鎖
 
 外部 → [Cloudflare Zero Trust] → [Bearer トークン] → API / MCP

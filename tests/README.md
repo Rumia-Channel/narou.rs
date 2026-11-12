@@ -47,6 +47,19 @@ cargo check -p narou_worker --target wasm32-unknown-unknown
 
 バックエンドポリシー、デプロイ前の必須検証、サニタイズされた制限付き LIST プローブの挙動を検証します。
 
+配信用 Worker の変更では、source の保持と2つの実行環境の分離も確認する:
+
+```sh
+cargo test -p narou_rs --test reader_storage
+python3 -m unittest discover -s worker_entry/tests -p 'test_ci_*.py'
+```
+
+`worker_entry/` で `worker-build --release` を実行した後、リポジトリルートで
+`node worker_entry/tests/read_worker.mjs` を実行する。共有のローカル D1 と HTTP S3
+fixture に対して管理・配信の2 Worker を動かし、管理側の重い処理が占有中でも
+API / EPUB が配信できること、認証・CORS・編集要求の転送、source の書き込み禁止と
+EPUB の一時データの後始末を確認する。実際の本番 OOM や Cloudflare 配備の検証とは区別する。
+
 ## 4. 共通ランタイム境界の回帰テスト
 
 ```sh

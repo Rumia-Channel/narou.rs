@@ -759,6 +759,19 @@ API 復旧・配備後の継続負荷は未確認。検証コピーの結果と�
 
 ## Workers の有界ストリーム処理
 
+### 管理・更新と配信の実行環境
+
+管理・更新用と配信用は別の Worker script として配備し、D1 / S3 の作品データだけを共有する。
+`worker_entry/src/worker_role.rs` が配信側で実行できる読み取りルートを限定し、
+プレフィックス Route に巻き込まれた編集要求は元の管理 Worker へ転送する。
+配信先への公開 Route は管理 Worker を経由しないため、更新側のメモリ・
+`MemoryPermit` を API / EPUB の取得と共有しない。
+
+配信用の composition は保存方式の初期化・旧属性のバックフィルを行わず、
+source ObjectStore / AssetStore の変更を拒否する。例外は下記の非公開 stage と
+その予約 journal だけである。Queue / cron と一時データの期限付き回収は管理側に残す。
+URL・認証・配備上の境界は [`external-api.md`](external-api.md#workers-の配信用-worker) を参照。
+
 ### 所有権・保存・公開
 
 HTTP の `send_stream` と `AssetStore` の `read_stream` / `read_range` / `stage_stream` を

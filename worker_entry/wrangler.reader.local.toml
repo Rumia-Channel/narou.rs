@@ -1,0 +1,50 @@
+# ローカル開発用の reader 設定。writer (`wrangler.toml`) と対になる。
+#
+# 同じ Rust 成果物 (`build/worker/shim.mjs`) を別の script 名で動かす設定。
+# CI の reader (`wrangler.reader.toml` → `wrangler.reader.ci.toml`) と同じ形
+# で、ローカルの値だけを書いている。
+#
+# reader は配信 (外部 API / ブラウザの読み / EPUB) だけを担う:
+#   - queue / cron / RATE_LIMITER / 静的アセット / ビルドを持たない
+#   - `NAROU_WRITER` サービスバインディングで既存 writer へ流す
+#   - `PUSH_HUB` は writer の DO を参照する (新しい名前空間を作らない)
+#
+# `NAROU_WRITER` と `PUSH_HUB` は writer 側の script 名を前提にしているため、
+# writer (`wrangler.toml`) も同時に起動しないとローカルで繋がらない。
+
+name = "narou-rs-local-reader"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-08-10"
+workers_dev = true
+
+[limits]
+cpu_ms = 300000
+
+[vars]
+# 認証は既定で有効。ローカルで外すときだけ false にする。
+NAROU_AUTH_REQUIRED = "true"
+# reader は読み取り専用。mutation ハンドラは実行しない。
+NAROU_WORKER_ROLE = "reader"
+NAROU_REQUIRE_S3 = "true"
+# S3 互換ストレージ。ローカルは MinIO 等を想定した既定値。
+S3_ENDPOINT = "http://127.0.0.1:9000"
+S3_REGION = "us-east-1"
+S3_BUCKET = "narou-local"
+S3_PREFIX = "narou/local"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "narou-local"
+database_id = "local-narou"
+migrations_dir = "migrations"
+
+# 配信以外 (管理画面 / ジョブ操作) は既存 writer へそのまま流す。
+[[services]]
+binding = "NAROU_WRITER"
+service = "narou-rs-local"
+
+# Web UI のコンソール/進捗イベントは writer の PushHub に届ける。
+[[durable_objects.bindings]]
+name = "PUSH_HUB"
+class_name = "PushHub"
+script_name = "narou-rs-local"

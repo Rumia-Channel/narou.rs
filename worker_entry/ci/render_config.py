@@ -1,5 +1,8 @@
 """`wrangler.<target>.toml` をレンダリングして `wrangler.ci.toml` を作る。
 
+reader (配信専用) は writer と同じ Rust 成果物を別の script 名で配備するため、
+`--role reader` で `wrangler.reader.ci.toml` も作る。
+
 account 固有の値 (D1 の database_id、S3 の接続先、公開ドメイン) はリポジトリに
 置かず、CI の環境変数から注入する。値の形式は置換前に検証し、未解決の
 プレースホルダが残っていれば失敗させる。
@@ -9,18 +12,34 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import tomllib
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, Sequence
 from uuid import UUID
 
 TARGETS = ("develop", "production")
+ROLES = ("writer", "reader")
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 REGION_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 SECRET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 PREFIX_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
 HOSTNAME_PATTERN = re.compile(r"^[A-Za-z0-9.-]+$")
+
+# reader の script 名は writer の名前の後ろに付ける (既存 writer は変えない)。
+READER_NAME_SUFFIX = "-reader"
+
+# reader が edge で受け取る配信パスの接頭辞。Cloudflare の Route はパス途中の
+# ワイルドカードに対応しないため、末尾の `*` で前方一致させる。
+# パスの境界は Worker が検証し、既存ドメインの URL と Access を維持する。
+READER_ROUTE_PREFIXES = (
+    "/api/v1",
+    "/api/read/v1",
+    "/api/novels",
+    "/api/virtual_novels",
+    "/novels",
+)
 
 WORKER_DIR = Path(__file__).resolve().parent.parent
 
@@ -53,7 +72,130 @@ def unresolved_placeholders(template: str) -> list[str]:
     return found
 
 
-def main() -> None:
+def parse_role(argv: Sequence[str]) -> str:
+    """`--role writer|reader` を読む (既定は writer)。"""
+
+    role = "writer"
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--role":
+            index += 1
+            if index >= len(argv):
+                fail("--role needs a value (writer or reader)")
+            role = argv[index]
+        elif argument.startswith("--role="):
+            role = argument.split("=", 1)[1]
+        else:
+            fail(f"unknown argument: {argument}")
+        index += 1
+    if role not in ROLES:
+        fail("--role must be writer or reader")
+    return role
+
+
+def template_name(path: Path) -> str:
+    """テンプレートの `name = "..."` を取り出す (プレースホルダ無しの静的値)。"""
+
+    match = re.search(
+        r'^name\s*=\s*"([^"]+)"', path.read_text(encoding="utf-8"), re.MULTILINE
+    )
+    if not match:
+        fail(f"{path.name} has no name")
+    return match.group(1)
+
+
+def reader_routes(domain: str, zone: str) -> str:
+    """reader へ向ける path route を組み立てる (ドメインが無ければ空)。"""
+
+    if not domain:
+        return ""
+    zone_line = f'zone_name = "{zone}"\n' if zone else ""
+    return "".join(
+        f'\n[[routes]]\npattern = "{domain}{prefix}*"\n{zone_line}custom_domain = false\n'
+        for prefix in READER_ROUTE_PREFIXES
+    )
+
+
+def secret_store_blocks(
+    secret_store_id: str,
+    s3_secret_names: dict[str, str],
+    token_secrets: dict[str, str],
+    access_secrets: dict[str, str],
+    *,
+    include_login_key: bool,
+) -> str:
+    """`[[secrets_store_secrets]]` のブロックを組み立てる。
+
+    名前を渡した項目だけバインディングを足す (S3 の 5 つは全部入るか全部入ら
+    ないか。トークン系は個別)。reader にはログイン資格情報の暗号鍵を載せない
+    (reader は資格情報を読み書きしない)。
+    """
+
+    entries = [
+        ("S3_ACCESS_KEY_ID_STORE", s3_secret_names["S3_ACCESS_KEY_ID_SECRET_NAME"]),
+        ("S3_SECRET_ACCESS_KEY_STORE", s3_secret_names["S3_SECRET_ACCESS_KEY_SECRET_NAME"]),
+        ("S3_ENDPOINT_STORE", s3_secret_names["S3_ENDPOINT_SECRET_NAME"]),
+        ("S3_REGION_STORE", s3_secret_names["S3_REGION_SECRET_NAME"]),
+        ("S3_BUCKET_STORE", s3_secret_names["S3_BUCKET_SECRET_NAME"]),
+        ("NAROU_ADMIN_TOKEN_STORE", token_secrets["NAROU_ADMIN_TOKEN"]),
+        (
+            "NAROU_CF_ACCESS_CLIENT_ID_STORE",
+            access_secrets["NAROU_CF_ACCESS_CLIENT_ID"],
+        ),
+        (
+            "NAROU_CF_ACCESS_CLIENT_SECRET_STORE",
+            access_secrets["NAROU_CF_ACCESS_CLIENT_SECRET"],
+        ),
+    ]
+    if include_login_key:
+        entries.append(("NAROU_RS_LOGIN_KEY_STORE", token_secrets["NAROU_RS_LOGIN_KEY"]))
+    return "".join(
+        f'\n[[secrets_store_secrets]]\nbinding = "{binding}"\n'
+        f'store_id = "{secret_store_id}"\nsecret_name = "{name}"\n'
+        for binding, name in entries
+        if name
+    )
+
+
+def validate_reader(config: dict, path: Path, writer_name: str) -> None:
+    """reader のトポロジーを固定する (queue / cron / DO の新規作成を持ち込まない)。
+
+    reader は配信だけを担う。書き込み系 (queue / cron) と静的アセット、ビルドを
+    持ち込むと、reader が更新経路まで引きを受けて(writer と二重に)動作する。
+    """
+
+    if config.get("vars", {}).get("NAROU_WORKER_ROLE") != "reader":
+        fail(f'{path.name} must set vars.NAROU_WORKER_ROLE = "reader"')
+    if config.get("queues"):
+        fail(f"{path.name} must not bind queues; the reader only serves reads")
+    if config.get("triggers", {}).get("crons"):
+        fail(f"{path.name} must not define cron triggers")
+    if "assets" in config:
+        fail(f"{path.name} must not serve static assets; the writer owns the Web UI")
+    if "build" in config:
+        fail(f"{path.name} must not build; the reader reuses the writer's artifact")
+    if config.get("migrations") or config.get("exports"):
+        fail(f"{path.name} must not create Durable Object namespaces")
+    bindings = config.get("durable_objects", {}).get("bindings", [])
+    names = {binding.get("name") for binding in bindings}
+    if "RATE_LIMITER" in names:
+        fail(f"{path.name} must not bind RATE_LIMITER")
+    push = [binding for binding in bindings if binding.get("name") == "PUSH_HUB"]
+    if len(push) != 1 or push[0].get("script_name") != writer_name:
+        fail(f"{path.name} must bind the writer's PUSH_HUB through script_name")
+    services = {
+        service.get("binding"): service.get("service")
+        for service in config.get("services", [])
+    }
+    if services.get("NAROU_WRITER") != writer_name:
+        fail(f'{path.name} must bind the writer as the "NAROU_WRITER" service')
+    if not config.get("d1_databases"):
+        fail(f"{path.name} must bind the shared D1 database")
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    role = parse_role(argv or ())
     target = required("NAROU_DEPLOY_TARGET")
     if target not in TARGETS:
         fail("NAROU_DEPLOY_TARGET must be develop or production")
@@ -190,34 +332,19 @@ def main() -> None:
     if secret_store_id:
         # 名前を渡した項目だけ <NAME>_STORE バインディングを足す
         # (S3 の 5 つは全部入るか全部入らないか。トークン系は個別)。
-        blocks = "".join(
-            f'\n[[secrets_store_secrets]]\nbinding = "{binding}"\n'
-            f'store_id = "{secret_store_id}"\nsecret_name = "{name}"\n'
-            for binding, name in (
-                ("S3_ACCESS_KEY_ID_STORE", s3_secret_names["S3_ACCESS_KEY_ID_SECRET_NAME"]),
-                ("S3_SECRET_ACCESS_KEY_STORE", s3_secret_names["S3_SECRET_ACCESS_KEY_SECRET_NAME"]),
-                ("S3_ENDPOINT_STORE", s3_secret_names["S3_ENDPOINT_SECRET_NAME"]),
-                ("S3_REGION_STORE", s3_secret_names["S3_REGION_SECRET_NAME"]),
-                ("S3_BUCKET_STORE", s3_secret_names["S3_BUCKET_SECRET_NAME"]),
-                ("NAROU_ADMIN_TOKEN_STORE", token_secrets["NAROU_ADMIN_TOKEN"]),
-                ("NAROU_RS_LOGIN_KEY_STORE", token_secrets["NAROU_RS_LOGIN_KEY"]),
-                (
-                    "NAROU_CF_ACCESS_CLIENT_ID_STORE",
-                    access_secrets["NAROU_CF_ACCESS_CLIENT_ID"],
-                ),
-                (
-                    "NAROU_CF_ACCESS_CLIENT_SECRET_STORE",
-                    access_secrets["NAROU_CF_ACCESS_CLIENT_SECRET"],
-                ),
-            )
-            if name
+        replacements["__SECRET_STORE_BLOCKS__"] = secret_store_blocks(
+            secret_store_id,
+            s3_secret_names,
+            token_secrets,
+            access_secrets,
+            include_login_key=(role == "writer"),
         )
-        replacements["__SECRET_STORE_BLOCKS__"] = blocks
     # custom domain の route。production は必須、develop は任意で、未設定なら
     # workers.dev の URL だけで動く。前段に Cloudflare Access (Zero Trust) を
     # 置く前提なので、route を入れた環境では workers_dev を閉じる。
     domain_var = {"production": "SERVICE_DOMAIN", "develop": "DEVELOP_DOMAIN"}[target]
     domain = required(domain_var) if target == "production" else optional(domain_var, "").strip()
+    zone = ""
     if domain:
         if not HOSTNAME_PATTERN.fullmatch(domain) or "." not in domain:
             fail(f"{domain_var} must be a hostname without a scheme or path")
@@ -256,10 +383,25 @@ def main() -> None:
         fail("NAROU_AUTH_REQUIRED must be true or false")
     replacements["NAROU_AUTH_REQUIRED"] = auth_required
 
-    template_path = WORKER_DIR / f"wrangler.{target}.toml"
+    # writer の script 名から reader の名前と参照先を決める。既存の writer の
+    # 名前と DO 名前空間は変えない (reader は writer 名 + "-reader")。
+    writer_template = WORKER_DIR / f"wrangler.{target}.toml"
+    if role == "reader":
+        writer_name = template_name(writer_template)
+        reader_name = f"{writer_name}{READER_NAME_SUFFIX}"
+        if not NAME_PATTERN.fullmatch(reader_name):
+            fail("the reader name must be a lowercase name (a-z, 0-9, -)")
+        replacements["READER_NAME"] = reader_name
+        replacements["WRITER_NAME"] = writer_name
+        # reader は既存ドメインの配信パスだけを向き取る (DNS / Access は触らない)。
+        replacements["__READER_ROUTES_BLOCK__"] = reader_routes(domain, zone)
+
+    template_path = (
+        writer_template if role == "writer" else WORKER_DIR / "wrangler.reader.toml"
+    )
     template = template_path.read_text(encoding="utf-8")
     # ブロック単位のプレースホルダは「値があれば差し込み、無ければ空にする」。
-    for block in ("__SECRET_STORE_BLOCKS__", "__CUSTOM_DOMAIN_BLOCK__"):
+    for block in ("__SECRET_STORE_BLOCKS__", "__CUSTOM_DOMAIN_BLOCK__", "__READER_ROUTES_BLOCK__"):
         template = template.replace(block, replacements.pop(block, ""))
     for name, value in replacements.items():
         template = template.replace("__" + name + "__", value)
@@ -276,11 +418,17 @@ def main() -> None:
         fail(f"{template_path.name} is not valid TOML")
     if config.get("vars", {}).get("NAROU_REQUIRE_S3") != "true":
         fail(f'{template_path.name} must set vars.NAROU_REQUIRE_S3 = "true" for CI')
+    if role == "reader":
+        validate_reader(config, template_path, writer_name)
+    elif config.get("vars", {}).get("NAROU_WORKER_ROLE", "writer") != "writer":
+        fail(f'{template_path.name} must set vars.NAROU_WORKER_ROLE = "writer"')
 
-    output_path = WORKER_DIR / "wrangler.ci.toml"
+    output_path = WORKER_DIR / (
+        "wrangler.ci.toml" if role == "writer" else "wrangler.reader.ci.toml"
+    )
     output_path.write_text(template, encoding="utf-8")
     print(output_path)
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

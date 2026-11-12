@@ -36,7 +36,14 @@ pub(crate) fn primary_database(env: &Env) -> worker::Result<DbHandle> {
 }
 
 /// Backfill legacy classifications before indexed list and tag queries.
+///
+/// 配信 Worker (reader) は source を変更しないので backfill も走らせない。
+/// 未分類のままの行は writer の backfill が同じ値を入れるので、配信は
+/// 保存済みの値をそのまま読む。
 pub(crate) async fn initialize_attributes(env: &Env) -> worker::Result<()> {
+    if crate::worker_role::is_reader(env)? {
+        return Ok(());
+    }
     let db = primary_database(env)?;
     let repository = D1NovelRepository::new(db.clone());
     if repository.attributes_initialized().await.map_err(|error| worker::Error::RustError(error.to_string()))? {
