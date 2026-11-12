@@ -3,6 +3,16 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
+## v0.6.5 — 外部 API・EPUB 配信の Worker 分離
+
+- 既存の UI / Access ユーザー認証で一覧・作品情報・EPUB・お気に入りタグを読む `/api/read/v1` を追加しました。明示した Origin にだけ CORS を許可し、管理・更新 API や別の認証発行は追加しません。
+- デプロイ時に Access の認証ヘッダー設定を自動変更しなくなりました。本番の既存 Route は `NAROU_DOMAIN_MODE=route` で維持できます。
+- Workers の外部 API・ブラウザ連携 API・EPUB 配信を専用の `-reader` Worker へ分離しました。URL・認証と D1 / S3 の作品データは共有し、更新・Queue・定期実行とはメモリと実行枠を分けます。配信側は作品データを変更せず、EPUB 生成の非公開一時領域だけを書き込みます。
+
+Workers の配備では、管理側の readiness と旧データの初期化を確認してから配信側の Route を切り替えます。Cloudflare Access の内側で運用している場合は、CI の `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` でこの確認を通せるようにしてください。確認できないときは配信側の配備・既存 Route の変更を停止します。作品データのコピーや、新しい Access アプリケーションの作成は不要です。
+
+変更一覧は [v0.6.4...v0.6.5](https://github.com/Rumia-Channel/narou.rs/compare/v0.6.4...v0.6.5) を参照してください。
+
 ## v0.6.4 — Workers のストリーム処理と異常終了の回復
 
 - **HTTP・S3・ZIP 転送・APNG・Worker の本文変換と EPUB 生成を、有界チャンクと一時ストレージを使う処理へ移行しました**。完成した ZIP・APNG・EPUB や全話の本文をまとめて保持せず、受信側の読み取り速度に合わせて処理します。画像の透過・フレーム・表示時間を省略する最適化は行いません。

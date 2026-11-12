@@ -306,14 +306,33 @@ phase と対象を持たない共通カーソル/`done` は移行完了の証明
 
 ### 2.2.8 CI からのデプロイ (P0e, 2026-09-26 実装)
 
-`worker_entry/ci/deploy_worker.py` が 1 環境分のデプロイを最後まで行う:
+`worker_entry/ci/deploy_worker.py` が 1 環境分の管理・配信 Worker を配備する:
 
-1. `ci/provision_resources.py` で D1・取得用 Queue・変換用 Queue と各 DLQ を冪等に用意（名前は環境名から導出）
-2. `ci/render_config.py` で `wrangler.ci.toml` をレンダリング（未置換プレースホルダは失敗）
-3. `wrangler d1 migrations apply <db> --remote` でリモート D1 を更新
-4. `wrangler deploy --secrets-file <json>` で `NAROU_ADMIN_TOKEN` と `NAROU_RS_LOGIN_KEY` を投入してデプロイ
-   （secret ファイルは `finally` で必ず削除。Zero Trust が境界で両方とも不要な場合はファイルを作らない）
-5. デプロイ先の URL を wrangler の出力から拾い、契約テストを smoke として流す（`NAROU_SMOKE=0` で省略）
+1. `ci/provision_resources.py` で既存の D1・取得用 Queue・変換用 Queue と各 DLQ を冪等に用意（名前は環境名から導出）
+2. `ci/render_config.py` で管理用 `wrangler.ci.toml` と配信用 `wrangler.reader.ci.toml` をレンダリング（未置換プレースホルダは失敗）
+3. 管理用の設定で `wrangler d1 migrations apply <db> --remote` を実行し、共有 D1 を更新
+4. 管理 Worker を既存の名前・Durable Object namespace のままビルド・配備
+5. 同じビルド済み成果物を `<管理 Worker 名>-reader` として配備。配信側は Queue / cron を持たず、共有 DB / S3・認証と、管理側への Service Binding・既存 PushHub だけを使う
+6. 必須のストレージ確認と契約 smoke を実行（一般 smoke は `NAROU_SMOKE=0` で省略可。必須確認は省略しない）
+
+管理側の `/health/ready` が成功して旧データの属性補完を終えるまで、配信側の
+配備・Route の更新は行わない。Access が前段にある場合は、CI の
+`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` でこの確認を通せるようにする。
+到達できない場合は既存の配信先を維持して配備を失敗させる。S3 LIST プローブの
+「前段の 403 は未検証としてスキップ」という例外は、この切替前提には適用しない。
+
+secret ファイルは `finally` で削除し、配信側へは認証・S3 の資格情報だけを渡す。
+ログイン Cookie の復号鍵と取得リレーの資格情報は管理側に残す。
+管理側を先に配備することで、配信側の Service Binding が参照する script / PushHub を
+初回配備でも確保する。既存の D1 / S3 データを別 Worker 用へコピー・移行しない。
+
+公開ドメインがある場合は、同じホストの `/api/v1*`・`/api/read/v1*`・
+`/api/novels*`・`/api/virtual_novels*`・`/novels/*` を配信用の Route にする。
+EPUB や外部 API の要求は管理 Worker を中継せず、既存 URL・Access の保護を維持する。
+プレフィックスに巻き込まれた編集要求や HTML ページは Service Binding で管理側へ転送する。
+DNS レコード・Access アプリケーション・認証ポリシーは変更しない。
+公開ドメインを持たない develop 検証では、配信用の `workers.dev` URL を直接使う。
+読み取り専用の範囲とメモリ上限は [`external-api.md`](external-api.md#workers-の配信用-worker) を参照。
 
 トリガーは `.github/workflows/platform.yml`:
 

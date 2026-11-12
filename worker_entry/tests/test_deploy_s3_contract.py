@@ -89,7 +89,26 @@ class DeploymentFlowTests(unittest.TestCase):
 
     def ready(self):
         if self.http:
-            self.http.return_value.open.return_value = FakeResponse(VERIFIED)
+            # /health/ready は writer の source 初期化 (属性の backfill) も行う。
+            def respond(request, timeout=None):
+                path = request.full_url
+                if path.endswith("/health/live"):
+                    return FakeResponse({
+                        "status": "alive",
+                        "authentication_required": True,
+                        "authentication_configured": True,
+                    })
+                if path.endswith("/health/ready"):
+                    return FakeResponse({"status": "ready"})
+                return FakeResponse(VERIFIED)
+            self.http.return_value.open.side_effect = respond
+
+    def assert_both_scripts_deployed(self):
+        """writer を先に、reader を後に配備する (同じ D1 / 同じ成果物)。"""
+        self.assertEqual(self.calls.deploy.call_count, 2)
+        first, second = self.calls.deploy.call_args_list
+        self.assertEqual(first.kwargs["config"], deploy.WRITER_CONFIG)
+        self.assertEqual(second.kwargs["config"], deploy.READER_CONFIG)
 
     def test_old_d1_marker_or_data_does_not_block_deployment(self):
         # If a deployment tries the former D1 query, these are its responses.
@@ -101,7 +120,7 @@ class DeploymentFlowTests(unittest.TestCase):
                 self.d1_rows([{"asset_backend": backend, "has_d1_illustrations": illustrations}])
                 deploy.main()
                 self.d1.assert_not_called()
-                self.calls.deploy.assert_called_once()
+                self.assert_both_scripts_deployed()
                 # Schema migrations remain; no ad-hoc data query or deletion is introduced.
                 command, = self.calls.run.call_args.args
                 self.assertEqual(command[3:6], ["d1", "migrations", "apply"])
@@ -141,26 +160,28 @@ class DeploymentFlowTests(unittest.TestCase):
         os.environ["NAROU_ADMIN_TOKEN_SECRET_NAME"] = "runtime-token"
         self.http.return_value.open.side_effect = self.store_only_responder()
         deploy.main()
-        self.calls.deploy.assert_called_once()
-        self.calls.smoke.assert_called_once()
+        self.assert_both_scripts_deployed()
+        # writer と reader の 2 つを smoke する。
+        self.assertEqual(self.calls.smoke.call_count, 2)
         self.assertTrue(self.calls.summary.call_args.kwargs["s3_status"].startswith("skipped:"))
 
-    def test_access_blocked_deployment_completes_as_skipped(self):
+    def test_access_blocked_deployment_stops_before_the_reader(self):
         # The whole deployment sits behind Cloudflare Access: the mandatory S3
-        # check cannot run, so the job reports it as skipped instead of failing,
-        # and the step summary never claims the S3 backend was verified.
-        self.http.return_value.open.side_effect = urllib.error.HTTPError(
-            "https://worker.example.invalid/api/storage/mode?probe=s3",
-            403,
-            "Forbidden",
-            {},
-            io.BytesIO(b""),
-        )
-        deploy.main()
-        self.calls.deploy.assert_called_once()
-        status = self.calls.summary.call_args.kwargs["s3_status"]
-        self.assertTrue(status.startswith("skipped:"), status)
-        self.assertIn("Access", status)
+        # check cannot run, so it is reported as skipped instead of failing.
+        # The writer's readiness is a prerequisite for the reader, so the job
+        # fails there and the reader is never deployed: the delivery paths stay
+        # with the writer instead of activating an uninitialised reader.
+        def blocked(request, timeout=None):
+            raise urllib.error.HTTPError(
+                request.full_url, 403, "Forbidden", {}, io.BytesIO(b"")
+            )
+        self.http.return_value.open.side_effect = blocked
+        with self.assertRaises(SystemExit) as failure:
+            deploy.main()
+        self.assertIn("readiness", str(failure.exception))
+        # reader の配備・既存の配信 Route の変更は行わない。
+        self.assertEqual(self.calls.deploy.call_count, 1)
+        self.calls.summary.assert_not_called()
 
     def test_store_only_token_fails_when_probe_answers_without_auth(self):
         # If the authenticated probe answers 200 without a token, the worker is
@@ -188,6 +209,7 @@ class DeploymentFlowTests(unittest.TestCase):
     def test_s3_failure_still_fails_when_smoke_is_disabled(self):
         self.ready()
         os.environ["NAROU_SMOKE"] = "0"
+        self.http.return_value.open.side_effect = None
         self.http.return_value.open.return_value = FakeResponse({**VERIFIED, "s3_list": "failed"}, 503)
         with self.assertRaises(SystemExit):
             deploy.main()
@@ -197,9 +219,16 @@ class DeploymentFlowTests(unittest.TestCase):
         self.ready()
         os.environ["NAROU_SMOKE"] = "0"
         deploy.main()
-        self.http.return_value.open.assert_called_once()
+        paths = [
+            call.args[0].full_url
+            for call in self.http.return_value.open.call_args_list
+        ]
+        base = "https://worker.example.workers.dev"
+        self.assertIn(f"{base}/api/storage/mode?probe=s3", paths)
+        # writer の readiness は source の初期化も行う (reader の配備前に通す)。
+        self.assertIn(f"{base}/health/ready", paths)
         self.calls.smoke.assert_not_called()
-        self.calls.deploy.assert_called_once()
+        self.assert_both_scripts_deployed()
 
 
 class ProbeTests(unittest.TestCase):

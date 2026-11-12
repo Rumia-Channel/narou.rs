@@ -173,6 +173,8 @@ jobs:
           NAROU_CHECK_UNCONFIGURED: "1"
       - name: Worker compressed content lifecycle
         run: node tests/content_storage.mjs
+      - name: Worker delivery and update isolation
+        run: node tests/read_worker.mjs
       - name: Worker abrupt termination and checkpoint recovery
         run: node tests/runtime_recovery.mjs
 
@@ -316,6 +318,8 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NAROU_DEPLOY_TARGET: production
+      # 既存の Route 運用なら route を選び、DNS / custom domain を付け替えない。
+      NAROU_DOMAIN_MODE: ${{ vars.NAROU_DOMAIN_MODE || 'custom' }}
       # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
       SERVICE_DOMAIN: ${{ secrets.SERVICE_DOMAIN || vars.SERVICE_DOMAIN }}
       # リレードメイン。設定時は NAROU_RELAY_ENDPOINT より優先して https://<domain> を使う。

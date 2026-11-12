@@ -33,6 +33,10 @@ use crate::rate_limiter::WorkerRateLimiter;
 mod asset_backend;
 use asset_backend::AssetBackend;
 
+#[path = "reader_storage.rs"]
+mod reader_storage;
+use reader_storage::ReaderStores;
+
 /// Result of the complete ledger + Queue producer operation for one plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchOutcome {
@@ -43,6 +47,9 @@ pub struct DispatchOutcome {
 /// Queue producer binding that carries version-2 job envelopes.
 pub const JOB_QUEUE_BINDING: &str = "NAROU_JOBS";
 const CONVERT_QUEUE_BINDING: &str = "CONVERT_QUEUE";
+/// Service binding of the writer script. 配信 Worker は捕捉した変更系を
+/// ここへ転送する (同一ドメインの更新 Worker)。
+pub const WRITER_SERVICE_BINDING: &str = "NAROU_WRITER";
 
 /// Only the current job's novel hashes await persistence; never a library snapshot.
 pub type PendingSectionHashCache =
@@ -176,11 +183,16 @@ struct WorkerObjectStores {
 /// 本文は未設定なら S3 を選び、既存の D1 本文は migrating で保持する。
 /// `NAROU_REQUIRE_S3=true` は挿絵・本文とも S3 を必須とする。
 /// S3 設定に失敗した場合はマーカーを変えず、黙って D1 へ落とさない。
+///
+/// `reader = true` は配信 Worker (読み取り専用) の組立。sources への
+/// 書き込み (本文マーカーの確定・属性の backfill) は一切行わず、
+/// 配信は private staging だけを書ける保存層で組み立てる。
 async fn build_object_stores(
     env: &Env,
     db: &DbHandle,
     subrequests: crate::budget::SubrequestBudget,
     fresh: bool,
+    reader: bool,
 ) -> worker::Result<WorkerObjectStores> {
     let required = required_s3(env)?;
     let backend = read_asset_backend(db, fresh).await?.resolve(required);
@@ -198,6 +210,10 @@ async fn build_object_stores(
     };
     let content_backend = match content_marker {
         Some(mode) if mode != crate::content_store::ContentBackend::D1 || !required => mode,
+        // 配信はマーカーを確定しない。writer が適用する遷移を推測して
+        // 同じ保存先 (S3 本文 + 旧 D1 本文) から読むだけにする。
+        _ if reader => crate::content_store::inferred_backend(&primary_db).await
+            .map_err(|error| worker::Error::RustError(error.to_string()))?,
         _ => crate::content_store::initialize_s3_default(&primary_db, required).await
             .map_err(|error| worker::Error::RustError(error.to_string()))?,
     };
@@ -220,9 +236,19 @@ async fn build_object_stores(
         split = split.with_staging((store.clone(), store.clone()));
     }
     let split = Arc::new(split);
+    let (objects, assets): (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) = if reader {
+        // 配信は source を書き換えない。private staging (S3) だけを書ける。
+        let staging = stage_store
+            .clone()
+            .map(|store| reader_storage::StagingTarget::new(store.clone(), store));
+        let guarded = ReaderStores::new(split.clone(), split, staging);
+        (guarded.objects(), guarded.assets())
+    } else {
+        (split.clone(), split)
+    };
     Ok(WorkerObjectStores {
-        objects: split.clone(),
-        assets: split,
+        objects,
+        assets,
         s3_illustrations: s3_handle,
         stage_store,
     })
@@ -303,15 +329,17 @@ impl WorkerRuntime {
         write_db: DbHandle,
         profile: CompositionProfile,
     ) -> worker::Result<Self> {
+        // 配信 Worker では source を変更しない組立に落とす。
+        let reader = crate::worker_role::is_reader(env)?;
         let subrequests = crate::budget::SubrequestBudget::new();
         let WorkerObjectStores {
             objects: write_objects, assets: write_assets, stage_store, ..
-        } = build_object_stores(env, &write_db, subrequests.clone(), true).await?;
+        } = build_object_stores(env, &write_db, subrequests.clone(), true, reader).await?;
         let (objects, assets) = match profile {
             CompositionProfile::Job => (write_objects.clone(), write_assets),
             CompositionProfile::Ui => {
                 let WorkerObjectStores { objects, assets, .. } =
-                    build_object_stores(env, &db, subrequests.clone(), false).await?;
+                    build_object_stores(env, &db, subrequests.clone(), false, reader).await?;
                 (objects, assets)
             }
         };
@@ -991,14 +1019,19 @@ pub async fn build_services(env: &Env) -> worker::Result<AppServices> {
 pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     // 読み取り系の API 面。UI 経路なので `DbHandle::ui` (first-unconstrained
     // セッション、失敗時は primary) で組み立てる。
+    //
+    // 配信 Worker (reader) では source を変更しない: 保存層は書き込みを
+    // 拒否する private staging 付き、かつ lazy な backfill も走らない。
+    let reader = crate::worker_role::is_reader(env)?;
     let db = DbHandle::ui(Arc::new(env.d1("DB")?));
     let subrequests = crate::budget::SubrequestBudget::new();
     let WorkerObjectStores { objects, assets, s3_illustrations, .. } =
-        build_object_stores(env, &db, subrequests, false).await?;
+        build_object_stores(env, &db, subrequests, false, reader).await?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
     let site_settings = crate::bundled_sites::load_site_settings(&objects).await
         .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    // 属性の backfill は writer の責務 (配信では実行しない)。
     crate::webui::metadata::initialize_attributes(env).await?;
     let novels: Arc<dyn NovelRepository> =
         Arc::new(D1NovelRepository::new(db.clone()).with_sites(site_settings.clone()));
@@ -1035,10 +1068,17 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
 /// write_services` と同じ組立) — 更新系ハンドラは「書き込み判断のための
 /// 読み取り」も stale な replica/キャッシュ値を使えないため。
 pub async fn build_mutation_services(env: &Env) -> worker::Result<AppServices> {
+    // 配信 Worker は更新経路を実行しない (捕捉した変更系は writer へ
+    // 転送される)。ここでも source を書き換えないことを保証する。
+    if crate::worker_role::is_reader(env)? {
+        return Err(worker::Error::RustError(
+            "mutation services are writer-only".into(),
+        ));
+    }
     let db = DbHandle::primary(Arc::new(env.d1("DB")?));
     let subrequests = crate::budget::SubrequestBudget::new();
     let WorkerObjectStores { objects, .. } =
-        build_object_stores(env, &db, subrequests, true).await?;
+        build_object_stores(env, &db, subrequests, true, false).await?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::for_writes(db.clone()));
     let site_settings = crate::bundled_sites::load_site_settings_uncached(&objects).await
@@ -1119,6 +1159,10 @@ fn services_from(deps: ServiceDependencies<'_>) -> AppServices {
 ///
 /// Nothing here performs network I/O; a missing binding or config fails
 /// with `Err`, which the handler maps to 503.
+///
+/// 配信 Worker (reader) はキュー・cron・rate limiter を持たないので、
+/// 読み取り専用組立 (source を変更しない) と writer への転送用 service
+/// binding だけを確かめる。
 pub async fn check_ready(env: &Env) -> worker::Result<()> {
     let db = env.d1("DB")?;
     let row = db
@@ -1133,6 +1177,11 @@ pub async fn check_ready(env: &Env) -> worker::Result<()> {
                 "D1 readiness returned no row".to_string(),
             ));
         }
+    }
+    if crate::worker_role::is_reader(env)? {
+        // 捕捉した変更系は writer へ転送するので、その binding を要求する。
+        env.service(WRITER_SERVICE_BINDING)?;
+        return build_read_services(env).await.map(|_| ());
     }
     env.queue(JOB_QUEUE_BINDING)?;
     env.queue(CONVERT_QUEUE_BINDING)?;

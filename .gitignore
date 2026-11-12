@@ -56,6 +56,7 @@ __pycache__/
 /worker_entry/build/
 .wrangler/
 /worker_entry/wrangler.ci.toml
+/worker_entry/wrangler.reader.ci.toml
 # tests/run.mjs が生成する実行用設定
 /worker_entry/wrangler.test.toml
 /worker_entry/.dev.vars

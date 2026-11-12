@@ -68,6 +68,28 @@ pub async fn backend(db: &DbHandle) -> Result<ContentBackend> {
     Ok(stored_backend(db).await?.unwrap_or(ContentBackend::D1))
 }
 
+/// The backend a writer would persist for a library without a marker, without
+/// writing the marker. A delivery Worker composes the same store and lets the
+/// content reads fall back to the legacy D1 bodies, so an uninitialized
+/// library stays readable without mutating the shared source.
+pub async fn inferred_backend(db: &DbHandle) -> Result<ContentBackend> {
+    Ok(if legacy_content_exists(db).await? {
+        ContentBackend::Migrating
+    } else {
+        ContentBackend::S3
+    })
+}
+
+/// Whether legacy (pre-migration) episode bodies still exist in D1.
+async fn legacy_content_exists(db: &DbHandle) -> Result<bool> {
+    let row = db
+        .prepare("SELECT 1 AS present FROM legacy_content_objects LIMIT 1")
+        .first::<i64>(Some("present"))
+        .await
+        .map_err(error)?;
+    Ok(row.is_some())
+}
+
 /// Call only after constructing the S3 store successfully. The legacy-content
 /// check and marker transition are one statement, so no old body is stranded.
 pub async fn initialize_s3_default(db: &DbHandle, required: bool) -> Result<ContentBackend> {

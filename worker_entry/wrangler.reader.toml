@@ -1,0 +1,64 @@
+# 読み取り専用 Reader Worker のテンプレート。
+#
+# `worker_entry/ci/render_config.py` がプレースホルダを CI の環境変数と writer
+# の設定から置換し、`wrangler.reader.ci.toml` を生成する (生成物は .gitignore
+# 済み)。account 固有の値 (database_id / S3 の接続先 / secret 名) はここに
+# 書かない。置く値は reader 名 / writer 名 / workers.dev / 認証 / S3 の
+# endpoint・region・bucket・prefix / D1 の名前と ID / Secrets Store の
+# バインディング / 配信パスの route。
+#
+# writer (`wrangler.ci.toml`) との差:
+#   - 配信 (外部 API / ブラウザの読み / EPUB) だけを受け持つ。mutation は
+#     実行せず、既存 writer へ流す。
+#   - queue / cron / RATE_LIMITER / 静的アセット / ビルドを持たない。同じ Rust
+#     成果物 (`build/worker/shim.mjs`) を writer がビルドし、reader はそれを
+#     使い回す (ビルドは 1 回だけ)。
+#   - D1 / S3 / 認証は writer と同一のものを参照する (同じ読み取り元)。
+#   - `[[routes]]` は既存ドメインの配信パスだけを reader へ向き付ける。
+#     DNS も Access アプリも作らない (既存ドメインをそのまま使う)。
+
+name = "__READER_NAME__"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-08-10"
+workers_dev = __WORKERS_DEV__
+
+[limits]
+# 有料プラン前提の余裕。EPUB 生成を 1 invocation で扱う。
+cpu_ms = 300000
+
+[vars]
+# CI deployment requires bodies and illustrations in S3; metadata remains in D1.
+NAROU_REQUIRE_S3 = "true"
+# Zero Trust (Access) を境界にする場合は CI の `NAROU_AUTH_REQUIRED=false` で
+# Bearer トークン検査を切る (NAROU_ADMIN_TOKEN も不要になる)。
+NAROU_AUTH_REQUIRED = "__NAROU_AUTH_REQUIRED__"
+# writer / reader の役割。reader は mutation ハンドラを自分で実行しない。
+NAROU_WORKER_ROLE = "reader"
+S3_ENDPOINT = "__S3_ENDPOINT__"
+S3_REGION = "__S3_REGION__"
+S3_BUCKET = "__S3_BUCKET__"
+S3_PREFIX = "__S3_PREFIX__"
+
+# Secrets Store を使う場合、render_config.py がここに [[secrets_store_secrets]] を差し込む。
+__SECRET_STORE_BLOCKS__
+
+[[d1_databases]]
+binding = "DB"
+database_name = "__NAROU_D1_DATABASE_NAME__"
+database_id = "__NAROU_D1_DATABASE_ID__"
+migrations_dir = "migrations"
+
+# 配信以外 (管理画面 / ジョブ操作 / 設定) は既存 writer へそのまま流す。
+[[services]]
+binding = "NAROU_WRITER"
+service = "__WRITER_NAME__"
+
+# Web UI のコンソール/進捗イベント (EPUB 生成を含む) は writer の PushHub に
+# 届ける。reader は新しい DO 名前空間を作らない。
+[[durable_objects.bindings]]
+name = "PUSH_HUB"
+class_name = "PushHub"
+script_name = "__WRITER_NAME__"
+
+# 既存ドメインの配信パスだけを reader へ向き付ける (DNS は触らない)。
+__READER_ROUTES_BLOCK__

@@ -23,6 +23,7 @@ use crate::composition::WorkerRuntime;
 
 pub mod download;
 pub mod external;
+pub mod read_api;
 pub mod job_actions;
 pub mod library_backup;
 pub mod login_actions;

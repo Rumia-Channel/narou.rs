@@ -34,6 +34,7 @@ mod epub_stream;
 pub mod http;
 mod isolate_cache;
 mod memory_budget;
+mod worker_role;
 mod ledger;
 mod object_migration;
 mod illustration_migration;
@@ -60,15 +61,19 @@ use crate::d1_repository::D1SettingsStore;
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    let path = req.path();
+    if worker_role::is_reader(&env)? && !worker_role::owns_request(&path, req.method()) {
+        return env.service(composition::WRITER_SERVICE_BINDING)?.fetch_request(req).await;
+    }
     // native (axum) は GET ルートに HEAD も通す。Worker の各ハンドラは
     // GET/POST 前提で 405 を返すので、HEAD は GET として処理し、応答から
     // 本文だけを落として返す (method とヘッダを引き継いだ複製を作る)。
     let is_head = req.method() == Method::Head;
     let mut response = if is_head {
         let get_request = request_as_get(&req)?;
-        route(get_request, env).await?
+        route(get_request, env, path).await?
     } else {
-        route(req, env).await?
+        route(req, env, path).await?
     };
     // Response::error has no Content-Type. Browsers otherwise guess an encoding
     // and display Japanese object keys as mojibake instead of the actual key.
@@ -101,11 +106,13 @@ fn head_response(response: Response) -> Result<Response> {
         .empty())
 }
 
-async fn route(req: Request, env: Env) -> Result<Response> {
-    let path = req.path();
+async fn route(req: Request, env: Env, path: String) -> Result<Response> {
     // 外部公開 API (`/api/v1`)。認証は Cloudflare Access / Bearer トークン。
     if path == "/api/v1" || path.starts_with("/api/v1/") {
         return webui::external::handle(req, env).await;
+    }
+    if narou_rs::application::read_api::is_read_path(&path) {
+        return webui::read_api::handle(req, env).await;
     }
     // 外部 API の設定 (トークン管理)。管理トークンで保護する。
     if path == "/api/external_api" || path.starts_with("/api/external_api/") {
@@ -1418,9 +1425,13 @@ async fn auth_state(req: &Request, env: &Env) -> AuthState {
         return AuthState::Allowed;
     }
     // ブラウザは HttpOnly Cookie でトークンを運ぶ (migration plan §3.2)。
-    // Cookie は自動で付く資格情報なので、同一オリジン検査を併せて要求する
-    // (SameSite=Lax と二重の CSRF 対策)。
-    if cookie_matches(req, &secret) && same_origin(req) {
+    // 通常 UI は同一オリジンのまま。読み取り API だけは、そのハンドラが
+    // 許可元 Origin を検証した後に既存 Cookie 認証へ進む。
+    if cookie_matches(req, &secret)
+        && (same_origin(req)
+            || (matches!(req.method(), Method::Get | Method::Head)
+                && narou_rs::application::read_api::is_read_path(&req.path())))
+    {
         return AuthState::Allowed;
     }
     AuthState::Required
@@ -1597,6 +1608,17 @@ async fn api_auth_login(mut req: Request, env: Env) -> Result<Response> {
 
 #[event(scheduled)]
 pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    match worker_role::is_reader(&env) {
+        Ok(false) => {}
+        Ok(true) => {
+            console_error!("reader Worker does not run scheduled jobs");
+            return;
+        }
+        Err(error) => {
+            console_error!("scheduled Worker role: {error}");
+            return;
+        }
+    }
     // The cron handler only plans and enqueues; execution happens through
     // the queue consumer. Errors are logged: the next scheduled event
     // re-plans, and the ledger's active dedupe keeps it duplicate-free.
@@ -1611,6 +1633,9 @@ pub async fn queue(
     env: Env,
     _ctx: Context,
 ) -> Result<()> {
+    if worker_role::is_reader(&env)? {
+        return Err(Error::RustError("reader Worker does not consume queues".into()));
+    }
     consumer::process_batch(message_batch, &env)
         .await
         .map_err(|error| Error::RustError(error.to_string()))

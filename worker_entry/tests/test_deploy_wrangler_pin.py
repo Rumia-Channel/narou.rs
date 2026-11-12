@@ -82,6 +82,7 @@ class WranglerPinTests(unittest.TestCase):
             "deploy": "https://worker.example.workers.dev",
             "smoke_url": ("https://worker.example.workers.dev", False),
             "verify_s3": "ok",
+            "verify_writer_ready": "ok",
             "smoke": True,
             "summary": None,
         }
