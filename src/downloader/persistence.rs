@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, Clock, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore, SystemClock,
+    ObjectFingerprint, ObjectFingerprintMismatch,
 };
 
 use super::types::{SectionElement, SectionFile, SubtitleInfo, TocFile};
@@ -142,10 +143,10 @@ impl PersistenceService {
     /// Pin conversion to the supplied TOC generation without retaining bodies.
     ///
     /// Current downloads publish section revisions before the replacement TOC.
-    /// Reject those in-flight bodies rather than combining generations. Legacy
-    /// inputs have no revision token, so retain only their hashes and recheck
-    /// them before successful EOF. The consumer must not publish a partial
-    /// result before EOF (conversion uses an unpublished staged asset).
+    /// Reject in-flight bodies rather than combining generations, then recheck
+    /// their content fingerprints before EOF. Immutable stores can compare
+    /// authoritative digests; mutable/legacy stores re-read their bytes. The
+    /// consumer must not publish a partial result before successful EOF.
     pub fn stream_sections_snapshot(&self, keys: NovelObjectKeys, toc: TocFile) -> SectionStream {
         let persistence = self.clone();
         let expected_toc = serialize_toc(&toc).map(|text| Sha256::digest(text.as_bytes()).to_vec());
@@ -175,20 +176,25 @@ impl PersistenceService {
                             "section generation changed during conversion: {key}",
                         )));
                     }
-                    fingerprints.push((key, <[u8; 32]>::from(Sha256::digest(&bytes))));
+                    fingerprints.push(ObjectFingerprint {
+                        key, sha256: <[u8; 32]>::from(Sha256::digest(&bytes)),
+                    });
                     return Ok(Some((section, (
                         persistence, keys, toc, Ok(expected_toc), position + 1, fingerprints,
                     ))));
                 }
-                for (key, expected) in fingerprints {
-                    let bytes = persistence.objects.read_small(&key).await?.ok_or_else(|| {
-                        NarouError::Platform(format!("section disappeared during conversion: {key}"))
-                    })?;
-                    if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected {
+                match persistence.objects.verify_fingerprints(&fingerprints).await? {
+                    Some(ObjectFingerprintMismatch::Missing(key)) => {
                         return Err(NarouError::Platform(format!(
-                            "section changed during conversion: {key}",
+                            "section disappeared during conversion: {key}"
                         )));
                     }
+                    Some(ObjectFingerprintMismatch::Changed(key)) => {
+                        return Err(NarouError::Platform(format!(
+                            "section changed during conversion: {key}"
+                        )));
+                    }
+                    None => {}
                 }
                 let current = persistence.load_toc(&keys).await?.ok_or_else(|| {
                     NarouError::Platform(format!("toc disappeared during conversion: {}", keys.toc()))
@@ -710,13 +716,20 @@ mod tests {
             let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
             store.write_small(&key, serialize_section(&section_file(&subtitle, "old")).unwrap().into_bytes())
                 .await.unwrap();
-            let mut stream = service.stream_sections_snapshot(keys, toc);
+            let mut stream = service.stream_sections_snapshot(keys.clone(), toc.clone());
             assert_eq!(stream.next().await.unwrap().unwrap().element.body, "old");
             // Even a legacy/manual rewrite without a revision bump is detected.
             store.write_small(&key, serialize_section(&section_file(&subtitle, "new")).unwrap().into_bytes())
                 .await.unwrap();
             let error = stream.next().await.unwrap().unwrap_err();
-            assert!(error.to_string().contains("section changed during conversion"));
+            assert!(matches!(error, NarouError::Platform(_)));
+            assert!(stream.next().await.is_none());
+
+            let mut stream = service.stream_sections_snapshot(keys, toc);
+            assert_eq!(stream.next().await.unwrap().unwrap().element.body, "new");
+            ObjectStore::delete(store.as_ref(), &key).await.unwrap();
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(matches!(error, NarouError::Platform(_)));
             assert!(stream.next().await.is_none());
         });
     }
@@ -741,7 +754,7 @@ mod tests {
             ).await.unwrap();
             let mut stream = service.stream_sections_snapshot(keys, toc);
             let error = stream.next().await.unwrap().unwrap_err();
-            assert!(error.to_string().contains("section generation changed"));
+            assert!(matches!(error, NarouError::Platform(_)));
         });
     }
 

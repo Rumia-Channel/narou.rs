@@ -91,8 +91,17 @@ pub(crate) async fn build_epub_response(env: &Env, id: i64, virtual_only: bool) 
                 .and_then(|value| narou_rs::converter::settings::ImageRotation::from_setting(&value)),
         });
         let mut preparation = StreamingPreparation::scan(&source, &options, Vec::new(), index, cover_image).await.map_err(stream_error)?;
+        let mut probed = std::collections::HashSet::new();
         for reference in preparation.references() {
             if names.iter().any(|name| name == reference) || !reference.starts_with("挿絵/") { continue; }
+            // Cache negative results too, without retaining an unbounded set
+            // of missing names. References beyond the cache still get probed.
+            let duplicate = if probed.len() < MAX_IMAGES {
+                !probed.insert(reference.as_str())
+            } else {
+                probed.contains(reference.as_str())
+            };
+            if duplicate { continue; }
             let key = epub_image_key(&keys, &illustration_sources, reference).map_err(stream_error)?;
             if services.assets.stat(&key).await.map_err(stream_error)?.is_some() {
                 if names.len() == MAX_IMAGES { return Response::error(format!("Illustrations exceed the Worker budget ({MAX_IMAGES} images)"), 413); }

@@ -952,6 +952,7 @@ narou setting name         # 読み取り
 - Worker の排他待ちは待機として永続化して ACK し、失敗回数や provider retry を消費しない。完了・毎分 cron で同じ job ID を再投入し、旧レーンの envelope も正しい Queue へ転送する。作品の別 URL と ID は YAML 解決後の TOC URL で照合し、元の target と再開用 checkpoint は変更しない。
 - 同じ isolate 内ではダウンロード・変換・EPUB・転送等の重い処理を 1 件に制限する。HTTP の容量待ちは `503 memory_capacity` と `Retry-After: 5`、Queue は実行 lease と試行回数を消費する前の延期とする。応答 stream の完了・失敗・キャンセルまで枠を保持する。別 isolate の実行と D1 のサイト・作品排他は維持する。
 - Workers の配備は管理・更新用と配信用 (`-reader`) に分ける。外部 API (`/api/v1`)・ブラウザ連携 API (`/api/read/v1`)・Web UI の EPUB 取得を配信用へ直接振り分け、既存 URL と認証を維持する。作品の D1 / S3 は共有・読み取り専用とし、EPUB の非公開 stage だけ書き込みを許可する。更新・設定変更・Queue・cron は管理側に残し、重い処理のメモリ枠を共有しない。
+- Worker の EPUB 終端検証は、初読で照合済みの immutable 本文の SHA-256 を D1 primary の参照と100件ずつ比較し、全話の S3 再取得を省く。差し替え・削除・初読時の破損は引き続き拒否する。同じ欠落挿絵の存在確認もリクエスト内で共用する（記録は最大512参照）。1話ずつの本文処理、非公開 stage、`convert.keep-txt` の設定・既定値は変更しない。
 - 容量待ちの再投入では期限切れ lease を取り除き、再配信直後に同じ cron が配送喪失として回収することを防ぐ。未到来の backoff と並行実行が取得済みの lease は維持する。
 - Worker の待機ジョブ選択は、実行中または中断後の lease を保持する所有者を SQL 内で一度だけ取り出し、待機ジョブごとに過去の終了履歴を走査しない。同一サイト・同一作品の競合判定と 1 サイトにつき 1 件の再開規則は維持する。
 - 待機選択と atomic claim の URL / N コード照合は migration `0018_novel_target_aliases.sql` の永続索引 `novel_target_aliases` を使い、再開のたびに全作品の対応表を作り直さない。索引は作品と同じトランザクションで更新し、複数一致時の最小 ID・従来の URL suffix・数値 ID の解釈と未登録 URL の排他は維持する。

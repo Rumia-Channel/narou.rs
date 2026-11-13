@@ -62,7 +62,7 @@ pub fn is_safe_public_ip(ip: IpAddr) -> bool {
 
 fn is_safe_public_ipv4(octets: [u8; 4]) -> bool {
     let [a, b, c, d] = octets;
-    if a == 0
+    !(a == 0
         || a == 10
         || a == 127
         || (a == 169 && b == 254)
@@ -77,11 +77,7 @@ fn is_safe_public_ipv4(octets: [u8; 4]) -> bool {
         || (a == 198 && b == 19)
         || (a == 198 && b == 51 && c == 100)
         || (a == 203 && b == 0 && c == 113)
-        || (a == 255 && b == 255 && c == 255 && d == 255)
-    {
-        return false;
-    }
-    true
+        || (a == 255 && b == 255 && c == 255 && d == 255))
 }
 
 /// IPv4 を埋め込む移行機構の形式から埋め込み IPv4 を取り出す。
@@ -150,14 +146,10 @@ fn is_safe_public_ipv6(segments: [u16; 8]) -> bool {
     }
 
     let first = segments[0];
-    if (first & 0xfe00) == 0xfc00
+    !((first & 0xfe00) == 0xfc00
         || (first & 0xffc0) == 0xfe80
         || (first & 0xff00) == 0xff00
-        || (first == 0x2001 && segments[1] == 0x0db8)
-    {
-        return false;
-    }
-    true
+        || (first == 0x2001 && segments[1] == 0x0db8))
 }
 
 #[cfg(test)]

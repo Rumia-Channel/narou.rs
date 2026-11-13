@@ -10,6 +10,7 @@ use narou_rs::platform::{
     ObjectMetadata, ObjectStore, ObjectUpdateResult, PlatformFuture, SmallObjectMutator,
     content_type_for_key, decode_object_payload_limited, encode_object_payload,
     object_crc32, prefix_upper_bound, verify_object_crc32,
+    ObjectFingerprint, ObjectFingerprintMismatch,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +21,8 @@ pub(crate) mod sql;
 #[path = "content_asset_stream.rs"]
 mod asset_stream;
 const CAP: usize = 16 * 1024 * 1024;
+// D1 allows at most 100 bound parameters per statement.
+const FINGERPRINT_BATCH_SIZE: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum ContentBackend {
@@ -151,6 +154,8 @@ impl MetadataRow {
 }
 #[derive(Deserialize)]
 struct KeyRow { object_key: String }
+#[derive(Deserialize)]
+struct FingerprintRow { object_key: String, sha256: String }
 #[derive(Deserialize)]
 struct CommitRow { committed: i64 }
 
@@ -389,6 +394,68 @@ impl ObjectStore for ContentStore {
                 return primary.legacy.read_small(key).await;
             }
             self.legacy.read_small(key).await
+        })
+    }
+    fn verify_fingerprints<'a>(
+        &'a self,
+        fingerprints: &'a [ObjectFingerprint],
+    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'a>>>> {
+        Box::pin(async move {
+            let mut position = 0;
+            while let Some(first) = fingerprints.get(position) {
+                if !is_content_key(&first.key) {
+                    let store = if asset_stream::is_private_or_generated(&first.key) {
+                        self.remote.as_ref()
+                    } else {
+                        self.legacy.as_ref()
+                    };
+                    if let Some(mismatch) = store.verify_fingerprints(std::slice::from_ref(first)).await? {
+                        return Ok(Some(mismatch));
+                    }
+                    position += 1;
+                    continue;
+                }
+                let count = fingerprints[position..].iter().take(FINGERPRINT_BATCH_SIZE)
+                    .take_while(|fingerprint| is_content_key(&fingerprint.key)).count();
+                let batch = &fingerprints[position..position + count];
+                const PREFIX: &str = "SELECT object_key,sha256 FROM content_objects WHERE object_key IN (";
+                const SUFFIX: &str = ") ORDER BY object_key COLLATE BINARY";
+                let mut query = String::with_capacity(PREFIX.len() + count * 2 + SUFFIX.len());
+                query.push_str(PREFIX);
+                for index in 0..count {
+                    if index != 0 { query.push(','); }
+                    query.push('?');
+                }
+                query.push_str(SUFFIX);
+                let values: Vec<JsValue> = batch.iter()
+                    .map(|fingerprint| JsValue::from_str(fingerprint.key.as_ref())).collect();
+                // These fresh primary rows name immutable blobs. The initial
+                // read has already checked each blob's decoded SHA-256.
+                let rows = self.statement(&query, &values)?.all().await.map_err(error)?
+                    .results::<FingerprintRow>().map_err(error)?;
+                for fingerprint in batch {
+                    if let Ok(index) = rows.binary_search_by(|row| {
+                        row.object_key.as_str().cmp(fingerprint.key.as_ref())
+                    }) {
+                        let mut expected = [0u8; 64];
+                        hex::encode_to_slice(fingerprint.sha256.as_slice(), &mut expected).map_err(error)?;
+                        if rows[index].sha256.as_bytes() != expected {
+                            return Ok(Some(ObjectFingerprintMismatch::Changed(&fingerprint.key)));
+                        }
+                    } else {
+                        // Missing refs can still be legacy D1 content during
+                        // migration. Keep the existing backend/fallback rules.
+                        let Some(bytes) = self.read_small(&fingerprint.key).await? else {
+                            return Ok(Some(ObjectFingerprintMismatch::Missing(&fingerprint.key)));
+                        };
+                        if <[u8; 32]>::from(Sha256::digest(&bytes)) != fingerprint.sha256 {
+                            return Ok(Some(ObjectFingerprintMismatch::Changed(&fingerprint.key)));
+                        }
+                    }
+                }
+                position += count;
+            }
+            Ok(None)
         })
     }
     fn write_small<'a>(&'a self,key:&'a ObjectKey,data:Vec<u8>) -> PlatformFuture<'a,Result<()>> {
