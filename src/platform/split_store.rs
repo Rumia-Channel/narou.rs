@@ -14,6 +14,7 @@ use super::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
     ObjectPrefix, ObjectStore, PlatformFuture,
     ObjectUpdateResult, SmallObjectMutator,
+    ObjectFingerprint, ObjectFingerprintMismatch,
 };
 use crate::error::{NarouError, Result};
 
@@ -151,6 +152,26 @@ impl ObjectStore for SplitStore {
         key: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
         self.pair_for(key).objects.read_small(key)
+    }
+
+    fn verify_fingerprints<'a>(
+        &'a self,
+        fingerprints: &'a [ObjectFingerprint],
+    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'a>>>> {
+        Box::pin(async move {
+            let mut remaining = fingerprints;
+            while let Some(first) = remaining.first() {
+                let store = &self.pair_for(&first.key).objects;
+                let count = remaining.iter().take_while(|fingerprint| {
+                    Arc::ptr_eq(store, &self.pair_for(&fingerprint.key).objects)
+                }).count();
+                if let Some(mismatch) = store.verify_fingerprints(&remaining[..count]).await? {
+                    return Ok(Some(mismatch));
+                }
+                remaining = &remaining[count..];
+            }
+            Ok(None)
+        })
     }
 
     fn write_small<'a>(

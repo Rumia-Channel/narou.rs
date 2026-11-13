@@ -10,6 +10,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 
 use futures::Stream;
+use sha2::{Digest, Sha256};
 
 use crate::error::{NarouError, Result};
 
@@ -248,6 +249,20 @@ pub enum ObjectUpdateResult {
     Conflict,
 }
 
+/// SHA-256 of the decoded bytes already consumed from one logical object.
+#[derive(Debug)]
+pub struct ObjectFingerprint {
+    pub key: ObjectKey,
+    pub sha256: [u8; 32],
+}
+
+/// The first object that no longer matches a consumed snapshot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ObjectFingerprintMismatch<'a> {
+    Missing(&'a ObjectKey),
+    Changed(&'a ObjectKey),
+}
+
 /// Blob store for bounded control objects.
 ///
 /// `read_small`/`write_small` deliberately make the buffering contract
@@ -261,6 +276,28 @@ pub trait ObjectStore: PlatformService {
     }
 
     fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>>;
+
+    /// Recheck consumed content in input order, without retaining its bodies.
+    ///
+    /// Mutable stores re-read bytes by default. An adapter may instead compare
+    /// fresh authoritative digests of immutable, checksum-verified payloads.
+    /// Cached digests, timestamps and opaque ETags are not sufficient.
+    fn verify_fingerprints<'a>(
+        &'a self,
+        fingerprints: &'a [ObjectFingerprint],
+    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'a>>>> {
+        Box::pin(async move {
+            for fingerprint in fingerprints {
+                let Some(bytes) = self.read_small(&fingerprint.key).await? else {
+                    return Ok(Some(ObjectFingerprintMismatch::Missing(&fingerprint.key)));
+                };
+                if <[u8; 32]>::from(Sha256::digest(&bytes)) != fingerprint.sha256 {
+                    return Ok(Some(ObjectFingerprintMismatch::Changed(&fingerprint.key)));
+                }
+            }
+            Ok(None)
+        })
+    }
 
     fn write_small<'a>(
         &'a self,

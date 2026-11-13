@@ -33,7 +33,7 @@ pub(crate) fn owns_request(path: &str, method: Method) -> bool {
         return true;
     }
     if let Some(rest) = path.strip_prefix("/api/novels/") {
-        let (id, tail) = rest.split_once('/').map_or((rest, ""), |parts| parts);
+        let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
         return id.parse::<i64>().is_ok()
             && (matches!(tail, "" | "download.epub" | "author_comments")
                 || tail.starts_with("illustrations/"));

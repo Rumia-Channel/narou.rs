@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import process from 'node:process';
+import { deflateSync } from 'node:zlib';
 import {
   assertEpubShape,
   createS3Fixture,
@@ -113,6 +114,64 @@ const VIRTUAL = {
   members: [NOVEL.id, MEMBER.id],
 };
 
+// More than two fingerprint batches; image-free and missing-image workloads
+// must be measured separately rather than charging every book for misses.
+const PLAIN = {
+  ...NOVEL,
+  id: 4,
+  fileTitle: 'ReadPlain',
+  title: 'Reader Plain Novel',
+  ncode: 'n3333aa',
+  tocUrl: 'https://example.test/n3333aa/',
+  withIllustration: false,
+  sections: Array.from({ length: 205 }, (_, index) => ({
+    index: String(index + 1),
+    subtitle: `検証話${index + 1}`,
+    body: '挿絵なし検証本文です。',
+    marker: '挿絵なし検証本文',
+  })),
+};
+const MISSING_IMAGE = {
+  ...PLAIN,
+  id: 5,
+  fileTitle: 'ReadMissingImage',
+  title: 'Reader Missing Image Novel',
+  ncode: 'n4444aa',
+  tocUrl: 'https://example.test/n4444aa/',
+  withIllustration: true,
+};
+
+const pngChunk = (name, data) => {
+  const type = Buffer.from(name);
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const checksum = Buffer.alloc(4);
+  checksum.writeUInt32BE(crc32(Buffer.concat([type, data])));
+  return Buffer.concat([length, type, data, checksum]);
+};
+const imageHeader = Buffer.alloc(13);
+imageHeader.writeUInt32BE(1, 0);
+imageHeader.writeUInt32BE(1, 4);
+imageHeader[8] = 8;
+imageHeader[9] = 6;
+const BUDGET_IMAGE = Buffer.concat([
+  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+  pngChunk('IHDR', imageHeader),
+  pngChunk('IDAT', deflateSync(Buffer.from([0, 0, 0, 0, 255]))),
+  pngChunk('IEND', Buffer.alloc(0)),
+]);
+const budgetImageHash = createHash('sha256').update(BUDGET_IMAGE).digest('hex');
+const IMAGE_BUDGET = {
+  ...NOVEL, id: 6, fileTitle: 'ReadImageBudget', title: 'Reader Image Budget',
+  ncode: 'n5555aa', tocUrl: 'https://example.test/n5555aa/', withIllustration: false,
+  sections: [{
+    index: '1', subtitle: '画像の境界', marker: '画像境界検証本文',
+    body: '画像境界検証本文です。' +
+      Array.from({ length: 512 }, (_, index) => `<img src="挿絵/missing-${index}.png">`).join('') +
+      `<img src="挿絵/${budgetImageHash}.png">`,
+  }],
+};
+
 const novelPrefix = (novel) => `novels/${novel.sitename}/${novel.fileTitle}`;
 const subtitleOf = (novel, section) => ({
   index: section.index,
@@ -136,9 +195,9 @@ const sectionOf = (novel, section) => ({
   element: {
     data_type: 'html',
     introduction: '',
-    // 挿絵参照を 1 個入れる。EPUB 変換が「挿絵を解決できない」警告を
-    // PushHub へ配信する経路を通すため (reader → writer の DO 配信を観測する)。
-    body: `<p>${section.body}</p><img src="挿絵/illust.png">`,
+    // The original fixtures exercise missing-illustration reporting; the plain
+    // workload omits images so its request count measures section I/O alone.
+    body: `<p>${section.body}</p>${novel.withIllustration === false ? '' : '<img src="挿絵/illust.png">'}`,
     postscript: '',
   },
 });
@@ -235,11 +294,15 @@ try {
     { fatal: true },
   );
 
-  const seeded = [NOVEL, MEMBER, VIRTUAL];
+  const seeded = [NOVEL, MEMBER, VIRTUAL, PLAIN, MISSING_IMAGE, IMAGE_BUDGET];
   const allObjects = new Map();
   for (const novel of seeded) {
     for (const [key, value] of novelObjects(novel)) allObjects.set(key, value);
   }
+  fixture.objects.set(
+    `/${bucket}/${prefix}/illustrations/${Buffer.from(budgetImageHash, 'hex').toString('base64url')}.png`,
+    BUDGET_IMAGE,
+  );
 
   // --- 2. 投入 (legacy D1 と S3 参照の両方) -------------------------------
   await check(
@@ -254,7 +317,10 @@ try {
         novelInsert(NOVEL),
         novelInsert(MEMBER),
         novelInsert(VIRTUAL),
-        'UPDATE novel_id_sequence SET next_id=4;',
+        novelInsert(PLAIN),
+        novelInsert(MISSING_IMAGE),
+        novelInsert(IMAGE_BUDGET),
+        'UPDATE novel_id_sequence SET next_id=7;',
       ];
       let blobIndex = 0;
       for (const [key, value] of allObjects) {
@@ -550,6 +616,53 @@ try {
     );
   });
 
+  for (const novel of [PLAIN, MISSING_IMAGE]) {
+    await check(
+      novel.withIllustration
+        ? 'repeated missing illustrations are probed once per EPUB'
+        : 'image-free EPUB reads each immutable section only once',
+      async () => {
+        const startIndex = fixture.requests.length;
+        const start = performance.now();
+        const response = await admin(reader.base, `/api/novels/${novel.id}/download.epub`);
+        const headersMs = performance.now() - start;
+        const bytes = await assertEpubBody(response, [PLAIN.sections[0].marker]);
+        assert.equal(
+          (epubText(bytes).match(/挿絵なし検証本文/g) ?? []).length,
+          novel.sections.length,
+          'every section must survive bounded snapshot verification',
+        );
+        const requests = fixture.requests.slice(startIndex);
+        const bodyReads = requests.filter(request =>
+          request.method === 'GET' && request.logicalKey.startsWith('content/'));
+        const imageProbes = requests.filter(request =>
+          request.method === 'GET' &&
+          request.logicalKey === `${novelPrefix(novel)}/挿絵/illust.png`);
+        console.log('    EPUB I/O ' + JSON.stringify({
+          images: novel.withIllustration ? 'repeated-missing' : 'none',
+          sections: novel.sections.length, bodyReads: bodyReads.length,
+          imageProbes: imageProbes.length, totalRequests: requests.length,
+          headersMs: Math.round(headersMs), totalMs: Math.round(performance.now() - start),
+        }));
+        assert.equal(bodyReads.length, novel.sections.length,
+          'snapshot validation must not download the same immutable bodies again');
+        assert.equal(imageProbes.length, novel.withIllustration ? 1 : 0,
+          'missing-image probes must be bounded by distinct references');
+      },
+    );
+  }
+
+  await check('resolved images survive a full bounded missing-image probe cache', async () => {
+    const response = await admin(reader.base, `/api/novels/${IMAGE_BUDGET.id}/download.epub`);
+    const bytes = await assertEpubBody(response, [IMAGE_BUDGET.sections[0].marker]);
+    const entries = assertEpubShape(bytes);
+    const images = [...entries].filter(([name]) => /\.(?:png|jpe?g|gif|webp)$/.test(name));
+    assert.equal(images.length, 1, 'unlisted pooled images must still be resolved after 512 misses');
+    assert.deepEqual(images[0][1].subarray(0, 8), BUDGET_IMAGE.subarray(0, 8));
+    assert(epubText(bytes).includes(images[0][0].split('/').at(-1)),
+      'the resolved image must be referenced by the book, not merely bundled');
+  });
+
   await check('reader serves the UI EPUB route with real content', async () => {
     const response = await admin(reader.base, `/novels/${NOVEL.id}/download`);
     await assertEpubBody(
@@ -785,6 +898,78 @@ try {
     assert.equal(status, 0, `deployed reader smoke failed: ${stdout}\n${stderr}`);
     for (const line of stdout.trim().split('\n')) {
       console.log(`    ${line}`);
+    }
+  });
+
+  // Failed producers may leave expiry-journal reservations for recovery.
+  // Inject faults after checking cleanup of successful EPUB requests.
+  const assertSnapshotMutation = async (mutate) => {
+    const key = `${novelPrefix(NOVEL)}/本文/${NOVEL.sections[0].index} ${NOVEL.sections[0].subtitle}.yaml`;
+    const original = (await sql(`SELECT * FROM content_objects WHERE object_key=${quote(key)}`))[0].results[0];
+    fixture.holdNextSourceRead();
+    const pending = admin(reader.base, `/api/novels/${NOVEL.id}/download.epub`)
+      .catch(error => error);
+    try {
+      const deadline = Date.now() + 15000;
+      while (fixture.heldCount() === 0 && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      assert.equal(fixture.heldCount(), 1, 'the original immutable body must be pinned before publication');
+      await mutate(original, key);
+      fixture.releaseHolds();
+      const response = await pending;
+      if (response instanceof Error) throw response;
+      await expectStatus(response, 500, 'an invalidated snapshot');
+      assert.notEqual(response.headers.get('content-type'), 'application/epub+zip');
+      await response.text();
+    } finally {
+      fixture.releaseHolds();
+      const response = await pending;
+      if (!(response instanceof Error) && !response.bodyUsed) await response.text();
+      const columns = Object.keys(original);
+      await sql(`INSERT OR REPLACE INTO content_objects(${columns.join(',')}) VALUES (` +
+        columns.map(column => original[column] == null ? 'NULL' : quote(original[column])).join(',') + ')');
+    }
+  };
+
+  await check('reader rejects a body republished after its first read', async () => {
+    const blobKey = 'content/changed-during-epub.bin';
+    const changed = Buffer.from(JSON.stringify(sectionOf(NOVEL, {
+      ...NOVEL.sections[0], body: '取得中に差し替えた別の本文です。',
+    })));
+    fixture.objects.set(`/${bucket}/${prefix}/${blobKey}`, changed);
+    try {
+      await assertSnapshotMutation(async (_original, key) => {
+        await sql(`UPDATE content_objects SET blob_key=${quote(blobKey)},` +
+          `size=${changed.length},stored_size=${changed.length},encoding='none',` +
+          `crc32=${crc32(changed)},sha256=${quote(createHash('sha256').update(changed).digest('hex'))} ` +
+          `WHERE object_key=${quote(key)}`);
+      });
+    } finally {
+      fixture.objects.delete(`/${bucket}/${prefix}/${blobKey}`);
+    }
+  });
+
+  await check('reader rejects a body reference removed after its first read', async () => {
+    await assertSnapshotMutation(async (_original, key) => {
+      await sql(`DELETE FROM content_objects WHERE object_key=${quote(key)}`);
+    });
+  });
+
+  await check('reader still validates the first S3 body against its published checksum', async () => {
+    const key = `${novelPrefix(NOVEL)}/本文/${NOVEL.sections[0].index} ${NOVEL.sections[0].subtitle}.yaml`;
+    const row = (await sql(`SELECT blob_key FROM content_objects WHERE object_key=${quote(key)}`))[0].results[0];
+    const path = `/${bucket}/${prefix}/${row.blob_key}`;
+    const original = fixture.objects.get(path);
+    const damaged = Buffer.from(original.toString('utf8').replace('読み取り', '書き取り'));
+    fixture.objects.set(path, damaged);
+    try {
+      const response = await admin(reader.base, `/api/novels/${NOVEL.id}/download.epub`);
+      await expectStatus(response, 500, 'a corrupt S3 body');
+      assert.notEqual(response.headers.get('content-type'), 'application/epub+zip');
+      await response.text();
+    } finally {
+      fixture.objects.set(path, original);
     }
   });
 

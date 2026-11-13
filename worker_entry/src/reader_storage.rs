@@ -17,6 +17,7 @@ use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
     ObjectStore, ObjectUpdateResult, PlatformFuture, SmallObjectMutator, StagedAsset,
+    ObjectFingerprint, ObjectFingerprintMismatch,
     staging::is_staging_key,
 };
 
@@ -112,6 +113,13 @@ impl ObjectStore for ReaderObjectStore {
         key: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
         self.inner.read_small(key)
+    }
+
+    fn verify_fingerprints<'a>(
+        &'a self,
+        fingerprints: &'a [ObjectFingerprint],
+    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'a>>>> {
+        self.inner.verify_fingerprints(fingerprints)
     }
 
     fn write_small<'a>(
