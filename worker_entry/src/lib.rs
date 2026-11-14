@@ -103,10 +103,12 @@ fn request_as_get(req: &Request) -> Result<Request> {
 /// EPUB を返す経路かどうか (HEAD をメタデータ応答に分ける)。
 fn is_epub_head_path(path: &str) -> bool {
     // 外部公開 API: /api/v1/novels/{id}/epub
-    if let Some(rest) = path.strip_prefix("/api/v1/novels/")
-        && let Some(id) = rest.strip_suffix("/epub")
-    {
-        return id.parse::<i64>().is_ok();
+    if path.starts_with("/api/v1/") {
+        let mut segments = webui::external::path_segments(path);
+        return matches!(
+            (segments.next(), segments.next(), segments.next(), segments.next()),
+            (Some("novels"), Some(id), Some("epub"), None) if id.parse::<i64>().is_ok()
+        );
     }
     // ブラウザ読取 API: /api/read/v1/novels/{id}/epub
     if let Some(rest) = path.strip_prefix(narou_rs::application::read_api::PREFIX)

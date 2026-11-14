@@ -753,6 +753,29 @@ try {
     );
   });
 
+  await check('normalized external EPUB HEAD routes do not prepare or retain a book', async () => {
+    for (const path of [
+      `/api/v1/novels/${NOVEL.id}/epub/`,
+      `/api/v1//novels//${NOVEL.id}///epub//`,
+    ]) {
+      const startIndex = fixture.requests.length;
+      const head = await external(path, { method: 'HEAD' });
+      await expectStatus(head, 200, `HEAD ${path}`);
+      assert.equal((await head.arrayBuffer()).byteLength, 0);
+      const requests = fixture.requests.slice(startIndex);
+      assert.equal(requests.filter(request =>
+        request.method === 'GET' && request.logicalKey.startsWith('content/')).length, 0,
+      `HEAD ${path} must not read the novel body`);
+      assert.equal(requests.filter(request =>
+        request.logicalKey.startsWith(STAGING_PREFIX)).length, 0,
+      `HEAD ${path} must not stage anything`);
+      await assertEpubBody(
+        await external(path),
+        NOVEL.sections.map(section => section.marker),
+      );
+    }
+  });
+
   await check('reader serves the virtual novel EPUB', async () => {
     const response = await admin(reader.base, `/api/virtual_novels/${VIRTUAL.id}/download.epub`);
     await assertEpubBody(response, [

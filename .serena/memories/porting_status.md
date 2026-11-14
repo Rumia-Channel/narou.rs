@@ -4,7 +4,7 @@
 
 - 通常 GET の生成器は UI / 外部 API / ブラウザ API で共通。Native は保存済み EPUB があれば直接配信し、Worker は都度生成する。ヘッダ到着、EOF、外部閲覧ソフトの ZIP 展開・キャッシュ保存後の表示完了を区別して比較する（`docs/external-api.md`）。
 - Worker 外部 API は認証時の `ReadServices` を EPUB に渡して再構築を省く（36話 fixture の応答前 D1 照会は通常47→46回）。HEAD は本文変換・stage 作成・heavy permit を使わずメタデータを返す。サイズ不明なので Content-Length / Accept-Ranges は付けない。実測は本文36話の取得が0回、S3要求45→1回、HEAD 553→63ms、直後の GET は503→200。通常 GET の大幅な時間短縮は確認できていない。
-- `node worker_entry/tests/read_worker.mjs` の実 workerd 33/33 項目で、各入口の HEAD が本文を読まず、直後の GET が有効な EPUB を返すことを確認。更新中の参照差し替え・削除・破損の拒否、205話の本文1回取得、source 書き込み禁止も維持。
+- `node worker_entry/tests/read_worker.mjs` の実 workerd 34/34 項目で、各入口の HEAD が本文を読まず、直後の GET が有効な EPUB を返すことを確認。外部 API の末尾 `/`・連続 `/` は `webui::external::path_segments` をルータと HEAD 判定で共用し、GET 化による全生成と permit 保持を防ぐ。更新中の参照差し替え・削除・破損の拒否、205話の本文1回取得、source 書き込み禁止も維持。
 - 本番の同一作品比較と実 Dantalian の観測では、通常 GET は1回だけで HEAD や二重取得は無かった。HEAD の改善を、その閲覧ソフトでの体感差の確定原因として説明しない。大きい作品では UI / API ともヘッダ到着前の共通処理が支配的だった。
 
 ## 現況（v0.5.8 公開・本番配備済み）

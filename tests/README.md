@@ -79,6 +79,8 @@ EPUB の HEAD は UI・内部 download.epub・ブラウザ API・外部 API・�
 各入口で本文取得と stage 書き込みを行わず、未知のサイズを `Content-Length: 0` と
 誤表示しないことを確認する。直後の GET は `503 memory_capacity` にならず有効な
 EPUB を返し、別の EPUB 生成が実行枠を使用中でも HEAD は成功しなければならない。
+外部 API の末尾スラッシュ・空のパス要素を含む URI でも、HEAD の本文取得・stage 作成が
+ゼロで、同じ URI への直後の GET が有効な EPUB を返すことを確認する。
 
 ## 4. 共通ランタイム境界の回帰テスト
 

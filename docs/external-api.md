@@ -219,6 +219,10 @@ Workers の EPUB `HEAD` は認証とメタデータ確認だけで応答し、�
 `Content-Length` を付けず、`Accept-Ranges` も広告しない。`HEAD` の成功は
 本文の破損や変換エラーが無いことを保証せず、実際の GET は引き続き検証して失敗し得る。
 
+外部 API は `/api/v1/` 以下の空のパス要素を無視する。
+`/api/v1/novels/{id}/epub/` や途中に連続 `/` を含む経路の HEAD も、
+ルータと同じ正規化で判定し、本文を生成しない。
+
 ## MCP
 
 `POST /api/v1/mcp` は JSON-RPC 2.0。対応するメソッドは `initialize` /

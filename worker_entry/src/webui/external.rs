@@ -104,15 +104,19 @@ pub async fn handle_settings(req: Request, env: Env) -> worker::Result<Response>
     Response::error("Not Found", 404)
 }
 
+/// 外部 API は空のパス要素を無視する。HEAD の振り分けも同じ規則を使う。
+pub(crate) fn path_segments(path: &str) -> impl Iterator<Item = &str> {
+    path.strip_prefix("/api/v1").unwrap_or_default()
+        .split('/').filter(|part| !part.is_empty())
+}
+
 /// 外部公開 API の入口。
 pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
     let path = req.path();
     if !(path == "/api/v1" || path.starts_with("/api/v1/")) {
         return Response::error("Not Found", 404);
     }
-    let rest = path.strip_prefix("/api/v1").unwrap_or_default();
-    let rest = rest.strip_prefix('/').unwrap_or(rest);
-    let segments: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+    let segments: Vec<&str> = path_segments(&path).collect();
 
     let services = match crate::composition::build_read_services(&env).await {
         Ok(services) => services,
