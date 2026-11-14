@@ -1,4 +1,7 @@
 //! Read-only browser integration; the existing UI authentication is authoritative.
+//!
+//! `HEAD` は本文を作らない: `GET` と同じヘッダだけを返す (EPUB の経路は
+//! 変換も挿絵の stage も走らないので、`GET` の生成時間を使わない)。
 use std::sync::Arc;
 
 use narou_rs::application::external_api::ExternalListRequest;
@@ -112,7 +115,7 @@ async fn read(req: &Request, env: &Env) -> worker::Result<Response> {
         return super::json_error(400, "bad_request", Some("Invalid novel id"));
     };
     if epub {
-        return crate::build_epub_response(env, id, false).await;
+        return crate::build_epub_response(req, env, id, false).await;
     }
     let services = crate::composition::build_read_services(env).await?;
     match services.app.external_api.novel(id).await {

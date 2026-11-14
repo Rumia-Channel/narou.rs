@@ -35,6 +35,7 @@ import {
   runWrangler,
   startDev,
   writeDevVars,
+  STAGING_PREFIX,
 } from './read_worker_fixture.mjs';
 
 const keep = process.argv.includes('--keep');
@@ -702,6 +703,56 @@ try {
     );
   });
 
+  await check('HEAD on the EPUB routes answers metadata without preparing the book', async () => {
+    const probes = [
+      ['HEAD /api/novels/{id}/download.epub',
+        () => admin(reader.base, `/api/novels/${NOVEL.id}/download.epub`, { method: 'HEAD' })],
+      ['HEAD /novels/{id}/download',
+        () => admin(reader.base, `/novels/${NOVEL.id}/download`, { method: 'HEAD' })],
+      ['HEAD /api/read/v1/novels/{id}/epub',
+        () => admin(reader.base, `/api/read/v1/novels/${NOVEL.id}/epub`, { method: 'HEAD' })],
+      ['HEAD /api/v1/novels/{id}/epub',
+        () => external(`/api/v1/novels/${NOVEL.id}/epub`, { method: 'HEAD' })],
+      ['HEAD /api/virtual_novels/{id}/download.epub',
+        () => admin(reader.base, `/api/virtual_novels/${VIRTUAL.id}/download.epub`, { method: 'HEAD' })],
+    ];
+    for (const [label, probe] of probes) {
+      const startIndex = fixture.requests.length;
+      const response = await probe();
+      await expectStatus(response, 200, label);
+      assert.equal(response.headers.get('content-type'), 'application/epub+zip',
+        `${label} must keep the EPUB type`);
+      assert(response.headers.get('content-disposition'),
+        `${label} must keep the download name`);
+      assert.equal(response.headers.get('content-length'), null,
+        `${label} must not claim a body length`);
+      assert.equal(response.headers.get('accept-ranges'), null,
+        `${label} must not claim range support`);
+      assert.equal((await response.arrayBuffer()).byteLength, 0,
+        `${label} must not carry a body`);
+      const requests = fixture.requests.slice(startIndex);
+      const bodyReads = requests.filter(request =>
+        request.method === 'GET' && request.logicalKey.startsWith('content/'));
+      assert.equal(bodyReads.length, 0,
+        `${label} must not read the novel body (the book is not prepared)`);
+      const staged = requests.filter(request => request.logicalKey.startsWith(STAGING_PREFIX));
+      assert.equal(staged.length, 0, `${label} must not stage anything`);
+    }
+  });
+
+  await check('a HEAD probe leaves the EPUB capacity free for the next download', async () => {
+    // 本文を用意しない HEAD は、重い処理の枠を保持したまま終わってはいけない
+    // (保持したままだと次の EPUB が 503 memory_capacity になる)。
+    const head = await admin(reader.base, `/api/novels/${NOVEL.id}/download.epub`, { method: 'HEAD' });
+    await expectStatus(head, 200, 'HEAD /api/novels/{id}/download.epub');
+    await head.arrayBuffer();
+    const response = await admin(reader.base, `/api/novels/${NOVEL.id}/download.epub`);
+    await assertEpubBody(
+      response,
+      NOVEL.sections.map((section) => section.marker),
+    );
+  });
+
   await check('reader serves the virtual novel EPUB', async () => {
     const response = await admin(reader.base, `/api/virtual_novels/${VIRTUAL.id}/download.epub`);
     await assertEpubBody(response, [
@@ -853,6 +904,9 @@ try {
     const busy = await admin(writer.base, `/api/novels/${NOVEL.id}/download.epub`);
     await expectStatus(busy, 503, 'a second heavy operation on the writer');
     assert.equal((await busy.json()).error, 'memory_capacity');
+    const head = await admin(writer.base, `/api/novels/${NOVEL.id}/download.epub`, { method: 'HEAD' });
+    await expectStatus(head, 200, 'HEAD must not compete for the occupied EPUB capacity');
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
 
     const list = await external('/api/v1/novels?limit=10');
     await expectStatus(list, 200, 'GET /api/v1/novels while the writer is busy');

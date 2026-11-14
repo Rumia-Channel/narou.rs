@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use narou_rs::application::convert::ConvertedText;
 use narou_rs::epub_lite::{self, ChunkSink, EpubStreamWriter, StreamingBuild, StreamingPreparation};
 use narou_rs::platform::{AssetStore, AssetStream, ObjectKey, StagedAsset};
-use worker::{Env, Response, Result};
+use worker::{Env, Method, Request, Response, Result};
 
 use crate::{epub_download_filename, epub_image_key, load_global_settings_map, load_illustration_index,
     load_local_settings_map, load_novel_settings, report_missing_illustrations, sanitize_content_disposition, setting_text, stream_error};
@@ -17,12 +17,31 @@ use crate::{epub_download_filename, epub_image_key, load_global_settings_map, lo
 const CHUNK: usize = 64 * 1024;
 const MAX_IMAGES: usize = 512;
 
-pub(crate) async fn build_epub_response(env: &Env, id: i64, virtual_only: bool) -> Result<Response> {
-    let Some(permit) = crate::memory_budget::try_heavy() else { return crate::memory_budget::busy_response(); };
+/// EPUB を生成して返す (認証は呼び出し側)。
+pub(crate) async fn build_epub_response(
+    req: &Request,
+    env: &Env,
+    id: i64,
+    virtual_only: bool,
+) -> Result<Response> {
     let services = match crate::composition::build_read_services(env).await {
         Ok(services) => services,
         Err(_) => return Response::error("Service unavailable", 503),
     };
+    build_epub_with_services(req, env, &services, id, virtual_only).await
+}
+
+/// 組み立て済みの services で EPUB を返す。
+///
+/// 外部公開 API (`/api/v1/novels/{id}/epub`) は認証判定のために組み立てた
+/// services をそのまま渡すので、同じ要求で組立を 2 回行わない。
+pub(crate) async fn build_epub_with_services(
+    req: &Request,
+    env: &Env,
+    services: &crate::composition::ReadServices,
+    id: i64,
+    virtual_only: bool,
+) -> Result<Response> {
     let record = match services.app.library.get(narou_rs::platform::NovelId(id)).await {
         Ok(Some(record)) => record,
         Ok(None) => return Response::error("Not Found", 404),
@@ -32,6 +51,12 @@ pub(crate) async fn build_epub_response(env: &Env, id: i64, virtual_only: bool) 
     if virtual_only && !is_virtual { return Response::error("Not Found", 404); }
     let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).map_err(stream_error)?;
     let local_map = load_local_settings_map(env).await;
+    if req.method() == Method::Head {
+        // メタデータだけ: 本文の変換も挿絵の stage もしない (GET と同じ
+        // ヘッダだけを返すので本文の長さは載せない)。
+        return epub_metadata_response(services, &record, &keys, &local_map, is_virtual).await;
+    }
+    let Some(permit) = crate::memory_budget::try_heavy() else { return crate::memory_budget::busy_response(); };
     let global_map = load_global_settings_map(env).await;
     let push_sink = crate::push_hub::PushHubSink::shared(crate::push_hub::PushHubClient::new(env, crate::budget::SubrequestBudget::new()), None);
     let debug = narou_rs::application::debug::enabled_in_settings(&local_map);
@@ -59,31 +84,12 @@ pub(crate) async fn build_epub_response(env: &Env, id: i64, virtual_only: bool) 
         let filename = epub_download_filename(&record, &settings, &local_map);
         let index = if is_virtual { None } else { load_illustration_index(&services.objects, &keys).await.map(Arc::new) };
         let illust_prefix = narou_rs::platform::ObjectPrefix::new(format!("{}/挿絵", keys.prefix().as_ref())).map_err(stream_error)?;
-        let mut names = Vec::new();
-        let mut cover_image = None;
-        if settings.enable_illust {
-            for filename in narou_rs::converter::render::COVER_IMAGE_NAMES {
-                let key = keys.prefix().join(filename).map_err(stream_error)?;
-                if services.assets.stat(&key).await.map_err(stream_error)?.is_some() {
-                    cover_image = Some(filename);
-                    names.push(filename.to_owned());
-                    break;
-                }
+        let (mut names, cover_image) = match collect_stored_illustrations(services, &keys, &illust_prefix, is_virtual, settings.enable_illust).await? {
+            StoredIllustrations::OverBudget => {
+                return Response::error(format!("Illustrations exceed the Worker budget ({MAX_IMAGES} images)"), 413);
             }
-        }
-        if !is_virtual {
-            let mut request = narou_rs::platform::ObjectListRequest::new(illust_prefix.clone(), 100.try_into().unwrap());
-            loop {
-                let page = services.objects.list_page(&request).await.map_err(stream_error)?;
-                for meta in page.objects {
-                    let name = meta.key.as_ref().rsplit('/').next().unwrap_or_default();
-                    if !epub_lite::is_supported_image(name) { continue; }
-                    if names.len() == MAX_IMAGES { return Response::error(format!("Illustrations exceed the Worker budget ({MAX_IMAGES} images)"), 413); }
-                    names.push(format!("挿絵/{name}"));
-                }
-                match page.next_cursor { Some(cursor) => request.cursor = Some(cursor), None => break }
-            }
-        }
+            StoredIllustrations::Collected { names, cover } => (names, cover),
+        };
         let mut options = epub_lite::EpubBuildOptions::from_settings(epub_lite::EpubSettingsInput {
             title: &record.title, author: &record.author, settings: &settings,
             has_cover_image: cover_image.is_some(), extra_assets: Vec::new(), assets_dir: None, kindle: false,
@@ -182,6 +188,75 @@ pub(crate) async fn build_epub_response(env: &Env, id: i64, virtual_only: bool) 
             .with_header("Cache-Control", "no-store")?
             .with_header("Content-Disposition", &sanitize_content_disposition(&filename))?.from_stream(stream)
     })).await
+}
+
+/// 保存済みの挿絵 (cover と `挿絵/` の一覧) を集めた結果。
+enum StoredIllustrations {
+    /// 収集できた (cover は `None` のこともある)。
+    Collected { names: Vec<String>, cover: Option<&'static str> },
+    /// Worker の枚数上限を超えた (GET は 413 で返す)。
+    OverBudget,
+}
+
+/// 保存済みの挿絵を集める (cover 判定と `挿絵/` の一覧)。
+///
+/// `GET` の本文生成と `HEAD` のメタデータ判定で同じ判定を使うので、
+/// 枚数上限 (413) の判定はどちらの経路でも同じになる。
+async fn collect_stored_illustrations(
+    services: &crate::composition::ReadServices,
+    keys: &narou_rs::platform::NovelObjectKeys,
+    illust_prefix: &narou_rs::platform::ObjectPrefix,
+    is_virtual: bool,
+    enable_illust: bool,
+) -> Result<StoredIllustrations> {
+    let mut names = Vec::new();
+    let mut cover = None;
+    if enable_illust {
+        for filename in narou_rs::converter::render::COVER_IMAGE_NAMES {
+            let key = keys.prefix().join(filename).map_err(stream_error)?;
+            if services.assets.stat(&key).await.map_err(stream_error)?.is_some() {
+                cover = Some(filename);
+                names.push(filename.to_owned());
+                break;
+            }
+        }
+    }
+    if !is_virtual {
+        let mut request = narou_rs::platform::ObjectListRequest::new(illust_prefix.clone(), 100.try_into().unwrap());
+        loop {
+            let page = services.objects.list_page(&request).await.map_err(stream_error)?;
+            for meta in page.objects {
+                let name = meta.key.as_ref().rsplit('/').next().unwrap_or_default();
+                if !epub_lite::is_supported_image(name) { continue; }
+                if names.len() == MAX_IMAGES { return Ok(StoredIllustrations::OverBudget); }
+                names.push(format!("挿絵/{name}"));
+            }
+            match page.next_cursor { Some(cursor) => request.cursor = Some(cursor), None => break }
+        }
+    }
+    Ok(StoredIllustrations::Collected { names, cover })
+}
+
+/// `HEAD` の応答 (本文なし)。
+///
+/// 本文を準備しないので長さは分からない: `Content-Length` も
+/// `Accept-Ranges` も載せない (`GET` の応答も同じヘッダだけだから)。
+async fn epub_metadata_response(
+    services: &crate::composition::ReadServices,
+    record: &narou_rs::db::NovelRecord,
+    keys: &narou_rs::platform::NovelObjectKeys,
+    local_map: &std::collections::HashMap<String, serde_yaml::Value>,
+    is_virtual: bool,
+) -> Result<Response> {
+    let settings = load_novel_settings(&services.objects, record, keys, local_map).await.map_err(stream_error)?;
+    let filename = epub_download_filename(record, &settings, local_map);
+    let illust_prefix = narou_rs::platform::ObjectPrefix::new(format!("{}/挿絵", keys.prefix().as_ref())).map_err(stream_error)?;
+    if matches!(collect_stored_illustrations(services, keys, &illust_prefix, is_virtual, settings.enable_illust).await?, StoredIllustrations::OverBudget) {
+        return Response::error(format!("Illustrations exceed the Worker budget ({MAX_IMAGES} images)"), 413);
+    }
+    Ok(worker::ResponseBuilder::new().with_header("Content-Type", "application/epub+zip")?
+        .with_header("Cache-Control", "no-store")?
+        .with_header("Content-Disposition", &sanitize_content_disposition(&filename))?.empty())
 }
 
 struct StageCleanup { store: Arc<dyn AssetStore>, keys: Vec<ObjectKey>, scratch: epub_lite::ImageScratch }

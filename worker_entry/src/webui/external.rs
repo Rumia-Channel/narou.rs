@@ -132,7 +132,7 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
         ["mcp"] => api_mcp(req, &env, &services.app).await,
         ["novels", id] => api_novel(&req, &env, &services.app, id).await,
         ["novels", id, "toc"] => api_novel_toc(&req, &env, &services.app, id).await,
-        ["novels", id, "epub"] => api_novel_epub(&env, id).await,
+        ["novels", id, "epub"] => api_novel_epub(&req, &env, &services, id).await,
         ["novels", id, "sections"] => api_novel_sections(&req, &env, &services.app, id).await,
         ["novels", id, "sections", key] => {
             api_novel_section(&req, &env, &services.app, id, key).await
@@ -529,12 +529,20 @@ async fn api_novel_section(
 }
 
 /// EPUB。
-async fn api_novel_epub(env: &Env, id: &str) -> worker::Result<Response> {
+///
+/// 認証判定のために組み立てた `services` をそのまま使うので、同じ要求で
+/// 組立を 2 回行わない (組立のたびに D1 を読むため、応答が 1 往復遅くなる)。
+async fn api_novel_epub(
+    req: &Request,
+    env: &Env,
+    services: &crate::composition::ReadServices,
+    id: &str,
+) -> worker::Result<Response> {
     let id = match parse_id(id) {
         Ok(id) => id,
         Err(error) => return json_error(400, "bad_request", Some(&error.to_string())),
     };
-    crate::build_epub_response(env, id, false).await
+    crate::build_epub_with_services(req, env, services, id, false).await
 }
 
 /// タグ一覧。
