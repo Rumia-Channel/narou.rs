@@ -601,7 +601,7 @@ pub async fn download_epub(req: Request, env: Env, id: i64) -> worker::Result<Re
     if let Some(response) = crate::auth_failure(&req, &env).await {
         return response;
     }
-    crate::build_epub_response(&env, id, true).await
+    crate::build_epub_response(&req, &env, id, true).await
 }
 
 pub(crate) async fn load_book(

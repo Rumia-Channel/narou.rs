@@ -18,6 +18,9 @@
 //! (download-time EPUB ストリーム) をそのまま返す。native は変換済みファイル
 //! を探してなければ lite で生成する経路だが、Worker の EPUB は常に要求時
 //! 生成なので両者は同じ実装に収束する。
+//!
+//! `HEAD /novels/{id}/download` は本文を生成しない: 変換も挿絵の stage も
+//! 走らせず、`GET` と同じヘッダ (名前・型) だけを返す。
 
 use worker::{Env, Method, Request, Response};
 

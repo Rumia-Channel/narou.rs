@@ -68,8 +68,13 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // native (axum) は GET ルートに HEAD も通す。Worker の各ハンドラは
     // GET/POST 前提で 405 を返すので、HEAD は GET として処理し、応答から
     // 本文だけを落として返す (method とヘッダを引き継いだ複製を作る)。
+    //
+    // EPUB の経路だけは HEAD をそのまま各ハンドラへ渡す: HEAD は
+    // 「その本のメタデータだけ」を返すので本文を準備しない。GET として
+    // 複製して返すと変換も挿絵の stage も走り、重い permit を保持したまま
+    // 本文だけが落ちるため、同じ Worker の次の EPUB が 503 になる。
     let is_head = req.method() == Method::Head;
-    let mut response = if is_head {
+    let mut response = if is_head && !is_epub_head_path(&path) {
         let get_request = request_as_get(&req)?;
         route(get_request, env, path).await?
     } else {
@@ -93,6 +98,42 @@ fn request_as_get(req: &Request) -> Result<Request> {
     init.with_headers(headers);
     Request::new_with_init(url.as_str(), &init)
         .map_err(|error| Error::RustError(error.to_string()))
+}
+
+/// EPUB を返す経路かどうか (HEAD をメタデータ応答に分ける)。
+fn is_epub_head_path(path: &str) -> bool {
+    // 外部公開 API: /api/v1/novels/{id}/epub
+    if let Some(rest) = path.strip_prefix("/api/v1/novels/")
+        && let Some(id) = rest.strip_suffix("/epub")
+    {
+        return id.parse::<i64>().is_ok();
+    }
+    // ブラウザ読取 API: /api/read/v1/novels/{id}/epub
+    if let Some(rest) = path.strip_prefix(narou_rs::application::read_api::PREFIX)
+        .and_then(|rest| rest.strip_prefix("/novels/"))
+        && let Some(id) = rest.strip_suffix("/epub")
+    {
+        return id.parse::<i64>().is_ok();
+    }
+    // WEB UI: /novels/{id}/download
+    if let Some(rest) = path.strip_prefix("/novels/")
+        && let Some(id) = rest.strip_suffix("/download")
+    {
+        return id.parse::<i64>().is_ok();
+    }
+    // 内部 API: /api/novels/{id}/download.epub
+    if let Some(rest) = path.strip_prefix("/api/novels/")
+        && let Some(id) = rest.strip_suffix("/download.epub")
+    {
+        return id.parse::<i64>().is_ok();
+    }
+    // バーチャル小説: /api/virtual_novels/{id}/download.epub
+    if let Some(rest) = path.strip_prefix("/api/virtual_novels/")
+        && let Some(id) = rest.strip_suffix("/download.epub")
+    {
+        return id.parse::<i64>().is_ok();
+    }
+    false
 }
 
 /// HEAD 応答: ステータスとヘッダはそのまま、本文だけ落とす。
@@ -533,15 +574,29 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
-    build_epub_response(&env, id, false).await
+    build_epub_response(&req, &env, id, false).await
 }
 
 /// EPUB を生成して返す (認証は呼び出し側)。
 ///
 /// 外部公開 API (`/api/v1/novels/{id}/epub`) からも使うため、認証だけを
 /// 呼び出し側に分離している。
-pub(crate) async fn build_epub_response(env: &Env, id: i64, virtual_only: bool) -> Result<Response> {
-    epub_stream::build_epub_response(env, id, virtual_only).await
+pub(crate) async fn build_epub_response(req: &Request, env: &Env, id: i64, virtual_only: bool) -> Result<Response> {
+    epub_stream::build_epub_response(req, env, id, virtual_only).await
+}
+
+/// 組み立て済みの services で EPUB を返す (認証は呼び出し側)。
+///
+/// 外部公開 API は認証判定で組み立てた services をそのまま渡すので、
+/// 同じ要求で組立を 2 回行わない。
+pub(crate) async fn build_epub_with_services(
+    req: &Request,
+    env: &Env,
+    services: &composition::ReadServices,
+    id: i64,
+    virtual_only: bool,
+) -> Result<Response> {
+    epub_stream::build_epub_with_services(req, env, services, id, virtual_only).await
 }
 
 /// 挿絵の一覧が 0 件だったときに、切り分けの材料を Web コンソールへ出す。
