@@ -245,7 +245,7 @@ pub async fn freeze_novel(
     }
     let persisted = result.store_failed.is_empty();
     for event in crate::application::webui::mutations::mutation_events(
-        crate::application::webui::mutations::MutationNotice::TableReload,
+        crate::application::webui::mutations::MutationNotice::TableAndTags,
     ) {
         state.push_server.broadcast_raw(event);
     }
@@ -274,7 +274,7 @@ pub async fn unfreeze_novel(
     }
     let persisted = result.store_failed.is_empty();
     for event in crate::application::webui::mutations::mutation_events(
-        crate::application::webui::mutations::MutationNotice::TableReload,
+        crate::application::webui::mutations::MutationNotice::TableAndTags,
     ) {
         state.push_server.broadcast_raw(event);
     }

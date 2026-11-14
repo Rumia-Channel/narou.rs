@@ -962,39 +962,8 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
         };
         let id = data.id;
 
-        // narou.rb の Command::Freeze は .narou/freeze.yaml だけを更新し、
-        // レコードのタグには触れない (凍結状態の判定は Narou.novel_frozen? =
-        // freeze.yaml で行う)。frozen/404 タグの付け替えはしない。
-        // 保存先は Inventory の共通入口に任せる: YAML 管理では freeze.yaml、
-        // SQLite 管理では app_state('inv','freeze') (+ frozen_novels への投影)。
-        // ファイルを直接書くと SQLite 側の状態が更新されず、次回起動の
-        // レガシー取込で他の凍結が失われる。
-        let result = db::with_database(|db| {
-            db.inventory().update_yaml::<
-                bool,
-                std::collections::HashMap<i64, serde_yaml::Value>,
-                _,
-            >("freeze", InventoryScope::Local, |mut frozen_list| {
-                let is_frozen = frozen_list.contains_key(&id);
-                let should_freeze = if on {
-                    true
-                } else if off {
-                    false
-                } else {
-                    !is_frozen
-                };
-
-                if should_freeze {
-                    frozen_list.insert(id, serde_yaml::Value::Bool(true));
-                } else {
-                    frozen_list.remove(&id);
-                }
-
-                Ok((frozen_list, should_freeze))
-            })
-        });
-
-        match result {
+        let frozen = if on { Some(true) } else if off { Some(false) } else { None };
+        match narou_rs::compat::set_frozen_state(id, frozen) {
             Ok(true) => println!("{} を凍結しました", data.title),
             Ok(false) => println!("{} の凍結を解除しました", data.title),
             Err(e) => eprintln!("  Error: {}", e),
@@ -1075,28 +1044,15 @@ pub fn cmd_remove(targets: &[String], yes: bool, with_file: bool, all_ss: bool) 
 }
 
 pub fn freeze_by_target(target: &str) {
-    use narou_rs::db;
-
     let Some(data) = download::get_data_by_target(target) else {
         return;
     };
     let id = data.id;
 
-    // `narou download --freeze` は upstream では `Command::Freeze.execute!`
-    // を呼ぶだけなので、cmd_freeze と同様に凍結状態だけを更新する。
-    let result = db::with_database(|db| {
-        db.inventory().update_yaml::<
-            (),
-            std::collections::HashMap<i64, serde_yaml::Value>,
-            _,
-        >("freeze", InventoryScope::Local, |mut frozen_list| {
-            frozen_list.insert(id, serde_yaml::Value::Bool(true));
-            Ok((frozen_list, ()))
-        })
-    });
+    let result = narou_rs::compat::set_frozen_state(id, Some(true));
 
     match result {
-        Ok(()) => println!("  Froze ID: {}", id),
+        Ok(_) => println!("  Froze ID: {}", id),
         Err(e) => eprintln!("  Error: {}", e),
     }
 }

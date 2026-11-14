@@ -92,7 +92,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--no-strip` / `--make-zip` / `--no-zip` / `--verbose` / `device` 設定反映 / `convert.multi-device` / `convert.copy-to` / `convert.copy-zip-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript`、表紙タイトルの `title_date` / 完結装飾反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFO、`lite` feature の組み込み EPUB エンジン (AozoraEpub3_Lite) フォールバックまでは実装。実機 send 最終確認が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--sort-by`, `--echo` と pipe 時ID出力まで実装 |
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションと `webui.new-tag-color` 既定色まで実装 |
-| `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
+| `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、凍結集合と `frozen` タグの同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
 | `web` | ✅ | 🟡 部分 | API / queue worker (自動リトライ含む) / auto-scheduler に加え、pure JS / pure CSS の分割 frontend、JP/EN 切替、theme/performance/reload 設定反映、「ログイン」設定タブ、`self-update.variant` によるセルフアップデート variant 選択、バージョン別機能ツアー (`/api/feature_tour/*`)、SQLite 移行の opt-in (`/api/storage/mode`) までは実装済み。一覧件数と仮想小説一覧を Native／Worker 共通化し、全件取得時の重複 COUNT・仮想小説の個別メタデータ取得・タグ色の同値再保存を除去（キャッシュ期間は変更なし、実測は `docs/v0.5.0-architecture.md`）。frontend は全件取得+client-side 描画のため narou.rb 細部 parity は継続中 |
 | `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた。`self-update.variant` / `narou-compat` など Rust 拡張変数も管理する |
@@ -708,10 +708,10 @@ narou setting name         # 読み取り
 - `--on` で強制凍結
 - `--off` で強制解除
 - `--list` / `-l` で凍結済み一覧表示 (`list --frozen` に委譲)
-- 解除時に `404` タグも削除
+- 解除時は `frozen` タグだけを取り除き、`404` や利用者のタグは保持する
 - 引数なし時はヘルプ表示
 - タイトル付きメッセージ: `タイトル を凍結しました` / `タイトル の凍結を解除しました`
-- `.narou/freeze.yaml` を保存先に使い、`frozen` タグとも同期
+- 凍結集合は YAML 管理では `.narou/freeze.yaml`、SQLite 管理では Inventory 経由の `app_state('inv','freeze')` に保存する。Rust 拡張として凍結・解除時に `frozen` タグも同期する（Ruby 版は凍結集合だけを更新する）。古いタグだけの凍結もトグル・解除できる。ダウンロード後の `--freeze`、404・ダイジェスト変更時の自動凍結も同じ保存先とタグ同期を使う
 - `tagname_to_ids` と `Downloader.get_data_by_target` 相当で ID/Nコード/URL/タイトル/別名/タグ名を解決
 
 ---
@@ -882,7 +882,7 @@ narou setting name         # 読み取り
 - hidden global `server-reverse-proxy.enable` は narou.rs 独自の reverse proxy モード。既定値 `false` で、`true` にすると nginx 等の前段 proxy が付ける外側の Host / Origin を受け入れ、same-origin の `/ws` 接続を使う（Web UI には表示しない）
 - global `server-add-accepted-hosts` は HTTP の `Host` ヘッダに追加で許可するホストのリスト（カンマ区切り）。`*.example.com` 形式の安全なワイルドカードに対応し、unsafe なパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視。既定の許可集合（bind host + loopback + 自ホスト名）はそのまま残り、追加ホストだけを opt-in で広げる
 - hidden global `server-max-targets-per-request` は WEB UI が 1 リクエストで送れる小説 ID の最大数。既定値 `100000`、未設定または 0 以下は既定にフォールバック（Web UI には表示しない）。蔵書数が極端に多い環境で `narou setting server-max-targets-per-request=200000` のように上書きできる（`server-*` は変数名から自動で global スコープに振り分けられる）
-- API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
+- API の単体・一括凍結/解除は凍結集合と `frozen` タグを同期し、一覧とタグメニューを再読込する。選択中の行を右クリックした「凍結 or 解凍」は選択全件を個別にトグルし、選択外の行ではその1件だけを対象にする。上部メニューの「凍結」「凍結を解除」は選択全件を指定状態へ揃える。選択外の凍結や `404`・利用者タグは保持する
 - queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / auto_update / convert / send / backup / mail の queued job を別プロセスまたは worker 内処理で実行する。Ruby版同様 `pending` / `running` を分けて保持し、legacy `cmd` / `args` / `meta` / `status` / `created_at` / `started_at` を維持したまま復元できる。`concurrency` 有効時は外部通信あり(download/update/auto_update)とその他(convert/send/backup/mail)を別 lane で並列実行し、無効時は全 job を投入順に逐次実行する
 - 一時的なネットワーク失敗で夜間更新全体が止まらないよう、queue worker は失敗した job を `JobOutcome::Failed` 時に判定し、`retry_count < max_retries` かつ恒久失敗 (detail に "not found" / "invalid argument" / "no such file" / "permanent failure" / "永久失敗" / "恒久失敗" を含む) でなければ `available_at` 付きで `active_pending` へ自動再投入する。`available_at` 経過後の job だけが `pop` 系で取り出されるためスリープを挟まない。Web UI には `queue_retry` イベントを、追加試行なしで `failed` へ落ちた場合は従来どおり `queue_failed` イベントを通知する
 - Web UI のキュー詳細モーダルは `queue_start` / `queue_complete` / `queue_failed` / `queue_retry` / `notification.queue` 受信時に開いていれば再取得し、WebSocket が届かない場合も定期更新時に開いている詳細だけ再取得する

@@ -1361,10 +1361,7 @@ export function bindActions() {
       });
       await refreshList();
     },
-    freezeToggle: async (id) => {
-      await postJson('/api/freeze', { ids: [Number(id)] });
-      await refreshList();
-    },
+    freezeToggle: toggleFreeze,
     updateSingle: (id) => postSortedJson('/api/update', { targets: [String(id)] }),
     updateForceSingle: (id) => postSortedJson('/api/update', { targets: [String(id)], force: true }),
     sendSingle: (id) => postSortedJson('/api/send', { targets: [String(id)] }),
@@ -1669,8 +1666,18 @@ async function batchAction(endpoint, triggerEl, errorMessage = '操作に失敗�
   await runGuardedAction(triggerEl, async () => {
     const result = await postJson(endpoint, { ids: ids.map(Number) });
     assertApiSuccess(result, errorMessage);
-    await refreshList();
+    await Promise.all([refreshList(), refreshTags()]);
   }, errorMessage);
+}
+
+async function toggleFreeze(id) {
+  const selected = getSelectedIdsInDisplayOrder();
+  const ids = selected.some(selectedId => String(selectedId) === String(id)) ? selected : [id];
+  await runGuardedAction(null, async () => {
+    const result = await postJson('/api/freeze', { ids: ids.map(Number) });
+    assertApiSuccess(result, '凍結状態の切り替えに失敗しました');
+    await Promise.all([refreshList(), refreshTags()]);
+  }, '凍結状態の切り替えに失敗しました');
 }
 
 function requireSelectedIds() {

@@ -153,8 +153,7 @@ async fn freeze_or_unfreeze(
     if !result.missing.is_empty() {
         return json_error(404, "not_found", Some(&format!("ID: {}", id.0)));
     }
-    // native `freeze_novel` / `unfreeze_novel` と同じく、一覧だけを再読込させる。
-    crate::push_hub::broadcast_mutations(env, MutationNotice::TableReload).await;
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableAndTags).await;
     let persisted = result.store_failed.is_empty();
     let verb = if freeze { "Froze" } else { "Unfroze" };
     let message = if persisted {

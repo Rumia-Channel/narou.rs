@@ -1027,7 +1027,7 @@ impl Downloader {
                     crate::compat::DigestChoice::Cancel => return Ok(true),
                     crate::compat::DigestChoice::CancelAndFreeze => {
                         if let Some(id) = existing_id {
-                            let _ = crate::compat::set_frozen_state(id, true);
+                            let _ = crate::compat::set_frozen_state(id, Some(true));
                         }
                         return Ok(true);
                     }

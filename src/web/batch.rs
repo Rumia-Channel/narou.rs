@@ -136,8 +136,7 @@ pub async fn batch_freeze(
     let ids = sort_ids_for_request(&state, &body.ids, body.sort_state.as_ref(), body.timestamp).await;
     let result = apply_freeze(&state, &ids, true).await?;
     ensure_no_missing(&result.missing)?;
-    // 凍結状態だけが変わる操作は一覧の再読込だけで足りる (native の選択を維持)。
-    for event in mutation_events(MutationNotice::TableReload) {
+    for event in mutation_events(MutationNotice::TableAndTags) {
         state.push_server.broadcast_raw(event);
     }
 
@@ -157,8 +156,7 @@ pub async fn batch_unfreeze(
     let ids = sort_ids_for_request(&state, &body.ids, body.sort_state.as_ref(), body.timestamp).await;
     let result = apply_freeze(&state, &ids, false).await?;
     ensure_no_missing(&result.missing)?;
-    // 凍結状態だけが変わる操作は一覧の再読込だけで足りる (native の選択を維持)。
-    for event in mutation_events(MutationNotice::TableReload) {
+    for event in mutation_events(MutationNotice::TableAndTags) {
         state.push_server.broadcast_raw(event);
     }
 
@@ -229,8 +227,7 @@ pub async fn batch_freeze_toggle(
         .await
         .map_err(map_application_error)?;
     ensure_no_missing(&result.missing)?;
-    // 凍結状態だけが変わる操作は一覧の再読込だけで足りる (native の選択を維持)。
-    for event in mutation_events(MutationNotice::TableReload) {
+    for event in mutation_events(MutationNotice::TableAndTags) {
         state.push_server.broadcast_raw(event);
     }
 
