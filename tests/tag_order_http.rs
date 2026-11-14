@@ -168,3 +168,36 @@ fn malformed_favorite_state_is_reported_without_overwriting_it() {
             json!(["1", "1023", "2", "5", "Alpha", "Middle", "New", "Zulu"]));
     }
 }
+
+#[test]
+fn batch_freeze_and_unfreeze_keep_status_tags_and_selection_consistent() {
+    for sqlite in [false, true] {
+        let server = Server::start(sqlite, "alphabetical");
+        let selection = json!({"ids": [2048, 1023]});
+        server.post("/api/novels/1/freeze", json!({}));
+        for _ in 0..2 {
+            server.post("/api/novels/freeze", selection.clone());
+            let rows = server.get("/api/list?all=true")["data"].as_array().unwrap().clone();
+            for row in &rows {
+                assert_eq!(row["frozen"], true, "{row}; sqlite={sqlite}");
+                assert_eq!(row["tags"].as_array().unwrap().iter().filter(|tag| *tag == "frozen").count(), 1);
+            }
+            assert!(server.get("/api/tag_list?format=json")["tags"].as_array().unwrap().contains(&json!("frozen")));
+        }
+        server.post("/api/novels/unfreeze", selection.clone());
+        let rows = server.get("/api/list?all=true")["data"].as_array().unwrap().clone();
+        for row in rows {
+            let frozen = row["id"] == 1;
+            assert_eq!(row["frozen"], frozen, "{row}; sqlite={sqlite}");
+            assert_eq!(row["tags"].as_array().unwrap().contains(&json!("frozen")), frozen);
+            assert!(row["tags"].as_array().unwrap().contains(&json!("Middle")) || row["id"] == 1);
+        }
+        server.post("/api/freeze", json!({"ids": [1, 1023]}));
+        let rows = server.get("/api/list?all=true")["data"].as_array().unwrap().clone();
+        for row in rows {
+            assert_eq!(row["frozen"], row["id"] == 1023, "{row}; sqlite={sqlite}");
+        }
+        server.post("/api/novels/unfreeze", json!({"ids": [1, 1023, 2048]}));
+        assert!(!server.get("/api/tag_list?format=json")["tags"].as_array().unwrap().contains(&json!("frozen")));
+    }
+}

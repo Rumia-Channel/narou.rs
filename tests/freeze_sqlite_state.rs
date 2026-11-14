@@ -121,7 +121,8 @@ fn cli_freeze_keeps_other_novels_frozen_across_restarts() {
 
     // The reporter's step: freeze a second novel. Pre-fix builds wrote a
     // fragment holding only that id, which the next launch imported.
-    run_cli(root, &["freeze", "2"]);
+    run_cli(root, &["freeze", "--on", "2"]);
+    assert_eq!(run_cli(root, &["list", "--tag", "frozen"]).trim(), "2");
     assert!(
         !root.join(".narou").join("freeze.yaml").exists(),
         "SQLite mode must not write freeze.yaml"
@@ -143,6 +144,7 @@ fn cli_freeze_keeps_other_novels_frozen_across_restarts() {
     run_cli(root, &["list"]);
     assert_eq!(stored_freeze_ids(root), BTreeSet::from([1]));
     assert_eq!(frozen_rows(root), vec![1]);
+    assert!(run_cli(root, &["list", "--tag", "frozen"]).trim().is_empty());
     assert_eq!(fragments(root).len(), 1);
 }
 
@@ -297,7 +299,8 @@ fn yaml_mode_freeze_still_writes_freeze_yaml() {
     let root = temp.path();
     std::fs::remove_file(root.join(".narou").join("storage-backend")).unwrap();
 
-    run_cli(root, &["freeze", "2"]);
+    run_cli(root, &["freeze", "--on", "2"]);
+    assert_eq!(run_cli(root, &["list", "--tag", "frozen"]).trim(), "2");
     let freeze_yaml = std::fs::read_to_string(root.join(".narou").join("freeze.yaml")).unwrap();
     assert!(freeze_yaml.contains("2: true"), "{freeze_yaml}");
     assert!(!root.join(".narou").join("db.sqlite").exists());
@@ -312,11 +315,31 @@ fn yaml_mode_freeze_still_writes_freeze_yaml() {
     // Toggling the same id off rewrites the file without it.
     run_cli(root, &["freeze", "2"]);
     let freeze_yaml = std::fs::read_to_string(root.join(".narou").join("freeze.yaml")).unwrap();
+    assert_eq!(run_cli(root, &["list", "--tag", "frozen"]).trim(), "1");
     assert!(
         freeze_yaml.contains("1: true") && !freeze_yaml.contains("2: true"),
         "{freeze_yaml}"
     );
     assert!(fragments(root).is_empty());
+}
+
+#[test]
+fn cli_toggle_clears_legacy_frozen_tags_in_both_storage_modes() {
+    for sqlite in [false, true] {
+        let temp = prepare_library();
+        let root = temp.path();
+        if !sqlite {
+            std::fs::remove_file(root.join(".narou/storage-backend")).unwrap();
+        }
+        // The golden record 2 has a frozen tag but no freeze-store entry.
+        run_cli(root, &["freeze", "2"]);
+        assert!(run_cli(root, &["list", "--tag", "frozen"]).trim().is_empty());
+        assert_eq!(run_cli(root, &["list", "--tag", "進行中"]).trim(), "2");
+        run_cli(root, &["freeze", "2"]);
+        assert_eq!(run_cli(root, &["list", "--tag", "frozen"]).trim(), "2");
+        run_cli(root, &["freeze", "--off", "2"]);
+        assert!(run_cli(root, &["list", "--tag", "frozen"]).trim().is_empty());
+    }
 }
 
 fn run_cli(root: &Path, args: &[&str]) -> String {

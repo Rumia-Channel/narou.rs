@@ -19,9 +19,7 @@
 //! にする (`request_preserves_input_order` / `requested_or_current_sort_state`
 //! の「常にサーバー側を使う」実装に対応)。
 //!
-//! native `batch.rs` と同じく、変更後に PushHub 経由で他クライアントへ
-//! 再読込イベントを配信する (凍結系は一覧だけ、削除はタグ表示も — 選択は
-//! `application::webui::mutations` が唯一の定義)。
+//! 変更後は一覧とタグ表示の再読込イベントを配信する。
 
 use narou_rs::application::webui::mutations::MutationNotice;
 use narou_rs::application::{ApplicationError, FileDeletionStatus, FreezeRequest, RemoveRequest};
@@ -161,8 +159,7 @@ async fn freeze_toggle(
     if let Some(response) = missing_error(&result.missing) {
         return response;
     }
-    // native `batch_freeze_toggle` と同じく、一覧だけを再読込させる。
-    crate::push_hub::broadcast_mutations(env, MutationNotice::TableReload).await;
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableAndTags).await;
     Response::from_json(&serde_json::json!({
         "success": result.store_failed.is_empty(),
         "message": "凍結状態を切り替えました",
@@ -204,8 +201,7 @@ async fn batch_freeze(
     if let Some(response) = missing_error(&result.missing) {
         return response;
     }
-    // native `batch_freeze` / `batch_unfreeze` と同じく、一覧だけを再読込させる。
-    crate::push_hub::broadcast_mutations(env, MutationNotice::TableReload).await;
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableAndTags).await;
     let message = if freeze {
         format!("Froze {} novels", ids.len())
     } else {

@@ -1,0 +1,7 @@
+複数選択の凍結修正。右クリック freezeToggle はクリックした行が選択内なら getSelectedIdsInDisplayOrder() 全件、選択外ならその1件だけを /api/freeze に送る。明示 on/off は既存の batchAction。Native/Worker の単体・一括 HTTP は TableAndTags を配信し、操作元も一覧とタグを再取得する。
+
+NovelActionService の freeze/unfreeze/toggle は凍結集合と frozen タグを同期し、タグだけの旧凍結も解除・トグルする。重複 ID は一度だけ処理。404 と利用者タグ、選択外の凍結は保持する。sync_frozen_tag が共有のタグ同期。native compat::set_frozen_state(id, Option<bool>) は None でトグル、Some で明示指定し、CLI freeze / download --freeze / ダイジェスト変更時の凍結が共有する。404 の mark_not_found_and_freeze もタグを同期する。旧 compat helper は SQLite でも freeze.yaml を直書きしていたため Inventory::update_yaml へ統一した。Ruby 版 Freeze は集合だけを更新するため、タグ同期は利用者要望による Rust 拡張と COMMANDS.md に明記。
+
+検証済み: freeze_ui.test.mjs 4件、既存 queue_refresh.test.mjs、lib の freeze 関連10件、freeze_sqlite_state.rs 8件、tag_order_http.rs 3件（YAML / SQLite）、実 workerd release ビルドの worker_entry/tests/freeze.mjs（run.mjs に登録）。ブラウザで2件を選択して明示凍結・解除と個別メニューのトグルを実行し、frozen タグ・選択維持・選択外の状態を確認。ブラウザは合成 TempDir fixture。指定の Documents/WebNovel は native 子プロセスから書込拒否されるため実データでの変更検証はできなかった。throwaway のホスト・ライブラリは終了時に削除。
+
+検証環境の注意: MSVC 14.51 は D8050 になったため Visual Studio Developer Shell + CC_x86_64_pc_windows_msvc=clang-cl を使った。既定 TEMP もアクセス拒否だったため、Rust テストの TEMP/TMP を target/tmp 配下へ変更。Worker の debug ビルドは /health/live から memory access out of bounds となったが、配備と同じ release ビルドでは正常起動し凍結の実 HTTP / D1 契約検査が成功した。debug の原因は未調査で、今回の修正による解消は主張しない。

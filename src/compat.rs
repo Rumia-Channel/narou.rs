@@ -513,55 +513,39 @@ pub fn is_frozen_id(id: i64) -> bool {
         .unwrap_or(false)
 }
 
-pub fn set_frozen_state(id: i64, frozen: bool) -> Result<()> {
-    crate::db::with_database(|db| {
-        if db.get(id).is_none() {
-            return Err(NarouError::NotFound(format!("ID: {}", id)));
-        }
-
-        let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        crate::db::inventory::update_locked_yaml_file::<
-            (),
-            HashMap<i64, serde_yaml::Value>,
-            _,
-        >(&freeze_path, |mut frozen_list| {
-            // upstream の Command::Freeze.execute! 相当: freeze.yaml だけを
-            // 更新し、レコードのタグには触れない。
-            if frozen {
-                frozen_list.insert(id, serde_yaml::Value::Bool(true));
-            } else {
-                frozen_list.remove(&id);
-            }
-            Ok((frozen_list, ()))
+/// Set the frozen state, or toggle the effective state when `frozen` is None.
+pub fn set_frozen_state(id: i64, frozen: Option<bool>) -> Result<bool> {
+    let frozen = crate::db::with_database(|db| {
+        let record = db.get(id).ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
+        db.inventory().update_yaml::<bool, HashMap<i64, serde_yaml::Value>, _>(
+            "freeze", InventoryScope::Local, |mut frozen_list| {
+                let current = frozen_list.contains_key(&id) || record.tags.iter().any(|tag| tag == "frozen");
+                let frozen = frozen.unwrap_or(!current);
+                if frozen {
+                    frozen_list.insert(id, serde_yaml::Value::Bool(true));
+                } else {
+                    frozen_list.remove(&id);
+                }
+                Ok((frozen_list, frozen))
+            },
+        )
+    })?;
+    crate::native::novel_repository::NativeNovelRepository::new()
+        .update_existing_sync(id.into(), |record| {
+            crate::application::novel_actions::sync_frozen_tag(record, frozen);
+            Ok(())
         })?;
-        Ok(())
-    })
+    Ok(frozen)
 }
 
 pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
-    crate::db::with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-
-        let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        crate::db::inventory::update_locked_yaml_file::<
-            (),
-            HashMap<i64, serde_yaml::Value>,
-            _,
-        >(&freeze_path, |mut frozen_list| {
-            // upstream: `narou tag --add 404` + `narou freeze --on`。
-            // freeze 側は freeze.yaml だけを更新するので `frozen` タグは付けない。
-            frozen_list.insert(id, serde_yaml::Value::Bool(true));
-            crate::application::novel_actions::mark_not_found(&mut updated);
-
-            db.insert(updated.clone());
-            Ok((frozen_list, ()))
+    set_frozen_state(id, Some(true))?;
+    crate::native::novel_repository::NativeNovelRepository::new()
+        .update_existing_sync(id.into(), |record| {
+            crate::application::novel_actions::mark_not_found(record);
+            Ok(())
         })?;
-        db.save()
-    })
+    Ok(())
 }
 fn absolute_directory_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -1278,12 +1262,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        std::fs::write(temp.path().join(".narou/storage-backend"), "sqlite").unwrap();
 
         *crate::db::DATABASE.lock() = None;
         crate::db::init_database().unwrap();
         crate::db::with_database_mut(|db| {
             db.insert(sample_record(7, &[]));
-            Ok(())
+            db.save()
         })
         .unwrap();
 
@@ -1291,12 +1276,15 @@ mod tests {
 
         let record = crate::db::with_database(|db| Ok(db.get(7).cloned().unwrap())).unwrap();
         assert!(record.tags.contains(&"404".to_string()));
-        // upstream の freeze --on 相当なので `frozen` タグは付けない。
-        assert!(!record.tags.contains(&"frozen".to_string()));
+        assert!(record.tags.contains(&"frozen".to_string()));
 
         let inventory = Inventory::new(temp.path().to_path_buf());
         let frozen_ids = load_frozen_ids_from_inventory(&inventory).unwrap();
         assert!(frozen_ids.contains(&7));
+        assert!(!temp.path().join(".narou/freeze.yaml").exists());
+        assert!(std::fs::read_dir(temp.path().join(".narou")).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with("freeze.yaml.imported-")
+        }));
 
         *crate::db::DATABASE.lock() = None;
     }

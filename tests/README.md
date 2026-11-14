@@ -35,6 +35,16 @@ Web UI のリンク属性エスケープ回帰テストは以下で実行しま�
 node --test tests/render_links.test.mjs
 ```
 
+### 複数選択の凍結・解除
+
+```sh
+node --test tests/freeze_ui.test.mjs
+cargo test -p narou_rs --lib application::novel_actions::tests
+cargo test -p narou_rs --test tag_order_http --test freeze_sqlite_state
+```
+
+選択範囲内・範囲外の右クリック、全件への明示的な凍結・解除、旧 `frozen` タグだけの凍結、タグの重複防止、選択外の状態保持を確認する。Native の HTTP 検査は YAML / SQLite の両方を実行する。Worker は `node worker_entry/tests/run.mjs --release` 内の `freeze.mjs` が実 workerd / D1 と一覧・タグ API を検証する。
+
 ## 3. Worker S3 設定・デプロイの回帰テスト
 
 モック値およびローカルストアを用いた検証です。実際のマイグレーション、Cloudflare への本番デプロイ、本番 S3 へのアクセスは行いません。

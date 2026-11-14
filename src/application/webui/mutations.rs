@@ -4,9 +4,7 @@
 //! native の各ハンドラに散っていた `table.reload` / `tag.updateCanvas` /
 //! `notepad.change` の選択をここに集約する。イベントの形は
 //! `application::push_events`、送信 (broadcast / best-effort) は各ランタイムの
-//! トランスポートに残す。native が一部の操作だけを再読込させている
-//! (凍結は一覧だけ、タグ操作は一覧 + タグ表示、メモ帳はメモ帳だけ) のと同じ
-//! 選択を Worker も使う。
+//! トランスポートに残す。凍結・タグ操作・削除は一覧とタグ表示を更新する。
 
 use serde_json::Value;
 
@@ -17,9 +15,9 @@ use super::notepad::notepad_response_value;
 /// 変更内容に対応するイベントの種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationNotice<'a> {
-    /// 一覧の表示内容だけが変わった (凍結 / 解除など)。
+    /// 一覧の表示内容だけが変わった。
     TableReload,
-    /// 一覧とタグ表示の両方が変わった (タグ操作・削除)。
+    /// 一覧とタグ表示の両方が変わった (凍結・タグ操作・削除)。
     TableAndTags,
     /// メモ帳が保存された。`content` は保存後の本文。
     Notepad { content: &'a str },
@@ -41,13 +39,6 @@ pub fn mutation_events(notice: MutationNotice<'_>) -> Vec<Value> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn table_reload_is_the_only_event_for_freeze_changes() {
-        assert_eq!(
-            mutation_events(MutationNotice::TableReload),
-            vec![serde_json::json!({ "type": "table.reload", "data": "" })]
-        );
-    }
 
     #[test]
     fn tag_changes_reload_both_table_and_tag_canvas() {
