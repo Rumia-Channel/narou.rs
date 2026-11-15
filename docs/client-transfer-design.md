@@ -65,6 +65,40 @@ ZIP の中身の仕様は [transfer-archive-format.md](transfer-archive-format.m
 - バーチャル親はメンバーを重複なく同梱し、順序を保持する。通常作品を先に公開し、Skip した既存メンバーも取り込み先 ID へ解決する。欠落・種類不一致・所属競合がある親は公開しない。
 - 既存の親の永続 URL を補完する必要がある場合、それは現行どおりサーバーの明示的な CAS 更新である。書き出しを完全な無副作用処理とは記載しない。
 
+### 4.1 通常移行と完全保全を分ける
+
+Web の既定は **`runtime`（通常移行）** とする。閲覧・更新・再変換を続けるための論理データを移し、取得時のraw HTMLや再生成可能と確認できた出力は送らない。`complete` は作品データの完全保全で、同梱可能なraw・履歴・生成物も含める。作品ZIPはライブラリ全体のbackupやDBの丸ごと複製ではない。
+
+| 分類 | 例 | runtime | complete | 保存先の制約 |
+|---|---|---|---|---|
+| 現在の本文・目次・作品情報 | `本文/*.yaml`、`toc.yaml`、manifest metadata | 必須 | 必須 | YAMLという拡張子だけでDBには不要と判断しない |
+| 利用者の変換設定 | `setting.ini`、`replace.txt`、`converter.yaml`、明示的表紙 | 保持 | 保持 | 保存先の同等の論理設定へ適用 |
+| 挿絵と参照解決用索引 | 画像/APNG、`.illustration_cache.yaml` | 保持 | 保持 | 「cache」という名前でも索引は必要。共有poolの参照も実体へ解決 |
+| 取得元の生HTML | `raw/*.html` 等、downloaderが所有するraw | 既定で除外。Native向けは保守用として追加選択可 | 同梱可能なら保持 | Workerへは新規保存しない。Native YAML/SQLiteはどちらも任意 |
+| 旧本文・差分履歴 | 同梱対象の `本文/cache` / 差分退避 | 既定で除外。履歴保持を選択可 | 保持 | 履歴非対応なら事前表示。rawや話変換cacheとは別分類 |
+| 再生成可能と確認済みの出力 | アプリが生成元・所有を把握するEPUB、`novel.txt`、話変換cache | 除外 | 同梱対象なら保持 | 拡張子がtxt/epubというだけでは除外しない |
+| 不明・利用者が追加したファイル | 独自メモ、手動生成物、分類不能な画像等 | 既定で保持し、別枠表示 | 保持 | 不明を「不要」と決めつけない |
+| 実装内部・実行状態 | DB本体/WAL/SHM、row/object ID、lock/tmp、資格情報 | 送らない | 送らない | 作品のポータブルデータではない |
+
+raw無しでも現在の本文と挿絵は読めるが、Nativeの `illust rebuild` / orphan判定 / mitemin移行が使う材料は減る。この違いを保守用rawの選択説明に出す。SQLiteかどうかではなく、転送目的と保存先機能で決める。`economy=nosave_raw` 等は既定値の説明に使い、既存rawを削除する指示へ変換しない。
+
+### 4.2 client/serverで共有する選別規則
+
+portable coreに `FileRole` と `TransferProjection` を定義し、sourceの所有情報・既知の論理path・TOC/挿絵索引から分類する。サイト名や保存先DBの有無を条件にraw/本文を混同しない。古いZIP等で生成物の所有を証明できなければunknownに倒して保持する。
+
+- capabilities/catalogはrole、選択可否、必須依存、件数・raw byte、除外理由、policy版を返す。UIで分類ごとに送る/送らない量を確認できる。必須dataの手動除外は許可しない。
+- clientは同じcore規則で取り込みZIPを分類し、profile・追加role・保存先policyを適用して投影manifestを作る。serverはclient申告roleを信用せず再分類する。rawをbodyと偽装してWorkerの禁止を通せない。
+- exportは**catalogのmetadata列挙 → client確認/select → 選択済みpathだけsnapshot/read**の順。全ファイルを一度転送・実体化してから不要分を捨てる構成にしない。
+- importは全ZIPをローカル検証するが、除外ファイルは本文PUTを一度も行わず、serverのraw stageにも作らない。「送ってからserverで削除」は選別ではない。
+- profile、追加role、policy版、選択集合のdigestをsession/manifest/planに束ねる。確認後の変更は新projectionとして再計画し、既存verified bytesは同じfile identityの場合だけ再利用する。
+- runtimeで除外する内容・保守/履歴への影響は開始画面に常時表示し、「完全なbackup」と表示しない。追加の保存先制約による除外は明示確認を要求する。原本ZIPとsource libraryは変更しない。
+
+### 4.3 SQLite / D1 は物理ファイルでなく論理データを移す
+
+DBのrow、S3 blob、YAML/FS mirrorを同じObjectKeyの論理データへ解決し、1回だけcatalogへ載せる。DB本体や同じ本文のmirrorを別の転送ファイルとして二重同梱しない。Nativeの既存ユーザー編集・escaped folder解決の契約は維持し、sourceの優先順位を転送だけの別規則にしない。
+
+受信側は目次・本文・設定・索引を自身のDB/ObjectStore表現へ保存する。wire/ZIPが本文YAMLを使うことと、受信側にその物理YAMLファイルを残すことは別である。`sqlite.mirror-files` 等のFS投影はnative adapterが決め、通信のためだけに不要なmirrorを生成しない。現行のmirror=false import拒否は §12 の明示制約として残り、本項だけで対応済みとはしない。
+
 ## 5. 制限を4種類に分離する
 
 以下は新プロトコルの設計値。未実装のため、現行の制限が既に変わったという意味ではない。
@@ -102,7 +136,7 @@ ZIP の中身の仕様は [transfer-archive-format.md](transfer-archive-format.m
 - 作成には同じ `creation_ticket` も束ねる。既存の `request_id` の再送を先に照合し、終端結果を含め7日間は同じ session / receipt を返す。対応表を回収済みでも、古い ticket は `410 request_expired` とし、新しい session を勝手に発行しない。新規やり直しは利用者の明示操作で新 identity を作る。
 - 認証管理単位は server の library ID と既存の管理権限主体。現状の単一管理者モデルでは library/admin を使い、Cookie 値やローテーションする鍵そのものを identity にしない。新しいユーザー認証モデルは追加しない。
 - secret は URL、ダウンロード名、ログへ出さない。サーバーにはハッシュを保存。ブラウザは再開情報と一緒に同一 origin の IndexedDB へ保存し、終了・破棄時に消す。
-- 状態には `revision` と ETag を付ける。seal / ready / publish / pause / resume / DELETE / complete は `If-Match` と永続 `operation_id` に束ねる。同じ operation の再送は precondition 判定より先に receipt を返し、ACK 消失を二重実行や単なる412にしない。
+- 状態には `revision` と ETag を付ける。select / seal / ready / publish / pause / resume / DELETE / complete は `If-Match` と永続 `operation_id` に束ねる。同じ operation の再送は precondition 判定より先に receipt を返し、ACK 消失を二重実行や単なる412にしない。
 - binary PUT はレコード identity、`advance` は server が `next_action` と共に返す `operation_id` で冪等化する。この2種には `If-Match` を要求しない。epoch/CAS は server 内部で検査し、古い `advance` の再送では処理をもう一段進めない。UI は古い応答で revision を巻き戻さない。
 - session / plan / receipt / 公開結果だけでなく、stage の read-back、snapshot、reuse、lease を含む v2 の全ストアアクセスを primary / `for_writes` 相当へ接続する。isolate キャッシュや read replica の遅れを確定判定へ使わない。
 - 制御応答は小さい JSON、バイトは `application/octet-stream`。`Cache-Control: no-store` と `nosniff`。アーカイブ名や本文を HTML として返さない。
@@ -131,7 +165,7 @@ ZIP の中身の仕様は [transfer-archive-format.md](transfer-archive-format.m
 
 | Method / `/imports` 以下のパス | 契約 |
 |---|---|
-| `POST /imports` | ローカル検証済みsource fingerprint、転送manifestのサイズ・SHA、Skip/Overwrite、request_id、creation_ticketで作成 |
+| `POST /imports` | ローカル検証済みsource fingerprint、投影manifestのサイズ・SHA、profile/追加role/policy版、Skip/Overwrite、request_id、creation_ticketで作成 |
 | `PUT /{s}/manifest/chunks/{n}` | 正規化した転送 manifest のバイトを送信。ZIP 自体は送らない |
 | `POST /{s}/manifest/seal` | 受信時の確定サイズ・SHA checkpoint を照合してバイト列を不変にするだけ。構造検証は `advance` の planning で行う |
 | `POST /{s}/advance` | plan、検証、公開のうち `next_action` が指す有界処理を1単位進める |
@@ -151,8 +185,10 @@ ZIP の中身の仕様は [transfer-archive-format.md](transfer-archive-format.m
 
 | Method / `/exports` 以下のパス | 契約 |
 |---|---|
-| `POST /exports` | 選択ID、同梱方針 `complete`、request_id、creation_ticketで作成。巨大なGET queryは使わない |
-| `POST /{s}/advance` | 一覧・スナップショットを有界処理で準備する |
+| `POST /exports` | 選択ID、既定 `runtime` / 明示 `complete`、request_id、creation_ticketでcatalog sessionを作成 |
+| `POST /{s}/select` | catalog revisionとprofile/追加roleの確認結果を固定し、選択済みpathだけsnapshot対象にする |
+| `GET /{s}/catalog?cursor=...` | snapshot前の分類・必須依存・容量・除外理由をページ取得 |
+| `POST /{s}/advance` | catalog、選択済みsnapshotを有界処理で準備する |
 | `GET /{s}` | 準備状況、総数・サイズ、失敗と期限 |
 | `GET /{s}/manifest/chunks/{n}` | snapshot 確定後の archive manifest の raw JSON バイト。最大8 MiB |
 | `GET /{s}/batches/{b}` | snapshot準備時に固定した順序・境界で最大100 file-chunkレコード、総本文8 MiB以下を返す。通常の逐次読出しに使う |
@@ -227,7 +263,7 @@ sequenceDiagram
 2. WASM は中央ディレクトリ、manifest、全 entry を検証する。既知でない JSON 項目も増分で読み飛ばし、CRC、宣言サイズ、実サイズ、パス、重複、SHA、バーチャル参照を確認する。
 3. 旧 ZIP の任意項目である size/SHA が無い場合も、読みながら実値を計算して転送 manifest に必ず入れる。元の ZIP を書き換える必要はない。
 4. 検証済み manifest と各ファイルの実 SHA・サイズを安定した順序でハッシュし、source fingerprint とする。ファイル名・mtime・ZIP のサイズだけでは再開元を認証しない。
-5. 保存先のfile policyと選択を適用し、除外が必要なら原本ZIPのどのデータを保存しないか表示して確認する。その後に投影manifestを送りplanを得る。URLを100件以下で索引照合し、1作品1 HTTP往復や全ライブラリJSONは要求しない。
+5. §4のruntime/complete・追加role・保存先policyを適用し、何を送る/除外するか表示して確認する。除外ファイルの本文は送らず、投影manifestからplanを得る。URLを100件以下で索引照合し、1作品1 HTTP往復や全ライブラリJSONは要求しない。
 6. Skip の作品は本文を送らない。同一パス・サイズ・SHA の verified immutable 版が既にあり、サーバーが pin できる場合だけ `reuse` する。現行の全ファイルに SHA 索引があるとは仮定しない。不明なら送る。転送のたびに既存ライブラリ全部をハッシュしない。
 7. 第2パスで必要な entry だけを展開する。最初の検証パスと異なる SHA になったら停止する。通常は元 ZIP を読み直す代わりに、展開済み全量のディスク複製を不要にする。
 8. 出力64 KiBを file chunk / 8 MiB以下のバッチへまとめ、送信と receipt を待つ。retry 用には現在の1バッチだけを保持/OPFS spool する。全本文を JS の配列や IndexedDB に貯めない。
@@ -281,7 +317,7 @@ snapshot 作成には保存容量と I/O が必要な場合がある。これは
 
 取り込みのserver stateは `receiving_manifest → planning → transferring → ready → publishing → completed | completed_with_errors`。公開前の失敗は `failed`。`paused` は `resume_phase` を持ち、`cancelling` は現在作品の確定/回復を行ってから `cancelled` になる。期限切れは `expired`。
 
-書き出しは `preparing → ready → reading → released`。`paused` / `cancelling` / `cancelled` / `failed` / `expired` も明示する。statusの `resume_mode` は `continue` / `reselect_source` / `restart_output` / `recover_first` / `none` で、実際の保持資源から決める。`revision` が進まないretryを進捗に数えない。
+書き出しは `cataloguing → selecting → preparing → ready → reading → released`。selectを確定するまでは分類・metadataだけを読み、除外対象をsnapshotしない。`paused` / `cancelling` / `cancelled` / `failed` / `expired` も明示する。statusの `resume_mode` は `continue` / `reselect_source` / `restart_output` / `recover_first` / `none` で、実際の保持資源から決める。`revision` が進まないretryを進捗に数えない。
 
 ### 10.1 チャンクの確定
 
@@ -441,7 +477,7 @@ export/import の shared core、raw-to-store 変換、publication を HTTP handl
 
 | 検証対象 | シナリオと成功条件 |
 |---|---|
-| 報告された合計サイズ | 168作品、展開後合計1 GiB以上。raw・本文を含めたZIPが完成し、取り込み先の全SHA/メタデータが一致。512 MiB付近で止まらない |
+| 報告された合計サイズ | 168作品、展開後合計1 GiB以上。Nativeのcompleteではraw・本文を含めて全SHAを一致させ、runtimeでは表示した投影集合だけで一致させる。512 MiB付近で止まらない |
 | 413の実経路 | 前段を1リクエスト10 MiBに制限したHTTP fixture経由で、100 MB超のZIPを実ブラウザから取り込む。全制御/バイナリ要求が交渉上限以下。provider本番とは区別する |
 | 単一大容量 | 256 MiB超、さらに4 GiB超の単一entryとdirectory offset超過を生成可能なディスクfixtureで確認。ZIP64中央索引とCRC/SHAまで照合 |
 | WASMの実使用 | Firefox / Chromiumで配布artifactを読み、実WASMの実行・entry読出しを観測。通信ログに旧ZIP endpoint、`application/zip` upload、Base64 data frameがない |
@@ -460,6 +496,8 @@ export/import の shared core、raw-to-store 変換、publication を HTTP handl
 | 公開途中の故障 | ファイル設置の各境界、DB COMMIT前後、YAML rename/fsync、S3 503で故障注入。gate中に新旧混在を返さず、回復後は旧版または完全な新版 |
 | gate/epochの競争 | admission閉鎖とdrainの隙間、期限切れreader、停止したFS writer、遅れたS3 completeを故障注入。新旧混在の成功応答・失効ownerのcanonical変更がない |
 | 保存方針の投影 | Nativeの完全ZIPをWorkerへ取り込み、raw除外の事前表示/未確認時の本文PUTゼロ/確認後の必要データ保存/原本ZIP不変を確認。旧本文履歴を誤除外しない |
+| role別の通信ゼロ | YAML/SQLite/D1各保存先でruntime/completeを比較。runtimeのraw・確認済み生成物、未選択履歴についてdata GET/PUTとserver stage生成がゼロ。本文・設定・挿絵索引・unknownは保持。rawをbodyと偽装した直接API要求は拒否 |
+| 論理データの重複排除 | 同じ本文がDBとFS mirrorに存在しても1file/1payload。DB本体やWALを送らず、mirror出力方針と通信選別を混同しない。除外対象はsnapshot準備でも実バイトを読まない |
 | タグ・所属の並行変更 | 別作品のタグ連番、親所属、属性を同時変更。rollbackで他操作を消さず、最終 metadata とreceiptが同じ境界 |
 | 消失と取消 | tab/Worker/process/isolateを止め、sessionとpublicationを復旧。完了作品は残り、未公開分は再開/回収、MemoryPermitは解放 |
 | GCとの競合 | 長い転送、無活動期限、lease喪失、失敗したDELETE。使用中/pre-image/現行/共有poolを誤削除せず、orphanは回収される |
