@@ -378,7 +378,7 @@ narou author remove 1
 
 ---
 
-### 3.x-transfer `export` / `import` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
+### 3.x-transfer `export` / `import` — CLI 実装済み / Web のクライアント WASM は未接続 (narou.rs 独自, Ruby版対応外)
 
 選択した作品の小説データを ZIP で持ち出し、別のライブラリへ取り込む。
 
@@ -400,6 +400,7 @@ narou author remove 1
 - 進捗応答は NDJSON (`progress` / `data` / `complete` / `error`)。完了フレームの無い切断を成功扱いせず、ブラウザでの保存完了はダウンロード一覧で確認する。通信中止は取り込み済み作品を巻き戻さない。詳細は `WEBUI.md` §6.1b。
 - ブラウザ保存は File System Access または Service Worker の pull 型ストリームを使い、全量 `Blob` 化へフォールバックしない。保存先の書き込みを待って次のチャンクを受け取り、明示的な完了通知前の切断・キャンセルを成功扱いしない。
 - 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が生成・検証・取り込み計画を共有する。
+- **Web の完了判定**: 上記はサーバー ZIP 版の現行動作。`transfer_wasm` は単体 API のみで UI から呼ばれておらず、当初のクライアント処理方針は未達。ZIP 生成・検証・展開をブラウザへ移す session / チャンク転送の設計と受入条件は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) に記載（未実装）。サマリの `export` / `import` の完了は CLI を指し、Web の WASM 接続完了を意味しない。
 - **書式 (ZIP の中身) の詳細は [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md)** を参照 (`manifest.json` のスキーマ・検証ルール・衝突規則・同梱するファイル・挿絵の扱い)。
 
 ### 3.x-hidden `hidden` — ✅ 完了 (narou.rs 独自, Ruby版対応外)

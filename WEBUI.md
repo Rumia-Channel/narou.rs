@@ -587,6 +587,8 @@ markup は初回表示時に JS が組み立てる (`#app-dialog`、HTML 側の�
 
 ### 6.1b 小説データの ZIP 転送
 
+**現状訂正 (2026-11-15)**: 以下はサーバー ZIP 版の動作であり、クライアント WASM 版の完成を示さない。`transfer_wasm` は UI に未接続。ZIP を端末内で生成・検証・展開し、必要なデータだけをチャンク転送する [新設計](docs/client-transfer-design.md) は未実装である。
+
 | エンドポイント | メソッド | Rust |
 |-------------|--------|------|
 | `/api/transfer/export?ids=1,2` | GET | ✅ (`application/zip`) |
