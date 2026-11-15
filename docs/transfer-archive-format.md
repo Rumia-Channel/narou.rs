@@ -9,6 +9,8 @@
 - 取り込み計画: `plan_manifest` (検証済み manifest と既存作品から決定)
 - 明示的な全量 utility: `build_archive` / `parse_archive` / `plan_import` (fixture 等向け。本番の転送経路では使わない)
 
+**現状と将来設計の区別 (2026-11-15)**: Web UI は現在サーバー ZIP / ZIP 全体 POST を使い、独立 WASM API は UI に未接続。本書の現行上限・入口は実装の説明である。[クライアント主体の転送設計](client-transfer-design.md) は、ZIP の schema を維持したまま HTTP・実行場所・容量制限・公開境界を切り替えるための未実装の設計であり、既に制限が解消したという意味ではない。
+
 ## 1. 全体構造
 
 ```
