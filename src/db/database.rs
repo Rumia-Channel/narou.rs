@@ -13,7 +13,7 @@ const DATABASE_NAME: &str = "database";
 
 pub struct Database {
     data: HashMap<i64, NovelRecord>,
-    /// Last acknowledged SQLite snapshot; save() publishes only local edits.
+    /// Last acknowledged persisted snapshot; save() publishes only local edits.
     #[cfg(feature = "native-runtime")]
     persisted: HashMap<i64, NovelRecord>,
     index: IndexStore,
@@ -21,8 +21,8 @@ pub struct Database {
     archive_root: PathBuf,
     id_allocator: crate::platform::id_allocator::IdAllocator,
     /// SQLite backend (P2). `None` when `NAROU_RS_LEGACY_YAML` is set or the
-    /// database directory cannot host `db.sqlite`; then the legacy YAML path
-    /// below runs unchanged.
+    /// database directory cannot host `db.sqlite`; then every mutation runs
+    /// through the same locked `database.yaml` read-modify-write boundary.
     #[cfg(feature = "native-runtime")]
     sqlite: Option<crate::native::sqlite::SqliteNovelRepository>,
 }
@@ -265,6 +265,7 @@ impl Database {
         } else {
             self.data.clear();
         }
+        self.persisted = self.data.clone();
         self.id_allocator.reconcile(
             self.data.keys().max().copied(), |id| self.data.contains_key(&id),
         );
@@ -274,85 +275,51 @@ impl Database {
     }
 
     pub fn save(&mut self) -> Result<()> {
-        #[cfg(feature = "native-runtime")]
-        if self.sqlite.is_some() {
-            let baseline = self.persisted.clone();
-            let edited = self.data.clone();
-            return self.update_records(move |mut current| {
-                for id in baseline.keys() {
-                    if !edited.contains_key(id) {
-                        current.remove(id);
-                    }
+        let baseline = self.persisted.clone();
+        let edited = self.data.clone();
+        self.update_records(move |mut current| {
+            for id in baseline.keys() {
+                if !edited.contains_key(id) {
+                    current.remove(id);
                 }
-                for (&id, record) in &edited {
-                    let mut record = record.clone();
-                    record.id = id;
-                    let Some(before) = baseline.get(&id) else {
-                        if current.contains_key(&id) {
-                            return Err(crate::error::NarouError::Database(format!(
-                                "Novel ID {id} was registered by another writer; local insert was not saved",
-                            )));
-                        }
-                        current.insert(id, record);
-                        continue;
-                    };
-                    let before = serde_yaml::to_value(before)?;
-                    let after = serde_yaml::to_value(&record)?;
-                    if before == after {
-                        continue;
+            }
+            for (&id, record) in &edited {
+                let mut record = record.clone();
+                record.id = id;
+                let Some(before) = baseline.get(&id) else {
+                    if current.contains_key(&id) {
+                        return Err(crate::error::NarouError::Database(format!(
+                            "Novel ID {id} was registered by another writer; local insert was not saved",
+                        )));
                     }
-                    // A stale field edit must not resurrect a deleted novel.
-                    let Some(authoritative) = current.get(&id) else { continue; };
-                    let mut merged = serde_yaml::to_value(authoritative)?;
-                    let before = before.as_mapping().expect("record serializes as a map");
-                    let after = after.as_mapping().expect("record serializes as a map");
-                    let fields = merged.as_mapping_mut().expect("record serializes as a map");
-                    // Flattened unknown fields participate in the same field-level
-                    // delta, so concurrent keys are not overwritten by stale saves.
-                    for key in before.keys().chain(after.keys()) {
-                        if before.get(key) != after.get(key) {
-                            match after.get(key) {
-                                Some(value) => { fields.insert(key.clone(), value.clone()); }
-                                None => { fields.remove(key); }
-                            }
+                    current.insert(id, record);
+                    continue;
+                };
+                let before = serde_yaml::to_value(before)?;
+                let after = serde_yaml::to_value(&record)?;
+                if before == after {
+                    continue;
+                }
+                // A stale field edit must not resurrect a deleted novel.
+                let Some(authoritative) = current.get(&id) else { continue; };
+                let mut merged = serde_yaml::to_value(authoritative)?;
+                let before = before.as_mapping().expect("record serializes as a map");
+                let after = after.as_mapping().expect("record serializes as a map");
+                let fields = merged.as_mapping_mut().expect("record serializes as a map");
+                // Flattened unknown fields participate in the same field-level
+                // delta, so concurrent keys are not overwritten by stale saves.
+                for key in before.keys().chain(after.keys()) {
+                    if before.get(key) != after.get(key) {
+                        match after.get(key) {
+                            Some(value) => { fields.insert(key.clone(), value.clone()); }
+                            None => { fields.remove(key); }
                         }
                     }
-                    current.insert(id, serde_yaml::from_value(merged)?);
                 }
-                Ok((current, ()))
-            });
-        }
-        let content = serde_yaml::to_string(
-            &self
-                .data
-                .iter()
-                .map(|(&id, record)| {
-                    let mut normalized = record.clone();
-                    normalized.id = id;
-                    (id, normalized)
-                })
-                .collect::<BTreeMap<_, _>>(),
-        )?;
-        let written = tags_of_data(&self.data);
-        let sequence_path = self.inventory.inventory_path("tag_sequence", InventoryScope::Local);
-        let yaml_path = self.inventory.inventory_path(DATABASE_NAME, InventoryScope::Local);
-        // 作品と連番表を同じ直列化境界の中で確定する ✓
-        crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
-            crate::db::inventory::with_exclusive_file_lock(&yaml_path, || {
-                LockedFileUpdates::run(&self.inventory, |files| {
-                    let before_library = persisted_library_tags(&self.inventory)?;
-                    let (sequence, changed) = crate::native::tag_sequence::advance_content(
-                        files.original(&sequence_path)?.unwrap_or_default(),
-                        before_library.as_ref(), &written,
-                    )?;
-                    if changed { files.write(&sequence_path, &sequence)?; }
-                    crate::native::tag_sequence::notify_record_save_hook()?;
-                    files.write(&yaml_path, &content)?;
-                    Ok(())
-                })
-            })
-        })?;
-        self.index.flush(&self.inventory)
+                current.insert(id, serde_yaml::from_value(merged)?);
+            }
+            Ok((current, ()))
+        })
     }
 
     pub fn update_records<T, F>(&mut self, update: F) -> Result<T>
@@ -755,49 +722,12 @@ impl<'a> LockedFileUpdates<'a> {
     }
 }
 
-/// 保存済みのライブラリのタグを読む。
-///
-/// バックフィル (既存タグの登録順) の材料にする。読めなければ `None`。
-fn persisted_library_tags(
-    inventory: &Inventory,
-) -> Result<Option<crate::application::tag_sequence::LibraryTags>> {
-    let raw = inventory.load_raw(DATABASE_NAME, InventoryScope::Local)?;
-    if raw.trim().is_empty() {
-        return Ok(None);
-    }
-    let records: BTreeMap<i64, NovelRecord> = match serde_yaml::from_str(&raw) {
-        Ok(records) => records,
-        Err(_) => return Ok(None),
-    };
-    Ok(Some(crate::application::tag_sequence::library_tags(
-        records
-            .iter()
-            .map(|(id, record)| (*id, record.tags.as_slice())),
-        |tag| !crate::virtual_novel::is_internal_tag(tag),
-    )))
-}
-
 /// 小説に付いたタグ (小説 ID 順 → 小説内の位置順)。
 ///
 /// タグの登録順を進めるとき、新しいタグを判定する材料になる。
 fn tags_of_records(records: &BTreeMap<i64, NovelRecord>) -> Vec<&str> {
     records
         .values()
-        .flat_map(|record| record.tags.iter().map(String::as_str))
-        .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
-        .collect()
-}
-
-
-/// 小説に付いたタグ (小説 ID 順 → 小説内の位置順)。
-///
-/// `data` は ID 順を持たないため、ソートしてから並べる (登録順の決定を
-/// 安定させるため)。
-fn tags_of_data(data: &HashMap<i64, NovelRecord>) -> Vec<&str> {
-    let mut ids: Vec<i64> = data.keys().copied().collect();
-    ids.sort_unstable();
-    ids.iter()
-        .filter_map(|id| data.get(id))
         .flat_map(|record| record.tags.iter().map(String::as_str))
         .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
         .collect()

@@ -102,7 +102,13 @@ impl NativeObjectStore {
         let candidate = self
             .root
             .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-        crate::db::paths::ensure_within_archive_root(&candidate, &self.root)
+        // Missing components may only exist under a historical `‛`-escaped
+        // spelling; walk toward them so reads and writes land in the
+        // directory that already holds the novel's data instead of creating
+        // a parallel canonical one. New components stay canonical.
+        let resolved =
+            crate::db::paths::resolve_existing_path_components(&self.root, &candidate);
+        crate::db::paths::ensure_within_archive_root(&resolved, &self.root)
     }
 
     pub(crate) fn resolve_read_path(&self, key: &ObjectKey) -> Result<PathBuf> {
@@ -163,7 +169,11 @@ impl NativeObjectStore {
             self.root
                 .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
         };
-        crate::db::paths::ensure_within_archive_root(&candidate, &self.root)
+        // Same legacy-name resolution as `resolve_path`: the physical
+        // directory may carry the historical `‛`-escaped spelling.
+        let resolved =
+            crate::db::paths::resolve_existing_path_components(&self.root, &candidate);
+        crate::db::paths::ensure_within_archive_root(&resolved, &self.root)
     }
 
     pub(crate) fn metadata_for_path(&self, key: &ObjectKey, path: &Path) -> Result<Option<ObjectMetadata>> {
@@ -271,18 +281,45 @@ impl NativeObjectStore {
             return Ok(Vec::new());
         }
         let mut keys = Vec::new();
-        for entry in fs::read_dir(dir)? {
+        for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
             if !path.is_file() {
                 continue;
             }
             let safe_path = crate::db::paths::ensure_within_archive_root(&path, &self.root)?;
-            if let Some(key) = logical_key_for_native_path(&self.root, &safe_path) {
+            if let Some(key) = self.logical_key_for_listed_path(prefix.as_ref(), &dir, &safe_path) {
                 keys.push(key);
             }
         }
         keys.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
         Ok(keys)
+    }
+
+    /// Maps a file found under `prefix_dir` back to the logical key callers
+    /// asked for. When the physical directory differs from the requested
+    /// prefix (historical `‛`-escaped spelling), the emitted key is rebased
+    /// under `prefix` so listings stay consistent for the caller; files under
+    /// the physical `.objects/` mirror root keep their physical mapping.
+    pub(crate) fn logical_key_for_listed_path(
+        &self,
+        prefix: &str,
+        prefix_dir: &Path,
+        path: &Path,
+    ) -> Option<ObjectKey> {
+        let logical = logical_key_for_native_path(&self.root, path)?;
+        let prefix = prefix.trim_end_matches('/');
+        if prefix.is_empty() {
+            // Whole-archive listings keep the physical mapping (`novels/…`
+            // vs `.objects/…`).
+            return Some(logical);
+        }
+        let relative = path.strip_prefix(prefix_dir).ok()?;
+        if relative.starts_with(".objects") && !logical.as_ref().starts_with("novels/") {
+            // `.objects/` already means "outside the novels namespace".
+            return Some(logical);
+        }
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        ObjectKey::try_new(format!("{prefix}/{relative}")).ok()
     }
 
     pub(crate) fn recursive_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
@@ -454,10 +491,9 @@ impl ObjectStore for NativeObjectStore {
                 Self::recursive_files(&this.root, &prefix_dir, &mut paths)?;
             }
             let mut objects = paths
-
                 .into_iter()
                 .filter_map(|path| {
-                    let key = logical_key_for_native_path(&this.root, &path)?;
+                    let key = this.logical_key_for_listed_path(request.prefix.as_ref(), &prefix_dir, &path)?;
                     if !request.prefix.matches(&key) {
                         return None;
                     }
@@ -1439,5 +1475,154 @@ mod tests {
 
         let result = futures::executor::block_on(store.read_small(&section)).unwrap();
         assert!(result.is_none());
+    }
+
+    /// Objects whose novel directory carries the historical `‛`-escaped
+    /// spelling must stay reachable through the canonical logical key:
+    /// writes of *new* sections land inside the legacy directory (never in a
+    /// parallel canonical directory), reads find them, and listings emit
+    /// keys under the caller's logical prefix.
+    #[test]
+    fn native_store_reads_writes_and_lists_inside_escaped_novel_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let file_title = "n6247ex 旧題：異世界";
+        let keys = crate::platform::NovelObjectKeys::new("site", file_title, false).unwrap();
+        let legacy_dir = root
+            .path()
+            .join("site")
+            .join("n6247ex 旧題\u{201b}：異世界");
+        std::fs::create_dir_all(legacy_dir.join("本文")).unwrap();
+        std::fs::write(legacy_dir.join("toc.yaml"), b"title: legacy\n").unwrap();
+        std::fs::write(legacy_dir.join("本文").join("1 第一話.yaml"), b"section one").unwrap();
+
+        futures::executor::block_on(async {
+            // Read: the logical key reaches the escaped physical file.
+            assert_eq!(
+                store.read_small(&keys.toc()).await.unwrap().unwrap(),
+                b"title: legacy\n"
+            );
+            assert_eq!(
+                store
+                    .read_small(&keys.section("1", "第一話"))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b"section one"
+            );
+
+            // Write: a new section is created inside the legacy directory
+            // with its canonical filename; no parallel directory appears.
+            store
+                .write_small(&keys.section("2", "第二話"), b"section two".to_vec())
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            std::fs::read(legacy_dir.join("本文").join("2 第二話.yaml")).unwrap(),
+            b"section two"
+        );
+        assert!(!root.path().join("site").join("n6247ex 旧題：異世界").exists());
+
+        // List: entries are emitted under the caller's logical prefix even
+        // though the physical directory name differs.
+        let listed = store.list_direct_files(keys.prefix()).unwrap();
+        assert!(
+            listed.iter().any(|key| key == &keys.toc()),
+            "{listed:?} must contain {}",
+            keys.toc().as_ref()
+        );
+
+        futures::executor::block_on(async {
+            let prefix =
+                crate::platform::ObjectPrefix::new(keys.prefix().to_string()).unwrap();
+            let page = store
+                .list_page(&ObjectListRequest::new(
+                    prefix,
+                    std::num::NonZeroUsize::new(10).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let listed: Vec<_> = page.objects.iter().map(|object| object.key.as_ref()).collect();
+            assert!(listed.contains(&keys.toc().as_ref()), "{listed:?}");
+            assert!(
+                listed.contains(&keys.section("2", "第二話").as_ref()),
+                "{listed:?}"
+            );
+            assert!(
+                listed.iter().all(|key| key.starts_with("novels/")),
+                "{listed:?}"
+            );
+        });
+
+        // Snapshot callers that build keys from the physical escaped
+        // directory name keep working verbatim.
+        let physical_prefix = crate::platform::ObjectPrefix::new(
+            "novels/site/n6247ex 旧題\u{201b}：異世界",
+        )
+        .unwrap();
+        let page = futures::executor::block_on(store.list_page(&ObjectListRequest::new(
+            physical_prefix,
+            std::num::NonZeroUsize::new(10).unwrap(),
+        )))
+        .unwrap();
+        assert!(
+            page.objects
+                .iter()
+                .any(|object| object.key.as_ref().ends_with("toc.yaml")),
+            "{:?}",
+            page.objects
+        );
+    }
+
+    /// When both spellings exist the canonical directory wins; the escaped
+    /// one is left untouched.
+    #[test]
+    fn native_store_prefers_canonical_dir_over_escaped() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let file_title = "n0001ab 旧題：話";
+        let keys = crate::platform::NovelObjectKeys::new("site", file_title, false).unwrap();
+        std::fs::create_dir_all(root.path().join("site").join(file_title)).unwrap();
+        let legacy_dir = root
+            .path()
+            .join("site")
+            .join("n0001ab 旧題\u{201b}：話");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+
+        futures::executor::block_on(
+            store.write_small(&keys.toc(), b"title: canonical\n".to_vec()),
+        )
+        .unwrap();
+        assert!(root
+            .path()
+            .join("site")
+            .join(file_title)
+            .join("toc.yaml")
+            .is_file());
+        assert!(!legacy_dir.join("toc.yaml").exists());
+    }
+
+    /// A literal `‛` inside the logical name is itself escaped (`‛‛`), so a
+    /// name containing the marker resolves to its own directory rather than
+    /// aliasing a marked sibling.
+    #[test]
+    fn native_store_doubles_literal_marker_character() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let keys =
+            crate::platform::NovelObjectKeys::new("site", "n2 t\u{201b}：x", false).unwrap();
+        let legacy_dir = root
+            .path()
+            .join("site")
+            .join("n2 t\u{201b}\u{201b}\u{201b}：x");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+
+        futures::executor::block_on(
+            store.write_small(&keys.toc(), b"title: marker\n".to_vec()),
+        )
+        .unwrap();
+        assert!(legacy_dir.join("toc.yaml").is_file());
+        assert!(!root.path().join("site").join("n2 t：x").exists());
     }
 }

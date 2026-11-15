@@ -8,11 +8,15 @@ use narou_rs::db::{Database, NovelRecord};
 use narou_rs::native::sqlite::state::{self, StorageMode};
 
 fn library() -> tempfile::TempDir {
+    library_mode(StorageMode::Sqlite)
+}
+
+fn library_mode(mode: StorageMode) -> tempfile::TempDir {
     let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/sqlite-record-consistency");
     std::fs::create_dir_all(&scratch).unwrap();
     let temp = tempfile::Builder::new().prefix("library-").tempdir_in(scratch).unwrap();
     std::fs::create_dir_all(temp.path().join(".narousetting")).unwrap();
-    state::write_mode(&temp.path().join(".narou"), StorageMode::Sqlite).unwrap();
+    state::write_mode(&temp.path().join(".narou"), mode).unwrap();
     temp
 }
 
@@ -125,43 +129,45 @@ fn mutation_holds_sqlite_write_transaction_before_invoking_closure_and_rolls_bac
 
 #[test]
 fn save_applies_only_local_field_and_record_deltas() {
-    let temp = library();
-    let mut stale = seed(temp.path());
-    stale.update_records(|mut records| {
-        records.get_mut(&1).unwrap().extra_fields.insert("remove_me".into(), serde_yaml::Value::Bool(true));
-        Ok((records, ()))
-    }).unwrap();
-    let mut writer = Database::with_root(temp.path().to_path_buf()).unwrap();
-    writer.update_records(|mut records| {
-        records.get_mut(&1).unwrap().tags.push("concurrent".into());
-        records.get_mut(&1).unwrap().extra_fields.insert("new_key".into(), serde_yaml::Value::Bool(true));
-        records.insert(3, record(3));
-        Ok((records, ()))
-    }).unwrap();
-    let local = stale.all_records_mut().get_mut(&1).unwrap();
-    local.length = Some(42);
-    local.extra_fields.remove("remove_me");
-    stale.remove(2);
-    stale.insert(record(4));
-    stale.save().unwrap();
-    assert_eq!(stale.get(1).unwrap().tags, vec!["concurrent"]);
-    assert_eq!(stale.get(1).unwrap().length, Some(42));
-    assert_eq!(stale.get(1).unwrap().extra_fields["new_key"], serde_yaml::Value::Bool(true));
-    assert!(!stale.get(1).unwrap().extra_fields.contains_key("remove_me"));
-    assert!(stale.get(2).is_none());
-    assert!(stale.get(3).is_some());
-    assert!(stale.get(4).is_some());
-    writer.update_records(|mut records| {
-        records.get_mut(&3).unwrap().author = "latest".into();
-        records.remove(&1);
-        Ok((records, ()))
-    }).unwrap();
-    stale.all_records_mut().get_mut(&1).unwrap().length = Some(99);
-    stale.save().unwrap();
-    assert!(stale.get(1).is_none(), "stale saves do not resurrect deleted rows");
-    assert_eq!(stale.get(3).unwrap().author, "latest");
-    stale.save().unwrap();
-    assert_eq!(Database::with_root(temp.path().to_path_buf()).unwrap().get(3).unwrap().author, "latest");
+    for mode in [StorageMode::Sqlite, StorageMode::Yaml] {
+        let temp = library_mode(mode);
+        let mut stale = seed(temp.path());
+        stale.update_records(|mut records| {
+            records.get_mut(&1).unwrap().extra_fields.insert("remove_me".into(), serde_yaml::Value::Bool(true));
+            Ok((records, ()))
+        }).unwrap();
+        let mut writer = Database::with_root(temp.path().to_path_buf()).unwrap();
+        writer.update_records(|mut records| {
+            records.get_mut(&1).unwrap().tags.push("concurrent".into());
+            records.get_mut(&1).unwrap().extra_fields.insert("new_key".into(), serde_yaml::Value::Bool(true));
+            records.insert(3, record(3));
+            Ok((records, ()))
+        }).unwrap();
+        let local = stale.all_records_mut().get_mut(&1).unwrap();
+        local.length = Some(42);
+        local.extra_fields.remove("remove_me");
+        stale.remove(2);
+        stale.insert(record(4));
+        stale.save().unwrap();
+        assert_eq!(stale.get(1).unwrap().tags, vec!["concurrent"], "{mode:?}");
+        assert_eq!(stale.get(1).unwrap().length, Some(42), "{mode:?}");
+        assert_eq!(stale.get(1).unwrap().extra_fields["new_key"], serde_yaml::Value::Bool(true), "{mode:?}");
+        assert!(!stale.get(1).unwrap().extra_fields.contains_key("remove_me"), "{mode:?}");
+        assert!(stale.get(2).is_none(), "{mode:?}");
+        assert!(stale.get(3).is_some(), "stale save must not drop concurrently added novels: {mode:?}");
+        assert!(stale.get(4).is_some(), "{mode:?}");
+        writer.update_records(|mut records| {
+            records.get_mut(&3).unwrap().author = "latest".into();
+            records.remove(&1);
+            Ok((records, ()))
+        }).unwrap();
+        stale.all_records_mut().get_mut(&1).unwrap().length = Some(99);
+        stale.save().unwrap();
+        assert!(stale.get(1).is_none(), "stale saves do not resurrect deleted rows: {mode:?}");
+        assert_eq!(stale.get(3).unwrap().author, "latest", "{mode:?}");
+        stale.save().unwrap();
+        assert_eq!(Database::with_root(temp.path().to_path_buf()).unwrap().get(3).unwrap().author, "latest", "{mode:?}");
+    }
 }
 
 #[test]
@@ -237,19 +243,21 @@ fn sqlite_allocations_share_durable_ownership_and_generation_fenced_release() {
 
 #[test]
 fn save_rejects_conflicting_new_id_without_overwriting_acknowledged_record() {
-    let temp = library();
-    let mut first = seed(temp.path());
-    let mut stale = Database::with_root(temp.path().to_path_buf()).unwrap();
-    first.insert(record(3));
-    first.save().unwrap();
-    let mut conflicting = record(3);
-    conflicting.title = "conflict".into();
-    stale.insert(conflicting);
-    stale.remove(1);
-    stale.save().expect_err("a stale new-ID collision must not overwrite a published row");
-    let reopened = Database::with_root(temp.path().to_path_buf()).unwrap();
-    assert_eq!(reopened.get(3).unwrap().title, "title-3");
-    assert!(reopened.get(1).is_some(), "the whole conflicting save must roll back");
+    for mode in [StorageMode::Sqlite, StorageMode::Yaml] {
+        let temp = library_mode(mode);
+        let mut first = seed(temp.path());
+        let mut stale = Database::with_root(temp.path().to_path_buf()).unwrap();
+        first.insert(record(3));
+        first.save().unwrap();
+        let mut conflicting = record(3);
+        conflicting.title = "conflict".into();
+        stale.insert(conflicting);
+        stale.remove(1);
+        stale.save().expect_err("a stale new-ID collision must not overwrite a published row");
+        let reopened = Database::with_root(temp.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.get(3).unwrap().title, "title-3", "{mode:?}");
+        assert!(reopened.get(1).is_some(), "the whole conflicting save must roll back: {mode:?}");
+    }
 }
 
 // Invoked by the parent test as an actual fresh process, never through Cargo.
