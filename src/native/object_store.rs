@@ -2797,7 +2797,7 @@ mod tests {
     fn visit_namespace_gates_suppresses_adopted_side_both_directions() {
         let root = tempfile::tempdir().unwrap();
         let conn = crate::native::sqlite::open_in_memory().unwrap();
-        let mirror = NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let mirror = NativeObjectStore::from_root(root.path().join(crate::downloader::types::ARCHIVE_ROOT_DIR)).unwrap();
         let store = crate::native::sqlite::object_store::SqliteObjectStore::new(conn.clone(), mirror.clone());
         let prefix = ObjectPrefix::new("novels/site/visit/").unwrap();
         futures::executor::block_on(async {

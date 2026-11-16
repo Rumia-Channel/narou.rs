@@ -1948,7 +1948,7 @@ mod tests {
             ..NovelSettings::default()
         };
         let section = make_illustration_section();
-        let mut converter = NovelConverter::try_new(settings).unwrap();
+        let mut converter = NovelConverter::new(settings);
         let resolved = converter.resolve_section_html_illustrations(&section).unwrap();
         assert!(resolved.body.contains(r#"src="挿絵/i422674.png""#));
         assert_eq!(
@@ -2005,7 +2005,7 @@ mod tests {
         };
         let mut section = make_illustration_section();
         section.element.body = format!("{}{}", section.element.body, section.element.body);
-        let mut converter = NovelConverter::try_new(settings).unwrap();
+        let mut converter = NovelConverter::new(settings);
         let resolved = converter.resolve_section_html_illustrations(&section).unwrap();
 
         assert_eq!(
@@ -2092,7 +2092,7 @@ mod tests {
             subtitles: Vec::new(),
             novel_type: Some(0),
         };
-        let mut converter = NovelConverter::try_new(settings).unwrap();
+        let mut converter = NovelConverter::new(settings);
         let text = converter
             .convert_novel(&toc, &[make_illustration_section()], None)
             .unwrap();
@@ -2493,7 +2493,7 @@ before_settings:
 
     /// 変換できる最小の小説ディレクトリ (`toc.yaml` + 本文 1 話) を作る。
     #[cfg(feature = "native-runtime")]
-    fn write_convertible_novel(root: &std::path::Path) -> std::path::PathBuf {
+    fn write_convertible_novel(root: &std::path::Path) -> (std::path::PathBuf, i64) {
         let novel_dir = root.join("小説データ").join("site").join("n1234ab");
         let subtitle = crate::downloader::SubtitleInfo {
             index: "1".to_string(),
@@ -2537,12 +2537,17 @@ before_settings:
             "id: 1\ntitle: 作品タイトル\nauthor: 作者名\nfile_title: n1234ab\nsitename: site\n\
              toc_url: https://example.com/novel/1\nnovel_type: 2\nlast_update: 2026-01-01T00:00:00Z\n",
         ).unwrap();
-        crate::native::materialization::block_on(async {
+        let novel_id = crate::native::materialization::block_on(async {
             use crate::platform::NovelRepository;
             let repository = crate::native::novel_repository::NativeNovelRepository::new();
             let reservation = repository.allocate_id().await?;
-            assert_eq!(reservation.id().0, 1, "conversion fixture requires an empty library");
-            record.id = reservation.id().0;
+            assert_eq!(
+                repository.count_sync(&crate::platform::NovelFilter::all())?,
+                0,
+                "conversion fixture requires an empty library"
+            );
+            let novel_id = reservation.id().0;
+            record.id = novel_id;
             let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
             let stores = crate::native::object_store::NativeStores::for_current_root()?;
             let mut write = crate::application::novel_access::NovelWriteGuard::capture_for(&stores.objects, Some(&stores.assets), &keys).await?;
@@ -2552,9 +2557,9 @@ before_settings:
             write.write_small(&keys.section(&subtitle.index, &subtitle.file_subtitle), serde_yaml::to_string(&section)?.into_bytes()).await?;
             repository.apply_create_guarded(write.fence(), &reservation, record).await?;
             reservation.adopt();
-            Ok::<_, crate::error::NarouError>(())
+            Ok::<_, crate::error::NarouError>(novel_id)
         }).unwrap();
-        novel_dir
+        (novel_dir, novel_id)
     }
 
     /// issue #40: `convert.keep-txt=true` の変換は per-title の txt だけを
@@ -2572,10 +2577,10 @@ before_settings:
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         crate::db::init_database().unwrap();
 
-        let novel_dir = write_convertible_novel(temp.path());
-        let settings = NovelSettings::load_for_novel(1, "作品タイトル", "作者名", &novel_dir).unwrap();
+        let (novel_dir, novel_id) = write_convertible_novel(temp.path());
+        let settings = NovelSettings::load_for_novel(novel_id, "作品タイトル", "作者名", &novel_dir).unwrap();
         let mut converter = NovelConverter::try_new(settings).unwrap();
-        let txt_path = converter.convert_novel_by_id(1, &novel_dir).unwrap();
+        let txt_path = converter.convert_novel_by_id(novel_id, &novel_dir).unwrap();
 
         assert!(std::path::Path::new(&txt_path).is_file(), "{txt_path}");
         assert_eq!(
@@ -2594,12 +2599,12 @@ before_settings:
         // 旧バージョンが書いた重複ミラーは、次回の変換で消える。
         std::fs::write(&mirror, std::fs::read(&txt_path).unwrap()).unwrap();
         let mut converter = NovelConverter::try_new(NovelSettings::load_for_novel(
-            1,
+            novel_id,
             "作品タイトル",
             "作者名",
             &novel_dir,
         ).unwrap()).unwrap();
-        converter.convert_novel_by_id(1, &novel_dir).unwrap();
+        converter.convert_novel_by_id(novel_id, &novel_dir).unwrap();
         assert!(
             !mirror.exists(),
             "旧バージョンの固定名ミラーが残っている: {}",
@@ -2630,10 +2635,10 @@ before_settings:
         .unwrap();
         crate::db::init_database().unwrap();
 
-        let novel_dir = write_convertible_novel(temp.path());
-        let settings = NovelSettings::load_for_novel(1, "作品タイトル", "作者名", &novel_dir).unwrap();
+        let (novel_dir, novel_id) = write_convertible_novel(temp.path());
+        let settings = NovelSettings::load_for_novel(novel_id, "作品タイトル", "作者名", &novel_dir).unwrap();
         let mut converter = NovelConverter::try_new(settings).unwrap();
-        let txt_path = converter.convert_novel_by_id(1, &novel_dir).unwrap();
+        let txt_path = converter.convert_novel_by_id(novel_id, &novel_dir).unwrap();
 
         assert!(std::path::Path::new(&txt_path).is_file(), "{txt_path}");
         assert!(!novel_dir.join("novel.txt").exists());

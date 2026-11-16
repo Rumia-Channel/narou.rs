@@ -1389,7 +1389,7 @@ mod tests {
         crate::db::init_database().unwrap();
         crate::db::with_database_mut(|db| {
             db.insert(sample_record(0, &[]));
-            Ok(())
+            db.save()
         })
         .unwrap();
 

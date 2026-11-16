@@ -593,7 +593,7 @@ mod tests {
         let key = crate::platform::ObjectKey::try_new(write.prefix().as_ref()).unwrap();
         block_on(async {
             write.write_small(&key.join("setting.ini")?, b"old setting".to_vec()).await?;
-            write.write_small(&key.join("挿絵/old.png")?, b"old image".to_vec()).await
+            write.write_small(&key.join("挿絵")?.join("old.png")?, b"old image".to_vec()).await
         }).unwrap();
         let stores = crate::native::object_store::NativeStores::for_narou_root(root.path()).unwrap();
         let snapshot = NativeMutationSnapshot::begin_with_origin(&directory, write).unwrap();
@@ -606,7 +606,7 @@ mod tests {
             let fresh = crate::application::novel_access::NovelWriteGuard::capture(&stores.objects, Some(&stores.assets), &prefix).await?;
             let key = crate::platform::ObjectKey::try_new(prefix.as_ref())?;
             fresh.write_small(&key.join("setting.ini")?, b"new setting".to_vec()).await?;
-            fresh.write_small(&key.join("挿絵/old.png")?, b"new image".to_vec()).await
+            fresh.write_small(&key.join("挿絵")?.join("old.png")?, b"new image".to_vec()).await
         }).unwrap();
         assert!(snapshot.publish_changes().is_err());
         assert_eq!(std::fs::read(directory.join("setting.ini")).unwrap(), b"new setting");
