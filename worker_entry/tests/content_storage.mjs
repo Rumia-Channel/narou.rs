@@ -665,7 +665,13 @@ min_interval: 0.01
     assert(indexText.includes(`/smoke-image/${i}.png`), `image ${i} must be recorded in the persisted index`);
     const image = Buffer.concat([imagePng, Buffer.from(`/smoke-image/${i}.png`)]);
     const digest = createHash('sha256').update(image).digest();
-    assert.deepEqual(objects.get(`/narou-local/narou/local/illustrations/${digest.toString('base64url')}.png`), image);
+    const imageKey = `/narou-local/narou/local/illustrations/${digest.toString('base64url')}.png`;
+    if (!objects.has(imageKey)) {
+      const exactKeys = [...objects].filter(([, bytes]) => bytes.equals(image)).map(([key]) => key).slice(0, 3);
+      const poolKeys = [...objects.keys()].filter((key) => key.includes('/illustrations/')).slice(0, 3);
+      assert.fail(`Missing shared image ${imageKey}; exact payload keys=${JSON.stringify(exactKeys)}; pool sample=${JSON.stringify(poolKeys)}; index head=${indexText.slice(0, 600)}`);
+    }
+    assert.deepEqual(objects.get(imageKey), image);
   }
   const illustratedId = scalar("SELECT id FROM novels WHERE ncode='smoke-novel'");
   assert.equal(illustratedId, reservedCreation[0], 'the completed real record must adopt its original reserved ID');

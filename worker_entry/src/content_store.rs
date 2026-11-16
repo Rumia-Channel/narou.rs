@@ -64,16 +64,35 @@ impl TransferReferenceStore{
     }
     async fn publish_stream_cas(&self,fence:&narou_rs::platform::WriteFence,key:&ObjectKey,stream:AssetStream,expected:Option<&str>)->Result<bool>{
         if !fence.prefix.matches(key){return Err(error("write outside captured fence"));}
-        let metadata = metadata_in_d1(role_for(fence, key)?);
+        let role = role_for(fence, key)?;
+        let metadata = metadata_in_d1(role);
         let remote = self.remote.as_ref().filter(|_| !metadata);
         let token=nonce()?;let(blob,size,sha,backend)=if let Some(remote)=remote{
-            let blob=ObjectKey::try_new(format!("content/{}.bin",nonce()?))?;
-            self.db.prepare("INSERT INTO content_garbage(blob_key,not_before) VALUES (?,?)").bind(&[blob.as_ref().into(),(Utc::now()+Duration::hours(24)).to_rfc3339().into()]).map_err(error)?.run().await.map_err(error)?;
-            let stage=remote.stage_stream(stream).await?;remote.copy(&stage.key,&blob).await?;remote.delete(&stage.key).await?;(blob,stage.size,stage.sha256,"s3")
+            if role==FileRole::Illustration{
+                // Hash-addressed pool: the physical key derives from the staged
+                // content SHA-256, so identical images share one immutable
+                // object across novels. Pool objects are shared and exempt
+                // from content_garbage; a failed ref commit keeps them.
+                let stage=remote.stage_stream(stream).await?;
+                let outcome=async{
+                    let mut digest=[0u8;32];hex::decode_to_slice(&stage.sha256,&mut digest).map_err(|error|NarouError::Platform(error.to_string()))?;
+                    let extension=key.as_ref().rsplit_once('.').map(|(_,extension)|extension).ok_or_else(||error("illustration extension missing"))?;
+                    let pool=ObjectKey::try_new(format!("illustrations/{}.{}",base64::display::Base64Display::new(&digest,&base64::engine::general_purpose::URL_SAFE_NO_PAD),extension))?;
+                    let stream=remote.read_stream(&stage.key).await?.ok_or_else(||error("illustration stage missing"))?;
+                    remote.write_stream_once(&pool,stream,stage.size,&stage.sha256).await?;
+                    Ok::<_,NarouError>(pool)
+                }.await;
+                let _=remote.delete(&stage.key).await;
+                (outcome?,stage.size,stage.sha256,"s3")
+            }else{
+                let blob=ObjectKey::try_new(format!("content/{}.bin",nonce()?))?;
+                self.db.prepare("INSERT INTO content_garbage(blob_key,not_before) VALUES (?,?)").bind(&[blob.as_ref().into(),(Utc::now()+Duration::hours(24)).to_rfc3339().into()]).map_err(error)?.run().await.map_err(error)?;
+                let stage=remote.stage_stream(stream).await?;remote.copy(&stage.key,&blob).await?;remote.delete(&stage.key).await?;(blob,stage.size,stage.sha256,"s3")
+            }
         }else{let id=format!("ordinary-{token}");let stage=narou_rs::platform::transfer_stage::stage_asset_stream(self.d1.as_ref(),&id,&id,1,24*60*60,stream).await?;(stage.key,stage.size,stage.sha256,"d1")};
         let prepare=|sql:&str,values:&[JsValue]|self.db.prepare(sql).bind(values).map_err(error);
         let statements=vec![prepare("INSERT INTO transfer_storage_guards(token,prefix,owner,epoch,closed) VALUES (?,?,'',?,0)",&[token.as_str().into(),fence.prefix.as_ref().trim_end_matches('/').into(),JsValue::from_f64(fence.epoch as f64)])?,
-            prepare("SELECT CASE WHEN ?='d1' OR EXISTS(SELECT 1 FROM content_garbage WHERE blob_key=? AND julianday(not_before)>julianday('now')) THEN 1 ELSE abs(-9223372036854775808) END",&[backend.into(),blob.as_ref().into()])?,
+            prepare("SELECT CASE WHEN ?='d1' OR ? GLOB 'illustrations/*' OR EXISTS(SELECT 1 FROM content_garbage WHERE blob_key=? AND julianday(not_before)>julianday('now')) THEN 1 ELSE abs(-9223372036854775808) END",&[backend.into(),blob.as_ref().into(),blob.as_ref().into()])?,
             prepare("INSERT INTO transfer_object_refs(object_key,blob_key,size,sha256,backend,updated_at,blob_generation) SELECT ?1,?2,?3,?4,?5,?6,CASE WHEN ?5='d1' THEN (SELECT v.generation FROM transfer_verified_objects v JOIN objects o ON o.object_key=v.blob_key AND o.generation=v.generation WHERE v.blob_key=?2 AND v.size=?3 AND v.sha256=?4) ELSE '' END WHERE ?7 IS NULL OR COALESCE((SELECT blob_key FROM transfer_object_refs WHERE object_key=?1),'')=?7 ON CONFLICT(object_key) DO UPDATE SET blob_key=excluded.blob_key,size=excluded.size,sha256=excluded.sha256,backend=excluded.backend,updated_at=excluded.updated_at,blob_generation=excluded.blob_generation RETURNING object_key",&[key.as_ref().into(),blob.as_ref().into(),JsValue::from_f64(size as f64),sha.as_str().into(),backend.into(),Utc::now().to_rfc3339().into(),expected.map(JsValue::from_str).unwrap_or(JsValue::NULL)])?,
             prepare("DELETE FROM content_garbage WHERE blob_key=? AND EXISTS(SELECT 1 FROM transfer_object_refs WHERE blob_key=?)",&[blob.as_ref().into(),blob.as_ref().into()])?,self.d1.finish_publication_guard(&token)?];
         let results=self.db.batch(statements).await.map_err(error)?;crate::d1_repository::ensure_batch_success(&results)?;
