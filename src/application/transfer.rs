@@ -2744,6 +2744,7 @@ impl TransferService {
                 if !self.copy_wire_metadata_step(row,&key,ordinal,&layout,&mut cursor,budget).await?{import_ext_mut(row)?.graph_cursor=Some(serde_json::to_string(&cursor).map_err(TransferError::platform)?);return Ok(());}
                 let url=self.metadata_text(&row.session_id,&key,0,8192).await?;let urlkey=format!("url:{}",sha256_hex(url.as_bytes()));
                 if let Some(previous)=self.value::<u32>(&row.session_id,&urlkey).await?&&previous!=ordinal{return Err(TransferError::invalid("duplicate_novel_url","manifest repeats toc_url"));}
+                self.save_value(&row.session_id,&urlkey,&ordinal).await?;
                 let wire:crate::transfer::protocol::WireNovel=self.value(&row.session_id,&format!("{JKEY_NOVEL}{ordinal}")).await?.ok_or_else(||TransferError::invalid("novel_missing","normalized novel missing"))?;
                 if wire.kind==NovelKind::Normal&&self.value::<u32>(&row.session_id,&format!("path:{ordinal}:{}",sha256_hex(b"toc.yaml"))).await?.is_none(){return Err(TransferError::invalid("required_file_missing","ordinary novel must include toc.yaml"));}import_ext_mut(row)?.graph_cursor=None;
             }

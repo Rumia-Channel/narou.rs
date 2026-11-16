@@ -24,8 +24,10 @@ function instrument(database,mode,state){
     if(name==='all')return async(...args)=>{
       if(mode==='member_before_read'&&!state.fired&&/FROM json_each\(\?\) j LEFT JOIN novels n ON n.id=j.value/.test(sql)){
         const id=JSON.parse(bound[0]).at(-1);if(!Number.isSafeInteger(id))throw new Error('member fixture did not receive an exact novel id');
-        const result=await database.withSession('first-primary').prepare('DELETE FROM novels WHERE id=?').bind(id).run();
-        if(result.meta.changes!==1)throw new Error('member fixture did not remove its exact novel');
+        const primary=database.withSession('first-primary');
+        if(!await primary.prepare('SELECT id FROM novels WHERE id=?').bind(id).first())throw new Error('member fixture was absent before its injected deletion');
+        await primary.prepare('DELETE FROM novels WHERE id=?').bind(id).run();
+        if(await primary.prepare('SELECT id FROM novels WHERE id=?').bind(id).first())throw new Error('member fixture did not remove its exact novel');
         state.fired=true;
       }
       return target.all(...args);
@@ -98,7 +100,7 @@ export default class TransferFailureWorker extends Worker{
       const targets=await db.prepare('SELECT publication_id,assigned_id,prefix,epoch,committed,rolled_back FROM transfer_targets WHERE session_id=? ORDER BY publication_id').bind(id).all();
       const stages=await db.prepare('SELECT stage_id,file_id,expected_size,backend,initialized,purpose AS stagepurpose,sealed_key IS NOT NULL AS sealed FROM transfer_stage_owners WHERE session_id=? ORDER BY file_id').bind(id).all();
       const refs=await db.prepare('SELECT object_key,blob_key,size,sha256,backend FROM transfer_object_refs ORDER BY object_key').all();
-      const snapshot=await db.prepare("SELECT (SELECT COUNT(*) FROM transfer_snapshot_gates s JOIN novel_access_gates g ON g.prefix=s.prefix AND g.owner=s.owner AND g.closed=1 WHERE s.session_id=?) gates,(SELECT COUNT(*) FROM transfer_files WHERE session_id=? AND state IN ('staged','verified','reused')) pinned,(SELECT COUNT(*) FROM transfer_catalog_entries WHERE session_id=? AND selected=1) selected").bind(id,id,id).first();
+      const snapshot=await db.prepare("SELECT (SELECT COUNT(*) FROM transfer_snapshot_gates s JOIN novel_access_gates g ON g.prefix=s.prefix AND g.owner=s.owner AND g.closed=1 WHERE s.session_id=?) gates,(SELECT COUNT(*) FROM transfer_files WHERE session_id=? AND state IN ('staged','pinned')) pinned,(SELECT COUNT(*) FROM transfer_catalog_entries WHERE session_id=? AND selected=1) selected").bind(id,id,id).first();
       const frozen=await db.prepare('SELECT COALESCE(MAX(length(CAST(data AS BLOB))),0) max_row_bytes,COUNT(*) fragments FROM transfer_inventory_fragments WHERE session_id=?').bind(id).first();
       const selection=await db.prepare('SELECT * FROM transfer_export_selection_state WHERE session_id=?').bind(id).first();
       return Response.json({publications:publications.results,targets:targets.results,stages:stages.results,refs:refs.results,snapshot,frozen,selection});

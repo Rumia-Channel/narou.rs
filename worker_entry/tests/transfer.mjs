@@ -13,6 +13,11 @@ const CHUNK=8*1024*1024-64*1024;
 const WIRE=8*1024*1024;
 export const sha256=bytes=>createHash('sha256').update(bytes).digest('hex');
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function assertFileBytes(actual,expected,path){
+  assert(actual!==undefined,`${path}: missing file`);
+  assert.equal(actual.length,expected.length,`${path}: byte length`);
+  assert.equal(Buffer.compare(actual,expected),0,`${path}: content differs`);
+}
 export function encodeBatch(records){
   const frames=records.map(({file_id,chunk_index,bytes,final,sha256:digest})=>{
     const header=Buffer.from(JSON.stringify({file_id,chunk_index,payload_size:String(bytes.length),final,sha256:digest??sha256(bytes)}));
@@ -82,7 +87,7 @@ function session(client,direction,status,secret,extra={}){
     }await flush();if(s.status.next_action==='finalize_file')await s.until(v=>v.next_action!=='finalize_file');},
   async cancel(){await s.get();const identity=randomUUID();const r=await client.json(`${s.path}?operation_id=${identity}`,{method:'DELETE',headers:s.headers({'if-match':`"${s.status.revision}"`})});assert.equal(r.response.status,200,JSON.stringify(r.body));s.status=r.body;await s.until(v=>v.state==='cancelled');await s.drain();},
   async download(){const chunks=[];for(let index=0;;index++){const r=await client.request(`${s.path}/manifest/chunks/${index}`,{headers:s.headers()});assert.equal(r.status,200);assert.match(r.headers.get('content-type'),/octet-stream/);const bytes=Buffer.from(await r.arrayBuffer());assert(bytes.length<=WIRE);assert.equal(Number(r.headers.get('x-transfer-body-bytes')),bytes.length);chunks.push(bytes);if(r.headers.get('x-transfer-last')==='true'){assert.equal(Number(r.headers.get('x-transfer-manifest-bytes')),chunks.reduce((n,v)=>n+v.length,0));break;}}
-    const manifest=JSON.parse(Buffer.concat(chunks));const pieces=new Map();const expected=[];for(const[index,novel]of manifest.novels.entries())for(const file of novel.files)expected.push({path:`novels/${index}/${file.path}`,...file});
+    const manifest=JSON.parse(Buffer.concat(chunks));const pieces=new Map();const expected=[];for(const[index,novel]of manifest.novels.entries())for(const file of novel.files)expected.push({...file,path:`novels/${index}/${file.path}`});
     for(let batch=0;;batch++){const r=await client.request(`${s.path}/batches/${batch}`,{headers:s.headers()});assert.equal(r.status,200);const bytes=Buffer.from(await r.arrayBuffer());assert(bytes.length<=WIRE);assert.equal(Number(r.headers.get('x-transfer-body-bytes')),bytes.length);let offset=0,count=0;
       while(offset<bytes.length){const n=bytes.readUInt32BE(offset);offset+=4;assert(n>0&&n<=512);const header=JSON.parse(bytes.subarray(offset,offset+n));offset+=n;const length=Number(header.payload_size);const data=bytes.subarray(offset,offset+length);assert.equal(data.length,length);offset+=length;const value=pieces.get(header.file_id)??{next:0,chunks:[],final:false};assert.equal(header.chunk_index,value.next++);assert.equal(value.final,false);value.final=header.final;value.chunks.push(data);pieces.set(header.file_id,value);count++;}
       assert.equal(count,Number(r.headers.get('x-transfer-record-count')));assert(count<=100);if(r.headers.get('x-transfer-last')==='true')break;
@@ -121,11 +126,11 @@ async function contracts(){
     const first=fixtureNovel('first',[{path:'notes.bin',bytes:large},{path:'replace.txt',bytes:Buffer.from('user settings')},{path:'本文/cache/old.yaml',bytes:Buffer.from('body: historic\n')}]);
     const imported=await ca.importData([first],{profile:'complete'});assert.equal(imported.status.state,'completed');assert.equal(imported.plan[0].action,'create');
     let listed=(await ca.json('/api/novels')).body.data;const id=listed.find(v=>v.toc_url===first.toc_url).id;
-    const runtime=await ca.exportData([id]);assert(!runtime.files.has('novels/0/本文/cache/old.yaml'));assert.deepEqual(runtime.files.get('novels/0/notes.bin'),large);
+    const runtime=await ca.exportData([id]);assert(!runtime.files.has('novels/0/本文/cache/old.yaml'));assertFileBytes(runtime.files.get('novels/0/notes.bin'),large,'runtime notes.bin');
     const complete=await ca.exportData([id],{profile:'complete'});assert(complete.files.has('novels/0/本文/cache/old.yaml'));
     const transferred=complete.manifest.novels.map((novel,index)=>({...novel,files:novel.files.map(file=>({path:file.path,bytes:complete.files.get(`novels/${index}/${file.path}`)}))}));
     const second=await cb.importData(transferred,{profile:'complete'});assert.equal(second.status.state,'completed');const idb=(await cb.json('/api/novels')).body.data.find(v=>v.toc_url===first.toc_url).id;
-    const round=await cb.exportData([idb],{profile:'complete'});for(const[path,bytes]of complete.files)assert.deepEqual(round.files.get(path),bytes,path);
+    const round=await cb.exportData([idb],{profile:'complete'});for(const[path,bytes]of complete.files)assertFileBytes(round.files.get(path),bytes,path);
     const replacement=fixtureNovel('first',[{path:'notes.bin',bytes:Buffer.from('replacement')}]);const overwrite=await cb.importData([replacement],{policy:'overwrite'});assert.equal(overwrite.status.state,'completed');const after=await cb.exportData([idb],{profile:'complete'});assert.equal(after.files.get('novels/0/notes.bin').toString(),'replacement');assert.equal(after.files.get('novels/0/replace.txt').toString(),'user settings');assert(after.files.has('novels/0/本文/cache/old.yaml'));
     const skipped=await cb.importData([replacement]);assert.equal(skipped.plan[0].action,'skip');assert(!skipped.session.client.requests.slice(-10).some(r=>r.path.endsWith('/chunks')&&r.method==='PUT'));
     console.log('PASS bounded 17MiB file, runtime/complete, two libraries, overwrite preservation, Skip');
@@ -147,7 +152,7 @@ async function contracts(){
     console.log('PASS virtual expansion, deduplication, mixed attributes, ordered destination membership and skipped member');
     const vanishingMember=fixtureNovel('vanishing-member');await ca.importData([vanishingMember]);
     const vanishingParent={...parent,toc_url:`https://narou.rs/virtual/${randomBytes(16).toString('hex')}`,title:'Vanishing member group',virtual_members:[vanishingMember.toc_url]};
-    const vanishing=await ca.createImport([vanishingParent]);await vanishing.manifest();await vanishing.until(v=>v.state==='transferring');await vanishing.upload();await vanishing.op('ready');await vanishing.op('publish',{plan_revision:vanishing.status.plan_revision});
+    const vanishing=await ca.createImport([vanishingMember,vanishingParent]);await vanishing.manifest();await vanishing.until(v=>v.state==='transferring');await vanishing.upload();await vanishing.op('ready');await vanishing.op('publish',{plan_revision:vanishing.status.plan_revision});
     let memberFault=false,memberHttpError=false;for(let i=0;i<2000;i++){
       await vanishing.get();const response=await ca.request(`${vanishing.path}/advance`,{method:'POST',headers:vanishing.headers({'content-type':'application/json','x-narou-test-transfer-fault':'member_before_read'}),body:JSON.stringify({operation_id:vanishing.status.operation_id})});const body=JSON.parse(await response.text());
       if(response.headers.get('x-test-transfer-fault-fired')==='true'){memberFault=true;if(response.status!==200){assert.equal(body.error?.code,'plan_stale',JSON.stringify(body));memberHttpError=true;}else vanishing.status=body;break;}
