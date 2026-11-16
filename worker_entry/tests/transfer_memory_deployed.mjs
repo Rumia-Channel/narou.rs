@@ -17,9 +17,11 @@ const client=transferClient(base.origin,token,{verifyPrimary:true});
 const request=client.request;
 let requestNumber=0,lastFailure;
 client.request=async(path,init={})=>{
-  const ordinal=++requestNumber,periodic=ordinal===1||ordinal%100===0;
+  const ordinal=++requestNumber,periodic=ordinal<=20||ordinal%100===0;
   if(periodic)console.log(JSON.stringify({event:'transfer_request',ordinal,path,method:init.method??'GET'}));
-  const response=await request(path,init);
+  let response;
+  try{response=await request(path,init);}
+  catch(error){const code=['ECONNRESET','ETIMEDOUT','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_SOCKET'].includes(error?.cause?.code)?error.cause.code:'transport_failure';console.log(JSON.stringify({event:'transfer_transport_error',ordinal,path,code}));throw error;}
   if(periodic||response.status>=400){
     const value=response.headers.get('content-type')?.includes('application/json')?await response.clone().json():null;
     const category=String(value?.error?.message??'').match(/D1_[A-Z_]+|SQLITE_[A-Z_]+|too many SQL variables|out of memory|memory limit|too large|exceeded maximum/gi)?.join(',')??null;

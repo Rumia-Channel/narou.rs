@@ -1,10 +1,10 @@
 // Disposable, D1-only Cloudflare transfer fixture. This never renders the
 // production/develop config and never creates routes, Access apps, or queues.
-// Build the production shim/assets first. Modes: provision, run, cleanup.
+// Build the production shim/assets first. Modes: provision, exercise, run, cleanup.
 import assert from 'node:assert/strict';
 import {appendFileSync,existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
 import {createHash,randomBytes} from 'node:crypto';
-import {spawnSync} from 'node:child_process';
+import {spawn,spawnSync} from 'node:child_process';
 import {dirname,join,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 const root=resolve(dirname(fileURLToPath(import.meta.url)),'..');
@@ -18,7 +18,7 @@ assert(statePath,'NAROU_TRANSFER_FIXTURE_STATE must name a private temporary sta
 const pin=process.env.NAROU_WRANGLER_VERSION??'4.151.3';
 assert.match(pin,/^\d+\.\d+\.\d+$/,'Wrangler must be exactly pinned');
 const mode=process.argv[2]??'run';
-assert(['provision','run','cleanup'].includes(mode));
+assert(['provision','exercise','run','cleanup'].includes(mode));
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 // Match the established deployment probe and downloader DEFAULT_USER_AGENT.
 const probeUserAgent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0';
@@ -87,6 +87,48 @@ async function provision(){
   if(process.env.GITHUB_ENV)appendFileSync(process.env.GITHUB_ENV,`NAROU_TRANSFER_TEST_URL=${state.url}\nNAROU_TRANSFER_TEST_TOKEN=${state.adminToken}\n`);
   return state;
 }
+async function exercise(state){
+  validate(state);
+  const tailPath=`/workers/scripts/${state.workerName}/tails`;
+  const record=await api(tailPath,{method:'POST',body:{filters:[]}});
+  assert.match(record?.id??'',/^[a-f0-9-]{36}$/i);
+  const address=new URL(record.url);assert.equal(address.protocol,'wss:');
+  let socket,closing=false,tailFailure;
+  try{
+    socket=new WebSocket(address,'trace-v1');socket.binaryType='arraybuffer';
+    const lost=reason=>{if(!closing){tailFailure=reason;console.log(JSON.stringify({event:'transfer_tail_lost',reason}));}};
+    socket.addEventListener('error',()=>lost('connection_error'));
+    socket.addEventListener('close',()=>lost('connection_closed'));
+    socket.addEventListener('message',event=>{
+      const bytes=Buffer.from(event.data);
+      if(bytes.length>256*1024){lost('event_too_large');return;}
+      let value;try{value=JSON.parse(bytes.toString('utf8'));}catch{lost('invalid_event');return;}
+      const outcomes=['ok','canceled','exception','exceededCpu','exceededMemory','unknown'];
+      if(!outcomes.includes(value.outcome)){lost('unknown_outcome');return;}
+      if(value.outcome==='ok')return;
+      let path='other';
+      try{const candidate=new URL(value.event?.request?.url).pathname;if(candidate.startsWith('/api/transfer/'))path=candidate;}catch{}
+      // Tail events contain credentials and arbitrary console text. Never print
+      // their headers, URLs with query strings, logs, or exception messages.
+      console.log(JSON.stringify({event:'transfer_isolate',outcome:value.outcome,path}));
+    });
+    await new Promise((resolve,reject)=>{
+      const timer=setTimeout(()=>reject(new Error('disposable transfer tail did not open')),15000);
+      socket.addEventListener('open',()=>{clearTimeout(timer);socket.send(JSON.stringify({debug:false}));resolve();},{once:true});
+      socket.addEventListener('error',()=>{clearTimeout(timer);reject(new Error('disposable transfer tail connection failed'));},{once:true});
+      socket.addEventListener('close',()=>{clearTimeout(timer);reject(new Error('disposable transfer tail closed before readiness'));},{once:true});
+    });
+    console.log(JSON.stringify({event:'transfer_tail_ready'}));
+    const child=spawn(process.execPath,[join(root,'tests/transfer_memory_deployed.mjs')],{cwd:root,stdio:'inherit',env:{...process.env,NAROU_TRANSFER_TEST_URL:state.url,NAROU_TRANSFER_TEST_TOKEN:state.adminToken},signal:AbortSignal.timeout(25*60*1000)});
+    let processFailure;
+    const result=await new Promise(resolve=>{child.once('error',()=>{processFailure=true;});child.once('close',(code,signal)=>resolve({code,signal}));});
+    assert(!processFailure&&result.code===0,`deployed transfer regressions failed (code=${result.code}, signal=${result.signal})`);
+    assert.equal(tailFailure,undefined,'disposable transfer tail lost diagnostic coverage');
+  }finally{
+    closing=true;socket?.close();
+    await api(`${tailPath}/${record.id}`,{method:'DELETE',missing:true});
+  }
+}
 async function cleanup(){
   if(!existsSync(statePath))return;
   const state=validate(JSON.parse(readFileSync(statePath,'utf8')));const failures=[];
@@ -102,4 +144,5 @@ if(mode==='cleanup'){
   if(process.env.NAROU_TRANSFER_FIXTURE_CLEANUP){assert(!existsSync(statePath),'refusing to replace cleanup state');const state=validate(JSON.parse(Buffer.from(process.env.NAROU_TRANSFER_FIXTURE_CLEANUP,'base64url').toString('utf8')));mkdirSync(dirname(statePath),{recursive:true});save(state);}
   await cleanup();
 }else if(mode==='provision')await provision();
-else{try{const state=await provision();const result=spawnSync(process.execPath,[join(root,'tests/transfer_memory_deployed.mjs')],{cwd:root,stdio:'inherit',env:{...process.env,NAROU_TRANSFER_TEST_URL:state.url,NAROU_TRANSFER_TEST_TOKEN:state.adminToken},timeout:25*60*1000});assert.equal(result.status,0,'deployed transfer regressions failed');}finally{await cleanup();}}
+else if(mode==='exercise')await exercise(validate(JSON.parse(readFileSync(statePath,'utf8'))));
+else{try{await exercise(await provision());}finally{await cleanup();}}
