@@ -274,6 +274,12 @@ impl ConversionWorkspace {
             }
         }
         let published = self.publish(output)?;
+        if let Some(text) = text
+            && !text.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.eq_ignore_ascii_case("novel.txt"))
+        {
+            // Retire the old canonical mirror only after publishing, under the original origin.
+            crate::native::materialization::delete_file(origin, &self.directory.join("novel.txt"))?;
+        }
         self.discard_intermediate(id, text, Some(output))?;
         Ok(published)
     }
