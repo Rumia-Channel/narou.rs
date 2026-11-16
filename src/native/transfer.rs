@@ -1550,12 +1550,14 @@ pub mod v2 {
             if self.committed(spec)?{p.committed=true;self.save_publication(spec,&p)?;return Ok(PublicationStep{done:true,committed:true,assigned_id:Some(p.record_id),receipt:Some(bytes),..Default::default()});}
             self.check_plan(spec,&p).await?;let member_ids=spec.member_ids.clone();let parent=spec.kind==NovelKind::VirtualParent;let target=spec.target.clone();
             self.primary.with_closed_write(&ObjectPrefix::new(&p.prefix).map_err(TransferError::platform)?,&p.owner,p.epoch,||crate::converter::clear_section_convert_cache(p.record_id)).map_err(TransferError::platform)?;
+            // New-record settings/site lookups may read SQLite; resolve them before its metadata transaction.
+            let new_record=if target.action==PlanAction::Create{Some(self.make_record(spec,p.record_id,None)?)}else{None};
             let result=crate::db::with_database_mut(|db|db.update_transfer_records(&marker,|mut records,mut members|{
                 let current=records.get(&p.record_id);
                 if target.action==PlanAction::Overwrite && current.is_none(){return Err(crate::error::NarouError::Platform("plan_stale: destination deleted".into()));}
                 if let Some(current)=current&&(target.action==PlanAction::Create||Some(Self::record_revision(current).map_err(|e|crate::error::NarouError::Platform(e.to_string()))?)!=target.record_revision){return Err(crate::error::NarouError::Platform("plan_stale: destination changed".into()));}
                 let existing=records.remove(&p.record_id);
-                let mut record=self.make_record(spec,p.record_id,existing).map_err(|e|crate::error::NarouError::Platform(e.to_string()))?;
+                let mut record=match existing{Some(existing)=>self.make_record(spec,p.record_id,Some(existing)).map_err(|e|crate::error::NarouError::Platform(e.to_string()))?,None=>new_record.ok_or_else(||crate::error::NarouError::Platform("plan_stale: destination disappeared".into()))?};
                 record.file_title=p.file_title.clone();record.sitename=p.sitename.clone();record.use_subdirectory=p.use_subdirectory;record.is_narou=p.is_narou;
                 match target.action{PlanAction::Create=>{if records.contains_key(&record.id)||records.values().any(|r|r.toc_url==record.toc_url){return Err(crate::error::NarouError::Platform("plan_stale: destination identity was claimed".into()));}},PlanAction::Overwrite=>{},_=>return Err(crate::error::NarouError::Platform("invalid publication action".into()))}
                 if parent{crate::virtual_novel::validate_members(&member_ids).map_err(crate::error::NarouError::Platform)?;for id in &member_ids{let member=records.get(id).ok_or_else(||crate::error::NarouError::Platform("member disappeared".into()))?;if crate::virtual_novel::is_virtual_record(member)||members.groups.iter().any(|(parent,ids)|*parent!=record.id&&ids.contains(id)){return Err(crate::error::NarouError::Platform("membership_conflict".into()));}}members.groups.insert(record.id,member_ids.clone());if !record.tags.contains(&crate::virtual_novel::tag(record.id)){record.tags.push(crate::virtual_novel::tag(record.id));}}
