@@ -118,12 +118,12 @@ static UPSERT_CHANGED_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::ne
 
 pub(crate) fn bind_existing_record_origin(conn:&Connection,id:i64)->Result<()>{
     use rusqlite::OptionalExtension;let old:Option<(String,String,bool)>=conn.query_row("SELECT sitename,file_title,use_subdirectory FROM novels WHERE id=?",[id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(super::sqlite_error)?;
-    if let Some((site,title,subdirectory))=old{let keys=crate::platform::NovelObjectKeys::new(&site,&title,subdirectory)?;conn.execute("INSERT INTO novel_gate_bindings(novel_id,prefix) VALUES(?,?) ON CONFLICT(novel_id) DO UPDATE SET prefix=excluded.prefix",rusqlite::params![id,keys.prefix().as_ref()]).map_err(super::sqlite_error)?;}Ok(())
+    if let Some((site,title,subdirectory))=old{let keys=crate::platform::NovelObjectKeys::new(&site,&title,subdirectory)?;conn.execute("INSERT INTO novel_gate_bindings(novel_id,prefix) VALUES(?,?) ON CONFLICT(novel_id) DO UPDATE SET prefix=excluded.prefix WHERE novel_gate_bindings.prefix IS NOT excluded.prefix",rusqlite::params![id,keys.prefix().as_ref()]).map_err(super::sqlite_error)?;}Ok(())
 }
 
 pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Result<()> {
     let keys=crate::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;
-    conn.execute("INSERT INTO novel_gate_bindings(novel_id,prefix) VALUES (?,?) ON CONFLICT(novel_id) DO UPDATE SET prefix=excluded.prefix",rusqlite::params![record.id,keys.prefix().as_ref()]).map_err(super::sqlite_error)?;
+    conn.execute("INSERT INTO novel_gate_bindings(novel_id,prefix) VALUES (?,?) ON CONFLICT(novel_id) DO UPDATE SET prefix=excluded.prefix WHERE novel_gate_bindings.prefix IS NOT excluded.prefix",rusqlite::params![record.id,keys.prefix().as_ref()]).map_err(super::sqlite_error)?;
     // A re-registered novel can receive the same tag from multiple sources.
     // Normalize before encoding tags_json/tags_sort as well as novel_tags, so
     // the denormalized and indexed representations never disagree.
