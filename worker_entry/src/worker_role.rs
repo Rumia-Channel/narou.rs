@@ -1,18 +1,77 @@
-//! Delivery runs in a separate script; captured management routes stay on the writer.
+//! Deployment roles of one Worker artifact.
+//!
+//! The same Wasm artifact is deployed as several scripts:
+//!
+//! - `writer` — Web UI, API, cron, the conversion queue and the legacy
+//!   acquisition ingress. It never executes an acquisition itself.
+//! - `reader` — read-only delivery of public content.
+//! - `acquisition` — one acquisition lane. It consumes exactly one
+//!   acquisition queue and runs at most one heavy operation per isolate.
 
+use narou_rs::application::acquisition_lanes::LANE_COUNT;
 use worker::{Env, Error, Method, Result};
 
-pub(crate) fn is_reader(env: &Env) -> Result<bool> {
-    let value = js_sys::Reflect::get(env, &wasm_bindgen::JsValue::from_str("NAROU_WORKER_ROLE"))
+/// Deployment role of this script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerRole {
+    /// Web UI, API, cron, conversion queue and the legacy acquisition ingress.
+    Writer,
+    /// Read-only delivery of public content.
+    Reader,
+    /// One acquisition lane: consumes exactly one acquisition queue.
+    Acquisition,
+}
+
+const ROLE_VAR: &str = "NAROU_WORKER_ROLE";
+const LANE_VAR: &str = "NAROU_ACQUISITION_LANE";
+
+/// The role of this script. An unset variable means the writer.
+pub(crate) fn role(env: &Env) -> Result<WorkerRole> {
+    let value = js_sys::Reflect::get(env, &wasm_bindgen::JsValue::from_str(ROLE_VAR))
         .map_err(|_| Error::RustError("failed to read NAROU_WORKER_ROLE".into()))?;
     if value.is_undefined() {
-        return Ok(false);
+        return Ok(WorkerRole::Writer);
     }
     match value.as_string().as_deref() {
-        Some("writer") => Ok(false),
-        Some("reader") => Ok(true),
-        _ => Err(Error::RustError("NAROU_WORKER_ROLE must be writer or reader".into())),
+        Some("writer") => Ok(WorkerRole::Writer),
+        Some("reader") => Ok(WorkerRole::Reader),
+        Some("acquisition") => Ok(WorkerRole::Acquisition),
+        _ => Err(Error::RustError(
+            "NAROU_WORKER_ROLE must be writer, reader or acquisition".into(),
+        )),
     }
+}
+
+/// Whether this script is the read-only delivery Worker.
+pub(crate) fn is_reader(env: &Env) -> Result<bool> {
+    Ok(role(env)? == WorkerRole::Reader)
+}
+
+/// The acquisition lane this script owns. `None` for every other role.
+///
+/// The lane index is part of the deployment identity: a lane script may only
+/// execute an assignment that names its own lane.
+pub(crate) fn acquisition_lane(env: &Env) -> Result<Option<u8>> {
+    if role(env)? != WorkerRole::Acquisition {
+        return Ok(None);
+    }
+    let value = js_sys::Reflect::get(env, &wasm_bindgen::JsValue::from_str(LANE_VAR))
+        .map_err(|_| Error::RustError("failed to read NAROU_ACQUISITION_LANE".into()))?;
+    let text = value.as_string().ok_or_else(|| {
+        Error::RustError("NAROU_ACQUISITION_LANE is required for the acquisition role".into())
+    })?;
+    let lane: u8 = text.trim().parse().map_err(|_| {
+        Error::RustError(format!(
+            "NAROU_ACQUISITION_LANE must be 0..{}, got {text:?}",
+            LANE_COUNT - 1
+        ))
+    })?;
+    if lane >= LANE_COUNT {
+        return Err(Error::RustError(format!(
+            "NAROU_ACQUISITION_LANE {lane} is out of range"
+        )));
+    }
+    Ok(Some(lane))
 }
 
 /// Only these routes may execute locally in a delivery isolate. Cloudflare's

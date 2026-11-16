@@ -18,10 +18,9 @@
 //!   台帳の dedupe index からも外れる (native 同様、同じ対象を即再投入可)。
 //!   副作用として Web UI では `failed` バケットに数えられる — 第 1 波の
 //!   写像 (`permanent` + `blocked` → `failed`) と矛盾しない唯一の状態。
-//! - running job の中断は Wasm を途中で殺せないが、execution_token を消す
-//!   tombstone により「結果を記録できないジョブ」になる (native の
-//!   SIGKILL と同じ終了状態: mark_terminal / yield / record_attempt は
-//!   全て失敗し、再配信は即 ack)。
+//! - running job の中断は Wasm を途中で殺せないため、tombstone 後も
+//!   execution_token と lease を保持し、物理処理が停止してから解放する。
+//!   未実行の pending 予約は取消と同じ batch で解放し、配信待ちにしない。
 //! - native の restorable tasks (停止時に running だったジョブ) に相当する
 //!   のは、実行中の Worker が失われて lease 切れになった `running` 行。
 //!   `claim` の lease 期限分岐が回収できるので、envelope を再送して復元する。
@@ -254,6 +253,9 @@ async fn remove_pending_task(mut req: Request, env: Env) -> worker::Result<Respo
     {
         // native は削除成功 (`Ok(true)`) のみで送る。
         Ok(true) => {
+            if let Err(error) = runtime.dispatch_acquisition().await {
+                worker::console_log!("acquisition dispatch after cancellation failed: {error}");
+            }
             notify_queue_changed(&env, &runtime).await;
             api_response(true, "Task removed")
         }

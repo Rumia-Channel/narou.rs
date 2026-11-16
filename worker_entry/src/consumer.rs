@@ -1,4 +1,4 @@
-//! Queue consumer (Phase 8).
+//! Queue consumers.
 //!
 //! One worker invocation consumes one or more envelopes. Each envelope is
 //! claimed against the D1 ledger, executed (Download/Update via the shared
@@ -15,10 +15,21 @@
 //!
 //! A panic or a ledger failure propagates to the queue runtime (redelivery /
 //! DLQ); there is no `catch_unwind` and no silent acknowledgment.
+//!
+//! # Roles
+//!
+//! - The **writer** consumes the conversion queue (version-2 execution) and
+//!   the legacy acquisition ingress. The ingress is *drain only*: it gives the
+//!   row its identity and lets the lane dispatcher assign it. The writer
+//!   never executes an acquisition.
+//! - An **acquisition lane** consumes exactly one acquisition queue. It
+//!   executes the version-3 assignment named by the envelope, and only when
+//!   the envelope names the lane this script owns.
 
 use std::borrow::Cow;
 use std::time::Duration;
 
+use narou_rs::application::acquisition_lanes::{AcquisitionEnvelope, ENVELOPE_VERSION};
 use narou_rs::application::{
     JobKind,
     decode_legacy_envelope, JobClaim, JobId, JobLedgerStatus, JobPlan, JobQueue, JobRequest,
@@ -86,35 +97,146 @@ pub(crate) async fn table_reload_after_job(runtime: &WorkerRuntime) -> bool {
 /// 文字列で判定して `queue_cancelled` を送出する ([`settle_user_cancel`])。
 pub(crate) const USER_CANCEL_REASON: &str = "cancelled by user via Web UI";
 
-/// Process a queue batch. Builds a fresh runtime and Downloader per
-/// invocation so no mutable state is shared across event handlers.
+/// Delay of the rare capacity retry of an assigned acquisition.
+///
+/// The reservation is retained by the capacity park, so the same envelope can
+/// be delivered again without losing the job.
+const CAPACITY_RETRY_DELAY_SECS: u32 = 5;
+
+/// A lightweight ledger for the paths that must not build the full runtime.
+fn bare_ledger(env: &Env) -> Result<crate::ledger::D1JobLedger> {
+    Ok(crate::ledger::D1JobLedger::new(
+        crate::db_handle::DbHandle::primary(std::sync::Arc::new(env.d1("DB").map_err(worker_error)?)),
+        std::sync::Arc::new(narou_rs::platform::SystemClock),
+    ))
+}
+
+/// Process a writer queue batch.
+///
+/// The conversion queue keeps the version-2 execution protocol. The legacy
+/// acquisition ingress is drained into the lane dispatcher: the writer never
+/// runs an acquisition itself.
 pub async fn process_batch(
     message_batch: MessageBatch<serde_json::Value>,
     env: &Env,
 ) -> Result<()> {
-    let Some(_memory_permit) = crate::memory_budget::try_heavy() else {
-        // No runtime/site compilation, downloader, or site lease while waiting.
-        // Park in D1 and ack: physical queue retries must not spend business
-        // attempts (nor fall into the DLQ merely because the isolate is busy).
-        let ledger = crate::ledger::D1JobLedger::new(
-            crate::db_handle::DbHandle::primary(std::sync::Arc::new(env.d1("DB").map_err(worker_error)?)),
-            std::sync::Arc::new(narou_rs::platform::SystemClock),
-        );
-        for message in message_batch.messages().map_err(worker_error)? {
-            defer_capacity(&ledger, &message).await?;
-            message.ack();
-        }
-        return Ok(());
+    let queue_name = message_batch.queue();
+    let source_convert =
+        crate::composition::convert_queue_name(env).as_deref() == Some(queue_name.as_str());
+    let memory_permit = if source_convert {
+        let Some(memory_permit) = crate::memory_budget::try_heavy() else {
+            // No runtime/site compilation, downloader, or site lease while waiting.
+            // Park in D1 and ack: physical queue retries must not spend business
+            // attempts (nor fall into the DLQ merely because the isolate is busy).
+            let ledger = bare_ledger(env)?;
+            for message in message_batch.messages().map_err(worker_error)? {
+                defer_capacity(&ledger, &message).await?;
+                message.ack();
+            }
+            return Ok(());
+        };
+        Some(memory_permit)
+    } else {
+        None
     };
     let runtime = WorkerRuntime::build(env).await.map_err(worker_error)?;
-    let push = PushHubClient::new(env, runtime.subrequests.clone());
-    let source_convert = runtime.is_conversion_queue(&message_batch.queue());
+    let push = runtime.push();
     for message in message_batch.messages().map_err(worker_error)? {
         // A batch never accumulates section caches from previous novels.
         let mut downloader = None;
-        process_envelope(&runtime, &mut downloader, &push, message.body(), &message, source_convert).await?;
+        if source_convert {
+            process_envelope(&runtime, &mut downloader, push, message.body(), &message, true).await?;
+        } else {
+            drain_ingress(&runtime, push, message.body(), &message).await?;
+        }
+    }
+    drop(memory_permit);
+    if let Err(error) = runtime.wake_waiting_jobs().await {
+        console_log!("admission wake failed; cron will recover it: {error}");
+    }
+    if source_convert && let Err(error) = runtime.dispatch_acquisition().await {
+        console_log!("acquisition dispatch after conversion failed: {error}");
+    }
+    Ok(())
+}
+
+/// Process one acquisition lane batch.
+///
+/// The lane owns exactly one assigned job. The heavy permit is dropped after
+/// physical work drains, before releasing or reclassifying its reservation.
+pub async fn process_acquisition_batch(
+    message_batch: MessageBatch<serde_json::Value>,
+    env: &Env,
+    lane: u8,
+) -> Result<()> {
+    for message in message_batch.messages().map_err(worker_error)? {
+        let value = message.body();
+        let version = value.get("version").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        if version != u64::from(ENVELOPE_VERSION) {
+            // Legacy envelopes are ingress notifications: they are drained into
+            // the dispatcher, never executed in a lane.
+            let runtime = WorkerRuntime::build(env).await.map_err(worker_error)?;
+            drain_ingress(&runtime, runtime.push(), &value, &message).await?;
+            continue;
+        }
+        let envelope: AcquisitionEnvelope = match serde_json::from_value(value.clone()) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                // Malformed payloads are poison: they would never parse again
+                // on redelivery, so durably block + ack instead of spinning.
+                let reason = format!("malformed v3 envelope: {error}");
+                console_log!("rejecting envelope {}: {reason}", message.id());
+                let ledger = bare_ledger(env)?;
+                ledger.record_rejected(&message.id(), &reason).await?;
+                message.ack();
+                continue;
+            }
+        };
+        if !envelope.is_valid() || envelope.lane != lane {
+            // A delivery for another lane never executes, and it never frees
+            // the current owner of that lane.
+            console_log!(
+                "ignoring acquisition envelope for lane {} on lane {lane}",
+                envelope.lane
+            );
+            message.ack();
+            continue;
+        }
+        // The heavy permit belongs to this job only.
+        let Some(memory_permit) = crate::memory_budget::try_heavy() else {
+            let ledger = bare_ledger(env)?;
+            ledger.park_acquisition_capacity(&envelope).await?;
+            // The assignment is retained, so the same envelope may be
+            // delivered again without losing the job.
+            let options = QueueRetryOptionsBuilder::new()
+                .with_delay_seconds(CAPACITY_RETRY_DELAY_SECS)
+                .build();
+            message.retry_with_options(&options);
+            continue;
+        };
+        let runtime = WorkerRuntime::build(env).await.map_err(worker_error)?;
+        let completion = execute_assigned(&runtime, runtime.push(), &envelope, &message).await;
+        drop(memory_permit);
+        match completion? {
+            AcquisitionCompletion::Retain => {}
+            AcquisitionCompletion::Release => {
+                runtime.ledger.release_acquisition_lane(&envelope).await?;
+            }
+            AcquisitionCompletion::Reclassify(fresh) => {
+                runtime.ledger.reclassify_acquisition(
+                    &envelope,
+                    &fresh.normalized_target,
+                    &fresh.site_key,
+                ).await?;
+                message.ack();
+            }
+        }
+        // Ownership and capacity must both be free before the next dispatch.
         if let Err(error) = runtime.wake_waiting_jobs().await {
-            console_log!("admission wake failed; cron will recover it: {error}");
+            console_log!("conversion admission wake failed: {error}");
+        }
+        if let Err(error) = runtime.dispatch_acquisition().await {
+            console_log!("acquisition dispatch failed: {error}");
         }
     }
     Ok(())
@@ -174,6 +296,157 @@ async fn notify_rejected(push: &PushHubClient, message_id: &str, reason: &str) {
         notification_queue(),
     ])
     .await;
+}
+
+/// Drain one legacy ingress envelope into the lane dispatcher.
+///
+/// The old acquisition queue is an ingress, not an execution path: the row is
+/// given its identity and the dispatcher assigns it to a free lane. Nothing
+/// is executed here, so the writer never holds a heavy permit for it.
+async fn drain_ingress(
+    runtime: &WorkerRuntime,
+    push: &PushHubClient,
+    value: &serde_json::Value,
+    message: &Message<serde_json::Value>,
+) -> Result<()> {
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    match version {
+        v if v == u64::from(WORKER_JOB_ENVELOPE_VERSION) => {
+            let envelope: WorkerJobEnvelope = match serde_json::from_value(value.clone()) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    // Malformed payloads are poison: they would never parse
+                    // again on redelivery, so durably block + ack instead of
+                    // spinning. `Err` is reserved for ledger/runtime
+                    // failures, which are retried.
+                    let reason = format!("malformed v2 envelope: {error}");
+                    console_log!("rejecting envelope {}: {reason}", message.id());
+                    runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                    notify_rejected(push, &message.id(), &reason).await;
+                    message.ack();
+                    return Ok(());
+                }
+            };
+            // Defense in depth: an envelope that somehow exceeds the payload
+            // limit is durably blocked, never executed.
+            let oversized = match narou_rs::application::envelope_bytes(&envelope) {
+                Ok(size) => size > narou_rs::application::job_limits::MAX_ENVELOPE_BYTES,
+                Err(_) => true,
+            };
+            if oversized {
+                let reason = format!(
+                    "envelope exceeds queue payload limit (max {} bytes)",
+                    narou_rs::application::job_limits::MAX_ENVELOPE_BYTES
+                );
+                console_log!("rejecting envelope {}: {reason}", message.id());
+                runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                notify_rejected(push, &message.id(), &reason).await;
+                message.ack();
+                return Ok(());
+            }
+            // The ledger row is the authority for the plan; the envelope
+            // only names the job.
+            match runtime.ledger.get(&envelope.job_id).await? {
+                Some(view) if !view.status.is_terminal() => {
+                    route_acquisition_row(runtime, &envelope.job_id, &view.job).await?;
+                }
+                Some(_) => {
+                    message.ack();
+                    return Ok(());
+                }
+                None => {
+                    let reason = format!("ledger has no row for queued job {}", envelope.job_id);
+                    console_log!("rejecting envelope {}: {reason}", message.id());
+                    runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                    notify_rejected(push, &message.id(), &reason).await;
+                    message.ack();
+                    return Ok(());
+                }
+            }
+            message.ack();
+        }
+        v if v == u64::from(ENVELOPE_VERSION) => {
+            // An assigned delivery that reached the legacy ingress: the lane
+            // reservation owns the job, so the message is acknowledged
+            // without touching the row.
+            console_log!("ignoring an assigned acquisition delivery on the legacy ingress");
+            message.ack();
+        }
+        1 => {
+            // Legacy envelope: one `JobRequest` body. Only a request that
+            // plans exactly one unambiguous job is promoted; everything else
+            // is durably ledgered as blocked and acked.
+            let legacy = value.get("job").cloned().unwrap_or(serde_json::Value::Null);
+            let request: JobRequest = match serde_json::from_value(legacy) {
+                Ok(request) => request,
+                Err(error) => {
+                    let reason = format!("malformed v1 envelope: {error}");
+                    console_log!("rejecting envelope {}: {reason}", message.id());
+                    runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                    notify_rejected(push, &message.id(), &reason).await;
+                    message.ack();
+                    return Ok(());
+                }
+            };
+            match decode_legacy_envelope(&request) {
+                LegacyEnvelopeOutcome::Plan(job) => {
+                    let queued = runtime.ledger.enqueue(job.clone()).await?;
+                    notify_queue_changed(push).await;
+                    route_acquisition_row(runtime, &queued.job_id, &queued.job).await?;
+                    message.ack();
+                }
+                LegacyEnvelopeOutcome::Reject { reason } => {
+                    console_log!("rejecting legacy envelope {}: {reason}", message.id());
+                    runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                    notify_rejected(push, &message.id(), &reason).await;
+                    message.ack();
+                }
+            }
+        }
+        other => {
+            let reason = format!("unsupported envelope version {other}");
+            console_log!("rejecting envelope {}: {reason}", message.id());
+            runtime.ledger.record_rejected(&message.id(), &reason).await?;
+            notify_rejected(push, &message.id(), &reason).await;
+            message.ack();
+        }
+    }
+    runtime.dispatch_acquisition().await?;
+    Ok(())
+}
+
+/// Route one durable row: conversion keeps its queue, acquisition gets an
+/// identity and waits for a lane.
+async fn route_acquisition_row(
+    runtime: &WorkerRuntime,
+    job_id: &JobId,
+    job: &JobPlan,
+) -> Result<()> {
+    if job.kind == narou_rs::application::JobKind::Convert {
+        runtime.send_existing_job(job_id, job.kind.as_str()).await?;
+        return Ok(());
+    }
+    let settings = match runtime.effective_site_settings().await {
+        Ok(settings) => settings,
+        Err(error) => {
+            // 定義が読めなければ identity は確定できない。行は identity なし
+            // のまま残り、次の取り込み処理が解決する。
+            console_log!("site definitions are unavailable: {error}");
+            return Ok(());
+        }
+    };
+    if let Err(error) = runtime
+        .prepare_acquisition_identity(job_id, job, &settings)
+        .await
+    {
+        // 対象が解決できない行は identity なしで残る。ディスパッチャの取り込み
+        // 処理が、実行時と同じ恒久エラーとして終端する。
+        console_log!("job {job_id} has no effective site identity yet: {error}");
+    }
+    Ok(())
 }
 
 async fn process_envelope(
@@ -384,13 +657,225 @@ async fn process_discrete(
         )
         .await
     };
+    settle_outcome(
+        runtime,
+        push,
+        &job_id,
+        job,
+        &execution_token,
+        outcome,
+        message,
+        RetryDispatch::Provider,
+    )
+    .await
+}
+
+/// The preflight verdict of one assigned job.
+enum Preflight {
+    /// The stored identity still matches the effective YAML.
+    Ready,
+    /// The effective YAML changed: the row must be re-identified before it
+    /// can run under the current family.
+    Stale(crate::acquisition::AcquisitionIdentity),
+    /// The target lost its definition: the job cannot run at all.
+    Unresolvable {
+        status: JobLedgerStatus,
+        reason: String,
+    },
+}
+
+/// Reservation changes are deferred until the isolate's heavy permit is free.
+enum AcquisitionCompletion {
+    Retain,
+    Release,
+    Reclassify(crate::acquisition::AcquisitionIdentity),
+}
+
+/// Execute one assigned acquisition.
+///
+/// The assignment owns the job: the claim validates the lane, the dispatch
+/// token and the lease, and the stored site identity is authoritative.
+async fn execute_assigned(
+    runtime: &WorkerRuntime,
+    push: &PushHubClient,
+    envelope: &AcquisitionEnvelope,
+    message: &Message<serde_json::Value>,
+) -> Result<AcquisitionCompletion> {
+    // The effective YAML may have changed after the assignment was made. The
+    // stored identity is then stale and the job must not run under the old
+    // family: it is re-identified and the dispatcher assigns it again.
+    let preflight = match runtime.ledger.get_view(&envelope.job_id).await? {
+        Some(view) => match crate::acquisition::resolve_identity(runtime, &view.job.target).await {
+            Ok(fresh) => {
+                let stale = view.site_key.as_deref() != Some(fresh.site_key.as_str())
+                    || view.normalized_target.as_deref() != Some(fresh.normalized_target.as_str());
+                if stale {
+                    Preflight::Stale(fresh)
+                } else {
+                    Preflight::Ready
+                }
+            }
+            Err(error) => {
+                let status = match narou_rs::application::classify_failure(&error) {
+                    narou_rs::application::JobFailureClass::Retryable => {
+                        // A transient failure keeps the assignment: the
+                        // delivery is retried by the queue.
+                        let options = QueueRetryOptionsBuilder::new()
+                            .with_delay_seconds(CAPACITY_RETRY_DELAY_SECS)
+                            .build();
+                        message.retry_with_options(&options);
+                        return Ok(AcquisitionCompletion::Retain);
+                    }
+                    narou_rs::application::JobFailureClass::Permanent => JobLedgerStatus::Permanent,
+                    narou_rs::application::JobFailureClass::Blocked => JobLedgerStatus::Blocked,
+                };
+                Preflight::Unresolvable {
+                    status,
+                    reason: error.to_string(),
+                }
+            }
+        },
+        // Without a row the claim reports the unknown job.
+        None => Preflight::Ready,
+    };
+    if let Preflight::Stale(fresh) = preflight {
+        console_log!(
+            "acquisition job {} changed identity; re-assigning it",
+            envelope.job_id
+        );
+        // The outer consumer drops its permit before the fenced batch updates
+        // the identity and releases the reservation.
+        return Ok(AcquisitionCompletion::Reclassify(fresh));
+    }
+    let unresolvable = match preflight {
+        Preflight::Unresolvable { status, reason } => Some((status, reason)),
+        _ => None,
+    };
+    let claim = runtime.ledger.claim_acquisition(envelope).await?;
+    let (execution_token, checkpoint) = match claim {
+        JobClaim::Claimed {
+            execution_token,
+            checkpoint,
+        } => (execution_token, checkpoint),
+        JobClaim::AlreadyTerminal => {
+            // Exact terminal reservations can be released; stale or live
+            // owners remain protected by the token/status guards in SQL.
+            message.ack();
+            return Ok(AcquisitionCompletion::Release);
+        }
+        JobClaim::Unknown => {
+            let reason = format!("ledger has no row for queued job {}", envelope.job_id);
+            console_log!("rejecting envelope {}: {reason}", message.id());
+            runtime.ledger.record_rejected(&message.id(), &reason).await?;
+            notify_rejected(push, &message.id(), &reason).await;
+            message.ack();
+            return Ok(AcquisitionCompletion::Retain);
+        }
+        JobClaim::Busy => {
+            // The admission was lost to another owner. The job keeps its
+            // identity and returns to the dispatchable pool.
+            message.ack();
+            return Ok(AcquisitionCompletion::Release);
+        }
+    };
+    let Some(view) = runtime.ledger.get(&envelope.job_id).await? else {
+        message.ack();
+        return Ok(AcquisitionCompletion::Retain);
+    };
+    let job = view.job;
+    if let Some((status, reason)) = unresolvable {
+        // The target lost its definition: the job cannot run under any
+        // family. The claim already owns the row, so the durable error is
+        // written with the same token guard as any other terminal state.
+        console_log!("acquisition job {} cannot be resolved: {reason}", envelope.job_id);
+        let outcome = match status {
+            JobLedgerStatus::Permanent => JobOutcome::Permanent { reason },
+            _ => JobOutcome::Blocked { reason },
+        };
+        settle_outcome(
+            runtime,
+            push,
+            &envelope.job_id,
+            &job,
+            &execution_token,
+            outcome,
+            message,
+            RetryDispatch::Lane,
+        )
+        .await?;
+        return Ok(AcquisitionCompletion::Release);
+    }
+    let (update_record, record_error) = if job.kind == JobKind::Update {
+        match load_update_record(runtime, &job.target).await {
+            Ok(record) => (record, None),
+            Err(error) => (None, Some(error)),
+        }
+    } else { (None, None) };
+    let virtual_update = update_record.as_ref().is_some_and(narou_rs::virtual_novel::is_virtual_record);
+    let outcome = if virtual_update {
+        JobOutcome::Succeeded
+    } else if let Some(error) = record_error {
+        JobOutcome::from_error(error)
+    } else {
+        // Construction errors are execution failures too; do not bypass the
+        // bounded attempt settlement after a claim has been acquired.
+        match runtime.new_downloader(&job.target).await {
+            Ok(mut downloader) => execute_job(
+                &mut downloader,
+                &job,
+                crate::executor::JobExecution {
+                    job_id: &envelope.job_id, checkpoint: checkpoint.as_ref(),
+                    execution_token: &execution_token, update_record: update_record.as_ref(),
+                },
+                runtime,
+                push,
+            ).await,
+            Err(error) => JobOutcome::from_error(error),
+        }
+    };
+    settle_outcome(
+        runtime,
+        push,
+        &envelope.job_id,
+        &job,
+        &execution_token,
+        outcome,
+        message,
+        RetryDispatch::Lane,
+    )
+    .await?;
+    // A failed settlement retains the reservation for crash recovery.
+    Ok(AcquisitionCompletion::Release)
+}
+
+/// How a retryable outcome is delivered again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryDispatch {
+    /// The queue owns redelivery: ask the provider for a delayed retry.
+    Provider,
+    /// The lane dispatcher owns redelivery: the backoff is persisted and the
+    /// dispatcher sends a fresh assignment once the lane is free.
+    Lane,
+}
+
+/// Write the durable outcome of one execution and settle the message.
+async fn settle_outcome(
+    runtime: &WorkerRuntime,
+    push: &PushHubClient,
+    job_id: &JobId,
+    job: &JobPlan,
+    execution_token: &str,
+    outcome: JobOutcome,
+    message: &Message<serde_json::Value>,
+    retry: RetryDispatch,
+) -> Result<()> {
     match outcome {
         JobOutcome::Succeeded => {
             if let Err(error) = runtime
                 .ledger
                 .mark_terminal(
-                    &job_id,
-                    &execution_token,
+                    job_id,
+                    execution_token,
                     JobLedgerStatus::Succeeded,
                     None,
                 )
@@ -398,12 +883,12 @@ async fn process_discrete(
             {
                 // 実行中に行が tombstone されていれば queue_cancelled で閉じる
                 // (`queue_complete` は送らない)。
-                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                settle_user_cancel(runtime, push, job_id, execution_token, message, error).await?;
                 return Ok(());
             }
             broadcast_terminal_events(
                 push,
-                &job_id,
+                job_id,
                 &[event("queue_complete", json!(job_id.as_str()))],
                 table_reload_after_job(runtime).await,
             )
@@ -416,19 +901,19 @@ async fn process_discrete(
             if let Err(error) = runtime
                 .ledger
                 .mark_terminal(
-                    &job_id,
-                    &execution_token,
+                    job_id,
+                    execution_token,
                     JobLedgerStatus::Partial,
                     Some(&reason),
                 )
                 .await
             {
-                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                settle_user_cancel(runtime, push, job_id, execution_token, message, error).await?;
                 return Ok(());
             }
             broadcast_terminal_events(
                 push,
-                &job_id,
+                job_id,
                 &[event(
                     "queue_partial",
                     json!({ "job_id": job_id.as_str(), "reason": reason }),
@@ -445,16 +930,16 @@ async fn process_discrete(
             console_log!("job {job_id} yielded for continuation: {reason}");
             if let Err(error) = runtime
                 .ledger
-                .yield_for_continuation(&job_id, &execution_token, &checkpoint)
+                .yield_for_continuation(job_id, execution_token, &checkpoint)
                 .await
             {
                 // 中断されたジョブを再投入しない (行は terminal 済み)。
-                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                settle_user_cancel(runtime, push, job_id, execution_token, message, error).await?;
                 return Ok(());
             }
             broadcast_terminal_events(
                 push,
-                &job_id,
+                job_id,
                 &[
                     echo(&reason, "stdout"),
                     event(
@@ -467,54 +952,56 @@ async fn process_discrete(
             .await;
             // Preserve the yielded row's checkpoint, attempts, and cancellation
             // tombstone even if the queue was cleared during notification.
-            runtime.send_existing_job(&job_id, job.kind.as_str()).await?;
+            if retry == RetryDispatch::Provider {
+                runtime.send_existing_job(job_id, job.kind.as_str()).await?;
+            }
             message.ack();
         }
         JobOutcome::Blocked { reason } => {
             if let Err(error) = runtime
                 .ledger
                 .mark_terminal(
-                    &job_id,
-                    &execution_token,
+                    job_id,
+                    execution_token,
                     JobLedgerStatus::Blocked,
                     Some(&reason),
                 )
                 .await
             {
                 // 実行中にキャンセルされたなら queue_failed は出さない。
-                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                settle_user_cancel(runtime, push, job_id, execution_token, message, error).await?;
                 return Ok(());
             }
             console_log!("job {job_id} blocked: {reason}");
-            broadcast_failure(runtime, push, &job_id, &reason).await;
+            broadcast_failure(runtime, push, job_id, &reason).await;
             message.ack();
         }
         JobOutcome::Permanent { reason } => {
             if let Err(error) = runtime
                 .ledger
                 .mark_terminal(
-                    &job_id,
-                    &execution_token,
+                    job_id,
+                    execution_token,
                     JobLedgerStatus::Permanent,
                     Some(&reason),
                 )
                 .await
             {
                 // 実行中にキャンセルされたなら queue_failed は出さない。
-                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                settle_user_cancel(runtime, push, job_id, execution_token, message, error).await?;
                 return Ok(());
             }
             console_log!("job {job_id} failed permanently: {reason}");
-            broadcast_failure(runtime, push, &job_id, &reason).await;
+            broadcast_failure(runtime, push, job_id, &reason).await;
             message.ack();
         }
         JobOutcome::Retryable { reason } => {
-            match settle_retryable(runtime, &job_id, &execution_token, &reason).await {
+            match settle_retryable(runtime, job_id, execution_token, &reason).await {
                 Err(error) => {
                     // `record_attempt` / 二次 `mark_terminal` が token 失効で
                     // 失敗 = 実行中にキャンセルされた。queue_retry /
                     // queue_failed は送らず queue_cancelled で閉じる。
-                    settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                    settle_user_cancel(runtime, push, job_id, execution_token, message, error).await?;
                     return Ok(());
                 }
                 Ok(RetryDisposition::Rescheduled {
@@ -525,12 +1012,9 @@ async fn process_discrete(
                     // Cloudflare Queues の遅延は秒整数なのでイベント値を
                     // u32 にクランプして渡す (スケジュール値は非負)。
                     let delay = backoff_secs.min(i64::from(u32::MAX)) as u32;
-                    let options = QueueRetryOptionsBuilder::new()
-                        .with_delay_seconds(delay)
-                        .build();
                     broadcast_terminal_events(
                         push,
-                        &job_id,
+                        job_id,
                         &[event(
                             "queue_retry",
                             json!({
@@ -546,10 +1030,23 @@ async fn process_discrete(
                         table_reload_after_job(runtime).await,
                     )
                     .await;
-                    message.retry_with_options(&options);
+                    match retry {
+                        RetryDispatch::Provider => {
+                            let options = QueueRetryOptionsBuilder::new()
+                                .with_delay_seconds(delay)
+                                .build();
+                            message.retry_with_options(&options);
+                        }
+                        RetryDispatch::Lane => {
+                            // The persisted backoff owns the schedule: the
+                            // dispatcher sends a fresh assignment once it
+                            // elapsed and the lane is free again.
+                            message.ack();
+                        }
+                    }
                 }
                 Ok(RetryDisposition::Exhausted) => {
-                    broadcast_failure(runtime, push, &job_id, &reason).await;
+                    broadcast_failure(runtime, push, job_id, &reason).await;
                     message.ack();
                 }
             }
@@ -659,6 +1156,7 @@ pub(crate) async fn webui_debug_mode(runtime: &WorkerRuntime) -> bool {
 }
 
 /// `queue.max-retries` の設定値をクランプする Cloudflare 側の上限。
+///
 /// `wrangler.toml` の `[[queues.consumers]] max_retries = 3` はデプロイ時の
 /// 値で、Cloudflare は explicit な `retry_with_options` も同じ回数までしか
 /// 再配信しない。設定値をこれより大きくしても 3 回目で DLQ に落ちて台帳が
@@ -768,4 +1266,3 @@ async fn settle_retryable(
 fn worker_error(error: impl std::fmt::Display) -> NarouError {
     NarouError::Platform(format!("Worker runtime error: {error}"))
 }
-

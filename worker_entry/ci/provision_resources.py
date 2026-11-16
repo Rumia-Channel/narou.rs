@@ -163,9 +163,17 @@ def main() -> None:
     dead_letter_queue = f"{queue_name}-dlq"
     convert_queue_name = f"{base_queue}-convert-{target}"
     convert_dead_letter_queue = f"{convert_queue_name}-dlq"
+    acquisition_queues = [
+        f"{base_queue}-acquire-{number}-{target}" for number in range(1, 5)
+    ]
+    acquisition_dlqs = [f"{name}-dlq" for name in acquisition_queues]
     if any(
         len(name) > MAX_NAME_LENGTH
-        for name in (database_name, queue_name, dead_letter_queue, convert_queue_name, convert_dead_letter_queue)
+        for name in (
+            database_name, queue_name, dead_letter_queue,
+            convert_queue_name, convert_dead_letter_queue,
+            *acquisition_queues, *acquisition_dlqs,
+        )
     ):
         fail("derived D1 or Queue name exceeds 63 characters")
 
@@ -174,6 +182,9 @@ def main() -> None:
     ensure_queue(dead_letter_queue)
     ensure_queue(convert_queue_name)
     ensure_queue(convert_dead_letter_queue)
+    # 旧取得キューは drain-only の入口として残し、新しい取得キューを追加する。
+    for name in (*acquisition_queues, *acquisition_dlqs):
+        ensure_queue(name)
     write_outputs(
         {
             "database_name": database_name,
@@ -182,6 +193,14 @@ def main() -> None:
             "dead_letter_queue": dead_letter_queue,
             "convert_queue_name": convert_queue_name,
             "convert_dead_letter_queue": convert_dead_letter_queue,
+            **{
+                f"acquire_queue_name_{number}": name
+                for number, name in enumerate(acquisition_queues, start=1)
+            },
+            **{
+                f"acquire_dead_letter_queue_{number}": name
+                for number, name in enumerate(acquisition_dlqs, start=1)
+            },
         }
     )
 

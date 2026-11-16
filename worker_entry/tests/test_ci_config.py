@@ -30,6 +30,14 @@ class RenderConfigTests(unittest.TestCase):
             "NAROU_JOB_DLQ": "audit-develop-dlq",
             "NAROU_CONVERT_QUEUE": "audit-convert-develop",
             "NAROU_CONVERT_DLQ": "audit-convert-develop-dlq",
+            **{
+                f"NAROU_ACQUIRE_QUEUE_{number}": f"audit-acquire-{number}-develop"
+                for number in range(1, 5)
+            },
+            **{
+                f"NAROU_ACQUIRE_DLQ_{number}": f"audit-acquire-{number}-develop-dlq"
+                for number in range(1, 5)
+            },
             "NAROU_S3_ENDPOINT": "https://s3.example.com",
             "NAROU_S3_REGION": "us-east-1",
             "NAROU_S3_BUCKET": "audit-bucket",

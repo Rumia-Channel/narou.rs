@@ -24,6 +24,7 @@ use narou_rs::application::{
 };
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{Clock, PlatformFuture};
+use narou_rs::application::acquisition_lanes::{self, AcquisitionEnvelope, LaneAssignment};
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
 use worker::{D1PreparedStatement, D1Result};
@@ -112,9 +113,22 @@ impl Clone for D1JobLedger {
     }
 }
 
+/// Admission must not decode unrelated (and potentially damaged) novel fields.
+#[derive(Deserialize)]
+pub(crate) struct AcquisitionNovel {
+    pub id: i64,
+    pub ncode: Option<String>,
+    pub toc_url: String,
+}
+
 impl D1JobLedger {
     pub fn new(db: DbHandle, clock: Arc<dyn Clock>) -> Self {
         Self { db, clock }
+    }
+
+    pub(crate) async fn acquisition_novel(&self, target: &str) -> Result<Option<AcquisitionNovel>> {
+        self.prepare_core(acquisition_lanes::lookup_novel(target))?
+            .first::<AcquisitionNovel>(None).await.map_err(worker_error)
     }
 
     fn prepare(&self, sql: &str, values: Vec<BindValue>) -> Result<D1PreparedStatement> {
@@ -146,9 +160,18 @@ impl D1JobLedger {
     async fn select_row(&self, job_id: &str) -> Result<Option<JobRow>> {
         let statement = self.prepare(
             "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
-                    checkpoint_json
-             FROM worker_jobs WHERE job_id = ? LIMIT 1",
-            vec![BindValue::Text(job_id.to_string())],
+                    checkpoint_json, site_key, normalized_target,
+                    CASE WHEN status NOT IN ('pending','retryable') OR kind NOT IN ('download','update','author_check') THEN NULL
+                      WHEN EXISTS (SELECT 1 FROM worker_acquisition_lanes WHERE job_id = worker_jobs.job_id)
+                        THEN CASE WHEN wait_reason = 'capacity' THEN 'capacity' ELSE 'dispatch' END
+                      WHEN EXISTS (SELECT 1 FROM worker_acquisition_lanes WHERE site_key = worker_jobs.site_key)
+                        OR EXISTS (SELECT 1 FROM worker_jobs AS owner WHERE owner.job_id != worker_jobs.job_id
+                          AND owner.kind IN ('download','update','author_check')
+                          AND (owner.site_key IS NULL OR owner.site_key = worker_jobs.site_key) AND owner.lease_until > ?2
+                          AND (owner.status = 'running' OR (owner.status = 'permanent' AND owner.execution_token IS NOT NULL)))
+                        THEN 'site' ELSE 'lane' END AS wait_reason
+             FROM worker_jobs WHERE job_id = ?1 LIMIT 1",
+            vec![BindValue::Text(job_id.to_string()), BindValue::Text(self.now_rfc3339())],
         )?;
         let row = statement.first::<JobRow>(None).await.map_err(worker_error)?;
         Ok(row)
@@ -394,7 +417,9 @@ impl D1JobLedger {
         let Some(row) = self.select_row(job_id.as_str()).await? else {
             return Ok(None);
         };
-        row.into_view().map(Some)
+        let mut view = row.into_view()?;
+        view.acquisition_lane = self.assignment(job_id).await?.map(|assignment| assignment.lane);
+        Ok(Some(view))
     }
 
     // ------------------------------------------------------------------
@@ -434,10 +459,14 @@ impl D1JobLedger {
         // counts only the ledger rows; read it in the same atomic batch.
         #[derive(Deserialize)]
         struct Count { n: usize }
-        let results = self.db.batch(vec![statement, self.db.prepare("SELECT changes() AS n")])
+        let results = self.db.batch(vec![
+            self.prepare_core(acquisition_lanes::release_pending(None))?,
+            statement,
+            self.db.prepare("SELECT changes() AS n"),
+        ])
             .await.map_err(worker_error)?;
         ensure_batch_success(&results)?;
-        results.get(1).ok_or_else(|| worker_error("missing cancellation count"))?
+        results.get(2).ok_or_else(|| worker_error("missing cancellation count"))?
             .results::<Count>().map_err(worker_error)?
             .into_iter().next().map(|row| row.n)
             .ok_or_else(|| worker_error("missing cancellation count"))
@@ -459,7 +488,12 @@ impl D1JobLedger {
                 BindValue::Text(job_id.to_string()),
             ],
         )?;
-        Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
+        let results = self.db.batch(vec![
+            self.prepare_core(acquisition_lanes::release_pending(Some(job_id)))?,
+            statement,
+        ]).await.map_err(worker_error)?;
+        ensure_batch_success(&results)?;
+        Ok(changed_rows(results.get(1).ok_or_else(|| worker_error("missing cancellation result"))?)? > 0)
     }
 
     /// Settle a just-enqueued plan as skipped (`partial` + reason) when the
@@ -595,7 +629,7 @@ impl D1JobLedger {
     }
 
     pub async fn waiting_jobs(&self) -> Result<Vec<QueuedJobRoute>> {
-        let statement = self.prepare_core(narou_rs::application::worker_ledger::select_waiting(
+        let statement = self.prepare_core(narou_rs::application::worker_ledger::select_waiting_converts(
             &self.now_rfc3339(), 8,
         ))?;
         statement.all().await.map_err(worker_error)?.results().map_err(worker_error)
@@ -613,7 +647,14 @@ impl D1JobLedger {
     /// [`narou_rs::application::worker_ledger::select_stuck`]; `limit` caps
     /// how many rows one call returns (one cron page).
     pub async fn stuck_jobs(&self, stuck_before: &str, limit: usize) -> Result<Vec<StuckJob>> {
-        let statement = narou_rs::application::worker_ledger::select_stuck(stuck_before, limit);
+        let mut statement = narou_rs::application::worker_ledger::select_stuck(
+            stuck_before, limit.saturating_add(usize::from(acquisition_lanes::LANE_COUNT)),
+        );
+        statement.sql = format!(
+            "SELECT stuck.* FROM ({}) AS stuck WHERE NOT EXISTS \
+             (SELECT 1 FROM worker_acquisition_lanes WHERE job_id = stuck.job_id) LIMIT {limit}",
+            statement.sql,
+        );
         let statement = self.prepare(
             &statement.sql,
             statement.binds.into_iter().map(BindValue::Text).collect(),
@@ -633,11 +674,12 @@ impl D1JobLedger {
     /// envelope. `false` means a live delivery or a concurrent reaper tick
     /// already moved the row, and no duplicate must be produced.
     pub async fn touch_for_reenqueue(&self, job_id: &str, stuck_before: &str) -> Result<bool> {
-        let statement = narou_rs::application::worker_ledger::mark_reenqueue(
+        let mut statement = narou_rs::application::worker_ledger::mark_reenqueue(
             &self.now_rfc3339(),
             job_id,
             stuck_before,
         );
+        statement.sql.push_str(" AND NOT EXISTS (SELECT 1 FROM worker_acquisition_lanes WHERE job_id = worker_jobs.job_id)");
         let statement = self.prepare(
             &statement.sql,
             statement.binds.into_iter().map(BindValue::Text).collect(),
@@ -656,18 +698,151 @@ impl D1JobLedger {
         min_attempts: u32,
         reason: &str,
     ) -> Result<bool> {
-        let statement = narou_rs::application::worker_ledger::finalize_stuck(
+        let mut statement = narou_rs::application::worker_ledger::finalize_stuck(
             reason,
             &self.now_rfc3339(),
             job_id,
             stuck_before,
             min_attempts,
         );
+        statement.sql.push_str(" AND NOT EXISTS (SELECT 1 FROM worker_acquisition_lanes WHERE job_id = worker_jobs.job_id)");
         let statement = self.prepare(
             &statement.sql,
             statement.binds.into_iter().map(BindValue::Text).collect(),
         )?;
         Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
+    }
+}
+
+impl D1JobLedger {
+    pub async fn set_acquisition_identity(&self, job_id: &JobId, normalized_target: &str, site_key: &str) -> Result<()> {
+        if normalized_target.is_empty() || site_key.is_empty() {
+            return Err(NarouError::Platform("acquisition identity must not be empty".into()));
+        }
+        self.prepare_core(acquisition_lanes::set_identity(
+            &self.now_rfc3339(), job_id.as_str(), normalized_target, site_key,
+        ))?.run().await.map_err(worker_error)?;
+        Ok(())
+    }
+
+    pub async fn reclassify_acquisition(&self, envelope: &AcquisitionEnvelope, normalized_target: &str, site_key: &str) -> Result<()> {
+        if normalized_target.is_empty() || site_key.is_empty() {
+            return Err(NarouError::Platform("acquisition identity must not be empty".into()));
+        }
+        let results = self.db.batch(vec![
+            self.prepare_core(acquisition_lanes::reclassify(&self.now_rfc3339(), envelope, normalized_target, site_key))?,
+            self.prepare_core(acquisition_lanes::release(envelope))?,
+        ]).await.map_err(worker_error)?;
+        ensure_batch_success(&results)
+    }
+
+    pub async fn unresolved_acquisitions(&self, limit: usize) -> Result<Vec<QueuedJob>> {
+        let statement = self.prepare(
+            &format!("SELECT job_id,kind,target,options,status,attempts,last_error,created_at,updated_at,checkpoint_json,site_key,normalized_target,wait_reason \
+                FROM worker_jobs WHERE kind IN ('download','update','author_check') \
+                  AND status IN ('pending','retryable') AND (site_key IS NULL OR normalized_target IS NULL) \
+                  AND NOT EXISTS (SELECT 1 FROM worker_acquisition_lanes WHERE job_id = worker_jobs.job_id) \
+                ORDER BY created_at,job_id LIMIT {}", limit.min(ENQUEUE_CHUNK)),
+            Vec::new(),
+        )?;
+        let rows: Vec<JobRow> = statement.all().await.map_err(worker_error)?.results().map_err(worker_error)?;
+        rows.into_iter().map(|row| {
+            let view = row.into_view()?.try_into_typed()?;
+            Ok(QueuedJob { job_id: view.job_id, job: view.job })
+        }).collect()
+    }
+
+    pub async fn settle_acquisition_resolution_error(&self, job_id: &JobId, status: JobLedgerStatus, reason: &str) -> Result<()> {
+        if !matches!(status, JobLedgerStatus::Blocked | JobLedgerStatus::Permanent) {
+            return Err(NarouError::Platform("invalid acquisition resolution outcome".into()));
+        }
+        self.prepare(
+            "UPDATE worker_jobs SET status = ?1,last_error = ?2,updated_at = ?3,execution_token = NULL, \
+             lease_until = NULL,checkpoint_json = NULL,admission_waiting = 0,wait_reason = NULL \
+             WHERE job_id = ?4 AND status IN ('pending','retryable') \
+               AND NOT EXISTS (SELECT 1 FROM worker_acquisition_lanes WHERE job_id = ?4)",
+            vec![BindValue::Text(status_str(status).into()), BindValue::Text(reason.into()),
+                BindValue::Text(self.now_rfc3339()), BindValue::Text(job_id.as_str().into())],
+        )?.run().await.map_err(worker_error)?;
+        Ok(())
+    }
+
+    pub async fn reserve_acquisition_lane(&self) -> Result<Option<LaneAssignment>> {
+        let now = self.now_rfc3339();
+        let token = Self::new_execution_token();
+        let reserve = self.prepare_core(acquisition_lanes::reserve(&now, &self.lease_until_rfc3339(), &token))?;
+        let mark = self.prepare_core(acquisition_lanes::mark_reserved(&now, &token))?;
+        let select = self.prepare(
+            "SELECT lane,job_id,site_key,dispatch_token,lease_until FROM worker_acquisition_lanes WHERE dispatch_token = ?",
+            vec![BindValue::Text(token)],
+        )?;
+        let results = self.db.batch(vec![reserve, mark, select]).await.map_err(worker_error)?;
+        ensure_batch_success(&results)?;
+        results.get(2).ok_or_else(|| worker_error("missing lane reservation result"))?
+            .results::<LaneAssignment>().map_err(worker_error).map(|rows| rows.into_iter().next())
+    }
+
+    pub async fn assignment(&self, job_id: &JobId) -> Result<Option<LaneAssignment>> {
+        self.prepare(
+            "SELECT lane,job_id,site_key,dispatch_token,lease_until FROM worker_acquisition_lanes WHERE job_id = ?",
+            vec![BindValue::Text(job_id.as_str().into())],
+        )?.first(None).await.map_err(worker_error)
+    }
+
+    pub async fn claim_acquisition(&self, envelope: &AcquisitionEnvelope) -> Result<JobClaim> {
+        if !envelope.is_valid() { return Ok(JobClaim::AlreadyTerminal); }
+        let Some(row) = self.select_row(envelope.job_id.as_str()).await? else {
+            return Ok(JobClaim::Unknown);
+        };
+        if JobLedgerStatus::parse(&row.status)?.is_terminal() {
+            return Ok(JobClaim::AlreadyTerminal);
+        }
+        let Some(assignment) = self.assignment(&envelope.job_id).await? else {
+            return Ok(JobClaim::AlreadyTerminal);
+        };
+        let now = self.now_rfc3339();
+        if assignment.lane != envelope.lane || assignment.dispatch_token != envelope.dispatch_token
+            || assignment.lease_until.as_str() <= now.as_str()
+        {
+            return Ok(JobClaim::AlreadyTerminal);
+        }
+        if row.status == "running" { return Ok(JobClaim::AlreadyTerminal); }
+        let target = row.normalized_target.as_deref().ok_or_else(|| worker_error("assigned acquisition has no target identity"))?;
+        let site = row.site_key.as_deref().ok_or_else(|| worker_error("assigned acquisition has no site identity"))?;
+        let lease = self.lease_until_rfc3339();
+        let claim = self.prepare_core(acquisition_lanes::claim(&now, &lease, envelope, target, site))?;
+        let renew = self.prepare_core(acquisition_lanes::renew_claim(&lease, envelope))?;
+        let results = self.db.batch(vec![claim, renew]).await.map_err(worker_error)?;
+        ensure_batch_success(&results)?;
+        if changed_rows(results.first().ok_or_else(|| worker_error("missing assigned claim result"))?)? == 0 {
+            return Ok(JobClaim::Busy);
+        }
+        let row = self.select_row(envelope.job_id.as_str()).await?
+            .ok_or_else(|| worker_error("claimed acquisition disappeared"))?;
+        Self::claimed_from_row(&row, envelope.dispatch_token.clone())
+    }
+
+    pub async fn release_acquisition_lane(&self, envelope: &AcquisitionEnvelope) -> Result<()> {
+        let results = self.db.batch(vec![
+            self.prepare_core(acquisition_lanes::finish_job(&self.now_rfc3339(), envelope))?,
+            self.prepare_core(acquisition_lanes::release(envelope))?,
+        ]).await.map_err(worker_error)?;
+        ensure_batch_success(&results)
+    }
+
+    pub async fn recover_acquisition_lanes(&self) -> Result<()> {
+        let now = self.now_rfc3339();
+        let results = self.db.batch(vec![
+            self.prepare_core(acquisition_lanes::recover_jobs(&now))?,
+            self.prepare_core(acquisition_lanes::recover_lanes(&now))?,
+        ]).await.map_err(worker_error)?;
+        ensure_batch_success(&results)
+    }
+
+    pub async fn park_acquisition_capacity(&self, envelope: &AcquisitionEnvelope) -> Result<()> {
+        self.prepare_core(acquisition_lanes::park_capacity(&self.now_rfc3339(), envelope))?
+            .run().await.map_err(worker_error)?;
+        Ok(())
     }
 }
 
@@ -721,14 +896,14 @@ impl JobQueue for D1JobLedger {
             // `running` (native `job_conflicts_with_running` parity — here
             // lane-blind because every consumer runs jobs concurrently).
             if status != JobLedgerStatus::Running {
-                let statement = self.prepare_core(narou_rs::application::worker_ledger::claim_fresh(
+                let statement = self.prepare_core(acquisition_lanes::guard_reservations(narou_rs::application::worker_ledger::claim_fresh(
                     &now,
                     &self.lease_until_rfc3339(),
                     &execution_token,
                     job_id.as_str(),
                     normalized_target,
                     site_key,
-                ))?;
+                ), job_id.as_str(), normalized_target))?;
                 if changed_rows(&statement.run().await.map_err(worker_error)?)? > 0 {
                     let row = self.select_row(job_id.as_str()).await?.ok_or_else(|| {
                         NarouError::Platform(format!("claimed job {job_id} disappeared"))
@@ -742,14 +917,14 @@ impl JobQueue for D1JobLedger {
             // lost invocation). The same exclusion applies so a stale
             // redelivery cannot resurrect a novel that another executor is
             // actively working on.
-            let statement = self.prepare_core(narou_rs::application::worker_ledger::claim_reclaim(
+            let statement = self.prepare_core(acquisition_lanes::guard_reservations(narou_rs::application::worker_ledger::claim_reclaim(
                 &now,
                 &self.lease_until_rfc3339(),
                 &execution_token,
                 job_id.as_str(),
                 normalized_target,
                 site_key,
-            ))?;
+            ), job_id.as_str(), normalized_target))?;
             if changed_rows(&statement.run().await.map_err(worker_error)?)? > 0 {
                 let row = self.select_row(job_id.as_str()).await?.ok_or_else(|| {
                     NarouError::Platform(format!("reclaimed job {job_id} disappeared"))
@@ -1150,6 +1325,12 @@ struct JobRow {
     /// it unset.
     #[serde(default)]
     dedupe_key: Option<String>,
+    #[serde(default)]
+    site_key: Option<String>,
+    #[serde(default)]
+    normalized_target: Option<String>,
+    #[serde(default)]
+    wait_reason: Option<String>,
 }
 
 impl JobRow {
@@ -1187,6 +1368,10 @@ impl JobRow {
             last_error: self.last_error,
             created_at,
             updated_at,
+            site_key: self.site_key,
+            normalized_target: self.normalized_target,
+            waiting_reason: self.wait_reason,
+            acquisition_lane: None,
         })
     }
 }
@@ -1207,6 +1392,14 @@ pub struct JobView {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acquisition_lane: Option<u8>,
 }
 
 /// [`JobPlan`] with the raw-kind escape hatch (see [`JobView`]).
@@ -1289,7 +1482,6 @@ pub struct QueuedJobRoute {
 #[derive(Debug, Deserialize)]
 pub struct StuckJob {
     pub job_id: String,
-    pub kind: String,
     pub recovery_attempts: i64,
     pub status: String,
     pub attempts: i64,

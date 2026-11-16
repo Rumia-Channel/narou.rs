@@ -14,6 +14,7 @@ mod hidden;
 mod tag_sequence;
 mod virtual_novels;
 mod composition;
+mod acquisition;
 mod content_store;
 mod content_migration;
 mod convert;
@@ -62,8 +63,20 @@ use crate::d1_repository::D1SettingsStore;
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
-    if worker_role::is_reader(&env)? && !worker_role::owns_request(&path, req.method()) {
-        return env.service(composition::WRITER_SERVICE_BINDING)?.fetch_request(req).await;
+    match worker_role::role(&env)? {
+        worker_role::WorkerRole::Writer => {}
+        worker_role::WorkerRole::Reader => {
+            if !worker_role::owns_request(&path, req.method()) {
+                return env.service(composition::WRITER_SERVICE_BINDING)?.fetch_request(req).await;
+            }
+        }
+        worker_role::WorkerRole::Acquisition => {
+            // 取得レーンは health だけ自分で答え、他の要求は writer へ転送する
+            // (レーンは重い処理を一切持たない)。
+            if !matches!(path.as_str(), "/health/live" | "/health/ready") {
+                return env.service(composition::WRITER_SERVICE_BINDING)?.fetch_request(req).await;
+            }
+        }
     }
     // native (axum) は GET ルートに HEAD も通す。Worker の各ハンドラは
     // GET/POST 前提で 405 を返すので、HEAD は GET として処理し、応答から
@@ -1665,10 +1678,14 @@ async fn api_auth_login(mut req: Request, env: Env) -> Result<Response> {
 
 #[event(scheduled)]
 pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    match worker_role::is_reader(&env) {
-        Ok(false) => {}
-        Ok(true) => {
+    match worker_role::role(&env) {
+        Ok(worker_role::WorkerRole::Writer) => {}
+        Ok(worker_role::WorkerRole::Reader) => {
             console_error!("reader Worker does not run scheduled jobs");
+            return;
+        }
+        Ok(worker_role::WorkerRole::Acquisition) => {
+            console_error!("acquisition lane Worker does not run scheduled jobs");
             return;
         }
         Err(error) => {
@@ -1690,10 +1707,21 @@ pub async fn queue(
     env: Env,
     _ctx: Context,
 ) -> Result<()> {
-    if worker_role::is_reader(&env)? {
-        return Err(Error::RustError("reader Worker does not consume queues".into()));
+    match worker_role::role(&env)? {
+        worker_role::WorkerRole::Reader => {
+            Err(Error::RustError("reader Worker does not consume queues".into()))
+        }
+        worker_role::WorkerRole::Acquisition => {
+            // 取得レーンは自分のレーンだけを実行する。
+            let lane = worker_role::acquisition_lane(&env)?.ok_or_else(|| {
+                Error::RustError("acquisition role has no lane index".into())
+            })?;
+            consumer::process_acquisition_batch(message_batch, &env, lane)
+                .await
+                .map_err(|error| Error::RustError(error.to_string()))
+        }
+        worker_role::WorkerRole::Writer => consumer::process_batch(message_batch, &env)
+            .await
+            .map_err(|error| Error::RustError(error.to_string())),
     }
-    consumer::process_batch(message_batch, &env)
-        .await
-        .map_err(|error| Error::RustError(error.to_string()))
 }

@@ -6,9 +6,10 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { renderAcquisitionTopology } from './acquisition_topology.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
@@ -30,8 +31,9 @@ for (const key of Object.keys(environment)) {
 }
 mkdirSync(join(root, '.wrangler'), { recursive: true });
 const work = mkdtempSync(join(root, '.wrangler', 'runtime-recovery-'));
-const config = join(work, 'wrangler.toml');
+let config = join(work, 'wrangler.toml');
 const persist = join(work, 'state');
+let topology;
 let child, port, inspectorPort, logs = '', processError, fixtureError;
 let allowedJobs = null; // null allows all real deliveries; a Set selects job IDs.
 const deliveryGates = new Set();
@@ -166,7 +168,8 @@ async function start() {
   assert(!child);
   processError = undefined;
   logs += '\n--- starting preserved local state ---\n';
-  child = spawn(npx, [...wrangler, 'dev', '--local', '--test-scheduled', '--config', config,
+  child = spawn(npx, [...wrangler, 'dev', '--local', '--test-scheduled',
+    ...topology.configs.flatMap((path) => ['--config', path]),
     '--persist-to', persist, '--ip', '127.0.0.1', '--port', String(port),
     '--inspector-port', String(inspectorPort)], {
     cwd: root, shell: windows, detached: !windows, env: environment, stdio: ['ignore', 'pipe', 'pipe'],
@@ -250,6 +253,8 @@ function assertRunning(row, recoveries, checkpoint = null) {
 async function expireAndRestart(id, expected) {
   // The ONLY recovery fault injection is moving this local lease into the past.
   // Status, attempts, recovery_attempts, tokens and checkpoints stay untouched.
+  // The lane reservation carries its own lease: a real crash loses both, so
+  // both are expired (an early steal would not be a real crash).
   const [before] = offlineSql(`SELECT * FROM worker_jobs WHERE job_id=${quote(id)};`);
   assert.equal(before.status, expected.status);
   assert.equal(before.execution_token, expected.execution_token);
@@ -257,6 +262,7 @@ async function expireAndRestart(id, expected) {
   assert.equal(before.attempts, expected.attempts);
   assert.equal(before.checkpoint_json, expected.checkpoint_json);
   offlineSql(`UPDATE worker_jobs SET lease_until=${quote(EXPIRED)} WHERE job_id=${quote(id)};`);
+  offlineSql(`UPDATE worker_acquisition_lanes SET lease_until=${quote(EXPIRED)} WHERE job_id=${quote(id)};`);
   const [after] = offlineSql(`SELECT * FROM worker_jobs WHERE job_id=${quote(id)};`);
   assert.deepEqual(after, { ...before, lease_until: EXPIRED }, 'expiration changes no recovery state');
   releaseDeliveries([]);
@@ -313,13 +319,15 @@ try {
   sourceV6.listen(sourcePort, '::1'); await once(sourceV6, 'listening');
   port = await unusedPort();
   inspectorPort = await unusedPort();
-  const toml = readFileSync(join(root, 'wrangler.toml'), 'utf8').replace(/\[build\][^\[]*/, '')
-    .replace(/^main = .*$/m, `main = ${JSON.stringify(join(root, 'tests/runtime_recovery_worker.mjs').replaceAll('\\', '/'))}`)
-    .replace(/^directory = "public"$/m, `directory = ${JSON.stringify(join(root, 'public').replaceAll('\\', '/'))}`)
-    .replace(/^migrations_dir = "migrations"$/m, `migrations_dir = ${JSON.stringify(join(root, 'migrations').replaceAll('\\', '/'))}`)
-    .replace('[vars]', `[vars]\nRECOVERY_FIXTURE_ORIGIN = "http://127.0.0.1:${sourcePort}"`)
-    .replace('http://127.0.0.1:9000', `http://127.0.0.1:${sourcePort}`);
-  writeFileSync(config, toml);
+  // 取得は writer 1 本 + 取得専用 4 本で実行する (writer は実行しない)。
+  topology = renderAcquisitionTopology({
+    work,
+    target: 'local',
+    main: join(root, 'tests/runtime_recovery_worker.mjs').replaceAll('\\', '/'),
+    s3Endpoint: `http://127.0.0.1:${sourcePort}`,
+    vars: { RECOVERY_FIXTURE_ORIGIN: `http://127.0.0.1:${sourcePort}` },
+  });
+  config = topology.writerPath;
   writeFileSync(join(work, '.dev.vars'), `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${Buffer.alloc(32, 7).toString('base64')}\nS3_ACCESS_KEY_ID=local-test-key\nS3_SECRET_ACCESS_KEY=local-test-secret\n`);
   localWrangler(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
   offlineSql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','\"d1\"','d1'),('inv','asset_backend','\"d1\"','d1'),('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
@@ -370,8 +378,10 @@ try {
   assert.deepEqual(await job(crashId), owner);
   const successorId = await enqueue(target('successor'));
   releaseDeliveries([successorId]);
-  await until(() => deliveries.includes(successorId), 'same-site admission delivery');
   const waiting = await job(successorId);
+  assert(!(await snapshot()).lanes.some(lane => lane.job_id === successorId),
+    'same-site work must wait before lane delivery, not consume a lane');
+  assert(!deliveries.includes(successorId), 'same-site waiting must not burn a physical delivery');
   assert.equal(waiting.status, 'pending', JSON.stringify(waiting));
   assert.equal(waiting.admission_waiting, 1, 'same-site work must durably wait, not retry');
   assert.equal(waiting.site_key, site);
@@ -391,7 +401,7 @@ try {
   assert.equal(exhausted.status, 'permanent', JSON.stringify(exhausted));
   assert.equal(exhausted.attempts, 0);
   assert.equal(exhausted.recovery_attempts, MAX_RECOVERIES);
-  assert.match(exhausted.last_error, /recovery exhausted after 0 business failures and 3 lost deliveries\/executions/);
+  assert.match(exhausted.last_error, /acquisition execution recovery exhausted without checkpoint progress/);
   assert.equal(exhausted.lease_until, null);
   assert.equal(exhausted.execution_token, null);
   assert.equal(exhausted.checkpoint_json, null);

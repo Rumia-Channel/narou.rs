@@ -332,7 +332,7 @@ pub trait NovelRepository: PlatformService {
 Production binding setup keeps credentials out of the repository. `worker_entry/wrangler.toml` declares the `DB` binding and `migrations_dir`; set the remote D1 `database_id` in an environment-specific Wrangler configuration before deployment. Object payloads live in the D1 `objects`/`object_chunks` tables (migration 0008), so no external bucket is required. Define `NAROU_ADMIN_TOKEN` as a secret.
 
 `worker_entry/` は fetch / scheduled / queue の3エントリだけを持つ。`composition.rs` が唯一のサービス構成点であり、Worker固有型を application/platform coreへ持ち込まない。
-Queue payload は `WorkerJobEnvelope { version: 2, job_id, job }` とし、未知 version・不正payloadはledgerへ記録して安全にackする。D1はproduction bindingとして構成し、Download/Updateはbounded execution + checkpoint resume、native-only jobはblockedとして処理する。
+変換・旧取得 Queue の入口は v2 の `WorkerJobEnvelope { version, job_id }`、取得専用 Queue は v3 の `AcquisitionEnvelope { version, job_id, lane, dispatch_token }` を運ぶ。計画本体は D1 にだけ保存する。旧 v1/v2 の取得配信は取り込み専用の入口から新しいレーンへ移し、旧 Worker 上で取得を続行する互換実行経路は持たない。未知 version・不正 payload は台帳へ記録して安全に ack する。
 
 D1 supports SQLite FTS5, but this adapter intentionally keeps the current
 `instr`-based folded-column search. Native compatibility requires substring,
@@ -444,37 +444,29 @@ Worker (worker_entry)
 
 ### Phase 8 実装境界（Worker Queue / crawler / scheduler）
 
-- Queue payloadは`WorkerJobEnvelope`（version付き）で、1メッセージを1つの`JobPlan`として扱う。複数小説を1 payloadへ詰めず、サイズ上限と再試行回数を明示する。
+- Queue は1メッセージを1つの台帳 job ID として扱う。取得は v3 の lane / dispatch token で配信先を fence し、変換は既存の v2 envelope を維持する。複数小説を1 payloadへ詰めず、サイズ上限と再試行回数を明示する。
 - D1のjob ledgerをsource of truthとし、enqueue前にidempotency keyを確定する。`pending` / `running` / `succeeded` / `retryable` / `partial` / `permanent` / `blocked` を永続化し、再配信はledger遷移で冪等化する。
-- Queue consumerは、成功またはledgerへ永続化した恒久失敗・blockedだけをackする。一時失敗はbounded retryへ送り、未知のenvelope version・未対応JobKind・認証必須サイトは成功扱いにしない。
-- `running` leaseの有効期限内に同じjobが再配信された場合は`Busy { retry_after }`として明示的に遅延再配信し、ackしない。DLQはruntimeの運用経路であり、通常consumerが直接drainしない。
+- 取得用 consumer は結果・継続・再試行予定を D1 へ永続化してから現在の配信を ack し、実行枠・メモリ枠の解放後に共通 dispatcher が次の v3 配信を予約する。通常の失敗回数と回復回数を混同しない。
+- 有効な実行の重複配信・古い dispatch token は取得を始めず ack する。別の所有者の予約・リースは変更しない。DLQ は運用上の退避先で、通常 consumer が中身を直接取り出さない。
 - 同一サイトの取得間隔はサイト単位の Durable Object へ集約する。実際の送信前に許可を確認し、本文の受信完了・通信失敗後に `RateLimiter::complete` で次回許可時刻を更新・保存する。caller は `worker::Delay` 後に再確認し、通信時間を待機時間に含めない。`SiteRateLimiter` 自身は alarm を使用しない。別サイトの許可と作品間の開始基準の `update.interval` は独立して進める。
 - Cronはplannerに限定し、D1をbounded pageで走査して個別Update jobをenqueueする。Cron発火時刻をgenerationとして保存せず、D1が管理する論理generationとkeyset cursorをplanner lease付きで再開する。
 - Worker crawler は話の開始前と未取得画像の直前で実行予算を確認する。画像取得中の中断では挿絵索引を保存し、section 単位の checkpoint は未完了の話を指す。次回 claim 時に checkpoint の job/novel identity を検証し、完了した話の prefix を ObjectStore から復元する。同じ話の保存済み画像は索引で読み飛ばして残りを取得する。prefix が欠損する場合は section 0 から安全に再開する。
-- Budget による話・画像境界の yield は失敗 retry ではない。checkpoint を D1 へ保存して job を `pending` へ戻し、同じ job の新しい v2 envelope を Queue へ送信し、送信成功後に現在 message を ack する。正常経路では `attempts` と Queue retry 回数を消費しない。送信後 ack 前のクラッシュは通常の再配信に任せ、lease/dedupe で二重実行を防ぐ。
+- Budget による話・画像境界の yield は失敗 retry ではない。checkpoint を D1 へ保存して同じ job を `pending` へ戻し、本文処理・実行枠・メモリ枠の解放後に新しい配信トークンで再割当する。`attempts` を消費せず、旧配信による二重実行は台帳の予約・token で防ぐ。
 - 継続通知の送信は既存 job ID の envelope 再送だけとし、台帳への新規 enqueue は行わない。yield の記録と送信の間に clear/cancel が入っても tombstone を保持し、別 ID の実行を作らない。滞留回収は `attempts > max_retries` だけを上限超過と扱い、初回を含む失敗回数と追加 retry の回数を混同しない。
 - HTTP 等の通常の retryable エラーも最新の話境界を保存してから失敗記録へ進む。境界は 100 話未満でも保持し、非同期の定期保存を回収してから execution token で fenced な最終書込みを await する。予算による yield とは区別し、通常の attempts / retry-backoff を消費する。破損 prefix から再開始するときも旧保存を回収し、位置 0 と同じ実行文脈を以後のダウンローダへ渡す。本文に続いて dirty な挿絵索引も通常エラー時に保存するため、再試行は保存済みデータを再利用できる。
 - `Convert` / `Send` / `Mail` / `Backup` の重いnative処理はWorkerで実行せず、blockedとしてledgerへ記録する。Worker APIは既存read APIと分離し、認証・binding readiness・失敗分類を明示する。
 
 ### Phase 8 運用ポリシー
 
-- Queue consumer は `succeeded`、`blocked`、`permanent`、retry 上限到達後の
-  `permanent` を記録してから ack する。`running` の lease が有効な再配信は
-  `Busy` として ack せず、Queue の再配信/DLQ経路へ返す。
-- 一時エラーは ledger の `attempts` を増やし、`queue.max-retries` (既定 3) 回
-  まで `queue.retry-backoff` (既定 `1m,5m,15m`) の bounded retry を行う。
-  上限後は `permanent` として ack するため、無限 retry ループや暗黙の DLQ
-  再投入は行わない。DLQ は Queue binding の運用設定で保持し、
-  `worker_jobs` の `last_error` と attempt 数を調査の source of truth とする。
-- Cloudflare の consumer `max_retries` (既定 3) は ledger の retry 予定とは
-  独立に消費される (`Busy` の遅延再配信や consumer 内部エラーも消費する)
-  ため、台帳が retryable のまま配信だけが DLQ に落ちることがある。毎分の
-  cron が `scheduler::reap_stuck_jobs` を走らせ、バックオフ予定時刻
-  (`lease_until`) または更新時刻から猶予 (2 分) を過ぎても進まない
-  active 行を拾う: リトライ枠が残る行は新しい envelope を再送し (新しい
-  配信予算で通常経路へ復帰)、枠を使い切った retryable 行は `permanent`
-  に確定する。これにより UI の「待機中」は常に「再試行または終端確定が
-  予定されている」状態と一致する。
+- 取得用 Queue は4つの専用 script に分離し、各 script の batch / concurrency は1とする。D1 の空きレーン予約が最大4系列を選び、同一系列・同一作品の予約と実行を排他する。管理・変換・EPUB 配信の isolate と取得のメモリ枠を共有しない。
+- 一時エラーは台帳の `attempts` を増やし、`queue.max-retries` と `queue.retry-backoff` に従った期限まで待機する。取得の再試行は物理 Queue の retry ではなく、期限後の新しいレーン割当で行う。上限到達後は `permanent` にする。
+- `worker_acquisition_lanes` の配信リースが失効した場合、実行側にも有効な lease が無いことを確認してから予約を回収する。実行・配信喪失は独立した `recovery_attempts` を消費し、checkpoint の実際の進展だけで予算を戻す。キャンセル後も生きている実行から枠を奪わない。
+- 未 claim の予約 (`pending` / `retryable` かつ execution token 無し) は、待機取消の tombstone と同じ D1 batch 内で解放する。配信済みメッセージの再到着を待たず、単体取消後は空き枠を再配信する。実行中・中止処理中の所有権には触れず、古い v3 配信は token で拒否する。
+- 変換の v2 Queue は既存の bounded retry / 滞留回収を維持する。cron の一般回収は取得レーンの予約行に干渉せず、古い回収スナップショットによる CAS も新しい予約を上書きしない。
+- cron の重い計画・回収中は変換を再配信しない。失われた変換配信は D1 の admission 待機へ戻し、計画が失敗した場合もメモリ枠を解放してから共通の待機変換 dispatcher を呼ぶ。cron 中に届いて容量待ちへ戻された変換を、次の cron でも同じ状態へ戻し続けない。
+- 待機前に系列と正規化対象を保存する。`GET /api/jobs/:id` は任意の診断項目 `site_key`・`normalized_target`・`waiting_reason`・`acquisition_lane` を返し、サイト排他待ち・空き枠待ち・配信待ち・容量待ちを区別できる。配信 token は公開しない。
+- 移行順は D1 migration `0020_acquisition_lanes.sql` → 同じ成果物の4取得 script → 管理 script → 配信 script。既存の旧 Queue / DLQ / Secret は削除せず、残った取得配信は取り込み専用 consumer が新レーンへ移す。
+- 初回は共有 DO 所有者が未作成なので、CI が非公開・consumer / cron 無しの管理 script を同じ成果物で bootstrap してから4取得 script を配備する。既存の管理 script は置換しない。[Script Settings API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/settings/methods/get/) の 404 かつ Workers の未存在コード `10007` だけを未配備と扱い、認証失敗・通信失敗・不明な応答は中止する。bootstrap 設定は終了時に削除する。
 - Worker のサイト単位 rate limiter は Durable Object 1 instance をサイトごとに
   使用する。`acquire` の許可後、実 HTTP 試行の本文受信完了・失敗で `complete`
   を通知し、次回許可までの間隔を完了時点から計算する。リダイレクトと
@@ -761,7 +753,7 @@ API 復旧・配備後の継続負荷は未確認。検証コピーの結果と�
 
 ### 管理・更新と配信の実行環境
 
-管理・更新用と配信用は別の Worker script として配備し、D1 / S3 の作品データだけを共有する。
+管理・取得・配信は別の Worker script として配備する。管理と4つの取得 script が D1 のジョブ台帳を共有し、配信側とは D1 / S3 の作品データを共有する。各 script の `MemoryPermit` は独立する。
 `worker_entry/src/worker_role.rs` が配信側で実行できる読み取りルートを限定し、
 プレフィックス Route に巻き込まれた編集要求は元の管理 Worker へ転送する。
 配信先への公開 Route は管理 Worker を経由しないため、更新側のメモリ・
@@ -769,7 +761,7 @@ API 復旧・配備後の継続負荷は未確認。検証コピーの結果と�
 
 配信用の composition は保存方式の初期化・旧属性のバックフィルを行わず、
 source ObjectStore / AssetStore の変更を拒否する。例外は下記の非公開 stage と
-その予約 journal だけである。Queue / cron と一時データの期限付き回収は管理側に残す。
+その予約 journal だけである。cron・配信の割当と一時データの期限付き回収は管理側が担い、実際の取得は別の4 script、変換は既存の専用 Queue で実行する。
 URL・認証・配備上の境界は [`external-api.md`](external-api.md#workers-の配信用-worker) を参照。
 
 ### 所有権・保存・公開
@@ -846,9 +838,10 @@ APNG は ZIP を stage に置き、1 フレームずつ復号・符号化する�
 ### 同時実行・キャッシュ・異常終了
 
 `memory_budget::MemoryPermit` は isolate 内の作業所有権で、HTTP 容量待ちは
-`503` / `memory_capacity` / `Retry-After: 5` を返す。Queue は実行 lease と通常の試行回数を
-消費する前に延期する。サイト・作品単位の D1 排他とは別であり、別 isolate の処理まで
-グローバルに 1 件へ減らすものではない。
+`503` / `memory_capacity` / `Retry-After: 5` を返す。取得 Queue は別 script の
+専用レーンで実行し、各 isolate の1件制限を外さずに系列間を並列化する。
+通常の枠待ちは、系列・対象を保存した D1 の待機状態として扱い、実行 lease と
+通常の試行回数を消費しない。枠とメモリの解放前に次の配信を開始しない。
 クライアントの `cancel()` 完了は、サーバーが切断を受け取ったことの確認ではない。
 切断伝播中の別要求は 503 になり得る。時間切れだけで許可を解放して旧処理と
 併走させず、stream の破棄で解放する。回帰検証では上流画像を EOF 前に停止し、

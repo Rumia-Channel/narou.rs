@@ -1,5 +1,15 @@
 # narou.rs 移植状況
 
+## Workers のサイト系列別取得レーン（未リリース・検証中）
+
+- `fix-worker-site-concurrency` で、取得専用 Worker / Queue を4レーンへ分離する。各 isolate の重い処理1件制限は維持し、D1 の `worker_acquisition_lanes` が固定ハッシュではなく空き枠へ系列を動的に割り当てる。
+- migration `0020_acquisition_lanes.sql` は既存の待機ジョブ・checkpoint・backoff を保持する。v3 の job ID / lane / dispatch token で古い配信・古い解放を拒否し、同一作品の変換も配信予約と排他する。旧取得 Queue は取り込み専用として残し、削除しない。
+- 待機前に実効 YAML の系列・対象を保存し、定義変更時は予約の解放と再分類を原子的に行う。次の配信は本文処理・メモリ枠・実行枠の解放後に行う。配備・本番 D1 更新は今回実施しない。
+- runtime / CI / ローカル設定 / 実 workerd 回帰の実装は統合済み。基盤 SQL 8 件・既存 jobs SQL 49 件・系列判定 2 件が通過。初回配備は非公開・consumer / cron 無しの管理 Worker で共有 DO を用意し、既存所有者は変更しない。bootstrap のオフライン契約 16 件と配備ゲート 29 件が通過。
+- release の実 workerd で取得レーン10項目が通過。別系列4並列・同系列直列・5系列目の繰上げ・EPUBとの分離・実行中変換のメモリ枠保持・クラッシュ回収・古い配信・旧入口・各更新経路を確認した。cron 中に届いた変換が再待機し続ける経路も、実 S3 LIST と実 Queue send の保留で修正前の停止を再現し、枠解放後の再配信で完走を確認した。
+- 既存 HTTP 契約110件、仮想作品の更新選択・作者追跡・進捗履歴・転送は通過。保存・配信・実行回収の残りの互換テストを実行中。取消後の取得は自動で再配信しないため、保存テストは捕獲した実 v3 配信を再投入して、遅延配送でも tombstone・作品・話・挿絵が変わらないことを検証する。
+- debug Wasm は `/health/live` の route future 先頭で memory access out of bounds。生成物の `route` のスタックフレームは 673,664 bytes で、stack 不足と推定（既存版との差は未確認）。検証は実配布と同じ release 成果物で行っており、debug の問題を解消済みとはしない。
+
 ## EPUB 配信経路と API の待ち時間（未リリース）
 
 - 通常 GET の生成器は UI / 外部 API / ブラウザ API で共通。Native は保存済み EPUB があれば直接配信し、Worker は都度生成する。ヘッダ到着、EOF、外部閲覧ソフトの ZIP 展開・キャッシュ保存後の表示完了を区別して比較する（`docs/external-api.md`）。

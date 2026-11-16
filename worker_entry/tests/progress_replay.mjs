@@ -4,9 +4,11 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { renderAcquisitionTopology, stripQueueConsumers } from './acquisition_topology.mjs';
+import { localWorkerEnvironment, wranglerPackage } from './read_worker_fixture.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
@@ -14,12 +16,13 @@ const npx = windows ? 'npx.cmd' : 'npx';
 const parent = process.env.PROGRESS_FIXTURE_PARENT || join(root, '.wrangler');
 mkdirSync(parent, { recursive: true });
 const work = mkdtempSync(join(parent, 'progress-replay-'));
-const config = join(work, 'wrangler.toml');
+let config = join(work, 'wrangler.toml');
 const persist = join(work, 'state');
 const token = 'isolated-progress-replay-token';
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 let child, port, logs = '', enteredFirst = false, enteredSecond = false;
 let releaseFirst, releaseSecond;
+let topology;
 const firstHeld = new Promise(resolve => { releaseFirst = resolve; });
 const secondHeld = new Promise(resolve => { releaseSecond = resolve; });
 const handler = async (req, res) => {
@@ -36,7 +39,7 @@ const source = http.createServer(handler);
 const sourceV6 = http.createServer(handler);
 const sockets = new Set();
 function run(args) {
-  const result = spawnSync(npx, ['--yes', 'wrangler@4.151.3', ...args], { cwd: root, shell: windows, encoding: 'utf8' });
+  const result = spawnSync(npx, ['--yes', wranglerPackage, ...args], { cwd: root, shell: windows, encoding: 'utf8', env: localWorkerEnvironment });
   assert.equal(result.status, 0, result.stderr + result.stdout);
   return result.stdout;
 }
@@ -56,8 +59,8 @@ async function until(predicate, label, timeout = 30000) {
 }
 async function start() {
   logs = '';
-  child = spawn(npx, ['--yes', 'wrangler@4.151.3', 'dev', '--config', config, '--persist-to', persist, '--port', String(port)], {
-    cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'],
+  child = spawn(npx, ['--yes', wranglerPackage, 'dev', ...topology.configs.flatMap((path) => ['--config', path]), '--persist-to', persist, '--port', String(port)], {
+    cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'], env: localWorkerEnvironment,
   });
   for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { logs = (logs + chunk).slice(-100000); });
   await until(async () => {
@@ -100,12 +103,14 @@ try {
   const probe = http.createServer(); probe.listen(0, '127.0.0.1'); await once(probe, 'listening');
   port = probe.address().port; await new Promise(resolve => probe.close(resolve));
   const main = process.env.PROGRESS_WORKER_MAIN || join(root, 'build/worker/shim.mjs');
-  let toml = readFileSync(join(root, 'wrangler.toml'), 'utf8').replace(/\[build\][^\[]*/, '')
-    .replace(/^main = .*$/m, `main = ${JSON.stringify(main.replaceAll('\\', '/'))}`)
-    .replace(/^directory = "public"$/m, `directory = ${JSON.stringify(join(root, 'public').replaceAll('\\', '/'))}`)
-    .replace(/^migrations_dir = "migrations"$/m, `migrations_dir = ${JSON.stringify(join(root, 'migrations').replaceAll('\\', '/'))}`)
-    .replace('NAROU_AUTH_REQUIRED = "true"', 'NAROU_AUTH_REQUIRED = "false"');
-  writeFileSync(config, toml);
+  // 取得は writer 1 本 + 取得専用 4 本で実行する (writer は実行しない)。
+  topology = renderAcquisitionTopology({
+    work,
+    target: 'local',
+    main: main.replaceAll('\\', '/'),
+    vars: { NAROU_AUTH_REQUIRED: 'false' },
+  });
+  config = topology.writerPath;
   writeFileSync(join(work, '.dev.vars'), `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${Buffer.alloc(32, 7).toString('base64')}\nS3_ACCESS_KEY_ID=local-test-key\nS3_SECRET_ACCESS_KEY=local-test-secret\n`);
   run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
   sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','\"d1\"','d1'),('inv','asset_backend','\"d1\"','d1'),('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
@@ -129,8 +134,7 @@ try {
   await stop();
   releaseSecond();
   // Keep the crash's queue envelope from delivering a terminal event on restart.
-  toml = toml.replace(/\[\[queues\.consumers\]\][\s\S]*?(?=\n\[|$)/g, '');
-  writeFileSync(config, toml);
+  for (const path of topology.configs) stripQueueConsumers(path);
   sql(`UPDATE worker_jobs SET status='permanent',admission_waiting=0,execution_token=NULL,lease_until=NULL WHERE job_id='${job}';`);
   const records = sql('SELECT * FROM worker_jobs ORDER BY job_id');
   const stored = sql('SELECT object_key,size,crc32 FROM objects ORDER BY object_key');

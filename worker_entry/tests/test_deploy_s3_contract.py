@@ -40,6 +40,14 @@ ENV = {
     "NAROU_JOB_DLQ": "narou-jobs-develop-dlq",
     "NAROU_CONVERT_QUEUE": "narou-jobs-convert-develop",
     "NAROU_CONVERT_DLQ": "narou-jobs-convert-develop-dlq",
+    **{
+        f"NAROU_ACQUIRE_QUEUE_{number}": f"narou-jobs-acquire-{number}-develop"
+        for number in range(1, 5)
+    },
+    **{
+        f"NAROU_ACQUIRE_DLQ_{number}": f"narou-jobs-acquire-{number}-develop-dlq"
+        for number in range(1, 5)
+    },
     "NAROU_S3_ENDPOINT": "https://s3.example.invalid",
     "NAROU_S3_REGION": "us-east-1",
     "NAROU_S3_BUCKET": "fake-bucket",
@@ -71,6 +79,8 @@ class DeploymentFlowTests(unittest.TestCase):
             "render": "narou-rs-develop",
             "enable_read_replication": None,
             "run": "",
+            "build_artifact": None,
+            "bootstrap_writer": None,
             "secret_file": None,
             "deploy": "https://worker.example.workers.dev",
             "smoke_url": ("https://worker.example.workers.dev", False),
@@ -103,12 +113,13 @@ class DeploymentFlowTests(unittest.TestCase):
                 return FakeResponse(VERIFIED)
             self.http.return_value.open.side_effect = respond
 
-    def assert_both_scripts_deployed(self):
-        """writer を先に、reader を後に配備する (同じ D1 / 同じ成果物)。"""
-        self.assertEqual(self.calls.deploy.call_count, 2)
-        first, second = self.calls.deploy.call_args_list
-        self.assertEqual(first.kwargs["config"], deploy.WRITER_CONFIG)
-        self.assertEqual(second.kwargs["config"], deploy.READER_CONFIG)
+    def assert_topology_deployed(self):
+        """取得 4 レーンを先に、writer の切替後に reader を配備する。"""
+        self.assertEqual(self.calls.deploy.call_count, 6)
+        self.assertEqual(
+            [call.kwargs["config"] for call in self.calls.deploy.call_args_list],
+            [*deploy.ACQUISITION_CONFIGS, deploy.WRITER_CONFIG, deploy.READER_CONFIG],
+        )
 
     def test_old_d1_marker_or_data_does_not_block_deployment(self):
         # If a deployment tries the former D1 query, these are its responses.
@@ -120,7 +131,7 @@ class DeploymentFlowTests(unittest.TestCase):
                 self.d1_rows([{"asset_backend": backend, "has_d1_illustrations": illustrations}])
                 deploy.main()
                 self.d1.assert_not_called()
-                self.assert_both_scripts_deployed()
+                self.assert_topology_deployed()
                 # Schema migrations remain; no ad-hoc data query or deletion is introduced.
                 command, = self.calls.run.call_args.args
                 self.assertEqual(command[3:6], ["d1", "migrations", "apply"])
@@ -160,7 +171,7 @@ class DeploymentFlowTests(unittest.TestCase):
         os.environ["NAROU_ADMIN_TOKEN_SECRET_NAME"] = "runtime-token"
         self.http.return_value.open.side_effect = self.store_only_responder()
         deploy.main()
-        self.assert_both_scripts_deployed()
+        self.assert_topology_deployed()
         # writer と reader の 2 つを smoke する。
         self.assertEqual(self.calls.smoke.call_count, 2)
         self.assertTrue(self.calls.summary.call_args.kwargs["s3_status"].startswith("skipped:"))
@@ -180,7 +191,7 @@ class DeploymentFlowTests(unittest.TestCase):
             deploy.main()
         self.assertIn("readiness", str(failure.exception))
         # reader の配備・既存の配信 Route の変更は行わない。
-        self.assertEqual(self.calls.deploy.call_count, 1)
+        self.assertEqual(self.calls.deploy.call_count, len(deploy.ACQUISITION_CONFIGS) + 1)
         self.calls.summary.assert_not_called()
 
     def test_store_only_token_fails_when_probe_answers_without_auth(self):
@@ -228,7 +239,7 @@ class DeploymentFlowTests(unittest.TestCase):
         # writer の readiness は source の初期化も行う (reader の配備前に通す)。
         self.assertIn(f"{base}/health/ready", paths)
         self.calls.smoke.assert_not_called()
-        self.assert_both_scripts_deployed()
+        self.assert_topology_deployed()
 
 
 class ProbeTests(unittest.TestCase):
@@ -385,6 +396,9 @@ class RenderTests(unittest.TestCase):
         env = {**ENV, "NAROU_DEPLOY_TARGET": target, "SERVICE_DOMAIN": "production.example.invalid"}
         for name in ("NAROU_D1_DATABASE_NAME", "NAROU_JOB_QUEUE", "NAROU_JOB_DLQ", "NAROU_CONVERT_QUEUE", "NAROU_CONVERT_DLQ"):
             env[name] = env[name].replace("develop", target)
+        for number in range(1, 5):
+            env[f"NAROU_ACQUIRE_QUEUE_{number}"] = f"narou-jobs-acquire-{number}-{target}"
+            env[f"NAROU_ACQUIRE_DLQ_{number}"] = f"narou-jobs-acquire-{number}-{target}-dlq"
         env.update(extra_env or {})
         with tempfile.TemporaryDirectory() as directory, patch.object(render, "WORKER_DIR", Path(directory)), patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()):
             (Path(directory) / f"wrangler.{target}.toml").write_text(template, encoding="utf-8")
@@ -423,7 +437,7 @@ class RenderTests(unittest.TestCase):
                 self.render_template(f"[vars]\nNAROU_REQUIRE_S3 = {value}\n")
 
     def test_ci_s3_requirement_is_not_configurable_by_environment(self):
-        template = '[vars]\nNAROU_REQUIRE_S3 = "true"\n'
+        template = (WORKER / "wrangler.develop.toml").read_text(encoding="utf-8")
         self.assertIn('NAROU_REQUIRE_S3 = "true"', self.render_template(template, extra_env={"NAROU_REQUIRE_S3": "false"}))
 
     def test_real_deploy_templates_require_s3_and_reject_tampering(self):

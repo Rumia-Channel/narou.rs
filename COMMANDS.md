@@ -277,7 +277,9 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 通常更新・作者からの新規取得・Workers の定期更新も download と同じ取得経路を使い、閲覧制限・0 件見送り・Cookie 選択・サイトごとの取得間隔を共有する。
 - バーチャル小説の親 (`ncode=vs_<数字>`) は更新しない。識別は Native／Worker 共通で、同名タグを持つ実作品は除外しない。Web の一括・タグ更新と Worker の選択・定期更新では投入前に除外し、Native CLI および投入済みの Worker 更新では取得せず正常終了する。`--force` でも親は取得しない。Worker の `/api/jobs` の対象なし Update は実作品全件へ展開するが、親だけを明示選択した要求を一括更新に変えない。
 - 小説間インターバル（Ruby版 `Interval` クラス互換）
-- `update.max-parallel-domains` 設定対応（既定4）。対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカーを割り当てて並列にダウンロードする。同一ドメイン内は常に直列のまま処理されるため対サイト礼儀は崩れない。Web UI でも操作ごとの進捗を分離して並列処理する。1で従来通りの逐次動作、フォース指定・ドメインが1種類しかない時は自動的に逐次処理にフォールバック
+- Native の `update.max-parallel-domains` 設定対応（既定4）。対象小説をサイト系列別にグルーピングし、系列ごとにワーカーを割り当てて並列にダウンロードする。同一系列内は常に直列のまま処理される。Native Web UI も同じ更新経路を使い、1指定・フォース指定・系列が1種類の場合は逐次処理にフォールバックする。
+- Workers の取得・手動更新・全件更新・タグ更新・定期更新・作者確認は、D1 が空き枠へ動的に割り当てる4つの取得専用 Worker / Queue で実行する。同じ系列は直列、異なる系列は最大4系列まで並列で、固定ハッシュによる系列の衝突は作らない。各 isolate の重い処理は1件のまま維持し、EPUB 配信と取得の実行枠を分離する。待機前に実効 YAML から系列・対象を保存し、枠とメモリを解放してから再配信する。旧 Queue は既存メッセージの取り込み専用として残す。配備前に migration `0020_acquisition_lanes.sql` と取得専用 Worker の配備が必要で、`update.max-parallel-domains` は Native 専用のまま。
+- Workers の定期処理は計画・滞留回収中に変換を再配信せず、メモリ枠の解放後に待機変換を起こす。計画失敗時もこの再配信を行い、容量待ちへ戻された変換が定期処理ごとに再び待機し続ける状態を防ぐ。
 - `update.disabled-author-tracking` で、一括更新後の追跡作者からの新作品追加を停止できる。Native／Worker 共通の設定で、自動確認だけを止め、利用者が明示した作者確認は維持する。
 - 全件更新時の凍結スキップ、個別指定時の凍結メッセージ
 - 終了コード: エラー数（最大127）、中断時126
@@ -886,6 +888,8 @@ narou setting name         # 読み取り
 - hidden global `server-max-targets-per-request` は WEB UI が 1 リクエストで送れる小説 ID の最大数。既定値 `100000`、未設定または 0 以下は既定にフォールバック（Web UI には表示しない）。蔵書数が極端に多い環境で `narou setting server-max-targets-per-request=200000` のように上書きできる（`server-*` は変数名から自動で global スコープに振り分けられる）
 - API の単体・一括凍結/解除は凍結集合と `frozen` タグを同期し、一覧とタグメニューを再読込する。選択中の行を右クリックした「凍結 or 解凍」は選択全件を個別にトグルし、選択外の行ではその1件だけを対象にする。上部メニューの「凍結」「凍結を解除」は選択全件を指定状態へ揃える。選択外の凍結や `404`・利用者タグは保持する
 - queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / auto_update / convert / send / backup / mail の queued job を別プロセスまたは worker 内処理で実行する。Ruby版同様 `pending` / `running` を分けて保持し、legacy `cmd` / `args` / `meta` / `status` / `created_at` / `started_at` を維持したまま復元できる。`concurrency` 有効時は外部通信あり(download/update/auto_update)とその他(convert/send/backup/mail)を別 lane で並列実行し、無効時は全 job を投入順に逐次実行する
+- Workers の更新は上記 `update` 節の取得専用4レーンを使う。`GET /api/jobs/{id}` の任意の診断項目 `site_key`・`normalized_target`・`waiting_reason`・`acquisition_lane` で、同系列待ち・空き枠待ち・配信待ち・容量待ちを区別できる。配信トークンは返さない。
+- Workers の未実行の取得予約は、待機ジョブの取消・キュークリアと同じ D1 batch で解放する。旧配信が失われていても後続の同系列を止めず、実行中・中止処理中の所有権は物理処理が戻るまで保持する。
 - 一時的なネットワーク失敗で夜間更新全体が止まらないよう、queue worker は失敗した job を `JobOutcome::Failed` 時に判定し、`retry_count < max_retries` かつ恒久失敗 (detail に "not found" / "invalid argument" / "no such file" / "permanent failure" / "永久失敗" / "恒久失敗" を含む) でなければ `available_at` 付きで `active_pending` へ自動再投入する。`available_at` 経過後の job だけが `pop` 系で取り出されるためスリープを挟まない。Web UI には `queue_retry` イベントを、追加試行なしで `failed` へ落ちた場合は従来どおり `queue_failed` イベントを通知する
 - Web UI のキュー詳細モーダルは `queue_start` / `queue_complete` / `queue_failed` / `queue_retry` / `notification.queue` 受信時に開いていれば再取得し、WebSocket が届かない場合も定期更新時に開いている詳細だけ再取得する
 - リトライ挙動は `narou setting` の `queue.max-retries`（既定 3、`0` で無効）と `queue.retry-backoff`（既定 `1m,5m,15m`、カンマ区切り、`s`/`m`/`h` 単位可、要素数を超えて失敗したときは最後の値を再利用）で調整できる。`QueueJob` の `available_at` フィールドは `#[serde(default, skip_serializing_if = "Option::is_none")]` 付きで読み書きされ、リトライ機能導入前の旧 `queue.yaml` もそのまま再ロード可能

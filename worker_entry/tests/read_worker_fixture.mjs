@@ -25,6 +25,7 @@ const environment = { ...process.env, WRANGLER_SEND_METRICS: 'false' };
 for (const name of Object.keys(environment)) {
   if (/^(CLOUDFLARE_|CF_API_|NAROU_|S3_|AWS_)/.test(name)) delete environment[name];
 }
+export const localWorkerEnvironment = environment;
 
 // 配信 Worker が書き込んでよい唯一の S3 接頭辞 (private staging と予約台帳)。
 export const STAGING_PREFIX = '.narou-staging/';
@@ -93,6 +94,7 @@ export async function createS3Fixture({ bucket, prefix }) {
   const held = [];
   const uploads = new Map();
   let armed = false;
+  let listingArmed = false;
   let uploadSequence = 0;
 
   const base = `/${bucket}/${prefix}/`;
@@ -127,6 +129,11 @@ export async function createS3Fixture({ bucket, prefix }) {
       ) {
         armed = false;
         await new Promise((resolve) => held.push({ key, resolve }));
+      }
+
+      if (listingArmed && req.method === 'GET' && url.searchParams.get('list-type') === '2') {
+        listingArmed = false;
+        await new Promise(resolve => held.push({ key, resolve }));
       }
 
       if (req.method === 'GET' && url.searchParams.get('list-type') === '2') {
@@ -310,11 +317,17 @@ export async function createS3Fixture({ bucket, prefix }) {
     holdNextSourceRead() {
       armed = true;
     },
+    /** 次の実 S3 LIST を保留し、cron の GC をメモリ枠の中で止める。 */
+    holdNextListing() {
+      listingArmed = true;
+    },
     heldCount() {
       return held.length;
     },
     /** 保留した読み出しを解放し、元の内容を返す。 */
     releaseHolds() {
+      armed = false;
+      listingArmed = false;
       for (const entry of held.splice(0)) entry.resolve();
     },
     /** staging 接頭辞のオブジェクトだけを残した一覧 (残留 staging の検出用)。 */
@@ -489,6 +502,14 @@ export function renderConfigs({
     'binding = "CONVERT_QUEUE"',
     'queue = "narou-read-smoke-convert"',
     '',
+    // writer は取得を自分で実行しないが、4 本の取得レーンへ割り当てる
+    // producer を全部持つ (readiness も production と同じ形)。
+    ...Array.from({ length: 4 }, (_, lane) => [
+      '[[queues.producers]]',
+      `binding = "ACQUISITION_QUEUE_${lane}"`,
+      `queue = "narou-read-smoke-acquire-${lane + 1}"`,
+      '',
+    ].join('\n')),
     '[[queues.consumers]]',
     'queue = "narou-read-smoke-jobs"',
     'max_batch_size = 1',
@@ -552,7 +573,7 @@ export function createWorkspace() {
 }
 
 /** wrangler dev を起動して readiness を待つ。 */
-export async function startDev({ config, port, persist, cwd = root, env = environment }) {
+export async function startDev({ config, port, persist, cwd = root, env = environment, extraArgs = [] }) {
   let logs = '';
   const configs = Array.isArray(config) ? config : [config];
   const child = spawn(npx, [
@@ -560,6 +581,7 @@ export async function startDev({ config, port, persist, cwd = root, env = enviro
     ...configs.flatMap(path => ['--config', path]),
     '--persist-to', persist, '--port', String(port), '--ip', '127.0.0.1',
     '--show-interactive-dev-session', 'false',
+    ...extraArgs,
   ], { cwd, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'], env });
   for (const stream of [child.stdout, child.stderr]) {
     stream.on('data', chunk => { logs = (logs + chunk.toString()).slice(-200000); });

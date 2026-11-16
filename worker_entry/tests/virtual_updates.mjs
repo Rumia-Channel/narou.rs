@@ -5,6 +5,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { familySiteDefinition, startFamilySource } from './acquisition_topology.mjs';
+import { localWorkerEnvironment } from './read_worker_fixture.mjs';
 
 const base = process.env.BASE_URL || 'http://127.0.0.1:8787';
 assert(/^http:\/\/(127\.0\.0\.1|localhost):/.test(base), 'Local Worker required');
@@ -21,15 +23,16 @@ async function sql(command) {
     const result = await exec(process.platform === 'win32' ? 'npx.cmd' : 'npx', [
       '--yes', `wrangler@${process.env.NAROU_WRANGLER_VERSION || '4.151.3'}`,
       'd1', 'execute', 'DB', '--local', '-c', config, '--persist-to', persist, '--file', file, '--json',
-    ], { shell: process.platform === 'win32', encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    ], { shell: process.platform === 'win32', encoding: 'utf8', maxBuffer: 8 * 1024 * 1024,
+      env: localWorkerEnvironment, timeout: 60000 });
     return JSON.parse(result.stdout).flatMap(result => result.results || []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
-async function api(path, body) {
+async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
   const response = await fetch(base + path, {
-    method: body === undefined ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json', Authorization: `Bearer ${process.env.NAROU_ADMIN_TOKEN || 'local-contract-token'}` },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    method,
+    headers: { 'content-type': typeof body === 'string' ? 'application/yaml' : 'application/json', Authorization: `Bearer ${process.env.NAROU_ADMIN_TOKEN || 'local-contract-token'}` },
+    ...(body === undefined ? {} : { body: typeof body === 'string' ? body : JSON.stringify(body) }),
   });
   const text = await response.text();
   assert.equal(response.status, 200, `${path}: ${text}`);
@@ -64,15 +67,24 @@ async function tick() {
   assert.equal(response.status, 200, await response.text());
 }
 let previousRetrySetting;
+let source;
+let realUrl;
 try {
+  source = await startFamilySource({ family: 'virtual-update' });
+  realUrl = `${source.origin}/virtual-update/virtual-update-real/`;
+  const site = await api('/api/sites/virtual-update-fixture.yaml', familySiteDefinition({
+    family: 'virtual-update', novel: 'real', port: source.port,
+  }), 'PUT');
+  assert.equal(site.success, true, JSON.stringify(site));
   assert((await api('/__test/jobs/pause', {})).success);
   await sql([...virtualIds, real].map(id => {
     const virtual = id !== real;
     const title = `!!! virtual-update-fixture ${String(id - first).padStart(3, '0')}`;
-    const url = `https://fixture.invalid/virtual-update-${id}`;
+    const url = virtual ? `https://fixture.invalid/virtual-update-${id}` : realUrl;
     const tags = ['virtual-update-fixture', `vs_${first}`];
-    const ncode = virtual ? `vs_${id}` : `n${id}aa`;
-    return `INSERT INTO novels(id,ncode,ncode_fold,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,domain,last_update,tags_json,tags_fold) VALUES(${id},${quote(ncode)},${quote(ncode)},'fixture','fixture',${quote(title)},${quote(title)},${quote(title)},${quote(url)},${quote(url)},'fixture','fixture','fixture.invalid','2026-11-01T00:00:00Z',${quote(JSON.stringify(tags))},${quote(tags.join('\n'))});`;
+    const ncode = virtual ? `vs_${id}` : 'virtual-update-real';
+    const domain = virtual ? 'fixture.invalid' : 'localhost';
+    return `INSERT INTO novels(id,ncode,ncode_fold,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,domain,last_update,tags_json,tags_fold) VALUES(${id},${quote(ncode)},${quote(ncode)},'fixture','fixture',${quote(title)},${quote(title)},${quote(title)},${quote(url)},${quote(url)},'fixture','fixture',${quote(domain)},'2026-11-01T00:00:00Z',${quote(JSON.stringify(tags))},${quote(tags.join('\n'))});`;
   }).join('\n') + [...virtualIds, real].map(id =>
     `INSERT INTO novel_tags(novel_id,position,tag,tag_fold) VALUES(${id},0,'virtual-update-fixture','virtual-update-fixture'),(${id},1,'vs_${first}','vs_${first}');`).join('\n')
     + putState('local', 'update.disabled-author-tracking', true)
@@ -157,11 +169,16 @@ try {
   assert.equal((await sql(`SELECT extra_fields_yaml FROM novels WHERE id=${real}`))[0].extra_fields_yaml, '[]');
   console.log('PASS invalid stored metadata reaches bounded retry settlement without being replaced');
 } finally {
-  await clearQueue();
-  await sql(`DELETE FROM novels WHERE id BETWEEN ${first} AND ${real}; DELETE FROM app_state WHERE ${stateWhere};`
-    + savedState.map(row => `INSERT INTO app_state(scope,key,value_yaml,value_json) VALUES(${quote(row.scope)},${quote(row.key)},${quote(row.value_yaml)},${quote(row.value_json)});`).join('\n'));
-  if (previousRetrySetting !== undefined) {
-    assert((await api('/api/global_setting', { settings: { 'queue.max-retries': previousRetrySetting } })).success);
+  try {
+    await clearQueue();
+    await sql(`DELETE FROM novels WHERE id BETWEEN ${first} AND ${real}; DELETE FROM app_state WHERE ${stateWhere};`
+      + savedState.map(row => `INSERT INTO app_state(scope,key,value_yaml,value_json) VALUES(${quote(row.scope)},${quote(row.key)},${quote(row.value_yaml)},${quote(row.value_json)});`).join('\n'));
+    if (previousRetrySetting !== undefined) {
+      assert((await api('/api/global_setting', { settings: { 'queue.max-retries': previousRetrySetting } })).success);
+    }
+    await api('/__test/jobs/resume', {});
+  } finally {
+    try { await api('/api/sites/virtual-update-fixture.yaml', undefined, 'DELETE'); }
+    finally { if (source) await source.close(); }
   }
-  await api('/__test/jobs/resume', {});
 }

@@ -49,10 +49,10 @@ class DeploySecretMaskingTests(unittest.TestCase):
             "NAROU_RELAY_KEY": "",
         }
 
-    def _secret_file(self):
+    def _secret_file(self, role="writer"):
         buffer = io.StringIO()
         with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(buffer):
-            path = deploy.secret_file("develop")
+            path = deploy.secret_file("develop", role=role)
         return path, buffer.getvalue()
 
     def test_secret_values_are_registered_for_log_masking(self):
@@ -83,6 +83,21 @@ class DeploySecretMaskingTests(unittest.TestCase):
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(payload["NAROU_ADMIN_TOKEN"], ADMIN_TOKEN)
             self.assertEqual(payload["S3_SECRET_ACCESS_KEY"], S3_SECRET)
+        finally:
+            if path is not None:
+                path.unlink(missing_ok=True)
+
+    def test_acquisition_secrets_are_masked_and_use_a_separate_private_file(self):
+        path, output = self._secret_file(role="acquisition")
+        try:
+            self.assertEqual(path.name, ".deploy-secrets-develop-acquire.json")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["NAROU_ADMIN_TOKEN"], ADMIN_TOKEN)
+            self.assertEqual(payload["S3_SECRET_ACCESS_KEY"], S3_SECRET)
+            self.assertIn(f"::add-mask::{ADMIN_TOKEN}", output)
+            self.assertIn(f"::add-mask::{S3_SECRET}", output)
+            if os.name != "nt":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         finally:
             if path is not None:
                 path.unlink(missing_ok=True)

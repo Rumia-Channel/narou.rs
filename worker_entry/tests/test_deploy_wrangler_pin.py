@@ -78,6 +78,7 @@ class WranglerPinTests(unittest.TestCase):
             },
             "render": "narou-rs-develop",
             "enable_read_replication": None,
+            "build_artifact": None,
             "secret_file": None,
             "deploy": "https://worker.example.workers.dev",
             "smoke_url": ("https://worker.example.workers.dev", False),
