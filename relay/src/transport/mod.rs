@@ -124,6 +124,8 @@ pub struct TransportResponse {
     pub set_cookie: Vec<String>,
     pub body: Vec<u8>,
     pub via: &'static str,
+    /// 上流が返したブラウザ確認の種別 (`x-amzn-waf-action`)。
+    pub waf_action: Option<String>,
 }
 
 impl TransportResponse {
@@ -134,6 +136,7 @@ impl TransportResponse {
             location: self.location.clone(),
             set_cookie: self.set_cookie.clone(),
             via: self.via,
+            waf_action: self.waf_action.clone(),
         }
     }
 }

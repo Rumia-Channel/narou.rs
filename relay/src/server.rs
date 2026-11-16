@@ -10,7 +10,9 @@
 //! - 1 リクエストにつき上流取得は 1 回だけ。リダイレクトは辿らない。
 //! - 期限 (既定 75 秒) とクライアント切断で処理 future を drop し、
 //!   取得中の curl / wget を子プロセスの drop ガードで止める。
-//! - 成功応答は JSON `{status, contentType, location?, setCookie, via, body}`。
+//! - 成功応答は JSON `{status, contentType, location?, setCookie, via,
+//!   wafAction?, body}`。`wafAction` は上流のブラウザ確認種別で、確認要求を
+//!   Fallback で握り潰さないためにそのまま運ぶ。
 //!   4xx/5xx は `{"error": "..."}` と `Connection: close`。
 
 use std::io;

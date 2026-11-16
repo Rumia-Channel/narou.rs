@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
+import net from "node:net";
 import process from "node:process";
 import test from "node:test";
 
@@ -1918,6 +1919,87 @@ if (QUEUE_CHECKS) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     throw new Error(`job stayed ${status} for 60s (queue consumer did not run)`);
+  });
+
+  // ─── ブラウザ確認 (AWS WAF) ──────────────────────────────────────────────
+  //
+  // 合成上流 (予約済みホスト) だけが答え、返り値は Worker の Rust 側
+  // (downloader::http_policy と Job の失敗区分) がそのまま処理する。確認要求
+  // は認証要求なので、空の成功・切り詰められた一覧・凍結になってはならない。
+  // 2 段目は 403 (確認のヘッダ無し) → 生接続は拒否 → 踏み台が 405 + wafAction
+  // を返す。踏み台の答えが元の 403 に埋もれてもいけない。
+  const unusedPort = async () => {
+    const server = net.createServer();
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+    await new Promise((resolve) => server.close(resolve));
+    return port;
+  };
+  await check("a browser verification fails the download as an authentication problem", async () => {
+    const port = await unusedPort();
+    const scenarios = [
+      {
+        name: "waf-challenge",
+        url: "http://waf-challenge.invalid/novel/1/",
+        yaml: [
+          "name: WAF Fixture",
+          "domain: waf-challenge.invalid",
+          "top_url: http://waf-challenge.invalid",
+          "sitename: WAF Fixture",
+          "url: http://waf-challenge\\.invalid/novel/(?<ncode>\\d+)/",
+          "toc_url: http://waf-challenge.invalid/novel/\\k<ncode>/",
+          "",
+        ].join("\n"),
+      },
+      {
+        name: "waf-forbidden",
+        url: `http://localhost:${port}/novel/1/`,
+        yaml: [
+          "name: WAF Fixture",
+          "domain: localhost",
+          `top_url: http://localhost:${port}`,
+          "sitename: WAF Fixture",
+          `url: http://localhost:${port}/novel/(?<ncode>\\d+)/`,
+          `toc_url: http://localhost:${port}/novel/\\k<ncode>/`,
+          "",
+        ].join("\n"),
+      },
+    ];
+    for (const scenario of scenarios) {
+      const stored = await json(await request(`/api/sites/${scenario.name}`, {
+        method: "PUT",
+        ...auth(),
+        body: scenario.yaml,
+      }));
+      assert(stored.success === true, `the site definition must be stored: ${JSON.stringify(stored)}`);
+      try {
+        const [jobId] = await enqueuePlans("Download", [scenario.url]);
+        const status = await waitForTerminal(jobId);
+        const view = await json(await request(`/api/jobs/${jobId}`, auth()));
+        const reason = String(view.last_error ?? "");
+        assert.equal(
+          status,
+          "blocked",
+          `a browser verification must fail as an authentication problem: ${scenario.url} (${status}: ${reason})`,
+        );
+        assert(
+          reason.includes("Login error"),
+          `the browser verification must be reported as an authentication problem: ${reason}`,
+        );
+      } finally {
+        await request(`/api/sites/${scenario.name}`, { method: "DELETE", ...auth() });
+      }
+    }
+    // 認証要求は成功にも凍結にもならない。合成上流の作品は保存されない。
+    const library = await json(await request("/api/novels?limit=100", auth()));
+    for (const row of library.data ?? []) {
+      const toc = String(row.toc_url ?? "");
+      assert(
+        !toc.includes("waf-challenge.invalid") && !toc.includes(`localhost:${port}`),
+        `a browser verification must not store a work: ${JSON.stringify(row)}`,
+      );
+      assert(row.frozen !== true, `a browser verification must not freeze a work: ${JSON.stringify(row)}`);
+    }
   });
 
   await check("console history keeps the convert lines per stream and clear empties both", async () => {

@@ -35,8 +35,8 @@ use crate::downloader::security::{
 };
 use crate::error::{NarouError, Result};
 use crate::platform::http::{
-    RedirectChain, is_safe_header_name, is_safe_header_value, response_body_limit,
-    validate_http_url_syntax,
+    RedirectChain, WAF_ACTION_HEADER, browser_challenge, is_safe_header_name, is_safe_header_value,
+    response_body_limit, validate_http_url_syntax,
 };
 use crate::platform::http1::MAX_HTTP1_HEAD;
 use crate::platform::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
@@ -62,7 +62,17 @@ const TIER_REQWEST: usize = 1;
 const TIER_SUBPROCESS: usize = 2;
 const TIER_COUNT: usize = 3;
 
-fn should_try_next_tier(status: u16) -> bool {
+/// Whether the fallback may try the next transport after this answer.
+///
+/// A browser-verification challenge ends the fallback: it is the site's own
+/// answer, and the next transport would only replace it with the plain
+/// forbidden response an unauthenticated client receives. Every other
+/// non-definitive status keeps its ordinary meaning, so an ordinary 405
+/// still falls through to the next transport.
+fn should_try_next_tier(status: u16, action: Option<&str>) -> bool {
+    if browser_challenge(status, action).is_some() {
+        return false;
+    }
     (400..600).contains(&status) && status != 404 && status != 503
 }
 
@@ -255,7 +265,7 @@ impl NativeHttpClient {
             chain = returned_chain;
             match attempt {
                 Ok(value) => {
-                    if tiered && should_try_next_tier(value.status) {
+                    if tiered && should_try_next_tier(value.status, value.header(WAF_ACTION_HEADER)) {
                         if let Some(domain) = domain.as_deref() { self.tiers.lock().note_failure(domain, tier); }
                         response = Some(value);
                         continue;
@@ -406,7 +416,9 @@ impl NativeHttpClient {
         let mut response = None;
         for tool in candidates {
             match self.run_fetch_tool(tool, request, user_agent) {
-                Ok(value) if should_try_next_tier(value.status) => response = Some(value),
+                Ok(value) if should_try_next_tier(value.status, value.header(WAF_ACTION_HEADER)) => {
+                    response = Some(value)
+                }
                 Ok(value) => return Ok(value),
                 Err(err) => {
                     let not_found = matches!(
@@ -1012,7 +1024,78 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
+
+    /// The browser verification the site asks for: a CAPTCHA.
+    const WAF_CAPTCHA: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\nx-amzn-waf-action: captcha\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    /// The browser verification the site asks for: an interstitial.
+    const WAF_CHALLENGE: &[u8] = b"HTTP/1.1 202 Accepted\r\nx-amzn-waf-action: challenge\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    /// The answer every later request receives: a plain forbidden response
+    /// without the browser-verification header.
+    const PLAIN_FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    /// An ordinary method-not-allowed answer without the header.
+    const PLAIN_METHOD_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    /// A successful answer, used to prove that the next transport still runs.
+    const OK_BODY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    /// A loopback HTTP fixture that answers the first request with `first`
+    /// and every later request with `later`, counting the requests.
+    ///
+    /// The fixture stops as soon as the test drops it, so a failing
+    /// assertion cannot leave a thread behind.
+    struct CountingFixture {
+        url: String,
+        requests: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        server: Option<thread::JoinHandle<()>>,
+    }
+
+    impl CountingFixture {
+        fn new(first: &'static [u8], later: &'static [u8]) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let server = {
+                let requests = Arc::clone(&requests);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                let served = requests.fetch_add(1, Ordering::SeqCst);
+                                stream.set_nonblocking(false).unwrap();
+                                let _ = read_request(&mut stream);
+                                let _ = stream.write_all(if served == 0 { first } else { later });
+                                let _ = stream.shutdown(std::net::Shutdown::Write);
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                })
+            };
+            Self { url, requests, stop, server: Some(server) }
+        }
+
+        /// How many requests the fixture has accepted so far.
+        fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for CountingFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
 
     #[test]
     fn curl_404_is_not_found() {
@@ -1240,6 +1323,88 @@ mod tests {
             assert_eq!(tiers.failures[domain][super::TIER_CURL], 0);
             assert_eq!(tiers.failures[domain][super::TIER_REQWEST], 0);
         }
+    }
+
+    /// A browser verification is the site's own answer, not a transport
+    /// failure: the tier fallback must keep it instead of replacing it with
+    /// the plain forbidden response a later transport receives.
+    #[tokio::test]
+    async fn native_untrusted_get_keeps_a_browser_challenge_and_stops_the_fallback() {
+        for (response, status, action) in [
+            (WAF_CAPTCHA, 405, "captcha"),
+            (WAF_CHALLENGE, 202, "challenge"),
+        ] {
+            let fixture = CountingFixture::new(response, PLAIN_FORBIDDEN);
+            let client = native_tiers_only(&fixture.url);
+            let request = HttpRequest::get(fixture.url.clone());
+            assert!(!request.trusted_endpoint);
+            // Enter at the post-validation dispatcher, as the loopback
+            // fixture is deliberately not an admissible public site URL.
+            let result = client.send_validated_hop(
+                RedirectChain::new(request, super::MAX_REDIRECTS), None,
+            ).await;
+            let (_, answer) = result.expect("the challenge is a complete HTTP response");
+            assert_eq!(answer.status, status, "the challenge must survive the tier fallback");
+            assert_eq!(
+                answer.header("x-amzn-waf-action"),
+                Some(action),
+                "the browser-verification header must survive the tier fallback"
+            );
+            assert_eq!(
+                fixture.requests(),
+                1,
+                "the challenge is a definitive answer: no later transport may run"
+            );
+            let error = crate::downloader::http_policy::ensure_success_response(&fixture.url, answer)
+                .expect_err("a browser verification is an authentication problem");
+            assert!(matches!(error, NarouError::Login(_)), "unexpected error: {error}");
+        }
+    }
+
+    /// The streaming dispatcher judges the head with the same policy the
+    /// buffered path uses, and it keeps the challenge as well.
+    #[tokio::test]
+    async fn native_untrusted_stream_keeps_a_browser_challenge_and_stops_the_fallback() {
+        let fixture = CountingFixture::new(WAF_CAPTCHA, PLAIN_FORBIDDEN);
+        let client = native_tiers_only(&fixture.url);
+        let request = HttpRequest::get(fixture.url.clone());
+        assert!(!request.trusted_endpoint);
+        let (_, response) = client.send_stream_validated_hop(
+            RedirectChain::new(request, super::MAX_REDIRECTS), None,
+        ).await.expect("the challenge is a complete HTTP response");
+        assert_eq!(response.status, 405, "the challenge must survive the tier fallback");
+        assert_eq!(
+            response.header("x-amzn-waf-action"),
+            Some("captcha"),
+            "the browser-verification header must survive the tier fallback"
+        );
+        assert_eq!(
+            fixture.requests(),
+            1,
+            "the challenge is a definitive answer: no later transport may run"
+        );
+        let error = crate::downloader::http_policy::ensure_success_response(&fixture.url, response.head())
+            .expect_err("a browser verification is an authentication problem");
+        assert!(matches!(error, NarouError::Login(_)), "unexpected error: {error}");
+    }
+
+    /// Only a browser verification is definitive: an ordinary 405 without the
+    /// header is a transport error, so the next transport still runs and its
+    /// successful answer is the one the caller sees.
+    #[tokio::test]
+    async fn an_ordinary_405_still_reaches_the_next_transport() {
+        let (url, server) = serve_responses(vec![PLAIN_METHOD_NOT_ALLOWED, OK_BODY]);
+        let client = native_tiers_only(&url);
+        let result = client.send_validated_hop(
+            RedirectChain::new(HttpRequest::get(url.clone()), 10), None,
+        ).await;
+        server.join().unwrap();
+        let (_, response) = result.expect("the second transport answers with a complete response");
+        assert_eq!(
+            response.status, 200,
+            "an error without the browser-verification header must still fall through"
+        );
+        assert_eq!(response.body, b"ok");
     }
 
     #[tokio::test]

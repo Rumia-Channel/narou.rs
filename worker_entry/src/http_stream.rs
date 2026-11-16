@@ -135,6 +135,9 @@ impl WorkerHttpClient {
                     if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.complete(scope).await?; }
                     match socket {
                         Ok(value) if value.is_success() || value.is_redirection() => response = value,
+                        // A browser verification is the site's own answer: it
+                        // must not be replaced by the original 403.
+                        Ok(value) if value.browser_challenge().is_some() => response = value,
                         _ => {
                             if let Some(relay) = self.relay.as_ref() {
                                 if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.acquire(scope).await?; }
@@ -151,7 +154,14 @@ impl WorkerHttpClient {
                                 if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.complete(scope).await?; }
                                 if let Ok(mut value) = relay_response {
                                     value.url = request.url.clone();
-                                    if value.is_success() || value.is_redirection() { response = value; }
+                                    // A browser verification is the site's own
+                                    // answer: it must not be replaced by the
+                                    // original 403.
+                                    if value.is_success() || value.is_redirection()
+                                        || value.browser_challenge().is_some()
+                                    {
+                                        response = value;
+                                    }
                                 }
                             }
                         }

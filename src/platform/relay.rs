@@ -13,7 +13,8 @@
 //!   POST: {"url": "...", "headers": {...}}
 //! 認証: X-Proxy-Token: <NAROU_RELAY_KEY>
 //! 応答: {"status": 200, "contentType": "...", "location": "...",
-//!        "setCookie": ["..."], "via": "curl", "body": "<base64>"}
+//!        "setCookie": ["..."], "via": "curl", "wafAction": "captcha",
+//!        "body": "<base64>"}
 //! 失敗: {"status": <上流>, "error": "..."} /
 //!       HTTP 403 {"error":"forbidden"} / 500 {"error":"NAROU_RELAY_KEY is not set"}
 //! ```
@@ -332,6 +333,12 @@ pub struct RelayResponse {
     pub set_cookie: Vec<String>,
     /// 踏み台がどのクライアントで取ったか (`curl` / `wget` / 診断情報)。
     pub via: Option<String>,
+    /// 上流が返したブラウザ確認の種別 (`x-amzn-waf-action`)。
+    ///
+    /// 古い踏み台はこの値を運ばないため `None` になり得る。値は
+    /// [`crate::platform::http::WAF_ACTION_HEADER`] の名前で応答ヘッダに
+    /// 戻され、呼び出し側の判定 (確認要求は終端) に使われる。
+    pub waf_action: Option<String>,
     /// base64 をデコード済みのレスポンスボディ。
     pub body: Vec<u8>,
 }
@@ -377,6 +384,10 @@ struct RelayEnvelope<'a> {
     set_cookie: Option<serde_json::Value>,
     #[serde(borrow)]
     via: Option<RelayString<'a>>,
+    /// ブラウザ確認の種別。古い踏み台 (このフィールドを持たないもの) では
+    /// 欠落する。
+    #[serde(rename = "wafAction", borrow)]
+    waf_action: Option<RelayString<'a>>,
 }
 
 impl RelayResponse {
@@ -444,6 +455,7 @@ impl RelayResponse {
             location: envelope.location.and_then(RelayString::into_nonempty_string),
             set_cookie,
             via: envelope.via.and_then(RelayString::into_nonempty_string),
+            waf_action: envelope.waf_action.and_then(RelayString::into_nonempty_string),
             body,
         })
     }
@@ -643,6 +655,21 @@ mod tests {
             RelayResponse::parse(403, br#"{"status":{},"error":"forbidden","body":123}"#, 1),
             Err(RelayError::Rejected { http_status: 403, upstream_status: None, .. }),
         ));
+    }
+
+    #[test]
+    fn response_carries_the_browser_verification_action() {
+        let response = br#"{"status":405,"wafAction":"captcha","body":"QQ=="}"#;
+        let parsed = RelayResponse::parse(200, response, 1024).unwrap();
+        assert_eq!(parsed.status, 405);
+        assert_eq!(parsed.waf_action.as_deref(), Some("captcha"));
+
+        // フィールド欠落 (古い踏み台) と非文字列は None / 無視。
+        let plain = RelayResponse::parse(200, br#"{"status":200,"body":"QQ=="}"#, 1024).unwrap();
+        assert!(plain.waf_action.is_none());
+        let mixed =
+            RelayResponse::parse(200, br#"{"status":200,"wafAction":7,"body":"QQ=="}"#, 1024).unwrap();
+        assert!(mixed.waf_action.is_none());
     }
 
     #[test]
