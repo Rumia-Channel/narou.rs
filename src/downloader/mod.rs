@@ -127,6 +127,12 @@ struct DownloadCreation {
     committed: bool,
 }
 
+struct DownloadDiscovery {
+    url_captures: HashMap<String, String>,
+    toc_url: String,
+    response: Result<(String, Option<crate::platform::HttpResponse>)>,
+}
+
 async fn checkpoint_download_access(
     budget: &mut Option<&mut dyn SectionBudget>,
     origin: &AccessOrigin,
@@ -1363,6 +1369,24 @@ impl Downloader {
         NovelWriteGuard::capture_for(self.persistence.objects(), Some(&self.assets), &keys).await
     }
 
+    fn download_toc_target(setting: &SiteSetting, target: &str, stored_url: Option<&str>) -> (HashMap<String, String>, String) {
+        let captures = stored_url
+            .and_then(|url| setting.extract_url_captures(url))
+            .or_else(|| setting.extract_url_captures(target))
+            .or_else(|| ncode_target_url(target).and_then(|url| setting.extract_url_captures(&url)))
+            .unwrap_or_default();
+        let toc_url = if let Some(url) = stored_url {
+            url.to_string()
+        } else if captures.is_empty() {
+            setting.toc_url()
+        } else {
+            let mut selects = captures.clone();
+            selects.insert("__target_url".to_string(), target.to_string());
+            setting.get_toc_url_with_captures(&selects)
+        };
+        (captures, Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url))
+    }
+
     pub async fn download_novel(&mut self, target: &str) -> Result<DownloadResult> {
         self.download_novel_with_force(target, false).await
     }
@@ -1410,18 +1434,47 @@ impl Downloader {
         // with an empty set so nothing leaks between works.
         self.preprocess_jobs.reset();
         self.section_cache = section::SectionCache::new();
-        let (existing_id, setting) = self.resolve_target_for_download(target).await?;
-        let setting = setting.clone();
+        let (mut existing_id, setting) = self.resolve_target_for_download(target).await?;
+        let mut setting = setting.clone();
         if options.access.is_none() && (options.resume_from_section.is_some()
             || (options.creation_reservation.is_some() && existing_id.is_some())) {
             return Err(NarouError::DownloadResumeCorrupt("download checkpoint has no original writer fence".into()));
         }
+        if existing_id.is_none() && options.resume_from_section.is_some() && options.creation_reservation.is_none() {
+            return Err(NarouError::DownloadResumeCorrupt("new download checkpoint has no original ID reservation".into()));
+        }
+        // A wholly unresolved alias can discover its canonical URL before
+        // first admission. An admitted writer or creation never changes ID,
+        // and a same-URL absence remains a create intent across the probe.
+        let discovery = if existing_id.is_none() && options.access.is_none() && options.creation_reservation.is_none() {
+            let (url_captures, initial_url) = Self::download_toc_target(&setting, target, None);
+            let policy = crate::downloader::http_policy::FetchPolicy::for_site(&setting);
+            let mut discovery = crate::downloader::http_policy::resolve_final_url_with_body(
+                self.http.as_ref(), self.rate_limiter.as_ref(), &initial_url, &policy,
+            ).await;
+            if let Ok((final_url, _)) = &discovery {
+                let ageauth_url = Self::ageauth_redirect_target(final_url);
+                let final_url = ageauth_url.as_deref().unwrap_or(final_url);
+                if final_url != initial_url {
+                    let canonical_url = self.site_setting_for_url(final_url)
+                        .and_then(|setting| setting.toc_url_with_url_captures(final_url));
+                    let canonical_url = canonical_url.as_deref().unwrap_or(final_url);
+                    if canonical_url != initial_url
+                        && let Some(record) = self.novels.find_by_toc_url_current(canonical_url).await?
+                    {
+                        setting = self.site_setting_for_stored_target(&record, TargetType::Url)?.clone();
+                        existing_id = Some(record.id);
+                        // Canonical admission may select stored login cookies;
+                        // its source fetch must use that newly selected scope.
+                        if let Ok((_, body)) = &mut discovery { *body = None; }
+                    }
+                }
+            }
+            Some(DownloadDiscovery { url_captures, toc_url: initial_url, response: discovery })
+        } else { None };
         if options.access.is_none() && let Some(id) = existing_id {
             let record = self.novels.get_current(id.into()).await?.ok_or_else(|| NarouError::NotFound(format!("Novel not found: {id}")))?;
             options.access = Some(self.capture_write_for_record(&record).await?);
-        }
-        if existing_id.is_none() && options.resume_from_section.is_some() && options.creation_reservation.is_none() {
-            return Err(NarouError::DownloadResumeCorrupt("new download checkpoint has no original ID reservation".into()));
         }
         let mut creation = match options.creation_reservation {
             Some((id, generation)) => {
@@ -1454,7 +1507,7 @@ impl Downloader {
             if let Some(write) = options.access.as_ref() {
                 checkpoint_download_access(&mut options.budget, &write.origin(), creation.as_mut()).await?;
             }
-            self.download_novel_reserved(target, options, existing_id, setting, creation.as_mut()).await
+            self.download_novel_reserved(target, options, existing_id, setting, discovery, creation.as_mut()).await
         }.await;
         if let Some(creation) = creation {
             if creation.committed {
@@ -1475,6 +1528,7 @@ impl Downloader {
         mut options: DownloadExecutionOptions<'_>,
         existing_id: Option<i64>,
         mut setting: SiteSetting,
+        discovery: Option<DownloadDiscovery>,
         mut creation: Option<&mut DownloadCreation>,
     ) -> Result<DownloadResult> {
         let force = options.force;
@@ -1492,22 +1546,17 @@ impl Downloader {
             None
         };
 
-        let url_captures = db_toc_url
-            .as_deref()
-            .and_then(|url| setting.extract_url_captures(url))
-            .or_else(|| setting.extract_url_captures(target))
-            .or_else(|| ncode_target_url(target).and_then(|url| setting.extract_url_captures(&url)))
-            .unwrap_or_default();
-        let toc_url = if let Some(ref url) = db_toc_url {
-            url.clone()
-        } else if url_captures.is_empty() {
-            setting.toc_url()
-        } else {
-            let mut selects = url_captures.clone();
-            selects.insert("__target_url".to_string(), target.to_string());
-            setting.get_toc_url_with_captures(&selects)
+        let ((url_captures, toc_url), discovery) = match discovery {
+            Some(discovery) => {
+                let target = if existing_id.is_none() {
+                    (discovery.url_captures, discovery.toc_url)
+                } else {
+                    Self::download_toc_target(&setting, target, db_toc_url.as_deref())
+                };
+                (target, Some(discovery.response))
+            }
+            None => (Self::download_toc_target(&setting, target, db_toc_url.as_deref()), None),
         };
-        let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
         // Login fallback: a novel already flagged as needing authentication
         // sends the stored cookie from the first request; every other novel
         // stays anonymous until a fetch actually fails.
@@ -1544,15 +1593,13 @@ impl Downloader {
         let mut requires_login = login_cookie.is_some();
         let mut login_site_changed = false;
         let probe_policy = crate::downloader::http_policy::FetchPolicy::for_site(&setting);
-        let (resolved_toc_url, prefetched_toc) =
-            match crate::downloader::http_policy::resolve_final_url_with_body(
-                self.http.as_ref(),
-                self.rate_limiter.as_ref(),
-                &toc_url,
-                &probe_policy,
-            )
-            .await
-            {
+        let discovered = match discovery {
+            Some(discovery) => discovery,
+            None => crate::downloader::http_policy::resolve_final_url_with_body(
+                self.http.as_ref(), self.rate_limiter.as_ref(), &toc_url, &probe_policy,
+            ).await,
+        };
+        let (resolved_toc_url, prefetched_toc, redirected) = match discovered {
                 Ok((final_url, _body)) if final_url != toc_url => {
                     let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
                     if let Some(mut final_setting) = self.find_site_setting(&final_url) {
@@ -1572,32 +1619,25 @@ impl Downloader {
                                 .toc_url_with_url_captures(&final_url)
                                 .unwrap_or(final_url),
                             None,
+                            true,
                         )
                     } else {
-                        (final_url, None)
+                        (final_url, None, true)
                     }
                 }
-                Ok((final_url, body)) => (final_url, body),
-                Err(_) => (toc_url, None),
+                Ok((final_url, body)) => (final_url, body, false),
+                Err(_) => (toc_url, None, false),
             };
+        if redirected
+            && let Some(claimed) = self.novels.find_by_toc_url_current(&resolved_toc_url).await?
+            && claimed.id != provisional_id
+        {
+            return Err(NarouError::Platform(format!("novel_busy: redirect belongs to another admitted identity: {}", claimed.id)));
+        }
         let toc_url = resolved_toc_url;
         let url_captures = setting
             .extract_url_captures(&toc_url)
             .unwrap_or(url_captures);
-        // リダイレクト解決で toc_url が入力時と変わった場合、解決後の URL で
-        // 既存レコードを再照合して ID を引き継ぐ。別ドメインへ転送されるサイト
-        // (例: ハーメルンの h.syosetu.org 分離)で同じ小説が重複登録されるのを防ぐ。
-        let existing_id = match existing_id {
-            Some(id) => Some(id),
-            None => self
-                .novels
-                .find_by_toc_url(&toc_url)
-                .await
-                .ok()
-                .flatten()
-                .map(|record| record.id),
-        };
-        let provisional_id = existing_id.unwrap_or(provisional_id);
         let toc_source = match prefetched_toc {
             // The redirect probe already fetched the final URL with the same
             // cookie scope; reuse the body instead of a second GET.
@@ -1973,7 +2013,16 @@ impl Downloader {
         let object_keys = NovelObjectKeys::new(&sitename, &file_title, use_subdirectory)
             .map_err(|error| NarouError::Platform(error.to_string()))?;
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
-        // Existing works carry the epoch captured before the first HTTP await.
+        if existing_id.is_none() {
+            let by_url = self.novels.find_by_toc_url_current(&toc_url).await?;
+            let by_prefix = self.novels.find_by_storage_prefix_current(object_keys.prefix()).await?;
+            for claimed in [by_url, by_prefix].into_iter().flatten() {
+                if claimed.id != provisional_id {
+                    return Err(NarouError::Platform(format!("novel_busy: novel identity was registered during download: {}", claimed.id)));
+                }
+            }
+        }
+        // Existing works retain the epoch from first canonical admission.
         // A new prefix becomes knowable only after resolving the source TOC.
         let mut write = match options.access.take() {
             Some(write) => write,
@@ -1987,15 +2036,6 @@ impl Downloader {
         }
         if write.prefix() != &crate::platform::ObjectPrefix::from(object_keys.prefix().clone()) {
             return Err(NarouError::Platform("download writer belongs to another novel".into()));
-        }
-        if existing_id.is_none() {
-            let by_url = self.novels.find_by_toc_url_current(&toc_url).await?;
-            let by_prefix = self.novels.find_by_storage_prefix_current(object_keys.prefix()).await?;
-            for claimed in [by_url, by_prefix].into_iter().flatten() {
-                if claimed.id != provisional_id {
-                    return Err(NarouError::Platform(format!("novel_busy: novel identity was registered during download: {}", claimed.id)));
-                }
-            }
         }
         if !reacked {
             checkpoint_download_access(&mut budget, &write.origin(), creation.as_deref_mut()).await?;
@@ -3447,6 +3487,7 @@ is_narou: false
         let objects = Arc::new(MemoryObjectStore::new());
         let mut baseline = sample_record(chrono::Utc::now());
         baseline.id = 0;
+        baseline.toc_url = "https://example.com/n0000aa/".into();
         let novels = Arc::new(MemoryNovelRepository::from_records(vec![baseline]).with_objects(objects.clone()));
         let downloader = Downloader::with_platform_and_storage_and_settings(
             DownloaderPlatform {
@@ -4042,7 +4083,7 @@ is_narou: false
         );
 
         let primary = Arc::new(MemoryObjectStore::new());
-        let illustrations = Arc::new(MemoryObjectStore::new());
+        let illustrations = Arc::new(MemoryObjectStore::new_with_shared_authority(primary.as_ref()));
         let split = Arc::new(crate::platform::SplitStore::new(
             (primary.clone(), primary.clone()),
             (illustrations.clone(), illustrations.clone()),
@@ -5620,7 +5661,7 @@ is_narou: false
         .unwrap();
         let keys = NovelObjectKeys::new("Strong Budget Test", "n1234ab", false).unwrap();
 
-        downloader.download_novel(target).await.unwrap();
+        let initial = downloader.download_novel(target).await.unwrap();
         // 強更新の基準日 (`subupdate`) と保存済み本文の取得日を揃え、
         // 本文が変わったセクションだけが強更新の予定段階を通るようにする。
         let toc_bytes = objects.read_small(&keys.toc()).await.unwrap().unwrap();
@@ -5654,8 +5695,8 @@ is_narou: false
         // 取り直して前進しなくなる (修正前の livelock) ので、ここは必ず
         // 「保存済みの次」を指す。
         let checkpoint = Arc::new(MemoryObjectStore::new());
+        let origin = test_origin(&downloader, &keys).await;
         let mut budget = CheckpointBudget::new(YieldBeforeSection(1), checkpoint.clone());
-        let origin = test_origin(&downloader, &NovelObjectKeys::new("Strong Budget Test", "n1234ab", false).unwrap()).await;
         let partial = downloader
             .download_novel_with_execution_options(
                 target,
@@ -5668,8 +5709,15 @@ is_narou: false
             )
             .await
             .unwrap_err();
+        assert_eq!(budget.allocations, 0, "an existing-record update never allocates a replacement identity");
+        assert_eq!(budget.restorations, 0, "an ordinary update has no creation receipt to restore");
         let creation_reservation = budget.creation_reservation;
-        assert!(creation_reservation.is_some());
+        assert!(creation_reservation.is_none());
+        let checkpoint_key = ObjectKey::try_new(".narou-transfer/test-create-checkpoint").unwrap();
+        let checkpoint_bytes = checkpoint.read_small(&checkpoint_key).await.unwrap().unwrap();
+        let (saved_origin, saved_creation): (AccessOrigin, Option<(NovelId, i64)>) = serde_json::from_slice(&checkpoint_bytes).unwrap();
+        assert_eq!(saved_origin, origin.origin());
+        assert_eq!(saved_creation, creation_reservation);
         assert!(
             matches!(
                 partial,
@@ -5715,6 +5763,9 @@ is_narou: false
             )
             .await
             .unwrap_err();
+        assert_eq!(budget.creation_reservation, creation_reservation);
+        assert_eq!(budget.allocations, 0);
+        assert_eq!(budget.restorations, 0);
         assert!(
             matches!(
                 partial,
@@ -5751,8 +5802,14 @@ is_narou: false
             )
             .await
             .unwrap();
+        assert_eq!(budget.creation_reservation, creation_reservation);
+        assert_eq!(budget.allocations, 0);
+        assert_eq!(budget.restorations, 0);
         assert_eq!(partial.status, crate::downloader::types::UpdateStatus::Ok);
         assert_eq!(partial.updated_count, 2);
+        assert_eq!(partial.id, initial.id, "the update retains the existing novel identity");
+        assert_eq!(checkpoint.read_small(&checkpoint_key).await.unwrap().unwrap(), checkpoint_bytes,
+            "all update continuations retain the original epoch and no creation reservation");
         assert_eq!(
             http.requested_urls().iter().filter(|url| url.ends_with(section_1)).count(),
             1,
@@ -7500,46 +7557,61 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
 "#).unwrap();
         setting.compile();
         let record: crate::db::NovelRecord = serde_yaml::from_str("id: 1\nauthor: Author\ntitle: Original\nfile_title: n1234ab\ntoc_url: https://example.com/n1234ab/\nsitename: Fence Test\nlast_update: 2026-01-01T00:00:00Z\n").unwrap();
-        let store = Arc::new(MemoryObjectStore::new());
-        let repository = Arc::new(MemoryNovelRepository::from_records(vec![record.clone()]).with_objects(store.clone()));
-        let keys = NovelObjectKeys::new("Fence Test", "n1234ab", false).unwrap();
-        let http = MockHttpClient::new();
-        http.add_text("https://example.com/n1234ab/", 200, "<h1>Original</h1><span>Author</span><a href=\"/n1234ab/1/\">episode</a>");
-        http.add_text("https://example.com/n1234ab/1/", 200, "<div class=\"body\">old fetched body</div>");
-        let origins = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let http = Arc::new(ReplacingHttp { http, store: store.clone(), repository: repository.clone(), record, keys: keys.clone(), swapped: AtomicBool::new(false), origins: origins.clone() });
-        let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
-            DownloaderPlatform {
-                http: http.clone(), rate_limiter: Arc::new(FakeRateLimiter::new()), novels: repository.clone(),
-                objects: store.clone(), assets: store.clone(), clock: Arc::new(SystemClock),
-            }, vec![setting.clone()], HashMap::new(), Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
-        ).unwrap();
-        let mut budget = OriginBudget(origins.clone());
-        let error = downloader.download_novel_with_execution_options("1", DownloadExecutionOptions {
-            force: false, budget: Some(&mut budget), resume_from_section: None, access: None,
-            creation_reservation: None,
-        }).await.unwrap_err();
-        assert!(error.to_string().contains("novel_busy"), "{error}");
-        assert!(http.swapped.load(Ordering::SeqCst));
-        assert_eq!(store.read_small(&keys.section("1", "episode")).await.unwrap().unwrap(), b"replacement section bytes");
-        assert_eq!(store.read_small(&keys.converted_text()).await.unwrap().unwrap(), b"replacement output");
-        let toc = store.read_small(&keys.toc()).await.unwrap().unwrap();
-        assert_eq!(crate::downloader::persistence::deserialize_toc(&toc).unwrap().title, "Replacement");
-        assert_eq!(repository.get(1.into()).await.unwrap().unwrap().title, "Replacement");
-        let replacement_epoch = store.gate_info(&ObjectPrefix::from(keys.prefix().clone())).await.unwrap().epoch;
-        {
-            let origins = origins.lock();
-            assert_eq!(origins.len(), 2, "capture is checkpointed before HTTP and reused after it");
-            assert!(origins.iter().all(|origin| origin == &origins[0]), "continuation must retain the first epoch");
-            assert_ne!(origins[0].epoch, replacement_epoch);
+        for supplied_origin in [false, true] {
+            let store = Arc::new(MemoryObjectStore::new());
+            let repository = Arc::new(MemoryNovelRepository::from_records(vec![record.clone()]).with_objects(store.clone()));
+            let keys = NovelObjectKeys::new("Fence Test", "n1234ab", false).unwrap();
+            let http = MockHttpClient::new();
+            http.add_text("https://example.com/n1234ab/", 200, "<h1>Original</h1><span>Author</span><a href=\"/n1234ab/1/\">episode</a>");
+            http.add_text("https://example.com/n1234ab/1/", 200, "<div class=\"body\">old fetched body</div>");
+            let origins = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let http = Arc::new(ReplacingHttp { http, store: store.clone(), repository: repository.clone(), record: record.clone(), keys: keys.clone(), swapped: AtomicBool::new(false), origins: origins.clone() });
+            let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+                DownloaderPlatform {
+                    http: http.clone(), rate_limiter: Arc::new(FakeRateLimiter::new()), novels: repository.clone(),
+                    objects: store.clone(), assets: store.clone(), clock: Arc::new(SystemClock),
+                }, vec![setting.clone()], HashMap::new(), Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
+            ).unwrap();
+            let access = if supplied_origin { Some(downloader.capture_write_for_record(&record).await.unwrap()) } else { None };
+            let mut budget = OriginBudget(origins.clone());
+            let error = downloader.download_novel_with_execution_options("1", DownloadExecutionOptions {
+                force: false, budget: Some(&mut budget), resume_from_section: None, access,
+                creation_reservation: None,
+            }).await.unwrap_err();
+            assert!(error.to_string().contains("novel_busy"), "{error}");
+            assert!(http.swapped.load(Ordering::SeqCst));
+            assert_eq!(store.read_small(&keys.section("1", "episode")).await.unwrap().unwrap(), b"replacement section bytes");
+            assert_eq!(store.read_small(&keys.converted_text()).await.unwrap().unwrap(), b"replacement output");
+            let toc = store.read_small(&keys.toc()).await.unwrap().unwrap();
+            assert_eq!(crate::downloader::persistence::deserialize_toc(&toc).unwrap().title, "Replacement");
+            assert_eq!(repository.get(1.into()).await.unwrap().unwrap().title, "Replacement");
+            let replacement_epoch = store.gate_info(&ObjectPrefix::from(keys.prefix().clone())).await.unwrap().epoch;
+            {
+                let origins = origins.lock();
+                assert_eq!(origins.len(), 2, "capture is checkpointed before HTTP and reused after it");
+                assert!(origins.iter().all(|origin| origin == &origins[0]), "continuation must retain the first epoch");
+                assert_ne!(origins[0].epoch, replacement_epoch);
+            }
         }
 
         // The prefix cannot be known until a new work's first TOC fetch.
         // A transfer may claim either its URL or the same physical prefix
         // while that fetch awaits; a fresh late capture must not bless it.
-        for claimed_url in ["https://example.com/n1234ab/", "https://example.com/different-url/"] {
+        for (claimed_url, owns_creation) in [
+            ("https://example.com/n1234ab/", false), ("https://example.com/different-url/", false),
+            ("https://example.com/n1234ab/", true), ("https://example.com/different-url/", true),
+        ] {
             let store = Arc::new(MemoryObjectStore::new());
-            let repository = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
+            let mut baseline = sample_record(chrono::Utc::now());
+            baseline.id = 0;
+            baseline.toc_url = "https://example.com/n0000aa/".into();
+            let repository = Arc::new(MemoryNovelRepository::from_records(vec![baseline]).with_objects(store.clone()));
+            let creation_reservation = if owns_creation {
+                let reservation = repository.allocate_id().await.unwrap();
+                let pair = (reservation.id(), reservation.generation());
+                reservation.adopt();
+                Some(pair)
+            } else { None };
             let keys = NovelObjectKeys::new("Fence Test", "n1234ab", false).unwrap();
             let imported: crate::db::NovelRecord = serde_yaml::from_str(&format!(
                 "id: 1\nauthor: Author\ntitle: Original\nfile_title: n1234ab\ntoc_url: {claimed_url}\nsitename: Fence Test\nlast_update: 2026-01-01T00:00:00Z\n",
@@ -7557,7 +7629,9 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
                     objects: store.clone(), assets: store.clone(), clock: Arc::new(SystemClock),
                 }, vec![setting.clone()], HashMap::new(), Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
             ).unwrap();
-            let error = downloader.download_novel("https://example.com/n1234ab/").await.unwrap_err();
+            let error = downloader.download_novel_with_execution_options("https://example.com/n1234ab/", DownloadExecutionOptions {
+                force: false, budget: None, resume_from_section: None, access: None, creation_reservation,
+            }).await.unwrap_err();
             assert!(error.to_string().contains("novel_busy"), "{error}");
             assert!(http.swapped.load(Ordering::SeqCst));
             assert_eq!(store.read_small(&keys.section("1", "episode")).await.unwrap().unwrap(), b"replacement section bytes");
@@ -7565,9 +7639,132 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
             let toc = store.read_small(&keys.toc()).await.unwrap().unwrap();
             assert_eq!(crate::downloader::persistence::deserialize_toc(&toc).unwrap().title, "Replacement");
             let claimed = repository.find_by_toc_url_current(claimed_url).await.unwrap().unwrap();
-            assert_ne!(claimed.id, 1, "transfer must not reuse the downloader's live ID reservation");
+            if let Some((id, generation)) = creation_reservation {
+                assert_ne!(claimed.id, id.0, "transfer must not reuse the downloader's live ID reservation");
+                assert!(repository.get_current(id).await.unwrap().is_none());
+                let reservation = repository.resume_id(id, generation).await.unwrap();
+                repository.release_id(reservation).await.unwrap();
+            }
             assert_eq!(claimed.title, "Replacement");
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_redirect_admits_once_without_replacing_an_owned_identity() {
+        struct NoYield;
+        impl SectionBudget for NoYield { fn should_yield(&mut self, _: usize) -> bool { false } }
+        let definition = r#"
+name: Redirect Test
+domain: alias.test
+top_url: https://alias.test
+url: 'https://alias\.test/(?<ncode>n\d+[a-z]+)/?'
+sitename: Redirect Test
+toc_url: 'https://alias.test/\k<ncode>/'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+subtitles: '<a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>'
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+is_narou: false
+"#;
+        let mut alias_setting: SiteSetting = serde_yaml::from_str(definition).unwrap();
+        let mut canonical_setting: SiteSetting = serde_yaml::from_str(&definition.replace("alias", "canonical")).unwrap();
+        alias_setting.compile();
+        canonical_setting.compile();
+        let alias_url = "https://alias.test/n1234ab/";
+        let canonical_url = "https://canonical.test/n1234ab/";
+        let mut record = sample_record(chrono::Utc::now());
+        record.id = 0;
+        record.title = "Redirected".into();
+        record.author = "Author".into();
+        record.sitename = "Redirect Test".into();
+        record.file_title = "kept-directory".into();
+        record.toc_url = canonical_url.into();
+        record.domain = Some("canonical.test".into());
+        let store = Arc::new(MemoryObjectStore::new());
+        let novels = Arc::new(MemoryNovelRepository::from_records(vec![record.clone()]).with_objects(store.clone()));
+        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, false).unwrap();
+        let retained = keys.prefix().join("retained.dat").unwrap();
+        store.write_small(&retained, b"canonical retained bytes".to_vec()).await.unwrap();
+        let http = Arc::new(MockHttpClient::new());
+        http.add_response(alias_url, HttpResponse {
+            status: 302, headers: vec![("Location".into(), canonical_url.into())], body: Vec::new(),
+        });
+        http.add_text(canonical_url, 200, "<h1>Redirected</h1><span>Author</span><a href=\"/n1234ab/1/\">episode</a>");
+        http.add_text("https://canonical.test/n1234ab/1/", 200, "<div class=\"body\">canonical body</div>");
+        let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+            DownloaderPlatform {
+                http: http.clone(), rate_limiter: Arc::new(FakeRateLimiter::new()), novels: novels.clone(),
+                objects: store.clone(), assets: store.clone(), clock: Arc::new(SystemClock),
+            }, vec![alias_setting.clone(), canonical_setting.clone()], HashMap::new(),
+            Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
+        ).unwrap();
+        let checkpoint = Arc::new(MemoryObjectStore::new());
+        let mut budget = CheckpointBudget::new(NoYield, checkpoint.clone());
+        let result = downloader.download_novel_with_execution_options(alias_url, DownloadExecutionOptions {
+            force: false, budget: Some(&mut budget), resume_from_section: None, access: None, creation_reservation: None,
+        }).await.unwrap();
+        assert_eq!(result.id, record.id);
+        assert!(!result.new_novel);
+        assert_eq!(budget.allocations, 0, "canonical discovery admits the existing identity before allocating a creation");
+        assert_eq!(budget.restorations, 0);
+        assert!(budget.creation_reservation.is_none());
+        let saved = checkpoint.read_small(&ObjectKey::try_new(".narou-transfer/test-create-checkpoint").unwrap()).await.unwrap().unwrap();
+        let (origin, creation): (AccessOrigin, Option<(NovelId, i64)>) = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(origin.prefix.as_str(), keys.prefix().as_ref());
+        assert!(creation.is_none());
+        assert_eq!(store.read_small(&retained).await.unwrap().unwrap(), b"canonical retained bytes");
+        let body = store.read_small(&keys.section("1", "episode")).await.unwrap().unwrap();
+        let section: SectionFile = serde_yaml::from_slice(&body).unwrap();
+        assert_eq!(section.element.body, "canonical body");
+        let toc = store.read_small(&keys.toc()).await.unwrap().unwrap();
+        let requested = http.requested_urls();
+        assert_eq!(requested.iter().filter(|url| url.ends_with(alias_url)).count(), 1);
+        assert_eq!(requested.iter().filter(|url| url.ends_with(canonical_url)).count(), 2,
+            "redirect discovery is reused; only the cookie-scoped canonical fetch follows it");
+
+        // Once a creation is owned, the same redirect is a competing identity,
+        // not permission to adopt the canonical record or its newer writer.
+        let reservation = novels.allocate_id().await.unwrap();
+        let creation = (reservation.id(), reservation.generation());
+        reservation.adopt();
+        let mut budget = CheckpointBudget::new(NoYield, Arc::new(MemoryObjectStore::new()));
+        let error = downloader.download_novel_with_execution_options(alias_url, DownloadExecutionOptions {
+            force: false, budget: Some(&mut budget), resume_from_section: None, access: None,
+            creation_reservation: Some(creation),
+        }).await.unwrap_err();
+        assert!(error.to_string().contains("novel_busy"), "{error}");
+        assert_eq!(budget.allocations, 0);
+        assert_eq!(budget.restorations, 1);
+        assert_eq!(store.read_small(&keys.section("1", "episode")).await.unwrap().unwrap(), body);
+        assert_eq!(store.read_small(&keys.toc()).await.unwrap().unwrap(), toc);
+        assert!(novels.get_current(creation.0).await.unwrap().is_none());
+        let reservation = novels.resume_id(creation.0, creation.1).await.unwrap();
+        novels.release_id(reservation).await.unwrap();
+
+        // An already-known alias likewise keeps its original ID and prefix.
+        let mut source = record.clone();
+        source.id = 1;
+        source.sitename = "Alias Source".into();
+        source.file_title = "kept-source".into();
+        source.toc_url = alias_url.into();
+        let source_keys = NovelObjectKeys::new(&source.sitename, &source.file_title, false).unwrap();
+        let source_body = source_keys.section("1", "episode");
+        store.write_small(&source_body, b"original source bytes".to_vec()).await.unwrap();
+        let current = novels.get_current(record.id.into()).await.unwrap().unwrap();
+        let novels = Arc::new(MemoryNovelRepository::from_records(vec![current, source.clone()]).with_objects(store.clone()));
+        let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+            DownloaderPlatform {
+                http, rate_limiter: Arc::new(FakeRateLimiter::new()), novels: novels.clone(),
+                objects: store.clone(), assets: store.clone(), clock: Arc::new(SystemClock),
+            }, vec![alias_setting, canonical_setting], HashMap::new(),
+            Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
+        ).unwrap();
+        let error = downloader.download_novel(alias_url).await.unwrap_err();
+        assert!(error.to_string().contains("novel_busy"), "{error}");
+        assert_eq!(store.read_small(&source_body).await.unwrap().unwrap(), b"original source bytes");
+        assert_eq!(store.read_small(&keys.section("1", "episode")).await.unwrap().unwrap(), body);
+        assert_eq!(store.read_small(&keys.toc()).await.unwrap().unwrap(), toc);
+        assert_eq!(novels.get_current(source.id.into()).await.unwrap().unwrap().toc_url, alias_url);
     }
 
 

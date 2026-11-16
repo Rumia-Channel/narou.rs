@@ -91,7 +91,7 @@ async function exercise(state){
   validate(state);
   const tailPath=`/workers/scripts/${state.workerName}/tails`;
   const record=await api(tailPath,{method:'POST',body:{filters:[]}});
-  assert.match(record?.id??'',/^[a-f0-9-]{36}$/i);
+  assert(typeof record?.id==='string'&&record.id.length>0,'disposable transfer tail has no opaque identifier');
   const address=new URL(record.url);assert.equal(address.protocol,'wss:');
   let socket,closing=false,tailFailure;
   try{
@@ -126,7 +126,7 @@ async function exercise(state){
     assert.equal(tailFailure,undefined,'disposable transfer tail lost diagnostic coverage');
   }finally{
     closing=true;socket?.close();
-    await api(`${tailPath}/${record.id}`,{method:'DELETE',missing:true});
+    await api(`${tailPath}/${encodeURIComponent(record.id)}`,{method:'DELETE',missing:true});
   }
 }
 async function cleanup(){
