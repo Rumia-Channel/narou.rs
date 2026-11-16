@@ -197,25 +197,6 @@ pub fn keep_converted_text_file() -> bool {
     )
 }
 
-/// 旧バージョンが小説ディレクトリへ書いていた固定名ミラー `novel.txt` を消す。
-///
-/// native の変換結果を読むのは per-title の txt と SQLite の `novel_outputs`
-/// だけで、`novel.txt` は ObjectStore 互換を目的にした内部ミラーだった
-/// (issue #40: `convert.keep-txt=true` で同じ内容の txt が 2 つ残っていた)。
-/// 変換出力自体が `novel.txt` という名前になる設定 (`convert.filename`) では
-/// 消さない。
-#[cfg(feature = "native-runtime")]
-fn remove_legacy_converted_text_mirror(novel_dir: &Path, txt_path: &Path) {
-    let output_uses_mirror_name = txt_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("novel.txt"));
-    if output_uses_mirror_name {
-        return;
-    }
-    let _ = std::fs::remove_file(novel_dir.join("novel.txt"));
-}
-
 /// セクション変換キャッシュを作るか。
 ///
 /// 環境変数 `NAROU_RS_SECTION_CACHE` (0/false/no/off で無効) が最優先、
@@ -1152,8 +1133,6 @@ impl NovelConverter {
         );
         crate::application::novel_access::require_private_path(&txt_path)?;
         std::fs::write(&txt_path, &aozora_text)?;
-        // 旧バージョンが書いた固定名ミラー `novel.txt` を片付ける (issue #40)。
-        remove_legacy_converted_text_mirror(novel_dir, &txt_path);
         #[cfg(feature = "native-runtime")]
         {
             self.last_text_path = Some(txt_path.clone());
@@ -1215,8 +1194,6 @@ impl NovelConverter {
         );
         crate::application::novel_access::require_private_path(&txt_path)?;
         std::fs::write(&txt_path, &aozora_text)?;
-        // 旧バージョンが書いた固定名ミラー `novel.txt` を片付ける (issue #40)。
-        remove_legacy_converted_text_mirror(novel_dir, &txt_path);
         #[cfg(feature = "native-runtime")]
         {
             self.last_text_path = Some(txt_path.clone());
