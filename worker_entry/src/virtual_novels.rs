@@ -148,51 +148,53 @@ async fn mutate_membership_at_origins(
     prepared: &std::collections::BTreeMap<i64, narou_rs::platform::WriteFence>,
 ) -> Result<()> {
     let db = runtime.write_db();
-    // Discover affected identities, then retain one original fence for each
-    // through every membership/tag-sequence CAS retry and the final D1 batch.
+    // Keep each identity's first fence across CAS retries. A concurrent append
+    // may introduce another member; admit only that newly discovered identity,
+    // never recapture or upgrade an existing fence.
     let discovered = read(db).await?;
     let parent_id = match mutation {
         MembershipMutation::Create { record, .. } => record.id,
         MembershipMutation::Append { id, .. } | MembershipMutation::Reorder { id, .. }
         | MembershipMutation::Remove(id) => id,
     };
-    let mut affected = std::collections::BTreeSet::new();
-    affected.insert(parent_id);
-    if let Some(members) = discovered.get(parent_id) { affected.extend(members.iter().copied()); }
+    let mut origins: std::collections::BTreeMap<_, Option<narou_rs::platform::WriteFence>> = std::collections::BTreeMap::new();
+    origins.insert(parent_id, None);
+    if let Some(members) = discovered.get(parent_id) { origins.extend(members.iter().map(|id| (*id, None))); }
     match mutation {
-        MembershipMutation::Create { members, .. } | MembershipMutation::Append { members, .. } => affected.extend(members.iter().copied()),
-        MembershipMutation::Reorder { ordered, .. } => affected.extend(ordered.iter().copied()),
+        MembershipMutation::Create { members, .. } | MembershipMutation::Append { members, .. } => origins.extend(members.iter().map(|id| (*id, None))),
+        MembershipMutation::Reorder { ordered, .. } => origins.extend(ordered.iter().map(|id| (*id, None))),
         MembershipMutation::Remove(_) => {},
     }
     let repository = crate::d1_repository::D1NovelRepository::new(db.clone()).with_objects(runtime.write_objects());
-    let mut origins = Vec::with_capacity(affected.len());
-    for id in &affected {
-        let record = match mutation {
-            MembershipMutation::Create { record, .. } if *id == record.id => std::borrow::Cow::Borrowed(record),
-            _ => {
-                let record = repository.get(narou_rs::platform::NovelId(*id)).await?
-                    .ok_or_else(|| NarouError::NotFound(format!("小説 {id} がありません")))?;
-                repository.bind_record_origin(&record).await?;
-                std::borrow::Cow::Owned(record)
-            }
-        };
-        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
-        let origin = match prepared.get(id) {
-            Some(origin) if origin.prefix.as_ref().trim_end_matches('/') == keys.prefix().as_ref() => origin.clone(),
-            Some(_) => return Err(db_error("virtual member namespace changed after source admission")),
-            None => NovelWriteGuard::capture_for(&runtime.write_objects(), None, &keys).await?.fence().clone(),
-        };
-        origins.push(origin);
-    }
     let storage = crate::d1_object_store::D1ObjectStore::new(db.clone());
     for _ in 0..8 {
         let Snapshot { raw_json, mut members } = read_snapshot(db).await?;
-        if members.get(parent_id).is_some_and(|members| members.iter().any(|id| !affected.contains(id))) {
-            return Err(db_error("virtual membership changed after writer admission"));
+        if let Some(current) = members.get(parent_id) {
+            for id in current { origins.entry(*id).or_insert(None); }
+        }
+        for (id, origin) in &mut origins {
+            if origin.is_some() { continue; }
+            let record = match mutation {
+                MembershipMutation::Create { record, .. } if *id == record.id => std::borrow::Cow::Borrowed(record),
+                _ => {
+                    let record = repository.get(narou_rs::platform::NovelId(*id)).await?
+                        .ok_or_else(|| NarouError::NotFound(format!("小説 {id} がありません")))?;
+                    repository.bind_record_origin(&record).await?;
+                    std::borrow::Cow::Owned(record)
+                }
+            };
+            let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+            let captured = match prepared.get(id) {
+                Some(origin) if origin.prefix.as_ref().trim_end_matches('/') == keys.prefix().as_ref() => origin.clone(),
+                Some(_) => return Err(db_error("virtual member namespace changed after source admission")),
+                None => NovelWriteGuard::capture_for(&runtime.write_objects(), None, &keys).await?.fence().clone(),
+            };
+            *origin = Some(captured);
         }
         let mut statements = Vec::new();
         let mut guard_tokens = Vec::with_capacity(origins.len());
-        for origin in &origins {
+        for origin in origins.values() {
+            let origin = origin.as_ref().ok_or_else(|| db_error("virtual write authority missing after capture"))?;
             let token = crate::content_store::nonce()?;
             statements.push(storage.open_guard(origin, &token)?);
             guard_tokens.push(token);
