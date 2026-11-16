@@ -779,11 +779,18 @@ impl Database {
                     id_reservations::retire_yaml(self, &updated)?;
                     files.publish_transfer()?;
                     if let Some(marker) = transfer_marker {
+                        // The durable commit mark IS the immutable publication
+                        // receipt; committed()/metadata recovery byte-compare it.
                         let committed = crate::db::inventory::atomic_write_locked(
-                            &marker.yaml_commit_path, "committed",
+                            &marker.yaml_commit_path,
+                            std::str::from_utf8(&marker.receipt).map_err(|error| {
+                                crate::error::NarouError::Platform(format!(
+                                    "transfer receipt is not UTF-8 JSON: {error}"
+                                ))
+                            })?,
                         );
                         files.committed = committed.is_ok() || match std::fs::read(&marker.yaml_commit_path) {
-                            Ok(bytes) => bytes == b"committed",
+                            Ok(bytes) => bytes == marker.receipt,
                             // Leave an uncertain outcome to durable journal
                             // recovery; do not silently roll back a committed mark.
                             Err(error) => error.kind() != std::io::ErrorKind::NotFound,

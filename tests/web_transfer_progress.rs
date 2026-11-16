@@ -208,13 +208,13 @@ fn export_profile(client:&Client,server:&Server,library:&Path,ids:&[i64],profile
     control(client,server,"exports",&secret,&mut status,"select",json!({"profile":profile,"extra_roles":[],"selection_digest":digest}));
     advance(client,server,"exports",&secret,&mut status);assert_eq!(status["state"],"ready");
     let mut manifest_bytes=Vec::new();let mut index=0;
-    loop{let path=format!("/api/transfer/v2/exports/{}/manifest/chunks/{index}",session_id(&status));let response=authenticated(client,server,reqwest::Method::GET,&path,Some(&secret)).send().unwrap();assert!(response.status().is_success());let last=response.headers()["x-transfer-last"]=="true";let total=response.headers()["x-transfer-manifest-bytes"].to_str().unwrap().parse::<usize>().unwrap();let bytes=response.bytes().unwrap();assert!(bytes.len() as u64<=protocol::CHUNK_BYTES);manifest_bytes.extend_from_slice(&bytes);if last{assert_eq!(manifest_bytes.len(),total);break;}index+=1;}
+    loop{let path=format!("/api/transfer/v2/exports/{}/manifest/chunks/{index}",session_id(&status));let response=authenticated(client,server,reqwest::Method::GET,&path,Some(&secret)).send().unwrap();assert!(response.status().is_success());let last=response.headers()["x-transfer-last"]=="true";let declared=response.headers()["x-transfer-body-bytes"].to_str().unwrap().parse::<usize>().unwrap();let total=response.headers()["x-transfer-manifest-bytes"].to_str().unwrap().parse::<usize>().unwrap();let bytes=response.bytes().unwrap();assert_eq!(bytes.len(),declared,"manifest chunk body must equal x-transfer-body-bytes");assert!(bytes.len() as u64<=protocol::CHUNK_BYTES);manifest_bytes.extend_from_slice(&bytes);if last{assert_eq!(manifest_bytes.len(),total);break;}index+=1;}
     let manifest:ArchiveManifest=serde_json::from_slice(&manifest_bytes).unwrap();assert_eq!(manifest.novels.len(),ids.len());
     assert!(!manifest.novels.iter().flat_map(|n|&n.files).any(|f|f.path=="db.sqlite"));if profile==TransferProfile::Runtime{assert!(!manifest.novels.iter().flat_map(|n|&n.files).any(|f|f.path.starts_with("raw/")||f.path.starts_with("本文/cache/")));}else{assert!(manifest.novels.iter().flat_map(|n|&n.files).any(|f|f.path=="raw/download.html"));}
     let mut payloads=BTreeMap::<u32,Vec<u8>>::new();let mut batch=0;
     loop{let response=authenticated(client,server,reqwest::Method::GET,&format!("/api/transfer/v2/exports/{}/batches/{batch}",session_id(&status)),Some(&secret)).send().unwrap();assert!(response.status().is_success());let last=response.headers()["x-transfer-last"]=="true";let expected=response.headers()["x-transfer-record-count"].to_str().unwrap().parse::<usize>().unwrap();let total=response.headers()["x-transfer-body-bytes"].to_str().unwrap().parse::<usize>().unwrap();let body=response.bytes().unwrap();assert_eq!(body.len(),total);assert!(body.len() as u64<=protocol::BINARY_BODY_MAX_BYTES);let mut decoder=FrameDecoder::new();let frames=decoder.feed(&body).unwrap();assert!(decoder.finish().unwrap().is_empty());assert_eq!(frames.len(),expected);for frame in frames{let bytes=payloads.entry(frame.header.file_id).or_default();assert_eq!(bytes.len() as u64,u64::from(frame.header.chunk_index)*protocol::CHUNK_BYTES);bytes.extend(frame.payload);if frame.header.is_final{let file=manifest.novels.iter().flat_map(|n|&n.files).nth(frame.header.file_id as usize).unwrap();assert_eq!(bytes.len() as u64,file.size.unwrap());assert_eq!(sha256_hex(bytes),file.sha256.as_deref().unwrap());}}if last{break;}batch+=1;}
     assert!(batch<10,"small files must use batches, not one GET per file");
-    let direct=authenticated(client,server,reqwest::Method::GET,&format!("/api/transfer/v2/exports/{}/files/0/chunks/0",session_id(&status)),Some(&secret)).send().unwrap();assert!(direct.status().is_success());assert_eq!(direct.bytes().unwrap().as_ref(),payloads[&0].as_slice());
+    let direct=authenticated(client,server,reqwest::Method::GET,&format!("/api/transfer/v2/exports/{}/files/0/chunks/0",session_id(&status)),Some(&secret)).send().unwrap();assert!(direct.status().is_success());let declared=direct.headers()["x-transfer-body-bytes"].to_str().unwrap().parse::<usize>().unwrap();let bytes=direct.bytes().unwrap();assert_eq!(bytes.len(),declared,"file chunk body must equal x-transfer-body-bytes");assert_eq!(bytes.as_ref(),payloads[&0].as_slice());
     control(client,server,"exports",&secret,&mut status,"complete",json!({}));advance(client,server,"exports",&secret,&mut status);assert_eq!(status["state"],"released");
     (manifest,payloads)
 }
@@ -269,6 +269,10 @@ fn native_web_v2_roundtrips_158_novels_with_durable_receipts_and_runtime_project
     let one=ArchiveManifest{novels:vec![first.clone()],..parsed.manifest.clone()};let mut one_payloads=BTreeMap::new();for(index,file)in first.files.iter().enumerate(){one_payloads.insert(index as u32,parsed.novels[0].files.iter().find(|(path,_)|path==&file.path).unwrap().1.clone());}
     let overwritten=import_projected(&client,&target_server,&one,&fingerprint,&one_payloads,true,TransferProfile::Runtime);assert_eq!(overwritten["published_novels"],1);assert_eq!(std::fs::read(directory.join("keep-user-note.txt")).unwrap(),b"keep exact extra bytes");
     let (complete,complete_bytes)=export_profile(&client,&source_server,&source,&ids[..1],TransferProfile::Complete);let complete_fingerprint=narou_rs::transfer::source_fingerprint(&complete).unwrap();let imported=import_projected(&client,&target_server,&complete,&complete_fingerprint,&complete_bytes,true,TransferProfile::Complete);assert_eq!(imported["published_novels"],1);assert_eq!(std::fs::read(directory.join("raw/download.html")).unwrap(),vec![b'R';3*1024*1024]);assert_eq!(std::fs::read(directory.join("本文/cache/old.yaml")).unwrap(),"body: 過去本文\n".as_bytes());
+    // The durable commit mark IS the immutable publication receipt: every
+    // finished publication must carry the receipt bytes verbatim, match the
+    // immutable expected receipt and resolve its metadata journal as committed.
+    let mut marks=0;for session in std::fs::read_dir(target.join(".narou/transfer/publications")).unwrap(){for publication in std::fs::read_dir(session.unwrap().path()).unwrap(){let publication=publication.unwrap().path();if let Ok(committed)=std::fs::read(publication.join("committed")){assert_eq!(committed,std::fs::read(publication.join("expected-receipt")).unwrap(),"durable commit mark must be the immutable receipt");serde_json::from_slice::<Value>(&committed).unwrap();assert_eq!(std::fs::read(publication.join("metadata-resolved")).unwrap(),b"committed");marks+=1;}}}assert!(marks>=3,"{marks}");
     for admin in [false,true]{let secret=hex::encode([43u8;32]);let mut cancelled=create(&client,&source_server,"exports",&secret,json!({"ids":[ids[0]],"profile":"runtime","extra_roles":[]}));let id=session_id(&cancelled).to_owned();let path=format!("/api/transfer/v2/{}/{id}",if admin{"sessions"}else{"exports"});let body=json!({"operation_id":uuid::Uuid::new_v4().to_string()});let etag=format!("\"{}\"",revision(&cancelled));let send=||with_json(authenticated(&client,&source_server,reqwest::Method::DELETE,&path,(!admin).then_some(secret.as_str())).header("if-match",&etag), &body).send().unwrap();let result=decode(send());assert_eq!(result,decode(send()));cancelled=result;advance(&client,&source_server,"exports",&secret,&mut cancelled);assert_eq!(cancelled["state"],"cancelled");}
 
 }
@@ -287,5 +291,55 @@ fn native_cli_and_web_v2_reject_selected_parent_with_unselected_child_before_cat
     let output=temp.path().join(if use_subdirectory{"physical-flat-parent-only.zip"}else{"logical-parent-only.zip"});let result=Command::new(env!("CARGO_BIN_EXE_narou_rs")).args(["export",&parent.id.to_string(),"--output"]).arg(&output).current_dir(&source).env("HOME",&source).env("USERPROFILE",&source).env_remove("NAROU_RS_LEGACY_YAML").env_remove("NAROU_RS_MIRROR_FILES").stdin(Stdio::null()).output().unwrap();let diagnostic=format!("{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));assert!(!result.status.success(),"{diagnostic}");assert!(diagnostic.contains("namespace")||diagnostic.contains("overlap")||diagnostic.contains("重な"),"export must fail at real namespace admission: {diagnostic}");assert!(!output.exists(),"a failed export must not publish an archive containing child bytes");
     let server=start(&source);let client=Client::builder().timeout(Duration::from_secs(60)).build().unwrap();let secret=hex::encode([31u8;32]);let mut status=create(&client,&server,"exports",&secret,json!({"ids":[parent.id],"profile":TransferProfile::Runtime,"extra_roles":[]}));let root=format!("/api/transfer/v2/exports/{}",session_id(&status));let mut rejected=false;for _ in 0..32{let response=with_json(authenticated(&client,&server,reqwest::Method::POST,&format!("{root}/advance"),Some(&secret)).header("if-match",revision(&status)), &json!({"operation_id":status["operation_id"]})).send().unwrap();let successful=response.status().is_success();let text=response.text().unwrap();if text.contains("ambiguous_source_namespace"){rejected=true;break;}assert!(successful,"unexpected source failure: {text}");status=serde_json::from_str(&text).unwrap();assert_eq!(status["next_action"],"advance","source must not become selectable before namespace admission: {status}");}assert!(rejected,"selected parent must reject the real unselected child namespace");assert!(page_items(&client,&server,&format!("{root}/catalog"),&secret).is_empty(),"no child paths may enter the parent catalog");let response=authenticated(&client,&server,reqwest::Method::GET,&format!("{root}/manifest/chunks/0"),Some(&secret)).send().unwrap();assert!(!response.status().is_success());assert!(!response.text().unwrap().contains(child_marker));assert!(std::fs::read_to_string(child_directory.join("本文/1.yaml")).unwrap().contains(child_marker));
     }
+}
+
+/// The DB-only backend (`storage-backend=sqlite`, `sqlite.mirror-files=false`)
+/// performs the same authenticated v2 import and export without materializing
+/// any novel file: canonical bytes live only in `.narou/db.sqlite`. Receipts,
+/// metadata-resolution recovery marks and payloads must match the YAML-backend
+/// contract byte for byte. The legacy CLI import restriction is unaffected.
+#[test]
+fn native_web_v2_sqlite_db_only_imports_exports_and_recovers_without_mirror_files(){
+    let temp=test_root();let source=temp.path().join("source");let target=temp.path().join("target");let ids=seed_novels(&source,1);
+    std::fs::create_dir_all(target.join(".narou")).unwrap();
+    std::fs::write(target.join(".narou/storage-backend"),"sqlite\n").unwrap();
+    std::fs::write(target.join(".narou/local_setting.yaml"),"sqlite.mirror-files: false\n").unwrap();
+    let source_server=start(&source);let target_server=start(&target);let client=Client::builder().timeout(Duration::from_secs(60)).build().unwrap();
+    let (manifest,payloads)=export_profile(&client,&source_server,&source,&ids,TransferProfile::Runtime);
+    let fingerprint=narou_rs::transfer::source_fingerprint(&manifest).unwrap();
+    let imported=import_projected(&client,&target_server,&manifest,&fingerprint,&payloads,false,TransferProfile::Runtime);assert_eq!(imported["published_novels"],1);
+    let mut mirrored=Vec::new();let mut stack=vec![target.join("小説データ")];
+    while let Some(directory)=stack.pop(){if !directory.is_dir(){continue;}for entry in std::fs::read_dir(&directory).unwrap(){let entry=entry.unwrap();if entry.file_type().unwrap().is_dir(){stack.push(entry.path());}else{mirrored.push(entry.path());}}}
+    assert!(mirrored.is_empty(),"DB-only import must not materialize novel files: {mirrored:?}");
+    let connection=narou_rs::native::sqlite::open(&target.join(".narou/db.sqlite")).unwrap();
+    let novel_id:i64=connection.query_row("SELECT id FROM novels WHERE toc_url=?",[&manifest.novels[0].toc_url],|row|row.get(0)).unwrap();
+    let referenced:i64=connection.query_row("SELECT COUNT(*) FROM transfer_object_refs",[],|row|row.get(0)).unwrap();
+    assert_eq!(referenced as usize,manifest.novels[0].files.len(),"every published file must reference a stored blob");
+    let session=session_id(&imported);let publication_root=target.join(".narou/transfer/publications").join(session).join("0000000000");
+    let expected=std::fs::read(publication_root.join("expected-receipt")).unwrap();
+    let receipt=serde_json::from_slice::<Value>(&expected).unwrap();assert_eq!(receipt["assigned_id"],novel_id);
+    let mark:Vec<u8>=connection.query_row("SELECT value FROM transfer_backend_marks WHERE key=?1",[format!("commit:{session}:0")],|row|row.get(0)).unwrap();
+    assert_eq!(mark,expected,"SQL durable mark must be the immutable expected receipt");
+    assert_eq!(std::fs::read(publication_root.join("metadata-resolved")).unwrap(),b"committed");
+    // Export the same record back through v2: DB-only reads are served by the
+    // object store and must reproduce the imported manifest and payload bytes.
+    let secret=hex::encode([7u8;32]);
+    let mut status=create(&client,&target_server,"exports",&secret,json!({"ids":[novel_id],"profile":TransferProfile::Runtime,"extra_roles":[]}));
+    advance(&client,&target_server,"exports",&secret,&mut status);assert_eq!(status["state"],"selecting");
+    let root=format!("/api/transfer/v2/exports/{}",session_id(&status));
+    let catalog=page_items(&client,&target_server,&format!("{root}/catalog"),&secret);
+    let selected=catalog.iter().map(|r|(r["novel_ordinal"].as_u64().unwrap() as u32,r["logical_path"].as_str().unwrap().to_owned(),r["size"].as_str().unwrap().parse().unwrap(),FileRole::parse(r["role"].as_str().unwrap()).unwrap())).collect::<Vec<_>>();
+    let digest=TransferService::selection_digest(status["catalog_revision"].as_str().unwrap().parse().unwrap(),TransferProfile::Runtime,&[],&selected);
+    control(&client,&target_server,"exports",&secret,&mut status,"select",json!({"profile":TransferProfile::Runtime,"extra_roles":[],"selection_digest":digest}));
+    advance(&client,&target_server,"exports",&secret,&mut status);assert_eq!(status["state"],"ready");
+    let mut bytes=Vec::new();let mut index=0u32;
+    loop{let response=authenticated(&client,&target_server,reqwest::Method::GET,&format!("{root}/manifest/chunks/{index}"),Some(&secret)).send().unwrap();assert!(response.status().is_success());let last=response.headers()["x-transfer-last"]=="true";let declared=response.headers()["x-transfer-body-bytes"].to_str().unwrap().parse::<usize>().unwrap();let chunk=response.bytes().unwrap();assert_eq!(chunk.len(),declared,"manifest chunk body must equal x-transfer-body-bytes");bytes.extend_from_slice(&chunk);if last{break;}index+=1;}
+    let exported:ArchiveManifest=serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(exported.novels.len(),1);let exported_files:Vec<_>=exported.novels[0].files.iter().map(|file|(file.path.clone(),file.size,file.sha256.clone())).collect();
+    assert_eq!(exported_files,manifest.novels[0].files.iter().map(|file|(file.path.clone(),file.size,file.sha256.clone())).collect::<Vec<_>>(),"DB-only round trip must reproduce manifest identity");
+    let mut re_payloads=BTreeMap::<u32,Vec<u8>>::new();let mut batch=0;
+    loop{let response=authenticated(&client,&target_server,reqwest::Method::GET,&format!("{root}/batches/{batch}"),Some(&secret)).send().unwrap();assert!(response.status().is_success());let last=response.headers()["x-transfer-last"]=="true";let total=response.headers()["x-transfer-body-bytes"].to_str().unwrap().parse::<usize>().unwrap();let body=response.bytes().unwrap();assert_eq!(body.len(),total);let mut decoder=FrameDecoder::new();let frames=decoder.feed(&body).unwrap();assert!(decoder.finish().unwrap().is_empty());for frame in frames{let bytes=re_payloads.entry(frame.header.file_id).or_default();bytes.extend(frame.payload);}if last{break;}batch+=1;}
+    for(index,payload)in payloads{assert_eq!(re_payloads.remove(&index).as_deref(),Some(payload.as_slice()),"file {index} payload must round trip byte-exact through DB-only");}
+    control(&client,&target_server,"exports",&secret,&mut status,"complete",json!({}));advance(&client,&target_server,"exports",&secret,&mut status);assert_eq!(status["state"],"released");
 }
 
