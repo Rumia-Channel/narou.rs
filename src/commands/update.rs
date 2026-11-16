@@ -611,19 +611,23 @@ fn apply_general_lastup_check_result(
     record.last_check_date = Some(now);
 }
 
-fn record_general_lastup_check(
-    write: &narou_rs::application::novel_access::NovelWriteGuard,
-    id: i64,
+struct GeneralLastupCheckSnapshot {
     novelupdated_at: Option<DateTime<Utc>>,
     general_lastup: Option<DateTime<Utc>>,
     length: Option<i64>,
     is_end: Option<bool>,
-    now: DateTime<Utc>,
+    checked_at: DateTime<Utc>,
+}
+
+fn record_general_lastup_check(
+    write: &narou_rs::application::novel_access::NovelWriteGuard,
+    id: i64,
+    check: GeneralLastupCheckSnapshot,
     sync_end: bool,
 ) -> narou_rs::error::Result<()> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     novels.update_existing_guarded_sync(write.fence(), id.into(), |record| {
-        apply_general_lastup_check_result(record, novelupdated_at, general_lastup, length, is_end, now);
+        apply_general_lastup_check_result(record, check.novelupdated_at, check.general_lastup, check.length, check.is_end, check.checked_at);
         if sync_end {
             narou_rs::application::novel_actions::sync_end_tag(record);
         }
@@ -1209,8 +1213,10 @@ async fn update_general_lastup_narou(
             for (id, entry) in updates {
                 let Some(write) = writes.get(&id) else { continue; };
                 if let Err(error) = record_general_lastup_check(
-                    write, id, parse_api_datetime(&entry.novelupdated_at), parse_api_datetime(&entry.general_lastup),
-                    Some(entry.length), None, Utc::now(), false,
+                    write, id, GeneralLastupCheckSnapshot {
+                        novelupdated_at: parse_api_datetime(&entry.novelupdated_at), general_lastup: parse_api_datetime(&entry.general_lastup),
+                        length: Some(entry.length), is_end: None, checked_at: Utc::now(),
+                    }, false,
                 ) {
                     tracing::warn!("metadata check commit failed for {id}: {error}");
                     outcome.had_api_error = true;
@@ -1253,7 +1259,7 @@ async fn update_general_lastup_other(
         };
 
         if let Err(error) = record_general_lastup_check(
-            &write, id, novelupdated_at, general_lastup, length, is_end, Utc::now(), true,
+            &write, id, GeneralLastupCheckSnapshot { novelupdated_at, general_lastup, length, is_end, checked_at: Utc::now() }, true,
         ) { tracing::warn!("metadata check commit failed for {id}: {error}"); }
 
         progress.inc(1);
@@ -1599,11 +1605,10 @@ async fn process_novel_for_update(
                 String::new()
             };
             print_status_messages(&dl, &ctx.sink, Some(&canceled_title));
-            if ctx.hotentry_enabled && !dl.new_arrival_subtitles.is_empty() {
-                if let Err(error) = merge_hotentry(hotentries, dl.id, HotentryInput { write: write.clone(), subtitles: dl.new_arrival_subtitles.clone() }) {
-                    ctx.sink.emit(Stream::Stderr, &messages::update::hotentry_failed(error));
-                    new_mistook += 1;
-                }
+            if ctx.hotentry_enabled && !dl.new_arrival_subtitles.is_empty()
+                && let Err(error) = merge_hotentry(hotentries, dl.id, HotentryInput { write: write.clone(), subtitles: dl.new_arrival_subtitles.clone() }) {
+                ctx.sink.emit(Stream::Stderr, &messages::update::hotentry_failed(error));
+                new_mistook += 1;
             }
 
             let new_arrivals = dl.new_arrivals;
@@ -1997,9 +2002,10 @@ mod tests {
         for sqlite in [false, true] {
             for sync_end in [false, true] {
                 let command = |write: &narou_rs::application::novel_access::NovelWriteGuard| super::record_general_lastup_check(
-                    write, 1, Some(last_update + Duration::hours(2)),
-                    Some(last_update + Duration::hours(3)), Some(123), Some(true),
-                    last_update + Duration::hours(5), sync_end,
+                    write, 1, super::GeneralLastupCheckSnapshot {
+                        novelupdated_at: Some(last_update + Duration::hours(2)), general_lastup: Some(last_update + Duration::hours(3)),
+                        length: Some(123), is_end: Some(true), checked_at: last_update + Duration::hours(5),
+                    }, sync_end,
                 ).unwrap();
                 let record = with_stale_command_database(sqlite, false, false, command).unwrap();
                 assert!(record.tags.iter().any(|tag| tag == "concurrent tag"));

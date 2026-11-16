@@ -1034,21 +1034,28 @@ impl NativeStore{
     }
 
 }
+/// Borrowed canonical install identity: target key, byte size, and SHA-256.
+struct InstallContent<'a>{key:&'a ObjectKey,size:u64,sha:&'a str}
+
+/// Borrowed staged-asset identity: sealed stage key, canonical target key, SHA-256.
+pub struct PreparedAsset<'a>{pub stage:&'a ObjectKey,pub key:&'a ObjectKey,pub sha256:&'a str}
+
 #[derive(Clone)]
 struct NativeRemoteStore{primary:Arc<NativeStore>,remote:Arc<S3Store>}
 impl NativeRemoteStore{
-    async fn install(&self,prefix:&ObjectPrefix,owner:Option<&str>,epoch:u64,stage:&ObjectKey,key:&ObjectKey,size:u64,sha:&str)->Result<()>{
-        ts::check_hash_named_key(key,sha)?;let pool=self.remote.illustration_pool_enabled_for(key);let nonce=crate::platform::staging::new_staging_key()?;let id=nonce.as_ref().strip_prefix(crate::platform::staging::STAGING_PREFIX).expect("stage prefix");
-        let physical=if pool{ts::illustration_pool_key(key)?}else{ObjectKey::try_new(format!("content/{id}"))?};
-        let mut row=NativeRemoteReference{physical:physical.to_string(),size,sha256:sha.into(),logical:key.to_string(),prefix:prefix.as_ref().into(),etag:String::new(),legacy_gc:None};
+    async fn install(&self,prefix:&ObjectPrefix,owner:Option<&str>,epoch:u64,stage:&ObjectKey,content:InstallContent<'_>)->Result<()>{
+        ts::check_hash_named_key(content.key,content.sha)?;let pool=self.remote.illustration_pool_enabled_for(content.key);let nonce=crate::platform::staging::new_staging_key()?;let id=nonce.as_ref().strip_prefix(crate::platform::staging::STAGING_PREFIX).expect("stage prefix");
+        let physical=if pool{ts::illustration_pool_key(content.key)?}else{ObjectKey::try_new(format!("content/{id}"))?};
+        let mut row=NativeRemoteReference{physical:physical.to_string(),size:content.size,sha256:content.sha.into(),logical:content.key.to_string(),prefix:prefix.as_ref().into(),etag:String::new(),legacy_gc:None};
         let reservation=NativeRemoteReservation{owner:owner.unwrap_or(id).into(),epoch,reference:row.clone(),pool,revision:0,preparation:None};let reservation_key=ObjectKey::try_new(format!(".narou-transfer/.remote/{id}"))?;
         ObjectStore::write_small(self.primary.as_ref(),&reservation_key,serde_json::to_vec(&reservation).map_err(|error|NarouError::Platform(error.to_string()))?).await?;
         let stream=self.primary.read_stream(stage).await?.ok_or_else(||NarouError::NotFound(stage.to_string()))?;
-        let(_,etag)=self.remote.write_stream_once_verified(&physical,stream,size,sha).await?;row.etag=etag;
-        run_scoped_blocking(||self.primary.commit_remote_reference(prefix,owner,epoch,key,Some(&row),None))?;Ok(())
+        let(_,etag)=self.remote.write_stream_once_verified(&physical,stream,content.size,content.sha).await?;row.etag=etag;
+        run_scoped_blocking(||self.primary.commit_remote_reference(prefix,owner,epoch,content.key,Some(&row),None))?;Ok(())
     }
     async fn read_remote_stream(&self,key:&ObjectKey,range:std::ops::Range<u64>)->Result<Option<AssetStream>>{
-        if let Some(reference)=self.primary.remote_reference(key).await?{if reference.physical.is_empty(){return Ok(None);}if reference.logical!=key.as_ref()||reference.etag.is_empty(){return Err(NarouError::Platform("immutable remote alias generation proof missing".into()));}let end=if range.end==u64::MAX{reference.size}else{range.end};if range.start>end||end>reference.size{return Err(NarouError::Platform("remote alias range exceeds object".into()));}return self.remote.read_stream_range_if_match(&ObjectKey::try_new(reference.physical)?,range.start..end,&reference.etag).await;}self.remote.read_stream_range(key,range).await
+        if let Some(reference)=self.primary.remote_reference(key).await?{if reference.physical.is_empty(){return Ok(None);}
+            if reference.logical!=key.as_ref()||reference.etag.is_empty(){return Err(NarouError::Platform("immutable remote alias generation proof missing".into()));}let end=if range.end==u64::MAX{reference.size}else{range.end};if range.start>end||end>reference.size{return Err(NarouError::Platform("remote alias range exceeds object".into()));}return self.remote.read_stream_range_if_match(&ObjectKey::try_new(reference.physical)?,range.start..end,&reference.etag).await;}self.remote.read_stream_range(key,range).await
     }
 }
 impl ObjectStore for NativeRemoteStore{
@@ -1089,8 +1096,10 @@ impl ObjectStore for NativeRemoteStore{
         let mut refs=ObjectListRequest::new(ObjectPrefix::new(format!("{REMOTE_REFERENCE_PREFIX}{}",request.prefix.as_ref()))?,window.limit);if let Some(cursor)=&request.cursor{refs=refs.after(format!("{REMOTE_REFERENCE_PREFIX}{cursor}"));}
         let indexed=self.primary.list_page(&refs).await?;let refs_more=indexed.next_cursor.as_deref().map(|key|key.strip_prefix(REMOTE_REFERENCE_PREFIX).map(str::to_owned).ok_or_else(||NarouError::Platform("remote reference cursor left its index".into()))).transpose()?;
         let cutoff=raw.next_cursor.into_iter().chain(refs_more).min();let mut map=std::collections::BTreeMap::<ObjectKey,Fields>::new();
-        let overlay=|map:&mut std::collections::BTreeMap<ObjectKey,Fields>,key:ObjectKey,reference:NativeRemoteReference|->Result<()>{if reference.logical!=key.as_ref(){return Err(NarouError::Platform("remote reference logical identity mismatch".into()));}if reference.physical.is_empty(){map.remove(&key);}else{let content_type=crate::platform::content_type_for_key(&key).map(str::to_owned);map.insert(key,(reference.size,Some(reference.sha256),content_type,None));}Ok(())};
-        for row in raw.objects{if cutoff.as_deref().is_some_and(|end|row.key.as_ref()>end){continue;}if let Some(reference)=self.primary.remote_reference(&row.key).await?{overlay(&mut map,row.key,reference)?;}else{map.insert(row.key,(row.size,row.etag,row.content_type,row.last_modified));}}
+        let overlay=|map:&mut std::collections::BTreeMap<ObjectKey,Fields>,key:ObjectKey,reference:NativeRemoteReference|->Result<()>{if reference.logical!=key.as_ref(){return Err(NarouError::Platform("remote reference logical identity mismatch".into()));}
+            if reference.physical.is_empty(){map.remove(&key);}else{let content_type=crate::platform::content_type_for_key(&key).map(str::to_owned);map.insert(key,(reference.size,Some(reference.sha256),content_type,None));}Ok(())};
+        for row in raw.objects{if cutoff.as_deref().is_some_and(|end|row.key.as_ref()>end){continue;}
+            if let Some(reference)=self.primary.remote_reference(&row.key).await?{overlay(&mut map,row.key,reference)?;}else{map.insert(row.key,(row.size,row.etag,row.content_type,row.last_modified));}}
         for row in indexed.objects{let logical=row.key.as_ref().strip_prefix(REMOTE_REFERENCE_PREFIX).ok_or_else(||NarouError::Platform("remote reference row left its index".into()))?;if cutoff.as_deref().is_some_and(|end|logical>end){continue;}let key=ObjectKey::try_new(logical)?;if !request.prefix.matches(&key){return Err(NarouError::Platform("remote reference list left its novel scope".into()));}let reference=self.primary.remote_reference(&key).await?.ok_or_else(||NarouError::Platform("remote reference disappeared during inventory".into()))?;overlay(&mut map,key,reference)?;}
         let next_cursor=if map.len()>cap{map.keys().nth(cap-1).map(ToString::to_string)}else{cutoff};let objects=map.into_iter().take(cap).map(|(key,(size,etag,content_type,last_modified))|ObjectMetadata{key,size,etag,content_type,last_modified}).collect();Ok(ObjectListPage{objects,next_cursor})
     })}
@@ -1104,7 +1113,7 @@ impl AssetStore for NativeRemoteStore{
     })}
     fn write_stream<'a>(&'a self,key:&'a ObjectKey,stream:AssetStream)->PlatformFuture<'a,Result<()>>{Box::pin(async move{if ts::hash_named_digest(key).is_some()||crate::platform::is_reserved_key(key){self.remote.write_stream(key,stream).await}else{Err(NarouError::Platform("mutable S3 stream requires captured WriteFence".into()))}})}
     fn write_stream_guarded<'a>(&'a self,fence:&'a crate::platform::WriteFence,key:&'a ObjectKey,stream:AssetStream)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
-        let stage=self.primary.stage_stream(stream).await?;let result=self.install(&fence.prefix,None,fence.epoch,&stage.key,key,stage.size,&stage.sha256).await;let cleanup=ObjectStore::delete(self.primary.as_ref(),&stage.key).await;result.and(cleanup)
+        let stage=self.primary.stage_stream(stream).await?;let result=self.install(&fence.prefix,None,fence.epoch,&stage.key,InstallContent{key,size:stage.size,sha:&stage.sha256}).await;let cleanup=ObjectStore::delete(self.primary.as_ref(),&stage.key).await;result.and(cleanup)
     })}
     fn write_stream_once<'a>(&'a self,key:&'a ObjectKey,stream:AssetStream,size:u64,sha:&'a str)->PlatformFuture<'a,Result<WriteOnce>>{self.remote.write_stream_once(key,stream,size,sha)}
     fn delete<'a>(&'a self,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{ObjectStore::delete(self,key)}
@@ -1132,7 +1141,8 @@ impl NativeStores {
     /// reference ETag. No canonical body is rehashed to reconcile a receipt.
     pub fn transfer_asset_fingerprint<'a>(&'a self,key:&'a ObjectKey)->PlatformFuture<'a,Result<Option<(u64,String)>>>{Box::pin(async move{
         if crate::platform::is_illustration_key(key)&&let Some(reference)=self.primary.remote_reference(key).await?{
-            if reference.physical.is_empty(){return Ok(None);}if reference.logical!=key.as_ref()||reference.etag.is_empty()||reference.sha256.len()!=64{return Err(NarouError::Platform("remote alias fingerprint proof missing".into()));}
+            if reference.physical.is_empty(){return Ok(None);}
+            if reference.logical!=key.as_ref()||reference.etag.is_empty()||reference.sha256.len()!=64{return Err(NarouError::Platform("remote alias fingerprint proof missing".into()));}
             let remote=self.s3.as_ref().ok_or_else(||NarouError::Platform("canonical remote alias requires configured S3 storage".into()))?;let physical=ObjectKey::try_new(reference.physical)?;
             let metadata=AssetStore::stat(remote.as_ref(),&physical).await?.ok_or_else(||NarouError::NotFound(physical.to_string()))?;
             if metadata.size!=reference.size||metadata.etag.as_deref()!=Some(reference.etag.as_str()){return Err(NarouError::Platform("canonical remote alias generation changed".into()));}return Ok(Some((reference.size,reference.sha256)));
@@ -1165,7 +1175,8 @@ impl NativeStores {
                 let remote=self.s3.as_ref().ok_or_else(||NarouError::Platform("remote stage GC storage missing".into()))?;if !remote.release_target_stage(&prep.remote_stage,owner,epoch,live||reservation.pool).await?{return Ok(retry());}
                 let receipts=self.primary.list_page(&ObjectListRequest::new(ObjectPrefix::new(format!(".narou-transfer/.remote_ops/{}/",prep.remote_stage))?,std::num::NonZeroUsize::new(16).expect("nonzero"))).await?;for receipt in receipts.objects{ObjectStore::delete(self.primary.as_ref(),&receipt.key).await?;}if receipts.next_cursor.is_some(){return Ok(retry());}
             }
-            if live{continue;}if !reservation.pool&&let Some(remote)=&self.s3{ObjectStore::delete(remote.as_ref(),&ObjectKey::try_new(reservation.reference.physical)?).await?;}ObjectStore::delete(self.primary.as_ref(),&row.key).await?;
+            if live{continue;}
+            if !reservation.pool&&let Some(remote)=&self.s3{ObjectStore::delete(remote.as_ref(),&ObjectKey::try_new(reservation.reference.physical)?).await?;}ObjectStore::delete(self.primary.as_ref(),&row.key).await?;
         }Ok(page.next_cursor)
     })}
 
@@ -1522,7 +1533,7 @@ fn consult_sql_gate_authority(connection:&rusqlite::Connection,prefix:&ObjectPre
     if identity::read_sql_gate_handoff(connection,prefix,epoch,origin)?{return Ok(SqlGateAuthority::Superseded);}
     let handoff=identity::read_fs_gate_handoff_raw(connection,prefix)?;
     let row:Option<(i64,String)>=connection.query_row("SELECT epoch,origin_url_fold FROM novel_access_gates WHERE prefix=?1",[prefix],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(crate::native::sqlite::sqlite_error)?;
-    if let Some((row_epoch,_))=&row{if *row_epoch<0{return Err(NarouError::Platform("negative epoch in durable SQL gate".into()));}}
+    if let Some((row_epoch,_))=&row&&*row_epoch<0{return Err(NarouError::Platform("negative epoch in durable SQL gate".into()));}
     match (handoff,row){
         (Some((_,fs_epoch,fs_origin)),None)if fs_epoch==epoch&&fs_origin==origin=>Ok(SqlGateAuthority::FsCanonical),
         (Some(_),_)=>Ok(SqlGateAuthority::Conflict),
@@ -1800,7 +1811,7 @@ pub(crate) fn visit_namespace_gates(root:&Path,connection:&rusqlite::Connection,
     if table.is_some(){let mut statement=connection.prepare("SELECT prefix,closed,owner,epoch,origin_url_fold FROM novel_access_gates WHERE closed<>0 OR origin_url_fold<>'' ORDER BY prefix").map_err(crate::native::sqlite::sqlite_error)?;let mut rows=statement.query([]).map_err(crate::native::sqlite::sqlite_error)?;while let Some(row)=rows.next().map_err(crate::native::sqlite::sqlite_error)?{let prefix:String=row.get(0).map_err(crate::native::sqlite::sqlite_error)?;let closed:bool=row.get(1).map_err(crate::native::sqlite::sqlite_error)?;let owner:Option<String>=row.get(2).map_err(crate::native::sqlite::sqlite_error)?;let epoch=crate::native::sqlite::read_u64(row,3).map_err(crate::native::sqlite::sqlite_error)?;let origin:String=row.get(4).map_err(crate::native::sqlite::sqlite_error)?;
         // A SQL→FS handoff supersedes this row only while a live FS gate
         // carries the recorded fs_epoch and origin: exact tuple proof.
-        if let Some((fs_epoch,fs_origin))=identity::read_fs_gate_handoff(connection,&prefix,epoch)?{if fs_gates.get(&prefix).is_some_and(|gate|gate.epoch==fs_epoch&&gate.origin_url_fold==fs_origin){continue;}}
+        if let Some((fs_epoch,fs_origin))=identity::read_fs_gate_handoff(connection,&prefix,epoch)?&&fs_gates.get(&prefix).is_some_and(|gate|gate.epoch==fs_epoch&&gate.origin_url_fold==fs_origin){continue;}
         visit(&prefix,closed,owner.as_deref(),epoch,&origin)?;}}
     for (prefix,gate)in fs_gates{
         if gate.owner.is_none()&&gate.origin_url_fold.is_empty()&&!gate.migrated{continue;}
@@ -1838,11 +1849,9 @@ pub(crate) fn read_namespace_gate_locked(root:&Path,connection:&rusqlite::Connec
         if let Some((closed,epoch,origin))=row{
             // A proven SQL→FS handoff covering this exact row epoch returns
             // the live FS gate tuple instead — the row is superseded.
-            if let Some((fs_epoch,fs_origin))=identity::read_fs_gate_handoff(connection,prefix,epoch)?{
-                if let Some(gate)=fs_gate.as_ref().filter(|gate|gate.epoch==fs_epoch&&gate.origin_url_fold==fs_origin){
-                    if gate.migrated{return Err(NarouError::Platform("migrated FS gate lost its SQL handoff".into()));}
-                    return Ok(Some((gate.owner.is_some(),gate.epoch,gate.origin_url_fold.clone())));
-                }
+            if let Some((fs_epoch,fs_origin))=identity::read_fs_gate_handoff(connection,prefix,epoch)?&&let Some(gate)=fs_gate.as_ref().filter(|gate|gate.epoch==fs_epoch&&gate.origin_url_fold==fs_origin){
+                if gate.migrated{return Err(NarouError::Platform("migrated FS gate lost its SQL handoff".into()));}
+                return Ok(Some((gate.owner.is_some(),gate.epoch,gate.origin_url_fold.clone())));
             }
             return Ok(Some((closed,epoch,origin)));
         }
@@ -2189,7 +2198,8 @@ impl TransferStageStore for NativeObjectStore {
 
 impl NovelAccessFence for NativeObjectStore {
     fn retire_writer<'a>(&'a self,fence:&'a crate::platform::WriteFence,owner:&'a str)->PlatformFuture<'a,Result<u64>>{Box::pin(async move{af::parse_removal_owner(owner)?;let next=fence.epoch.checked_add(1).ok_or_else(||NarouError::Platform("gate epoch overflow".into()))?;run_scoped_blocking(||self.with_gate(&fence.prefix,|gate|{
-        if gate.owner.as_deref()==Some(owner)&&gate.epoch==next{return Ok(next);}if gate.owner.is_some()||gate.epoch!=fence.epoch{return Err(af::gate_epoch_error(&fence.prefix,fence.epoch,gate.epoch));}gate.epoch=next;gate.owner=Some(owner.into());gate.updated_at=ts::now_secs();Ok(next)
+        if gate.owner.as_deref()==Some(owner)&&gate.epoch==next{return Ok(next);}
+        if gate.owner.is_some()||gate.epoch!=fence.epoch{return Err(af::gate_epoch_error(&fence.prefix,fence.epoch,gate.epoch));}gate.epoch=next;gate.owner=Some(owner.into());gate.updated_at=ts::now_secs();Ok(next)
     }))})}
     fn pending_removals<'a>(&'a self,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,Result<(Vec<(ObjectPrefix,String,u64)>,Option<String>)>>{Box::pin(async move{
         let mut request=ObjectListRequest::new(ObjectPrefix::new(".narou-transfer/.gate/")?,std::num::NonZeroUsize::new(limit.clamp(1,100)).expect("nonzero"));if let Some(cursor)=cursor{request=request.after(cursor);}let page=self.list_page(&request).await?;let mut out=Vec::new();

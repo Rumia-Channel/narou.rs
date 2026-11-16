@@ -44,7 +44,7 @@ fn require_record_origin(record:&NovelRecord,fences:&[crate::platform::WriteFenc
 
 fn load_current_yaml_records(inventory:&crate::db::inventory::Inventory)->Result<std::collections::BTreeMap<i64,NovelRecord>>{
     let path=inventory.inventory_path("database",crate::db::inventory::InventoryScope::Local);let raw=crate::db::inventory::read_optional_yaml_file(&path)?;
-    let mut records:std::collections::BTreeMap<i64,NovelRecord>=if raw.trim().is_empty(){Default::default()}else{serde_yaml::from_str(&raw)?};for(id,record)in &mut records{record.id=*id;}Ok(records)
+    let mut records:std::collections::BTreeMap<i64,NovelRecord>=if raw.trim().is_empty(){Default::default()}else{serde_yaml::from_str(&raw)?};for(id,record)in &mut records{record.id = *id;}Ok(records)
 }
 #[path="novel_repository_creation.rs"]
 mod creation;

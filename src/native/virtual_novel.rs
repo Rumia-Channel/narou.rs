@@ -590,13 +590,11 @@ fn mutate_with_fences<T>(
     change: impl FnOnce(&mut BTreeMap<i64, NovelRecord>, &mut VirtualNovelMembers, &Path) -> Result<T>,
 ) -> Result<T> {
     let store = NativeStore::for_current_root()?;
-    store.with_open_writes(&fences, || db::with_database_mut(|database| {
+    store.with_open_writes(fences, || db::with_database_mut(|database| {
         let archive_root = database.archive_root().to_path_buf();
         database.update_virtual_records_with_fences(fences, |mut records, mut members| {
-            if let Some((id, observed)) = expected {
-                if members.get(*id) != Some(observed.as_slice()) {
-                    return Err(NarouError::Platform("plan_stale: virtual parent membership changed during input capture".into()));
-                }
+            if let Some((id, observed)) = expected&&members.get(*id) != Some(observed.as_slice()) {
+                return Err(NarouError::Platform("plan_stale: virtual parent membership changed during input capture".into()));
             }
             let result = change(&mut records, &mut members, &archive_root)?;
             Ok((records, members, result))
@@ -698,7 +696,7 @@ pub fn convert_virtual(
         NarouError::Conversion("バーチャル小説の出力ファイル名を取得できません".into())
     })?;
     let destination = destination_dir.join(file_name);
-    crate::native::materialization::publish_file(&write, &output, &destination)?;
+    crate::native::materialization::publish_file(write, &output, &destination)?;
     Ok(destination)
 }
 

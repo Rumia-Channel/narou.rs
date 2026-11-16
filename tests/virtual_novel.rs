@@ -604,7 +604,7 @@ fn legacy_zero_virtual_export_rebinds_origin_and_converges_across_processes() {
         assert!(removed.status.success(), "{}", String::from_utf8_lossy(&removed.stderr));
         let memberships = if sqlite {
             let connection = rusqlite::Connection::open(root.join(".narou/db.sqlite")).unwrap();
-            let (origin, epoch): (String, u64) = connection.query_row(
+            let (origin, epoch): (String, i64) = connection.query_row(
                 "SELECT origin_url_fold,epoch FROM novel_access_gates WHERE prefix=?1",
                 [gate["prefix"].as_str().unwrap()], |row| Ok((row.get(0)?, row.get(1)?)),
             ).unwrap();

@@ -117,10 +117,7 @@ impl S3Store {
         for attempt in 0..LEDGER_CAS_ATTEMPTS {
             let loaded = self.transfer_ledger_load(stage_id).await?;
             let next = mutate(loaded.as_ref().map(|(record, _)| record.clone()))?;
-            let expected = match &loaded {
-                Some((_, etag)) => Some(Some(etag.as_str())),
-                None => None,
-            };
+            let expected = loaded.as_ref().map(|(_, etag)| Some(etag.as_str()));
             if self
                 .transfer_ledger_put(stage_id, &next, expected)
                 .await?
@@ -176,7 +173,8 @@ impl S3Store {
                 if number<next_part{if number!=accepted+1{return Err(NarouError::Platform("multipart confirmed prefix missing".into()));}let etag=super::streaming::xml_escape(&super::streaming::xml_text(block.as_bytes(),"ETag")?);if completion.len().saturating_add(etag.len()+96)>2*1024*1024{return Err(NarouError::Platform("multipart completion metadata admission exceeded".into()));}use std::fmt::Write;write!(&mut completion,"<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>").expect("String write");accepted=number;}
                 cursor=end+xml[end..].find('>').ok_or_else(||NarouError::Platform("truncated part listing".into()))?+1;
             }
-            if accepted==next_part-1||super::streaming::xml_text(&response.body,"IsTruncated")?!="true"{break;}if last<=marker{return Err(NarouError::Platform("part listing made no progress".into()));}marker=last;
+            if accepted==next_part-1||super::streaming::xml_text(&response.body,"IsTruncated")?!="true"{break;}
+            if last<=marker{return Err(NarouError::Platform("part listing made no progress".into()));}marker=last;
         }
         if accepted!=next_part-1{return Err(NarouError::Platform("multipart confirmed prefix missing".into()));}completion.push_str("</CompleteMultipartUpload>");Ok(completion)
     }
@@ -260,7 +258,8 @@ impl S3Store {
             // S3 ledger collector may abort its own upload, never delete the
             // immutable physical target. Primary-aware GC owns that decision.
             if record.direct_target.is_some()&&!payload.as_ref().starts_with("illustrations/"){uploads_done&=self.abort_untracked_uploads(&payload).await?;}
-            if let Some(target)=record.publication_target.as_deref(){let target=ObjectKey::try_new(target)?;if let Some(upload)=record.publication_upload_id.as_deref(){self.abort_upload(&target,upload).await?;}if !target.as_ref().starts_with("illustrations/"){uploads_done&=self.abort_untracked_uploads(&target).await?;}}
+            if let Some(target)=record.publication_target.as_deref(){let target=ObjectKey::try_new(target)?;if let Some(upload)=record.publication_upload_id.as_deref(){self.abort_upload(&target,upload).await?;}
+                if !target.as_ref().starts_with("illustrations/"){uploads_done&=self.abort_untracked_uploads(&target).await?;}}
         }
         uploads_done&=self.abort_untracked_uploads(&data_key).await?;let parts_done=self.delete_part_records(stage_id).await?;let checkpoints_done=self.delete_transfer_page(ObjectPrefix::new(format!(".narou-transfer/.checkpoints/{stage_id}/"))?).await?;self.delete_object_raw(&data_key).await?;
         if uploads_done&&parts_done&&checkpoints_done{self.delete_object_raw(&transfer_stage::stage_ledger_key(stage_id)?).await?;}Ok(())
@@ -279,7 +278,8 @@ impl S3Store {
     pub async fn stage_open_target(&self,id:&str,owner:&str,epoch:u64,ttl:i64,target:&ObjectKey)->Result<StageCursor>{
         if !target.as_ref().starts_with("illustrations/")&&!target.as_ref().starts_with("content/"){return Err(NarouError::Platform("direct stage target must be immutable physical content".into()));}
         let record=self.transfer_ledger_mutate(id,|current|{let mut record=match current{Some(record)=>record,None=>StageLedgerRecord::new(id,owner,epoch,ttl)?};transfer_stage::require_owner(&record,owner,epoch)?;
-            if record.direct_target.as_deref()!=Some(target.as_ref())&&(record.direct_target.is_some()||record.confirmed_bytes!=0||record.upload_id.is_some()){return Err(NarouError::Platform("direct stage identity conflict".into()));}if record.lease.state==StageLeaseState::Aborting{return Err(NarouError::Platform("stage_aborted".into()));}record.direct_target=Some(target.to_string());Ok(record)}).await?;Ok(record.cursor())
+            if record.direct_target.as_deref()!=Some(target.as_ref())&&(record.direct_target.is_some()||record.confirmed_bytes!=0||record.upload_id.is_some()){return Err(NarouError::Platform("direct stage identity conflict".into()));}
+            if record.lease.state==StageLeaseState::Aborting{return Err(NarouError::Platform("stage_aborted".into()));}record.direct_target=Some(target.to_string());Ok(record)}).await?;Ok(record.cursor())
     }
     /// Called only with a durable server-side checkpoint from an ETag-bound
     /// complete SHA scan. This is not a client-supplied adoption shortcut.
@@ -514,7 +514,8 @@ impl transfer_stage::TransferStageStore for S3Store {
                 let record=if record.upload_id.is_none(){
                     let upload=self.initiate_upload(&key).await?;
                     let selected=self.transfer_ledger_mutate(stage_id,|current|{let mut record=current.ok_or_else(||NarouError::Platform("stage disappeared".into()))?;transfer_stage::require_writable(&record,owner,epoch)?;
-                        if record.pending_append.as_ref()!=Some(&claim){return Err(NarouError::Platform("stage append claim lost".into()));}if record.upload_id.is_none(){record.upload_id=Some(upload.clone());}Ok(record)}).await?;
+                        if record.pending_append.as_ref()!=Some(&claim){return Err(NarouError::Platform("stage append claim lost".into()));}
+                        if record.upload_id.is_none(){record.upload_id=Some(upload.clone());}Ok(record)}).await?;
                     if selected.upload_id.as_deref()!=Some(upload.as_str()){self.abort_upload(&key,&upload).await?;}selected
                 }else{record.clone()};
                 if record.next_part>10_000{return Err(NarouError::Platform("S3 multipart part-count limit exceeded".into()));}

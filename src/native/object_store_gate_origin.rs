@@ -8,7 +8,7 @@ fn load(root:&Path,prefix:&ObjectPrefix)->Result<Option<(PathBuf,Vec<u8>)>>{
     let archive=root.join(crate::downloader::types::ARCHIVE_ROOT_DIR);let path=archive.join(".objects/.narou-transfer/.gate").join(hex::encode(sha2::Sha256::digest(prefix.as_ref().trim_end_matches('/').as_bytes())));
     if !path.try_exists()?{return Ok(None);}let path=crate::db::paths::ensure_within_archive_root(&path,&archive)?;match fs::read(&path){Ok(bytes)=>Ok(Some((path,bytes))),Err(error)if error.kind()==std::io::ErrorKind::NotFound=>Ok(None),Err(error)=>Err(error.into())}
 }
-fn string_field<'a>(fields:&BTreeMap<String,&'a RawValue>,name:&str)->Result<Option<String>>{fields.get(name).map(|value|serde_json::from_str::<Option<String>>(value.get()).map_err(json_error)).transpose().map(Option::flatten)}
+fn string_field(fields:&BTreeMap<String,&RawValue>,name:&str)->Result<Option<String>>{fields.get(name).map(|value|serde_json::from_str::<Option<String>>(value.get()).map_err(json_error)).transpose().map(Option::flatten)}
 pub(crate) fn read_fs_gate_origin(root:&Path,prefix:&ObjectPrefix)->Result<Option<String>>{
     let Some((_,bytes))=load(root,prefix)?else{return Ok(None);};let fields:BTreeMap<String,&RawValue>=serde_json::from_slice(&bytes).map_err(json_error)?;
     if string_field(&fields,"prefix")?.as_deref().is_some_and(|stored|stored!=prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("filesystem gate prefix mismatch".into()));}Ok(Some(string_field(&fields,"origin_url_fold")?.unwrap_or_default()))
@@ -36,7 +36,8 @@ fn update(root:&Path,prefix:&ObjectPrefix,rebind:Option<(u64,&str)>,new:&str)->R
         if stored_prefix.is_none(){return Err(NarouError::Platform("virtual identity gate has no exact prefix proof".into()));}
         let current:u64=serde_json::from_str(fields.get("epoch").ok_or_else(||NarouError::Platform("filesystem gate epoch is absent".into()))?.get()).map_err(json_error)?;
         let owner:Option<String>=serde_json::from_str(fields.get("owner").ok_or_else(||NarouError::Platform("filesystem gate admission state is absent".into()))?.get()).map_err(json_error)?;
-        if current!=epoch||owner.is_some(){return Err(af::gate_epoch_error(prefix,epoch,current));}if origin!=expected&&origin!=new{return Err(NarouError::Platform("virtual identity gate origin changed".into()));}
+        if current!=epoch||owner.is_some(){return Err(af::gate_epoch_error(prefix,epoch,current));}
+        if origin!=expected&&origin!=new{return Err(NarouError::Platform("virtual identity gate origin changed".into()));}
     }else if !origin.is_empty()&&origin!=new{return Err(NarouError::Platform("namespace origin conflicts with current record".into()));}
     if origin==new&&stored_prefix.is_some(){return Ok(());}
     let encoded_origin=RawValue::from_string(serde_json::to_string(new).map_err(json_error)?).map_err(json_error)?;let encoded_prefix=RawValue::from_string(serde_json::to_string(prefix.as_ref().trim_end_matches('/')).map_err(json_error)?).map_err(json_error)?;

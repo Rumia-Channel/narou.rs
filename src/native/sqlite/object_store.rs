@@ -796,7 +796,8 @@ impl AssetStore for SqliteObjectStore {
         key: &'a ObjectKey,
         stream: AssetStream,
     ) -> PlatformFuture<'a, Result<()>> {
-        Box::pin(async move{if let Some(sha)=ts::hash_named_digest(key){return self.write_stream_once(key,stream,u64::MAX,&sha).await.map(|_|());}if let Some(fence)=run_scoped_blocking(||self.writer_for_key(key))?{return self.write_stream_guarded(&fence,key,stream).await;}self.write_asset(key,stream).await})
+        Box::pin(async move{if let Some(sha)=ts::hash_named_digest(key){return self.write_stream_once(key,stream,u64::MAX,&sha).await.map(|_|());}
+            if let Some(fence)=run_scoped_blocking(||self.writer_for_key(key))?{return self.write_stream_guarded(&fence,key,stream).await;}self.write_asset(key,stream).await})
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
@@ -1451,10 +1452,8 @@ fn adopt_sql_gate_tx(mirror:&NativeObjectStore,tx:&Connection,prefix:&ObjectPref
     };
     // A committed intent tuple must match the row it was journaled from;
     // anything else is conflicting provenance and fails closed.
-    if let Some((recorded_sql,recorded_fs,recorded_origin))=&recorded{
-        if *recorded_sql!=sql_epoch||*recorded_fs!=sql_epoch.saturating_add(1)||*recorded_origin!=origin{
-            return Err(NarouError::Platform("conflicting durable FS gate handoff".into()));
-        }
+    if let Some((recorded_sql,recorded_fs,recorded_origin))=&recorded&&(*recorded_sql!=sql_epoch||*recorded_fs!=sql_epoch.saturating_add(1)||*recorded_origin!=origin){
+        return Err(NarouError::Platform("conflicting durable FS gate handoff".into()));
     }
     if closed{return Err(NarouError::Platform("closed SQL gate cannot migrate to filesystem authority".into()));}
     let fs_epoch=recorded.as_ref().map(|(_,fs_epoch,_)|*fs_epoch).map_or_else(||sql_epoch.checked_add(1),Some).ok_or_else(||NarouError::Platform("SQL gate epoch exhausted".into()))?;
@@ -1635,7 +1634,7 @@ impl TransferStageStore for SqliteObjectStore {
                 let key=ts::stage_checkpoint_key(id,checkpoint.confirmed_bytes)?;let payload=read_stored_payload(conn,&key,Some(64*1024))?.ok_or_else(||NarouError::Platform("rewind checkpoint missing".into()))?;let bytes=decode_stored_payload(payload,&key,Some(64*1024))?;let stored:StageCursor=serde_json::from_slice(&bytes).map_err(|error|NarouError::Platform(error.to_string()))?;if stored.prefix_sha256()!=checkpoint.prefix_sha256(){return Err(NarouError::Platform("rewind SHA conflict".into()));}stored};
             record.rewind(owner,epoch,&trusted)?;let key=ts::stage_data_key(id)?;let size=checkpoint.confirmed_bytes;
             conn.execute("DELETE FROM object_chunks WHERE object_key=? AND seq>=?",rusqlite::params![key.as_ref(),size.div_ceil(OBJECT_CHUNK_BYTES as u64) as i64]).map_err(super::sqlite_error)?;
-            if size%OBJECT_CHUNK_BYTES as u64!=0 {conn.execute("UPDATE object_chunks SET data=substr(data,1,?) WHERE object_key=? AND seq=?",rusqlite::params![(size%OBJECT_CHUNK_BYTES as u64) as i64,key.as_ref(),(size/OBJECT_CHUNK_BYTES as u64) as i64]).map_err(super::sqlite_error)?;}
+            if !size.is_multiple_of(OBJECT_CHUNK_BYTES as u64) {conn.execute("UPDATE object_chunks SET data=substr(data,1,?) WHERE object_key=? AND seq=?",rusqlite::params![(size%OBJECT_CHUNK_BYTES as u64) as i64,key.as_ref(),(size/OBJECT_CHUNK_BYTES as u64) as i64]).map_err(super::sqlite_error)?;}
             if self.mirror_files{let path=self.mirror.resolve_path(&key)?;match std::fs::OpenOptions::new().write(true).open(path){Ok(file)=>{file.set_len(size)?;file.sync_all()?;},Err(error)if error.kind()==std::io::ErrorKind::NotFound&&size==0=>{},Err(error)=>return Err(error.into())}}
             conn.execute("UPDATE objects SET size=?,crc32=? WHERE object_key=?",rusqlite::params![size as i64,record.crc32,key.as_ref()]).map_err(super::sqlite_error)?;Ok((record.cursor(),Some(record)))
         }))})

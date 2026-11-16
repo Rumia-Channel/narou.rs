@@ -1049,8 +1049,8 @@ mod tests {
             let base = super::ebook_base_name(record, &settings).unwrap();
             let key = crate::platform::ObjectKey::try_new(write.prefix().as_ref()).unwrap();
             crate::native::materialization::block_on(async {
-                write.write_small(&key.join(&format!("{base}.epub"))?, b"first ebook".to_vec()).await?;
-                write.write_small(&key.join(&format!("{base}_2.epub"))?, b"second ebook".to_vec()).await?;
+                write.write_small(&key.join(format!("{base}.epub"))?, b"first ebook".to_vec()).await?;
+                write.write_small(&key.join(format!("{base}_2.epub"))?, b"second ebook".to_vec()).await?;
                 write.write_small(&key.join("user-notes.txt")?, b"keep notes".to_vec()).await?;
                 write.write_small(&key.join("other-output.epub")?, b"keep output".to_vec()).await
             }).unwrap();

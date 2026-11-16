@@ -170,8 +170,6 @@ mod tests {
     use narou_rs::downloader::{SubtitleInfo, TocFile};
 
     use super::{expected_section_stems, find_orphan_files_with_expected};
-    use std::collections::HashSet;
-    use std::path::PathBuf;
 
     #[test]
     fn clean_snapshot_orphans_do_not_touch_nested_history_or_settings() {

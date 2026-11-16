@@ -19,9 +19,11 @@ const PROTOCOL_VERSION = 2;
 const ABI_VERSION = 2;
 const MANIFEST_URL = '/assets/transfer/manifest.json';
 const CAPABILITIES_URL = '/api/transfer/v2/capabilities';
-const SW_RELAY_VERSION = 2;
+const SW_RELAY_VERSION = 3;
 const SW_CHUNK_BYTES = 64 * 1024;
 const WORKER_BOOT_TIMEOUT_MS = 60_000;
+const SW_HEARTBEAT_INTERVAL_MS = 15_000;
+const SW_HEARTBEAT_TIMEOUT_MS = 90_000;
 
 let activeTransfer = null;
 let transferStarting = false;
@@ -663,6 +665,23 @@ async function downloadSink(controller) {
     };
   }
   if (!navigator.serviceWorker) throw new Error('File System Access / Service Worker 保存に対応していません。');
+  // A confirmation dialog may outlive a Service Worker. Do not start its
+  // download response until the producer has the first actual ZIP bytes.
+  let output = null, stopped = false;
+  const start = () => {
+    if (stopped || signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    return output ||= serviceWorkerDownloadSink(controller);
+  };
+  return {
+    mode: 'sw',
+    async write(bytes) { await (await start()).write(bytes); },
+    async close() { await (await start()).close(); stopped = true; },
+    async abort(reason) { if (stopped) return; stopped = true; if (output) await (await output).abort(reason); },
+  };
+}
+
+async function serviceWorkerDownloadSink(controller) {
+  const { signal } = controller;
   const script = new URL('./transfer-download-sw.js', import.meta.url);
   script.search = '';
   const registration = await navigator.serviceWorker.register(script.href,
@@ -685,9 +704,12 @@ async function downloadSink(controller) {
   const channel = new MessageChannel(), token = crypto.randomUUID();
   const frame = document.createElement('iframe'); frame.hidden = true;
   let demand = false, failure = null, disposed = false, closed = false, readyResolve, readyReject, writeResolve, writeReject, closeResolve, closeReject;
+  let heartbeatTimer = null, heartbeatSequence = 0, heartbeatAcknowledged = 0, lastActivity = Date.now();
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
   const cleanup = () => {
-    clearTimeout(handshakeTimeout); signal.removeEventListener('abort', cancelled); frame.remove(); channel.port1.close();
+    clearTimeout(handshakeTimeout); clearInterval(heartbeatTimer);
+    navigator.serviceWorker.removeEventListener('message', receiveHeartbeat);
+    signal.removeEventListener('abort', cancelled); frame.remove(); channel.port1.close();
   };
   const fail = (error) => {
     if (disposed) return;
@@ -696,17 +718,38 @@ async function downloadSink(controller) {
     readyReject(error); writeReject?.(error); closeReject?.(error); cleanup();
     if (!signal.aborted) controller.abort();
   };
+  const receiveHeartbeat = (event) => {
+    const data = event.data;
+    if (disposed || closeResolve || event.source !== worker || data?.type !== 'transfer-download-pong' || data.token !== token
+      || !Number.isSafeInteger(data.sequence) || data.sequence <= heartbeatAcknowledged || data.sequence > heartbeatSequence) return;
+    heartbeatAcknowledged = data.sequence;
+    if (data.version !== SW_RELAY_VERSION || data.active !== true) {
+      fail(new Error('ブラウザのダウンロード中継の状態が失われました。同じ snapshot から保存し直してください。')); return;
+    }
+    lastActivity = Date.now();
+  };
+  const heartbeat = () => {
+    if (disposed) return;
+    if (Date.now() - lastActivity >= SW_HEARTBEAT_TIMEOUT_MS) {
+      fail(new Error('ブラウザのダウンロード中継との接続が切れました。同じ snapshot から保存し直してください。')); return;
+    }
+    try { worker.postMessage({ type: 'transfer-download-ping', version: SW_RELAY_VERSION, token, sequence: ++heartbeatSequence }); }
+    catch (error) { fail(error); }
+  };
   const cancelled = () => fail(new DOMException('Aborted', 'AbortError'));
   const handshakeTimeout = setTimeout(() => fail(new Error('ダウンロード中継の版確認がタイムアウトしました。')), WORKER_BOOT_TIMEOUT_MS);
   signal.addEventListener('abort', cancelled, { once: true });
+  navigator.serviceWorker.addEventListener('message', receiveHeartbeat);
   channel.port1.onmessageerror = () => fail(new Error('ダウンロード中継の通信に失敗しました。'));
   channel.port1.onmessage = ({ data }) => {
     if (disposed) return;
     if (data.type === 'ready') {
       if (data.version !== SW_RELAY_VERSION) { fail(new Error('ダウンロード中継の版が一致しません。ページを再読み込みしてください。')); return; }
       clearTimeout(handshakeTimeout); readyResolve();
+      lastActivity = Date.now();
     } else if (data.type === 'pull') {
       if (demand) { fail(new Error('ダウンロード中継から重複した pull が届きました。')); return; }
+      lastActivity = Date.now();
       demand = true; writeResolve?.(); writeResolve = null; writeReject = null;
     } else if (data.type === 'closed') {
       if (!closeResolve) { fail(new Error('終了要求の前にダウンロードが閉じました。')); return; }
@@ -715,6 +758,8 @@ async function downloadSink(controller) {
   };
   worker.postMessage({ type: 'transfer-download', token, version: SW_RELAY_VERSION, name: 'narou-export.zip' }, [channel.port2]);
   await ready;
+  if (failure || signal.aborted) throw failure || new DOMException('Aborted', 'AbortError');
+  heartbeatTimer = setInterval(heartbeat, SW_HEARTBEAT_INTERVAL_MS); heartbeat();
   if (failure || signal.aborted) throw failure || new DOMException('Aborted', 'AbortError');
   frame.src = new URL(`./transfer-download/${token}`, script).href; document.body.append(frame);
   return {
@@ -734,6 +779,7 @@ async function downloadSink(controller) {
       if (failure) throw failure;
       if (closed) return;
       if (writeResolve) throw new Error('保存先への書込みが完了していません。');
+      clearInterval(heartbeatTimer);
       const timer = setTimeout(() => fail(new Error('ダウンロード中継の終了確認がタイムアウトしました。')), WORKER_BOOT_TIMEOUT_MS);
       try {
         await new Promise((resolve, reject) => {

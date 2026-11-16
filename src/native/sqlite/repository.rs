@@ -404,7 +404,8 @@ impl crate::application::events::FreezeStore for SqliteFreezeStore {
 impl crate::application::novel_actions::FreezeMutationStore for SqliteFreezeStore {
     fn set_frozen_guarded_many<'a>(&'a self,fences:&'a [crate::platform::WriteFence],ids:&'a [NovelId],frozen:bool)->crate::platform::PlatformFuture<'a,Result<()>>{
         let fences=fences.to_vec();let ids=ids.to_vec();Box::pin(blocking(self.conn.clone(),move|conn|{
-            if ids.is_empty(){return Ok(());}if fences.is_empty(){return Err(NarouError::Platform("freeze has no captured fence".into()));}
+            if ids.is_empty(){return Ok(());}
+            if fences.is_empty(){return Err(NarouError::Platform("freeze has no captured fence".into()));}
             let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
             for fence in &fences{super::object_store::require_transfer_epoch(&tx,&fence.prefix,None,fence.epoch,false)?;}
             for id in ids{bind_existing_record_origin(&tx,id.0)?;let prefix:String=tx.query_row("SELECT prefix FROM novel_gate_bindings WHERE novel_id=?",[id.0],|row|row.get(0)).map_err(super::sqlite_error)?;

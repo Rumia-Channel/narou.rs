@@ -2,13 +2,14 @@
 
 ## 最新状況: クライアント主体転送の別ブランチ実装（統合検証中・未公開）
 
-- 公開済み版の基準は調査時点の v0.6.6。ユーザーの最新指示で版数更新・リリースは中止し、develop 由来の別ブランチに commit・push する。main/develop へ統合せず、タグ・Release を作成しない。以下の旧「現況」は履歴であり、現在の公開版や新転送経路の検証結果ではない。
-- `/api/transfer/v2`、Dedicated Worker + 実 WASM、runtime/complete の通信前選別を実装・統合中。ZIP 全体 POST・サーバー ZIP/Base64 への互換フォールバックは撤去する。本文・目次・設定・挿絵索引は SQLite / D1 でも必要。raw は通常移行で除外し Worker へ新規保存しない。
-- 元の epoch・世代付き ID・実行 token・公開 journal・原子的メタデータ境界を通常の更新/変換/削除にも接続中。Native のグローバル在庫 commit だけはローカルで 8MiB 超を許容し、通信・Worker へは適用しない。
-- GitHub の旧45ブランチは統合済み祖先であることと open PR 無しを確認して削除済み。最新指示では main/develop に加えて作業ブランチ feature-client-transfer を push してよい。実装を main/develop へ統合せず、版数は 0.6.6 のまま維持する。
-- 部分検証済み: lean core89、JS/artifact42、実 Node/WASM の backpressure・SHA/size・再開・仮想メンバー・エスケープ済み大容量メタデータ、10MiB 制限の実HTTPゲート、Native SQL object-store37、export_yaml14、新しい物理名前空間の consumer 回帰1、両ライセンス再生成。統合検証は未完了: all-feature clippy に多数の指摘、yaml_cutover_guard は1200秒でタイムアウト、Worker転送は immutable pin barrier の状態判定を修正したが再実行前、content_storage は後半の取得で novel_busy。実ブラウザで168作品の選択と転送入口への到達は確認したが、ZIP完成・取込・再開の実証はまだない。Cloudflare128MiB実配備の検証も未完了。完成・リリース済みと扱わない。
-- 実 Node/WASM の逐次・検証・再開・仮想メンバー・6MiB エスケープ済みメタデータ検証が成功。別の有界 fixture で 4GiB 超の ZIP64 オフセット、4,295,032,955B のゼロ生成ファイルの圧縮・全検証・4GiB 位置からの再開も成功し、一時スクリプト/データは削除した。実ブラウザや Cloudflare の128MiB制約での証明とは区別する。
-- Native の残件は全体バックアップの control/S3参照保全、残る direct-file consumer の lease 移行、virtual URL と retained origin の原子的・回復可能な移行。SQLite snapshot 内の mode 判定は借用済み connection を使い、primary mutex を再ロックしない。Native 世代再開は実 OS liveness を再取得し、新しい ID を採番しない。これらの統合・実行確認前に公開しない。
+- 最新指示は版数更新・リリース中止。0.6.6のまま、develop由来のfeature-client-transferへcommit/pushする。main/develop統合、タグ、Release、本番配備は行わない。チェックポイントfec778dはpush済みで、以後の修正はまだ追加commit前。旧45ブランチの整理は実施済み。
+- `/api/transfer/v2` と実配布WASMで、ZIP生成・全体検証・展開をクライアントへ移す。本文・目次・設定・挿絵索引・unknownを保持し、runtimeではraw/任意履歴/確認済み派生物をsnapshotと本文通信の前に除外する。Workerへrawを新規保存しない。旧ZIP全体POST/Base64へのfallbackはない。
+- 実Firefox + 実workerd/D1で17MiBの利用者ファイルと目次を取り込み、raw1MiBの除外と新規1作品の公開を確認。同じexport sessionで一時停止から保存し直し、独立ZIP readerで全entry・SHAを照合。10MiBゲートの最大request bodyは8,323,470B、過大要求拒否0・旧ZIP要求0・記録打切り0。
+- 確認待ち6分で旧SWが0byte保存/次write待機になる不具合を実証。遅延開始・限定したstartup waitUntil・15秒ping/pong・90秒失活検出・close ACK優先のrelay版3へ修正。実Firefoxで最初の出力前と64KiB出力後の各6分停止を跨ぎ、両方1MiBとSHA一致。Chromium FSAの実操作は未確認。
+- Node消費者回帰33件が成功。確認待ち/無通知の状態消失は旧実配布JSで期待byte欠落/永久待機として失敗し、EOF後pong競合も修正前失敗・修正後成功を確認。Rust workspace/all-target/all-feature Clippyはexit0（既存vendor/host manifest警告は表示）。両ライセンスはcanonical LF入力から再生成済み。
+- Nativeの全相対パスjoin、Windows実directory境界、compat lock内の設定再読込、Workerのpinned snapshotと取消creation回収などを修正。Native HTTP・cutover・claim・guarded CLI検証を実行中。旧yaml_cutover_guardのタイムアウトは完了としない。
+- 全受入は未完了。Native保存方式別の実ブラウザ、168作品・100MiB超・4GiB超の実ブラウザ、完全なWorker故障契約、Cloudflare128MiB/provider予算は未検証。直近workerd契約はnpm/Node資源割当て失敗で中断したので成功に数えない。重いfixtureを直列化し、固定Wranglerのcache/offlineを使って再確認する。docs/client-transfer-design.md §16.1を実測の基準とする。
+- 既存browserの元タブは保持し、所有fixture・検証タブ・SW登録は終了時に回収、ダウンロード設定はdefaultへ戻す。Node/WASM単体の4GiB仮想fixtureや旧版の履歴を、新しい実ブラウザ/本番の成功に読み替えない。
 
 ## EPUB 配信経路と API の待ち時間（未リリース）
 

@@ -52,7 +52,8 @@ impl SqliteObjectStore {
         let referenced=Self::has_promoted_reference(conn,key)?;let private=crate::platform::is_reserved_key(key);
         if self.prefer_existing_files&&!referenced&&!private&&let Some((file,length))=self.mirror.open_range(key,range.clone())?{let metadata=crate::native::object_store::NativeObjectStore::metadata_for_open_file(key,&file)?;return Ok(Some((metadata,crate::native::object_store::native_range_stream(file,length))));}
         let Some(header)=Self::header_in_connection(conn,key)?else{
-            if referenced{return Err(NarouError::Platform("canonical reference payload missing".into()));}if private{return Ok(None);}
+            if referenced{return Err(NarouError::Platform("canonical reference payload missing".into()));}
+            if private{return Ok(None);}
             return self.mirror.open_range(key,range)?.map(|(file,length)|Ok((crate::native::object_store::NativeObjectStore::metadata_for_open_file(key,&file)?,crate::native::object_store::native_range_stream(file,length)))).transpose();
         };
         let metadata=ObjectMetadata{key:key.clone(),size:header.size,etag:Some(header.generation.clone()),content_type:crate::platform::content_type_for_key(key).map(str::to_owned),last_modified:None};

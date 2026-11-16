@@ -36,10 +36,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
+      - name: Build the browser transfer codec for native Web UI tests
+        run: node scripts/build-transfer-wasm.mjs --install-bindgen --assert-lean
       - name: Worker S3 deployment regressions
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_*s3*.py'
       - name: Deploy secret handling regressions
@@ -88,9 +91,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           key: gpl
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Build the browser transfer codec for GPL Web UI tests
+        run: node scripts/build-transfer-wasm.mjs --install-bindgen --assert-lean
       - run: cargo check -p narou_rs --all-targets --features lite
       - run: cargo test -p narou_rs --lib --features lite
       # Verify the GPL (embedded AozoraEpub3_Lite) binary links.

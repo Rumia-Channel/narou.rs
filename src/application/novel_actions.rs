@@ -737,7 +737,6 @@ fn validate_tags(tags: &[String]) -> Result<Vec<String>, ApplicationError> {
 /// `asset_backend=s3` の構成では小説プレフィックスの一覧に挿絵が含まれず、
 /// 挿絵側の一覧を明示的に消さないと「削除しました」と報告しながら実体が
 /// 残る。両方のプレフィックスを同じストア (SplitStore) 経由で消す。
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { createHash, randomUUID, webcrypto } from 'node:crypto';
+import { MessageChannel } from 'node:worker_threads';
 
 const workerSource = fs.readFileSync(new URL('../src/web/assets/js/ui/transfer-worker.js', import.meta.url), 'utf8');
 const uiSource = fs.readFileSync(new URL('../src/web/assets/js/ui/transfer.js', import.meta.url), 'utf8');
@@ -402,22 +403,22 @@ test('response limits are checked from actual bytes even without Content-Length'
   assert.equal(cancelled, true);
 });
 
-function relay(version = 2) {
-  const handlers = new Map(), messages = []; let lifetime, response, closed = false;
+function relay(version = 3) {
+  const handlers = new Map(), messages = []; let response, startup, closed = false;
   const port = { postMessage: (value) => messages.push(value), close() { closed = true; }, onmessage: null };
   const self = { location: new URL('https://example.test/assets/js/ui/transfer-download-sw.js'),
     addEventListener: (name, handler) => handlers.set(name, handler), skipWaiting: async () => {}, clients: { claim: async () => {} } };
   vm.runInNewContext(relaySource, { self, URL, Response, ReadableStream, ArrayBuffer, Uint8Array, Error, setTimeout, clearTimeout });
   const token = '12345678-1234-1234-1234-123456789abc';
-  handlers.get('message')({ data: { type: 'transfer-download', token, version }, ports: [port], waitUntil: (value) => { lifetime = value; } });
-  if (version !== 2) return { messages, get closed() { return closed; } };
+  handlers.get('message')({ data: { type: 'transfer-download', token, version }, ports: [port], waitUntil(value) { startup = value; } });
+  if (version !== 3) return { messages, get closed() { return closed; } };
   assert.equal(messages[0].type, 'ready');
   handlers.get('fetch')({ request: { url: `https://example.test/assets/js/ui/transfer-download/${token}` }, respondWith: (value) => { response = value; } });
-  return { messages, reader: response.body.getReader(), send: (data) => port.onmessage({ data }), lifetime };
+  return { messages, reader: response.body.getReader(), send: (data) => port.onmessage({ data }), startup, get closed() { return closed; } };
 }
 
 test('Firefox relay rejects stale handshake versions before starting a download', () => {
-  const download = relay(1); assert.equal(download.messages[0].type, 'error'); assert.equal(download.closed, true);
+  const download = relay(2); assert.equal(download.messages[0].type, 'error'); assert.equal(download.closed, true);
 });
 test('Firefox relay reads only on demand and forwards browser cancellation', async () => {
   const download = relay(); await tick(); assert.deepEqual(download.messages.map((value) => value.type), ['ready']);
@@ -425,20 +426,98 @@ test('Firefox relay reads only on demand and forwards browser cancellation', asy
   download.send({ type: 'chunk', bytes: new Uint8Array(64 * 1024).fill(7).buffer });
   assert.equal((await first).value.length, 64 * 1024); const before = download.messages.length;
   await tick(); assert.equal(download.messages.length, before);
-  await download.reader.cancel('user cancelled'); assert.equal(download.messages.at(-1).type, 'error'); await download.lifetime;
+  await download.reader.cancel('user cancelled'); assert.equal(download.messages.at(-1).type, 'error'); assert.equal(download.closed, true);
 });
 test('Firefox relay rejects oversized output instead of successful EOF', async () => {
   const download = relay(), next = download.reader.read(); await tick();
   download.send({ type: 'chunk', bytes: new Uint8Array(64 * 1024 + 1).buffer });
-  await assert.rejects(next, /Invalid download chunk/); await download.lifetime;
+  await assert.rejects(next, /Invalid download chunk/); assert.equal(download.closed, true);
 });
 test('Firefox relay closes only after explicit successful end', async () => {
   const download = relay(), next = download.reader.read(); await tick(); download.send({ type: 'end' });
-  assert.equal((await next).done, true); assert.equal(download.messages.at(-1).type, 'closed'); await download.lifetime;
+  assert.equal((await next).done, true); assert.equal(download.messages.at(-1).type, 'closed'); assert.equal(download.closed, true);
 });
 test('Firefox relay fails an in-flight pull on upstream cancellation', async () => {
   const download = relay(), next = download.reader.read(); await tick(); download.send({ type: 'abort', message: 'upstream failed' });
-  await assert.rejects(next, /upstream failed/); await download.lifetime;
+  await assert.rejects(next, /upstream failed/); assert.equal(download.closed, true);
+});
+
+function browserSinkHarness() {
+  let now = 0, handlers, reader, heldHeartbeat = false, pendingHeartbeat = null;
+  const intervals = new Map(), ports = new Set(), listeners = new Set(), lifetimes = new Set(), started = gate();
+  const worker = { state: 'activated', postMessage(data, transferred = []) {
+    for (const port of transferred) ports.add(port);
+    const deliver = () => handlers.get('message')({ data, ports: transferred, source: client,
+      waitUntil(promise) { lifetimes.add(promise); promise.finally(() => lifetimes.delete(promise)); } });
+    if (heldHeartbeat && data.type === 'transfer-download-ping') pendingHeartbeat = deliver;
+    else queueMicrotask(deliver);
+  } };
+  const client = { postMessage(data) { queueMicrotask(() => { for (const listener of listeners) listener({ data, source: worker }); }); } };
+  const load = () => {
+    handlers = new Map();
+    const self = { location: new URL('https://example.test/assets/js/ui/transfer-download-sw.js'),
+      addEventListener: (name, handler) => handlers.set(name, handler), skipWaiting: async () => {}, clients: { claim: async () => {} } };
+    vm.runInNewContext(relaySource, { self, URL, Response, ReadableStream, ArrayBuffer, Uint8Array, Error, Number, setTimeout, clearTimeout });
+  };
+  load();
+  const serviceWorker = { async register() { return { active: worker, async update() {} }; },
+    addEventListener(name, listener) { if (name === 'message') listeners.add(listener); },
+    removeEventListener(name, listener) { if (name === 'message') listeners.delete(listener); } };
+  const document = { createElement() { return { remove() {} }; }, body: { append(frame) {
+    let response;
+    handlers.get('fetch')({ request: { url: frame.src, method: 'GET' }, respondWith(value) { response = value; } });
+    reader = response.body.getReader(); started.resolve();
+  } } };
+  const scope = vm.createContext({ window: {}, navigator: { serviceWorker }, URL, Uint8Array, ArrayBuffer,
+    AbortController, DOMException, MessageChannel, crypto: { randomUUID }, setTimeout, clearTimeout,
+    setInterval(callback) { const id = Symbol(); intervals.set(id, callback); return id; }, clearInterval(id) { intervals.delete(id); },
+    Date: class extends Date { static now() { return now; } } });
+  vm.runInContext(uiSource.replace(/^import .*;$/gm, '').replace(/^export /gm, '').replaceAll('import.meta.url', '"https://example.test/assets/js/ui/transfer.js"'), scope);
+  scope.document = document;
+  return { scope, started,
+    read() { return reader.read(); },
+    async advance(milliseconds) { now += milliseconds; for (const callback of [...intervals.values()]) callback(); await tick(); },
+    async restart(cancelResponse = false) { if (cancelResponse && reader) await reader.cancel('worker terminated'); for (const port of ports) port.close(); ports.clear(); lifetimes.clear(); load(); await tick(); },
+    holdNextHeartbeat() { heldHeartbeat = true; },
+    releaseHeartbeat() { heldHeartbeat = false; const deliver = pendingHeartbeat; pendingHeartbeat = null; deliver?.(); },
+    async dispose(controller) { controller.abort(); if (reader) await reader.cancel('fixture cleanup'); for (const port of ports) port.close(); intervals.clear(); lifetimes.clear(); },
+  };
+}
+
+test('confirmation delays do not leave the eventual ZIP attached to an expired browser relay', async () => {
+  const h = browserSinkHarness(), controller = new AbortController();
+  const sink = await h.scope.downloadSink(controller);
+  try {
+    await h.advance(360_000); await h.restart(true);
+    const writing = sink.write(Uint8Array.of(7, 19, 255)); writing.catch(() => {});
+    await h.started.promise;
+    const first = await h.read(); assert.deepEqual(Array.from(first.value || []), [7, 19, 255]); await writing;
+    const closing = sink.close(); assert.equal((await h.read()).done, true); await closing;
+  } finally { await h.dispose(controller); }
+});
+
+test('a silently lost browser relay rejects a waiting ZIP write instead of hanging forever', async () => {
+  const h = browserSinkHarness(), controller = new AbortController();
+  const sink = await h.scope.downloadSink(controller);
+  try {
+    let failure;
+    const writing = sink.write(Uint8Array.of(23)); writing.catch(error => { failure = error; });
+    await h.started.promise; await h.restart(); await h.advance(15_000); await tick();
+    assert.match(failure?.message || 'write is still pending', /状態が失われました/);
+  } finally { await h.dispose(controller); }
+});
+
+test('a heartbeat delivered after EOF cannot turn an acknowledged ZIP close into a failure', async () => {
+  const h = browserSinkHarness(), controller = new AbortController();
+  const sink = await h.scope.downloadSink(controller);
+  try {
+    const writing = sink.write(Uint8Array.of(31)); writing.catch(() => {});
+    await h.started.promise; assert.deepEqual(Array.from((await h.read()).value), [31]); await writing;
+    h.holdNextHeartbeat(); await h.advance(15_000);
+    const closing = sink.close(); closing.catch(() => {});
+    assert.equal((await h.read()).done, true);
+    h.releaseHeartbeat(); await closing;
+  } finally { await h.dispose(controller); }
 });
 
 test('FSA picker is invoked synchronously and its write is awaited before close', async () => {

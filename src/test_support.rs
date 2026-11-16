@@ -85,23 +85,3 @@ impl Drop for LegacyYamlGuard {
     }
 }
 
-#[cfg(feature = "native-runtime")]
-pub(crate) struct DatabaseGuard {
-    _guard: GlobalStateGuard,
-    previous: Option<crate::db::Database>,
-}
-
-/// Restore the shared database before a test's temporary library is dropped.
-#[cfg(feature = "native-runtime")]
-pub(crate) fn isolate_database_for_test() -> DatabaseGuard {
-    let guard = global_state_guard();
-    let previous = crate::db::DATABASE.lock().take();
-    DatabaseGuard { _guard: guard, previous }
-}
-
-#[cfg(feature = "native-runtime")]
-impl Drop for DatabaseGuard {
-    fn drop(&mut self) {
-        *crate::db::DATABASE.lock() = self.previous.take();
-    }
-}

@@ -1459,13 +1459,11 @@ impl Downloader {
         if let Some(creation) = creation {
             if creation.committed {
                 creation.reservation.adopt();
-            } else if !creation.checkpoint_owned {
-                if let Err(release_error) = self.novels.release_id(creation.reservation).await {
-                    return Err(match result {
-                        Err(error) => NarouError::Platform(format!("{error}; 小説IDの予約を解放できませんでした: {release_error}")),
-                        Ok(_) => release_error,
-                    });
-                }
+            } else if !creation.checkpoint_owned&&let Err(release_error)=self.novels.release_id(creation.reservation).await{
+                return Err(match result{
+                    Err(error)=>NarouError::Platform(format!("{error}; 小説IDの予約を解放できませんでした: {release_error}")),
+                    Ok(_)=>release_error,
+                });
             }
         }
         result
@@ -7495,11 +7493,12 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
         assert_eq!(crate::downloader::persistence::deserialize_toc(&toc).unwrap().title, "Replacement");
         assert_eq!(repository.get(1.into()).await.unwrap().unwrap().title, "Replacement");
         let replacement_epoch = store.gate_info(&ObjectPrefix::from(keys.prefix().clone())).await.unwrap().epoch;
-        let origins = origins.lock();
-        assert_eq!(origins.len(), 2, "capture is checkpointed before HTTP and reused after it");
-        assert!(origins.iter().all(|origin| origin == &origins[0]), "continuation must retain the first epoch");
-        assert_ne!(origins[0].epoch, replacement_epoch);
-        drop(origins);
+        {
+            let origins = origins.lock();
+            assert_eq!(origins.len(), 2, "capture is checkpointed before HTTP and reused after it");
+            assert!(origins.iter().all(|origin| origin == &origins[0]), "continuation must retain the first epoch");
+            assert_ne!(origins[0].epoch, replacement_epoch);
+        }
 
         // The prefix cannot be known until a new work's first TOC fetch.
         // A transfer may claim either its URL or the same physical prefix

@@ -11,6 +11,9 @@ use crate::platform::{NovelId, NovelIdReservation};
 
 type YamlIds = BTreeMap<i64, serde::de::IgnoredAny>;
 
+/// `(pending (id, generation) rows, next cursor)` for the abandoned-creation sweep.
+pub(crate) type PendingLiveness = (Vec<(NovelId, i64)>, Option<i64>);
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS native_transfer_id_owners (
     allocator TEXT NOT NULL,
@@ -165,7 +168,7 @@ pub(crate) fn acknowledge_create(
 
 pub(super) fn pending_liveness(
     database: &super::Database, cursor: Option<i64>, limit: usize,
-) -> Result<(Vec<(NovelId, i64)>, Option<i64>)> {
+) -> Result<PendingLiveness> {
     let limit = limit.clamp(1, 100);
     let yaml = !database.using_sqlite();
     let connection = crate::native::transfer::control_connection(database.inventory.root_dir())?;

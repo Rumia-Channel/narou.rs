@@ -748,7 +748,7 @@ fn write_back_working_set(
     let section_dir = directory.join(SECTION_SAVE_DIR);
     fs::create_dir_all(&section_dir).map_err(|error| error.to_string())?;
     let mut expected = std::collections::HashSet::new();
-    for (_, (_, yaml)) in sections {
+    for (_, yaml) in sections.values() {
         let section: SectionFile = serde_yaml::from_str(yaml).map_err(|error| error.to_string())?;
         let name = format!("{} {}.yaml", section.index, section.file_subtitle);
         if Path::new(&name).components().count() != 1 || name.contains('\\') {

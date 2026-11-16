@@ -316,7 +316,7 @@ fn in_place_switch_preserves_immutable_canonical_bytes() {
         assert!(scope.open_key(&deleted, 0..u64::MAX).await.unwrap().is_none());
         scope.release_all().await.unwrap();
     });
-    assert_eq!(http.requested_urls(), [physical_url]);
+    assert_eq!(http.requested_urls(), [format!("GET {physical_url}")]);
     assert!(http.sent_requests()[0].1.iter().any(|(name, value)|
         name.eq_ignore_ascii_case("if-match") && value == "\"etag-pool-1\""));
 

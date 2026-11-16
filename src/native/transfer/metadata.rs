@@ -26,7 +26,9 @@ impl NativeTransferBackend {
         let operation=self.journal.executing_operation(session)?;
         if let Some(mut previous)=self.journal.backend_get::<TocStoryStage>(&session.0,&key)?{
             if previous.generation!=generation||previous.record_revision!=entry.record_revision||previous.content_revision!=entry.content_revision{return Err(TransferError::PlanStale{message:"TOC metadata changed during capture".into()});}
-            if let Some(cursor)=self.primary.stage_cursor(&previous.handle).await.map_err(TransferError::platform)?{if cursor.sealed{if cursor.confirmed_bytes!=previous.size||previous.sha256.is_none()||cursor.prefix_sha256()!=previous.sha256{return Err(TransferError::RecoveryRequired{message:"frozen TOC story lost its immutable seal".into()});}if !previous.complete{previous.complete=true;self.journal.backend_put(&session.0,&key,&previous)?;}if previous.operation==operation{return Err(TransferError::Busy{code:"catalog_preparing",message:"TOC metadata initializer already completed; adopt only".into()});}return Ok(previous);}}
+            if let Some(cursor)=self.primary.stage_cursor(&previous.handle).await.map_err(TransferError::platform)?&&cursor.sealed{if cursor.confirmed_bytes!=previous.size||previous.sha256.is_none()||cursor.prefix_sha256()!=previous.sha256{return Err(TransferError::RecoveryRequired{message:"frozen TOC story lost its immutable seal".into()});}
+                if !previous.complete{previous.complete=true;self.journal.backend_put(&session.0,&key,&previous)?;}
+                if previous.operation==operation{return Err(TransferError::Busy{code:"catalog_preparing",message:"TOC metadata initializer already completed; adopt only".into()});}return Ok(previous);}
             if previous.complete{return Err(TransferError::RecoveryRequired{message:"completed TOC story stage is missing".into()});}self.stage_abort(session,&previous.handle).await?;
         }
         let handle=self.opaque_id("story");let mut story_stage=TocStoryStage{handle:handle.clone(),operation,sha256:None,complete:false,present:false,size:0,generation,record_revision:entry.record_revision.clone(),content_revision:entry.content_revision.clone()};
@@ -56,7 +58,10 @@ impl NativeTransferBackend {
         Err(TransferError::Busy{code:"catalog_preparing",message:"TOC metadata projected once; resume raw fragment capture".into()})
     }
     async fn source_metadata_layout(&self,entry:&ExportNovelEntry,record:&crate::db::NovelRecord,prefix:&ObjectKey,members:Option<usize>)->TR<crate::transfer::NovelJsonLayout>{
-        let parent=entry.kind==NovelKind::VirtualParent;let mut optional=0x0fu16;if record.domain.is_some(){optional|=1<<4;}if record.attribute_tag().is_some(){optional|=1<<5;}if !parent&&record.ncode.is_some(){optional|=1<<6;}if record.general_lastup.is_some(){optional|=1<<8;}optional|=1<<9;
+        let parent=entry.kind==NovelKind::VirtualParent;let mut optional=0x0fu16;if record.domain.is_some(){optional|=1<<4;}
+        if record.attribute_tag().is_some(){optional|=1<<5;}
+        if !parent&&record.ncode.is_some(){optional|=1<<6;}
+        if record.general_lastup.is_some(){optional|=1<<8;}optional|=1<<9;
         if !parent&&self.toc_story_stage(entry,prefix).await?.present{optional|=1<<7;}
         let tags=record.tags.iter().filter(|tag|!parent||!crate::virtual_novel::is_internal_tag(tag)).count();let tags=u32::try_from(tags).map_err(|_|TransferError::invalid("metadata_budget","tag count overflow"))?;let members=members.map(u32::try_from).transpose().map_err(|_|TransferError::invalid("metadata_budget","member count overflow"))?;
         let layout=crate::transfer::NovelJsonLayout{novel_type:record.novel_type,optional,tags,members};layout.fields().map_err(TransferError::platform)?;Ok(layout)
@@ -71,7 +76,8 @@ impl NativeTransferBackend {
             if Self::record_revision(record).map_err(|error|crate::error::NarouError::Platform(error.to_string()))?!=source.entry.record_revision{return Err(crate::error::NarouError::Platform("plan_stale: source metadata changed".into()));}
             let parent=source.entry.kind==NovelKind::VirtualParent;let general_lastup=record.general_lastup.map(super::rfc3339);let last_update=super::rfc3339(record.last_update);let mut tags=record.tags.iter().filter(|tag|!parent||!crate::virtual_novel::is_internal_tag(tag));let mut tag_position=0u32;let mut current_tag=None;let mut fragments=Vec::new();
             while cursor.field<fields&&fragments.len()<limit{
-                if !source.layout.present(cursor.field){cursor.field+=1;continue;}if cursor.field==7{break;}
+                if !source.layout.present(cursor.field){cursor.field+=1;continue;}
+                if cursor.field==7{break;}
                 let text:Cow<'_,str>=match cursor.field{0=>Cow::Borrowed(&record.toc_url),1=>Cow::Borrowed(&record.title),2=>Cow::Borrowed(&record.author),3=>Cow::Borrowed(&record.sitename),4=>Cow::Borrowed(record.domain.as_deref().unwrap_or("")),5=>Cow::Borrowed(record.attribute_tag().unwrap_or("")),6=>Cow::Borrowed(record.ncode.as_deref().unwrap_or("")),8=>Cow::Borrowed(general_lastup.as_deref().unwrap_or("")),9=>Cow::Borrowed(&last_update),field if field<10+source.layout.tags=>{let index=field-10;if current_tag.as_ref().is_none_or(|(at,_)|*at!=index){let tag=tags.nth((index-tag_position) as usize).ok_or_else(||crate::error::NarouError::Platform("metadata tag cursor changed".into()))?;tag_position=index+1;current_tag=Some((index,tag.as_str()));}Cow::Borrowed(current_tag.as_ref().expect("assigned tag").1)},field=>{let id=members.and_then(|members|members.get((field-10-source.layout.tags) as usize)).ok_or_else(||crate::error::NarouError::Platform("metadata member cursor changed".into()))?;Cow::Borrowed(&db.get(*id).ok_or_else(||crate::error::NarouError::NotFound("member disappeared".into()))?.toc_url)}};
                 if cursor.byte>text.len()||!text.is_char_boundary(cursor.byte){return Err(crate::error::NarouError::Platform("invalid metadata byte cursor".into()));}let mut end=cursor.byte.saturating_add(crate::transfer::protocol::TEXT_FRAGMENT_MAX_BYTES).min(text.len());while !text.is_char_boundary(end){end-=1;}let last=end==text.len();fragments.push(MetadataFragment{field:cursor.field,part:cursor.part,byte_offset:cursor.byte,bytes:text.as_bytes()[cursor.byte..end].to_vec(),last});cursor.byte=end;cursor.part+=1;if last{cursor.field+=1;cursor.byte=0;cursor.part=0;}
             }Ok(fragments)

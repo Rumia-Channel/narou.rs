@@ -456,8 +456,8 @@ async fn collect_abandoned_creation_page(
     let mut release_error = None;
     for (id, generation) in candidates {
         let Some(reservation) = resume_abandoned_creation(root, id, generation)? else { continue; };
-        if let Err(error) = repository.release_id(reservation).await {
-            if release_error.is_none() { release_error = Some(error); }
+        if let Err(error)=repository.release_id(reservation).await&&release_error.is_none(){
+            release_error=Some(error);
         }
     }
     Ok((next, release_error))

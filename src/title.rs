@@ -67,7 +67,7 @@ pub fn sync_title_projection(write: &crate::application::novel_access::NovelWrit
         current.set_raw_title(raw_title);
         Ok(())
     })?;
-    rename_projected_outputs(&write, &previous_dir, &record.author, &record.title, &display_title)?;
+    rename_projected_outputs(write, &previous_dir, &record.author, &record.title, &display_title)?;
     crate::native::materialization::block_on(async {
         let stores = crate::native::object_store::NativeStores::for_current_root()?;
         let mut lease = crate::application::novel_access::NovelReadLease::admit_for(&stores.objects, &keys, "title-projection").await?;
@@ -106,8 +106,8 @@ pub fn rename_projected_outputs(
         let result = async {
             let prefix = crate::platform::ObjectKey::try_new(write.prefix().as_ref())?;
             for suffix in [".txt", ".epub", ".mobi", ".kepub.epub", ".zip"] {
-                let old = prefix.join(&format!("{previous_base}{suffix}"))?;
-                let new = prefix.join(&format!("{current_base}{suffix}"))?;
+                let old = prefix.join(format!("{previous_base}{suffix}"))?;
+                let new = prefix.join(format!("{current_base}{suffix}"))?;
                 if stores.objects.stat(&new).await?.is_some() { continue; }
                 if let Some(stream) = lease.open_all(&old).await? {
                     write.write_stream(&new, stream).await?;

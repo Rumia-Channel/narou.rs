@@ -626,8 +626,9 @@ mod tests {
         *narou_rs::db::DATABASE.lock() = None;
         narou_rs::db::init_database().unwrap();
         insert_download_fixture(1);
+        let write = narou_rs::native::materialization::capture_write_for_id(1).unwrap();
 
-        let result = auto_convert_existing_download(&DownloadResult {
+        let result = auto_convert_existing_download(&write, &DownloadResult {
             id: 1,
             title: "title".to_string(),
             author: "author".to_string(),
@@ -648,6 +649,7 @@ mod tests {
             result.unwrap_err(),
             "有効な端末名がひとつもありませんでした"
         );
+        drop(write);
         *narou_rs::db::DATABASE.lock() = None;
     }
 

@@ -622,7 +622,7 @@ fn convert_text_target(ctx: TextConvertContext<'_>) -> bool {
         .unwrap_or(target)
         .to_string();
     let mut settings = match NovelSettings::create_for_text_file_with_options(
-        &archive_path, &source_name, ignore_force, ignore_default,
+        archive_path, &source_name, ignore_force, ignore_default,
     ) {
         Ok(settings) => settings,
         Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); return false; }
@@ -633,7 +633,7 @@ fn convert_text_target(ctx: TextConvertContext<'_>) -> bool {
     apply_device_related_settings(&mut settings, selected_device, explicit_device);
     let include_illust = settings.enable_illust;
 
-    let converter = if let Some(user_converter) = UserConverter::load_with_title(&archive_path, &source_name) {
+    let converter = if let Some(user_converter) = UserConverter::load_with_title(archive_path, &source_name) {
         NovelConverter::try_with_user_converter(settings, user_converter)
     } else {
         NovelConverter::try_new(settings)

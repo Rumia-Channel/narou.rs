@@ -166,7 +166,9 @@ impl MemoryObjectStore{
 
 impl ObjectStore for MemoryObjectStore {
     fn delete_closed<'a>(&'a self,prefix:&'a super::ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{Box::pin(async move{super::access_fence::parse_removal_owner(owner)?;let mut gates=self.gate_map();let gate=gates.get_mut(&gate_key_of(prefix)).ok_or_else(||super::access_fence::gate_closed_error(prefix))?;gate.prune(super::transfer_stage::now_secs());
-        if !prefix.matches(key)||gate.state!=super::GateState::Closed||gate.owner.as_deref()!=Some(owner)||gate.epoch!=epoch{return Err(super::access_fence::gate_closed_error(prefix));}if !gate.readers.is_empty(){return Err(super::access_fence::novel_busy_error(prefix));}if self.objects.lock().remove(key.as_ref()).is_some(){gate.content_revision+=1;}Ok(())
+        if !prefix.matches(key)||gate.state!=super::GateState::Closed||gate.owner.as_deref()!=Some(owner)||gate.epoch!=epoch{return Err(super::access_fence::gate_closed_error(prefix));}
+        if !gate.readers.is_empty(){return Err(super::access_fence::novel_busy_error(prefix));}
+        if self.objects.lock().remove(key.as_ref()).is_some(){gate.content_revision+=1;}Ok(())
     })}
     fn retire_legacy_guarded<'a>(&'a self,fence:&'a super::WriteFence,logical:&'a ObjectKey,pool:&'a ObjectKey,size:u64,sha:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
         use sha2::Digest;if super::transfer_stage::illustration_pool_key(logical)?!=*pool{return Err(NarouError::Platform("retirement pool identity mismatch".into()));}
@@ -191,7 +193,9 @@ impl ObjectStore for MemoryObjectStore {
         if !fence.prefix.matches(key)||gate.state!=super::GateState::Open||gate.epoch!=fence.epoch{return Err(super::access_fence::gate_closed_error(&fence.prefix));}self.objects.lock().insert(key.to_string(),std::sync::Arc::new(data));gate.content_revision+=1;Ok(())
     })}
     fn delete_guarded<'a>(&'a self,fence:&'a super::WriteFence,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
-        let mut gates=self.gate_map();let gate=gates.get_mut(&gate_key_of(&fence.prefix)).ok_or_else(||super::access_fence::gate_closed_error(&fence.prefix))?;if !fence.prefix.matches(key)||gate.state!=super::GateState::Open||gate.epoch!=fence.epoch{return Err(super::access_fence::gate_closed_error(&fence.prefix));}if self.objects.lock().remove(key.as_ref()).is_some(){gate.content_revision+=1;}Ok(())
+        let mut gates=self.gate_map();let gate=gates.get_mut(&gate_key_of(&fence.prefix)).ok_or_else(||super::access_fence::gate_closed_error(&fence.prefix))?;
+        if !fence.prefix.matches(key)||gate.state!=super::GateState::Open||gate.epoch!=fence.epoch{return Err(super::access_fence::gate_closed_error(&fence.prefix));}
+        if self.objects.lock().remove(key.as_ref()).is_some(){gate.content_revision+=1;}Ok(())
     })}
 
     fn stat<'a>(
@@ -725,15 +729,18 @@ impl super::access_fence::WriteFenceProof for MemoryGateProof{
     fn source_id(&self)->usize{std::sync::Arc::as_ptr(&self.0) as usize}
     fn run_many(&self,fences:&[super::WriteFence],invalidate:bool,operation:&mut dyn FnMut()->Result<()>)->Result<()>{
         let mut gates=self.0.lock();let source=std::sync::Arc::as_ptr(&self.0) as usize;
-        for fence in fences{if fence.proof_source_id()!=Some(source){return Err(NarouError::Platform("mixed library writer fences".into()));}let gate=gates.get(&gate_key_of(&fence.prefix)).ok_or_else(||super::access_fence::gate_closed_error(&fence.prefix))?;if gate.state!=super::GateState::Open||gate.epoch!=fence.epoch{return Err(super::access_fence::gate_closed_error(&fence.prefix));}if invalidate&&gate.epoch==u64::MAX{return Err(NarouError::Platform("gate epoch overflow".into()));}}
+        for fence in fences{if fence.proof_source_id()!=Some(source){return Err(NarouError::Platform("mixed library writer fences".into()));}let gate=gates.get(&gate_key_of(&fence.prefix)).ok_or_else(||super::access_fence::gate_closed_error(&fence.prefix))?;if gate.state!=super::GateState::Open||gate.epoch!=fence.epoch{return Err(super::access_fence::gate_closed_error(&fence.prefix));}
+            if invalidate&&gate.epoch==u64::MAX{return Err(NarouError::Platform("gate epoch overflow".into()));}}
         operation()?;if invalidate{for fence in fences{let gate=gates.get_mut(&gate_key_of(&fence.prefix)).expect("validated gate");if gate.epoch==fence.epoch{gate.epoch+=1;}}}Ok(())
     }
 }
 impl super::access_fence::NovelAccessFence for MemoryObjectStore {
     fn retire_writer<'a>(&'a self,fence:&'a super::WriteFence,owner:&'a str)->PlatformFuture<'a,Result<u64>>{Box::pin(async move{super::access_fence::parse_removal_owner(owner)?;let next=fence.epoch.checked_add(1).ok_or_else(||NarouError::Platform("gate epoch overflow".into()))?;let mut gates=self.gate_map();let gate=gates.entry(gate_key_of(&fence.prefix)).or_insert_with(MemoryGate::open);
-        if fence.proof_source_id()!=Some(std::sync::Arc::as_ptr(&self.gates) as usize){return Err(NarouError::Platform("mixed library writer fence".into()));}if gate.state==super::GateState::Closed&&gate.owner.as_deref()==Some(owner)&&gate.epoch==next{return Ok(next);}if gate.state!=super::GateState::Open||gate.epoch!=fence.epoch{return Err(super::access_fence::gate_closed_error(&fence.prefix));}gate.epoch=next;gate.state=super::GateState::Closed;gate.owner=Some(owner.into());gate.updated_at=super::transfer_stage::now_secs();Ok(next)
+        if fence.proof_source_id()!=Some(std::sync::Arc::as_ptr(&self.gates) as usize){return Err(NarouError::Platform("mixed library writer fence".into()));}
+        if gate.state==super::GateState::Closed&&gate.owner.as_deref()==Some(owner)&&gate.epoch==next{return Ok(next);}
+        if gate.state!=super::GateState::Open||gate.epoch!=fence.epoch{return Err(super::access_fence::gate_closed_error(&fence.prefix));}gate.epoch=next;gate.state=super::GateState::Closed;gate.owner=Some(owner.into());gate.updated_at=super::transfer_stage::now_secs();Ok(next)
     })}
-    fn pending_removals<'a>(&'a self,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,Result<(Vec<(super::ObjectPrefix,String,u64)>,Option<String>)>>{Box::pin(async move{let cap=limit.clamp(1,100);let gates=self.gate_map();let mut out=Vec::new();let mut last=None;
+    fn pending_removals<'a>(&'a self,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,Result<super::access_fence::PendingRemovalPage>>{Box::pin(async move{let cap=limit.clamp(1,100);let gates=self.gate_map();let mut out=Vec::new();let mut last=None;
         for(index,(prefix,gate))in gates.range::<str,_>((std::ops::Bound::Excluded(cursor.unwrap_or("")),std::ops::Bound::Unbounded)).enumerate(){if index==cap{return Ok((out,last));}last=Some(prefix.clone());if gate.state==super::GateState::Closed&&let Some(owner)=gate.owner.as_ref().filter(|owner|owner.starts_with("remove-v1:")){super::access_fence::parse_removal_owner(owner)?;out.push((super::ObjectPrefix::new(prefix.as_str())?,owner.clone(),gate.epoch));}}Ok((out,None))
     })}
     fn capture_writer<'a>(&'a self,prefix:&'a super::ObjectPrefix)->PlatformFuture<'a,Result<super::WriteFence>>{Box::pin(async move{
@@ -996,7 +1003,9 @@ impl NovelRepository for MemoryNovelRepository {
     fn apply_create_guarded<'a>(&'a self,fence:&'a super::WriteFence,reservation:&'a super::NovelIdReservation,record:NovelRecord)->PlatformFuture<'a,Result<()>>{Box::pin(async move{self.commit_memory_creation(fence,reservation,record)})}
     fn remove_closed<'a>(&'a self,prefix:&'a super::ObjectPrefix,owner:&'a str,epoch:u64,id:NovelId)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
         if super::access_fence::parse_removal_owner(owner)?.0!=id{return Err(NarouError::Platform("removal owner ID mismatch".into()));}let objects=self.objects.as_ref().ok_or_else(||NarouError::Platform("Memory repository has no bound object-store gate authority".into()))?;let mut gates=objects.gates.lock();let gate=gates.get_mut(&gate_key_of(prefix)).ok_or_else(||super::access_fence::gate_closed_error(prefix))?;gate.prune(super::transfer_stage::now_secs());
-        if gate.state!=super::GateState::Closed||gate.owner.as_deref()!=Some(owner)||gate.epoch!=epoch{return Err(super::access_fence::gate_closed_error(prefix));}if !gate.readers.is_empty(){return Err(super::access_fence::novel_busy_error(prefix));}let mut records=self.records.lock();if let Some(record)=records.get(&id.0){let keys=super::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;if keys.prefix().as_ref()!=prefix.as_ref().trim_end_matches('/'){return Err(NarouError::Platform("removal record identity changed".into()));}let url=crate::db::novel_codec::fold(&record.toc_url);if !gate.origin_url_fold.is_empty()&&gate.origin_url_fold!=url{return Err(NarouError::Platform("retained record origin changed".into()));}gate.origin_url_fold=url;}records.remove(&id.0);Ok(())
+        if gate.state!=super::GateState::Closed||gate.owner.as_deref()!=Some(owner)||gate.epoch!=epoch{return Err(super::access_fence::gate_closed_error(prefix));}
+        if !gate.readers.is_empty(){return Err(super::access_fence::novel_busy_error(prefix));}
+        let mut records=self.records.lock();if let Some(record)=records.get(&id.0){let keys=super::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;if keys.prefix().as_ref()!=prefix.as_ref().trim_end_matches('/'){return Err(NarouError::Platform("removal record identity changed".into()));}let url=crate::db::novel_codec::fold(&record.toc_url);if !gate.origin_url_fold.is_empty()&&gate.origin_url_fold!=url{return Err(NarouError::Platform("retained record origin changed".into()));}gate.origin_url_fold=url;}records.remove(&id.0);Ok(())
     })}
     fn get_current<'a>(&'a self,id:NovelId)->PlatformFuture<'a,Result<Option<NovelRecord>>>{self.get(id)}
     fn get_many_current<'a>(&'a self,ids:&'a [NovelId])->PlatformFuture<'a,Result<Vec<Option<NovelRecord>>>>{Box::pin(async move{let records=self.records.lock();Ok(ids.iter().map(|id|records.get(&id.0).cloned()).collect())})}

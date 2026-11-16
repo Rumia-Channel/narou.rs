@@ -885,7 +885,7 @@ impl Database {
 
     pub(crate) fn ordinary_id_liveness_page(
         &self, cursor: Option<i64>, limit: usize,
-    ) -> Result<(Vec<(crate::platform::NovelId, i64)>, Option<i64>)> {
+    ) -> Result<id_reservations::PendingLiveness> {
         id_reservations::pending_liveness(self, cursor, limit)
     }
 

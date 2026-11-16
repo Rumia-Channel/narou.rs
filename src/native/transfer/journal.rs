@@ -161,7 +161,7 @@ impl TransferJournal for NativeTransferJournal {
         let(owner,mut session)=rows.session(&row.session_id)?;
         session.confirmed_bytes=session.confirmed_bytes.checked_sub(old.confirmed_bytes).ok_or_else(||TransferError::invalid("journal_corrupt","confirmed counter underflow"))?;
         session.revision+=1;session.updated_at=Utc::now();session.expires_at=session.updated_at+chrono::Duration::seconds(SESSION_IDLE_TTL_SECS);
-        if row.file_id==MANIFEST_FILE_ID{if let SessionExt::Import(ext)=&mut session.ext{ext.manifest_confirmed=0;}}
+        if row.file_id==MANIFEST_FILE_ID&&let SessionExt::Import(ext)=&mut session.ext{ext.manifest_confirmed=0;}
         let start=format!("{}:",number(row.file_id));let end=format!("{};",number(row.file_id));
         rows.0.execute("DELETE FROM transfer_native_rows WHERE kind='chunk' AND owner=?1 AND key>=?2 AND key<?3",rusqlite::params![row.session_id.0,start,end]).map_err(TransferError::platform)?;
         rows.write("active_stage",&row.session_id.0,&number(row.file_id),None)?;
@@ -174,11 +174,11 @@ impl TransferJournal for NativeTransferJournal {
         if old.confirmed_bytes!=chunk.offset||old.next_chunk_index!=chunk.chunk_index{return Err(TransferError::ChunkConflict{code:"unexpected_offset",message:"file advanced concurrently".into()});}
         let(owner,mut session)=rows.session(&chunk.session_id)?;session.confirmed_bytes=session.confirmed_bytes.checked_add(chunk.payload_size).ok_or_else(||TransferError::invalid("size_overflow","confirmed bytes overflow"))?;
         session.revision+=1;session.updated_at=Utc::now();session.expires_at=session.updated_at+chrono::Duration::seconds(SESSION_IDLE_TTL_SECS);
-        if file.file_id==MANIFEST_FILE_ID{if let SessionExt::Import(ext)=&mut session.ext{ext.manifest_confirmed=file.confirmed_bytes;}}
+        if file.file_id==MANIFEST_FILE_ID&&let SessionExt::Import(ext)=&mut session.ext{ext.manifest_confirmed=file.confirmed_bytes;}
         if file.state==FileState::Finalizing{session.next_action=NextAction::FinalizeFile;session.operation_id=file.finalize_operation.clone();}
         rows.put("chunk",&chunk.session_id.0,&key,chunk)?;rows.put("file",&file.session_id.0,&number(file.file_id),file)?;rows.put("session",&owner,&session.session_id.0,&session)
     })})}
-    fn put_publication<'a>(&'a self,row:&'a PublicationRow)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{let key=number(row.publication_id);if let Some(old)=rows.get::<PublicationRow>("publication",&row.session_id.0,&key)?{if !matches!(old.state,PublicationState::Pending|PublicationState::Skipped|PublicationState::RolledBack){return Ok(());}}rows.put("publication",&row.session_id.0,&key,row)})})}
+    fn put_publication<'a>(&'a self,row:&'a PublicationRow)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{let key=number(row.publication_id);if let Some(old)=rows.get::<PublicationRow>("publication",&row.session_id.0,&key)?&&!matches!(old.state,PublicationState::Pending|PublicationState::Skipped|PublicationState::RolledBack){return Ok(());}rows.put("publication",&row.session_id.0,&key,row)})})}
     fn publication<'a>(&'a self,id:&'a SessionId,publication:u32)->PlatformFuture<'a,TR<Option<PublicationRow>>>{Box::pin(async move{self.get("publication",&id.0,&number(publication))})}
     fn update_publication<'a>(&'a self,row:&'a PublicationRow)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{let key=number(row.publication_id);let old:Option<PublicationRow>=rows.get("publication",&row.session_id.0,&key)?;
         if old.as_ref().is_some_and(|old|(old.state==PublicationState::Committed&&old.phase_cursor.as_deref()==Some("finished"))||old.state==PublicationState::RolledBack){return Ok(());}

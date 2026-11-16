@@ -2568,7 +2568,7 @@ before_settings:
         let temp = tempfile::Builder::new().prefix("converted-text-").tempdir_in(libraries).unwrap();
         let _dir = crate::test_support::set_current_dir_for_test(temp.path());
         let _keep = KeepTxtEnvGuard::new("1");
-        let _database = crate::test_support::isolate_database_for_test();
+        let _database = crate::test_database::isolate_database_for_test();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         crate::db::init_database().unwrap();
 
@@ -2619,7 +2619,7 @@ before_settings:
         let temp = tempfile::Builder::new().prefix("discarded-text-").tempdir_in(libraries).unwrap();
         let _dir = crate::test_support::set_current_dir_for_test(temp.path());
         let _keep = KeepTxtEnvGuard::new("0");
-        let _database = crate::test_support::isolate_database_for_test();
+        let _database = crate::test_database::isolate_database_for_test();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         std::fs::write(
             temp.path()

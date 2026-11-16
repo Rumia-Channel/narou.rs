@@ -4,3 +4,7 @@
 # check behaves the same on Windows and Linux.
 Third-Party-License.md text
 Third-Party-License-non-GPL.md text
+
+# Vendored inputs must be canonical before cargo-about groups license texts.
+vendor/async_zip/LICENSE text eol=lf
+vendor/image-webp/LICENSE-MIT text eol=lf

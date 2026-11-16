@@ -121,8 +121,7 @@ pub const MAX_WIRE_MANIFEST_BYTES: u64 =
 pub const MAX_METADATA_BYTES: usize = 24 * 1024 * 1024;
 /// Page limits shared by catalog/files/plan/session pages.
 pub const MAX_PAGE_ITEMS: usize = crate::transfer::protocol::PAGE_MAX_ITEMS;
-pub const MAX_PAGE_BYTES: usize =
-    crate::transfer::protocol::PAGE_MAX_BYTES as usize;
+pub const MAX_PAGE_BYTES: usize = crate::transfer::protocol::PAGE_MAX_BYTES;
 /// Reserved `file_id` inside binary batches that carries wire-manifest bytes.
 /// Real file ids are the manifest's `file` record ordinals starting at 0, so
 /// they can never collide with `u32::MAX`.
@@ -1747,6 +1746,20 @@ pub trait TransferBackend: PlatformService {
 // Service
 // ---------------------------------------------------------------------------
 
+struct CreationParameters<'a> {
+    scope: &'a AuthScope,
+    direction: TransferDirection,
+    request_id: &'a str,
+    creation_ticket: &'a str,
+    fingerprint: String,
+    secret: &'a [u8],
+    policy: ConflictPolicy,
+    profile: TransferProfile,
+    extra_roles: Vec<String>,
+    policy_version: u32,
+    gate: &'a CapabilityGate,
+}
+
 /// Shared transfer engine. Constructed once per process with the concrete
 /// backend + journal; every method is a bounded, idempotent step.
 pub struct TransferService {
@@ -2043,11 +2056,10 @@ impl TransferService {
     // -- creation -------------------------------------------------------------
 
     async fn create_common(
-        &self, scope: &AuthScope, direction: TransferDirection, request_id: &str,
-        creation_ticket: &str, fingerprint: String, secret: &[u8],
-        make_ext: impl FnOnce() -> SessionExt, policy: ConflictPolicy, profile: TransferProfile,
-        extra_roles: Vec<String>, policy_version: u32, gate: &CapabilityGate,
+        &self, parameters: CreationParameters<'_>, make_ext: impl FnOnce() -> SessionExt,
     ) -> Result<CreateResult, TransferError> {
+        let CreationParameters { scope, direction, request_id, creation_ticket, fingerprint,
+            secret, policy, profile, extra_roles, policy_version, gate } = parameters;
         if request_id.is_empty() || request_id.len() > 128 || secret.len() != 32 {
             return Err(TransferError::invalid("invalid_request", "request_id must be 1..128 bytes and session secret exactly 256 bits"));
         }
@@ -2055,10 +2067,10 @@ impl TransferService {
         let previous = self.journal.find_create(scope, request_id).await?;
         if let Some(existing) = &previous {
             if existing.request_fingerprint != fingerprint { return Err(TransferError::IdempotencyConflict); }
-            if let Some(id) = &existing.session_id {
-                if let Some(row) = self.journal.session(scope, id).await? {
-                    return Ok(CreateResult { status: self.status_of(&row), replayed: true });
-                }
+            if let Some(id) = &existing.session_id
+                && let Some(row) = self.journal.session(scope, id).await?
+            {
+                return Ok(CreateResult { status: self.status_of(&row), replayed: true });
             }
         } else if !self.backend.verify_ticket(scope, creation_ticket).await? {
             return Err(TransferError::invalid("request_expired", "creation ticket is invalid or expired"));
@@ -2131,12 +2143,13 @@ impl TransferService {
         let manifest_sha256 = request.manifest_sha256.clone();
         let source_fingerprint = request.source_fingerprint.clone();
         self.create_common(
-            scope,
-            TransferDirection::Import,
-            &request.request_id,
-            &request.creation_ticket,
-            fingerprint,
-            secret,
+            CreationParameters {
+                scope, direction: TransferDirection::Import, request_id: &request.request_id,
+                creation_ticket: &request.creation_ticket, fingerprint, secret,
+                policy: request.conflict_policy, profile: request.profile,
+                extra_roles: request.extra_roles.clone(), policy_version: request.policy_version,
+                gate: &caps.import,
+            },
             move || {
                 SessionExt::Import(ImportSessionExt {
                     source_fingerprint,
@@ -2145,11 +2158,6 @@ impl TransferService {
                     ..Default::default()
                 })
             },
-            request.conflict_policy,
-            request.profile,
-            request.extra_roles.clone(),
-            request.policy_version,
-            &caps.import,
         )
         .await
     }
@@ -2175,23 +2183,19 @@ impl TransferService {
         );
         let ids = request.ids.clone();
         self.create_common(
-            scope,
-            TransferDirection::Export,
-            &request.request_id,
-            &request.creation_ticket,
-            fingerprint,
-            secret,
+            CreationParameters {
+                scope, direction: TransferDirection::Export, request_id: &request.request_id,
+                creation_ticket: &request.creation_ticket, fingerprint, secret,
+                policy: ConflictPolicy::Skip, profile: request.profile,
+                extra_roles: request.extra_roles.clone(), policy_version: caps.policy_version,
+                gate: &caps.export,
+            },
             move || {
                 SessionExt::Export(ExportSessionExt {
                     requested_ids: ids,
                     ..Default::default()
                 })
             },
-            ConflictPolicy::Skip,
-            request.profile,
-            request.extra_roles.clone(),
-            caps.policy_version,
-            &caps.export,
         )
         .await
     }
@@ -2367,12 +2371,12 @@ impl TransferService {
         if let Some(existing) = self.journal.operation(&row.session_id, &op.operation_id).await? {
             if existing.request_fingerprint != fingerprint { return Err(TransferError::OperationConflict); }
             if let Some(bytes) = existing.result { return serde_json::from_slice(&bytes).map(Some).map_err(TransferError::platform); }
-            if row.last_operation_id.as_ref() == Some(&op.operation_id) {
-                if let Some(bytes) = &row.last_operation_result {
-                    let mut done = existing; done.result = Some(bytes.clone()); done.completed = true;
-                    self.journal.finish_operation(&done).await?;
-                    return serde_json::from_slice(bytes).map(Some).map_err(TransferError::platform);
-                }
+            if row.last_operation_id.as_ref() == Some(&op.operation_id)
+                && let Some(bytes) = &row.last_operation_result
+            {
+                let mut done = existing; done.result = Some(bytes.clone()); done.completed = true;
+                self.journal.finish_operation(&done).await?;
+                return serde_json::from_slice(bytes).map(Some).map_err(TransferError::platform);
             }
         }
         if row.revision != op.if_match_revision { return Err(TransferError::RevisionMismatch { current: row.revision }); }
@@ -2380,12 +2384,24 @@ impl TransferService {
         self.journal.begin_operation(&claim).await?;
         let latest=self.journal.session(&row.scope,&row.session_id).await?.ok_or(TransferError::SessionNotFound)?;self.reconcile_last_operation(&latest).await?;
         let claimed=self.journal.operation(&row.session_id,&op.operation_id).await?.ok_or(TransferError::OperationConflict)?;
-        if claimed.request_fingerprint!=fingerprint{self.journal.finish_operation(&claimed).await?;return Err(TransferError::OperationConflict);}if let Some(result)=&claimed.result{self.journal.finish_operation(&claimed).await?;return serde_json::from_slice(result).map(Some).map_err(TransferError::platform);}
+        if claimed.request_fingerprint!=fingerprint{self.journal.finish_operation(&claimed).await?;return Err(TransferError::OperationConflict);}
+        if let Some(result)=&claimed.result{self.journal.finish_operation(&claimed).await?;return serde_json::from_slice(result).map(Some).map_err(TransferError::platform);}
         if latest.revision!=row.revision||latest.revision!=op.if_match_revision{self.journal.finish_operation(&claimed).await?;return Err(TransferError::RevisionMismatch{current:latest.revision});}Ok(None)
     }
 
-    async fn reconcile_last_operation(&self,row:&SessionRow)->Result<(),TransferError>{
-        if let(Some(id),Some(result))=(&row.last_operation_id,&row.last_operation_result){if let Some(mut receipt)=self.journal.operation(&row.session_id,id).await?{if receipt.result.as_ref().is_some_and(|saved|saved!=result){return Err(TransferError::RecoveryRequired{message:"immutable operation receipt conflicts with session CAS".into()});}if !receipt.completed||receipt.result.is_none(){receipt.result=Some(result.clone());receipt.completed=true;self.journal.finish_operation(&receipt).await?;}}}Ok(())
+    async fn reconcile_last_operation(&self, row: &SessionRow) -> Result<(), TransferError> {
+        if let (Some(id), Some(result)) = (&row.last_operation_id, &row.last_operation_result)
+            && let Some(mut receipt) = self.journal.operation(&row.session_id, id).await? {
+            if receipt.result.as_ref().is_some_and(|saved| saved != result) {
+                return Err(TransferError::RecoveryRequired { message: "immutable operation receipt conflicts with session CAS".into() });
+            }
+            if !receipt.completed || receipt.result.is_none() {
+                receipt.result = Some(result.clone());
+                receipt.completed = true;
+                self.journal.finish_operation(&receipt).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn finish_control(&self, row: &mut SessionRow, op: &ControlOp) -> Result<SessionStatus, TransferError> {
@@ -2635,7 +2651,8 @@ impl TransferService {
                     let scalar=metadata_scalar_field(&text.field);
                     let completed=match text.field.as_str(){"tag"=>text.item!=Some(checkpoint.tags),"member"=>text.item!=Some(checkpoint.members),_=>scalar.is_none_or(|field|checkpoint.scalar_fields&(1<<field)!=0)};
                     if completed || match &checkpoint.open_text { Some((field, item, part)) => field != &text.field || item != &text.item || *part != text.part, None => text.part != 0 } { return Err(TransferError::invalid("invalid_text_sequence", "text fragments must be consecutive, unique and explicitly terminated")); }
-                    if text.field=="title"&&!text.value.trim().is_empty(){checkpoint.title_nonempty=true;}if text.field=="toc_url"&&!text.value.is_empty(){checkpoint.url_nonempty=true;}
+                    if text.field=="title"&&!text.value.trim().is_empty(){checkpoint.title_nonempty=true;}
+                    if text.field=="toc_url"&&!text.value.is_empty(){checkpoint.url_nonempty=true;}
                     let key = format!("{JKEY_TEXT}{}:{}:{}:{}", text.novel, text.field, text.item.unwrap_or(0), text.part);
                     self.journal.put_journal_entry(&row.session_id, SESSION_JOURNAL_PUB, &key, text.value.as_bytes()).await?;
                     if text.last {
@@ -2659,7 +2676,7 @@ impl TransferService {
                     let mut digest = crate::transfer::projection::ProjectionDigest::from_checkpoint(checkpoint.projection_hash.as_deref().ok_or_else(|| TransferError::invalid("invalid_manifest", "selection hash missing"))?).map_err(TransferError::platform)?;
                     digest.file(&file.path, file.size, &file.sha256).map_err(TransferError::platform)?; checkpoint.projection_hash = Some(digest.checkpoint());
                     let pathkey = format!("path:{}:{}", file.novel, sha256_hex(file.path.as_bytes()));
-                    if let Some(previous) = self.value::<u32>(&row.session_id, &pathkey).await? { if previous != file.file_id { return Err(TransferError::invalid("duplicate_path", "novel contains duplicate file paths")); } }
+                    if let Some(previous) = self.value::<u32>(&row.session_id, &pathkey).await? && previous != file.file_id { return Err(TransferError::invalid("duplicate_path", "novel contains duplicate file paths")); }
                     self.save_value(&row.session_id, &pathkey, &file.file_id).await?;
                     self.journal.put_file(&FileRow { session_id: row.session_id.clone(), file_id: file.file_id, novel_ordinal: file.novel, logical_path: file.path.clone(), role, size: file.size, sha256: file.sha256, state: FileState::Pending, confirmed_bytes: 0, next_chunk_index: 0, confirmed_prefix_sha256: Some(sha256_hex(&[])), hash_checkpoint: None, stage: None, pin: None, finalize_operation: None }).await?;
                     checkpoint.files += 1; checkpoint.current_files += 1; checkpoint.current_bytes = checkpoint.current_bytes.checked_add(file.size).ok_or_else(|| TransferError::invalid("size_overflow", "novel size overflow"))?; checkpoint.metadata_bytes += file.path.len() as u64 + 256;
@@ -2711,7 +2728,7 @@ impl TransferService {
                 let mut file=self.journal.file(&row.session_id,file_id).await?.ok_or_else(||TransferError::invalid("file_missing","planned file row missing"))?;
                 let action=if let Some(action)=actions.get(&file.novel_ordinal){*action}else{let action:PlanAction=self.value(&row.session_id,&format!("action:{}",file.novel_ordinal)).await?.ok_or_else(||TransferError::invalid("plan_missing","file plan action missing"))?;actions.insert(file.novel_ordinal,action);action};
                 if matches!(action,PlanAction::Skip|PlanAction::Reject){file.state=FileState::Skipped;self.journal.update_file(&file).await?;}
-                else if !matches!(file.state,FileState::Verified|FileState::Reused){if let Some(pin)=self.backend.find_reusable(&row.scope,row,&file).await?{if pin.size!=file.size||pin.sha256!=file.sha256{return Err(TransferError::invalid("reuse_identity_mismatch","backend returned wrong immutable reuse identity"));}file.state=FileState::Reused;file.pin=Some(pin.pin);file.confirmed_bytes=file.size;file.confirmed_prefix_sha256=Some(file.sha256.clone());self.journal.update_file(&file).await?;}}
+                else if !matches!(file.state,FileState::Verified|FileState::Reused)&&let Some(pin)=self.backend.find_reusable(&row.scope,row,&file).await?{if pin.size!=file.size||pin.sha256!=file.sha256{return Err(TransferError::invalid("reuse_identity_mismatch","backend returned wrong immutable reuse identity"));}file.state=FileState::Reused;file.pin=Some(pin.pin);file.confirmed_bytes=file.size;file.confirmed_prefix_sha256=Some(file.sha256.clone());self.journal.update_file(&file).await?;}
                 file_id+=1;budget.records+=1;
             }
             import_ext_mut(row)?.planning_ordinal=file_id;
@@ -2723,10 +2740,10 @@ impl TransferService {
         match ext.planning_phase{
             1=>{
                 let layout:crate::transfer::NovelJsonLayout=self.value(&row.session_id,&format!("wire_layout:{ordinal}")).await?.ok_or_else(||TransferError::invalid("metadata_missing","normalized wire layout missing"))?;
-                let mut cursor:WireMetadataCursor=ext.graph_cursor.as_deref().map(serde_json::from_str).transpose().map_err(TransferError::platform)?.unwrap_or_default();let operation=row.operation_id.as_ref().ok_or_else(||TransferError::invalid("operation_missing","metadata normalization needs operation identity"))?;
-                if !self.copy_wire_metadata_step(&row.session_id,&key,ordinal,&layout,&mut cursor,operation,budget).await?{import_ext_mut(row)?.graph_cursor=Some(serde_json::to_string(&cursor).map_err(TransferError::platform)?);return Ok(());}
+                let mut cursor:WireMetadataCursor=ext.graph_cursor.as_deref().map(serde_json::from_str).transpose().map_err(TransferError::platform)?.unwrap_or_default();
+                if !self.copy_wire_metadata_step(row,&key,ordinal,&layout,&mut cursor,budget).await?{import_ext_mut(row)?.graph_cursor=Some(serde_json::to_string(&cursor).map_err(TransferError::platform)?);return Ok(());}
                 let url=self.metadata_text(&row.session_id,&key,0,8192).await?;let urlkey=format!("url:{}",sha256_hex(url.as_bytes()));
-                if let Some(previous)=self.value::<u32>(&row.session_id,&urlkey).await?{if previous!=ordinal{return Err(TransferError::invalid("duplicate_novel_url","manifest repeats toc_url"));}}self.save_value(&row.session_id,&urlkey,&ordinal).await?;
+                if let Some(previous)=self.value::<u32>(&row.session_id,&urlkey).await?&&previous!=ordinal{return Err(TransferError::invalid("duplicate_novel_url","manifest repeats toc_url"));}
                 let wire:crate::transfer::protocol::WireNovel=self.value(&row.session_id,&format!("{JKEY_NOVEL}{ordinal}")).await?.ok_or_else(||TransferError::invalid("novel_missing","normalized novel missing"))?;
                 if wire.kind==NovelKind::Normal&&self.value::<u32>(&row.session_id,&format!("path:{ordinal}:{}",sha256_hex(b"toc.yaml"))).await?.is_none(){return Err(TransferError::invalid("required_file_missing","ordinary novel must include toc.yaml"));}import_ext_mut(row)?.graph_cursor=None;
             }
@@ -2736,10 +2753,12 @@ impl TransferService {
                     let mut layout:crate::transfer::NovelJsonLayout=self.value(&row.session_id,&key).await?.ok_or_else(||TransferError::invalid("metadata_missing","metadata layout missing"))?;layout.optional&=!(1<<7);layout.members=None;
                     let mut measure:MetadataMeasure=ext.graph_cursor.as_deref().map(serde_json::from_str).transpose().map_err(TransferError::platform)?.unwrap_or_default();let mut cached:Option<(crate::transfer::NovelJsonRequest,Vec<u8>,bool)>=None;
                     while budget.records<ADVANCE_ITEM_BUDGET&&budget.bytes+crate::transfer::protocol::IO_CHUNK_BYTES as u64<=ADVANCE_BYTE_BUDGET{
-                        if let Some(request)=measure.request{if cached.as_ref().is_none_or(|(key,_,_)|*key!=request){let(bytes,last)=self.metadata_input(&row.session_id,&key,request).await?;cached=Some((request,bytes,last));}}
+                        if let Some(request)=measure.request&&cached.as_ref().is_none_or(|(key,_,_)|*key!=request){let(bytes,last)=self.metadata_input(&row.session_id,&key,request).await?;cached=Some((request,bytes,last));}
                         let input=cached.as_ref().map(|(request,bytes,last)|std::str::from_utf8(bytes).map(|text|crate::transfer::NovelJsonText{field:request.field,part:request.part,text,last:*last})).transpose().map_err(TransferError::platform)?;
                         let output=crate::transfer::novel_json_pull(&layout,&mut measure.cursor,input,crate::transfer::protocol::IO_CHUNK_BYTES).map_err(TransferError::platform)?;measure.bytes=measure.bytes.checked_add(output.bytes.len() as u64).ok_or_else(||TransferError::invalid("metadata_budget","record size overflow"))?;budget.bytes+=output.bytes.len() as u64;budget.records+=1;
-                        if measure.bytes>limit{return Err(TransferError::invalid("backend_metadata_limit",format!("record fields exceed backend{limit} byte row limit")));}if let Some(request)=output.request{measure.request=Some(request);}if output.done{import_ext_mut(row)?.graph_cursor=None;break;}
+                        if measure.bytes>limit{return Err(TransferError::invalid("backend_metadata_limit",format!("record fields exceed backend{limit} byte row limit")));}
+                        if let Some(request)=output.request{measure.request=Some(request);}
+                        if output.done{import_ext_mut(row)?.graph_cursor=None;break;}
                         if budget.exhausted(){import_ext_mut(row)?.graph_cursor=Some(serde_json::to_string(&measure).map_err(TransferError::platform)?);return Ok(());}
                     }
                     if budget.exhausted(){import_ext_mut(row)?.graph_cursor=Some(serde_json::to_string(&measure).map_err(TransferError::platform)?);return Ok(());}
@@ -2762,7 +2781,7 @@ impl TransferService {
                 }else{budget.records+=1;}
             }
             4=>{
-                if let Some(publication)=self.journal.publication(&row.session_id,ordinal).await?{if publication.state==PublicationState::Committed{return {import_ext_mut(row)?.planning_ordinal+=1;Ok(())};}}
+                if let Some(publication)=self.journal.publication(&row.session_id,ordinal).await?&&publication.state==PublicationState::Committed{return {import_ext_mut(row)?.planning_ordinal+=1;Ok(())};}
                 let novel=self.record_metadata(&row.session_id,&key).await?;let layout:crate::transfer::NovelJsonLayout=self.value(&row.session_id,&key).await?.ok_or_else(||TransferError::invalid("metadata_missing","metadata layout missing"))?;let kind=if layout.members.is_some(){NovelKind::VirtualParent}else{NovelKind::Normal};
                 let existing=self.backend.library_index(&row.scope,std::slice::from_ref(&novel.toc_url)).await?.into_iter().next();
                 let action=match &existing{Some(m)if m.kind!=kind=>PlanAction::Reject,Some(_)if row.conflict_policy==ConflictPolicy::Skip=>PlanAction::Skip,Some(_)=>PlanAction::Overwrite,None=>PlanAction::Create};
@@ -2837,7 +2856,7 @@ impl TransferService {
             let mut items=Vec::new();
             for file in &entry.files{
                 crate::transfer::validate_relative_path(&file.logical_path).map_err(TransferError::platform)?;let source_key=format!("xsource:{}:{}",entry.novel_ordinal,sha256_hex(file.logical_path.as_bytes()));
-                if let Some(previous)=self.value::<SourceFileEntry>(&row.session_id,&source_key).await?{if previous.size!=file.size||previous.logical_path!=file.logical_path{return Err(TransferError::PlanStale{message:"source changed during inventory".into()});}}
+                if let Some(previous)=self.value::<SourceFileEntry>(&row.session_id,&source_key).await?&&(previous.size!=file.size||previous.logical_path!=file.logical_path){return Err(TransferError::PlanStale{message:"source changed during inventory".into()});}
                 self.save_value(&row.session_id,&source_key,file).await?;if let SourceRef::Unavailable(reason)=&file.source{return Err(TransferError::invalid("source_missing",reason));}
                 let mut role=crate::transfer::projection::classify(&file.logical_path,entry.kind==NovelKind::VirtualParent,&ClassifyContext::default());if file.known_role==Some(FileRole::Generated)&&role==FileRole::Unknown{role=FileRole::Generated;}
                 let runtime=catalog_decision(TransferProfile::Runtime,role,&caps.unpersistable_roles);let complete=catalog_decision(TransferProfile::Complete,role,&caps.unpersistable_roles);let extras=row.extra_roles.iter().map(String::as_str).collect::<Vec<_>>();let decision=crate::transfer::projection::send_decision(row.profile,role,&extras);let selectable=role!=FileRole::Internal&&!caps.unpersistable_roles.contains(&role);let selected=selectable&&decision_selected(decision);
@@ -2972,11 +2991,12 @@ impl TransferService {
             2=>{
                 let key=format!("xmetadata:{}",cursor.novel);let layout:crate::transfer::NovelJsonLayout=self.value(&row.session_id,&key).await?.ok_or_else(||TransferError::invalid("metadata_missing","export metadata layout missing"))?;let mut cached:Option<(crate::transfer::NovelJsonRequest,Vec<u8>,bool)>=None;
                 while budget.records<ADVANCE_ITEM_BUDGET&&output.len()+crate::transfer::protocol::IO_CHUNK_BYTES<=ADVANCE_BYTE_BUDGET as usize{
-                    if let Some(request)=cursor.metadata_request{if cached.as_ref().is_none_or(|(key,_,_)|*key!=request){let(bytes,last)=self.metadata_input(&row.session_id,&key,request).await?;cached=Some((request,bytes,last));}}
+                    if let Some(request)=cursor.metadata_request&&cached.as_ref().is_none_or(|(key,_,_)|*key!=request){let(bytes,last)=self.metadata_input(&row.session_id,&key,request).await?;cached=Some((request,bytes,last));}
                     let input=cached.as_ref().map(|(request,bytes,last)|std::str::from_utf8(bytes).map(|text|crate::transfer::NovelJsonText{field:request.field,part:request.part,text,last:*last})).transpose().map_err(TransferError::platform)?;
                     let encoded=crate::transfer::novel_json_pull(&layout,&mut cursor.metadata,input,crate::transfer::protocol::IO_CHUNK_BYTES).map_err(TransferError::platform)?;let chunk=encoded.bytes;
                     let bytes=if cursor.metadata_started{chunk.as_slice()}else{cursor.metadata_started=true;if chunk.first()!=Some(&b'{'){return Err(TransferError::invalid("metadata_codec","metadata encoder did not start an object"));}&chunk[1..]};output.extend_from_slice(bytes);budget.records+=1;
-                    if let Some(request)=encoded.request{cursor.metadata_request=Some(request);}if encoded.done{cursor.novel+=1;cursor.phase=0;cursor.metadata_request=None;break;}
+                    if let Some(request)=encoded.request{cursor.metadata_request=Some(request);}
+                    if encoded.done{cursor.novel+=1;cursor.phase=0;cursor.metadata_request=None;break;}
                 }
             }
             _=>return Err(TransferError::invalid("invalid_manifest_cursor","unknown export manifest phase")),
@@ -3096,14 +3116,13 @@ impl TransferService {
             if receipt.kind != "advance" { return Err(TransferError::OperationConflict); }
             if let Some(result) = receipt.result { return serde_json::from_slice(&result).map_err(TransferError::platform); }
         }
-        if row.last_operation_id.as_ref() == Some(operation_id) {
-            if let Some(result) = &row.last_operation_result { return serde_json::from_slice(result).map_err(TransferError::platform); }
-        }
+        if row.last_operation_id.as_ref() == Some(operation_id) && let Some(result) = &row.last_operation_result { return serde_json::from_slice(result).map_err(TransferError::platform); }
         if row.operation_id.as_ref() != Some(operation_id) || !matches!(row.next_action, NextAction::Advance | NextAction::FinalizeFile) { return Err(TransferError::OperationConflict); }
         let receipt = OperationRow { session_id: id.clone(), operation_id: operation_id.clone(), kind: "advance".into(), request_fingerprint: sha256_hex(operation_id.0.as_bytes()), if_match_revision: None, result: None, completed: false, created_at: self.clock.now_utc() };
         self.journal.begin_operation(&receipt).await?;
         row=self.load_session(scope,id,secret).await?;self.reconcile_last_operation(&row).await?;let receipt=self.journal.operation(id,operation_id).await?.ok_or(TransferError::OperationConflict)?;
-        if let Some(result)=&receipt.result{self.journal.finish_operation(&receipt).await?;return serde_json::from_slice(result).map_err(TransferError::platform);}if receipt.kind!="advance"||row.operation_id.as_ref()!=Some(operation_id)||!matches!(row.next_action,NextAction::Advance|NextAction::FinalizeFile){self.journal.finish_operation(&receipt).await?;return Err(TransferError::OperationConflict);}
+        if let Some(result)=&receipt.result{self.journal.finish_operation(&receipt).await?;return serde_json::from_slice(result).map_err(TransferError::platform);}
+        if receipt.kind!="advance"||row.operation_id.as_ref()!=Some(operation_id)||!matches!(row.next_action,NextAction::Advance|NextAction::FinalizeFile){self.journal.finish_operation(&receipt).await?;return Err(TransferError::OperationConflict);}
         let before = row.revision; let mut budget = AdvanceBudget::default();
         let step = match row.state {
             SessionState::ReceivingManifest | SessionState::Transferring if row.next_action == NextAction::FinalizeFile => self.finalize_file_step(&mut row, &mut budget).await,
@@ -3224,7 +3243,8 @@ impl TransferService {
             };
             let committed=publication.state==PublicationState::Committed||step.committed;
             publication.phase_cursor=step.cursor;budget.bytes+=step.processed_bytes;budget.records+=1;
-            if let Some(receipt)=step.receipt{publication.receipt=Some(receipt);}if let Some(id)=step.assigned_id{publication.assigned_id=Some(id);}
+            if let Some(receipt)=step.receipt{publication.receipt=Some(receipt);}
+            if let Some(id)=step.assigned_id{publication.assigned_id=Some(id);}
             if step.done{self.backend.publication_gate_open(&spec,None).await?;publication.state=if committed{PublicationState::Committed}else{PublicationState::RolledBack};publication.phase_cursor=Some("finished".into());if committed{publication.error=None;}}
             self.journal.update_publication(&publication).await?;return Ok(());
         }
@@ -3259,7 +3279,8 @@ impl TransferService {
                 match step{
                     Ok(step)=>{
                         report.stepped_publications+=1;bytes=step.processed_bytes;let committed=was_committed||step.committed;publication.phase_cursor=step.cursor;
-                        if let Some(receipt)=step.receipt{publication.receipt=Some(receipt);}if let Some(id)=step.assigned_id{publication.assigned_id=Some(id);}
+                        if let Some(receipt)=step.receipt{publication.receipt=Some(receipt);}
+                        if let Some(id)=step.assigned_id{publication.assigned_id=Some(id);}
                         if step.done{self.backend.publication_gate_open(&spec,None).await?;publication.state=if committed{PublicationState::Committed}else{PublicationState::RolledBack};publication.phase_cursor=Some("finished".into());publication.error=None;row.error=None;report.resolved_publications+=1;}
                         else{publication.state=if committed{PublicationState::Committed}else{PublicationState::RollingBack};report.pending_recovery+=1;}
                     },
@@ -3273,7 +3294,7 @@ impl TransferService {
                 if let Some(operation)=old_operation{
                     let response=AdvanceResult{status:self.status_of(&row),step_done:false,processed_records:1,processed_bytes:bytes};let encoded=serde_json::to_vec(&response).map_err(TransferError::platform)?;row.last_operation_id=Some(operation.clone());row.last_operation_result=Some(encoded.clone());
                     self.journal.update_session(&row,revision).await?;
-                    if let Some(mut receipt)=self.journal.operation(&row.session_id,&operation).await?{if receipt.kind=="advance"&&receipt.result.is_none(){receipt.completed=true;receipt.result=Some(encoded);self.journal.finish_operation(&receipt).await?;}}
+                    if let Some(mut receipt)=self.journal.operation(&row.session_id,&operation).await?&&receipt.kind=="advance"&&receipt.result.is_none(){receipt.completed=true;receipt.result=Some(encoded);self.journal.finish_operation(&receipt).await?;}
                 }else{self.journal.update_session(&row,revision).await?;}
                 Ok(())
             }.await;
@@ -3311,7 +3332,10 @@ struct MetadataMeasure {cursor:crate::transfer::NovelJsonPullCursor,request:Opti
 fn metadata_scalar_field(name:&str)->Option<u32>{match name{"toc_url"=>Some(0),"title"=>Some(1),"author"=>Some(2),"sitename"=>Some(3),"domain"=>Some(4),"attribute_tag"=>Some(5),"ncode"=>Some(6),"subtitle"=>Some(7),"general_lastup"=>Some(8),"last_update"=>Some(9),_=>None}}
 fn wire_metadata_field(layout:&crate::transfer::NovelJsonLayout,field:u32)->Result<(&'static str,Option<u32>),TransferError>{
     const NAMES:[&str;10]=["toc_url","title","author","sitename","domain","attribute_tag","ncode","subtitle","general_lastup","last_update"];
-    if field<10{return Ok((NAMES[field as usize],None));}if field<10+layout.tags{return Ok(("tag",Some(field-10)));}if field<layout.fields().map_err(TransferError::platform)?{return Ok(("member",Some(field-10-layout.tags)));}Err(TransferError::invalid("metadata_corrupt","metadata field is outside layout"))
+    if field<10{return Ok((NAMES[field as usize],None));}
+    if field<10+layout.tags{return Ok(("tag",Some(field-10)));}
+    if field<layout.fields().map_err(TransferError::platform)?{return Ok(("member",Some(field-10-layout.tags)));}
+    Err(TransferError::invalid("metadata_corrupt","metadata field is outside layout"))
 }
 
 impl TransferService {
@@ -3321,7 +3345,8 @@ impl TransferService {
         if fragment.last{let parts=fragment.part.checked_add(1).ok_or_else(||TransferError::invalid("metadata_budget","metadata fragment count overflow"))?;self.save_value(id,&format!("{key}:field:{}",fragment.field),&parts).await?;let length=fragment.byte_offset.checked_add(fragment.bytes.len()).ok_or_else(||TransferError::invalid("metadata_budget","metadata field size overflow"))?;self.save_value(id,&format!("{key}:length:{}",fragment.field),&length).await?;}Ok(())
     }
 
-    async fn copy_wire_metadata_step(&self,id:&SessionId,key:&str,ordinal:u32,layout:&crate::transfer::NovelJsonLayout,cursor:&mut WireMetadataCursor,operation:&OperationId,budget:&mut AdvanceBudget)->Result<bool,TransferError>{
+    async fn copy_wire_metadata_step(&self,row:&SessionRow,key:&str,ordinal:u32,layout:&crate::transfer::NovelJsonLayout,cursor:&mut WireMetadataCursor,budget:&mut AdvanceBudget)->Result<bool,TransferError>{
+        let id=&row.session_id;let operation=row.operation_id.as_ref().ok_or_else(||TransferError::invalid("operation_missing","metadata normalization needs operation identity"))?;
         let fields=layout.fields().map_err(TransferError::platform)?;let mut pending=if let Some(key)=&cursor.pending_key{self.journal.journal_entry(id,SESSION_JOURNAL_PUB,key).await?.ok_or_else(||TransferError::invalid("metadata_corrupt","metadata normalization tail missing"))?}else{Vec::new()};
         if pending.len()>=crate::transfer::protocol::TEXT_FRAGMENT_MAX_BYTES{return Err(TransferError::invalid("metadata_corrupt","metadata tail is not bounded"));}
         while cursor.metadata.field<fields&&budget.records<ADVANCE_ITEM_BUDGET&&budget.bytes+crate::transfer::protocol::TEXT_FRAGMENT_MAX_BYTES as u64<=ADVANCE_BYTE_BUDGET{

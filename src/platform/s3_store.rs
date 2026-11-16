@@ -702,7 +702,8 @@ impl AssetStore for S3Store {
     fn legacy_etag<'a>(&'a self,logical:&'a ObjectKey)->PlatformFuture<'a,Result<Option<String>>>{Box::pin(async move{
         super::transfer_stage::illustration_pool_key(logical)?;
         let response=self.stream_get(&self.location.legacy_object_url(logical),&[("range","bytes=0-0")]).await?;
-        if response.status==404{return Ok(None);}if !matches!(response.status,200|206)&&!(response.status==416&&response.header("content-range")==Some("bytes */0")){return Err(NarouError::Platform(format!("legacy ETag lookup failed with status {}",response.status)));}
+        if response.status==404{return Ok(None);}
+        if !matches!(response.status,200|206)&&!(response.status==416&&response.header("content-range")==Some("bytes */0")){return Err(NarouError::Platform(format!("legacy ETag lookup failed with status {}",response.status)));}
         response.header("etag").filter(|etag|!etag.is_empty()).map(|etag|Some(etag.to_owned())).ok_or_else(||NarouError::Platform("legacy object omitted ETag; conditional GC unavailable".into()))
     })}
     fn delete_legacy_if_match<'a>(&'a self,logical:&'a ObjectKey,pool:&'a ObjectKey,etag:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{

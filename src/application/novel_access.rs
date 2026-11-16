@@ -740,9 +740,7 @@ impl NovelReadScope {
         let Ok(leases) = Arc::try_unwrap(self.leases) else { return Ok(()); };
         let mut failure = None;
         for (_, lease) in leases.into_inner() {
-            if let Err(error) = lease.release().await {
-                if failure.is_none() { failure = Some(error); }
-            }
+            if let Err(error) = lease.release().await && failure.is_none() { failure = Some(error); }
         }
         match failure { Some(error) => Err(error), None => Ok(()) }
     }

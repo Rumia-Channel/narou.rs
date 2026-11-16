@@ -46,6 +46,13 @@ struct RebindPlan<'a> {
     new_fold: String,
 }
 
+/// Borrowed observed/candidate TOC URLs for one virtual rebind proof.
+#[derive(Clone, Copy)]
+struct RebindUrls<'a> {
+    observed: &'a str,
+    candidate: &'a str,
+}
+
 pub(super) struct PreparedRecords<'a> {
     claims: crate::native::transfer::RecordClaimGuard,
     creation: Option<(&'a WriteFence, &'a NovelIdReservation, bool)>,
@@ -118,7 +125,7 @@ pub(super) fn prepare<'a>(
 ) -> Result<PreparedRecords<'a>> {
     let prepare_with = |connection: &Connection, yaml: bool| {
         if let Some(RecordMutation::Rebind { fence, id, observed, candidate }) = mutation {
-            prepare_virtual_origin(root, connection, current, fence, id, observed, candidate, yaml)?;
+            prepare_virtual_origin(root, connection, current, fence, id, RebindUrls { observed, candidate }, yaml)?;
         }
         if let Some(RecordMutation::VirtualFences(fences)) = mutation {
             let by_prefix = fences.iter().map(|fence| (fence.prefix.as_ref().trim_end_matches('/'), fence))
@@ -129,7 +136,7 @@ pub(super) fn prepare<'a>(
                 {
                     let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
                     if let Some(fence) = by_prefix.get(keys.prefix().as_ref()) {
-                        prepare_virtual_origin(root, connection, current, fence, NovelId(id), &record.toc_url, &record.toc_url, yaml)?;
+                        prepare_virtual_origin(root, connection, current, fence, NovelId(id), RebindUrls { observed: &record.toc_url, candidate: &record.toc_url }, yaml)?;
                     }
                 }
             }
@@ -148,10 +155,8 @@ pub(super) fn prepare<'a>(
                 if !(committed && existing.is_some()) && !reservation.has_liveness() {
                     return Err(NarouError::Platform("id_reservation_lost: pending native creation has no retained liveness proof".into()));
                 }
-                if let Some(existing) = existing {
-                    if !allow_existing || !record_in_prefix(existing, &fence.prefix)? {
-                        return Err(identity_error());
-                    }
+                if let Some(existing) = existing&&(!allow_existing||!record_in_prefix(existing, &fence.prefix)?) {
+                    return Err(identity_error());
                 }
                 let active: bool = connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM native_transfer_target_claims WHERE owner_kind='ordinary' AND novel_id=?1 AND generation=?2 AND prefix=?3 AND epoch=?4)",
@@ -191,7 +196,7 @@ pub(super) fn prepare<'a>(
                 } else {
                     candidate
                 };
-                let new_fold = crate::db::novel_codec::fold(&effective_candidate);
+                let new_fold = crate::db::novel_codec::fold(effective_candidate);
                 let sql_origin = sql_gate_origin(connection, &fence.prefix)?;
                 let fs_origin = read_fs_gate_origin(root, &fence.prefix)?;
                 let legacy = legacy_virtual_url(id);
@@ -338,7 +343,7 @@ pub(super) fn repair_virtual_before_removal(
         && crate::virtual_novel::is_virtual_record(record)
         && crate::virtual_novel::is_portable_toc_url(&record.toc_url)
     {
-        prepare_virtual_origin(inventory.root_dir(), control, &current, fence, id, &record.toc_url, &record.toc_url, yaml_backend)?;
+        prepare_virtual_origin(inventory.root_dir(), control, &current, fence, id, RebindUrls { observed: &record.toc_url, candidate: &record.toc_url }, yaml_backend)?;
     }
     Ok(())
 }
@@ -352,7 +357,7 @@ fn legacy_virtual_url(id: NovelId) -> String {
 fn prepare_virtual_origin(
     root: &std::path::Path, connection: &Connection,
     current: &BTreeMap<i64, NovelRecord>, fence: &WriteFence,
-    id: NovelId, observed: &str, candidate: &str, yaml: bool,
+    id: NovelId, RebindUrls { observed, candidate }: RebindUrls<'_>, yaml: bool,
 ) -> Result<()> {
     let record = current.get(&id.0).ok_or_else(identity_error)?;
     let legacy = legacy_virtual_url(id);

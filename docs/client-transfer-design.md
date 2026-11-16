@@ -1,6 +1,6 @@
 # 小説データ転送のクライアント主体設計
 
-状態: **設計。未実装。** 2026-11-15 の現行コードを調査した結果と、今後実装する契約を分離して記す。
+状態: **別ブランチで実装・統合検証中。未リリース。** `feature-client-transfer` で作業し、版数は `0.6.6` のままとする。main/develop への統合、タグ・Release の作成は行わない。移行前の調査、実装契約、実測済みの範囲 (§16.1) を分けて記す。
 対象は Native / Workers 共通の Web UI による小説データの持ち出し・取り込み。CLI はローカル実行を維持する。
 ZIP の中身の仕様は [transfer-archive-format.md](transfer-archive-format.md)。本書は HTTP プロトコル・実行場所・保存境界の再設計である。
 
@@ -8,9 +8,9 @@ ZIP の中身の仕様は [transfer-archive-format.md](transfer-archive-format.m
 
 **クライアントでできる処理はクライアントで行う。** Web の ZIP 生成・展開・CRC/SHA 検証・選択・転送制御をブラウザの Dedicated Worker + WASM へ移す。サーバーは認証、所有するデータの読み出し、受信データの独立検証、保存、競合判定、公開を担当する。
 
-現行の証拠:
+移行前の調査結果 (2026-11-15):
 
-| 箇所 | 現行の実態 |
+| 箇所 | 移行前の実態 |
 |---|---|
 | `src/web/assets/js/ui/transfer.js` の `exportSelectedNovels` | サーバー製 ZIP を NDJSON 内の Base64 から復元する |
 | 同 `importNovelArchive` | `Content-Type: application/zip` / `body: file` で ZIP 全体を1回の POST にする |
@@ -20,7 +20,7 @@ ZIP の中身の仕様は [transfer-archive-format.md](transfer-archive-format.m
 | `src/transfer/async_stream.rs` | `force_no_zip64()` がある。サイズ定数の削除だけでは大容量対応にならない |
 | `src/native/transfer.rs` / `worker_entry/src/transfer.rs` | ファイルの書き込みと小説レコードの公開は、全体で1つのトランザクションではない |
 
-当初の [v0.5.0-plan.md](v0.5.0-plan.md) が約束したブラウザ WASM 経路は未接続である。「WASM 単体がビルド・テストできる」を Web 機能の完了条件にしてはならない。
+当初の [v0.5.0-plan.md](v0.5.0-plan.md) が約束したブラウザ WASM 経路は、この調査時点では未接続だった。別ブランチでは新経路を実装して検証している。「WASM 単体がビルド・テストできる」を Web 機能の完了条件にしてはならない。
 
 今回の2種類の失敗は別の制限である。書き出し中の `raw/...: 展開後サイズが上限` はアプリの展開後合計または単一ファイル上限。取り込みの HTTP 413 はリクエスト本文の拒否で、Cloudflare 前段にも独立した上限がある。報告された 413 の応答本文は未確認なので、その発生元の断定はしない。
 
@@ -97,11 +97,11 @@ portable coreに `FileRole` と `TransferProjection` を定義し、sourceの所
 
 DBのrow、S3 blob、YAML/FS mirrorを同じObjectKeyの論理データへ解決し、1回だけcatalogへ載せる。DB本体や同じ本文のmirrorを別の転送ファイルとして二重同梱しない。Nativeの既存ユーザー編集・escaped folder解決の契約は維持し、sourceの優先順位を転送だけの別規則にしない。
 
-受信側は目次・本文・設定・索引を自身のDB/ObjectStore表現へ保存する。wire/ZIPが本文YAMLを使うことと、受信側にその物理YAMLファイルを残すことは別である。`sqlite.mirror-files` 等のFS投影はnative adapterが決め、通信のためだけに不要なmirrorを生成しない。現行のmirror=false import拒否は §12 の明示制約として残り、本項だけで対応済みとはしない。
+受信側は目次・本文・設定・索引を自身のDB/ObjectStore表現へ保存する。wire/ZIPが本文YAMLを使うことと、受信側にその物理YAMLファイルを残すことは別である。`sqlite.mirror-files` 等のFS投影はnative adapterが決め、通信のためだけに不要なmirrorを生成しない。CLIの従来のmirror=false import拒否と、Web v2の論理参照による公開は区別し、後者はDB-onlyの実動作を受入条件とする。
 
 ## 5. 制限を4種類に分離する
 
-以下は新プロトコルの設計値。未実装のため、現行の制限が既に変わったという意味ではない。
+以下は別ブランチ実装の契約値。公開済み版の制限が変更・配布されたという意味ではない。
 
 | 分類 | 設計値・方針 | 超過時 |
 |---|---|---|
@@ -283,7 +283,7 @@ sequenceDiagram
 1. UI のクリック処理中に保存先を取得する。`showSaveFilePicker()` を長い WASM 初期化の後まで遅らせ、user activation を失わない。
 2. session の対象をサーバーが認証・解決する。親のメンバー展開、重複除去、同梱規則、source の存在検査を行う。
 3. サーバーはメタデータ・ファイル一覧・実バイトを snapshot として固定する。既存のverified immutable stage/本文版や、内容hashを検証したwrite-once画像poolで、保持が保証できるものだけ参照をpinする。`ObjectMetadata` やファイル名だけからSHAやpinの存在を仮定しない。それ以外は64 KiBストリームで private raw stage へ一度コピーし、同時に SHA を計算する。
-4. Native は現行の `native::materialization::snapshot` の専用領域を使う方向へ整理する。元の小説ディレクトリへ書き戻してから消す方式にはしない。Worker は private stage と primary の session 行へ pin を永続化する。
+4. Native は `src/native/transfer/snapshot.rs` の私有 snapshot 領域を使い、元の小説ディレクトリへ書き戻してから消す方式にはしない。Worker は private stage と primary の session 行へ pin を永続化する。
 5. snapshot準備は対象作品のmutation fence内で行い、アプリ経由の更新・削除と混ぜない。大作品のコピー中は更新を待たせるコストを明示し、UIはsnapshotの処理中byteとwriter側の `novel_busy` を表示する。無検証の楽観コピーは既定にしない。固定後はfenceを解放し、遅い保存中ずっと更新を止めない。
 6. 複数作品が同じ一瞬の状態とは保証しない。各作品は固定した版で整合し、親の所属と参照メンバー集合を固定する。親とメンバーの集合取得時は共通の順序で fence を取る。
 7. 準備完了前に ZIP の出力は開始しない。不足ファイルや容量不足を、ダウンロードの途中で初めて知らせる構成を避ける。
@@ -305,7 +305,7 @@ snapshot 作成には保存容量と I/O が必要な場合がある。これは
 - `catalog_page` は最大100項目/256 KiBの表示用メタデータだけを返す。`write_transfer_manifest` は全値のsize/SHA・選択・親参照から §6.5 のNDJSONを64 KiB以下で出力する。完全な文字列をJSに二重保持せず、元entryと `manifest_file_index` の対応をhandle内に残す。
 - `stream_entry` はresume offsetまでDeflateを先頭から再実行して捨て、serverのfilesページ/receiptが返す `confirmed_prefix_sha256` と比較してから続きを出す。server内部のhash state自体は渡さない。圧縮状態の永続化はせず、再送を避ける代わりのローカルCPUコストを表示する。
 - `build_zip` は既存の callback 形を使い、期待 size/SHA 比較を必須にする。I/O callback は最大64 KiB、await と取消を保証する。
-- 現行 `parse_zip` / `plan_zip` の全検証を何度も重複実行しない。新 UI は1回の validate handle を再利用する。サーバーの plan が最終決定で、クライアント計画は表示用である。
+- 旧 binding の `parse_zip` / `plan_zip` は残さず、新 UI は1回の validate handle を再利用する。サーバーの plan が最終決定で、クライアント計画は表示用である。
 - 新 API へ移した公開 binding の旧名・使用されない re-export は残さない。テスト・CLI の共通呼び出しも同じ変更単位で移す。
 
 ### 9.2 実行スレッドと保存先
@@ -314,6 +314,9 @@ snapshot 作成には保存容量と I/O が必要な場合がある。これは
 - UI へ渡す byte chunk は `ArrayBuffer` を transfer list に入れ、所有権を移す。WASM memory 自体を detach してはならない。binding が所有する64 KiB chunkへ1回コピーする境界を明確にする。
 - Chromium の保存は File System Access を使う。非対応ブラウザは既存 `transfer-download-sw.js` の pull 型 Service Worker を使う。完成 ZIP のメモリ Blob 化はしない。
 - Service Worker の保存先はブラウザのダウンロード管理。API へ ZIP を取りに行く proxy として使わず、クライアント生成バイトを受け渡す。
+- FSA の picker はクリック中に取得するが、SW の登録・download iframe は最初の実 ZIP byte が生成されるまで開始しない。確認画面で待っている間に中継が失効し、0 byte の保存や次の write の永久待機になることを避ける。
+- download relay の内部 handshake は版3とし、HTTP/codec の版2とは分ける。登録の `waitUntil` は最初の fetch または60秒の開始失敗までに限り、ZIP 全体を1つの未解決 message event で保持しない。進行中は15秒間隔の能力トークン付き ping/pong で生存を確認し、90秒間 pull/pong が無い場合や状態消失時は待機 write を失敗させる。取消・close で listener/timer を回収し、途中出力を成功扱いしない。
+- close 開始後は heartbeat を止め、遅れて届く pong より明示的な `closed` ACK を優先する。EOF 後の中継 map 削除を「状態消失」と誤判定して、正常な保存を失敗へ変えない。ACK の無応答は別の終了確認 timeout で扱う。
 - OPFS は manifest spool、現在のuploadバッチ、再開の私有メタデータに限定して利用する。不足するAPIは小さい同じ単位をメモリで扱い、永続再開状態を保存できない環境はページをまたぐ再開を不可と明示する。容量不足時に巨大Blobへ切り替えない。
 - IndexedDB に保存するのは session・receipt・manifest identity・再開位置等のメタデータ。書籍本文を localStorage へ置かない。
 - `isSecureContext` / WASM / Worker / File API / 保存経路を実動作で検査する。外部 bind の平文 HTTP は不足する場合がある。loopback の secure-context 扱いと混同しない。
@@ -421,7 +424,7 @@ server の専用モデルは `TransferSession`、`TransferFile`、`ChunkReceipt`
 - 削除失敗は再開可能な回収cursorを残す。現行本文、共有pool、他sessionの資源を消さない。beforeunload/beacon/DELETE成功やDrop実行を回収の必要条件にしない。
 - ライブラリbackup/restoreは未解決publicationを先にdrain/回復する。未解決journalだけをbackupしてpre-imageを除外する組合せを作らず、activeな私有転送資源を通常の持ち出しZIPへ混ぜない。
 
-現在の `sqlite.mirror-files=false` の import 拒否はこの設計では変更しない。capabilities で理由を返し、upload 前に止める。export は対応する。これは新プロトコルの未実装を隠す fallback ではなく、既存保存契約の明示的な制約である。
+CLI の ZIP 取り込みは従来の `sqlite.mirror-files=false` 拒否を維持する。Web v2 は別経路として、論理データと参照を保存し、DB-only でも必要なデータを公開できることを検証する。保存先の制約は capabilities で upload 前に返し、未対応を旧 ZIP 経路への fallback で隠さない。
 
 ## 13. セキュリティとエラー
 
@@ -491,7 +494,7 @@ export/import の shared core、raw-to-store 変換、publication を HTTP handl
 
 ## 16. 受入試験と完了判定
 
-この節は実装時に実行する計画であり、現時点で実行済みという意味ではない。
+以下は受入条件であり、全項目の実施済みを意味しない。観測済みの結果と残る検証は §16.1 に記す。
 
 | 検証対象 | シナリオと成功条件 |
 |---|---|
@@ -520,7 +523,7 @@ export/import の shared core、raw-to-store 変換、publication を HTTP handl
 | 消失と取消 | tab/Worker/process/isolateを止め、sessionとpublicationを復旧。完了作品は残り、未公開分は再開/回収、MemoryPermitは解放 |
 | GCとの競合 | 長い転送、無活動期限、lease喪失、失敗したDELETE。使用中/pre-image/現行/共有poolを誤削除せず、orphanは回収される |
 | バーチャル小説 | 親だけのexport、メンバー重複、Skip/Overwrite、ID 0、混在属性、他親の所属競合をNative/Workerで確認 |
-| Native保存方式 | YAML、SQLite+mirror、S3挿絵で実CLI/Webを動かす。mirror=falseのexport成功/import事前拒否。既存のescaped folderとユーザー編集を保持 |
+| Native保存方式 | YAML、SQLite+mirror、DB-only、S3挿絵で実CLI/Webを動かす。Web v2のmirror=false import/exportと、CLIの既存制約を分けて確認。既存のescaped folderとユーザー編集を保持 |
 | Worker保存方式 | 実workerdのD1+S3 fixture。dedup poolのみの挿絵、旧D1本文、内容codec、S3停止を含める。fail closedを維持 |
 | ブラウザ保存 | Chromium FSA、Firefox SW、可能な環境のSafariで操作。user activation、disk/quota不足、cancel、SW更新、HTML認証応答、保存完了表示を確認 |
 | 配布と旧タブ | clean buildされたNative通常/GPL/Worker assetsでWASM MIME/hash/ABIを検査。stale glue/WASM/SW・欠落artifact・旧サーバーで旧ZIP経路に戻らない |
@@ -530,6 +533,22 @@ CI は core・adapter・WASM 単体に加え、**生成済み配布assetsを使�
 
 完了とは、利用者が Web UI から対象を選び、クライアントで ZIP を作成/検証し、チャンクで必要なデータだけを転送し、保存・公開結果を確認できること。CLIやWASM単体の成功、APIの存在、設計書の追加だけでは完了ではない。
 
+### 16.1 別ブランチで観測済みの結果
+
+現時点で受入試験全体の完了は主張しない。以下は合成データの隔離 fixture での観測であり、利用者の本番ライブラリ・Cloudflare本番での成功ではない。
+
+| 経路 | 観測したこと |
+|---|---|
+| Firefox + 実 workerd/D1 | 17 MiB の利用者ファイルと目次を、実配布 WASM で ZIP から検証・抽出して取り込み、新規1作品の公開を確認。raw 1 MiB は事前表示・確認後も送信対象に含めなかった |
+| 10 MiB 制限の HTTP gateway | 上記取り込みと書き出しで観測した最大 request body は 8,323,470 byte。過大要求の拒否は0件、旧 `/api/transfer/import` / `export` 要求は0件。観測記録の打切りなし |
+| Firefox の実 ZIP 保存 | 一時停止後に同じ export session から保存し直し、独立した Python ZIP reader で全3 entry と利用者ファイルの SHA-256 を照合。raw が保存先・再書き出し ZIP に入らないことを確認 |
+| SW の長い確認待ち | 修正前は、最初の write 前に6分待つと、queue の0/1のどちらでも0 byteの保存と次の write の待機が発生。修正後の実 Firefox では、最初の byte 前に6分待つ場合と、64 KiB出力後に6分止める場合の両方で1 MiBを保存し、独立したSHA-256を一致させた |
+| 消費者回帰 | `tests/transfer_streaming.test.mjs` は33件成功。確認待ち・中継状態消失は修正前の実配布JSで「期待 byte が無い」「write が未完了」と失敗し、修正後は成功。EOF と heartbeat の競合も修正前の close 失敗を再現し、修正後の成功を確認 |
+| Rust の全 target / feature | `cargo clippy --workspace --all-targets --all-features -- -D warnings` は exit 0。vendored dependency と native host 用 Worker manifest の既存警告は別途表示される |
+
+Native の保存方式別の実ブラウザ、大容量・4 GiB超の実ブラウザ、Chromium FSA、Worker の完全な故障契約・128 MiB/provider予算は、まだ完了として記載しない。途中で資源割当てエラーになった workerd 契約実行も成功には数えない。以後の結果はこの節へ追記し、未確認を除外して完了扱いしない。
+
+
 ## 17. 参照と設計検証の範囲
 
 - [Cloudflare Workers: Request and response limits](https://developers.cloudflare.com/workers/platform/limits/#request-and-response-limits): domain plan の本文上限と Worker memory/CPU を分離する根拠。
@@ -537,5 +556,6 @@ CI は core・adapter・WASM 単体に加え、**生成済み配布assetsを使�
 - [MDN: OPFS](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system): quota と Dedicated Worker の sync access。
 - [MDN: Transferable objects](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Transferable_objects): File/Blob の structured clone と ArrayBuffer 所有権移転の区別。
 - [RustCrypto sha2: Sha256](https://docs.rs/sha2/latest/sha2/struct.Sha256.html): 既存0.11依存での hash state serialize/deserialize。
+- [MDN: Offline and background operation](https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Guides/Offline_and_background_operation): `waitUntil` でも browser 固有の最大実行時間を超える継続は保証されない。
 
-本設計では現行コードと公式API文書を調査し、状態・保存境界・受入条件を設計した。まだプロトコル、migration、ブラウザUIを実装しておらず、大容量転送の動作試験を通したわけではない。実装後に上記の検証結果を付けるまで、制限解消済みと案内しない。
+移行前の調査を元に、プロトコル・migration・ブラウザUIと保存境界を別ブランチで実装している。§16.1 の実測だけを確認済みとし、受入条件が未達の間は機能全体・容量制限・HTTP 413 の解消済みやリリース済みとは案内しない。

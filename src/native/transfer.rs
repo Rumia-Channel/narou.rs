@@ -1055,7 +1055,7 @@ fn write_novel_files(
                 target.display()
             )));
         }
-        let key=ObjectKey::try_new(write.prefix().as_ref().trim_end_matches('/')).and_then(|prefix|prefix.join(relative))?;
+        let key=ObjectKey::try_new(format!("{}/{relative}",write.prefix().as_ref().trim_end_matches('/')))?;
         block_on(write.install_staged(&asset.key,&key))?;
     }
     Ok(())
@@ -1318,16 +1318,17 @@ pub mod v2 {
         }
         fn frozen_selection(&self,scope:&AuthScope,session:&SessionId,requested:&[i64])->TR<Option<FrozenSelection>>{
             let session=&session.0;let status=self.journal.get::<SessionRow>("session",&scope_key(scope),session)?.ok_or(TransferError::SessionNotFound)?;let operation=status.operation_id.ok_or(TransferError::OperationConflict)?;
-            let mut frozen:FrozenSelection=self.journal.backend_get(&session,"export_selection")?.unwrap_or_default();
+            let mut frozen:FrozenSelection=self.journal.backend_get(session,"export_selection")?.unwrap_or_default();
             if frozen.complete&&frozen.last_operation.as_ref()!=Some(&operation){return Ok(Some(frozen));}
             if frozen.last_operation.as_ref()==Some(&operation){return Ok(None);}
             let memberships=crate::native::virtual_novel::load().map_err(TransferError::platform)?;
             crate::db::with_database_mut(|db|{db.refresh()?;let mut processed=0;while processed<MAX_PAGE_ITEMS{
-                if let Some(parent)=frozen.pending_parent{let members=&frozen.memberships[&parent];if frozen.member<members.len(){let id=members[frozen.member];let row=db.get(id).ok_or_else(||crate::error::NarouError::NotFound(format!("member ID:{id}")))?;if crate::virtual_novel::is_virtual_record(row){return Err(crate::error::NarouError::Platform("virtual parent contains a virtual member".into()));}if frozen.seen.insert(id){frozen.ordinary.push(id);}frozen.member+=1;processed+=1;continue;}frozen.pending_parent=None;frozen.member=0;}
+                if let Some(parent)=frozen.pending_parent{let members=&frozen.memberships[&parent];if frozen.member<members.len(){let id=members[frozen.member];let row=db.get(id).ok_or_else(||crate::error::NarouError::NotFound(format!("member ID:{id}")))?;if crate::virtual_novel::is_virtual_record(row){return Err(crate::error::NarouError::Platform("virtual parent contains a virtual member".into()));}
+                    if frozen.seen.insert(id){frozen.ordinary.push(id);}frozen.member+=1;processed+=1;continue;}frozen.pending_parent=None;frozen.member=0;}
                 let Some(id)=requested.get(frozen.requested).copied()else{frozen.complete=true;break;};let record=db.get(id).ok_or_else(||crate::error::NarouError::NotFound(format!("ID:{id}")))?;frozen.requested+=1;processed+=1;
                 if crate::virtual_novel::is_virtual_record(record){if !frozen.memberships.contains_key(&id){let members=memberships.get(id).ok_or_else(||crate::error::NarouError::Platform("virtual parent has no members".into()))?.to_vec();frozen.parents.push(id);frozen.memberships.insert(id,members);frozen.pending_parent=Some(id);}}else if frozen.seen.insert(id){frozen.ordinary.push(id);}
             }Ok(())}).map_err(TransferError::platform)?;
-            if frozen.ordinary.len()+frozen.parents.len()>10_000{return Err(TransferError::invalid("novel_limit","expanded export exceeds10000 novels"));}frozen.last_operation=Some(operation);self.journal.backend_put(&session,"export_selection",&frozen)?;Ok(None)
+            if frozen.ordinary.len()+frozen.parents.len()>10_000{return Err(TransferError::invalid("novel_limit","expanded export exceeds10000 novels"));}frozen.last_operation=Some(operation);self.journal.backend_put(session,"export_selection",&frozen)?;Ok(None)
         }
         fn source_record(&self,entry:&ExportNovelEntry)->TR<crate::db::NovelRecord>{crate::db::with_database_mut(|db|{db.refresh()?;db.get(entry.id.0).cloned().ok_or_else(||crate::error::NarouError::NotFound("export source was deleted".into()))}).map_err(TransferError::platform)}
         fn record_prefix(&self,record:&crate::db::NovelRecord)->TR<ObjectKey>{
@@ -1388,7 +1389,11 @@ pub mod v2 {
         fn make_record(&self,spec:&PublicationSpec,id:i64,existing:Option<crate::db::NovelRecord>)->TR<crate::db::NovelRecord>{
             let metadata=&spec.metadata;
             if let Some(mut record)=existing {
-                if record.title.trim().is_empty(){record.title=metadata.title.clone();}if record.author.trim().is_empty(){record.author=metadata.author.clone();}if record.ncode.is_none(){record.ncode=metadata.ncode.clone();}if record.domain.is_none(){record.domain=metadata.domain.clone();}if record.general_lastup.is_none(){record.general_lastup=super::parse_rfc3339(metadata.general_lastup.as_deref());}
+                if record.title.trim().is_empty(){record.title=metadata.title.clone();}
+                if record.author.trim().is_empty(){record.author=metadata.author.clone();}
+                if record.ncode.is_none(){record.ncode=metadata.ncode.clone();}
+                if record.domain.is_none(){record.domain=metadata.domain.clone();}
+                if record.general_lastup.is_none(){record.general_lastup=super::parse_rfc3339(metadata.general_lastup.as_deref());}
                 for tag in &metadata.tags{if !crate::virtual_novel::is_internal_tag(tag)&&!record.tags.contains(tag){record.tags.push(tag.clone());}}if let Some(a)=metadata.attribute_tag.as_deref(){record.set_attribute_tag(a);}return Ok(record);
             }
             let parent=spec.kind==NovelKind::VirtualParent;let setting=super::find_site_setting(&spec.toc_url);let ncode=if parent{Some(crate::virtual_novel::ncode(id))}else{metadata.ncode.clone().or_else(||super::extract_ncode(&spec.toc_url))};
@@ -1404,7 +1409,7 @@ pub mod v2 {
             }
             let existing=crate::db::with_database_mut(|db|{db.refresh()?;let folded=crate::db::novel_codec::fold(&spec.toc_url);Ok(db.all_records().values().find(|r|crate::db::novel_codec::fold(&r.toc_url)==folded).cloned())}).map_err(TransferError::platform)?;
             if matches!(spec.target.action,PlanAction::Create)&&existing.is_some()||matches!(spec.target.action,PlanAction::Overwrite)&&existing.as_ref().map(|r|r.id)!=spec.target.existing_id{return Err(TransferError::PlanStale{message:"publication target was created or deleted since planning".into()});}
-            if let Some(record)=&existing{if Some(Self::record_revision(record)?)!=spec.target.record_revision || Some(self.content_revision(record)?)!=spec.target.content_revision{return Err(TransferError::PlanStale{message:"record or content changed since planning".into()});}}
+            if let Some(record)=&existing&&(Some(Self::record_revision(record)?)!=spec.target.record_revision||Some(self.content_revision(record)?)!=spec.target.content_revision){return Err(TransferError::PlanStale{message:"record or content changed since planning".into()});}
             let owner=Self::owner(spec);let id=if let Some(record)=&existing{record.id}else{crate::db::with_database_mut(|db|db.allocate_transfer_id(&owner).map(|reservation|reservation.id().0)).map_err(TransferError::platform)?};
             let record=self.make_record(spec,id,existing.clone())?;let prefix=self.record_prefix(&record)?.as_ref().to_string();
             if existing.is_none(){let directory=crate::db::novel_dir_for_record(&self.archive_root(),&record);if directory.exists(){return Err(TransferError::PlanStale{message:"destination folder already exists and is not owned by this import".into()});}}
@@ -1413,7 +1418,7 @@ pub mod v2 {
                 let save=|connection:&rusqlite::Connection|->crate::error::Result<()>{
                     let transaction=rusqlite::Transaction::new_unchecked(connection,rusqlite::TransactionBehavior::Immediate).map_err(crate::native::sqlite::sqlite_error)?;
                     let identity_connection=if db.metadata_is_yaml_in_snapshot(primary){None}else{primary.map(|_|&*transaction)};super::claims::assert_current_identity(inventory,identity_connection,&transaction,publication.record_id,&spec.toc_url,&publication.prefix,spec.target.action==PlanAction::Create)?;
-                    super::claims::claim(inventory.root_dir(),&transaction,&publication.owner,&spec.session_id.0,spec.publication_id,&spec.plan_revision,publication.record_id,&spec.toc_url,&publication.prefix)?;
+                    super::claims::claim(inventory.root_dir(),&transaction,&super::claims::PublicationClaim{owner:&publication.owner,session:&spec.session_id.0,publication:spec.publication_id,revision:&spec.plan_revision},publication.record_id,&spec.toc_url,&publication.prefix)?;
                     let mut rows=super::journal::Rows(&transaction);rows.put("backend",&spec.session_id.0,&format!("publication:{}",spec.publication_id),&publication).and_then(|_|rows.put("backend",&format!("publication_owners:{}",spec.session_id.0),&publication.owner,&publication)).map_err(|error|crate::error::NarouError::Platform(error.to_string()))?;
                     transaction.commit().map_err(crate::native::sqlite::sqlite_error)
                 };if let Some(connection)=primary{save(connection)}else{save(&control.lock())}
@@ -1445,7 +1450,7 @@ pub mod v2 {
             let handle=self.journal.run(|rows|{if let Some(handle)=rows.get::<String>("active_stage",&id.0,&number(file_id))?{return Ok(handle);}let handle=self.opaque_id("stage");let binding=StageBinding{owner:id.0.clone(),file_id,size,epoch:1};rows.put("backend","stages",&handle,&binding)?;rows.put("active_stage",&id.0,&number(file_id),&handle)?;Ok(handle)})?;
             let binding=self.stage_binding(&handle)?;if binding.owner!=id.0||binding.file_id!=file_id||binding.size!=size{return Err(TransferError::invalid("stage_identity_conflict","stage declaration changed"));}
             let cursor=match self.primary.stage_open(&handle,&id.0,1,SESSION_IDLE_TTL_SECS).await{Ok(cursor)=>cursor,Err(crate::error::NarouError::Platform(message))if message.starts_with("stage_checkpoint_invalid:")=>{let cursor=self.primary.stage_cursor(&handle).await.map_err(TransferError::platform)?.ok_or_else(||TransferError::invalid("stage_missing","corrupt stage ledger is missing"))?;if cursor.sealed{return Err(TransferError::RecoveryRequired{message:"sealed stage checkpoint is corrupt; immutable data cannot be reset".into()});}let file=self.journal.file(id,file_id).await?.ok_or_else(||TransferError::invalid("file_missing","corrupt unverified file row missing"))?;self.restart_unverified_stage(&session,file,&handle).await?;return Err(TransferError::invalid("file_restart_required","unverified stage checkpoint is corrupt; restart at offset0"));},Err(error)=>return Err(TransferError::platform(error))};
-            if !cursor.sealed{if let Some(file)=self.journal.file(id,file_id).await?{
+            if !cursor.sealed&&let Some(file)=self.journal.file(id,file_id).await?{
                 if cursor.confirmed_bytes>0&&cursor.prefix_sha256().is_none()||cursor.confirmed_bytes<file.confirmed_bytes||cursor.confirmed_bytes==file.confirmed_bytes&&cursor.prefix_sha256()!=file.confirmed_prefix_sha256 {
                     self.restart_unverified_stage(&session,file,&handle).await?;return Err(TransferError::invalid("file_restart_required","unverified stage checkpoint was lost; restart this file at offset0"));
                 }
@@ -1454,7 +1459,7 @@ pub mod v2 {
                     let checkpoint=crate::platform::StageCursor::from_sha_checkpoint(file.confirmed_bytes,state);
                     if let Err(error)=self.primary.stage_rewind(&handle,&id.0,1,&checkpoint).await{let corrupt=match &error{crate::error::NarouError::Io(error)=>error.kind()==std::io::ErrorKind::NotFound,crate::error::NarouError::Platform(message)=>message.starts_with("stage_checkpoint_invalid:")||matches!(message.as_str(),"rewind SHA checkpoint conflict"|"rewind checkpoint SHA conflict"|"rewind checkpoint missing"),_=>false};if !corrupt{return Err(TransferError::platform(error));}self.restart_unverified_stage(&session,file,&handle).await?;return Err(TransferError::invalid("file_restart_required","unverified rewind checkpoint is unavailable; restart at offset0"));}
                 }
-            }}Ok(handle)
+            }Ok(handle)
         })}
         fn stage_append<'a>(&'a self,handle:&'a str,offset:u64,data:&'a [u8])->PlatformFuture<'a,TR<()>>{Box::pin(async move{let b=self.stage_binding(handle)?;let cursor=self.primary.stage_cursor(handle).await.map_err(TransferError::platform)?.ok_or_else(||TransferError::invalid("stage_missing","stage ledger missing"))?;if cursor.sealed&&cursor.confirmed_bytes==b.size{return Ok(());}self.primary.stage_append(handle,&b.owner,b.epoch,offset,data,offset+data.len() as u64==b.size).await.map_err(TransferError::platform)?;Ok(())})}
         fn stage_seal<'a>(&'a self,handle:&'a str,size:u64,sha:&'a str)->PlatformFuture<'a,TR<String>>{Box::pin(async move{let b=self.stage_binding(handle)?;self.primary.stage_seal(handle,&b.owner,b.epoch,size,sha).await.map_err(TransferError::platform)?;Ok(handle.into())})}
@@ -1480,9 +1485,9 @@ pub mod v2 {
                 crate::web::safe_existing_novel_dir(&self.archive_root(),&record).map_err(|e|TransferError::invalid("unsafe_source",e))?;
                 let entry=ExportNovelEntry{session_id:session.clone(),novel_ordinal:position.novel as u32,id:NovelId(id),toc_url:record.toc_url.clone(),title:record.title.chars().take(DISPLAY_TITLE_CHARS).collect(),kind:if parent{NovelKind::VirtualParent}else{NovelKind::Normal},membership_digest:frozen.memberships.get(&id).map(|ids|crate::platform::access_fence::membership_digest(ids.iter().map(i64::to_string))),record_revision:Self::record_revision(&record)?,content_revision:self.content_revision(&record)?,metadata:None,files:Vec::new(),files_complete:false};
                 let prefix=self.record_prefix(&record)?;let layout=self.source_metadata_layout(&entry,&record,&prefix,frozen.memberships.get(&record.id).map(Vec::len)).await?;metadata=Some(layout.clone());let source=SnapshotSource{entry,prefix:prefix.as_ref().to_owned(),layout};
-                if let Some(previous)=self.journal.backend_get::<SnapshotSource>(&format!("snapshot_by_ordinal:{}",session.0),&number(position.novel as u32))?{if previous.entry!=source.entry||previous.prefix!=source.prefix||previous.layout!=source.layout{return Err(TransferError::PlanStale{message:"export source changed during metadata capture".into()});}}
+                if let Some(previous)=self.journal.backend_get::<SnapshotSource>(&format!("snapshot_by_ordinal:{}",session.0),&number(position.novel as u32))?&&(previous.entry!=source.entry||previous.prefix!=source.prefix||previous.layout!=source.layout){return Err(TransferError::PlanStale{message:"export source changed during metadata capture".into()});}
                 self.save_snapshot_source(session,&source)?;position.metadata_emitted=true;source
-            }else{self.snapshot_source(&session,position.novel as u32)?};
+            }else{self.snapshot_source(session,position.novel as u32)?};
             let parent=source.entry.kind==NovelKind::VirtualParent;let prefix=ObjectKey::try_new(&source.prefix).map_err(TransferError::platform)?;let mut files=Vec::new();
             if !first&&position.phase==0{
                 let mut request=crate::platform::ObjectListRequest::new(ObjectPrefix::from(prefix.clone()),std::num::NonZeroUsize::new(MAX_PAGE_ITEMS).expect("nonzero page"));request.cursor=position.after.clone();
@@ -1496,7 +1501,7 @@ pub mod v2 {
                 position.after=page.next_cursor;if position.after.is_none(){position.phase=1;}
             }else if !first&&position.phase==1{
                 if parent{position.phase=2;}else{
-                    let spool=self.illustration_spool(&session,position.novel as u32,&prefix).await?;let offset=position.after.as_deref().unwrap_or("0").parse::<u64>().map_err(TransferError::platform)?;
+                    let spool=self.illustration_spool(session,position.novel as u32,&prefix).await?;let offset=position.after.as_deref().unwrap_or("0").parse::<u64>().map_err(TransferError::platform)?;
                     let mut input=std::io::BufReader::with_capacity(64*1024,fs::File::open(self.root.join(&spool.path)).map_err(TransferError::platform)?);input.seek(SeekFrom::Start(offset)).map_err(TransferError::platform)?;
                     for _ in 0..MAX_PAGE_ITEMS{
                         let mut filename=String::new();let count=input.read_line(&mut filename).map_err(TransferError::platform)?;if count==0{position.phase=2;break;}
@@ -1529,7 +1534,7 @@ pub mod v2 {
         fn source_read_range<'a>(&'a self,entry:&'a ExportNovelEntry,file:&'a SourceFileEntry,range:std::ops::Range<u64>)->PlatformFuture<'a,TR<Vec<u8>>>{Box::pin(async move{
             use std::io::{Read,Seek,SeekFrom};let source=self.check_owned_source(entry).await?;let path=self.checked_source_path(&source.prefix,&file.logical_path)?;
             let length=range.end.checked_sub(range.start).filter(|length|*length<=ADVANCE_BYTE_BUDGET&&range.end<=file.size).ok_or_else(||TransferError::invalid("invalid_range","source range exceeds budget or file"))?;
-            if path.is_file(){let key=ObjectKey::try_new(&source.prefix).and_then(|prefix|prefix.join(&file.logical_path)).map_err(TransferError::platform)?;let identity=self.frozen_source_generation(entry,file,&key).await?;let mut input=fs::File::open(&path).map_err(TransferError::platform)?;input.seek(SeekFrom::Start(range.start)).map_err(TransferError::platform)?;let mut bytes=vec![0;length as usize];input.read_exact(&mut bytes).map_err(TransferError::platform)?;if self.readable_generation(&key).await?.as_deref()!=Some(identity.as_str()){return Err(TransferError::PlanStale{message:"source file changed during snapshot range read".into()});}self.check_owned_source(entry).await?;return Ok(bytes);}
+            if path.is_file(){let key=ObjectKey::try_new(format!("{}/{}",source.prefix.trim_end_matches('/'),file.logical_path)).map_err(TransferError::platform)?;let identity=self.frozen_source_generation(entry,file,&key).await?;let mut input=fs::File::open(&path).map_err(TransferError::platform)?;input.seek(SeekFrom::Start(range.start)).map_err(TransferError::platform)?;let mut bytes=vec![0;length as usize];input.read_exact(&mut bytes).map_err(TransferError::platform)?;if self.readable_generation(&key).await?.as_deref()!=Some(identity.as_str()){return Err(TransferError::PlanStale{message:"source file changed during snapshot range read".into()});}self.check_owned_source(entry).await?;return Ok(bytes);}
             let key:String=self.journal.backend_get(&Self::source_owner(&entry.session_id,entry.id.0),&sha256_hex(file.logical_path.as_bytes()))?.ok_or_else(||TransferError::invalid("source_missing","catalogued source key missing"))?;let key=ObjectKey::try_new(key).map_err(TransferError::platform)?;let identity=self.frozen_source_generation(entry,file,&key).await?;
             let initialized=self.legacy_source(&entry.session_id,&format!("initialized_source:{}:{}",entry.novel_ordinal,sha256_hex(file.logical_path.as_bytes())),&key,file.size,"snapshot_preparing").await?;let bytes=if let Some(stage)=initialized{self.stage_read_range(&stage,range).await?}else{self.read_bytes(&key,range).await?};if self.source_generation(&key).await?.as_deref()!=Some(identity.as_str()){return Err(TransferError::PlanStale{message:"source generation changed during snapshot".into()});}self.check_owned_source(entry).await?;Ok(bytes)
         })}
@@ -1548,7 +1553,7 @@ pub mod v2 {
             let result=crate::db::with_database_mut(|db|db.update_transfer_records(&marker,|mut records,mut members|{
                 let current=records.get(&p.record_id);
                 if target.action==PlanAction::Overwrite && current.is_none(){return Err(crate::error::NarouError::Platform("plan_stale: destination deleted".into()));}
-                if let Some(current)=current{if target.action==PlanAction::Create || Some(Self::record_revision(current).map_err(|e|crate::error::NarouError::Platform(e.to_string()))?)!=target.record_revision{return Err(crate::error::NarouError::Platform("plan_stale: destination changed".into()));}}
+                if let Some(current)=current&&(target.action==PlanAction::Create||Some(Self::record_revision(current).map_err(|e|crate::error::NarouError::Platform(e.to_string()))?)!=target.record_revision){return Err(crate::error::NarouError::Platform("plan_stale: destination changed".into()));}
                 let existing=records.remove(&p.record_id);
                 let mut record=self.make_record(spec,p.record_id,existing).map_err(|e|crate::error::NarouError::Platform(e.to_string()))?;
                 record.file_title=p.file_title.clone();record.sitename=p.sitename.clone();record.use_subdirectory=p.use_subdirectory;record.is_narou=p.is_narou;
@@ -1556,7 +1561,7 @@ pub mod v2 {
                 if parent{crate::virtual_novel::validate_members(&member_ids).map_err(crate::error::NarouError::Platform)?;for id in &member_ids{let member=records.get(id).ok_or_else(||crate::error::NarouError::Platform("member disappeared".into()))?;if crate::virtual_novel::is_virtual_record(member)||members.groups.iter().any(|(parent,ids)|*parent!=record.id&&ids.contains(id)){return Err(crate::error::NarouError::Platform("membership_conflict".into()));}}members.groups.insert(record.id,member_ids.clone());if !record.tags.contains(&crate::virtual_novel::tag(record.id)){record.tags.push(crate::virtual_novel::tag(record.id));}}
                 records.insert(record.id,record);Ok((records,members,()))
             }));
-            if let Err(error)=result{if !self.committed(spec)?{return Err(TransferError::platform(error));}}p.committed=true;self.save_publication(spec,&p)?;Ok(PublicationStep{done:true,committed:true,assigned_id:Some(p.record_id),receipt:Some(bytes),..Default::default()})
+            if let Err(error)=result&&!self.committed(spec)?{return Err(TransferError::platform(error));}p.committed=true;self.save_publication(spec,&p)?;Ok(PublicationStep{done:true,committed:true,assigned_id:Some(p.record_id),receipt:Some(bytes),..Default::default()})
         })}
         fn publication_rollback<'a>(&'a self,spec:&'a PublicationSpec,cursor:Option<&'a str>)->PlatformFuture<'a,TR<PublicationStep>>{Box::pin(self.rollback_publication(spec,cursor))}
         fn publication_finish<'a>(&'a self,spec:&'a PublicationSpec,_cursor:Option<&'a str>)->PlatformFuture<'a,TR<PublicationStep>>{Box::pin(async move{
@@ -1610,7 +1615,8 @@ pub fn v2_service()->std::result::Result<Arc<crate::application::transfer::Trans
 
 pub fn recover_startup()->Result<()>{
     let service=v2_service().map_err(|e|NarouError::Platform(e.to_string()))?;let scope=v2::native_scope().map_err(|e|NarouError::Platform(e.to_string()))?;
-    loop{let report=futures::executor::block_on(service.recover(&scope)).map_err(|e|NarouError::Platform(e.to_string()))?;if report.pending_recovery==0{break;}if report.stepped_publications==0{return Err(NarouError::Platform("recovery_required: unfinished transfer publication must be recovered before opening the library".into()));}}
+    loop{let report=futures::executor::block_on(service.recover(&scope)).map_err(|e|NarouError::Platform(e.to_string()))?;if report.pending_recovery==0{break;}
+        if report.stepped_publications==0{return Err(NarouError::Platform("recovery_required: unfinished transfer publication must be recovered before opening the library".into()));}}
     futures::executor::block_on(service.expire_idle(&scope)).map_err(|e|NarouError::Platform(e.to_string()))?;Ok(())
 }
 
@@ -1666,7 +1672,8 @@ pub fn stage_metadata(marker:&TransferCommitMarker,path:&Path,original:Option<&s
     let name=metadata_name(path)?;let library_root=path.parent().and_then(Path::parent).ok_or_else(||metadata_error("inventory root missing"))?;let publication_root=marker.yaml_commit_path.parent().ok_or_else(||metadata_error("publication root missing"))?;validate_publication_root(library_root,publication_root)?;
     save_expected_metadata_receipt(library_root,marker)?;
     if metadata_resolution(publication_root)?.is_some(){return Err(metadata_error("resolved metadata publication cannot be staged again"));}
-    let pending=library_root.join(".narou/transfer/metadata-pending");let owner=publication_root.strip_prefix(library_root).map_err(|_|metadata_error("publication is outside library"))?.to_string_lossy().replace('\\',"/");if let Ok(existing)=fs::read_to_string(&pending){if existing!=owner{return Err(metadata_error("another publication owns pending library metadata"));}}
+    let pending=library_root.join(".narou/transfer/metadata-pending");let owner=publication_root.strip_prefix(library_root).map_err(|_|metadata_error("publication is outside library"))?.to_string_lossy().replace('\\',"/");
+    if let Ok(existing)=fs::read_to_string(&pending)&&existing!=owner{return Err(metadata_error("another publication owns pending library metadata"));}
     durable_metadata_bytes(&pending,owner.as_bytes())?;let directory=publication_root.join("metadata");let descriptor=directory.join(format!("{name}.json"));let image=MetadataImage{name:name.into(),old_sha256:original.map(|s|crate::application::transfer::sha256_hex(s.as_bytes())),new_sha256:crate::application::transfer::sha256_hex(replacement.as_bytes())};
     if descriptor.exists(){let existing:MetadataImage=serde_json::from_slice(&fs::read(&descriptor)?).map_err(|e|metadata_error(e.to_string()))?;if existing.old_sha256!=image.old_sha256||existing.new_sha256!=image.new_sha256{return Err(metadata_error("metadata replay changed its preimage or postimage"));}return Ok(());}
     if let Some(original)=original{durable_metadata_bytes(&directory.join(format!("{name}.undo")),original.as_bytes())?;}durable_metadata_bytes(&directory.join(format!("{name}.new")),replacement.as_bytes())?;durable_metadata_bytes(&descriptor,&serde_json::to_vec(&image).map_err(|e|metadata_error(e.to_string()))?)
@@ -1680,7 +1687,8 @@ pub fn install_metadata(marker:&TransferCommitMarker,path:&Path)->Result<()>{
 
 fn apply_metadata_image(path:&Path,publication_root:&Path,image:&MetadataImage,committed:bool)->Result<()>{
     if metadata_name(path)?!=image.name{return Err(metadata_error("metadata descriptor target differs"));}let current=metadata_fingerprint(path)?;
-    let expected=if committed{Some(&image.new_sha256)}else{image.old_sha256.as_ref()};if current.as_ref()==expected{return Ok(());}if current.as_ref()!=Some(&image.new_sha256)&&current!=image.old_sha256{return Err(metadata_error(format!("{name} differs from both journal fingerprints; preserving bytes",name=image.name)));}
+    let expected=if committed{Some(&image.new_sha256)}else{image.old_sha256.as_ref()};if current.as_ref()==expected{return Ok(());}
+    if current.as_ref()!=Some(&image.new_sha256)&&current!=image.old_sha256{return Err(metadata_error(format!("{name} differs from both journal fingerprints; preserving bytes",name=image.name)));}
     if let Some(expected)=expected{let suffix=if committed{"new"}else{"undo"};durable_metadata_image(path,&publication_root.join("metadata").join(format!("{}.{suffix}",image.name)),expected)}else{match fs::remove_file(path){Ok(())=>Ok(()),Err(e)if e.kind()==std::io::ErrorKind::NotFound=>Ok(()),Err(e)=>Err(e.into())}}
 }
 

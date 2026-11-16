@@ -422,7 +422,6 @@ impl IllustrationDedupState {
 /// 対象は hex 名 (`<sha256-hex>.<ext>`) の旧配置だけ。mitemin の `iNNN` 名など
 /// 内容ハッシュでない名前は、index の対応を壊さずには移せないため従来配置を
 /// 保つ (新規取得分は dedup により最初から hex 名になる)。
-
 /// Use an admitted/leased logical source view while the pool destination keeps
 /// its conditional, SHA-checked write-once semantics. Legacy cleanup never
 /// deletes the shared pool or any immutable canonical reference target.

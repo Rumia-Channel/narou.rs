@@ -1160,7 +1160,6 @@ fn colorize_removed_message(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use tempfile::TempDir;
 
     use super::{
         ListOptions, TagOptions, build_tag_mode, matches_filters, matches_grep, remove_novel_by_id,

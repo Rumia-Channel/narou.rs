@@ -38,7 +38,8 @@ pub fn novel_json_pull(layout:&NovelJsonLayout,cursor:&mut NovelJsonPullCursor,i
             Phase::Start=>if token(&mut bytes,limit,cursor,b"{")?{cursor.phase=Phase::Scalar;},
             Phase::Scalar=>{
                 while cursor.field<10&&!layout.present(cursor.field){cursor.field+=1;}
-                if cursor.field==10{cursor.phase=Phase::Tags;continue;}if cursor.field>10{return Err(invalid());}
+                if cursor.field==10{cursor.phase=Phase::Tags;continue;}
+                if cursor.field>10{return Err(invalid());}
                 if token(&mut bytes,limit,cursor,prefix(cursor.field))?{cursor.section=0;cursor.phase=Phase::Open;}
             },
             Phase::Open=>if token(&mut bytes,limit,cursor,b"\"")?{cursor.phase=Phase::Text;},
@@ -61,11 +62,13 @@ pub fn novel_json_pull(layout:&NovelJsonLayout,cursor:&mut NovelJsonPullCursor,i
             },
             Phase::Close=>if token(&mut bytes,limit,cursor,b"\"")?{match cursor.section{0=>{cursor.field+=1;cursor.phase=Phase::Scalar;},1=>{cursor.item+=1;cursor.phase=Phase::Tag;},2=>{cursor.item+=1;cursor.phase=Phase::Member;},_=>return Err(invalid())}},
             Phase::Tags=>if token(&mut bytes,limit,cursor,b",\"tags\":[")?{cursor.item=0;cursor.phase=Phase::Tag;},
-            Phase::Tag=>{if cursor.item>=layout.tags{if cursor.item!=layout.tags{return Err(invalid());}cursor.phase=Phase::TagsEnd;continue;}if cursor.item==0||token(&mut bytes,limit,cursor,b",")?{cursor.section=1;cursor.phase=Phase::Open;}},
+            Phase::Tag=>{if cursor.item>=layout.tags{if cursor.item!=layout.tags{return Err(invalid());}cursor.phase=Phase::TagsEnd;continue;}
+                if cursor.item==0||token(&mut bytes,limit,cursor,b",")?{cursor.section=1;cursor.phase=Phase::Open;}},
             Phase::TagsEnd=>if token(&mut bytes,limit,cursor,b"]")?{cursor.phase=Phase::Number;},
             Phase::Number=>{let mut digits=[0u8;20];let number=super::manifest_write::decimal(layout.novel_type as u64,&mut digits);let mut value=[0u8;22];let name=b",\"novel_type\":";value[..name.len()].copy_from_slice(name);value[name.len()..name.len()+number.len()].copy_from_slice(number);if token(&mut bytes,limit,cursor,&value[..name.len()+number.len()])?{cursor.phase=if layout.members.is_some(){Phase::Members}else{Phase::End};}},
             Phase::Members=>if token(&mut bytes,limit,cursor,b",\"virtual_members\":[")?{cursor.item=0;cursor.phase=Phase::Member;},
-            Phase::Member=>{let count=layout.members.ok_or_else(invalid)?;if cursor.item>=count{if cursor.item!=count{return Err(invalid());}cursor.phase=Phase::MembersEnd;continue;}if cursor.item==0||token(&mut bytes,limit,cursor,b",")?{cursor.section=2;cursor.phase=Phase::Open;}},
+            Phase::Member=>{let count=layout.members.ok_or_else(invalid)?;if cursor.item>=count{if cursor.item!=count{return Err(invalid());}cursor.phase=Phase::MembersEnd;continue;}
+                if cursor.item==0||token(&mut bytes,limit,cursor,b",")?{cursor.section=2;cursor.phase=Phase::Open;}},
             Phase::MembersEnd=>if token(&mut bytes,limit,cursor,b"]")?{cursor.phase=Phase::End;},
             Phase::End=>if token(&mut bytes,limit,cursor,b"}")?{cursor.phase=Phase::Done;},
             Phase::Done=>{},

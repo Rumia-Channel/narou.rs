@@ -38,6 +38,8 @@ impl NovelKind {
 }
 
 /// `header` record: versions, selection policy, fingerprint and totals.
+/// Serialized key order is fixed by field declaration order; producers build
+/// the struct literal directly.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct WireHeader {
     /// Archive format version the client validated against (`2`).
@@ -288,10 +290,10 @@ impl WireManifestDecoder {
     }
 
     fn end_novel(&self) -> Result<()> {
-        if let Some((_, expected, actual)) = self.current {
-            if expected != actual || self.pending_text.is_some() || self.fields & 15 != 15 {
-                return Err(super::protocol_error("incomplete novel files or text fields"));
-            }
+        if let Some((_, expected, actual)) = self.current
+            && (expected != actual || self.pending_text.is_some() || self.fields & 15 != 15)
+        {
+            return Err(super::protocol_error("incomplete novel files or text fields"));
         }
         Ok(())
     }
@@ -383,36 +385,6 @@ impl WireManifestDecoder {
     }
 }
 
-/// JSON key order is fixed by these structs; the wrapper is exposed for
-/// producers that build records field-by-field.
-impl WireHeader {
-    /// Construct a header; callers fill `fingerprint`/totals.
-    pub fn new(
-        format_version: u32,
-        policy_version: u32,
-        profile: TransferProfile,
-        extra_roles: Vec<String>,
-        fingerprint: String,
-        selection_digest: String,
-        novels: u32,
-        files: u32,
-        texts: u32,
-    ) -> WireHeader {
-        WireHeader {
-            format_version,
-            protocol_version: super::PROTOCOL_VERSION,
-            policy_version,
-            profile,
-            extra_roles,
-            fingerprint,
-            selection_digest,
-            novels,
-            files,
-            texts,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,9 +400,11 @@ mod tests {
     }
 
     fn records() -> Vec<WireRecord> {
-        let mut records = vec![WireRecord::Header(WireHeader::new(
-            2, 1, TransferProfile::Runtime, vec![], "a".repeat(64), "c".repeat(64), 1, 1, 4,
-        )), WireRecord::Novel(WireNovel { index: 0, kind: NovelKind::Normal, novel_type: 1, files: 1 })];
+        let mut records = vec![WireRecord::Header(WireHeader {
+            format_version: 2, protocol_version: super::super::PROTOCOL_VERSION, policy_version: 1,
+            profile: TransferProfile::Runtime, extra_roles: vec![],
+            fingerprint: "a".repeat(64), selection_digest: "c".repeat(64), novels: 1, files: 1, texts: 4,
+        }), WireRecord::Novel(WireNovel { index: 0, kind: NovelKind::Normal, novel_type: 1, files: 1 })];
         for field in ["toc_url", "title", "author", "sitename"] {
             records.push(WireRecord::Text(WireText { novel: 0, field: field.into(), item: None, part: 0, last: true, value: field.into() }));
         }

@@ -144,9 +144,8 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
         return Ok(out_dir);
     };
 
-    let export_state = Some(&state).filter(|_| {
-        in_place || comparable(&out_dir) == comparable(&narou_dir)
-    });
+    let export_state = (in_place || comparable(&out_dir) == comparable(&narou_dir))
+        .then_some(&state);
 
     if in_place {
         sweep_stale_staging(&narou_dir)?;
@@ -207,13 +206,12 @@ fn sql_fingerprint(conn: &rusqlite::Connection) -> Result<String> {
         hash.update([0u8]);
     };
     let table_exists = |conn: &rusqlite::Connection, name: &str| -> Result<bool> {
-        Ok(conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
-                [name],
-                |row| row.get(0),
-            )
-            .map_err(super::sqlite_error)?)
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(super::sqlite_error)
     };
     let mut walk = |conn: &rusqlite::Connection, sql: &str| -> Result<()> {
         let mut statement = conn.prepare(sql).map_err(super::sqlite_error)?;
@@ -583,6 +581,14 @@ fn finalize_in_place(
     staged: &[(PathBuf, PathBuf)],
     export_state: Option<&super::state::StateDb>,
 ) -> Result<()> {
+    // `SqliteObjectStore::new` resolves `sqlite.mirror-files` through
+    // `Inventory`, which routes `local_setting` back through
+    // `StateDb::get_raw` — itself a `with_compat_lock` acquisition. Building
+    // the store inside the compat lock therefore deadlocks on the same
+    // process mutex. Adoption only ever needs the shared connection and the
+    // mirror root, so construct both before the guarded region opens.
+    let mirror = NativeObjectStore::from_root(layout.library_archive.clone())?;
+    let store = super::object_store::SqliteObjectStore::new(state.conn_ref().clone(), mirror.clone());
     state.with_compat_lock(|| {
         // Validation 1: metadata and SQL fingerprint under one read
         // transaction. The compat lock excludes record/state writers; object
@@ -645,11 +651,6 @@ fn finalize_in_place(
             }
             out
         };
-        // Propagate mirror construction errors: the store owns the adoption
-        // hooks and a silently skipped mirror would flip the marker over
-        // unmigrated gates.
-        let mirror = NativeObjectStore::from_root(layout.library_archive.clone())?;
-        let store = super::object_store::SqliteObjectStore::new(state.conn_ref().clone(), mirror.clone());
         let intent_path = narou_dir.join(CUTOVER_INTENT_FILE);
         // Durable in-flight marker: written before the barrier transaction so
         // a process exit at any later point is unambiguous on restart
@@ -782,6 +783,7 @@ const CUTOVER_INTENT_FILE: &str = ".cutover-yaml-intent";
 /// - marker=sqlite: rolled back or already restored — converge leftover
 ///   journals like the sweep, discharge stale intent evidence, drop the
 ///   intent file last.
+///
 /// No intent file -> no-op, so converged and never-switched libraries are
 /// untouched.
 pub(crate) fn reconcile_cutover_intent(narou_dir: &Path) -> Result<()> {

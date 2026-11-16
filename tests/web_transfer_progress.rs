@@ -202,7 +202,7 @@ fn export_profile(client:&Client,server:&Server,library:&Path,ids:&[i64],profile
     for path in ["setting.ini","replace.txt","converter.yaml",".illustration_cache.yaml","novel.txt","user-notes.epub","挿絵/unchanged.apng"]{assert_eq!(catalog.iter().find(|r|r["logical_path"]==path).unwrap()["selected"],true,"{path}");}
     assert_eq!(catalog.iter().find(|r|r["logical_path"]=="user-notes.epub").unwrap()["role"],"unknown");
     let selected=catalog.iter().map(|r|(
-        r["novel_ordinal"].as_u64().unwrap() as u32,r["logical_path"].as_str().unwrap().to_owned(),r["size"].as_str().unwrap().parse().unwrap(),FileRole::from_str(r["role"].as_str().unwrap()).unwrap()
+        r["novel_ordinal"].as_u64().unwrap() as u32,r["logical_path"].as_str().unwrap().to_owned(),r["size"].as_str().unwrap().parse().unwrap(),FileRole::parse(r["role"].as_str().unwrap()).unwrap()
     )).collect::<Vec<_>>();
     let digest=TransferService::selection_digest(status["catalog_revision"].as_str().unwrap().parse().unwrap(),profile,&[],&selected);
     control(client,server,"exports",&secret,&mut status,"select",json!({"profile":profile,"extra_roles":[],"selection_digest":digest}));
@@ -227,7 +227,7 @@ fn wire_manifest(manifest:&ArchiveManifest,fingerprint:&str,policy:u32,profile:T
         for(item,value)in n.tags.iter().enumerate(){text(&mut records,&mut texts,index,"tag",Some(item as u32),value);}if let Some(members)=&n.virtual_members{for(item,value)in members.iter().enumerate(){text(&mut records,&mut texts,index,"member",Some(item as u32),value);}}
         for file in &n.files{let size=file.size.unwrap();let sha=file.sha256.clone().unwrap();digest.file(&file.path,size,&sha).unwrap();records.push(WireRecord::File(WireFile{file_id,novel:index,path:file.path.clone(),size,sha256:sha}));file_id+=1;}
     }
-    records.insert(0,WireRecord::Header(WireHeader::new(manifest.format_version,policy,profile,vec![],fingerprint.into(),digest.finish(),manifest.novels.len() as u32,file_id,texts)));
+    records.insert(0,WireRecord::Header(WireHeader{format_version:manifest.format_version,protocol_version:protocol::PROTOCOL_VERSION,policy_version:policy,profile,extra_roles:vec![],fingerprint:fingerprint.into(),selection_digest:digest.finish(),novels:manifest.novels.len() as u32,files:file_id,texts}));
     records.push(WireRecord::End(WireEnd{novels:manifest.novels.len() as u32,files:file_id,texts}));records.iter().flat_map(|r|protocol::serialize_record(r).unwrap()).collect()
 }
 fn send_batch(client:&Client,server:&Server,path:&str,secret:&str,body:&[u8],count:usize)->Value{

@@ -71,7 +71,7 @@ function gatedDatabase(database, phase, paused) {
               await meet(`${phase}:${key}`);
             }
           }
-          if (paused && !gated.has('member-rows') && /^\s*SELECT\b/i.test(sql) &&
+          if (paused === 'member-classification' && !gated.has('member-rows') && /^\s*SELECT\b/i.test(sql) &&
               /\bFROM novels n\b/.test(sql) && /\bn\.id IN\b/.test(sql)) {
             gated.add('member-rows');
             await pause(paused);

@@ -646,6 +646,25 @@ pub(crate) async fn advance_terminal_creation(runtime: &WorkerRuntime, job_id: &
         return Err(NarouError::Platform(format!("terminal creation checkpoint ownership for {job_id} is invalid")));
     }
     let (id, generation) = checkpoint.creation_reservation.ok_or_else(|| NarouError::Platform(format!("terminal creation checkpoint for {job_id} has no reservation")))?;
+    // release_creation は未公開の空 namespace を durable に `remove-v1:` owner
+    // で閉じて `CreationCleanupPending` を返す。drain は cron の
+    // `recover_pending_removals` だけに頼らず、ここでも同じ bounded sweep を
+    // 回す — native `recover_removals` が release と removal drain を交互に
+    // 回すのと同じ形。閉じたままでは後続の取得が `novel_busy` で止まる。
+    let mut cursor: Option<String> = None;
+    for _ in 0..8 {
+        match runtime.novels.release_id(narou_rs::platform::NovelIdReservation::new(id, generation)).await {
+            Ok(()) => break,
+            Err(NarouError::CreationCleanupPending) => {},
+            Err(error) => return Err(error),
+        }
+        let next = runtime.write_services().novel_actions.recover_removals(cursor.as_deref(), 4, 16).await
+            .map_err(|error| NarouError::Platform(format!("creation removal drain: {error}")))?;
+        // `None` カーソル = ページ走査が末尾に到達。owner が drain し切れて
+        // いなければ次のループが先頭からもう1パス回り、per-owner ファイル
+        // 予算で残った分を同じ呼び出しで続ける。
+        cursor = next;
+    }
     match runtime.novels.release_id(narou_rs::platform::NovelIdReservation::new(id, generation)).await {
         Ok(()) => {},
         Err(NarouError::CreationCleanupPending) => return Ok(false),

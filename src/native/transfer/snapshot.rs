@@ -70,7 +70,7 @@ impl NativeTransferBackend {
         let session=&entry.session_id;let source=self.snapshot_source(session,entry.novel_ordinal)?;
         if source.entry.id!=entry.id||source.entry.record_revision!=entry.record_revision||source.entry.content_revision!=entry.content_revision||source.entry.membership_digest!=entry.membership_digest{return Err(TransferError::invalid("snapshot_identity_mismatch","source summary differs from frozen catalog"));}
         let key=format!("{}\0{}",source.prefix,number(entry.novel_ordinal));
-        let gate:SnapshotGate=self.journal.backend_get(&Self::snapshot_gates_owner(&session),&key)?.ok_or_else(||TransferError::invalid("snapshot_gate_missing","source gate is missing"))?;
+        let gate:SnapshotGate=self.journal.backend_get(&Self::snapshot_gates_owner(session),&key)?.ok_or_else(||TransferError::invalid("snapshot_gate_missing","source gate is missing"))?;
         if gate.released{return Err(TransferError::Busy{code:"snapshot_gate_lost",message:"snapshot source gate was already released".into()});}
         let prefix=ObjectPrefix::new(&source.prefix).map_err(TransferError::platform)?;
         self.primary.renew_gate(&prefix,&gate.owner,gate.epoch).await.map_err(TransferError::platform)?;
@@ -111,7 +111,7 @@ impl NativeTransferBackend {
     }
     fn checked_source_path(&self,prefix:&str,relative:&str)->TR<PathBuf> {
         crate::transfer::validate_relative_path(relative).map_err(TransferError::platform)?;
-        let key=ObjectKey::try_new(prefix).and_then(|prefix|prefix.join(relative)).map_err(TransferError::platform)?;
+        let key=ObjectKey::try_new(format!("{}/{relative}",prefix.trim_end_matches('/'))).map_err(TransferError::platform)?;
         let mapped=match &self.filesystem{NativeStore::Fs(store)=>store.resolve_path(&key).map_err(TransferError::platform)?,NativeStore::Sqlite(_)=>return Err(TransferError::invalid("source_store","filesystem source resolver is unavailable"))};let root=self.archive_root();let relative=mapped.strip_prefix(&root).map_err(|_|TransferError::invalid("unsafe_source","resolved source escapes archive root"))?;let mut path=root.clone();
         for part in relative.components(){if !matches!(part,std::path::Component::Normal(_)){return Err(TransferError::invalid("unsafe_source","resolved source contains a non-normal component"));}path.push(part);
             match fs::symlink_metadata(&path) {
@@ -132,7 +132,8 @@ impl NativeTransferBackend {
         if size>16*1024*1024{return Err(TransferError::invalid("legacy_metadata_limit","legacy compressed source exceeds decoded16MiB storage contract"));}
         let operation=self.journal.executing_operation(session)?;
         if let Some(reference)=self.journal.backend_get::<LegacySourceReference>(&session.0,binding_key)? {
-            if let Some(cursor)=self.primary.stage_cursor(&reference.handle).await.map_err(TransferError::platform)?{if cursor.sealed{if cursor.confirmed_bytes!=size||reference.sha256.is_none()||cursor.prefix_sha256()!=reference.sha256{return Err(TransferError::RecoveryRequired{message:"sealed initializer lost its immutable SHA proof".into()});}if reference.operation==operation{return Err(TransferError::Busy{code,message:"initializer unit already completed; adopt without copying payload".into()});}return Ok(Some(reference.handle));}}
+            if let Some(cursor)=self.primary.stage_cursor(&reference.handle).await.map_err(TransferError::platform)?&&cursor.sealed{if cursor.confirmed_bytes!=size||reference.sha256.is_none()||cursor.prefix_sha256()!=reference.sha256{return Err(TransferError::RecoveryRequired{message:"sealed initializer lost its immutable SHA proof".into()});}
+                if reference.operation==operation{return Err(TransferError::Busy{code,message:"initializer unit already completed; adopt without copying payload".into()});}return Ok(Some(reference.handle));}
             self.primary.stage_abort(&reference.handle,&session.0,1).await.map_err(TransferError::platform)?;
         }
         let handle=self.opaque_id("source");let binding=StageBinding{owner:session.0.clone(),file_id:MANIFEST_FILE_ID,size,epoch:1};

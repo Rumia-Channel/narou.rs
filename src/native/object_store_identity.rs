@@ -18,7 +18,8 @@ impl NativeStore{
         af::parse_removal_owner(owner)?;let next=fence.epoch.checked_add(1).ok_or_else(||NarouError::Platform("gate epoch exhausted".into()))?;
         match self{
             Self::Fs(store)=>{let path=store.gate_path(&fence.prefix)?;let mut gate:FsGate=serde_json::from_slice(&fs::read(&path)?).map_err(|error|NarouError::Platform(error.to_string()))?;
-                if gate.migrated{return Err(af::gate_closed_error(&fence.prefix));}match store.live_sql_authority(&fence.prefix,gate.epoch,&gate.origin_url_fold)?{SqlGateAuthority::Superseded|SqlGateAuthority::Conflict=>return Err(af::gate_closed_error(&fence.prefix)),_=>{}}if gate.owner.as_deref()==Some(owner)&&gate.epoch==next{return Ok(next);}if gate.owner.is_some()||gate.epoch!=fence.epoch{return Err(af::gate_epoch_error(&fence.prefix,fence.epoch,gate.epoch));}
+                if gate.migrated{return Err(af::gate_closed_error(&fence.prefix));}match store.live_sql_authority(&fence.prefix,gate.epoch,&gate.origin_url_fold)?{SqlGateAuthority::Superseded|SqlGateAuthority::Conflict=>return Err(af::gate_closed_error(&fence.prefix)),_=>{}}if gate.owner.as_deref()==Some(owner)&&gate.epoch==next{return Ok(next);}
+                if gate.owner.is_some()||gate.epoch!=fence.epoch{return Err(af::gate_epoch_error(&fence.prefix,fence.epoch,gate.epoch));}
                 gate.prefix=Some(fence.prefix.as_ref().trim_end_matches('/').into());gate.epoch=next;gate.owner=Some(owner.into());gate.updated_at=ts::now_secs();atomic_write_bytes(&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(&path)?;Ok(next)
             },
             Self::Sqlite(_)=>{let connection=connection.ok_or_else(||NarouError::Platform("SQL removal has no metadata transaction".into()))?;let next=i64::try_from(next).map_err(|_|NarouError::Platform("SQL gate epoch exhausted".into()))?;

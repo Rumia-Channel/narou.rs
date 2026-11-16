@@ -135,6 +135,10 @@ pub fn namespace_prefixes_overlap(left:&str,right:&str)->bool{
     left==right||left.strip_prefix(right).is_some_and(|rest|rest.starts_with('/'))||right.strip_prefix(left).is_some_and(|rest|rest.starts_with('/'))
 }
 
+/// One `pending_removals` page: `(gate prefix, removal owner, closed epoch)`
+/// rows plus the continuation cursor when the scan was bounded.
+pub type PendingRemovalPage=(Vec<(ObjectPrefix,String,u64)>,Option<String>);
+
 pub trait NovelAccessFence: PlatformService {
     fn capture_writer<'a>(&'a self, prefix: &'a ObjectPrefix) -> PlatformFuture<'a, Result<WriteFence>> {
         Box::pin(async move {
@@ -152,8 +156,7 @@ pub trait NovelAccessFence: PlatformService {
     /// self-contained removal owner in the same atomic gate transition.
     fn retire_writer<'a>(&'a self,fence:&'a WriteFence,owner:&'a str)->PlatformFuture<'a,Result<u64>>{let _=(fence,owner);Box::pin(async{Err(NarouError::Platform("closed-owner removal unsupported".into()))})}
     /// Bounded gate scan. An empty result with a cursor is NOT end-of-input.
-    fn pending_removals<'a>(&'a self,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,Result<(Vec<(ObjectPrefix,String,u64)>,Option<String>)>>{let _=(cursor,limit);Box::pin(async{Err(NarouError::Platform("pending removal enumeration unsupported".into()))})}
-
+    fn pending_removals<'a>(&'a self,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,Result<PendingRemovalPage>>{let _=(cursor,limit);Box::pin(async{Err(NarouError::Platform("pending removal enumeration unsupported".into()))})}
     /// Admit a reader. Succeeds only while the gate is `Open`; returns the
     /// epoch pinned at admission. A closed gate returns
     /// `novel_recovering`/`novel_busy`-class errors, never a lease.

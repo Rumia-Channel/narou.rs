@@ -32,9 +32,10 @@ jobs:
       # Match the existing Cloudflare environment, including its legacy spelling.
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      NAROU_TRANSFER_FIXTURE_STATE: ${{ runner.temp }}/transfer-fixture-${{ github.run_id }}-${{ github.run_attempt }}.json
     steps:
       - uses: actions/checkout@v5
+      - name: Set the isolated fixture state path
+        run: echo "NAROU_TRANSFER_FIXTURE_STATE=$RUNNER_TEMP/transfer-fixture-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json" >> "$GITHUB_ENV"
       - name: Require verification credentials
         run: |
           test -n "$CLOUDFLARE_ACCOUNT_ID"
@@ -81,9 +82,10 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NAROU_TRANSFER_FIXTURE_CLEANUP: ${{ needs.fixture.outputs.cleanup }}
-      NAROU_TRANSFER_FIXTURE_STATE: ${{ runner.temp }}/transfer-fixture-cleanup-${{ github.run_id }}-${{ github.run_attempt }}.json
     steps:
       - uses: actions/checkout@v5
+      - name: Set the isolated cleanup state path
+        run: echo "NAROU_TRANSFER_FIXTURE_STATE=$RUNNER_TEMP/transfer-fixture-cleanup-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v5
         with:
           node-version: "24"

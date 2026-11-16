@@ -259,7 +259,7 @@ mod tests {
         }
         all.extend(decoder.finish().unwrap());
         assert_eq!(all.len(), 3);
-        assert_eq!(all[2].header.is_final, true);
+        assert!(all[2].header.is_final);
         assert_eq!(all[1].header.chunk_index, 1);
     }
 

@@ -395,12 +395,12 @@ narou author remove 1
 - Worker は作品フォルダの一覧を挿絵索引で補完し、S3 の共有プールにだけ存在する画像も同梱する。画像の実体は共通の論理キーで確認し、旧配置への読み取り互換を維持する。
 - Web v2 の ZIP 生成・検証・展開は Dedicated Worker 上の WASM が担当し、ZIP 全体をサーバーへ送る方式へフォールバックしない。パス・重複・宣言サイズ・CRC・SHA-256 を検証し、非公開 stage の保存成功後だけ作品を公開する。
 - 通信要求はフレームを含め 8 MiB / 100 レコード以下に分割する。作品全体・全 ZIP の展開サイズに旧来の 512 MiB 一律上限は置かず、manifest・索引・メタデータの制御上限と有界バッファを別に管理する。
-- Web の既定 `runtime` は raw・履歴・確認済みの派生物を列挙／転送前に除外し、本文・目次・設定・挿絵・未知の利用者ファイルを保持する。`complete` は保存先が対応する保守データも対象にする。Worker は raw を新規保存しない。
+- Web の既定 `runtime` は raw・履歴・確認済みの派生物を snapshot・本文通信の前に除外し、本文・目次・設定・挿絵・未知の利用者ファイルを保持する。catalog の除外件数・用途は開始前に表示する。`complete` は保存先が対応する保守データも対象にし、Worker は raw を新規保存しない。
 - Web は `/api/transfer/v2` の session / チャンク API へ切り替え中。session と操作の永続 ACK で再送・再開を扱い、公開済み作品をキャンセルで巻き戻さず、未公開分を回収する。既存の Web 認証ミドルウェア配下で動作する。
 - 上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。CLI の既存取り込みでの `sqlite.mirror-files=false` の制限と、Web v2 の参照公開は別経路として確認する。詳細は `WEBUI.md` §6.1b。
-- ブラウザ保存は File System Access または Service Worker の pull 型ストリームを使い、全量 `Blob` 化へフォールバックしない。保存先の書き込みを待って次のチャンクを受け取り、明示的な完了通知前の切断・キャンセルを成功扱いしない。
+- ブラウザ保存は File System Access または Service Worker の pull 型ストリームを使い、全量 `Blob` 化へフォールバックしない。FSA の picker はクリック中、SW の開始は最初の ZIP byte まで遅らせる。保存先の書き込みを待って次のチャンクを受け取り、中継の状態消失・明示的な完了通知前の切断・キャンセルを成功扱いしない。
 - 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が生成・検証・取り込み計画を共有する。
-- **Web の完了判定**: クライアント WASM・Native/Worker の新経路を実装中で、統合動作は未確認。サマリの `export` / `import` の完了は CLI を指す。大容量・再開・配布物・実ブラウザの受入条件は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) を参照し、未検証の経路を完了扱いしない。公開済み v0.6.6 のサーバー ZIP 経路の修正が配布済みという意味ではない。
+- **Web の完了判定**: 別ブランチで統合検証中。Firefox と実 workerd/D1 の17 MiB取り込み・同一sessionからの保存し直し・独立ZIP readerによるSHA照合、10 MiB制限gatewayでの8 MiB以下の本文通信は確認した。Native保存方式別・100 MB超・4 GiB超の実ブラウザ・Chromium FSA・Worker予算等の受入条件は未完了。サマリの `export` / `import` の完了は CLI を指す。詳細は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) §16.1。公開済み v0.6.6 のサーバー ZIP 経路の修正が配布済みという意味ではない。
 - **書式 (ZIP の中身) の詳細は [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md)** を参照 (`manifest.json` のスキーマ・検証ルール・衝突規則・同梱するファイル・挿絵の扱い)。
 
 ### 3.x-hidden `hidden` — ✅ 完了 (narou.rs 独自, Ruby版対応外)

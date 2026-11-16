@@ -1367,7 +1367,7 @@ mod tests {
         std::fs::create_dir_all(&libraries).unwrap();
         let root = tempfile::Builder::new().prefix("text-settings-io-").tempdir_in(libraries).unwrap();
         let _cwd = crate::test_support::set_current_dir_for_test(root.path());
-        let _database = crate::test_support::isolate_database_for_test();
+        let _database = crate::test_database::isolate_database_for_test();
         std::fs::create_dir_all(root.path().join(".narou/local_setting.yaml")).unwrap();
         let input = root.path().join("settings-input");
         std::fs::create_dir(&input).unwrap();

@@ -5,6 +5,8 @@ extern crate self as narou_rs;
 mod output_macros;
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(all(test, feature = "native-runtime"))]
+pub(crate) mod test_database;
 
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod application;

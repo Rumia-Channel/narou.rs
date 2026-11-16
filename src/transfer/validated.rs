@@ -612,17 +612,18 @@ impl<R: AsyncBufRead + AsyncSeek + Unpin + 'static> ValidatedArchive<R> {
             file_records += sent;
             text_records += count_novel_texts(manifest_novel);
         }
-        let header = WireHeader::new(
-            super::FORMAT_VERSION,
-            selection.policy_version,
-            projection.profile,
-            projection.extra_roles.iter().map(|role| role.as_str().to_string()).collect(),
-            fingerprint.clone(),
-            selection_digest.clone(),
-            novel_records,
-            file_records,
-            text_records,
-        );
+        let header = WireHeader {
+            format_version: super::FORMAT_VERSION,
+            protocol_version: super::protocol::PROTOCOL_VERSION,
+            policy_version: selection.policy_version,
+            profile: projection.profile,
+            extra_roles: projection.extra_roles.iter().map(|role| role.as_str().to_string()).collect(),
+            fingerprint: fingerprint.clone(),
+            selection_digest: selection_digest.clone(),
+            novels: novel_records,
+            files: file_records,
+            texts: text_records,
+        };
         let mut out = ManifestSink { sink, hash: Sha256::new(), bytes: 0, buffer: Vec::new() };
         out.record(&WireRecord::Header(header)).await?;
         let mut file_id = 0u32;

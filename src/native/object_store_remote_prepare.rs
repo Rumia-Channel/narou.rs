@@ -40,7 +40,8 @@ impl NativeStores {
     }
     /// Exactly one fixed operation per invocation. Retries reconcile the same
     /// range or return its immutable receipt; they never start the next part.
-    pub fn prepare_transfer_asset<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,stage:&'a ObjectKey,key:&'a ObjectKey,sha:&'a str,operation:&'a str)->PlatformFuture<'a,Result<(bool,u64)>>{Box::pin(async move{
+    pub fn prepare_transfer_asset<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,asset:PreparedAsset<'a>,operation:&'a str)->PlatformFuture<'a,Result<(bool,u64)>>{Box::pin(async move{
+        let(stage,key,sha)=(asset.stage,asset.key,asset.sha256);
         let Some(remote)=self.s3.as_ref().filter(|_|crate::platform::is_illustration_key(key)) else{return Ok((true,0));};
         if operation.is_empty()||!prefix.matches(key){return Err(NarouError::Platform("invalid remote preparation identity".into()));}
         ts::check_hash_named_key(key,sha)?;self.primary.renew_gate(prefix,owner,epoch).await?;

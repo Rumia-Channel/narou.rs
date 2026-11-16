@@ -282,7 +282,7 @@ pub fn novel_json_chunk(
 }
 
 /// Exact escaping shared by the durable cursor and asynchronous serializer.
-pub(super) fn json_escape<'a>(byte: u8, encoded: &'a mut [u8; 6]) -> Option<&'a [u8]> {
+pub(super) fn json_escape(byte: u8, encoded: &mut [u8; 6]) -> Option<&[u8]> {
     Some(match byte {
         b'"' => b"\\\"", b'\\' => b"\\\\", b'\n' => b"\\n", b'\r' => b"\\r",
         b'\t' => b"\\t", 8 => b"\\b", 12 => b"\\f",

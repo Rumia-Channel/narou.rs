@@ -94,7 +94,7 @@ impl FileRole {
     }
 
     /// Parses a wire role name.
-    pub fn from_str(value: &str) -> Option<FileRole> {
+    pub fn parse(value: &str) -> Option<FileRole> {
         FileRole::ALL.iter().copied().find(|role| role.as_str() == value)
     }
 
@@ -108,19 +108,17 @@ impl FileRole {
 
 /// Selection profile: ordinary migration (`runtime`) vs. full preservation
 /// (`complete`). Serde names are part of the wire contract.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferProfile {
     /// Default: move logical data needed to keep using the library; exclude
     /// raw fetches, history and regenerable output unless explicitly added.
+    #[default]
     Runtime,
     /// Preserve every eligible novel file, including raw/history/generated.
     Complete,
 }
 
-impl Default for TransferProfile {
-    fn default() -> Self { Self::Runtime }
-}
 
 impl TransferProfile {
     /// Wire name.
@@ -131,14 +129,6 @@ impl TransferProfile {
         }
     }
 
-    /// Parses a wire profile name.
-    pub fn from_str(value: &str) -> Option<TransferProfile> {
-        match value {
-            "runtime" => Some(TransferProfile::Runtime),
-            "complete" => Some(TransferProfile::Complete),
-            _ => None,
-        }
-    }
 
     /// Roles the profile sends by default (before `extra_roles` toggles and
     /// destination policy). `internal` never defaults on.
@@ -369,7 +359,7 @@ pub fn validate_extra_roles(
 ) -> std::result::Result<Vec<FileRole>, TransferError> {
     let mut roles = Vec::with_capacity(extra_roles.len());
     for name in extra_roles {
-        let role = FileRole::from_str(name).ok_or_else(|| {
+        let role = FileRole::parse(name).ok_or_else(|| {
             TransferError::InvalidSelection(format!("unknown extra role {name:?}"))
         })?;
         if !profile.is_selectable(role) {
@@ -535,17 +525,15 @@ pub fn project(
     let by_url: std::collections::HashMap<&str, usize> = manifest.novels.iter()
         .enumerate().map(|(index, novel)| (novel.toc_url.as_str(), index)).collect();
     for (index, novel) in manifest.novels.iter().enumerate() {
-        if included[index] {
-            if let Some(members) = &novel.virtual_members {
-                for member in members {
-                    let member_index = *by_url.get(member.as_str()).ok_or_else(|| {
-                        TransferError::InvalidSelection(format!("missing member {member:?}"))
-                    })?;
-                    if manifest.novels[member_index].virtual_members.is_some() {
-                        return Err(TransferError::InvalidSelection("nested virtual parent".into()));
-                    }
-                    included[member_index] = true;
+        if included[index] && let Some(members) = &novel.virtual_members {
+            for member in members {
+                let member_index = *by_url.get(member.as_str()).ok_or_else(|| {
+                    TransferError::InvalidSelection(format!("missing member {member:?}"))
+                })?;
+                if manifest.novels[member_index].virtual_members.is_some() {
+                    return Err(TransferError::InvalidSelection("nested virtual parent".into()));
                 }
+                included[member_index] = true;
             }
         }
     }
@@ -802,6 +790,6 @@ mod tests {
         assert_eq!(FileRole::IllustrationIndex.as_str(), "illustration_index");
         assert_eq!(serde_json::to_string(&FileRole::Body).unwrap(), "\"body\"");
         assert_eq!(serde_json::to_string(&TransferProfile::Complete).unwrap(), "\"complete\"");
-        assert_eq!(FileRole::from_str("illustration_index"), Some(FileRole::IllustrationIndex));
+        assert_eq!(FileRole::parse("illustration_index"), Some(FileRole::IllustrationIndex));
     }
 }
