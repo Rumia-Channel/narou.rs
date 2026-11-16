@@ -1475,7 +1475,7 @@ mod tests {
             let subtitles = [subtitle];
             let error = service.stream_sections_ordered(lease, &keys, &subtitles).try_collect::<Vec<_>>().await.unwrap_err();
             assert!(matches!(error, SectionLoadFailure::Read(_)));
-            assert!(format!("{error:?}").contains("novel_busy"));
+            assert!(format!("{error:?}").contains("novel_epoch_conflict"), "lease renewal must be denied after the gate closes mid-read: {error:?}");
             assert_eq!(data.read_small(&key).await.unwrap().unwrap(), original);
         });
     }

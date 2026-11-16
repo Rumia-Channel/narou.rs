@@ -1046,7 +1046,7 @@ mod tests {
     #[test]
     fn remove_with_split_store_deletes_illustration_prefix_too() {
         let primary = Arc::new(MemoryObjectStore::new());
-        let illustrations = Arc::new(MemoryObjectStore::new());
+        let illustrations = Arc::new(MemoryObjectStore::new_with_shared_authority(primary.as_ref()));
         let repo = Arc::new(MemoryNovelRepository::from_records(vec![sample_record(1)]).with_objects(primary.clone()));
         let split = Arc::new(crate::platform::SplitStore::new(
             (primary.clone(), primary.clone()),

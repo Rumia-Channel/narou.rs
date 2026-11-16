@@ -136,6 +136,8 @@ impl SplitStore {
 }
 
 impl ObjectStore for SplitStore {
+    // Both backends must enforce the same gate authority. Never separate the
+    // closed-owner check from the deletion that it authorizes.
     fn delete_closed<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{self.pair_for(key).objects.delete_closed(prefix,owner,epoch,key)}
     fn retire_legacy<'a>(&'a self,logical:&'a ObjectKey,pool:&'a ObjectKey,size:u64,sha:&'a str)->PlatformFuture<'a,Result<()>>{self.pair_for(logical).objects.retire_legacy(logical,pool,size,sha)}
     fn retire_legacy_guarded<'a>(&'a self,fence:&'a super::WriteFence,logical:&'a ObjectKey,pool:&'a ObjectKey,size:u64,sha:&'a str)->PlatformFuture<'a,Result<()>>{self.pair_for(logical).objects.retire_legacy_guarded(fence,logical,pool,size,sha)}

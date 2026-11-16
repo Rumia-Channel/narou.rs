@@ -1906,6 +1906,22 @@ impl Downloader {
         } else {
             fetched_raw_title
         };
+        // A supplied writer on an existing record already knows its durable
+        // prefix, so re-acknowledge canonical ownership before the first
+        // writer-dependent read; a mid-download replacement must not be
+        // blessed by this guard and an abort must leave both ACKs persisted.
+        let mut reacked = false;
+        if let Some(record) = existing_record.as_ref() {
+            if let Some(write) = options.access.as_ref() {
+                let record_keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+                    .map_err(|error| NarouError::Platform(error.to_string()))?;
+                if write.prefix() != &crate::platform::ObjectPrefix::from(record_keys.prefix().clone()) {
+                    return Err(NarouError::Platform("download writer belongs to another novel".into()));
+                }
+                checkpoint_download_access(&mut budget, &write.origin(), creation.as_deref_mut()).await?;
+                reacked = true;
+            }
+        }
         #[cfg(feature = "native-runtime")]
         let title_ini = if let Some(record) = existing_record.as_ref() {
             let write = options.access.as_ref().ok_or_else(|| NarouError::Platform("existing title settings have no original writer".into()))?;
@@ -1981,7 +1997,9 @@ impl Downloader {
                 }
             }
         }
-        checkpoint_download_access(&mut budget, &write.origin(), creation.as_deref_mut()).await?;
+        if !reacked {
+            checkpoint_download_access(&mut budget, &write.origin(), creation.as_deref_mut()).await?;
+        }
         if let Some(creation) = creation.as_deref_mut() {
             self.novels.reserve_create(write.fence(), &creation.reservation, &toc_url).await?;
             creation.committed = existing_id.is_some();
@@ -3329,7 +3347,9 @@ mod tests {
     async fn default_creation_restore_requires_existing_exact_allocator_proof() {
         struct NoYield;
         impl SectionBudget for NoYield { fn should_yield(&mut self, _: usize) -> bool { false } }
-        let novels = MemoryNovelRepository::new();
+        let mut baseline = sample_record(chrono::Utc::now());
+        baseline.id = 0;
+        let novels = MemoryNovelRepository::from_records(vec![baseline]);
         let mut budget = NoYield;
         assert!(budget.restore_creation_id(&novels, NovelId(1), 1).await.is_err());
         let allocated = novels.allocate_id().await.unwrap();
@@ -3425,7 +3445,9 @@ is_narou: false
         http.add_text("https://example.com/n1234ab/", 200, r#"<h1>Creation Identity</h1><span>Author</span><a href="/n1234ab/1/" data-date="2000-01-01">第1話</a>"#);
         http.add_text("https://example.com/n1234ab/1/", 200, r#"<div class="body">持続本文</div>"#);
         let objects = Arc::new(MemoryObjectStore::new());
-        let novels = Arc::new(MemoryNovelRepository::new());
+        let mut baseline = sample_record(chrono::Utc::now());
+        baseline.id = 0;
+        let novels = Arc::new(MemoryNovelRepository::from_records(vec![baseline]).with_objects(objects.clone()));
         let downloader = Downloader::with_platform_and_storage_and_settings(
             DownloaderPlatform {
                 http: http.clone(), rate_limiter: Arc::new(FakeRateLimiter::new()),
@@ -4032,7 +4054,7 @@ is_narou: false
             DownloaderPlatform {
                 http: http.clone(),
                 rate_limiter: Arc::new(FakeRateLimiter::new()),
-                novels: Arc::new(MemoryNovelRepository::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(primary.clone())),
                 objects,
                 assets,
                 clock: Arc::new(SystemClock),
@@ -4155,20 +4177,31 @@ is_narou: false
 
     #[test]
     fn repository_injection_resolves_existing_ncode_without_database_global() {
-        // `with_platform` loads サイト定義 from the working directory, so this
-        // test must not overlap another one that changes it.
+        // Keep DATABASE absent: every data source is explicitly injected.
         let _state = crate::test_support::global_state_guard();
+        let previous_db = db::DATABASE.lock().take();
+        let _db_guard = DatabaseGuard(previous_db);
         let mut record = sample_record(chrono::Utc::now());
         record.id = 42;
         record.toc_url = "https://ncode.syosetu.com/n1234ab/".to_string();
         record.ncode = Some("n1234ab".to_string());
         record.is_narou = true;
 
-        let repository = Arc::new(MemoryNovelRepository::from_records(vec![record]));
-        let downloader = Downloader::with_platform(
-            Arc::new(MockHttpClient::new()),
-            Arc::new(FakeRateLimiter::new()),
-            repository,
+        let objects = Arc::new(MemoryObjectStore::new());
+        let repository = Arc::new(MemoryNovelRepository::from_records(vec![record]).with_objects(objects.clone()));
+        let mut setting: SiteSetting = serde_yaml::from_str(include_str!("../../webnovel/ncode.syosetu.com.yaml")).unwrap();
+        setting.compile();
+        let downloader = Downloader::with_platform_and_storage_and_settings(
+            DownloaderPlatform {
+                http: Arc::new(MockHttpClient::new()),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: repository,
+                objects: objects.clone(),
+                assets: objects,
+                clock: Arc::new(SystemClock),
+            },
+            vec![setting],
+            HashMap::new(),
         )
         .unwrap();
 
@@ -4176,6 +4209,7 @@ is_narou: false
             futures::executor::block_on(downloader.resolve_target_for_download("N1234AB")).unwrap();
         assert_eq!(id, Some(42));
         assert_eq!(setting.domain, "ncode.syosetu.com");
+        assert!(db::DATABASE.lock().is_none());
     }
 
     #[tokio::test]
@@ -4197,7 +4231,7 @@ is_narou: false
         let downloader = Downloader::with_platform_and_storage_and_settings(
             DownloaderPlatform {
                 http: http.clone(), rate_limiter: Arc::new(FakeRateLimiter::new()),
-                novels: Arc::new(MemoryNovelRepository::from_records(vec![hameln, narou])),
+                novels: Arc::new(MemoryNovelRepository::from_records(vec![hameln, narou]).with_objects(store.clone())),
                 objects: store.clone(), assets: store, clock: Arc::new(SystemClock),
             },
             sites, HashMap::new(),
@@ -4229,7 +4263,7 @@ is_narou: false
         let downloader = Downloader::with_platform_and_storage_and_settings(
             DownloaderPlatform {
                 http: Arc::new(MockHttpClient::new()), rate_limiter: Arc::new(FakeRateLimiter::new()),
-                novels: Arc::new(MemoryNovelRepository::from_records(vec![record.clone()])),
+                novels: Arc::new(MemoryNovelRepository::from_records(vec![record.clone()]).with_objects(store.clone())),
                 objects: store.clone(), assets: store, clock: Arc::new(SystemClock),
             },
             sites, HashMap::new(),
@@ -4244,12 +4278,12 @@ is_narou: false
     fn explicit_storage_constructor_avoids_native_loaders() {
         let store = Arc::new(MemoryObjectStore::new());
         let objects: Arc<dyn ObjectStore> = store.clone();
-        let assets: Arc<dyn AssetStore> = store;
+        let assets: Arc<dyn AssetStore> = store.clone();
         let downloader = Downloader::with_platform_and_storage_and_settings(
             DownloaderPlatform {
                 http: Arc::new(MockHttpClient::new()),
                 rate_limiter: Arc::new(FakeRateLimiter::new()),
-                novels: Arc::new(MemoryNovelRepository::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store)),
                 objects,
                 assets,
                 clock: Arc::new(SystemClock),
@@ -4426,12 +4460,12 @@ is_narou: false
 
         let store = Arc::new(MemoryObjectStore::new());
         let objects: Arc<dyn ObjectStore> = store.clone();
-        let assets: Arc<dyn AssetStore> = store;
+        let assets: Arc<dyn AssetStore> = store.clone();
         let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
             DownloaderPlatform {
                 http: http.clone(),
                 rate_limiter: Arc::new(FakeRateLimiter::new()),
-                novels: Arc::new(MemoryNovelRepository::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
                 objects: objects.clone(),
                 assets,
                 clock: Arc::new(SystemClock),
@@ -4573,7 +4607,7 @@ is_narou: false
         ).unwrap();
         setting.compile();
         let store = Arc::new(MemoryObjectStore::new());
-        let novels = Arc::new(MemoryNovelRepository::new());
+        let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
         let persistence = PersistenceService::new(store.clone());
         let keys = NovelObjectKeys::new("Diff Test", "n1234ab", false).unwrap();
         let settings: Arc<dyn DownloaderSettings> = Arc::new(SnapshotDownloaderSettings::default());
@@ -4724,7 +4758,7 @@ is_narou: false
         let target = "https://example.com/n1234ab/";
         let section_url = "https://example.com/n1234ab/1/";
         let store = Arc::new(MemoryObjectStore::new());
-        let novels = Arc::new(MemoryNovelRepository::new());
+        let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
         let http = Arc::new(MockHttpClient::new());
         let persistence = PersistenceService::new(store.clone());
         let mut record_id = None;
@@ -4821,7 +4855,7 @@ is_narou: false
             setting.compile();
             let target = "https://example.com/n1234ab/";
             let store = Arc::new(MemoryObjectStore::new());
-            let novels = Arc::new(MemoryNovelRepository::new());
+            let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
             let http = Arc::new(MockHttpClient::new());
             http.add_text(
                 target,
@@ -4960,7 +4994,7 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
         let inner = Arc::new(MemoryObjectStore::new());
         let requests = Arc::new(AtomicUsize::new(0));
         let objects = Arc::new(CountedStore { inner: inner.clone(), requests: requests.clone() });
-        let novels = Arc::new(MemoryNovelRepository::new());
+        let novels = Arc::new(MemoryNovelRepository::new().with_objects(inner.clone()));
         let keys = NovelObjectKeys::new("Long Resume", "n1234ab", false).unwrap();
         let test_objects: Arc<dyn ObjectStore> = objects.clone();
         let test_assets: Arc<dyn AssetStore> = inner.clone();
@@ -5129,12 +5163,12 @@ is_narou: false
         http.add_text(section_2, 200, r#"<div class="body">本文2</div>"#);
         let store = Arc::new(MemoryObjectStore::new());
         let objects: Arc<dyn ObjectStore> = store.clone();
-        let assets: Arc<dyn AssetStore> = store;
+        let assets: Arc<dyn AssetStore> = store.clone();
         let mut downloader = Downloader::with_platform_and_storage_and_settings(
             DownloaderPlatform {
                 http: http.clone(),
                 rate_limiter: Arc::new(FakeRateLimiter::new()),
-                novels: Arc::new(MemoryNovelRepository::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
                 objects,
                 assets,
                 clock: Arc::new(FixedClock),
@@ -5389,12 +5423,12 @@ is_narou: false
         http.add_text(section_3, 200, r#"<div class="body">本文3</div>"#);
         let store = Arc::new(MemoryObjectStore::new());
         let objects: Arc<dyn ObjectStore> = store.clone();
-        let assets: Arc<dyn AssetStore> = store;
+        let assets: Arc<dyn AssetStore> = store.clone();
         let mut downloader = Downloader::with_platform_and_storage_and_settings(
             DownloaderPlatform {
                 http: http.clone(),
                 rate_limiter: Arc::new(FakeRateLimiter::new()),
-                novels: Arc::new(MemoryNovelRepository::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
                 objects,
                 assets,
                 clock: Arc::new(SystemClock),
@@ -5569,12 +5603,12 @@ is_narou: false
 
         let store = Arc::new(MemoryObjectStore::new());
         let objects: Arc<dyn ObjectStore> = store.clone();
-        let assets: Arc<dyn AssetStore> = store;
+        let assets: Arc<dyn AssetStore> = store.clone();
         let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
             DownloaderPlatform {
                 http: http.clone(),
                 rate_limiter: Arc::new(FakeRateLimiter::new()),
-                novels: Arc::new(MemoryNovelRepository::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
                 objects: objects.clone(),
                 assets,
                 clock: Arc::new(SystemClock),
@@ -5767,7 +5801,7 @@ is_narou: false
         let keys = NovelObjectKeys::new("Image Budget Test", "n1234ab", false).unwrap();
         for force in [false, true] {
             let store = Arc::new(MemoryObjectStore::new());
-            let novels = Arc::new(MemoryNovelRepository::new());
+            let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
             let test_objects: Arc<dyn ObjectStore> = store.clone();
             let test_assets: Arc<dyn AssetStore> = store.clone();
             let origin = NovelWriteGuard::capture_for(&test_objects, Some(&test_assets), &keys).await.unwrap();
@@ -5910,12 +5944,12 @@ is_narou: false
 
         let store = Arc::new(MemoryObjectStore::new());
         let objects: Arc<dyn ObjectStore> = store.clone();
-        let assets: Arc<dyn AssetStore> = store;
+        let assets: Arc<dyn AssetStore> = store.clone();
         let mut downloader = Downloader::with_platform_and_storage_and_settings(
             DownloaderPlatform {
                 http: http.clone(),
                 rate_limiter: Arc::new(FakeRateLimiter::new()),
-                novels: Arc::new(MemoryNovelRepository::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
                 objects: objects.clone(),
                 assets: assets.clone(),
                 clock: Arc::new(SystemClock),
@@ -6053,7 +6087,7 @@ is_narou: false
             DownloaderPlatform {
                 http: Arc::new(MockHttpClient::new()),
                 rate_limiter: Arc::new(FakeRateLimiter::new()),
-                novels: Arc::new(MemoryNovelRepository::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
                 objects: store.clone(), assets: store, clock: Arc::new(SystemClock),
             },
             Vec::new(), HashMap::new(),
@@ -7466,8 +7500,8 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
 "#).unwrap();
         setting.compile();
         let record: crate::db::NovelRecord = serde_yaml::from_str("id: 1\nauthor: Author\ntitle: Original\nfile_title: n1234ab\ntoc_url: https://example.com/n1234ab/\nsitename: Fence Test\nlast_update: 2026-01-01T00:00:00Z\n").unwrap();
-        let repository = Arc::new(MemoryNovelRepository::from_records(vec![record.clone()]));
         let store = Arc::new(MemoryObjectStore::new());
+        let repository = Arc::new(MemoryNovelRepository::from_records(vec![record.clone()]).with_objects(store.clone()));
         let keys = NovelObjectKeys::new("Fence Test", "n1234ab", false).unwrap();
         let http = MockHttpClient::new();
         http.add_text("https://example.com/n1234ab/", 200, "<h1>Original</h1><span>Author</span><a href=\"/n1234ab/1/\">episode</a>");
@@ -7504,8 +7538,8 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
         // A transfer may claim either its URL or the same physical prefix
         // while that fetch awaits; a fresh late capture must not bless it.
         for claimed_url in ["https://example.com/n1234ab/", "https://example.com/different-url/"] {
-            let repository = Arc::new(MemoryNovelRepository::new());
             let store = Arc::new(MemoryObjectStore::new());
+            let repository = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
             let keys = NovelObjectKeys::new("Fence Test", "n1234ab", false).unwrap();
             let imported: crate::db::NovelRecord = serde_yaml::from_str(&format!(
                 "id: 1\nauthor: Author\ntitle: Original\nfile_title: n1234ab\ntoc_url: {claimed_url}\nsitename: Fence Test\nlast_update: 2026-01-01T00:00:00Z\n",
@@ -7575,8 +7609,8 @@ body_pattern: '<div class="body">(?<body>.+?)</div>'
 "#).unwrap();
         setting.compile();
         let record: crate::db::NovelRecord = serde_yaml::from_str("id: 1\nauthor: Author\ntitle: Original\nfile_title: n1234ab\ntoc_url: https://example.com/n1234ab/\nsitename: Removed Test\nlast_update: 2026-01-01T00:00:00Z\n").unwrap();
-        let repository = Arc::new(MemoryNovelRepository::from_records(vec![record.clone()]));
         let store = Arc::new(MemoryObjectStore::new());
+        let repository = Arc::new(MemoryNovelRepository::from_records(vec![record.clone()]).with_objects(store.clone()));
         let http = MockHttpClient::new();
         http.add_text("https://example.com/n1234ab/", 200, "<h1>Original</h1><span>Author</span><a href=\"/n1234ab/1/\">episode</a>");
         http.add_text("https://example.com/n1234ab/1/", 200, "<div class=\"body\">fetched body</div>");

@@ -145,6 +145,16 @@ impl MemoryObjectStore {
         Self::default()
     }
 
+    /// Separate payload/stage storage with the same admission, epoch and reader authority.
+    pub fn new_with_shared_authority(authority: &Self) -> Self {
+        Self {
+            objects: Mutex::default(),
+            stage: MemoryStage::default(),
+            gates: authority.gates.clone(),
+            verified: Mutex::default(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.objects.lock().len()
     }
