@@ -30,6 +30,7 @@
 //!   `not_supported_on_worker` を返す (成功を偽装しない)。
 
 use std::collections::HashMap;
+use narou_rs::application::novel_access::{NovelReadScope, NovelWriteGuard};
 
 use narou_rs::application::ApplicationError;
 use narou_rs::application::aliases::resolve_alias_target;
@@ -195,13 +196,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
 
 /// native `map_application_error` (`src/web/novels.rs`) と同じステータス割当。
 fn map_application_error(error: ApplicationError) -> worker::Result<Response> {
-    let (status, code, message) = match error {
-        ApplicationError::InvalidRequest(message) => (400, "bad_request", message),
-        ApplicationError::Conflict(message) => (409, "conflict", message),
-        ApplicationError::NotFound(message) => (404, "not_found", message),
-        ApplicationError::Platform(message) => (500, "internal_error", message),
-    };
-    json_error(status, code, Some(&message))
+    super::application_error_response(&error)
 }
 
 /// native `ApiResponse` を JSON ボディとして返す (ステータスは native 同様 200)。
@@ -214,6 +209,8 @@ fn api_json_response(success: bool, message: impl Into<String>) -> worker::Resul
 // ---------------------------------------------------------------------------
 
 async fn get_story(req: &Request, runtime: &WorkerRuntime) -> worker::Result<Response> {
+    let mut scope = runtime.services.content.read_scope("web-content");
+    let result = async {
     let url = req.url()?;
     let id_str = match query_param(&url, "id") {
         Some(id) => id,
@@ -224,7 +221,7 @@ async fn get_story(req: &Request, runtime: &WorkerRuntime) -> worker::Result<Res
         Err(_) => return json_error(400, "bad_request", Some("invalid id")),
     };
 
-    let record = match runtime.services.library.get(NovelId(id)).await {
+    let record = match runtime.services.content.read_record(&mut scope, NovelId(id)).await {
         Ok(record) => record,
         Err(error) => return map_application_error(error),
     };
@@ -232,7 +229,7 @@ async fn get_story(req: &Request, runtime: &WorkerRuntime) -> worker::Result<Res
         return json_error(404, "not_found", Some(&format!("ID: {}", id)));
     };
 
-    let toc = match runtime.services.content.toc(NovelId(id)).await {
+    let toc = match runtime.services.content.toc(&mut scope, NovelId(id)).await {
         Ok(bytes) => bytes
             .and_then(|bytes| serde_yaml::from_slice::<narou_rs::downloader::TocObject>(&bytes).ok()),
         Err(error) => return map_application_error(error),
@@ -246,6 +243,8 @@ async fn get_story(req: &Request, runtime: &WorkerRuntime) -> worker::Result<Res
     };
 
     Response::from_json(&json!({ "title": title, "story": story }))
+    }.await;
+    super::leased_response(result, scope).await
 }
 
 // ---------------------------------------------------------------------------
@@ -314,36 +313,33 @@ async fn resolve_diff_target_id(
 // ---------------------------------------------------------------------------
 
 async fn diff_list_get(req: &Request, runtime: &WorkerRuntime) -> worker::Result<Response> {
-    let url = req.url()?;
-    let html = match query_param(&url, "target").as_deref() {
-        Some(target) => diff_list_html_for_target(runtime, target).await,
-        None => String::new(),
-    };
-    Response::from_html(html)
+    let mut scope = runtime.services.content.read_scope("diff-catalog");
+    let result = async {
+        let url = req.url()?;
+        let html = match query_param(&url, "target").as_deref() {
+            Some(target) => match diff_list_html_for_target(&mut scope, runtime, target).await {
+                Ok(html) => html,
+                Err(error) => return json_error(503, "novel_unavailable", Some(&error.to_string())),
+            },
+            None => String::new(),
+        };
+        Response::from_html(html)
+    }.await;
+    super::leased_response(result, scope).await
 }
 
-/// 解決失敗・記録なし・列挙失敗は native と同じ空文字列。保存済みの
-/// バージョンの分類と本文デコードは共通のカタログに任せる。
-async fn diff_list_html_for_target(runtime: &WorkerRuntime, target: &str) -> String {
-    let Some(id) = resolve_existing_id(runtime, target).await else {
-        return String::new();
-    };
-    let Ok(Some(record)) = runtime.services.library.get(id.into()).await else {
-        return String::new();
-    };
-    let Ok(object_keys) = NovelObjectKeys::new(
-        &record.sitename,
-        &record.file_title,
-        record.use_subdirectory,
-    ) else {
-        return String::new();
-    };
-    let Ok(versions) =
-        read_diff_cache_catalog(runtime.objects().as_ref(), object_keys.prefix(), &[]).await
-    else {
-        return String::new();
-    };
-    render_diff_list_html(&versions)
+async fn diff_list_html_for_target(
+    scope: &mut NovelReadScope,
+    runtime: &WorkerRuntime,
+    target: &str,
+) -> narou_rs::error::Result<String> {
+    let Some(id) = resolve_existing_id(runtime, target).await else { return Ok(String::new()); };
+    let record = runtime.services.content.read_record(scope, id.into()).await
+        .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))?;
+    let Some(record) = record else { return Ok(String::new()); };
+    let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+    let versions = read_diff_cache_catalog(scope, runtime.objects().as_ref(), keys.prefix(), &[]).await?;
+    Ok(render_diff_list_html(&versions))
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +347,8 @@ async fn diff_list_html_for_target(runtime: &WorkerRuntime, target: &str) -> Str
 // ---------------------------------------------------------------------------
 
 async fn diff_list_post(req: &mut Request, runtime: &WorkerRuntime) -> worker::Result<Response> {
+    let mut scope = runtime.services.content.read_scope("web-content");
+    let result = async {
     let body: TargetsBody = match req.json().await {
         Ok(body) => body,
         Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
@@ -365,15 +363,24 @@ async fn diff_list_post(req: &mut Request, runtime: &WorkerRuntime) -> worker::R
             Ok(id) => id,
             Err(_) => continue,
         };
-        let record = runtime.services.library.get(id.into()).await.ok().flatten();
+        let record = match runtime.services.content.read_record(&mut scope, id.into()).await {
+            Ok(record) => record,
+            Err(error) => return map_application_error(error),
+        };
         let Some(record) = record else {
             diffs.push(diff_missing_entry(id));
             continue;
         };
-        let content = diff_content_label(runtime.services.content.diff(id.into()).await);
+        let bytes = match runtime.services.content.diff(&mut scope, id.into()).await {
+            Ok(bytes) => bytes,
+            Err(error) => return map_application_error(error),
+        };
+        let content = diff_content_label::<ApplicationError>(Ok(bytes));
         diffs.push(diff_list_entry(id, &record.title, &content));
     }
     Response::from_json(&json!({ "diffs": diffs }))
+    }.await;
+    super::leased_response(result, scope).await
 }
 
 // ---------------------------------------------------------------------------
@@ -415,12 +422,16 @@ async fn diff_clean(
         return api_json_response(false, DIFF_CLEAN_FAILED);
     };
     let objects = runtime.write_objects();
+    let guard = match NovelWriteGuard::capture_for(&objects, None, &keys).await {
+        Ok(guard) => guard,
+        Err(error) => return api_json_response(false, error.to_string()),
+    };
     let cache_keys = match plan_diff_cache_clean(objects.as_ref(), keys.prefix()).await {
         Ok(keys) => keys,
         Err(_) => return api_json_response(false, DIFF_CLEAN_FAILED),
     };
     for key in cache_keys {
-        if objects.delete(&key).await.is_err() {
+        if guard.delete(&key).await.is_err() {
             return api_json_response(false, DIFF_CLEAN_FAILED);
         }
     }

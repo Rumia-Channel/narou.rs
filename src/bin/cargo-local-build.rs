@@ -30,6 +30,9 @@ fn run() -> Result<(), String> {
     let backup_binary = target_release_dir.join(format!("narou_rs_backup{exe_suffix}"));
     let login_binary = target_release_dir.join(format!("narou_rs_login{exe_suffix}"));
     let mcp_binary = target_release_dir.join(format!("narou_rs_mcp{exe_suffix}"));
+    // A local package must ship with the real browser transfer codec; building
+    // it is part of the package, not an optional extra (no fallback path).
+    build_transfer_wasm_artifacts(&root)?;
 
     build_release_binary(&options, "narou_rs_updater")?;
     build_release_binary(&options, "narou_rs_backup")?;
@@ -113,7 +116,19 @@ fn build_app_binary(options: &Options, updater_hash: &str) -> Result<(), String>
     command.env("NAROU_RS_RELEASE_BUILD", "1");
     command.env("NAROU_RS_LOCAL_BUILD", "1");
     command.env("NAROU_RS_UPDATER_SHA256", updater_hash);
+    command.env("NAROU_RS_REQUIRE_TRANSFER_ARTIFACTS", "1");
     run_command(&mut command, "failed to build narou_rs")
+}
+
+/// Runs `scripts/build-transfer-wasm.mjs` so `build.rs` can embed the real
+/// browser codec (glue/wasm/worker). Fails closed like the rest of the
+/// package: a distributable build without the artifacts must not silently
+/// degrade, and there is no server-side ZIP path to fall back to.
+fn build_transfer_wasm_artifacts(root: &Path) -> Result<(), String> {
+    let script = root.join("scripts").join("build-transfer-wasm.mjs");
+    let mut command = Command::new("node");
+    command.arg(&script).current_dir(root);
+    run_command(&mut command, "failed to build transfer WASM artifacts")
 }
 
 fn cargo_build_command(options: &Options) -> Command {

@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
 use narou_rs::db;
-use narou_rs::db::paths::novel_dir_for_record;
+use narou_rs::application::novel_access::NovelWriteGuard;
 use narou_rs::illustration_store;
-use narou_rs::platform::{AssetStore, ObjectStore, StoreMigrationState};
+use narou_rs::platform::StoreMigrationState;
 
 use super::download;
 use super::log;
@@ -54,69 +53,41 @@ async fn cmd_illust_inner(
         _ => {}
     }
 
-    let dirs = resolve_target_dirs(targets, all)?;
+    let origins = resolve_target_origins(targets, all)?;
 
-    if dirs.is_empty() {
+    if origins.is_empty() {
         println!("対象の小説が見つかりませんでした。");
         return Ok(());
     }
 
-    let total = dirs.len();
-    for (idx, dir) in dirs.into_iter().enumerate() {
+    let total = origins.len();
+    for (idx, write) in origins.into_iter().enumerate() {
         if total > 1 {
             println!("---");
         }
+        let dir = narou_rs::native::materialization::directory_for_origin(&write).map_err(|error| error.to_string())?;
         println!("[{} / {}] {}", idx + 1, total, dir.display());
+        let snapshot = narou_rs::native::materialization::NativeMutationSnapshot::begin_with_origin(&dir, write)
+            .map_err(|error| error.to_string())?;
         match sub {
-            IllustSubcommand::Orphan => run_orphan(&dir, force)?,
-            IllustSubcommand::Migrate => run_migrate(&dir, force)?,
-            IllustSubcommand::FixExt => run_fix_ext(&dir, force)?,
-            IllustSubcommand::Rebuild => run_rebuild(&dir)?,
+            IllustSubcommand::Orphan => run_orphan(snapshot.path(), force)?,
+            IllustSubcommand::Migrate => run_migrate(snapshot.path(), force)?,
+            IllustSubcommand::FixExt => run_fix_ext(snapshot.path(), force)?,
+            IllustSubcommand::Rebuild => run_rebuild(snapshot.path())?,
             // ライブラリ全体の操作なので、この小説単位のループには来ない
             // (手前で return する)。
             IllustSubcommand::S3Push | IllustSubcommand::S3Verify | IllustSubcommand::S3Dedup => {
                 unreachable!("S3 subcommands run before the per-novel loop")
             }
         }
+        if force || sub == IllustSubcommand::Rebuild {
+            snapshot.publish_changes().map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
 
 
-/// 移行用のストア (移行元 = ローカル、移行先 = S3)。
-///
-/// 挿絵の保存先が S3 になっていなければ失敗させる。ここでローカルへ
-/// フォールバックすると、利用者が「移行した」と誤解する。
-#[allow(clippy::type_complexity)]
-fn s3_migration_stores() -> Result<
-    (
-        Arc<dyn ObjectStore>,
-        Arc<dyn AssetStore>,
-        Arc<dyn ObjectStore>,
-        Arc<dyn AssetStore>,
-    ),
-    String,
-> {
-    let root = narou_rs::db::inventory::Inventory::with_default_root()
-        .map_err(|error| error.to_string())?
-        .root_dir()
-        .to_path_buf();
-    let local = Arc::new(
-        narou_rs::native::object_store::NativeStore::for_narou_root(&root)
-            .map_err(|error| error.to_string())?,
-    );
-    let s3 = narou_rs::native::s3::illustration_store()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            "挿絵の保存先が S3 になっていません (narou setting s3.asset-backend=s3 と S3 の接続情報が必要です)"
-                .to_string()
-        })?;
-    let from_objects: Arc<dyn ObjectStore> = local.clone();
-    let from_assets: Arc<dyn AssetStore> = local;
-    let to_objects: Arc<dyn ObjectStore> = s3.clone();
-    let to_assets: Arc<dyn AssetStore> = s3;
-    Ok((from_objects, from_assets, to_objects, to_assets))
-}
 
 fn report_migration_failures(state: &StoreMigrationState) {
     if state.failed.is_empty() {
@@ -133,20 +104,8 @@ fn report_migration_failures(state: &StoreMigrationState) {
 
 /// 挿絵をローカルから S3 へ写す。既定は数えるだけで、`--force` で実行する。
 async fn run_s3_push(force: bool) -> Result<(), String> {
-    let (from_objects, from_assets, to_objects, to_assets) = s3_migration_stores()?;
     let action = if force { "copy" } else { "plan" };
-    let mut state = StoreMigrationState::default();
-    while !state.done {
-        narou_rs::platform::migrate_page(
-            &from_objects,
-            &from_assets,
-            &to_assets,
-            &to_objects,
-            action,
-            narou_rs::platform::store_migration::DEFAULT_LIMIT,
-            &mut state,
-        ).await.map_err(|error| error.to_string())?;
-    }
+    let state = narou_rs::native::illustrations::migrate_illustrations(action).await.map_err(|error| error.to_string())?;
     if force {
         println!("S3 へ写しました: {} 件", state.copied);
     } else {
@@ -161,19 +120,7 @@ async fn run_s3_push(force: bool) -> Result<(), String> {
 
 /// ローカルと S3 の挿絵をバイト単位で突き合わせる (書き込みはしない)。
 async fn run_s3_verify() -> Result<(), String> {
-    let (from_objects, from_assets, to_objects, to_assets) = s3_migration_stores()?;
-    let mut state = StoreMigrationState::default();
-    while !state.done {
-        narou_rs::platform::migrate_page(
-            &from_objects,
-            &from_assets,
-            &to_assets,
-            &to_objects,
-            "verify",
-            narou_rs::platform::store_migration::DEFAULT_LIMIT,
-            &mut state,
-        ).await.map_err(|error| error.to_string())?;
-    }
+    let state = narou_rs::native::illustrations::migrate_illustrations("verify").await.map_err(|error| error.to_string())?;
     println!("一致: {} 件", state.verified);
     report_migration_failures(&state);
     Ok(())
@@ -184,22 +131,8 @@ async fn run_s3_verify() -> Result<(), String> {
 /// `pool_exists` で確認後、legacy の実オブジェクトを `delete`。
 /// 既定は dry-run (pool へ写さず件数だけ数える)。
 async fn run_s3_dedup(force: bool) -> Result<(), String> {
-    let s3 = narou_rs::native::s3::illustration_store()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            "挿絵の保存先が S3 になっていません (narou setting s3.asset-backend=s3 と S3 の接続情報が必要です)"
-                .to_string()
-        })?;
-    let mut state = narou_rs::platform::IllustrationDedupState::default();
     let action = if force { "copy" } else { "plan" };
-    while !state.done {
-        narou_rs::platform::deduplicate_illustrations_page(
-            s3.as_ref(),
-            action,
-            narou_rs::platform::store_migration::MAX_LIMIT,
-            &mut state,
-        ).await.map_err(|error| error.to_string())?;
-    }
+    let state = narou_rs::native::illustrations::deduplicate_illustrations(action).await.map_err(|error| error.to_string())?;
 
     if !force {
         println!(
@@ -224,72 +157,41 @@ async fn run_s3_dedup(force: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_target_dirs(targets: &[String], all: bool) -> Result<Vec<PathBuf>, String> {
-    if all {
-        return collect_all_novel_dirs();
-    }
-    if targets.is_empty() {
-        let Some(target) = super::latest_convert_target() else {
-            return Ok(Vec::new());
-        };
-        let Some(dir) = resolve_novel_dir(&target) else {
-            log::report_error(&format!("{} は存在しません", target));
-            return Ok(Vec::new());
-        };
-        return Ok(vec![dir]);
-    }
-
-    let expanded = download::tagname_to_ids(targets);
-    let mut dirs = Vec::new();
-    for target in expanded {
-        let Some(dir) = resolve_novel_dir(&target) else {
-            log::report_error(&format!("{} は存在しません", target));
-            continue;
-        };
-        dirs.push(dir);
-    }
-    Ok(dirs)
-}
-
-fn collect_all_novel_dirs() -> Result<Vec<PathBuf>, String> {
-    let frozen_ids = narou_rs::compat::load_frozen_ids().map_err(|e| e.to_string())?;
-    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let ids = novels
-        .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
-        .map_err(|e| e.to_string())?;
-    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-        .map_err(|e| e.to_string())?;
-    let mut dirs = Vec::new();
-    for id in ids {
-        let Ok(Some(record)) = novels.get_sync(id) else {
-            continue;
-        };
-        if narou_rs::compat::record_is_frozen(&record, &frozen_ids) {
-            continue;
+fn resolve_target_origins(targets: &[String], all: bool) -> Result<Vec<NovelWriteGuard>, String> {
+    if all { return collect_all_novel_origins(); }
+    let targets = if targets.is_empty() {
+        super::latest_convert_target().into_iter().collect()
+    } else {
+        download::tagname_to_ids(targets)
+    };
+    let mut origins = Vec::new();
+    for target in targets {
+        match resolve_novel_origin(&target)? {
+            Some(write) => origins.push(write),
+            None => log::report_error(&format!("{} は存在しません", target)),
         }
-        dirs.push(novel_dir_for_record(&archive_root, &record));
     }
-    Ok(dirs)
+    Ok(origins)
 }
 
-fn resolve_novel_dir(target: &str) -> Option<PathBuf> {
-    let id = super::resolve_target_to_id(target)?;
+fn collect_all_novel_origins() -> Result<Vec<NovelWriteGuard>, String> {
+    let frozen_ids = narou_rs::compat::load_frozen_ids().map_err(|error| error.to_string())?;
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let record = novels.get_sync(id.into()).ok().flatten()?;
-    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-        .unwrap_or_else(|_| PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
-    Some(novel_dir_for_record(&archive_root, &record))
+    let ids = novels.scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX).map_err(|error| error.to_string())?;
+    let mut origins = Vec::new();
+    for record in novels.get_many_current_sync(&ids).map_err(|error| error.to_string())?.into_iter().flatten() {
+        if narou_rs::compat::record_is_frozen(&record, &frozen_ids) { continue; }
+        origins.push(narou_rs::native::materialization::capture_write_for_record(&record).map_err(|error| error.to_string())?);
+    }
+    Ok(origins)
+}
+
+fn resolve_novel_origin(target: &str) -> Result<Option<NovelWriteGuard>, String> {
+    let Some(id) = super::resolve_target_to_id(target) else { return Ok(None); };
+    narou_rs::native::materialization::capture_write_for_id(id).map(Some).map_err(|error| error.to_string())
 }
 
 fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {
-    if !archive_path.join("挿絵").is_dir() {
-        // 実体がローカルに無い構成では、ストア上のオブジェクトを直接調べる。
-        let scan =
-            narou_rs::native::illustrations::scan_stored_illustrations_blocking(archive_path)
-                .map_err(|e| e.to_string())?;
-        return run_orphan_scan(archive_path, scan, force);
-    }
-
     let orphans =
         illustration_store::find_orphan_illustrations(archive_path).map_err(|e| e.to_string())?;
     if orphans.is_empty() {
@@ -299,7 +201,7 @@ fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {
     println!("  孤児挿絵: {} 件", orphans.len());
     for path in &orphans {
         if force {
-            match remove_illustration_or_local(path) {
+            match std::fs::remove_file(path).map_err(|error| error.to_string()) {
                 Ok(()) => println!("  [削除] {}", path.display()),
                 Err(err) => {
                     log::report_error(&format!("{} の削除に失敗しました: {}", path.display(), err))
@@ -315,85 +217,9 @@ fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// ストア上のオブジェクトを対象にした孤児の表示・削除。
-fn run_orphan_scan(
-    archive_path: &Path,
-    scan: narou_rs::native::illustrations::StoredIllustrationScan,
-    force: bool,
-) -> Result<(), String> {
-    if scan.total == 0 || scan.orphans.is_empty() {
-        println!("  孤児挿絵はありません。");
-        return Ok(());
-    }
-    println!("  孤児挿絵: {} 件", scan.orphans.len());
-    let stores = native_stores()?;
-    for (filename, key) in &scan.orphans {
-        let display = archive_path.join("挿絵").join(filename);
-        if force {
-            match futures::executor::block_on(narou_rs::platform::ObjectStore::delete(
-                stores.objects.as_ref(),
-                key,
-            )) {
-                Ok(()) => println!("  [削除] {}", display.display()),
-                Err(err) => log::report_error(&format!(
-                    "{} の削除に失敗しました: {}",
-                    display.display(),
-                    err
-                )),
-            }
-        } else {
-            println!("  {}", display.display());
-        }
-    }
-    if !force {
-        println!("  -f を指定すると実際に削除します。");
-    }
-    Ok(())
-}
 
-/// 挿絵 1 件をストアとローカルの両方から消す。
-///
-/// mirror-files=false ではストアの delete が実ファイルに触れないため、
-/// 残っていればファイルも消す (どちらか一方だけが残ると不整合になる)。
-fn remove_illustration_or_local(path: &Path) -> Result<(), String> {
-    let archive_root = archive_root()?;
-    let stores = native_stores()?;
-    if let Some(key) = narou_rs::native::object_store::object_key_for_file(&archive_root, path) {
-        futures::executor::block_on(narou_rs::platform::ObjectStore::delete(
-            stores.objects.as_ref(),
-            &key,
-        ))
-        .map_err(|e| e.to_string())?;
-    }
-    if path.is_file() {
-        std::fs::remove_file(path).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-fn archive_root() -> Result<PathBuf, String> {
-    let inventory = narou_rs::db::inventory::Inventory::with_default_root()
-        .map_err(|e| e.to_string())?;
-    Ok(inventory
-        .root_dir()
-        .join(narou_rs::downloader::ARCHIVE_ROOT_DIR))
-}
-
-fn native_stores() -> Result<narou_rs::native::object_store::NativeStores, String> {
-    let inventory = narou_rs::db::inventory::Inventory::with_default_root()
-        .map_err(|e| e.to_string())?;
-    narou_rs::native::object_store::NativeStores::for_narou_root(inventory.root_dir())
-        .map_err(|e| e.to_string())
-}
 
 fn run_migrate(archive_path: &Path, force: bool) -> Result<(), String> {
-    if store_backed_illustrations_only(archive_path)? {
-        report_fs_only_operation(
-            "legacy ファイル名の移行",
-            Some("S3 上の legacy 配置は `narou illust s3-dedup` で dedup プールへ移せます"),
-        );
-        return Ok(());
-    }
     let plans = illustration_store::plan_legacy_illustration_migrations(archive_path)
         .map_err(|e| e.to_string())?;
     if plans.is_empty() {
@@ -422,21 +248,11 @@ fn run_migrate(archive_path: &Path, force: bool) -> Result<(), String> {
     }
     let renamed = illustration_store::apply_legacy_illustration_migrations(archive_path)
         .map_err(|e| e.to_string())?;
-    let renames: Vec<(PathBuf, PathBuf)> = plans
-        .iter()
-        .map(|plan| (plan.old_path.clone(), plan.new_path.clone()))
-        .collect();
-    sync_illustration_renames_in_store(&renames)?;
-    push_illustration_index_to_store(archive_path)?;
     println!("  移行完了: {} 件", renamed);
     Ok(())
 }
 
 fn run_fix_ext(archive_path: &Path, force: bool) -> Result<(), String> {
-    if store_backed_illustrations_only(archive_path)? {
-        report_fs_only_operation("拡張子の修正", None);
-        return Ok(());
-    }
     let illust_dir = archive_path.join("挿絵");
     let plans = illustration_store::plan_extension_fixes(&illust_dir).map_err(|e| e.to_string())?;
     if plans.is_empty() {
@@ -461,148 +277,18 @@ fn run_fix_ext(archive_path: &Path, force: bool) -> Result<(), String> {
     }
     let renamed = illustration_store::apply_extension_fixes(&illust_dir, &plans)
         .map_err(|e| e.to_string())?;
-    sync_illustration_renames_in_store(&plans)?;
     println!("  改名完了: {} 件", renamed);
     Ok(())
 }
 
-/// ローカル `挿絵/` に実体が無く、挿絵がストアにだけある構成か。
-fn store_backed_illustrations_only(archive_path: &Path) -> Result<bool, String> {
-    if archive_path.join("挿絵").is_dir() {
-        return Ok(false);
-    }
-    let count = narou_rs::native::illustrations::stored_illustration_count_blocking(archive_path)
-        .map_err(|e| e.to_string())?;
-    Ok(count > 0)
-}
-
-fn report_fs_only_operation(operation: &str, hint: Option<&str>) {
-    println!("  挿絵はローカルに無く、ストア (SQLite/S3) に保存されています。");
-    println!(
-        "  「{operation}」はローカルの実体を対象にする操作のため、この構成では実行できません。"
-    );
-    if let Some(hint) = hint {
-        println!("  {hint}");
-    }
-}
-
-/// ローカルで改名した挿絵を、ストア側のキーにも反映する。
-///
-/// mirror-files=true / S3 構成では DB 行や S3 オブジェクトのキーは改名に
-/// 追随しないため、旧キーが保管されている場合だけ copy → delete する。
-/// (純 YAML 構成では改名済みで旧キーが無いので何もしない。)
-fn sync_illustration_renames_in_store(renames: &[(PathBuf, PathBuf)]) -> Result<(), String> {
-    if renames.is_empty() {
-        return Ok(());
-    }
-    let archive_root = archive_root()?;
-    let stores = native_stores()?;
-    for (old_path, new_path) in renames {
-        let Some(old_key) = narou_rs::native::object_store::object_key_for_file(&archive_root, old_path)
-        else {
-            continue;
-        };
-        let Some(new_key) = narou_rs::native::object_store::object_key_for_file(&archive_root, new_path)
-        else {
-            continue;
-        };
-        let stored =
-            futures::executor::block_on(narou_rs::platform::AssetStore::stat(stores.assets.as_ref(), &old_key))
-                .map_err(|e| e.to_string())?;
-        if stored.is_none() {
-            continue;
-        }
-        futures::executor::block_on(narou_rs::platform::AssetStore::copy(
-            stores.assets.as_ref(),
-            &old_key,
-            &new_key,
-        ))
-        .map_err(|e| e.to_string())?;
-        futures::executor::block_on(narou_rs::platform::AssetStore::delete(
-            stores.assets.as_ref(),
-            &old_key,
-        ))
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// ローカルの索引ファイルをストアの `.illustration_cache.yaml` へ書き戻す。
-fn push_illustration_index_to_store(archive_path: &Path) -> Result<(), String> {
-    let cache = illustration_store::cache_path(archive_path);
-    let Ok(body) = std::fs::read(&cache) else {
-        return Ok(());
-    };
-    let archive_root = archive_root()?;
-    let Some(prefix) =
-        narou_rs::native::object_store::novel_object_prefix(&archive_root, archive_path)
-    else {
-        return Ok(());
-    };
-    let key = prefix.join(".illustration_cache.yaml").map_err(|e| e.to_string())?;
-    let stores = native_stores()?;
-    futures::executor::block_on(narou_rs::platform::ObjectStore::write_small(
-        stores.objects.as_ref(),
-        &key,
-        body,
-    ))
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
 
 fn run_rebuild(archive_path: &Path) -> Result<(), String> {
-    if !archive_path.join("挿絵").is_dir() {
-        return run_rebuild_via_store(archive_path);
-    }
     let count =
         illustration_store::rebuild_illustration_cache(archive_path).map_err(|e| e.to_string())?;
     println!("  cache 再構築完了: {} エントリ", count);
     Ok(())
 }
 
-/// 実体がストアにだけある構成の索引再構築。
-///
-/// raw HTML と挿絵を含む私有スナップショットで既存の FS 再構築を実行し、
-/// 索引だけを元のストアへ書き戻す。実ディレクトリの生成物には触らない。
-fn run_rebuild_via_store(archive_path: &Path) -> Result<(), String> {
-    let inventory = narou_rs::db::inventory::Inventory::with_default_root()
-        .map_err(|e| e.to_string())?;
-    let archive_root = inventory
-        .root_dir()
-        .join(narou_rs::downloader::ARCHIVE_ROOT_DIR);
-    let snapshot = narou_rs::native::materialization::snapshot(archive_path)
-        .map_err(|e| e.to_string())?;
-    let count = illustration_store::rebuild_illustration_cache(snapshot.path())
-        .map_err(|e| e.to_string())?;
-    let cache = illustration_store::cache_path(snapshot.path());
-    let body = match std::fs::read(&cache) {
-        Ok(body) => body,
-        // エントリ 0 件では flush がファイルを書かない (空の索引を表す)。
-        Err(_) => illustration_index_empty_yaml(),
-    };
-    let Some(prefix) =
-        narou_rs::native::object_store::novel_object_prefix(&archive_root, archive_path)
-    else {
-        return Err("索引の保存先を解決できません".to_string());
-    };
-    let key = prefix.join(".illustration_cache.yaml").map_err(|e| e.to_string())?;
-    let stores = native_stores()?;
-    futures::executor::block_on(narou_rs::platform::ObjectStore::write_small(
-        stores.objects.as_ref(),
-        &key,
-        body,
-    ))
-    .map_err(|e| e.to_string())?;
-    println!("  cache 再構築完了: {} エントリ (ストア保存)", count);
-    Ok(())
-}
-
-/// 空の索引 YAML (`IllustrationIndex::to_cache_yaml` と同じ形式)。
-fn illustration_index_empty_yaml() -> Vec<u8> {
-    narou_rs::illustration_store::IllustrationIndex::default()
-        .to_cache_yaml()
-        .unwrap_or_else(|_| b"version: 2\n".to_vec())
-}
 
 #[cfg(test)]
 mod tests {

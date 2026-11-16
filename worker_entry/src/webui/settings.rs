@@ -75,11 +75,12 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
 // ---------------------------------------------------------------------------
 
 async fn get_settings(services: &AppServices, id: i64) -> worker::Result<Response> {
-    let view = match services.novel_settings.load(id.into()).await {
-        Ok(view) => view,
-        Err(error) => return application_error_response(&error),
+    let mut scope = services.novel_settings.read_scope("web-novel-settings");
+    let result = match services.novel_settings.load(&mut scope, id.into()).await {
+        Ok(view) => Response::from_json(&view.to_json_value(narou_rs::application::webui::capabilities::RuntimeKind::Worker)),
+        Err(error) => application_error_response(&error),
     };
-    Response::from_json(&view.to_json_value(narou_rs::application::webui::capabilities::RuntimeKind::Worker))
+    super::leased_response(result, scope).await
 }
 
 // ---------------------------------------------------------------------------

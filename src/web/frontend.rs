@@ -7,6 +7,67 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 include!(concat!(env!("OUT_DIR"), "/web_asset_versions.rs"));
+include!(concat!(env!("OUT_DIR"), "/web_transfer_artifacts.rs"));
+
+/// `/assets/transfer/manifest.json` — the generated WASM artifact manifest.
+///
+/// `None` when this binary was built without the transfer artifact set
+/// (development build before `scripts/build-transfer-wasm.mjs` ran). The
+/// capabilities endpoint and the UI report the codec as unavailable from this
+/// truth; the raw manifest string is never served in that case either.
+pub fn transfer_asset_manifest() -> Option<&'static str> {
+    TRANSFER_ARTIFACT_MANIFEST
+}
+
+/// Build identity baked into the compiled codec (`codec_info().build_id`).
+/// The UI compares this with the manifest `build_id` it fetched; `None` when
+/// the artifact set is absent.
+pub fn transfer_build_id() -> Option<&'static str> {
+    TRANSFER_ARTIFACT_BUILD_ID
+}
+
+/// ABI verified against the content-hashed artifact set at compile time.
+pub fn transfer_abi_version() -> Option<u32> {
+    TRANSFER_ARTIFACT_ABI_VERSION
+}
+
+/// Serves `/assets/transfer/*` — generated WASM/glue/worker artifacts.
+///
+/// Hashed immutable files are cached for a year; the stable manifest URL is
+/// `no-store` so a stale loader can never pair an old manifest with new
+/// artifacts. Missing artifacts are a plain 404 (fail closed), never a
+/// redirect to any server-side archive endpoint.
+fn transfer_artifact_response(name: &str) -> Response {
+    if name == "manifest.json" {
+        if let Some(manifest) = transfer_asset_manifest() {
+            return (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                manifest,
+            )
+                .into_response();
+        }
+    } else if let Some((content_type, bytes)) = web_transfer_artifact(name) {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            bytes,
+        )
+            .into_response();
+    }
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "Not found",
+    )
+        .into_response()
+}
 
 fn render_page(source: &'static str) -> Html<String> {
     Html(inject_build_info(&apply_asset_versions(source)))
@@ -191,6 +252,11 @@ pub async fn edit_menu_page() -> Html<String> {
 }
 
 pub async fn asset(Path(path): Path<String>) -> Response {
+    // Generated transfer WASM artifacts are dynamic per build, so they live
+    // outside the static table below (exact-name lookup only).
+    if let Some(name) = path.strip_prefix("transfer/") {
+        return transfer_artifact_response(name);
+    }
     // WEB UI assets are embedded at compile time, so this routing table must stay
     // aligned with the files under src/web/assets/.
     let (content_type, body): (&'static str, Cow<'static, [u8]>) = match path.as_str() {
@@ -330,6 +396,10 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                 apply_js_module_versions("js/ui/transfer.js", include_str!("assets/js/ui/transfer.js"))
                     .into_bytes(),
             ),
+        ),
+        "js/ui/transfer-worker.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Borrowed(include_bytes!("assets/js/ui/transfer-worker.js")),
         ),
         "js/ui/transfer-download-sw.js" => (
             "application/javascript; charset=utf-8",
@@ -494,5 +564,73 @@ mod tests {
             let response = super::asset(Path((*path).to_string())).await;
             assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
+    }
+
+    #[test]
+    fn transfer_manifest_matches_embedded_artifact_table() {
+        let Some(manifest) = super::transfer_asset_manifest() else {
+            // Development builds without generated artifacts embed nothing and
+            // must report that absence consistently.
+            assert!(super::transfer_build_id().is_none());
+            assert!(super::web_transfer_artifact("manifest.json").is_none());
+            return;
+        };
+        let json: serde_json::Value = serde_json::from_str(manifest).unwrap();
+        assert_eq!(json["protocol_version"].as_i64(), Some(2));
+        assert!(json["abi_version"].is_i64());
+        let files = json["files"].as_object().expect("files map");
+        assert!(!files.is_empty());
+        for field in ["worker_url", "glue_url", "wasm_url"] {
+            let url = json[field].as_str().expect(field);
+            let name = url
+                .strip_prefix("/assets/transfer/")
+                .expect("artifact URL prefix");
+            assert!(files.contains_key(name), "{field} target {name}");
+            assert!(
+                super::web_transfer_artifact(name).is_some(),
+                "embedded artifact {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_manifest_route_agrees_with_helper() {
+        let response = super::asset(Path("transfer/manifest.json".to_string())).await;
+        assert_eq!(
+            response.status() == StatusCode::OK,
+            super::transfer_asset_manifest().is_some()
+        );
+        if response.status() == StatusCode::OK {
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/json; charset=utf-8"
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_artifact_lookup_is_exact() {
+        for path in ["transfer/", "transfer/../secret", "transfer/nonexistent.js"] {
+            let response = super::asset(Path(path.to_string())).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_wasm_artifact_is_served_with_wasm_mime() {
+        let Some(manifest) = super::transfer_asset_manifest() else {
+            return;
+        };
+        let json: serde_json::Value = serde_json::from_str(manifest).unwrap();
+        let url = json["wasm_url"].as_str().unwrap();
+        let path = url.strip_prefix("/assets/").unwrap();
+        let response = super::asset(Path(path.to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/wasm");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
     }
 }

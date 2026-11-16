@@ -74,6 +74,7 @@ pub(crate) fn replace_records_conn(
         .into_iter()
         .filter(|id| !records.contains_key(id))
         .collect();
+    for id in &stale{super::repository::bind_existing_record_origin(conn,*id)?;}
     // Cascades to novel_tags / frozen_novels per row; chunking the `IN` list
     // turns one statement per removed id into one statement per 200 ids.
     for chunk in stale.chunks(DELETE_CHUNK) {

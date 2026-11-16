@@ -55,11 +55,14 @@ fn cmd_mail_inner(opts: MailOptions, sink: &dyn MessageSink) -> Result<(), i32> 
     };
 
     let send_all = opts.targets.is_empty();
-    let targets = if send_all {
+    let targets = (if send_all {
         collect_all_targets()
     } else {
         expand_targets(&opts.targets)
-    };
+    }).map_err(|error| {
+        sink.emit(Stream::Stderr, &error);
+        127
+    })?;
 
     for target in targets {
         if let Err(e) = send_target_with_setting_interruptible(
@@ -100,58 +103,44 @@ fn mail_interrupt_flag(sink: &dyn MessageSink) -> Result<Arc<AtomicBool>, i32> {
     Ok(flag)
 }
 
-fn collect_all_targets() -> Vec<String> {
-    let frozen_ids = narou_rs::compat::load_frozen_ids().unwrap_or_default();
+fn collect_all_targets() -> Result<Vec<String>, String> {
+    let frozen_ids = narou_rs::compat::load_frozen_ids().map_err(|error| error.to_string())?;
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let mut ids: Vec<i64> = novels
-        .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|id| id.0)
-        .collect();
-    ids.sort_unstable();
-    ids.into_iter()
-        .filter(|id| {
-            novels
-                .get_sync((*id).into())
-                .ok()
-                .flatten()
-                .map(|record| !narou_rs::compat::record_is_frozen(&record, &frozen_ids))
-                .unwrap_or(false)
-        })
-        .map(|id| id.to_string())
-        .collect()
+    let mut ids = novels.scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
+        .map_err(|error| error.to_string())?;
+    ids.sort_unstable_by_key(|id| id.0);
+    let records = novels.get_many_current_sync(&ids).map_err(|error| error.to_string())?;
+    Ok(records.into_iter().flatten()
+        .filter(|record| !narou_rs::compat::record_is_frozen(record, &frozen_ids))
+        .map(|record| record.id.to_string()).collect())
 }
 
-fn expand_targets(targets: &[String]) -> Vec<String> {
+fn expand_targets(targets: &[String]) -> Result<Vec<String>, String> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let all_ids: Vec<i64> = novels
         .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())?
         .into_iter()
         .map(|id| id.0)
         .collect();
     let mut all_sorted = all_ids;
     all_sorted.sort_unstable();
     let attributes_enabled = narou_rs::application::attribute_tags::enabled_native();
-    let tag_ids = |tag_name: &str| -> Vec<i64> {
+    let tag_ids = |tag_name: &str| -> Result<Vec<i64>, String> {
         let filter = narou_rs::platform::NovelFilter {
             tag: Some(tag_name.to_string()),
             attribute_tags_enabled: attributes_enabled,
             ..Default::default()
         };
-        novels
-            .scan_ids_sync(&filter, None, usize::MAX)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|id| id.0)
-            .collect()
+        novels.scan_ids_sync(&filter, None, usize::MAX)
+            .map(|ids| ids.into_iter().map(|id| id.0).collect())
+            .map_err(|error| error.to_string())
     };
 
     let mut expanded = Vec::new();
     for target in targets {
         if let Ok(id) = target.parse::<i64>() {
-            let exists = novels.get_sync(id.into()).ok().flatten().is_some();
+            let exists = novels.get_current_sync(id.into()).map_err(|error| error.to_string())?.is_some();
             if exists {
                 expanded.push(id.to_string());
                 continue;
@@ -159,7 +148,7 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
         }
 
         if let Some(tag_name) = target.strip_prefix("^tag:") {
-            let exclude: std::collections::HashSet<i64> = tag_ids(tag_name).into_iter().collect();
+            let exclude: std::collections::HashSet<i64> = tag_ids(tag_name)?.into_iter().collect();
             if !exclude.is_empty() {
                 expanded.extend(
                     all_sorted
@@ -174,7 +163,7 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
         }
 
         if let Some(tag_name) = target.strip_prefix("tag:") {
-            let ids = tag_ids(tag_name);
+            let ids = tag_ids(tag_name)?;
             if !ids.is_empty() {
                 expanded.extend(ids.iter().map(|id| id.to_string()));
             } else {
@@ -183,7 +172,7 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
             continue;
         }
 
-        let ids = tag_ids(target);
+        let ids = tag_ids(target)?;
         if !ids.is_empty() {
             expanded.extend(ids.iter().map(|id| id.to_string()));
         } else {
@@ -192,8 +181,8 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
     }
 
     let mut seen = std::collections::HashSet::new();
-    expanded
+    Ok(expanded
         .into_iter()
         .filter(|target| seen.insert(target.clone()))
-        .collect()
+        .collect())
 }

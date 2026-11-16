@@ -34,16 +34,83 @@ pub async fn run_scheduled_plan(event: ScheduledEvent, env: &Env) -> Result<()> 
     let runtime = WorkerRuntime::build(env).await.map_err(|error| {
         NarouError::Platform(format!("Worker runtime error: {error}"))
     })?;
+    let removal_error = recover_pending_removals(&runtime).await.err();
+    if let Some(error) = &removal_error { console_warn!("ordinary removal recovery failed: {error}"); }
     if let Err(error) = runtime.collect_expired_assets().await {
         console_warn!("asset staging reaper failed: {error}");
     }
+    let retirement_error = crate::object_migration::collect_legacy_retirements(env, runtime.write_db(), runtime.subrequests.clone()).await.err();
+    if let Some(error) = &retirement_error { console_warn!("legacy object retirement collector failed: {error}"); }
+    // Private transfer stage/ref GC (WorkerRepair's `transfer::collect`).
+    // The caller already holds the heavy MemoryPermit; the collector itself
+    // never runs detached. A failure is reported, not swallowed as success —
+    // the next tick retries the same durable cursor.
+    let transfer_error = crate::transfer::collect(env).await.err();
+    if let Some(error) = &transfer_error { console_warn!("transfer collector failed: {error}"); }
     // DLQ 行きで取り残された行の回収は auto-update の有無と無関係に毎分走らせる。
     // 失敗しても planner は続行する (次の tick で再試行される)。
     let push = PushHubClient::new(env, runtime.subrequests.clone());
     if let Err(error) = reap_stuck_jobs(&runtime, &push).await {
         console_warn!("job reaper failed: {error}");
     }
-    plan_auto_update(&runtime, event.schedule() as u64).await
+    let creation_error = recover_creation_reservations(&runtime).await.err();
+    if let Some(error) = &creation_error { console_warn!("creation reservation recovery failed: {error}"); }
+    // Keep ordinary planning available, but never report a failed collector
+    // invocation as successful after logging it.
+    plan_auto_update(&runtime, event.schedule() as u64).await?;
+    match (transfer_error, retirement_error, removal_error, creation_error) {
+        (Some(error), _, _, _) => Err(NarouError::Platform(error.to_string())),
+        (None, Some(error), _, _) | (None, None, Some(error), _) | (None, None, None, Some(error)) => Err(error),
+        (None, None, None, None) => Ok(()),
+    }
+}
+
+/// A gate owner is the durable intent; this cursor only rotates bounded work
+/// fairly across owners that may still be draining readers or deleting files.
+async fn recover_pending_removals(runtime: &WorkerRuntime) -> Result<()> {
+    let db = runtime.write_db();
+    let previous = db.prepare("SELECT value_json FROM app_state WHERE scope='inv' AND key='ordinary_removal_cursor'")
+        .first::<String>(Some("value_json")).await.map_err(removal_recovery_error)?;
+    let cursor: Option<String> = match previous.as_deref() {
+        Some(value) => serde_json::from_str(value).map_err(removal_recovery_error)?,
+        None => None,
+    };
+    let next = runtime.write_services().novel_actions.recover_removals(cursor.as_deref(), 4, 16)
+        .await.map_err(removal_recovery_error)?;
+    if cursor == next { return Ok(()); }
+    let payload = serde_json::to_string(&next).map_err(removal_recovery_error)?;
+    db.prepare("INSERT INTO app_state(scope,key,value_json) VALUES('inv','ordinary_removal_cursor',?1) ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json WHERE app_state.value_json IS ?2")
+        .bind(&[payload.into(), previous.map(Into::into).unwrap_or(wasm_bindgen::JsValue::NULL)])
+        .map_err(removal_recovery_error)?.run().await.map_err(removal_recovery_error)?;
+    Ok(())
+}
+
+fn removal_recovery_error(error: impl std::fmt::Display) -> NarouError {
+    NarouError::Platform(format!("ordinary removal recovery: {error}"))
+}
+
+/// Terminal checkpoints keep their exact numeric/namespace claim until this
+/// awaited release succeeds; a crashed cancellation cannot lose that proof.
+pub(crate) async fn recover_creation_reservations(runtime: &WorkerRuntime) -> Result<()> {
+    let db = runtime.write_db();
+    let previous = db.prepare("SELECT value_json FROM app_state WHERE scope='inv' AND key='creation_release_cursor'")
+        .first::<String>(Some("value_json")).await.map_err(creation_recovery_error)?;
+    let cursor: Option<String> = match previous.as_deref() {
+        Some(value) => serde_json::from_str(value).map_err(creation_recovery_error)?,
+        None => None,
+    };
+    let (jobs, next) = runtime.ledger.pending_creation_releases(cursor.as_deref(), 4).await?;
+    for job in jobs { crate::consumer::advance_terminal_creation(runtime, &job).await?; }
+    if cursor == next { return Ok(()); }
+    let payload = serde_json::to_string(&next).map_err(creation_recovery_error)?;
+    db.prepare("INSERT INTO app_state(scope,key,value_json) VALUES('inv','creation_release_cursor',?1) ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json WHERE app_state.value_json IS ?2")
+        .bind(&[payload.into(), previous.map(Into::into).unwrap_or(wasm_bindgen::JsValue::NULL)])
+        .map_err(creation_recovery_error)?.run().await.map_err(creation_recovery_error)?;
+    Ok(())
+}
+
+fn creation_recovery_error(error: impl std::fmt::Display) -> NarouError {
+    NarouError::Platform(format!("creation reservation recovery: {error}"))
 }
 
 /// 1 回の cron で reaper が処理する行数の上限。

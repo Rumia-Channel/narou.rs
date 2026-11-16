@@ -53,7 +53,7 @@ pub async fn api_library_backup_status(
 ) -> Json<serde_json::Value> {
     let pending = evaluate_pending(&state);
     match pending {
-        Some(offer) => serde_json::json!({
+        Ok(Some(offer)) => serde_json::json!({
             "pending": true,
             "total_bytes": offer.total_bytes,
             "free_bytes": offer.free_bytes,
@@ -63,11 +63,16 @@ pub async fn api_library_backup_status(
             "running": state.library_backup.running.load(Ordering::Acquire),
         })
         .into(),
-        None => serde_json::json!({
+        Ok(None) => serde_json::json!({
             "pending": false,
             "running": state.library_backup.running.load(Ordering::Acquire),
         })
         .into(),
+        Err(error) => serde_json::json!({
+            "pending": false,
+            "error": error.to_string(),
+            "running": state.library_backup.running.load(Ordering::Acquire),
+        }).into(),
     }
 }
 
@@ -94,11 +99,16 @@ pub async fn api_library_backup(
         "create" => {
             // 既に他経路 (CLI 等) で提案済みなら冪等に成功を返す。
             // marker を直接見て判定する (キャッシュは持たない)。
-            if startup_backup::pending_offer(&root).is_none() {
-                return (
+            match startup_backup::backup_offer_needed(&root) {
+                Ok(false) => return (
                     StatusCode::OK,
                     Json(serde_json::json!({"success": true, "already_done": true})),
-                );
+                ),
+                Err(error) => return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"success": false, "message": error.to_string()})),
+                ),
+                Ok(true) => {},
             }
             if state.library_backup.running.swap(true, Ordering::AcqRel) {
                 return (
@@ -141,9 +151,11 @@ pub async fn api_library_backup(
 }
 
 /// 提案状態を評価する。毎回 marker と容量を見直す。
-fn evaluate_pending(state: &AppState) -> Option<startup_backup::PendingOffer> {
-    let _ = state;
-    crate::logger::find_narou_root().and_then(|root| startup_backup::pending_offer(&root))
+fn evaluate_pending(_state: &AppState) -> crate::error::Result<Option<startup_backup::PendingOffer>> {
+    match crate::logger::find_narou_root() {
+        Some(root) => startup_backup::pending_offer(&root),
+        None => Ok(None),
+    }
 }
 
 /// `narou_rs_backup` をサブプロセスで起動し、出力をコンソールへ流す。
@@ -175,14 +187,15 @@ fn run_backup(
     output: &Path,
     target_console: &str,
 ) -> Result<PathBuf, String> {
+    let output = if output.is_absolute() { output.to_path_buf() } else { root.join(output) };
     if let Some(exe) = startup_backup::backup_exe_path() {
-        run_backup_subprocess(push_server, &exe, root, output, target_console)
+        run_backup_subprocess(push_server, &exe, root, &output, target_console)
     } else {
         push_server.broadcast_echo(
             "narou_rs_backup が見つからないためプロセス内でバックアップします",
             target_console,
         );
-        startup_backup::create_library_backup(root, output).map_err(|e| e.to_string())
+        startup_backup::create_library_backup(root, &output).map_err(|e| e.to_string())
     }
 }
 
@@ -199,6 +212,7 @@ fn run_backup_subprocess(
         .arg(root)
         .arg("--output")
         .arg(output)
+        .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -212,30 +226,33 @@ fn run_backup_subprocess(
     let ps_out = push_server.clone();
     let console = target_console.to_string();
     let stdout_thread = std::thread::spawn(move || {
-        if let Some(out) = stdout {
-            for text in BufReader::new(out).lines().map_while(Result::ok) {
-                ps_out.broadcast_echo(&text, &console);
-            }
-        }
+        let out = stdout.ok_or_else(|| "バックアッププロセスの標準出力がありません".to_string())?;
+        read_backup_completion(BufReader::new(out), |text| ps_out.broadcast_echo(text, &console))
     });
     let ps_err = push_server.clone();
     let console = target_console.to_string();
-    let stderr_thread = std::thread::spawn(move || {
-        if let Some(err) = stderr {
-            for text in BufReader::new(err).lines().map_while(Result::ok) {
-                ps_err.broadcast_echo(&text, &console);
-            }
+    let stderr_thread = std::thread::spawn(move || -> Result<(), String> {
+        let err = stderr.ok_or_else(|| "バックアッププロセスの標準エラー出力がありません".to_string())?;
+        for line in BufReader::new(err).lines() {
+            let text = line.map_err(|error| format!("バックアップ出力の読み取りに失敗: {error}"))?;
+            ps_err.broadcast_echo(&text, &console);
         }
+        Ok(())
     });
 
     let status = child.wait().map_err(|e| e.to_string())?;
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
+    let reported = stdout_thread.join().map_err(|_| "バックアップ標準出力スレッドが異常終了しました".to_string())?;
+    let errors = stderr_thread.join().map_err(|_| "バックアップ標準エラースレッドが異常終了しました".to_string())?;
 
     if status.success() {
-        // 出力ファイル名は narou-backup-<timestamp>.zip。最新を拾う。
-        latest_backup_zip(output)
-            .ok_or_else(|| "バックアップファイルが見つかりません".to_string())
+        errors?;
+        let path = reported?;
+        let actual = path.canonicalize().map_err(|error| format!("バックアップ完了ファイルを開けません: {error}"))?;
+        let expected = output.canonicalize().map_err(|error| error.to_string())?;
+        if actual.parent() != Some(expected.as_path()) || !actual.is_file() {
+            return Err("バックアップ完了パスが指定した保存先と一致しません".into());
+        }
+        Ok(actual)
     } else {
         Err(format!(
             "バックアッププロセスが異常終了しました: {}",
@@ -244,19 +261,53 @@ fn run_backup_subprocess(
     }
 }
 
-fn latest_backup_zip(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("narou-backup-") && n.ends_with(".zip"))
-        })
-        .max_by_key(|path| {
-            path.metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        })
+fn read_backup_completion(reader: impl BufRead, mut echo: impl FnMut(&str)) -> Result<PathBuf, String> {
+    let mut completed = None;
+    for line in reader.lines() {
+        let line = line.map_err(|error| format!("バックアップ出力の読み取りに失敗: {error}"))?;
+        if let Some(json) = line.strip_prefix(startup_backup::BACKUP_RESULT_PREFIX) {
+            if completed.is_some() { return Err("バックアップ完了パスが複数報告されました".into()); }
+            let path: PathBuf = serde_json::from_str(json).map_err(|error| format!("バックアップ完了パスが不正です: {error}"))?;
+            if !path.is_absolute() { return Err("バックアップ完了パスが絶対パスではありません".into()); }
+            completed = Some(path);
+        } else {
+            echo(&line);
+        }
+    }
+    completed.ok_or_else(|| "バックアッププロセスから完了パスが報告されませんでした".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_uses_exact_reported_path_not_a_preexisting_latest_zip() {
+        let output = tempfile::tempdir().unwrap();
+        let old = output.path().join("narou-backup-newer-but-unrelated.zip");
+        std::fs::write(&old, b"old backup").unwrap();
+        let exact = output.path().join("narou-backup-this-run.zip");
+        let line = format!("作成しました\n{}{}\n", startup_backup::BACKUP_RESULT_PREFIX, serde_json::to_string(&exact).unwrap());
+        let mut echoed = Vec::new();
+        assert_eq!(read_backup_completion(line.as_bytes(), |line| echoed.push(line.to_owned())).unwrap(), exact);
+        assert_eq!(echoed, ["作成しました"]);
+        assert!(read_backup_completion("作成しました\n".as_bytes(), |_| {}).is_err());
+    }
+
+    #[test]
+    fn malformed_duplicate_and_truncated_completion_fail_closed() {
+        assert!(read_backup_completion(format!("{}not-json\n", startup_backup::BACKUP_RESULT_PREFIX).as_bytes(), |_| {}).is_err());
+        let path = tempfile::tempdir().unwrap();
+        let marker = format!("{}{}\n", startup_backup::BACKUP_RESULT_PREFIX, serde_json::to_string(path.path()).unwrap());
+        assert!(read_backup_completion(format!("{marker}{marker}").as_bytes(), |_| {}).is_err());
+        let reader = std::io::BufReader::new(FailingRead);
+        assert!(read_backup_completion(reader, |_| {}).is_err());
+    }
+
+    struct FailingRead;
+    impl std::io::Read for FailingRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "lost process output"))
+        }
+    }
 }

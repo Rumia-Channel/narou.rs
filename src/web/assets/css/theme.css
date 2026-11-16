@@ -20,6 +20,13 @@
   --border-radius: 0.25em;
   --transfer-progress-width: 100%;
   --transfer-progress-height: 1em;
+  --transfer-role-list-max-height: 18em;
+  --transfer-role-gap: 0.4em;
+  --transfer-action-gap: 0.5em;
+  --transfer-policy-padding: 0.75em;
+  --transfer-choice-width: 42rem;
+  --transfer-progress-layer: 1048;
+  --transfer-choice-layer: 1049;
   --settings-hidden-control-size: 0.0625rem;
   --settings-hidden-control-clip: 50%;
   --control-focus-width: 0.125rem;

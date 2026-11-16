@@ -16,6 +16,7 @@ INSERT INTO content_garbage(blob_key, not_before)
 SELECT blob_key, ?8 FROM content_objects
 WHERE object_key = ?1 AND blob_key != ?2
 AND (?11 = '*' OR blob_key = ?11)
+AND (?11 = '*' OR NOT EXISTS(SELECT 1 FROM transfer_object_refs WHERE object_key=?1))
 AND COALESCE((SELECT value_json FROM app_state WHERE scope='inv' AND key='content_backend'), '"d1"') IN ('"migrating"','migrating','"s3"','s3')
 AND EXISTS(SELECT 1 FROM content_garbage WHERE blob_key=?2 AND julianday(not_before)>julianday('now'))
 AND (?12 = '' OR EXISTS(SELECT 1 FROM legacy_content_objects WHERE object_key = ?1 AND updated_at = ?12))
@@ -28,6 +29,7 @@ SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10
 WHERE COALESCE((SELECT value_json FROM app_state WHERE scope='inv' AND key='content_backend'), '"d1"') IN ('"migrating"','migrating','"s3"','s3')
 AND EXISTS(SELECT 1 FROM content_garbage WHERE blob_key=?2 AND julianday(not_before)>julianday('now'))
 AND (?11 = '*' OR COALESCE((SELECT blob_key FROM content_objects WHERE object_key = ?1),'') = ?11)
+AND (?11 = '*' OR NOT EXISTS(SELECT 1 FROM transfer_object_refs WHERE object_key=?1))
 AND (?12 = '' OR EXISTS(SELECT 1 FROM legacy_content_objects WHERE object_key = ?1 AND updated_at = ?12))
 ON CONFLICT(object_key) DO UPDATE SET blob_key=excluded.blob_key,size=excluded.size,
 stored_size=excluded.stored_size,encoding=excluded.encoding,crc32=excluded.crc32,
@@ -38,8 +40,9 @@ pub const CUTOVER: &str = r#"
 UPDATE app_state SET value_json='"s3"',value_yaml='s3'
 WHERE scope='inv' AND key='content_backend' AND value_json IN ('"migrating"','migrating')
 AND NOT EXISTS(SELECT 1 FROM legacy_content_objects l LEFT JOIN content_objects c USING(object_key)
-               WHERE c.object_key IS NULL OR c.verified != 1)
-AND NOT EXISTS(SELECT 1 FROM content_objects WHERE verified != 1)
+               WHERE (c.object_key IS NULL OR c.verified != 1) AND NOT EXISTS(SELECT 1 FROM transfer_object_refs r WHERE r.object_key=l.object_key AND r.backend IN ('s3','deleted')))
+AND NOT EXISTS(SELECT 1 FROM content_objects c WHERE verified != 1 AND NOT EXISTS(SELECT 1 FROM transfer_object_refs r WHERE r.object_key=c.object_key AND r.backend IN ('s3','deleted')))
+AND NOT EXISTS(SELECT 1 FROM novel_access_gates WHERE closed=1)
 RETURNING key AS object_key
 "#;
 

@@ -9,7 +9,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 
-use futures::Stream;
+use futures::{Stream, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 
 use crate::error::{NarouError, Result};
@@ -268,11 +268,53 @@ pub enum ObjectFingerprintMismatch<'a> {
 /// `read_small`/`write_small` deliberately make the buffering contract
 /// explicit. Large or generated binary assets use [`AssetStore`] instead.
 pub trait ObjectStore: PlatformService {
+    fn access_fence(&self) -> Option<&dyn super::NovelAccessFence> { None }
+
+    fn read_stream_leased<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a super::GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        let _ = (prefix, lease, key, range);
+        Box::pin(async { Err(NarouError::Platform("leased content reads unsupported".into())) })
+    }
+
+    fn write_small_guarded<'a>(&'a self, fence: &'a super::WriteFence, key: &'a ObjectKey, data: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
+        let _ = (fence, key, data);
+        Box::pin(async { Err(NarouError::Platform("epoch-guarded writes unsupported".into())) })
+    }
+
+    fn update_small_guarded<'a,'data:'a>(&'a self,fence:&'a super::WriteFence,key:&'a ObjectKey,mutate:&'a mut SmallObjectMutator<'data>)->PlatformFuture<'a,Result<ObjectUpdateResult>>{
+        let _=(fence,key,mutate);Box::pin(async{Err(NarouError::Platform("epoch-guarded atomic updates unsupported".into()))})
+    }
+
+    fn delete_guarded<'a>(&'a self, fence: &'a super::WriteFence, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        let _ = (fence, key);
+        Box::pin(async { Err(NarouError::Platform("epoch-guarded deletion unsupported".into())) })
+    }
+    /// Only a drained CLOSED gate with this exact owner/epoch may unlink.
+    fn delete_closed<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{let _=(prefix,owner,epoch,key);Box::pin(async{Err(NarouError::Platform("closed-owner deletion unsupported".into()))})}
+
+    /// Publish a verified explicit pool reference, then retire only obsolete
+    /// legacy physical bytes. This must never tombstone the logical image.
+    fn retire_legacy<'a>(&'a self,logical:&'a ObjectKey,pool:&'a ObjectKey,size:u64,sha256:&'a str)->PlatformFuture<'a,Result<()>>{
+        let _=(logical,pool,size,sha256);Box::pin(async{Err(NarouError::Platform("legacy retirement requires an admitted source adapter".into()))})
+    }
+    fn retire_legacy_guarded<'a>(&'a self,fence:&'a super::WriteFence,logical:&'a ObjectKey,pool:&'a ObjectKey,size:u64,sha256:&'a str)->PlatformFuture<'a,Result<()>>{
+        let _=(fence,logical,pool,size,sha256);Box::pin(async{Err(NarouError::Platform("guarded legacy retirement unsupported".into()))})
+    }
+
     fn stat<'a>(&'a self, key: &'a ObjectKey)
     -> PlatformFuture<'a, Result<Option<ObjectMetadata>>>;
 
     fn exists<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<bool>> {
         Box::pin(async move { Ok(self.stat(key).await?.is_some()) })
+    }
+
+    /// Whether `key` is currently backed by an immutable remote/canonical
+    /// reference rather than directly stored local bytes. Read adapters that
+    /// resolve references transparently override this so callers can
+    /// distinguish "absent" from "served elsewhere". Stores without a
+    /// reference concept answer `false`.
+    fn is_remote_reference<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<bool>> {
+        let _ = key;
+        Box::pin(async { Ok(false) })
     }
 
     fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>>;
@@ -362,6 +404,16 @@ pub trait ObjectStore: PlatformService {
 /// unbounded `Vec`. Implementations may use chunked filesystem, HTTP, or
 /// object-storage streams internally.
 pub trait AssetStore: PlatformService {
+
+    /// Raw legacy-physical GC capabilities, used only after an authoritative
+    /// guarded pool-ref + GC-intent commit. Unsupported stores fail closed.
+    fn legacy_etag<'a>(&'a self,logical:&'a ObjectKey)->PlatformFuture<'a,Result<Option<String>>>{let _=logical;Box::pin(async{Err(NarouError::Platform("legacy physical ETag lookup unsupported".into()))})}
+    fn delete_legacy_if_match<'a>(&'a self,logical:&'a ObjectKey,pool:&'a ObjectKey,etag:&'a str)->PlatformFuture<'a,Result<()>>{let _=(logical,pool,etag);Box::pin(async{Err(NarouError::Platform("conditional legacy physical GC unsupported".into()))})}
+    fn write_stream_guarded<'a>(&'a self, fence: &'a super::WriteFence, key: &'a ObjectKey, stream: AssetStream) -> PlatformFuture<'a, Result<()>> {
+        let _ = (fence, key, stream);
+        Box::pin(async { Err(NarouError::Platform("epoch-guarded asset writes unsupported".into())) })
+    }
+
     fn stat<'a>(&'a self, key: &'a ObjectKey)
     -> PlatformFuture<'a, Result<Option<ObjectMetadata>>>;
 
@@ -383,6 +435,110 @@ pub trait AssetStore: PlatformService {
         key: &'a ObjectKey,
         range: std::ops::Range<u64>,
     ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>>;
+
+    /// Read an exclusive-end byte range of **any** length as a bounded
+    /// stream (each item ≤ 64 KiB).
+    ///
+    /// This is the transfer read path: one 8 MiB HTTP batch must never
+    /// degrade into 128 separate `read_range` calls. Backends with real
+    /// range I/O override the default: S3 issues exactly one `Range` GET,
+    /// DB stores bound every fetched chunk row to the object generation
+    /// pinned when the range was opened, and the filesystem performs one
+    /// `seek`. `range.end == u64::MAX` means "to end of object" — the
+    /// backend resolves the concrete size itself.
+    ///
+    /// The default walks `read_stream` and discards the prefix. It is
+    /// correct but linear in `range.start`; never leave it on a backend
+    /// that can seek or issue range requests.
+    ///
+    /// `Ok(None)` = object absent. Truncated/changed objects and ranges
+    /// exceeding the object are errors, never short silent reads.
+    fn read_stream_range<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        range: std::ops::Range<u64>,
+    ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        let range = range.clone();
+        Box::pin(async move {
+            if range.start >= range.end {
+                return match self.stat(key).await? {
+                    Some(_) => {
+                        let empty: AssetStream =
+                            Box::pin(futures::stream::empty::<Result<AssetChunk>>());
+                        Ok(Some(empty))
+                    }
+                    None => Ok(None),
+                };
+            }
+            let Some(stream) = self.read_stream(key).await? else {
+                return Ok(None);
+            };
+            let to_end = range.end == u64::MAX;
+            let out = futures::stream::try_unfold(
+                (stream, 0u64),
+                move |(mut stream, position)| {
+                    let wanted = range.clone();
+                    async move {
+                        if position >= wanted.end {
+                            return Ok(None);
+                        }
+                        let Some(chunk) = stream.next().await else {
+                            if to_end {
+                                return Ok(None);
+                            }
+                            return Err(NarouError::Platform(
+                                "asset range exceeds object".into(),
+                            ));
+                        };
+                        let chunk = chunk?;
+                        let chunk_start = position;
+                        let chunk_end = position.saturating_add(chunk.len() as u64);
+                        if chunk_end <= wanted.start {
+                            return Ok(Some((Vec::new(), (stream, chunk_end))));
+                        }
+                        let lo = wanted.start.saturating_sub(chunk_start) as usize;
+                        let hi = (wanted.end.min(chunk_end) - chunk_start) as usize;
+                        Ok(Some((chunk[lo..hi].to_vec(), (stream, chunk_end))))
+                    }
+                },
+            )
+            // drop the empty trim items without copying
+            .try_filter_map(|chunk| async move {
+                Ok(if chunk.is_empty() { None } else { Some(chunk) })
+            });
+            Ok(Some(Box::pin(out) as AssetStream))
+        })
+    }
+
+    /// Conditionally write an object that must not already exist, hashing
+    /// the streamed bytes in the same pass and comparing the actual digest
+    /// to `expected_sha256` (lowercase hex) before committing.
+    ///
+    /// This is the write-once contract for hash-named pools (dedup
+    /// illustrations) and for transfer stages that must stay byte-exact:
+    /// * `Ok(WriteOnce::Written)` — the object was absent and is now stored.
+    /// * `Ok(WriteOnce::Reused)` — it already existed with byte-identical
+    ///   content (the caller's hash-named key was right and the bytes are
+    ///   proven, not assumed).
+    /// * `Err` — absent-write precondition failed *and* the existing bytes
+    ///   differ, the actual digest ≠ `expected_sha256`, or the backend
+    ///   lacks a conditional write. There is no unconditional-PUT fallback.
+    ///
+    /// `expected_size` must equal the decoded byte length.
+    fn write_stream_once<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        stream: AssetStream,
+        expected_size: u64,
+        expected_sha256: &'a str,
+    ) -> PlatformFuture<'a, Result<super::transfer_stage::WriteOnce>> {
+        let _ = (key, stream, expected_size, expected_sha256);
+        Box::pin(async {
+            Err(NarouError::Platform(
+                "conditional write-once is unsupported by this store".into(),
+            ))
+        })
+    }
 
     /// Write a private immutable temporary object and hash it in the same pass.
     fn stage_stream<'a>(

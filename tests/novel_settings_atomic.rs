@@ -37,6 +37,15 @@ struct ReadBarrierStore {
 }
 
 impl ObjectStore for ReadBarrierStore {
+    fn access_fence(&self) -> Option<&dyn narou_rs::platform::NovelAccessFence> {
+        self.inner.access_fence()
+    }
+    fn read_stream_leased<'a>(&'a self, prefix: &'a narou_rs::platform::ObjectPrefix, lease: &'a narou_rs::platform::GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<narou_rs::platform::AssetStream>>> {
+        self.inner.read_stream_leased(prefix, lease, key, range)
+    }
+    fn update_small_guarded<'a, 'data: 'a>(&'a self, fence: &'a narou_rs::platform::WriteFence, key: &'a ObjectKey, mutate: &'a mut SmallObjectMutator<'data>) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
+        self.inner.update_small_guarded(fence, key, mutate)
+    }
     fn stat<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
         self.inner.stat(key)
     }
@@ -149,7 +158,9 @@ fn committed_sqlite_settings_are_acknowledged_when_the_mirror_cannot_publish() {
     assert_eq!(result.settings.get("enable_yokogaki"), Some(&Some(IniValue::Boolean(true))));
     assert!(result.failure.is_some());
     assert_eq!(result.to_json_value()["partial"], true);
-    let view = futures::executor::block_on(service.load(NovelId(1))).unwrap();
+    let mut scope = service.read_scope("committed-settings-view");
+    let view = futures::executor::block_on(service.load(&mut scope, NovelId(1))).unwrap();
+    futures::executor::block_on(scope.release_all()).unwrap();
     assert_eq!(view.settings.iter().find(|entry| entry.name == "enable_yokogaki").unwrap().value,
         Some(IniValue::Boolean(true)));
 
@@ -164,6 +175,8 @@ fn committed_sqlite_settings_are_acknowledged_when_the_mirror_cannot_publish() {
     assert_eq!(result.replace_patterns, Some(Vec::new()));
     assert!(result.failure.is_some());
     assert_eq!(result.to_json_value()["partial"], true);
-    let view = futures::executor::block_on(service.load(NovelId(1))).unwrap();
+    let mut scope = service.read_scope("committed-replace-view");
+    let view = futures::executor::block_on(service.load(&mut scope, NovelId(1))).unwrap();
+    futures::executor::block_on(scope.release_all()).unwrap();
     assert!(view.replace_patterns.is_empty());
 }

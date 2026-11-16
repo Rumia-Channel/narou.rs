@@ -318,6 +318,34 @@ async fn run_command(
     let ua = user_agent.clone().or(cli.user_agent);
     logger::use_convert_log_postfix(matches!(&cli.command, Commands::Convert { .. }));
 
+    // 中断した転送公開は他のライブラリ利用より先に回復する (client-transfer §11.2)。
+    // `recover_startup` は DB シングルトンを初期化しないため、ストレージ方式を
+    // 解決した `init_database` の後で呼ぶ。ライブラリを触らないコマンドは除外する。
+    if narou_rs::db::narou_root_exists()
+        && !matches!(
+            &cli.command,
+            Commands::Init { .. }
+                | Commands::Version { .. }
+                | Commands::Trace
+                | Commands::Log { .. }
+                | Commands::Alias { .. }
+                | Commands::Login { .. }
+                | Commands::Api { .. }
+        )
+    {
+        if let Err(error) = narou_rs::db::init_database() {
+            eprintln!("Error initializing database: {error}");
+            return 1;
+        }
+        if let Err(error) = narou_rs::native::transfer::recover_startup() {
+            eprintln!("Error: {error}");
+            return 1;
+        }
+        if let Err(error) = narou_rs::native::application::recover_removals() {
+            eprintln!("Error recovering removals: {error}");
+            return 1;
+        }
+    }
     // サイト定義は保存方式に応じて読み込む（SQLite モードではオブジェクトストア）。
     // 未初期化のディレクトリ (.narou/ が無い) には読み込む対象が無いので、警告を
     // 出さずに飛ばす。init はこの後で .narou/ を作る。
@@ -327,6 +355,7 @@ async fn run_command(
     {
         eprintln!("[WARN] サイト定義の読み込みに失敗しました: {error}");
     }
+
 
     match cli.command {
         Commands::Web {

@@ -37,6 +37,7 @@ pub mod jobs;
 pub mod novel_actions;
 pub mod novel_settings;
 pub mod novel_content;
+pub mod novel_access;
 pub mod scheduler;
 pub mod self_update;
 pub mod settings;
@@ -50,6 +51,8 @@ pub mod favorite_tags;
 pub mod tag_sequence;
 pub mod web_actions;
 pub mod webui;
+#[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
+pub mod transfer;
 pub use jobs::{
     CheckpointClaim, CheckpointState, ExecutionPhase, JobClaim, JobFailureClass, JobId, JobKind,
     JobLedgerStatus, JobPlan, JobPlanResult, JobQueue, JobRequest, JobService, JobTarget,
@@ -60,7 +63,7 @@ pub use jobs::{
 };
 pub use novel_actions::{
     FileDeletionStatus, FreezeMutationStore, FreezeRequest, FreezeResult,
-    MemoryFreezeMutationStore, NoopFreezeMutationStore, NovelActionService,
+    MemoryFreezeMutationStore, NovelActionService,
     RemoveRequest, RemoveResult, TagAction, TagChangeRequest, TagChangeResult,
 };
 pub use novel_settings::{

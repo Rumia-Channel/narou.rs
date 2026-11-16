@@ -1,149 +1,32 @@
-//! Filesystem compatibility wrappers for pre-Phase-4 callers.
-//!
-//! Core downloader persistence uses `PersistenceService` and logical keys. CLI
-//! and Web compatibility APIs still accept `Path` values; those wrappers are
-//! intentionally native-only and preserve the existing layout and guards.
+//! Private filesystem section lookup used by native codecs. Canonical IO belongs
+//! to PersistenceService and its operation-owned reader lease/write guard.
 
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
-
-use crate::downloader::persistence::{
-    compute_section_hash, raw_filename, section_filename,
-};
-use crate::downloader::{SectionElement, SectionFile, SubtitleInfo, TocFile};
+use crate::downloader::SubtitleInfo;
 use crate::error::Result;
 
-pub fn section_needs_update(
-    section_dir: &Path,
-    subtitle: &SubtitleInfo,
-    new_section: &SectionElement,
-) -> bool {
-    let path = section_dir.join(section_filename(subtitle));
-    if !path.exists() {
-        return true;
-    }
-    if let Some(existing) = load_section_file(&path) {
-        return compute_section_hash(&existing.element) != compute_section_hash(new_section);
-    }
-    true
-}
-
-pub fn resolve_section_file_path(section_dir: &Path, subtitle: &SubtitleInfo) -> Option<PathBuf> {
-    let exact = section_dir.join(section_filename(subtitle));
-    if exact.exists() {
-        return Some(exact);
-    }
-    find_section_file_by_index(section_dir, &subtitle.index)
-}
-
-pub fn find_section_file_by_index(section_dir: &Path, index: &str) -> Option<PathBuf> {
-    let prefix = format!("{} ", index);
-    let entries = std::fs::read_dir(section_dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".yaml") {
-            continue;
-        }
-        let stem = &name[..name.len() - 5];
-        if stem == index || stem.starts_with(&prefix) {
-            return Some(entry.path());
-        }
-    }
-    None
-}
-
-pub fn load_section_file(path: &Path) -> Option<SectionFile> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_yaml::from_str(&content).ok()
-}
-
-pub fn save_section_file(
-    section_dir: &Path,
-    subtitle: &SubtitleInfo,
-    section: &SectionElement,
-) -> Result<()> {
-    let section_dir = validate_archive_write_dir(section_dir, 2)?;
-    std::fs::create_dir_all(&section_dir)?;
-    let path = section_dir.join(section_filename(subtitle));
-    let file_data = SectionFile {
-        index: subtitle.index.clone(),
-        href: subtitle.href.clone(),
-        chapter: subtitle.chapter.clone(),
-        subchapter: subtitle.subchapter.clone(),
-        subtitle: subtitle.subtitle.clone(),
-        file_subtitle: subtitle.file_subtitle.clone(),
-        subdate: subtitle.subdate.clone(),
-        subupdate: subtitle.subupdate.clone(),
-        download_time: Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string()),
-        element: section.clone(),
-        download_revision: subtitle.download_revision,
+pub(crate) fn resolve_section_file_path(section_dir: &Path, subtitle: &SubtitleInfo) -> Result<Option<PathBuf>> {
+    crate::application::novel_access::require_private_path(section_dir)?;
+    let exact = section_dir.join(crate::downloader::persistence::section_filename(subtitle));
+    crate::application::novel_access::require_private_path(&exact)?;
+    if exact.try_exists()? { return Ok(Some(exact)); }
+    let prefix = format!("{} ", subtitle.index);
+    let entries = match std::fs::read_dir(section_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
-    let content = crate::downloader::persistence::serialize_section(&file_data)?;
-    crate::db::inventory::atomic_write(&path, &content)?;
-    Ok(())
-}
-
-pub fn save_raw_file(raw_dir: &Path, subtitle: &SubtitleInfo, raw_html: &str) -> Result<()> {
-    if raw_html.is_empty() {
-        return Ok(());
-    }
-    let raw_dir = validate_archive_write_dir(raw_dir, 2)?;
-    std::fs::create_dir_all(&raw_dir)?;
-    let path = raw_dir.join(raw_filename(subtitle));
-    crate::db::inventory::atomic_write(&path, raw_html)?;
-    Ok(())
-}
-
-pub fn move_file_to_dir(path: &Path, dst_dir: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dst_dir)?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| crate::error::NarouError::Io(std::io::Error::other("invalid file name")))?;
-    std::fs::rename(path, dst_dir.join(file_name))?;
-    Ok(())
-}
-
-pub fn remove_dir_if_empty(path: &Path) -> Result<()> {
-    if path.is_dir() && std::fs::read_dir(path)?.next().is_none() {
-        std::fs::remove_dir_all(path)?;
-    }
-    Ok(())
-}
-
-pub fn load_toc_file(novel_dir: &Path) -> Option<TocFile> {
-    let path = novel_dir.join("toc.yaml");
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_yaml::from_str(&content).ok()
-}
-
-pub fn save_toc_file(novel_dir: &Path, toc: &TocFile) -> Result<()> {
-    let novel_dir = validate_archive_write_dir(novel_dir, 1)?;
-    std::fs::create_dir_all(&novel_dir)?;
-    let path = novel_dir.join("toc.yaml");
-    let content = crate::downloader::persistence::serialize_toc(toc)?;
-    crate::db::inventory::atomic_write(&path, &content)?;
-    Ok(())
-}
-
-
-fn validate_archive_write_dir(path: &Path, fallback_depth: usize) -> Result<PathBuf> {
-    let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-        .unwrap_or_else(|_| infer_archive_root(path, fallback_depth));
-    crate::db::paths::ensure_within_archive_root(path, &archive_root)
-}
-
-fn infer_archive_root(path: &Path, fallback_depth: usize) -> PathBuf {
-    let mut current = path.to_path_buf();
-    for _ in 0..fallback_depth {
-        if let Some(parent) = current.parent() {
-            current = parent.to_path_buf();
-        } else {
-            break;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(stem) = name.strip_suffix(".yaml") else { continue; };
+        if stem == subtitle.index || stem.starts_with(&prefix) {
+            let path = entry.path();
+            crate::application::novel_access::require_private_path(&path)?;
+            return Ok(Some(path));
         }
     }
-    current
+    Ok(None)
 }

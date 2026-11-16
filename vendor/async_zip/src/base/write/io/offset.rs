@@ -49,7 +49,8 @@ where
         let poll = this.inner.poll_write(cx, buf);
 
         if let Poll::Ready(Ok(inner)) = &poll {
-            *this.offset += *inner as u64;
+            *this.offset = this.offset.checked_add(*inner as u64)
+                .ok_or_else(|| Error::other("ZIP output offset overflow"))?;
         }
 
         poll
@@ -68,6 +69,32 @@ where
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<Result<usize, Error>> {
-        self.project().inner.poll_write_vectored(cx, bufs)
+        let this = self.project();
+        let result = this.inner.poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(count)) = &result {
+            *this.offset = this.offset.checked_add(*count as u64)
+                .ok_or_else(|| Error::other("ZIP output offset overflow"))?;
+        }
+        result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_lite::io::{AsyncWriteExt, Cursor};
+
+    #[test]
+    fn scalar_and_vectored_counts_cross_zip32_offsets_without_truncation() {
+        futures_lite::future::block_on(async {
+            let mut writer = AsyncOffsetWriter::new(Cursor::new(Vec::new()));
+            writer.offset = u32::MAX as u64 - 1;
+            writer.write_all(b"abcd").await.unwrap();
+            assert_eq!(writer.offset(), u32::MAX as u64 + 3);
+            let count = writer.write_vectored(&[IoSlice::new(b"ef"), IoSlice::new(b"gh")]).await.unwrap();
+            assert!(count > 0);
+            assert_eq!(writer.offset(), u32::MAX as u64 + 3 + count as u64);
+        });
+    }
+}
+

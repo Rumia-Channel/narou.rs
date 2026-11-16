@@ -198,11 +198,17 @@ pub async fn api_virtual_convert(
     Path(id): Path<i64>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let result = async {
-        let record = state.services.library.get(NovelId(id)).await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("仮想小説 vs_{id} が見つかりません"))?;
-        let path = super::novels::generate_virtual_epub(record).await
-            .map_err(|(_, message)| message)?;
+        let mut reads = state.services.content.read_scope("virtual-epub");
+        let result = async {
+            let record = state.services.content.read_record(&mut reads, NovelId(id)).await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("仮想小説 vs_{id} が見つかりません"))?;
+            let path = super::novels::generate_virtual_epub(&mut reads, record).await
+                .map_err(|(_, message)| message)?;
+            Ok::<_, String>(path)
+        }.await;
+        let released = reads.release_all().await;
+        let path = result.and_then(|path| released.map(|_| path).map_err(|error| error.to_string()))?;
         Ok::<_, String>((
             core::ncode(id),
             path.file_name()
@@ -479,8 +485,9 @@ mod tests {
         // 存在しないメンバー ID に差し替え、構成から分類を確定できない状態にする。
         {
             let repository = crate::native::novel_repository::NativeNovelRepository::new();
+            let write = crate::native::materialization::capture_write_for_record(&record).unwrap();
             repository
-                .update_existing_sync(NovelId(record.id), |record| {
+                .update_existing_guarded_sync(write.fence(), NovelId(record.id), |record| {
                     record.set_attribute_tag("漫画");
                     Ok(())
                 })

@@ -83,7 +83,7 @@ fn generate_csv() -> Result<String, String> {
         .map_err(|e: std::io::Error| e.to_string())?;
 
     for id in ids {
-        let Ok(Some(record)) = novels.get_sync(id.into()) else {
+        let Ok(Some(record)) = novels.get_current_sync(id.into()) else {
             continue;
         };
         // upstream の csv.rb は Narou.novel_frozen? (freeze.yaml) だけを見る。

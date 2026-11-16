@@ -12,15 +12,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::application::attribute_tags::{MANGA_TAG, NOVEL_TAG};
 
-/// 仮想小説の ncode 接頭辞。
-pub const VIRTUAL_NCODE_PREFIX: &str = "vs_";
-
-/// Portable identity is independent of the library-local `vs_<ID>` ncode.
-pub fn is_portable_toc_url(url: &str) -> bool {
-    url.strip_prefix("https://narou.rs/virtual/").is_some_and(|identity| {
-        identity.len() == 32 && identity.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
-}
+pub use crate::virtual_identity::{
+    VIRTUAL_NCODE_PREFIX, is_internal_tag, is_portable_toc_url, is_virtual_ncode,
+};
 
 /// Issue a persistent transfer identity without leaking a library-local ID.
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
@@ -36,13 +30,6 @@ pub fn new_toc_url() -> crate::error::Result<String> {
 /// 仮想小説 ID から ncode を作る。
 pub fn ncode(id: i64) -> String {
     format!("{VIRTUAL_NCODE_PREFIX}{id}")
-}
-
-/// `vs_<数字>` 形式の ncode か。
-pub fn is_virtual_ncode(ncode: &str) -> bool {
-    ncode
-        .strip_prefix(VIRTUAL_NCODE_PREFIX)
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Virtual parents are stored novels, but never upstream download/update targets.
@@ -62,11 +49,6 @@ pub fn id_from_ncode(ncode: &str) -> Option<i64> {
 /// 仮想小説に必ず付与するタグ。
 pub fn tag(id: i64) -> String {
     ncode(id)
-}
-
-/// UI やタグ一覧に出さない内部タグ (`vs_<ID>`) か。
-pub fn is_internal_tag(tag: &str) -> bool {
-    is_virtual_ncode(tag)
 }
 
 /// 仮想小説 ID → 登録順のメンバー ID。

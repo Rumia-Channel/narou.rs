@@ -47,7 +47,7 @@ pub fn is_illustration_key(key: &ObjectKey) -> bool {
 /// Reserved staging and generated outputs always belong to the large tier.
 pub fn is_large_asset_key(key: &ObjectKey) -> bool {
     is_illustration_key(key)
-        || super::staging::is_staging_key(key)
+        || super::staging::is_reserved_key(key)
         || key.as_ref().starts_with("generated/")
 }
 
@@ -115,7 +115,7 @@ impl SplitStore {
     }
 
     fn pair_for(&self, key: &ObjectKey) -> &StorePair {
-        if super::staging::is_staging_key(key) {
+        if super::staging::is_reserved_key(key) {
             &self.staging
         } else if is_large_asset_key(key) {
             &self.illustrations
@@ -125,7 +125,7 @@ impl SplitStore {
     }
 
     fn pair_for_prefix(&self, prefix: &ObjectPrefix) -> &StorePair {
-        if prefix.as_ref().starts_with(super::staging::STAGING_PREFIX.trim_end_matches('/')) {
+        if prefix.as_ref().starts_with(super::staging::STAGING_PREFIX.trim_end_matches('/')) || prefix.as_ref().starts_with(super::transfer_stage::TRANSFER_PREFIX.trim_end_matches('/')) {
             &self.staging
         } else if is_illustration_prefix(prefix) {
             &self.illustrations
@@ -136,6 +136,27 @@ impl SplitStore {
 }
 
 impl ObjectStore for SplitStore {
+    fn delete_closed<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{self.pair_for(key).objects.delete_closed(prefix,owner,epoch,key)}
+    fn retire_legacy<'a>(&'a self,logical:&'a ObjectKey,pool:&'a ObjectKey,size:u64,sha:&'a str)->PlatformFuture<'a,Result<()>>{self.pair_for(logical).objects.retire_legacy(logical,pool,size,sha)}
+    fn retire_legacy_guarded<'a>(&'a self,fence:&'a super::WriteFence,logical:&'a ObjectKey,pool:&'a ObjectKey,size:u64,sha:&'a str)->PlatformFuture<'a,Result<()>>{self.pair_for(logical).objects.retire_legacy_guarded(fence,logical,pool,size,sha)}
+    fn update_small_guarded<'a,'data:'a>(&'a self,fence:&'a super::WriteFence,key:&'a ObjectKey,mutate:&'a mut SmallObjectMutator<'data>)->PlatformFuture<'a,Result<ObjectUpdateResult>>{self.pair_for(key).objects.update_small_guarded(fence,key,mutate)}
+    fn access_fence(&self) -> Option<&dyn super::NovelAccessFence> { self.primary.objects.access_fence() }
+    fn read_stream_leased<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a super::GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        let pair = self.pair_for(key);
+        if Arc::ptr_eq(&pair.objects, &self.primary.objects) { return pair.objects.read_stream_leased(prefix,lease,key,range); }
+        Box::pin(async move {
+            let access = self.access_fence().ok_or_else(|| NarouError::Platform("missing metadata access fence".into()))?;
+            access.renew_reader(prefix,lease,super::READER_LEASE_SECS).await?;
+            let stream=pair.assets.read_stream_range(key,range).await?;access.renew_reader(prefix,lease,super::READER_LEASE_SECS).await?;Ok(stream)
+        })
+    }
+    fn write_small_guarded<'a>(&'a self, fence: &'a super::WriteFence, key: &'a ObjectKey, data: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
+        self.pair_for(key).objects.write_small_guarded(fence,key,data)
+    }
+    fn delete_guarded<'a>(&'a self, fence: &'a super::WriteFence, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        self.pair_for(key).objects.delete_guarded(fence,key)
+    }
+
     fn stat<'a>(
         &'a self,
         key: &'a ObjectKey,
@@ -205,6 +226,12 @@ impl ObjectStore for SplitStore {
 }
 
 impl AssetStore for SplitStore {
+    fn legacy_etag<'a>(&'a self,logical:&'a ObjectKey)->PlatformFuture<'a,Result<Option<String>>>{self.pair_for(logical).assets.legacy_etag(logical)}
+    fn delete_legacy_if_match<'a>(&'a self,logical:&'a ObjectKey,pool:&'a ObjectKey,etag:&'a str)->PlatformFuture<'a,Result<()>>{self.pair_for(logical).assets.delete_legacy_if_match(logical,pool,etag)}
+    fn write_stream_guarded<'a>(&'a self, fence: &'a super::WriteFence, key: &'a ObjectKey, stream: AssetStream) -> PlatformFuture<'a, Result<()>> {
+        self.pair_for(key).assets.write_stream_guarded(fence,key,stream)
+    }
+
     fn stat<'a>(
         &'a self,
         key: &'a ObjectKey,
@@ -223,6 +250,14 @@ impl AssetStore for SplitStore {
         &'a self, key: &'a ObjectKey, range: std::ops::Range<u64>,
     ) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
         self.pair_for(key).assets.read_range(key, range)
+    }
+
+    fn read_stream_range<'a>(&'a self, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        self.pair_for(key).assets.read_stream_range(key, range)
+    }
+
+    fn write_stream_once<'a>(&'a self, key: &'a ObjectKey, stream: AssetStream, size: u64, sha256: &'a str) -> PlatformFuture<'a, Result<super::WriteOnce>> {
+        self.pair_for(key).assets.write_stream_once(key, stream, size, sha256)
     }
 
     fn stage_stream<'a>(&'a self, stream: AssetStream) -> PlatformFuture<'a, Result<super::staging::StagedAsset>> {

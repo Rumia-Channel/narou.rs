@@ -33,6 +33,12 @@ param(
     # Optional build variant tag appended to the archive name (e.g. "GPL").
     [string]$Variant = "",
 
+    # When set (release CI, same runner as the build), the transfer WASM
+    # artifact manifest must exist and declare a build id. The artifacts are
+    # embedded into the binary by build.rs; this check proves the packaging
+    # ran on a checkout where they were really produced.
+    [string]$TransferArtifactsManifest,
+
     # 署名検証を省く。署名できないローカル検証用の抜け道で、
     # リリース CI では指定しない (未署名のまま配布する事故を防ぐ)。
     [switch]$SkipSignatureCheck
@@ -68,6 +74,18 @@ if (-not [string]::IsNullOrWhiteSpace($McpBinaryPath)) {
     $resolvedMcpBinary = (Resolve-Path -Path $McpBinaryPath).Path
 }
 $resolvedOutputDir = (Resolve-Path -Path $OutputDir).Path
+
+# The binary embeds /assets/transfer/*; when the CI contract passes a manifest
+# path, prove the artifact set was produced on this checkout before shipping.
+if (-not [string]::IsNullOrWhiteSpace($TransferArtifactsManifest)) {
+    if (-not (Test-Path -Path $TransferArtifactsManifest -PathType Leaf)) {
+        throw "Transfer WASM artifact manifest not found: $TransferArtifactsManifest"
+    }
+    $transferManifest = Get-Content -Path $TransferArtifactsManifest -Raw | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace($transferManifest.build_id) -or -not $transferManifest.files) {
+        throw "Transfer WASM artifact manifest is missing build_id/files: $TransferArtifactsManifest"
+    }
+}
 
 # Windows 版は本体とサブ実行ファイルすべてに Authenticode 署名が要る。
 # 署名ジョブが成果物を落とした場合に未署名のまま zip へ入るのを防ぐため、

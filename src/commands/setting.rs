@@ -4,7 +4,6 @@ use narou_rs::compat::confirm;
 use narou_rs::converter::ini::{IniData, IniValue};
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
-use narou_rs::db::novel_dir_for_record;
 use narou_rs::db::settings as settings_store;
 use narou_rs::setting_core::{
     SettingScope as Scope, apply_device_related_settings, cast_setting_value, setting_scope,
@@ -350,9 +349,7 @@ fn burn_default_settings(
     let targets = tagname_to_ids(targets);
     let default_settings = load_settings_by_pattern(inv, "default");
     let original_settings = get_original_settings();
-    let archive_root = inv.root_dir().join("小説データ");
     narou_rs::db::init_database()?;
-    let store = narou_rs::native::object_store::NativeStore::for_narou_root(inv.root_dir())?;
 
     for target in targets {
         let data = match get_data_by_target(&target) {
@@ -363,7 +360,7 @@ fn burn_default_settings(
             }
         };
         let record = match narou_rs::native::novel_repository::NativeNovelRepository::new()
-            .get_sync(data.id.into())
+            .get_current_sync(data.id.into())
         {
             Ok(Some(r)) => r,
             _ => {
@@ -372,16 +369,13 @@ fn burn_default_settings(
             }
         };
 
-        let archive_path = novel_dir_for_record(&archive_root, &record);
+        let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        let write = narou_rs::native::materialization::capture_write_for_record(&record)?;
 
         // Web UI の設定保存と同じ `setting.ini` オブジェクトへ書く。FS だけに
         // 書くと SQLite モード (`mirror-files=false`) の本文と DB の設定が
         // 分離し、次の変換で焼き付けが消える。
-        let setting_key = narou_rs::native::object_store::novel_object_prefix(
-            &archive_root,
-            &archive_path,
-        )
-        .ok_or("小説の設定保存先がライブラリ外です")?.join("setting.ini")?;
+        let setting_key = keys.prefix().join("setting.ini")?;
         let mut mutate = |raw: Option<&[u8]>| {
             let text = std::str::from_utf8(raw.unwrap_or_default()).map_err(|error| {
                 narou_rs::error::NarouError::Platform(format!("setting.ini is not UTF-8: {error}"))
@@ -399,7 +393,7 @@ fn burn_default_settings(
             Ok(changed.then(|| std::borrow::Cow::Owned(ini.to_ini_string().into_bytes())))
         };
         let result = futures::executor::block_on(
-            narou_rs::platform::ObjectStore::update_small(&store, &setting_key, &mut mutate),
+            write.update_small(&setting_key, &mut mutate),
         )?;
         match result {
             narou_rs::platform::ObjectUpdateResult::Committed => {}

@@ -147,6 +147,11 @@ fn failure(err: NarouError) -> worker::Result<Response> {
 
 async fn run(env: &Env, db: &DbHandle, token: &str, action: &str, limit: usize) -> Result<(Report,u16)> {
     let mut state=load_state(db).await?;
+    if !crate::object_migration::prepare_bindings(db).await? {
+        state.done=false;
+        return Ok((report(db,state,true).await?,200));
+    }
+    let authority: Arc<dyn narou_rs::platform::ObjectStore> = Arc::new(crate::d1_object_store::D1ObjectStore::new(db.primary_view()));
     let mode=content_store::backend(db).await?;
     if action=="verify" && !state.copy_done || action=="cutover" && (!state.copy_done || !state.verify_done) || action=="purge" && mode!=ContentBackend::S3 {
         state.action=action.into(); state.done=false; state.next_cursor=None;
@@ -175,7 +180,14 @@ async fn run(env: &Env, db: &DbHandle, token: &str, action: &str, limit: usize) 
                 let done=page.len()<limit;
                 for metadata in page {
                     renew(db,token).await?;
-                    if store.copy_legacy(&metadata.key).await? { state.copied+=1; }
+                    let prefix=crate::object_migration::novel_prefix(db,&metadata.key).await?.ok_or_else(||error("content has no novel prefix"))?;
+                    let mut access=narou_rs::application::novel_access::NovelAccess::for_operation(&authority,None,&prefix,"content-migration").await?;
+                    let fence=access.write()?.fence().clone();
+                    let lease=access.read()?.lease().clone();
+                    let copied=store.copy_legacy_guarded(&metadata.key,&fence,&lease).await;
+                    let released=access.release().await;
+                    if copied? { state.copied+=1; }
+                    released?;
                     state.next_cursor=Some(metadata.key.to_string());
                     save_state(db,token,&state).await?;
                 }
@@ -187,7 +199,13 @@ async fn run(env: &Env, db: &DbHandle, token: &str, action: &str, limit: usize) 
                 let done=page.len()<limit;
                 for metadata in page {
                     renew(db,token).await?;
-                    store.verify_reference(&metadata.key).await?;
+                    let prefix=crate::object_migration::novel_prefix(db,&metadata.key).await?.ok_or_else(||error("content has no novel prefix"))?;
+                    let mut access=narou_rs::application::novel_access::NovelAccess::for_operation(&authority,None,&prefix,"content-verification").await?;
+                    let fence=access.write()?.fence().clone();
+                    let lease=access.read()?.lease().clone();
+                    let verified=store.verify_reference_guarded(&metadata.key,&fence,&lease).await;
+                    let released=access.release().await;
+                    verified?; released?;
                     state.verified+=1; state.next_cursor=Some(metadata.key.to_string());
                     save_state(db,token,&state).await?;
                 }
@@ -196,7 +214,13 @@ async fn run(env: &Env, db: &DbHandle, token: &str, action: &str, limit: usize) 
             "cutover"=>{ renew(db,token).await?; store.cutover().await?; state.done=true; }
             "purge"=>{
                 renew(db,token).await?;
-                let removed=store.purge_legacy_page(limit).await?;
+                let page=store.legacy_page(None,limit).await?;
+                let mut removed=0;
+                for metadata in page {
+                    let prefix=crate::object_migration::novel_prefix(db,&metadata.key).await?.ok_or_else(||error("content has no novel prefix"))?;
+                    let guard=narou_rs::application::novel_access::NovelWriteGuard::capture(&authority,None,&prefix).await?;
+                    removed+=store.purge_legacy_guarded(&metadata.key,guard.fence()).await?;
+                }
                 state.purged+=removed;
                 state.done=inventory(db).await?.remaining_legacy==0;
                 if removed==0 && !state.done { return Err(error("legacy rows lack verified references")); }

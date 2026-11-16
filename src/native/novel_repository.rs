@@ -31,6 +31,24 @@ fn initialize_attributes(mutations: &mut [NovelMutation]) {
     }
 }
 
+fn current_store()->Result<crate::native::object_store::NativeStore>{
+    // Do not retain DATABASE while acquiring a gate: synchronous callers also
+    // acquire the gate before the authoritative metadata transaction.
+    let root=crate::db::with_database(|db|db.archive_root().parent().map(std::path::Path::to_owned).ok_or_else(||NarouError::Platform("archive has no library root".into())))?;
+    crate::native::object_store::NativeStore::for_narou_root(&root)
+}
+fn require_record_origin(record:&NovelRecord,fences:&[crate::platform::WriteFence])->Result<()>{
+    let keys=crate::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;
+    if !fences.iter().any(|fence|keys.prefix().as_ref()==fence.prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("record origin outside captured fence".into()));}Ok(())
+}
+
+fn load_current_yaml_records(inventory:&crate::db::inventory::Inventory)->Result<std::collections::BTreeMap<i64,NovelRecord>>{
+    let path=inventory.inventory_path("database",crate::db::inventory::InventoryScope::Local);let raw=crate::db::inventory::read_optional_yaml_file(&path)?;
+    let mut records:std::collections::BTreeMap<i64,NovelRecord>=if raw.trim().is_empty(){Default::default()}else{serde_yaml::from_str(&raw)?};for(id,record)in &mut records{record.id=*id;}Ok(records)
+}
+#[path="novel_repository_creation.rs"]
+mod creation;
+
 /// Native repository. Stateless: every operation locks the shared
 /// [`crate::db::DATABASE`] global for the duration of its (short, blocking)
 /// section.
@@ -47,6 +65,13 @@ impl NativeNovelRepository {
     pub fn new() -> Self {
         Self
     }
+    pub fn get_current_sync(&self,id:NovelId)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::point_snapshot_conn(connection,id),None=>Ok(load_current_yaml_records(inventory)?.remove(&id.0))}))}
+    pub fn get_many_current_sync(&self,ids:&[NovelId])->Result<Vec<Option<NovelRecord>>>{if ids.is_empty(){return Ok(Vec::new());}crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::many_snapshot_conn(connection,ids),None=>Ok(crate::platform::repository::align_current_records(ids,load_current_yaml_records(inventory)?.into_values()))}))}
+    pub fn query_current_sync(&self,query:&NovelQuery)->Result<Vec<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::query_snapshot_conn(connection,query),None=>Ok(crate::platform::repository::query_records(load_current_yaml_records(inventory)?.values(),query))}))}
+    pub fn find_by_toc_url_current_sync(&self,url:&str)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::url_snapshot_conn(connection,url);}let folded=crate::db::novel_codec::fold(url);Ok(load_current_yaml_records(inventory)?.into_values().find(|record|crate::db::novel_codec::fold(&record.toc_url)==folded))}))}
+    pub fn find_by_storage_prefix_current_sync(&self,prefix:&crate::platform::ObjectKey)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::prefix_snapshot_conn(connection,prefix);}for record in load_current_yaml_records(inventory)?.into_values(){let keys=crate::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;if keys.prefix()==prefix{return Ok(Some(record));}}Ok(None)}))}
+    pub fn find_by_title_current_sync(&self,title:&str)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::title_snapshot_conn(connection,title);}let folded=crate::db::novel_codec::fold(title);Ok(load_current_yaml_records(inventory)?.into_values().find(|record|crate::db::novel_codec::fold(&record.title)==folded))}))}
+    pub fn find_by_ncode_current_sync(&self,ncode:&str)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::ncode_snapshot_conn(connection,ncode);}let folded=crate::db::novel_codec::fold(ncode);let suffix=format!("/{folded}");Ok(load_current_yaml_records(inventory)?.into_values().find(|record|record.ncode.as_deref().is_some_and(|value|crate::db::novel_codec::fold(value)==folded)||crate::db::novel_codec::fold(&record.toc_url).trim_end_matches('/').ends_with(&suffix)))}))}
 
     /// Synchronous entry points for native-only callers (CLI commands).
     /// These never spawn blocking work — they lock the shared database
@@ -55,24 +80,13 @@ impl NativeNovelRepository {
         crate::db::with_database(|db| Ok(db.get(id.0).cloned()))
     }
 
-    /// Mutate the authoritative existing row inside the database write transaction.
-    /// Returns false without calling `mutator` if the ID was removed. Unlike
-    /// `Upsert`, this native-only field-editing entry point never creates a row.
-    pub fn update_existing_sync<F>(&self, id: NovelId, mutator: F) -> Result<bool>
-    where
-        F: FnOnce(&mut NovelRecord) -> Result<()>,
-    {
-        crate::db::with_database_mut(|db| {
-            db.update_records(|mut records| {
-                let found = if let Some(record) = records.get_mut(&id.0) {
-                    mutator(record)?;
-                    true
-                } else {
-                    false
-                };
-                Ok((records, found))
-            })
-        })
+    /// Mutate an existing authoritative row with the original operation epoch.
+    /// Lock order is per-novel OS gate(s), then DATABASE and metadata locks.
+    pub fn update_existing_guarded_sync<F>(&self,fence:&crate::platform::WriteFence,id:NovelId,mutator:F)->Result<bool>
+    where F:FnOnce(&mut NovelRecord)->Result<()>{
+        let store=current_store()?;store.with_open_write(fence,||crate::db::with_database_mut(|db|db.update_records_with_fences(std::slice::from_ref(fence),|mut records|{
+            let found=if let Some(record)=records.get_mut(&id.0){require_record_origin(record,std::slice::from_ref(fence))?;mutator(record)?;require_record_origin(record,std::slice::from_ref(fence))?;true}else{false};Ok((records,found))
+        })))
     }
 
     pub fn find_by_toc_url_sync(&self, url: &str) -> Result<Option<NovelRecord>> {
@@ -122,28 +136,14 @@ impl NativeNovelRepository {
         after_id: Option<NovelId>,
         limit: usize,
     ) -> Result<Vec<NovelId>> {
-        let after = after_id.map(|id| id.0).unwrap_or(i64::MIN);
-        crate::db::with_database(|db| {
-            let mut ids: Vec<NovelId> = db
-                .all_records()
-                .values()
-                .filter(|r| r.id > after && record_matches_filter(r, filter))
-                .map(|r| NovelId::from(r.id))
-                .collect();
-            ids.sort();
-            ids.truncate(limit);
-            Ok(ids)
-        })
+        crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){
+            Some(connection)=>crate::native::sqlite::SqliteNovelRepository::scan_snapshot_conn(connection,filter,after_id,limit),
+            None=>{let after=after_id.map_or(i64::MIN,|id|id.0);Ok(load_current_yaml_records(inventory)?.values().filter(|record|record.id>after&&record_matches_filter(record,filter)).take(limit).map(|record|NovelId(record.id)).collect())}
+        }))
     }
 
     pub fn count_sync(&self, filter: &NovelFilter) -> Result<u64> {
-        crate::db::with_database(|db| {
-            Ok(db
-                .all_records()
-                .values()
-                .filter(|r| record_matches_filter(r, filter))
-                .count() as u64)
-        })
+        crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::count_snapshot_conn(connection,filter),None=>Ok(load_current_yaml_records(inventory)?.values().filter(|record|record_matches_filter(record,filter)).count() as u64)}))
     }
 
     /// Resolve by ncode with the legacy `toc_url` suffix fallback used by
@@ -181,6 +181,33 @@ where
 }
 
 impl NovelRepository for NativeNovelRepository {
+    fn resume_id(&self,id:NovelId,generation:i64)->PlatformFuture<'_,Result<crate::platform::NovelIdReservation>>{Box::pin(run_db(move||crate::db::with_database_mut(|db|db.resume_id(id,generation))))}
+    fn reserve_create<'a>(&'a self,fence:&'a crate::platform::WriteFence,reservation:&'a crate::platform::NovelIdReservation,toc_url:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{crate::native::object_store::run_scoped_blocking(||self.reserve_native_creation(fence,reservation,toc_url))})}
+    fn apply_create_guarded<'a>(&'a self,fence:&'a crate::platform::WriteFence,reservation:&'a crate::platform::NovelIdReservation,record:NovelRecord)->PlatformFuture<'a,Result<()>>{Box::pin(async move{crate::native::object_store::run_scoped_blocking(||{let store=current_store()?;store.with_open_write(fence,||crate::db::with_database_mut(|db|db.apply_create_record(fence,reservation,record)))})})}
+    fn remove_closed<'a>(&'a self,prefix:&'a crate::platform::ObjectPrefix,owner:&'a str,epoch:u64,id:NovelId)->PlatformFuture<'a,Result<()>>{let prefix=prefix.clone();let owner=owner.to_owned();Box::pin(run_db(move||{
+        if crate::platform::access_fence::parse_removal_owner(&owner)?.0!=id{return Err(NarouError::Platform("removal owner ID mismatch".into()));}let store=current_store()?;store.with_closed_write(&prefix,&owner,epoch,||crate::db::with_database_mut(|db|db.remove_closed_record(&prefix,&owner,epoch,id)))
+    }))}
+    fn get_current<'a>(&'a self,id:NovelId)->PlatformFuture<'a,Result<Option<NovelRecord>>>{Box::pin(run_db(move||Self::new().get_current_sync(id)))}
+    fn get_many_current<'a>(&'a self,ids:&'a [NovelId])->PlatformFuture<'a,Result<Vec<Option<NovelRecord>>>>{let ids=ids.to_vec();Box::pin(run_db(move||Self::new().get_many_current_sync(&ids)))}
+    fn query_current<'a>(&'a self,query:&'a NovelQuery)->PlatformFuture<'a,Result<Vec<NovelRecord>>>{let query=query.clone();Box::pin(run_db(move||Self::new().query_current_sync(&query)))}
+    fn find_by_toc_url_current<'a>(&'a self,url:&'a str)->PlatformFuture<'a,Result<Option<NovelRecord>>>{let url=url.to_owned();Box::pin(run_db(move||Self::new().find_by_toc_url_current_sync(&url)))}
+    fn find_by_storage_prefix_current<'a>(&'a self,prefix:&'a crate::platform::ObjectKey)->PlatformFuture<'a,Result<Option<NovelRecord>>>{let prefix=prefix.clone();Box::pin(run_db(move||Self::new().find_by_storage_prefix_current_sync(&prefix)))}
+    fn apply_batch_guarded_many<'a>(&'a self,fences:&'a [crate::platform::WriteFence],mutations:Vec<NovelMutation>)->PlatformFuture<'a,Result<()>>{
+        let fences=fences.to_vec();Box::pin(async move{run_db(move||{
+            let mut mutations=mutations;initialize_attributes(&mut mutations);
+            if fences.is_empty()&&!mutations.is_empty(){return Err(NarouError::Platform("record mutation has no writer fence".into()));}
+            let store=current_store()?;
+            store.with_open_writes(&fences,||crate::db::with_database_mut(|db|db.update_records_with_fences(&fences,|mut records|{
+                    for mutation in &mutations{let id=match mutation{NovelMutation::Upsert(record)=>record.id,NovelMutation::Remove(id)=>id.0};if let Some(previous)=records.get(&id){let keys=crate::platform::NovelObjectKeys::new(&previous.sitename,&previous.file_title,previous.use_subdirectory)?;if !fences.iter().any(|fence|keys.prefix().as_ref()==fence.prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("previous record origin outside captured fence".into()));}}}
+                    if mutations.iter().any(|mutation|matches!(mutation,NovelMutation::Remove(_)))&&let crate::native::object_store::NativeStore::Fs(fs)=&store{for fence in &fences{fs.invalidate_writer_locked(fence)?;}}
+                    for mutation in &mutations{let record=match mutation{NovelMutation::Upsert(record)=>Some(record),NovelMutation::Remove(id)=>records.get(&id.0)};
+                        if let Some(record)=record{let keys=crate::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;if !fences.iter().any(|fence|keys.prefix().as_ref()==fence.prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("record mutation outside captured fence".into()));}}
+                        match mutation{NovelMutation::Upsert(record)=>{records.insert(record.id,record.clone());},NovelMutation::Remove(id)=>{records.remove(&id.0);}}
+                    }Ok((records,()))
+            })))
+        }).await})
+    }
+
     fn get<'a>(&'a self, id: NovelId) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
         Box::pin(async move {
             run_db(move || {
@@ -214,23 +241,14 @@ impl NovelRepository for NativeNovelRepository {
         &'a self,
         title: &'a str,
     ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
-        let title = title.to_string();
-        Box::pin(async move {
-            run_db(move || {
-                crate::db::with_database(|db| Ok(db.find_by_title(&title).cloned()))
-            })
-            .await
-        })
+        let title=title.to_owned();Box::pin(run_db(move||Self::new().find_by_title_current_sync(&title)))
     }
 
     fn find_by_ncode<'a>(
         &'a self,
         ncode: &'a str,
     ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
-        let ncode = ncode.to_string();
-        Box::pin(async move {
-            run_db(move || Self::find_by_ncode_sync_impl(&ncode)).await
-        })
+        let ncode=ncode.to_owned();Box::pin(run_db(move||Self::new().find_by_ncode_current_sync(&ncode)))
     }
 
     fn count<'a>(
@@ -238,14 +256,7 @@ impl NovelRepository for NativeNovelRepository {
         filter: &'a NovelFilter,
     ) -> PlatformFuture<'a, Result<u64>> {
         let filter = filter.clone();
-        Box::pin(async move {
-            run_db(move || {
-                crate::db::with_database(|db| {
-                    Ok(db.all_records().values().filter(|r| record_matches_filter(r, &filter)).count() as u64)
-                })
-            })
-            .await
-        })
+        Box::pin(run_db(move||Self::new().count_sync(&filter)))
     }
 
     fn query<'a>(
@@ -265,25 +276,7 @@ impl NovelRepository for NativeNovelRepository {
         limit: usize,
     ) -> PlatformFuture<'a, Result<Vec<NovelId>>> {
         let filter = filter.clone();
-        let after_id = after_id.map(|id| id.0).unwrap_or(i64::MIN);
-        Box::pin(async move {
-            run_db(move || {
-                crate::db::with_database(|db| {
-                    let mut ids: Vec<NovelId> = db
-                        .all_records()
-                        .values()
-                        .filter(|r| {
-                            r.id > after_id && record_matches_filter(r, &filter)
-                        })
-                        .map(|r| NovelId::from(r.id))
-                        .collect();
-                    ids.sort();
-                    ids.truncate(limit);
-                    Ok(ids)
-                })
-            })
-            .await
-        })
+        Box::pin(run_db(move||Self::new().scan_ids_sync(&filter,after_id,limit)))
     }
 
     fn allocate_id(&self) -> PlatformFuture<'_, Result<crate::platform::NovelIdReservation>> {
@@ -294,10 +287,7 @@ impl NovelRepository for NativeNovelRepository {
 
     fn release_id(&self, reservation: crate::platform::NovelIdReservation) -> PlatformFuture<'_, Result<()>> {
         Box::pin(async move {
-            run_db(move || crate::db::with_database_mut(|db| {
-                db.release_id(reservation);
-                Ok(())
-            })).await
+            run_db(move || Self::new().release_native_creation(reservation)).await
         })
     }
 
@@ -336,19 +326,19 @@ impl NovelRepository for NativeNovelRepository {
 /// Synchronous adapter for `application::target_lookup` (native CLI paths).
 impl NovelLookup for NativeNovelRepository {
     fn get(&self, id: NovelId) -> Result<Option<NovelRecord>> {
-        self.get_sync(id)
+        self.get_current_sync(id)
     }
 
     fn find_by_toc_url(&self, url: &str) -> Result<Option<NovelRecord>> {
-        self.find_by_toc_url_sync(url)
+        self.find_by_toc_url_current_sync(url)
     }
 
     fn find_by_ncode(&self, ncode: &str) -> Result<Option<NovelRecord>> {
-        self.find_by_ncode_sync(ncode)
+        self.find_by_ncode_current_sync(ncode)
     }
 
     fn find_by_title(&self, title: &str) -> Result<Option<NovelRecord>> {
-        self.find_by_title_sync(title)
+        self.find_by_title_current_sync(title)
     }
 
     fn scan_ids(

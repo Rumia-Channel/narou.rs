@@ -1,5 +1,5 @@
 // Real wasm-bindgen Node bindings; build first, then pass the generated .js path.
-// Exercises bounded callbacks, validation-before-output, planning, and escaping
+// Exercises handles, bounded callbacks, validation-before-output, resume, and escaping
 // amplification without materializing the large manifest in JavaScript either.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -53,8 +53,8 @@ function outputChunks(accept) {
 }
 const body = Buffer.from('title: Streaming fixture\nauthor: Tester\nsubtitles: []\n');
 const bodyHash = createHash('sha256').update(body).digest('hex');
-const readBody = async (index, path, offset, length) => {
-  assert(index === 0 || index === 1); assert.equal(path, 'toc.yaml');
+const readBody = async (index, path, offset, length, fileId) => {
+  assert(index === 0 || index === 1); assert.equal(fileId, index); assert.equal(path, 'toc.yaml');
   assert(length <= 64 * 1024); fileReads += 1;
   return body.subarray(offset, offset + length);
 };
@@ -75,7 +75,7 @@ try {
   let entered, release, writes = 0;
   const waiting = new Promise(resolve => { entered = resolve; });
   const gate = new Promise(resolve => { release = resolve; });
-  const building = wasm.build_zip(ranges(metadata), (await metadata.stat()).size, readBody,
+  const building = wasm.build_zip(ranges(metadata), String((await metadata.stat()).size), readBody,
     outputChunks(async bytes => {
       if (writes++ === 0) { entered(); await gate; }
       await writeAll(zip, bytes);
@@ -87,21 +87,42 @@ try {
   release(); await building; await close(zip); await close(metadata);
   const archive = await file(zipPath, 'r');
   const size = (await archive.stat()).size;
-  const smallChunks = [];
-  await wasm.parse_zip(ranges(archive), size, outputChunks(bytes => { smallChunks.push(Buffer.from(bytes)); }));
-  const parsed = JSON.parse(Buffer.concat(smallChunks).toString('utf8'));
-  assert.deepEqual(parsed.novels.map(novel => novel.title), ['one', 'two']);
-  assert(parsed.novels.every(novel => novel.files[0].sha256 === bodyHash && novel.files[0].size === body.length));
-  for (const overwrite of [false, true]) {
-    const decisions = [];
-    await wasm.plan_zip(ranges(archive), size, async (index, url) => {
-      assert.equal(url, source.novels[index].toc_url); return index === 0;
-    }, overwrite, outputChunks(bytes => { decisions.push(Buffer.from(bytes)); }));
-    assert.deepEqual(Buffer.concat(decisions).toString('utf8').trim().split('\n').map(JSON.parse), [
-      { index: 0, action: overwrite ? 'Overwrite' : 'Skip' }, { index: 1, action: 'Create' },
-    ]);
-  }
+  const info = JSON.parse(wasm.codec_info());
+  assert.equal(info.protocol_version, 2); assert.equal(info.abi_version, 2); assert(info.build_id);
+  assert.equal(wasm.parse_zip, undefined); assert.equal(wasm.plan_zip, undefined);
+  const handle = await wasm.open_archive(ranges(archive), String(size), null);
+  assert.throws(() => wasm.catalog_page(handle, null), /not validated/);
+  const verified = JSON.parse(await wasm.validate_archive(handle, () => {}));
+  assert.equal(verified.files, 2); assert.equal(verified.novels, 2);
+  assert.equal(verified.total_uncompressed, String(body.length * 2));
+  const page = JSON.parse(wasm.catalog_page(handle, null));
+  assert.deepEqual(page.items.filter(item => item.kind === 'novel').map(item => item.title), ['one', 'two']);
+  assert(page.items.filter(item => item.kind === 'file').every(item => item.sha256 === bodyHash && item.size === String(body.length)));
+  const wireChunks = [];
+  const summary = JSON.parse(await wasm.write_transfer_manifest(handle, JSON.stringify({ profile: 'runtime', extra_roles: [], policy_version: 1, allow_raw: true, novels: [1] }), outputChunks(bytes => wireChunks.push(Buffer.from(bytes)))));
+  const wireBytes = Buffer.concat(wireChunks), wire = wireBytes.toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(summary.wire_sha256, createHash('sha256').update(wireBytes).digest('hex'));
+  assert.equal(summary.wire_size, String(wireBytes.length));
+  assert.equal(summary.files, 1);
+  assert(wire.filter(record => record.type === 'file').every(record => record.novel === 0 && record.file_id === 0));
+  const prefix = createHash('sha256').update(body.subarray(0, 7)).digest('hex'), streamed = [];
+  const resumed = JSON.parse(await wasm.stream_entry(handle, 0, '7', prefix, outputChunks(bytes => streamed.push(Buffer.from(bytes)))));
+  assert.equal(resumed.sha256, bodyHash); assert.equal(resumed.emitted, String(body.length - 7));
+  assert.deepEqual(Buffer.concat(streamed), body.subarray(7));
+  let rejectedWrites = 0;
+  await assert.rejects(wasm.stream_entry(handle, 0, '7', '0'.repeat(64), () => { rejectedWrites++; }));
+  await assert.rejects(wasm.stream_entry(handle, 0, String(body.length + 1), prefix, () => { rejectedWrites++; }));
+  assert.equal(rejectedWrites, 0);
+  wasm.close_archive(handle);
+  assert.throws(() => wasm.catalog_page(handle, null), /unknown archive/);
+  const parsed = structuredClone(source);
   await close(archive);
+
+  const wrongSource = structuredClone(source); wrongSource.novels[0].files[0].sha256 = '0'.repeat(64);
+  const wrongPath = join(work, 'wrong-manifest.json'); await writeFile(wrongPath, JSON.stringify(wrongSource));
+  const wrong = await file(wrongPath, 'r');
+  await assert.rejects(wasm.build_zip(ranges(wrong), String((await wrong.stat()).size), readBody, () => {}), /sha256 mismatch/);
+  await close(wrong);
 
   // Corrupt the second file: validating the first must not publish metadata yet.
   const damaged = await readFile(zipPath);
@@ -113,12 +134,15 @@ try {
   const corruptPath = join(work, 'corrupt.zip'); await writeFile(corruptPath, damaged);
   const corrupt = await file(corruptPath, 'r');
   let published = 0;
-  await assert.rejects(wasm.parse_zip(ranges(corrupt), damaged.length, async () => { published += 1; }));
+  const corruptHandle = await wasm.open_archive(ranges(corrupt), String(damaged.length), null);
+  await assert.rejects(wasm.validate_archive(corruptHandle, () => {}));
+  await assert.rejects(wasm.write_transfer_manifest(corruptHandle, JSON.stringify({ policy_version: 1 }), async () => { published += 1; }));
+  wasm.close_archive(corruptHandle);
   assert.equal(published, 0, 'late invalid entry must fail before any metadata output');
   await close(corrupt);
 
-  // A parent may appear first in incoming metadata, but its import decisions
-  // must follow both members. References are URLs, not source-library IDs.
+  // A parent may appear first in metadata; selecting it must include both
+  // required members. References are ordered URLs, not source-library IDs.
   const parentSettings = Buffer.from('enable_yokogaki=true\n');
   const grouped = {
     format_version: 2,
@@ -126,7 +150,7 @@ try {
       toc_url: 'https://narou.rs/virtual/0123456789abcdef0123456789abcdef',
       title: '結合する作品', author: 'Tester', sitename: 'Group', novel_type: 0,
       virtual_members: [source.novels[1].toc_url, source.novels[0].toc_url],
-      files: [{ path: 'setting.ini', size: parentSettings.length }],
+      files: [{ path: 'setting.ini', size: parentSettings.length, sha256: createHash('sha256').update(parentSettings).digest('hex') }],
     }, ...source.novels],
   };
   const groupedMetadataPath = join(work, 'grouped-manifest.json');
@@ -134,7 +158,7 @@ try {
   const groupedMetadata = await file(groupedMetadataPath, 'r');
   const groupedZipPath = join(work, 'grouped.zip');
   const groupedZip = await file(groupedZipPath, 'w');
-  await wasm.build_zip(ranges(groupedMetadata), (await groupedMetadata.stat()).size,
+  await wasm.build_zip(ranges(groupedMetadata), String((await groupedMetadata.stat()).size),
     async (index, path, offset, length) => {
       assert.equal(path, index === 0 ? 'setting.ini' : 'toc.yaml');
       assert(index >= 0 && index <= 2);
@@ -143,18 +167,15 @@ try {
   await close(groupedZip); await close(groupedMetadata);
   const groupedArchive = await file(groupedZipPath, 'r');
   const groupedSize = (await groupedArchive.stat()).size;
+  const groupHandle = await wasm.open_archive(ranges(groupedArchive), String(groupedSize), null);
+  await wasm.validate_archive(groupHandle, () => {});
   const groupedChunks = [];
-  await wasm.parse_zip(ranges(groupedArchive), groupedSize, outputChunks(bytes => groupedChunks.push(Buffer.from(bytes))));
-  const groupedParsed = JSON.parse(Buffer.concat(groupedChunks).toString('utf8'));
-  assert.deepEqual(groupedParsed.novels[0].virtual_members, grouped.novels[0].virtual_members);
-  assert.equal(groupedParsed.novels[0].files[0].sha256, createHash('sha256').update(parentSettings).digest('hex'));
-  const groupedDecisions = [], lookupOrder = [];
-  await wasm.plan_zip(ranges(groupedArchive), groupedSize, async (index, url) => {
-    lookupOrder.push(index); assert.equal(url, grouped.novels[index].toc_url); return index === 2;
-  }, false, outputChunks(bytes => groupedDecisions.push(Buffer.from(bytes))));
-  assert.deepEqual(lookupOrder, [1, 2, 0]);
-  assert.deepEqual(Buffer.concat(groupedDecisions).toString('utf8').trim().split('\n').map(JSON.parse),
-    [{ index: 1, action: 'Create' }, { index: 2, action: 'Skip' }, { index: 0, action: 'Create' }]);
+  const groupSummary = JSON.parse(await wasm.write_transfer_manifest(groupHandle, JSON.stringify({ policy_version: 1, novels: [0] }), outputChunks(bytes => groupedChunks.push(Buffer.from(bytes)))));
+  const groupRecords = Buffer.concat(groupedChunks).toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(groupSummary.novels, 3, 'selecting the parent includes both required members');
+  assert.deepEqual(groupRecords.filter(record => record.type === 'text' && record.field === 'member').map(record => record.value), grouped.novels[0].virtual_members);
+  assert(groupRecords.filter(record => record.type === 'file').some(record => record.path === 'setting.ini' && record.sha256 === createHash('sha256').update(parentSettings).digest('hex')));
+  wasm.close_archive(groupHandle);
   await close(groupedArchive);
 
   grouped.novels[0].virtual_members.push('https://example.test/missing/');
@@ -162,7 +183,7 @@ try {
   await writeFile(invalidMetadataPath, JSON.stringify(grouped));
   const invalidMetadata = await file(invalidMetadataPath, 'r');
   let invalidWrites = 0;
-  await assert.rejects(wasm.build_zip(ranges(invalidMetadata), (await invalidMetadata.stat()).size, readBody,
+  await assert.rejects(wasm.build_zip(ranges(invalidMetadata), String((await invalidMetadata.stat()).size), readBody,
     async () => { invalidWrites += 1; }));
   assert.equal(invalidWrites, 0, 'missing member must be rejected before ZIP output');
   await close(invalidMetadata);
@@ -172,33 +193,47 @@ try {
   parsed.novels.length = 1; parsed.novels[0].title = '';
   const halves = JSON.stringify(parsed).split('"title":""');
   assert.equal(halves.length, 2);
-  const prefix = Buffer.from(`${halves[0]}"title":"`), suffix = Buffer.from(`"${halves[1]}`);
+  const titlePrefix = Buffer.from(`${halves[0]}"title":"`), titleSuffix = Buffer.from(`"${halves[1]}`);
   const repeated = Buffer.from('\\u0000'.repeat(4096));
   const expected = createHash('sha256');
   const largePath = join(work, 'large-manifest.json');
   const largeOutput = await file(largePath, 'w');
-  for (const bytes of [prefix]) { expected.update(bytes); await writeAll(largeOutput, bytes); }
+  for (const bytes of [titlePrefix]) { expected.update(bytes); await writeAll(largeOutput, bytes); }
   for (let count = 0; count < 6 * 1024 * 1024 / 4096; count++) {
     expected.update(repeated); await writeAll(largeOutput, repeated);
   }
-  expected.update(suffix); await writeAll(largeOutput, suffix); await close(largeOutput);
+  expected.update(titleSuffix); await writeAll(largeOutput, titleSuffix); await close(largeOutput);
   const largeInput = await file(largePath, 'r');
   const largeZipPath = join(work, 'large.zip');
   const largeZip = await file(largeZipPath, 'w');
-  await wasm.build_zip(ranges(largeInput), (await largeInput.stat()).size, readBody,
+  await wasm.build_zip(ranges(largeInput), String((await largeInput.stat()).size), readBody,
     outputChunks(bytes => writeAll(largeZip, bytes)));
   await close(largeZip); await close(largeInput);
   const largeArchive = await file(largeZipPath, 'r');
-  const actual = createHash('sha256');
-  let emitted = 0;
-  await wasm.parse_zip(ranges(largeArchive), (await largeArchive.stat()).size,
-    outputChunks(bytes => { emitted += bytes.length; actual.update(bytes); }));
-  assert.equal(actual.digest('hex'), expected.digest('hex'), 'streamed metadata must preserve all escaped content');
+  const largeHandle = await wasm.open_archive(ranges(largeArchive), String((await largeArchive.stat()).size), null);
+  await wasm.validate_archive(largeHandle, () => {});
+  const actual = createHash('sha256'), titleExpected = createHash('sha256');
+  const zeroBlock = Buffer.alloc(32768); for (let index = 0; index < 192; index++) titleExpected.update(zeroBlock);
+  let emitted = 0, titleBytes = 0, titleParts = 0, tail = '';
+  const decoder = new TextDecoder();
+  await wasm.write_transfer_manifest(largeHandle, JSON.stringify({ policy_version: 1 }), outputChunks(bytes => {
+    emitted += bytes.length; tail += decoder.decode(bytes, { stream: true });
+    for (let newline; (newline = tail.indexOf('\n')) !== -1;) {
+      const record = JSON.parse(tail.slice(0, newline)); tail = tail.slice(newline + 1);
+      if (record.type === 'text' && record.field === 'title') {
+        assert.equal(record.part, titleParts++); const value = Buffer.from(record.value);
+        assert(value.length <= 32768); actual.update(value); titleBytes += value.length;
+      }
+    }
+  }));
+  assert.equal(tail, ''); assert.equal(titleBytes, 6 * 1024 * 1024); assert.equal(titleParts, 192);
+  assert.equal(actual.digest('hex'), titleExpected.digest('hex'), 'fragmented wire metadata preserves all escaped content');
+  wasm.close_archive(largeHandle);
   const heapBytes = instance.exports.memory.buffer.byteLength;
   assert(heapBytes < 64 * 1024 * 1024, `metadata serialization amplified Wasm heap to ${heapBytes}`);
   console.log(JSON.stringify({ result: 'PASS', wasm_heap_bytes: heapBytes, metadata_bytes: emitted,
     max_read_chunk: maximumRead, max_write_chunk: maximumWrite,
-    checks: ['backpressure', 'SHA/size roundtrip', 'skip/overwrite/create', 'virtual members before parent with ordered URLs', 'invalid virtual graph before output', 'validation before output', 'escaped metadata without whole JSON copies'] }));
+    checks: ['backpressure', 'SHA/size roundtrip', 'dense projected file IDs', 'prefix-hash resume', 'virtual selection dependencies with ordered URLs', 'invalid virtual graph before output', 'validation before output', 'escaped metadata without whole JSON copies'] }));
 } finally {
   await Promise.allSettled([...handles].map(value => value.close()));
   await rm(work, { recursive: true, force: true });

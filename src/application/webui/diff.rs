@@ -3,6 +3,7 @@
 //! キャッシュの分類・列挙・デコード・削除計画は ObjectStore 上で共有する。
 //! native は旧 YAML レイアウトの空ディレクトリと列挙失敗だけを補足する。
 
+use crate::application::novel_access::NovelReadScope;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
@@ -114,6 +115,7 @@ fn section_file_index(filename: &str) -> usize {
 /// SQLite) and Worker. A listed section counts even when reading/decoding it
 /// fails; only its unreadable title is skipped.
 pub async fn read_diff_cache_catalog(
+    scope: &mut NovelReadScope,
     objects: &dyn ObjectStore,
     novel_prefix: &ObjectKey,
     native_hints: &[CacheVersionHint],
@@ -124,6 +126,8 @@ pub async fn read_diff_cache_catalog(
         sections: Vec<(usize, &'a str, &'a ObjectKey)>,
     }
 
+    let prefix = ObjectPrefix::from(novel_prefix.clone());
+    let mut lease = scope.lease_for(&prefix).await?;
     let cache_objects = list_cache_objects(objects, novel_prefix).await?;
     let mut versions: BTreeMap<&str, Version<'_>> = BTreeMap::new();
     for hint in native_hints {
@@ -146,7 +150,7 @@ pub async fn read_diff_cache_catalog(
         let only_latest_update = group.sections.is_empty() && !group.enumeration_failed;
         let mut entries = Vec::with_capacity(group.sections.len());
         for (_, _, key) in group.sections {
-            let Ok(Some(bytes)) = objects.read_small(key).await else {
+            let Some(bytes) = lease.read_small(key).await? else {
                 continue;
             };
             let Ok(section) = serde_yaml::from_slice::<SectionFile>(&bytes) else {
@@ -281,7 +285,8 @@ mod tests {
     #[test]
     fn stored_catalog_pages_orders_and_cleans_sections_and_markers() {
         futures::executor::block_on(async {
-            let store = MemoryObjectStore::new();
+            let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(MemoryObjectStore::new());
+            let mut scope = NovelReadScope::new(&store, "diff-catalog-test");
             let keys = NovelObjectKeys::new("site", "title", true).unwrap();
             // More than one real page; key order differs from section order.
             for index in (1..=1002).rev() {
@@ -298,7 +303,7 @@ mod tests {
             store.write_small(&nested, section_bytes(1)).await.unwrap();
             store.write_small(&keys.section("1", "現在"), section_bytes(1)).await.unwrap();
 
-            let versions = read_diff_cache_catalog(&store, keys.prefix(), &[]).await.unwrap();
+            let versions = read_diff_cache_catalog(&mut scope, store.as_ref(), keys.prefix(), &[]).await.unwrap();
             assert_eq!(versions.iter().map(|version| version.version.as_str()).collect::<Vec<_>>(),
                 ["v4", "v3", "v2", "v1"]);
             assert!(!versions[0].only_latest_update);
@@ -315,18 +320,19 @@ mod tests {
                 CacheVersionHint { version: "v0".to_string(), enumeration_succeeded: true },
                 CacheVersionHint { version: "v3".to_string(), enumeration_succeeded: false },
             ];
-            let hinted = read_diff_cache_catalog(&store, keys.prefix(), &hints).await.unwrap();
+            let hinted = read_diff_cache_catalog(&mut scope, store.as_ref(), keys.prefix(), &hints).await.unwrap();
             assert!(!hinted.iter().find(|version| version.version == "v3").unwrap().only_latest_update);
             assert!(hinted.iter().find(|version| version.version == "v0").unwrap().only_latest_update);
 
-            let plan = plan_diff_cache_clean(&store, keys.prefix()).await.unwrap();
+            let plan = plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap();
             assert_eq!(plan.len(), 1005);
             for key in plan {
                 store.delete(&key).await.unwrap();
             }
-            assert!(read_diff_cache_catalog(&store, keys.prefix(), &[]).await.unwrap().is_empty());
+            assert!(read_diff_cache_catalog(&mut scope, store.as_ref(), keys.prefix(), &[]).await.unwrap().is_empty());
             assert!(store.read_small(&nested).await.unwrap().is_some());
             assert!(store.read_small(&keys.section("1", "現在")).await.unwrap().is_some());
+            scope.release_all().await.unwrap();
         });
     }
 

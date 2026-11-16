@@ -59,3 +59,5 @@ pub fn open_in_memory() -> Result<Arc<Mutex<Connection>>> {
 pub(crate) fn sqlite_error(error: impl std::fmt::Display) -> NarouError {
     NarouError::Platform(format!("sqlite: {error}"))
 }
+
+pub(crate) fn read_u64(row:&rusqlite::Row<'_>,index:usize)->rusqlite::Result<u64>{let value:i64=row.get(index)?;u64::try_from(value).map_err(|error|rusqlite::Error::FromSqlConversionFailure(index,rusqlite::types::Type::Integer,Box::new(error)))}

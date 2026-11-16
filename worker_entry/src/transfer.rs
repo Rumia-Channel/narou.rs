@@ -1,1668 +1,201 @@
-//! `/api/transfer/export` / `/api/transfer/import` — portable novel archives.
-//!
-//! The archive format itself is platform neutral (`narou_rs::transfer`): the
-//! manifest, the deterministic ZIP writer and the parser are shared with the
-//! CLI and the native Web API. This module is only the Worker glue.
-//!
-//! `GET  /api/transfer/export?ids=1,2` returns `application/zip`.
-//! `POST /api/transfer/import[?overwrite=true]` accepts a raw ZIP body and
-//! returns `{success, created, overwritten, skipped, errors}`.
-//!
-//! # Storage strategy
-//!
-//! Both directions talk to the object store, never to a filesystem (the Worker
-//! has none):
-//!
-//! * Export opens each stored object as a stream and compresses it directly
-//!   into the pull-driven response. Only manifest/directory metadata remains.
-//! * Import receives into an unpublished durable stage, verifies every ZIP
-//!   entry and manifest digest, and stages decoded entries before applying the
-//!   complete conflict plan. Staged keys are cleaned on success, failure and
-//!   cancellation; the store journal reconciles isolate termination.
-//! * Overwrite preserves record IDs, folder names and files absent from the
-//!   archive. New records are published only after their files are durable.
-//!
-//! # Virtual groups
-//!
-//! A selected virtual parent expands into its ordinary members; the members
-//! are written once and the parent descriptor carries their URLs in
-//! registration order. The parent itself owns no body: only its per-novel
-//! inputs (settings, replacement rules, converter options, cover) travel.
-//! Import restores the ordinary members first and publishes the parent with
-//! the destination IDs, so a group never points at a foreign library.
-//!
-//! The shared 512 MiB archive and 256 MiB file limits apply; binary files do
-//! not travel through the 16 MiB small-object API.
-//!
-//! [`SplitStore`]: narou_rs::platform::SplitStore
-
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+//! Authenticated client-first transfer v2; no server ZIP or Base64 path.
+use base64::Engine;
 use futures::StreamExt;
-use chrono::{DateTime, SecondsFormat, Utc};
-use narou_rs::db::NovelRecord;
-use narou_rs::downloader::site_setting::SiteSetting;
-use narou_rs::downloader::types::TocFile;
-use narou_rs::downloader::util::{load_length_limit, sanitize_filename_with_limit};
-use narou_rs::illustration_store::IllustrationIndex;
-use narou_rs::platform::{
-    NovelId, NovelMutation, NovelObjectKeys, ObjectKey, ObjectListRequest, ObjectPrefix,
-    ObjectStore, AssetStore, AssetStream, StagedAsset,
-};
-use narou_rs::transfer::{
-    ArchiveFile, ArchiveNovel, ConflictPolicy, ExistingNovel, StagedArchive, StagedNovel,
-    ImportAction, MAX_ARCHIVE_BYTES, MAX_FILE_BYTES, VIRTUAL_INPUT_FILES, flag_value,
-    import_payload, is_zip_content_type, parse_ids, plan_manifest, bounded_asset_stream,
-};
-use narou_rs::virtual_novel as virtual_core;
-use worker::{Env, Method, Request, Response, console_log};
-
-use crate::composition::WorkerRuntime;
-
-mod progress;
-
-/// Maximum request body accepted by `POST /api/transfer/import`.
-///
-/// The archive core enforces the same cap after decode; checking it here keeps
-/// an oversized body out of the parser in the first place.
-pub const MAX_IMPORT_BODY_BYTES: u64 = MAX_ARCHIVE_BYTES;
-
-
-/// Page size for object listings (the D1/S3 adapters both paginate by cursor).
-const LIST_PAGE_SIZE: usize = 100;
-
-/// Upper bound on listing pages per prefix, so a backend that keeps returning
-/// a cursor cannot spin forever (100 pages = 10,000 objects per prefix).
-const MAX_LIST_PAGES: usize = 100;
-
-/// The single file every novel must contain for a transfer.
-const TOC_FILE: &str = "toc.yaml";
-/// Existing small-metadata contract, not a binary asset/ZIP limit.
-const MAX_TOC_METADATA_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Top-level novel-directory entries the native export never archives.
-const EXCLUDED_TOP_LEVEL_DIRS: &[&str] = &["backup"];
-
-/// Same limits `narou_rs::transfer` enforces when it validates a path.
-const MAX_PATH_BYTES: usize = 4096;
-const MAX_PATH_COMPONENT_CHARS: usize = 255;
-
-/// Folder-name length limit used by the downloader (`folder-length-limit`).
-///
-/// Matches the native `derive_file_title` call: the Worker has no local setting
-/// file, so `load_length_limit` returns the caller-provided default.
-const FOLDER_LENGTH_LIMIT: Option<usize> = Some(50);
-
-/// Entry point; `lib.rs` routes both transfer paths here.
-pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
-    match (req.method(), req.path().as_str()) {
-        (Method::Get, "/api/transfer/export") => export(req, env).await,
-        (Method::Post, "/api/transfer/import") => import(req, env).await,
-        (
-            _,
-            "/api/transfer/export" | "/api/transfer/import",
-        ) => Response::error("Method Not Allowed", 405),
-        _ => Response::error("Not Found", 404),
-    }
+use narou_rs::application::transfer::*;
+use narou_rs::transfer::protocol::{BatchHeader,FrameDecoder};
+use serde::{Deserialize,Serialize};
+use worker::{Env,Method,Request,Response};
+pub(crate) mod journal;
+mod ticket;
+mod error;
+#[path="transfer/protocol.rs"]
+pub(crate) mod backend;
+#[path="transfer/progress.rs"]
+mod publication;
+#[path="transfer/source.rs"]
+mod source;
+#[path="transfer/steps.rs"]
+mod steps;
+const PREFIX:&str="/api/transfer/v2";
+#[derive(Deserialize)]
+struct Operation{operation_id:String}
+#[derive(Deserialize)]
+struct Seal{operation_id:String,#[serde(with="narou_rs::transfer::protocol::decimal_u64")]size:u64,sha256:String}
+#[derive(Deserialize)]
+struct Select{operation_id:String,#[serde(flatten)]selection:SelectionRequest}
+#[derive(Deserialize)]
+struct Publish{operation_id:String,plan_revision:String}
+fn invalid(code:&'static str,message:impl Into<String>)->TransferError{TransferError::InvalidRequest{code,message:message.into()}}
+fn platform(e:impl std::fmt::Display)->TransferError{TransferError::Platform{message:e.to_string()}}
+fn header(req:&Request,name:&str)->Result<Option<String>,TransferError>{req.headers().get(name).map_err(platform)}
+fn secret(req:&Request)->Result<Vec<u8>,TransferError>{
+    let value=header(req,"x-narou-transfer-secret")?.ok_or(TransferError::SecretMismatch)?;
+    let bytes=base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value).map_err(|_|TransferError::SecretMismatch)?;
+    if bytes.len()!=32{return Err(TransferError::SecretMismatch);}Ok(bytes)
 }
-
-// ---------------------------------------------------------------------------
-// export
-// ---------------------------------------------------------------------------
-
-/// `GET /api/transfer/export?ids=1,2` — download a ZIP of the selected novels.
-async fn export(req: Request, env: Env) -> worker::Result<Response> {
-    if let Some(response) = crate::auth_failure(&req, &env).await {
-        return response;
-    }
-    let url = req.url().map_err(|error| worker::Error::RustError(error.to_string()))?;
-    let ids = match parse_ids(crate::webui::query_param(&url, "ids").as_deref()) {
-        Ok(ids) => ids,
-        Err(message) => return export_error(400, message),
-    };
-    let events = flag_value(crate::webui::query_param(&url, "progress").as_deref());
-    let Some(permit) = crate::memory_budget::try_heavy() else {
-        return crate::memory_budget::busy_response();
-    };
-    let runtime = match WorkerRuntime::build_ui(&env).await {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            console_log!("transfer export: service composition failed: {error}");
-            return export_error(503, "Service unavailable".into());
-        }
-    };
-    let novels = match collect_export_novels(&runtime, &ids).await {
-        Ok(novels) => novels,
-        Err((status, message)) => return progress::export_error(events, status, message),
-    };
-    progress::export(runtime.assets(), novels, permit, events)
+fn control(req:&Request,operation_id:String)->Result<ControlOp,TransferError>{
+    if operation_id.is_empty()||operation_id.len()>128{return Err(invalid("invalid_operation","operation_id is required"));}
+    let value=header(req,"if-match")?.ok_or(TransferError::PreconditionRequired)?;
+    let text=value.strip_prefix('"').and_then(|v|v.strip_suffix('"')).unwrap_or(&value);
+    let revision=text.parse().map_err(|_|invalid("invalid_revision","If-Match must be a decimal revision"))?;
+    Ok(ControlOp{operation_id:OperationId(operation_id),if_match_revision:revision})
 }
-
-/// One novel inside the export stream: manifest metadata plus stored objects.
-pub(super) struct ExportNovel {
-    /// Manifest metadata; the streaming writer fills the file list itself.
-    pub(super) metadata: ArchiveNovel,
-    /// Stored objects as `(relative path, key, size)`.
-    pub(super) files: Vec<(String, ObjectKey, u64)>,
+async fn json<T:serde::de::DeserializeOwned>(req:&mut Request)->Result<T,TransferError>{
+    if !header(req,"content-type")?.is_some_and(|v|v.split(';').next().is_some_and(|s|s.trim().eq_ignore_ascii_case("application/json"))){return Err(invalid("unsupported_media_type","control body must be application/json"));}
+    let mut input=req.stream().map_err(platform)?;let mut bytes=Vec::new();
+    while let Some(part)=input.next().await{let part=part.map_err(platform)?;
+        if part.len()>MAX_CONTROL_BODY_BYTES.saturating_sub(bytes.len()){return Err(TransferError::ExceedsLimit{code:"control_too_large",message:"control body exceeds 256 KiB".into()});}
+        bytes.extend_from_slice(&part);
+    }
+    serde_json::from_slice(&bytes).map_err(|e|invalid("invalid_json",e.to_string()))
 }
-
-/// Builds the export list: ordinary works first, then the virtual parents.
-///
-/// A selected virtual parent expands into its ordinary members; a member that
-/// is selected as well is stored once. The membership order travels in
-/// `virtual_members`, so the archive order stays "members before parents".
-async fn collect_export_novels(
-    runtime: &WorkerRuntime,
-    ids: &[i64],
-) -> Result<Vec<ExportNovel>, (u16, String)> {
-    let objects = runtime.write_objects();
-    let membership = crate::virtual_novels::load_membership(runtime.write_db())
-        .await
-        .map_err(|error| (500, format!("バーチャル小説のメンバー構成を読み込めません: {error}")))?;
-
-    let mut ordinary: Vec<NovelRecord> = Vec::new();
-    let mut seen: HashSet<i64> = HashSet::new();
-    // A parent keeps the ordered member URLs only; the member records move
-    // into the ordinary list so no record is stored twice.
-    let mut parents: Vec<(NovelRecord, Vec<String>)> = Vec::new();
-
-    for id in ids {
-        let record = runtime
-            .novels
-            .get(NovelId(*id))
-            .await
-            .map_err(|error| (500, format!("ID: {id}: {error}")))?
-            .ok_or((404, format!("ID: {id} が見つかりません")))?;
-        let Some(member_ids) = membership.get(record.id) else {
-            if virtual_core::is_virtual_record(&record) {
-                return Err((404, format!("ID: {id} のバーチャル小説にメンバーがありません")));
-            }
-            if seen.insert(record.id) {
-                ordinary.push(record);
-            }
-            continue;
-        };
-        let mut member_urls = Vec::with_capacity(member_ids.len());
-        for member_id in member_ids {
-            let member = runtime
-                .novels
-                .get(NovelId(*member_id))
-                .await
-                .map_err(|error| (500, format!("ID: {id}: メンバー ID:{member_id}: {error}")))?
-                .ok_or((404, format!("ID: {id}: メンバー ID:{member_id} が見つかりません")))?;
-            if virtual_core::is_virtual_record(&member) {
-                return Err((400, format!("ID: {id}: メンバー ID:{member_id} はバーチャル小説です")));
-            }
-            member_urls.push(member.toc_url.clone());
-            if seen.insert(member.id) {
-                ordinary.push(member);
-            }
-        }
-        parents.push((record, member_urls));
-    }
-
-    let mut novels = Vec::with_capacity(ordinary.len() + parents.len());
-    for record in ordinary {
-        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
-            .map_err(|error| (400, error.to_string()))?;
-        let files = collect_novel_files(objects.as_ref(), &keys)
-            .await
-            .map_err(|message| (400, message))?;
-        if !files.iter().any(|(path, _, _)| path == TOC_FILE) {
-            return Err((404, format!("ID: {} に {TOC_FILE} がありません", record.id)));
-        }
-        novels.push(ExportNovel {
-            metadata: archive_novel_from_record(&record, Vec::new(), None),
-            files,
-        });
-    }
-    for (record, member_urls) in parents {
-        // The parent's own identity travels as a portable URL, so another
-        // library can address the same group without the local ID.
-        let toc_url = portable_toc_url(runtime, &record)
-            .await
-            .map_err(|message| (500, message))?;
-        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
-            .map_err(|error| (400, error.to_string()))?;
-        // A parent has no body of its own: only the shared input files are
-        // stat'ed, so unrelated content never enters the archive.
-        let files = collect_virtual_inputs(objects.as_ref(), &keys)
-            .await
-            .map_err(|message| (400, message))?;
-        novels.push(ExportNovel {
-            metadata: archive_virtual_from_record(&record, &toc_url, member_urls),
-            files,
-        });
-    }
-    Ok(novels)
+fn decorate(mut response:Response)->worker::Result<Response>{
+    response.headers_mut().set("Cache-Control","no-store, no-transform")?;
+    response.headers_mut().set("X-Content-Type-Options","nosniff")?;Ok(response)
 }
-
-/// Collects a virtual parent's own portable inputs.
-///
-/// Only the six shared input files are stat'ed. A parent keeps no body, so
-/// listing the whole prefix would read content that never travels.
-async fn collect_virtual_inputs(
-    store: &dyn ObjectStore,
-    keys: &NovelObjectKeys,
-) -> Result<Vec<(String, ObjectKey, u64)>, String> {
-    let mut files = Vec::new();
-    for name in VIRTUAL_INPUT_FILES {
-        let key = object_key_for(keys, name)?;
-        let Some(metadata) = store
-            .stat(&key)
-            .await
-            .map_err(|error| format!("保存先を確認できません: {error}"))?
-        else {
-            continue;
-        };
-        if metadata.size > MAX_FILE_BYTES {
-            return Err(format!("{name}: ファイルが上限 {MAX_FILE_BYTES} bytes を超えています"));
-        }
-        files.push((name.to_string(), key, metadata.size));
-    }
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(files)
+fn response<T:Serialize>(value:&T)->worker::Result<Response>{
+    let bytes=serde_json::to_vec(value).map_err(|e|worker::Error::RustError(e.to_string()))?;
+    if bytes.len()>MAX_CONTROL_BODY_BYTES{return error::response(&TransferError::ExceedsLimit{code:"metadata_budget",message:"control response exceeds 256 KiB".into()});}
+    let mut response=Response::from_bytes(bytes)?;response.headers_mut().set("Content-Type","application/json; charset=utf-8")?;decorate(response)
 }
-
-/// Older virtual records carry a library-local URL (`.../virtual/vs_<ID>`)
-/// that collides across libraries. The first export persists one portable
-/// identity in the source record; concurrent exports converge on the same
-/// winner and unrelated columns are left untouched.
-async fn portable_toc_url(runtime: &WorkerRuntime, record: &NovelRecord) -> Result<String, String> {
-    let mut current = record.toc_url.clone();
-    for _ in 0..8 {
-        if virtual_core::is_portable_toc_url(&current) {
-            return Ok(current);
-        }
-        let candidate = virtual_core::new_toc_url()
-            .map_err(|error| format!("バーチャル小説の保存先 URL を作れません: {error}"))?;
-        let updated = runtime
-            .write_db()
-            .prepare(
-                "UPDATE novels SET toc_url=?1, toc_url_fold=?2 \
-                 WHERE id=?3 AND toc_url_fold=?4 AND ncode GLOB 'vs_[0-9]*' \
-                 AND substr(ncode,4) NOT GLOB '*[^0-9]*' RETURNING toc_url",
-            )
-            .bind(&[
-                candidate.clone().into(),
-                narou_rs::db::novel_codec::fold(&candidate).into(),
-                (record.id as f64).into(),
-                narou_rs::db::novel_codec::fold(&current).into(),
-            ])
-            .map_err(|error| format!("バーチャル小説の保存先 URL を保存できません: {error}"))?
-            .all()
-            .await
-            .map_err(|error| format!("バーチャル小説の保存先 URL を保存できません: {error}"))?
-            .results::<TocUrlRow>()
-            .map_err(|error| format!("バーチャル小説の保存先 URL を保存できません: {error}"))?;
-        if let Some(row) = updated.into_iter().next() {
-            return Ok(row.toc_url);
-        }
-        // Another writer stored an identity first: its value is the shared one.
-        let row = runtime
-            .write_db()
-            .prepare("SELECT toc_url FROM novels WHERE id=?1")
-            .bind(&[(record.id as f64).into()])
-            .map_err(|error| format!("バーチャル小説の保存先 URL を読み込めません: {error}"))?
-            .first::<TocUrlRow>(None)
-            .await
-            .map_err(|error| format!("バーチャル小説の保存先 URL を読み込めません: {error}"))?;
-        current = row
-            .map(|row| row.toc_url)
-            .ok_or_else(|| format!("ID:{} が見つかりません", record.id))?;
-    }
-    Err(format!("ID:{} のバーチャル小説の保存先 URL を更新できません", record.id))
+fn status_response(status:&SessionStatus)->worker::Result<Response>{
+    let mut response=response(status)?;response.headers_mut().set("ETag",&format!("\"{}\"",status.revision))?;Ok(response)
 }
-
-/// One `toc_url` column of the novels table.
-#[derive(serde::Deserialize)]
-struct TocUrlRow {
-    toc_url: String,
-}
-
-
-/// Collects one novel's stored objects as archive entries (relative paths).
-///
-/// Mirrors the native `collect_novel_files`: the whole logical prefix is
-/// archived except runtime artifacts and names the archive format cannot
-/// represent, which are skipped rather than failing the export.
-async fn collect_novel_files(
-    store: &dyn ObjectStore,
-    keys: &NovelObjectKeys,
-) -> Result<Vec<(String, ObjectKey, u64)>, String> {
-    let mut listed: BTreeMap<String, u64> = BTreeMap::new();
-    let prefix = keys.prefix();
-    list_prefix(store, prefix.as_ref(), &mut listed).await?;
-    // Illustrations can live in a different backend (S3). `SplitStore` routes
-    // only an illustration *prefix* to it, so the novel prefix above never
-    // covers them there.
-    let illustrations = ObjectPrefix::new(format!("{}/挿絵", prefix.as_ref()))
-        .map_err(|error| format!("挿絵のプレフィックスを作れません: {error}"))?;
-    list_prefix(store, illustrations.as_ref(), &mut listed).await?;
-    collect_indexed_illustrations(store, keys, &mut listed).await?;
-
-    let root = format!("{}/", prefix.as_ref());
-    let mut files = Vec::new();
-    for (key, size) in listed {
-        let Some(relative) = key.strip_prefix(root.as_str()) else {
-            continue;
-        };
-        let relative = relative.to_string();
-        if is_excluded_top_level(&relative)
-            || is_excluded_file_name(&relative)
-            || !is_archivable_relative_path(&relative)
-        {
-            continue;
-        }
-        if size > MAX_FILE_BYTES {
-            return Err(format!("{relative}: ファイルが上限 {MAX_FILE_BYTES} bytes を超えています"));
-        }
-        let object_key = ObjectKey::try_new(key).map_err(|error| error.to_string())?;
-        files.push((relative, object_key, size));
-    }
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(files)
-}
-
-/// Deduplicated S3 images live outside the novel prefix. Resolve the index's
-/// logical keys through the store, which also preserves legacy-file fallback.
-async fn collect_indexed_illustrations(
-    store: &dyn ObjectStore,
-    keys: &NovelObjectKeys,
-    listed: &mut BTreeMap<String, u64>,
-) -> Result<(), String> {
-    let filenames = match store.read_small(&keys.illustration_cache()).await
-        .map_err(|error| format!("挿絵の索引を取得できません: {error}"))?
-    {
-        Some(bytes) => {
-            let index: IllustrationIndex = serde_yaml::from_slice(&bytes)
-                .map_err(|error| format!("挿絵の索引を解析できません: {error}"))?;
-            index.filenames()
-        }
-        None => return Ok(()),
-    };
-    // Release the decoded index before awaiting storage; only unique filenames
-    // survive. Binary payloads remain on the existing streaming export path.
-    for filename in filenames {
-        let key = keys.illustration(&filename).map_err(|error| error.to_string())?;
-        if let Some(metadata) = store.stat(&key).await
-            .map_err(|error| format!("挿絵の保存状態を確認できません: {error}"))?
-        {
-            listed.insert(key.as_ref().to_string(), metadata.size);
-        }
-    }
-    Ok(())
-}
-
-/// Lists every key below `prefix` and records its size.
-async fn list_prefix(
-    store: &dyn ObjectStore,
-    prefix: &str,
-    into: &mut BTreeMap<String, u64>,
-) -> Result<(), String> {
-    let prefix = ObjectPrefix::new(prefix)
-        .map_err(|error| format!("オブジェクトのプレフィックスが不正です: {error}"))?;
-    let mut cursor: Option<String> = None;
-    for _ in 0..MAX_LIST_PAGES {
-        let mut request = ObjectListRequest::new(
-            prefix.clone(),
-            std::num::NonZeroUsize::new(LIST_PAGE_SIZE).expect("page size is non-zero"),
-        );
-        request.cursor = cursor.take();
-        let page = store
-            .list_page(&request)
-            .await
-            .map_err(|error| format!("オブジェクト一覧を取得できません: {error}"))?;
-        for metadata in page.objects {
-            into.entry(metadata.key.as_ref().to_string())
-                .or_insert(metadata.size);
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(()),
-        }
-    }
-    Err(format!(
-        "オブジェクト一覧が {MAX_LIST_PAGES} ページを超えました ({} 件)",
-        into.len()
-    ))
-}
-
-/// Builds the manifest metadata for one record (native
-/// `archive_novel_from_record`).
-fn archive_novel_from_record(
-    record: &NovelRecord,
-    files: Vec<ArchiveFile>,
-    subtitle: Option<String>,
-) -> ArchiveNovel {
-    ArchiveNovel {
-        toc_url: record.toc_url.clone(),
-        title: record.title.clone(),
-        author: record.author.clone(),
-        sitename: record.sitename.clone(),
-        domain: record.domain.clone(),
-        tags: record.tags.clone(),
-        attribute_tag: record.attribute_tag().map(str::to_string),
-        novel_type: record.novel_type,
-        files,
-        ncode: record.ncode.clone(),
-        subtitle,
-        general_lastup: record.general_lastup.map(rfc3339),
-        last_update: Some(rfc3339(record.last_update)),
-        virtual_members: None,
-    }
-}
-
-/// Builds the manifest metadata for one virtual parent.
-///
-/// A parent is a grouping structure, not a work: it carries no ncode, no
-/// library-local tag and no body. Its members travel as ordinary URLs in
-/// registration order.
-fn archive_virtual_from_record(
-    record: &NovelRecord,
-    toc_url: &str,
-    members: Vec<String>,
-) -> ArchiveNovel {
-    ArchiveNovel {
-        toc_url: toc_url.to_string(),
-        title: record.title.clone(),
-        author: record.author.clone(),
-        sitename: record.sitename.clone(),
-        domain: record.domain.clone(),
-        tags: record
-            .tags
-            .iter()
-            .filter(|tag| !virtual_core::is_internal_tag(tag))
-            .cloned()
-            .collect(),
-        attribute_tag: record.attribute_tag().map(str::to_string),
-        novel_type: record.novel_type,
-        files: Vec::new(),
-        ncode: None,
-        subtitle: None,
-        general_lastup: record.general_lastup.map(rfc3339),
-        last_update: Some(rfc3339(record.last_update)),
-        virtual_members: Some(members),
-    }
-}
-
-fn parse_toc_story(bytes: &[u8]) -> Option<String> {
-    let toc: TocFile = serde_yaml::from_slice(bytes).ok()?;
-    toc.story.filter(|story| !story.trim().is_empty())
-}
-
-fn rfc3339(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Secs, true)
-}
-
-fn parse_rfc3339(value: Option<&str>) -> Option<DateTime<Utc>> {
-    value
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&Utc))
-}
-
-// ---------------------------------------------------------------------------
-// import
-// ---------------------------------------------------------------------------
-
-/// `POST /api/transfer/import[?overwrite=true]` — import a raw ZIP body.
-async fn import(mut req: Request, env: Env) -> worker::Result<Response> {
-    if let Some(response) = crate::auth_failure(&req, &env).await {
-        return response;
-    }
-    if !request_is_zip(&req) {
-        return import_error(
-            415,
-            "Content-Type は application/zip を指定してください".to_string(),
-        );
-    }
-    // Refuse an oversized upload before buffering it. The platform enforces its
-    // own request-body limit first; this is the archive contract's cap.
-    let declared = req
-        .headers()
-        .get("content-length")
-        .ok()
-        .flatten()
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    if let Some(declared) = declared
-        && declared > MAX_IMPORT_BODY_BYTES
-    {
-        return import_error(
-            413,
-            format!(
-                "アーカイブが大きすぎます ({declared} bytes、上限 {MAX_IMPORT_BODY_BYTES} bytes)"
-            ),
-        );
-    }
-
-    let url = req.url().map_err(|error| worker::Error::RustError(error.to_string()))?;
-    let policy = if flag_value(crate::webui::query_param(&url, "overwrite").as_deref()) {
-        ConflictPolicy::Overwrite
-    } else {
-        ConflictPolicy::Skip
-    };
-    let Some(permit) = crate::memory_budget::try_heavy() else {
-        return crate::memory_budget::busy_response();
-    };
-    let runtime = match WorkerRuntime::build_ui(&env).await {
-        Ok(runtime) => runtime,
-        Err(error) => return import_error(503, error.to_string()),
-    };
-    let stream = match req.stream() {
-        Ok(stream) => stream,
-        Err(error) => return import_error(400, error.to_string()),
-    };
-    let body: AssetStream = Box::pin(stream.map(|chunk| chunk.map_err(|error| {
-        narou_rs::error::NarouError::Platform(format!("request body: {error}"))
-    })));
-    if flag_value(crate::webui::query_param(&url, "progress").as_deref()) {
-        return progress::import(body, policy, runtime, permit);
-    }
-    // Plain JSON has no response-body work; admission lasts through import.
-    let _permit = permit;
-    import_body(body, policy, runtime, None).await
-}
-
-async fn import_body(
-    body: AssetStream, policy: ConflictPolicy, runtime: WorkerRuntime,
-    progress: Option<&mut progress::EventSender>,
-) -> worker::Result<Response> {
-
-    let assets = runtime.assets();
-    let mut cleanup = StageCleanup { assets: assets.clone(), keys: Vec::new() };
-    let source = match assets.stage_stream(bounded_asset_stream(body, MAX_IMPORT_BODY_BYTES)).await {
-        Ok(source) => source,
-        Err(error) => return import_error(400, error.to_string()),
-    };
-    cleanup.keys.push(source.key.clone());
-    let parsed = match StagedArchive::read(assets.clone(), &source, &mut cleanup.keys, None).await {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            cleanup.finish().await;
-            return import_error(400, error.to_string());
-        }
-    };
-    let result = import_validated(runtime, parsed, policy, progress).await;
-    cleanup.finish().await;
-    result
-}
-
-async fn import_validated(
-    runtime: WorkerRuntime, parsed: StagedArchive, policy: ConflictPolicy,
-    mut progress: Option<&mut progress::EventSender>,
-) -> worker::Result<Response> {
-    let assets = runtime.assets();
-    let objects = runtime.write_objects();
-
-    // Conflicts are resolved by `toc_url`. Resolve only the archives' URLs
-    // through the indexed membership query, then fetch the matching records —
-    // an import must not read the whole library.
-    let urls: Vec<String> = parsed
-        .novels
-        .iter()
-        .map(|novel| novel.toc_url.clone())
-        .collect();
-    let known = match runtime.novels.contains_toc_urls(&urls).await {
-        Ok(known) if known.len() == urls.len() => known,
-        Ok(_) => {
-            return import_error(500, "URL の照合結果が不正です".to_string());
-        }
-        Err(error) => {
-            return import_error(
-                500,
-                format!("ライブラリの照合に失敗しました: {error}"),
-            );
-        }
-    };
-
-    let mut existing = Vec::with_capacity(urls.len());
-    let mut records_by_url: HashMap<String, NovelRecord> = HashMap::new();
-    for (index, url) in urls.iter().enumerate() {
-        if !known[index] {
-            continue;
-        }
-        match runtime.novels.find_by_toc_url(url).await {
-            Ok(Some(record)) => {
-                records_by_url
-                    .entry(url.clone())
-                    .or_insert_with(|| record.clone());
-                existing.push(ExistingNovel {
-                    toc_url: url.clone(),
-                    title: record.title,
-                });
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return import_error(
-                    500,
-                    format!("{url} のレコードを取得できません: {error}"),
-                );
-            }
-        }
-    }
-
-    let plan = plan_manifest(&parsed.manifest, &existing, policy);
-    let local = runtime
-        .settings_store()
-        .load(narou_rs::setting_core::SettingScope::Local)
-        .await
-        .unwrap_or_default();
-    let now = Utc::now();
-
-    let mut created = 0usize;
-    let mut overwritten = 0usize;
-    let mut skipped = 0usize;
-    let mut errors = Vec::new();
-    // The plan was computed against the library before the run; a single
-    // archive may repeat a toc_url, so track what this run already handled.
-    let mut handled_urls: HashSet<String> = HashSet::new();
-    // Archive member URL -> the destination record ID of an imported member.
-    // A parent is published with these IDs, never with the source ones.
-    let mut destinations: HashMap<String, i64> = HashMap::new();
-
-    // The plan is already ordered: ordinary members first, then the parents
-    // that reference them.
-    let total = plan.entries.len();
-    for (position, entry) in plan.entries.iter().enumerate() {
-        let novel = &parsed.novels[entry.index];
-        let metadata = &parsed.manifest.novels[entry.index];
-        let is_parent = metadata.virtual_members.is_some();
-        if let Some(sender) = progress.as_mut() {
-            progress::send_event(sender, serde_json::json!({"type":"progress","phase":"import",
-                "completed":position,"total":total,"title":novel.title})).await?;
-        }
-        if !handled_urls.insert(novel.toc_url.clone()) {
-            errors.push(format!(
-                "{}: 同じ toc_url がアーカイブ内で重複しています",
-                describe(novel)
-            ));
-            continue;
-        }
-        // A virtual parent and an ordinary work never replace each other.
-        if let Some(record) = records_by_url.get(&novel.toc_url)
-            && is_parent != virtual_core::is_virtual_record(record)
-        {
-            errors.push(format!(
-                "{}: ライブラリにある作品と種類が違います",
-                describe(novel)
-            ));
-            continue;
-        }
-        let result = match entry.action {
-            ImportAction::Skip => {
-                skipped += 1;
-                // An existing member still maps to its destination ID, so a
-                // parent can reference a member this run did not import.
-                if let Some(record) = records_by_url.get(&novel.toc_url) {
-                    destinations.insert(novel.toc_url.clone(), record.id);
-                }
-                continue;
-            }
-            ImportAction::Create if is_parent => {
-                let member_ids = match member_destinations(metadata, &destinations) {
-                    Ok(ids) => ids,
-                    Err(message) => {
-                        errors.push(format!("{}: {message}", describe(novel)));
-                        continue;
-                    }
-                };
-                create_virtual_parent(
-                    &runtime,
-                    objects.as_ref(),
-                    metadata,
-                    novel,
-                    &member_ids,
-                    &local,
-                    now,
-                )
-                .await
-                .map(|id| {
-                    created += 1;
-                    destinations.insert(novel.toc_url.clone(), id);
-                })
-            }
-            ImportAction::Create => create_novel(
-                &runtime,
-                objects.as_ref(),
-                metadata,
-                novel,
-                &local,
-                now,
-                assets.as_ref(),
-            )
-            .await
-            .map(|id| {
-                created += 1;
-                destinations.insert(novel.toc_url.clone(), id);
-            }),
-            ImportAction::Overwrite if is_parent => {
-                let Some(record) = records_by_url.get(&novel.toc_url) else {
-                    errors.push(format!(
-                        "{}: ライブラリにありません",
-                        describe(novel)
-                    ));
-                    continue;
-                };
-                let member_ids = match member_destinations(metadata, &destinations) {
-                    Ok(ids) => ids,
-                    Err(message) => {
-                        errors.push(format!("{}: {message}", describe(novel)));
-                        continue;
-                    }
-                };
-                overwrite_virtual_parent(
-                    &runtime,
-                    record,
-                    metadata,
-                    novel,
-                    &member_ids,
-                    assets.as_ref(),
-                )
-                .await
-                .map(|_| {
-                    overwritten += 1;
-                    destinations.insert(novel.toc_url.clone(), record.id);
-                })
-            }
-            ImportAction::Overwrite => {
-                let Some(record) = records_by_url.get(&novel.toc_url) else {
-                    errors.push(format!(
-                        "{}: ライブラリにありません",
-                        describe(novel)
-                    ));
-                    continue;
-                };
-                overwrite_novel(objects.as_ref(), &runtime, record, metadata, novel, assets.as_ref())
-                    .await
-                    .map(|_| {
-                        overwritten += 1;
-                        destinations.insert(novel.toc_url.clone(), record.id);
-                    })
-            }
-        };
-        if let Err(message) = result {
-            errors.push(format!("{}: {message}", describe(novel)));
-        }
-    }
-    if let Some(sender) = progress.as_mut() {
-        progress::send_event(sender, serde_json::json!({"type":"progress","phase":"import",
-            "completed":total,"total":total,"title":""})).await?;
-    }
-
-    let success = errors.is_empty();
-    Response::from_json(&import_payload(
-        success,
-        created,
-        overwritten,
-        skipped,
-        errors,
-    ))
-}
-
-/// Maps a parent's member references to destination record IDs.
-///
-/// A member that this run did not import blocks the parent: a group is never
-/// published with a missing member.
-fn member_destinations(
-    metadata: &ArchiveNovel,
-    destinations: &HashMap<String, i64>,
-) -> Result<Vec<i64>, String> {
-    let members = metadata
-        .virtual_members
-        .as_ref()
-        .ok_or_else(|| "バーチャル小説のメンバー構成がありません".to_string())?;
-    let mut ids = Vec::with_capacity(members.len());
-    for url in members {
-        match destinations.get(url) {
-            Some(id) => ids.push(*id),
-            None => {
-                return Err(format!(
-                    "メンバー {url} が取り込まれていないため公開しません"
-                ));
-            }
-        }
-    }
-    Ok(ids)
-}
-
-fn describe(novel: &StagedNovel) -> String {
-    if novel.title.is_empty() {
-        novel.toc_url.clone()
-    } else {
-        format!("{} ({})", novel.title, novel.toc_url)
-    }
-}
-
-/// Creates a new library entry from one archive novel.
-///
-/// Files are written first; the record is published only after every object is
-/// stored. A failure removes what this run wrote and releases the reserved id,
-/// so an interrupted import never leaves a half novel behind.
-async fn create_novel(
-    runtime: &WorkerRuntime,
-    objects: &dyn ObjectStore,
-    metadata: &ArchiveNovel,
-    novel: &StagedNovel,
-    local: &HashMap<String, serde_yaml::Value>,
-    now: DateTime<Utc>,
-    assets: &dyn AssetStore,
-) -> Result<i64, String> {
-    // Authoritative duplicate check: the plan ran against an earlier snapshot.
-    match runtime.novels.find_by_toc_url(&novel.toc_url).await {
-        Ok(Some(existing)) => {
-            return Err(format!("既に ID:{} として登録されています", existing.id));
-        }
-        Ok(None) => {}
-        Err(error) => return Err(format!("重複を確認できません: {error}")),
-    }
-    if !novel.files.iter().any(|(path, _)| path == TOC_FILE) {
-        return Err(format!("アーカイブに {TOC_FILE} がありません"));
-    }
-
-    let toc = parse_archive_toc(assets, &novel.files).await?;
-    let title = toc
-        .as_ref()
-        .map(|toc| toc.title.clone())
-        .filter(|title| !title.trim().is_empty())
-        .unwrap_or_else(|| metadata.title.clone());
-    if title.trim().is_empty() {
-        return Err("アーカイブに作品名がありません".to_string());
-    }
-    let author = toc
-        .as_ref()
-        .map(|toc| toc.author.clone())
-        .filter(|author| !author.trim().is_empty())
-        .unwrap_or_else(|| metadata.author.clone());
-
-    let setting = find_site_setting(runtime, &novel.toc_url);
-    // Manifest sitename first, then the site definition, then the URL host —
-    // the record needs a non-empty sitename because it names the key prefix.
-    let mut sitename = metadata.sitename.trim().to_string();
-    if sitename.is_empty()
-        && let Some(setting) = setting.as_ref()
-    {
-        sitename = setting.sitename.clone();
-    }
-    if sitename.is_empty()
-        && let Some(host) = host_of(&novel.toc_url)
-    {
-        sitename = host;
-    }
-    if sitename.is_empty() {
-        return Err("アーカイブにサイト名がありません".to_string());
-    }
-
-    let domain = metadata
-        .domain
-        .clone()
-        .filter(|domain| !domain.trim().is_empty())
-        .or_else(|| setting.as_ref().map(|setting| setting.domain.clone()))
-        .or_else(|| host_of(&novel.toc_url));
-    let ncode = metadata
-        .ncode
-        .clone()
-        .filter(|ncode| !ncode.trim().is_empty())
-        .or_else(|| extract_ncode(&novel.toc_url));
-    let append_title = setting
-        .as_ref()
-        .is_some_and(|setting| setting.append_title_to_folder_name);
-    let file_title = derive_file_title(ncode.as_deref(), &title, append_title);
-    let use_subdirectory = download_use_subdirectory(local);
-    let novel_type = if metadata.novel_type != 0 {
-        metadata.novel_type
-    } else {
-        toc.as_ref().and_then(|toc| toc.novel_type).unwrap_or(1)
-    };
-    let general_all_no = toc
-        .as_ref()
-        .map(|toc| toc.subtitles.len() as i64)
-        .filter(|count| *count > 0);
-
-    let keys = NovelObjectKeys::new(&sitename, &file_title, use_subdirectory)
-        .map_err(|error| format!("保存先キーを作れません: {error}"))?;
-
-    // The native import refuses an existing directory: it would overwrite a
-    // folder that is not the record it is about to create. The Worker
-    // equivalent is "the prefix already stores objects".
-    if prefix_has_objects(objects, &keys).await? {
-        return Err(format!(
-            "保存先 {} は既に使われています。管理外の保存先は上書きしません",
-            keys.prefix()
-        ));
-    }
-
-    let mut record = NovelRecord {
-        id: 0,
-        author,
-        title,
-        file_title,
-        toc_url: novel.toc_url.clone(),
-        sitename,
-        novel_type,
-        end: false,
-        last_update: now,
-        new_arrivals_date: None,
-        use_subdirectory,
-        general_firstup: None,
-        novelupdated_at: None,
-        general_lastup: parse_rfc3339(metadata.general_lastup.as_deref()),
-        last_mail_date: None,
-        tags: metadata.tags.clone(),
-        ncode,
-        domain,
-        general_all_no,
-        length: None,
-        suspend: false,
-        is_narou: setting.as_ref().is_some_and(|setting| setting.is_narou),
-        last_check_date: None,
-        convert_failure: false,
-        requires_login: false,
-        login_session: None,
-        extra_fields: Default::default(),
-    };
-    // The classification is metadata, not a tag: it travels in its own field.
-    // An archive without one leaves the record to the repository's own
-    // initialization.
-    if let Some(attribute) = metadata.attribute_tag.as_deref() {
-        record.set_attribute_tag(attribute);
-    }
-
-    let destinations = novel.files.iter().map(|(path, _)| object_key_for(&keys, path))
-        .collect::<Result<Vec<_>, _>>()?;
-    let reservation = runtime
-        .novels
-        .allocate_id()
-        .await
-        .map_err(|error| format!("ID を確保できません: {error}"))?;
-    record.id = reservation.id().0;
-    let id = record.id;
-
-    let mut cleanup = CreateCleanup {
-        assets: runtime.assets(), novels: runtime.novels.clone(),
-        reservation: Some(reservation), keys: destinations,
-    };
-    if let Err(message) = write_novel_files(assets, &keys, &novel.files).await {
-        cleanup.finish().await;
-        return Err(message);
-    }
-
-    if let Err(error) = runtime
-        .novels
-        .apply_batch(vec![NovelMutation::Upsert(record)])
-        .await
-    {
-        cleanup.finish().await;
-        return Err(format!("レコードを保存できません: {error}"));
-    }
-    cleanup.reservation = None;
-    Ok(id)
-}
-
-/// Replaces the files of an existing novel, keeping its record id and prefix.
-async fn overwrite_novel(
-    objects: &dyn ObjectStore,
-    runtime: &WorkerRuntime,
-    record: &NovelRecord,
-    metadata: &ArchiveNovel,
-    novel: &StagedNovel,
-    assets: &dyn AssetStore,
-) -> Result<(), String> {
-    let keys = NovelObjectKeys::new(
-        &record.sitename,
-        &record.file_title,
-        record.use_subdirectory,
-    )
-    .map_err(|error| format!("保存先キーを作れません: {error}"))?;
-
-    // A record whose stored toc is gone is not an overwrite target: writing
-    // the prefix back would resurrect a copy while the rest of the novel is
-    // missing.
-    match objects.stat(&keys.toc()).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return Err(format!(
-                "保存先 {} に {TOC_FILE} がありません。上書きは既存の保存先にだけ行います",
-                keys.prefix()
-            ));
-        }
-        Err(error) => return Err(format!("保存先を確認できません: {error}")),
-    }
-
-    let toc = parse_archive_toc(assets, &novel.files).await?;
-    write_novel_files(assets, &keys, &novel.files).await?;
-
-    // Only fill fields the live record does not have. Changing title/author of
-    // a managed novel is the downloader's job, and changing sitename/file_title
-    // would move the prefix out from under the files just written.
-    let toc_title = toc
-        .as_ref()
-        .map(|toc| toc.title.clone())
-        .filter(|title| !title.trim().is_empty());
-    let toc_author = toc
-        .as_ref()
-        .map(|toc| toc.author.clone())
-        .filter(|author| !author.trim().is_empty());
-    let mut updated = record.clone();
-    let mut changed = false;
-    if updated.author.trim().is_empty()
-        && let Some(author) = toc_author
-            .or_else(|| (!metadata.author.trim().is_empty()).then(|| metadata.author.clone()))
-    {
-        updated.author = author;
-        changed = true;
-    }
-    if updated.title.trim().is_empty()
-        && let Some(title) = toc_title
-            .or_else(|| (!metadata.title.trim().is_empty()).then(|| metadata.title.clone()))
-    {
-        updated.title = title;
-        changed = true;
-    }
-    if updated.ncode.is_none()
-        && let Some(ncode) = metadata
-            .ncode
-            .clone()
-            .filter(|ncode| !ncode.trim().is_empty())
-    {
-        updated.ncode = Some(ncode);
-        changed = true;
-    }
-    if updated.domain.is_none()
-        && let Some(domain) = metadata.domain.clone()
-    {
-        updated.domain = Some(domain);
-        changed = true;
-    }
-    if updated.general_all_no.is_none()
-        && let Some(count) = toc
-            .as_ref()
-            .map(|toc| toc.subtitles.len() as i64)
-            .filter(|count| *count > 0)
-    {
-        updated.general_all_no = Some(count);
-        changed = true;
-    }
-    if updated.general_lastup.is_none()
-        && let Some(lastup) = parse_rfc3339(metadata.general_lastup.as_deref())
-    {
-        updated.general_lastup = Some(lastup);
-        changed = true;
-    }
-    // The classification is metadata the archive carries explicitly, so an
-    // overwrite restores it. An archive without one leaves the live
-    // classification untouched.
-    if let Some(attribute) = metadata.attribute_tag.as_deref()
-        && updated.attribute_tag() != Some(attribute)
-    {
-        updated.set_attribute_tag(attribute);
-        changed = true;
-    }
-
-    if changed {
-        runtime
-            .novels
-            .apply_batch(vec![NovelMutation::Upsert(updated)])
-            .await
-            .map_err(|error| format!("レコードを保存できません: {error}"))?;
-    }
-    Ok(())
-}
-
-/// Creates a new virtual parent from one archive entry.
-///
-/// The parent owns no body: only its per-novel inputs (settings, replacement
-/// rules, converter options and cover) are stored. The record and the
-/// membership are published in one transaction, so a failed member never
-/// leaves a visible group behind.
-async fn create_virtual_parent(
-    runtime: &WorkerRuntime,
-    objects: &dyn ObjectStore,
-    metadata: &ArchiveNovel,
-    novel: &StagedNovel,
-    member_ids: &[i64],
-    local: &HashMap<String, serde_yaml::Value>,
-    now: DateTime<Utc>,
-) -> Result<i64, String> {
-    if !virtual_core::is_portable_toc_url(&novel.toc_url) {
-        return Err("バーチャル小説の保存先 URL が移植できません".to_string());
-    }
-    // Authoritative duplicate check: the plan ran against an earlier snapshot.
-    match runtime.novels.find_by_toc_url(&novel.toc_url).await {
-        Ok(Some(existing)) => {
-            return Err(format!("既に ID:{} として登録されています", existing.id));
-        }
-        Ok(None) => {}
-        Err(error) => return Err(format!("重複を確認できません: {error}")),
-    }
-    let title = metadata.title.trim();
-    if title.is_empty() {
-        return Err("アーカイブに作品名がありません".to_string());
-    }
-    // The record needs a non-empty sitename because it names the key prefix.
-    let sitename = metadata
-        .sitename
-        .trim()
-        .to_string();
-    let sitename = if sitename.is_empty() {
-        host_of(&novel.toc_url).unwrap_or_else(|| "narou.rs".to_string())
-    } else {
-        sitename
-    };
-    let use_subdirectory = download_use_subdirectory(local);
-    // The folder name is derived from the new local ID, so a group with the
-    // same title never shares a folder with an existing one.
-    let reservation = runtime
-        .novels
-        .allocate_id()
-        .await
-        .map_err(|error| format!("ID を確保できません: {error}"))?;
-    let id = reservation.id().0;
-    // The cleanup owns the reservation from here on: every fallible step
-    // below releases it, and only the files this run wrote are deleted.
-    let mut cleanup = CreateCleanup {
-        assets: runtime.assets(), novels: runtime.novels.clone(),
-        reservation: Some(reservation), keys: Vec::new(),
-    };
-    let ncode = virtual_core::ncode(id);
-    let file_title = ncode.clone();
-    let keys = match NovelObjectKeys::new(&sitename, &file_title, use_subdirectory) {
-        Ok(keys) => keys,
-        Err(error) => {
-            cleanup.finish().await;
-            return Err(format!("保存先キーを作れません: {error}"));
-        }
-    };
-    let occupied = match prefix_has_objects(objects, &keys).await {
-        Ok(occupied) => occupied,
-        Err(message) => {
-            cleanup.finish().await;
-            return Err(message);
-        }
-    };
-    if occupied {
-        cleanup.finish().await;
-        return Err(format!(
-            "保存先 {} は既に使われています。管理外の保存先は上書きしません",
-            keys.prefix()
-        ));
-    }
-
-    let mut record = NovelRecord {
-        id,
-        author: metadata.author.clone(),
-        title: metadata.title.clone(),
-        file_title,
-        // The archive's identity is kept; the local ncode is new.
-        toc_url: novel.toc_url.clone(),
-        sitename,
-        novel_type: metadata.novel_type,
-        end: true,
-        last_update: now,
-        new_arrivals_date: None,
-        use_subdirectory,
-        general_firstup: None,
-        novelupdated_at: None,
-        general_lastup: None,
-        last_mail_date: None,
-        tags: metadata
-            .tags
-            .iter()
-            .filter(|tag| !virtual_core::is_internal_tag(tag))
-            .cloned()
-            .collect(),
-        ncode: Some(ncode),
-        domain: metadata.domain.clone(),
-        general_all_no: None,
-        length: None,
-        suspend: false,
-        is_narou: false,
-        last_check_date: None,
-        convert_failure: false,
-        requires_login: false,
-        login_session: None,
-        extra_fields: Default::default(),
-    };
-    // The classification travels as metadata; a mixed group keeps the value
-    // the archive carries.
-    if let Some(attribute) = metadata.attribute_tag.as_deref() {
-        record.set_attribute_tag(attribute);
-    }
-    // The member summary fills the counts, the date and the tag composition.
-    let summary = match crate::virtual_novels::summarize_members(runtime, member_ids).await {
-        Ok(summary) => summary,
-        Err(error) => {
-            cleanup.finish().await;
-            return Err(format!("メンバーを集計できません: {error}"));
-        }
-    };
-    if let Err(error) = summary.refresh(&mut record) {
-        cleanup.finish().await;
-        return Err(format!("メンバー構成を反映できません: {error}"));
-    }
-    // Members without an update date keep the date the archive carries.
-    if record.general_lastup.is_none() {
-        record.general_lastup = parse_rfc3339(metadata.general_lastup.as_deref());
-    }
-
-    // The destination keys are registered only now: the prefix was free and
-    // the cleanup deletes exactly the objects this run writes.
-    let destinations = match novel
-        .files
-        .iter()
-        .map(|(path, _)| object_key_for(&keys, path))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(destinations) => destinations,
-        Err(message) => {
-            cleanup.finish().await;
-            return Err(message);
-        }
-    };
-    cleanup.keys = destinations;
-    if let Err(message) = write_novel_files(cleanup.assets.as_ref(), &keys, &novel.files).await {
-        cleanup.finish().await;
-        return Err(message);
-    }
-    // The record and the membership are one transaction: the group becomes
-    // visible only with its members.
-    if let Err(error) =
-        crate::virtual_novels::publish_virtual_parent(runtime, &record, member_ids).await
-    {
-        cleanup.finish().await;
-        return Err(format!("バーチャル小説を登録できません: {error}"));
-    }
-    cleanup.reservation = None;
-    Ok(id)
-}
-
-/// Replaces an existing virtual parent with the archive's structure.
-///
-/// The record ID and the folder stay; the membership order, the supplied
-/// per-novel inputs and the derived metadata are replaced. Files that the
-/// archive does not carry are left alone.
-async fn overwrite_virtual_parent(
-    runtime: &WorkerRuntime,
-    record: &NovelRecord,
-    metadata: &ArchiveNovel,
-    novel: &StagedNovel,
-    member_ids: &[i64],
-    assets: &dyn AssetStore,
-) -> Result<(), String> {
-    if !virtual_core::is_virtual_record(record) {
-        return Err("既存の記録はバーチャル小説ではありません".to_string());
-    }
-    let keys = NovelObjectKeys::new(
-        &record.sitename,
-        &record.file_title,
-        record.use_subdirectory,
-    )
-    .map_err(|error| format!("保存先キーを作れません: {error}"))?;
-    // Only the archived inputs are replaced; other files stay untouched.
-    write_novel_files(assets, &keys, &novel.files).await?;
-    // The membership and the derived metadata are replaced in one CAS batch:
-    // the live row is re-read there and only the archived fields are merged.
-    crate::virtual_novels::replace_virtual_members(runtime, record.id, metadata, member_ids)
-        .await
-        .map_err(|error| format!("バーチャル小説を更新できません: {error}"))
-}
-
-/// Publish already-validated entries. Create owns a cancellation cleanup guard;
-/// overwrite never deletes destinations (including files absent from the ZIP).
-async fn write_novel_files(
-    assets: &dyn AssetStore,
-    keys: &NovelObjectKeys,
-    files: &[(String, StagedAsset)],
-) -> Result<(), String> {
-    for (relative, asset) in files {
-        let key = object_key_for(keys, relative)?;
-        if let Err(error) = assets.copy(&asset.key, &key).await {
-            return Err(format!("{relative} を保存できません: {error}"));
-        }
-    }
-    Ok(())
-}
-
-
-fn object_key_for(keys: &NovelObjectKeys, relative: &str) -> Result<ObjectKey, String> {
-    ObjectKey::try_new(format!("{}/{}", keys.prefix().as_ref(), relative))
-        .map_err(|error| format!("安全でないファイルパスです {relative:?}: {error}"))
-}
-
-/// Whether anything is stored below the novel prefix.
-async fn prefix_has_objects(
-    objects: &dyn ObjectStore,
-    keys: &NovelObjectKeys,
-) -> Result<bool, String> {
-    let prefix = ObjectPrefix::from(keys.prefix().clone());
-    let request = ObjectListRequest::new(
-        prefix,
-        std::num::NonZeroUsize::new(1).expect("page size is non-zero"),
-    );
-    let page = objects
-        .list_page(&request)
-        .await
-        .map_err(|error| format!("保存先を確認できません: {error}"))?;
-    Ok(!page.objects.is_empty())
-}
-
-async fn parse_archive_toc(assets: &dyn AssetStore, files: &[(String, StagedAsset)]) -> Result<Option<TocFile>, String> {
-    let Some((_, asset)) = files.iter().find(|(path, _)| path == TOC_FILE) else { return Ok(None); };
-    if asset.size > MAX_TOC_METADATA_BYTES {
-        return Err("toc.yaml がメタデータの上限 16 MiB を超えています".into());
-    }
-    let mut stream = assets.read_stream(&asset.key).await.map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("{} がありません", asset.key))?;
-    // The table of contents is metadata; file bodies stay in durable stages.
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| error.to_string())?;
-        if bytes.len() as u64 + chunk.len() as u64 > MAX_TOC_METADATA_BYTES {
-            return Err("toc.yaml がメタデータの上限 16 MiB を超えています".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(serde_yaml::from_slice(&bytes).ok())
-}
-
-struct StageCleanup { assets: Arc<dyn AssetStore>, keys: Vec<ObjectKey> }
-impl StageCleanup {
-    async fn finish(&mut self) {
-        while let Some(key) = self.keys.pop() {
-            if let Err(error) = self.assets.delete(&key).await {
-                console_log!("transfer staging cleanup {key}: {error}");
-            }
-        }
-    }
-}
-impl Drop for StageCleanup {
-    fn drop(&mut self) {
-        if self.keys.is_empty() { return; }
-        let assets = self.assets.clone();
-        let keys = std::mem::take(&mut self.keys);
-        wasm_bindgen_futures::spawn_local(async move {
-            for key in keys {
-                if let Err(error) = assets.delete(&key).await {
-                    console_log!("transfer staging cleanup {key}: {error}");
-                }
-            }
-        });
-    }
-}
-
-fn find_site_setting(runtime: &WorkerRuntime, url: &str) -> Option<SiteSetting> {
-    runtime
-        .site_settings()
-        .iter()
-        .find(|setting| setting.matches_url(url))
-        .cloned()
-}
-
-fn host_of(url: &str) -> Option<String> {
-    worker::Url::parse(url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-}
-
-/// Extracts an `n1234ab`-style work id from a table-of-contents URL.
-///
-/// Same rule as the native import (`(?i)[/?](n\d+[a-z]+)`), without pulling the
-/// `regex` crate into the Worker: split on non-alphanumerics and take the first
-/// segment that is `n` + digits + letters.
-fn extract_ncode(url: &str) -> Option<String> {
-    url.split(|ch: char| !ch.is_ascii_alphanumeric())
-        .find_map(|segment| {
-            let bytes = segment.as_bytes();
-            if bytes.len() < 3 || !bytes[0].eq_ignore_ascii_case(&b'n') {
-                return None;
-            }
-            let digits = bytes[1..].iter().take_while(|byte| byte.is_ascii_digit()).count();
-            if digits == 0 {
-                return None;
-            }
-            let letters = bytes[1 + digits..]
-                .iter()
-                .take_while(|byte| byte.is_ascii_alphabetic())
-                .count();
-            if letters == 0 || 1 + digits + letters != bytes.len() {
-                return None;
-            }
-            Some(segment.to_ascii_lowercase())
-        })
-}
-
-/// Same rule as the downloader's `compute_file_title` for a new novel.
-fn derive_file_title(ncode: Option<&str>, title: &str, append_title: bool) -> String {
-    let limit = load_length_limit("folder-length-limit", FOLDER_LENGTH_LIMIT);
-    if let Some(ncode) = ncode.filter(|ncode| !ncode.is_empty()) {
-        if !append_title {
-            return ncode.to_string();
-        }
-        let combined = format!("{ncode} {title}");
-        let sanitized = sanitize_filename_with_limit(&combined, limit);
-        return if sanitized.is_empty() {
-            ncode.to_string()
-        } else {
-            sanitized
-        };
-    }
-    sanitize_filename_with_limit(title, limit)
-}
-
-/// `download.use-subdirectory` (local setting, default `false`).
-fn download_use_subdirectory(local: &HashMap<String, serde_yaml::Value>) -> bool {
-    local
-        .get("download.use-subdirectory")
-        .and_then(narou_rs::setting_core::setting_bool_value)
-        .unwrap_or(false)
-}
-
-/// Whether `path` (relative, `/` separated) can be stored in an archive.
-///
-/// Mirrors `narou_rs::transfer`'s path rules so one odd object name does not
-/// abort an export, and rejects traversal before a key is built.
-fn is_archivable_relative_path(path: &str) -> bool {
-    if path.is_empty() || path.len() > MAX_PATH_BYTES || path.starts_with('/') {
-        return false;
-    }
-    if path.contains('\\') || path.contains('\0') {
-        return false;
-    }
-    for (index, component) in path.split('/').enumerate() {
-        if component.is_empty() || component == "." || component == ".." {
-            return false;
-        }
-        if component.chars().count() > MAX_PATH_COMPONENT_CHARS {
-            return false;
-        }
-        if component.ends_with('.') || component.ends_with(' ') {
-            return false;
-        }
-        if index == 0 {
-            let bytes = component.as_bytes();
-            if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-                return false;
-            }
-        }
-        for character in component.chars() {
-            if character.is_control() {
-                return false;
-            }
-            if matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
-                return false;
-            }
-        }
-        let stem = component
-            .split('.')
-            .next()
-            .unwrap_or(component)
-            .trim_end_matches([' ', '.'])
-            .to_ascii_uppercase();
-        if is_reserved_device_name(&stem) {
-            return false;
-        }
-    }
-    true
-}
-
-fn is_reserved_device_name(stem: &str) -> bool {
-    matches!(
-        stem,
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
-    ) || (stem.len() == 4
-        && (stem.starts_with("COM") || stem.starts_with("LPT"))
-        && stem.as_bytes()[3].is_ascii_digit())
-}
-
-fn is_excluded_top_level(relative: &str) -> bool {
-    relative
-        .split('/')
-        .next()
-        .is_some_and(|first| EXCLUDED_TOP_LEVEL_DIRS.contains(&first))
-}
-
-/// Runtime artifacts that must not travel: `*.lock` files from the inventory
-/// writers and `*.tmp` partial writes.
-fn is_excluded_file_name(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    name.ends_with(".lock") || name.ends_with(".tmp")
-}
-
-// ---------------------------------------------------------------------------
-// request parsing / responses
-// ---------------------------------------------------------------------------
-
-/// リクエストの `Content-Type` が ZIP として受け付けるメディア型か。
-fn request_is_zip(req: &Request) -> bool {
-    let Ok(Some(value)) = req.headers().get("content-type") else {
-        return false;
-    };
-    is_zip_content_type(&value)
-}
-
-fn import_error(status: u16, message: String) -> worker::Result<Response> {
-    let payload = import_payload(false, 0, 0, 0, vec![message]);
-    Ok(Response::from_json(&payload)?.with_status(status))
-}
-
-fn export_error(status: u16, message: String) -> worker::Result<Response> {
-    let payload = serde_json::json!({
-        "success": false,
-        "message": message,
+fn binary(bytes:Vec<u8>,permit:crate::memory_budget::MemoryPermit)->worker::Result<Response>{
+    let len=bytes.len();
+    // Admission is owned by the pull stream, including cancellation/error/EOF.
+    let stream=futures::stream::try_unfold((bytes,0,permit),|(bytes,offset,permit)|async move{
+        if offset==bytes.len(){return Ok::<_,worker::Error>(None);}
+        let end=(offset+64*1024).min(bytes.len());let part=bytes[offset..end].to_vec();
+        Ok(Some((part,(bytes,end,permit))))
     });
-    Ok(Response::from_json(&payload)?.with_status(status))
+    let mut response=Response::from_stream(stream)?;response.headers_mut().set("Content-Type","application/octet-stream")?;
+    response.headers_mut().set("Content-Length",&len.to_string())?;response.headers_mut().set("x-transfer-body-bytes",&len.to_string())?;decorate(response)
+}
+pub async fn handle(mut req:Request,env:Env)->worker::Result<Response>{
+    if let Some(response)=crate::auth_failure(&req,&env).await{return response;}
+    if crate::worker_role::is_reader(&env)?{return error::response(&TransferError::Unsupported{code:"writer_required",reason:"transfer belongs to the writer Worker".into()});}
+    if !matches!(req.method(),Method::Get|Method::Head)&&!crate::same_origin(&req){return error::response(&invalid("origin_mismatch","same-origin request required"));}
+    if header(&req,"content-encoding").ok().flatten().is_some_and(|v|!v.eq_ignore_ascii_case("identity")){return error::response(&invalid("unsupported_content_encoding","transfer bodies must be unencoded"));}
+    let Some(permit)=crate::memory_budget::try_heavy()else{return error::response(&TransferError::Busy{code:"memory_capacity",message:"another heavy request is active".into()});};
+    match dispatch(&mut req,&env,permit).await{Ok(response)=>Ok(response),Err(error)=>error::response(&error)}
+}
+async fn dispatch(req:&mut Request,env:&Env,permit:crate::memory_budget::MemoryPermit)->Result<Response,TransferError>{
+    let (service,scope,journal)=crate::composition::build_transfer_service(env).await?;
+    let result=dispatch_routes(req,permit,&service,&scope).await;
+    let released=journal.release_request_leases().await;
+    match result {Ok(response)=>{released?;Ok(response)},Err(error)=>Err(error)}
+}
+async fn dispatch_routes(req:&mut Request,permit:crate::memory_budget::MemoryPermit,service:&TransferService,scope:&AuthScope)->Result<Response,TransferError>{
+    let path=req.path();let rest=path.strip_prefix(PREFIX).ok_or(TransferError::SessionNotFound)?;
+    let parts:Vec<&str>=rest.trim_start_matches('/').split('/').collect();
+    let url=req.url().map_err(platform)?;let cursor=crate::webui::query_param(&url,"cursor");let method=req.method();
+    if method==Method::Get&&parts==["capabilities"]{return response(&service.capabilities(&scope).await?).map_err(platform);}
+    if method==Method::Get&&parts==["sessions"]{return response(&service.list_sessions(&scope,cursor.as_deref()).await?).map_err(platform);}
+    if method==Method::Post&&matches!(parts.as_slice(),["imports"]|["exports"]){
+        let secret=secret(req)?;let result=if parts[0]=="imports"{service.create_import(&scope,&json(req).await?,&secret).await?}
+        else{service.create_export(&scope,&json(req).await?,&secret).await?};
+        return status_response(&result.status).map_err(platform);
+    }
+    let [direction,id,tail @ ..]=parts.as_slice()else{return Err(invalid("not_found","unknown transfer route"));};
+    if !matches!(*direction,"imports"|"exports"|"sessions")||id.is_empty(){return Err(invalid("not_found","unknown transfer route"));}
+    let session=SessionId((*id).into());let admin=*direction=="sessions";
+    let supplied=if admin{None}else{Some(secret(req)?)};
+    let status=service.session(&scope,&session,supplied.as_deref()).await?;
+    if !admin&&((*direction=="imports")!=(status.direction==TransferDirection::Import)){return Err(TransferError::SessionNotFound);}
+    if method==Method::Delete&&tail.is_empty(){
+        let opid=crate::webui::query_param(&url,"operation_id").or(header(req,"x-transfer-operation-id")?).ok_or_else(||invalid("invalid_operation","DELETE requires operation_id"))?;
+        return status_response(&service.delete_session(&scope,&session,supplied.as_deref(),&control(req,opid)?).await?).map_err(platform);
+    }
+    if admin{return Err(invalid("not_found","management routes never serve transfer bytes"));}
+    let secret=supplied.as_deref().ok_or(TransferError::SecretMismatch)?;
+    match(method,tail){
+        (Method::Get,[])=>status_response(&status).map_err(platform),
+        (Method::Get,["files"])=>response(&service.files(&scope,&session,secret,cursor.as_deref()).await?).map_err(platform),
+        (Method::Get,["plan"])=>response(&service.plan(&scope,&session,secret,cursor.as_deref()).await?).map_err(platform),
+        (Method::Get,["catalog"])=>response(&service.catalog(&scope,&session,secret,cursor.as_deref()).await?).map_err(platform),
+        (Method::Put,["chunks"])=>upload(req,&service,&scope,&session,secret,None).await,
+        (Method::Put,["manifest","chunks",index])=>upload(req,&service,&scope,&session,secret,Some(index.parse().map_err(|_|invalid("invalid_chunk","invalid manifest chunk index"))?)).await,
+        (Method::Get,["manifest","chunks",index])=>{
+            let chunk=service.export_manifest(&scope,&session,secret,index.parse().map_err(|_|invalid("invalid_chunk","invalid chunk index"))?).await?;
+            let mut response=binary(chunk.bytes,permit).map_err(platform)?;
+            response.headers_mut().set("ETag",&format!("\"{}\"",chunk.sha256)).map_err(platform)?;
+            response.headers_mut().set("x-transfer-manifest-bytes",&chunk.total_bytes.to_string()).map_err(platform)?;
+            response.headers_mut().set("x-transfer-last",if chunk.last{"true"}else{"false"}).map_err(platform)?;Ok(response)
+        },
+        (Method::Get,["batches",index])=>{
+            let batch=service.export_batch(&scope,&session,secret,index.parse().map_err(|_|invalid("invalid_chunk","invalid batch index"))?).await?;
+            let mut response=binary(batch.body,permit).map_err(platform)?;
+            response.headers_mut().set("x-transfer-record-count",&batch.record_count.to_string()).map_err(platform)?;
+            response.headers_mut().set("x-transfer-body-bytes",&batch.body_bytes.to_string()).map_err(platform)?;
+            response.headers_mut().set("x-transfer-last",if batch.last{"true"}else{"false"}).map_err(platform)?;Ok(response)
+        },
+        (Method::Get,["files",file,"chunks",index])=>{
+            let chunk=service.export_file_chunk(&scope,&session,secret,file.parse().map_err(|_|invalid("invalid_file","invalid file id"))?,index.parse().map_err(|_|invalid("invalid_chunk","invalid chunk index"))?).await?;
+            binary(chunk.bytes,permit).map_err(platform)
+        },
+        (Method::Post,["manifest","seal"])=>{let body:Seal=json(req).await?;status_response(&service.seal_manifest(&scope,&session,secret,&control(req,body.operation_id)?,body.size,&body.sha256).await?).map_err(platform)},
+        (Method::Post,["select"])=>{let body:Select=json(req).await?;status_response(&service.select(&scope,&session,secret,&control(req,body.operation_id)?,&body.selection).await?).map_err(platform)},
+        (Method::Post,["publish"])=>{let body:Publish=json(req).await?;status_response(&service.publish(&scope,&session,secret,&control(req,body.operation_id)?,&body.plan_revision).await?).map_err(platform)},
+        (Method::Post,["advance"])=>{let body:Operation=json(req).await?;status_response(&service.advance(&scope,&session,secret,&OperationId(body.operation_id)).await?.status).map_err(platform)},
+        (Method::Post,[action @ ("ready"|"pause"|"resume"|"complete")])=>{
+            let body:Operation=json(req).await?;let op=control(req,body.operation_id)?;
+            let status=match *action{"ready"=>service.ready(&scope,&session,secret,&op).await?,"pause"=>service.pause(&scope,&session,secret,&op).await?,"resume"=>service.resume(&scope,&session,secret,&op).await?,_=>service.complete(&scope,&session,secret,&op).await?};status_response(&status).map_err(platform)
+        },
+        _=>Err(invalid("not_found","unknown transfer route or method")),
+    }
+}
+/// Scheduled caller already holds its per-invocation MemoryPermit. Recovery
+/// never runs detached and never reclaims resources merely because TTL passed.
+pub(crate) async fn collect(env:&Env)->Result<(),TransferError>{
+    let(service,scope,journal)=crate::composition::build_transfer_service(env).await?;
+    let result=async{
+        let now=chrono::Utc::now();
+        service.recover(&scope).await?;
+        service.expire_idle(&scope).await?;
+        let page=journal.list_sessions(&scope,None,100).await?;
+        for mut row in page.items.into_iter().filter(|row|row.state.is_terminal()&&row.next_action==NextAction::Advance).take(16){
+            let operation=OperationRow{session_id:row.session_id.clone(),operation_id:OperationId(format!("gc_{}",row.revision)),kind:"maintenance".into(),request_fingerprint:row.revision.to_string(),if_match_revision:Some(row.revision),result:None,completed:false,created_at:now};
+            if journal.begin_operation(&operation).await.is_err(){continue;}
+            let step=service.backend().release_session_resources(&row,row.gc_cursor.as_deref()).await?;let before=row.revision;row.gc_cursor=step.cursor;row.revision+=1;row.updated_at=now;
+            if step.done{row.next_action=NextAction::None;row.operation_id=None;}journal.update_session(&row,before).await?;
+        }
+        #[derive(Deserialize)]struct Orphan{stage_id:String,session_id:String}
+        let orphans=backend::statement(journal.db(),"SELECT o.stage_id,o.session_id FROM transfer_stage_owners o JOIN transfer_sessions s USING(session_id) WHERE s.state IN ('completed','completed_with_errors','released','cancelled','failed','expired') AND NOT EXISTS(SELECT 1 FROM transfer_publications p WHERE p.session_id=s.session_id AND (p.state NOT IN ('pending','committed','rolled_back','skipped') OR (p.state='committed' AND COALESCE(p.phase_cursor,'')<>'finished'))) AND NOT EXISTS(SELECT 1 FROM transfer_object_refs r WHERE r.blob_key=o.sealed_key) AND NOT EXISTS(SELECT 1 FROM transfer_pins p WHERE p.stage=o.sealed_key) ORDER BY o.stage_id LIMIT 16",&[])?.all().await.map_err(platform)?.results::<Orphan>().map_err(platform)?;
+        for orphan in orphans{journal.queue_gc(&orphan.session_id,&orphan.stage_id,"stage",now,now).await?;}
+        for task in journal.due_gc(now,16).await?{
+            let session=journal.session(&scope,&SessionId(task.session_id.clone())).await?;
+            if !session.as_ref().is_some_and(|row|row.state.is_terminal())||!journal.active_publications(&SessionId(task.session_id.clone()),1).await?.is_empty(){journal.retry_gc(task.id,now+chrono::Duration::minutes(5)).await?;continue;}
+            if journal.ensure_execution(&SessionId(task.session_id.clone())).await.is_err(){journal.retry_gc(task.id,now+chrono::Duration::minutes(5)).await?;continue;}
+            let exists=backend::statement(journal.db(),"SELECT 1 live FROM transfer_stage_owners WHERE stage_id=? AND session_id=?",&[task.target.as_str().into(),task.session_id.as_str().into()])?.first::<i64>(Some("live")).await.map_err(platform)?.is_some();
+            if !exists{journal.finish_gc(task.id).await?;continue;}
+            match service.backend().stage_abort(&SessionId(task.session_id.clone()),&task.target).await{Ok(())=>{let retained=backend::statement(journal.db(),"SELECT 1 retained FROM transfer_stage_owners WHERE stage_id=?",&[task.target.as_str().into()])?.first::<i64>(Some("retained")).await.map_err(platform)?.is_some();if retained{journal.retry_gc(task.id,now+chrono::Duration::minutes(5)).await?;}else{journal.finish_gc(task.id).await?;}},Err(_)=>journal.retry_gc(task.id,now+chrono::Duration::minutes(5)).await?}
+        }
+        backend::run(journal.db(),"DELETE FROM transfer_requests WHERE created_at<? AND session_id IN(SELECT session_id FROM transfer_sessions WHERE state IN ('completed','completed_with_errors','released','cancelled','failed','expired') AND next_action='none' AND updated_at<?)",&[(now-chrono::Duration::days(7)).to_rfc3339().into(),(now-chrono::Duration::days(7)).to_rfc3339().into()]).await?;
+        Ok(())
+    }.await;
+    let released=journal.release_request_leases().await;result.and(released)
 }
 
-struct CreateCleanup {
-    assets: Arc<dyn AssetStore>,
-    novels: Arc<dyn narou_rs::platform::NovelRepository>,
-    reservation: Option<narou_rs::platform::NovelIdReservation>,
-    keys: Vec<ObjectKey>,
-}
-
-impl CreateCleanup {
-    async fn finish(&mut self) {
-        // Disarm before the first await: failure or cancellation must not let
-        // Drop recursively spawn another cleanup task.
-        let Some(reservation) = self.reservation.take() else { return; };
-        // A cancelled/failed publication may have committed before its reply
-        // disappeared. Never delete files belonging to that committed record.
-        match self.novels.get(reservation.id()).await {
-            Ok(Some(_)) => { self.keys.clear(); return; }
-            Err(error) => { console_log!("transfer create cleanup lookup: {error}"); return; }
-            Ok(None) => {}
+async fn upload(req:&mut Request,service:&TransferService,scope:&AuthScope,session:&SessionId,secret:&[u8],manifest_index:Option<u32>)->Result<Response,TransferError>{
+    if !header(req,"content-type")?.is_some_and(|v|v.split(';').next().is_some_and(|s|s.trim().eq_ignore_ascii_case("application/octet-stream"))){return Err(invalid("unsupported_media_type","binary batches require application/octet-stream"));}
+    let count=header(req,"x-transfer-record-count")?.and_then(|v|v.parse::<usize>().ok()).ok_or_else(||invalid("invalid_batch","record-count header is required"))?;
+    let declared=header(req,"x-transfer-body-bytes")?.and_then(|v|v.parse::<u64>().ok()).ok_or_else(||invalid("invalid_batch","body-bytes header is required"))?;
+    if count==0||count>MAX_BATCH_RECORDS||declared>MAX_BINARY_BODY_BYTES as u64{return Err(TransferError::ExceedsLimit{code:"transfer_chunk_too_large",message:"batch exceeds negotiated limits".into()});}
+    let mut input=req.stream().map_err(platform)?;let mut decoder=FrameDecoder::new();let mut receipts=Vec::new();let mut first=true;
+    while let Some(bytes)=input.next().await{let bytes=bytes.map_err(platform)?;for part in bytes.chunks(64*1024){
+        if decoder.bytes_seen()+part.len() as u64>declared{return Err(invalid("invalid_batch","body exceeds declared length"));}
+        for frame in decoder.feed(part).map_err(|e|invalid("invalid_batch",e.to_string()))?{
+            let BatchHeader{file_id,chunk_index,is_final,sha256,..}=frame.header;
+            if manifest_index.is_some()&&(file_id!=MANIFEST_FILE_ID||(first&&Some(chunk_index)!=manifest_index)){return Err(invalid("invalid_manifest_chunk","manifest route and record identity differ"));}
+            if manifest_index.is_none()&&file_id==MANIFEST_FILE_ID{return Err(invalid("invalid_file","manifest requires its own route"));}
+            first=false;let sha=sha256.as_deref().and_then(sha256_from_hex).ok_or_else(||invalid("missing_sha256","upload record requires SHA-256"))?;
+            let record=BatchRecord{file_id,chunk_index,payload:frame.payload,sha256:Some(sha),is_final};
+            let mut result=if manifest_index.is_some(){service.put_manifest(scope,session,secret,vec![record]).await?}else{service.put_records(scope,session,secret,vec![record]).await?};
+            receipts.append(&mut result.receipts);if result.failure.is_some(){result.receipts=receipts;return response(&result).map_err(platform);}
         }
-        while let Some(key) = self.keys.last() {
-            if let Err(error) = self.assets.delete(key).await {
-                console_log!("transfer create cleanup {key}: {error}");
-                return;
-            }
-            self.keys.pop();
-        }
-        if let Err(error) = self.novels.release_id(reservation).await {
-            console_log!("transfer create reservation cleanup: {error}");
-        }
-    }
-}
-
-impl Drop for CreateCleanup {
-    fn drop(&mut self) {
-        if self.reservation.is_none() { return; }
-        let mut cleanup = Self {
-            assets: self.assets.clone(), novels: self.novels.clone(),
-            reservation: self.reservation.take(), keys: std::mem::take(&mut self.keys),
-        };
-        wasm_bindgen_futures::spawn_local(async move {
-            cleanup.finish().await;
-        });
-    }
-}
-
-// ---------------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------------
-
-// The crate is `#![cfg(target_arch = "wasm32")]`, so a host `cargo test
-// -p narou_worker` builds an empty crate and a wasm test binary needs a wasm
-// runner. The pure helpers are exercised by `worker_entry/tests/transfer.mjs`
-// against a real `workerd` instead (see that file's header).
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_ncode_follows_the_native_rule() {
-        assert_eq!(
-            extract_ncode("https://ncode.syosetu.com/n1234ab/").as_deref(),
-            Some("n1234ab")
-        );
-        assert_eq!(
-            extract_ncode("https://novel18.syosetu.com/N1234AB/").as_deref(),
-            Some("n1234ab")
-        );
-        assert_eq!(
-            extract_ncode("https://example.com/?ncode=n9999zz").as_deref(),
-            Some("n9999zz")
-        );
-        assert_eq!(extract_ncode("https://example.com/1234ab/"), None);
-        assert_eq!(extract_ncode("https://example.com/n1234/"), None);
-        assert_eq!(extract_ncode("https://example.com/n1234abx1/"), None);
-    }
-
-    #[test]
-    fn runtime_artifacts_are_not_archivable() {
-        assert!(is_excluded_file_name("toc.yaml.lock"));
-        assert!(is_excluded_file_name("本文/.1 一話.yaml.tmp"));
-        assert!(!is_excluded_file_name("toc.yaml"));
-        assert!(is_excluded_top_level("backup/novel.zip"));
-        assert!(!is_excluded_top_level("本文/1 一話.yaml"));
-    }
-
-    #[test]
-    fn unsafe_object_names_are_skipped() {
-        for path in [
-            "../escape.txt",
-            "/absolute.txt",
-            "a\\b.txt",
-            "bad\0name.txt",
-            "CON",
-            "COM1.log",
-            "dir//empty.txt",
-            "trailing.",
-        ] {
-            assert!(!is_archivable_relative_path(path), "{path:?}");
-        }
-        for path in ["toc.yaml", "本文/1 一話.yaml", "挿絵/001.png"] {
-            assert!(is_archivable_relative_path(path), "{path:?}");
-        }
-    }
-
-    #[test]
-    fn file_title_follows_the_downloader_rule() {
-        assert_eq!(derive_file_title(Some("n1234ab"), "作品名", false), "n1234ab");
-        assert_eq!(
-            derive_file_title(Some("n1234ab"), "作品名", true),
-            "n1234ab 作品名"
-        );
-        assert_eq!(derive_file_title(None, "作品/名", false), "作品_名");
-    }
+    }}
+    decoder.finish().map_err(|e|invalid("truncated_batch",e.to_string()))?;
+    if decoder.bytes_seen()!=declared||decoder.records_seen()!=count{return Err(invalid("truncated_batch","actual batch byte/record count differs from headers"));}
+    let status=service.session(scope,session,Some(secret)).await?;response(&BatchResult{receipts,failure:None,status}).map_err(platform)
 }

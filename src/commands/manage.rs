@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, Local, Utc};
 use narou_rs::compat::confirm;
@@ -204,7 +204,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
             0,
             usize::MAX,
         );
-        novels.query_sync(&query)
+        novels.query_current_sync(&query)
     };
     let records = match all_records {
         Ok(records) => records,
@@ -434,6 +434,7 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         let mut outputs = Vec::new();
         let mut color_tags = Vec::new();
         let mut mutations = Vec::new();
+        let mut fences = Vec::new();
         for item in resolved {
             let (id, title) = match item {
                 Ok(data) => data,
@@ -444,12 +445,14 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             };
 
             let record = novels
-                .get_sync(id.into())
+                .get_current_sync(id.into())
                 .map_err(|err| narou_rs::error::NarouError::Database(err.to_string()))?
                 .ok_or_else(|| {
                     narou_rs::error::NarouError::NotFound(format!("ID:{} は存在しません", id))
                 })?;
 
+            let write = narou_rs::native::materialization::capture_write_for_record(&record)?;
+            fences.push(write.fence().clone());
             let mut updated = record;
             match &mode {
                 TagMode::Add(tags) => {
@@ -486,9 +489,8 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             mutations.push(narou_rs::platform::NovelMutation::Upsert(updated));
         }
         if !mutations.is_empty() {
-            novels
-                .apply_batch_sync(mutations)
-                .map_err(|err| narou_rs::error::NarouError::Database(err.to_string()))?;
+            use narou_rs::platform::NovelRepository;
+            futures::executor::block_on(novels.apply_batch_guarded_many(&fences, mutations))?;
         }
         Ok((outputs, color_tags))
     })();
@@ -883,7 +885,7 @@ fn get_tag_list() -> Result<Vec<(String, usize)>, String> {
     let mut order = Vec::<String>::new();
     let attributes_enabled = attribute_visibility().0;
     for id in ids {
-        let Ok(Some(record)) = novels.get_sync(id) else {
+        let Ok(Some(record)) = novels.get_current_sync(id) else {
             continue;
         };
         for tag in &record.tags {
@@ -963,7 +965,11 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
         let id = data.id;
 
         let frozen = if on { Some(true) } else if off { Some(false) } else { None };
-        match narou_rs::compat::set_frozen_state(id, frozen) {
+        let write = match narou_rs::native::materialization::capture_write_for_id(id) {
+            Ok(write) => write,
+            Err(error) => { log::report_error(&error.to_string()); continue; }
+        };
+        match narou_rs::compat::set_frozen_state(&write, id, frozen) {
             Ok(true) => println!("{} を凍結しました", data.title),
             Ok(false) => println!("{} の凍結を解除しました", data.title),
             Err(e) => eprintln!("  Error: {}", e),
@@ -1049,7 +1055,8 @@ pub fn freeze_by_target(target: &str) {
     };
     let id = data.id;
 
-    let result = narou_rs::compat::set_frozen_state(id, Some(true));
+    let result = narou_rs::native::materialization::capture_write_for_id(id)
+        .and_then(|write| narou_rs::compat::set_frozen_state(&write, id, Some(true)));
 
     match result {
         Ok(_) => println!("  Froze ID: {}", id),
@@ -1076,19 +1083,19 @@ struct RemoveOutcome {
 fn remove_novel_by_id(id: i64, with_file: bool) -> Result<RemoveOutcome, String> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let record = novels
-        .get_sync(id.into())
+        .get_current_sync(id.into())
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("ID: {} は存在しません", id))?;
     let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
         .map_err(|e| e.to_string())?;
     let dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
-    remove_novel_objects(&record, with_file).map_err(|e| e.to_string())?;
-    remove_novel_files(&dir, with_file).map_err(|e| e.to_string())?;
-    novels
-        .apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(id.into())])
-        .map_err(|e| e.to_string())?;
-
-    let _ = narou_rs::converter::clear_section_convert_cache(id);
+    let inventory = std::sync::Arc::new(narou_rs::db::inventory::Inventory::with_default_root().map_err(|error| error.to_string())?);
+    let services = narou_rs::native::application::NativeAppServices::new(inventory).map_err(|error| error.to_string())?;
+    let result = narou_rs::native::materialization::block_on(async {
+        services.services.novel_actions.remove(&narou_rs::application::RemoveRequest { ids: vec![id.into()], delete_files: with_file })
+            .await.map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))
+    }).map_err(|error| error.to_string())?;
+    if !result.removed.contains(&narou_rs::platform::NovelId(id)) { return Err(format!("ID: {id} は削除されませんでした")); }
     Ok(RemoveOutcome {
         title: record.title,
         removed_path: with_file.then_some(dir),
@@ -1110,7 +1117,7 @@ fn collect_all_short_story_ids() -> Vec<String> {
         usize::MAX,
     );
     let mut ids = novels
-        .query_sync(&query)
+        .query_current_sync(&query)
         .unwrap_or_default()
         .into_iter()
         .map(|record| record.id.to_string())
@@ -1148,47 +1155,7 @@ fn colorize_removed_message(title: &str) -> String {
     }
 }
 
-/// Delete the novel's stored objects from the active storage backend.
-///
-/// `--with-file` drops every object below the novel prefix, while a plain
-/// `remove` drops only `toc.yaml` so the next download re-reads the table of
-/// contents (the same split [`remove_novel_files`] applies to the saved files).
-/// SQLite storage keeps these objects in the database, so leaving them behind
-/// makes a later download believe the section files are still there and skip
-/// rewriting them, which then breaks the conversion.
-fn remove_novel_objects(
-    record: &narou_rs::db::novel_record::NovelRecord,
-    with_file: bool,
-) -> narou_rs::error::Result<()> {
-    use narou_rs::platform::ObjectStore;
 
-    let store = narou_rs::native::object_store::NativeStore::for_current_root()?;
-    let keys = narou_rs::platform::NovelObjectKeys::new(
-        &record.sitename,
-        &record.file_title,
-        record.use_subdirectory,
-    )?;
-    if with_file {
-        narou_rs::native::object_store::delete_prefix_sync(&store, keys.prefix())
-    } else {
-        futures::executor::block_on(store.delete(&keys.toc()))
-    }
-}
-
-fn remove_novel_files(dir: &Path, with_file: bool) -> Result<(), String> {
-    if with_file {
-        if dir.exists() {
-            std::fs::remove_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        return Ok(());
-    }
-
-    let toc_path = dir.join("toc.yaml");
-    if toc_path.exists() {
-        std::fs::remove_file(toc_path).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -1197,36 +1164,10 @@ mod tests {
 
     use super::{
         ListOptions, TagOptions, build_tag_mode, matches_filters, matches_grep, remove_novel_by_id,
-        remove_novel_files, resolve_list_sort, resolve_list_sort_key,
+        resolve_list_sort, resolve_list_sort_key,
     };
     use narou_rs::db::novel_record::NovelRecord;
 
-    #[test]
-    fn remove_without_with_file_only_deletes_toc() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("novel");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("toc.yaml"), "toc").unwrap();
-        std::fs::write(dir.join("section.txt"), "body").unwrap();
-
-        remove_novel_files(&dir, false).unwrap();
-
-        assert!(dir.exists());
-        assert!(!dir.join("toc.yaml").exists());
-        assert!(dir.join("section.txt").exists());
-    }
-
-    #[test]
-    fn remove_with_file_deletes_directory() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("novel");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("toc.yaml"), "toc").unwrap();
-
-        remove_novel_files(&dir, true).unwrap();
-
-        assert!(!dir.exists());
-    }
 
     #[test]
     fn build_tag_mode_rejects_banned_word() {
@@ -1389,70 +1330,48 @@ mod tests {
         assert!(resolve_list_sort(&reversed, Some("title")).reverse);
     }
 
-    /// Regression: SQLite storage keeps novel objects in the database, so
-    /// `remove --with-file` has to drop them as well. Otherwise the next
-    /// download sees the sections as already stored, skips rewriting the files
-    /// on disk and the conversion fails with "section file not found".
     #[test]
-    fn remove_with_file_drops_stored_objects_in_sqlite_mode() {
-        use narou_rs::platform::{NovelObjectKeys, ObjectStore};
-
-        let temp = TempDir::new().unwrap();
-        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
-        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
-        std::fs::write(temp.path().join(".narou").join("storage-backend"), "sqlite").unwrap();
-        narou_rs::db::init_database().unwrap();
-
-        let record = sample_record(1, 1, &[]);
-        narou_rs::db::with_database_mut(|db| {
-            db.insert(record.clone());
-            Ok(())
-        })
-        .unwrap();
-
-        let store = narou_rs::native::object_store::NativeStore::for_current_root().unwrap();
-        let keys = NovelObjectKeys::new(
-            &record.sitename,
-            &record.file_title,
-            record.use_subdirectory,
-        )
-        .unwrap();
-        futures::executor::block_on(async {
-            store
-                .write_small(&keys.toc(), b"toc".to_vec())
-                .await
-                .unwrap();
-            store
-                .write_small(&keys.section("1", "第一話"), b"body".to_vec())
-                .await
-                .unwrap();
-        });
-
-        remove_novel_by_id(record.id, true).unwrap();
-
-        assert!(
-            futures::executor::block_on(store.read_small(&keys.toc()))
-                .unwrap()
-                .is_none(),
-            "toc object must not survive remove --with-file"
-        );
-        assert!(
-            futures::executor::block_on(store.read_small(&keys.section("1", "第一話")))
-                .unwrap()
-                .is_none(),
-            "section object must not survive remove --with-file"
-        );
-        assert!(
-            !temp
-                .path()
-                .join("小説データ")
-                .join("site")
-                .join("file_title")
-                .join("本文")
-                .join("1 第一話.yaml")
-                .exists()
-        );
-
-        *narou_rs::db::DATABASE.lock() = None;
+    fn guarded_remove_preserves_or_deletes_content_and_rejects_late_writers() {
+        use narou_rs::application::novel_access::{NovelReadLease, NovelWriteGuard};
+        use narou_rs::platform::NovelObjectKeys;
+        struct RestoreDatabase(Option<narou_rs::db::Database>);
+        impl Drop for RestoreDatabase {
+            fn drop(&mut self) { *narou_rs::db::DATABASE.lock() = self.0.take(); }
+        }
+        for sqlite in [false, true] {
+            for with_file in [false, true] {
+                let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-libraries");
+                std::fs::create_dir_all(&base).unwrap();
+                let temp = tempfile::Builder::new().prefix("remove-guarded-").tempdir_in(base).unwrap();
+                let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+                let _database = RestoreDatabase(narou_rs::db::DATABASE.lock().take());
+                std::fs::create_dir(temp.path().join(".narou")).unwrap();
+                if sqlite { std::fs::write(temp.path().join(".narou/storage-backend"), "sqlite").unwrap(); }
+                narou_rs::db::init_database().unwrap();
+                let record = sample_record(1, 1, &[]);
+                narou_rs::db::with_database_mut(|database| database.update_records(|mut records| {
+                    records.insert(record.id, record.clone()); Ok((records, ()))
+                })).unwrap();
+                let stores = narou_rs::native::object_store::NativeStores::for_current_root().unwrap();
+                let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).unwrap();
+                let section = keys.section("1", "第一話");
+                let write = futures::executor::block_on(NovelWriteGuard::capture_for(&stores.objects, Some(&stores.assets), &keys)).unwrap();
+                futures::executor::block_on(async {
+                    write.write_small(&keys.toc(), b"toc".to_vec()).await?;
+                    write.write_small(&section, b"body".to_vec()).await
+                }).unwrap();
+                remove_novel_by_id(record.id, with_file).unwrap();
+                let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
+                assert!(repository.get_current_sync(record.id.into()).unwrap().is_none());
+                futures::executor::block_on(async {
+                    assert!(write.write_small(&section, b"late".to_vec()).await.is_err());
+                    let mut read = NovelReadLease::admit(&stores.objects, write.prefix(), "removed-content-check").await?;
+                    assert!(read.read_small(&keys.toc()).await?.is_none());
+                    assert_eq!(read.read_small(&section).await?, (!with_file).then(|| b"body".to_vec()));
+                    read.release().await
+                }).unwrap();
+                assert_eq!(temp.path().join("小説データ/site/file_title").exists(), !with_file);
+            }
+        }
     }
 }

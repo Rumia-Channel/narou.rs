@@ -2,7 +2,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json, Response},
 };
 
 use crate::application::novel_settings::parse_settings_patch;
@@ -12,33 +12,22 @@ use super::state::IdPath;
 
 
 fn map_application_error(error: crate::application::ApplicationError) -> (StatusCode, String) {
-    match error {
-        crate::application::ApplicationError::InvalidRequest(message) => {
-            (StatusCode::BAD_REQUEST, message)
-        }
-        crate::application::ApplicationError::Conflict(message) => {
-            (StatusCode::CONFLICT, message)
-        }
-        crate::application::ApplicationError::NotFound(message) => {
-            (StatusCode::NOT_FOUND, message)
-        }
-        crate::application::ApplicationError::Platform(message) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, message)
-        }
-    }
+    let (status, _) = crate::application::external_api::http_error(&error);
+    (StatusCode::from_u16(status).expect("application status"), error.message().to_owned())
 }
 
 pub async fn get_settings(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let view = state
-        .services
-        .novel_settings
-        .load(id.into())
-        .await
-        .map_err(map_application_error)?;
-    Ok(Json(view.to_json_value(crate::application::webui::capabilities::RuntimeKind::Native)))
+) -> Result<Response, (StatusCode, String)> {
+    let mut reads = state.services.novel_settings.read_scope("native-novel-settings");
+    let result = state.services.novel_settings.load(&mut reads, id.into()).await;
+    match result {
+        Ok(view) => Ok(super::novels::leased_response(
+            Json(view.to_json_value(crate::application::webui::capabilities::RuntimeKind::Native)).into_response(), reads,
+        )),
+        Err(error) => { let _ = reads.release_all().await; Err(map_application_error(error)) }
+    }
 }
 
 pub async fn save_settings(

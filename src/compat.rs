@@ -514,34 +514,35 @@ pub fn is_frozen_id(id: i64) -> bool {
 }
 
 /// Set the frozen state, or toggle the effective state when `frozen` is None.
-pub fn set_frozen_state(id: i64, frozen: Option<bool>) -> Result<bool> {
-    let frozen = crate::db::with_database(|db| {
-        let record = db.get(id).ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        db.inventory().update_yaml::<bool, HashMap<i64, serde_yaml::Value>, _>(
+pub fn set_frozen_state(write: &crate::application::novel_access::NovelWriteGuard, id: i64, frozen: Option<bool>) -> Result<bool> {
+    let repository = crate::native::novel_repository::NativeNovelRepository::new();
+    let record = repository.get_current_sync(id.into())?.ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
+    let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+    if write.prefix().as_ref() != keys.prefix().as_ref() { return Err(NarouError::Platform("freeze record changed its origin".into())); }
+    let inventory = crate::db::inventory::Inventory::with_default_root()?;
+    let primary = crate::native::object_store::NativeStore::for_narou_root(inventory.root_dir())?;
+    let frozen = primary.with_open_write(write.fence(), || {
+        inventory.update_yaml::<bool, HashMap<i64, serde_yaml::Value>, _>(
             "freeze", InventoryScope::Local, |mut frozen_list| {
                 let current = frozen_list.contains_key(&id) || record.tags.iter().any(|tag| tag == "frozen");
                 let frozen = frozen.unwrap_or(!current);
-                if frozen {
-                    frozen_list.insert(id, serde_yaml::Value::Bool(true));
-                } else {
-                    frozen_list.remove(&id);
-                }
+                if frozen { frozen_list.insert(id, serde_yaml::Value::Bool(true)); }
+                else { frozen_list.remove(&id); }
                 Ok((frozen_list, frozen))
             },
         )
     })?;
-    crate::native::novel_repository::NativeNovelRepository::new()
-        .update_existing_sync(id.into(), |record| {
-            crate::application::novel_actions::sync_frozen_tag(record, frozen);
-            Ok(())
-        })?;
+    repository.update_existing_guarded_sync(write.fence(), id.into(), |record| {
+        crate::application::novel_actions::sync_frozen_tag(record, frozen);
+        Ok(())
+    })?;
     Ok(frozen)
 }
 
-pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
-    set_frozen_state(id, Some(true))?;
+pub fn mark_not_found_and_freeze(write: &crate::application::novel_access::NovelWriteGuard, id: i64) -> Result<()> {
+    set_frozen_state(write, id, Some(true))?;
     crate::native::novel_repository::NativeNovelRepository::new()
-        .update_existing_sync(id.into(), |record| {
+        .update_existing_guarded_sync(write.fence(), id.into(), |record| {
             crate::application::novel_actions::mark_not_found(record);
             Ok(())
         })?;
@@ -685,8 +686,22 @@ pub fn choose_digest_action(title: &str, message: &str) -> DigestChoice {
     choose_digest_action_inner(title, message, &mut auto_choices)
 }
 
-pub fn create_backup(source_dir: &Path, novel_dir: &Path, title: &str) -> Result<String> {
-    let backup_dir = novel_dir.join("backup");
+pub fn create_backup(write: &crate::application::novel_access::NovelWriteGuard, title: &str) -> Result<String> {
+    let inventory = crate::db::inventory::Inventory::with_default_root()?;
+    let directory = crate::native::materialization::directory_for_origin(write)?;
+    let snapshot = crate::native::materialization::snapshot_with_origin(&directory, write)?;
+    // The archive must be staged outside the snapshotted inputs so the zip
+    // being written can never end up inside itself.
+    let staging = tempfile::Builder::new().prefix(".narou-snapshot-").tempdir_in(inventory.root_dir())?;
+    let name = create_backup_from_private(snapshot.path(), staging.path(), title)?;
+    crate::native::materialization::publish_file(write, &staging.path().join("backup").join(&name), &directory.join("backup").join(&name))?;
+    Ok(name)
+}
+
+fn create_backup_from_private(source_dir: &Path, staging_dir: &Path, title: &str) -> Result<String> {
+    crate::application::novel_access::require_private_path(source_dir)?;
+    crate::application::novel_access::require_private_path(staging_dir)?;
+    let backup_dir = staging_dir.join("backup");
     fs::create_dir_all(&backup_dir)?;
     let backup_name = format!(
         "{}_{}.zip",
@@ -706,41 +721,54 @@ pub fn create_backup(source_dir: &Path, novel_dir: &Path, title: &str) -> Result
 }
 
 pub fn convert_existing_novel(
+    write: &crate::application::novel_access::NovelWriteGuard,
     id: i64,
-    title: &str,
-    author: &str,
-    novel_dir: &Path,
     no_open: bool,
 ) -> std::result::Result<PathBuf, String> {
     let _lock = NovelLockGuard::acquire(Some(id)).map_err(|e| e.to_string())?;
-    // `DownloadResult.novel_dir` は `小説データ/...` の相対パスで返る。
-    // 変換は SQLite のオブジェクトを一時的に実ファイル化するが、その照合は
-    // 絶対 archive root と `strip_prefix` するため、相対パスのまま渡すと
-    // 実体化されず toc.yaml が見つからない (issue #39)。ここで必ず絶対パスへ
-    // 直してから設定・変換へ渡す。
-    let novel_dir = absolute_directory_path(novel_dir);
+    // All inputs are copied privately; the original operation token authorizes
+    // canonical publication after rendering, including subprocess continuations.
+    let novel_dir = crate::native::materialization::directory_for_origin(write).map_err(|error| error.to_string())?;
+    let primary = crate::native::object_store::NativeStore::for_current_root().map_err(|error| error.to_string())?;
+    let record = primary.with_open_write(write.fence(), || {
+        let record = crate::native::novel_repository::NativeNovelRepository::new().get_current_sync(id.into())?
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
+        let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        if keys.prefix().as_ref() != write.prefix().as_ref() { return Err(NarouError::Platform("conversion record changed its original namespace".into())); }
+        Ok(record)
+    }).map_err(|error| error.to_string())?;
+    let title = record.title.as_str();
+    let author = record.author.as_str();
     let novel_dir = novel_dir.as_path();
     let multi_device = load_local_setting_string("convert.multi-device").is_some();
     let devices = resolve_auto_convert_devices()?;
+    let (snapshot, base_settings) = crate::native::materialization::conversion_snapshot_with_origin(novel_dir, write, None, |path| {
+        let settings = NovelSettings::load_for_novel(id, title, author, path)?;
+        let selection = crate::native::materialization::ConversionInputSelection {
+            illustrations: settings.enable_illust,
+            cover: devices.iter().any(|device| device.is_some_and(|device| device != Device::Text)),
+        };
+        Ok((settings, selection))
+    }).map_err(|error| error.to_string())?;
     let mut last_output_path = None;
     for device in devices {
-        let mut settings = NovelSettings::load_for_novel(id, title, author, novel_dir);
+        let mut settings = base_settings.clone();
         apply_auto_convert_device_settings(&mut settings, device, multi_device);
-        let mut converter =
-            if let Some(user_converter) = UserConverter::load_with_title(novel_dir, title) {
-                NovelConverter::with_user_converter(settings, user_converter)
-            } else {
-                NovelConverter::new(settings)
-            };
+        let mut converter = if let Some(user_converter) = UserConverter::load_with_title(snapshot.path(), title) {
+            NovelConverter::try_with_user_converter(settings, user_converter)
+        } else {
+            NovelConverter::try_new(settings)
+        }.map_err(|error| error.to_string())?;
+        converter.set_write_guard(write.clone()).map_err(|error| error.to_string())?;
         converter.set_progress(Box::new(crate::platform::progress::NoProgress));
 
         let output_path = match device {
             Some(device) => converter
-                .convert_novel_by_id_with_device(id, novel_dir, device, false, false)
+                .convert_novel_by_id_with_device(id, snapshot.path(), device, false, false)
                 .map_err(|e| e.to_string())?,
             None => PathBuf::from(
                 converter
-                    .convert_novel_by_id(id, novel_dir)
+                    .convert_novel_by_id(id, snapshot.path())
                     .map_err(|e| e.to_string())?,
             ),
         };
@@ -750,13 +778,17 @@ pub fn convert_existing_novel(
             println!("{}", inspection);
         }
 
+        let private_output = match output_path.strip_prefix(novel_dir) {
+            Ok(relative) => snapshot.path().join(relative),
+            Err(_) => { crate::application::novel_access::require_private_path(&output_path).map_err(|error| error.to_string())?; output_path.clone() }
+        };
         if let Some(device) = device {
-            match copy_to_converted_file(&output_path, Some(device), id) {
+            match copy_to_converted_file(&private_output, Some(device), id) {
                 Ok(Some(path)) => println!("{} へコピーしました", path.display()),
                 Ok(None) => {}
                 Err(err) => println!("{}", err),
             }
-            let _ = send_file_to_device(&output_path, device);
+            let _ = send_file_to_device(&private_output, device);
         }
         last_output_path = Some(output_path);
     }
@@ -886,7 +918,7 @@ fn get_copy_to_directory(
         .any(|value| value.eq_ignore_ascii_case("site"))
     {
         let sitename = crate::native::novel_repository::NativeNovelRepository::new()
-            .get_sync(novel_id.into())
+            .get_current_sync(novel_id.into())
             .ok()
             .flatten()
             .map(|record| record.sitename);
@@ -1272,7 +1304,8 @@ mod tests {
         })
         .unwrap();
 
-        mark_not_found_and_freeze(7).unwrap();
+        let write = crate::native::materialization::capture_write_for_id(7).unwrap();
+        mark_not_found_and_freeze(&write, 7).unwrap();
 
         let record = crate::db::with_database(|db| Ok(db.get(7).cloned().unwrap())).unwrap();
         assert!(record.tags.contains(&"404".to_string()));

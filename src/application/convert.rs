@@ -28,6 +28,7 @@ use crate::setting_core::SettingScope;
 
 use super::messages::{self, MessageSink, Stream};
 use super::settings::SettingsStore;
+use super::novel_access::{NovelAccess, NovelReadLease};
 
 /// 変換結果。`output` は実際に保存した場合だけ、そのオブジェクトキーを持つ。
 #[derive(Debug)]
@@ -67,9 +68,10 @@ impl ConvertedText {
     /// read of its mutable key during the EPUB output pass.
     pub async fn from_stored(
         assets: Arc<dyn AssetStore>,
+        lease: &mut NovelReadLease,
         key: ObjectKey,
     ) -> Result<Option<Self>> {
-        let Some(stream) = assets.read_stream(&key).await? else {
+        let Some(stream) = lease.clone().into_open(&key, 0..u64::MAX).await? else {
             return Ok(None);
         };
         let stage = assets.stage_stream(stream).await?;
@@ -345,32 +347,34 @@ impl ConvertService {
     ///
     /// 本文は一話ずつ読み、世代と内容ハッシュを検証してから公開する。
     /// 目次にある本文が欠ける場合は既存の出力を変更しない。
-    pub async fn convert_and_store(&self, record: &NovelRecord) -> Result<ConvertedNovel> {
-        self.convert_inner(record, true, None).await
+    pub async fn convert_and_store(&self, access: &mut NovelAccess, record: &NovelRecord) -> Result<ConvertedNovel> {
+        self.convert_inner(access, record, true, None).await
     }
 
     /// 変換だけを行う (`convert_and_store` と同じだが、結果を保存しない)。
     ///
     /// 変換済みテキストを保存しない構成 (`convert.keep-txt=false`) で、
     /// 必要になった時点で組み立て直すために使う。
-    pub async fn convert_only(&self, record: &NovelRecord) -> Result<ConvertedNovel> {
-        self.convert_inner(record, false, None).await
+    pub async fn convert_only(&self, access: &mut NovelAccess, record: &NovelRecord) -> Result<ConvertedNovel> {
+        self.convert_inner(access, record, false, None).await
     }
 
     /// Convert an owned, ordered source (including virtual-book members).
     /// The source must report generation/hash changes as errors before EOF.
     pub async fn convert_source(
         &self,
+        access: &mut NovelAccess,
         record: &NovelRecord,
         toc: TocFile,
         sections: SectionStream,
         store: bool,
     ) -> Result<ConvertedNovel> {
-        self.convert_inner(record, store, Some((toc, sections))).await
+        self.convert_inner(access, record, store, Some((toc, sections))).await
     }
 
     async fn convert_inner(
         &self,
+        access: &mut NovelAccess,
         record: &NovelRecord,
         store: bool,
         source: Option<(TocFile, SectionStream)>,
@@ -380,27 +384,41 @@ impl ConvertService {
             &record.file_title,
             record.use_subdirectory,
         )?;
-        // 目次・本文と、小説単位の独立な設定ファイルを同時に読む。
-        // エラーの優先順位は直列だったときの読取順 (本文 → setting.ini →
-        // 置換 → converter.yaml) のままになるよう、join 後にこの順で評価する。
+        let prefix = crate::platform::ObjectPrefix::from(keys.prefix().clone());
+        if access.read()?.prefix() != &prefix {
+            return Err(NarouError::Platform("conversion reader belongs to another novel".into()));
+        }
+        if store && access.write()?.prefix() != &prefix {
+            return Err(NarouError::Platform("conversion writer belongs to another novel".into()));
+        }
+        let persistence = PersistenceService::new(self.objects.clone());
+        // Keep one admission from TOC through configuration and section EOF.
+        // Record source failure before settings failure, as before.
+        let source: Result<_> = match source {
+            Some((toc, sections)) => Ok((toc, Some(sections))),
+            None => persistence.load_toc(access.read()?, &keys).await.and_then(|toc| {
+                toc.map(|toc| (toc, None)).ok_or_else(|| {
+                    NarouError::Platform(format!("toc がありません: {}", keys.toc()))
+                })
+            }),
+        };
         let replace_key = keys.replace();
-        let (source, ini, local_settings, replacement, converter_yaml) = futures::join!(
+        let (inputs, local_settings) = futures::join!(
             async {
-                match source {
-                    Some(source) => Ok(source),
-                    None => self.load_source(&keys).await,
-                }
+                let lease = access.read()?;
+                let ini = self.load_ini(lease, &keys).await?;
+                let replacement = self.read_text(lease, &replace_key).await?;
+                let converter_key = ObjectKey::try_new(format!("{}/converter.yaml", keys.prefix()))?;
+                let yaml = self.read_text(lease, &converter_key).await?;
+                Ok::<_, NarouError>((ini, replacement, yaml))
             },
-            self.load_ini(&keys),
             self.settings.load(SettingScope::Local),
-            self.read_text(&replace_key),
-            async {
-                let converter_key =
-                    ObjectKey::try_new(format!("{}/converter.yaml", keys.prefix().as_ref()))?;
-                self.read_text(&converter_key).await
-            },
         );
-        let (toc, mut sections) = source?;
+        let (toc, sections) = source?;
+        let mut sections = match sections {
+            Some(sections) => sections,
+            None => persistence.stream_sections_snapshot(access.read()?.clone(), keys.clone(), toc.clone()),
+        };
         if toc.subtitles.is_empty() {
             return Err(NarouError::Platform(format!(
                 "本文がありません: {}",
@@ -408,7 +426,6 @@ impl ConvertService {
             )));
         }
 
-        let inputs = (|| Ok::<_, NarouError>((ini?, replacement?, converter_yaml?)))();
         let (ini, replacement, converter_yaml) = match inputs {
             Ok(inputs) => inputs,
             Err(error) => {
@@ -442,8 +459,11 @@ impl ConvertService {
         };
 
         let result_settings = settings.clone();
-        let converter =
-            NovelConverter::build(settings, user_converter, self.capabilities.clone());
+        let capabilities = match self.capabilities.clone() {
+            Some(caps) => Some(caps.with_write_guard(access.write()?.clone())),
+            None => None,
+        };
+        let converter = NovelConverter::build(settings, user_converter, capabilities);
         let toc_object = TocObject {
             title: toc.title,
             author: toc.author,
@@ -465,7 +485,7 @@ impl ConvertService {
             true,
         );
         let output = if store && keep_text {
-            if let Err(error) = self.assets.copy(&source.key, &output).await {
+            if let Err(error) = access.write()?.install_staged(&source.key, &output).await {
                 let _ = source.cleanup().await;
                 return Err(error);
             }
@@ -476,17 +496,8 @@ impl ConvertService {
         Ok(ConvertedNovel { source, output, settings: result_settings })
     }
 
-    async fn load_source(&self, keys: &NovelObjectKeys) -> Result<(TocFile, SectionStream)> {
-        let persistence = PersistenceService::new(self.objects.clone(), self.assets.clone());
-        let toc = persistence.load_toc(keys).await?.ok_or_else(|| {
-            NarouError::Platform(format!("toc がありません: {}", keys.toc().as_ref()))
-        })?;
-        let sections = persistence.stream_sections_snapshot(keys.clone(), toc.clone());
-        Ok((toc, sections))
-    }
-
-    async fn load_ini(&self, keys: &NovelObjectKeys) -> Result<IniData> {
-        Ok(match self.objects.read_small(&keys.setting()).await? {
+    async fn load_ini(&self, lease: &mut NovelReadLease, keys: &NovelObjectKeys) -> Result<IniData> {
+        Ok(match lease.read_small(&keys.setting()).await? {
             Some(bytes) => IniData::load(&String::from_utf8_lossy(&bytes)),
             None => IniData::new(),
         })
@@ -494,10 +505,10 @@ impl ConvertService {
 
     async fn read_text(
         &self,
+        lease: &mut NovelReadLease,
         key: &crate::platform::ObjectKey,
     ) -> Result<Option<String>> {
-        Ok(self
-            .objects
+        Ok(lease
             .read_small(key)
             .await?
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
@@ -511,6 +522,16 @@ mod tests {
     use crate::downloader::types::{SectionElement, SubtitleInfo, TocFile};
     use crate::platform::mocks::MemoryObjectStore;
     use futures::executor::block_on;
+
+    async fn test_access(service: &ConvertService, record: &NovelRecord) -> NovelAccess {
+        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).unwrap();
+        NovelAccess::for_operation(&service.objects, Some(&service.assets), &crate::platform::ObjectPrefix::from(keys.prefix().clone()), "convert-test").await.unwrap()
+    }
+
+    async fn cached_lease(store: Arc<MemoryObjectStore>) -> NovelReadLease {
+        let objects: Arc<dyn ObjectStore> = store;
+        NovelReadLease::admit(&objects, &crate::platform::ObjectPrefix::new("novels/site/book").unwrap(), "cached-test").await.unwrap()
+    }
 
     async fn collected_text(source: &ConvertedText) -> String {
         let mut stream = source.read_stream().await.unwrap();
@@ -668,7 +689,7 @@ mod tests {
         let key = ObjectKey::try_new("novels/site/book/novel.txt").unwrap();
         block_on(async {
             store.write_small(&key, b"first generation".to_vec()).await.unwrap();
-            let source = ConvertedText::from_stored(store.clone(), key.clone()).await.unwrap().unwrap();
+            let source = ConvertedText::from_stored(store.clone(), &mut cached_lease(store.clone()).await, key.clone()).await.unwrap().unwrap();
             store.write_small(&key, b"second generation".to_vec()).await.unwrap();
             assert_eq!(collected_text(&source).await, "first generation");
             assert_eq!(collected_text(&source).await, "first generation");
@@ -685,7 +706,7 @@ mod tests {
         let key = ObjectKey::try_new("novels/site/book/novel.txt").unwrap();
         block_on(async {
             store.write_small(&key, b"snapshot".to_vec()).await.unwrap();
-            let source = ConvertedText::from_stored(store.clone(), key).await.unwrap().unwrap();
+            let source = ConvertedText::from_stored(store.clone(), &mut cached_lease(store.clone()).await, key).await.unwrap().unwrap();
             for (bytes, message) in [
                 (&b"tampered"[..], "checksum mismatch"),
                 (&b"short"[..], "truncated"),
@@ -723,7 +744,7 @@ mod tests {
         ]));
         block_on(async {
             store.write_small(&keys.converted_text(), b"previous output".to_vec()).await.unwrap();
-            let error = service.convert_source(&target, toc, source, true).await.unwrap_err();
+            let error = service.convert_source(&mut test_access(&service, &target).await, &target, toc, source, true).await.unwrap_err();
             assert!(error.to_string().contains("source generation changed"));
             assert_eq!(
                 store.read_small(&keys.converted_text()).await.unwrap().unwrap(),
@@ -836,7 +857,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let converted = service.convert_and_store(&target).await.unwrap();
+            let converted = service.convert_and_store(&mut test_access(&service, &target).await, &target).await.unwrap();
             assert_eq!(converted.output, Some(keys.converted_text()));
             let text = collected_text(&converted.source).await;
             assert_eq!(text.lines().next(), Some("テスト小説 [example/2001-02-03] (完結)"));
@@ -855,7 +876,7 @@ mod tests {
         // 保存が無い小説では失敗する (空の EPUB を配らない)。
         let mut missing = record(8);
         missing.file_title = "missing".to_string();
-        assert!(block_on(service.convert_and_store(&missing)).is_err());
+        assert!(block_on(async { service.convert_and_store(&mut test_access(&service, &missing).await, &missing).await }).is_err());
     }
 
     /// 目次にあるのに本文オブジェクトが無い話を含む小説は失敗する。
@@ -924,7 +945,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let error = service.convert_and_store(&target).await.unwrap_err();
+            let error = service.convert_and_store(&mut test_access(&service, &target).await, &target).await.unwrap_err();
             let message = error.to_string();
             let expected = format!("{} {}.yaml", missing.index, missing.file_subtitle);
             assert!(
@@ -1020,7 +1041,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let error = service.convert_and_store(&target).await.unwrap_err();
+            let error = service.convert_and_store(&mut test_access(&service, &target).await, &target).await.unwrap_err();
             let message = error.to_string();
             let expected = format!("{} {}.yaml", missing.index, missing.file_subtitle);
             assert!(
@@ -1049,7 +1070,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let converted = service.convert_and_store(&target).await.unwrap();
+            let converted = service.convert_and_store(&mut test_access(&service, &target).await, &target).await.unwrap();
             let text = collected_text(&converted.source).await;
             let first_at = text.find("みかん").unwrap();
             let second_at = text.find("りんご").unwrap();
@@ -1130,7 +1151,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let converted = service.convert_and_store(&target).await.unwrap();
+            let converted = service.convert_and_store(&mut test_access(&service, &target).await, &target).await.unwrap();
             let text = collected_text(&converted.source).await;
             assert!(text.contains("本文。"), "{text}");
             assert!(converted.output.is_none());
@@ -1261,4 +1282,33 @@ mod tests {
             ));
         }
     }
+    #[test]
+    fn stale_render_cannot_publish_over_replacement_output() {
+        use crate::platform::{NovelAccessFence, ObjectPrefix};
+        let _env = KeepTxtEnvGuard::cleared();
+        block_on(async {
+            let store = Arc::new(MemoryObjectStore::new());
+            let service = ConvertService::new(store.clone(), store.clone(), Arc::new(crate::application::settings::MemorySettingsStore::new()));
+            let target = record(1);
+            let keys = NovelObjectKeys::new(&target.sitename, &target.file_title, target.use_subdirectory).unwrap();
+            let prefix = ObjectPrefix::from(keys.prefix().clone());
+            let mut access = test_access(&service, &target).await;
+            let (toc, mut sections) = streaming_fixture(1, "old body from source");
+            let section = sections.remove(0);
+            let output = keys.converted_text();
+            let delayed_store = store.clone();
+            let delayed_output = output.clone();
+            let source: SectionStream = Box::pin(futures::stream::once(async move {
+                let epoch = delayed_store.close_gate(&prefix, "replacement").await?;
+                delayed_store.open_gate(&prefix, "replacement", epoch).await?;
+                let new = delayed_store.capture_writer(&prefix).await?;
+                delayed_store.write_small_guarded(&new, &delayed_output, b"new published text".to_vec()).await?;
+                Ok(section)
+            }));
+            assert!(service.convert_source(&mut access, &target, toc, source, true).await.is_err());
+            access.release().await.unwrap();
+            assert_eq!(store.read_small(&output).await.unwrap().unwrap(), b"new published text");
+        });
+    }
+
 }

@@ -206,32 +206,16 @@ impl S3Location {
 
     /// 一覧 (ListObjectsV2) の URL。クエリは署名対象と一致する canonical
     /// form で組み立てる (呼び出し側はこの URL をそのまま送ればよい)。
-    pub fn list_url(
-        &self,
-        prefix: &str,
-        limit: usize,
-        continuation_token: Option<&str>,
-    ) -> String {
-        let storage_prefix = if self.prefix.is_empty() {
-            prefix.to_string()
-        } else if prefix.is_empty() {
-            format!("{}/", self.prefix)
-        } else {
-            format!("{}/{}", self.prefix, prefix.trim_start_matches('/'))
-        };
-        let mut params = vec![
-            ("list-type".to_string(), "2".to_string()),
-            ("max-keys".to_string(), limit.to_string()),
-            ("prefix".to_string(), storage_prefix),
-            // 非 ASCII のキーを持つバケットで AccessDenied/署名不一致を避けるため、
-            // SDK と同じく応答キーの URL エンコードを要求する。
-            ("encoding-type".to_string(), "url".to_string()),
-        ];
-        if let Some(token) = continuation_token {
-            params.push(("continuation-token".to_string(), token.to_string()));
-        }
-        let query = canonical_query(&params);
-        format!("{}{}?{}", self.endpoint, self.bucket_path(), query)
+    pub fn list_url(&self,prefix:&str,limit:usize,continuation_token:Option<&str>)->String{self.list_url_cursor(prefix,limit,continuation_token.map(|value|("continuation-token",value.to_owned())))}
+    #[cfg(feature = "native-runtime")]
+    /// Raw LIST-scoped StartAfter. Never route the cursor through dedup keys.
+    pub(crate) fn list_keyset_url(&self,prefix:&str,limit:usize,start_after:Option<&str>)->String{
+        let cursor=start_after.map(|value|("start-after",if self.prefix.is_empty(){value.to_owned()}else{format!("{}/{value}",self.prefix)}));self.list_url_cursor(prefix,limit,cursor)
+    }
+    fn list_url_cursor(&self,prefix:&str,limit:usize,cursor:Option<(&str,String)>)->String{
+        let storage_prefix=if self.prefix.is_empty(){prefix.to_owned()}else if prefix.is_empty(){format!("{}/",self.prefix)}else{format!("{}/{}",self.prefix,prefix.trim_start_matches('/'))};
+        let mut params=vec![("list-type".to_owned(),"2".to_owned()),("max-keys".to_owned(),limit.to_string()),("prefix".to_owned(),storage_prefix),("encoding-type".to_owned(),"url".to_owned())];
+        if let Some((name,value))=cursor{params.push((name.to_owned(),value));}format!("{}{}?{}",self.endpoint,self.bucket_path(),canonical_query(&params))
     }
 
     /// サーバサイドコピー (`x-amz-copy-source`) に渡す値。

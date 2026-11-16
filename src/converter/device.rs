@@ -711,20 +711,14 @@ impl OutputManager {
         base_name: &str,
         include_illust: bool,
     ) -> Result<PathBuf> {
+        #[cfg(feature = "native-runtime")]
+        {
+            crate::application::novel_access::require_private_path(input_txt)?;
+            crate::application::novel_access::require_private_path(output_dir)?;
+        }
         if matches!(self.device, Device::Text) {
             return Ok(input_txt.to_path_buf());
         }
-        // EPUB/ZIP 組立はローカルの画像ファイルを要求する。挿絵が
-        // ObjectStore / S3 にある構成では実体が無いので、入力テキストの隣へ
-        // 取り出し、この呼び出しを抜ける時点で自分が書いた分だけ片付ける。
-        // (ライブラリ外のテキストファイル変換では取り出す対象が無い。)
-        #[cfg(feature = "native-runtime")]
-        let _materialized = match crate::db::inventory::Inventory::with_default_root() {
-            Ok(_) => Some(crate::native::illustrations::materialize_blocking(
-                input_txt.parent().unwrap_or(input_txt),
-            )?),
-            Err(_) => None,
-        };
         match self.device {
             Device::Text => Ok(input_txt.to_path_buf()),
             Device::Epub => self.epub_output(input_txt, output_dir, ".epub"),

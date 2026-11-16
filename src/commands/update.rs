@@ -33,7 +33,7 @@ use narou_rs::downloader::narou_api::{
 };
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::downloader::{
-    DownloadResult, Downloader, SubtitleInfo, TocFile, TocObject, UpdateStatus,
+    DownloadResult, Downloader, SubtitleInfo, TocObject, UpdateStatus,
 };
 use narou_rs::mail::{
     MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
@@ -159,7 +159,7 @@ pub async fn cmd_update(opts: UpdateOptions, sink: &Arc<dyn MessageSink>) {
 
     let multi = CliProgress::multi();
     let hotentry_enabled = load_local_setting_bool("hotentry");
-    let mut hotentries: HashMap<i64, Vec<SubtitleInfo>> = HashMap::new();
+    let mut hotentries: HashMap<i64, HotentryInput> = HashMap::new();
 
     // Build the shared context once so the per-novel helper and any
     // parallel workers can clone it cheaply.
@@ -456,7 +456,7 @@ fn sort_update_ids_by_key(ids: &mut [i64], key: &str) {
         .iter()
         .filter_map(|id| {
             novels
-                .get_sync((*id).into())
+                .get_current_sync((*id).into())
                 .ok()
                 .flatten()
                 .map(|r| (r.id, r))
@@ -501,7 +501,7 @@ fn load_frozen_ids() -> HashSet<i64> {
 
 fn get_novel_title(id: i64) -> String {
     narou_rs::native::novel_repository::NativeNovelRepository::new()
-        .get_sync(id.into())
+        .get_current_sync(id.into())
         .ok()
         .flatten()
         .map(|r| r.title)
@@ -510,47 +510,39 @@ fn get_novel_title(id: i64) -> String {
 
 fn repair_empty_titles() {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let filter = narou_rs::platform::NovelFilter::default();
-    let ids = novels
-        .scan_ids_sync(&filter, None, usize::MAX)
-        .unwrap_or_default();
-    let mut records: Vec<(i64, String, String)> = Vec::new();
-    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-        .unwrap_or_else(|_| std::path::PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
-    for id in ids {
-        let Ok(Some(r)) = novels.get_sync(id) else {
-            continue;
-        };
-        if !r.title.is_empty() && !r.author.is_empty() {
-            continue;
-        }
-        let novel_dir = narou_rs::db::novel_dir_for_record(&archive_root, &r);
-        let toc_path = novel_dir.join("toc.yaml");
-        let mut fixed_fields: Option<(String, String)> = None;
-        if let Ok(toc_content) = std::fs::read_to_string(&toc_path)
-            && let Ok(toc) = serde_yaml::from_str::<narou_rs::downloader::TocFile>(&toc_content)
-            && (!toc.title.is_empty() || !toc.author.is_empty())
-        {
-            fixed_fields = Some((toc.title, toc.author));
-        }
-        let (title, author) = fixed_fields.unwrap_or_else(|| {
-            let title = extract_title_from_file_title(&r.file_title);
-            (title, String::new())
-        });
-        if !title.is_empty() {
-            records.push((r.id, title, author));
-        }
-    }
-    for (id, title, author) in &records {
-        let _ = novels.update_existing_sync((*id).into(), |record| {
-            if record.title.is_empty() && !title.is_empty() {
-                record.title = title.clone();
-            }
-            if record.author.is_empty() && !author.is_empty() {
-                record.author = author.clone();
-            }
+    let Ok(ids) = novels.scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX) else { return; };
+    let Ok(records) = novels.get_many_current_sync(&ids) else { return; };
+    let root = narou_rs::db::with_database(|database| database.archive_root().parent().map(std::path::Path::to_path_buf)
+        .ok_or_else(|| narou_rs::error::NarouError::Platform("archive has no library root".into())));
+    let objects = match root.and_then(|root| narou_rs::native::materialization::read_store(&root)) {
+        Ok(objects) => objects,
+        Err(error) => { tracing::warn!("title repair cannot read the library: {error}"); return; }
+    };
+    for record in records.into_iter().flatten() {
+        if !record.title.is_empty() && !record.author.is_empty() { continue; }
+        let result = (|| -> narou_rs::error::Result<()> {
+            let write = narou_rs::native::materialization::capture_write_for_record(&record)?;
+            let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+            let fields = narou_rs::native::materialization::block_on(async {
+                let mut lease = narou_rs::application::novel_access::NovelReadLease::admit_for(&objects, &keys, "repair-title").await?;
+                let result = async {
+                    if lease.epoch() != write.epoch() { return Err(narou_rs::error::NarouError::Platform("novel_busy: title repair origin changed".into())); }
+                    let bytes = lease.read_small(&keys.toc()).await?;
+                    lease.validate().await?;
+                    Ok(bytes.and_then(|bytes| serde_yaml::from_slice::<narou_rs::downloader::TocFile>(&bytes).ok()).map(|toc| (toc.title, toc.author)))
+                }.await;
+                let released = lease.release().await;
+                match result { Ok(fields) => { released?; Ok(fields) }, Err(error) => Err(error) }
+            })?;
+            let (title, author) = fields.unwrap_or_else(|| (extract_title_from_file_title(&record.file_title), String::new()));
+            novels.update_existing_guarded_sync(write.fence(), record.id.into(), |current| {
+                if current.title.is_empty() && !title.is_empty() { current.title = title; }
+                if current.author.is_empty() && !author.is_empty() { current.author = author; }
+                Ok(())
+            })?;
             Ok(())
-        });
+        })();
+        if let Err(error) = result { tracing::warn!("title repair failed for ID {}: {error}", record.id); }
     }
 }
 
@@ -562,13 +554,14 @@ fn extract_title_from_file_title(file_title: &str) -> String {
     }
 }
 
-fn record_update_check(id: i64) {
+fn record_update_check(write: &narou_rs::application::novel_access::NovelWriteGuard, id: i64) -> narou_rs::error::Result<()> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let _ = novels.update_existing_sync(id.into(), |record| {
+    novels.update_existing_guarded_sync(write.fence(), id.into(), |record| {
         mark_update_checked(record, Utc::now());
         Ok(())
-    });
+    })?;
     narou_rs::progress::emit_novel_refresh(id);
+    Ok(())
 }
 
 fn apply_general_lastup_check_result(
@@ -619,6 +612,7 @@ fn apply_general_lastup_check_result(
 }
 
 fn record_general_lastup_check(
+    write: &narou_rs::application::novel_access::NovelWriteGuard,
     id: i64,
     novelupdated_at: Option<DateTime<Utc>>,
     general_lastup: Option<DateTime<Utc>>,
@@ -626,15 +620,16 @@ fn record_general_lastup_check(
     is_end: Option<bool>,
     now: DateTime<Utc>,
     sync_end: bool,
-) {
+) -> narou_rs::error::Result<()> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let _ = novels.update_existing_sync(id.into(), |record| {
+    novels.update_existing_guarded_sync(write.fence(), id.into(), |record| {
         apply_general_lastup_check_result(record, novelupdated_at, general_lastup, length, is_end, now);
         if sync_end {
             narou_rs::application::novel_actions::sync_end_tag(record);
         }
         Ok(())
-    });
+    })?;
+    Ok(())
 }
 
 #[derive(Default)]
@@ -644,20 +639,22 @@ struct GeneralLastupNarouOutcome {
 }
 
 
-fn set_convert_failure(id: i64) {
+fn set_convert_failure(write: &narou_rs::application::novel_access::NovelWriteGuard, id: i64) -> narou_rs::error::Result<()> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let _ = novels.update_existing_sync(id.into(), |record| {
+    novels.update_existing_guarded_sync(write.fence(), id.into(), |record| {
         mark_convert_failure(record, true);
         Ok(())
-    });
+    })?;
+    Ok(())
 }
 
-fn clear_convert_failure(id: i64) {
+fn clear_convert_failure(write: &narou_rs::application::novel_access::NovelWriteGuard, id: i64) -> narou_rs::error::Result<()> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let _ = novels.update_existing_sync(id.into(), |record| {
+    novels.update_existing_guarded_sync(write.fence(), id.into(), |record| {
         mark_convert_failure(record, false);
         Ok(())
-    });
+    })?;
+    Ok(())
 }
 
 /// `narou update` の 1 件分の結果行。文言・順序・ストリームは Worker の
@@ -679,16 +676,16 @@ fn print_status_messages(
     }
 }
 
-fn auto_convert(dl: &DownloadResult, no_open: bool) -> Result<(), String> {
+fn auto_convert(write: &narou_rs::application::novel_access::NovelWriteGuard, dl: &DownloadResult, no_open: bool) -> Result<(), String> {
     if is_web_mode() {
-        return auto_convert_via_web_subprocess(dl.id, no_open);
+        return auto_convert_via_web_subprocess(write, dl.id, no_open);
     }
-    convert_existing_novel(dl.id, &dl.title, &dl.author, &dl.novel_dir, no_open).map(|_| ())
+    convert_existing_novel(write, dl.id, no_open).map(|_| ())
 }
 
-fn auto_convert_via_web_subprocess(id: i64, no_open: bool) -> Result<(), String> {
+fn auto_convert_via_web_subprocess(write: &narou_rs::application::novel_access::NovelWriteGuard, id: i64, no_open: bool) -> Result<(), String> {
     if narou_rs::compat::load_local_setting_bool("concurrency") {
-        super::enqueue_web_convert_job(id)?;
+        super::enqueue_web_convert_job(write, id)?;
         return Ok(());
     }
 
@@ -699,6 +696,7 @@ fn auto_convert_via_web_subprocess(id: i64, no_open: bool) -> Result<(), String>
         command.arg("--no-open");
     }
     command.arg(id.to_string());
+    command.env("NAROU_RS_WRITE_ORIGIN", serde_json::to_string(&write.origin()).map_err(|error| error.to_string())?);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -740,34 +738,53 @@ fn relay_web_convert_stream<R: io::Read>(reader: R) -> Result<(), String> {
     relay_web_stream_to_console(reader, "stdout2")
 }
 
+struct HotentryInput {
+    write: narou_rs::application::novel_access::NovelWriteGuard,
+    subtitles: Vec<SubtitleInfo>,
+}
+
+fn merge_hotentry(hotentries: &mut HashMap<i64, HotentryInput>, id: i64, input: HotentryInput) -> Result<(), String> {
+    match hotentries.entry(id) {
+        std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(input); }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let previous = entry.get_mut();
+            if previous.write.prefix() != input.write.prefix() || previous.write.epoch() != input.write.epoch() {
+                return Err(format!("novel_busy: hotentry origin changed for ID {id}"));
+            }
+            previous.subtitles.extend(input.subtitles);
+        }
+    }
+    Ok(())
+}
+
 fn process_hotentry(
-    hotentries: &HashMap<i64, Vec<SubtitleInfo>>,
+    hotentries: &HashMap<i64, HotentryInput>,
     sink: &Arc<dyn MessageSink>,
 ) -> Result<(), String> {
     if hotentries.is_empty() {
         return Ok(());
     }
 
-    let mut collected: Vec<(i64, PathBuf, TocObject, Vec<SubtitleInfo>)> = Vec::new();
-    for (id, subtitles) in hotentries {
+    let mut collected: Vec<(i64, tempfile::TempDir, TocObject, Vec<SubtitleInfo>)> = Vec::new();
+    for (id, input) in hotentries {
+        let subtitles = &input.subtitles;
         if subtitles.is_empty() {
             continue;
         }
 
         let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
         let record = novels
-            .get_sync((*id).into())
+            .get_current_sync((*id).into())
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("ID: {}", id))?;
         let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
             .map_err(|e| e.to_string())?;
         let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
-        let title = record.title.clone();
-        let author = record.author.clone();
-
-        let toc = load_toc_object(&novel_dir).map_err(|e| e.to_string())?;
-        let _ = (title, author);
-        collected.push((*id, novel_dir, toc, subtitles.clone()));
+        let (snapshot, toc) = narou_rs::native::materialization::conversion_snapshot_with_origin(&novel_dir, &input.write, Some(subtitles), |path| {
+            let toc: TocObject = serde_yaml::from_slice(&std::fs::read(path.join("toc.yaml"))?)?;
+            Ok((toc, narou_rs::native::materialization::ConversionInputSelection { illustrations: false, cover: false }))
+        }).map_err(|error| error.to_string())?;
+        collected.push((*id, snapshot, toc, subtitles.clone()));
     }
 
     if collected.is_empty() {
@@ -778,8 +795,9 @@ fn process_hotentry(
     sink.emit(Stream::Stdout, messages::update::hotentry_convert_started());
 
     let mut converted_entries = Vec::new();
-    for (id, novel_dir, toc, subtitles) in &collected {
-        let settings = NovelSettings::load_for_novel(*id, &toc.title, &toc.author, novel_dir);
+    for (id, snapshot, toc, subtitles) in &collected {
+        let novel_dir = snapshot.path();
+        let settings = NovelSettings::load_for_novel(*id, &toc.title, &toc.author, novel_dir).map_err(|error| error.to_string())?;
         let mut settings = settings;
         settings.enable_illust = false;
         let display_title = settings.novel_title.clone();
@@ -787,10 +805,10 @@ fn process_hotentry(
 
         let mut converter = if let Some(uc) = UserConverter::load_with_title(novel_dir, &toc.title)
         {
-            NovelConverter::with_user_converter(settings, uc)
+            NovelConverter::try_with_user_converter(settings, uc)
         } else {
-            NovelConverter::new(settings)
-        };
+            NovelConverter::try_new(settings)
+        }.map_err(|error| error.to_string())?;
 
         let text = converter
             .convert_subtitles_for_hotentry(toc, subtitles, novel_dir)
@@ -890,19 +908,6 @@ struct HotentryEntry {
     text: String,
 }
 
-fn load_toc_object(novel_dir: &Path) -> narou_rs::error::Result<TocObject> {
-    let toc_path = novel_dir.join("toc.yaml");
-    let toc_content = std::fs::read_to_string(&toc_path)?;
-    let toc: TocFile = serde_yaml::from_str(&toc_content)?;
-    Ok(TocObject {
-        title: toc.title,
-        author: toc.author,
-        toc_url: toc.toc_url,
-        story: toc.story,
-        subtitles: toc.subtitles,
-        novel_type: toc.novel_type,
-    })
-}
 
 fn hotentry_dir_path() -> PathBuf {
     PathBuf::from(HOTENTRY_DIR_NAME)
@@ -1057,7 +1062,6 @@ async fn update_general_lastup(
         update_general_lastup_other(&other_targets, user_agent, progress.as_ref()).await;
     }
 
-    let _ = narou_rs::db::with_database_mut(|db| db.save());
 
     if had_api_error {
         sink.emit(Stream::Stderr, messages::update::lastup_check_failed());
@@ -1078,7 +1082,7 @@ fn partition_novels_by_api_support(site_settings: &[SiteSetting], automatic: boo
         .unwrap_or_default();
     let mut records: Vec<(i64, String, Option<String>)> = Vec::new();
     for id in ids {
-        let Ok(Some(r)) = novels.get_sync(id) else {
+        let Ok(Some(r)) = novels.get_current_sync(id) else {
             continue;
         };
         if frozen_ids.contains(&r.id) {
@@ -1170,6 +1174,13 @@ async fn update_general_lastup_narou(
 
     for (api_url, novels) in novels_by_api {
         for chunk in novels.chunks(50) {
+            let mut writes = HashMap::new();
+            for (id, _) in chunk {
+                match narou_rs::native::materialization::capture_write_for_id(*id) {
+                    Ok(write) => { writes.insert(*id, write); }
+                    Err(error) => { tracing::warn!("metadata check admission failed for {id}: {error}"); outcome.had_api_error = true; }
+                }
+            }
             let ncodes: Vec<&str> = chunk.iter().map(|(_, nc)| nc.as_str()).collect();
             let ncode_param = ncodes.join("-");
 
@@ -1196,15 +1207,14 @@ async fn update_general_lastup_narou(
             outcome.fallback_ids.extend(fallback_ids);
 
             for (id, entry) in updates {
-                record_general_lastup_check(
-                    id,
-                    parse_api_datetime(&entry.novelupdated_at),
-                    parse_api_datetime(&entry.general_lastup),
-                    Some(entry.length),
-                    None,
-                    Utc::now(),
-                    false,
-                );
+                let Some(write) = writes.get(&id) else { continue; };
+                if let Err(error) = record_general_lastup_check(
+                    write, id, parse_api_datetime(&entry.novelupdated_at), parse_api_datetime(&entry.general_lastup),
+                    Some(entry.length), None, Utc::now(), false,
+                ) {
+                    tracing::warn!("metadata check commit failed for {id}: {error}");
+                    outcome.had_api_error = true;
+                }
             }
             progress.inc(chunk.len() as u64);
         }
@@ -1231,6 +1241,10 @@ async fn update_general_lastup_other(
 
     for &id in novels {
         tokio::time::sleep(std::time::Duration::from_secs_f64(UPDATE_INTERVAL_MIN_SECS)).await;
+        let write = match narou_rs::native::materialization::capture_write_for_id(id) {
+            Ok(write) => write,
+            Err(error) => { tracing::warn!("metadata check admission failed for {id}: {error}"); progress.inc(1); continue; }
+        };
 
         let latest_status = downloader.fetch_latest_status_by_id(id).await;
         let Ok((novelupdated_at, general_lastup, length, is_end)) = latest_status else {
@@ -1238,15 +1252,9 @@ async fn update_general_lastup_other(
             continue;
         };
 
-        record_general_lastup_check(
-            id,
-            novelupdated_at,
-            general_lastup,
-            length,
-            is_end,
-            Utc::now(),
-            true,
-        );
+        if let Err(error) = record_general_lastup_check(
+            &write, id, novelupdated_at, general_lastup, length, is_end, Utc::now(), true,
+        ) { tracing::warn!("metadata check commit failed for {id}: {error}"); }
 
         progress.inc(1);
     }
@@ -1278,7 +1286,7 @@ fn collect_record_domains(target_ids: &[i64]) -> Result<HashMap<i64, String>, St
     let mut map = HashMap::new();
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     for &id in target_ids {
-        if let Ok(Some(record)) = novels.get_sync(id.into())
+        if let Ok(Some(record)) = novels.get_current_sync(id.into())
             && let Some(domain) = record.domain.as_ref().filter(|d| !d.is_empty())
         {
             map.insert(id, domain.clone());
@@ -1345,7 +1353,7 @@ async fn run_serial_update(
     domain_records: &HashMap<i64, String>,
     ctx: &UpdateContext,
     mistook: &mut usize,
-    hotentries: &mut HashMap<i64, Vec<SubtitleInfo>>,
+    hotentries: &mut HashMap<i64, HotentryInput>,
     interrupted: &AtomicBool,
 ) -> std::result::Result<(), UpdateInterrupted> {
     let mut downloader = match Downloader::with_user_agent(ctx.opts.user_agent.as_deref()) {
@@ -1409,7 +1417,7 @@ async fn run_parallel_per_domain_update(
     max_parallel_domains: usize,
     interrupted: Arc<AtomicBool>,
     mistook: &mut usize,
-    hotentries: &mut HashMap<i64, Vec<SubtitleInfo>>,
+    hotentries: &mut HashMap<i64, HotentryInput>,
 ) -> std::result::Result<ParallelUpdateOutcome, UpdateInterrupted> {
     let group_lookup: HashMap<String, Vec<i64>> = domain_groups.iter().cloned().collect();
     let _ = target_ids; // documentation: future use if we add fine-grained stats.
@@ -1445,7 +1453,7 @@ async fn run_parallel_per_domain_update(
             downloader.set_message_sink(narou_rs::progress::console_sink());
             let mut last_started_by_domain = HashMap::new();
             let mut local_mistook = 0usize;
-            let mut local_hotentries: HashMap<i64, Vec<SubtitleInfo>> = HashMap::new();
+            let mut local_hotentries: HashMap<i64, HotentryInput> = HashMap::new();
 
             loop {
                 if interrupted.load(AtomicOrdering::SeqCst) {
@@ -1496,8 +1504,11 @@ async fn run_parallel_per_domain_update(
         match handle.await.expect("worker panicked") {
             Ok((inc, h)) => {
                 *mistook += inc;
-                for (id, subtitles) in h {
-                    hotentries.entry(id).or_default().extend(subtitles);
+                for (id, input) in h {
+                    if let Err(error) = merge_hotentry(hotentries, id, input) {
+                        ctx.sink.emit(Stream::Stderr, &messages::update::hotentry_failed(error));
+                        *mistook += 1;
+                    }
                 }
             }
             Err(UpdateInterrupted) => {
@@ -1524,7 +1535,7 @@ async fn process_novel_for_update(
     domain: &str,
     ctx: &UpdateContext,
     last_started_by_domain: &mut HashMap<String, Instant>,
-    hotentries: &mut HashMap<i64, Vec<SubtitleInfo>>,
+    hotentries: &mut HashMap<i64, HotentryInput>,
     interrupted: &AtomicBool,
 ) -> std::result::Result<usize, UpdateInterrupted> {
     if interrupted.load(AtomicOrdering::SeqCst) {
@@ -1532,7 +1543,7 @@ async fn process_novel_for_update(
     }
     // 仮想小説は実体を持たないので更新しない。
     if let Ok(Some(record)) =
-        narou_rs::native::novel_repository::NativeNovelRepository::new().get_sync(id.into())
+        narou_rs::native::novel_repository::NativeNovelRepository::new().get_current_sync(id.into())
         && narou_rs::virtual_novel::is_virtual_record(&record)
     {
         return Ok(0);
@@ -1563,11 +1574,20 @@ async fn process_novel_for_update(
     downloader.set_progress(ctx.make_progress(id));
 
     let mut new_mistook = 0usize;
+    let write = match narou_rs::native::materialization::capture_write_for_id(id) {
+        Ok(write) => write,
+        Err(error) => { ctx.sink.emit(Stream::Stderr, &messages::indented_error(error)); return Ok(1); }
+    };
 
     // ダウンロード中はこの小説をロックする (別レーンの変換と同時に触らない)。
     let download_result = {
-        let _lock = narou_rs::compat::NovelLockGuard::acquire(Some(id));
-        downloader.download_novel(&id.to_string()).await
+        let _lock = match narou_rs::compat::NovelLockGuard::acquire(Some(id)) {
+            Ok(lock) => lock,
+            Err(error) => { ctx.sink.emit(Stream::Stderr, &messages::indented_error(error)); return Ok(1); }
+        };
+        downloader.download_novel_with_execution_options(&id.to_string(), narou_rs::downloader::DownloadExecutionOptions {
+            force: false, budget: None, resume_from_section: None, access: Some(write.clone()), creation_reservation: None,
+        }).await
     };
     match download_result {
         Ok(dl) => {
@@ -1580,16 +1600,16 @@ async fn process_novel_for_update(
             };
             print_status_messages(&dl, &ctx.sink, Some(&canceled_title));
             if ctx.hotentry_enabled && !dl.new_arrival_subtitles.is_empty() {
-                hotentries
-                    .entry(dl.id)
-                    .or_default()
-                    .extend(dl.new_arrival_subtitles.clone());
+                if let Err(error) = merge_hotentry(hotentries, dl.id, HotentryInput { write: write.clone(), subtitles: dl.new_arrival_subtitles.clone() }) {
+                    ctx.sink.emit(Stream::Stderr, &messages::update::hotentry_failed(error));
+                    new_mistook += 1;
+                }
             }
 
             let new_arrivals = dl.new_arrivals;
             let has_convert_failure =
                 narou_rs::native::novel_repository::NativeNovelRepository::new()
-                    .get_sync(dl.id.into())
+                    .get_current_sync(dl.id.into())
                     .ok()
                     .flatten()
                     .map(|r| r.convert_failure)
@@ -1610,7 +1630,10 @@ async fn process_novel_for_update(
             );
             match dl.status {
                 UpdateStatus::Ok => {
-                    record_update_check(dl.id);
+                    if let Err(error) = record_update_check(&write, dl.id) {
+                        ctx.sink.emit(Stream::Stderr, &messages::indented_error(error));
+                        return Ok(new_mistook + 1);
+                    }
                     if !needs_convert {
                         tokio::time::sleep(std::time::Duration::from_secs_f64(FORCE_WAIT_SECS))
                             .await;
@@ -1618,7 +1641,10 @@ async fn process_novel_for_update(
                     }
                 }
                 UpdateStatus::None => {
-                    record_update_check(dl.id);
+                    if let Err(error) = record_update_check(&write, dl.id) {
+                        ctx.sink.emit(Stream::Stderr, &messages::indented_error(error));
+                        return Ok(new_mistook + 1);
+                    }
                     if !needs_convert {
                         return Ok(new_mistook);
                     }
@@ -1642,14 +1668,19 @@ async fn process_novel_for_update(
             }
 
             if needs_convert {
-                match auto_convert(&dl, ctx.is_bulk) {
+                match auto_convert(&write, &dl, ctx.is_bulk) {
                     Ok(()) => {
-                        clear_convert_failure(dl.id);
+                        if let Err(error) = clear_convert_failure(&write, dl.id) {
+                            ctx.sink.emit(Stream::Stderr, &messages::indented_error(error));
+                            new_mistook += 1;
+                        }
                     }
                     Err(e) => {
                         ctx.sink
                             .emit(Stream::Stdout, &messages::download::convert_error_line(e));
-                        set_convert_failure(dl.id);
+                        if let Err(error) = set_convert_failure(&write, dl.id) {
+                            ctx.sink.emit(Stream::Stderr, &messages::indented_error(error));
+                        }
                         new_mistook += 1;
                     }
                 }
@@ -1840,13 +1871,7 @@ mod tests {
     fn automatic_api_checks_exclude_site_rules_without_changing_manual_checks() {
         use super::SiteSetting;
         for sqlite in [false, true] {
-            with_stale_command_database(sqlite, false, false, || {
-                let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-                novels.update_existing_sync(1.into(), |record| {
-                    record.toc_url = "https://ncode.syosetu.com/n0001aa/".into();
-                    record.ncode = Some("n0001aa".into());
-                    Ok(())
-                }).unwrap();
+            with_stale_command_database(sqlite, false, false, |_| {
                 let yaml = format!("{}\nupdate_rules:\n  - match: {{ncode: '^n'}}\n    automatic: skip\n",
                     include_str!("../../webnovel/ncode.syosetu.com.yaml"));
                 let sites = SiteSetting::load_bundled(&[&yaml]).unwrap();
@@ -1870,7 +1895,7 @@ mod tests {
         sqlite: bool,
         deleted: bool,
         convert_failure: bool,
-        command: impl FnOnce(),
+        command: impl FnOnce(&narou_rs::application::novel_access::NovelWriteGuard),
     ) -> Option<NovelRecord> {
         let _global = crate::test_support::global_state_guard();
         let _legacy = (!sqlite).then(crate::test_support::legacy_yaml_guard);
@@ -1891,6 +1916,8 @@ mod tests {
         initial.author.clear();
         initial.file_title = "[author] repaired title".into();
         initial.convert_failure = convert_failure;
+        initial.toc_url = "https://ncode.syosetu.com/n0001aa/".into();
+        initial.ncode = Some("n0001aa".into());
         let mut database = narou_rs::db::Database::with_root(temp.path().to_path_buf()).unwrap();
         assert_eq!(database.sqlite_integrity().unwrap().is_some(), sqlite);
         database.update_records(|mut records| {
@@ -1898,6 +1925,7 @@ mod tests {
             Ok((records, ()))
         }).unwrap();
         *narou_rs::db::DATABASE.lock() = Some(database);
+        let write = narou_rs::native::materialization::capture_write_for_id(1).unwrap();
 
         // This independent writer leaves the process-global command cache stale.
         let mut writer = narou_rs::db::Database::with_root(temp.path().to_path_buf()).unwrap();
@@ -1914,7 +1942,7 @@ mod tests {
             Ok((records, ()))
         }).unwrap();
         assert!(narou_rs::db::with_database(|db| Ok(db.get(1).unwrap().tags.is_empty())).unwrap());
-        command();
+        command(&write);
         // Reopen rather than refresh the writer: Inventory's mtime cache may
         // still match a fast atomic replacement on Windows and hide the result.
         let reader = narou_rs::db::Database::with_root(temp.path().to_path_buf()).unwrap();
@@ -1923,11 +1951,11 @@ mod tests {
 
     #[test]
     fn command_metadata_helpers_preserve_concurrent_fields() {
-        let commands: [fn(i64); 3] = [super::record_update_check,
+        let commands: [fn(&narou_rs::application::novel_access::NovelWriteGuard, i64) -> narou_rs::error::Result<()>; 3] = [super::record_update_check,
             super::set_convert_failure, super::clear_convert_failure];
         for sqlite in [false, true] {
             for (index, command) in commands.into_iter().enumerate() {
-                let record = with_stale_command_database(sqlite, false, index == 2, || command(1)).unwrap();
+                let record = with_stale_command_database(sqlite, false, index == 2, |write| command(write, 1).unwrap()).unwrap();
                 assert!(record.tags.iter().any(|tag| tag == "concurrent tag"),
                     "command {index}, sqlite={sqlite}");
                 assert_eq!(record.extra_fields["concurrent_unknown"]["nested"][1].as_str(), Some("two"));
@@ -1942,11 +1970,11 @@ mod tests {
 
     #[test]
     fn command_metadata_helpers_do_not_resurrect_deleted_records() {
-        let commands: [fn(i64); 3] = [super::record_update_check,
+        let commands: [fn(&narou_rs::application::novel_access::NovelWriteGuard, i64) -> narou_rs::error::Result<()>; 3] = [super::record_update_check,
             super::set_convert_failure, super::clear_convert_failure];
         for sqlite in [false, true] {
             for (index, command) in commands.into_iter().enumerate() {
-                assert!(with_stale_command_database(sqlite, true, index == 2, || command(1)).is_none(),
+                assert!(with_stale_command_database(sqlite, true, index == 2, |write| command(write, 1).unwrap()).is_none(),
                     "command {index}, sqlite={sqlite}");
             }
         }
@@ -1955,11 +1983,11 @@ mod tests {
     #[test]
     fn command_title_repair_preserves_concurrent_fields_and_deletion() {
         for sqlite in [false, true] {
-            let record = with_stale_command_database(sqlite, false, false, super::repair_empty_titles).unwrap();
+            let record = with_stale_command_database(sqlite, false, false, |_| super::repair_empty_titles()).unwrap();
             assert_eq!(record.title, "repaired title");
             assert_eq!(record.tags, vec!["concurrent tag"]);
             assert!(record.extra_fields.contains_key("concurrent_unknown"));
-            assert!(with_stale_command_database(sqlite, true, false, super::repair_empty_titles).is_none());
+            assert!(with_stale_command_database(sqlite, true, false, |_| super::repair_empty_titles()).is_none());
         }
     }
 
@@ -1968,11 +1996,11 @@ mod tests {
         let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
         for sqlite in [false, true] {
             for sync_end in [false, true] {
-                let command = || super::record_general_lastup_check(
-                    1, Some(last_update + Duration::hours(2)),
+                let command = |write: &narou_rs::application::novel_access::NovelWriteGuard| super::record_general_lastup_check(
+                    write, 1, Some(last_update + Duration::hours(2)),
                     Some(last_update + Duration::hours(3)), Some(123), Some(true),
                     last_update + Duration::hours(5), sync_end,
-                );
+                ).unwrap();
                 let record = with_stale_command_database(sqlite, false, false, command).unwrap();
                 assert!(record.tags.iter().any(|tag| tag == "concurrent tag"));
                 assert!(record.extra_fields.contains_key("concurrent_unknown"));
@@ -1992,7 +2020,7 @@ mod tests {
     #[test]
     fn command_title_repair_does_not_overwrite_concurrently_filled_title() {
         for sqlite in [false, true] {
-            let record = with_stale_command_database(sqlite, false, false, || {
+            let record = with_stale_command_database(sqlite, false, false, |_| {
                 let mut writer = narou_rs::db::Database::with_root(std::env::current_dir().unwrap()).unwrap();
                 writer.update_records(|mut records| {
                     records.get_mut(&1).unwrap().title = "concurrent title".into();
@@ -2008,13 +2036,13 @@ mod tests {
     #[test]
     fn native_existing_update_skips_absent_mutator_and_rolls_back_errors() {
         for sqlite in [false, true] {
-            assert!(with_stale_command_database(sqlite, true, false, || {
+            assert!(with_stale_command_database(sqlite, true, false, |write| {
                 let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
-                assert!(!repository.update_existing_sync(1.into(), |_| panic!("absent mutator called")).unwrap());
+                assert!(!repository.update_existing_guarded_sync(write.fence(), 1.into(), |_| panic!("absent mutator called")).unwrap());
             }).is_none());
-            let record = with_stale_command_database(sqlite, false, false, || {
+            let record = with_stale_command_database(sqlite, false, false, |write| {
                 let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
-                let result = repository.update_existing_sync(1.into(), |record| {
+                let result = repository.update_existing_guarded_sync(write.fence(), 1.into(), |record| {
                     record.tags.clear();
                     record.extra_fields.clear();
                     Err(narou_rs::error::NarouError::Database("abort mutation".into()))
@@ -2027,19 +2055,65 @@ mod tests {
     }
 
     #[test]
-    fn native_upsert_keeps_full_replacement_and_creation_contract() {
+    fn original_metadata_guard_cannot_mutate_reopened_generation() {
+        use narou_rs::platform::NovelAccessFence;
         for sqlite in [false, true] {
-            for deleted in [false, true] {
-                let record = with_stale_command_database(sqlite, deleted, false, || {
-                    let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
-                    let mut replacement = sample_record(Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap());
-                    replacement.tags = vec!["replacement".into()];
-                    repository.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(replacement)]).unwrap();
+            let record = with_stale_command_database(sqlite, false, false, |write| {
+                let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
+                let before = repository.get_current_sync(1.into()).unwrap();
+                let stores = narou_rs::native::object_store::NativeStores::for_current_root().unwrap();
+                narou_rs::native::materialization::block_on(async {
+                    let epoch = stores.primary.close_gate(write.prefix(), "metadata-test").await?;
+                    stores.primary.open_gate(write.prefix(), "metadata-test", epoch).await
                 }).unwrap();
-                assert_eq!(record.tags, vec!["replacement"]);
-                assert_eq!(record.attribute_tag(), Some("小説"));
-                assert!(!record.extra_fields.contains_key("concurrent_unknown"));
-            }
+                assert!(super::set_convert_failure(write, 1).is_err());
+                assert!(super::record_update_check(write, 1).is_err());
+                assert_eq!(repository.get_current_sync(1.into()).unwrap(), before);
+            }).unwrap();
+            assert!(!record.convert_failure);
+        }
+    }
+
+    #[test]
+    fn guarded_native_replacement_and_reserved_creation_keep_their_contracts() {
+        use narou_rs::application::novel_access::NovelWriteGuard;
+        use narou_rs::platform::{NovelMutation, NovelObjectKeys, NovelRepository};
+        for sqlite in [false, true] {
+            let record = with_stale_command_database(sqlite, false, false, |write| {
+                let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
+                let current = repository.get_current_sync(1.into()).unwrap().unwrap();
+                let mut replacement = sample_record(Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap());
+                replacement.file_title = current.file_title;
+                replacement.toc_url = current.toc_url;
+                replacement.sitename = current.sitename;
+                replacement.use_subdirectory = current.use_subdirectory;
+                replacement.tags = vec!["replacement".into()];
+                narou_rs::native::materialization::block_on(async {
+                    repository.apply_batch_guarded(write.fence(), vec![NovelMutation::Upsert(replacement)]).await?;
+                    let reservation = repository.allocate_id().await?;
+                    let mut created = sample_record(Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap());
+                    created.id = reservation.id().0;
+                    created.file_title = format!("created-{}", created.id);
+                    created.toc_url = format!("https://example.test/created/{}/", created.id);
+                    created.tags = vec!["created".into()];
+                    let keys = NovelObjectKeys::new(&created.sitename, &created.file_title, created.use_subdirectory)?;
+                    let stores = narou_rs::native::object_store::NativeStores::for_current_root()?;
+                    let mut creation = NovelWriteGuard::capture_for(&stores.objects, Some(&stores.assets), &keys).await?;
+                    creation.retain_reservation(&reservation)?;
+                    repository.reserve_create(creation.fence(), &reservation, &created.toc_url).await?;
+                    creation.write_small(&keys.toc(), b"title: created\nsubtitles: []\n".to_vec()).await?;
+                    let id = reservation.id();
+                    repository.apply_create_guarded(creation.fence(), &reservation, created).await?;
+                    reservation.adopt();
+                    let saved = repository.get_current(id).await?.unwrap();
+                    assert_eq!(saved.tags, vec!["created"]);
+                    assert_eq!(saved.attribute_tag(), Some("小説"));
+                    Ok::<_, narou_rs::error::NarouError>(())
+                }).unwrap();
+            }).unwrap();
+            assert_eq!(record.tags, vec!["replacement"]);
+            assert_eq!(record.attribute_tag(), Some("小説"));
+            assert!(!record.extra_fields.contains_key("concurrent_unknown"));
         }
     }
 

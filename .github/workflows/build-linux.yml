@@ -35,7 +35,18 @@ jobs:
         with:
           key: linux-release
 
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Build transfer WASM artifacts
+        run: |
+          rustup target add wasm32-unknown-unknown
+          node scripts/build-transfer-wasm.mjs --install-bindgen
+
       - name: Build
+        env:
+          NAROU_RS_REQUIRE_TRANSFER_ARTIFACTS: "1"
         run: |
           cargo build --locked --release --features lite \
             --bin narou_rs --bin narou_rs_backup --bin narou_rs_login

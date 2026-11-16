@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use narou_rs::application::JobQueue;
 use narou_rs::downloader::SectionBudget;
+use narou_rs::application::novel_access::AccessOrigin;
 use narou_rs::error::Result;
 
 
@@ -70,16 +71,29 @@ pub const CHECKPOINT_EVERY_SECTIONS: u64 = 100;
 /// the native runtime.
 type SendLedger = send_wrapper::SendWrapper<std::sync::Arc<crate::ledger::D1JobLedger>>;
 
-struct CheckpointSink {
+struct CheckpointSink<'a> {
     ledger: SendLedger,
-    job_id: narou_rs::application::JobId,
-    execution_token: String,
+    job_id: &'a narou_rs::application::JobId,
+    owner: Arc<narou_rs::platform::JobExecutionOwner>,
     novel_id: Option<narou_rs::platform::NovelId>,
+    write_origin: Option<AccessOrigin>,
+    creation_reservation: Option<(narou_rs::platform::NovelId, i64)>,
     last_saved_index: u64,
     latest_boundary: Option<u64>,
 }
 
-impl CheckpointSink {
+impl CheckpointSink<'_> {
+    fn checkpoint(&self) -> narou_rs::application::WorkerExecutionCheckpoint {
+        let mut checkpoint = narou_rs::application::WorkerExecutionCheckpoint::planned((*self.job_id).clone(), self.novel_id);
+        checkpoint.write_origin = self.write_origin.clone();
+        checkpoint.creation_reservation = self.creation_reservation;
+        if let Some(next) = self.latest_boundary {
+            checkpoint.phase = narou_rs::application::ExecutionPhase::Fetching;
+            checkpoint.next_section_index = Some(next);
+        }
+        checkpoint
+    }
+
     /// Only remember the latest boundary. Persistence is awaited at the next
     /// async boundary, never spawned into an unbounded receiver/task backlog.
     fn save(&mut self, next_section_index: u64) {
@@ -91,10 +105,8 @@ impl CheckpointSink {
         if next < self.last_saved_index.saturating_add(CHECKPOINT_EVERY_SECTIONS) {
             return Ok(());
         }
-        let checkpoint = narou_rs::application::WorkerExecutionCheckpoint::planned(
-            self.job_id.clone(), self.novel_id,
-        ).advance(narou_rs::application::ExecutionPhase::Fetching, Some(next));
-        self.ledger.save_checkpoint(&self.job_id, &self.execution_token, &checkpoint).await?;
+        let checkpoint = self.checkpoint();
+        self.ledger.save_checkpoint(self.job_id, self.owner.execution_token(), &checkpoint).await?;
         self.last_saved_index = next;
         Ok(())
     }
@@ -109,7 +121,7 @@ pub struct WorkerBudget<'a> {
     deadline_ms: f64,
     subrequests: &'a SubrequestBudget,
     subrequest_limit: u64,
-    sink: Option<CheckpointSink>,
+    sink: Option<CheckpointSink<'a>>,
 }
 
 impl<'a> WorkerBudget<'a> {
@@ -126,52 +138,63 @@ impl<'a> WorkerBudget<'a> {
     pub fn with_checkpoints(
         mut self,
         ledger: std::sync::Arc<crate::ledger::D1JobLedger>,
-        job_id: narou_rs::application::JobId,
-        execution_token: String,
+        job_id: &'a narou_rs::application::JobId,
+        owner: Arc<narou_rs::platform::JobExecutionOwner>,
         novel_id: Option<narou_rs::platform::NovelId>,
     ) -> Self {
         self.sink = Some(CheckpointSink {
             ledger: send_wrapper::SendWrapper::new(ledger),
             job_id,
-            execution_token,
+            owner,
             novel_id,
+            write_origin: None,
+            creation_reservation: None,
             last_saved_index: 0,
             latest_boundary: None,
         });
         self
     }
 
+    pub fn with_resume_checkpoint(mut self, checkpoint: Option<&narou_rs::application::WorkerExecutionCheckpoint>) -> Self {
+        if let (Some(sink), Some(checkpoint)) = (&mut self.sink, checkpoint) {
+            sink.write_origin = checkpoint.write_origin.clone();
+            sink.creation_reservation = checkpoint.creation_reservation;
+            // An unproven legacy cursor is never blessed by the first origin.
+            // Numeric-only planned creation ownership has no cursor to adopt.
+            sink.latest_boundary = checkpoint.write_origin.as_ref().and(checkpoint.next_section_index);
+            sink.last_saved_index = sink.latest_boundary.unwrap_or(0);
+        }
+        self
+    }
+
     /// Wait for periodic writes before replacing or finalizing the cursor.
-    pub(crate) async fn drain_checkpoint_writes(&mut self) {
-        let Some(sink) = &mut self.sink else {
-            return;
-        };
-        if let Err(error) = sink.flush().await {
-            worker::console_log!("job {}: periodic checkpoint write failed: {error}", sink.job_id);
+    pub(crate) async fn drain_checkpoint_writes(&mut self) -> Result<()> {
+        match &mut self.sink {
+            Some(sink) => sink.flush().await,
+            None => Ok(()),
         }
     }
 
     /// Persist the latest completed boundary before recording a retryable error.
     /// A failure before any boundary preserves the incoming resume checkpoint.
     pub async fn save_retry_progress(&mut self) -> Result<()> {
-        self.drain_checkpoint_writes().await;
+        self.drain_checkpoint_writes().await?;
         let Some(sink) = &self.sink else {
             return Ok(());
         };
-        let Some(next_section_index) = sink.latest_boundary else {
-            return Ok(());
-        };
-        let checkpoint = narou_rs::application::WorkerExecutionCheckpoint::planned(
-            sink.job_id.clone(),
-            sink.novel_id,
-        )
-        .advance(
-            narou_rs::application::ExecutionPhase::Fetching,
-            Some(next_section_index),
-        );
+        if sink.latest_boundary.is_none() { return Ok(()); }
+        let checkpoint = sink.checkpoint();
         sink.ledger
-            .save_checkpoint(&sink.job_id, &sink.execution_token, &checkpoint)
+            .save_checkpoint(sink.job_id, sink.owner.execution_token(), &checkpoint)
             .await
+    }
+
+    pub fn write_origin(&self) -> Option<&AccessOrigin> {
+        self.sink.as_ref().and_then(|sink| sink.write_origin.as_ref())
+    }
+
+    pub fn creation_reservation(&self) -> Option<(narou_rs::platform::NovelId, i64)> {
+        self.sink.as_ref().and_then(|sink| sink.creation_reservation)
     }
 
     /// Which limit tripped, for the `Partial` reason string. Returns `None`
@@ -188,6 +211,74 @@ impl<'a> WorkerBudget<'a> {
 }
 
 impl SectionBudget for WorkerBudget<'_> {
+    fn job_owner(&self) -> Option<Arc<narou_rs::platform::JobExecutionOwner>> {
+        self.sink.as_ref().map(|sink| Arc::clone(&sink.owner))
+    }
+
+    fn allocate_creation_id<'a>(&'a mut self, novels: &'a dyn narou_rs::platform::NovelRepository) -> narou_rs::platform::PlatformFuture<'a, Result<(narou_rs::platform::NovelIdReservation, bool)>> {
+        Box::pin(async move {
+            let Some(sink) = &mut self.sink else {
+                return Err(narou_rs::error::NarouError::Platform("durable worker allocation sink is missing".into()));
+            };
+            let reservation = novels.allocate_id_for_job(&sink.owner).await?;
+            let identity = (reservation.id(), reservation.generation());
+            if sink.creation_reservation.is_some_and(|saved| saved != identity) {
+                return Err(narou_rs::error::NarouError::Platform("worker creation allocation changed its durable generation".into()));
+            }
+            sink.creation_reservation = Some(identity);
+            Ok((reservation, true))
+        })
+    }
+
+    fn restore_creation_id<'a>(&'a mut self, novels: &'a dyn narou_rs::platform::NovelRepository, id: narou_rs::platform::NovelId, generation: i64) -> narou_rs::platform::PlatformFuture<'a, Result<narou_rs::platform::NovelIdReservation>> {
+        Box::pin(async move {
+            let Some(sink) = &mut self.sink else {
+                return Err(narou_rs::error::NarouError::Platform("durable worker reservation restore sink is missing".into()));
+            };
+            if sink.creation_reservation != Some((id, generation)) {
+                return Err(narou_rs::error::NarouError::Platform("worker reservation restore does not match its durable checkpoint".into()));
+            }
+            let reservation = novels.resume_id_for_job(&sink.owner, id, generation).await?;
+            if (reservation.id(), reservation.generation()) != (id, generation) {
+                return Err(narou_rs::error::NarouError::Platform("worker reservation restore changed its original generation".into()));
+            }
+            Ok(reservation)
+        })
+    }
+
+    fn set_access_origin<'a>(&'a mut self, origin: &'a AccessOrigin, creation_reservation: Option<(narou_rs::platform::NovelId, i64)>) -> narou_rs::platform::PlatformFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            let Some(sink) = &mut self.sink else {
+                return Err(narou_rs::error::NarouError::Platform("durable worker checkpoint sink is missing".into()));
+            };
+            if sink.write_origin.as_ref().is_some_and(|saved| saved != origin) {
+                return Err(narou_rs::error::NarouError::Platform("worker continuation writer origin changed".into()));
+            }
+            if sink.creation_reservation.is_some() && sink.creation_reservation != creation_reservation {
+                return Err(narou_rs::error::NarouError::Platform("worker continuation creation reservation changed".into()));
+            }
+            if sink.write_origin.is_some() && sink.creation_reservation.is_none() && creation_reservation.is_some() {
+                return Err(narou_rs::error::NarouError::Platform("worker continuation has no original creation reservation".into()));
+            }
+            let mut checkpoint = sink.checkpoint();
+            checkpoint.write_origin = Some(origin.clone());
+            checkpoint.creation_reservation = creation_reservation;
+            if let Err(error) = sink.ledger.save_checkpoint(sink.job_id, sink.owner.execution_token(), &checkpoint).await {
+                // A response can be lost after the primary commit. Only an
+                // exact read-back confirms the ownership acknowledgement.
+                match sink.ledger.execution_checkpoint(sink.job_id).await {
+                    Ok(Some(saved)) if saved == checkpoint => {
+                        sink.ledger.ensure_execution_active(sink.job_id, sink.owner.execution_token()).await?;
+                    },
+                    _ => return Err(error),
+                }
+            }
+            sink.write_origin = Some(origin.clone());
+            sink.creation_reservation = creation_reservation;
+            Ok(true)
+        })
+    }
+
     fn should_yield(&mut self, next_section_index: usize) -> bool {
         if let Some(sink) = &mut self.sink {
             sink.save(next_section_index as u64);
@@ -200,7 +291,7 @@ impl SectionBudget for WorkerBudget<'_> {
             narou_rs::application::messages::ready().await;
             if let Some(sink) = &mut self.sink {
                 sink.flush().await?;
-                sink.ledger.ensure_execution_active(&sink.job_id, &sink.execution_token).await?;
+                sink.ledger.ensure_execution_active(sink.job_id, sink.owner.execution_token()).await?;
             }
             Ok(())
         })

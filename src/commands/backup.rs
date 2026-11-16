@@ -64,42 +64,53 @@ pub fn cmd_backup(targets: &[String]) -> Result<()> {
 
         let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
         let record = novels
-            .get_sync(data.id.into())
+            .get_current_sync(data.id.into())
             .map_err(|e| NarouError::Database(e.to_string()))?
             .ok_or_else(|| NarouError::NotFound(format!("ID: {}", data.id)))?;
+        let write = narou_rs::native::materialization::capture_write_for_record(&record)?;
         let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
             .map_err(|e| NarouError::Database(e.to_string()))?;
         let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
-        if !novel_dir.exists() {
-            // mirror-files=false の構成では有効な作品でもフォルダが無い。
-            // ストアに本文が残っているなら記録を消さず、下で取り出して
-            // バックアップする。ストアを確認できないときも消さない。
-            match narou_rs::native::object_store::novel_content_stored(&archive_root, &novel_dir) {
-                Ok(false) => {
-                    novels
-                        .apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(
-                            data.id.into(),
-                        )])
-                        .map_err(|e| NarouError::Database(e.to_string()))?;
-                    return Err(NarouError::NotFound(format!(
-                        "{} が見つかりません。\n保存フォルダが消去されていたため、データベースのインデックスを削除しました。",
-                        novel_dir.display()
-                    )));
+        if !novel_dir.try_exists()? {
+            // Absence of a mirror is not absence of a novel. Prove canonical
+            // toc absence under the original admission, releasing our reader
+            // before retiring that same writer into a durable removal owner.
+            let stores = narou_rs::native::object_store::NativeStores::for_current_root()?;
+            let stored = narou_rs::native::materialization::block_on(async {
+                let mut lease = narou_rs::application::novel_access::NovelReadLease::admit(&stores.objects, write.prefix(), "backup-content-check").await?;
+                let result = async {
+                    if lease.epoch() != write.epoch() {
+                        return Err(NarouError::Platform("novel_busy: backup origin changed".into()));
+                    }
+                    let key = narou_rs::platform::ObjectKey::try_new(write.prefix().as_ref())?.join("toc.yaml")?;
+                    Ok(lease.read_small(&key).await?.is_some())
+                }.await;
+                let released = lease.release().await;
+                match result { Ok(value) => { released?; Ok(value) }, Err(error) => Err(error) }
+            })?;
+            if !stored {
+                use narou_rs::platform::NovelAccessFence;
+                let owner = narou_rs::platform::access_fence::new_removal_owner(data.id.into(), false)?;
+                narou_rs::native::materialization::block_on(stores.primary.retire_writer(write.fence(), &owner))?;
+                narou_rs::native::application::recover_removals()?;
+                if novels.get_current_sync(data.id.into())?.is_some() {
+                    return Err(NarouError::Platform("novel_busy: missing novel index removal is still recovering".into()));
                 }
-                Ok(true) => {}
-                Err(error) => return Err(error),
+                return Err(NarouError::NotFound(format!(
+                    "{} が見つかりません。\n保存フォルダが消去されていたため、データベースのインデックスを削除しました。",
+                    novel_dir.display()
+                )));
             }
         }
 
         // Read all stored files in a private directory, never in a converter's
         // live output directory. A failed snapshot does not change the record.
-        let snapshot = narou_rs::native::materialization::snapshot(&novel_dir)?;
 
         println!("ID:{}　{}", data.id, data.title);
         print!("バックアップを作成しています");
         let _ = io::stdout().flush();
         let spinner = Spinner::start();
-        let backup_name = compat::create_backup(snapshot.path(), &novel_dir, &record.title)?;
+        let backup_name = compat::create_backup(&write, &record.title)?;
         drop(spinner);
         println!();
         println!("{} を作成しました", backup_name);
@@ -150,7 +161,7 @@ mod tests {
     #[test]
     fn backup_materializes_db_only_novel_and_keeps_record() {
         use narou_rs::native::sqlite::state;
-        use narou_rs::platform::{NovelMutation, NovelObjectKeys, ObjectStore};
+        use narou_rs::platform::{NovelObjectKeys, NovelRepository};
 
         let root = tempfile::tempdir().unwrap();
         let narou_dir = root.path().join(".narou");
@@ -164,24 +175,22 @@ mod tests {
         }).unwrap();
 
         let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-        novels
-            .apply_batch_sync(vec![NovelMutation::Upsert(sample_record())])
-            .unwrap();
-
-        let archive_root = root.path().join("小説データ");
+        let stores = narou_rs::native::object_store::NativeStores::for_narou_root(root.path()).unwrap();
         let keys = NovelObjectKeys::new("example.test", "backup-test", false).unwrap();
-        let handle = state::active_for(&narou_dir).expect("sqlite state");
-        let mirror = narou_rs::native::object_store::NativeObjectStore::from_root(
-            archive_root.clone(),
-        )
-        .unwrap();
-        let store = narou_rs::native::sqlite::object_store::SqliteObjectStore::with_mirror_files(
-            handle.conn_ref().clone(),
-            mirror,
-            false,
-        );
+        let (record, write) = narou_rs::native::materialization::block_on(async {
+            let reservation = novels.allocate_id().await?;
+            let mut record = sample_record();
+            record.id = reservation.id().0;
+            let mut write = narou_rs::application::novel_access::NovelWriteGuard::capture_for(&stores.objects, Some(&stores.assets), &keys).await?;
+            write.retain_reservation(&reservation)?;
+            novels.reserve_create(write.fence(), &reservation, &record.toc_url).await?;
+            novels.apply_create_guarded(write.fence(), &reservation, record.clone()).await?;
+            novels.release_id(reservation).await?;
+            Ok((record, write))
+        }).unwrap();
+        let archive_root = root.path().join("小説データ");
         futures::executor::block_on(async {
-            store
+            write
                 .write_small(
                     &keys.toc(),
                     b"title: BackupTest\nauthor: author\ntoc_url: https://example.test/1\nsubtitles: []\n"
@@ -189,11 +198,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            store
+            write
                 .write_small(&keys.setting(), b"enable_yokogaki = true\n".to_vec())
                 .await
                 .unwrap();
-            store
+            write
                 .write_small(
                     &keys.section("1", "第一話"),
                     "index: '1'\nhref: '1'\nchapter: ''\nsubchapter: ''\nsubtitle: 第一話\nfile_subtitle: 第一話\nsubdate: '2026-01-01'\n"
@@ -202,16 +211,18 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            write.write_small(&keys.prefix().join("user-notes.txt").unwrap(), b"keep user notes".to_vec()).await.unwrap();
+            write.write_small(&keys.prefix().join("previous.epub").unwrap(), b"keep generated output".to_vec()).await.unwrap();
         });
 
-        cmd_backup(&["1".to_string()]).unwrap();
+        cmd_backup(&[record.id.to_string()]).unwrap();
 
         // 誤ってインデックスを消していないこと。
         let record = novels
-            .get_sync(1i64.into())
+            .get_current_sync(record.id.into())
             .unwrap()
             .expect("record must survive a DB-only backup");
-        assert_eq!(record.id, 1);
+        assert_eq!(record.file_title, "backup-test");
 
         let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
         let zip_path = std::fs::read_dir(novel_dir.join("backup"))
@@ -230,6 +241,10 @@ mod tests {
             names.iter().any(|name| name.contains("第一話.yaml")),
             "{names:?}"
         );
+        assert!(names.iter().any(|name| name == "user-notes.txt"));
+        assert!(names.iter().any(|name| name == "previous.epub"));
+        assert!(!names.iter().any(|name| name.ends_with(zip_path.file_name().unwrap().to_str().unwrap())),
+            "a backup must never contain the zip currently being written");
 
         // 取り出したファイルはガードが片付ける。
         assert!(!novel_dir.join("toc.yaml").exists());

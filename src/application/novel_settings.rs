@@ -17,6 +17,7 @@
 //! service never touches `Path`, the inventory, the database globals, or
 //! the web framework.
 
+use super::novel_access::{NovelReadLease, NovelReadScope, NovelWriteGuard};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -122,9 +123,8 @@ impl NovelSettingsSaveResult {
 
 /// Concrete per-novel settings service.
 ///
-/// All dependencies are injected platform ports; the service is testable
-/// with the platform mocks and usable from both the native web layer and a
-/// future Worker backend.
+/// Injected platform ports share one scope-first reader and original writer
+/// fence contract across native, Worker and deterministic memory tests.
 pub struct NovelSettingsService {
     novels: Arc<dyn NovelRepository>,
     objects: Arc<dyn ObjectStore>,
@@ -136,24 +136,22 @@ impl NovelSettingsService {
         Self { novels, objects }
     }
 
+    pub fn read_scope(&self, hint: &str) -> NovelReadScope {
+        NovelReadScope::new(&self.objects, hint)
+    }
+
     /// Load the settings view for one novel.
     ///
     /// Missing `setting.ini` / `replace.txt` objects are treated as empty
     /// (matching the existing web behavior).
-    pub async fn load(&self, id: NovelId) -> Result<NovelSettingsView, ApplicationError> {
-        let record = self
-            .novels
-            .get(id)
-            .await
-            .map_err(ApplicationError::platform)?
+    pub async fn load(&self, scope: &mut NovelReadScope, id: NovelId) -> Result<NovelSettingsView, ApplicationError> {
+        let content = super::novel_content::NovelContentService::new(self.novels.clone(), self.objects.clone());
+        let record = content.read_record(scope, id).await?
             .ok_or_else(|| ApplicationError::NotFound(format!("ID: {}", id.0)))?;
         let keys = self.keys_for(&record)?;
-
-        // setting.ini と replace.txt は独立なので同時に読む。エラーの優先
-        // 順位は直列時と同じ (INI → replace) になるよう、この順で評価する。
-        let (ini, replace) = futures::join!(self.load_ini(&keys), self.load_replace(&keys));
-        let ini = ini.map_err(ApplicationError::platform)?;
-        let replace = replace.map_err(ApplicationError::platform)?;
+        let mut lease = scope.lease_for(&keys.prefix().clone().into()).await.map_err(ApplicationError::platform)?;
+        let ini = self.load_ini(&mut lease, &keys).await.map_err(ApplicationError::platform)?;
+        let replace = self.load_replace(&mut lease, &keys).await.map_err(ApplicationError::platform)?;
 
         let settings = build_setting_entries(&ini);
         Ok(NovelSettingsView {
@@ -178,12 +176,21 @@ impl NovelSettingsService {
     ) -> Result<NovelSettingsSaveResult, ApplicationError> {
         let record = self
             .novels
-            .get(id)
+            .get_current(id)
             .await
             .map_err(ApplicationError::platform)?
             .ok_or_else(|| ApplicationError::NotFound(format!("ID: {}", id.0)))?;
         let keys = self.keys_for(&record)?;
 
+        // One origin for both files, captured before their read-modify-write
+        // work; a transfer between the two writes cannot adopt its new epoch.
+        let guard = NovelWriteGuard::capture_for(&self.objects, None, &keys)
+            .await.map_err(ApplicationError::platform)?;
+        let current = self.novels.get_current(id).await.map_err(ApplicationError::platform)?
+            .ok_or_else(|| ApplicationError::NotFound(format!("ID: {}", id.0)))?;
+        if self.keys_for(&current)?.prefix() != keys.prefix() {
+            return Err(ApplicationError::Conflict("novel namespace changed before settings save".into()));
+        }
         let replace_content = patch.replace_patterns.as_deref()
             .map(serialize_replace_patterns).transpose()?;
         let mut result = NovelSettingsSaveResult::default();
@@ -202,7 +209,7 @@ impl NovelSettingsService {
                     let content = ini.to_ini_string().into_bytes();
                     Ok((raw != Some(content.as_slice())).then_some(std::borrow::Cow::Owned(content)))
                 };
-                self.objects.update_small(&keys.setting(), &mut mutate)
+                guard.update_small(&keys.setting(), &mut mutate)
                     .await.map_err(ApplicationError::platform)?
             };
             match commit {
@@ -221,7 +228,7 @@ impl NovelSettingsService {
                 let mut mutate = |raw: Option<&[u8]>| {
                     Ok((raw != Some(content.as_bytes())).then_some(std::borrow::Cow::Borrowed(content.as_bytes())))
                 };
-                self.objects.update_small(&keys.replace(), &mut mutate).await
+                guard.update_small(&keys.replace(), &mut mutate).await
             };
             match write {
                 Ok(crate::platform::ObjectUpdateResult::Committed)
@@ -255,8 +262,8 @@ impl NovelSettingsService {
         .map_err(ApplicationError::platform)
     }
 
-    async fn load_ini(&self, keys: &NovelObjectKeys) -> crate::error::Result<IniData> {
-        let Some(bytes) = self.objects.read_small(&keys.setting()).await? else {
+    async fn load_ini(&self, lease: &mut NovelReadLease, keys: &NovelObjectKeys) -> crate::error::Result<IniData> {
+        let Some(bytes) = lease.read_small(&keys.setting()).await? else {
             return Ok(IniData::new());
         };
         let text = String::from_utf8(bytes).map_err(|e| {
@@ -265,8 +272,8 @@ impl NovelSettingsService {
         Ok(IniData::load(&text))
     }
 
-    async fn load_replace(&self, keys: &NovelObjectKeys) -> crate::error::Result<Vec<ReplacePattern>> {
-        let Some(bytes) = self.objects.read_small(&keys.replace()).await? else {
+    async fn load_replace(&self, lease: &mut NovelReadLease, keys: &NovelObjectKeys) -> crate::error::Result<Vec<ReplacePattern>> {
+        let Some(bytes) = lease.read_small(&keys.replace()).await? else {
             return Ok(Vec::new());
         };
         let text = String::from_utf8(bytes).map_err(|e| {
@@ -617,7 +624,9 @@ mod tests {
     #[test]
     fn load_returns_defaults_for_missing_objects() {
         let (service, _, _) = service();
-        let view = futures::executor::block_on(service.load(NovelId(1))).unwrap();
+        let mut scope = service.read_scope("settings-defaults-test");
+        let view = futures::executor::block_on(service.load(&mut scope, NovelId(1))).unwrap();
+        futures::executor::block_on(scope.release_all()).unwrap();
         assert!(view.replace_patterns.is_empty());
         let entry = view.settings.iter().find(|entry| entry.name == "enable_yokogaki").unwrap();
         assert_eq!(entry.value, None);
@@ -626,7 +635,9 @@ mod tests {
     #[test]
     fn load_returns_not_found_for_unknown_id() {
         let (service, _, _) = service();
-        let err = futures::executor::block_on(service.load(NovelId(99))).unwrap_err();
+        let mut scope = service.read_scope("settings-missing-test");
+        let err = futures::executor::block_on(service.load(&mut scope, NovelId(99))).unwrap_err();
+        futures::executor::block_on(scope.release_all()).unwrap();
         assert!(matches!(err, ApplicationError::NotFound(_)));
     }
 
@@ -709,7 +720,9 @@ mod tests {
                 .unwrap();
         });
 
-        let error = futures::executor::block_on(service.load(NovelId(1))).unwrap_err();
+        let mut scope = service.read_scope("settings-invalid-test");
+        let error = futures::executor::block_on(service.load(&mut scope, NovelId(1))).unwrap_err();
+        futures::executor::block_on(scope.release_all()).unwrap();
         let message = error.to_string();
         assert!(
             message.contains("setting.ini is not UTF-8"),

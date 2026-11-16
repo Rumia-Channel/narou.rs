@@ -61,9 +61,11 @@ impl<R: AsyncBufRead + Unpin> ZipFileReader<R> {
 
 impl<R: AsyncBufRead + Unpin> AsyncRead for ZipFileReader<R> {
     fn poll_read(mut self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() { return Poll::Ready(Ok(0)); }
         let written = Pin::new(&mut self.reader).poll_read(cx, buf);
         let written = poll_result_ok!(ready!(written));
-        self.read += written as u64;
+        self.read = self.read.checked_add(written as u64)
+            .ok_or_else(|| std::io::Error::other("ZIP entry length overflow"))?;
 
         if self.read > self.opts.max_uncompressed_size_per_file {
             let error = crate::error::ZipError::UncompressedSizeAboveMax(self.opts.max_uncompressed_size_per_file);

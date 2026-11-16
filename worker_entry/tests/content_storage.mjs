@@ -10,11 +10,15 @@ import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
 import { createS3MultipartFixture } from './s3_multipart_fixture.mjs';
-import { animationFixture, verifyPng, isAnimation, storedZip } from './animation_fixture.mjs';
+import { animationFixture, verifyPng, isAnimation } from './animation_fixture.mjs';
+import { transferClient } from './transfer.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
 const npx = windows ? 'npx.cmd' : 'npx';
+const wranglerVersion = process.env.NAROU_WRANGLER_VERSION ?? '4.151.3';
+assert.match(wranglerVersion, /^\d+\.\d+\.\d+$/);
+const wranglerPackage = `wrangler@${wranglerVersion}`;
 mkdirSync(join(root, '.wrangler'), { recursive: true });
 const work = mkdtempSync(join(root, '.wrangler', 'content-smoke-'));
 const config = join(work, 'wrangler.toml');
@@ -37,6 +41,7 @@ const sourceRequests = new Map();
 const imageContinuations = [];
 let yieldBarrier = null;
 let deliveryWitness = null;
+let canonicalWriteBarrier = null;
 const longEpisodeCount = 1685;
 const longEpisodeRequests = new Map();
 const longInvocationStarts = [];
@@ -62,11 +67,27 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && key === '/_fixture/delivery') {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
-      const ids = JSON.parse(Buffer.concat(chunks).toString()).ids;
-      if (deliveryWitness) {
-        deliveryWitness.ids.push(...ids);
-        if (deliveryWitness.ids.length >= 2) deliveryWitness.completed.resolve();
+      const delivery = JSON.parse(Buffer.concat(chunks).toString());
+      if (deliveryWitness && (!deliveryWitness.canonicalOnly || delivery.canonical)) {
+        deliveryWitness.ids.push(...delivery.ids);
+        if (deliveryWitness.ids.length >= (deliveryWitness.expected ?? 2)) deliveryWitness.completed.resolve();
       }
+      res.end('recorded'); return;
+    }
+    if (req.method === 'POST' && key === '/_fixture/canonical-boundary') {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const gate = canonicalWriteBarrier;
+      if (gate) {
+        gate.entered.resolve(JSON.parse(Buffer.concat(chunks).toString()));
+        await gate.release.promise;
+      }
+      res.end('released'); return;
+    }
+    if (req.method === 'POST' && key === '/_fixture/canonical-result') {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      if (canonicalWriteBarrier) canonicalWriteBarrier.result.resolve(JSON.parse(Buffer.concat(chunks).toString()));
       res.end('recorded'); return;
     }
     if (sourceTimings && key.startsWith('/smoke-novel/')) {
@@ -96,6 +117,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && /^\/smoke-(novel|single|series)\/$/.test(key)) {
       sourceRequests.set(key, (sourceRequests.get(key) ?? 0) + 1);
+      if (sourcePause) await sourcePause(key);
       if (sourceImageCount && imageRequests.size > 0) {
         const checkpoint = scalar("SELECT checkpoint_json FROM worker_jobs WHERE kind='download' AND status='running'");
         imageContinuations.push({ fetched: imageRequests.size, checkpoint: JSON.parse(checkpoint) });
@@ -179,7 +201,7 @@ const server = http.createServer(async (req, res) => {
 const sourceServer = http.createServer(server.listeners('request')[0]);
 
 function run(args, options = {}) {
-  const result = spawnSync(npx, ['wrangler', ...args], { cwd: root, shell: windows, encoding: 'utf8', ...options });
+  const result = spawnSync(npx, [wranglerPackage, ...args], { cwd: root, shell: windows, encoding: 'utf8', ...options });
   if (result.status !== 0) throw new Error(`wrangler failed: ${result.stderr}\n${result.stdout}`);
   return result.stdout;
 }
@@ -206,7 +228,7 @@ function objectInsert(key, value) {
 }
 async function start() {
   logs = '';
-  child = spawn(npx, ['wrangler', 'dev', '--test-scheduled', '--config', config, '--persist-to', persist, '--port', String(port)], { cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
+  child = spawn(npx, [wranglerPackage, 'dev', '--test-scheduled', '--config', config, '--persist-to', persist, '--port', String(port)], { cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
   for (const stream of [child.stdout, child.stderr]) stream.on('data', (chunk) => { logs = (logs + chunk).slice(-300000); });
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
@@ -420,7 +442,7 @@ min_interval: 0.01
     await download(target, force);
     assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 0, 'downloads must not duplicate body blobs into D1');
     const current = sql("SELECT * FROM content_objects WHERE object_key LIKE '%/smoke-novel%/本文/%' AND instr(object_key,'/cache/')=0")[0].results;
-    assert.equal(current.length, 1);
+    assert.equal(current.length, 1, 'ordinary downloads must publish exactly one current content reference');
     const bytes = objects.get(`/narou-local/narou/local/${current[0].blob_key}`);
     const text = (current[0].encoding === 'brotli' ? brotliDecompressSync(bytes) : bytes).toString();
     assert(text.includes((force ? '更新後の本文です。' : '初回取得の本文です。').repeat(100)));
@@ -616,6 +638,7 @@ min_interval: 0.01
   await installDefaultSource();
   sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
   sourceImageCount = 500;
+  imageContinuations.length = 0;
   await download(target, false);
   assert.equal(imageRequests.size, sourceImageCount);
   assert([...imageRequests.values()].every((count) => count === 1), 'continuations must not fetch any saved image twice');
@@ -624,6 +647,16 @@ min_interval: 0.01
   assert.equal(imageJob.attempts, 0, 'budget continuations must not consume error retries');
   assert(imageContinuations.some(({ fetched, checkpoint }) => fetched > 0 && fetched < sourceImageCount && checkpoint?.next_section_index === 0),
     'the real queue must resume the same episode after persisting a mid-image-loop checkpoint');
+  const creationCheckpoints = imageContinuations.filter(({ fetched }) => fetched > 0 && fetched < sourceImageCount).map(({ checkpoint }) => checkpoint);
+  assert(creationCheckpoints.length > 0, 'a genuine new-download budget continuation must be witnessed');
+  const reservedCreation = creationCheckpoints[0].creation_reservation;
+  assert(Array.isArray(reservedCreation) && reservedCreation.length === 2 && reservedCreation.every(Number.isSafeInteger), 'the original reserved numeric ID and generation must be durable before continuation');
+  const creationOrigin = creationCheckpoints[0].write_origin;
+  assert(creationOrigin && typeof creationOrigin.prefix === 'string' && Number.isSafeInteger(creationOrigin.epoch), 'the original namespace epoch must be durable with the reservation');
+  for (const checkpoint of creationCheckpoints) {
+    assert.deepEqual(checkpoint.creation_reservation, reservedCreation, 'a new download must retain the SAME ID and generation across real yields, never release/reallocate');
+    assert.deepEqual(checkpoint.write_origin, creationOrigin, 'the reservation and original prefix epoch must travel together');
+  }
   const imageIndex = sql("SELECT encoding,hex(data) payload FROM objects WHERE object_key LIKE '%/smoke-novel/.illustration_cache.yaml'")[0].results[0];
   assert(imageIndex, 'image source mapping must survive the continuation');
   const encodedIndex = Buffer.from(imageIndex.payload, 'hex');
@@ -635,6 +668,7 @@ min_interval: 0.01
     assert.deepEqual(objects.get(`/narou-local/narou/local/illustrations/${digest.toString('base64url')}.png`), image);
   }
   const illustratedId = scalar("SELECT id FROM novels WHERE ncode='smoke-novel'");
+  assert.equal(illustratedId, reservedCreation[0], 'the completed real record must adopt its original reserved ID');
   const illustratedEpub = await api(`/api/novels/${illustratedId}/download.epub`);
   assert.equal(illustratedEpub.status, 200, await illustratedEpub.clone().text());
   const illustratedText = epubText(Buffer.from(await illustratedEpub.arrayBuffer()));
@@ -690,24 +724,22 @@ export default class extends Production.default {
       assert(!objects.has(upload.key), 'temporary uploaded objects must be removed after publication');
     }
 
-    const exportedAnimation = await api(`/api/transfer/export?ids=${animationId}`);
-    assert.equal(exportedAnimation.status, 200);
+    const exportedAnimation = await transferClient(`http://127.0.0.1:${port}`, token).exportData([animationId]);
     const animationHash = createHash('sha256').update(animationBytes).digest('hex');
     const imagePath = `挿絵/${animationHash}.png`;
-    let archivedAnimation, animationManifest;
-    epubText(Buffer.from(await exportedAnimation.arrayBuffer()), (name, bytes) => {
-      if (name === `novels/0/${imagePath}`) archivedAnimation = bytes;
-      if (name === 'manifest.json') animationManifest = JSON.parse(bytes.toString());
-    });
-    assert(archivedAnimation, 'a pool-only illustration must be included even when the novel-prefix LIST is empty');
-    assert.deepEqual(archivedAnimation, animationBytes, 'the exported image must retain every original animation byte');
-    assert.deepEqual(animationManifest.novels[0].files.find(file => file.path === imagePath), {
+    const archivedAnimation = exportedAnimation.files.get(`novels/0/${imagePath}`);
+    assert(archivedAnimation, 'a pool-only illustration must be included even when novel-prefix LIST is empty');
+    assert.deepEqual(archivedAnimation, animationBytes, 'export retains every original animation byte');
+    assert.deepEqual(exportedAnimation.manifest.novels[0].files.find(file => file.path === imagePath), {
       path: imagePath, size: animationBytes.length, sha256: animationHash,
     });
-    console.log('PASS S3 pool-only animation is exported with exact bytes, size and SHA-256');
+    console.log('PASS v2 export resolves pool-only animation with exact bytes, size and SHA-256');
 
     const response = await api(`/api/novels/${animationId}/download.epub`);
     assert.equal(response.status, 200, response.status === 200 ? undefined : await response.text());
+    const readerPrefix = scalar(`SELECT prefix FROM novel_gate_bindings WHERE novel_id=${animationId}`);
+    const liveReaders = () => scalar(`SELECT COUNT(*) FROM novel_reader_leases WHERE prefix=${quote(readerPrefix)} AND expires_at>unixepoch()`);
+    assert(liveReaders() > 0, 'the real EPUB response must own its durable novel lease before body consumption');
     const busy = await api(`/api/novels/${animationId}/download.epub`);
     assert.equal(busy.status, 503, 'the in-flight EPUB must retain its isolate memory reservation');
     assert(busy.headers.get('retry-after'), 'capacity refusal must tell the client when to retry');
@@ -738,6 +770,7 @@ export default class extends Production.default {
     assert(text.includes('初回取得の本文です。'));
     assert.equal(imageReferences.size, 1, JSON.stringify({ references: [...imageReferences], animations: [...animatedImages] }));
     for (const image of imageReferences) assert(animatedImages.has(image), 'the displayed image must retain every animation frame');
+    assert.equal(liveReaders(), 0, 'EOF must release the actual D1 reader lease inline');
     const upstreamClosed = Promise.withResolvers();
     let stalledResponse;
     multipart.beforeReadBody = async (_req, res, key, bytes) => {
@@ -764,6 +797,7 @@ export default class extends Production.default {
         cancelBytes += value.length;
       }
       assert(stalledResponse, 'the upstream image must be paused before EOF');
+      assert(liveReaders() > 0, 'the paused HTTP body must retain novel admission as well as memory');
       await cancelledReader.cancel();
       let deadline;
       try {
@@ -799,26 +833,16 @@ export default class extends Production.default {
       const largeId = scalar(`SELECT id FROM novels WHERE ncode='${slug}'`);
       // Import the explicit cover through the production streaming boundary;
       // exercise chunked storage without embedding large blobs in SQL.
-      const coverExport = await api(`/api/transfer/export?ids=${largeId}`);
-      assert.equal(coverExport.status, 200);
-      const coverEntries = [];
-      let coverManifest;
-      epubText(Buffer.from(await coverExport.arrayBuffer()), (name, bytes) => {
-        if (name === 'manifest.json') coverManifest = JSON.parse(bytes.toString());
-        else coverEntries.push([name, bytes]);
-      });
-      coverManifest.novels[0].files.push({
-        path: 'cover.png', size: sourceStaticImage.bytes.length,
-        sha256: createHash('sha256').update(sourceStaticImage.bytes).digest('hex'),
-      });
-      coverEntries.unshift(['manifest.json', Buffer.from(JSON.stringify(coverManifest))]);
-      coverEntries.push(['novels/0/cover.png', sourceStaticImage.bytes]);
-      const coverImport = await fetch(`http://127.0.0.1:${port}/api/transfer/import?overwrite=true`, {
-        method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/zip', Connection: 'close' },
-        body: storedZip(coverEntries),
-      });
-      assert.equal(coverImport.status, 200, coverImport.status === 200 ? undefined : await coverImport.text());
-      assert.deepEqual(await coverImport.json(), { success: true, created: 0, overwritten: 1, skipped: 0, errors: [] });
+      const transfer = transferClient(`http://127.0.0.1:${port}`, token);
+      const coverExport = await transfer.exportData([largeId]);
+      const coverNovel = coverExport.manifest.novels[0];
+      const coverFiles = coverNovel.files.filter(file => file.path !== 'cover.png').map(file => ({
+        path: file.path, bytes: coverExport.files.get(`novels/0/${file.path}`),
+      }));
+      coverFiles.push({ path: 'cover.png', bytes: sourceStaticImage.bytes });
+      const coverImport = await transfer.importData([{ ...coverNovel, files: coverFiles }], { policy: 'overwrite' });
+      assert.equal(coverImport.status.state, 'completed');
+      assert.equal(coverImport.plan[0].action, 'overwrite');
       const largeEpub = await api(`/api/novels/${largeId}/download.epub`);
       assert.equal(largeEpub.status, 200, largeEpub.status === 200 ? undefined : await largeEpub.text());
       const coverPaths = new Set();
@@ -852,36 +876,20 @@ export default class extends Production.default {
     }
 
     const transferId = scalar("SELECT id FROM novels WHERE ncode='smoke-series'");
-    const exported = await api(`/api/transfer/export?progress=1&ids=${transferId}`);
-    assert.equal(exported.status, 200);
-    const exportEvents = (await exported.text()).trim().split('\n').map(line => JSON.parse(line));
-    assert(!exportEvents.some(event => event.type === 'error'), JSON.stringify(exportEvents));
-    const exportedZip = Buffer.concat(exportEvents.filter(event => event.type === 'data').map(event => Buffer.from(event.data, 'base64')));
-    assert.equal(exportEvents.at(-1).type, 'complete');
-    assert.equal(exportEvents.at(-1).bytes, exportedZip.length);
-    const importedEntries = [];
-    epubText(exportedZip, (name, bytes) => {
-      if (name === 'manifest.json') {
-        const manifest = JSON.stringify(JSON.parse(bytes.toString()));
-        // Small legal JSON, but materializing five million Value nodes exceeds
-        // the entire isolate. Unknown extension fields must be streamed past.
-        bytes = Buffer.from(`${manifest.slice(0, -1)},"ignored":[${'0,'.repeat(4_999_999)}0]}`);
-      }
-      importedEntries.push([name, bytes]);
-    });
-    const imported = await fetch(`http://127.0.0.1:${port}/api/transfer/import?progress=1`, {
-      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/zip', Connection: 'close' },
-      body: storedZip(importedEntries),
-    });
-    assert.equal(imported.status, 200, imported.status === 200 ? undefined : await imported.text());
-    const importEvents = (await imported.text()).trim().split('\n').map(line => JSON.parse(line));
-    assert(!importEvents.some(event => event.type === 'error'), JSON.stringify(importEvents));
-    assert.equal(importEvents.at(-1).type, 'complete');
-    assert.deepEqual(importEvents.at(-1).result, { success: true, created: 0, overwritten: 0, skipped: 1, errors: [] });
+    const transfer = transferClient(`http://127.0.0.1:${port}`, token);
+    const exported = await transfer.exportData([transferId]);
+    const importedNovels = exported.manifest.novels.map((novel, index) => ({
+      ...novel, files: novel.files.map(file => ({ path: file.path, bytes: exported.files.get(`novels/${index}/${file.path}`) })),
+    }));
+    const imported = await transfer.importData(importedNovels);
+    assert.equal(imported.status.state, 'completed');
+    assert(imported.plan.every(row => row.action === 'skip'));
+    assert(!transfer.requests.some(request => request.type === 'application/zip'));
+    assert(transfer.requests.filter(request => request.type === 'application/octet-stream').every(request => request.bytes <= 8 * 1024 * 1024));
     const transferMemory = await (await api('/_fixture/memory')).json();
-    assert.equal(transferMemory.instances, 1, 'ignored manifest values must not trap Wasm');
-    assert(transferMemory.highWater < 112 * 1024 * 1024, `manifest decoding must remain bounded: ${JSON.stringify(transferMemory)}`);
-    console.log(`PASS streamed import ignores five million extension values without materializing them; Wasm high-water=${transferMemory.highWater}`);
+    assert.equal(transferMemory.instances, 1, 'bounded v2 transfer must not trap Wasm');
+    assert(transferMemory.highWater < 112 * 1024 * 1024, `bounded v2 transfer leaves room for the JS heap: ${JSON.stringify(transferMemory)}`);
+    console.log(`PASS chunked v2 transfer/Skip stays bounded; Wasm high-water=${transferMemory.highWater}`);
   }
 
   // Hold the actual Durable Object notification after the ledger has yielded,
@@ -892,6 +900,61 @@ export default class extends Production.default {
   writeFileSync(wrapper, `
 import Entry, { PushHub as ProductionPushHub } from ${production};
 export * from ${production};
+let canonicalTarget = null;
+function canonicalDatabase(database, onCanonicalBoundary) {
+  const metadata = new WeakMap();
+  const statement = (raw, sql, values = []) => {
+    const proxy = new Proxy(raw, { get(target, name) {
+      if (name === 'constructor') return target.constructor;
+      if (name === 'bind') return (...bound) => statement(target.bind(...bound), sql, bound);
+      const value = Reflect.get(target, name, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    metadata.set(proxy, { raw, sql, values });
+    return proxy;
+  };
+  const wrap = raw => new Proxy(raw, { get(target, name) {
+    if (name === 'constructor') return target.constructor;
+    if (name === 'prepare') return sql => statement(target.prepare(sql), sql);
+    if (name === 'batch') return async statements => {
+      const entries = statements.map(value => metadata.get(value)).filter(Boolean);
+      const selected = canonicalTarget;
+      const held = selected && !selected.consumed && entries.some(entry =>
+        /(?:INSERT(?:\\s+OR\\s+[A-Z]+)?\\s+INTO|UPDATE|DELETE\\s+FROM)\\s+(?:objects|content_objects|transfer_object_refs)\\b/i.test(entry.sql)
+        && entry.values.some(value => value === selected.key));
+      if (held) {
+        selected.consumed = true;
+        onCanonicalBoundary();
+        const guards = entries.filter(entry => entry.sql.includes('transfer_storage_guards'));
+        const ownerBound = guards.some(entry => entry.sql.includes(selected.token)
+          || entry.values.some(value => typeof value === 'string' && value.includes(selected.token)));
+        const response = await fetch('http://127.0.0.1:${s3Port}/_fixture/canonical-boundary', {
+          method: 'POST', body: JSON.stringify({ key: selected.key, ownerBound }),
+        });
+        if (!response.ok) throw new Error('canonical boundary fixture failed');
+      }
+      try {
+        const results = await target.batch(statements.map(value => metadata.get(value)?.raw || value));
+        if (held) {
+          const failure = results.find(result => result.success === false || result.error);
+          await fetch('http://127.0.0.1:${s3Port}/_fixture/canonical-result', {
+            method: 'POST', body: JSON.stringify({ ok: !failure, error: failure?.error }),
+          });
+        }
+        return results;
+      } catch (error) {
+        if (held) await fetch('http://127.0.0.1:${s3Port}/_fixture/canonical-result', {
+          method: 'POST', body: JSON.stringify({ ok: false, error: String(error) }),
+        });
+        throw error;
+      }
+    };
+    const value = Reflect.get(target, name, target);
+    if (name === 'withSession' && typeof value === 'function') return (...args) => wrap(value.apply(target, args));
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  return wrap(database);
+}
 const hasPartial = value => value && typeof value === 'object'
   && (value.type === 'queue_partial' || Object.values(value).some(hasPartial));
 export class PushHub extends ProductionPushHub {
@@ -904,11 +967,27 @@ export class PushHub extends ProductionPushHub {
   }
 }
 export default class extends Entry {
-  async queue(batch, ...rest) {
-    await super.queue(batch, ...rest);
-    await fetch('http://127.0.0.1:${s3Port}/_fixture/delivery', {
-      method: 'POST', body: JSON.stringify({ ids: batch.messages.map(message => message.body.job_id) }),
-    });
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === '/__test/canonical-write/arm') {
+      canonicalTarget = { ...await request.json(), consumed: false };
+      return Response.json({ success: true });
+    }
+    if (path === '/__test/canonical-write/clear') {
+      canonicalTarget = null;
+      return Response.json({ success: true });
+    }
+    return super.fetch(request);
+  }
+  async queue(batch) {
+    let canonical = false;
+    try {
+      await new Entry(this.ctx, { ...this.env, DB: canonicalDatabase(this.env.DB, () => { canonical = true; }) }).queue(batch);
+    } finally {
+      await fetch('http://127.0.0.1:${s3Port}/_fixture/delivery', {
+        method: 'POST', body: JSON.stringify({ ids: batch.messages.map(message => message.body.job_id), canonical }),
+      });
+    }
   }
 }
 `);
@@ -920,9 +999,23 @@ export default class extends Entry {
   const gate = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
   const witness = { ids: [], completed: Promise.withResolvers() };
   yieldBarrier = gate; deliveryWitness = witness;
+  const tick = async () => {
+    const response = await api('/__scheduled?cron=*+*+*+*+*');
+    assert.equal(response.status, 200, await response.text());
+  };
   const bounded = (promise, label) => Promise.race([
     promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out`)), 180000).unref()),
   ]);
+  const settleCreation = async (jobId) => {
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      if (scalar(`SELECT checkpoint_json IS NULL FROM worker_jobs WHERE job_id=${quote(jobId)}`)) return;
+      await tick();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(scalar(`SELECT checkpoint_json IS NULL FROM worker_jobs WHERE job_id=${quote(jobId)}`), 1,
+      'actual scheduled removal and terminal release must acknowledge full cleanup before clearing its proof');
+  };
   try {
     const accepted = await (await api('/api/download', { targets: [target] })).json();
     assert(accepted.success, JSON.stringify(accepted));
@@ -931,6 +1024,9 @@ export default class extends Entry {
     const pending = await (await api(`/api/jobs/${jobId}`)).json();
     assert.equal(pending.status, 'pending');
     assert(scalar(`SELECT checkpoint_json IS NOT NULL FROM worker_jobs WHERE job_id=${quote(jobId)}`));
+    const cancelledCheckpoint = JSON.parse(scalar(`SELECT checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`));
+    assert(Array.isArray(cancelledCheckpoint.creation_reservation), 'the cancelled new-download continuation must own an exact numeric reservation');
+    assert(cancelledCheckpoint.write_origin, 'namespace claim and original epoch must remain recoverable at cancellation');
     const cleared = await (await api('/api/queue/clear', {})).json();
     assert(cleared.success, JSON.stringify(cleared));
     const cancelled = await (await api(`/api/jobs/${jobId}`)).json();
@@ -950,19 +1046,213 @@ export default class extends Entry {
     assert.deepEqual([...sourceRequests.entries()], received, 'canceled continuation cannot fetch another episode or TOC');
     assert.deepEqual([...imageRequests.entries()], images, 'canceled continuation cannot fetch another image');
     assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), 1);
-    console.log('PASS clearing after budget yield retains the tombstone, original identity, and saved content');
+    await settleCreation(jobId);
+    assert.equal(scalar(`SELECT checkpoint_json IS NULL FROM worker_jobs WHERE job_id=${quote(jobId)}`), 1,
+      'only complete fenced cleanup may clear the durable reservation proof');
+    console.log('PASS clearing after budget yield preserves the tombstone and original identity through full fenced cleanup');
+
+    // The same namespace must now support a REAL fresh acquisition. Pause its
+    // first body response to inspect the new claim before publication, rather
+    // than inferring release from an empty checkpoint column.
+    sourceImageCount = 0;
+    sourceGeneration = 1;
+    const retryEntered = Promise.withResolvers();
+    const retryRelease = Promise.withResolvers();
+    sourcePause = async (path) => {
+      if (path !== '/smoke-novel/1/') return;
+      sourcePause = null;
+      retryEntered.resolve();
+      await retryRelease.promise;
+    };
+    const recreated = download(target, false);
+    try {
+      await bounded(retryEntered.promise, 'fresh creation after cancellation');
+      const checkpoint = JSON.parse(scalar("SELECT checkpoint_json FROM worker_jobs WHERE kind='download' AND status='running'"));
+      assert.equal(checkpoint.creation_reservation[0], cancelledCheckpoint.creation_reservation[0], 'the released unpublished numeric ID must be reusable');
+      assert.notEqual(checkpoint.creation_reservation[1], cancelledCheckpoint.creation_reservation[1], 'reusing that ID must create a new generation');
+      assert.equal(checkpoint.write_origin.prefix, cancelledCheckpoint.write_origin.prefix);
+      assert(checkpoint.write_origin.epoch > cancelledCheckpoint.write_origin.epoch, 'release must invalidate the old producer epoch before admitting the new claim');
+    } finally {
+      retryRelease.resolve();
+      sourcePause = null;
+    }
+    await recreated;
+    const recreatedId = scalar("SELECT id FROM novels WHERE ncode='smoke-novel'");
+    assert.equal(recreatedId, cancelledCheckpoint.creation_reservation[0]);
+    const recreatedEpub = await api(`/api/novels/${recreatedId}/download.epub`);
+    assert.equal(recreatedEpub.status, 200, await recreatedEpub.clone().text());
+    assert(epubText(Buffer.from(await recreatedEpub.arrayBuffer())).includes('初回取得の本文です。'.repeat(100)), 'the new claim must publish and serve the actual section bytes');
   } finally {
     gate.release.resolve();
     yieldBarrier = null; deliveryWitness = null;
   }
 
+  // Reclaiming a SAME-job invocation changes its token, not its novel epoch.
+  // Pause the real canonical batch after its last active check: the actual
+  // D1 guard must reject the old token even while the row remains running.
+  {
+    await defaultLibrary('same-epoch-execution-token', { required: true, entrypoint: wrapper });
+    await installDefaultSource();
+    sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
+    sourceImageCount = 0;
+    await download(target, false);
+    sourceGeneration = 2;
+    await download(target, true); // Positive control: an existing-record owner really commits.
+    const id = scalar("SELECT id FROM novels WHERE ncode='smoke-novel'");
+    const client = transferClient(`http://127.0.0.1:${port}`, token);
+    const before = await client.exportData([id]);
+    const bodyPath = before.manifest.novels[0].files.find(file => file.path.startsWith('本文/') && file.path.endsWith('.yaml') && !file.path.includes('/cache/') && !file.path.includes('/.cache/')).path;
+    const originalBody = before.files.get(`novels/0/${bodyPath}`);
+    assert(originalBody.includes(Buffer.from('更新後の本文です。')), 'positive control must publish real changed section bytes');
+    sourceGeneration = 3;
+    const sourceGate = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
+    const writeGate = { entered: Promise.withResolvers(), release: Promise.withResolvers(), result: Promise.withResolvers() };
+    const completed = { ids: [], expected: 1, canonicalOnly: true, completed: Promise.withResolvers() };
+    canonicalWriteBarrier = writeGate;
+    deliveryWitness = completed;
+    sourcePause = async path => {
+      if (path !== '/smoke-novel/1/') return;
+      sourcePause = null;
+      sourceGate.entered.resolve();
+      await sourceGate.release.promise;
+    };
+    let jobId;
+    let successor;
+    try {
+      const accepted = await (await api('/api/download', { targets: [target], force: true })).json();
+      assert(accepted.success, JSON.stringify(accepted));
+      jobId = accepted.results[0].job_id;
+      await bounded(sourceGate.entered.promise, 'live source HTTP before canonical write');
+      const running = sql(`SELECT execution_token,checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)} AND status='running'`)[0].results[0];
+      const checkpoint = JSON.parse(running.checkpoint_json);
+      assert.equal(checkpoint.creation_reservation, null, 'existing-record writes require execution ownership too');
+      assert(!running.checkpoint_json.includes(running.execution_token), 'the execution token must not be persisted in the portable checkpoint');
+      const prefix = checkpoint.write_origin.prefix;
+      const epoch = scalar(`SELECT epoch FROM novel_access_gates WHERE prefix=${quote(prefix)}`);
+      const armed = await (await api('/__test/canonical-write/arm', { key: `${prefix.replace(/\/$/, '')}/${bodyPath}`, token: running.execution_token })).json();
+      assert(armed.success);
+      sourceGate.release.resolve();
+      const boundary = await bounded(writeGate.entered.promise, 'actual canonical transaction boundary');
+      assert.equal(boundary.ownerBound, true, 'the actual prepared canonical guard must retain this invocation token');
+      successor = globalThis.crypto.randomUUID();
+      const now = new Date().toISOString();
+      const until = new Date(Date.now() + 600000).toISOString();
+      sql(`UPDATE worker_jobs SET execution_token=${quote(successor)},lease_until=${quote(until)},updated_at=${quote(now)},recovery_attempts=recovery_attempts+1 WHERE job_id=${quote(jobId)} AND status='running' AND execution_token=${quote(running.execution_token)}`);
+      const claimed = sql(`SELECT status,execution_token FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
+      assert.equal(claimed.status, 'running');
+      assert.equal(claimed.execution_token, successor);
+      assert.equal(scalar(`SELECT epoch FROM novel_access_gates WHERE prefix=${quote(prefix)}`), epoch, 'the race must not rely on epoch revocation');
+      writeGate.release.resolve();
+      const result = await bounded(writeGate.result.promise, 'actual stale canonical transaction result');
+      assert.equal(result.ok, false, `the real D1 canonical batch accepted an old execution token: ${JSON.stringify(result)}`);
+      await bounded(completed.completed.promise, 'stale physical invocation completion');
+      const live = sql(`SELECT status,execution_token FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
+      assert.equal(live.status, 'running', 'old settlement must not terminate the successor');
+      assert.equal(live.execution_token, successor);
+      assert.equal(scalar(`SELECT epoch FROM novel_access_gates WHERE prefix=${quote(prefix)}`), epoch);
+      // Explicit fixture teardown of the durable successor claim; no second
+      // physical isolate is fabricated or assumed dead by this regression.
+      sql(`UPDATE worker_jobs SET status='permanent',last_error='cancelled by user via Web UI',execution_token=NULL,lease_until=NULL,checkpoint_json=NULL WHERE job_id=${quote(jobId)} AND status='running' AND execution_token=${quote(successor)}`);
+      const after = await client.exportData([id]);
+      assert.deepEqual(after.files.get(`novels/0/${bodyPath}`), originalBody, 'actual stale canonical rejection must preserve the complete published section bytes');
+    } finally {
+      sourcePause = null;
+      sourceGate.release.resolve();
+      writeGate.release.resolve();
+      await api('/__test/canonical-write/clear', {});
+      canonicalWriteBarrier = null;
+      deliveryWitness = null;
+      if (jobId && successor) sql(`UPDATE worker_jobs SET status='permanent',last_error='cancelled by user via Web UI',execution_token=NULL,lease_until=NULL,checkpoint_json=NULL WHERE job_id=${quote(jobId)} AND execution_token=${quote(successor)}`);
+    }
+    console.log('PASS real same-epoch canonical transaction rejects a superseded SAME-job execution token and preserves actual section bytes');
+  }
+
+  // Pause a REAL continuation before it enters Rust/MemoryPermit admission,
+  // publish replacement bytes through transfer v2, then let that same durable
+  // job run. A JSON checkpoint assertion alone cannot prove stale-write safety.
+  {
+    const staleWrapper = join(work, 'stale-origin-wrapper.mjs');
+    writeFileSync(staleWrapper, `
+import Entry from ${production};
+export * from ${production};
+export default class extends Entry {
+  async queue(batch, ...rest) {
+    for (const message of batch.messages) {
+      const row = await this.env.DB.prepare("SELECT checkpoint_json FROM worker_jobs WHERE job_id=? AND status='pending'")
+        .bind(message.body.job_id).first();
+      if (row?.checkpoint_json) {
+        await fetch('http://127.0.0.1:${s3Port}/_fixture/yield', { method: 'POST' });
+      }
+    }
+    return super.queue(batch, ...rest);
+  }
+}
+`);
+    await defaultLibrary('stale-origin-after-transfer', { required: true, entrypoint: staleWrapper });
+    await installDefaultSource();
+    sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
+    await download(target, false);
+    const id = scalar("SELECT id FROM novels WHERE ncode='smoke-novel'");
+    const client = transferClient(`http://127.0.0.1:${port}`, token);
+    const baseline = await client.exportData([id]);
+    const novel = baseline.manifest.novels[0];
+    const bodyPath = novel.files.find(file => file.path.startsWith('本文/') && file.path.endsWith('.yaml') && !file.path.includes('/cache/') && !file.path.includes('/.cache/')).path;
+    const publishedMarker = '転送で公開した後続世代の本文です。';
+    const replacementFiles = novel.files.map(file => {
+      let bytes = baseline.files.get(`novels/0/${file.path}`);
+      if (file.path === bodyPath) {
+        assert(bytes.includes(Buffer.from('初回取得の本文です。')), 'replace actual serialized section body bytes');
+        bytes = Buffer.from(bytes.toString().replaceAll('初回取得の本文です。', publishedMarker));
+      }
+      return { path: file.path, bytes };
+    });
+    sourceGeneration = 2;
+    sourceImageCount = 500;
+    sourceRequests.clear(); imageRequests.clear();
+    const gate = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
+    yieldBarrier = gate;
+    try {
+      const accepted = await (await api('/api/download', { targets: [target], force: true })).json();
+      assert(accepted.success, JSON.stringify(accepted));
+      const jobId = accepted.results[0].job_id;
+      await bounded(gate.entered.promise, 'stale-origin continuation admission');
+      const checkpoint = JSON.parse(scalar(`SELECT checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`));
+      assert(checkpoint.write_origin, 'the real completed-prefix checkpoint must contain its original fence');
+      const requestsBefore = [...sourceRequests.entries()];
+      const imagesBefore = [...imageRequests.entries()];
+      const imported = await client.importData([{ ...novel, files: replacementFiles }], { policy: 'overwrite' });
+      assert.equal(imported.status.state, 'completed');
+      assert.equal(imported.plan[0].action, 'overwrite');
+      const afterPublication = await client.exportData([id]);
+      assert(afterPublication.files.get(`novels/0/${bodyPath}`).includes(Buffer.from(publishedMarker)));
+
+      gate.release.resolve();
+      const rejected = await waitForAcquisition(jobId, true);
+      assert.match(rejected.last_error ?? '', /novel|epoch|origin/i);
+      const afterContinuation = await client.exportData([id]);
+      assert.deepEqual(afterContinuation.files.get(`novels/0/${bodyPath}`), replacementFiles.find(file => file.path === bodyPath).bytes,
+        'the stale continuation must not replace the later published section bytes');
+      assert.deepEqual([...sourceRequests.entries()], requestsBefore, 'origin rejection occurs before another upstream TOC/episode fetch');
+      assert.deepEqual([...imageRequests.entries()], imagesBefore, 'origin rejection must not continue the old illustration loop');
+      assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='convert'"), 1, 'only the initial successful download may enqueue conversion');
+      const cleared = await (await api('/api/queue/cancel', {})).json();
+      assert(cleared.success, JSON.stringify(cleared));
+    } finally {
+      gate.release.resolve();
+      yieldBarrier = null;
+    }
+    console.log('PASS real persisted continuation rejects its old writer origin after v2 publishes replacement bytes');
+  }
+
   for (const scenario of [
+    { name: 'cancel-before-toc', episodes: 3, pauseToc: true },
     { name: 'cancel-between-episodes', episodes: 3 },
     { name: 'cancel-final-episode', episodes: 1 },
     { name: 'cancel-between-images', episodes: 1, images: 3 },
+    { name: 'cancel-expired-live-invocation', episodes: 1, images: 3, revokeExpired: true },
     { name: 'clear-running-and-waiting', episodes: 3, clearAll: true },
   ]) {
-    await defaultLibrary(scenario.name, { required: true });
+    await defaultLibrary(scenario.name, { required: true, ...(scenario.revokeExpired ? { entrypoint: wrapper } : {}) });
     await installDefaultSource();
     sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
     sourceEpisodeCount = scenario.episodes;
@@ -970,7 +1260,9 @@ export default class extends Entry {
     sourceRequests.clear(); imageRequests.clear();
     const entered = Promise.withResolvers();
     const release = Promise.withResolvers();
-    const pausePath = scenario.images ? '/smoke-image/0.png' : '/smoke-novel/1/';
+    const pausePath = scenario.pauseToc ? '/smoke-novel/' : scenario.images ? '/smoke-image/0.png' : '/smoke-novel/1/';
+    const revocationWitness = scenario.revokeExpired ? { ids: [], expected: 1, completed: Promise.withResolvers() } : null;
+    if (revocationWitness) deliveryWitness = revocationWitness;
     sourcePause = async (path) => {
       if (path !== pausePath) return;
       sourcePause = null;
@@ -982,6 +1274,15 @@ export default class extends Entry {
       assert(accepted.success, JSON.stringify(accepted));
       const jobId = accepted.results[0].job_id;
       await Promise.race([entered.promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`source gate timed out: ${scenario.name}`)), 30000).unref())]);
+      if (scenario.pauseToc) {
+        const early = JSON.parse(scalar(`SELECT checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`));
+        assert(Array.isArray(early.creation_reservation) && early.creation_reservation.length === 2, 'the allocator must durably associate its exact ID/generation with the live job BEFORE the first TOC response');
+        assert.equal(early.write_origin, null, 'a numeric-only pre-TOC claim must not fabricate a namespace epoch');
+        assert.equal(early.phase, 'planned');
+        assert.equal(early.next_section_index, null);
+        assert.equal(scalar('SELECT COUNT(*) FROM novels'), 0);
+        assert.equal(scalar('SELECT COUNT(*) FROM content_objects'), 0, 'pre-prefix ownership cannot publish canonical body bytes');
+      }
       if (scenario.clearAll) {
         const waiting = await (await api('/api/download', { targets: [target], force: true })).json();
         assert(waiting.success, JSON.stringify(waiting));
@@ -993,7 +1294,28 @@ export default class extends Entry {
         scenario.clearAll ? {} : { task_id: jobId },
       )).json();
       assert(scenario.clearAll ? cancellation.success : cancellation.status === 'ok', JSON.stringify(cancellation));
+      if (scenario.revokeExpired) {
+        const held = sql(`SELECT status,execution_token,checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
+        assert.equal(held.status, 'permanent');
+        assert(held.execution_token, 'logical cancellation must not pretend the held physical fetch has stopped');
+        const origin = JSON.parse(held.checkpoint_json).write_origin;
+        assert(origin, 'the exact original epoch must remain durable until atomic revocation');
+        sql(`UPDATE worker_jobs SET lease_until='2000-01-01T00:00:00.000000000Z' WHERE job_id=${quote(jobId)} AND execution_token=${quote(held.execution_token)}`);
+        // The source response is STILL awaiting release.promise. Expiry is a
+        // revocation condition, never evidence that its physical owner died.
+        const revoked = await (await api('/api/queue/clear', {})).json();
+        assert(revoked.success, JSON.stringify(revoked));
+        const settled = sql(`SELECT execution_token,checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
+        assert.equal(settled.execution_token, null);
+        assert(settled.checkpoint_json, 'revocation must retain the exact claim until closed-owner cleanup and final release finish');
+        const epoch = scalar(`SELECT epoch FROM novel_access_gates WHERE prefix=${quote(origin.prefix.replace(/\/$/, ''))}`);
+        assert(epoch > origin.epoch, 'the old producer must be fenced while its real HTTP fetch is still alive');
+        assert.equal(scalar(`SELECT closed FROM novel_access_gates WHERE prefix=${quote(origin.prefix.replace(/\/$/, ''))}`), 1, 'revocation keeps the namespace CLOSED until cleanup; it must not bump and reopen early');
+        assert.equal(imageRequests.get('/smoke-image/0.png'), 1);
+      }
       release.resolve();
+      if (revocationWitness) await bounded(revocationWitness.completed.promise, 'revoked physical delivery settlement');
+      if (revocationWitness) assert.deepEqual([...imageRequests.keys()], ['/smoke-image/0.png'], 'revoking a live expired invocation must prevent any later image fetch');
       const deadline = Date.now() + 60000;
       let job;
       do {
@@ -1004,11 +1326,11 @@ export default class extends Entry {
       assert.equal(job.execution_token, null, JSON.stringify(job));
       assert.equal(job.status, 'permanent');
       assert.equal(job.last_error, 'cancelled by user via Web UI');
-      assert.equal(sourceRequests.get('/smoke-novel/1/'), 1);
+      assert.equal(sourceRequests.get('/smoke-novel/1/') || 0, scenario.pauseToc ? 0 : 1);
       assert.equal(sourceRequests.get('/smoke-novel/2/') || 0, 0, 'cancellation must stop subsequent episodes');
       assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='convert'"), 0, 'a canceled acquisition must not enqueue a new conversion');
       assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE status IN ('pending','running','retryable')"), 0, 'bulk clearing must not wake the former waiting queue');
-      assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), 1, 'already received body data must be retained');
+      assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), scenario.pauseToc ? 0 : 1, 'received bytes are retained; a pre-TOC cancellation must not invent body data');
       const queueStatus = await (await api('/api/queue/status')).json();
       assert.equal(queueStatus.failed, 0, 'intentional interruption and cleared waiting work must not appear as failures');
       assert.equal(queueStatus.cancelled, 1, 'the stopped running execution must be counted as canceled');
@@ -1018,16 +1340,18 @@ export default class extends Entry {
         assert.equal(withFailure.failed, 1, 'unrelated failures must remain visible alongside canceled executions');
         assert.equal(withFailure.cancelled, 1);
       }
-      if (scenario.images) {
+      if (scenario.images && !scenario.revokeExpired) {
         assert.deepEqual([...imageRequests.keys()], ['/smoke-image/0.png'], 'cancellation must stop subsequent images');
         const index = sql("SELECT encoding,hex(data) payload FROM objects WHERE object_key LIKE '%/.illustration_cache.yaml'")[0].results[0];
         const bytes = Buffer.from(index.payload, 'hex');
         const text = (index.encoding === 'brotli' ? brotliDecompressSync(bytes) : bytes).toString();
         assert(text.includes('/smoke-image/0.png'), 'cancellation must retain the already saved image mapping');
       }
-      console.log(`PASS ${scenario.name}: no later fetches or follow-up conversion, saved content retained`);
+      await settleCreation(jobId);
+      console.log(`PASS ${scenario.name}: durable cancellation, no later fetches or follow-up conversion, full fenced reservation cleanup`);
     } finally {
       sourcePause = null;
+      if (revocationWitness) deliveryWitness = null;
       release.resolve();
     }
   }
@@ -1079,10 +1403,6 @@ export default class extends Entry {
   } })).json();
   assert(settingsSaved.success, JSON.stringify(settingsSaved));
   const checkpoint = () => JSON.parse(scalar("SELECT value_json FROM app_state WHERE scope='scheduler' AND key='auto_update'"));
-  const tick = async () => {
-    const response = await api('/__scheduled?cron=*+*+*+*+*');
-    assert.equal(response.status, 200, await response.text());
-  };
   const expirePlannerLease = () => sql("UPDATE app_state SET value_yaml=json_set(value_json, '$.planner_lease_until', '2000-01-01T00:00:00Z'), value_json=json_set(value_json, '$.planner_lease_until', '2000-01-01T00:00:00Z') WHERE scope='scheduler' AND key='auto_update';");
   const singleRequests = sourceRequests.get('/smoke-single/');
   const seriesRequests = sourceRequests.get('/smoke-series/');

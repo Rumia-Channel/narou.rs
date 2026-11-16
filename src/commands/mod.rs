@@ -75,15 +75,16 @@ fn latest_convert_target() -> Option<String> {
     latest.get("id").and_then(yaml_value_to_string)
 }
 
-pub(crate) fn enqueue_web_convert_job(id: i64) -> Result<(), String> {
+pub(crate) fn enqueue_web_convert_job(write: &narou_rs::application::novel_access::NovelWriteGuard, id: i64) -> Result<(), String> {
     let queue_path = std::env::current_dir()
         .map_err(|e| e.to_string())?
         .join(".narou")
         .join("queue.yaml");
     let queue = PersistentQueue::new(&queue_path).map_err(|e| e.to_string())?;
-    queue
-        .push(JobType::Convert, &id.to_string())
-        .map_err(|e| e.to_string())?;
+    let mut meta = serde_yaml::Mapping::new();
+    meta.insert(serde_yaml::Value::String("write_origin".into()), serde_yaml::Value::String(serde_json::to_string(&write.origin()).map_err(|error| error.to_string())?));
+    queue.push_with_legacy(JobType::Convert, &id.to_string(), "convert", vec![serde_yaml::Value::String(id.to_string())], meta)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 

@@ -130,7 +130,7 @@ fn list() -> Result<()> {
     let states = virtual_novel::attribute_states_in(&members);
     for (virtual_id, member_ids) in &members.groups {
         let ncode = core::ncode(*virtual_id);
-        let record = repository.get_sync(NovelId(*virtual_id))?.ok_or_else(|| {
+        let record = repository.get_current_sync(NovelId(*virtual_id))?.ok_or_else(|| {
             NarouError::Database(format!("仮想小説 {ncode} のレコードがありません"))
         })?;
         let state = states.get(virtual_id);
@@ -147,7 +147,7 @@ fn list() -> Result<()> {
         );
         for (position, member) in member_ids.iter().enumerate() {
             let title = repository
-                .get_sync(NovelId(*member))?
+                .get_current_sync(NovelId(*member))?
                 .map(|record| record.title)
                 .unwrap_or_else(|| "<missing>".to_string());
             println!("  {}. ID:{member} {title}", position + 1);
@@ -212,7 +212,7 @@ fn resolve_virtual_id(target: &str) -> Result<i64> {
         return Ok(id);
     }
     if let Ok(id) = target.parse::<i64>() {
-        let record = NativeNovelRepository::new().get_sync(NovelId(id))?;
+        let record = NativeNovelRepository::new().get_current_sync(NovelId(id))?;
         if record
             .and_then(|record| record.ncode)
             .is_some_and(|ncode| core::is_virtual_ncode(&ncode))

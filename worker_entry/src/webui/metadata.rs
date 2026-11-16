@@ -10,17 +10,15 @@
 use std::sync::Arc;
 
 use narou_rs::application::{
-    EmptySiteTimezoneProvider, LibraryService, SettingsService, TagColorService,
+    SettingsService, TagColorService,
 };
-use narou_rs::platform::SystemClock;
 use worker::{Env, Response};
 
-use crate::d1_repository::{D1FreezeStore, D1NovelRepository, D1SettingsStore, D1TagColorStore};
+use crate::d1_repository::{D1NovelRepository, D1SettingsStore, D1TagColorStore};
 use crate::db_handle::DbHandle;
 
 pub(crate) struct MetadataServices {
     pub db: DbHandle,
-    pub library: LibraryService,
     pub settings: SettingsService,
     pub tag_colors: TagColorService,
 }
@@ -78,14 +76,7 @@ pub(crate) fn settings_for_writes(env: &Env) -> worker::Result<SettingsService> 
 impl MetadataServices {
     pub(crate) fn new(env: &Env) -> worker::Result<Self> {
         let db = database(env)?;
-        let library = LibraryService::new(
-            Arc::new(D1NovelRepository::new(db.clone())),
-            Arc::new(SystemClock),
-            Arc::new(D1FreezeStore::new(db.clone())),
-            Arc::new(EmptySiteTimezoneProvider),
-        );
         Ok(Self {
-            library,
             settings: SettingsService::new(Arc::new(D1SettingsStore::new(db.clone()))),
             tag_colors: TagColorService::new(Arc::new(D1TagColorStore::new(db.clone()))),
             db,

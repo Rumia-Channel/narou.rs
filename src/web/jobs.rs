@@ -216,19 +216,19 @@ async fn sort_numeric_targets_for_state(
     targets: &[String],
     sort_state: Option<&serde_json::Value>,
     timestamp: Option<u64>,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let Some(ids) = targets
         .iter()
         .map(|target| target.parse::<i64>().ok())
         .collect::<Option<Vec<_>>>()
     else {
-        return targets.to_vec();
+        return Ok(targets.to_vec());
     };
-    let records = state.services.library.records().await.unwrap_or_default();
-    sort_ids_from_records(&ids, &records, sort_state, timestamp)
+    let records = state.services.library.records_by_ids(&ids).await.map_err(|error| error.to_string())?;
+    Ok(sort_ids_from_records(&ids, &records, sort_state, timestamp)
         .into_iter()
         .map(|id| id.to_string())
-        .collect()
+        .collect())
 }
 fn build_update_by_tag_queue_payload(
     tag_params: &[String],
@@ -337,7 +337,7 @@ fn existing_update_job_id(
 async fn resolve_existing_id_for_target_with_library(
     state: &AppState,
     target: &str,
-) -> Option<i64> {
+) -> Result<Option<i64>, String> {
     state
         .services
         .library
@@ -350,9 +350,8 @@ async fn resolve_existing_id_for_target_with_library(
             target,
         )
         .await
-        .ok()
-        .flatten()
-        .map(|record| record.id)
+        .map(|record| record.map(|record| record.id))
+        .map_err(|error| error.to_string())
 }
 
 fn push_update_job_if_needed(
@@ -583,35 +582,28 @@ fn native_cache_version_hints(
     Ok(hints)
 }
 
-async fn render_diff_list_html_for_target(state: &AppState, target: &str) -> String {
-    let Some(id) = resolve_existing_id_for_target_with_library(state, target).await else {
-        return String::new();
+async fn render_diff_list_html_for_target(state: &AppState, target: &str) -> Result<String, String> {
+    let Some(id) = resolve_existing_id_for_target_with_library(state, target).await? else {
+        return Ok(String::new());
     };
-    let Ok(Some(record)) = state.services.library.get(id.into()).await else {
-        return String::new();
-    };
-    let Ok(archive_root) =
-        crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-    else {
-        return String::new();
-    };
-
-    let Ok(base_dir) = super::safe_existing_novel_dir(&archive_root, &record) else {
-        return String::new();
-    };
-    let Some(prefix) = crate::native::object_store::novel_object_prefix(&archive_root, &base_dir)
-    else {
-        return String::new();
-    };
-    let Ok(hints) = native_cache_version_hints(&archive_root, &base_dir) else {
-        return String::new();
-    };
-    let Ok(versions) =
-        diff::read_diff_cache_catalog(state.services.content.object_store(), &prefix, &hints).await
-    else {
-        return String::new();
-    };
-    diff::render_diff_list_html(&versions)
+    let mut reads = state.services.content.read_scope("native-diff-catalog");
+    let result = async {
+        let Some(record) = state.services.content.read_record(&mut reads, id.into()).await
+            .map_err(|error| error.to_string())? else {
+            return Ok(String::new());
+        };
+        let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+            .map_err(|error| error.to_string())?;
+        let base_dir = super::safe_existing_novel_dir(&archive_root, &record)?;
+        let prefix = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+            .map_err(|error| error.to_string())?.prefix().clone();
+        let hints = native_cache_version_hints(&archive_root, &base_dir)?;
+        let versions = diff::read_diff_cache_catalog(&mut reads, state.services.content.object_store(), &prefix, &hints)
+            .await.map_err(|error| error.to_string())?;
+        Ok(diff::render_diff_list_html(&versions))
+    }.await;
+    let released = reads.release_all().await;
+    result.and_then(|value| released.map(|_| value).map_err(|error| error.to_string()))
 }
 
 #[cfg(test)]
@@ -626,12 +618,14 @@ mod cache_catalog_tests {
         let base = archive.join("site/title");
         let version_dir = base.join("本文/.cache/2026.10.13@01.02.03");
         std::fs::create_dir_all(&version_dir).unwrap();
-        let objects = NativeObjectStore::from_root(archive.to_path_buf()).unwrap();
+        let objects: std::sync::Arc<dyn crate::platform::ObjectStore> = std::sync::Arc::new(NativeObjectStore::from_root(archive.to_path_buf()).unwrap());
         let prefix = crate::native::object_store::novel_object_prefix(archive, &base).unwrap();
         let hints = native_cache_version_hints(archive, &base).unwrap();
+        let mut reads = crate::application::novel_access::NovelReadScope::new(&objects, "diff-test");
         let versions = futures::executor::block_on(
-            diff::read_diff_cache_catalog(&objects, &prefix, &hints),
+            diff::read_diff_cache_catalog(&mut reads, objects.as_ref(), &prefix, &hints),
         ).unwrap();
+        futures::executor::block_on(reads.release_all()).unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version, "2026.10.13@01.02.03");
         assert!(versions[0].only_latest_update);
@@ -718,16 +712,18 @@ pub async fn api_update(
         (targets.join("\t"), None)
     } else {
         let mut args = if is_update_all {
-            let records = state.services.library.records().await.unwrap_or_default();
+            let records = match state.services.library.records().await {
+                Ok(records) => records,
+                Err(error) => return serde_json::json!({ "success": false, "message": error.to_string() }).into(),
+            };
             sorted_update_all_ids(records)
         } else {
-            sort_numeric_targets_for_state(
-                &state,
-                &targets,
-                body.sort_state.as_ref(),
-                body.timestamp,
-            )
-            .await
+            match sort_numeric_targets_for_state(
+                &state, &targets, body.sort_state.as_ref(), body.timestamp,
+            ).await {
+                Ok(targets) => targets,
+                Err(error) => return serde_json::json!({ "success": false, "message": error }).into(),
+            }
         };
         count = args.len();
         let author_only = if count == 0 && is_update_all {
@@ -880,9 +876,10 @@ pub async fn api_convert(
             .into();
         }
     };
-    let ordered_targets =
-        sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp)
-            .await;
+    let ordered_targets = match sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp).await {
+        Ok(targets) => targets,
+        Err(error) => return serde_json::json!({ "success": false, "message": error, "results": [] }).into(),
+    };
     let mut meta = Mapping::new();
     if let Some(device) = device.as_deref() {
         meta.insert(
@@ -1041,9 +1038,10 @@ pub async fn api_send(
             .into();
         }
     };
-    let ordered_targets =
-        sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp)
-            .await;
+    let ordered_targets = match sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp).await {
+        Ok(targets) => targets,
+        Err(error) => return serde_json::json!({ "success": false, "message": error }).into(),
+    };
     let legacy_args = ordered_targets
         .iter()
         .cloned()
@@ -1216,9 +1214,10 @@ pub async fn api_backup(
             .into();
         }
     };
-    let ordered_targets =
-        sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp)
-            .await;
+    let ordered_targets = match sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp).await {
+        Ok(targets) => targets,
+        Err(error) => return serde_json::json!({ "success": false, "message": error }).into(),
+    };
     let legacy_args = ordered_targets
         .iter()
         .cloned()
@@ -1398,13 +1397,26 @@ pub async fn api_diff_list(
             Ok(id) => id,
             Err(_) => continue,
         };
-        let record = state.services.library.get(id.into()).await.ok().flatten();
-        let Some(record) = record else {
+        let mut reads = state.services.content.read_scope("native-diff-list");
+        let outcome = async {
+            let Some(record) = state.services.content.read_record(&mut reads, id.into()).await? else {
+                return Ok(None);
+            };
+            let result = state.services.content.diff(&mut reads, id.into()).await;
+            Ok::<_, crate::application::error::ApplicationError>(Some((record.title, result)))
+        }.await;
+        let released = reads.release_all().await;
+        let Ok(resolved) = outcome.and_then(|value| released.map(|_| value).map_err(crate::application::error::ApplicationError::platform))
+        else {
+            diffs.push(diff::diff_list_entry(id, "", diff::DIFF_READ_ERROR));
+            continue;
+        };
+        let Some((title, result)) = resolved else {
             diffs.push(diff::diff_missing_entry(id));
             continue;
         };
-        let content = diff::diff_content_label(state.services.content.diff(id.into()).await);
-        diffs.push(diff::diff_list_entry(id, &record.title, &content));
+        let content = diff::diff_content_label(result);
+        diffs.push(diff::diff_list_entry(id, &title, &content));
     }
     serde_json::json!({ "diffs": diffs }).into()
 }
@@ -1413,12 +1425,15 @@ pub async fn api_diff_list(
 pub async fn api_diff_list_get(
     State(state): State<AppState>,
     Query(params): Query<DiffListQuery>,
-) -> Html<String> {
+) -> Response {
     let html = match params.target.as_deref() {
         Some(target) => render_diff_list_html_for_target(&state, target).await,
-        None => String::new(),
+        None => Ok(String::new()),
     };
-    Html(html)
+    match html {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
 }
 
 // GET /api/downloadable.gif
@@ -1428,13 +1443,10 @@ pub async fn api_downloadable_gif(
 ) -> Response {
     let _number = match params.target.as_deref() {
         Some(target) if !target.trim().is_empty() => {
-            if resolve_existing_id_for_target_with_library(&state, target)
-                .await
-                .is_some()
-            {
-                1
-            } else {
-                0
+            match resolve_existing_id_for_target_with_library(&state, target).await {
+                Ok(Some(_)) => 1,
+                Ok(None) => 0,
+                Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
             }
         }
         _ => 2,
@@ -1508,11 +1520,13 @@ pub async fn api_diff(
         }
     }
 
-    let history: serde_json::Map<String, serde_json::Value> = ids
-        .iter()
-        .filter_map(|id| id.parse::<i64>().ok())
-        .map(|id| (id.to_string(), serde_json::json!(diff_history_versions(id))))
-        .collect();
+    let mut history = serde_json::Map::new();
+    for id in ids.iter().filter_map(|id| id.parse::<i64>().ok()) {
+        match diff_history_versions(&state, id).await {
+            Ok(versions) => { history.insert(id.to_string(), serde_json::json!(versions)); }
+            Err(error) => return serde_json::json!({ "success": false, "message": error }).into(),
+        }
+    }
     serde_json::json!({
         "success": true,
         "message": format!("Diff completed for {} novel(s)", ids.len()),
@@ -1574,38 +1588,45 @@ pub async fn api_diff_clean(
     }
 }
 
-/// Shared SQLite connection for diff-history endpoints; `None` when the
-/// library still runs on the legacy YAML backend.
-fn diff_history_conn(
-) -> Option<std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>> {
-    let narou_dir = crate::db::inventory::Inventory::with_default_root()
-        .ok()?
-        .root_dir()
-        .join(".narou");
-    crate::native::sqlite::state::active_for(&narou_dir).map(|state| state.conn())
+/// Read version data through the same original admission as its current
+/// record. YAML deliberately has no SQLite version history; storage failures
+/// are errors, never a fabricated empty catalog.
+async fn with_diff_history<T>(
+    state: &AppState,
+    id: i64,
+    read: impl FnOnce(&rusqlite::Connection) -> crate::error::Result<T>,
+) -> Result<Option<T>, String> {
+    let mut reads = state.services.content.read_scope("native-diff-history");
+    let result = async {
+        let record = state.services.content.read_record(&mut reads, id.into()).await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("ID: {id}"))?;
+        let store = crate::native::object_store::NativeStore::for_current_root().map_err(|error| error.to_string())?;
+        if !matches!(&store, crate::native::object_store::NativeStore::Sqlite(_)) {
+            return Ok(None);
+        }
+        let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+            .map_err(|error| error.to_string())?;
+        let prefix = crate::platform::ObjectPrefix::from(keys.prefix().clone());
+        let lease = reads.lease_for(&prefix).await.map_err(|error| error.to_string())?;
+        store.with_reader_transaction(&prefix, lease.lease(), read).map(Some).map_err(|error| error.to_string())
+    }.await;
+    let released = reads.release_all().await;
+    result.and_then(|value| released.map(|_| value).map_err(|error| error.to_string()))
 }
 
-fn diff_history_versions(id: i64) -> Vec<serde_json::Value> {
-    let Some(conn) = diff_history_conn() else {
-        return Vec::new();
-    };
-    let guard = conn.lock();
-    match crate::native::sqlite::versions::list_versions(&guard, id) {
-        Ok(versions) => versions
-            .into_iter()
-            .map(|version| {
-                serde_json::json!({
-                    "id": version.id,
-                    "parent_id": version.parent_id,
-                    "origin": version.origin,
-                    "note": version.note,
-                    "created_at": version.created_at,
-                    "section_count": version.section_count,
-                })
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+async fn diff_history_versions(state: &AppState, id: i64) -> Result<Vec<serde_json::Value>, String> {
+    let versions = with_diff_history(state, id, |connection| {
+        crate::native::sqlite::versions::list_versions(connection, id)
+    }).await?.unwrap_or_default();
+    Ok(versions.into_iter().map(|version| serde_json::json!({
+        "id": version.id,
+        "parent_id": version.parent_id,
+        "origin": version.origin,
+        "note": version.note,
+        "created_at": version.created_at,
+        "section_count": version.section_count,
+    })).collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1615,16 +1636,20 @@ pub struct DiffHistoryQuery {
 
 // GET /api/diff_history?id=N — P4b version history (newest first).
 pub async fn api_diff_history(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<DiffHistoryQuery>,
 ) -> Json<serde_json::Value> {
     let Some(id) = params.id else {
         return serde_json::json!({ "success": false, "message": "id is required" }).into();
     };
+    let versions = match diff_history_versions(&state, id).await {
+        Ok(versions) => versions,
+        Err(error) => return serde_json::json!({ "success": false, "message": error }).into(),
+    };
     serde_json::json!({
         "success": true,
         "id": id,
-        "versions": diff_history_versions(id),
+        "versions": versions,
     })
     .into()
 }
@@ -1637,27 +1662,25 @@ pub struct DiffShowQuery {
 
 // GET /api/diff_show?id=N&version=V — stored unified diff for one version.
 pub async fn api_diff_show(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<DiffShowQuery>,
 ) -> Json<serde_json::Value> {
     let (Some(id), Some(version_id)) = (params.id, params.version) else {
         return serde_json::json!({ "success": false, "message": "id and version are required" })
             .into();
     };
-    let Some(conn) = diff_history_conn() else {
-        return serde_json::json!({ "success": false, "message": "SQLite backend is not active" })
-            .into();
-    };
-    let guard = conn.lock();
-    match crate::native::sqlite::versions::version_diff(&guard, id, version_id) {
-        Ok(Some(diff)) => serde_json::json!({
+    match with_diff_history(&state, id, |connection| {
+        crate::native::sqlite::versions::version_diff(connection, id, version_id)
+    }).await {
+        Ok(None) => serde_json::json!({ "success": false, "message": "SQLite backend is not active" }).into(),
+        Ok(Some(Some(diff))) => serde_json::json!({
             "success": true,
             "id": id,
             "version": version_id,
             "diff": diff,
         })
         .into(),
-        Ok(None) => serde_json::json!({
+        Ok(Some(None)) => serde_json::json!({
             "success": false,
             "message": format!("バージョン{version_id}の差分はありません"),
         })
@@ -2088,7 +2111,10 @@ pub async fn api_update_by_tag(
     // Snapshot current matching novel IDs before queuing, then run through the
     // same update worker path used by normal selected-ID updates.
     let server_sort_state = current_web_update_sort_state();
-    let mut records = state.services.library.records().await.unwrap_or_default();
+    let mut records = match state.services.library.records().await {
+        Ok(records) => records,
+        Err(error) => return serde_json::json!({ "success": false, "message": error.to_string() }).into(),
+    };
     crate::application::attribute_tags::project(
         &mut records,
         crate::application::attribute_tags::enabled(&state.services.settings).await,
@@ -2168,7 +2194,10 @@ pub async fn api_taginfo(
             _ => None,
         })
         .collect();
-    let mut records = state.services.library.records().await.unwrap_or_default();
+    let mut records = match state.services.library.records().await {
+        Ok(records) => records,
+        Err(error) => return serde_json::json!({ "success": false, "message": error.to_string() }).into(),
+    };
     crate::application::attribute_tags::project(
         &mut records,
         crate::application::attribute_tags::enabled(&state.services.settings).await,

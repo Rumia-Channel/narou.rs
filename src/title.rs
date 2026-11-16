@@ -39,38 +39,52 @@ pub fn project_title(raw_title: &str, strip_prefix: bool) -> String {
 /// Native-only: rewrites the stored record and renames generated output files
 /// on disk after a title-prefix setting change.
 #[cfg(feature = "native-runtime")]
-pub fn sync_title_projection(id: i64) -> Result<()> {
+pub fn sync_title_projection(write: &crate::application::novel_access::NovelWriteGuard, id: i64) -> Result<()> {
     let novels = crate::native::novel_repository::NativeNovelRepository::new();
     let record = novels
-        .get_sync(id.into())?
+        .get_current_sync(id.into())?
         .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
-    let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-        .unwrap_or_else(|_| std::path::PathBuf::from(crate::downloader::ARCHIVE_ROOT_DIR));
-    let previous_dir = crate::db::existing_novel_dir_for_record(&archive_root, &record);
+    let previous_dir = crate::native::materialization::directory_for_origin(write)?;
+    let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+    if write.prefix().as_ref() != keys.prefix().as_ref() { return Err(NarouError::Platform("title projection changed its operation origin".into())); }
     let raw_title = record.raw_title().to_string();
-    let settings = crate::converter::settings::NovelSettings::load_for_novel(
-        id,
-        &raw_title,
-        &record.author,
-        &previous_dir,
-    );
+    let (_snapshot, settings) = crate::native::materialization::conversion_snapshot_with_origin(
+        &previous_dir, write, Some(&[]), |path| {
+            let settings = crate::converter::settings::NovelSettings::load_for_novel(id, &raw_title, &record.author, path)?;
+            Ok((settings, crate::native::materialization::ConversionInputSelection { illustrations: false, cover: false }))
+        },
+    )?;
     if !settings.enable_strip_title_prefix && !record.has_raw_title() {
         return Ok(());
     }
 
     let display_title = project_title(&raw_title, settings.enable_strip_title_prefix);
-    let mut projected = record.clone();
-    projected.title = display_title.clone();
-    projected.set_raw_title(raw_title);
-
-    novels.apply_batch_sync(vec![crate::platform::NovelMutation::Upsert(projected)])?;
-    rename_projected_outputs(&previous_dir, &record.author, &record.title, &display_title)?;
-
-    if let Some(mut toc) = crate::native::legacy_persistence::load_toc_file(&previous_dir)
-        && toc.title != display_title {
-            toc.title = display_title;
-            crate::native::legacy_persistence::save_toc_file(&previous_dir, &toc)?;
+    novels.update_existing_guarded_sync(write.fence(), id.into(), |current| {
+        if current.raw_title() != record.raw_title() || current.title != record.title {
+            return Err(NarouError::Platform("novel_busy: title changed during projection".into()));
         }
+        current.title = display_title.clone();
+        current.set_raw_title(raw_title);
+        Ok(())
+    })?;
+    rename_projected_outputs(&write, &previous_dir, &record.author, &record.title, &display_title)?;
+    crate::native::materialization::block_on(async {
+        let stores = crate::native::object_store::NativeStores::for_current_root()?;
+        let mut lease = crate::application::novel_access::NovelReadLease::admit_for(&stores.objects, &keys, "title-projection").await?;
+        let result = async {
+            if lease.epoch() != write.epoch() { return Err(NarouError::Platform("title projection origin changed".into())); }
+            if let Some(bytes) = lease.read_small(&keys.toc()).await? {
+                let mut toc: crate::downloader::TocFile = serde_yaml::from_slice(&bytes)?;
+                if toc.title != display_title {
+                    toc.title = display_title;
+                    write.write_small(&keys.toc(), crate::downloader::persistence::serialize_toc(&toc)?.into_bytes()).await?;
+                }
+            }
+            Ok(())
+        }.await;
+        let released = lease.release().await;
+        result.and(released)
+    })?;
     Ok(())
 }
 
@@ -78,27 +92,33 @@ pub fn sync_title_projection(id: i64) -> Result<()> {
 /// when the projected title changes. Worker builds have no generated files.
 #[cfg(feature = "native-runtime")]
 pub fn rename_projected_outputs(
-    novel_dir: &Path,
-    author: &str,
-    previous_title: &str,
-    current_title: &str,
+    write: &crate::application::novel_access::NovelWriteGuard,
+    _novel_dir: &Path, author: &str, previous_title: &str, current_title: &str,
 ) -> Result<()> {
-    if previous_title == current_title || !novel_dir.exists() {
-        return Ok(());
-    }
+    if previous_title == current_title { return Ok(()); }
+    let stores = crate::native::object_store::NativeStores::for_current_root()?;
     let previous_base = crate::converter::output::default_output_basename(author, previous_title);
     let current_base = crate::converter::output::default_output_basename(author, current_title);
-    for suffix in [".txt", ".epub", ".mobi", ".kepub.epub", ".zip"] {
-        let previous = novel_dir.join(format!("{previous_base}{suffix}"));
-        if !previous.exists() {
-            continue;
-        }
-        let current = novel_dir.join(format!("{current_base}{suffix}"));
-        if !current.exists() {
-            std::fs::rename(previous, current)?;
-        }
-    }
-    Ok(())
+    crate::native::materialization::block_on(async {
+        let mut lease = crate::application::novel_access::NovelReadLease::admit(
+            &stores.objects, write.prefix(), "title-output-rename",
+        ).await?;
+        let result = async {
+            let prefix = crate::platform::ObjectKey::try_new(write.prefix().as_ref())?;
+            for suffix in [".txt", ".epub", ".mobi", ".kepub.epub", ".zip"] {
+                let old = prefix.join(&format!("{previous_base}{suffix}"))?;
+                let new = prefix.join(&format!("{current_base}{suffix}"))?;
+                if stores.objects.stat(&new).await?.is_some() { continue; }
+                if let Some(stream) = lease.open_all(&old).await? {
+                    write.write_stream(&new, stream).await?;
+                    write.delete(&old).await?;
+                }
+            }
+            Ok(())
+        }.await;
+        let released = lease.release().await;
+        result.and(released)
+    })
 }
 
 #[cfg(test)]
@@ -152,8 +172,7 @@ mod tests {
             "epub",
         )
         .unwrap();
-        crate::native::legacy_persistence::save_toc_file(
-            &raw_dir,
+        std::fs::write(raw_dir.join("toc.yaml"), serde_yaml::to_string(
             &TocFile {
                 title: "【書籍化】作品名".to_string(),
                 author: "author".to_string(),
@@ -162,7 +181,7 @@ mod tests {
                 subtitles: Vec::new(),
                 novel_type: Some(1),
             },
-        )
+        ).unwrap())
         .unwrap();
 
         let record: NovelRecord = serde_yaml::from_str(
@@ -185,7 +204,8 @@ last_update: 2026-04-20 00:00:00.000000000 +09:00
         drop(slot);
         let _db_guard = DatabaseGuard(previous);
 
-        sync_title_projection(1).unwrap();
+        let write = crate::native::materialization::capture_write_for_id(1).unwrap();
+        sync_title_projection(&write, 1).unwrap();
 
         let projected = db::with_database(|db| Ok(db.get(1).cloned().unwrap())).unwrap();
         assert_eq!(projected.title, "作品名");
@@ -205,7 +225,7 @@ last_update: 2026-04-20 00:00:00.000000000 +09:00
                 .join("[author] 【書籍化】作品名.epub")
                 .exists()
         );
-        let toc = crate::native::legacy_persistence::load_toc_file(&raw_dir).unwrap();
+        let toc: TocFile = serde_yaml::from_slice(&std::fs::read(raw_dir.join("toc.yaml")).unwrap()).unwrap();
         assert_eq!(toc.title, "作品名");
 
         std::fs::write(
@@ -213,7 +233,8 @@ last_update: 2026-04-20 00:00:00.000000000 +09:00
             "enable_strip_title_prefix=false\n",
         )
         .unwrap();
-        sync_title_projection(1).unwrap();
+        let write = crate::native::materialization::capture_write_for_id(1).unwrap();
+        sync_title_projection(&write, 1).unwrap();
 
         let restored = db::with_database(|db| Ok(db.get(1).cloned().unwrap())).unwrap();
         assert_eq!(restored.title, "【書籍化】作品名");
@@ -221,7 +242,7 @@ last_update: 2026-04-20 00:00:00.000000000 +09:00
         assert!(raw_dir.exists());
         assert!(!projected_dir.exists());
         assert!(raw_dir.join("[author] 【書籍化】作品名.epub").exists());
-        let toc = crate::native::legacy_persistence::load_toc_file(&raw_dir).unwrap();
+        let toc: TocFile = serde_yaml::from_slice(&std::fs::read(raw_dir.join("toc.yaml")).unwrap()).unwrap();
         assert_eq!(toc.title, "【書籍化】作品名");
     }
 }

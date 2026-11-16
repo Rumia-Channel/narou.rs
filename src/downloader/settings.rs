@@ -55,11 +55,10 @@ pub trait DownloaderSettings: Send + Sync {
         true
     }
 
-    /// Whether the novel's `setting.ini` strips bracketed title prefixes
-    /// (`enable_strip_title_prefix`). Worker: no converter settings on disk,
-    /// so `false`.
-    fn strip_title_prefix_for(&self, _novel_id: i64, _raw_title: &str, _author: &str) -> bool {
-        false
+    /// Native title policy receives only original-lease per-novel INI, never a
+    /// filesystem path. Worker keeps its preloaded policy (default `false`).
+    fn strip_title_prefix_for(&self, _novel_id: i64, _raw_title: &str, _author: &str, _ini: Option<&crate::converter::ini::IniData>) -> Result<bool> {
+        Ok(false)
     }
 
     /// Load the section hash cache used by strong-update comparison. Worker:
@@ -275,28 +274,16 @@ impl DownloaderSettings for NativeDownloaderSettings {
             .any(|value| value == "nosave_diff")
     }
 
-    fn strip_title_prefix_for(&self, novel_id: i64, raw_title: &str, author: &str) -> bool {
-        let previous_novel_dir = crate::db::with_database(|db| {
-            Ok(db.get(novel_id).map(|record| {
-                crate::db::existing_novel_dir_for_record(
-                    std::path::Path::new(crate::downloader::types::ARCHIVE_ROOT_DIR),
-                    record,
-                )
-            }))
-        })
-        .ok()
-        .flatten();
-        let settings_dir = previous_novel_dir.unwrap_or_else(|| {
-            std::path::PathBuf::from(crate::downloader::types::ARCHIVE_ROOT_DIR)
-                .join(".new-novel-settings")
-        });
-        crate::converter::settings::NovelSettings::load_for_novel(
-            novel_id,
-            raw_title,
-            author,
-            &settings_dir,
-        )
-        .enable_strip_title_prefix
+    fn strip_title_prefix_for(&self, novel_id: i64, raw_title: &str, author: &str, ini: Option<&crate::converter::ini::IniData>) -> Result<bool> {
+        let defaults;
+        let ini = match ini {
+            Some(ini) => ini,
+            None => { defaults = crate::converter::ini::IniData::new(); &defaults }
+        };
+        let settings = crate::db::settings::load(crate::setting_core::SettingScope::Local)?;
+        Ok(crate::converter::settings::NovelSettings::from_sources(
+            Some(novel_id), raw_title, author, ini, &settings, false, false,
+        ).enable_strip_title_prefix)
     }
 
     fn load_section_hash_cache(&self) -> HashMap<String, HashMap<String, String>> {

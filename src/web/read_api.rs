@@ -130,29 +130,31 @@ pub async fn novels(
         Err(error_value) => return application_error(error_value),
     };
     let hidden = crate::native::hidden::load().unwrap_or_default();
-    match state
-        .services
-        .external_api
-        .list(&request, Some(hidden))
-        .await
-    {
+    let mut reads = state.services.content.read_scope("read-api-list");
+    let result = state.services.external_api.list(&mut reads, &request, Some(hidden)).await;
+    let response = match result {
         Ok(list) => Json(list.to_json()).into_response(),
         Err(error_value) => application_error(error_value),
-    }
+    };
+    super::novels::leased_response(response, reads)
 }
 
 pub async fn novel(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    match state.services.external_api.novel(id).await {
+    let mut reads = state.services.content.read_scope("read-api-novel");
+    let result = state.services.external_api.novel(&mut reads, id).await;
+    let response = match result {
         Ok(novel) => Json(novel).into_response(),
         Err(error_value) => application_error(error_value),
-    }
+    };
+    super::novels::leased_response(response, reads)
 }
 
 pub async fn epub(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    let record = match state.services.library.get(NovelId(id)).await {
+    let mut reads = state.services.content.read_scope("read-api-epub");
+    let record = match state.services.content.read_record(&mut reads, NovelId(id)).await {
         Ok(Some(record)) => record,
-        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "Novel not found"),
-        Err(error_value) => return application_error(error_value),
+        Ok(None) => { let _ = reads.release_all().await; return error(StatusCode::NOT_FOUND, "not_found", "Novel not found"); }
+        Err(error_value) => { let _ = reads.release_all().await; return application_error(error_value); }
     };
     let novel_dir = match crate::db::with_database(|db| {
         super::safe_existing_novel_dir(db.archive_root(), &record)
@@ -160,6 +162,7 @@ pub async fn epub(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
     }) {
         Ok(dir) => dir,
         Err(error_value) => {
+            let _ = reads.release_all().await;
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -167,8 +170,9 @@ pub async fn epub(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
             );
         }
     };
-    match super::novels::serve_epub(&state, id, &record, &novel_dir).await {
+    let response = match super::novels::serve_epub(&state, &mut reads, id, &record, &novel_dir).await {
         Ok(response) => response,
         Err((status, message)) => error(status, "internal_error", &message),
-    }
+    };
+    super::novels::leased_response(response, reads)
 }

@@ -92,6 +92,26 @@ fn store(http: Arc<Transport>) -> S3Store {
 }
 
 #[test]
+fn transfer_stream_range_uses_one_get_and_bounded_output(){
+    struct Ranges{calls:AtomicUsize}
+    impl HttpClient for Ranges{
+        fn send<'a>(&'a self,_:HttpRequest)->PlatformFuture<'a,Result<HttpResponse>>{Box::pin(async{Err(NarouError::Platform("unexpected buffered request".into()))})}
+        fn send_stream<'a>(&'a self,request:HttpRequest)->PlatformFuture<'a,Result<HttpStreamResponse>>{Box::pin(async move{
+            self.calls.fetch_add(1,Ordering::SeqCst);assert_eq!(request.header("range"),Some("bytes=1048576-9437183"));
+            Ok(HttpStreamResponse{status:206,url:request.url,headers:vec![("content-range".into(),"bytes 1048576-9437183/10485760".into()),("content-length".into(),"8388608".into())],
+                body:Box::pin(futures::stream::iter((0..16).map(|_|Ok(vec![7;512*1024]))))})
+        })}
+    }
+    futures::executor::block_on(async{
+        let transport=Arc::new(Ranges{calls:AtomicUsize::new(0)});
+        let store=S3Store::new(S3StoreConfig{endpoint:"https://s3.example.com".into(),bucket:"bucket".into(),region:"test".into(),prefix:String::new(),illustration_dedup:false,access_key_id:"test".into(),secret_access_key:"test".into()},transport.clone(),Arc::new(crate::platform::SystemClock)).unwrap();
+        let mut stream=store.read_stream_range(&ObjectKey::try_new("source.bin").unwrap(),1024*1024..9*1024*1024).await.unwrap().unwrap();let mut seen=0;
+        while let Some(chunk)=stream.next().await{let bytes=chunk.unwrap();assert!(bytes.len()<=64*1024);seen+=bytes.len();}
+        assert_eq!(seen,8*1024*1024);assert_eq!(transport.calls.load(Ordering::SeqCst),1);
+    });
+}
+
+#[test]
 fn ignored_range_is_rejected_without_reading_any_body() {
     futures::executor::block_on(async {
         let transport = Arc::new(Transport::default());

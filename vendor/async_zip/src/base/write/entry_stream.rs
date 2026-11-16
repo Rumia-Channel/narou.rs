@@ -246,8 +246,15 @@ impl<'b, W: AsyncWrite + Unpin> EntryStreamWriter<'b, W> {
 
         inner_writer.write_all(&crate::spec::consts::DATA_DESCRIPTOR_SIGNATURE.to_le_bytes()).await?;
         inner_writer.write_all(&self.entry.crc32.to_le_bytes()).await?;
-        inner_writer.write_all(&cdr_compressed_size.to_le_bytes()).await?;
-        inner_writer.write_all(&cdr_uncompressed_size.to_le_bytes()).await?;
+        // ZIP64 descriptors contain actual 64-bit lengths, not the
+        // 0xffffffff sentinels used by the central directory fields.
+        if self.force_no_zip64 {
+            inner_writer.write_all(&cdr_compressed_size.to_le_bytes()).await?;
+            inner_writer.write_all(&cdr_uncompressed_size.to_le_bytes()).await?;
+        } else {
+            inner_writer.write_all(&compressed_size.to_le_bytes()).await?;
+            inner_writer.write_all(&self.entry.uncompressed_size.to_le_bytes()).await?;
+        }
 
         let comment_basic = self.entry.comment().alternative().unwrap_or_else(|| self.entry.comment().as_bytes());
 

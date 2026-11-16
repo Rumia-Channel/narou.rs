@@ -20,6 +20,9 @@ pub struct NovelSettings {
     pub title: Option<String>,
     pub archive_path: PathBuf,
     pub replace_patterns: Vec<(String, String)>,
+    #[cfg(feature = "native-runtime")]
+    #[serde(skip)]
+    pub(crate) native_read_origin: Option<crate::application::novel_access::AccessOrigin>,
 
     pub enable_yokogaki: bool,
     pub enable_inspect: bool,
@@ -78,6 +81,8 @@ impl Default for NovelSettings {
             title: None,
             archive_path: PathBuf::new(),
             replace_patterns: Vec::new(),
+            #[cfg(feature = "native-runtime")]
+            native_read_origin: None,
 
             enable_yokogaki: false,
             enable_inspect: false,
@@ -136,7 +141,7 @@ impl NovelSettings {
         novel_title: &str,
         novel_author: &str,
         archive_path: &Path,
-    ) -> Self {
+    ) -> crate::error::Result<Self> {
         Self::load_for_novel_with_options(
             novel_id,
             novel_title,
@@ -199,24 +204,17 @@ impl NovelSettings {
         archive_path: &Path,
         ignore_force: bool,
         ignore_default: bool,
-    ) -> Self {
-        let replace_path = archive_path.join("replace.txt");
-
-        let ini = crate::native::converter::load_novel_ini(archive_path).unwrap_or_default();
-
-        let data = crate::db::settings::load(SettingScope::Local).unwrap_or_default();
-        let mut settings = Self::from_sources(
-            Some(novel_id),
-            novel_title,
-            novel_author,
-            &ini,
-            &data,
-            ignore_force,
-            ignore_default,
-        );
+    ) -> crate::error::Result<Self> {
+        let (mut settings, origin) = crate::native::converter::with_novel_settings_input(novel_id, archive_path, |input| {
+            let ini = IniData::load_file(&input.join("setting.ini"))?;
+            let data = crate::db::settings::load(SettingScope::Local)?;
+            let mut settings = Self::from_sources(Some(novel_id), novel_title, novel_author, &ini, &data, ignore_force, ignore_default);
+            settings.replace_patterns = load_replace_patterns_with_global(&input.join("replace.txt"), input)?;
+            Ok(settings)
+        })?;
         settings.archive_path = archive_path.to_path_buf();
-        settings.replace_patterns = load_replace_patterns_with_global(&replace_path, archive_path);
-        settings
+        settings.native_read_origin = origin;
+        Ok(settings)
     }
 
     /// Derive the generated-artifact title without mutating the stored setting values.
@@ -235,23 +233,24 @@ impl NovelSettings {
         source_name: &str,
         ignore_force: bool,
         ignore_default: bool,
-    ) -> Self {
+    ) -> crate::error::Result<Self> {
+        crate::application::novel_access::require_private_path(archive_path)?;
         let ini_path = archive_path.join("setting.ini");
         let replace_path = archive_path.join("replace.txt");
 
-        let ini = IniData::load_file(&ini_path).unwrap_or_default();
+        let ini = IniData::load_file(&ini_path)?;
 
         let mut settings = Self {
             title: Some(source_name.to_string()),
             author: Some(String::new()),
             archive_path: archive_path.to_path_buf(),
-            replace_patterns: load_replace_patterns_with_global(&replace_path, archive_path),
+            replace_patterns: load_replace_patterns_with_global(&replace_path, archive_path)?,
             ..Self::default()
         };
 
         settings = Self::apply_ini_defaults(&settings, &ini);
-        settings =
-            Self::apply_force_and_default_settings(&settings, ignore_force, ignore_default, &ini);
+        let data = crate::db::settings::load(SettingScope::Local)?;
+        settings = Self::apply_force_and_default_settings_from(&settings, ignore_force, ignore_default, &data, &ini);
 
         if settings.novel_title.is_empty() {
             settings.novel_title = source_name.to_string();
@@ -260,7 +259,7 @@ impl NovelSettings {
             settings.novel_author = String::new();
         }
 
-        settings
+        Ok(settings)
     }
 
     fn apply_ini_defaults(settings: &Self, ini: &IniData) -> Self {
@@ -338,24 +337,6 @@ impl NovelSettings {
             .is_some_and(|value| Self::get_setting_as_ini(ini_settings, key) == *value)
     }
 
-    #[cfg(feature = "native-runtime")]
-    fn apply_force_and_default_settings(
-        settings: &Self,
-        ignore_force: bool,
-        ignore_default: bool,
-        ini: &IniData,
-    ) -> Self {
-        let Ok(data) = crate::db::settings::load(SettingScope::Local) else {
-            return settings.clone();
-        };
-        Self::apply_force_and_default_settings_from(
-            settings,
-            ignore_force,
-            ignore_default,
-            &data,
-            ini,
-        )
-    }
 
     fn get_setting_as_ini(s: &Self, key: &str) -> IniValue {
         match key {
@@ -1110,47 +1091,47 @@ pub fn parse_replace_patterns(content: &str) -> Vec<(String, String)> {
 }
 
 #[cfg(feature = "native-runtime")]
-pub fn load_replace_patterns(path: &Path) -> Vec<(String, String)> {
-    if !path.exists() {
-        return Vec::new();
-    }
+pub fn load_replace_patterns(path: &Path) -> crate::error::Result<Vec<(String, String)>> {
+    crate::application::novel_access::require_private_path(path)?;
     let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
     };
-    parse_replace_patterns(&content)
+    Ok(parse_replace_patterns(&content))
 }
 
 #[cfg(feature = "native-runtime")]
 fn load_replace_patterns_with_global(
     local_path: &Path,
     archive_path: &Path,
-) -> Vec<(String, String)> {
-    let mut patterns = load_replace_patterns(local_path);
-    let Some(root) = find_narou_root_from(archive_path) else {
-        return patterns;
-    };
+) -> crate::error::Result<Vec<(String, String)>> {
+    let mut patterns = load_replace_patterns(local_path)?;
+    let Some(root) = find_narou_root_from(archive_path)? else { return Ok(patterns); };
     let global_path = root.join("replace.txt");
-    if global_path != local_path {
-        patterns.extend(load_replace_patterns(&global_path));
-    }
-    patterns
+    if global_path != local_path { patterns.extend(load_replace_patterns(&global_path)?); }
+    Ok(patterns)
 }
 
 #[cfg(feature = "native-runtime")]
-fn find_narou_root_from(start: &Path) -> Option<PathBuf> {
-    let mut current = if start.is_file() {
-        start.parent()?.to_path_buf()
-    } else {
-        start.to_path_buf()
+fn find_narou_root_from(start: &Path) -> crate::error::Result<Option<PathBuf>> {
+    let mut current = match fs::metadata(start) {
+        Ok(metadata) if metadata.is_file() => match start.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => return Ok(None),
+        },
+        Ok(_) => start.to_path_buf(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => start.to_path_buf(),
+        Err(error) => return Err(error.into()),
     };
     loop {
-        if current.join(".narou").is_dir() {
-            return Some(current);
+        match fs::metadata(current.join(".narou")) {
+            Ok(metadata) if metadata.is_dir() => return Ok(Some(current)),
+            Ok(_) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
         }
-        if !current.pop() {
-            return None;
-        }
+        if !current.pop() { return Ok(None); }
     }
 }
 
@@ -1207,7 +1188,7 @@ mod tests {
         // 一時ディレクトリに溜まらない。
         let root_dir = tempfile::tempdir().unwrap();
         let root = root_dir.path();
-        let archive_path = root.join("小説データ").join("test-novel");
+        let archive_path = root.join("settings-input");
         std::fs::create_dir_all(root.join(".narou")).unwrap();
         std::fs::create_dir_all(&archive_path).unwrap();
         std::fs::write(
@@ -1218,7 +1199,7 @@ mod tests {
 
         let settings = {
             let _guard = crate::test_support::set_current_dir_for_test(&archive_path);
-            NovelSettings::load_for_novel(1, "title", "author", &archive_path)
+            NovelSettings::load_for_novel(1, "title", "author", &archive_path).unwrap()
         };
 
         assert!(settings.enable_inspect);
@@ -1238,7 +1219,7 @@ mod tests {
         // 一時ディレクトリに溜まらない。
         let root_dir = tempfile::tempdir().unwrap();
         let root = root_dir.path();
-        let archive_path = root.join("小説データ").join("test-novel");
+        let archive_path = root.join("settings-input");
         std::fs::create_dir_all(root.join(".narou")).unwrap();
         std::fs::create_dir_all(&archive_path).unwrap();
         std::fs::write(root.join(".narou").join("storage-backend"), "sqlite\n").unwrap();
@@ -1268,7 +1249,7 @@ mod tests {
 
         {
             let _guard = crate::test_support::set_current_dir_for_test(&archive_path);
-            let settings = NovelSettings::load_for_novel(1, "title", "author", &archive_path);
+            let settings = NovelSettings::load_for_novel(1, "title", "author", &archive_path).unwrap();
             assert!(settings.enable_yokogaki);
             assert!(!settings.enable_illust);
             assert!(settings.enable_add_date_to_title);
@@ -1288,7 +1269,7 @@ mod tests {
 
         {
             let _guard = crate::test_support::set_current_dir_for_test(&archive_path);
-            let forced = NovelSettings::load_for_novel(1, "title", "author", &archive_path);
+            let forced = NovelSettings::load_for_novel(1, "title", "author", &archive_path).unwrap();
             assert!(!forced.enable_yokogaki);
             assert!(forced.enable_illust);
             assert!(!forced.enable_add_date_to_title);
@@ -1300,7 +1281,7 @@ mod tests {
                 &archive_path,
                 true,
                 false,
-            );
+            ).unwrap();
             assert!(no_force.enable_yokogaki);
             assert!(!no_force.enable_illust);
             assert!(no_force.enable_add_date_to_title);
@@ -1312,7 +1293,7 @@ mod tests {
     fn load_for_novel_with_options_ignores_force_and_default_settings() {
         let root_dir = tempfile::tempdir().unwrap();
         let root = root_dir.path();
-        let archive_path = root.join("小説データ").join("test-novel");
+        let archive_path = root.join("settings-input");
         std::fs::create_dir_all(root.join(".narou")).unwrap();
         std::fs::create_dir_all(&archive_path).unwrap();
         std::fs::write(
@@ -1331,7 +1312,7 @@ mod tests {
                     &archive_path,
                     false,
                     true,
-                ),
+                ).unwrap(),
                 NovelSettings::load_for_novel_with_options(
                     1,
                     "title",
@@ -1339,7 +1320,7 @@ mod tests {
                     &archive_path,
                     true,
                     false,
-                ),
+                ).unwrap(),
             )
         };
 
@@ -1352,13 +1333,13 @@ mod tests {
     fn load_for_novel_appends_global_replace_patterns_after_local_patterns() {
         let root_dir = tempfile::tempdir().unwrap();
         let root = root_dir.path();
-        let archive_path = root.join("小説データ").join("test-novel");
+        let archive_path = root.join("settings-input");
         std::fs::create_dir_all(root.join(".narou")).unwrap();
         std::fs::create_dir_all(&archive_path).unwrap();
         std::fs::write(root.join("replace.txt"), "GLOBAL\tglobal\n").unwrap();
         std::fs::write(archive_path.join("replace.txt"), "LOCAL\tlocal\n").unwrap();
 
-        let settings = NovelSettings::load_for_novel(1, "title", "author", &archive_path);
+        let settings = NovelSettings::load_for_novel(1, "title", "author", &archive_path).unwrap();
 
         assert_eq!(
             settings.replace_patterns,
@@ -1369,4 +1350,29 @@ mod tests {
         );
 
     }
+    #[test]
+    fn native_settings_reject_private_ini_read_failure_instead_of_defaulting() {
+        let root = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(root.path());
+        std::fs::create_dir(root.path().join(".narou")).unwrap();
+        let input = root.path().join("settings-input");
+        std::fs::create_dir_all(input.join("setting.ini")).unwrap();
+        assert!(NovelSettings::load_for_novel(1, "title", "author", &input).is_err());
+        assert!(NovelSettings::create_for_text_file_with_options(&input, "source.txt", false, false).is_err());
+    }
+
+    #[test]
+    fn standalone_text_settings_propagate_local_settings_io_errors() {
+        let libraries = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-libraries");
+        std::fs::create_dir_all(&libraries).unwrap();
+        let root = tempfile::Builder::new().prefix("text-settings-io-").tempdir_in(libraries).unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(root.path());
+        let _database = crate::test_support::isolate_database_for_test();
+        std::fs::create_dir_all(root.path().join(".narou/local_setting.yaml")).unwrap();
+        let input = root.path().join("settings-input");
+        std::fs::create_dir(&input).unwrap();
+        let error = NovelSettings::create_for_text_file_with_options(&input, "source.txt", false, false).unwrap_err();
+        assert!(matches!(error, crate::error::NarouError::Io(_)), "{error}");
+    }
+
 }

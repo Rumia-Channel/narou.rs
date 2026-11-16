@@ -119,6 +119,9 @@ pub struct StoreMigrationState {
     pub planned: u64,
     /// `plan` が数えた対象の合計バイト数。
     pub planned_bytes: u64,
+    /// 対象キーが immutable remote reference で直接コピーできず読み飛ばした件数。
+    #[serde(default)]
+    pub skipped: u64,
     pub failed: Vec<String>,
     pub done: bool,
 }
@@ -132,6 +135,12 @@ impl StoreMigrationState {
 
     pub fn record_verified(&mut self, key: &str) {
         self.verified += 1;
+        self.failed.retain(|entry| !entry.starts_with(key));
+    }
+
+    /// 対象キーが immutable remote reference のため読み飛ばしたことを記録する。
+    pub fn record_skip(&mut self, key: &str) {
+        self.skipped += 1;
         self.failed.retain(|entry| !entry.starts_with(key));
     }
 
@@ -190,7 +199,7 @@ pub async fn migrate_page(
         "copy" => {
             for window in io_windows(&sizes) {
                 let slice = &targets[window.start..window.end];
-                copy_window(from_assets, to_assets, slice, window.width(), state).await?;
+                copy_window(from_objects, from_assets, to_assets, slice, window.width(), state).await?;
             }
         }
         _ => {
@@ -210,6 +219,9 @@ pub async fn migrate_page(
 enum CopyOutcome {
     Copied,
     MissingInSource,
+    /// The source key resolves to an immutable remote reference: canonical
+    /// bytes are not migratable local bytes, so the key is skipped.
+    RemoteReferenced,
 }
 
 /// ウィンドウ内の対象を `width` 並行でコピーし、結果をキー順に記録する。
@@ -217,6 +229,7 @@ enum CopyOutcome {
 /// 途中で失敗したキー以降の結果は記録しない (再開時に同じページをやり直せ
 /// る)。並行していても記録の順序は一覧順で決定的。
 async fn copy_window(
+    from_objects: &Arc<dyn ObjectStore>,
     from_assets: &Arc<dyn AssetStore>,
     to_assets: &Arc<dyn AssetStore>,
     targets: &[&ObjectMetadata],
@@ -226,10 +239,11 @@ async fn copy_window(
     let results: Vec<(super::ObjectKey, Result<CopyOutcome>)> = stream::iter(
         targets.iter().map(|metadata| {
             let key = metadata.key.clone();
+            let from_objects = Arc::clone(from_objects);
             let from_assets = Arc::clone(from_assets);
             let to_assets = Arc::clone(to_assets);
             async move {
-                let outcome = copy_object(&from_assets, &to_assets, &key).await;
+                let outcome = copy_object(&from_objects, &from_assets, &to_assets, &key).await;
                 (key, outcome)
             }
         }),
@@ -241,6 +255,7 @@ async fn copy_window(
     for (key, outcome) in results {
         match outcome? {
             CopyOutcome::Copied => state.record_copy(key.as_ref()),
+            CopyOutcome::RemoteReferenced => state.record_skip(key.as_ref()),
             CopyOutcome::MissingInSource => {
                 state.record_failure(format!("{}: missing in the source", key.as_ref()))
             }
@@ -254,6 +269,7 @@ async fn copy_window(
 /// 途中で切れたストリームは `write_stream` がエラーにするので、部分コピーを
 /// 成功として数えない。
 async fn copy_object(
+    from_objects: &Arc<dyn ObjectStore>,
     from_assets: &Arc<dyn AssetStore>,
     to_assets: &Arc<dyn AssetStore>,
     key: &super::ObjectKey,
@@ -263,8 +279,18 @@ async fn copy_object(
             to_assets.write_stream(key, stream).await?;
             Ok(CopyOutcome::Copied)
         }
+        // A canonical-local-only source answers `None` for both missing keys
+        // and immutable remote references; only the former is a failure.
+        None if from_objects.is_remote_reference(key).await? => Ok(CopyOutcome::RemoteReferenced),
         None => Ok(CopyOutcome::MissingInSource),
     }
+}
+
+/// 突き合わせ結果。リモート参照キーは比較対象外として読み飛ばす。
+enum VerifyOutcome {
+    Verified,
+    Skipped,
+    Failed(String),
 }
 
 /// ウィンドウ内の対象を `width` 並行で突き合わせ、結果をキー順に記録する。
@@ -275,7 +301,7 @@ async fn verify_window(
     width: usize,
     state: &mut StoreMigrationState,
 ) -> Result<()> {
-    let results: Vec<(super::ObjectKey, Result<std::result::Result<(), String>>)> = stream::iter(
+    let results: Vec<(super::ObjectKey, Result<VerifyOutcome>)> = stream::iter(
         targets.iter().map(|metadata| {
             let key = metadata.key.clone();
             let listed_size = metadata.size;
@@ -293,8 +319,9 @@ async fn verify_window(
 
     for (key, outcome) in results {
         match outcome {
-            Ok(Ok(())) => state.record_verified(key.as_ref()),
-            Ok(Err(reason)) => state.record_failure(reason),
+            Ok(VerifyOutcome::Verified) => state.record_verified(key.as_ref()),
+            Ok(VerifyOutcome::Skipped) => state.record_skip(key.as_ref()),
+            Ok(VerifyOutcome::Failed(reason)) => state.record_failure(reason),
             Err(error) => state.record_failure(format!("{}: {error}", key.as_ref())),
         }
     }
@@ -312,9 +339,9 @@ async fn verify_object(
     to: &Arc<dyn ObjectStore>,
     key: &super::ObjectKey,
     listed_size: u64,
-) -> Result<std::result::Result<(), String>> {
+) -> Result<VerifyOutcome> {
     if listed_size > VERIFY_CAP {
-        return Ok(Err(format!("{}: exceeds the {VERIFY_CAP} byte verify cap", key.as_ref())));
+        return Ok(VerifyOutcome::Failed(format!("{}: exceeds the {VERIFY_CAP} byte verify cap", key.as_ref())));
     }
     let (source, target) = if is_small_known(listed_size) {
         let (source, target) = futures::join!(from.read_small(key), to.read_small(key));
@@ -325,15 +352,15 @@ async fn verify_object(
     match (source, target) {
         (Some(source), Some(target)) => {
             if source.len() as u64 > VERIFY_CAP {
-                return Ok(Err(format!(
+                return Ok(VerifyOutcome::Failed(format!(
                     "{}: exceeds the {VERIFY_CAP} byte verify cap",
                     key.as_ref()
                 )));
             }
             if source == target {
-                Ok(Ok(()))
+                Ok(VerifyOutcome::Verified)
             } else {
-                Ok(Err(format!(
+                Ok(VerifyOutcome::Failed(format!(
                     "{}: content differs (source {} bytes, target {} bytes)",
                     key.as_ref(),
                     source.len(),
@@ -341,8 +368,11 @@ async fn verify_object(
                 )))
             }
         }
-        (Some(_), None) => Ok(Err(format!("{}: missing in the target", key.as_ref()))),
-        (None, _) => Ok(Err(format!("{}: missing in the source", key.as_ref()))),
+        (Some(_), None) => Ok(VerifyOutcome::Failed(format!("{}: missing in the target", key.as_ref()))),
+        // Canonical-local-only sources hide remote references as `None`; they
+        // are not migratable local bytes, so they are skipped not failed.
+        (None, _) if from.is_remote_reference(key).await? => Ok(VerifyOutcome::Skipped),
+        (None, _) => Ok(VerifyOutcome::Failed(format!("{}: missing in the source", key.as_ref()))),
     }
 }
 
@@ -392,12 +422,14 @@ impl IllustrationDedupState {
 /// 対象は hex 名 (`<sha256-hex>.<ext>`) の旧配置だけ。mitemin の `iNNN` 名など
 /// 内容ハッシュでない名前は、index の対応を壊さずには移せないため従来配置を
 /// 保つ (新規取得分は dedup により最初から hex 名になる)。
-pub async fn deduplicate_illustrations_page(
-    s3: &S3Store,
-    action: &str,
-    limit: usize,
-    state: &mut IllustrationDedupState,
-) -> Result<()> {
+
+/// Use an admitted/leased logical source view while the pool destination keeps
+/// its conditional, SHA-checked write-once semantics. Legacy cleanup never
+/// deletes the shared pool or any immutable canonical reference target.
+pub async fn deduplicate_illustrations_page_with_source(
+    s3:&S3Store,source_objects:&dyn ObjectStore,source_assets:&dyn AssetStore,
+    action:&str,limit:usize,state:&mut IllustrationDedupState,
+)->Result<()>{
     if action != "plan" && action != "copy" {
         return Err(NarouError::Platform(format!(
             "unknown illustration dedup action: {action:?}"
@@ -419,7 +451,7 @@ pub async fn deduplicate_illustrations_page(
             Some(cursor) => request.after(cursor.clone()),
             None => request,
         };
-        let page = s3.list_page(&request).await?;
+        let page = source_objects.list_page(&request).await?;
         if page.objects.is_empty() {
             state.done = true;
             break;
@@ -444,26 +476,13 @@ pub async fn deduplicate_illustrations_page(
                 continue;
             }
 
-            let already_pooled = s3.pool_exists(key).await?;
-            if already_pooled {
-                state.already_pooled += 1;
-            } else {
-                let Some(stream) = s3.read_stream(key).await? else {
-                    state.record_failure(format!("{}: source object missing", key.as_ref()));
-                    continue;
-                };
-                if let Err(error) = s3.write_stream(key, stream).await {
-                    state.record_failure(format!(
-                        "{}: pool write failed: {error}",
-                        key.as_ref()
-                    ));
-                    continue;
-                }
-                state.migrated += 1;
-            }
-            // プールに実体があることを確認してから旧配置を消す。delete は
-            // dedup 無効時と同じく旧 `挿絵/` の物理キーだけを指す。
-            if let Err(error) = ObjectStore::delete(s3, key).await {
+            // Existing pools also consume the admitted source and run the
+            // conditional writer's real size/SHA validation, never HEAD reuse.
+            let Some(stream)=source_assets.read_stream(key).await?else{state.record_failure(format!("{}: source object missing",key.as_ref()));continue;};
+            let pool=super::transfer_stage::illustration_pool_key(key)?;let sha=stem.to_ascii_lowercase();
+            let outcome=match s3.write_stream_once(&pool,stream,metadata.size,&sha).await{Ok(outcome)=>outcome,Err(error)=>{state.record_failure(format!("{}: pool write failed: {error}",key.as_ref()));continue;}};
+            match outcome{super::WriteOnce::Written=>state.migrated+=1,super::WriteOnce::Reused=>state.already_pooled+=1}
+            if let Err(error) = source_objects.retire_legacy(key,&pool,metadata.size,&sha).await {
                 state.record_failure(format!("{}: legacy delete failed: {error}", key.as_ref()));
             }
         }
@@ -498,6 +517,15 @@ mod tests {
 
     async fn write(store: &dyn ObjectStore, key: &super::super::ObjectKey, data: &[u8]) {
         store.write_small(key, data.to_vec()).await.unwrap();
+    }
+
+    #[test]
+    fn migration_progress_resumes_snapshots_without_remote_reference_counts() {
+        let state: StoreMigrationState = serde_json::from_str(r#"{"cursor":"novels/site/book/挿絵/a.png","copied":2,"verified":1,"planned":3,"planned_bytes":65537,"failed":[],"done":false}"#).unwrap();
+        assert_eq!(state.cursor.as_deref(), Some("novels/site/book/挿絵/a.png"));
+        assert_eq!((state.copied, state.verified, state.planned, state.planned_bytes), (2, 1, 3, 65537));
+        assert_eq!(state.skipped, 0);
+        assert!(!state.done);
     }
 
     /// 挿絵だけがコピーされ、本文・メタデータは移行元に残ること。

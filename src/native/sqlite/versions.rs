@@ -57,8 +57,13 @@ fn now_rfc3339() -> String {
 /// Snapshot the mirrored working set as a new immutable version and record
 /// the unified diff against the previous head. Fails when nothing is
 /// mirrored yet (callers must refresh the mirror first).
-pub fn snapshot_working_set(
-    conn: &mut Connection,
+pub fn snapshot_working_set(conn:&mut Connection,novel_id:i64,origin:&str,note:Option<&str>)->Result<i64>{
+    let tx=conn.transaction().map_err(sqlite_error)?;let id=snapshot_working_set_in_tx(&tx,novel_id,origin,note)?;tx.commit().map_err(sqlite_error)?;Ok(id)
+}
+
+/// Caller owns the transaction and its original novel fencing epoch.
+pub fn snapshot_working_set_in_tx(
+    conn: &Connection,
     novel_id: i64,
     origin: &str,
     note: Option<&str>,
@@ -70,17 +75,12 @@ pub fn snapshot_working_set(
     };
     let (diff_stored, diff_encoding) = prepare_diff(conn, prev_head, &current)?;
 
-    let tx = conn.transaction().map_err(sqlite_error)?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO novel_versions (novel_id, parent_id, origin, note, created_at) VALUES (?, ?, ?, ?, ?)",
         params![novel_id, prev_head, origin, note, now_rfc3339()],
-    )
-    .map_err(sqlite_error)?;
-    let version_id = tx.last_insert_rowid();
-    write_version_sections(&tx, version_id, &current)?;
-    store_diff(&tx, version_id, prev_head, &diff_stored, diff_encoding)?;
-    tx.commit().map_err(sqlite_error)?;
-    Ok(version_id)
+    ).map_err(sqlite_error)?;
+    let version_id=conn.last_insert_rowid();write_version_sections(conn,version_id,&current)?;
+    store_diff(conn,version_id,prev_head,&diff_stored,diff_encoding)?;Ok(version_id)
 }
 
 fn current_and_prev(conn: &Connection, novel_id: i64) -> Result<Option<(SectionMap, Option<i64>)>> {

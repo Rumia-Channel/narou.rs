@@ -2,14 +2,14 @@
 
 use super::*;
 use futures::StreamExt;
-use narou_rs::platform::{ObjectEncoding, asset_codec::{decode_stream, range_from_stream, PayloadCrc32}, staging::{ASSET_CHUNK_BYTES, STAGE_TTL_SECONDS, is_staging_key, new_staging_key, validate_range}};
+use narou_rs::platform::{ObjectEncoding, asset_codec::{decode_stream, PayloadCrc32}, staging::{ASSET_CHUNK_BYTES, STAGE_TTL_SECONDS, is_staging_key, new_staging_key}};
 
 #[derive(Clone, Deserialize)]
 struct Header {
     size: u64,
     encoding: String,
     crc32: u32,
-    updated_at: String,
+    generation: String,
     inline: i64,
     stored_size: u64,
 }
@@ -30,18 +30,18 @@ impl D1ObjectStore {
     }
 
     async fn asset_header(&self, key: &ObjectKey) -> Result<Option<Header>> {
-        self.prepare("SELECT size,encoding,crc32,updated_at,data IS NOT NULL AS inline,COALESCE(length(data),(SELECT SUM(length(data)) FROM object_chunks WHERE object_key=objects.object_key),0) AS stored_size FROM objects WHERE object_key=?",
+        self.prepare("SELECT size,encoding,crc32,generation,data IS NOT NULL AS inline,CASE WHEN data IS NOT NULL THEN length(data) WHEN encoding='none' THEN size ELSE COALESCE((SELECT SUM(length(data)) FROM object_chunks WHERE object_key=objects.object_key),0) END AS stored_size FROM objects WHERE object_key=?",
             vec![key.as_ref().into()])?.first(None).await.map_err(worker_error)
     }
 
     async fn raw_slice(&self, key: &ObjectKey, header: &Header, seq: u64, offset: u64, length: usize) -> Result<(Vec<u8>, u64)> {
         self.renew_stage_progress(key).await?;
         let (sql, values) = if header.inline != 0 {
-            ("SELECT substr(data,?,?),length(data) FROM objects WHERE object_key=? AND (updated_at=? OR object_key GLOB '.narou-staging/*')",
-                vec![JsValue::from_f64((offset + 1) as f64), JsValue::from_f64(length as f64), key.as_ref().into(), header.updated_at.as_str().into()])
+            ("SELECT substr(data,?,?),length(data) FROM objects WHERE object_key=? AND generation=?",
+                vec![JsValue::from_f64((offset + 1) as f64), JsValue::from_f64(length as f64), key.as_ref().into(), header.generation.as_str().into()])
         } else {
-            ("SELECT substr(c.data,?,?),length(c.data) FROM object_chunks c JOIN objects o ON o.object_key=c.object_key WHERE c.object_key=? AND (o.updated_at=? OR o.object_key GLOB '.narou-staging/*') AND c.seq=?",
-                vec![JsValue::from_f64((offset + 1) as f64), JsValue::from_f64(length as f64), key.as_ref().into(), header.updated_at.as_str().into(), JsValue::from_f64(seq as f64)])
+            ("SELECT substr(c.data,?,?),length(c.data) FROM object_chunks c JOIN objects o ON o.object_key=c.object_key WHERE c.object_key=? AND o.generation=? AND c.seq=?",
+                vec![JsValue::from_f64((offset + 1) as f64), JsValue::from_f64(length as f64), key.as_ref().into(), header.generation.as_str().into(), JsValue::from_f64(seq as f64)])
         };
         let rows = self.prepare(sql, values)?.raw_js_value().await.map_err(worker_error)?;
         let row = rows.into_iter().next().ok_or_else(|| worker_error("asset changed or stored chunk missing"))?;
@@ -74,27 +74,19 @@ impl D1ObjectStore {
         Ok(Some(decode_stream(raw, encoding, size, crc32)))
     }
 
-    pub(super) async fn read_asset_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> Result<Option<Vec<u8>>> {
-        let length = validate_range(&range)?;
-        let Some(header) = self.asset_header(key).await? else { return Ok(None); };
-        self.renew_stage_progress(key).await?;
-        if range.end > header.size { return Err(worker_error("asset range exceeds object")); }
-        if header.encoding != "none" {
-            let stream = self.read_asset(key).await?.ok_or_else(|| worker_error("asset disappeared"))?;
-            return range_from_stream(stream, range).await.map(Some);
-        }
-        let mut result = Vec::with_capacity(length);
-        let mut position = range.start;
-        while position < range.end {
-            let (seq, offset) = if header.inline != 0 { (0, position) }
-                else { (position / CHUNK_SIZE as u64, position % CHUNK_SIZE as u64) };
-            let wanted = (range.end - position).min(CHUNK_SIZE as u64 - offset) as usize;
-            let (bytes, _) = self.raw_slice(key, &header, seq, offset, wanted).await?;
-            if bytes.len() != wanted { return Err(worker_error("asset range truncated")); }
-            position += bytes.len() as u64;
-            result.extend_from_slice(&bytes);
-        }
-        Ok(Some(result))
+
+    pub(super) async fn read_asset_stream_range(&self,key:&ObjectKey,range:std::ops::Range<u64>)->Result<Option<AssetStream>>{self.read_asset_stream_range_generation(key,range,None).await}
+    pub(super) async fn read_asset_stream_range_generation(&self,key:&ObjectKey,range:std::ops::Range<u64>,expected:Option<&str>)->Result<Option<AssetStream>>{
+        let Some(header)=self.asset_header(key).await? else{return Ok(None);};if expected.is_some_and(|expected|expected!=header.generation){return Err(worker_error("referenced D1 generation changed"));}let end=if range.end==u64::MAX{header.size}else{range.end};
+        if range.start>end||end>header.size{return Err(worker_error("asset range exceeds object"));}
+        if header.encoding!="none"{let stream=self.read_asset(key).await?.ok_or_else(||worker_error("asset disappeared"))?;return Ok(Some(narou_rs::platform::asset_codec::slice_stream(stream,range.start..end)));}
+        let full=range.start==0&&end==header.size;let size=header.size;let crc=header.crc32;
+        let raw:AssetStream=Box::pin(futures::stream::try_unfold((self.clone(),key.clone(),header,range.start),move|(store,key,header,position)|async move{
+            if position==end{return Ok(None);}let(seq,offset)=if header.inline!=0{(0,position)}else{(position/CHUNK_SIZE as u64,position%CHUNK_SIZE as u64)};
+            let wanted=(end-position).min(ASSET_CHUNK_BYTES as u64).min(CHUNK_SIZE as u64-offset) as usize;let(bytes,_)=store.raw_slice(&key,&header,seq,offset,wanted).await?;
+            if bytes.len()!=wanted{return Err(worker_error("asset range truncated"));}Ok(Some((bytes,(store,key,header,position+wanted as u64))))
+        }));
+        Ok(Some(if full{decode_stream(raw,ObjectEncoding::None,size,crc)}else{raw}))
     }
 
     pub(super) async fn write_asset(&self, destination: &ObjectKey, mut stream: AssetStream) -> Result<()> {

@@ -10,7 +10,7 @@
 //
 //   node tests/tag_sequence.mjs      # run.mjs から呼ばれる
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { transferClient } from './transfer.mjs';
 import process from 'node:process';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -38,85 +38,14 @@ async function request(path, init = {}) {
   return fetch(`${BASE_URL}${path}`, init);
 }
 
-// --- ZIP (stored) ------------------------------------------------------------
+// --- 可搬メタデータと raw file fixtures --------------------------------------------------------------
 
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let index = 0; index < 256; index += 1) {
-    let value = index;
-    for (let bit = 0; bit < 8; bit += 1) {
-      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
-    }
-    table[index] = value >>> 0;
-  }
-  return table;
-})();
-
-function crc32(buffer) {
-  let crc = 0xffffffff;
-  for (const byte of buffer) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-function buildZip(entries) {
-  const locals = [];
-  const central = [];
-  let offset = 0;
-  for (const entry of entries) {
-    const name = Buffer.from(entry.name, 'utf8');
-    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data, 'utf8');
-    const crc = crc32(data);
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(0x0800, 6);
-    local.writeUInt16LE(0, 8);
-    local.writeUInt16LE(0, 10);
-    local.writeUInt16LE(0x21, 12);
-    local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(data.length, 18);
-    local.writeUInt32LE(data.length, 22);
-    local.writeUInt16LE(name.length, 26);
-    local.writeUInt16LE(0, 28);
-    const header = Buffer.concat([local, name, data]);
-    const directory = Buffer.alloc(46);
-    directory.writeUInt32LE(0x02014b50, 0);
-    directory.writeUInt16LE(20, 4);
-    directory.writeUInt16LE(20, 6);
-    directory.writeUInt16LE(0x0800, 8);
-    directory.writeUInt16LE(0, 10);
-    directory.writeUInt16LE(0, 12);
-    directory.writeUInt16LE(0x21, 14);
-    directory.writeUInt32LE(crc, 16);
-    directory.writeUInt32LE(data.length, 20);
-    directory.writeUInt32LE(data.length, 24);
-    directory.writeUInt16LE(name.length, 28);
-    directory.writeUInt32LE(0, 38);
-    directory.writeUInt32LE(offset, 42);
-    central.push(Buffer.concat([directory, name]));
-    locals.push(header);
-    offset += header.length;
-  }
-  const centralBytes = Buffer.concat(central);
-  const end = Buffer.alloc(22);
-  end.writeUInt32LE(0x06054b50, 0);
-  end.writeUInt16LE(entries.length, 8);
-  end.writeUInt16LE(entries.length, 10);
-  end.writeUInt32LE(centralBytes.length, 12);
-  end.writeUInt32LE(offset, 16);
-  return Buffer.concat([...locals, centralBytes, end]);
-}
-
-function sha256(buffer) {
-  return createHash('sha256').update(buffer).digest('hex');
-}
-
-// --- アーカイブ --------------------------------------------------------------
-
-function tocYaml() {
+function tocYaml(tocUrl) {
   return [
     'title: 順序テスト',
     'author: 順序テスト',
+    `toc_url: ${tocUrl}`,
+    'subtitles: []',
     'sitename: 例サイト',
     'domain: example.com',
     'ncode: n00000000',
@@ -148,62 +77,21 @@ function sectionYaml(index, name) {
 
 /** 1 作品だけのアーカイブを作る (タグは 1 個だけ)。 */
 function archiveFor(tocUrl, tag, index, stamp) {
-  const files = [
-    { path: 'toc.yaml', data: Buffer.from(tocYaml()) },
-    {
-      path: `本文/${index} 第一話.yaml`,
-      data: Buffer.from(sectionYaml(index, '第一話')),
-    },
-  ];
-  const manifest = {
-    format_version: 1,
-    app_version: '0.5.0',
-    exported_at: '2026-10-29T00:00:00Z',
-    novels: [
-      {
-        toc_url: tocUrl,
-        title: `順序テスト ${index}`,
-        author: '順序テスト',
-        sitename: '例サイト',
-        domain: 'example.com',
-        tags: [tag],
-        novel_type: 1,
-        // 保存先は ncode から作るので、実行ごとに違う値にする (前回の
-        // 取り込みと衝突して保存先に.exists になるのを避ける)。
-        ncode: `n${stamp}${index}`,
-        files: files.map((file) => ({
-          path: file.path,
-          size: file.data.length,
-          sha256: sha256(file.data),
-        })),
-      },
+  return [{
+    toc_url: tocUrl, title: `順序テスト ${index}`, author: '順序テスト',
+    sitename: '例サイト', domain: 'example.com', tags: [tag], novel_type: 1,
+    ncode: `n${stamp}${index}`,
+    files: [
+      { path: 'toc.yaml', bytes: Buffer.from(tocYaml(tocUrl)) },
+      { path: `本文/${index} 第一話.yaml`, bytes: Buffer.from(sectionYaml(index, '第一話')) },
     ],
-  };
-  return buildZip([
-    { name: 'manifest.json', data: JSON.stringify(manifest) },
-    ...files.map((file) => ({ name: `novels/0/${file.path}`, data: file.data })),
-  ]);
+  }];
 }
 
-async function importArchive(zip) {
-  const deadline = Date.now() + 30_000;
-  for (;;) {
-    const response = await request('/api/transfer/import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/zip', ...auth() },
-      body: zip,
-    });
-    const body = await json(response);
-    if (response.status === 503 && body.error === 'memory_capacity' && Date.now() < deadline) {
-      const delay = Number(response.headers.get('Retry-After'));
-      assert.ok(Number.isFinite(delay) && delay > 0 && delay <= 10, 'capacity response must give a bounded retry delay');
-      await new Promise(resolve => setTimeout(resolve, delay * 1000));
-      continue;
-    }
-    assert.equal(response.status, 200, `import failed: ${JSON.stringify(body)}`);
-    assert.equal(body.success, true, `import failed: ${JSON.stringify(body)}`);
-    return body;
-  }
+async function importArchive(novels) {
+  const result = await transferClient(BASE_URL, TOKEN).importData(novels);
+  assert.equal(result.status.state, 'completed', JSON.stringify(result.status));
+  return result;
 }
 
 async function tagList() {

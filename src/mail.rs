@@ -122,18 +122,20 @@ pub fn seed_last_mail_dates() -> Result<()> {
     let ids = novels
         .scan_ids_sync(&crate::platform::NovelFilter::all(), None, usize::MAX)?;
     let now = chrono::Utc::now();
-    let mut mutations = Vec::new();
     for id in ids {
-        let Ok(Some(mut record)) = novels.get_sync(id) else {
+        let Some(record) = novels.get_current_sync(id)? else {
             continue;
         };
-        if record.last_mail_date.is_none() {
-            record.last_mail_date = Some(now);
-            mutations.push(crate::platform::NovelMutation::Upsert(record));
+        if record.last_mail_date.is_some() {
+            continue;
         }
-    }
-    if !mutations.is_empty() {
-        novels.apply_batch_sync(mutations)?;
+        let write = crate::native::materialization::capture_write_for_record(&record)?;
+        novels.update_existing_guarded_sync(write.fence(), id, |record| {
+            if record.last_mail_date.is_none() {
+                record.last_mail_date = Some(now);
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -196,7 +198,7 @@ pub fn send_target_with_setting_interruptible(
     force: bool,
     interrupted: Option<&AtomicBool>,
 ) -> std::result::Result<bool, String> {
-    let target = alias_to_target(target);
+    let target = alias_to_target(target)?;
 
     if target == "hotentry" {
         return send_hotentry(setting, send_all, interrupted);
@@ -219,16 +221,10 @@ pub fn send_target_with_setting_interruptible(
                 return Ok(false);
             }
 
-    let novel_dir = crate::db::with_database(|db| -> Result<PathBuf> {
-        Ok(crate::db::existing_novel_dir_for_record(
-            db.archive_root(),
-            &record,
-        ))
-    })
-    .map_err(|e| e.to_string())?;
-
+    let write = crate::native::materialization::capture_write_for_record(&record)
+        .map_err(|error| error.to_string())?;
     let ext = current_device_ext().unwrap_or_else(|| ".epub".to_string());
-    let ebook_paths = get_ebook_file_paths(&record, &novel_dir, &ext)?;
+    let ebook_paths = get_ebook_file_paths(&record, &write, &ext)?;
     let Some(first) = ebook_paths.first() else {
         return Ok(false);
     };
@@ -251,7 +247,7 @@ pub fn send_target_with_setting_interruptible(
         green_bold(&format!("ID:{}　{}", record.id, record.title))
     );
 
-    for ebook_path in ebook_paths {
+    for ebook_path in &ebook_paths {
         if !ebook_path.exists() {
             continue;
         }
@@ -264,7 +260,7 @@ pub fn send_target_with_setting_interruptible(
             setting,
             &record.id.to_string(),
             &body,
-            &ebook_path,
+            ebook_path,
             interrupted,
         )?;
         println!(
@@ -274,7 +270,7 @@ pub fn send_target_with_setting_interruptible(
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
         );
-        update_last_mail_date(record.id)?;
+        update_last_mail_date(&write, record.id)?;
     }
 
     Ok(true)
@@ -329,9 +325,12 @@ pub fn send_mail(
     }
 
     let message = build_message(setting, id, body, attachment_path)?;
+    send_built_message(setting, &message)
+}
 
+fn send_built_message(setting: &MailSetting, message: &Message) -> std::result::Result<(), String> {
     let transport = build_transport(setting)?;
-    transport.send(&message).map_err(|e| e.to_string())?;
+    transport.send(message).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -341,6 +340,7 @@ fn build_message(
     body: &str,
     attachment_path: &Path,
 ) -> std::result::Result<Message, String> {
+    crate::application::novel_access::require_private_path(attachment_path).map_err(|error| error.to_string())?;
     let from = parse_mailbox(&setting.from)?;
     let to = parse_mailboxes(&setting.to)?;
     let attachment_name = attachment_name(setting, id, attachment_path)?;
@@ -381,15 +381,24 @@ fn send_mail_with_progress(
     attachment_path: &Path,
     interrupted: Option<&AtomicBool>,
 ) -> std::result::Result<(), String> {
+    if interrupted.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err(MAIL_INTERRUPTED_MESSAGE.to_string());
+    }
+    if !setting.via.eq_ignore_ascii_case("smtp") {
+        return Err(format!("unsupported mail via: {}", setting.via));
+    }
+    // Consume the private attachment before spawning. An interrupted caller
+    // may drop its workspace immediately; the SMTP thread owns bytes, never
+    // another operation's soon-to-be-cleaned temporary path.
+    let message = build_message(setting, id, body, attachment_path)?;
+    if interrupted.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err(MAIL_INTERRUPTED_MESSAGE.to_string());
+    }
     let setting = setting.clone();
-    let id = id.to_string();
-    let body = body.to_string();
-    let attachment_path = attachment_path.to_path_buf();
     let (tx, rx) = mpsc::channel();
-
-    std::thread::spawn(move || {
-        let _ = tx.send(send_mail(&setting, &id, &body, &attachment_path));
-    });
+    std::thread::Builder::new().spawn(move || {
+        let _ = tx.send(send_built_message(&setting, &message));
+    }).map_err(|error| error.to_string())?;
 
     print!("メールを送信しています");
     let _ = std::io::stdout().flush();
@@ -553,13 +562,43 @@ fn resolve_record(target: &str) -> std::result::Result<Option<NovelRecord>, Stri
     .map_err(|e| e.to_string())
 }
 
-pub fn get_ebook_file_paths(
+/// Private materialized copies of a novel's generated ebooks. Paths live
+/// only while the workspace does; callers hold the set, never clone paths
+/// past its drop.
+pub struct EbookFileSet {
+    _workspace: tempfile::TempDir,
+    paths: Vec<PathBuf>,
+}
+
+impl EbookFileSet {
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+}
+
+impl std::ops::Deref for EbookFileSet {
+    type Target = [PathBuf];
+
+    fn deref(&self) -> &[PathBuf] {
+        &self.paths
+    }
+}
+
+impl<'a> IntoIterator for &'a EbookFileSet {
+    type Item = &'a PathBuf;
+    type IntoIter = std::slice::Iter<'a, PathBuf>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.paths.iter()
+    }
+}
+
+/// The output basename shared by every ebook naming rule (record → toc
+/// fallback) so CLI and Web enumerate identical candidates.
+fn ebook_base_name(
     record: &NovelRecord,
-    novel_dir: &Path,
-    ext: &str,
-) -> std::result::Result<Vec<PathBuf>, String> {
-    let settings =
-        NovelSettings::load_for_novel(record.id, &record.title, &record.author, novel_dir);
+    settings: &NovelSettings,
+) -> std::result::Result<String, String> {
     let toc = TocObject {
         title: record.title.clone(),
         author: record.author.clone(),
@@ -568,25 +607,154 @@ pub fn get_ebook_file_paths(
         subtitles: Vec::new(),
         novel_type: Some(record.novel_type),
     };
-    let txt_name = create_output_text_filename(&settings, record.id, &toc, Some(record));
-    let base = PathBuf::from(txt_name)
+    let txt_name = create_output_text_filename(settings, record.id, &toc, Some(record));
+    PathBuf::from(txt_name)
         .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| "Invalid converted filename".to_string())?
-        .to_string();
+        .and_then(|stem| stem.to_str().map(|stem| stem.to_string()))
+        .ok_or_else(|| "Invalid converted filename".to_string())
+}
 
-    let mut paths = vec![novel_dir.join(format!("{}{}", base, ext))];
-    let mut idx = 2usize;
+/// Ordered candidate names mirroring the legacy directory walk: the primary
+/// name first (present or not), then `base_N.ext` while N is contiguous from
+/// 2 and the name actually exists in storage.
+fn planned_ebook_names(
+    base: &str,
+    ext: &str,
+    present: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut names = vec![format!("{base}{ext}")];
+    let mut index = 2usize;
     loop {
-        let next = novel_dir.join(format!("{}_{}{}", base, idx, ext));
-        if next.exists() {
-            paths.push(next);
-            idx += 1;
-        } else {
+        let next = format!("{base}_{index}{ext}");
+        if !present(&next) {
             break;
         }
+        names.push(next);
+        index += 1;
     }
-    Ok(paths)
+    names
+}
+
+/// Select canonical objects that may be one of this novel's ebooks.
+fn ebook_name_matches(base: &str, ext: &str, name: &str) -> bool {
+    name.strip_prefix(base).is_some_and(|rest| {
+        rest == ext || rest.strip_suffix(ext)
+            .and_then(|rest| rest.strip_prefix('_'))
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
+fn current_ebook_record(record: &NovelRecord, prefix: &crate::platform::ObjectPrefix) -> Result<NovelRecord> {
+    let current = crate::native::novel_repository::NativeNovelRepository::new().get_current_sync(record.id.into())?
+        .ok_or_else(|| crate::error::NarouError::NotFound(format!("ID: {}", record.id)))?;
+    let keys = crate::platform::NovelObjectKeys::new(&current.sitename, &current.file_title, current.use_subdirectory)?;
+    if keys.prefix().as_ref() != prefix.as_ref().trim_end_matches('/') {
+        return Err(crate::error::NarouError::Platform("plan_stale: ebook metadata moved outside its original admission".into()));
+    }
+    Ok(current)
+}
+
+/// Ebook candidate `(name, present)` pairs under the caller's admitted read
+/// scope. Settings come from a private metadata snapshot admitted inside the
+/// same lease — no fresh epoch is captured and canonical paths are never
+/// touched. `present` reports object existence on the canonical store, never
+/// a filesystem mirror.
+pub async fn ebook_file_candidates(
+    scope: &mut crate::application::novel_access::NovelReadScope,
+    record: &NovelRecord,
+    ext: &str,
+) -> Result<Vec<(String, bool)>> {
+    let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+    let prefix = crate::platform::ObjectPrefix::from(keys.prefix().clone());
+    let inventory = Inventory::with_default_root()?;
+    let objects = crate::native::materialization::read_store(inventory.root_dir())?;
+    let mut lease = scope.lease_for(&prefix).await?;
+    let current = current_ebook_record(record, lease.prefix())?;
+    lease.validate().await?;
+    let record = &current;
+    let inputs = crate::native::materialization::ConversionInputs::begin(
+        &objects, &mut lease, inventory.root_dir(),
+    ).await?;
+    let settings = NovelSettings::load_for_novel(record.id, &record.title, &record.author, inputs.path())?;
+    let base = ebook_base_name(record, &settings).map_err(crate::error::NarouError::Conversion)?;
+
+    let prefix_text = prefix.as_ref().to_owned();
+    let mut present = std::collections::BTreeSet::new();
+    let mut request = crate::platform::ObjectListRequest::new(
+        prefix, std::num::NonZeroUsize::new(100).expect("nonzero ebook listing page"),
+    );
+    loop {
+        lease.validate().await?;
+        let page = objects.list_page(&request).await?;
+        for object in page.objects {
+            let Some(name) = object.key.as_ref()
+                .strip_prefix(&prefix_text)
+                .and_then(|rest| rest.strip_prefix('/'))
+            else {
+                return Err(crate::error::NarouError::Platform("ebook listing key escaped its novel".to_string()));
+            };
+            if crate::platform::is_reserved_key(&object.key) || name.contains('/') {
+                continue;
+            }
+            if ebook_name_matches(&base, ext, name) {
+                present.insert(name.to_owned());
+            }
+        }
+        match page.next_cursor {
+            Some(cursor) => request = request.after(cursor),
+            None => break,
+        }
+    }
+    inputs.populate(&objects, &mut lease, false, None, crate::native::materialization::ConversionInputSelection {
+        illustrations: false,
+        cover: false,
+    }).await?;
+    Ok(planned_ebook_names(&base, ext, |name| present.contains(name))
+        .into_iter()
+        .map(|name| {
+            let exists = present.contains(&name);
+            (name, exists)
+        })
+        .collect())
+}
+
+/// Materialize generated ebooks under the caller's original writer epoch.
+/// Settings and outputs are read privately; no canonical raw-path fallback.
+pub fn get_ebook_file_paths(
+    record: &NovelRecord,
+    write: &crate::application::novel_access::NovelWriteGuard,
+    ext: &str,
+) -> std::result::Result<EbookFileSet, String> {
+    crate::native::materialization::block_on(async {
+        let inventory = Inventory::with_default_root()?;
+        let objects = crate::native::materialization::read_store(inventory.root_dir())?;
+        let mut lease = crate::application::novel_access::NovelReadLease::admit(
+            &objects, write.prefix(), "native-ebook-files",
+        ).await?;
+        let result = async {
+            if lease.epoch() != write.epoch() {
+                return Err(crate::error::NarouError::Platform("novel_busy: ebook origin changed".into()));
+            }
+            let current = current_ebook_record(record, lease.prefix())?;
+            lease.validate().await?;
+            let record = &current;
+            let inputs = crate::native::materialization::ConversionInputs::begin(&objects, &mut lease, inventory.root_dir()).await?;
+            let settings = NovelSettings::load_for_novel(record.id, &record.title, &record.author, inputs.path())?;
+            let base = ebook_base_name(record, &settings).map_err(crate::error::NarouError::Conversion)?;
+            let (workspace, copied) = crate::native::materialization::selected_files_snapshot_leased(
+                &objects, &mut lease, inventory.root_dir(), |name| ebook_name_matches(&base, ext, name),
+            ).await?;
+            inputs.populate(&objects, &mut lease, false, None, crate::native::materialization::ConversionInputSelection {
+                illustrations: false,
+                cover: false,
+            }).await?;
+            let names = planned_ebook_names(&base, ext, |name| copied.contains(name));
+            let paths = names.iter().map(|name| workspace.path().join(name)).collect();
+            Ok(EbookFileSet { _workspace: workspace, paths })
+        }.await;
+        let released = lease.release().await;
+        match result { Ok(value) => { released?; Ok(value) }, Err(error) => Err(error) }
+    }).map_err(|error| error.to_string())
 }
 
 pub fn newest_hotentry_file_path(ext: &str) -> std::result::Result<Option<PathBuf>, String> {
@@ -610,14 +778,17 @@ pub fn newest_hotentry_file_path(ext: &str) -> std::result::Result<Option<PathBu
     Ok(candidates.pop())
 }
 
-fn update_last_mail_date(id: i64) -> std::result::Result<(), String> {
-    let novels = crate::native::novel_repository::NativeNovelRepository::new();
-    if let Ok(Some(mut record)) = novels.get_sync(id.into()) {
-        record.last_mail_date = Some(chrono::Utc::now());
-        novels
-            .apply_batch_sync(vec![crate::platform::NovelMutation::Upsert(record)])
-            .map_err(|e| e.to_string())?;
-    }
+fn update_last_mail_date(
+    write: &crate::application::novel_access::NovelWriteGuard,
+    id: i64,
+) -> std::result::Result<(), String> {
+    let found = crate::native::novel_repository::NativeNovelRepository::new()
+        .update_existing_guarded_sync(write.fence(), id.into(), |record| {
+            record.last_mail_date = Some(chrono::Utc::now());
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+    if !found { return Err(format!("ID: {id}")); }
     Ok(())
 }
 
@@ -628,15 +799,15 @@ fn current_device_ext() -> Option<String> {
 /// 別名表 (alias.yaml) の完全一致解決を共有実装で行う。未登録の名前は
 /// そのまま返す (小文字化しない) — `hotentry` 判定・`resolve_record` の前に
 /// 適用する順序も従来どおり。
-fn alias_to_target(target: &str) -> String {
+fn alias_to_target(target: &str) -> std::result::Result<String, String> {
     let aliases = crate::db::with_database(|db| -> Result<HashMap<String, String>> {
         let values: HashMap<String, serde_yaml::Value> = db
             .inventory()
             .load("alias", crate::db::inventory::InventoryScope::Local)?;
         Ok(crate::application::aliases::alias_map_from_values(values))
     })
-    .unwrap_or_default();
-    crate::application::aliases::resolve_alias_target(&aliases, target).into_owned()
+    .map_err(|error| error.to_string())?;
+    Ok(crate::application::aliases::resolve_alias_target(&aliases, target).into_owned())
 }
 
 fn attachment_name(
@@ -854,6 +1025,89 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
+
+    fn with_ebook_library(run: impl FnOnce(&TempDir, &crate::db::NovelRecord, &crate::application::novel_access::NovelWriteGuard)) {
+        struct DatabaseRestore(Option<crate::db::Database>);
+        impl Drop for DatabaseRestore {
+            fn drop(&mut self) { *crate::db::DATABASE.lock() = self.0.take(); }
+        }
+        let root = TempDir::new().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(root.path());
+        let _database = DatabaseRestore(crate::db::DATABASE.lock().take());
+        let _legacy = crate::test_support::legacy_yaml_guard();
+        std::fs::create_dir(root.path().join(".narou")).unwrap();
+        crate::db::init_database().unwrap();
+        let record = serde_yaml::from_str("id: 1\ntitle: book\nauthor: author\nfile_title: book\nsitename: site\ntoc_url: https://example.test/book\nnovel_type: 2\nlast_update: 2026-01-01T00:00:00Z\n").unwrap();
+        let (record, write) = crate::native::materialization::create_test_record(record).unwrap();
+        run(&root, &record, &write);
+    }
+
+    #[test]
+    fn ebook_files_use_private_copies_and_preserve_source_files() {
+        with_ebook_library(|root, record, write| {
+            let settings = crate::converter::settings::NovelSettings::load_for_novel(record.id, &record.title, &record.author, root.path()).unwrap();
+            let base = super::ebook_base_name(record, &settings).unwrap();
+            let key = crate::platform::ObjectKey::try_new(write.prefix().as_ref()).unwrap();
+            crate::native::materialization::block_on(async {
+                write.write_small(&key.join(&format!("{base}.epub"))?, b"first ebook".to_vec()).await?;
+                write.write_small(&key.join(&format!("{base}_2.epub"))?, b"second ebook".to_vec()).await?;
+                write.write_small(&key.join("user-notes.txt")?, b"keep notes".to_vec()).await?;
+                write.write_small(&key.join("other-output.epub")?, b"keep output".to_vec()).await
+            }).unwrap();
+            let directory = crate::native::materialization::directory_for_origin(write).unwrap();
+            let files = super::get_ebook_file_paths(record, write, ".epub").unwrap();
+            assert_eq!(files.len(), 2);
+            assert_eq!(std::fs::read(&files[0]).unwrap(), b"first ebook");
+            assert_eq!(std::fs::read(&files[1]).unwrap(), b"second ebook");
+            assert!(!files[0].starts_with(&directory));
+            assert_eq!(std::fs::metadata(&files[0]).unwrap().modified().unwrap(),
+                std::fs::metadata(directory.join(format!("{base}.epub"))).unwrap().modified().unwrap());
+            let private = files[0].clone();
+            drop(files);
+            assert!(!private.exists());
+            assert_eq!(std::fs::read(directory.join("user-notes.txt")).unwrap(), b"keep notes");
+            assert_eq!(std::fs::read(directory.join("other-output.epub")).unwrap(), b"keep output");
+            assert_eq!(std::fs::read(directory.join(format!("{base}.epub"))).unwrap(), b"first ebook");
+        });
+    }
+
+    #[test]
+    fn ebook_and_mail_date_never_upgrade_stale_original_epochs() {
+        use crate::platform::NovelAccessFence;
+        with_ebook_library(|root, record, write| {
+            let stores = crate::native::object_store::NativeStores::for_narou_root(root.path()).unwrap();
+            let mut reads = crate::application::novel_access::NovelReadScope::new(&stores.objects, "ebook-stale-test");
+            crate::native::materialization::block_on(async {
+                drop(reads.lease_for(write.prefix()).await?);
+                let epoch = stores.primary.close_gate(write.prefix(), "ebook-new-publisher").await?;
+                stores.primary.open_gate(write.prefix(), "ebook-new-publisher", epoch).await
+            }).unwrap();
+            assert!(super::get_ebook_file_paths(record, write, ".epub").is_err());
+            assert!(super::update_last_mail_date(write, record.id).is_err());
+            crate::native::materialization::block_on(async {
+                assert!(super::ebook_file_candidates(&mut reads, record, ".epub").await.is_err());
+                reads.release_all().await
+            }).unwrap();
+            assert!(crate::native::novel_repository::NativeNovelRepository::new()
+                .get_current_sync(record.id.into()).unwrap().unwrap().last_mail_date.is_none());
+        });
+    }
+
+    #[test]
+    fn ebook_settings_io_failure_is_not_a_missing_file_success() {
+        with_ebook_library(|root, record, write| {
+            let objects = crate::native::materialization::read_store(root.path()).unwrap();
+            let mut reads = crate::application::novel_access::NovelReadScope::new(&objects, "ebook-settings-error");
+            let setting = root.path().join(".narou/local_setting.yaml");
+            if setting.try_exists().unwrap() { std::fs::remove_file(&setting).unwrap(); }
+            std::fs::create_dir(&setting).unwrap();
+            assert!(super::get_ebook_file_paths(record, write, ".epub").is_err());
+            crate::native::materialization::block_on(async {
+                assert!(super::ebook_file_candidates(&mut reads, record, ".epub").await.is_err());
+                reads.release_all().await
+            }).unwrap();
+        });
+    }
 
     fn test_mail_setting(extras: HashMap<String, serde_yaml::Value>) -> MailSetting {
         MailSetting {

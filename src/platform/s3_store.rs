@@ -25,6 +25,8 @@ use crate::platform::PlatformFuture;
 
 #[path = "s3_stream.rs"]
 mod streaming;
+#[path = "s3_transfer.rs"]
+mod transfer;
 
 /// `read_small` / `write_small` の上限。
 pub const SMALL_CAP: u64 = 16 * 1024 * 1024;
@@ -301,6 +303,8 @@ impl S3Store {
     pub async fn pool_exists(&self, key: &ObjectKey) -> Result<bool> {
         Ok(self.pool_stat(key).await?.is_some())
     }
+    pub fn illustration_pool_enabled_for(&self,key:&ObjectKey)->bool{self.location.has_pool_alternate(key)}
+
 
     async fn stat_object(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>> {
         self.renew_stage_progress(key).await?;
@@ -343,6 +347,9 @@ impl S3Store {
     }
 
     async fn write_object(&self, key: &ObjectKey, data: Vec<u8>) -> Result<()> {
+        if let Some(sha)=super::transfer_stage::hash_named_digest(key){
+            return Box::pin(self.conditional_small_write(key,data,&sha)).await;
+        }
         if data.len() as u64 > MAX_OBJECT_BYTES {
             return Err(NarouError::Platform(format!(
                 "S3 PUT {} exceeds the {} byte limit",
@@ -400,13 +407,12 @@ impl S3Store {
         self.delete_stage_record(key).await
     }
 
-    async fn list_objects(&self, request: &ObjectListRequest) -> Result<ObjectListPage> {
-        let url = self.location.list_url(
-            request.prefix.as_ref(),
-            request.limit.get(),
-            request.cursor.as_deref(),
-        );
-        let (response, signed) = self.send(HttpMethod::Get, &url, &[], None, None).await?;
+    async fn list_objects(&self,request:&ObjectListRequest)->Result<ObjectListPage>{let url=self.location.list_url(request.prefix.as_ref(),request.limit.get(),request.cursor.as_deref());self.list_objects_url(request,&url,false).await}
+    #[cfg(feature = "native-runtime")]
+    /// Internal keyset view for merging immutable refs with legacy raw keys.
+    pub(crate) async fn list_page_keyset(&self,request:&ObjectListRequest)->Result<ObjectListPage>{let url=self.location.list_keyset_url(request.prefix.as_ref(),request.limit.get().min(1000),request.cursor.as_deref());self.list_objects_url(request,&url,true).await}
+    async fn list_objects_url(&self,request:&ObjectListRequest,url:&str,keyset:bool)->Result<ObjectListPage>{
+        let(response,signed)=self.send(HttpMethod::Get,url,&[],None,None).await?;
         let (status, body) = status_and_body(response)?;
         if status != 200 {
             // Response XML can contain credential identifiers and signatures.
@@ -422,6 +428,13 @@ impl S3Store {
             )));
         }
         let page = parse_list_objects_v2(&String::from_utf8_lossy(&body))?;
+        let next_cursor=if keyset{
+            let mut last=None;for summary in &page.objects{let rest=if self.location.prefix().is_empty(){summary.key.as_str()}else{summary.key.strip_prefix(self.location.prefix()).and_then(|key|key.strip_prefix('/')).ok_or_else(||NarouError::Platform("S3 keyset response left its storage prefix".into()))?};
+                if !rest.starts_with(request.prefix.as_ref())||request.cursor.as_deref().is_some_and(|cursor|rest<=cursor){return Err(NarouError::Platform("S3 keyset response did not advance within its LIST scope".into()));}
+                if !rest.ends_with('/')&&!rest.starts_with("illustrations/"){ObjectKey::try_new(rest)?;}last=Some(rest.to_owned());
+            }
+            if page.next_token.is_some(){Some(last.ok_or_else(||NarouError::Platform("truncated S3 keyset response has no progress key".into()))?)}else{None}
+        }else{page.next_token};
 
         let mut objects = Vec::new();
         for summary in page.objects {
@@ -441,7 +454,7 @@ impl S3Store {
         }
         Ok(ObjectListPage {
             objects,
-            next_cursor: page.next_token,
+            next_cursor,
         })
     }
 
@@ -470,6 +483,10 @@ impl S3Store {
 
     async fn copy_object(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
         if source == destination { return Ok(()); }
+        if let Some(sha)=super::transfer_stage::hash_named_digest(destination){
+            let source=self.stream_read(source).await?.ok_or_else(||NarouError::NotFound(source.to_string()))?;
+            return Box::pin(self.conditional_stream_write(destination,source,u64::MAX,&sha)).await.map(|_|());
+        }
         let metadata = self.stat_object(source).await?
             .ok_or_else(|| NarouError::NotFound(source.to_string()))?;
         let copy_source = if self.location.has_pool_alternate(source) && !self.pool_exists(source).await? {
@@ -665,7 +682,7 @@ impl ObjectStore for S3Store {
                     SMALL_CAP
                 )));
             }
-            self.write_object(key, data).await
+            if let Some(sha)=super::transfer_stage::hash_named_digest(key){let size=data.len() as u64;self.conditional_stream_write(key,Box::pin(futures::stream::once(async move{Ok(data)})),size,&sha).await.map(|_|())}else{self.write_object(key,data).await}
         })
     }
 
@@ -682,6 +699,17 @@ impl ObjectStore for S3Store {
 }
 
 impl AssetStore for S3Store {
+    fn legacy_etag<'a>(&'a self,logical:&'a ObjectKey)->PlatformFuture<'a,Result<Option<String>>>{Box::pin(async move{
+        super::transfer_stage::illustration_pool_key(logical)?;
+        let response=self.stream_get(&self.location.legacy_object_url(logical),&[("range","bytes=0-0")]).await?;
+        if response.status==404{return Ok(None);}if !matches!(response.status,200|206)&&!(response.status==416&&response.header("content-range")==Some("bytes */0")){return Err(NarouError::Platform(format!("legacy ETag lookup failed with status {}",response.status)));}
+        response.header("etag").filter(|etag|!etag.is_empty()).map(|etag|Some(etag.to_owned())).ok_or_else(||NarouError::Platform("legacy object omitted ETag; conditional GC unavailable".into()))
+    })}
+    fn delete_legacy_if_match<'a>(&'a self,logical:&'a ObjectKey,pool:&'a ObjectKey,etag:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
+        if super::transfer_stage::illustration_pool_key(logical)?!=*pool||logical==pool||etag.is_empty(){return Err(NarouError::Platform("invalid legacy GC identity".into()));}
+        let(response,_)=self.send(HttpMethod::Delete,&self.location.legacy_object_url(logical),&[("if-match",etag)],None,Some(64*1024)).await?;
+        if response.status==404{return Ok(());}streaming::require_status(&response,&[200,204],"conditional legacy physical delete")
+    })}
     fn stat<'a>(
         &'a self,
         key: &'a ObjectKey,
@@ -702,12 +730,24 @@ impl AssetStore for S3Store {
         Box::pin(self.range_read(key, range))
     }
 
+    fn read_stream_range<'a>(&'a self, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        Box::pin(self.stream_range(key, range))
+    }
+
+    fn write_stream_once<'a>(&'a self, key: &'a ObjectKey, stream: AssetStream, expected_size: u64, expected_sha256: &'a str) -> PlatformFuture<'a, Result<super::WriteOnce>> {
+        Box::pin(self.conditional_stream_write(key, stream, expected_size, expected_sha256))
+    }
+
     fn write_stream<'a>(
         &'a self,
         key: &'a ObjectKey,
         stream: AssetStream,
     ) -> PlatformFuture<'a, Result<()>> {
-        Box::pin(self.multipart_write(key, stream))
+        Box::pin(async move{
+            if let Some(sha)=super::transfer_stage::hash_named_digest(key){
+                self.conditional_stream_write(key,stream,u64::MAX,&sha).await.map(|_|())
+            }else{self.multipart_write(key,stream).await}
+        })
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
@@ -1438,7 +1478,7 @@ mod tests {
     #[test]
     fn illustration_dedup_plan_counts_only_hex_named_legacy_objects() {
         use crate::platform::store_migration::{
-            IllustrationDedupState, deduplicate_illustrations_page,
+            IllustrationDedupState, deduplicate_illustrations_page_with_source,
         };
 
         let http = Arc::new(MockHttpClient::new());
@@ -1462,8 +1502,8 @@ mod tests {
         );
 
         let mut state = IllustrationDedupState::default();
-        futures::executor::block_on(deduplicate_illustrations_page(
-            &store, "plan", 500, &mut state,
+        futures::executor::block_on(deduplicate_illustrations_page_with_source(
+            &store, &store, &store, "plan", 500, &mut state,
         ))
         .unwrap();
 

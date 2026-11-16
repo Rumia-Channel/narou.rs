@@ -14,8 +14,8 @@ struct FetchReader {
 impl Drop for FetchReader {
     fn drop(&mut self) {
         if !self.finished {
-            let promise = self.reader.cancel();
-            wasm_bindgen_futures::spawn_local(async move { let _ = JsFuture::from(promise).await; });
+            // Cancellation starts synchronously; Drop never spawns an owner.
+            let _ = self.reader.cancel();
         }
         self.reader.release_lock();
     }
@@ -180,9 +180,7 @@ impl Drop for SocketReader {
     fn drop(&mut self) {
         self.socket.reader.release_lock();
         self.socket.writer.release_lock();
-        if let Ok(promise) = self.socket.inner.close() {
-            wasm_bindgen_futures::spawn_local(async move { let _ = JsFuture::from(promise).await; });
-        }
+        let _ = self.socket.inner.close();
     }
 }
 

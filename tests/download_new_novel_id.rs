@@ -130,6 +130,7 @@ async fn a_new_download_consumes_exactly_one_id() {
         "https://example.com/novel/n1111aa/",
         narou_rs::downloader::DownloadExecutionOptions {
             force: true, budget: None, resume_from_section: None,
+            access: None, creation_reservation: None,
         },
     ).await.unwrap();
     assert_eq!(inaccessible.status,narou_rs::downloader::UpdateStatus::Canceled);

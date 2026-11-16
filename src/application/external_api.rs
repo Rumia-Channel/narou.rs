@@ -18,6 +18,7 @@
 //! - [`VirtualNovelMode::Exclude`][]: バーチャル小説もメンバーも出さない
 //!   (どのバーチャル小説にも入っていない元の小説だけ)。
 
+use super::novel_access::NovelReadScope;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -55,6 +56,10 @@ pub fn http_error(error: &ApplicationError) -> (u16, &'static str) {
         ApplicationError::InvalidRequest(_) => (400, "bad_request"),
         ApplicationError::NotFound(_) => (404, "not_found"),
         ApplicationError::Conflict(_) => (409, "conflict"),
+        ApplicationError::Platform(message) if message.contains("novel_recovering:") => (503, "novel_recovering"),
+        ApplicationError::Platform(message) if message.contains("recovery_required:") => (503, "recovery_required"),
+        ApplicationError::Platform(message) if message.contains("novel_busy:") => (423, "novel_busy"),
+        ApplicationError::Platform(message) if message.contains("novel_epoch_conflict:") || message.contains("gate_epoch_conflict:") => (409, "novel_epoch_conflict"),
         ApplicationError::Platform(_) => (500, "internal_error"),
     }
 }
@@ -372,6 +377,12 @@ impl ExternalApiService {
         }
     }
 
+    /// One logical read operation's lazy admission; the HTTP boundary owns
+    /// the scope until its response body reaches EOF.
+    pub fn read_scope(&self, hint: &str) -> NovelReadScope {
+        self.content.read_scope(hint)
+    }
+
     /// Bearer トークンを必須にするか。
     pub async fn require_token(&self) -> bool {
         self.settings
@@ -418,6 +429,7 @@ impl ExternalApiService {
     /// 一覧を返す。
     pub async fn list(
         &self,
+        scope: &mut NovelReadScope,
         request: &ExternalListRequest,
         hidden: Option<HiddenState>,
     ) -> Result<ExternalList, ApplicationError> {
@@ -460,7 +472,29 @@ impl ExternalApiService {
             .list_records(filter, sort, request.offset, request.limit)
             .await?;
 
-        let related_titles = self.related_titles(&members).await;
+        // The replica page is discovery only: every returned row is re-read
+        // under the operation's original admission before it is rendered.
+        let admitted = self.content.read_discovered_records(scope, &records).await?;
+        let mut records = records;
+        for (record, current) in records.iter_mut().zip(admitted) {
+            let current = current
+                .ok_or_else(|| ApplicationError::Conflict("novel disappeared during listing".into()))?;
+            if record.id != current.id || record.title != current.title || record.author != current.author
+                || record.sitename != current.sitename || record.file_title != current.file_title
+                || record.use_subdirectory != current.use_subdirectory || record.toc_url != current.toc_url
+                || record.novel_type != current.novel_type || record.end != current.end
+                || record.suspend != current.suspend || record.is_narou != current.is_narou
+                || record.tags != current.tags || record.ncode != current.ncode || record.domain != current.domain
+                || record.length != current.length || record.general_all_no != current.general_all_no
+                || record.last_update != current.last_update || record.general_lastup != current.general_lastup
+                || record.new_arrivals_date != current.new_arrivals_date || record.last_check_date != current.last_check_date
+                || record.extra_fields != current.extra_fields
+            {
+                return Err(ApplicationError::Conflict("novel metadata changed during listing".into()));
+            }
+            *record = current;
+        }
+        let related_titles = self.related_titles(scope, &members, &records).await?;
         let mut novels: Vec<ExternalNovel> = records
             .iter()
             .map(|record| {
@@ -488,6 +522,7 @@ impl ExternalApiService {
                 &related_titles,
             ));
         }
+        self.validate_membership(scope, &members, records.iter().map(|record| record.id)).await?;
 
         Ok(ExternalList {
             records_total,
@@ -499,22 +534,19 @@ impl ExternalApiService {
     }
 
     /// 1 件の作品情報。
-    pub async fn novel(&self, id: i64) -> Result<ExternalNovel, ApplicationError> {
-        let members = self
-            .virtual_novels
-            .members()
-            .await
-            .map_err(ApplicationError::platform)?;
+    pub async fn novel(&self, scope: &mut NovelReadScope, id: i64) -> Result<ExternalNovel, ApplicationError> {
         let frozen_ids = self.library.frozen_ids().await?;
         let attribute_tags_enabled = attribute_tags::enabled(&self.settings).await;
         let record = self
-            .library
-            .get(NovelId(id))
+            .content
+            .read_record(scope, NovelId(id))
             .await?
             .ok_or_else(|| ApplicationError::NotFound(format!("作品が見つかりません: {id}")))?;
         // 親バーチャル小説の題名だけを読む (全メンバーの記録は読まない)。
+        let members = self.virtual_novels.members().await.map_err(ApplicationError::platform)?;
         let owner = members.owner_of(id);
-        let parent_title = self.parent_title(owner).await;
+        let parent_title = self.parent_title(scope, owner).await?;
+        self.validate_membership(scope, &members, std::iter::once(id)).await?;
         Ok(self.novel_row(
             &record,
             &frozen_ids,
@@ -525,21 +557,16 @@ impl ExternalApiService {
     }
 
     /// 目次。バーチャル小説はメンバーの目次を連結する。
-    pub async fn toc(&self, id: i64) -> Result<ExternalToc, ApplicationError> {
-        let members = self
-            .virtual_novels
-            .members()
-            .await
-            .map_err(ApplicationError::platform)?;
+    pub async fn toc(&self, scope: &mut NovelReadScope, id: i64) -> Result<ExternalToc, ApplicationError> {
         let record = self
-            .library
-            .get(NovelId(id))
+            .content
+            .read_record(scope, NovelId(id))
             .await?
             .ok_or_else(|| ApplicationError::NotFound(format!("作品が見つかりません: {id}")))?;
-
+        let members = self.virtual_novels.members().await.map_err(ApplicationError::platform)?;
         let member_ids = members.get(id).map(<[i64]>::to_vec).unwrap_or_default();
         // このバーチャル小説のメンバーの題名だけを読む。
-        let member_titles = self.titles_of(&member_ids).await;
+        let member_titles = self.titles_of(scope, &member_ids).await?;
         let virtual_novel = if member_ids.is_empty() {
             None
         } else {
@@ -567,12 +594,13 @@ impl ExternalApiService {
             member_ids.clone()
         };
         for owner in owners {
-            let toc = self.read_toc(owner).await?;
+            let toc = self.read_toc(scope, owner).await?;
             if let Some(story) = toc.story.clone() {
                 stories.push(story);
             }
             sections.extend(sections_of(&toc, owner, member));
         }
+        self.validate_membership(scope, &members, std::iter::once(id)).await?;
 
         Ok(ExternalToc {
             id,
@@ -589,16 +617,12 @@ impl ExternalApiService {
     ///
     /// `key` は目次が返す識別子。通常の作品では話番号 (`"3"`)、
     /// バーチャル小説では `メンバーID:話番号` (`"12:3"`)。
-    pub async fn section(&self, id: i64, key: &str) -> Result<ExternalSection, ApplicationError> {
-        let members = self
-            .virtual_novels
-            .members()
-            .await
-            .map_err(ApplicationError::platform)?;
-        self.library
-            .get(NovelId(id))
+    pub async fn section(&self, scope: &mut NovelReadScope, id: i64, key: &str) -> Result<ExternalSection, ApplicationError> {
+        self.content
+            .read_record(scope, NovelId(id))
             .await?
             .ok_or_else(|| ApplicationError::NotFound(format!("作品が見つかりません: {id}")))?;
+        let members = self.virtual_novels.members().await.map_err(ApplicationError::platform)?;
         let member_ids = members.get(id).map(<[i64]>::to_vec).unwrap_or_default();
         let member = !member_ids.is_empty();
         let owners: Vec<i64> = if member_ids.is_empty() {
@@ -611,7 +635,7 @@ impl ExternalApiService {
         // 読む (他のメンバーの目次は読み直さない)。
         let (owner, index) = resolve_section_owner(&owners, key)
             .ok_or_else(|| section_not_found(id, key))?;
-        let toc = self.read_toc(owner).await?;
+        let toc = self.read_toc(scope, owner).await?;
         let subtitle = toc
             .subtitles
             .iter()
@@ -619,23 +643,21 @@ impl ExternalApiService {
             .or_else(|| toc.subtitles.iter().find(|subtitle| subtitle.index == index))
             .ok_or_else(|| section_not_found(id, key))?;
 
-        self.read_section(id, owner, member, subtitle).await
+        let section = self.read_section(scope, id, owner, member, subtitle).await?;
+        self.validate_membership(scope, &members, std::iter::once(id)).await?;
+        Ok(section)
     }
 
     /// 作品 1 件の全話の本文 (目次の順)。
     ///
     /// 目次は所有者ごとに 1 回だけ読む (話ごとに目次を読み直さない)。
     /// 欠落・破損した話があれば失敗し、不完全な本を成功として返さない。
-    pub async fn sections(&self, id: i64) -> Result<ExternalSections, ApplicationError> {
-        let members = self
-            .virtual_novels
-            .members()
-            .await
-            .map_err(ApplicationError::platform)?;
-        self.library
-            .get(NovelId(id))
+    pub async fn sections(&self, scope: &mut NovelReadScope, id: i64) -> Result<ExternalSections, ApplicationError> {
+        self.content
+            .read_record(scope, NovelId(id))
             .await?
             .ok_or_else(|| ApplicationError::NotFound(format!("作品が見つかりません: {id}")))?;
+        let members = self.virtual_novels.members().await.map_err(ApplicationError::platform)?;
         let member_ids = members.get(id).map(<[i64]>::to_vec).unwrap_or_default();
         let member = !member_ids.is_empty();
         let owners: Vec<i64> = if member_ids.is_empty() {
@@ -646,11 +668,12 @@ impl ExternalApiService {
 
         let mut sections = Vec::new();
         for owner in owners {
-            let toc = self.read_toc(owner).await?;
+            let toc = self.read_toc(scope, owner).await?;
             for subtitle in &toc.subtitles {
-                sections.push(self.read_section(id, owner, member, subtitle).await?);
+                sections.push(self.read_section(scope, id, owner, member, subtitle).await?);
             }
         }
+        self.validate_membership(scope, &members, std::iter::once(id)).await?;
         Ok(ExternalSections {
             id,
             sections,
@@ -660,6 +683,7 @@ impl ExternalApiService {
     /// 1 話の本文を読む。
     async fn read_section(
         &self,
+        scope: &mut NovelReadScope,
         id: i64,
         owner: i64,
         member: bool,
@@ -667,7 +691,7 @@ impl ExternalApiService {
     ) -> Result<ExternalSection, ApplicationError> {
         let bytes = self
             .content
-            .section(NovelId(owner), &subtitle.index, &subtitle.file_subtitle)
+            .section(scope, NovelId(owner), &subtitle.index, &subtitle.file_subtitle)
             .await?
             .ok_or_else(|| {
                 ApplicationError::NotFound(format!("本文が見つかりません: {owner} / {}", subtitle.index))
@@ -692,10 +716,12 @@ impl ExternalApiService {
     }
 
     /// タグの一覧 (名前と使用数)。
-    pub async fn tags(&self) -> Result<Vec<ExternalTag>, ApplicationError> {
+    pub async fn tags(&self, scope: &mut NovelReadScope) -> Result<Vec<ExternalTag>, ApplicationError> {
         let records = self.library.records().await?;
         let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-        for record in records {
+        for record in self.content.read_discovered_records(scope, &records).await? {
+            let record = record
+                .ok_or_else(|| ApplicationError::Conflict("novel disappeared during tag listing".into()))?;
             for tag in record.tags {
                 if crate::virtual_novel::is_internal_tag(&tag) {
                     continue;
@@ -709,10 +735,10 @@ impl ExternalApiService {
             .collect())
     }
 
-    async fn read_toc(&self, id: i64) -> Result<TocObject, ApplicationError> {
+    async fn read_toc(&self, scope: &mut NovelReadScope, id: i64) -> Result<TocObject, ApplicationError> {
         let bytes = self
             .content
-            .toc(NovelId(id))
+            .toc(scope, NovelId(id))
             .await?
             .ok_or_else(|| ApplicationError::NotFound(format!("目次がありません: {id}")))?;
         serde_yaml::from_slice(&bytes)
@@ -722,20 +748,16 @@ impl ExternalApiService {
     /// バーチャル小説と、そのメンバーの題名 (作品 ID -> 題名)。
     async fn related_titles(
         &self,
+        scope: &mut NovelReadScope,
         members: &VirtualNovelMembers,
-    ) -> std::collections::HashMap<i64, String> {
-        let mut ids: Vec<i64> = members.all_member_ids().into_iter().collect();
-        ids.extend(members.groups.keys().copied());
-        if ids.is_empty() {
-            return std::collections::HashMap::new();
+        records: &[NovelRecord],
+    ) -> Result<std::collections::HashMap<i64, String>, ApplicationError> {
+        let mut ids = std::collections::BTreeSet::new();
+        for record in records {
+            if let Some(owner) = members.owner_of(record.id) { ids.insert(owner); }
+            if let Some(children) = members.get(record.id) { ids.extend(children.iter().copied()); }
         }
-        match self.library.records_by_ids(&ids).await {
-            Ok(records) => records
-                .into_iter()
-                .map(|record| (record.id, record.title))
-                .collect(),
-            Err(_) => std::collections::HashMap::new(),
-        }
+        self.titles_of(scope, &ids.into_iter().collect::<Vec<_>>()).await
     }
 
     /// 親バーチャル小説の題名 (メンバーでなければ `None`)。
@@ -743,27 +765,21 @@ impl ExternalApiService {
     /// 1 件の作品情報では親 1 件分だけ読む (全メンバーの記録は読まない)。
     async fn parent_title(
         &self,
+        scope: &mut NovelReadScope,
         owner: Option<i64>,
-    ) -> Option<String> {
-        let owner = owner?;
-        match self.library.get(NovelId(owner)).await {
-            Ok(Some(record)) => Some(record.title),
-            _ => None,
-        }
+    ) -> Result<Option<String>, ApplicationError> {
+        let Some(owner) = owner else { return Ok(None); };
+        Ok(self.content.read_record(scope, NovelId(owner)).await?.map(|record| record.title))
     }
 
     /// 指定した作品の題名 (作品 ID -> 題名)。
-    async fn titles_of(&self, ids: &[i64]) -> std::collections::HashMap<i64, String> {
-        if ids.is_empty() {
-            return std::collections::HashMap::new();
+    async fn titles_of(&self, scope: &mut NovelReadScope, ids: &[i64]) -> Result<std::collections::HashMap<i64, String>, ApplicationError> {
+        let mut titles = std::collections::HashMap::with_capacity(ids.len());
+        let novel_ids: Vec<_> = ids.iter().copied().map(NovelId).collect();
+        for (id, record) in ids.iter().zip(self.content.read_records(scope, &novel_ids).await?) {
+            if let Some(record) = record { titles.insert(*id, record.title); }
         }
-        match self.library.records_by_ids(ids).await {
-            Ok(records) => records
-                .into_iter()
-                .map(|record| (record.id, record.title))
-                .collect(),
-            Err(_) => std::collections::HashMap::new(),
-        }
+        Ok(titles)
     }
 
     fn virtual_novel_info(
@@ -789,6 +805,23 @@ impl ExternalApiService {
                 })
                 .collect(),
         }
+    }
+
+    async fn validate_membership(
+        &self,
+        scope: &mut NovelReadScope,
+        expected: &VirtualNovelMembers,
+        ids: impl Iterator<Item = i64>,
+    ) -> Result<(), ApplicationError> {
+        scope.refresh_all().await.map_err(ApplicationError::platform)?;
+        let current = self.virtual_novels.members().await.map_err(ApplicationError::platform)?;
+        scope.refresh_all().await.map_err(ApplicationError::platform)?;
+        for id in ids {
+            if current.get(id) != expected.get(id) || current.owner_of(id) != expected.owner_of(id) {
+                return Err(ApplicationError::Conflict("virtual membership changed during read".into()));
+            }
+        }
+        Ok(())
     }
 
     fn novel_row(
@@ -1365,5 +1398,19 @@ mod tests {
             resolve_section_owner(&[12], "3"),
             Some((12, "3".to_string()))
         );
+    }
+
+    #[test]
+    fn gate_errors_keep_their_public_recovery_and_conflict_statuses() {
+        for (message, expected) in [
+            ("novel_recovering: closed", (503, "novel_recovering")),
+            ("recovery_required: journal", (503, "recovery_required")),
+            ("novel_busy: writer", (423, "novel_busy")),
+            ("novel_epoch_conflict: stale", (409, "novel_epoch_conflict")),
+            ("gate_epoch_conflict: stale", (409, "novel_epoch_conflict")),
+            ("storage unavailable", (500, "internal_error")),
+        ] {
+            assert_eq!(http_error(&ApplicationError::Platform(message.into())), expected);
+        }
     }
 }

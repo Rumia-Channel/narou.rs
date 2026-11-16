@@ -422,7 +422,13 @@ mod tests {
     async fn source(store: Arc<MemoryObjectStore>, text: String) -> ConvertedText {
         let key = ObjectKey::try_new("fixture/novel.txt").unwrap();
         store.write_stream(&key, owned_bytes_stream(text.into_bytes())).await.unwrap();
-        ConvertedText::from_stored(store, key).await.unwrap().unwrap()
+        let objects: Arc<dyn crate::platform::ObjectStore> = store.clone();
+        let mut lease = crate::application::novel_access::NovelReadLease::admit(
+            &objects, &crate::platform::ObjectPrefix::new("fixture").unwrap(), "epub-test",
+        ).await.unwrap();
+        let text = ConvertedText::from_stored(store, &mut lease, key).await.unwrap().unwrap();
+        lease.release().await.unwrap();
+        text
     }
 
     async fn fragments(store: &dyn AssetStore, build: &StreamingBuild) -> Vec<String> {

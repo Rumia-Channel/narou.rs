@@ -372,7 +372,8 @@ pub mod worker_ledger {
             sql: format!(
                 "UPDATE worker_jobs \
                  SET status = 'permanent', last_error = ?, updated_at = ?, \
-                     lease_until = NULL, execution_token = NULL, checkpoint_json = NULL, admission_waiting = 0 \
+                     lease_until = NULL, execution_token = NULL, \
+                     checkpoint_json = CASE WHEN json_extract(checkpoint_json, '$.creation_reservation') IS NOT NULL THEN checkpoint_json ELSE NULL END, admission_waiting = 0 \
                  WHERE job_id = ? AND status IN ('pending', 'running', 'retryable') \
                    AND ((status = 'retryable' AND attempts > {max_retries}) OR recovery_attempts >= {MAX_RECOVERY_ATTEMPTS}) \
                    AND COALESCE(lease_until, updated_at) <= ?"
@@ -422,6 +423,24 @@ pub mod worker_ledger {
         checkpoint_statement(now, job_id, execution_token, checkpoint_json, false)
     }
 
+    /// Restart a corrupt section under the same durable ownership, without
+    /// earning a new delivery-recovery budget or changing reservations.
+    pub fn restart_checkpoint(now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs SET checkpoint_json=?1, updated_at=?2 \
+                  WHERE job_id=?3 AND status='running' AND execution_token=?4 \
+                    AND json_extract(checkpoint_json,'$.job_id')=?3 \
+                    AND json_extract(?1,'$.job_id')=?3 \
+                    AND json_extract(?1,'$.phase')='fetching' AND json_extract(?1,'$.next_section_index')=0 \
+                    AND json_extract(?1,'$.write_origin.prefix') IS NOT NULL \
+                    AND json_extract(checkpoint_json,'$.write_origin.prefix') IS json_extract(?1,'$.write_origin.prefix') \
+                    AND json_extract(checkpoint_json,'$.write_origin.epoch') IS json_extract(?1,'$.write_origin.epoch') \
+                    AND json_extract(checkpoint_json,'$.creation_reservation[0]') IS json_extract(?1,'$.creation_reservation[0]') \
+                    AND json_extract(checkpoint_json,'$.creation_reservation[1]') IS json_extract(?1,'$.creation_reservation[1]')".into(),
+            binds: vec![checkpoint_json.to_owned(), now.to_owned(), job_id.to_owned(), execution_token.to_owned()],
+        }
+    }
+
     fn checkpoint_statement(
         now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str, release: bool,
     ) -> Statement {
@@ -443,10 +462,18 @@ pub mod worker_ledger {
                      json_extract(checkpoint_json, '$.novel_id') AS old_novel, \
                      json_extract(checkpoint_json, '$.phase') AS old_phase, \
                      json_extract(checkpoint_json, '$.next_section_index') AS old_cursor, \
+                     json_extract(checkpoint_json, '$.write_origin.prefix') AS old_prefix, \
+                     json_extract(checkpoint_json, '$.write_origin.epoch') AS old_epoch, \
+                     json_extract(checkpoint_json, '$.creation_reservation[0]') AS old_create_id, \
+                     json_extract(checkpoint_json, '$.creation_reservation[1]') AS old_create_generation, \
                      json_extract(?1, '$.job_id') AS new_job, \
                      json_extract(?1, '$.novel_id') AS new_novel, \
                      json_extract(?1, '$.phase') AS new_phase, \
-                     json_extract(?1, '$.next_section_index') AS new_cursor \
+                     json_extract(?1, '$.next_section_index') AS new_cursor, \
+                     json_extract(?1, '$.write_origin.prefix') AS new_prefix, \
+                     json_extract(?1, '$.write_origin.epoch') AS new_epoch, \
+                     json_extract(?1, '$.creation_reservation[0]') AS new_create_id, \
+                     json_extract(?1, '$.creation_reservation[1]') AS new_create_generation \
                    FROM worker_jobs WHERE job_id = ?3 AND status = 'running' AND execution_token = ?4 \
                  ), compatible AS ( \
                    SELECT *, new_job = ?3 \
@@ -454,21 +481,32 @@ pub mod worker_ledger {
                      AND ((new_phase IN ('planned', 'finished') AND new_cursor IS NULL) \
                        OR (new_phase IN ('fetching', 'persisting', 'finished') \
                          AND typeof(new_cursor) = 'integer' AND new_cursor >= 0)) \
+                     AND ((new_prefix IS NULL AND new_epoch IS NULL) \
+                       OR (typeof(new_prefix) = 'text' AND typeof(new_epoch) = 'integer' AND new_epoch >= 0)) \
+                     AND ((new_create_id IS NULL AND new_create_generation IS NULL) \
+                       OR (typeof(new_create_id) = 'integer' AND typeof(new_create_generation) = 'integer' \
+                         AND (new_prefix IS NOT NULL OR (new_phase = 'planned' AND new_cursor IS NULL)))) \
                      AND (initial OR (old_job = ?3 \
                        AND (old_novel IS NULL OR old_novel IS new_novel) \
+                       AND (old_prefix IS NULL OR (old_prefix IS new_prefix AND old_epoch IS new_epoch)) \
+                       AND (old_create_id IS NULL OR (old_create_id IS new_create_id AND old_create_generation IS new_create_generation)) \
+                       AND (old_prefix IS NULL OR old_create_id IS NOT NULL OR new_create_id IS NULL) \
                        AND ((old_phase = 'planned' AND old_cursor IS NULL) \
                          OR (old_phase IN ('fetching', 'persisting') \
                            AND typeof(old_cursor) = 'integer' AND old_cursor >= 0)))) AS valid \
                    FROM positions \
                  ), progress AS MATERIALIZED ( \
-                   SELECT valid AND initial AS initialize, valid AND (new_phase = 'finished' \
+                   SELECT valid AND (initial OR (old_prefix IS NULL AND new_prefix IS NOT NULL) \
+                     OR (old_create_id IS NULL AND new_create_id IS NOT NULL AND new_phase = 'planned' AND new_cursor IS NULL) \
+                     OR (old_phase = 'planned' AND old_cursor IS NULL AND new_phase IN ('fetching','persisting') AND new_cursor = 0)) AS initialize, \
+                     valid AND (new_phase = 'finished' \
                      OR (new_phase IN ('fetching', 'persisting') \
                        AND new_cursor > COALESCE(old_cursor, 0))) AS advanced FROM compatible \
                  ) UPDATE worker_jobs SET {release} \
                    recovery_attempts = CASE WHEN (SELECT advanced FROM progress) THEN 0 ELSE recovery_attempts END, \
                    checkpoint_json = CASE WHEN (SELECT initialize OR advanced FROM progress) THEN ?1 ELSE checkpoint_json END, \
                    updated_at = ?2 \
-                 WHERE job_id = ?3 AND status = 'running' AND execution_token = ?4"
+                 WHERE job_id = ?3 AND status = 'running' AND execution_token = ?4 AND (SELECT valid FROM compatible)"
             ),
             binds: vec![checkpoint_json.to_string(), now.to_string(), job_id.to_string(), execution_token.to_string()],
         }
@@ -876,6 +914,9 @@ pub fn classify_failure(error: &NarouError) -> JobFailureClass {
         | NarouError::Platform(_)
         | NarouError::SuspendDownload(_)
         | NarouError::DownloadBudgetExpired { .. } => JobFailureClass::Retryable,
+        // A drained creator's cleanup is still competing with admitted
+        // readers/file handles; recovery itself is transient, never terminal.
+        NarouError::CreationCleanupPending => JobFailureClass::Retryable,
         NarouError::DownloadResumeCorrupt(_)
         | NarouError::SiteSetting(_)
         | NarouError::Yaml(_)
@@ -1117,6 +1158,12 @@ pub struct WorkerExecutionCheckpoint {
     pub phase: ExecutionPhase,
     /// `Some` when the downloader yielded before starting this section.
     pub next_section_index: Option<u64>,
+    /// Original open epoch: continuation never adopts a later publication.
+    #[serde(default)]
+    pub write_origin: Option<super::novel_access::AccessOrigin>,
+    /// Exact creation ID and generation retained through publication and release.
+    #[serde(default)]
+    pub creation_reservation: Option<(NovelId, i64)>,
 }
 
 impl WorkerExecutionCheckpoint {
@@ -1127,7 +1174,14 @@ impl WorkerExecutionCheckpoint {
             novel_id,
             phase: ExecutionPhase::Planned,
             next_section_index: None,
+            write_origin: None,
+            creation_reservation: None,
         }
+    }
+
+    pub fn with_write_origin(mut self, origin: super::novel_access::AccessOrigin) -> Self {
+        self.write_origin = Some(origin);
+        self
     }
 
     /// Advance to a later phase, optionally recording the next section index.
@@ -1137,6 +1191,8 @@ impl WorkerExecutionCheckpoint {
             novel_id: self.novel_id,
             phase,
             next_section_index,
+            write_origin: self.write_origin.clone(),
+            creation_reservation: self.creation_reservation,
         }
     }
 }
@@ -1704,6 +1760,10 @@ mod tests {
             JobFailureClass::Retryable
         );
         assert_eq!(
+            classify_failure(&NarouError::CreationCleanupPending),
+            JobFailureClass::Retryable
+        );
+        assert_eq!(
             classify_failure(&NarouError::NotFound("gone".into())),
             JobFailureClass::Permanent
         );
@@ -1919,6 +1979,38 @@ mod tests {
         assert_eq!(back, advanced);
         assert!(json.contains("fetching"));
         assert!(json.contains("next_section_index"));
+    }
+
+    #[test]
+    fn serialized_continuation_cannot_replace_later_published_bytes() {
+        use std::sync::Arc;
+        use crate::application::novel_access::NovelWriteGuard;
+        use crate::platform::{AssetStore, ObjectStore, ObjectPrefix, NovelObjectKeys};
+        use crate::platform::mocks::MemoryObjectStore;
+        futures::executor::block_on(async {
+            let backend = Arc::new(MemoryObjectStore::new());
+            let objects: Arc<dyn ObjectStore> = backend.clone();
+            let keys = NovelObjectKeys::new("site", "continued", false).unwrap();
+            let prefix = ObjectPrefix::from(keys.prefix().clone());
+            let key = keys.section("1", "body");
+            let writer = NovelWriteGuard::capture_for(&objects, None, &keys).await.unwrap();
+            writer.write_small(&key, b"job's completed section".to_vec()).await.unwrap();
+            let checkpoint = WorkerExecutionCheckpoint::planned(JobId("continued".into()), Some(NovelId(1)))
+                .with_write_origin(writer.origin()).advance(ExecutionPhase::Fetching, Some(1));
+            let durable = serde_json::to_vec(&checkpoint).unwrap();
+            let gate = objects.access_fence().unwrap();
+            let epoch = gate.close_gate(&prefix, "replacement").await.unwrap();
+            let stage = backend.stage_stream(crate::platform::staging::owned_bytes_stream(b"published replacement".to_vec())).await.unwrap();
+            gate.commit_staged(&prefix, "replacement", epoch, &stage.key, &key).await.unwrap();
+            gate.open_gate(&prefix, "replacement", epoch).await.unwrap();
+
+            let resumed: WorkerExecutionCheckpoint = serde_json::from_slice(&durable).unwrap();
+            let advanced = resumed.advance(ExecutionPhase::Persisting, Some(2));
+            let origin = advanced.write_origin.as_ref().unwrap();
+            assert_eq!(origin, &writer.origin(), "every checkpoint transition retains the same origin");
+            assert!(NovelWriteGuard::resume(objects.clone(), None, origin).await.is_err(), "a durable continuation must reject its superseded epoch before source I/O");
+            assert_eq!(objects.read_small(&key).await.unwrap().unwrap(), b"published replacement");
+        });
     }
 
     #[test]
@@ -2547,6 +2639,76 @@ mod tests {
             ).unwrap()
         }
 
+        #[test]
+        fn creation_checkpoint_binds_origin_and_reservation_atomically_before_progress() {
+            let conn = db();
+            insert(&conn, "creation", "https://example.test/new/", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "creation", "https://example.test/new/", None)), 1);
+            let planned = checkpoint_json("creation", None, ExecutionPhase::Planned, None);
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "token", &planned)), 1);
+            conn.execute("UPDATE worker_jobs SET recovery_attempts=2 WHERE job_id='creation'", []).unwrap();
+            let mut owned: serde_json::Value = serde_json::from_str(&planned).unwrap();
+            owned["creation_reservation"] = serde_json::json!([43,17]);
+            let early = serde_json::to_string(&owned).unwrap();
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "token", &early)), 1);
+            assert_eq!(recovery_checkpoint(&conn, "creation"), (2, Some(early.clone())));
+            let mut unsafe_cursor = owned.clone();
+            unsafe_cursor["phase"] = serde_json::json!("fetching");
+            unsafe_cursor["next_section_index"] = serde_json::json!(0);
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "token", &serde_json::to_string(&unsafe_cursor).unwrap())), 0, "a numeric-only claim cannot authorize even cursor zero before its prefix is known");
+            owned["write_origin"] = serde_json::json!({"prefix":"novels/example/new", "epoch":7});
+            let original = serde_json::to_string(&owned).unwrap();
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "stale-token", &original)), 0);
+            assert_eq!(recovery_checkpoint(&conn, "creation"), (2, Some(early)));
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "token", &original)), 1);
+            assert_eq!(recovery_checkpoint(&conn, "creation"), (2, Some(original.clone())), "claim ownership is durable without laundering a new recovery budget");
+            for (field, value) in [
+                ("creation_reservation", serde_json::json!([44,17])),
+                ("creation_reservation", serde_json::json!([43,18])),
+                ("creation_reservation", serde_json::Value::Null),
+                ("write_origin", serde_json::json!({"prefix":"novels/example/new", "epoch":8})),
+                ("write_origin", serde_json::Value::Null),
+            ] {
+                let mut changed = owned.clone();
+                changed[field] = value;
+                changed["phase"] = serde_json::json!("fetching");
+                changed["next_section_index"] = serde_json::json!(100);
+                let encoded = serde_json::to_string(&changed).unwrap();
+                assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "token", &encoded)), 0);
+                assert_eq!(recovery_checkpoint(&conn, "creation"), (2, Some(original.clone())));
+            }
+            conn.execute("UPDATE worker_jobs SET recovery_attempts=3,lease_until=? WHERE job_id='creation'", [NOW]).unwrap();
+            assert_eq!(apply(&conn, worker_ledger::finalize_stuck("delivery lost", NOW, "creation", NOW, 0)), 1);
+            assert_eq!(status_of(&conn, "creation"), "permanent");
+            assert_eq!(recovery_checkpoint(&conn, "creation"), (3, Some(original)), "terminal recovery must retain the exact claim proof until release succeeds");
+            let token: Option<String> = conn.query_row("SELECT execution_token FROM worker_jobs WHERE job_id='creation'", [], |row| row.get(0)).unwrap();
+            assert!(token.is_none());
+        }
+
+        #[test]
+        fn corrupt_creation_resume_restarts_only_under_the_same_origin_and_generation() {
+            let conn = db();
+            insert(&conn, "restart", "https://example.test/new/", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "restart", "https://example.test/new/", None)), 1);
+            let mut saved: serde_json::Value = serde_json::from_str(&checkpoint_json("restart", None, ExecutionPhase::Fetching, Some(200))).unwrap();
+            saved["write_origin"] = serde_json::json!({"prefix":"novels/example/new", "epoch":7});
+            saved["creation_reservation"] = serde_json::json!([43,17]);
+            let original = serde_json::to_string(&saved).unwrap();
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "restart", "token", &original)), 1);
+            conn.execute("UPDATE worker_jobs SET recovery_attempts=2 WHERE job_id='restart'", []).unwrap();
+            saved["next_section_index"] = serde_json::json!(0);
+            let restarted = serde_json::to_string(&saved).unwrap();
+            assert_eq!(apply(&conn, worker_ledger::restart_checkpoint(NOW, "restart", "stale-token", &restarted)), 0);
+            let mut foreign = saved.clone();
+            foreign["creation_reservation"] = serde_json::json!([43,18]);
+            assert_eq!(apply(&conn, worker_ledger::restart_checkpoint(NOW, "restart", "token", &serde_json::to_string(&foreign).unwrap())), 0);
+            assert_eq!(recovery_checkpoint(&conn, "restart"), (2, Some(original)));
+            assert_eq!(apply(&conn, worker_ledger::restart_checkpoint(NOW, "restart", "token", &restarted)), 1);
+            assert_eq!(recovery_checkpoint(&conn, "restart"), (2, Some(restarted.clone())));
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "restart", "token", &restarted)), 1);
+            assert_eq!(recovery_checkpoint(&conn, "restart"), (2, Some(restarted)));
+        }
+
         fn stuck(conn: &Connection, before: &str) -> Vec<String> {
             let statement = worker_ledger::select_stuck(before, 50);
             conn.prepare(&statement.sql).unwrap()
@@ -2606,30 +2768,31 @@ mod tests {
                 let malformed_cursor = r#"{"job_id":"progress","novel_id":null,"phase":"fetching","next_section_index":"300"}"#;
                 let unknown_shape = r#"{"job_id":"progress","novel_id":null,"phase":"other","next_section_index":300}"#;
                 let cases = [
-                    (planned.clone(), false, planned.clone()),
-                    (checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(0)), false, planned.clone()),
-                    (unresolved.clone(), true, unresolved.clone()),
-                    (serde_json::to_string_pretty(&metadata).unwrap(), false, unresolved.clone()),
-                    (checkpoint_json("other-generation", None, ExecutionPhase::Fetching, Some(300)), false, unresolved.clone()),
-                    (malformed_cursor.into(), false, unresolved.clone()),
-                    (unknown_shape.into(), false, unresolved.clone()),
-                    (planned, false, unresolved),
-                    (resolved.clone(), true, resolved.clone()),
-                    (checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(300)), false, resolved.clone()),
-                    (checkpoint_json("progress", Some(99), ExecutionPhase::Fetching, Some(300)), false, resolved),
-                    (persisted.clone(), true, persisted),
-                    (finished.clone(), true, finished.clone()),
-                    (checkpoint_json("progress", Some(42), ExecutionPhase::Fetching, Some(300)), false, finished.clone()),
-                    (finished.clone(), false, finished),
+                    (planned.clone(), false, true, planned.clone()),
+                    (checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(0)), false, true, checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(0))),
+                    (unresolved.clone(), true, true, unresolved.clone()),
+                    (serde_json::to_string_pretty(&metadata).unwrap(), false, true, unresolved.clone()),
+                    (checkpoint_json("other-generation", None, ExecutionPhase::Fetching, Some(300)), false, false, unresolved.clone()),
+                    (malformed_cursor.into(), false, false, unresolved.clone()),
+                    (unknown_shape.into(), false, false, unresolved.clone()),
+                    (planned, false, true, unresolved),
+                    (resolved.clone(), true, true, resolved.clone()),
+                    (checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(300)), false, false, resolved.clone()),
+                    (checkpoint_json("progress", Some(99), ExecutionPhase::Fetching, Some(300)), false, false, resolved),
+                    (persisted.clone(), true, true, persisted),
+                    (finished.clone(), true, true, finished.clone()),
+                    (checkpoint_json("progress", Some(42), ExecutionPhase::Fetching, Some(300)), false, false, finished.clone()),
+                    (finished.clone(), false, false, finished),
                 ];
-                for (encoded, advances, expected) in cases {
+                for (encoded, advances, accepted, expected) in cases {
                     if status_of(&conn, "progress") == "pending" {
                         assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "progress", "42", None)), 1);
                     }
                     conn.execute("UPDATE worker_jobs SET recovery_attempts = 2", []).unwrap();
-                    assert_eq!(apply(&conn, publish(NOW, "progress", "token", &encoded)), 1);
+                    assert_eq!(apply(&conn, publish(NOW, "progress", "token", &encoded)), usize::from(accepted));
                     assert_eq!(recovery_checkpoint(&conn, "progress"),
                         (if advances { 0 } else { 2 }, Some(expected)), "release={release}, checkpoint={encoded}");
+                    if !accepted { assert_eq!(status_of(&conn, "progress"), "running", "invalid ownership must not release the actual token"); }
                 }
             }
         }

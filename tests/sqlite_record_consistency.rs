@@ -224,21 +224,21 @@ fn sqlite_allocations_share_durable_ownership_and_generation_fenced_release() {
     let other = second.allocate_id().unwrap();
     assert_ne!(owned.id(), other.id());
     let reusable = owned.id();
-    first.release_id(owned);
+    first.release_id(&owned).unwrap();
     let retry = second.allocate_id().unwrap();
     assert_eq!(retry.id(), reusable);
     assert_ne!(retry.generation(), stale.generation());
-    first.release_id(stale);
+    first.release_id(&stale).unwrap();
     let fresh = first.allocate_id().unwrap();
     assert_ne!(fresh.id(), retry.id(), "stale release must not free a new owner's reservation");
     second.insert(record(retry.id().0));
     second.save().unwrap();
-    second.release_id(retry);
+    second.release_id(&retry).unwrap();
     let later = first.allocate_id().unwrap();
     assert_ne!(later.id(), reusable, "committed IDs must not reenter the pool");
-    first.release_id(fresh);
-    first.release_id(later);
-    second.release_id(other);
+    first.release_id(&fresh).unwrap();
+    first.release_id(&later).unwrap();
+    second.release_id(&other).unwrap();
 }
 
 #[test]

@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use narou_rs::application::novel_access::NovelReadScope;
 
 use narou_rs::application::webui::diff::{plan_diff_cache_clean, read_diff_cache_catalog};
 use narou_rs::native::object_store::NativeObjectStore;
@@ -60,14 +62,16 @@ fn empty_legacy_versions_survive_real_import_and_yaml_export() {
     let original_marker = archive.join("site/title/本文/cache/v3/.version");
     std::fs::write(&original_marker, b"existing version record").unwrap();
     let keys = NovelObjectKeys::new("site", "title", false).unwrap();
-    let store = db_only_store(root);
+    let store: Arc<dyn ObjectStore> = Arc::new(db_only_store(root));
     futures::executor::block_on(async {
-        let versions = read_diff_cache_catalog(&store, keys.prefix(), &[]).await.unwrap();
+        let mut scope = NovelReadScope::new(&store, "sqlite-diff-catalog");
+        let versions = read_diff_cache_catalog(&mut scope, store.as_ref(), keys.prefix(), &[]).await.unwrap();
         assert_eq!(versions.iter().map(|version| version.version.as_str()).collect::<Vec<_>>(), ["v3", "v2", "v1"]);
         assert!(versions.iter().all(|version| version.only_latest_update));
-        assert_eq!(plan_diff_cache_clean(&store, keys.prefix()).await.unwrap().len(), 3,
+        assert_eq!(plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap().len(), 3,
             "only recognized empty cache-version directories become rows");
         assert_eq!(store.read_small(&keys.cached_version_marker("v3")).await.unwrap().unwrap(), b"existing version record");
+        scope.release_all().await.unwrap();
     });
     assert!(!archive.join("site/title/本文/cache/v1/.version").exists(), "import only writes database rows");
     assert!(!archive.join("site/title/本文/.cache/v2/.version").exists());
@@ -86,8 +90,13 @@ fn empty_legacy_versions_survive_real_import_and_yaml_export() {
     }
     assert!(!exported_archive.join("site/title/raw/cache/not-a-version").exists());
     assert!(!exported_archive.join("site/title/本文/cache/not-a-version").exists());
-    let exported = NativeObjectStore::from_root(exported_archive).unwrap();
-    let versions = futures::executor::block_on(read_diff_cache_catalog(&exported, keys.prefix(), &[])).unwrap();
+    let exported: Arc<dyn ObjectStore> = Arc::new(NativeObjectStore::from_root(exported_archive).unwrap());
+    let versions = futures::executor::block_on(async {
+        let mut scope = NovelReadScope::new(&exported, "exported-diff-catalog");
+        let result = read_diff_cache_catalog(&mut scope, exported.as_ref(), keys.prefix(), &[]).await;
+        scope.release_all().await.unwrap();
+        result.unwrap()
+    });
     assert_eq!(versions.iter().map(|version| version.version.as_str()).collect::<Vec<_>>(), ["v3", "v2", "v1"]);
     assert!(versions.iter().all(|version| version.only_latest_update));
 }

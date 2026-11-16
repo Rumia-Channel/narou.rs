@@ -120,6 +120,7 @@ fn start_queue_worker_for_lane(
     lane: WorkerLane,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut recovery = crate::native::application::NativeRecoveryCursor::default();
         loop {
             let job = {
                 let _guard = job_transition_lock.lock();
@@ -133,7 +134,21 @@ fn start_queue_worker_for_lane(
             let Some(job) = job else {
                 tokio::select! {
                     _ = workers.queue.wait_for_change() => {}
-                    _ = tokio::time::sleep(Duration::from_secs(IDLE_EXTERNAL_QUEUE_POLL_SECS)) => {}
+                    _ = tokio::time::sleep(Duration::from_secs(IDLE_EXTERNAL_QUEUE_POLL_SECS)) => {
+                        match tokio::task::spawn_blocking(move || {
+                            let result = crate::native::application::recover_maintenance(&mut recovery);
+                            (recovery, result)
+                        }).await {
+                            Ok((cursor, result)) => {
+                                recovery = cursor;
+                                if let Err(error) = result { eprintln!("Native cleanup deferred: {error}"); }
+                            }
+                            Err(error) => {
+                                recovery = crate::native::application::NativeRecoveryCursor::default();
+                                eprintln!("Native cleanup worker failed: {error}");
+                            }
+                        }
+                    }
                 }
                 continue;
             };
@@ -463,6 +478,9 @@ fn execute_job(workers: &QueueWorkerContext, job: &QueueJob) -> JobRunResult {
     }
 
     let mut command = new_web_subprocess_command(&exe, root_dir, &job.id);
+    if let Some(origin) = spec.as_ref().and_then(|spec| execution_spec_meta_string(spec, "write_origin")) {
+        command.env("NAROU_RS_WRITE_ORIGIN", origin);
+    }
 
     if let Some(spec) = spec {
         match spec.cmd.as_str() {

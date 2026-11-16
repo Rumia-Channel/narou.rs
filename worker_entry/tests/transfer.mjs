@@ -1,1185 +1,215 @@
-// Worker の可搬アーカイブ API (`/api/transfer/export` / `import`) の契約テスト。
-//
-// 先に Worker をビルドしておく (このファイルはビルドしない):
-//
-//   worker-build            # または node tests/run.mjs (run.mjs が全部やる)
-//   node tests/transfer.mjs
-//
-// 独立した D1 (miniflare SQLite) を 2 つ用意し、1 つ目へ取り込んだ小説を
-// 書き出し、その ZIP を 2 つ目の空 DB へ取り込む往復を検証する。DB は
-// `.wrangler/transfer-smoke-*` に作り、終了時に削除する。
-//
-// 検証すること:
-//   * import (create): ZIP → D1 レコード + オブジェクト (toc.yaml / 本文 /
-//     setting.ini / replace.txt / converter.yaml / 挿絵)
-//   * export: manifest.json のメタデータ・ファイル一覧・SHA-256 と実体
-//   * 別 DB への import と再 export (同じ相対パス・同じ内容)
-//   * overwrite: レコード ID と保存先を維持し、アーカイブに無いファイルを
-//     消さない / 空のメタデータだけ埋める
-//   * 認証 (401) / Content-Type (415) / 存在しない ID (404) / 壊れた ZIP (400)
+// Real workerd/D1 transfer v2 contracts. Build artifacts first; this file
+// never invokes a compiler. Helpers are also used by storage/tag contracts.
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import { once } from 'node:events';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { deflateSync, inflateSync, inflateRawSync } from 'node:zlib';
-import process from 'node:process';
-
-const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-if (!existsSync(join(root, 'build', 'worker', 'shim.mjs'))) {
-  console.error('build/worker/shim.mjs is missing; run `worker-build` (or node tests/run.mjs) first');
-  process.exit(1);
+import {spawn,spawnSync} from 'node:child_process';
+import {existsSync,mkdirSync,mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
+import {createHash,randomBytes,randomUUID} from 'node:crypto';
+import {crc32} from 'node:zlib';
+import {once} from 'node:events';
+import {dirname,join} from 'node:path';
+import {fileURLToPath,pathToFileURL} from 'node:url';
+const root=join(dirname(fileURLToPath(import.meta.url)),'..');
+const CHUNK=8*1024*1024-64*1024;
+const WIRE=8*1024*1024;
+export const sha256=bytes=>createHash('sha256').update(bytes).digest('hex');
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+export function encodeBatch(records){
+  const frames=records.map(({file_id,chunk_index,bytes,final,sha256:digest})=>{
+    const header=Buffer.from(JSON.stringify({file_id,chunk_index,payload_size:String(bytes.length),final,sha256:digest??sha256(bytes)}));
+    assert(header.length<=512);const length=Buffer.alloc(4);length.writeUInt32BE(header.length);return Buffer.concat([length,header,bytes]);
+  });const bytes=Buffer.concat(frames);assert(records.length<=100&&bytes.length<=WIRE);return bytes;
 }
-mkdirSync(join(root, '.wrangler'), { recursive: true });
-const work = mkdtempSync(join(root, '.wrangler', 'transfer-smoke-'));
-const token = 'isolated-transfer-smoke-token';
-const windows = process.platform === 'win32';
-const npx = windows ? 'npx.cmd' : 'npx';
-// Same pinned Wrangler as `tests/run.mjs` (and the deploy CI).
-const WRANGLER_VERSION = process.env.NAROU_WRANGLER_VERSION || '4.151.3';
-if (!/^\d+\.\d+\.\d+$/.test(WRANGLER_VERSION)) {
-  throw new Error(`NAROU_WRANGLER_VERSION must be exact x.y.z: ${WRANGLER_VERSION}`);
+function wireManifest(novels,policyVersion,profile,roles){
+  let ordinal=0,texts=0;const records=[];const files=[];
+  for(const [index,novel]of novels.entries()){
+    records.push({type:'novel',index,kind:novel.virtual_members?'virtual_parent':'normal',novel_type:novel.novel_type??1,files:novel.files.length});
+    const text=(field,value,item)=>{const input=String(value);let pending='',partBytes=0;let part=0;for(const point of input){const n=Buffer.byteLength(point);if(partBytes+n>32768){records.push({type:'text',novel:index,field,item,part:part++,last:false,value:pending});texts++;pending='';partBytes=0;}pending+=point;partBytes+=n;}records.push({type:'text',novel:index,field,item,part,last:true,value:pending});texts++;};
+    for(const field of ['toc_url','title','author','sitename','domain','attribute_tag','ncode','subtitle','general_lastup','last_update']){if(novel[field]!==undefined&&novel[field]!==null)text(field,novel[field]);}
+    for(const [item,tag]of(novel.tags??[]).entries())text('tag',tag,item);
+    for(const [item,url]of(novel.virtual_members??[]).entries())text('member',url,item);
+    for(const file of novel.files){const bytes=Buffer.from(file.bytes??file.data);const value={type:'file',file_id:ordinal++,novel:index,path:file.path,size:String(bytes.length),sha256:sha256(bytes)};records.push(value);files.push({...value,bytes});}
+  }
+  const fingerprint=sha256(Buffer.from(JSON.stringify(records)));
+  const u32=value=>{const bytes=Buffer.alloc(4);bytes.writeUInt32BE(value);return bytes;};
+  const u64=value=>{const bytes=Buffer.alloc(8);bytes.writeBigUInt64BE(BigInt(value));return bytes;};
+  const selected=createHash('sha256').update(Buffer.from('narou-transfer-projection-v2\0')).update(u32(policyVersion)).update(Buffer.from(fingerprint,'hex')).update(Buffer.from(profile+'\0'));
+  const sorted=[...new Set(roles)].sort();selected.update(u32(sorted.length));for(const role of sorted)selected.update(Buffer.from(role+'\0'));
+  for(const record of records){if(record.type==='novel')selected.update(Buffer.from('N')).update(u32(record.index));if(record.type==='file'){const path=Buffer.from(record.path);selected.update(Buffer.from('F')).update(u64(path.length)).update(path).update(u64(record.size)).update(Buffer.from(record.sha256,'hex'));}}
+  const header={type:'header',format_version:2,protocol_version:2,policy_version:policyVersion,profile,extra_roles:roles,fingerprint,selection_digest:selected.digest('hex'),novels:novels.length,files:ordinal,texts};
+  const bytes=Buffer.from([header,...records,{type:'end',novels:novels.length,files:ordinal,texts}].map(r=>JSON.stringify(r)+'\n').join(''));
+  return {bytes,files,fingerprint};
 }
-const WRANGLER = `wrangler@${WRANGLER_VERSION}`;
-const devVars = `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${Buffer.alloc(32, 7).toString('base64')}\nS3_ACCESS_KEY_ID=local-test-key\nS3_SECRET_ACCESS_KEY=local-test-secret\n`;
-
-// ---------------------------------------------------------------------------
-// ZIP (ストアのみで作り、読み出しはストア/Deflate の両対応)
-// ---------------------------------------------------------------------------
-
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let index = 0; index < 256; index += 1) {
-    let value = index;
-    for (let bit = 0; bit < 8; bit += 1) {
-      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+export function selectionDigest(revision,profile,roles,items){
+  const rows=items.map(item=>`${item.novel_ordinal}\0${item.logical_path}\0${item.size}\0${item.role}`).sort((a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b)));
+  return sha256(Buffer.from(`v2\0${revision}\0${profile}\0${[...roles].sort().join(',')}\0${rows.map(r=>r+'\x01').join('')}`));
+}
+export function transferClient(base,token,{verifyPrimary=false}={}){
+  const client={base,token,verifyPrimary,requests:[],
+    async request(path,init={}){const bytes=init.body===undefined?0:Buffer.byteLength(init.body);if(init.headers?.['content-type']==='application/octet-stream')assert(bytes<=WIRE);
+      client.requests.push({path,method:init.method??'GET',bytes,type:init.headers?.['content-type']??''});
+      const response=await fetch(client.base+path,{...init,redirect:'manual',headers:{Authorization:`Bearer ${token}`,Connection:'close',...client.extraHeaders,...init.headers}});if(client.verifyPrimary&&path.startsWith('/api/transfer/v2'))assert.equal(response.headers.get('x-test-transfer-primary-only'),'true','all v2 store access must use primary');const wasmBytes=Number(response.headers.get('x-test-transfer-wasm-bytes'));if(Number.isSafeInteger(wasmBytes)&&wasmBytes>0)client.memoryHighWater=Math.max(client.memoryHighWater??0,wasmBytes);if(response.headers.get('x-test-transfer-fault-fired')==='true')client.faults=(client.faults??0)+1;return response;},
+    async json(path,init={}){for(let attempt=0;;attempt++){const response=await client.request(path,init);const text=await response.text();let body;try{body=text?JSON.parse(text):null;}catch{throw new Error(`HTTP ${response.status}: ${text.slice(0,1000)}`);}
+      if(((response.status===503||response.status===423)&&body?.error?.retryable||response.status===409&&body?.error?.code==='too_many_sessions')&&attempt<1200){await sleep(50);continue;}return{response,body};}},
+    async caps(){const{response,body}=await client.json('/api/transfer/v2/capabilities');assert.equal(response.status,200,JSON.stringify(body));assert.equal(body.protocol_version,2);assert.equal(body.storage.import.allowed,true,JSON.stringify(body));return body;},
+    async createImport(novels,{policy='skip',profile='runtime',roles=[],requestId=randomUUID(),secret=randomBytes(32).toString('base64url')}={}){
+      const caps=await client.caps();const wire=wireManifest(novels,caps.storage.policy_version,profile,roles);
+      const body={request_id:requestId,creation_ticket:caps.creation_ticket,source_fingerprint:wire.fingerprint,profile,extra_roles:roles,policy_version:caps.storage.policy_version,conflict_policy:policy,manifest_size:String(wire.bytes.length),manifest_sha256:sha256(wire.bytes)};
+      const init={method:'POST',headers:{'content-type':'application/json','x-narou-transfer-secret':secret},body:JSON.stringify(body)};
+      const created=await client.json('/api/transfer/v2/imports',init);assert.equal(created.response.status,200,JSON.stringify(created.body));
+      return session(client,'imports',created.body,secret,{wire,create:init});
+    },
+    async importData(novels,options={}){const s=await client.createImport(novels,options);await s.manifest();await s.until(v=>v.state==='transferring');await s.upload();await s.op('ready');const plan=await s.pages('plan');await s.op('publish',{plan_revision:s.status.plan_revision});await s.until(v=>['completed','completed_with_errors'].includes(v.state));const final=s.status;await s.drain();return{status:final,plan,session:s};},
+    async beginExport(ids,{profile='runtime',roles=[]}={}){const caps=await client.caps();const secret=randomBytes(32).toString('base64url');const body={request_id:randomUUID(),creation_ticket:caps.creation_ticket,ids:Array.isArray(ids)?ids:[Number(ids)],profile,extra_roles:roles};
+      const created=await client.json('/api/transfer/v2/exports',{method:'POST',headers:{'content-type':'application/json','x-narou-transfer-secret':secret},body:JSON.stringify(body)});assert.equal(created.response.status,200,JSON.stringify(created.body));return session(client,'exports',created.body,secret);},
+    async createExport(ids,{profile='runtime',roles=[]}={}){const s=await client.beginExport(ids,{profile,roles});await s.until(v=>v.state==='selecting');const catalog=await s.pages('catalog');await s.op('select',{profile,extra_roles:roles,selection_digest:selectionDigest(s.status.catalog_revision,profile,roles,catalog)});await s.until(v=>['ready','reading'].includes(v.state));return s;},
+    async exportData(ids,options={}){const s=await client.createExport(ids,options);return s.download();},
+  };return client;
+}
+function session(client,direction,status,secret,extra={}){
+ const s={client,direction,status,secret,...extra,get path(){return`/api/transfer/v2/${direction}/${s.status.session_id}`;},
+  headers(extra={}){return{'x-narou-transfer-secret':secret,...extra};},
+  async get(){const r=await client.json(s.path,{headers:s.headers()});assert.equal(r.response.status,200,JSON.stringify(r.body));s.status=r.body;return r.body;},
+  async pages(name){let items=[],cursor=null;do{const r=await client.json(`${s.path}/${name}${cursor===null?'':`?cursor=${encodeURIComponent(cursor)}`}`,{headers:s.headers()});assert.equal(r.response.status,200,JSON.stringify(r.body));assert(r.body.items.length<=100);assert(Buffer.byteLength(JSON.stringify(r.body))<=256*1024);items.push(...r.body.items);cursor=r.body.next_cursor??null;}while(cursor!==null);return items;},
+  async op(action,body={},identity=randomUUID(),revision=s.status.revision){const init={method:'POST',headers:s.headers({'content-type':'application/json','if-match':`"${revision}"`}),body:JSON.stringify({...body,operation_id:identity})};const r=await client.json(`${s.path}/${action}`,init);assert.equal(r.response.status,200,JSON.stringify(r.body));if(BigInt(r.body.revision)>=BigInt(s.status.revision))s.status=r.body;return{...r,identity,init};},
+  async step(){const r=await client.json(`${s.path}/advance`,{method:'POST',headers:s.headers({'content-type':'application/json'}),body:JSON.stringify({operation_id:s.status.operation_id})});assert.equal(r.response.status,200,JSON.stringify(r.body));s.status=r.body;return r;},
+  async until(predicate){for(let i=0;i<100000;i++){await s.get();if(predicate(s.status))return s.status;if(['failed','expired','cancelled'].includes(s.status.state))throw new Error(JSON.stringify(s.status));assert(['advance','finalize_file'].includes(s.status.next_action),JSON.stringify(s.status));await s.step();}throw new Error('advance did not converge');},
+  async drain(){for(let i=0;i<100000;i++){await s.get();if(s.status.next_action==='none')return;if(!s.status.operation_id)return;await s.step();}throw new Error('GC did not converge');},
+  async batch(records,manifest=false){const bytes=encodeBatch(records);const path=manifest?`${s.path}/manifest/chunks/${records[0].chunk_index}`:`${s.path}/chunks`;const r=await client.json(path,{method:'PUT',headers:s.headers({'content-type':'application/octet-stream','x-transfer-record-count':String(records.length),'x-transfer-body-bytes':String(bytes.length)}),body:bytes});assert.equal(r.response.status,200,JSON.stringify(r.body));s.status=r.body.status??r.body;return r.body;},
+  async manifest(){for(let start=0,index=0;start<s.wire.bytes.length;index++){const end=Math.min(start+CHUNK,s.wire.bytes.length);const r=await s.batch([{file_id:0xffffffff,chunk_index:index,bytes:s.wire.bytes.subarray(start,end),final:end===s.wire.bytes.length}],true);assert.equal(r.failure,null);start=end;}if(s.status.next_action==='finalize_file')await s.until(v=>v.next_action!=='finalize_file');await s.op('manifest/seal',{size:String(s.wire.bytes.length),sha256:sha256(s.wire.bytes)});},
+  async upload(){const files=await s.pages('files');let batch=[],size=0;const flush=async()=>{if(batch.length){const result=await s.batch(batch);assert.equal(result.failure,null,JSON.stringify(result));batch=[];size=0;}};
+    for(const file of files){if(!file.upload_required)continue;const source=s.wire.files[file.manifest_file_index];assert(source);let offset=Number(file.confirmed_bytes),index=file.next_chunk_index;
+      do{const end=Math.min(offset+CHUNK,source.bytes.length);const record={file_id:file.file_id,chunk_index:index++,bytes:source.bytes.subarray(offset,end),final:end===source.bytes.length};const n=encodeBatch([record]).length;if(batch.length&&(batch.length===100||size+n>WIRE))await flush();batch.push(record);size+=n;offset=end;}while(offset<source.bytes.length);
+    }await flush();if(s.status.next_action==='finalize_file')await s.until(v=>v.next_action!=='finalize_file');},
+  async cancel(){await s.get();const identity=randomUUID();const r=await client.json(`${s.path}?operation_id=${identity}`,{method:'DELETE',headers:s.headers({'if-match':`"${s.status.revision}"`})});assert.equal(r.response.status,200,JSON.stringify(r.body));s.status=r.body;await s.until(v=>v.state==='cancelled');await s.drain();},
+  async download(){const chunks=[];for(let index=0;;index++){const r=await client.request(`${s.path}/manifest/chunks/${index}`,{headers:s.headers()});assert.equal(r.status,200);assert.match(r.headers.get('content-type'),/octet-stream/);const bytes=Buffer.from(await r.arrayBuffer());assert(bytes.length<=WIRE);assert.equal(Number(r.headers.get('x-transfer-body-bytes')),bytes.length);chunks.push(bytes);if(r.headers.get('x-transfer-last')==='true'){assert.equal(Number(r.headers.get('x-transfer-manifest-bytes')),chunks.reduce((n,v)=>n+v.length,0));break;}}
+    const manifest=JSON.parse(Buffer.concat(chunks));const pieces=new Map();const expected=[];for(const[index,novel]of manifest.novels.entries())for(const file of novel.files)expected.push({path:`novels/${index}/${file.path}`,...file});
+    for(let batch=0;;batch++){const r=await client.request(`${s.path}/batches/${batch}`,{headers:s.headers()});assert.equal(r.status,200);const bytes=Buffer.from(await r.arrayBuffer());assert(bytes.length<=WIRE);assert.equal(Number(r.headers.get('x-transfer-body-bytes')),bytes.length);let offset=0,count=0;
+      while(offset<bytes.length){const n=bytes.readUInt32BE(offset);offset+=4;assert(n>0&&n<=512);const header=JSON.parse(bytes.subarray(offset,offset+n));offset+=n;const length=Number(header.payload_size);const data=bytes.subarray(offset,offset+length);assert.equal(data.length,length);offset+=length;const value=pieces.get(header.file_id)??{next:0,chunks:[],final:false};assert.equal(header.chunk_index,value.next++);assert.equal(value.final,false);value.final=header.final;value.chunks.push(data);pieces.set(header.file_id,value);count++;}
+      assert.equal(count,Number(r.headers.get('x-transfer-record-count')));assert(count<=100);if(r.headers.get('x-transfer-last')==='true')break;
     }
-    table[index] = value >>> 0;
-  }
-  return table;
-})();
-
-function crc32(buffer) {
-  let crc = 0xffffffff;
-  for (const byte of buffer) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-function sha256(buffer) {
-  return createHash('sha256').update(buffer).digest('hex');
-}
-
-function buildZip(entries) {
-  const locals = [];
-  const central = [];
-  let offset = 0;
-  for (const entry of entries) {
-    const name = Buffer.from(entry.name, 'utf8');
-    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data, 'utf8');
-    const crc = crc32(data);
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(0x0800, 6); // UTF-8 names
-    local.writeUInt16LE(0, 8); // stored
-    local.writeUInt16LE(0, 10);
-    local.writeUInt16LE(0x21, 12); // 1980-01-01
-    local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(data.length, 18);
-    local.writeUInt32LE(data.length, 22);
-    local.writeUInt16LE(name.length, 26);
-    local.writeUInt16LE(0, 28);
-    const header = Buffer.concat([local, name, data]);
-
-    const directory = Buffer.alloc(46);
-    directory.writeUInt32LE(0x02014b50, 0);
-    directory.writeUInt16LE(20, 4);
-    directory.writeUInt16LE(20, 6);
-    directory.writeUInt16LE(0x0800, 8);
-    directory.writeUInt16LE(0, 10);
-    directory.writeUInt16LE(0, 12);
-    directory.writeUInt16LE(0x21, 14);
-    directory.writeUInt32LE(crc, 16);
-    directory.writeUInt32LE(data.length, 20);
-    directory.writeUInt32LE(data.length, 24);
-    directory.writeUInt16LE(name.length, 28);
-    directory.writeUInt16LE(0, 30);
-    directory.writeUInt16LE(0, 32);
-    directory.writeUInt16LE(0, 34);
-    directory.writeUInt16LE(0, 36);
-    directory.writeUInt32LE(0, 38);
-    directory.writeUInt32LE(offset, 42);
-    central.push(Buffer.concat([directory, name]));
-    locals.push(header);
-    offset += header.length;
-  }
-  const centralBytes = Buffer.concat(central);
-  const end = Buffer.alloc(22);
-  end.writeUInt32LE(0x06054b50, 0);
-  end.writeUInt16LE(0, 4);
-  end.writeUInt16LE(0, 6);
-  end.writeUInt16LE(entries.length, 8);
-  end.writeUInt16LE(entries.length, 10);
-  end.writeUInt32LE(centralBytes.length, 12);
-  end.writeUInt32LE(offset, 16);
-  end.writeUInt16LE(0, 20);
-  return Buffer.concat([...locals, centralBytes, end]);
-}
-
-function readZip(buffer) {
-  const end = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
-  assert(end >= 0, 'zip end-of-central-directory not found');
-  const count = buffer.readUInt16LE(end + 10);
-  let offset = buffer.readUInt32LE(end + 16);
-  const entries = new Map();
-  for (let index = 0; index < count; index += 1) {
-    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, 'central directory signature');
-    const method = buffer.readUInt16LE(offset + 10);
-    const crc = buffer.readUInt32LE(offset + 16);
-    const compressedSize = buffer.readUInt32LE(offset + 20);
-    const size = buffer.readUInt32LE(offset + 24);
-    const nameLength = buffer.readUInt16LE(offset + 28);
-    const extraLength = buffer.readUInt16LE(offset + 30);
-    const commentLength = buffer.readUInt16LE(offset + 32);
-    const localOffset = buffer.readUInt32LE(offset + 42);
-    const name = buffer.toString('utf8', offset + 46, offset + 46 + nameLength);
-    const dataStart =
-      localOffset +
-      30 +
-      buffer.readUInt16LE(localOffset + 26) +
-      buffer.readUInt16LE(localOffset + 28);
-    const raw = buffer.subarray(dataStart, dataStart + compressedSize);
-    const data = method === 0 ? Buffer.from(raw) : inflateRawSync(raw);
-    assert.equal(data.length, size, `${name}: uncompressed size`);
-    assert.equal(crc32(data), crc, `${name}: crc`);
-    entries.set(name, data);
-    offset += 46 + nameLength + extraLength + commentLength;
-  }
-  return entries;
-}
-
-// ---------------------------------------------------------------------------
-// fixture
-// ---------------------------------------------------------------------------
-
-const TOC_URL = 'https://example.com/n1234ab/';
-const TITLE = '転生したらテストだった';
-const AUTHOR = '作者名';
-const SITENAME = 'Example Site';
-const DOMAIN = 'example.com';
-// 旧形式アーカイブ検証用の別作品 (同じ toc_url だと衝突キーになる)。
-const LEGACY_TOC_URL = 'https://example.com/legacy9999zz/';
-// 1x1 の透過 PNG (挿絵は別ストアへ振り分けられる経路も通す)。
-const PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
-  'base64',
-);
-
-function solidPng(rgb) {
-  const chunk = (name, data) => {
-    const type = Buffer.from(name);
-    const size = Buffer.alloc(4), crc = Buffer.alloc(4);
-    size.writeUInt32BE(data.length);
-    crc.writeUInt32BE(crc32(Buffer.concat([type, data])));
-    return Buffer.concat([size, type, data, crc]);
-  };
-  const header = Buffer.alloc(13);
-  header.writeUInt32BE(96, 0); header.writeUInt32BE(96, 4);
-  header[8] = 8; header[9] = 2;
-  const row = Buffer.alloc(1 + 96 * 3);
-  row.fill(Buffer.from(rgb), 1);
-  return Buffer.concat([
-    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-    chunk('IHDR', header), chunk('IDAT', deflateSync(Buffer.concat(Array(96).fill(row)))),
-    chunk('IEND', Buffer.alloc(0)),
-  ]);
-}
-
-function firstPngPixel(bytes) {
-  assert.deepEqual(bytes.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
-  assert.equal(bytes[24], 8);
-  assert([2, 6].includes(bytes[25]), 'the solid-color fixture must remain RGB or RGBA');
-  const chunks = [];
-  for (let offset = 8; offset + 12 <= bytes.length;) {
-    const size = bytes.readUInt32BE(offset);
-    if (bytes.toString('ascii', offset + 4, offset + 8) === 'IDAT') chunks.push(bytes.subarray(offset + 8, offset + 8 + size));
-    offset += size + 12;
-  }
-  const pixels = inflateSync(Buffer.concat(chunks));
-  assert(pixels[0] <= 4);
-  // Every PNG row filter predicts zero for the first pixel of the first row.
-  return [...pixels.subarray(1, 4)];
-}
-
-function tocYaml(story, subtitles) {
-  return tocYamlFor(TOC_URL, TITLE, story, subtitles);
-}
-
-/// 指定 URL / 作品名の目次 YAML。
-function tocYamlFor(tocUrl, title, story, subtitles) {
-  const lines = ['---', `toc_url: ${tocUrl}`, `title: ${title}`, `author: ${AUTHOR}`, 'story: |-', `  ${story}`, 'subtitles:'];
-  for (const subtitle of subtitles) {
-    lines.push(
-      `- index: '${subtitle.index}'`,
-      `  href: ${tocUrl}${subtitle.index}/`,
-      "  chapter: ''",
-      "  subchapter: ''",
-      `  subtitle: ${subtitle.name}`,
-      `  file_subtitle: ${subtitle.name}`,
-      "  subdate: '2026-01-02 03:04:05'",
-    );
-  }
-  lines.push('novel_type: 1', '');
-  return lines.join('\n');
-}
-
-function sectionYaml(index, name, body) {
-  return sectionYamlFor(TOC_URL, index, name, body);
-}
-
-/// 指定 URL の本文 YAML。
-function sectionYamlFor(tocUrl, index, name, body) {
-  return [
-    '---',
-    `index: '${index}'`,
-    `href: ${tocUrl}${index}/`,
-    "chapter: ''",
-    "subchapter: ''",
-    `subtitle: ${name}`,
-    `file_subtitle: ${name}`,
-    "subdate: '2026-01-02 03:04:05'",
-    'element:',
-    '  data_type: text',
-    "  introduction: ''",
-    "  postscript: ''",
-    '  body: |-',
-    `    ${body}`,
-    '',
-  ].join('\n');
-}
-
-/// `files` は小説ディレクトリからの相対パス。
-/// `options.legacy` は旧形式 (属性タグが `tags` に埋まっている) の manifest を作る。
-function archiveFor(files, options = {}) {
-  const manifest = {
-    format_version: 1,
-    app_version: '0.5.0',
-    exported_at: '2026-10-24T00:00:00Z',
-    novels: [
-      {
-        toc_url: options.tocUrl ?? TOC_URL,
-        title: options.title ?? TITLE,
-        author: AUTHOR,
-        sitename: SITENAME,
-        domain: DOMAIN,
-        tags: options.legacy ? ['テスト', '小説'] : ['テスト'],
-        novel_type: 1,
-        ncode: options.ncode ?? 'n1234ab',
-        files: files.map((file) => ({
-          path: file.path,
-          size: file.data.length,
-          sha256: sha256(file.data),
-        })),
-      },
-    ],
-  };
-  return buildZip([
-    { name: 'manifest.json', data: JSON.stringify(manifest) },
-    ...files.map((file) => ({ name: `novels/0/${file.path}`, data: file.data })),
-  ]);
-}
-
-const firstSectionPath = '本文/1 第一話.yaml';
-const secondSectionPath = '本文/2 第二話.yaml';
-
-const fixtureA = [
-  { path: 'toc.yaml', data: Buffer.from(tocYaml('テスト用のあらすじ', [{ index: '1', name: '第一話' }])) },
-  { path: firstSectionPath, data: Buffer.from(sectionYaml('1', '第一話', '最初の本文です。')) },
-  { path: 'setting.ini', data: Buffer.from('[global]\nenable_yokogaki=false\n') },
-  { path: 'replace.txt', data: Buffer.from('元の置換設定\n') },
-  { path: 'converter.yaml', data: Buffer.from('{}\n') },
-  { path: '挿絵/001.png', data: PNG },
-];
-const zipA = archiveFor(fixtureA);
-
-// overwrite 用: 本文と目次を差し替え、replace.txt と挿絵を**含めない**
-// (アーカイブに無いファイルは消さないことの確認)。
-const fixtureB = [
-  {
-    path: 'toc.yaml',
-    data: Buffer.from(
-      tocYaml('更新後のあらすじ', [
-        { index: '1', name: '第一話' },
-        { index: '2', name: '第二話' },
-      ]),
-    ),
+    const files=new Map();for(const[index,entry]of expected.entries()){const value=pieces.get(index);assert(value?.final,entry.path);const bytes=Buffer.concat(value.chunks);assert.equal(BigInt(bytes.length),BigInt(entry.size));assert.equal(sha256(bytes),entry.sha256);files.set(entry.path,bytes);}assert.equal(pieces.size,expected.length);
+    await s.op('complete',{archive_size:'0',archive_sha256:null});await s.drain();return{manifest,files,session:s};
   },
-  { path: firstSectionPath, data: Buffer.from(sectionYaml('1', '第一話', '更新後の本文です。')) },
-  { path: secondSectionPath, data: Buffer.from(sectionYaml('2', '第二話', '追加された本文です。')) },
-];
-const zipB = archiveFor(fixtureB);
-
-// ---------------------------------------------------------------------------
-// 虚拟小说（分组）的归档 fixture
-// ---------------------------------------------------------------------------
-
-// 分组父作品的标题 / 表紙 / 保存先 ( 通常作品とは別の保存先を持つ )。
-const GROUP_TITLE = 'TransferVirtualGroup';
-const GROUP_COVER = solidPng([12, 34, 56]);
-const GROUP_PREFIX = `novels/${SITENAME}/${GROUP_TITLE}`;
-
-/// 通常の作品記述子。
-function ordinaryDescriptor({ tocUrl, title, ncode, story, body, files = [] }) {
-  return {
-    toc_url: tocUrl,
-    title,
-    ncode,
-    files: [
-      { path: 'toc.yaml', data: Buffer.from(tocYamlFor(tocUrl, title, story, [{ index: '1', name: '第一話' }])) },
-      { path: '本文/1 第一話.yaml', data: Buffer.from(sectionYamlFor(tocUrl, '1', '第一話', body)) },
-      ...files,
-    ],
-  };
+ };return s;
+}
+export function fixtureNovel(slug,files=[],extra={}){const title=`Transfer ${slug}`,toc_url=`https://example.test/${slug}/`;return{toc_url,title,author:'Fixture',sitename:'Transfer',domain:'example.test',ncode:slug,novel_type:1,tags:['transfer'],attribute_tag:'小説',files:[{path:'toc.yaml',bytes:Buffer.from(`title: ${title}\nauthor: Fixture\ntoc_url: ${toc_url}\nsubtitles: []\nnovel_type: 1\n`)},...files],...extra};}
+export async function sourceNamespaceContracts(client,slug){
+  const parent=fixtureNovel(`${slug}-parent`,[{path:'own.bin',bytes:Buffer.from('parent-only')}],{ncode:'12'});assert.equal((await client.importData([parent])).status.state,'completed');
+  const parentId=(await client.json('/api/novels?limit=1000')).body.data.find(record=>record.toc_url===parent.toc_url).id;
+  const seed=async mode=>{const novel=fixtureNovel(`${slug}-${mode}`,[{path:'secret.bin',bytes:Buffer.from(`private-${mode}`)}]);const result=await client.json('/_fixture/transfer-namespace',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:parentId,mode,toc_url:novel.toc_url,files:novel.files.map(file=>({path:file.path,data:file.bytes.toString('base64'),crc32:crc32(file.bytes)}))})});assert.equal(result.response.status,200,JSON.stringify(result.body));return result.body.id;};
+  const siblingId=await seed('sibling');const clean=await client.exportData([parentId]);assert.equal(clean.manifest.novels.length,1);assert.equal(clean.files.get('novels/0/own.bin').toString(),'parent-only');assert([...clean.files.keys()].every(path=>!path.includes('secret.bin')),'a lexical sibling must not be enumerated as source files');
+  const childId=await seed('child');const listed=await client.json('/api/novels?limit=1000');assert.equal(listed.response.status,200);assert([parentId,siblingId,childId].every(id=>listed.body.data.some(row=>row.id===id)),'metadata listing remains available for legacy collisions');
+  for(const ids of[[parentId],[parentId,childId]]){
+    const source=await client.beginExport(ids);await source.until(value=>value.state==='failed');assert.match(String(source.status.error),/source_namespace_overlap/);
+    const observed=(await client.json(`/_fixture/transfer-observe?session=${source.status.session_id}`)).body;assert.equal(observed.stages.length,0,'namespace collisions must fail before any source snapshots or metadata staging');assert.equal(observed.frozen.fragments,0);assert.equal(observed.snapshot.gates,0);assert.equal(observed.snapshot.pinned,0);assert(!client.requests.some(request=>request.path.startsWith(`${source.path}/batches/`)),'no child body batch may be requested');await source.drain();
+  }
+  return{parentId,siblingId,childId};
 }
 
-/// 归档記述子から manifest と ZIP を作る。
-/// `virtual_members` を持つ作品だけが format 2 (分组) として書き出される。
-function archiveFrom(descriptors) {
-  const manifest = {
-    format_version: descriptors.some((descriptor) => descriptor.virtual_members) ? 2 : 1,
-    app_version: '0.6.3',
-    exported_at: '2026-11-10T00:00:00Z',
-    novels: descriptors.map((descriptor) => ({
-      toc_url: descriptor.toc_url,
-      title: descriptor.title,
-      author: descriptor.author ?? AUTHOR,
-      sitename: descriptor.sitename ?? SITENAME,
-      domain: descriptor.domain ?? DOMAIN,
-      tags: descriptor.tags ?? ['テスト'],
-      attribute_tag: descriptor.attribute_tag ?? '小説',
-      novel_type: descriptor.novel_type ?? 1,
-      ...(descriptor.ncode === undefined ? {} : { ncode: descriptor.ncode }),
-      ...(descriptor.virtual_members === undefined ? {} : { virtual_members: descriptor.virtual_members }),
-      files: descriptor.files.map((file) => ({
-        path: file.path,
-        size: file.data.length,
-        sha256: sha256(file.data),
-      })),
-    })),
-  };
-  const entries = [{ name: 'manifest.json', data: JSON.stringify(manifest) }];
-  descriptors.forEach((descriptor, index) => {
-    for (const file of descriptor.files) {
-      entries.push({ name: `novels/${index}/${file.path}`, data: file.data });
-    }
-  });
-  return { zip: buildZip(entries), manifest };
+async function contracts(){
+  assert(existsSync(join(root,'build/worker/shim.mjs')),'build Worker artifacts before running this contract');mkdirSync(join(root,'.wrangler'),{recursive:true});const work=mkdtempSync(join(root,'.wrangler/transfer-v2-'));const token='isolated-transfer-v2-token';const windows=process.platform==='win32';const npx=windows?'npx.cmd':'npx';const pin=process.env.NAROU_WRANGLER_VERSION??'4.151.3';assert.match(pin,/^\d+\.\d+\.\d+$/);const children=[];
+  const run=(args,phase)=>{const r=spawnSync(npx,[`wrangler@${pin}`,...args,'--config',phase.config,'--persist-to',phase.persist],{cwd:root,shell:windows,encoding:'utf8',env:{...process.env,CI:'true',WRANGLER_SEND_METRICS:'false'}});assert.equal(r.status,0,`${r.stdout}\n${r.stderr}`);return r.stdout;};
+  const sql=(phase,query)=>{const file=join(phase.dir,'fixture.sql');writeFileSync(file,query);return run(['d1','execute','DB','--local','--file',file],phase);};
+  const setup=name=>{const dir=join(work,name);mkdirSync(dir);const config=join(dir,'wrangler.toml');let toml=readFileSync(join(root,'wrangler.toml'),'utf8').replace(/\[build\][^\[]*/,'').replace(/^main = .*$/m,`main = ${JSON.stringify(join(root,'tests/transfer_failure_worker.mjs').replaceAll('\\','/'))}`).replace(/^directory = .*$/m,`directory = ${JSON.stringify(join(root,'public').replaceAll('\\','/'))}`).replace(/^migrations_dir = .*$/m,`migrations_dir = ${JSON.stringify(join(root,'migrations').replaceAll('\\','/'))}`);writeFileSync(config,toml);writeFileSync(join(dir,'.dev.vars'),`NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${Buffer.alloc(32,7).toString('base64')}\n`);const phase={dir,config,persist:join(dir,'state')};run(['d1','migrations','apply','DB','--local'],phase);sql(phase,`INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES('inv','content_backend','"d1"','d1'),('inv','asset_backend','"d1"','d1');`);return phase;};
+  const stop=async child=>{if(child.exitCode!==null)return;const ended=once(child,'exit');if(windows)spawnSync('taskkill',['/pid',String(child.pid),'/T','/F']);else process.kill(-child.pid,'SIGTERM');await ended;};
+  const start=async phase=>{const net=await import('node:net');const probe=net.createServer().listen(0,'127.0.0.1');await once(probe,'listening');const port=probe.address().port;await new Promise(r=>probe.close(r));let logs='';const child=spawn(npx,[`wrangler@${pin}`,'dev','--config',phase.config,'--persist-to',phase.persist,'--port',String(port),'--test-scheduled'],{cwd:root,shell:windows,detached:!windows,stdio:['ignore','pipe','pipe'],env:{...process.env,CI:'true',WRANGLER_SEND_METRICS:'false'}});children.push(child);for(const stream of[child.stdout,child.stderr])stream.on('data',bytes=>{logs=(logs+bytes).slice(-50000);});const base=`http://127.0.0.1:${port}`;for(let i=0;i<480;i++){if(child.exitCode!==null)throw new Error(logs);try{if((await fetch(base+'/health/live')).ok)return{child,client:transferClient(base,token,{verifyPrimary:true})};}catch{}await sleep(250);}throw new Error(logs);};
+  try{
+    const a=setup('a'),b=setup('b');let wa=await start(a),wb=await start(b);let ca=wa.client,cb=wb.client;
+    assert.equal((await fetch(ca.base+'/api/transfer/v2/capabilities')).status,401);
+    assert.equal((await ca.request('/api/transfer/export?ids=1')).status,404);assert.equal((await ca.request('/api/transfer/import',{method:'POST',body:'retired'})).status,404);
+    const large=Buffer.alloc(17*1024*1024);for(let i=0;i<large.length;i++)large[i]=(i*31+(i>>>7))&255;
+    const first=fixtureNovel('first',[{path:'notes.bin',bytes:large},{path:'replace.txt',bytes:Buffer.from('user settings')},{path:'本文/cache/old.yaml',bytes:Buffer.from('body: historic\n')}]);
+    const imported=await ca.importData([first],{profile:'complete'});assert.equal(imported.status.state,'completed');assert.equal(imported.plan[0].action,'create');
+    let listed=(await ca.json('/api/novels')).body.data;const id=listed.find(v=>v.toc_url===first.toc_url).id;
+    const runtime=await ca.exportData([id]);assert(!runtime.files.has('novels/0/本文/cache/old.yaml'));assert.deepEqual(runtime.files.get('novels/0/notes.bin'),large);
+    const complete=await ca.exportData([id],{profile:'complete'});assert(complete.files.has('novels/0/本文/cache/old.yaml'));
+    const transferred=complete.manifest.novels.map((novel,index)=>({...novel,files:novel.files.map(file=>({path:file.path,bytes:complete.files.get(`novels/${index}/${file.path}`)}))}));
+    const second=await cb.importData(transferred,{profile:'complete'});assert.equal(second.status.state,'completed');const idb=(await cb.json('/api/novels')).body.data.find(v=>v.toc_url===first.toc_url).id;
+    const round=await cb.exportData([idb],{profile:'complete'});for(const[path,bytes]of complete.files)assert.deepEqual(round.files.get(path),bytes,path);
+    const replacement=fixtureNovel('first',[{path:'notes.bin',bytes:Buffer.from('replacement')}]);const overwrite=await cb.importData([replacement],{policy:'overwrite'});assert.equal(overwrite.status.state,'completed');const after=await cb.exportData([idb],{profile:'complete'});assert.equal(after.files.get('novels/0/notes.bin').toString(),'replacement');assert.equal(after.files.get('novels/0/replace.txt').toString(),'user settings');assert(after.files.has('novels/0/本文/cache/old.yaml'));
+    const skipped=await cb.importData([replacement]);assert.equal(skipped.plan[0].action,'skip');assert(!skipped.session.client.requests.slice(-10).some(r=>r.path.endsWith('/chunks')&&r.method==='PUT'));
+    console.log('PASS bounded 17MiB file, runtime/complete, two libraries, overwrite preservation, Skip');
+
+    const replay=await ca.createImport([fixtureNovel('replay')]);const again=await ca.json('/api/transfer/v2/imports',replay.create);assert.equal(again.body.session_id,replay.status.session_id);const conflict=await ca.json('/api/transfer/v2/imports',{...replay.create,headers:{...replay.create.headers,'x-narou-transfer-secret':randomBytes(32).toString('base64url')}});assert.equal(conflict.response.status,409);await replay.manifest();await replay.until(v=>v.state==='transferring');
+    await stop(wa.child);wa=await start(a);ca=wa.client;replay.client.base=ca.base;await replay.upload();const ack=await replay.op('ready');const ackAgain=await replay.client.json(`${replay.path}/ready`,ack.init);assert.equal(ackAgain.response.status,200);assert.equal(ackAgain.body.revision,ack.body.revision);await replay.op('publish',{plan_revision:replay.status.plan_revision});await replay.until(v=>v.state==='completed');await replay.drain();
+    console.log('PASS create/control ACK replay and workerd restart resume');
+
+    const partial=await ca.createImport([fixtureNovel('partial',[{path:'a.bin',bytes:Buffer.from('first')},{path:'b.bin',bytes:Buffer.from('second')}])]);await partial.manifest();await partial.until(v=>v.state==='transferring');const files=await partial.pages('files');const needed=files.filter(v=>v.upload_required);const good=needed[0],bad=needed[1];const records=[good,bad].map(v=>({file_id:v.file_id,chunk_index:0,bytes:partial.wire.files[v.file_id].bytes,final:true}));records[1].sha256='0'.repeat(64);const result=await partial.batch(records);assert.equal(result.receipts.length,1);assert(result.failure);const positions=await partial.pages('files');assert.equal(positions.find(v=>v.file_id===good.file_id).state,'verified');assert.equal(positions.find(v=>v.file_id===bad.file_id).confirmed_bytes,'0');const confirmed=(await partial.get()).confirmed_bytes;const duplicate=await partial.batch([records[0]]);assert.equal(duplicate.receipts[0].outcome,'duplicate');assert.equal((await partial.get()).confirmed_bytes,confirmed);await partial.upload();await partial.op('ready');await partial.op('publish',{plan_revision:partial.status.plan_revision});await partial.until(v=>v.state==='completed');await partial.drain();
+    console.log('PASS partial-batch durable receipt, mismatched SHA, identical retry without double count');
+
+    const raw=await ca.createImport([fixtureNovel('raw-forbidden',[{path:'raw/page.html',bytes:Buffer.from('<html/>')}])],{profile:'complete'});await raw.manifest();await raw.until(v=>v.state==='failed');assert.match(raw.status.error,/file_policy/);await raw.drain();assert(!(await ca.json('/api/novels')).body.data.some(v=>v.toc_url.includes('raw-forbidden')));
+    const long=fixtureNovel('unicode',[{path:'memo.txt',bytes:Buffer.from('unknown file retained')}],{subtitle:'あ\n"'.repeat(30000)});const longResult=await ca.importData([long]);assert.equal(longResult.status.state,'completed');
+    console.log('PASS Worker raw policy is enforced before file payload; fragmented metadata and unknown files survive');
+
+    const one=fixtureNovel('member-one',[],{attribute_tag:'漫画'}),two=fixtureNovel('member-two');const parent={toc_url:'https://narou.rs/virtual/0123456789abcdef0123456789abcdef',title:'Group',author:'Fixture',sitename:'Transfer',novel_type:1,tags:['group'],attribute_tag:'小説',virtual_members:[two.toc_url,one.toc_url],files:[{path:'setting.ini',bytes:Buffer.from('enable_yokogaki=true\n')}]};
+    const groupResult=await ca.importData([one,two,parent]);assert.equal(groupResult.status.state,'completed');listed=(await ca.json('/api/novels?limit=1000')).body.data;const parentId=listed.find(v=>v.toc_url===parent.toc_url).id;const memberId=listed.find(v=>v.toc_url===one.toc_url).id;const group=await ca.exportData([parentId,memberId],{profile:'complete'});assert.equal(group.manifest.novels.length,3);assert.deepEqual(group.manifest.novels[2].virtual_members,parent.virtual_members);assert(!group.manifest.novels[2].tags.some(t=>t.startsWith('vs_')));
+    const groupInput=group.manifest.novels.map((novel,index)=>({...novel,files:novel.files.map(file=>({path:file.path,bytes:group.files.get(`novels/${index}/${file.path}`)}))}));await cb.importData([one]);const groupImport=await cb.importData(groupInput,{profile:'complete'});assert.equal(groupImport.status.state,'completed');assert(groupImport.plan.some(v=>v.action==='skip'));const groups=(await cb.json('/api/virtual_novels')).body.novels;assert(groups.some(v=>v.title==='Group'&&v.members.length===2));
+    console.log('PASS virtual expansion, deduplication, mixed attributes, ordered destination membership and skipped member');
+    const vanishingMember=fixtureNovel('vanishing-member');await ca.importData([vanishingMember]);
+    const vanishingParent={...parent,toc_url:`https://narou.rs/virtual/${randomBytes(16).toString('hex')}`,title:'Vanishing member group',virtual_members:[vanishingMember.toc_url]};
+    const vanishing=await ca.createImport([vanishingParent]);await vanishing.manifest();await vanishing.until(v=>v.state==='transferring');await vanishing.upload();await vanishing.op('ready');await vanishing.op('publish',{plan_revision:vanishing.status.plan_revision});
+    let memberFault=false,memberHttpError=false;for(let i=0;i<2000;i++){
+      await vanishing.get();const response=await ca.request(`${vanishing.path}/advance`,{method:'POST',headers:vanishing.headers({'content-type':'application/json','x-narou-test-transfer-fault':'member_before_read'}),body:JSON.stringify({operation_id:vanishing.status.operation_id})});const body=JSON.parse(await response.text());
+      if(response.headers.get('x-test-transfer-fault-fired')==='true'){memberFault=true;if(response.status!==200){assert.equal(body.error?.code,'plan_stale',JSON.stringify(body));memberHttpError=true;}else vanishing.status=body;break;}
+      assert.equal(response.status,200,JSON.stringify(body));vanishing.status=body;
+    }assert(memberFault,'the real virtual-member join must observe a concurrent deletion');
+    if(memberHttpError){await vanishing.get();if(!['failed','completed','completed_with_errors','cancelled'].includes(vanishing.status.state))await vanishing.cancel();else await vanishing.drain();}
+    else{await vanishing.until(v=>['failed','completed','completed_with_errors'].includes(v.state));const failedPlan=await vanishing.pages('plan');assert.match(JSON.stringify({status:vanishing.status,plan:failedPlan}),/plan_stale/);await vanishing.drain();}
+    const afterVanishing=(await ca.json('/api/novels?limit=1000')).body.data;assert(!afterVanishing.some(row=>row.toc_url===vanishingParent.toc_url),'a parent with a deleted member must not be published');assert(afterVanishing.some(row=>row.toc_url===one.toc_url),'an unrelated member must remain managed');
+    console.log('PASS concurrent virtual-member deletion is a plan conflict, not a deserialization/platform retry');
+
+    const uncertain=transferClient(cb.base,token,{verifyPrimary:true});uncertain.extraHeaders={'x-narou-test-transfer-fault':'commit_after'};
+    const uncertainResult=await uncertain.importData([fixtureNovel('commit-ack')]);assert.equal(uncertainResult.status.state,'completed');assert(uncertain.faults>0,'fixture must interrupt the real committed D1 batch acknowledgement');
+    const committedRows=(await cb.json('/api/novels?limit=1000')).body.data.filter(row=>row.toc_url==='https://example.test/commit-ack/');assert.equal(committedRows.length,1);
+    const blocked=await cb.createImport([fixtureNovel('first',[{path:'notes.bin',bytes:Buffer.from('must not become canonical')}])],{policy:'overwrite'});await blocked.manifest();await blocked.until(v=>v.state==='transferring');await blocked.upload();await blocked.op('ready');await blocked.op('publish',{plan_revision:blocked.status.plan_revision});
+    for(let i=0;i<100;i++){const observed=(await cb.json(`/_fixture/transfer-observe?session=${blocked.status.session_id}`)).body;if(observed.publications[0]?.state==='committing')break;await blocked.step();}
+    await blocked.get();const fail=await cb.request(`${blocked.path}/advance`,{method:'POST',headers:blocked.headers({'content-type':'application/json','x-narou-test-transfer-fault':'commit_before'}),body:JSON.stringify({operation_id:blocked.status.operation_id})});assert([423,503].includes(fail.status));assert.equal(fail.headers.get('x-test-transfer-fault-fired'),'true');await fail.arrayBuffer();
+    const beforeCancel=(await cb.json(`/_fixture/transfer-observe?session=${blocked.status.session_id}`)).body;assert.equal(beforeCancel.targets[0].committed,0);await blocked.cancel();
+    const preserved=await cb.exportData([idb]);assert.equal(preserved.files.get('novels/0/notes.bin').toString(),'replacement');
+    console.log('PASS actual D1 commit ACK loss is idempotent; pre-commit failure/cancel preserves old canonical bytes');
+
+    let index='version: 2\nsources:\n';for(let i=0;i<50000;i++)index+=`  'https://example.test/index/${i}/${'x'.repeat(160)}': shared.png\n`;assert(Buffer.byteLength(index)<16*1024*1024);
+    const indexNovel=fixtureNovel('large-index',[{path:'.illustration_cache.yaml',bytes:Buffer.from(index)},{path:'挿絵/shared.png',bytes:Buffer.from([7])}]);const indexImport=await ca.importData([indexNovel]);assert.equal(indexImport.status.state,'completed');
+    const indexId=(await ca.json('/api/novels?limit=1000')).body.data.find(row=>row.toc_url===indexNovel.toc_url).id;const indexCaps=await ca.caps();const indexSecret=randomBytes(32).toString('base64url');const indexCreated=await ca.json('/api/transfer/v2/exports',{method:'POST',headers:{'content-type':'application/json','x-narou-transfer-secret':indexSecret},body:JSON.stringify({request_id:randomUUID(),creation_ticket:indexCaps.creation_ticket,ids:[indexId],profile:'runtime',extra_roles:[]})});assert.equal(indexCreated.response.status,200,JSON.stringify(indexCreated.body));const indexSession=session(ca,'exports',indexCreated.body,indexSecret);
+    let initialized=false,lostIndexStage;for(let i=0;i<80;i++){
+      const response=await ca.request(`${indexSession.path}/advance`,{method:'POST',headers:indexSession.headers({'content-type':'application/json',...(!lostIndexStage?{'x-narou-test-transfer-fault':'initializer_after'}:{})}),body:JSON.stringify({operation_id:indexSession.status.operation_id})});const text=await response.text();
+      const observed=(await ca.json(`/_fixture/transfer-observe?session=${indexSession.status.session_id}`)).body;
+      if(response.headers.get('x-test-transfer-fault-fired')==='true'){assert([500,503].includes(response.status),text);const stage=observed.stages.find(stage=>stage.stagepurpose==='illustration_index');assert(stage?.initialized);assert.equal(stage.sealed,0);lostIndexStage=stage.stage_id;continue;}
+      assert.equal(response.status,200,text);indexSession.status=JSON.parse(text);
+      if(observed.stages.some(stage=>stage.stagepurpose==='illustration_index'&&stage.sealed)){assert(lostIndexStage);assert.equal(observed.stages.length,1);assert.equal(observed.stages[0].stage_id,lostIndexStage);assert(observed.stages.every(stage=>stage.stagepurpose==='illustration_index'),'no selected image/body snapshots may exist before select');initialized=true;break;}
+    }assert(initialized,'real illustration metadata initializer must run');
+    assert.equal(indexSession.status.state,'cataloguing');const indexMemory=(await ca.json('/_fixture/transfer-memory')).body;assert.equal(indexMemory.instances,1);assert(indexMemory.highWater<112*1024*1024,JSON.stringify(indexMemory));await indexSession.cancel();
+    console.log('PASS 50000-entry real YAML metadata initializer is bounded, reuses completed stage after ACK loss, and never snapshots images before selection');
+
+    const story='\x01'.repeat(3*1024*1024);const storyNovel=fixtureNovel('escaped-story',[],{subtitle:story});storyNovel.files[0].bytes=Buffer.concat([storyNovel.files[0].bytes,Buffer.from(`story: "${'\\x01'.repeat(story.length)}"\n`)]);
+    assert(storyNovel.files[0].bytes.length<16*1024*1024);await ca.importData([storyNovel]);const storyId=(await ca.json('/api/novels?limit=1000')).body.data.find(row=>row.toc_url===storyNovel.toc_url).id;
+    const storySession=await ca.beginExport([storyId]);await storySession.until(value=>value.state==='selecting');const storyObserved=(await ca.json(`/_fixture/transfer-observe?session=${storySession.status.session_id}`)).body;
+    assert(storyObserved.frozen.fragments>90);assert(storyObserved.frozen.max_row_bytes<=32768);assert(storyObserved.stages.every(stage=>stage.file_id===null),'metadata-only initializer cannot snapshot payload files');
+    const storyCatalog=await storySession.pages('catalog');await storySession.op('select',{profile:'runtime',extra_roles:[],selection_digest:selectionDigest(storySession.status.catalog_revision,'runtime',[],storyCatalog)});await storySession.until(value=>['ready','reading'].includes(value.state));const storyExport=await storySession.download();assert.equal(storyExport.manifest.novels[0].subtitle,story);
+    const storyMemory=(await ca.json('/_fixture/transfer-memory')).body;assert.equal(storyMemory.instances,1);assert(storyMemory.highWater<112*1024*1024,JSON.stringify(storyMemory));
+    console.log('PASS measured local workerd memory: 12MiB YAML / 3MiB scalar / 18MiB escaped JSON uses <=32KiB D1 rows and exact pull cursors');
+
+    const gateNovels=Array.from({length:33},(_,index)=>fixtureNovel(`gate-${index}`));await ca.importData(gateNovels);const gateListed=(await ca.json('/api/novels?limit=1000')).body.data;const gateIds=gateNovels.map(novel=>gateListed.find(row=>row.toc_url===novel.toc_url).id);const gates=await ca.beginExport(gateIds);
+    let creationOp,selectionInterrupted=false;for(let index=0;index<1000;index++){
+      creationOp={method:'POST',headers:gates.headers({'content-type':'application/json','x-narou-test-transfer-fault':'backend_after'}),body:JSON.stringify({operation_id:gates.status.operation_id})};const response=await ca.request(`${gates.path}/advance`,creationOp);const text=await response.text();if(response.headers.get('x-test-transfer-fault-fired')==='true'){assert([500,503].includes(response.status),text);selectionInterrupted=true;break;}assert.equal(response.status,200,text);gates.status=JSON.parse(text);
+    }assert(selectionInterrupted,'the actual selected-source cursor commit must be interrupted');const selectionBefore=(await ca.json(`/_fixture/transfer-observe?session=${gates.status.session_id}`)).body.selection;
+    const selectionReplay=await ca.json(`${gates.path}/advance`,{...creationOp,headers:gates.headers({'content-type':'application/json'})});assert.equal(selectionReplay.response.status,200,JSON.stringify(selectionReplay.body));gates.status=selectionReplay.body;assert.deepEqual((await ca.json(`/_fixture/transfer-observe?session=${gates.status.session_id}`)).body.selection,selectionBefore,'old opcode must not freeze the next selected source');
+    await gates.until(value=>value.state==='selecting');const gateCatalog=await gates.pages('catalog');await gates.op('select',{profile:'runtime',extra_roles:[],selection_digest:selectionDigest(gates.status.catalog_revision,'runtime',[],gateCatalog)});
+    let gateIntent;for(let index=0;index<1000;index++){await gates.get();gateIntent={method:'POST',headers:gates.headers({'content-type':'application/json','x-narou-test-transfer-fault':'backend_after'}),body:JSON.stringify({operation_id:gates.status.operation_id})};const response=await ca.request(`${gates.path}/advance`,gateIntent);const text=await response.text();if(response.headers.get('x-test-transfer-fault-fired')==='true'){assert([500,503].includes(response.status),text);break;}assert.equal(response.status,200,text);gates.status=JSON.parse(text);gateIntent=null;}assert(gateIntent,'real gate-admission commit must be interrupted');
+    const beforeGateReplay=(await ca.json(`/_fixture/transfer-observe?session=${gates.status.session_id}`)).body.snapshot;assert.equal(beforeGateReplay.gates,16);
+    const replayGate=await ca.json(`${gates.path}/advance`,{...gateIntent,headers:gates.headers({'content-type':'application/json'})});assert.equal(replayGate.response.status,200,JSON.stringify(replayGate.body));gates.status=replayGate.body;assert.equal((await ca.json(`/_fixture/transfer-observe?session=${gates.status.session_id}`)).body.snapshot.gates,beforeGateReplay.gates,'old opcode must not close the next gate page');
+    let partialSnapshot=false;for(let index=0;index<10000;index++){await gates.get();if(['ready','reading'].includes(gates.status.state))break;const observed=(await ca.json(`/_fixture/transfer-observe?session=${gates.status.session_id}`)).body.snapshot;if(observed.pinned>0&&observed.pinned<33){assert.equal(observed.gates,33,'all source gates remain closed until every selected file is pinned');partialSnapshot=true;}await gates.step();}assert(partialSnapshot);assert.equal((await ca.json(`/_fixture/transfer-observe?session=${gates.status.session_id}`)).body.snapshot.gates,0);assert.equal((await gates.download()).manifest.novels.length,33);
+    console.log('PASS private cursor ACK replay, decimal ordinal selection digest and full-selection gate retention until all pins exist');
+    await sourceNamespaceContracts(ca,'local-source-overlap');console.log('PASS legacy parent/child sources fail before snapshot/body; lexical siblings and metadata lists remain valid');
+    const staleSnapshot=await ca.beginExport([id]);await staleSnapshot.until(v=>v.state==='selecting');const staleCatalog=await staleSnapshot.pages('catalog');await staleSnapshot.op('select',{profile:'runtime',extra_roles:[],selection_digest:selectionDigest(staleSnapshot.status.catalog_revision,'runtime',[],staleCatalog)});
+    let snapshotFault=false;for(let i=0;i<2000;i++){
+      await staleSnapshot.get();const response=await ca.request(`${staleSnapshot.path}/advance`,{method:'POST',headers:staleSnapshot.headers({'content-type':'application/json','x-narou-test-transfer-fault':'snapshot_epoch_after_read'}),body:JSON.stringify({operation_id:staleSnapshot.status.operation_id})});const text=await response.text();
+      if(response.headers.get('x-test-transfer-fault-fired')==='true'){snapshotFault=true;break;}
+      assert.equal(response.status,200,text);staleSnapshot.status=JSON.parse(text);
+    }assert(snapshotFault,'the real snapshot release must race a later epoch of the same owner');
+    const stillOwned=(await ca.json(`/_fixture/transfer-observe?session=${staleSnapshot.status.session_id}`)).body;assert.equal(stillOwned.snapshot.gates,1,'an old snapshot must never re-stamp its token and open the later gate');
+    console.log('PASS stale snapshot release preserves the later same-owner gate instead of recapturing its epoch');
+    assert(ca.requests.every(r=>r.type!=='application/zip'));assert(ca.requests.filter(r=>r.type==='application/octet-stream').every(r=>r.bytes<=WIRE));
+  }finally{for(const child of children)await stop(child);rmSync(work,{recursive:true,force:true,maxRetries:20,retryDelay:100});}
 }
-
-// ---------------------------------------------------------------------------
-// Worker の起動 / 停止
-// ---------------------------------------------------------------------------
-
-function runWrangler(args, phase) {
-  const result = spawnSync(npx, [WRANGLER, ...args, '--config', phase.config, '--persist-to', phase.persist], {
-    cwd: root,
-    shell: windows,
-    encoding: 'utf8',
-    env: { ...process.env, CI: 'true', WRANGLER_SEND_METRICS: 'false' },
-  });
-  if (result.status !== 0) {
-    throw new Error(`wrangler ${args.join(' ')} failed: ${result.stderr}\n${result.stdout}`);
-  }
-  return result.stdout;
-}
-
-function preparePhase(name, extraSql = '') {
-  const directory = join(work, name);
-  mkdirSync(directory, { recursive: true });
-  let toml = readFileSync(join(root, 'wrangler.toml'), 'utf8').replace(/\[build\][^\[]*/, '');
-  toml = toml
-    .replace(/^main = .*$/m, `main = ${JSON.stringify(join(root, 'tests', 'transfer_failure_worker.mjs').replaceAll('\\', '/'))}`)
-    .replace(/^directory = "public"$/m, `directory = ${JSON.stringify(join(root, 'public').replaceAll('\\', '/'))}`)
-    .replace(/^migrations_dir = "migrations"$/m, `migrations_dir = ${JSON.stringify(join(root, 'migrations').replaceAll('\\', '/'))}`);
-  const config = join(directory, 'wrangler.toml');
-  writeFileSync(config, toml);
-  writeFileSync(join(directory, '.dev.vars'), devVars);
-  const phase = { config, persist: join(directory, 'state'), directory };
-  runWrangler(['d1', 'migrations', 'apply', 'DB', '--local'], phase);
-  // The contract test intentionally runs legacy D1 (no MinIO): keep bodies in
-  // D1 instead of the S3 default.
-  const seed = join(directory, 'content-backend.sql');
-  writeFileSync(
-    seed,
-    `INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend','"d1"','d1') ON CONFLICT(scope,key) DO NOTHING;`,
-  );
-  runWrangler(['d1', 'execute', 'DB', '--local', '--file', seed], phase);
-  if (extraSql) {
-    const extra = join(directory, 'extra-seed.sql');
-    writeFileSync(extra, extraSql);
-    runWrangler(['d1', 'execute', 'DB', '--local', '--file', extra], phase);
-  }
-  return phase;
-}
-
-async function freePort() {
-  const probe = await import('node:net').then((net) => net.createServer());
-  probe.listen(0, '127.0.0.1');
-  await once(probe, 'listening');
-  const port = probe.address().port;
-  await new Promise((resolve) => probe.close(resolve));
-  return port;
-}
-
-async function startWorker(phase) {
-  const port = await freePort();
-  const child = spawn(
-    npx,
-    [WRANGLER, 'dev', '--config', phase.config, '--persist-to', phase.persist, '--port', String(port), '--test-scheduled'],
-    {
-      cwd: root,
-      shell: windows,
-      detached: !windows,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, CI: 'true', WRAPPER_SEND_METRICS: 'false', WRANGLER_SEND_METRICS: 'false' },
-    },
-  );
-  let logs = '';
-  for (const stream of [child.stdout, child.stderr]) {
-    stream.on('data', (chunk) => {
-      logs = (logs + chunk).slice(-100000);
-    });
-  }
-  const base = `http://127.0.0.1:${port}`;
-  const deadline = Date.now() + 120000;
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error(`worker exited: ${logs}`);
-    try {
-      if ((await fetch(`${base}/health/live`, { headers: { Connection: 'close' } })).ok) {
-        return { base, child, logs: () => logs };
-      }
-    } catch {
-      // not up yet
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  throw new Error(`worker did not become ready: ${logs}`);
-}
-
-async function stopWorker(worker) {
-  if (!worker || worker.child.exitCode !== null) return;
-  const exited = once(worker.child, 'exit');
-  if (windows) {
-    spawnSync('taskkill', ['/pid', String(worker.child.pid), '/T', '/F'], { stdio: 'ignore' });
-  } else {
-    try {
-      process.kill(-worker.child.pid, 'SIGTERM');
-    } catch (error) {
-      if (error.code !== 'ESRCH') throw error;
-    }
-  }
-  await exited;
-}
-
-// ---------------------------------------------------------------------------
-// requests
-// ---------------------------------------------------------------------------
-
-function client(base) {
-  const auth = { Authorization: `Bearer ${token}`, Connection: 'close' };
-  return {
-    async request(path, init = {}) {
-      return fetch(`${base}${path}`, { ...init, headers: { ...auth, ...(init.headers ?? {}) } });
-    },
-    async json(path, init) {
-      const response = await this.request(path, init);
-      const body = await response.json();
-      return { response, body };
-    },
-    async anonymous(path, init = {}) {
-      return fetch(`${base}${path}`, { ...init, headers: { Connection: 'close', ...(init.headers ?? {}) } });
-    },
-    async upload(zip, query = '') {
-      return this.json(`/api/transfer/import${query}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/zip' },
-        body: zip,
-      });
-    },
-    async exportZip(ids) {
-      const response = await this.request(`/api/transfer/export?ids=${ids}`);
-      assert.equal(response.status, 200, await response.clone().text());
-      return { response, bytes: Buffer.from(await response.arrayBuffer()) };
-    },
-  };
-}
-
-function manifestOf(bytes) {
-  const entries = readZip(bytes);
-  const manifest = JSON.parse(entries.get('manifest.json').toString('utf8'));
-  return { entries, manifest };
-}
-
-function filesFrom(manifest, index = 0) {
-  return manifest.novels[index].files.map((file) => ({
-    path: file.path,
-    size: file.size,
-    sha256: file.sha256,
-  }));
-}
-
-// ---------------------------------------------------------------------------
-// scenario
-// ---------------------------------------------------------------------------
-
-let phaseA;
-let phaseB;
-let phaseC;
-let phaseD;
-let workerA;
-let workerB;
-let workerC;
-let workerD;
-let exitCode = 1;
-try {
-  // --- DB A: import → export ------------------------------------------------
-  phaseA = preparePhase('a');
-  workerA = await startWorker(phaseA);
-  console.log(`worker A ready on ${workerA.base}`);
-  const a = client(workerA.base);
-
-  // 未認証は 401 (export / import とも)。
-  assert.equal((await a.anonymous('/api/transfer/export?ids=1')).status, 401);
-  assert.equal(
-    (await a.anonymous('/api/transfer/import', { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: zipA }))
-      .status,
-    401,
-  );
-
-  // Content-Type が ZIP でなければ 415。
-  const wrongType = await a.json('/api/transfer/import', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ hello: 'world' }),
-  });
-  assert.equal(wrongType.response.status, 415, JSON.stringify(wrongType.body));
-  assert.equal(wrongType.body.success, false);
-  assert.equal(wrongType.body.errors.length, 1);
-
-  // 壊れた ZIP は 400 (リクエスト単位の失敗)。
-  const broken = await a.json('/api/transfer/import', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/zip' },
-    body: Buffer.from('this is not a zip'),
-  });
-  assert.equal(broken.response.status, 400, JSON.stringify(broken.body));
-  assert.equal(broken.body.success, false);
-  assert.equal(broken.body.created, 0);
-
-  // 取り込み (create)。
-  const created = await a.upload(zipA);
-  assert.equal(created.response.status, 200, JSON.stringify(created.body));
-  assert.deepEqual(created.body, { success: true, created: 1, overwritten: 0, skipped: 0, errors: [] });
-
-  const list = await a.json('/api/novels');
-  assert.equal(list.body.records_total, 1, JSON.stringify(list.body));
-  const id = list.body.data[0].id;
-  const record = await a.json(`/api/novels/${id}`);
-  assert.equal(record.body.title, TITLE);
-  assert.equal(record.body.author, AUTHOR);
-  assert.equal(record.body.sitename, SITENAME);
-  assert.equal(record.body.toc_url, TOC_URL);
-  assert.equal(record.body.file_title, 'n1234ab');
-  assert.equal(record.body.ncode, 'n1234ab');
-  assert.equal(record.body.domain, DOMAIN);
-  assert.equal(record.body.novel_type, 1);
-  // 属性タグは通常タグから独立している (保存は extra_fields / attribute_tag)。
-  assert.deepEqual(record.body.tags, ['テスト']);
-  assert.equal(record.body.attribute_tag, '小説');
-  assert.equal(record.body.general_all_no, 1);
-  assert.equal(record.body.use_subdirectory, false);
-  console.log('PASS import creates the record and objects; unauthenticated / wrong-type / broken-zip are rejected');
-
-  for (const [fault, ncode] of [['lookup', 'n9981zz'], ['delete', 'n9982zz']]) {
-    const failed = await a.json('/api/transfer/import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/zip', 'x-narou-test-cleanup-fault': fault },
-      body: archiveFor(fixtureA, { tocUrl: `https://ncode.syosetu.com/${ncode}/`, ncode }),
-      signal: AbortSignal.timeout(15000),
-    });
-    assert.equal(failed.response.status, 200, JSON.stringify(failed.body));
-    assert.equal(failed.body.success, false);
-    assert.equal(failed.body.created, 0);
-    assert.equal(failed.response.headers.get('x-test-cleanup-lookups'), '1', 'failed cleanup must not respawn itself');
-    assert.equal(failed.response.headers.get('x-test-cleanup-deletes'), fault === 'delete' ? '1' : '0');
-    const remaining = await a.json('/api/novels');
-    assert.deepEqual(remaining.body.data.map(record => record.toc_url), [TOC_URL], 'failed publication must not expose a new novel');
-  }
-  console.log('PASS failed import cleanup is bounded when lookup or deletion fails; existing novels remain usable');
-
-  // 同じ ZIP の再取り込みは skip。
-  const skipped = await a.upload(zipA);
-  assert.deepEqual(skipped.body, { success: true, created: 0, overwritten: 0, skipped: 1, errors: [] });
-
-  // export: ヘッダと ZIP の中身。
-  const exportedA = await a.exportZip(id);
-  assert.equal(exportedA.response.headers.get('content-type'), 'application/zip');
-  assert.equal(exportedA.response.headers.get('cache-control'), 'no-store');
-  assert.match(exportedA.response.headers.get('content-disposition') ?? '', /^attachment; filename="narou-export-\d{14}\.zip"$/);
-
-  const { entries: zipEntries, manifest: exportedManifest } = manifestOf(exportedA.bytes);
-  // 書き出しは format 2 ( 旧形式 1 の読み込みは引き続き可能 )。
-  assert.equal(exportedManifest.format_version, 2);
-  assert.equal(exportedManifest.novels.length, 1);
-  const exportedNovel = exportedManifest.novels[0];
-  assert.equal(exportedNovel.toc_url, TOC_URL);
-  assert.equal(exportedNovel.title, TITLE);
-  assert.equal(exportedNovel.author, AUTHOR);
-  assert.equal(exportedNovel.sitename, SITENAME);
-  assert.equal(exportedNovel.domain, DOMAIN);
-  assert.equal(exportedNovel.ncode, 'n1234ab');
-  assert.equal(exportedNovel.novel_type, 1);
-  // 属性タグは manifest の独立フィールド (tags には入らない)。
-  assert.deepEqual(exportedNovel.tags, ['テスト']);
-  assert.equal(exportedNovel.attribute_tag, '小説');
-  assert.equal(exportedNovel.subtitle, 'テスト用のあらすじ');
-  assert.match(exportedNovel.last_update, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
-  assert.equal(exportedNovel.general_lastup, undefined);
-
-  // ファイルは相対パスの昇順で並び、すべて manifest に載る。
-  const paths = exportedNovel.files.map((file) => file.path);
-  assert.deepEqual(paths, [...paths].sort());
-  assert.deepEqual(paths, [
-    'converter.yaml',
-    'replace.txt',
-    'setting.ini',
-    'toc.yaml',
-    '挿絵/001.png',
-    firstSectionPath,
-  ]);
-  for (const file of exportedNovel.files) {
-    const data = zipEntries.get(`novels/0/${file.path}`);
-    assert(data, `${file.path} が ZIP にありません`);
-    assert.equal(file.size, data.length, `${file.path}: size`);
-    assert.equal(file.sha256, sha256(data), `${file.path}: sha256`);
-  }
-  // 実体が一致する。
-  for (const file of fixtureA) {
-    assert.deepEqual(zipEntries.get(`novels/0/${file.path}`), file.data, `${file.path}: body`);
-  }
-  console.log('PASS export writes a manifest with records metadata, digests and the stored objects');
-
-  // 存在しない ID / ids なし。
-  const missing = await a.json('/api/transfer/export?ids=99999');
-  assert.equal(missing.response.status, 404, JSON.stringify(missing.body));
-  assert.equal(missing.body.success, false);
-  assert.equal(typeof missing.body.message, 'string');
-  const noIds = await a.json('/api/transfer/export');
-  assert.equal(noIds.response.status, 400);
-  assert.equal(noIds.body.success, false);
-  console.log('PASS export rejects missing ids (404 JSON) and an omitted ids parameter (400)');
-
-  await stopWorker(workerA);
-  workerA = undefined;
-
-  // --- DB B: 別 DB へ取り込み、同じ ZIP が再現できる -----------------------
-  // 分组父作品の表紙は保存先に置かれる ( 設定如同 )。
-  phaseB = preparePhase('b', `INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES ('${GROUP_PREFIX}/cover.png',${GROUP_COVER.length},'2026-11-10T00:00:00Z','none',${crc32(GROUP_COVER)},X'${GROUP_COVER.toString('hex')}');`);
-  workerB = await startWorker(phaseB);
-  console.log(`worker B ready on ${workerB.base}`);
-  const b = client(workerB.base);
-
-  const imported = await b.upload(exportedA.bytes);
-  assert.deepEqual(imported.body, { success: true, created: 1, overwritten: 0, skipped: 0, errors: [] });
-  const listB = await b.json('/api/novels');
-  assert.equal(listB.body.records_total, 1);
-  const idB = listB.body.data[0].id;
-  const recordB = await b.json(`/api/novels/${idB}`);
-  assert.equal(recordB.body.title, TITLE);
-  assert.equal(recordB.body.ncode, 'n1234ab');
-  assert.equal(recordB.body.domain, DOMAIN);
-
-  const reExported = await b.exportZip(idB);
-  const { manifest: reExportedManifest } = manifestOf(reExported.bytes);
-  assert.deepEqual(filesFrom(reExportedManifest), filesFrom(exportedManifest));
-  // 取り込みも書き出しも決定的: 同じ小説は同じバイト列になる
-  // (exported_at と last_update だけが時刻)。
-  assert.equal(reExported.bytes.length > 0, true);
-  for (const file of fixtureA) {
-    assert.deepEqual(
-      readZip(reExported.bytes).get(`novels/0/${file.path}`),
-      file.data,
-      `${file.path}: 往復後の実体`,
-    );
-  }
-  console.log('PASS a fresh database imports the exported ZIP and re-exports identical files');
-
-  // --- overwrite -----------------------------------------------------------
-  const overwritten = await b.upload(zipB, '?overwrite=true');
-  assert.deepEqual(overwritten.body, { success: true, created: 0, overwritten: 1, skipped: 0, errors: [] });
-
-  const recordAfter = await b.json(`/api/novels/${idB}`);
-  assert.equal(recordAfter.body.id, idB, '上書きでレコード ID は変わらない');
-  assert.equal(recordAfter.body.file_title, 'n1234ab', '上書きで保存先は変わらない');
-  assert.equal(recordAfter.body.title, TITLE);
-  assert.equal(recordAfter.body.author, AUTHOR);
-
-  const afterOverwrite = await b.exportZip(idB);
-  const { entries: afterEntries, manifest: afterManifest } = manifestOf(afterOverwrite.bytes);
-  const overwrittenNovel = afterManifest.novels[0];
-  assert.equal(overwrittenNovel.subtitle, '更新後のあらすじ');
-  const afterPaths = overwrittenNovel.files.map((file) => file.path);
-  assert(afterPaths.includes(secondSectionPath), '追加された話が保存されている');
-  // アーカイブに無いファイルは消さない。
-  assert(afterPaths.includes('replace.txt'), 'アーカイブに無い replace.txt が消えている');
-  assert(afterPaths.includes('挿絵/001.png'), 'アーカイブに無い挿絵が消えている');
-  // 置換された実体。
-  assert.equal(
-    afterEntries.get(`novels/0/${firstSectionPath}`).toString('utf8'),
-    fixtureB.find((file) => file.path === firstSectionPath).data.toString('utf8'),
-  );
-  assert.deepEqual(afterEntries.get(`novels/0/${secondSectionPath}`), fixtureB.find((file) => file.path === secondSectionPath).data);
-  assert.deepEqual(afterEntries.get('novels/0/replace.txt'), Buffer.from('元の置換設定\n'));
-  assert.deepEqual(afterEntries.get('novels/0/挿絵/001.png'), PNG);
-  console.log('PASS overwrite replaces archived files, keeps the id/folder and leaves absent files alone');
-
-  // A late corrupt entry must not publish the valid replacement entries read
-  // before it. Rebuild CRC-correct ZIP records but leave the declared SHA bad.
-  const corruptEntries = readZip(zipB);
-  const corruptManifest = JSON.parse(corruptEntries.get('manifest.json'));
-  corruptManifest.novels[0].files.at(-1).sha256 = '0'.repeat(64);
-  corruptEntries.set('manifest.json', Buffer.from(JSON.stringify(corruptManifest)));
-  const corruptOverwrite = await b.upload(buildZip([...corruptEntries].map(([name, data]) => ({ name, data }))), '?overwrite=true');
-  assert.equal(corruptOverwrite.response.status, 400);
-  const afterCorruption = readZip((await b.exportZip(idB)).bytes);
-  for (const [path, bytes] of afterEntries) {
-    if (path !== 'manifest.json') assert.deepEqual(afterCorruption.get(path), bytes, `${path}: corrupt import must not mutate live data`);
-  }
-  console.log('PASS late archive corruption leaves every existing file unchanged');
-
-  // overwrite なしの再取り込みは skip (上書きしない)。
-  const skippedAgain = await b.upload(zipB);
-  assert.deepEqual(skippedAgain.body, { success: true, created: 0, overwritten: 0, skipped: 1, errors: [] });
-  console.log('PASS importing an existing novel without ?overwrite=true only skips it');
-
-  // --- 旧形式 (属性タグが tags に埋まっているアーカイブ) ----------------------
-  const legacyZip = archiveFor(fixtureA, { legacy: true, tocUrl: LEGACY_TOC_URL, ncode: 'n9999zz' });
-  const legacy = await b.upload(legacyZip);
-  assert.deepEqual(legacy.body, { success: true, created: 1, overwritten: 0, skipped: 0, errors: [] });
-  const legacyList = await b.json('/api/novels');
-  const legacyRow = legacyList.body.data.find((row) => row.toc_url === LEGACY_TOC_URL);
-  assert(legacyRow, '旧形式のアーカイブが取り込まれていない');
-  const legacyRecord = await b.json(`/api/novels/${legacyRow.id}`);
-  // 旧形式の属性タグは tags から取り出され、専用の項目に移る。
-  assert.deepEqual(legacyRecord.body.tags, ['テスト']);
-  assert.equal(legacyRecord.body.attribute_tag, '小説');
-  const legacyExport = await b.exportZip(legacyRow.id);
-  const { manifest: legacyManifest } = manifestOf(legacyExport.bytes);
-  assert.deepEqual(legacyManifest.novels[0].tags, ['テスト']);
-  assert.equal(legacyManifest.novels[0].attribute_tag, '小説');
-  console.log('PASS a legacy archive with the classification inside tags is migrated into attribute_tag');
-
-  // 158 works must not require retaining every uncompressed body in one Worker.
-  const bulkCount = 158;
-  const bulkBody = Buffer.from(`body: ${'x'.repeat(511992)}\n`);
-  const bulkBodyExpression = "CAST('body: ' || replace(hex(zeroblob(255996)), '00', 'xx') || char(10) AS BLOB)";
-  const bulkQueries = [];
-  const bulkIds = [];
-  for (let index = 0; index < bulkCount; index++) {
-    const id = 10000 + index;
-    bulkIds.push(id);
-    const tocUrl = `https://example.com/bulk/${index}/`;
-    const title = `Bulk ${index}`;
-    const prefix = `novels/BulkTransfer/bulk-${index}`;
-    const toc = Buffer.from(`title: ${title}\nauthor: Fixture\ntoc_url: ${tocUrl}\nsubtitles: []\nnovel_type: 1\n`);
-    const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
-    bulkQueries.push(`INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,novel_type,use_subdirectory) VALUES (${id},'Fixture','fixture',${quote(title)},${quote(title.toLowerCase())},'bulk-${index}',${quote(tocUrl)},${quote(tocUrl)},'BulkTransfer','bulktransfer','2026-11-02T00:00:00Z','bulk-${index}','bulk-${index}',1,0);`);
-    bulkQueries.push(`INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (${quote(`${prefix}/toc.yaml`)},${toc.length},'2026-11-02T00:00:00Z','none',${crc32(toc)},X'${toc.toString('hex')}');`);
-    bulkQueries.push(`INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (${quote(`${prefix}/本文/1 話.yaml`)},${bulkBody.length},'2026-11-02T00:00:00Z','none',${crc32(bulkBody)},${bulkBodyExpression});`);
-  }
-  const bulkSeed = join(phaseA.directory, 'bulk-transfer.sql');
-  writeFileSync(bulkSeed, bulkQueries.join('\n'));
-  await stopWorker(workerA);
-  runWrangler(['d1', 'execute', 'DB', '--local', '--file', bulkSeed], phaseA);
-  workerA = await startWorker(phaseA);
-  const bulkClient = client(workerA.base);
-  async function progressResponse(response) {
-    if (response.status !== 200) assert.fail(`HTTP ${response.status}: ${await response.text()}`);
-    assert.match(response.headers.get('content-type'), /application\/x-ndjson/);
-    const decoder = new TextDecoder();
-    let pending = '';
-    const frames = [], chunks = [];
-    for await (const chunk of response.body) {
-      pending += decoder.decode(chunk, { stream: true });
-      let newline;
-      while ((newline = pending.indexOf('\n')) !== -1) {
-        const frame = JSON.parse(pending.slice(0, newline));
-        pending = pending.slice(newline + 1);
-        assert.notEqual(frame.type, 'error', JSON.stringify(frame));
-        if (frame.type === 'data') chunks.push(Buffer.from(frame.data, 'base64'));
-        else frames.push(frame);
-      }
-    }
-    assert.equal(pending.trim(), '');
-    assert.equal(frames.at(-1)?.type, 'complete', 'a closed stream is not a successful transfer');
-    return { frames, bytes: Buffer.concat(chunks) };
-  }
-  const bulkExport = await progressResponse(await bulkClient.request(`/api/transfer/export?progress=1&ids=${bulkIds.join(',')}`));
-  assert.equal(bulkExport.frames.at(-1).bytes, bulkExport.bytes.length);
-  assert(bulkExport.frames.some((frame) => frame.type === 'progress' && frame.completed === bulkCount && frame.total === bulkCount));
-  const { manifest: bulkManifest, entries: bulkEntries } = manifestOf(bulkExport.bytes);
-  assert.equal(bulkManifest.novels.length, bulkCount);
-  for (let index = 0; index < bulkCount; index++) {
-    assert.equal(bulkManifest.novels[index].toc_url, `https://example.com/bulk/${index}/`);
-    assert.deepEqual(bulkEntries.get(`novels/${index}/本文/1 話.yaml`), bulkBody);
-    assert.equal(bulkManifest.novels[index].files.find((file) => file.path === '本文/1 話.yaml').sha256, sha256(bulkBody));
-  }
-  console.log('PASS 158 novels / 77 MiB of bodies stream into one valid ZIP with progress and verified hashes');
-  const streamedImport = await progressResponse(await b.request('/api/transfer/import?progress=1', {
-    method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: bulkExport.bytes,
-  }));
-  assert.deepEqual(streamedImport.frames.at(-1).result, { success: true, created: bulkCount, overwritten: 0, skipped: 0, errors: [] });
-  assert(streamedImport.frames.some((frame) => frame.type === 'progress' && frame.phase === 'import' && frame.completed === bulkCount));
-  const importList = await b.json('/api/novels?limit=1000');
-  assert.equal(importList.body.data.filter((novel) => novel.toc_url.startsWith('https://example.com/bulk/')).length, bulkCount);
-  const missingStream = await bulkClient.request('/api/transfer/export?progress=1&ids=999999999');
-  const missingFrames = (await missingStream.text()).trim().split('\n').map(JSON.parse);
-  assert.equal(missingFrames.at(-1).type, 'error');
-  assert(!missingFrames.some((frame) => frame.type === 'complete'));
-  console.log('PASS streamed import reports all 158 committed works and missing exports fail without a completion marker');
-
-  const colors = [[240, 0, 0], [0, 0, 240]];
-  const memberTitles = ['赤い作品', '青い作品'];
-  const memberUrls = memberTitles.map((_, index) => `https://example.com/virtual-image-${index}/`);
-  for (const [index, color] of colors.entries()) {
-    const files = [
-      { path: 'toc.yaml', data: Buffer.from(tocYaml('結合に混ぜない個別あらすじ', [{ index: '1', name: '第一話' }])) },
-      { path: firstSectionPath, data: Buffer.from(sectionYaml('1', '第一話', `${memberTitles[index]}の本文。［＃挿絵（挿絵/001.png）入る］`)) },
-      { path: '挿絵/001.png', data: solidPng(color) },
-    ];
-    const imported = await b.upload(archiveFor(files, { tocUrl: memberUrls[index], ncode: `virtual-image-${index}`, title: memberTitles[index] }));
-    assert.equal(imported.response.status, 200, JSON.stringify(imported.body));
-    assert.equal(imported.body.created, 1);
-  }
-  const withImages = (await b.json('/api/novels?limit=1000')).body.data;
-  const members = memberUrls.map(url => withImages.find(record => record.toc_url === url).id);
-  const post = body => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  const virtual = await b.json('/api/virtual_novels', post({ title: '画像結合検証', author: '検証作者', members }));
-  assert.equal(virtual.response.status, 200, JSON.stringify(virtual.body));
-  const virtualId = virtual.body.id;
-  const savedLayout = await b.json(`/api/settings/${virtualId}`, post({ settings: [{ name: 'enable_yokogaki', value: true }] }));
-  assert.equal(savedLayout.response.status, 200, JSON.stringify(savedLayout.body));
-  assert.equal((await b.request(`/api/virtual_novels/${members[0]}/download.epub`)).status, 404);
-  const combined = await b.request(`/api/virtual_novels/${virtualId}/download.epub`);
-  assert.equal(combined.status, 200, combined.status === 200 ? '' : await combined.text());
-  const book = readZip(Buffer.from(await combined.arrayBuffer()));
-  assert(!book.has('item/xhtml/cover.xhtml'), 'the first member illustration must stay in the virtual book body');
-  const pixels = [...book].filter(([name]) => name.startsWith('item/image/')).map(([, bytes]) => firstPngPixel(bytes));
-  assert.deepEqual(new Set(pixels.map(rgb => rgb.join(','))), new Set(colors.map(rgb => rgb.join(','))), 'both same-named member images must survive');
-  const packageText = [...book].find(([name]) => name.endsWith('.opf'))[1].toString();
-  assert.match(packageText, /page-progression-direction="ltr"/);
-  assert.doesNotMatch(packageText, /\bcover-image\b/, 'a virtual book needs its own explicit cover');
-  const xhtml = [...book].filter(([name]) => name.endsWith('.xhtml')).map(([, bytes]) => bytes.toString()).join('\n');
-  for (const title of memberTitles) assert(xhtml.includes(`${title}の本文`), xhtml);
-  assert(!xhtml.includes('結合に混ぜない個別あらすじ'), 'member books must not be concatenated with their individual front matter');
-  const queued = await b.json('/api/convert', post({ targets: [String(virtualId)], device: 'epub' }));
-  assert.equal(queued.response.status, 200, JSON.stringify(queued.body));
-  const jobId = queued.body.results[0].job_id;
-  let outcome;
-  const deadline = Date.now() + 60000;
-  do {
-    outcome = (await b.json(`/api/jobs/${jobId}`)).body;
-    if (!['pending', 'running'].includes(outcome.status)) break;
-    await new Promise(resolve => setTimeout(resolve, 100));
-  } while (Date.now() < deadline);
-  assert.equal(outcome.status, 'succeeded', JSON.stringify(outcome));
-  console.log('PASS virtual EPUB preserves member pixels, one book structure, target layout, and queued conversion');
-
-  // --- バーチャル小説の構成とメンバーを別ライブラリへ転送 -------------------
-  // 本文は通常作品、親は構成・変換設定・明示的な表紙を保持する。
-  const groupTitle = GROUP_TITLE;
-  const groupCover = GROUP_COVER;
-  const vmemberOne = { tocUrl: 'https://example.com/vmember-1/', title: 'VirtualMemberOne', ncode: 'vmember1', body: '第一の作品の本文。' };
-  const vmemberTwo = { tocUrl: 'https://example.com/vmember-2/', title: 'VirtualMemberTwo', ncode: 'vmember2', body: '第二の作品の本文。' };
-  for (const member of [vmemberOne, vmemberTwo]) {
-    const { zip } = archiveFrom([ordinaryDescriptor({
-      tocUrl: member.tocUrl, title: member.title, ncode: member.ncode,
-      story: `${member.title}のあらすじ`, body: member.body,
-    })]);
-    const imported = await b.upload(zip);
-    assert.equal(imported.response.status, 200, JSON.stringify(imported.body));
-    assert.equal(imported.body.created, 1, JSON.stringify(imported.body));
-  }
-  const virtualList = await b.json('/api/novels?limit=1000');
-  const memberIds = [vmemberOne, vmemberTwo].map((member) => {
-    const row = virtualList.body.data.find((record) => record.toc_url === member.tocUrl);
-    assert(row, `missing member ${member.tocUrl}`);
-    return row.id;
-  });
-  const group = await b.json('/api/virtual_novels', post({
-    title: groupTitle, author: 'グループ作者', sitename: SITENAME, members: memberIds,
-  }));
-  assert.equal(group.response.status, 200, JSON.stringify(group.body));
-  const groupId = group.body.id;
-  const groupRecord = await b.json(`/api/novels/${groupId}`);
-  assert.match(groupRecord.body.toc_url, /^https:\/\/narou\.rs\/virtual\/[0-9a-f]{32}$/, 'a new group uses a portable identity');
-  assert.equal(groupRecord.body.ncode, `vs_${groupId}`);
-  const groupSettings = await b.json(`/api/settings/${groupId}`, post({ settings: [{ name: 'enable_yokogaki', value: true }] }));
-  assert.equal(groupSettings.response.status, 200, JSON.stringify(groupSettings.body));
-  console.log('PASS a new virtual group registers with a portable identity and per-novel settings');
-
-  // 親だけを書き出すと、メンバーが自動的に展開される。
-  const groupExport = await b.exportZip(groupId);
-  const { entries: groupEntries, manifest: groupManifest } = manifestOf(groupExport.bytes);
-  assert.equal(groupManifest.format_version, 2);
-  assert.equal(groupManifest.novels.length, 3, 'the parent expands into its two members');
-  assert.equal(groupManifest.novels[0].virtual_members, undefined);
-  assert.equal(groupManifest.novels[1].virtual_members, undefined);
-  const parentNovel = groupManifest.novels[2];
-  assert.deepEqual(parentNovel.virtual_members, [vmemberOne.tocUrl, vmemberTwo.tocUrl], 'the membership order travels with the parent');
-  assert.equal(parentNovel.ncode, undefined, 'a parent carries no library-local ncode');
-  assert.equal(parentNovel.toc_url, groupRecord.body.toc_url);
-  assert(!parentNovel.tags.some((tag) => tag.startsWith('vs_')), 'the internal tag never travels');
-  assert.deepEqual(parentNovel.files.map((file) => file.path), ['cover.png', 'setting.ini']);
-  assert.deepEqual(groupEntries.get('novels/2/cover.png'), groupCover);
-  assert(groupEntries.get('novels/2/setting.ini').toString('utf8').includes('enable_yokogaki'));
-  // 選択されたメンバーも 1 度だけ書かれる。
-  const dedupExport = await b.exportZip(`${groupId},${memberIds[0]}`);
-  const { manifest: dedupManifest } = manifestOf(dedupExport.bytes);
-  assert.equal(dedupManifest.novels.length, 3, 'a member that is also selected is stored once');
-  console.log('PASS exporting a selected group writes the members once and the parent descriptor with its order');
-
-  // --- 別ライブラリへ取り込む (衝突 / 順序 / 設定 / 表紙 / EPUB) --------------
-  phaseC = preparePhase('c');
-  workerC = await startWorker(phaseC);
-  const c = client(workerC.base);
-  // 同じ作品名のグループが既にあるライブラリを用意する (保存先の衝突)。
-  const otherMember = { tocUrl: 'https://example.com/vmember-9/', title: 'VirtualMemberNine', ncode: 'vmember9' };
-  const otherImport = await c.upload(archiveFrom([ordinaryDescriptor({
-    tocUrl: otherMember.tocUrl, title: otherMember.title, ncode: otherMember.ncode,
-    story: 'Ninth story', body: 'VirtualMemberNineの本文。',
-  })]).zip);
-  assert.equal(otherImport.body.created, 1, JSON.stringify(otherImport.body));
-  const otherRow = (await c.json('/api/novels?limit=1000')).body.data.find((row) => row.toc_url === otherMember.tocUrl);
-  const sameTitle = await c.json('/api/virtual_novels', post({
-    title: groupTitle, author: '既存グループ', sitename: SITENAME, members: [otherRow.id],
-  }));
-  assert.equal(sameTitle.response.status, 200, JSON.stringify(sameTitle.body));
-  const sameTitleRow = (await c.json(`/api/novels/${sameTitle.body.id}`)).body;
-
-  // 取り込み先に既にいるメンバーは skip されても、親はその ID を引き継ぐ。
-  const existingMember = await c.upload(archiveFrom([ordinaryDescriptor({
-    tocUrl: vmemberOne.tocUrl, title: vmemberOne.title, ncode: vmemberOne.ncode,
-    story: `${vmemberOne.title}のあらすじ`, body: vmemberOne.body,
-  })]).zip);
-  assert.equal(existingMember.body.created, 1, JSON.stringify(existingMember.body));
-
-  const importedGroup = await c.upload(groupExport.bytes);
-  assert.deepEqual(importedGroup.body, { success: true, created: 2, overwritten: 0, skipped: 1, errors: [] });
-  const cList = (await c.json('/api/novels?limit=1000')).body.data;
-  const cMembers = [vmemberOne, vmemberTwo].map((member) => cList.find((row) => row.toc_url === member.tocUrl).id);
-  const cParentRow = cList.find((row) => row.toc_url === groupRecord.body.toc_url);
-  assert(cParentRow, 'the parent was imported');
-  const cParent = (await c.json(`/api/novels/${cParentRow.id}`)).body;
-  assert.equal(cParent.ncode, `vs_${cParent.id}`, 'the parent gets a destination-local ncode');
-  assert.notEqual(cParent.file_title, sameTitleRow.file_title, 'the imported group must not share the folder of an existing same-title group');
-  const cGroups = (await c.json('/api/virtual_novels')).body.novels;
-  const cGroup = cGroups.find((row) => row.id === cParent.id);
-  assert.deepEqual(cGroup.members, cMembers, 'the membership order survives the reallocated ids');
-  assert.deepEqual(cGroups.find((row) => row.id === sameTitle.body.id).members, [otherRow.id], 'the existing group is untouched');
-  console.log('PASS a fresh library imports the group after its members and keeps the order under new ids');
-
-  // 取り込み直後の父作品: 設定と表紙がそのまま保存されている。
-  const cParentExport = await c.exportZip(cParent.id);
-  const { entries: cParentEntries, manifest: cParentManifest } = manifestOf(cParentExport.bytes);
-  const cParentNovel = cParentManifest.novels.find((novel) => novel.toc_url === groupRecord.body.toc_url);
-  const cParentIndex = cParentManifest.novels.indexOf(cParentNovel);
-  assert.deepEqual(cParentNovel.files.map((file) => file.path), ['cover.png', 'setting.ini']);
-  assert.deepEqual(cParentEntries.get(`novels/${cParentIndex}/cover.png`), groupCover);
-  assert.deepEqual(cParentEntries.get(`novels/${cParentIndex}/setting.ini`), groupEntries.get('novels/2/setting.ini'));
-  console.log('PASS the imported group keeps its settings and cover bytes');
-
-  // 結合 EPUB: UI の実経路で両メンバーの本文が登録順に現れる。
-  const epub = await c.request(`/novels/${cParent.id}/download`);
-  assert.equal(epub.status, 200, epub.status === 200 ? '' : await epub.text());
-  const importedBook = readZip(Buffer.from(await epub.arrayBuffer()));
-  const importedXhtml = [...importedBook].filter(([name]) => name.endsWith('.xhtml')).map(([, bytes]) => bytes.toString()).join('\n');
-  assert(importedXhtml.includes(vmemberOne.body), importedXhtml);
-  assert(importedXhtml.includes(vmemberTwo.body), importedXhtml);
-  assert(importedXhtml.indexOf(vmemberOne.body) < importedXhtml.indexOf(vmemberTwo.body), 'the members keep their order');
-  console.log('PASS the imported group renders one EPUB through the UI route');
-
-  // 同じアーカイブの再取り込みは skip。
-  const repeated = await c.upload(groupExport.bytes);
-  assert.deepEqual(repeated.body, { success: true, created: 0, overwritten: 0, skipped: 3, errors: [] });
-  console.log('PASS importing the same group archive again skips every entry');
-
-  // 上書き: メンバー順が入れ替わっても保存先 ID とフォルダは変わらない。
-  const reversedArchive = archiveFrom([
-    ordinaryDescriptor({
-      tocUrl: vmemberOne.tocUrl, title: vmemberOne.title, ncode: vmemberOne.ncode,
-      story: `${vmemberOne.title}のあらすじ`, body: vmemberOne.body,
-    }),
-    ordinaryDescriptor({
-      tocUrl: vmemberTwo.tocUrl, title: vmemberTwo.title, ncode: vmemberTwo.ncode,
-      story: `${vmemberTwo.title}のあらすじ`, body: vmemberTwo.body,
-    }),
-    {
-      toc_url: groupRecord.body.toc_url, title: groupTitle, files: [],
-      virtual_members: [vmemberTwo.tocUrl, vmemberOne.tocUrl],
-    },
-  ]);
-  const reversedImport = await c.upload(reversedArchive.zip, '?overwrite=true');
-  assert.deepEqual(reversedImport.body, { success: true, created: 0, overwritten: 3, skipped: 0, errors: [] });
-  const reversedGroup = (await c.json('/api/virtual_novels')).body.novels.find((row) => row.id === cParent.id);
-  assert.deepEqual(reversedGroup.members, [cMembers[1], cMembers[0]], 'the overwrite replaces the membership order');
-  const reversedParent = (await c.json(`/api/novels/${cParent.id}`)).body;
-  assert.equal(reversedParent.file_title, cParent.file_title, 'the folder of the group is preserved');
-  assert.equal(reversedParent.toc_url, groupRecord.body.toc_url, 'the portable identity is preserved');
-  console.log('PASS overwriting a group replaces the membership order and keeps its identity and folder');
-
-  // --- 壊れたメンバー参照は公開前に拒否される ------------------------------
-  const brokenGraphs = [
-    ['missing member', ['https://example.com/missing-member/']],
-    ['self reference', ['https://narou.rs/virtual/11111111111111111111111111111111']],
-  ];
-  for (const [label, refs] of brokenGraphs) {
-    const broken = archiveFrom([
-      ordinaryDescriptor({
-        tocUrl: 'https://example.com/broken-member/', title: 'BrokenMember', ncode: 'broken1',
-        story: 'broken', body: 'broken',
-      }),
-      {
-        toc_url: 'https://narou.rs/virtual/11111111111111111111111111111111',
-        title: 'BrokenGroup', files: [], virtual_members: refs,
-      },
-    ]);
-    const refused = await c.upload(broken.zip);
-    assert.equal(refused.response.status, 400, `${label}: ${JSON.stringify(refused.body)}`);
-    const afterRefusal = (await c.json('/api/novels?limit=1000')).body.data;
-    assert(!afterRefusal.some((row) => row.toc_url === 'https://example.com/broken-member/'), `${label}: nothing may be imported`);
-  }
-  // 入れ子の親 (親がメンバーを参照) も拒否される。
-  const nested = archiveFrom([
-    ordinaryDescriptor({
-      tocUrl: 'https://example.com/nested-member/', title: 'NestedMember', ncode: 'nested1',
-      story: 'nested', body: 'nested',
-    }),
-    {
-      toc_url: 'https://narou.rs/virtual/22222222222222222222222222222222',
-      title: 'InnerGroup', files: [], virtual_members: ['https://example.com/nested-member/'],
-    },
-    {
-      toc_url: 'https://narou.rs/virtual/33333333333333333333333333333333',
-      title: 'OuterGroup', files: [], virtual_members: ['https://narou.rs/virtual/22222222222222222222222222222222'],
-    },
-  ]);
-  assert.equal((await c.upload(nested.zip)).response.status, 400);
-  console.log('PASS malformed member graphs are refused before anything is imported');
-
-  // --- メンバーの保存に失敗したら親も公開されない --------------------------
-  const blocked = await c.upload(archiveFrom([
-    // ncode / 保存先が既存作品と衝突する。
-    ordinaryDescriptor({
-      tocUrl: 'https://example.com/collide/', title: 'CollideMember', ncode: 'vmember1',
-      story: 'collide', body: 'CollideMemberの本文。',
-    }),
-    ordinaryDescriptor({
-      tocUrl: 'https://example.com/healthy-member/', title: 'HealthyMember', ncode: 'vmember3',
-      story: 'healthy', body: 'HealthyMemberの本文。',
-    }),
-    {
-      toc_url: 'https://narou.rs/virtual/44444444444444444444444444444444',
-      title: 'BlockedGroup', files: [],
-      virtual_members: ['https://example.com/collide/', 'https://example.com/healthy-member/'],
-    },
-  ]).zip);
-  assert.equal(blocked.response.status, 200, JSON.stringify(blocked.body));
-  assert.equal(blocked.body.success, false);
-  assert.equal(blocked.body.created, 1, 'the healthy member is still imported');
-  const blockedList = (await c.json('/api/novels?limit=1000')).body.data;
-  assert(!blockedList.some((row) => row.toc_url === 'https://narou.rs/virtual/44444444444444444444444444444444'), 'the parent must not be published');
-  assert(!(await c.json('/api/virtual_novels')).body.novels.some((row) => row.title === 'BlockedGroup'));
-  console.log('PASS a failed member blocks the publication of its parent');
-
-  // --- 旧 ID のバーチャル小説 ( 移植可能な ID への移行 ) --------------------
-  // ライブラリローカルな URL (`/virtual/vs_<ID>`) だけを持つ旧グループ。
-  const legacyRows = [
-    { id: 901, title: 'LegacyMemberOne', fileTitle: 'legacymember1', tocUrl: 'https://example.com/legacy-1/' },
-    { id: 902, title: 'LegacyMemberTwo', fileTitle: 'legacymember2', tocUrl: 'https://example.com/legacy-2/' },
-  ];
-  const legacySeed = [];
-  const sqlQuote = (value) => `'${String(value).replaceAll("'", "''")}'`;
-  for (const row of legacyRows) {
-    const toc = Buffer.from(`title: ${row.title}\nauthor: Fixture\ntoc_url: ${row.tocUrl}\nsubtitles: []\nnovel_type: 1\n`);
-    const prefix = `novels/Legacy Site/${row.fileTitle}`;
-    legacySeed.push(`INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,novel_type,use_subdirectory) VALUES (${row.id},'Fixture','fixture',${sqlQuote(row.title)},${sqlQuote(row.title.toLowerCase())},${sqlQuote(row.fileTitle)},${sqlQuote(row.tocUrl)},${sqlQuote(row.tocUrl)},'Legacy Site','legacy site','2026-11-10T00:00:00Z',${sqlQuote(row.fileTitle)},${sqlQuote(row.fileTitle)},1,0);`);
-    legacySeed.push(`INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (${sqlQuote(`${prefix}/toc.yaml`)},${toc.length},'2026-11-10T00:00:00Z','none',${crc32(toc)},X'${toc.toString('hex')}');`);
-  }
-  legacySeed.push("INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,novel_type,use_subdirectory) VALUES (900,'Fixture','fixture','LegacyGroup','legacygroup','LegacyGroup','https://narou.rs/virtual/vs_900','https://narou.rs/virtual/vs_900','Legacy Site','legacy site','2026-11-10T00:00:00Z','vs_900','vs_900',0,0);");
-  legacySeed.push("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','virtual_novel_members','{\"900\":[901,902]}','{\"900\":[901,902]}');");
-  phaseD = preparePhase('d', legacySeed.join('\n'));
-  workerD = await startWorker(phaseD);
-  const d = client(workerD.base);
-  const legacyGroupExport = await d.exportZip(900);
-  const { manifest: legacyGroupManifest } = manifestOf(legacyGroupExport.bytes);
-  assert.equal(legacyGroupManifest.novels.length, 3, 'the legacy group expands into its members');
-  const legacyParent = legacyGroupManifest.novels[2];
-  assert.match(legacyParent.toc_url, /^https:\/\/narou\.rs\/virtual\/[0-9a-f]{32}$/, 'the first export persists a portable identity');
-  assert.deepEqual(legacyParent.virtual_members, ['https://example.com/legacy-1/', 'https://example.com/legacy-2/']);
-  const legacyGroupRow = await d.json('/api/novels/900');
-  assert.equal(legacyGroupRow.body.toc_url, legacyParent.toc_url, 'the source record keeps the portable identity');
-  const legacyExportAgain = await d.exportZip(900);
-  const { manifest: legacyAgain } = manifestOf(legacyExportAgain.bytes);
-  assert.equal(legacyAgain.novels[2].toc_url, legacyParent.toc_url, 'later exports reuse the same identity');
-  console.log('PASS the first export of an older group persists one portable identity and reuses it');
-
-  // Exercise one file and one ZIP above the old 16 MiB small-object ceiling.
-  // Client fixture allocations are outside the Worker; production routes must
-  // receive, stage, validate, export and re-import these bodies incrementally.
-  const large = Buffer.alloc(17 * 1024 * 1024);
-  let random = 0x12345678;
-  for (let index = 0; index < large.length; index++) {
-    random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
-    large[index] = random & 255;
-  }
-  const largeFiles = [
-    { path: 'toc.yaml', data: Buffer.from(tocYaml('大きな挿絵', [])) },
-    { path: '挿絵/large.bin', data: large },
-  ];
-  const largeImport = await b.upload(archiveFor(largeFiles, { tocUrl: 'https://example.com/large-transfer/', ncode: 'large-transfer' }));
-  assert.equal(largeImport.body.created, 1, JSON.stringify(largeImport.body));
-  const largeId = (await b.json('/api/novels?limit=1000')).body.data.find(record => record.toc_url === 'https://example.com/large-transfer/').id;
-  const largeExport = await progressResponse(await b.request(`/api/transfer/export?progress=1&ids=${largeId}`));
-  assert(largeExport.bytes.length > 16 * 1024 * 1024);
-  assert.equal(sha256(readZip(largeExport.bytes).get('novels/0/挿絵/large.bin')), sha256(large));
-  const largeRoundtrip = await bulkClient.upload(largeExport.bytes);
-  assert.equal(largeRoundtrip.body.created, 1, JSON.stringify(largeRoundtrip.body));
-  // Cancelling a body releases the isolate-local heavy permit. A subsequent
-  // request must not remain busy merely because the client stopped pulling.
-  const cancelledExport = await b.request(`/api/transfer/export?progress=1&ids=${largeId}`);
-  const cancelledReader = cancelledExport.body.getReader();
-  await cancelledReader.read();
-  await cancelledReader.cancel('contract cancellation');
-  const resumed = await b.exportZip(largeId);
-  assert.equal(sha256(readZip(resumed.bytes).get('novels/0/挿絵/large.bin')), sha256(large));
-  console.log('PASS large per-entry transfer and cancelled-stream admission cleanup');
-
-  exitCode = 0;
-} catch (error) {
-  if (workerA) console.error(workerA.logs().slice(-20000));
-  if (workerB) console.error(workerB.logs().slice(-20000));
-  if (workerC) console.error(workerC.logs().slice(-20000));
-  if (workerD) console.error(workerD.logs().slice(-20000));
-  console.error(error);
-} finally {
-  await stopWorker(workerA);
-  await stopWorker(workerB);
-  await stopWorker(workerC);
-  await stopWorker(workerD);
-  rmSync(work, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
-}
-
-process.exit(exitCode);
+if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){await contracts();}

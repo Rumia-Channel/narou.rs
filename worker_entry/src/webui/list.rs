@@ -101,20 +101,32 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
     } else {
         crate::hidden::load_from_env(env).await.ok()
     };
-    let exclude_ids: Vec<i64> = crate::virtual_novels::load_from_env(env)
-        .await
-        .map(|members| members.all_member_ids().into_iter().collect())
-        .unwrap_or_default();
-    let services = match super::metadata::MetadataServices::new(env) {
-        Ok(services) => services,
+    let members = match crate::virtual_novels::load_from_env(env).await {
+        Ok(members) => members,
+        Err(error) => return json_error(503, "service_unavailable", Some(&error.to_string())),
+    };
+    let exclude_ids = members.all_member_ids().into_iter().collect();
+    let settings = match super::metadata::settings_for_writes(env) {
+        Ok(settings) => settings,
         Err(error) => {
             worker::console_log!("service composition failed: {error}");
             return json_error(503, "service_unavailable", None);
         }
     };
-    let page = match services
-        .library
-        .list(&LibraryListRequest {
+    let db = super::metadata::primary_database(env)?;
+    let objects: std::sync::Arc<dyn narou_rs::platform::ObjectStore> = std::sync::Arc::new(crate::d1_object_store::D1ObjectStore::new(db.clone()));
+    let repository: std::sync::Arc<dyn narou_rs::platform::NovelRepository> = std::sync::Arc::new(crate::d1_repository::D1NovelRepository::new(db.clone()));
+    let primary_library = narou_rs::application::LibraryService::new(
+        repository.clone(),
+        std::sync::Arc::new(narou_rs::platform::SystemClock),
+        std::sync::Arc::new(crate::d1_repository::D1FreezeStore::for_writes(db)),
+        std::sync::Arc::new(narou_rs::application::EmptySiteTimezoneProvider),
+    );
+    let content = narou_rs::application::NovelContentService::new(repository, objects);
+    let mut scope = content.read_scope("web-library-list");
+    let result = async {
+    let page = match primary_library
+        .list(&mut scope, &LibraryListRequest {
             search,
             start,
             length,
@@ -123,13 +135,21 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
             hidden,
             include_hidden,
             exclude_ids,
-            attribute_tags_enabled: narou_rs::application::attribute_tags::enabled(&services.settings).await,
+            attribute_tags_enabled: narou_rs::application::attribute_tags::enabled(&settings).await,
         })
         .await
     {
         Ok(page) => page,
         Err(error) => return map_application_error(error),
     };
+    let latest_members = match crate::virtual_novels::load_from_env(env).await {
+        Ok(members) => members,
+        Err(error) => return json_error(503, "service_unavailable", Some(&error.to_string())),
+    };
+    if latest_members != members {
+        return json_error(409, "conflict", Some("virtual membership changed during listing"));
+    }
+
 
     let data = page
         .data
@@ -168,6 +188,8 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
         data,
     })?;
     super::metadata::timed_response(response, "list", started_ms)
+    }.await;
+    super::leased_response(result, scope).await
 }
 
 /// `serde_urlencoded` (= `form_urlencoded`) と同じ規則で生バイト列から
@@ -270,15 +292,8 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// native `map_application_error` と同じステータス割当。
-/// `json_error` がクレート非公開なので JSON 形だけ合わせて自前で返す。
+/// Keep the public gate error taxonomy shared with all content endpoints.
 fn map_application_error(error: ApplicationError) -> worker::Result<Response> {
-    let (status, code, message) = match error {
-        ApplicationError::InvalidRequest(message) => (400, "invalid_request", message),
-        ApplicationError::Conflict(message) => (409, "conflict", message),
-        ApplicationError::NotFound(message) => (404, "not_found", message),
-        ApplicationError::Platform(message) => (500, "internal_error", message),
-    };
-    json_error(status, code, Some(&message))
+    super::application_error_response(&error)
 }
 

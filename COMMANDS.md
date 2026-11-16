@@ -106,7 +106,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `hidden` | — (Rust 拡張) | ✅ 完了 | 作品・タグ・作者・サイトを一覧から非表示にする。`add`/`remove`/`list`/`clear`。`add 123 --tag 秘密 --author 作者名 --site kakuyomu.jp` のように単位を指定でき、タグ非表示はそのタグを持つ作品も隠す。設定は在庫 `hidden`（Native は `.narou/hidden.yaml` / SQLite `app_state`、Worker は D1 `app_state`）に保存し、`narou list --show-hidden` と Web UI の「非表示も表示」で解除表示できる。更新・変換などの内部処理は非表示作品も対象 |
 | `virtual` | — (Rust 拡張) | 🟡 部分 | 複数の実小説を `vs_<ID>` の 1 作品として `novels` に登録する。`add`（タイトル・作者・サイト・タグ・メンバー・`--attribute`）/`append`（既存の仮想小説へメンバーを追加）/`list`/`order`/`attribute`/`remove`、Web API `/api/virtual_novels`（`POST /{id}/members` で追加）、Web UI の登録・追加・並べ替え・変換・削除を実装。仮想小説には `vs_<ID>` タグが付き、hidden tag で非表示にできる。メンバー行は一覧から自動除外。`convert vs_<ID>` はメンバーを登録順に結合した EPUB を出力する。本文・章見出し・画像参照の結合は Native／Worker 共通で、同名の挿絵を作品ごとに区別し、仮想小説自身の変換設定を適用する。Web の結合 EPUB はメンバー変更を反映するため毎回生成する。`append` は共通の集計処理でタグ・話数・最新話掲載日を再計算し、既に別の仮想小説に属する作品と仮想小説自身は拒否する。登録・追加・削除は作品と所属情報を同じ保存境界で更新し、競合で別の変更を消さず、保存失敗時も片方だけ変更しない（YAML のプロセス強制終了時の制約は設計資料を参照）。破損した所属情報はエラーにする。属性タグ (小説 / 漫画) はメンバーの属性から自動分類し、混在時だけ `add --attribute` / `attribute <vs_ID> <小説|漫画>` で利用者が選べる。Worker は登録・一覧・並べ替え・メンバー追加・削除 API と結合 EPUB ダウンロードに対応 |
 | `export` | — (Rust 拡張) | ✅ 完了 | 選択した作品を ZIP に書き出す (`narou export <target>... -o file.zip`)。`toc.yaml`・本文・`setting.ini`・`replace.txt`・`converter.yaml`・挿絵・EPUB を含み、`manifest.json` にメタデータと SHA-256 を記録。DB-only の作品も一時的に実体化して書き出す |
-| `import` | — (Rust 拡張) | ✅ 完了 | `narou export` の ZIP を取り込む (`narou import file.zip [--overwrite|--skip]`)。`toc_url` が一致する既存作品は上書き/スキップ、無い作品は新しい ID で追加。書込みは YAML / SQLite / S3 挿絵の各バックエンドの ObjectStore 経由で行い、古いアーカイブで既存本文を削らない。Web API `GET /api/transfer/export` / `POST /api/transfer/import` も同じ処理 |
+| `import` | — (Rust 拡張) | ✅ 完了 | `narou export` の ZIP を取り込む (`narou import file.zip [--overwrite|--skip]`)。`toc_url` が一致する既存作品は上書き/スキップ、無い作品は新しい ID で追加。書込みは YAML / SQLite / S3 挿絵の各バックエンドの ObjectStore 経由で行い、古いアーカイブで既存本文を削らない。Web は ZIP 全体の POST ではなく `/api/transfer/v2` へ移行・統合検証中（詳細は転送節） |
 | `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`rename`/`order`/`clear` を実装。**サイトごとに複数の「名前つきログイン」を試行順つきで保持**し、1 ログインが複数ホストの Cookie を持つ (ブラウザのセッションがホストをまたぐため)。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET /api/login`、`POST /api/login/import\|rename\|order`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}` も対応 |
 | `api` | — (Rust 拡張) | ✅ 完了 | 外部公開 API (`/api/v1`) の Bearer トークン管理。`create`/`list`/`delete`/`info`。設定ページの「外部API」タブからも同じ操作ができる。詳細は [`docs/external-api.md`](docs/external-api.md) |
 | `db` | — (Rust 拡張) | ✅ 完了 | SQLite 管理 DB の保守。`verify` / `export-yaml [--out\|--in-place]` / `vacuum` / `repair-freeze [--dry-run]`。既定は YAML 管理で、SQLite は Web UI 初回ツアーまたは `.narou/storage-backend` マーカーによる opt-in。`repair-freeze` は旧ビルドが残した `freeze.yaml.imported-*` から失われた凍結状態を復旧する |
@@ -378,7 +378,7 @@ narou author remove 1
 
 ---
 
-### 3.x-transfer `export` / `import` — CLI 実装済み / Web のクライアント WASM は未接続 (narou.rs 独自, Ruby版対応外)
+### 3.x-transfer `export` / `import` — CLI 実装済み / Web v2 は統合検証中 (narou.rs 独自, Ruby版対応外)
 
 選択した作品の小説データを ZIP で持ち出し、別のライブラリへ取り込む。
 
@@ -390,17 +390,17 @@ narou author remove 1
 - ZIP: `manifest.json` + `novels/<index>/...`。作品メタデータ（`toc_url` / title / author / sitename / domain / tags / novel_type / ncode）と各ファイルのサイズ・SHA-256 を manifest に記録する。
 - ZIP 形式は `2` (通常作品の旧形式 `1` も読み取り可)。バーチャル小説だけの指定でもメンバーを重複なく先に格納し、親の `virtual_members` に作品 URL を結合順で記録する。親には自身の変換設定・置換規則・明示的な表紙だけを同梱し、本文を複製しない。
 - 取り込みは通常作品を復元してから取り込み先 ID で親を登録する。既存メンバーのスキップ・親の再取り込み・構成順の上書きに対応し、メンバー失敗時は親を公開しない。親の永続識別 URL はライブラリ ID と分離し、取り込み先の `vs_<ID>` と内部タグを再生成する。Native で正規の作品 ID `0` が割り当てられたメンバーも扱う。
-- Native の書き出しは専用の一時ディレクトリへ完全な保存内容を取得する。SQLite のミラー無効時も raw・履歴・生成物・利用者ファイルを含め、S3 の挿絵も同梱する。実行中の変換先へ一時復元せず、その生成物を後片付けで削除しない。
+- CLI の Native 書き出しは専用の一時ディレクトリへ完全な保存内容を取得する。SQLite のミラー無効時も raw・履歴・生成物・利用者ファイルを含め、S3 の挿絵も同梱する。実行中の変換先へ一時復元せず、その生成物を後片付けで削除しない。
 - Native は旧データのエスケープ済みフォルダ名も既存の保存先として解決する。全角の `：` / `＜` / `＞` や末尾の `．` などを含む既存データを、DB・フォルダ名の書き換えや作品の読み飛ばしなしで書き出せる。本文・設定の読み書きも同じ既存フォルダを参照し、別の正規名フォルダを作らない。両方が存在する場合は正規名を優先し、自動的に内容を統合しない。
 - Worker は作品フォルダの一覧を挿絵索引で補完し、S3 の共有プールにだけ存在する画像も同梱する。画像の実体は共通の論理キーで確認し、旧配置への読み取り互換を維持する。
-- 本文は 1 ファイルの内部もチャンクで圧縮・保存し、ZIP 全体や全展開ファイルをメモリへ集めない。取り込みは全エントリを非公開 stage へ検証してから適用する。形式上限は維持し、Worker / WASM では manifest・ZIP 索引等に別途 24 MiB の割当予算を適用する。
-- 安全策: パストラバーサル・absolute path・重複パス・サイズ/エントリ上限・zip bomb を共通コアで拒否。上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。`sqlite.mirror-files=false` のライブラリへの import は fail closed。
-- Web API: `GET /api/transfer/export?ids=1,2` は ZIP、`POST /api/transfer/import[?overwrite=true]` は ZIP 本文を受け取り `{success, created, overwritten, skipped, errors}` を返す。既存の Web 認証ミドルウェア配下。
-- Web UI は両 API の `progress=1` を使い、作品数・転送量・検証／取り込み状況・エラーをモーダル表示する。書き出しは本文を 1 ファイルずつ圧縮・送信し、選択した複数作品を 1 個の ZIP にまとめる。取り込みは ZIP 1 個を選び、その中の複数作品を処理する。
-- 進捗応答は NDJSON (`progress` / `data` / `complete` / `error`)。完了フレームの無い切断を成功扱いせず、ブラウザでの保存完了はダウンロード一覧で確認する。通信中止は取り込み済み作品を巻き戻さない。詳細は `WEBUI.md` §6.1b。
+- Web v2 の ZIP 生成・検証・展開は Dedicated Worker 上の WASM が担当し、ZIP 全体をサーバーへ送る方式へフォールバックしない。パス・重複・宣言サイズ・CRC・SHA-256 を検証し、非公開 stage の保存成功後だけ作品を公開する。
+- 通信要求はフレームを含め 8 MiB / 100 レコード以下に分割する。作品全体・全 ZIP の展開サイズに旧来の 512 MiB 一律上限は置かず、manifest・索引・メタデータの制御上限と有界バッファを別に管理する。
+- Web の既定 `runtime` は raw・履歴・確認済みの派生物を列挙／転送前に除外し、本文・目次・設定・挿絵・未知の利用者ファイルを保持する。`complete` は保存先が対応する保守データも対象にする。Worker は raw を新規保存しない。
+- Web は `/api/transfer/v2` の session / チャンク API へ切り替え中。session と操作の永続 ACK で再送・再開を扱い、公開済み作品をキャンセルで巻き戻さず、未公開分を回収する。既存の Web 認証ミドルウェア配下で動作する。
+- 上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。CLI の既存取り込みでの `sqlite.mirror-files=false` の制限と、Web v2 の参照公開は別経路として確認する。詳細は `WEBUI.md` §6.1b。
 - ブラウザ保存は File System Access または Service Worker の pull 型ストリームを使い、全量 `Blob` 化へフォールバックしない。保存先の書き込みを待って次のチャンクを受け取り、明示的な完了通知前の切断・キャンセルを成功扱いしない。
 - 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が生成・検証・取り込み計画を共有する。
-- **Web の完了判定**: 上記はサーバー ZIP 版の現行動作。`transfer_wasm` は単体 API のみで UI から呼ばれておらず、当初のクライアント処理方針は未達。ZIP 生成・検証・展開をブラウザへ移す session / チャンク転送の設計と受入条件は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) に記載（未実装）。サマリの `export` / `import` の完了は CLI を指し、Web の WASM 接続完了を意味しない。
+- **Web の完了判定**: クライアント WASM・Native/Worker の新経路を実装中で、統合動作は未確認。サマリの `export` / `import` の完了は CLI を指す。大容量・再開・配布物・実ブラウザの受入条件は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) を参照し、未検証の経路を完了扱いしない。公開済み v0.6.6 のサーバー ZIP 経路の修正が配布済みという意味ではない。
 - **書式 (ZIP の中身) の詳細は [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md)** を参照 (`manifest.json` のスキーマ・検証ルール・衝突規則・同梱するファイル・挿絵の扱い)。
 
 ### 3.x-hidden `hidden` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
@@ -510,7 +510,8 @@ Cloudflare Workers では Cloudflare Zero Trust の Service Token (`CF-Access-Cl
 - HTML の `&nbsp;` は narou.rb と同じ通常スペースへ復元する（本文・前書き・後書き・あらすじの合成入力で回帰確認）。
 - 作品レコードを Native／Worker 共通の変換入口へ渡し、完結タグ・掲載日・サイト名を使う題名展開をオンデマンド変換でも反映する。
 - `sqlite.mirror-files=false` の変換用取り出しは全ページを走査するが、目次・本文・設定・挿絵索引・表紙だけを対象にする。4,096 件を超えても取りこぼさず、生成物・履歴を一時ファイルとして所有しない。既存の実ファイルは変更しない。
-- CLI も `setting.ini` / `replace.txt` を取り出してから個別設定を読み、挿絵索引を実効 ObjectStore に保存する。ミラー有効時の復元ファイルは残し、無効時の取り出しファイルだけ最後の利用者が解放した時点で消す。挿絵を含む同期 I/O は既存 Tokio 文脈でも二重 runtime にしない。
+- Native CLI は、元の操作の読み書きガードを保持した専用 private snapshot で `setting.ini` / `replace.txt`・本文・挿絵を読み、生成物の公開だけを元のガードへ戻す。読み出しのために canonical のミラーを復元・削除せず、実効 ObjectStore の保存値を使う。同期 I/O は既存 Tokio 文脈でも二重 runtime にしない（別ブランチで統合検証中）。
+- Native のファイル変換は、個別 INI・ローカル設定・ライブラリ探索の I/O エラーを既定値として握り潰さず、呼び出し元へ返す。純粋なテキスト描画と Native I/O の構築を分離する（別ブランチで統合検証中）。
 - 個別 `setting.ini` は Native CLI / Web の変換子プロセスでも実効 ObjectStore から読み、SQLite 移行前の実ファイルが残っていても正準保存値を優先する。`novel_title` / `novel_author` を含む再編集・設定解除を反映し、読み出しのために既存ファイルを上書き・削除しない。YAML 管理とライブラリ外の読み出しは従来どおり（issue #37）。
 - 挿絵の一時取り出しが途中で失敗した場合も、新規作成した完全／不完全ファイルを片付け、再試行時に不完全な画像を再利用しない。
 - 挿絵の公開は既存ファイルを上書きしない方法で行い、取得中に別処理が作った画像は削除対象にしない。Native Web の保存済みテキストも要求専用の一時ファイルへ読み、名前付きテキストの SQLite オブジェクトだけが残る構成に対応する。

@@ -202,11 +202,17 @@ DBのrow、S3 blob、YAML/FS mirrorを同じObjectKeyの論理データへ解決
 
 ### 6.4 有界実行と費用
 
-`advance` は最大8 MiBのバイト処理、または100項目の制御処理で checkpoint を永続化して返す。実際の adapter の SQL / subrequest 上限が先ならさらに小さく切る。長いファイルがあっても次回の invocation から進める。
+通常の `advance` は最大8 MiBのバイト処理、または100項目の制御処理で checkpoint を永続化して返す。実際の adapter の SQL / subrequest 上限が先ならさらに小さく切る。長いファイルがあっても次回の invocation から進める。
 
 8 MiB の HTTP 読出しを `AssetStore::read_range` の64 KiBごとに別の S3 GET へ変換してはならない。`read_stream_range(key, range)` を追加し、S3 は1回の Range GETを64 KiB以下のチャンクで返す。D1/SQLite は必要な chunk 行の範囲を読む。FS は seek する。SplitStore 等は同じ契約を委譲する。既存 `read_range` の64 KiB契約は変えない。
 
-圧縮保存された source をチャンクごとに先頭から展開し直す二乗コストも禁止する。必要なら snapshot 準備時に一度だけ内部 codec を復号し、raw の range-readable stage にする。
+圧縮保存された source をチャンクごとに先頭から展開し直す二乗コストも禁止する。既存の圧縮オブジェクトだけは、初回に64 KiB以下の復号ストリームを私有 raw stage へ一度だけ保存する。この初期化単位は既存ストアの復号後上限16 MiBの1オブジェクトまでとし、その回は初期化だけで返す（同じ回にさらに8 MiBをコピーしない）。内部復号器の状態を invocation 間で永続化できないための明示的な処理予算の例外であり、HTTP本文8 MiBの上限を変更しない。初期化前にowner/参照を永続化し、完了したstageは応答消失後も再利用する。途中の初期化は安全に回収・再実行し、以後のrange読出しは通常の8 MiB単位に戻す。大きな未圧縮ファイルにはこの16 MiB上限を適用しない。
+
+挿絵索引の初回 catalog 準備も、既存の16 MiB以下のYAMLオブジェクト1個を読む内部初期化単位とする。値全体のmapや全ファイル名のsort用Vecは作らず、YAMLイベントからファイル名を私有spoolへ流し、以後は100件以下のページで検査する。この段階で画像・本文・rawを取得しない。入力・anchor投影・送信待ちpartを含む保持メタデータは24 MiB内とし、必要ならpartを5 MiBにする。parserが1個のscalarを復号する一時領域は入力上限内の別作業領域であり、保持予算と混同しない。alias展開後のspool件数・byteもメタデータのadmissionで数え、入力より小さいと仮定しない。解析・容量エラーで途中までの一覧を成功扱いせず、私有stageを回収する。
+
+**Native の authoritative Inventory commit だけの例外:** 既存の保護されたライブラリ全体の YAML / SQLite metadata（作品行、tag sequence、仮想所属、索引）の確定・undo/redo は、既存の共通ロックと原子的な公開・rollback 境界で行い、ローカル I/O が8 MiBを超える場合がある。書込み・ファイル hash / image copy の作業 buffer は64 KiB以下とし、既に Native プロセス内にある Inventory snapshot を Worker の128 MiB / portable codec の保持24 MiB保証に含めない。これは Native 全体 metadata storage / serialization の作り直しを今回の転送payload再設計へ含めないための明示的な許可であり、ライブラリ全体の `database.yaml` に新しい16 MiB上限を設けない。
+
+この例外を「全 physical I/O が8 MiB以下」と言い換えてはならない。HTTP request のフレーム込み8 MiB、通常の bounded data/control advance、file publication の分割、事前の個別metadata/field admission は従来どおりである。Worker/D1 と WASM に全ライブラリ・巨大cellの例外を与えず、前段の圧縮source / 索引1個の16 MiB初期化例外も拡大しない。
 
 データ本文は raw bytes とし、HTTP `Content-Encoding` 付き upload は受け付けない。レスポンスは `no-transform` を指定し、クライアントは宣言だけでなく実読出し byte を上限付きで数える。これはサーバーの ZIP 展開をなくす選択であり、高圧縮率の本文では ZIP 全体の送信より通信量が増える。転送削減は Skip・verified reuse・未確定チャンクだけの再送によって行い、「WASM 化すれば必ず送信量も減る」とは約束しない。
 
@@ -364,6 +370,18 @@ revisionは現状既存ではないためmigrationで追加する。SQLite/D1は
 8. このcommit点の前の失敗はpre-imageへ復元して私有の新規分だけを除く。復元失敗ならgate/journalを残す。commit後の取消は作品を巻き戻さず、応答消失はreceiptで回収する。
    undo/redo自体もfile単位のcheckpointと期待fingerprintで冪等にする。旧版へ復元済みならskip、設置済み新版ならundo、どちらでもない値は外部/競合変更としてgateを残す。途中回復のプロセス死から再実行しても、別操作のbyteを削除・上書きしない。
 9. committedまたは回復完了後にgateを開き、pre-imageを回収する。未解決publicationをTTL GCで消さない。
+
+新規・移動した identity は、他の現在作品の folded URL と prefix の完全一致だけでなく、component 境界の祖先・子孫との重なりも拒否する。旧データの既存衝突は、変更前に衝突していた identity の fingerprint が不変な通常 metadata 編集だけ許可し、新しい衝突を追加しない。active claim が0件でも現在作品の検査を省略しない。
+
+Native の削除は OS lock → 実 metadata authority の順で検査し、その authority を実 gate の CLOSED owner 永続化まで保持してから最初の file delete を行う。metadata の行を消した後も CLOSED-removal gate は namespace を予約しており、再起動時の削除再実行が新しい子作品を消せないよう、新規・移動 identity を gate が開くまで拒否する。削除専用の別 claim は新設しない。保持したファイルの origin も authority に含め、同じ prefix の同じ URL への再利用以外の rebinding、および origin を持つ別 prefix の祖先・子孫への新規割当てを拒否する。既存の入れ子作品を親作品の所有物とみなして広く削除してはならない。
+
+Native の source admission も、catalog 列挙・snapshot・本文 read より前に現在作品と保持 gate の namespace を検査する。旧形式の親・子 folder が別作品として登録されている場合、子を選択していない親 export へ「unknown file」として取り込まず、CLI と Web v2 の両方で衝突を解消するよう拒否する。論理 prefix だけでなく、旧 flat 配置への解決や filesystem alias による実 directory の重なりも所有境界に含める。
+
+削除前に current record または完全一致の ordinary claim から証明した folded URL を gate origin へ結び、metadata 消失後も別 identity が旧 byte を取り込まない。既に portable URI を持つ仮想親の URI は通常 metadata writer から変更・旧 URI へ巻き戻しできない。legacy 仮想 URI の初期化だけは、同じ ID・prefix・original OPEN epoch の専用 CAS で許可し、metadata commit より前に candidate origin を永続化しない。commit 後の応答消失・再起動は、実 current row と同じ legacy origin の証明で修復・収束する。
+
+未登録 prefix を whole-library backup へ含める場合も、不在を読出し許可とみなさない。保持している original lease に加え、完全一致する OPEN gate の空でない origin、現在作品・他の保持 gate との論理/実 directory の非重複、未公開 active claim がないことを実 metadata authority の下で証明する。既存ファイルを保持した paused create を除外して「成功した backup」にしてはならない。
+
+portable metadata commit と origin 更新の間で停止した場合、live `ncode == vs_ID`・同じ prefix・完全一致する `https://narou.rs/virtual/vs_ID` origin だけを readonly な検査 view で current portable URI と対応させる。global current-map の走査だけで他作品の gate を永続更新しない。変更対象の修復・削除では original OPEN epoch と OS authority を持つ同じ prefix だけを CAS 修復し、keep-files 削除も metadata DELETE より前に portable origin を残す。
 
 `NovelContentAccess` / mutation fenceは**新設するport**であり、現行 `NovelLockGuard` は代替にならない。CLIのdownload/update/convert/import/export/backup、Web/Workerの本文・挿絵・EPUB・external/read API・編集・削除・小説設定まで全入口を移す。gate確認とreader admissionは同じロック/CAS境界で行い、次のlogical file openもlease/epochを検査する。
 

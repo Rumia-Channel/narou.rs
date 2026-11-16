@@ -39,7 +39,7 @@ pub struct DiffOptions {
 #[derive(Clone)]
 struct NovelContext {
     record: NovelRecord,
-    archive_root: PathBuf,
+    private_dir: Option<PathBuf>,
 }
 
 struct DiffTexts {
@@ -71,7 +71,7 @@ pub fn cmd_diff(opts: DiffOptions) -> i32 {
 fn cmd_diff_inner(opts: DiffOptions) -> std::result::Result<(), String> {
     db::init_database().map_err(|e| e.to_string())?;
 
-    let context = match resolve_context(opts.target.as_deref())? {
+    let mut context = match resolve_context(opts.target.as_deref())? {
         Some(context) => context,
         None => return Ok(()),
     };
@@ -86,11 +86,6 @@ fn cmd_diff_inner(opts: DiffOptions) -> std::result::Result<(), String> {
         return Err("差分指定の書式が違います(正しい例:2013.02.21@01.39.46)".to_string());
     }
 
-    if opts.list {
-        display_diff_list(&context)?;
-        return Ok(());
-    }
-
     if opts.clean {
         clean_diff(&context)?;
         return Ok(());
@@ -98,6 +93,14 @@ fn cmd_diff_inner(opts: DiffOptions) -> std::result::Result<(), String> {
 
     if opts.all_clean {
         clean_all_diff()?;
+        return Ok(());
+    }
+    let write = narou_rs::native::materialization::capture_write_for_record(&context.record).map_err(|error| error.to_string())?;
+    let directory = narou_rs::native::materialization::directory_for_origin(&write).map_err(|error| error.to_string())?;
+    let snapshot = narou_rs::native::materialization::snapshot_with_origin(&directory, &write).map_err(|error| error.to_string())?;
+    context.private_dir = Some(snapshot.path().to_path_buf());
+    if opts.list {
+        display_diff_list(&context)?;
         return Ok(());
     }
 
@@ -125,15 +128,12 @@ fn resolve_context(target: Option<&str>) -> std::result::Result<Option<NovelCont
 
             let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
             let record = novels
-                .get_sync(data.id.into())
+                .get_current_sync(data.id.into())
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("ID: {}", data.id))?;
-            let archive_root =
-                narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-                    .map_err(|e| e.to_string())?;
             Ok(Some(NovelContext {
                 record,
-                archive_root,
+                private_dir: None,
             }))
         }
         None => {
@@ -147,16 +147,13 @@ fn resolve_context(target: Option<&str>) -> std::result::Result<Option<NovelCont
             let mut query = query;
             query.sort.reverse = true;
             let latest = novels
-                .query_sync(&query)
+                .query_current_sync(&query)
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .next();
-            let archive_root =
-                narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-                    .map_err(|e| e.to_string())?;
             Ok(latest.map(|record| NovelContext {
                 record,
-                archive_root,
+                private_dir: None,
             }))
         }
     }
@@ -176,7 +173,7 @@ fn load_global_setting_string(key: &str) -> std::result::Result<Option<String>, 
 }
 
 fn cache_root_dir(context: &NovelContext) -> PathBuf {
-    narou_rs::db::existing_novel_dir_for_record(&context.archive_root, &context.record)
+    context.private_dir.clone().expect("diff inputs are a leased private snapshot")
         .join(SECTION_SAVE_DIR)
         .join(CACHE_SAVE_DIR)
 }
@@ -290,8 +287,7 @@ fn build_diff_texts(
         return Ok(None);
     }
 
-    let novel_dir =
-        narou_rs::db::existing_novel_dir_for_record(&context.archive_root, &context.record);
+    let novel_dir = context.private_dir.as_ref().ok_or_else(|| "diff input snapshot is missing".to_string())?;
     let section_dir = novel_dir.join(SECTION_SAVE_DIR);
 
     let mut cache_sections = Vec::new();
@@ -435,73 +431,32 @@ fn display_diff_list(context: &NovelContext) -> std::result::Result<(), String> 
     Ok(())
 }
 
-fn remove_empty_diff_directory(path: &Path) -> std::result::Result<bool, String> {
-    let mut entries = fs::read_dir(path).map_err(|error| error.to_string())?;
-    match entries.next() {
-        None => {
-            fs::remove_dir(path).map_err(|error| error.to_string())?;
-            Ok(true)
-        }
-        Some(Ok(_)) => Ok(false),
-        Some(Err(error)) => Err(error.to_string()),
-    }
-}
 
-/// Shared object cleanup plus native I/O for legacy empty cache directories.
-/// Used by --clean and --all-clean, and by the Web action's one CLI invocation.
+/// Maintenance edits a private snapshot; canonical deletes and SQL pruning use
+/// the same origin captured before reading the old cache.
 fn clean_diff_data(context: &NovelContext) -> std::result::Result<bool, String> {
-    use narou_rs::application::webui::diff::{DIFF_CACHE_DIR_NAMES, plan_diff_cache_clean};
-    use narou_rs::platform::ObjectStore;
-
-    let novel_dir = narou_rs::db::existing_novel_dir_for_record(&context.archive_root, &context.record);
-    let novel_dir = narou_rs::db::paths::ensure_within_archive_root(&novel_dir, &context.archive_root)
+    use narou_rs::application::webui::diff::DIFF_CACHE_DIR_NAMES;
+    let write = narou_rs::native::materialization::capture_write_for_record(&context.record).map_err(|error| error.to_string())?;
+    let directory = narou_rs::native::materialization::directory_for_origin(&write).map_err(|error| error.to_string())?;
+    let snapshot = narou_rs::native::materialization::NativeMutationSnapshot::begin_with_origin(&directory, write)
         .map_err(|error| error.to_string())?;
-    let prefix = narou_rs::native::object_store::novel_object_prefix(&context.archive_root, &novel_dir)
-        .ok_or_else(|| "invalid novel storage path".to_string())?;
-    let store = narou_rs::native::object_store::NativeStore::for_current_root()
-        .map_err(|error| error.to_string())?;
-    let plan = futures::executor::block_on(plan_diff_cache_clean(&store, &prefix))
-        .map_err(|error| error.to_string())?;
-    let mut removed = !plan.is_empty();
-    futures::executor::block_on(async {
-        for key in plan {
-            store.delete(&key).await?;
-        }
-        Ok::<_, narou_rs::error::NarouError>(())
-    })
-    .map_err(|error| error.to_string())?;
-
+    let mut removed = false;
     for name in DIFF_CACHE_DIR_NAMES {
-        let root = novel_dir.join(SECTION_SAVE_DIR).join(name);
-        let root = narou_rs::db::paths::ensure_within_archive_root(&root, &context.archive_root)
-            .map_err(|error| error.to_string())?;
-        let entries = match fs::read_dir(&root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+        let cache = snapshot.path().join(SECTION_SAVE_DIR).join(name);
+        match fs::remove_dir_all(&cache) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
-        };
-        for entry in entries {
-            let dir = entry.map_err(|error| error.to_string())?.path();
-            let dir = narou_rs::db::paths::ensure_within_archive_root(&dir, &context.archive_root)
-                .map_err(|error| error.to_string())?;
-            if !dir.is_dir() {
-                continue;
-            }
-            removed |= remove_empty_diff_directory(&dir)?;
         }
-        removed |= remove_empty_diff_directory(&root)?;
     }
-    // P4b: clearing diffs also clears the SQLite version history (plan §11.3:
-    // api_diff_clean == prune all).
-    #[cfg(feature = "native-runtime")]
-    {
-        if let Ok(conn) = version_conn() {
-            let guard = conn.lock();
-            let pruned =
-                narou_rs::native::sqlite::versions::prune_history(&guard, context.record.id, 0)
-                    .map_err(|e| e.to_string())?;
-            removed = removed || pruned > 0;
-        }
+    snapshot.publish_changes().map_err(|error| error.to_string())?;
+    let primary = narou_rs::native::object_store::NativeStore::for_current_root().map_err(|error| error.to_string())?;
+    if matches!(&primary, narou_rs::native::object_store::NativeStore::Sqlite(_)) {
+        let pruned = primary.with_open_write(snapshot.origin().fence(), || {
+            let connection = version_conn().map_err(narou_rs::error::NarouError::Platform)?;
+            narou_rs::native::sqlite::versions::prune_history(&connection.lock(), context.record.id, 0)
+        }).map_err(|error| error.to_string())?;
+        removed |= pruned > 0;
     }
     Ok(removed)
 }
@@ -525,9 +480,7 @@ fn clean_all_diff() -> std::result::Result<(), String> {
         0,
         usize::MAX,
     );
-    let records = novels.query_sync(&query).map_err(|e| e.to_string())?;
-    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-        .map_err(|e| e.to_string())?;
+    let records = novels.query_current_sync(&query).map_err(|e| e.to_string())?;
 
     let frozen_ids = compat::load_frozen_ids().map_err(|e| e.to_string())?;
 
@@ -537,8 +490,8 @@ fn clean_all_diff() -> std::result::Result<(), String> {
         }
 
         let context = NovelContext {
-            archive_root: archive_root.clone(),
             record,
+            private_dir: None,
         };
         if clean_diff_data(&context)? {
             println!("{} の差分を削除しました", context.record.title);
@@ -731,200 +684,84 @@ fn version_conn()
 
 #[cfg(feature = "native-runtime")]
 fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Result<(), String> {
+    use narou_rs::application::novel_access::NovelReadLease;
     use narou_rs::native::sqlite::versions;
-
-    let conn = version_conn()?;
-    let mut guard = conn.lock();
+    let stores = narou_rs::native::object_store::NativeStores::for_current_root().map_err(|error| error.to_string())?;
+    let keys = narou_rs::platform::NovelObjectKeys::new(&context.record.sitename, &context.record.file_title, context.record.use_subdirectory)
+        .map_err(|error| error.to_string())?;
+    let prefix = narou_rs::platform::ObjectPrefix::from(keys.prefix().clone());
     let novel_id = context.record.id;
-
-    if opts.history {
-        let versions = versions::list_versions(&guard, novel_id).map_err(|e| e.to_string())?;
-        if versions.is_empty() {
-            println!("バージョン履歴はありません");
-            return Ok(());
+    if opts.history || opts.show.is_some() {
+        return futures::executor::block_on(async {
+            let mut lease = NovelReadLease::admit(&stores.objects, &prefix, "native-version-read").await?;
+            let result = stores.primary.with_reader_transaction(&prefix, lease.lease(), |connection| {
+                if opts.history {
+                    let entries = versions::list_versions(connection, novel_id)?;
+                    if entries.is_empty() { println!("バージョン履歴はありません"); }
+                    else {
+                        println!("{:>6}  {:<8}  {:<24}  {:>8}  {}", "ID", "ORIGIN", "CREATED", "SECTIONS", "NOTE");
+                        for version in entries {
+                            println!("{:>6}  {:<8}  {:<24}  {:>8}  {}", version.id, version.origin, version.created_at, version.section_count, version.note.as_deref().unwrap_or(""));
+                        }
+                    }
+                } else if let Some(version_id) = opts.show {
+                    let diff = versions::version_diff(connection, novel_id, version_id)?
+                        .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("バージョン{version_id}の差分はありません")))?;
+                    print!("{diff}");
+                }
+                Ok(())
+            });
+            let result = match result { Ok(()) => lease.validate().await, Err(error) => Err(error) };
+            let released = lease.release().await;
+            result.and(released)
+        }).map_err(|error| error.to_string());
+    }
+    let write = narou_rs::native::materialization::capture_write_for_record(&context.record).map_err(|error| error.to_string())?;
+    let directory = narou_rs::native::materialization::directory_for_origin(&write).map_err(|error| error.to_string())?;
+    let snapshot = narou_rs::native::materialization::NativeMutationSnapshot::begin_with_origin(&directory, write).map_err(|error| error.to_string())?;
+    let working = stores.primary.with_open_write(snapshot.origin().fence(), || {
+        let connection = version_conn().map_err(narou_rs::error::NarouError::Platform)?;
+        let mut guard = connection.lock();
+        if let Some(version_id) = opts.restore {
+            versions::restore_version(&mut guard, novel_id, version_id, false)?;
+        } else if let Some(version_id) = opts.merge_from {
+            let only = opts.merge_sections.as_ref().map(|raw| raw.split(',').map(str::trim).filter(|part| !part.is_empty()).map(str::to_owned).collect::<Vec<_>>());
+            versions::merge_from_version(&mut guard, novel_id, version_id, only.as_deref(), None)?;
         }
-        println!(
-            "{:>6}  {:<8}  {:<24}  {:>8}  {}",
-            "ID", "ORIGIN", "CREATED", "SECTIONS", "NOTE"
-        );
-        for version in versions {
-            println!(
-                "{:>6}  {:<8}  {:<24}  {:>8}  {}",
-                version.id,
-                version.origin,
-                version.created_at,
-                version.section_count,
-                version.note.as_deref().unwrap_or("")
-            );
-        }
-        return Ok(());
-    }
-
-    if let Some(version_id) = opts.show {
-        let diff = versions::version_diff(&guard, novel_id, version_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("バージョン{version_id}の差分はありません"))?;
-        print!("{diff}");
-        return Ok(());
-    }
-
-    if let Some(version_id) = opts.restore {
-        versions::restore_version(&mut guard, novel_id, version_id, false)
-            .map_err(|e| e.to_string())?;
-        let working_set = load_working_set(&guard, novel_id)?;
-        // 書戻しは ObjectStore 経由で同じ接続を掴むため、ロックを解放してから行う。
-        drop(guard);
-        write_back_working_set(context, &working_set)?;
-        println!("バージョン{version_id}から復元しました (新しいヘッドとして記録)");
-        return Ok(());
-    }
-
-    if let Some(version_id) = opts.merge_from {
-        let only = opts.merge_sections.as_ref().map(|raw| {
-            raw.split(',')
-                .map(|part| part.trim().to_string())
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-        });
-        versions::merge_from_version(&mut guard, novel_id, version_id, only.as_deref(), None)
-            .map_err(|e| e.to_string())?;
-        let working_set = load_working_set(&guard, novel_id)?;
-        // 書戻しは ObjectStore 経由で同じ接続を掴むため、ロックを解放してから行う。
-        drop(guard);
-        write_back_working_set(context, &working_set)?;
-        println!("バージョン{version_id}からマージしました");
-        return Ok(());
-    }
-
+        narou_rs::native::sqlite::content::load_sections(&guard, novel_id)?
+            .ok_or_else(|| narou_rs::error::NarouError::NotFound("作業セットがミラーされていません".into()))
+    }).map_err(|error| error.to_string())?;
+    write_back_working_set(snapshot.path(), &working)?;
+    snapshot.publish_changes().map_err(|error| error.to_string())?;
+    if let Some(version_id) = opts.restore { println!("バージョン{version_id}から復元しました (新しいヘッドとして記録)"); }
+    if let Some(version_id) = opts.merge_from { println!("バージョン{version_id}からマージしました"); }
     Ok(())
 }
 
-#[cfg(feature = "native-runtime")]
-fn load_working_set(
-    conn: &rusqlite::Connection,
-    novel_id: i64,
-) -> std::result::Result<narou_rs::native::sqlite::content::SectionMap, String> {
-    narou_rs::native::sqlite::content::load_sections(conn, novel_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "作業セットがミラーされていません".to_string())
-}
 
-/// Write the mirrored working set back after a restore/merge.
-///
-/// The SQLite tables are a mirror of the version history; the working set
-/// (`本文/*.yaml`) is what conversion, the web reader and the version tooling
-/// observe. In SQLite mode a filesystem-only write is shadowed by the stored
-/// `objects` rows (reads prefer the database), so the update must go through
-/// the same ObjectStore boundary the readers use — which also keeps the
-/// filesystem mirror in sync when it is enabled.
+/// Restore the selected SQL working set only into the operation's private tree.
 #[cfg(feature = "native-runtime")]
 fn write_back_working_set(
-    context: &NovelContext,
+    directory: &Path,
     sections: &narou_rs::native::sqlite::content::SectionMap,
 ) -> std::result::Result<(), String> {
-    use narou_rs::downloader::persistence::section_filename;
-    use narou_rs::downloader::types::SubtitleInfo;
-    use narou_rs::platform::{ObjectListRequest, ObjectPrefix, ObjectStore};
-
-    let novel_dir =
-        narou_rs::db::existing_novel_dir_for_record(&context.archive_root, &context.record);
-    let section_dir = novel_dir.join(SECTION_SAVE_DIR);
-    let store = narou_rs::native::object_store::NativeStore::for_current_root()
-        .map_err(|e| e.to_string())?;
-    let section_prefix = narou_rs::native::object_store::novel_object_prefix(
-        &context.archive_root,
-        &novel_dir,
-    )
-    .map(|prefix| {
-        prefix
-            .join(SECTION_SAVE_DIR)
-            .map_err(|e| e.to_string())
-    })
-    .transpose()?;
-
+    let section_dir = directory.join(SECTION_SAVE_DIR);
+    fs::create_dir_all(&section_dir).map_err(|error| error.to_string())?;
     let mut expected = std::collections::HashSet::new();
-    for (idx, (subtitle, body_yaml)) in sections {
-        let section: SectionFile = serde_yaml::from_str(body_yaml).map_err(|e| e.to_string())?;
-        let info = SubtitleInfo {
-            index: idx.clone(),
-            href: section.href.clone(),
-            chapter: section.chapter.clone(),
-            subchapter: section.subchapter.clone(),
-            subtitle: subtitle.clone().unwrap_or_else(|| section.subtitle.clone()),
-            file_subtitle: section.file_subtitle.clone(),
-            subdate: section.subdate.clone(),
-            subupdate: section.subupdate.clone(),
-            download_time: section.download_time.clone(),
-            download_revision: section.download_revision,
-        };
-        let name = section_filename(&info);
+    for (_, (_, yaml)) in sections {
+        let section: SectionFile = serde_yaml::from_str(yaml).map_err(|error| error.to_string())?;
+        let name = format!("{} {}.yaml", section.index, section.file_subtitle);
+        if Path::new(&name).components().count() != 1 || name.contains('\\') {
+            return Err("version section filename is invalid".into());
+        }
         expected.insert(name.clone());
-        match &section_prefix {
-            Some(prefix) => {
-                let key = prefix.join(&name).map_err(|e| e.to_string())?;
-                futures::executor::block_on(store.write_small(&key, body_yaml.clone().into_bytes()))
-                    .map_err(|e| e.to_string())?;
-            }
-            None => {
-                fs::create_dir_all(&section_dir).map_err(|e| e.to_string())?;
-                fs::write(section_dir.join(&name), body_yaml).map_err(|e| e.to_string())?;
-            }
-        }
+        fs::write(section_dir.join(name), yaml).map_err(|error| error.to_string())?;
     }
-
-    // Remove section entries that no longer exist in the working set
-    // (renamed subtitles leave the previous file name behind).
-    match &section_prefix {
-        Some(prefix) => {
-            let request = ObjectListRequest::new(
-                ObjectPrefix::new(prefix.as_ref()).map_err(|e| e.to_string())?,
-                std::num::NonZeroUsize::new(512).expect("page size is non-zero"),
-            );
-            let mut cursor: Option<String> = None;
-            loop {
-                let request = match &cursor {
-                    Some(cursor) => request.clone().after(cursor.clone()),
-                    None => request.clone(),
-                };
-                let page = futures::executor::block_on(store.list_page(&request))
-                    .map_err(|e| e.to_string())?;
-                for metadata in &page.objects {
-                    let key = metadata.key.as_ref();
-                    let Some(name) = key.strip_prefix(&format!("{}/", prefix.as_ref())) else {
-                        continue;
-                    };
-                    if name.contains('/') || !name.ends_with(".yaml") || expected.contains(name) {
-                        continue;
-                    }
-                    futures::executor::block_on(store.delete(&metadata.key))
-                        .map_err(|e| e.to_string())?;
-                }
-                match page.next_cursor {
-                    Some(next) => cursor = Some(next),
-                    None => break,
-                }
-            }
-        }
-        None => {
-            fs::create_dir_all(&section_dir).map_err(|e| e.to_string())?;
-            for entry in fs::read_dir(&section_dir).map_err(|e| e.to_string())? {
-                let path = entry.map_err(|e| e.to_string())?.path();
-                let is_yaml = path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext == "yaml");
-                if !is_yaml {
-                    continue;
-                }
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if !expected.contains(&name) {
-                    fs::remove_file(&path).map_err(|e| e.to_string())?;
-                }
-            }
+    for entry in fs::read_dir(&section_dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "yaml") && !expected.contains(&entry.file_name().to_string_lossy().into_owned()) {
+            fs::remove_file(path).map_err(|error| error.to_string())?;
         }
     }
     Ok(())

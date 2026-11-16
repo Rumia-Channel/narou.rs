@@ -4,12 +4,13 @@
 > 形式そのものは `src/transfer` (プラットフォーム非依存) に実装があり、CLI・Native Web
 > API・Worker・ブラウザ WASM が生成・検証・取り込み計画を共有します。
 
-- 本番の逐次生成: `ArchiveStream<W>` / `AsyncArchiveStream<W>` (1 ファイルを有界チャンクで圧縮)
-- 本番の検証・一時保存: `StagedArchive` / `validate_archive` (全検証が済むまで既存データを変更しない)
-- 取り込み計画: `plan_manifest` (検証済み manifest と既存作品から決定)
-- 明示的な全量 utility: `build_archive` / `parse_archive` / `plan_import` (fixture 等向け。本番の転送経路では使わない)
+- 逐次生成: `ArchiveStream<W>` / `AsyncArchiveStream<W>` (ZIP64、64 KiB 単位の I/O)
+- クライアント検証: `ValidatedArchive` (immutable な範囲読み出し、全エントリ検証後だけ個別展開)
+- Native CLI の一時保存: `StagedArchive` (全検証が済むまで既存データを変更しない)
+- 取り込み計画: `plan_manifest`、選別: `transfer::projection` (`runtime` / `complete`)
+- 全量 utility: `build_archive` / `parse_archive` / `plan_import` (fixture 等向け。本番の Web 転送には使わない)
 
-**現状と将来設計の区別 (2026-11-15)**: Web UI は現在サーバー ZIP / ZIP 全体 POST を使い、独立 WASM API は UI に未接続。本書の現行上限・入口は実装の説明である。[クライアント主体の転送設計](client-transfer-design.md) は、ZIP の schema を維持したまま HTTP・実行場所・容量制限・公開境界を切り替えるための未実装の設計であり、既に制限が解消したという意味ではない。
+**未公開の別ブランチ実装**: Web は `/api/transfer/v2` のセッション・生バイト転送へ切り替え、ZIP の生成・検証・展開をブラウザの Dedicated Worker + WASM が担当する。ZIP 全体 POST・サーバー ZIP・Base64 応答への互換フォールバックは持たない。統合動作検証は未完了。実行場所と公開・再開境界は [クライアント主体の転送設計](client-transfer-design.md) を参照。
 
 ## 1. 全体構造
 
@@ -149,25 +150,23 @@ whole-value utility とのバイト一致は保証しない。同じ形式・検
 
 取り込み時は次のすべてを検査する。1 つでも欠ければ既存データを変更せず中止し、非公開の一時データを回収する。
 
-### 4.1 サイズ・個数の上限
+### 4.1 サイズ・個数と作業領域
 
-| 上限 | 値 | 対象 |
-|---|---|---|
-| `MAX_ARCHIVE_BYTES` | 512 MiB | ZIP ファイル全体 |
-| `MAX_TOTAL_UNCOMPRESSED_BYTES` | 512 MiB | 全エントリの展開後合計 (manifest を含む) |
-| `MAX_FILE_BYTES` | 256 MiB | 1 エントリ |
-| `MAX_MANIFEST_BYTES` | 64 MiB | `manifest.json` |
-| `MAX_ENTRIES` | 50,000 | ZIP エントリ数 (manifest を含む) |
-| `MAX_NOVELS` | 10,000 | 1 アーカイブ中の作品数 |
+| 対象 | 制約 |
+|---|---|
+| ZIP 全体・展開後合計・1 ファイル | 逐次経路には旧 512 MiB / 256 MiB の固定上限を置かない。ZIP64 と保存先の空き容量に従う |
+| `manifest.json` / wire manifest | 直列化後 64 MiB 以下 |
+| ZIP エントリ / 作品数 | 50,000 / 10,000 以下 |
+| WASM / Worker の保持メタデータ | 24 MiB 以下。capacity・再確保中の旧新領域・管理領域を含めて確保前に判定 |
+| JS↔WASM / codec の I/O | 1 回 64 KiB 以下 |
+| HTTP バイナリ本文 | フレーミング込み 8 MiB 以下、最大 100 レコード |
+| 制御 JSON / ページ | 256 KiB 以下、ページは最大 100 項目 |
 
-展開は `take` で上限付き読み出しなので、zip bomb (展開サイズが ZIP の何倍もあるもの) は
-上限で止まる。
+本文・ZIP 全体を `Vec` / `String` / `Blob` に連結して上限を回避しない。展開時は宣言サイズとの一致・CRC・SHA・パス・索引整合を検査する。小さな ZIP でも展開は逐次で、巨大な割り当てを起こさない。中断時は出力を完了扱いにしない。
 
-Worker / ブラウザ WASM には、形式上限とは別に **24 MiB の転送メタデータ割当予算**がある。
-manifest の保持値・ZIP 索引・重複パス判定の領域について、要素数ではなく capacity、
-割当の管理領域、再確保中の旧新領域を含めて確保前に判定する。
-未知の JSON 項目は構文検証しながら読み飛ばし、`serde_json::Value` に全量展開しない。
-Native の形式上限は従来どおりで、この Wasm 用の割当予算は適用しない。
+未知の JSON 項目は構文検証しながら読み飛ばす。Native の既存グローバル在庫を更新する原子的なメタデータ処理だけは、ローカルで 8 MiB を超えることがある。この例外を Worker の処理・通信・本文へ適用しない。
+
+明示的な全量 utility には別の保護が残る: `UTILITY_ARCHIVE_BUDGET_BYTES` / `UTILITY_TOTAL_BUDGET_BYTES` は 512 MiB、`UTILITY_FILE_BUDGET_BYTES` は 256 MiB。本番の逐次転送の容量制限ではない。
 
 ### 4.2 パスの安全性
 
@@ -224,32 +223,25 @@ Native の形式上限は従来どおりで、この Wasm 用の割当予算は�
   `original_url` / `raw_title` / ログイン状態は **転送されない**。保存フォルダ名は
   ncode とタイトルから取り込み側で再計算する。
 
-## 6. 何を同梱するか (native の `narou export`)
+## 6. 通信前の用途別選別
 
-小説ディレクトリ (`小説データ/<sitename>[/<subdir>]/<file_title>/`) の
-**通常ファイル全部**が対象。
+Web の既定は `runtime`。書き出しはサーバー側のファイル列挙後、**snapshot 作成・本文読み出し・通信の前**に選別する。取り込みは端末内で ZIP 全体を検証し、**セッション作成・アップロードの前**に選別する。サーバーもパスから再分類し、クライアント申告の role を信用しない。
 
-この節は現行CLI/サーバーZIP版の同梱契約。未実装のWeb再設計では、[runtime/completeとrole別選別](client-transfer-design.md#41-通常移行と完全保全を分ける)を区別する。通常移行は本文・目次・設定・挿絵・必要索引を保持し、raw/任意履歴/確認済み生成物は転送前に選別する。SQLite/D1の物理rowやFS mirrorの有無だけで必要性を判断せず、元ZIP・source libraryを削除しない。現行コードが既に選別しているという意味ではない。
+| 対象 | `runtime` | `complete` | 理由・例外 |
+|---|---|---|---|
+| 現行本文 `本文/*.yaml` / `toc.yaml` | 含む | 含む | SQLite / D1 でも必要な論理データ |
+| 作品メタデータ / 親の構成 | 含む | 含む | manifest 内で運ぶ。ローカル ID は再採番 |
+| `setting.ini` / `replace.txt` / `converter.yaml` / 明示的な表紙 | 含む | 含む | 利用者設定 |
+| `挿絵/*` / `.illustration_cache.yaml` | 含む | 含む | 索引は名前に cache があっても必須 |
+| `raw/*` | 既定で除外 | 対応先だけ含む | Native は任意追加可。Worker は新規保存しない |
+| `本文/cache/*` / `cache/*` | 既定で除外 | 含む | 任意の過去本文・差分履歴 |
+| アプリ生成物と証明できた出力 | 除外 | 含む | EPUB / `novel.txt` など |
+| 未知・利用者追加のファイル | 含む | 含む | 拡張子が EPUB でも生成物と証明できなければ残す |
+| DB 本体・WAL/SHM・資格情報・在庫・一時/ロック | 除外 | 除外 | Web の内部 role。ライブラリ全体のバックアップではない |
 
-| 対象 | 同梱 | 備考 |
-|---|---|---|
-| `toc.yaml` | ✅ | **通常作品は必須**。バーチャル小説は構成情報を持ち、親自身の目次は不要 (§2.5) |
-| `本文/*.yaml` | ✅ | |
-| `setting.ini` / `replace.txt` / `converter.yaml` | ✅ | |
-| `挿絵/*` | ✅ | S3 バックエンドのときは一時実体化して収集する |
-| `.illustration_cache.yaml` | ✅ | 取得済み挿絵の索引 (§7) |
-| `raw/*.html` | ✅ | 生 HTML (挿絵の索引を張り直す材料) |
-| `cache/*` | ✅ | 差分退避 |
-| `backup/` | ❌ | `narou backup` が除外するディレクトリと同じ |
-| `*.lock` / `*.tmp` | ❌ | 実行時の一時ファイル |
-| symlink / リパースポイント | ❌ | 小説ディレクトリの外へ出ないため辿らない |
+`complete` でも宛先の非対応データは送らない。選別は元ライブラリや元 ZIP を削除しない。SQLite の物理 row、D1 の row、FS mirror があるかどうかだけで本文 YAML・設定・索引を不要と判断しない。
 
-- Native の書き出しは、保存先から専用の一時ディレクトリへ必要な通常ファイルを
-  取得して収集する。SQLite のミラー無効時も raw・履歴・生成物・利用者ファイルを
-  含め、S3 の挿絵も取得する。既存の実ファイルがある場合は利用者の編集を保持する。
-  後片付けは専用ディレクトリだけを削除し、変換先の生成物を消さない。
-- `sqlite.mirror-files=false` のライブラリへの **取り込み** は fail closed
-  (ミラーが narou.rb 向けの写しなので)。
+Native CLI の `narou export` はローカルで完全保全用 ZIP を作る従来の入口で、作品内の通常ファイルを対象にする (`backup/`、ロック・一時ファイル、symlink / reparse point は除外)。専用の一時ディレクトリに保存先の論理ファイルを集め、S3 の挿絵も収集する。CLI の ZIP 取り込みは `sqlite.mirror-files=false` へは fail closed。Web v2 の論理参照による公開とは別の制約である。
 
 ## 7. 挿絵 (`挿絵/`) と索引
 
@@ -271,47 +263,44 @@ Native の形式上限は従来どおりで、この Wasm 用の割当予算は�
 
 | 入口 | 用途 |
 |---|---|
-| `narou export <target>... [-o file.zip]` | 現在のライブラリから ZIP を作る (既定名 `narou-export-<timestamp>.zip`) |
-| `narou import <file.zip> [--overwrite\|--skip]` | ZIP を取り込む (既定は Skip) |
-| `GET /api/transfer/export?ids=1,2` | Native Web API の書き出し (`application/zip`) |
-| `POST /api/transfer/import[?overwrite=true]` | Native Web API の取り込み (本文の body limit 512 MiB) |
-| Worker の `/api/transfer/*` | 同じ形式 (D1 + S3 バックエンド) |
-| `transfer_wasm` | 下記の `build_zip` / `parse_zip` / `plan_zip`。ZIP / manifest / 既存ライブラリ全体の JS 配列・文字列を要求しない |
+| `narou export <target>... [-o file.zip]` | ローカルで ZIP を作る (既定名 `narou-export-<timestamp>.zip`) |
+| `narou import <file.zip> [--overwrite\|--skip]` | ローカル ZIP を取り込む (既定 Skip) |
+| `GET /api/transfer/v2/capabilities` | 宛先・role・codec・上限の照会 |
+| `POST /api/transfer/v2/imports` / `exports` | クライアント UUID と秘密値に束縛したセッション作成 |
+| `.../imports/{id}/manifest/chunks/{n}` / `chunks` | 検証・選別後の manifest / ファイルをバイナリレコードで PUT |
+| `.../exports/{id}/manifest/chunks/{n}` / `batches/{n}` | 固定 snapshot のメタデータ / 生データを GET |
+| `.../{direction}/{id}/catalog` / `files` / `plan` | 有界ページで確認・計画・再開位置を取得 |
+| `.../{direction}/{id}/advance` | bounded な準備・公開・回復を進める |
 
-### 8.1 独立 WASM API
+Web の旧 `/api/transfer/export` / `import` と `progress=1` は使わない。HTTP は ZIP ではなく生バイトと小さな制御 JSON を運ぶ。制御変更は operation ID + `If-Match`、ファイルは offset・サイズ・SHA と受領記録で重複を検出する。公開は作品単位で、完了済み作品は後続の中断で巻き戻さない。
 
-すべて `Promise<void>` を返す。読み書きの各コールバックを `await` し、
-出力先が待っている間は入力を先読みしない。チャンク上限は 64 KiB。
-入力は処理中に変化しないファイル・オブジェクトを使う。
+### 8.1 Dedicated Worker の WASM API
 
-- `build_zip(read_manifest, manifest_size, read_chunk, write_chunk)`:
-  `read_manifest(offset, length)` は manifest JSON の指定範囲を、
-  `read_chunk(novel_index, path, offset, length)` は各ファイルの指定範囲を
-  `Uint8Array` で返す。`write_chunk(bytes)` に ZIP を順次渡す。
-- `parse_zip(read_range, size, write_chunk)`:
-  `read_range(offset, length)` から ZIP を検証し、**全エントリの検証成功後だけ**
-  `write_chunk(bytes)` へ UTF-8 の manifest JSON を順次渡す。
-  作品一覧を二重に含むラッパー JSON や、完成済み JSON 文字列は返さない。
-- `plan_zip(read_range, size, has_novel, overwrite, write_chunk)`:
-  同じ完全検証後、`has_novel(index, toc_url)` に URL の存在を問い合わせる
-  (`Promise<boolean>`)。通常作品 → バーチャル親の順に、元の manifest の `index` を保った
-  UTF-8 JSONL を順次渡す。形式は `{"index":0,"action":"Skip"}`、`action` は `Create` / `Skip` / `Overwrite`。
-  既存作品全件の JSON は受け取らない。
+- `codec_info()`: 実際に実行する protocol / ABI / build ID。
+- `open_archive(read_range, size, limits)`: immutable な端末ファイルを範囲読み出し。サイズは十進文字列。
+- `validate_archive(handle, progress)`: 全エントリを検証。成功前に manifest や本文をアップロードしない。
+- `catalog_page(handle, cursor)`: role・件数等の表示用ページ。全 manifest の複製は返さない。
+- `write_transfer_manifest(handle, selection, write_chunk)`: 選別済み NDJSON を逐次出力し、ファイル ID 対応を保持。
+- `stream_entry(handle, entry_id, confirmed_offset, expected_prefix_sha256, write_chunk)`: 確認済み prefix を再検証してから残りを展開。
+- `close_archive(handle)`: handle と作業領域を解放。
+- `build_zip(read_manifest, manifest_size, read_chunk, write_chunk)`: 固定 snapshot を ZIP64 へ逐次圧縮。サイズ・SHA が変われば失敗。
 
-チャンク境界は JSON の文字・行境界とは限らない。呼び出し側も `Blob` や文字列へ
-全量連結せず、ファイルや増分パーサーへ流す。取り込みのメタデータには前述の
-24 MiB の割り当て予算を適用し、文字列の JSON エスケープ展開も逐次出力する。
+入出力コールバックは各回を `await` し、64 KiB を超えない。文字・JSON 行境界とは限らないため増分処理する。WASM の memory view を JS へ保持させず、所有する bounded chunk を渡す。
 
-実 WASM の回帰テスト（対応する `wasm-bindgen` CLI が必要）:
+配布物の生成・検証:
+
+```sh
+node scripts/build-transfer-wasm.mjs
+node scripts/build-transfer-wasm.mjs --verify --assert-lean
+```
+
+実 WASM の回帰 (`wasm-bindgen` CLI は Cargo.lock と同じ版):
 
 ```sh
 cargo build --manifest-path transfer_wasm/Cargo.toml --target wasm32-unknown-unknown --release
 wasm-bindgen target/wasm32-unknown-unknown/release/narou_transfer_wasm.wasm --target nodejs --out-dir target/transfer-wasm-smoke
 node transfer_wasm/tests/streaming.mjs target/transfer-wasm-smoke/narou_transfer_wasm.js
 ```
-
-入力の停止、SHA/サイズ、競合方針、後半の破損時に出力しないこと、および
-6 MiB の文字列が約 36 MiB の JSON へ展開されても全量コピーしないことを検証する。
 
 ## 9. バージョン
 

@@ -9,7 +9,7 @@
 //! dropped (the repository's own initialization then decides), and every
 //! attribute name is removed from the ordinary tag list.
 
-use crate::application::attribute_tags::{is_attribute_tag, MANGA_TAG, NOVEL_TAG};
+use crate::attribute_tag::{is_attribute_tag, MANGA_TAG, NOVEL_TAG};
 use crate::transfer::{ArchiveNovel, Result, TransferError};
 
 /// Normalises one manifest entry: validates the explicit classification and

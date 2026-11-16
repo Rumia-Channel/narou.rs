@@ -1,6 +1,6 @@
 [package]
 name = "narou_transfer_wasm"
-version = "0.6.0"
+version = "0.6.6"
 edition = "2024"
 license = "BSD-2-Clause"
 publish = false
@@ -10,7 +10,8 @@ description = "Browser WASM wrapper around narou.rs transfer archives"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-narou_rs = { path = "..", default-features = false, features = ["worker-runtime"] }
+serde_json = "1"
+narou_rs = { path = "..", default-features = false, features = ["transfer-runtime"] }
 wasm-bindgen = "0.2"
 futures = "0.3.34"
 js-sys = "0.3.107"

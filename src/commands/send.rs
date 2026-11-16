@@ -9,8 +9,7 @@ use narou_rs::converter::device::{Device, OutputManager};
 use narou_rs::db;
 use narou_rs::db::NovelRecord;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
-use narou_rs::db::paths::existing_novel_dir_for_record;
-use narou_rs::mail::{get_ebook_file_paths, newest_hotentry_file_path};
+use narou_rs::mail::{EbookFileSet, get_ebook_file_paths, newest_hotentry_file_path};
 
 use super::download;
 
@@ -157,7 +156,7 @@ fn cmd_send_inner(opts: SendOptions, sink: &dyn MessageSink) -> Result<(), Strin
                 None => continue,
             };
 
-        let Some(first_path) = ebook_paths.first() else {
+        let Some(first_path) = ebook_paths.paths().first() else {
             sink.emit(Stream::Stderr, &messages::target_missing(target));
             continue;
         };
@@ -181,8 +180,8 @@ fn cmd_send_inner(opts: SendOptions, sink: &dyn MessageSink) -> Result<(), Strin
         }
 
         sink.emit(Stream::Stdout, &highlight_target(&display_target));
-        for ebook_path in ebook_paths {
-            let copied_to = copy_with_progress(device, &ebook_path, sink)?;
+        for ebook_path in ebook_paths.paths() {
+            let copied_to = copy_with_progress(device, ebook_path, sink)?;
             match copied_to {
                 Some(path) => sink.emit(Stream::Stdout, &messages::copied_to(path.display())),
                 None => {
@@ -236,7 +235,7 @@ fn collect_all_targets(
     for id in ids {
         let key = id.to_string();
         targets.push(key.clone());
-        if let Ok(Some(record)) = novels.get_sync(id.into()) {
+        if let Some(record) = novels.get_current_sync(id.into()).map_err(|error| error.to_string())? {
             titles.insert(key, record.title);
         }
     }
@@ -262,15 +261,29 @@ fn is_target_frozen(target: &str, frozen_ids: &HashSet<i64>) -> bool {
         .unwrap_or(false)
 }
 
+enum SendFiles {
+    Novel(EbookFileSet),
+    Hotentry(PathBuf),
+}
+
+impl SendFiles {
+    fn paths(&self) -> &[PathBuf] {
+        match self {
+            Self::Novel(files) => files.paths(),
+            Self::Hotentry(path) => std::slice::from_ref(path),
+        }
+    }
+}
+
 fn resolve_send_target(
     target: &str,
     device: SendDevice,
     titles: &HashMap<String, String>,
     sink: &dyn MessageSink,
-) -> Result<Option<(String, Vec<PathBuf>)>, String> {
+) -> Result<Option<(String, SendFiles)>, String> {
     if target == "hotentry" {
         let path = newest_hotentry_file_path(device.ebook_file_ext())?;
-        return Ok(path.map(|value| ("hotentry".to_string(), vec![value])));
+        return Ok(path.map(|value| ("hotentry".to_string(), SendFiles::Hotentry(value))));
     }
 
     let Some(data) = download::get_data_by_target(target) else {
@@ -278,20 +291,19 @@ fn resolve_send_target(
         return Ok(None);
     };
     let record = load_record(data.id)?;
-    let novel_dir =
-        db::with_database(|db| Ok(existing_novel_dir_for_record(db.archive_root(), &record)))
-            .map_err(|e| e.to_string())?;
-    let ebook_paths = get_ebook_file_paths(&record, &novel_dir, device.ebook_file_ext())?;
+    let write = narou_rs::native::materialization::capture_write_for_record(&record)
+        .map_err(|error| error.to_string())?;
+    let ebook_paths = get_ebook_file_paths(&record, &write, device.ebook_file_ext())?;
     let title = titles
         .get(target)
         .cloned()
         .unwrap_or_else(|| data.title.clone());
-    Ok(Some((format!("ID:{}　{}", target, title), ebook_paths)))
+    Ok(Some((format!("ID:{}　{}", target, title), SendFiles::Novel(ebook_paths))))
 }
 
 fn load_record(id: i64) -> Result<NovelRecord, String> {
     narou_rs::native::novel_repository::NativeNovelRepository::new()
-        .get_sync(id.into())
+        .get_current_sync(id.into())
         .map_err(|e| e.to_string())?
         .ok_or_else(|| messages::target_missing(id))
 }

@@ -116,7 +116,9 @@ fn an_unbounded_external_list_starts_at_the_requested_offset() {
         offset: 1,
         ..ExternalListRequest::default()
     };
-    let list = runtime.block_on(api.list(&request, None)).unwrap();
+    let mut scope = api.read_scope("unbounded-external-page");
+    let list = runtime.block_on(api.list(&mut scope, &request, None)).unwrap();
+    runtime.block_on(scope.release_all()).unwrap();
 
     assert_eq!(list.records_total, 3);
     assert_eq!(list.records_filtered, 3);
@@ -129,7 +131,9 @@ fn an_unbounded_external_list_starts_at_the_requested_offset() {
         offset: 99,
         ..ExternalListRequest::default()
     };
-    let list = runtime.block_on(api.list(&request, None)).unwrap();
+    let mut scope = api.read_scope("empty-external-page");
+    let list = runtime.block_on(api.list(&mut scope, &request, None)).unwrap();
+    runtime.block_on(scope.release_all()).unwrap();
     assert_eq!(list.records_filtered, 3);
     assert!(list.novels.is_empty());
 }

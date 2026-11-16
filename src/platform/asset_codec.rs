@@ -38,6 +38,24 @@ pub fn decode_stream(raw: AssetStream, encoding: ObjectEncoding, size: u64, crc3
     }))
 }
 
+/// Slice one already-open bounded decoder stream, preserving backpressure.
+pub fn slice_stream(stream: AssetStream, range: std::ops::Range<u64>) -> AssetStream {
+    Box::pin(futures::stream::try_unfold((stream,0u64),move |(mut stream,mut position)| {
+        let range=range.clone();
+        async move {
+            loop {
+                if position >= range.end { return Ok(None); }
+                let bytes=stream.next().await.ok_or_else(|| NarouError::Platform("asset range truncated".into()))??;
+                let next=position.checked_add(bytes.len() as u64).ok_or_else(|| NarouError::Platform("asset size overflow".into()))?;
+                let lo=range.start.saturating_sub(position).min(bytes.len() as u64) as usize;
+                let hi=range.end.saturating_sub(position).min(bytes.len() as u64) as usize;
+                position=next;
+                if lo<hi { return Ok(Some((bytes[lo..hi].to_vec(),(stream,position)))); }
+            }
+        }
+    }))
+}
+
 /// Legacy compressed rows require decoding up to the requested offset, but
 /// never retaining the prefix or allocating beyond a single read window.
 pub async fn range_from_stream(mut stream: AssetStream, range: std::ops::Range<u64>) -> Result<Vec<u8>> {

@@ -4,7 +4,6 @@
 //! retain the historical CLI constructors while keeping native adapters out of
 //! the core implementation.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::downloader::{Downloader, DownloaderPlatform};
@@ -31,10 +30,7 @@ impl Downloader {
         novels: Arc<dyn NovelRepository>,
     ) -> crate::error::Result<Self> {
         // 挿絵の保存先 (ローカル / S3) を含めて解決する。
-        let stores =
-            crate::native::object_store::NativeStores::for_current_root().or_else(|_| {
-                crate::native::object_store::NativeStores::for_narou_root(&PathBuf::from("."))
-            })?;
+        let stores = crate::native::object_store::NativeStores::for_current_root()?;
         let objects = stores.objects;
         let assets = stores.assets;
         let cookies = cookie_store();

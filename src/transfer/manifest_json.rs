@@ -13,7 +13,7 @@ pub async fn read_manifest<R: AsyncRead + Unpin>(reader: R) -> Result<ArchiveMan
     read_with_budget(reader, default_limit()).await
 }
 
-async fn read_with_budget<R: AsyncRead + Unpin>(reader: R, limit: usize) -> Result<ArchiveManifest> {
+pub(super) async fn read_with_budget<R: AsyncRead + Unpin>(reader: R, limit: usize) -> Result<ArchiveManifest> {
     let mut json = Json {
         reader, bytes: vec![0; 64 * 1024], position: 0, length: 0, read: 0,
         memory: MetadataBudget { used: 0, limit },

@@ -34,7 +34,7 @@ use crate::platform::{
 };
 
 use crate::native::object_store::{
-    NativeObjectStore, content_type_for_path, logical_key_for_native_path, run_blocking, run_scoped_blocking,
+    FsGate, NativeObjectStore, content_type_for_path, logical_key_for_native_path, run_blocking, run_scoped_blocking,
 };
 
 #[path = "asset_stream.rs"]
@@ -60,6 +60,9 @@ pub struct SqliteObjectStore {
 }
 
 impl SqliteObjectStore {
+    pub fn path_for_canonical_key(&self,key:&ObjectKey)->Result<PathBuf>{self.mirror.resolve_path(key)}
+    pub(crate) fn with_gate_lock<T>(&self,prefix:&ObjectPrefix,operation:impl FnOnce()->Result<T>)->Result<T>{self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),operation)}
+    pub(crate) fn namespace_state_locked(&self,prefix:&ObjectPrefix)->Result<(GateInfo,String)>{let connection=self.conn.lock();let info=Self::gate_info_conn(&connection,prefix)?;let origin=connection.query_row("SELECT origin_url_fold FROM novel_access_gates WHERE prefix=?",[prefix.as_ref().trim_end_matches('/')],|row|row.get(0)).map_err(super::sqlite_error)?;Ok((info,origin))}
     pub fn new(conn: Arc<Mutex<Connection>>, mirror: NativeObjectStore) -> Self {
         Self::with_mirror_files(conn, mirror, crate::native::sqlite::state::mirror_files_enabled())
     }
@@ -96,6 +99,27 @@ impl SqliteObjectStore {
         self.prefer_existing_files = true;
         self
     }
+    fn has_promoted_reference(conn:&Connection,key:&ObjectKey)->Result<bool>{conn.query_row("SELECT EXISTS(SELECT 1 FROM transfer_object_refs WHERE object_key=?)",[key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)}
+    fn prefer_mirror(&self,key:&ObjectKey)->Result<bool>{Ok(self.prefer_existing_files&&!Self::has_promoted_reference(&self.conn.lock(),key)?)}
+    pub fn open_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>>{Box::pin(async move{
+        if !prefix.matches(key){return Err(NarouError::Platform("reader key outside novel".into()));}
+        run_scoped_blocking(||self.with_reader_transaction(prefix,lease,|conn|self.open_asset_in_connection(conn,key,range)))
+    })}
+
+    /// Lease-validated open that never resolves a canonical reference: the ref
+    /// check, reader admission and payload pin share one lock boundary.
+    pub fn open_local_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>>{Box::pin(async move{
+        if !prefix.matches(key){return Err(NarouError::Platform("reader key outside novel".into()));}
+        run_scoped_blocking(||self.with_reader_transaction(prefix,lease,|conn|self.open_local_asset_in_connection(conn,key,range)))
+    })}
+    /// Local-only open under the same OS transfer lock used by reference
+    /// publication: `Ok(None)` for missing keys AND canonical references.
+    pub fn local_asset_stream<'a>(&'a self,prefix:&'a ObjectPrefix,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<AssetStream>>>{Box::pin(async move{
+        let this=self.clone();let key=key.clone();run_scoped_blocking(move||this.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{let conn=this.conn.lock();Ok(this.open_local_asset_in_connection(&conn,&key,range)?.map(|(_,stream)|stream))}))
+    })}
+    /// Whether `key` is backed by a canonical reference. Cheap existence probe;
+    /// an existence answer is correct even without the caller's lock.
+    pub fn has_remote_reference(&self,key:&ObjectKey)->Result<bool>{Self::has_promoted_reference(&self.conn.lock(),key)}
 
     fn now_rfc3339() -> String {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
@@ -130,11 +154,12 @@ impl SqliteObjectStore {
 
     fn stat_blocking(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>> {
         let conn = self.conn.lock();
+        let physical=resolve_payload_key(&conn,key)?;
         let mut statement = conn
             .prepare("SELECT size, content_type, updated_at FROM objects WHERE object_key = ?")
             .map_err(super::sqlite_error)?;
         let mut rows = statement
-            .query(rusqlite::params![key.as_ref()])
+            .query(rusqlite::params![physical.as_ref()])
             .map_err(super::sqlite_error)?;
         match rows.next().map_err(super::sqlite_error)? {
             Some(row) => {
@@ -145,7 +170,7 @@ impl SqliteObjectStore {
                     key: key.clone(),
                     size: size as u64,
                     etag: None,
-                    content_type,
+                    content_type:content_type.or_else(||content_type_for_path(Path::new(key.as_ref())).map(str::to_owned)),
                     last_modified: chrono::DateTime::parse_from_rfc3339(&updated_at)
                         .ok()
                         .map(|value| value.with_timezone(&chrono::Utc)),
@@ -280,6 +305,7 @@ impl SqliteObjectStore {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(super::sqlite_error)?;
         if base.is_empty() {
+            tx.execute("DELETE FROM transfer_object_refs",[]).map_err(super::sqlite_error)?;
             tx.execute("DELETE FROM object_chunks", [])
                 .map_err(super::sqlite_error)?;
             tx.execute("DELETE FROM objects", [])
@@ -290,7 +316,7 @@ impl SqliteObjectStore {
             // range so the delete never scans the table.
             let lower = format!("{base}/");
             let upper = prefix_upper_bound(&lower);
-            for table in ["object_chunks", "objects"] {
+            for table in ["transfer_object_refs", "object_chunks", "objects"] {
                 tx.execute(
                     &format!(
                         "DELETE FROM {table} WHERE object_key = ?1 OR (object_key >= ?2 AND object_key < ?3)"
@@ -304,13 +330,11 @@ impl SqliteObjectStore {
     }
 
     fn delete_blocking(&self, key: &ObjectKey) -> Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM objects WHERE object_key = ?",
-            rusqlite::params![key.as_ref()],
-        )
-        .map_err(super::sqlite_error)?;
-        Ok(())
+        let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
+        let pinned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM transfer_object_refs WHERE blob_key=?)",[key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;
+        if pinned{return Err(NarouError::Platform("cannot delete referenced physical object".into()));}
+        tx.execute("DELETE FROM transfer_object_refs WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;
+        tx.execute("DELETE FROM objects WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;tx.commit().map_err(super::sqlite_error)
     }
 
     /// Remove the filesystem copy of `key`; `Ok(())` when it is already gone.
@@ -340,86 +364,7 @@ impl SqliteObjectStore {
         Ok(())
     }
 
-    fn copy_blocking(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
-        if source == destination { return Ok(()); }
-        self.renew_stage_progress(source)?;
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction().map_err(super::sqlite_error)?;
-        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM objects WHERE object_key=?)",
-            [source.as_ref()], |row| row.get(0)).map_err(super::sqlite_error)?;
-        if !exists { return Err(NarouError::NotFound(source.to_string())); }
-        tx.execute("DELETE FROM object_chunks WHERE object_key=?", [destination.as_ref()]).map_err(super::sqlite_error)?;
-        tx.execute("INSERT INTO objects(object_key,size,updated_at,content_type,encoding,crc32,data)
-            SELECT ?,size,?, ?,encoding,crc32,data FROM objects WHERE object_key=?
-            ON CONFLICT(object_key) DO UPDATE SET size=excluded.size,updated_at=excluded.updated_at,
-            content_type=excluded.content_type,encoding=excluded.encoding,crc32=excluded.crc32,data=excluded.data",
-            rusqlite::params![destination.as_ref(), Self::now_rfc3339(),
-                content_type_for_path(Path::new(destination.as_ref())), source.as_ref()]).map_err(super::sqlite_error)?;
-        tx.execute("INSERT INTO object_chunks(object_key,seq,data) SELECT ?,seq,data FROM object_chunks WHERE object_key=?",
-            rusqlite::params![destination.as_ref(), source.as_ref()]).map_err(super::sqlite_error)?;
-        tx.commit().map_err(super::sqlite_error)
-    }
 
-    /// 保存済みオブジェクトを小説ディレクトリへ実ファイルとして取り出す (同期)。
-    ///
-    /// 変換がファイルパスを要求するときに使う。既にあるファイルは触らない。
-    /// ミラー無効時だけスコープに登録し、使い終わったら消す。ミラー有効時は
-    /// 削除されたミラーの復元として残す。
-    /// 目次・本文・変換設定だけを対象にし、生成物や履歴は取り出さない。
-    pub(crate) fn materialize_into(
-        &self,
-        novel_dir: &Path,
-        prefix: &ObjectKey,
-        scope: &crate::native::materialization::MaterializationScope,
-    ) -> Result<Vec<PathBuf>> {
-        let mut request = ObjectListRequest::new(
-            ObjectPrefix::new(prefix.as_ref())?,
-            std::num::NonZeroUsize::new(4096).expect("nonzero"),
-        );
-        let mut written = Vec::new();
-        loop {
-            let page = self.list_blocking(&request)?;
-            for metadata in &page.objects {
-                let key = metadata.key.as_ref();
-                let Some(relative) = key.strip_prefix(prefix.as_ref()).and_then(|rest| rest.strip_prefix('/')) else {
-                    continue;
-                };
-                let input = matches!(relative, "toc.yaml" | "setting.ini" | "replace.txt" | "converter.yaml" | ".illustration_cache.yaml" | "cover.jpg" | "cover.png" | "cover.jpeg")
-                    || relative.strip_prefix("本文/").is_some_and(|name| !name.contains('/') && name.ends_with(".yaml"));
-                if !input {
-                    continue;
-                }
-                let path = novel_dir.join(relative);
-                if path.is_file() {
-                    continue;
-                }
-                let Some(data) = self.read_blocking(&metadata.key, None)? else {
-                    continue;
-                };
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let parent = path.parent().ok_or_else(|| NarouError::Platform("materialized file has no parent".to_string()))?;
-                let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-                std::io::Write::write_all(&mut temporary, &data)?;
-                match temporary.persist_noclobber(&path) {
-                    Ok(_) => {
-                        if !self.mirror_files {
-                            scope.register(&path);
-                        }
-                        written.push(path);
-                    }
-                    Err(error) if path.is_file() => drop(error),
-                    Err(error) => return Err(error.error.into()),
-                }
-            }
-            match page.next_cursor {
-                Some(cursor) => request = request.after(cursor),
-                None => break,
-            }
-        }
-        Ok(written)
-    }
 
     pub(crate) fn list_direct_files(&self, prefix: &ObjectKey) -> Result<Vec<ObjectKey>> {
         let start = format!("{prefix}/");
@@ -428,7 +373,7 @@ impl SqliteObjectStore {
         {
             let conn = self.conn.lock();
             let mut statement = conn.prepare(
-                "SELECT object_key FROM objects
+                "SELECT object_key FROM native_logical_objects
                  WHERE object_key >= ?1 AND object_key < ?2
                    AND instr(substr(object_key, length(?1) + 1), '/') = 0
                  ORDER BY object_key",
@@ -451,12 +396,12 @@ impl SqliteObjectStore {
         // limit + 1 database keys with filesystem fallbacks preserves DB wins.
         let base = request.prefix.as_ref().trim_end_matches('/');
         let lower = if base.is_empty() { String::new() } else { format!("{base}/") };
-        let upper = prefix_upper_bound(&lower);
-        let cap = request.limit.get().saturating_add(1).min(i64::MAX as usize) as i64;
+        let upper=if base.is_empty(){prefix_upper_bound(&lower)}else{format!("{base}0")};
+        let limit=request.limit.get().min(100);let cap=(limit+1) as i64;
         {
             let conn = self.conn.lock();
             let mut statement = conn
-                .prepare(crate::db::object_query::LIST_PAGE_SQL)
+                .prepare(NATIVE_LIST_PAGE_SQL)
                 .map_err(super::sqlite_error)?;
             let mut rows = statement
                 .query(rusqlite::params![base, lower, upper, request.cursor.as_deref().unwrap_or(""), cap])
@@ -490,29 +435,13 @@ impl SqliteObjectStore {
         // mirror modes: that is the same fallback `stat`/`read_small`/
         // `read_stream` use, so a listed key and a readable key always agree.
         // Rows win, so a stale file never overrides stored content.
-        let prefix_dir = self.mirror.resolve_prefix_dir(request.prefix.as_ref())?;
-        if prefix_dir.is_dir() {
-            let mut paths = Vec::new();
-            NativeObjectStore::recursive_files(self.mirror.root(), &prefix_dir, &mut paths)?;
-            for path in paths {
-                let Some(key) = logical_key_for_native_path(self.mirror.root(), &path) else {
-                    continue;
-                };
-                if !request.prefix.matches(&key)
-                    || request.cursor.as_deref().is_some_and(|cursor| key.as_ref() <= cursor)
-                    || merged.contains_key(key.as_ref()) {
-                    continue;
-                }
-                if let Some(metadata) = self.mirror.metadata_for_path(&key, &path)? {
-                    merged.insert(key.as_ref().to_string(), metadata);
-                }
-            }
-        }
+        let files=self.mirror.list_window_blocking(request,limit+1)?;
+        for metadata in files.objects{merged.entry(metadata.key.to_string()).or_insert(metadata);}
         let objects: Vec<ObjectMetadata> = merged.into_values().collect();
         let (page, next_cursor) = crate::platform::paginate_object_listing(
             objects,
             request.cursor.as_deref(),
-            request.limit.get(),
+            limit,
             |item| item.key.as_ref(),
         );
         Ok(ObjectListPage {
@@ -529,11 +458,21 @@ struct StoredPayload {
     size: u64,
 }
 
+fn resolve_payload_key(conn:&Connection,key:&ObjectKey)->Result<ObjectKey>{
+    let alias=crate::native::object_store::legacy_flat_key(key)?;
+    let logical=if let Some(alias)=alias{let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM native_logical_objects WHERE object_key=?)",[key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;if exists{key.clone()}else{alias}}else{key.clone()};let key=&logical;
+    let reference:Option<(String,String)>=conn.query_row("SELECT blob_key,blob_generation FROM transfer_object_refs WHERE object_key=? AND backend='d1'",[key.as_ref()],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(super::sqlite_error)?;
+    let Some((physical,generation))=reference else{return Ok(key.clone());};
+    let current:Option<String>=conn.query_row("SELECT generation FROM objects WHERE object_key=?",[&physical],|row|row.get(0)).optional().map_err(super::sqlite_error)?;
+    if current.as_deref()!=Some(generation.as_str()){return Err(NarouError::Platform("canonical transfer object generation changed".into()));}ObjectKey::try_new(physical)
+}
+
 fn read_stored_payload(
     conn: &Connection,
     key: &ObjectKey,
     limit: Option<u64>,
 ) -> Result<Option<StoredPayload>> {
+    let resolved=resolve_payload_key(conn,key)?;let key=&resolved;
     let mut statement = conn.prepare(
         "SELECT data, size, encoding, crc32 FROM objects WHERE object_key = ?",
     ).map_err(super::sqlite_error)?;
@@ -684,6 +623,38 @@ fn insert_stored_object(tx: &Connection, object: StoredObject<'_>) -> Result<()>
 }
 
 impl ObjectStore for SqliteObjectStore {
+    fn delete_closed<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{Box::pin(async move{af::parse_removal_owner(owner)?;if !prefix.matches(key){return Err(NarouError::Platform("closed deletion outside novel".into()));}run_scoped_blocking(||self.with_publication_transaction(prefix,owner,epoch,|conn|{
+        self.remove_file_copy(key)?;conn.execute("DELETE FROM transfer_object_refs WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;conn.execute("DELETE FROM object_chunks WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;conn.execute("DELETE FROM objects WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;Ok(())
+    }))})}
+    fn update_small_guarded<'a,'data:'a>(&'a self,fence:&'a WriteFence,key:&'a ObjectKey,mutate:&'a mut SmallObjectMutator<'data>)->PlatformFuture<'a,Result<ObjectUpdateResult>>{Box::pin(async move{run_scoped_blocking(||self.mirror.with_transfer_lock(fence.prefix.as_ref().trim_end_matches('/'),||{
+        if !fence.prefix.matches(key){return Err(NarouError::Platform("atomic update outside fence".into()));}
+        let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;require_transfer_epoch(&tx,&fence.prefix,None,fence.epoch,false)?;let limit=crate::native::object_store::MAX_SMALL_OBJECT_BYTES;
+        let current=match read_stored_payload(&tx,key,Some(limit))?{Some(payload)=>Some(decode_stored_payload(payload,key,Some(limit))?),None=>self.mirror.read_small_blocking(key)?};
+        let Some(next)=mutate(current.as_deref())?else{tx.commit().map_err(super::sqlite_error)?;return Ok(ObjectUpdateResult::Committed);};if next.len() as u64>limit{return Err(NarouError::Platform("atomic small write exceeds cap".into()));}
+        let(stored,encoding)=crate::platform::encode_object_payload(&next);insert_stored_object(&tx,StoredObject{key,size:next.len() as i64,crc32:crate::platform::object_crc32(&next) as i64,stored:&stored,encoding,content_type:crate::platform::content_type_for_key(key),updated_at:&Self::now_rfc3339()})?;
+        tx.commit().map_err(super::sqlite_error)?;drop(conn);
+        if self.mirror_files&&let Err(error)=self.mirror.write_bytes_blocking(key,&next){return Ok(ObjectUpdateResult::ProjectionFailed(error));}Ok(ObjectUpdateResult::Committed)
+    }))})}
+    fn access_fence(&self)->Option<&dyn NovelAccessFence>{Some(self)}
+    fn read_stream_leased<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<AssetStream>>>{Box::pin(async move{Ok(self.open_leased_asset(prefix,lease,key,range).await?.map(|(_,stream)|stream))})}
+    fn write_small_guarded<'a>(&'a self,fence:&'a WriteFence,key:&'a ObjectKey,data:Vec<u8>)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
+        if !fence.prefix.matches(key)||data.len() as u64>crate::native::object_store::MAX_SMALL_OBJECT_BYTES{return Err(NarouError::Platform("invalid guarded small write".into()));}
+        let(stored,encoding)=crate::platform::encode_object_payload(&data);
+        run_scoped_blocking(||self.mirror.with_transfer_lock(fence.prefix.as_ref().trim_end_matches('/'),||{
+            let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;require_transfer_epoch(&tx,&fence.prefix,None,fence.epoch,false)?;
+            insert_stored_object(&tx,StoredObject{key,size:data.len() as i64,crc32:crate::platform::object_crc32(&data) as i64,stored:&stored,encoding,content_type:crate::platform::content_type_for_key(key),updated_at:&Self::now_rfc3339()})?;
+            if self.mirror_files{self.mirror.write_bytes_blocking(key,&data)?;}tx.commit().map_err(super::sqlite_error)
+        }))
+    })}
+    fn delete_guarded<'a>(&'a self,fence:&'a WriteFence,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
+        if !fence.prefix.matches(key){return Err(NarouError::Platform("delete outside fence".into()));}
+        run_scoped_blocking(||self.mirror.with_transfer_lock(fence.prefix.as_ref().trim_end_matches('/'),||{
+            let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;require_transfer_epoch(&tx,&fence.prefix,None,fence.epoch,false)?;self.remove_file_copy(key)?;
+            tx.execute("DELETE FROM transfer_object_refs WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;
+            tx.execute("DELETE FROM objects WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;tx.commit().map_err(super::sqlite_error)
+        }))
+    })}
+
     fn stat<'a>(
         &'a self,
         key: &'a ObjectKey,
@@ -691,7 +662,7 @@ impl ObjectStore for SqliteObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || {
-            if this.prefer_existing_files {
+            if this.prefer_mirror(&key)? {
                 let path = this.mirror.resolve_read_path(&key)?;
                 if let Some(metadata) = this.mirror.metadata_for_path(&key, &path)? {
                     return Ok(Some(metadata));
@@ -713,7 +684,7 @@ impl ObjectStore for SqliteObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || {
-            if this.prefer_existing_files
+            if this.prefer_mirror(&key)?
                 && let Some(data) = this.mirror.read_small_blocking(&key)?
             {
                 return Ok(Some(data));
@@ -731,20 +702,13 @@ impl ObjectStore for SqliteObjectStore {
         key: &'a ObjectKey,
         data: Vec<u8>,
     ) -> PlatformFuture<'a, Result<()>> {
-        let this = self.clone();
-        let key = key.clone();
-        run_blocking(move || {
-            if data.len() as u64 > crate::native::object_store::MAX_SMALL_OBJECT_BYTES {
-                return Err(NarouError::Platform(format!(
-                    "small object exceeds {} bytes: {key}",
-                    crate::native::object_store::MAX_SMALL_OBJECT_BYTES
-                )));
-            }
-            this.write_blocking(&key, &data)?;
-            if this.mirror_files {
-                this.mirror.write_bytes_blocking(&key, &data)?;
-            }
-            Ok(())
+        Box::pin(async move {
+            if let Some(fence)=run_scoped_blocking(||self.writer_for_key(key))?{return self.write_small_guarded(&fence,key,data).await;}
+            let this=self.clone();let key=key.clone();run_blocking(move||{
+                if data.len() as u64>crate::native::object_store::MAX_SMALL_OBJECT_BYTES{return Err(NarouError::Platform("small object exceeds write cap".into()));}
+                if this.writer_for_key(&key)?.is_some(){return Err(NarouError::Platform("novel_epoch_conflict: admission changed".into()));}
+                this.write_blocking(&key,&data)?;if this.mirror_files{this.mirror.write_bytes_blocking(&key,&data)?;}Ok(())
+            }).await
         })
     }
 
@@ -754,20 +718,17 @@ impl ObjectStore for SqliteObjectStore {
         mutate: &'a mut SmallObjectMutator<'data>,
     ) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
         Box::pin(async move {
+            if let Some(fence)=run_scoped_blocking(||self.writer_for_key(key))?{return self.update_small_guarded(&fence,key,mutate).await;}
             run_scoped_blocking(|| self.update_small_blocking(key, mutate))
         })
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
-        let this = self.clone();
-        let key = key.clone();
-        run_blocking(move || this.delete_both(&key))
+        Box::pin(async move{if let Some(fence)=run_scoped_blocking(||self.writer_for_key(key))?{self.delete_guarded(&fence,key).await}else{let this=self.clone();let key=key.clone();run_blocking(move||this.delete_both(&key)).await}})
     }
 
     fn delete_prefix<'a>(&'a self, prefix: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
-        let this = self.clone();
-        let prefix = prefix.clone();
-        run_blocking(move || this.delete_prefix_blocking(&prefix))
+        Box::pin(async move{let fence=run_scoped_blocking(||self.writer_for_key(prefix))?;run_scoped_blocking(||match &fence{Some(fence)=>self.with_open_write(fence,||self.delete_prefix_blocking(prefix)),None=>self.delete_prefix_blocking(prefix)})})
     }
 
     fn list_page<'a>(
@@ -781,6 +742,27 @@ impl ObjectStore for SqliteObjectStore {
 }
 
 impl AssetStore for SqliteObjectStore {
+    fn read_stream_range<'a>(&'a self,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<AssetStream>>>{Box::pin(self.read_asset_stream_range(key,range))}
+    fn write_stream_guarded<'a>(&'a self,fence:&'a WriteFence,key:&'a ObjectKey,stream:AssetStream)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
+        if !fence.prefix.matches(key){return Err(NarouError::Platform("write outside fence".into()));}
+        let stage=self.stage_stream(stream).await?;
+        run_scoped_blocking(||self.with_open_fence_transaction(fence,|conn|self.install_reference(conn,&stage.key,key)))
+    })}
+    fn write_stream_once<'a>(&'a self,key:&'a ObjectKey,stream:AssetStream,size:u64,sha:&'a str)->PlatformFuture<'a,Result<WriteOnce>>{Box::pin(async move{
+        ts::check_hash_named_key(key,sha)?;let stage=self.stage_stream(stream).await?;let size=if size==u64::MAX{stage.size}else{size};
+        if stage.size!=size||!stage.sha256.eq_ignore_ascii_case(sha){return Err(NarouError::Platform("write-once size/SHA mismatch".into()));}
+        let before=run_scoped_blocking(||self.source_generation(key))?;
+        if before.is_some(){let mut stream=self.read_stream(key).await?.ok_or_else(||NarouError::NotFound(key.to_string()))?;let mut seen=0u64;let mut hash=sha2::Sha256::new();
+            while let Some(chunk)=stream.next().await{let bytes=chunk?;seen=seen.checked_add(bytes.len() as u64).filter(|value|*value<=size).ok_or_else(||NarouError::Platform("write-once existing size differs".into()))?;hash.update(&bytes);}
+            if seen!=size||!hex::encode(hash.finalize()).eq_ignore_ascii_case(sha){return Err(NarouError::Platform("write-once existing bytes differ".into()));}
+        }
+        let outcome=run_scoped_blocking(||self.mirror.with_transfer_lock(&format!("write-once/{key}"),||{
+            if self.source_generation(key)?!=before{return Err(NarouError::Platform("write-once existing generation changed".into()));}
+            if before.is_some(){return Ok(WriteOnce::Reused);}let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;self.install_reference(&tx,&stage.key,key)?;tx.commit().map_err(super::sqlite_error)?;Ok(WriteOnce::Written)
+        }))?;
+        if let Some(id)=stage.key.as_ref().strip_prefix(".narou-transfer/data/"){self.stage_abort(id,id,1).await?;}Ok(outcome)
+    })}
+
     fn stat<'a>(
         &'a self,
         key: &'a ObjectKey,
@@ -803,8 +785,9 @@ impl AssetStore for SqliteObjectStore {
 
     fn stage_stream<'a>(&'a self, stream: AssetStream) -> PlatformFuture<'a, Result<crate::platform::StagedAsset>> {
         Box::pin(async move {
-            self.cleanup_asset_stages().await?;
-            crate::platform::staging::stage(self, stream).await
+            let id=format!("ordinary-{}",uuid::Uuid::new_v4().simple());
+            let sealed=ts::stage_asset_stream(self,&id,&id,1,crate::platform::staging::STAGE_TTL_SECONDS,stream).await?;
+            Ok(crate::platform::StagedAsset{key:sealed.key,size:sealed.size,sha256:sealed.sha256})
         })
     }
 
@@ -813,7 +796,7 @@ impl AssetStore for SqliteObjectStore {
         key: &'a ObjectKey,
         stream: AssetStream,
     ) -> PlatformFuture<'a, Result<()>> {
-        Box::pin(self.write_asset(key, stream))
+        Box::pin(async move{if let Some(sha)=ts::hash_named_digest(key){return self.write_stream_once(key,stream,u64::MAX,&sha).await.map(|_|());}if let Some(fence)=run_scoped_blocking(||self.writer_for_key(key))?{return self.write_stream_guarded(&fence,key,stream).await;}self.write_asset(key,stream).await})
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
@@ -826,16 +809,9 @@ impl AssetStore for SqliteObjectStore {
         destination: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
-            let this = self.clone();
-            let source = source.clone();
-            let destination_key = destination.clone();
-            run_blocking(move || this.copy_blocking(&source, &destination_key)).await?;
-            if self.mirror_files {
-                let stream = self.read_asset(destination).await?
-                    .ok_or_else(|| NarouError::NotFound(destination.to_string()))?;
-                self.mirror.write_stream(destination, stream).await?;
-            }
-            Ok(())
+            if source==destination{return Ok(());}let fence=run_scoped_blocking(||self.writer_for_key(destination))?;
+            let stream=self.read_stream(source).await?.ok_or_else(||NarouError::NotFound(source.to_string()))?;
+            match fence{Some(fence)=>self.write_stream_guarded(&fence,destination,stream).await,None=>self.write_stream(destination,stream).await}
         })
     }
 
@@ -844,29 +820,24 @@ impl AssetStore for SqliteObjectStore {
         source: &'a ObjectKey,
         destination: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<()>> {
-        let this = self.clone();
-        let source = source.clone();
-        let destination = destination.clone();
-        run_blocking(move || {
-            if source == destination { return Ok(()); }
-            this.copy_blocking(&source, &destination)?;
-            // The moved-away source must stop being readable from either copy;
-            // with the mirror on the file itself moves (falling back to
-            // copy+remove), without it a stale file is simply removed.
-            let source_path = this.mirror.resolve_path(&source)?;
-            if this.mirror_files && source_path.is_file() {
-                let destination_path = this.mirror.resolve_path(&destination)?;
-                this.mirror.ensure_parent_dir(&destination_path)?;
-                if std::fs::rename(&source_path, &destination_path).is_err() {
-                    std::fs::copy(&source_path, &destination_path)?;
-                    this.remove_file_copy(&source)?;
-                }
-            } else {
-                this.remove_file_copy(&source)?;
-            }
-            this.delete_blocking(&source)
+        Box::pin(async move{if source==destination{return Ok(());}let source_fence=run_scoped_blocking(||self.writer_for_key(source))?;
+            self.copy(source,destination).await?;match source_fence{Some(fence)=>self.delete_guarded(&fence,source).await,None=>ObjectStore::delete(self,source).await}
         })
     }
+}
+
+/// Sanitize only a PRIVATE `VACUUM INTO` image, never the live connection.
+/// Canonical refs and every reachable raw blob survive; unpublished transfer
+/// state, reader leases and checkpoint payloads do not travel in a backup.
+pub fn sanitize_transfer_snapshot(conn:&mut Connection)->Result<()>{
+    let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
+    tx.execute_batch("CREATE TEMP TABLE backup_transfer_live(key TEXT PRIMARY KEY) WITHOUT ROWID; INSERT INTO backup_transfer_live SELECT blob_key FROM transfer_object_refs WHERE backend='d1' AND blob_key!=''; INSERT OR IGNORE INTO backup_transfer_live SELECT object_key FROM objects WHERE object_key>='.narou-transfer/.refs/' AND object_key<'.narou-transfer/.refs0';
+        DELETE FROM objects WHERE (substr(object_key,1,16)='.narou-transfer/' OR substr(object_key,1,15)='.narou-staging/') AND NOT EXISTS(SELECT 1 FROM backup_transfer_live l WHERE l.key=objects.object_key);
+        DELETE FROM transfer_verified_objects WHERE NOT EXISTS(SELECT 1 FROM backup_transfer_live l WHERE l.key=transfer_verified_objects.blob_key);
+        DELETE FROM novel_reader_leases; DELETE FROM transfer_storage_guards; UPDATE novel_access_gates SET closed=0,owner=NULL; DROP TABLE backup_transfer_live;").map_err(super::sqlite_error)?;
+    let tables={let mut query=tx.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'transfer_*' AND name NOT IN ('transfer_object_refs','transfer_verified_objects')").map_err(super::sqlite_error)?;query.query_map([],|row|row.get::<_,String>(0)).map_err(super::sqlite_error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(super::sqlite_error)?};
+    for table in tables{tx.execute(&format!("DELETE FROM \"{}\"",table.replace('"',"\"\"")),[]).map_err(super::sqlite_error)?;}
+    tx.commit().map_err(super::sqlite_error)
 }
 
 /// Payload bytes (raw + stored) one import transaction may carry. Keeps
@@ -1133,7 +1104,13 @@ pub(crate) fn verify_payload_crc32(conn: &Connection) -> Result<Vec<PayloadCorru
         let mut meta = next_verify_meta(&mut meta_rows)?;
         let mut chunk = next_verify_chunk(&mut chunk_rows)?;
         while let Some((meta_key, encoding, crc32)) = meta {
+            // Raw (encoding=none) objects — including multi-GiB imported
+            // payloads — are checksummed incrementally over each 64KiB
+            // chunk row so the object is never assembled in memory.
+            // Compressed encodings keep the bounded assemble/decode path.
+            let raw = matches!(ObjectEncoding::parse(&encoding), Ok(ObjectEncoding::None));
             let mut stored = Vec::new();
+            let mut hasher = crc32fast::Hasher::new();
             while let Some((chunk_key, data)) = chunk.take() {
                 if chunk_key.as_str() < meta_key.as_str() {
                     // Leftover chunks without an object row: ignored, as before.
@@ -1141,7 +1118,7 @@ pub(crate) fn verify_payload_crc32(conn: &Connection) -> Result<Vec<PayloadCorru
                     continue;
                 }
                 if chunk_key == meta_key {
-                    stored.extend_from_slice(&data);
+                    if raw { hasher.update(&data); } else { stored.extend_from_slice(&data); }
                     chunk = next_verify_chunk(&mut chunk_rows)?;
                     continue;
                 }
@@ -1149,7 +1126,15 @@ pub(crate) fn verify_payload_crc32(conn: &Connection) -> Result<Vec<PayloadCorru
                 chunk = Some((chunk_key, data));
                 break;
             }
-            if let Err(reason) = verify_stored_payload(&stored, &encoding, crc32) {
+            if raw {
+                let actual = hasher.finalize();
+                if actual != crc32 as u32 {
+                    corruptions.push(PayloadCorruption {
+                        key: meta_key,
+                        reason: format!("object payload CRC mismatch: expected {:08x}, got {actual:08x}", crc32 as u32),
+                    });
+                }
+            } else if let Err(reason) = verify_stored_payload(&stored, &encoding, crc32) {
                 corruptions.push(PayloadCorruption {
                     key: meta_key,
                     reason,
@@ -1240,10 +1225,552 @@ fn hex_digest(hash: &[u8]) -> String {
     }
     out
 }
+use crate::platform::{transfer_stage as ts, access_fence as af, TransferStageStore, NovelAccessFence,
+    StageCursor, SealedAsset, StageLease, GateLease, GateInfo, GateState, WriteFence, WriteOnce};
+use rusqlite::OptionalExtension;
+use sha2::Digest;
+
+const NATIVE_LIST_PAGE_SQL:&str=r#"
+SELECT object_key,size,content_type,updated_at FROM native_logical_objects WHERE object_key=?1 AND object_key>?4
+UNION ALL SELECT object_key,size,content_type,updated_at FROM native_logical_objects WHERE ?1!='' AND object_key>=max(?2,?4) AND object_key<?3 AND object_key>?4
+UNION ALL SELECT object_key,size,content_type,updated_at FROM native_logical_objects WHERE ?1='' AND object_key>?4
+ORDER BY object_key LIMIT ?5
+"#;
+
+fn stage_row(conn: &Connection, id: &str) -> Result<Option<ts::StageLedgerRecord>> {
+    let value: Option<String> = conn.query_row("SELECT record_json FROM transfer_stage_ledger WHERE stage_id=?",[id],|row|row.get(0)).optional().map_err(super::sqlite_error)?;
+    value.map(|value|ts::decode_ledger(value.as_bytes())).transpose()
+}
+fn put_stage_row(conn: &Connection, record: &ts::StageLedgerRecord) -> Result<()> {
+    let json=String::from_utf8(ts::encode_ledger(record)?).map_err(|error|NarouError::Platform(error.to_string()))?;
+    conn.execute("INSERT INTO transfer_stage_ledger(stage_id,record_json) VALUES (?,?) ON CONFLICT(stage_id) DO UPDATE SET record_json=excluded.record_json,revision=revision+1",
+        rusqlite::params![record.lease.stage_id,json]).map_err(super::sqlite_error)?;
+    if record.lease.state==ts::StageLeaseState::Writing{let key=ts::stage_checkpoint_key(&record.lease.stage_id,record.confirmed_bytes)?;let bytes=serde_json::to_vec(&record.cursor()).map_err(|error|NarouError::Platform(error.to_string()))?;
+        insert_stored_object(conn,StoredObject{key:&key,size:bytes.len() as i64,crc32:crate::platform::object_crc32(&bytes) as i64,stored:&bytes,encoding:ObjectEncoding::None,content_type:Some("application/json"),updated_at:&SqliteObjectStore::now_rfc3339()})?;}Ok(())
+}
+
+/// Must be called inside the SAME transaction as the guarded metadata/content commit.
+/// Owner-scoped callers require the CLOSED gate owned by `owner`; owner-less
+/// callers require the OPEN gate — both at the exact supplied epoch. Any
+/// committed SQL→FS handoff retires every SQL token for the prefix, and a
+/// row created afterwards can never revive authority by accident.
+pub fn require_transfer_epoch(conn:&Connection,prefix:&ObjectPrefix,owner:Option<&str>,epoch:u64,drained:bool)->Result<()> {
+    let row:Option<(u64,i64,Option<String>)>=conn.query_row("SELECT epoch,closed,owner FROM novel_access_gates WHERE prefix=?",
+        [prefix.as_ref().trim_end_matches('/')],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?))).optional().map_err(super::sqlite_error)?;
+    let Some((current,closed,current_owner))=row else { return Err(af::gate_closed_error(prefix)); };
+    if crate::native::object_store::read_fs_gate_handoff_raw(conn,prefix.as_ref().trim_end_matches('/'))?.is_some(){return Err(af::gate_closed_error(prefix));}
+    match owner {
+        Some(owner)=>{
+            if closed==0||current_owner.as_deref()!=Some(owner)||current!=epoch { return Err(af::gate_epoch_error(prefix,epoch,current)); }
+        }
+        None=>{
+            if closed!=0||current!=epoch { return Err(af::gate_epoch_error(prefix,epoch,current)); }
+        }
+    }
+    if drained {
+        let count:i64=conn.query_row("SELECT count(*) FROM novel_reader_leases WHERE prefix=? AND expires_at>?",
+            rusqlite::params![prefix.as_ref().trim_end_matches('/'),ts::now_secs()],|row|row.get(0)).map_err(super::sqlite_error)?;
+        if count!=0 { return Err(af::novel_busy_error(prefix)); }
+    } Ok(())
+}
+
+impl SqliteObjectStore {
+    pub(crate) fn source_generation(&self,key:&ObjectKey)->Result<Option<String>>{
+        if self.prefer_mirror(key)?&&let Some(stamp)=self.mirror.file_generation(key)?{return Ok(Some(format!("fs:{stamp}")));}
+        let conn=self.conn.lock();let physical=resolve_payload_key(&conn,key)?;let generation:Option<String>=conn.query_row("SELECT generation FROM objects WHERE object_key=?",[physical.as_ref()],|row|row.get(0)).optional().map_err(super::sqlite_error)?;
+        drop(conn);match generation{Some(generation)=>Ok(Some(format!("db:{physical}:{generation}"))),None=>self.mirror.file_generation(key)}
+    }
+    fn writer_for_key(&self,key:&ObjectKey)->Result<Option<WriteFence>>{
+        if crate::platform::is_reserved_key(key){return Ok(None);}
+        let prefix:Option<String>={let conn=self.conn.lock();conn.query_row("SELECT prefix FROM (SELECT prefix FROM novel_access_gates UNION SELECT prefix FROM novel_gate_bindings) WHERE ?1=prefix OR substr(?1,1,length(prefix)+1)=prefix||'/' ORDER BY length(prefix) DESC LIMIT 1",[key.as_ref()],|row|row.get(0)).optional().map_err(super::sqlite_error)?};
+        let Some(prefix)=prefix else{return Ok(None);};let prefix=ObjectPrefix::new(prefix)?;
+        self.gate_transaction(&prefix,|conn|{let info=Self::gate_info_conn(conn,&prefix)?;if info.state!=GateState::Open{return Err(af::gate_closed_error(&prefix));}Ok(Some(WriteFence::new(prefix.clone(),info.epoch)))})
+    }
+    pub(crate) fn stored_encoding(&self,key:&ObjectKey)->Result<Option<ObjectEncoding>>{
+        let conn=self.conn.lock();let key=resolve_payload_key(&conn,key)?;
+        let value:Option<String>=conn.query_row("SELECT encoding FROM objects WHERE object_key=?",[key.as_ref()],|row|row.get(0)).optional().map_err(super::sqlite_error)?;value.map(|value|ObjectEncoding::parse(&value)).transpose()
+    }
+    pub(crate) fn transfer_fingerprint(&self,key:&ObjectKey)->Result<Option<(u64,String)>>{
+        let conn=self.conn.lock();let physical=resolve_payload_key(&conn,key)?;
+        let value:Option<(u64,String,String)>=conn.query_row("SELECT v.size,v.sha256,v.generation FROM transfer_verified_objects v JOIN objects o ON o.object_key=v.blob_key AND o.generation=v.generation WHERE v.blob_key=?",[physical.as_ref()],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?))).optional().map_err(super::sqlite_error)?;
+        if let Some((size,sha,_))=value{if self.mirror_files&&!crate::platform::is_reserved_key(key){let mirror=self.mirror.trusted_file_fingerprint(key)?.ok_or_else(||NarouError::Platform("canonical mirror proof missing".into()))?;if mirror.0!=size||!mirror.1.eq_ignore_ascii_case(&sha){return Err(NarouError::Platform("canonical mirror fingerprint conflict".into()));}}return Ok(Some((size,sha)));}Ok(None)
+    }
+    fn record_verified_object(conn:&Connection,key:&ObjectKey,size:u64,sha:&str)->Result<()>{
+        let (actual,encoding,generation):(u64,String,String)=conn.query_row("SELECT size,encoding,generation FROM objects WHERE object_key=?",[key.as_ref()],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?))).map_err(super::sqlite_error)?;
+        if actual!=size||encoding!="none"{return Err(NarouError::Platform("raw stage metadata changed".into()));}
+        conn.execute("INSERT INTO transfer_verified_objects(blob_key,size,sha256,generation) VALUES(?,?,?,?) ON CONFLICT(blob_key) DO UPDATE SET size=excluded.size,sha256=excluded.sha256,generation=excluded.generation",rusqlite::params![key.as_ref(),size as i64,sha.to_ascii_lowercase(),generation]).map_err(super::sqlite_error)?;Ok(())
+    }
+    fn install_reference(&self,conn:&Connection,stage:&ObjectKey,key:&ObjectKey)->Result<()>{
+        let (size,sha,generation):(u64,String,String)=conn.query_row("SELECT v.size,v.sha256,v.generation FROM transfer_verified_objects v JOIN objects o ON o.object_key=v.blob_key AND o.generation=v.generation WHERE v.blob_key=?",[stage.as_ref()],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?))).optional().map_err(super::sqlite_error)?.ok_or_else(||NarouError::Platform("sealed stage proof missing or changed".into()))?;
+        let same:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM transfer_object_refs WHERE object_key=? AND blob_key=? AND blob_generation=? AND sha256=?)",rusqlite::params![key.as_ref(),stage.as_ref(),generation,sha],|row|row.get(0)).map_err(super::sqlite_error)?;
+        if self.mirror_files{let installed=self.mirror.install_verified_file(stage,key)?;if installed.0!=size||!installed.1.eq_ignore_ascii_case(&sha){return Err(NarouError::Platform("mirror stage fingerprint differs".into()));}}
+        if same{return Ok(());}
+        conn.execute("INSERT INTO transfer_object_refs(object_key,blob_key,size,sha256,backend,updated_at,blob_generation) VALUES(?,?,?,?,'d1',?,?) ON CONFLICT(object_key) DO UPDATE SET blob_key=excluded.blob_key,size=excluded.size,sha256=excluded.sha256,backend=excluded.backend,updated_at=excluded.updated_at,blob_generation=excluded.blob_generation",rusqlite::params![key.as_ref(),stage.as_ref(),size as i64,sha,Self::now_rfc3339(),generation]).map_err(super::sqlite_error)?;Ok(())
+    }
+    fn append_mirror_stage(&self,key:&ObjectKey,offset:u64,payload:&[u8])->Result<()>{
+        if !self.mirror_files{return Ok(());}use std::io::{Seek,SeekFrom,Write};let path=self.mirror.resolve_path(key)?;self.mirror.ensure_parent_dir(&path)?;
+        let mut file=std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+        if file.metadata()?.len()<offset{return Err(NarouError::Platform("confirmed mirror stage prefix disappeared".into()));}file.set_len(offset)?;file.seek(SeekFrom::Start(offset))?;file.write_all(payload)?;file.sync_all()?;Ok(())
+    }
+    fn stage_transaction<T>(&self,id:&str,operation:impl FnOnce(&Connection,Option<ts::StageLedgerRecord>)->Result<(T,Option<ts::StageLedgerRecord>)>)->Result<T> {
+        ts::stage_data_key(id)?;
+        let mut conn=self.conn.lock(); let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
+        let current=stage_row(&tx,id)?; let (value,next)=operation(&tx,current)?;
+        if let Some(next)=next { put_stage_row(&tx,&next)?; } tx.commit().map_err(super::sqlite_error)?; Ok(value)
+    }
+    pub fn with_publication_transaction<T>(&self,prefix:&ObjectPrefix,owner:&str,epoch:u64,operation:impl FnOnce(&Connection)->Result<T>)->Result<T> {
+        self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),|| {
+            let mut conn=self.conn.lock(); let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
+            require_transfer_epoch(&tx,prefix,Some(owner),epoch,true)?; let value=operation(&tx)?; tx.commit().map_err(super::sqlite_error)?; Ok(value)
+        })
+    }
+    pub fn with_reader_transaction<T>(&self,prefix:&ObjectPrefix,lease:&GateLease,operation:impl FnOnce(&Connection)->Result<T>)->Result<T>{
+        let epoch=i64::try_from(lease.epoch).map_err(|_|af::gate_epoch_error(prefix,lease.epoch,u64::MAX))?;
+        self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
+            let conn=self.conn.lock();require_transfer_epoch(&conn,prefix,None,lease.epoch,false)?;
+            let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM novel_reader_leases WHERE prefix=? AND reader_id=? AND epoch=? AND expires_at>?)",rusqlite::params![prefix.as_ref().trim_end_matches('/'),lease.reader_id,epoch,ts::now_secs()],|row|row.get(0)).map_err(super::sqlite_error)?;
+            if !valid{return Err(af::gate_closed_error(prefix));}operation(&conn)
+        })
+    }
+    pub fn with_open_fence_transaction<T>(&self,fence:&WriteFence,operation:impl FnOnce(&Connection)->Result<T>)->Result<T>{
+        self.mirror.with_transfer_lock(fence.prefix.as_ref().trim_end_matches('/'),||{
+            let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
+            require_transfer_epoch(&tx,&fence.prefix,None,fence.epoch,false)?;let value=operation(&tx)?;tx.commit().map_err(super::sqlite_error)?;Ok(value)
+        })
+    }
+    pub(crate) fn with_open_write<T>(&self,fence:&WriteFence,operation:impl FnOnce()->Result<T>)->Result<T>{
+        self.mirror.with_transfer_lock(fence.prefix.as_ref().trim_end_matches('/'),||{
+            {let conn=self.conn.lock();require_transfer_epoch(&conn,&fence.prefix,None,fence.epoch,false)?;}
+            // Every native gate transition takes this same OS lock before its
+            // SQL transaction, so no close/reopen can race the inner DB commit.
+            operation()
+        })
+    }
+    pub(crate) fn with_closed_write<T>(&self,prefix:&ObjectPrefix,owner:&str,epoch:u64,operation:impl FnOnce()->Result<T>)->Result<T>{self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{{let conn=self.conn.lock();require_transfer_epoch(&conn,prefix,Some(owner),epoch,true)?;}operation()})}
+    pub(crate) fn commit_remote_reference(&self,prefix:&ObjectPrefix,owner:Option<&str>,epoch:u64,key:&ObjectKey,data:Option<&[u8]>,expected_sha:Option<&str>)->Result<()> {
+        self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
+            let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;require_transfer_epoch(&tx,prefix,owner,epoch,owner.is_some())?;
+            if let Some(expected)=expected_sha{let Some(payload)=read_stored_payload(&tx,key,Some(64*1024))?else{return Ok(());};let bytes=decode_stored_payload(payload,key,Some(64*1024))?;let row:serde_json::Value=serde_json::from_slice(&bytes).map_err(|error|NarouError::Platform(error.to_string()))?;if !row.get("sha256").and_then(serde_json::Value::as_str).is_some_and(|sha|sha.eq_ignore_ascii_case(expected)){return Err(NarouError::Platform("recovery reference fingerprint conflict".into()));}}
+            if let Some(data)=data{insert_stored_object(&tx,StoredObject{key,size:data.len() as i64,crc32:crate::platform::object_crc32(data) as i64,stored:data,encoding:ObjectEncoding::None,content_type:Some("application/json"),updated_at:&Self::now_rfc3339()})?;}else{tx.execute("DELETE FROM objects WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;}
+            tx.execute("UPDATE novel_access_gates SET content_revision=content_revision+1 WHERE prefix=?",[prefix.as_ref().trim_end_matches('/')]).map_err(super::sqlite_error)?;
+            tx.commit().map_err(super::sqlite_error)
+        })
+    }
+    fn gate_transaction<T>(&self,prefix:&ObjectPrefix,operation:impl FnOnce(&Connection)->Result<T>)->Result<T> {
+        self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
+            let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
+            // A committed SQL→FS handoff retires every SQL token for this
+            // prefix: creating a default epoch-0 row must never revive SQL
+            // authority against the live FS gate.
+            if crate::native::object_store::read_fs_gate_handoff_raw(&tx,prefix.as_ref().trim_end_matches('/'))?.is_some(){return Err(af::gate_closed_error(prefix));}
+            tx.execute("INSERT OR IGNORE INTO novel_access_gates(prefix,updated_at) VALUES (?,?)",rusqlite::params![prefix.as_ref().trim_end_matches('/'),ts::now_secs()]).map_err(super::sqlite_error)?;
+            let value=operation(&tx)?;tx.commit().map_err(super::sqlite_error)?;Ok(value)
+        })
+    }
+    fn gate_info_conn(conn:&Connection,prefix:&ObjectPrefix)->Result<GateInfo> {
+        let (epoch,closed,owner,updated_at,content_revision):(u64,i64,Option<String>,i64,u64)=conn.query_row("SELECT epoch,closed,owner,updated_at,content_revision FROM novel_access_gates WHERE prefix=?",[prefix.as_ref().trim_end_matches('/')],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?,row.get(3)?,super::read_u64(row,4)?))).map_err(super::sqlite_error)?;
+        let count:u32=conn.query_row("SELECT count(*) FROM novel_reader_leases WHERE prefix=? AND expires_at>?",rusqlite::params![prefix.as_ref().trim_end_matches('/'),ts::now_secs()],|row|row.get(0)).map_err(super::sqlite_error)?;
+        Ok(GateInfo{epoch,content_revision,state:if closed==0{GateState::Open}else{GateState::Closed},pending_readers:count,owner,updated_at})
+    }
+
+    /// SQL→FS gate authority adoption, in-transaction half. Caller's
+    /// Immediate transaction must be the metadata boundary for `prefix`, and
+    /// the caller must hold the prefix's OS transfer lock. Reads the gate row
+    /// inside `tx`, fails closed on a closed gate, verifies or records the
+    /// durable `fs_gate_handoffs` intent (a committed-but-interrupted adoption
+    /// resumes on its recorded fs_epoch, never a fresh epoch), imports every
+    /// live reader lease with its original token epoch (stale tokens lose on
+    /// renew while the drain contract holds), pre-flights the canonical FS
+    /// gate conflict rule, writes the pending journal, then deletes the SQL
+    /// gate row + leases so no old SQL token can revive.
+    /// Returns `Some(gate)` to finalize with
+    /// `finalize_sql_gate_adoption_locked` after the caller's COMMIT, or
+    /// `None` when the handoff is already proven by the canonical FS gate
+    /// (idempotent re-run).
+    pub(crate) fn adopt_sql_gate_in_tx(&self,tx:&Connection,prefix:&ObjectPrefix)->Result<Option<FsGate>> {
+        adopt_sql_gate_tx(&self.mirror,tx,prefix)
+    }
+
+    /// Post-COMMIT half of SQL→FS adoption: installs the canonical FS gate
+    /// (lineage re-validated against the now-committed handoff) and retires
+    /// the pending journal. `connection` must be the connection the intent
+    /// committed on; the caller still holds the prefix's OS transfer lock.
+    pub(crate) fn finalize_sql_gate_adoption_locked(&self,prefix:&ObjectPrefix,gate:&FsGate,connection:&Connection)->Result<()> {
+        self.mirror.install_adopted_gate_locked(&self.mirror.gate_path(prefix)?,prefix,gate,connection)?;
+        self.mirror.remove_pending_gate_locked(prefix)
+    }
+
+    /// SQL→FS gate authority adoption for `prefix`. Under the prefix's OS
+    /// transfer lock + one immediate transaction: verify the row, journal the
+    /// intent (`fs_gate_handoffs` + `.gate.pending`), delete the SQL row and
+    /// leases, commit, then install the canonical FS gate and retire the
+    /// journal. A crash anywhere before the journal+intent commit leaves SQL
+    /// authoritative and is rolled back by the startup sweep; a crash after
+    /// it leaves a committed intent the same sweep completes. Idempotent: a
+    /// re-run sees the row deleted and the handoff covering the live FS gate
+    /// and passes.
+    #[cfg(test)]
+    pub(crate) fn adopt_sql_gate_locked(&self,prefix:&ObjectPrefix)->Result<()>{
+        self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
+            let conn=self.conn.lock();
+            let tx=rusqlite::Transaction::new_unchecked(&conn,rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
+            let gate=self.adopt_sql_gate_in_tx(&tx,prefix)?;
+            tx.commit().map_err(super::sqlite_error)?;
+            if let Some(gate)=gate{self.finalize_sql_gate_adoption_locked(prefix,&gate,&conn)?;}
+            Ok(())
+        })
+    }
+}
+
+/// The in-transaction core shared by `SqliteObjectStore::adopt_sql_gate_in_tx`
+/// and `adopt_sql_gate_locked` (the free function used by the startup sweep,
+/// which holds the connection guard rather than a store).
+fn adopt_sql_gate_tx(mirror:&NativeObjectStore,tx:&Connection,prefix:&ObjectPrefix)->Result<Option<FsGate>> {
+    let prefix_key=prefix.as_ref().trim_end_matches('/');
+    let row:Option<(u64,bool,String,u64)>=tx.query_row("SELECT epoch,closed,origin_url_fold,content_revision FROM novel_access_gates WHERE prefix=?1",[prefix_key],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?,super::read_u64(row,3)?))).optional().map_err(super::sqlite_error)?;
+    let recorded=crate::native::object_store::read_fs_gate_handoff_raw(tx,prefix_key)?;
+    let Some((sql_epoch,closed,origin,content_revision))=row else{
+        // The SQL row is gone: the handoff is authoritative only when the
+        // recorded tuple is covered by the canonical FS gate (idempotent
+        // re-run) or still carried by the durable pending journal a previous
+        // crash left to finalize.
+        let Some((_,fs_epoch,fs_origin))=recorded else{return Err(NarouError::Platform("FS gate adoption lost its durable handoff".into()));};
+        match crate::native::object_store::read_durable_gate(&mirror.gate_path(prefix)?)? {
+            Some(gate)=>{
+                if gate.epoch!=fs_epoch||gate.origin_url_fold!=fs_origin{return Err(NarouError::Platform("FS gate adoption proof mismatch".into()));}
+                if gate.migrated{return Err(NarouError::Platform("migrated FS gate lost its SQL handoff".into()));}
+                mirror.remove_pending_gate_locked(prefix)?;
+                return Ok(None);
+            }
+            None=>{
+                let Some(gate)=mirror.read_pending_gate_locked(prefix)? else{return Err(NarouError::Platform("FS gate adoption lost its durable journal".into()));};
+                if gate.epoch!=fs_epoch||gate.origin_url_fold!=fs_origin{return Err(NarouError::Platform("FS gate journal proof mismatch".into()));}
+                return Ok(Some(gate));
+            }
+        }
+    };
+    // A committed intent tuple must match the row it was journaled from;
+    // anything else is conflicting provenance and fails closed.
+    if let Some((recorded_sql,recorded_fs,recorded_origin))=&recorded{
+        if *recorded_sql!=sql_epoch||*recorded_fs!=sql_epoch.saturating_add(1)||*recorded_origin!=origin{
+            return Err(NarouError::Platform("conflicting durable FS gate handoff".into()));
+        }
+    }
+    if closed{return Err(NarouError::Platform("closed SQL gate cannot migrate to filesystem authority".into()));}
+    let fs_epoch=recorded.as_ref().map(|(_,fs_epoch,_)|*fs_epoch).map_or_else(||sql_epoch.checked_add(1),Some).ok_or_else(||NarouError::Platform("SQL gate epoch exhausted".into()))?;
+    let mut readers=std::collections::BTreeMap::new();
+    {let mut statement=tx.prepare("SELECT reader_id,epoch,expires_at FROM novel_reader_leases WHERE prefix=?1 AND expires_at>?2").map_err(super::sqlite_error)?;let mut rows=statement.query(rusqlite::params![prefix_key,ts::now_secs()]).map_err(super::sqlite_error)?;while let Some(row)=rows.next().map_err(super::sqlite_error)?{let id:String=row.get(0).map_err(super::sqlite_error)?;let epoch=super::read_u64(row,1).map_err(super::sqlite_error)?;let expiry:i64=row.get(2).map_err(super::sqlite_error)?;readers.insert(id,(epoch,expiry));}}
+    let gate=FsGate{prefix:Some(prefix_key.to_owned()),origin_url_fold:origin.clone(),content_revision,epoch:fs_epoch,owner:None,updated_at:ts::now_secs(),migrated:false,readers};
+    mirror.require_adopted_gate_target(&mirror.gate_path(prefix)?,prefix,&gate,tx)?;
+    if recorded.is_none(){
+        crate::native::object_store::record_fs_gate_handoff(tx,prefix_key,sql_epoch,fs_epoch,&origin)?;
+    }
+    mirror.install_pending_gate_locked(prefix,&gate)?;
+    tx.execute("DELETE FROM novel_reader_leases WHERE prefix=?1",[prefix_key]).map_err(super::sqlite_error)?;
+    tx.execute("DELETE FROM novel_access_gates WHERE prefix=?1",[prefix_key]).map_err(super::sqlite_error)?;
+    Ok(Some(gate))
+}
+
+/// SQL→FS adoption for callers holding only the connection (startup sweep):
+/// identical to `SqliteObjectStore::adopt_sql_gate_locked` — the prefix's OS
+/// transfer lock wraps intent commit + canonical finalize.
+pub(crate) fn adopt_sql_gate_locked(mirror:&NativeObjectStore,connection:&Connection,prefix:&ObjectPrefix)->Result<()>{
+    mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
+        let tx=rusqlite::Transaction::new_unchecked(connection,rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
+        let gate=adopt_sql_gate_tx(mirror,&tx,prefix)?;
+        tx.commit().map_err(super::sqlite_error)?;
+        if let Some(gate)=gate{
+            mirror.install_adopted_gate_locked(&mirror.gate_path(prefix)?,prefix,&gate,connection)?;
+            mirror.remove_pending_gate_locked(prefix)?;
+        }
+        Ok(())
+    })
+}
+
+/// Resume or roll back every durable SQL→FS adoption intent. Used by both
+/// the Sqlite-mode startup sweep and restart recovery after an interrupted
+/// management-backend switch: a recorded handoff means the deletion
+/// transaction committed, so the adoption is finalized from its journal; an
+/// unrecorded journal means the commit never landed and the intent is
+/// discarded so its SQL row stays the single authority.
+pub(crate) fn reconcile_pending_gate_journals(mirror:&NativeObjectStore,connection:&Arc<Mutex<Connection>>)->Result<()> {
+    // Phase 1: pending journals. A recorded handoff resumes the committed
+    // adoption (the journal is finalized or the row deleted); an unproven
+    // journal is rolled back so its SQL row stays the single authority.
+    for (prefix_key,_gate) in crate::native::object_store::durable_fs_gates(&mirror.root().join(".objects/.narou-transfer/.gate.pending"))? {
+        let prefix=ObjectPrefix::new(prefix_key.clone())?;
+        let recorded={let conn=connection.lock();crate::native::object_store::read_fs_gate_handoff_raw(&conn,&prefix_key)?};
+        if recorded.is_none(){
+            mirror.with_transfer_lock(&prefix_key,||mirror.remove_pending_gate_locked(&prefix))?;
+            continue;
+        }
+        adopt_sql_gate_locked(mirror,&connection.lock(),&prefix)
+            .map_err(|error|NarouError::Platform(format!("pending FS gate adoption failed for {prefix_key}: {error}")))?;
+    }
+    // Phase 2: recorded intents the journal scan cannot see (crash before
+    // the journal write). A live SQL row resumes the adoption; a deleted row
+    // finalizes whatever the journal carried.
+    {let conn=connection.lock();
+        let table:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='fs_gate_handoffs')",[],|row|row.get(0)).map_err(super::sqlite_error)?;
+        if table{let mut statement=conn.prepare("SELECT prefix FROM fs_gate_handoffs").map_err(super::sqlite_error)?;let mut rows=statement.query([]).map_err(super::sqlite_error)?;let mut prefixes=Vec::new();while let Some(row)=rows.next().map_err(super::sqlite_error)?{prefixes.push(row.get::<_,String>(0).map_err(super::sqlite_error)?);}drop(rows);drop(statement);drop(conn);
+            for prefix_key in prefixes{let prefix=ObjectPrefix::new(prefix_key.clone())?;
+                adopt_sql_gate_locked(mirror,&connection.lock(),&prefix)
+                    .map_err(|error|NarouError::Platform(format!("FS gate handoff resume failed for {prefix_key}: {error}")))?;}}
+    }
+    Ok(())
+}
+
+/// Delete `.gate.pending` journals that have no committed handoff behind
+/// them. Used by restart recovery when the switch transaction provably
+/// never committed (or the database itself is gone); a journal WITH a
+/// recorded handoff is a conflict and fails closed instead.
+pub(crate) fn rollback_unproven_pending_journals(mirror:&NativeObjectStore,connection:Option<&Connection>)->Result<()> {
+    for (prefix_key,_gate) in crate::native::object_store::durable_fs_gates(&mirror.root().join(".objects/.narou-transfer/.gate.pending"))? {
+        let recorded=match connection{
+            Some(conn)=>crate::native::object_store::read_fs_gate_handoff_raw(conn,&prefix_key)?,
+            None=>None,
+        };
+        if recorded.is_some(){return Err(NarouError::Platform(format!("pending FS gate journal has committed provenance for {prefix_key}")));}
+        let prefix=ObjectPrefix::new(prefix_key.clone())?;
+        mirror.with_transfer_lock(&prefix_key,||mirror.remove_pending_gate_locked(&prefix))?;
+    }
+    Ok(())
+}
+
+/// Startup authority recovery: resolve every committed-but-interrupted
+/// SQL→FS handoff, roll back orphaned journals, reconcile each durable FS
+/// gate file, then adopt live FS authority into SQL. Every classification
+/// uses exact epoch+origin tuples; conflicting provenance fails closed.
+pub(crate) fn reconcile_namespace_gate_authority(mirror:&NativeObjectStore,connection:&Arc<Mutex<Connection>>)->Result<()> {
+    reconcile_pending_gate_journals(mirror,connection)?;
+    // Phase 3: classify every remaining durable FS gate file. Exact
+    // epoch+origin tuples decide; every ambiguous combination fails closed.
+    for (prefix_key,mut gate) in crate::native::object_store::durable_fs_gates(&mirror.root().join(".objects/.narou-transfer/.gate"))? {
+        let prefix=ObjectPrefix::new(prefix_key.clone())?;
+        // Read-only classification under the conn guard; actions below take
+        // their own guards so the OS transfer lock is never sought while a
+        // long-lived connection borrow is held.
+        let(proven_sql,fs_handoff,row)={
+            let conn=connection.lock();
+            (crate::native::object_store::read_sql_gate_handoff(&conn,&prefix_key,gate.epoch,&gate.origin_url_fold)?,
+             crate::native::object_store::read_fs_gate_handoff_raw(&conn,&prefix_key)?,
+             conn.query_row("SELECT epoch,origin_url_fold FROM novel_access_gates WHERE prefix=?1",[&prefix_key],|row|Ok((super::read_u64(row,0)?,row.get::<_,String>(1)?))).optional().map_err(super::sqlite_error)?)
+        };
+        let fs_owned=fs_handoff.as_ref().is_some_and(|(_,fs_epoch,fs_origin)|*fs_epoch==gate.epoch&&fs_origin==&gate.origin_url_fold);
+        if fs_handoff.is_some()&&!fs_owned{return Err(NarouError::Platform(format!("conflicting durable FS gate handoff for {prefix_key}")));}
+        if gate.migrated{
+            if fs_owned{return Err(NarouError::Platform(format!("SQL and filesystem handoffs conflict for {prefix_key}")));}
+            // A proven FS→SQL handoff retires this file: SQL row is canonical.
+            if proven_sql{continue;}
+            // The FS→SQL commit never landed: the file is the only authority
+            // again — clear the marker and adopt afresh below.
+            mirror.clear_unproven_migrated_gate_locked(&prefix,&connection.lock())?;
+            gate.migrated=false;
+        }
+        if let Some((sql_epoch,origin))=row {
+            if gate.migrated{return Err(NarouError::Platform("migrated FS gate lost its SQL handoff".into()));}
+            if proven_sql{
+                // SQL→FS commit landed but crashed before the migrated
+                // marker: the file was already superseded — record it so
+                // FS-side checks fail closed from now on.
+                mirror.mark_proven_migrated_gate_locked(&prefix)?;
+                continue;
+            }
+            if fs_owned{return Err(NarouError::Platform(format!("FS gate adoption resume missing for {prefix_key}")));}
+            if sql_epoch.checked_add(1)==Some(gate.epoch)&&origin==gate.origin_url_fold{
+                return Err(NarouError::Platform(format!("SQL and filesystem gates conflict for {prefix_key}")));
+            }
+            return Err(NarouError::Platform(format!("SQL gate conflicts with filesystem authority for {prefix_key}")));
+        }
+        if fs_owned{
+            // An FS gate a proven SQL→FS handoff produced stays FS-side; it
+            // already carried this exact epoch+origin back from SQL. A stale
+            // migrated marker was cleared above if needed.
+            continue;
+        }
+        if gate.migrated{return Err(NarouError::Platform("migrated FS gate lost its SQL handoff".into()));}
+        // Pristine defaults (stray releases created the file without ever
+        // holding authority) carry nothing worth adopting.
+        if gate.epoch == 0 && gate.owner.is_none() && gate.origin_url_fold.is_empty() && gate.readers.is_empty() && gate.content_revision == 0 { continue; }
+        if gate.owner.is_some() { continue; }
+        // Fail closed: a skipped adoption would leave live dual authority
+        // (FS gate + this handle) for the same prefix.
+        mirror.adopt_fs_gate_locked(&prefix, &connection.lock())
+            .map_err(|error| NarouError::Platform(format!("FS gate adoption failed for {prefix_key}: {error}")))?;
+    }
+    Ok(())
+}
+
+impl TransferStageStore for SqliteObjectStore {
+    fn stage_open<'a>(&'a self,id:&'a str,owner:&'a str,epoch:u64,ttl:i64)->PlatformFuture<'a,Result<StageCursor>> {
+        Box::pin(async move { run_scoped_blocking(||self.stage_transaction(id,|conn,current| {
+            let record=match current {Some(record)=>{ts::require_owner(&record,owner,epoch)?;if record.lease.state==ts::StageLeaseState::Aborting{return Err(NarouError::Platform("stage_aborted".into()));}record},None=>{
+                let record=ts::StageLedgerRecord::new(id,owner,epoch,ttl)?;
+                conn.execute("INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (?,0,?,'none',0,NULL)",rusqlite::params![ts::stage_data_key(id)?.as_ref(),Self::now_rfc3339()]).map_err(super::sqlite_error)?;record}};
+            Ok((record.cursor(),Some(record)))
+        })) })
+    }
+    fn stage_cursor<'a>(&'a self,id:&'a str)->PlatformFuture<'a,Result<Option<StageCursor>>> {
+        Box::pin(async move{run_scoped_blocking(||self.stage_transaction(id,|conn,record|{if record.as_ref().is_some_and(|record|record.lease.state==ts::StageLeaseState::Aborting){let pinned:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM transfer_object_refs WHERE blob_key=?)",[ts::stage_data_key(id)?.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;if pinned{return Ok((None,None));}}Ok((record.as_ref().map(|record|record.cursor()),None))}))})
+    }
+    fn stage_append<'a>(&'a self,id:&'a str,owner:&'a str,epoch:u64,offset:u64,payload:&'a [u8],last:bool)->PlatformFuture<'a,Result<StageCursor>> {
+        Box::pin(async move{run_scoped_blocking(||self.stage_transaction(id,|conn,current|{
+            let mut record=current.ok_or_else(||NarouError::Platform("stage not open".into()))?;record.append(owner,epoch,offset,payload,last)?;let key=ts::stage_data_key(id)?;
+            let mut position=offset; let mut input=payload;
+            while !input.is_empty(){
+                let seq=position/OBJECT_CHUNK_BYTES as u64;let inside=(position%OBJECT_CHUNK_BYTES as u64) as usize;let length=input.len().min(OBJECT_CHUNK_BYTES-inside);
+                if inside==0 {conn.execute("INSERT INTO object_chunks(object_key,seq,data) VALUES (?,?,?) ON CONFLICT(object_key,seq) DO UPDATE SET data=excluded.data",rusqlite::params![key.as_ref(),seq as i64,&input[..length]]).map_err(super::sqlite_error)?;}
+                else {let changed=conn.execute("UPDATE object_chunks SET data=CAST(substr(data,1,?) || ? AS BLOB) WHERE object_key=? AND seq=? AND length(data)>=?",rusqlite::params![inside as i64,&input[..length],key.as_ref(),seq as i64,inside as i64]).map_err(super::sqlite_error)?;if changed!=1{return Err(NarouError::Platform("stage prefix missing".into()));}}
+                position+=length as u64;input=&input[length..];
+            }
+            self.append_mirror_stage(&key,offset,payload)?;
+            conn.execute("UPDATE objects SET size=?,crc32=?,updated_at=? WHERE object_key=?",rusqlite::params![record.confirmed_bytes as i64,record.crc32,Self::now_rfc3339(),key.as_ref()]).map_err(super::sqlite_error)?;
+            Ok((record.cursor(),Some(record)))
+        }))})
+    }
+    fn stage_rewind<'a>(&'a self,id:&'a str,owner:&'a str,epoch:u64,checkpoint:&'a StageCursor)->PlatformFuture<'a,Result<StageCursor>>{
+        Box::pin(async move{run_scoped_blocking(||self.stage_transaction(id,|conn,current|{
+            let mut record=current.ok_or_else(||NarouError::Platform("stage not open".into()))?;
+            let trusted=if checkpoint.confirmed_bytes==0{ts::StageLedgerRecord::new(id,owner,epoch,1)?.cursor()}else{
+                let key=ts::stage_checkpoint_key(id,checkpoint.confirmed_bytes)?;let payload=read_stored_payload(conn,&key,Some(64*1024))?.ok_or_else(||NarouError::Platform("rewind checkpoint missing".into()))?;let bytes=decode_stored_payload(payload,&key,Some(64*1024))?;let stored:StageCursor=serde_json::from_slice(&bytes).map_err(|error|NarouError::Platform(error.to_string()))?;if stored.prefix_sha256()!=checkpoint.prefix_sha256(){return Err(NarouError::Platform("rewind SHA conflict".into()));}stored};
+            record.rewind(owner,epoch,&trusted)?;let key=ts::stage_data_key(id)?;let size=checkpoint.confirmed_bytes;
+            conn.execute("DELETE FROM object_chunks WHERE object_key=? AND seq>=?",rusqlite::params![key.as_ref(),size.div_ceil(OBJECT_CHUNK_BYTES as u64) as i64]).map_err(super::sqlite_error)?;
+            if size%OBJECT_CHUNK_BYTES as u64!=0 {conn.execute("UPDATE object_chunks SET data=substr(data,1,?) WHERE object_key=? AND seq=?",rusqlite::params![(size%OBJECT_CHUNK_BYTES as u64) as i64,key.as_ref(),(size/OBJECT_CHUNK_BYTES as u64) as i64]).map_err(super::sqlite_error)?;}
+            if self.mirror_files{let path=self.mirror.resolve_path(&key)?;match std::fs::OpenOptions::new().write(true).open(path){Ok(file)=>{file.set_len(size)?;file.sync_all()?;},Err(error)if error.kind()==std::io::ErrorKind::NotFound&&size==0=>{},Err(error)=>return Err(error.into())}}
+            conn.execute("UPDATE objects SET size=?,crc32=? WHERE object_key=?",rusqlite::params![size as i64,record.crc32,key.as_ref()]).map_err(super::sqlite_error)?;Ok((record.cursor(),Some(record)))
+        }))})
+    }
+    fn stage_read<'a>(&'a self,id:&'a str,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<AssetStream>>>{Box::pin(async move{
+        run_scoped_blocking(||{let conn=self.conn.lock();let Some(record)=stage_row(&conn,id)?.filter(|record|record.lease.state==ts::StageLeaseState::Sealed)else{return Ok(None);};let key=ts::stage_data_key(id)?;
+            let proof:Option<(u64,String)>=conn.query_row("SELECT v.size,v.sha256 FROM transfer_verified_objects v JOIN objects o ON o.object_key=v.blob_key AND o.generation=v.generation WHERE v.blob_key=?",[key.as_ref()],|row|Ok((super::read_u64(row,0)?,row.get(1)?))).optional().map_err(super::sqlite_error)?;
+            if !proof.is_some_and(|(size,sha)|size==record.confirmed_bytes&&record.cursor().prefix_sha256().is_some_and(|expected|expected.eq_ignore_ascii_case(&sha))){return Err(NarouError::Platform("sealed stage generation/SHA proof missing or changed".into()));}Ok(self.open_asset_in_connection(&conn,&key,range)?.map(|(_,stream)|stream))
+        })
+    })}
+    fn stage_touch<'a>(&'a self,id:&'a str,owner:&'a str,epoch:u64,ttl:i64)->PlatformFuture<'a,Result<()>>{Box::pin(async move{run_scoped_blocking(||self.stage_transaction(id,|_,current|{
+        let mut record=current.ok_or_else(||NarouError::Platform("stage not open".into()))?;ts::require_owner(&record,owner,epoch)?;if record.lease.state==ts::StageLeaseState::Aborting{return Err(NarouError::Platform("stage_aborted".into()));}
+        record.lease.expires_at=ts::now_secs().saturating_add(ttl.max(1));Ok(((),Some(record)))
+    }))})}
+    fn stage_seal<'a>(&'a self,id:&'a str,owner:&'a str,epoch:u64,size:u64,sha:&'a str)->PlatformFuture<'a,Result<SealedAsset>>{Box::pin(async move{run_scoped_blocking(||self.stage_transaction(id,|conn,current|{
+        let mut record=current.ok_or_else(||NarouError::Platform("stage not open".into()))?;let sealed=record.verify_seal(owner,epoch,size,sha)?;
+        Self::record_verified_object(conn,&sealed.key,size,sha)?;
+        if self.mirror_files{self.mirror.save_verified_file(&sealed.key,size,sha)?;}record.lease.state=ts::StageLeaseState::Sealed;Ok((sealed,Some(record)))
+    }))})}
+    fn stage_abort<'a>(&'a self,id:&'a str,owner:&'a str,epoch:u64)->PlatformFuture<'a,Result<()>>{Box::pin(async move{run_scoped_blocking(||self.stage_transaction(id,|conn,current|{
+        let Some(mut record)=current else{return Ok(((),None));};ts::require_owner(&record,owner,epoch)?;
+        let key=ts::stage_data_key(id)?;let referenced:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM transfer_object_refs WHERE blob_key=?)",[key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;
+        if !referenced{self.remove_file_copy(&key)?;conn.execute("DELETE FROM object_chunks WHERE object_key=?1 AND seq IN (SELECT seq FROM object_chunks WHERE object_key=?1 ORDER BY seq LIMIT 16)",[key.as_ref()]).map_err(super::sqlite_error)?;conn.execute("DELETE FROM objects WHERE object_key=?1 AND NOT EXISTS(SELECT 1 FROM object_chunks WHERE object_key=?1)",[key.as_ref()]).map_err(super::sqlite_error)?;}record.lease.state=ts::StageLeaseState::Aborting;
+        let lower=format!(".narou-transfer/.checkpoints/{id}/");let upper=prefix_upper_bound(&lower);
+        conn.execute("DELETE FROM objects WHERE object_key IN (SELECT object_key FROM objects WHERE object_key>=? AND object_key<? ORDER BY object_key LIMIT 32)",rusqlite::params![lower,upper]).map_err(super::sqlite_error)?;
+        let more:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM objects WHERE object_key>=?1 AND object_key<?2) OR EXISTS(SELECT 1 FROM objects WHERE object_key=?3)",rusqlite::params![lower,upper,key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;
+        if more{Ok(((),Some(record)))}else{conn.execute("DELETE FROM transfer_stage_ledger WHERE stage_id=?",[id]).map_err(super::sqlite_error)?;Ok(((),None))}
+    }))})}
+    fn stage_lease_page<'a>(&'a self,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,Result<(Vec<StageLease>,Option<String>)>>{Box::pin(async move{run_scoped_blocking(||{
+        let conn=self.conn.lock();let mut statement=conn.prepare("SELECT stage_id,record_json FROM transfer_stage_ledger WHERE stage_id>? ORDER BY stage_id LIMIT ?").map_err(super::sqlite_error)?;let cap=limit.clamp(1,100);
+        let mut rows=statement.query(rusqlite::params![cursor.unwrap_or(""),(cap+1) as i64]).map_err(super::sqlite_error)?;let mut out=Vec::new();let mut last=None;
+        while let Some(row)=rows.next().map_err(super::sqlite_error)?{if out.len()==cap{return Ok((out,last));}let id:String=row.get(0).map_err(super::sqlite_error)?;let json:String=row.get(1).map_err(super::sqlite_error)?;out.push(ts::decode_ledger(json.as_bytes())?.lease);last=Some(id);}Ok((out,None))
+    })})}
+    fn stage_reclaim<'a>(&'a self,id:&'a str,owner:&'a str,epoch:u64)->PlatformFuture<'a,Result<bool>>{Box::pin(async move{
+        let claimed=run_scoped_blocking(||self.stage_transaction(id,|conn,current|{
+            let Some(mut record)=current else{return Ok((true,None));};if record.lease.owner!=owner||record.lease.epoch!=epoch||(record.lease.state!=ts::StageLeaseState::Aborting&&record.lease.expires_at>ts::now_secs()){return Ok((false,None));}
+            let key=ts::stage_data_key(id)?;let pinned:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM transfer_object_refs WHERE blob_key=?)",[key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;if pinned{return Ok((false,None));}record.lease.state=ts::StageLeaseState::Aborting;Ok((true,Some(record)))
+        }))?;if !claimed{return Ok(false);}self.stage_abort(id,owner,epoch).await?;Ok(self.stage_cursor(id).await?.is_none())
+    })}
+}
+
+impl NovelAccessFence for SqliteObjectStore {
+    fn retire_writer<'a>(&'a self,fence:&'a WriteFence,owner:&'a str)->PlatformFuture<'a,Result<u64>>{Box::pin(async move{af::parse_removal_owner(owner)?;let next=fence.epoch.checked_add(1).filter(|value|*value<=i64::MAX as u64).ok_or_else(||NarouError::Platform("gate epoch overflow".into()))?;run_scoped_blocking(||self.gate_transaction(&fence.prefix,|conn|{
+        let info=Self::gate_info_conn(conn,&fence.prefix)?;if info.state==GateState::Closed&&info.owner.as_deref()==Some(owner)&&info.epoch==next{return Ok(next);}require_transfer_epoch(conn,&fence.prefix,None,fence.epoch,false)?;
+        let changed=conn.execute("UPDATE novel_access_gates SET closed=1,owner=?,epoch=?,updated_at=? WHERE prefix=? AND closed=0 AND epoch=?",rusqlite::params![owner,next as i64,ts::now_secs(),fence.prefix.as_ref().trim_end_matches('/'),i64::try_from(fence.epoch).map_err(|_|af::gate_epoch_error(&fence.prefix,fence.epoch,u64::MAX))?]).map_err(super::sqlite_error)?;if changed!=1{return Err(af::gate_closed_error(&fence.prefix));}Ok(next)
+    }))})}
+    fn pending_removals<'a>(&'a self,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,Result<(Vec<(ObjectPrefix,String,u64)>,Option<String>)>>{Box::pin(async move{run_scoped_blocking(||{
+        let cap=limit.clamp(1,100);let conn=self.conn.lock();let mut statement=conn.prepare("SELECT prefix,owner,epoch,closed FROM novel_access_gates WHERE prefix>? ORDER BY prefix LIMIT ?").map_err(super::sqlite_error)?;let mut rows=statement.query(rusqlite::params![cursor.unwrap_or(""),(cap+1) as i64]).map_err(super::sqlite_error)?;let mut out=Vec::new();let mut last=None;let mut scanned=0;
+        while let Some(row)=rows.next().map_err(super::sqlite_error)?{if scanned==cap{return Ok((out,last));}scanned+=1;let prefix:String=row.get(0).map_err(super::sqlite_error)?;let owner:Option<String>=row.get(1).map_err(super::sqlite_error)?;let epoch=super::read_u64(row,2).map_err(super::sqlite_error)?;let closed:bool=row.get(3).map_err(super::sqlite_error)?;last=Some(prefix.clone());if closed&&let Some(owner)=owner.filter(|owner|owner.starts_with("remove-v1:")){af::parse_removal_owner(&owner)?;out.push((ObjectPrefix::new(prefix)?,owner,epoch));}}
+        Ok((out,None))
+    })})}
+    fn rebind_writer<'a>(&'a self,prefix:&'a ObjectPrefix,expected_epoch:u64)->PlatformFuture<'a,Result<WriteFence>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|{require_transfer_epoch(conn,prefix,None,expected_epoch,false)?;Ok(WriteFence::new(prefix.clone(),expected_epoch))}))})}
+    fn gate_info<'a>(&'a self,prefix:&'a ObjectPrefix)->PlatformFuture<'a,Result<GateInfo>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|Self::gate_info_conn(conn,prefix)))})}
+    fn admit_reader<'a>(&'a self,prefix:&'a ObjectPrefix,id:&'a str,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|{
+        let info=Self::gate_info_conn(conn,prefix)?;if info.state!=GateState::Open{return Err(af::gate_closed_error(prefix));}let expires=ts::now_secs().saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));
+        conn.execute("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) VALUES (?,?,?,?) ON CONFLICT(prefix,reader_id) DO UPDATE SET epoch=excluded.epoch,expires_at=excluded.expires_at",rusqlite::params![prefix.as_ref().trim_end_matches('/'),id,i64::try_from(info.epoch).map_err(|_|NarouError::Platform("gate epoch exceeds SQLite integer range".into()))?,expires]).map_err(super::sqlite_error)?;
+        Ok(GateLease{reader_id:id.into(),epoch:info.epoch,expires_at:expires})
+    }))})}
+    fn renew_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|{
+        require_transfer_epoch(conn,prefix,None,lease.epoch,false)?;let now=ts::now_secs();let expires=now.saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));
+        let changed=conn.execute("UPDATE novel_reader_leases SET expires_at=? WHERE prefix=? AND reader_id=? AND epoch=? AND expires_at>?",rusqlite::params![expires,prefix.as_ref().trim_end_matches('/'),lease.reader_id,i64::try_from(lease.epoch).map_err(|_|af::gate_epoch_error(prefix,lease.epoch,u64::MAX))?,now]).map_err(super::sqlite_error)?;if changed!=1{return Err(af::gate_closed_error(prefix));}
+        Ok(GateLease{reader_id:lease.reader_id.clone(),epoch:lease.epoch,expires_at:expires})
+    }))})}
+    fn release_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease)->PlatformFuture<'a,Result<()>>{Box::pin(async move{run_scoped_blocking(||{
+        let epoch=i64::try_from(lease.epoch).map_err(|_|af::gate_epoch_error(prefix,lease.epoch,u64::MAX))?;
+        // Original-lease release drains the authority that still knows the
+        // token: the SQL row AND a durable FS gate entry an SQL→FS adoption
+        // imported — both under the prefix's OS transfer lock, so a release
+        // racing an adoption can never leave a live lease on the other side.
+        // The delete qualifies the exact (reader_id, epoch) the token was
+        // admitted at: drain stays legal after close advanced the gate
+        // epoch, a stale token cannot touch a same-reader-id lease
+        // re-admitted at a newer epoch, and a missing/already-released row
+        // is idempotent.
+        self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
+            self.conn.lock().execute("DELETE FROM novel_reader_leases WHERE prefix=? AND reader_id=? AND epoch=?",rusqlite::params![prefix.as_ref().trim_end_matches('/'),lease.reader_id,epoch]).map_err(super::sqlite_error)?;
+            self.mirror.release_reader_locked(prefix,lease)
+        })
+    })})}
+    fn close_gate<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str)->PlatformFuture<'a,Result<u64>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|{
+        let info=Self::gate_info_conn(conn,prefix)?;if info.state==GateState::Closed{if info.owner.as_deref()==Some(owner){return Ok(info.epoch);}return Err(af::gate_owner_error(prefix,info.owner.as_deref().unwrap_or("")));}
+        let next=info.epoch.checked_add(1).filter(|value|*value<=i64::MAX as u64).ok_or_else(||NarouError::Platform("gate epoch overflow".into()))?;
+        conn.execute("UPDATE novel_access_gates SET closed=1,owner=?,epoch=?,updated_at=? WHERE prefix=?",rusqlite::params![owner,next as i64,ts::now_secs(),prefix.as_ref().trim_end_matches('/')]).map_err(super::sqlite_error)?;Ok(next)
+    }))})}
+    fn renew_gate<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64)->PlatformFuture<'a,Result<()>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|{
+        require_transfer_epoch(conn,prefix,Some(owner),epoch,false)?;conn.execute("UPDATE novel_access_gates SET updated_at=? WHERE prefix=?",rusqlite::params![ts::now_secs(),prefix.as_ref().trim_end_matches('/')]).map_err(super::sqlite_error)?;Ok(())
+    }))})}
+    fn open_gate<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64)->PlatformFuture<'a,Result<()>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|{
+        require_transfer_epoch(conn,prefix,Some(owner),epoch,false)?;let clear_origin=owner.starts_with("remove-v1:")&&af::parse_removal_owner(owner)?.1;conn.execute("UPDATE novel_access_gates SET closed=0,owner=NULL,updated_at=?1,origin_url_fold=CASE WHEN ?3 THEN '' ELSE origin_url_fold END WHERE prefix=?2",rusqlite::params![ts::now_secs(),prefix.as_ref().trim_end_matches('/'),clear_origin]).map_err(super::sqlite_error)?;Ok(())
+    }))})}
+    fn commit_staged<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,stage:&'a ObjectKey,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
+        if !prefix.matches(key)||!crate::platform::is_reserved_key(stage){return Err(NarouError::Platform("invalid fenced install namespace".into()));}
+        run_scoped_blocking(||self.with_publication_transaction(prefix,owner,epoch,|conn|self.install_reference(conn,stage,key)))
+    })}
+    fn remove_committed<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey,sha:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{run_scoped_blocking(||self.with_publication_transaction(prefix,owner,epoch,|conn|{
+        if !prefix.matches(key){return Err(NarouError::Platform("rollback key outside novel".into()));}
+        let proof:Option<(String,String,String)>=conn.query_row("SELECT blob_key,blob_generation,sha256 FROM transfer_object_refs WHERE object_key=? AND backend='d1'",[key.as_ref()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(super::sqlite_error)?;
+        let Some((physical,generation,current))=proof else{let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM objects WHERE object_key=?)",[key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;if exists{return Err(NarouError::Platform("rollback canonical reference proof missing".into()));}return Ok(());};
+        if !current.eq_ignore_ascii_case(sha){return Err(NarouError::Platform("recovery fingerprint conflict".into()));}
+        let actual:Option<String>=conn.query_row("SELECT generation FROM objects WHERE object_key=?",[&physical],|row|row.get(0)).optional().map_err(super::sqlite_error)?;
+        if actual.as_deref()!=Some(generation.as_str()){return Err(NarouError::Platform("recovery generation conflict".into()));}
+        if self.mirror_files{self.mirror.remove_verified_file(key,sha)?;}
+        conn.execute("DELETE FROM transfer_object_refs WHERE object_key=? AND blob_generation=?",rusqlite::params![key.as_ref(),generation]).map_err(super::sqlite_error)?;Ok(())
+    }))})}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::ObjectPrefix;
+    use crate::native::object_store::NativeStore;
+
+    #[test]
+    fn transfer_db_append_rewind_seal_is_durable_and_crc_correct(){
+        let root=tempfile::tempdir().unwrap();let conn=crate::native::sqlite::open_in_memory().unwrap();
+        let store=SqliteObjectStore::with_mirror_files(conn.clone(),NativeObjectStore::from_root(root.path().to_owned()).unwrap(),false);
+        futures::executor::block_on(async{
+            store.stage_open("durable","owner",9,30).await.unwrap();let first=store.stage_append("durable","owner",9,0,b"abc",false).await.unwrap();
+            store.stage_append("durable","owner",9,3,b"tail",true).await.unwrap();
+            let reopened=SqliteObjectStore::with_mirror_files(conn,NativeObjectStore::from_root(root.path().to_owned()).unwrap(),false);
+            reopened.stage_rewind("durable","owner",9,&StageCursor::from_sha_checkpoint(3,first.hash_state)).await.unwrap();
+            reopened.stage_append("durable","owner",9,3,b"def",true).await.unwrap();let sha=hex::encode(sha2::Sha256::digest(b"abcdef"));let sealed=reopened.stage_seal("durable","owner",9,6,&sha).await.unwrap();
+            let mut stream=reopened.read_stream(&sealed.key).await.unwrap().unwrap();let mut out=Vec::new();while let Some(chunk)=stream.next().await{out.extend_from_slice(&chunk.unwrap());}assert_eq!(out,b"abcdef");
+            assert!(reopened.stage_abort("durable","wrong",9).await.is_err());
+        });
+    }
+    #[test]
+    fn transfer_db_stream_aborts_when_generation_changes(){
+        let root=tempfile::tempdir().unwrap();let conn=crate::native::sqlite::open_in_memory().unwrap();let store=SqliteObjectStore::with_mirror_files(conn,NativeObjectStore::from_root(root.path().to_owned()).unwrap(),false);
+        futures::executor::block_on(async{
+            let key=ObjectKey::try_new("novels/site/book/large.bin").unwrap();let bytes=vec![1;192*1024];store.write_stream(&key,Box::pin(futures::stream::once(async move{Ok(bytes)}))).await.unwrap();
+            let mut opened=store.read_stream_range(&key,0..192*1024).await.unwrap().unwrap();assert_eq!(opened.next().await.unwrap().unwrap().len(),64*1024);
+            let replacement=vec![2;192*1024];store.write_stream(&key,Box::pin(futures::stream::once(async move{Ok(replacement)}))).await.unwrap();assert!(opened.next().await.unwrap().is_err());
+        });
+    }
+    use crate::platform::{NovelObjectKeys, ObjectPrefix, illustration_key};
     use std::num::NonZeroUsize;
 
     #[test]
@@ -1370,7 +1897,9 @@ mod tests {
             store.write_small(&keys.cached_version_marker("v1"), Vec::new()).await.unwrap();
             store.write_small(&keys.section("2", "現在"), b"current".to_vec()).await.unwrap();
             assert!(!dir.path().join("site/title").exists(), "all cache objects are DB-only");
-            let versions = read_diff_cache_catalog(&store, keys.prefix(), &[]).await.unwrap();
+            let objects:Arc<dyn ObjectStore>=Arc::new(store.clone());
+            let mut scope=crate::application::novel_access::NovelReadScope::new(&objects,"cache-catalog-test");
+            let versions = read_diff_cache_catalog(&mut scope,&store, keys.prefix(), &[]).await.unwrap();
             assert_eq!(versions.len(), 2);
             assert_eq!(versions[0].entries, vec![("2".to_string(), "保存済み".to_string())]);
             assert!(!versions[0].only_latest_update);
@@ -1381,15 +1910,79 @@ mod tests {
                 [cached.as_ref()],
             ).unwrap();
             assert!(store.read_small(&cached).await.is_err(), "exercise a real stored-payload read failure");
-            let corrupt = read_diff_cache_catalog(&store, keys.prefix(), &[]).await.unwrap();
-            assert!(corrupt[0].entries.is_empty());
-            assert!(!corrupt[0].only_latest_update, "failed I/O cannot become an empty version");
+            assert!(read_diff_cache_catalog(&mut scope,&store,keys.prefix(),&[]).await.is_err(),"stored CRC errors must not be mistaken for an empty cache version");
             for key in plan_diff_cache_clean(&store, keys.prefix()).await.unwrap() {
                 ObjectStore::delete(&store, &key).await.unwrap();
             }
-            assert!(read_diff_cache_catalog(&store, keys.prefix(), &[]).await.unwrap().is_empty());
+            assert!(read_diff_cache_catalog(&mut scope,&store, keys.prefix(), &[]).await.unwrap().is_empty());
+            scope.release_all().await.unwrap();
             assert_eq!(store.read_small(&keys.section("2", "現在")).await.unwrap().unwrap(), b"current");
             assert!(!dir.path().join("site/title").exists(), "catalog/clean must not materialize DB-only files");
+        });
+    }
+
+    #[test]
+    fn gate_authority_roundtrips_between_filesystem_and_sql(){
+        let root=tempfile::tempdir().unwrap();let conn=crate::native::sqlite::open_in_memory().unwrap();
+        let mirror=NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let store=SqliteObjectStore::with_mirror_files(conn.clone(),mirror.clone(),false);
+        let prefix=ObjectPrefix::new("novels/site/book/").unwrap();
+        futures::executor::block_on(async{
+            // FS gate opens at epoch 0; a live reader lease exists pre-cutover.
+            mirror.rebind_writer(&prefix,0).await.unwrap();
+            let lease=mirror.admit_reader(&prefix,"rd",60).await.unwrap();
+            // FS→SQL adoption: SQL row at epoch+1, lease imported, gate migrated.
+            mirror.adopt_fs_gate_locked(&prefix,&conn.lock()).unwrap();
+            let (closed,epoch,origin)=crate::native::object_store::read_namespace_gate_locked(root.path(),&conn.lock(),prefix.as_ref().trim_end_matches('/')).unwrap().unwrap();
+            assert_eq!((closed,epoch,origin.as_str()),(false,1,""));
+            // Old FS token dead; SQL rebind works at the advanced epoch.
+            assert!(mirror.rebind_writer(&prefix,0).await.is_err());
+            store.rebind_writer(&prefix,1).await.unwrap();
+            // SQL→FS adoption: FS gate at sql_epoch+1, row+leases deleted.
+            store.adopt_sql_gate_locked(&prefix).unwrap();
+            assert!(store.rebind_writer(&prefix,1).await.is_err());
+            let (closed,epoch,_)=crate::native::object_store::read_namespace_gate_locked(root.path(),&conn.lock(),prefix.as_ref().trim_end_matches('/')).unwrap().unwrap();
+            assert_eq!((closed,epoch),(false,2));
+            // The imported lease counts as a live reader; stale-token release
+            // stays idempotent and clears the drain.
+            assert_eq!(mirror.gate_info(&prefix).await.unwrap().pending_readers,1);
+            mirror.release_reader(&prefix,&lease).await.unwrap();
+            assert_eq!(mirror.gate_info(&prefix).await.unwrap().pending_readers,0);
+            mirror.release_reader(&prefix,&lease).await.unwrap();
+            mirror.rebind_writer(&prefix,2).await.unwrap();
+            // Re-adoption FS→SQL: epoch advances again, reverse handoff cleared.
+            mirror.adopt_fs_gate_locked(&prefix,&conn.lock()).unwrap();
+            assert!(crate::native::object_store::read_fs_gate_handoff_raw(&conn.lock(),prefix.as_ref().trim_end_matches('/')).unwrap().is_none());
+            let (_,epoch,_)=crate::native::object_store::read_namespace_gate_locked(root.path(),&conn.lock(),prefix.as_ref().trim_end_matches('/')).unwrap().unwrap();
+            assert_eq!(epoch,3);
+            // Idempotent re-runs: proven re-adoption + already-adopted reverse.
+            mirror.adopt_fs_gate_locked(&prefix,&conn.lock()).unwrap();
+            store.adopt_sql_gate_locked(&prefix).unwrap();
+            store.adopt_sql_gate_locked(&prefix).unwrap();
+            let (_,epoch,_)=crate::native::object_store::read_namespace_gate_locked(root.path(),&conn.lock(),prefix.as_ref().trim_end_matches('/')).unwrap().unwrap();
+            assert_eq!(epoch,4);
+        });
+    }
+
+    #[test]
+    fn gate_adoption_fails_closed_on_conflict_and_closed_gates(){
+        let root=tempfile::tempdir().unwrap();let conn=crate::native::sqlite::open_in_memory().unwrap();
+        let mirror=NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let store=SqliteObjectStore::with_mirror_files(conn.clone(),mirror.clone(),false);
+        let prefix=ObjectPrefix::new("novels/site/conflict/").unwrap();
+        futures::executor::block_on(async{
+            // Closed FS gate cannot migrate.
+            mirror.close_gate(&prefix,"writer").await.unwrap();
+            assert!(mirror.adopt_fs_gate_locked(&prefix,&conn.lock()).is_err());
+            mirror.open_gate(&prefix,"writer",1).await.unwrap();
+            // A competing un-proven SQL row blocks adoption.
+            conn.lock().execute("INSERT INTO novel_access_gates(prefix,epoch,closed,updated_at) VALUES(?1,99,0,0)",[prefix.as_ref().trim_end_matches('/')]).unwrap();
+            assert!(mirror.adopt_fs_gate_locked(&prefix,&conn.lock()).is_err());
+            conn.lock().execute("DELETE FROM novel_access_gates WHERE prefix=?1",[prefix.as_ref().trim_end_matches('/')]).unwrap();
+            // Closed SQL gate cannot migrate either.
+            mirror.adopt_fs_gate_locked(&prefix,&conn.lock()).unwrap();
+            store.close_gate(&prefix,"writer").await.unwrap();
+            assert!(store.adopt_sql_gate_locked(&prefix).is_err());
         });
     }
 
@@ -1436,79 +2029,36 @@ mod tests {
         let page = futures::executor::block_on(ObjectStore::list_page(&store, &request)).unwrap();
         assert_eq!(page.objects.len(), 1);
 
-        // 必要なときだけ実体化し、返したパスを消せば元に戻る。
-        let prefix = ObjectKey::try_new("novels/site/title").unwrap();
-        let novel_dir = dir.path().join("site/title");
-        let scope = crate::native::materialization::MaterializationScope::acquire(dir.path(), &novel_dir).unwrap();
-        let written = store.materialize_into(&novel_dir, &prefix, &scope).unwrap();
-        assert_eq!(written, vec![mirrored.clone()]);
-        assert!(mirrored.is_file());
-        drop(scope);
-        assert!(!mirrored.exists());
+        let prefix=ObjectPrefix::new("novels/site/title").unwrap();
+        futures::executor::block_on(async{let lease=store.admit_reader(&prefix,"db-only",30).await.unwrap();let mut stream=store.read_stream_leased(&prefix,&lease,&key,0..u64::MAX).await.unwrap().unwrap();assert_eq!(stream.next().await.unwrap().unwrap(),b"body");assert!(stream.next().await.is_none());store.release_reader(&prefix,&lease).await.unwrap();});
+        assert!(!mirrored.exists(),"leased reads must not materialize canonical paths");
     }
 
     #[test]
-    fn materialize_reads_past_a_full_page_of_skipped_illustrations() {
-        let (dir, mut store) = temp_store();
-        store.mirror_files = false;
-        let prefix = ObjectKey::try_new("novels/site/title").unwrap();
-        // Illustrations sort before 本文 and fill the entire first page.
-        for index in 0..4096 {
-            let key = prefix
-                .join("挿絵")
-                .unwrap()
-                .join(format!("{index:04}.png"))
-                .unwrap();
-            store.write_blocking(&key, b"image").unwrap();
-        }
-        let body = prefix.join("本文").unwrap().join("1 body.yaml").unwrap();
-        store.write_blocking(&body, b"body").unwrap();
-        let existing = prefix.join("本文").unwrap().join("2 existing.yaml").unwrap();
-        store.write_blocking(&existing, b"stored").unwrap();
-        let novel_dir = dir.path().join("site/title");
-        let existing_path = novel_dir.join("本文/2 existing.yaml");
-        std::fs::create_dir_all(existing_path.parent().unwrap()).unwrap();
-        std::fs::write(&existing_path, b"keep local").unwrap();
-
-        let scope = crate::native::materialization::MaterializationScope::acquire(dir.path(), &novel_dir).unwrap();
-        let written = store.materialize_into(&novel_dir, &prefix, &scope).unwrap();
-        let body_path = novel_dir.join("本文/1 body.yaml");
-        assert_eq!(written, vec![body_path.clone()]);
-        assert_eq!(std::fs::read(&body_path).unwrap(), b"body");
-        assert!(!novel_dir.join("挿絵").exists());
-        let guard = crate::native::object_store::MaterializedNovelFiles::from_paths(written, scope);
-        drop(guard);
-        assert!(!body_path.exists());
-        assert_eq!(std::fs::read(&existing_path).unwrap(), b"keep local");
+    fn leased_reads_page_past_illustrations_without_materializing(){
+        let(dir,mut store)=temp_store();store.mirror_files=false;let prefix=ObjectKey::try_new("novels/site/title").unwrap();
+        let keys=NovelObjectKeys::new("site","title",false).unwrap();
+        for index in 0..4096{store.write_blocking(&illustration_key(&prefix,&format!("{index:04}.png")).unwrap(),b"image").unwrap();}
+        let body=keys.section("1","body");store.write_blocking(&body,b"body").unwrap();
+        let existing=dir.path().join("site/title/本文/2 existing.yaml");std::fs::create_dir_all(existing.parent().unwrap()).unwrap();std::fs::write(&existing,b"keep local").unwrap();
+        futures::executor::block_on(async{
+            let prefix=ObjectPrefix::from(prefix);let lease=store.admit_reader(&prefix,"paged",30).await.unwrap();let mut request=ObjectListRequest::new(prefix.clone(),NonZeroUsize::new(100).unwrap());let mut found=false;
+            loop{let page=store.list_page(&request).await.unwrap();for metadata in page.objects{if metadata.key==body{let mut stream=store.read_stream_leased(&prefix,&lease,&body,0..u64::MAX).await.unwrap().unwrap();assert_eq!(stream.next().await.unwrap().unwrap(),b"body");assert!(stream.next().await.is_none());found=true;}}
+                match page.next_cursor{Some(cursor)=>request=request.after(cursor),None=>break}
+            }assert!(found);store.release_reader(&prefix,&lease).await.unwrap();
+        });
+        assert!(!dir.path().join("site/title/本文/1 body.yaml").exists());assert!(!dir.path().join("site/title/挿絵").exists());assert_eq!(std::fs::read(existing).unwrap(),b"keep local");
     }
 
     #[test]
-    fn materialized_inputs_do_not_own_new_conversion_outputs() {
-        let (dir, mut store) = temp_store();
-        store.mirror_files = false;
-        let prefix = ObjectKey::try_new("novels/site/title").unwrap();
-        for relative in [
-            "toc.yaml", "本文/1 body.yaml", "setting.ini", "replace.txt",
-            "converter.yaml", ".illustration_cache.yaml", "novel.txt", "Book.epub", "cover.png",
-        ] {
-            let key = ObjectKey::try_new(format!("{prefix}/{relative}")).unwrap();
-            store.write_blocking(&key, b"stored").unwrap();
-        }
-        let novel_dir = dir.path().join("site/title");
-        let scope = crate::native::materialization::MaterializationScope::acquire(dir.path(), &novel_dir).unwrap();
-        let written = store.materialize_into(&novel_dir, &prefix, &scope).unwrap();
-        for relative in ["toc.yaml", "本文/1 body.yaml", "setting.ini", "replace.txt", "converter.yaml", ".illustration_cache.yaml", "cover.png"] {
-            assert_eq!(std::fs::read(novel_dir.join(relative)).unwrap(), b"stored");
-        }
-        for output in ["novel.txt", "Book.epub"] {
-            std::fs::write(novel_dir.join(output), b"new conversion output").unwrap();
-        }
-        drop(crate::native::object_store::MaterializedNovelFiles::from_paths(written, scope));
-        for output in ["novel.txt", "Book.epub"] {
-            assert_eq!(std::fs::read(novel_dir.join(output)).unwrap(), b"new conversion output");
-        }
-        assert!(!novel_dir.join("toc.yaml").exists());
-        assert!(!novel_dir.join("本文/1 body.yaml").exists());
+    fn leased_inputs_leave_existing_conversion_outputs_untouched(){
+        let(dir,mut store)=temp_store();store.mirror_files=false;let prefix=ObjectKey::try_new("novels/site/title").unwrap();
+        let keys=NovelObjectKeys::new("site","title",false).unwrap();
+        let inputs=[keys.toc(),keys.section("1","body"),keys.setting(),keys.replace(),prefix.join("converter.yaml").unwrap(),keys.illustration_cache(),prefix.join("cover.png").unwrap()];
+        for key in&inputs{store.write_blocking(key,b"stored").unwrap();}
+        let novel_dir=dir.path().join("site/title");std::fs::create_dir_all(&novel_dir).unwrap();for output in ["novel.txt","Book.epub"]{std::fs::write(novel_dir.join(output),b"new conversion output").unwrap();}
+        futures::executor::block_on(async{let scope=ObjectPrefix::from(prefix.clone());let lease=store.admit_reader(&scope,"inputs",30).await.unwrap();for key in&inputs{let mut stream=store.read_stream_leased(&scope,&lease,key,0..u64::MAX).await.unwrap().unwrap();assert_eq!(stream.next().await.unwrap().unwrap(),b"stored");assert!(stream.next().await.is_none());}store.release_reader(&scope,&lease).await.unwrap();});
+        for output in ["novel.txt","Book.epub"]{assert_eq!(std::fs::read(novel_dir.join(output)).unwrap(),b"new conversion output");}for key in&inputs{let logical=key.as_ref().strip_prefix("novels/").unwrap_or(key.as_ref());assert!(!dir.path().join(logical).exists());}
     }
 
     #[test]
@@ -2124,5 +2674,307 @@ mod tests {
                 "novels/site/小説2/fs-only.yaml".to_string(),
             ]
         );
+    }
+
+    /// require_transfer_epoch must reject every stale epoch/wrong owner/wrong
+    /// gate state through the actual mutation entry points, not just reads.
+    #[test]
+    fn transfer_epoch_validation_rejects_stale_owner_epoch_and_wrong_state(){
+        let root=tempfile::tempdir().unwrap();let conn=crate::native::sqlite::open_in_memory().unwrap();
+        let store=SqliteObjectStore::with_mirror_files(conn,NativeObjectStore::from_root(root.path().to_owned()).unwrap(),false);
+        let prefix=ObjectPrefix::new("novels/site/epoch/").unwrap();
+        let key=ObjectKey::try_new("novels/site/epoch/toc.yaml").unwrap();
+        futures::executor::block_on(async{
+            store.rebind_writer(&prefix,0).await.unwrap();
+            // Stale epoch on an OPEN gate must fail before any row is touched.
+            assert!(store.rebind_writer(&prefix,9).await.is_err());
+            let lease=store.admit_reader(&prefix,"rd",60).await.unwrap();
+            let epoch=store.close_gate(&prefix,"publication").await.unwrap();
+            // A wrong owner cannot renew, reopen, mutate or release the gate.
+            assert!(store.renew_gate(&prefix,"intruder",epoch).await.is_err());
+            assert!(store.open_gate(&prefix,"intruder",epoch).await.is_err());
+            let stage_id="epoch-install";store.stage_open(stage_id,"publication",epoch,30).await.unwrap();store.stage_append(stage_id,"publication",epoch,0,b"x",true).await.unwrap();
+            let sha=hex::encode(sha2::Sha256::digest(b"x"));let stage=store.stage_seal(stage_id,"publication",epoch,1,&sha).await.unwrap();
+            assert!(store.commit_staged(&prefix,"intruder",epoch,&stage.key,&key).await.is_err());
+            // A stale epoch fails even for the true owner.
+            assert!(store.commit_staged(&prefix,"publication",epoch+1,&stage.key,&key).await.is_err());
+            assert!(store.open_gate(&prefix,"publication",epoch+1).await.is_err());
+            // The gate stays closed on owner+epoch until its reader drains.
+            assert!(store.commit_staged(&prefix,"publication",epoch,&stage.key,&key).await.is_err());
+            store.release_reader(&prefix,&lease).await.unwrap();
+            store.commit_staged(&prefix,"publication",epoch,&stage.key,&key).await.unwrap();
+            store.open_gate(&prefix,"publication",epoch).await.unwrap();
+            assert_eq!(store.read_small(&key).await.unwrap().unwrap(),b"x");
+        });
+    }
+
+    /// After a committed SQL→FS handoff, no SQL-side path may revive the
+    /// namespace: default-row creation, reader admission, rebind and writer
+    /// close all fail closed while the FS gate serves the original tokens.
+    #[test]
+    fn revived_default_row_cannot_reopen_after_reverse_handoff(){
+        let root=tempfile::tempdir().unwrap();let conn=crate::native::sqlite::open_in_memory().unwrap();
+        let mirror=NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let store=SqliteObjectStore::with_mirror_files(conn.clone(),mirror.clone(),false);
+        let prefix=ObjectPrefix::new("novels/site/revive/").unwrap();
+        futures::executor::block_on(async{
+            store.rebind_writer(&prefix,0).await.unwrap();
+            store.adopt_sql_gate_locked(&prefix).unwrap();
+            // The durable handoff retires every SQL token: no SQL path may
+            // create a fresh epoch-0 row or serve the deleted one.
+            assert!(store.gate_info(&prefix).await.is_err());
+            assert!(store.admit_reader(&prefix,"late",60).await.is_err());
+            assert!(store.rebind_writer(&prefix,0).await.is_err());
+            assert!(store.rebind_writer(&prefix,1).await.is_err());
+            assert!(store.close_gate(&prefix,"ghost").await.is_err());
+            // The FS gate is the single live authority for this prefix.
+            mirror.rebind_writer(&prefix,1).await.unwrap();
+            mirror.admit_reader(&prefix,"rd",60).await.unwrap();
+            assert_eq!(mirror.gate_info(&prefix).await.unwrap().epoch,1);
+        });
+    }
+
+    /// Releasing a reader through the ORIGINAL backend drains the lease from
+    /// the authority that actually owns it: FS tokens clear their imported
+    /// SQL row, SQL tokens clear their imported FS gate entry.
+    #[test]
+    fn original_backend_release_drains_imported_leases_both_ways(){
+        let _guard=crate::test_support::global_state_guard();
+        let root=tempfile::tempdir().unwrap();
+        let narou_dir=root.path().join(".narou");std::fs::create_dir_all(&narou_dir).unwrap();
+        crate::native::sqlite::state::write_mode(&narou_dir,crate::native::sqlite::state::StorageMode::Sqlite).unwrap();
+        let handle=crate::native::sqlite::state::active_for(&narou_dir).expect("sqlite state");
+        // The mirror must live under the library's archive root so the FS
+        // release path resolves this same `.narou` handle.
+        let mirror=NativeObjectStore::from_root(root.path().join(crate::downloader::types::ARCHIVE_ROOT_DIR)).unwrap();
+        let store=SqliteObjectStore::with_mirror_files(handle.conn_ref().clone(),mirror.clone(),false);
+        let prefix=ObjectPrefix::new("novels/site/drain/").unwrap();
+        futures::executor::block_on(async{
+            // FS→SQL: the original FS release drains the imported SQL row.
+            let fs_lease=mirror.admit_reader(&prefix,"fs-rd",300).await.unwrap();
+            mirror.adopt_fs_gate_locked(&prefix,&handle.conn_ref().lock()).unwrap();
+            {let count:i64=handle.conn_ref().lock().query_row("SELECT count(*) FROM novel_reader_leases WHERE prefix=?1",[prefix.as_ref().trim_end_matches('/')],|row|row.get(0)).unwrap();assert_eq!(count,1);}
+            mirror.release_reader(&prefix,&fs_lease).await.unwrap();
+            {let count:i64=handle.conn_ref().lock().query_row("SELECT count(*) FROM novel_reader_leases WHERE prefix=?1",[prefix.as_ref().trim_end_matches('/')],|row|row.get(0)).unwrap();assert_eq!(count,0,"original FS release must drain the imported SQL lease");}
+            // SQL→FS: the original SQL release drains the imported FS entry.
+            let sql_lease=store.admit_reader(&prefix,"sql-rd",300).await.unwrap();
+            store.adopt_sql_gate_locked(&prefix).unwrap();
+            assert_eq!(mirror.gate_info(&prefix).await.unwrap().pending_readers,1);
+            store.release_reader(&prefix,&sql_lease).await.unwrap();
+            assert_eq!(mirror.gate_info(&prefix).await.unwrap().pending_readers,0,"original SQL release must drain the imported FS lease");
+            // The stale SQL token can never renew against the live FS gate.
+            assert!(store.renew_reader(&prefix,&sql_lease,60).await.is_err());
+        });
+    }
+
+    /// Crash boundaries of SQL→FS adoption: an uncommitted intent is rolled
+    /// back by the startup sweep (journal orphan removed, SQL row stays the
+    /// single authority); a committed intent is finalized from its durable
+    /// journal exactly once.
+    #[test]
+    fn startup_sweep_rolls_back_orphans_and_finalizes_committed_handoffs(){
+        let root=tempfile::tempdir().unwrap();let conn=crate::native::sqlite::open_in_memory().unwrap();
+        let mirror=NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let store=SqliteObjectStore::with_mirror_files(conn.clone(),mirror.clone(),false);
+        let rollback=ObjectPrefix::new("novels/site/rollback/").unwrap();
+        let resume=ObjectPrefix::new("novels/site/resume/").unwrap();
+        futures::executor::block_on(async{
+            store.rebind_writer(&rollback,0).await.unwrap();
+            store.rebind_writer(&resume,0).await.unwrap();
+        });
+        // Orphan journal: fabricated pending gate with NO recorded intent —
+        // the sweep must delete it and keep the SQL row authoritative.
+        let orphan=FsGate{prefix:Some(rollback.as_ref().trim_end_matches('/').to_owned()),origin_url_fold:String::new(),content_revision:0,epoch:1,owner:None,updated_at:0,migrated:false,readers:std::collections::BTreeMap::new()};
+        mirror.install_pending_gate_locked(&rollback,&orphan).unwrap();
+        // Abandoned intent: the in-tx half ran but the transaction rolled
+        // back — SQL stays authoritative and the journal orphan is retired.
+        {let conn_lock=conn.lock();let tx=rusqlite::Transaction::new_unchecked(&conn_lock,rusqlite::TransactionBehavior::Immediate).unwrap();
+            let gate=adopt_sql_gate_tx(&mirror,&tx,&resume).unwrap();
+            assert!(gate.is_some());tx.rollback().unwrap();}
+        assert!(mirror.read_pending_gate_locked(&resume).unwrap().is_some(),"rolled-back intent leaves its durable journal for the sweep");
+        {let row:bool=conn.lock().query_row("SELECT EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix=?1)",[resume.as_ref().trim_end_matches('/')],|row|row.get(0)).unwrap();assert!(row,"rollback restores the SQL row");}
+        // Startup recovery.
+        reconcile_namespace_gate_authority(&mirror,&conn).unwrap();
+        // Orphan removed, SQL row still the only authority.
+        assert!(mirror.read_pending_gate_locked(&rollback).unwrap().is_none());
+        {let row:bool=conn.lock().query_row("SELECT EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix=?1)",[rollback.as_ref().trim_end_matches('/')],|row|row.get(0)).unwrap();assert!(row);}
+        futures::executor::block_on(async{store.rebind_writer(&rollback,0).await.unwrap();});
+        // The rolled-back intent's journal was swept too: the SQL row stays
+        // the single authority.
+        assert!(mirror.read_pending_gate_locked(&resume).unwrap().is_none());
+        {let row:bool=conn.lock().query_row("SELECT EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix=?1)",[resume.as_ref().trim_end_matches('/')],|row|row.get(0)).unwrap();assert!(row,"the rolled-back intent leaves the SQL row the single authority");}
+        futures::executor::block_on(async{store.rebind_writer(&resume,0).await.unwrap();});
+    }
+
+    /// A committed SQL→FS intent whose transaction deleted the row (crash
+    /// before finalize) completes from its durable journal — the FS gate is
+    /// installed at the recorded epoch and the journal retired.
+    #[test]
+    fn startup_sweep_completes_committed_handoff_from_journal(){
+        let root=tempfile::tempdir().unwrap();let conn=crate::native::sqlite::open_in_memory().unwrap();
+        let mirror=NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let store=SqliteObjectStore::with_mirror_files(conn.clone(),mirror.clone(),false);
+        let prefix=ObjectPrefix::new("novels/site/journal/").unwrap();
+        futures::executor::block_on(async{
+            store.rebind_writer(&prefix,0).await.unwrap();
+            let lease=store.admit_reader(&prefix,"rd",300).await.unwrap();
+            // Commit the intent + journal + row/lease deletes as one unit —
+            // the durable crash state between COMMIT and canonical install.
+            store.adopt_sql_gate_locked(&prefix).unwrap();
+            // Fabricate the crash: intent committed, canonical missing,
+            // journal still present is impossible after a clean adopt —
+            // rebuild it from the recorded tuple to test finalize itself.
+            let Some((sql_epoch,fs_epoch,origin))=crate::native::object_store::read_fs_gate_handoff_raw(&conn.lock(),prefix.as_ref().trim_end_matches('/')).unwrap()else{panic!("handoff must be recorded")};
+            assert_eq!((sql_epoch,fs_epoch,origin.as_str()),(0,1,""));
+            assert!(store.release_reader(&prefix,&lease).await.is_ok());
+        });
+        // Simulate the pre-finalize crash: pending journal exists and no
+        // canonical file — resolve must finalize it.
+        std::fs::remove_file(mirror.gate_path(&prefix).unwrap()).unwrap();
+        let journal=FsGate{prefix:Some(prefix.as_ref().trim_end_matches('/').to_owned()),origin_url_fold:String::new(),content_revision:0,epoch:1,owner:None,updated_at:0,migrated:false,readers:std::collections::BTreeMap::new()};
+        mirror.install_pending_gate_locked(&prefix,&journal).unwrap();
+        reconcile_namespace_gate_authority(&mirror,&conn).unwrap();
+        assert!(mirror.read_pending_gate_locked(&prefix).unwrap().is_none());
+        {let row:bool=conn.lock().query_row("SELECT EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix=?1)",[prefix.as_ref().trim_end_matches('/')],|row|row.get(0)).unwrap();assert!(!row,"the retired SQL row must stay deleted");}
+        futures::executor::block_on(async{
+            assert_eq!(mirror.gate_info(&prefix).await.unwrap().epoch,1);
+            mirror.rebind_writer(&prefix,1).await.unwrap();
+            assert!(store.rebind_writer(&prefix,1).await.is_err());
+        });
+        // Second sweep is idempotent.
+        reconcile_namespace_gate_authority(&mirror,&conn).unwrap();
+    }
+
+    /// Crash window between the FS→SQL commit and the migrated-marker write:
+    /// every FS-side admission path must honor the committed handoff via the
+    /// live SQL authority, heal the marker, and reject stale FS tokens — no
+    /// startup sweep required.
+    #[test]
+    fn committed_handoff_without_marker_rejects_all_fs_admission(){
+        let root=tempfile::tempdir().unwrap();
+        let narou_dir=root.path().join(".narou");
+        let state=crate::native::sqlite::state::configure(&narou_dir).unwrap();
+        crate::native::sqlite::state::write_mode(&narou_dir,crate::native::sqlite::state::StorageMode::Sqlite).unwrap();
+        let mirror=NativeObjectStore::from_root(root.path().join(crate::downloader::types::ARCHIVE_ROOT_DIR)).unwrap();
+        let store=SqliteObjectStore::with_mirror_files(state.conn_ref().clone(),mirror.clone(),false);
+        let prefix=ObjectPrefix::new("novels/site/lost-marker/").unwrap();
+        let key=ObjectKey::try_new("novels/site/lost-marker/toc.yaml").unwrap();
+        futures::executor::block_on(async{
+            mirror.rebind_writer(&prefix,0).await.unwrap();
+            let lease=mirror.admit_reader(&prefix,"rd",300).await.unwrap();
+            mirror.write_small(&key,b"title: t\n".to_vec()).await.unwrap();
+            // COMMIT the adoption but suppress the migrated marker: the
+            // durable post-commit/pre-marker crash state.
+            {let conn=state.conn_ref().lock();let tx=rusqlite::Transaction::new_unchecked(&conn,rusqlite::TransactionBehavior::Immediate).unwrap();
+                tx.execute("INSERT INTO novel_access_gates(prefix,epoch,closed,owner,updated_at,content_revision,origin_url_fold) VALUES('novels/site/lost-marker',1,0,NULL,unixepoch(),0,'')",[]).unwrap();
+                tx.execute("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) VALUES('novels/site/lost-marker','rd',0,99999999)",[]).unwrap();
+                crate::native::object_store::record_sql_gate_handoff(&tx,"novels/site/lost-marker",0,1,"").unwrap();
+                tx.commit().unwrap();}
+            // The file still claims live authority — every mutation lane
+            // must refuse it through the live SQL consult.
+            assert!(mirror.rebind_writer(&prefix,0).await.is_err());
+            assert!(mirror.write_small(&key,b"title: x\n".to_vec()).await.is_err());
+            // Drain stays legal but heals the marker.
+            mirror.release_reader(&prefix,&lease).await.unwrap();
+            let gate:FsGate=serde_json::from_slice(&std::fs::read(mirror.gate_path(&prefix).unwrap()).unwrap()).unwrap();
+            assert!(gate.migrated,"the release consult must heal the lost marker");
+            // The stale imported epoch-0 token cannot revoke the lease a
+            // reader re-admitted under the live SQL gate: release only ever
+            // drops the exact (reader_id, epoch) row it was admitted at.
+            let fresh=store.admit_reader(&prefix,"stale-proof",60).await.unwrap();
+            store.release_reader(&prefix,&lease).await.unwrap();
+            let alive:bool=state.conn_ref().lock().query_row("SELECT EXISTS(SELECT 1 FROM novel_reader_leases WHERE prefix=?1 AND reader_id='stale-proof' AND epoch=1)",[prefix.as_ref().trim_end_matches('/')],|row|row.get(0)).unwrap();
+            assert!(alive,"stale epoch-0 release must not delete the epoch-1 row");
+            store.renew_reader(&prefix,&fresh,60).await.unwrap();
+            // SQL authority is whole and owns the namespace now.
+            store.rebind_writer(&prefix,1).await.unwrap();
+        });
+    }
+
+    /// `for_narou_root` must converge a crashed SQLite->Yaml flip before the
+    /// store variant is chosen. Uncommitted barrier tx (yaml marker + intent
+    /// file, no `yaml_pending` row, orphan `.gate.pending` journal): restore
+    /// the sqlite marker, keep the live SQL row, drain the orphan journal —
+    /// the FS side never gains authority.
+    #[test]
+    fn for_narou_root_reverts_uncommitted_cutover_flip(){
+        let root=tempfile::tempdir().unwrap();
+        let narou_dir=root.path().join(".narou");
+        let state=crate::native::sqlite::state::configure(&narou_dir).unwrap();
+        crate::native::sqlite::state::write_mode(&narou_dir,crate::native::sqlite::state::StorageMode::Sqlite).unwrap();
+        let mirror=NativeObjectStore::from_root(root.path().join(crate::downloader::types::ARCHIVE_ROOT_DIR)).unwrap();
+        let store=SqliteObjectStore::with_mirror_files(state.conn_ref().clone(),mirror.clone(),false);
+        let prefix=ObjectPrefix::new("novels/site/flip/").unwrap();
+        futures::executor::block_on(async{store.rebind_writer(&prefix,0).await.unwrap();});
+        // Fabricate the crashed flip: intent file + Yaml marker + orphan
+        // journal, but no committed yaml_pending and no fs_gate_handoffs.
+        let journal=FsGate{prefix:Some(prefix.as_ref().trim_end_matches('/').to_owned()),origin_url_fold:String::new(),content_revision:0,epoch:1,owner:None,updated_at:0,migrated:false,readers:std::collections::BTreeMap::new()};
+        mirror.install_pending_gate_locked(&prefix,&journal).unwrap();
+        std::fs::write(narou_dir.join(".cutover-yaml-intent"),"sqlite-to-yaml").unwrap();
+        crate::native::sqlite::state::write_mode(&narou_dir,crate::native::sqlite::state::StorageMode::Yaml).unwrap();
+        let resolved=NativeStore::for_narou_root(root.path()).unwrap();
+        assert!(matches!(resolved,NativeStore::Sqlite(_)),"uncommitted flip must restore SQLite authority");
+        assert_eq!(crate::native::sqlite::state::read_mode(&narou_dir),crate::native::sqlite::state::StorageMode::Sqlite);
+        assert!(!narou_dir.join(".cutover-yaml-intent").exists());
+        assert!(mirror.read_pending_gate_locked(&prefix).unwrap().is_none(),"orphan journal must be rolled back");
+        {let row:bool=state.conn_ref().lock().query_row("SELECT EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix='novels/site/flip' AND closed=0)",[],|row|row.get(0)).unwrap();assert!(row,"the live SQL row stays the single authority");}
+        futures::executor::block_on(async{
+            // The FS gate never existed; stale FS admission stays absent and
+            // SQL authority is whole.
+            store.rebind_writer(&prefix,0).await.unwrap();
+        });
+    }
+
+    /// Committed barrier tx (yaml marker + intent + `yaml_pending` row +
+    /// recorded fs_gate_handoffs + pending journal, canonical FS gate never
+    /// installed): `for_narou_root` keeps Yaml and finalizes the canonical
+    /// gate from the journal — FS authority resumes exactly once.
+    #[test]
+    fn for_narou_root_finalizes_committed_cutover_flip(){
+        let root=tempfile::tempdir().unwrap();
+        let narou_dir=root.path().join(".narou");
+        let state=crate::native::sqlite::state::configure(&narou_dir).unwrap();
+        crate::native::sqlite::state::write_mode(&narou_dir,crate::native::sqlite::state::StorageMode::Sqlite).unwrap();
+        let mirror=NativeObjectStore::from_root(root.path().join(crate::downloader::types::ARCHIVE_ROOT_DIR)).unwrap();
+        let prefix=ObjectPrefix::new("novels/site/flip/").unwrap();
+        futures::executor::block_on(async{mirror.rebind_writer(&prefix,0).await.unwrap();});
+        // Fabricate the committed flip: handoff recorded, row deleted,
+        // yaml_pending committed, canonical FS gate still missing.
+        {let conn=state.conn_ref().lock();let tx=rusqlite::Transaction::new_unchecked(&conn,rusqlite::TransactionBehavior::Immediate).unwrap();
+            tx.execute("CREATE TABLE IF NOT EXISTS cutover_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID",[]).unwrap();
+            crate::native::object_store::record_fs_gate_handoff(&tx,"novels/site/flip",0,1,"").unwrap();
+            tx.execute("DELETE FROM novel_access_gates WHERE prefix='novels/site/flip'",[]).unwrap();
+            tx.execute("INSERT OR REPLACE INTO cutover_meta(key,value) VALUES('yaml_pending','1')",[]).unwrap();
+            tx.commit().unwrap();}
+        let journal=FsGate{prefix:Some(prefix.as_ref().trim_end_matches('/').to_owned()),origin_url_fold:String::new(),content_revision:0,epoch:1,owner:None,updated_at:0,migrated:false,readers:std::collections::BTreeMap::new()};
+        mirror.install_pending_gate_locked(&prefix,&journal).unwrap();
+        std::fs::remove_file(mirror.gate_path(&prefix).unwrap()).unwrap();
+        std::fs::write(narou_dir.join(".cutover-yaml-intent"),"sqlite-to-yaml").unwrap();
+        crate::native::sqlite::state::write_mode(&narou_dir,crate::native::sqlite::state::StorageMode::Yaml).unwrap();
+        let resolved=NativeStore::for_narou_root(root.path()).unwrap();
+        assert!(matches!(resolved,NativeStore::Fs(_)),"committed flip keeps filesystem authority");
+        assert_eq!(crate::native::sqlite::state::read_mode(&narou_dir),crate::native::sqlite::state::StorageMode::Yaml);
+        assert!(!narou_dir.join(".cutover-yaml-intent").exists());
+        assert!(mirror.read_pending_gate_locked(&prefix).unwrap().is_none(),"journal finalized into the canonical gate");
+        futures::executor::block_on(async{
+            // The finalized FS gate serves the namespace at fs_epoch 1.
+            mirror.rebind_writer(&prefix,1).await.unwrap();
+        });
+    }
+
+    /// Zero-gate library variant of the interrupted flip: marker=yaml +
+    /// intent, no committed evidence and no gate files at all — the marker
+    /// restores to sqlite and nothing else is touched.
+    #[test]
+    fn for_narou_root_reverts_flip_with_no_gates(){
+        let root=tempfile::tempdir().unwrap();
+        let narou_dir=root.path().join(".narou");
+        let _state=crate::native::sqlite::state::configure(&narou_dir).unwrap();
+        std::fs::write(narou_dir.join(".cutover-yaml-intent"),"sqlite-to-yaml").unwrap();
+        crate::native::sqlite::state::write_mode(&narou_dir,crate::native::sqlite::state::StorageMode::Yaml).unwrap();
+        let resolved=NativeStore::for_narou_root(root.path()).unwrap();
+        assert!(matches!(resolved,NativeStore::Sqlite(_)),"uncommitted flip must restore SQLite authority");
+        assert_eq!(crate::native::sqlite::state::read_mode(&narou_dir),crate::native::sqlite::state::StorageMode::Sqlite);
+        assert!(!narou_dir.join(".cutover-yaml-intent").exists());
     }
 }

@@ -22,6 +22,7 @@ pub mod http;
 /// `connect()` socket fallback). Byte-oriented and platform-neutral.
 pub mod http1;
 pub(crate) mod id_allocator;
+pub mod job_owner;
 pub mod mocks;
 pub mod object_store;
 pub mod progress;
@@ -36,11 +37,33 @@ pub mod s3_sigv4;
 pub mod s3_store;
 pub mod split_store;
 pub mod staging;
+
+/// Durable, resumable staged uploads in the `.narou-transfer/` namespace:
+/// ordered appends with a persisted `sha2` hash checkpoint, seal/abort,
+/// owner-bound leases and owner-based reclamation. Transfer stage objects
+/// are never touched by the `.narou-staging/` TTL collector.
+pub mod transfer_stage;
+
+/// Per-novel reader/writer access fence (`NovelContentAccess`): admission
+/// close happens before reader drain, renewals reuse the admission CAS, and
+/// canonical commits are epoch-guarded. Identified by `ObjectPrefix`, not
+/// OS paths.
+pub mod access_fence;
 pub mod store_migration;
 pub mod url_policy;
 
 pub use asset_reader::AssetReader;
 pub use staging::StagedAsset;
+pub use job_owner::JobExecutionOwner;
+pub use access_fence::{
+    GateInfo, GateLease, GateState, WriteFence, NovelAccessFence, READER_LEASE_SECS, membership_digest,
+};
+pub use staging::{is_reserved_key, is_staging_key, is_transfer_key};
+pub use transfer_stage::{
+    HASH_CHECKPOINT_ALG, SealedAsset, StageCursor, StageLease, StageLeaseState,
+    STAGE_APPEND_MAX, TRANSFER_PREFIX, TransferStageStore, WriteOnce,
+    decode_sha_state, encode_sha_state, stage_data_key, stage_ledger_key,
+};
 pub use clock::{Clock, SystemClock};
 pub use cookie_store::{
     CookieStore, DecodedGroups, HostCookie, LoginGroup, apply_set_cookie, cookie_host_for_url,
@@ -73,7 +96,7 @@ pub use repository::{
 };
 pub use split_store::{SplitStore, is_illustration_key};
 pub use store_migration::{
-    IllustrationDedupState, StoreMigrationState, deduplicate_illustrations_page, migrate_page,
+    IllustrationDedupState, StoreMigrationState, deduplicate_illustrations_page_with_source, migrate_page,
 };
 pub use url_policy::{is_safe_public_ip, validate_url_syntax};
 

@@ -12,6 +12,9 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+#[path = "../scripts/transfer-artifacts.rs"]
+mod transfer_artifacts;
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -58,6 +61,29 @@ fn main() {
     fs::write(&out_path, emitted).unwrap_or_else(|error| {
         panic!("cannot write generated site bundle {}: {error}", out_path.display())
     });
+    emit_transfer_identity(&manifest_dir);
+}
+
+fn emit_transfer_identity(manifest_dir: &std::path::Path) {
+    println!("cargo:rerun-if-env-changed=NAROU_RS_REQUIRE_TRANSFER_ARTIFACTS");
+    let root = manifest_dir.parent().expect("worker_entry is a workspace member");
+    match transfer_artifacts::load(&root.join("target/transfer-artifacts")) {
+        Ok(artifacts) => {
+            println!("cargo:rustc-env=NAROU_TRANSFER_BUILD_ID={}", artifacts.build_id);
+            println!("cargo:rustc-env=NAROU_TRANSFER_ABI_VERSION={}", artifacts.abi_version);
+        }
+        Err(error) => {
+            let required = env::var("PROFILE").as_deref() == Ok("release")
+                || env::var("NAROU_RS_REQUIRE_TRANSFER_ARTIFACTS")
+                    .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"));
+            if required {
+                panic!("transfer artifacts unavailable: {error}; run `node build_assets.mjs` before worker-build");
+            }
+            println!("cargo:warning=transfer artifacts unavailable: {error}");
+            println!("cargo:rustc-env=NAROU_TRANSFER_BUILD_ID=");
+            println!("cargo:rustc-env=NAROU_TRANSFER_ABI_VERSION=0");
+        }
+    }
 }
 
 /// Emit `content` as a raw string literal, choosing a delimiter that cannot

@@ -195,6 +195,10 @@ impl AssetStore for ReaderAssetStore {
         self.inner.read_range(key, range)
     }
 
+    fn read_stream_range<'a>(&'a self, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        self.inner.read_stream_range(key, range)
+    }
+
     fn stage_stream<'a>(
         &'a self,
         stream: AssetStream,

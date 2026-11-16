@@ -169,14 +169,14 @@ impl LibraryService {
         &self,
         id: crate::platform::NovelId,
     ) -> Result<Option<NovelRecord>, ApplicationError> {
-        self.novels.get(id).await.map_err(ApplicationError::platform)
+        self.novels.get_current(id).await.map_err(ApplicationError::platform)
     }
     pub async fn find_by_toc_url(
         &self,
         url: &str,
     ) -> Result<Option<NovelRecord>, ApplicationError> {
         self.novels
-            .find_by_toc_url(url)
+            .find_by_toc_url_current(url)
             .await
             .map_err(ApplicationError::platform)
     }
@@ -243,7 +243,7 @@ impl LibraryService {
     }
     pub async fn records(&self) -> Result<Vec<NovelRecord>, ApplicationError> {
         self.novels
-            .query(&NovelQuery::page(
+            .query_current(&NovelQuery::page(
                 NovelFilter::all(),
                 NovelSort::by(crate::platform::NovelSortKey::Id),
                 0,
@@ -290,7 +290,7 @@ impl LibraryService {
             ..NovelFilter::default()
         };
         self.novels
-            .query(&NovelQuery::page(
+            .query_current(&NovelQuery::page(
                 filter,
                 NovelSort::by(crate::platform::NovelSortKey::Id),
                 0,
@@ -307,6 +307,7 @@ impl LibraryService {
     /// row with frozen status and the new-arrival marker.
     pub async fn list(
         &self,
+        scope: &mut crate::application::novel_access::NovelReadScope,
         request: &LibraryListRequest,
     ) -> Result<LibraryPage, ApplicationError> {
         let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
@@ -326,60 +327,58 @@ impl LibraryService {
         let (records_total, records_filtered, records) = self
             .list_records(filter, sort, request.start, request.length)
             .await?;
-
-        let now = self.clock.now_utc();
-        let default_timezone = site_timezone(Some(DEFAULT_SITE_TIMEZONE));
-
-        let mut data = Vec::with_capacity(records.len());
-        for record in records {
-            let timezone = self
-                .record_site_timezone(&record, default_timezone)
-                .await
-                .unwrap_or(default_timezone);
-            let is_new = is_new_arrivals_marker(
-                record.new_arrivals_date,
-                record.last_update,
-                now,
-                timezone,
-            );
-            let is_frozen =
-                record_is_frozen(&record, Some(&frozen_ids), FreezeReadMode::InventoryOrTag);
-            let display_url = record.display_url().to_string();
-            let attribute_tag = request.attribute_tags_enabled.then(|| record.attribute_tag().map(str::to_owned)).flatten();
-            let mut tags: Vec<String> = record.tags.into_iter()
-                .filter(|tag| !crate::virtual_novel::is_internal_tag(tag))
-                .collect();
-            if let Some(tag) = attribute_tag {
-                tags.push(tag);
-            }
-            data.push(NovelSummary {
-                id: record.id,
-                title: record.title,
-                author: record.author,
-                sitename: record.sitename,
-                novel_type: record.novel_type,
-                end: record.end,
-                last_update: record.last_update,
-                general_lastup: record.general_lastup,
-                last_check_date: record.last_check_date,
-                new_arrivals_date: record.new_arrivals_date,
-                tags,
-                new_arrivals: is_new,
-                frozen: is_frozen,
-                suspend: record.suspend,
-                length: record.length,
-                toc_url: record.toc_url,
-                ncode: record.ncode,
-                display_url,
-                general_all_no: record.general_all_no,
-            });
+        let admitted = crate::application::novel_content::NovelContentService::read_discovered_records_from(self.novels.as_ref(), scope, &records).await?;
+        let mut current = Vec::with_capacity(records.len());
+        for (original, record) in records.into_iter().zip(admitted) {
+            let record = record.ok_or_else(|| ApplicationError::platform(crate::error::NarouError::Platform("novel_busy: library row disappeared during admission".into())))?;
+            if record != original { return Err(ApplicationError::platform(crate::error::NarouError::Platform("novel_busy: library selection changed during admission".into()))); }
+            current.push(record);
         }
+
+        let data = self.summarize_records_with_frozen(current, request.attribute_tags_enabled, &frozen_ids).await;
 
         Ok(LibraryPage {
             records_total,
             records_filtered,
             data,
         })
+    }
+
+    /// Project already-admitted authoritative records with the same native and
+    /// Worker timezone, freeze and attribute rules as the ordinary list.
+    pub async fn summarize_records(
+        &self,
+        records: Vec<NovelRecord>,
+        attribute_tags_enabled: bool,
+    ) -> Result<Vec<NovelSummary>, ApplicationError> {
+        let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
+        Ok(self.summarize_records_with_frozen(records, attribute_tags_enabled, &frozen_ids).await)
+    }
+
+    async fn summarize_records_with_frozen(
+        &self, records: Vec<NovelRecord>, attribute_tags_enabled: bool, frozen_ids: &HashSet<i64>,
+    ) -> Vec<NovelSummary> {
+        let now = self.clock.now_utc();
+        let default_timezone = site_timezone(Some(DEFAULT_SITE_TIMEZONE));
+        let mut data = Vec::with_capacity(records.len());
+        for record in records {
+            let timezone = self.record_site_timezone(&record, default_timezone).await.unwrap_or(default_timezone);
+            let is_new = is_new_arrivals_marker(record.new_arrivals_date, record.last_update, now, timezone);
+            let is_frozen = record_is_frozen(&record, Some(frozen_ids), FreezeReadMode::InventoryOrTag);
+            let display_url = record.display_url().to_string();
+            let attribute_tag = attribute_tags_enabled.then(|| record.attribute_tag().map(str::to_owned)).flatten();
+            let mut tags: Vec<String> = record.tags.into_iter().filter(|tag| !crate::virtual_novel::is_internal_tag(tag)).collect();
+            if let Some(tag) = attribute_tag { tags.push(tag); }
+            data.push(NovelSummary {
+                id: record.id, title: record.title, author: record.author, sitename: record.sitename,
+                novel_type: record.novel_type, end: record.end, last_update: record.last_update,
+                general_lastup: record.general_lastup, last_check_date: record.last_check_date,
+                new_arrivals_date: record.new_arrivals_date, tags, new_arrivals: is_new, frozen: is_frozen,
+                suspend: record.suspend, length: record.length, toc_url: record.toc_url, ncode: record.ncode,
+                display_url, general_all_no: record.general_all_no,
+            });
+        }
+        data
     }
 
     /// Fetch one page of records with a caller-built filter.
@@ -398,7 +397,7 @@ impl LibraryService {
     ) -> Result<(u64, u64, Vec<NovelRecord>), ApplicationError> {
         let unrestricted = filter.is_unrestricted();
         let query = NovelQuery::page(filter.clone(), sort, start, length.unwrap_or(usize::MAX));
-        let records = self.novels.query(&query);
+        let records = self.novels.query_current(&query);
         if start == 0 && length.is_none() {
             if unrestricted {
                 let records = records.await.map_err(ApplicationError::platform)?;
@@ -763,6 +762,16 @@ mod tests {
         )
     }
 
+    fn list(service: &LibraryService, request: &LibraryListRequest) -> Result<LibraryPage, ApplicationError> {
+        let objects: Arc<dyn crate::platform::ObjectStore> = Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+        let mut scope = crate::application::novel_access::NovelReadScope::new(&objects, "library-test");
+        futures::executor::block_on(async {
+            let result = service.list(&mut scope, request).await;
+            let released = scope.release_all().await.map_err(ApplicationError::platform);
+            match result { Ok(value) => { released?; Ok(value) }, Err(error) => Err(error) }
+        })
+    }
+
     fn request(search: Option<&str>, start: usize, length: Option<usize>) -> LibraryListRequest {
         LibraryListRequest {
             search: search.map(str::to_string),
@@ -826,16 +835,15 @@ mod tests {
             Arc::new(FakeClock::default()),
         );
         for query in ["https://ncode.syosetu.com/n1980en/", "n1980en", "42"] {
-            let page =
-                futures::executor::block_on(service.list(&request(Some(query), 0, None))).unwrap();
+            let page = list(&service, &request(Some(query), 0, None)).unwrap();
             assert_eq!(page.records_filtered, 1, "query={query}");
             assert_eq!(page.data[0].id, 42, "query={query}");
         }
-        let page = futures::executor::block_on(service.list(&request(
+        let page = list(&service, &request(
             Some("16818093084718034215"),
             0,
             None,
-        )))
+        ))
         .unwrap();
         assert_eq!(page.records_filtered, 1);
         assert_eq!(page.data[0].id, 43);
@@ -883,7 +891,7 @@ mod tests {
             (1, Some(2), vec![2, 3]), (0, None, vec![1, 2, 3, 4, 5]),
             (1, None, vec![2, 3, 4, 5]), (0, Some(0), vec![]), (usize::MAX, None, vec![]),
         ] {
-            let page = futures::executor::block_on(service.list(&request(None, start, length))).unwrap();
+            let page = list(&service, &request(None, start, length)).unwrap();
             assert_eq!(page.records_total, 5);
             assert_eq!(page.records_filtered, 5);
             assert_eq!(page.data.iter().map(|record| record.id).collect::<Vec<_>>(), expected);
@@ -975,7 +983,7 @@ mod tests {
         let repo = Arc::new(MemoryNovelRepository::from_records(records));
         let service = service(repo, Arc::new(FakeClock::default()));
 
-        let page = futures::executor::block_on(service.list(&request(Some("novel 2"), 0, None)))
+        let page = list(&service, &request(Some("novel 2"), 0, None))
             .unwrap();
         assert_eq!(page.records_total, 3);
         assert_eq!(page.records_filtered, 1);
@@ -990,7 +998,7 @@ mod tests {
         let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
         let service = service(repo, Arc::new(FakeClock::default()));
 
-        let page = futures::executor::block_on(service.list(&request(None, 0, None))).unwrap();
+        let page = list(&service, &request(None, 0, None)).unwrap();
         assert_eq!(page.data.len(), 1);
         assert!(page.data[0].frozen);
     }
@@ -1067,7 +1075,7 @@ mod tests {
         let clock = Arc::new(FakeClock(AtomicI64::new(now.timestamp())));
         let service = service(repo, clock);
 
-        let page = futures::executor::block_on(service.list(&request(None, 0, None))).unwrap();
+        let page = list(&service, &request(None, 0, None)).unwrap();
         assert_eq!(page.data.len(), 1);
         assert!(page.data[0].new_arrivals);
     }
@@ -1082,7 +1090,7 @@ mod tests {
         let clock = Arc::new(FakeClock(AtomicI64::new(now.timestamp())));
         let service = service(repo, clock);
 
-        let page = futures::executor::block_on(service.list(&request(None, 0, None))).unwrap();
+        let page = list(&service, &request(None, 0, None)).unwrap();
         assert_eq!(page.data.len(), 1);
         assert!(!page.data[0].new_arrivals);
     }

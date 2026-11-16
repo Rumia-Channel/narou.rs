@@ -1677,3 +1677,109 @@ li.enable-selected.disabled a {
 .transfer-progress-detail {
   color: var(--text-muted);
 }
+
+.transfer-select-summary {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.transfer-select-note {
+  font-size: 0.9em;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.transfer-profile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--transfer-role-gap, 0.4em);
+  margin: 0.5em 0;
+}
+.transfer-profile-option {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4em;
+  flex-wrap: wrap;
+  cursor: pointer;
+}
+.transfer-profile-detail {
+  flex-basis: 100%;
+  margin-left: 1.5em;
+  font-size: 0.85em;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.transfer-role-list {
+  max-height: var(--transfer-role-list-max-height, 18em);
+  overflow-y: auto;
+  border: 0.0625em solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 0.5em;
+  display: flex;
+  flex-direction: column;
+  gap: var(--transfer-role-gap, 0.4em);
+}
+.transfer-role-row {
+  display: flex;
+}
+.transfer-role-row.transfer-role-blocked .transfer-role-text strong {
+  color: var(--btn-danger-bg);
+}
+.transfer-role-label {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4em;
+  cursor: pointer;
+}
+.transfer-role-label:has(input:disabled) {
+  cursor: default;
+}
+.transfer-role-text {
+  display: flex;
+  flex-direction: column;
+}
+.transfer-role-detail {
+  font-size: 0.85em;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.transfer-role-reason {
+  color: var(--btn-warning-bg);
+}
+.transfer-role-total {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2em;
+  border-top: 0.0625em solid var(--border-color);
+  padding-top: 0.4em;
+  font-size: 0.9em;
+}
+.transfer-progress-overlay {
+  z-index: var(--transfer-progress-layer);
+}
+.transfer-choice-overlay {
+  z-index: var(--transfer-choice-layer);
+}
+.transfer-choice-overlay .modal-dialog {
+  max-width: var(--transfer-choice-width);
+}
+.transfer-policy-ack {
+  display: flex;
+  align-items: baseline;
+  gap: var(--transfer-role-gap);
+  padding: var(--transfer-policy-padding);
+  border: 0.0625em solid var(--btn-warning-border);
+  border-radius: var(--border-radius);
+  color: var(--text-color);
+  overflow-wrap: anywhere;
+}
+.transfer-policy-ack[hidden] {
+  display: none;
+}
+.transfer-session-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--transfer-action-gap);
+  margin-top: var(--transfer-policy-padding);
+}

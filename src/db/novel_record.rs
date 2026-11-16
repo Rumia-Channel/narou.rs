@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::de;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NovelRecord {
     pub id: i64,
     pub author: String,
@@ -79,12 +79,15 @@ impl NovelRecord {
     pub fn attribute_tag(&self) -> Option<&str> {
         self.extra_fields.get("attribute_tag")
             .and_then(serde_yaml::Value::as_str)
-            .filter(|tag| crate::application::attribute_tags::is_attribute_tag(tag))
+            .filter(|tag| crate::attribute_tag::is_attribute_tag(tag))
     }
 
     pub fn set_attribute_tag(&mut self, tag: &str) {
-        assert!(crate::application::attribute_tags::is_attribute_tag(tag));
-        self.extra_fields.insert("attribute_tag".into(), serde_yaml::Value::String(tag.into()));
+        assert!(crate::attribute_tag::is_attribute_tag(tag));
+        self.extra_fields.insert(
+            "attribute_tag".to_string(),
+            serde_yaml::Value::String(tag.to_string()),
+        );
     }
 
     pub fn average_length(&self) -> i64 {

@@ -327,6 +327,7 @@ preprocess: |-
     let result = downloader.download_novel_with_execution_options("http://example.com/n1234ab/",
         narou_rs::downloader::DownloadExecutionOptions {
             force: false, budget: None, resume_from_section: None,
+            access: None, creation_reservation: None,
         },
     ).await;
     finished.store(true, Ordering::Release);

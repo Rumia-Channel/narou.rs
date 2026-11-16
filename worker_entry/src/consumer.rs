@@ -286,12 +286,20 @@ async fn load_update_record(
     runtime: &WorkerRuntime,
     target: &JobTarget,
 ) -> Result<Option<narou_rs::db::NovelRecord>> {
-    match target {
-        JobTarget::Id(id) => runtime.novels.get(*id).await,
-        JobTarget::Ncode(ncode) => runtime.novels.find_by_ncode(ncode).await,
-        JobTarget::Url(url) => runtime.novels.find_by_toc_url(url).await,
-        JobTarget::All => Ok(None),
-    }
+    let id = match target {
+        JobTarget::Id(id) => Some(*id),
+        JobTarget::Ncode(ncode) => runtime.novels.find_by_ncode(ncode).await?.map(|record| record.id.into()),
+        JobTarget::Url(url) => runtime.novels.find_by_toc_url(url).await?.map(|record| record.id.into()),
+        JobTarget::All => None,
+    };
+    let Some(id) = id else { return Ok(None); };
+    let content = narou_rs::application::NovelContentService::new(runtime.novels.clone(), runtime.write_objects());
+    let mut scope = content.read_scope("update-admission");
+    let record = content.read_record(&mut scope, id).await.map_err(|error| NarouError::Platform(error.to_string()));
+    let released = scope.release_all().await;
+    let record = record?;
+    released?;
+    Ok(record)
 }
 
 
@@ -316,15 +324,24 @@ async fn process_discrete(
         }
     } else { (None, None) };
     let virtual_update = update_record.as_ref().is_some_and(narou_rs::virtual_novel::is_virtual_record);
-    if record_error.is_none() && job.kind != JobKind::Convert && !virtual_update && downloader.is_none() {
-        *downloader = Some(runtime.new_downloader(&job.target).await?);
+    let mut prepared_writer = None;
+    let mut setup_error = record_error;
+    if setup_error.is_none() && job.kind != JobKind::Convert && !virtual_update {
+        let prepared = async {
+            let checkpoint = runtime.ledger.execution_checkpoint(&job_id).await?;
+            runtime.new_downloader(&job.target, checkpoint.as_ref().and_then(|checkpoint| checkpoint.write_origin.as_ref())).await
+        }.await;
+        match prepared {
+            Ok((value, writer)) => { *downloader = Some(value); prepared_writer = writer; }
+            Err(error) => setup_error = Some(error),
+        }
     }
     let target = match &job.target {
         JobTarget::Id(id) => Cow::Owned(id.0.to_string()),
         JobTarget::Ncode(value) | JobTarget::Url(value) => Cow::Borrowed(value.as_str()),
         JobTarget::All => Cow::Borrowed("*"),
     };
-    let (site_key, admission_error) = if let Some(error) = record_error {
+    let (site_key, admission_error) = if let Some(error) = setup_error {
         (None, Some(error))
     } else if !virtual_update && matches!(job.kind, JobKind::Download | JobKind::Update | JobKind::AuthorCheck) {
         match downloader.as_ref().expect("acquisition downloader").site_key_for_target(&target, update_record.as_ref()).await {
@@ -339,7 +356,12 @@ async fn process_discrete(
             execution_token,
             checkpoint,
         } => (execution_token, checkpoint),
-        JobClaim::AlreadyTerminal | JobClaim::Unknown => {
+        JobClaim::AlreadyTerminal => {
+            advance_terminal_creation(runtime, &job_id).await?;
+            message.ack();
+            return Ok(());
+        }
+        JobClaim::Unknown => {
             message.ack();
             return Ok(());
         }
@@ -351,6 +373,10 @@ async fn process_discrete(
             return Ok(());
         }
     };
+    // Move the actual claim token into one immutable owner. Every writer and
+    // reservation in this invocation retains this same Arc, never a new token.
+    let job_owner = std::sync::Arc::new(narou_rs::platform::JobExecutionOwner::new(job_id.as_str(), execution_token));
+    let execution_token = job_owner.execution_token();
 
     // 開始通知: キュー表示の更新だけを送る。native はここで echo 行を出さず
     // CLI 子プロセスの出力が流れるだけなので、worker でも合成の開始行は
@@ -370,14 +396,15 @@ async fn process_discrete(
     } else if job.kind == JobKind::Convert {
         // Convert は保存済みデータだけを見るので Downloader を使わない。
         // コンソール行は PushHubSink を内側で install/drain する。
-        crate::convert::execute_convert(runtime, job, push).await
+        crate::convert::execute_convert(runtime, job, &job_id, std::sync::Arc::clone(&job_owner), checkpoint.as_ref(), push).await
     } else {
         execute_job(
             downloader.as_mut().expect("acquisition downloader"),
             job,
             crate::executor::JobExecution {
                 job_id: &job_id, checkpoint: checkpoint.as_ref(),
-                execution_token: &execution_token, update_record: update_record.as_ref(),
+                owner: std::sync::Arc::clone(&job_owner), update_record: update_record.as_ref(),
+                prepared_writer,
             },
             runtime,
             push,
@@ -401,6 +428,7 @@ async fn process_discrete(
                 settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
+            advance_terminal_creation(runtime, &job_id).await?;
             broadcast_terminal_events(
                 push,
                 &job_id,
@@ -426,6 +454,7 @@ async fn process_discrete(
                 settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
+            advance_terminal_creation(runtime, &job_id).await?;
             broadcast_terminal_events(
                 push,
                 &job_id,
@@ -485,6 +514,7 @@ async fn process_discrete(
                 settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
+            advance_terminal_creation(runtime, &job_id).await?;
             console_log!("job {job_id} blocked: {reason}");
             broadcast_failure(runtime, push, &job_id, &reason).await;
             message.ack();
@@ -504,6 +534,7 @@ async fn process_discrete(
                 settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
+            advance_terminal_creation(runtime, &job_id).await?;
             console_log!("job {job_id} failed permanently: {reason}");
             broadcast_failure(runtime, push, &job_id, &reason).await;
             message.ack();
@@ -549,6 +580,7 @@ async fn process_discrete(
                     message.retry_with_options(&options);
                 }
                 Ok(RetryDisposition::Exhausted) => {
+                    advance_terminal_creation(runtime, &job_id).await?;
                     broadcast_failure(runtime, push, &job_id, &reason).await;
                     message.ack();
                 }
@@ -586,6 +618,7 @@ async fn settle_user_cancel(
     if !cancelled || !runtime.ledger.finish_cancelled(job_id, execution_token).await? {
         return Err(error);
     }
+    advance_terminal_creation(runtime, job_id).await?;
     console_log!("job {job_id} was cancelled by the user while running");
     broadcast_terminal_events(
         push,
@@ -596,6 +629,30 @@ async fn settle_user_cancel(
     .await;
     message.ack();
     Ok(())
+}
+
+/// The terminal CAS comes first: a superseded physical executor must never
+/// free the reservation still owned by another continuation of the same job.
+/// Keep the exact checkpoint until release succeeds so cron can finish after
+/// a lost response or isolate crash. `false` means durable cancellation still
+/// awaits physical stop or closed cleanup, never namespace/numeric release.
+pub(crate) async fn advance_terminal_creation(runtime: &WorkerRuntime, job_id: &JobId) -> Result<bool> {
+    let Some((raw, eligible)) = runtime.ledger.terminal_creation_checkpoint(job_id).await? else { return Ok(true); };
+    if !eligible { return Ok(false); }
+    let checkpoint: narou_rs::application::WorkerExecutionCheckpoint = serde_json::from_str(&raw)
+        .map_err(|error| NarouError::Platform(format!("terminal creation checkpoint for {job_id} is corrupt: {error}")))?;
+    if checkpoint.job_id != *job_id || (checkpoint.write_origin.is_none()
+        && (checkpoint.phase != narou_rs::application::ExecutionPhase::Planned || checkpoint.next_section_index.is_some())) {
+        return Err(NarouError::Platform(format!("terminal creation checkpoint ownership for {job_id} is invalid")));
+    }
+    let (id, generation) = checkpoint.creation_reservation.ok_or_else(|| NarouError::Platform(format!("terminal creation checkpoint for {job_id} has no reservation")))?;
+    match runtime.novels.release_id(narou_rs::platform::NovelIdReservation::new(id, generation)).await {
+        Ok(()) => {},
+        Err(NarouError::CreationCleanupPending) => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    runtime.ledger.clear_terminal_creation_checkpoint(job_id, &raw).await?;
+    Ok(true)
 }
 
 /// `queue_failed` + コンソール echo — Blocked / Permanent / リトライ枯渇・

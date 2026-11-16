@@ -252,6 +252,13 @@ pub fn delete_output(conn: &Connection, novel_id: i64, kind: &str) -> Result<()>
     Ok(())
 }
 
+/// Invalidate only derived projections during a transfer metadata replacement.
+/// Shared body blobs and canonical object refs are deliberately untouched.
+pub fn invalidate_transfer_projection(conn:&Connection,novel_id:i64)->Result<()>{
+    conn.execute("DELETE FROM novel_outputs WHERE novel_id=?",[novel_id]).map_err(sqlite_error)?;
+    conn.execute("DELETE FROM novel_sections WHERE novel_id=?",[novel_id]).map_err(sqlite_error)?;
+    conn.execute("DELETE FROM novel_versions WHERE novel_id=?",[novel_id]).map_err(sqlite_error)?;Ok(())
+}
 
 pub fn load_output(conn: &Connection, novel_id: i64, kind: &str) -> Result<Option<Vec<u8>>> {
     let mut statement = conn

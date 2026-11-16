@@ -14,9 +14,11 @@
 //! the queue runtime, which redelivers / dead-letters the message.
 
 use std::time::Duration;
+use std::sync::Arc;
 
 use worker::console_log;
 
+use narou_rs::application::novel_access::{NovelAccess, NovelWriteGuard};
 use narou_rs::application::{
     classify_failure, messages, ExecutionPhase, JobFailureClass, JobId, JobKind, JobPlan,
     JobTarget, WorkerExecutionCheckpoint,
@@ -25,7 +27,7 @@ use narou_rs::downloader::{
     DownloadExecutionOptions, DownloadResult, Downloader, SectionBudget, UpdateStatus,
 };
 use narou_rs::error::{NarouError, Result};
-use narou_rs::platform::{NovelId, NovelObjectKeys, NovelRepository};
+use narou_rs::platform::{JobExecutionOwner, NovelId, NovelObjectKeys, NovelRepository};
 
 use crate::budget::WorkerBudget;
 use crate::composition::WorkerRuntime;
@@ -101,6 +103,15 @@ fn resume_section_for_checkpoint(
     if checkpoint.novel_id.is_some() && checkpoint.novel_id != novel_id {
         return Err("execution checkpoint belongs to a different novel".to_string());
     }
+    if checkpoint.creation_reservation.is_some() && checkpoint.write_origin.is_none()
+        && (checkpoint.phase != ExecutionPhase::Planned || checkpoint.next_section_index.is_some()) {
+        return Err("only a pre-prefix planned creation may lack its original namespace epoch".into());
+    }
+    // A legacy cursor cannot prove which epoch produced its saved sections.
+    // Re-fetch from zero rather than bless that continuation with a new epoch.
+    if checkpoint.write_origin.is_none() {
+        return Ok(None);
+    }
     match checkpoint.phase {
         ExecutionPhase::Planned | ExecutionPhase::Finished => Ok(None),
         ExecutionPhase::Fetching | ExecutionPhase::Persisting => {
@@ -117,9 +128,10 @@ fn resume_section_for_checkpoint(
 /// Claimed execution state and metadata already read for update admission.
 pub struct JobExecution<'a> {
     pub job_id: &'a JobId,
-    pub execution_token: &'a str,
+    pub owner: Arc<JobExecutionOwner>,
     pub checkpoint: Option<&'a WorkerExecutionCheckpoint>,
     pub update_record: Option<&'a narou_rs::db::NovelRecord>,
+    pub prepared_writer: Option<NovelWriteGuard>,
 }
 
 /// Execute one job and classify the outcome.
@@ -134,7 +146,8 @@ pub async fn execute_job(
     runtime: &WorkerRuntime,
     push: &PushHubClient,
 ) -> JobOutcome {
-    let JobExecution { job_id, execution_token, checkpoint, update_record } = execution;
+    let JobExecution { job_id, owner, checkpoint, update_record, prepared_writer } = execution;
+    let execution_token = owner.execution_token();
     if let Some(reason) = unsupported_reason(job) {
         return JobOutcome::Blocked { reason };
     }
@@ -178,8 +191,38 @@ pub async fn execute_job(
         }.await;
         return match result {
             Ok(()) => JobOutcome::Succeeded,
-            Err(error) => classify_result(Err(error), job, job_id, runtime, push_sink.as_ref()).await,
+            Err(error) => classify_result(Err(error), job, runtime, push_sink.as_ref(), None).await,
         };
+    }
+
+    let novel_id = match job.target {
+        JobTarget::Id(id) => Some(id),
+        _ => None,
+    };
+    let resume_from_section = match resume_section_for_checkpoint(job_id, novel_id, checkpoint) {
+        Ok(index) => index,
+        Err(reason) => return JobOutcome::Permanent { reason },
+    };
+    // Reuse the writer prepared before metadata/hash hints. A saved checkpoint
+    // is authoritative; it can never be blessed with today's captured epoch.
+    let mut origin_guard = match (checkpoint.and_then(|saved| saved.write_origin.as_ref()), prepared_writer) {
+        (Some(origin), Some(writer)) if writer.origin() != *origin => {
+            return JobOutcome::from_error(NarouError::Platform("worker continuation writer origin changed during claim".into()));
+        }
+        (_, Some(writer)) => Some(writer),
+        (Some(origin), None) => match NovelWriteGuard::resume(runtime.write_objects(), Some(runtime.assets()), origin).await {
+            Ok(writer) => Some(writer),
+            Err(error) => return JobOutcome::from_error(error),
+        },
+        (None, None) => None,
+    };
+    if let Some(writer) = origin_guard.as_mut() {
+        if let Err(error) = writer.bind_job_owner(Arc::clone(&owner)) { return JobOutcome::from_error(error); }
+        let admission = match NovelAccess::from_writer(writer.clone(), "worker-execution-origin").await {
+            Ok(admission) => admission,
+            Err(error) => return JobOutcome::from_error(error),
+        };
+        if let Err(error) = admission.release().await { return JobOutcome::from_error(error); }
     }
 
     // The execution boundary also accepts raw series plans (persisted ledger
@@ -207,7 +250,7 @@ pub async fn execute_job(
             }
             Err(error) => {
                 sink.emit_async(messages::Stream::Stdout, &messages::indented_error(&error)).await;
-                classify_result(Err(error), job, job_id, runtime, sink.as_ref()).await
+                classify_result(Err(error), job, runtime, sink.as_ref(), None).await
             }
         };
         return outcome;
@@ -218,15 +261,6 @@ pub async fn execute_job(
         .iter()
         .any(|option| option == "--force" || option == "-f");
     let target = job.target.as_str();
-    let novel_id = match job.target {
-        JobTarget::Id(id) => Some(id),
-        _ => None,
-    };
-    let resume_from_section =
-        match resume_section_for_checkpoint(job_id, novel_id, checkpoint) {
-            Ok(index) => index,
-            Err(reason) => return JobOutcome::Permanent { reason },
-        };
 
     if !force && job.kind == JobKind::Update && let Some(record) = update_record
         && runtime.write_services().novel_actions.is_frozen(NovelId(record.id)).await
@@ -283,10 +317,10 @@ pub async fn execute_job(
     let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, &runtime.subrequests)
         .with_checkpoints(
             runtime.ledger.clone(),
-            job_id.clone(),
-            execution_token.to_string(),
+            job_id,
+            Arc::clone(&owner),
             novel_id,
-        );
+        ).with_resume_checkpoint(checkpoint);
     let result = downloader
         .download_novel_with_execution_options(
             &target,
@@ -294,6 +328,8 @@ pub async fn execute_job(
                 force,
                 budget: Some(&mut budget),
                 resume_from_section,
+                access: origin_guard.clone(),
+                creation_reservation: checkpoint.and_then(|saved| saved.creation_reservation),
             },
         )
         .await;
@@ -307,14 +343,22 @@ pub async fn execute_job(
                 "stdout",
             )])
             .await;
-            budget.drain_checkpoint_writes().await;
+            if let Err(error) = budget.drain_checkpoint_writes().await {
+                return JobOutcome::from_error(error);
+            }
+            let mut restarted = checkpoint.expect("a section resume has a durable checkpoint").clone();
+            restarted.phase = ExecutionPhase::Fetching;
+            restarted.next_section_index = Some(0);
+            if let Err(error) = runtime.ledger.restart_checkpoint(job_id, execution_token, &restarted).await {
+                return JobOutcome::from_error(error);
+            }
             budget = WorkerBudget::new(JOB_TIME_BUDGET, &runtime.subrequests)
                 .with_checkpoints(
                     runtime.ledger.clone(),
-                    job_id.clone(),
-                    execution_token.to_string(),
+                    job_id,
+                    Arc::clone(&owner),
                     novel_id,
-                );
+                ).with_resume_checkpoint(Some(&restarted));
             // Even a failure before the restarted section loop must not retain
             // the corrupt incoming cursor.
             budget.should_yield(0);
@@ -325,6 +369,10 @@ pub async fn execute_job(
                         force,
                         budget: Some(&mut budget),
                         resume_from_section: None,
+                        // A corrupt section cursor does not authorize a new
+                        // writer epoch for an already-running operation.
+                        access: origin_guard.clone(),
+                        creation_reservation: restarted.creation_reservation,
                     },
                 )
                 .await
@@ -406,9 +454,16 @@ pub async fn execute_job(
         _ => {}
     }
     // ダウンロードが更新した section hash cache を D1 へ書き戻す
-    // (強更新の判定ヒント。失敗は再 DL だけに効くのでログだけ残す)。
-    if let Err(error) = runtime.persist_pending_section_hash_cache().await {
-        console_log!("job {job_id}: section hash cache write-back failed: {error}");
+    // (強更新の判定ヒント。書き戻しは必ず当初の writer origin 経由)。
+    if let Some(origin) = budget.write_origin() {
+        let persist: Result<()> = async {
+            let mut guard = NovelWriteGuard::resume(runtime.write_objects(), Some(runtime.assets()), origin).await?;
+            guard.bind_job_owner(Arc::clone(&owner))?;
+            runtime.persist_pending_section_hash_cache(guard.fence()).await
+        }.await;
+        if let Err(error) = persist {
+            return JobOutcome::from_error(error);
+        }
     }
     // A cancellation during the last in-flight fetch must not create a new
     // Convert job (or perform post-update bookkeeping) after acquisition ends.
@@ -435,11 +490,32 @@ pub async fn execute_job(
                     next_section_index,
                     runtime.subrequests.used(),
                 ),
-                checkpoint: WorkerExecutionCheckpoint::planned(job_id.clone(), novel_id)
-                    .advance(ExecutionPhase::Fetching, Some(next_section_index as u64)),
+                checkpoint: {
+                    let Some(origin) = budget.write_origin() else {
+                        return JobOutcome::Permanent { reason: "download yielded without a durable writer origin".into() };
+                    };
+                    let mut checkpoint = WorkerExecutionCheckpoint::planned(job_id.clone(), novel_id);
+                    checkpoint.write_origin = Some(origin.clone());
+                    checkpoint.creation_reservation = budget.creation_reservation();
+                    checkpoint.phase = ExecutionPhase::Fetching;
+                    checkpoint.next_section_index = Some(next_section_index as u64);
+                    checkpoint
+                },
             }
         }
-        result => classify_result(result, job, job_id, runtime, push_sink.as_ref()).await,
+        result => {
+            let writer = match budget.write_origin() {
+                Some(origin) => match NovelWriteGuard::resume(runtime.write_objects(), Some(runtime.assets()), origin).await {
+                    Ok(mut guard) => {
+                        if let Err(error) = guard.bind_job_owner(Arc::clone(&owner)) { return JobOutcome::from_error(error); }
+                        Some(guard)
+                    },
+                    Err(error) => return JobOutcome::from_error(error),
+                },
+                None => None,
+            };
+            classify_result(result, job, runtime, push_sink.as_ref(), writer.as_ref()).await
+        },
     }
     }).await;
     // Drain every exit, including expansion, frozen and pacing-error paths.
@@ -478,37 +554,37 @@ pub(crate) async fn resolve_novel_id(novels: &dyn NovelRepository, target: &JobT
 async fn classify_result(
     result: Result<DownloadResult>,
     job: &JobPlan,
-    job_id: &JobId,
     runtime: &WorkerRuntime,
     sink: &dyn messages::MessageSink,
+    writer: Option<&NovelWriteGuard>,
 ) -> JobOutcome {
     match result {
         Ok(result) => match result.status {
             UpdateStatus::Ok | UpdateStatus::None => {
+                let Some(writer) = writer else {
+                    return JobOutcome::Permanent { reason: "download completed without a durable writer origin".into() };
+                };
                 // native `commands::update` parity: a checked update —
                 // changed or not — clears `modified`, stamps
                 // `last_check_date`, and syncs the `end` tag.
-                if job.kind == JobKind::Update
-                    && let Err(error) = runtime
-                        .services
-                        .novel_actions
-                        .record_update_check(
-                            NovelId(result.id),
-                            runtime.clock.now_utc(),
-                        )
-                        .await
-                {
-                    console_log!(
-                        "job {job_id}: post-update bookkeeping failed for novel {}: {error}",
-                        result.id
-                    );
+                if job.kind == JobKind::Update {
+                    let checked: Result<()> = async {
+                        let Some(mut record) = runtime.novels.get_current(NovelId(result.id)).await? else {
+                            return Err(NarouError::NotFound(format!("novel {} disappeared during update", result.id)));
+                        };
+                        if narou_rs::application::novel_actions::mark_update_checked(&mut record, runtime.clock.now_utc()) {
+                            runtime.novels.apply_batch_guarded(writer.fence(), vec![narou_rs::platform::NovelMutation::Upsert(record)]).await?;
+                        }
+                        Ok(())
+                    }.await;
+                    if let Err(error) = checked { return JobOutcome::from_error(error); }
                 }
                 // native `commands::{download,update}` は成功した小説を直後に
                 // 変換する (`narou download` → `narou convert`)。Worker では
                 // `/api/convert` と同じ Convert ジョブを積む。投入自体が
                 // 失敗したらジョブ全体を Retryable に倒す — 変換テキストが
                 // 無いまま「成功」で閉じないため。
-                match enqueue_followup_convert(runtime, job, &result, sink).await {
+                match enqueue_followup_convert(runtime, job, &result, sink, writer).await {
                     Ok(()) => JobOutcome::Succeeded,
                     // native は変換失敗を `convert_error_line` でユーザーへ
                     // 通知する (`commands::{download,update}` の
@@ -537,13 +613,10 @@ async fn classify_result(
                 if let Err(error) = runtime
                     .services
                     .novel_actions
-                    .mark_not_found_and_freeze(NovelId(result.id))
+                    .mark_not_found_and_freeze(match writer { Some(writer) => writer, None => return JobOutcome::Permanent { reason: "404 result has no writer origin".into() } }, NovelId(result.id))
                     .await
                 {
-                    console_log!(
-                        "job {job_id}: auto-freeze after 404 failed for novel {}: {error}",
-                        result.id
-                    );
+                    return JobOutcome::from_error(NarouError::Platform(error.to_string()));
                 }
                 JobOutcome::Permanent {
                     reason: "download failed: novel was not found or the update was refused"
@@ -567,6 +640,7 @@ async fn enqueue_followup_convert(
     job: &JobPlan,
     result: &DownloadResult,
     sink: &dyn messages::MessageSink,
+    writer: &NovelWriteGuard,
 ) -> std::result::Result<(), String> {
     // 連鎖するのは Download / Update のみ。Convert 自身がここを通らない
     // (consumer が execute_convert に分岐する) ので無限連鎖は起きない。
@@ -579,13 +653,23 @@ async fn enqueue_followup_convert(
         && (has_option(&job.options, &["--convert-only-new-arrival", "-a"])
             || convert_only_new_arrival_setting(runtime).await);
     let (convert_failure, missing_cached_text) = if !no_convert && result.status == UpdateStatus::None {
-        match runtime.novels.get(NovelId(result.id)).await {
-            Ok(Some(record)) => (
-                record.convert_failure,
-                !record.convert_failure && missing_converted_text(runtime, &record).await,
-            ),
-            _ => (false, false),
-        }
+        let mut access = NovelAccess::from_writer(writer.clone(), "followup-convert-decision").await.map_err(|error| error.to_string())?;
+        let inspected: Result<_> = async {
+            access.read()?.validate().await?;
+            let record = runtime.novels.get_current(NovelId(result.id)).await?
+                .ok_or_else(|| NarouError::NotFound(format!("novel {} disappeared before conversion", result.id)))?;
+            let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+            if keys.prefix().as_ref() != writer.prefix().as_ref().trim_end_matches('/') {
+                return Err(NarouError::Platform("followup conversion namespace changed".into()));
+            }
+            let missing = !record.convert_failure && missing_converted_text(runtime, &record).await;
+            access.read()?.validate().await?;
+            Ok((record.convert_failure, missing))
+        }.await;
+        let released = access.release().await;
+        let decision = inspected.map_err(|error| error.to_string())?;
+        released.map_err(|error| error.to_string())?;
+        decision
     } else {
         (false, false)
     };
@@ -606,11 +690,11 @@ async fn enqueue_followup_convert(
     }
 
     let outcome = runtime
-        .enqueue_plan(JobPlan {
+        .enqueue_plan_with_origin(JobPlan {
             kind: JobKind::Convert,
             target: JobTarget::Id(NovelId(result.id)),
             options: Vec::new(),
-        })
+        }, &writer.origin())
         .await
         .map_err(|error| format!("failed to enqueue convert for novel {}: {error}", result.id))?;
     if let Some(reason) = outcome.blocked {
@@ -683,6 +767,7 @@ mod tests {
             job_id.clone(),
             Some(NovelId(42)),
         )
+        .with_write_origin(narou_rs::application::novel_access::AccessOrigin { prefix: "novels/site/title".into(), epoch: 4 })
         .advance(ExecutionPhase::Fetching, Some(3));
         assert_eq!(
             resume_section_for_checkpoint(&job_id, Some(NovelId(42)), Some(&checkpoint))
@@ -698,5 +783,13 @@ mod tests {
             .unwrap_err(),
             "execution checkpoint belongs to job job-1, not other-job"
         );
+    }
+
+    #[test]
+    fn legacy_checkpoint_does_not_authorize_a_saved_section_cursor() {
+        let id = JobId("legacy-job".into());
+        let saved = WorkerExecutionCheckpoint::planned(id.clone(), Some(NovelId(42)))
+            .advance(ExecutionPhase::Fetching, Some(200));
+        assert_eq!(resume_section_for_checkpoint(&id, Some(NovelId(42)), Some(&saved)).unwrap(), None);
     }
 }

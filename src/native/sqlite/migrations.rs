@@ -24,6 +24,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (13, include_str!("migrations/0013_id_reservations.sql")),
     (14, include_str!("migrations/0014_attribute_tag.sql")),
     (15, include_str!("migrations/0015_query_indexes.sql")),
+    (16, crate::db::object_query::TRANSFER_STORAGE_SCHEMA),
 ];
 
 pub(crate) fn apply(conn: &mut Connection) -> Result<()> {
@@ -78,6 +79,15 @@ fn apply_one(conn: &mut Connection, version: i64, sql: &str) -> Result<()> {
     }
     tx.execute_batch(sql)
         .map_err(|error| NarouError::Platform(format!("sqlite migration {version}: {error}")))?;
+    if version==16{
+        let mut statement=tx.prepare("SELECT id,sitename,file_title,use_subdirectory FROM novels ORDER BY id").map_err(super::sqlite_error)?;
+        let mut rows=statement.query([]).map_err(super::sqlite_error)?;
+        while let Some(row)=rows.next().map_err(super::sqlite_error)?{let id:i64=row.get(0).map_err(super::sqlite_error)?;let site:String=row.get(1).map_err(super::sqlite_error)?;let title:String=row.get(2).map_err(super::sqlite_error)?;let subdirectory:bool=row.get(3).map_err(super::sqlite_error)?;
+            let keys=crate::platform::NovelObjectKeys::new(&site,&title,subdirectory)?;
+            tx.execute("INSERT OR IGNORE INTO novel_gate_bindings(novel_id,prefix) VALUES (?,?)",rusqlite::params![id,keys.prefix().as_ref()]).map_err(super::sqlite_error)?;
+            tx.execute("INSERT OR IGNORE INTO novel_revisions(novel_id,record_revision) VALUES (?,1)",[id]).map_err(super::sqlite_error)?;
+        }
+    }
     tx.pragma_update(None, "user_version", version)
         .map_err(|error| {
             NarouError::Platform(format!("sqlite set user_version {version}: {error}"))

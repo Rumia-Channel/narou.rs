@@ -1,5 +1,15 @@
 # narou.rs 移植状況
 
+## 最新状況: クライアント主体転送の別ブランチ実装（統合検証中・未公開）
+
+- 公開済み版の基準は調査時点の v0.6.6。ユーザーの最新指示で版数更新・リリースは中止し、develop 由来の別ブランチに commit・push する。main/develop へ統合せず、タグ・Release を作成しない。以下の旧「現況」は履歴であり、現在の公開版や新転送経路の検証結果ではない。
+- `/api/transfer/v2`、Dedicated Worker + 実 WASM、runtime/complete の通信前選別を実装・統合中。ZIP 全体 POST・サーバー ZIP/Base64 への互換フォールバックは撤去する。本文・目次・設定・挿絵索引は SQLite / D1 でも必要。raw は通常移行で除外し Worker へ新規保存しない。
+- 元の epoch・世代付き ID・実行 token・公開 journal・原子的メタデータ境界を通常の更新/変換/削除にも接続中。Native のグローバル在庫 commit だけはローカルで 8MiB 超を許容し、通信・Worker へは適用しない。
+- GitHub の旧45ブランチは統合済み祖先であることと open PR 無しを確認して削除済み。最新指示では main/develop に加えて作業ブランチ feature-client-transfer を push してよい。実装を main/develop へ統合せず、版数は 0.6.6 のまま維持する。
+- 部分検証済み: lean core89、JS/artifact42、実 Node/WASM の backpressure・SHA/size・再開・仮想メンバー・エスケープ済み大容量メタデータ、10MiB 制限の実HTTPゲート、Native SQL object-store37、export_yaml14、新しい物理名前空間の consumer 回帰1、両ライセンス再生成。統合検証は未完了: all-feature clippy に多数の指摘、yaml_cutover_guard は1200秒でタイムアウト、Worker転送は immutable pin barrier の状態判定を修正したが再実行前、content_storage は後半の取得で novel_busy。実ブラウザで168作品の選択と転送入口への到達は確認したが、ZIP完成・取込・再開の実証はまだない。Cloudflare128MiB実配備の検証も未完了。完成・リリース済みと扱わない。
+- 実 Node/WASM の逐次・検証・再開・仮想メンバー・6MiB エスケープ済みメタデータ検証が成功。別の有界 fixture で 4GiB 超の ZIP64 オフセット、4,295,032,955B のゼロ生成ファイルの圧縮・全検証・4GiB 位置からの再開も成功し、一時スクリプト/データは削除した。実ブラウザや Cloudflare の128MiB制約での証明とは区別する。
+- Native の残件は全体バックアップの control/S3参照保全、残る direct-file consumer の lease 移行、virtual URL と retained origin の原子的・回復可能な移行。SQLite snapshot 内の mode 判定は借用済み connection を使い、primary mutex を再ロックしない。Native 世代再開は実 OS liveness を再取得し、新しい ID を採番しない。これらの統合・実行確認前に公開しない。
+
 ## EPUB 配信経路と API の待ち時間（未リリース）
 
 - 通常 GET の生成器は UI / 外部 API / ブラウザ API で共通。Native は保存済み EPUB があれば直接配信し、Worker は都度生成する。ヘッダ到着、EOF、外部閲覧ソフトの ZIP 展開・キャッシュ保存後の表示完了を区別して比較する（`docs/external-api.md`）。

@@ -396,3 +396,33 @@ fn sqlite_keeps_a_mixed_selection_separate_from_tags_across_restarts() {
     let tags: Vec<String> = serde_json::from_str(&tags).unwrap();
     assert_eq!(tags, vec!["vs_3", "共通"]);
 }
+
+#[test]
+fn attribute_edit_repairs_a_committed_portable_origin_without_replacing_identity() {
+    use sha2::Digest;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture(root, &[(1, "Text", Some("小説")), (2, "Pictures", Some("漫画"))]);
+    let output = run(root, &["virtual", "add", "--title", "Mixed", "--attribute", "漫画", "1", "2"]);
+    assert!(output.status.success(), "{}{}", stdout(&output), stderr(&output));
+    let path = root.join(".narou/database.yaml");
+    let before: std::collections::BTreeMap<i64, narou_rs::db::NovelRecord> =
+        serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let parent = &before[&3];
+    assert!(narou_rs::virtual_novel::is_portable_toc_url(&parent.toc_url));
+    let keys = narou_rs::platform::NovelObjectKeys::new(&parent.sitename, &parent.file_title, parent.use_subdirectory).unwrap();
+    let gate_path = root.join("小説データ/.objects/.narou-transfer/.gate")
+        .join(hex::encode(sha2::Sha256::digest(keys.prefix().as_ref().as_bytes())));
+    let mut gate: serde_json::Value = serde_json::from_slice(&std::fs::read(&gate_path).unwrap()).unwrap();
+    gate["origin_url_fold"] = serde_json::Value::String("https://narou.rs/virtual/vs_3".into());
+    std::fs::write(&gate_path, serde_json::to_vec(&gate).unwrap()).unwrap();
+    let output = run(root, &["virtual", "attribute", "vs_3", "小説"]);
+    assert!(output.status.success(), "{}{}", stdout(&output), stderr(&output));
+    let after: std::collections::BTreeMap<i64, narou_rs::db::NovelRecord> =
+        serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(after[&3].toc_url, parent.toc_url);
+    assert_eq!(after[&3].tags, parent.tags);
+    assert_eq!(after[&3].attribute_tag(), Some("小説"));
+    let repaired: serde_json::Value = serde_json::from_slice(&std::fs::read(gate_path).unwrap()).unwrap();
+    assert_eq!(repaired["origin_url_fold"].as_str(), Some(parent.toc_url.as_str()));
+}

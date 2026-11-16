@@ -4,7 +4,7 @@ on:
   push:
     # develop 更新で develop 環境へ、v* タグで production 環境へデプロイする
     # (下の worker-deploy-* を参照)。
-    branches: [develop, refactor-platform-abstraction, main]
+    branches: [develop, 'feature-*', refactor-platform-abstraction, main]
     # release.yml と同じタグ集合 (v* と数字始まり) で production へ。
     tags: ["v*", "[0-9]*"]
   pull_request:
@@ -50,6 +50,8 @@ jobs:
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_bounded_runtime_sql.py'
       - name: Web UI streamed transfer regressions
         run: node --test tests/transfer_streaming.test.mjs
+      - name: Transfer WASM artifact pipeline regressions
+        run: node --test tests/transfer_artifacts.test.mjs
       - name: Web UI source-link escaping regressions
         run: node --test tests/render_links.test.mjs
       - name: Web UI progress bar regressions
@@ -108,11 +110,15 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
-      - name: Build and exercise the standalone streaming WASM API
+      - name: Build the browser transfer artifact set
+        # Generates content-hashed glue/wasm/worker plus manifest.json in
+        # target/transfer-artifacts/ and proves the codec dependency graph is
+        # free of the GPL Lite engine. Fails closed when any piece is missing.
         run: |
-          cargo build --manifest-path transfer_wasm/Cargo.toml --target wasm32-unknown-unknown --release
-          version=$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("Cargo.lock", "rb"))["package"] if p["name"] == "wasm-bindgen"))')
-          cargo install wasm-bindgen-cli --version "$version" --locked
+          node scripts/build-transfer-wasm.mjs --install-bindgen --assert-lean
+          node scripts/build-transfer-wasm.mjs --verify
+      - name: Exercise the standalone streaming WASM API
+        run: |
           wasm-bindgen target/wasm32-unknown-unknown/release/narou_transfer_wasm.wasm --target nodejs --out-dir target/transfer-wasm-smoke
           node transfer_wasm/tests/streaming.mjs target/transfer-wasm-smoke/narou_transfer_wasm.js
 
@@ -128,6 +134,9 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
       - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
       # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
       # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
@@ -135,6 +144,9 @@ jobs:
         with:
           path: ~/.cache/worker-build
           key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
+      # build_assets.mjs also produces the transfer WASM artifact set under
+      # public/assets/transfer; the deployable artifact is incomplete without it.
+      - run: node build_assets.mjs
       - run: worker-build --release
 
   worker-contract:

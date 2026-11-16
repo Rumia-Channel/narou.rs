@@ -43,16 +43,23 @@
 //!
 //! # Failure policy
 //!
-//! The marker flips only after every file has been written. A read, decode
-//! (CRC-32) or write error aborts the export with the marker left as it was:
-//! a corrupt database, an unreadable object or an unreachable S3 illustration
-//! must not be reported as a completed rollback.
+//! An in-place export is a guarded compare-and-swap cutover. One coherent
+//! snapshot (records, managed states, object/gate/generation rows and the
+//! live filesystem stamp set) is captured under the compat authority lock;
+//! bodies are streamed into a private staging directory; finalization
+//! re-validates every captured fingerprint, publishes the files and — inside
+//! a single Immediate transaction that also retires the SQL namespace gates —
+//! flips the marker. A concurrent update anywhere in the window fails the
+//! compare and leaves SQLite authoritative instead of being silently lost.
+//! A read, decode (CRC-32) or write error aborts the export the same way:
+//! a corrupt database, an unreadable object or an unreachable S3
+//! illustration must not be reported as a completed rollback.
 //! In-place management files are atomically published with their SHA-256
 //! provenance recorded first. SQLite startup retires unchanged export
 //! projections without reimporting them, preserving writes made after a
 //! failed rollback; genuinely edited files remain legacy import sources.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -63,7 +70,7 @@ use futures::StreamExt;
 
 use crate::db::state_inventory;
 use crate::error::{NarouError, Result};
-use crate::native::object_store::NativeObjectStore;
+use crate::native::object_store::{FsGate, NativeObjectStore};
 use crate::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListRequest, ObjectPrefix, ObjectStore,
 };
@@ -95,6 +102,9 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
     let inventory = crate::db::inventory::Inventory::with_default_root()?;
     let root = inventory.root_dir().to_path_buf();
     let narou_dir = root.join(".narou");
+    // Heal any interrupted earlier cutover before reading the mode: this is
+    // the only YAML-side entrypoint that can reach the reconciler.
+    reconcile_cutover_intent(&narou_dir)?;
     // Validate the authoritative backend before writing any rollback artifact.
     let sqlite_state = match crate::native::sqlite::state::read_mode(&narou_dir) {
         StorageMode::Sqlite => Some(crate::native::sqlite::state::active_for(&narou_dir).ok_or_else(|| {
@@ -112,75 +122,742 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
     };
     std::fs::create_dir_all(&out_dir)?;
     let layout = ExportLayout::new(&root, out_dir.clone(), in_place)?;
-    let export_state = sqlite_state.as_ref().filter(|_| {
+
+    let Some(state) = sqlite_state else {
+        // YAML is already authoritative: only the two management files are
+        // rendered, straight from the live `Database` cache.
+        let (records_yaml, index_yaml) = crate::db::with_database(|db| {
+            let mut records: std::collections::BTreeMap<i64, _> = db
+                .all_records()
+                .iter()
+                .map(|(&id, record)| (id, record.clone()))
+                .collect();
+            for (&id, record) in &mut records {
+                record.id = id;
+            }
+            let mut index = crate::db::index_store::IndexStore::new();
+            index.reconcile(&records.iter().map(|(&id, record)| (id, record.clone())).collect());
+            Ok((serde_yaml::to_string(&records)?, index.to_yaml()?))
+        })?;
+        write_state_file(None, &out_dir, "database.yaml", &records_yaml)?;
+        write_state_file(None, &out_dir, "database_index.yaml", &index_yaml)?;
+        return Ok(out_dir);
+    };
+
+    let export_state = Some(&state).filter(|_| {
         in_place || comparable(&out_dir) == comparable(&narou_dir)
     });
 
-    // Take DATABASE before the authority lock, matching record mutations.
-    // Keep synchronous metadata reads and publication together: a running Web
-    // process may retain a cache older than another CLI writer's commit.
-    let global_payload = crate::db::with_database(|db| {
-        let publish = || -> Result<Option<String>> {
-            let mut records = if let Some(state) = &sqlite_state {
-                let source = narou_dir.join("database.yaml");
-                let file_raw = if state.compat_now() {
-                    match crate::db::inventory::ensure_yaml_size_limit(&source) {
-                        Ok(()) => Some(std::fs::read_to_string(&source)?),
-                        Err(NarouError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(error) => return Err(error),
-                    }
-                } else {
-                    None
-                };
-                if let Some(raw) = file_raw {
-                    if raw.trim().is_empty() { std::collections::BTreeMap::new() }
-                    else { serde_yaml::from_str(&raw)? }
-                } else {
-                    super::bulk::load_all_records(&state.conn_ref().lock())?
-                }
-            } else {
-                db.all_records().iter().map(|(&id, record)| (id, record.clone())).collect()
-            };
-            for (&id, record) in &mut records { record.id = id; }
-            write_state_file(export_state, &out_dir, "database.yaml", &serde_yaml::to_string(&records)?)?;
+    if in_place {
+        sweep_stale_staging(&narou_dir)?;
+    }
 
-            // Derive the index from that same authoritative map, never from
-            // the singleton's independently stale cached index.
-            let mut index = crate::db::index_store::IndexStore::new();
-            index.reconcile(&records.into_iter().collect());
-            write_state_file(export_state, &out_dir, "database_index.yaml", &index.to_yaml()?)?;
-            if let Some(state) = &sqlite_state {
-                for (key, file) in state_inventory::import_export_states() {
-                    if let Some(payload) = state.get_raw_unlocked("inv", key)? {
-                        write_state_file(export_state, &out_dir, file, &payload)?;
-                    }
-                }
-                state.get_raw_db("global", "global_setting")
-            } else {
-                Ok(None)
-            }
-        };
-        if let Some(state) = &sqlite_state { state.with_compat_lock(publish) }
-        else { publish() }
+    // Phase 1 — coherent capture. The compat authority lock serializes with
+    // record/state writers, and one deferred transaction pins the SQL side,
+    // so every published byte comes from the same consistent snapshot.
+    let snapshot = state.with_compat_lock(|| {
+        CutoverSnapshot::capture(&state, &narou_dir, &layout.library_archive)
     })?;
+
+    // Phase 2 — stream bodies. In place they are prepared privately (one
+    // staging directory inside `.narou`, renamed into position only after the
+    // finalization re-validates the snapshot); bundle exports write their
+    // final paths directly. The primary connection mutex is never held or
+    // re-locked across this asynchronous payload IO.
+    let staging_dir = in_place.then(|| staging_dir(&narou_dir));
+    let staged = export_objects(&state, &layout, &root, staging_dir.as_deref()).await;
+    let staged = match staged {
+        Ok(staged) => staged,
+        Err(error) => {
+            if let Some(dir) = &staging_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return Err(error);
+        }
+    };
+
+    // Phase 3 — guarded finalization / bundle publication.
+    let result = if in_place {
+        finalize_in_place(
+            &state,
+            &narou_dir,
+            &layout,
+            &snapshot,
+            &staged,
+            export_state,
+        )
+    } else {
+        publish_metadata(&out_dir, &layout, &snapshot, export_state)
+    };
+    if let Some(dir) = &staging_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    result.map(|()| out_dir)
+}
+
+/// One deterministic fingerprint over the rows a rollback publishes or
+/// transfers authority for. Content `generation` is a random per-write nonce,
+/// so even a write later reverted byte-for-byte still breaks the compare —
+/// exactly what a compare-and-swap cutover needs.
+fn sql_fingerprint(conn: &rusqlite::Connection) -> Result<String> {
+    use sha2::Digest;
+    let mut hash = sha2::Sha256::new();
+    let mut feed = |part: &str| {
+        hash.update(part.as_bytes());
+        hash.update([0u8]);
+    };
+    let table_exists = |conn: &rusqlite::Connection, name: &str| -> Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(super::sqlite_error)?)
+    };
+    let mut walk = |conn: &rusqlite::Connection, sql: &str| -> Result<()> {
+        let mut statement = conn.prepare(sql).map_err(super::sqlite_error)?;
+        let mut rows = statement.query([]).map_err(super::sqlite_error)?;
+        while let Some(row) = rows.next().map_err(super::sqlite_error)? {
+            let value: String = row.get(0).map_err(super::sqlite_error)?;
+            feed(&value);
+        }
+        Ok(())
+    };
+    if table_exists(conn, "objects")? {
+        walk(
+            conn,
+            "SELECT object_key||char(0)||size||char(0)||generation FROM objects ORDER BY object_key",
+        )?;
+    }
+    for (table, sql) in [
+        ("transfer_object_refs", "SELECT object_key||char(0)||blob_key||char(0)||blob_generation||char(0)||size||char(0)||sha256||char(0)||backend FROM transfer_object_refs ORDER BY object_key"),
+        ("novel_access_gates", "SELECT prefix||char(0)||epoch||char(0)||closed||char(0)||coalesce(owner,'')||char(0)||content_revision||char(0)||origin_url_fold FROM novel_access_gates ORDER BY prefix"),
+        ("novel_gate_bindings", "SELECT novel_id||char(0)||prefix FROM novel_gate_bindings ORDER BY novel_id"),
+        ("novel_revisions", "SELECT novel_id||char(0)||record_revision||char(0)||content_revision FROM novel_revisions ORDER BY novel_id"),
+    ] {
+        if table_exists(conn, table)? {
+            walk(conn, sql)?;
+        }
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
+/// `(size, mtime-nanos)` of one live archive/definition file. Export targets
+/// keep no `objects` row (the filesystem fallback), so a mid-export edit to
+/// them can only be detected by comparing the file stamp before the staged
+/// body replaces it.
+type FileStamp = (u64, i128);
+
+fn file_stamp(path: &Path) -> Result<Option<FileStamp>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|span| span.as_nanos() as i128)
+        .unwrap_or(-1);
+    Ok(Some((metadata.len(), mtime)))
+}
+
+/// Paths the fingerprint must never see: the live transfer namespace (gate
+/// files, lock files, stage ledgers, sessions — they mutate under every lock
+/// we take) except committed `.narou-transfer/.refs/` markers (those are
+/// published remote-alias metadata and cutover targets), `.narou-staging/`
+/// stage payloads, per-file `.lock` siblings, and the export's own
+/// temporary/staging names.
+fn fingerprint_ignored(relative: &str) -> bool {
+    if relative
+        .strip_prefix(".objects/")
+        .is_some_and(|rest| rest.starts_with(crate::native::object_store::REMOTE_REFERENCE_PREFIX))
+    {
+        return false;
+    }
+    let mut parts = relative.split('/');
+    if parts.any(|part| part == ".narou-transfer" || part == ".narou-staging") {
+        return true;
+    }
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    name.ends_with(".lock") || name.starts_with(".narou-export-")
+}
+
+fn fingerprint_tree(base: &Path, prefix: &str, out: &mut BTreeMap<String, Option<FileStamp>>) -> Result<()> {
+    if !base.is_dir() {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    NativeObjectStore::recursive_files(base, base, &mut files)?;
+    for path in files {
+        let Ok(relative) = path.strip_prefix(base) else { continue };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if fingerprint_ignored(&relative) {
+            continue;
+        }
+        out.insert(format!("{prefix}{relative}"), file_stamp(&path)?);
+    }
+    Ok(())
+}
+
+/// Filesystem side of the export, keyed by library-root-relative names (the
+/// same names staged renames are checked against): every live file under the
+/// archive root and the `webnovel/` definition directory, plus the exact
+/// `.narou`/`~/.narousetting` files publication overwrites. Those singles are
+/// stamped by name rather than by tree walk so `db.sqlite`, lock files and
+/// staging residue — all of which legitimately change during an export —
+/// never enter the compare.
+fn collect_file_stamps(root: &Path, narou_dir: &Path, library_archive: &Path) -> Result<BTreeMap<String, Option<FileStamp>>> {
+    let mut map = BTreeMap::new();
+    fingerprint_tree(
+        library_archive,
+        &format!("{}/", crate::downloader::types::ARCHIVE_ROOT_DIR),
+        &mut map,
+    )?;
+    fingerprint_tree(&root.join("webnovel"), "webnovel/", &mut map)?;
+    for file in ["database.yaml", "database_index.yaml"] {
+        map.insert(format!(".narou/{file}"), file_stamp(&narou_dir.join(file))?);
+    }
+    for (_key, file) in state_inventory::import_export_states() {
+        map.insert(format!(".narou/{file}"), file_stamp(&narou_dir.join(file))?);
+    }
+    map.insert(
+        ".narousetting/global_setting.yaml".to_string(),
+        file_stamp(&crate::db::inventory::global_setting_dir(root).join("global_setting.yaml"))?,
+    );
+    Ok(map)
+}
+
+/// The coherent point-in-time the whole cutover is validated against.
+struct CutoverSnapshot {
+    /// Serialized records for `database.yaml`.
+    records_yaml: String,
+    /// Reconciled index for `database_index.yaml` (derived, not compared).
+    index_yaml: String,
+    /// `(state key, file name, payload)` for every managed import/export state.
+    states: Vec<(String, &'static str, Option<String>)>,
+    /// `global/global_setting` payload (stays a plain file in both modes).
+    global_setting: Option<String>,
+    /// Deterministic hash of the published SQL tables.
+    sql_fingerprint: String,
+    /// Live fallback/mirror files: `root-relative path -> stamp`.
+    fs_fingerprint: BTreeMap<String, Option<FileStamp>>,
+}
+
+impl CutoverSnapshot {
+    /// Capture under the compat authority lock. The records file is the
+    /// authority in `narou-compat` mode; otherwise `app_state`/relational
+    /// rows are. Reads share one deferred transaction so the SQL parts are a
+    /// single consistent snapshot; the connection mutex is released before
+    /// the filesystem walk.
+    fn capture(
+        state: &super::state::StateDb,
+        narou_dir: &Path,
+        library_archive: &Path,
+    ) -> Result<Self> {
+        let mut conn = state.conn_ref().lock();
+        let tx = conn.transaction().map_err(super::sqlite_error)?;
+        let compat = state.compat_now_with_connection(&tx);
+
+        let source = narou_dir.join("database.yaml");
+        let file_raw = if compat {
+            match crate::db::inventory::ensure_yaml_size_limit(&source) {
+                Ok(()) => Some(std::fs::read_to_string(&source)?),
+                Err(NarouError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let mut records: std::collections::BTreeMap<i64, _> = if let Some(raw) = file_raw {
+            if raw.trim().is_empty() {
+                std::collections::BTreeMap::new()
+            } else {
+                serde_yaml::from_str(&raw)?
+            }
+        } else {
+            super::bulk::load_all_records(&tx)?
+        };
+        for (&id, record) in &mut records {
+            record.id = id;
+        }
+        let records_yaml = serde_yaml::to_string(&records)?;
+        let mut index = crate::db::index_store::IndexStore::new();
+        index.reconcile(&records.into_iter().collect());
+        let index_yaml = index.to_yaml()?;
+
+        let mut states = Vec::new();
+        for (key, file) in state_inventory::import_export_states() {
+            let payload = if compat
+                && let Some(path) = state_inventory::legacy_path("inv", key, narou_dir)
+                && let Ok(content) = std::fs::read_to_string(&path)
+            {
+                Some(content)
+            } else {
+                state.read_state_row_conn(&tx, "inv", key)?
+            };
+            states.push((key.to_string(), file, payload));
+        }
+        let global_setting = state.read_state_row_conn(&tx, "global", "global_setting")?;
+        let sql_fingerprint = sql_fingerprint(&tx)?;
+        drop(tx);
+        drop(conn);
+
+        let root = narou_dir.parent().unwrap_or(narou_dir).to_path_buf();
+        let fs_fingerprint = collect_file_stamps(&root, narou_dir, library_archive)?;
+        Ok(Self {
+            records_yaml,
+            index_yaml,
+            states,
+            global_setting,
+            sql_fingerprint,
+            fs_fingerprint,
+        })
+    }
+
+    /// Re-derive every compared piece inside `tx` and fail the cutover on the
+    /// first difference — the snapshot another writer committed over can
+    /// never be selected by the marker flip.
+    fn validate(
+        &self,
+        state: &super::state::StateDb,
+        tx: &rusqlite::Transaction<'_>,
+        narou_dir: &Path,
+    ) -> Result<()> {
+        let changed = |what: &str| {
+            NarouError::Database(format!(
+                "書き出し中に{what}が更新されたため切り替えを中止しました (SQLite 管理を継続します)"
+            ))
+        };
+        let compat = state.compat_now_with_connection(tx);
+        let source = narou_dir.join("database.yaml");
+        let file_raw = if compat {
+            match crate::db::inventory::ensure_yaml_size_limit(&source) {
+                Ok(()) => Some(std::fs::read_to_string(&source)?),
+                Err(NarouError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let mut records: std::collections::BTreeMap<i64, _> = if let Some(raw) = file_raw {
+            if raw.trim().is_empty() {
+                std::collections::BTreeMap::new()
+            } else {
+                serde_yaml::from_str(&raw)?
+            }
+        } else {
+            super::bulk::load_all_records(tx)?
+        };
+        for (&id, record) in &mut records {
+            record.id = id;
+        }
+        if serde_yaml::to_string(&records)? != self.records_yaml {
+            return Err(changed("小説レコード"));
+        }
+        for (key, _, payload) in &self.states {
+            let current = if compat
+                && let Some(path) = state_inventory::legacy_path("inv", key, narou_dir)
+                && let Ok(content) = std::fs::read_to_string(&path)
+            {
+                Some(content)
+            } else {
+                state.read_state_row_conn(tx, "inv", key.as_str())?
+            };
+            if &current != payload {
+                return Err(changed("管理状態"));
+            }
+        }
+        if state.read_state_row_conn(tx, "global", "global_setting")? != self.global_setting {
+            return Err(changed("グローバル設定"));
+        }
+        if sql_fingerprint(tx)? != self.sql_fingerprint {
+            return Err(changed("保存オブジェクト"));
+        }
+        Ok(())
+    }
+}
+
+/// Write `database.yaml`, `database_index.yaml`, the managed states and the
+/// global setting into the export directory with SHA-256 provenance.
+fn publish_metadata(
+    out_dir: &Path,
+    layout: &ExportLayout,
+    snapshot: &CutoverSnapshot,
+    export_state: Option<&super::state::StateDb>,
+) -> Result<()> {
+    write_state_file(export_state, out_dir, "database.yaml", &snapshot.records_yaml)?;
+    write_state_file(export_state, out_dir, "database_index.yaml", &snapshot.index_yaml)?;
+    for (_, file, payload) in &snapshot.states {
+        if let Some(payload) = payload {
+            write_state_file(export_state, out_dir, file, payload)?;
+        }
+    }
     // Global settings are shared, file-only state; do not hold the library
     // authority lock while taking their independent file lock.
-    if let Some(payload) = global_payload {
+    if let Some(payload) = &snapshot.global_setting {
         let global_dir = layout.global_setting_dir();
         std::fs::create_dir_all(&global_dir)?;
-        crate::db::inventory::atomic_write(&global_dir.join("global_setting.yaml"), &payload)?;
+        crate::db::inventory::atomic_write(&global_dir.join("global_setting.yaml"), payload)?;
     }
-    if let Some(state) = &sqlite_state {
-        // No synchronous authority guard is held across asynchronous object IO.
-        export_objects(state, &layout).await?;
-    }
+    Ok(())
+}
 
-    if in_place {
-        // Switch the storage marker back so the next launch runs in legacy
-        // YAML mode and narou.rb sees the full library.
-        crate::native::sqlite::state::write_mode(&narou_dir, StorageMode::Yaml)?;
+/// `.narou`-local directory the in-place export stages object bodies into.
+/// Same filesystem as every target, so publication is a rename.
+fn staging_dir(narou_dir: &Path) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|span| span.as_nanos())
+        .unwrap_or(0);
+    narou_dir.join(format!(".export-staging-{}-{nonce}", std::process::id()))
+}
+
+/// Staged location of one export target: the library-root-relative path
+/// mirrored under the staging root.
+fn staged_path(staging: &Path, library_root: &Path, target: &Path) -> Result<PathBuf> {
+    let canonical_root = comparable(library_root);
+    let canonical_target = comparable(target);
+    let relative = canonical_target
+        .strip_prefix(&canonical_root)
+        .map_err(|_| {
+            NarouError::Database(format!(
+                "書き出し先がライブラリの外にあります: {}",
+                target.display()
+            ))
+        })?;
+    Ok(staging.join(relative))
+}
+
+/// Remove staging directories an interrupted earlier run left behind. Their
+/// contents are uncommitted copies, never the only copy of anything.
+fn sweep_stale_staging(narou_dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(narou_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".export-staging-") && entry.path().is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        }
     }
-    Ok(out_dir)
+    Ok(())
+}
+
+/// Hold every prefix transfer lock (sorted, so lock order is consistent with
+/// the per-prefix `lock -> connection` order writers use) for the whole
+/// finalization. Gate mutations and gate-adoption callers serialize here.
+fn with_prefix_locks<T>(
+    mirror: &NativeObjectStore,
+    prefixes: &[String],
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match prefixes.split_first() {
+        Some((first, rest)) => {
+            mirror.with_transfer_lock(first, || with_prefix_locks(mirror, rest, operation))
+        }
+        None => operation(),
+    }
+}
+
+/// Guarded in-place finalization: re-validate the snapshot, publish metadata,
+/// move staged bodies into position, then — inside one Immediate transaction
+/// — journal the durable `yaml_pending` intent, retire every SQL gate and
+/// fsync the flipped marker before COMMIT. The intent row is the crash
+/// evidence: it exists committed only when the flipped marker was already
+/// durable, so a restart can always tell "committed but unfinished" apart
+/// from "rolled back" (see reconcile_cutover_intent).
+fn finalize_in_place(
+    state: &super::state::StateDb,
+    narou_dir: &Path,
+    layout: &ExportLayout,
+    snapshot: &CutoverSnapshot,
+    staged: &[(PathBuf, PathBuf)],
+    export_state: Option<&super::state::StateDb>,
+) -> Result<()> {
+    state.with_compat_lock(|| {
+        // Validation 1: metadata and SQL fingerprint under one read
+        // transaction. The compat lock excludes record/state writers; object
+        // and gate writers are fenced by the Immediate transaction below.
+        {
+            let mut conn = state.conn_ref().lock();
+            let tx = conn.transaction().map_err(super::sqlite_error)?;
+            snapshot.validate(state, &tx, narou_dir)?;
+        }
+        // The filesystem half changes only outside SQL, so compare it before
+        // the publishes/renames below (and per-file again at rename time).
+        let root = narou_dir.parent().unwrap_or(narou_dir).to_path_buf();
+        if collect_file_stamps(&root, narou_dir, &layout.library_archive)? != snapshot.fs_fingerprint {
+            return Err(NarouError::Database(
+                "書き出し中に実ファイルが更新されたため切り替えを中止しました (SQLite 管理を継続します)"
+                    .to_string(),
+            ));
+        }
+        publish_metadata(narou_dir, layout, snapshot, export_state)?;
+
+        // Move staged bodies into place, each under its target's file lock
+        // with the captured stamp re-checked so a fallback file edited
+        // mid-export is never silently overwritten.
+        for (staged_path, target) in staged {
+            let canonical_target = comparable(target);
+            let canonical_root = comparable(&root);
+            let relative = canonical_target
+                .strip_prefix(&canonical_root)
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .map_err(|_| {
+                    NarouError::Database(format!(
+                        "書き出し先がライブラリの外にあります: {}",
+                        target.display()
+                    ))
+                })?;
+            crate::db::inventory::with_exclusive_file_lock(target, || {
+                if file_stamp(target)? != snapshot.fs_fingerprint.get(&relative).copied().flatten() {
+                    return Err(NarouError::Database(format!(
+                        "書き出し中に {relative} が更新されたため切り替えを中止しました (SQLite 管理を継続します)"
+                    )));
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(staged_path, target)?;
+                crate::compat::fsync_parent_dir(target)?;
+                Ok(())
+            })?;
+        }
+
+        let prefixes: Vec<String> = {
+            let conn = state.conn_ref().lock();
+            let mut statement = conn
+                .prepare("SELECT prefix FROM novel_access_gates ORDER BY prefix")
+                .map_err(super::sqlite_error)?;
+            let mut rows = statement.query([]).map_err(super::sqlite_error)?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().map_err(super::sqlite_error)? {
+                out.push(row.get(0).map_err(super::sqlite_error)?);
+            }
+            out
+        };
+        // Propagate mirror construction errors: the store owns the adoption
+        // hooks and a silently skipped mirror would flip the marker over
+        // unmigrated gates.
+        let mirror = NativeObjectStore::from_root(layout.library_archive.clone())?;
+        let store = super::object_store::SqliteObjectStore::new(state.conn_ref().clone(), mirror.clone());
+        let intent_path = narou_dir.join(CUTOVER_INTENT_FILE);
+        // Durable in-flight marker: written before the barrier transaction so
+        // a process exit at any later point is unambiguous on restart
+        // (reconcile_cutover_intent). Removed only after convergence.
+        crate::db::inventory::atomic_write(&intent_path, "sqlite->yaml cutover in flight\n")?;
+
+        let mut committed = false;
+        let cutover = with_prefix_locks(&mirror, &prefixes, || -> Result<()> {
+            let mut conn = state.conn_ref().lock();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(super::sqlite_error)?;
+            // Durable commit evidence: `yaml_pending` exists committed only
+            // when the flipped marker was already fsync'd (it is written
+            // after the marker below and before COMMIT).
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cutover_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;",
+            )
+            .map_err(super::sqlite_error)?;
+            // Validation 2 under the write barrier: nothing committed since
+            // validation 1 may pass the flip.
+            if sql_fingerprint(&tx)? != snapshot.sql_fingerprint {
+                return Err(NarouError::Database(
+                    "書き出し中に保存オブジェクトが更新されたため切り替えを中止しました (SQLite 管理を継続します)"
+                        .to_string(),
+                ));
+            }
+            let mut adopted: Vec<(ObjectPrefix, FsGate)> = Vec::new();
+            for prefix_key in &prefixes {
+                let prefix = ObjectPrefix::new(prefix_key.clone())?;
+                if let Some(gate) = store
+                    .adopt_sql_gate_in_tx(&tx, &prefix)
+                    .map_err(|error| {
+                        NarouError::Platform(format!("FS gate adoption failed for {prefix_key}: {error}"))
+                    })?
+                {
+                    adopted.push((prefix, gate));
+                }
+            }
+            // The marker flips inside the write barrier so the first SQLite
+            // commit that can land after it is ordered after YAML authority.
+            // write_mode is atomic+fsync'd: after this line the selector file
+            // durably reads yaml even if the process dies before COMMIT, so
+            // the intent file + pending row are what startup reconciliation
+            // uses to tell a committed flip from a rolled-back one.
+            crate::native::sqlite::state::write_mode(narou_dir, StorageMode::Yaml)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO cutover_meta(key,value) VALUES('yaml_pending','1')",
+                [],
+            )
+            .map_err(super::sqlite_error)?;
+            tx.commit().map_err(super::sqlite_error)?;
+            committed = true;
+            for (prefix, gate) in &adopted {
+                store
+                    .finalize_sql_gate_adoption_locked(prefix, gate, &conn)
+                    .map_err(|error| {
+                        NarouError::Platform(format!(
+                            "FS gate finalization failed for {}: {error}",
+                            prefix.as_ref()
+                        ))
+                    })?;
+            }
+            // Converged: discharge the in-flight intent evidence (best-effort;
+            // the reconciler removes it too if this process dies first).
+            let _ = std::fs::remove_file(&intent_path);
+            let _ = conn.execute("DELETE FROM cutover_meta WHERE key='yaml_pending'", []);
+            Ok(())
+        });
+        if let Err(error) = cutover {
+            if !committed {
+                // The barrier tx rolled back, but the fsync'd marker may
+                // already name yaml: restore the SQLite selector, drain any
+                // `.gate.pending` journals the rolled-back tx staged
+                // (provenance-carrying journals fail closed in the drain),
+                // discharge the never-committed row — and only then remove
+                // the intent file, so a crash mid-unwind is reconcilable.
+                if crate::native::sqlite::state::read_mode(narou_dir) == StorageMode::Yaml {
+                    let _ = crate::native::sqlite::state::write_mode(narou_dir, StorageMode::Sqlite);
+                }
+                {
+                    // Resumes committed journals and drops unproven staged
+                    // ones; best-effort — the restart reconciler repeats it.
+                    let _ = super::object_store::reconcile_pending_gate_journals(
+                        &mirror,
+                        state.conn_ref(),
+                    );
+                    let guard = state.conn_ref().lock();
+                    let _ = guard.execute("DELETE FROM cutover_meta WHERE key='yaml_pending'", []);
+                }
+                let _ = std::fs::remove_file(&intent_path);
+            }
+            // committed: the flip is durable — marker=yaml is the correct
+            // selector and the intent evidence stays for the reconciler to
+            // finish journal canonicalization on the next entrypoint.
+            return Err(error);
+        }
+        Ok(())
+    })
+}
+
+/// Durable intent file naming an in-flight SQLite->YAML flip. It is created
+/// before the barrier transaction and removed only after the marker flip is
+/// fully converged; its presence is what makes a crashed flip distinguishable
+/// from an ordinary YAML-mode library (which never has this file).
+const CUTOVER_INTENT_FILE: &str = ".cutover-yaml-intent";
+
+/// Startup reconciliation for an interrupted in-place cutover. `configure`
+/// and `NativeStore::for_narou_root` run it before the store variant /
+/// namespace-gate authority is chosen; `export_yaml_async` runs it before
+/// re-validating mode so a re-run heals the same state. It opens the
+/// database itself so it works under either marker.
+///
+/// Evidence protocol (all durable):
+/// - `.narou/.cutover-yaml-intent` exists only while a flip is in flight.
+/// - `cutover_meta.yaml_pending` commits only inside the barrier
+///   transaction, after the fsync'd `write_mode(Yaml)` call — so a committed
+///   row proves the tx (gate retirement + marker) committed.
+/// - `.gate.pending` journals prove a committed adoption whose FS gate
+///   canonicalization did not finish.
+///
+/// Matrix (intent present):
+/// - marker=yaml + pending row: committed flip, unfinished finalization —
+///   resume leftover `.gate.pending` journals via the shared sweep, then
+///   discharge the intent evidence.
+/// - marker=yaml + no pending row: the marker was written but the tx rolled
+///   back — restore the SQLite selector (the published YAML files are
+///   ignored under SQLite; re-running the switch redoes them) and drain
+///   unproven staged journals, failing closed on provenance conflicts.
+/// - marker=sqlite: rolled back or already restored — converge leftover
+///   journals like the sweep, discharge stale intent evidence, drop the
+///   intent file last.
+/// No intent file -> no-op, so converged and never-switched libraries are
+/// untouched.
+pub(crate) fn reconcile_cutover_intent(narou_dir: &Path) -> Result<()> {
+    let intent_path = narou_dir.join(CUTOVER_INTENT_FILE);
+    if !intent_path.is_file() {
+        return Ok(());
+    }
+    let db_path = narou_dir.join("db.sqlite");
+    if !db_path.is_file() {
+        let _ = std::fs::remove_file(&intent_path);
+        return Ok(());
+    }
+    let conn = rusqlite::Connection::open(&db_path).map_err(super::sqlite_error)?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let pending_row = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cutover_meta')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(super::sqlite_error)?
+        && conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM cutover_meta WHERE key='yaml_pending')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(super::sqlite_error)?;
+    let marker_yaml = crate::native::sqlite::state::read_mode(narou_dir) == StorageMode::Yaml;
+    if marker_yaml && pending_row {
+        // Committed flip: finish any journaled FS-gate installations and
+        // resume recorded handoffs that never reached a journal (crash
+        // between COMMIT and the journal write), then discharge the intent
+        // evidence. Same routine the gate sweep runs.
+        let archive_root = narou_dir
+            .parent()
+            .map(|root| root.join(crate::downloader::types::ARCHIVE_ROOT_DIR))
+            .unwrap_or_else(|| narou_dir.join(crate::downloader::types::ARCHIVE_ROOT_DIR));
+        let mirror = NativeObjectStore::from_root(archive_root)?;
+        let shared = Arc::new(parking_lot::Mutex::new(conn));
+        super::object_store::reconcile_pending_gate_journals(&mirror, &shared)?;
+        let guard = shared.lock();
+        let _ = guard.execute("DELETE FROM cutover_meta WHERE key='yaml_pending'", []);
+        drop(guard);
+        let _ = std::fs::remove_file(&intent_path);
+    } else if marker_yaml {
+        // Marker flipped but the barrier tx rolled back: SQL authority was
+        // never retired — restore the original selector. Journals staged
+        // inside that rolled-back transaction carry no provenance and must
+        // not shadow the live SQL rows on the next run; any journal that
+        // DOES have recorded provenance fails closed in the rollback.
+        crate::native::sqlite::state::write_mode(narou_dir, StorageMode::Sqlite)?;
+        let archive_root = narou_dir
+            .parent()
+            .map(|root| root.join(crate::downloader::types::ARCHIVE_ROOT_DIR))
+            .unwrap_or_else(|| narou_dir.join(crate::downloader::types::ARCHIVE_ROOT_DIR));
+        let mirror = NativeObjectStore::from_root(archive_root)?;
+        super::object_store::rollback_unproven_pending_journals(&mirror, Some(&conn))?;
+        let _ = std::fs::remove_file(&intent_path);
+    } else {
+        // Rolled back or already restored: converge leftover journals the
+        // same way the gate sweep does (committed resumes, unproven drops),
+        // discharge stale intent evidence, then drop the intent file last.
+        let archive_root = narou_dir
+            .parent()
+            .map(|root| root.join(crate::downloader::types::ARCHIVE_ROOT_DIR))
+            .unwrap_or_else(|| narou_dir.join(crate::downloader::types::ARCHIVE_ROOT_DIR));
+        let mirror = NativeObjectStore::from_root(archive_root)?;
+        let shared = Arc::new(parking_lot::Mutex::new(conn));
+        super::object_store::reconcile_pending_gate_journals(&mirror, &shared)?;
+        let guard = shared.lock();
+        let _ = guard.execute("DELETE FROM cutover_meta WHERE key='yaml_pending'", []);
+        drop(guard);
+        let _ = std::fs::remove_file(&intent_path);
+    }
+    Ok(())
 }
 
 fn write_state_file(
@@ -269,19 +946,23 @@ impl ExportLayout {
     }
 }
 
-/// Absolute, symlink-resolved form for the "is this inside the archive?" guard.
-/// Both paths usually exist; a missing one falls back to the absolute path so
-/// the comparison still works.
+/// Resolve the nearest existing ancestor before comparing a new output path.
+/// Windows canonicalization adds a verbatim prefix, so mixing an existing
+/// root with a missing target's lexical spelling would reject valid children.
 fn comparable(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(path))
-                .unwrap_or_else(|_| path.to_path_buf())
+    let absolute = if path.is_absolute() { path.to_path_buf() } else {
+        std::env::current_dir().map(|cwd| cwd.join(path)).unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut ancestor = absolute.as_path();
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(ancestor) {
+            let suffix = absolute.strip_prefix(ancestor).expect("ancestor of the same output path");
+            if !suffix.as_os_str().is_empty() { canonical.push(suffix); }
+            return canonical;
         }
-    })
+        let Some(parent) = ancestor.parent() else { return absolute; };
+        ancestor = parent;
+    }
 }
 
 /// Render every stored object and the illustrations the per-novel indexes
@@ -289,15 +970,28 @@ fn comparable(path: &Path) -> PathBuf {
 async fn export_objects(
     state: &crate::native::sqlite::state::StateDb,
     layout: &ExportLayout,
-) -> Result<usize> {
+    library_root: &Path,
+    staging: Option<&Path>,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
     let library_mirror = NativeObjectStore::from_root(layout.library_archive.clone())?;
     let store =
         super::object_store::SqliteObjectStore::new(state.conn_ref().clone(), library_mirror);
-    let (written, indexed, seen) = write_stored_objects(&store, layout).await?;
+    let (mut staged, indexed, seen) =
+        write_stored_objects(&store, layout, library_root, staging).await?;
     let backend = illustration_backend()?;
-    let indexed_written =
-        write_indexed_illustrations(&store, layout, &seen, indexed, backend.as_deref()).await?;
-    Ok(written + indexed_written)
+    staged.extend(
+        write_indexed_illustrations(
+            &store,
+            layout,
+            library_root,
+            staging,
+            &seen,
+            indexed,
+            backend.as_deref(),
+        )
+        .await?,
+    );
+    Ok(staged)
 }
 
 /// The configured illustration backend, or `None` when illustrations live in
@@ -319,12 +1013,25 @@ fn illustration_backend() -> Result<Option<Arc<dyn AssetStore>>> {
 
 /// Write every listed object to its legacy path and collect the per-novel
 /// illustration indexes (used for the S3-only files).
+///
+/// Reserved namespaces (`.narou-staging/`, `.narou-transfer/`) are not user
+/// content: they carry live stage data and would otherwise land on top of
+/// the transfer gate files `resolve_path` maps them to. Under `staging` each
+/// body is streamed into that private directory and the `(staged, target)`
+/// pair is collected for the atomic finalization rename; without it bodies
+/// are written to their final paths directly.
 #[allow(clippy::type_complexity)]
 async fn write_stored_objects(
     store: &super::object_store::SqliteObjectStore,
     layout: &ExportLayout,
-) -> Result<(usize, Vec<(ObjectKey, Vec<String>)>, BTreeSet<String>)> {
-    let mut written = 0usize;
+    library_root: &Path,
+    staging: Option<&Path>,
+) -> Result<(
+    Vec<(PathBuf, PathBuf)>,
+    Vec<(ObjectKey, Vec<String>)>,
+    BTreeSet<String>,
+)> {
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut indexes: Vec<(ObjectKey, Vec<String>)> = Vec::new();
 
@@ -343,6 +1050,15 @@ async fn write_stored_objects(
                 continue;
             }
             let key = &metadata.key;
+            // Remote-reference markers (.narou-transfer/.refs/<logical>) are
+            // published metadata the FS/YAML backend reads verbatim — they
+            // must cross the cutover. Every other reserved namespace
+            // (sessions, stage ledgers, locks, .data blobs) stays out.
+            if crate::platform::is_reserved_key(key)
+                && !crate::native::object_store::is_remote_reference_key(key)
+            {
+                continue;
+            }
             if let Some(prefix) = index_prefix(key) {
                 let Some(payload) = store.read_small(key).await? else {
                     return Err(NarouError::Database(format!(
@@ -358,16 +1074,23 @@ async fn write_stored_objects(
                     index.filenames().into_iter().collect(),
                 ));
             }
-            if !write_asset(store, key, &layout.target_path(key)?).await? {
+            let target = layout.target_path(key)?;
+            let path = match staging {
+                Some(dir) => staged_path(dir, library_root, &target)?,
+                None => target.clone(),
+            };
+            if !write_asset(store, key, &path).await? {
                 return Err(NarouError::Database(format!(
                     "書き出すべきオブジェクトを読み出せません: {key}"
                 )));
             }
-            written += 1;
+            if staging.is_some() {
+                staged.push((path, target));
+            }
         }
         match page.next_cursor {
             Some(next) => cursor = Some(next),
-            None => return Ok((written, indexes, seen)),
+            None => return Ok((staged, indexes, seen)),
         }
     }
 }
@@ -382,29 +1105,37 @@ async fn write_stored_objects(
 async fn write_indexed_illustrations(
     store: &super::object_store::SqliteObjectStore,
     layout: &ExportLayout,
+    library_root: &Path,
+    staging: Option<&Path>,
     seen: &BTreeSet<String>,
     indexes: Vec<(ObjectKey, Vec<String>)>,
     backend: Option<&dyn AssetStore>,
-) -> Result<usize> {
-    let mut written = 0usize;
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (prefix, names) in indexes {
         for name in names {
             let key = crate::platform::illustration_key(&prefix, &name)?;
             if seen.contains(key.as_ref()) {
                 continue;
             }
-            let path = layout.target_path(&key)?;
+            let target = layout.target_path(&key)?;
+            let path = match staging {
+                Some(dir) => staged_path(dir, library_root, &target)?,
+                None => target.clone(),
+            };
             if write_asset(store, &key, &path).await? {
-                written += 1;
+                if staging.is_some() {
+                    staged.push((path, target));
+                }
                 continue;
             }
             let Some(backend) = backend else { continue };
-            if write_asset(backend, &key, &path).await? {
-                written += 1;
+            if write_asset(backend, &key, &path).await? && staging.is_some() {
+                staged.push((path, target));
             }
         }
     }
-    Ok(written)
+    Ok(staged)
 }
 
 /// `<novel prefix>` of a `.illustration_cache.yaml` object key.
@@ -511,6 +1242,10 @@ mod tests {
         ExportLayout::new(&root, dir.join("bundle"), in_place).unwrap()
     }
 
+    fn root_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("library")
+    }
+
     fn memory_store(layout: &ExportLayout) -> super::super::object_store::SqliteObjectStore {
         let conn = {
             let mut conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -602,8 +1337,10 @@ mod tests {
             std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
             std::fs::write(&legacy, b"legacy").unwrap();
 
-            let (written, indexes, seen) = write_stored_objects(&store, &layout).await.unwrap();
-            assert_eq!(written, 4);
+            let (staged, indexes, seen) = write_stored_objects(&store, &layout, &root_path(&dir), None)
+                .await
+                .unwrap();
+            assert!(staged.is_empty(), "no staging directory means direct writes");
             assert_eq!(
                 std::fs::read(archive.join("site/title/toc.yaml")).unwrap(),
                 b"toc\n"
@@ -646,16 +1383,18 @@ mod tests {
                 vec!["0002.png".to_string(), "upstream.png".to_string()],
             )];
             let backend_ref: &dyn AssetStore = &backend;
-            let written = write_indexed_illustrations(
+            let staged = write_indexed_illustrations(
                 &store,
                 &layout,
+                &root_path(&dir),
+                None,
                 &BTreeSet::new(),
                 indexes,
                 Some(backend_ref),
             )
             .await
             .unwrap();
-            assert_eq!(written, 1);
+            assert!(staged.is_empty());
             assert_eq!(
                 std::fs::read(archive.join("site/title/挿絵/0002.png")).unwrap(),
                 b"image"
@@ -688,8 +1427,551 @@ mod tests {
                     )
                     .unwrap();
             }
-            let error = write_stored_objects(&store, &layout).await.unwrap_err();
+            let error = write_stored_objects(&store, &layout, &root_path(&dir), None).await.unwrap_err();
             assert!(error.to_string().contains("toc.yaml"), "{error}");
         });
+    }
+    /// The in-place cutover publishes staged bodies under the library root.
+    #[test]
+    fn staged_bodies_wait_for_their_legacy_targets() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = temp_layout(true, dir.path());
+            let staging = dir.path().join("staging");
+            let store = memory_store(&layout);
+            let key = ObjectKey::try_new("novels/site/title/toc.yaml").unwrap();
+            ObjectStore::write_small(&store, &key, b"toc\n".to_vec())
+                .await
+                .unwrap();
+
+            let (staged, _, _) =
+                write_stored_objects(&store, &layout, &root_path(&dir), Some(&staging))
+                    .await
+                    .unwrap();
+            assert_eq!(staged.len(), 1);
+            let (prepared, target) = &staged[0];
+            assert_eq!(*target, layout.target_path(&key).unwrap());
+            assert_eq!(std::fs::read(prepared).unwrap(), b"toc\n");
+            assert!(
+                !target.exists(),
+                "the body must not land before finalization validates the snapshot"
+            );
+        });
+    }
+
+    /// Transfer/staging namespaces are not library content: they are never
+    /// rendered into the export (which would also clobber the live gate
+    /// files `resolve_path` maps them to).
+    #[test]
+    fn reserved_namespace_objects_are_skipped() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = temp_layout(true, dir.path());
+            let store = memory_store(&layout);
+            let canonical = ObjectKey::try_new("novels/site/title/toc.yaml").unwrap();
+            ObjectStore::write_small(&store, &canonical, b"toc\n".to_vec())
+                .await
+                .unwrap();
+            for reserved in [".narou-transfer/.data/blob-x", ".narou-staging/y"] {
+                ObjectStore::write_small(
+                    &store,
+                    &ObjectKey::try_new(reserved).unwrap(),
+                    b"internal".to_vec(),
+                )
+                .await
+                .unwrap();
+            }
+
+            let (staged, _, _) =
+                write_stored_objects(&store, &layout, &root_path(&dir), None)
+                    .await
+                    .unwrap();
+            assert!(staged.is_empty());
+            let archive = layout.write_root.root();
+            assert_eq!(
+                std::fs::read(archive.join("site/title/toc.yaml")).unwrap(),
+                b"toc\n"
+            );
+            assert!(
+                !archive.join(".objects/.narou-transfer/.data/blob-x").exists(),
+                "transfer internals never reach the export"
+            );
+        });
+    }
+
+    /// A canonical reference (`transfer_object_refs`) resolves to its
+    /// physical blob, so the exported file carries the imported immutable
+    /// bytes; a blob whose generation no longer matches the recorded
+    /// reference aborts instead of exporting stale content.
+    #[test]
+    fn canonical_references_export_blob_bytes_and_tombstones_abort() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = temp_layout(true, dir.path());
+            let store = memory_store(&layout);
+            let blob = ObjectKey::try_new(".narou-transfer/.data/blob-9f").unwrap();
+            let canonical = ObjectKey::try_new("novels/site/title/payload.bin").unwrap();
+            ObjectStore::write_small(&store, &blob, b"canonical-bytes".to_vec())
+                .await
+                .unwrap();
+            let generation: String = {
+                let conn = store.conn_handle();
+                conn.lock()
+                    .query_row(
+                        "SELECT generation FROM objects WHERE object_key=?",
+                        [blob.as_ref()],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            };
+            {
+                let conn = store.conn_handle();
+                conn.lock()
+                    .execute(
+                        "INSERT INTO transfer_object_refs(object_key,blob_key,size,sha256,backend,updated_at,blob_generation) VALUES(?,?,?,?,'d1',?,?)",
+                        rusqlite::params![canonical.as_ref(), blob.as_ref(), 15i64, "00", "t", generation],
+                    )
+                    .unwrap();
+            }
+
+            let staging = dir.path().join("staging");
+            let (staged, _, _) = write_stored_objects(
+                &store,
+                &layout,
+                &root_path(&dir),
+                Some(&staging),
+            )
+            .await
+            .unwrap();
+            assert_eq!(staged.len(), 1);
+            assert_eq!(
+                std::fs::read(&staged[0].0).unwrap(),
+                b"canonical-bytes",
+                "the reference resolves to the exact immutable blob"
+            );
+
+            // A tombstoned reference (blob generation no longer matches) must
+            // fail the export rather than silently emit other bytes.
+            {
+                let conn = store.conn_handle();
+                conn.lock()
+                    .execute(
+                        "UPDATE objects SET generation='deadbeef' WHERE object_key=?",
+                        [blob.as_ref()],
+                    )
+                    .unwrap();
+            }
+            let error =
+                write_stored_objects(&store, &layout, &root_path(&dir), None).await.unwrap_err();
+            assert!(
+                error.to_string().contains("generation") || error.to_string().contains("payload.bin"),
+                "{error}"
+            );
+        });
+    }
+
+    /// A write committed between snapshot capture and finalization must stop
+    /// the marker flip, never be silently lost: the export fails closed and
+    /// SQLite stays authoritative with its gates intact.
+    #[test]
+    fn concurrent_update_between_capture_and_finalize_aborts_cutover() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = root_path(&dir);
+            std::fs::create_dir_all(&root).unwrap();
+            let narou_dir = root.join(".narou");
+            crate::native::sqlite::state::write_mode(&narou_dir, StorageMode::Sqlite).unwrap();
+            let state = super::super::state::configure(&narou_dir).unwrap();
+            let layout = ExportLayout::new(&root, narou_dir.clone(), true).unwrap();
+            let mirror = NativeObjectStore::from_root(layout.library_archive.clone()).unwrap();
+            let store = super::super::object_store::SqliteObjectStore::with_mirror_files(
+                state.conn_ref().clone(),
+                mirror,
+                false,
+            );
+            let key = ObjectKey::try_new("novels/site/title/toc.yaml").unwrap();
+            ObjectStore::write_small(&store, &key, b"before".to_vec())
+                .await
+                .unwrap();
+
+            let snapshot = state
+                .with_compat_lock(|| {
+                    CutoverSnapshot::capture(&state, &narou_dir, &layout.library_archive)
+                })
+                .unwrap();
+            let staging = dir.path().join("staging");
+            let staged = export_objects(&state, &layout, &root, Some(&staging))
+                .await
+                .unwrap();
+            assert_eq!(staged.len(), 1, "the body waits in private staging");
+            assert!(!layout.target_path(&key).unwrap().exists());
+
+            // A writer commits inside the cutover window.
+            ObjectStore::write_small(&store, &key, b"after".to_vec())
+                .await
+                .unwrap();
+
+            let error = finalize_in_place(
+                &state,
+                &narou_dir,
+                &layout,
+                &snapshot,
+                &staged,
+                Some(&state),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("切り替えを中止"), "{error}");
+            assert_eq!(
+                crate::native::sqlite::state::read_mode(&narou_dir),
+                StorageMode::Sqlite,
+                "a failed cutover keeps the original mode"
+            );
+            assert!(
+                !layout.target_path(&key).unwrap().exists(),
+                "the aborted cutover must not publish the stale body"
+            );
+        });
+    }
+
+    /// Successful in-place finalization flips the marker and retires every
+    /// open SQL gate into a proven FS gate in one transaction; a closed gate
+    /// blocks the whole cutover instead of being partially adopted.
+    #[test]
+    fn finalization_adopts_open_gates_and_refuses_closed_ones() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = root_path(&dir);
+            std::fs::create_dir_all(&root).unwrap();
+            let narou_dir = root.join(".narou");
+            crate::native::sqlite::state::write_mode(&narou_dir, StorageMode::Sqlite).unwrap();
+            let state = super::super::state::configure(&narou_dir).unwrap();
+            let layout = ExportLayout::new(&root, narou_dir.clone(), true).unwrap();
+            let mirror = NativeObjectStore::from_root(layout.library_archive.clone()).unwrap();
+            let store = super::super::object_store::SqliteObjectStore::with_mirror_files(
+                state.conn_ref().clone(),
+                mirror.clone(),
+                false,
+            );
+            let key = ObjectKey::try_new("novels/site/title/toc.yaml").unwrap();
+            ObjectStore::write_small(&store, &key, b"toc".to_vec())
+                .await
+                .unwrap();
+            {
+                let conn = state.conn_ref().lock();
+                conn.execute(
+                    "INSERT INTO novel_access_gates(prefix,epoch,closed,owner,updated_at,content_revision,origin_url_fold) VALUES('novels/site/title',3,0,NULL,1,7,'')",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) VALUES('novels/site/title','reader-1',3,?1)",
+                    [crate::platform::transfer_stage::now_secs() + 600],
+                )
+                .unwrap();
+            }
+
+            let snapshot = state
+                .with_compat_lock(|| {
+                    CutoverSnapshot::capture(&state, &narou_dir, &layout.library_archive)
+                })
+                .unwrap();
+            let staged = export_objects(&state, &layout, &root, Some(&dir.path().join("staging")))
+                .await
+                .unwrap();
+            finalize_in_place(&state, &narou_dir, &layout, &snapshot, &staged, Some(&state))
+                .unwrap();
+
+            assert_eq!(
+                crate::native::sqlite::state::read_mode(&narou_dir),
+                StorageMode::Yaml
+            );
+            assert_eq!(std::fs::read(layout.target_path(&key).unwrap()).unwrap(), b"toc");
+            {
+                let conn = state.conn_ref().lock();
+                let sql_gate: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix='novels/site/title')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(!sql_gate, "the SQL row is retired");
+                let handoff =
+                    crate::native::object_store::read_fs_gate_handoff_raw(&conn, "novels/site/title")
+                        .unwrap();
+                assert_eq!(handoff.map(|(sql, fs, _)| (sql, fs)), Some((3, 4)));
+            }
+            // The live FS gate carries the reader lease at its original epoch.
+            let gate_path = mirror
+                .gate_path(&ObjectPrefix::new("novels/site/title".to_string()).unwrap())
+                .unwrap();
+            let gate: crate::native::object_store::FsGate =
+                serde_json::from_slice(&std::fs::read(&gate_path).unwrap()).unwrap();
+            assert_eq!(gate.epoch, 4);
+            assert_eq!(
+                gate.readers.get("reader-1").map(|(epoch, _)| *epoch),
+                Some(3)
+            );
+
+            // A closed SQL gate blocks adoption: the whole cutover fails and
+            // the marker stays on SQLite.
+            crate::native::sqlite::state::write_mode(&narou_dir, StorageMode::Sqlite).unwrap();
+            {
+                let conn = state.conn_ref().lock();
+                conn.execute(
+                    "INSERT INTO novel_access_gates(prefix,epoch,closed,owner,updated_at,content_revision,origin_url_fold) VALUES('novels/site/closed',2,1,'remove-v1:1:1',1,0,'')",
+                    [],
+                )
+                .unwrap();
+            }
+            // The earlier object write bumped the captured fingerprint; take
+            // a fresh snapshot so only the closed gate fails validation.
+            let snapshot = state
+                .with_compat_lock(|| {
+                    CutoverSnapshot::capture(&state, &narou_dir, &layout.library_archive)
+                })
+                .unwrap();
+            let error = finalize_in_place(
+                &state,
+                &narou_dir,
+                &layout,
+                &snapshot,
+                &[],
+                Some(&state),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("closed") || error.to_string().contains("FS gate"),
+                "{error}"
+            );
+            assert_eq!(
+                crate::native::sqlite::state::read_mode(&narou_dir),
+                StorageMode::Sqlite
+            );
+            {
+                let conn = state.conn_ref().lock();
+                let rows: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM novel_access_gates", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(rows, 1, "the rolled-back cutover leaves SQL authority intact");
+            }
+        });
+    }
+
+    /// Remote-reference markers (`.narou-transfer/.refs/<logical>`) are the
+    /// one reserved namespace that must cross the cutover: the FS/YAML
+    /// backend reads them verbatim to resolve remote reads. Everything else
+    /// under `.narou-transfer/` and `.narou-staging/` stays behind.
+    #[test]
+    fn remote_reference_markers_cross_the_export_boundary() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = temp_layout(true, dir.path());
+            let store = memory_store(&layout);
+            let canonical = ObjectKey::try_new("novels/site/title/toc.yaml").unwrap();
+            ObjectStore::write_small(&store, &canonical, b"toc\n".to_vec())
+                .await
+                .unwrap();
+            // A non-hash S3 alias marker (physical is NOT a content hash —
+            // only this row knows where the bytes live) plus a deletion
+            // tombstone (physical == "").
+            let alias = serde_json::json!({
+                "physical": "content/7f9c2ab4-pool",
+                "size": 120,
+                "sha256": "9f".repeat(32),
+                "logical": "novels/site/title/挿絵/ref.png",
+                "prefix": "novels/site/title",
+                "etag": "etag-abc"
+            });
+            let alias_key =
+                ObjectKey::try_new(".narou-transfer/.refs/novels/site/title/挿絵/ref.png").unwrap();
+            ObjectStore::write_small(&store, &alias_key, serde_json::to_vec(&alias).unwrap())
+                .await
+                .unwrap();
+            let tombstone = serde_json::json!({
+                "physical": "",
+                "size": 0,
+                "sha256": "",
+                "logical": "novels/site/title/挿絵/gone.png",
+                "prefix": "novels/site/title"
+            });
+            let tomb_key =
+                ObjectKey::try_new(".narou-transfer/.refs/novels/site/title/挿絵/gone.png").unwrap();
+            ObjectStore::write_small(&store, &tomb_key, serde_json::to_vec(&tombstone).unwrap())
+                .await
+                .unwrap();
+            for reserved in [
+                ".narou-transfer/.data/blob-x",
+                ".narou-transfer/.remote/session-1",
+                ".narou-staging/y",
+            ] {
+                ObjectStore::write_small(
+                    &store,
+                    &ObjectKey::try_new(reserved).unwrap(),
+                    b"internal".to_vec(),
+                )
+                .await
+                .unwrap();
+            }
+
+            let (staged, _, _) =
+                write_stored_objects(&store, &layout, &root_path(&dir), None)
+                    .await
+                    .unwrap();
+            assert!(staged.is_empty());
+            let objects_root = layout.write_root.root().join(".objects/.narou-transfer/.refs");
+            let alias_written: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(objects_root.join("novels/site/title/挿絵/ref.png")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(alias_written["physical"].as_str(), Some("content/7f9c2ab4-pool"));
+            assert_eq!(alias_written["etag"].as_str(), Some("etag-abc"));
+            let tomb_written: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(objects_root.join("novels/site/title/挿絵/gone.png")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(tomb_written["physical"].as_str(), Some(""));
+            assert!(
+                !layout.write_root.root().join(".objects/.narou-transfer/.data/blob-x").exists(),
+                "sessions/blobs/locks never reach the export"
+            );
+            assert!(!layout
+                .write_root
+                .root()
+                .join(".objects/.narou-transfer/.remote/session-1")
+                .exists());
+            assert!(!layout.write_root.root().join(".objects/.narou-staging/y").exists());
+        });
+    }
+
+    /// Restart recovery for a crashed flip: durable intent file + marker in
+    /// each crash position must converge to exactly one authority.
+    /// `reconcile_cutover_intent` opens the database itself — the same path a
+    /// marker=yaml restart takes via `NativeStore::for_narou_root`.
+    #[test]
+    fn reconcile_cutover_intent_converges_every_crash_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_path(&dir);
+        std::fs::create_dir_all(&root).unwrap();
+        let narou_dir = root.join(".narou");
+        crate::native::sqlite::state::write_mode(&narou_dir, StorageMode::Sqlite).unwrap();
+        let state = super::super::state::configure(&narou_dir).unwrap();
+        let intent = narou_dir.join(CUTOVER_INTENT_FILE);
+
+        // Case A: marker=yaml written but tx rolled back (no pending row).
+        crate::db::inventory::atomic_write(&intent, "in flight\n").unwrap();
+        crate::native::sqlite::state::write_mode(&narou_dir, StorageMode::Yaml).unwrap();
+        reconcile_cutover_intent(&narou_dir).unwrap();
+        assert_eq!(
+            crate::native::sqlite::state::read_mode(&narou_dir),
+            StorageMode::Sqlite,
+            "rolled-back flip restores the SQLite selector"
+        );
+        assert!(!intent.exists());
+
+        // Case B: marker=sqlite + leftover intent (post-crash debris) —
+        // discharges evidence without touching the selector.
+        {
+            let conn = state.conn_ref().lock();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cutover_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;\
+                 INSERT OR REPLACE INTO cutover_meta(key,value) VALUES('yaml_pending','1');",
+            )
+            .unwrap();
+        }
+        crate::db::inventory::atomic_write(&intent, "in flight\n").unwrap();
+        reconcile_cutover_intent(&narou_dir).unwrap();
+        assert_eq!(
+            crate::native::sqlite::state::read_mode(&narou_dir),
+            StorageMode::Sqlite
+        );
+        assert!(!intent.exists());
+        {
+            let conn = state.conn_ref().lock();
+            let pending: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cutover_meta WHERE key='yaml_pending')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!pending, "stale intent row discharged");
+        }
+
+        // No intent file: untouched regardless of marker.
+        reconcile_cutover_intent(&narou_dir).unwrap();
+        assert_eq!(
+            crate::native::sqlite::state::read_mode(&narou_dir),
+            StorageMode::Sqlite
+        );
+    }
+
+    /// Committed-flip crash: marker=yaml + committed pending row + a
+    /// `.gate.pending` journal -> the reconciler installs the canonical FS
+    /// gate at the journaled epoch, retires the journal and discharges
+    /// intent. The marker correctly stays yaml (the flip DID commit).
+    #[test]
+    fn reconcile_cutover_intent_finishes_committed_pending_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_path(&dir);
+        std::fs::create_dir_all(&root).unwrap();
+        let narou_dir = root.join(".narou");
+        crate::native::sqlite::state::write_mode(&narou_dir, StorageMode::Sqlite).unwrap();
+        let state = super::super::state::configure(&narou_dir).unwrap();
+        let mirror =
+            NativeObjectStore::from_root(root.join(crate::downloader::types::ARCHIVE_ROOT_DIR))
+                .unwrap();
+        let prefix = ObjectPrefix::new("novels/site/title".to_string()).unwrap();
+        {
+            let conn = state.conn_ref().lock();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cutover_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;\
+                 INSERT OR REPLACE INTO cutover_meta(key,value) VALUES('yaml_pending','1');",
+            )
+            .unwrap();
+            // The handoff tuple the committed adoption recorded (sql 3 -> fs 4).
+            crate::native::object_store::record_fs_gate_handoff(&conn, "novels/site/title", 3, 4, "")
+                .unwrap();
+        }
+        let pending_gate = crate::native::object_store::FsGate {
+            prefix: Some("novels/site/title".to_string()),
+            origin_url_fold: String::new(),
+            content_revision: 7,
+            epoch: 4,
+            owner: None,
+            updated_at: 1,
+            migrated: false,
+            readers: std::collections::BTreeMap::from([(
+                "reader-1".to_string(),
+                (3u64, crate::platform::transfer_stage::now_secs() + 600),
+            )]),
+        };
+        let pending_path = mirror.gate_pending_path(&prefix).unwrap();
+        std::fs::create_dir_all(pending_path.parent().unwrap()).unwrap();
+        std::fs::write(&pending_path, serde_json::to_vec(&pending_gate).unwrap()).unwrap();
+
+        let intent = narou_dir.join(CUTOVER_INTENT_FILE);
+        crate::db::inventory::atomic_write(&intent, "in flight\n").unwrap();
+        crate::native::sqlite::state::write_mode(&narou_dir, StorageMode::Yaml).unwrap();
+
+        reconcile_cutover_intent(&narou_dir).unwrap();
+
+        assert_eq!(
+            crate::native::sqlite::state::read_mode(&narou_dir),
+            StorageMode::Yaml,
+            "committed flip keeps the yaml selector"
+        );
+        assert!(!intent.exists(), "converged intent discharged");
+        assert!(!pending_path.exists(), "journal retired");
+        let gate_path = mirror.gate_path(&prefix).unwrap();
+        let gate: crate::native::object_store::FsGate =
+            serde_json::from_slice(&std::fs::read(&gate_path).unwrap()).unwrap();
+        assert_eq!(gate.epoch, 4);
+        assert_eq!(gate.content_revision, 7);
+        assert_eq!(
+            gate.readers.get("reader-1").map(|(epoch, _)| *epoch),
+            Some(3),
+            "reader lease survives at its original epoch"
+        );
     }
 }

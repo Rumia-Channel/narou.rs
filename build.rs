@@ -5,6 +5,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[path = "scripts/transfer-artifacts.rs"]
+mod transfer_artifacts;
+
 fn main() {
     configure_windows_uac_manifest();
     configure_windows_main_thread_stack();
@@ -64,6 +67,10 @@ fn main() {
     writeln!(file, "        _ => None,").expect("write asset version default");
     writeln!(file, "    }}").expect("write asset version footer");
     writeln!(file, "}}").expect("write asset version end");
+
+    if std::env::var_os("CARGO_FEATURE_NATIVE_RUNTIME").is_some() {
+        emit_transfer_artifacts(&out_dir);
+    }
 }
 
 fn configure_windows_uac_manifest() {
@@ -135,3 +142,97 @@ fn sha3_256_base64_url(bytes: &[u8]) -> String {
     hasher.update(bytes);
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
+
+/// Browser transfer WASM artifacts.
+///
+/// `scripts/build-transfer-wasm.mjs` compiles `transfer_wasm` and emits
+/// content-hashed glue/wasm/worker files plus `manifest.json` under
+/// `target/transfer-artifacts/`. We copy them into OUT_DIR and generate the
+/// include used by `src/web/frontend.rs` to serve `/assets/transfer/*`.
+///
+/// Development builds tolerate a missing set: `web_transfer_artifact` then
+/// returns `None` and the UI reports the capability as unavailable (design
+/// §14.1; never a server-side ZIP fallback). Release/CI packaging sets
+/// `NAROU_RS_REQUIRE_TRANSFER_ARTIFACTS=1`, which turns absence into a hard
+/// failure so nothing ships as "transfer capable" without the real artifacts.
+fn emit_transfer_artifacts(out_dir: &Path) {
+    println!("cargo:rerun-if-env-changed=NAROU_RS_REQUIRE_TRANSFER_ARTIFACTS");
+    let artifact_dir = PathBuf::from("target").join("transfer-artifacts");
+    let required = std::env::var("NAROU_RS_REQUIRE_TRANSFER_ARTIFACTS")
+        .map(|value| !matches!(value.trim(), "" | "0" | "false" | "FALSE"))
+        .unwrap_or(false);
+    let artifacts = match transfer_artifacts::load(&artifact_dir) {
+        Ok(artifacts) => Some(artifacts),
+        Err(error) => {
+            let detail = format!(
+                "transfer WASM artifacts unavailable: {error}; run `node scripts/build-transfer-wasm.mjs --install-bindgen` before building"
+            );
+            if required {
+                panic!("{detail}");
+            }
+            println!("cargo:warning={detail}");
+            None
+        }
+    };
+    let mut file = fs::File::create(out_dir.join("web_transfer_artifacts.rs"))
+        .expect("create generated transfer artifact file");
+    if let Some(artifacts) = artifacts {
+        let dest_dir = out_dir.join("transfer");
+        fs::create_dir_all(&dest_dir).expect("create transfer artifact directory");
+        fs::write(dest_dir.join("manifest.json"), artifacts.json)
+            .expect("copy verified transfer manifest");
+        writeln!(
+            file,
+            "pub const TRANSFER_ARTIFACT_MANIFEST: Option<&'static str> = Some(include_str!(concat!(env!(\"OUT_DIR\"), \"/transfer/manifest.json\")));"
+        )
+        .expect("write transfer manifest constant");
+        writeln!(
+            file,
+            "pub const TRANSFER_ARTIFACT_BUILD_ID: Option<&'static str> = Some({:?});",
+            artifacts.build_id
+        )
+        .expect("write transfer build id");
+        writeln!(
+            file,
+            "pub const TRANSFER_ARTIFACT_ABI_VERSION: Option<u32> = Some({});",
+            artifacts.abi_version
+        )
+        .expect("write transfer ABI version");
+        writeln!(
+            file,
+            "pub fn web_transfer_artifact(name: &str) -> Option<(&'static str, &'static [u8])> {{\n    match name {{"
+        )
+        .expect("write transfer artifact function");
+        for name in artifacts.files.keys() {
+            let target = dest_dir.join(name);
+            fs::create_dir_all(target.parent().expect("artifact parent"))
+                .expect("create artifact subdirectory");
+            fs::copy(artifact_dir.join(name), target).expect("copy verified transfer artifact");
+            writeln!(
+                file,
+                "        {:?} => Some(({:?}, &include_bytes!(concat!(env!(\"OUT_DIR\"), \"/transfer/{}\"))[..])),",
+                name,
+                transfer_content_type(name),
+                name
+            )
+            .expect("write transfer artifact entry");
+        }
+        writeln!(file, "        _ => None,\n    }}\n}}").expect("write artifact match end");
+    } else {
+        writeln!(
+            file,
+            "pub const TRANSFER_ARTIFACT_MANIFEST: Option<&'static str> = None;\npub const TRANSFER_ARTIFACT_BUILD_ID: Option<&'static str> = None;\npub const TRANSFER_ARTIFACT_ABI_VERSION: Option<u32> = None;\npub fn web_transfer_artifact(_name: &str) -> Option<(&'static str, &'static [u8])> {{ None }}"
+        )
+        .expect("write unavailable transfer capability");
+    }
+}
+
+fn transfer_content_type(name: &str) -> &'static str {
+    match Path::new(name).extension().and_then(|ext| ext.to_str()) {
+        Some("wasm") => "application/wasm",
+        Some("js" | "mjs") => "application/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+

@@ -36,6 +36,15 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         eprintln!("Error initializing database: {}", e);
         std::process::exit(1);
     }
+    // Recover interrupted transfer publication before bootstrap readers or tasks.
+    if let Err(e) = narou_rs::native::transfer::recover_startup() {
+        eprintln!("Error recovering transfer publication: {}", e);
+        std::process::exit(1);
+    }
+    if let Err(e) = narou_rs::native::application::recover_removals() {
+        eprintln!("Error recovering ordinary library operations: {}", e);
+        std::process::exit(1);
+    }
     if let Err(e) = fill_general_all_no_in_database() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
@@ -322,59 +331,44 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
 }
 
 fn fill_general_all_no_in_database() -> Result<(), String> {
-    use narou_rs::platform::{NovelFilter, NovelMutation};
+    use narou_rs::platform::NovelFilter;
 
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let ids = novels
         .scan_ids_sync(&NovelFilter::all(), None, usize::MAX)
         .map_err(|e| e.to_string())?;
-    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-        .map_err(|e| e.to_string())?;
-    // mirror-files=false では toc.yaml が実ファイルに無いので、
-    // ストアのオブジェクトから読めるようにする。
-    let store = narou_rs::native::object_store::NativeStore::for_current_root()
-        .map_err(|e| e.to_string())?;
-    let mut modified = false;
 
     for id in ids {
-        let Ok(Some(mut record)) = novels.get_sync(id) else {
+        let Some(record) = novels.get_current_sync(id).map_err(|error| error.to_string())? else {
             continue;
         };
         if record.general_all_no.is_some() {
             continue;
         }
-        let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
-        let toc = narou_rs::native::legacy_persistence::load_toc_file(&novel_dir)
-            .or_else(|| load_toc_from_store(&store, &archive_root, &novel_dir));
-        let Some(toc) = toc else {
-            continue;
-        };
-        record.general_all_no = Some(toc.subtitles.len() as i64);
-        novels
-            .apply_batch_sync(vec![NovelMutation::Upsert(record)])
-            .map_err(|e| e.to_string())?;
-        modified = true;
+        let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).map_err(|error| error.to_string())?;
+        let write = narou_rs::native::materialization::capture_write_for_record(&record).map_err(|error| error.to_string())?;
+        narou_rs::native::materialization::block_on(async {
+            let mut access = narou_rs::application::novel_access::NovelAccess::from_writer(write.clone(), "web-fill-count").await?;
+            let result = async {
+                let Some(bytes) = access.read()?.read_small(&keys.toc()).await? else {
+                    return Ok(false);
+                };
+                let toc: narou_rs::downloader::TocFile = serde_yaml::from_slice(&bytes)?;
+                novels.update_existing_guarded_sync(write.fence(), id, |record| {
+                    if record.general_all_no.is_none() {
+                        record.general_all_no = Some(toc.subtitles.len() as i64);
+                    }
+                    Ok(())
+                })
+            }.await;
+            let released = access.release().await;
+            result.and_then(|value| released.map(|_| value))
+        }).map_err(|error| error.to_string())?;
     }
 
-    let _ = modified;
     Ok(())
 }
 
-/// ストア上の `toc.yaml` を読む (実ファイルが無い構成の補完用)。
-fn load_toc_from_store(
-    store: &narou_rs::native::object_store::NativeStore,
-    archive_root: &std::path::Path,
-    novel_dir: &std::path::Path,
-) -> Option<narou_rs::downloader::TocFile> {
-    let prefix = narou_rs::native::object_store::novel_object_prefix(archive_root, novel_dir)?;
-    let key = prefix.join("toc.yaml").ok()?;
-    let bytes = futures::executor::block_on(narou_rs::platform::ObjectStore::read_small(
-        store, &key,
-    ))
-    .ok()
-    .flatten()?;
-    serde_yaml::from_slice(&bytes).ok()
-}
 
 fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;

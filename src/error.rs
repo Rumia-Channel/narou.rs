@@ -16,6 +16,9 @@ pub enum NarouError {
     #[error("Platform error: {0}")]
     Platform(String),
 
+    #[error("novel_recovering: creation cleanup pending")]
+    CreationCleanupPending,
+
     #[error("Regex error: {0}")]
     Regex(#[from] regex::Error),
 

@@ -53,6 +53,23 @@ fn column<T: rusqlite::types::FromSql>(row: &Row<'_>, index: usize) -> Result<T>
 }
 
 impl SqliteNovelRepository {
+    pub(crate) fn query_snapshot_sql(conn:&Connection,sql:&str,binds:&[rusqlite::types::Value])->Result<Vec<NovelRecord>>{
+        let mut statement=conn.prepare(sql).map_err(super::sqlite_error)?;let mut rows=statement.query(params_from_iter(binds.iter())).map_err(super::sqlite_error)?;let mut records=Vec::new();while let Some(row)=rows.next().map_err(super::sqlite_error)?{records.push(record_from_row(row)?);}Ok(records)
+    }
+    pub(crate) fn point_snapshot_conn(conn:&Connection,id:NovelId)->Result<Option<NovelRecord>>{
+        let mut statement=conn.prepare(&select_by_id_sql()).map_err(super::sqlite_error)?;let mut rows=statement.query([id.0]).map_err(super::sqlite_error)?;rows.next().map_err(super::sqlite_error)?.map(record_from_row).transpose()
+    }
+    pub(crate) fn query_snapshot_conn(conn:&Connection,query:&NovelQuery)->Result<Vec<NovelRecord>>{let SqlQuery{sql,binds}=novel_query::query_sql(query,query_bind);Self::query_snapshot_sql(conn,&sql,&binds)}
+    pub(crate) fn many_snapshot_conn(conn:&Connection,ids:&[NovelId])->Result<Vec<Option<NovelRecord>>>{
+        if ids.is_empty(){return Ok(Vec::new());}let sql=format!("{} WHERE n.id IN (SELECT CAST(value AS INTEGER) FROM json_each(?1))",crate::db::novel_codec::NOVEL_SELECT_SQL);let ids_json=serde_json::to_string(ids).map_err(|error|NarouError::Platform(error.to_string()))?;
+        Ok(crate::platform::repository::align_current_records(ids,Self::query_snapshot_sql(conn,&sql,&[rusqlite::types::Value::Text(ids_json)])?))
+    }
+    pub(crate) fn prefix_snapshot_conn(conn:&Connection,prefix:&crate::platform::ObjectKey)->Result<Option<NovelRecord>>{let sql=format!("{} WHERE n.id IN (SELECT novel_id FROM novel_gate_bindings WHERE prefix=?1) ORDER BY n.id LIMIT 1",crate::db::novel_codec::NOVEL_SELECT_SQL);Ok(Self::query_snapshot_sql(conn,&sql,&[rusqlite::types::Value::Text(prefix.to_string())])?.pop())}
+    pub(crate) fn url_snapshot_conn(conn:&Connection,url:&str)->Result<Option<NovelRecord>>{Ok(Self::query_snapshot_sql(conn,&select_by_toc_url_sql(),&[rusqlite::types::Value::Text(crate::db::novel_codec::fold(url))])?.pop())}
+    pub(crate) fn title_snapshot_conn(conn:&Connection,title:&str)->Result<Option<NovelRecord>>{Ok(Self::query_snapshot_sql(conn,&select_by_title_sql(),&[rusqlite::types::Value::Text(fold(title))])?.pop())}
+    pub(crate) fn ncode_snapshot_conn(conn:&Connection,ncode:&str)->Result<Option<NovelRecord>>{let folded=fold(ncode);let mut statement=conn.prepare(&select_by_ncode_sql()).map_err(super::sqlite_error)?;let mut rows=statement.query([folded.as_str();3]).map_err(super::sqlite_error)?;rows.next().map_err(super::sqlite_error)?.map(record_from_row).transpose()}
+    pub(crate) fn count_snapshot_conn(conn:&Connection,filter:&NovelFilter)->Result<u64>{let SqlQuery{sql,binds}=novel_query::count_sql(filter,query_bind);let count:i64=conn.query_row(&sql,params_from_iter(binds.iter()),|row|row.get(0)).map_err(super::sqlite_error)?;u64::try_from(count).map_err(|_|NarouError::Platform("negative record count".into()))}
+    pub(crate) fn scan_snapshot_conn(conn:&Connection,filter:&NovelFilter,after:Option<NovelId>,limit:usize)->Result<Vec<NovelId>>{let SqlQuery{sql,binds}=novel_query::scan_ids_sql(filter,after,limit,query_bind);let mut statement=conn.prepare(&sql).map_err(super::sqlite_error)?;statement.query_map(params_from_iter(binds.iter()),|row|row.get::<_,i64>(0).map(NovelId)).map_err(super::sqlite_error)?.collect::<std::result::Result<_,_>>().map_err(super::sqlite_error)}
     /// Raw connection handle for `bulk` persistence helpers.
     pub(crate) fn conn_handle(&self) -> Arc<Mutex<Connection>> {
         self.conn.clone()
@@ -99,7 +116,14 @@ static UPSERT_CHANGED_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::ne
     format!("{NOVEL_UPSERT_SQL} WHERE {comparisons}")
 });
 
+pub(crate) fn bind_existing_record_origin(conn:&Connection,id:i64)->Result<()>{
+    use rusqlite::OptionalExtension;let old:Option<(String,String,bool)>=conn.query_row("SELECT sitename,file_title,use_subdirectory FROM novels WHERE id=?",[id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(super::sqlite_error)?;
+    if let Some((site,title,subdirectory))=old{let keys=crate::platform::NovelObjectKeys::new(&site,&title,subdirectory)?;conn.execute("INSERT INTO novel_gate_bindings(novel_id,prefix) VALUES(?,?) ON CONFLICT(novel_id) DO UPDATE SET prefix=excluded.prefix",rusqlite::params![id,keys.prefix().as_ref()]).map_err(super::sqlite_error)?;}Ok(())
+}
+
 pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Result<()> {
+    let keys=crate::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;
+    conn.execute("INSERT INTO novel_gate_bindings(novel_id,prefix) VALUES (?,?) ON CONFLICT(novel_id) DO UPDATE SET prefix=excluded.prefix",rusqlite::params![record.id,keys.prefix().as_ref()]).map_err(super::sqlite_error)?;
     // A re-registered novel can receive the same tag from multiple sources.
     // Normalize before encoding tags_json/tags_sort as well as novel_tags, so
     // the denormalized and indexed representations never disagree.
@@ -186,6 +210,36 @@ pub(crate) fn sync_frozen_novels(conn: &rusqlite::Transaction<'_>, frozen_ids: &
 }
 
 impl NovelRepository for SqliteNovelRepository {
+    fn remove_closed<'a>(&'a self,prefix:&'a crate::platform::ObjectPrefix,owner:&'a str,epoch:u64,id:NovelId)->crate::platform::PlatformFuture<'a,Result<()>>{
+        let prefix=prefix.clone();let owner=owner.to_owned();Box::pin(blocking(self.conn.clone(),move|conn|{
+            if crate::platform::access_fence::parse_removal_owner(&owner)?.0!=id{return Err(NarouError::Platform("removal owner ID mismatch".into()));}let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;super::object_store::require_transfer_epoch(&tx,&prefix,Some(&owner),epoch,true)?;
+            if let Some(record)=Self::point_snapshot_conn(&tx,id)?{let keys=crate::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;if keys.prefix().as_ref()!=prefix.as_ref().trim_end_matches('/'){return Err(NarouError::Platform("removal record identity changed".into()));}bind_existing_record_origin(&tx,id.0)?;tx.execute(novel_query::DELETE_NOVEL_SQL,[id.0]).map_err(super::sqlite_error)?;}
+            tx.commit().map_err(super::sqlite_error)
+        }))
+    }
+    fn get_current<'a>(&'a self,id:NovelId)->crate::platform::PlatformFuture<'a,Result<Option<NovelRecord>>>{Box::pin(blocking(self.conn.clone(),move|conn|Self::point_snapshot_conn(conn,id)))}
+    fn get_many_current<'a>(&'a self,ids:&'a [NovelId])->crate::platform::PlatformFuture<'a,Result<Vec<Option<NovelRecord>>>>{let ids=ids.to_vec();Box::pin(blocking(self.conn.clone(),move|conn|Self::many_snapshot_conn(conn,&ids)))}
+    fn query_current<'a>(&'a self,query:&'a NovelQuery)->crate::platform::PlatformFuture<'a,Result<Vec<NovelRecord>>>{self.query(query)}
+    fn find_by_toc_url_current<'a>(&'a self,url:&'a str)->crate::platform::PlatformFuture<'a,Result<Option<NovelRecord>>>{self.find_by_toc_url(url)}
+    fn find_by_storage_prefix_current<'a>(&'a self,prefix:&'a crate::platform::ObjectKey)->crate::platform::PlatformFuture<'a,Result<Option<NovelRecord>>>{let prefix=prefix.clone();Box::pin(blocking(self.conn.clone(),move|conn|Self::prefix_snapshot_conn(conn,&prefix)))}
+    fn apply_batch_guarded_many<'a>(&'a self,fences:&'a [crate::platform::WriteFence],mutations:Vec<NovelMutation>)->crate::platform::PlatformFuture<'a,Result<()>>{
+        let fences=fences.to_vec();Box::pin(blocking(self.conn.clone(),move|conn|{
+            if fences.is_empty()&&!mutations.is_empty(){return Err(NarouError::Platform("record mutation has no writer fence".into()));}
+            let invalidate=mutations.iter().any(|mutation|matches!(mutation,NovelMutation::Remove(_)));
+            let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;for fence in &fences{super::object_store::require_transfer_epoch(&tx,&fence.prefix,None,fence.epoch,false)?;}
+            for mutation in &mutations{let id=match mutation{NovelMutation::Upsert(record)=>record.id,NovelMutation::Remove(id)=>id.0};use rusqlite::OptionalExtension;
+                let previous:Option<(String,String,bool)>=tx.query_row("SELECT sitename,file_title,use_subdirectory FROM novels WHERE id=?",[id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(super::sqlite_error)?;
+                if let Some((site,title,subdirectory))=previous{let keys=crate::platform::NovelObjectKeys::new(&site,&title,subdirectory)?;if !fences.iter().any(|fence|keys.prefix().as_ref()==fence.prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("previous record origin outside captured fence".into()));}}
+            }
+            for mutation in mutations{match mutation{NovelMutation::Upsert(record)=>{let keys=crate::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;if !fences.iter().any(|fence|keys.prefix().as_ref()==fence.prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("record outside captured fence".into()));}upsert_record_conn(&tx,&record)?;},NovelMutation::Remove(id)=>{
+                use rusqlite::OptionalExtension;let prefix:Option<String>=tx.query_row("SELECT prefix FROM novel_gate_bindings WHERE novel_id=?",[id.0],|row|row.get(0)).optional().map_err(super::sqlite_error)?;if prefix.as_deref().is_some_and(|prefix|!fences.iter().any(|fence|prefix==fence.prefix.as_ref().trim_end_matches('/'))){return Err(NarouError::Platform("record outside captured fence".into()));}
+                bind_existing_record_origin(&tx,id.0)?;
+                tx.execute(novel_query::DELETE_NOVEL_SQL,[id.0]).map_err(super::sqlite_error)?;}}}
+            if invalidate{for fence in &fences{tx.execute("UPDATE novel_access_gates SET epoch=CASE WHEN epoch<9223372036854775807 THEN epoch+1 ELSE abs(-9223372036854775808) END,updated_at=unixepoch() WHERE prefix=? AND epoch=? AND closed=0",rusqlite::params![fence.prefix.as_ref().trim_end_matches('/'),fence.epoch as i64]).map_err(super::sqlite_error)?;}}
+            tx.commit().map_err(super::sqlite_error)
+        }))
+    }
+
     fn get<'a>(
         &'a self,
         id: NovelId,
@@ -348,6 +402,18 @@ impl crate::application::events::FreezeStore for SqliteFreezeStore {
 }
 
 impl crate::application::novel_actions::FreezeMutationStore for SqliteFreezeStore {
+    fn set_frozen_guarded_many<'a>(&'a self,fences:&'a [crate::platform::WriteFence],ids:&'a [NovelId],frozen:bool)->crate::platform::PlatformFuture<'a,Result<()>>{
+        let fences=fences.to_vec();let ids=ids.to_vec();Box::pin(blocking(self.conn.clone(),move|conn|{
+            if ids.is_empty(){return Ok(());}if fences.is_empty(){return Err(NarouError::Platform("freeze has no captured fence".into()));}
+            let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
+            for fence in &fences{super::object_store::require_transfer_epoch(&tx,&fence.prefix,None,fence.epoch,false)?;}
+            for id in ids{bind_existing_record_origin(&tx,id.0)?;let prefix:String=tx.query_row("SELECT prefix FROM novel_gate_bindings WHERE novel_id=?",[id.0],|row|row.get(0)).map_err(super::sqlite_error)?;
+                if !fences.iter().any(|fence|prefix==fence.prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("freeze outside captured fences".into()));}
+                tx.execute(if frozen{"INSERT OR IGNORE INTO frozen_novels(novel_id) VALUES (?)"}else{"DELETE FROM frozen_novels WHERE novel_id=?"},[id.0]).map_err(super::sqlite_error)?;refresh_status_sort(&tx,id.0)?;
+            }tx.commit().map_err(super::sqlite_error)
+        }))
+    }
+
     fn set_frozen<'a>(
         &'a self,
         ids: &'a [NovelId],

@@ -133,8 +133,21 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
             });
 
             let target_path = Path::new(target);
-            if target_path.is_file() {
-                convert_text_target(TextConvertContext {
+            let text_target = match std::fs::metadata(target_path) {
+                Ok(metadata) => metadata.is_file(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if !target.contains("://") && target_path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("txt")) {
+                        match narou_rs::application::novel_access::is_private_path(target_path) {
+                            Ok(private) => !private,
+                            Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); continue; }
+                        }
+                    } else { false }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => false,
+                Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); continue; }
+            };
+            if text_target {
+                if convert_text_target(TextConvertContext {
                     target,
                     target_path,
                     output_filename: output_filename.as_deref(),
@@ -151,7 +164,10 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                     verbose,
                     first_output_dir: &mut first_output_dir,
                     sink,
-                });
+                }) {
+                    completed_count += 1;
+                    sink.emit(Stream::Stdout, &messages::convert::completed(index + 1, total_count, target));
+                }
                 continue;
             }
 
@@ -159,27 +175,37 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                 sink.emit(Stream::Stdout, &messages::target_missing(target));
                 continue;
             };
-
-            let dc_subjects = match load_dc_subjects_for_novel(id) {
-                Ok(subjects) => subjects,
-                Err(err) => {
-                    sink.emit(Stream::Stdout, &err);
-                    None
-                }
+            let write = match conversion_origin(id) {
+                Ok(write) => write,
+                Err(error) => { sink.emit(Stream::Stdout, &error); continue; }
+            };
+            let _lock = match narou_rs::compat::NovelLockGuard::acquire(Some(id)) {
+                Ok(lock) => lock,
+                Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); continue; }
             };
 
-            if let Err(err) = narou_rs::title::sync_title_projection(id) {
+
+            if let Err(err) = narou_rs::title::sync_title_projection(&write, id) {
                 sink.emit(Stream::Stdout, &messages::indented_error(err));
                 continue;
             }
 
             let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-            let record = match novels.get_sync(id.into()) {
+            let record = match novels.get_current_sync(id.into()) {
                 Ok(Some(record)) => record,
-                _ => {
+                Ok(None) => {
                     sink.emit(Stream::Stdout, &messages::convert::id_missing(id));
                     continue;
                 }
+                Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); continue; }
+            };
+            let novel_dir = match novel_directory(&record) {
+                Ok(path) => path,
+                Err(error) => { sink.emit(Stream::Stdout, &error); continue; }
+            };
+            let dc_subjects = match load_dc_subjects_for_novel(&record) {
+                Ok(subjects) => subjects,
+                Err(error) => { sink.emit(Stream::Stdout, &error); None }
             };
             if record
                 .ncode
@@ -202,14 +228,8 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                     );
                     continue;
                 };
-                let _lock = match narou_rs::compat::NovelLockGuard::acquire(Some(id)) {
-                    Ok(lock) => lock,
-                    Err(err) => {
-                        sink.emit(Stream::Stdout, &messages::indented_error(err));
-                        continue;
-                    }
-                };
                 match narou_rs::native::virtual_novel::convert_virtual(
+                    &write,
                     id,
                     &record,
                     &members,
@@ -218,6 +238,18 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                     verbose,
                 ) {
                     Ok(path) => {
+                        let snapshot = match narou_rs::native::materialization::snapshot_with_origin(&novel_dir, &write) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); continue; }
+                        };
+                        let private_output = match private_output_path(&path, &novel_dir, snapshot.path()) {
+                            Ok(path) => path,
+                            Err(error) => { sink.emit(Stream::Stdout, &error); continue; }
+                        };
+                        if apply_dc_subjects_if_needed(&private_output, dc_subjects.as_deref(), sink)
+                            && let Err(error) = publish_generated_file(&write, &private_output, &novel_dir, snapshot.path()) {
+                            sink.emit(Stream::Stdout, &error); continue;
+                        }
                         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                             sink.emit(Stream::Stdout, &messages::convert::output_written(name));
                         }
@@ -231,7 +263,7 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                             first_output_dir = path.parent().map(Path::to_path_buf);
                         }
                         if let Err(err) = print_copy_to_result(
-                            &path.display().to_string(),
+                            &private_output.display().to_string(),
                             copy_device,
                             id,
                             sink,
@@ -253,28 +285,23 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                 }
                 continue;
             }
-            let archive_root =
-                narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-                    .unwrap_or_else(|_| {
-                        std::path::PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR)
-                    });
-            let (novel_dir, title, author) = (
-                narou_rs::db::existing_novel_dir_for_record(&archive_root, &record),
-                record.title.clone(),
-                record.author.clone(),
-            );
-
-            // `setting.ini` / `replace.txt` / `converter.yaml` はストアにだけ
-            // あることがある (mirror-files=false)。ファイルとして読む前に
-            // 取り出し、この対象の処理が終わるまで保持する。
-            let _materialized_inputs = match narou_rs::converter::materialize_for_conversion(&novel_dir) {
-                Ok(files) => files,
-                Err(err) => {
-                    sink.emit(Stream::Stdout, &messages::indented_error(err));
-                    continue;
-                }
+            let (title, author) = (record.title.clone(), record.author.clone());
+            let (input_snapshot, settings) = match narou_rs::native::materialization::conversion_snapshot_with_origin(&novel_dir, &write, None, |path| {
+                let mut settings = NovelSettings::load_for_novel_with_options(id, &title, &author, path, ignore_force, ignore_default)?;
+                if let Some(filename) = &output_filename { settings.output_filename = filename.clone(); }
+                apply_device_related_settings(&mut settings, selected_device, explicit_device);
+                let selection = narou_rs::native::materialization::ConversionInputSelection {
+                    illustrations: settings.enable_illust,
+                    cover: create_ibunko_side_epub || output_device.is_some_and(|device| device != narou_rs::converter::device::Device::Text),
+                };
+                Ok((settings, selection))
+            }) {
+                Ok(inputs) => inputs,
+                Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); continue; }
             };
 
+            // The converter snapshots inputs privately; never restore temporary
+            // inputs into the canonical directory and delete them afterwards.
             let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
                 Box::new(WebProgress::new("convert"))
             } else {
@@ -284,47 +311,39 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                 ))
             };
 
-            let mut settings = NovelSettings::load_for_novel_with_options(
-                id,
-                &title,
-                &author,
-                &novel_dir,
-                ignore_force,
-                ignore_default,
-            );
-            if let Some(output_filename) = &output_filename {
-                settings.output_filename = output_filename.clone();
-            }
-            apply_device_related_settings(&mut settings, selected_device, explicit_device);
             let include_illust = settings.enable_illust;
-            let mut converter =
-                if let Some(user_converter) = UserConverter::load_with_title(&novel_dir, &title) {
-                    NovelConverter::with_user_converter(settings, user_converter)
-                } else {
-                    NovelConverter::new(settings)
-                };
+            let converter = if let Some(user_converter) = UserConverter::load_with_title(input_snapshot.path(), &title) {
+                NovelConverter::try_with_user_converter(settings, user_converter)
+            } else {
+                NovelConverter::try_new(settings)
+            };
+            let mut converter = match converter {
+                Ok(converter) => converter,
+                Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); continue; }
+            };
+            if let Err(error) = converter.set_write_guard(write.clone()) {
+                sink.emit(Stream::Stdout, &messages::indented_error(error));
+                continue;
+            }
             converter.set_progress(progress);
             converter.set_display_inspector(inspect);
 
-            let _lock = match narou_rs::compat::NovelLockGuard::acquire(Some(id)) {
-                Ok(lock) => lock,
-                Err(e) => {
-                    sink.emit(Stream::Stdout, &messages::indented_error(e));
-                    continue;
-                }
-            };
             let result = match output_device {
                 Some(device) => converter
-                    .convert_novel_by_id_with_device(id, &novel_dir, device, no_strip, verbose)
+                    .convert_novel_by_id_with_device(id, input_snapshot.path(), device, no_strip, verbose)
                     .map(|path| path.display().to_string()),
-                None => converter.convert_novel_by_id(id, &novel_dir),
+                None => converter.convert_novel_by_id(id, input_snapshot.path()),
             };
 
             match result {
                 Ok(output_path) => {
+                    let private_output = match private_output_path(Path::new(&output_path), &novel_dir, input_snapshot.path()) {
+                        Ok(path) => path,
+                        Err(error) => { sink.emit(Stream::Stdout, &error); continue; }
+                    };
                     if create_ibunko_side_epub {
                         match create_ibunko_epub_output(
-                            Path::new(&output_path),
+                            &private_output,
                             narou_rs::converter::device::Device::Epub,
                             include_illust,
                             verbose,
@@ -335,6 +354,9 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                                     dc_subjects.as_deref(),
                                     sink,
                                 );
+                                if let Err(error) = publish_generated_file(&write, &epub_path, &novel_dir, input_snapshot.path()) {
+                                    sink.emit(Stream::Stdout, &error); continue;
+                                }
                                 if let Some(fname) = epub_path.file_name().and_then(|n| n.to_str())
                                 {
                                     sink.emit(
@@ -372,29 +394,28 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                             &bold_colored(messages::convert::epub_written(), "green"),
                         );
                     }
+                    if apply_dc_subjects_if_needed(&private_output, dc_subjects.as_deref(), sink)
+                        && let Err(error) = publish_generated_file(&write, &private_output, &novel_dir, input_snapshot.path()) {
+                        sink.emit(Stream::Stdout, &error); continue;
+                    }
                     if first_output_dir.is_none() {
                         first_output_dir = std::path::Path::new(&output_path)
                             .parent()
                             .map(|path| path.to_path_buf());
                     }
-                    if let Err(err) = print_copy_to_result(&output_path, copy_device, id, sink) {
+                    if let Err(err) = print_copy_to_result(&private_output.display().to_string(), copy_device, id, sink) {
                         sink.emit(Stream::Stdout, &err);
                     }
                     if output_path.to_ascii_lowercase().ends_with(".zip")
-                        && let Err(err) = print_copy_zip_to_result(&output_path, sink)
+                        && let Err(err) = print_copy_zip_to_result(&private_output.display().to_string(), sink)
                     {
                         sink.emit(Stream::Stdout, &err);
                     }
                     if let Some(device) = copy_device
-                        && let Err(err) = print_send_result(&output_path, device)
+                        && let Err(err) = print_send_result(&private_output.display().to_string(), device)
                     {
                         sink.emit(Stream::Stdout, &err);
                     }
-                    apply_dc_subjects_if_needed(
-                        Path::new(&output_path),
-                        dc_subjects.as_deref(),
-                        sink,
-                    );
                     print_inspection_output(&mut converter, sink);
                     completed_count += 1;
                     sink.emit(
@@ -408,14 +429,6 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                         &messages::convert::item_error(index + 1, total_count, target, e),
                     );
                 }
-            }
-            // Device errors occur after the intermediate text was written.
-            // Apply the keep-txt contract on both success and failure.
-            if !narou_rs::converter::keep_converted_text_file() {
-                if let Some(txt) = converter.last_converted_text_path() {
-                    let _ = std::fs::remove_file(txt);
-                }
-                let _ = std::fs::remove_file(novel_dir.join("novel.txt"));
             }
         }
 
@@ -432,6 +445,44 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
         && let Some(dir) = first_output_dir
     {
         narou_rs::compat::open_directory(&dir, Some("小説の保存フォルダを開きますか"));
+    }
+}
+
+fn conversion_origin(id: i64) -> Result<narou_rs::application::novel_access::NovelWriteGuard, String> {
+    let Some(raw) = std::env::var_os("NAROU_RS_WRITE_ORIGIN") else {
+        return narou_rs::native::materialization::capture_write_for_id(id).map_err(|error| error.to_string());
+    };
+    let raw = raw.to_str().ok_or_else(|| "queued conversion origin is not UTF-8".to_string())?;
+    let origin: narou_rs::application::novel_access::AccessOrigin = serde_json::from_str(raw).map_err(|error| error.to_string())?;
+    let stores = narou_rs::native::object_store::NativeStores::for_current_root().map_err(|error| error.to_string())?;
+    let write = narou_rs::native::materialization::block_on(narou_rs::application::novel_access::NovelWriteGuard::resume(stores.objects, Some(stores.assets), &origin)).map_err(|error| error.to_string())?;
+    let record = narou_rs::native::novel_repository::NativeNovelRepository::new().get_current_sync(id.into())
+        .map_err(|error| error.to_string())?.ok_or_else(|| format!("ID: {id}"))?;
+    let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).map_err(|error| error.to_string())?;
+    if write.prefix().as_ref() != keys.prefix().as_ref() { return Err("queued conversion origin changed its novel namespace".into()); }
+    Ok(write)
+}
+
+fn novel_directory(record: &narou_rs::db::NovelRecord) -> Result<PathBuf, String> {
+    let root = narou_rs::db::with_database(|database| Ok(database.archive_root().to_path_buf())).map_err(|error| error.to_string())?;
+    Ok(narou_rs::db::novel_dir_for_record(&root, record))
+}
+
+fn private_output_path(output: &Path, directory: &Path, snapshot: &Path) -> Result<PathBuf, String> {
+    match output.strip_prefix(directory) {
+        Ok(relative) => Ok(snapshot.join(relative)),
+        Err(_) => { narou_rs::application::novel_access::require_private_path(output).map_err(|error| error.to_string())?; Ok(output.to_path_buf()) }
+    }
+}
+
+fn publish_generated_file(write: &narou_rs::application::novel_access::NovelWriteGuard, source: &Path, directory: &Path, snapshot: &Path) -> Result<PathBuf, String> {
+    match source.strip_prefix(snapshot) {
+        Ok(relative) => {
+            let destination = directory.join(relative);
+            narou_rs::native::materialization::publish_file(write, source, &destination).map_err(|error| error.to_string())?;
+            Ok(destination)
+        }
+        Err(_) => { narou_rs::application::novel_access::require_private_path(source).map_err(|error| error.to_string())?; Ok(source.to_path_buf()) }
     }
 }
 
@@ -460,7 +511,78 @@ struct TextConvertContext<'a> {
     sink: &'a dyn MessageSink,
 }
 
-fn convert_text_target(ctx: TextConvertContext<'_>) {
+struct TextFileWorkspace {
+    source: PathBuf,
+    archive: PathBuf,
+    input: Option<narou_rs::native::materialization::NativeMutationSnapshot>,
+    output: Option<narou_rs::native::materialization::NativeMutationSnapshot>,
+}
+
+impl TextFileWorkspace {
+    fn begin(target: &Path, output_filename: Option<&str>) -> Result<Self, String> {
+        use narou_rs::native::materialization::NativeMutationSnapshot;
+        let input_origin = NativeMutationSnapshot::origin_for_path(target).map_err(|error| error.to_string())?;
+        let input_directory = input_origin.as_ref().map(|(write, _)| {
+            narou_rs::native::materialization::directory_for_origin(write)
+        }).transpose().map_err(|error| error.to_string())?;
+        let requested = text_output_archive_path(target, output_filename);
+        let requested = if requested.as_os_str().is_empty() {
+            std::env::current_dir().map_err(|error| error.to_string())?
+        } else if !narou_rs::application::novel_access::is_private_path(&requested).map_err(|error| error.to_string())? {
+            let archive = narou_rs::db::with_database(|database| Ok(database.archive_root().to_path_buf())).map_err(|error| error.to_string())?;
+            narou_rs::db::paths::ensure_within_archive_root(&requested, &archive).map_err(|error| error.to_string())?
+        } else {
+            std::fs::canonicalize(requested).map_err(|error| error.to_string())?
+        };
+        let shared = input_directory.as_ref().and_then(|directory| requested.strip_prefix(directory).ok().map(Path::to_path_buf));
+        // Admit both canonical owners before any body copy or rendering.
+        let output_origin = if shared.is_some() { None } else {
+            NativeMutationSnapshot::origin_for_path(&requested).map_err(|error| error.to_string())?
+        };
+        let input = match input_origin {
+            Some((write, relative)) => {
+                let directory = narou_rs::native::materialization::directory_for_origin(&write).map_err(|error| error.to_string())?;
+                Some((NativeMutationSnapshot::begin_with_origin(&directory, write).map_err(|error| error.to_string())?, relative))
+            }
+            None => None,
+        };
+        let source = match &input {
+            Some((snapshot, relative)) => snapshot.path().join(relative),
+            None => std::fs::canonicalize(target).map_err(|error| error.to_string())?,
+        };
+        let (output, archive) = match shared {
+            Some(relative) => (None, input.as_ref().expect("shared original input").0.path().join(relative)),
+            None => match output_origin {
+                Some((write, relative)) => {
+                    let directory = narou_rs::native::materialization::directory_for_origin(&write).map_err(|error| error.to_string())?;
+                    let snapshot = NativeMutationSnapshot::begin_with_origin(&directory, write).map_err(|error| error.to_string())?;
+                    let path = snapshot.path().join(relative);
+                    (Some(snapshot), path)
+                }
+                None => (None, requested),
+            },
+        };
+        Ok(Self { source, archive, input: input.map(|(snapshot, _)| snapshot), output })
+    }
+
+    fn publish(&self, source: &Path) -> Result<PathBuf, String> {
+        if self.input.is_some() && source == self.source {
+            return Err("変換結果で元のテキストファイルを置き換えることはできません。別の出力名を指定してください".into());
+        }
+        for snapshot in self.output.iter().chain(self.input.iter()) {
+            if let Ok(relative) = source.strip_prefix(snapshot.path()) {
+                let destination = snapshot.canonical_directory().join(relative);
+                narou_rs::native::materialization::publish_file(snapshot.origin(), source, &destination)
+                    .map_err(|error| error.to_string())?;
+                return Ok(destination);
+            }
+        }
+        narou_rs::application::novel_access::require_private_path(source).map_err(|error| error.to_string())?;
+        Ok(source.to_path_buf())
+    }
+}
+
+fn convert_text_target(ctx: TextConvertContext<'_>) -> bool {
     let TextConvertContext {
         target,
         target_path,
@@ -479,40 +601,47 @@ fn convert_text_target(ctx: TextConvertContext<'_>) {
         first_output_dir,
         sink,
     } = ctx;
-    let text = match read_text_file(target_path, encoding) {
+    let workspace = match TextFileWorkspace::begin(target_path, output_filename) {
+        Ok(workspace) => workspace,
+        Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); return false; }
+    };
+    let text = match read_text_file(&workspace.source, encoding) {
         Ok(text) => text,
         Err(message) => {
             for line in message.lines() {
                 sink.emit(Stream::Stdout, line);
             }
-            return;
+            return false;
         }
     };
 
-    let archive_path = text_output_archive_path(target_path, output_filename);
+    let archive_path = &workspace.archive;
     let source_name = target_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(target)
         .to_string();
-    let mut settings = NovelSettings::create_for_text_file_with_options(
-        &archive_path,
-        &source_name,
-        ignore_force,
-        ignore_default,
-    );
+    let mut settings = match NovelSettings::create_for_text_file_with_options(
+        &archive_path, &source_name, ignore_force, ignore_default,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); return false; }
+    };
     if let Some(output_filename) = output_filename {
         settings.output_filename = output_filename.to_string();
     }
     apply_device_related_settings(&mut settings, selected_device, explicit_device);
     let include_illust = settings.enable_illust;
 
-    let mut converter =
-        if let Some(user_converter) = UserConverter::load_with_title(&archive_path, &source_name) {
-            NovelConverter::with_user_converter(settings, user_converter)
-        } else {
-            NovelConverter::new(settings)
-        };
+    let converter = if let Some(user_converter) = UserConverter::load_with_title(&archive_path, &source_name) {
+        NovelConverter::try_with_user_converter(settings, user_converter)
+    } else {
+        NovelConverter::try_new(settings)
+    };
+    let mut converter = match converter {
+        Ok(converter) => converter,
+        Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); return false; }
+    };
     converter.set_display_inspector(inspect);
 
     let result = match output_device {
@@ -522,6 +651,10 @@ fn convert_text_target(ctx: TextConvertContext<'_>) {
 
     match result {
         Ok(output_path) => {
+            let published = match workspace.publish(Path::new(&output_path)) {
+                Ok(path) => path,
+                Err(error) => { sink.emit(Stream::Stdout, &messages::indented_error(error)); return false; }
+            };
             if create_ibunko_side_epub {
                 match create_ibunko_epub_output(
                     Path::new(&output_path),
@@ -530,6 +663,10 @@ fn convert_text_target(ctx: TextConvertContext<'_>) {
                     verbose,
                 ) {
                     Ok(Some(epub_path)) => {
+                        if let Err(error) = workspace.publish(&epub_path) {
+                            sink.emit(Stream::Stdout, &messages::indented_error(error));
+                            return false;
+                        }
                         if let Some(fname) = epub_path.file_name().and_then(|n| n.to_str()) {
                             sink.emit(Stream::Stdout, &messages::convert::output_written(fname));
                         }
@@ -541,6 +678,7 @@ fn convert_text_target(ctx: TextConvertContext<'_>) {
                     Ok(None) => {}
                     Err(err) => {
                         sink.emit(Stream::Stdout, &err);
+                        return false;
                     }
                 }
             }
@@ -560,9 +698,7 @@ fn convert_text_target(ctx: TextConvertContext<'_>) {
                 );
             }
             if first_output_dir.is_none() {
-                *first_output_dir = Path::new(&output_path)
-                    .parent()
-                    .map(|path| path.to_path_buf());
+                *first_output_dir = published.parent().map(Path::to_path_buf);
             }
             if let Err(err) = print_copy_to_result(&output_path, copy_device, 0, sink) {
                 sink.emit(Stream::Stdout, &err);
@@ -578,9 +714,11 @@ fn convert_text_target(ctx: TextConvertContext<'_>) {
                 sink.emit(Stream::Stdout, &err);
             }
             print_inspection_output(&mut converter, sink);
+            true
         }
         Err(e) => {
             sink.emit(Stream::Stdout, &messages::indented_error(e));
+            false
         }
     }
 }
@@ -748,6 +886,7 @@ fn create_ibunko_epub_output(
     include_illust: bool,
     verbose: bool,
 ) -> std::result::Result<Option<PathBuf>, String> {
+    narou_rs::application::novel_access::require_private_path(primary_output_path).map_err(|error| error.to_string())?;
     if !primary_output_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -773,17 +912,11 @@ fn create_ibunko_epub_output(
     Ok(Some(path))
 }
 
-fn load_dc_subjects_for_novel(novel_id: i64) -> std::result::Result<Option<Vec<String>>, String> {
+fn load_dc_subjects_for_novel(record: &narou_rs::db::NovelRecord) -> std::result::Result<Option<Vec<String>>, String> {
     if !narou_rs::compat::load_local_setting_bool("convert.add-dc-subject-to-epub") {
         return Ok(None);
     }
 
-    let record = narou_rs::native::novel_repository::NativeNovelRepository::new()
-        .get_sync(novel_id.into())
-        .map_err(|e| e.to_string())?;
-    let Some(record) = record else {
-        return Ok(None);
-    };
     if record.tags.is_empty() {
         return Ok(None);
     }
@@ -841,12 +974,12 @@ fn apply_dc_subjects_if_needed(
     output_path: &Path,
     subjects: Option<&[String]>,
     sink: &dyn MessageSink,
-) {
+) -> bool {
     let Some(subjects) = subjects else {
-        return;
+        return false;
     };
     if subjects.is_empty() || !is_epub_output(output_path) {
-        return;
+        return false;
     }
 
     match add_dc_subject_to_epub(output_path, subjects) {
@@ -855,10 +988,12 @@ fn apply_dc_subjects_if_needed(
                 Stream::Stdout,
                 &messages::convert::dc_subject_added(subjects.join(", ")),
             );
+            true
         }
         Err(err) => {
             sink.emit(Stream::Stdout, &messages::convert::dc_subject_error(err));
             sink.emit(Stream::Stdout, messages::convert::dc_subject_continue());
+            false
         }
     }
 }
@@ -874,6 +1009,7 @@ fn add_dc_subject_to_epub(
     epub_path: &Path,
     subjects: &[String],
 ) -> std::result::Result<(), String> {
+    narou_rs::application::novel_access::require_private_path(epub_path).map_err(|error| error.to_string())?;
     if subjects.is_empty() {
         return Ok(());
     }
@@ -1093,6 +1229,7 @@ fn resolve_text_file_encoding(label: &str) -> Option<&'static Encoding> {
 }
 
 fn read_text_file(path: &Path, encoding: Option<&str>) -> std::result::Result<String, String> {
+    narou_rs::application::novel_access::require_private_path(path).map_err(|error| error.to_string())?;
     let bytes = std::fs::read(path).map_err(messages::indented_error)?;
     let decoded = match encoding {
         Some(label) => decode_text_file_with_encoding(&bytes, label, path)?,
@@ -1143,6 +1280,68 @@ mod tests {
 
     impl narou_rs::application::messages::MessageSink for TestSink {
         fn emit(&self, _stream: narou_rs::application::messages::Stream, _text: &str) {}
+    }
+
+    #[test]
+    fn canonical_text_conversion_preserves_inputs_and_rejects_stale_publication() {
+        use narou_rs::platform::{NovelAccessFence, NovelObjectKeys, NovelRepository};
+        struct DatabaseRestore(Option<narou_rs::db::Database>);
+        impl Drop for DatabaseRestore {
+            fn drop(&mut self) { *narou_rs::db::DATABASE.lock() = self.0.take(); }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(root.path());
+        let _database = DatabaseRestore(narou_rs::db::DATABASE.lock().take());
+        std::fs::create_dir(root.path().join(".narou")).unwrap();
+        std::fs::write(root.path().join(".narou/storage-backend"), "sqlite").unwrap();
+        narou_rs::db::init_database().unwrap();
+        let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
+        let stores = narou_rs::native::object_store::NativeStores::for_narou_root(root.path()).unwrap();
+        let keys = NovelObjectKeys::new("site", "book", false).unwrap();
+        let write = narou_rs::native::materialization::block_on(async {
+            let reservation = repository.allocate_id().await?;
+            let mut record: narou_rs::db::NovelRecord = serde_yaml::from_str("id: 1\ntitle: book\nauthor: author\nfile_title: book\nsitename: site\ntoc_url: https://example.test/book\nnovel_type: 2\nlast_update: 2026-01-01T00:00:00Z\n")?;
+            record.id = reservation.id().0;
+            let mut write = narou_rs::application::novel_access::NovelWriteGuard::capture_for(&stores.objects, Some(&stores.assets), &keys).await?;
+            write.retain_reservation(&reservation)?;
+            repository.reserve_create(write.fence(), &reservation, &record.toc_url).await?;
+            repository.apply_create_guarded(write.fence(), &reservation, record).await?;
+            repository.release_id(reservation).await?;
+            write.write_small(&keys.prefix().join("source.txt")?, "タイトル\n著者\n\n原本文。\n".as_bytes().to_vec()).await?;
+            write.write_small(&keys.prefix().join("novel.txt")?, b"user-owned legacy name".to_vec()).await?;
+            write.write_small(&keys.prefix().join("previous.epub")?, b"preserve generated output".to_vec()).await?;
+            Ok(write)
+        }).unwrap();
+        let directory = narou_rs::native::materialization::directory_for_origin(&write).unwrap();
+        let source = directory.join("source.txt");
+        let mut first_output_dir = None;
+        super::convert_text_target(super::TextConvertContext {
+            target: source.to_str().unwrap(), target_path: &source, output_filename: None,
+            encoding: None, inspect: false, ignore_default: false, ignore_force: false,
+            selected_device: None, explicit_device: false, output_device: None, copy_device: None,
+            create_ibunko_side_epub: false, no_strip: false, verbose: false,
+            first_output_dir: &mut first_output_dir, sink: &TestSink,
+        });
+        assert!(first_output_dir.is_some(), "conversion must publish an observable output");
+        let output = std::fs::read_dir(&directory).unwrap().map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "txt") && path != &source && path.file_name().unwrap() != "novel.txt")
+            .expect("converted text is published canonically");
+        assert!(std::fs::read_to_string(output).unwrap().contains("原本文"));
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "タイトル\n著者\n\n原本文。\n");
+        assert_eq!(std::fs::read(directory.join("novel.txt")).unwrap(), b"user-owned legacy name");
+        assert_eq!(std::fs::read(directory.join("previous.epub")).unwrap(), b"preserve generated output");
+
+        let workspace = super::TextFileWorkspace::begin(&source, None).unwrap();
+        let private = workspace.archive.join("late.txt");
+        std::fs::write(&private, b"stale operation").unwrap();
+        narou_rs::native::materialization::block_on(async {
+            let epoch = stores.primary.close_gate(write.prefix(), "text-new-publisher").await?;
+            stores.primary.open_gate(write.prefix(), "text-new-publisher", epoch).await?;
+            let fresh = narou_rs::application::novel_access::NovelWriteGuard::capture_for(&stores.objects, Some(&stores.assets), &keys).await?;
+            fresh.write_small(&keys.prefix().join("late.txt")?, b"new generation".to_vec()).await
+        }).unwrap();
+        assert!(workspace.publish(&private).is_err());
+        assert_eq!(std::fs::read(directory.join("late.txt")).unwrap(), b"new generation");
     }
 
     #[test]

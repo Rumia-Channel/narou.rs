@@ -70,14 +70,16 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    // ライブラリの管理データ (SQLite / YAML) を先に開く。
-    narou_rs::db::init_database().map_err(|error| error.to_string())?;
     let inventory = match &args.root {
         Some(root) => Inventory::new(root.clone()),
         None => Inventory::with_default_root().map_err(|error| {
             format!("{error}\n(ライブラリフォルダは --root で指定できます)")
         })?,
     };
+    std::env::set_current_dir(inventory.root_dir()).map_err(|error| error.to_string())?;
+    narou_rs::db::init_database().map_err(|error| error.to_string())?;
+    narou_rs::native::transfer::recover_startup().map_err(|error| error.to_string())?;
+    narou_rs::native::application::recover_removals().map_err(|error| error.to_string())?;
     let services = NativeAppServices::new(std::sync::Arc::new(inventory))
         .map_err(|error| error.to_string())?;
     let server = McpServer::new(&services.services.external_api);
@@ -118,11 +120,17 @@ fn run(args: Args) -> Result<(), String> {
             }
         };
         let hidden = narou_rs::native::hidden::load().ok();
-        let response = runtime.block_on(server.handle(&request, hidden));
-        if let Some(response) = response {
-            writeln!(stdout, "{response}").map_err(|error| error.to_string())?;
-            stdout.flush().map_err(|error| error.to_string())?;
-        }
+        let mut reads = services.services.content.read_scope("stdio-mcp");
+        let response = runtime.block_on(server.handle(&mut reads, &request, hidden));
+        let written = (|| -> Result<(), String> {
+            if let Some(response) = response {
+                writeln!(stdout, "{response}").map_err(|error| error.to_string())?;
+                stdout.flush().map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })();
+        let released = runtime.block_on(reads.release_all()).map_err(|error| error.to_string());
+        written.and(released)?;
     }
     Ok(())
 }

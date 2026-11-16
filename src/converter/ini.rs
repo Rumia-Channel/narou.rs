@@ -67,10 +67,13 @@ impl IniData {
     }
 
     pub fn load_file(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::new());
-        }
-        let content = fs::read_to_string(path)?;
+        #[cfg(feature = "native-runtime")]
+        crate::application::novel_access::require_private_path(path)?;
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
+            Err(error) => return Err(error.into()),
+        };
         Ok(Self::load(&content))
     }
 

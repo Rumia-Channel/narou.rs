@@ -16,16 +16,16 @@
 //! unavailable — it never silently claims files were deleted.
 
 use std::collections::HashSet;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
+use super::novel_access::NovelWriteGuard;
 
 use crate::application::error::ApplicationError;
 use crate::application::events::FreezeStore;
 use crate::db::NovelRecord;
 use crate::platform::repository::{FreezeReadMode, record_is_frozen};
 use crate::platform::{
-    NovelId, NovelMutation, NovelObjectKeys, NovelRepository, ObjectListRequest, ObjectPrefix,
-    ObjectStore, PlatformFuture,
+    NovelId, NovelMutation, NovelObjectKeys, NovelRepository, WriteFence,
+    GateState, ObjectListRequest, ObjectPrefix, ObjectStore, PlatformFuture, is_reserved_key,
 };
 
 /// Maximum number of tags accepted in one request (mirrors the web layer).
@@ -73,6 +73,21 @@ pub struct TagChangeResult {
 /// This is the write side of [`FreezeStore`]. The service persists it before
 /// synchronizing record tags, so a failed store write leaves tags unchanged.
 pub trait FreezeMutationStore: Send + Sync {
+    /// Same original writer token as the record mutation; unsupported stores
+    /// fail closed rather than perform a late, unfenced freeze.
+    fn set_frozen_guarded<'a>(
+        &'a self, fence: &'a WriteFence, ids: &'a [NovelId], frozen: bool,
+    ) -> PlatformFuture<'a, crate::error::Result<()>> {
+        self.set_frozen_guarded_many(std::slice::from_ref(fence), ids, frozen)
+    }
+
+    fn set_frozen_guarded_many<'a>(
+        &'a self, fences: &'a [WriteFence], ids: &'a [NovelId], frozen: bool,
+    ) -> PlatformFuture<'a, crate::error::Result<()>> {
+        let _ = (fences, ids, frozen);
+        Box::pin(async { Err(crate::error::NarouError::Platform("epoch-guarded grouped freeze updates unsupported".into())) })
+    }
+
     /// Mark `ids` as frozen (`frozen = true`) or unfrozen (`frozen = false`).
     fn set_frozen<'a>(
         &'a self,
@@ -81,8 +96,8 @@ pub trait FreezeMutationStore: Send + Sync {
     ) -> PlatformFuture<'a, crate::error::Result<()>>;
 }
 
-/// In-memory freeze store for tests and for wiring before a real adapter
-/// exists. Tracks the frozen set in a `HashSet`.
+/// In-memory freeze store for tests. Guarded writes use the captured
+/// memory-store proof, so expired operation epochs cannot edit the set.
 #[derive(Debug, Default)]
 pub struct MemoryFreezeMutationStore {
     frozen: parking_lot::Mutex<HashSet<i64>>,
@@ -100,6 +115,19 @@ impl MemoryFreezeMutationStore {
 }
 
 impl FreezeMutationStore for MemoryFreezeMutationStore {
+    fn set_frozen_guarded_many<'a>(
+        &'a self, fences: &'a [WriteFence], ids: &'a [NovelId], frozen: bool,
+    ) -> PlatformFuture<'a, crate::error::Result<()>> {
+        Box::pin(async move {
+            WriteFence::run_many_proven(fences, false, &mut || {
+                let mut set = self.frozen.lock();
+                for id in ids {
+                    if frozen { set.insert(id.0); } else { set.remove(&id.0); }
+                }
+                Ok(())
+            })
+        })
+    }
     fn set_frozen<'a>(
         &'a self,
         ids: &'a [NovelId],
@@ -120,23 +148,6 @@ impl FreezeMutationStore for MemoryFreezeMutationStore {
     }
 }
 
-/// A freeze store that accepts mutations but persists nothing.
-///
-/// Useful when the caller only wants the record-side `frozen` tag and does
-/// not track a separate frozen set (e.g. a Worker backend that derives
-/// frozen status purely from tags).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoopFreezeMutationStore;
-
-impl FreezeMutationStore for NoopFreezeMutationStore {
-    fn set_frozen<'a>(
-        &'a self,
-        _ids: &'a [NovelId],
-        _frozen: bool,
-    ) -> PlatformFuture<'a, crate::error::Result<()>> {
-        Box::pin(async move { Ok(()) })
-    }
-}
 
 /// Freeze/unfreeze request for one or more novels.
 #[derive(Debug, Clone)]
@@ -173,10 +184,6 @@ pub struct RemoveRequest {
 pub enum FileDeletionStatus {
     /// All objects under the novel's key prefix were deleted.
     Deleted,
-    /// `delete_files` was requested but no [`ObjectStore`] was injected.
-    Unavailable,
-    /// The object store reported an error while deleting.
-    Failed(String),
 }
 
 /// Outcome of a removal.
@@ -187,16 +194,15 @@ pub struct RemoveResult {
     /// Requested ids with no record in the repository.
     pub missing: Vec<NovelId>,
     /// File deletion status per removed id. Empty when `delete_files` was
-    /// not requested. The record is removed regardless of file status; the
-    /// caller decides how to surface partial file deletion.
+    /// not requested. Unavailable fencing or failed deletion returns an error
+    /// instead of acknowledging an unprotected record removal.
     pub files: Vec<(NovelId, FileDeletionStatus)>,
 }
 
 /// Concrete novel action service.
 ///
-/// All dependencies are injected platform ports; the service is testable
-/// with the platform mocks and usable from both the native web layer and a
-/// future Worker backend.
+/// Dependencies are injected platform ports shared by native and Worker.
+/// Memory adapters exercise the same admission and guarded-write contracts.
 pub struct NovelActionService {
     novels: Arc<dyn NovelRepository>,
     freeze_store: Arc<dyn FreezeStore>,
@@ -207,9 +213,8 @@ pub struct NovelActionService {
 impl NovelActionService {
     /// Create the service with injected dependencies.
     ///
-    /// `objects` is optional: pass `Some` to enable file deletion on remove,
-    /// `None` to keep removal record-only (file deletion is then reported as
-    /// [`FileDeletionStatus::Unavailable`]).
+    /// Mutations require `Some(objects)` with a real access fence. `None`
+    /// supports reads only; writes fail closed, including record-only removal.
     pub fn new(
         novels: Arc<dyn NovelRepository>,
         freeze_store: Arc<dyn FreezeStore>,
@@ -222,6 +227,51 @@ impl NovelActionService {
             freeze_mutations,
             objects,
         }
+    }
+
+    /// Resolve the namespace, capture once, then load the mutation input under
+    /// that origin. The first metadata lookup is only namespace discovery; it
+    /// is never the stale record later committed after a transfer.
+    async fn mutation_records(&self, ids: &[NovelId]) -> Result<Vec<Option<(NovelRecord, NovelWriteGuard)>>, ApplicationError> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let initial = self.novels.get_many_current(ids).await.map_err(ApplicationError::platform)?;
+        if initial.len() != ids.len() { return Err(ApplicationError::Platform("current mutation metadata is not aligned".into())); }
+        let mut captured = std::collections::BTreeMap::new();
+        let mut origins = Vec::with_capacity(ids.len());
+        for (id, record) in ids.iter().zip(initial) {
+            let Some(record) = record else { origins.push(None); continue; };
+            let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).map_err(ApplicationError::platform)?;
+            let guard = match captured.get(id) {
+                Some(guard) => NovelWriteGuard::clone(guard),
+                None => {
+                    let objects = self.objects.as_ref().ok_or_else(|| ApplicationError::Platform("novel access fence unavailable".into()))?;
+                    let guard = NovelWriteGuard::capture_for(objects, None, &keys).await.map_err(ApplicationError::platform)?;
+                    captured.insert(*id, guard.clone());
+                    guard
+                }
+            };
+            if keys.prefix().as_ref() != guard.prefix().as_ref().trim_end_matches('/') {
+                return Err(ApplicationError::Conflict("novel namespace changed during mutation admission".into()));
+            }
+            origins.push(Some(guard));
+        }
+        let current = self.novels.get_many_current(ids).await.map_err(ApplicationError::platform)?;
+        if current.len() != ids.len() { return Err(ApplicationError::Platform("current mutation metadata is not aligned".into())); }
+        let mut records = Vec::with_capacity(ids.len());
+        for (origin, record) in origins.into_iter().zip(current) {
+            match (origin, record) {
+                (Some(guard), Some(record)) => {
+                    let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).map_err(ApplicationError::platform)?;
+                    if keys.prefix().as_ref() != guard.prefix().as_ref().trim_end_matches('/') {
+                        return Err(ApplicationError::Conflict("novel namespace changed during mutation admission".into()));
+                    }
+                    records.push(Some((record, guard)));
+                }
+                (None, Some(_)) => return Err(ApplicationError::Conflict("novel appeared during mutation admission".into())),
+                (_, None) => records.push(None),
+            }
+        }
+        Ok(records)
     }
 
     /// Apply a tag edit to several novels in one atomic batch.
@@ -239,9 +289,10 @@ impl NovelActionService {
         let mut unchanged = Vec::new();
         let mut missing = Vec::new();
         let mut mutations = Vec::new();
+        let mut fences = Vec::new();
 
-        for id in &request.ids {
-            let Some(mut record) = self.novels.get(*id).await.map_err(ApplicationError::platform)?
+        for (id, admitted) in request.ids.iter().zip(self.mutation_records(&request.ids).await?) {
+            let Some((mut record, guard)) = admitted
             else {
                 missing.push(*id);
                 continue;
@@ -271,13 +322,14 @@ impl NovelActionService {
                 unchanged.push(*id);
             } else {
                 updated.push(*id);
+                fences.push(guard.fence().clone());
                 mutations.push(NovelMutation::Upsert(record));
             }
         }
 
         if !mutations.is_empty() {
             self.novels
-                .apply_batch(mutations)
+                .apply_batch_guarded_many(&fences, mutations)
                 .await
                 .map_err(ApplicationError::platform)?;
         }
@@ -312,61 +364,111 @@ impl NovelActionService {
         self.set_frozen(ids, None).await
     }
 
-    /// Remove records (and optionally their files) in one atomic batch.
-    ///
-    /// The record is always removed when it exists. File deletion is
-    /// reported per id and never silently assumed: without an injected
-    /// [`ObjectStore`] every id is reported as
-    /// [`FileDeletionStatus::Unavailable`].
+    /// Close each original epoch before enumerating or deleting anything.
+    /// The durable owner lets recovery finish an interrupted removal without
+    /// ever capturing a new writer or exposing an admission window.
     pub async fn remove(
         &self,
         request: &RemoveRequest,
     ) -> Result<RemoveResult, ApplicationError> {
+        let admitted = self.mutation_records(&request.ids).await?;
         let mut removed = Vec::new();
         let mut missing = Vec::new();
         let mut files = Vec::new();
-        let mut mutations = Vec::new();
-
-        for id in &request.ids {
-            let Some(record) = self.novels.get(*id).await.map_err(ApplicationError::platform)?
-            else {
+        let mut completed = HashSet::new();
+        for (id, admitted) in request.ids.iter().zip(admitted) {
+            let Some((_record, guard)) = admitted else {
                 missing.push(*id);
                 continue;
             };
+            if !completed.contains(id) {
+                let objects = self.objects.as_ref().ok_or_else(|| ApplicationError::Platform("novel access fence unavailable".into()))?;
+                let access = objects.access_fence().ok_or_else(|| ApplicationError::Platform("novel access fence unavailable".into()))?;
+                let owner = crate::platform::access_fence::new_removal_owner(*id, request.delete_files).map_err(ApplicationError::platform)?;
+                let epoch = access.retire_writer(guard.fence(), &owner).await.map_err(ApplicationError::platform)?;
+                if !self.advance_removal(guard.prefix(), &owner, epoch, *id, request.delete_files, usize::MAX).await? {
+                    return Err(ApplicationError::platform(crate::platform::access_fence::novel_busy_error(guard.prefix())));
+                }
+                completed.insert(*id);
+            }
             removed.push(*id);
-            mutations.push(NovelMutation::Remove(*id));
+            if request.delete_files { files.push((*id, FileDeletionStatus::Deleted)); }
+        }
+        Ok(RemoveResult { removed, missing, files })
+    }
 
-            if !request.delete_files {
-                continue;
-            }
-            let Some(objects) = &self.objects else {
-                files.push((*id, FileDeletionStatus::Unavailable));
-                continue;
-            };
-            let keys = NovelObjectKeys::new(
-                &record.sitename,
-                &record.file_title,
-                record.use_subdirectory,
-            )
-            .map_err(ApplicationError::platform)?;
-            match delete_novel_objects(objects.as_ref(), &keys).await {
-                Ok(()) => files.push((*id, FileDeletionStatus::Deleted)),
-                Err(message) => files.push((*id, FileDeletionStatus::Failed(message))),
+    /// Advance one page of durable removal owners. A deferred reader or file
+    /// budget leaves its owner closed for a later scan, without blocking other
+    /// owners. Native startup may use `usize::MAX` to finish all drained files;
+    /// Worker cron supplies an explicit small per-owner deletion budget.
+    pub async fn recover_removals(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        max_files_per_owner: usize,
+    ) -> Result<Option<String>, ApplicationError> {
+        let objects = self.objects.as_ref().ok_or_else(|| ApplicationError::Platform("novel access fence unavailable".into()))?;
+        let access = objects.access_fence().ok_or_else(|| ApplicationError::Platform("novel access fence unavailable".into()))?;
+        let (owners, next) = access.pending_removals(cursor, limit).await.map_err(ApplicationError::platform)?;
+        for (prefix, owner, epoch) in owners {
+            let (id, delete_files) = crate::platform::access_fence::parse_removal_owner(&owner).map_err(ApplicationError::platform)?;
+            self.advance_removal(&prefix, &owner, epoch, id, delete_files, max_files_per_owner).await?;
+        }
+        Ok(next)
+    }
+
+    async fn advance_removal(
+        &self,
+        prefix: &ObjectPrefix,
+        owner: &str,
+        epoch: u64,
+        id: NovelId,
+        delete_files: bool,
+        max_files: usize,
+    ) -> Result<bool, ApplicationError> {
+        let objects = self.objects.as_ref().ok_or_else(|| ApplicationError::Platform("novel access fence unavailable".into()))?;
+        let access = objects.access_fence().ok_or_else(|| ApplicationError::Platform("novel access fence unavailable".into()))?;
+        let info = access.gate_info(prefix).await.map_err(ApplicationError::platform)?;
+        if info.state == GateState::Open && info.epoch >= epoch {
+            // The original owner already finished. In particular, do not list
+            // a namespace that has since been reused in a later open epoch.
+            return Ok(true);
+        }
+        if info.epoch != epoch {
+            return Err(ApplicationError::platform(crate::platform::access_fence::gate_epoch_error(prefix, epoch, info.epoch)));
+        }
+        if info.state != GateState::Closed || info.owner.as_deref() != Some(owner) {
+            return Err(ApplicationError::platform(crate::platform::access_fence::gate_owner_error(prefix, info.owner.as_deref().unwrap_or("missing"))));
+        }
+        if info.pending_readers != 0 { return Ok(false); }
+        if delete_files {
+            let illustration_prefix = ObjectPrefix::new(format!("{}/挿絵", prefix.as_ref().trim_end_matches('/'))).map_err(ApplicationError::platform)?;
+            let mut remaining = max_files;
+            for listed_prefix in [prefix.clone(), illustration_prefix] {
+                let mut request = ObjectListRequest::new(listed_prefix, std::num::NonZeroUsize::new(remaining.clamp(1, 100)).expect("bounded non-zero page"));
+                loop {
+                    access.renew_gate(prefix, owner, epoch).await.map_err(ApplicationError::platform)?;
+                    let page = objects.list_page(&request).await.map_err(ApplicationError::platform)?;
+                    for object in page.objects {
+                        if is_reserved_key(&object.key) { continue; }
+                        if remaining == 0 { return Ok(false); }
+                        objects.delete_closed(prefix, owner, epoch, &object.key).await.map_err(ApplicationError::platform)?;
+                        remaining -= 1;
+                    }
+                    match page.next_cursor {
+                        Some(next) => {
+                            request.cursor = Some(next);
+                            request.limit = std::num::NonZeroUsize::new(remaining.clamp(1, 100)).expect("bounded non-zero page");
+                        }
+                        None => break,
+                    }
+                }
             }
         }
-
-        if !mutations.is_empty() {
-            self.novels
-                .apply_batch(mutations)
-                .await
-                .map_err(ApplicationError::platform)?;
-        }
-
-        Ok(RemoveResult {
-            removed,
-            missing,
-            files,
-        })
+        access.renew_gate(prefix, owner, epoch).await.map_err(ApplicationError::platform)?;
+        self.novels.remove_closed(prefix, owner, epoch, id).await.map_err(ApplicationError::platform)?;
+        access.open_gate(prefix, owner, epoch).await.map_err(ApplicationError::platform)?;
+        Ok(true)
     }
 
     /// Store-only freeze write, mirroring upstream `Command::Freeze.execute!`
@@ -380,28 +482,30 @@ impl NovelActionService {
         ids: &[NovelId],
         frozen: Option<bool>,
     ) -> Result<FreezeResult, ApplicationError> {
+        let mut result = FreezeResult::default();
+        let mut records = Vec::new();
+        let mut seen = HashSet::new();
+        let ids: Vec<_> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+        for (id, admitted) in ids.iter().zip(self.mutation_records(&ids).await?) {
+            match admitted {
+                Some((record, guard)) => records.push((*id, record, guard)),
+                None => result.missing.push(*id),
+            }
+        }
+        // The toggle snapshot is fetched only after every operation origin
+        // has been captured; no post-publication epoch can bless an old set.
         let current = if frozen.is_none() {
             Some(self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?)
-        } else {
-            None
-        };
-        let mut result = FreezeResult::default();
+        } else { None };
         let mut groups = [(Vec::new(), Vec::new()), (Vec::new(), Vec::new())];
-        let mut seen = HashSet::new();
-        for id in ids {
-            if !seen.insert(*id) {
-                continue;
-            }
-            let Some(mut record) = self.novels.get(*id).await.map_err(ApplicationError::platform)?
-            else {
-                result.missing.push(*id);
-                continue;
-            };
+        let mut guards = std::collections::HashMap::new();
+        for (id, mut record, guard) in records {
             let freeze = frozen.unwrap_or_else(|| {
                 !record_is_frozen(&record, current.as_ref(), FreezeReadMode::InventoryOrTag)
             });
             let (persisted_ids, mutations) = &mut groups[usize::from(!freeze)];
-            persisted_ids.push(*id);
+            persisted_ids.push(id);
+            guards.insert(id, guard);
             if sync_frozen_tag(&mut record, freeze) {
                 mutations.push(NovelMutation::Upsert(record));
             }
@@ -410,12 +514,13 @@ impl NovelActionService {
             if persisted_ids.is_empty() {
                 continue;
             }
-            if self.freeze_mutations.set_frozen(&persisted_ids, freeze).await.is_err() {
+            let fences = persisted_ids.iter().map(|id| guards[id].fence().clone()).collect::<Vec<_>>();
+            if self.freeze_mutations.set_frozen_guarded_many(&fences, &persisted_ids, freeze).await.is_err() {
                 result.store_failed.extend(persisted_ids);
                 continue;
             }
             if !mutations.is_empty() {
-                self.novels.apply_batch(mutations).await.map_err(ApplicationError::platform)?;
+                self.novels.apply_batch_guarded_many(&fences, mutations).await.map_err(ApplicationError::platform)?;
             }
             if freeze {
                 result.frozen.extend(persisted_ids);
@@ -442,7 +547,7 @@ impl NovelActionService {
             return true;
         }
         self.novels
-            .get(id)
+            .get_current(id)
             .await
             .ok()
             .flatten()
@@ -453,24 +558,25 @@ impl NovelActionService {
     /// the `404` and `frozen` tags with native automatic freezes.
     ///
     /// Returns `Ok(false)` when the id has no record (nothing to freeze).
-    /// A freeze-store write failure surfaces as `Err` — callers treat it
-    /// best-effort like the native `let _ =` call site.
+    /// A guarded freeze-store failure surfaces as `Err`; callers must not
+    /// acknowledge an unfenced automatic freeze as successful bookkeeping.
     pub async fn mark_not_found_and_freeze(
         &self,
+        guard: &NovelWriteGuard,
         id: NovelId,
     ) -> Result<bool, ApplicationError> {
-        let Some(mut record) = self.novels.get(id).await.map_err(ApplicationError::platform)?
+        let Some(mut record) = self.novels.get_current(id).await.map_err(ApplicationError::platform)?
         else {
             return Ok(false);
         };
         self.freeze_mutations
-            .set_frozen(&[id], true)
+            .set_frozen_guarded(guard.fence(), &[id], true)
             .await
             .map_err(ApplicationError::platform)?;
         let changed = mark_not_found(&mut record);
         if sync_frozen_tag(&mut record, true) || changed {
             self.novels
-                .apply_batch(vec![NovelMutation::Upsert(record)])
+                .apply_batch_guarded(guard.fence(), vec![NovelMutation::Upsert(record)])
                 .await
                 .map_err(ApplicationError::platform)?;
         }
@@ -491,17 +597,18 @@ impl NovelActionService {
     /// `now` so tests can pin the timestamp.
     pub async fn record_update_check(
         &self,
+        guard: &NovelWriteGuard,
         id: NovelId,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, ApplicationError> {
-        let Some(mut record) = self.novels.get(id).await.map_err(ApplicationError::platform)?
+        let Some(mut record) = self.novels.get_current(id).await.map_err(ApplicationError::platform)?
         else {
             return Ok(false);
         };
         let changed = mark_update_checked(&mut record, now);
         if changed {
             self.novels
-                .apply_batch(vec![NovelMutation::Upsert(record)])
+                .apply_batch_guarded(guard.fence(), vec![NovelMutation::Upsert(record)])
                 .await
                 .map_err(ApplicationError::platform)?;
         }
@@ -630,49 +737,6 @@ fn validate_tags(tags: &[String]) -> Result<Vec<String>, ApplicationError> {
 /// `asset_backend=s3` の構成では小説プレフィックスの一覧に挿絵が含まれず、
 /// 挿絵側の一覧を明示的に消さないと「削除しました」と報告しながら実体が
 /// 残る。両方のプレフィックスを同じストア (SplitStore) 経由で消す。
-async fn delete_novel_objects(
-    objects: &dyn ObjectStore,
-    keys: &NovelObjectKeys,
-) -> Result<(), String> {
-    let mut prefixes = vec![ObjectPrefix::from(keys.prefix().clone())];
-    prefixes.push(
-        ObjectPrefix::new(format!("{}/挿絵", keys.prefix().as_ref()))
-            .map_err(|e| e.to_string())?,
-    );
-    for prefix in prefixes {
-        delete_objects_under_prefix(objects, prefix).await?;
-    }
-    Ok(())
-}
-
-/// Delete every object under one prefix, paging through the store. The cursor
-/// contract is strictly "resume after the last returned key", so deleting the
-/// returned keys between pages is safe.
-async fn delete_objects_under_prefix(
-    objects: &dyn ObjectStore,
-    prefix: ObjectPrefix,
-) -> Result<(), String> {
-    let mut cursor: Option<String> = None;
-    loop {
-        let request = ObjectListRequest::new(prefix.clone(), NonZeroUsize::new(100).unwrap());
-        let request = match &cursor {
-            Some(cursor) => request.after(cursor.clone()),
-            None => request,
-        };
-        let page = objects
-            .list_page(&request)
-            .await
-            .map_err(|e| e.to_string())?;
-        for object in &page.objects {
-            objects.delete(&object.key).await.map_err(|e| e.to_string())?;
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -721,8 +785,14 @@ mod tests {
             repo,
             Arc::new(crate::application::events::SystemFreezeStore),
             Arc::new(MemoryFreezeMutationStore::new()),
-            objects,
+            Some(objects.unwrap_or_else(|| Arc::new(MemoryObjectStore::new()))),
         )
+    }
+
+    fn test_write(service: &NovelActionService, id: i64) -> NovelWriteGuard {
+        let record = sample_record(id);
+        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).unwrap();
+        futures::executor::block_on(NovelWriteGuard::capture_for(service.objects.as_ref().unwrap(), None, &keys)).unwrap()
     }
 
     #[test]
@@ -813,7 +883,7 @@ mod tests {
             record, sample_record(2), sample_record(3),
         ]));
         let store = Arc::new(MemoryFreezeMutationStore::new());
-        let service = NovelActionService::new(repo.clone(), store.clone(), store.clone(), None);
+        let service = NovelActionService::new(repo.clone(), store.clone(), store.clone(), Some(Arc::new(MemoryObjectStore::new())));
         futures::executor::block_on(async {
             service.freeze(&[NovelId(3)]).await.unwrap();
             let ids = [NovelId(2), NovelId(1), NovelId(2), NovelId(99)];
@@ -848,7 +918,7 @@ mod tests {
             legacy, sample_record(2), sample_record(3),
         ]));
         let store = Arc::new(MemoryFreezeMutationStore::new());
-        let service = NovelActionService::new(repo.clone(), store.clone(), store.clone(), None);
+        let service = NovelActionService::new(repo.clone(), store.clone(), store.clone(), Some(Arc::new(MemoryObjectStore::new())));
         futures::executor::block_on(async {
             store.set_frozen(&[NovelId(3)], true).await.unwrap();
             let ids = [NovelId(1), NovelId(2), NovelId(3), NovelId(1)];
@@ -864,24 +934,23 @@ mod tests {
     }
 
     #[test]
-    fn remove_without_object_store_reports_unavailable() {
+    fn remove_without_fence_preserves_the_record() {
         let repo = Arc::new(MemoryNovelRepository::from_records(vec![sample_record(1)]));
-        let service = service(repo.clone(), None);
+        let service = NovelActionService::new(repo.clone(), Arc::new(crate::application::events::SystemFreezeStore), Arc::new(MemoryFreezeMutationStore::new()), None);
 
         let result = futures::executor::block_on(service.remove(&RemoveRequest {
             ids: vec![NovelId(1)],
             delete_files: true,
         }))
-        .unwrap();
-        assert_eq!(result.removed, vec![NovelId(1)]);
-        assert_eq!(result.files, vec![(NovelId(1), FileDeletionStatus::Unavailable)]);
-        assert!(futures::executor::block_on(repo.get(NovelId(1))).unwrap().is_none());
+        .unwrap_err();
+        assert!(matches!(result, ApplicationError::Platform(_)));
+        assert!(futures::executor::block_on(repo.get(NovelId(1))).unwrap().is_some());
     }
 
     #[test]
     fn remove_with_object_store_deletes_objects() {
-        let repo = Arc::new(MemoryNovelRepository::from_records(vec![sample_record(1)]));
         let objects = Arc::new(MemoryObjectStore::new());
+        let repo = Arc::new(MemoryNovelRepository::from_records(vec![sample_record(1)]).with_objects(objects.clone()));
         let keys = NovelObjectKeys::new("example", "title 1", false).unwrap();
         futures::executor::block_on(objects.write_small(&keys.toc(), b"toc".to_vec())).unwrap();
         futures::executor::block_on(
@@ -901,15 +970,85 @@ mod tests {
         assert!(!futures::executor::block_on(objects.exists(&keys.setting())).unwrap());
     }
 
+    #[test]
+    fn removal_closes_before_cleanup_and_recovers_without_touching_reused_bytes() {
+        futures::executor::block_on(async {
+            let backend = Arc::new(MemoryObjectStore::new());
+            let objects: Arc<dyn ObjectStore> = backend.clone();
+            let repo = Arc::new(MemoryNovelRepository::from_records(vec![sample_record(1)]).with_objects(backend));
+            let service = service(repo.clone(), Some(objects.clone()));
+            let keys = NovelObjectKeys::new("example", "title 1", false).unwrap();
+            let writer = NovelWriteGuard::capture_for(&objects, None, &keys).await.unwrap();
+            let prefix = writer.prefix().clone();
+            let body = keys.section("1", "body");
+            let illustration = keys.illustration("0001.jpg").unwrap();
+            for key in [&keys.toc(), &body, &illustration] { writer.write_small(key, b"old bytes".to_vec()).await.unwrap(); }
+            let access = objects.access_fence().unwrap();
+            let reader = access.admit_reader(&prefix, "removal-reader", crate::platform::READER_LEASE_SECS).await.unwrap();
+            assert!(service.remove(&RemoveRequest { ids: vec![NovelId(1)], delete_files: true }).await.is_err());
+            let closed = access.gate_info(&prefix).await.unwrap();
+            assert_eq!(closed.state, GateState::Closed);
+            assert_eq!(closed.epoch, writer.fence().epoch + 1);
+            assert_eq!(closed.pending_readers, 1);
+            assert!(repo.get_current(NovelId(1)).await.unwrap().is_some());
+            assert_eq!(objects.read_small(&body).await.unwrap().unwrap(), b"old bytes");
+            let late = keys.section("2", "late-writer");
+            assert!(writer.write_small(&late, b"must not escape enumeration".to_vec()).await.is_err());
+            assert!(!objects.exists(&late).await.unwrap());
+            access.release_reader(&prefix, &reader).await.unwrap();
+
+            service.recover_removals(None, 100, 1).await.unwrap();
+            assert_eq!(access.gate_info(&prefix).await.unwrap().state, GateState::Closed);
+            assert!(repo.get_current(NovelId(1)).await.unwrap().is_some(), "a bounded unfinished cleanup must not remove metadata or reopen");
+            let listing = ObjectListRequest::new(prefix.clone(), std::num::NonZeroUsize::new(100).unwrap());
+            assert_eq!(objects.list_page(&listing).await.unwrap().objects.len(), 2);
+            service.recover_removals(None, 100, usize::MAX).await.unwrap();
+            assert!(repo.get_current(NovelId(1)).await.unwrap().is_none());
+            assert!(objects.list_page(&listing).await.unwrap().objects.is_empty());
+            assert_eq!(access.gate_info(&prefix).await.unwrap().state, GateState::Open);
+
+            let fresh = NovelWriteGuard::capture_for(&objects, None, &keys).await.unwrap();
+            fresh.write_small(&body, b"reused namespace".to_vec()).await.unwrap();
+            assert!(service.advance_removal(&prefix, closed.owner.as_deref().unwrap(), closed.epoch, NovelId(1), true, usize::MAX).await.unwrap());
+            assert_eq!(objects.read_small(&body).await.unwrap().unwrap(), b"reused namespace");
+            assert!(writer.write_small(&body, b"old operation".to_vec()).await.is_err());
+            assert_eq!(objects.read_small(&body).await.unwrap().unwrap(), b"reused namespace");
+        });
+    }
+
+    #[test]
+    fn record_only_removal_retains_files_and_recovers_after_metadata_commit() {
+        futures::executor::block_on(async {
+            let backend = Arc::new(MemoryObjectStore::new());
+            let objects: Arc<dyn ObjectStore> = backend.clone();
+            let repo = Arc::new(MemoryNovelRepository::from_records(vec![sample_record(1)]).with_objects(backend));
+            let service = service(repo.clone(), Some(objects.clone()));
+            let keys = NovelObjectKeys::new("example", "title 1", false).unwrap();
+            let writer = NovelWriteGuard::capture_for(&objects, None, &keys).await.unwrap();
+            writer.write_small(&keys.toc(), b"retained toc".to_vec()).await.unwrap();
+            let owner = crate::platform::access_fence::new_removal_owner(NovelId(1), false).unwrap();
+            let access = objects.access_fence().unwrap();
+            let epoch = access.retire_writer(writer.fence(), &owner).await.unwrap();
+            repo.remove_closed(writer.prefix(), &owner, epoch, NovelId(1)).await.unwrap();
+            // Simulate losing the response before the original owner opens.
+            assert_eq!(access.gate_info(writer.prefix()).await.unwrap().state, GateState::Closed);
+            service.recover_removals(None, 100, usize::MAX).await.unwrap();
+            assert_eq!(access.gate_info(writer.prefix()).await.unwrap().state, GateState::Open);
+            assert!(repo.get_current(NovelId(1)).await.unwrap().is_none());
+            assert_eq!(objects.read_small(&keys.toc()).await.unwrap().unwrap(), b"retained toc");
+            assert!(writer.write_small(&keys.toc(), b"stale".to_vec()).await.is_err());
+        });
+    }
+
     /// `asset_backend=s3` のような分割ストアでは、小説プレフィックスの一覧は
     /// プライマリ側にしか行かない (SplitStore は `<prefix>/挿絵` の形だけを
     /// 挿絵側へ回す)。挿絵プレフィックスを明示的に消さないと、実体だけが
     /// 残ったまま「削除しました」と報告してしまう。
     #[test]
     fn remove_with_split_store_deletes_illustration_prefix_too() {
-        let repo = Arc::new(MemoryNovelRepository::from_records(vec![sample_record(1)]));
         let primary = Arc::new(MemoryObjectStore::new());
         let illustrations = Arc::new(MemoryObjectStore::new());
+        let repo = Arc::new(MemoryNovelRepository::from_records(vec![sample_record(1)]).with_objects(primary.clone()));
         let split = Arc::new(crate::platform::SplitStore::new(
             (primary.clone(), primary.clone()),
             (illustrations.clone(), illustrations.clone()),
@@ -973,15 +1112,16 @@ mod tests {
             repo.clone(),
             Arc::new(crate::application::events::SystemFreezeStore),
             freeze_mutations.clone(),
-            None,
+            Some(Arc::new(MemoryObjectStore::new())),
         );
 
         // Missing record → nothing to freeze (native NotFound parity).
-        let done = futures::executor::block_on(service.mark_not_found_and_freeze(NovelId(9)))
+        let guard = test_write(&service, 7);
+        let done = futures::executor::block_on(service.mark_not_found_and_freeze(&guard, NovelId(9)))
             .unwrap();
         assert!(!done);
 
-        let done = futures::executor::block_on(service.mark_not_found_and_freeze(NovelId(7)))
+        let done = futures::executor::block_on(service.mark_not_found_and_freeze(&guard, NovelId(7)))
             .unwrap();
         assert!(done);
         assert_eq!(freeze_mutations.frozen_ids(), HashSet::from([7]));
@@ -989,7 +1129,7 @@ mod tests {
         assert_eq!(record.tags, vec!["404", "frozen"]);
 
         // Idempotent: a second 404 must not duplicate the tag.
-        futures::executor::block_on(service.mark_not_found_and_freeze(NovelId(7))).unwrap();
+        futures::executor::block_on(service.mark_not_found_and_freeze(&guard, NovelId(7))).unwrap();
         let record = futures::executor::block_on(repo.get(NovelId(7))).unwrap().unwrap();
         assert_eq!(record.tags, vec!["404", "frozen"]);
     }
@@ -1006,7 +1146,7 @@ mod tests {
         record.end = false;
         let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
         let actions = service(repo.clone(), None);
-        futures::executor::block_on(actions.record_update_check(NovelId(1), now)).unwrap();
+        futures::executor::block_on(actions.record_update_check(&test_write(&actions, 1), NovelId(1), now)).unwrap();
         let record = futures::executor::block_on(repo.get(NovelId(1))).unwrap().unwrap();
         assert!(record.tags.is_empty(), "modified and stale end must go: {:?}", record.tags);
         assert_eq!(record.last_check_date, Some(now));
@@ -1015,14 +1155,14 @@ mod tests {
         let record = { let mut r = sample_record(2); r.end = true; r };
         let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
         let actions = service(repo.clone(), None);
-        futures::executor::block_on(actions.record_update_check(NovelId(2), now)).unwrap();
+        futures::executor::block_on(actions.record_update_check(&test_write(&actions, 2), NovelId(2), now)).unwrap();
         let record = futures::executor::block_on(repo.get(NovelId(2))).unwrap().unwrap();
         assert_eq!(record.tags, vec!["end"]);
 
         // Missing id is a clean no-op.
         let repo = Arc::new(MemoryNovelRepository::new());
         let actions = service(repo, None);
-        let done = futures::executor::block_on(actions.record_update_check(NovelId(5), now)).unwrap();
+        let done = futures::executor::block_on(actions.record_update_check(&test_write(&actions, 5), NovelId(5), now)).unwrap();
         assert!(!done);
     }
 

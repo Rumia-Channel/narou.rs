@@ -9,6 +9,11 @@ use super::sort::compare_records_by_key;
 use crate::error::Result;
 
 const ARCHIVE_ROOT_DIR: &str = "小説データ";
+
+#[path = "id_reservations.rs"]
+pub(crate) mod id_reservations;
+#[path = "record_mutation.rs"]
+mod record_mutation;
 const DATABASE_NAME: &str = "database";
 
 pub struct Database {
@@ -19,7 +24,6 @@ pub struct Database {
     index: IndexStore,
     inventory: Inventory,
     archive_root: PathBuf,
-    id_allocator: crate::platform::id_allocator::IdAllocator,
     /// SQLite backend (P2). `None` when `NAROU_RS_LEGACY_YAML` is set or the
     /// database directory cannot host `db.sqlite`; then every mutation runs
     /// through the same locked `database.yaml` read-modify-write boundary.
@@ -36,6 +40,7 @@ impl Database {
     fn with_inventory(inventory: Inventory) -> Result<Self> {
         let archive_root = inventory.root_dir().join(ARCHIVE_ROOT_DIR);
         std::fs::create_dir_all(&archive_root)?;
+        crate::native::transfer::recover_pending_metadata_before_open(inventory.root_dir())?;
 
         #[cfg(feature = "native-runtime")]
         let sqlite = {
@@ -141,7 +146,6 @@ impl Database {
             index: IndexStore::load(&inventory)?,
             inventory,
             archive_root,
-            id_allocator: crate::platform::id_allocator::IdAllocator::default(),
             #[cfg(feature = "native-runtime")]
             sqlite,
         };
@@ -173,9 +177,46 @@ impl Database {
             .unwrap_or(false)
     }
 
+
+    /// Mode lookup while the snapshot already owns the primary mutex.
+    pub(crate) fn metadata_is_yaml_in_snapshot(&self, primary: Option<&rusqlite::Connection>) -> bool {
+        primary.is_none_or(|connection| self.state_handle()
+            .is_none_or(|state| state.compat_now_with_connection(connection)))
+    }
+
     /// Serialized `database_index.yaml` payload for `db export-yaml`.
     pub fn index_yaml(&self) -> Result<String> {
         self.index.to_yaml()
+    }
+
+    /// Capture authoritative inventory metadata under the publication lock order.
+    /// A SQLite callback may create a consistent `VACUUM INTO` image. It must not
+    /// call adapters that reacquire the primary connection or copy novel bodies.
+    pub(crate) fn with_library_metadata_snapshot<T, F>(&self, capture: F) -> Result<T>
+    where
+        F: FnOnce(&Inventory, Option<&rusqlite::Connection>) -> Result<T>,
+    {
+        let sequence_path = self.inventory.inventory_path("tag_sequence", InventoryScope::Local);
+        let members_path = self.inventory.inventory_path("virtual_novel_members", InventoryScope::Local);
+        let database_path = self.inventory.inventory_path(DATABASE_NAME, InventoryScope::Local);
+        let operation = || crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
+            crate::db::inventory::with_exclusive_file_lock(&members_path, || {
+                crate::db::inventory::with_exclusive_file_lock(&database_path, || {
+                    crate::native::transfer::recover_pending_metadata_locked(self.inventory.root_dir())?;
+                    if let Some(repo) = &self.sqlite {
+                        let connection = repo.conn_handle();
+                        let guard = connection.lock();
+                        capture(&self.inventory, Some(&guard))
+                    } else {
+                        capture(&self.inventory, None)
+                    }
+                })
+            })
+        });
+        match self.state_handle() {
+            Some(state) => state.with_compat_lock(operation),
+            None => operation(),
+        }
     }
 
     #[cfg(feature = "native-runtime")]
@@ -240,9 +281,6 @@ impl Database {
             )?;
             self.data = loaded.into_iter().collect();
             self.persisted = self.data.clone();
-            self.id_allocator.reconcile(
-                self.data.keys().max().copied(), |id| self.data.contains_key(&id),
-            );
             // 索引 (`by_toc_url` / `by_title`) はリレーショナル側の全件から作り直す。
             // `get_by_toc_url` / `find_by_title` は索引しか見ないため、SQLite モードで
             // 退避済みの `database_index.yaml` を引き継ぐと、既に登録済みの URL を
@@ -266,9 +304,6 @@ impl Database {
             self.data.clear();
         }
         self.persisted = self.data.clone();
-        self.id_allocator.reconcile(
-            self.data.keys().max().copied(), |id| self.data.contains_key(&id),
-        );
         // SQLite モードは上で return するため、ここは YAML モードのみ。
         self.index.reconcile(&self.data);
         Ok(())
@@ -326,22 +361,204 @@ impl Database {
     where
         F: FnOnce(BTreeMap<i64, NovelRecord>) -> Result<(BTreeMap<i64, NovelRecord>, T)>,
     {
-        self.update_records_inner(false, |records, _| {
+        self.update_records_inner(false, None, None, |records, _| {
+            let (records, result) = update(records)?;
+            Ok((records, crate::virtual_novel::VirtualNovelMembers::default(), result))
+        })
+    }
+
+    /// The caller holds these original OPEN proofs before DATABASE and
+    /// metadata authority. Repair only their live portable virtual origins;
+    /// never acquire or reconstruct a writer for unrelated metadata rows.
+    pub(crate) fn update_records_with_fences<T, F>(
+        &mut self, fences: &[crate::platform::WriteFence], update: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(BTreeMap<i64, NovelRecord>) -> Result<(BTreeMap<i64, NovelRecord>, T)>,
+    {
+        self.update_records_inner(false, None, Some(record_mutation::RecordMutation::VirtualFences(fences)), |records, _| {
             let (records, result) = update(records)?;
             Ok((records, crate::virtual_novel::VirtualNovelMembers::default(), result))
         })
     }
 
     /// Publish virtual membership, parent metadata and tag registration together.
+    #[cfg(test)]
     pub(crate) fn update_virtual_records<T, F>(&mut self, update: F) -> Result<T>
     where
         F: FnOnce(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers)
             -> Result<(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers, T)>,
     {
-        self.update_records_inner(true, update)
+        self.update_records_inner(true, None, None, update)
     }
 
-    fn update_records_inner<T, F>(&mut self, update_members: bool, update: F) -> Result<T>
+    /// Original OPEN proofs remain held through virtual metadata mutation and
+    /// deterministic recovery of a previously committed portable origin.
+    pub(crate) fn update_virtual_records_with_fences<T, F>(
+        &mut self, fences: &[crate::platform::WriteFence], update: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers)
+            -> Result<(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers, T)>,
+    {
+        self.update_records_inner(true, None, Some(record_mutation::RecordMutation::VirtualFences(fences)), update)
+    }
+
+    /// Publish transfer metadata and its durable receipt in one commit boundary.
+    /// The caller holds the publication gate and owns durable YAML preimages.
+    pub(crate) fn update_transfer_records<T, F>(
+        &mut self,
+        marker: &crate::native::transfer::TransferCommitMarker,
+        update: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers)
+            -> Result<(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers, T)>,
+    {
+        self.update_records_inner(true, Some(marker), None, update)
+    }
+
+    pub(crate) fn reserve_create_identity(
+        &mut self, fence: &crate::platform::WriteFence,
+        reservation: &crate::platform::NovelIdReservation, toc_url: &str, empty_owned: bool,
+    ) -> Result<()> {
+        record_mutation::reserve_identity(self, fence, reservation, toc_url, empty_owned)
+    }
+
+    pub(crate) fn assert_current_identity_conn(
+        connection: &rusqlite::Connection, id: crate::platform::NovelId,
+        prefix: &crate::platform::ObjectPrefix, folded_url: &str,
+    ) -> Result<bool> {
+        record_mutation::assert_current_identity_conn(connection, id, prefix, folded_url)
+    }
+
+    pub(crate) fn assert_current_namespace_conn(
+        connection: &rusqlite::Connection, id: crate::platform::NovelId,
+        prefix: &crate::platform::ObjectPrefix,
+    ) -> Result<bool> {
+        record_mutation::assert_current_namespace_conn(connection, id, prefix)
+    }
+
+    /// Caller holds the original OS gate proof. Keep the metadata authority
+    /// until the supplied synchronous gate-close commit is durably recorded.
+    pub(crate) fn with_removal_identity<T>(
+        &self, fence: &crate::platform::WriteFence, id: crate::platform::NovelId,
+        commit: impl FnOnce(Option<&rusqlite::Connection>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_library_metadata_snapshot(|inventory, primary| {
+            crate::native::transfer::with_control_metadata_snapshot(inventory.root_dir(), primary, |control| {
+                let transaction = rusqlite::Transaction::new_unchecked(control, rusqlite::TransactionBehavior::Immediate)
+                    .map_err(crate::native::sqlite::sqlite_error)?;
+                let records = if self.metadata_is_yaml_in_snapshot(primary) { None } else { Some(&*transaction) };
+                record_mutation::repair_virtual_before_removal(
+                    inventory, records, &transaction, primary.is_none(), fence, id,
+                )?;
+                crate::native::transfer::assert_removal_identity(inventory, records, &transaction, fence, id)?;
+                let result = commit(if primary.is_some() { Some(&transaction) } else { None })?;
+                transaction.commit().map_err(crate::native::sqlite::sqlite_error)?;
+                Ok(result)
+            })
+        })
+    }
+
+    pub(crate) fn apply_create_record(
+        &mut self, fence: &crate::platform::WriteFence,
+        reservation: &crate::platform::NovelIdReservation, record: NovelRecord,
+    ) -> Result<()> {
+        if record.id != reservation.id().0 || !record_mutation::record_in_prefix(&record, &fence.prefix)? {
+            return Err(crate::error::NarouError::Platform("identity_conflict: create record does not match its reservation".into()));
+        }
+        self.update_records_inner(false, None, Some(record_mutation::RecordMutation::Create {
+            fence, reservation, allow_existing: true,
+        }), move |mut records, members| {
+            if let Some(existing) = records.get(&record.id) {
+                if crate::db::novel_codec::fold(&existing.toc_url) != crate::db::novel_codec::fold(&record.toc_url)
+                    || !record_mutation::record_in_prefix(existing, &fence.prefix)?
+                {
+                    return Err(crate::error::NarouError::Platform("identity_conflict: published create identity changed".into()));
+                }
+                // A lost acknowledgement must not overwrite subsequent edits.
+            } else {
+                records.insert(record.id, record);
+            }
+            Ok((records, members, ()))
+        })
+    }
+
+    pub(crate) fn update_virtual_records_for_create<T, F>(
+        &mut self, fence: &crate::platform::WriteFence,
+        reservation: &crate::platform::NovelIdReservation, update: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers)
+            -> Result<(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers, T)>,
+    {
+        self.update_records_inner(true, None, Some(record_mutation::RecordMutation::Create {
+            fence, reservation, allow_existing: false,
+        }), update)
+    }
+
+    pub(crate) fn remove_closed_record(
+        &mut self, prefix: &crate::platform::ObjectPrefix, owner: &str,
+        epoch: u64, id: crate::platform::NovelId,
+    ) -> Result<()> {
+        self.update_records_inner(true, None, Some(record_mutation::RecordMutation::RemoveClosed {
+            prefix, owner, epoch, id,
+        }), |mut records, mut members| {
+            records.remove(&id.0);
+            members.remove(id.0);
+            Ok((records, members, ()))
+        })
+    }
+
+    /// Migrate one virtual novel's library-local `toc_url` to its portable
+    /// URI and rebind every retained gate origin in the same immediate
+    /// metadata authority. The caller must already hold the original OPEN
+    /// gate proof (`fence`) for this exact record. `observed` is the URL the
+    /// caller read; `candidate` is the generated portable URI. The actual
+    /// current URL is returned so concurrent migrations converge on the
+    /// first portable winner instead of rewinding it.
+    pub(crate) fn rebind_virtual_identity(
+        &mut self,
+        fence: &crate::platform::WriteFence,
+        id: crate::platform::NovelId,
+        observed: &str,
+        candidate: &str,
+    ) -> Result<String> {
+        self.update_records_inner(false, None, Some(record_mutation::RecordMutation::Rebind {
+            fence, id, observed, candidate,
+        }), move |mut records, members| {
+            let entry = records.get_mut(&id.0).ok_or_else(|| crate::error::NarouError::NotFound(
+                format!("ID: {} が見つかりません", id.0)))?;
+            if !crate::virtual_novel::is_virtual_record(entry) {
+                return Err(crate::error::NarouError::InvalidTarget(
+                    format!("ID: {} はバーチャル小説ではありません", id.0)));
+            }
+            if !record_mutation::record_in_prefix(entry, &fence.prefix)? {
+                return Err(crate::error::NarouError::Platform(
+                    "identity_conflict: virtual identity record moved to another namespace".into()));
+            }
+            // A portable row is immutable and wins the race; only the
+            // observed library-local URL is replaced.
+            if !crate::virtual_novel::is_portable_toc_url(&entry.toc_url) && entry.toc_url == observed {
+                if !crate::virtual_novel::is_portable_toc_url(candidate) {
+                    return Err(crate::error::NarouError::Platform(
+                        "identity_conflict: virtual rebind candidate is not portable".into()));
+                }
+                entry.toc_url = candidate.to_owned();
+            }
+            let current = entry.toc_url.clone();
+            Ok((records, members, current))
+        })
+    }
+
+    fn update_records_inner<T, F>(
+        &mut self,
+        update_members: bool,
+        transfer_marker: Option<&crate::native::transfer::TransferCommitMarker>,
+        mutation: Option<record_mutation::RecordMutation<'_>>,
+        update: F,
+    ) -> Result<T>
     where
         F: FnOnce(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers)
             -> Result<(BTreeMap<i64, NovelRecord>, crate::virtual_novel::VirtualNovelMembers, T)>,
@@ -363,9 +580,11 @@ impl Database {
             let before_library: std::cell::RefCell<
                 Option<crate::application::tag_sequence::LibraryTags>,
             > = std::cell::RefCell::new(None);
+            let finished_claims = std::cell::RefCell::new(None);
             let (updated, result, compat) = state.with_compat_lock(|| {
                 let compat = state.compat_now();
-                let operation = || LockedFileUpdates::run(&self.inventory, |files| {
+                let operation = || {
+                    let published = LockedFileUpdates::run(&self.inventory, transfer_marker, compat, |files| {
                     let conn = repo.conn_handle();
                     let mut guard = conn.lock();
                     // Acquire the database write lock BEFORE reading. The process
@@ -389,9 +608,17 @@ impl Database {
                         let file = if compat { files.original(path)? } else { None };
                         parse_members(file.or(member_yaml.as_deref()))?
                     } else { Default::default() };
+                    let record_claims = record_mutation::prepare(
+                        self.inventory.root_dir(), Some(&tx), &current, transfer_marker, mutation,
+                    )?;
                     let (mut updated, members, result) = update(current, members)?;
                     for (&id, record) in &mut updated { record.id = id; }
+                    record_claims.validate(&updated)?;
+                    if let Some(marker) = transfer_marker {
+                        crate::native::sqlite::content::invalidate_transfer_projection(&tx, marker.novel_id.0)?;
+                    }
                     crate::native::sqlite::bulk::replace_records_conn(&tx, &updated)?;
+                    record_claims.finish_sql(&tx)?;
                     // 連番表を作品と同じトランザクションで確定する。別の
                     // トランザクションにすると「作品を保存した順」と「連番を
                     // 振った順」がずれる。
@@ -437,9 +664,56 @@ impl Database {
                         files.write(&yaml_path, &content)?;
                         remember_records_mirror(&tx, &content)?;
                     }
-                    tx.commit().map_err(crate::native::sqlite::sqlite_error)?;
+                    files.publish_transfer()?;
+                    let commit_key = transfer_marker.map(|marker| {
+                        format!("commit:{}:{}", marker.session_id, marker.publication_id)
+                    });
+                    if let Some(marker) = transfer_marker {
+                        let inserted = tx.execute(
+                            "INSERT INTO transfer_backend_marks(key,value) VALUES (?1,?2)
+                             ON CONFLICT(key) DO NOTHING",
+                            rusqlite::params![commit_key.as_deref(), marker.receipt.as_slice()],
+                        ).map_err(crate::native::sqlite::sqlite_error)?;
+                        if inserted == 0 {
+                            let same_receipt = tx.query_row(
+                                "SELECT value FROM transfer_backend_marks WHERE key=?1",
+                                [commit_key.as_deref()],
+                                |row| Ok(matches!(
+                                    row.get_ref(0)?,
+                                    rusqlite::types::ValueRef::Blob(bytes) if bytes == marker.receipt.as_slice()
+                                )),
+                            ).map_err(crate::native::sqlite::sqlite_error)?;
+                            if !same_receipt {
+                                return Err(crate::error::NarouError::Database(
+                                    "transfer publication receipt conflict".into(),
+                                ));
+                            }
+                        }
+                    }
+                    let committed = tx.commit().map_err(crate::native::sqlite::sqlite_error);
+                    if let Some(marker) = transfer_marker {
+                        // A commit error can be an uncertain outcome. Never undo
+                        // compatibility files after the durable receipt exists.
+                        files.committed = committed.is_ok() || guard.query_row(
+                            "SELECT value FROM transfer_backend_marks WHERE key=?1",
+                            [commit_key.as_deref()],
+                            |row| Ok(matches!(
+                                row.get_ref(0)?,
+                                rusqlite::types::ValueRef::Blob(bytes) if bytes == marker.receipt.as_slice()
+                            )),
+                        ).unwrap_or_else(|error| !matches!(error, rusqlite::Error::QueryReturnedNoRows));
+                    }
+                    committed?;
+                    *finished_claims.borrow_mut() = Some(record_claims);
                     Ok((updated, result, compat))
-                });
+                    })?;
+                    if let Some(claims) = finished_claims.borrow().as_ref() {
+                        // Postcommit, outside rollback but inside every held
+                        // inventory lock and the original OS gate proof.
+                        claims.finish_fs_origin(self.inventory.root_dir())?;
+                    }
+                    Ok(published)
+                };
                 if compat {
                     crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
                         let publish = || crate::db::inventory::with_exclusive_file_lock(&yaml_path, operation);
@@ -453,9 +727,6 @@ impl Database {
             })?;
             self.data = updated.into_iter().collect();
             self.persisted = self.data.clone();
-            self.id_allocator.reconcile(
-                self.data.keys().max().copied(), |id| self.data.contains_key(&id),
-            );
             self.index.reconcile(&self.data);
             if compat {
                 self.index.flush(&self.inventory)?;
@@ -471,7 +742,7 @@ impl Database {
         // 連番表も確定する (別に更新すると順序が作品とずれる)。
         let result = crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
             let operation = || crate::db::inventory::with_exclusive_file_lock(&yaml_path, || {
-                LockedFileUpdates::run(&self.inventory, |files| {
+                let (result, record_claims) = LockedFileUpdates::run(&self.inventory, transfer_marker, true, |files| {
                     let raw = files.original(&yaml_path)?.unwrap_or_default();
                     let mut current: BTreeMap<i64, NovelRecord> =
                         if raw.is_empty() { BTreeMap::new() } else { serde_yaml::from_str(raw)? };
@@ -486,10 +757,14 @@ impl Database {
                     let members = if let Some(path) = members_path.as_deref() {
                         parse_members(files.original(path)?)?
                     } else { Default::default() };
+                    let record_claims = record_mutation::prepare(
+                        self.inventory.root_dir(), None, &current, transfer_marker, mutation,
+                    )?;
                     let (mut updated, members, result) = update(current, members)?;
                     for (id, record) in updated.iter_mut() {
                         record.id = *id;
                     }
+                    record_claims.validate(&updated)?;
                     let written = tags_of_records(&updated);
                     let (content, changed) = crate::native::tag_sequence::advance_content(
                         files.original(&sequence_path)?.unwrap_or_default(),
@@ -501,8 +776,24 @@ impl Database {
                     }
                     crate::native::tag_sequence::notify_record_save_hook()?;
                     files.write(&yaml_path, &crate::db::inventory::serialize_yaml_content(&updated)?)?;
-                    Ok(result)
-                })
+                    id_reservations::retire_yaml(self, &updated)?;
+                    files.publish_transfer()?;
+                    if let Some(marker) = transfer_marker {
+                        let committed = crate::db::inventory::atomic_write_locked(
+                            &marker.yaml_commit_path, "committed",
+                        );
+                        files.committed = committed.is_ok() || match std::fs::read(&marker.yaml_commit_path) {
+                            Ok(bytes) => bytes == b"committed",
+                            // Leave an uncertain outcome to durable journal
+                            // recovery; do not silently roll back a committed mark.
+                            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+                        };
+                        committed?;
+                    }
+                    Ok((result, record_claims))
+                })?;
+                record_claims.finish_yaml(self.inventory.root_dir())?;
+                Ok(result)
             });
             if let Some(path) = members_path.as_deref() {
                 crate::db::inventory::with_exclusive_file_lock(path, operation)
@@ -523,7 +814,6 @@ impl Database {
         let id = record.id;
         let toc_url = Some(record.toc_url.clone());
         let title = Some(record.title.clone());
-        self.id_allocator.commit(id);
         self.data.insert(id, record);
         self.index.upsert(id, toc_url.as_deref(), title.as_deref());
     }
@@ -570,45 +860,44 @@ impl Database {
         self.data.values().find(|&record| record.title.to_lowercase() == lower).map(|v| v as _)
     }
 
-    /// Reserve an ID until record publication. SQLite ownership is durable
-    /// across processes; YAML retains its existing process-local allocator.
+    /// Reserve an ID durably across processes in either storage mode.
     pub fn allocate_id(&mut self) -> Result<crate::platform::NovelIdReservation> {
-        #[cfg(feature = "native-runtime")]
-        if let Some(repo) = &self.sqlite {
-            let conn = repo.conn_handle();
-            let mut guard = conn.lock();
-            let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(crate::native::sqlite::sqlite_error)?;
-            tx.execute(crate::db::novel_query::ALLOCATE_STEP_SQL, [])
-                .map_err(crate::native::sqlite::sqlite_error)?;
-            tx.execute(crate::db::novel_query::ALLOCATE_BUMP_SQL, [])
-                .map_err(crate::native::sqlite::sqlite_error)?;
-            let (id, generation) = tx.query_row(
-                crate::db::novel_query::ALLOCATE_READ_SQL, [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).map_err(crate::native::sqlite::sqlite_error)?;
-            tx.commit().map_err(crate::native::sqlite::sqlite_error)?;
-            return Ok(crate::platform::NovelIdReservation::new(
-                crate::platform::NovelId(id), generation,
-            ));
-        }
-        self.id_allocator.allocate()
+        id_reservations::allocate(self, None)
     }
 
-    pub fn release_id(&mut self, reservation: crate::platform::NovelIdReservation) {
-        #[cfg(feature = "native-runtime")]
-        if let Some(repo) = &self.sqlite {
-            let conn = repo.conn_handle();
-            // The public release seam is infallible. A failed release leaves
-            // ownership reserved (safe leakage), never available to two writers.
-            let _ = conn.lock().execute(
-                crate::db::novel_query::RELEASE_ID_SQL,
-                [reservation.id().0, reservation.generation()],
-            );
-            return;
-        }
-        let committed = self.data.contains_key(&reservation.id().0);
-        self.id_allocator.release(reservation, committed);
+    /// Reacquire the same durable generation; never allocate a replacement.
+    pub fn resume_id(
+        &mut self, id: crate::platform::NovelId, generation: i64,
+    ) -> Result<crate::platform::NovelIdReservation> {
+        id_reservations::resume(self, id, generation)
+    }
+
+    /// Retry the same publication owner without leaking a different ID.
+    pub(crate) fn allocate_transfer_id(
+        &mut self, owner: &str,
+    ) -> Result<crate::platform::NovelIdReservation> {
+        id_reservations::allocate(self, Some(owner))
+    }
+
+    pub(crate) fn release_transfer_id(&mut self, owner: &str) -> Result<()> {
+        id_reservations::release_owner(self, owner)
+    }
+
+    pub(crate) fn ordinary_id_liveness_page(
+        &self, cursor: Option<i64>, limit: usize,
+    ) -> Result<(Vec<(crate::platform::NovelId, i64)>, Option<i64>)> {
+        id_reservations::pending_liveness(self, cursor, limit)
+    }
+
+    pub(crate) fn release_creation_after_cleanup(
+        &mut self, prefix: &crate::platform::ObjectPrefix, completed_epoch: u64,
+        reservation: &crate::platform::NovelIdReservation,
+    ) -> Result<()> {
+        id_reservations::release_after_cleanup(self, prefix, completed_epoch, reservation)
+    }
+
+    pub fn release_id(&mut self, reservation: &crate::platform::NovelIdReservation) -> Result<()> {
+        id_reservations::release(self, reservation)
     }
 
     pub fn sort_by(&self, key: &str, reverse: bool) -> Vec<&NovelRecord> {
@@ -649,17 +938,28 @@ impl Database {
 #[derive(Default)]
 struct LockedFileUpdates<'a> {
     files: Vec<FileUpdate<'a>>,
+    committed: bool,
+    transfer_marker: Option<&'a crate::native::transfer::TransferCommitMarker>,
 }
 
 struct FileUpdate<'a> {
     path: &'a Path,
     original: Option<String>,
     written: bool,
+    staged: bool,
 }
 
 impl<'a> LockedFileUpdates<'a> {
-    fn run<T>(inventory: &Inventory, operation: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let mut files = Self::default();
+    fn run<T>(
+        inventory: &Inventory,
+        transfer_marker: Option<&'a crate::native::transfer::TransferCommitMarker>,
+        recover_pending: bool,
+        operation: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        if recover_pending {
+            crate::native::transfer::recover_pending_metadata_locked(inventory.root_dir())?;
+        }
+        let mut files = Self { transfer_marker, ..Self::default() };
         let result = operation(&mut files);
         files.finish(inventory, result)
     }
@@ -675,7 +975,7 @@ impl<'a> LockedFileUpdates<'a> {
                         Some(std::fs::read_to_string(path)?)
                     }
                 };
-                self.files.push(FileUpdate { path, original, written: false });
+                self.files.push(FileUpdate { path, original, written: false, staged: false });
                 self.files.len() - 1
             }
         };
@@ -687,21 +987,52 @@ impl<'a> LockedFileUpdates<'a> {
     }
 
     fn write(&mut self, path: &'a Path, content: &str) -> Result<bool> {
+        let marker = self.transfer_marker;
         let entry = self.entry(path)?;
         if entry.original.as_deref() == Some(content) { return Ok(false); }
+        if let Some(marker) = marker {
+            crate::native::transfer::stage_metadata(marker, path, entry.original.as_deref(), content)?;
+            entry.staged = true;
+            return Ok(true);
+        }
         // Rename may succeed before directory synchronization returns an error.
         entry.written = true;
         crate::db::inventory::atomic_write_locked(path, content)?;
         Ok(true)
     }
 
+    fn publish_transfer(&mut self) -> Result<()> {
+        if let Some(marker) = self.transfer_marker {
+            // All postimages and undo descriptors exist before the first
+            // authoritative metadata file is replaced.
+            for entry in self.files.iter_mut().filter(|entry| entry.staged) {
+                crate::native::transfer::install_metadata(marker, entry.path)?;
+                entry.written = true;
+            }
+        }
+        Ok(())
+    }
+
     fn finish<T>(self, inventory: &Inventory, result: Result<T>) -> Result<T> {
         let mut failures = Vec::new();
-        for entry in self.files.into_iter().rev().filter(|entry| entry.written) {
+        if result.is_err() && !self.committed && self.files.iter().any(|entry| entry.staged)
+            && let Some(marker) = self.transfer_marker
+        {
+            let restored = match marker.yaml_commit_path.parent() {
+                Some(directory) => crate::native::transfer::recover_metadata_locked(
+                    inventory.root_dir(), directory, false,
+                ),
+                None => Err(crate::error::NarouError::Database(
+                    "transfer metadata journal has no publication directory".into(),
+                )),
+            };
+            if let Err(error) = restored { failures.push(error.to_string()); }
+        }
+        for entry in self.files.into_iter().rev().filter(|entry| entry.written || entry.staged) {
             if let Some(name) = entry.path.file_stem().and_then(|name| name.to_str()) {
                 inventory.unload(name);
             }
-            if result.is_err() {
+            if result.is_err() && !self.committed && self.transfer_marker.is_none() {
                 let restored = match entry.original {
                     Some(content) => crate::db::inventory::atomic_write_locked(entry.path, &content),
                     None => match std::fs::remove_file(entry.path) {
@@ -1513,6 +1844,251 @@ mod tests {
                 assert_eq!(std::fs::read(&path).unwrap(), bytes, "{}", path.display());
             }
             assert_eq!(Database::with_root(root).unwrap().get(1).unwrap().title, "title 1");
+        }
+    }
+
+    fn virtual_identity_fixture(root: &std::path::Path, mode: u8, id: i64) -> (
+        Database, crate::native::object_store::NativeStore, crate::platform::WriteFence, String,
+    ) {
+        use crate::platform::NovelAccessFence;
+        use crate::native::sqlite::state::{self, StorageMode};
+        state::write_mode(&root.join(".narou"), if mode == 0 { StorageMode::Yaml } else { StorageMode::Sqlite }).unwrap();
+        if mode == 2 {
+            std::fs::write(root.join(".narou/local_setting.yaml"), "narou-compat: true\n").unwrap();
+        }
+        let mut database = Database::with_root(root.to_path_buf()).unwrap();
+        let legacy = format!("https://narou.rs/virtual/vs_{id}");
+        let mut record = sample_record(id, None, &["unchanged"]);
+        record.ncode = Some(crate::virtual_novel::ncode(id));
+        record.toc_url = legacy.clone();
+        record.is_narou = false;
+        let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).unwrap();
+        database.update_records(|mut records| { records.insert(id, record); Ok((records, ())) }).unwrap();
+        let store = crate::native::object_store::NativeStore::for_narou_root(root).unwrap();
+        let prefix = crate::platform::ObjectPrefix::from(keys.prefix().clone());
+        let fence = futures::executor::block_on(store.capture_writer(&prefix)).unwrap();
+        store.with_open_write(&fence, || database.with_library_metadata_snapshot(|inventory, primary| {
+            crate::native::transfer::with_control_metadata_snapshot(inventory.root_dir(), primary, |connection| {
+                crate::native::object_store::bind_namespace_origin(root, connection, &prefix, &legacy)
+            })
+        })).unwrap();
+        (database, store, fence, legacy)
+    }
+
+    fn identity_origin(store: &crate::native::object_store::NativeStore, fence: &crate::platform::WriteFence) -> String {
+        store.with_gate_lock(&fence.prefix, || store.namespace_state_locked(&fence.prefix).map(|(_, origin)| origin)).unwrap()
+    }
+
+    #[test]
+    fn virtual_rebind_converges_and_rejects_stale_ordinary_writers_in_every_mode() {
+        let _global = crate::test_support::global_state_guard();
+        for mode in [0, 1, 2] {
+            for id in [0, 7] {
+                let root = tempfile::tempdir().unwrap();
+                let (mut database, store, fence, legacy) = virtual_identity_fixture(root.path(), mode, id);
+                let first = crate::virtual_novel::new_toc_url().unwrap();
+                let losing = crate::virtual_novel::new_toc_url().unwrap();
+                let rebind = |db: &mut Database, candidate: &str| store.with_open_write(&fence, || {
+                    db.rebind_virtual_identity(&fence, crate::platform::NovelId(id), &legacy, candidate)
+                });
+                assert_eq!(rebind(&mut database, &first).unwrap(), first);
+                let mut restarted = Database::with_root(root.path().to_path_buf()).unwrap();
+                assert_eq!(rebind(&mut restarted, &losing).unwrap(), first);
+                assert_eq!(identity_origin(&store, &fence), first);
+                for stale in [&legacy, &losing] {
+                    let error = store.with_open_write(&fence, || restarted.update_records(|mut records| {
+                        records.get_mut(&id).unwrap().toc_url = stale.to_owned();
+                        Ok((records, ()))
+                    })).unwrap_err();
+                    assert!(error.to_string().contains("immutable"), "{error}");
+                }
+                assert_eq!(Database::with_root(root.path().to_path_buf()).unwrap().get(id).unwrap().toc_url, first);
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_rebind_metadata_and_sql_origin_faults_leave_legacy_identity() {
+        let _global = crate::test_support::global_state_guard();
+        for mode in [0, 1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut database, store, fence, legacy) = virtual_identity_fixture(root.path(), mode, 0);
+            let candidate = crate::virtual_novel::new_toc_url().unwrap();
+            if mode == 0 {
+                crate::db::inventory::fail_after_publication(root.path().join(".narou/database.yaml"));
+            } else {
+                let connection = database.sqlite.as_ref().unwrap().conn_handle();
+                connection.lock().execute_batch(
+                    "CREATE TRIGGER fail_virtual_origin BEFORE UPDATE OF origin_url_fold ON novel_access_gates BEGIN SELECT RAISE(ABORT,'injected virtual origin SQL failure'); END;"
+                ).unwrap();
+            }
+            assert!(store.with_open_write(&fence, || database.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, &candidate)).is_err());
+            assert_eq!(identity_origin(&store, &fence), legacy);
+            assert_eq!(Database::with_root(root.path().to_path_buf()).unwrap().get(0).unwrap().toc_url, legacy);
+            if mode != 0 {
+                database.sqlite.as_ref().unwrap().conn_handle().lock().execute_batch("DROP TRIGGER fail_virtual_origin").unwrap();
+            }
+            assert_eq!(store.with_open_write(&fence, || database.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, &candidate)).unwrap(), candidate);
+        }
+    }
+
+    #[test]
+    fn virtual_rebind_postcommit_faults_repair_before_keep_files_removal() {
+        use crate::platform::NovelAccessFence;
+        let _global = crate::test_support::global_state_guard();
+        for (mode, after_write) in [(0, false), (0, true), (1, false), (1, true), (2, false), (2, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut database, store, fence, legacy) = virtual_identity_fixture(root.path(), mode, 0);
+            let candidate = crate::virtual_novel::new_toc_url().unwrap();
+            super::record_mutation::fail_virtual_origin(after_write);
+            let error = store.with_open_write(&fence, || database.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, &candidate)).unwrap_err();
+            assert!(error.to_string().contains("injected virtual origin"), "{error}");
+            let mut restarted = Database::with_root(root.path().to_path_buf()).unwrap();
+            assert_eq!(restarted.get(0).unwrap().toc_url, candidate);
+            assert_eq!(identity_origin(&store, &fence), if after_write || mode != 0 { candidate.clone() } else { legacy });
+            let owner = crate::platform::access_fence::new_removal_owner(crate::platform::NovelId(0), false).unwrap();
+            let epoch = store.with_gate_lock(&fence.prefix, || restarted.with_removal_identity(&fence, crate::platform::NovelId(0), |connection| {
+                store.persist_retirement_locked(&fence, &owner, connection)
+            })).unwrap();
+            store.with_closed_write(&fence.prefix, &owner, epoch, || {
+                restarted.remove_closed_record(&fence.prefix, &owner, epoch, crate::platform::NovelId(0))
+            }).unwrap();
+            futures::executor::block_on(store.open_gate(&fence.prefix, &owner, epoch)).unwrap();
+            assert_eq!(identity_origin(&store, &fence), candidate, "keep-files deletion retains the committed portable provenance");
+            assert!(store.with_open_write(&fence, || restarted.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &candidate, &candidate)).is_err(), "the original E0 cannot be reused after removal");
+            let current = futures::executor::block_on(store.capture_writer(&fence.prefix)).unwrap();
+            assert!(store.with_open_write(&current, || restarted.rebind_virtual_identity(&current, crate::platform::NovelId(0), &candidate, &candidate)).is_err(), "record absence never repairs or adopts a retained origin");
+        }
+    }
+
+    #[test]
+    fn virtual_rebind_pre_metadata_failure_does_not_bind_the_candidate() {
+        let _global = crate::test_support::global_state_guard();
+        let root = tempfile::tempdir().unwrap();
+        let (mut database, store, fence, legacy) = virtual_identity_fixture(root.path(), 0, 0);
+        let candidate = crate::virtual_novel::new_toc_url().unwrap();
+        let writer_store = store.clone();
+        let writer_fence = fence.clone();
+        let writer_legacy = legacy.clone();
+        let writer_candidate = candidate.clone();
+        let error = std::thread::spawn(move || {
+            crate::native::tag_sequence::set_record_save_hook(|| {
+                Err(crate::error::NarouError::Database("injected before virtual metadata".into()))
+            });
+            writer_store.with_open_write(&writer_fence, || {
+                database.rebind_virtual_identity(&writer_fence, crate::platform::NovelId(0), &writer_legacy, &writer_candidate)
+            })
+        }).join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("injected before virtual metadata"), "{error}");
+        assert_eq!(identity_origin(&store, &fence), legacy);
+        let mut restarted = Database::with_root(root.path().to_path_buf()).unwrap();
+        assert_eq!(restarted.get(0).unwrap().toc_url, legacy);
+        assert_eq!(store.with_open_write(&fence, || {
+            restarted.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, &candidate)
+        }).unwrap(), candidate);
+    }
+
+    #[test]
+    fn concurrent_virtual_rebinds_keep_the_first_committed_identity() {
+        let _global = crate::test_support::global_state_guard();
+        for mode in [0, 1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let (_database, store, fence, legacy) = virtual_identity_fixture(root.path(), mode, 0);
+            let candidates = [crate::virtual_novel::new_toc_url().unwrap(), crate::virtual_novel::new_toc_url().unwrap()];
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let writers = candidates.iter().map(|candidate| {
+                let root = root.path().to_path_buf();
+                let fence = fence.clone();
+                let observed = legacy.clone();
+                let candidate = candidate.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut database = Database::with_root(root.clone()).unwrap();
+                    let store = crate::native::object_store::NativeStore::for_narou_root(&root).unwrap();
+                    barrier.wait();
+                    store.with_open_write(&fence, || {
+                        database.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &observed, &candidate)
+                    })
+                })
+            }).collect::<Vec<_>>();
+            let results = writers.into_iter().map(|writer| writer.join().unwrap()).collect::<Vec<_>>();
+            assert!(results.iter().any(Result::is_ok));
+            let mut restarted = Database::with_root(root.path().to_path_buf()).unwrap();
+            let winner = restarted.get(0).unwrap().toc_url.clone();
+            assert!(candidates.contains(&winner));
+            for result in results {
+                match result {
+                    Ok(uri) => assert_eq!(uri, winner),
+                    Err(error) => assert!(error.to_string().contains("novel_busy"), "{error}"),
+                }
+            }
+            for candidate in &candidates {
+                assert_eq!(store.with_open_write(&fence, || {
+                    restarted.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, candidate)
+                }).unwrap(), winner, "a contender retries the SAME original epoch, never a recaptured one");
+            }
+            assert_eq!(identity_origin(&store, &fence), winner);
+        }
+    }
+
+    #[test]
+    fn virtual_rebind_first_binds_legacy_origin_before_portable_cutover() {
+        use sha2::Digest;
+        let _global = crate::test_support::global_state_guard();
+        for mode in [0, 1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut database, store, fence, legacy) = virtual_identity_fixture(root.path(), mode, 0);
+            if mode == 0 {
+                let path = root.path().join("小説データ/.objects/.narou-transfer/.gate")
+                    .join(hex::encode(sha2::Sha256::digest(fence.prefix.as_ref().as_bytes())));
+                let mut gate: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                gate["origin_url_fold"] = serde_json::Value::String(String::new());
+                std::fs::write(path, serde_json::to_vec(&gate).unwrap()).unwrap();
+            } else {
+                database.sqlite.as_ref().unwrap().conn_handle().lock().execute(
+                    "UPDATE novel_access_gates SET origin_url_fold='' WHERE prefix=?1", [fence.prefix.as_ref()],
+                ).unwrap();
+            }
+            let candidate = crate::virtual_novel::new_toc_url().unwrap();
+            if mode == 0 {
+                crate::db::inventory::fail_after_publication(root.path().join(".narou/database.yaml"));
+                assert!(store.with_open_write(&fence, || {
+                    database.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, &candidate)
+                }).is_err());
+                assert_eq!(Database::with_root(root.path().to_path_buf()).unwrap().get(0).unwrap().toc_url, legacy);
+                assert_eq!(identity_origin(&store, &fence), legacy, "a failed first cutover retains only the actual OLD identity, never the candidate");
+            }
+            let current = store.with_open_write(&fence, || {
+                database.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, &candidate)
+            }).unwrap();
+            assert_eq!(current, candidate);
+            assert_eq!(Database::with_root(root.path().to_path_buf()).unwrap().get(0).unwrap().toc_url, candidate);
+            assert_eq!(identity_origin(&store, &fence), candidate);
+        }
+    }
+
+    #[test]
+    fn virtual_rebind_rejects_wrong_kind_id_and_unproven_legacy_origin() {
+        use sha2::Digest;
+        let _global = crate::test_support::global_state_guard();
+        for invalid in ["kind", "id", "origin"] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut database, store, fence, legacy) = virtual_identity_fixture(root.path(), 0, 0);
+            if invalid == "origin" {
+                let path = root.path().join("小説データ/.objects/.narou-transfer/.gate")
+                    .join(hex::encode(sha2::Sha256::digest(fence.prefix.as_ref().as_bytes())));
+                let mut gate: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                gate["origin_url_fold"] = serde_json::Value::String("https://example.test/foreign/".into());
+                std::fs::write(path, serde_json::to_vec(&gate).unwrap()).unwrap();
+            } else {
+                database.update_records(|mut records| {
+                    records.get_mut(&0).unwrap().ncode = if invalid == "kind" { None } else { Some("vs_8".into()) };
+                    Ok((records, ()))
+                }).unwrap();
+            }
+            let candidate = crate::virtual_novel::new_toc_url().unwrap();
+            assert!(store.with_open_write(&fence, || database.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, &candidate)).is_err(), "{invalid}");
+            assert_eq!(Database::with_root(root.path().to_path_buf()).unwrap().get(0).unwrap().toc_url, legacy);
         }
     }
 

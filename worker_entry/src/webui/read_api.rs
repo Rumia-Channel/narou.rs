@@ -100,10 +100,12 @@ async fn read(req: &Request, env: &Env) -> worker::Result<Response> {
         } else {
             crate::hidden::load_from_env(env).await.ok()
         };
-        return match services.app.external_api.list(&query, hidden).await {
+        let mut scope = services.app.external_api.read_scope("browser-list");
+        let result = match services.app.external_api.list(&mut scope, &query, hidden).await {
             Ok(list) => Response::from_json(&list.to_json()),
             Err(error) => super::application_error_response(&error),
         };
+        return super::leased_response(result, scope).await;
     }
     let Some(novel_path) = relative.strip_prefix("/novels/") else {
         return Response::error("Not Found", 404);
@@ -118,8 +120,10 @@ async fn read(req: &Request, env: &Env) -> worker::Result<Response> {
         return crate::build_epub_response(req, env, id, false).await;
     }
     let services = crate::composition::build_read_services(env).await?;
-    match services.app.external_api.novel(id).await {
+    let mut scope = services.app.external_api.read_scope("browser-novel");
+    let result = match services.app.external_api.novel(&mut scope, id).await {
         Ok(novel) => Response::from_json(&novel),
         Err(error) => super::application_error_response(&error),
-    }
+    };
+    super::leased_response(result, scope).await
 }

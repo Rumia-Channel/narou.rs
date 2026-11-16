@@ -1,7 +1,7 @@
 //! Work-type classification and its reserved, read-only tag projection.
 
-pub const NOVEL_TAG: &str = "小説";
-pub const MANGA_TAG: &str = "漫画";
+pub use crate::attribute_tag::{MANGA_TAG, NOVEL_TAG, is_attribute_tag};
+
 pub const ENABLED_SETTING: &str = "tag.attributes-enabled";
 
 pub async fn enabled(settings: &crate::application::settings::SettingsService) -> bool {
@@ -27,9 +27,6 @@ pub fn project(records: &mut [crate::db::NovelRecord], enabled: bool) {
     }
 }
 
-pub fn is_attribute_tag(tag: &str) -> bool {
-    matches!(tag, NOVEL_TAG | MANGA_TAG)
-}
 
 pub fn is_visible(tag: &str, show_novel: bool, show_manga: bool) -> bool {
     match tag {

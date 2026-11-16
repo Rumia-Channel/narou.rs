@@ -65,13 +65,29 @@ pub async fn run(
                 .await
                 .map_err(|error| NarouError::Platform(error.to_string()))?;
             let limit = limit.clamp(1, MAX_LIMIT);
-            narou_rs::platform::deduplicate_illustrations_page(
-                s3.as_ref(),
-                action,
-                limit,
-                &mut progress.state,
-            )
-            .await?;
+            if action == "plan" {
+                // Metadata-only enumeration never reads or retires bytes.
+                narou_rs::platform::deduplicate_illustrations_page_with_source(
+                    s3.as_ref(), s3.as_ref(), s3.as_ref(), action, limit, &mut progress.state,
+                ).await?;
+            } else {
+                if !crate::object_migration::prepare_bindings(db).await? {
+                    progress.state.done = false;
+                    return Ok(report(action, progress.state));
+                }
+                let source = Arc::new(crate::content_store::TransferReferenceStore::new(
+                    db.primary_view(), s3.clone(), s3.clone(), Arc::new(crate::d1_object_store::D1ObjectStore::new(db.primary_view())), Some(s3.clone() as Arc<dyn narou_rs::platform::AssetStore>),
+                ));
+                let source_objects: Arc<dyn narou_rs::platform::ObjectStore> = source.clone();
+                let reads = narou_rs::application::novel_access::NovelReadScope::new(&source_objects, "illustration-dedup");
+                let guarded = Arc::new(narou_rs::application::novel_access::NovelMigrationStore::new(source_objects, source, crate::object_migration::migration_origins(db)?, reads.clone())?);
+                let migrated = narou_rs::platform::deduplicate_illustrations_page_with_source(
+                    s3.as_ref(), guarded.as_ref(), guarded.as_ref(), action, limit, &mut progress.state,
+                ).await;
+                drop(guarded);
+                let released = reads.release_all().await;
+                migrated?; released?;
+            }
             progress.state.trim_failures(20);
             save_progress(db, &progress).await?;
             Ok(report(action, progress.state))

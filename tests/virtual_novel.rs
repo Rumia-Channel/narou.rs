@@ -533,3 +533,97 @@ fn corrupt_membership_is_not_reported_as_an_empty_library() {
     let listed = run(temp.path(), &["virtual", "list"]);
     assert!(!listed.status.success(), "corrupt membership must be reported, not silently hidden");
 }
+
+fn write_legacy_zero_virtual(root: &Path) -> std::path::PathBuf {
+    use sha2::Digest;
+    write_fixture(root);
+    let database_path = root.join(".narou/database.yaml");
+    let mut records: std::collections::BTreeMap<i64, narou_rs::db::NovelRecord> =
+        serde_yaml::from_str(&std::fs::read_to_string(&database_path).unwrap()).unwrap();
+    let mut parent = records[&1].clone();
+    parent.id = 0;
+    parent.title = "Portable parent".into();
+    parent.file_title = "Portable parent".into();
+    parent.ncode = Some("vs_0".into());
+    parent.toc_url = "https://narou.rs/virtual/vs_0".into();
+    parent.tags = vec!["vs_0".into(), "user-tag".into()];
+    let keys = narou_rs::platform::NovelObjectKeys::new(&parent.sitename, &parent.file_title, parent.use_subdirectory).unwrap();
+    let prefix = keys.prefix().as_ref();
+    let gate_path = root.join("小説データ/.objects/.narou-transfer/.gate")
+        .join(hex::encode(sha2::Sha256::digest(prefix.as_bytes())));
+    std::fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+    std::fs::write(&gate_path, serde_json::to_vec(&serde_json::json!({
+        "prefix": prefix, "origin_url_fold": parent.toc_url,
+        "epoch": 0, "owner": null, "updated_at": 0, "readers": {}, "content_revision": 0,
+    })).unwrap()).unwrap();
+    records.insert(0, parent);
+    std::fs::write(database_path, serde_yaml::to_string(&records).unwrap()).unwrap();
+    std::fs::write(root.join(".narou/virtual_novel_members.yaml"), "0: [1, 2]\n").unwrap();
+    gate_path
+}
+
+#[test]
+fn legacy_zero_virtual_export_rebinds_origin_and_converges_across_processes() {
+    for sqlite in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let gate_path = write_legacy_zero_virtual(root);
+        if sqlite { std::fs::write(root.join(".narou/storage-backend"), "sqlite").unwrap(); }
+        let export = |name: &str| {
+            let mut process = command(root);
+            if sqlite { process.env_remove("NAROU_RS_LEGACY_YAML"); }
+            process.args(["export", "vs_0", "-o", name]).output().unwrap()
+        };
+        let first = export("first.zip");
+        assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+        let stored = || -> String {
+            if sqlite {
+                rusqlite::Connection::open(root.join(".narou/db.sqlite")).unwrap()
+                    .query_row("SELECT toc_url FROM novels WHERE id=0", [], |row| row.get(0)).unwrap()
+            } else {
+                let records: std::collections::BTreeMap<i64, narou_rs::db::NovelRecord> =
+                    serde_yaml::from_str(&std::fs::read_to_string(root.join(".narou/database.yaml")).unwrap()).unwrap();
+                records[&0].toc_url.clone()
+            }
+        };
+        let portable = stored();
+        assert!(narou_rs::virtual_novel::is_portable_toc_url(&portable));
+        let second = export("second.zip");
+        assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
+        assert_eq!(stored(), portable);
+        let gate: serde_json::Value = serde_json::from_slice(&std::fs::read(&gate_path).unwrap()).unwrap();
+        assert_eq!(gate["origin_url_fold"].as_str(), Some(portable.as_str()));
+        if sqlite {
+            let origin: String = rusqlite::Connection::open(root.join(".narou/db.sqlite")).unwrap()
+                .query_row("SELECT origin_url_fold FROM novel_access_gates WHERE prefix=?1", [gate["prefix"].as_str().unwrap()], |row| row.get(0)).unwrap();
+            assert_eq!(origin, portable);
+        }
+        let mut remove = command(root);
+        if sqlite { remove.env_remove("NAROU_RS_LEGACY_YAML"); }
+        let removed = remove.args(["virtual", "remove", "vs_0"]).output().unwrap();
+        assert!(removed.status.success(), "{}", String::from_utf8_lossy(&removed.stderr));
+        let memberships = if sqlite {
+            let connection = rusqlite::Connection::open(root.join(".narou/db.sqlite")).unwrap();
+            let (origin, epoch): (String, u64) = connection.query_row(
+                "SELECT origin_url_fold,epoch FROM novel_access_gates WHERE prefix=?1",
+                [gate["prefix"].as_str().unwrap()], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(origin, portable);
+            assert!(epoch > 0);
+            let ids: Vec<i64> = connection.prepare("SELECT id FROM novels ORDER BY id").unwrap()
+                .query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+            assert_eq!(ids, [1, 2]);
+            connection.query_row("SELECT value_yaml FROM app_state WHERE scope='inv' AND key='virtual_novel_members'", [], |row| row.get::<_, String>(0)).unwrap()
+        } else {
+            let retained: serde_json::Value = serde_json::from_slice(&std::fs::read(&gate_path).unwrap()).unwrap();
+            assert_eq!(retained["origin_url_fold"].as_str(), Some(portable.as_str()));
+            assert!(retained["epoch"].as_u64().unwrap() > 0);
+            let records: std::collections::BTreeMap<i64, narou_rs::db::NovelRecord> =
+                serde_yaml::from_str(&std::fs::read_to_string(root.join(".narou/database.yaml")).unwrap()).unwrap();
+            assert_eq!(records.keys().copied().collect::<Vec<_>>(), [1, 2]);
+            std::fs::read_to_string(root.join(".narou/virtual_novel_members.yaml")).unwrap()
+        };
+        let memberships: narou_rs::virtual_novel::VirtualNovelMembers = serde_yaml::from_str(&memberships).unwrap();
+        assert!(memberships.get(0).is_none());
+    }
+}

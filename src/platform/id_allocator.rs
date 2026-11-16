@@ -34,6 +34,7 @@ impl IdAllocator {
         self.reserved.insert(id, generation);
         Ok(NovelIdReservation::new(NovelId(id), generation))
     }
+    pub(crate) fn owns(&self,reservation:&NovelIdReservation)->bool{self.reserved.get(&reservation.id().0)==Some(&reservation.generation())}
 
     pub(crate) fn commit(&mut self, id: i64) {
         self.next_id = self.next_id.max(id.saturating_add(1));
@@ -41,7 +42,7 @@ impl IdAllocator {
         self.released.remove(&id);
     }
 
-    #[cfg(any(feature = "native-runtime", test))]
+    #[cfg(test)]
     pub(crate) fn reconcile(&mut self, max_id: Option<i64>, mut committed: impl FnMut(i64) -> bool) {
         if let Some(id) = max_id {
             self.next_id = self.next_id.max(id.saturating_add(1));

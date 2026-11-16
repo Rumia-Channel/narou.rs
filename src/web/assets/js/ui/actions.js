@@ -418,7 +418,11 @@ export function bindActions() {
   on('action-option-about', openAbout);
   on('action-option-hidden', openHiddenSettings);
   on('action-option-export', () => exportSelectedNovels(getSelectedIdsInDisplayOrder()));
-  on('action-option-import', () => document.getElementById('transfer-import-file')?.click());
+  on('action-option-import', () => {
+    const action = document.getElementById('action-option-import');
+    if (action?.getAttribute('aria-disabled') === 'true') { showNotification(action.title, 'error'); return; }
+    document.getElementById('transfer-import-file')?.click();
+  });
   document.getElementById('transfer-import-file')?.addEventListener('change', async (event) => {
     const file = event.target.files?.[0];
     event.target.value = '';

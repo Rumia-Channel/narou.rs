@@ -236,15 +236,16 @@ async fn build_object_stores(
         split = split.with_staging((store.clone(), store.clone()));
     }
     let split = Arc::new(split);
+    let refs=Arc::new(crate::content_store::TransferReferenceStore::new(db.primary_view(),split.clone(),split,Arc::new(D1ObjectStore::new(db.primary_view())),stage_store.clone().map(|store|store as Arc<dyn AssetStore>)));
     let (objects, assets): (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) = if reader {
         // 配信は source を書き換えない。private staging (S3) だけを書ける。
         let staging = stage_store
             .clone()
             .map(|store| reader_storage::StagingTarget::new(store.clone(), store));
-        let guarded = ReaderStores::new(split.clone(), split, staging);
+        let guarded = ReaderStores::new(refs.clone(), refs, staging);
         (guarded.objects(), guarded.assets())
     } else {
-        (split.clone(), split)
+        (refs.clone(), refs)
     };
     Ok(WorkerObjectStores {
         objects,
@@ -254,44 +255,34 @@ async fn build_object_stores(
     })
 }
 
-/// Hash hints are loaded by novel id, with a bounded immutable warm cache.
+/// Hash hints belong to the primary generation admitted by the job's origin.
 type SectionHashes = HashMap<String, String>;
-static SECTION_HASH_CACHE: std::sync::LazyLock<
-    crate::isolate_cache::TtlMap<Arc<SectionHashes>>,
-> = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(
-    30_000.0, 1024 * 1024, |hashes| {
-        hashes.capacity() * (std::mem::size_of::<(String, String)>() + 16)
-            + hashes.iter().map(|(key, value)| key.capacity() + value.capacity()).sum::<usize>()
-    },
-));
 
-async fn load_section_hash_cache(db: &DbHandle, id: i64) -> Result<HashMap<String, SectionHashes>> {
-    let key = id.to_string();
-    if let Some(cached) = SECTION_HASH_CACHE.get(&key) {
-        return Ok(HashMap::from([(key, (*cached).clone())]));
-    }
-    let value = db.prepare("SELECT digests_json FROM novel_section_hashes WHERE novel_id = ?")
-        .bind(&[wasm_bindgen::JsValue::from_str(&key)])
-        .map_err(|error| NarouError::Platform(error.to_string()))?
-        .first::<String>(Some("digests_json")).await
-        .map_err(|error| NarouError::Platform(error.to_string()))?;
-    let hashes: SectionHashes = value.and_then(|value| serde_json::from_str(&value).ok()).unwrap_or_default();
-    SECTION_HASH_CACHE.put(key.clone(), Arc::new(hashes.clone()));
-    Ok(HashMap::from([(key, hashes)]))
+async fn load_section_hash_cache(db: &DbHandle, id: i64, fence: &narou_rs::platform::WriteFence) -> Result<HashMap<String, SectionHashes>> {
+    #[derive(serde::Deserialize)]struct HashRow{digests_json:String}
+    let db=db.primary_view();let store=D1ObjectStore::new(db.clone());let token=crate::content_store::nonce()?;
+    let check=db.prepare("INSERT INTO transfer_batch_guard(id) SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM novel_gate_bindings WHERE novel_id=? AND prefix=?)").bind(&[(id as f64).into(),fence.prefix.as_ref().trim_end_matches('/').into()]).map_err(|e|NarouError::Platform(e.to_string()))?;
+    let select=db.prepare("SELECT digests_json FROM novel_section_hashes WHERE novel_id=?").bind(&[(id as f64).into()]).map_err(|e|NarouError::Platform(e.to_string()))?;
+    let rows=db.batch(vec![store.open_guard(fence,&token)?,check,select,store.finish_publication_guard(&token)?]).await.map_err(|e|NarouError::Platform(e.to_string()))?;
+    crate::d1_repository::ensure_batch_success(&rows)?;
+    let value=rows[2].results::<HashRow>().map_err(|e|NarouError::Platform(e.to_string()))?.into_iter().next();
+    let hashes=value.and_then(|row|serde_json::from_str(&row.digests_json).ok()).unwrap_or_default();
+    Ok(HashMap::from([(id.to_string(),hashes)]))
 }
 
-async fn persist_section_hash_cache(db: &DbHandle, pending: HashMap<String, SectionHashes>) -> Result<()> {
+async fn persist_section_hash_cache(db: &DbHandle, pending: HashMap<String, SectionHashes>, fence: &narou_rs::platform::WriteFence) -> Result<()> {
+    let db=db.primary_view();let store=D1ObjectStore::new(db.clone());let token=crate::content_store::nonce()?;
+    let mut statements=vec![store.open_guard(fence,&token)?];
     for (id, hashes) in pending {
-        let json = serde_json::to_string(&hashes).map_err(|error| NarouError::Platform(error.to_string()))?;
-        db.prepare(
-            "INSERT INTO novel_section_hashes (novel_id, digests_json) VALUES (?, ?)
-             ON CONFLICT(novel_id) DO UPDATE SET digests_json = excluded.digests_json",
-        ).bind(&[wasm_bindgen::JsValue::from_str(&id), wasm_bindgen::JsValue::from_str(&json)])
-            .map_err(|error| NarouError::Platform(error.to_string()))?
-            .run().await.map_err(|error| NarouError::Platform(error.to_string()))?;
-        SECTION_HASH_CACHE.put(id, Arc::new(hashes));
+        let json=serde_json::to_string(&hashes).map_err(|error|NarouError::Platform(error.to_string()))?;
+        statements.push(db.prepare("INSERT INTO transfer_batch_guard(id) SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM novel_gate_bindings WHERE novel_id=? AND prefix=?)")
+            .bind(&[id.as_str().into(),fence.prefix.as_ref().trim_end_matches('/').into()]).map_err(|error|NarouError::Platform(error.to_string()))?);
+        statements.push(db.prepare("INSERT INTO novel_section_hashes(novel_id,digests_json) VALUES(?,?) ON CONFLICT(novel_id) DO UPDATE SET digests_json=excluded.digests_json")
+            .bind(&[id.into(),json.into()]).map_err(|error|NarouError::Platform(error.to_string()))?);
     }
-    Ok(())
+    statements.push(store.finish_publication_guard(&token)?);
+    let results=db.batch(statements).await.map_err(|error|NarouError::Platform(error.to_string()))?;
+    crate::d1_repository::ensure_batch_success(&results)
 }
 
 impl WorkerRuntime {
@@ -395,9 +386,9 @@ impl WorkerRuntime {
             .await.map_err(|error| worker::Error::RustError(error.to_string()))?;
         crate::webui::metadata::initialize_attributes(env).await?;
         let novels: Arc<dyn NovelRepository> =
-            Arc::new(D1NovelRepository::new(db.clone()).with_sites(site_settings.clone()));
+            Arc::new(D1NovelRepository::new(db.clone()).with_sites(site_settings.clone()).with_objects(write_objects.clone()));
         let write_novels: Arc<dyn NovelRepository> =
-            Arc::new(D1NovelRepository::new(write_db.clone()).with_sites(site_settings.clone()));
+            Arc::new(D1NovelRepository::new(write_db.clone()).with_sites(site_settings.clone()).with_objects(write_objects.clone()));
         let site_rules = Arc::new(
             narou_rs::application::site_definitions::SiteSettingsSnapshot::new(site_settings.clone()),
         );
@@ -478,24 +469,37 @@ impl WorkerRuntime {
     /// native's `false` / `None` defaults; `None` leaves the confirmation path
     /// intact and the executor reports `Blocked`. Diff snapshots are saved
     /// unless economy contains `nosave_diff`; raw HTML stays unsaved on Worker.
-    pub async fn new_downloader(&self, target: &JobTarget) -> Result<Downloader> {
-        let record = match target {
-            JobTarget::Id(id) => self.novels.get(*id).await?,
-            JobTarget::Ncode(ncode) => self.novels.find_by_ncode(ncode).await?,
-            JobTarget::Url(url) => self.novels.find_by_toc_url(url).await?,
-            JobTarget::All => None,
+    pub async fn new_downloader(&self, target: &JobTarget, origin: Option<&narou_rs::application::novel_access::AccessOrigin>) -> Result<(Downloader,Option<narou_rs::application::novel_access::NovelWriteGuard>)> {
+        let repository=D1NovelRepository::new(self.write_db.primary_view()).with_sites(self.site_settings.clone()).with_objects(self.write_objects.clone());
+        let record=match target{
+            JobTarget::Id(id)=>repository.get(*id).await?,
+            JobTarget::Ncode(ncode)=>repository.find_by_ncode(ncode).await?,
+            JobTarget::Url(url)=>repository.find_by_toc_url(url).await?,
+            JobTarget::All=>None,
         };
-        let section_hash_cache = match record {
-            Some(record) => load_section_hash_cache(&self.write_db, record.id).await?,
-            None => HashMap::new(),
+        let prepared_writer=if let Some(origin)=origin{
+            Some(narou_rs::application::novel_access::NovelWriteGuard::resume(self.write_objects.clone(),Some(self.assets.clone()),origin).await?)
+        }else if let Some(record)=record.as_ref(){
+            repository.bind_record_origin(record).await?;
+            let keys=narou_rs::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;
+            Some(narou_rs::application::novel_access::NovelWriteGuard::capture_for(&self.write_objects,Some(&self.assets),&keys).await?)
+        }else{None};
+        let section_hash_cache=match(record.as_ref(),prepared_writer.as_ref()){
+            (Some(record),Some(writer))=>{
+                let keys=narou_rs::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;
+                if writer.prefix().as_ref()!=keys.prefix().as_ref(){return Err(NarouError::Platform("novel_epoch_conflict: resumed writer namespace differs from canonical record".into()));}
+                repository.bind_record_origin(record).await?;
+                load_section_hash_cache(&self.write_db,record.id,writer.fence()).await?
+            },
+            _=>HashMap::new(),
         };
         let settings = self.downloader_settings().await?;
         let downloader = Downloader::with_platform_and_storage_and_settings_and_support(
             narou_rs::downloader::DownloaderPlatform {
                 http: self.http.clone(),
                 rate_limiter: self.rate_limiter.clone(),
-                novels: self.novels.clone(),
-                objects: self.objects.clone(),
+                novels: Arc::new(repository),
+                objects: self.write_objects.clone(),
                 assets: self.assets.clone(),
                 clock: self.clock.clone(),
             },
@@ -503,7 +507,7 @@ impl WorkerRuntime {
             section_hash_cache,
             settings,
         )?;
-        Ok(downloader.with_cookie_store(self.cookie_store.clone()))
+        Ok((downloader.with_cookie_store(self.cookie_store.clone()),prepared_writer))
     }
 
     /// Use the same effective YAML URL resolution as acquisition. The original
@@ -553,13 +557,13 @@ impl WorkerRuntime {
     }
 
     /// Flush this invocation's current-novel hints without reading other books.
-    pub async fn persist_pending_section_hash_cache(&self) -> Result<()> {
+    pub async fn persist_pending_section_hash_cache(&self, fence: &narou_rs::platform::WriteFence) -> Result<()> {
         let pending = self.pending_section_hash_cache.lock().take();
         let Some(pending) = pending else {
             return Ok(());
         };
         // Each novel owns an independent row: no library-wide read/merge/write.
-        persist_section_hash_cache(&self.write_db, pending).await
+        persist_section_hash_cache(&self.write_db, pending, fence).await
     }
 
     pub(crate) async fn collect_expired_assets(&self) -> Result<()> {
@@ -706,12 +710,10 @@ impl WorkerRuntime {
 
     /// Enqueue one plan through the ledger and Queue binding as one operation.
     /// Pending/retryable rows are sent; a live running row is not duplicated.
-    pub async fn enqueue_plan(&self, plan: JobPlan) -> Result<DispatchOutcome> {
-        let mut outcomes = self.dispatch_plans(std::slice::from_ref(&plan)).await?;
-        outcomes
-            .pop()
-            .ok_or_else(|| NarouError::Platform("enqueue produced no outcome".to_string()))?
-            .map_err(NarouError::Platform)
+
+    pub async fn enqueue_plan_with_origin(&self, plan: JobPlan, origin: &narou_rs::application::novel_access::AccessOrigin) -> Result<DispatchOutcome> {
+        let mut outcomes=self.dispatch_plans(std::slice::from_ref(&plan),Some(origin)).await?;
+        outcomes.pop().ok_or_else(||NarouError::Platform("enqueue produced no outcome".into()))?.map_err(NarouError::Platform)
     }
 
     /// Enqueue a bounded page as one batch operation: one ledger dedupe
@@ -723,7 +725,7 @@ impl WorkerRuntime {
         if plans.is_empty() {
             return Ok(Vec::new());
         }
-        let results = self.dispatch_plans(plans).await?;
+        let results = self.dispatch_plans(plans,None).await?;
         let mut outcomes = Vec::with_capacity(results.len());
         let mut failures = Vec::new();
         for result in results {
@@ -752,10 +754,14 @@ impl WorkerRuntime {
     async fn dispatch_plans(
         &self,
         plans: &[JobPlan],
+        origin: Option<&narou_rs::application::novel_access::AccessOrigin>,
     ) -> Result<Vec<std::result::Result<DispatchOutcome, String>>> {
         // One ledger round trip per chunk: dedupe lookup, bounded inserts,
         // and the status of every winning row (no per-plan re-read).
-        let enqueued = self.ledger.enqueue_batch(plans).await?;
+        let enqueued=if let Some(origin)=origin{
+            let [plan]=plans else{return Err(NarouError::Platform("origin-bound dispatch requires one logical job".into()))};
+            vec![self.ledger.enqueue_with_origin(plan,origin).await?]
+        }else{self.ledger.enqueue_batch(plans).await?};
         let frozen = self.frozen_skip_reasons(plans).await;
         let mut results: Vec<std::result::Result<DispatchOutcome, String>> =
             Vec::with_capacity(plans.len());
@@ -998,6 +1004,29 @@ impl WorkerRuntime {
     }
 }
 
+/// Transfer decisions and byte reads always use primary-bound, uncached stores.
+/// This lightweight composition does not require queue bindings.
+pub(crate) async fn build_transfer_service(env: &Env) -> std::result::Result<(narou_rs::application::transfer::TransferService,narou_rs::application::transfer::AuthScope,Arc<crate::transfer::journal::D1TransferJournal>),narou_rs::application::transfer::TransferError> {
+    use narou_rs::application::transfer::{AuthScope,TransferBuildInfo,TransferError,TransferService};
+    use narou_rs::platform::TransferStageStore;
+    let error=|e:worker::Error|TransferError::Platform{message:e.to_string()};
+    let db=DbHandle::primary(Arc::new(env.d1("DB").map_err(error)?));
+    let stores=build_object_stores(env,&db,crate::budget::SubrequestBudget::new(),true,false).await.map_err(error)?;
+    let d1=Arc::new(D1ObjectStore::new(db.clone()));
+    let (stage,s3):(Arc<dyn TransferStageStore>,bool)=match stores.stage_store {Some(store)=>(store,true),None=>(d1.clone(),false)};
+    let journal=Arc::new(crate::transfer::journal::D1TransferJournal::new(db.clone()));
+    let candidate=crate::content_store::nonce().map_err(|e|TransferError::Platform{message:e.to_string()})?;
+    db.prepare("INSERT OR IGNORE INTO app_state(scope,key,value_json,value_yaml) VALUES('inv','transfer_library_id',?,?)").bind(&[serde_json::to_string(&candidate).map_err(|e|TransferError::Platform{message:e.to_string()})?.into(),candidate.into()]).map_err(error)?.run().await.map_err(error)?;
+    let id=db.prepare("SELECT value_json FROM app_state WHERE scope='inv' AND key='transfer_library_id'").first::<String>(Some("value_json")).await.map_err(error)?.ok_or_else(||TransferError::Platform{message:"library transfer identity is missing".into()})?;
+    let scope=AuthScope{library_id:serde_json::from_str(&id).map_err(|e|TransferError::Platform{message:e.to_string()})?,principal:"admin".into()};
+    let key=crate::secrets::require(env,"NAROU_RS_LOGIN_KEY").await.map_err(error)?;
+    let sites=crate::bundled_sites::load_site_settings_uncached(&stores.objects).await.map_err(|e|TransferError::Platform{message:e.to_string()})?;
+    let backend=Arc::new(crate::transfer::backend::WorkerTransferBackend::new(db,journal.clone(),stores.objects,stores.assets,stage,d1,s3,key.into_bytes(),sites));
+    let build_id=option_env!("NAROU_TRANSFER_BUILD_ID").filter(|id|id.len()==64&&id.bytes().all(|b|b.is_ascii_hexdigit())).map(str::to_owned);
+    let build=TransferBuildInfo{wasm_build_id:build_id,abi_version:option_env!("NAROU_TRANSFER_ABI_VERSION").filter(|id|*id=="2").map(str::to_owned)};
+    Ok((TransferService::new(backend,journal.clone(),Arc::new(SystemClock),build),scope,journal))
+}
+
 /// Application services plus direct access to the novel object store, for
 /// handlers that stream content (download-time EPUB).
 pub struct ReadServices {
@@ -1017,13 +1046,11 @@ pub async fn build_services(env: &Env) -> worker::Result<AppServices> {
 }
 
 pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
-    // 読み取り系の API 面。UI 経路なので `DbHandle::ui` (first-unconstrained
-    // セッション、失敗時は primary) で組み立てる。
-    //
-    // 配信 Worker (reader) では source を変更しない: 保存層は書き込みを
-    // 拒否する private staging 付き、かつ lazy な backfill も走らない。
+    // Content metadata and leases must observe the same primary publication.
+    // Metadata-only list queries retain their separate UI replica path.
+    // Reader stores reject writes and never perform lazy source backfills.
     let reader = crate::worker_role::is_reader(env)?;
-    let db = DbHandle::ui(Arc::new(env.d1("DB")?));
+    let db = DbHandle::primary(Arc::new(env.d1("DB")?));
     let subrequests = crate::budget::SubrequestBudget::new();
     let WorkerObjectStores { objects, assets, s3_illustrations, .. } =
         build_object_stores(env, &db, subrequests, false, reader).await?;
@@ -1034,7 +1061,7 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     // 属性の backfill は writer の責務 (配信では実行しない)。
     crate::webui::metadata::initialize_attributes(env).await?;
     let novels: Arc<dyn NovelRepository> =
-        Arc::new(D1NovelRepository::new(db.clone()).with_sites(site_settings.clone()));
+        Arc::new(D1NovelRepository::new(db.clone()).with_sites(site_settings.clone()).with_objects(objects.clone()));
     let site_rules = Arc::new(
         narou_rs::application::site_definitions::SiteSettingsSnapshot::new(site_settings),
     );

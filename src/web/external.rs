@@ -49,12 +49,9 @@ pub async fn api_novels(
         Err(error) => return error_response(StatusCode::BAD_REQUEST, "bad_request", error.message()),
     };
     let hidden = crate::native::hidden::load().unwrap_or_default();
-    match state
-        .services
-        .external_api
-        .list(&request, Some(hidden))
-        .await
-    {
+    let mut reads = state.services.content.read_scope("external-list");
+    let result = state.services.external_api.list(&mut reads, &request, Some(hidden)).await;
+    let response = match result {
         Ok(list) => {
             let document = list.to_json();
             respond(
@@ -67,7 +64,8 @@ pub async fn api_novels(
             )
         }
         Err(error) => application_error(error),
-    }
+    };
+    super::novels::leased_response(response, reads)
 }
 
 /// 作品 1 件の情報。
@@ -87,7 +85,9 @@ pub async fn api_novel(
         Ok(format) => format,
         Err(error) => return application_error(error),
     };
-    match state.services.external_api.novel(id).await {
+    let mut reads = state.services.content.read_scope("external-novel");
+    let result = state.services.external_api.novel(&mut reads, id).await;
+    let response = match result {
         Ok(novel) => {
             let document = serde_json::to_value(&novel).unwrap_or(Value::Null);
             respond(
@@ -100,7 +100,8 @@ pub async fn api_novel(
             )
         }
         Err(error) => application_error(error),
-    }
+    };
+    super::novels::leased_response(response, reads)
 }
 
 /// 作品 1 件の目次。
@@ -120,7 +121,9 @@ pub async fn api_novel_toc(
         Ok(format) => format,
         Err(error) => return application_error(error),
     };
-    match state.services.external_api.toc(id).await {
+    let mut reads = state.services.content.read_scope("external-toc");
+    let result = state.services.external_api.toc(&mut reads, id).await;
+    let response = match result {
         Ok(toc) => {
             let document = serde_json::to_value(&toc).unwrap_or(Value::Null);
             respond(
@@ -133,7 +136,8 @@ pub async fn api_novel_toc(
             )
         }
         Err(error) => application_error(error),
-    }
+    };
+    super::novels::leased_response(response, reads)
 }
 
 /// 作品 1 件の全話の本文。
@@ -154,19 +158,21 @@ pub async fn api_novel_sections(
         Err(error) => return application_error(error),
     };
     // 目次は所有者ごとに 1 回だけ読む (話ごとに目次を読み直さない)。
-    let sections = match state.services.external_api.sections(id).await {
+    let mut reads = state.services.content.read_scope("external-sections");
+    let result = state.services.external_api.sections(&mut reads, id).await;
+    let sections = match result {
         Ok(sections) => sections,
-        Err(error) => return application_error(error),
+        Err(error) => return super::novels::leased_response(application_error(error), reads),
     };
     let document = serde_json::to_value(&sections).unwrap_or(Value::Null);
-    respond(
+    super::novels::leased_response(respond(
         format,
         &document,
         "sections",
         &[("sections", "section")],
         "section",
         document.get("sections").and_then(Value::as_array).map(Vec::as_slice),
-    )
+    ), reads)
 }
 
 /// 作品 1 件の 1 話の本文。
@@ -186,13 +192,16 @@ pub async fn api_novel_section(
         Ok(format) => format,
         Err(error) => return application_error(error),
     };
-    match state.services.external_api.section(id, &key).await {
+    let mut reads = state.services.content.read_scope("external-section");
+    let result = state.services.external_api.section(&mut reads, id, &key).await;
+    let response = match result {
         Ok(section) => {
             let document = serde_json::to_value(&section).unwrap_or(Value::Null);
             respond(format, &document, "section", &[], "section", None)
         }
         Err(error) => application_error(error),
-    }
+    };
+    super::novels::leased_response(response, reads)
 }
 
 /// 作品 1 件の EPUB。
@@ -209,22 +218,25 @@ pub async fn api_novel_epub(
     let Some(id) = parse_id(&id) else {
         return invalid_id(&id);
     };
-    let record = match state.services.library.get(NovelId(id)).await {
+    let mut reads = state.services.content.read_scope("external-epub");
+    let record = match state.services.content.read_record(&mut reads, NovelId(id)).await {
         Ok(Some(record)) => record,
         Ok(None) => {
+            let _ = reads.release_all().await;
             return error_response(
                 StatusCode::NOT_FOUND,
                 "not_found",
                 &format!("作品が見つかりません: {id}"),
             );
         }
-        Err(error) => return application_error(error),
+        Err(error) => { let _ = reads.release_all().await; return application_error(error); }
     };
     let novel_dir = match crate::db::with_database(|db| {
         crate::web::safe_existing_novel_dir(db.archive_root(), &record).map_err(crate::error::NarouError::Database)
     }) {
         Ok(novel_dir) => novel_dir,
         Err(error) => {
+            let _ = reads.release_all().await;
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -232,10 +244,11 @@ pub async fn api_novel_epub(
             );
         }
     };
-    match crate::web::novels::serve_epub(&state, id, &record, &novel_dir).await {
+    let response = match crate::web::novels::serve_epub(&state, &mut reads, id, &record, &novel_dir).await {
         Ok(response) => response,
         Err((status, message)) => error_response(status, "internal_error", &message),
-    }
+    };
+    super::novels::leased_response(response, reads)
 }
 
 /// タグの一覧。
@@ -251,14 +264,17 @@ pub async fn api_tags(
         Ok(format) => format,
         Err(error) => return application_error(error),
     };
-    match state.services.external_api.tags().await {
+    let mut reads = state.services.content.read_scope("external-tags");
+    let result = state.services.external_api.tags(&mut reads).await;
+    let response = match result {
         Ok(tags) => {
             let document = serde_json::to_value(&tags).unwrap_or(Value::Null);
             // タグ一覧は 1 件ずつ並べる (JSON Lines も XML も 1 タグ = 1 要素)。
             respond(format, &document, "tags", &[], "tag", document.as_array().map(Vec::as_slice))
         }
         Err(error) => application_error(error),
-    }
+    };
+    super::novels::leased_response(response, reads)
 }
 
 /// MCP の JSON-RPC 窓口。
@@ -283,10 +299,13 @@ pub async fn api_mcp(
     };
     let hidden = crate::native::hidden::load().unwrap_or_default();
     let server = McpServer::new(&state.services.external_api);
-    match server.handle(&request, Some(hidden)).await {
+    let mut reads = state.services.content.read_scope("http-mcp");
+    let result = server.handle(&mut reads, &request, Some(hidden)).await;
+    let response = match result {
         Some(response) => Json(response).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
-    }
+    };
+    super::novels::leased_response(response, reads)
 }
 
 /// API の案内。

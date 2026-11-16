@@ -104,10 +104,13 @@ the time of this audit.
 | regex | ^1 | MIT OR Apache-2.0 |
 | reqwest | ^0.13 | MIT OR Apache-2.0 |
 | rusqlite | ^0.41 | MIT |
+| saphyr-parser | ^0.3.4 | MIT OR Apache-2.0 |
 | serde | ^1 | MIT OR Apache-2.0 |
-| serde_json | ^1 | MIT OR Apache-2.0 |
+| serde_json | ^1.0.154 | MIT OR Apache-2.0 |
+| serde_json (build) | ^1 | MIT OR Apache-2.0 |
 | serde_yaml | ^0.9 | MIT OR Apache-2.0 |
 | sha2 | ^0.11 | MIT OR Apache-2.0 |
+| sha2 (build) | ^0.11 | MIT OR Apache-2.0 |
 | sha3 (build) | ^0.12 | MIT OR Apache-2.0 |
 | shell-words | ^1.1 | MIT/Apache-2.0 |
 | similar | ^3.1 | Apache-2.0 |
@@ -123,6 +126,7 @@ the time of this audit.
 | ua_generator | ^0.5 | MIT |
 | unicode-normalization | ^0.1 | MIT OR Apache-2.0 |
 | url | ^2 | MIT OR Apache-2.0 |
+| uuid | ^1 | MIT OR Apache-2.0 |
 | windows-sys (Windows) | ^0.61 | MIT OR Apache-2.0 |
 | zip | ^9.1 | MIT |
 
@@ -137,7 +141,7 @@ dependency).
 
 | License | Used by |
 | --- | ---: |
-| MIT License | 328 |
+| MIT License | 338 |
 | Unicode License v3 | 20 |
 | Apache License 2.0 | 8 |
 | BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License | 7 |
@@ -1866,6 +1870,7 @@ Used by:
 - cc 1.11.0
 - cfg-if 1.0.5
 - find-msvc-tools 0.1.15
+- js-sys 0.3.107
 - openssl-probe 0.1.6
 - openssl-probe 0.2.2
 - openssl-src 300.6.1+3.6.3
@@ -1873,6 +1878,11 @@ Used by:
 - pkg-config 0.3.34
 - socket2 0.6.5
 - stacker 0.1.25
+- wasm-bindgen-futures 0.4.80
+- wasm-bindgen-macro-support 0.2.130
+- wasm-bindgen-macro 0.2.130
+- wasm-bindgen-shared 0.2.130
+- wasm-bindgen 0.2.130
 
 ```text
 Copyright (c) 2014 Alex Crichton
@@ -2105,6 +2115,41 @@ Used by:
 
 ```text
 Copyright (c) 2014 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
+- uuid 1.29.2
+
+```text
+Copyright (c) 2014 The Rust Project Developers
+Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -4093,6 +4138,40 @@ THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
+- bumpalo 3.20.3
+
+```text
+Copyright (c) 2019 Nick Fitzgerald
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
 - ppv-lite86 0.2.21
 
 ```text
@@ -5734,37 +5813,6 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ### MIT License (`MIT`)
 
 Used by:
-- async_zip 0.0.19
-
-```text
-MIT License
-
-Copyright (c) 2021 Harry
-Copyright (c) 2023 Cognite AS
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-### MIT License (`MIT`)
-
-Used by:
 - psl-types 2.0.11
 
 ```text
@@ -5963,6 +6011,7 @@ Used by:
 - objc2-foundation 0.3.2
 - objc2 0.6.5
 - parse-zoneinfo 0.4.1
+- saphyr-parser 0.3.4
 - windows-core 0.62.2
 - windows-implement 0.60.2
 - windows-interface 0.59.3
@@ -6215,6 +6264,37 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+### MIT License (`MIT`)
+
+Used by:
+- async_zip 0.0.19
+
+```text
+MIT License
+
+Copyright (c) 2021 Harry
+Copyright (c) 2023 Cognite AS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ```
 
 ### MIT License (`MIT`)
@@ -6751,6 +6831,36 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
+- arraydeque 0.5.1
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2018 Andy Lok <andylokandy@hotmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ```
 

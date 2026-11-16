@@ -1,7 +1,9 @@
 //! Pull-driven ZIP encoding with working-set admission before metadata growth.
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
+#[cfg(test)]
 use std::pin::Pin;
+#[cfg(test)]
 use std::task::{Context, Poll};
 
 use async_zip::{Compression, ZipEntryBuilder, base::write::ZipFileWriter};
@@ -11,23 +13,7 @@ use sha2::{Digest, Sha256};
 use super::archive::validate_relative_path;
 use super::memory::{MetadataBudget, allocation_limit, default_limit};
 use super::{ArchiveFile, ArchiveManifest, ArchiveNovel, FORMAT_VERSION, MANIFEST_PATH,
-    MAX_ARCHIVE_BYTES, MAX_ENTRIES, MAX_FILE_BYTES, MAX_MANIFEST_BYTES, MAX_NOVELS,
-    MAX_TOTAL_UNCOMPRESSED_BYTES, Result, TransferError};
-
-struct LimitedWriter<W> { inner: W, written: u64 }
-impl<W: AsyncWrite + Unpin> AsyncWrite for LimitedWriter<W> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<std::io::Result<usize>> {
-        if self.written.saturating_add(bytes.len() as u64) > MAX_ARCHIVE_BYTES {
-            return Poll::Ready(Err(std::io::Error::other("transfer ZIP exceeds 512 MiB")));
-        }
-        match Pin::new(&mut self.inner).poll_write(cx, bytes) {
-            Poll::Ready(Ok(count)) => { self.written += count as u64; Poll::Ready(Ok(count)) }
-            other => other,
-        }
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> { Pin::new(&mut self.inner).poll_flush(cx) }
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> { Pin::new(&mut self.inner).poll_close(cx) }
-}
+    MAX_ENTRIES, MAX_MANIFEST_BYTES, MAX_NOVELS, Result, TransferError};
 
 /// A salted digest set backed only by explicitly admitted Vec allocations.
 /// Tracking occupied slots makes per-novel clear proportional to that novel,
@@ -78,7 +64,7 @@ impl PathIndex {
 /// and the path index, including old+new storage during growth. Native retains
 /// its existing format limits instead of receiving a new heap limit.
 pub struct AsyncArchiveStream<W: AsyncWrite + Unpin> {
-    writer: ZipFileWriter<LimitedWriter<W>>, manifest: ArchiveManifest,
+    writer: ZipFileWriter<W>, manifest: ArchiveManifest,
     paths: PathIndex, memory: MetadataBudget, files: usize, uncompressed: u64,
 }
 impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
@@ -102,7 +88,7 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
         memory.adopt_manifest(&manifest)?;
         super::structure::validate_with_budget(&manifest, &mut memory)?;
         manifest.format_version = FORMAT_VERSION;
-        Ok(Self { writer: ZipFileWriter::new(LimitedWriter { inner: writer, written: 0 }).force_no_zip64(),
+        Ok(Self { writer: ZipFileWriter::new(writer),
             manifest, paths: PathIndex::default(), memory, files: 1, uncompressed: 0 })
     }
 
@@ -154,12 +140,12 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
             .ok_or_else(|| TransferError::InvalidArchive("missing novel".into()))?;
         let path = self.normalized_path(path)?;
         self.memory.reserve(&mut self.manifest.novels[index].files, 1)?;
-        let (size, sha256) = self.entry(index, &path, reader).await?;
+        let (size, sha256) = self.entry(index, &path, reader, None).await?;
         self.manifest.novels[index].files.push(ArchiveFile { path, bytes: Vec::new(), sha256: Some(sha256), size: Some(size) });
         Ok(())
     }
 
-    async fn entry<R: AsyncRead + Unpin>(&mut self, index: usize, path: &str, reader: &mut R) -> Result<(u64, String)> {
+    async fn entry<R: AsyncRead + Unpin>(&mut self, index: usize, path: &str, reader: &mut R, expected_size: Option<u64>) -> Result<(u64, String)> {
         let digest = self.folded_path(path)?;
         if !self.paths.insert(digest, &mut self.memory)? {
             return Err(TransferError::InvalidArchive(format!("duplicate file path {path:?}")));
@@ -181,11 +167,12 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
         loop {
             let count = reader.read(&mut bytes).await?;
             if count == 0 { break; }
-            size += count as u64;
-            self.uncompressed += count as u64;
-            if size > MAX_FILE_BYTES || self.uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
-                return Err(TransferError::TooLarge(format!("{path}: uncompressed size exceeds limit")));
+            size = size.checked_add(count as u64).ok_or_else(|| TransferError::TooLarge("file size overflow".into()))?;
+            if expected_size.is_some_and(|expected| size > expected) {
+                return Err(TransferError::InvalidArchive(format!("size mismatch for {path:?}")));
             }
+            self.uncompressed = self.uncompressed.checked_add(count as u64)
+                .ok_or_else(|| TransferError::TooLarge("uncompressed total overflow".into()))?;
             hash.update(&bytes[..count]);
             entry.write_all(&bytes[..count]).await?;
         }
@@ -223,6 +210,13 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
     }
     async fn write_manifest_with_limit<R: AsyncRead + Unpin, F>(writer: W, manifest: ArchiveManifest, mut open: F, limit: usize) -> Result<()>
     where F: FnMut(usize, &str, u64) -> Result<R> {
+        for novel in &manifest.novels {
+            for file in &novel.files {
+                if file.size.is_none() { return Err(TransferError::InvalidArchive("missing expected file size".into())); }
+                let digest = file.sha256.as_deref().ok_or_else(|| TransferError::InvalidArchive("missing expected file sha256".into()))?;
+                super::protocol::check_sha256_hex(digest)?;
+            }
+        }
         let mut writer = Self::with_manifest(writer, manifest, limit)?;
         for index in 0..writer.manifest.novels.len() {
             writer.paths.clear();
@@ -230,7 +224,6 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
                 let file = &mut writer.manifest.novels[index].files[position];
                 if !file.bytes.is_empty() { return Err(TransferError::InvalidArchive("manifest must contain metadata, not file bodies".into())); }
                 let size = file.size.ok_or_else(|| TransferError::InvalidArchive("missing file size".into()))?;
-                if size > MAX_FILE_BYTES { return Err(TransferError::TooLarge("file exceeds size limit".into())); }
                 let original = std::mem::take(&mut file.path);
                 let path = writer.normalized_path(&original)?;
                 writer.memory.release_charge(MetadataBudget::allocation::<u8>(original.capacity())?);
@@ -239,12 +232,16 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
                 let reader_path = MetadataBudget::allocation::<u8>(path.len())?;
                 writer.memory.charge(reader_path)?;
                 let mut reader = open(index, &path, size)?;
-                let (actual, sha256) = writer.entry(index, &path, &mut reader).await?;
+                let (actual, sha256) = writer.entry(index, &path, &mut reader, Some(size)).await?;
                 drop(reader);
                 writer.memory.release_charge(reader_path);
                 if actual != size { return Err(TransferError::InvalidArchive(format!("size mismatch for {path:?}"))); }
                 let file = &mut writer.manifest.novels[index].files[position];
-                if let Some(old) = &file.sha256 { writer.memory.release_charge(MetadataBudget::allocation::<u8>(old.capacity())?); }
+                let old = file.sha256.as_ref().expect("expected digest admitted");
+                if !old.eq_ignore_ascii_case(&sha256) {
+                    return Err(TransferError::HashMismatch { path, expected: old.clone(), actual: sha256 });
+                }
+                writer.memory.release_charge(MetadataBudget::allocation::<u8>(old.capacity())?);
                 file.path = path; file.sha256 = Some(sha256); file.size = Some(actual);
             }
             writer.end_novel(index)?;
@@ -257,9 +254,10 @@ impl<W: AsyncWrite + Unpin> AsyncArchiveStream<W> {
         super::structure::validate_with_budget(&self.manifest, &mut self.memory)?;
         let mut count = super::stream::CountingWriter(0);
         serde_json::to_writer(&mut count, &self.manifest)?;
-        if count.0 > MAX_MANIFEST_BYTES || self.uncompressed.saturating_add(count.0) > MAX_TOTAL_UNCOMPRESSED_BYTES {
-            return Err(TransferError::TooLarge("manifest and files exceed uncompressed limit".into()));
+        if count.0 > MAX_MANIFEST_BYTES {
+            return Err(TransferError::TooLarge("manifest exceeds metadata limit".into()));
         }
+        self.uncompressed.checked_add(count.0).ok_or_else(|| TransferError::TooLarge("uncompressed total overflow".into()))?;
         let mut filename = self.memory.string(MANIFEST_PATH.len())?;
         filename.push_str(MANIFEST_PATH);
         self.reserve_directory_entry()?;
@@ -281,9 +279,63 @@ mod tests {
     use super::*;
     fn metadata() -> ArchiveManifest {
         ArchiveManifest { novels: vec![ArchiveNovel { title: "budget".into(),
-            files: vec![ArchiveFile { path: "toc.yaml".into(), size: Some(3), ..Default::default() }],
+            files: vec![ArchiveFile { path: "toc.yaml".into(), size: Some(3), sha256: Some(hex::encode(Sha256::digest(b"toc"))), ..Default::default() }],
             ..Default::default() }], ..Default::default() }
     }
+    #[test]
+    fn streaming_roundtrips_beyond_the_whole_value_file_budget() {
+        futures::executor::block_on(async {
+            struct Zeros(u64);
+            impl AsyncRead for Zeros {
+                fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &mut [u8]) -> Poll<std::io::Result<usize>> {
+                    assert!(bytes.len() <= 64 * 1024);
+                    let count = self.0.min(bytes.len() as u64) as usize;
+                    bytes[..count].fill(0); self.0 -= count as u64; Poll::Ready(Ok(count))
+                }
+            }
+            let size = super::super::UTILITY_FILE_BUDGET_BYTES + 1;
+            let mut output = futures::io::Cursor::new(Vec::new());
+            let mut writer = AsyncArchiveStream::new(&mut output, "test".into(), "fixed".into()).unwrap();
+            writer.begin_novel(ArchiveNovel::default()).unwrap();
+            writer.add_reader("toc.yaml", &mut Zeros(size)).await.unwrap();
+            writer.finish().await.unwrap();
+            let bytes: std::sync::Arc<[u8]> = output.into_inner().into();
+            let archive_size = bytes.len() as u64;
+            let mut archive = super::super::ValidatedArchive::open(
+                move || Ok(futures::io::Cursor::new(bytes.clone())), archive_size, Default::default()).await.unwrap();
+            archive.validate(|_, _| Ok(())).await.unwrap();
+            assert_eq!(archive.total_uncompressed(), size);
+            assert_eq!(archive.manifest().novels[0].files[0].size, Some(size));
+        });
+    }
+
+    #[test]
+    fn zip64_expected_sizes_above_u32_are_not_rejected_as_binary_caps() {
+        futures::executor::block_on(async {
+            let mut manifest = metadata(); manifest.novels[0].files[0].size = Some(u32::MAX as u64 + 1);
+            let mut opened = false;
+            let result = AsyncArchiveStream::write_manifest(futures::io::sink(), manifest, |_, _, size| {
+                opened = true; assert!(size > u32::MAX as u64); Ok(futures::io::Cursor::new(b""))
+            }).await;
+            assert!(opened);
+            assert!(matches!(result, Err(TransferError::InvalidArchive(message)) if message.contains("size mismatch")));
+        });
+    }
+
+    #[test]
+    fn export_rejects_missing_or_changed_expected_hash_instead_of_rewriting_it() {
+        futures::executor::block_on(async {
+            let mut missing = metadata(); missing.novels[0].files[0].sha256 = None;
+            let mut output = futures::io::Cursor::new(Vec::new());
+            let result = AsyncArchiveStream::write_manifest(&mut output, missing, |_, _, _| Ok(futures::io::Cursor::new(b"toc"))).await;
+            assert!(result.is_err()); assert!(output.get_ref().is_empty());
+            let mut changed = metadata(); changed.novels[0].files[0].sha256 = Some("0".repeat(64));
+            let result = AsyncArchiveStream::write_manifest(&mut output, changed, |_, _, _| Ok(futures::io::Cursor::new(b"toc"))).await;
+            assert!(matches!(result, Err(TransferError::HashMismatch { .. })));
+            assert!(!output.get_ref().windows(4).any(|bytes| bytes == b"PK\x05\x06"));
+        });
+    }
+
     #[test]
     fn adopted_manifest_and_directory_growth_share_one_budget() {
         futures::executor::block_on(async {

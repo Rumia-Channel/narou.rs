@@ -4,13 +4,13 @@
 //! 書く。native の `convert_novel_by_id` が書く固定名ミラーと同じキーなので、
 //! 続けて `download.epub` がそのまま配信できる（外部プロセスは使わない）。
 
+use narou_rs::application::novel_access::{NovelAccess, NovelReadScope, NovelWriteGuard};
 use narou_rs::application::convert::{
     ConvertItemReport, ConvertService, ConvertedNovel, emit_convert_item_lines,
 };
 use narou_rs::application::jobs::{JobFailureClass, JobPlan, JobTarget, classify_failure};
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::NovelMutation;
-use worker::console_log;
 
 use crate::composition::WorkerRuntime;
 use crate::executor::JobOutcome;
@@ -57,6 +57,9 @@ async fn concurrency_enabled(runtime: &WorkerRuntime) -> bool {
 pub async fn execute_convert(
     runtime: &WorkerRuntime,
     job: &JobPlan,
+    job_id: &narou_rs::application::JobId,
+    owner: std::sync::Arc<narou_rs::platform::JobExecutionOwner>,
+    checkpoint: Option<&narou_rs::application::WorkerExecutionCheckpoint>,
     push: &PushHubClient,
 ) -> JobOutcome {
     let target = match job.target {
@@ -68,20 +71,62 @@ pub async fn execute_convert(
         }
     };
 
+    // The shared emitter wraps the whole attempt: namespace lookup, writer
+    // admission, metadata revalidation and the conversion itself. Rejected
+    // targets therefore still reach this job's console through the shared
+    // id_missing/item_error lines under the started/processing header, exactly
+    // like native `cmd_convert` prints them.
     let push_sink = PushHubSink::shared(push.clone(), console_target(runtime).await);
-    let report = push_sink.run(narou_rs::application::messages::MessageContext::new(
+    let lines_sink = push_sink.clone();
+    let context = narou_rs::application::messages::MessageContext::new(
         push_sink.clone(), crate::consumer::webui_debug_mode(runtime).await,
-    ).scope(async {
-        emit_convert_item_lines(push_sink.as_ref(), &job.target.as_str(), target.0, || {
-            convert(runtime, target)
+    );
+    // Admission hands the guard/read-lease pair back through this slot so the
+    // lease is released and the convert-failure flag is updated with the same
+    // original writer after the emitter has drained its lines.
+    let mut conversion = None;
+    let conversion_slot = &mut conversion;
+    let report = push_sink.run(context.scope(async move {
+        emit_convert_item_lines(lines_sink.as_ref(), &job.target.as_str(), target.0, || async move {
+            let Some(mut attempt) = prepare(runtime, job_id, checkpoint, target, owner).await? else {
+                return Ok(None);
+            };
+            let converted = convert(runtime, &mut attempt.access, &attempt.record).await;
+            *conversion_slot = Some(attempt);
+            converted
         }).await
     })).await;
 
+    let (guard, access) = match conversion {
+        Some(PreparedConversion { guard, access, .. }) => (guard, access),
+        None => {
+            return match report {
+                // レコード不在: ledger / queue_failed には従来通りのエラー文言を残す
+                // (コンソール行は id_missing で既に出ている)。
+                ConvertItemReport::Missing => JobOutcome::Permanent {
+                    reason: format!("小説 {} がありません", target.0),
+                },
+                // admission (guard 捕捉・checkpoint 保存・再検証) の失敗は既に
+                // item_error で出ている。失敗フラグを立てる guard が無いので
+                // 分類だけ返す。
+                ConvertItemReport::Failed { error } => classify(error),
+                // 成功した変換は必ず pair をスロットへ戻す。
+                ConvertItemReport::Converted { .. } => classify(NarouError::Platform(
+                    "conversion writer lost after a successful convert".into(),
+                )),
+            };
+        }
+    };
+
+    let released = access.release().await;
+    if let Err(error) = released { return classify(error); }
     match report {
         ConvertItemReport::Converted { .. } => {
             // native `clear_convert_failure` 相当: 成功したら失敗フラグを落とす。
-            set_convert_failure_flag(runtime, target, false).await;
-            JobOutcome::Succeeded
+            match set_convert_failure_flag(runtime, &guard, target, false).await {
+                Ok(()) => JobOutcome::Succeeded,
+                Err(error) => classify(error),
+            }
         }
         // レコード不在: ledger / queue_failed には従来通りのエラー文言を残す
         // (コンソール行は id_missing で既に出ている)。
@@ -91,9 +136,67 @@ pub async fn execute_convert(
         // native `set_convert_failure` 相当: 失敗した変換はレコードに記録し、
         // 次回 update の差分なし (`None`) 実行で再変換されるようにする。
         ConvertItemReport::Failed { error } => {
-            set_convert_failure_flag(runtime, target, true).await;
+            if let Err(flag_error) = set_convert_failure_flag(runtime, &guard, target, true).await { return classify(flag_error); }
             classify(error)
         }
+    }
+}
+
+/// 変換 1 件分の admission が持ち帰るもの。emitter を抜けた後の read lease
+/// 解放と失敗フラグ更新に同じ pair (writer guard + admission) を渡すため
+/// 1 つにまとめる。
+struct PreparedConversion {
+    record: narou_rs::db::NovelRecord,
+    guard: NovelWriteGuard,
+    access: NovelAccess,
+}
+
+/// 名前空間 lookup → writer 捕捉 → checkpoint 保存 → read lease 許可 →
+/// メタデータ再検証を一連の admission として行う。
+///
+/// The first lookup discovers only the namespace; `Ok(None)` maps to the
+/// shared `id_missing` line without touching content. A chained job resumes
+/// its saved origin and a standalone conversion captures once — either way
+/// before any content access, and every `Err` also releases the admitted
+/// reader before returning.
+async fn prepare(
+    runtime: &WorkerRuntime,
+    job_id: &narou_rs::application::JobId,
+    checkpoint: Option<&narou_rs::application::WorkerExecutionCheckpoint>,
+    target: narou_rs::platform::NovelId,
+    owner: std::sync::Arc<narou_rs::platform::JobExecutionOwner>,
+) -> Result<Option<PreparedConversion>> {
+    let Some(initial) = runtime.novels.get_current(target).await? else {
+        return Ok(None);
+    };
+    let keys = narou_rs::platform::NovelObjectKeys::new(&initial.sitename, &initial.file_title, initial.use_subdirectory)?;
+    let writer = match checkpoint.and_then(|saved| saved.write_origin.as_ref()) {
+        Some(origin) => NovelWriteGuard::resume(runtime.write_objects(), Some(runtime.assets()), origin).await,
+        None => NovelWriteGuard::capture_for(&runtime.write_objects(), Some(&runtime.assets()), &keys).await,
+    };
+    let mut guard = writer?;
+    guard.bind_job_owner(std::sync::Arc::clone(&owner))?;
+    if guard.prefix().as_ref().trim_end_matches('/') != keys.prefix().as_ref() {
+        return Err(NarouError::Platform("conversion writer namespace changed".into()));
+    }
+    let durable = checkpoint.cloned().unwrap_or_else(|| narou_rs::application::WorkerExecutionCheckpoint::planned(job_id.clone(), Some(target)))
+        .with_write_origin(guard.origin());
+    narou_rs::application::JobQueue::save_checkpoint(runtime.ledger.as_ref(), job_id, owner.execution_token(), &durable).await?;
+    let mut access = NovelAccess::from_writer(guard.clone(), "convert-job").await?;
+    let loaded: Result<_> = async {
+        access.read()?.validate().await?;
+        let record = runtime.novels.get_current(target).await?
+            .ok_or_else(|| NarouError::NotFound(format!("小説 {} がありません", target.0)))?;
+        let current = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        access.read()?.validate().await?;
+        if current.prefix() != keys.prefix() {
+            return Err(NarouError::Platform("conversion namespace changed during admission".into()));
+        }
+        Ok(record)
+    }.await;
+    match loaded {
+        Ok(record) => Ok(Some(PreparedConversion { record, guard, access })),
+        Err(error) => { let _ = access.release().await; Err(error) }
     }
 }
 
@@ -101,68 +204,50 @@ pub async fn execute_convert(
 /// / `clear_convert_failure` 相当)。レコード遷移は共有
 /// `novel_actions::mark_convert_failure` が持ち、更新するタイミング
 /// (Converted で解除 / Failed で設定) は native と同じ。
-/// 失敗してもジョブ結果を変えない (ログだけ残す best-effort)。
-async fn set_convert_failure_flag(runtime: &WorkerRuntime, id: narou_rs::platform::NovelId, failed: bool) {
+/// The same origin is validated again before guarded bookkeeping.
+async fn set_convert_failure_flag(runtime: &WorkerRuntime, guard: &NovelWriteGuard, id: narou_rs::platform::NovelId, failed: bool) -> Result<()> {
+    let mut access = NovelAccess::from_writer(guard.clone(), "convert-failure-flag").await?;
     let result: Result<()> = async {
-        let Some(mut record) = runtime.novels.get(id).await? else {
-            return Ok(());
+        access.read()?.validate().await?;
+        let Some(mut record) = runtime.novels.get_current(id).await? else {
+            return Err(narou_rs::error::NarouError::NotFound(format!("novel {} disappeared during conversion", id.0)));
         };
+        let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        access.read()?.validate().await?;
+        if keys.prefix().as_ref() != guard.prefix().as_ref().trim_end_matches('/') {
+            return Err(narou_rs::error::NarouError::Platform("conversion bookkeeping namespace changed".into()));
+        }
         if narou_rs::application::novel_actions::mark_convert_failure(&mut record, failed) {
-            runtime
-                .novels
-                .apply_batch(vec![NovelMutation::Upsert(record)])
-                .await?;
+            runtime.novels.apply_batch_guarded(guard.fence(), vec![NovelMutation::Upsert(record)]).await?;
         }
         Ok(())
-    }
-    .await;
-    if let Err(error) = result {
-        console_log!("convert flag update failed for novel {}: {error}", id.0);
-    }
+    }.await;
+    let released = access.release().await;
+    result?;
+    released
 }
 
 /// レコード解決込みで 1 件変換する。`Ok(None)` は id_missing に対応する。
 async fn convert(
     runtime: &WorkerRuntime,
-    id: narou_rs::platform::NovelId,
+    access: &mut NovelAccess,
+    record: &narou_rs::db::NovelRecord,
 ) -> Result<Option<ConvertedNovel>> {
-    let Some(record) = runtime
-        .services
-        .library
-        .get(id)
-        .await
-        .map_err(|error| NarouError::Platform(error.to_string()))?
-    else {
-        return Ok(None);
-    };
-
-    let service = ConvertService::new(runtime.objects(), runtime.assets(), runtime.settings_store());
-    // `convert.keep-txt=false` では変換済みテキストを保存しない
-    // (EPUB のダウンロード時に組み立て直す。CPU と引き換えに D1 を節約する)。
+    let service = ConvertService::new(runtime.write_objects(), runtime.assets(), runtime.settings_store());
     let keep_text = keep_converted_text(runtime).await;
     let converted = if record.ncode.as_deref().is_some_and(narou_rs::virtual_novel::is_virtual_ncode) {
-        let persistence = narou_rs::downloader::persistence::PersistenceService::new(
-            runtime.objects(), runtime.assets(),
-        );
-        let book = crate::virtual_novels::load_book(
-            runtime.write_db(), &record, runtime.novels.as_ref(), &persistence,
-        ).await?;
-        service.convert_source(&record, book.toc, book.sections, keep_text).await?
+        let persistence = narou_rs::downloader::persistence::PersistenceService::new(runtime.write_objects());
+        let scope = NovelReadScope::new(&runtime.write_objects(), "virtual-convert");
+        let book = crate::virtual_novels::load_book(scope, runtime.write_db(), record, runtime.novels.as_ref(), &persistence).await?;
+        service.convert_source(access, record, book.toc, book.sections, keep_text).await?
     } else if keep_text {
-        service.convert_and_store(&record).await?
+        service.convert_and_store(access, record).await?
     } else {
-        service.convert_only(&record).await?
+        service.convert_only(access, record).await?
     };
     if !keep_text {
-        // 以前に変換済みテキストが残っていれば掃除する
-        // (`convert.keep-txt=false` は何も保存しない構成)。
-        if let Ok(keys) = narou_rs::platform::NovelObjectKeys::new(
-            &record.sitename,
-            &record.file_title,
-            record.use_subdirectory,
-        ) {
-            let _ = runtime.objects().delete(&keys.converted_text()).await;
-        }
+        let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        access.write()?.delete(&keys.converted_text()).await?;
     }
     Ok(Some(converted))
 }

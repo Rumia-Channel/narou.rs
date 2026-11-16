@@ -9,7 +9,7 @@ use crate::application::settings::SettingsStore;
 use crate::application::tag_colors::TagColorStore;
 use crate::error::{NarouError, Result};
 use crate::db::inventory::{Inventory, InventoryScope};
-use crate::platform::PlatformFuture;
+use crate::platform::{ObjectStore, PlatformFuture};
 
 /// Console used for local-only jobs when web concurrency is enabled.
 ///
@@ -108,33 +108,43 @@ impl FreezeStore for NativeFreezeStore {
 }
 
 impl FreezeMutationStore for NativeFreezeStore {
+    fn set_frozen_guarded_many<'a>(
+        &'a self, fences: &'a [crate::platform::WriteFence], ids: &'a [crate::platform::NovelId], frozen: bool,
+    ) -> PlatformFuture<'a, Result<()>> {
+        let inventory = self.inventory.clone();
+        let fences = fences.to_vec();
+        let ids = ids.to_vec();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let store = crate::native::object_store::NativeStore::for_narou_root(inventory.root_dir())?;
+                store.with_open_writes(&fences, || {
+                    let records = crate::native::novel_repository::NativeNovelRepository::new().get_many_current_sync(&ids)?;
+                    for (id, record) in ids.iter().zip(records) {
+                        let record = record.ok_or_else(|| NarouError::NotFound(format!("ID: {}", id.0)))?;
+                        let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+                        if !fences.iter().any(|fence| fence.prefix.as_ref() == keys.prefix().as_ref()) {
+                            return Err(NarouError::Platform("freeze requires every novel's original writer fence".into()));
+                        }
+                    }
+                    inventory.update_yaml("freeze", InventoryScope::Local, |mut current: HashMap<i64, serde_yaml::Value>| {
+                        for id in ids {
+                            if frozen { current.insert(id.0, serde_yaml::Value::Bool(true)); }
+                            else { current.remove(&id.0); }
+                        }
+                        Ok((current, ()))
+                    })
+                })
+            }).await.map_err(|error| NarouError::Platform(format!("freeze inventory task failed: {error}")))?
+        })
+    }
+
     fn set_frozen<'a>(
         &'a self,
         ids: &'a [crate::platform::NovelId],
         frozen: bool,
     ) -> PlatformFuture<'a, Result<()>> {
-        let inventory = Arc::clone(&self.inventory);
-        let ids = ids.iter().map(|id| id.0).collect::<Vec<_>>();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                inventory.update_yaml(
-                    "freeze",
-                    InventoryScope::Local,
-                    |mut current: HashMap<i64, serde_yaml::Value>| {
-                        for id in ids {
-                            if frozen {
-                                current.insert(id, serde_yaml::Value::Bool(true));
-                            } else {
-                                current.remove(&id);
-                            }
-                        }
-                        Ok((current, ()))
-                    },
-                )
-            })
-            .await
-            .map_err(|error| NarouError::Platform(format!("freeze inventory task failed: {error}")))?
-        })
+        let _ = (ids, frozen);
+        Box::pin(async { Err(NarouError::Platform("freeze requires original writer fences".into())) })
     }
 }
 
@@ -318,13 +328,13 @@ pub struct NativeAppServices {
 impl NativeAppServices {
     pub fn new(inventory: Arc<Inventory>) -> Result<Self> {
         let root_dir = inventory.root_dir().to_path_buf();
+        let active_root = crate::db::with_database(|database| database.archive_root().parent().map(std::path::Path::to_path_buf)
+            .ok_or_else(|| NarouError::Platform("archive has no library root".into())))?;
+        if active_root != root_dir { return Err(NarouError::Platform("service inventory differs from the active database root".into())); }
         let novels: Arc<dyn crate::platform::NovelRepository> =
             Arc::new(crate::native::novel_repository::NativeNovelRepository::new());
         let stores = crate::native::object_store::NativeStores::for_narou_root(&root_dir)?;
         let objects = stores.objects;
-        // 挿絵だけ S3 へ流す構成でも削除・読み出しが同じ経路になるよう、
-        // SplitStore 自体を objects として渡す (AssetStore も兼ねる)。
-        let _assets = stores.assets;
         let freeze_native = Arc::new(Self::freeze_store(inventory.clone()));
         let site_provider = Arc::new(NativeSiteTimezoneProvider::load());
         let library = Arc::new(crate::application::LibraryService::new(
@@ -388,10 +398,137 @@ impl NativeAppServices {
     }
 }
 
+/// Finish every eligible closed remove owner and abandoned ordinary claim.
+/// Live OS liveness owners are never reaped, and deferred readers stay closed.
+pub fn recover_removals() -> Result<()> {
+    crate::native::materialization::block_on(async {
+        let (service, objects, root) = native_recovery_service()?;
+        let repository = crate::native::novel_repository::NativeNovelRepository::new();
+        loop {
+            let mut cursor = None;
+            let mut release_error = None;
+            loop {
+                let (next, error) = collect_abandoned_creation_page(&repository, &root, cursor, 100).await?;
+                if release_error.is_none() { release_error = error; }
+                cursor = next;
+                if cursor.is_none() { break; }
+            }
+            let had_pending = has_pending_removals(objects.as_ref()).await?;
+            let mut cursor = None;
+            loop {
+                cursor = service.recover_removals(cursor.as_deref(), 100, usize::MAX).await
+                    .map_err(|error| NarouError::Platform(error.to_string()))?;
+                if cursor.is_none() { break; }
+            }
+            if has_pending_removals(objects.as_ref()).await? {
+                return Err(NarouError::Platform("novel_recovering: removal is waiting for admitted readers or closed file handles".into()));
+            }
+            // A drained owner may still need its exact creation claim ACK.
+            // Revisit it through release_id, never through a guessed Remove.
+            if had_pending { continue; }
+            return match release_error { Some(error) => Err(error), None => Ok(()) };
+        }
+    })
+}
+
+fn native_recovery_service() -> Result<(crate::application::NovelActionService, Arc<dyn ObjectStore>, std::path::PathBuf)> {
+    let inventory = Arc::new(Inventory::with_default_root()?);
+    let root = crate::db::with_database(|database| database.archive_root().parent().map(std::path::Path::to_path_buf)
+        .ok_or_else(|| NarouError::Platform("archive has no library root".into())))?;
+    if root.canonicalize()? != inventory.root_dir().canonicalize()? {
+        return Err(NarouError::Platform("active database belongs to a different library".into()));
+    }
+    let objects = crate::native::object_store::NativeStores::for_narou_root(inventory.root_dir())?.objects;
+    let freeze = Arc::new(NativeFreezeStore::new(inventory));
+    let service = crate::application::NovelActionService::new(
+        Arc::new(crate::native::novel_repository::NativeNovelRepository::new()), freeze.clone(), freeze, Some(objects.clone()),
+    );
+    Ok((service, objects, root))
+}
+
+async fn collect_abandoned_creation_page(
+    repository: &dyn crate::platform::NovelRepository,
+    root: &std::path::Path,
+    cursor: Option<i64>,
+    limit: usize,
+) -> Result<(Option<i64>, Option<NarouError>)> {
+    let (candidates, next) = crate::db::with_database(|database| database.ordinary_id_liveness_page(cursor, limit))?;
+    let mut release_error = None;
+    for (id, generation) in candidates {
+        let Some(reservation) = resume_abandoned_creation(root, id, generation)? else { continue; };
+        if let Err(error) = repository.release_id(reservation).await {
+            if release_error.is_none() { release_error = Some(error); }
+        }
+    }
+    Ok((next, release_error))
+}
+
+/// A pending-liveness row belongs to a creator that either died holding its
+/// OS claim or is still alive. Try the real lock: `None` means a live owner
+/// and is skipped, never treated as an error; `Some` is the actual OS proof
+/// retained on the reservation for `release_id` to revalidate under the
+/// ledger. I/O failures and invalid identities propagate.
+fn resume_abandoned_creation(
+    root: &std::path::Path, id: crate::platform::NovelId, generation: i64,
+) -> Result<Option<crate::platform::NovelIdReservation>> {
+    let Some(liveness) = crate::db::database::id_reservations::try_liveness_lock(root, id, generation)? else { return Ok(None); };
+    Ok(Some(crate::platform::NovelIdReservation::new(id, generation).with_liveness(liveness)))
+}
+
+async fn has_pending_removals(objects: &dyn ObjectStore) -> Result<bool> {
+    let fence = objects.access_fence().ok_or_else(|| NarouError::Platform("removal access fence unavailable".into()))?;
+    let mut cursor = None;
+    loop {
+        let (pending, next) = fence.pending_removals(cursor.as_deref(), 100).await?;
+        if !pending.is_empty() { return Ok(true); }
+        cursor = next;
+        if cursor.is_none() { return Ok(false); }
+    }
+}
+
+#[derive(Default)]
+pub struct NativeRecoveryCursor {
+    creations: Option<i64>,
+    removals: Option<String>,
+}
+
+/// Advance bounded ordinary cleanup on the existing native queue idle cadence.
+pub fn recover_maintenance(cursor: &mut NativeRecoveryCursor) -> Result<()> {
+    crate::native::materialization::block_on(async {
+        let (service, _, root) = native_recovery_service()?;
+        let repository = crate::native::novel_repository::NativeNovelRepository::new();
+        let (next, release_error) = collect_abandoned_creation_page(&repository, &root, cursor.creations, 4).await?;
+        cursor.creations = next;
+        cursor.removals = service.recover_removals(cursor.removals.as_deref(), 4, 16).await
+            .map_err(|error| NarouError::Platform(error.to_string()))?;
+        match release_error { Some(error) => Err(error), None => Ok(()) }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::downloader::site_setting::{SiteSetting, install_effective_site_settings};
+
+    #[test]
+    fn recovery_skips_live_creation_claim_and_keeps_os_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let id = crate::platform::NovelId(42);
+        let held = crate::db::database::id_reservations::try_liveness_lock(root.path(), id, 7)
+            .unwrap().expect("first claim acquires the OS lock");
+        assert!(resume_abandoned_creation(root.path(), id, 7).unwrap().is_none(),
+            "a genuinely held claim is skipped, never released as abandoned");
+        assert!(resume_abandoned_creation(root.path(), id, -1).is_err(),
+            "invalid identities are errors, not skipped claims");
+        drop(held);
+        let reservation = resume_abandoned_creation(root.path(), id, 7).unwrap()
+            .expect("a dead creator's claim resumes with real OS proof");
+        assert!(crate::db::database::id_reservations::try_liveness_lock(root.path(), id, 7).unwrap().is_none(),
+            "the resumed token must exclude another process until cleanup finishes");
+        drop(reservation);
+        assert!(crate::db::database::id_reservations::try_liveness_lock(root.path(), id, 7).unwrap().is_some(),
+            "dropping the resumed token releases its actual OS ownership");
+    }
 
     #[tokio::test]
     async fn rejected_settings_cas_preserves_raw_yaml_and_absent_replace_file() {

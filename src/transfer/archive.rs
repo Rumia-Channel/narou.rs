@@ -7,8 +7,9 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use super::{
-    FORMAT_VERSION, MANIFEST_PATH, MAX_ARCHIVE_BYTES, MAX_ENTRIES, MAX_FILE_BYTES,
-    MAX_MANIFEST_BYTES, MAX_NOVELS, MAX_TOTAL_UNCOMPRESSED_BYTES, Result, TransferError,
+    FORMAT_VERSION, MANIFEST_PATH, MAX_ENTRIES, MAX_MANIFEST_BYTES, MAX_NOVELS,
+    Result, TransferError,
+    UTILITY_ARCHIVE_BUDGET_BYTES, UTILITY_FILE_BUDGET_BYTES, UTILITY_TOTAL_BUDGET_BYTES,
 };
 
 /// A complete transfer manifest.
@@ -147,9 +148,9 @@ pub(crate) struct Limits {
 }
 
 pub(crate) const DEFAULT_LIMITS: Limits = Limits {
-    max_archive_bytes: MAX_ARCHIVE_BYTES,
-    max_total_uncompressed: MAX_TOTAL_UNCOMPRESSED_BYTES,
-    max_file_bytes: MAX_FILE_BYTES,
+    max_archive_bytes: UTILITY_ARCHIVE_BUDGET_BYTES,
+    max_total_uncompressed: UTILITY_TOTAL_BUDGET_BYTES,
+    max_file_bytes: UTILITY_FILE_BUDGET_BYTES,
     max_entries: MAX_ENTRIES,
     max_novels: MAX_NOVELS,
     max_manifest_bytes: MAX_MANIFEST_BYTES,
@@ -168,8 +169,8 @@ const MAX_PATH_COMPONENT_CHARS: usize = 255;
 /// written into `manifest.json`, so callers do not have to fill them in.
 ///
 /// Paths are validated before anything is written. The archive is rejected if
-/// it exceeds [`MAX_ENTRIES`], [`MAX_NOVELS`], [`MAX_FILE_BYTES`] or
-/// [`MAX_TOTAL_UNCOMPRESSED_BYTES`].
+/// it exceeds [`MAX_ENTRIES`], [`MAX_NOVELS`] or the whole-value budgets in
+/// [`UTILITY_FILE_BUDGET_BYTES`]/[`UTILITY_TOTAL_BUDGET_BYTES`].
 pub fn build_archive(manifest: &ArchiveManifest) -> Result<Vec<u8>> {
     build_archive_with_limits(manifest, DEFAULT_LIMITS)
 }
@@ -632,7 +633,7 @@ fn validate_sha256(value: &str) -> Result<()> {
 /// Rejects absolute paths, drive prefixes, backslashes, NULs, `.`/`..`
 /// components, empty components, control characters, Windows-invalid
 /// characters, trailing dots/spaces and Windows reserved device names.
-pub(crate) fn validate_relative_path(path: &str) -> Result<String> {
+pub fn validate_relative_path(path: &str) -> Result<String> {
     if path.is_empty() {
         return Err(TransferError::UnsafePath("empty path".into()));
     }

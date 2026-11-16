@@ -6,9 +6,10 @@ use futures::StreamExt;
 use sha2::{Digest, Sha256};
 
 use crate::error::{NarouError, Result};
+use crate::application::novel_access::{NovelReadLease, NovelWriteGuard};
 use crate::platform::{
-    AssetStore, Clock, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore, SystemClock,
-    ObjectFingerprint, ObjectFingerprintMismatch,
+    Clock, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore, SystemClock,
+    ObjectFingerprint,
 };
 
 use super::types::{SectionElement, SectionFile, SubtitleInfo, TocFile};
@@ -65,28 +66,25 @@ pub fn raw_filename(subtitle: &SubtitleInfo) -> String {
 
 /// Storage-backed downloader persistence.
 ///
-/// The codec functions below remain pure; this service owns only the
-/// ObjectStore/AssetStore calls and the injected clock.
+/// The codec functions below remain pure; this service owns the ObjectStore
+/// and clock. Writes use the caller's original NovelWriteGuard.
 #[derive(Clone)]
 pub struct PersistenceService {
     objects: Arc<dyn ObjectStore>,
-    assets: Arc<dyn AssetStore>,
     clock: Arc<dyn Clock>,
 }
 
 impl PersistenceService {
-    pub fn new(objects: Arc<dyn ObjectStore>, assets: Arc<dyn AssetStore>) -> Self {
-        Self::with_clock(objects, assets, Arc::new(SystemClock))
+    pub fn new(objects: Arc<dyn ObjectStore>) -> Self {
+        Self::with_clock(objects, Arc::new(SystemClock))
     }
 
     pub fn with_clock(
         objects: Arc<dyn ObjectStore>,
-        assets: Arc<dyn AssetStore>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             objects,
-            assets,
             clock,
         }
     }
@@ -95,43 +93,43 @@ impl PersistenceService {
         &self.objects
     }
 
-    pub async fn load_toc(&self, keys: &NovelObjectKeys) -> Result<Option<TocFile>> {
-        let Some(bytes) = self.objects.read_small(&keys.toc()).await? else {
+    pub async fn load_toc(&self, lease: &mut NovelReadLease, keys: &NovelObjectKeys) -> Result<Option<TocFile>> {
+        let Some(bytes) = lease.read_small(&keys.toc()).await? else {
             return Ok(None);
         };
         Ok(Some(deserialize_toc(&bytes)?))
     }
 
-    pub async fn save_toc(&self, keys: &NovelObjectKeys, toc: &TocFile) -> Result<()> {
-        self.objects
+    pub async fn save_toc(&self, access: &NovelWriteGuard, keys: &NovelObjectKeys, toc: &TocFile) -> Result<()> {
+        access
             .write_small(&keys.toc(), serialize_toc(toc)?.into_bytes())
             .await
     }
 
-    pub(crate) async fn load_download_resume(&self, keys: &NovelObjectKeys) -> Result<Option<TocFile>> {
+    pub(crate) async fn load_download_resume(&self, lease: &mut NovelReadLease, keys: &NovelObjectKeys) -> Result<Option<TocFile>> {
         let key = keys.prefix().join(DOWNLOAD_RESUME_FILE)?;
-        self.objects.read_small(&key).await?
+        lease.read_small(&key).await?
             .map(|bytes| deserialize_toc(&bytes)).transpose()
     }
 
-    pub(crate) async fn save_download_resume(&self, keys: &NovelObjectKeys, toc: &TocFile) -> Result<()> {
-        self.objects.write_small(
+    pub(crate) async fn save_download_resume(&self, access: &NovelWriteGuard, keys: &NovelObjectKeys, toc: &TocFile) -> Result<()> {
+        access.write_small(
             &keys.prefix().join(DOWNLOAD_RESUME_FILE)?,
             serialize_toc(toc)?.into_bytes(),
         ).await
     }
 
-    pub(crate) async fn clear_download_resume(&self, keys: &NovelObjectKeys) -> Result<()> {
-        self.objects.delete(&keys.prefix().join(DOWNLOAD_RESUME_FILE)?).await
+    pub(crate) async fn clear_download_resume(&self, access: &NovelWriteGuard, keys: &NovelObjectKeys) -> Result<()> {
+        access.delete(&keys.prefix().join(DOWNLOAD_RESUME_FILE)?).await
     }
 
     pub async fn load_section(
         &self,
+        lease: &mut NovelReadLease,
         keys: &NovelObjectKeys,
         subtitle: &SubtitleInfo,
     ) -> Result<Option<SectionFile>> {
-        let Some(bytes) = self
-            .objects
+        let Some(bytes) = lease
             .read_small(&keys.section(&subtitle.index, &subtitle.file_subtitle))
             .await?
         else {
@@ -147,66 +145,48 @@ impl PersistenceService {
     /// their content fingerprints before EOF. Immutable stores can compare
     /// authoritative digests; mutable/legacy stores re-read their bytes. The
     /// consumer must not publish a partial result before successful EOF.
-    pub fn stream_sections_snapshot(&self, keys: NovelObjectKeys, toc: TocFile) -> SectionStream {
-        let persistence = self.clone();
-        let expected_toc = serialize_toc(&toc).map(|text| Sha256::digest(text.as_bytes()).to_vec());
+    pub fn stream_sections_snapshot(&self, lease: NovelReadLease, keys: NovelObjectKeys, toc: TocFile) -> SectionStream {
+        let expected_toc = serialize_toc(&toc).map(|text| <[u8; 32]>::from(Sha256::digest(text.as_bytes())));
         Box::pin(futures::stream::try_unfold(
-            (persistence, keys, toc, expected_toc, 0usize, Vec::new()),
-            |(persistence, keys, toc, expected_toc, position, mut fingerprints)| async move {
-                let expected_toc = expected_toc?;
-                if let Some(subtitle) = toc.subtitles.get(position) {
-                    let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
-                    let bytes = persistence.objects.read_small(&key).await?.ok_or_else(|| {
-                        let filename = key.as_ref().rsplit('/').next().unwrap_or(key.as_ref());
-                        NarouError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!(
-                                "section file not found: expected '{filename}' in {}/本文",
-                                keys.prefix().as_ref(),
-                            ),
-                        ))
+            (lease, keys, toc, expected_toc, 0usize, Vec::<ObjectFingerprint>::new()),
+            |(mut lease, keys, toc, expected_toc, position, mut fingerprints)| async move {
+                let result: Result<Option<SectionFile>> = async {
+                    let expected = expected_toc.as_ref().map_err(|error| NarouError::Platform(error.to_string()))?;
+                    if let Some(subtitle) = toc.subtitles.get(position) {
+                        let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+                        let bytes = lease.read_small(&key).await?.ok_or_else(|| {
+                            NarouError::Io(std::io::Error::new(std::io::ErrorKind::NotFound,
+                                format!("section file not found: expected '{}' in {}/本文", section_filename(subtitle), keys.prefix())))
+                        })?;
+                        let section = deserialize_section(&bytes)?;
+                        if section.download_revision.max(1) != subtitle.download_revision.max(1)
+                            || subtitle.download_time.as_ref().is_some_and(|time| section.download_time.as_ref() != Some(time)) {
+                            return Err(NarouError::Platform(format!("section generation changed during conversion: {key}")));
+                        }
+                        fingerprints.push(ObjectFingerprint { key, sha256: Sha256::digest(&bytes).into() });
+                        return Ok(Some(section));
+                    }
+                    for fingerprint in &fingerprints {
+                        let bytes = lease.read_small(&fingerprint.key).await?.ok_or_else(|| {
+                            NarouError::Platform(format!("section disappeared during conversion: {}", fingerprint.key))
+                        })?;
+                        if <[u8; 32]>::from(Sha256::digest(&bytes)) != fingerprint.sha256 {
+                            return Err(NarouError::Platform(format!("section changed during conversion: {}", fingerprint.key)));
+                        }
+                    }
+                    let current = lease.read_small(&keys.toc()).await?.ok_or_else(|| {
+                        NarouError::Platform(format!("toc disappeared during conversion: {}", keys.toc()))
                     })?;
-                    let section = deserialize_section(&bytes)?;
-                    if section.download_revision.max(1) != subtitle.download_revision.max(1)
-                        || subtitle.download_time.as_ref().is_some_and(|expected| {
-                            section.download_time.as_ref() != Some(expected)
-                        })
-                    {
-                        return Err(NarouError::Platform(format!(
-                            "section generation changed during conversion: {key}",
-                        )));
+                    if <[u8; 32]>::from(Sha256::digest(serialize_toc(&deserialize_toc(&current)?)?.as_bytes())) != *expected {
+                        return Err(NarouError::Platform(format!("toc changed during conversion: {}", keys.toc())));
                     }
-                    fingerprints.push(ObjectFingerprint {
-                        key, sha256: <[u8; 32]>::from(Sha256::digest(&bytes)),
-                    });
-                    return Ok(Some((section, (
-                        persistence, keys, toc, Ok(expected_toc), position + 1, fingerprints,
-                    ))));
+                    Ok(None)
+                }.await;
+                match result {
+                    Ok(Some(section)) => Ok(Some((section, (lease, keys, toc, expected_toc, position + 1, fingerprints)))),
+                    Ok(None) => { let _ = lease.release().await; Ok(None) }
+                    Err(error) => { let _ = lease.release().await; Err(error) }
                 }
-                match persistence.objects.verify_fingerprints(&fingerprints).await? {
-                    Some(ObjectFingerprintMismatch::Missing(key)) => {
-                        return Err(NarouError::Platform(format!(
-                            "section disappeared during conversion: {key}"
-                        )));
-                    }
-                    Some(ObjectFingerprintMismatch::Changed(key)) => {
-                        return Err(NarouError::Platform(format!(
-                            "section changed during conversion: {key}"
-                        )));
-                    }
-                    None => {}
-                }
-                let current = persistence.load_toc(&keys).await?.ok_or_else(|| {
-                    NarouError::Platform(format!("toc disappeared during conversion: {}", keys.toc()))
-                })?;
-                if Sha256::digest(serialize_toc(&current)?.as_bytes()).as_slice()
-                    != expected_toc.as_slice()
-                {
-                    return Err(NarouError::Platform(format!(
-                        "toc changed during conversion: {}", keys.toc(),
-                    )));
-                }
-                Ok(None)
             },
         ))
     }
@@ -220,33 +200,48 @@ impl PersistenceService {
     /// 最初の失敗より先 (窓の分だけ) を先読みしていた読み込みは破棄される。
     pub fn stream_sections_ordered<'a>(
         &'a self,
+        lease: NovelReadLease,
         keys: &'a NovelObjectKeys,
         subtitles: &'a [SubtitleInfo],
     ) -> impl futures::Stream<Item = std::result::Result<SectionFile, SectionLoadFailure>> + 'a {
-        // The queued work owns its ordinal. All source borrows are captured at
-        // this stream's lifetime, rather than passed through an iterator's
-        // reference-valued mapper into a nested opaque async future.
-        let pending = futures::stream::iter(
-            (0..subtitles.len()).map(move |section_index| async move {
-                match self.load_section(keys, &subtitles[section_index]).await {
+        let shared = lease.clone();
+        let pending = futures::stream::iter((0..subtitles.len()).map(move |section_index| {
+            let mut reader = shared.clone();
+            async move {
+                let read = self.load_section(&mut reader, keys, &subtitles[section_index]).await;
+                let _ = reader.release().await;
+                match read {
                     Ok(Some(section)) => Ok(section),
                     Ok(None) => Err(SectionLoadFailure::Missing { section_index }),
                     Err(error) => Err(SectionLoadFailure::Read(error)),
                 }
-            }),
-        ).buffered(SECTION_READ_WINDOW);
-        // try_unfold drops the pending window on the first ordered error; no
-        // further input is read even if a caller polls again after that error.
-        futures::stream::try_unfold(pending, |mut pending| async move {
+            }
+        })).buffered(SECTION_READ_WINDOW);
+        futures::stream::try_unfold((pending, lease), |(mut pending, mut lease)| async move {
+            if let Err(error) = lease.refresh().await {
+                drop(pending);
+                let _ = lease.release().await;
+                return Err(SectionLoadFailure::Read(error));
+            }
             match pending.next().await {
-                Some(section) => Ok(Some((section?, pending))),
-                None => Ok(None),
+                Some(Ok(section)) => Ok(Some((section, (pending, lease)))),
+                Some(Err(error)) => {
+                    drop(pending);
+                    let _ = lease.release().await;
+                    Err(error)
+                }
+                None => {
+                    drop(pending);
+                    let _ = lease.release().await;
+                    Ok(None)
+                }
             }
         })
     }
 
     pub async fn save_section(
         &self,
+        access: &NovelWriteGuard,
         keys: &NovelObjectKeys,
         subtitle: &SubtitleInfo,
         section: &SectionElement,
@@ -270,7 +265,7 @@ impl PersistenceService {
             element: section.clone(),
             download_revision,
         };
-        self.objects
+        access
             .write_small(
                 &keys.section(&subtitle.index, &subtitle.file_subtitle),
                 serialize_section(&file_data)?.into_bytes(),
@@ -281,11 +276,12 @@ impl PersistenceService {
 
     pub async fn section_needs_update(
         &self,
+        lease: &mut NovelReadLease,
         keys: &NovelObjectKeys,
         subtitle: &SubtitleInfo,
         new_section: &SectionElement,
     ) -> Result<bool> {
-        let Some(existing) = self.load_section(keys, subtitle).await? else {
+        let Some(existing) = self.load_section(lease, keys, subtitle).await? else {
             return Ok(true);
         };
         Ok(compute_section_hash(&existing.element) != compute_section_hash(new_section))
@@ -346,6 +342,7 @@ impl PersistenceService {
 
     pub async fn save_raw(
         &self,
+        access: &NovelWriteGuard,
         keys: &NovelObjectKeys,
         subtitle: &SubtitleInfo,
         raw_html: &str,
@@ -353,7 +350,7 @@ impl PersistenceService {
         if raw_html.is_empty() {
             return Ok(());
         }
-        self.objects
+        access
             .write_small(
                 &keys.raw_section(&subtitle.index, &subtitle.file_subtitle),
                 raw_html.as_bytes().to_vec(),
@@ -366,19 +363,18 @@ impl PersistenceService {
     /// Return `false` for a missing source, which is not a cached version.
     pub async fn cache_section(
         &self,
+        access: &NovelWriteGuard,
+        lease: &mut NovelReadLease,
         keys: &NovelObjectKeys,
         timestamp: &str,
         subtitle: &SubtitleInfo,
     ) -> Result<bool> {
         let source = keys.section(&subtitle.index, &subtitle.file_subtitle);
-        if !self.objects.exists(&source).await? {
-            return Ok(false);
-        }
+        let Some(stream) = lease.open_all(&source).await? else { return Ok(false); };
         let destination = keys.cached_section(timestamp, &subtitle.index, &subtitle.file_subtitle);
+        access.write_stream(&destination, stream).await?;
         #[cfg(feature = "native-runtime")]
-        self.assets.move_or_copy(&source, &destination).await?;
-        #[cfg(not(feature = "native-runtime"))]
-        self.assets.copy(&source, &destination).await?;
+        access.delete(&source).await?;
         Ok(true)
     }
 
@@ -386,10 +382,11 @@ impl PersistenceService {
     /// explicitly record an empty version after a completed latest-only update.
     pub async fn record_cache_version(
         &self,
+        access: &NovelWriteGuard,
         keys: &NovelObjectKeys,
         timestamp: &str,
     ) -> Result<()> {
-        self.objects.write_small(&keys.cached_version_marker(timestamp), Vec::new()).await
+        access.write_small(&keys.cached_version_marker(timestamp), Vec::new()).await
     }
 
     /// Write `setting.ini` / `replace.txt` defaults for files that do not yet
@@ -399,6 +396,7 @@ impl PersistenceService {
     /// `stat`.
     pub async fn ensure_default_files(
         &self,
+        access: &NovelWriteGuard,
         keys: &NovelObjectKeys,
         title: &str,
         author: &str,
@@ -414,7 +412,7 @@ impl PersistenceService {
             let mut mutate = |current: Option<&[u8]>| {
                 Ok(current.is_none().then_some(std::borrow::Cow::Borrowed(content.as_bytes())))
             };
-            match self.objects.update_small(&keys.setting(), &mut mutate).await? {
+            match access.update_small(&keys.setting(), &mut mutate).await? {
                 crate::platform::ObjectUpdateResult::Committed => {}
                 crate::platform::ObjectUpdateResult::ProjectionFailed(error) => return Err(error),
                 crate::platform::ObjectUpdateResult::Conflict => {
@@ -431,7 +429,7 @@ impl PersistenceService {
             let mut mutate = |current: Option<&[u8]>| {
                 Ok(current.is_none().then_some(std::borrow::Cow::Borrowed(content.as_bytes())))
             };
-            match self.objects.update_small(&keys.replace(), &mut mutate).await? {
+            match access.update_small(&keys.replace(), &mut mutate).await? {
                 crate::platform::ObjectUpdateResult::Committed => {}
                 crate::platform::ObjectUpdateResult::ProjectionFailed(error) => return Err(error),
                 crate::platform::ObjectUpdateResult::Conflict => {
@@ -486,9 +484,10 @@ impl PersistenceService {
 
     pub async fn load_cache(
         &self,
+        lease: &mut NovelReadLease,
         keys: &NovelObjectKeys,
     ) -> Result<Option<crate::illustration_store::IllustrationIndex>> {
-        let Some(bytes) = self.objects.read_small(&keys.illustration_cache()).await? else {
+        let Some(bytes) = lease.read_small(&keys.illustration_cache()).await? else {
             return Ok(None);
         };
         Ok(Some(serde_yaml::from_slice(&bytes)?))
@@ -496,11 +495,12 @@ impl PersistenceService {
 
     pub async fn save_cache(
         &self,
+        access: &NovelWriteGuard,
         keys: &NovelObjectKeys,
         index: &crate::illustration_store::IllustrationIndex,
     ) -> Result<()> {
         let body = index.to_cache_yaml()?;
-        self.objects
+        access
             .write_small(&keys.illustration_cache(), body)
             .await
     }
@@ -535,6 +535,231 @@ pub fn deserialize_toc(bytes: &[u8]) -> Result<TocFile> {
     Ok(serde_yaml::from_slice(bytes)?)
 }
 
+/// Metadata needed by publication without allocating the TOC chapter vector.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TocMetadata {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub chapter_count: u64,
+    pub novel_type: Option<u8>,
+}
+
+/// Consume the complete YAML stream, retaining only the root story scalar.
+pub fn deserialize_toc_story(bytes: &[u8]) -> Result<Option<String>> {
+    project_toc(bytes, true).map(|(story, _)| story)
+}
+
+/// Consume the complete YAML stream, counting subtitle mapping records in
+/// place. Scalar/sequence aliases retain only bounded projections, not chapters.
+pub fn deserialize_toc_metadata(bytes: &[u8]) -> Result<TocMetadata> {
+    project_toc(bytes, false).map(|(_, metadata)| metadata)
+}
+
+fn project_toc(bytes: &[u8], want_story: bool) -> Result<(Option<String>, TocMetadata)> {
+    use std::borrow::Cow;
+    use std::collections::BTreeMap;
+    use saphyr_parser::{Event, Parser, ScalarStyle};
+
+    #[derive(Clone)]
+    enum Anchor<'a> {
+        Scalar(Cow<'a, str>, ScalarStyle, u8),
+        Mapping,
+        Sequence { count: u64, mappings_only: bool },
+        Pending,
+    }
+    struct Frame {
+        mapping: bool,
+        anchor: usize,
+        count: u64,
+        mappings_only: bool,
+        subtitles: bool,
+    }
+    fn invalid(message: impl std::fmt::Display) -> NarouError {
+        NarouError::Platform(format!("invalid toc.yaml projection: {message}"))
+    }
+    fn charge(retained: &mut usize, limit: usize, bytes: usize) -> Result<()> {
+        *retained = retained.checked_add(bytes).ok_or_else(|| {
+            NarouError::Platform("transfer_metadata_budget: TOC projection overflow".into())
+        })?;
+        if *retained > limit {
+            return Err(NarouError::Platform("transfer_metadata_budget: TOC projection exceeds metadata budget".into()));
+        }
+        Ok(())
+    }
+    fn sequence_item(frames: &mut [Frame], mapping: bool) -> Result<()> {
+        if let Some(frame) = frames.last_mut().filter(|frame| !frame.mapping) {
+            frame.count = frame.count.checked_add(1).ok_or_else(|| invalid("subtitle count overflow"))?;
+            frame.mappings_only &= mapping;
+        }
+        Ok(())
+    }
+    fn mark(seen: &mut [bool; 6], field: usize) -> Result<()> {
+        if field != 0 && std::mem::replace(&mut seen[field], true) { return Err(invalid("duplicate projected field")); }
+        Ok(())
+    }
+
+    if bytes.len() as u64 > crate::platform::SMALL_CAP {
+        return Err(NarouError::Platform("transfer_metadata_budget: toc.yaml exceeds 16 MiB".into()));
+    }
+    let text = std::str::from_utf8(bytes).map_err(invalid)?;
+    let mut parser = Parser::new_from_str(text);
+    // Input + retained projections <=18 MiB, with 5 MiB pending append and
+    // 1 MiB slack inside 24 MiB. One parser scalar is transient codec space.
+    let retention_limit = (18 * 1024 * 1024usize).saturating_sub(bytes.len());
+    let mut retained = 0usize;
+    let mut anchors: BTreeMap<usize, Anchor<'_>> = BTreeMap::new();
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut documents = 0usize;
+    let mut root_seen = false;
+    let mut root_done = false;
+    let mut key_next = true;
+    // 0 ignored, 1 story, 2 title, 3 author, 4 subtitles, 5 novel_type.
+    let mut field = 0usize;
+    let mut seen = [false; 6];
+    let mut story = None;
+    let mut metadata = TocMetadata::default();
+    loop {
+        let (event, _) = parser.next_event().ok_or_else(|| invalid("unexpected parser EOF"))?.map_err(invalid)?;
+        let mapping_event = matches!(&event, Event::MappingStart(..) | Event::MappingEnd);
+        let (value, style, tag_kind) = match event {
+            Event::StreamStart | Event::Nothing => continue,
+            Event::DocumentStart(_) => {
+                documents += 1;
+                if documents != 1 { return Err(invalid("multiple YAML documents")); }
+                continue;
+            }
+            Event::DocumentEnd => {
+                if !root_done || !frames.is_empty() { return Err(invalid("incomplete root mapping")); }
+                continue;
+            }
+            Event::StreamEnd => {
+                if documents != 1 || !root_done { return Err(invalid("root must be one mapping")); }
+                return Ok((story, metadata));
+            }
+            Event::MappingStart(anchor, _) | Event::SequenceStart(anchor, _) => {
+                let mut subtitles = false;
+                if frames.is_empty() {
+                    if root_seen || !mapping_event { return Err(invalid("root must be one mapping")); }
+                    root_seen = true;
+                } else if frames.len() == 1 {
+                    if key_next { return Err(invalid("root mapping key must be a scalar")); }
+                    mark(&mut seen, field)?;
+                    if field != 0 && field != 4 { return Err(invalid("projected field must be a scalar")); }
+                    if field == 4 {
+                        if mapping_event { return Err(invalid("subtitles must be a sequence")); }
+                        subtitles = true;
+                    }
+                    key_next = true;
+                }
+                if frames.len() >= 128 { return Err(invalid("metadata nesting exceeds limit")); }
+                sequence_item(&mut frames, mapping_event)?;
+                if anchor != 0 {
+                    charge(&mut retained, retention_limit, 128)?;
+                    anchors.insert(anchor, if mapping_event { Anchor::Mapping } else { Anchor::Pending });
+                }
+                frames.push(Frame { mapping: mapping_event, anchor, count: 0, mappings_only: true, subtitles });
+                continue;
+            }
+            Event::MappingEnd | Event::SequenceEnd => {
+                let frame = frames.pop().ok_or_else(|| invalid("unmatched collection end"))?;
+                if frame.mapping != mapping_event { return Err(invalid("mismatched collection end")); }
+                if frame.subtitles {
+                    if !frame.mappings_only { return Err(invalid("subtitle records must be mappings")); }
+                    metadata.chapter_count = frame.count;
+                }
+                if frame.anchor != 0 {
+                    anchors.insert(frame.anchor, if frame.mapping { Anchor::Mapping }
+                        else { Anchor::Sequence { count: frame.count, mappings_only: frame.mappings_only } });
+                }
+                if frames.is_empty() {
+                    if !key_next { return Err(invalid("root mapping value missing")); }
+                    root_done = true;
+                }
+                continue;
+            }
+            Event::Scalar(value, style, anchor, tag) => {
+                sequence_item(&mut frames, false)?;
+                // String projections ignore non-null tags. novel_type also
+                // distinguishes an explicit integer from a quoted string.
+                let tag_kind = match tag.as_deref() {
+                    None => 0,
+                    Some(tag) if tag.is_yaml_core_schema() && tag.suffix == "null" => 1,
+                    Some(tag) if tag.is_yaml_core_schema() && tag.suffix == "str" => 2,
+                    Some(tag) if tag.is_yaml_core_schema() && tag.suffix == "int" => 3,
+                    Some(_) => 4,
+                };
+                if anchor != 0 {
+                    charge(&mut retained, retention_limit, value.len().saturating_add(128))?;
+                    anchors.insert(anchor, Anchor::Scalar(value.clone(), style, tag_kind));
+                }
+                (value, style, tag_kind)
+            }
+            Event::Alias(anchor) => {
+                let value = anchors.get(&anchor).cloned().ok_or_else(|| invalid("unknown alias"))?;
+                sequence_item(&mut frames, matches!(&value, Anchor::Mapping))?;
+                match value {
+                    Anchor::Scalar(value, style, tag_kind) => (value, style, tag_kind),
+                    collection => {
+                        if frames.is_empty() { return Err(invalid("root must be a mapping")); }
+                        if frames.len() == 1 {
+                            if key_next { return Err(invalid("root key alias must be a scalar")); }
+                            mark(&mut seen, field)?;
+                            if field == 4 {
+                                match collection {
+                                    Anchor::Sequence { count, mappings_only: true } => metadata.chapter_count = count,
+                                    _ => return Err(invalid("subtitles alias must contain mapping records")),
+                                }
+                            } else if field != 0 { return Err(invalid("projected alias must be a scalar")); }
+                            key_next = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        if frames.is_empty() { return Err(invalid("root must be a mapping")); }
+        if frames.len() != 1 { continue; }
+        if key_next {
+            field = match value.as_ref() {
+                "story" if want_story => 1,
+                "title" if !want_story => 2,
+                "author" if !want_story => 3,
+                "subtitles" if !want_story => 4,
+                "novel_type" if !want_story => 5,
+                _ => 0,
+            };
+            key_next = false;
+            continue;
+        }
+        key_next = true;
+        mark(&mut seen, field)?;
+        if field == 0 { continue; }
+        if field == 4 { return Err(invalid("subtitles must be a sequence")); }
+        let plain = style == ScalarStyle::Plain;
+        let null_spelling = matches!(value.as_ref(), "null" | "Null" | "NULL" | "~");
+        let null = if matches!(field, 1 | 5) && plain && tag_kind == 1 {
+            if !null_spelling { return Err(invalid("invalid explicitly tagged null")); }
+            true
+        } else { matches!(field, 1 | 5) && plain && tag_kind == 0 && (value.is_empty() || null_spelling) };
+        if field == 5 {
+            if !null {
+                if (!plain && tag_kind != 3) || tag_kind == 2 { return Err(invalid("novel_type must be an integer or null")); }
+                let number = value.strip_prefix('+').unwrap_or(&value);
+                let (radix, digits) = if let Some(digits) = number.strip_prefix("0x") { (16, digits) }
+                    else if let Some(digits) = number.strip_prefix("0o") { (8, digits) }
+                    else if let Some(digits) = number.strip_prefix("0b") { (2, digits) }
+                    else { (10, number) };
+                metadata.novel_type = Some(u8::from_str_radix(digits, radix).map_err(invalid)?);
+            }
+        } else if field != 1 || !null {
+            let retained_bytes = match &value { Cow::Owned(value) => value.capacity(), Cow::Borrowed(value) => value.len() };
+            charge(&mut retained, retention_limit, retained_bytes)?;
+            let value = Some(value.into_owned());
+            match field { 1 => story = value, 2 => metadata.title = value, 3 => metadata.author = value, _ => unreachable!() }
+        }
+    }
+}
+
 pub fn fix_yaml_block_scalar(yaml: &str) -> String {
     let re = regex::Regex::new(r"(?m)^story:\s*\|[-+]?\s*$").unwrap();
     re.replace_all(yaml, "story: |-").to_string()
@@ -553,6 +778,14 @@ mod tests {
     use chrono::{DateTime, Utc};
     use std::sync::Arc;
     use futures::TryStreamExt;
+
+    async fn test_write(service: &PersistenceService, assets: Arc<dyn AssetStore>, keys: &NovelObjectKeys) -> NovelWriteGuard {
+        NovelWriteGuard::capture_for(&service.objects, Some(&assets), keys).await.unwrap()
+    }
+
+    async fn test_read(service: &PersistenceService, keys: &NovelObjectKeys) -> NovelReadLease {
+        NovelReadLease::admit_for(&service.objects, keys, "persistence-test").await.unwrap()
+    }
 
     struct FixedClock(DateTime<Utc>);
 
@@ -582,30 +815,30 @@ mod tests {
         use crate::application::webui::diff::{plan_diff_cache_clean, read_diff_cache_catalog};
 
         let store = Arc::new(MemoryObjectStore::new());
-        let service = PersistenceService::new(store.clone(), store.clone());
+        let service = PersistenceService::new(store.clone());
         let keys = NovelObjectKeys::new("site", "title", false).unwrap();
         let subtitle = subtitle();
         futures::executor::block_on(async {
-            assert!(!service.cache_section(&keys, "missing", &subtitle).await.unwrap());
+            assert!(!service.cache_section(&test_write(&service, store.clone(), &keys).await, &mut test_read(&service, &keys).await, &keys, "missing", &subtitle).await.unwrap());
             assert!(plan_diff_cache_clean(store.as_ref(), keys.prefix()).await.unwrap().is_empty());
-            service.record_cache_version(&keys, "empty").await.unwrap();
-            let empty = read_diff_cache_catalog(store.as_ref(), keys.prefix(), &[]).await.unwrap();
+            service.record_cache_version(&test_write(&service, store.clone(), &keys).await, &keys, "empty").await.unwrap();
+            let empty = read_diff_cache_catalog(&mut crate::application::novel_access::NovelReadScope::new(&service.objects, "cache-test"), store.as_ref(), keys.prefix(), &[]).await.unwrap();
             assert_eq!(empty.len(), 1);
             assert_eq!(empty[0].version, "empty");
             assert!(empty[0].only_latest_update);
 
             let section = section_file(&subtitle, "previous body");
-            service.save_section(&keys, &subtitle, &section.element, 2).await.unwrap();
-            assert!(service.cache_section(&keys, "snapshot", &subtitle).await.unwrap());
-            service.record_cache_version(&keys, "snapshot").await.unwrap();
+            service.save_section(&test_write(&service, store.clone(), &keys).await, &keys, &subtitle, &section.element, 2).await.unwrap();
+            assert!(service.cache_section(&test_write(&service, store.clone(), &keys).await, &mut test_read(&service, &keys).await, &keys, "snapshot", &subtitle).await.unwrap());
+            service.record_cache_version(&test_write(&service, store.clone(), &keys).await, &keys, "snapshot").await.unwrap();
             #[cfg(feature = "native-runtime")]
-            assert!(service.load_section(&keys, &subtitle).await.unwrap().is_none());
+            assert!(service.load_section(&mut test_read(&service, &keys).await, &keys, &subtitle).await.unwrap().is_none());
             #[cfg(not(feature = "native-runtime"))]
-            assert_eq!(service.load_section(&keys, &subtitle).await.unwrap().unwrap().element.body, "previous body");
+            assert_eq!(service.load_section(&mut test_read(&service, &keys).await, &keys, &subtitle).await.unwrap().unwrap().element.body, "previous body");
             let cached = store.read_small(&keys.cached_section("snapshot", "1", &subtitle.file_subtitle))
                 .await.unwrap().unwrap();
             assert_eq!(serde_yaml::from_slice::<SectionFile>(&cached).unwrap().element.body, "previous body");
-            let versions = read_diff_cache_catalog(store.as_ref(), keys.prefix(), &[]).await.unwrap();
+            let versions = read_diff_cache_catalog(&mut crate::application::novel_access::NovelReadScope::new(&service.objects, "cache-test"), store.as_ref(), keys.prefix(), &[]).await.unwrap();
             assert_eq!(versions.len(), 2);
             assert_eq!(versions[0].version, "snapshot");
             assert!(!versions[0].only_latest_update);
@@ -624,7 +857,7 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         ));
-        let service = PersistenceService::with_clock(objects.clone(), assets, clock);
+        let service = PersistenceService::with_clock(objects.clone(), clock);
         let keys = NovelObjectKeys::new("example.test", "n1234ab", true).unwrap();
         let subtitle = subtitle();
         let section = SectionElement {
@@ -636,12 +869,12 @@ mod tests {
 
         futures::executor::block_on(async {
             let time = service
-                .save_section(&keys, &subtitle, &section, 2)
+                .save_section(&test_write(&service, assets.clone(), &keys).await, &keys, &subtitle, &section, 2)
                 .await
                 .unwrap();
             assert_eq!(time, "2026-08-09 01:02:03.000000 +0000");
             let loaded = service
-                .load_section(&keys, &subtitle)
+                .load_section(&mut test_read(&service, &keys).await, &keys, &subtitle)
                 .await
                 .unwrap()
                 .unwrap();
@@ -649,11 +882,11 @@ mod tests {
             assert_eq!(loaded.download_time.as_deref(), Some(time.as_str()));
 
             service
-                .ensure_default_files(&keys, "題名", "作者", "https://example.test", None)
+                .ensure_default_files(&test_write(&service, assets.clone(), &keys).await, &keys, "題名", "作者", "https://example.test", None)
                 .await
                 .unwrap();
             service
-                .save_toc(
+                .save_toc(&test_write(&service, assets.clone(), &keys).await, 
                     &keys,
                     &TocFile {
                         title: "題名".to_string(),
@@ -667,7 +900,7 @@ mod tests {
                 .await
                 .unwrap();
             service
-                .ensure_default_files(&keys, "題名", "作者", "https://example.test", None)
+                .ensure_default_files(&test_write(&service, assets.clone(), &keys).await, &keys, "題名", "作者", "https://example.test", None)
                 .await
                 .unwrap();
         });
@@ -704,7 +937,7 @@ mod tests {
     #[test]
     fn section_snapshot_rejects_body_changes_before_successful_eof() {
         let store = Arc::new(MemoryObjectStore::new());
-        let service = PersistenceService::new(store.clone(), store.clone());
+        let service = PersistenceService::new(store.clone());
         let keys = NovelObjectKeys::new("site", "book", false).unwrap();
         let subtitle = subtitle();
         let toc = TocFile {
@@ -712,11 +945,11 @@ mod tests {
             story: None, subtitles: vec![subtitle.clone()], novel_type: Some(1),
         };
         futures::executor::block_on(async {
-            service.save_toc(&keys, &toc).await.unwrap();
+            service.save_toc(&test_write(&service, store.clone(), &keys).await, &keys, &toc).await.unwrap();
             let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
             store.write_small(&key, serialize_section(&section_file(&subtitle, "old")).unwrap().into_bytes())
                 .await.unwrap();
-            let mut stream = service.stream_sections_snapshot(keys.clone(), toc.clone());
+            let mut stream = service.stream_sections_snapshot(test_read(&service, &keys).await, keys.clone(), toc.clone());
             assert_eq!(stream.next().await.unwrap().unwrap().element.body, "old");
             // Even a legacy/manual rewrite without a revision bump is detected.
             store.write_small(&key, serialize_section(&section_file(&subtitle, "new")).unwrap().into_bytes())
@@ -725,7 +958,7 @@ mod tests {
             assert!(matches!(error, NarouError::Platform(_)));
             assert!(stream.next().await.is_none());
 
-            let mut stream = service.stream_sections_snapshot(keys, toc);
+            let mut stream = service.stream_sections_snapshot(test_read(&service, &keys).await, keys, toc);
             assert_eq!(stream.next().await.unwrap().unwrap().element.body, "new");
             ObjectStore::delete(store.as_ref(), &key).await.unwrap();
             let error = stream.next().await.unwrap().unwrap_err();
@@ -737,7 +970,7 @@ mod tests {
     #[test]
     fn section_snapshot_rejects_uncommitted_download_generation() {
         let store = Arc::new(MemoryObjectStore::new());
-        let service = PersistenceService::new(store.clone(), store.clone());
+        let service = PersistenceService::new(store.clone());
         let keys = NovelObjectKeys::new("site", "book", false).unwrap();
         let subtitle = subtitle();
         let toc = TocFile {
@@ -745,14 +978,14 @@ mod tests {
             story: None, subtitles: vec![subtitle.clone()], novel_type: Some(1),
         };
         futures::executor::block_on(async {
-            service.save_toc(&keys, &toc).await.unwrap();
+            service.save_toc(&test_write(&service, store.clone(), &keys).await, &keys, &toc).await.unwrap();
             let mut section = section_file(&subtitle, "new generation");
             section.download_revision = 2;
             store.write_small(
                 &keys.section(&subtitle.index, &subtitle.file_subtitle),
                 serialize_section(&section).unwrap().into_bytes(),
             ).await.unwrap();
-            let mut stream = service.stream_sections_snapshot(keys, toc);
+            let mut stream = service.stream_sections_snapshot(test_read(&service, &keys).await, keys, toc);
             let error = stream.next().await.unwrap().unwrap_err();
             assert!(matches!(error, NarouError::Platform(_)));
         });
@@ -850,6 +1083,15 @@ mod tests {
     }
 
     impl ObjectStore for GatedStore {
+        fn access_fence(&self) -> Option<&dyn crate::platform::NovelAccessFence> { Some(&self.data) }
+        fn read_stream_leased<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a crate::platform::GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<crate::platform::AssetStream>>> {
+            Box::pin(async move {
+                let snapshot = self.data.read_stream_leased(prefix, lease, key, range).await?;
+                self.read_small(key).await?;
+                Ok(snapshot)
+            })
+        }
+
         fn stat<'a>(
             &'a self,
             key: &'a ObjectKey,
@@ -935,7 +1177,7 @@ mod tests {
             .collect();
 
         let (store, senders) = GatedStore::new(&section_keys);
-        let service = PersistenceService::new(store.clone(), Arc::new(MemoryObjectStore::new()));
+        let service = PersistenceService::new(store.clone());
         futures::executor::block_on(async {
             for (index, subtitle) in subtitles.iter().enumerate() {
                 let section = section_file(subtitle, &format!("本文{}", index + 1));
@@ -971,7 +1213,7 @@ mod tests {
         });
 
         let sections =
-            futures::executor::block_on(service.stream_sections_ordered(&keys, &subtitles).try_collect::<Vec<_>>()).unwrap();
+            futures::executor::block_on(async { service.stream_sections_ordered(test_read(&service, &keys).await, &keys, &subtitles).try_collect::<Vec<_>>().await }).unwrap();
         releaser.join().unwrap();
 
         assert_eq!(
@@ -1006,13 +1248,16 @@ mod tests {
             super::SECTION_READ_WINDOW,
             "同時に走る読み込みは窓の件数まで"
         );
+        assert_eq!(futures::executor::block_on(crate::platform::NovelAccessFence::gate_info(
+            &store.data, &ObjectPrefix::from(keys.prefix().clone()),
+        )).unwrap().pending_readers, 0, "EOF drops the prefetch window before releasing its final lease");
     }
 
     /// 走査順で最初の失敗 (欠落 or 読み込みエラー) だけを返す。
     #[test]
     fn stream_sections_ordered_reports_the_first_failure_in_input_order() {
         let store = Arc::new(MemoryObjectStore::new());
-        let service = PersistenceService::new(store.clone(), store.clone());
+        let service = PersistenceService::new(store.clone());
         let keys = NovelObjectKeys::new("example.test", "n1234ab", true).unwrap();
         let subtitles: Vec<SubtitleInfo> = ["1", "2", "3"]
             .iter()
@@ -1040,7 +1285,7 @@ mod tests {
             .await
             .unwrap();
         });
-        match futures::executor::block_on(service.stream_sections_ordered(&keys, &subtitles).try_collect::<Vec<_>>()) {
+        match futures::executor::block_on(async { service.stream_sections_ordered(test_read(&service, &keys).await, &keys, &subtitles).try_collect::<Vec<_>>().await }) {
             Err(SectionLoadFailure::Missing { section_index }) => assert_eq!(section_index, 1),
             Err(SectionLoadFailure::Read(error)) => {
                 panic!("欠落が先に報告されるべき: {error}")
@@ -1056,7 +1301,7 @@ mod tests {
             b"not: [valid yaml".to_vec(),
         ))
         .unwrap();
-        match futures::executor::block_on(service.stream_sections_ordered(&keys, &subtitles).try_collect::<Vec<_>>()) {
+        match futures::executor::block_on(async { service.stream_sections_ordered(test_read(&service, &keys).await, &keys, &subtitles).try_collect::<Vec<_>>().await }) {
             Err(SectionLoadFailure::Read(_)) => {}
             Err(SectionLoadFailure::Missing { section_index }) => {
                 panic!("読み込みエラーが先に報告されるべき: missing {section_index}")
@@ -1083,7 +1328,7 @@ mod tests {
             .collect();
 
         let (store, senders) = GatedStore::new(&section_keys);
-        let service = PersistenceService::new(store.clone(), Arc::new(MemoryObjectStore::new()));
+        let service = PersistenceService::new(store.clone());
         // 1 話目は欠落させたまま、最初の窓が開始したら gate を開ける。
         // 残りの gate はテストが保持し続けるので、破棄された先読みは完了しない。
         let releaser = std::thread::spawn({
@@ -1097,7 +1342,7 @@ mod tests {
             }
         });
 
-        let failure = futures::executor::block_on(service.stream_sections_ordered(&keys, &subtitles).try_collect::<Vec<_>>())
+        let failure = futures::executor::block_on(async { service.stream_sections_ordered(test_read(&service, &keys).await, &keys, &subtitles).try_collect::<Vec<_>>().await })
             .unwrap_err();
         releaser.join().unwrap();
 
@@ -1115,5 +1360,170 @@ mod tests {
             "開始する読み込みは窓の件数まで: {:?}",
             store.started()
         );
+        assert_eq!(futures::executor::block_on(crate::platform::NovelAccessFence::gate_info(
+            &store.data, &ObjectPrefix::from(keys.prefix().clone()),
+        )).unwrap().pending_readers, 0, "failed prefetch tasks cannot retain the operation admission");
+    }
+
+    #[test]
+    fn toc_story_projection_matches_legacy_scalar_and_alias_semantics() {
+        for (story, expected) in [
+            ("null", None), ("~", None), ("", None),
+            ("'null'", Some("null")), ("!!str null", Some("null")),
+            ("true", Some("true")), ("123", Some("123")),
+            ("\"escaped\\u0020story\"", Some("escaped story")),
+        ] {
+            let yaml = format!("title: t\nauthor: a\ntoc_url: https://fixture.test/\nsubtitles: []\nstory: {story}\n");
+            let legacy: TocFile = serde_yaml::from_str(&yaml).unwrap();
+            let actual = deserialize_toc_story(yaml.as_bytes()).unwrap();
+            assert_eq!(actual, expected.map(str::to_owned));
+            assert_eq!(actual, legacy.story);
+        }
+        let yaml = b"holder: &text 'aliased story'\nsubtitles: [{story: nested-not-root}]\nstory: *text\n";
+        assert_eq!(deserialize_toc_story(yaml).unwrap().as_deref(), Some("aliased story"));
+    }
+
+    #[test]
+    fn toc_story_projection_checks_trailing_yaml_without_collecting_chapters() {
+        let mut yaml = String::from("story: retained story\nsubtitles:\n");
+        for index in 0..50_000 { yaml.push_str(&format!("  - index: '{index}'\n    subtitle: chapter\n")); }
+        assert_eq!(deserialize_toc_story(yaml.as_bytes()).unwrap().as_deref(), Some("retained story"));
+        yaml.push_str("broken: [unterminated\n");
+        assert!(deserialize_toc_story(yaml.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn toc_story_projection_rejects_non_scalar_duplicate_and_over_budget_metadata() {
+        for yaml in ["story: [nested]\n", "story: one\nstory: two\n", "story: yes\n---\nstory: no\n"] {
+            assert!(deserialize_toc_story(yaml.as_bytes()).is_err(), "{yaml:?}");
+        }
+        let yaml = format!("story: &text '{}'\n", "x".repeat(7 * 1024 * 1024));
+        assert!(deserialize_toc_story(yaml.as_bytes()).unwrap_err().to_string().contains("transfer_metadata_budget"));
+    }
+
+    #[test]
+    fn ordered_prefetch_renews_its_original_lease_during_pinned_file_reads() {
+        use crate::platform::{AssetStream, NovelAccessFence};
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        struct ProgressClock(AtomicI64);
+        impl Clock for ProgressClock {
+            fn now_utc(&self) -> DateTime<Utc> {
+                DateTime::from_timestamp(self.0.load(Ordering::SeqCst), 0).unwrap()
+            }
+        }
+        struct PinnedReadStore {
+            data: Arc<MemoryObjectStore>,
+            clock: Arc<ProgressClock>,
+        }
+        impl ObjectStore for PinnedReadStore {
+            fn access_fence(&self) -> Option<&dyn NovelAccessFence> { Some(self.data.as_ref()) }
+            fn read_stream_leased<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a crate::platform::GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+                Box::pin(async move {
+                    // Model a filesystem handle pinned atomically at open:
+                    // its bytes remain old even after admission closes.
+                    let Some(opened) = self.data.read_stream_leased(prefix, lease, key, range).await? else { return Ok(None); };
+                    drop(opened);
+                    let bytes = self.data.read_small(key).await?.unwrap();
+                    let chunks = crate::platform::staging::owned_bytes_stream(bytes);
+                    let data = self.data.clone();
+                    let clock = self.clock.clone();
+                    let prefix = prefix.clone();
+                    let stream: AssetStream = Box::pin(futures::stream::try_unfold(
+                        (chunks, data, clock, prefix, false),
+                        |(mut chunks, data, clock, prefix, closed)| async move {
+                            let Some(chunk) = chunks.next().await else { return Ok(None); };
+                            if !closed {
+                                clock.0.fetch_add(10, Ordering::SeqCst);
+                                data.close_gate(&prefix, "publication").await?;
+                            }
+                            Ok(Some((chunk?, (chunks, data, clock, prefix, true))))
+                        },
+                    ));
+                    Ok(Some(stream))
+                })
+            }
+            fn stat<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+                ObjectStore::stat(self.data.as_ref(), key)
+            }
+            fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+                self.data.read_small(key)
+            }
+            fn write_small<'a>(&'a self, key: &'a ObjectKey, data: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
+                self.data.write_small(key, data)
+            }
+            fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+                ObjectStore::delete(self.data.as_ref(), key)
+            }
+            fn list_page<'a>(&'a self, request: &'a ObjectListRequest) -> PlatformFuture<'a, Result<ObjectListPage>> {
+                self.data.list_page(request)
+            }
+        }
+        futures::executor::block_on(async {
+            let data = Arc::new(MemoryObjectStore::new());
+            let clock = Arc::new(ProgressClock(AtomicI64::new(Utc::now().timestamp())));
+            let objects: Arc<dyn ObjectStore> = Arc::new(PinnedReadStore { data: data.clone(), clock: clock.clone() });
+            let service = PersistenceService::new(objects.clone());
+            let keys = NovelObjectKeys::new("site", "pinned-read", false).unwrap();
+            let subtitle = subtitle();
+            let section = section_file(&subtitle, &"old body".repeat(32 * 1024));
+            let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+            let original = serialize_section(&section).unwrap().into_bytes();
+            data.write_small(&key, original.clone()).await.unwrap();
+            let prefix = ObjectPrefix::from(keys.prefix().clone());
+            let lease = NovelReadLease::admit_with_clock(&objects, clock, &prefix, "prefetch").await.unwrap();
+            let subtitles = [subtitle];
+            let error = service.stream_sections_ordered(lease, &keys, &subtitles).try_collect::<Vec<_>>().await.unwrap_err();
+            assert!(matches!(error, SectionLoadFailure::Read(_)));
+            assert!(format!("{error:?}").contains("novel_busy"));
+            assert_eq!(data.read_small(&key).await.unwrap().unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn toc_metadata_projects_scalar_and_subtitle_sequence_aliases() {
+        let yaml = b"text: &title 'aliased title'\nchapters: &chapters [{index: '1', subtitle: one}, {index: '2', subtitle: two}]\ntitle: *title\nauthor: null\nsubtitles: *chapters\nnovel_type: &type 2\n";
+        assert_eq!(deserialize_toc_metadata(yaml).unwrap(), TocMetadata {
+            title: Some("aliased title".into()), author: Some("null".into()), chapter_count: 2, novel_type: Some(2),
+        });
+        let yaml = b"record: &chapter {index: '1', subtitle: one}\ntitle: title\nauthor: author\nsubtitles: [*chapter, *chapter]\nnovel_type: null\n";
+        assert_eq!(deserialize_toc_metadata(yaml).unwrap().chapter_count, 2);
+        assert_eq!(deserialize_toc_metadata(yaml).unwrap().novel_type, None);
+        let expected = TocFile {
+            title: "legacy title".into(), author: "legacy author".into(),
+            toc_url: "https://fixture.test/book/".into(), story: Some("story".into()),
+            subtitles: vec![subtitle(), subtitle()], novel_type: Some(2),
+        };
+        let yaml = serialize_toc(&expected).unwrap();
+        let legacy = deserialize_toc(yaml.as_bytes()).unwrap();
+        let projected = deserialize_toc_metadata(yaml.as_bytes()).unwrap();
+        assert_eq!(projected.title, Some(legacy.title));
+        assert_eq!(projected.author, Some(legacy.author));
+        assert_eq!(projected.chapter_count, legacy.subtitles.len() as u64);
+        assert_eq!(projected.novel_type, legacy.novel_type);
+    }
+
+    #[test]
+    fn toc_metadata_counts_large_list_and_validates_complete_tail() {
+        let mut yaml = String::from("title: projected title\nauthor: projected author\nnovel_type: 1\nsubtitles:\n");
+        for index in 0..50_000 { yaml.push_str(&format!("  - index: '{index}'\n    subtitle: chapter\n")); }
+        let metadata = deserialize_toc_metadata(yaml.as_bytes()).unwrap();
+        assert_eq!(metadata.title.as_deref(), Some("projected title"));
+        assert_eq!(metadata.author.as_deref(), Some("projected author"));
+        assert_eq!(metadata.chapter_count, 50_000);
+        assert_eq!(metadata.novel_type, Some(1));
+        yaml.push_str("broken: [unterminated\n");
+        assert!(deserialize_toc_metadata(yaml.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn toc_metadata_rejects_wrong_types_duplicates_and_over_budget_retention() {
+        for yaml in [
+            "title: [nested]\n", "subtitles: {index: one}\n", "subtitles: [one]\n",
+            "subtitles: [[{index: one}]]\n", "title: one\ntitle: two\n", "novel_type: 256\n",
+            "chapters: &chapters [one]\nsubtitles: *chapters\n",
+        ] { assert!(deserialize_toc_metadata(yaml.as_bytes()).is_err(), "{yaml:?}"); }
+        let yaml = format!("title: &text '{}'\n", "x".repeat(7 * 1024 * 1024));
+        assert!(deserialize_toc_metadata(yaml.as_bytes()).unwrap_err().to_string().contains("transfer_metadata_budget"));
     }
 }

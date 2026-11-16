@@ -6,6 +6,7 @@ use super::{ArchiveManifest, ParsedArchive};
 
 /// How an existing novel (same `toc_url`) should be handled.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ConflictPolicy {
     /// Keep the library copy and skip this archive entry.
     #[default]

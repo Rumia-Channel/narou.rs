@@ -381,7 +381,8 @@ async fn api_novels(
     } else {
         crate::hidden::load_from_env(env).await.ok()
     };
-    match services.external_api.list(&request, hidden).await {
+    let mut scope = services.external_api.read_scope("external-list");
+    let result = match services.external_api.list(&mut scope, &request, hidden).await {
         Ok(list) => {
             let document = list.to_json();
             respond(
@@ -394,7 +395,8 @@ async fn api_novels(
             )
         }
         Err(error) => application_error(error),
-    }
+    };
+    super::leased_response(result, scope).await
 }
 
 /// 作品 1 件。
@@ -416,7 +418,8 @@ async fn api_novel(
         Ok(format) => format,
         Err(response) => return response,
     };
-    match services.external_api.novel(id).await {
+    let mut scope = services.external_api.read_scope("external-novel");
+    let result = match services.external_api.novel(&mut scope, id).await {
         Ok(novel) => {
             let document = serde_json::to_value(&novel).unwrap_or(Value::Null);
             respond(
@@ -429,7 +432,8 @@ async fn api_novel(
             )
         }
         Err(error) => application_error(error),
-    }
+    };
+    super::leased_response(result, scope).await
 }
 
 /// 目次。
@@ -451,7 +455,9 @@ async fn api_novel_toc(
         Ok(format) => format,
         Err(response) => return response,
     };
-    match services.external_api.toc(id).await {
+    let mut scope = services.external_api.read_scope("external-content");
+    let result = async {
+    match services.external_api.toc(&mut scope, id).await {
         Ok(toc) => {
             let document = serde_json::to_value(&toc).unwrap_or(Value::Null);
             respond(
@@ -465,6 +471,8 @@ async fn api_novel_toc(
         }
         Err(error) => application_error(error),
     }
+    }.await;
+    super::leased_response(result, scope).await
 }
 
 /// 全話の本文。
@@ -486,8 +494,10 @@ async fn api_novel_sections(
         Ok(format) => format,
         Err(response) => return response,
     };
+    let mut scope = services.external_api.read_scope("external-content");
+    let result = async {
     // 目次は所有者ごとに 1 回だけ読む (話ごとに目次を読み直さない)。
-    let sections = match services.external_api.sections(id).await {
+    let sections = match services.external_api.sections(&mut scope, id).await {
         Ok(sections) => sections,
         Err(error) => return application_error(error),
     };
@@ -500,6 +510,8 @@ async fn api_novel_sections(
         "section",
         document.get("sections").and_then(Value::as_array).map(Vec::as_slice),
     )
+    }.await;
+    super::leased_response(result, scope).await
 }
 
 /// 1 話の本文。
@@ -523,13 +535,17 @@ async fn api_novel_section(
         Ok(format) => format,
         Err(response) => return response,
     };
-    match services.external_api.section(id, &key).await {
+    let mut scope = services.external_api.read_scope("external-content");
+    let result = async {
+    match services.external_api.section(&mut scope, id, &key).await {
         Ok(section) => {
             let document = serde_json::to_value(&section).unwrap_or(Value::Null);
             respond(format, &document, "section", &[], "section", None)
         }
         Err(error) => application_error(error),
     }
+    }.await;
+    super::leased_response(result, scope).await
 }
 
 /// EPUB。
@@ -563,14 +579,16 @@ async fn api_tags(
         Ok(format) => format,
         Err(response) => return response,
     };
-    match services.external_api.tags().await {
+    let mut scope = services.external_api.read_scope("external-tags");
+    let result = match services.external_api.tags(&mut scope).await {
         Ok(tags) => {
             let document = serde_json::to_value(&tags).unwrap_or(Value::Null);
             // タグ一覧は 1 件ずつ並べる (JSON Lines も XML も 1 タグ = 1 要素)。
             respond(format, &document, "tags", &[], "tag", document.as_array().map(Vec::as_slice))
         }
         Err(error) => application_error(error),
-    }
+    };
+    super::leased_response(result, scope).await
 }
 
 /// MCP の窓口。
@@ -600,11 +618,14 @@ async fn api_mcp(
     };
     let hidden = crate::hidden::load_from_env(env).await.ok();
     let server = McpServer::new(&services.external_api);
-    match server.handle(&request, hidden).await {
+    let mut scope = services.external_api.read_scope("mcp-content");
+    let result = match server.handle(&mut scope, &request, hidden).await {
         Some(response) => Ok(Response::from_json(&response)?),
         // 通知 (id なし) には応答しない。native と同じく 202 を返す。
         None => Ok(Response::from_bytes(Vec::new())?.with_status(202)),
-    }
+    };
+    super::leased_response(result, scope).await
+
 }
 
 /// `%xx` をデコードする (パスの話番号 `12:3` をそのまま扱うため)。

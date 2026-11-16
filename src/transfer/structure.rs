@@ -34,16 +34,16 @@ pub(super) fn validate_with_budget(manifest: &ArchiveManifest, memory: &mut Meta
             if manifest.format_version < 2 {
                 return Err(invalid("virtual structure requires archive format 2"));
             }
-            if !crate::virtual_novel::is_portable_toc_url(&novel.toc_url) {
+            if !crate::virtual_identity::is_portable_toc_url(&novel.toc_url) {
                 return Err(invalid("virtual parent needs a portable identity URL"));
             }
-            if novel.ncode.is_some() || novel.tags.iter().any(|tag| crate::virtual_novel::is_internal_tag(tag)) {
+            if novel.ncode.is_some() || novel.tags.iter().any(|tag| crate::virtual_identity::is_internal_tag(tag)) {
                 return Err(invalid("virtual parent must not carry a library-local ncode or tag"));
             }
             if novel.files.iter().any(|file| !is_virtual_input_file(&file.path)) {
                 return Err(invalid("virtual parent contains non-input files"));
             }
-        } else if novel.ncode.as_deref().is_some_and(crate::virtual_novel::is_virtual_ncode)
+        } else if novel.ncode.as_deref().is_some_and(crate::virtual_identity::is_virtual_ncode)
             || novel.toc_url.starts_with("https://narou.rs/virtual/")
         {
             return Err(invalid("virtual parent is missing its member structure"));

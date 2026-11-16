@@ -24,6 +24,10 @@ use worker::{D1PreparedStatement, D1Result};
 
 use crate::db_handle::DbHandle;
 
+#[path="d1_creation.rs"]
+mod creation;
+pub(crate) use creation::ancestors;
+
 /// D1 tolerates much larger statement payloads than the native store's
 /// `novel_codec::MAX_EXTRA_FIELDS_BYTES`; keep the historical D1 cap.
 const MAX_EXTRA_FIELDS_BYTES: usize = 1_900_000;
@@ -35,20 +39,78 @@ SELECT CAST(j.key AS INTEGER) AS position,
 FROM json_each(?1) AS j ORDER BY CAST(j.key AS INTEGER)
 "#;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct D1NovelRepository {
     db: DbHandle,
     sites: Arc<Vec<narou_rs::downloader::site_setting::SiteSetting>>,
+    objects:Option<Arc<dyn narou_rs::platform::ObjectStore>>,
 }
+impl std::fmt::Debug for D1NovelRepository{fn fmt(&self,formatter:&mut std::fmt::Formatter<'_>)->std::fmt::Result{formatter.debug_struct("D1NovelRepository").field("objects_configured",&self.objects.is_some()).finish_non_exhaustive()}}
 
 impl D1NovelRepository {
     pub fn new(db: DbHandle) -> Self {
-        Self { db, sites: Arc::new(Vec::new()) }
+        Self { db, sites: Arc::new(Vec::new()),objects:None }
     }
 
     pub fn with_sites(mut self, sites: Arc<Vec<narou_rs::downloader::site_setting::SiteSetting>>) -> Self {
         self.sites = sites;
         self
+    }
+    pub fn with_objects(mut self,objects:Arc<dyn narou_rs::platform::ObjectStore>)->Self{self.objects=Some(objects);self}
+    fn primary(&self)->Self{Self{db:self.db.primary_view(),sites:self.sites.clone(),objects:self.objects.clone()}}
+
+    /// id/prefix bind candidates for one durable origin row.
+    ///
+    /// The closed-gate rejection covers creation of a NEW binding and moving
+    /// an existing binding into a namespace that is closed for recovery. A
+    /// durable binding that already equals the record's derived prefix is a
+    /// no-op refresh: under a snapshot/publication owner's closed gate the
+    /// record itself cannot change, so refusing it deadlocked export
+    /// admission against its own held gate.
+    fn bind_origin_statement(db:&DbHandle,id:i64,prefix:&str,sitename:&str,file_title:&str,use_subdirectory:i64)->Result<D1PreparedStatement>{
+        bind_statement(db.prepare("INSERT INTO novel_gate_bindings(novel_id,prefix) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM novels WHERE id=?1 AND sitename=?3 AND file_title=?4 AND use_subdirectory=?5) AND (EXISTS(SELECT 1 FROM novel_gate_bindings WHERE novel_id=?1 AND prefix=?2) OR NOT EXISTS(SELECT 1 FROM novel_access_gates WHERE closed=1 AND (prefix=?2 OR prefix=(SELECT prefix FROM novel_gate_bindings WHERE novel_id=?1)))) ON CONFLICT(novel_id) DO UPDATE SET prefix=excluded.prefix RETURNING novel_id"),vec![BindValue::Int(id),BindValue::Text(prefix.into()),BindValue::Text(sitename.into()),BindValue::Text(file_title.into()),BindValue::Int(use_subdirectory)])
+    }
+
+    pub async fn bind_record_origin(&self,record:&NovelRecord)->Result<()>{
+        let primary=self.primary();let keys=narou_rs::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;
+        #[derive(Deserialize)]struct Bound{novel_id:i64}
+        let results=primary.db.batch(vec![Self::bind_origin_statement(&primary.db,record.id,keys.prefix().as_ref(),&record.sitename,&record.file_title,i64::from(record.use_subdirectory))?,
+            primary.prepare("INSERT OR IGNORE INTO novel_revisions(novel_id,record_revision) SELECT id,1 FROM novels WHERE id=?",vec![BindValue::Int(record.id)])?]).await.map_err(worker_error)?;ensure_batch_success(&results)?;
+        if !results[0].results::<Bound>().map_err(worker_error)?.iter().any(|row|row.novel_id==record.id){return Err(NarouError::Platform("record_changed_or_novel_recovering".into()));}Ok(())
+    }
+    pub async fn bind_record_origins_page(&self,after:Option<NovelId>,limit:usize)->Result<Option<NovelId>>{
+        #[derive(Deserialize)]struct Row{id:i64,sitename:String,file_title:String,use_subdirectory:i64}
+        #[derive(Deserialize)]struct Bound{novel_id:i64}
+        let db=self.db.primary_view();let cap=limit.clamp(1,32);
+        let rows=bind_statement(db.prepare("SELECT id,sitename,file_title,use_subdirectory FROM novels WHERE id>? ORDER BY id LIMIT ?"),vec![BindValue::Int(after.map_or(-1,|id|id.0)),BindValue::Int((cap+1) as i64)])?.all().await.map_err(worker_error)?.results::<Row>().map_err(worker_error)?;
+        let next=if rows.len()>cap{Some(NovelId(rows[cap-1].id))}else{None};let mut statements=Vec::with_capacity(cap*2);let mut expected=Vec::with_capacity(cap);
+        for row in rows.into_iter().take(cap){let keys=narou_rs::platform::NovelObjectKeys::new(&row.sitename,&row.file_title,row.use_subdirectory!=0)?;expected.push(row.id);
+            statements.push(Self::bind_origin_statement(&db,row.id,keys.prefix().as_ref(),&row.sitename,&row.file_title,row.use_subdirectory)?);
+            statements.push(bind_statement(db.prepare("INSERT OR IGNORE INTO novel_revisions(novel_id,record_revision) SELECT id,1 FROM novels WHERE id=?"),vec![BindValue::Int(row.id)])?);
+        }
+        if !statements.is_empty(){let results=db.batch(statements).await.map_err(worker_error)?;ensure_batch_success(&results)?;
+            for(index,id)in expected.into_iter().enumerate(){if !results[index*2].results::<Bound>().map_err(worker_error)?.iter().any(|row|row.novel_id==id){return Err(NarouError::Platform("record_changed_or_novel_recovering: origin bootstrap cursor retained".into()));}}
+        }Ok(next)
+    }
+    /// Advance one durable primary-only page. Response loss only repeats an
+    /// idempotent page; a skipped/closed record can never advance the cursor.
+    pub async fn bootstrap_record_origins(&self)->Result<bool>{
+        #[derive(Default,Serialize,Deserialize)]struct Cursor{after:Option<i64>,complete:bool}
+        const KEY:&str="transfer_gate_binding_bootstrap_v1";
+        let db=self.db.primary_view();let raw=bind_statement(db.prepare("SELECT value_json FROM app_state WHERE scope='inv' AND key=?"),vec![BindValue::Text(KEY.into())])?.first::<String>(Some("value_json")).await.map_err(worker_error)?;
+        let current:Cursor=raw.as_deref().map(serde_json::from_str).transpose().map_err(|error|NarouError::Platform(format!("invalid origin bootstrap cursor: {error}")))?.unwrap_or_default();
+        if current.complete{return Ok(true);}let next=self.bind_record_origins_page(current.after.map(NovelId),32).await?;
+        let value=serde_json::to_string(&Cursor{after:next.map(|id|id.0),complete:next.is_none()}).map_err(|error|NarouError::Platform(error.to_string()))?;
+        let result=bind_statement(db.prepare("INSERT INTO app_state(scope,key,value_json,value_yaml) SELECT 'inv',?1,?2,?2 WHERE ?3 IS NULL OR EXISTS(SELECT 1 FROM app_state WHERE scope='inv' AND key=?1 AND value_json=?3) ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,value_yaml=excluded.value_yaml WHERE app_state.value_json IS ?3 RETURNING value_json"),vec![BindValue::Text(KEY.into()),BindValue::Text(value.clone()),raw.map_or(BindValue::Null,BindValue::Text)])?.run().await.map_err(worker_error)?;
+        ensure_batch_success(std::slice::from_ref(&result))?;
+        Ok(next.is_none()&&result.results::<JsonValue>().map_err(worker_error)?.iter().any(|row|row.get("value_json").and_then(JsonValue::as_str)==Some(value.as_str())))
+    }
+
+    /// Whether the durable origin-bootstrap cursor has been marked complete.
+    async fn origin_bootstrap_ready(&self)->Result<bool>{
+        let primary=self.db.primary_view();
+        let marker=bind_statement(primary.prepare("SELECT value_json FROM app_state WHERE scope='inv' AND key='transfer_gate_binding_bootstrap_v1'"),vec![])?.first::<String>(Some("value_json")).await.map_err(worker_error)?;
+        Ok(marker.as_deref().map(serde_json::from_str::<JsonValue>).transpose().map_err(worker_error)?.is_some_and(|value|value.get("complete").and_then(JsonValue::as_bool)==Some(true)))
     }
 
     fn prepare(&self, sql: &str, values: Vec<BindValue>) -> Result<D1PreparedStatement> {
@@ -173,6 +235,9 @@ impl D1NovelRepository {
 pub(crate) fn push_upsert_statements(db: &DbHandle, record: &NovelRecord, statements: &mut Vec<D1PreparedStatement>) -> Result<()> {
     let prepare = |sql: &str, values| bind_statement(db.prepare(sql), values);
     statements.reserve(record.tags.len() + 5);
+    let use_subdirectory=record.use_subdirectory;
+    let keys=narou_rs::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,use_subdirectory)?;
+    statements.push(prepare("INSERT INTO novel_gate_bindings(novel_id,prefix) VALUES (?,?) ON CONFLICT(novel_id) DO UPDATE SET prefix=excluded.prefix",vec![BindValue::Int(record.id),BindValue::Text(keys.prefix().as_ref().to_owned())])?);
     statements.push(prepare(NOVEL_UPSERT_SQL, record_binds(record)?)?);
     statements.push(prepare(novel_query::COMMIT_ID_RESERVATION_SQL, vec![BindValue::Int(record.id)])?);
     push_tag_statements(db, record.id, &record.tags, statements)?;
@@ -195,6 +260,32 @@ pub(crate) fn push_tag_statements(db: &DbHandle, id: i64, tags: &[String], state
 }
 
 impl NovelRepository for D1NovelRepository {
+    fn allocate_id_for_job<'a>(&'a self,owner:&'a Arc<narou_rs::platform::JobExecutionOwner>)->PlatformFuture<'a,Result<narou_rs::platform::NovelIdReservation>>{Box::pin(self.allocate_job_creation(owner))}
+    fn resume_id_for_job<'a>(&'a self,owner:&'a Arc<narou_rs::platform::JobExecutionOwner>,id:NovelId,generation:i64)->PlatformFuture<'a,Result<narou_rs::platform::NovelIdReservation>>{Box::pin(self.resume_job_creation(owner,id,generation))}
+    fn reserve_create<'a>(&'a self,fence:&'a narou_rs::platform::WriteFence,reservation:&'a narou_rs::platform::NovelIdReservation,toc_url:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(self.reserve_creation(fence,reservation,toc_url))}
+    fn apply_create_guarded<'a>(&'a self,fence:&'a narou_rs::platform::WriteFence,reservation:&'a narou_rs::platform::NovelIdReservation,record:NovelRecord)->PlatformFuture<'a,Result<()>>{Box::pin(self.commit_creation(fence,reservation,record))}
+    fn remove_closed<'a>(&'a self,prefix:&'a narou_rs::platform::ObjectPrefix,owner:&'a str,epoch:u64,id:NovelId)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
+        if narou_rs::platform::access_fence::parse_removal_owner(owner)?.0!=id{return Err(NarouError::Platform("removal owner ID mismatch".into()));}let db=self.db.primary_view();let storage=crate::d1_object_store::D1ObjectStore::new(db.clone());let primary=Self::new(db.clone());let record=primary.get_current(id).await?;let token=crate::content_store::nonce()?;let mut statements=storage.publication_guard(prefix,owner,epoch,&token)?;
+        if let Some(record)=record{let keys=narou_rs::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;if keys.prefix().as_ref()!=prefix.as_ref().trim_end_matches('/'){return Err(NarouError::Platform("removal record identity changed".into()));}
+            statements.push(bind_statement(db.prepare("SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM novels WHERE id=?1) OR EXISTS(SELECT 1 FROM novels WHERE id=?1 AND sitename=?2 AND file_title=?3 AND use_subdirectory=?4) THEN 1 ELSE abs(-9223372036854775808) END"),vec![BindValue::Int(id.0),BindValue::Text(record.sitename),BindValue::Text(record.file_title),BindValue::Int(i64::from(record.use_subdirectory))])?);
+        }else{statements.push(bind_statement(db.prepare("SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM novels WHERE id=?) THEN 1 ELSE abs(-9223372036854775808) END"),vec![BindValue::Int(id.0)])?);}
+        statements.push(bind_statement(db.prepare(novel_query::DELETE_NOVEL_SQL),vec![BindValue::Int(id.0)])?);statements.push(storage.finish_publication_guard(&token)?);let results=db.batch(statements).await.map_err(worker_error)?;ensure_batch_success(&results)
+    })}
+    fn get_current<'a>(&'a self,id:NovelId)->PlatformFuture<'a,Result<Option<NovelRecord>>>{Box::pin(async move{self.primary().one(&select_by_id_sql(),vec![BindValue::Int(id.0)]).await})}
+    fn get_many_current<'a>(&'a self,ids:&'a [NovelId])->PlatformFuture<'a,Result<Vec<Option<NovelRecord>>>>{Box::pin(async move{if ids.is_empty(){return Ok(Vec::new());}let primary=self.primary();let sql=format!("{} WHERE n.id IN (SELECT CAST(value AS INTEGER) FROM json_each(?1))",novel_codec::NOVEL_SELECT_SQL);let encoded=serde_json::to_string(ids).map_err(worker_error)?;Ok(narou_rs::platform::repository::align_current_records(ids,primary.rows(&sql,vec![BindValue::Text(encoded)]).await?))})}
+    fn query_current<'a>(&'a self,query:&'a NovelQuery)->PlatformFuture<'a,Result<Vec<NovelRecord>>>{let SqlQuery{sql,binds}=novel_query::query_sql(query,|bind|bind);Box::pin(async move{self.primary().rows(&sql,binds).await})}
+    fn find_by_toc_url_current<'a>(&'a self,url:&'a str)->PlatformFuture<'a,Result<Option<NovelRecord>>>{Box::pin(async move{self.primary().one(&select_by_toc_url_sql(),vec![BindValue::Text(fold(url))]).await})}
+    fn find_by_storage_prefix_current<'a>(&'a self,prefix:&'a narou_rs::platform::ObjectKey)->PlatformFuture<'a,Result<Option<NovelRecord>>>{Box::pin(async move{
+        if !self.origin_bootstrap_ready().await?{
+            // The downloader/acquisition path never goes through the transfer
+            // routes that advance this cursor, so drive bounded pages here:
+            // each invocation migrates up to 4*32 rows on the primary, then
+            // reports pending only if completion is still in flight.
+            for _ in 0..4{if self.bootstrap_record_origins().await?{break;}}
+            if !self.origin_bootstrap_ready().await?{return Err(NarouError::Platform("novel origin bindings initialization pending".into()));}
+        }
+        self.primary().one(&format!("{} WHERE n.id IN (SELECT novel_id FROM novel_gate_bindings WHERE prefix=?1) ORDER BY n.id LIMIT 1",novel_codec::NOVEL_SELECT_SQL),vec![BindValue::Text(prefix.to_string())]).await
+    })}
     fn get<'a>(&'a self, id: NovelId) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
         Box::pin(async move {
             self.one(&select_by_id_sql(), vec![BindValue::Int(id.0)]).await
@@ -237,7 +328,7 @@ impl NovelRepository for D1NovelRepository {
     ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
         let folded = fold(title);
         Box::pin(async move {
-            self.one(&select_by_title_sql(), vec![BindValue::Text(folded)]).await
+            self.primary().one(&select_by_title_sql(), vec![BindValue::Text(folded)]).await
         })
     }
 
@@ -247,7 +338,7 @@ impl NovelRepository for D1NovelRepository {
     ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
         let folded = fold(ncode);
         Box::pin(async move {
-            self.one(
+            self.primary().one(
                 &select_by_ncode_sql(),
                 vec![
                     BindValue::Text(folded.clone()),
@@ -313,19 +404,19 @@ impl NovelRepository for D1NovelRepository {
     }
 
     fn release_id(&self, reservation: narou_rs::platform::NovelIdReservation) -> PlatformFuture<'_, Result<()>> {
-        Box::pin(async move {
-            let statement = self.prepare(novel_query::RELEASE_ID_SQL,
-                vec![BindValue::Int(reservation.id().0), BindValue::Int(reservation.generation())])?;
-            let result = statement.run().await.map_err(worker_error)?;
-            ensure_batch_success(&[result])
-        })
+        Box::pin(self.release_creation(reservation))
     }
 
-    fn apply_batch<'a>(
-        &'a self,
-        mutations: Vec<NovelMutation>,
-    ) -> PlatformFuture<'a, Result<()>> {
-        Box::pin(async move {
+    fn apply_batch<'a>(&'a self,mutations:Vec<NovelMutation>)->PlatformFuture<'a,Result<()>>{Box::pin(self.apply_mutations(mutations,None))}
+    fn apply_batch_guarded_many<'a>(&'a self,fences:&'a [narou_rs::platform::WriteFence],mutations:Vec<NovelMutation>)->PlatformFuture<'a,Result<()>>{Box::pin(self.apply_mutations(mutations,Some(fences)))}
+}
+impl D1NovelRepository{
+    async fn apply_mutations(&self,mutations:Vec<NovelMutation>,fences:Option<&[narou_rs::platform::WriteFence]>)->Result<()>{
+        self.primary().apply_mutations_primary(mutations,fences,None).await
+    }
+    async fn apply_mutations_primary(&self,mutations:Vec<NovelMutation>,fences:Option<&[narou_rs::platform::WriteFence]>,creation:Option<(&narou_rs::platform::WriteFence,&narou_rs::platform::NovelIdReservation)>)->Result<()>{
+        if fences.is_some_and(|fences|fences.is_empty())&&!mutations.is_empty(){return Err(NarouError::Platform("record mutation has no writer fence".into()));}
+
             let mut mutations = mutations;
             for mutation in &mut mutations {
                 if let NovelMutation::Upsert(record) = mutation {
@@ -364,10 +455,19 @@ impl NovelRepository for D1NovelRepository {
                     Some(crate::tag_sequence::library_tags(&self.db).await?)
                 };
                 let next = crate::tag_sequence::advance(&snapshot, before.as_ref(), &written);
-                let mut statements = Vec::new();
+                let mut statements=Vec::new();let storage=crate::d1_object_store::D1ObjectStore::new(self.db.clone());let mut gate_tokens=Vec::new();
+                if let Some(fences)=fences{
+                    for fence in fences{let token=crate::content_store::nonce()?;statements.push(storage.open_guard(fence,&token)?);gate_tokens.push(token);}
+                    for mutation in &mutations{let id=match mutation{NovelMutation::Upsert(record)=>{let keys=narou_rs::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;if !fences.iter().any(|fence|keys.prefix().as_ref()==fence.prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("record outside captured fence".into()));}record.id},NovelMutation::Remove(id)=>id.0};
+                        let mut sql=String::from("SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM novel_gate_bindings WHERE novel_id=?1) OR EXISTS(SELECT 1 FROM novel_gate_bindings WHERE novel_id=?1 AND prefix IN (");
+                        let mut binds=vec![BindValue::Int(id)];for(index,fence)in fences.iter().enumerate(){if index!=0{sql.push(',');}sql.push('?');sql.push_str(&(index+2).to_string());binds.push(BindValue::Text(fence.prefix.as_ref().trim_end_matches('/').into()));}sql.push_str(")) THEN 1 ELSE abs(-9223372036854775808) END");statements.push(self.prepare(&sql,binds)?);
+                    }
+                }
+                if let Some((fence,reservation))=creation{statements.extend(self.creation_commit_guards(fence,reservation)?);}
                 for mutation in &mutations {
                     match mutation {
                         NovelMutation::Upsert(record) => {
+                            if creation.is_none(){statements.push(self.namespace_mutation_guard(record)?);}
                             push_upsert_statements(&self.db, record, &mut statements)?;
                         }
                         NovelMutation::Remove(id) => {
@@ -378,6 +478,7 @@ impl NovelRepository for D1NovelRepository {
                         }
                     }
                 }
+                if let Some((fence,reservation))=creation{statements.extend(self.creation_commit_finish(fence,reservation)?);}
                 // 連番表の更新を作品と同じ batch に入れる。batch は 1 トランザクション
                 // なので、作品と順序が同時に確定する。CAS が外れたときは guard 文が
                 // 一意制約違反を起こして batch 全体を中断し、作品もロールバックする。
@@ -387,6 +488,8 @@ impl NovelRepository for D1NovelRepository {
                     &next,
                 )?);
                 statements.push(crate::tag_sequence::guard_statement(&self.db, &next)?);
+                if mutations.iter().any(|mutation|matches!(mutation,NovelMutation::Remove(_)))&&let Some(fences)=fences{for fence in fences{statements.push(self.prepare("UPDATE novel_access_gates SET epoch=CASE WHEN epoch<9223372036854775807 THEN epoch+1 ELSE abs(-9223372036854775808) END,updated_at=unixepoch() WHERE prefix=? AND epoch=? AND closed=0",vec![BindValue::Text(fence.prefix.as_ref().trim_end_matches('/').into()),BindValue::Int(fence.epoch as i64)])?);}}
+                for token in &gate_tokens{statements.push(storage.finish_publication_guard(token)?);}
                 let outcome = match self.db.batch(statements).await {
                     Ok(results) => {
                         ensure_batch_success(&results).map_err(|error| error.to_string())
@@ -408,7 +511,6 @@ impl NovelRepository for D1NovelRepository {
             Err(NarouError::Platform(
                 "タグの登録順が同時に更新されています。再試行してください".to_string(),
             ))
-        })
     }
 }
 
@@ -468,6 +570,20 @@ impl FreezeStore for D1FreezeStore {
 }
 
 impl FreezeMutationStore for D1FreezeStore {
+    fn set_frozen_guarded_many<'a>(&'a self,fences:&'a [narou_rs::platform::WriteFence],ids:&'a [NovelId],frozen:bool)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
+        if ids.is_empty(){return Ok(());}if fences.is_empty(){return Err(NarouError::Platform("freeze has no captured fence".into()));}
+        let db=self.db.primary_view();let repository=D1NovelRepository::new(db.clone());let records=repository.get_many_current(ids).await?;
+        let storage=crate::d1_object_store::D1ObjectStore::new(db.clone());let mut statements=Vec::new();let mut tokens=Vec::with_capacity(fences.len());
+        for fence in fences{let token=crate::content_store::nonce()?;statements.push(storage.open_guard(fence,&token)?);tokens.push(token);}
+        for(id,record)in ids.iter().zip(records){let record=record.ok_or_else(||NarouError::NotFound(format!("Novel {}",id.0)))?;let keys=narou_rs::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;
+            if !fences.iter().any(|fence|keys.prefix().as_ref()==fence.prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("freeze outside captured fences".into()));}
+            statements.push(bind_statement(db.prepare("INSERT INTO novel_gate_bindings(novel_id,prefix) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM novels WHERE id=?1 AND sitename=?3 AND file_title=?4 AND use_subdirectory=?5) AND NOT EXISTS(SELECT 1 FROM novel_access_gates WHERE closed=1 AND prefix=(SELECT prefix FROM novel_gate_bindings WHERE novel_id=?1)) ON CONFLICT(novel_id) DO UPDATE SET prefix=excluded.prefix"),vec![BindValue::Int(id.0),BindValue::Text(keys.prefix().to_string()),BindValue::Text(record.sitename),BindValue::Text(record.file_title),BindValue::Int(i64::from(record.use_subdirectory))])?);
+            statements.push(bind_statement(db.prepare("SELECT CASE WHEN EXISTS(SELECT 1 FROM novels n JOIN novel_gate_bindings b ON b.novel_id=n.id WHERE n.id=? AND b.prefix=?) THEN 1 ELSE abs(-9223372036854775808) END"),vec![BindValue::Int(id.0),BindValue::Text(keys.prefix().to_string())])?);
+            statements.push(bind_statement(db.prepare(if frozen{"INSERT OR IGNORE INTO frozen_novels(novel_id) VALUES (?)"}else{"DELETE FROM frozen_novels WHERE novel_id=?"}),vec![BindValue::Int(id.0)])?);statements.push(bind_statement(db.prepare(novel_query::refresh_status_sort_sql()),vec![BindValue::Int(id.0)])?);
+        }
+        for token in tokens{statements.push(storage.finish_publication_guard(&token)?);}let results=db.batch(statements).await.map_err(worker_error)?;ensure_batch_success(&results)?;FROZEN_IDS_CACHE.invalidate("frozen");Ok(())
+    })}
+
     fn set_frozen<'a>(
         &'a self,
         ids: &'a [NovelId],

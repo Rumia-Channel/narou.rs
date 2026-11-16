@@ -55,6 +55,7 @@ async function pause(name) {
 function gatedDatabase(database, phase, paused) {
   const gated = new Set();
   const originals = new WeakMap();
+  const sqlByStatement = new WeakMap();
   const statement = (target, sql, values = []) => {
     const proxy = new Proxy(target, {
       get(target, name) {
@@ -82,13 +83,23 @@ function gatedDatabase(database, phase, paused) {
       },
     });
     originals.set(proxy, target);
+    sqlByStatement.set(proxy, sql);
     return proxy;
   };
   const wrap = target => new Proxy(target, {
     get(target, name) {
       if (name === 'constructor') return target.constructor;
       if (name === 'prepare') return sql => statement(target.prepare(sql), sql);
-      if (name === 'batch') return statements => target.batch(statements.map(value => originals.get(value) || value));
+      if (name === 'batch') return async statements => {
+        if (paused === 'create-namespace' && !gated.has('creation-batch') && statements.some(value => {
+          const sql = sqlByStatement.get(value) || '';
+          return /INSERT INTO novel_id_sequence/.test(sql) && /novel_namespace_claims/.test(sql);
+        })) {
+          gated.add('creation-batch');
+          await pause(paused);
+        }
+        return target.batch(statements.map(value => originals.get(value) || value));
+      };
       if (name === 'withSession') return (...args) => wrap(target.withSession(...args));
       const value = Reflect.get(target, name, target);
       return typeof value === 'function' ? value.bind(target) : value;

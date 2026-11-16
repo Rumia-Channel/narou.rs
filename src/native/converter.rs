@@ -1,7 +1,6 @@
-//! Native compatibility constructors for the converter.
-//!
-//! The converter pipeline itself remains platform-neutral. These constructors
-//! preserve the historical zero-argument capability wiring for the native CLI.
+//! Explicit native file capabilities and operation-owned converter workspaces.
+//! Pure converter constructors perform no filesystem or HTTP initialization;
+//! native file entrypoints use the fallible `try_*` constructors below.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -12,22 +11,20 @@ use crate::converter::{
 use crate::downloader::rate_limit::RateLimiter;
 use crate::illustration_store::IllustrationIndex;
 use crate::native::http::NativeHttpClient;
-use crate::platform::ObjectStore;
 
-fn native_http_and_rate_limiter() -> Option<(
+fn native_http_and_rate_limiter() -> crate::error::Result<(
     Arc<dyn crate::platform::HttpClient>,
     Arc<dyn crate::platform::RateLimiter>,
 )> {
     let user_agent = ua_generator::ua::spoof_firefox_ua().to_string();
-    let http: Arc<dyn crate::platform::HttpClient> =
-        Arc::new(NativeHttpClient::new(&user_agent).ok()?);
+    let http: Arc<dyn crate::platform::HttpClient> = Arc::new(NativeHttpClient::new(&user_agent)?);
     let rate_limiter: Arc<dyn crate::platform::RateLimiter> = Arc::new(RateLimiter::new());
-    Some((http, rate_limiter))
+    Ok((http, rate_limiter))
 }
 
-fn native_capabilities() -> Option<ConverterCapabilities> {
+fn native_capabilities() -> crate::error::Result<ConverterCapabilities> {
     let (http, rate_limiter) = native_http_and_rate_limiter()?;
-    Some(ConverterCapabilities {
+    Ok(ConverterCapabilities {
         http,
         rate_limiter,
         fetch_policy: crate::downloader::http_policy::FetchPolicy::default(),
@@ -35,12 +32,8 @@ fn native_capabilities() -> Option<ConverterCapabilities> {
         objects: None,
         illustration_index: None,
         illustration_prefix: None,
-        novel_record_resolver: Some(Arc::new(|id| {
-            crate::native::novel_repository::NativeNovelRepository::new()
-                .get_sync(id.into())
-                .ok()
-                .flatten()
-        })),
+        write_guard: None,
+        novel_record: None,
         fetch_policy_resolver: Some(Arc::new(|record| {
             let settings = crate::downloader::site_setting::effective_site_settings();
             crate::downloader::http_policy::FetchPolicy::for_record(&settings, record)
@@ -48,80 +41,54 @@ fn native_capabilities() -> Option<ConverterCapabilities> {
     })
 }
 
-/// Capabilities that persist the illustration index and newly fetched images
-/// through the active [`ObjectStore`]/[`AssetStore`](crate::platform::AssetStore) boundary.
-///
-/// Returns `None` when the plain filesystem layout is the only storage (YAML
-/// mode without S3), where the legacy `挿絵/` directory scan and
-/// `.illustration_cache.yaml` handling stays authoritative. SQLite mode (even
-/// with the mirror disabled) and `s3.asset-backend=s3` store illustrations
-/// outside the novel folder, so a conversion that only wrote filesystem files
-/// would clobber the stored index and make the web readers see stale data.
-pub fn store_capabilities_for_novel(novel_dir: &Path) -> Option<ConverterCapabilities> {
-    let inventory = crate::db::inventory::Inventory::with_default_root().ok()?;
-    let narou_dir = inventory.root_dir().join(".narou");
-    let sqlite_active = crate::native::sqlite::state::active_for(&narou_dir).is_some();
-    let s3_active = crate::native::s3::illustration_store().ok().flatten().is_some();
-    if !sqlite_active && !s3_active {
-        return None;
+/// Read only the settings metadata needed by a native constructor. Canonical
+/// inputs retain their original epoch; private inputs never touch a library.
+pub(crate) fn with_novel_settings_input<T: Send>(
+    id: i64,
+    directory: &Path,
+    configure: impl FnOnce(&Path) -> crate::error::Result<T> + Send,
+) -> crate::error::Result<(T, Option<crate::application::novel_access::AccessOrigin>)> {
+    use crate::application::novel_access::{AccessOrigin, NovelReadLease};
+    use crate::error::NarouError;
+    if crate::application::novel_access::is_private_path(directory)? {
+        return configure(directory).map(|value| (value, None));
     }
-
-    let archive_root = inventory
-        .root_dir()
-        .join(crate::downloader::types::ARCHIVE_ROOT_DIR);
-    let prefix = crate::native::object_store::logical_key_for_native_path(&archive_root, novel_dir)?;
-    let stores = crate::native::object_store::NativeStores::for_narou_root(inventory.root_dir()).ok()?;
-    let index = load_stored_illustration_index(stores.objects.as_ref(), &prefix);
-    let mut capabilities = native_capabilities()?;
-    capabilities.assets = Some(stores.assets);
-    capabilities.objects = Some(stores.objects);
-    capabilities.illustration_index = Some(index);
-    capabilities.illustration_prefix = Some(prefix);
-    Some(capabilities)
-}
-
-/// Read `<prefix>/.illustration_cache.yaml` from the object store.
-///
-/// Missing or unparsable entries yield an empty index (same contract as the
-/// downloader's `PersistenceService::load_cache`): the conversion re-fetches
-/// what it cannot map instead of failing.
-fn load_stored_illustration_index(objects: &dyn ObjectStore, prefix: &crate::platform::ObjectKey) -> IllustrationIndex {
-    let Ok(key) = prefix.join(".illustration_cache.yaml") else {
-        return IllustrationIndex::default();
-    };
-    let Some(bytes) = run_store_io(objects.read_small(&key)).ok().flatten() else {
-        return IllustrationIndex::default();
-    };
-    match serde_yaml::from_slice::<crate::illustration_store::IllustrationStore>(&bytes) {
-        Ok(store) => IllustrationIndex::from_store(store),
-        Err(_) => IllustrationIndex::default(),
-    }
-}
-
-/// Read the canonical per-novel INI, not a stale pre-migration mirror.
-pub(crate) fn load_novel_ini(novel_dir: &Path) -> crate::error::Result<crate::converter::ini::IniData> {
-    use crate::converter::ini::IniData;
-    use crate::native::object_store::{NativeStore, logical_key_for_native_path};
-
-    let path = novel_dir.join("setting.ini");
-    let Some(root) = novel_dir.ancestors().find(|root| root.join(".narou").is_dir()) else {
-        return IniData::load_file(&path);
-    };
-    let archive_root = root.join(crate::downloader::types::ARCHIVE_ROOT_DIR);
-    let Some(key) = logical_key_for_native_path(&archive_root, &path) else {
-        return IniData::load_file(&path);
-    };
-    let store = NativeStore::for_narou_root(root)?;
-    if matches!(&store, NativeStore::Fs(_)) {
-        return IniData::load_file(&path);
-    }
-    let Some(bytes) = futures::executor::block_on(store.read_small(&key))? else {
-        return Ok(IniData::new());
-    };
-    let text = String::from_utf8(bytes).map_err(|error| {
-        crate::error::NarouError::Platform(format!("setting.ini is not UTF-8: {error}"))
-    })?;
-    Ok(IniData::load(&text))
+    run_store_io(async {
+        let inventory = crate::db::inventory::Inventory::with_default_root()?;
+        let archive = inventory.root_dir().join(crate::downloader::ARCHIVE_ROOT_DIR);
+        let repository = crate::native::novel_repository::NativeNovelRepository::new();
+        let discovered = repository.get_current_sync(id.into())?.ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
+        let keys = crate::platform::NovelObjectKeys::new(&discovered.sitename, &discovered.file_title, discovered.use_subdirectory)?;
+        let prefix = crate::platform::ObjectPrefix::from(keys.prefix().clone());
+        let primary = crate::native::object_store::NativeStore::for_narou_root(inventory.root_dir())?;
+        let expected = crate::db::paths::ensure_within_archive_root(&primary.novel_directory(&prefix)?, &archive)?;
+        if crate::db::paths::ensure_within_archive_root(directory, &archive)? != expected {
+            return Err(NarouError::Platform("plan_stale: settings directory changed its canonical novel identity".into()));
+        }
+        let objects = crate::native::materialization::read_store(inventory.root_dir())?;
+        let mut lease = NovelReadLease::admit(&objects, &prefix, "native-settings-input").await?;
+        let result = async {
+            let current = repository.get_current_sync(id.into())?.ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
+            if current != discovered { return Err(NarouError::Platform("plan_stale: settings metadata changed before admission".into())); }
+            crate::native::transfer::assert_source_namespace(&current)?;
+            drop(current);
+            drop(discovered);
+            let fence = objects.access_fence().ok_or_else(|| NarouError::Platform("settings reader fence unavailable".into()))?;
+            let before = fence.gate_info(&prefix).await?;
+            let temporary = tempfile::Builder::new().prefix(".narou-snapshot-").tempdir_in(inventory.root_dir())?;
+            for name in ["setting.ini", "replace.txt"] {
+                crate::native::materialization::copy_asset(&objects, &mut lease, &keys.prefix().join(name)?, &temporary.path().join(name)).await?;
+            }
+            let configured = configure(temporary.path())?;
+            lease.validate().await?;
+            if fence.gate_info(&prefix).await?.content_revision != before.content_revision {
+                return Err(NarouError::Platform("novel_busy: settings changed during private capture".into()));
+            }
+            Ok((configured, Some(AccessOrigin { prefix: prefix.as_ref().to_owned(), epoch: lease.epoch() })))
+        }.await;
+        let released = lease.release().await;
+        match result { Ok(value) => { released?; Ok(value) }, Err(error) => Err(error) }
+    })
 }
 
 /// Drive store I/O from a synchronous converter, including callers already on Tokio.
@@ -145,14 +112,213 @@ where
     runtime.block_on(future)
 }
 
+pub(crate) fn private_capabilities(path: &Path) -> crate::error::Result<ConverterCapabilities> {
+    crate::application::novel_access::require_private_path(path)?;
+    let store = Arc::new(crate::native::object_store::NativeObjectStore::from_root(path.to_path_buf())?);
+    let objects: Arc<dyn crate::platform::ObjectStore> = store.clone();
+    let assets: Arc<dyn crate::platform::AssetStore> = store;
+    let write = run_store_io(crate::application::novel_access::NovelWriteGuard::capture(
+        &objects, Some(&assets), &crate::platform::ObjectPrefix::new("novels")?,
+    ))?;
+    let mut capabilities = native_capabilities()?;
+    capabilities.objects = Some(objects);
+    capabilities.assets = Some(assets);
+    capabilities.illustration_prefix = Some(crate::platform::ObjectKey::try_new("novels")?);
+    capabilities.write_guard = Some(write);
+    capabilities.illustration_index = Some(IllustrationIndex::from_store(crate::illustration_store::IllustrationStore::load(path)?));
+    Ok(capabilities)
+}
+
+/// Own all native conversion inputs and outputs privately until the original
+/// operation token authorizes each canonical install. No canonical helper files
+/// are created and subsequently deleted.
+pub(crate) struct ConversionWorkspace {
+    _temporary: Option<tempfile::TempDir>,
+    _original_lock: Option<crate::compat::NovelLockGuard>,
+    input: std::path::PathBuf,
+    directory: std::path::PathBuf,
+    origin: Option<crate::application::novel_access::NovelWriteGuard>,
+    primary: Option<Arc<crate::native::object_store::NativeStore>>,
+    pub(crate) private_write: crate::application::novel_access::NovelWriteGuard,
+    pub(crate) objects: Arc<dyn crate::platform::ObjectStore>,
+    pub(crate) assets: Arc<dyn crate::platform::AssetStore>,
+}
+
+impl ConversionWorkspace {
+    pub(crate) fn begin(
+        novel_dir: &Path,
+        id: i64,
+        supplied: Option<&crate::application::novel_access::NovelWriteGuard>,
+        selection: crate::native::materialization::ConversionInputSelection,
+    ) -> crate::error::Result<Self> {
+        use crate::application::novel_access::NovelWriteGuard;
+        use crate::platform::ObjectPrefix;
+        let private_input = crate::application::novel_access::is_private_path(novel_dir)?;
+        let mut directory = novel_dir.to_path_buf();
+        let mut original_lock = None;
+        let (origin, primary, temporary) = if !private_input {
+            let stores = crate::native::object_store::NativeStores::for_current_root()?;
+            let guard = match supplied {
+                Some(guard) => guard.clone(),
+                None => crate::native::materialization::capture_write_for_id(id)?,
+            };
+            directory = crate::native::materialization::directory_for_origin(&guard)?;
+            original_lock = Some(crate::compat::NovelLockGuard::acquire(Some(id))?);
+            let (snapshot, ()) = crate::native::materialization::conversion_snapshot_with_origin(novel_dir, &guard, None, |_| Ok(((), selection)))?;
+            (Some(guard), Some(stores.primary), Some(snapshot))
+        } else if let Some(guard) = supplied {
+            crate::application::novel_access::require_private_path(novel_dir)?;
+            let inventory = crate::db::inventory::Inventory::with_default_root()?;
+            let stores = crate::native::object_store::NativeStores::for_narou_root(inventory.root_dir())?;
+            directory = stores.primary.with_open_write(guard.fence(), || {
+                let record = crate::native::novel_repository::NativeNovelRepository::new().get_current_sync(id.into())?
+                    .ok_or_else(|| crate::error::NarouError::NotFound(format!("ID: {id}")))?;
+                let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+                if keys.prefix().as_ref() != guard.prefix().as_ref() { return Err(crate::error::NarouError::Platform("private conversion changed its operation origin".into())); }
+                crate::native::transfer::assert_source_namespace(&record)?;
+                stores.primary.novel_directory(guard.prefix())
+            })?;
+            (Some(guard.clone()), Some(stores.primary), None)
+        } else {
+            crate::application::novel_access::require_private_path(novel_dir)?;
+            (None, None, None)
+        };
+        let input = temporary.as_ref().map(|temp| temp.path()).unwrap_or(novel_dir).to_path_buf();
+        let store = Arc::new(crate::native::object_store::NativeObjectStore::from_root(input.clone())?);
+        let objects: Arc<dyn crate::platform::ObjectStore> = store.clone();
+        let assets: Arc<dyn crate::platform::AssetStore> = store;
+        let private_write = run_store_io(NovelWriteGuard::capture(
+            &objects, Some(&assets), &ObjectPrefix::new("novels")?,
+        ))?;
+        Ok(Self { _temporary: temporary, _original_lock: original_lock, input, directory, origin, primary, private_write, objects, assets })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.input
+    }
+
+    pub(crate) fn origin(&self) -> Option<&crate::application::novel_access::NovelWriteGuard> {
+        self.origin.as_ref()
+    }
+
+    pub(crate) fn output_path(&self, path: &Path) -> crate::error::Result<std::path::PathBuf> {
+        if self.origin.is_none() { return Ok(path.to_path_buf()); }
+        let relative = match path.strip_prefix(self.path()) {
+            Ok(relative) => relative,
+            Err(_) => { crate::application::novel_access::require_private_path(path)?; return Ok(path.to_path_buf()); }
+        };
+        Ok(self.directory.join(relative))
+    }
+
+    pub(crate) fn publish(&self, path: &Path) -> crate::error::Result<std::path::PathBuf> {
+        let Some(origin) = &self.origin else { return Ok(path.to_path_buf()); };
+        let relative = match path.strip_prefix(self.path()) {
+            Ok(relative) => relative,
+            Err(_) => { crate::application::novel_access::require_private_path(path)?; return Ok(path.to_path_buf()); }
+        };
+        let destination = self.directory.join(relative);
+        crate::native::materialization::publish_file(origin, path, &destination)?;
+        Ok(destination)
+    }
+
+    pub(crate) fn discard_intermediate(&self, _id: i64, text: Option<&Path>, output: Option<&Path>) -> crate::error::Result<()> {
+        if crate::converter::keep_converted_text_file() { return Ok(()); }
+        // These bytes were rendered privately by this invocation. Never turn
+        // private cleanup into deletion of a pre-existing canonical user file
+        // or a previous generated output that this operation did not install.
+        if let Some(text) = text.filter(|text| Some(*text) != output) {
+            crate::application::novel_access::require_private_path(text)?;
+            match std::fs::remove_file(text) {
+                Ok(()) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        &self, id: i64, output: &Path, text: Option<&Path>, illustrations: &std::collections::HashSet<String>,
+    ) -> crate::error::Result<std::path::PathBuf> {
+        let Some(origin) = &self.origin else { return Ok(output.to_path_buf()); };
+        for name in illustrations {
+            let path = self.path().join("挿絵").join(name);
+            if path.is_file() { self.publish(&path)?; }
+        }
+        for name in [".illustration_cache.yaml", crate::converter::inspector::INSPECT_LOG_NAME] {
+            let path = self.path().join(name);
+            if path.is_file() { self.publish(&path)?; }
+        }
+        if let Some(text) = text {
+            if output != text && crate::converter::keep_converted_text_file() { self.publish(text)?; }
+            if let Some(primary) = &self.primary
+                && matches!(primary.as_ref(), crate::native::object_store::NativeStore::Sqlite(_))
+            {
+                let toc: crate::downloader::TocFile = serde_yaml::from_slice(&std::fs::read(self.path().join("toc.yaml"))?)?;
+                let sections = crate::converter::load_sections_from_dir(self.path(), &toc.subtitles)?;
+                let mut map = std::collections::BTreeMap::new();
+                for section in sections {
+                    map.insert(section.index.clone(), (Some(section.subtitle.clone()), serde_yaml::to_string(&section)?));
+                }
+                let bytes = std::fs::read(text)?;
+                primary.with_open_fence_transaction(origin.fence(), |connection| {
+                    crate::native::sqlite::content::store_sections_in_tx(connection, id, &map)?;
+                    if crate::converter::keep_converted_text_file() {
+                        crate::native::sqlite::content::store_output(connection, id, "converted_text", &bytes)?;
+                    } else {
+                        crate::native::sqlite::content::delete_output(connection, id, "converted_text")?;
+                    }
+                    crate::native::sqlite::versions::snapshot_working_set_in_tx(connection, id, "update", Some("convert"))?;
+                    Ok(())
+                })?;
+            }
+        }
+        let published = self.publish(output)?;
+        self.discard_intermediate(id, text, Some(output))?;
+        Ok(published)
+    }
+}
+
 impl NovelConverter {
+    /// Pure rendering constructor: no filesystem or native transport setup.
     pub fn new(settings: NovelSettings) -> Self {
-        let capabilities = store_capabilities_for_novel(&settings.archive_path).or_else(native_capabilities);
-        Self::build(settings, None, capabilities)
+        Self::build(settings, None, None)
     }
 
     pub fn with_user_converter(settings: NovelSettings, user_converter: UserConverter) -> Self {
-        let capabilities = store_capabilities_for_novel(&settings.archive_path).or_else(native_capabilities);
-        Self::build(settings, Some(user_converter), capabilities)
+        Self::build(settings, Some(user_converter), None)
+    }
+
+    /// Native file conversion admits only explicit, fallible capabilities.
+    pub fn try_new(settings: NovelSettings) -> crate::error::Result<Self> {
+        let capabilities = if crate::application::novel_access::is_private_path(&settings.archive_path)? {
+            private_capabilities(&settings.archive_path)?
+        } else {
+            native_capabilities()?
+        };
+        Ok(Self::build(settings, None, Some(capabilities)))
+    }
+
+    pub fn try_with_user_converter(settings: NovelSettings, user_converter: UserConverter) -> crate::error::Result<Self> {
+        let capabilities = if crate::application::novel_access::is_private_path(&settings.archive_path)? {
+            private_capabilities(&settings.archive_path)?
+        } else {
+            native_capabilities()?
+        };
+        Ok(Self::build(settings, Some(user_converter), Some(capabilities)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_constructor_propagates_private_index_io_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".illustration_cache.yaml")).unwrap();
+        let settings = NovelSettings { archive_path: directory.path().to_path_buf(), ..NovelSettings::default() };
+        assert!(NovelConverter::try_new(settings.clone()).is_err());
+        assert!(NovelConverter::try_with_user_converter(settings, UserConverter::default()).is_err());
     }
 }

@@ -9,6 +9,7 @@
 //   - 全体のハッシュを `.asset-version` に書く (差分検知用)
 //
 // `public/` は gitignore 済みで、`wrangler` の `[assets]` がそのまま配信する。
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -108,7 +109,64 @@ await rm(outputDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 2
 await mkdir(assetsDir, { recursive: true });
 await cp(sourceDir, assetsDir, { recursive: true });
 
-const buildHash = hashOf(Buffer.from(assetPaths.map((path) => versions.get(path)).join("")));
+// Transfer WASM artifacts: generated outside the source assets by
+// `scripts/build-transfer-wasm.mjs` (cargo + wasm-bindgen, never inside
+// build.rs) and copied verbatim under `/assets/transfer/`. A missing or
+// invalid set fails this whole build — the Worker is never shipped without
+// the real codec, and there is no server-ZIP fallback (design §14.1).
+const transferDir = join(projectDir, "target", "transfer-artifacts");
+const transferScript = join(projectDir, "scripts", "build-transfer-wasm.mjs");
+const verifyTransfer = () =>
+  spawnSync(process.execPath, [transferScript, "--verify", "--out", transferDir], {
+    cwd: projectDir,
+    stdio: "inherit",
+    shell: false,
+  });
+// The builder checks source/config fingerprints even when a valid artifact
+// set exists; verification alone would silently retain a stale worker/codec.
+const build = spawnSync(process.execPath, [transferScript, "--install-bindgen"], {
+  cwd: projectDir,
+  stdio: "inherit",
+  shell: false,
+});
+if (build.status !== 0) {
+  throw new Error("transfer WASM artifact build failed; Worker assets are not deployable without them");
+}
+if (verifyTransfer().status !== 0) {
+  throw new Error("transfer WASM artifacts failed verification after build");
+}
+const transferManifestBytes = await readFile(join(transferDir, "manifest.json"), "utf8");
+const transferManifest = JSON.parse(transferManifestBytes);
+const artifactNames = Object.keys(transferManifest.files ?? {});
+if (artifactNames.length === 0) {
+  throw new Error("transfer manifest lists no artifact files");
+}
+const transferDest = join(assetsDir, "transfer");
+await mkdir(transferDest, { recursive: true });
+await writeFile(join(transferDest, "manifest.json"), transferManifestBytes);
+const transferHashParts = [Buffer.from(transferManifestBytes, "utf8")];
+for (const name of artifactNames) {
+  if (
+    name === "manifest.json" ||
+    name.startsWith("/") ||
+    name.includes("\\") ||
+    name.split("/").includes("..")
+  ) {
+    throw new Error(`unsafe transfer artifact name: ${name}`);
+  }
+  const bytes = await readFile(join(transferDir, ...name.split("/")));
+  const target = join(transferDest, ...name.split("/"));
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, bytes);
+  transferHashParts.push(Buffer.from(name, "utf8"), bytes);
+}
+
+const buildHash = hashOf(
+  Buffer.concat([
+    Buffer.from(assetPaths.map((path) => versions.get(path)).join("")),
+    ...transferHashParts,
+  ]),
+);
 const version = await projectVersion();
 const buildScript = `<script>window.__NAROU_RS_WEBUI_BUILD__ = { appVersion: "${version}", assetsVersion: "${buildHash}" };</script>`;
 

@@ -10,6 +10,15 @@ pub enum TransferError {
     #[error("invalid transfer archive: {0}")]
     InvalidArchive(String),
 
+    /// A `/api/transfer/v2` wire document or binary frame violated the
+    /// protocol contract.
+    #[error("transfer protocol error: {0}")]
+    Protocol(String),
+
+    /// A projection/selection request referenced an invalid role or file.
+    #[error("invalid transfer selection: {0}")]
+    InvalidSelection(String),
+
     /// The archive, one of its entries or its manifest exceeds a size cap.
     #[error("transfer archive is too large: {0}")]
     TooLarge(String),
@@ -48,6 +57,7 @@ pub enum TransferError {
     Serde(#[from] serde_json::Error),
 }
 
+#[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 impl From<TransferError> for crate::error::NarouError {
     fn from(error: TransferError) -> Self {
         crate::error::NarouError::Platform(format!("transfer: {error}"))

@@ -13,6 +13,7 @@ use narou_rs::mail::{
     MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
 };
 use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
+use narou_rs::platform::NovelRepository;
 
 const EXIT_INTERRUPT: i32 = 126;
 
@@ -365,6 +366,13 @@ fn inspect_existing_download(
         title: record.title.clone(),
         toc_url: record.toc_url.clone(),
     };
+    let write = match narou_rs::native::materialization::capture_write_for_record(&record) {
+        Ok(write) => write,
+        Err(error) => {
+            sink.emit(Stream::Stderr, &messages::indented_error(error));
+            return Some(ExistingDownloadState::Present(info));
+        }
+    };
     // archive_root は Inventory 依存 (Phase 4 対象)。
     let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
         .unwrap_or_else(|_| std::path::PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
@@ -384,13 +392,12 @@ fn inspect_existing_download(
         }
     }
 
-    if let Err(err) = novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(
-        record.id.into(),
-    )]) {
+    if let Err(err) = narou_rs::native::materialization::block_on(novels.apply_batch_guarded(write.fence(), vec![narou_rs::platform::NovelMutation::Remove(record.id.into())])) {
         sink.emit(
             Stream::Stderr,
             &messages::download::stale_index_cleanup_warn(err),
         );
+        return Some(ExistingDownloadState::Present(info));
     }
 
     Some(ExistingDownloadState::Missing {
@@ -405,13 +412,13 @@ fn get_record_for_target(target: &str) -> Option<narou_rs::db::NovelRecord> {
     match target_type {
         TargetType::Id => {
             if let Ok(id) = target.parse::<i64>() {
-                novels.get_sync(id.into()).ok().flatten()
+                novels.get_current_sync(id.into()).ok().flatten()
             } else {
                 None
             }
         }
         _ => get_data_by_target(target)
-            .and_then(|info| novels.get_sync(info.id.into()).ok().flatten()),
+            .and_then(|info| novels.get_current_sync(info.id.into()).ok().flatten()),
     }
 }
 
@@ -501,25 +508,27 @@ fn after_process(target: &str, opts: &DownloadOptions, sink: &Arc<dyn MessageSin
 }
 
 fn auto_convert(dl: &DownloadResult) -> Result<(), String> {
+    let write = narou_rs::native::materialization::capture_write_for_id(dl.id).map_err(|error| error.to_string())?;
     if is_web_mode() {
-        return auto_convert_via_web_subprocess(dl.id);
+        return auto_convert_via_web_subprocess(&write, dl.id);
     }
-    auto_convert_existing_download(dl)
+    auto_convert_existing_download(&write, dl)
 }
 
-fn auto_convert_existing_download(dl: &DownloadResult) -> Result<(), String> {
-    convert_existing_novel(dl.id, &dl.title, &dl.author, &dl.novel_dir, true).map(|_| ())
+fn auto_convert_existing_download(write: &narou_rs::application::novel_access::NovelWriteGuard, dl: &DownloadResult) -> Result<(), String> {
+    convert_existing_novel(write, dl.id, true).map(|_| ())
 }
 
-fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
+fn auto_convert_via_web_subprocess(write: &narou_rs::application::novel_access::NovelWriteGuard, id: i64) -> Result<(), String> {
     if narou_rs::compat::load_local_setting_bool("concurrency") {
-        super::enqueue_web_convert_job(id)?;
+        super::enqueue_web_convert_job(write, id)?;
         return Ok(());
     }
 
     let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut command = Command::new(exe_path);
     command.arg("convert").arg("--no-open").arg(id.to_string());
+    command.env("NAROU_RS_WRITE_ORIGIN", serde_json::to_string(&write.origin()).map_err(|error| error.to_string())?);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -593,6 +602,16 @@ mod tests {
         assert_eq!(EXIT_INTERRUPT, 126);
     }
 
+    fn insert_download_fixture(id: i64) {
+        let record: narou_rs::db::NovelRecord = serde_yaml::from_str(&format!(
+            "id: {id}\ntitle: title\nauthor: author\nfile_title: fixture-{id}\nsitename: test\ntoc_url: https://example.test/{id}/\nnovel_type: 2\nlast_update: 2026-01-01T00:00:00Z\n",
+        )).unwrap();
+        narou_rs::db::with_database_mut(|database| database.update_records(|mut records| {
+            records.insert(id, record);
+            Ok((records, ()))
+        })).unwrap();
+    }
+
     #[test]
     fn download_auto_convert_uses_shared_auto_convert_device_resolution() {
         let temp = tempfile::tempdir().unwrap();
@@ -606,6 +625,7 @@ mod tests {
         .unwrap();
         *narou_rs::db::DATABASE.lock() = None;
         narou_rs::db::init_database().unwrap();
+        insert_download_fixture(1);
 
         let result = auto_convert_existing_download(&DownloadResult {
             id: 1,
@@ -644,7 +664,9 @@ mod tests {
         *narou_rs::db::DATABASE.lock() = None;
         narou_rs::db::init_database().unwrap();
 
-        crate::commands::enqueue_web_convert_job(3062).unwrap();
+        insert_download_fixture(3062);
+        let write = narou_rs::native::materialization::capture_write_for_id(3062).unwrap();
+        crate::commands::enqueue_web_convert_job(&write, 3062).unwrap();
 
         let queue = PersistentQueue::new(&temp.path().join(".narou").join("queue.yaml")).unwrap();
         assert_eq!(queue.pending_count(), 1);
@@ -742,7 +764,7 @@ mod tests {
             Some(ExistingDownloadState::Present(_))
         ));
         let kept = novels
-            .get_sync(1i64.into())
+            .get_current_sync(1i64.into())
             .unwrap()
             .expect("DB-only record must not be deleted");
         assert_eq!(kept.id, 1);

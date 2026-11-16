@@ -8,29 +8,11 @@ use zip::write::{SimpleFileOptions, StreamWriter};
 use zip::{CompressionMethod, ZipWriter};
 
 use super::{ArchiveFile, ArchiveManifest, ArchiveNovel, FORMAT_VERSION, MANIFEST_PATH,
-    MAX_ARCHIVE_BYTES, MAX_ENTRIES, MAX_FILE_BYTES, MAX_MANIFEST_BYTES, MAX_NOVELS,
-    MAX_TOTAL_UNCOMPRESSED_BYTES, Result, TransferError};
+    MAX_ENTRIES, MAX_MANIFEST_BYTES, MAX_NOVELS, Result, TransferError};
 use super::archive::{reject_file_directory_conflicts, validate_relative_path};
 
-struct LimitedWriter<W> {
-    inner: W,
-    written: u64,
-}
-
-impl<W: Write> Write for LimitedWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.written.saturating_add(bytes.len() as u64) > MAX_ARCHIVE_BYTES {
-            return Err(std::io::Error::other("転送 ZIP が上限の 512 MiB を超えています"));
-        }
-        let count = self.inner.write(bytes)?;
-        self.written += count as u64;
-        Ok(count)
-    }
-    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
-}
-
 pub struct ArchiveStream<W: Write> {
-    writer: ZipWriter<StreamWriter<LimitedWriter<W>>>,
+    writer: ZipWriter<StreamWriter<W>>,
     manifest: ArchiveManifest,
     paths: HashSet<[u8; 32]>,
     files: usize,
@@ -40,7 +22,7 @@ pub struct ArchiveStream<W: Write> {
 impl<W: Write> ArchiveStream<W> {
     pub fn new(writer: W, app_version: String, exported_at: String) -> Self {
         Self {
-            writer: ZipWriter::new_stream(LimitedWriter { inner: writer, written: 0 }),
+            writer: ZipWriter::new_stream(writer),
             manifest: ArchiveManifest { format_version: FORMAT_VERSION,
                 app_version: Some(app_version), exported_at: Some(exported_at), novels: Vec::new() },
             paths: HashSet::new(), files: 1, uncompressed: 0,
@@ -89,11 +71,9 @@ impl<W: Write> ArchiveStream<W> {
         loop {
             let count = reader.read(&mut buffer).map_err(zip_io)?;
             if count == 0 { break; }
-            size += count as u64;
-            self.uncompressed += count as u64;
-            if size > MAX_FILE_BYTES || self.uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
-                return Err(TransferError::TooLarge(format!("{path}: 展開後サイズが上限を超えています")));
-            }
+            size = size.checked_add(count as u64).ok_or_else(|| TransferError::TooLarge("file size overflow".into()))?;
+            self.uncompressed = self.uncompressed.checked_add(count as u64)
+                .ok_or_else(|| TransferError::TooLarge("uncompressed total overflow".into()))?;
             hash.update(&buffer[..count]);
             self.writer.write_all(&buffer[..count]).map_err(zip_io)?;
         }
@@ -124,8 +104,8 @@ impl<W: Write> ArchiveStream<W> {
         // into the compressor. Even the directory is written to the sink.
         let mut counter = CountingWriter(0);
         serde_json::to_writer(&mut counter, &self.manifest)?;
-        if counter.0 > MAX_MANIFEST_BYTES
-            || self.uncompressed.saturating_add(counter.0) > MAX_TOTAL_UNCOMPRESSED_BYTES {
+        self.uncompressed.checked_add(counter.0).ok_or_else(|| TransferError::TooLarge("uncompressed total overflow".into()))?;
+        if counter.0 > MAX_MANIFEST_BYTES {
             return Err(TransferError::TooLarge("manifest を含む転送データが上限を超えています".into()));
         }
         self.writer.start_file(MANIFEST_PATH, options())?;
@@ -147,7 +127,7 @@ impl Write for CountingWriter {
 }
 
 fn options() -> SimpleFileOptions {
-    SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)
+    SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true)
         .last_modified_time(zip::DateTime::default())
 }
 

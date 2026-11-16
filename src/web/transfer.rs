@@ -1,282 +1,61 @@
-//! `/api/transfer/*` — export and import portable novel archives.
-//!
-//! `GET  /api/transfer/export?ids=1,2` returns `application/zip`.
-//! `POST /api/transfer/import` accepts a raw ZIP body (`Content-Type:
-//! application/zip`) and returns a JSON summary.
-//!
-//! Both endpoints delegate to [`crate::native::transfer`], the same helper the
-//! `narou export` / `narou import` CLI uses, so the two front ends cannot drift
-//! apart. Authentication is the normal native Web middleware (loopback UI token
-//! or Basic auth) — these routes are registered without a bypass.
-
-use axum::Json;
-use axum::body::{Body, Bytes};
+//! Authenticated raw-byte transfer v2. ZIP processing stays in the client.
+use axum::{Router,Json,body::Body,extract::{Request,State},http::{HeaderMap,StatusCode,Method,header},response::{Response,IntoResponse},routing::any};
 use futures::StreamExt;
-use axum::extract::{Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-
-use crate::native::transfer;
-use crate::transfer::{
-    flag_value, import_payload, is_zip_content_type, parse_ids, ConflictPolicy,
-};
-
+use serde::{Serialize,Deserialize,de::DeserializeOwned};
+use crate::application::transfer::*;
+use crate::transfer::protocol::FrameDecoder;
 use super::AppState;
 
-/// Maximum request body accepted by `POST /api/transfer/import`.
-///
-/// The archive core enforces the same cap after decode; raising axum's global
-/// 2 MiB body limit on this route is what lets a real archive arrive at all.
-pub const MAX_TRANSFER_IMPORT_BODY_BYTES: usize = crate::transfer::MAX_ARCHIVE_BYTES as usize;
-
-#[derive(Debug, Deserialize)]
-pub struct ExportParams {
-    /// Comma-separated library ids (`ids=1,2,3`).
-    pub ids: Option<String>,
-    pub progress: Option<String>,
+pub fn routes()->Router<AppState>{
+    Router::new().route("/capabilities",any(handle)).route("/sessions",any(handle))
+        .route("/imports",any(handle)).route("/exports",any(handle))
+        .route("/{direction}/{session}",any(handle)).route("/{direction}/{session}/{*tail}",any(handle))
 }
-
-#[derive(Debug, Deserialize)]
-pub struct ImportParams {
-    /// `true` replaces novels that already exist instead of skipping them.
-    pub overwrite: Option<String>,
-    pub progress: Option<String>,
+#[derive(Deserialize)]struct OperationBody{operation_id:OperationId}
+#[derive(Deserialize)]struct SealBody{operation_id:OperationId,#[serde(with="crate::transfer::protocol::decimal_u64")]size:u64,sha256:String}
+#[derive(Deserialize)]struct PublishBody{operation_id:OperationId,plan_revision:String}
+#[derive(Deserialize)]struct SelectBody{operation_id:OperationId,#[serde(flatten)]selection:SelectionRequest}
+fn secret(headers:&HeaderMap)->Result<Vec<u8>,TransferError>{
+    use base64::Engine;let value=headers.get("x-narou-transfer-secret").and_then(|v|v.to_str().ok()).ok_or(TransferError::SecretMismatch)?;
+    let bytes=if value.len()==64{hex::decode(value).map_err(|_|TransferError::SecretMismatch)?}else{base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value).or_else(|_|base64::engine::general_purpose::STANDARD.decode(value)).map_err(|_|TransferError::SecretMismatch)?};if bytes.len()!=32{return Err(TransferError::SecretMismatch);}Ok(bytes)
 }
-
-/// `GET /api/transfer/export?ids=1,2` — download a ZIP of the selected novels.
-pub async fn export_novels(
-    State(_state): State<AppState>,
-    Query(params): Query<ExportParams>,
-) -> Response {
-    let ids = match parse_ids(params.ids.as_deref()) {
-        Ok(ids) => ids,
-        Err(message) => return export_error(StatusCode::BAD_REQUEST, message),
-    };
-    if flag_value(params.progress.as_deref()) {
-        return progress_response(move |emit, _| transfer::export_archive_stream(&ids, emit));
-    }
-
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(1);
-    tokio::task::spawn_blocking(move || {
-        struct Sink(tokio::sync::mpsc::Sender<std::io::Result<Bytes>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                for chunk in bytes.chunks(64 * 1024) {
-                    self.0.blocking_send(Ok(Bytes::copy_from_slice(chunk)))
-                        .map_err(|_| std::io::Error::other("transfer cancelled"))?;
-                }
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+fn control(headers:&HeaderMap,id:OperationId)->Result<ControlOp,TransferError>{
+    let value=headers.get(header::IF_MATCH).and_then(|v|v.to_str().ok()).ok_or(TransferError::PreconditionRequired)?;if value.len()<3||!value.starts_with('\"')||!value.ends_with('\"'){return Err(TransferError::invalid("invalid_etag","If-Match must be a quoted session revision"));}
+    Ok(ControlOp{operation_id:id,if_match_revision:value[1..value.len()-1].parse().map_err(|_|TransferError::invalid("invalid_etag","invalid revision"))?})
+}
+async fn json_body<T:DeserializeOwned>(headers:&HeaderMap,body:Body)->Result<T,TransferError>{
+    if headers.get(header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).and_then(|v|v.split(';').next())!=Some("application/json"){return Err(TransferError::invalid("invalid_content_type","control requests require application/json"));}
+    let bytes=axum::body::to_bytes(body,MAX_CONTROL_BODY_BYTES).await.map_err(|_|TransferError::ExceedsLimit{code:"control_body_too_large",message:"control body exceeds256KiB".into()})?;serde_json::from_slice(&bytes).map_err(|e|TransferError::invalid("invalid_json",e.to_string()))
+}
+fn json<T:Serialize>(value:T)->Result<Response,TransferError>{let value=serde_json::to_value(value).map_err(TransferError::platform)?;let revision=value.get("revision").and_then(|v|v.as_str()).map(str::to_owned);let mut r=Json(value).into_response();if let Some(revision)=revision{r.headers_mut().insert(header::ETAG,format!("\"{revision}\"").parse().map_err(TransferError::platform)?);}Ok(r)}
+fn binary(chunk:BinaryChunk,manifest:bool)->Result<Response,TransferError>{let mut r=Body::from(chunk.bytes).into_response();r.headers_mut().insert(header::CONTENT_TYPE,header::HeaderValue::from_static("application/octet-stream"));r.headers_mut().insert(header::ETAG,format!("\"{}\"",chunk.sha256).parse().map_err(TransferError::platform)?);r.headers_mut().insert("x-transfer-last",header::HeaderValue::from_static(if chunk.last{"true"}else{"false"}));if manifest{r.headers_mut().insert("x-transfer-manifest-bytes",chunk.total_bytes.to_string().parse().map_err(TransferError::platform)?);}Ok(r)}
+async fn handle(State(_):State<AppState>,request:Request)->Response{
+    let context={let uri=request.extensions().get::<axum::extract::OriginalUri>().map(|uri|&uri.0).unwrap_or(request.uri());let parts=uri.path().trim_matches('/').split('/').collect::<Vec<_>>();if parts.len()>=5&&parts[..3]==["api","transfer","v2"]&&matches!(parts[3],"imports"|"exports"|"sessions"){secret(request.headers()).ok().map(|secret|(SessionId(parts[4].into()),secret))}else{None}};
+    let mut response=match dispatch(request).await{Ok(response)=>response,Err(error)=>{let current=if let Some((id,secret))=context{match(crate::native::transfer::v2_service(),crate::native::transfer::v2::native_scope()){(Ok(service),Ok(scope))=>service.session(&scope,&id,Some(&secret)).await.ok(),_=>None}}else{None};error_response(&error,current.as_ref())}};
+    response.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store, no-transform"));response.headers_mut().insert("x-content-type-options",header::HeaderValue::from_static("nosniff"));response
+}
+fn index(s:&str)->Result<u32,TransferError>{s.parse().map_err(|_|TransferError::invalid("invalid_index","index must be unsigned32bit"))}
+async fn dispatch(request:Request)->Result<Response,TransferError>{
+    let(parts,body)=request.into_parts();let uri=parts.extensions.get::<axum::extract::OriginalUri>().map(|u|u.0.clone()).unwrap_or(parts.uri);let path=uri.path().strip_prefix("/api/transfer/v2").ok_or_else(||TransferError::invalid("invalid_route","unknown transfer route"))?;let segments=path.trim_matches('/').split('/').collect::<Vec<_>>();let method=parts.method;let headers=parts.headers;if headers.contains_key(header::CONTENT_ENCODING){return Err(TransferError::invalid("content_encoding_forbidden","transfer bytes must not have Content-Encoding"));}
+    let service=crate::native::transfer::v2_service()?;let scope=crate::native::transfer::v2::native_scope()?;let query=url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).into_owned().collect::<std::collections::HashMap<_,_>>();let cursor=query.get("cursor").map(String::as_str);
+    if method==Method::GET&&segments==["capabilities"]{return json(service.capabilities(&scope).await?);}if method==Method::GET&&segments==["sessions"]{return json(service.list_sessions(&scope,cursor).await?);}
+    if method==Method::POST&&segments.len()==1{let secret=secret(&headers)?;return match segments[0]{"imports"=>{let r=json_body(&headers,body).await?;json(service.create_import(&scope,&r,&secret).await?)},"exports"=>{let r=json_body(&headers,body).await?;json(service.create_export(&scope,&r,&secret).await?)},_=>Err(TransferError::invalid("invalid_route","unknown direction"))};}
+    if segments.len()<2||!matches!(segments[0],"imports"|"exports"|"sessions"){return Err(TransferError::SessionNotFound);}let id=SessionId(segments[1].into());let admin=segments[0]=="sessions"&&method==Method::DELETE;let secret=if admin{None}else{Some(secret(&headers)?)};let status=service.session(&scope,&id,secret.as_deref()).await?;if !admin&&((segments[0]=="imports")!=(status.direction==TransferDirection::Import)){return Err(TransferError::SessionNotFound);}
+    if method==Method::GET{match &segments[2..]{[]=>return json(status),["files"]=>return json(service.files(&scope,&id,secret.as_deref().unwrap(),cursor).await?),["plan"]=>return json(service.plan(&scope,&id,secret.as_deref().unwrap(),cursor).await?),["catalog"]=>return json(service.catalog(&scope,&id,secret.as_deref().unwrap(),cursor).await?),["manifest","chunks",n]=>return binary(service.export_manifest(&scope,&id,secret.as_deref().unwrap(),index(n)?).await?,true),["files",f,"chunks",n]=>return binary(service.export_file_chunk(&scope,&id,secret.as_deref().unwrap(),index(f)?,index(n)?).await?,false),["batches",n]=>{let b=service.export_batch(&scope,&id,secret.as_deref().unwrap(),index(n)?).await?;let mut r=Body::from(b.body).into_response();r.headers_mut().insert(header::CONTENT_TYPE,header::HeaderValue::from_static("application/octet-stream"));r.headers_mut().insert("x-transfer-record-count",b.record_count.to_string().parse().map_err(TransferError::platform)?);r.headers_mut().insert("x-transfer-body-bytes",b.body_bytes.to_string().parse().map_err(TransferError::platform)?);r.headers_mut().insert("x-transfer-last",header::HeaderValue::from_static(if b.last{"true"}else{"false"}));return Ok(r);},_=>return Err(TransferError::invalid("invalid_route","unknown read"))}}
+    if method==Method::PUT{let manifest=match &segments[2..]{["manifest","chunks",n]=>Some(index(n)?),["chunks"]=>None,_=>return Err(TransferError::invalid("invalid_route","unknown upload route"))};return upload(&service,&scope,&id,secret.as_deref().unwrap(),&headers,body,manifest).await;}
+    if method==Method::DELETE{let r:OperationBody=json_body(&headers,body).await?;return json(service.delete_session(&scope,&id,secret.as_deref(),&control(&headers,r.operation_id)?).await?);}if method!=Method::POST{return Err(TransferError::invalid("invalid_method","unsupported transfer method"));}let secret=secret.as_deref().unwrap();match &segments[2..]{
+        ["manifest","seal"]=>{let r:SealBody=json_body(&headers,body).await?;json(service.seal_manifest(&scope,&id,secret,&control(&headers,r.operation_id)?,r.size,&r.sha256).await?)},["select"]=>{let r:SelectBody=json_body(&headers,body).await?;json(service.select(&scope,&id,secret,&control(&headers,r.operation_id)?,&r.selection).await?)},["publish"]=>{let r:PublishBody=json_body(&headers,body).await?;json(service.publish(&scope,&id,secret,&control(&headers,r.operation_id)?,&r.plan_revision).await?)},["advance"]=>{let r:OperationBody=json_body(&headers,body).await?;json(service.advance(&scope,&id,secret,&r.operation_id).await?)},[action]=>{let r:OperationBody=json_body(&headers,body).await?;let op=control(&headers,r.operation_id)?;match *action{"ready"=>json(service.ready(&scope,&id,secret,&op).await?),"pause"=>json(service.pause(&scope,&id,secret,&op).await?),"resume"=>json(service.resume(&scope,&id,secret,&op).await?),"complete"=>json(service.complete(&scope,&id,secret,&op).await?),_=>Err(TransferError::invalid("invalid_route","unknown control"))}},_=>Err(TransferError::invalid("invalid_route","unknown action"))}
+}
+async fn upload(service:&TransferService,scope:&AuthScope,id:&SessionId,secret:&[u8],headers:&HeaderMap,body:Body,manifest:Option<u32>)->Result<Response,TransferError>{
+    if headers.get(header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).and_then(|s|s.split(';').next())!=Some("application/octet-stream"){return Err(TransferError::invalid("invalid_content_type","binary records require application/octet-stream"));}let count=headers.get("x-transfer-record-count").and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<usize>().ok()).filter(|v|*v>0&&*v<=MAX_BATCH_RECORDS).ok_or_else(||TransferError::invalid("invalid_batch_count","missing or invalid count"))?;let declared=headers.get("x-transfer-body-bytes").and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<u64>().ok()).filter(|v|*v<=MAX_BINARY_BODY_BYTES as u64).ok_or_else(||TransferError::ExceedsLimit{code:"transfer_chunk_too_large",message:"binary wire body exceeds8MiB or lacks declared length".into()})?;if manifest.is_some()&&count!=1{return Err(TransferError::invalid("invalid_batch_count","manifest route requires one record"));}
+    let mut decoder=FrameDecoder::new();let mut stream=body.into_data_stream();let mut received=0usize;let mut result=BatchResult{receipts:Vec::new(),failure:None,status:service.session(scope,id,Some(secret)).await?};
+    while let Some(bytes)=stream.next().await{let bytes=bytes.map_err(|error|TransferError::invalid("truncated_batch",error.to_string()))?;for part in bytes.chunks(64*1024){received=received.checked_add(part.len()).filter(|size|*size<=MAX_BINARY_BODY_BYTES).ok_or_else(||TransferError::ExceedsLimit{code:"transfer_chunk_too_large",message:"actual binary wire body exceeds8MiB".into()})?;if received as u64>declared{return Err(TransferError::invalid("batch_length_mismatch","actual binary body exceeds its declared length"));}
+        for frame in decoder.feed(part).map_err(|error|TransferError::invalid("invalid_batch",error.to_string()))?{if result.receipts.len()>=count{return Err(TransferError::invalid("batch_length_mismatch","actual record count exceeds declaration"));}if let Some(index)=manifest{if frame.header.file_id!=MANIFEST_FILE_ID||frame.header.chunk_index!=index{return Err(TransferError::invalid("manifest_chunk_mismatch","record identity differs from route"));}}
+            let record=BatchRecord{file_id:frame.header.file_id,chunk_index:frame.header.chunk_index,payload:frame.payload,sha256:frame.header.sha256.as_deref().and_then(sha256_from_hex),is_final:frame.header.is_final};let next=if manifest.is_some(){service.put_manifest(scope,id,secret,vec![record]).await?}else{service.put_records(scope,id,secret,vec![record]).await?};result.receipts.extend(next.receipts);result.failure=next.failure;result.status=next.status;if result.failure.is_some(){return json(result);}
         }
-        let mut sink = std::io::BufWriter::with_capacity(64 * 1024, Sink(sender.clone()));
-        let result = transfer::export_archive_to(&ids, &mut sink)
-            .and_then(|_| std::io::Write::flush(&mut sink).map_err(Into::into));
-        if let Err(error) = result { let _ = sender.blocking_send(Err(std::io::Error::other(error.to_string()))); }
-    });
-    // The encoder resolves every requested ID before writing. Preserve the
-    // ordinary JSON error response if preflight fails before the first chunk.
-    let first = match receiver.recv().await {
-        Some(Ok(bytes)) => bytes,
-        Some(Err(error)) => return export_error(StatusCode::BAD_REQUEST, error.to_string()),
-        None => return export_error(StatusCode::INTERNAL_SERVER_ERROR, "export ended before producing a ZIP".into()),
-    };
-    let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(first) })
-        .chain(futures::stream::unfold(receiver, |mut receiver| async {
-            receiver.recv().await.map(|chunk| (chunk, receiver))
-        }));
-
-    let filename = format!(
-        "narou-export-{}.zip",
-        chrono::Local::now().format("%Y%m%d%H%M%S")
-    );
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/zip"),
-    );
-    match HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
-        Ok(value) => {
-            headers.insert(header::CONTENT_DISPOSITION, value);
-        }
-        Err(error) => {
-            return export_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid Content-Disposition: {error}"),
-            );
-        }
-    }
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    (headers, Body::from_stream(stream)).into_response()
+    }}decoder.finish().map_err(|error|TransferError::invalid("truncated_batch",error.to_string()))?;if decoder.records_seen()!=count||decoder.bytes_seen()!=declared{return Err(TransferError::invalid("batch_length_mismatch","actual batch count/bytes differ from headers"));}json(result)
 }
-
-/// `POST /api/transfer/import[?overwrite=true]` — import a raw ZIP body.
-pub async fn import_archive(
-    State(_state): State<AppState>,
-    Query(params): Query<ImportParams>,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    if !request_is_zip(&headers) {
-        return import_error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Content-Type は application/zip を指定してください".to_string(),
-        );
-    }
-    // Receive into a private file under OS backpressure. TempPath removes the
-    // upload if the request is cancelled, including during validation.
-    let temp = match tempfile::NamedTempFile::new() {
-        Ok(temp) => temp,
-        Err(error) => return import_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-    };
-    let (file, path) = temp.into_parts();
-    let mut file = tokio::fs::File::from_std(file);
-    let mut body = body.into_data_stream();
-    let mut size = 0usize;
-    while let Some(chunk) = body.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => return import_error(StatusCode::BAD_REQUEST, error.to_string()),
-        };
-        size = match size.checked_add(chunk.len()).filter(|size| *size <= MAX_TRANSFER_IMPORT_BODY_BYTES) {
-            Some(size) => size,
-            None => return import_error(StatusCode::PAYLOAD_TOO_LARGE, "アーカイブが大きすぎます".into()),
-        };
-        if let Err(error) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
-            return import_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-        }
-    }
-    if size == 0 { return import_error(StatusCode::BAD_REQUEST, "空のリクエストです".into()); }
-    if let Err(error) = file.sync_all().await {
-        return import_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-    }
-    drop(file);
-    let policy = conflict_policy(flag_value(params.overwrite.as_deref()));
-    if flag_value(params.progress.as_deref()) {
-        return progress_response(move |emit, cancelled| {
-            emit(serde_json::json!({"type":"progress","phase":"validate","completed":0,"total":0}))?;
-            let mut progress = |completed, total, title: &str| {
-                emit(serde_json::json!({"type":"progress","phase":"import",
-                    "completed":completed,"total":total,"title":title}))
-            };
-            let outcome = transfer::import_archive_reader(std::fs::File::open(&path)?, policy, Some(&mut progress), Some(cancelled))?;
-            emit(serde_json::json!({"type":"complete","result":import_payload(
-                outcome.success(), outcome.created, outcome.overwritten, outcome.skipped, outcome.errors,
-            )}))
-        });
-    }
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
-    match tokio::task::spawn_blocking(move || transfer::import_archive_reader(std::fs::File::open(&path)?, policy, None, Some(cancelled))).await
-    {
-        Ok(Ok(outcome)) => Json(import_payload(
-            outcome.success(),
-            outcome.created,
-            outcome.overwritten,
-            outcome.skipped,
-            outcome.errors,
-        ))
-        .into_response(),
-        Ok(Err(error)) => import_error(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
-        Err(error) => import_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("import task failed: {error}"),
-        )
-        .into_response(),
-    }
-}
-
-type ProgressEmitter<'a> = dyn FnMut(serde_json::Value) -> crate::error::Result<()> + 'a;
-
-fn progress_response(
-    task: impl FnOnce(&mut ProgressEmitter<'_>, Arc<AtomicBool>) -> crate::error::Result<()> + Send + 'static,
-) -> Response {
-    let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(1);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let guard = CancelOnDrop(cancelled.clone());
-    tokio::task::spawn_blocking(move || {
-        let mut emit = |value: serde_json::Value| -> crate::error::Result<()> {
-            let mut bytes = serde_json::to_vec(&value).map_err(|error| {
-                crate::error::NarouError::Platform(format!("転送応答を作成できません: {error}"))
-            })?;
-            bytes.push(b'\n');
-            sender.blocking_send(Bytes::from(bytes)).map_err(|_| {
-                crate::error::NarouError::Platform("転送の接続が閉じられました".into())
-            })
-        };
-        if let Err(error) = task(&mut emit, cancelled) {
-            let _ = emit(serde_json::json!({"type":"error","message":error.to_string()}));
-        }
-    });
-    let stream = futures::stream::unfold((receiver, guard), |(mut receiver, guard)| async {
-        receiver.recv().await.map(|bytes| (Ok::<_, std::convert::Infallible>(bytes), (receiver, guard)))
-    });
-    (
-        [(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-store")],
-        axum::body::Body::from_stream(stream),
-    ).into_response()
-}
-
-struct CancelOnDrop(Arc<AtomicBool>);
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); }
-}
-
-fn conflict_policy(overwrite: bool) -> ConflictPolicy {
-    if overwrite {
-        ConflictPolicy::Overwrite
-    } else {
-        ConflictPolicy::Skip
-    }
-}
-
-/// リクエストの `Content-Type` が ZIP として受け付けるメディア型か。
-fn request_is_zip(headers: &HeaderMap) -> bool {
-    let Some(value) = headers.get(header::CONTENT_TYPE) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    is_zip_content_type(value)
-}
-
-fn import_error(status: StatusCode, message: String) -> Response {
-    (status, Json(import_payload(false, 0, 0, 0, vec![message]))).into_response()
-}
-
-fn export_error(status: StatusCode, message: String) -> Response {
-    (
-        status,
-        Json(serde_json::json!({ "success": false, "message": message })),
-    )
-        .into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// リクエストの `Content-Type` 判定は共有の規則を使う。
-    #[test]
-    fn transfer_archive_import_requires_a_zip_media_type() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/zip"),
-        );
-        assert!(request_is_zip(&headers));
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        assert!(!request_is_zip(&headers));
-
-        assert!(!request_is_zip(&HeaderMap::new()));
-    }
+fn error_response(error:&TransferError,current:Option<&SessionStatus>)->Response{
+    let status=match error{TransferError::SessionNotFound=>StatusCode::NOT_FOUND,TransferError::SecretMismatch=>StatusCode::FORBIDDEN,TransferError::SessionExpired{..}=>StatusCode::GONE,TransferError::RevisionMismatch{..}=>StatusCode::PRECONDITION_FAILED,TransferError::PreconditionRequired=>StatusCode::PRECONDITION_REQUIRED,TransferError::ExceedsLimit{..}=>StatusCode::PAYLOAD_TOO_LARGE,TransferError::TooManySessions{..}=>StatusCode::TOO_MANY_REQUESTS,TransferError::InsufficientStorage{..}=>StatusCode::INSUFFICIENT_STORAGE,TransferError::Busy{..}=>StatusCode::LOCKED,TransferError::RecoveryRequired{..}|TransferError::Platform{..}=>StatusCode::SERVICE_UNAVAILABLE,TransferError::IdempotencyConflict|TransferError::OperationConflict|TransferError::ChunkConflict{..}|TransferError::PlanStale{..}|TransferError::SelectionMismatch{..}|TransferError::InvalidState{..}=>StatusCode::CONFLICT,TransferError::InvalidRequest{code:"request_expired",..}=>StatusCode::GONE,_=>StatusCode::BAD_REQUEST};
+    let mut response=(status,Json(serde_json::json!({"error":{"code":error.code(),"message":error.message(),"retryable":error.retryable(),"session_id":current.map(|status|&status.session_id),"revision":current.map(|status|status.revision.to_string())}}))).into_response();if error.retryable(){response.headers_mut().insert(header::RETRY_AFTER,header::HeaderValue::from_static("1"));}response
 }

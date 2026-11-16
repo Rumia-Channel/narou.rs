@@ -44,6 +44,20 @@ pub fn is_staging_key(key: &ObjectKey) -> bool {
     key.as_ref().starts_with(STAGING_PREFIX)
 }
 
+/// Transfer-owned payloads and ledgers live in their own namespace so the
+/// `.narou-staging/` inactivity TTL collector can never reap them.
+/// Reclamation is owner-based: only [`super::transfer_stage`] compares owner
+/// leases and epochs.
+pub fn is_transfer_key(key: &ObjectKey) -> bool {
+    key.as_ref().starts_with(super::transfer_stage::TRANSFER_PREFIX)
+}
+
+/// Keys whose durability is owned by an explicit lease/journal rather than
+/// by the canonical library namespace (staging and transfer objects).
+pub fn is_reserved_key(key: &ObjectKey) -> bool {
+    is_staging_key(key) || is_transfer_key(key)
+}
+
 pub fn new_staging_key() -> Result<ObjectKey> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);

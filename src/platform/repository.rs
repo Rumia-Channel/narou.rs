@@ -44,21 +44,28 @@ impl From<NovelId> for i64 {
     }
 }
 
+/// Opaque native ownership resource, retained by every in-flight writer clone.
+/// The portable layer never needs to know whether it is an OS lock handle.
+#[doc(hidden)]
+pub trait ReservationLiveness: std::fmt::Debug + Send + Sync {}
+impl<T: std::fmt::Debug + Send + Sync> ReservationLiveness for T {}
+
 /// An owned, generation-fenced reservation for an unpublished novel ID.
 ///
 /// Publish a record with this ID, or return the reservation through
 /// [`NovelRepository::release_id`]. The generation prevents a delayed release
 /// from freeing the same numeric ID after another download has reserved it.
-#[derive(Debug, PartialEq, Eq)]
 #[must_use = "Publish the reserved record or release the unused ID reservation"]
 pub struct NovelIdReservation {
     id: NovelId,
     generation: i64,
+    liveness: Option<std::sync::Arc<dyn ReservationLiveness>>,
+    job_owner: Option<std::sync::Arc<super::JobExecutionOwner>>,
 }
 
 impl NovelIdReservation {
     pub fn new(id: NovelId, generation: i64) -> Self {
-        Self { id, generation }
+        Self { id, generation, liveness: None, job_owner: None }
     }
 
     pub fn id(&self) -> NovelId {
@@ -68,7 +75,63 @@ impl NovelIdReservation {
     pub fn generation(&self) -> i64 {
         self.generation
     }
+
+    #[cfg(any(feature = "native-runtime", test))]
+    pub(crate) fn with_liveness<T: ReservationLiveness + 'static>(
+        mut self, resource: std::sync::Arc<T>,
+    ) -> Self {
+        self.liveness = Some(resource);
+        self
+    }
+
+    pub(crate) fn liveness(&self) -> Option<std::sync::Arc<dyn ReservationLiveness>> {
+        self.liveness.clone()
+    }
+
+    #[cfg(feature = "native-runtime")]
+    pub(crate) fn has_liveness(&self) -> bool {
+        self.liveness.is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn with_job_owner(
+        mut self, owner: std::sync::Arc<super::JobExecutionOwner>,
+    ) -> crate::error::Result<Self> {
+        if let Some(current) = &self.job_owner {
+            if current.as_ref() != owner.as_ref() {
+                return Err(crate::error::NarouError::Platform("job_owner_changed: reservation belongs to another execution".into()));
+            }
+        } else {
+            self.job_owner = Some(owner);
+        }
+        Ok(self)
+    }
+
+    #[doc(hidden)]
+    pub fn job_owner(&self) -> Option<&std::sync::Arc<super::JobExecutionOwner>> {
+        self.job_owner.as_ref()
+    }
+
+    /// Consume ownership only after the authoritative record commit succeeds.
+    pub fn adopt(self) {
+        drop(self.liveness);
+    }
 }
+
+impl std::fmt::Debug for NovelIdReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("NovelIdReservation")
+            .field("id", &self.id).field("generation", &self.generation).finish()
+    }
+}
+
+impl PartialEq for NovelIdReservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.generation == other.generation
+    }
+}
+
+impl Eq for NovelIdReservation {}
 
 /// Which field a [`SearchTerm`] matches against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -319,6 +382,27 @@ pub enum NovelMutation {
 /// implementation detail; the D1 backend must paginate/filter at the SQL
 /// level and never `SELECT` the whole table.
 pub trait NovelRepository: PlatformService {
+    fn resume_id(&self,id:NovelId,generation:i64)->PlatformFuture<'_,crate::error::Result<NovelIdReservation>>{let _=(id,generation);Box::pin(async{Err(crate::error::NarouError::Platform("exact numeric reservation resume unsupported".into()))})}
+    fn allocate_id_for_job<'a>(&'a self,owner:&'a std::sync::Arc<super::JobExecutionOwner>)->PlatformFuture<'a,crate::error::Result<NovelIdReservation>>{let _=owner;Box::pin(async{Err(crate::error::NarouError::Platform("job-owned numeric allocation unsupported".into()))})}
+    fn resume_id_for_job<'a>(&'a self,owner:&'a std::sync::Arc<super::JobExecutionOwner>,id:NovelId,generation:i64)->PlatformFuture<'a,crate::error::Result<NovelIdReservation>>{let _=(owner,id,generation);Box::pin(async{Err(crate::error::NarouError::Platform("job-owned numeric resume unsupported".into()))})}
+    fn reserve_create<'a>(&'a self,fence:&'a super::WriteFence,reservation:&'a NovelIdReservation,toc_url:&'a str)->PlatformFuture<'a,crate::error::Result<()>>{let _=(fence,reservation,toc_url);Box::pin(async{Err(crate::error::NarouError::Platform("atomic creation identity reservation unsupported".into()))})}
+    fn apply_create_guarded<'a>(&'a self,fence:&'a super::WriteFence,reservation:&'a NovelIdReservation,record:NovelRecord)->PlatformFuture<'a,crate::error::Result<()>>{let _=(fence,reservation,record);Box::pin(async{Err(crate::error::NarouError::Platform("reserved creation commit unsupported".into()))})}
+    fn apply_batch_guarded<'a>(&'a self,fence:&'a super::WriteFence,mutations:Vec<NovelMutation>)->PlatformFuture<'a,crate::error::Result<()>>{
+        self.apply_batch_guarded_many(std::slice::from_ref(fence),mutations)
+    }
+    fn apply_batch_guarded_many<'a>(&'a self,fences:&'a [super::WriteFence],mutations:Vec<NovelMutation>)->PlatformFuture<'a,crate::error::Result<()>>{
+        let _=(fences,mutations);Box::pin(async{Err(crate::error::NarouError::Platform("epoch-guarded record commits unsupported".into()))})
+    }
+    fn remove_closed<'a>(&'a self,prefix:&'a super::ObjectPrefix,owner:&'a str,epoch:u64,id:NovelId)->PlatformFuture<'a,crate::error::Result<()>>{let _=(prefix,owner,epoch,id);Box::pin(async{Err(crate::error::NarouError::Platform("closed-owner record removal unsupported".into()))})}
+    /// Authoritative metadata, never an isolate/process planning cache.
+    fn get_current<'a>(&'a self,id:NovelId)->PlatformFuture<'a,crate::error::Result<Option<NovelRecord>>>{Box::pin(async move{let mut rows=self.get_many_current(std::slice::from_ref(&id)).await?;if rows.len()!=1{return Err(crate::error::NarouError::Platform("unaligned authoritative record result".into()));}Ok(rows.pop().flatten())})}
+    /// One current metadata snapshot, aligned with requested IDs (including
+    /// missing and repeated IDs). Native YAML decodes the map once per batch.
+    fn get_many_current<'a>(&'a self,ids:&'a [NovelId])->PlatformFuture<'a,crate::error::Result<Vec<Option<NovelRecord>>>>{let _=ids;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative batch metadata reads unsupported".into()))})}
+    fn query_current<'a>(&'a self,query:&'a NovelQuery)->PlatformFuture<'a,crate::error::Result<Vec<NovelRecord>>>{let _=query;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative metadata query unsupported".into()))})}
+    fn find_by_toc_url_current<'a>(&'a self,url:&'a str)->PlatformFuture<'a,crate::error::Result<Option<NovelRecord>>>{let _=url;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative URL lookup unsupported".into()))})}
+    fn find_by_storage_prefix_current<'a>(&'a self,prefix:&'a super::ObjectKey)->PlatformFuture<'a,crate::error::Result<Option<NovelRecord>>>{let _=prefix;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative storage-prefix lookup unsupported".into()))})}
+
     fn get<'a>(
         &'a self,
         id: NovelId,
@@ -389,6 +473,13 @@ pub trait NovelRepository: PlatformService {
         &'a self,
         mutations: Vec<NovelMutation>,
     ) -> PlatformFuture<'a, crate::error::Result<()>>;
+}
+
+/// Move unique rows into input order; only repeated IDs clone their record.
+pub fn align_current_records(ids:&[NovelId],records:impl IntoIterator<Item=NovelRecord>)->Vec<Option<NovelRecord>>{
+    let mut by_id=records.into_iter().map(|record|(record.id,(record,0usize))).collect::<std::collections::HashMap<_,_>>();
+    for id in ids{if let Some((_,remaining))=by_id.get_mut(&id.0){*remaining+=1;}}
+    ids.iter().map(|id|{let(_,remaining)=by_id.get_mut(&id.0)?;*remaining-=1;if *remaining==0{by_id.remove(&id.0).map(|(record,_)|record)}else{by_id.get(&id.0).map(|(record,_)|record.clone())}}).collect()
 }
 
 /// Synchronous counterpart of [`NovelRepository`] for native CLI resolution

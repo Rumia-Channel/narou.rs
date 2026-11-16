@@ -62,6 +62,9 @@ use crate::d1_repository::D1SettingsStore;
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
+    if worker_role::is_reader(&env)? && (path=="/api/transfer/v2"||path.starts_with("/api/transfer/v2/")) {
+        return transfer::handle(req,env).await;
+    }
     if worker_role::is_reader(&env)? && !worker_role::owns_request(&path, req.method()) {
         return env.service(composition::WRITER_SERVICE_BINDING)?.fetch_request(req).await;
     }
@@ -150,6 +153,9 @@ fn head_response(response: Response) -> Result<Response> {
 }
 
 async fn route(req: Request, env: Env, path: String) -> Result<Response> {
+    if path == "/api/transfer/v2" || path.starts_with("/api/transfer/v2/") {
+        return transfer::handle(req, env).await;
+    }
     // 外部公開 API (`/api/v1`)。認証は Cloudflare Access / Bearer トークン。
     if path == "/api/v1" || path.starts_with("/api/v1/") {
         return webui::external::handle(req, env).await;
@@ -224,8 +230,6 @@ async fn route(req: Request, env: Env, path: String) -> Result<Response> {
         // 登録経路 (native `src/web/mod.rs` と同じルート構成)。
         "/api/jobs" => api_jobs(req, env).await,
         "/api/authors" | "/api/authors/check" => authors::handle(req, env).await,
-        // 可搬アーカイブ (native `src/web/transfer.rs` の `/api/transfer/*`)。
-        "/api/transfer/export" | "/api/transfer/import" => transfer::handle(req, env).await,
         "/api/hidden" => hidden::handle(req, env).await,
         "/api/favorite_tags" => favorite_tags::handle(req, env).await,
         "/api/virtual_novels" => virtual_novels::handle(req, env).await,
@@ -348,9 +352,12 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
     let search = query_param(&url, "q");
     let start = query_param(&url, "start").and_then(|value| value.parse().ok()).unwrap_or(0);
     let length = query_param(&url, "limit").and_then(|value| value.parse().ok()).or(Some(100));
+    let attributes_enabled=narou_rs::application::attribute_tags::enabled(&services.settings).await;
+    let mut scope=services.content.read_scope("worker-api-novels");
+    let result=async {
     let page = services
         .library
-        .list(&narou_rs::application::LibraryListRequest {
+        .list(&mut scope, &narou_rs::application::LibraryListRequest {
             search,
             start,
             length,
@@ -359,10 +366,22 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
             hidden: None,
             include_hidden: true,
             exclude_ids: Vec::new(),
-            attribute_tags_enabled: narou_rs::application::attribute_tags::enabled(&services.settings).await,
+            attribute_tags_enabled: attributes_enabled,
         })
-        .await
-        .map_err(|error| Error::RustError(error.to_string()))?;
+        .await;
+    let page=match page{Ok(page)=>page,Err(error)=>return webui::application_error_response(&error)};
+    for row in &page.data{
+        let live=match services.content.read_record(&mut scope,narou_rs::platform::NovelId(row.id)).await{
+            Ok(Some(record))=>record,
+            Ok(None)=>return webui::json_error(409,"metadata_changed",Some("novel list changed while admitting its read scope")),
+            Err(error)=>return webui::application_error_response(&error),
+        };
+        let mut tags=live.tags.iter().filter(|tag|!narou_rs::virtual_novel::is_internal_tag(tag)).cloned().collect::<Vec<_>>();
+        if attributes_enabled{if let Some(attribute)=live.attribute_tag(){tags.push(attribute.to_string());}}
+        if row.title!=live.title||row.author!=live.author||row.sitename!=live.sitename||row.novel_type!=live.novel_type||row.end!=live.end||row.last_update!=live.last_update||row.general_lastup!=live.general_lastup||row.last_check_date!=live.last_check_date||row.new_arrivals_date!=live.new_arrivals_date||row.tags!=tags||row.suspend!=live.suspend||row.length!=live.length||row.toc_url!=live.toc_url||row.general_all_no!=live.general_all_no{
+            return webui::json_error(409,"metadata_changed",Some("novel list metadata changed during read admission"));
+        }
+    }
     let data = page
         .data
         .into_iter()
@@ -393,6 +412,8 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
         "records_filtered": page.records_filtered,
         "data": data,
     }))
+    }.await;
+    webui::leased_response(result,scope).await
 }
 
 /// GET /api/novels/count — native `src/web/novels.rs::novels_count`。
@@ -556,16 +577,16 @@ async fn api_novel_get(_req: Request, env: Env, id: i64) -> Result<Response> {
         Ok(services) => services,
         Err(_) => return Response::error("Service unavailable", 503),
     };
-    let record = services
-        .library
-        .get(narou_rs::platform::NovelId(id))
-        .await
-        .map_err(|error| Error::RustError(error.to_string()))?;
-    let Some(record) = record else {
-        return Response::error("Not Found", 404);
-    };
-    let value = serde_json::to_value(record).map_err(|error| Error::RustError(error.to_string()))?;
-    Response::from_json(&value)
+    let mut scope=services.content.read_scope("worker-api-novel");
+    let result=async{
+        let record=match services.content.read_record(&mut scope,narou_rs::platform::NovelId(id)).await{
+            Ok(Some(record))=>record,
+            Ok(None)=>return Response::error("Not Found",404),
+            Err(error)=>return webui::application_error_response(&error),
+        };
+        Response::from_json(&record)
+    }.await;
+    webui::leased_response(result,scope).await
 }
 
 /// GET /api/novels/:id/download.epub — prepare immutable text/image snapshots,
@@ -670,25 +691,18 @@ pub(crate) async fn load_local_settings_map(env: &Env) -> HashMap<String, serde_
 /// `<prefix>/.illustration_cache.yaml` (取得元 URL → ファイル名) を読む。
 /// 未保存・破損は `None` (詳細は debug ログ)。
 async fn load_illustration_index(
-    objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
+    lease: &mut narou_rs::application::novel_access::NovelReadLease,
     keys: &narou_rs::platform::NovelObjectKeys,
-) -> Option<narou_rs::illustration_store::IllustrationIndex> {
-    let bytes = match objects.read_small(&keys.illustration_cache()).await {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
-            narou_rs::application::debug::emit_async("EPUB: 挿絵索引 (.illustration_cache.yaml) がありません").await;
-            return None;
-        }
-        Err(error) => {
-            narou_rs::application::debug::emit_error_async(format!("挿絵索引を読めません: {error}")).await;
-            return None;
-        }
+) -> narou_rs::error::Result<Option<narou_rs::illustration_store::IllustrationIndex>> {
+    let Some(bytes)=lease.read_small(&keys.illustration_cache()).await? else {
+        narou_rs::application::debug::emit_async("EPUB: 挿絵索引 (.illustration_cache.yaml) がありません").await;
+        return Ok(None);
     };
     match serde_yaml::from_slice(&bytes) {
-        Ok(index) => Some(index),
-        Err(error) => {
+        Ok(index)=>Ok(Some(index)),
+        Err(error)=>{
             narou_rs::application::debug::emit_error_async(format!("挿絵索引を解釈できません: {error}")).await;
-            None
+            Ok(None)
         }
     }
 }
@@ -721,12 +735,12 @@ async fn load_global_settings_map(env: &Env) -> HashMap<String, serde_yaml::Valu
 /// 組む。native の `NovelSettings::load_for_novel` と同じ規則
 /// (`default.*` / `force.*` の適用込み) を、ObjectStore + D1 の入力で行う。
 async fn load_novel_settings(
-    objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
+    lease: &mut narou_rs::application::novel_access::NovelReadLease,
     record: &narou_rs::db::NovelRecord,
     keys: &narou_rs::platform::NovelObjectKeys,
     local_map: &HashMap<String, serde_yaml::Value>,
 ) -> narou_rs::error::Result<narou_rs::converter::settings::NovelSettings> {
-    let ini = match objects.read_small(&keys.setting()).await? {
+    let ini = match lease.read_small(&keys.setting()).await? {
         Some(bytes) => narou_rs::converter::ini::IniData::load(&String::from_utf8_lossy(&bytes)),
         None => narou_rs::converter::ini::IniData::new(),
     };
@@ -853,8 +867,8 @@ async fn api_site(req: Request, env: Env) -> Result<Response> {
 
 /// GET /api/novels/:id/illustrations/:name — 挿絵 1 枚。
 ///
-/// S3 に置く構成 (`asset_backend = s3`) では **presigned URL へ 302** し、
-/// 大きいオブジェクトを Worker で中継しない。D1 に置く構成ではそのまま返す。
+/// All D1/S3/reference/pool bytes remain under the admitted lease through
+/// HTTP EOF; a presigned legacy URL cannot retain its reader generation.
 async fn api_novel_illustration(req: Request, env: Env, id: i64, name: &str) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
@@ -888,27 +902,27 @@ async fn api_novel_illustration(req: Request, env: Env, id: i64, name: &str) -> 
         Err(_) => return Response::error("Not Found", 404),
     };
 
-    if let Some(s3) = services.s3_illustrations.as_ref() {
-        // Worker を経由させない。URL の寿命は短くして、共有を避ける。
-        // dedup プールへの移行前オブジェクトでも配信できるよう、プールに
-        // 実体があるかを確認して無ければ旧 `挿絵/` の URL を返す。
-        let presigned = s3
-            .presign_get_url_prefer_existing(&key, 240)
-            .await
-            .map_err(|error| Error::RustError(error.to_string()))?;
-        let url = worker::Url::parse(&presigned)
-            .map_err(|error| Error::RustError(error.to_string()))?;
-        return Response::redirect(url);
-    }
+    let lease=match narou_rs::application::novel_access::NovelReadLease::admit_for(&services.objects,&keys,"illustration").await {
+        Ok(lease)=>lease,Err(error)=>return Response::error(format!("Novel access unavailable: {error}"),503),
+    };
+    let latest=match services.novels.get(narou_rs::platform::NovelId(id)).await{
+        Ok(Some(record))=>record,
+        Ok(None)=>{lease.release().await.map_err(stream_error)?;return Response::error("Not Found",404);},
+        Err(error)=>{lease.release().await.map_err(stream_error)?;return Err(stream_error(error));},
+    };
+    let current=match narou_rs::platform::NovelObjectKeys::new(&latest.sitename,&latest.file_title,latest.use_subdirectory){Ok(keys)=>keys,Err(error)=>{lease.release().await.map_err(stream_error)?;return Err(stream_error(error));}};
+    if current.prefix()!=keys.prefix(){lease.release().await.map_err(stream_error)?;return Response::error("Novel origin changed; retry",503);}
 
-    match services.objects.read_small(&key).await {
-        Ok(Some(bytes)) => {
-            let content_type =
-                narou_rs::platform::content_type_for_key(&key).unwrap_or("application/octet-stream");
-            Ok(worker::ResponseBuilder::new()
-                .with_header("Content-Type", content_type)?
-                .with_header("Cache-Control", "private, max-age=240")?
-                .from_bytes(bytes)?)
+    match lease.into_open(&key,0..u64::MAX).await {
+        Ok(Some(stream)) => {
+            use futures::StreamExt;
+            let content_type=narou_rs::platform::content_type_for_key(&key).unwrap_or("application/octet-stream");
+            let stream=stream.map(|part|part.map_err(|error|Error::RustError(error.to_string())));
+            let mut response=Response::from_stream(stream)?;
+            response.headers_mut().set("Content-Type",content_type)?;
+            response.headers_mut().set("Cache-Control","private, max-age=240")?;
+            response.headers_mut().set("X-Content-Type-Options","nosniff")?;
+            Ok(response)
         }
         Ok(None) => Response::error("Not Found", 404),
         Err(error) => Response::error(format!("Object store error: {error}"), 500),

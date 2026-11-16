@@ -74,7 +74,9 @@ pub async fn all_ids(services: &AppServices) -> worker::Result<Response> {
 // ---------------------------------------------------------------------------
 
 pub async fn author_comments(services: &AppServices, id: NovelId) -> worker::Result<Response> {
-    let record = match services.library.get(id).await {
+    let mut scope = services.content.read_scope("author-comments");
+    let result = async {
+    let record = match services.content.read_record(&mut scope, id).await {
         Ok(Some(record)) => record,
         Ok(None) => {
             return json_error(404, "not_found", Some(&format!("ID: {}", id.0)));
@@ -82,7 +84,7 @@ pub async fn author_comments(services: &AppServices, id: NovelId) -> worker::Res
         Err(error) => return application_error_response(&error),
     };
     // native は TOC なしを 404 ("TOC not found")、壊れた YAML を 500 にする。
-    let toc = match services.content.toc(id).await {
+    let toc = match services.content.toc(&mut scope, id).await {
         Ok(toc) => toc,
         Err(error) => return application_error_response(&error),
     };
@@ -101,7 +103,7 @@ pub async fn author_comments(services: &AppServices, id: NovelId) -> worker::Res
     for sub in &toc.subtitles {
         let Some(bytes) = (match services
             .content
-            .section(id, &sub.index, &sub.file_subtitle)
+            .section(&mut scope, id, &sub.index, &sub.file_subtitle)
             .await
         {
             Ok(bytes) => bytes,
@@ -114,6 +116,8 @@ pub async fn author_comments(services: &AppServices, id: NovelId) -> worker::Res
     }
 
     Response::from_json(&author_comments_payload(&record.title, &toc, &sections))
+    }.await;
+    super::leased_response(result, scope).await
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use narou_rs::application::convert::ConvertedText;
+use narou_rs::application::novel_access::{NovelAccess, NovelReadLease, NovelReadScope};
 use narou_rs::epub_lite::{self, ChunkSink, EpubStreamWriter, StreamingBuild, StreamingPreparation};
 use narou_rs::platform::{AssetStore, AssetStream, ObjectKey, StagedAsset};
 use worker::{Env, Method, Request, Response, Result};
@@ -42,7 +43,9 @@ pub(crate) async fn build_epub_with_services(
     id: i64,
     virtual_only: bool,
 ) -> Result<Response> {
-    let record = match services.app.library.get(narou_rs::platform::NovelId(id)).await {
+    let mut scope = NovelReadScope::new(&services.objects, "epub-response");
+    let result = async {
+    let record = match services.app.content.read_record(&mut scope, narou_rs::platform::NovelId(id)).await {
         Ok(Some(record)) => record,
         Ok(None) => return Response::error("Not Found", 404),
         Err(error) => return Response::error(format!("Repository error: {error}"), 500),
@@ -50,11 +53,14 @@ pub(crate) async fn build_epub_with_services(
     let is_virtual = record.ncode.as_deref().is_some_and(narou_rs::virtual_novel::is_virtual_ncode);
     if virtual_only && !is_virtual { return Response::error("Not Found", 404); }
     let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).map_err(stream_error)?;
+    let prefix = narou_rs::platform::ObjectPrefix::from(keys.prefix().clone());
+    let lease = scope.lease_for(&prefix).await.map_err(stream_error)?;
+    let mut access = NovelAccess::read_only(lease);
     let local_map = load_local_settings_map(env).await;
     if req.method() == Method::Head {
         // メタデータだけ: 本文の変換も挿絵の stage もしない (GET と同じ
         // ヘッダだけを返すので本文の長さは載せない)。
-        return epub_metadata_response(services, &record, &keys, &local_map, is_virtual).await;
+        return epub_metadata_response(access.read().map_err(stream_error)?, services, &record, &keys, &local_map, is_virtual).await;
     }
     let Some(permit) = crate::memory_budget::try_heavy() else { return crate::memory_budget::busy_response(); };
     let global_map = load_global_settings_map(env).await;
@@ -64,25 +70,25 @@ pub(crate) async fn build_epub_with_services(
     push_sink.run(context.scope(async {
         let mut cleanup = StageCleanup { store: services.assets.clone(), keys: Vec::new(), scratch: epub_lite::ImageScratch::default() };
         let cached = if !is_virtual && crate::convert::keep_converted_text_with(&local_map) {
-            ConvertedText::from_stored(services.assets.clone(), keys.converted_text()).await.map_err(stream_error)?
+            ConvertedText::from_stored(services.assets.clone(), access.read().map_err(stream_error)?, keys.converted_text()).await.map_err(stream_error)?
         } else { None };
         let mut illustration_sources = BTreeMap::new();
         let (source, settings) = if let Some(source) = cached {
             cleanup.keys.push(source.key.clone());
-            let settings = load_novel_settings(&services.objects, &record, &keys, &local_map).await.map_err(stream_error)?;
+            let settings = load_novel_settings(access.read().map_err(stream_error)?, &record, &keys, &local_map).await.map_err(stream_error)?;
             (source, settings)
         } else {
             let converted = if is_virtual {
-                let persistence = narou_rs::downloader::persistence::PersistenceService::new(services.objects.clone(), services.assets.clone());
-                let book = crate::virtual_novels::load_book(&services.db.primary_view(), &record, services.novels.as_ref(), &persistence).await.map_err(stream_error)?;
+                let persistence = narou_rs::downloader::persistence::PersistenceService::new(services.objects.clone());
+                let book = crate::virtual_novels::load_book(scope.clone(), &services.db.primary_view(), &record, services.novels.as_ref(), &persistence).await.map_err(stream_error)?;
                 illustration_sources = book.illustrations;
-                services.conversion.convert_source(&record, book.toc, book.sections, false).await
-            } else { services.conversion.convert_only(&record).await }.map_err(stream_error)?;
+                services.conversion.convert_source(&mut access, &record, book.toc, book.sections, false).await
+            } else { services.conversion.convert_only(&mut access, &record).await }.map_err(stream_error)?;
             cleanup.keys.push(converted.source.key.clone());
             (converted.source, converted.settings)
         };
         let filename = epub_download_filename(&record, &settings, &local_map);
-        let index = if is_virtual { None } else { load_illustration_index(&services.objects, &keys).await.map(Arc::new) };
+        let index = if is_virtual { None } else { load_illustration_index(access.read().map_err(stream_error)?, &keys).await.map_err(stream_error)?.map(Arc::new) };
         let illust_prefix = narou_rs::platform::ObjectPrefix::new(format!("{}/挿絵", keys.prefix().as_ref())).map_err(stream_error)?;
         let (mut names, cover_image) = match collect_stored_illustrations(services, &keys, &illust_prefix, is_virtual, settings.enable_illust).await? {
             StoredIllustrations::OverBudget => {
@@ -129,7 +135,7 @@ pub(crate) async fn build_epub_with_services(
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     let key = epub_image_key(&keys, &illustration_sources, request.source).map_err(stream_error)?;
-                    let stream = services.assets.read_stream(&key).await.map_err(stream_error)?
+                    let stream = scope.open_key(&key, 0..u64::MAX).await.map_err(stream_error)?
                         .ok_or_else(|| stream_error(format!("missing illustration: {key}")))?;
                     let snapshot = services.assets.stage_stream(stream).await.map_err(stream_error)?;
                     cleanup.keys.push(snapshot.key.clone());
@@ -186,8 +192,11 @@ pub(crate) async fn build_epub_with_services(
         });
         worker::ResponseBuilder::new().with_header("Content-Type", "application/epub+zip")?
             .with_header("Cache-Control", "no-store")?
-            .with_header("Content-Disposition", &sanitize_content_disposition(&filename))?.from_stream(stream)
+            .with_header("Content-Disposition", &sanitize_content_disposition(&filename))?
+            .from_stream(stream)
     })).await
+    }.await;
+    crate::webui::leased_response(result, scope).await
 }
 
 /// 保存済みの挿絵 (cover と `挿絵/` の一覧) を集めた結果。
@@ -242,13 +251,14 @@ async fn collect_stored_illustrations(
 /// 本文を準備しないので長さは分からない: `Content-Length` も
 /// `Accept-Ranges` も載せない (`GET` の応答も同じヘッダだけだから)。
 async fn epub_metadata_response(
+    lease: &mut NovelReadLease,
     services: &crate::composition::ReadServices,
     record: &narou_rs::db::NovelRecord,
     keys: &narou_rs::platform::NovelObjectKeys,
     local_map: &std::collections::HashMap<String, serde_yaml::Value>,
     is_virtual: bool,
 ) -> Result<Response> {
-    let settings = load_novel_settings(&services.objects, record, keys, local_map).await.map_err(stream_error)?;
+    let settings = load_novel_settings(lease, record, keys, local_map).await.map_err(stream_error)?;
     let filename = epub_download_filename(record, &settings, local_map);
     let illust_prefix = narou_rs::platform::ObjectPrefix::new(format!("{}/挿絵", keys.prefix().as_ref())).map_err(stream_error)?;
     if matches!(collect_stored_illustrations(services, keys, &illust_prefix, is_virtual, settings.enable_illust).await?, StoredIllustrations::OverBudget) {
@@ -272,20 +282,9 @@ impl StageCleanup {
         error.map_or(Ok(()), Err)
     }
 }
-impl Drop for StageCleanup {
-    fn drop(&mut self) {
-        let mut keys = std::mem::take(&mut self.keys);
-        keys.extend(self.scratch.take_keys());
-        if keys.is_empty() { return; }
-        let store = self.store.clone();
-        // Cancellation drops the reader and permit synchronously. Deletion is
-        // best-effort here; the durable staging expiry journal is the fallback
-        // for failed cleanup, request termination and isolate loss.
-        wasm_bindgen_futures::spawn_local(async move {
-            for key in keys { if let Err(error) = store.delete(&key).await { worker::console_log!("EPUB stage cleanup {key}: {error}"); } }
-        });
-    }
-}
+// Cancellation performs no detached work: each private stage already has a
+// durable reservation/expiry journal. EOF and errors call finish() inline;
+// dropped responses rely on the scheduled staging collector.
 
 enum EntryInput {
     Bytes { bytes: Vec<u8>, offset: usize },

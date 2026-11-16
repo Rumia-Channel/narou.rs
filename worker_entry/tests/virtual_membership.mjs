@@ -41,6 +41,7 @@ function summary(id) { return sql(`SELECT general_all_no,tags_json,attribute_tag
 const members = [990300001, 990300002, 990300003, 990300004, 990300005, 990300006, 990300007, 990300008, 990300009];
 const created = [];
 try {
+  sql("DELETE FROM novel_namespace_claims WHERE owner='virtual-direct-namespace-race'");
   sql(members.map(id => `INSERT INTO novels(id,title,title_fold,author,author_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,attribute_tag,general_all_no,tags_json) VALUES (${id},'Membership ${id}','membership ${id}','fixture','fixture','membership-${id}','https://example.test/membership-${id}','https://example.test/membership-${id}','fixture','fixture','2026-11-06T00:00:00Z','小説',1,json_array('membership-${id}'));`).join('\n'));
   const registrations = await Promise.all(members.slice(0, 2).map((id, index) =>
     api('/api/virtual_novels', { title: `Concurrent virtual ${index}`, members: [id] }, 'membership-create')));
@@ -51,6 +52,43 @@ try {
   let listed = await groups();
   assert.deepEqual(listed.filter(row => created.includes(row.id)).map(row => row.id).sort((a,b) => a-b), [...created].sort((a,b) => a-b),
     'both successful registrations must retain their membership');
+
+  // Hold the REAL final batch, then add a primary namespace claim after all
+  // preflight reads. A prequery-only check must not publish this new parent.
+  const racedTitle = 'Namespace raced virtual';
+  const raced = api('/api/virtual_novels', { title: racedTitle, members: [members[8]] },
+    undefined, undefined, { 'x-narou-test-snapshot-pause': 'create-namespace' });
+  let reserved;
+  try {
+    const paused = await fetch(base + '/__test/virtual-pause/create-namespace/wait');
+    assert.equal(paused.status, 200);
+    reserved = sql('SELECT id,generation FROM novel_id_reservations WHERE available=0 AND job_id IS NULL ORDER BY generation DESC LIMIT 1')[0];
+    assert(reserved, 'the direct create must retain its actual scalar reservation through the batch');
+    const gate = sql("SELECT prefix,epoch FROM novel_access_gates WHERE prefix LIKE '%/Namespace raced virtual'")[0];
+    assert(gate, 'the parent must already hold its original gate origin');
+    const quote = value => `'${String(value).replaceAll("'", "''")}'`;
+    sql(`INSERT INTO novel_namespace_claims(prefix,novel_id,reservation_generation,toc_url_fold,owner,epoch,job_id) VALUES(${quote(gate.prefix)},990399999,NULL,'https://example.test/direct-namespace-race','virtual-direct-namespace-race',${gate.epoch},NULL)`);
+  } finally {
+    await fetch(base + '/__test/virtual-pause/create-namespace/release');
+  }
+  try {
+    const rejected = await raced;
+    if (rejected.data?.id) created.push(rejected.data.id);
+    assert.equal(rejected.status, 400, 'a namespace claimed after preflight must abort the actual metadata transaction');
+    assert.equal(sql("SELECT COUNT(*) AS n FROM novels WHERE title='Namespace raced virtual'")[0].n, 0);
+    assert.equal(sql(`SELECT available FROM novel_id_reservations WHERE id=${reserved.id} AND generation=${reserved.generation}`)[0].available, 1,
+      'failed direct creation must release its exact unbound generation, not silently ignore a non-job token');
+    assert.equal(sql("SELECT COUNT(*) AS n FROM novel_namespace_claims WHERE owner='virtual-direct-namespace-race'")[0].n, 1,
+      'the failed direct creator must not clear the foreign namespace owner');
+  } finally {
+    sql("DELETE FROM novel_namespace_claims WHERE owner='virtual-direct-namespace-race'");
+  }
+  const retried = await api('/api/virtual_novels', { title: racedTitle, members: [members[8]] });
+  if (retried.data?.id) created.push(retried.data.id);
+  assert.equal(retried.status, 200, JSON.stringify(retried));
+  assert.equal(retried.data.id, reserved.id, 'the released direct numeric ID must be reusable');
+  assert.equal((await api(`/api/virtual_novels/${retried.data.id}`, undefined, undefined, 'DELETE')).status, 200);
+  created.pop();
   const parent = created[0];
   const appended = await Promise.all(members.slice(2, 4).map(id =>
     api(`/api/virtual_novels/${parent}/members`, { members: [id] }, 'membership-append')));
@@ -135,6 +173,7 @@ try {
   console.log('Virtual membership atomicity workerd contracts passed');
 } finally {
   sql('DROP TRIGGER IF EXISTS fail_virtual_summary');
+  sql("DELETE FROM novel_namespace_claims WHERE owner='virtual-direct-namespace-race'");
   for (const id of created) await api(`/api/virtual_novels/${id}`, undefined, undefined, 'DELETE');
   const ids = [...members, ...created].join(',');
   sql(`DELETE FROM novel_tags WHERE novel_id IN (${ids}); DELETE FROM novels WHERE id IN (${ids});`);

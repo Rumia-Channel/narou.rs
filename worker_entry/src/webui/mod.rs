@@ -64,13 +64,8 @@ pub(crate) fn api_response(success: bool, message: impl Into<String>) -> serde_j
 pub(crate) fn application_error(
     error: &narou_rs::application::ApplicationError,
 ) -> (u16, &'static str, String) {
-    use narou_rs::application::ApplicationError;
-    match error {
-        ApplicationError::InvalidRequest(message) => (400, "bad_request", message.clone()),
-        ApplicationError::Conflict(message) => (409, "conflict", message.clone()),
-        ApplicationError::NotFound(message) => (404, "not_found", message.clone()),
-        ApplicationError::Platform(message) => (500, "internal_error", message.clone()),
-    }
+    let (status, code) = narou_rs::application::external_api::http_error(error);
+    (status, code, error.message().to_owned())
 }
 
 /// `application_error` をそのまま `json_error` 応答へ変換する。
@@ -144,4 +139,43 @@ pub(crate) async fn load_current_sort_state_for(
 /// `webui.new-tag-color` 設定を読み、小文字化 + 有効色チェックを通す。
 pub(crate) async fn configured_tag_color(runtime: &WorkerRuntime) -> Option<String> {
     metadata::configured_tag_color(&runtime.services.settings).await
+}
+
+/// Keep the operation's admission attached to the actual HTTP body. Buffered
+/// JSON/HTML still owns the lease until EOF; cancel drops it and relies on the
+/// durable expiry, never on a spawned cleanup task.
+pub(crate) async fn leased_response(
+    response: worker::Result<Response>,
+    scope: narou_rs::application::novel_access::NovelReadScope,
+) -> worker::Result<Response> {
+    use futures::StreamExt;
+    use narou_rs::platform::AssetStream;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => { let _ = scope.release_all().await; return Err(error); }
+    };
+    let (builder, body) = response.into_parts();
+    let stream: AssetStream = match body {
+        worker::ResponseBody::Empty => {
+            scope.release_all().await.map_err(crate::stream_error)?;
+            return Ok(builder.empty());
+        }
+        worker::ResponseBody::Body(bytes) => narou_rs::platform::staging::owned_bytes_stream(bytes),
+        worker::ResponseBody::Stream(body) => {
+            let mut response = Response::from_body(worker::ResponseBody::Stream(body))?;
+            Box::pin(response.stream()?.map(|item| item.map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))))
+        }
+    };
+    let stream = futures::stream::try_unfold((scope, stream), |(mut scope, mut stream)| async move {
+        if let Err(error) = scope.refresh_all().await {
+            let _ = scope.release_all().await;
+            return Err(crate::stream_error(error));
+        }
+        match stream.next().await {
+            Some(Ok(bytes)) => Ok(Some((bytes, (scope, stream)))),
+            Some(Err(error)) => { let _ = scope.release_all().await; Err(crate::stream_error(error)) }
+            None => { scope.release_all().await.map_err(crate::stream_error)?; Ok(None) }
+        }
+    });
+    builder.from_stream(stream)
 }

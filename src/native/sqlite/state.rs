@@ -26,7 +26,19 @@ use rusqlite::Connection;
 use crate::db::state_inventory;
 use crate::error::{NarouError, Result};
 
-const DB_FILE_NAME: &str = "db.sqlite";
+pub(crate) const DB_FILE_NAME: &str = "db.sqlite";
+
+/// Read only the durable transfer receipt before normal StateDb initialization.
+/// Opening this path must never migrate, import, configure, or enter DATABASE.
+pub(crate) fn transfer_commit_receipt_before_open(narou_dir:&Path,key:&str)->Result<Option<Vec<u8>>>{
+    use rusqlite::OptionalExtension;
+    let path=narou_dir.join(DB_FILE_NAME);
+    match std::fs::metadata(&path){Ok(_)=>{},Err(error)if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(error)=>return Err(error.into())}
+    let connection=Connection::open_with_flags(&path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(super::sqlite_error)?;
+    let present:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='transfer_backend_marks')",[],|row|row.get(0)).map_err(super::sqlite_error)?;
+    if !present{return Ok(None);}
+    connection.query_row("SELECT value FROM transfer_backend_marks WHERE key=?1",[key],|row|row.get(0)).optional().map_err(super::sqlite_error)
+}
 
 #[derive(Clone)]
 pub struct StateDb {
@@ -86,23 +98,13 @@ impl StateDb {
     /// may predate the database); otherwise the imported `app_state` value
     /// decides. Direct SQL — never routed through `get_raw`/`set_raw`.
     pub fn compat_now(&self) -> bool {
-        let file_value = self
-            .legacy_path("inv", "local_setting")
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|content| compat_flag_in_yaml(&content));
-        if let Some(value) = file_value {
-            return value;
-        }
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT value_yaml FROM app_state WHERE scope = 'inv' AND key = 'local_setting'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .and_then(|yaml| compat_flag_in_yaml(&yaml))
-        .unwrap_or(false)
+        if let Some(value)=self.compat_file_flag(){return value;}
+        Self::compat_database_flag(&self.conn.lock())
     }
+    fn compat_file_flag(&self)->Option<bool>{self.legacy_path("inv","local_setting").and_then(|path|std::fs::read_to_string(path).ok()).and_then(|content|compat_flag_in_yaml(&content))}
+    fn compat_database_flag(connection:&Connection)->bool{connection.query_row("SELECT value_yaml FROM app_state WHERE scope='inv' AND key='local_setting'",[],|row|row.get::<_,String>(0)).ok().and_then(|yaml|compat_flag_in_yaml(&yaml)).unwrap_or(false)}
+    /// Same authority while the caller already holds the primary connection.
+    pub(crate) fn compat_now_with_connection(&self,connection:&Connection)->bool{self.compat_file_flag().unwrap_or_else(||Self::compat_database_flag(connection))}
 
     /// `app_state` read that bypasses the compat file layer. Used by
     /// reconciliation and for `meta` keys.
@@ -727,6 +729,14 @@ pub fn active_for(narou_dir: &Path) -> Option<StateDb> {
     }
 }
 
+/// Established handle for this narou root, or `None` when the database was
+/// never configured this process. Unlike `active_for` this never lazily
+/// opens the database, so FS-side gate code can consult live SQL authority
+/// without itself performing the startup sweep.
+pub(crate) fn established_for(narou_dir: &Path) -> Option<StateDb> {
+    OPEN_HANDLES.lock().get(narou_dir).cloned()
+}
+
 pub fn legacy_yaml_active() -> bool {
     legacy_yaml_disabled()
 }
@@ -825,6 +835,23 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
         {
             let _ = super::object_store::import_archive_into_objects(state.conn_ref(), &mirror);
         }
+    }
+    // A crashed management-backend flip heals first: the durable cutover
+    // intent decides which authority owns the marker before the gate sweep.
+    super::export_yaml::reconcile_cutover_intent(narou_dir)?;
+
+    // Gate authority recovery: pending SQL→FS journals resume or roll back,
+    // recorded handoffs without journals finalize, and every durable FS gate
+    // still carrying namespace authority is adopted into SQL — all before
+    // the handle goes live. Conflicting provenance fails closed rather than
+    // defaulting either side.
+    {
+        let archive_root = narou_dir
+            .parent()
+            .map(|root| root.join(crate::downloader::types::ARCHIVE_ROOT_DIR))
+            .unwrap_or_else(|| narou_dir.join(crate::downloader::types::ARCHIVE_ROOT_DIR));
+        let mirror = crate::native::object_store::NativeObjectStore::from_root(archive_root)?;
+        super::object_store::reconcile_namespace_gate_authority(&mirror, state.conn_ref())?;
     }
     // migration や初回取込で新しく作られた -wal / -shm もここで締め直す。
     restrict_sqlite_permissions(&database);

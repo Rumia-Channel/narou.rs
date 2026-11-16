@@ -37,7 +37,7 @@ fn run() -> Result<(), String> {
         Some(dir) => dir,
         None => find_library_root()
             .ok_or_else(|| ".narou を持つライブラリフォルダが見つかりません".to_string())?,
-    };
+    }.canonicalize().map_err(|error| error.to_string())?;
     if !root.join(".narou").is_dir() {
         return Err(format!(".narou が見つかりません: {}", root.display()));
     }
@@ -47,15 +47,20 @@ fn run() -> Result<(), String> {
         None => startup_backup::default_backup_dir()
             .ok_or_else(|| "実行ファイルの場所を特定できません".to_string())?,
     };
+    let output = if output.is_absolute() { output } else { std::env::current_dir().map_err(|error| error.to_string())?.join(output) };
+    std::env::set_current_dir(&root).map_err(|error| error.to_string())?;
+    narou_rs::db::init_database().map_err(|error| error.to_string())?;
 
-    let total = startup_backup::backup_size(&root).map_err(|e| e.to_string())?;
-    println!("対象: ライブラリフォルダ全体 (計 {})", format_size(total));
+    println!("対象: ライブラリフォルダ全体 (整合したスナップショットを作成します)");
     println!("保存先: {}", output.display());
-    startup_backup::check_free_space(&output, total).map_err(|e| e.to_string())?;
 
     println!("バックアップを作成しています...");
     let path = startup_backup::create_library_backup(&root, &output).map_err(|e| e.to_string())?;
     println!("作成しました: {}", path.display());
+    if !io::stdout().is_terminal() {
+        println!("{}{}", startup_backup::BACKUP_RESULT_PREFIX,
+            serde_json::to_string(&path).map_err(|error| error.to_string())?);
+    }
 
     wait_for_enter();
     Ok(())
@@ -119,17 +124,3 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-fn format_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{} {}", bytes, UNITS[unit])
-    } else {
-        format!("{:.1} {}", value, UNITS[unit])
-    }
-}

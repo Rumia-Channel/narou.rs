@@ -585,44 +585,35 @@ markup は初回表示時に JS が組み立てる (`#app-dialog`、HTML 側の�
 | `/api/novels/{id}` | DELETE | ✅ |
 | `/api/webui/config` | GET | ✅ |
 
-### 6.1b 小説データの ZIP 転送
+### 6.1b クライアント主体の小説データ転送
 
-**現状訂正 (2026-11-15)**: 以下はサーバー ZIP 版の動作であり、クライアント WASM 版の完成を示さない。`transfer_wasm` は UI に未接続。ZIP を端末内で生成・検証・展開し、必要なデータだけをチャンク転送する [新設計](docs/client-transfer-design.md) は未実装である。
+**未公開の別ブランチ実装。統合動作検証は未完了。** ZIP の生成・検証・展開は端末内の Dedicated Worker + WASM で行い、Native / Workers との通信は `/api/transfer/v2` の生バイトと制御 JSON に限定する。ZIP 全体 POST・サーバー ZIP・Base64 応答へのフォールバックはない。
 
-| エンドポイント | メソッド | Rust |
-|-------------|--------|------|
-| `/api/transfer/export?ids=1,2` | GET | ✅ (`application/zip`) |
-| `/api/transfer/import?overwrite=true` | POST | ✅ (ZIP 本文、body limit 512 MiB) |
-| `/api/transfer/export?progress=1&ids=1,2` | GET | ✅ (逐次 ZIP データと作品数を NDJSON で返す) |
-| `/api/transfer/import?progress=1&overwrite=true` | POST | ✅ (ZIP 本文、検証・作品数・取り込み結果を NDJSON で返す) |
-
-ZIP の書式 (`manifest.json` のスキーマ・検証ルール・衝突規則・挿絵の扱い) は
-[`docs/transfer-archive-format.md`](docs/transfer-archive-format.md) を参照。
-
-オプションの「選択した作品をダウンロード」「小説データをアップロード」は進捗付き API を使う。
-ダウンロードは選択した複数作品を **1 個の ZIP** にまとめ、作品数と受信量を表示する。
-アップロードは **1 個の ZIP 内の複数作品** が対象で、送信量・検証・取り込み件数を表示する。
-サーバーは 1 ファイルの内部も有界チャンクで圧縮する。ブラウザも全量を `Blob` にせず、
-File System Access の書き込み先、または Service Worker の pull 型ダウンロードへ逐次送る。
-受信側が遅ければ次のチャンクを待ち、完了フレームが来たときだけ出力を正常に閉じる。
-Service Worker を使う経路のディスク保存結果は、ブラウザのダウンロード一覧で確認する。
-どちらの保存手段も使えない環境では、全量メモリ保存に戻さずエラーを表示する。
-
-進捗応答は `application/x-ndjson`。各行は次の JSON オブジェクト:
-
-| `type` | 内容 |
+| エンドポイント (`/api/transfer/v2` 配下) | 用途 |
 |---|---|
-| `progress` | `phase` (`export` / `validate` / `import`)、`completed`、`total`、処理中の `title` (省略可) |
-| `data` | ZIP の一部を Base64 にした `data` (書き出しのみ) |
-| `complete` | 書き出しは `filename` / ZIP の `bytes`、取り込みは従来の結果オブジェクトを `result` に持つ |
-| `error` | `message`。この後に完了フレームは返さない |
+| `GET /capabilities` | 宛先・role・codec / ABI・上限を確認 |
+| `POST /imports` / `/exports` | セッション作成 |
+| `GET /{direction}/{id}` / `catalog` / `files` / `plan` | 状態・選別・計画・再開位置の確認 |
+| `PUT /imports/{id}/manifest/chunks/{n}` / `chunks` | 選別済み manifest / ファイルを有界フレームで送信 |
+| `GET /exports/{id}/manifest/chunks/{n}` / `batches/{n}` | 固定 snapshot のメタデータ / 生バイトを受信 |
+| `POST /{direction}/{id}/advance` | 準備・作品単位の公開・回復を進める |
+| `GET /sessions` / `DELETE /sessions/{id}` | 残ったセッションの確認・削除 |
 
-HTTP エラー・エラーフレーム・完了フレームの無い切断は失敗として画面に残す。
-「通信を中止」はクライアントの通信を中止する操作で、取り込み済み作品は保持する。
-取り込みは ZIP 全体の検証後に作品単位で書き込むため、中止後は一覧で結果を確認する。
-`progress` を指定しない従来の ZIP / JSON 応答と CLI は変更しない。
-Worker の重い処理枠が使用中なら `503` (`memory_capacity`) と `Retry-After: 5` を返す。
-これは取り込み成功ではない。表示されたエラーを確認し、他の処理が終わってから再操作する。
+#### 選別と保存
+
+- 既定の `runtime` は現行本文・目次・作品情報・設定・挿絵・挿絵索引・未知の利用者ファイルを保持する。raw・任意の履歴・アプリ生成と証明できた出力は既定で送らない。
+- `complete` は保存可能な追加データも含める。Worker は raw を新規保存しない。本文 YAML や挿絵索引は SQLite / D1 でも必要で、DB 管理だけを理由に除外しない。
+- 取り込みは端末内で ZIP **全体を検証し、選別した後**にセッションを作成する。書き出しはサーバーの列挙から選別した後だけ snapshot を作る。不要な raw を送ってから捨てる方式ではない。
+- ZIP と本文は全量を `Blob` / `ArrayBuffer` にしない。File System Access または Service Worker の pull 型保存へ逐次書き出す。両方使えない場合はエラーにし、全量メモリ保存へ戻さない。Service Worker 経路の最終保存結果はブラウザのダウンロード一覧で確認する。
+
+#### 再開・失敗
+
+- 1 HTTP バイナリ本文はフレーミング込み 8 MiB / 100 レコード以下。ZIP 合計の旧 512 MiB 制限とは別で、ZIP64 の大きなファイルも分割する。
+- UUID と秘密値をセッション作成前に端末へ保存する。通信断では受領済み offset / SHA を照会し、同じ operation ID と revision で重複実行を防ぐ。取り込み再開では同じ ZIP を選び直し、確認済み prefix を再検証する。
+- 公開は作品単位。中断しても完了済み作品は保持し、公開中の作品は元の epoch と保存済み journal に従って回復する。HTTP 切断・容量不足・保存失敗を完了表示にしない。
+- codec の欠落、ABI / build ID 不一致は開始前にエラーにする。Worker の重い処理枠不足 (`503 memory_capacity`) も成功ではない。
+
+ZIP 書式・用途別ファイル表は [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md)、通信・認証・有界処理・公開境界は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) を参照。
 
 ### 6.2 ダウンロード・更新・変換
 

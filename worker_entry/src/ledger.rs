@@ -76,7 +76,8 @@ VALUES (?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?)
 const SETTLE_SKIPPED_SQL: &str = r#"
 UPDATE worker_jobs
 SET status = ?, last_error = ?, updated_at = ?,
-    lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+    lease_until = NULL, execution_token = NULL,
+    checkpoint_json = CASE WHEN json_extract(checkpoint_json, '$.creation_reservation') IS NOT NULL THEN checkpoint_json ELSE NULL END
 WHERE job_id = ? AND status IN ('pending', 'retryable')
 "#;
 
@@ -327,6 +328,47 @@ impl D1JobLedger {
             .collect()
     }
 
+    /// A chained conversion belongs to the acquisition's original epoch.
+    /// Its checkpoint and pending row become visible in the same INSERT.
+    pub(crate) async fn enqueue_with_origin(
+        &self,
+        job: &JobPlan,
+        origin: &narou_rs::application::novel_access::AccessOrigin,
+    ) -> Result<EnqueuedJob> {
+        let origin_json = serde_json::to_string(origin).map_err(worker_error)?;
+        let dedupe = format!("{}:write_origin:{origin_json}", job.dedupe_key());
+        let from_existing = |row: JobRow| -> Result<EnqueuedJob> {
+            if Self::checkpoint_from_row(&row)?.and_then(|checkpoint| checkpoint.write_origin).as_ref() != Some(origin) {
+                return Err(NarouError::Platform("queued conversion writer origin changed".into()));
+            }
+            Ok(EnqueuedJob {
+                status: JobLedgerStatus::parse(&row.status)?,
+                queued: QueuedJob { job_id: JobId(row.job_id), job: job.clone() },
+            })
+        };
+        if let Some(row) = self.select_active_by_dedupe_keys(std::slice::from_ref(&dedupe)).await?.remove(&dedupe) {
+            return from_existing(row);
+        }
+        let options = serde_json::to_string(&job.options).map_err(worker_error)?;
+        let novel_id = match job.target { JobTarget::Id(id) => Some(id), _ => None };
+        for _ in 0..ENQUEUE_MAX_ATTEMPTS {
+            let job_id = JobId(Self::new_job_id());
+            let checkpoint = serde_json::to_string(&WorkerExecutionCheckpoint::planned(job_id.clone(), novel_id).with_write_origin(origin.clone())).map_err(worker_error)?;
+            let now = self.now_rfc3339();
+            let statement = self.prepare(
+                "INSERT OR IGNORE INTO worker_jobs(job_id,kind,target,options,status,dedupe_key,attempts,last_error,created_at,updated_at,checkpoint_json) VALUES(?,?,?,?,'pending',?,0,NULL,?,?,?)",
+                vec![BindValue::Text(job_id.as_str().into()), BindValue::Text(job.kind.as_str().into()), BindValue::Text(job.target.as_str()), BindValue::Text(options.clone()), BindValue::Text(dedupe.clone()), BindValue::Text(now.clone()), BindValue::Text(now), BindValue::Text(checkpoint)],
+            )?;
+            if changed_rows(&statement.run().await.map_err(worker_error)?)? > 0 {
+                return Ok(EnqueuedJob { queued: QueuedJob { job_id, job: job.clone() }, status: JobLedgerStatus::Pending });
+            }
+            if let Some(row) = self.select_active_by_dedupe_keys(std::slice::from_ref(&dedupe)).await?.remove(&dedupe) {
+                return from_existing(row);
+            }
+        }
+        Err(NarouError::Platform("queued conversion could not reserve its original writer epoch".into()))
+    }
+
     /// A fresh, practically-unique job id (timestamp + random hex).
     fn new_job_id() -> String {
         let now = js_sys::Date::now() as u64;
@@ -345,6 +387,54 @@ impl D1JobLedger {
                 })
             })
             .transpose()
+    }
+
+    /// Pre-claim discovery for preparing storage under the saved origin.
+    /// The claim still returns the authoritative checkpoint for execution.
+    pub(crate) async fn execution_checkpoint(&self, job_id: &JobId) -> Result<Option<WorkerExecutionCheckpoint>> {
+        match self.select_row(job_id.as_str()).await? {
+            Some(row) => Self::checkpoint_from_row(&row),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn restart_checkpoint(&self, job_id: &JobId, execution_token: &str, checkpoint: &WorkerExecutionCheckpoint) -> Result<()> {
+        let value = serde_json::to_string(checkpoint).map_err(worker_error)?;
+        let statement = self.prepare_core(narou_rs::application::worker_ledger::restart_checkpoint(&self.now_rfc3339(), job_id.as_str(), execution_token, &value))?;
+        if changed_rows(&statement.run().await.map_err(worker_error)?)? == 0 {
+            return Err(NarouError::Platform(format!("execution checkpoint restart ownership for job {job_id} is no longer valid")));
+        }
+        Ok(())
+    }
+
+    /// A terminal token is only a revocation candidate after expiry. The
+    /// repository rechecks it and fences the old epoch in its release batch.
+    pub(crate) async fn terminal_creation_checkpoint(&self, job_id: &JobId) -> Result<Option<(String, bool)>> {
+        #[derive(Deserialize)]
+        struct TerminalCreation { checkpoint_json: String, eligible: u32 }
+        let row = self.prepare(
+            "SELECT checkpoint_json,CASE WHEN execution_token IS NULL OR lease_until<=?2 THEN 1 ELSE 0 END AS eligible FROM worker_jobs WHERE job_id=?1 AND status IN ('succeeded','partial','blocked','permanent') AND json_extract(checkpoint_json,'$.creation_reservation') IS NOT NULL",
+            vec![BindValue::Text(job_id.as_str().to_owned()), BindValue::Text(self.now_rfc3339())],
+        )?.first::<TerminalCreation>(None).await.map_err(worker_error)?;
+        Ok(row.map(|row| (row.checkpoint_json, row.eligible != 0)))
+    }
+
+    pub(crate) async fn clear_terminal_creation_checkpoint(&self, job_id: &JobId, expected: &str) -> Result<()> {
+        self.prepare(
+            "UPDATE worker_jobs SET checkpoint_json=NULL WHERE job_id=? AND status IN ('succeeded','partial','blocked','permanent') AND execution_token IS NULL AND checkpoint_json=?",
+            vec![BindValue::Text(job_id.as_str().to_owned()), BindValue::Text(expected.to_owned())],
+        )?.run().await.map_err(worker_error)?;
+        Ok(())
+    }
+
+    pub(crate) async fn pending_creation_releases(&self, cursor: Option<&str>, limit: usize) -> Result<(Vec<JobId>, Option<String>)> {
+        let limit = limit.clamp(1, 100);
+        let rows = self.prepare(
+            "SELECT job_id FROM worker_jobs WHERE job_id>? AND status IN ('succeeded','partial','blocked','permanent') AND (execution_token IS NULL OR lease_until<=?) AND json_extract(checkpoint_json,'$.creation_reservation') IS NOT NULL ORDER BY job_id LIMIT ?",
+            vec![BindValue::Text(cursor.unwrap_or("").to_owned()), BindValue::Text(self.now_rfc3339()), BindValue::Int(limit as i64)],
+        )?.all().await.map_err(worker_error)?.results::<JobIdRow>().map_err(worker_error)?;
+        let next = if rows.len() == limit { rows.last().map(|row| row.job_id.clone()) } else { None };
+        Ok((rows.into_iter().map(|row| JobId(row.job_id)).collect(), next))
     }
 
     fn claimed_from_row(row: &JobRow, execution_token: String) -> Result<JobClaim> {
@@ -422,7 +512,8 @@ impl D1JobLedger {
         let statement = self.prepare(
             "UPDATE worker_jobs
              SET status = ?, last_error = ?, updated_at = ?,
-                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL, admission_waiting = 0
+                 lease_until = NULL, execution_token = NULL,
+                 checkpoint_json = CASE WHEN json_extract(checkpoint_json, '$.creation_reservation') IS NOT NULL THEN checkpoint_json ELSE NULL END, admission_waiting = 0
              WHERE status IN ('pending', 'retryable')",
             vec![
                 BindValue::Text(status_str(JobLedgerStatus::Permanent).to_string()),
@@ -450,7 +541,8 @@ impl D1JobLedger {
         let statement = self.prepare(
             "UPDATE worker_jobs
              SET status = ?, last_error = ?, updated_at = ?,
-                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL, admission_waiting = 0
+                 lease_until = NULL, execution_token = NULL,
+                 checkpoint_json = CASE WHEN json_extract(checkpoint_json, '$.creation_reservation') IS NOT NULL THEN checkpoint_json ELSE NULL END, admission_waiting = 0
              WHERE job_id = ? AND status IN ('pending', 'retryable')",
             vec![
                 BindValue::Text(status_str(JobLedgerStatus::Permanent).to_string()),
@@ -489,7 +581,7 @@ impl D1JobLedger {
         let statement = self.prepare(
             "UPDATE worker_jobs
              SET status = ?, last_error = ?, updated_at = ?,
-                 checkpoint_json = NULL
+                 checkpoint_json = CASE WHEN json_extract(checkpoint_json, '$.creation_reservation') IS NOT NULL THEN checkpoint_json ELSE NULL END
              WHERE job_id = ? AND status = 'running'",
             vec![
                 BindValue::Text(status_str(JobLedgerStatus::Permanent).to_string()),
@@ -504,8 +596,8 @@ impl D1JobLedger {
     pub async fn finish_cancelled(&self, job_id: &JobId, execution_token: &str) -> Result<bool> {
         let statement = self.prepare(
             "UPDATE worker_jobs SET lease_until = NULL, execution_token = NULL
-             WHERE job_id = ? AND status = 'permanent' AND execution_token = ?",
-            vec![BindValue::Text(job_id.as_str().to_string()), BindValue::Text(execution_token.to_string())],
+             WHERE job_id = ? AND status = 'permanent' AND last_error = ? AND (execution_token = ? OR execution_token IS NULL)",
+            vec![BindValue::Text(job_id.as_str().to_string()), BindValue::Text(crate::consumer::USER_CANCEL_REASON.to_owned()), BindValue::Text(execution_token.to_string())],
         )?;
         Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
     }
@@ -798,9 +890,9 @@ impl JobQueue for D1JobLedger {
             let statement = self.prepare_core(narou_rs::application::worker_ledger::save_checkpoint(
                 &self.now_rfc3339(), job_id.as_str(), execution_token, &value,
             ))?;
-            // A stale token means another executor owns the job; the write is
-            // best-effort progress, so that is not an error.
-            let _ = statement.run().await.map_err(worker_error)?;
+            if changed_rows(&statement.run().await.map_err(worker_error)?)? == 0 {
+                return Err(NarouError::Platform(format!("execution checkpoint ownership for job {job_id} is no longer valid")));
+            }
             Ok(())
         })
     }
@@ -883,7 +975,8 @@ impl JobQueue for D1JobLedger {
                 Some(error) => (
                     "UPDATE worker_jobs
                      SET status = ?, last_error = ?, updated_at = ?,
-                         lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+                         lease_until = NULL, execution_token = NULL,
+                         checkpoint_json = CASE WHEN json_extract(checkpoint_json, '$.creation_reservation') IS NOT NULL THEN checkpoint_json ELSE NULL END
                      WHERE job_id = ? AND status IN ('running', 'retryable') AND execution_token = ?",
                     vec![
                         BindValue::Text(status_str(status).to_string()),
@@ -896,7 +989,8 @@ impl JobQueue for D1JobLedger {
                 None => (
                     "UPDATE worker_jobs
                      SET status = ?, last_error = NULL, updated_at = ?,
-                         lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+                         lease_until = NULL, execution_token = NULL,
+                         checkpoint_json = CASE WHEN json_extract(checkpoint_json, '$.creation_reservation') IS NOT NULL THEN checkpoint_json ELSE NULL END
                      WHERE job_id = ? AND status IN ('running', 'retryable') AND execution_token = ?",
                     vec![
                         BindValue::Text(status_str(status).to_string()),

@@ -18,10 +18,10 @@
 //!   台帳の dedupe index からも外れる (native 同様、同じ対象を即再投入可)。
 //!   副作用として Web UI では `failed` バケットに数えられる — 第 1 波の
 //!   写像 (`permanent` + `blocked` → `failed`) と矛盾しない唯一の状態。
-//! - running job の中断は Wasm を途中で殺せないが、execution_token を消す
-//!   tombstone により「結果を記録できないジョブ」になる (native の
-//!   SIGKILL と同じ終了状態: mark_terminal / yield / record_attempt は
-//!   全て失敗し、再配信は即 ack)。
+//! - running job の中断は Wasm を途中で殺せないため、物理実行が戻るまで
+//!   execution_token/lease を保持する。以降の check_active は失敗し、終端
+//!   CAS が停止を確認してから予約 ID/namespace を解放する。作成予約を含む
+//!   checkpoint は解放完了まで残し、クラッシュ時は cron が回収する。
 //! - native の restorable tasks (停止時に running だったジョブ) に相当する
 //!   のは、実行中の Worker が失われて lease 切れになった `running` 行。
 //!   `claim` の lease 期限分岐が回収できるので、envelope を再送して復元する。
@@ -134,6 +134,9 @@ async fn queue_clear(req: Request, env: Env) -> worker::Result<Response> {
     // running は残す。除去済み行の tombstone は再配信防止に残すが、
     // キューの集計では失敗として数えない。
     if let Err(error) = runtime.ledger.cancel_all_pending(REASON_QUEUE_CLEARED).await {
+        return api_failure(error);
+    }
+    if let Err(error) = crate::scheduler::recover_creation_reservations(&runtime).await {
         return api_failure(error);
     }
     let running_count = match runtime.ledger.running_job_count().await {
@@ -254,6 +257,9 @@ async fn remove_pending_task(mut req: Request, env: Env) -> worker::Result<Respo
     {
         // native は削除成功 (`Ok(true)`) のみで送る。
         Ok(true) => {
+            if let Err(error) = crate::consumer::advance_terminal_creation(&runtime, &JobId(body.task_id.clone())).await {
+                return api_failure(error);
+            }
             notify_queue_changed(&env, &runtime).await;
             api_response(true, "Task removed")
         }

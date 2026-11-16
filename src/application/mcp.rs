@@ -9,6 +9,7 @@
 //! Worker の同じパス) と stdIO (バイナリ `narou_rs_mcp`) の両方で使う。
 //! 通知 (id なし) には応答しない。
 
+use super::novel_access::NovelReadScope;
 use serde_json::{json, Value};
 
 use crate::application::external_api::{
@@ -60,7 +61,7 @@ impl<'a> McpServer<'a> {
     /// 1 件の JSON-RPC 要求を処理する。
     ///
     /// 通知 (id なし) は `None` を返す (応答しない)。
-    pub async fn handle(&self, request: &Value, hidden: Option<HiddenState>) -> Option<Value> {
+    pub async fn handle(&self, scope: &mut NovelReadScope, request: &Value, hidden: Option<HiddenState>) -> Option<Value> {
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let id = request.get("id").cloned();
         let params = request.get("params").cloned().unwrap_or(Value::Null);
@@ -69,7 +70,7 @@ impl<'a> McpServer<'a> {
             "initialize" => Ok(self.initialize_result()),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(self.tool_definitions()),
-            "tools/call" => self.call_tool(&params, hidden).await,
+            "tools/call" => self.call_tool(scope, &params, hidden).await,
             _ => {
                 // 未知の通知は黙って受け流す (応答しない)。
                 id.as_ref()?;
@@ -91,12 +92,13 @@ impl<'a> McpServer<'a> {
 
     async fn call_tool(
         &self,
+        scope: &mut NovelReadScope,
         params: &Value,
         hidden: Option<HiddenState>,
     ) -> Result<Value, (i64, String)> {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-        match self.run_tool(name, &arguments, hidden).await {
+        match self.run_tool(scope, name, &arguments, hidden).await {
             Ok(text) => Ok(tool_result(text)),
             Err(message) => Ok(tool_error(message)),
         }
@@ -104,6 +106,7 @@ impl<'a> McpServer<'a> {
 
     async fn run_tool(
         &self,
+        scope: &mut NovelReadScope,
         name: &str,
         arguments: &Value,
         hidden: Option<HiddenState>,
@@ -114,7 +117,7 @@ impl<'a> McpServer<'a> {
                     .map_err(|error| error.message().to_string())?;
                 let list = self
                     .api
-                    .list(&request, hidden)
+                    .list(scope, &request, hidden)
                     .await
                     .map_err(|error| error.message().to_string())?;
                 let document = list.to_json();
@@ -137,7 +140,7 @@ impl<'a> McpServer<'a> {
                 let id = argument_id(arguments)?;
                 let novel = self
                     .api
-                    .novel(id)
+                    .novel(scope, id)
                     .await
                     .map_err(|error| error.message().to_string())?;
                 let document = serde_json::to_value(&novel)
@@ -157,7 +160,7 @@ impl<'a> McpServer<'a> {
                 let id = argument_id(arguments)?;
                 let toc = self
                     .api
-                    .toc(id)
+                    .toc(scope, id)
                     .await
                     .map_err(|error| error.message().to_string())?;
                 let document = serde_json::to_value(&toc)
@@ -182,7 +185,7 @@ impl<'a> McpServer<'a> {
                     .ok_or_else(|| "key (話番号) を指定してください".to_string())?;
                 let section = self
                     .api
-                    .section(id, key)
+                    .section(scope, id, key)
                     .await
                     .map_err(|error| error.message().to_string())?;
                 let document = serde_json::to_value(&section)
@@ -201,7 +204,7 @@ impl<'a> McpServer<'a> {
             "list_tags" => {
                 let tags = self
                     .api
-                    .tags()
+                    .tags(scope)
                     .await
                     .map_err(|error| error.message().to_string())?;
                 let document = serde_json::to_value(&tags)

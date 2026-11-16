@@ -7,12 +7,12 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use narou_rs::application::novel_access::{NovelReadLease, NovelReadScope, NovelWriteGuard};
 use narou_rs::db::NovelRecord;
 use narou_rs::downloader::types::TocFile;
 use narou_rs::downloader::util::{load_length_limit, sanitize_filename_with_limit};
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{NovelObjectKeys, NovelRepository};
-use narou_rs::transfer::ArchiveNovel;
 use narou_rs::virtual_novel::{self as core, AttributeComposition, VirtualNovelMembers};
 use serde::Deserialize;
 use serde_json::json;
@@ -50,11 +50,9 @@ struct ParentSnapshot {
 
 #[derive(Clone, Copy)]
 enum MembershipMutation<'a> {
-    Create { record: &'a NovelRecord, members: &'a [i64] },
+    Create { record: &'a NovelRecord, members: &'a [i64], reservation: &'a narou_rs::platform::NovelIdReservation },
     Append { id: i64, members: &'a [i64] },
     Reorder { id: i64, ordered: &'a [i64] },
-    /// Replace the whole membership of an existing group (import overwrite).
-    Replace { id: i64, metadata: &'a ArchiveNovel, members: &'a [i64] },
     Remove(i64),
 }
 
@@ -67,12 +65,24 @@ fn guard_new_parent(
     db: &DbHandle,
     record: &NovelRecord,
     member_ids: &[i64],
+    reservation: &narou_rs::platform::NovelIdReservation,
+    prefix: &narou_rs::platform::ObjectPrefix,
 ) -> Result<D1PreparedStatement> {
+    if reservation.id().0 != record.id { return Err(db_error("virtual creation reservation ID mismatch")); }
     let members = serde_json::to_string(member_ids).map_err(db_error)?;
     db.prepare(
         "INSERT INTO novel_id_sequence(id,next_id) SELECT 1,0 WHERE \
 EXISTS(SELECT 1 FROM novels WHERE id=?1) \
 OR EXISTS(SELECT 1 FROM novels WHERE toc_url_fold=?2) \
+OR NOT EXISTS(SELECT 1 FROM novel_id_reservations WHERE id=?1 AND generation=?4 AND available=0 AND job_id IS NULL) \
+OR EXISTS(SELECT 1 FROM worker_jobs WHERE json_valid(checkpoint_json) \
+AND CAST(json_extract(checkpoint_json,'$.creation_reservation[0]') AS INTEGER)=?1 \
+AND CAST(json_extract(checkpoint_json,'$.creation_reservation[1]') AS INTEGER)=?4) \
+OR EXISTS(SELECT 1 FROM novel_namespace_claims WHERE prefix=?5 OR novel_id=?1 OR toc_url_fold=?2) \
+OR EXISTS(SELECT 1 FROM novel_gate_bindings b JOIN novels n ON n.id=b.novel_id WHERE b.prefix=?5 AND b.novel_id<>?1) \
+OR EXISTS(SELECT 1 FROM transfer_object_refs WHERE backend<>'deleted' AND (object_key=?5 OR (object_key>=?5||'/' AND object_key<?5||'0'))) \
+OR EXISTS(SELECT 1 FROM objects o WHERE (o.object_key=?5 OR (o.object_key>=?5||'/' AND o.object_key<?5||'0')) \
+AND NOT EXISTS(SELECT 1 FROM transfer_object_refs r WHERE r.object_key=o.object_key)) \
 OR EXISTS(SELECT 1 FROM json_each(?3) m LEFT JOIN novels n ON n.id=m.value WHERE n.id IS NULL) \
 OR EXISTS(SELECT 1 FROM json_each(?3) m JOIN novels n ON n.id=m.value \
 WHERE n.ncode GLOB 'vs_[0-9]*' AND substr(n.ncode,4) NOT GLOB '*[^0-9]*')",
@@ -80,7 +90,27 @@ WHERE n.ncode GLOB 'vs_[0-9]*' AND substr(n.ncode,4) NOT GLOB '*[^0-9]*')",
         (record.id as f64).into(),
         narou_rs::db::novel_codec::fold(&record.toc_url).into(),
         members.into(),
+        (reservation.generation() as f64).into(),
+        prefix.as_ref().trim_end_matches('/').into(),
     ]).map_err(db_error)
+}
+
+/// Metadata-only creation cannot inherit an unowned legacy/S3 namespace.
+/// Real concurrent creators are excluded again in the final primary batch;
+/// the original parent epoch survives these bounded metadata reads.
+async fn require_empty_parent_namespace(objects: &dyn narou_rs::platform::ObjectStore, prefix: &narou_rs::platform::ObjectPrefix) -> Result<()> {
+    let illustrations = narou_rs::platform::ObjectPrefix::new(format!("{}/挿絵", prefix.as_ref().trim_end_matches('/')))?;
+    for prefix in [prefix.clone(), illustrations] {
+        let mut request = narou_rs::platform::ObjectListRequest::new(prefix, std::num::NonZeroUsize::new(1).expect("one metadata entry"));
+        loop {
+            let page = objects.list_page(&request).await?;
+            if page.objects.iter().any(|object| !narou_rs::platform::is_reserved_key(&object.key)) {
+                return Err(NarouError::InvalidTarget("virtual parent namespace already contains unowned files".into()));
+            }
+            match page.next_cursor { Some(next) => request.cursor = Some(next), None => break }
+        }
+    }
+    Ok(())
 }
 
 fn db_error(value: impl std::fmt::Display) -> NarouError {
@@ -109,19 +139,74 @@ async fn parent_snapshot(db: &DbHandle, id: i64) -> Result<Option<ParentSnapshot
 }
 
 async fn mutate_membership(runtime: &WorkerRuntime, mutation: MembershipMutation<'_>) -> Result<()> {
+    mutate_membership_at_origins(runtime, mutation, &std::collections::BTreeMap::new()).await
+}
+
+async fn mutate_membership_at_origins(
+    runtime: &WorkerRuntime,
+    mutation: MembershipMutation<'_>,
+    prepared: &std::collections::BTreeMap<i64, narou_rs::platform::WriteFence>,
+) -> Result<()> {
     let db = runtime.write_db();
+    // Discover affected identities, then retain one original fence for each
+    // through every membership/tag-sequence CAS retry and the final D1 batch.
+    let discovered = read(db).await?;
+    let parent_id = match mutation {
+        MembershipMutation::Create { record, .. } => record.id,
+        MembershipMutation::Append { id, .. } | MembershipMutation::Reorder { id, .. }
+        | MembershipMutation::Remove(id) => id,
+    };
+    let mut affected = std::collections::BTreeSet::new();
+    affected.insert(parent_id);
+    if let Some(members) = discovered.get(parent_id) { affected.extend(members.iter().copied()); }
+    match mutation {
+        MembershipMutation::Create { members, .. } | MembershipMutation::Append { members, .. } => affected.extend(members.iter().copied()),
+        MembershipMutation::Reorder { ordered, .. } => affected.extend(ordered.iter().copied()),
+        MembershipMutation::Remove(_) => {},
+    }
+    let repository = crate::d1_repository::D1NovelRepository::new(db.clone()).with_objects(runtime.write_objects());
+    let mut origins = Vec::with_capacity(affected.len());
+    for id in &affected {
+        let record = match mutation {
+            MembershipMutation::Create { record, .. } if *id == record.id => std::borrow::Cow::Borrowed(record),
+            _ => {
+                let record = repository.get(narou_rs::platform::NovelId(*id)).await?
+                    .ok_or_else(|| NarouError::NotFound(format!("小説 {id} がありません")))?;
+                repository.bind_record_origin(&record).await?;
+                std::borrow::Cow::Owned(record)
+            }
+        };
+        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        let origin = match prepared.get(id) {
+            Some(origin) if origin.prefix.as_ref().trim_end_matches('/') == keys.prefix().as_ref() => origin.clone(),
+            Some(_) => return Err(db_error("virtual member namespace changed after source admission")),
+            None => NovelWriteGuard::capture_for(&runtime.write_objects(), None, &keys).await?.fence().clone(),
+        };
+        origins.push(origin);
+    }
+    let storage = crate::d1_object_store::D1ObjectStore::new(db.clone());
     for _ in 0..8 {
         let Snapshot { raw_json, mut members } = read_snapshot(db).await?;
+        if members.get(parent_id).is_some_and(|members| members.iter().any(|id| !affected.contains(id))) {
+            return Err(db_error("virtual membership changed after writer admission"));
+        }
         let mut statements = Vec::new();
+        let mut guard_tokens = Vec::with_capacity(origins.len());
+        for origin in &origins {
+            let token = crate::content_store::nonce()?;
+            statements.push(storage.open_guard(origin, &token)?);
+            guard_tokens.push(token);
+        }
         let mut guarded_parent = None;
         let mut guarded_composition = None;
         let written_tags: Option<std::borrow::Cow<'_, [String]>> = match mutation {
-            MembershipMutation::Create { record, members: added } => {
+            MembershipMutation::Create { record, members: added, reservation } => {
                 members.insert(record.id, added.to_vec()).map_err(NarouError::InvalidTarget)?;
                 // The id and the portable identity must be free and every
                 // member must still be an ordinary work: the guard aborts the
                 // batch, so the publication never replaces a record.
-                statements.push(guard_new_parent(db, record, added)?);
+                let parent = prepared.get(&record.id).ok_or_else(|| db_error("virtual creation has no original parent fence"))?;
+                statements.push(guard_new_parent(db, record, added, reservation, &parent.prefix)?);
                 crate::d1_repository::push_upsert_statements(db, record, &mut statements)?;
                 Some(std::borrow::Cow::Borrowed(&record.tags))
             }
@@ -163,91 +248,6 @@ AND EXISTS(SELECT 1 FROM json_each(?10) m CROSS JOIN novels n ON n.id=m.value WH
                 members.reorder(id, ordered.to_vec()).map_err(NarouError::InvalidTarget)?;
                 None
             }
-            MembershipMutation::Replace { id, metadata, members: replacement } => {
-                core::validate_members(replacement).map_err(NarouError::InvalidTarget)?;
-                if !members.groups.contains_key(&id) {
-                    return Err(NarouError::NotFound(format!("バーチャル小説 vs_{id} は登録されていません")));
-                }
-                // A member belongs to at most one group.
-                for member in replacement {
-                    if let Some(owner) = members.owner_of(*member) && owner != id {
-                        return Err(NarouError::InvalidTarget(format!(
-                            "小説 {member} は既にバーチャル小説 vs_{owner} に属しています"
-                        )));
-                    }
-                }
-                members.groups.insert(id, replacement.to_vec());
-                let member_ids = members.get(id).expect("validated virtual novel");
-                let summary = summarize_members(runtime, member_ids).await?;
-                // The live parent on the primary: the import planned against an
-                // older snapshot, and a concurrent writer must not be erased.
-                let parent = parent_snapshot(db, id).await?
-                    .ok_or_else(|| NarouError::NotFound(format!("バーチャル小説 vs_{id} が見つかりません")))?;
-                let mut existing: Vec<String> = serde_json::from_str(&parent.tags_json).map_err(db_error)?;
-                existing.extend(metadata.tags.iter().filter(|tag| !core::is_internal_tag(tag)).cloned());
-                let tags = summary.merged_tags(id, &existing);
-                // The archived classification wins for a mixed group; a single
-                // kind is always derived from the members.
-                let requested = metadata
-                    .attribute_tag
-                    .as_deref()
-                    .or(parent.attribute_tag.as_deref());
-                let attribute = summary
-                    .composition
-                    .resolve(None, requested)
-                    .map_err(NarouError::InvalidTarget)?;
-                let folded: Vec<String> = tags
-                    .iter()
-                    .map(|tag| narou_rs::db::novel_codec::fold(tag))
-                    .collect();
-                let date = summary
-                    .latest_update
-                    .or_else(|| metadata.general_lastup.as_deref()
-                        .and_then(|date| chrono::DateTime::parse_from_rfc3339(date).ok())
-                        .map(|date| date.with_timezone(&Utc)))
-                    .map(|date| date.to_rfc3339())
-                    .map(JsValue::from)
-                    .unwrap_or(JsValue::NULL);
-                let member_json = serde_json::to_string(member_ids).map_err(db_error)?;
-                // One guarded statement writes the derived metadata and the
-                // fields an overwrite may fill, and verifies the member set
-                // inside the same transaction.
-                statements.push(db.prepare(
-                    r#"UPDATE novels SET tags_json=?1,tags_fold=?2,tags_sort=?3,general_all_no=?4,general_lastup=?5,attribute_tag=?6,
-title=CASE WHEN trim(title)='' THEN ?7 ELSE title END,
-title_fold=CASE WHEN trim(title)='' THEN ?16 ELSE title_fold END,
-author=CASE WHEN trim(author)='' THEN ?8 ELSE author END,
-author_fold=CASE WHEN trim(author)='' THEN ?17 ELSE author_fold END,
-domain=COALESCE(domain,?9),domain_fold=CASE WHEN domain IS NULL THEN ?18 ELSE domain_fold END
-WHERE id=?10 AND tags_json=?11 AND attribute_tag IS ?12
-AND ncode GLOB 'vs_[0-9]*' AND substr(ncode,4) NOT GLOB '*[^0-9]*'
-AND NOT EXISTS(SELECT 1 FROM json_each(?13) m LEFT JOIN novels n ON n.id=m.value WHERE n.id IS NULL)
-AND NOT EXISTS(SELECT 1 FROM json_each(?13) m JOIN novels n ON n.id=m.value WHERE n.ncode GLOB 'vs_[0-9]*' AND substr(n.ncode,4) NOT GLOB '*[^0-9]*')
-AND EXISTS(SELECT 1 FROM json_each(?13) m CROSS JOIN novels n ON n.id=m.value WHERE COALESCE(n.attribute_tag,'小説')='小説')=?14
-AND EXISTS(SELECT 1 FROM json_each(?13) m CROSS JOIN novels n ON n.id=m.value WHERE n.attribute_tag='漫画')=?15"#
-                ).bind(&[
-                    serde_json::to_string(&tags).map_err(db_error)?.into(), folded.join("\n").into(), folded.join("\u{1f}").into(),
-                    if summary.general_all_no > 0 { (summary.general_all_no as f64).into() } else { JsValue::NULL },
-                    date, attribute.into(),
-                    metadata.title.as_str().into(), metadata.author.as_str().into(),
-                    metadata.domain.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
-                    (id as f64).into(), parent.tags_json.as_str().into(),
-                    parent.attribute_tag.as_deref().map(JsValue::from).unwrap_or(JsValue::NULL),
-                    member_json.into(),
-                    (u8::from(summary.composition.has_novel) as f64).into(),
-                    (u8::from(summary.composition.has_manga) as f64).into(),
-                    narou_rs::db::novel_codec::fold(&metadata.title).into(),
-                    narou_rs::db::novel_codec::fold(&metadata.author).into(),
-                    metadata.domain.as_deref().map(narou_rs::db::novel_codec::fold).map(JsValue::from).unwrap_or(JsValue::NULL),
-                ]).map_err(db_error)?);
-                // The guarded update must have matched: the guard statement
-                // aborts the batch when it did not.
-                statements.push(db.prepare("INSERT INTO novel_id_sequence(id,next_id) SELECT 1,0 WHERE changes()=0"));
-                crate::d1_repository::push_tag_statements(db, id, &tags, &mut statements)?;
-                guarded_parent = Some((id, parent));
-                guarded_composition = Some((member_ids, summary.composition));
-                Some(std::borrow::Cow::Owned(tags))
-            }
             MembershipMutation::Remove(id) => {
                 if members.remove(id).is_none() {
                     return Err(NarouError::NotFound(format!("仮想小説 vs_{id} は登録されていません")));
@@ -276,7 +276,7 @@ AND EXISTS(SELECT 1 FROM json_each(?13) m CROSS JOIN novels n ON n.id=m.value WH
         ]).map_err(db_error)?);
         // Check whether this CAS wrote, not whether another writer produced the
         // same value. A duplicate append must fail after re-reading membership.
-        statements.push(db.prepare("INSERT INTO novel_id_sequence(id,next_id) SELECT 1,0 WHERE changes()=0"));
+        for token in guard_tokens { statements.push(storage.finish_publication_guard(&token)?); }
         let outcome = match db.batch(statements).await {
             Ok(results) => crate::d1_repository::ensure_batch_success(&results),
             Err(error) => Err(db_error(error)),
@@ -315,30 +315,6 @@ pub async fn load_from_env(env: &Env) -> Result<VirtualNovelMembers> {
     read(&db).await
 }
 
-/// 転送経路がメンバー構成を読むための入口。
-pub(crate) async fn load_membership(db: &DbHandle) -> Result<VirtualNovelMembers> {
-    read(db).await
-}
-
-/// 新規のバーチャル小説を公開する (レコードと所属は 1 つのトランザクション)。
-pub(crate) async fn publish_virtual_parent(
-    runtime: &WorkerRuntime,
-    record: &NovelRecord,
-    members: &[i64],
-) -> Result<()> {
-    mutate_membership(runtime, MembershipMutation::Create { record, members }).await
-}
-
-/// 既存のバーチャル小説の所属と派生メタデータを置き換える。
-/// live 行を読み直して、アーカイブが担う項目だけを反映する。
-pub(crate) async fn replace_virtual_members(
-    runtime: &WorkerRuntime,
-    id: i64,
-    metadata: &ArchiveNovel,
-    members: &[i64],
-) -> Result<()> {
-    mutate_membership(runtime, MembershipMutation::Replace { id, metadata, members }).await
-}
 
 /// D1 の所属を [`VirtualNovelDirectory`] として使うアダプタ。
 ///
@@ -377,11 +353,13 @@ async fn composition(db: &DbHandle, members: &[i64]) -> Result<AttributeComposit
 /// CROSS JOIN keeps members on the outside of the primary-key probes; otherwise
 /// the attribute index can make SQLite scan every manga for each group.
 pub(crate) async fn reconcile_attributes(db: &DbHandle) -> Result<()> {
-    db.prepare(r#"
+    const CLASSIFIED: &str = r#"
 WITH groups AS (
   SELECT CAST(g.key AS INTEGER) AS id, g.value AS members
   FROM app_state a, json_each(a.value_json) g
   WHERE a.scope='inv' AND a.key='virtual_novel_members'
+    AND (?1 IS NULL OR CAST(g.key AS INTEGER)=?1)
+    AND (?2 IS NULL OR CAST(g.key AS INTEGER)>?2)
 ), classified AS MATERIALIZED (
   SELECT g.id, CASE
     WHEN NOT EXISTS(SELECT 1 FROM json_each(g.members) m CROSS JOIN novels n ON n.id=m.value WHERE COALESCE(n.attribute_tag,'小説')<>'漫画') THEN '漫画'
@@ -391,11 +369,54 @@ WITH groups AS (
   WHERE json_array_length(g.members)>0
     AND NOT EXISTS(SELECT 1 FROM json_each(g.members) m LEFT JOIN novels n ON n.id=m.value WHERE n.id IS NULL)
 )
-UPDATE novels SET attribute_tag=(SELECT attribute FROM classified WHERE classified.id=novels.id)
-WHERE id IN (SELECT id FROM classified)
-  AND attribute_tag IS NOT (SELECT attribute FROM classified WHERE classified.id=novels.id)
-"#).run().await.map_err(db_error)?;
-    Ok(())
+"#;
+    #[derive(Deserialize)] struct Candidate { id: i64 }
+    let db = db.primary_view();
+    let repository = crate::d1_repository::D1NovelRepository::new(db.clone());
+    let objects: Arc<dyn narou_rs::platform::ObjectStore> = Arc::new(crate::d1_object_store::D1ObjectStore::new(db.clone()));
+    let storage = crate::d1_object_store::D1ObjectStore::new(db.clone());
+    let enumerate = format!("{CLASSIFIED} SELECT c.id FROM classified c JOIN novels n ON n.id=c.id WHERE n.attribute_tag IS NOT c.attribute ORDER BY c.id LIMIT 32");
+    let update = format!("{CLASSIFIED} UPDATE novels SET attribute_tag=(SELECT attribute FROM classified WHERE classified.id=novels.id) WHERE id IN (SELECT id FROM classified) AND attribute_tag IS NOT (SELECT attribute FROM classified WHERE classified.id=novels.id)");
+    let mut after = None;
+    loop {
+        let page = db.prepare(&enumerate).bind(&[JsValue::NULL, after.map(|id: i64| JsValue::from_f64(id as f64)).unwrap_or(JsValue::NULL)])
+            .map_err(db_error)?.all().await.map_err(db_error)?.results::<Candidate>().map_err(db_error)?;
+        if page.is_empty() { return Ok(()); }
+        for candidate in page {
+            after = Some(candidate.id);
+            let Some(record) = repository.get(candidate.id.into()).await? else { continue; };
+            repository.bind_record_origin(&record).await?;
+            let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+            let guard = match NovelWriteGuard::capture_for(&objects, None, &keys).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let gate = objects.access_fence().ok_or_else(|| db_error("novel access fence unavailable"))?;
+                    if gate.gate_info(&keys.prefix().clone().into()).await?.state != narou_rs::platform::GateState::Open {
+                        // No completion marker is written; the next request
+                        // reconciles this parent after its publication opens.
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let token = crate::content_store::nonce()?;
+            let statements = vec![
+                storage.open_guard(guard.fence(), &token)?,
+                db.prepare(&update).bind(&[JsValue::from_f64(candidate.id as f64), JsValue::NULL]).map_err(db_error)?,
+                storage.finish_publication_guard(&token)?,
+            ];
+            let committed = match db.batch(statements).await {
+                Ok(results) => crate::d1_repository::ensure_batch_success(&results),
+                Err(error) => Err(db_error(error)),
+            };
+            if let Err(error) = committed {
+                let gate = objects.access_fence().ok_or_else(|| db_error("novel access fence unavailable"))?;
+                let current = gate.gate_info(guard.prefix()).await?;
+                if current.state != narou_rs::platform::GateState::Open || current.epoch != guard.epoch() { continue; }
+                return Err(error);
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -409,26 +430,57 @@ pub async fn handle_attribute(mut req: Request, env: Env, id: i64) -> worker::Re
         Err(_) => return Ok(Response::from_json(&json!({"success":false,"message":"invalid JSON body"}))?.with_status(400)),
     };
     let db = DbHandle::primary(Arc::new(env.d1("DB")?));
+    let runtime = match WorkerRuntime::build_ui(&env).await {
+        Ok(runtime) => runtime,
+        Err(error) => return Err(error),
+    };
+    let repository = crate::d1_repository::D1NovelRepository::new(db.clone()).with_objects(runtime.write_objects());
     let result = async {
+        let parent = repository.get(narou_rs::platform::NovelId(id)).await.map_err(db_error)?
+            .ok_or_else(|| db_error("小説レコードがありません"))?;
+        repository.bind_record_origin(&parent).await.map_err(db_error)?;
+        let keys = NovelObjectKeys::new(&parent.sitename, &parent.file_title, parent.use_subdirectory)?;
+        let guard = NovelWriteGuard::capture_for(&runtime.write_objects(), None, &keys).await.map_err(db_error)?;
+        let origin = guard.fence().clone();
         let snapshot = db.prepare(SELECT_SQL).first::<Row>(None).await.map_err(db_error)?
             .ok_or_else(|| db_error("バーチャル小説は登録されていません"))?.value_json;
         let groups: VirtualNovelMembers = serde_json::from_str(&snapshot).map_err(db_error)?;
         let ids = groups.get(id).ok_or_else(|| NarouError::NotFound(format!("仮想小説 vs_{id} は登録されていません")))?;
+        let mut origins = vec![origin];
+        for member in ids {
+            let record = repository.get((*member).into()).await?
+                .ok_or_else(|| NarouError::NotFound(format!("小説 {member} がありません")))?;
+            repository.bind_record_origin(&record).await?;
+            let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+            let guard = NovelWriteGuard::capture_for(&runtime.write_objects(), None, &keys).await?;
+            origins.push(guard.fence().clone());
+        }
         let types = composition(&db, ids).await?;
         if !types.is_mixed() {
             return Err(NarouError::InvalidTarget("混在していないバーチャル小説の属性タグは変更できません".into()));
         }
         let attribute = types.resolve(Some(&body.attribute_tag), None).map_err(NarouError::InvalidTarget)?;
         let member_json = serde_json::to_string(ids).map_err(db_error)?;
-        let updated = db.prepare(r#"
+        let storage = crate::d1_object_store::D1ObjectStore::new(db.clone());
+        let mut tokens = Vec::with_capacity(origins.len());
+        let mut statements = Vec::new();
+        for origin in &origins {
+            let token = crate::content_store::nonce()?;
+            statements.push(storage.open_guard(origin, &token)?);
+            tokens.push(token);
+        }
+        statements.push(db.prepare(r#"
 UPDATE novels SET attribute_tag=?1 WHERE id=?2
 AND EXISTS(SELECT 1 FROM app_state WHERE scope='inv' AND key='virtual_novel_members' AND value_json=?3)
 AND EXISTS(SELECT 1 FROM json_each(?4) m JOIN novels n ON n.id=m.value WHERE n.attribute_tag='漫画')
 AND EXISTS(SELECT 1 FROM json_each(?4) m JOIN novels n ON n.id=m.value WHERE COALESCE(n.attribute_tag,'小説')='小説')
 AND NOT EXISTS(SELECT 1 FROM json_each(?4) m LEFT JOIN novels n ON n.id=m.value WHERE n.id IS NULL)
 RETURNING id"#)
-            .bind(&[attribute.into(), (id as f64).into(), snapshot.into(), member_json.into()]).map_err(db_error)?
-            .all().await.map_err(db_error)?.results::<IdRow>().map_err(db_error)?;
+            .bind(&[attribute.into(), (id as f64).into(), snapshot.into(), member_json.into()]).map_err(db_error)?);
+        for token in &tokens { statements.push(storage.finish_publication_guard(token)?); }
+        let updated = db.batch(statements).await.map_err(db_error)?
+            .into_iter().nth(origins.len()).ok_or_else(|| db_error("attribute update result missing"))?
+            .results::<IdRow>().map_err(db_error)?;
         if updated.is_empty() { return Err(db_error("メンバー構成が変更されました。再試行してください")); }
         Ok(attribute)
     }.await;
@@ -449,16 +501,26 @@ pub async fn handle_classify(mut req: Request, env: Env) -> worker::Result<Respo
         Err(_) => return Ok(Response::from_json(&json!({"success":false,"message":"invalid JSON body"}))?.with_status(400)),
     };
     let db = DbHandle::primary(Arc::new(env.d1("DB")?));
+    let objects: Arc<dyn narou_rs::platform::ObjectStore> = Arc::new(crate::d1_object_store::D1ObjectStore::new(db.clone()));
+    let repository: Arc<dyn narou_rs::platform::NovelRepository> = Arc::new(crate::d1_repository::D1NovelRepository::new(db.clone()));
+    let content = narou_rs::application::NovelContentService::new(repository, objects);
+    let mut scope = content.read_scope("virtual-classification");
     let result = async {
         let members = core::parse_member_ids(&body.members).map_err(NarouError::InvalidTarget)?;
+        for id in &members {
+            content.read_record(&mut scope, narou_rs::platform::NovelId(*id)).await
+                .map_err(db_error)?.ok_or_else(|| NarouError::NotFound(format!("小説 {id} がありません")))?;
+        }
         let types = composition(&db, &members).await?;
+        scope.refresh_all().await.map_err(db_error)?;
         let tag = types.resolve(None,None).map_err(NarouError::InvalidTarget)?;
         Ok::<_,NarouError>((types.is_mixed(),tag))
     }.await;
-    match result {
+    let response = match result {
         Ok((mixed,tag)) => Response::from_json(&json!({"success":true,"mixed":mixed,"attribute_tag":tag})),
         Err(error) => Ok(Response::from_json(&json!({"success":false,"message":error.to_string()}))?.with_status(400)),
-    }
+    };
+    crate::webui::leased_response(response, scope).await
 }
 
 #[derive(Deserialize)]
@@ -483,9 +545,12 @@ struct VirtualRequest {
 async fn count_sections(runtime: &WorkerRuntime, record: &NovelRecord) -> Result<i64> {
     let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
         .map_err(|error| NarouError::Platform(error.to_string()))?;
-    let Some(bytes) = runtime.objects().read_small(&keys.toc()).await? else {
-        return Ok(0);
-    };
+    let mut lease = NovelReadLease::admit_for(&runtime.write_objects(), &keys, "virtual-section-count").await?;
+    let read = lease.read_small(&keys.toc()).await;
+    let released = lease.release().await;
+    let bytes = read?;
+    released?;
+    let Some(bytes) = bytes else { return Ok(0); };
     let toc: TocFile = serde_yaml::from_slice(&bytes)
         .map_err(|error| NarouError::Platform(format!("toc.yaml: {error}")))?;
     Ok(toc.subtitles.len() as i64)
@@ -501,12 +566,23 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
             "メンバーを指定してください".into(),
         ));
     }
+    let repository = crate::d1_repository::D1NovelRepository::new(runtime.write_db().clone()).with_objects(runtime.write_objects());
+    let mut origins = std::collections::BTreeMap::new();
+    for id in &members {
+        let record = repository.get_current((*id).into()).await?
+            .ok_or_else(|| NarouError::NotFound(format!("小説 {id} がありません")))?;
+        repository.bind_record_origin(&record).await?;
+        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        let guard = NovelWriteGuard::capture_for(&runtime.write_objects(), None, &keys).await?;
+        origins.insert(*id, guard.fence().clone());
+    }
     let summary = summarize_members(runtime, &members).await?;
     if body.tags.iter().any(|tag| narou_rs::application::attribute_tags::is_attribute_tag(tag.trim())) {
         return Err(NarouError::InvalidTarget("属性タグは編集できません".into()));
     }
 
     let attribute = summary.composition.resolve(body.attribute_tag.as_deref(), None).map_err(NarouError::InvalidTarget)?;
+    let toc_url = core::new_toc_url()?;
     let reservation = runtime.novels.allocate_id().await?;
     let id = reservation.id().0;
     let ncode = core::ncode(id);
@@ -534,7 +610,7 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         file_title,
         // The transfer identity is portable: it addresses the same group in
         // another library, unlike the library-local `vs_<ID>` ncode.
-        toc_url: core::new_toc_url()?,
+        toc_url,
         sitename: body.sitename,
         novel_type: 0,
         end: true,
@@ -559,8 +635,18 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
         extra_fields: Default::default(),
     };
     record.set_attribute_tag(attribute);
-    if let Err(error) = mutate_membership(runtime, MembershipMutation::Create { record: &record, members: &members }).await {
-        let _ = runtime.novels.release_id(reservation).await;
+    let publish = async {
+        let objects = runtime.write_objects();
+        let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        let parent = NovelWriteGuard::capture_for(&objects, None, &keys).await?;
+        require_empty_parent_namespace(objects.as_ref(), parent.prefix()).await?;
+        origins.insert(id, parent.fence().clone());
+        mutate_membership_at_origins(runtime, MembershipMutation::Create { record: &record, members: &members, reservation: &reservation }, &origins).await
+    }.await;
+    if let Err(error) = publish {
+        if let Err(release) = runtime.novels.release_id(reservation).await {
+            return Err(db_error(format!("{error}; virtual creation reservation release failed: {release}")));
+        }
         return Err(error);
     }
     Ok(record)
@@ -569,14 +655,14 @@ async fn create(runtime: &WorkerRuntime, body: VirtualRequest) -> Result<NovelRe
 pub(crate) async fn summarize_members(runtime: &WorkerRuntime, members: &[i64]) -> Result<core::MemberSummary> {
     core::validate_members(members).map_err(NarouError::InvalidTarget)?;
     // Mutation retries must not reuse a possibly stale read-replica snapshot.
-    let repository = crate::d1_repository::D1NovelRepository::new(runtime.write_db().clone());
+    let repository = crate::d1_repository::D1NovelRepository::new(runtime.write_db().clone()).with_objects(runtime.write_objects());
     let records = narou_rs::application::virtual_book::load_member_records(&repository, members).await?;
     let mut summary = core::MemberSummary::default();
     for member in members {
         let record = &records[member];
         let count = match record.general_all_no {
             Some(count) if count > 0 => count,
-            _ => count_sections(runtime, record).await.unwrap_or(0),
+            _ => count_sections(runtime, record).await?,
         };
         summary.add(record, count, record.attribute_tag());
     }
@@ -605,6 +691,7 @@ pub async fn download_epub(req: Request, env: Env, id: i64) -> worker::Result<Re
 }
 
 pub(crate) async fn load_book(
+    scope: NovelReadScope,
     db: &DbHandle,
     record: &NovelRecord,
     repository: &dyn NovelRepository,
@@ -614,7 +701,7 @@ pub(crate) async fn load_book(
     let ids = members.get(record.id).ok_or_else(|| {
         NarouError::NotFound(format!("バーチャル小説 {} がありません", record.id))
     })?;
-    narou_rs::application::virtual_book::load(record, ids, repository, persistence).await
+    narou_rs::application::virtual_book::load(scope, record, ids, repository, persistence).await
 }
 
 #[derive(Deserialize)]
@@ -697,29 +784,48 @@ pub async fn handle_add_members(mut req: Request, env: Env, id: i64) -> worker::
     }
 }
 
+async fn list_read_only(env: &Env) -> worker::Result<Response> {
+    crate::webui::metadata::initialize_attributes(env).await?;
+    let db = DbHandle::primary(Arc::new(env.d1("DB")?));
+    let objects: Arc<dyn narou_rs::platform::ObjectStore> = Arc::new(crate::d1_object_store::D1ObjectStore::new(db.clone()));
+    let repository: Arc<dyn NovelRepository> = Arc::new(crate::d1_repository::D1NovelRepository::new(db.clone()));
+    let content = narou_rs::application::NovelContentService::new(repository, objects.clone());
+    let mut scope = content.read_scope("virtual-library-list");
+    let result = async {
+        let members = read(&db).await.map_err(crate::stream_error)?;
+        let mut ids = members.all_member_ids();
+        ids.extend(members.groups.keys().copied());
+        let ids: Vec<_> = ids.into_iter().map(narou_rs::platform::NovelId).collect();
+        let admitted = match content.read_records(&mut scope, &ids).await {
+            Ok(records) => records,
+            Err(error) => return crate::webui::application_error_response(&error),
+        };
+        let mut records = std::collections::BTreeMap::new();
+        for (id, record) in ids.into_iter().zip(admitted) {
+            match record {
+                Some(record) => { records.insert(id.0, record); }
+                None => return crate::webui::json_error(409, "conflict", Some("virtual membership changed during listing")),
+            }
+        }
+        let sites = crate::bundled_sites::load_site_settings(&objects).await.map_err(crate::stream_error)?;
+        scope.refresh_all().await.map_err(crate::stream_error)?;
+        if read(&db).await.map_err(crate::stream_error)? != members {
+            return crate::webui::json_error(409, "conflict", Some("virtual membership changed during listing"));
+        }
+        scope.refresh_all().await.map_err(crate::stream_error)?;
+        let novels = narou_rs::application::virtual_book::list_entries(&members, &sites, |id| records.get(&id));
+        Response::from_json(&json!({"success":true,"novels":novels}))
+    }.await;
+    crate::webui::leased_response(result, scope).await
+}
+
 pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
+    if let Some(response) = crate::auth_failure(&req, &env).await { return response; }
+    if req.path() == "/api/virtual_novels" && req.method() == Method::Get {
+        return list_read_only(&env).await;
+    }
     let runtime = WorkerRuntime::build_ui(&env).await?;
     match (req.path().as_str(), req.method()) {
-        ("/api/virtual_novels", Method::Get) => {
-            let members = match read(runtime.write_db()).await {
-                Ok(members) => members,
-                Err(error) => {
-                    return Ok(Response::from_json(
-                        &json!({"success":false,"message":error.to_string()}),
-                    )?
-                    .with_status(503));
-                }
-            };
-            // build_ui already reconciled attributes. Read the records from
-            // primary too, so the response cannot undo that with replica lag.
-            let repository = crate::d1_repository::D1NovelRepository::new(runtime.write_db().clone());
-            let novels = narou_rs::application::virtual_book::load_listing(
-                &repository, &members, runtime.site_settings(),
-            ).await.map_err(|error| worker::Error::RustError(error.to_string()))?;
-            Ok(Response::from_json(
-                &json!({"success":true,"novels":novels}),
-            )?)
-        }
         ("/api/virtual_novels", Method::Post) => {
             let body: VirtualRequest = match req.json().await {
                 Ok(body) => body,

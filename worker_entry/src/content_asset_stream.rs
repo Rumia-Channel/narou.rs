@@ -48,10 +48,23 @@ impl ContentStore {
         range_from_stream(self.read_content_stream(key).await?.ok_or_else(|| error("content disappeared"))?, range).await.map(Some)
     }
 
+    pub(super) async fn read_content_stream_range(&self,key:&ObjectKey,range:std::ops::Range<u64>)->Result<Option<AssetStream>>{
+        if is_private_or_generated(key)||narou_rs::platform::is_transfer_key(key){return self.remote_assets.read_stream_range(key,range).await;}
+        if !is_content_key(key){return self.legacy.read_stream_range(key,range).await;}
+        let Some(row)=self.reference(key).await?else{if key.as_ref().ends_with("/novel.txt")||backend(&self.db).await?!=ContentBackend::S3{return self.legacy.read_stream_range(key,range).await;}return Ok(None);};
+        let end=if range.end==u64::MAX{row.size}else{range.end};if range.start>end||end>row.size{return Err(error("content range exceeds object"));}
+        if row.encoding=="none"{return self.remote_assets.read_stream_range(&ObjectKey::try_new(row.blob_key)?,range.start..end).await;}
+        let stream=self.read_content_stream(key).await?.ok_or_else(||error("content disappeared"))?;Ok(Some(narou_rs::platform::asset_codec::slice_stream(stream,range.start..end)))
+    }
+
     pub(super) async fn write_content_stream(&self, key: &ObjectKey, stream: AssetStream) -> Result<()> {
+        self.write_content_stream_with_fence(key,stream,None).await
+    }
+
+    pub(super) async fn write_content_stream_with_fence(&self, key: &ObjectKey, stream: AssetStream, fence: Option<&narou_rs::platform::WriteFence>) -> Result<()> {
         if is_private_or_generated(key) { return self.remote_assets.write_stream(key, stream).await; }
         if !is_content_key(key) || backend(&self.db).await? == ContentBackend::D1 {
-            return self.legacy.write_stream(key, stream).await;
+            return match fence { Some(fence)=>self.legacy.write_stream_guarded(fence,key,stream).await, None=>self.legacy.write_stream(key,stream).await };
         }
         let crc = Arc::new(std::sync::Mutex::new(PayloadCrc32::new()));
         let progress = crc.clone();
@@ -67,7 +80,7 @@ impl ContentStore {
             let row = Reference { object_key: key.to_string(), blob_key: blob.to_string(), size: stage.size,
                 stored_size: stage.size, encoding: "none".into(), crc32: crc, sha256: stage.sha256,
                 updated_at: now, content_type: content_type_for_key(key).map(str::to_owned), verified: 1 };
-            if !self.commit_reference(&row, "*", "").await? { return Err(error("asset publication conflict")); }
+            if !self.commit_reference_guarded(&row, "*", "", fence).await? { return Err(error("asset publication conflict")); }
             self.collect_garbage(4).await?;
             Ok(())
         }.await;

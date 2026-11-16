@@ -31,7 +31,7 @@ fn encode_query(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>().replace('+', "%20")
 }
 
-fn xml_text(body: &[u8], field: &str) -> Result<String> {
+pub(super) fn xml_text(body: &[u8], field: &str) -> Result<String> {
     let xml = std::str::from_utf8(body).map_err(|_| NarouError::Platform("S3 returned non-UTF8 XML".into()))?;
     if super::super::s3_request::find_tag(xml, "Error").is_some() {
         return Err(NarouError::Platform("S3 operation returned Error XML".into()));
@@ -40,11 +40,11 @@ fn xml_text(body: &[u8], field: &str) -> Result<String> {
         .ok_or_else(|| NarouError::Platform(format!("S3 response missing {field}")))
 }
 
-fn xml_escape(value: &str) -> String {
+pub(super) fn xml_escape(value: &str) -> String {
     value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 
-fn require_status(response: &super::super::http::HttpResponse, allowed: &[u16], operation: &str) -> Result<()> {
+pub(super) fn require_status(response: &super::super::http::HttpResponse, allowed: &[u16], operation: &str) -> Result<()> {
     if !allowed.contains(&response.status) {
         return Err(NarouError::Platform(format!("S3 {operation} failed with status {}", response.status)));
     }
@@ -133,7 +133,7 @@ impl S3Store {
         Ok(())
     }
 
-    async fn abort_upload(&self, key: &ObjectKey, upload_id: &str) -> Result<()> {
+    pub(super) async fn abort_upload(&self, key: &ObjectKey, upload_id: &str) -> Result<()> {
         let url = format!("{}?uploadId={}", self.location.object_url(key), encode_query(upload_id));
         let (response, _) = self.send(HttpMethod::Delete, &url, &[], None, Some(XML_LIMIT)).await?;
         require_status(&response, &[200, 204, 404], "abort multipart")
@@ -227,7 +227,7 @@ impl S3Store {
         result
     }
 
-    async fn upload_part(&self, url: &str, upload_id: &str, number: usize, part: Vec<u8>) -> Result<String> {
+    pub(super) async fn upload_part(&self, url: &str, upload_id: &str, number: usize, part: Vec<u8>) -> Result<String> {
         if number > 10_000 { return Err(NarouError::Platform("S3 multipart part-count limit exceeded".into())); }
         let url = format!("{url}?partNumber={number}&uploadId={}", encode_query(upload_id));
         let (response, _) = self.send(HttpMethod::Put, &url, &[], Some(part), Some(XML_LIMIT)).await?;
@@ -327,7 +327,7 @@ pub(super) fn metadata_size(response: &HttpStreamResponse) -> Result<u64> {
     }
 }
 
-fn content_range(response: &HttpStreamResponse) -> Result<(Range<u64>, u64)> {
+pub(super) fn content_range(response: &HttpStreamResponse) -> Result<(Range<u64>, u64)> {
     let header = response.header("content-range").and_then(|value| value.strip_prefix("bytes "))
         .ok_or_else(|| NarouError::Platform("S3 range omitted Content-Range".into()))?;
     let (span, total) = header.split_once('/').ok_or_else(|| NarouError::Platform("invalid Content-Range".into()))?;
@@ -355,7 +355,7 @@ pub(super) fn validate_content_range(response: &HttpStreamResponse, range: &Rang
     Ok(total)
 }
 
-fn exact_stream(stream: AssetStream, expected: Option<u64>) -> AssetStream {
+pub(super) fn exact_stream(stream: AssetStream, expected: Option<u64>) -> AssetStream {
     Box::pin(futures::stream::try_unfold((stream, 0u64), move |(mut stream, total)| async move {
         match stream.next().await {
             Some(chunk) => {
