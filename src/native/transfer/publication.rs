@@ -135,7 +135,11 @@ impl NativeTransferBackend {
             0=>{let step=self.release_snapshot_page(&session.session_id,state.cursor.as_deref()).await?;state.cursor=step.cursor;if step.done{state.phase=1;state.cursor=None;}},
             1=>{
                 let(leases,next)=self.primary.stage_lease_page(state.cursor.as_deref(),MAX_PAGE_ITEMS).await.map_err(TransferError::platform)?;
-                for lease in leases{if lease.owner==session.session_id.0&&!self.primary.stage_reclaim(&lease.stage_id,&lease.owner,lease.epoch).await.map_err(TransferError::platform)?{return Ok(PublicationStep{cursor:Some(serde_json::to_string(&state).map_err(TransferError::platform)?),..Default::default()});}}
+                for lease in leases{if lease.owner==session.session_id.0{
+                    // A terminal owner can never renew its lease, so the 24h stage TTL must not delay collection: abort first under the same (owner, epoch) CAS to mark `Aborting` and drain bounded checkpoint pages, then reclaim.
+                    self.primary.stage_abort(&lease.stage_id,&lease.owner,lease.epoch).await.map_err(TransferError::platform)?;
+                    if !self.primary.stage_reclaim(&lease.stage_id,&lease.owner,lease.epoch).await.map_err(TransferError::platform)?{return Ok(PublicationStep{cursor:Some(serde_json::to_string(&state).map_err(TransferError::platform)?),..Default::default()});}
+                }}
                 state.cursor=next;if state.cursor.is_none(){state.phase=2;}
             },
             2=>{
@@ -160,3 +164,7 @@ impl NativeTransferBackend {
         Ok(PublicationStep{cursor:Some(serde_json::to_string(&state).map_err(TransferError::platform)?),..Default::default()})
     }
 }
+
+#[cfg(test)]
+#[path="publication_tests.rs"]
+mod tests;

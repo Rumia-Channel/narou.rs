@@ -25,8 +25,9 @@ fn reset_removes_only_that_unverified_files_receipts_and_counter(){block_on(asyn
 
 #[test]
 fn session_cursor_orders_nanoseconds_not_random_ids(){block_on(async{
-    let root=tempfile::tempdir().unwrap();let journal=NativeTransferJournal::open(root.path()).unwrap();for(id,nanos)in[("a",2),("z",0),("b",1)]{let mut row=session(id);row.updated_at=DateTime::from_timestamp(1_700_000_000,nanos).unwrap();journal.create_session(&row).await.unwrap();}
-    let mut cursor=None;let mut ids=Vec::new();loop{let page=journal.list_sessions(&scope(),cursor.as_deref(),1).await.unwrap();ids.extend(page.items.into_iter().map(|row|row.session_id.0));cursor=page.next_cursor;if cursor.is_none(){break;}}assert_eq!(ids,["z","b","a"]);
+    // Two active sessions exercise sub-microsecond ordering and a page boundary without exceeding admission.
+    let root=tempfile::tempdir().unwrap();let journal=NativeTransferJournal::open(root.path()).unwrap();for(id,nanos)in[("a",2),("z",0)]{let mut row=session(id);row.updated_at=DateTime::from_timestamp(1_700_000_000,nanos).unwrap();journal.create_session(&row).await.unwrap();}
+    let mut cursor=None;let mut ids=Vec::new();loop{let page=journal.list_sessions(&scope(),cursor.as_deref(),1).await.unwrap();ids.extend(page.items.into_iter().map(|row|row.session_id.0));cursor=page.next_cursor;if cursor.is_none(){break;}}assert_eq!(ids,["z","a"]);
 })}
 
 #[test]
