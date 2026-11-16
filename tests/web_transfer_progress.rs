@@ -311,7 +311,8 @@ fn native_web_v2_sqlite_db_only_imports_exports_and_recovers_without_mirror_file
     let mut mirrored=Vec::new();let mut stack=vec![target.join("小説データ")];
     while let Some(directory)=stack.pop(){if !directory.is_dir(){continue;}for entry in std::fs::read_dir(&directory).unwrap(){let entry=entry.unwrap();if entry.file_type().unwrap().is_dir(){stack.push(entry.path());}else{mirrored.push(entry.path());}}}
     assert!(mirrored.is_empty(),"DB-only import must not materialize novel files: {mirrored:?}");
-    let connection=narou_rs::native::sqlite::open(&target.join(".narou/db.sqlite")).unwrap();
+    let database_connection=narou_rs::native::sqlite::open(&target.join(".narou/db.sqlite")).unwrap();
+    let connection=database_connection.lock();
     let novel_id:i64=connection.query_row("SELECT id FROM novels WHERE toc_url=?",[&manifest.novels[0].toc_url],|row|row.get(0)).unwrap();
     let referenced:i64=connection.query_row("SELECT COUNT(*) FROM transfer_object_refs",[],|row|row.get(0)).unwrap();
     assert_eq!(referenced as usize,manifest.novels[0].files.len(),"every published file must reference a stored blob");
@@ -321,6 +322,7 @@ fn native_web_v2_sqlite_db_only_imports_exports_and_recovers_without_mirror_file
     let mark:Vec<u8>=connection.query_row("SELECT value FROM transfer_backend_marks WHERE key=?1",[format!("commit:{session}:0")],|row|row.get(0)).unwrap();
     assert_eq!(mark,expected,"SQL durable mark must be the immutable expected receipt");
     assert_eq!(std::fs::read(publication_root.join("metadata-resolved")).unwrap(),b"committed");
+    drop(connection);
     // Export the same record back through v2: DB-only reads are served by the
     // object store and must reproduce the imported manifest and payload bytes.
     let secret=hex::encode([7u8;32]);
