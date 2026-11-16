@@ -376,7 +376,14 @@ fn capture_library_backup_with_stores(
     use crate::platform::{GateState, ObjectStore, ObjectPrefix};
     let stage = tempfile::Builder::new().prefix("narou-library-backup-").tempdir()?;
     let objects = crate::native::materialization::read_store_with(&stores);
-    let exclude_dir = exclude_dir.map(Path::canonicalize).transpose()?
+    // Store backends resolve every canonical path through
+    // `ensure_within_archive_root` (canonical spelling without the `\\?\`
+    // verbatim marker). Normalize the library root and the exclusion to the
+    // same spelling or `strip_prefix`/`starts_with` always fail on Windows.
+    let root = &crate::db::paths::ensure_within_archive_root(root, root)?;
+    let exclude_dir = exclude_dir
+        .map(|path| crate::db::paths::ensure_within_archive_root(path, path))
+        .transpose()?
         .filter(|path| path.starts_with(root));
     if exclude_dir.as_ref().is_some_and(|path| path == root || path.starts_with(root.join(".narou")) || path.starts_with(root.join(".narousetting"))) {
         return Err(NarouError::Platform("backup destination cannot exclude the library root or its authoritative metadata".into()));
@@ -399,7 +406,7 @@ fn capture_library_backup_with_stores(
                 }
                 sources.push((stores.primary.novel_directory(&prefix)?, prefix, info.content_revision));
             }
-            let mut directories = sources.iter().map(|(path, _, _)| if path.exists() { path.canonicalize() } else { Ok(path.clone()) }).collect::<io::Result<Vec<_>>>()?;
+            let mut directories = sources.iter().map(|(path, _, _)| if path.exists() { crate::db::paths::ensure_within_archive_root(path, path) } else { Ok(path.clone()) }).collect::<Result<Vec<_>>>()?;
             directories.sort();
             if directories.windows(2).any(|pair| pair[1].starts_with(&pair[0])) {
                 return Err(NarouError::Platform("ambiguous overlapping physical backup directories".into()));
