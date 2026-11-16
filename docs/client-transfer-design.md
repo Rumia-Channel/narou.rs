@@ -544,9 +544,13 @@ CI は core・adapter・WASM 単体に加え、**生成済み配布assetsを使�
 | Firefox の実 ZIP 保存 | 一時停止後に同じ export session から保存し直し、独立した Python ZIP reader で全3 entry と利用者ファイルの SHA-256 を照合。raw が保存先・再書き出し ZIP に入らないことを確認 |
 | SW の長い確認待ち | 修正前は、最初の write 前に6分待つと、queue の0/1のどちらでも0 byteの保存と次の write の待機が発生。修正後の実 Firefox では、最初の byte 前に6分待つ場合と、64 KiB出力後に6分止める場合の両方で1 MiBを保存し、独立したSHA-256を一致させた |
 | 消費者回帰 | `tests/transfer_streaming.test.mjs` は33件成功。確認待ち・中継状態消失は修正前の実配布JSで「期待 byte が無い」「write が未完了」と失敗し、修正後は成功。EOF と heartbeat の競合も修正前の close 失敗を再現し、修正後の成功を確認 |
-| Rust の全 target / feature | `cargo clippy --workspace --all-targets --all-features -- -D warnings` は exit 0。vendored dependency と native host 用 Worker manifest の既存警告は別途表示される |
+| 配布 artifact の契約 | `tests/transfer_artifacts.test.mjs` は12件成功。欠落・hash/URL不整合・worker依存・lean依存境界を検査 |
+| workerd/D1 の故障契約 | `worker_entry/tests/transfer.mjs` は終了コード0。ACK再送・再起動再開・部分batch/SHA不一致・仮想メンバー消失時のplan競合・全pin確定までのgate保持・旧epoch解放拒否を確認。50,000件の挿絵索引と、12 MiB YAML / 3 MiB scalar / 18 MiB escaped JSON の実処理で、D1 fragmentは32 KiB以下、測定したWASM領域は112 MiB未満。S3・一般Web契約とは別検証 |
+| Chromium の保存経路 | 実クリックから `showSaveFilePicker` の呼び出しへ到達したが、MCP環境ではネイティブ保存ダイアログを操作できず、実picker経由は未確認。実OPFS handleでの1 MiB超の書き込み・独立SHA照合は部分証拠であり、pickerやアプリ全体の成功には数えない |
+| Cloudflare の隔離 fixture | Worker/D1の作成後、capabilitiesのready確認で停止し、128 MiBの実行試験へは未到達。通常・保証用の両cleanup jobは成功。provider予算の確認済みとは扱わない |
+| Rust の全 target / feature | Native GC・仮想メンバーURL索引・共有挿絵poolの追加修正後も `cargo clippy --workspace --all-targets --all-features -- -D warnings` はexit 0。vendored dependency とnative host用Worker manifestの既存警告は別途表示される。テスト全体の成功を意味しない |
 
-Native の保存方式別の実ブラウザ、大容量・4 GiB超の実ブラウザ、Chromium FSA、Worker の完全な故障契約・128 MiB/provider予算は、まだ完了として記載しない。途中で資源割当てエラーになった workerd 契約実行も成功には数えない。以後の結果はこの節へ追記し、未確認を除外して完了扱いしない。
+Nativeの保存方式別の実ブラウザ、大容量・4 GiB超の実ブラウザ、Chromium FSA、WorkerのS3・一般Web契約と128 MiB/provider予算は、まだ完了として記載しない。途中の `Array buffer allocation failed` は、テストhelperのpath上書きによりNodeが巨大な失敗差分を生成した箇所で発生した。helperと比較方法を修正しており、Worker OOMの実証にも成功結果にも数えない。以後の結果はこの節へ追記し、未確認を除外して完了扱いしない。
 
 
 ## 17. 参照と設計検証の範囲

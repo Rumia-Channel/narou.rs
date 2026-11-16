@@ -20,6 +20,8 @@ assert.match(pin,/^\d+\.\d+\.\d+$/,'Wrangler must be exactly pinned');
 const mode=process.argv[2]??'run';
 assert(['provision','run','cleanup'].includes(mode));
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+// Match the established deployment probe and downloader DEFAULT_USER_AGENT.
+const probeUserAgent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0';
 async function api(path,{method='GET',body,missing=false}={}){
   const response=await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}${path}`,{method,headers:{authorization:`Bearer ${apiToken}`,'content-type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(mode==='cleanup'?20000:90000)});
   if(missing&&response.status===404)return null;
@@ -70,13 +72,18 @@ async function provision(){
   const date=/^compatibility_date\s*=\s*"([\d-]+)"/m.exec(readFileSync(join(root,'wrangler.toml'),'utf8'))?.[1];assert(date);
   const config=join(directory,'wrangler.json');
   writeFileSync(config,JSON.stringify({name:state.workerName,account_id:account,main:join(root,'tests/transfer_failure_worker.mjs'),compatibility_date:date,workers_dev:true,preview_urls:false,limits:{cpu_ms:300000},vars:{NAROU_AUTH_REQUIRED:'true',NAROU_REQUIRE_S3:'false',NAROU_WORKER_ROLE:'writer'},assets:{directory:join(root,'public'),binding:'ASSETS',html_handling:'auto-trailing-slash',not_found_handling:'none'},d1_databases:[{binding:'DB',database_name:state.databaseName,database_id:state.databaseId,migrations_dir:join(root,'migrations')}],durable_objects:{bindings:[{name:'RATE_LIMITER',class_name:'SiteRateLimiter'},{name:'PUSH_HUB',class_name:'PushHub'}]},migrations:[{tag:'fixture-v1',new_sqlite_classes:['SiteRateLimiter','PushHub']}]}));
-  save(state);wrangler(['d1','migrations','apply','DB','--remote','--config',config]);wrangler(['deploy','--config',config,'--secrets-file',secrets]);
-  let ready=false;
+  save(state);wrangler(['d1','migrations','apply','DB','--remote','--config',config]);
+  // A new library defaults to S3. This isolated fixture deliberately has no S3 binding.
+  const storage=join(directory,'storage.sql');
+  writeFileSync(storage,`INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES('inv','content_backend','"d1"','d1'),('inv','asset_backend','"d1"','d1');`);
+  wrangler(['d1','execute','DB','--remote','--file',storage,'--config',config]);
+  wrangler(['deploy','--config',config,'--secrets-file',secrets]);
+  let ready=false,lastResponse='no HTTP response';
   for(let attempt=0;attempt<90;attempt++){
-    try{const response=await fetch(`${state.url}/api/transfer/v2/capabilities`,{headers:{authorization:`Bearer ${state.adminToken}`},signal:AbortSignal.timeout(15000)});const body=await response.text();if(response.status===200){assert(response.headers.get('cf-ray'));const caps=JSON.parse(body);assert.equal(caps.protocol_version,2);assert.equal(caps.storage.import.allowed,true,body);ready=true;break;}}catch(error){if(attempt===89)throw error;}
+    try{const response=await fetch(`${state.url}/api/transfer/v2/capabilities`,{headers:{authorization:`Bearer ${state.adminToken}`,'user-agent':probeUserAgent},signal:AbortSignal.timeout(15000)});lastResponse=`HTTP ${response.status}; content-type=${response.headers.get('content-type')??'missing'}; cf-mitigated=${response.headers.has('cf-mitigated')}`;const body=await response.text();if(response.status===200){assert(response.headers.get('cf-ray'));const caps=JSON.parse(body);assert.equal(caps.protocol_version,2);assert.equal(caps.storage.import.allowed,true,body);ready=true;break;}}catch(error){if(attempt===89)throw error;}
     await sleep(2000);
   }
-  assert(ready,'deployed disposable fixture did not become ready');
+  assert(ready,`deployed disposable fixture did not become ready (${lastResponse})`);
   if(process.env.GITHUB_ENV)appendFileSync(process.env.GITHUB_ENV,`NAROU_TRANSFER_TEST_URL=${state.url}\nNAROU_TRANSFER_TEST_TOKEN=${state.adminToken}\n`);
   return state;
 }

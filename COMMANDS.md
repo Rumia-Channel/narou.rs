@@ -397,6 +397,7 @@ narou author remove 1
 - 通信要求はフレームを含め 8 MiB / 100 レコード以下に分割する。作品全体・全 ZIP の展開サイズに旧来の 512 MiB 一律上限は置かず、manifest・索引・メタデータの制御上限と有界バッファを別に管理する。
 - Web の既定 `runtime` は raw・履歴・確認済みの派生物を snapshot・本文通信の前に除外し、本文・目次・設定・挿絵・未知の利用者ファイルを保持する。catalog の除外件数・用途は開始前に表示する。`complete` は保存先が対応する保守データも対象にし、Worker は raw を新規保存しない。
 - Web は `/api/transfer/v2` の session / チャンク API へ切り替え中。session と操作の永続 ACK で再送・再開を扱い、公開済み作品をキャンセルで巻き戻さず、未公開分を回収する。既存の Web 認証ミドルウェア配下で動作する。
+- Web v2 の終端回収は元の owner / epoch で stage を abort してから進め、24時間の lease 期限を待ち続けない。仮想小説のメンバーは、保存済みの投影内 URL 索引で解決し、消失・所属競合は公開前の plan 競合として扱う。
 - 上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。CLI の既存取り込みでの `sqlite.mirror-files=false` の制限と、Web v2 の参照公開は別経路として確認する。詳細は `WEBUI.md` §6.1b。
 - ブラウザ保存は File System Access または Service Worker の pull 型ストリームを使い、全量 `Blob` 化へフォールバックしない。FSA の picker はクリック中、SW の開始は最初の ZIP byte まで遅らせる。保存先の書き込みを待って次のチャンクを受け取り、中継の状態消失・明示的な完了通知前の切断・キャンセルを成功扱いしない。
 - 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が生成・検証・取り込み計画を共有する。
