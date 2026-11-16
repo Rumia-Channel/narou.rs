@@ -13,6 +13,22 @@ assert(base.hostname.endsWith('.workers.dev'),'this test requires real Cloudflar
 const token=process.env.NAROU_TRANSFER_TEST_TOKEN;
 assert(token,'NAROU_TRANSFER_TEST_TOKEN is required for the disposable test fixture');
 const client=transferClient(base.origin,token,{verifyPrimary:true});
+// Keep diagnostics bounded and omit credentials, payload text and raw backend errors.
+const request=client.request;
+let requestNumber=0,lastFailure;
+client.request=async(path,init={})=>{
+  const ordinal=++requestNumber,periodic=ordinal===1||ordinal%100===0;
+  if(periodic)console.log(JSON.stringify({event:'transfer_request',ordinal,path,method:init.method??'GET'}));
+  const response=await request(path,init);
+  if(periodic||response.status>=400){
+    const value=response.headers.get('content-type')?.includes('application/json')?await response.clone().json():null;
+    const category=String(value?.error?.message??'').match(/D1_[A-Z_]+|SQLITE_[A-Z_]+|too many SQL variables|out of memory|memory limit|too large|exceeded maximum/gi)?.join(',')??null;
+    const failure=`${path}:${response.status}:${value?.error?.code}:${category}`;
+    if(periodic||response.status>=400&&failure!==lastFailure)console.log(JSON.stringify({event:'transfer_response',ordinal,path,status:response.status,state:value?.state,revision:value?.revision,next_action:value?.next_action,error_code:value?.error?.code,retryable:value?.error?.retryable,error_category:category}));
+    if(response.status>=400)lastFailure=failure;
+  }
+  return response;
+};
 const probe=await client.request('/api/transfer/v2/capabilities');
 assert.equal(probe.status,200,await probe.text());
 assert(probe.headers.get('cf-ray'),'the memory test must execute on Cloudflare');
