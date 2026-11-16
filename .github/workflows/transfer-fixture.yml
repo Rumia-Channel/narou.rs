@@ -62,7 +62,7 @@ jobs:
         id: provision
         run: node ci/transfer_fixture.mjs provision
       - name: Exercise real enforced 128 MiB isolates
-        run: node tests/transfer_memory_deployed.mjs
+        run: node ci/transfer_fixture.mjs exercise
       - name: Remove this fixture only
         if: always() && steps.provision.outputs.cleanup != ''
         run: node ci/transfer_fixture.mjs cleanup
