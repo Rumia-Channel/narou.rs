@@ -20,6 +20,7 @@
 //! download host reads it back with `narou login import`), and outside a
 //! library that export is the only output.
 
+use std::borrow::Cow;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -124,6 +125,7 @@ fn run(args: Args) -> std::result::Result<(), String> {
 
     // Collect the cookies to store or export. A throwaway browser profile (the
     // default) is remembered here and removed once the cookies are safe.
+    let user_agent = narou_rs::compat::load_local_setting_string("user-agent");
     let mut throwaway_profile: Option<PathBuf> = None;
     let captured: BTreeMap<String, String> = if let Some(cookie) = args.cookie.as_deref() {
         let host = hosts
@@ -132,10 +134,7 @@ fn run(args: Args) -> std::result::Result<(), String> {
             .clone();
         BTreeMap::from([(host, cookie.to_string())])
     } else {
-        let login_url = site
-            .login_url()
-            .or_else(|| Some(site.top_url()))
-            .ok_or_else(|| format!("{} のログイン URL がサイト定義にありません", site.sitename))?;
+        let login_url = browser_start_url(&site, &target);
         println!("{login_url} をブラウザで開きます。ログインが終わったら Enter を押してください。");
 
         let browser = args.browser.clone().or_else(find_browser).ok_or_else(|| {
@@ -156,7 +155,7 @@ fn run(args: Args) -> std::result::Result<(), String> {
         ) {
             Ok(captured) => captured,
             Err(error) => {
-                let _ = child.kill();
+                stop_browser(&mut child);
                 println!(
                     "ブラウザプロファイルを残しました: {} (再試行時に使えます)",
                     profile.display()
@@ -164,7 +163,7 @@ fn run(args: Args) -> std::result::Result<(), String> {
                 return Err(error);
             }
         };
-        let _ = child.kill();
+        stop_browser(&mut child);
         if args.profile.is_none() {
             throwaway_profile = Some(profile);
         }
@@ -190,13 +189,28 @@ fn run(args: Args) -> std::result::Result<(), String> {
 
     // 保存は済んでいるので、その Cookie で実際に取得できるかだけ確かめる。
     if site.matches_url(&target) && cookie_host_for_url(&target).is_some() {
-        verify_capture(&target, site, captured);
+        verify_capture(&target, site, captured, user_agent);
     }
     // Cookie を保存し終えたので、使い捨てのプロファイルを片付ける。
     if let Some(profile) = throwaway_profile {
         cleanup_profile(&profile);
     }
     Ok(())
+}
+
+fn browser_start_url<'a>(site: &SiteSetting, target: &'a str) -> Cow<'a, str> {
+    if matches!(site.login_wall_error, narou_rs::downloader::site_setting::LoginWallError::Login)
+        && site.matches_url(target)
+    {
+        Cow::Borrowed(target)
+    } else {
+        Cow::Owned(site.login_url().unwrap_or_else(|| site.top_url()))
+    }
+}
+
+fn stop_browser(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Browser profile directory for this run.
@@ -221,7 +235,7 @@ fn cleanup_profile(profile: &Path) {
 /// One request with the captured cookies, mirroring the downloader's login-wall
 /// detection: a work that needs the session keeps answering with the site's
 /// error message or login marker while the captured cookies are anonymous.
-fn verify_capture(target: &str, mut site: SiteSetting, cookies: BTreeMap<String, String>) {
+fn verify_capture(target: &str, mut site: SiteSetting, cookies: BTreeMap<String, String>, user_agent: Option<String>) {
     if cookie_host_for_url(target).is_none() {
         return;
     }
@@ -236,7 +250,7 @@ fn verify_capture(target: &str, mut site: SiteSetting, cookies: BTreeMap<String,
         Some(base) => narou_rs::platform::cookie_store::merge_cookie_headers(Some(&base), Some(&cookie)),
         None => Some(cookie),
     };
-    let user_agent = ua_generator::ua::spoof_firefox_ua().to_string();
+    let user_agent = narou_rs::downloader::resolve_user_agent(None, user_agent);
     let Ok(client) = narou_rs::native::http::NativeHttpClient::new(&user_agent) else {
         return;
     };
@@ -465,8 +479,7 @@ fn capture_cookies(
     hosts: &[String],
 ) -> std::result::Result<Vec<(String, String)>, String> {
     let websocket_url = wait_for_devtools(child, port, profile, Duration::from_secs(30))?;
-    let (mut socket, _) = tungstenite::connect(websocket_url.as_str())
-        .map_err(|error| format!("DevTools に接続できませんでした: {error}"))?;
+    let mut socket = connect_devtools(&websocket_url, Duration::from_secs(5))?;
 
     let finished = Arc::new(AtomicBool::new(false));
     {
@@ -656,18 +669,57 @@ fn wait_for_devtools(
     }
 }
 
+type DevToolsSocket = tungstenite::WebSocket<std::net::TcpStream>;
+
+fn connect_devtools(url: &str, timeout: Duration) -> std::result::Result<DevToolsSocket, String> {
+    let endpoint = url::Url::parse(url)
+        .map_err(|error| format!("DevTools の WebSocket URL が不正です: {error}"))?;
+    if endpoint.scheme() != "ws" {
+        return Err("DevTools はループバックの ws 接続を要求します".to_string());
+    }
+    let addresses = match endpoint.host() {
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => [Some(ip.into()), None],
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => [Some(ip.into()), None],
+        Some(url::Host::Domain("localhost")) => [
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+        ],
+        _ => return Err("DevTools がループバックを指していません".to_string()),
+    };
+    let port = endpoint.port_or_known_default()
+        .ok_or_else(|| "DevTools のポートが不正です".to_string())?;
+    let mut connection = Err(std::io::Error::from(std::io::ErrorKind::NotConnected));
+    for address in addresses.into_iter().flatten() {
+        connection = std::net::TcpStream::connect_timeout(&std::net::SocketAddr::new(address, port), timeout);
+        if connection.is_ok() {
+            break;
+        }
+    }
+    let stream = connection.map_err(|error| format!("DevTools に接続できませんでした: {error}"))?;
+    stream.set_read_timeout(Some(timeout))
+        .and_then(|_| stream.set_write_timeout(Some(timeout)))
+        .map_err(|error| format!("DevTools の通信期限を設定できません: {error}"))?;
+    let (socket, _) = tungstenite::client(url, stream)
+        .map_err(|error| format!("DevTools の接続を開始できませんでした: {error}"))?;
+    Ok(socket)
+}
+
 fn read_cookies(
-    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    socket: &mut DevToolsSocket,
     request_id: u64,
 ) -> std::result::Result<Vec<serde_json::Value>, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        if Instant::now() >= deadline {
+            return Err("DevTools の応答待ちが上限に達しました".to_string());
+        }
         let message = socket
             .read()
             .map_err(|error| format!("DevTools からの受信に失敗しました: {error}"))?;
         let tungstenite::Message::Text(text) = message else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(text.as_str()) else {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text.as_str()) else {
             continue;
         };
         if value.get("id").and_then(|id| id.as_u64()) != Some(request_id) {
@@ -677,10 +729,10 @@ fn read_cookies(
             return Err(format!("DevTools がエラーを返しました: {error}"));
         }
         return Ok(value
-            .get("result")
-            .and_then(|result| result.get("cookies"))
-            .and_then(|cookies| cookies.as_array())
-            .cloned()
+            .get_mut("result")
+            .and_then(|result| result.get_mut("cookies"))
+            .and_then(|cookies| cookies.as_array_mut())
+            .map(std::mem::take)
             .unwrap_or_default());
     }
 }
@@ -909,5 +961,42 @@ mod tests {
         }
         assert!(resolve_site("https://unrelated.co.jp/").is_err());
         assert!(resolve_site("https://co.jp/").is_err());
+    }
+
+    #[test]
+    fn browser_check_opens_the_requested_work_without_changing_other_login_pages() {
+        let mut site = SiteSetting::load_bundled(&["name: example\nsitename: Example\ndomain: example.com\ntop_url: https://example.com\ntoc_url: \\k<url>\nurl: '^https://example\\.com/story/\\d+$'\nlogin_url: https://example.com/sign-in\n"]).unwrap().remove(0);
+        let target = "https://example.com/story/42";
+        assert_eq!(browser_start_url(&site, target), "https://example.com/sign-in");
+        site.login_wall_error = narou_rs::downloader::site_setting::LoginWallError::Login;
+        assert_eq!(browser_start_url(&site, target), target);
+        assert_eq!(browser_start_url(&site, "example.com"), "https://example.com/sign-in");
+        assert_eq!(browser_start_url(&site, "https://unrelated.com/story/42"), "https://example.com/sign-in");
+    }
+
+    #[test]
+    fn stalled_devtools_does_not_hold_cookie_capture_open() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/devtools/browser/test", listener.local_addr().unwrap());
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            socket.read().unwrap();
+            let _ = stopped.recv();
+        });
+        let mut socket = connect_devtools(&url, Duration::from_millis(50)).unwrap();
+        socket.send(tungstenite::Message::text(
+            r#"{"id":1,"method":"Storage.getCookies"}"#,
+        )).unwrap();
+        let (result, received) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = result.send(read_cookies(&mut socket, 1));
+        });
+        let outcome = received.recv_timeout(Duration::from_secs(2));
+        drop(stop);
+        server.join().unwrap();
+        reader.join().unwrap();
+        assert!(matches!(outcome, Ok(Err(_))), "{outcome:?}");
     }
 }

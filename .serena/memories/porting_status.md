@@ -1,5 +1,14 @@
 # narou.rs 移植状況
 
+## ノベルアップ＋と認証回復（未リリース）
+
+- `feature-novelup-session` で `webnovel/novelup.plus.yaml` version 1.2 を追加。作品・各話・作者一覧・ページ送り・抽出は YAML / preprocess DSL で駆動する。最低間隔は 20 秒で、WAF 回避を保証する設定ではない。2 桁年は Ruby と同じ 1969–2068 の範囲へ解釈し、通常の 4 桁年には追加の書式解析を行わない。
+- `platform::http::browser_challenge` は 202/challenge と 405/captcha の組み合わせだけを割当てなしで認識し、Native は tier 切替を打ち切る。Worker の socket / relay も確認応答を保持する。relay JSON / NRS1 の追加メタデータ `wafAction` は省略可能で、対応するリレーの更新が必要。
+- downloader の私有 `AuthState` は資格情報を必要時に一度だけ読み込み、各候補を元の設定 Cookie から組み直す。後続目次・本文・強い更新も認証回復し、採用したセッションを保持する。途中の壁を短い目次として保存せず、公開取得に不要な Cookie を送らない。目次の所有権を渡し、認証試行ごとの全文コピーも削減した。
+- `narou_rs_login` は確認が必要なサイトの作品 URL を直接開き、設定済み User-Agent で保存後確認する。DevTools の接続・応答待ちに上限を置き、Cookie 配列の複製をなくし、ブラウザ終了を待ってからプロファイルを清掃する。
+- 実サイト確認: 短編 `874968302` を 1 話取得し、TXT と Kobo EPUB を生成。EPUB 37,600 bytes / 17 entries の ZIP・XML と本文の先頭／末尾を検証し、最終ビルドの CLI で再更新が「更新なし」となることも確認した。作者 `813181327` は CLI の追跡登録・dry-run で 13 作品を列挙した。連載 `759726165` は Native で 202/challenge、公式 SDK のトークン取得後にも 405/captcha を観測し、Firefox も人間確認画面になった。全話取得・再更新は未確認で、トークン寿命や UA / IP の拘束条件は断定しない。CAPTCHA の自動解読・ブラウザ常駐・TLS 指紋偽装は追加していない。
+- 検証: Native の HTTP・認証回復・日付・サイト定義・既存ログイン／前処理の関連テスト、relay テスト、ログイン helper 7 件、Native と Worker wasm の Clippy ゲートが成功。強い更新の新規回帰は、本文だけの認証要求から回復し、同一本文の二重取得を避けることを確認した。実 workerd の HTTP 契約は追加 WAF ケースを含め 111/111 成功。ただし runner 全体は後続の `virtual_membership.mjs` で `ECONNRESET` により失敗し、全フェーズ成功ではない。原因未確定のため無関係なテストの緩和・再試行は加えていない。
+
 ## EPUB 配信経路と API の待ち時間（未リリース）
 
 - 通常 GET の生成器は UI / 外部 API / ブラウザ API で共通。Native は保存済み EPUB があれば直接配信し、Worker は都度生成する。ヘッダ到着、EOF、外部閲覧ソフトの ZIP 展開・キャッシュ保存後の表示完了を区別して比較する（`docs/external-api.md`）。

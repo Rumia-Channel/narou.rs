@@ -1,3 +1,5 @@
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
+
 use crate::error::Result;
 use crate::platform::{HttpClient, RateLimiter};
 
@@ -285,6 +287,48 @@ pub fn decode_numeric_entities(src: &mut String) {
     }
 }
 
+// ------------------------------------------------------------
+// 日付の解析 (2 桁年)
+// ------------------------------------------------------------
+
+/// 2 桁年 (`24/5/29 7:36`) を読むときの書式。
+///
+/// Ruby の `Time.parse` と同じ規則 (00-68 → 2000-2068、69-99 → 1969-1999) に
+/// 補正する。chrono の `%y` は 69 を 2069 とするため、そのまま使わない。
+const TWO_DIGIT_YEAR_FORMATS: [&str; 2] = [
+    "%y/%m/%d %H:%M:%S",
+    "%y/%m/%d %H:%M",
+];
+
+/// 2 桁年だけを持つ日付文字列を、サイトのタイムゾーンで解釈する。
+///
+/// 2 桁年の無い日付 (`2024/5/29 7:36`、`2024-05-29 07:36` など) は `None` を
+/// 返す — 4 桁年の書式 (`%Y`) が担当する。`%Y` は 2 桁の年も西暦 24 年として
+/// 読んでしまうため、2 桁年はここで先に確定する。
+///
+/// 文字列を書き換えない (割り当てなし) ので、既存の書式を壊さない。
+pub(crate) fn parse_two_digit_year_datetime(
+    value: &str,
+    timezone: super::SiteTimezone,
+) -> Option<DateTime<Utc>> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 3 || bytes[2] != b'/' || !bytes[..2].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let short_year = i32::from((bytes[0] - b'0') * 10 + bytes[1] - b'0');
+    let year = if short_year >= 69 { 1900 } else { 2000 } + short_year;
+    let datetime = if value.contains(':') {
+        TWO_DIGIT_YEAR_FORMATS.iter()
+            .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())?
+            .with_year(year)?
+    } else {
+        NaiveDate::parse_from_str(value, "%y/%m/%d").ok()?
+            .with_year(year)?
+            .and_hms_opt(0, 0, 0)?
+    };
+    timezone.resolve_local_datetime(datetime)
+}
+
 /// Length limit for generated filenames (`folder-length-limit` /
 /// `filename-length-limit` local settings). Worker builds have no local
 /// settings and fall back to the provided default.
@@ -328,8 +372,51 @@ pub fn mask_spoiler_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_section_url, mask_spoiler_text, sanitize_filename_with_limit};
+    use super::{
+        build_section_url, mask_spoiler_text, parse_two_digit_year_datetime,
+        sanitize_filename_with_limit,
+    };
     use crate::downloader::site_setting::SiteSetting;
+
+    fn tokyo() -> super::super::SiteTimezone {
+        super::super::SiteTimezone::Named(chrono_tz::Asia::Tokyo)
+    }
+
+    fn local(value: &str) -> String {
+        let parsed = parse_two_digit_year_datetime(value, tokyo())
+            .unwrap_or_else(|| panic!("{value} must parse as a two-digit-year date"));
+        parsed
+            .with_timezone(&chrono_tz::Asia::Tokyo)
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    }
+
+    #[test]
+    fn two_digit_year_dates_use_the_posix_and_ruby_rule() {
+        // ノベルアップ＋の目次日 (`24/5/29 7:36`)。
+        assert_eq!(local("24/5/29 7:36"), "2024-05-29 07:36");
+        assert_eq!(local("26/11/16 8:15"), "2026-11-16 08:15");
+        assert_eq!(local("24/5/29"), "2024-05-29 00:00");
+        assert_eq!(local("24/5/29 7:36:05"), "2024-05-29 07:36");
+    }
+
+    #[test]
+    fn two_digit_year_boundaries_follow_ruby() {
+        // Ruby の Time.parse と同じ振り分け (00-68 → 2000年代, 69-99 → 1900年代)。
+        assert_eq!(local("00/1/1"), "2000-01-01 00:00");
+        assert_eq!(local("68/12/31"), "2068-12-31 00:00");
+        assert_eq!(local("69/1/1"), "1969-01-01 00:00");
+        assert_eq!(local("69/1/1 12:34"), "1969-01-01 12:34");
+        assert_eq!(local("99/12/31"), "1999-12-31 00:00");
+    }
+
+    #[test]
+    fn four_digit_year_dates_are_left_to_the_regular_formats() {
+        // 4 桁の年は `%y` に合致しないので、ここで読んでも既存の解釈を壊さない。
+        assert!(parse_two_digit_year_datetime("2024/5/29 7:36", tokyo()).is_none());
+        assert!(parse_two_digit_year_datetime("2024-05-29 07:36", tokyo()).is_none());
+        assert!(parse_two_digit_year_datetime("2024/5/29", tokyo()).is_none());
+    }
 
     #[test]
     fn build_section_url_decodes_html_entities_in_href() {

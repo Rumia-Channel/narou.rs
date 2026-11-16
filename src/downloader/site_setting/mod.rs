@@ -167,6 +167,16 @@ pub struct SiteSetting {
     /// the list (a retry with the stored cookie may see more).
     #[serde(default)]
     pub login_partial_pattern: Option<SiteSettingValue>,
+    /// What a still-matching login/challenge wall means after every stored
+    /// credential has been tried.
+    ///
+    /// `not_found` (the default) keeps narou.rb's behavior: the novel is
+    /// treated as private/deleted and frozen. `login` reports an
+    /// authentication error instead, so a site whose browser-verification
+    /// token expired can be refreshed and retried without freezing the
+    /// record.
+    #[serde(default)]
+    pub login_wall_error: LoginWallError,
     /// Retain cached omitted sections on a nonempty partial TOC; indices must be stable numeric positions.
     #[serde(default)]
     pub preserve_missing_sections: bool,
@@ -301,6 +311,17 @@ pub struct SiteSetting {
     /// コンパイル済みの作品属性規則。
     #[serde(skip)]
     pub(super) compiled_work_type_rules: Vec<(WorkTypeField, Regex, WorkType)>,
+}
+
+/// Meaning of a login/challenge wall that remains after every stored login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginWallError {
+    /// narou.rb-compatible behavior: the novel is private/deleted (freeze).
+    #[default]
+    NotFound,
+    /// The site needs a browser check or a fresh session; do not freeze.
+    Login,
 }
 
 /// サイトが作品属性の判定に使う値。
@@ -1175,6 +1196,33 @@ impl SiteSetting {
         self.compiled_login_pattern.as_ref()
     }
 
+    /// Whether `source` is the site's login wall: a page that was served
+    /// successfully but asks for authentication.
+    pub fn is_login_wall(&self, source: &str) -> bool {
+        self.compiled_login_pattern
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(source))
+    }
+
+    /// Error produced when a login/challenge wall remains after every stored
+    /// credential was tried.
+    ///
+    /// The site's `login_wall_error` decides what the wall means: the
+    /// narou.rb-compatible `not_found` (the default) treats the novel as
+    /// private/deleted, while `login` reports an authentication problem so
+    /// the record is neither deleted nor frozen.
+    pub fn login_wall_failure(&self) -> crate::error::NarouError {
+        match self.login_wall_error {
+            LoginWallError::Login => crate::error::NarouError::Login(format!(
+                "{} はブラウザ確認またはログインが必要です。narou_rs_login で Cookie を更新してください",
+                self.sitename
+            )),
+            LoginWallError::NotFound => crate::error::NarouError::NotFound(
+                "Novel deleted or private".into(),
+            ),
+        }
+    }
+
     /// Whether `source` shows only part of the list because the request was
     /// anonymous.
     pub fn is_partial_login_view(&self, source: &str) -> bool {
@@ -1352,6 +1400,52 @@ login_partial_pattern: ^login_partial::1$
         .unwrap();
         plain.compile();
         assert!(!plain.is_partial_login_view("login_partial::1"));
+    }
+
+    #[test]
+    fn login_wall_error_parses_and_defaults_to_not_found() {
+        let login = SiteSetting::load_bundled(&[r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<ncode>
+login_wall_error: login
+"#])
+        .unwrap()
+        .remove(0);
+        assert_eq!(login.login_wall_error, LoginWallError::Login);
+        assert!(matches!(
+            login.login_wall_failure(),
+            crate::error::NarouError::Login(_)
+        ));
+
+        let default = SiteSetting::load_bundled(&[r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<ncode>
+"#])
+        .unwrap()
+        .remove(0);
+        assert_eq!(default.login_wall_error, LoginWallError::NotFound);
+        assert!(matches!(
+            default.login_wall_failure(),
+            crate::error::NarouError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn a_login_pattern_marks_the_login_wall() {
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: x\\k<url>\nlogin_pattern: ログインが必要です\n",
+        )
+        .unwrap();
+        setting.compile();
+
+        assert!(setting.is_login_wall("<h1>ログインが必要です</h1>"));
+        assert!(!setting.is_login_wall("<h1>本文</h1>"));
     }
 
     #[test]

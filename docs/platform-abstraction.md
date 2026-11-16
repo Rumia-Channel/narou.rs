@@ -161,8 +161,10 @@ pub trait HttpClient: Send + Sync {
 - 「reqwest API のコピー」にしない。narou.rs が必要とする最小仕様（GET/POST + headers + body + status + timeout + size limit）。
 - `HttpRequest` は所有型（`spawn_blocking` へ move できる）。`RedirectMode::Manual` は 3xx をそのまま返し、`resolve_final_url` が `Location` を追跡する。
 - `HttpResponse` は bytes のみ。文字デコード（Shift_JIS 等）は core の `downloader::http_policy::decode_with_encoding` が行う。
-- ステータス→ドメインエラー変換（404→NotFound / 503→SuspendDownload）は `http_policy::ensure_success_response` に一元化。transport は生ステータスを返す。
+- ステータス→ドメインエラー変換（404→NotFound / 503→SuspendDownload、既知のブラウザ確認→Login）は `http_policy` に一元化する。`platform::http::browser_challenge` は `202 + x-amzn-waf-action: challenge` / `405 + ...: captcha` だけを認識する追加メモリ割り当てのない共通判定で、transport は元のステータスとヘッダを保持する。本文が空の 202、必須 JSON 取得、ストリームでも確認画面を成功データとして扱わない。
 - 将来の future は `Send`（`tokio::spawn` で並列 update を駆動するため）。wasm32 では全型が自動 Send なので Workers は影響なし。
+- ブラウザ確認は通信手段の障害ではない。Native はこの応答で tier を打ち切り、Worker の socket / relay でも元の 403 より優先して返す。Cookie 候補の選択・目次の再評価・本文の再試行は downloader の私有 `AuthState` が担う。資格情報は必要時に一度だけ読み、候補は常にサイトの設定 Cookie から組み直す。通常の成功ページごとに資格情報を再読込せず、認証以外の失敗を追加試行しない。
+- AWS WAF の公式 [`getToken()`](https://docs.aws.amazon.com/waf/latest/developerguide/waf-js-challenge-api-get-token.html) はトークン取得・再利用の API であり、CAPTCHA を解くものではない。Cookie の存在だけで通過成功や有効期間を推定せず、実際の取得結果で判定する。`narou_rs_login` は対話ブラウザでの取得と保存後確認を担い、SDK の自動注入・常駐更新・CAPTCHA の自動解読は行わない。
 
 ### RateLimiter
 
@@ -550,7 +552,7 @@ Worker (worker_entry)
 （`cloudflare:sockets`）で取り直す。理由は実測で、`fetch` は Cloudflare の公開 IP レンジから、
 `connect()` は公開レンジ外のプレフィックス（実測 `104.28.157.13`）から出るため、Cloudflare の
 レンジを弾くサイト（例: CloudFront 配信のカクヨム）でも後者なら 200 が返る。ソケット側で
-2xx/3xx が得られたときだけ採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。
+2xx/3xx または既知のブラウザ確認応答が得られたときに採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。確認応答を元の 403 で隠さない。
 **全アドレスが Cloudflare の公開レンジ内にあるサイト（例: ハーメルン）は `connect()` 自体が
 ランタイムに拒否される**ため、別の出口 IP を持つ外部の踏み台（取得リレー）が別途必要。
 
@@ -563,9 +565,9 @@ Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト向�
   旧 Node 実装 (`scripts/relay/*.mjs` / `relay.js` / `worker/`) は削除した。
 - プロトコルは旧版と同一で、クライアント側は `src/platform/relay.rs`。`POST /proxy` の
   JSON 本文で `url` と `headers` を送り、`X-Proxy-Token` で認証する。GET も受け付けるが、
-  Cookie 等を URL に載せない。応答は `{status, contentType, location?, setCookie, via, body(base64)}`、
+  Cookie 等を URL に載せない。応答は `{status, contentType, location?, setCookie, via, body(base64), wafAction?}`、
   エラーは `{"error": "..."}`。`GET /health` は認証不要で
-  `{"ok":true,"fetch":"curl,wget"}`（実際の解決済み取得順）を返す。
+  `{"ok":true,"fetch":"curl,wget"}`（実際の解決済み取得順）を返す。任意の `wafAction` は JSON と NRS1 の両形式で同じ `x-amzn-waf-action` を伝える。フィールドが無い旧応答も読めるが、旧リレーが落としたヘッダはクライアントだけの更新では復元できないため、この判定を使う配備ではリレーも更新する。
 - `worker_entry/src/http.rs` は既存の `with_relay` と、Worker の通常の fetch サブリクエスト
   （`send_fetch_hop`）で送信する。サイト定義のヘッダを転送し、返ったリダイレクトは
   呼び出し側の共通 `RedirectChain` が検証する。
