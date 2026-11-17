@@ -44,11 +44,11 @@ version: 1.0
 
 fn downloader_for(
     http: Arc<MockHttpClient>,
-    novels: Arc<MemoryNovelRepository>,
     sites: Vec<SiteSetting>,
     auto_add_tags: bool,
-) -> Downloader {
+) -> (Downloader, Arc<MemoryNovelRepository>) {
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let objects: Arc<dyn ObjectStore> = store.clone();
     let assets: Arc<dyn AssetStore> = store;
     let settings = SnapshotDownloaderSettings::new(
@@ -56,20 +56,23 @@ fn downloader_for(
         Some(true),
         HashMap::new(),
     );
-    Downloader::with_platform_and_storage_and_settings_and_support(
-        DownloaderPlatform {
-            http,
-            rate_limiter: Arc::new(FakeRateLimiter::new()),
-            novels,
-            objects,
-            assets,
-            clock: Arc::new(SystemClock),
-        },
-        sites,
-        HashMap::new(),
-        Arc::new(settings),
+    (
+        Downloader::with_platform_and_storage_and_settings_and_support(
+            DownloaderPlatform {
+                http,
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: novels.clone(),
+                objects,
+                assets,
+                clock: Arc::new(SystemClock),
+            },
+            sites,
+            HashMap::new(),
+            Arc::new(settings),
+        )
+        .unwrap(),
+        novels,
     )
-    .unwrap()
 }
 
 fn sites() -> Vec<SiteSetting> {
@@ -109,9 +112,8 @@ async fn configured_tags_are_applied_to_new_and_updated_records() {
 
     let http = Arc::new(MockHttpClient::new());
     mock_site(&http, &["a111", "c222", "n333"]);
-    let novels = Arc::new(MemoryNovelRepository::new());
     // 抽出したサイトタグは使わない (`auto-add-tags` 無効)。
-    let mut downloader = downloader_for(http.clone(), novels.clone(), sites(), false);
+    let (mut downloader, novels) = downloader_for(http.clone(), sites(), false);
 
     let manga = downloader
         .download_novel("https://tagged.example/novel/a111/")
@@ -148,8 +150,7 @@ async fn an_update_keeps_existing_tags_and_does_not_duplicate_them() {
 
     let http = Arc::new(MockHttpClient::new());
     mock_site(&http, &["a111"]);
-    let novels = Arc::new(MemoryNovelRepository::new());
-    let mut downloader = downloader_for(http.clone(), novels.clone(), sites(), false);
+    let (mut downloader, novels) = downloader_for(http.clone(), sites(), false);
 
     let first = downloader
         .download_novel("https://tagged.example/novel/a111/")
@@ -201,8 +202,7 @@ preprocess: |-
     let sites = SiteSetting::load_bundled(&[&yaml]).unwrap();
     let http = Arc::new(MockHttpClient::new());
     mock_site(&http, &["n333"]);
-    let novels = Arc::new(MemoryNovelRepository::new());
-    let mut downloader = downloader_for(http.clone(), novels.clone(), sites, false);
+    let (mut downloader, novels) = downloader_for(http.clone(), sites, false);
 
     let first = downloader.download_novel("https://tagged.example/novel/n333/").await.unwrap();
     let mut record = novels.get(first.id.into()).await.unwrap().unwrap();

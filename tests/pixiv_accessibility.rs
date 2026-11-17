@@ -459,8 +459,8 @@ async fn mixed_private_comic_metadata_saves_only_readable_chapters() {
         let http = Arc::new(ReaderFixture::new(Visibility {
             private_orders: vec![2], private_reply, ..Default::default()
         }));
-        let novels = Arc::new(MemoryNovelRepository::new());
         let store = Arc::new(MemoryObjectStore::new());
+        let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
         let mut downloader = downloader(http.clone(), novels.clone(), store.clone());
         let result = downloader.download_novel(COMIC).await.unwrap();
         assert_eq!(result.status, UpdateStatus::Ok, "{private_reply:?}");
@@ -488,8 +488,8 @@ async fn entitled_login_recovers_private_metadata_and_persists_the_winning_sessi
     let http = Arc::new(ReaderFixture::new(Visibility {
         private_orders: vec![2], member_has_access: true, ..Default::default()
     }));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http.clone(), novels.clone(), store.clone()).with_cookie_store(logins().await);
     let result = downloader.download_novel(COMIC).await.unwrap();
     assert_eq!(result.status, UpdateStatus::Ok);
@@ -524,8 +524,8 @@ async fn entitled_login_recovers_private_metadata_and_persists_the_winning_sessi
 #[tokio::test]
 async fn stored_nonmember_is_tried_without_discarding_the_public_subset() {
     let http = Arc::new(ReaderFixture::new(Visibility { private_orders: vec![2], ..Default::default() }));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http.clone(), novels.clone(), store.clone()).with_cookie_store(logins().await);
     let result = downloader.download_novel(COMIC).await.unwrap();
     assert_eq!(result.status, UpdateStatus::Ok);
@@ -550,8 +550,8 @@ async fn all_private_after_login_fallback_cancels_without_objects_or_an_id_gap()
     let http = Arc::new(ReaderFixture::new(Visibility {
         private_orders: vec![1, 2, 3], ..Default::default()
     }));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http.clone(), novels.clone(), store.clone()).with_cookie_store(logins().await);
     let canceled = downloader.download_novel(COMIC).await.unwrap();
     assert_eq!(canceled.status, UpdateStatus::Canceled);
@@ -582,8 +582,8 @@ async fn all_private_after_login_fallback_cancels_without_objects_or_an_id_gap()
 async fn cached_private_chapter_survives_new_readable_content_even_under_force() {
     for force in [false, true] {
         let http = Arc::new(ReaderFixture::new(Visibility::default()));
-        let novels = Arc::new(MemoryNovelRepository::new());
         let store = Arc::new(MemoryObjectStore::new());
+        let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
         let mut downloader = downloader(http.clone(), novels.clone(), store.clone());
         let first = downloader.download_novel(COMIC).await.unwrap();
         let before = snapshot(store.as_ref()).await;
@@ -620,8 +620,8 @@ async fn cached_private_chapter_survives_new_readable_content_even_under_force()
 #[tokio::test]
 async fn all_saved_chapters_becoming_private_preserves_the_record_toc_and_every_byte() {
     let http = Arc::new(ReaderFixture::new(Visibility::default()));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http.clone(), novels.clone(), store.clone()).with_cookie_store(logins().await);
     let first = downloader.download_novel(COMIC).await.unwrap();
     let before = snapshot(store.as_ref()).await;
@@ -645,8 +645,8 @@ async fn all_saved_chapters_becoming_private_preserves_the_record_toc_and_every_
 #[tokio::test]
 async fn novel_series_filters_both_masked_thumbnails_and_denied_contents_without_body_gets() {
     let http = Arc::new(ReaderFixture::new(Visibility::default()));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http.clone(), novels.clone(), store.clone());
     let result = downloader.download_novel("https://www.pixiv.net/novel/series/93").await.unwrap();
     assert_eq!(result.status, UpdateStatus::Ok);
@@ -665,8 +665,8 @@ async fn novel_series_filters_both_masked_thumbnails_and_denied_contents_without
 #[tokio::test]
 async fn masked_thirtieth_novel_does_not_truncate_the_next_contents_page() {
     let http = Arc::new(ReaderFixture::new(Visibility::default()));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http.clone(), novels.clone(), store.clone());
     let result = downloader.download_novel("https://www.pixiv.net/novel/series/94").await.unwrap();
     let orders: Vec<_> = (1..=29).chain(std::iter::once(31)).collect();
@@ -687,8 +687,8 @@ async fn masked_thirtieth_novel_does_not_truncate_the_next_contents_page() {
 #[tokio::test]
 async fn empty_novel_contents_at_eof_is_not_a_partial_listing_or_login_retry() {
     let http = Arc::new(ReaderFixture::new(Visibility::default()));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http.clone(), novels.clone(), store.clone()).with_cookie_store(logins().await);
     let result = downloader.download_novel("https://www.pixiv.net/novel/series/95").await.unwrap();
     assert_eq!(result.status, UpdateStatus::Ok);
@@ -708,8 +708,8 @@ async fn empty_novel_contents_at_eof_is_not_a_partial_listing_or_login_retry() {
 async fn essential_comic_metadata_http403_and_malformed_json_remain_errors() {
     for fault in [Fault::MetadataForbidden, Fault::MetadataMalformed] {
         let http = Arc::new(ReaderFixture::new(Visibility { fault: Some(fault), ..Default::default() }));
-        let novels = Arc::new(MemoryNovelRepository::new());
         let store = Arc::new(MemoryObjectStore::new());
+        let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
         let mut downloader = downloader(http.clone(), novels.clone(), store.clone()).with_cookie_store(logins().await);
         let error = downloader.download_novel(COMIC).await.unwrap_err();
         assert!(matches!(&error, NarouError::Http(_)), "{fault:?}: {error}");
@@ -728,8 +728,8 @@ async fn essential_comic_metadata_http403_and_malformed_json_remain_errors() {
 #[tokio::test]
 async fn required_artwork_pages_http403_does_not_register_a_shortened_series() {
     let http = Arc::new(ReaderFixture::new(Visibility { fault: Some(Fault::PagesForbidden), ..Default::default() }));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http.clone(), novels.clone(), store.clone());
     let error = downloader.download_novel(COMIC).await.unwrap_err();
     assert!(matches!(&error, NarouError::Http(_)), "{error}");
@@ -739,8 +739,7 @@ async fn required_artwork_pages_http403_does_not_register_a_shortened_series() {
     let saved = snapshot(store.as_ref()).await;
     assert!(saved.keys().all(|key| !key.ends_with("/toc.yaml")));
     let sections = saved_sections(&saved);
-    assert_eq!(sections.keys().map(String::as_str).collect::<Vec<_>>(), ["1"]);
-    assert_eq!(sections["1"].element.body.trim(), format!("<img src=\"{}\">", image_url(101)));
+    assert!(sections.is_empty(), "failed creation must remove its unpublished partial sections");
     assert_eq!(http.calls(&pages_url(101)), 1);
     assert_eq!(http.calls(&image_url(101)), 1);
     assert_eq!(http.calls(&pages_url(102)), 1);
@@ -755,8 +754,8 @@ async fn masked_or_omitted_middle_chapters_use_listing_fallback_before_private_m
             let http = Arc::new(ReaderFixture::new(Visibility {
                 private_orders: vec![2], private_reply, member_has_access: true, ..Default::default()
             }));
-            let novels = Arc::new(MemoryNovelRepository::new());
             let store = Arc::new(MemoryObjectStore::new());
+            let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
             let mut downloader = downloader(http.clone(), novels.clone(), store.clone());
             if has_login { downloader = downloader.with_cookie_store(logins().await); }
             let result = downloader.download_novel(COMIC).await.unwrap();
@@ -777,8 +776,8 @@ async fn comic_series_merges_episode_tags_without_duplicates() {
     // 漫画シリーズは各話の /ajax/illust/{id} が持つタグを統合する。
     // 同じタグが複数話にあっても 1 つにまとめ、初出順を保つ。
     let http = Arc::new(ReaderFixture::new(Visibility::default()));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader_with_settings(
         http.clone(), novels.clone(), store.clone(),
         HashMap::from([("auto-add-tags".to_string(), true)]),

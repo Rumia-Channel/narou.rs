@@ -177,7 +177,7 @@ async fn illustrations_come_from_the_body_not_page_controls_or_data_uris() {
     let store=Arc::new(MemoryObjectStore::new());
     let mut downloader=Downloader::with_platform_and_storage_and_settings_and_support(
         DownloaderPlatform {http:Arc::new(ReaderFixture {illustrated:true,..Default::default()}),
-            rate_limiter:Arc::new(FakeRateLimiter::new()), novels:Arc::new(MemoryNovelRepository::new()),
+            rate_limiter:Arc::new(FakeRateLimiter::new()), novels:Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
             objects:store.clone(), assets:store.clone(), clock:Arc::new(SystemClock)},
         vec![site()], HashMap::new(), Arc::new(SnapshotDownloaderSettings::new(HashMap::new(),Some(false),HashMap::new())),
     ).unwrap();
@@ -208,8 +208,8 @@ async fn captcha_is_an_error_not_saved_text() {
 #[tokio::test]
 async fn r18_consent_denial_leaves_the_library_without_a_novel() {
     let store=Arc::new(MemoryObjectStore::new());
-    let objects:Arc<dyn ObjectStore>=store.clone(); let assets:Arc<dyn AssetStore>=store;
-    let novels=Arc::new(MemoryNovelRepository::new());
+    let objects:Arc<dyn ObjectStore>=store.clone(); let assets:Arc<dyn AssetStore>=store.clone();
+    let novels=Arc::new(MemoryNovelRepository::new().with_objects(store));
     let mut downloader=Downloader::with_platform_and_storage_and_settings_and_support(
         DownloaderPlatform {http:Arc::new(ReaderFixture {r18:true,..Default::default()}), rate_limiter:Arc::new(FakeRateLimiter::new()),
             novels:novels.clone(), objects, assets, clock:Arc::new(SystemClock)},
@@ -231,7 +231,7 @@ async fn saved_parent_domain_login_is_selected_and_reused_for_protected_alphapol
         }).collect::<Vec<_>>();
         cookies.save_groups("www.alphapolis.co.jp",&groups).await.unwrap();
         let store=Arc::new(MemoryObjectStore::new());
-        let novels=Arc::new(MemoryNovelRepository::new());
+        let novels=Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
         let setting=if error_marker {site()} else {
             let mut yaml:serde_yaml::Value=serde_yaml::from_str(include_str!("../webnovel/www.alphapolis.co.jp.yaml")).unwrap();
             yaml["error_message"]=serde_yaml::Value::Null;

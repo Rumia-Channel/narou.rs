@@ -56,8 +56,8 @@ async fn all_episode_tags_are_merged_once_and_refresh_without_body_changes() {
     }
     let store = Arc::new(MemoryObjectStore::new());
     let objects: Arc<dyn ObjectStore> = store.clone();
-    let assets: Arc<dyn AssetStore> = store;
-    let novels = Arc::new(MemoryNovelRepository::new());
+    let assets: Arc<dyn AssetStore> = store.clone();
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store));
     let settings = SnapshotDownloaderSettings::new(
         HashMap::from([("auto-add-tags".to_string(), true)]), Some(true), HashMap::new(),
     );

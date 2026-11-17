@@ -131,6 +131,7 @@ struct DownloadDiscovery {
     url_captures: HashMap<String, String>,
     toc_url: String,
     response: Result<(String, Option<crate::platform::HttpResponse>)>,
+    policy: crate::downloader::http_policy::FetchPolicy,
 }
 
 async fn checkpoint_download_access(
@@ -1470,7 +1471,7 @@ impl Downloader {
                     }
                 }
             }
-            Some(DownloadDiscovery { url_captures, toc_url: initial_url, response: discovery })
+            Some(DownloadDiscovery { url_captures, toc_url: initial_url, response: discovery, policy })
         } else { None };
         if options.access.is_none() && let Some(id) = existing_id {
             let record = self.novels.get_current(id.into()).await?.ok_or_else(|| NarouError::NotFound(format!("Novel not found: {id}")))?;
@@ -1553,7 +1554,7 @@ impl Downloader {
                 } else {
                     Self::download_toc_target(&setting, target, db_toc_url.as_deref())
                 };
-                (target, Some(discovery.response))
+                (target, Some((discovery.response, discovery.policy)))
             }
             None => (Self::download_toc_target(&setting, target, db_toc_url.as_deref()), None),
         };
@@ -1592,12 +1593,17 @@ impl Downloader {
         };
         let mut requires_login = login_cookie.is_some();
         let mut login_site_changed = false;
-        let probe_policy = crate::downloader::http_policy::FetchPolicy::for_site(&setting);
-        let discovered = match discovery {
-            Some(discovery) => discovery,
-            None => crate::downloader::http_policy::resolve_final_url_with_body(
-                self.http.as_ref(), self.rate_limiter.as_ref(), &toc_url, &probe_policy,
-            ).await,
+        // Prefetched input and its response-cookie jar are one fetch context.
+        // Rebuilding a policy here loses CSRF cookies needed by YAML form jobs.
+        let (probe_policy, discovered) = match discovery {
+            Some((response, policy)) => (policy, response),
+            None => {
+                let policy = crate::downloader::http_policy::FetchPolicy::for_site(&setting);
+                let response = crate::downloader::http_policy::resolve_final_url_with_body(
+                    self.http.as_ref(), self.rate_limiter.as_ref(), &toc_url, &policy,
+                ).await;
+                (policy, response)
+            }
         };
         let (resolved_toc_url, prefetched_toc, redirected) = match discovered {
                 Ok((final_url, _body)) if final_url != toc_url => {
