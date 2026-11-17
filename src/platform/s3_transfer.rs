@@ -7,9 +7,9 @@
 //! `UploadPart` is never lost to an isolate/process death; `Complete` rebuilds
 //! the manifest from the durable part log.
 //!
-//! A late `CompleteMultipartUpload` can only ever produce the *staged*
-//! object — canonical keys are never written by this path, so a stale epoch's
-//! completion cannot overwrite published data.
+//! Staged upload completion stays in the private namespace. Immutable targets
+//! are created only with destination preconditions; a late completion cannot
+//! replace existing data, and publication still requires its original epoch.
 
 use std::ops::Range;
 
@@ -34,6 +34,13 @@ const LEDGER_LIMIT: usize = 64 * 1024;
 const PART_RECORD_LIMIT: usize = 16 * 1024;
 const LEDGER_CAS_ATTEMPTS: usize = 8;
 const XML_LIMIT: usize = 1024 * 1024;
+
+fn canonical_owned_etag(mut value: String) -> String {
+    value.truncate(value.trim_end_matches('"').len());
+    let leading = value.len() - value.trim_start_matches('"').len();
+    if leading != 0 { drop(value.drain(..leading)); }
+    value
+}
 
 #[derive(Serialize, Deserialize)]
 struct PartRecord {
@@ -243,7 +250,11 @@ impl S3Store {
                 "invalid S3 multipart completion document".into(),
             ));
         }
-        let etag=response.header("etag").map(str::to_owned).or_else(||super::streaming::xml_text(&response.body,"ETag").ok()).filter(|value|!value.is_empty()).ok_or_else(||NarouError::Platform("multipart completion omitted ETag proof".into()))?;
+        let etag=response.header("etag").map(|value|value.trim_matches('"').to_owned())
+            .or_else(||super::streaming::xml_text(&response.body,"ETag").ok().map(canonical_owned_etag)).filter(|value|!value.is_empty())
+            .ok_or_else(||NarouError::Platform("multipart completion omitted ETag proof".into()))?;
+        // ObjectMetadata.etag is the unquoted opaque tag; the completion proof
+        // arrives in wire form, so compare canonical values.
         let metadata=self.stat_object(key).await?.ok_or_else(||NarouError::Platform("completed S3 object missing".into()))?;
         if metadata.size!=expected_size||metadata.etag.as_deref()!=Some(etag.as_str()){return Err(NarouError::Platform("completed S3 object generation/length mismatch".into()));}
         Ok(etag)
@@ -284,11 +295,17 @@ impl S3Store {
     /// Called only with a durable server-side checkpoint from an ETag-bound
     /// complete SHA scan. This is not a client-supplied adoption shortcut.
     pub async fn seal_verified_target(&self,id:&str,owner:&str,epoch:u64,checkpoint:&StageCursor,sha:&str,etag:&str)->Result<SealedAsset>{
+        // Generation proofs persist in canonical (unquoted) form; wire quotes
+        // from whichever response produced the proof are stripped here.
+        let etag=etag.trim_matches('"');
         if etag.is_empty()||!checkpoint.prefix_sha256().is_some_and(|value|value.eq_ignore_ascii_case(sha)){return Err(NarouError::Platform("verified target SHA/ETag proof missing".into()));}
         let record=self.transfer_ledger_mutate(id,|current|{let mut record=current.ok_or_else(||NarouError::Platform("direct stage missing".into()))?;transfer_stage::require_owner(&record,owner,epoch)?;if record.direct_target.is_none()||record.lease.state==StageLeaseState::Aborting{return Err(NarouError::Platform("invalid verified target state".into()));}
             record.confirmed_bytes=checkpoint.confirmed_bytes;record.hash_state_hex=checkpoint.hash_state.as_deref().map(hex::encode);record.hash_algorithm=transfer_stage::HASH_CHECKPOINT_ALG.into();record.crc32=checkpoint.crc32;record.pending_append=None;record.final_received=true;record.sealed_etag=Some(etag.into());record.lease.state=StageLeaseState::Sealed;Ok(record)}).await?;record.verify_seal(owner,epoch,checkpoint.confirmed_bytes,sha)
     }
-    pub async fn sealed_stage_etag(&self,id:&str,owner:&str,epoch:u64,size:u64,sha:&str)->Result<String>{let(record,_)=self.transfer_ledger_load(id).await?.ok_or_else(||NarouError::Platform("sealed stage proof missing".into()))?;record.verify_seal(owner,epoch,size,sha)?;if record.lease.state!=StageLeaseState::Sealed{return Err(NarouError::Platform("S3 stage is not sealed".into()));}record.sealed_etag.filter(|etag|!etag.is_empty()).ok_or_else(||NarouError::Platform("sealed S3 generation proof missing".into()))}
+    pub async fn sealed_stage_etag(&self,id:&str,owner:&str,epoch:u64,size:u64,sha:&str)->Result<String>{let(record,_)=self.transfer_ledger_load(id).await?.ok_or_else(||NarouError::Platform("sealed stage proof missing".into()))?;record.verify_seal(owner,epoch,size,sha)?;if record.lease.state!=StageLeaseState::Sealed{return Err(NarouError::Platform("S3 stage is not sealed".into()));}
+        // Ledgers written by earlier builds may hold the wire-quoted form;
+        // readers need the canonical opaque tag, so normalize at the boundary.
+        record.sealed_etag.map(canonical_owned_etag).filter(|etag|!etag.is_empty()).ok_or_else(||NarouError::Platform("sealed S3 generation proof missing".into()))}
     /// Detach control ownership after promotion without ever deleting the
     /// referenced physical object. Pool targets are always retained.
     pub async fn release_target_stage(&self,id:&str,owner:&str,epoch:u64,retain:bool)->Result<bool>{
@@ -324,16 +341,20 @@ impl S3Store {
                 let bytes=self.read_object(&stage.key,Some(transfer_stage::STAGE_APPEND_MAX)).await?.ok_or_else(||NarouError::Platform("conditional source missing".into()))?;
                 let(response,_)=self.send(HttpMethod::Put,&self.location().object_url(key),&[("if-none-match","*"),("content-type",crate::platform::content_type_for_key(key).unwrap_or("application/octet-stream"))],Some(bytes),Some(XML_LIMIT)).await?;
                 if matches!(response.status,409|412){return self.verify_immutable_object(key,size,sha).await.map(|etag|(WriteOnce::Reused,etag));}
-                super::streaming::require_status(&response,&[200,201,204],"conditional PUT")?;let etag=response.header("etag").filter(|etag|!etag.is_empty()).ok_or_else(||NarouError::Platform("conditional PUT omitted ETag proof".into()))?;return Ok((WriteOnce::Written,etag.to_owned()));
+                super::streaming::require_status(&response,&[200,201,204],"conditional PUT")?;let etag=response.header("etag").map(|value|value.trim_matches('"').to_owned()).filter(|etag|!etag.is_empty()).ok_or_else(||NarouError::Platform("conditional PUT omitted ETag proof".into()))?;return Ok((WriteOnce::Written,etag));
             }
             let upload=self.initiate_upload(key).await?;
             self.transfer_ledger_mutate(&lock_id,|current|{let mut record=current.ok_or_else(||NarouError::Platform("conditional reservation missing".into()))?;transfer_stage::require_owner(&record,&owner,1)?;record.publication_upload_id=Some(upload.clone());Ok(record)}).await?;
+            // Every copied part is pinned to the sealed staged generation, so
+            // a torn source can never publish bytes we did not verify.
+            let source_etag=self.sealed_stage_etag(id,&owner,1,size,sha).await?;
+            let source_match=format!("\"{source_etag}\"");
             let copy_source=self.location().copy_source(&stage.key);let mut parts=Vec::new();let mut offset=0u64;
             while offset<size{
                 if parts.len()==10_000{return Err(NarouError::Platform("conditional multipart part limit".into()));}
                 let end=(offset+transfer_stage::STAGE_APPEND_MAX as u64).min(size);let range=format!("bytes={offset}-{}",end-1);let number=parts.len()+1;
                 let url=format!("{}?uploadId={}&partNumber={number}",self.location().object_url(key),encode_query(&upload));
-                let(response,_)=self.send(HttpMethod::Put,&url,&[("x-amz-copy-source",&copy_source),("x-amz-copy-source-range",&range)],None,Some(XML_LIMIT)).await?;
+                let(response,_)=self.send(HttpMethod::Put,&url,&[("x-amz-copy-source",&copy_source),("x-amz-copy-source-range",&range),("x-amz-copy-source-if-match",source_match.as_str())],None,Some(XML_LIMIT)).await?;
                 super::streaming::require_status(&response,&[200],"conditional copy part")?;parts.push((number as u32,super::streaming::xml_text(&response.body,"ETag")?));offset=end;
             }
             let mut xml=String::from("<CompleteMultipartUpload>");
@@ -342,7 +363,9 @@ impl S3Store {
             if matches!(response.status,409|412){return self.verify_immutable_object(key,size,sha).await.map(|etag|(WriteOnce::Reused,etag));}
             super::streaming::require_status(&response,&[200],"conditional multipart complete")?;
             if !std::str::from_utf8(&response.body).is_ok_and(|xml|super::super::s3_request::xml_result_body(xml,"CompleteMultipartUploadResult").is_some()){return Err(NarouError::Platform("invalid conditional completion".into()));}
-            let etag=response.header("etag").map(str::to_owned).or_else(||super::streaming::xml_text(&response.body,"ETag").ok()).filter(|etag|!etag.is_empty()).ok_or_else(||NarouError::Platform("conditional completion omitted ETag proof".into()))?;Ok((WriteOnce::Written,etag))
+            let etag=response.header("etag").map(|value|value.trim_matches('"').to_owned())
+                .or_else(||super::streaming::xml_text(&response.body,"ETag").ok().map(canonical_owned_etag)).filter(|etag|!etag.is_empty())
+                .ok_or_else(||NarouError::Platform("conditional completion omitted ETag proof".into()))?;Ok((WriteOnce::Written,etag))
         }.await;
         // On failure the owner ledger remains for resumable GC, including the
         // destination multipart identity. Pool objects are never rolled back.
@@ -380,6 +403,9 @@ impl S3Store {
     ) -> Result<Option<AssetStream>> {self.stream_range_if_match(key,range,None).await}
     pub async fn read_stream_range_if_match(&self,key:&ObjectKey,range:Range<u64>,etag:&str)->Result<Option<AssetStream>>{self.stream_range_if_match(key,range,Some(etag)).await}
     async fn stream_range_if_match(&self,key:&ObjectKey,range:Range<u64>,etag:Option<&str>)->Result<Option<AssetStream>>{
+        // Callers pass the canonical unquoted proof; the header needs the wire
+        // form. The proof is an exact opaque tag — quoting is unconditional.
+        let etag=etag.map(|value|value.trim_matches('"'));
         if range.start>range.end{return Err(NarouError::Platform("invalid asset range".into()));}
         if range.start == range.end {
             return match self.stat_object(key).await? {
@@ -395,9 +421,10 @@ impl S3Store {
         } else {
             format!("bytes={}-{}", range.start, range.end - 1)
         };
-        let mut headers=vec![("range",header.as_str())];if let Some(etag)=etag{headers.push(("if-match",etag));}
+        let if_match=etag.map(|value|format!("\"{value}\""));
+        let mut headers=vec![("range",header.as_str())];if let Some(value)=if_match.as_deref(){headers.push(("if-match",value));}
         let response=self.stream_get_object(key,&headers).await?;
-        if etag.is_some_and(|expected|response.status==206&&response.header("etag")!=Some(expected)){return Err(NarouError::Platform("S3 target generation changed".into()));}
+        if etag.is_some_and(|expected|response.status==206&&response.header("etag").map(|value|value.trim_matches('"'))!=Some(expected)){return Err(NarouError::Platform("S3 target generation changed".into()));}
         match response.status {
             404 => Ok(None),
             206 => {

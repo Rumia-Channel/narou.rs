@@ -727,7 +727,11 @@ export default class extends Production.default {
     assert(animationKey.endsWith(`/illustrations/${digest}.png`), 'pool name must hash the exact complete animation');
     assert.equal(multipart.uploads.size, 0, 'completed downloads must not leave unfinished multipart uploads');
     for (const upload of multipart.completed.slice(completedBefore)) {
-      assert(!objects.has(upload.key), 'temporary uploaded objects must be removed after publication');
+      // Temporary namespaces must never retain a completed object after
+      // publication. Canonical immutable targets (the illustration pool) are
+      // legal conditional-complete destinations and stay put.
+      const temporary = upload.key.includes('/.narou-staging/') || upload.key.includes('/.narou-transfer/');
+      assert(!temporary || !objects.has(upload.key), `temporary uploaded object ${upload.key} must be removed after publication`);
     }
 
     const exportedAnimation = await transferClient(`http://127.0.0.1:${port}`, token).exportData([animationId]);

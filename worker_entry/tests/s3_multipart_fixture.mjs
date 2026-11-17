@@ -88,6 +88,36 @@ export function createS3MultipartFixture({ objects, failPut = () => false, maxPa
           state.maxActiveParts = Math.max(state.maxActiveParts, state.activeParts);
           try {
             if (state.beforePart) await state.beforePart({ uploadId, key, number });
+            let bytes;
+            if (req.headers['x-amz-copy-source']) {
+              // UploadPartCopy: the body is empty; bytes come from the source.
+              req.resume();
+              const source = decodeURIComponent(req.headers['x-amz-copy-source']);
+              const sourceKey = source.startsWith('/') ? source : `/${source}`;
+              const sourceBytes = objects.get(sourceKey);
+              if (!sourceBytes) return error(404, 'NoSuchKey');
+              const sourceIfMatch = req.headers['x-amz-copy-source-if-match'];
+              if (sourceIfMatch && sourceIfMatch !== (state.etags.get(sourceKey) ?? etag(sourceBytes))) {
+                return error(412, 'PreconditionFailed');
+              }
+              const range = req.headers['x-amz-copy-source-range'];
+              if (range !== undefined) {
+                const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+                if (!match) return error(400, 'InvalidArgument');
+                const start = Number(match[1]);
+                const end = Number(match[2]);
+                if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || end >= sourceBytes.length) {
+                  return error(400, 'InvalidArgument');
+                }
+                bytes = Buffer.from(sourceBytes.subarray(start, end + 1));
+              } else {
+                bytes = Buffer.from(sourceBytes);
+              }
+              if (bytes.length > maxPartBytes) return error(413, 'EntityTooLarge');
+              upload.parts.set(number, bytes);
+              state.partRequests.push({ uploadId, key, number, size: bytes.length });
+              return result(`<CopyPartResult><LastModified>2026-10-15T00:00:00Z</LastModified><ETag>${xml(etag(bytes))}</ETag></CopyPartResult>`);
+            }
             const chunks = [];
             let size = 0;
             for await (const chunk of req) {
@@ -95,7 +125,7 @@ export function createS3MultipartFixture({ objects, failPut = () => false, maxPa
               if (size > maxPartBytes) return error(413, 'EntityTooLarge');
               chunks.push(chunk);
             }
-            const bytes = Buffer.concat(chunks);
+            bytes = Buffer.concat(chunks);
             const expected = req.headers['x-amz-content-sha256'];
             if (expected && expected !== createHash('sha256').update(bytes).digest('hex')) return error(403, 'SignatureDoesNotMatch');
             upload.parts.set(number, bytes);
@@ -133,6 +163,9 @@ export function createS3MultipartFixture({ objects, failPut = () => false, maxPa
             ordered.push(bytes);
             previous = number;
           }
+          // Destination conditional write: If-None-Match:*/If-Match apply to
+          // the completed key, exactly like a conditional PutObject.
+          if (!state.checkConditions(req, res, key)) return true;
           if (ordered.slice(0, -1).some((part) => part.length < 5 * 1024 * 1024)) return error(400, 'EntityTooSmall');
           const bytes = Buffer.concat(ordered);
           const finalEtag = `"${md5(Buffer.concat(ordered.map((part) => Buffer.from(md5(part), 'hex'))))}-${ordered.length}"`;
