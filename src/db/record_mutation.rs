@@ -210,7 +210,11 @@ pub(super) fn prepare<'a>(
                 claims.authorize_virtual_rebind(current, fence, id, &effective_observed, effective_candidate)?;
                 rebind = Some(RebindPlan {
                     id, fence,
-                    sql_origin, fs_origin, new_fold,
+                    sql_origin,
+                    // SQL authority retires the FS file as immutable handoff
+                    // evidence; only a live YAML gate needs an origin update.
+                    fs_origin: if yaml { fs_origin } else { None },
+                    new_fold,
                 });
                 None
             }
@@ -274,7 +278,7 @@ impl PreparedRecords<'_> {
     /// record commit while the caller still holds the OS gate proof and the
     /// metadata authority. YAML never publishes a random origin first.
     pub(super) fn finish_fs_origin(&self, root: &std::path::Path) -> Result<()> {
-        if let Some(rebind) = &self.rebind {
+        if let Some(rebind) = &self.rebind && rebind.fs_origin.is_some() {
             #[cfg(test)]
             virtual_origin_fault(false)?;
             publish_fs_origin(root, rebind.fence, rebind.fs_origin.as_deref(), &rebind.new_fold)?;
@@ -432,7 +436,7 @@ fn prepare_virtual_origin(
         ).map_err(crate::native::sqlite::sqlite_error)?;
         if changed != 1 { return Err(identity_error()); }
     }
-    if let Some(origin) = fs_origin.as_deref()
+    if yaml && let Some(origin) = fs_origin.as_deref()
         && (origin.is_empty() || (portable && origin == legacy))
     {
         rebind_fs_gate_origin_locked(root, &fence.prefix, fence.epoch, origin, actual_origin)?;

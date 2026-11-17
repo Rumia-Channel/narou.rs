@@ -67,7 +67,12 @@ impl NativeNovelRepository{
             })}))?;
             match outcome{
                 Outcome::Published=>Ok(()),
-                Outcome::Pending=>Err(NarouError::CreationCleanupPending),
+                // The closed-removal mark committed inside the transaction:
+                // release succeeded, only the deferred namespace teardown
+                // remains (reader drain + orphan sweep). Report success so a
+                // cancelled create still returns its original outcome instead
+                // of `novel_recovering: creation cleanup pending`.
+                Outcome::Pending=>Ok(()),
                 Outcome::Released=>{
                     // This proof is deliberately outside DATABASE, while the
                     // original OS lock still excludes every gate transition.

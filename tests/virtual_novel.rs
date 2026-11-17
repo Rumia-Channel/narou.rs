@@ -592,7 +592,12 @@ fn legacy_zero_virtual_export_rebinds_origin_and_converges_across_processes() {
         assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
         assert_eq!(stored(), portable);
         let gate: serde_json::Value = serde_json::from_slice(&std::fs::read(&gate_path).unwrap()).unwrap();
-        assert_eq!(gate["origin_url_fold"].as_str(), Some(portable.as_str()));
+        if sqlite {
+            assert_eq!(gate["migrated"], true);
+            assert_eq!(gate["origin_url_fold"].as_str(), Some("https://narou.rs/virtual/vs_0"));
+        } else {
+            assert_eq!(gate["origin_url_fold"].as_str(), Some(portable.as_str()));
+        }
         if sqlite {
             let origin: String = rusqlite::Connection::open(root.join(".narou/db.sqlite")).unwrap()
                 .query_row("SELECT origin_url_fold FROM novel_access_gates WHERE prefix=?1", [gate["prefix"].as_str().unwrap()], |row| row.get(0)).unwrap();
