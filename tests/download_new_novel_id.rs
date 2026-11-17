@@ -88,8 +88,8 @@ async fn a_new_download_consumes_exactly_one_id() {
 
     let store = Arc::new(MemoryObjectStore::new());
     let objects: Arc<dyn ObjectStore> = store.clone();
-    let assets: Arc<dyn AssetStore> = store;
-    let repository = Arc::new(MemoryNovelRepository::new());
+    let assets: Arc<dyn AssetStore> = store.clone();
+    let repository = Arc::new(MemoryNovelRepository::new().with_objects(store));
     let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
         narou_rs::downloader::DownloaderPlatform {
             http: http.clone(),

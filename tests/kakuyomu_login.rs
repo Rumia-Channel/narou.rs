@@ -135,8 +135,8 @@ async fn snapshot(store: &MemoryObjectStore) -> BTreeMap<String, Vec<u8>> {
 #[tokio::test]
 async fn next_chooses_an_entitled_login_and_reuses_it_without_losing_paid_chapters() {
     let http = Arc::new(ReaderFixture::new(true));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http.clone(), novels.clone(), store.clone())
         .with_cookie_store(logins(&["expired", "member", "subscriber"]).await);
     let result = downloader.download_novel(TOP).await.unwrap();
@@ -175,8 +175,8 @@ async fn next_chooses_an_entitled_login_and_reuses_it_without_losing_paid_chapte
 async fn next_without_entitlement_downloads_only_the_accessible_free_episodes() {
     for values in [vec![], vec!["expired", "member"]] {
         let http = Arc::new(ReaderFixture::new(true));
-        let novels = Arc::new(MemoryNovelRepository::new());
         let store = Arc::new(MemoryObjectStore::new());
+        let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
         let mut downloader = downloader(http, novels.clone(), store.clone()).with_cookie_store(logins(&values).await);
         let result = downloader.download_novel(TOP).await.unwrap();
         assert_eq!(result.status, UpdateStatus::Ok);
@@ -194,8 +194,8 @@ async fn next_without_entitlement_downloads_only_the_accessible_free_episodes() 
 #[tokio::test]
 async fn adding_an_entitled_login_upgrades_a_saved_free_subset() {
     let http = Arc::new(ReaderFixture::new(true));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http, novels.clone(), store.clone());
     let free = downloader.download_novel(TOP).await.unwrap();
     assert_eq!(free.total_count, 1);
@@ -213,8 +213,8 @@ async fn adding_an_entitled_login_upgrades_a_saved_free_subset() {
 #[tokio::test]
 async fn a_partial_listing_without_any_accessible_episode_does_not_create_an_empty_novel() {
     let http = Arc::new(ReaderFixture { free_count: 0, ..ReaderFixture::new(true) });
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http, novels.clone(), store.clone());
     let result = downloader.download_novel(TOP).await.unwrap();
     assert_eq!(result.status, UpdateStatus::Canceled);
@@ -226,8 +226,8 @@ async fn a_partial_listing_without_any_accessible_episode_does_not_create_an_emp
 #[tokio::test]
 async fn public_kakuyomu_novels_stay_anonymous_with_saved_logins() {
     let http = Arc::new(ReaderFixture::new(false));
-    let novels = Arc::new(MemoryNovelRepository::new());
     let store = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
     let mut downloader = downloader(http.clone(), novels.clone(), store)
         .with_cookie_store(logins(&["subscriber"]).await);
     let result = downloader.download_novel(TOP).await.unwrap();

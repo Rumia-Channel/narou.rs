@@ -313,8 +313,8 @@ preprocess: |-
   end
 "#]).unwrap().remove(0);
 
-    let novels = Arc::new(MemoryNovelRepository::new());
     let objects = Arc::new(MemoryObjectStore::new());
+    let novels = Arc::new(MemoryNovelRepository::new().with_objects(objects.clone()));
     let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
         DownloaderPlatform {
             http: Arc::new(FixtureHttp { inner: LocalHttp::new(), port }),

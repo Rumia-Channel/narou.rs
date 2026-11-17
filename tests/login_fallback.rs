@@ -144,8 +144,8 @@ async fn login_fallback_retries_with_the_stored_cookie_and_flags_the_novel() {
 
     let store = Arc::new(MemoryObjectStore::new());
     let objects: Arc<dyn ObjectStore> = store.clone();
-    let assets: Arc<dyn AssetStore> = store;
-    let repository = Arc::new(MemoryNovelRepository::new());
+    let assets: Arc<dyn AssetStore> = store.clone();
+    let repository = Arc::new(MemoryNovelRepository::new().with_objects(store));
     let mut downloader = Downloader::with_platform_and_storage_and_settings(
         narou_rs::downloader::DownloaderPlatform {
             http: http.clone(),
@@ -327,8 +327,8 @@ async fn novels_that_do_not_need_login_are_never_fetched_logged_in() {
         .unwrap();
     let store = Arc::new(MemoryObjectStore::new());
     let objects: Arc<dyn ObjectStore> = store.clone();
-    let assets: Arc<dyn AssetStore> = store;
-    let repository = Arc::new(MemoryNovelRepository::new());
+    let assets: Arc<dyn AssetStore> = store.clone();
+    let repository = Arc::new(MemoryNovelRepository::new().with_objects(store));
     let mut downloader = Downloader::with_platform_and_storage_and_settings(
         narou_rs::downloader::DownloaderPlatform {
             http: http.clone(),
@@ -484,7 +484,7 @@ async fn redirected_sites_use_their_own_consent_and_login_scope() {
             ]).with_id(id)]).await.unwrap();
         }
         let store = Arc::new(MemoryObjectStore::new());
-        let repository = Arc::new(MemoryNovelRepository::new());
+        let repository = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
         let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
             narou_rs::downloader::DownloaderPlatform {
                 http: http.clone(), rate_limiter: Arc::new(FakeRateLimiter::new()),
