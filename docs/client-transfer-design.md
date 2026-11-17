@@ -131,12 +131,15 @@ DBのrow、S3 blob、YAML/FS mirrorを同じObjectKeyの論理データへ解決
 全ルートは `/api/transfer/v2` 配下。同じ UI 認証、Host/Origin/CSRF 境界に置き、外部読み取り API `/api/v1` には置かない。Worker の writer が所有し、reader Worker には公開しない。
 
 - `GET /capabilities`: protocol/codec の版、同梱 WASM build ID、上記 limits、対応保存方式、import/export の可否と理由、server 時刻と10分有効の署名付き `creation_ticket` を返す。ticket はライブラリ・protocol に束ねる操作 nonce で、認証の代わりではない。
+- Native は SQLite 選択済みなのに管理 DB を開けない場合、保存方式を YAML と偽って広告しない。`methods=["sqlite"]` と import/export の `allowed=false`・理由を返し、転送の永続変更を拒否する。通常の YAML ライブラリとは区別する。
 - 作成前にブラウザが `request_id` (UUID) と256 bit の session secret を生成して保存する。作成要求にも `x-narou-transfer-secret` を付ける。サーバー発行 secret を初回応答だけで返す設計にはしない。
 - `request_id` は認証管理単位・方向・要求本文 digest・secret hash に束ねる。同じ要求の再送は同じランダムな session ID、違う本文/secret は `409 idempotency_conflict`。初回応答が消失しても、クライアントに残った同じ identity で session を回収できる。UI 認証は毎回必要で、secret は代替認証ではない。
 - 作成には同じ `creation_ticket` も束ねる。既存の `request_id` の再送を先に照合し、終端結果を含め7日間は同じ session / receipt を返す。対応表を回収済みでも、古い ticket は `410 request_expired` とし、新しい session を勝手に発行しない。新規やり直しは利用者の明示操作で新 identity を作る。
 - 認証管理単位は server の library ID と既存の管理権限主体。現状の単一管理者モデルでは library/admin を使い、Cookie 値やローテーションする鍵そのものを identity にしない。新しいユーザー認証モデルは追加しない。
 - secret は URL、ダウンロード名、ログへ出さない。サーバーにはハッシュを保存。ブラウザは再開情報と一緒に同一 origin の IndexedDB へ保存し、終了・破棄時に消す。
 - 状態には `revision` と ETag を付ける。select / seal / ready / publish / pause / resume / DELETE / complete は `If-Match` と永続 `operation_id` に束ねる。同じ operation の再送は precondition 判定より先に receipt を返し、ACK 消失を二重実行や単なる412にしない。
+- DELETE の `operation_id` は query（または `x-transfer-operation-id` ヘッダ）で渡し、JSON 本文は要求しない。Native / Worker / ブラウザで同じ契約を使い、secret は引き続き専用ヘッダだけで送る。
+- 制御の確定した412/428では状態を再取得し、同じ操作ID・本文を新しい revision へ束ね直す。一方、423や通信断は先行処理の ACK 消失かもしれないため、元の `If-Match` を含む fingerprint のまま再送する。再照合も既存の計6試行に数え、尽きた場合は IndexedDB の未確定操作を残す。成功していない一時停止を完了表示しない。
 - binary PUT はレコード identity、`advance` は server が `next_action` と共に返す `operation_id` で冪等化する。この2種には `If-Match` を要求しない。epoch/CAS は server 内部で検査し、古い `advance` の再送では処理をもう一段進めない。UI は古い応答で revision を巻き戻さない。
 - session / plan / receipt / 公開結果だけでなく、stage の read-back、snapshot、reuse、lease を含む v2 の全ストアアクセスを primary / `for_writes` 相当へ接続する。isolate キャッシュや read replica の遅れを確定判定へ使わない。
 - 制御応答は小さい JSON、バイトは `application/octet-stream`。`Cache-Control: no-store` と `nosniff`。アーカイブ名や本文を HTML として返さない。
@@ -388,6 +391,8 @@ portable metadata commit と origin 更新の間で停止した場合、live `nc
 
 `NovelContentAccess` / mutation fenceは**新設するport**であり、現行 `NovelLockGuard` は代替にならない。CLIのdownload/update/convert/import/export/backup、Web/Workerの本文・挿絵・EPUB・external/read API・編集・削除・小説設定まで全入口を移す。gate確認とreader admissionは同じロック/CAS境界で行い、次のlogical file openもlease/epochを検査する。
 
+配信専用Workerも同じ作品gateを使う。readerは共有D1/S3のsourceへ書かず、`NAROU_WRITER` service bindingからwriterの管理認証付き `POST /api/control/novel-access` へadmit/renew/release/gate_infoだけを委譲する。writerはprimary D1の既存fenceを呼び、別のgateやwriter権限を発行しない。本文はreaderから既存の検証済みObjectStore経路で読み、初読CRC/SHAとimmutable参照のfingerprint記録を保つ。汎用AssetStoreのRangeへ迂回して検証を落としたり、終端で全話を再取得したりしない。writerのheavy permitが使用中でもこの制御路と他作品の配信は動作させる。
+
 writerはすべて私有stageへ書き、canonical設置だけをepochで条件付ける。FSはepoch検査とrenameを奪取不能なOSロック内、SQLite/D1は同一transactionのguard内で行う。S3はD1検査の直後にmutable keyへPUTするだけではlate completeを防げないので、以下を必須とする。
 
 - 本文の既存immutable版とwrite-once画像poolはその参照を使う。残るmutableなS3旧配置への新規書込みはimmutable物理版へ行い、logical key→物理版の参照だけをDB transaction / YAML journalで公開する。既存配置は旧データ読出し用に残し、書込みfallbackにはしない。
@@ -420,6 +425,7 @@ server の専用モデルは `TransferSession`、`TransferFile`、`ChunkReceipt`
 - 外部PUT/part開始の**前**にkey・owner・epoch・予約期限を台帳へ記録する。ACKや採用CAS前の死でもorphanを辿れるようにし、key予約だけ残った場合も回収する。
 - 予約容量は未公開byte・pre-image・export snapshotを基準に取り、CASで二重計上を防ぐ。heartbeatは台帳のleaseを更新する。進行中publicationのpre-imageはsession期限だけでは回収しない。
 - 終了時はsessionをterminalにCASし、epochを無効にしてから、そのsessionのstage・snapshot・pinをページ単位で解放する。live readerやpublicationの参照が残れば消さない。
+- Native SQLiteでstageの実体をcanonical参照へ昇格した場合、公開済みblobの寿命はその参照が所有する。終了時はstageのcontrolとcheckpointを回収し、公開済みデータを待つことでsession GCを無限継続させない。最後のcanonical参照の削除・置換時にだけ物理blobを回収し、同じSQL境界で未終了stageや別参照の存在を確認する。
 - 新規ID/prefix予約はowner・epoch・expires_at付きとし、ownerのlive leaseと共に更新する。時刻超過だけでは再割当てしない。owner無効化とpublication回復を終えて未公開と確認してから同じCAS/ロック境界で回収し、公開済みIDや他操作のprefixは解放しない。採番sequenceを巻き戻さない。
 - 削除失敗は再開可能な回収cursorを残す。現行本文、共有pool、他sessionの資源を消さない。beforeunload/beacon/DELETE成功やDrop実行を回収の必要条件にしない。
 - ライブラリbackup/restoreは未解決publicationを先にdrain/回復する。未解決journalだけをbackupしてpre-imageを除外する組合せを作らず、activeな私有転送資源を通常の持ち出しZIPへ混ぜない。
@@ -543,14 +549,20 @@ CI は core・adapter・WASM 単体に加え、**生成済み配布assetsを使�
 | 10 MiB 制限の HTTP gateway | 上記取り込みと書き出しで観測した最大 request body は 8,323,470 byte。過大要求の拒否は0件、旧 `/api/transfer/import` / `export` 要求は0件。観測記録の打切りなし |
 | Firefox の実 ZIP 保存 | 一時停止後に同じ export session から保存し直し、独立した Python ZIP reader で全3 entry と利用者ファイルの SHA-256 を照合。raw が保存先・再書き出し ZIP に入らないことを確認 |
 | SW の長い確認待ち | 修正前は、最初の write 前に6分待つと、queue の0/1のどちらでも0 byteの保存と次の write の待機が発生。修正後の実 Firefox では、最初の byte 前に6分待つ場合と、64 KiB出力後に6分止める場合の両方で1 MiBを保存し、独立したSHA-256を一致させた |
-| 消費者回帰 | `tests/transfer_streaming.test.mjs` は33件成功。確認待ち・中継状態消失は修正前の実配布JSで「期待 byte が無い」「write が未完了」と失敗し、修正後は成功。EOF と heartbeat の競合も修正前の close 失敗を再現し、修正後の成功を確認 |
+| 消費者回帰 | `tests/transfer_streaming.test.mjs` は37件成功。SWの確認待ち・中継状態消失・EOF/heartbeat競合に加え、412→423→412の再照合、ACK消失後の同じfingerprintの再送、6試行後も未確定操作を保持する回帰を確認。再試行上限の423でreceiptを消す経路も修正前の失敗・修正後の成功を確認 |
 | 配布 artifact の契約 | `tests/transfer_artifacts.test.mjs` は12件成功。欠落・hash/URL不整合・worker依存・lean依存境界を検査 |
 | workerd/D1 の故障契約 | `worker_entry/tests/transfer.mjs` は終了コード0。ACK再送・再起動再開・部分batch/SHA不一致・仮想メンバー消失時のplan競合・全pin確定までのgate保持・旧epoch解放拒否を確認。50,000件の挿絵索引と、12 MiB YAML / 3 MiB scalar / 18 MiB escaped JSON の実処理で、D1 fragmentは32 KiB以下、測定したWASM領域は112 MiB未満。S3・一般Web契約とは別検証 |
-| Chromium の保存経路 | 実クリックから `showSaveFilePicker` の呼び出しへ到達したが、MCP環境ではネイティブ保存ダイアログを操作できず、実picker経由は未確認。実OPFS handleでの1 MiB超の書き込み・独立SHA照合は部分証拠であり、pickerやアプリ全体の成功には数えない |
-| Cloudflare の隔離 fixture | Worker/D1の作成後、capabilitiesのready確認で停止し、128 MiBの実行試験へは未到達。通常・保証用の両cleanup jobは成功。provider予算の確認済みとは扱わない |
-| Rust の全 target / feature | Native GC・仮想メンバーURL索引・共有挿絵poolの追加修正後も `cargo clippy --workspace --all-targets --all-features -- -D warnings` はexit 0。vendored dependency とnative host用Worker manifestの既存警告は別途表示される。テスト全体の成功を意味しない |
+| Native Firefox の大容量往復 | 実配布WASMで168作品を選び、346file / 4224 MiBをZIP保存。128 MiBと4 GiB+17byteの利用者fileを保持し、raw 4file / 1027 MiBはsnapshot前に除外。出力途中で一時停止し同じsessionから保存し直した138,536,498byteのZIPを独立readerで全347entryのCRC/SHA/size照合後、実UIからYAMLとSQLite DB-onlyへ各168作品を公開。両保存先の大容量実体と完了receiptまで一致し、DB-onlyに小説mirrorは無い。全20,236要求の記録打切り0・413/過大拒否/旧ZIP endpoint各0、最大upload 8,323,449byte、最大response 8,323,297byte |
+| Firefox の取込中断再開 | 実ZIPを実UIから取り込み、YAML・SQLite DB-onlyの両方で同じsessionの一時停止・再開後に168作品を公開。SQLiteは8,512,323byte確定で停止し、19,083,302byte確定後に公開。canonical全346file・18,894,138byteのSHA/size/実体generationと168件のcommitted/created receiptを独立照合。別sessionの実UI破棄もquery操作IDのDELETEが200となり、公開済み346参照・168作品を保持した。全6684要求の記録打切り/413/旧ZIP経路/過大拒否は0、最大upload8,323,449byte。以前のSQLite試験失敗とは別の成功実測 |
+| Native の実 HTTP 回帰 | 168作品のruntime/complete選別とYAML公開receipt、6 MiB題名、親子namespace重なり、SQLite DB-onlyの公開・完了receipt・再書き出しが成功。SQLite利用不可の501拒否と、normal/admin双方のquery操作IDによるYAML/SQLite破棄も成功。旧JSON呼出しを移行した158作品の往復を再実行し成功。転送library44件とmigration4件も成功。SQLiteの既存76件では共有canonical blobの保持・最後の参照解除時の回収を確認 |
+| Native の取得・コマンド回帰 | commands 108件、実SQLite CLI 3件、SQLite object-store 38件、実HTTP Cookieを含む取得8suite・40件が成功。追加のlegacy cache・中止・設定競合・S3論理alias・v8移行・CLI転送・仮想小説・大metadataの8suiteは修正後に各対象を実行し計40件成功（browser fixture 1件は明示実行用）。仮想原点のlibrary回帰50件も成功。最新workspace全体の成功とは扱わない |
+| Chromium の実保存 picker | 実ネイティブ保存ダイアログで168作品・346fileを通常2回保存し、全347entryのCRC/SHA/sizeを独立照合。別試験ではZIP sink83byteで一時停止し、未完成fileは0byte・成功表示なし。同じsnapshot/sessionを新しいpicker・別fileへ再開し、17,935,010byteの完成ZIPを全entry照合。全3546要求で413・旧ZIP経路・除外fileの通信は0。既存ZIPへの追記ではない |
+| Cloudflare の隔離 fixture | 268115eの隔離CI44013246489でmetadata全3・publication全9・gates全2scenarioと各cleanup jobが成功。要求数275 / 520 / 1073、WASM高水位34,930,688 / 34,930,688 / 26,607,616byte。各isolateの上限134,217,728byte、既存の全14assertion・時間/通信予算を維持。primary marker・tail接続連続性・sampling・異常outcomeの厳格検査も通過し、本番配備はしていない |
+| Worker の一般契約・S3 | 268115eのCIで一般Web・仮想小説・作者・転送契約とproduction release artifactが成功。8f722の取消契約を含むローカルLTO無効の実S3 lifecycleも終了コード0。500挿絵、16 MiB超64frame animationのmultipart保存とbyte一致export、EPUBのalpha/表示時間、実RangeのEOF前キャンセル・上流切断・admission解放が成功。4096²/6000²画像の658²表紙もpixel/alpha一致、WASM高水位54,067,200byte（JS heap別）。終端回収・同job旧token・旧origin拒否、取消6条件の元予約保持と完全回収、1685話/17目次ページの予算継続・既取得本文の再取得なし・完全EPUB、規則のhot reloadまで成功。最新production profileの成功とは扱わない |
+| Worker の実強制終了復旧 | 47232fのfixtureを実workerdで実行し終了コード0。original ID/generation/prefix/epochとplanned checkpointを保ったまま3回だけ回復し、business attemptsは0のまま。失効させるのはjob leaseだけで、強制終了したreaderの30秒leaseは自然失効を待ち、元予約を保持したclosed cleanupから回収。既存の60秒待機上限・回復予算・TTLは変更せず、同サイトの待機作品が再開。900話では実際のcursor進行だけで回復予算を戻し、既取得話の再取得なしで完全EPUBまで成功 |
+| Rust の全 target / feature | 817061のguard・HTTP helper修正まで `cargo clippy --workspace --all-targets --all-features -- -D warnings` はexit 0。vendored dependency とnative host用Worker manifestの既存警告は別途表示される。後続のreader修正やテスト全体の成功を意味しない |
 
-Nativeの保存方式別の実ブラウザ、大容量・4 GiB超の実ブラウザ、Chromium FSA、WorkerのS3・一般Web契約と128 MiB/provider予算は、まだ完了として記載しない。途中の `Array buffer allocation failed` は、テストhelperのpath上書きによりNodeが巨大な失敗差分を生成した箇所で発生した。helperと比較方法を修正しており、Worker OOMの実証にも成功結果にも数えない。以後の結果はこの節へ追記し、未確認を除外して完了扱いしない。
+最新Native全CLI、Workerの配信契約、新しいLinux CI browser gate、後続修正を含むproduction profile/Clippyは、まだ完了として記載しない。readerのfence接続後は35/38条件が成功し、管理認証・gate拒否・EOF/取消・writer並行・source書込禁止は通過したが、205話を410回取得する2条件と初読破損の拒否が失敗したため、既存の検証済み読出し経路への接続を修正中。Nativeの168作品・4 GiB超entryの実Firefox往復、Chromium実picker保存、隔離providerの128 MiB試験、ローカルS3の全lifecycleと実強制終了復旧は上表の範囲で確認済み。新しいCI gateは17 MiB利用者fileで配布UI/WASMの書出し・独立ZIP検証・YAML/DB-only取込を行う構成だが、268115eのNative全suiteが先に失敗し未実行。ローカルの新規Selenium Firefoxはheadless・headed双方で起動途中exit 1・registry初期化エラーとなったため、既存の実Firefox操作成功とは区別する。17 MiB smokeを4 GiBの実測とは扱わない。以前の `Array buffer allocation failed` は、テストhelperのpath上書きによりNodeが巨大な失敗差分を生成した箇所で発生したもので、Worker OOMの証拠には数えない。
 
 
 ## 17. 参照と設計検証の範囲
@@ -561,5 +573,7 @@ Nativeの保存方式別の実ブラウザ、大容量・4 GiB超の実ブラウ
 - [MDN: Transferable objects](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Transferable_objects): File/Blob の structured clone と ArrayBuffer 所有権移転の区別。
 - [RustCrypto sha2: Sha256](https://docs.rs/sha2/latest/sha2/struct.Sha256.html): 既存0.11依存での hash state serialize/deserialize。
 - [MDN: Offline and background operation](https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Guides/Offline_and_background_operation): `waitUntil` でも browser 固有の最大実行時間を超える継続は保証されない。
+- [Wrangler tail transport](https://github.com/cloudflare/workers-sdk/blob/main/packages/wrangler/src/tail/createTail.ts): `trace-v1` の初期設定frameと `mask: false`。ping/pongは同ディレクトリの `index.ts` に従う。
+- [S3 AbortMultipartUpload](https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html): 存在しないupload IDの `404 NoSuchUpload`。他の404や2xx Error XMLまで成功へ緩めない。
 
 移行前の調査を元に、プロトコル・migration・ブラウザUIと保存境界を別ブランチで実装している。§16.1 の実測だけを確認済みとし、受入条件が未達の間は機能全体・容量制限・HTTP 413 の解消済みやリリース済みとは案内しない。
