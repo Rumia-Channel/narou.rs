@@ -50,7 +50,6 @@ impl SqliteObjectStore {
     }
     pub(super) fn open_asset_in_connection(&self,conn:&Connection,key:&ObjectKey,range:std::ops::Range<u64>)->Result<Option<(ObjectMetadata,AssetStream)>>{
         let referenced=Self::has_promoted_reference(conn,key)?;let private=crate::platform::is_reserved_key(key);
-        if self.prefer_existing_files&&!referenced&&!private&&let Some((file,length))=self.mirror.open_range(key,range.clone())?{let metadata=crate::native::object_store::NativeObjectStore::metadata_for_open_file(key,&file)?;return Ok(Some((metadata,crate::native::object_store::native_range_stream(file,length))));}
         let Some(header)=Self::header_in_connection(conn,key)?else{
             if referenced{return Err(NarouError::Platform("canonical reference payload missing".into()));}
             if private{return Ok(None);}
@@ -66,7 +65,6 @@ impl SqliteObjectStore {
     pub(super) fn open_local_asset_in_connection(&self,conn:&Connection,key:&ObjectKey,range:std::ops::Range<u64>)->Result<Option<(ObjectMetadata,AssetStream)>>{
         let referenced=Self::has_promoted_reference(conn,key)?;let private=crate::platform::is_reserved_key(key);
         if referenced{return Ok(None);}
-        if self.prefer_existing_files&&!private&&let Some((file,length))=self.mirror.open_range(key,range.clone())?{let metadata=crate::native::object_store::NativeObjectStore::metadata_for_open_file(key,&file)?;return Ok(Some((metadata,crate::native::object_store::native_range_stream(file,length))));}
         let Some(header)=Self::header_in_connection(conn,key)?else{
             if private{return Ok(None);}
             return self.mirror.open_range(key,range)?.map(|(file,length)|Ok((crate::native::object_store::NativeObjectStore::metadata_for_open_file(key,&file)?,crate::native::object_store::native_range_stream(file,length)))).transpose();

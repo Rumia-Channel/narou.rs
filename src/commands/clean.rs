@@ -88,7 +88,8 @@ fn clean_novel(write: NovelWriteGuard, remove: bool) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
-    let toc: narou_rs::downloader::TocFile = serde_yaml::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let toc: narou_rs::downloader::TocFile = serde_yaml::from_slice(&bytes)
+        .map_err(|error| format!("目次の読み込みに失敗しました: {error}"))?;
     let expected = expected_section_stems(&toc);
     for orphan in find_orphan_files_with_expected(snapshot.path(), &expected)? {
         let relative = orphan.strip_prefix(snapshot.path()).map_err(|error| error.to_string())?;

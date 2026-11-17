@@ -160,6 +160,7 @@ mod tests {
                 Some("n9669bk"),
                 "sample title",
             ));
+            db.save()?;
             Ok::<(), NarouError>(())
         })
         .unwrap();

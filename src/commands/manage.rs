@@ -1338,6 +1338,7 @@ mod tests {
             fn drop(&mut self) { *narou_rs::db::DATABASE.lock() = self.0.take(); }
         }
         for sqlite in [false, true] {
+            let _legacy = (!sqlite).then(crate::test_support::legacy_yaml_guard);
             for with_file in [false, true] {
                 let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-libraries");
                 std::fs::create_dir_all(&base).unwrap();
@@ -1365,7 +1366,7 @@ mod tests {
                 futures::executor::block_on(async {
                     assert!(write.write_small(&section, b"late".to_vec()).await.is_err());
                     let mut read = NovelReadLease::admit(&stores.objects, write.prefix(), "removed-content-check").await?;
-                    assert!(read.read_small(&keys.toc()).await?.is_none());
+                    assert_eq!(read.read_small(&keys.toc()).await?, (!with_file).then(|| b"toc".to_vec()));
                     assert_eq!(read.read_small(&section).await?, (!with_file).then(|| b"body".to_vec()));
                     read.release().await
                 }).unwrap();
