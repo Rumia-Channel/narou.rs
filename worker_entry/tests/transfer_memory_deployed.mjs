@@ -12,6 +12,14 @@ assert.equal(base.protocol,'https:','NAROU_TRANSFER_TEST_URL must be a deployed 
 assert(base.hostname.endsWith('.workers.dev'),'this test requires real Cloudflare Workers, not local workerd');
 const token=process.env.NAROU_TRANSFER_TEST_TOKEN;
 assert(token,'NAROU_TRANSFER_TEST_TOKEN is required for the disposable test fixture');
+const caseGroups={
+  metadata:['bounded_metadata_fragments','50000_entry_aliased_index_ack_reuse','16MiB_legacy_initializer_ack_reuse'],
+  publication:['17MiB_bounded_wire','runtime_complete','overwrite_skip','create_control_replay','partial_batch_sha_receipts','raw_forbidden','canonical_commit_ack_loss','cancel_before_commit','virtual_members_frozen_order'],
+  gates:['33_source_gate_and_private_cursor_replay','legacy_source_namespace_isolation'],
+};
+const caseGroup=process.env.NAROU_TRANSFER_CASE_GROUP??'all';
+assert(caseGroup==='all'||Object.hasOwn(caseGroups,caseGroup),'unknown transfer case group');
+const groups=caseGroup==='all'?Object.keys(caseGroups):[caseGroup];
 const client=transferClient(base.origin,token,{verifyPrimary:true});
 // Keep diagnostics bounded and omit credentials, payload text and raw backend errors.
 const request=client.request;
@@ -46,6 +54,7 @@ async function replayStep(session,attempt){const replay=await client.json(`${ses
 assert.equal((await fetch(`${base.origin}/api/transfer/v2/capabilities`)).status,401);
 assert.equal((await client.request('/api/transfer/export?ids=1')).status,404);
 assert.equal((await client.request('/api/transfer/import',{method:'POST',body:'retired'})).status,404);
+if(groups.includes('metadata')){
 const story='\x01'.repeat(3*1024*1024);
 const novel=fixtureNovel(slug,[],{subtitle:story});
 novel.files[0].bytes=Buffer.concat([novel.files[0].bytes,Buffer.from(`story: "${'\\x01'.repeat(story.length)}"\n`)]);
@@ -98,7 +107,10 @@ for(let step=0;step<1000;step++){
 assert(lostLegacyStage,'the actual 16MiB decoded initializer must persist its EOF checkpoint');assert(['ready','reading'].includes(legacy.status.state));
 const legacyStages=(await observe(legacy)).stages.filter(stage=>stage.stagepurpose==='legacy_source');assert.equal(legacyStages.length,1);assert.equal(legacyStages[0].stage_id,lostLegacyStage);assert(legacyStages[0].sealed);
 assert.deepEqual((await legacy.download()).files.get('novels/0/legacy.bin'),legacyBytes);
+console.log(JSON.stringify({event:'transfer_case_group_completed',case_group:'metadata',requests:client.requests.length,wasm_highwater_bytes:client.memoryHighWater}));
+}
 
+if(groups.includes('publication')){
 const large=Buffer.alloc(17*1024*1024);for(let index=0;index<large.length;index++)large[index]=(index*31+(index>>>7))&255;
 const original=fixtureNovel(`${slug}-bounded`,[{path:'notes.bin',bytes:large},{path:'replace.txt',bytes:Buffer.from('user settings')},{path:'本文/cache/old.yaml',bytes:Buffer.from('body: historic\n')}]);
 assert.equal((await client.importData([original],{profile:'complete'})).status.state,'completed');
@@ -126,7 +138,11 @@ assert.equal((await client.importData([memberOne,memberTwo,parent],{profile:'com
 const groupRecords=(await client.json('/api/novels?limit=1000')).body.data;const parentId=groupRecords.find(row=>row.toc_url===parent.toc_url).id;const memberId=groupRecords.find(row=>row.toc_url===memberOne.toc_url).id;
 const group=await client.exportData([parentId,memberId],{profile:'complete'});assert.equal(group.manifest.novels.length,3);assert.deepEqual(group.manifest.novels[2].virtual_members,parent.virtual_members);assert(!group.manifest.novels[2].tags.some(tag=>tag.startsWith('vs_')));
 assert((await client.json('/api/virtual_novels')).body.novels.some(group=>group.title===parent.title&&group.members.length===2));
+client.memoryHighWater=Math.max(client.memoryHighWater??0,uncertain.memoryHighWater??0);
+console.log(JSON.stringify({event:'transfer_case_group_completed',case_group:'publication',requests:client.requests.length,wasm_highwater_bytes:client.memoryHighWater}));
+}
 
+if(groups.includes('gates')){
 const gateNovels=Array.from({length:33},(_,index)=>fixtureNovel(`${slug}-gate-${index}`));await client.importData(gateNovels);const listed=(await client.json('/api/novels?limit=1000')).body.data;const gateIds=gateNovels.map(novel=>listed.find(row=>row.toc_url===novel.toc_url).id);const gates=await client.beginExport(gateIds);
 let selectionFault;for(let step=0;step<1000;step++){const attempt=await faultStep(gates,'backend_after');if(attempt.fired){selectionFault=attempt;break;}}assert(selectionFault,'actual selected-source cursor commit must be interrupted');const beforeSelectionReplay=(await observe(gates)).selection;await replayStep(gates,selectionFault);assert.deepEqual((await observe(gates)).selection,beforeSelectionReplay,'an old operation must not freeze the next source page');
 await gates.until(value=>value.state==='selecting');await select(gates);
@@ -135,11 +151,12 @@ const beforeGateReplay=(await observe(gates)).snapshot;assert.equal(beforeGateRe
 let partialSnapshot=false;for(let step=0;step<10000;step++){await gates.get();if(['ready','reading'].includes(gates.status.state))break;const snapshot=(await observe(gates)).snapshot;if(snapshot.pinned>0&&snapshot.pinned<33){assert.equal(snapshot.gates,33,'every source gate remains closed until every selected file is pinned');partialSnapshot=true;}await gates.step();}
 assert(partialSnapshot);assert.equal((await observe(gates)).snapshot.gates,0);assert.equal((await gates.download()).manifest.novels.length,33);
 await sourceNamespaceContracts(client,`${slug}-source`);
-client.memoryHighWater=Math.max(client.memoryHighWater??0,uncertain.memoryHighWater??0);
+console.log(JSON.stringify({event:'transfer_case_group_completed',case_group:'gates',requests:client.requests.length,wasm_highwater_bytes:client.memoryHighWater}));
+}
 // Each v2 response reports the current invocation's WASM allocation; this is
 // not a later request to a possibly different isolate's diagnostic endpoint.
 assert(client.memoryHighWater>0,'the deployed production WASM must be instrumented');
 assert(client.memoryHighWater<112*1024*1024,`WASM highwater ${client.memoryHighWater} leaves insufficient room in the enforced 128 MiB isolate`);
 assert(client.requests.filter(request=>request.type==='application/octet-stream').every(request=>request.bytes<=8*1024*1024));
 assert(client.requests.every(request=>request.type!=='application/zip'));
-console.log(JSON.stringify({passed:true,platform:'Cloudflare Workers',enforced_isolate_bytes:128*1024*1024,wasm_highwater_bytes:client.memoryHighWater,scenarios:['bounded_metadata_fragments','50000_entry_aliased_index_ack_reuse','16MiB_legacy_initializer_ack_reuse','17MiB_bounded_wire','runtime_complete','overwrite_skip','create_control_replay','partial_batch_sha_receipts','raw_forbidden','canonical_commit_ack_loss','cancel_before_commit','virtual_members_frozen_order','33_source_gate_and_private_cursor_replay','legacy_source_namespace_isolation']}));
+console.log(JSON.stringify({passed:true,case_group:caseGroup,platform:'Cloudflare Workers',enforced_isolate_bytes:128*1024*1024,wasm_highwater_bytes:client.memoryHighWater,scenarios:groups.flatMap(group=>caseGroups[group])}));

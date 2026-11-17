@@ -25,6 +25,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (14, include_str!("migrations/0014_attribute_tag.sql")),
     (15, include_str!("migrations/0015_query_indexes.sql")),
     (16, crate::db::object_query::TRANSFER_STORAGE_SCHEMA),
+    (17, include_str!("migrations/0017_transferred_blob_lifetime.sql")),
 ];
 
 pub(crate) fn apply(conn: &mut Connection) -> Result<()> {
