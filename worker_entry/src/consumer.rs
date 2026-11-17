@@ -423,9 +423,9 @@ async fn process_discrete(
                 )
                 .await
             {
-                // 実行中に行が tombstone されていれば queue_cancelled で閉じる
-                // (`queue_complete` は送らない)。
-                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                // Distinguish cancellation from a superseding execution
+                // without changing the successor's row or reservations.
+                settle_lost_execution(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
             advance_terminal_creation(runtime, &job_id).await?;
@@ -451,7 +451,7 @@ async fn process_discrete(
                 )
                 .await
             {
-                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                settle_lost_execution(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
             advance_terminal_creation(runtime, &job_id).await?;
@@ -478,7 +478,7 @@ async fn process_discrete(
                 .await
             {
                 // 中断されたジョブを再投入しない (行は terminal 済み)。
-                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                settle_lost_execution(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
             broadcast_terminal_events(
@@ -511,7 +511,7 @@ async fn process_discrete(
                 .await
             {
                 // 実行中にキャンセルされたなら queue_failed は出さない。
-                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                settle_lost_execution(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
             advance_terminal_creation(runtime, &job_id).await?;
@@ -531,7 +531,7 @@ async fn process_discrete(
                 .await
             {
                 // 実行中にキャンセルされたなら queue_failed は出さない。
-                settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                settle_lost_execution(runtime, push, &job_id, &execution_token, message, error).await?;
                 return Ok(());
             }
             advance_terminal_creation(runtime, &job_id).await?;
@@ -542,10 +542,9 @@ async fn process_discrete(
         JobOutcome::Retryable { reason } => {
             match settle_retryable(runtime, &job_id, &execution_token, &reason).await {
                 Err(error) => {
-                    // `record_attempt` / 二次 `mark_terminal` が token 失効で
-                    // 失敗 = 実行中にキャンセルされた。queue_retry /
-                    // queue_failed は送らず queue_cancelled で閉じる。
-                    settle_user_cancel(runtime, push, &job_id, &execution_token, message, error).await?;
+                    // Confirm cancellation or lost authority in D1. A stale
+                    // physical execution must not retry/fail its successor.
+                    settle_lost_execution(runtime, push, &job_id, &execution_token, message, error).await?;
                     return Ok(());
                 }
                 Ok(RetryDisposition::Rescheduled {
@@ -597,12 +596,13 @@ async fn process_discrete(
 /// `ledger::cancel_running_job` で tombstone する (terminal status +
 /// [`USER_CANCEL_REASON`])。同じ実行トークンの物理処理が戻ってから排他を解放し、
 /// native の killed child と同じ `queue_cancelled` を送って ack する。
-/// それ以外の失敗 (別実行への lease 移譲・D1 エラー等) は元のエラーを返す。
+/// 別実行へ移った場合は行・予約を触らず古い配信だけ ack する。D1 の検証失敗や
+/// 現在も所有している実行の失敗はエラーとして返す。
 ///
 /// `Wasm` 自体を外側から kill せず、取得は話・未取得画像の境界で台帳を
 /// 再確認して中断する。最後の処理との競合も終端書き込みの token/status
 /// guard で検出し、物理処理が戻るまでは所有権を解放しない。
-async fn settle_user_cancel(
+async fn settle_lost_execution(
     runtime: &WorkerRuntime,
     push: &PushHubClient,
     job_id: &JobId,
@@ -611,12 +611,22 @@ async fn settle_user_cancel(
     error: NarouError,
 ) -> std::result::Result<(), NarouError> {
     let cancelled = matches!(
-        runtime.ledger.get(job_id).await,
-        Ok(Some(view))
+        runtime.ledger.get(job_id).await?,
+        Some(view)
             if view.status.is_terminal() && view.last_error.as_deref() == Some(USER_CANCEL_REASON)
     );
     if !cancelled || !runtime.ledger.finish_cancelled(job_id, execution_token).await? {
-        return Err(error);
+        return match runtime.ledger.ensure_execution_active(job_id, execution_token).await {
+            Err(NarouError::SuspendDownload(_)) => {
+                // A primary read proves this token is no longer current.
+                // Do not clear checkpoints, release creation IDs, or emit
+                // terminal events belonging to another physical executor.
+                message.ack();
+                Ok(())
+            }
+            Err(check_error) => Err(check_error),
+            Ok(()) => Err(error),
+        };
     }
     advance_terminal_creation(runtime, job_id).await?;
     console_log!("job {job_id} was cancelled by the user while running");
