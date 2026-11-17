@@ -9,7 +9,7 @@ use crate::error::{NarouError, Result};
 use crate::application::novel_access::{NovelReadLease, NovelWriteGuard};
 use crate::platform::{
     Clock, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore, SystemClock,
-    ObjectFingerprint,
+    ObjectFingerprint, ObjectFingerprintMismatch,
 };
 
 use super::types::{SectionElement, SectionFile, SubtitleInfo, TocFile};
@@ -166,13 +166,11 @@ impl PersistenceService {
                         fingerprints.push(ObjectFingerprint { key, sha256: Sha256::digest(&bytes).into() });
                         return Ok(Some(section));
                     }
-                    for fingerprint in &fingerprints {
-                        let bytes = lease.read_small(&fingerprint.key).await?.ok_or_else(|| {
-                            NarouError::Platform(format!("section disappeared during conversion: {}", fingerprint.key))
-                        })?;
-                        if <[u8; 32]>::from(Sha256::digest(&bytes)) != fingerprint.sha256 {
-                            return Err(NarouError::Platform(format!("section changed during conversion: {}", fingerprint.key)));
-                        }
+                    if let Some(mismatch) = lease.verify_fingerprints(&fingerprints).await? {
+                        return Err(NarouError::Platform(match mismatch {
+                            ObjectFingerprintMismatch::Missing(key) => format!("section disappeared during conversion: {key}"),
+                            ObjectFingerprintMismatch::Changed(key) => format!("section changed during conversion: {key}"),
+                        }));
                     }
                     let current = lease.read_small(&keys.toc()).await?.ok_or_else(|| {
                         NarouError::Platform(format!("toc disappeared during conversion: {}", keys.toc()))

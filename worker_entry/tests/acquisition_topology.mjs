@@ -53,6 +53,7 @@ export function renderAcquisitionTopology({
   const shared = (extraVars) => [
     `main = ${JSON.stringify(main)}`,
     `compatibility_date = ${JSON.stringify(COMPATIBILITY_DATE)}`,
+    'compatibility_flags = ["enable_request_signal"]',
     'workers_dev = true',
     '',
     '[limits]',

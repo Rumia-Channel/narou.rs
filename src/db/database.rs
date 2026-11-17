@@ -1943,16 +1943,22 @@ mod tests {
     fn virtual_rebind_postcommit_faults_repair_before_keep_files_removal() {
         use crate::platform::NovelAccessFence;
         let _global = crate::test_support::global_state_guard();
-        for (mode, after_write) in [(0, false), (0, true), (1, false), (1, true), (2, false), (2, true)] {
+        for (mode, after_write) in [(0, Some(false)), (0, Some(true)), (1, None), (2, None)] {
             let root = tempfile::tempdir().unwrap();
             let (mut database, store, fence, legacy) = virtual_identity_fixture(root.path(), mode, 0);
             let candidate = crate::virtual_novel::new_toc_url().unwrap();
-            super::record_mutation::fail_virtual_origin(after_write);
-            let error = store.with_open_write(&fence, || database.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, &candidate)).unwrap_err();
-            assert!(error.to_string().contains("injected virtual origin"), "{error}");
+            if let Some(after_write) = after_write {
+                super::record_mutation::fail_virtual_origin(after_write);
+                let error = store.with_open_write(&fence, || database.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, &candidate)).unwrap_err();
+                assert!(error.to_string().contains("injected virtual origin"), "{error}");
+            } else {
+                // SQL commits the live origin with metadata; the retired FS
+                // handoff is immutable, so it has no postcommit file write.
+                assert_eq!(store.with_open_write(&fence, || database.rebind_virtual_identity(&fence, crate::platform::NovelId(0), &legacy, &candidate)).unwrap(), candidate);
+            }
             let mut restarted = Database::with_root(root.path().to_path_buf()).unwrap();
             assert_eq!(restarted.get(0).unwrap().toc_url, candidate);
-            assert_eq!(identity_origin(&store, &fence), if after_write || mode != 0 { candidate.clone() } else { legacy });
+            assert_eq!(identity_origin(&store, &fence), if after_write == Some(false) { legacy } else { candidate.clone() });
             let owner = crate::platform::access_fence::new_removal_owner(crate::platform::NovelId(0), false).unwrap();
             let epoch = store.with_gate_lock(&fence.prefix, || restarted.with_removal_identity(&fence, crate::platform::NovelId(0), |connection| {
                 store.persist_retirement_locked(&fence, &owner, connection)

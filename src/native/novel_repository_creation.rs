@@ -67,7 +67,12 @@ impl NativeNovelRepository{
             })}))?;
             match outcome{
                 Outcome::Published=>Ok(()),
-                Outcome::Pending=>Err(NarouError::CreationCleanupPending),
+                // The closed-removal mark committed inside the transaction:
+                // release succeeded, only the deferred namespace teardown
+                // remains (reader drain + orphan sweep). Report success so a
+                // cancelled create still returns its original outcome instead
+                // of `novel_recovering: creation cleanup pending`.
+                Outcome::Pending=>Ok(()),
                 Outcome::Released=>{
                     // This proof is deliberately outside DATABASE, while the
                     // original OS lock still excludes every gate transition.
@@ -80,6 +85,6 @@ impl NativeNovelRepository{
     /// Startup collector: actual nonblocking OS ownership, never age/PID/TTL.
     pub fn reap_creation_claims_sync(&self,cursor:Option<i64>,limit:usize)->Result<(usize,Option<i64>)>{
         let(root,(candidates,next))=crate::db::with_database(|database|Ok((database.archive_root().parent().ok_or_else(||NarouError::Platform("archive has no library root".into()))?.to_owned(),database.ordinary_id_liveness_page(cursor,limit.clamp(1,100))?)))?;let mut count=0;
-        for(id,generation)in candidates{let Some(resource)=crate::db::database::id_reservations::try_liveness_lock(&root,id,generation)?else{continue;};let reservation=NovelIdReservation::new(id,generation).with_liveness(resource);match self.release_native_creation(reservation){Ok(())|Err(NarouError::CreationCleanupPending)=>count+=1,Err(error)=>return Err(error)}}Ok((count,next))
+        for(id,generation)in candidates{let Some(resource)=crate::db::database::id_reservations::try_liveness_lock(&root,id,generation)?else{continue;};let reservation=NovelIdReservation::new(id,generation).with_liveness(resource);match self.release_native_creation(reservation){Ok(())=>count+=1,Err(error)=>return Err(error)}}Ok((count,next))
     }
 }

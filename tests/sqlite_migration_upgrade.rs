@@ -152,15 +152,24 @@ fn open_upgrades_v8_objects_without_losing_db_only_rows() {
     std::fs::create_dir_all(&archive_root).unwrap();
 
     let conn = v8_objects_database(&db_path);
-    // Seed the v8 format itself: today's writer requires gate tables that
-    // did not exist in this schema.
+    // A body that exists only in the database (the mirror is disabled). Seed
+    // the row in the schema-v8 object format directly: the current
+    // SqliteObjectStore write path resolves gate bindings through tables that
+    // migration 16 creates, so it can only run on a post-upgrade connection.
     let key =
         narou_rs::platform::ObjectKey::try_new("novels/site/fixture/本文/1 第一話.yaml").unwrap();
-    let body = b"body: db only".as_slice();
+    let body = b"body: db only";
     conn.execute(
-        "INSERT INTO objects (object_key, size, updated_at, encoding, crc32, data)
-         VALUES (?1, ?2, '2026-01-01T00:00:00Z', 'none', ?3, ?4)",
-        rusqlite::params![key.as_ref(), body.len() as i64, narou_rs::platform::object_crc32(body) as i64, body],
+        "INSERT INTO objects (object_key, size, content_type, updated_at, encoding, crc32, data)
+         VALUES (?, ?, ?, ?, 'none', ?, ?)",
+        rusqlite::params![
+            key.as_ref(),
+            body.len() as i64,
+            narou_rs::platform::content_type_for_key(&key),
+            "2026-01-01T00:00:00Z",
+            narou_rs::platform::object_crc32(body) as i64,
+            body.as_slice(),
+        ],
     ).unwrap();
     drop(conn);
     let mirror_files: usize = walkdir_yaml_count(&archive_root);

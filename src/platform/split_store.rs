@@ -177,10 +177,11 @@ impl ObjectStore for SplitStore {
         self.pair_for(key).objects.read_small(key)
     }
 
-    fn verify_fingerprints<'a>(
+    fn verify_fingerprints<'a, 'input: 'a>(
         &'a self,
-        fingerprints: &'a [ObjectFingerprint],
-    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'a>>>> {
+        fingerprints: &'input [ObjectFingerprint],
+        reader: &'a mut dyn super::ObjectFingerprintReader,
+    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'input>>>> {
         Box::pin(async move {
             let mut remaining = fingerprints;
             while let Some(first) = remaining.first() {
@@ -188,7 +189,7 @@ impl ObjectStore for SplitStore {
                 let count = remaining.iter().take_while(|fingerprint| {
                     Arc::ptr_eq(store, &self.pair_for(&fingerprint.key).objects)
                 }).count();
-                if let Some(mismatch) = store.verify_fingerprints(&remaining[..count]).await? {
+                if let Some(mismatch) = store.verify_fingerprints(&remaining[..count], reader).await? {
                     return Ok(Some(mismatch));
                 }
                 remaining = &remaining[count..];

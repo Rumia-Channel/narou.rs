@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import subprocess
 import tempfile
 import time
@@ -107,6 +108,7 @@ def main():
     driver = None
     fixture = None
     gateway_process = None
+    gateway_stats = None
     stage = "fixture startup"
     with tempfile.TemporaryDirectory(prefix="browser-controller-", dir=base) as directory:
         work = Path(directory)
@@ -122,6 +124,7 @@ def main():
             )
             try:
                 fixture = wait_json(ready, process)
+                overall_deadline = time.monotonic() + 20 * 60 - 5
                 gateway_ready, gateway_stop, gateway_stats = [work / name for name in ("gateways.json", "gateway-stop", "gateway-stats.json")]
                 gateway_process = subprocess.Popen(
                     ["node", "scripts/transfer-browser-gateways.mjs", str(ready), str(gateway_ready), str(gateway_stop), str(gateway_stats)],
@@ -164,6 +167,10 @@ def main():
                     driver.add_cookie({"name": "narou_ui_token", "value": origin["ui_token"], "path": "/", "httpOnly": True, "sameSite": "Strict"})
                     driver.get(base_url + "/")
                     wait.until(lambda browser: browser.execute_script("return document.readyState === 'complete'"))
+                    # Each owned library is fresh: acknowledge the shipped
+                    # first-run tour through its real UI, not by hiding it.
+                    click("#feature-tour-ok")
+                    wait.until(lambda browser: not browser.find_element(By.ID, "feature-tour-ok").is_displayed())
                     wait.until(lambda browser: browser.find_element(By.ID, "action-option-export").get_attribute("aria-disabled") != "true")
                     identity = driver.execute_async_script("""
                         const done = arguments[0];
@@ -174,22 +181,53 @@ def main():
                     assert identity and identity["caps"]["build"]["wasm_build_id"] == identity["manifest"]["build_id"]
                     assert str(identity["caps"]["build"]["abi_version"]) == str(identity["manifest"]["abi_version"]) == "2"
 
-                def completed():
-                    screen = driver.find_element(By.ID, "transfer-progress")
-                    outcome = screen.get_attribute("data-outcome")
-                    if outcome == "error":
-                        raise AssertionError(screen.text)
-                    return outcome == "success"
+                def no_transfer_error():
+                    for screen in driver.find_elements(By.ID, "transfer-progress"):
+                        if screen.get_attribute("data-outcome") == "error":
+                            raise AssertionError(screen.text)
+                    return True
 
-                stage = "source UI export"
+                def completed():
+                    no_transfer_error()
+                    return driver.find_element(By.ID, "transfer-progress").get_attribute("data-outcome") == "success"
+
+                def wait_completed():
+                    last_progress = None
+                    last_change = time.monotonic()
+
+                    def progressing(browser):
+                        nonlocal last_progress, last_change
+                        now = time.monotonic()
+                        if now - last_change >= 240:
+                            raise TimeoutError(f"No byte/publication progress for 240 seconds: {last_progress}")
+                        if completed():
+                            return True
+                        progress = browser.execute_script(r"""
+                            const lines = document.querySelectorAll('#transfer-progress .transfer-progress-detail');
+                            return [lines[2], lines[3]].map(line =>
+                              line?.textContent.match(/\d+(?:\.\d+)?/g) || []);
+                        """)
+                        if progress != last_progress:
+                            last_progress, last_change = progress, now
+                            print(json.dumps({"stage": stage, "progress": progress}), flush=True)
+                        return False
+
+                    remaining = overall_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("The owned browser fixture's 20-minute lifetime expired")
+                    WebDriverWait(driver, remaining, poll_frequency=0.1).until(progressing)
+
+                stage = "source list readiness"
                 page(0)
+                wait.until(lambda browser: f"/ {fixture['count']}" in browser.find_element(By.ID, "novel-list-info").text)
+                stage = "source UI export"
                 menu("select-menu", "action-select-all")
                 wait.until(lambda browser: browser.find_element(By.ID, "badge-selecting").text == str(fixture["count"]))
                 menu("options-menu", "action-option-export")
-                wait.until(lambda browser: browser.find_element(By.CSS_SELECTOR, ".transfer-choice-overlay .transfer-select-summary").text.startswith("168 "))
+                wait.until(lambda browser: no_transfer_error() and browser.find_element(By.CSS_SELECTOR, ".transfer-choice-overlay .transfer-select-summary").text.startswith("168 "))
                 assert driver.find_element(By.CSS_SELECTOR, '.transfer-choice-overlay input[value="runtime"]').is_selected()
                 click(".transfer-choice-overlay .modal-footer .btn-primary")
-                wait.until(lambda browser: completed())
+                wait_completed()
                 driver.save_screenshot(str(ARTIFACTS / "export.png"))
 
                 def downloaded(_):
@@ -208,9 +246,9 @@ def main():
                     # actual file input; its change handler runs shipped WASM.
                     driver.find_element(By.ID, "transfer-import-file").send_keys(str(archive_path))
                     click(".transfer-choice-overlay .modal-footer .btn-primary")
-                    wait.until(lambda browser: "公開内容の確認" in browser.find_element(By.CSS_SELECTOR, ".transfer-choice-overlay").text)
+                    wait.until(lambda browser: no_transfer_error() and "公開内容の確認" in browser.find_element(By.CSS_SELECTOR, ".transfer-choice-overlay").text)
                     click(".transfer-choice-overlay .modal-footer .btn-primary")
-                    wait.until(lambda browser: completed())
+                    wait_completed()
                     assert f"新規 {fixture['count']}" in driver.find_element(By.ID, "transfer-progress-status").text
                     driver.save_screenshot(str(ARTIFACTS / f"{kind}-import.png"))
                     validate_target(fixture["origins"][index], manifest, index == 2)
@@ -250,6 +288,8 @@ def main():
                     except subprocess.TimeoutExpired:
                         gateway_process.kill()
                         gateway_process.wait()
+                if gateway_stats and gateway_stats.exists():
+                    shutil.copyfile(gateway_stats, ARTIFACTS / "gateway-stats.json")
                 if fixture:
                     Path(fixture["stop"]).touch()
                 try:

@@ -660,6 +660,14 @@ fn restore_compat_files(published: &[&CompatMirror]) -> Result<()> {
 static OPEN_HANDLES: LazyLock<Mutex<HashMap<PathBuf, StateDb>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Last `configure` failure per narou dir. `active_for` keeps retrying, so
+/// callers that must fail closed (the transfer storage authority) can read
+/// the recorded cause here instead of guessing from `None`. The map also
+/// dedupes the warning: a persistent failure is reported once per distinct
+/// message, not once per `active_for` call.
+static OPEN_FAILURES: LazyLock<Mutex<HashMap<PathBuf, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Which management backend owns `<root>/.narou`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageMode {
@@ -713,20 +721,40 @@ pub fn active_for(narou_dir: &Path) -> Option<StateDb> {
     }
     match configure(&dir) {
         Ok(handle) => {
+            OPEN_FAILURES.lock().remove(&dir);
             cache.insert(dir, handle.clone());
             Some(handle)
         }
         // SQLite was opted into (storage-backend marker) but the database
         // could not be opened — keep the legacy-YAML fallback, but surface
-        // the cause instead of silently degrading.
+        // the cause instead of silently degrading. The failure is recorded
+        // for `configured_failure` so authorities that cannot fall back can
+        // still distinguish "not configured" from "configured but broken".
         Err(error) => {
-            eprintln!(
-                "warning: sqlite storage unavailable for {}: {error}; falling back to YAML file storage",
-                dir.display()
-            );
+            let message = error.to_string();
+            let mut failures = OPEN_FAILURES.lock();
+            if failures.get(&dir) != Some(&message) {
+                eprintln!(
+                    "warning: sqlite storage unavailable for {}: {message}; falling back to YAML file storage",
+                    dir.display()
+                );
+                failures.insert(dir, message);
+            }
             None
         }
     }
+}
+
+/// The recorded `configure` failure for a SQLite-configured narou dir, or
+/// `None` when the dir is not configured for SQLite or the last attempt
+/// succeeded (or has not run yet). `active_for` retries a failing
+/// `configure` on every call, so a `Some` here is only as fresh as the most
+/// recent `active_for` — which is what the transfer journal performs.
+pub fn configured_failure(narou_dir: &Path) -> Option<String> {
+    if legacy_yaml_active() || read_mode(narou_dir) != StorageMode::Sqlite {
+        return None;
+    }
+    OPEN_FAILURES.lock().get(narou_dir).cloned()
 }
 
 /// Established handle for this narou root, or `None` when the database was

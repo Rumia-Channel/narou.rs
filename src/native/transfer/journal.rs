@@ -15,6 +15,13 @@ const LIVE: &str = "json_extract(value,'$.state') NOT IN ('completed','completed
 pub struct NativeTransferJournal {
     pub(super) root: PathBuf,
     pub(super) state: Option<crate::native::sqlite::state::StateDb>,
+    /// `Some` when the library is configured for SQLite (`storage-backend`
+    /// marker) but `active_for` could not configure the database. Mutations
+    /// must never run on the silent YAML fallback: the FS gate consult still
+    /// sees the SQLite marker and fails closed against the unmigrated
+    /// schema, so transfer writes are rejected up front with the original
+    /// `configure` error preserved as the reason.
+    pub(super) authority_error: Option<String>,
     connection: Arc<parking_lot::Mutex<Connection>>,
     pub(super) active_locks: Arc<parking_lot::Mutex<BTreeMap<String, (fs::File,OperationId)>>>,
 }
@@ -36,7 +43,13 @@ fn cursor_encode(value:&str)->String { use base64::Engine; base64::engine::gener
 impl NativeTransferJournal {
     pub fn open(root:&Path)->TR<Self> {
         let root=root.join(".narou/transfer"); fs::create_dir_all(&root).map_err(TransferError::platform)?;
-        let state=crate::native::sqlite::state::active_for(root.parent().expect("transfer directory has parent"));
+        let narou_dir=root.parent().expect("transfer directory has parent");
+        let state=crate::native::sqlite::state::active_for(narou_dir);
+        // `active_for` just attempted `configure`, so `configured_failure` is
+        // the fresh cause when the configured SQLite authority is missing.
+        let authority_error=if state.is_none(){
+            crate::native::sqlite::state::configured_failure(narou_dir)
+        }else{None};
         let connection=if let Some(state)=&state {state.conn_ref().clone()} else {
             let connection=Connection::open(root.join("control.sqlite")).map_err(TransferError::platform)?;
             connection.busy_timeout(std::time::Duration::from_secs(10)).map_err(TransferError::platform)?;
@@ -56,7 +69,23 @@ impl NativeTransferJournal {
                 CREATE INDEX IF NOT EXISTS transfer_native_selection_order ON transfer_native_rows(owner,CAST(json_extract(value,'$.novel_ordinal') AS TEXT),json_extract(value,'$.logical_path')) WHERE kind='catalog';") .map_err(TransferError::platform)?;
             connection.execute_batch(super::claims::SCHEMA).map_err(TransferError::platform)?;
         }
-        Ok(Self {root,state,connection,active_locks:Arc::new(parking_lot::Mutex::new(BTreeMap::new()))})
+        Ok(Self {root,state,authority_error,connection,active_locks:Arc::new(parking_lot::Mutex::new(BTreeMap::new()))})
+    }
+    /// Reject when the configured SQLite storage authority is unavailable.
+    /// Called at mutating entry points *before* any journal or store write so
+    /// a `storage-backend=sqlite` library whose `db.sqlite` could not be
+    /// configured never silently executes transfer work on YAML semantics.
+    pub(super) fn require_authority(&self)->TR<()> {
+        if let Some(reason)=&self.authority_error {
+            return Err(TransferError::Unsupported{code:"storage_unavailable",reason:reason.clone()});
+        }
+        Ok(())
+    }
+    /// Mutating journal transaction. Reads stay on `run`; every path that can
+    /// insert/update/delete durable transfer rows goes through this gate.
+    pub(super) fn run_write<T>(&self, operation:impl FnOnce(&mut Rows<'_>)->TR<T>)->TR<T> {
+        self.require_authority()?;
+        self.run(operation)
     }
     pub(super) fn run<T>(&self, operation:impl FnOnce(&mut Rows<'_>)->TR<T>)->TR<T> {
         let mut connection=self.connection.lock();
@@ -66,6 +95,7 @@ impl NativeTransferJournal {
     }
     pub(super) fn get<T:DeserializeOwned>(&self,kind:&str,owner:&str,key:&str)->TR<Option<T>> {self.run(|rows|rows.get(kind,owner,key))}
     pub(super) fn put<T:Serialize>(&self,kind:&str,owner:&str,key:&str,value:&T,insert_only:bool)->TR<bool> {
+        self.require_authority()?;
         self.run(|rows| {if insert_only&&rows.raw(kind,owner,key)?.is_some(){return Ok(false);}rows.put(kind,owner,key,value)?;Ok(true)})
     }
     pub(super) fn page<T:DeserializeOwned+Serialize>(&self,kind:&str,owner:&str,cursor:Option<&str>,limit:usize,predicate:&str)->TR<Page<T>> {
@@ -115,14 +145,14 @@ impl Rows<'_> {
 }
 
 impl TransferJournal for NativeTransferJournal {
-    fn create_session<'a>(&'a self,row:&'a SessionRow)->PlatformFuture<'a,TR<()>> {Box::pin(async move {self.run(|rows| {
+    fn create_session<'a>(&'a self,row:&'a SessionRow)->PlatformFuture<'a,TR<()>> {Box::pin(async move {self.run_write(|rows| {
         let owner=scope_key(&row.scope);if rows.raw("session",&owner,&row.session_id.0)?.is_some(){return Ok(());}
         let count:u32=rows.0.query_row(&format!("SELECT COUNT(*) FROM transfer_native_rows WHERE kind='session' AND owner=?1 AND ({LIVE})"),[&owner],|row|row.get(0)).map_err(TransferError::platform)?;
         if count>=DEFAULT_MAX_SESSIONS_PER_SCOPE{return Err(TransferError::TooManySessions{max:DEFAULT_MAX_SESSIONS_PER_SCOPE});}
         rows.put("session",&owner,&row.session_id.0,row)
     })})}
     fn session<'a>(&'a self,scope:&'a AuthScope,id:&'a SessionId)->PlatformFuture<'a,TR<Option<SessionRow>>>{Box::pin(async move{self.get("session",&scope_key(scope),&id.0)})}
-    fn update_session<'a>(&'a self,row:&'a SessionRow,expected:u64)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{let owner=scope_key(&row.scope);let old:SessionRow=rows.get("session",&owner,&row.session_id.0)?.ok_or(TransferError::SessionNotFound)?;if old.revision!=expected{return Err(TransferError::RevisionMismatch{current:old.revision});}rows.put("session",&owner,&row.session_id.0,row)})})}
+    fn update_session<'a>(&'a self,row:&'a SessionRow,expected:u64)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run_write(|rows|{let owner=scope_key(&row.scope);let old:SessionRow=rows.get("session",&owner,&row.session_id.0)?.ok_or(TransferError::SessionNotFound)?;if old.revision!=expected{return Err(TransferError::RevisionMismatch{current:old.revision});}rows.put("session",&owner,&row.session_id.0,row)})})}
     fn list_sessions<'a>(&'a self,scope:&'a AuthScope,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,TR<Page<SessionRow>>>{Box::pin(async move{self.page("session",&scope_key(scope),cursor,limit,&format!("({LIVE}) OR json_extract(value,'$.next_action')='advance'"))})}
     fn count_live_sessions<'a>(&'a self,scope:&'a AuthScope)->PlatformFuture<'a,TR<u32>>{Box::pin(async move{self.run(|rows|rows.0.query_row(&format!("SELECT COUNT(*) FROM transfer_native_rows WHERE kind='session' AND owner=?1 AND ({LIVE})"),[scope_key(scope)],|row|row.get(0)).map_err(TransferError::platform))})}
     fn find_idle_sessions<'a>(&'a self,scope:&'a AuthScope,now:DateTime<Utc>,limit:usize)->PlatformFuture<'a,TR<Vec<SessionRow>>>{Box::pin(async move{
@@ -140,6 +170,9 @@ impl TransferJournal for NativeTransferJournal {
     fn update_create<'a>(&'a self,row:&'a CreateRow)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.put("create",&scope_key(&row.scope),&row.request_id,row,false).map(|_|())})}
     fn operation<'a>(&'a self,id:&'a SessionId,op:&'a OperationId)->PlatformFuture<'a,TR<Option<OperationRow>>>{Box::pin(async move{self.get("operation",&id.0,&op.0)})}
     fn begin_operation<'a>(&'a self,row:&'a OperationRow)->PlatformFuture<'a,TR<bool>>{Box::pin(async move{
+        // Reject before taking the OS invocation lock: an unavailable
+        // configured SQLite authority must never acquire transfer leases.
+        self.require_authority()?;
         let mut locks=self.active_locks.lock();if locks.contains_key(&row.session_id.0){return Err(TransferError::Busy{code:"operation_busy",message:"another invocation holds this transfer session".into()});}
         let directory=self.root.join("invocations");fs::create_dir_all(&directory).map_err(TransferError::platform)?;
         let file=fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(directory.join(format!("{}.lock",sha256_hex(row.session_id.0.as_bytes())))).map_err(TransferError::platform)?;
@@ -154,7 +187,7 @@ impl TransferJournal for NativeTransferJournal {
     fn pending_files<'a>(&'a self,id:&'a SessionId,limit:usize)->PlatformFuture<'a,TR<Vec<FileRow>>>{Box::pin(async move{Ok(self.page("file",&id.0,None,limit,"json_extract(value,'$.file_id')<>4294967295 AND json_extract(value,'$.state') IN ('pending','receiving','failed','finalizing')")?.items)})}
     fn finalizing_files<'a>(&'a self,id:&'a SessionId,limit:usize)->PlatformFuture<'a,TR<Vec<FileRow>>>{Box::pin(async move{Ok(self.page("file",&id.0,None,limit,"json_extract(value,'$.state')='finalizing'")?.items)})}
     fn staged_files<'a>(&'a self,id:&'a SessionId,limit:usize)->PlatformFuture<'a,TR<Vec<FileRow>>>{Box::pin(async move{Ok(self.page("file",&id.0,None,limit,"json_extract(value,'$.stage') IS NOT NULL OR json_extract(value,'$.pin') IS NOT NULL")?.items)})}
-    fn reset_file<'a>(&'a self,row:&'a FileRow)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{
+    fn reset_file<'a>(&'a self,row:&'a FileRow)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run_write(|rows|{
         if row.state!=FileState::Pending||row.confirmed_bytes!=0||row.next_chunk_index!=0||row.stage.is_some()||row.pin.is_some(){return Err(TransferError::invalid("invalid_file_reset","restart must be an empty pending file"));}
         let old:FileRow=rows.get("file",&row.session_id.0,&number(row.file_id))?.ok_or_else(||TransferError::invalid("file_missing","restart file missing"))?;
         if !matches!(old.state,FileState::Pending|FileState::Receiving|FileState::Failed){return Err(TransferError::invalid("verified_file_reset","verified or sealed files cannot be reset"));}
@@ -168,7 +201,7 @@ impl TransferJournal for NativeTransferJournal {
         rows.put("file",&row.session_id.0,&number(row.file_id),row)?;rows.put("session",&owner,&row.session_id.0,&session)
     })})}
     fn chunk<'a>(&'a self,id:&'a SessionId,file:u32,chunk:u32)->PlatformFuture<'a,TR<Option<ChunkRow>>>{Box::pin(async move{self.get("chunk",&id.0,&chunk_key(file,chunk))})}
-    fn commit_chunk<'a>(&'a self,chunk:&'a ChunkRow,file:&'a FileRow,_confirmed:u64)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{
+    fn commit_chunk<'a>(&'a self,chunk:&'a ChunkRow,file:&'a FileRow,_confirmed:u64)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run_write(|rows|{
         let key=chunk_key(chunk.file_id,chunk.chunk_index);if let Some(old)=rows.get::<ChunkRow>("chunk",&chunk.session_id.0,&key)?{if old!=*chunk{return Err(TransferError::ChunkConflict{code:"chunk_conflict",message:"chunk receipt differs".into()});}return Ok(());}
         let old:FileRow=rows.get("file",&file.session_id.0,&number(file.file_id))?.ok_or_else(||TransferError::invalid("file_missing","chunk file missing"))?;
         if old.confirmed_bytes!=chunk.offset||old.next_chunk_index!=chunk.chunk_index{return Err(TransferError::ChunkConflict{code:"unexpected_offset",message:"file advanced concurrently".into()});}
@@ -178,9 +211,9 @@ impl TransferJournal for NativeTransferJournal {
         if file.state==FileState::Finalizing{session.next_action=NextAction::FinalizeFile;session.operation_id=file.finalize_operation.clone();}
         rows.put("chunk",&chunk.session_id.0,&key,chunk)?;rows.put("file",&file.session_id.0,&number(file.file_id),file)?;rows.put("session",&owner,&session.session_id.0,&session)
     })})}
-    fn put_publication<'a>(&'a self,row:&'a PublicationRow)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{let key=number(row.publication_id);if let Some(old)=rows.get::<PublicationRow>("publication",&row.session_id.0,&key)?&&!matches!(old.state,PublicationState::Pending|PublicationState::Skipped|PublicationState::RolledBack){return Ok(());}rows.put("publication",&row.session_id.0,&key,row)})})}
+    fn put_publication<'a>(&'a self,row:&'a PublicationRow)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run_write(|rows|{let key=number(row.publication_id);if let Some(old)=rows.get::<PublicationRow>("publication",&row.session_id.0,&key)?&&!matches!(old.state,PublicationState::Pending|PublicationState::Skipped|PublicationState::RolledBack){return Ok(());}rows.put("publication",&row.session_id.0,&key,row)})})}
     fn publication<'a>(&'a self,id:&'a SessionId,publication:u32)->PlatformFuture<'a,TR<Option<PublicationRow>>>{Box::pin(async move{self.get("publication",&id.0,&number(publication))})}
-    fn update_publication<'a>(&'a self,row:&'a PublicationRow)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{let key=number(row.publication_id);let old:Option<PublicationRow>=rows.get("publication",&row.session_id.0,&key)?;
+    fn update_publication<'a>(&'a self,row:&'a PublicationRow)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run_write(|rows|{let key=number(row.publication_id);let old:Option<PublicationRow>=rows.get("publication",&row.session_id.0,&key)?;
         if old.as_ref().is_some_and(|old|(old.state==PublicationState::Committed&&old.phase_cursor.as_deref()==Some("finished"))||old.state==PublicationState::RolledBack){return Ok(());}
         if row.state==PublicationState::Committed&&row.phase_cursor.as_deref()==Some("finished")&&!old.as_ref().is_some_and(|old|old.state==PublicationState::Committed&&old.phase_cursor.as_deref()==Some("finished")){
             let(owner,mut session)=rows.session(&row.session_id)?;session.published_novels=session.published_novels.checked_add(1).ok_or_else(||TransferError::invalid("count_overflow","published count overflow"))?;rows.put("session",&owner,&row.session_id.0,&session)?;
@@ -189,16 +222,16 @@ impl TransferJournal for NativeTransferJournal {
     fn pending_publications<'a>(&'a self,id:&'a SessionId,limit:usize)->PlatformFuture<'a,TR<Vec<PublicationRow>>>{Box::pin(async move{Ok(self.page("publication",&id.0,None,limit,UNFINISHED)?.items)})}
     fn active_publications<'a>(&'a self,id:&'a SessionId,limit:usize)->PlatformFuture<'a,TR<Vec<PublicationRow>>>{Box::pin(async move{Ok(self.page("publication",&id.0,None,limit,ACTIVE)?.items)})}
     fn publications<'a>(&'a self,id:&'a SessionId,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,TR<Page<PublicationRow>>>{Box::pin(async move{self.page("publication",&id.0,cursor,limit,"1")})}
-    fn put_journal_entry<'a>(&'a self,id:&'a SessionId,publication:u32,key:&'a str,value:&'a [u8])->PlatformFuture<'a,TR<()>>{Box::pin(async move{if value.len()>MAX_CONTROL_BODY_BYTES{return Err(TransferError::invalid("journal_row_too_large","journal fragment exceeds256KiB"));}self.run(|rows|rows.write("blob",&format!("{}:{}",id.0,number(publication)),key,Some(value.to_vec())))})}
+    fn put_journal_entry<'a>(&'a self,id:&'a SessionId,publication:u32,key:&'a str,value:&'a [u8])->PlatformFuture<'a,TR<()>>{Box::pin(async move{if value.len()>MAX_CONTROL_BODY_BYTES{return Err(TransferError::invalid("journal_row_too_large","journal fragment exceeds256KiB"));}self.run_write(|rows|rows.write("blob",&format!("{}:{}",id.0,number(publication)),key,Some(value.to_vec())))})}
     fn journal_entry<'a>(&'a self,id:&'a SessionId,publication:u32,key:&'a str)->PlatformFuture<'a,TR<Option<Vec<u8>>>>{Box::pin(async move{self.run(|rows|rows.raw("blob",&format!("{}:{}",id.0,number(publication)),key))})}
-    fn delete_journal_entries<'a>(&'a self,id:&'a SessionId,publication:u32)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{rows.0.execute("DELETE FROM transfer_native_rows WHERE kind='blob' AND owner=?1",[format!("{}:{}",id.0,number(publication))]).map_err(TransferError::platform)?;Ok(())})})}
-    fn put_plan_entries<'a>(&'a self,id:&'a SessionId,_revision:&'a str,entries:&'a [PlanEntry])->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{for entry in entries{rows.put("plan",&id.0,&number(entry.novel_ordinal),entry)?;}Ok(())})})}
+    fn delete_journal_entries<'a>(&'a self,id:&'a SessionId,publication:u32)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run_write(|rows|{rows.0.execute("DELETE FROM transfer_native_rows WHERE kind='blob' AND owner=?1",[format!("{}:{}",id.0,number(publication))]).map_err(TransferError::platform)?;Ok(())})})}
+    fn put_plan_entries<'a>(&'a self,id:&'a SessionId,_revision:&'a str,entries:&'a [PlanEntry])->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run_write(|rows|{for entry in entries{rows.put("plan",&id.0,&number(entry.novel_ordinal),entry)?;}Ok(())})})}
     fn plan_entries<'a>(&'a self,id:&'a SessionId,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,TR<Page<PlanEntry>>>{Box::pin(async move{let mut page:Page<PlanEntry>=self.page("plan",&id.0,cursor,limit,"1")?;let mut bytes=128usize;let mut keep=0;for entry in &mut page.items{entry.receipt=self.get::<PublicationRow>("publication",&id.0,&number(entry.novel_ordinal))?.and_then(|publication|publication.receipt).map(|bytes|serde_json::from_slice(&bytes).map_err(TransferError::platform)).transpose()?;let size=serde_json::to_vec(entry).map_err(TransferError::platform)?.len()+1;if bytes+size>MAX_PAGE_BYTES-1024{break;}bytes+=size;keep+=1;}if keep<page.items.len(){if keep==0{return Err(TransferError::invalid("metadata_row_too_large","plan receipt exceeds page budget"));}page.items.truncate(keep);page.next_cursor=Some(cursor_encode(&number(page.items.last().expect("nonempty page").novel_ordinal)));}Ok(page)})}
-    fn put_catalog_entries<'a>(&'a self,id:&'a SessionId,_revision:u64,entries:&'a [CatalogItem])->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{for entry in entries{rows.put("catalog",&id.0,&catalog_key(entry.novel_ordinal,&entry.logical_path),entry)?;rows.put("selection_catalog",&id.0,&format!("{}\0{}",entry.novel_ordinal,entry.logical_path),entry)?;}Ok(())})})}
+    fn put_catalog_entries<'a>(&'a self,id:&'a SessionId,_revision:u64,entries:&'a [CatalogItem])->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run_write(|rows|{for entry in entries{rows.put("catalog",&id.0,&catalog_key(entry.novel_ordinal,&entry.logical_path),entry)?;rows.put("selection_catalog",&id.0,&format!("{}\0{}",entry.novel_ordinal,entry.logical_path),entry)?;}Ok(())})})}
     fn catalog_entries<'a>(&'a self,id:&'a SessionId,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,TR<Page<CatalogItem>>>{Box::pin(async move{self.page("catalog",&id.0,cursor,limit,"1")})}
     fn selection_catalog_entries<'a>(&'a self,id:&'a SessionId,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,TR<Page<CatalogItem>>>{Box::pin(async move{self.page("selection_catalog",&id.0,cursor,limit,"1")})}
     fn selected_catalog_entries<'a>(&'a self,id:&'a SessionId,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,TR<Page<CatalogItem>>>{Box::pin(async move{self.page("catalog",&id.0,cursor,limit,"json_extract(value,'$.selected')=1")})}
-    fn mark_catalog_selected<'a>(&'a self,id:&'a SessionId,keys:&'a [(u32,String)],selected:bool)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run(|rows|{for(ordinal,path)in keys{let key=catalog_key(*ordinal,path);let mut item:CatalogItem=rows.get("catalog",&id.0,&key)?.ok_or_else(||TransferError::invalid("catalog_missing","catalog row missing"))?;item.selected=selected;rows.put("catalog",&id.0,&key,&item)?;}Ok(())})})}
+    fn mark_catalog_selected<'a>(&'a self,id:&'a SessionId,keys:&'a [(u32,String)],selected:bool)->PlatformFuture<'a,TR<()>>{Box::pin(async move{self.run_write(|rows|{for(ordinal,path)in keys{let key=catalog_key(*ordinal,path);let mut item:CatalogItem=rows.get("catalog",&id.0,&key)?.ok_or_else(||TransferError::invalid("catalog_missing","catalog row missing"))?;item.selected=selected;rows.put("catalog",&id.0,&key,&item)?;}Ok(())})})}
 }
 
 /// Only for a dedicated VACUUM/backup COPY, never the live control connection.

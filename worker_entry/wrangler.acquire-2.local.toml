@@ -5,6 +5,7 @@
 name = "narou-rs-local-acquire-2"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-08-10"
+compatibility_flags = ["enable_request_signal"]
 workers_dev = false
 
 [limits]

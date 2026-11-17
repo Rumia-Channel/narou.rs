@@ -106,7 +106,7 @@ impl SqliteObjectStore {
     /// Local-only open under the same OS transfer lock used by reference
     /// publication: `Ok(None)` for missing keys AND canonical references.
     pub fn local_asset_stream<'a>(&'a self,prefix:&'a ObjectPrefix,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<AssetStream>>>{Box::pin(async move{
-        let this=self.clone();let key=key.clone();run_scoped_blocking(move||this.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{let conn=this.conn.lock();Ok(this.open_local_asset_in_connection(&conn,&key,range)?.map(|(_,stream)|stream))}))
+        let this=self.clone();let key=key.clone();run_scoped_blocking(move||this.mirror.with_reader_gate_lock(prefix.as_ref().trim_end_matches('/'),||{let conn=this.conn.lock();Ok(this.open_local_asset_in_connection(&conn,&key,range)?.map(|(_,stream)|stream))}))
     })}
     /// Whether `key` is backed by a canonical reference. Cheap existence probe;
     /// an existence answer is correct even without the caller's lock.
@@ -1305,7 +1305,7 @@ impl SqliteObjectStore {
     }
     pub fn with_reader_transaction<T>(&self,prefix:&ObjectPrefix,lease:&GateLease,operation:impl FnOnce(&Connection)->Result<T>)->Result<T>{
         let epoch=i64::try_from(lease.epoch).map_err(|_|af::gate_epoch_error(prefix,lease.epoch,u64::MAX))?;
-        self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
+        self.mirror.with_reader_gate_lock(prefix.as_ref().trim_end_matches('/'),||{
             let conn=self.conn.lock();require_transfer_epoch(&conn,prefix,None,lease.epoch,false)?;
             let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM novel_reader_leases WHERE prefix=? AND reader_id=? AND epoch=? AND expires_at>?)",rusqlite::params![prefix.as_ref().trim_end_matches('/'),lease.reader_id,epoch,ts::now_secs()],|row|row.get(0)).map_err(super::sqlite_error)?;
             if !valid{return Err(af::gate_closed_error(prefix));}operation(&conn)
@@ -1336,7 +1336,13 @@ impl SqliteObjectStore {
         })
     }
     fn gate_transaction<T>(&self,prefix:&ObjectPrefix,operation:impl FnOnce(&Connection)->Result<T>)->Result<T> {
-        self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
+        self.gate_transaction_mode(prefix,false,operation)
+    }
+    fn reader_gate_transaction<T>(&self,prefix:&ObjectPrefix,operation:impl FnOnce(&Connection)->Result<T>)->Result<T> {
+        self.gate_transaction_mode(prefix,true,operation)
+    }
+    fn gate_transaction_mode<T>(&self,prefix:&ObjectPrefix,reader:bool,operation:impl FnOnce(&Connection)->Result<T>)->Result<T> {
+        let run=||{
             let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
             // A committed SQL→FS handoff retires every SQL token for this
             // prefix: creating a default epoch-0 row must never revive SQL
@@ -1344,7 +1350,9 @@ impl SqliteObjectStore {
             if crate::native::object_store::read_fs_gate_handoff_raw(&tx,prefix.as_ref().trim_end_matches('/'))?.is_some(){return Err(af::gate_closed_error(prefix));}
             tx.execute("INSERT OR IGNORE INTO novel_access_gates(prefix,updated_at) VALUES (?,?)",rusqlite::params![prefix.as_ref().trim_end_matches('/'),ts::now_secs()]).map_err(super::sqlite_error)?;
             let value=operation(&tx)?;tx.commit().map_err(super::sqlite_error)?;Ok(value)
-        })
+        };
+        if reader { self.mirror.with_reader_gate_lock(prefix.as_ref().trim_end_matches('/'),run) }
+        else { self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),run) }
     }
     fn gate_info_conn(conn:&Connection,prefix:&ObjectPrefix)->Result<GateInfo> {
         let (epoch,closed,owner,updated_at,content_revision):(u64,i64,Option<String>,i64,u64)=conn.query_row("SELECT epoch,closed,owner,updated_at,content_revision FROM novel_access_gates WHERE prefix=?",[prefix.as_ref().trim_end_matches('/')],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?,row.get(3)?,super::read_u64(row,4)?))).map_err(super::sqlite_error)?;
@@ -1667,13 +1675,13 @@ impl NovelAccessFence for SqliteObjectStore {
         Ok((out,None))
     })})}
     fn rebind_writer<'a>(&'a self,prefix:&'a ObjectPrefix,expected_epoch:u64)->PlatformFuture<'a,Result<WriteFence>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|{require_transfer_epoch(conn,prefix,None,expected_epoch,false)?;Ok(WriteFence::new(prefix.clone(),expected_epoch))}))})}
-    fn gate_info<'a>(&'a self,prefix:&'a ObjectPrefix)->PlatformFuture<'a,Result<GateInfo>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|Self::gate_info_conn(conn,prefix)))})}
-    fn admit_reader<'a>(&'a self,prefix:&'a ObjectPrefix,id:&'a str,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|{
+    fn gate_info<'a>(&'a self,prefix:&'a ObjectPrefix)->PlatformFuture<'a,Result<GateInfo>>{Box::pin(async move{run_scoped_blocking(||self.reader_gate_transaction(prefix,|conn|Self::gate_info_conn(conn,prefix)))})}
+    fn admit_reader<'a>(&'a self,prefix:&'a ObjectPrefix,id:&'a str,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{run_scoped_blocking(||self.reader_gate_transaction(prefix,|conn|{
         let info=Self::gate_info_conn(conn,prefix)?;if info.state!=GateState::Open{return Err(af::gate_closed_error(prefix));}let expires=ts::now_secs().saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));
         conn.execute("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) VALUES (?,?,?,?) ON CONFLICT(prefix,reader_id) DO UPDATE SET epoch=excluded.epoch,expires_at=excluded.expires_at",rusqlite::params![prefix.as_ref().trim_end_matches('/'),id,i64::try_from(info.epoch).map_err(|_|NarouError::Platform("gate epoch exceeds SQLite integer range".into()))?,expires]).map_err(super::sqlite_error)?;
         Ok(GateLease{reader_id:id.into(),epoch:info.epoch,expires_at:expires})
     }))})}
-    fn renew_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|{
+    fn renew_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{run_scoped_blocking(||self.reader_gate_transaction(prefix,|conn|{
         require_transfer_epoch(conn,prefix,None,lease.epoch,false)?;let now=ts::now_secs();let expires=now.saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));
         let changed=conn.execute("UPDATE novel_reader_leases SET expires_at=? WHERE prefix=? AND reader_id=? AND epoch=? AND expires_at>?",rusqlite::params![expires,prefix.as_ref().trim_end_matches('/'),lease.reader_id,i64::try_from(lease.epoch).map_err(|_|af::gate_epoch_error(prefix,lease.epoch,u64::MAX))?,now]).map_err(super::sqlite_error)?;if changed!=1{return Err(af::gate_closed_error(prefix));}
         Ok(GateLease{reader_id:lease.reader_id.clone(),epoch:lease.epoch,expires_at:expires})
@@ -1689,7 +1697,7 @@ impl NovelAccessFence for SqliteObjectStore {
         // epoch, a stale token cannot touch a same-reader-id lease
         // re-admitted at a newer epoch, and a missing/already-released row
         // is idempotent.
-        self.mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
+        self.mirror.with_reader_gate_lock(prefix.as_ref().trim_end_matches('/'),||{
             self.conn.lock().execute("DELETE FROM novel_reader_leases WHERE prefix=? AND reader_id=? AND epoch=?",rusqlite::params![prefix.as_ref().trim_end_matches('/'),lease.reader_id,epoch]).map_err(super::sqlite_error)?;
             self.mirror.release_reader_locked(prefix,lease)
         })

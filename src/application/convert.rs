@@ -651,8 +651,12 @@ mod tests {
             &toc.title,
         ).unwrap();
         let target = record(1);
+        #[cfg(feature = "native-runtime")]
+        let private = tempfile::tempdir().unwrap();
         for style in ["default", "simple", "plain"] {
             let settings = NovelSettings {
+                #[cfg(feature = "native-runtime")]
+                archive_path: private.path().to_path_buf(),
                 author_comment_style: style.into(), enable_inspect: false,
                 enable_auto_join_line: false, ..NovelSettings::default()
             };

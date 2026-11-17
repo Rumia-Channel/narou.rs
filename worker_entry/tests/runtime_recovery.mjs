@@ -239,7 +239,69 @@ async function held(path, after = 0) {
   return until(() => holds.slice(after).find(entry => entry.path === path && !entry.closed && !entry.res.destroyed),
     `upstream response held at ${path}`, 300000);
 }
-function assertRunning(row, recoveries, checkpoint = null) {
+// The creation contract now persists a durable planned checkpoint before the
+// first owned TOC/section request: numeric reservation plus original writer
+// prefix/epoch, still without a novel row or a body cursor.
+function plannedCreation(row) {
+  assert(typeof row.checkpoint_json === 'string',
+    `a claimed new download must carry its durable planned creation checkpoint: ${JSON.stringify(row)}`);
+  const checkpoint = JSON.parse(row.checkpoint_json);
+  assert.equal(checkpoint.job_id, row.job_id);
+  assert.equal(checkpoint.novel_id, null, 'the reservation is not yet a publication');
+  assert.equal(checkpoint.phase, 'planned');
+  assert.equal(checkpoint.next_section_index, null, 'no accepted body may pose as progress');
+  assert(checkpoint.write_origin && typeof checkpoint.write_origin.prefix === 'string'
+    && Number.isInteger(checkpoint.write_origin.epoch),
+    `the first writer epoch must be durable: ${row.checkpoint_json}`);
+  assert(Array.isArray(checkpoint.creation_reservation)
+    && checkpoint.creation_reservation.length === 2
+    && checkpoint.creation_reservation.every(Number.isInteger),
+    `the exact original ID/generation must be durable: ${row.checkpoint_json}`);
+  return checkpoint;
+}
+
+// The checkpoint claim is only durable if the same ID/generation, namespace
+// and gate epoch are still owned by this exact execution.
+function assertClaimed(state, row, checkpoint) {
+  const [id, generation] = checkpoint.creation_reservation;
+  const owed = state.reservations.find(r => r.id === id && r.generation === generation);
+  assert(owed, `reservation ${id}:${generation} must exist while owned`);
+  assert.equal(owed.available, 0, 'an owned reservation must not reenter the pool');
+  assert.equal(owed.job_id, row.job_id);
+  const claim = state.claims.find(c => c.novel_id === id);
+  assert(claim, 'the running owner must hold its namespace claim');
+  assert.equal(claim.reservation_generation, generation);
+  assert.equal(claim.owner, `create:${id}:${generation}`);
+  assert.equal(claim.job_id, row.job_id);
+  assert.equal(claim.epoch, checkpoint.write_origin.epoch);
+  assert.equal(claim.prefix, checkpoint.write_origin.prefix.replace(/\/+$/, ''));
+  const gate = state.gates.find(g => g.prefix === claim.prefix);
+  assert(gate, 'the claimed namespace gate must exist');
+  assert.equal(gate.closed, 0);
+  assert.equal(gate.epoch, checkpoint.write_origin.epoch);
+  assert.equal(gate.origin_url_fold, claim.toc_url_fold);
+  assert(!state.novels.some(n => n.id === id), 'no novel row exists before publication');
+}
+
+// Completed cleanup re-opens the gate at the next epoch (fencing the dead
+// writer), returns the exact ID to the pool and deletes the namespace claim.
+function assertCreationReleased(state, checkpoint, label) {
+  const [id, generation] = checkpoint.creation_reservation;
+  const prefix = checkpoint.write_origin.prefix.replace(/\/+$/, '');
+  const released = state.reservations.find(r => r.id === id && r.generation === generation);
+  assert(released && released.available === 1 && released.job_id === null,
+    `${label}: reservation ${id}:${generation} must return to the pool, got ${JSON.stringify(released)}`);
+  assert(!state.claims.some(c => c.novel_id === id), `${label}: namespace claim must be retired`);
+  const gate = state.gates.find(g => g.prefix === prefix);
+  assert(gate, `${label}: namespace gate must still exist`);
+  assert.equal(gate.closed, 0, `${label}: cleanup must re-open the gate`);
+  assert.equal(gate.pending_readers, 0, `${label}: cleanup cannot reopen before dead readers expire`);
+  assert.equal(gate.epoch, checkpoint.write_origin.epoch + 1,
+    `${label}: close-and-reopen must fence the original epoch`);
+  assert.equal(gate.origin_url_fold, '', `${label}: an empty-owned namespace must lose its origin`);
+}
+
+function assertRunning(row, recoveries, checkpoint = undefined) {
   assert.equal(row.status, 'running', JSON.stringify(row));
   assert.equal(row.attempts, 0, 'abrupt loss must not masquerade as a handled business failure');
   assert.equal(row.recovery_attempts, recoveries, JSON.stringify(row));
@@ -247,7 +309,8 @@ function assertRunning(row, recoveries, checkpoint = null) {
   assert(row.site_key && row.normalized_target, 'real YAML admission must own the site and target');
   assert(row.execution_token, 'the real consumer must have claimed the execution');
   assert(Date.parse(row.lease_until) > Date.now(), 'the running owner must have a live lease');
-  assert.equal(row.checkpoint_json, checkpoint);
+  if (checkpoint === undefined) return plannedCreation(row);
+  assert.equal(row.checkpoint_json, checkpoint, 'reattachment must keep the exact original claim');
 }
 
 async function expireAndRestart(id, expected) {
@@ -278,7 +341,8 @@ async function recover(id, previous, recoveries) {
   assert.equal(recovered.attempts, 0);
   assert.equal(recovered.recovery_attempts, recoveries, 'the real cron must charge the lost execution');
   assert.equal(recovered.execution_token, null, 'cron retires the dead owner before redelivery');
-  assert.equal(recovered.checkpoint_json, previous.checkpoint_json);
+  assert.equal(recovered.checkpoint_json, previous.checkpoint_json,
+    'the pending hand-off must carry the same durable checkpoint claim');
   releaseDeliveries();
 }
 
@@ -355,7 +419,9 @@ try {
   const crashId = await enqueue(target('crash'));
   await held('/runtime-crash/1/');
   let owner = await job(crashId);
-  assertRunning(owner, 0);
+  const crashCheckpoint = assertRunning(owner, 0);
+  const originalClaim = owner.checkpoint_json;
+  assertClaimed(await snapshot(), owner, crashCheckpoint);
   const site = owner.site_key;
   const tokens = new Set([owner.execution_token]);
   for (let attempt = 1; attempt <= MAX_RECOVERIES; attempt++) {
@@ -364,8 +430,13 @@ try {
     await recover(crashId, owner, attempt);
     await held('/runtime-crash/1/', mark);
     owner = await job(crashId);
-    assertRunning(owner, attempt);
+    assertRunning(owner, attempt, originalClaim);
+    assertClaimed(await snapshot(), owner, crashCheckpoint);
     assert.equal(owner.site_key, site);
+    // A held body proves no durable progress: reattachment replays the TOC
+    // under the same reservation and never repays the lost-execution budget.
+    assert.equal(requests.get('/runtime-crash/'), attempt + 1,
+      'a recovered execution replays discovery under the same identity');
     assert(!tokens.has(owner.execution_token), 'each recovery must receive a fresh fencing token');
     tokens.add(owner.execution_token);
   }
@@ -404,8 +475,36 @@ try {
   assert.match(exhausted.last_error, /acquisition execution recovery exhausted without checkpoint progress/);
   assert.equal(exhausted.lease_until, null);
   assert.equal(exhausted.execution_token, null);
-  assert.equal(exhausted.checkpoint_json, null);
   assert.equal(exhausted.admission_waiting, 0);
+  // Killed executions cannot release their download reader leases. Cron must
+  // retain the original claim and closed gate until their real wall-clock TTL
+  // expires; extra ticks cannot accelerate that expiry. Use the existing wait
+  // deadline, without changing leases, recovery limits or production budgets.
+  let observedReaderDrain = false;
+  const tombstone = await until(async () => {
+    const state = await snapshot();
+    const current = state.jobs.find(row => row.job_id === crashId);
+    assert(current, 'the original tombstone must remain durable');
+    if (current.checkpoint_json === null) return current;
+    assert.equal(current.status, 'permanent', JSON.stringify(current));
+    assert.equal(current.checkpoint_json, originalClaim,
+      'pending creation cleanup must keep the exact original claim');
+    const stillOwed = state.reservations
+      .find(r => r.id === crashCheckpoint.creation_reservation[0]
+        && r.generation === crashCheckpoint.creation_reservation[1]);
+    assert(stillOwed && stillOwed.available === 0 && stillOwed.job_id === crashId,
+      `a retained cleanup checkpoint must still owe its reservation: ${JSON.stringify(stillOwed)}`);
+    const gate = state.gates.find(row => row.prefix === crashCheckpoint.write_origin.prefix.replace(/\/+$/, ''));
+    assert(gate && gate.closed === 1 && gate.owner,
+      'pending cleanup must keep admission closed under its removal owner');
+    assert.equal(gate.epoch, crashCheckpoint.write_origin.epoch + 1);
+    observedReaderDrain ||= gate.pending_readers > 0;
+    await tick();
+    return false;
+  }, 'creation cleanup after natural dead-reader expiration');
+  assert.deepEqual(tombstone, { ...exhausted, checkpoint_json: null },
+    'closed cleanup clears only the checkpoint proof');
+  assertCreationReleased(await snapshot(), crashCheckpoint, 'exhausted creation');
   releaseDeliveries();
   const afterRelease = await drained(successorId);
   const successor = afterRelease.jobs.find(row => row.job_id === successorId);
@@ -415,8 +514,8 @@ try {
   assert.equal(requests.get('/runtime-successor/1/'), 1);
   assert.equal(afterRelease.jobs.filter(row => row.target === target('crash')).length, 1,
     'recovery must keep the same durable job, not create replacement identities');
-  assert.deepEqual(await job(crashId), exhausted, 'later queue deliveries cannot revive the tombstone');
-  console.log('PASS abrupt attempts=0 crashes exhaust three recoveries; real site admission releases queued work');
+  assert.deepEqual(await job(crashId), tombstone, 'later queue deliveries cannot revive the tombstone');
+  console.log(`PASS abrupt attempts=0 crashes exhaust three recoveries; exact creation identity survives natural reader drain (${observedReaderDrain}) and real site admission releases queued work`);
 
   // Actual progress earns a fresh crash budget. Cross the unchanged production
   // subrequest bound and stop the next invocation at its first TOC fetch.
@@ -424,13 +523,17 @@ try {
   const progressId = await enqueue(target('progress'));
   await held('/runtime-progress/1/', mark);
   let progress = await job(progressId);
-  assertRunning(progress, 0);
+  const progressCreation = assertRunning(progress, 0);
+  const progressClaim = progress.checkpoint_json;
   await killWorker();
   mark = holds.length;
   await recover(progressId, progress, 1);
   const first = await held('/runtime-progress/1/', mark);
   progress = await job(progressId);
-  assertRunning(progress, 1);
+  // The reattached execution still owns only the original planned claim: the
+  // lost delivery is charged, never repaid by reattachment alone.
+  assertRunning(progress, 1, progressClaim);
+  assertClaimed(await snapshot(), progress, progressCreation);
   const recoveredToken = progress.execution_token;
   mark = holds.length;
   holdProgressFirst = false;
@@ -444,6 +547,10 @@ try {
   assert.equal(checkpoint.phase, 'fetching');
   assert(checkpoint.next_section_index > 0 && checkpoint.next_section_index < EPISODES,
     'a real bounded continuation must persist an advancing section cursor');
+  // Real progress repays the crash budget while carrying forward the same
+  // original reservation and writer epoch — never a new creation identity.
+  assert.deepEqual(checkpoint.creation_reservation, progressCreation.creation_reservation);
+  assert.deepEqual(checkpoint.write_origin, progressCreation.write_origin);
   assert.notEqual(progress.execution_token, recoveredToken, 'continuation must run as a fresh queue claim');
   assert.equal(completedEpisodes.size, checkpoint.next_section_index);
   assert(!continuation.closed);

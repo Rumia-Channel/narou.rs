@@ -146,6 +146,9 @@ pub(crate) fn clear_fs_gate_handoff(connection:&rusqlite::Connection,prefix:&str
 impl NativeObjectStore{
     pub(crate) fn list_window_blocking(&self,request:&ObjectListRequest,limit:usize)->Result<ObjectListPage>{
         fn walk(store:&NativeObjectStore,request:&ObjectListRequest,base:&Path,path:&Path,capacity:usize,rows:&mut std::collections::BTreeMap<String,ObjectMetadata>,ancestors:&mut Vec<PathBuf>)->Result<()>{
+            let prefix=request.prefix.as_ref().trim_end_matches('/');
+            let internal=if prefix.is_empty()||prefix=="novels"{path.strip_prefix(base).is_ok_and(|relative|relative.starts_with(".objects"))}else{!prefix.starts_with("novels/")};
+            if internal&&path.file_name().is_some_and(|name|name.as_encoded_bytes().starts_with(ATOMIC_OBJECT_TEMP_PREFIX.as_bytes())){return Ok(());}
             let path=crate::db::paths::ensure_within_archive_root(path,store.root())?;
             if !path.starts_with(base){return Err(NarouError::Platform("namespace inventory crosses a physical book boundary".into()));}
             let metadata=fs::metadata(&path)?;if metadata.is_dir(){if ancestors.contains(&path){return Err(NarouError::Platform("cyclic native namespace link".into()));}ancestors.push(path.clone());for entry in fs::read_dir(&path)?{walk(store,request,base,&entry?.path(),capacity,rows,ancestors)?;}ancestors.pop();return Ok(());}

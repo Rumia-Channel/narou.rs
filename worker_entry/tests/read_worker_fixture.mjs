@@ -460,6 +460,7 @@ export function renderConfigs({
     [
       `main = ${JSON.stringify(main)}`,
       'compatibility_date = "2026-08-10"',
+      'compatibility_flags = ["enable_request_signal"]',
       'workers_dev = true',
       '',
       '[limits]',

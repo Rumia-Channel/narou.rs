@@ -196,6 +196,10 @@ fn illustration_migration_cli_preserves_bytes_and_dry_run_boundaries() {
                             let path = decoded_path(uri.path());
                             let query: BTreeMap<_, _> = url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).into_owned().collect();
                             let mut stored = stored.lock().unwrap();
+                            if method == Method::GET && path == "/bucket" && query.contains_key("uploads") {
+                                return ([(header::CONTENT_TYPE, "application/xml")],
+                                    "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>").into_response();
+                            }
                             if method == Method::GET && path == "/bucket" {
                                 let prefix = format!("/bucket/{}", query.get("prefix").map(String::as_str).unwrap_or(""));
                                 let contents = stored.iter().filter(|(key, _)| key.starts_with(&prefix))
@@ -288,11 +292,27 @@ fn illustration_migration_cli_preserves_bytes_and_dry_run_boundaries() {
     run(&["s3-push"]);
     assert!(stored.lock().unwrap().is_empty(), "dry run must not publish an object");
     run(&["s3-push", "-f"]);
-    let remote_image = "/bucket/fixture/novels/site/title/挿絵/001.png";
-    assert_eq!(stored.lock().unwrap().get(remote_image).map(Vec::as_slice), Some(expected.as_slice()));
+    let remote = Arc::new(S3Store::new(
+        S3StoreConfig {
+            endpoint: format!("http://{address}"), bucket: "bucket".into(),
+            region: "us-east-1".into(), prefix: "fixture".into(), illustration_dedup: true,
+            access_key_id: "fixture".into(), secret_access_key: "fixture-secret".into(),
+        },
+        Arc::new(narou_rs::native::http::NativeHttpClient::new("s3-range-fixture").unwrap()),
+        Arc::new(SystemClock),
+    ).unwrap());
+    let canonical = narou_rs::native::object_store::NativeStores::remote_objects(
+        Arc::new(narou_rs::native::object_store::NativeStore::for_narou_root(root).unwrap()), remote,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let image_key = key("novels/site/title/挿絵/001.png");
+    // Canonical aliases may point at immutable physical generations, not the
+    // legacy HTTP path. Read the logical asset through the real native adapter.
+    let read_image = || runtime.block_on(canonical.read_small(&image_key)).unwrap().unwrap();
+    assert_eq!(read_image().as_slice(), expected);
     run(&["s3-verify"]);
     run(&["s3-dedup"]);
     run(&["s3-dedup", "-f"]);
-    assert_eq!(stored.lock().unwrap().get(remote_image).map(Vec::as_slice), Some(expected.as_slice()), "non-hash image names must not be deleted by dedup");
+    assert_eq!(read_image().as_slice(), expected, "non-hash images must remain readable after dedup");
     assert_eq!(std::fs::read(image).unwrap(), expected);
 }

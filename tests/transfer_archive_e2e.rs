@@ -692,7 +692,7 @@ fn virtual_parent_import_skips_existing_members_and_overwrite_restores_the_order
     std::fs::create_dir_all(existing.join("本文")).unwrap();
     std::fs::write(
         existing.join("toc.yaml"),
-        "---\ntitle: 作品一\nauthor: 作者一\ntoc_url: https://example.test/novel/1/\nsubtitles:\n  - index: '1'\n    href: '1'\n    subtitle: 第一話\n    file_subtitle: 第一話\n    subdate: '2026-04-20'\nnovel_type: 1\n",
+        "---\ntitle: 作品一\nauthor: 作者一\ntoc_url: https://example.test/novel/1/\nsubtitles:\n  - index: '1'\n    href: '1'\n    chapter: ''\n    subchapter: ''\n    subtitle: 第一話\n    file_subtitle: 第一話\n    subdate: '2026-04-20'\nnovel_type: 1\n",
     )
     .unwrap();
 

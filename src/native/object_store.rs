@@ -432,12 +432,14 @@ pub(crate) fn run_scoped_blocking<T>(operation: impl FnOnce() -> Result<T>) -> R
     }
 }
 
+const ATOMIC_OBJECT_TEMP_PREFIX: &str = ".narou-object-";
+
 pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
     let mut temporary = tempfile::Builder::new()
-        .prefix(".narou-object-")
+        .prefix(ATOMIC_OBJECT_TEMP_PREFIX)
         .tempfile_in(parent)?;
     // NamedTempFile creates exclusively; existing links are never opened.
     for chunk in data.chunks(1024 * 1024) {
@@ -1596,7 +1598,7 @@ impl NativeObjectStore {
     /// Raw gate mutation used by `release_reader`, which must stay idempotent
     /// even after SQL authority adopted the namespace.
     fn with_gate_raw<T>(&self, prefix: &ObjectPrefix, operation: impl FnOnce(&mut FsGate) -> Result<T>) -> Result<T> {
-        self.with_transfer_lock(prefix.as_ref().trim_end_matches('/'), || {
+        self.with_reader_gate_lock(prefix.as_ref().trim_end_matches('/'), || {
             let path = self.gate_path(prefix)?;
             self.ensure_parent_dir(&path)?;
             let mut gate: FsGate = match fs::read(&path) {
@@ -1823,7 +1825,8 @@ pub(crate) fn read_durable_gate(path:&Path)->Result<Option<FsGate>>{
 pub(crate) fn durable_fs_gates(directory:&Path)->Result<Vec<(String,FsGate)>>{
     let entries=match fs::read_dir(directory){Ok(entries)=>entries,Err(error)if error.kind()==std::io::ErrorKind::NotFound=>return Ok(Vec::new()),Err(error)=>return Err(error.into())};
     let mut out=Vec::new();
-    for entry in entries{let entry=entry?;if !entry.file_type()?.is_file(){continue;}let gate:FsGate=serde_json::from_slice(&fs::read(entry.path())?).map_err(|error|NarouError::Platform(format!("invalid namespace gate: {error}")))?;let prefix=gate.prefix.clone().ok_or_else(||NarouError::Platform("protected namespace gate has no durable prefix".into()))?;out.push((prefix,gate));}
+    // Atomic replacements are unpublished state, even when their JSON is complete.
+    for entry in entries{let entry=entry?;let path=entry.path();if path.file_name().is_some_and(|name|name.as_encoded_bytes().starts_with(ATOMIC_OBJECT_TEMP_PREFIX.as_bytes()))||!entry.file_type()?.is_file(){continue;}let gate:FsGate=serde_json::from_slice(&fs::read(&path)?).map_err(|error|NarouError::Platform(format!("invalid namespace gate: {error}")))?;let prefix=gate.prefix.clone().ok_or_else(||NarouError::Platform("protected namespace gate has no durable prefix".into()))?;out.push((prefix,gate));}
     out.sort_by(|left,right|left.0.cmp(&right.0));
     Ok(out)
 }
@@ -1979,15 +1982,41 @@ impl NativeObjectStore {
     /// The caller's closure (including canonical rename) runs under this OS lock.
     /// A paused process still owns its kernel lock; no wall-clock takeover exists.
     pub fn with_transfer_lock<T>(&self, identity: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_namespace_lock(identity, false, operation)
+    }
+    /// Readers share publication exclusion, then serialize only gate metadata.
+    /// A live publisher still fails admission immediately, without takeover.
+    pub(crate) fn with_reader_gate_lock<T>(&self, identity: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_namespace_lock(identity, true, operation)
+    }
+    fn with_namespace_lock<T>(&self, identity: &str, reader: bool, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         let digest = hex::encode(sha2::Sha256::digest(identity.as_bytes()));
         let path = self.resolve_path(&ObjectKey::try_new(format!(".narou-transfer/.lock/{digest}"))?)?;
         self.ensure_parent_dir(&path)?;
         let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(|error| {
+        let acquired = if reader { fs2::FileExt::try_lock_shared(&lock) } else { fs2::FileExt::try_lock_exclusive(&lock) };
+        acquired.map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
                 NarouError::Platform("novel_busy: OS mutation lock is held".into())
             } else { error.into() }
         })?;
+        // Windows may defer CloseHandle's automatic unlock; release before reuse.
+        #[cfg(windows)]
+        struct UnlockOnDrop(fs::File);
+        #[cfg(windows)]
+        impl Drop for UnlockOnDrop {
+            fn drop(&mut self) { let _ = fs2::FileExt::unlock(&self.0); }
+        }
+        #[cfg(windows)]
+        let _lock = UnlockOnDrop(lock);
+        let _readers = if reader {
+            let path = self.resolve_path(&ObjectKey::try_new(format!(".narou-transfer/.lock/{digest}.readers"))?)?;
+            let file = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+            fs2::FileExt::lock_exclusive(&file)?;
+            #[cfg(windows)]
+            let file = UnlockOnDrop(file);
+            Some(file)
+        } else { None };
         operation()
     }
 
@@ -2005,7 +2034,13 @@ impl NativeObjectStore {
             hex::encode(sha2::Sha256::digest(prefix.as_ref().trim_end_matches('/').as_bytes()))))?)
     }
     fn with_gate<T>(&self, prefix: &ObjectPrefix, operation: impl FnOnce(&mut FsGate) -> Result<T>) -> Result<T> {
-        self.with_transfer_lock(prefix.as_ref().trim_end_matches('/'), || {
+        self.with_gate_mode(prefix, false, operation)
+    }
+    fn with_reader_gate<T>(&self, prefix: &ObjectPrefix, operation: impl FnOnce(&mut FsGate) -> Result<T>) -> Result<T> {
+        self.with_gate_mode(prefix, true, operation)
+    }
+    fn with_gate_mode<T>(&self, prefix: &ObjectPrefix, reader: bool, operation: impl FnOnce(&mut FsGate) -> Result<T>) -> Result<T> {
+        self.with_namespace_lock(prefix.as_ref().trim_end_matches('/'), reader, || {
             let path = self.gate_path(prefix)?;
             self.ensure_parent_dir(&path)?;
             let mut gate: FsGate = match fs::read(&path) {
@@ -2070,7 +2105,7 @@ impl NativeObjectStore {
     /// Validate admission and open the file within the same OS critical section.
     pub fn open_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>> {
         let this=self.clone();let prefix=prefix.clone();let lease=lease.clone();let key=key.clone();Box::pin(async move{
-            let opened=run_blocking(move||this.with_gate(&prefix,|gate|{
+            let opened=run_blocking(move||this.with_reader_gate(&prefix,|gate|{
                 if !prefix.matches(&key)||gate.owner.is_some()||gate.epoch!=lease.epoch||!gate.readers.get(&lease.reader_id).is_some_and(|(epoch,expiry)|*epoch==lease.epoch&&*expiry>ts::now_secs()){return Err(af::gate_closed_error(&prefix));}
                 let Some((file,length))=this.open_range(&key,range)?else{return Ok(None);};Ok(Some((Self::metadata_for_open_file(&key,&file)?,file,length)))
             })).await?;Ok(opened.map(|(metadata,file,length)|(metadata,native_range_stream(file,length))))
@@ -2085,7 +2120,7 @@ impl NativeObjectStore {
     /// can be served for a key that already resolved elsewhere.
     pub fn open_local_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>>{
         let this=self.clone();let prefix=prefix.clone();let lease=lease.clone();let key=key.clone();Box::pin(async move{
-            let opened=run_blocking(move||this.with_gate(&prefix,|gate|{
+            let opened=run_blocking(move||this.with_reader_gate(&prefix,|gate|{
                 if !prefix.matches(&key)||gate.owner.is_some()||gate.epoch!=lease.epoch||!gate.readers.get(&lease.reader_id).is_some_and(|(epoch,expiry)|*epoch==lease.epoch&&*expiry>ts::now_secs()){return Err(af::gate_closed_error(&prefix));}
                 if this.ref_marker_exists(&key)?{return Ok(None);}
                 let Some((file,length))=this.open_range(&key,range)?else{return Ok(None);};Ok(Some((Self::metadata_for_open_file(&key,&file)?,file,length)))
@@ -2096,7 +2131,7 @@ impl NativeObjectStore {
     /// `Ok(None)` covers missing keys and canonical references alike.
     pub fn local_asset_stream<'a>(&'a self,prefix:&'a ObjectPrefix,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<AssetStream>>>{
         let this=self.clone();let prefix=prefix.clone();let key=key.clone();Box::pin(async move{
-            run_blocking(move||this.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
+            run_blocking(move||this.with_reader_gate_lock(prefix.as_ref().trim_end_matches('/'),||{
                 if this.gate_path(&prefix).map(|path|path.is_file())?&&{let bytes=fs::read(this.gate_path(&prefix)?)?;let gate:FsGate=serde_json::from_slice(&bytes).map_err(|error|NarouError::Platform(format!("invalid durable gate: {error}")))?;gate.migrated}{return Err(af::gate_closed_error(&prefix));}
                 if this.ref_marker_exists(&key)?{return Ok(None);}
                 Ok(this.open_range(&key,range)?.map(|(file,length)|native_range_stream(file,length)))
@@ -2235,7 +2270,7 @@ impl NovelAccessFence for NativeObjectStore {
     })}
     fn rebind_writer<'a>(&'a self,prefix:&'a ObjectPrefix,expected_epoch:u64)->PlatformFuture<'a,Result<crate::platform::WriteFence>>{Box::pin(async move{run_scoped_blocking(||self.with_gate(prefix,|gate|{if gate.owner.is_some()||gate.epoch!=expected_epoch{return Err(af::gate_epoch_error(prefix,expected_epoch,gate.epoch));}Ok(crate::platform::WriteFence::new(prefix.clone(),expected_epoch))}))})}
     fn admit_reader<'a>(&'a self, prefix: &'a ObjectPrefix, id: &'a str, ttl: i64) -> PlatformFuture<'a, Result<GateLease>> {
-        Box::pin(async move { run_scoped_blocking(|| self.with_gate(prefix, |gate| {
+        Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate(prefix, |gate| {
             if gate.owner.is_some() { return Err(af::gate_closed_error(prefix)); }
             let expiry = ts::now_secs().saturating_add(ttl.clamp(1, af::READER_LEASE_SECS));
             gate.readers.insert(id.into(), (gate.epoch, expiry));
@@ -2243,7 +2278,7 @@ impl NovelAccessFence for NativeObjectStore {
         })) })
     }
     fn renew_reader<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a GateLease, ttl: i64) -> PlatformFuture<'a, Result<GateLease>> {
-        Box::pin(async move { run_scoped_blocking(|| self.with_gate(prefix, |gate| {
+        Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate(prefix, |gate| {
             if gate.owner.is_some() || gate.epoch != lease.epoch || !gate.readers.get(&lease.reader_id).is_some_and(|(epoch, _)| *epoch == lease.epoch) { return Err(af::gate_closed_error(prefix)); }
             let expiry = ts::now_secs().saturating_add(ttl.clamp(1, af::READER_LEASE_SECS));
             gate.readers.insert(lease.reader_id.clone(), (gate.epoch, expiry));
@@ -2262,7 +2297,7 @@ impl NovelAccessFence for NativeObjectStore {
         })) })
     }
     fn gate_info<'a>(&'a self, prefix: &'a ObjectPrefix) -> PlatformFuture<'a, Result<GateInfo>> {
-        Box::pin(async move { run_scoped_blocking(|| self.with_gate(prefix, |gate| Ok(GateInfo { epoch: gate.epoch, content_revision:gate.content_revision,
+        Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate(prefix, |gate| Ok(GateInfo { epoch: gate.epoch, content_revision:gate.content_revision,
             state: if gate.owner.is_some() { GateState::Closed } else { GateState::Open }, pending_readers: gate.readers.len() as u32, owner: gate.owner.clone(), updated_at: gate.updated_at }))) })
     }
     fn close_gate<'a>(&'a self, prefix: &'a ObjectPrefix, owner: &'a str) -> PlatformFuture<'a, Result<u64>> {
@@ -2341,6 +2376,137 @@ mod tests {
         let root=tempfile::tempdir().unwrap();let store=NativeObjectStore::from_root(root.path().to_owned()).unwrap();
         store.with_transfer_lock("novels/site/book",||{assert!(store.with_transfer_lock("novels/site/book",||Ok(())).is_err());Ok(())}).unwrap();
         store.with_transfer_lock("novels/site/book",||Ok(())).unwrap();
+    }
+    #[test]
+    fn durable_gate_scan_ignores_uncommitted_atomic_files() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let prefix = ObjectPrefix::new("novels/site/retained").unwrap();
+        futures::executor::block_on(store.close_gate(&prefix, "publication")).unwrap();
+        let path = store.gate_path(&prefix).unwrap();
+        let directory = path.parent().unwrap();
+        let staged = tempfile::Builder::new().prefix(ATOMIC_OBJECT_TEMP_PREFIX).tempfile_in(directory).unwrap();
+        let mut unpublished: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        unpublished["owner"] = serde_json::json!("unpublished");
+        let unpublished_bytes = serde_json::to_vec(&unpublished).unwrap();
+        for bytes in [b"{".as_slice(), unpublished_bytes.as_slice()] {
+            fs::write(staged.path(), bytes).unwrap();
+            let gates = durable_fs_gates(directory).unwrap();
+            assert_eq!(gates.len(), 1);
+            assert_eq!(gates[0].0, prefix.as_ref());
+            assert_eq!(gates[0].1.owner.as_deref(), Some("publication"));
+            assert_eq!(gates[0].1.epoch, 1);
+        }
+        atomic_write_bytes(&path, b"{").unwrap();
+        assert!(durable_fs_gates(directory).is_err(), "corrupt committed authority must still fail closed");
+    }
+    #[test]
+    fn pending_removals_ignore_uncommitted_atomic_files() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let prefix = ObjectPrefix::new("novels/site/removal").unwrap();
+        let owner = af::new_removal_owner(crate::platform::NovelId(1), true).unwrap();
+        let epoch = futures::executor::block_on(async {
+            let fence = store.capture_writer(&prefix).await?;
+            store.retire_writer(&fence, &owner).await
+        }).unwrap();
+        let path = store.gate_path(&prefix).unwrap();
+        let committed = fs::read(&path).unwrap();
+        let staged = tempfile::Builder::new().prefix(ATOMIC_OBJECT_TEMP_PREFIX).tempfile_in(path.parent().unwrap()).unwrap();
+        for bytes in [b"{".as_slice(), committed.as_slice()] {
+            fs::write(staged.path(), bytes).unwrap();
+            let (pending, cursor) = futures::executor::block_on(store.pending_removals(None, 100)).unwrap();
+            assert!(cursor.is_none());
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].0, prefix);
+            assert_eq!(pending[0].1, owner);
+            assert_eq!(pending[0].2, epoch);
+        }
+        atomic_write_bytes(&path, b"{").unwrap();
+        assert!(futures::executor::block_on(store.pending_removals(None, 100)).is_err());
+    }
+    #[test]
+    fn windowed_inventory_preserves_atomic_prefix_novel_files() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let key = ObjectKey::try_new(format!("novels/site/user/{ATOMIC_OBJECT_TEMP_PREFIX}note.txt")).unwrap();
+        let path = store.resolve_path(&key).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"user").unwrap();
+        let private = root.path().join(".objects/metadata");
+        fs::create_dir_all(&private).unwrap();
+        let staged = tempfile::Builder::new().prefix(ATOMIC_OBJECT_TEMP_PREFIX).tempfile_in(private).unwrap();
+        fs::write(staged.path(), b"{").unwrap();
+        for prefix in ["novels/site/user", "novels", ""] {
+            let request = ObjectListRequest::new(ObjectPrefix::new(prefix).unwrap(), std::num::NonZeroUsize::new(10).unwrap());
+            let page = futures::executor::block_on(store.list_page(&request)).unwrap();
+            assert!(page.next_cursor.is_none());
+            assert_eq!(page.objects.len(), 1);
+            assert_eq!(page.objects[0].key, key);
+            assert_eq!(page.objects[0].size, 4);
+        }
+    }
+    #[test]
+    fn transfer_readers_share_namespace_while_serializing_gate_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let reopened = NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let prefix = ObjectPrefix::new("novels/site/book").unwrap();
+        let first = futures::executor::block_on(store.admit_reader(&prefix, "first", 30)).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|threads| {
+            let held_store = &store;
+            let held_prefix = &prefix;
+            let holder = threads.spawn(move || held_store.with_reader_gate(held_prefix, |gate| {
+                assert!(gate.readers.contains_key("first"));
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                Ok(())
+            }));
+            entered_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            let digest = hex::encode(sha2::Sha256::digest(prefix.as_ref().as_bytes()));
+            let path = store.resolve_path(&ObjectKey::try_new(format!(".narou-transfer/.lock/{digest}")).unwrap()).unwrap();
+            let probe = fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+            let shared = fs2::FileExt::try_lock_shared(&probe);
+            let publication = store.with_transfer_lock(prefix.as_ref(), || Ok(()));
+            let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let reader_store = &reopened;
+            let reader_prefix = &prefix;
+            let waiter = threads.spawn(move || {
+                attempted_tx.send(()).unwrap();
+                result_tx.send(futures::executor::block_on(async {
+                    let lease = reader_store.admit_reader(reader_prefix, "second", 30).await?;
+                    reader_store.renew_reader(reader_prefix, &lease, 30).await
+                })).unwrap();
+            });
+            attempted_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            let pending = result_rx.recv_timeout(std::time::Duration::from_millis(100));
+            let waited = matches!(&pending, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+            release_tx.send(()).unwrap();
+            let second = pending.unwrap_or_else(|error| {
+                assert!(matches!(error, std::sync::mpsc::RecvTimeoutError::Timeout));
+                result_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap()
+            });
+            waiter.join().unwrap();
+            let held = holder.join().unwrap();
+            if shared.is_ok() { fs2::FileExt::unlock(&probe).unwrap(); }
+            held.unwrap();
+            shared.unwrap();
+            assert!(waited, "a concurrent reader must wait for the gate metadata update");
+            assert!(publication.is_err(), "readers must still exclude publication");
+            let second = second.unwrap();
+            assert_eq!(first.epoch, second.epoch);
+            futures::executor::block_on(async {
+                assert_eq!(store.gate_info(&prefix).await.unwrap().pending_readers, 2);
+                store.release_reader(&prefix, &first).await.unwrap();
+                reopened.release_reader(&prefix, &second).await.unwrap();
+                assert_eq!(store.gate_info(&prefix).await.unwrap().pending_readers, 0);
+                store.close_gate(&prefix, "publication").await.unwrap();
+                assert!(reopened.admit_reader(&prefix, "late", 30).await.is_err());
+            });
+        });
     }
     use crate::platform::ObjectStore;
 

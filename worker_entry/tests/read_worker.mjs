@@ -1084,6 +1084,220 @@ try {
     assert.deepEqual(await snapshot(), before, 'the reader must not change the shared D1 database');
   });
 
+  // --- 12. reader admission は writer 制御路でだけ行う -------------------
+  await check('the novel-access control path rejects unauthenticated and forged calls', async () => {
+    const control = (body, token) =>
+      fetchOn(reader.base, '/api/control/novel-access', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+    const prefix = novelPrefix(NOVEL);
+    for (const token of [undefined, 'forged-token-0000']) {
+      for (const op of [
+        { op: 'admit', prefix, reader_id: 'forged-public' },
+        { op: 'renew', prefix, lease: { reader_id: 'forged-public', epoch: 0, expires_at: 0 } },
+        { op: 'release', prefix, lease: { reader_id: 'forged-public', epoch: 0, expires_at: 0 } },
+        { op: 'gate_info', prefix },
+      ]) {
+        const response = await control(op, token);
+        await expectStatus(response, 401, `${op.op} with${token ? ' a forged token' : 'out a token'}`);
+        await response.text();
+      }
+    }
+    // 認証済みでも存在しない lease の renew は gate が拒否する (CAS と同じ
+    // 判定): 他 reader の lease を偽装できない。
+    const forged = await control(
+      { op: 'renew', prefix, lease: { reader_id: 'forged-nonexistent-reader', epoch: 0, expires_at: 1 } },
+      adminToken,
+    );
+    await expectStatus(forged, 200, 'renew returns a domain verdict');
+    const verdict = await forged.json();
+    assert.equal(verdict.ok, false, 'a fabricated lease must not renew');
+    // 偽造 release は他 reader の lease を消せない。
+    const admitted = await control(
+      { op: 'admit', prefix, reader_id: 'control-probe-reader', lease_secs: 30 },
+      adminToken,
+    );
+    await expectStatus(admitted, 200, 'control admit');
+    const admission = await admitted.json();
+    assert.equal(admission.ok, true);
+    assert.equal(admission.payload.lease.reader_id, 'control-probe-reader');
+    const gateEpoch = await scalar(
+      `SELECT epoch FROM novel_access_gates WHERE prefix=${quote(prefix)}`,
+    );
+    assert.equal(
+      admission.payload.lease.epoch,
+      gateEpoch,
+      'the issued lease must pin the current gate epoch',
+    );
+    const spoofed = await control(
+      {
+        op: 'release',
+        prefix,
+        lease: { ...admission.payload.lease, reader_id: 'control-probe-impostor' },
+      },
+      adminToken,
+    );
+    await expectStatus(spoofed, 200, 'spoofed release');
+    assert.equal((await spoofed.json()).ok, true, 'release is idempotent but scoped');
+    assert.equal(
+      await scalar(
+        `SELECT COUNT(*) AS count FROM novel_reader_leases WHERE prefix=${quote(prefix)} ` +
+          `AND reader_id='control-probe-reader'`,
+      ),
+      1,
+      'a forged reader_id must not release another reader',
+    );
+    const released = await control(
+      { op: 'release', prefix, lease: admission.payload.lease },
+      adminToken,
+    );
+    await expectStatus(released, 200, 'release');
+    assert.equal((await released.json()).ok, true);
+    assert.equal(
+      await scalar(
+        `SELECT COUNT(*) AS count FROM novel_reader_leases WHERE prefix=${quote(prefix)} ` +
+          `AND reader_id='control-probe-reader'`,
+      ),
+      0,
+      'the real lease must be released at the authority',
+    );
+  });
+
+  await check('closed or replaced gates reject reader delivery and stale leases', async () => {
+    const prefix = novelPrefix(NOVEL);
+    try {
+      // writer が gate を閉じた状態 (= drain/commit 中) を再現する。
+      await sql(
+        `UPDATE novel_access_gates SET closed=1,owner='smoke-writer',epoch=epoch+1,` +
+          `updated_at=unixepoch() WHERE prefix=${quote(prefix)}`,
+      );
+      const blocked = await external(`/api/v1/novels/${NOVEL.id}`);
+      await expectStatus(blocked, 503, 'delivery must refuse admission on a closed gate');
+      const body = await blocked.text();
+      assert.match(body, /novel_recovering/, 'the rejection must report the closed gate');
+      const epubBlocked = await admin(reader.base, `/api/novels/${NOVEL.id}/download.epub`);
+      await expectStatus(epubBlocked, 500, 'EPUB generation must refuse admission on a closed gate');
+      assert.match(await epubBlocked.text(), /novel_recovering/, 'the EPUB failure must report the closed gate');
+      // gate が (閉鎖→再公開で) 置き換わると旧 epoch の lease は CAS で拒否される。
+      const stale = await fetchOn(reader.base, '/api/control/novel-access', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', Authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({
+          op: 'renew',
+          prefix,
+          lease: { reader_id: 'vanished-reader', epoch: 0, expires_at: 1 },
+        }),
+      });
+      await expectStatus(stale, 200, 'renew verdict');
+      assert.equal((await stale.json()).ok, false, 'a stale-epoch lease must not renew');
+      await sql(
+        `UPDATE novel_access_gates SET closed=0,owner=NULL,updated_at=unixepoch() ` +
+          `WHERE prefix=${quote(prefix)}`,
+      );
+      const recovered = await external(`/api/v1/novels/${NOVEL.id}`);
+      await expectStatus(recovered, 200, 'delivery resumes once the gate reopens');
+      await recovered.text();
+    } finally {
+      await sql(
+        `UPDATE novel_access_gates SET closed=0,owner=NULL WHERE prefix=${quote(prefix)}`,
+      );
+      await sql(`DELETE FROM novel_reader_leases WHERE prefix=${quote(prefix)}`);
+    }
+  });
+
+  await check('an in-flight read holds the delegated lease until EOF or safe expiry', async () => {
+    const prefix = novelPrefix(NOVEL);
+    try {
+      fixture.holdNextSourceRead();
+      const pending = admin(reader.base, `/api/novels/${NOVEL.id}/download.epub`);
+      const deadline = Date.now() + 30000;
+      while (fixture.heldCount() === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.equal(fixture.heldCount(), 1, 'the read must be in flight before inspecting its lease');
+      const rows = (
+        await sql(`SELECT reader_id,epoch,expires_at FROM novel_reader_leases WHERE prefix=${quote(prefix)}`)
+      )[0].results;
+      assert.equal(rows.length, 1, 'the in-flight reader must hold exactly one delegated lease');
+      const gateEpoch = await scalar(
+        `SELECT epoch FROM novel_access_gates WHERE prefix=${quote(prefix)}`,
+      );
+      assert.equal(
+        rows[0].epoch,
+        gateEpoch,
+        'the lease delegated through the writer keeps the admitted epoch',
+      );
+      const now = Math.floor(Date.now() / 1000);
+      assert(
+        rows[0].expires_at > now && rows[0].expires_at <= now + 31,
+        `the lease must carry its bounded TTL: ${JSON.stringify(rows[0])}`,
+      );
+      fixture.releaseHolds();
+      const response = await pending;
+      if (response instanceof Error) throw response;
+      await assertEpubBody(response, NOVEL.sections.map((section) => section.marker));
+      assert.equal(
+        await scalar(`SELECT COUNT(*) AS count FROM novel_reader_leases WHERE prefix=${quote(prefix)}`),
+        0,
+        'a completed read must release its lease',
+      );
+    } finally {
+      fixture.releaseHolds();
+      await sql(`DELETE FROM novel_reader_leases WHERE prefix=${quote(prefix)}`);
+    }
+  });
+
+  await check('a cancelled read cannot pin a lease forever', async () => {
+    const prefix = novelPrefix(NOVEL);
+    const controller = new AbortController();
+    try {
+      fixture.holdNextSourceRead();
+      const pending = fetchOn(reader.base, `/api/novels/${NOVEL.id}/download.epub`, {
+        headers: { Authorization: `Bearer ${adminToken}` },
+        signal: controller.signal,
+      }).catch((error) => error);
+      const deadline = Date.now() + 30000;
+      while (fixture.heldCount() === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.equal(fixture.heldCount(), 1, 'the read must be in flight before cancellation');
+      const issued = (
+        await sql(`SELECT reader_id,expires_at FROM novel_reader_leases WHERE prefix=${quote(prefix)}`)
+      )[0].results;
+      assert.equal(issued.length, 1, 'cancellation must begin with a real delegated lease');
+      controller.abort();
+      fixture.releaseHolds();
+      await pending;
+      // Observe release or actual expiry, not merely a TTL-shaped timestamp:
+      // a detached renewal loop must not keep the abandoned reader alive.
+      const expiryDeadline = (issued[0].expires_at + 2) * 1000;
+      let active;
+      do {
+        active = (
+          await sql(`SELECT reader_id,expires_at FROM novel_reader_leases WHERE prefix=${quote(prefix)} AND expires_at>unixepoch()`)
+        )[0].results;
+        for (const row of active) {
+          assert.equal(row.reader_id, issued[0].reader_id, 'cancellation cannot create a new reader identity');
+          assert(row.expires_at <= issued[0].expires_at + 1,
+            `an abandoned reader must not continue renewing: ${JSON.stringify(row)}`);
+        }
+        if (active.length === 0 || Date.now() >= expiryDeadline) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      } while (true);
+      assert.equal(active.length, 0, 'the cancelled reader must release or naturally expire');
+      const next = await admin(reader.base, `/api/novels/${NOVEL.id}/download.epub`);
+      await assertEpubBody(next, NOVEL.sections.map((section) => section.marker));
+    } finally {
+      fixture.releaseHolds();
+      await sql(`DELETE FROM novel_reader_leases WHERE prefix=${quote(prefix)}`);
+    }
+  });
+
   const failed = steps.filter((step) => !step.ok);
   exitCode = failed.length === 0 ? 0 : 1;
   console.log(

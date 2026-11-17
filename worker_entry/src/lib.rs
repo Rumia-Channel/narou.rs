@@ -36,6 +36,7 @@ pub mod http;
 mod isolate_cache;
 mod memory_budget;
 mod worker_role;
+mod reader_control;
 mod ledger;
 mod object_migration;
 mod illustration_migration;
@@ -168,6 +169,11 @@ fn head_response(response: Response) -> Result<Response> {
 }
 
 async fn route(req: Request, env: Env, path: String) -> Result<Response> {
+    // 配信 Worker の reader admission を代理する制御路 (writer 側でだけ
+    // 実行する; reader 自身が受けた要求は owns_request 経由で writer へ流れる)。
+    if path == reader_control::CONTROL_PATH {
+        return reader_control::handle(req, env).await;
+    }
     if path == "/api/transfer/v2" || path.starts_with("/api/transfer/v2/") {
         return transfer::handle(req, env).await;
     }
@@ -1569,7 +1575,7 @@ fn same_origin(req: &Request) -> bool {
 }
 
 /// 認証を要求し、失敗していればその応答を返す。
-async fn auth_failure(req: &Request, env: &Env) -> Option<worker::Result<Response>> {
+pub(crate) async fn auth_failure(req: &Request, env: &Env) -> Option<worker::Result<Response>> {
     match auth_state(req, env).await {
         AuthState::Allowed => None,
         AuthState::Required => Some(json_error(401, "authentication_required", None)),

@@ -4,25 +4,51 @@ use super::*;
 use futures::StreamExt;
 use narou_rs::platform::{AssetStream, http::{HttpStreamResponse, HttpPacing}, staging::{ASSET_CHUNK_BYTES, owned_bytes_stream}};
 
+/// Owns the request that produced a response body. Dropping it aborts the
+/// request, so a cancelled consumer closes the upstream connection instead of
+/// leaving it to the runtime's own drain.
+struct FetchAbortGuard(Option<worker::AbortController>);
+
+impl Drop for FetchAbortGuard {
+    fn drop(&mut self) {
+        if let Some(abort) = self.0.take() {
+            abort.abort();
+        }
+    }
+}
+
 struct FetchReader {
     reader: ReadableStreamDefaultReader,
+    /// Owns the request that produced this body. Dropping the reader aborts
+    /// that request, so a cancelled consumer closes the upstream connection
+    /// instead of leaving it to the runtime's own drain.
+    abort: FetchAbortGuard,
     pending: Option<js_sys::Uint8Array>,
     offset: u32,
-    finished: bool,
 }
 
 impl Drop for FetchReader {
     fn drop(&mut self) {
-        if !self.finished {
-            // Cancellation starts synchronously; Drop never spawns an owner.
+        if self.abort.0.is_some() {
+            // Cancelling the body reader alone only closes the response body;
+            // the upstream request would keep its socket until the runtime
+            // decides to reuse or drop it. Abort the request itself so the
+            // peer observes the interruption, and never drain the remaining
+            // body to EOF. Drop never spawns an owner.
             let _ = self.reader.cancel();
         }
         self.reader.release_lock();
     }
 }
 
-fn fetch_stream(body: worker::ResponseBody, limit: Option<u64>, expected: Option<u64>) -> Result<AssetStream> {
+fn fetch_stream(
+    body: worker::ResponseBody,
+    limit: Option<u64>,
+    expected: Option<u64>,
+    mut abort: FetchAbortGuard,
+) -> Result<AssetStream> {
     let worker::ResponseBody::Stream(stream) = body else {
+        abort.0 = None;
         return match body {
             worker::ResponseBody::Empty if expected.unwrap_or(0) == 0 => Ok(Box::pin(futures::stream::empty())),
             worker::ResponseBody::Empty => Err(NarouError::Http("truncated Fetch body".into())),
@@ -38,7 +64,7 @@ fn fetch_stream(body: worker::ResponseBody, limit: Option<u64>, expected: Option
     };
     let reader = stream.get_reader().dyn_into::<ReadableStreamDefaultReader>()
         .map_err(|_| NarouError::Http("invalid Fetch stream reader".into()))?;
-    let reader = FetchReader { reader, pending: None, offset: 0, finished: false };
+    let reader = FetchReader { reader, abort, pending: None, offset: 0 };
     Ok(Box::pin(futures::stream::try_unfold((reader, 0u64), move |(mut state, total)| async move {
         loop {
             if let Some(chunk) = state.pending.as_ref()
@@ -59,7 +85,7 @@ fn fetch_stream(body: worker::ResponseBody, limit: Option<u64>, expected: Option
                 READ_TIMEOUT_SECS as f64 * 1_000.0, "Fetch body read").await?;
             if js_sys::Reflect::get(&value, &JsValue::from_str("done")).map_err(js_error)?.is_truthy() {
                 if expected.is_some_and(|length| length != total) { return Err(NarouError::Http("truncated Fetch body".into())); }
-                state.finished = true;
+                state.abort.0 = None;
                 drop(state);
                 return Ok(None);
             }
@@ -86,7 +112,13 @@ impl WorkerHttpClient {
         }
         let fetch = Request::new_with_init(&request.url, &init).map_err(|error| NarouError::Http(error.to_string()))?;
         self.subrequests.record();
-        let response = Fetch::Request(fetch).send().await.map_err(|error| NarouError::Http(error.to_string()))?;
+        // The response body owns the request: dropping the body aborts the
+        // request, so a cancelled consumer never leaves the upstream socket
+        // open and never has to read the remaining bytes to EOF.
+        let abort = FetchAbortGuard(Some(worker::AbortController::default()));
+        let signal = abort.0.as_ref().expect("new Fetch owns its controller").signal();
+        let response = Fetch::Request(fetch).send_with_signal(&signal).await
+            .map_err(|error| NarouError::Http(error.to_string()))?;
         let status = response.status_code();
         let mut headers = response.headers().entries().filter(|(name, _)| !name.eq_ignore_ascii_case("set-cookie")).collect::<Vec<_>>();
         for cookie in response.headers().get_all("set-cookie").map_err(|error| NarouError::Http(error.to_string()))? {
@@ -100,7 +132,7 @@ impl WorkerHttpClient {
         let limit = if request.trusted_endpoint && (200..300).contains(&status) {
             request.trusted_response_body_limit.map(|value| value as u64)
         } else if !(200..300).contains(&status) { Some(MAX_WORKER_HTTP_BODY as u64) } else { None };
-        let body = fetch_stream(response.into_parts().1, limit, expected)?;
+        let body = fetch_stream(response.into_parts().1, limit, expected, abort)?;
         Ok(HttpStreamResponse { status, url: request.url.clone(), headers, body })
     }
 

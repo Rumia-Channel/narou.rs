@@ -1,7 +1,7 @@
 #![cfg(feature = "native-runtime")]
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Barrier, atomic::{AtomicBool, Ordering}};
+use std::sync::Arc;
 
 use narou_rs::application::{NovelSettingsPatch, NovelSettingsService};
 use narou_rs::converter::ini::{IniData, IniValue};
@@ -28,15 +28,15 @@ fn fixture() -> tempfile::TempDir {
     tempfile::Builder::new().prefix("novel-settings-").tempdir_in(base).unwrap()
 }
 
-// Force both legacy service reads to see the same pre-save snapshot. The
-// atomic path goes straight into the real adapter's transaction instead.
-struct ReadBarrierStore {
+// Hold the first save at the real atomic update boundary. The competing
+// same-process save must wait, then preserve both edits and unknown fields.
+struct PausedWriteStore {
     inner: Arc<dyn ObjectStore>,
-    gate: Arc<AtomicBool>,
-    barrier: Arc<Barrier>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
-impl ObjectStore for ReadBarrierStore {
+impl ObjectStore for PausedWriteStore {
     fn access_fence(&self) -> Option<&dyn narou_rs::platform::NovelAccessFence> {
         self.inner.access_fence()
     }
@@ -44,19 +44,21 @@ impl ObjectStore for ReadBarrierStore {
         self.inner.read_stream_leased(prefix, lease, key, range)
     }
     fn update_small_guarded<'a, 'data: 'a>(&'a self, fence: &'a narou_rs::platform::WriteFence, key: &'a ObjectKey, mutate: &'a mut SmallObjectMutator<'data>) -> PlatformFuture<'a, Result<ObjectUpdateResult>> {
-        self.inner.update_small_guarded(fence, key, mutate)
+        Box::pin(async move {
+            let mut paused = |current: Option<&[u8]>| {
+                self.entered.send(()).map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))?;
+                self.resume.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))?;
+                mutate(current)
+            };
+            self.inner.update_small_guarded(fence, key, &mut paused).await
+        })
     }
     fn stat<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
         self.inner.stat(key)
     }
     fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
-        Box::pin(async move {
-            let value = self.inner.read_small(key).await?;
-            if key.as_ref().ends_with("/setting.ini") && self.gate.load(Ordering::SeqCst) {
-                self.barrier.wait();
-            }
-            Ok(value)
-        })
+        self.inner.read_small(key)
     }
     fn write_small<'a>(&'a self, key: &'a ObjectKey, data: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
         self.inner.write_small(key, data)
@@ -102,24 +104,31 @@ fn concurrent_save(sqlite: bool) {
     futures::executor::block_on(stores[0].write_small(&keys.setting(),
         b"enable_yokogaki = false\nenable_convert_num_to_kanji = false\nunknown = \"123\"\n".to_vec(),
     )).unwrap();
-    let gate = Arc::new(AtomicBool::new(true));
-    let barrier = Arc::new(Barrier::new(2));
     let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
-    let workers: Vec<_> = stores.iter().zip(["enable_yokogaki", "enable_convert_num_to_kanji"])
-        .map(|(store, name)| {
-            let objects = Arc::new(ReadBarrierStore {
-                inner: Arc::clone(store), gate: Arc::clone(&gate), barrier: Arc::clone(&barrier),
-            });
-            let service = NovelSettingsService::new(repo.clone(), objects);
-            std::thread::spawn(move || {
-                let mut patch = NovelSettingsPatch::default();
-                patch.settings.insert(name.into(), Some(IniValue::Boolean(true)));
-                let result = futures::executor::block_on(service.save(NovelId(1), &patch)).unwrap();
-                assert!(result.failure.is_none());
-            })
-        }).collect();
-    for worker in workers { worker.join().unwrap(); }
-    gate.store(false, Ordering::SeqCst);
+    let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+    let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+    let first = NovelSettingsService::new(repo.clone(), Arc::new(PausedWriteStore {
+        inner: stores[0].clone(), entered, resume: std::sync::Mutex::new(resumed),
+    }));
+    let second = NovelSettingsService::new(repo, stores[1].clone());
+    let mut first_patch = NovelSettingsPatch::default();
+    first_patch.settings.insert("enable_yokogaki".into(), Some(IniValue::Boolean(true)));
+    let mut second_patch = NovelSettingsPatch::default();
+    second_patch.settings.insert("enable_convert_num_to_kanji".into(), Some(IniValue::Boolean(true)));
+    let (saved, second_saved) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| futures::executor::block_on(first.save(NovelId(1), &first_patch)));
+        waiting.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let second_saved = futures::executor::block_on(async {
+            let pending = second.save(NovelId(1), &second_patch);
+            futures::pin_mut!(pending);
+            assert!(futures::poll!(pending.as_mut()).is_pending(), "a concurrent edit must wait rather than fail");
+            resume.send(()).unwrap();
+            pending.await
+        });
+        (writer.join().unwrap(), second_saved)
+    });
+    assert!(saved.unwrap().failure.is_none());
+    assert!(second_saved.unwrap().failure.is_none());
     let bytes = futures::executor::block_on(stores[0].read_small(&keys.setting())).unwrap().unwrap();
     let restored = IniData::load(std::str::from_utf8(&bytes).unwrap());
     assert_eq!(restored.get_global("enable_yokogaki"), Some(&IniValue::Boolean(true)));

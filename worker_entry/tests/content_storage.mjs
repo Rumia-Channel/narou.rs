@@ -5,7 +5,7 @@ import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { brotliDecompressSync, inflateRawSync } from 'node:zlib';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
@@ -40,6 +40,12 @@ const imageRequests = new Map();
 const sourceRequests = new Map();
 const imageContinuations = [];
 let yieldBarrier = null;
+// Read-only witness barrier: released only once the armed S3 gate really
+// holds an upstream request. The test caller waits on it instead of sleeping.
+let upstreamHeld = null;
+// The held state is observed before the caller may cancel, so the test can
+// check the admission while the upstream is genuinely held.
+let heldRelease = null;
 let deliveryWitness = null;
 let canonicalWriteBarrier = null;
 // The armed canonical write is shared by every script of the topology (the
@@ -92,6 +98,29 @@ const server = http.createServer(async (req, res) => {
         instances: Math.max(0, ...memorySamples.map(sample => sample.instances)),
         samples: memorySamples.length,
       }));
+      return;
+    }
+    if (req.method === 'GET' && key === '/_fixture/upstream-held') {
+      // Read-only witness. The answer is released only after the armed gate
+      // really holds an upstream request, so the caller never guesses when the
+      // receiver is pending, and only after the test has observed the held
+      // state. One answer per arming.
+      const gate = upstreamHeld;
+      if (!gate || gate.observed) { res.writeHead(409); res.end('no armed upstream gate'); return; }
+      gate.observed = true;
+      // The producer callbacks must retain their shared handles until resolved.
+      await gate.promise;
+      const release = heldRelease;
+      if (release) await release.promise;
+      if (upstreamHeld === gate) upstreamHeld = null;
+      res.end('held');
+      return;
+    }
+    if (req.method === 'POST' && key === '/_fixture/release-held') {
+      // The test lets the caller cancel now that the held state is observed.
+      heldRelease?.resolve();
+      heldRelease = null;
+      res.end('released');
       return;
     }
     if (req.method === 'POST' && key === '/_fixture/yield') {
@@ -301,6 +330,14 @@ function renderTopology({ required = false, entrypoint, invalidEndpoint = false 
     vars: { NAROU_REQUIRE_S3: String(required) },
   });
   config = topology.writerPath;
+  // The test caller dispatches to the actual writer through a real service
+  // binding (the workerd service-dispatch cancellation model), so the writer
+  // binds to itself. The binding is generated here, next to the topology it
+  // belongs to; nothing in the shared topology helper has to change.
+  const writerConfig = readFileSync(topology.writerPath, 'utf8');
+  if (!writerConfig.includes('binding = "SERVER"')) {
+    writeFileSync(topology.writerPath, `${writerConfig}\n[[services]]\nbinding = "SERVER"\nservice = ${JSON.stringify(topology.writerName)}\n`);
+  }
 }
 
 async function start() {
@@ -781,15 +818,70 @@ export default class extends Production.default {
     await response.text();
   }
   async fetch(request, ...rest) {
-    if (new URL(request.url).pathname === '/_fixture/memory') {
+    const path = new URL(request.url).pathname;
+    if (path === '/_fixture/memory') {
       await this.reportMemory();
       return fetch('http://127.0.0.1:${s3Port}/_fixture/memory');
     }
+    if (path === '/_fixture/dispatch-abort') return this.dispatchAbort(request);
+    if (path === '/_fixture/dispatch-body') return this.dispatchBody(request);
     return super.fetch(request, ...rest);
   }
   async queue(batch, ...rest) {
     await super.queue(batch, ...rest);
     await this.reportMemory();
+  }
+  // Test-only caller. It owns the AbortController and cancels a real
+  // service-binding dispatch to the actual writer. The receiver sees its own
+  // request.signal fire and must abort the pending upstream read; nothing
+  // here fabricates a signal for the application.
+  async dispatchAbort(request) {
+    if (!this.env.SERVER) return new Response('caller binding missing', 501);
+    const target = new URL(request.url).searchParams.get('target');
+    const controller = new AbortController();
+    const dispatch = this.env.SERVER.fetch(target, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer ' + this.env.NAROU_ADMIN_TOKEN },
+      signal: controller.signal,
+    }).then(response => ({ status: response.status }), error => ({ name: error.name }));
+    try {
+      // Read-only witness: the S3 fixture answers only once the actual
+      // upstream request is held, so the cancel never races the receiver.
+      await (await fetch('http://127.0.0.1:${s3Port}/_fixture/upstream-held')).text();
+      controller.abort();
+      return Response.json(await dispatch);
+    } finally {
+      controller.abort();
+    }
+  }
+  async dispatchBody(request) {
+    if (!this.env.SERVER) return new Response('caller binding missing', 501);
+    const target = new URL(request.url).searchParams.get('target');
+    const controller = new AbortController();
+    const dispatch = this.env.SERVER.fetch(target, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer ' + this.env.NAROU_ADMIN_TOKEN },
+      signal: controller.signal,
+    });
+    const held = fetch('http://127.0.0.1:${s3Port}/_fixture/upstream-held').then(response => response.text());
+    try {
+      const response = await dispatch;
+      const reader = response.body.getReader();
+      let bytes = 0;
+      while (bytes < 4 * 1024 * 1024) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        bytes += value.length;
+      }
+      await held;
+      controller.abort();
+      let name = null;
+      try { await reader.read(); } catch (error) { name = error.name; }
+      await reader.cancel().catch(() => {});
+      return Response.json({ status: response.status, read: bytes, name });
+    } finally {
+      controller.abort();
+    }
   }
 }
 `);
@@ -838,7 +930,8 @@ export default class extends Production.default {
     const busy = await api(`/api/novels/${animationId}/download.epub`);
     assert.equal(busy.status, 503, 'the in-flight EPUB must retain its isolate memory reservation');
     assert(busy.headers.get('retry-after'), 'capacity refusal must tell the client when to retry');
-    await busy.body.cancel();
+    const busyBody = await busy.json();
+    assert.equal(busyBody.error, 'memory_capacity', 'the refusal must name the isolate memory reservation it holds');
     const reader = response.body.getReader();
     const chunks = [];
     for (let count = 0;; count++) {
@@ -866,57 +959,244 @@ export default class extends Production.default {
     assert.equal(imageReferences.size, 1, JSON.stringify({ references: [...imageReferences], animations: [...animatedImages] }));
     for (const image of imageReferences) assert(animatedImages.has(image), 'the displayed image must retain every animation frame');
     assert.equal(liveReaders(), 0, 'EOF must release the actual D1 reader lease inline');
+    // Service-dispatch cancellation. The test caller dispatches to the actual
+    // writer through a real service binding and cancels that dispatch; the
+    // receiver's own request.signal must fire and abort its pending upstream
+    // read. A local TCP disconnect cannot deliver that signal through the dev
+    // bridge, so this proves the service-dispatch path only.
+    const leaseRows = () => sql(`SELECT reader_id,epoch,expires_at FROM novel_reader_leases WHERE prefix=${quote(readerPrefix)} ORDER BY reader_id`)[0].results;
+    const headersPaused = Promise.withResolvers();
+    const headersClosed = Promise.withResolvers();
+    const upstreamTornDown = Promise.withResolvers();
+    let headerResponse;
+    const headerWitness = { held: null, socket: { ended: false, closed: false }, error: null };
+    multipart.beforeReadHeaders = async (req, res, key, bytes, read) => {
+      // The witness must be the upstream read this EPUB request owns: the
+      // published pool object. The same animation bytes also travel as a
+      // staged copy and as a producer's re-read, and holding one of those
+      // would say nothing about the in-flight request.
+      if (key !== animationKey) return false;
+      if (!isAnimation(bytes)) return false;
+      const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
+      const start = range ? Number(range[1]) : 0;
+      const end = range?.[2] ? Math.min(Number(range[2]), bytes.length - 1) : bytes.length - 1;
+      if (end - start + 1 <= 8 * 1024 * 1024) return false;
+      assert.equal(headerResponse, undefined, 'only one upstream read of the published object may await headers');
+      assert.equal(res.headersSent, false);
+      headerResponse = res;
+      read.held = true;
+      headerWitness.held = {
+        key, method: req.method, url: req.url, range: req.headers.range ?? null,
+        ifMatch: req.headers['if-match'] ?? null, span: end - start + 1, at: Date.now(),
+      };
+      res.once('close', () => headersClosed.resolve());
+      // An aborted upstream surfaces as a socket error; record it instead of
+      // letting it escape as an unhandled event.
+      res.once('error', (error) => { headerWitness.error = error.code ?? error.message; });
+      // The response object can be closed without the connection being torn
+      // down. Only the socket proves that the peer really aborted.
+      req.socket.once('end', () => { headerWitness.socket.ended = true; });
+      req.socket.once('close', () => { headerWitness.socket.closed = true; upstreamTornDown.resolve(); });
+      // Read-only witness: the caller may cancel only once the upstream
+      // request is really pending.
+      headersPaused.resolve();
+      upstreamHeld?.resolve();
+      await headersClosed.promise;
+      return true;
+    };
+    try {
+      const dispatchTarget = `http://${topology.writerName}/api/novels/${animationId}/download.epub`;
+      const knownReaders = new Set(leaseRows().map((row) => row.reader_id));
+      upstreamHeld = Promise.withResolvers();
+      heldRelease = Promise.withResolvers();
+      const caller = api(`/_fixture/dispatch-abort?target=${encodeURIComponent(dispatchTarget)}`)
+        .then((result) => result.json())
+        .catch((error) => ({ name: error.name }));
+      let deadline;
+      try {
+        await Promise.race([
+          headersPaused.promise,
+          new Promise((_, reject) => {
+            deadline = setTimeout(() => reject(new Error(`the dispatched EPUB did not reach the upstream header gate (reads=${JSON.stringify(multipart.reads.slice(-6))})`)), 5000);
+          }),
+        ]);
+      } finally { clearTimeout(deadline); }
+      // The receiver admitted its durable reader before it touched the
+      // upstream, and it is still live while the upstream is held.
+      const admitted = leaseRows().find((row) => !knownReaders.has(row.reader_id));
+      assert(admitted, 'the dispatched EPUB must admit its durable novel reader');
+      assert(Number(admitted.expires_at) > Math.floor(Date.now() / 1000), 'the dispatched EPUB must hold a live novel admission');
+      assert(liveReaders() > 0, 'the held upstream must retain the original novel admission');
+      // Only now may the caller cancel its dispatch.
+      await fetch(`http://127.0.0.1:${s3Port}/_fixture/release-held`, { method: 'POST' });
+      let outcome;
+      try {
+        outcome = await Promise.race([
+          caller,
+          new Promise((_, reject) => {
+            deadline = setTimeout(() => reject(new Error(`the service-dispatch caller did not settle (reads=${JSON.stringify(multipart.reads.slice(-6))})`)), 5000);
+          }),
+        ]);
+      } finally { clearTimeout(deadline); }
+      assert.equal(outcome.name, 'AbortError', 'the cancelled service dispatch must reject with AbortError');
+      // The held read is the only full delivery of the published object: no
+      // replay, producer or second request shares it while it is open.
+      const poolReads = multipart.reads.filter((read) => read.key === animationKey && read.span > 8 * 1024 * 1024);
+      const heldRead = poolReads.find((read) => read.held);
+      assert(heldRead, `the armed gate must hold the published object read: ${JSON.stringify(poolReads)}`);
+      assert.equal(poolReads.filter((read) => read.held).length, 1, `only one upstream read of the published object may be held: ${JSON.stringify(poolReads)}`);
+      const overlapping = poolReads.filter((read) => read !== heldRead && read.at < (heldRead.closedAt ?? Infinity) && heldRead.at < (read.closedAt ?? Infinity));
+      assert.equal(overlapping.length, 0, `no other full read of the published object may overlap the held one: ${JSON.stringify(poolReads)}`);
+      try {
+        // The Node response close stays the witness it always was; the socket
+        // teardown is the stricter physical fact that must come with it.
+        await Promise.race([Promise.all([headersClosed.promise, upstreamTornDown.promise]), new Promise((_, reject) => {
+          deadline = setTimeout(() => reject(new Error(`EPUB cancellation did not abort the upstream header wait (readers=${liveReaders()}, tcpEnded=${headerWitness.socket.ended}, destroyed=${headerResponse.destroyed}, held=${JSON.stringify(headerWitness.held)}, socket=${JSON.stringify(headerWitness.socket)}, error=${headerWitness.error}, reads=${JSON.stringify(multipart.reads.slice(-4))})`)), 5000);
+        })]);
+      } finally { clearTimeout(deadline); }
+      assert.equal(headerWitness.socket.closed, true, 'the upstream connection must be torn down, not merely abandoned');
+      assert.equal(headerResponse.headersSent, false, 'cancellation must not invent upstream headers');
+      assert.equal(headerResponse.writableEnded, false, 'cancellation must not finish the upstream response');
+      // Reader contract: the lease has a TTL fallback. An inline release is
+      // valid when the invocation could still observe the disconnect signal;
+      // otherwise the lease drains by its own expiry. The test never deletes,
+      // backdates or rewrites a row, and EOF still releases inline.
+      const current = leaseRows().find((row) => row.reader_id === admitted.reader_id);
+      if (current) {
+        assert.equal(current.epoch, admitted.epoch, 'the cancelled reader lease must keep its own generation');
+        assert(Number(current.expires_at) >= Number(admitted.expires_at), 'the cancelled reader lease expiry must not be backdated or rewritten');
+      }
+      const expiry = Number(current?.expires_at ?? admitted.expires_at);
+      const drainBy = expiry * 1000 + 5000;
+      while (liveReaders() !== 0) {
+        assert(Date.now() < drainBy, `the cancelled reader lease must drain by its own expiry (${expiry}): the renewal must stop`);
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    } finally {
+      multipart.beforeReadHeaders = null;
+      upstreamHeld?.resolve();
+      heldRelease?.resolve();
+      upstreamHeld = null;
+      heldRelease = null;
+      headerResponse?.destroy();
+    }
+    console.log('PASS service-dispatch cancellation before upstream headers aborts the real fetch; the reader lease is released inline or drains by its own TTL');
+
     const upstreamClosed = Promise.withResolvers();
+    const upstreamPaused = Promise.withResolvers();
+    const stalledTornDown = Promise.withResolvers();
     let stalledResponse;
-    multipart.beforeReadBody = async (_req, res, _key, bytes) => {
+    const cancellationReads = { total: 0, animation: 0, bodies: 0, first: [], last: null, held: null, socket: { ended: false, closed: false }, error: null };
+    multipart.beforeReadBody = async (req, res, key, bytes, range, read) => {
+      cancellationReads.total++;
+      if (isAnimation(bytes)) cancellationReads.animation++;
+      const observed = { key, size: bytes.length, range };
+      if (cancellationReads.first.length < 4) cancellationReads.first.push(observed);
+      cancellationReads.last = observed;
       // Pass-through images may stream from their immutable pool object or a
       // stage. Pause the image body, not one storage implementation's path.
       if (!isAnimation(bytes)) return false;
+      // Header probes use small ranges. The body may use one full-image
+      // Range response while still consuming it in bounded stream chunks.
+      if (range && range.end - range.start + 1 <= 8 * 1024 * 1024) return false;
+      // Assembling the EPUB copies the animation once; the response body is
+      // the next full delivery of it. Count deliveries, not storage paths:
+      // the shared pool object, a private stage and a direct full-range read
+      // all carry the same bytes, and the copy must not stall the assembly.
+      cancellationReads.bodies++;
+      if (cancellationReads.bodies < 2) return false;
       assert.equal(stalledResponse, undefined, 'only the EPUB image stream may reach the cancellation gate');
       stalledResponse = res;
+      read.held = true;
+      // Name the delivery that is held: the pool object, the private stage
+      // or a direct full-range read all carry the same animation bytes.
+      cancellationReads.held = { key, url: req.url, range: req.headers.range ?? null, ifMatch: req.headers['if-match'] ?? null, at: Date.now() };
       res.once('close', () => upstreamClosed.resolve());
+      res.once('error', (error) => { cancellationReads.error = error.code ?? error.message; });
+      // Only the socket proves that the peer aborted the upstream request.
+      req.socket.once('end', () => { cancellationReads.socket.ended = true; });
+      req.socket.once('close', () => { cancellationReads.socket.closed = true; stalledTornDown.resolve(); });
       // Never send EOF: releasing admission by silently finishing the book
       // would not prove cancellation. The upstream request must be aborted.
-      res.write(bytes.subarray(0, 8 * 1024 * 1024));
+      const start = range?.start ?? 0;
+      const length = 8 * 1024 * 1024;
+      res.write(bytes.subarray(start, start + length));
+      upstreamPaused.resolve();
+      // Read-only witness: the caller cancels only once the upstream body is
+      // really held.
+      upstreamHeld?.resolve();
       await upstreamClosed.promise;
       return true;
     };
     try {
-      const cancelled = await fetch(`http://127.0.0.1:${port}/api/novels/${animationId}/download.epub`, {
-        headers: { Authorization: `Bearer ${token}`, Connection: 'close' }, signal: AbortSignal.timeout(15000),
-      });
-      assert.equal(cancelled.status, 200, 'completed streaming must release the memory reservation');
-      const cancelledReader = cancelled.body.getReader();
-      let cancelBytes = 0;
-      while (cancelBytes < 4 * 1024 * 1024) {
-        const { value, done } = await cancelledReader.read();
-        assert(!done, 'cancel must occur while the large image is still being delivered');
-        cancelBytes += value.length;
-      }
-      assert(stalledResponse, 'the upstream image must be paused before EOF');
-      assert(liveReaders() > 0, 'the paused HTTP body must retain novel admission as well as memory');
-      await cancelledReader.cancel();
+      const dispatchTarget = `http://${topology.writerName}/api/novels/${animationId}/download.epub`;
+      upstreamHeld = Promise.withResolvers();
+      heldRelease = Promise.withResolvers();
+      // The caller reads the real EPUB body and then cancels its own dispatch.
+      const caller = api(`/_fixture/dispatch-body?target=${encodeURIComponent(dispatchTarget)}`)
+        .then((result) => result.json())
+        .catch((error) => ({ name: error.name }));
       let deadline;
       try {
-        // Local cancel() is not an acknowledgement from the remote Worker.
-        await Promise.race([upstreamClosed.promise, new Promise((_, reject) => {
-          deadline = setTimeout(() => reject(new Error('EPUB cancellation did not abort the upstream body')), 5000);
+        await Promise.race([
+          upstreamPaused.promise,
+          new Promise((_, reject) => {
+            deadline = setTimeout(() => reject(new Error(`the EPUB image stream did not reach the cancellation gate (reads=${JSON.stringify(multipart.reads.slice(-6))})`)), 5000);
+          }),
+        ]);
+      } finally { clearTimeout(deadline); }
+      assert(stalledResponse, 'the upstream image must be paused before EOF');
+      assert(liveReaders() > 0, 'the paused HTTP body must retain novel admission as well as memory');
+      // Only now may the caller cancel its dispatch.
+      await fetch(`http://127.0.0.1:${s3Port}/_fixture/release-held`, { method: 'POST' });
+      let outcome;
+      try {
+        outcome = await Promise.race([
+          caller,
+          new Promise((_, reject) => {
+            deadline = setTimeout(() => reject(new Error(`the service-dispatch caller did not settle (reads=${JSON.stringify(multipart.reads.slice(-6))})`)), 5000);
+          }),
+        ]);
+      } finally { clearTimeout(deadline); }
+      assert.equal(outcome.status, 200, 'the dispatched EPUB must stream the real body (the cancelled dispatch released the memory reservation)');
+      assert(outcome.read >= 4 * 1024 * 1024, `the caller must read the real EPUB body before it cancels: ${JSON.stringify(outcome)}`);
+      assert.equal(outcome.name, 'AbortError', 'the cancelled dispatch body must reject with AbortError');
+      try {
+        // The Node response close stays the witness it always was; the socket
+        // teardown is the stricter physical fact that must come with it.
+        await Promise.race([Promise.all([upstreamClosed.promise, stalledTornDown.promise]), new Promise((_, reject) => {
+          deadline = setTimeout(() => reject(new Error(`EPUB cancellation did not abort the upstream body (readers=${liveReaders()}, held=${JSON.stringify(cancellationReads.held)}, socket=${JSON.stringify(cancellationReads.socket)}, error=${cancellationReads.error}, reads=${JSON.stringify(cancellationReads)})`)), 5000);
         })]);
       } finally { clearTimeout(deadline); }
+      assert.equal(cancellationReads.socket.closed, true, 'the upstream connection must be torn down, not merely abandoned');
       assert.equal(stalledResponse.writableEnded, false, 'cancellation must not drain the remaining image');
     } finally {
       multipart.beforeReadBody = null;
+      upstreamHeld?.resolve();
+      heldRelease?.resolve();
+      upstreamHeld = null;
+      heldRelease = null;
       stalledResponse?.destroy();
     }
     const afterCancel = await api(`/api/novels/${animationId}/download.epub`);
     assert.equal(afterCancel.status, 200, 'client cancellation must release the memory reservation');
-    await afterCancel.body.cancel();
+    // The dev bridge ignores a Node body cancel, so the fresh EPUB is consumed
+    // to EOF instead: that proves the recovery and leaves nothing running.
+    const afterImages = new Set();
+    const afterText = epubText(Buffer.from(await afterCancel.arrayBuffer()), (name, bytes) => {
+      if (isAnimation(bytes)) {
+        verifyPng(bytes, animation);
+        afterImages.add(name);
+      }
+    });
+    assert(afterText.includes('初回取得の本文です。'), 'the EPUB after a cancelled dispatch must still carry the body');
+    assert.equal(afterImages.size, 1, `the EPUB after a cancelled dispatch must still embed the animation: ${JSON.stringify([...afterImages])}`);
     sourceAnimation = null;
     const memory = await (await api('/_fixture/memory')).json();
     assert.equal(memory.instances, 1, 'the successful animation path must not recover from a Wasm trap');
     assert(memory.highWater < 96 * 1024 * 1024, `Wasm high-water must leave space for the JS heap: ${JSON.stringify(memory)}`);
     console.log(`Worker animation Wasm memory high-water: ${memory.highWater} bytes (JS heap excluded)`);
-    console.log('PASS large64-frame animation streams through multipart storage and EPUB with alpha/timing intact; EOF/cancel releases admission');
+    console.log('PASS large64-frame animation streams through multipart storage and EPUB with alpha/timing intact; service-dispatch cancel aborts the upstream');
 
     const color = [13, 37, 193, 127];
     const expectedPixels = createHash('sha256');
@@ -1176,10 +1456,11 @@ export default class extends Entry {
     assert.equal(after.attempts, cancelled.attempts);
     assert.deepEqual([...sourceRequests.entries()], received, 'canceled continuation cannot fetch another episode or TOC');
     assert.deepEqual([...imageRequests.entries()], images, 'canceled continuation cannot fetch another image');
-    assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), 1);
     await settleCreation(jobId);
     assert.equal(scalar(`SELECT checkpoint_json IS NULL FROM worker_jobs WHERE job_id=${quote(jobId)}`), 1,
       'only complete fenced cleanup may clear the durable reservation proof');
+    assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), 0,
+      'terminal creation cleanup must not retain an unpublished episode');
     console.log('PASS clearing after budget yield preserves the tombstone and original identity through full fenced cleanup');
 
     // The same namespace must now support a REAL fresh acquisition. Pause its
@@ -1386,6 +1667,8 @@ export default class extends Entry {
     await defaultLibrary(scenario.name, { required: true, ...(scenario.revokeExpired ? { entrypoint: wrapper } : {}) });
     await installDefaultSource();
     sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
+    const objectSnapshotSql = "SELECT object_key,size,encoding,crc32,hex(data) AS payload FROM objects ORDER BY object_key";
+    const unrelatedObjects = sql(objectSnapshotSql)[0].results;
     sourceEpisodeCount = scenario.episodes;
     sourceImageCount = scenario.images || 0;
     sourceRequests.clear(); imageRequests.clear();
@@ -1405,14 +1688,29 @@ export default class extends Entry {
       assert(accepted.success, JSON.stringify(accepted));
       const jobId = accepted.results[0].job_id;
       await Promise.race([entered.promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`source gate timed out: ${scenario.name}`)), 30000).unref())]);
+      const earlyRow = sql(`SELECT checkpoint_json,status,execution_token FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
       if (scenario.pauseToc) {
-        const early = JSON.parse(scalar(`SELECT checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`));
-        assert(Array.isArray(early.creation_reservation) && early.creation_reservation.length === 2, 'the allocator must durably associate its exact ID/generation with the live job BEFORE the first TOC response');
-        assert.equal(early.write_origin, null, 'a numeric-only pre-TOC claim must not fabricate a namespace epoch');
+        // The first /smoke-novel/ request is the unowned URL-resolution probe:
+        // canonical admission only allocates the durable reservation after that
+        // probe resolves the target, so nothing may be claimed or published
+        // while the probe is still outstanding.
+        assert.equal(earlyRow.status, 'running');
+        assert(earlyRow.execution_token, 'the live execution must own its claim before any admission');
+        assert.equal(earlyRow.checkpoint_json, null, 'a pre-allocation resolution probe must not be answered with a durable claim already attached');
+        assert.equal(scalar('SELECT COUNT(*) FROM novels'), 0);
+        assert.equal(scalar('SELECT COUNT(*) FROM content_objects'), 0, 'a pre-allocation probe cannot publish canonical body bytes');
+      } else {
+        // Every other pause point is an owned upstream fetch: the exact
+        // numeric reservation and writer origin must already be durable or a
+        // lost execution would leak an unclaimed ID or stale producer epoch.
+        assert.equal(earlyRow.status, 'running');
+        assert(earlyRow.execution_token, 'the live execution must own its claim');
+        const early = JSON.parse(earlyRow.checkpoint_json);
+        assert(Array.isArray(early.creation_reservation) && early.creation_reservation.length === 2 && early.creation_reservation.every(Number.isSafeInteger), 'the allocator must durably associate its exact ID/generation with the live job BEFORE the first owned upstream fetch');
+        assert(early.write_origin && typeof early.write_origin.prefix === 'string' && Number.isSafeInteger(early.write_origin.epoch), 'the original namespace epoch must be durable before the first owned upstream fetch');
         assert.equal(early.phase, 'planned');
         assert.equal(early.next_section_index, null);
-        assert.equal(scalar('SELECT COUNT(*) FROM novels'), 0);
-        assert.equal(scalar('SELECT COUNT(*) FROM content_objects'), 0, 'pre-prefix ownership cannot publish canonical body bytes');
+        assert.equal(scalar(`SELECT COUNT(*) FROM novel_id_reservations WHERE job_id=${quote(jobId)} AND available=0 AND id=${early.creation_reservation[0]} AND generation=${early.creation_reservation[1]}`), 1, 'the exact reserved ID/generation must be owned by this live job');
       }
       if (scenario.clearAll) {
         const waiting = await (await api('/api/download', { targets: [target], force: true })).json();
@@ -1429,7 +1727,10 @@ export default class extends Entry {
         const held = sql(`SELECT status,execution_token,checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
         assert.equal(held.status, 'permanent');
         assert(held.execution_token, 'logical cancellation must not pretend the held physical fetch has stopped');
-        const origin = JSON.parse(held.checkpoint_json).write_origin;
+        assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), 1,
+          'ordinary cancellation retains the body committed before the held image; explicit revocation may drain it');
+        const checkpoint = JSON.parse(held.checkpoint_json);
+        const origin = checkpoint.write_origin;
         assert(origin, 'the exact original epoch must remain durable until atomic revocation');
         sql(`UPDATE worker_jobs SET lease_until='2000-01-01T00:00:00.000000000Z' WHERE job_id=${quote(jobId)} AND execution_token=${quote(held.execution_token)}`);
         // The source response is STILL awaiting release.promise. Expiry is a
@@ -1438,11 +1739,44 @@ export default class extends Entry {
         assert(revoked.success, JSON.stringify(revoked));
         const settled = sql(`SELECT execution_token,checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
         assert.equal(settled.execution_token, null);
-        assert(settled.checkpoint_json, 'revocation must retain the exact claim until closed-owner cleanup and final release finish');
-        const epoch = scalar(`SELECT epoch FROM novel_access_gates WHERE prefix=${quote(origin.prefix.replace(/\/$/, ''))}`);
-        assert(epoch > origin.epoch, 'the old producer must be fenced while its real HTTP fetch is still alive');
-        assert.equal(scalar(`SELECT closed FROM novel_access_gates WHERE prefix=${quote(origin.prefix.replace(/\/$/, ''))}`), 1, 'revocation keeps the namespace CLOSED until cleanup; it must not bump and reopen early');
+        if (settled.checkpoint_json !== null) {
+          const pending = JSON.parse(settled.checkpoint_json);
+          assert.deepEqual(pending.creation_reservation, checkpoint.creation_reservation, 'bounded cleanup retains the original numeric generation');
+          assert.deepEqual(pending.write_origin, origin, 'bounded cleanup must not reauthenticate a revoked producer');
+        }
+        const prefix = origin.prefix.replace(/\/$/, '');
+        const gate = sql(`SELECT epoch,closed,owner,origin_url_fold FROM novel_access_gates WHERE prefix=${quote(prefix)}`)[0].results[0];
+        assert.equal(gate.epoch, origin.epoch + 1, 'the fenced producer is superseded by exactly one epoch while its real HTTP fetch is still alive');
+        if (gate.closed === 1) {
+          assert(settled.checkpoint_json, 'an unfinished drain must retain durable reservation proof');
+          assert(gate.owner, 'a closed namespace must retain its removal owner');
+          const [id, generation] = checkpoint.creation_reservation;
+          assert.equal(scalar(`SELECT COUNT(*) FROM novel_id_reservations WHERE id=${id} AND generation=${generation} AND available=0 AND job_id=${quote(jobId)}`), 1,
+            'the numeric identity cannot be released before its closed namespace is drained');
+        } else {
+          assert.equal(gate.closed, 0);
+          assert.equal(gate.owner, null, 'only a completed namespace drain may reopen admission');
+          assert.equal(gate.origin_url_fold ?? '', '', 'reopened empty namespaces must clear their old origin');
+          assert.equal(scalar("SELECT COUNT(*) FROM content_objects"), 0, 'reopened admission requires all unpublished canonical bytes to be drained');
+          assert.deepEqual(sql(objectSnapshotSql)[0].results, unrelatedObjects, 'a completed drain preserves unrelated site definitions');
+        }
+        if (settled.checkpoint_json === null) {
+          assert.equal(gate.closed, 0, 'checkpoint release cannot precede reopening the drained namespace');
+          assert.equal(scalar("SELECT COUNT(*) FROM novel_namespace_claims"), 0);
+          assert.equal(scalar("SELECT COUNT(*) FROM novel_id_reservations WHERE available=0"), 0);
+        }
         assert.equal(imageRequests.get('/smoke-image/0.png'), 1);
+      }
+      // Only bytes committed before the cancellation tombstone are retained:
+      // the held response lands after the tombstone, so a still-paused section
+      // body was never durably accepted, while a body committed before the
+      // pause survives until fenced terminal cleanup drains the namespace.
+      // Explicit revocation can make bounded cleanup progress while the
+      // source is still held; ordinary cancellation must retain prior commits.
+      if (!scenario.revokeExpired) {
+        assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"),
+          scenario.images ? 1 : 0,
+          'pre-cancellation commits are retained through cancellation; bytes still in flight are never durably accepted');
       }
       release.resolve();
       if (revocationWitness) await bounded(revocationWitness.completed.promise, 'revoked physical delivery settlement');
@@ -1461,7 +1795,6 @@ export default class extends Entry {
       assert.equal(sourceRequests.get('/smoke-novel/2/') || 0, 0, 'cancellation must stop subsequent episodes');
       assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='convert'"), 0, 'a canceled acquisition must not enqueue a new conversion');
       assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE status IN ('pending','running','retryable')"), 0, 'bulk clearing must not wake the former waiting queue');
-      assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), scenario.pauseToc ? 0 : 1, 'received bytes are retained; a pre-TOC cancellation must not invent body data');
       const queueStatus = await (await api('/api/queue/status')).json();
       assert.equal(queueStatus.failed, 0, 'intentional interruption and cleared waiting work must not appear as failures');
       assert.equal(queueStatus.cancelled, 1, 'the stopped running execution must be counted as canceled');
@@ -1473,12 +1806,25 @@ export default class extends Entry {
       }
       if (scenario.images && !scenario.revokeExpired) {
         assert.deepEqual([...imageRequests.keys()], ['/smoke-image/0.png'], 'cancellation must stop subsequent images');
-        const index = sql("SELECT encoding,hex(data) payload FROM objects WHERE object_key LIKE '%/.illustration_cache.yaml'")[0].results[0];
-        const bytes = Buffer.from(index.payload, 'hex');
-        const text = (index.encoding === 'brotli' ? brotliDecompressSync(bytes) : bytes).toString();
-        assert(text.includes('/smoke-image/0.png'), 'cancellation must retain the already saved image mapping');
+        assert.equal(scalar("SELECT COUNT(*) FROM objects WHERE object_key LIKE '%/.illustration_cache.yaml'"), 0,
+          'an image still in flight at cancellation is never durably committed, so no saved mapping can exist');
       }
       await settleCreation(jobId);
+      // Full fenced cleanup leaves nothing behind for an unpublished creation:
+      // no owned numeric reservation, namespace claim, publication receipt,
+      // durable checkpoint, record, or stored object survives settlement.
+      assert.equal(scalar("SELECT COUNT(*) FROM novel_id_reservations WHERE available=0"), 0,
+        'settlement must release the owned numeric ID');
+      assert.equal(scalar("SELECT COUNT(*) FROM novel_namespace_claims"), 0,
+        'settlement must release the namespace claim');
+      assert.equal(scalar("SELECT COUNT(*) FROM novel_creation_receipts"), 0,
+        'settlement must release the publication receipt');
+      assert.equal(scalar("SELECT COUNT(*) FROM novels"), 0,
+        'an unpublished creation must not leave a record');
+      assert.equal(scalar("SELECT COUNT(*) FROM content_objects"), 0,
+        'settlement drains every unpublished canonical object');
+      assert.deepEqual(sql(objectSnapshotSql)[0].results, unrelatedObjects,
+        'settlement removes creation-owned objects but preserves the saved site definition and other unrelated data');
       console.log(`PASS ${scenario.name}: durable cancellation, no later fetches or follow-up conversion, full fenced reservation cleanup`);
     } finally {
       sourcePause = null;

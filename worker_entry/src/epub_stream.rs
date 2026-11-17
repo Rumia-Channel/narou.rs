@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
 use narou_rs::application::convert::ConvertedText;
 use narou_rs::application::novel_access::{NovelAccess, NovelReadLease, NovelReadScope};
@@ -17,6 +17,59 @@ use crate::{epub_download_filename, epub_image_key, load_global_settings_map, lo
 
 const CHUNK: usize = 64 * 1024;
 const MAX_IMAGES: usize = 512;
+
+/// The client's disconnect reaches the Worker only through the request's own
+/// abort signal. One listener settles one promise; the pending upstream read
+/// waits for it, so a cancelled consumer ends the response and aborts the
+/// upstream request instead of draining a body nobody will read.
+struct DisconnectSignal {
+    signal: worker::web_sys::AbortSignal,
+    listener: js_sys::Function,
+    future: futures::future::Shared<wasm_bindgen_futures::JsFuture>,
+}
+
+impl Drop for DisconnectSignal {
+    fn drop(&mut self) {
+        let _ = self.signal.remove_event_listener_with_callback("abort", &self.listener);
+    }
+}
+
+fn disconnect_signal(req: &Request) -> Result<DisconnectSignal> {
+    let signal = req.inner().signal();
+    let mut listener = None;
+    let aborted = js_sys::Promise::new(&mut |resolve, _reject| {
+        listener = Some(resolve);
+    });
+    let listener = listener.expect("Promise executor runs synchronously");
+    signal.add_event_listener_with_callback("abort", &listener)?;
+    if signal.aborted() {
+        listener.call0(&wasm_bindgen::JsValue::UNDEFINED)?;
+    }
+    Ok(DisconnectSignal { signal, listener, future: wasm_bindgen_futures::JsFuture::from(aborted).shared() })
+}
+
+/// One upstream chunk. A disconnected client ends the response instead of
+/// waiting for a body nobody will read: dropping the pending read aborts the
+/// upstream request, and the response never drains it to EOF.
+async fn next_upstream(
+    aborted: &mut DisconnectSignal,
+    stream: &mut AssetStream,
+) -> Result<Option<Result<Vec<u8>, narou_rs::error::NarouError>>> {
+    let mut read = stream.next();
+    let outcome = futures::future::poll_fn(|cx| {
+        if std::pin::Pin::new(&mut aborted.future).poll(cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        match std::pin::Pin::new(&mut read).poll(cx) {
+            std::task::Poll::Ready(chunk) => std::task::Poll::Ready(Some(chunk)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }).await;
+    match outcome {
+        Some(chunk) => Ok(chunk),
+        None => Err(stream_error("EPUB client disconnected")),
+    }
+}
 
 /// EPUB を生成して返す (認証は呼び出し側)。
 pub(crate) async fn build_epub_response(
@@ -44,7 +97,10 @@ pub(crate) async fn build_epub_with_services(
     virtual_only: bool,
 ) -> Result<Response> {
     let mut scope = NovelReadScope::new(&services.objects, "epub-response");
-    let result = async {
+    let mut disconnect = if req.method() == Method::Head { None } else { Some(disconnect_signal(req)?) };
+    let aborted = disconnect.as_ref().map(|signal| signal.future.clone());
+    let result = {
+    let preparation = async {
     let record = match services.app.content.read_record(&mut scope, narou_rs::platform::NovelId(id)).await {
         Ok(Some(record)) => record,
         Ok(None) => return Response::error("Not Found", 404),
@@ -171,6 +227,9 @@ pub(crate) async fn build_epub_with_services(
             images: image_assets, active: None, cleanup,
             permit: Some(permit), context: narou_rs::application::messages::MessageContext::new(push_sink.clone(), debug),
             messages: push_sink.clone(),
+            // The client's disconnect ends the response and aborts the pending
+            // upstream read; it never drains the remaining body to EOF.
+            disconnect: disconnect.take().expect("GET builds an EPUB body"),
         };
         let stream = futures::stream::unfold(state, |mut state| async move {
             let context = state.context.clone();
@@ -195,7 +254,18 @@ pub(crate) async fn build_epub_with_services(
             .with_header("Content-Disposition", &sanitize_content_disposition(&filename))?
             .from_stream(stream)
     })).await
-    }.await;
+    };
+    futures::pin_mut!(preparation);
+    match aborted {
+        Some(aborted) => match futures::future::select(preparation, aborted).await {
+            futures::future::Either::Left((result, _)) => result,
+            // Leaving this block drops the preparation future and every
+            // pending fetch before the original reader scope is released.
+            futures::future::Either::Right(_) => Err(stream_error("EPUB client disconnected")),
+        },
+        None => preparation.await,
+    }
+    };
     crate::webui::leased_response(result, scope).await
 }
 
@@ -309,6 +379,8 @@ struct EpubStreamState {
     permit: Option<crate::memory_budget::MemoryPermit>,
     context: narou_rs::application::messages::MessageContext,
     messages: Arc<crate::push_hub::PushHubSink>,
+    /// The client's disconnect, awaited by every pending upstream read.
+    disconnect: DisconnectSignal,
 }
 impl EpubStreamState {
     async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
@@ -329,7 +401,10 @@ impl EpubStreamState {
                         continue;
                     }
                     EntryInput::Stream { stream, remaining, hash, expected } => {
-                        match stream.next().await {
+                        // A pending upstream read never outlives the client:
+                        // the disconnect drops the read, which aborts the
+                        // upstream request instead of draining it to EOF.
+                        match next_upstream(&mut self.disconnect, stream).await? {
                             Some(bytes) => {
                                 let bytes = bytes.map_err(stream_error)?;
                                 if bytes.len() > CHUNK || bytes.len() as u64 > *remaining {
@@ -389,8 +464,9 @@ impl EpubStreamState {
         let mut bytes = Vec::with_capacity(length);
         while bytes.len() < length {
             if self.fragment_offset == self.fragment_pending.len() {
-                let chunk = self.fragment_stream.as_mut().ok_or_else(|| stream_error("EPUB fragments ended early"))?
-                    .next().await.ok_or_else(|| stream_error("truncated EPUB fragment"))?.map_err(stream_error)?;
+                let stream = self.fragment_stream.as_mut().ok_or_else(|| stream_error("EPUB fragments ended early"))?;
+                let chunk = next_upstream(&mut self.disconnect, stream).await?
+                    .ok_or_else(|| stream_error("truncated EPUB fragment"))?.map_err(stream_error)?;
                 if chunk.len() > CHUNK || self.fragment_bytes + chunk.len() as u64 > self.fragments.size {
                     return Err(stream_error("invalid EPUB fragment stream length"));
                 }
@@ -409,7 +485,7 @@ impl EpubStreamState {
         if self.fragment_bytes == self.fragments.size && !self.fragments_finished {
             if self.fragment_offset != self.fragment_pending.len() { return Err(stream_error("extra EPUB fragment bytes")); }
             let mut stream = self.fragment_stream.take().ok_or_else(|| stream_error("EPUB fragment stream missing"))?;
-            while let Some(chunk) = stream.next().await {
+            while let Some(chunk) = next_upstream(&mut self.disconnect, &mut stream).await? {
                 if !chunk.map_err(stream_error)?.is_empty() { return Err(stream_error("extra EPUB fragment bytes")); }
             }
             self.fragment_pending.clear();

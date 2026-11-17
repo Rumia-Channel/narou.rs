@@ -1870,16 +1870,16 @@ impl Downloader {
         // writer-dependent read; a mid-download replacement must not be
         // blessed by this guard and an abort must leave both ACKs persisted.
         let mut reacked = false;
-        if let Some(record) = existing_record.as_ref() {
-            if let Some(write) = options.access.as_ref() {
-                let record_keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
-                    .map_err(|error| NarouError::Platform(error.to_string()))?;
-                if write.prefix() != &crate::platform::ObjectPrefix::from(record_keys.prefix().clone()) {
-                    return Err(NarouError::Platform("download writer belongs to another novel".into()));
-                }
-                checkpoint_download_access(&mut budget, &write.origin(), creation.as_deref_mut()).await?;
-                reacked = true;
+        if let Some(record) = existing_record.as_ref()
+            && let Some(write) = options.access.as_ref()
+        {
+            let record_keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+                .map_err(|error| NarouError::Platform(error.to_string()))?;
+            if write.prefix() != &crate::platform::ObjectPrefix::from(record_keys.prefix().clone()) {
+                return Err(NarouError::Platform("download writer belongs to another novel".into()));
             }
+            checkpoint_download_access(&mut budget, &write.origin(), creation.as_deref_mut()).await?;
+            reacked = true;
         }
         #[cfg(feature = "native-runtime")]
         let title_ini = if let Some(record) = existing_record.as_ref() {

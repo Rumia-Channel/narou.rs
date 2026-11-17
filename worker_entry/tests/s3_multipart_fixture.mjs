@@ -7,6 +7,18 @@ const unxml = (value) => value.replaceAll('&quot;', '"').replaceAll('&apos;', "'
 const md5 = (value) => createHash('md5').update(value).digest('hex');
 const etag = (value) => `"${md5(value)}"`;
 
+// The byte span one read actually delivers. A read without a Range header
+// takes the whole object; a ranged read takes the clamped window. The
+// cancellation gates use it to tell a full delivery from a metadata probe.
+const rangeSpan = (value, size) => {
+  if (value === undefined) return size;
+  const match = /^bytes=(\d+)-(\d*)$/.exec(value);
+  if (!match) return 0;
+  const start = Number(match[1]);
+  const end = match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
+  return end - start + 1;
+};
+
 export function createS3MultipartFixture({ objects, failPut = () => false, maxPartBytes = 8 * 1024 * 1024 }) {
   let nextId = 1;
   const state = {
@@ -16,12 +28,18 @@ export function createS3MultipartFixture({ objects, failPut = () => false, maxPa
     aborted: [],
     partRequests: [],
     rangeRequests: [],
+    // Every object read this fixture served, in arrival order. A gate that
+    // holds one read must be able to name it exactly and to prove that no
+    // other delivery of the same bytes was still open, so the wire shape of
+    // each read (method, key, Range, precondition, span, lifetime) is kept.
+    reads: [],
     activeParts: 0,
     maxActiveParts: 0,
     failComplete: false,
     ignoreRange: false,
     beforePart: null,
     beforeReadBody: null,
+    beforeReadHeaders: null,
     checkConditions(req, res, key) {
       const exists = objects.has(key);
       const tag = exists ? state.etags.get(key) ?? etag(objects.get(key)) : undefined;
@@ -181,10 +199,29 @@ export function createS3MultipartFixture({ objects, failPut = () => false, maxPa
         const bytes = objects.get(key);
         const tag = state.etags.get(key) ?? etag(bytes);
         if (req.headers['if-match'] && req.headers['if-match'] !== tag) return error(412, 'PreconditionFailed');
+        const read = {
+          method: req.method,
+          key,
+          range: req.headers.range ?? null,
+          ifMatch: req.headers['if-match'] ?? null,
+          span: rangeSpan(req.headers.range, bytes.length),
+          at: Date.now(),
+          closedAt: null,
+          held: false,
+          done: false,
+        };
+        state.reads.push(read);
+        // The read is finished once its response is gone: either it completed
+        // or the peer tore the connection down.
+        res.once('close', () => { read.done = true; read.closedAt = Date.now(); });
+        if (req.method === 'GET' && state.beforeReadHeaders) {
+          read.held = await state.beforeReadHeaders(req, res, key, bytes, read);
+          if (read.held) return true;
+        }
         res.setHeader('etag', tag);
         if (!req.headers.range || req.method === 'HEAD') {
           res.writeHead(200, { 'content-length': bytes.length });
-          if (req.method === 'GET' && state.beforeReadBody && await state.beforeReadBody(req, res, key, bytes)) return true;
+          if (req.method === 'GET' && state.beforeReadBody && await state.beforeReadBody(req, res, key, bytes, undefined, read)) return true;
           res.end(req.method === 'HEAD' ? undefined : bytes);
           return true;
         }
@@ -202,6 +239,7 @@ export function createS3MultipartFixture({ objects, failPut = () => false, maxPa
           res.end(bytes);
         } else {
           res.writeHead(206, { 'content-range': `bytes ${start}-${end}/${bytes.length}`, 'content-length': end - start + 1 });
+          if (state.beforeReadBody && await state.beforeReadBody(req, res, key, bytes, { start, end }, read)) return true;
           res.end(bytes.subarray(start, end + 1));
         }
         return true;

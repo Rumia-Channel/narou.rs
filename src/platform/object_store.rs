@@ -263,6 +263,12 @@ pub enum ObjectFingerprintMismatch<'a> {
     Changed(&'a ObjectKey),
 }
 
+/// Caller-owned byte reads used when a fingerprint has no immutable digest.
+/// Verification must retain the caller's original admission and lease.
+pub trait ObjectFingerprintReader: PlatformService {
+    fn read_small<'a>(&'a mut self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>>;
+}
+
 /// Blob store for bounded control objects.
 ///
 /// `read_small`/`write_small` deliberately make the buffering contract
@@ -321,16 +327,18 @@ pub trait ObjectStore: PlatformService {
 
     /// Recheck consumed content in input order, without retaining its bodies.
     ///
-    /// Mutable stores re-read bytes by default. An adapter may instead compare
-    /// fresh authoritative digests of immutable, checksum-verified payloads.
+    /// Mutable stores re-read through the caller's admitted reader. An adapter
+    /// may instead compare fresh authoritative digests of immutable,
+    /// checksum-verified payloads, forwarding this reader for every fallback.
     /// Cached digests, timestamps and opaque ETags are not sufficient.
-    fn verify_fingerprints<'a>(
+    fn verify_fingerprints<'a, 'input: 'a>(
         &'a self,
-        fingerprints: &'a [ObjectFingerprint],
-    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'a>>>> {
+        fingerprints: &'input [ObjectFingerprint],
+        reader: &'a mut dyn ObjectFingerprintReader,
+    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'input>>>> {
         Box::pin(async move {
             for fingerprint in fingerprints {
-                let Some(bytes) = self.read_small(&fingerprint.key).await? else {
+                let Some(bytes) = reader.read_small(&fingerprint.key).await? else {
                     return Ok(Some(ObjectFingerprintMismatch::Missing(&fingerprint.key)));
                 };
                 if <[u8; 32]>::from(Sha256::digest(&bytes)) != fingerprint.sha256 {

@@ -226,6 +226,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 保存済みログイン Cookie は、最初の目次だけでなく後続の目次ページ・本文（強い更新の事前取得を含む）の認証要求でも試す。通常の公開作品には送らず、認証回復時にだけ候補を読み込む。各候補はサイト設定の Cookie を起点にし、前のアカウントの Cookie を混ぜない。目次は候補ごとに最初から再評価し、途中のログイン壁を正常な短い一覧として保存しない。採用したログインは残りの本文にも使い、`requires_login` / `login_session` を次回へ保存する。部分一覧では従来どおり欠けの解消・話数増加を確認してから採用する。`update` も同じ経路を通る。
 - `202 + x-amzn-waf-action: challenge` と `405 + x-amzn-waf-action: captcha` は `Login` として報告する。Native の通信手段切替で別の応答に上書きせず、Worker の socket / relay 経路でも判定情報を保持する。HTML のログイン壁はサイト定義の `login_wall_error: login` で凍結しない認証エラーにできる（未指定の `not_found` は従来互換）。通常の 202 / 403 / 405 はこの特例に含めない。CAPTCHA はブラウザで利用者が解く必要がある。
 - リダイレクトでサイト定義が変わった場合は、転送先の定義にある同意 Cookie と転送先の保存ログインだけを使い、元サイトの Cookie・セッション ID・ログイン要否を引き継がない。同一サイト内の転送では選択済みログインを維持する。
+- サイト定義が応答 Cookie の利用を有効にしている場合、新規取得の URL 確認で受け取った Cookie を、同じ取得文脈の前処理フォームへ引き継ぐ。元の応答本文だけを再利用して CSRF Cookie を失わない。別サイトへのリダイレクト時の資格情報制限は変更しない。
+- 転送と同時に取得・更新する場合は、最初に取得した作品 ID・保存先・writer epochを途中で差し替えない。未解決のURLは最初のadmission前だけcanonical URLの既存作品を選べる。取得中に別作品が登録された場合や、予約済みの新規取得が別作品へredirectした場合は競合として停止し、既存本文を上書きしない。通常の更新・強更新では新規作品のID予約を作らない。
 - Workers は年齢認証を対話で確認できない。成人向け作品の取得を許可する場合は Web UI の「環境設定 → Global」で `over18=true` を保存する。`false` は明示的な拒否であり、設定変更で既に `blocked` になったジョブを自動再開はしない
 - 話ごとの進捗行・章/節の見出し・ログイン再試行・「小説が削除されているか非公開な可能性があります」などのレポート行は、コンソールと同時に `logging` のログファイルへも出力する。narou.rb は `$stdout` への write をすべて `append_log` するため、ログに残らない行があってはならない。並列ドメインワーカー間の行混線は sink 内の排他 (`STDOUT_LOCK`) で防ぐ。原因は `src/logger.rs` が bin と lib の両方にコンパイルされて `LoggerState` が 2 つ存在し、`logger::init()` が bin 側しか初期化していなかったこと。`MessageSink` (`progress::console_sink`) 経由の行は未初期化の lib 側ロガーへ書かれていた。bin は lib のロガーを共有する (2026-10 修正、issue #36)
 - 大きな挿絵・アニメーション ZIP は有界チャンクで非公開 stage へ保存し、APNG を 1 フレームずつ生成する。完成 APNG を全量保持せず、保存・長さ・ハッシュの検証後に挿絵索引へ公開する。画素・透過・フレーム・表示時間を省略せず、失敗した途中出力を取得済みとして残さない。
@@ -407,11 +409,13 @@ narou author remove 1
 - 通信要求はフレームを含め 8 MiB / 100 レコード以下に分割する。作品全体・全 ZIP の展開サイズに旧来の 512 MiB 一律上限は置かず、manifest・索引・メタデータの制御上限と有界バッファを別に管理する。
 - Web の既定 `runtime` は raw・履歴・確認済みの派生物を snapshot・本文通信の前に除外し、本文・目次・設定・挿絵・未知の利用者ファイルを保持する。catalog の除外件数・用途は開始前に表示する。`complete` は保存先が対応する保守データも対象にし、Worker は raw を新規保存しない。
 - Web は `/api/transfer/v2` の session / チャンク API へ切り替え中。session と操作の永続 ACK で再送・再開を扱い、公開済み作品をキャンセルで巻き戻さず、未公開分を回収する。既存の Web 認証ミドルウェア配下で動作する。
+- 一時停止・再開・破棄は同じ操作IDで永続receiptを再送できる。確定したrevision競合だけを再照合し、423や通信断では元のfingerprintを維持する。試行上限後も未確定操作を保持し、未完了を成功表示しない。DELETEの操作IDはqueryまたは専用ヘッダで渡す。
+- NativeでSQLiteを選択済みなのに管理DBを開けない場合、転送capabilitiesはSQLiteのまま利用不可と理由を返し、永続変更を拒否する。転送を黙ってYAML管理へ切り替えない。
 - Web v2 の終端回収は元の owner / epoch で stage を abort してから進め、24時間の lease 期限を待ち続けない。仮想小説のメンバーは、保存済みの投影内 URL 索引で解決し、消失・所属競合は公開前の plan 競合として扱う。
 - 上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。CLI の既存取り込みでの `sqlite.mirror-files=false` の制限と、Web v2 の参照公開は別経路として確認する。詳細は `WEBUI.md` §6.1b。
 - ブラウザ保存は File System Access または Service Worker の pull 型ストリームを使い、全量 `Blob` 化へフォールバックしない。FSA の picker はクリック中、SW の開始は最初の ZIP byte まで遅らせる。保存先の書き込みを待って次のチャンクを受け取り、中継の状態消失・明示的な完了通知前の切断・キャンセルを成功扱いしない。
 - 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が生成・検証・取り込み計画を共有する。
-- **Web の完了判定**: 別ブランチで統合検証中。Firefox と実 workerd/D1 の17 MiB取り込み・同一sessionからの保存し直し・独立ZIP readerによるSHA照合、10 MiB制限gatewayでの8 MiB以下の本文通信は確認した。Native保存方式別・100 MB超・4 GiB超の実ブラウザ・Chromium FSA・Worker予算等の受入条件は未完了。サマリの `export` / `import` の完了は CLI を指す。詳細は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) §16.1。公開済み v0.6.6 のサーバー ZIP 経路の修正が配布済みという意味ではない。
+- **Web の完了判定**: 元ブランチの実Firefox大容量往復・Chromium FSA・隔離provider・workerd/D1の観測範囲は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) §16.1、統合ツリーの確認は §16.2 を参照。対象別の成功を全suite一括成功や全providerでの受入完了とは扱わない。サマリの `export` / `import` の完了はCLIを指し、Web全体やHTTP 413の解消・公開済みを意味しない。
 - **書式 (ZIP の中身) の詳細は [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md)** を参照 (`manifest.json` のスキーマ・検証ルール・衝突規則・同梱するファイル・挿絵の扱い)。
 
 ### 3.x-hidden `hidden` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
@@ -813,7 +817,7 @@ narou setting name         # 読み取り
 | `--merge-from ID` | — | int | — | (P4b) 指定バージョンを作業セットへマージ |
 | `--merge-sections LIST` | — | str | — | (P4b) `--merge-from` の対象話制限 (カンマ区切り) |
 
-> P4b オプションは SQLite バックエンド有効時のみ動作する。履歴は convert 実行時に自動スナップショットされ、保持数は将来 `diff.history-limit` で制御予定。`--restore` / `--merge-from` はリレーショナル作業セットに加えて ObjectStore の TOC・本文を更新し、古い話のキーを削除する。ファイル出力はミラー設定に従う。`--clean` は差分キャッシュに加えて SQLite バージョン履歴も全削除する。
+> P4b オプションは SQLite バックエンド有効時のみ動作する。履歴は convert 実行時に自動スナップショットされ、保持数は将来 `diff.history-limit` で制御予定。`--restore` / `--merge-from` はリレーショナル作業セットに加えて ObjectStore の TOC・本文を更新し、古い話のキーを削除する。ファイル出力はミラー設定に従う。`--clean` は差分キャッシュに加えて SQLite バージョン履歴も全削除する。実ファイル側に残る旧形式の空の履歴ディレクトリも、同じ作品の書き込み排他内で除去する。通常ファイルや別作品へ抜けるパスは消さない。
 | target | | string | — | 小説指定 (省略時=最終更新) |
 
 **実装状況**:
@@ -894,6 +898,9 @@ narou setting name         # 読み取り
 **実装済み動作**:
 - `--port` 未指定時は Ruby版同様 global `server-port` を使い、未設定ならランダムポートを採番して保存する
 - Native の起動時の話数補完は作品情報をまとめて読み、作品ごとに同じ YAML 全体を再解析しない。補完の書込みは従来どおり作品単位の元の書込み権限を検証する。
+- Native の一覧・バックアップ等の reader は共有 namespace ロックと gate 更新の直列化を使い、読み取り同士の一時的な競合を423として返さない。公開・削除との排他、閉鎖済み gate と失効 epoch の拒否は維持する。Windows のロックはハンドル破棄前に明示解放する。
+- Native の転送・削除回復は atomic write 用の内部一時ファイルを確定 gate として列挙しない。作品内の同じ接頭辞の利用者ファイルは保持し、壊れた確定 gate の拒否は維持する。
+- Workers の EPUB 配信は元の要求の切断通知を準備処理・上流ヘッダ待ち・本文ストリームへ伝え、上流 fetch の中止後にメモリ枠を解放する。reader は通常終了時に解放し、中断で後片付けできない場合は元の30秒リースで自然失効する。ローカル契約は実service bindingの取消で検証し、dev TCP bridgeの切断を通知受信の証拠としない。
 - global `server-bind` を読み、未設定時は `127.0.0.1` に bind する（`localhost` は `127.0.0.1` 扱い）
 - WebSocket サーバは HTTP と別に `server-port + 1` で起動する
 - 初回起動時は Ruby版同様にファイアウォール許可と停止方法の案内を表示し、`server_setting.yaml` に起動済みフラグを保存する

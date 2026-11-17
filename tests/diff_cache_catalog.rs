@@ -127,7 +127,13 @@ fn cli_clean_and_all_clean_remove_db_only_objects_and_legacy_empty_directories()
             store.write_small(&keys.cached_section("v2", "1", "old"), b"cached body".to_vec()).await.unwrap();
         });
         let empty_dir = root.join("小説データ/site/title/本文/.cache/legacy-empty");
-        std::fs::create_dir_all(&empty_dir).unwrap();
+        // A deeper empty descendant goes with its empty parents.
+        let nested_empty = empty_dir.join("nested/deeper");
+        std::fs::create_dir_all(&nested_empty).unwrap();
+        // History deletion must not touch unrelated user data.
+        let kept_dir = root.join("小説データ/site/title/notes");
+        std::fs::create_dir_all(&kept_dir).unwrap();
+        std::fs::write(kept_dir.join("keep.txt"), b"real file").unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_narou_rs"))
             .args(args)
             .current_dir(root)
@@ -138,8 +144,12 @@ fn cli_clean_and_all_clean_remove_db_only_objects_and_legacy_empty_directories()
             .output().unwrap();
         assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
         assert!(!empty_dir.exists(), "legacy empty versions must be removed by native I/O");
+        assert!(!nested_empty.exists(), "empty descendants must be removed with their empty parents");
+        assert_eq!(std::fs::read(kept_dir.join("keep.txt")).unwrap(), b"real file", "history cleanup must preserve unrelated user data");
         futures::executor::block_on(async {
             assert!(plan_diff_cache_clean(&store, keys.prefix()).await.unwrap().is_empty());
+            let kept_key = ObjectKey::try_new(format!("{}/notes/keep.txt", keys.prefix())).unwrap();
+            assert_eq!(store.read_small(&kept_key).await.unwrap().unwrap(), b"real file");
             assert!(store.read_small(&keys.toc()).await.unwrap().is_some());
             assert_eq!(store.read_small(&keys.section("1", "keep")).await.unwrap().unwrap(), b"current body");
         });

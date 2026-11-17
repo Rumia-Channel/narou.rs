@@ -21,11 +21,18 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// Operation state crosses threads on native, but never leaves a wasm isolate.
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc as SharedState;
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc as SharedState;
+
 use futures::StreamExt;
 
 use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, AssetStream, Clock, GateLease, NovelAccessFence, NovelObjectKeys, ObjectKey, ObjectPrefix,
+    ObjectFingerprint, ObjectFingerprintMismatch, ObjectFingerprintReader,
     ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectStore, ObjectUpdateResult,
     PlatformFuture, PlatformService, SmallObjectMutator, SystemClock, WriteFence,
     READER_LEASE_SECS, is_reserved_key,
@@ -512,6 +519,24 @@ impl NovelReadLease {
         Ok(Some(bytes))
     }
 
+    /// Recheck immutable references without re-fetching their bodies. Mutable
+    /// fallbacks still read through this exact lease, never an unguarded store.
+    pub async fn verify_fingerprints<'input>(
+        &mut self,
+        fingerprints: &'input [ObjectFingerprint],
+    ) -> Result<Option<ObjectFingerprintMismatch<'input>>> {
+        for fingerprint in fingerprints {
+            if !self.prefix.matches(&fingerprint.key) {
+                return Err(key_outside_novel(&self.prefix, &fingerprint.key));
+            }
+        }
+        self.validate().await?;
+        let objects = self.objects.clone();
+        let mismatch = objects.verify_fingerprints(fingerprints, self).await?;
+        self.validate().await?;
+        Ok(mismatch)
+    }
+
     /// lease を response body 相当の stream へ移す。
     ///
     /// 先に `open` で対象を開き、成功した read access を返す stream の所有物
@@ -554,6 +579,12 @@ impl NovelReadLease {
     /// 呼び出し側で再試行は要らない。
     pub async fn release(mut self) -> Result<()> {
         self.release_inner().await
+    }
+}
+
+impl ObjectFingerprintReader for NovelReadLease {
+    fn read_small<'a>(&'a mut self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(NovelReadLease::read_small(self, key))
     }
 }
 
@@ -672,7 +703,7 @@ pub struct NovelReadScope {
     objects: Arc<dyn ObjectStore>,
     clock: Arc<dyn Clock>,
     reader_hint: Arc<str>,
-    leases: Arc<futures::lock::Mutex<BTreeMap<String, NovelReadLease>>>,
+    leases: SharedState<futures::lock::Mutex<BTreeMap<String, NovelReadLease>>>,
 }
 
 impl NovelReadScope {
@@ -681,7 +712,7 @@ impl NovelReadScope {
     }
 
     pub fn with_clock(objects: &Arc<dyn ObjectStore>, clock: Arc<dyn Clock>, reader_hint: &str) -> Self {
-        Self { objects: objects.clone(), clock, reader_hint: Arc::from(reader_hint), leases: Arc::new(futures::lock::Mutex::new(BTreeMap::new())) }
+        Self { objects: objects.clone(), clock, reader_hint: Arc::from(reader_hint), leases: SharedState::new(futures::lock::Mutex::new(BTreeMap::new())) }
     }
 
     pub async fn lease_for(&mut self, prefix: &ObjectPrefix) -> Result<NovelReadLease> {
@@ -737,7 +768,7 @@ impl NovelReadScope {
 
     pub async fn release_all(self) -> Result<()> {
         // Other scopes still own the same map and its original admissions.
-        let Ok(leases) = Arc::try_unwrap(self.leases) else { return Ok(()); };
+        let Ok(leases) = SharedState::try_unwrap(self.leases) else { return Ok(()); };
         let mut failure = None;
         for (_, lease) in leases.into_inner() {
             if let Err(error) = lease.release().await && failure.is_none() { failure = Some(error); }
@@ -767,11 +798,11 @@ struct MigrationOriginState {
 }
 
 impl NovelMigrationOrigins {
-    pub fn new(authority: Arc<dyn ObjectStore>, resolver: Arc<dyn NovelPrefixResolver>) -> Result<Arc<Self>> {
+    pub fn new(authority: Arc<dyn ObjectStore>, resolver: Arc<dyn NovelPrefixResolver>) -> Result<SharedState<Self>> {
         if authority.access_fence().is_none() {
             return Err(NarouError::Platform("novel migration requires an authoritative access fence".into()));
         }
-        Ok(Arc::new(Self { authority, resolver, state: futures::lock::Mutex::new(MigrationOriginState::default()) }))
+        Ok(SharedState::new(Self { authority, resolver, state: futures::lock::Mutex::new(MigrationOriginState::default()) }))
     }
 
     /// Return the same original token for legacy-only retirement as for
@@ -807,14 +838,14 @@ impl NovelMigrationOrigins {
 pub struct NovelMigrationStore {
     objects: Arc<dyn ObjectStore>,
     assets: Arc<dyn AssetStore>,
-    origins: Arc<NovelMigrationOrigins>,
+    origins: SharedState<NovelMigrationOrigins>,
     reads: NovelReadScope,
 }
 
 impl NovelMigrationStore {
     pub fn new(
         objects: Arc<dyn ObjectStore>, assets: Arc<dyn AssetStore>,
-        origins: Arc<NovelMigrationOrigins>, reads: NovelReadScope,
+        origins: SharedState<NovelMigrationOrigins>, reads: NovelReadScope,
     ) -> Result<Self> {
         if objects.access_fence().is_none() {
             return Err(NarouError::Platform("migration logical view has no access fence".into()));

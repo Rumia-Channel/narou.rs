@@ -432,6 +432,31 @@ fn display_diff_list(context: &NovelContext) -> std::result::Result<(), String> 
 }
 
 
+/// Remove a directory tree only when it contains no files at all. Legacy
+/// `cache/` and `.cache/` layouts can leave empty version directories the
+/// store never tracked; real files always keep their parent directories.
+/// Links are content for this purpose: they are never followed, so a linked
+/// directory keeps its parent alive instead of being pruned.
+fn remove_empty_diff_tree(path: &Path, novel_directory: &Path) -> std::result::Result<bool, String> {
+    let path = narou_rs::db::paths::ensure_within_archive_root(path, novel_directory)
+        .map_err(|error| error.to_string())?;
+    let mut empty = true;
+    for entry in fs::read_dir(&path).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_dir() {
+            empty &= remove_empty_diff_tree(&entry.path(), novel_directory)?;
+        } else {
+            empty = false;
+        }
+    }
+    if !empty {
+        return Ok(false);
+    }
+    fs::remove_dir(path).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
 /// Maintenance edits a private snapshot; canonical deletes and SQL pruning use
 /// the same origin captured before reading the old cache.
 fn clean_diff_data(context: &NovelContext) -> std::result::Result<bool, String> {
@@ -466,6 +491,8 @@ fn clean_diff_data(context: &NovelContext) -> std::result::Result<bool, String> 
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(narou_rs::error::NarouError::Platform("diff cache is not a physical directory".into()));
             }
+            // The captured novel root is the confinement boundary: a legacy
+            // cache path can never leave the book it belongs to.
             let cache = narou_rs::db::paths::ensure_within_archive_root(&cache, &directory)?;
             let entries = match fs::read_dir(&cache) {
                 Ok(entries) => entries,
@@ -474,11 +501,15 @@ fn clean_diff_data(context: &NovelContext) -> std::result::Result<bool, String> 
             };
             for entry in entries {
                 let entry = entry?;
+                // Only real directories can hold an empty tree; files and
+                // links are never traversed.
                 if !entry.file_type()?.is_dir() { continue; }
                 let path = narou_rs::db::paths::ensure_within_archive_root(&entry.path(), &directory)?;
-                pruned |= remove_empty_diff_directory(&path)?;
+                pruned |= remove_empty_diff_tree(&path, &directory)
+                    .map_err(narou_rs::error::NarouError::Platform)?;
             }
-            pruned |= remove_empty_diff_directory(&cache)?;
+            pruned |= remove_empty_diff_tree(&cache, &directory)
+                .map_err(narou_rs::error::NarouError::Platform)?;
         }
         if matches!(&primary, narou_rs::native::object_store::NativeStore::Sqlite(_)) {
             let connection = version_conn().map_err(narou_rs::error::NarouError::Platform)?;
@@ -488,15 +519,6 @@ fn clean_diff_data(context: &NovelContext) -> std::result::Result<bool, String> 
     }).map_err(|error| error.to_string())?;
     Ok(removed)
 }
-fn remove_empty_diff_directory(path: &Path) -> std::io::Result<bool> {
-    let mut entries = fs::read_dir(path)?;
-    let empty = entries.next().transpose()?.is_none();
-    drop(entries);
-    if empty { fs::remove_dir(path)?; }
-    Ok(empty)
-}
-
-
 fn clean_diff(context: &NovelContext) -> std::result::Result<(), String> {
     let removed = clean_diff_data(context)?;
     print!("{} の", context.record.title);

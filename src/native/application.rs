@@ -457,10 +457,10 @@ async fn collect_abandoned_creation_page(
     for (id, generation) in candidates {
         let Some(reservation) = resume_abandoned_creation(root, id, generation)? else { continue; };
         if let Err(error)=repository.release_id(reservation).await{
-            // A deferred cleanup is not a failure: the removal recovery of the
-            // same pass drains the namespace it owns, and the next release
-            // confirms it. Only a real release failure is reported.
-            if !matches!(&error,NarouError::CreationCleanupPending)&&release_error.is_none(){
+            // The release commits its closed-removal ownership before it
+            // returns; only the reader drain and the orphan sweep stay
+            // deferred. Every error here is a real release failure.
+            if release_error.is_none(){
                 release_error=Some(error);
             }
         }

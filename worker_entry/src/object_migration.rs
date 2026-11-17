@@ -10,6 +10,7 @@
 //! `asset_backend` を `d1` に戻せば即座に元の経路へ復帰できる。
 
 use std::sync::Arc;
+use std::rc::Rc;
 
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::store_migration::{StoreMigrationState, migrate_page};
@@ -50,7 +51,7 @@ impl NovelPrefixResolver for PrefixResolver {
     }
 }
 
-pub(crate) fn migration_origins(db: &DbHandle) -> Result<Arc<NovelMigrationOrigins>> {
+pub(crate) fn migration_origins(db: &DbHandle) -> Result<Rc<NovelMigrationOrigins>> {
     NovelMigrationOrigins::new(
         Arc::new(D1ObjectStore::new(db.primary_view())),
         Arc::new(PrefixResolver(db.primary_view())),
