@@ -318,7 +318,7 @@ fn native_web_v2_sqlite_db_only_imports_exports_and_recovers_without_mirror_file
     let imported=import_projected(&client,&target_server,&manifest,&fingerprint,&payloads,false,TransferProfile::Runtime);assert_eq!(imported["published_novels"],1);
     let archive=target.join("小説データ");
     let mut mirrored=Vec::new();let mut stack=vec![archive.clone()];
-    while let Some(directory)=stack.pop(){if !directory.is_dir(){continue;}for entry in std::fs::read_dir(&directory).unwrap(){let entry=entry.unwrap();if directory==archive&&entry.file_name()==".objects"{continue;}if entry.file_type().unwrap().is_dir(){stack.push(entry.path());}else{mirrored.push(entry.path());}}}
+    while let Some(directory)=stack.pop(){if !directory.is_dir(){continue;}for entry in std::fs::read_dir(&directory).unwrap(){let entry=entry.unwrap();if directory==archive&&entry.file_name()==".objects"{continue;}else if entry.file_type().unwrap().is_dir(){stack.push(entry.path());}else{mirrored.push(entry.path());}}}
     assert!(mirrored.is_empty(),"DB-only import must not materialize novel files: {mirrored:?}");
     let database_connection=narou_rs::native::sqlite::open(&target.join(".narou/db.sqlite")).unwrap();
     let connection=database_connection.lock();
@@ -433,7 +433,7 @@ fn native_transfer_browser_fixture() {
     let mut chunk = [0u8; 64 * 1024];
     let mut remaining = large_size;
     while remaining != 0 {
-        for bytes in chunk.chunks_exact_mut(8) {
+        for bytes in chunk.as_chunks_mut::<8>().0 {
             state ^= state << 13; state ^= state >> 7; state ^= state << 17;
             bytes.copy_from_slice(&state.to_le_bytes());
         }
