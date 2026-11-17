@@ -5,9 +5,11 @@
 - `feature-novelup-session` で `webnovel/novelup.plus.yaml` version 1.2 を追加。作品・各話・作者一覧・ページ送り・抽出は YAML / preprocess DSL で駆動する。最低間隔は 20 秒で、WAF 回避を保証する設定ではない。2 桁年は Ruby と同じ 1969–2068 の範囲へ解釈し、通常の 4 桁年には追加の書式解析を行わない。
 - `platform::http::browser_challenge` は 202/challenge と 405/captcha の組み合わせだけを割当てなしで認識し、Native は tier 切替を打ち切る。Worker の socket / relay も確認応答を保持する。relay JSON / NRS1 の追加メタデータ `wafAction` は省略可能で、対応するリレーの更新が必要。
 - downloader の私有 `AuthState` は資格情報を必要時に一度だけ読み込み、各候補を元の設定 Cookie から組み直す。後続目次・本文・強い更新も認証回復し、採用したセッションを保持する。途中の壁を短い目次として保存せず、公開取得に不要な Cookie を送らない。目次の所有権を渡し、認証試行ごとの全文コピーも削減した。
+- 部分一覧を補う任意のログイン試行が失敗しても採用済み一覧を失わず、対応する資格情報へ戻す。利用可能な一覧を得ていない場合のエラー処理は維持する。期限切れログインの 404 で既存作品が削除・非公開扱いになる経路を追加修正した。
 - `narou_rs_login` は確認が必要なサイトの作品 URL を直接開き、設定済み User-Agent で保存後確認する。DevTools の接続・応答待ちに上限を置き、Cookie 配列の複製をなくし、ブラウザ終了を待ってからプロファイルを清掃する。
-- 実サイト確認: 短編 `874968302` を 1 話取得し、TXT と Kobo EPUB を生成。EPUB 37,600 bytes / 17 entries の ZIP・XML と本文の先頭／末尾を検証し、最終ビルドの CLI で再更新が「更新なし」となることも確認した。作者 `813181327` は CLI の追跡登録・dry-run で 13 作品を列挙した。連載 `759726165` は Native で 202/challenge、公式 SDK のトークン取得後にも 405/captcha を観測し、Firefox も人間確認画面になった。全話取得・再更新は未確認で、トークン寿命や UA / IP の拘束条件は断定しない。CAPTCHA の自動解読・ブラウザ常駐・TLS 指紋偽装は追加していない。
+- 実サイト確認: 短編 `874968302` を 1 話取得し、TXT と Kobo EPUB を生成。EPUB 37,600 bytes / 17 entries の ZIP・XML と本文の先頭／末尾を検証し、最終ビルドの CLI で再更新が「更新なし」となることも確認した。作者 `813181327` は CLI の追跡登録・dry-run で 13 作品を列挙した。連載 `759726165` は Native で 202/challenge、公式 SDK のトークン取得後にも 405/captcha を観測した。その後、利用者が Firefox の CAPTCHA を手動で完了し、66 話の目次と Native での 5 話取得を確認したが、6 話目は保存済み Cookie での再試行でも HTTP 403 となり停止した。全話取得・再更新・出力は未確認で、トークン寿命や UA / IP の拘束条件は断定しない。CAPTCHA の自動解読・ブラウザ常駐・TLS 指紋偽装は追加していない。
 - 検証: Native の HTTP・認証回復・日付・サイト定義・既存ログイン／前処理の関連テスト、relay テスト、ログイン helper 7 件、Native と Worker wasm の Clippy ゲートが成功。強い更新の新規回帰は、本文だけの認証要求から回復し、同一本文の二重取得を避けることを確認した。実 workerd の HTTP 契約は追加 WAF ケースを含め 111/111 成功。ただし runner 全体は後続の `virtual_membership.mjs` で `ECONNRESET` により失敗し、全フェーズ成功ではない。原因未確定のため無関係なテストの緩和・再試行は加えていない。
+- 追加回帰: 匿名の部分一覧を得た後に保存ログインが 404 を返すと、修正前は既存作品の更新が `Failed` になることを再現。修正後は 404・後続目次の壁・500 の全ケースで公開一覧・作品 ID・匿名の本文取得を保持する。`auth_recovery` 9 件、`kakuyomu_login` 6 件、`login_fallback` 3 件、`pixiv_accessibility` 13 件の計 31 件が成功し、追加修正後の Native / Worker wasm Clippy も通過した。
 
 ## EPUB 配信経路と API の待ち時間（未リリース）
 

@@ -339,7 +339,7 @@ fn token_group(id: &str, cookie: &str) -> LoginGroup {
 
 /// Build a downloader over the fixture server.
 fn build_downloader(
-    http: Arc<Fixture>,
+    http: Arc<dyn HttpClient>,
     cookies: Arc<CountingCookieStore>,
     yaml: &str,
 ) -> (Downloader, Arc<MemoryNovelRepository>, Arc<MemoryObjectStore>) {
@@ -816,4 +816,102 @@ async fn strong_update_recovers_a_body_login_without_refetching_unchanged_conten
     let record = repository.find_by_toc_url(TOC_URL).await.unwrap().unwrap();
     assert!(record.requires_login);
     assert_eq!(record.login_session.as_deref(), Some("seed"));
+}
+
+#[tokio::test]
+async fn failed_optional_logins_preserve_the_public_listing_and_its_credentials() {
+    #[derive(Clone, Copy, Debug)]
+    enum Failure {
+        NotFound,
+        LaterWall,
+        ServerError,
+    }
+    struct PartialFixture {
+        inner: Arc<Fixture>,
+        partial: AtomicBool,
+        failure: Failure,
+    }
+    impl HttpClient for PartialFixture {
+        fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
+            Box::pin(async move {
+                let is_toc = request.url == TOC_URL;
+                let authenticated = request.header("Cookie").is_some();
+                let mut response = self.inner.send(request).await?;
+                if is_toc && self.partial.load(Ordering::SeqCst) {
+                    if !authenticated {
+                        response = html(&format!("{}login_partial::1", toc_page(false)));
+                    } else {
+                        match self.failure {
+                            Failure::LaterWall => response = html(&toc_page(true)),
+                            Failure::NotFound | Failure::ServerError => {
+                                response.status = match self.failure {
+                                    Failure::NotFound => 404,
+                                    _ => 500,
+                                };
+                                response.body.clear();
+                            }
+                        }
+                    }
+                }
+                Ok(response)
+            })
+        }
+        fn send_stream<'a>(
+            &'a self,
+            request: HttpRequest,
+        ) -> PlatformFuture<'a, Result<narou_rs::platform::HttpStreamResponse>> {
+            self.inner.send_stream(request)
+        }
+    }
+
+    let _serial = PIPELINE.lock().await;
+    for failure in [Failure::NotFound, Failure::LaterWall, Failure::ServerError] {
+        let temp = scratch_library();
+        std::env::set_current_dir(temp.path()).unwrap();
+        narou_rs::db::init_database().unwrap();
+        let http = Arc::new(PartialFixture {
+            inner: Arc::new(Fixture::new()),
+            partial: AtomicBool::new(false),
+            failure,
+        });
+        let cookies = Arc::new(CountingCookieStore::new());
+        cookies.save_groups("example.com", &[token_group("expired", "session=expired")]).await.unwrap();
+        let mut yaml = site_yaml(None).replace(
+            r#"(?<href>[^"]+)"#,
+            "(?<href>/novel/n1234ab/(?<index>\\d+)/)",
+        );
+        yaml.push_str("login_partial_pattern: login_partial::1\n");
+        let (mut downloader, repository, store) =
+            build_downloader(http.clone(), cookies.clone(), &yaml);
+        let acquired = downloader.download_novel(TOC_URL).await.unwrap();
+        let before = repository.find_by_toc_url(TOC_URL).await.unwrap().unwrap();
+        let before_toc = saved_toc(&store, &before).await.unwrap();
+        let first_body = http.inner.count(BODY1_URL);
+        let second_body = http.inner.count(BODY2_URL);
+        http.partial.store(true, Ordering::SeqCst);
+
+        let updated = downloader.download_novel_with_force(TOC_URL, true).await
+            .unwrap_or_else(|error| panic!("{failure:?}: {error}"));
+        assert_eq!(updated.status, UpdateStatus::Ok, "{failure:?}");
+        assert_eq!(updated.id, acquired.id, "{failure:?}");
+        let after = repository.find_by_toc_url(TOC_URL).await.unwrap().unwrap();
+        assert_eq!(after.general_all_no, Some(2), "{failure:?}");
+        assert!(!after.requires_login, "{failure:?}");
+        assert!(after.login_session.is_none(), "{failure:?}");
+        let after_toc = saved_toc(&store, &after).await.unwrap();
+        // Forced downloads advance bookkeeping; the published entries must survive unchanged.
+        assert!(
+            after_toc.subtitles.iter()
+                .map(|entry| (&entry.index, &entry.href, &entry.subtitle))
+                .eq(before_toc.subtitles.iter()
+                    .map(|entry| (&entry.index, &entry.href, &entry.subtitle))),
+            "{failure:?}"
+        );
+        assert_eq!(http.inner.count(BODY1_URL), first_body + 1, "{failure:?}");
+        assert_eq!(http.inner.count(BODY2_URL), second_body + 1, "{failure:?}");
+        for url in [BODY1_URL, BODY2_URL] {
+            assert_eq!(http.inner.count_with_cookie(url, "session=expired"), 0, "{failure:?}");
+        }
+        assert_eq!(cookies.loads(), 1, "{failure:?}");
+    }
 }

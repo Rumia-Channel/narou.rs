@@ -2845,13 +2845,22 @@ impl Downloader {
         let mut best: Option<TocAttempt> = None;
         let mut source = Some(first_source);
         loop {
-            let attempt = self
+            let attempt = match self
                 .fetch_attempt_with_logins(setting, auth, toc_url, url_captures, source.take())
-                .await?;
+                .await
+            {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    // An optional login cannot invalidate an earlier usable listing.
+                    auth.restore(setting, original.as_ref());
+                    return best.ok_or(error);
+                }
+            };
             if attempt.listing.wall {
                 // 壁が残った。保存済みログインを順に試す。
                 if !self.try_next_login(setting, auth).await {
-                    return Err(setting.login_wall_failure());
+                    auth.restore(setting, original.as_ref());
+                    return best.ok_or_else(|| setting.login_wall_failure());
                 }
                 continue;
             }

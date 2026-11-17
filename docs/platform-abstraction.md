@@ -164,6 +164,7 @@ pub trait HttpClient: Send + Sync {
 - ステータス→ドメインエラー変換（404→NotFound / 503→SuspendDownload、既知のブラウザ確認→Login）は `http_policy` に一元化する。`platform::http::browser_challenge` は `202 + x-amzn-waf-action: challenge` / `405 + ...: captcha` だけを認識する追加メモリ割り当てのない共通判定で、transport は元のステータスとヘッダを保持する。本文が空の 202、必須 JSON 取得、ストリームでも確認画面を成功データとして扱わない。
 - 将来の future は `Send`（`tokio::spawn` で並列 update を駆動するため）。wasm32 では全型が自動 Send なので Workers は影響なし。
 - ブラウザ確認は通信手段の障害ではない。Native はこの応答で tier を打ち切り、Worker の socket / relay でも元の 403 より優先して返す。Cookie 候補の選択・目次の再評価・本文の再試行は downloader の私有 `AuthState` が担う。資格情報は必要時に一度だけ読み、候補は常にサイトの設定 Cookie から組み直す。通常の成功ページごとに資格情報を再読込せず、認証以外の失敗を追加試行しない。
+- 取得済みの部分一覧を補うログイン試行は任意であり、その候補の 404・通信エラー・後続目次のログイン壁で採用済み一覧を無効にしない。改善できなければ一覧と資格情報を一緒に元へ戻す。利用可能な一覧を一度も得られなかった場合だけ、元のエラーを返す。
 - AWS WAF の公式 [`getToken()`](https://docs.aws.amazon.com/waf/latest/developerguide/waf-js-challenge-api-get-token.html) はトークン取得・再利用の API であり、CAPTCHA を解くものではない。Cookie の存在だけで通過成功や有効期間を推定せず、実際の取得結果で判定する。`narou_rs_login` は対話ブラウザでの取得と保存後確認を担い、SDK の自動注入・常駐更新・CAPTCHA の自動解読は行わない。
 
 ### RateLimiter
