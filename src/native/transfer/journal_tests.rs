@@ -53,3 +53,23 @@ fn copied_control_sanitizer_scrubs_sessions_but_keeps_generation_and_origin_auth
     {let connection=journal.control_connection();let connection=connection.lock();connection.execute_batch("CREATE TABLE native_yaml_id_sequence(id INTEGER PRIMARY KEY CHECK(id=1),next_id INTEGER NOT NULL,next_generation INTEGER NOT NULL); INSERT INTO native_yaml_id_sequence VALUES(1,45,99); CREATE TABLE native_yaml_id_claims(novel_id INTEGER PRIMARY KEY,generation INTEGER NOT NULL,available INTEGER NOT NULL CHECK(available IN(0,1)),retired INTEGER NOT NULL CHECK(retired IN(0,1))); INSERT INTO native_yaml_id_claims VALUES(12,71,0,1); CREATE TABLE native_id_liveness(allocator TEXT NOT NULL,novel_id INTEGER NOT NULL,generation INTEGER NOT NULL,liveness_key TEXT NOT NULL,committed INTEGER NOT NULL CHECK(committed IN(0,1)),PRIMARY KEY(allocator,novel_id)); INSERT INTO native_id_liveness VALUES('yaml',12,71,'12-71',1); CREATE TABLE native_transfer_id_owners(allocator TEXT NOT NULL,owner TEXT NOT NULL,novel_id INTEGER NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(allocator,owner),UNIQUE(allocator,novel_id)); INSERT INTO native_transfer_id_owners VALUES('yaml','old-session:0:plan',12,71); CREATE TABLE novel_access_gates(prefix TEXT PRIMARY KEY,closed INTEGER NOT NULL,owner TEXT,epoch INTEGER NOT NULL,origin_url_fold TEXT NOT NULL); INSERT INTO novel_access_gates VALUES('novels/Test/published',0,NULL,7,'https://example.test/published/');").unwrap();connection.execute("VACUUM INTO ?1",[image.to_str().unwrap()]).unwrap();}
     let mut copy=Connection::open(&image).unwrap();sanitize_control_snapshot(&mut copy).unwrap();assert_eq!(copy.query_row("SELECT COUNT(*) FROM transfer_native_rows",[],|row|row.get::<_,i64>(0)).unwrap(),0);assert_eq!(copy.query_row("SELECT COUNT(*) FROM native_transfer_id_owners",[],|row|row.get::<_,i64>(0)).unwrap(),0);assert_eq!(copy.query_row("SELECT next_id,next_generation FROM native_yaml_id_sequence WHERE id=1",[],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?))).unwrap(),(45,99));assert_eq!(copy.query_row("SELECT generation,retired FROM native_yaml_id_claims WHERE novel_id=12",[],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,bool>(1)?))).unwrap(),(71,true));assert_eq!(copy.query_row("SELECT generation,committed FROM native_id_liveness WHERE novel_id=12",[],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,bool>(1)?))).unwrap(),(71,true));assert_eq!(copy.query_row("SELECT origin_url_fold FROM novel_access_gates",[],|row|row.get::<_,String>(0)).unwrap(),"https://example.test/published/");assert!(!std::fs::read(&image).unwrap().windows(marker.len()).any(|window|window==marker.as_bytes()));assert!(journal.session(&scope(),&row.session_id).await.unwrap().is_some());assert_eq!(journal.backend_get::<String>(&row.session_id.0,"private-token").unwrap().as_deref(),Some(marker));
 })}
+
+#[test]
+fn sqlite_marker_with_unopenable_db_fails_mutations_instead_of_yaml_fallback(){block_on(async{
+    // Regression for the observed incident: a `storage-backend=sqlite`
+    // library whose `db.sqlite` cannot be configured used to be accepted by
+    // the transfer on silent YAML-file semantics; the publication step then
+    // issued SQL against the unmigrated schema (`no such table
+    // novel_access_gates`). Mutations must fail closed instead.
+    let root=tempfile::tempdir().unwrap();let narou=root.path().join(".narou");std::fs::create_dir_all(&narou).unwrap();
+    std::fs::write(narou.join(crate::native::sqlite::state::MARKER_FILE),"sqlite\n").unwrap();
+    // `configure` fails on this path (a directory squats on db.sqlite), so
+    // `active_for` is `None` while `configured_failure` records the cause.
+    std::fs::create_dir_all(narou.join("db.sqlite")).unwrap();
+    let journal=NativeTransferJournal::open(root.path()).unwrap();
+    let row=session("gated");
+    assert!(matches!(journal.create_session(&row).await,Err(TransferError::Unsupported{code,..}) if code=="storage_unavailable"));
+    assert!(matches!(journal.backend_put(&row.session_id.0,"k",&1u32),Err(TransferError::Unsupported{code,..}) if code=="storage_unavailable"));
+    // Read-only journal paths stay usable for diagnostics; nothing was written.
+    assert!(journal.session(&scope(),&row.session_id).await.unwrap().is_none());
+})}

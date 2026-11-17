@@ -14,7 +14,7 @@ impl NativeTransferBackend {
         self.journal.backend_get(&format!("snapshot_by_ordinal:{}",session.0),&number(ordinal))?.ok_or_else(||TransferError::invalid("snapshot_missing","frozen source metadata missing"))
     }
     fn save_snapshot_source(&self,session:&SessionId,source:&SnapshotSource)->TR<()> {
-        self.journal.run(|rows|{
+        self.journal.run_write(|rows|{
             rows.put("backend",&Self::snapshot_sources_owner(session),&format!("{}\0{}",source.prefix,number(source.entry.novel_ordinal)),source)?;
             rows.put("backend",&format!("snapshot_by_ordinal:{}",session.0),&number(source.entry.novel_ordinal),source)
         })
@@ -34,7 +34,7 @@ impl NativeTransferBackend {
         Ok(())
     }
     async fn admit_snapshot(&self,session:&SessionId)->TR<bool> {
-        let current:SnapshotAdmission=self.journal.backend_get(&session.0,"snapshot_admission")?.unwrap_or_default();
+        self.journal.require_authority()?;let current:SnapshotAdmission=self.journal.backend_get(&session.0,"snapshot_admission")?.unwrap_or_default();
         let mut state=self.work_input(session,"snapshot_admission",current)?;
         if state.admitted{return Ok(true);}
         let owner=format!("{}:snapshot:group",session.0);
@@ -67,7 +67,7 @@ impl NativeTransferBackend {
         Ok(false)
     }
     async fn check_owned_source(&self,entry:&ExportNovelEntry)->TR<SnapshotSource> {
-        let session=&entry.session_id;let source=self.snapshot_source(session,entry.novel_ordinal)?;
+        self.journal.require_authority()?;let session=&entry.session_id;let source=self.snapshot_source(session,entry.novel_ordinal)?;
         if source.entry.id!=entry.id||source.entry.record_revision!=entry.record_revision||source.entry.content_revision!=entry.content_revision||source.entry.membership_digest!=entry.membership_digest{return Err(TransferError::invalid("snapshot_identity_mismatch","source summary differs from frozen catalog"));}
         let key=format!("{}\0{}",source.prefix,number(entry.novel_ordinal));
         let gate:SnapshotGate=self.journal.backend_get(&Self::snapshot_gates_owner(session),&key)?.ok_or_else(||TransferError::invalid("snapshot_gate_missing","source gate is missing"))?;
@@ -99,7 +99,7 @@ impl NativeTransferBackend {
         Ok(PublicationStep{done:state.released,..Default::default()})
     }
     async fn release_snapshot_page(&self,session:&SessionId,cursor:Option<&str>)->TR<PublicationStep> {
-        let page=self.journal.backend_page::<SnapshotGate>(&Self::snapshot_gates_owner(session),cursor,MAX_PAGE_ITEMS)?;
+        self.journal.require_authority()?;let page=self.journal.backend_page::<SnapshotGate>(&Self::snapshot_gates_owner(session),cursor,MAX_PAGE_ITEMS)?;
         for mut gate in page.items {
             if gate.released{continue;}
             let prefix=ObjectPrefix::new(&gate.source.prefix).map_err(TransferError::platform)?;let current=self.primary.gate_info(&prefix).await.map_err(TransferError::platform)?;
@@ -126,7 +126,7 @@ impl NativeTransferBackend {
         Ok(path)
     }
     async fn legacy_source(&self,session:&SessionId,binding_key:&str,logical:&ObjectKey,size:u64,code:&'static str)->TR<Option<String>> {
-        use futures::StreamExt;
+        self.journal.require_authority()?;use futures::StreamExt;
         let encoding=self.primary.stored_encoding(logical).await.map_err(TransferError::platform)?;
         if encoding.is_none_or(|encoding|encoding==crate::platform::ObjectEncoding::None){return Ok(None);}
         if size>16*1024*1024{return Err(TransferError::invalid("legacy_metadata_limit","legacy compressed source exceeds decoded16MiB storage contract"));}
