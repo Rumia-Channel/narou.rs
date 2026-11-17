@@ -152,16 +152,26 @@ fn open_upgrades_v8_objects_without_losing_db_only_rows() {
     std::fs::create_dir_all(&archive_root).unwrap();
 
     let conn = v8_objects_database(&db_path);
-    // A body that exists only in the database (the mirror is disabled).
-    let store = narou_rs::native::sqlite::object_store::SqliteObjectStore::with_mirror_files(
-        std::sync::Arc::new(parking_lot::Mutex::new(conn)),
-        narou_rs::native::object_store::NativeObjectStore::from_root(archive_root.clone()).unwrap(),
-        false,
-    );
+    // A body that exists only in the database (the mirror is disabled). Seed
+    // the row in the schema-v8 object format directly: the current
+    // SqliteObjectStore write path resolves gate bindings through tables that
+    // migration 16 creates, so it can only run on a post-upgrade connection.
     let key =
         narou_rs::platform::ObjectKey::try_new("novels/site/fixture/本文/1 第一話.yaml").unwrap();
-    futures::executor::block_on(store.write_small(&key, b"body: db only".to_vec())).unwrap();
-    drop(store);
+    let body = b"body: db only";
+    conn.execute(
+        "INSERT INTO objects (object_key, size, content_type, updated_at, encoding, crc32, data)
+         VALUES (?, ?, ?, ?, 'none', ?, ?)",
+        rusqlite::params![
+            key.as_ref(),
+            body.len() as i64,
+            narou_rs::platform::content_type_for_key(&key),
+            "2026-01-01T00:00:00Z",
+            narou_rs::platform::object_crc32(body) as i64,
+            body.as_slice(),
+        ],
+    ).unwrap();
+    drop(conn);
     let mirror_files: usize = walkdir_yaml_count(&archive_root);
     assert_eq!(mirror_files, 0, "前提: 実ファイルのミラーは存在しない");
 
