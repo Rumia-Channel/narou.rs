@@ -1065,32 +1065,62 @@ function ifMatchHeaders(ctx) {
 async function recoverPendingOperation(ctx) {
   const pending = ctx.pendingOperation;
   if (!pending) return ctx.status;
-  for (let round = 0; ; round += 1) {
+  // Only a definitive 412/428 revision-gate rejection proves this send left no
+  // receipt: adopt the authoritative status, then replay the identical
+  // operation identity/body under the fresh revision. A Busy (423) or any
+  // other ambiguous retryable failure does NOT prove an earlier attempt never
+  // ran — the session lock may be held by that same in-flight operation, and a
+  // committed receipt fingerprint binds the revision it was sent with — so the
+  // identical receipt is replayed unchanged: a committed operation dedups
+  // before the revision gate, while a never-applied one meets a definitive
+  // mismatch that reconciles (repeatedly, inside the unchanged send budget).
+  const reconcile = async () => {
+    adoptStatus(ctx, (await apiRequest(ctx, sessionPath(ctx))).body);
+    pending.revision = ctx.revision;
+    await saveSessionRecord(ctx);
+  };
+  for (let attempt = 0; ; attempt += 1) {
+    throwIfAborted(ctx);
     try {
       const path = pending.method === 'DELETE'
         ? `${pending.path}?operation_id=${encodeURIComponent(pending.operationId)}` : pending.path;
-      const response = await withRetry(ctx, () => apiRequest(ctx, path, {
+      const response = await apiRequest(ctx, path, {
         method: pending.method,
         json: pending.method === 'DELETE' ? undefined : { ...pending.body, operation_id: pending.operationId },
         headers: pending.intrinsic ? {} : { 'if-match': `"${pending.revision}"` },
-      }), { operation: pending.path });
+      });
       const status = adoptStatus(ctx, response.body);
       ctx.pendingOperation = null;
       await saveSessionRecord(ctx);
       return status;
     } catch (error) {
-      if ((error.httpStatus === 412 || error.httpStatus === 428 || error.code === 'revision_mismatch') && round < 1) {
-        adoptStatus(ctx, (await apiRequest(ctx, sessionPath(ctx))).body);
-        pending.revision = ctx.revision;
-        await saveSessionRecord(ctx);
+      if (error instanceof TransferError && (error.code === 'authentication_required' || error.httpStatus === 401)) {
+        const retry = await requestUi(ctx, 'auth', {
+          message: '認証が切れました。別のタブでログインし直してから「再試行」を押してください。転送は中断せず待機しています。',
+        });
+        if (!retry) throw error;
         continue;
       }
-      if (error instanceof TransferError && error.httpStatus >= 400 && error.httpStatus < 500
-        && error.httpStatus !== 401 && error.httpStatus !== 429) {
-        ctx.pendingOperation = null;
-        await saveSessionRecord(ctx);
+      const mismatch = error.httpStatus === 412 || error.httpStatus === 428 || error.code === 'revision_mismatch';
+      const retryable = isRetryable(error);
+      if ((!mismatch && !retryable) || attempt + 1 >= MAX_CONTROL_ATTEMPTS) {
+        // A definitive non-conflict rejection voids the persisted receipt. A
+        // revision conflict or an exhausted retryable failure keeps it so a
+        // later recovery can reconcile and replay the same identity.
+        if (!mismatch && !retryable && error instanceof TransferError && error.httpStatus >= 400 && error.httpStatus < 500
+          && error.httpStatus !== 401 && error.httpStatus !== 429) {
+          ctx.pendingOperation = null;
+          await saveSessionRecord(ctx);
+        }
+        throw error;
       }
-      throw error;
+      if (mismatch) {
+        await reconcile();
+      } else {
+        const delay = retryDelayMs(attempt, error);
+        progress(ctx, { phase: 'retry', label: `${pending.path} を再試行します (${Math.ceil(delay / 1000)} 秒後)`, attempt: attempt + 1 });
+        await sleep(delay, ctx);
+      }
     }
   }
 }

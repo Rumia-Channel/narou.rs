@@ -190,6 +190,115 @@ test('control replay preserves operation_id, body and original If-Match across A
   assert.equal((await h.ctx.store.get('request')).pendingOperation, null);
 });
 
+test('in-flight progress reconciles a Busy control retry instead of replaying a stale revision', async () => {
+  const h = workerHarness(); Object.assign(h.ctx, { direction: 'imports', sessionId: 'session', requestId: 'request', secretHeader: 'secret', revision: '989' });
+  // Server model: a committed batch may still advance the revision while a
+  // rejected control holds nothing; the session lock is busy while one
+  // invocation is in flight. Revision gate rejects before the lock check, and
+  // an ambiguous Busy failure replays the identical receipt until a definitive
+  // mismatch re-fetches the authoritative revision.
+  let serverRevision = 991, inFlight = false, gets = 0;
+  const sends = [], bodies = [];
+  h.fetch = async (url, init) => {
+    if (inFlight) { serverRevision += 1; inFlight = false; }
+    if (url.endsWith('/pause')) {
+      sends.push(init.headers['if-match']); bodies.push(init.body);
+      if (BigInt(sends.at(-1).replaceAll('"', '')) !== BigInt(serverRevision)) {
+        return json({ error: { code: 'revision_mismatch', message: `session revision is now ${serverRevision}`, retryable: false }, revision: String(serverRevision) }, 412);
+      }
+      if (sends.length === 2) {
+        inFlight = true;
+        return json({ error: { code: 'operation_busy', message: 'another invocation holds this transfer session', retryable: true }, revision: String(serverRevision) }, 423);
+      }
+      serverRevision += 1;
+      return json(status(h, { revision: String(serverRevision), state: 'paused', next_action: 'none' }));
+    }
+    gets += 1;
+    return json(status(h, { revision: String(serverRevision) }));
+  };
+  const result = await h.api.sessionOperation(h.ctx, '/imports/session/pause');
+  // Busy replays the identical "991" receipt; only the next 412 reconciles.
+  assert.deepEqual(sends, ['"989"', '"991"', '"991"', '"992"']);
+  assert.equal(gets, 2);
+  assert.ok(bodies.every((body) => body === bodies[0]));
+  assert.equal(result.state, 'paused');
+  assert.equal(h.ctx.pendingOperation, null);
+  assert.equal((await h.ctx.store.get('request')).pendingOperation, null);
+});
+
+test('a Busy replay of a committed operation dedups its original receipt instead of rebasing', async () => {
+  const h = workerHarness(); Object.assign(h.ctx, { direction: 'imports', sessionId: 'session', requestId: 'request', secretHeader: 'secret', revision: '9' });
+  // First send commits under If-Match "9" but its ACK is lost; the retried send
+  // finds the server still holding the same operation's session lock (423).
+  // Replaying the identical "9" receipt must dedup to the committed result;
+  // rebasing to the fresh revision would conflict with that fingerprint.
+  let applied = 0, revision = 9, busyOnce = true;
+  const sends = [], bodies = [];
+  h.fetch = async (url, init) => {
+    if (!url.endsWith('/pause')) return json(status(h, { revision: String(revision), state: 'paused', next_action: 'none' }));
+    sends.push(init.headers['if-match']); bodies.push(init.body);
+    const sent = sends.at(-1).replaceAll('"', '');
+    if (sends.length === 1) {
+      assert.equal(sent, '9'); applied += 1; revision = 10; throw new TypeError('lost pause ACK');
+    }
+    if (busyOnce) {
+      busyOnce = false;
+      return json({ error: { code: 'operation_busy', message: 'same operation still in flight', retryable: true }, revision: String(revision) }, 423);
+    }
+    if (sent === '9') return json(status(h, { revision: '10', state: 'paused', next_action: 'none' }));
+    return json({ error: { code: 'operation_conflict', message: 'operation_id was already used with a different request', retryable: false }, revision: '10' }, 409);
+  };
+  const result = await h.api.sessionOperation(h.ctx, '/imports/session/pause');
+  assert.equal(applied, 1);
+  assert.deepEqual(sends, ['"9"', '"9"', '"9"']);
+  assert.ok(bodies.every((body) => body === bodies[0]));
+  assert.equal(result.state, 'paused');
+  assert.equal(h.ctx.pendingOperation, null);
+});
+
+test('an exhausted control conflict retains the same operation receipt without claiming progress', async () => {
+  const h = workerHarness(); Object.assign(h.ctx, { direction: 'imports', sessionId: 'session', requestId: 'request', secretHeader: 'secret', revision: '989' });
+  const sends = [], bodies = []; let reconciles = 0;
+  h.fetch = async (url, init) => {
+    if (url.endsWith('/pause')) {
+      sends.push(init.headers['if-match']); bodies.push(init.body);
+      return json({ error: { code: 'revision_mismatch', message: 'session revision is now 991', retryable: false }, revision: '991' }, 412);
+    }
+    reconciles += 1;
+    return json(status(h, { revision: '991' }));
+  };
+  await assert.rejects(h.api.sessionOperation(h.ctx, '/imports/session/pause'), (error) => error.httpStatus === 412);
+  assert.equal(sends.length, 6); // MAX_CONTROL_ATTEMPTS sends, reconcile before each replay
+  assert.equal(sends[0], '"989"'); assert.ok(sends.slice(1).every((tag) => tag === '"991"'));
+  assert.ok(bodies.every((body) => body === bodies[0]));
+  assert.equal(reconciles, 5);
+  const operationId = JSON.parse(bodies[0]).operation_id;
+  assert.equal(h.ctx.pendingOperation.operationId, operationId);
+  const saved = await h.ctx.store.get('request');
+  assert.equal(saved.pendingOperation.operationId, operationId);
+  assert.equal(saved.pendingOperation.revision, '991');
+  assert.notEqual(h.ctx.status?.state, 'paused');
+});
+
+test('an exhausted Busy control retains the unresolved receipt for later recovery', async () => {
+  const h = workerHarness(); Object.assign(h.ctx, { direction: 'imports', sessionId: 'session', requestId: 'request', secretHeader: 'secret', revision: '9' });
+  const sends = [], bodies = [];
+  h.fetch = async (url, init) => {
+    assert(url.endsWith('/pause'), 'an ambiguous Busy must not rebase its receipt');
+    sends.push(init.headers['if-match']); bodies.push(init.body);
+    return json({ error: { code: 'operation_busy', message: 'the original invocation is still in flight', retryable: true }, revision: '10' }, 423);
+  };
+  await assert.rejects(h.api.sessionOperation(h.ctx, '/imports/session/pause'), (error) => error.httpStatus === 423);
+  assert.deepEqual(sends, Array(6).fill('"9"'));
+  assert.ok(bodies.every((body) => body === bodies[0]));
+  const operationId = JSON.parse(bodies[0]).operation_id;
+  assert.equal(h.ctx.pendingOperation?.operationId, operationId);
+  const saved = await h.ctx.store.get('request');
+  assert.equal(saved.pendingOperation?.operationId, operationId);
+  assert.equal(saved.pendingOperation.revision, '9');
+  assert.notEqual(h.ctx.status?.state, 'paused');
+});
+
 test('stale status never rolls back revision or next-action identity', () => {
   const h = workerHarness();
   h.api.adoptStatus(h.ctx, status(h, { revision: '12', operation_id: 'new' }));
