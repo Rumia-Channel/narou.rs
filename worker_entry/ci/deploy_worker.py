@@ -1,28 +1,26 @@
 """Worker を Cloudflare へデプロイする（環境ごとに 1 回）。
 
-同じ Rust 成果物を 2 つの script として配備する: 既存の writer（更新と管理）と、
-配信だけを担う reader（外部 API / ブラウザの読み / EPUB）。reader は既存ドメイン
-の配信パスだけを edge で受け取り、配信以外は writer へ流す。writer の名前・
-DO 名前空間・キュー・cron は変えない。
+同じ Rust 成果物を 6 script として配備する: writer（Web/API/cron、変換と
+旧取得キューの drain-only 入口）、取得専用の 4 レーン、配信専用の reader。
+writer の script 名・DO 名前空間・既存キューは残す。初回は非公開・
+consumer/cron 無しの writer を先に作り、共有 RATE_LIMITER / PUSH_HUB を用意する。
 
 流れ:
 
-1. D1 と Queue を冪等に用意する（`ci/provision_resources.py`）
-2. `wrangler.ci.toml` と `wrangler.reader.ci.toml` をレンダリングする
+1. D1、既存キューと 4 本の取得キュー・各 DLQ を冪等に用意する
+   （`ci/provision_resources.py`。旧キュー・secret は削除しない）
+2. writer / reader / 取得レーン 4 本の設定をレンダリングする
    （`ci/render_config.py`）
-3. リモート D1 に schema migration を適用する（writer と同じ D1）
-4. secret を `--secrets-file` で投入して、writer を配備し、writer の readiness
-   （source の初期化）を確かめてから reader を配備する（reader は writer の
-   script 名と DO を参照するので writer を先に置く。成果物は writer のビルドを
-   reader が使い回すのでビルドは 1 回だけ。readiness を確認できないときは
-   失敗させ、reader の配備と既存の配信 Route の変更を行わない）
-5. 認証済み診断 API で実際の S3 backend と LIST を検証する（トークンが
-   Secrets Store 専用の場合は LIST を notice 付きで省略し、health と
-   未認証 401 の fail-closed 確認だけを行う。custom domain が Cloudflare
-   Access の内側にあり CI に service token が無い場合は、前段の 403 を
-   警告つきのスキップとして報告し、成功扱いにはしない）
-6. デプロイ先の URL に対して契約テストを流す（smoke。`NAROU_SMOKE=0` で省略）。
-   writer は管理 URL、reader は配信 URL を使う
+3. 共有 D1 の schema migration を適用し、assets / Wasm を 1 回だけビルドする
+4. writer が未配備なら同じ成果物で共有 DO 所有者だけを非公開 bootstrap する。
+   存在確認の認証失敗・不明な応答では中止し、既存 writer は変更しない。
+5. `--secrets-file` で取得に必要な資格情報を渡し、取得レーン 4 本を先に配備する。
+   どれかが失敗したら writer の切替は行わない
+6. writer を切り替え、S3 backend / LIST と readiness（source 初期化）を確認して
+   reader を最後に配備する。readiness を確認できなければ既存の配信 Route は変えない。
+   Secrets Store 専用トークンの認証付き検査や前段 Access の 403 は既存の
+   notice / warning 付きスキップとして扱い、検証成功とは報告しない
+7. 配備済み writer / reader の URL に smoke を流す（`NAROU_SMOKE=0` で省略）
 
 CI は NAROU_REQUIRE_S3=true 固定。旧 D1 の挿絵との互換性は維持せず、
 runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカーや挿絵行を検査・
@@ -87,6 +85,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -97,18 +97,16 @@ WORKER_DIR = Path(__file__).resolve().parent.parent
 TARGETS = ("develop", "production")
 WORKER_URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+\.workers\.dev")
 
-# 配備する 2 つの script。writer は既存の更新/管理用、reader は配信専用で
-# 同じ Rust 成果物を別の script 名で配備する。
+# 1 回だけビルドした成果物を writer / acquisition 4 本 / reader で共有する。
 WRITER_CONFIG = "wrangler.ci.toml"
 READER_CONFIG = "wrangler.reader.ci.toml"
+ACQUISITION_CONFIGS = tuple(f"wrangler.acquire-{number}.ci.toml" for number in range(1, 5))
 
 # それぞれの smoke。writer は管理 URL (契約テスト)、reader は配信 URL
 # (読み取り専用の回帰) を使う。
 WRITER_SMOKE_SCRIPT = "tests/contract.mjs"
 READER_SMOKE_SCRIPT = "tests/read_worker_deployed.mjs"
 
-# reader は writer と同じビルド成果物を使う (ビルドは 1 回だけ)。
-READER_ARTIFACT = "build/worker/shim.mjs"
 
 # デプロイと D1 migration に使う wrangler はバージョンを固定する。
 # `wrangler@4` のような範囲指定だとデプロイのたびに新しい 4.x が入り、
@@ -471,6 +469,11 @@ def provision(target: str) -> dict[str, str]:
     for key in (
         "database_name", "database_id", "queue_name", "dead_letter_queue",
         "convert_queue_name", "convert_dead_letter_queue",
+        *(
+            f"acquire_{kind}_{number}"
+            for number in range(1, 5)
+            for kind in ("queue_name", "dead_letter_queue")
+        ),
     ):
         if not values.get(key):
             fail(f"provisioning did not report {key}")
@@ -504,11 +507,7 @@ def enable_read_replication(resources: dict[str, str]) -> None:
 
 
 def render(target: str, resources: dict[str, str]) -> str:
-    """writer と reader の設定を作り、D1 のデータベース名を返す。
-
-    reader は writer と同じ D1 / S3 / 認証を使うので、置換の入力も同じもの
-    を渡す (D1 の migration も writer と同じ 1 本)。
-    """
+    """writer / reader / 取得レーン 4 本の設定を作り、共有 D1 の名前を返す。"""
     env = dict(os.environ)
     env["NAROU_DEPLOY_TARGET"] = target
     env["NAROU_D1_DATABASE_NAME"] = resources["database_name"]
@@ -517,9 +516,82 @@ def render(target: str, resources: dict[str, str]) -> str:
     env["NAROU_JOB_DLQ"] = resources["dead_letter_queue"]
     env["NAROU_CONVERT_QUEUE"] = resources["convert_queue_name"]
     env["NAROU_CONVERT_DLQ"] = resources["convert_dead_letter_queue"]
+    for number in range(1, 5):
+        env[f"NAROU_ACQUIRE_QUEUE_{number}"] = resources[f"acquire_queue_name_{number}"]
+        env[f"NAROU_ACQUIRE_DLQ_{number}"] = resources[f"acquire_dead_letter_queue_{number}"]
     run([sys.executable, "ci/render_config.py", "--role", "writer"], env=env)
     run([sys.executable, "ci/render_config.py", "--role", "reader"], env=env)
+    for lane in range(4):
+        run([
+            sys.executable, "ci/render_config.py", "--role", "acquisition",
+            "--lane", str(lane),
+        ], env=env)
     return resources["database_name"]
+
+
+def build_artifact() -> None:
+    """lane の配備より前に共通 artifacts を 1 回だけビルドする。"""
+    run(["node", "build_assets.mjs"])
+    run(["worker-build", "--release"])
+
+
+def writer_exists(name: str) -> bool:
+    """Only a confirmed 404 permits creating the private namespace owner."""
+    account = urllib.parse.quote(required("CLOUDFLARE_ACCOUNT_ID"), safe="")
+    script = urllib.parse.quote(name, safe="")
+    request = urllib.request.Request(
+        f"https://api.cloudflare.com/client/v4/accounts/{account}/workers/scripts/{script}/script-settings",
+        headers={"Authorization": f"Bearer {required('CLOUDFLARE_API_TOKEN')}"},
+    )
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+            body = response.read(64 * 1024 + 1)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            try:
+                body = error.read(64 * 1024 + 1)
+                payload = json.loads(body) if len(body) <= 64 * 1024 else None
+            except ValueError:
+                payload = None
+            errors = payload.get("errors") if isinstance(payload, dict) else None
+            # Pinned Wrangler also identifies a missing Worker with code 10007.
+            # An arbitrary 404 must not replace an existing public writer.
+            if isinstance(errors, list) and errors and all(
+                isinstance(item, dict) and item.get("code") == 10007 for item in errors
+            ) and payload.get("success") is False:
+                return False
+        fail(f"writer discovery failed (HTTP {error.code}); existing deployment was not changed")
+    except (urllib.error.URLError, OSError):
+        fail("writer discovery failed; existing deployment was not changed")
+    try:
+        payload = json.loads(body) if len(body) <= 64 * 1024 else None
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    if not isinstance(payload, dict) or payload.get("success") is not True or not isinstance(payload.get("result"), dict):
+        fail("writer discovery returned an invalid response; existing deployment was not changed")
+    return True
+
+
+def bootstrap_writer(secrets: Path | None) -> None:
+    """Create missing shared DO namespaces without exposing or consuming work."""
+    configuration = tomllib.loads((WORKER_DIR / WRITER_CONFIG).read_text(encoding="utf-8"))
+    if writer_exists(configuration["name"]):
+        return
+    configuration["workers_dev"] = False
+    configuration["preview_urls"] = False
+    configuration["main"] = str((WORKER_DIR / configuration["main"]).resolve())
+    for key in ("assets", "routes", "route", "triggers", "build"):
+        configuration.pop(key, None)
+    configuration.get("queues", {}).pop("consumers", None)
+    directory = WORKER_DIR / ".wrangler"
+    directory.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="writer-bootstrap-", dir=directory) as temporary:
+        path = Path(temporary) / "wrangler.json"
+        path.write_text(json.dumps(configuration), encoding="utf-8")
+        code, log = run_deploy(secrets, str(path))
+        print(log)
+        if code != 0:
+            fail("private writer namespace bootstrap failed; acquisition lanes were not deployed")
 
 
 def secret_file(target: str, role: str = "writer") -> Path | None:
@@ -529,9 +601,11 @@ def secret_file(target: str, role: str = "writer") -> Path | None:
     `NAROU_ADMIN_TOKEN` は要らない。`*_SECRET_NAME` を渡した項目は Secrets Store に
     置くので、値が無くても失敗にしない。
 
-    reader は配信だけを担うので、資格情報の at-rest 鍵 (`NAROU_RS_LOGIN_KEY`) と
-    取得リレーの資格情報は渡さない。writer だけが持つ。
+    writer と acquisition は取得用の login key / relay を共有する。reader には
+    渡さない。S3 / admin / push 関連の認証設定は各 script で同じ値を使う。
     """
+    if role not in ("writer", "reader", "acquisition"):
+        fail("secret role must be writer, reader or acquisition")
     # Worker 側の名前 -> GitHub 側の環境変数名。`*_SECRET_NAME` を渡した項目は
     # Secrets Store に置くので値が無くてもよい。
     plain = [
@@ -543,7 +617,7 @@ def secret_file(target: str, role: str = "writer") -> Path | None:
             "NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME",
         ),
     ]
-    if role == "writer":
+    if role in ("writer", "acquisition"):
         plain.insert(
             1,
             ("NAROU_RS_LOGIN_KEY", "NAROU_RS_LOGIN_KEY", "NAROU_RS_LOGIN_KEY_SECRET_NAME"),
@@ -597,8 +671,8 @@ def secret_file(target: str, role: str = "writer") -> Path | None:
     # 未設定なら Worker 側のリレー段は無効のまま（Cloudflare から取れないサイトが残る）。
     # RELAY_DOMAIN があれば https://<domain> を公開先として優先する（名前付きトンネル用）。
     # 公開先とキーは両方揃ったときだけ入れる（片方だけ残して古い値と組み合わさらないように）。
-    # reader は配信だけを担うのでリレーを持たない（取得は writer の担当）。
-    if role == "writer":
+    # reader は配信だけを担うのでリレーを持たない (取得レーンには必ず同じ値を渡す)。
+    if role in ("writer", "acquisition"):
         relay_domain = os.environ.get("RELAY_DOMAIN", "").strip()
         relay_endpoint = os.environ.get("NAROU_RELAY_ENDPOINT", "").strip()
         if relay_domain:
@@ -621,7 +695,7 @@ def secret_file(target: str, role: str = "writer") -> Path | None:
     # ログには伏せられる (登録は以降の出力に効く)。
     for value in secrets.values():
         mask(value)
-    suffix = "" if role == "writer" else "-reader"
+    suffix = {"writer": "", "reader": "-reader", "acquisition": "-acquire"}[role]
     path = WORKER_DIR / f".deploy-secrets-{target}{suffix}.json"
     path.write_text(json.dumps(secrets), encoding="utf-8")
     # 同ホストの別ユーザーから読まれないよう、秘密ファイルは 0600 にする。
@@ -812,6 +886,7 @@ def summary(target: str, url: str, smoke_ok: bool | None, *, hidden_url: bool = 
         f"### Worker deploy ({target})",
         "",
         f"- URL (writer): {'（custom domain。ログでは伏せています）' if hidden_url else url}",
+        f"- acquisition lanes: {len(ACQUISITION_CONFIGS)} private scripts (deployed before writer cutover)",
         f"- S3 backend + LIST: {s3_status}",
         f"- smoke (writer): {state(smoke_ok)}",
     ]
@@ -858,13 +933,21 @@ def main() -> None:
         )
     )
 
-    # writer を先に配備する。reader は writer の script 名と DO を参照するので、
-    # writer が無いと reader の配備が成立しない。
+    # 旧 writer は残したままレーンを追加し、全レーンの配備成功後に writer を切り替える。
+    # どの設定も [build] を持たず、この 1 回の成果物を再利用する。
+    build_artifact()
     writer_secrets = None
     reader_secrets = None
+    acquisition_secrets = None
     try:
         writer_secrets = secret_file(target, role="writer")
         reader_secrets = secret_file(target, role="reader")
+        acquisition_secrets = secret_file(target, role="acquisition")
+        # First deployment needs the shared DO owner before external bindings.
+        # Existing writers are never replaced by this private bootstrap.
+        bootstrap_writer(writer_secrets)
+        for config in ACQUISITION_CONFIGS:
+            deploy(acquisition_secrets, target, resources, config=config)
         writer_url = deploy(writer_secrets, target, resources, config=WRITER_CONFIG)
         target_url, hidden_url = smoke_url(target, writer_url)
         if target_url is None:
@@ -878,7 +961,7 @@ def main() -> None:
         verify_writer_ready(target_url)
         reader_url = deploy(reader_secrets, target, resources, config=READER_CONFIG)
     finally:
-        for path in (writer_secrets, reader_secrets):
+        for path in (writer_secrets, reader_secrets, acquisition_secrets):
             if path is not None:
                 path.unlink(missing_ok=True)
 

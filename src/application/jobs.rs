@@ -301,7 +301,7 @@ pub mod worker_ledger {
     pub fn select_stuck(stuck_before: &str, limit: usize) -> Statement {
         Statement {
             sql: format!(
-                "SELECT job_id, status, attempts, recovery_attempts, last_error, kind FROM worker_jobs \
+                "SELECT job_id, status, attempts, recovery_attempts, last_error FROM worker_jobs \
                  WHERE status IN ('pending', 'running', 'retryable') AND admission_waiting = 0 \
                    AND COALESCE(lease_until, updated_at) <= ? \
                  ORDER BY COALESCE(lease_until, updated_at) ASC, job_id ASC \
@@ -333,13 +333,16 @@ pub mod worker_ledger {
 
     /// Reserve a recovery delivery and retire an expired running token. Keeping
     /// it `running` would keep its old site locked while the new envelope waits.
+    /// Conversions return to durable admission waiting; cron dispatches them
+    /// only after releasing its own heavy-memory permit.
     ///
     /// Bind order: `now`, `now`, `job_id`, `stuck_before`.
     pub fn mark_reenqueue(now: &str, job_id: &str, stuck_before: &str) -> Statement {
         Statement {
             sql: "UPDATE worker_jobs SET updated_at = ?, lease_until = ?, \
                       status = CASE WHEN status = 'running' THEN 'pending' ELSE status END, \
-                      execution_token = NULL, recovery_attempts = recovery_attempts + 1 \
+                      execution_token = NULL, recovery_attempts = recovery_attempts + 1, \
+                      admission_waiting = CASE WHEN kind = 'convert' THEN 1 ELSE admission_waiting END \
                   WHERE job_id = ? \
                     AND status IN ('pending', 'running', 'retryable') \
                     AND COALESCE(lease_until, updated_at) <= ?"
@@ -517,7 +520,7 @@ pub mod worker_ledger {
     const OWNER: &str = "(other.lease_until > ? AND (other.status = 'running' \
         OR (other.status = 'permanent' AND other.execution_token IS NOT NULL)))";
 
-    fn novel_id_expression(target: &str) -> String {
+    pub(crate) fn novel_id_expression(target: &str) -> String {
         format!("CASE WHEN {target} = CAST(CAST({target} AS INTEGER) AS TEXT) \
             THEN CAST({target} AS INTEGER) ELSE (SELECT MIN(novel_id) FROM novel_target_aliases \
             WHERE target = lower({target})) END")
@@ -528,6 +531,15 @@ pub mod worker_ledger {
     /// Physical owners are materialized once; URL/ncode/suffix identities use
     /// the transactionally maintained alias index, not a per-wakeup library scan.
     pub fn select_waiting(now: &str, limit: usize) -> Statement {
+        select_waiting_filtered(now, limit, "")
+    }
+
+    /// Acquisition work is dispatched through its independently fenced lanes.
+    pub fn select_waiting_converts(now: &str, limit: usize) -> Statement {
+        select_waiting_filtered(now, limit, "candidate.kind = 'convert' AND ")
+    }
+
+    fn select_waiting_filtered(now: &str, limit: usize, filter: &str) -> Statement {
         let candidate_target = "COALESCE(candidate.normalized_target, candidate.target)";
         let other_target = "COALESCE(other.normalized_target, other.target)";
         let candidate_id = novel_id_expression(candidate_target);
@@ -543,7 +555,7 @@ pub mod worker_ledger {
                        CASE WHEN candidate.site_key IS NULL THEN candidate.job_id ELSE '' END \
                        ORDER BY candidate.created_at, candidate.job_id) AS site_rank \
                    FROM worker_jobs AS candidate \
-                   WHERE candidate.admission_waiting = 1 \
+                   WHERE {filter}candidate.admission_waiting = 1 \
                      AND candidate.status IN ('pending', 'retryable') \
                      AND (candidate.lease_until IS NULL OR candidate.lease_until <= ?) \
                      AND NOT EXISTS (SELECT 1 FROM owners AS other \

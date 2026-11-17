@@ -728,7 +728,14 @@ fn create_novel(
 }
 
 fn import_failure_after_release(repository:&NativeNovelRepository,reservation:crate::platform::NovelIdReservation,error:NarouError)->NarouError{
-    match block_on(repository.release_id(reservation)){Ok(())=>error,Err(cleanup)=>NarouError::Platform(format!("{error}; reservation cleanup failed: {cleanup}"))}
+    match block_on(repository.release_id(reservation)){
+        Ok(())=>error,
+        // A deferred cleanup keeps the unpublished namespace gated to its own
+        // removal owner until the startup collector finishes it. The import
+        // still failed, so its own error stays the reported cause.
+        Err(NarouError::CreationCleanupPending)=>error,
+        Err(cleanup)=>NarouError::Platform(format!("{error}; reservation cleanup failed: {cleanup}")),
+    }
 }
 
 /// Replaces the files of an existing novel, keeping its record id and folder.

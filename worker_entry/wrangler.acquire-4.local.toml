@@ -1,0 +1,68 @@
+# ローカル取得レーン 4 (lane 3)。writer (wrangler.toml) と同時に起動する。
+# 共通成果物のビルドは writer の [build] が 1 回だけ行う。
+# 資格情報は writer と同じ .dev.vars / --var で渡す (この設定に値を置かない)。
+
+name = "narou-rs-local-acquire-4"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-08-10"
+workers_dev = false
+
+[limits]
+cpu_ms = 300000
+
+[vars]
+NAROU_AUTH_REQUIRED = "true"
+NAROU_WORKER_ROLE = "acquisition"
+NAROU_ACQUISITION_LANE = "3"
+CONVERT_QUEUE_NAME = "narou-jobs-convert-local"
+S3_ENDPOINT = "http://127.0.0.1:9000"
+S3_REGION = "us-east-1"
+S3_BUCKET = "narou-local"
+S3_PREFIX = "narou/local"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "narou-local"
+database_id = "local-narou"
+migrations_dir = "migrations"
+
+[[queues.producers]]
+binding = "CONVERT_QUEUE"
+queue = "narou-jobs-convert-local"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_0"
+queue = "narou-jobs-acquire-1-local"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_1"
+queue = "narou-jobs-acquire-2-local"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_2"
+queue = "narou-jobs-acquire-3-local"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_3"
+queue = "narou-jobs-acquire-4-local"
+
+[[queues.consumers]]
+queue = "narou-jobs-acquire-4-local"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "narou-jobs-acquire-4-local-dlq"
+max_concurrency = 1
+
+[[services]]
+binding = "NAROU_WRITER"
+service = "narou-rs-local"
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "SiteRateLimiter"
+script_name = "narou-rs-local"
+
+[[durable_objects.bindings]]
+name = "PUSH_HUB"
+class_name = "PushHub"
+script_name = "narou-rs-local"

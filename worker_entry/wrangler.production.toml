@@ -18,9 +18,8 @@ NAROU_REQUIRE_S3 = "true"
 # Zero Trust (Access) を境界にする場合は CI の `NAROU_AUTH_REQUIRED=false` で
 # Bearer トークン検査を切る (NAROU_ADMIN_TOKEN も不要になる)。
 NAROU_AUTH_REQUIRED = "__NAROU_AUTH_REQUIRED__"
-# writer / reader の役割。writer は更新と管理を担い、reader は配信 (外部 API /
-# ブラウザの読み / EPUB) だけを受け持つ。同じ成果物を別の script 名の reader へ
-# 配備。役目は `vars.NAROU_WORKER_ROLE` で区別する。
+# writer は Web/API/cron と変換、旧取得キューの drain-only 入口を持つ。
+# 取得は別 script の acquisition 4 レーン、配信は reader が担う。
 NAROU_WORKER_ROLE = "writer"
 CONVERT_QUEUE_NAME = "__NAROU_CONVERT_QUEUE__"
 S3_ENDPOINT = "__S3_ENDPOINT__"
@@ -42,8 +41,7 @@ not_found_handling = "none"
 # Secrets Store を使う場合、render_config.py がここに [[secrets_store_secrets]] を差し込む。
 __SECRET_STORE_BLOCKS__
 
-[build]
-command = "node build_assets.mjs && worker-build --release"
+# ci/deploy_worker.py が assets / Wasm を 1 回だけビルドし、全 6 script で共有する。
 
 # 資格情報は既定で Worker の secret (`wrangler secret` / `--secrets-file`) から読む。
 # アカウント共有の Cloudflare Secrets Store に置く場合は、次の 2 つを有効にする
@@ -84,12 +82,30 @@ queue = "__NAROU_JOB_QUEUE__"
 binding = "CONVERT_QUEUE"
 queue = "__NAROU_CONVERT_QUEUE__"
 
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_0"
+queue = "__NAROU_ACQUIRE_QUEUE_1__"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_1"
+queue = "__NAROU_ACQUIRE_QUEUE_2__"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_2"
+queue = "__NAROU_ACQUIRE_QUEUE_3__"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_3"
+queue = "__NAROU_ACQUIRE_QUEUE_4__"
+
+# 旧取得キューは identity 解決 + lane dispatch だけを行う (重い取得は実行しない)。
+
 [[queues.consumers]]
 queue = "__NAROU_JOB_QUEUE__"
 max_batch_size = 1
 max_retries = 3
 dead_letter_queue = "__NAROU_JOB_DLQ__"
-max_concurrency = 4
+max_concurrency = 1
 
 [[queues.consumers]]
 queue = "__NAROU_CONVERT_QUEUE__"

@@ -11,7 +11,24 @@ fn load(root:&Path,prefix:&ObjectPrefix)->Result<Option<(PathBuf,Vec<u8>)>>{
 fn string_field(fields:&BTreeMap<String,&RawValue>,name:&str)->Result<Option<String>>{fields.get(name).map(|value|serde_json::from_str::<Option<String>>(value.get()).map_err(json_error)).transpose().map(Option::flatten)}
 pub(crate) fn read_fs_gate_origin(root:&Path,prefix:&ObjectPrefix)->Result<Option<String>>{
     let Some((_,bytes))=load(root,prefix)?else{return Ok(None);};let fields:BTreeMap<String,&RawValue>=serde_json::from_slice(&bytes).map_err(json_error)?;
-    if string_field(&fields,"prefix")?.as_deref().is_some_and(|stored|stored!=prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("filesystem gate prefix mismatch".into()));}Ok(Some(string_field(&fields,"origin_url_fold")?.unwrap_or_default()))
+    if string_field(&fields,"prefix")?.as_deref().is_some_and(|stored|stored!=prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("filesystem gate prefix mismatch".into()));}
+    let origin=string_field(&fields,"origin_url_fold")?.unwrap_or_default();
+    // A retired gate file holds no authoritative origin: the committed FS→SQL
+    // handoff superseded it and the SQL gate row carries the origin from now
+    // on. Only the SQLite backend retires a gate file, and only with a live
+    // database behind it; a marker without that authority is unproven
+    // provenance and stays fail-closed. The caller proves the per-prefix SQL
+    // gate row itself before this read (the writer epoch check), so the
+    // retired file never becomes the only origin proof.
+    let migrated:bool=fields.get("migrated").map(|value|serde_json::from_str::<bool>(value.get()).map_err(json_error)).transpose()?.unwrap_or(false);
+    if migrated{
+        let narou_dir=root.join(".narou");
+        let retired=crate::native::sqlite::state::read_mode(&narou_dir)==crate::native::sqlite::state::StorageMode::Sqlite
+            &&narou_dir.join(crate::native::sqlite::state::DB_FILE_NAME).exists();
+        if !retired{return Err(af::gate_closed_error(prefix));}
+        return Ok(None);
+    }
+    Ok(Some(origin))
 }
 pub(crate) fn rebind_fs_gate_origin_locked(root:&Path,prefix:&ObjectPrefix,fence_epoch:u64,expected:&str,new:&str)->Result<()>{
     if new.is_empty(){return Err(NarouError::Platform("virtual identity rebind requires a proven nonempty new origin".into()));}update(root,prefix,Some((fence_epoch,expected)),new)

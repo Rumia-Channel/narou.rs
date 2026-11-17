@@ -1,0 +1,74 @@
+# 取得専用 Worker の CI テンプレート。--role acquisition --lane 0..3 で描画する。
+# lane 0..3 は script / queue / config 名の acquire-1..4 に対応する。
+# ci/deploy_worker.py が 1 回だけビルドした成果物を writer / reader と共有する。
+# HTTP の公開口は持たず、取得キュー 1 本だけを消費する。
+
+name = "__ACQUISITION_NAME__"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-08-10"
+workers_dev = false
+
+[limits]
+cpu_ms = 300000
+
+[vars]
+NAROU_REQUIRE_S3 = "true"
+NAROU_AUTH_REQUIRED = "__NAROU_AUTH_REQUIRED__"
+NAROU_WORKER_ROLE = "acquisition"
+NAROU_ACQUISITION_LANE = "__ACQUISITION_LANE__"
+CONVERT_QUEUE_NAME = "__NAROU_CONVERT_QUEUE__"
+S3_ENDPOINT = "__S3_ENDPOINT__"
+S3_REGION = "__S3_REGION__"
+S3_BUCKET = "__S3_BUCKET__"
+S3_PREFIX = "__S3_PREFIX__"
+
+__SECRET_STORE_BLOCKS__
+
+[[d1_databases]]
+binding = "DB"
+database_name = "__NAROU_D1_DATABASE_NAME__"
+database_id = "__NAROU_D1_DATABASE_ID__"
+migrations_dir = "migrations"
+
+[[queues.producers]]
+binding = "CONVERT_QUEUE"
+queue = "__NAROU_CONVERT_QUEUE__"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_0"
+queue = "__NAROU_ACQUIRE_QUEUE_1__"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_1"
+queue = "__NAROU_ACQUIRE_QUEUE_2__"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_2"
+queue = "__NAROU_ACQUIRE_QUEUE_3__"
+
+[[queues.producers]]
+binding = "ACQUISITION_QUEUE_3"
+queue = "__NAROU_ACQUIRE_QUEUE_4__"
+
+# 取得の実行元はこのキューだけ。旧 NAROU_JOBS は writer が drain する。
+[[queues.consumers]]
+queue = "__NAROU_ACQUIRE_QUEUE__"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "__NAROU_ACQUIRE_DLQ__"
+max_concurrency = 1
+
+[[services]]
+binding = "NAROU_WRITER"
+service = "__WRITER_NAME__"
+
+# 新しい DO 名前空間は作らず、writer の既存名前空間を参照する。
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "SiteRateLimiter"
+script_name = "__WRITER_NAME__"
+
+[[durable_objects.bindings]]
+name = "PUSH_HUB"
+class_name = "PushHub"
+script_name = "__WRITER_NAME__"

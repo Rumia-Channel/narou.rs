@@ -13,13 +13,14 @@ export default class RuntimeRecoveryWorker extends Worker {
       return new Response('Unauthorized', { status: 401 });
     }
     // Read through the live workerd, not a competing Wrangler/SQLite process.
-    const [jobs, novels] = await Promise.all([
+    const [jobs, novels, lanes] = await Promise.all([
       this.env.DB.prepare(`SELECT job_id,kind,target,status,attempts,recovery_attempts,
         site_key,normalized_target,admission_waiting,lease_until,execution_token,
         checkpoint_json,last_error FROM worker_jobs ORDER BY created_at,job_id`).all(),
       this.env.DB.prepare('SELECT id,ncode,general_all_no FROM novels ORDER BY id').all(),
+      this.env.DB.prepare('SELECT lane,job_id,site_key,dispatch_token,lease_until FROM worker_acquisition_lanes ORDER BY lane').all(),
     ]);
-    return Response.json({ jobs: jobs.results, novels: novels.results });
+    return Response.json({ jobs: jobs.results, novels: novels.results, lanes: lanes.results });
   }
 
   async queue(batch) {

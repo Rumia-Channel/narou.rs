@@ -136,6 +136,20 @@ struct DownloadDiscovery {
     policy: crate::downloader::http_policy::FetchPolicy,
 }
 
+/// Whether a release failure only means "the cleanup is still pending".
+///
+/// An unpublished creation keeps its own namespace gated to its removal
+/// owner until the native startup collector finishes the cleanup. That state
+/// is durable and owned by the collector, so it never fails the operation
+/// that released the reservation.
+fn deferred_creation_cleanup(error: &NarouError) -> bool {
+    match error {
+        NarouError::CreationCleanupPending => true,
+        NarouError::Shared(inner) => deferred_creation_cleanup(inner),
+        _ => false,
+    }
+}
+
 async fn checkpoint_download_access(
     budget: &mut Option<&mut dyn SectionBudget>,
     origin: &AccessOrigin,
@@ -930,32 +944,52 @@ impl Downloader {
     }
 
     fn site_setting_for_stored_target(&self, record: &NovelRecord, target_type: TargetType) -> Result<&SiteSetting> {
+        Self::site_setting_for_stored_target_in(&self.site_settings, record.id, &record.toc_url, target_type)
+    }
+
+    fn site_setting_for_stored_target_in<'a>(settings: &'a [SiteSetting], id: i64, toc_url: &str, target_type: TargetType) -> Result<&'a SiteSetting> {
         match target_type {
-            TargetType::Id => self.site_setting_for_url(&record.toc_url).or_else(|| {
-                Self::ageauth_redirect_target(&record.toc_url)
-                    .and_then(|url| self.site_setting_for_url(&url))
-            }).ok_or_else(|| NarouError::NotFound(format!("Novel not found for ID: {}", record.id))),
-            _ => self.site_setting_for_url(&record.toc_url)
+            TargetType::Id => settings.iter().find(|setting| setting.matches_url(toc_url)).or_else(|| {
+                Self::ageauth_redirect_target(toc_url)
+                    .and_then(|url| settings.iter().find(|setting| setting.matches_url(&url)))
+            }).ok_or_else(|| NarouError::NotFound(format!("Novel not found for ID: {id}"))),
+            _ => settings.iter().find(|setting| setting.matches_url(toc_url))
                 .ok_or_else(|| NarouError::SiteSetting("No matching site setting".into())),
         }
     }
 
+    fn site_setting_for_new_ncode_in<'a>(settings: &'a [SiteSetting], url: &str, ncode: &str) -> Result<&'a SiteSetting> {
+        settings.iter().find(|setting| setting.matches_url(url))
+            .ok_or_else(|| NarouError::InvalidTarget(format!("対応外のncodeです({})", ncode.to_lowercase())))
+    }
+
     /// Admission identity follows the effective YAML definition, not an alias host.
+    /// Known metadata is just `(novel ID, TOC URL)`; unrelated fields are not decoded.
     /// Resolving this key performs no HTTP requests and does not clone the DSL.
-    pub async fn site_key_for_target(&self, target: &str, known_record: Option<&NovelRecord>) -> Result<String> {
+    pub fn site_key_for_known_target(settings: &[SiteSetting], target: &str, known: Option<(i64, &str)>) -> Result<String> {
         let target_type = Self::get_target_type(target);
         if matches!(target_type, TargetType::Url) {
-            let setting = self.site_settings.iter()
+            let setting = settings.iter()
                 .find(|setting| setting.matches_series_url(target))
-                .or_else(|| self.site_setting_for_url(target))
-                .or_else(|| self.site_settings.iter().find(|setting| setting.matches_author_url(target)))
+                .or_else(|| settings.iter().find(|setting| setting.matches_url(target)))
+                .or_else(|| settings.iter().find(|setting| setting.matches_author_url(target)))
                 .ok_or_else(|| NarouError::InvalidTarget(format!("No site setting for URL: {target}")))?;
             return Ok(setting.download_site_family());
         }
-        // Callers may reuse metadata already resolved for this target. URLs
-        // and free-text targets retain their original resolution precedence.
-        if let Some(record) = known_record && matches!(target_type, TargetType::Id | TargetType::Ncode) {
-            return Ok(self.site_setting_for_stored_target(record, target_type)?.download_site_family());
+        if known.is_none() && matches!(target_type, TargetType::Ncode) {
+            return Ok(Self::site_setting_for_new_ncode_in(settings, &narou_ncode_url(target), target)?.download_site_family());
+        }
+        let (id, toc_url) = known.ok_or_else(|| NarouError::NotFound(format!("Novel not found for ID: {target}")))?;
+        Ok(Self::site_setting_for_stored_target_in(settings, id, toc_url, target_type)?.download_site_family())
+    }
+
+    /// Admission lookup reuses already-loaded metadata without HTTP or downloader caches.
+    pub async fn site_key_for_target(&self, target: &str, known_record: Option<&NovelRecord>) -> Result<String> {
+        let target_type = Self::get_target_type(target);
+        if matches!(target_type, TargetType::Url)
+            || (known_record.is_some() && matches!(target_type, TargetType::Id | TargetType::Ncode))
+        {
+            return Self::site_key_for_known_target(&self.site_settings, target, known_record.map(|record| (record.id, record.toc_url.as_str())));
         }
         let (_, setting) = self.resolve_target_for_download(target).await?;
         Ok(setting.download_site_family())
@@ -1541,10 +1575,17 @@ impl Downloader {
             if creation.committed {
                 creation.reservation.adopt();
             } else if !creation.checkpoint_owned&&let Err(release_error)=self.novels.release_id(creation.reservation).await{
-                return Err(match result{
-                    Err(error)=>NarouError::Platform(format!("{error}; 小説IDの予約を解放できませんでした: {release_error}")),
-                    Ok(_)=>release_error,
-                });
+                // A deferred cleanup keeps the unpublished namespace gated to
+                // its own removal owner until the startup collector finishes
+                // it. That pending state never fails the download: a canceled
+                // new work is a normal skip, and a failed download keeps its
+                // own error.
+                if !deferred_creation_cleanup(&release_error){
+                    return Err(match result{
+                        Err(error)=>NarouError::Platform(format!("{error}; 小説IDの予約を解放できませんでした: {release_error}")),
+                        Ok(_)=>release_error,
+                    });
+                }
             }
         }
         result
@@ -3411,13 +3452,7 @@ impl Downloader {
                         }
                         None => {
                             let narou_url = narou_ncode_url(&ncode);
-                            let setting =
-                                self.site_setting_for_url(&narou_url).ok_or_else(|| {
-                                    NarouError::InvalidTarget(format!(
-                                        "対応外のncodeです({})",
-                                        ncode
-                                    ))
-                                })?;
+                            let setting = Self::site_setting_for_new_ncode_in(&self.site_settings, &narou_url, &ncode)?;
                             let toc_url = setting
                                 .toc_url_with_url_captures(&narou_url)
                                 .unwrap_or_else(|| setting.toc_url());

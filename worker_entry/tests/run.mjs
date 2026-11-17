@@ -3,6 +3,7 @@
 //   node tests/run.mjs            # debug build
 //   node tests/run.mjs --release  # CI と同じ release build
 //   node tests/run.mjs --keep     # 終了後も wrangler dev を残す
+//   node tests/run.mjs --skip-build  # ビルド済みの同じ成果物を全 suite で使う
 //
 // 実行ごとに .wrangler/contract-* に設定・合成資格情報・D1 を隔離する。
 // 開発用 .dev.vars と .wrangler/state は読み書きしない。
@@ -14,13 +15,15 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
+import { renderAcquisitionTopology } from "./acquisition_topology.mjs";
+import { localWorkerEnvironment } from "./read_worker_fixture.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
 const release = process.argv.includes("--release");
 const keep = process.argv.includes("--keep");
 const port = process.env.PORT ?? "8787";
-const token = process.env.NAROU_ADMIN_TOKEN ?? "local-contract-token";
+const token = "local-contract-token";
 const isWindows = process.platform === "win32";
 const npx = isWindows ? "npx.cmd" : "npx";
 
@@ -29,6 +32,7 @@ function run(command, args, options = {}) {
     cwd: root,
     stdio: "inherit",
     shell: isWindows,
+    env: localWorkerEnvironment,
     ...options,
   });
   if (result.status !== 0) {
@@ -55,7 +59,6 @@ async function stop(child) {
 mkdirSync(join(root, ".wrangler"), { recursive: true });
 const work = mkdtempSync(join(root, ".wrangler", "contract-"));
 const persist = join(work, "state");
-const testConfig = join(work, "wrangler.toml");
 let dev;
 let exitCode = 1;
 try {
@@ -79,17 +82,23 @@ if (!/^\d+\.\d+\.\d+$/.test(WRANGLER_VERSION)) {
   throw new Error(`NAROU_WRANGLER_VERSION must be exact x.y.z: ${WRANGLER_VERSION}`);
 }
 const WRANGLER_PACKAGE = `wrangler@${WRANGLER_VERSION}`;
-const config = readFileSync(join(root, "wrangler.toml"), "utf8")
-  .replace(/\[build\][^\[]*/, "")
-  .replace(/^main = .*$/m, `main = ${JSON.stringify(join(here, "virtual_race_worker.mjs").replaceAll("\\", "/"))}`)
-  .replace(/^directory = .*$/m, `directory = ${JSON.stringify(join(root, "public").replaceAll("\\", "/"))}`)
-  .replace(/^migrations_dir = .*$/m, `migrations_dir = ${JSON.stringify(join(root, "migrations").replaceAll("\\", "/"))}`);
-writeFileSync(testConfig, config);
-console.log(`wrote ${testConfig}`);
+// 取得は writer 1 本 + 取得専用 4 本 (同じ成果物) で実行する。writer は
+// Web/API/cron と変換キュー・旧取得キュー (drain-only) だけを持つ。
+const topology = renderAcquisitionTopology({
+  work,
+  target: "local",
+  main: join(here, "virtual_race_worker.mjs").replaceAll("\\", "/"),
+  assetsDirectory: join(root, "public").replaceAll("\\", "/"),
+  migrationsDirectory: join(root, "migrations").replaceAll("\\", "/"),
+});
+const testConfig = topology.writerPath;
+console.log(`wrote ${topology.configs.join(", ")}`);
 
 // 3. ビルド (設定から [build] を外しているのでアセットはここで作る)。
-run("node", ["build_assets.mjs"]);
-run("worker-build", release ? ["--release"] : []);
+if (!process.argv.includes("--skip-build")) {
+  run("node", ["build_assets.mjs"]);
+  run("worker-build", release ? ["--release"] : []);
+}
 
 // 4. ローカル D1 にマイグレーションを適用。
 run(npx, [
@@ -121,15 +130,14 @@ dev = spawn(
     "--yes",
     WRANGLER_PACKAGE,
     "dev",
-    "-c",
-    testConfig,
+    ...topology.configs.flatMap((path) => ["-c", path]),
     "--persist-to",
     persist,
     "--port",
     port,
     "--test-scheduled",
   ],
-  { cwd: root, stdio: "inherit", shell: isWindows, detached: !isWindows },
+  { cwd: root, stdio: "inherit", shell: isWindows, detached: !isWindows, env: localWorkerEnvironment },
 );
 
   const base = `http://127.0.0.1:${port}`;
@@ -213,7 +221,7 @@ dev = spawn(
         "--var",
         "NAROU_AUTH_REQUIRED:true",
       ],
-      { cwd: root, stdio: "inherit", shell: isWindows, detached: !isWindows },
+      { cwd: root, stdio: "inherit", shell: isWindows, detached: !isWindows, env: localWorkerEnvironment },
     );
     try {
       const unconfiguredBase = `http://127.0.0.1:${authPort}`;

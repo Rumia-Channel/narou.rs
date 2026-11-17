@@ -2,20 +2,23 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
+import { renderAcquisitionTopology } from './acquisition_topology.mjs';
+import { localWorkerEnvironment, wranglerPackage } from './read_worker_fixture.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 mkdirSync(join(root, '.wrangler'), { recursive: true });
 const work = mkdtempSync(join(root, '.wrangler', 'author-smoke-'));
-const config = join(work, 'wrangler.toml');
+let config = join(work, 'wrangler.toml');
 const persist = join(work, 'state');
 const token = 'isolated-author-smoke-token';
 const windows = process.platform === 'win32';
 const npx = windows ? 'npx.cmd' : 'npx';
 let child, port, sourcePort, logs = '', workCount = 2, authorHits = 0, pause;
+let topology;
 async function source(req, res) {
   const path = new URL(req.url, 'http://localhost').pathname;
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -35,7 +38,7 @@ async function source(req, res) {
 const server = http.createServer((req, res) => { source(req, res).catch((error) => { res.statusCode = 500; res.end(String(error)); }); });
 const ipv6 = http.createServer((req, res) => { source(req, res).catch((error) => { res.statusCode = 500; res.end(String(error)); }); });
 function run(args) {
-  const result = spawnSync(npx, ['wrangler', ...args], { cwd: root, shell: windows, encoding: 'utf8', env: { ...process.env, CI: 'true', WRANGLER_SEND_METRICS: 'false' } });
+  const result = spawnSync(npx, ['--yes', wranglerPackage, ...args], { cwd: root, shell: windows, encoding: 'utf8', env: localWorkerEnvironment });
   if (result.status !== 0) throw new Error(`wrangler failed: ${result.stderr}\n${result.stdout}`);
   return result.stdout;
 }
@@ -80,7 +83,7 @@ async function update() {
 async function setting(values, expected) { return json('/api/global_setting', { settings: values, expected }); }
 async function start() {
   logs = '';
-  child = spawn(npx, ['wrangler', 'dev', '--config', config, '--persist-to', persist, '--port', String(port), '--test-scheduled'], { cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CI: 'true', WRANGLER_SEND_METRICS: 'false' } });
+  child = spawn(npx, ['--yes', wranglerPackage, 'dev', ...topology.configs.flatMap((path) => ['--config', path]), '--persist-to', persist, '--port', String(port), '--test-scheduled'], { cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'], env: localWorkerEnvironment });
   for (const stream of [child.stdout, child.stderr]) stream.on('data', (chunk) => { logs = (logs + chunk).slice(-150000); });
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
@@ -104,11 +107,13 @@ try {
   server.listen(0, '127.0.0.1'); await once(server, 'listening'); sourcePort = server.address().port;
   ipv6.listen(sourcePort, '::1'); await once(ipv6, 'listening');
   const probe = http.createServer(); probe.listen(0, '127.0.0.1'); await once(probe, 'listening'); port = probe.address().port; await new Promise((resolve) => probe.close(resolve));
-  let toml = readFileSync(join(root, 'wrangler.toml'), 'utf8').replace(/\[build\][^\[]*/, '');
-  toml = toml.replace(/^main = .*$/m, `main = ${JSON.stringify(join(root, 'build/worker/shim.mjs').replaceAll('\\', '/'))}`)
-    .replace(/^directory = "public"$/m, `directory = ${JSON.stringify(join(root, 'public').replaceAll('\\', '/'))}`)
-    .replace(/^migrations_dir = "migrations"$/m, `migrations_dir = ${JSON.stringify(join(root, 'migrations').replaceAll('\\', '/'))}`);
-  writeFileSync(config, toml);
+  // 取得は writer 1 本 + 取得専用 4 本で実行する (writer は実行しない)。
+  topology = renderAcquisitionTopology({
+    work,
+    target: 'local',
+    main: join(root, 'build/worker/shim.mjs').replaceAll('\\', '/'),
+  });
+  config = topology.writerPath;
   writeFileSync(join(work, '.dev.vars'), `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${Buffer.alloc(32, 7).toString('base64')}\nS3_ACCESS_KEY_ID=local-test-key\nS3_SECRET_ACCESS_KEY=local-test-secret\n`);
   run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
   // Author scenarios intentionally use legacy D1, independent of S3-default coverage.

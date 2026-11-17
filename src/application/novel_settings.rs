@@ -18,8 +18,9 @@
 //! the web framework.
 
 use super::novel_access::{NovelReadLease, NovelReadScope, NovelWriteGuard};
+use futures::lock::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Weak};
 
 use crate::application::error::ApplicationError;
 use crate::converter::ini::{IniData, IniValue};
@@ -130,6 +131,28 @@ pub struct NovelSettingsService {
     objects: Arc<dyn ObjectStore>,
 }
 
+/// The process-wide mutation lock of one novel namespace.
+///
+/// The platform's guarded small update is exclusive per namespace for its
+/// whole read-modify-write, so two settings saves of the same novel inside
+/// one process would otherwise collide on that lock instead of keeping each
+/// other's unrelated fields. Active saves share a lock per prefix; expired
+/// weak entries are pruned in bounded batches.
+fn novel_mutation_lock(prefix: &str) -> Arc<Mutex<()>> {
+    static LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Weak<Mutex<()>>>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    let mut locks = LOCKS.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(lock) = locks.get(prefix).and_then(Weak::upgrade) {
+        return lock;
+    }
+    if locks.len() >= 256 {
+        locks.retain(|_, lock| lock.strong_count() > 0);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(prefix.to_owned(), Arc::downgrade(&lock));
+    lock
+}
+
 impl NovelSettingsService {
     /// Create the service with injected dependencies.
     pub fn new(novels: Arc<dyn NovelRepository>, objects: Arc<dyn ObjectStore>) -> Self {
@@ -181,6 +204,14 @@ impl NovelSettingsService {
             .map_err(ApplicationError::platform)?
             .ok_or_else(|| ApplicationError::NotFound(format!("ID: {}", id.0)))?;
         let keys = self.keys_for(&record)?;
+
+        // One writer per novel inside this process. The platform's guarded
+        // small update holds the novel's OS mutation lock for its whole
+        // read-modify-write, so two concurrent saves of the same novel would
+        // fail with `novel_busy` instead of keeping each other's unrelated
+        // fields. The OS lock still excludes every other writer.
+        let mutation = novel_mutation_lock(keys.prefix().as_ref());
+        let _mutation = mutation.lock().await;
 
         // One origin for both files, captured before their read-modify-write
         // work; a transfer between the two writes cannot adopt its new epoch.

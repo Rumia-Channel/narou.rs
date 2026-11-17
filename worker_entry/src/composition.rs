@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::SecondsFormat;
+use narou_rs::application::acquisition_lanes::LANE_COUNT;
 use narou_rs::application::settings::SettingsStore;
 use narou_rs::application::{
     AppServiceDependencies, AppServices,
@@ -27,7 +28,9 @@ use crate::d1_object_store::D1ObjectStore;
 use crate::d1_repository::{D1FreezeStore, D1NovelRepository, D1SettingsStore, D1TagColorStore};
 use crate::http::WorkerHttpClient;
 use crate::ledger::{D1JobLedger, D1SchedulerCheckpoint};
+use crate::push_hub::PushHubClient;
 use crate::rate_limiter::WorkerRateLimiter;
+use crate::worker_role::WorkerRole;
 
 #[path = "asset_backend.rs"]
 mod asset_backend;
@@ -47,6 +50,8 @@ pub struct DispatchOutcome {
 /// Queue producer binding that carries version-2 job envelopes.
 pub const JOB_QUEUE_BINDING: &str = "NAROU_JOBS";
 const CONVERT_QUEUE_BINDING: &str = "CONVERT_QUEUE";
+/// Producer binding prefix of the four acquisition lane queues.
+pub const ACQUISITION_QUEUE_BINDING_PREFIX: &str = "ACQUISITION_QUEUE_";
 /// Service binding of the writer script. 配信 Worker は捕捉した変更系を
 /// ここへ転送する (同一ドメインの更新 Worker)。
 pub const WRITER_SERVICE_BINDING: &str = "NAROU_WRITER";
@@ -81,9 +86,12 @@ pub struct WorkerRuntime {
     pub write_services: AppServices,
     pub ledger: Arc<D1JobLedger>,
     pub checkpoint: D1SchedulerCheckpoint,
-    acquisition_queue: Queue,
-    convert_queue: Queue,
-    convert_queue_name: String,
+    /// Producer handles of the four acquisition lane queues.
+    acquisition_lane_queues: Vec<Queue>,
+    /// Conversion producer for writer and acquisition lanes; reader has none.
+    convert_queue: Option<Queue>,
+    /// Live event client bound to this invocation's subrequest budget.
+    push: PushHubClient,
     pub freeze: Arc<D1FreezeStore>,
     pub novels: Arc<dyn NovelRepository>,
     http: Arc<dyn HttpClient>,
@@ -98,6 +106,8 @@ pub struct WorkerRuntime {
     write_objects: Arc<dyn ObjectStore>,
     pub clock: Arc<dyn Clock>,
     site_settings: Arc<Vec<SiteSetting>>,
+    /// Job snapshots bypass the cross-isolate YAML TTL; UI snapshots do not.
+    site_settings_fresh: bool,
     /// 更新系の D1 ハンドル。常に primary 直行 — read replica の遅延中に
     /// 書き込み判断の読み取りを行わせない。
     write_db: DbHandle,
@@ -321,7 +331,11 @@ impl WorkerRuntime {
         profile: CompositionProfile,
     ) -> worker::Result<Self> {
         // 配信 Worker では source を変更しない組立に落とす。
-        let reader = crate::worker_role::is_reader(env)?;
+        let role = crate::worker_role::role(env)?;
+        // The lane index is validated here so a misconfigured lane script
+        // fails composition instead of consuming another lane's deliveries.
+        let _lane = crate::worker_role::acquisition_lane(env)?;
+        let reader = role == WorkerRole::Reader;
         let subrequests = crate::budget::SubrequestBudget::new();
         let WorkerObjectStores {
             objects: write_objects, assets: write_assets, stage_store, ..
@@ -382,8 +396,12 @@ impl WorkerRuntime {
             WorkerRateLimiter::new(env, subrequests.clone())
                 .map_err(|error| worker::Error::RustError(error.to_string()))?,
         );
-        let site_settings = crate::bundled_sites::load_site_settings(&write_objects)
-            .await.map_err(|error| worker::Error::RustError(error.to_string()))?;
+        let site_settings_fresh = matches!(profile, CompositionProfile::Job);
+        let site_settings = if site_settings_fresh {
+            crate::bundled_sites::load_site_settings_uncached(&write_objects).await
+        } else {
+            crate::bundled_sites::load_site_settings(&write_objects).await
+        }.map_err(|error| worker::Error::RustError(error.to_string()))?;
         crate::webui::metadata::initialize_attributes(env).await?;
         let novels: Arc<dyn NovelRepository> =
             Arc::new(D1NovelRepository::new(db.clone()).with_sites(site_settings.clone()).with_objects(write_objects.clone()));
@@ -397,12 +415,32 @@ impl WorkerRuntime {
         // 側がセッションハンドルを使う。
         let ledger = Arc::new(D1JobLedger::new(write_db.clone(), clock.clone()));
         let checkpoint = D1SchedulerCheckpoint::new(write_db.clone());
-        let acquisition_queue = env.queue(JOB_QUEUE_BINDING)?;
-        let convert_queue = env.queue(CONVERT_QUEUE_BINDING)?;
-        let convert_queue_name = env.var("CONVERT_QUEUE_NAME")?.to_string();
-        if convert_queue_name.is_empty() {
-            return Err(worker::Error::RustError("CONVERT_QUEUE_NAME is empty".into()));
+        // 取得レーンも取得後の変換を writer のキューへ送る。実行は writer だけ。
+        // キュー名は配備の識別子なので、空のままでは組立させない。
+        let convert_queue = match role {
+            WorkerRole::Writer | WorkerRole::Acquisition => {
+                let name = env.var("CONVERT_QUEUE_NAME")?.to_string();
+                if name.is_empty() {
+                    return Err(worker::Error::RustError("CONVERT_QUEUE_NAME is empty".into()));
+                }
+                Some(env.queue(CONVERT_QUEUE_BINDING)?)
+            }
+            WorkerRole::Reader => None,
+        };
+        // 取得レーンの送信先。4 本すべての binding が揃っている脚本だけが
+        // 組立できる (binding が欠けた脚本は、配信できない job を受け取る
+        // ので fail closed する)。
+        let mut acquisition_lane_queues: Vec<Queue> = Vec::with_capacity(LANE_COUNT as usize);
+        for index in 0..LANE_COUNT {
+            let binding = format!("{ACQUISITION_QUEUE_BINDING_PREFIX}{index}");
+            let queue = env.queue(&binding).map_err(|error| {
+                worker::Error::RustError(format!(
+                    "acquisition lane queue binding {binding} is missing: {error}"
+                ))
+            })?;
+            acquisition_lane_queues.push(queue);
         }
+        let push = PushHubClient::new(env, subrequests.clone());
 
         let services = services_from(ServiceDependencies {
             novels: novels.clone(),
@@ -431,9 +469,9 @@ impl WorkerRuntime {
             write_services,
             ledger,
             checkpoint,
-            acquisition_queue,
+            acquisition_lane_queues,
             convert_queue,
-            convert_queue_name,
+            push,
             freeze,
             novels: write_novels,
             http,
@@ -445,6 +483,7 @@ impl WorkerRuntime {
             stage_store,
             clock,
             site_settings,
+            site_settings_fresh,
             write_db,
             cookie_store,
             pending_section_hash_cache: Arc::new(parking_lot::Mutex::new(None)),
@@ -456,6 +495,54 @@ impl WorkerRuntime {
         self.clock
             .now_utc()
             .to_rfc3339_opts(SecondsFormat::Nanos, true)
+    }
+
+    /// The producer handle of one acquisition lane queue.
+    pub fn lane_queue(&self, lane: u8) -> Option<&Queue> {
+        self.acquisition_lane_queues.get(lane as usize)
+    }
+
+    /// The live event client of this invocation.
+    pub fn push(&self) -> &PushHubClient {
+        &self.push
+    }
+
+    /// Assign ready acquisition rows to free lanes.
+    ///
+    /// The dispatcher only moves durable rows into a lane queue; it never
+    /// executes an acquisition itself.
+    pub async fn dispatch_acquisition(&self) -> Result<()> {
+        crate::acquisition::dispatch(self).await
+    }
+
+    /// Admission uses current primary definitions, sharing the fresh job
+    /// snapshot when one was already loaded during composition.
+    pub(crate) async fn effective_site_settings(&self) -> Result<Arc<Vec<SiteSetting>>> {
+        if self.site_settings_fresh {
+            return Ok(self.site_settings.clone());
+        }
+        crate::bundled_sites::load_site_settings_uncached(&self.write_objects).await
+    }
+
+    /// Give one acquisition row the identity the lane dispatcher needs.
+    ///
+    /// The identity is resolved from the effective YAML definitions, without
+    /// building a heavy downloader and without an upstream request.
+    pub(crate) async fn prepare_acquisition_identity(
+        &self,
+        job_id: &JobId,
+        plan: &JobPlan,
+        settings: &[SiteSetting],
+    ) -> Result<()> {
+        let identity =
+            crate::acquisition::resolve_identity_with(settings, self, &plan.target).await?;
+        self.ledger
+            .set_acquisition_identity(
+                job_id,
+                &identity.normalized_target,
+                &identity.site_key,
+            )
+            .await
     }
 
     /// A fresh, exclusively-owned shared Downloader for one event invocation.
@@ -682,28 +769,34 @@ impl WorkerRuntime {
         Ok(expanded)
     }
 
-    fn queue_for_kind(&self, kind: &str) -> &Queue {
-        if kind == JobKind::Convert.as_str() { &self.convert_queue } else { &self.acquisition_queue }
-    }
-
-    pub fn is_conversion_queue(&self, name: &str) -> bool {
-        name == self.convert_queue_name
-    }
-
-    /// Redispatch the same durable job, including envelopes left in the old queue.
+    /// Redispatch the same durable job.
+    ///
+    /// Conversion keeps the version-2 protocol on the conversion queue.
+    /// Acquisition work is only ever delivered by the lane dispatcher: the
+    /// writer never executes an acquisition itself.
     pub async fn send_existing_job(&self, job_id: &JobId, kind: &str) -> Result<()> {
-        self.queue_for_kind(kind)
-            .send(WorkerJobEnvelope::v2(job_id.clone()))
-            .await
-            .map_err(|error| NarouError::Platform(format!("queue send failed: {error}")))
+        if kind == JobKind::Convert.as_str() {
+            let queue = self.convert_queue.as_ref().ok_or_else(|| {
+                NarouError::Platform("conversion queue binding is unavailable in this script".into())
+            })?;
+            return queue
+                .send(WorkerJobEnvelope::v2(job_id.clone()))
+                .await
+                .map_err(|error| NarouError::Platform(format!("queue send failed: {error}")));
+        }
+        self.dispatch_acquisition().await
     }
 
     /// Completion and cron wake durable waiting work without provider retries.
+    ///
+    /// Only conversion rows wait in the queue's waiting set; acquisition rows
+    /// are woken by the lane dispatcher.
     pub async fn wake_waiting_jobs(&self) -> Result<()> {
         for job in self.ledger.waiting_jobs().await? {
-            if self.ledger.mark_waiting_dispatched(&job.job_id).await? {
-                self.send_existing_job(&JobId(job.job_id), &job.kind).await?;
+            if !self.ledger.mark_waiting_dispatched(&job.job_id).await? {
+                continue;
             }
+            self.send_existing_job(&JobId(job.job_id), &job.kind).await?;
         }
         Ok(())
     }
@@ -765,7 +858,23 @@ impl WorkerRuntime {
         let frozen = self.frozen_skip_reasons(plans).await;
         let mut results: Vec<std::result::Result<DispatchOutcome, String>> =
             Vec::with_capacity(plans.len());
-        let mut sends: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+        let mut converts: Vec<usize> = Vec::new();
+        let mut acquisitions = 0usize;
+        // 取得行の identity はページ全体で同じ定義スナップショットを使う。
+        let settings = if plans
+            .iter()
+            .any(|plan| plan.kind != JobKind::Convert)
+        {
+            match self.effective_site_settings().await {
+                Ok(settings) => Some(settings),
+                Err(error) => {
+                    console_log!("site definitions are unavailable: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         for (index, plan) in plans.iter().enumerate() {
             let job_id = enqueued[index].queued.job_id.clone();
             // 凍結小説の除外はここでも行う (native の update/download 拒否と
@@ -833,19 +942,43 @@ impl WorkerRuntime {
                 }));
                 continue;
             }
-            sends[usize::from(plan.kind == JobKind::Convert)].push(index);
+            if plan.kind == JobKind::Convert {
+                converts.push(index);
+                results.push(Ok(DispatchOutcome {
+                    job_id: job_id.as_str().to_string(),
+                    sent: false,
+                    blocked: None,
+                }));
+                continue;
+            }
+            // 取得は「識別子のある行」としてだけ予約できる。effective YAML から
+            // 正規の target と site family を先に確定し (重い Downloader は
+            // 作らない)、そのあとレーンへ割り当ててもらう。
+            if let Some(settings) = &settings
+                && let Err(error) = self
+                    .prepare_acquisition_identity(&job_id, plan, settings)
+                    .await
+            {
+                // 対象が解決できない行は identity なしで残る。ディスパッチャの
+                // 取り込み処理が、実行時と同じ恒久エラーとして終端する。
+                console_log!("job {job_id} has no effective site identity yet: {error}");
+            }
+            acquisitions += 1;
             results.push(Ok(DispatchOutcome {
                 job_id: job_id.as_str().to_string(),
-                sent: false,
+                sent: true,
                 blocked: None,
             }));
         }
+        // 変換だけは version-2 のまま変換キューへ送る。
         // Bounded Queue batches. A failed `send_batch` is retried per message
         // so the failure stays attached to its own plan and the rest of the
         // page (and later chunks) still goes out.
-        for (kind, indices) in [(JobKind::Download, &sends[0]), (JobKind::Convert, &sends[1])] {
-            let queue = self.queue_for_kind(kind.as_str());
-            for chunk in indices.chunks(QUEUE_SEND_BATCH_SIZE) {
+        if !converts.is_empty() {
+            let queue = self.convert_queue.as_ref().ok_or_else(|| {
+                NarouError::Platform("conversion queue binding is unavailable in this script".into())
+            })?;
+            for chunk in converts.chunks(QUEUE_SEND_BATCH_SIZE) {
                 let envelopes: Vec<WorkerJobEnvelope> = chunk
                     .iter()
                     .map(|index| WorkerJobEnvelope::v2(enqueued[*index].queued.job_id.clone()))
@@ -879,6 +1012,13 @@ impl WorkerRuntime {
                         }
                     }
                 }
+            }
+        }
+        // 取得はレーンへ割り当てる。割り当てに失敗しても行は台帳に残るので、
+        // 次のディスパッチ/クロンが回収する (ジョブは失われない)。
+        if acquisitions > 0 {
+            if let Err(error) = self.dispatch_acquisition().await {
+                console_log!("acquisition dispatch failed: {error}");
             }
         }
         Ok(results)
@@ -1205,17 +1345,49 @@ pub async fn check_ready(env: &Env) -> worker::Result<()> {
             ));
         }
     }
-    if crate::worker_role::is_reader(env)? {
-        // 捕捉した変更系は writer へ転送するので、その binding を要求する。
-        env.service(WRITER_SERVICE_BINDING)?;
-        return build_read_services(env).await.map(|_| ());
+    match crate::worker_role::role(env)? {
+        WorkerRole::Reader => {
+            // 捕捉した変更系は writer へ転送するので、その binding を要求する。
+            env.service(WRITER_SERVICE_BINDING)?;
+            return build_read_services(env).await.map(|_| ());
+        }
+        WorkerRole::Acquisition => {
+            // consumer は自分の1本だけ。producer は系列再配信と取得後の変換用。
+            let lane = crate::worker_role::acquisition_lane(env)?.ok_or_else(|| {
+                worker::Error::RustError("acquisition role has no lane index".to_string())
+            })?;
+            env.queue(&format!("{ACQUISITION_QUEUE_BINDING_PREFIX}{lane}"))?;
+            env.queue(CONVERT_QUEUE_BINDING)?;
+            env.durable_object("RATE_LIMITER")?;
+            env.durable_object("PUSH_HUB")?;
+            // The lane dispatches acquisitions too, so every lane queue must
+            // be bound.
+            for index in 0..LANE_COUNT {
+                env.queue(&format!("{ACQUISITION_QUEUE_BINDING_PREFIX}{index}"))?;
+            }
+            // Full composition validates bundled sites and all adapters.
+            return WorkerRuntime::build(env).await.map(|_| ());
+        }
+        WorkerRole::Writer => {}
     }
     env.queue(JOB_QUEUE_BINDING)?;
     env.queue(CONVERT_QUEUE_BINDING)?;
     env.durable_object("RATE_LIMITER")?;
     env.durable_object("PUSH_HUB")?;
+    // The writer dispatches acquisitions, so every lane queue must be bound.
+    for index in 0..LANE_COUNT {
+        env.queue(&format!("{ACQUISITION_QUEUE_BINDING_PREFIX}{index}"))?;
+    }
     // Full composition validates bundled sites and all adapters.
     WorkerRuntime::build(env).await.map(|_| ())
+}
+
+/// The name of the conversion queue of this deployment, when it has one.
+pub fn convert_queue_name(env: &Env) -> Option<String> {
+    env.var("CONVERT_QUEUE_NAME")
+        .ok()
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Deserialize)]

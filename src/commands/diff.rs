@@ -451,15 +451,51 @@ fn clean_diff_data(context: &NovelContext) -> std::result::Result<bool, String> 
     }
     snapshot.publish_changes().map_err(|error| error.to_string())?;
     let primary = narou_rs::native::object_store::NativeStore::for_current_root().map_err(|error| error.to_string())?;
-    if matches!(&primary, narou_rs::native::object_store::NativeStore::Sqlite(_)) {
-        let pruned = primary.with_open_write(snapshot.origin().fence(), || {
+    removed |= primary.with_open_write(snapshot.origin().fence(), || {
+        let mut pruned = false;
+        // Empty legacy versions are absent from the object catalog and the
+        // private snapshot. Remove only empty physical directories, under
+        // the same original fence as the catalog deletion.
+        for name in DIFF_CACHE_DIR_NAMES {
+            let cache = directory.join(SECTION_SAVE_DIR).join(name);
+            let metadata = match fs::symlink_metadata(&cache) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(narou_rs::error::NarouError::Platform("diff cache is not a physical directory".into()));
+            }
+            let cache = narou_rs::db::paths::ensure_within_archive_root(&cache, &directory)?;
+            let entries = match fs::read_dir(&cache) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() { continue; }
+                let path = narou_rs::db::paths::ensure_within_archive_root(&entry.path(), &directory)?;
+                pruned |= remove_empty_diff_directory(&path)?;
+            }
+            pruned |= remove_empty_diff_directory(&cache)?;
+        }
+        if matches!(&primary, narou_rs::native::object_store::NativeStore::Sqlite(_)) {
             let connection = version_conn().map_err(narou_rs::error::NarouError::Platform)?;
-            narou_rs::native::sqlite::versions::prune_history(&connection.lock(), context.record.id, 0)
-        }).map_err(|error| error.to_string())?;
-        removed |= pruned > 0;
-    }
+            pruned |= narou_rs::native::sqlite::versions::prune_history(&connection.lock(), context.record.id, 0)? > 0;
+        }
+        Ok(pruned)
+    }).map_err(|error| error.to_string())?;
     Ok(removed)
 }
+fn remove_empty_diff_directory(path: &Path) -> std::io::Result<bool> {
+    let mut entries = fs::read_dir(path)?;
+    let empty = entries.next().transpose()?.is_none();
+    drop(entries);
+    if empty { fs::remove_dir(path)?; }
+    Ok(empty)
+}
+
 
 fn clean_diff(context: &NovelContext) -> std::result::Result<(), String> {
     let removed = clean_diff_data(context)?;

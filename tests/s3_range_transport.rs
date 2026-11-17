@@ -258,7 +258,13 @@ fn illustration_migration_cli_preserves_bytes_and_dry_run_boundaries() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     std::fs::create_dir(root.join(".narou")).unwrap();
-    std::fs::write(root.join(".narou/database.yaml"), "{}\n").unwrap();
+    let record: narou_rs::db::NovelRecord = serde_yaml::from_str(
+        "id: 1\nauthor: author\ntitle: Fixture\nfile_title: title\ntoc_url: https://example.test/1\nsitename: site\nlast_update: '2026-01-01T00:00:00Z'\n",
+    ).unwrap();
+    std::fs::write(
+        root.join(".narou/database.yaml"),
+        serde_yaml::to_string(&std::collections::BTreeMap::from([(record.id, record)])).unwrap(),
+    ).unwrap();
     std::fs::write(root.join(".narou/local_setting.yaml"), format!(
         "s3.asset-backend: s3\ns3.endpoint: http://{address}\ns3.bucket: bucket\ns3.prefix: fixture\ns3.region: us-east-1\ns3.access-key-id: fixture\ns3.secret-access-key: fixture-secret\n",
     )).unwrap();

@@ -337,9 +337,16 @@ fn fill_general_all_no_in_database() -> Result<(), String> {
     let ids = novels
         .scan_ids_sync(&NovelFilter::all(), None, usize::MAX)
         .map_err(|e| e.to_string())?;
+    // One metadata load for the whole library. Every single-record read
+    // re-reads and re-parses the library metadata, so a per-id loop turns a
+    // large library (a multi-megabyte title included) into minutes of
+    // startup work before the server binds its port.
+    let records = novels
+        .get_many_current_sync(&ids)
+        .map_err(|error| error.to_string())?;
 
-    for id in ids {
-        let Some(record) = novels.get_current_sync(id).map_err(|error| error.to_string())? else {
+    for (id, record) in ids.into_iter().zip(records) {
+        let Some(record) = record else {
             continue;
         };
         if record.general_all_no.is_some() {

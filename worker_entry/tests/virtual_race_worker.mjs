@@ -91,6 +91,11 @@ try {
 }
 
 let jobsPaused = false;
+async function waitForJobs() {
+  // Timers belong to the waiting invocation. Resolving a shared Promise from
+  // a later HTTP request can cancel workerd's cross-request continuation.
+  while (jobsPaused) await new Promise(resolve => setTimeout(resolve, 25));
+}
 const barriers = new Map();
 async function meet(name) {
   let barrier = barriers.get(name);
@@ -197,9 +202,13 @@ function gatedDatabase(database, phase, paused) {
 
 export default class SnapshotRaceWorker extends worker {
   async fetch(request) {
-    const jobs = new URL(request.url).pathname.match(/^\/__test\/jobs\/(pause|resume)$/);
+    const jobs = new URL(request.url).pathname.match(/^\/__test\/jobs\/(pause|resume|wait)$/);
     if (jobs) {
-      jobsPaused = jobs[1] === 'pause';
+      if (jobs[1] === 'wait') {
+        await waitForJobs();
+      } else {
+        jobsPaused = jobs[1] === 'pause';
+      }
       return Response.json({ success: true });
     }
     const control = new URL(request.url).pathname.match(/^\/__test\/virtual-pause\/([^/]+)\/(wait|release)$/);
@@ -216,11 +225,14 @@ export default class SnapshotRaceWorker extends worker {
   }
 
   async queue(batch) {
-    // Selection tests inspect real queued rows without making upstream
-    // requests. They cancel those rows before resuming delivery.
-    if (jobsPaused) {
-      batch.retryAll({ delaySeconds: 3600 });
-      return;
+    // The writer owns the pause barrier; lane isolates consult the same gate.
+    // Wait outside production, without ACK, retry or ledger-state fabrication.
+    if (this.env.NAROU_WORKER_ROLE === 'acquisition') {
+      const response = await this.env.NAROU_WRITER.fetch('http://fixture/__test/jobs/wait');
+      if (!response.ok) throw new Error(`queue pause barrier: ${response.status}`);
+      await response.text();
+    } else {
+      await waitForJobs();
     }
     // ブラウザ確認の合成リレーだけを設定する。踏み台の答えは合成上流に
     // 対するもので、他の取得先の回答には触れない。

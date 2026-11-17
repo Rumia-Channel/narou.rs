@@ -5,23 +5,23 @@ import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { brotliDecompressSync, inflateRawSync } from 'node:zlib';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
 import { createS3MultipartFixture } from './s3_multipart_fixture.mjs';
 import { animationFixture, verifyPng, isAnimation } from './animation_fixture.mjs';
 import { transferClient } from './transfer.mjs';
+import { renderAcquisitionTopology } from './acquisition_topology.mjs';
+import { localWorkerEnvironment, wranglerPackage } from './read_worker_fixture.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
 const npx = windows ? 'npx.cmd' : 'npx';
-const wranglerVersion = process.env.NAROU_WRANGLER_VERSION ?? '4.151.3';
-assert.match(wranglerVersion, /^\d+\.\d+\.\d+$/);
-const wranglerPackage = `wrangler@${wranglerVersion}`;
 mkdirSync(join(root, '.wrangler'), { recursive: true });
 const work = mkdtempSync(join(root, '.wrangler', 'content-smoke-'));
-const config = join(work, 'wrangler.toml');
+let config = join(work, 'wrangler.toml');
+let topology;
 let persist = join(work, 'state');
 const token = 'isolated-content-smoke-token';
 const objects = new Map();
@@ -42,6 +42,10 @@ const imageContinuations = [];
 let yieldBarrier = null;
 let deliveryWitness = null;
 let canonicalWriteBarrier = null;
+// The armed canonical write is shared by every script of the topology (the
+// acquisition runs in a lane isolate, the arm arrives at the writer), so the
+// fixture sink keeps it instead of a script-local module variable.
+let canonicalArmed = null;
 const longEpisodeCount = 1685;
 const longEpisodeRequests = new Map();
 const longInvocationStarts = [];
@@ -50,12 +54,46 @@ const imagePng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0
 let child;
 let logs = '';
 let port;
+let s3Port = 0;
+const memorySamples = [];
+const memoryObservers = new Set();
 const xml = (s) => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
 const etag = (bytes) => `"${createHash('md5').update(bytes).digest('hex')}"`;
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://127.0.0.1');
     const key = decodeURIComponent(url.pathname);
+    if (key === '/_fixture/memory') {
+      if (req.method === 'POST') {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const sample = JSON.parse(Buffer.concat(chunks).toString());
+        memorySamples.push(sample);
+        if (sample.role === 'acquisition') {
+          for (const release of memoryObservers) release();
+          memoryObservers.clear();
+        }
+        res.writeHead(204); res.end(); return;
+      }
+      if (!memorySamples.some(sample => sample.role === 'acquisition')) {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            memoryObservers.delete(release);
+            reject(new Error('acquisition memory observation missing'));
+          }, 60000);
+          const release = () => { clearTimeout(timer); resolve(); };
+          memoryObservers.add(release);
+        });
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        wasmBytes: Math.max(0, ...memorySamples.map(sample => sample.wasmBytes)),
+        highWater: Math.max(0, ...memorySamples.map(sample => sample.highWater)),
+        instances: Math.max(0, ...memorySamples.map(sample => sample.instances)),
+        samples: memorySamples.length,
+      }));
+      return;
+    }
     if (req.method === 'POST' && key === '/_fixture/yield') {
       const gate = yieldBarrier;
       if (gate) {
@@ -68,15 +106,37 @@ const server = http.createServer(async (req, res) => {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const delivery = JSON.parse(Buffer.concat(chunks).toString());
+      // A canonical-only witness ignores the deliveries that did not publish
+      // canonical bytes; the expected count and the captured envelopes are
+      // shared by both contracts.
       if (deliveryWitness && (!deliveryWitness.canonicalOnly || delivery.canonical)) {
         deliveryWitness.ids.push(...delivery.ids);
+        if (deliveryWitness.messages) deliveryWitness.messages.push(...(delivery.messages ?? []));
+        deliveryWitness.returned?.resolve();
         if (deliveryWitness.ids.length >= (deliveryWitness.expected ?? 2)) deliveryWitness.completed.resolve();
       }
       res.end('recorded'); return;
     }
+    if (key === '/_fixture/canonical-arm') {
+      if (req.method === 'POST') {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        canonicalArmed = JSON.parse(Buffer.concat(chunks).toString());
+        res.end('armed'); return;
+      }
+      if (req.method === 'DELETE') {
+        canonicalArmed = null;
+        res.end('cleared'); return;
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(canonicalArmed));
+      return;
+    }
     if (req.method === 'POST' && key === '/_fixture/canonical-boundary') {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
+      // The armed boundary fires exactly once.
+      canonicalArmed = null;
       const gate = canonicalWriteBarrier;
       if (gate) {
         gate.entered.resolve(JSON.parse(Buffer.concat(chunks).toString()));
@@ -201,7 +261,7 @@ const server = http.createServer(async (req, res) => {
 const sourceServer = http.createServer(server.listeners('request')[0]);
 
 function run(args, options = {}) {
-  const result = spawnSync(npx, [wranglerPackage, ...args], { cwd: root, shell: windows, encoding: 'utf8', ...options });
+  const result = spawnSync(npx, ['--yes', wranglerPackage, ...args], { cwd: root, shell: windows, encoding: 'utf8', env: localWorkerEnvironment, ...options });
   if (result.status !== 0) throw new Error(`wrangler failed: ${result.stderr}\n${result.stdout}`);
   return result.stdout;
 }
@@ -226,9 +286,26 @@ function objectInsert(key, value) {
   const bytes = Buffer.from(typeof value === 'string' ? value : JSON.stringify(value));
   return `INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (${quote(key)},${bytes.length},'2026-10-15T00:00:00+00:00','none',${crc32(bytes)},X'${bytes.toString('hex')}');`;
 }
+/**
+ * writer + 取得レーン 4 本の設定を描画する。
+ *
+ * 取得は writer では実行しない。writer は入口 (Web/API/cron/変換/旧入口)、
+ * 取得専用 4 本が自分の取得キューだけを実行する。
+ */
+function renderTopology({ required = false, entrypoint, invalidEndpoint = false } = {}) {
+  topology = renderAcquisitionTopology({
+    work,
+    target: 'local',
+    main: (entrypoint ?? join(root, 'build/worker/shim.mjs')).replaceAll('\\', '/'),
+    s3Endpoint: invalidEndpoint ? 'not-a-url' : `http://127.0.0.1:${s3Port}`,
+    vars: { NAROU_REQUIRE_S3: String(required) },
+  });
+  config = topology.writerPath;
+}
+
 async function start() {
   logs = '';
-  child = spawn(npx, [wranglerPackage, 'dev', '--test-scheduled', '--config', config, '--persist-to', persist, '--port', String(port)], { cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
+  child = spawn(npx, ['--yes', wranglerPackage, 'dev', '--test-scheduled', ...topology.configs.flatMap((path) => ['--config', path]), '--persist-to', persist, '--port', String(port)], { cwd: root, shell: windows, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'], env: localWorkerEnvironment });
   for (const stream of [child.stdout, child.stderr]) stream.on('data', (chunk) => { logs = (logs + chunk).slice(-300000); });
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
@@ -342,16 +419,12 @@ async function epub() {
 
 try {
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
-  const s3Port = server.address().port;
+  s3Port = server.address().port;
   sourceServer.listen(s3Port, '::1'); await once(sourceServer, 'listening');
   const portProbe = http.createServer(); portProbe.listen(0, '127.0.0.1'); await once(portProbe, 'listening');
   port = portProbe.address().port; await new Promise((resolve) => portProbe.close(resolve));
-  let toml = readFileSync(join(root, 'wrangler.toml'), 'utf8').replace(/\[build\][^\[]*/, '');
-  toml = toml.replace(/^main = .*$/m, `main = ${JSON.stringify(join(root, 'build/worker/shim.mjs').replaceAll('\\', '/'))}`)
-    .replace(/^directory = "public"$/m, `directory = ${JSON.stringify(join(root, 'public').replaceAll('\\', '/'))}`)
-    .replace(/^migrations_dir = "migrations"$/m, `migrations_dir = ${JSON.stringify(join(root, 'migrations').replaceAll('\\', '/'))}`)
-    .replace('http://127.0.0.1:9000', `http://127.0.0.1:${s3Port}`);
-  writeFileSync(config, toml);
+  // 取得は writer 1 本 + 取得専用 4 本で実行する (writer は実行しない)。
+  renderTopology({});
   writeFileSync(join(work, '.dev.vars'), `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${Buffer.alloc(32, 7).toString('base64')}\nS3_ACCESS_KEY_ID=local-test-key\nS3_SECRET_ACCESS_KEY=local-test-secret\n`);
   run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
   const prefix = 'novels/Storage Smoke/本文/本文';
@@ -518,11 +591,9 @@ min_interval: 0.01
 
   async function defaultLibrary(name, { required = false, marker, legacy = false, invalidEndpoint = false, entrypoint } = {}) {
     await stop();
+    memorySamples.length = 0;
     persist = join(work, `default-${name}`);
-    let source = toml.replace('[vars]', `[vars]\nNAROU_REQUIRE_S3 = "${required}"`);
-    if (entrypoint) source = source.replace(/^main = .*$/m, `main = ${JSON.stringify(entrypoint.replaceAll('\\', '/'))}`);
-    if (invalidEndpoint) source = source.replace(/^S3_ENDPOINT = .*$/m, 'S3_ENDPOINT = "not-a-url"');
-    writeFileSync(config, source);
+    renderTopology({ required, entrypoint, invalidEndpoint });
     run(['d1', 'migrations', 'apply', 'DB', '--local', '--config', config, '--persist-to', persist]);
     if (marker !== undefined) sql(`INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('inv','content_backend',${quote(JSON.stringify(marker))},${quote(marker)});`);
     if (legacy) sql(legacyFixtureSql);
@@ -702,9 +773,23 @@ const Production = await import(${modulePath});
 export const PushHub = Production.PushHub;
 export const SiteRateLimiter = Production.SiteRateLimiter;
 export default class extends Production.default {
+  async reportMemory() {
+    const response = await fetch('http://127.0.0.1:${s3Port}/_fixture/memory', {
+      method: 'POST', body: JSON.stringify({ ...sample(), role: this.env.NAROU_WORKER_ROLE }),
+    });
+    if (!response.ok) throw new Error('memory observation failed');
+    await response.text();
+  }
   async fetch(request, ...rest) {
-    if (new URL(request.url).pathname === '/_fixture/memory') return Response.json(sample());
+    if (new URL(request.url).pathname === '/_fixture/memory') {
+      await this.reportMemory();
+      return fetch('http://127.0.0.1:${s3Port}/_fixture/memory');
+    }
     return super.fetch(request, ...rest);
+  }
+  async queue(batch, ...rest) {
+    await super.queue(batch, ...rest);
+    await this.reportMemory();
   }
 }
 `);
@@ -783,8 +868,10 @@ export default class extends Production.default {
     assert.equal(liveReaders(), 0, 'EOF must release the actual D1 reader lease inline');
     const upstreamClosed = Promise.withResolvers();
     let stalledResponse;
-    multipart.beforeReadBody = async (_req, res, key, bytes) => {
-      if (!key.includes('/.narou-staging/') || !isAnimation(bytes)) return false;
+    multipart.beforeReadBody = async (_req, res, _key, bytes) => {
+      // Pass-through images may stream from their immutable pool object or a
+      // stage. Pause the image body, not one storage implementation's path.
+      if (!isAnimation(bytes)) return false;
       assert.equal(stalledResponse, undefined, 'only the EPUB image stream may reach the cancellation gate');
       stalledResponse = res;
       res.once('close', () => upstreamClosed.resolve());
@@ -910,7 +997,15 @@ export default class extends Production.default {
   writeFileSync(wrapper, `
 import Entry, { PushHub as ProductionPushHub } from ${production};
 export * from ${production};
-let canonicalTarget = null;
+// The armed canonical write is shared by every script of the topology: the
+// acquisition runs in a lane isolate while the arm arrives at the writer, so
+// the target lives in the fixture sink and not in this module scope.
+async function armedCanonicalTarget() {
+  const response = await fetch('http://127.0.0.1:${s3Port}/_fixture/canonical-arm');
+  if (!response.ok) return null;
+  const value = await response.json();
+  return value && value.key ? value : null;
+}
 function canonicalDatabase(database, onCanonicalBoundary) {
   const metadata = new WeakMap();
   const statement = (raw, sql, values = []) => {
@@ -928,12 +1023,12 @@ function canonicalDatabase(database, onCanonicalBoundary) {
     if (name === 'prepare') return sql => statement(target.prepare(sql), sql);
     if (name === 'batch') return async statements => {
       const entries = statements.map(value => metadata.get(value)).filter(Boolean);
-      const selected = canonicalTarget;
-      const held = selected && !selected.consumed && entries.some(entry =>
-        /(?:INSERT(?:\\s+OR\\s+[A-Z]+)?\\s+INTO|UPDATE|DELETE\\s+FROM)\\s+(?:objects|content_objects|transfer_object_refs)\\b/i.test(entry.sql)
-        && entry.values.some(value => value === selected.key));
+      const canonical = entries.filter(entry =>
+        /(?:INSERT(?:\\s+OR\\s+[A-Z]+)?\\s+INTO|UPDATE|DELETE\\s+FROM)\\s+(?:objects|content_objects|transfer_object_refs)\\b/i.test(entry.sql));
+      const selected = canonical.length > 0 ? await armedCanonicalTarget() : null;
+      const held = selected && !selected.consumed && canonical.some(entry =>
+        entry.values.some(value => value === selected.key));
       if (held) {
-        selected.consumed = true;
         onCanonicalBoundary();
         const guards = entries.filter(entry => entry.sql.includes('transfer_storage_guards'));
         const ownerBound = guards.some(entry => entry.sql.includes(selected.token)
@@ -977,25 +1072,45 @@ export class PushHub extends ProductionPushHub {
   }
 }
 export default class extends Entry {
-  async fetch(request) {
+  async fetch(request, ...rest) {
     const path = new URL(request.url).pathname;
     if (path === '/__test/canonical-write/arm') {
-      canonicalTarget = { ...await request.json(), consumed: false };
+      // The armed write is shared by every script of the topology: the
+      // acquisition runs in a lane isolate while the arm arrives at the
+      // writer, so the fixture sink keeps the target, not this module scope.
+      const target = { ...await request.json(), consumed: false };
+      const armed = await fetch('http://127.0.0.1:${s3Port}/_fixture/canonical-arm', {
+        method: 'POST', body: JSON.stringify(target),
+      });
+      if (!armed.ok) throw new Error('canonical arm fixture failed');
       return Response.json({ success: true });
     }
     if (path === '/__test/canonical-write/clear') {
-      canonicalTarget = null;
+      const cleared = await fetch('http://127.0.0.1:${s3Port}/_fixture/canonical-arm', { method: 'DELETE' });
+      if (!cleared.ok) throw new Error('canonical arm fixture failed');
       return Response.json({ success: true });
     }
-    return super.fetch(request);
+    if (request.method === 'POST' && path === '/_fixture/replay') {
+      if (request.headers.get('Authorization') !== 'Bearer ${token}') return new Response('Unauthorized', { status: 401 });
+      const envelope = await request.json();
+      await this.env['ACQUISITION_QUEUE_' + envelope.lane].send(envelope);
+      return Response.json({ success: true });
+    }
+    return super.fetch(request, ...rest);
   }
   async queue(batch) {
     let canonical = false;
     try {
+      // The proxied DB must reach the production entrypoint, so the batch runs
+      // on a fresh instance that owns the proxied binding.
       await new Entry(this.ctx, { ...this.env, DB: canonicalDatabase(this.env.DB, () => { canonical = true; }) }).queue(batch);
     } finally {
       await fetch('http://127.0.0.1:${s3Port}/_fixture/delivery', {
-        method: 'POST', body: JSON.stringify({ ids: batch.messages.map(message => message.body.job_id), canonical }),
+        method: 'POST', body: JSON.stringify({
+          ids: batch.messages.map(message => message.body.job_id),
+          messages: batch.messages.map(message => message.body),
+          canonical,
+        }),
       });
     }
   }
@@ -1007,7 +1122,7 @@ export default class extends Entry {
   sourceImageCount = 500;
   sourceRequests.clear(); imageRequests.clear();
   const gate = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
-  const witness = { ids: [], completed: Promise.withResolvers() };
+  const witness = { ids: [], messages: [], returned: Promise.withResolvers(), completed: Promise.withResolvers() };
   yieldBarrier = gate; deliveryWitness = witness;
   const tick = async () => {
     const response = await api('/__scheduled?cron=*+*+*+*+*');
@@ -1044,6 +1159,12 @@ export default class extends Entry {
     const received = [...sourceRequests.entries()];
     const images = [...imageRequests.entries()];
     gate.release.resolve();
+    await bounded(witness.returned.promise, 'original acquisition delivery completion');
+    // A cancelled v3 job is no longer automatically redispatched. Replay its
+    // captured real assignment to prove a late delivery cannot resurrect it.
+    const original = witness.messages.find(message => message.job_id === jobId);
+    assert.equal(original.version, 3);
+    assert((await (await api('/_fixture/replay', original)).json()).success);
     await bounded(witness.completed.promise, 'continuation delivery completion');
     assert(witness.ids.every((id) => id === jobId), JSON.stringify(witness.ids));
     assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='download'"), 1,

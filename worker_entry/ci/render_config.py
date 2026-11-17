@@ -2,6 +2,8 @@
 
 reader (配信専用) は writer と同じ Rust 成果物を別の script 名で配備するため、
 `--role reader` で `wrangler.reader.ci.toml` も作る。
+`--role acquisition --lane 0..3` は取得専用の同じ成果物を別 script に配備する
+`wrangler.acquire-1.ci.toml` ... `wrangler.acquire-4.ci.toml` を作る。
 
 account 固有の値 (D1 の database_id、S3 の接続先、公開ドメイン) はリポジトリに
 置かず、CI の環境変数から注入する。値の形式は置換前に検証し、未解決の
@@ -19,7 +21,8 @@ from typing import NoReturn, Sequence
 from uuid import UUID
 
 TARGETS = ("develop", "production")
-ROLES = ("writer", "reader")
+ROLES = ("writer", "reader", "acquisition")
+ACQUISITION_LANE_COUNT = 4
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 REGION_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
@@ -72,26 +75,36 @@ def unresolved_placeholders(template: str) -> list[str]:
     return found
 
 
-def parse_role(argv: Sequence[str]) -> str:
-    """`--role writer|reader` を読む (既定は writer)。"""
+def parse_options(argv: Sequence[str]) -> tuple[str, int | None]:
+    """`--role writer|reader|acquisition` と取得レーンの `--lane 0..3`。"""
 
     role = "writer"
+    lane = None
     index = 0
     while index < len(argv):
         argument = argv[index]
-        if argument == "--role":
+        name, separator, value = argument.partition("=")
+        if name not in ("--role", "--lane"):
+            fail(f"unknown argument: {argument}")
+        if not separator:
             index += 1
             if index >= len(argv):
-                fail("--role needs a value (writer or reader)")
-            role = argv[index]
-        elif argument.startswith("--role="):
-            role = argument.split("=", 1)[1]
+                fail(f"{name} needs a value")
+            value = argv[index]
+        if name == "--role":
+            role = value
         else:
-            fail(f"unknown argument: {argument}")
+            if value not in tuple(str(lane) for lane in range(ACQUISITION_LANE_COUNT)):
+                fail("--lane must be 0, 1, 2 or 3")
+            lane = int(value)
         index += 1
     if role not in ROLES:
-        fail("--role must be writer or reader")
-    return role
+        fail("--role must be writer, reader or acquisition")
+    if role == "acquisition" and lane is None:
+        fail("--role acquisition requires --lane 0..3")
+    if role != "acquisition" and lane is not None:
+        fail("--lane is only valid for --role acquisition")
+    return role, lane
 
 
 def template_name(path: Path) -> str:
@@ -194,8 +207,59 @@ def validate_reader(config: dict, path: Path, writer_name: str) -> None:
         fail(f"{path.name} must bind the shared D1 database")
 
 
+def validate_queue_producers(config: dict, path: Path, expected: dict[str, str]) -> None:
+    entries = config.get("queues", {}).get("producers", [])
+    actual = {entry.get("binding"): entry.get("queue") for entry in entries}
+    if len(entries) != len(expected) or actual != expected:
+        fail(f"{path.name} must bind the deployment's queue producers: {', '.join(expected)}")
+
+
+def validate_queue_consumers(config: dict, path: Path, queues: dict[str, str]) -> None:
+    entries = config.get("queues", {}).get("consumers", [])
+    if len(entries) != len(queues) or {entry.get("queue") for entry in entries} != set(queues):
+        fail(f"{path.name} must consume only its assigned queues")
+    for entry in entries:
+        if (entry.get("max_batch_size") != 1 or entry.get("max_concurrency") != 1
+                or entry.get("dead_letter_queue") != queues[entry["queue"]]
+                or entry.get("max_retries") != 3):
+            fail(f"{path.name} consumers must use batch=1, concurrency=1, retries=3 and their own DLQ")
+
+
+def validate_acquisition(
+    config: dict, path: Path, writer_name: str, lane: int,
+    producers: dict[str, str], queue: str, dlq: str,
+) -> None:
+    """各取得 script は自分のキューだけを消費し、writer の DO を共有する。"""
+    if config.get("vars", {}).get("NAROU_WORKER_ROLE") != "acquisition":
+        fail(f'{path.name} must set vars.NAROU_WORKER_ROLE = "acquisition"')
+    if config.get("vars", {}).get("NAROU_ACQUISITION_LANE") != str(lane):
+        fail(f"{path.name} must set its assigned vars.NAROU_ACQUISITION_LANE")
+    if config.get("workers_dev") is not False or config.get("routes"):
+        fail(f"{path.name} must not expose a public HTTP endpoint")
+    if "assets" in config or "build" in config or config.get("triggers", {}).get("crons"):
+        fail(f"{path.name} must not define assets, builds or cron triggers")
+    if config.get("migrations") or config.get("exports"):
+        fail(f"{path.name} must not create Durable Object namespaces")
+    if config.get("main") != "build/worker/shim.mjs":
+        fail(f"{path.name} must reuse the shared Worker artifact")
+    validate_queue_producers(config, path, producers)
+    validate_queue_consumers(config, path, {queue: dlq})
+    bindings = config.get("durable_objects", {}).get("bindings", [])
+    expected = {"RATE_LIMITER": "SiteRateLimiter", "PUSH_HUB": "PushHub"}
+    if (len(bindings) != len(expected)
+            or {row.get("name"): row.get("class_name") for row in bindings} != expected
+            or any(row.get("script_name") != writer_name for row in bindings)):
+        fail(f"{path.name} must bind the writer's RATE_LIMITER and PUSH_HUB through script_name")
+    services = {row.get("binding"): row.get("service") for row in config.get("services", [])}
+    if services.get("NAROU_WRITER") != writer_name:
+        fail(f"{path.name} must bind the writer as the NAROU_WRITER service")
+    databases = config.get("d1_databases", [])
+    if len(databases) != 1 or databases[0].get("binding") != "DB":
+        fail(f"{path.name} must bind the shared D1 database as DB")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
-    role = parse_role(argv or ())
+    role, lane = parse_options(argv or ())
     target = required("NAROU_DEPLOY_TARGET")
     if target not in TARGETS:
         fail("NAROU_DEPLOY_TARGET must be develop or production")
@@ -206,12 +270,24 @@ def main(argv: Sequence[str] | None = None) -> None:
     dead_letter_queue = required("NAROU_JOB_DLQ")
     convert_queue_name = required("NAROU_CONVERT_QUEUE")
     convert_dead_letter_queue = required("NAROU_CONVERT_DLQ")
+    acquisition_queues = [
+        required(f"NAROU_ACQUIRE_QUEUE_{number}")
+        for number in range(1, ACQUISITION_LANE_COUNT + 1)
+    ]
+    acquisition_dlqs = [
+        required(f"NAROU_ACQUIRE_DLQ_{number}")
+        for number in range(1, ACQUISITION_LANE_COUNT + 1)
+    ]
 
     suffix = f"-{target}"
     for label, value in (
         ("NAROU_D1_DATABASE_NAME", database_name),
         ("NAROU_JOB_QUEUE", queue_name),
         ("NAROU_CONVERT_QUEUE", convert_queue_name),
+        *(
+            (f"NAROU_ACQUIRE_QUEUE_{number}", name)
+            for number, name in enumerate(acquisition_queues, start=1)
+        ),
     ):
         if not NAME_PATTERN.fullmatch(value):
             fail(f"{label} must be a lowercase name (a-z, 0-9, -)")
@@ -229,8 +305,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         fail("NAROU_CONVERT_DLQ must be the conversion queue name with a -dlq suffix")
     if not NAME_PATTERN.fullmatch(convert_dead_letter_queue) or len(convert_dead_letter_queue) > 63:
         fail("NAROU_CONVERT_DLQ must be a valid lowercase queue name (max 63 characters)")
-    if queue_name == convert_queue_name:
-        fail("acquisition and conversion must use different queues")
+    if len({queue_name, convert_queue_name, *acquisition_queues}) != ACQUISITION_LANE_COUNT + 2:
+        fail("legacy ingress, conversion and acquisition lanes must use different queues")
+    for number, (queue, dlq) in enumerate(zip(acquisition_queues, acquisition_dlqs), start=1):
+        if dlq != f"{queue}-dlq" or not NAME_PATTERN.fullmatch(dlq):
+            fail(f"NAROU_ACQUIRE_DLQ_{number} must be its acquisition queue name with a valid -dlq suffix")
     try:
         UUID(database_id)
     except ValueError:
@@ -324,6 +403,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         "NAROU_JOB_DLQ": dead_letter_queue,
         "NAROU_CONVERT_QUEUE": convert_queue_name,
         "NAROU_CONVERT_DLQ": convert_dead_letter_queue,
+        **{
+            f"NAROU_ACQUIRE_QUEUE_{number}": name
+            for number, name in enumerate(acquisition_queues, start=1)
+        },
         "S3_ENDPOINT": endpoint,
         "S3_REGION": region,
         "S3_BUCKET": bucket,
@@ -337,13 +420,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             s3_secret_names,
             token_secrets,
             access_secrets,
-            include_login_key=(role == "writer"),
+            include_login_key=(role in ("writer", "acquisition")),
         )
     # custom domain の route。production は必須、develop は任意で、未設定なら
     # workers.dev の URL だけで動く。前段に Cloudflare Access (Zero Trust) を
     # 置く前提なので、route を入れた環境では workers_dev を閉じる。
     domain_var = {"production": "SERVICE_DOMAIN", "develop": "DEVELOP_DOMAIN"}[target]
-    domain = required(domain_var) if target == "production" else optional(domain_var, "").strip()
+    domain = (
+        required(domain_var) if target == "production" and role != "acquisition"
+        else optional(domain_var, "").strip()
+    )
     zone = ""
     if domain:
         if not HOSTNAME_PATTERN.fullmatch(domain) or "." not in domain:
@@ -386,8 +472,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     # writer の script 名から reader の名前と参照先を決める。既存の writer の
     # 名前と DO 名前空間は変えない (reader は writer 名 + "-reader")。
     writer_template = WORKER_DIR / f"wrangler.{target}.toml"
+    writer_name = template_name(writer_template) if role != "writer" else ""
     if role == "reader":
-        writer_name = template_name(writer_template)
+        # writer の既存 script 名をそのまま参照する。
         reader_name = f"{writer_name}{READER_NAME_SUFFIX}"
         if not NAME_PATTERN.fullmatch(reader_name):
             fail("the reader name must be a lowercase name (a-z, 0-9, -)")
@@ -395,10 +482,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         replacements["WRITER_NAME"] = writer_name
         # reader は既存ドメインの配信パスだけを向き取る (DNS / Access は触らない)。
         replacements["__READER_ROUTES_BLOCK__"] = reader_routes(domain, zone)
+    elif role == "acquisition":
+        acquisition_name = f"{writer_name}-acquire-{lane + 1}"
+        if not NAME_PATTERN.fullmatch(acquisition_name):
+            fail("the acquisition script name must be a valid lowercase name (max 63 characters)")
+        replacements["ACQUISITION_NAME"] = acquisition_name
+        replacements["ACQUISITION_LANE"] = str(lane)
+        replacements["WRITER_NAME"] = writer_name
+        replacements["NAROU_ACQUIRE_QUEUE"] = acquisition_queues[lane]
+        replacements["NAROU_ACQUIRE_DLQ"] = acquisition_dlqs[lane]
 
-    template_path = (
-        writer_template if role == "writer" else WORKER_DIR / "wrangler.reader.toml"
-    )
+    template_path = {
+        "writer": writer_template,
+        "reader": WORKER_DIR / "wrangler.reader.toml",
+        "acquisition": WORKER_DIR / "wrangler.acquisition.toml",
+    }[role]
     template = template_path.read_text(encoding="utf-8")
     # ブロック単位のプレースホルダは「値があれば差し込み、無ければ空にする」。
     for block in ("__SECRET_STORE_BLOCKS__", "__CUSTOM_DOMAIN_BLOCK__", "__READER_ROUTES_BLOCK__"):
@@ -420,12 +518,36 @@ def main(argv: Sequence[str] | None = None) -> None:
         fail(f'{template_path.name} must set vars.NAROU_REQUIRE_S3 = "true" for CI')
     if role == "reader":
         validate_reader(config, template_path, writer_name)
-    elif config.get("vars", {}).get("NAROU_WORKER_ROLE", "writer") != "writer":
-        fail(f'{template_path.name} must set vars.NAROU_WORKER_ROLE = "writer"')
+    elif role == "acquisition":
+        validate_acquisition(
+            config, template_path, writer_name, lane,
+            {"CONVERT_QUEUE": convert_queue_name, **{
+                f"ACQUISITION_QUEUE_{index}": name
+                for index, name in enumerate(acquisition_queues)
+            }},
+            acquisition_queues[lane], acquisition_dlqs[lane],
+        )
+    else:
+        if config.get("vars", {}).get("NAROU_WORKER_ROLE", "writer") != "writer":
+            fail(f'{template_path.name} must set vars.NAROU_WORKER_ROLE = "writer"')
+        if "build" in config:
+            fail(f"{template_path.name} must reuse the artifact built once by ci/deploy_worker.py")
+        validate_queue_producers(config, template_path, {
+            "NAROU_JOBS": queue_name, "CONVERT_QUEUE": convert_queue_name, **{
+                f"ACQUISITION_QUEUE_{index}": name
+                for index, name in enumerate(acquisition_queues)
+            },
+        })
+        validate_queue_consumers(config, template_path, {
+            queue_name: dead_letter_queue, convert_queue_name: convert_dead_letter_queue,
+        })
 
-    output_path = WORKER_DIR / (
-        "wrangler.ci.toml" if role == "writer" else "wrangler.reader.ci.toml"
-    )
+    output_name = {
+        "writer": "wrangler.ci.toml",
+        "reader": "wrangler.reader.ci.toml",
+        "acquisition": f"wrangler.acquire-{lane + 1}.ci.toml" if lane is not None else "",
+    }[role]
+    output_path = WORKER_DIR / output_name
     output_path.write_text(template, encoding="utf-8")
     print(output_path)
 

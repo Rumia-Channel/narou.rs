@@ -47,6 +47,8 @@ jobs:
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_*s3*.py'
       - name: Deploy secret handling regressions
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_deploy_secret_masking.py'
+      - name: Deploy toolchain pin regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_deploy_wrangler_pin.py'
       - name: Worker content publication and migration regressions
         run: python3 -m unittest discover -s worker_entry/tests -p 'test_content_storage_sql.py'
       - name: Worker bounded runtime regressions
@@ -217,6 +219,8 @@ jobs:
         run: node tests/read_worker.mjs
       - name: Worker abrupt termination and checkpoint recovery
         run: node tests/runtime_recovery.mjs
+      - name: Worker acquisition lane concurrency
+        run: node tests/acquisition_concurrency.mjs
 
   # デプロイ。GitHub Environments は用途で 2 つに分ける:
   #   `Cloudflare` … この 2 ジョブ (develop / production) が使う Workers 用の値
@@ -359,7 +363,7 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NAROU_DEPLOY_TARGET: production
       # 既存の Route 運用なら route を選び、DNS / custom domain を付け替えない。
-      NAROU_DOMAIN_MODE: ${{ vars.NAROU_DOMAIN_MODE || 'custom' }}
+      NAROU_DOMAIN_MODE: ${{ vars.NAROU_DOMAIN_MODE || 'custom_domain' }}
       # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
       SERVICE_DOMAIN: ${{ secrets.SERVICE_DOMAIN || vars.SERVICE_DOMAIN }}
       # リレードメイン。設定時は NAROU_RELAY_ENDPOINT より優先して https://<domain> を使う。

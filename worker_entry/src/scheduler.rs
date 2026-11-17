@@ -27,7 +27,7 @@ pub const AUTO_UPDATE_PAGE_SIZE: usize = 100;
 /// Cron is only a probe. The persisted checkpoint owns the logical
 /// generation and cursor, so every minute does not reset an in-flight run.
 pub async fn run_scheduled_plan(event: ScheduledEvent, env: &Env) -> Result<()> {
-    let Some(_memory_permit) = crate::memory_budget::try_heavy() else {
+    let Some(memory_permit) = crate::memory_budget::try_heavy() else {
         // A later cron tick resumes durable cursors; no work is lost.
         return Ok(());
     };
@@ -57,11 +57,22 @@ pub async fn run_scheduled_plan(event: ScheduledEvent, env: &Env) -> Result<()> 
     if let Some(error) = &creation_error { console_warn!("creation reservation recovery failed: {error}"); }
     // Keep ordinary planning available, but never report a failed collector
     // invocation as successful after logging it.
-    plan_auto_update(&runtime, event.schedule() as u64).await?;
-    match (transfer_error, retirement_error, removal_error, creation_error) {
-        (Some(error), _, _, _) => Err(NarouError::Platform(error.to_string())),
-        (None, Some(error), _, _) | (None, None, Some(error), _) | (None, None, None, Some(error)) => Err(error),
-        (None, None, None, None) => Ok(()),
+    let planned = plan_auto_update(&runtime, event.schedule() as u64).await;
+    // A delivery while cron owns the permit is ACKed back into durable waiting.
+    // Even a failed plan must release capacity before waking those conversions.
+    drop(memory_permit);
+    let dispatched = runtime.wake_waiting_jobs().await;
+    let collector_error = match (transfer_error, retirement_error, removal_error, creation_error) {
+        (Some(error), _, _, _) => Some(NarouError::Platform(error.to_string())),
+        (None, Some(error), _, _) | (None, None, Some(error), _) | (None, None, None, Some(error)) => Some(error),
+        (None, None, None, None) => None,
+    };
+    match planned.and(dispatched) {
+        Err(error) => Err(error),
+        Ok(()) => match collector_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        },
     }
 }
 
@@ -142,28 +153,31 @@ const STUCK_GRACE: chrono::TimeDelta = chrono::TimeDelta::minutes(2);
 /// 再送前の `touch_for_reenqueue` CAS と finalize の CAS が、生存している
 /// 配信 (claim 済み) や並行 cron とのレースを排除する。
 pub async fn reap_stuck_jobs(runtime: &WorkerRuntime, push: &PushHubClient) -> Result<()> {
-    runtime.wake_waiting_jobs().await?;
     let stuck_before =
         (runtime.clock.now_utc() - STUCK_GRACE).to_rfc3339_opts(SecondsFormat::Nanos, true);
     let stuck = runtime
         .ledger
         .stuck_jobs(&stuck_before, REAPER_PAGE_SIZE)
         .await?;
-    if stuck.is_empty() {
-        return Ok(());
-    }
-    let max_retries = effective_max_retries(runtime).await;
-    let mut changed = false;
-    for job in &stuck {
-        match reap_one(runtime, push, job, &stuck_before, max_retries).await {
-            Ok(row_changed) => changed |= row_changed,
-            Err(error) => {
-                console_warn!("job reaper failed for {}: {error}", job.job_id);
+    if !stuck.is_empty() {
+        let max_retries = effective_max_retries(runtime).await;
+        let mut changed = false;
+        for job in &stuck {
+            match reap_one(runtime, push, job, &stuck_before, max_retries).await {
+                Ok(row_changed) => changed |= row_changed,
+                Err(error) => {
+                    console_warn!("job reaper failed for {}: {error}", job.job_id);
+                }
             }
         }
+        if changed {
+            notify_queue_changed(push).await;
+        }
     }
-    if changed {
-        notify_queue_changed(push).await;
+    // 取得行はレーン割り当てを待ち直す。割り当ての回収 (期限切れの予約) と
+    // 新しい割り当ての投入はここで行う。
+    if let Err(error) = runtime.dispatch_acquisition().await {
+        console_warn!("acquisition dispatch failed: {error}");
     }
     Ok(())
 }
@@ -220,12 +234,10 @@ async fn reap_one(
     {
         return Ok(false);
     }
-    if let Err(error) = runtime.send_existing_job(&JobId(job.job_id.clone()), &job.kind).await {
-        console_warn!("job reaper could not re-send {}: {error}", job.job_id);
-        return Ok(false);
-    }
+    // 取得行は台帳に残ったまま、レーン割り当てを待ち直す (割り当てられた
+    // 行は reaper の対象外なので、この再投入と二重にはならない)。
     console_log!(
-        "job reaper re-enqueued {} (status={}, attempts={attempts})",
+        "job reaper recovered {} for dispatch (status={}, attempts={attempts})",
         job.job_id,
         job.status
     );

@@ -34,6 +34,7 @@ pub mod mcp;
 pub mod messages;
 pub mod site_definitions;
 pub mod jobs;
+pub mod acquisition_lanes;
 pub mod novel_actions;
 pub mod novel_settings;
 pub mod novel_content;

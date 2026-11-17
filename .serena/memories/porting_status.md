@@ -2,7 +2,8 @@
 
 ## 最新状況: クライアント主体転送（ブランチ統合検証中・未公開）
 
-- 最新指示はローカル・リモートの全ブランチを main/develop に統合し、それ以外を整理すること。ローカル 50・origin 5 ブランチを取得・比較済み。クライアント転送、ノベルアップ＋、Worker 並列取得と main のリリース履歴を保持して統合する。版数は 0.6.6 のまま、タグ作成・Release・手動の本番配備は行わない。未完了の受入項目を公開済み・検証済みへ読み替えない。
+- 最新指示はローカル・リモートの全ブランチを main/develop に統合し、それ以外を整理すること。ローカル 50・origin 5 ブランチを取得・比較済み。クライアント転送、ノベルアップ＋、Worker 並列取得と main のリリース履歴を保持して統合する。版数更新・タグ作成・Release・手動の本番配備は行わない。未完了の受入項目を公開済み・検証済みへ読み替えない。
+- 統合検証は進行中。SDK JavaScript 4 件、転送 JavaScript 45 件、Worker の SQL・配備設定等の Python 162 件が成功し、Python 1 件は skip。認証回復・ノベルアップ＋の 24 件は Novelup 統合段階で成功した。Native 全体・統合後の release workerd・実ブラウザの最終確認と main/develop の push・不要ブランチ削除は未完了。
 - `/api/transfer/v2` と実配布WASMで、ZIP生成・全体検証・展開をクライアントへ移す。本文・目次・設定・挿絵索引・unknownを保持し、runtimeではraw/任意履歴/確認済み派生物をsnapshotと本文通信の前に除外する。Workerへrawを新規保存しない。旧ZIP全体POST/Base64へのfallbackはない。
 - 実Firefox + 実workerd/D1で17MiBの利用者ファイルと目次を取り込み、raw1MiBの除外と新規1作品の公開を確認。同じexport sessionで一時停止から保存し直し、独立ZIP readerで全entry・SHAを照合。10MiBゲートの最大request bodyは8,323,470B、過大要求拒否0・旧ZIP要求0・記録打切り0。
 - 確認待ち6分で旧SWが0byte保存/次write待機になる不具合を実証。遅延開始・限定したstartup waitUntil・15秒ping/pong・90秒失活検出・close ACK優先のrelay版3へ修正。実Firefoxで最初の出力前と64KiB出力後の各6分停止を跨ぎ、両方1MiBとSHA一致。Chromium FSAの実操作は未確認。
@@ -30,6 +31,16 @@
 - 作者 DSL の追加検証: 前処理 36・作者一覧 25・ノベルアップ＋ 10・helper 17・既存認証関連 36 の計 124 項目が成功。対象限定 Native Clippy と Worker wasm Clippy、Worker release ビルドも通過した（既存 `vendor/async_zip` の 36 警告は残る）。`worker_entry/tests/author_tracking.mjs` は実 workerd の一覧を DSL 経由へ変更し、空ライブラリからの取得・新作検知・重複防止・手動確認／dry-run・定期実行・解除競合・別ホスト作者 URL の取得が成功した。
 - 実 CLI の作者 `813181327` はデフォルト DSL で 13 URL（新規 12・既知 1）を列挙し、dry-run 前後で小説数が変わらないことを確認。利用者側 DSL で `903067203` だけを選ぶと作者 URL からその 1 作品・1 話を取得でき、TOC と空でない保存本文要素が一致した。元の検証用定義を復元し、新たに残ったブラウザプロファイルは 0 件。全 13 作品の本文一括取得は行わず、一覧列挙と代表 1 作品の取得を分けて確認した。
 - ブランチ統合前の追加回帰: 匿名の SDK 更新失敗後、同じ保存済みログインへのフォールバックで helper が 2 回起動することを再現した。作者確認全体で URL・解決済みログイン ID の試行を保持し、失敗でも予算を消費するよう修正。Cookie 名の存在判定は共有 `LoginGroup::has_cookie` に統一し、Native の対象選択と一致させる。回帰は同一 ID の二重起動抑止と、別 ID の正常な更新・取得を検証する。
+
+## Workers のサイト系列別取得レーン（未リリース・統合検証中）
+
+- `fix-worker-site-concurrency` で、取得専用 Worker / Queue を4レーンへ分離する。各 isolate の重い処理1件制限は維持し、D1 の `worker_acquisition_lanes` が固定ハッシュではなく空き枠へ系列を動的に割り当てる。
+- migration `0020_acquisition_lanes.sql` は既存の待機ジョブ・checkpoint・backoff を保持する。v3 の job ID / lane / dispatch token で古い配信・古い解放を拒否し、同一作品の変換も配信予約と排他する。旧取得 Queue は取り込み専用として残し、削除しない。
+- 待機前に実効 YAML の系列・対象を保存し、定義変更時は予約の解放と再分類を原子的に行う。次の配信は本文処理・メモリ枠・実行枠の解放後に行う。手動配備・本番 D1 更新は今回実施しない。develop の push は既存 CI の開発環境配備を起動する。
+- runtime / CI / ローカル設定 / 実 workerd 回帰の実装は統合済み。元ブランチでは基盤 SQL 8 件・既存 jobs SQL 49 件・系列判定 2 件が通過。初回配備は非公開・consumer / cron 無しの管理 Worker で共有 DO を用意し、既存所有者は変更しない。bootstrap のオフライン契約 16 件と配備ゲート 29 件が通過。
+- 元ブランチの release workerd で取得レーン10項目が通過。別系列4並列・同系列直列・5系列目の繰上げ・EPUBとの分離・実行中変換のメモリ枠保持・クラッシュ回収・古い配信・旧入口・各更新経路を確認した。cron 中に届いた変換が再待機し続ける経路も、実 S3 LIST と実 Queue send の保留で修正前の停止を再現し、枠解放後の再配信で完走を確認した。
+- 元ブランチでは既存 HTTP 契約110件、仮想作品の更新選択・作者追跡・進捗履歴・転送・保存・配信・実行回収の互換テストが通過。保存は1685話 / 17目次ページの予算継続、取消後に捕獲した実 v3 配信を再投入しても tombstone・作品・話・挿絵を変更しないことを確認。配信用 Worker は34/34項目、実行回収は3回の異常終了での終端化と900話の継続・回復予算リセットが通過。最終の portable release check と reaper SQL 4件も通過し、新規の本体警告はない（vendor の既存警告は残る）。
+- debug Wasm は `/health/live` の route future 先頭で memory access out of bounds。生成物の `route` のスタックフレームは 673,664 bytes で、stack 不足と推定（既存版との差は未確認）。検証は実配布と同じ release 成果物で行っており、debug の問題を解消済みとはしない。
 
 ## EPUB 配信経路と API の待ち時間（未リリース）
 

@@ -1,6 +1,6 @@
 """Reader Worker の設定とデプロイ経路の契約テスト。資格情報・ネットワークは使わない。
 
-同じ Rust 成果物を 2 つの script として配備する:
+同じ Rust 成果物の 6 script 構成で、reader は取得 4 レーンと分離する:
 
 - writer (既存): 更新と管理。queue / cron / RATE_LIMITER / 静的アセットを持つ。
 - reader (新規): 配信だけ。既存ドメインの配信パスだけを edge で受け取り、
@@ -46,6 +46,14 @@ ENV = {
     "NAROU_JOB_DLQ": "narou-jobs-develop-dlq",
     "NAROU_CONVERT_QUEUE": "narou-jobs-convert-develop",
     "NAROU_CONVERT_DLQ": "narou-jobs-convert-develop-dlq",
+    **{
+        f"NAROU_ACQUIRE_QUEUE_{number}": f"narou-jobs-acquire-{number}-develop"
+        for number in range(1, 5)
+    },
+    **{
+        f"NAROU_ACQUIRE_DLQ_{number}": f"narou-jobs-acquire-{number}-develop-dlq"
+        for number in range(1, 5)
+    },
     "NAROU_S3_ENDPOINT": "https://s3.example.invalid",
     "NAROU_S3_REGION": "us-east-1",
     "NAROU_S3_BUCKET": "fake-bucket",
@@ -268,9 +276,28 @@ class ReaderSecretTests(unittest.TestCase):
         self.assertEqual(payload["NAROU_RELAY_ENDPOINT"], "https://relay.example.invalid")
         self.assertEqual(payload["NAROU_RELAY_KEY"], "relay-key")
 
+    def test_acquisition_gets_the_writer_execution_credentials(self):
+        extra = {
+            "NAROU_RS_LOGIN_KEY": "synthetic-login-key",
+            "NAROU_S3_ACCESS_KEY_ID": "synthetic-s3-id",
+            "NAROU_S3_SECRET_ACCESS_KEY": "synthetic-s3-secret",
+            "RELAY_DOMAIN": "relay.example.invalid",
+            "NAROU_RELAY_KEY": "synthetic-relay-key",
+            "CF_ACCESS_CLIENT_ID": "synthetic-access-id",
+            "CF_ACCESS_CLIENT_SECRET": "synthetic-access-secret",
+        }
+        writer = self.build("writer", extra)
+        acquisition = self.build("acquisition", extra)
+        self.assertEqual(acquisition, writer)
+        self.assertEqual(acquisition["NAROU_ADMIN_TOKEN"], ENV["NAROU_ADMIN_TOKEN"])
+        self.assertEqual(acquisition["NAROU_RS_LOGIN_KEY"], extra["NAROU_RS_LOGIN_KEY"])
+        self.assertEqual(acquisition["S3_SECRET_ACCESS_KEY"], extra["NAROU_S3_SECRET_ACCESS_KEY"])
+        self.assertEqual(acquisition["NAROU_RELAY_ENDPOINT"], "https://relay.example.invalid")
+        self.assertEqual(acquisition["NAROU_RELAY_KEY"], extra["NAROU_RELAY_KEY"])
+
 
 class ReaderDeployTests(unittest.TestCase):
-    """デプロイは writer を先に、reader を後に置く (冪等に同じ設定で)。"""
+    """取得レーンを追加し、writer を切り替えてから reader の配信を更新する。"""
 
     def setUp(self):
         self.stack = contextlib.ExitStack()
@@ -290,7 +317,9 @@ class ReaderDeployTests(unittest.TestCase):
             "render": "narou-rs-develop",
             "enable_read_replication": None,
             "run": "",
+            "build_artifact": None,
             "secret_file": None,
+            "bootstrap_writer": None,
             "deploy": None,
             "smoke_url": ("https://writer.example.workers.dev", False),
             "reader_smoke_url": ("https://reader.example.workers.dev", False),
@@ -302,8 +331,8 @@ class ReaderDeployTests(unittest.TestCase):
         for name, value in values.items():
             mock = self.stack.enter_context(patch.object(DEPLOY, name, return_value=value))
             self.calls.attach_mock(mock, name)
-        # writer と reader は別の script として、writer の Reported URL を返す。
-        self.calls.deploy.side_effect = [
+        # private な取得レーン 4 本が先、writer / reader が後。
+        self.calls.deploy.side_effect = [None] * len(DEPLOY.ACQUISITION_CONFIGS) + [
             "https://writer.example.workers.dev",
             "https://reader.example.workers.dev",
         ]
@@ -313,11 +342,45 @@ class ReaderDeployTests(unittest.TestCase):
         # 初期化 (属性の backfill) が済んでいる必要がある。
         DEPLOY.main()
         order = [name for name, _, _ in self.calls.mock_calls]
-        first = order.index("deploy")
-        second = order.index("deploy", first + 1)
+        deployments = [index for index, name in enumerate(order) if name == "deploy"]
         ready = order.index("verify_writer_ready")
-        self.assertLess(first, ready)
-        self.assertLess(ready, second)
+        self.assertEqual(len(deployments), 6)
+        self.assertLess(deployments[-2], ready)
+        self.assertLess(ready, deployments[-1])
+        self.assertEqual(
+            [call.kwargs["config"] for call in self.calls.deploy.call_args_list],
+            [*DEPLOY.ACQUISITION_CONFIGS, DEPLOY.WRITER_CONFIG, DEPLOY.READER_CONFIG],
+        )
+
+    def test_migration_and_one_shared_build_precede_lane_deployments(self):
+        DEPLOY.main()
+        order = [name for name, _, _ in self.calls.mock_calls]
+        self.assertLess(order.index("run"), order.index("build_artifact"))
+        self.assertLess(order.index("build_artifact"), order.index("deploy"))
+        self.calls.build_artifact.assert_called_once_with()
+        self.assertEqual(
+            [entry.kwargs["role"] for entry in self.calls.secret_file.call_args_list],
+            ["writer", "reader", "acquisition"],
+        )
+
+    def test_each_lane_receives_acquisition_secrets_and_every_role_file_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / f"{role}.json" for role in ("writer", "reader", "acquire")]
+            for path in paths:
+                path.write_text('{"synthetic":"secret"}', encoding="utf-8")
+            self.calls.secret_file.side_effect = paths
+            DEPLOY.main()
+            self.assertTrue(all(not path.exists() for path in paths))
+        self.assertEqual(
+            [entry.args[0] for entry in self.calls.deploy.call_args_list],
+            [paths[2]] * len(DEPLOY.ACQUISITION_CONFIGS) + [paths[0], paths[1]],
+        )
+
+    def test_build_failure_prevents_all_deployments(self):
+        self.calls.build_artifact.side_effect = SystemExit("build failed")
+        with self.assertRaises(SystemExit):
+            DEPLOY.main()
+        self.calls.deploy.assert_not_called()
 
     def test_an_unverified_writer_readiness_stops_the_reader_deployment(self):
         # writer の readiness を確認できないときは reader を配備しない。
@@ -327,7 +390,7 @@ class ReaderDeployTests(unittest.TestCase):
         )
         with self.assertRaises(SystemExit):
             DEPLOY.main()
-        self.assertEqual(self.calls.deploy.call_count, 1)
+        self.assertEqual(self.calls.deploy.call_count, len(DEPLOY.ACQUISITION_CONFIGS) + 1)
         self.calls.summary.assert_not_called()
 
     def test_reader_secret_creation_failure_removes_the_writer_secret_file(self):
@@ -339,6 +402,38 @@ class ReaderDeployTests(unittest.TestCase):
                 DEPLOY.main()
             self.assertFalse(writer.exists())
         self.calls.deploy.assert_not_called()
+
+    def test_acquisition_secret_creation_failure_cleans_up_both_other_roles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = Path(directory) / "writer-secrets.json"
+            reader = Path(directory) / "reader-secrets.json"
+            for path in (writer, reader):
+                path.write_text('{"synthetic":"secret"}', encoding="utf-8")
+            self.calls.secret_file.side_effect = [
+                writer, reader, OSError("acquisition secret creation failed"),
+            ]
+            with self.assertRaises(OSError):
+                DEPLOY.main()
+            self.assertFalse(writer.exists())
+            self.assertFalse(reader.exists())
+        self.calls.deploy.assert_not_called()
+
+    def test_lane_deploy_failure_prevents_writer_cutover_and_cleans_all_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / f"{role}.json" for role in ("writer", "reader", "acquire")]
+            for path in paths:
+                path.write_text('{"synthetic":"secret"}', encoding="utf-8")
+            self.calls.secret_file.side_effect = paths
+            self.calls.deploy.side_effect = [None, SystemExit("lane deploy failed")]
+            with self.assertRaises(SystemExit):
+                DEPLOY.main()
+            self.assertTrue(all(not path.exists() for path in paths))
+        self.assertEqual(
+            [call.kwargs["config"] for call in self.calls.deploy.call_args_list],
+            list(DEPLOY.ACQUISITION_CONFIGS[:2]),
+        )
+        self.calls.verify_writer_ready.assert_not_called()
+        self.calls.summary.assert_not_called()
 
     def test_a_failing_reader_smoke_fails_the_deployment(self):
         self.calls.smoke.side_effect = [True, False]
