@@ -1285,6 +1285,8 @@ export default class extends Entry {
     await defaultLibrary(scenario.name, { required: true, ...(scenario.revokeExpired ? { entrypoint: wrapper } : {}) });
     await installDefaultSource();
     sql("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES ('local','download.interval','0','0'),('local','download.wait-steps','0','0');");
+    const objectSnapshotSql = "SELECT object_key,size,encoding,crc32,hex(data) AS payload FROM objects ORDER BY object_key";
+    const unrelatedObjects = sql(objectSnapshotSql)[0].results;
     sourceEpisodeCount = scenario.episodes;
     sourceImageCount = scenario.images || 0;
     sourceRequests.clear(); imageRequests.clear();
@@ -1304,14 +1306,29 @@ export default class extends Entry {
       assert(accepted.success, JSON.stringify(accepted));
       const jobId = accepted.results[0].job_id;
       await Promise.race([entered.promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`source gate timed out: ${scenario.name}`)), 30000).unref())]);
+      const earlyRow = sql(`SELECT checkpoint_json,status,execution_token FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
       if (scenario.pauseToc) {
-        const early = JSON.parse(scalar(`SELECT checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`));
-        assert(Array.isArray(early.creation_reservation) && early.creation_reservation.length === 2, 'the allocator must durably associate its exact ID/generation with the live job BEFORE the first TOC response');
-        assert.equal(early.write_origin, null, 'a numeric-only pre-TOC claim must not fabricate a namespace epoch');
+        // The first /smoke-novel/ request is the unowned URL-resolution probe:
+        // canonical admission only allocates the durable reservation after that
+        // probe resolves the target, so nothing may be claimed or published
+        // while the probe is still outstanding.
+        assert.equal(earlyRow.status, 'running');
+        assert(earlyRow.execution_token, 'the live execution must own its claim before any admission');
+        assert.equal(earlyRow.checkpoint_json, null, 'a pre-allocation resolution probe must not be answered with a durable claim already attached');
+        assert.equal(scalar('SELECT COUNT(*) FROM novels'), 0);
+        assert.equal(scalar('SELECT COUNT(*) FROM content_objects'), 0, 'a pre-allocation probe cannot publish canonical body bytes');
+      } else {
+        // Every other pause point is an owned upstream fetch: the exact
+        // numeric reservation and writer origin must already be durable or a
+        // lost execution would leak an unclaimed ID or stale producer epoch.
+        assert.equal(earlyRow.status, 'running');
+        assert(earlyRow.execution_token, 'the live execution must own its claim');
+        const early = JSON.parse(earlyRow.checkpoint_json);
+        assert(Array.isArray(early.creation_reservation) && early.creation_reservation.length === 2 && early.creation_reservation.every(Number.isSafeInteger), 'the allocator must durably associate its exact ID/generation with the live job BEFORE the first owned upstream fetch');
+        assert(early.write_origin && typeof early.write_origin.prefix === 'string' && Number.isSafeInteger(early.write_origin.epoch), 'the original namespace epoch must be durable before the first owned upstream fetch');
         assert.equal(early.phase, 'planned');
         assert.equal(early.next_section_index, null);
-        assert.equal(scalar('SELECT COUNT(*) FROM novels'), 0);
-        assert.equal(scalar('SELECT COUNT(*) FROM content_objects'), 0, 'pre-prefix ownership cannot publish canonical body bytes');
+        assert.equal(scalar(`SELECT COUNT(*) FROM novel_id_reservations WHERE job_id=${quote(jobId)} AND available=0 AND id=${early.creation_reservation[0]} AND generation=${early.creation_reservation[1]}`), 1, 'the exact reserved ID/generation must be owned by this live job');
       }
       if (scenario.clearAll) {
         const waiting = await (await api('/api/download', { targets: [target], force: true })).json();
@@ -1328,7 +1345,10 @@ export default class extends Entry {
         const held = sql(`SELECT status,execution_token,checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
         assert.equal(held.status, 'permanent');
         assert(held.execution_token, 'logical cancellation must not pretend the held physical fetch has stopped');
-        const origin = JSON.parse(held.checkpoint_json).write_origin;
+        assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), 1,
+          'ordinary cancellation retains the body committed before the held image; explicit revocation may drain it');
+        const checkpoint = JSON.parse(held.checkpoint_json);
+        const origin = checkpoint.write_origin;
         assert(origin, 'the exact original epoch must remain durable until atomic revocation');
         sql(`UPDATE worker_jobs SET lease_until='2000-01-01T00:00:00.000000000Z' WHERE job_id=${quote(jobId)} AND execution_token=${quote(held.execution_token)}`);
         // The source response is STILL awaiting release.promise. Expiry is a
@@ -1337,11 +1357,44 @@ export default class extends Entry {
         assert(revoked.success, JSON.stringify(revoked));
         const settled = sql(`SELECT execution_token,checkpoint_json FROM worker_jobs WHERE job_id=${quote(jobId)}`)[0].results[0];
         assert.equal(settled.execution_token, null);
-        assert(settled.checkpoint_json, 'revocation must retain the exact claim until closed-owner cleanup and final release finish');
-        const epoch = scalar(`SELECT epoch FROM novel_access_gates WHERE prefix=${quote(origin.prefix.replace(/\/$/, ''))}`);
-        assert(epoch > origin.epoch, 'the old producer must be fenced while its real HTTP fetch is still alive');
-        assert.equal(scalar(`SELECT closed FROM novel_access_gates WHERE prefix=${quote(origin.prefix.replace(/\/$/, ''))}`), 1, 'revocation keeps the namespace CLOSED until cleanup; it must not bump and reopen early');
+        if (settled.checkpoint_json !== null) {
+          const pending = JSON.parse(settled.checkpoint_json);
+          assert.deepEqual(pending.creation_reservation, checkpoint.creation_reservation, 'bounded cleanup retains the original numeric generation');
+          assert.deepEqual(pending.write_origin, origin, 'bounded cleanup must not reauthenticate a revoked producer');
+        }
+        const prefix = origin.prefix.replace(/\/$/, '');
+        const gate = sql(`SELECT epoch,closed,owner,origin_url_fold FROM novel_access_gates WHERE prefix=${quote(prefix)}`)[0].results[0];
+        assert.equal(gate.epoch, origin.epoch + 1, 'the fenced producer is superseded by exactly one epoch while its real HTTP fetch is still alive');
+        if (gate.closed === 1) {
+          assert(settled.checkpoint_json, 'an unfinished drain must retain durable reservation proof');
+          assert(gate.owner, 'a closed namespace must retain its removal owner');
+          const [id, generation] = checkpoint.creation_reservation;
+          assert.equal(scalar(`SELECT COUNT(*) FROM novel_id_reservations WHERE id=${id} AND generation=${generation} AND available=0 AND job_id=${quote(jobId)}`), 1,
+            'the numeric identity cannot be released before its closed namespace is drained');
+        } else {
+          assert.equal(gate.closed, 0);
+          assert.equal(gate.owner, null, 'only a completed namespace drain may reopen admission');
+          assert.equal(gate.origin_url_fold ?? '', '', 'reopened empty namespaces must clear their old origin');
+          assert.equal(scalar("SELECT COUNT(*) FROM content_objects"), 0, 'reopened admission requires all unpublished canonical bytes to be drained');
+          assert.deepEqual(sql(objectSnapshotSql)[0].results, unrelatedObjects, 'a completed drain preserves unrelated site definitions');
+        }
+        if (settled.checkpoint_json === null) {
+          assert.equal(gate.closed, 0, 'checkpoint release cannot precede reopening the drained namespace');
+          assert.equal(scalar("SELECT COUNT(*) FROM novel_namespace_claims"), 0);
+          assert.equal(scalar("SELECT COUNT(*) FROM novel_id_reservations WHERE available=0"), 0);
+        }
         assert.equal(imageRequests.get('/smoke-image/0.png'), 1);
+      }
+      // Only bytes committed before the cancellation tombstone are retained:
+      // the held response lands after the tombstone, so a still-paused section
+      // body was never durably accepted, while a body committed before the
+      // pause survives until fenced terminal cleanup drains the namespace.
+      // Explicit revocation can make bounded cleanup progress while the
+      // source is still held; ordinary cancellation must retain prior commits.
+      if (!scenario.revokeExpired) {
+        assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"),
+          scenario.images ? 1 : 0,
+          'pre-cancellation commits are retained through cancellation; bytes still in flight are never durably accepted');
       }
       release.resolve();
       if (revocationWitness) await bounded(revocationWitness.completed.promise, 'revoked physical delivery settlement');
@@ -1360,7 +1413,6 @@ export default class extends Entry {
       assert.equal(sourceRequests.get('/smoke-novel/2/') || 0, 0, 'cancellation must stop subsequent episodes');
       assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE kind='convert'"), 0, 'a canceled acquisition must not enqueue a new conversion');
       assert.equal(scalar("SELECT COUNT(*) FROM worker_jobs WHERE status IN ('pending','running','retryable')"), 0, 'bulk clearing must not wake the former waiting queue');
-      assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), scenario.pauseToc ? 0 : 1, 'received bytes are retained; a pre-TOC cancellation must not invent body data');
       const queueStatus = await (await api('/api/queue/status')).json();
       assert.equal(queueStatus.failed, 0, 'intentional interruption and cleared waiting work must not appear as failures');
       assert.equal(queueStatus.cancelled, 1, 'the stopped running execution must be counted as canceled');
@@ -1372,12 +1424,25 @@ export default class extends Entry {
       }
       if (scenario.images && !scenario.revokeExpired) {
         assert.deepEqual([...imageRequests.keys()], ['/smoke-image/0.png'], 'cancellation must stop subsequent images');
-        const index = sql("SELECT encoding,hex(data) payload FROM objects WHERE object_key LIKE '%/.illustration_cache.yaml'")[0].results[0];
-        const bytes = Buffer.from(index.payload, 'hex');
-        const text = (index.encoding === 'brotli' ? brotliDecompressSync(bytes) : bytes).toString();
-        assert(text.includes('/smoke-image/0.png'), 'cancellation must retain the already saved image mapping');
+        assert.equal(scalar("SELECT COUNT(*) FROM objects WHERE object_key LIKE '%/.illustration_cache.yaml'"), 0,
+          'an image still in flight at cancellation is never durably committed, so no saved mapping can exist');
       }
       await settleCreation(jobId);
+      // Full fenced cleanup leaves nothing behind for an unpublished creation:
+      // no owned numeric reservation, namespace claim, publication receipt,
+      // durable checkpoint, record, or stored object survives settlement.
+      assert.equal(scalar("SELECT COUNT(*) FROM novel_id_reservations WHERE available=0"), 0,
+        'settlement must release the owned numeric ID');
+      assert.equal(scalar("SELECT COUNT(*) FROM novel_namespace_claims"), 0,
+        'settlement must release the namespace claim');
+      assert.equal(scalar("SELECT COUNT(*) FROM novel_creation_receipts"), 0,
+        'settlement must release the publication receipt');
+      assert.equal(scalar("SELECT COUNT(*) FROM novels"), 0,
+        'an unpublished creation must not leave a record');
+      assert.equal(scalar("SELECT COUNT(*) FROM content_objects"), 0,
+        'settlement drains every unpublished canonical object');
+      assert.deepEqual(sql(objectSnapshotSql)[0].results, unrelatedObjects,
+        'settlement removes creation-owned objects but preserves the saved site definition and other unrelated data');
       console.log(`PASS ${scenario.name}: durable cancellation, no later fetches or follow-up conversion, full fenced reservation cleanup`);
     } finally {
       sourcePause = null;
