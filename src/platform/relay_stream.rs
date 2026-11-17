@@ -2,7 +2,7 @@
 use futures::{StreamExt, stream};
 use serde::Deserialize;
 
-use crate::platform::http::{HttpStreamResponse, is_safe_header_value};
+use crate::platform::http::{HttpStreamResponse, WAF_ACTION_HEADER, is_safe_header_value};
 use crate::platform::object_store::AssetStream;
 use crate::platform::relay::MAX_RELAY_METADATA;
 use crate::error::{NarouError, Result};
@@ -22,6 +22,8 @@ struct Metadata {
     #[serde(default)]
     set_cookie: Vec<String>,
     via: Option<String>,
+    /// ブラウザ確認の種別 (`x-amzn-waf-action`)。古い踏み台では欠落する。
+    waf_action: Option<String>,
     body_length: u64,
 }
 
@@ -112,11 +114,12 @@ pub async fn decode_relay_stream(response: HttpStreamResponse) -> Result<HttpStr
     if metadata.body_length > MAX_RELAY_BODY {
         return Err(invalid("relay stream body exceeds limit"));
     }
-    let mut headers = Vec::with_capacity(metadata.set_cookie.len() + 4);
+    let mut headers = Vec::with_capacity(metadata.set_cookie.len() + 5);
     for (name, value) in [
         ("content-type", metadata.content_type),
         ("location", metadata.location),
         ("x-narou-relay-via", metadata.via),
+        (WAF_ACTION_HEADER, metadata.waf_action),
     ] {
         if let Some(value) = value.filter(|value| !value.is_empty()) {
             if !is_safe_header_value(&value) {
@@ -162,6 +165,17 @@ mod tests {
         bytes
     }
 
+    fn prefix_with_action(length: u64, action: &str) -> Vec<u8> {
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "status": 405, "contentType": "text/html", "wafAction": action,
+            "setCookie": [], "via": "curl", "bodyLength": length,
+        })).unwrap();
+        let mut bytes = Vec::from(MAGIC.as_slice());
+        bytes.extend_from_slice(&(metadata.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&metadata);
+        bytes
+    }
+
     fn response(chunks: Vec<Vec<u8>>, pulls: Arc<AtomicUsize>) -> HttpStreamResponse {
         HttpStreamResponse {
             status: 200,
@@ -200,6 +214,21 @@ mod tests {
             let mut body = Vec::new();
             while let Some(chunk) = output.body.next().await { body.extend(chunk.unwrap()); }
             assert_eq!(body, [0, 255, 128, b'\n', 42]);
+        });
+    }
+
+    #[test]
+    fn the_browser_verification_action_survives_the_framing() {
+        futures::executor::block_on(async {
+            let input = response(vec![prefix_with_action(0, "captcha")], Arc::default());
+            let decoded = decode_relay_stream(input).await.unwrap();
+            assert_eq!(decoded.status, 405);
+            assert_eq!(decoded.header("x-amzn-waf-action"), Some("captcha"));
+
+            // 古い踏み台 (このフィールドを持たないもの) はヘッダなしで復号する。
+            let input = response(vec![prefix(0)], Arc::default());
+            let decoded = decode_relay_stream(input).await.unwrap();
+            assert_eq!(decoded.header("x-amzn-waf-action"), None);
         });
     }
 

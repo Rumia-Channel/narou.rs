@@ -1,3 +1,4 @@
+pub(crate) mod auth;
 pub(crate) mod author_listing;
 pub mod html;
 pub mod http_policy;
@@ -29,6 +30,7 @@ use chrono::{
 use chrono_tz::Tz;
 use regex::Regex;
 
+use self::auth::AuthState;
 use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
 use self::persistence::{PersistenceService, SectionLoadFailure, compute_section_hash};
@@ -44,7 +46,7 @@ use self::toc::{
 };
 use self::util::{
     build_section_url, compile_html_pattern, load_length_limit, mask_spoiler_text,
-    sanitize_filename_with_limit,
+    parse_two_digit_year_datetime, sanitize_filename_with_limit,
 };
 use crate::application::messages;
 use crate::db::novel_record::NovelRecord;
@@ -175,10 +177,28 @@ struct DigestContext<'a> {
     latest_count: usize,
 }
 
+/// One attempt at the table of contents: the first page, the metadata read
+/// from it and the episode list of every page.
+struct TocAttempt {
+    /// The first page's source.
+    source: String,
+    /// Metadata read from the first page.
+    info: NovelInfo,
+    /// 1 = series, 2 = short story.
+    novel_type: u8,
+    /// Whether the work is finished.
+    is_end: bool,
+    /// The episodes of every page.
+    listing: toc::TocListing,
+}
+
 /// One [`Downloader::section_needs_download`] probe: the latest and stored
 /// subtitle rows plus the cache/state handles the decision consults.
 struct SectionDecision<'a> {
-    setting: &'a SiteSetting,
+    setting: &'a mut SiteSetting,
+    /// The credentials the run may use; a body that needs authentication
+    /// switches to the next stored login through it.
+    auth: &'a mut AuthState,
     latest: &'a SubtitleInfo,
     old: Option<&'a SubtitleInfo>,
     existing_id: Option<i64>,
@@ -509,6 +529,13 @@ fn parse_loose_datetime_with_timezone(
     }
     if let Ok(dt) = DateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S%.f %z") {
         return Some(dt.with_timezone(&Utc));
+    }
+
+    // 2 桁年 (ノベルアップ＋ の `24/5/29 7:36`) は `%Y` だと西暦 24 年として
+    // 読まれるため、先に POSIX `%y` の規則 (Ruby の Date.parse と同じ) で読む。
+    // 4 桁の年は `%y` に合致しないので、既存の解釈には触れない。
+    if let Some(datetime) = parse_two_digit_year_datetime(&value, timezone) {
+        return Some(datetime);
     }
 
     let formats = [
@@ -1562,36 +1589,28 @@ impl Downloader {
         // sends the stored cookie from the first request; every other novel
         // stays anonymous until a fetch actually fails.
         let mut configured_cookie = setting.cookie.clone();
-        let mut login_session: Option<String> = None;
-        let mut login_cookie = match existing_id {
-            Some(id) => {
-                let record = self.novels.get_current(id.into()).await?;
-                let requires = record.as_ref().is_some_and(|record| record.requires_login);
-                if requires {
-                    // その小説で前に成功したログインがあればそれを、無ければ
-                    // 一覧の先頭を最初のリクエストから送る。
-                    let groups = self.stored_groups_for(&setting).await;
-                    let chosen = record
-                        .as_ref()
-                        .and_then(|record| record.login_session.as_deref())
-                        .and_then(|id| groups.iter().find(|group| group.id == id))
-                        .or_else(|| groups.first());
-                    chosen.and_then(|group| {
-                        let cookie = group.merged_cookie();
-                        if cookie.is_empty() {
-                            return None;
-                        }
-                        apply_login_cookie(&mut setting, &cookie, &group.cookies);
-                        login_session = Some(group.id.clone());
-                        Some(cookie)
-                    })
-                } else {
-                    None
+        // 認証状態: サイトの設定 cookie と、保存済みログインのうち今有効なもの。
+        // 候補を切り替えるたびに素の cookie へ戻すので、アカウントの cookie が
+        // 混ざらない。
+        let mut auth = AuthState::new(configured_cookie.clone());
+        if let Some(id) = existing_id {
+            let record = self.novels.get_current(id.into()).await?;
+            let requires = record.as_ref().is_some_and(|record| record.requires_login);
+            if requires {
+                // その小説で以前成功したログインがあればそれを、無ければ
+                // 一覧の先頭を最初のリクエストから送る。
+                let groups = self.stored_groups_for(&setting).await;
+                auth.set_groups(groups);
+                let chosen = record
+                    .as_ref()
+                    .and_then(|record| record.login_session.as_deref())
+                    .and_then(|id| auth.index_of(id))
+                    .or_else(|| auth.next_unused());
+                if let Some(index) = chosen {
+                    auth.apply(&mut setting, index);
                 }
             }
-            None => None,
-        };
-        let mut requires_login = login_cookie.is_some();
+        }
         let mut login_site_changed = false;
         // Prefetched input and its response-cookie jar are one fetch context.
         // Rebuilding a policy here loses CSRF cookies needed by YAML form jobs.
@@ -1614,10 +1633,10 @@ impl Downloader {
                             final_setting.cookie = setting.cookie.clone();
                             final_setting.login_cookie_hosts = setting.login_cookie_hosts.clone();
                         } else {
+                            // 別サイトへ移ったので、認証状態もそのサイトの
+                            // cookie で作り直す。
                             login_site_changed = true;
-                            login_cookie = None;
-                            login_session = None;
-                            requires_login = false;
+                            auth = AuthState::new(configured_cookie.clone());
                         }
                         setting = final_setting;
                         (
@@ -1694,102 +1713,20 @@ impl Downloader {
                 .await
             }
         };
-        // Login fallback: retry once with the stored cookie before treating the
-        // novel as deleted. Nothing is sent when no cookie is stored, so sites
-        // the user never signed in to behave exactly as before.
-        let mut toc_source = toc_source;
-        let login_wall = should_retry_with_login(&setting, &toc_source);
-        if login_cookie.is_none() && login_wall {
-            // ログイン壁だけ先に解消する。部分一覧の比較は全ページを読んでから行う。
-            let groups = self.stored_groups_for(&setting).await;
-            if !groups.is_empty() {
-                self.report_line(messages::download::login_retry()).await;
-                let base_cookie = setting.cookie.clone();
-                let mut winner: Option<LoginGroup> = None;
-                for group in &groups {
-                    setting.cookie = base_cookie.clone();
-                    apply_login_cookie(&mut setting, &group.merged_cookie(), &group.cookies);
-                    let mut candidate_jobs = preprocess::PreprocessJobs::new();
-                    let retried = fetch_toc(
-                        self.http.as_ref(),
-                        self.rate_limiter.as_ref(),
-                        &setting,
-                        &toc_url,
-                        &mut candidate_jobs,
-                    )
-                    .await;
-                    if retried.is_ok() && !should_retry_with_login(&setting, &retried) {
-                        requires_login = true;
-                        login_session = Some(group.id.clone());
-                        toc_source = retried;
-                        winner = Some(group.clone());
-                        self.preprocess_jobs = candidate_jobs;
-                        break;
-                    }
-                }
-                // 採用した資格情報を最終状態に残す（本文も同じ Cookie で取る）。
-                setting.cookie = base_cookie;
-                setting.login_cookie_hosts.clear();
-                if let Some(winner) = &winner {
-                    apply_login_cookie(&mut setting, &winner.merged_cookie(), &winner.cookies);
-                }
-            }
-        }
-        if toc_source.is_ok() && should_retry_with_login(&setting, &toc_source) {
-            toc_source = Err(NarouError::NotFound("Novel deleted or private".into()));
-        }
-        let mut toc_source = match toc_source {
+        // ログイン壁 (サイトのログインページやブラウザ確認の応答) が残った
+        // ときは、保存済みログインを順に試す。保存された cookie が無いサイトは
+        // 従来どおり匿名のまま失敗する。
+        // 目次を読む間は失効したトークンの更新を一度だけ試す (更新した
+        // トークンでも壁が残るなら、保存済みログインを従来どおり試す)。
+        auth.reset_token_refresh();
+        let toc_source = self
+            .recover_toc_page(&mut setting, &mut auth, &toc_url, toc_source)
+            .await;
+        let toc_source = match toc_source {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
-                self.report_line(messages::download::novel_unavailable()).await;
-                #[cfg(feature = "native-runtime")]
-                {
-                    let write = options.access.as_ref().ok_or_else(|| {
-                        NarouError::DownloadResumeCorrupt("not-found update has no original writer fence".into())
-                    })?;
-                    crate::compat::mark_not_found_and_freeze(write, id)?;
-                }
-                let record = self.novels.get_current(id.into()).await?;
-                let title = record
-                    .as_ref()
-                    .map(|record| record.title.clone())
-                    .unwrap_or_default();
-                let author = record
-                    .as_ref()
-                    .map(|record| record.author.clone())
-                    .unwrap_or_default();
-                let novel_dir = {
-                    // archive_root は Inventory 依存 (Phase 4 対象) のため
-                    // 従来どおり Database 経由で取得する。Worker は論理パスを
-                    // そのまま使う (freeze は native Inventory の責務)。
-                    #[cfg(feature = "native-runtime")]
-                    let archive_root =
-                        crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-                            .unwrap_or_else(|_| PathBuf::from(types::ARCHIVE_ROOT_DIR));
-                    #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
-                    let archive_root = PathBuf::from(types::ARCHIVE_ROOT_DIR);
-                    record
-                        .as_ref()
-                        .map(|record| crate::db::novel_dir_for_record(&archive_root, record))
-                        .unwrap_or_default()
-                };
-                return Ok(DownloadResult {
-                    id,
-                    title,
-                    author,
-                    novel_dir,
-                    new_novel: false,
-                    new_arrivals: false,
-                    new_arrival_subtitles: Vec::new(),
-                    updated_count: 0,
-                    total_count: 0,
-                    status: UpdateStatus::Failed,
-                    title_changed: false,
-                    author_changed: false,
-                    story_changed: false,
-                    sections_deleted: false,
-                });
+                return self.unavailable_result(options.access.as_ref(), id).await;
             }
             Err(err) => return Err(err),
         };
@@ -1844,103 +1781,38 @@ impl Downloader {
             }
         }
 
-        let mut info = self
-            .load_novel_info(&setting, &toc_source, &url_captures, &toc_url)
-            .await?;
-
         let existing_record = match existing_id {
             Some(eid) => self.novels.get_current(eid.into()).await?,
             None => None,
         };
 
-        let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info).await;
-
-        let toc::TocListing { mut subtitles, partial: mut partial_listing, tag_sources: mut page_tags } = if novel_type == 2 {
-            toc::TocListing {
-                subtitles: create_short_story_subtitles(&setting, &toc_source, &info).await?,
-                partial: false,
-                tag_sources: setting.resolve_info_pattern("tags", &toc_source).await.into_iter().collect(),
+        // 目次と各ページの話数一覧を読む。壁や欠けた一覧になったときは、保存済み
+        // ログインを順に試して最初の一ページから読み直すので、欠けた一覧を
+        // 成功として保存しない。
+        let attempt = match self
+            .recover_toc_listing(&mut setting, &mut auth, &toc_url, &url_captures, toc_source)
+            .await
+        {
+            Ok(attempt) => attempt,
+            Err(NarouError::NotFound(_)) if existing_id.is_some() => {
+                let id = existing_id.unwrap();
+                return self.unavailable_result(options.access.as_ref(), id).await;
             }
-        } else {
-            parse_subtitles_multipage(toc::MultipageTocRequest {
-                http: self.http.as_ref(),
-                rate_limiter: self.rate_limiter.as_ref(),
-                setting: &setting,
-                toc_source: &toc_source,
-                url_captures: &url_captures,
-                title: info.title.as_deref().unwrap_or_default(),
-                progress: self.progress.as_deref(),
-                jobs: &mut self.preprocess_jobs,
-            })
-            .await?
+            Err(error) => return Err(error),
         };
-
-        // 目次ページの途中で「一覧が欠けている」と分かった場合 (Pixiv の小説
-        // シリーズは未ログインだと本文一覧が 0 件になる) は、保存済み Cookie で
-        // 取り直し、話数が増えたときだけ採用する。
-        if partial_listing || subtitles.is_empty() {
-            let groups = self.stored_groups_for(&setting).await;
-            if !groups.is_empty() {
-                self.report_line(messages::download::login_retry()).await;
-                let active_cookie = setting.cookie.clone();
-                let active_cookie_hosts = setting.login_cookie_hosts.clone();
-                let base_cookie = configured_cookie.clone();
-                let mut winner: Option<LoginGroup> = None;
-                for group in &groups {
-                    if login_session.as_deref() == Some(group.id.as_str()) {
-                        continue;
-                    }
-                    setting.cookie = base_cookie.clone();
-                    apply_login_cookie(&mut setting, &group.merged_cookie(), &group.cookies);
-                    let mut candidate_jobs = preprocess::PreprocessJobs::new();
-                    let Ok(retried_source) = fetch_toc(
-                        self.http.as_ref(), self.rate_limiter.as_ref(), &setting,
-                        &toc_url, &mut candidate_jobs,
-                    ).await else {
-                        continue;
-                    };
-                    let Ok(toc::TocListing { subtitles: retried, partial: retried_partial, tag_sources: retried_tags }) =
-                        parse_subtitles_multipage(toc::MultipageTocRequest {
-                            http: self.http.as_ref(),
-                            rate_limiter: self.rate_limiter.as_ref(),
-                            setting: &setting,
-                            toc_source: &retried_source,
-                            url_captures: &url_captures,
-                            title: info.title.as_deref().unwrap_or_default(),
-                            progress: self.progress.as_deref(),
-                            jobs: &mut candidate_jobs,
-                        })
-                        .await
-                    else {
-                        continue;
-                    };
-                    if !retried.is_empty()
-                        && ((!retried_partial && partial_listing) || retried.len() > subtitles.len())
-                    {
-                        let resolved = !retried_partial;
-                        subtitles = retried;
-                        partial_listing = retried_partial;
-                        page_tags = retried_tags;
-                        requires_login = true;
-                        login_session = Some(group.id.clone());
-                        winner = Some(group.clone());
-                        self.preprocess_jobs = candidate_jobs;
-                        toc_source = retried_source;
-                        info = self.load_novel_info(&setting, &toc_source, &url_captures, &toc_url).await?;
-                        if resolved {
-                            break;
-                        }
-                    }
-                }
-                setting.cookie = active_cookie;
-                setting.login_cookie_hosts = active_cookie_hosts;
-                if let Some(winner) = &winner {
-                    setting.cookie = base_cookie;
-                    setting.login_cookie_hosts.clear();
-                    apply_login_cookie(&mut setting, &winner.merged_cookie(), &winner.cookies);
-                }
-            }
-        }
+        let TocAttempt {
+            source: toc_source,
+            info,
+            novel_type,
+            is_end,
+            listing,
+        } = attempt;
+        let toc::TocListing {
+            mut subtitles,
+            partial: partial_listing,
+            tag_sources: page_tags,
+            ..
+        } = listing;
         let author = info.author.clone().unwrap_or_default();
 
         let fetched_raw_title = info.title.clone().unwrap_or_default();
@@ -2316,7 +2188,8 @@ impl Downloader {
                 (true, None)
             } else {
                 self.section_needs_download(access.read()?, SectionDecision {
-                    setting: &setting,
+                    setting: &mut setting,
+                    auth: &mut auth,
                     latest: subtitle,
                     old: old_subtitles.get(&subtitle.index).copied(),
                     existing_id,
@@ -2397,7 +2270,8 @@ impl Downloader {
                 if defer_strong_update && !force && !plan.resumed && plan.needs_download {
                     let (needs_download, predownloaded) = self
                         .section_needs_download(access.read()?, SectionDecision {
-                            setting: &setting,
+                            setting: &mut setting,
+                            auth: &mut auth,
                             latest: subtitle,
                             old: old_subtitles.get(&subtitle.index).copied(),
                             existing_id,
@@ -2483,16 +2357,14 @@ impl Downloader {
 
                     let (section, raw_html) = match plan.predownloaded {
                         Some(downloaded) => downloaded,
-                        None => download_section(
-                            self.http.as_ref(),
-                            self.rate_limiter.as_ref(),
-                            &mut self.section_cache,
-                            &setting,
-                            subtitle,
-                            &toc_url,
-                            &mut self.preprocess_jobs,
-                        )
-                        .await?,
+                        None => self
+                            .download_section_with_logins(
+                                &mut setting,
+                                &mut auth,
+                                subtitle,
+                                &toc_url,
+                            )
+                            .await?,
                     };
                     let had_existing = plan.existed;
                     if had_existing {
@@ -2789,8 +2661,8 @@ impl Downloader {
             is_narou: setting.is_narou,
             last_check_date: None,
             convert_failure: false,
-            requires_login,
-            login_session: login_session.clone(),
+            requires_login: auth.requires_login(),
+            login_session: auth.active().map(|active| active.id.clone()),
             extra_fields: Default::default(),
         };
         // 取得に使う URL (toc_url) と利用者が指定した URL が違う場合、後者を
@@ -2848,13 +2720,15 @@ impl Downloader {
                     updated.domain = record.domain.clone();
                     updated.suspend = false;
                     updated.is_narou = record.is_narou;
+                    let requires_login = auth.requires_login();
+                    let login_session = auth.active().map(|active| active.id.clone());
                     if login_site_changed {
                         updated.requires_login = requires_login;
                     } else {
                         updated.requires_login |= requires_login;
                     }
                     if login_site_changed || login_session.is_some() {
-                        updated.login_session = login_session.clone();
+                        updated.login_session = login_session;
                     }
                     // 既存の小説をページ URL 指定で取り直したときも控え直す。
                     if target != updated.toc_url && updated.original_url().is_none() {
@@ -2945,6 +2819,443 @@ impl Downloader {
         operation
     }
 
+    /// The result for a novel the site no longer serves.
+    ///
+    /// narou.rb freezes the record and reports the novel as unavailable. A
+    /// site that declares `login_wall_error: login` never reaches here: its
+    /// wall stays an authentication error, so the record is not frozen.
+    ///
+    /// The freeze is a canonical metadata write, so it runs under the writer
+    /// fence of the run that found the novel gone. A run without that fence
+    /// cannot claim the record is missing, and fails instead of writing.
+    async fn unavailable_result(
+        &self,
+        write: Option<&NovelWriteGuard>,
+        id: i64,
+    ) -> Result<DownloadResult> {
+        self.report_line(messages::download::novel_unavailable()).await;
+        #[cfg(feature = "native-runtime")]
+        {
+            let write = write.ok_or_else(|| {
+                NarouError::DownloadResumeCorrupt(
+                    "not-found update has no original writer fence".into(),
+                )
+            })?;
+            crate::compat::mark_not_found_and_freeze(write, id)?;
+        }
+        #[cfg(not(feature = "native-runtime"))]
+        let _ = write;
+        let record = self.novels.get_current(id.into()).await?;
+        let title = record
+            .as_ref()
+            .map(|record| record.title.clone())
+            .unwrap_or_default();
+        let author = record
+            .as_ref()
+            .map(|record| record.author.clone())
+            .unwrap_or_default();
+        let novel_dir = {
+            // archive_root は Inventory 依存 (Phase 4 対象) のため
+            // 従来どおり Database 経由で取得する。Worker は論理パスを
+            // そのまま使う (freeze は native Inventory の責務)。
+            #[cfg(feature = "native-runtime")]
+            let archive_root =
+                crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                    .unwrap_or_else(|_| PathBuf::from(types::ARCHIVE_ROOT_DIR));
+            #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+            let archive_root = PathBuf::from(types::ARCHIVE_ROOT_DIR);
+            record
+                .as_ref()
+                .map(|record| crate::db::novel_dir_for_record(&archive_root, record))
+                .unwrap_or_default()
+        };
+        Ok(DownloadResult {
+            id,
+            title,
+            author,
+            novel_dir,
+            new_novel: false,
+            new_arrivals: false,
+            new_arrival_subtitles: Vec::new(),
+            updated_count: 0,
+            total_count: 0,
+            status: UpdateStatus::Failed,
+            title_changed: false,
+            author_changed: false,
+            story_changed: false,
+            sections_deleted: false,
+        })
+    }
+
+    /// Try the next stored login after an authentication wall.
+    ///
+    /// The stored logins are read once per run, and only when a credential is
+    /// selected or recovered. Every candidate starts from the site's own
+    /// cookie, so one account's cookies never reach another account's
+    /// request.
+    async fn try_next_login(
+        &mut self,
+        setting: &mut SiteSetting,
+        auth: &mut AuthState,
+    ) -> bool {
+        if auth.groups().is_none() {
+            let groups = self.stored_groups_for(&*setting).await;
+            auth.set_groups(groups);
+        }
+        if !auth.apply_next(setting) {
+            return false;
+        }
+        self.report_line(messages::download::login_retry()).await;
+        true
+    }
+
+    /// Renew the browser-issued token and send the refreshed credential.
+    ///
+    /// Returns `false` when no fresh token was obtained; the caller then
+    /// keeps its legacy behavior of walking the stored candidates.
+    async fn renew_token(
+        &mut self,
+        setting: &mut SiteSetting,
+        auth: &mut AuthState,
+        target_url: &str,
+    ) -> bool {
+        // The result is bound before the credential is written: the request
+        // for the new token must be over before the login changes.
+        let refreshed = self.refresh_browser_token(&*setting, auth, target_url).await;
+        match refreshed {
+            Some(group) => auth.apply_refreshed(&mut *setting, group),
+            None => false,
+        }
+    }
+
+    /// Ask the store for a fresh browser-issued token of the site.
+    ///
+    /// The store answers `None` when the capability is unavailable (the
+    /// storage only adapters) or when the site defines no browser token, so
+    /// the caller keeps its legacy behavior of walking the stored
+    /// candidates. A failure is reported and treated as "no token": the
+    /// stored candidates may still work.
+    ///
+    /// Only the site that defines a browser token is asked, and only after a
+    /// known authentication or browser-verification failure.
+    async fn refresh_browser_token(
+        &self,
+        setting: &SiteSetting,
+        auth: &mut AuthState,
+        target_url: &str,
+    ) -> Option<LoginGroup> {
+        let cookies = self.cookies.as_ref()?;
+        let config = setting.browser_token.as_ref()?;
+        // One renewal per logical operation: a renewed token that is still
+        // rejected must not start another one.
+        if !auth.claim_token_refresh() {
+            return None;
+        }
+        if auth.groups().is_none() {
+            let groups = self.stored_groups_for(setting).await;
+            auth.set_groups(groups);
+        }
+        // The login in effect is the one whose token is renewed; without one
+        // the store picks the login that carries the token.
+        let session_id = auth
+            .active()
+            .and_then(|login| (!login.id.is_empty()).then_some(login.id.as_str()));
+        let renewed = cookies
+            .refresh_browser_token(&setting.domain, target_url, &config.cookie_name, session_id)
+            .await;
+        match renewed {
+            Ok(Some(group)) => {
+                self.report_line(messages::download::browser_token_retry()).await;
+                Some(group)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                self.report_warn(&messages::download::token_refresh_failed(&error))
+                    .await;
+                None
+            }
+        }
+    }
+
+    /// Fetch the table of contents, retrying with the stored logins while the
+    /// site answers with a login wall.
+    ///
+    /// A wall is the site's own login page (the `login_pattern` matched the
+    /// body), a missing page or a browser-verification answer. The page is
+    /// fetched again for every credential, so a wall never leaves a half
+    /// fetched table of contents behind. When no stored login works, the
+    /// site's wall error is returned.
+    ///
+    /// A browser-issued token is renewed once before the stored candidates
+    /// are walked, because an expired token is not fixed by another stored
+    /// login.
+    async fn recover_toc_page(
+        &mut self,
+        setting: &mut SiteSetting,
+        auth: &mut AuthState,
+        toc_url: &str,
+        mut toc_source: Result<String>,
+    ) -> Result<String> {
+        loop {
+            let (wall, renewable) = match &toc_source {
+                Ok(source) => {
+                    let wall = setting.is_login_wall(source);
+                    (wall, wall)
+                }
+                // A missing page is not a token problem; only a
+                // browser-verification answer is.
+                Err(error) => (is_auth_failure(error), is_login_required(error)),
+            };
+            if !wall {
+                return toc_source;
+            }
+            let renewed = renewable && self.renew_token(setting, auth, toc_url).await;
+            if !renewed && !self.try_next_login(setting, auth).await {
+                return match toc_source {
+                    Ok(_) => Err(setting.login_wall_failure()),
+                    Err(error) => Err(error),
+                };
+            }
+            toc_source = fetch_toc(
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
+                setting,
+                toc_url,
+                &mut self.preprocess_jobs,
+            )
+            .await;
+        }
+    }
+
+    /// Read the metadata and the episode list of an already fetched table of
+    /// contents.
+    async fn build_toc_attempt(
+        &mut self,
+        setting: &SiteSetting,
+        toc_url: &str,
+        url_captures: &HashMap<String, String>,
+        toc_source: String,
+    ) -> Result<TocAttempt> {
+        let info = self
+            .load_novel_info(setting, &toc_source, url_captures, toc_url)
+            .await?;
+        let (novel_type, is_end) =
+            resolve_novel_type(setting, &toc_source, url_captures, &info).await;
+        let listing = if novel_type == 2 {
+            toc::TocListing {
+                subtitles: create_short_story_subtitles(setting, &toc_source, &info).await?,
+                partial: false,
+                tag_sources: setting
+                    .resolve_info_pattern("tags", &toc_source)
+                    .await
+                    .into_iter()
+                    .collect(),
+                wall: false,
+            }
+        } else {
+            parse_subtitles_multipage(toc::MultipageTocRequest {
+                http: self.http.as_ref(),
+                rate_limiter: self.rate_limiter.as_ref(),
+                setting,
+                toc_source: &toc_source,
+                url_captures,
+                title: info.title.as_deref().unwrap_or_default(),
+                progress: self.progress.as_deref(),
+                jobs: &mut self.preprocess_jobs,
+            })
+            .await?
+        };
+        Ok(TocAttempt {
+            source: toc_source,
+            info,
+            novel_type,
+            is_end,
+            listing,
+        })
+    }
+
+    /// Fetch the table of contents and its episode list with the credential in
+    /// effect, switching to the next stored login while the site asks for
+    /// authentication.
+    ///
+    /// `source` is the first page that was already fetched; later rounds
+    /// fetch it again, because the credential changed.
+    async fn fetch_attempt_with_logins(
+        &mut self,
+        setting: &mut SiteSetting,
+        auth: &mut AuthState,
+        toc_url: &str,
+        url_captures: &HashMap<String, String>,
+        source: Option<String>,
+    ) -> Result<TocAttempt> {
+        let mut source = source;
+        loop {
+            let page = match source.take() {
+                Some(page) => Ok(page),
+                None => fetch_toc(
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
+                    &*setting,
+                    toc_url,
+                    &mut self.preprocess_jobs,
+                )
+                .await,
+            };
+            let page = match page {
+                Ok(page) => page,
+                Err(error) if is_auth_failure(&error) => {
+                    // ページが無い / ブラウザ確認の答えなら、次の保存済み
+                    // ログインで読み直す。失効したトークンは先に更新する。
+                    let renewed = is_login_required(&error)
+                        && self.renew_token(setting, auth, toc_url).await;
+                    if !renewed && !self.try_next_login(setting, auth).await {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if setting.is_login_wall(&page) {
+                let renewed = self.renew_token(setting, auth, toc_url).await;
+                if !renewed && !self.try_next_login(setting, auth).await {
+                    return Err(setting.login_wall_failure());
+                }
+                continue;
+            }
+            match self
+                .build_toc_attempt(&*setting, toc_url, url_captures, page)
+                .await
+            {
+                Ok(attempt) => return Ok(attempt),
+                Err(error) if is_auth_failure(&error) => {
+                    // 続きのページが壁だった場合も、次のログインで最初の一
+                    // ページから読み直す。失効したトークンは先に更新する。
+                    let renewed = is_login_required(&error)
+                        && self.renew_token(setting, auth, toc_url).await;
+                    if !renewed && !self.try_next_login(setting, auth).await {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Read the episode list, retrying with the stored logins while the site
+    /// answers with a login wall or an incomplete list.
+    ///
+    /// The walk starts again from the first page for every credential, so a
+    /// truncated listing is never stored. The listing of the credential that
+    /// answered completely wins; an incomplete listing is kept only when no
+    /// stored login does better.
+    async fn recover_toc_listing(
+        &mut self,
+        setting: &mut SiteSetting,
+        auth: &mut AuthState,
+        toc_url: &str,
+        url_captures: &HashMap<String, String>,
+        first_source: String,
+    ) -> Result<TocAttempt> {
+        // 採用した一覧の資格情報。候補が採用されなかったときは戻す。
+        let mut original = auth.active().cloned();
+        let mut best: Option<TocAttempt> = None;
+        let mut source = Some(first_source);
+        loop {
+            let attempt = match self
+                .fetch_attempt_with_logins(setting, auth, toc_url, url_captures, source.take())
+                .await
+            {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    // An optional login cannot invalidate an earlier usable listing.
+                    auth.restore(setting, original.as_ref());
+                    return best.ok_or(error);
+                }
+            };
+            if attempt.listing.wall {
+                // 壁が残った。失効したトークンを先に更新し、それもだめなら
+                // 保存済みログインを順に試す。
+                let renewed = self.renew_token(setting, auth, toc_url).await;
+                if !renewed && !self.try_next_login(setting, auth).await {
+                    auth.restore(setting, original.as_ref());
+                    return best.ok_or_else(|| setting.login_wall_failure());
+                }
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some(best) => {
+                    !attempt.listing.subtitles.is_empty()
+                        && ((!attempt.listing.partial && best.listing.partial)
+                            || attempt.listing.subtitles.len() > best.listing.subtitles.len())
+                }
+            };
+            if better {
+                best = Some(attempt);
+                original = auth.active().cloned();
+            } else {
+                // 採用されなかった候補は元の資格情報へ戻す。
+                auth.restore(setting, original.as_ref());
+            }
+            let complete = best
+                .as_ref()
+                .is_some_and(|best| !best.listing.partial && !best.listing.subtitles.is_empty());
+            if complete {
+                return Ok(best.expect("a listing was built"));
+            }
+            // 一覧が欠けている (Pixiv の小説シリーズは未ログインだと 0 件に
+            // なる)。保存済みログインを順に試す。
+            if !self.try_next_login(setting, auth).await {
+                auth.restore(setting, original.as_ref());
+                return Ok(best.expect("a listing was built"));
+            }
+        }
+    }
+
+    /// Fetch a section body, retrying with the stored logins while the site
+    /// answers with a login wall.
+    ///
+    /// The login that works stays in effect for the remaining bodies and is
+    /// recorded with the novel, so later runs start with it.
+    ///
+    /// Every body may renew the browser-issued token once, so a long work can
+    /// renew it again after the site invalidated it.
+    async fn download_section_with_logins(
+        &mut self,
+        setting: &mut SiteSetting,
+        auth: &mut AuthState,
+        subtitle: &SubtitleInfo,
+        toc_url: &str,
+    ) -> Result<(SectionElement, String)> {
+        // The renewal budget belongs to this body: the next body starts with
+        // a fresh one.
+        auth.reset_token_refresh();
+        loop {
+            let attempt = download_section(
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
+                &mut self.section_cache,
+                setting,
+                subtitle,
+                toc_url,
+                &mut self.preprocess_jobs,
+            )
+            .await;
+            match attempt {
+                Ok(section) => return Ok(section),
+                Err(error) if is_login_required(&error) => {
+                    let body_url = build_section_url(&*setting, toc_url, &subtitle.href);
+                    let renewed = self.renew_token(setting, auth, &body_url).await;
+                    if !renewed && !self.try_next_login(setting, auth).await {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// 戻り値: `(要 DL, 強更新の比較で取得済みなら (本文, raw))`。
     ///
     /// 取得はセクションループと同じ `download_section` を通るので、
@@ -2956,6 +3267,7 @@ impl Downloader {
     ) -> Result<(bool, Option<(SectionElement, String)>)> {
         let SectionDecision {
             setting,
+            auth,
             latest,
             old,
             existing_id,
@@ -3019,16 +3331,9 @@ impl Downloader {
             if date_string_to_ymd_with_timezone(basis_date, timezone)
                 == section_timestamp_ymd(old_section.download_time.as_deref(), timezone)
             {
-                let downloaded = download_section(
-                    self.http.as_ref(),
-                    self.rate_limiter.as_ref(),
-                    &mut self.section_cache,
-                    setting,
-                    latest,
-                    toc_url,
-                    &mut self.preprocess_jobs,
-                )
-                .await?;
+                let downloaded = self
+                    .download_section_with_logins(setting, auth, latest, toc_url)
+                    .await?;
                 let new_hash = compute_section_hash(&downloaded.0);
                 let relative_path = section_relative_path(old);
                 let old_hash = existing_id
@@ -3336,16 +3641,21 @@ fn apply_login_cookie(
     setting.login_cookie_hosts = cookies.iter().map(|entry| entry.host.clone()).collect();
 }
 
-/// A missing page (404) or a login wall served with HTTP 200 both mean the
-/// fetch may need authentication; every other error is a real failure.
-fn should_retry_with_login(setting: &SiteSetting, toc_source: &Result<String>) -> bool {
-    match toc_source {
-        Err(NarouError::NotFound(_)) => true,
-        Ok(source) => setting
-            .compiled_login_pattern()
-            .is_some_and(|pattern| pattern.is_match(source)),
-        Err(_) => false,
-    }
+/// Whether the error means the site wants a credential rather than a broken
+/// fetch.
+///
+/// A missing page (404) and a browser-verification answer both mean the fetch
+/// may need authentication; every other error is a real failure.
+fn is_auth_failure(error: &NarouError) -> bool {
+    matches!(error, NarouError::NotFound(_) | NarouError::Login(_))
+}
+
+/// Whether the error means a body needs a credential.
+///
+/// Only a login wall or a browser-verification answer does. A missing body
+/// stays the plain failure it always was.
+fn is_login_required(error: &NarouError) -> bool {
+    matches!(error, NarouError::Login(_))
 }
 
 #[cfg(test)]

@@ -145,8 +145,19 @@ try {
   sql('DELETE FROM novels WHERE id IN (900,901)');
   const authorUrl = `http://localhost:${sourcePort}/authors/7/`;
   const storedUrl = authorUrl + '#works';
-  const definition = `name: Controlled Author Source\ndomain: localhost\ntop_url: http://localhost:${sourcePort}\nurl: 'http://localhost:${sourcePort}/(?<ncode>(?:work|oneshot)\\d+)/?'\nsitename: Controlled Author Source\nversion: 1.0\nconfirm_over18: no\ntoc_url: 'http://localhost:${sourcePort}/\\k<ncode>/'\nauthor_url: '^http://(?:localhost|authors\\.example):${sourcePort}/authors/(?<user_id>\\d+)/?'\nauthor_api_url: 'http://localhost:${sourcePort}/authors/\\k<user_id>/'\nauthor_novel_pattern: '(?<novel_url>http://localhost:${sourcePort}/(?:work|oneshot)\\d+/)'\ntitle: '<h1>(?<title>.+?)</h1>'\nauthor: '<span class="author">(?<author>.+?)</span>'\nsubtitles: '<a href="(?<href>/(?:work|oneshot)\\d+/(?<index>\\d+)/)">(?<subtitle>.+?)</a>'\nbody_pattern: '<div class="body">(?<body>.+?)</div>'\nmin_interval: 0.01\n`;
-  const workTypeRule = (work) => `\nwork_type_rules:\n  - field: source\n    match: '^category::comic$'\n    type: manga\npreprocess: |-\n  let kind = extract(/<h1>Controlled ([^<]+)<\\/h1>/)\n  if kind == "${work}"\n    emit "\\ncategory::comic\\n"\n    insert_at_match\n  end\n`;
+  const definition = `name: Controlled Author Source\ndomain: localhost\ntop_url: http://localhost:${sourcePort}\nurl: 'http://localhost:${sourcePort}/(?<ncode>(?:work|oneshot)\\d+)/?'\nsitename: Controlled Author Source\nversion: 1.0\nconfirm_over18: no\ntoc_url: 'http://localhost:${sourcePort}/\\k<ncode>/'\nauthor_url: '^http://(?:localhost|authors\\.example):${sourcePort}/authors/(?<user_id>\\d+)/?'\nauthor_api_url: 'http://localhost:${sourcePort}/authors/\\k<user_id>/'\nauthor_novel_pattern: '(?m)^author_work::(?<novel_url>http://localhost:${sourcePort}/(?:work|oneshot)\\d+/)$'\ntitle: '<h1>(?<title>.+?)</h1>'\nauthor: '<span class="author">(?<author>.+?)</span>'\nsubtitles: '<a href="(?<href>/(?:work|oneshot)\\d+/(?<index>\\d+)/)">(?<subtitle>.+?)</a>'\nbody_pattern: '<div class="body">(?<body>.+?)</div>'\nmin_interval: 0.01\npreprocess: |-
+  guard "AuthorPreprocessFixture"
+  let works = extract_all(/<a href="(http:\\/\\/localhost:\\d+\\/(?:work|oneshot)\\d+\\/)">/)
+  if !works.empty
+    emit "AuthorPreprocessFixture"
+    for work_url in works
+      emit "author_work::\${work_url}"
+    end
+    emit ""
+    insert_at_match
+  end
+`;
+  const workTypeRule = (work) => `  let kind = extract(/<h1>Controlled ([^<]+)<\\/h1>/)\n  if kind == "${work}"\n    emit "\\ncategory::comic\\n"\n    insert_at_match\n  end\nwork_type_rules:\n  - field: source\n    match: '^category::comic$'\n    type: manga\n`;
   await json('/api/sites/localhost.yaml', definition + workTypeRule('work1'), 'PUT');
   assert.equal((await fetch(`http://127.0.0.1:${port}/api/authors`, { headers: { Connection: 'close' } })).status, 401);
   assert.equal((await api('/api/authors', { url: `http://localhost:${sourcePort}/work1/` })).status, 400);

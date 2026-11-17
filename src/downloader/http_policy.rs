@@ -14,7 +14,10 @@
 
 mod session;
 use crate::error::{NarouError, Result};
-use crate::platform::http::{RedirectChain, is_safe_header_name, is_safe_header_value};
+use crate::platform::http::{
+    BrowserChallenge, RedirectChain, WAF_ACTION_HEADER, browser_challenge, is_safe_header_name,
+    is_safe_header_value,
+};
 use crate::platform::{
     HttpClient, HttpRequest, HttpResponse, HttpStreamResponse, RateLimitScope, RateLimiter, RedirectMode,
 };
@@ -177,21 +180,32 @@ pub fn decode_with_encoding(bytes: &[u8], encoding: Option<&str>) -> String {
 
 /// Map an HTTP status to the domain error narou.rb users expect.
 ///
+/// - a browser-verification challenge → `Login` (the site wants a browser)
 /// - 404 → `NotFound` (novel deleted/private)
 /// - 503 → `SuspendDownload` (rate limited)
 /// - other 4xx/5xx → `Http` with the status
 pub fn ensure_success_response(url: &str, response: HttpResponse) -> Result<HttpResponse> {
-    ensure_success_status(url, response.status)?;
+    ensure_success_status(
+        url,
+        response.status,
+        response.header(WAF_ACTION_HEADER),
+    )?;
     Ok(response)
 }
 
-/// True when a fetch error should stop the tier fallback instead of trying
-/// the next transport. 404/503 are definitive answers from the server.
-pub fn should_stop_fetch_fallback(err: &NarouError) -> bool {
-    matches!(
-        err,
-        NarouError::NotFound(_) | NarouError::SuspendDownload(_)
-    )
+/// The message a browser-verification challenge is reported with.
+///
+/// The challenge is an authentication problem, not a transport failure: the
+/// downloader has to try another stored login instead of retrying blindly.
+fn challenge_message(challenge: BrowserChallenge) -> String {
+    match challenge {
+        BrowserChallenge::Challenge => {
+            "サイトのブラウザ確認が必要です (AWS WAF challenge)。Cookie を更新してください".to_string()
+        }
+        BrowserChallenge::Captcha => {
+            "サイトのブラウザ確認が必要です (AWS WAF captcha)。Cookie を更新してください".to_string()
+        }
+    }
 }
 
 
@@ -284,7 +298,7 @@ pub async fn fetch_stream(
         let response = http.send_stream_paced(
             request, crate::platform::http::HttpPacing { limiter: rate_limiter, scope: &scope },
         ).await?;
-        ensure_success_status(url, response.status)?;
+        ensure_success_status(url, response.status, response.header(WAF_ACTION_HEADER))?;
         return Ok(response);
     }
     let mut chain = RedirectChain::new(request, MAX_REDIRECTS);
@@ -303,14 +317,27 @@ pub async fn fetch_stream(
             session.lock().observe(current, &response.headers);
         }
         if !chain.advance_parts(response.status, response.header("Location"))? {
-            ensure_success_status(&chain.request().url, response.status)?;
+            ensure_success_status(
+                &chain.request().url,
+                response.status,
+                response.header(WAF_ACTION_HEADER),
+            )?;
             return Ok(response);
         }
         // Dropping an unused redirect body cancels it instead of buffering it.
     }
 }
 
-fn ensure_success_status(url: &str, status: u16) -> Result<()> {
+/// Map a status (and the browser-verification action it carries) to the
+/// domain error.
+///
+/// A recognized challenge is terminal: it is the site's own answer, not a
+/// transport failure, so it is reported as an authentication problem even
+/// when the status itself would be a success (the 202 challenge).
+fn ensure_success_status(url: &str, status: u16, action: Option<&str>) -> Result<()> {
+    if let Some(challenge) = browser_challenge(status, action) {
+        return Err(NarouError::Login(challenge_message(challenge)));
+    }
     match status {
         404 => Err(NarouError::NotFound(url.to_string())),
         503 => Err(NarouError::SuspendDownload("Rate limited (503)".into())),
@@ -323,13 +350,21 @@ fn ensure_success_status(url: &str, status: u16) -> Result<()> {
 
 /// JSON dependencies inspect status separately without bypassing URL, pacing,
 /// redirects, credential scoping or response-cookie handling.
+///
+/// A browser-verification challenge is the one answer that is never left to
+/// the caller: it is an authentication problem, not a JSON document, so it is
+/// reported as `Login` here.
 pub(crate) async fn fetch_json_response(
     http: &dyn HttpClient, rate_limiter: &dyn RateLimiter,
     url: &str, policy: &FetchPolicy,
 ) -> Result<HttpResponse> {
     let mut request = HttpRequest::get(url);
     request.headers = policy.headers_for(url);
-    send_request(http, rate_limiter, request, policy, false).await
+    let response = send_request(http, rate_limiter, request, policy, false).await?;
+    if let Some(challenge) = browser_challenge(response.status, response.header(WAF_ACTION_HEADER)) {
+        return Err(NarouError::Login(challenge_message(challenge)));
+    }
+    Ok(response)
 }
 
 /// Fetch an encoded form through the site's credentials and admission policy.
@@ -653,14 +688,57 @@ headers:
 
 
     #[test]
-    fn stop_fallback_on_definitive_errors() {
-        assert!(should_stop_fetch_fallback(&NarouError::NotFound(
-            "x".into()
-        )));
-        assert!(should_stop_fetch_fallback(&NarouError::SuspendDownload(
-            "x".into()
-        )));
-        assert!(!should_stop_fetch_fallback(&NarouError::Http("x".into())));
+    fn a_browser_challenge_is_an_authentication_problem() {
+        // The 202 challenge is a success status, yet it is the site's answer
+        // that only a browser can pass: it must not be read as a page.
+        let challenge = HttpResponse {
+            status: 202,
+            headers: vec![("x-amzn-waf-action".into(), "challenge".into())],
+            body: vec![],
+        };
+        let error = ensure_success_response("https://e.com/", challenge)
+            .expect_err("a browser challenge is not a fetched page");
+        assert!(matches!(error, NarouError::Login(_)), "unexpected error: {error}");
+
+        let captcha = HttpResponse {
+            status: 405,
+            headers: vec![("x-amzn-waf-action".into(), "captcha".into())],
+            body: vec![],
+        };
+        let error = ensure_success_response("https://e.com/", captcha)
+            .expect_err("a captcha is not a fetched page");
+        assert!(matches!(error, NarouError::Login(_)), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn ordinary_answers_keep_their_meaning() {
+        // A plain 202 is an ordinary answer and stays a page.
+        let accepted = HttpResponse {
+            status: 202,
+            headers: vec![],
+            body: vec![],
+        };
+        assert!(ensure_success_response("https://e.com/", accepted).is_ok());
+
+        // A plain 405 without the action is an ordinary transport error.
+        let plain = HttpResponse {
+            status: 405,
+            headers: vec![],
+            body: vec![],
+        };
+        let error = ensure_success_response("https://e.com/", plain)
+            .expect_err("a plain 405 is not a success");
+        assert!(matches!(error, NarouError::Http(_)), "unexpected error: {error}");
+
+        // A forbidden answer without the action is not a challenge either.
+        let forbidden = HttpResponse {
+            status: 403,
+            headers: vec![],
+            body: vec![],
+        };
+        let error = ensure_success_response("https://e.com/", forbidden)
+            .expect_err("a 403 is not a success");
+        assert!(matches!(error, NarouError::Http(_)), "unexpected error: {error}");
     }
 
     struct StreamOnlyHttp {
@@ -720,6 +798,9 @@ headers:
                     "https://example.com/unsafe" => (302, vec![("Location".into(), "http://127.0.0.1/private".into())]),
                     "https://example.com/missing" => (404, Vec::new()),
                     "https://example.com/limited" => (503, Vec::new()),
+                    "https://example.com/challenge" => (202, vec![
+                        ("x-amzn-waf-action".into(), "challenge".into()),
+                    ]),
                     _ => (200, vec![("Content-Type".into(), "image/png".into())]),
                 };
                 let body: crate::platform::AssetStream = if status == 302 {
@@ -781,6 +862,25 @@ headers:
             assert!(matches!(fetch_stream(&http, &limiter, "https://example.com/missing", &FetchPolicy::default()).await, Err(NarouError::NotFound(_))));
             assert!(matches!(fetch_stream(&http, &limiter, "https://example.com/limited", &FetchPolicy::default()).await, Err(NarouError::SuspendDownload(_))));
             assert_eq!(http.polls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn a_streamed_challenge_is_reported_as_an_authentication_problem() {
+        futures::executor::block_on(async {
+            use std::sync::atomic::Ordering;
+            let http = StreamOnlyHttp::new();
+            let limiter = crate::platform::mocks::FakeRateLimiter::new();
+            let error = fetch_stream(
+                &http,
+                &limiter,
+                "https://example.com/challenge",
+                &FetchPolicy::default(),
+            )
+            .await
+            .expect_err("a browser challenge is not a stream");
+            assert!(matches!(error, NarouError::Login(_)), "unexpected error: {error}");
+            assert_eq!(http.polls.load(Ordering::SeqCst), 0, "the challenge body must not be read");
         });
     }
 

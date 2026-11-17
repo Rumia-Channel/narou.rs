@@ -313,6 +313,9 @@ fn build_response(
 ) -> TransportResponse {
     let content_type = header_value(headers, "content-type").unwrap_or_default();
     let location = header_value(headers, "location").filter(|value| !value.is_empty());
+    let waf_action = header_value(headers, crate::wire::WAF_ACTION_HEADER)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let set_cookie = headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
@@ -325,6 +328,7 @@ fn build_response(
         set_cookie,
         body: body.to_vec(),
         via,
+        waf_action,
     }
 }
 

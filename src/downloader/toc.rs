@@ -70,7 +70,9 @@ pub fn parse_subtitles(
 
         let index = caps
             .name("index")
-            .map(|m| m.as_str().to_string())
+            .map(|m| m.as_str().trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| caps.name("episode_id").map(|m| m.as_str().to_string()))
             .unwrap_or_default();
         let href = caps
             .name("href")
@@ -159,6 +161,12 @@ pub struct TocListing {
     pub partial: bool,
     /// Site tag captures from every visited TOC page, before normalization.
     pub tag_sources: Vec<String>,
+    /// The walk stopped at a login wall, so the listing is incomplete.
+    ///
+    /// A page that was served but asks for authentication is not an error of
+    /// its own: the caller retries the walk with another stored credential
+    /// instead of storing the truncated listing.
+    pub wall: bool,
 }
 
 pub async fn parse_subtitles_multipage(
@@ -199,6 +207,9 @@ where
         let mut all_subtitles = Vec::new();
         // 本文一覧のページが「未ログインで欠けている」と報告したか。
         let mut partial_listing = false;
+        // 途中ページがログイン壁だったか。壁は「続きがある」ことを意味するので、
+        // 欠けた一覧を成功として保存しない。
+        let mut login_wall = false;
         let mut page_tags = Vec::new();
         let mut visited_pages = HashSet::new();
         visited_pages.insert(setting.get_toc_url_with_captures(url_captures));
@@ -267,9 +278,20 @@ where
 
             current_toc_source =
                 fetch_next_toc(http, rate_limiter, setting, next_url, &mut *jobs).await?;
+            if setting.is_login_wall(&current_toc_source) {
+                // 続きのページがログイン壁だった。壁は「まだ続きがある」ことを
+                // 意味するので、欠けた一覧を成功として保存しない。
+                login_wall = true;
+                break;
+            }
         }
 
-        Ok(TocListing { subtitles: all_subtitles, partial: partial_listing, tag_sources: page_tags })
+        Ok(TocListing {
+            subtitles: all_subtitles,
+            partial: partial_listing,
+            tag_sources: page_tags,
+            wall: login_wall,
+        })
     })
 }
 
@@ -758,5 +780,33 @@ mod tests {
         assert_eq!(subtitles[0].subupdate.as_deref(), Some("2023/10/21 21:29"));
         assert_eq!(subtitles[1].chapter, "");
         assert_eq!(subtitles[1].subtitle, "通常タイトル");
+    }
+
+    #[test]
+    fn an_empty_display_number_falls_back_to_the_episode_id() {
+        let setting = SiteSetting::load_bundled(&[r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/story/\k<ncode>
+subtitles: |-
+  <a href="(?<href>https://example\.com/story/\d+/(?<episode_id>\d+))" data-number="(?<index>[^"]*)">(?<subtitle>[^<]+)</a>
+"#])
+        .unwrap()
+        .remove(0);
+
+        let short = r#"<a href="https://example.com/story/367896071/200796571" data-number="">短編の話</a>"#;
+        let subtitles = parse_subtitles(&setting, short, &HashMap::new()).unwrap();
+        assert_eq!(subtitles.len(), 1);
+        assert_eq!(subtitles[0].index, "200796571");
+        assert_eq!(
+            subtitles[0].href,
+            "https://example.com/story/367896071/200796571"
+        );
+
+        let numbered = r#"<a href="https://example.com/story/204312035/657715863" data-number="001">第一話</a>"#;
+        let subtitles = parse_subtitles(&setting, numbered, &HashMap::new()).unwrap();
+        assert_eq!(subtitles[0].index, "001", "the display number wins when present");
     }
 }

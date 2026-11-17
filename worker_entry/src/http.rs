@@ -161,6 +161,12 @@ impl WorkerHttpClient {
                 if let Some(location) = relay_response.location {
                     response_headers.push(("location".to_string(), location));
                 }
+                if let Some(action) = relay_response.waf_action {
+                    response_headers.push((
+                        narou_rs::platform::http::WAF_ACTION_HEADER.to_string(),
+                        action,
+                    ));
+                }
                 for cookie in relay_response.set_cookie {
                     response_headers.push(("set-cookie".to_string(), cookie));
                 }
@@ -290,6 +296,9 @@ impl WorkerHttpClient {
                     }
                     match socket_result {
                         Ok(response) if response.is_success() || response.is_redirection() => response,
+                        // A browser verification is the site's own answer: it
+                        // must not be replaced by the original 403.
+                        Ok(response) if response.browser_challenge().is_some() => response,
                         socket_result => {
                             let relay_result = match self.relay.as_ref() {
                                 Some(relay) => {
@@ -311,6 +320,10 @@ impl WorkerHttpClient {
                             match relay_result {
                                 Ok(Some(response))
                                     if response.is_success() || response.is_redirection() => response,
+                                // A browser verification is the site's own
+                                // answer: it must not be replaced by the
+                                // original 403.
+                                Ok(Some(response)) if response.browser_challenge().is_some() => response,
                                 relay_result => {
                                     match socket_result {
                                         Ok(response) => console_warn!(

@@ -1,8 +1,8 @@
 # narou.rs 移植状況
 
-## 最新状況: クライアント主体転送の別ブランチ実装（統合検証中・未公開）
+## 最新状況: クライアント主体転送（ブランチ統合検証中・未公開）
 
-- 最新指示は版数更新・リリース中止。0.6.6のまま、develop由来のfeature-client-transferへcommit/pushする。main/develop統合、タグ、Release、本番配備は行わない。チェックポイントfec778dはpush済みで、以後の修正はまだ追加commit前。旧45ブランチの整理は実施済み。
+- 最新指示はローカル・リモートの全ブランチを main/develop に統合し、それ以外を整理すること。ローカル 50・origin 5 ブランチを取得・比較済み。クライアント転送、ノベルアップ＋、Worker 並列取得と main のリリース履歴を保持して統合する。版数は 0.6.6 のまま、タグ作成・Release・手動の本番配備は行わない。未完了の受入項目を公開済み・検証済みへ読み替えない。
 - `/api/transfer/v2` と実配布WASMで、ZIP生成・全体検証・展開をクライアントへ移す。本文・目次・設定・挿絵索引・unknownを保持し、runtimeではraw/任意履歴/確認済み派生物をsnapshotと本文通信の前に除外する。Workerへrawを新規保存しない。旧ZIP全体POST/Base64へのfallbackはない。
 - 実Firefox + 実workerd/D1で17MiBの利用者ファイルと目次を取り込み、raw1MiBの除外と新規1作品の公開を確認。同じexport sessionで一時停止から保存し直し、独立ZIP readerで全entry・SHAを照合。10MiBゲートの最大request bodyは8,323,470B、過大要求拒否0・旧ZIP要求0・記録打切り0。
 - 確認待ち6分で旧SWが0byte保存/次write待機になる不具合を実証。遅延開始・限定したstartup waitUntil・15秒ping/pong・90秒失活検出・close ACK優先のrelay版3へ修正。実Firefoxで最初の出力前と64KiB出力後の各6分停止を跨ぎ、両方1MiBとSHA一致。Chromium FSAの実操作は未確認。
@@ -10,6 +10,26 @@
 - Nativeの全相対パスjoin、Windows実directory境界、compat lock内の設定再読込、Workerのpinned snapshotと取消creation回収などを修正。Native HTTP・cutover・claim・guarded CLI検証を実行中。旧yaml_cutover_guardのタイムアウトは完了としない。
 - 全受入は未完了。Native保存方式別の実ブラウザ、168作品・100MiB超・4GiB超の実ブラウザ、完全なWorker故障契約、Cloudflare128MiB/provider予算は未検証。直近workerd契約はnpm/Node資源割当て失敗で中断したので成功に数えない。重いfixtureを直列化し、固定Wranglerのcache/offlineを使って再確認する。docs/client-transfer-design.md §16.1を実測の基準とする。
 - 既存browserの元タブは保持し、所有fixture・検証タブ・SW登録は終了時に回収、ダウンロード設定はdefaultへ戻す。Node/WASM単体の4GiB仮想fixtureや旧版の履歴を、新しい実ブラウザ/本番の成功に読み替えない。
+
+## ノベルアップ＋と認証回復（未リリース）
+
+- `feature-novelup-session` で `webnovel/novelup.plus.yaml` version 1.4 を追加。作品・各話・作者一覧・ページ送り・抽出に加え、SDK の URL・関数・Cookie 名も YAML で駆動する。最低間隔は 20 秒で、WAF 回避を保証する設定ではない。2 桁年は Ruby と同じ 1969–2068 の範囲へ解釈する。
+- `platform::http::browser_challenge` は 202/challenge と 405/captcha の組み合わせだけを割当てなしで認識し、Native は tier 切替を打ち切る。Worker の socket / relay も確認応答を保持する。relay JSON / NRS1 の追加メタデータ `wafAction` は省略可能で、対応するリレーの更新が必要。
+- downloader の私有 `AuthState` は資格情報を必要時に一度だけ読み込み、各候補を元の設定 Cookie から組み直す。後続目次・本文・強い更新も認証回復し、採用したセッションを保持する。途中の壁を短い目次として保存せず、公開取得に不要な Cookie を送らない。目次の所有権を渡し、認証試行ごとの全文コピーも削減した。
+- 部分一覧を補う任意のログイン試行が失敗しても採用済み一覧を失わず、対応する資格情報へ戻す。利用可能な一覧を得ていない場合のエラー処理は維持する。期限切れログインの 404 で既存作品が削除・非公開扱いになる経路を追加修正した。
+- `narou_rs_login` は確認が必要なサイトの作品 URL を直接開き、設定済み User-Agent で保存後確認する。DevTools の接続・応答待ちに上限を置き、Cookie 配列の複製をなくし、ブラウザ終了を待ってからプロファイルを清掃する。
+- 実サイトの基本確認: 短編 `874968302` を 1 話取得し、TXT と Kobo EPUB を生成。ZIP・XML と本文の先頭／末尾を検証し、CLI の再更新が「更新なし」となることも確認した。作者 `813181327` は CLI の追跡登録・dry-run で 13 作品を列挙した。初期の Firefox による CAPTCHA 完了後だけでは連載の継続取得に失敗したが、後述の正規 SDK と必要時更新で連載を検証した。トークン寿命や UA / IP の拘束条件は断定しない。
+- 検証: Native の HTTP・認証回復・日付・サイト定義・既存ログイン／前処理の関連テスト、relay テスト、ログイン helper 7 件、Native と Worker wasm の Clippy ゲートが成功。強い更新の新規回帰は、本文だけの認証要求から回復し、同一本文の二重取得を避けることを確認した。実 workerd の HTTP 契約は追加 WAF ケースを含め 111/111 成功。ただし runner 全体は後続の `virtual_membership.mjs` で `ECONNRESET` により失敗し、全フェーズ成功ではない。原因未確定のため無関係なテストの緩和・再試行は加えていない。
+- 追加回帰: 匿名の部分一覧を得た後に保存ログインが 404 を返すと、修正前は既存作品の更新が `Failed` になることを再現。修正後は 404・後続目次の壁・500 の全ケースで公開一覧・作品 ID・匿名の本文取得を保持する。`auth_recovery` 9 件、`kakuyomu_login` 6 件、`login_fallback` 3 件、`pixiv_accessibility` 13 件の計 31 件が成功し、追加修正後の Native / Worker wasm Clippy も通過した。
+- 追加調査: Cookie なしの UA ローテーションは 20 秒間隔の 7 回目、固定 Firefox UA は 80 秒間隔の 2 回目で 202/challenge となり、UA や間隔だけでは解消しなかった。隔離した通常の Edge とサイトの正規 SDK でトークンを発行し、同じ UA の Native で同一本文を 20 秒間隔で 8 回取得できた。一度だけ保存したトークンを使う実 CLI は 67 話中 36 話目まで進んだ後に再び確認要求で停止し、再更新・変換には進んでいない。トークン寿命や UA/IP 拘束は未確定。
+- 必要時更新を実装: `CookieStore::refresh_browser_token` は既定 None、Native だけ `NAROU_RS_BROWSER_TOKEN=1` で有効にする。同梱 helper と一時ブラウザを確認時だけ起動し、値をログへ流さない私有 JSON でトークンのみ受け取る。同一 ID の更新と並行削除・変更の保護を atomic inventory 境界で行う。目次全体に 1 回、本文各話に 1 回の更新予算を持ち、成功ページの資格情報再読込は増やさない。
+- 初回の実 CLI は補助ブラウザの `Runtime.evaluate` が `Execution context was destroyed.` で失敗した。起動直後のページ遷移だけを元の期限内で待ち直し、別オリジンでは SDK を実行しないよう修正。実 helper で正規 SDK のトークン発行・トークンだけの JSON・一時プロファイルの削除まで確認した。Windows の終了直後のファイル共有違反だけに有界の削除待ちを加えた。CDP の同じポートの別 Browser GUID を使うローカル実行 fixture は、旧 helper で Cookie 読出し 1 回・書出しあり、新 helper で読出し 0 回・書出しなしを確認した。
+- 追加検証: SDK/Native ストア 19 件、helper 17 件、認証回復・既存ログイン関連 36 件、ノベルアップ＋ YAML 8 件の計 80 件と SDK JavaScript 4 件が成功。Native の対象限定 Clippy と Worker wasm Clippy が通過した（`vendor/async_zip` の警告は残る）。
+- 必要時更新を有効にした実 CLI で、連載 `759726165` の全 67 話取得（1370.88 秒）、再更新の「更新なし」、Kobo EPUB 生成が成功。UA はトークンを発行する通常の Edge と同じ値を設定した。取得中の確認要求でトークンを 1 回取り直して継続した。保存本文 67 件が空でないこと、EPUB 153,088 bytes / 83 entries の CRC・73 XML 文書、67 話すべての目次と先頭／末尾の本文を確認した。実行で新たに残った一時ブラウザプロファイルは 0 件。CAPTCHA の自動解読・常駐ブラウザ・識別情報の書き換えは行っていない。
+- 作者一覧にも通常式 `extract_all(/.../flags)` を使い、ノベルアップ＋のカード抽出・次ページ抽出を preprocess DSL にまとめた。最初の capture（なければ全体）を出現順に返し、未一致の任意 capture は null、マッチなしは空配列。全文の複製を避け、実行予算・文字列／配列上限を適用する。Native の作者一覧はページ URL・解決済みログイン ID ごとに 1 回だけ必要時トークン更新を行い、失敗した発行も含めて取得全体で予算を保持する。別 ID は更新でき、前ページと採用済みアカウントは保持する。Worker は既存の capability どおりブラウザ更新を行わない。
+- 作者 DSL の追加検証: 前処理 36・作者一覧 25・ノベルアップ＋ 10・helper 17・既存認証関連 36 の計 124 項目が成功。対象限定 Native Clippy と Worker wasm Clippy、Worker release ビルドも通過した（既存 `vendor/async_zip` の 36 警告は残る）。`worker_entry/tests/author_tracking.mjs` は実 workerd の一覧を DSL 経由へ変更し、空ライブラリからの取得・新作検知・重複防止・手動確認／dry-run・定期実行・解除競合・別ホスト作者 URL の取得が成功した。
+- 実 CLI の作者 `813181327` はデフォルト DSL で 13 URL（新規 12・既知 1）を列挙し、dry-run 前後で小説数が変わらないことを確認。利用者側 DSL で `903067203` だけを選ぶと作者 URL からその 1 作品・1 話を取得でき、TOC と空でない保存本文要素が一致した。元の検証用定義を復元し、新たに残ったブラウザプロファイルは 0 件。全 13 作品の本文一括取得は行わず、一覧列挙と代表 1 作品の取得を分けて確認した。
+- ブランチ統合前の追加回帰: 匿名の SDK 更新失敗後、同じ保存済みログインへのフォールバックで helper が 2 回起動することを再現した。作者確認全体で URL・解決済みログイン ID の試行を保持し、失敗でも予算を消費するよう修正。Cookie 名の存在判定は共有 `LoginGroup::has_cookie` に統一し、Native の対象選択と一致させる。回帰は同一 ID の二重起動抑止と、別 ID の正常な更新・取得を検証する。
 
 ## EPUB 配信経路と API の待ち時間（未リリース）
 

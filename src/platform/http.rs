@@ -50,6 +50,47 @@ pub fn is_safe_header_value(value: &str) -> bool {
     !value.bytes().any(|byte| byte.is_ascii_control())
 }
 
+/// Response header that names the browser-verification action of a WAF
+/// challenge.
+///
+/// The site answers a request it does not trust with the challenge instead of
+/// the requested page; the header says which kind of verification is needed.
+pub const WAF_ACTION_HEADER: &str = "x-amzn-waf-action";
+
+/// A browser-verification challenge that only a real browser can pass.
+///
+/// The site answers with one of these instead of the requested page, so the
+/// caller has to solve it in a browser and retry with the fresh cookies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserChallenge {
+    /// An interstitial the browser has to pass (`challenge`).
+    Challenge,
+    /// A CAPTCHA the browser has to solve (`captcha`).
+    Captcha,
+}
+
+/// The browser-verification challenge a response carries, if any.
+///
+/// Only two combinations are challenges: status 202 with the `challenge`
+/// action and status 405 with the `captcha` action. The action is compared
+/// case-insensitively after trimming the optional whitespace an HTTP header
+/// value may carry. Every other status/action pair keeps its ordinary
+/// meaning, so a plain 202, 403 or 405 answer and unrelated infrastructure
+/// responses are unaffected. The check allocates nothing and looks at no
+/// domain: the status and the action alone decide.
+pub fn browser_challenge(status: u16, action: Option<&str>) -> Option<BrowserChallenge> {
+    let action = action?.trim();
+    match (status, action) {
+        (202, action) if action.eq_ignore_ascii_case("challenge") => {
+            Some(BrowserChallenge::Challenge)
+        }
+        (405, action) if action.eq_ignore_ascii_case("captcha") => {
+            Some(BrowserChallenge::Captcha)
+        }
+        _ => None,
+    }
+}
+
 /// Body cap for a response: trusted infrastructure callers may ask for a
 /// tighter limit on success; non-2xx diagnostic bodies keep the full cap.
 ///
@@ -396,6 +437,11 @@ impl HttpResponse {
     pub fn is_redirection(&self) -> bool {
         (300..400).contains(&self.status)
     }
+
+    /// The browser-verification challenge this response carries, if any.
+    pub fn browser_challenge(&self) -> Option<BrowserChallenge> {
+        browser_challenge(self.status, self.header(WAF_ACTION_HEADER))
+    }
 }
 
 /// Owned response metadata plus a pull-driven body. Dropping the body cancels
@@ -423,6 +469,11 @@ impl HttpStreamResponse {
 
     pub fn is_success(&self) -> bool { (200..300).contains(&self.status) }
     pub fn is_redirection(&self) -> bool { (300..400).contains(&self.status) }
+
+    /// The browser-verification challenge this response carries, if any.
+    pub fn browser_challenge(&self) -> Option<BrowserChallenge> {
+        browser_challenge(self.status, self.header(WAF_ACTION_HEADER))
+    }
 
     pub fn head(&self) -> HttpResponse {
         HttpResponse { status: self.status, headers: self.headers.clone(), body: Vec::new() }
@@ -580,6 +631,66 @@ mod tests {
         assert!(!redirect.is_success());
         assert!(redirect.is_redirection());
         assert_eq!(redirect.header("Location"), Some("https://example.com/next"));
+    }
+
+    #[test]
+    fn browser_challenge_recognizes_only_the_known_status_action_pairs() {
+        assert_eq!(
+            browser_challenge(202, Some("challenge")),
+            Some(BrowserChallenge::Challenge)
+        );
+        assert_eq!(
+            browser_challenge(405, Some("captcha")),
+            Some(BrowserChallenge::Captcha)
+        );
+        // The action is case-insensitive and may carry HTTP whitespace.
+        assert_eq!(
+            browser_challenge(202, Some(" Challenge ")),
+            Some(BrowserChallenge::Challenge)
+        );
+        assert_eq!(
+            browser_challenge(405, Some("CAPTCHA\t")),
+            Some(BrowserChallenge::Captcha)
+        );
+        // Every other combination keeps its ordinary meaning.
+        for (status, action) in [
+            (202, None),
+            (202, Some("captcha")),
+            (405, None),
+            (405, Some("challenge")),
+            (403, Some("challenge")),
+            (403, Some("captcha")),
+            (200, Some("challenge")),
+            (202, Some("")),
+        ] {
+            assert_eq!(
+                browser_challenge(status, action),
+                None,
+                "{status} / {action:?} is not a challenge"
+            );
+        }
+    }
+
+    #[test]
+    fn response_reports_its_own_browser_challenge() {
+        let challenge = HttpResponse {
+            status: 202,
+            headers: vec![("X-Amzn-Waf-Action".into(), "challenge".into())],
+            body: Vec::new(),
+        };
+        assert_eq!(challenge.browser_challenge(), Some(BrowserChallenge::Challenge));
+        let captcha = HttpResponse {
+            status: 405,
+            headers: vec![("x-amzn-waf-action".into(), "captcha".into())],
+            body: Vec::new(),
+        };
+        assert_eq!(captcha.browser_challenge(), Some(BrowserChallenge::Captcha));
+        let plain = HttpResponse {
+            status: 405,
+            headers: vec![],
+            body: Vec::new(),
+        };
+        assert_eq!(plain.browser_challenge(), None);
     }
 
     #[test]

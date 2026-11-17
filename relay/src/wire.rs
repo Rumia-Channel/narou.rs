@@ -22,6 +22,11 @@ pub const MAX_HEAD_BYTES: usize = 64 * 1024;
 pub const MAX_METADATA_BYTES: usize = 6 * MAX_HEAD_BYTES + 64 * 1024;
 /// Metadata-first framing negotiated through the request's `Accept` header.
 pub const STREAM_CONTENT_TYPE: &str = "application/vnd.narou.relay.v1+octet-stream";
+/// 上流のブラウザ確認種別 (`x-amzn-waf-action`) を運ぶヘッダ名。
+///
+/// Worker 側の `platform::http::WAF_ACTION_HEADER` と同じ綴り。確認要求は
+/// 終端の回答なので、Fallback で握り潰さずそのまま呼び出し側へ運ぶ。
+pub const WAF_ACTION_HEADER: &str = "x-amzn-waf-action";
 /// curl / wget の子プロセスから受け取る出力 (`-i` / `--save-headers` の
 /// ヘッダ + 本文) の上限。
 pub const MAX_TRANSPORT_OUTPUT: usize = MAX_HEAD_BYTES + MAX_BODY_BYTES;
@@ -212,6 +217,12 @@ pub struct ResponseMetadata {
     pub set_cookie: Vec<String>,
     /// 取得に使ったクライアント (`curl` / `wget`)。
     pub via: &'static str,
+    /// 上流が返したブラウザ確認の種別 (`x-amzn-waf-action`)。
+    ///
+    /// 確認要求は終端の回答なので、呼び出し側 (Worker) が Fallback で
+    /// 握り潰さないよう、そのまま運ぶ。古い踏み台との互換のため未設定は
+    /// `None` のまま省略される。
+    pub waf_action: Option<String>,
 }
 
 impl ResponseMetadata {
@@ -225,6 +236,9 @@ impl ResponseMetadata {
         }
         map.insert("setCookie".to_string(), json!(self.set_cookie));
         map.insert("via".to_string(), json!(self.via));
+        if let Some(action) = &self.waf_action {
+            map.insert("wafAction".to_string(), json!(action));
+        }
         map.insert("body".to_string(), json!(""));
         Value::Object(map)
     }
@@ -271,6 +285,8 @@ pub fn encode_stream_prefix(metadata: &ResponseMetadata, body_length: usize) -> 
         location: Option<&'a str>,
         set_cookie: &'a [String],
         via: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        waf_action: Option<&'a str>,
         body_length: usize,
     }
     struct Prefix(Vec<u8>);
@@ -291,6 +307,7 @@ pub fn encode_stream_prefix(metadata: &ResponseMetadata, body_length: usize) -> 
         location: metadata.location.as_deref(),
         set_cookie: &metadata.set_cookie,
         via: metadata.via,
+        waf_action: metadata.waf_action.as_deref(),
         body_length,
     }).map_err(|_| WireError::ResponseTooLarge)?;
     let length = (prefix.0.len() - 8) as u32;
@@ -428,6 +445,7 @@ mod tests {
             location: None,
             set_cookie: vec!["a=1; Path=/".to_string(), "b=2".to_string()],
             via: "curl",
+            waf_action: None,
         };
         let body: Vec<u8> = (0u8..=255).collect();
         let wire = encode_response(&metadata, &body).unwrap();
@@ -456,6 +474,7 @@ mod tests {
             location: None,
             set_cookie: Vec::new(),
             via: "curl",
+            waf_action: None,
         };
         let base_len = metadata_wire_len(&base);
         let location_envelope = metadata_wire_len(&ResponseMetadata {
@@ -498,6 +517,7 @@ mod tests {
             location: None,
             set_cookie: vec!["sid=fresh".to_string()],
             via: "curl",
+            waf_action: None,
         };
         let body = vec![b'x'; limit];
         let wire = encode_response(&metadata, &body).unwrap();
@@ -508,6 +528,33 @@ mod tests {
     }
 
     #[test]
+    fn the_browser_verification_action_survives_both_encodings() {
+        let metadata = ResponseMetadata {
+            status: 405,
+            content_type: String::new(),
+            location: None,
+            set_cookie: Vec::new(),
+            via: "curl",
+            waf_action: Some("captcha".to_string()),
+        };
+        let wire = encode_response(&metadata, b"").unwrap();
+        let value: Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(value["wafAction"], "captcha");
+
+        // The metadata-first framing carries the same action.
+        let prefix = encode_stream_prefix(&metadata, 0).unwrap();
+        let length = u32::from_be_bytes(prefix[4..8].try_into().unwrap()) as usize;
+        let framed: Value = serde_json::from_slice(&prefix[8..8 + length]).unwrap();
+        assert_eq!(framed["wafAction"], "captcha");
+
+        // An upstream without the action keeps the old envelope shape.
+        let plain = ResponseMetadata { waf_action: None, ..metadata };
+        let wire = encode_response(&plain, b"").unwrap();
+        let value: Value = serde_json::from_slice(&wire).unwrap();
+        assert!(value.get("wafAction").is_none());
+    }
+
+    #[test]
     fn oversized_metadata_is_rejected_even_with_a_small_body() {
         let metadata = ResponseMetadata {
             status: 200,
@@ -515,6 +562,7 @@ mod tests {
             location: Some("x".repeat(MAX_METADATA_BYTES)),
             set_cookie: Vec::new(),
             via: "wget",
+            waf_action: None,
         };
         assert!(metadata_wire_len(&metadata) > MAX_METADATA_BYTES);
         assert_eq!(

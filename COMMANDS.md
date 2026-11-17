@@ -172,6 +172,9 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Worker の `/api/download`（`/api/download_force` を含む）と `/api/jobs` は、全対象のシリーズ・作者 URL 展開が成功してから作品ごとのジョブを登録し、元の `--force` 等を各作品へ引き継ぐ。取得失敗・空シリーズ一覧はエラー。正常に読めた空の作者一覧は追加なし。保存済みジョブ・旧 envelope の実行境界も同じ展開器を使う
 - 作者・ユーザー URL の単発登録と CLI `author` の継続追跡は別機能。`Downloader::author_works` / `AuthorListing` が作品列挙・複数ログインの試行・ページ送り・シリーズ所属作品の除外を共有し、サイト固有の規則は YAML / preprocess DSL に置く。小説・シリーズの URL 判定を優先するため、Pixiv のシリーズを作者一覧として展開しない
 - R18 なろうの作者はプロフィールの最新作だけでなく、`/mypage/novellist/xid/<作者ID>/` の全作品一覧を `author_api_url` から取得し、DSL / `author_next_pattern` で次ページを辿る。単発の一括取得と継続追跡で同じ列挙経路を使う
+- ノベルアップ＋ (`webnovel/novelup.plus.yaml`, version 1.4) は作品・各話 URL と作者プロフィール／作品一覧 URL に対応する。章・目次のページ送り・本文の改行・作品情報・作者一覧のリンク抽出とページ送りは YAML / preprocess DSL で処理する。初期の最低取得間隔は 20 秒で、ブラウザ確認や CAPTCHA の回避を保証する値ではない。公開短編の取得・再更新・EPUB 出力と作者一覧は実サイト確認済み。Native の `NAROU_RS_BROWSER_TOKEN=1` とブラウザに合わせた UA で、連載 `759726165` の 67 話取得・再更新（更新なし）・Kobo EPUB 出力を確認した。途中の確認要求では正規 SDK のトークンを 1 回取り直して継続し、出力の全話目次・先頭／末尾の本文・ZIP/ XML も確認した。CAPTCHA やサイト側の別ルールまで通過を保証するものではない。
+- 作者 DSL の実サイト確認では、作者 `813181327` の 13 作品の URL を列挙し（新規 12・既知 1）、dry-run で作品が増えないことを確認した。ユーザー定義の DSL で `903067203` だけを選ぶと、作者 URL の通常 download からその 1 作品・1 話と空でない本文要素が保存された。全 13 作品の本文一括取得を実施したという意味ではない。
+- 認証による部分一覧の補完に失敗しても、先に取得できた一覧とその資格情報を維持する。任意のログイン候補の 404・後続目次のログイン壁・通信エラーを理由に既存作品を削除・非公開扱いへ変えない。利用可能な一覧を一度も得られない場合の従来のエラー処理は維持する
 - 新規取得したセクションは解析済みの本文・前書き・後書きに加え、既定では raw HTML も `illust_grep_pattern` の検索対象にしてサイト固有マークアップ内の挿絵を先取り保存する。取得ページが空の本文枠と UI 画像だけの場合は、サイト定義の `illust_from_raw: false` で解析済み本文・前後書きだけに限定できる（アルファポリスで使用）。未更新セクションは従来どおり保存済み section のみを検索する
 - サイト定義に `illust_grep_pattern` が無いサイト (なろう / R18なろう / カクヨム / Arcadia) は narou.rb `HTML#initialize` の既定 `<img>` パターン (`downloader::DEFAULT_ILLUST_GREP_PATTERN`) で挿絵を先取り保存する。既定パターンでは URL でない注記 (相対パス) は対象外にし、挿絵 URL の protocol-relative (`//host/...`) は本文のスキームで解決し、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない (2026-10-08 修正)
 - 索引 (`.illustration_cache.yaml`) が知っている挿絵でも、`<prefix>/挿絵` の一覧に実体が無ければ取り直す (自己修復)。索引が空でないときだけ 1 小説 1 回一覧するので、通常の更新に余分な往復は付かない (2026-10-08 修正)
@@ -219,7 +222,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `fetch_json_required(url)` は必須の JSON 取得で、HTTP エラー・不正 JSON・JSON の null を前処理の失敗として返す。`fetch_json_required(url, [404])` のように指定した HTTP 状態だけは未閲覧の null として扱える。同じ URL の任意取得と競合しても必須条件を優先し、キャッシュ済み失敗の状態・元のエラー分類も保持する。依存 API の 404 は小説全体の削除・凍結とは扱わず、必須取得に失敗した途中の目次を書き出さない。Native の transport も数値の HTTP 状態を保持する。
 - DSL の `has_cookie` は、入力 URL に送れる設定済み Cookie ヘッダの有無を表す。同意 Cookie も含み、ログイン成功や閲覧権限の証明ではない。
 - `preprocess:` DSL の `extract(/.../)` は最初の capture を文字列として返す。`post_form(url, [[name, value], ...], [[header, value], ...])` は同一 origin へのフォーム POST を要求し、再実行時に本文文字列を返す（未取得は null）。第3引数は省略可能で、Cookie / Authorization 等の注入は拒否する。フォーム結果は1回の前処理だけ保持し、同じ URL でも本文・ヘッダが違う要求を区別する。取得失敗はエラーとなり、`fail "理由"` でも前処理を失敗させられる。失敗時に途中の書き換えを公開しない
-- 保存済みログイン Cookie のフォールバックを実装。TOC 取得がログイン壁（404 やサイト定義の `login_pattern`）/ 部分一覧（`login_partial_pattern`）/ 目次 0 件に当たったとき `narou login` の資格情報を試行順に試す。候補ごとに最初の目次ページから全ページを取り直し、欠けの解消または話数増加がある候補を採用する。成功した資格情報の ID を小説レコードの `login_session` に保存して次回から最初のリクエストで使い、通常の公開作品には保存ログインを送らない。`update` でも同じ経路を通る。
+- 保存済みログイン Cookie は、最初の目次だけでなく後続の目次ページ・本文（強い更新の事前取得を含む）の認証要求でも試す。通常の公開作品には送らず、認証回復時にだけ候補を読み込む。各候補はサイト設定の Cookie を起点にし、前のアカウントの Cookie を混ぜない。目次は候補ごとに最初から再評価し、途中のログイン壁を正常な短い一覧として保存しない。採用したログインは残りの本文にも使い、`requires_login` / `login_session` を次回へ保存する。部分一覧では従来どおり欠けの解消・話数増加を確認してから採用する。`update` も同じ経路を通る。
+- `202 + x-amzn-waf-action: challenge` と `405 + x-amzn-waf-action: captcha` は `Login` として報告する。Native の通信手段切替で別の応答に上書きせず、Worker の socket / relay 経路でも判定情報を保持する。HTML のログイン壁はサイト定義の `login_wall_error: login` で凍結しない認証エラーにできる（未指定の `not_found` は従来互換）。通常の 202 / 403 / 405 はこの特例に含めない。CAPTCHA はブラウザで利用者が解く必要がある。
 - リダイレクトでサイト定義が変わった場合は、転送先の定義にある同意 Cookie と転送先の保存ログインだけを使い、元サイトの Cookie・セッション ID・ログイン要否を引き継がない。同一サイト内の転送では選択済みログインを維持する。
 - Workers は年齢認証を対話で確認できない。成人向け作品の取得を許可する場合は Web UI の「環境設定 → Global」で `over18=true` を保存する。`false` は明示的な拒否であり、設定変更で既に `blocked` になったジョブを自動再開はしない
 - 話ごとの進捗行・章/節の見出し・ログイン再試行・「小説が削除されているか非公開な可能性があります」などのレポート行は、コンソールと同時に `logging` のログファイルへも出力する。narou.rb は `$stdout` への write をすべて `append_log` するため、ログに残らない行があってはならない。並列ドメインワーカー間の行混線は sink 内の排他 (`STDOUT_LOCK`) で防ぐ。原因は `src/logger.rs` が bin と lib の両方にコンパイルされて `LoggerState` が 2 つ存在し、`logger::init()` が bin 側しか初期化していなかったこと。`MessageSink` (`progress::console_sink`) 経由の行は未初期化の lib 側ロガーへ書かれていた。bin は lib のロガーを共有する (2026-10 修正、issue #36)
@@ -355,6 +359,8 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 **共通取得**: `author add/check` も現在の実効サイト定義を使う。作品一覧の取得・認証・シリーズ所属作品の除外は CLI / Worker の単発 URL 展開と共通。offset 型 API は `author_page_url` / `author_page_size` / `author_page_total_pattern` / `author_page_max_start` でページ送りする。なろう API の公式開始位置上限を越える場合や総件数に届かない場合は、途中までの一覧を成功扱いしない。
 
+**HTML 一覧の DSL**: 作者一覧にも `preprocess:` を実行し、出力した中間行を `author_novel_pattern` / `author_next_pattern` で読む。`extract_all(/正規表現/flags)` は現在の本文から全マッチを出現順の配列にする。capture があれば最初の capture、なければマッチ全体を返し、任意 capture の未一致は null、マッチなしは空配列になる。通常の式なので `for` や `.compact` 等でも使え、既存の実行予算・配列／文字列サイズ上限を適用する。ノベルアップ＋ではユーザー側の DSL を編集するだけで作品カードの選別やページ送りを変更できる。
+
 シリーズ所属作品の除外は数値 ID の部分一致ではなく作品 URL の完全一致で行う。`author_series_episode_work_url` / `author_comic_series_page_work_url` で capture から所属作品の URL を組み立てるか、パターンで `novel_url` / `url` を直接取得する。Pixiv の同じ数値 ID を持つ小説・イラスト・シリーズを混同せず、所属一覧を取得できなかったシリーズは単体作品を除外しない。
 
 アルファポリスの作者一覧は作品タイトル欄からサイト内の小説だけを列挙する。漫画、外部登録、プロフィール内リンクは除外し、現在ページ直後のページリンクを辿る。単発取得と継続追跡で同じ定義を使う。
@@ -435,7 +441,11 @@ narou author remove 1
 
 Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs_login` のブラウザ取得と書き出しファイルの取り込みだけで、利用者は名前と順序を管理する。
 
-**取得用 bin**: `narou_rs_login` は小説・作者・トップページの URL、サイト名、親ドメインも受理し、YAML の `login_url` を開く。アルファポリスは `narou_rs_login alphapolis.co.jp --name 本垢` で取得できる。対象作品 URL を渡した場合の保存後確認も共通の取得・YAML 前処理を通し、HTTP エラーやログイン壁を成功表示しない。
+**取得用 bin**: `narou_rs_login` は小説・作者・トップページの URL、サイト名、親ドメインも受理し、通常は YAML の `login_url` を開く。`login_wall_error: login` のサイトに作品・作者 URL を渡した場合は、そのページを開いてブラウザ確認を行えるようにする。アルファポリスは `narou_rs_login alphapolis.co.jp --name 本垢` で取得できる。対象作品の保存後確認は共通の取得・YAML 前処理と設定済み `user-agent` を使い、HTTP エラーやログイン壁を成功表示しない。Cookie の保存だけで WAF 通過や閲覧権限を保証するものではない。
+
+`narou_rs_login <作品または作者URL> --browser-token` は、サイト定義の `browser_token` (`script_url` / `function` / `cookie_name`) を使って、隔離ブラウザ内でサイトの正規 SDK を読み込み、確認トークンを準備してから保存する。トークンを復号・偽造せず、SDK 名や Cookie 名は Rust に固定しない。設定が無いサイトでは明示的に失敗する。`--port` 未指定の場合、このモードに限り空き非 0 ポートを使う。確認・ログインが済んだら Enter で保存し、その後に実際の取得で有効性を確認する。CAPTCHA が表示された場合は手動操作が必要で、トークンの発行だけで取得成功や有効期間を保証しない。
+
+Native の連続取得では `NAROU_RS_BROWSER_TOKEN=1` を指定すると、既知のブラウザ確認で止まった時だけ同梱 `narou_rs_login` を呼び、正規 SDK のトークンを取り直して同じ取得を再試行する（既定は無効、Chromium 系ブラウザが必要）。常駐ブラウザにはせず、目次取得では 1 回、本文は各話、作者一覧はページ・ログイン ID の組み合わせにつき 1 回までに制限する。匿名取得から更新する場合も保存済みトークンの対象 ID を先に決め、発行失敗後の同じ ID へのフォールバックで予算を復活させない。別アカウントは自身の ID で更新できる。作者一覧の途中で更新しても取得済みの前ページへは戻らず、保存済みアカウントの Cookie・ログイン ID・名前・順序を維持する。確認が完了しなければ従来の認証エラーで止まり、CAPTCHA の自動解読や通過保証は行わない。Worker ではブラウザを起動しない。
 
 カクヨムは `narou_rs_login kakuyomu.jp --name NEXT`、または対象作品 URL の指定で `/auth/login` を開く。NEXT の有料部分にはアカウントの閲覧権も必要で、ログイン済みというだけで取得可能とは判定しない。未ログイン・権利なしでは警告付きで無料分を取得し、保存済みの話を欠く部分一覧では更新を見送って既存データを保持する。
 
@@ -459,7 +469,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 
 **書き出しの保護**: `--passphrase` は 8 文字以上を要求し、空文字・短すぎる値では書き出さない (取り込みは旧ファイル互換のため任意長のパスフレーズを受け付ける)。書き出しファイルは Unix では 0600 で作成し、既存のシンボリックリンクは追従しない。
 
-**ブラウザ取得**: `narou_rs_login` は `--remote-debugging-port=0` で起動し、`<profile>/DevToolsActivePort` と `/json/version` の WebSocket URL が起動したブラウザの port/host/path と一致することを確認してから Cookie を取得する (`--port` で固定ポートを明示した場合も port 一致を確認)。
+**ブラウザ取得**: 既定は `--remote-debugging-port=0` で起動し、`<profile>/DevToolsActivePort` と `/json/version` の WebSocket URL が起動したブラウザの port/host/path と一致することを確認してから Cookie を取得する。`--port` の明示指定や `--browser-token` の非 0 ポートでも、起動した子プロセス自身の stderr に通知された Browser エンドポイントの port/host/path と照合し、同じポートの別プロセスへ接続しない。起動通知の読み取り・接続・ハンドシェイク・送受信にはサイズと待機上限を置く。取得後は Cookie 配列を複製せずに処理し、ブラウザの終了を待ってからプロファイルを片付ける。
 
 **ヘルプ**: トップレベル一覧と `narou login -h` は実装と同期している。`-h` の `<sub>` 一覧は `list`/`import`/`export`/`rename`/`order`/`clear` を、Examples は `rename`・`order`・`clear --index` を含む主要形を、オプション一覧は `--passphrase`/`--replace`/`--clear-text`/`--name`/`--index` を表示する。
 **Web UI**: 設定ページ「ログイン」タブで一覧 (サイト → 名前つきログイン)・取り込み (名前欄つき。空欄ならファイル名を使用)・名前変更・並べ替え (上下ボタン)・1 件削除・サイト削除・全削除。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET /api/login`、`POST /api/login/import`、`POST /api/login/rename`、`POST /api/login/order`、`DELETE /api/login`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}`。

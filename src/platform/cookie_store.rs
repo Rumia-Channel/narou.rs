@@ -30,6 +30,18 @@ pub struct HostCookie {
     pub cookie: String,
 }
 
+/// Private credential-helper response. It contains secrets and must never be
+/// logged; only the retried site request determines whether it was accepted.
+#[derive(Serialize, Deserialize)]
+pub struct BrowserTokenResponse {
+    pub version: u8,
+    pub site: String,
+    pub cookie_name: String,
+    pub cookies: BTreeMap<String, String>,
+}
+
+pub const BROWSER_TOKEN_RESPONSE_VERSION: u8 = 1;
+
 /// One login: which site it belongs to, what the user calls it, and the
 /// cookies it carries.
 ///
@@ -101,6 +113,15 @@ impl LoginGroup {
     /// value as the same login).
     pub fn same_cookies(&self, other: &Self) -> bool {
         self.cookies == other.cookies
+    }
+
+    /// Whether any host carries this exact (case-sensitive) cookie name.
+    pub fn has_cookie(&self, name: &str) -> bool {
+        self.cookies.iter().any(|entry| {
+            entry.cookie.split(';').any(|part| {
+                part.trim().split_once('=').is_some_and(|(key, _)| key.trim() == name)
+            })
+        })
     }
 
     /// Hosts of this login, most specific first.
@@ -735,6 +756,19 @@ pub trait CookieStore: Send + Sync {
         sent_cookie: &'a str,
         set_cookie: &'a [String],
     ) -> PlatformFuture<'a, Result<bool>>;
+    /// Acquire a fresh browser-issued token when an opted-in native client
+    /// encounters a verification wall. Storage-only adapters return `None`.
+    /// A refresh updates only `cookie_name`, preserving the selected login's
+    /// identity and other cookies; it never performs account sign-in.
+    fn refresh_browser_token<'a>(
+        &'a self,
+        _site: &'a str,
+        _target_url: &'a str,
+        _cookie_name: &'a str,
+        _session_id: Option<&'a str>,
+    ) -> PlatformFuture<'a, Result<Option<LoginGroup>>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Canonical form of a request host used as a credential key.

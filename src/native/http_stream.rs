@@ -60,43 +60,8 @@ impl NativeHttpClient {
                 }).await.map_err(|error| NarouError::Http(error.to_string()))?;
                 chain = returned;
                 validation?;
-                let scope = pacing.map(|policy| policy.scope_for(&chain)).transpose()?;
-                let tiered = chain.request().method == HttpMethod::Get && !chain.request().trusted_endpoint;
-                let domain = crate::downloader::http_policy::domain_of(&chain.request().url).to_string();
-                let mut order = if tiered { self.tier_order(&domain) } else { vec![TIER_REQWEST] };
-                if tiered && chain.request().redirect == RedirectMode::Manual {
-                    order.retain(|&tier| tier != TIER_CURL); order.insert(0, TIER_CURL);
-                }
-                let mut fallback = None;
-                let mut last_error = None;
-                let mut selected = None;
-                'tiers: for tier in order {
-                    let tools: &[Option<&'static str>] = if tier != TIER_SUBPROCESS { &[None] }
-                        else if cfg!(windows) { &[Some("curl"), Some("wget")] }
-                        else { &[Some("wget"), Some("curl")] };
-                    for &tool in tools {
-                        if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.acquire(scope).await?; }
-                        let result = self.streaming_attempt(chain.request().clone(), tier, tool).await;
-                        if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.complete(scope).await?; }
-                        match result {
-                            Ok(response) if tiered && should_try_next_tier(response.status) => {
-                                self.tiers.lock().note_failure(&domain, tier);
-                                // Only the most recent bounded diagnostic body is
-                                // retained; dropping the previous one cancels it.
-                                fallback = Some(response);
-                            }
-                            Ok(response) => {
-                                if tiered { self.tiers.lock().note_success(&domain, tier); }
-                                selected = Some(response); break 'tiers;
-                            }
-                            Err(error) => {
-                                if tiered { self.tiers.lock().note_failure(&domain, tier); }
-                                last_error = Some(error);
-                            }
-                        }
-                    }
-                }
-                let response = selected.or(fallback).ok_or_else(|| last_error.unwrap_or_else(|| io_error("all HTTP transports failed")))?;
+                let (returned, response) = self.send_stream_validated_hop(chain, pacing).await?;
+                chain = returned;
                 let head = response.head();
                 if let Some(store) = self.cookie_store.as_deref() {
                     crate::platform::cookie_store::persist_response_set_cookie(store, &head, chain.request().header("Cookie")).await;
@@ -104,6 +69,57 @@ impl NativeHttpClient {
                 if !chain.advance(&head)? { return Ok(response); }
             }
         })
+    }
+
+    /// Dispatch one already-validated streaming hop through the tier fallback.
+    ///
+    /// The hop already passed the admission check, so this only chooses the
+    /// transport. A browser-verification challenge ends the fallback: it is
+    /// the site's own answer, and the next transport would replace it with
+    /// the plain forbidden response an unauthenticated client receives.
+    pub(super) async fn send_stream_validated_hop<'a>(
+        &'a self,
+        chain: RedirectChain,
+        pacing: Option<HttpPacing<'a>>,
+    ) -> Result<(RedirectChain, HttpStreamResponse)> {
+        let scope = pacing.map(|policy| policy.scope_for(&chain)).transpose()?;
+        let tiered = chain.request().method == HttpMethod::Get && !chain.request().trusted_endpoint;
+        let domain = crate::downloader::http_policy::domain_of(&chain.request().url).to_string();
+        let mut order = if tiered { self.tier_order(&domain) } else { vec![TIER_REQWEST] };
+        if tiered && chain.request().redirect == RedirectMode::Manual {
+            order.retain(|&tier| tier != TIER_CURL); order.insert(0, TIER_CURL);
+        }
+        let mut fallback = None;
+        let mut last_error = None;
+        let mut selected = None;
+        'tiers: for tier in order {
+            let tools: &[Option<&'static str>] = if tier != TIER_SUBPROCESS { &[None] }
+                else if cfg!(windows) { &[Some("curl"), Some("wget")] }
+                else { &[Some("wget"), Some("curl")] };
+            for &tool in tools {
+                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.acquire(scope).await?; }
+                let result = self.streaming_attempt(chain.request().clone(), tier, tool).await;
+                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.complete(scope).await?; }
+                match result {
+                    Ok(response) if tiered && should_try_next_tier(response.status, response.header(WAF_ACTION_HEADER)) => {
+                        self.tiers.lock().note_failure(&domain, tier);
+                        // Only the most recent bounded diagnostic body is
+                        // retained; dropping the previous one cancels it.
+                        fallback = Some(response);
+                    }
+                    Ok(response) => {
+                        if tiered { self.tiers.lock().note_success(&domain, tier); }
+                        selected = Some(response); break 'tiers;
+                    }
+                    Err(error) => {
+                        if tiered { self.tiers.lock().note_failure(&domain, tier); }
+                        last_error = Some(error);
+                    }
+                }
+            }
+        }
+        let response = selected.or(fallback).ok_or_else(|| last_error.unwrap_or_else(|| io_error("all HTTP transports failed")))?;
+        Ok((chain, response))
     }
 
     fn stream_reqwest(&self, request: &HttpRequest, sink: &mut Sink) -> Result<()> {

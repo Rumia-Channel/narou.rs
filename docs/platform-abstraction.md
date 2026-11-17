@@ -161,8 +161,15 @@ pub trait HttpClient: Send + Sync {
 - 「reqwest API のコピー」にしない。narou.rs が必要とする最小仕様（GET/POST + headers + body + status + timeout + size limit）。
 - `HttpRequest` は所有型（`spawn_blocking` へ move できる）。`RedirectMode::Manual` は 3xx をそのまま返し、`resolve_final_url` が `Location` を追跡する。
 - `HttpResponse` は bytes のみ。文字デコード（Shift_JIS 等）は core の `downloader::http_policy::decode_with_encoding` が行う。
-- ステータス→ドメインエラー変換（404→NotFound / 503→SuspendDownload）は `http_policy::ensure_success_response` に一元化。transport は生ステータスを返す。
+- ステータス→ドメインエラー変換（404→NotFound / 503→SuspendDownload、既知のブラウザ確認→Login）は `http_policy` に一元化する。`platform::http::browser_challenge` は `202 + x-amzn-waf-action: challenge` / `405 + ...: captcha` だけを認識する追加メモリ割り当てのない共通判定で、transport は元のステータスとヘッダを保持する。本文が空の 202、必須 JSON 取得、ストリームでも確認画面を成功データとして扱わない。
 - 将来の future は `Send`（`tokio::spawn` で並列 update を駆動するため）。wasm32 では全型が自動 Send なので Workers は影響なし。
+- ブラウザ確認は通信手段の障害ではない。Native はこの応答で tier を打ち切り、Worker の socket / relay でも元の 403 より優先して返す。Cookie 候補の選択・目次の再評価・本文の再試行は downloader の私有 `AuthState` が担う。資格情報は必要時に一度だけ読み、候補は常にサイトの設定 Cookie から組み直す。通常の成功ページごとに資格情報を再読込せず、認証以外の失敗を追加試行しない。
+- 取得済みの部分一覧を補うログイン試行は任意であり、その候補の 404・通信エラー・後続目次のログイン壁で採用済み一覧を無効にしない。改善できなければ一覧と資格情報を一緒に元へ戻す。利用可能な一覧を一度も得られなかった場合だけ、元のエラーを返す。
+- AWS WAF の公式 [`getToken()`](https://docs.aws.amazon.com/waf/latest/developerguide/waf-js-challenge-api-get-token.html) はトークン取得・再利用の API であり、CAPTCHA を解くものではない。Cookie の存在だけで通過成功や有効期間を推定せず、実際の取得結果で判定する。YAML の `browser_token` は HTTPS SDK URL・関数パス・Cookie 名を指定し、`narou_rs_login --browser-token` が隔離ブラウザ内で正規 SDK を実行する。SDK の値やサイト名は Rust に固定せず、常駐更新・CAPTCHA の自動解読・ブラウザ識別情報の書き換えは行わない。
+
+- Native の必要時更新は `NAROU_RS_BROWSER_TOKEN=1` の明示 opt-in と `CookieStore::refresh_browser_token` capability に分離する。確認要求を受けた時だけ同梱 helper と一時ブラウザを起動し、トークンだけの私有 JSON をサイズ・期限つきで受け取る。値や子プロセスの出力をログへ流さず、同じログイン ID のトークンだけを原子的に更新し、並行する削除・トークン変更を巻き戻さない。実際の再試行は元のアカウント Cookie を保持する。目次の一連の取得では 1 回、本文は各話につき 1 回まで更新でき、成功ページごとの資格情報再読込は増やさない。既定・Worker の capability は未対応 (`None`) でブラウザを起動しない。
+- Chromium は [`--remote-debugging-port=0` で `navigator.webdriver` を true にする](https://developer.mozilla.org/en-US/docs/Web/API/Navigator/webdriver)。既定のログイン方式は維持し、明示したトークンモードでは空き非 0 ポートを使う。接続先は起動したブラウザ自身の stderr が通知した Browser GUID と照合する。ポート確保後に競合した場合も別プロセスの資格情報を取得せず失敗する。これはトークン有効性やサイト側の個別ルールを断定するものではない。
+- SDK 実行は起動直後の既知の execution-context 切替だけを元の期限内で待ち直し、同じ要求を別オリジンへ持ち越さない。SDK 要求のパラメータは再利用し、CDP の返答も所有権を移して処理する。ブラウザ終了後の Windows ファイル共有違反は有界に待つが、権限エラーや別種の削除エラーは再試行しない。
 
 ### RateLimiter
 
@@ -550,7 +557,7 @@ Worker (worker_entry)
 （`cloudflare:sockets`）で取り直す。理由は実測で、`fetch` は Cloudflare の公開 IP レンジから、
 `connect()` は公開レンジ外のプレフィックス（実測 `104.28.157.13`）から出るため、Cloudflare の
 レンジを弾くサイト（例: CloudFront 配信のカクヨム）でも後者なら 200 が返る。ソケット側で
-2xx/3xx が得られたときだけ採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。
+2xx/3xx または既知のブラウザ確認応答が得られたときに採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。確認応答を元の 403 で隠さない。
 **全アドレスが Cloudflare の公開レンジ内にあるサイト（例: ハーメルン）は `connect()` 自体が
 ランタイムに拒否される**ため、別の出口 IP を持つ外部の踏み台（取得リレー）が別途必要。
 
@@ -563,9 +570,9 @@ Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト向�
   旧 Node 実装 (`scripts/relay/*.mjs` / `relay.js` / `worker/`) は削除した。
 - プロトコルは旧版と同一で、クライアント側は `src/platform/relay.rs`。`POST /proxy` の
   JSON 本文で `url` と `headers` を送り、`X-Proxy-Token` で認証する。GET も受け付けるが、
-  Cookie 等を URL に載せない。応答は `{status, contentType, location?, setCookie, via, body(base64)}`、
+  Cookie 等を URL に載せない。応答は `{status, contentType, location?, setCookie, via, body(base64), wafAction?}`、
   エラーは `{"error": "..."}`。`GET /health` は認証不要で
-  `{"ok":true,"fetch":"curl,wget"}`（実際の解決済み取得順）を返す。
+  `{"ok":true,"fetch":"curl,wget"}`（実際の解決済み取得順）を返す。任意の `wafAction` は JSON と NRS1 の両形式で同じ `x-amzn-waf-action` を伝える。フィールドが無い旧応答も読めるが、旧リレーが落としたヘッダはクライアントだけの更新では復元できないため、この判定を使う配備ではリレーも更新する。
 - `worker_entry/src/http.rs` は既存の `with_relay` と、Worker の通常の fetch サブリクエスト
   （`send_fetch_hop`）で送信する。サイト定義のヘッダを転送し、返ったリダイレクトは
   呼び出し側の共通 `RedirectChain` が検証する。

@@ -1,0 +1,212 @@
+# ノベルアップ＋ (novelup.plus)
+#
+# このサイトの手前には AWS WAF のブラウザ確認が置かれることがある: HTTP 202 /
+# 405 と `x-amzn-waf-action` ヘッダー、または WAF の JavaScript を含む途中頁。
+# 正規 SDK で確認トークンを準備するときは、対象作品 URL を渡して
+#   narou_rs_login <作品URL> --browser-token
+# を実行する。Native の連続取得は NAROU_RS_BROWSER_TOKEN=1 で必要時の再取得を
+# 有効にできる。CAPTCHA が必要な場合は自動解読せず、通常の対話取得で確認する。
+# トークンの発行・保存だけでサイトが受け付けたとは判定しない。
+#
+# min_interval の 20 秒は確認を避けるための保守的な初期値で、保証ではない。
+# サイトの返答が安定しないときや CAPTCHA が出るときは、さらに遅くする。
+#
+# サイト固有の規則はすべてこの YAML に置く: セレクタ・前処理・目次/一覧のページ
+# 送り・作者ページの一覧・間隔。Rust 側にノベルアップ＋専用の分岐は無い。
+name: &name ノベルアップ＋
+domain: novelup.plus
+top_url: https://\k<domain>
+# 作品 URL (`/story/<作品ID>`) と話 URL (`/story/<作品ID>/<話ID>`) の両方。
+url: '^https?://novelup\.plus/story/(?<ncode>\d+)(?:/\d+)?/?(?:[?#].*)?$'
+encoding: UTF-8
+timezone: Asia/Tokyo
+confirm_over18: no
+append_title_to_folder_name: yes
+title_strip_pattern: null
+sitename: *name
+version: 1.4
+# ブラウザ確認を避けるため、保守的に空ける初期値 (保証ではない)。
+min_interval: 20
+
+# ------------------------------------------------------------
+# AWS WAF / ブラウザ確認
+headers:
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+  Accept-Language: 'ja,en-US;q=0.7,en;q=0.3'
+login_url: \k<top_url>
+# ブラウザ確認の途中頁 (WAF が返す JS を含むページ)。
+login_pattern: 'gokuProps|awsWafCookieDomainList'
+# ブラウザ確認が残っている結果を 404 (凍結) にしない。確認をやり直して再実行
+# できるようにする (認証エラーとして報告する)。
+login_wall_error: login
+browser_token:
+  script_url: https://d22788634aee.24b7ac35.ap-northeast-1.token.awswaf.com/d22788634aee/0b79e5f74db9/57975c88c871/challenge.js
+  function: AwsWafIntegration.getToken
+  cookie_name: aws-waf-token
+
+# ------------------------------------------------------------
+# 作者ページ (作者追跡)
+#
+# `narou author add https://novelup.plus/user/<作者ID>/profile` で登録する。
+# プロフィール頁は作品の一部 (先頭数件) しか出さないので、全作品は「作品」タブ
+# の一覧頁 (`/user/<作者ID>/story`) から取る。一覧頁はページ送りがあるので、
+# `author_next_pattern` で終端まで辿る (1 頁目で止めない)。
+author_url:
+  - '^https?://novelup\.plus/user/(?<author_id>\d+)/profile/?(?:[?#].*)?$'
+  - '^https?://novelup\.plus/user/(?<author_id>\d+)/story/?(?:[?#].*)?$'
+author_api_url: https://novelup.plus/user/\k<author_id>/story
+# 作品カードの選別とページ送りは下の preprocess DSL が行う。
+# ここでは DSL が出した中間行だけを読む (生 HTML のリンクを直接拾わない)。
+author_novel_pattern: '(?m)^novelup_author_novel::(?<novel_url>https://novelup\.plus/story/\d+)$'
+author_next_pattern: '(?m)^novelup_author_next::(?<author_next>https://novelup\.plus/user/\d+/story\?[^\r\n]+)$'
+
+# ------------------------------------------------------------
+# 前処理
+#
+# 本文・前書き・後書き・あらすじは <p> の中の生改行が段落区切りで、変換すると
+# 改行が消える。先に <br> に直してから marker ブロックとして挿入し、各
+# *_pattern がそのブロックを拾う (生改行を保つため `<p>` タグは残す)。
+preprocess: |-
+  guard "NovelupPlusPreprocessMagicWord2026"
+
+  # 作者の「作品」一覧。プロフィールの一部の作品や「読む」ボタンは使わない。
+  let author_page = url.gsub(/^https?:\/\/novelup\.plus\/user\/\d+\/story\/?(?:\?[^#]*)?(?:#.*)?$/, "author")
+  if author_page == "author"
+    let works = extract_all(/<p class="story_name">\s*<a[^>]*href="(https:\/\/novelup\.plus\/story\/\d+)"/)
+    let next_page = extract(/<li class="active"[^>]*>\s*<span>\d+<\/span>\s*<\/li>\s*<li[^>]*>\s*<a[^>]*href="(https:\/\/novelup\.plus\/user\/\d+\/story\?[^"]+)"/)
+    emit "NovelupPlusPreprocessMagicWord2026"
+    for work_url in works
+      emit "novelup_author_novel::${work_url}"
+    end
+    if next_page
+      emit "novelup_author_next::${next_page}"
+    end
+    emit ""
+    insert_at_match
+  end
+
+  # あらすじ (目次頁にある)
+  let story = extract(/<div class="novel_synopsis">\s*<p>(.*?)<\/p>\s*<\/div>/s)
+  if story
+    let story_text = story.gsub(/[\s]+/, "")
+    if !story_text.empty
+      emit "NovelupPlusPreprocessMagicWord2026"
+      emit "novelup_story::"
+      emit story.gsub(/\r?\n/, "<br>")
+      emit "::novelup_story_end"
+      insert_at_match
+    end
+  end
+
+  # 本文
+  let body = extract(/<p id="episode_content">(.*?)<\/p>/s)
+  if body
+    let body_text = body.gsub(/[\s]+/, "")
+    if !body_text.empty
+      emit "NovelupPlusPreprocessMagicWord2026"
+      emit "novelup_body::"
+      emit body.gsub(/\r?\n/, "<br>")
+      emit "::novelup_body_end"
+      insert_at_match
+    end
+  end
+
+  # 前書き
+  let intro = extract(/<div class="novel_foreword">(.*?)<\/div>/s)
+  if intro
+    let intro_text = intro.gsub(/[\s]+/, "")
+    if !intro_text.empty
+      emit "NovelupPlusPreprocessMagicWord2026"
+      emit "novelup_introduction::"
+      emit intro.gsub(/\r?\n/, "<br>")
+      emit "::novelup_introduction_end"
+      insert_at_match
+    end
+  end
+
+  # 後書き
+  let post = extract(/<div class="novel_afterword">(.*?)<\/div>/s)
+  if post
+    let post_text = post.gsub(/[\s]+/, "")
+    if !post_text.empty
+      emit "NovelupPlusPreprocessMagicWord2026"
+      emit "novelup_postscript::"
+      emit post.gsub(/\r?\n/, "<br>")
+      emit "::novelup_postscript_end"
+      insert_at_match
+    end
+  end
+
+# ------------------------------------------------------------
+# 目次取得設定
+toc_url: \k<top_url>/story/\k<ncode>
+# 1 頁 100 話。`data-number` が空の短編は話 ID を話数として使う (Rust 側の
+# 汎用フォールバック)。`subdate` は 2 桁年 (`26/11/16 8:15`)。
+subtitles: |-
+  (?x)
+  (?:<div\s+class="episodeListItem\s+chapter">\s*(?<chapter>.*?)\s*</div>\s*)?
+  <div\s+class="episodeListItem\s*">\s*
+  <a\s+class="episodeTitle"\s*href="(?<href>https?://novelup\.plus/story/\d+/(?<episode_id>\d+))"\s*data-number="(?<index>[^"]*)"\s*>\s*(?<subtitle>.*?)\s*</a>\s*
+  <div\s+class="episodeDate">\s*<p\s+class="publishDate">(?<subdate>[^<]+)</p>
+# 最後の頁へのリンクから総頁数を読む (100 話ごとの頁送り)。
+toc_page_max: 'href="https://novelup\.plus/story/\d+\?[^"]*\bp=(\d+)"[^>]*aria-label="[^"]*最後[^"]*"'
+# 現在の頁の次が次の頁。
+next_toc: '<li class="active"[^>]*>\s*<span>\d+</span>\s*</li>\s*<li[^>]*>\s*<a[^>]*href="(?<next_url>https://novelup\.plus/story/\d+\?[^"]*\bp=(?<next_page>\d+))"'
+next_url: \k<next_url>
+
+# ------------------------------------------------------------
+# 本文取得設定
+body_pattern: |-
+  novelup_body::
+  (?<body>.+?)
+  ::novelup_body_end
+introduction_pattern: |-
+  novelup_introduction::
+  (?<introduction>.+?)
+  ::novelup_introduction_end
+postscript_pattern: |-
+  novelup_postscript::
+  (?<postscript>.+?)
+  ::novelup_postscript_end
+
+# 挿絵は本文 (と前書き/後書き) の中だけを見る。raw HTML にはコメント欄の
+# スタンプ画像も入っているので、raw は走査しない。
+illust_current_url: \k<top_url>
+illust_from_raw: false
+illust_grep_pattern: '<img\b[^>]*\ssrc="(?<src>https?://[^"]+)"'
+
+# ------------------------------------------------------------
+# 小説情報 (目次頁と同じ)
+novel_info_url: \k<toc_url>
+# 題名。目次頁は `<h1 class="storyTitle">`、話頁は `<p class="storyTitle">`。
+title:
+  - '<h1 class="storyTitle">\s*(?<title>.*?)\s*</h1>'
+  - '<p class="storyTitle">\s*(?<title>.*?)\s*</p>'
+# 作者名 (作者頁へのリンクの文字)。
+author:
+  - '<a class="storyAuthor"[^>]*>\s*(?<author>.*?)\s*</a>'
+  - '<p class="storyAuthor">\s*(?<author>.*?)\s*</p>'
+# あらすじ (前処理で改行を <br> にしたもの)。
+story: |-
+  novelup_story::
+  (?<story>.+?)
+  ::novelup_story_end
+# 作品種別 (長編/短編/短編集) の次の span が状態。
+nt: '<span class="private">(?:長編|短編|短編集)</span>\s*<span class="private">(?<novel_type>[^<]+)</span>'
+# 状態 → 種別。1 = 連載, 2 = 短編, 3 = 完結 (完結は `end` として扱う)。
+# 未知の状態は既定 (連載) になる。
+novel_type_string:
+  連載中: 1
+  完結済: 3
+  完結: 3
+# 掲載話数 (目次の総話数)。
+ga: '<p class="totalEpisode">[^0-9]*(?<general_all_no>\d+)\s*話'
+# 初掲載日。
+gf: '<th>初掲載日</th>\s*<td>(?<general_firstup>[^<]+)</td>'
+# 最終更新日 (最新話掲載日と更新時刻は同じ行を使う)。
+gl: '<th>最終更新日</th>\s*<td>(?<general_lastup>[^<]+)</td>'
+nu: '<th>最終更新日</th>\s*<td>(?<novelupdated_at>[^<]+)</td>'
+# 文字数。
+l: '<th>文字数</th>\s*<td>(?<length>[\d,]+)文字</td>'
+# タグ (検索のタグ指定リンク)。
+tags: '<a href="(?:https?://novelup\.plus)?/search\?[^"]*search\[tag\]=1"[^>]*>(?<tag>[^<]+)</a>'

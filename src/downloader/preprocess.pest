@@ -68,6 +68,7 @@ primary = _{
     | required_json_expr
     | fetch_json_expr
     | post_form_expr
+    | extract_all_expr
     | chain_expr
     | array_chain_expr
     | array_literal
@@ -79,6 +80,9 @@ primary = _{
 // --- JSON extraction ---
 extract_json_expr = { "extract_json" ~ "(" ~ regex ~ ")" }
 extract_expr = { "extract" ~ "(" ~ regex ~ ")" }
+// ソース全体から全てのマッチを順に取り出す。キャプチャがあれば第1キャプチャ、
+// 無ければマッチ全体。マッチが無ければ空配列。
+extract_all_expr = { "extract_all" ~ "(" ~ regex ~ ")" }
 
 // --- extra fetch request ---
 // 追加の取得要求。実行は async 側 (サイトの FetchPolicy 経由) が行い、結果は
@@ -91,7 +95,7 @@ required_json_expr = { "fetch_json_required" ~ "(" ~ string ~ ("," ~ http_status
 http_status_list = { "[" ~ (int_lit ~ ("," ~ int_lit)*)? ~ "]" }
 post_form_expr = { "post_form" ~ "(" ~ string ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
 // `fetch_json(...).body[0].urls.original` のように呼び出し結果を辿る形。
-call_chain_expr = { (request_expr | required_json_expr | fetch_json_expr | post_form_expr) ~ chain_part+ }
+call_chain_expr = { (request_expr | required_json_expr | fetch_json_expr | post_form_expr | extract_all_expr) ~ chain_part+ }
 
 // --- accessor + method chain ---
 chain_expr = { ident ~ chain_part* }

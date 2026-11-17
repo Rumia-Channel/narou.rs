@@ -94,9 +94,19 @@ pub async fn download_section(
     })
     .await?;
     if setting.compiled_error_message_pattern().is_some_and(|pattern| pattern.is_match(&html_source))
-        || setting.compiled_login_pattern().is_some_and(|pattern| pattern.is_match(&html_source))
     {
         return Err(crate::error::NarouError::Http(format!("section is unavailable while fetching {url}")));
+    }
+    if setting.is_login_wall(&html_source) {
+        // ログインページが本文として返された。`login_wall_error: login` の
+        // サイトは認証エラーとして返し、別の保存済みログインで再試行できる
+        // ようにする。既定は従来どおりの失敗。
+        return Err(match setting.login_wall_error {
+            super::site_setting::LoginWallError::Login => setting.login_wall_failure(),
+            super::site_setting::LoginWallError::NotFound => {
+                crate::error::NarouError::Http(format!("section is unavailable while fetching {url}"))
+            }
+        });
     }
     let (element, raw_html) = parse_section_html(setting, html_source)?;
     cache.insert(url, element.clone());
