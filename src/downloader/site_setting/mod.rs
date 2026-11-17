@@ -1,3 +1,4 @@
+mod browser_token;
 mod info_extraction;
 mod interpolate;
 mod loader;
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+pub use browser_token::BrowserTokenSetting;
 pub use serde_helpers::deserialize_yes_no_bool;
 pub use update_rules::{UpdateRule, allows_automatic_update};
 
@@ -177,6 +179,19 @@ pub struct SiteSetting {
     /// record.
     #[serde(default)]
     pub login_wall_error: LoginWallError,
+    /// Browser-side token preparation for a site whose content sits behind a
+    /// browser check.
+    ///
+    /// The definition names the script to load, the function that issues the
+    /// token and the cookie that carries it; the values are site data, so no
+    /// site is special-cased in Rust. An unusable configuration is rejected
+    /// while the definition is compiled.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "browser_token::deserialize_browser_token"
+    )]
+    pub browser_token: Option<BrowserTokenSetting>,
     /// Retain cached omitted sections on a nonempty partial TOC; indices must be stable numeric positions.
     #[serde(default)]
     pub preserve_missing_sections: bool,

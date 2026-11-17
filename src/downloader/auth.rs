@@ -3,13 +3,16 @@
 //! One download keeps a single [`AuthState`]: the site's own cookie, the
 //! stored logins it may use and the login that is currently in effect.
 //!
-//! Two rules shape the module:
+//! Three rules shape the module:
 //!
 //! - Every candidate starts from the site's own cookie, so one account's
 //!   cookies never leak into another account's request.
 //! - The stored logins are read from the store once per run, and only when
 //!   a credential is selected or recovered. A successful section never
 //!   touches the store.
+//! - A browser-issued token may be renewed once per logical operation. The
+//!   renewed login replaces the stored one with the same id, so the account
+//!   keeps its identity while its cookie becomes usable again.
 
 use crate::platform::LoginGroup;
 
@@ -36,6 +39,9 @@ pub(crate) struct AuthState {
     active: Option<ActiveLogin>,
     /// Indexes of the logins already used in this run.
     used: Vec<usize>,
+    /// Whether the browser-issued token was already renewed in the current
+    /// logical operation.
+    token_refreshed: bool,
 }
 
 impl AuthState {
@@ -46,6 +52,7 @@ impl AuthState {
             groups: None,
             active: None,
             used: Vec::new(),
+            token_refreshed: false,
         }
     }
 
@@ -141,18 +148,108 @@ impl AuthState {
     /// Send `login` again, or the site's own cookie when there is none.
     ///
     /// A candidate that did not improve the listing is undone this way, so
-    /// the run keeps the credential it started with.
+    /// the run keeps the credential it started with. The account is the one
+    /// that is kept, not its cookie: a token renewed in the meantime is used
+    /// instead of the expired one the snapshot holds.
     pub fn restore(&mut self, setting: &mut SiteSetting, login: Option<&ActiveLogin>) {
         let Some(login) = login else {
             self.apply_configured(setting);
             return;
         };
+        let current = self
+            .groups
+            .as_deref()
+            .and_then(|groups| {
+                groups
+                    .iter()
+                    .find(|group| !login.id.is_empty() && group.id == login.id)
+            })
+            .map(|group| {
+                (
+                    group.merged_cookie(),
+                    group
+                        .cookies
+                        .iter()
+                        .map(|entry| entry.host.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .filter(|(cookie, _)| !cookie.is_empty());
+        let (cookie, hosts) = current.unwrap_or_else(|| (login.cookie.clone(), login.hosts.clone()));
         setting.cookie = crate::platform::merge_cookie_headers(
             self.configured_cookie.as_deref(),
-            Some(&login.cookie),
+            Some(&cookie),
         );
-        setting.login_cookie_hosts = login.hosts.clone();
-        self.active = Some(login.clone());
+        setting.login_cookie_hosts = hosts.clone();
+        self.active = Some(ActiveLogin {
+            id: login.id.clone(),
+            cookie,
+            hosts,
+        });
+    }
+
+    /// Claim the single browser-token renewal of the current operation.
+    ///
+    /// The claim is given up by [`Self::reset_token_refresh`], which the
+    /// caller does when the next operation starts. A renewed token that is
+    /// still rejected must not start another renewal.
+    pub fn claim_token_refresh(&mut self) -> bool {
+        if self.token_refreshed {
+            return false;
+        }
+        self.token_refreshed = true;
+        true
+    }
+
+    /// Start a new operation, which may renew the browser-issued token again.
+    pub fn reset_token_refresh(&mut self) {
+        self.token_refreshed = false;
+    }
+
+    /// Send the renewed login and remember it under its own id.
+    ///
+    /// The renewed login replaces the stored one with the same id, so the
+    /// account keeps its identity. The logins already tried stay tried, and
+    /// the renewed login's cookies replace the ones in effect — one account's
+    /// cookies never mix into another account's request.
+    pub fn apply_refreshed(&mut self, setting: &mut SiteSetting, group: LoginGroup) -> bool {
+        let cookie = group.merged_cookie();
+        if cookie.is_empty() {
+            // A login without cookies cannot authenticate anything.
+            return false;
+        }
+        let hosts: Vec<String> = group.cookies.iter().map(|entry| entry.host.clone()).collect();
+        let id = group.id.clone();
+        if !id.is_empty()
+            && let Some(groups) = self.groups.as_mut()
+        {
+            // The position is read before the group is written: the borrow of
+            // the search must not outlive it.
+            let found = groups.iter().position(|existing| existing.id == id);
+            let index = match found {
+                Some(index) => {
+                    groups[index] = group;
+                    index
+                }
+                None => {
+                    groups.push(group);
+                    groups.len() - 1
+                }
+            };
+            // The renewed login was tried already; it is not a new candidate.
+            if !self.used.contains(&index) {
+                self.used.push(index);
+            }
+        }
+        self.active = Some(ActiveLogin {
+            id,
+            cookie: cookie.clone(),
+            hosts: hosts.clone(),
+        });
+        setting.cookie =
+            crate::platform::merge_cookie_headers(self.configured_cookie.as_deref(), Some(&cookie));
+        setting.login_cookie_hosts = hosts;
+        true
     }
 
     /// Send the site's own cookie only and forget the login in effect.

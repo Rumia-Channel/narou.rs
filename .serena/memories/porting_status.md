@@ -2,14 +2,19 @@
 
 ## ノベルアップ＋と認証回復（未リリース）
 
-- `feature-novelup-session` で `webnovel/novelup.plus.yaml` version 1.2 を追加。作品・各話・作者一覧・ページ送り・抽出は YAML / preprocess DSL で駆動する。最低間隔は 20 秒で、WAF 回避を保証する設定ではない。2 桁年は Ruby と同じ 1969–2068 の範囲へ解釈し、通常の 4 桁年には追加の書式解析を行わない。
+- `feature-novelup-session` で `webnovel/novelup.plus.yaml` version 1.3 を追加。作品・各話・作者一覧・ページ送り・抽出に加え、SDK の URL・関数・Cookie 名も YAML で駆動する。最低間隔は 20 秒で、WAF 回避を保証する設定ではない。2 桁年は Ruby と同じ 1969–2068 の範囲へ解釈する。
 - `platform::http::browser_challenge` は 202/challenge と 405/captcha の組み合わせだけを割当てなしで認識し、Native は tier 切替を打ち切る。Worker の socket / relay も確認応答を保持する。relay JSON / NRS1 の追加メタデータ `wafAction` は省略可能で、対応するリレーの更新が必要。
 - downloader の私有 `AuthState` は資格情報を必要時に一度だけ読み込み、各候補を元の設定 Cookie から組み直す。後続目次・本文・強い更新も認証回復し、採用したセッションを保持する。途中の壁を短い目次として保存せず、公開取得に不要な Cookie を送らない。目次の所有権を渡し、認証試行ごとの全文コピーも削減した。
 - 部分一覧を補う任意のログイン試行が失敗しても採用済み一覧を失わず、対応する資格情報へ戻す。利用可能な一覧を得ていない場合のエラー処理は維持する。期限切れログインの 404 で既存作品が削除・非公開扱いになる経路を追加修正した。
 - `narou_rs_login` は確認が必要なサイトの作品 URL を直接開き、設定済み User-Agent で保存後確認する。DevTools の接続・応答待ちに上限を置き、Cookie 配列の複製をなくし、ブラウザ終了を待ってからプロファイルを清掃する。
-- 実サイト確認: 短編 `874968302` を 1 話取得し、TXT と Kobo EPUB を生成。EPUB 37,600 bytes / 17 entries の ZIP・XML と本文の先頭／末尾を検証し、最終ビルドの CLI で再更新が「更新なし」となることも確認した。作者 `813181327` は CLI の追跡登録・dry-run で 13 作品を列挙した。連載 `759726165` は Native で 202/challenge、公式 SDK のトークン取得後にも 405/captcha を観測した。その後、利用者が Firefox の CAPTCHA を手動で完了し、66 話の目次と Native での 5 話取得を確認したが、6 話目は保存済み Cookie での再試行でも HTTP 403 となり停止した。全話取得・再更新・出力は未確認で、トークン寿命や UA / IP の拘束条件は断定しない。CAPTCHA の自動解読・ブラウザ常駐・TLS 指紋偽装は追加していない。
+- 実サイトの基本確認: 短編 `874968302` を 1 話取得し、TXT と Kobo EPUB を生成。ZIP・XML と本文の先頭／末尾を検証し、CLI の再更新が「更新なし」となることも確認した。作者 `813181327` は CLI の追跡登録・dry-run で 13 作品を列挙した。初期の Firefox による CAPTCHA 完了後だけでは連載の継続取得に失敗したが、後述の正規 SDK と必要時更新で連載を検証した。トークン寿命や UA / IP の拘束条件は断定しない。
 - 検証: Native の HTTP・認証回復・日付・サイト定義・既存ログイン／前処理の関連テスト、relay テスト、ログイン helper 7 件、Native と Worker wasm の Clippy ゲートが成功。強い更新の新規回帰は、本文だけの認証要求から回復し、同一本文の二重取得を避けることを確認した。実 workerd の HTTP 契約は追加 WAF ケースを含め 111/111 成功。ただし runner 全体は後続の `virtual_membership.mjs` で `ECONNRESET` により失敗し、全フェーズ成功ではない。原因未確定のため無関係なテストの緩和・再試行は加えていない。
 - 追加回帰: 匿名の部分一覧を得た後に保存ログインが 404 を返すと、修正前は既存作品の更新が `Failed` になることを再現。修正後は 404・後続目次の壁・500 の全ケースで公開一覧・作品 ID・匿名の本文取得を保持する。`auth_recovery` 9 件、`kakuyomu_login` 6 件、`login_fallback` 3 件、`pixiv_accessibility` 13 件の計 31 件が成功し、追加修正後の Native / Worker wasm Clippy も通過した。
+- 追加調査: Cookie なしの UA ローテーションは 20 秒間隔の 7 回目、固定 Firefox UA は 80 秒間隔の 2 回目で 202/challenge となり、UA や間隔だけでは解消しなかった。隔離した通常の Edge とサイトの正規 SDK でトークンを発行し、同じ UA の Native で同一本文を 20 秒間隔で 8 回取得できた。一度だけ保存したトークンを使う実 CLI は 67 話中 36 話目まで進んだ後に再び確認要求で停止し、再更新・変換には進んでいない。トークン寿命や UA/IP 拘束は未確定。
+- 必要時更新を実装: `CookieStore::refresh_browser_token` は既定 None、Native だけ `NAROU_RS_BROWSER_TOKEN=1` で有効にする。同梱 helper と一時ブラウザを確認時だけ起動し、値をログへ流さない私有 JSON でトークンのみ受け取る。同一 ID の更新と並行削除・変更の保護を atomic inventory 境界で行う。目次全体に 1 回、本文各話に 1 回の更新予算を持ち、成功ページの資格情報再読込は増やさない。
+- 初回の実 CLI は補助ブラウザの `Runtime.evaluate` が `Execution context was destroyed.` で失敗した。起動直後のページ遷移だけを元の期限内で待ち直し、別オリジンでは SDK を実行しないよう修正。実 helper で正規 SDK のトークン発行・トークンだけの JSON・一時プロファイルの削除まで確認した。Windows の終了直後のファイル共有違反だけに有界の削除待ちを加えた。CDP の同じポートの別 Browser GUID を使うローカル実行 fixture は、旧 helper で Cookie 読出し 1 回・書出しあり、新 helper で読出し 0 回・書出しなしを確認した。
+- 追加検証: SDK/Native ストア 19 件、helper 17 件、認証回復・既存ログイン関連 36 件、ノベルアップ＋ YAML 8 件の計 80 件と SDK JavaScript 4 件が成功。Native の対象限定 Clippy と Worker wasm Clippy が通過した（`vendor/async_zip` の警告は残る）。
+- 必要時更新を有効にした実 CLI で、連載 `759726165` の全 67 話取得（1370.88 秒）、再更新の「更新なし」、Kobo EPUB 生成が成功。UA はトークンを発行する通常の Edge と同じ値を設定した。取得中の確認要求でトークンを 1 回取り直して継続した。保存本文 67 件が空でないこと、EPUB 153,088 bytes / 83 entries の CRC・73 XML 文書、67 話すべての目次と先頭／末尾の本文を確認した。実行で新たに残った一時ブラウザプロファイルは 0 件。CAPTCHA の自動解読・常駐ブラウザ・識別情報の書き換えは行っていない。
 
 ## EPUB 配信経路と API の待ち時間（未リリース）
 

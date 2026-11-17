@@ -172,7 +172,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Worker の `/api/download`（`/api/download_force` を含む）と `/api/jobs` は、全対象のシリーズ・作者 URL 展開が成功してから作品ごとのジョブを登録し、元の `--force` 等を各作品へ引き継ぐ。取得失敗・空シリーズ一覧はエラー。正常に読めた空の作者一覧は追加なし。保存済みジョブ・旧 envelope の実行境界も同じ展開器を使う
 - 作者・ユーザー URL の単発登録と CLI `author` の継続追跡は別機能。`Downloader::author_works` / `AuthorListing` が作品列挙・複数ログインの試行・ページ送り・シリーズ所属作品の除外を共有し、サイト固有の規則は YAML / preprocess DSL に置く。小説・シリーズの URL 判定を優先するため、Pixiv のシリーズを作者一覧として展開しない
 - R18 なろうの作者はプロフィールの最新作だけでなく、`/mypage/novellist/xid/<作者ID>/` の全作品一覧を `author_api_url` から取得し、DSL / `author_next_pattern` で次ページを辿る。単発の一括取得と継続追跡で同じ列挙経路を使う
-- ノベルアップ＋ (`webnovel/novelup.plus.yaml`, version 1.2) は作品・各話 URL と作者プロフィール／作品一覧 URL に対応する。章・目次のページ送り・本文の改行・作品情報・作者一覧のページ送りは YAML / preprocess DSL で処理する。初期の最低取得間隔は 20 秒だが、ブラウザ確認や CAPTCHA の回避を保証する値ではない。公開短編の取得・再更新・EPUB 出力と作者一覧は実サイト確認済み。連載は手動のブラウザ確認後に 5 話まで取得したが、6 話目が HTTP 403 で停止し、全話取得・再更新・出力は未確認。
+- ノベルアップ＋ (`webnovel/novelup.plus.yaml`, version 1.3) は作品・各話 URL と作者プロフィール／作品一覧 URL に対応する。章・目次のページ送り・本文の改行・作品情報・作者一覧のページ送りは YAML / preprocess DSL で処理する。初期の最低取得間隔は 20 秒で、ブラウザ確認や CAPTCHA の回避を保証する値ではない。公開短編の取得・再更新・EPUB 出力と作者一覧は実サイト確認済み。Native の `NAROU_RS_BROWSER_TOKEN=1` とブラウザに合わせた UA で、連載 `759726165` の 67 話取得・再更新（更新なし）・Kobo EPUB 出力を確認した。途中の確認要求では正規 SDK のトークンを 1 回取り直して継続し、出力の全話目次・先頭／末尾の本文・ZIP/ XML も確認した。CAPTCHA やサイト側の別ルールまで通過を保証するものではない。
 - 認証による部分一覧の補完に失敗しても、先に取得できた一覧とその資格情報を維持する。任意のログイン候補の 404・後続目次のログイン壁・通信エラーを理由に既存作品を削除・非公開扱いへ変えない。利用可能な一覧を一度も得られない場合の従来のエラー処理は維持する
 - 新規取得したセクションは解析済みの本文・前書き・後書きに加え、既定では raw HTML も `illust_grep_pattern` の検索対象にしてサイト固有マークアップ内の挿絵を先取り保存する。取得ページが空の本文枠と UI 画像だけの場合は、サイト定義の `illust_from_raw: false` で解析済み本文・前後書きだけに限定できる（アルファポリスで使用）。未更新セクションは従来どおり保存済み section のみを検索する
 - サイト定義に `illust_grep_pattern` が無いサイト (なろう / R18なろう / カクヨム / Arcadia) は narou.rb `HTML#initialize` の既定 `<img>` パターン (`downloader::DEFAULT_ILLUST_GREP_PATTERN`) で挿絵を先取り保存する。既定パターンでは URL でない注記 (相対パス) は対象外にし、挿絵 URL の protocol-relative (`//host/...`) は本文のスキームで解決し、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない (2026-10-08 修正)
@@ -439,6 +439,10 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 
 **取得用 bin**: `narou_rs_login` は小説・作者・トップページの URL、サイト名、親ドメインも受理し、通常は YAML の `login_url` を開く。`login_wall_error: login` のサイトに対象作品 URL を渡した場合は、その作品ページを開いてブラウザ確認を行えるようにする。アルファポリスは `narou_rs_login alphapolis.co.jp --name 本垢` で取得できる。対象作品の保存後確認は共通の取得・YAML 前処理と設定済み `user-agent` を使い、HTTP エラーやログイン壁を成功表示しない。Cookie の保存だけで WAF 通過や閲覧権限を保証するものではない。
 
+`narou_rs_login <作品URL> --browser-token` は、サイト定義の `browser_token` (`script_url` / `function` / `cookie_name`) を使って、隔離ブラウザ内でサイトの正規 SDK を読み込み、確認トークンを準備してから保存する。トークンを復号・偽造せず、SDK 名や Cookie 名は Rust に固定しない。設定が無いサイトでは明示的に失敗する。`--port` 未指定の場合、このモードに限り空き非 0 ポートを使う。確認・ログインが済んだら Enter で保存し、その後に実際の取得で有効性を確認する。CAPTCHA が表示された場合は手動操作が必要で、トークンの発行だけで取得成功や有効期間を保証しない。
+
+Native の連続取得では `NAROU_RS_BROWSER_TOKEN=1` を指定すると、既知のブラウザ確認で止まった時だけ同梱 `narou_rs_login` を呼び、正規 SDK のトークンを取り直して同じ取得を再試行する（既定は無効、Chromium 系ブラウザが必要）。常駐ブラウザにはせず、目次取得では 1 回、本文は各話につき 1 回までに制限する。保存済みアカウントの Cookie・ログイン ID・名前・順序を維持し、トークンだけを更新する。確認が完了しなければ従来の認証エラーで止まり、CAPTCHA の自動解読や通過保証は行わない。Worker ではブラウザを起動しない。
+
 カクヨムは `narou_rs_login kakuyomu.jp --name NEXT`、または対象作品 URL の指定で `/auth/login` を開く。NEXT の有料部分にはアカウントの閲覧権も必要で、ログイン済みというだけで取得可能とは判定しない。未ログイン・権利なしでは警告付きで無料分を取得し、保存済みの話を欠く部分一覧では更新を見送って既存データを保持する。
 
 **保存形式**: `login_cookie` inventory (SQLite `app_state` / `.narou/login_cookie.yaml`) に、**1 サイト = 順序つきログイン配列** (`LoginGroup { id, site, label, cookies: [{ host, cookie }], added_at }` の JSON 配列) を `enc:v1:<nonce>:<payload>` として暗号化保存。並び順がそのまま試行順になる。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。在庫のキー (サイト名) を AEAD の associated data に束ねるため別サイトへの流用は不可。旧形式の平文値はそのまま読め (ホスト名で束ねた旧暗号文も可)、次回保存時にサイト単位の新形式へ移行する。
@@ -461,7 +465,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 
 **書き出しの保護**: `--passphrase` は 8 文字以上を要求し、空文字・短すぎる値では書き出さない (取り込みは旧ファイル互換のため任意長のパスフレーズを受け付ける)。書き出しファイルは Unix では 0600 で作成し、既存のシンボリックリンクは追従しない。
 
-**ブラウザ取得**: `narou_rs_login` は `--remote-debugging-port=0` で起動し、`<profile>/DevToolsActivePort` と `/json/version` の WebSocket URL が起動したブラウザの port/host/path と一致することを確認してから Cookie を取得する (`--port` で固定ポートを明示した場合も port 一致を確認)。接続・ハンドシェイク・送受信に待機上限を置き、応答しない DevTools によって取得が待ち続けないようにする。取得後は Cookie 配列を複製せずに処理し、起動したブラウザの終了を待ってからプロファイルを片付ける。
+**ブラウザ取得**: 既定は `--remote-debugging-port=0` で起動し、`<profile>/DevToolsActivePort` と `/json/version` の WebSocket URL が起動したブラウザの port/host/path と一致することを確認してから Cookie を取得する。`--port` の明示指定や `--browser-token` の非 0 ポートでも、起動した子プロセス自身の stderr に通知された Browser エンドポイントの port/host/path と照合し、同じポートの別プロセスへ接続しない。起動通知の読み取り・接続・ハンドシェイク・送受信にはサイズと待機上限を置く。取得後は Cookie 配列を複製せずに処理し、ブラウザの終了を待ってからプロファイルを片付ける。
 
 **ヘルプ**: トップレベル一覧と `narou login -h` は実装と同期している。`-h` の `<sub>` 一覧は `list`/`import`/`export`/`rename`/`order`/`clear` を、Examples は `rename`・`order`・`clear --index` を含む主要形を、オプション一覧は `--passphrase`/`--replace`/`--clear-text`/`--name`/`--index` を表示する。
 **Web UI**: 設定ページ「ログイン」タブで一覧 (サイト → 名前つきログイン)・取り込み (名前欄つき。空欄ならファイル名を使用)・名前変更・並べ替え (上下ボタン)・1 件削除・サイト削除・全削除。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET /api/login`、`POST /api/login/import`、`POST /api/login/rename`、`POST /api/login/order`、`DELETE /api/login`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}`。

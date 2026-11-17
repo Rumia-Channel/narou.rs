@@ -27,6 +27,9 @@ use crate::platform::cookie_store::{
 };
 use crate::platform::{CookieStore, LoginGroup, PlatformFuture};
 
+#[path = "browser_token_refresh.rs"]
+mod browser_token_refresh;
+
 /// Ordered site logins and the sites encrypted at rest in the same snapshot.
 pub type LoginGroupsWithEncryption = (BTreeMap<String, Vec<LoginGroup>>, BTreeSet<String>);
 
@@ -300,6 +303,38 @@ impl CookieStore for InventoryCookieStore {
             let changed = renew_sent_login(map, &sent_cookie, &set_cookie);
             Ok((changed, changed))
         }))
+    }
+
+    /// Renew the browser-issued token of a login.
+    ///
+    /// The renewal starts a browser, so it stays off until the environment
+    /// asks for it: without the opt-in nothing is launched and nothing is
+    /// read. The token itself is never part of an error message; only the
+    /// request that follows tells whether the site accepted it.
+    fn refresh_browser_token<'a>(
+        &'a self,
+        site: &'a str,
+        target_url: &'a str,
+        cookie_name: &'a str,
+        session_id: Option<&'a str>,
+    ) -> PlatformFuture<'a, Result<Option<LoginGroup>>> {
+        if !browser_token_refresh::opted_in() {
+            return Box::pin(async { Ok(None) });
+        }
+        let this = self.clone();
+        let site = site.to_string();
+        let target_url = target_url.to_string();
+        let cookie_name = cookie_name.to_string();
+        let session_id = session_id.map(str::to_string);
+        run_blocking(move || {
+            browser_token_refresh::refresh(
+                &this,
+                &site,
+                &target_url,
+                &cookie_name,
+                session_id.as_deref(),
+            )
+        })
     }
 }
 

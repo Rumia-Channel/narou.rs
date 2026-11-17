@@ -1575,6 +1575,9 @@ impl Downloader {
         // ログイン壁 (サイトのログインページやブラウザ確認の応答) が残った
         // ときは、保存済みログインを順に試す。保存された cookie が無いサイトは
         // 従来どおり匿名のまま失敗する。
+        // 目次を読む間は失効したトークンの更新を一度だけ試す (更新した
+        // トークンでも壁が残るなら、保存済みログインを従来どおり試す)。
+        auth.reset_token_refresh();
         let toc_source = self
             .recover_toc_page(&mut setting, &mut auth, &toc_url, toc_source)
             .await;
@@ -2675,6 +2678,74 @@ impl Downloader {
         true
     }
 
+    /// Renew the browser-issued token and send the refreshed credential.
+    ///
+    /// Returns `false` when no fresh token was obtained; the caller then
+    /// keeps its legacy behavior of walking the stored candidates.
+    async fn renew_token(
+        &mut self,
+        setting: &mut SiteSetting,
+        auth: &mut AuthState,
+        target_url: &str,
+    ) -> bool {
+        // The result is bound before the credential is written: the request
+        // for the new token must be over before the login changes.
+        let refreshed = self.refresh_browser_token(&*setting, auth, target_url).await;
+        match refreshed {
+            Some(group) => auth.apply_refreshed(&mut *setting, group),
+            None => false,
+        }
+    }
+
+    /// Ask the store for a fresh browser-issued token of the site.
+    ///
+    /// The store answers `None` when the capability is unavailable (the
+    /// storage only adapters) or when the site defines no browser token, so
+    /// the caller keeps its legacy behavior of walking the stored
+    /// candidates. A failure is reported and treated as "no token": the
+    /// stored candidates may still work.
+    ///
+    /// Only the site that defines a browser token is asked, and only after a
+    /// known authentication or browser-verification failure.
+    async fn refresh_browser_token(
+        &self,
+        setting: &SiteSetting,
+        auth: &mut AuthState,
+        target_url: &str,
+    ) -> Option<LoginGroup> {
+        let cookies = self.cookies.as_ref()?;
+        let config = setting.browser_token.as_ref()?;
+        // One renewal per logical operation: a renewed token that is still
+        // rejected must not start another one.
+        if !auth.claim_token_refresh() {
+            return None;
+        }
+        if auth.groups().is_none() {
+            let groups = self.stored_groups_for(setting).await;
+            auth.set_groups(groups);
+        }
+        // The login in effect is the one whose token is renewed; without one
+        // the store picks the login that carries the token.
+        let session_id = auth
+            .active()
+            .and_then(|login| (!login.id.is_empty()).then_some(login.id.as_str()));
+        let renewed = cookies
+            .refresh_browser_token(&setting.domain, target_url, &config.cookie_name, session_id)
+            .await;
+        match renewed {
+            Ok(Some(group)) => {
+                self.report_line(messages::download::browser_token_retry()).await;
+                Some(group)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                self.report_warn(&messages::download::token_refresh_failed(&error))
+                    .await;
+                None
+            }
+        }
+    }
+
     /// Fetch the table of contents, retrying with the stored logins while the
     /// site answers with a login wall.
     ///
@@ -2683,6 +2754,10 @@ impl Downloader {
     /// fetched again for every credential, so a wall never leaves a half
     /// fetched table of contents behind. When no stored login works, the
     /// site's wall error is returned.
+    ///
+    /// A browser-issued token is renewed once before the stored candidates
+    /// are walked, because an expired token is not fixed by another stored
+    /// login.
     async fn recover_toc_page(
         &mut self,
         setting: &mut SiteSetting,
@@ -2691,14 +2766,20 @@ impl Downloader {
         mut toc_source: Result<String>,
     ) -> Result<String> {
         loop {
-            let wall = match &toc_source {
-                Ok(source) => setting.is_login_wall(source),
-                Err(error) => is_auth_failure(error),
+            let (wall, renewable) = match &toc_source {
+                Ok(source) => {
+                    let wall = setting.is_login_wall(source);
+                    (wall, wall)
+                }
+                // A missing page is not a token problem; only a
+                // browser-verification answer is.
+                Err(error) => (is_auth_failure(error), is_login_required(error)),
             };
             if !wall {
                 return toc_source;
             }
-            if !self.try_next_login(setting, auth).await {
+            let renewed = renewable && self.renew_token(setting, auth, toc_url).await;
+            if !renewed && !self.try_next_login(setting, auth).await {
                 return match toc_source {
                     Ok(_) => Err(setting.login_wall_failure()),
                     Err(error) => Err(error),
@@ -2793,8 +2874,10 @@ impl Downloader {
                 Ok(page) => page,
                 Err(error) if is_auth_failure(&error) => {
                     // ページが無い / ブラウザ確認の答えなら、次の保存済み
-                    // ログインで読み直す。
-                    if !self.try_next_login(setting, auth).await {
+                    // ログインで読み直す。失効したトークンは先に更新する。
+                    let renewed = is_login_required(&error)
+                        && self.renew_token(setting, auth, toc_url).await;
+                    if !renewed && !self.try_next_login(setting, auth).await {
                         return Err(error);
                     }
                     continue;
@@ -2802,7 +2885,8 @@ impl Downloader {
                 Err(error) => return Err(error),
             };
             if setting.is_login_wall(&page) {
-                if !self.try_next_login(setting, auth).await {
+                let renewed = self.renew_token(setting, auth, toc_url).await;
+                if !renewed && !self.try_next_login(setting, auth).await {
                     return Err(setting.login_wall_failure());
                 }
                 continue;
@@ -2814,8 +2898,10 @@ impl Downloader {
                 Ok(attempt) => return Ok(attempt),
                 Err(error) if is_auth_failure(&error) => {
                     // 続きのページが壁だった場合も、次のログインで最初の一
-                    // ページから読み直す。
-                    if !self.try_next_login(setting, auth).await {
+                    // ページから読み直す。失効したトークンは先に更新する。
+                    let renewed = is_login_required(&error)
+                        && self.renew_token(setting, auth, toc_url).await;
+                    if !renewed && !self.try_next_login(setting, auth).await {
                         return Err(error);
                     }
                     continue;
@@ -2857,8 +2943,10 @@ impl Downloader {
                 }
             };
             if attempt.listing.wall {
-                // 壁が残った。保存済みログインを順に試す。
-                if !self.try_next_login(setting, auth).await {
+                // 壁が残った。失効したトークンを先に更新し、それもだめなら
+                // 保存済みログインを順に試す。
+                let renewed = self.renew_token(setting, auth, toc_url).await;
+                if !renewed && !self.try_next_login(setting, auth).await {
                     auth.restore(setting, original.as_ref());
                     return best.ok_or_else(|| setting.login_wall_failure());
                 }
@@ -2899,6 +2987,9 @@ impl Downloader {
     ///
     /// The login that works stays in effect for the remaining bodies and is
     /// recorded with the novel, so later runs start with it.
+    ///
+    /// Every body may renew the browser-issued token once, so a long work can
+    /// renew it again after the site invalidated it.
     async fn download_section_with_logins(
         &mut self,
         setting: &mut SiteSetting,
@@ -2906,6 +2997,9 @@ impl Downloader {
         subtitle: &SubtitleInfo,
         toc_url: &str,
     ) -> Result<(SectionElement, String)> {
+        // The renewal budget belongs to this body: the next body starts with
+        // a fresh one.
+        auth.reset_token_refresh();
         loop {
             let attempt = download_section(
                 self.http.as_ref(),
@@ -2920,7 +3014,9 @@ impl Downloader {
             match attempt {
                 Ok(section) => return Ok(section),
                 Err(error) if is_login_required(&error) => {
-                    if !self.try_next_login(setting, auth).await {
+                    let body_url = build_section_url(&*setting, toc_url, &subtitle.href);
+                    let renewed = self.renew_token(setting, auth, &body_url).await;
+                    if !renewed && !self.try_next_login(setting, auth).await {
                         return Err(error);
                     }
                 }

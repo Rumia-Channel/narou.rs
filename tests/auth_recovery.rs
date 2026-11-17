@@ -56,6 +56,17 @@ fn site_yaml(login_wall_error: Option<&str>) -> String {
     yaml
 }
 
+/// The site definition of a site that issues its token through a browser.
+///
+/// The downloader may renew the token when the site rejects the stored one.
+fn site_yaml_with_token(login_wall_error: Option<&str>) -> String {
+    let mut yaml = site_yaml(login_wall_error);
+    yaml.push_str(
+        "browser_token:\n  script_url: https://example.com/challenge.js\n  function: AwsWafIntegration.getToken\n  cookie_name: waf-token\n",
+    );
+    yaml
+}
+
 const TOC_URL: &str = "https://example.com/novel/n1234ab/";
 const TOC_PAGE2_URL: &str = "https://example.com/novel/n1234ab/page/2";
 const BODY1_URL: &str = "https://example.com/novel/n1234ab/1/";
@@ -85,6 +96,8 @@ struct Fixture {
     reject_all: AtomicBool,
     /// Whether every request fails with a plain server error.
     server_error: bool,
+    /// Whether every request answers with a missing page.
+    not_found: bool,
     /// Every request the server saw.
     seen: std::sync::Mutex<Vec<Seen>>,
 }
@@ -98,6 +111,7 @@ impl Fixture {
             accepted: None,
             reject_all: AtomicBool::new(false),
             server_error: false,
+            not_found: false,
             seen: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -124,6 +138,12 @@ impl Fixture {
 
     fn with_server_error(mut self) -> Self {
         self.server_error = true;
+        self
+    }
+
+    /// Answer every request with a missing page.
+    fn with_not_found(mut self) -> Self {
+        self.not_found = true;
         self
     }
 
@@ -181,6 +201,13 @@ impl HttpClient for Fixture {
                     body: Vec::new(),
                 });
             }
+            if self.not_found {
+                return Ok(HttpResponse {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                });
+            }
             let authorized = self
                 .accepted
                 .as_ref()
@@ -229,10 +256,186 @@ impl HttpClient for Fixture {
     }
 }
 
+/// What the site answers with when the stored login is used.
+#[derive(Clone, Copy, Debug)]
+enum Failure {
+    NotFound,
+    LaterWall,
+    ServerError,
+}
+
+/// A server whose table of contents is complete only for an anonymous
+/// request, and fails for every stored login.
+struct PartialFixture {
+    inner: Arc<Fixture>,
+    partial: AtomicBool,
+    failure: Failure,
+}
+
+impl HttpClient for PartialFixture {
+    fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
+        Box::pin(async move {
+            let is_toc = request.url == TOC_URL;
+            let authenticated = request.header("Cookie").is_some();
+            let mut response = self.inner.send(request).await?;
+            if is_toc && self.partial.load(Ordering::SeqCst) {
+                if !authenticated {
+                    response = html(&format!("{}login_partial::1", toc_page(false)));
+                } else {
+                    match self.failure {
+                        Failure::LaterWall => response = html(&toc_page(true)),
+                        Failure::NotFound | Failure::ServerError => {
+                            response.status = match self.failure {
+                                Failure::NotFound => 404,
+                                _ => 500,
+                            };
+                            response.body.clear();
+                        }
+                    }
+                }
+            }
+            Ok(response)
+        })
+    }
+
+    fn send_stream<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> PlatformFuture<'a, Result<narou_rs::platform::HttpStreamResponse>> {
+        self.inner.send_stream(request)
+    }
+}
+
+/// How the fixture answers a body request.
+#[derive(Clone, Copy)]
+enum BodyMode {
+    /// The body needs the token the server expects.
+    Token,
+    /// The body always answers with the login wall.
+    Wall,
+}
+
+/// A server that accepts only the browser token it currently expects.
+///
+/// The site invalidates the token in the middle of the work: the table of
+/// contents is read with one token and the bodies need the next one.
+struct TokenFixture {
+    /// The cookie fragment the server accepts now.
+    expected: std::sync::Mutex<String>,
+    /// The cookie fragment the server accepts once the bodies are read.
+    body_expected: std::sync::Mutex<Option<String>>,
+    /// Whether the table of contents needs the accepted token.
+    toc_needs_token: bool,
+    /// How the bodies are answered.
+    body_mode: BodyMode,
+    /// Every request the server saw.
+    seen: std::sync::Mutex<Vec<Seen>>,
+}
+
+impl TokenFixture {
+    fn new(expected: &str) -> Self {
+        Self {
+            expected: std::sync::Mutex::new(expected.to_string()),
+            body_expected: std::sync::Mutex::new(None),
+            toc_needs_token: true,
+            body_mode: BodyMode::Token,
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The token the server expects for the bodies.
+    fn with_body_token(self, token: &str) -> Self {
+        *self.body_expected.lock().expect("body token") = Some(token.to_string());
+        self
+    }
+
+    /// The table of contents is public.
+    fn with_public_toc(mut self) -> Self {
+        self.toc_needs_token = false;
+        self
+    }
+
+    /// The bodies always answer with the login wall.
+    fn with_walled_bodies(mut self) -> Self {
+        self.body_mode = BodyMode::Wall;
+        self
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().expect("request log").clone()
+    }
+
+    fn count_with_cookie(&self, url: &str, cookie: &str) -> usize {
+        self.seen()
+            .iter()
+            .filter(|seen| seen.url == url && seen.cookie.contains(cookie))
+            .count()
+    }
+}
+
+impl HttpClient for TokenFixture {
+    fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
+        Box::pin(async move {
+            let cookie = request.header("Cookie").unwrap_or("").to_string();
+            self.seen.lock().expect("request log").push(Seen {
+                url: request.url.clone(),
+                cookie: cookie.clone(),
+            });
+            let expected = self.expected.lock().expect("expected token").clone();
+            let authorized = cookie.contains(&expected);
+            let response = if request.url == TOC_URL {
+                if self.toc_needs_token && !authorized {
+                    html(LOGIN_WALL)
+                } else {
+                    html(&toc_page(false))
+                }
+            } else if request.url == BODY1_URL || request.url == BODY2_URL {
+                // The site invalidates the token before the bodies are read.
+                if let Some(next) = self.body_expected.lock().expect("body token").take() {
+                    *self.expected.lock().expect("expected token") = next;
+                }
+                let expected = self.expected.lock().expect("expected token").clone();
+                match self.body_mode {
+                    BodyMode::Token if cookie.contains(&expected) => {
+                        html(r#"<div class="body">本文</div>"#)
+                    }
+                    _ => html(LOGIN_WALL),
+                }
+            } else {
+                return Err(NarouError::Http(format!(
+                    "unexpected fixture request: {}",
+                    request.url
+                )));
+            };
+            Ok(response)
+        })
+    }
+
+    fn send_stream<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> PlatformFuture<'a, Result<narou_rs::platform::HttpStreamResponse>> {
+        let url = request.url.clone();
+        Box::pin(async move {
+            let response = self.send(request).await?;
+            Ok(narou_rs::platform::HttpStreamResponse {
+                status: response.status,
+                url,
+                headers: response.headers,
+                body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
+            })
+        })
+    }
+}
+
 /// A cookie store that counts how often the stored logins are read.
 struct CountingCookieStore {
     groups: std::sync::Mutex<std::collections::BTreeMap<String, Vec<LoginGroup>>>,
     loads: AtomicUsize,
+    /// The token values handed out on a renewal, in order.
+    handouts: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// How often a browser token was renewed.
+    renewals: AtomicUsize,
 }
 
 impl CountingCookieStore {
@@ -240,12 +443,26 @@ impl CountingCookieStore {
         Self {
             groups: std::sync::Mutex::new(Default::default()),
             loads: AtomicUsize::new(0),
+            handouts: std::sync::Mutex::new(Default::default()),
+            renewals: AtomicUsize::new(0),
         }
     }
 
     /// How often the stored logins were read.
     fn loads(&self) -> usize {
         self.loads.load(Ordering::SeqCst)
+    }
+
+    /// How often a browser token was renewed.
+    fn renewals(&self) -> usize {
+        self.renewals.load(Ordering::SeqCst)
+    }
+
+    /// The token values handed out on a renewal, in order.
+    fn with_handouts(self, values: &[&str]) -> Self {
+        *self.handouts.lock().expect("handouts") =
+            values.iter().map(|value| value.to_string()).collect();
+        self
     }
 }
 
@@ -324,6 +541,65 @@ impl CookieStore for CountingCookieStore {
     ) -> PlatformFuture<'a, Result<bool>> {
         Box::pin(async { Ok(false) })
     }
+
+    /// Hand out the next token and put it into the login in effect.
+    ///
+    /// The account keeps its identity and its other cookies; only the token
+    /// is replaced.
+    fn refresh_browser_token<'a>(
+        &'a self,
+        site: &'a str,
+        _target_url: &'a str,
+        cookie_name: &'a str,
+        session_id: Option<&'a str>,
+    ) -> PlatformFuture<'a, Result<Option<LoginGroup>>> {
+        Box::pin(async move {
+            self.renewals.fetch_add(1, Ordering::SeqCst);
+            let Some(token) = self.handouts.lock().expect("handouts").pop_front() else {
+                return Ok(None);
+            };
+            let mut groups = self.groups.lock().expect("cookie store");
+            let Some(list) = groups.get_mut(site) else {
+                return Ok(None);
+            };
+            let index = session_id
+                .and_then(|id| list.iter().position(|group| group.id == id))
+                .or_else(|| {
+                    list.iter().position(|group| {
+                        group
+                            .cookies
+                            .iter()
+                            .any(|entry| entry.cookie.contains(cookie_name))
+                    })
+                });
+            let Some(index) = index else {
+                return Ok(None);
+            };
+            let group = &mut list[index];
+            for entry in group.cookies.iter_mut() {
+                entry.cookie = replace_cookie_value(&entry.cookie, cookie_name, &token);
+            }
+            Ok(Some(group.clone()))
+        })
+    }
+}
+
+/// Replace one cookie's value and keep the other ones.
+fn replace_cookie_value(header: &str, name: &str, value: &str) -> String {
+    let mut pairs = Vec::new();
+    for part in header.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((key, old)) = part.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = if key == name { value } else { old.trim() };
+        pairs.push(format!("{key}={value}"));
+    }
+    pairs.join("; ")
 }
 
 fn token_group(id: &str, cookie: &str) -> LoginGroup {
@@ -820,51 +1096,21 @@ async fn strong_update_recovers_a_body_login_without_refetching_unchanged_conten
 
 #[tokio::test]
 async fn failed_optional_logins_preserve_the_public_listing_and_its_credentials() {
-    #[derive(Clone, Copy, Debug)]
-    enum Failure {
-        NotFound,
-        LaterWall,
-        ServerError,
-    }
-    struct PartialFixture {
-        inner: Arc<Fixture>,
-        partial: AtomicBool,
-        failure: Failure,
-    }
-    impl HttpClient for PartialFixture {
-        fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
-            Box::pin(async move {
-                let is_toc = request.url == TOC_URL;
-                let authenticated = request.header("Cookie").is_some();
-                let mut response = self.inner.send(request).await?;
-                if is_toc && self.partial.load(Ordering::SeqCst) {
-                    if !authenticated {
-                        response = html(&format!("{}login_partial::1", toc_page(false)));
-                    } else {
-                        match self.failure {
-                            Failure::LaterWall => response = html(&toc_page(true)),
-                            Failure::NotFound | Failure::ServerError => {
-                                response.status = match self.failure {
-                                    Failure::NotFound => 404,
-                                    _ => 500,
-                                };
-                                response.body.clear();
-                            }
-                        }
-                    }
-                }
-                Ok(response)
-            })
-        }
-        fn send_stream<'a>(
-            &'a self,
-            request: HttpRequest,
-        ) -> PlatformFuture<'a, Result<narou_rs::platform::HttpStreamResponse>> {
-            self.inner.send_stream(request)
-        }
-    }
-
     let _serial = PIPELINE.lock().await;
+    optional_logins_preserve_the_public_listing(&site_yaml(None)).await;
+}
+
+/// A site that issues its token through a browser keeps the public listing
+/// too, when the renewal cannot deliver a usable token.
+#[tokio::test]
+async fn a_browser_token_site_keeps_the_public_listing_when_the_renewal_fails() {
+    let _serial = PIPELINE.lock().await;
+    optional_logins_preserve_the_public_listing(&site_yaml_with_token(None)).await;
+}
+
+/// The optional-login flow of a site: an anonymous listing is kept when the
+/// stored login cannot improve it.
+async fn optional_logins_preserve_the_public_listing(site: &str) {
     for failure in [Failure::NotFound, Failure::LaterWall, Failure::ServerError] {
         let temp = scratch_library();
         std::env::set_current_dir(temp.path()).unwrap();
@@ -876,7 +1122,7 @@ async fn failed_optional_logins_preserve_the_public_listing_and_its_credentials(
         });
         let cookies = Arc::new(CountingCookieStore::new());
         cookies.save_groups("example.com", &[token_group("expired", "session=expired")]).await.unwrap();
-        let mut yaml = site_yaml(None).replace(
+        let mut yaml = site.replace(
             r#"(?<href>[^"]+)"#,
             "(?<href>/novel/n1234ab/(?<index>\\d+)/)",
         );
@@ -914,4 +1160,169 @@ async fn failed_optional_logins_preserve_the_public_listing_and_its_credentials(
         }
         assert_eq!(cookies.loads(), 1, "{failure:?}");
     }
+}
+
+/// Two token invalidations in one work are both recovered: the table of
+/// contents and the bodies each get a renewed token.
+#[tokio::test]
+async fn two_token_invalidations_in_one_work_are_both_recovered() {
+    let _serial = PIPELINE.lock().await;
+    let temp = scratch_library();
+    std::env::set_current_dir(temp.path()).expect("enter scratch library");
+    narou_rs::db::init_database().unwrap();
+
+    // The site accepts the first renewed token for the table of contents and
+    // the second one for the bodies.
+    let http = Arc::new(TokenFixture::new("waf-token=fresh1").with_body_token("waf-token=fresh2"));
+    let cookies = Arc::new(CountingCookieStore::new().with_handouts(&["fresh1", "fresh2"]));
+    cookies
+        .save_groups(
+            "example.com",
+            &[token_group("acct", "waf-token=stale; session=abc")],
+        )
+        .await
+        .unwrap();
+    let (mut downloader, repository, _store) =
+        build_downloader(http.clone(), cookies.clone(), &site_yaml_with_token(Some("login")));
+
+    let outcome = downloader.download_novel(TOC_URL).await;
+    let outcome_text = describe(&outcome);
+    assert!(
+        outcome.is_ok(),
+        "the renewed tokens must complete the work, got {outcome_text}"
+    );
+    assert_eq!(cookies.renewals(), 2, "one renewal per invalidation");
+
+    let record = repository.find_by_toc_url(TOC_URL).await.unwrap().unwrap();
+    assert!(record.requires_login);
+    assert_eq!(record.login_session.as_deref(), Some("acct"));
+    assert_eq!(
+        http.count_with_cookie(BODY1_URL, "waf-token=fresh2"),
+        1,
+        "the body must be read with the renewed token"
+    );
+    assert_eq!(http.count_with_cookie(BODY2_URL, "waf-token=fresh2"), 1);
+    for request in http.seen().iter().filter(|seen| seen.url == BODY1_URL) {
+        assert!(
+            request.cookie.contains("session=abc"),
+            "the account keeps its other cookies: {}",
+            request.cookie
+        );
+    }
+
+    // The renewed token is the one that is stored.
+    let stored = cookies.load_groups("example.com").await.unwrap();
+    assert_eq!(stored.len(), 1);
+    let stored_cookie = &stored[0].cookies[0].cookie;
+    assert!(
+        stored_cookie.contains("waf-token=fresh2"),
+        "the renewed token must be stored: {stored_cookie}"
+    );
+    assert!(
+        stored_cookie.contains("session=abc"),
+        "the account keeps its other cookies: {stored_cookie}"
+    );
+}
+
+/// A section the site keeps rejecting is not renewed over and over.
+#[tokio::test]
+async fn a_repeatedly_rejected_section_renews_the_token_only_once() {
+    let _serial = PIPELINE.lock().await;
+    let temp = scratch_library();
+    std::env::set_current_dir(temp.path()).expect("enter scratch library");
+    narou_rs::db::init_database().unwrap();
+
+    // The table of contents is public; the bodies always answer with the
+    // login wall.
+    let http = Arc::new(
+        TokenFixture::new("waf-token=fresh1")
+            .with_public_toc()
+            .with_walled_bodies(),
+    );
+    let cookies = Arc::new(CountingCookieStore::new().with_handouts(&["fresh1", "fresh2"]));
+    cookies
+        .save_groups(
+            "example.com",
+            &[token_group("acct", "waf-token=stale; session=abc")],
+        )
+        .await
+        .unwrap();
+    let (mut downloader, _repository, _store) =
+        build_downloader(http.clone(), cookies.clone(), &site_yaml_with_token(Some("login")));
+
+    let outcome = downloader.download_novel(TOC_URL).await;
+    let outcome_text = describe(&outcome);
+    assert!(
+        matches!(outcome, Err(NarouError::Login(_))),
+        "a rejected body stays an authentication error, got {outcome_text}"
+    );
+    assert_eq!(
+        cookies.renewals(),
+        1,
+        "a rejected body must not renew the token again and again"
+    );
+}
+
+/// A failure that has nothing to do with authentication does not renew the
+/// token of a site that issues one.
+#[tokio::test]
+async fn a_transport_failure_does_not_renew_the_browser_token() {
+    let _serial = PIPELINE.lock().await;
+    let temp = scratch_library();
+    std::env::set_current_dir(temp.path()).expect("enter scratch library");
+    narou_rs::db::init_database().unwrap();
+
+    let http = Arc::new(Fixture::new().with_server_error());
+    let cookies = Arc::new(CountingCookieStore::new().with_handouts(&["fresh1"]));
+    cookies
+        .save_groups("example.com", &[token_group("acct", "waf-token=stale")])
+        .await
+        .unwrap();
+    let (mut downloader, _repository, _store) =
+        build_downloader(http.clone(), cookies.clone(), &site_yaml_with_token(Some("login")));
+
+    let outcome = downloader.download_novel(TOC_URL).await;
+    assert!(
+        matches!(outcome, Err(NarouError::Http(_))),
+        "a server error stays a server error"
+    );
+    assert_eq!(
+        cookies.renewals(),
+        0,
+        "a transport failure must not renew the token"
+    );
+    assert_eq!(
+        cookies.loads(),
+        0,
+        "a transport failure must not read the stored logins"
+    );
+}
+
+/// A missing page is not a token problem, so it is not renewed either.
+#[tokio::test]
+async fn a_missing_page_does_not_renew_the_browser_token() {
+    let _serial = PIPELINE.lock().await;
+    let temp = scratch_library();
+    std::env::set_current_dir(temp.path()).expect("enter scratch library");
+    narou_rs::db::init_database().unwrap();
+
+    let http = Arc::new(Fixture::new().with_not_found());
+    let cookies = Arc::new(CountingCookieStore::new().with_handouts(&["fresh1"]));
+    cookies
+        .save_groups("example.com", &[token_group("acct", "waf-token=stale")])
+        .await
+        .unwrap();
+    let (mut downloader, _repository, _store) =
+        build_downloader(http.clone(), cookies.clone(), &site_yaml_with_token(Some("login")));
+
+    let outcome = downloader.download_novel(TOC_URL).await;
+    assert!(
+        matches!(outcome, Err(NarouError::NotFound(_))),
+        "a missing page keeps its meaning"
+    );
+    assert_eq!(
+        cookies.renewals(),
+        0,
+        "a missing page must not renew the token"
+    );
 }

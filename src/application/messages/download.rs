@@ -167,6 +167,19 @@ pub fn login_retry() -> &'static str {
     "ログインが必要な可能性があります。保存済みのログイン情報で再試行します"
 }
 
+/// トークン更新後の再試行通知。サーバーが受け付けたという意味ではない。
+pub fn browser_token_retry() -> &'static str {
+    "ブラウザ確認トークンを更新しました。取得を再試行します"
+}
+
+/// ブラウザ発行トークンの更新に失敗したときの警告 (stderr)。
+///
+///  更新できたこと自体はサーバーへの受理を意味しないので、更新の失敗だけを
+/// 伝える。
+pub fn token_refresh_failed(error: impl Display) -> String {
+    format!("WARN: ブラウザのトークンを更新できませんでした: {error}")
+}
+
 /// 閲覧制限付きの部分目次で取得する範囲。
 pub fn partial_listing(available: usize) -> String {
     format!("閲覧制限があるため、現在閲覧できる {available} 話のみを取得します")

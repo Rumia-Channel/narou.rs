@@ -21,11 +21,12 @@
 //! library that export is the only output.
 
 use std::borrow::Cow;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -36,6 +37,9 @@ use narou_rs::platform::{HostCookie, LoginGroup};
 use narou_rs::login::build_export;
 use narou_rs::platform::CookieStore;
 use std::collections::BTreeMap;
+
+#[path = "login/browser_token.rs"]
+mod browser_token;
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +59,12 @@ struct Args {
     /// ブラウザのリモートデバッグポート (0 = ブラウザに空きポートを選ばせる)
     #[arg(long, default_value_t = 0)]
     port: u16,
+    /// サイト定義の SDK でブラウザ確認トークンを準備する
+    #[arg(long, conflicts_with = "cookie")]
+    browser_token: bool,
+    /// Private credential-helper protocol (stdout contains the token).
+    #[arg(long, hide = true, requires = "browser_token", conflicts_with_all = ["cookie", "export", "passphrase", "clear_text", "list", "clear"])]
+    token_json: bool,
     /// ログイン完了を待つ秒数
     #[arg(long, default_value_t = 300)]
     timeout: u64,
@@ -100,7 +110,7 @@ fn no_library_message() -> String {
 }
 
 fn run(args: Args) -> std::result::Result<(), String> {
-    let store = InventoryCookieStore::for_current_root().ok();
+    let store = if args.token_json { None } else { InventoryCookieStore::for_current_root().ok() };
 
     if args.list {
         let store = store.ok_or_else(no_library_message)?;
@@ -125,7 +135,13 @@ fn run(args: Args) -> std::result::Result<(), String> {
 
     // Collect the cookies to store or export. A throwaway browser profile (the
     // default) is remembered here and removed once the cookies are safe.
-    let user_agent = narou_rs::compat::load_local_setting_string("user-agent");
+    let user_agent = if args.token_json { None } else { narou_rs::compat::load_local_setting_string("user-agent") };
+    let mut token_profile = if args.token_json && args.profile.is_none() {
+        Some(narou_rs::native::browser_profile::BrowserProfile::new()
+            .map_err(|_| "ブラウザ確認用の一時プロファイルを作成できません".to_string())?)
+    } else {
+        None
+    };
     let mut throwaway_profile: Option<PathBuf> = None;
     let captured: BTreeMap<String, String> = if let Some(cookie) = args.cookie.as_deref() {
         let host = hosts
@@ -134,37 +150,65 @@ fn run(args: Args) -> std::result::Result<(), String> {
             .clone();
         BTreeMap::from([(host, cookie.to_string())])
     } else {
-        let login_url = browser_start_url(&site, &target);
-        println!("{login_url} をブラウザで開きます。ログインが終わったら Enter を押してください。");
+        if args.browser_token && site.browser_token.is_none() {
+            return Err("このサイトにはブラウザトークン取得が定義されていません".to_string());
+        }
+        let login_url = if args.browser_token && site.matches_url(&target) {
+            Cow::Borrowed(target.as_str())
+        } else {
+            browser_start_url(&site, &target)
+        };
+        if !args.token_json {
+            println!("{login_url} をブラウザで開きます。確認・ログインが終わったら Enter を押してください。");
+        }
+        // Port 0 advertises WebDriver automation in Chromium. This explicit
+        // token mode uses a free nonzero port, authenticated by the child's
+        // own endpoint announcement before any cookies are read.
+        let port = if args.browser_token && args.port == 0 {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .map_err(|_| "ブラウザの起動ポートを確保できません".to_string())?;
+            listener.local_addr()
+                .map_err(|_| "ブラウザの起動ポートを確認できません".to_string())?.port()
+        } else {
+            args.port
+        };
 
         let browser = args.browser.clone().or_else(find_browser).ok_or_else(|| {
             "Chromium 系ブラウザが見つかりませんでした。--browser でパスを指定するか、--cookie で Cookie 文字列を渡してください"
                 .to_string()
         })?;
-        let profile = profile_dir(args.profile.as_deref());
+        let profile = token_profile.as_ref().map_or_else(
+            || profile_dir(args.profile.as_deref()), |profile| profile.path().to_path_buf(),
+        );
         std::fs::create_dir_all(&profile)
             .map_err(|error| format!("{} を作成できません: {error}", profile.display()))?;
-        let mut child = launch_browser(&browser, &login_url, args.port, &profile)?;
+        let mut launched = launch_browser(&browser, &login_url, port, &profile)?;
         let captured = match capture_cookies(
-            &mut child,
-            args.port,
+            &mut launched,
             &profile,
             args.timeout,
             &site,
             &hosts,
+            &login_url,
+            if args.token_json { CaptureMode::TokenJson } else if args.browser_token { CaptureMode::BrowserToken } else { CaptureMode::Interactive },
         ) {
             Ok(captured) => captured,
             Err(error) => {
-                stop_browser(&mut child);
-                println!(
-                    "ブラウザプロファイルを残しました: {} (再試行時に使えます)",
-                    profile.display()
-                );
+                stop_browser(&mut launched.child);
+                if !args.token_json {
+                    println!(
+                        "ブラウザプロファイルを残しました: {} (再試行時に使えます)",
+                        profile.display()
+                    );
+                }
                 return Err(error);
             }
         };
-        stop_browser(&mut child);
-        if args.profile.is_none() {
+        stop_browser(&mut launched.child);
+        if let Some(profile) = token_profile.take() {
+            profile.close().map_err(|_| "ブラウザ確認用の一時プロファイルを削除できません".to_string())?;
+        }
+        if args.profile.is_none() && !args.token_json {
             throwaway_profile = Some(profile);
         }
         captured.into_iter().collect()
@@ -172,6 +216,14 @@ fn run(args: Args) -> std::result::Result<(), String> {
 
     if captured.is_empty() {
         return Err("Cookie を取得できませんでした".to_string());
+    }
+
+    if args.token_json {
+        let config = site.browser_token
+            .ok_or_else(|| "ブラウザトークン取得の定義がありません".to_string())?;
+        let response = browser_token_response(site.domain, config.cookie_name, &target, captured)?;
+        return serde_json::to_writer(std::io::stdout().lock(), &response)
+            .map_err(|_| "確認トークンを呼び出し元へ渡せません".to_string());
     }
 
     // Outside a library the export is the only output; inside one it is
@@ -198,6 +250,51 @@ fn run(args: Args) -> std::result::Result<(), String> {
     Ok(())
 }
 
+fn browser_token_response(
+    site: String,
+    cookie_name: String,
+    target: &str,
+    mut cookies: BTreeMap<String, String>,
+) -> std::result::Result<narou_rs::platform::cookie_store::BrowserTokenResponse, String> {
+    let host = cookie_host_for_url(target)
+        .ok_or_else(|| "ブラウザトークン取得には対象 URL が必要です".to_string())?;
+    let allowed_hosts = narou_rs::platform::cookie_store::cookie_lookup_hosts(&host);
+    cookies.retain(|host, header| {
+        allowed_hosts.iter().any(|allowed| allowed == host)
+            && retain_token_cookie(header, &cookie_name)
+    });
+    if cookies.is_empty() {
+        return Err("対象 URL の確認トークンを取得できませんでした".to_string());
+    }
+    Ok(narou_rs::platform::cookie_store::BrowserTokenResponse {
+        version: narou_rs::platform::cookie_store::BROWSER_TOKEN_RESPONSE_VERSION,
+        site,
+        cookie_name,
+        cookies,
+    })
+}
+
+fn retain_token_cookie(header: &mut String, wanted: &str) -> bool {
+    let mut offset = 0;
+    let mut selected = None;
+    for part in header.split(';') {
+        let trimmed = part.trim();
+        if trimmed.split_once('=').is_some_and(|(name, value)| name == wanted && !value.is_empty()) {
+            let start = offset + part.len() - part.trim_start().len();
+            selected = Some((start, start + trimmed.len()));
+            break;
+        }
+        offset += part.len() + 1;
+    }
+    if let Some((start, end)) = selected {
+        header.truncate(end);
+        drop(header.drain(..start));
+        true
+    } else {
+        false
+    }
+}
+
 fn browser_start_url<'a>(site: &SiteSetting, target: &'a str) -> Cow<'a, str> {
     if matches!(site.login_wall_error, narou_rs::downloader::site_setting::LoginWallError::Login)
         && site.matches_url(target)
@@ -209,6 +306,9 @@ fn browser_start_url<'a>(site: &SiteSetting, target: &'a str) -> Cow<'a, str> {
 }
 
 fn stop_browser(child: &mut Child) {
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        let _ = narou_rs::compat::terminate_process(child.id());
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -229,7 +329,9 @@ fn profile_dir(override_dir: Option<&Path>) -> PathBuf {
 
 /// Remove a throwaway browser profile once the cookies are safely stored.
 fn cleanup_profile(profile: &Path) {
-    let _ = std::fs::remove_dir_all(profile);
+    if narou_rs::native::browser_profile::remove(profile).is_err() {
+        eprintln!("WARN: ブラウザの一時プロファイルを削除できませんでした");
+    }
 }
 
 /// One request with the captured cookies, mirroring the downloader's login-wall
@@ -442,6 +544,19 @@ fn site_hosts(site: &SiteSetting, target: &str) -> Vec<String> {
     hosts
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptureMode {
+    Interactive,
+    BrowserToken,
+    TokenJson,
+}
+
+struct BrowserProcess {
+    child: Child,
+    endpoint: Option<Receiver<String>>,
+    port: u16,
+}
+
 /// Launch the browser with remote debugging enabled and the login page open.
 ///
 /// `port == 0` lets the browser pick a free port; it reports the choice in
@@ -453,34 +568,66 @@ fn launch_browser(
     login_url: &str,
     port: u16,
     profile: &Path,
-) -> std::result::Result<Child, String> {
+) -> std::result::Result<BrowserProcess, String> {
     if port == 0 {
         let _ = std::fs::remove_file(profile.join(DEVTOOLS_ACTIVE_PORT_FILE));
     }
-    Command::new(browser)
+    let mut child = Command::new(browser)
         .arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", profile.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg(login_url)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(if port == 0 { Stdio::null() } else { Stdio::piped() })
         .spawn()
-        .map_err(|error| format!("ブラウザの起動に失敗しました: {error}"))
+        .map_err(|error| format!("ブラウザの起動に失敗しました: {error}"))?;
+    if port == 0 {
+        return Ok(BrowserProcess { child, endpoint: None, port });
+    }
+    let Some(mut stderr) = child.stderr.take() else {
+        stop_browser(&mut child);
+        return Err("ブラウザの DevTools 起動通知を取得できません".to_string());
+    };
+    let (reported, endpoint) = mpsc::sync_channel(1);
+    if std::thread::Builder::new().name("narou-browser-endpoint".to_string()).spawn(move || {
+        if let Some(websocket) = read_browser_endpoint(&mut stderr) {
+            let _ = reported.send(websocket);
+        }
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+    }).is_err() {
+        stop_browser(&mut child);
+        return Err("ブラウザの DevTools 起動通知を待機できません".to_string());
+    }
+    Ok(BrowserProcess { child, endpoint: Some(endpoint), port })
 }
 
 /// Poll the browser's cookies until the user finishes signing in.
 fn capture_cookies(
-    child: &mut Child,
-    port: u16,
+    browser: &mut BrowserProcess,
     profile: &Path,
     timeout: u64,
     site: &SiteSetting,
     hosts: &[String],
+    target_url: &str,
+    mode: CaptureMode,
 ) -> std::result::Result<Vec<(String, String)>, String> {
-    let websocket_url = wait_for_devtools(child, port, profile, Duration::from_secs(30))?;
+    let websocket_url = wait_for_devtools(
+        &mut browser.child, browser.endpoint.as_ref(), browser.port, profile, Duration::from_secs(30),
+    )?;
+    if mode != CaptureMode::Interactive {
+        let config = site.browser_token.as_ref()
+            .ok_or_else(|| "このサイトにはブラウザトークン取得が定義されていません".to_string())?;
+        browser_token::prepare_token(&websocket_url, config, target_url)?;
+        if mode != CaptureMode::TokenJson {
+            println!("ブラウザの確認トークンを準備しました。確認が終わったら Enter で保存します。");
+        }
+    }
     let mut socket = connect_devtools(&websocket_url, Duration::from_secs(5))?;
 
+    if mode == CaptureMode::TokenJson {
+        return read_site_cookies(&mut socket, 1, site, hosts);
+    }
     let finished = Arc::new(AtomicBool::new(false));
     {
         let finished = Arc::clone(&finished);
@@ -496,12 +643,7 @@ fn capture_cookies(
     let mut last_summary: Vec<String> = Vec::new();
     loop {
         request_id += 1;
-        let request = serde_json::json!({ "id": request_id, "method": "Storage.getCookies" });
-        socket
-            .send(tungstenite::Message::text(request.to_string()))
-            .map_err(|error| format!("DevTools への送信に失敗しました: {error}"))?;
-        let cookies = read_cookies(&mut socket, request_id)?;
-        let captured = cookies_for_site(&cookies, site, hosts);
+        let captured = read_site_cookies(&mut socket, request_id, site, hosts)?;
         let summary: Vec<String> = captured
             .iter()
             .map(|(host, value)| format!("{host} ({} 件)", value.split(';').count()))
@@ -519,7 +661,7 @@ fn capture_cookies(
             println!("待ち時間が上限に達しました。取得できた Cookie を保存します。");
             return Ok(captured);
         }
-        if child.try_wait().ok().flatten().is_some() {
+        if browser.child.try_wait().ok().flatten().is_some() {
             println!("ブラウザが終了しました。取得できた Cookie を保存します。");
             return Ok(captured);
         }
@@ -527,8 +669,71 @@ fn capture_cookies(
     }
 }
 
+fn read_site_cookies(
+    socket: &mut DevToolsSocket,
+    request_id: u64,
+    site: &SiteSetting,
+    hosts: &[String],
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let request = serde_json::json!({ "id": request_id, "method": "Storage.getCookies" });
+    socket.send(tungstenite::Message::text(request.to_string()))
+        .map_err(|_| "DevTools へ Cookie 取得要求を送信できません".to_string())?;
+    let cookies = read_cookies(socket, request_id)?;
+    Ok(cookies_for_site(&cookies, site, hosts))
+}
+
 /// ブラウザが自動選択した DevTools ポートを書くファイル名 (`<profile>` 直下)。
 const DEVTOOLS_ACTIVE_PORT_FILE: &str = "DevToolsActivePort";
+
+/// Read only the endpoint announcement emitted by the child we started.
+/// Long or invalid diagnostic lines are discarded without growing a buffer.
+fn read_browser_endpoint(reader: &mut impl Read) -> Option<String> {
+    let mut line = [0u8; 4096];
+    let mut used = 0usize;
+    let mut oversized = false;
+    let mut chunk = [0u8; 1024];
+    loop {
+        let count = reader.read(&mut chunk).ok()?;
+        if count == 0 {
+            return (!oversized).then(|| parse_browser_endpoint_line(&line[..used])).flatten();
+        }
+        for &byte in &chunk[..count] {
+            if byte == b'\n' {
+                if !oversized
+                    && let Some(endpoint) = parse_browser_endpoint_line(&line[..used])
+                {
+                    return Some(endpoint);
+                }
+                used = 0;
+                oversized = false;
+            } else if used < line.len() {
+                line[used] = byte;
+                used += 1;
+            } else {
+                oversized = true;
+            }
+        }
+    }
+}
+
+fn parse_browser_endpoint_line(line: &[u8]) -> Option<String> {
+    std::str::from_utf8(line).ok()?.trim()
+        .strip_prefix("DevTools listening on ")
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_owned)
+}
+
+fn reported_browser_endpoint(websocket: &str, requested_port: u16) -> std::result::Result<(u16, String), String> {
+    let parsed = url::Url::parse(websocket)
+        .map_err(|_| "ブラウザの DevTools 起動通知が不正です".to_string())?;
+    let port = parsed.port().filter(|port| *port != 0)
+        .ok_or_else(|| "ブラウザの DevTools 起動通知にポートがありません".to_string())?;
+    if requested_port != 0 && port != requested_port {
+        return Err("ブラウザの DevTools 起動通知が指定ポートと一致しません".to_string());
+    }
+    verify_devtools_websocket(websocket, port, None)?;
+    Ok((port, parsed.path().to_owned()))
+}
 /// ブラウザ用 WebSocket のパス接頭辞。ページ用 (`/devtools/page/...`) ではなく、
 /// ブラウザ全体の Cookie を読む Browser エンドポイントに接続する。
 const DEVTOOLS_BROWSER_PATH: &str = "/devtools/browser/";
@@ -576,8 +781,7 @@ fn fetch_devtools_websocket(client: &reqwest::blocking::Client, port: u16) -> Op
 /// - ポートが期待値 (自動検出したポート / 利用者が指定したポート) と一致する
 ///   こと。固定ポートを先に使っている別プロセスが返す URL を掴まないため。
 /// - パスが `/devtools/browser/...` であること (ページ用ではなく Browser 用)。
-/// - 自動検出時は `<profile>/DevToolsActivePort` が示したパスとも一致すること
-///   (残っていた別ブラウザのファイルを掴まないため)。
+/// - 起動したブラウザの通知または `DevToolsActivePort` のパスとも一致すること。
 fn verify_devtools_websocket(
     websocket: &str,
     expected_port: u16,
@@ -608,10 +812,7 @@ fn verify_devtools_websocket(
     if let Some(expected_path) = expected_path
         && parsed.path() != expected_path
     {
-        return Err(format!(
-            "DevTools の WebSocket パスが {} と一致しません",
-            DEVTOOLS_ACTIVE_PORT_FILE
-        ));
+        return Err("DevTools の WebSocket パスが起動したブラウザと一致しません".to_string());
     }
     Ok(websocket.to_string())
 }
@@ -621,10 +822,11 @@ fn verify_devtools_websocket(
 /// `port == 0` means the browser picked the port itself: it is read from
 /// `<profile>/DevToolsActivePort` (polled with `timeout`), and the endpoint
 /// reported by `/json/version` must have that same loopback port and path.
-/// An explicit port keeps the old wait behavior, but the returned URL's port
-/// must equal the requested one.
+/// An explicit port additionally requires the endpoint announced on the
+/// launched child's stderr, so another local server cannot supply a session.
 fn wait_for_devtools(
     child: &mut Child,
+    endpoint: Option<&Receiver<String>>,
     port: u16,
     profile: &Path,
     timeout: Duration,
@@ -636,10 +838,17 @@ fn wait_for_devtools(
         .map_err(|error| error.to_string())?;
     // 自動検出時は DevToolsActivePort の (ポート, パス)。
     let mut discovered: Option<(u16, String)> = None;
+    let mut reported: Option<(u16, String)> = None;
     loop {
         // ブラウザが DevTools を公開する前に終了したら、待ち続けない。
         if child.try_wait().ok().flatten().is_some() {
             return Err("ブラウザが DevTools を公開する前に終了しました".to_string());
+        }
+        if reported.is_none()
+            && let Some(endpoint) = endpoint
+            && let Ok(websocket) = endpoint.try_recv()
+        {
+            reported = Some(reported_browser_endpoint(&websocket, port)?);
         }
         let endpoint = if port == 0 {
             if discovered.is_none() {
@@ -647,12 +856,12 @@ fn wait_for_devtools(
             }
             discovered.clone()
         } else {
-            Some((port, String::new()))
+            reported.clone()
         };
         if let Some((effective, active_path)) = endpoint
             && let Some(websocket) = fetch_devtools_websocket(&client, effective)
         {
-            let expected_path = (port == 0).then_some(active_path.as_str());
+            let expected_path = Some(active_path.as_str());
             return verify_devtools_websocket(&websocket, effective, expected_path);
         }
         if Instant::now() >= deadline {
@@ -998,5 +1207,37 @@ mod tests {
         server.join().unwrap();
         reader.join().unwrap();
         assert!(matches!(outcome, Ok(Err(_))), "{outcome:?}");
+    }
+
+    #[test]
+    fn browser_endpoint_uses_the_owned_announcement_after_oversized_diagnostics() {
+        let expected = "ws://127.0.0.1:52222/devtools/browser/owned";
+        let mut diagnostics = b"DevTools listening on ws://127.0.0.1:52222/devtools/browser/truncated".to_vec();
+        diagnostics.extend(std::iter::repeat_n(b'x', 5000));
+        diagnostics.extend_from_slice(b"\n\xffinvalid diagnostic\nDevTools listening on ");
+        diagnostics.extend_from_slice(expected.as_bytes());
+        diagnostics.extend_from_slice(b"\r\n");
+        let endpoint = read_browser_endpoint(&mut std::io::Cursor::new(diagnostics)).unwrap();
+        assert_eq!(endpoint, expected);
+        let (port, path) = reported_browser_endpoint(&endpoint, 52222).unwrap();
+        assert!(verify_devtools_websocket(
+            "ws://127.0.0.1:52222/devtools/browser/other-process", port, Some(&path),
+        ).is_err(), "a server on the same port must not replace the launched browser");
+    }
+
+    #[test]
+    fn token_protocol_excludes_accounts_siblings_and_prefix_matches() {
+        let cookies = BTreeMap::from([
+            ("example.test".to_string(), "account=do-not-export; example-token=opaque==; analytics=tracking".to_string()),
+            ("api.example.test".to_string(), "example-token=other-host-secret".to_string()),
+            ("www.example.test".to_string(), "example-token-extra=prefix-secret; account=private".to_string()),
+        ]);
+        let response = browser_token_response(
+            "example.test".to_string(), "example-token".to_string(),
+            "https://www.example.test/read/1", cookies,
+        ).unwrap();
+        assert_eq!(response.cookies, BTreeMap::from([
+            ("example.test".to_string(), "example-token=opaque==".to_string()),
+        ]));
     }
 }
