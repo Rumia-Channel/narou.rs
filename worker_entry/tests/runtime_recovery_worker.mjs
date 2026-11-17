@@ -13,13 +13,19 @@ export default class RuntimeRecoveryWorker extends Worker {
       return new Response('Unauthorized', { status: 401 });
     }
     // Read through the live workerd, not a competing Wrangler/SQLite process.
-    const [jobs, novels] = await Promise.all([
+    const [jobs, novels, reservations, claims, gates] = await Promise.all([
       this.env.DB.prepare(`SELECT job_id,kind,target,status,attempts,recovery_attempts,
         site_key,normalized_target,admission_waiting,lease_until,execution_token,
         checkpoint_json,last_error FROM worker_jobs ORDER BY created_at,job_id`).all(),
       this.env.DB.prepare('SELECT id,ncode,general_all_no FROM novels ORDER BY id').all(),
+      this.env.DB.prepare('SELECT id,generation,available,job_id FROM novel_id_reservations ORDER BY id').all(),
+      this.env.DB.prepare('SELECT prefix,novel_id,reservation_generation,toc_url_fold,owner,epoch,job_id,empty_owned FROM novel_namespace_claims ORDER BY prefix').all(),
+      this.env.DB.prepare('SELECT prefix,epoch,closed,owner,origin_url_fold,(SELECT COUNT(*) FROM novel_reader_leases r WHERE r.prefix=g.prefix AND r.expires_at>unixepoch()) AS pending_readers FROM novel_access_gates g ORDER BY prefix').all(),
     ]);
-    return Response.json({ jobs: jobs.results, novels: novels.results });
+    return Response.json({
+      jobs: jobs.results, novels: novels.results,
+      reservations: reservations.results, claims: claims.results, gates: gates.results,
+    });
   }
 
   async queue(batch) {
