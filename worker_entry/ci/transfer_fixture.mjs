@@ -7,6 +7,7 @@ import {createHash,randomBytes} from 'node:crypto';
 import {spawn,spawnSync} from 'node:child_process';
 import {dirname,join,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {createRequire} from 'node:module';
 const root=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const account=process.env.CLOUDFLARE_ACCOUNT_ID??process.env.CLOUDFLARE_ACCOUT_ID;
 const apiToken=process.env.CLOUDFLARE_API_TOKEN;
@@ -89,43 +90,57 @@ async function provision(){
 }
 async function exercise(state){
   validate(state);
+  const tools=process.env.NAROU_TRANSFER_TOOLS;
+  assert(tools,'NAROU_TRANSFER_TOOLS must contain the pinned ws tail transport');
+  const {WebSocket}=createRequire(join(resolve(tools),'package.json'))('ws');
   const tailPath=`/workers/scripts/${state.workerName}/tails`;
   const record=await api(tailPath,{method:'POST',body:{filters:[]}});
   assert(typeof record?.id==='string'&&record.id.length>0,'disposable transfer tail has no opaque identifier');
   const address=new URL(record.url);assert.equal(address.protocol,'wss:');
-  let socket,closing=false,tailFailure;
+  let socket,ping,closing=false,tailFailure,waitingForPong=false;
+  const lost=reason=>{if(!closing){tailFailure=tailFailure??reason;console.log(JSON.stringify({event:'transfer_tail_lost',reason}));}};
+  const pingBytes=Buffer.from('wrangler tail ping');
   try{
-    socket=new WebSocket(address,'trace-v1');socket.binaryType='arraybuffer';
-    const lost=reason=>{if(!closing){tailFailure=reason;console.log(JSON.stringify({event:'transfer_tail_lost',reason}));}};
-    socket.addEventListener('error',()=>lost('connection_error'));
-    socket.addEventListener('close',()=>lost('connection_closed'));
-    socket.addEventListener('message',event=>{
-      const bytes=Buffer.from(event.data);
+    // Match Wrangler's trace-v1 transport: its initial configuration frame is
+    // explicitly unmasked. The built-in WebSocket cannot express that option.
+    socket=new WebSocket(address,'trace-v1',{headers:{'User-Agent':`wrangler/${pin}`},maxPayload:256*1024});
+    socket.on('error',()=>lost('connection_error'));
+    socket.on('close',code=>{if(!closing)console.log(JSON.stringify({event:'transfer_tail_closed',code}));lost('connection_closed');});
+    socket.on('pong',bytes=>{if(bytes.equals(pingBytes))waitingForPong=false;});
+    socket.on('message',data=>{
+      const bytes=Buffer.from(data);
       if(bytes.length>256*1024){lost('event_too_large');return;}
       let value;try{value=JSON.parse(bytes.toString('utf8'));}catch{lost('invalid_event');return;}
+      if(value.event?.type==='overload'){lost('sampling_gap');return;}
       const outcomes=['ok','canceled','exception','exceededCpu','exceededMemory','unknown'];
       if(!outcomes.includes(value.outcome)){lost('unknown_outcome');return;}
       if(value.outcome==='ok')return;
       let path='other';
       try{const candidate=new URL(value.event?.request?.url).pathname;if(candidate.startsWith('/api/transfer/'))path=candidate;}catch{}
-      // Tail events contain credentials and arbitrary console text. Never print
-      // their headers, URLs with query strings, logs, or exception messages.
+      // Never print tail headers, query strings, console text or exceptions.
       console.log(JSON.stringify({event:'transfer_isolate',outcome:value.outcome,path}));
+      if(value.outcome!=='canceled')tailFailure=tailFailure??`isolate_${value.outcome}`;
     });
     await new Promise((resolve,reject)=>{
       const timer=setTimeout(()=>reject(new Error('disposable transfer tail did not open')),15000);
-      socket.addEventListener('open',()=>{clearTimeout(timer);socket.send(JSON.stringify({debug:false}));resolve();},{once:true});
-      socket.addEventListener('error',()=>{clearTimeout(timer);reject(new Error('disposable transfer tail connection failed'));},{once:true});
-      socket.addEventListener('close',()=>{clearTimeout(timer);reject(new Error('disposable transfer tail closed before readiness'));},{once:true});
+      socket.once('open',()=>socket.send(JSON.stringify({debug:false}),{binary:false,compress:false,mask:false,fin:true},error=>{
+        clearTimeout(timer);if(error)reject(new Error('disposable transfer tail configuration failed'));else resolve();
+      }));
+      socket.once('error',()=>{clearTimeout(timer);reject(new Error('disposable transfer tail connection failed'));});
+      socket.once('close',()=>{clearTimeout(timer);reject(new Error('disposable transfer tail closed before readiness'));});
     });
+    ping=setInterval(()=>{
+      if(waitingForPong){lost('keepalive_timeout');socket.terminate();return;}
+      if(socket.readyState===WebSocket.OPEN){waitingForPong=true;socket.ping(pingBytes);}
+    },10000);
     console.log(JSON.stringify({event:'transfer_tail_ready'}));
     const child=spawn(process.execPath,[join(root,'tests/transfer_memory_deployed.mjs')],{cwd:root,stdio:'inherit',env:{...process.env,NAROU_TRANSFER_TEST_URL:state.url,NAROU_TRANSFER_TEST_TOKEN:state.adminToken},signal:AbortSignal.timeout(25*60*1000)});
     let processFailure;
     const result=await new Promise(resolve=>{child.once('error',()=>{processFailure=true;});child.once('close',(code,signal)=>resolve({code,signal}));});
     assert(!processFailure&&result.code===0,`deployed transfer regressions failed (code=${result.code}, signal=${result.signal})`);
-    assert.equal(tailFailure,undefined,'disposable transfer tail lost diagnostic coverage');
+    assert.equal(tailFailure,undefined,'disposable transfer tail lost coverage or observed an isolate failure');
   }finally{
-    closing=true;socket?.close();
+    closing=true;clearInterval(ping);socket?.terminate();
     await api(`${tailPath}/${encodeURIComponent(record.id)}`,{method:'DELETE',missing:true});
   }
 }
