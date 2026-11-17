@@ -295,7 +295,8 @@ fn native_cli_and_web_v2_reject_selected_parent_with_unselected_child_before_cat
 
 /// The DB-only backend (`storage-backend=sqlite`, `sqlite.mirror-files=false`)
 /// performs the same authenticated v2 import and export without materializing
-/// any novel file: canonical bytes live only in `.narou/db.sqlite`. Receipts,
+/// any novel file: canonical bytes live only in `.narou/db.sqlite`, while
+/// private object-store control locks may remain on the filesystem. Receipts,
 /// metadata-resolution recovery marks and payloads must match the YAML-backend
 /// contract byte for byte. The legacy CLI import restriction is unaffected.
 #[test]
@@ -308,8 +309,9 @@ fn native_web_v2_sqlite_db_only_imports_exports_and_recovers_without_mirror_file
     let (manifest,payloads)=export_profile(&client,&source_server,&source,&ids,TransferProfile::Runtime);
     let fingerprint=narou_rs::transfer::source_fingerprint(&manifest).unwrap();
     let imported=import_projected(&client,&target_server,&manifest,&fingerprint,&payloads,false,TransferProfile::Runtime);assert_eq!(imported["published_novels"],1);
-    let mut mirrored=Vec::new();let mut stack=vec![target.join("小説データ")];
-    while let Some(directory)=stack.pop(){if !directory.is_dir(){continue;}for entry in std::fs::read_dir(&directory).unwrap(){let entry=entry.unwrap();if entry.file_type().unwrap().is_dir(){stack.push(entry.path());}else{mirrored.push(entry.path());}}}
+    let archive=target.join("小説データ");
+    let mut mirrored=Vec::new();let mut stack=vec![archive.clone()];
+    while let Some(directory)=stack.pop(){if !directory.is_dir(){continue;}for entry in std::fs::read_dir(&directory).unwrap(){let entry=entry.unwrap();if directory==archive&&entry.file_name()==".objects"{continue;}if entry.file_type().unwrap().is_dir(){stack.push(entry.path());}else{mirrored.push(entry.path());}}}
     assert!(mirrored.is_empty(),"DB-only import must not materialize novel files: {mirrored:?}");
     let database_connection=narou_rs::native::sqlite::open(&target.join(".narou/db.sqlite")).unwrap();
     let connection=database_connection.lock();

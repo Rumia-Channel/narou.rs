@@ -1660,7 +1660,9 @@ impl TransferStageStore for SqliteObjectStore {
         if !referenced{self.remove_file_copy(&key)?;conn.execute("DELETE FROM object_chunks WHERE object_key=?1 AND seq IN (SELECT seq FROM object_chunks WHERE object_key=?1 ORDER BY seq LIMIT 16)",[key.as_ref()]).map_err(super::sqlite_error)?;conn.execute("DELETE FROM objects WHERE object_key=?1 AND NOT EXISTS(SELECT 1 FROM object_chunks WHERE object_key=?1)",[key.as_ref()]).map_err(super::sqlite_error)?;}record.lease.state=ts::StageLeaseState::Aborting;
         let lower=format!(".narou-transfer/.checkpoints/{id}/");let upper=prefix_upper_bound(&lower);
         conn.execute("DELETE FROM objects WHERE object_key IN (SELECT object_key FROM objects WHERE object_key>=? AND object_key<? ORDER BY object_key LIMIT 32)",rusqlite::params![lower,upper]).map_err(super::sqlite_error)?;
-        let more:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM objects WHERE object_key>=?1 AND object_key<?2) OR EXISTS(SELECT 1 FROM objects WHERE object_key=?3)",rusqlite::params![lower,upper,key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;
+        // Canonical references own a promoted payload; only its stage control
+        // and checkpoints belong to the terminal transfer.
+        let more:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM objects WHERE object_key>=?1 AND object_key<?2) OR (?4=0 AND EXISTS(SELECT 1 FROM objects WHERE object_key=?3))",rusqlite::params![lower,upper,key.as_ref(),referenced],|row|row.get(0)).map_err(super::sqlite_error)?;
         if more{Ok(((),Some(record)))}else{conn.execute("DELETE FROM transfer_stage_ledger WHERE stage_id=?",[id]).map_err(super::sqlite_error)?;Ok(((),None))}
     }))})}
     fn stage_lease_page<'a>(&'a self,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,Result<(Vec<StageLease>,Option<String>)>>{Box::pin(async move{run_scoped_blocking(||{
@@ -1671,7 +1673,7 @@ impl TransferStageStore for SqliteObjectStore {
     fn stage_reclaim<'a>(&'a self,id:&'a str,owner:&'a str,epoch:u64)->PlatformFuture<'a,Result<bool>>{Box::pin(async move{
         let claimed=run_scoped_blocking(||self.stage_transaction(id,|conn,current|{
             let Some(mut record)=current else{return Ok((true,None));};if record.lease.owner!=owner||record.lease.epoch!=epoch||(record.lease.state!=ts::StageLeaseState::Aborting&&record.lease.expires_at>ts::now_secs()){return Ok((false,None));}
-            let key=ts::stage_data_key(id)?;let pinned:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM transfer_object_refs WHERE blob_key=?)",[key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;if pinned{return Ok((false,None));}record.lease.state=ts::StageLeaseState::Aborting;Ok((true,Some(record)))
+            record.lease.state=ts::StageLeaseState::Aborting;Ok((true,Some(record)))
         }))?;if !claimed{return Ok(false);}self.stage_abort(id,owner,epoch).await?;Ok(self.stage_cursor(id).await?.is_none())
     })}
 }
@@ -1758,6 +1760,38 @@ mod tests {
             reopened.stage_append("durable","owner",9,3,b"def",true).await.unwrap();let sha=hex::encode(sha2::Sha256::digest(b"abcdef"));let sealed=reopened.stage_seal("durable","owner",9,6,&sha).await.unwrap();
             let mut stream=reopened.read_stream(&sealed.key).await.unwrap().unwrap();let mut out=Vec::new();while let Some(chunk)=stream.next().await{out.extend_from_slice(&chunk.unwrap());}assert_eq!(out,b"abcdef");
             assert!(reopened.stage_abort("durable","wrong",9).await.is_err());
+        });
+    }
+    #[test]
+    fn promoted_stage_cleanup_finishes_without_losing_shared_canonical_bytes(){
+        let base=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-libraries");
+        std::fs::create_dir_all(&base).unwrap();
+        let root=tempfile::Builder::new().prefix("promoted-stage-gc-").tempdir_in(base).unwrap();
+        let conn=crate::native::sqlite::open_in_memory().unwrap();
+        let store=SqliteObjectStore::with_mirror_files(conn,NativeObjectStore::from_root(root.path().to_owned()).unwrap(),false);
+        futures::executor::block_on(async{
+            let bytes=vec![b'z';OBJECT_CHUNK_BYTES+17];
+            let sha=hex::encode(sha2::Sha256::digest(&bytes));
+            store.stage_open("promoted_gc","session",1,3600).await.unwrap();
+            store.stage_append("promoted_gc","session",1,0,&bytes,true).await.unwrap();
+            let sealed=store.stage_seal("promoted_gc","session",1,bytes.len() as u64,&sha).await.unwrap();
+            let prefix=ObjectPrefix::new("novels/site/book").unwrap();
+            let first=ObjectKey::try_new("novels/site/book/first.bin").unwrap();
+            let second=ObjectKey::try_new("novels/site/book/second.bin").unwrap();
+            let epoch=store.close_gate(&prefix,"publication").await.unwrap();
+            store.commit_staged(&prefix,"publication",epoch,&sealed.key,&first).await.unwrap();
+            store.commit_staged(&prefix,"publication",epoch,&sealed.key,&second).await.unwrap();
+            store.open_gate(&prefix,"publication",epoch).await.unwrap();
+            store.stage_abort("promoted_gc","session",1).await.unwrap();
+            assert!(store.stage_reclaim("promoted_gc","session",1).await.unwrap(),"published bytes must not keep a terminal transfer advancing forever");
+            assert!(store.stage_cursor("promoted_gc").await.unwrap().is_none());
+            assert!(store.stage_open("promoted_gc","intruder",2,3600).await.is_err());
+            assert_eq!(ObjectStore::read_small(&store,&first).await.unwrap().unwrap(),bytes);
+            ObjectStore::delete(&store,&first).await.unwrap();
+            assert_eq!(ObjectStore::read_small(&store,&second).await.unwrap().unwrap(),bytes,"another canonical reference still owns the shared payload");
+            ObjectStore::write_small(&store,&second,b"replacement".to_vec()).await.unwrap();
+            assert_eq!(ObjectStore::read_small(&store,&second).await.unwrap().unwrap(),b"replacement");
+            assert!(ObjectStore::read_small(&store,&sealed.key).await.unwrap().is_none(),"the last canonical replacement releases the retired physical payload");
         });
     }
     #[test]
