@@ -100,22 +100,12 @@ impl AuthState {
     /// Cookies of another login never survive, because every candidate
     /// starts from the pristine configured cookie.
     pub fn apply(&mut self, setting: &mut SiteSetting, index: usize) -> bool {
-        let details = self
+        let Some(cookie) = self
             .groups
             .as_deref()
             .and_then(|groups| groups.get(index))
-            .map(|group| {
-                (
-                    group.merged_cookie(),
-                    group
-                        .cookies
-                        .iter()
-                        .map(|entry| entry.host.clone())
-                        .collect::<Vec<_>>(),
-                    group.id.clone(),
-                )
-            });
-        let Some((cookie, hosts, id)) = details else {
+            .map(|group| group.merged_cookie())
+        else {
             return false;
         };
         if cookie.is_empty() {
@@ -123,15 +113,26 @@ impl AuthState {
             self.used.push(index);
             return false;
         }
+        let Some(group) = self
+            .groups
+            .as_deref()
+            .and_then(|groups| groups.get(index))
+        else {
+            return false;
+        };
+        let id = group.id.clone();
+        let hosts: Vec<String> = group
+            .cookies
+            .iter()
+            .map(|entry| entry.host.clone())
+            .collect();
+        // Every candidate starts from the site's own cookie, so one account's
+        // cookies never reach another account's request.
+        setting.cookie = self.configured_cookie.clone();
+        super::apply_login_cookie(setting, &cookie, &group.cookies);
+        // The stored login is not read again, so its borrow ends here.
         self.used.push(index);
-        self.active = Some(ActiveLogin {
-            id,
-            cookie: cookie.clone(),
-            hosts: hosts.clone(),
-        });
-        setting.cookie =
-            crate::platform::merge_cookie_headers(self.configured_cookie.as_deref(), Some(&cookie));
-        setting.login_cookie_hosts = hosts;
+        self.active = Some(ActiveLogin { id, cookie, hosts });
         true
     }
 
@@ -220,6 +221,10 @@ impl AuthState {
         }
         let hosts: Vec<String> = group.cookies.iter().map(|entry| entry.host.clone()).collect();
         let id = group.id.clone();
+        // The site's own cookie is the base: the renewed login only replaces
+        // the cookies it carries.
+        setting.cookie = self.configured_cookie.clone();
+        super::apply_login_cookie(setting, &cookie, &group.cookies);
         if !id.is_empty()
             && let Some(groups) = self.groups.as_mut()
         {
@@ -241,14 +246,7 @@ impl AuthState {
                 self.used.push(index);
             }
         }
-        self.active = Some(ActiveLogin {
-            id,
-            cookie: cookie.clone(),
-            hosts: hosts.clone(),
-        });
-        setting.cookie =
-            crate::platform::merge_cookie_headers(self.configured_cookie.as_deref(), Some(&cookie));
-        setting.login_cookie_hosts = hosts;
+        self.active = Some(ActiveLogin { id, cookie, hosts });
         true
     }
 

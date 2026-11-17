@@ -32,6 +32,10 @@ pub enum Expr {
     Regex(String, String),
     ExtractJson(String, String),
     Extract(String, String),
+    /// `extract_all(/re/flags)` — every match of the pattern in the source, in
+    /// source order. The first capture is used when the pattern has one, the
+    /// whole match otherwise.
+    ExtractAll(String, String),
     Request(Box<Expr>),
     FetchJson(Box<Expr>),
     FetchJsonRequired {

@@ -19,6 +19,7 @@ Kakuyomu preprocessing is fully YAML-driven via a pest-based DSL:
 - Statements: `guard`, `let`, `set`, `if`/`else`/`end`, `for`/`in`/`end`, `emit`, `insert_at_match`
 - Expressions: string interpolation (`${expr}`), accessor chains (`.field`, `["key"]`), method chains (`.map`, `.flat_map`, `.flatten`, `.compact`, `.join`, `.gsub`, `.replace`, `.is_array`, `.empty`)
 - `extract_json(/regex/flags)` — extract and parse JSON from HTML
+- `extract_all(/regex/flags)` — ordinary expression returning all source matches in order: capture 1 when present, otherwise the full match; unmatched optional captures are null and no matches yields an empty array. Chaining and direct `for` iteration work. Source is borrowed, each match consumes the step budget, and existing value/array limits apply. The first match updates the insertion anchor; no match preserves an earlier anchor. Novelup's author cards and next-page markers use the same editable DSL on Native and Worker.
 - Boolean operators: `&&`, `||`, `==`, `!=`, `!`
 - Comments: `# ...`
 

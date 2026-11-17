@@ -153,7 +153,9 @@ fn run(args: Args) -> std::result::Result<(), String> {
         if args.browser_token && site.browser_token.is_none() {
             return Err("このサイトにはブラウザトークン取得が定義されていません".to_string());
         }
-        let login_url = if args.browser_token && site.matches_url(&target) {
+        let login_url = if args.browser_token
+            && (site.matches_url(&target) || site.matches_author_url(&target))
+        {
             Cow::Borrowed(target.as_str())
         } else {
             browser_start_url(&site, &target)
@@ -297,7 +299,7 @@ fn retain_token_cookie(header: &mut String, wanted: &str) -> bool {
 
 fn browser_start_url<'a>(site: &SiteSetting, target: &'a str) -> Cow<'a, str> {
     if matches!(site.login_wall_error, narou_rs::downloader::site_setting::LoginWallError::Login)
-        && site.matches_url(target)
+        && (site.matches_url(target) || site.matches_author_url(target))
     {
         Cow::Borrowed(target)
     } else {
@@ -1173,12 +1175,20 @@ mod tests {
     }
 
     #[test]
-    fn browser_check_opens_the_requested_work_without_changing_other_login_pages() {
-        let mut site = SiteSetting::load_bundled(&["name: example\nsitename: Example\ndomain: example.com\ntop_url: https://example.com\ntoc_url: \\k<url>\nurl: '^https://example\\.com/story/\\d+$'\nlogin_url: https://example.com/sign-in\n"]).unwrap().remove(0);
-        let target = "https://example.com/story/42";
-        assert_eq!(browser_start_url(&site, target), "https://example.com/sign-in");
+    fn browser_check_opens_requested_works_and_authors_without_changing_other_login_pages() {
+        let mut site = SiteSetting::load_bundled(&["name: example\nsitename: Example\ndomain: example.com\ntop_url: https://example.com\ntoc_url: \\k<url>\nurl: '^https://example\\.com/story/\\d+$'\nauthor_url: '^https://example\\.com/user/\\d+/(?:profile|story)(?:\\?[^#]*)?$'\nlogin_url: https://example.com/sign-in\n"]).unwrap().remove(0);
+        let targets = [
+            "https://example.com/story/42",
+            "https://example.com/user/7/profile",
+            "https://example.com/user/7/story?p=2",
+        ];
+        for target in targets {
+            assert_eq!(browser_start_url(&site, target), "https://example.com/sign-in");
+        }
         site.login_wall_error = narou_rs::downloader::site_setting::LoginWallError::Login;
-        assert_eq!(browser_start_url(&site, target), target);
+        for target in targets {
+            assert_eq!(browser_start_url(&site, target), target);
+        }
         assert_eq!(browser_start_url(&site, "example.com"), "https://example.com/sign-in");
         assert_eq!(browser_start_url(&site, "https://unrelated.com/story/42"), "https://example.com/sign-in");
     }

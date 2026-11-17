@@ -180,6 +180,10 @@ fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
             let (pattern, flags) = build_regex(pair.into_inner().next().unwrap());
             Expr::Extract(pattern, flags)
         }
+        Rule::extract_all_expr => {
+            let (pattern, flags) = build_regex(pair.into_inner().next().unwrap());
+            Expr::ExtractAll(pattern, flags)
+        }
         Rule::chain_expr => {
             let mut inner = pair.into_inner();
             let base_name = inner.next().unwrap().as_str().to_string();

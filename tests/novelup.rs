@@ -360,6 +360,48 @@ async fn the_author_work_list_is_read_from_every_page() {
 }
 
 #[tokio::test]
+async fn an_empty_author_page_does_not_hide_later_works() {
+    let http = MockHttpClient::new();
+    let limiter = FakeRateLimiter::new();
+    let settings = vec![site()];
+    let empty_page = AUTHOR_WORKS_PAGE1.replace("class=\"story_name\"", "class=\"omitted_story\"");
+    http.add_text(AUTHOR_WORKS_URL, 200, &empty_page);
+    http.add_text(AUTHOR_WORKS_PAGE2_URL, 200, AUTHOR_WORKS_PAGE2);
+
+    let works = DownloadTargetExpander::new(&http, &limiter, &settings)
+        .author_works(AUTHOR_PROFILE_URL).await.unwrap();
+    assert_eq!(works, ["https://novelup.plus/story/439593115"]);
+}
+
+#[tokio::test]
+async fn a_user_edited_author_dsl_controls_which_works_are_discovered() {
+    let user = format!(r#"
+name: ノベルアップ＋
+version: {}
+preprocess: |-
+  guard "FilteredAuthorDsl2026"
+  let works = extract_all(/<p class="story_name">\s*<a[^>]*href="(https:\/\/novelup\.plus\/story\/\d+)"/)
+  emit "FilteredAuthorDsl2026"
+  for work_url in works
+    if work_url == "https://novelup.plus/story/590182848"
+      emit "novelup_author_novel::${{work_url}}"
+    end
+  end
+  emit ""
+  insert_at_match
+"#, site().version);
+    let merged = merge_user_definition_yaml(BUNDLED, &user);
+    let settings = SiteSetting::load_bundled(&[merged.as_str()]).unwrap();
+    let http = MockHttpClient::new();
+    let limiter = FakeRateLimiter::new();
+    http.add_text(AUTHOR_WORKS_URL, 200, AUTHOR_WORKS_PAGE1);
+
+    let works = DownloadTargetExpander::new(&http, &limiter, &settings)
+        .author_works(AUTHOR_PROFILE_URL).await.unwrap();
+    assert_eq!(works, ["https://novelup.plus/story/590182848"]);
+}
+
+#[tokio::test]
 async fn a_user_edited_definition_overrides_the_bundled_rules() {
     // ユーザーが自分の YAML を編集して、間隔と本文の取出方を変える。
     let user = format!(r#"

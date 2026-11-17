@@ -16,17 +16,26 @@
 //! site declared more works for than could be fetched (a total that is not
 //! reached, or a start offset past the range the API accepts) is an error too,
 //! not a short success.
+//!
+//! A page the site refuses (a browser-verification answer, or a login wall
+//! served with HTTP 200) is read again with a browser-issued token, once per
+//! page. The token comes from the definition (`browser_token`) and the store,
+//! so no site is special-cased here. The pages read before stay: a renewed
+//! token continues the listing instead of starting it over, and the request
+//! that follows the renewal — not the issued token — decides whether it was
+//! accepted.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{NarouError, Result};
 use crate::platform::{CookieStore, HttpClient, LoginGroup, RateLimiter};
 
+use super::auth::AuthState;
 use super::http_policy::{FetchPolicy, fetch_text};
+use super::is_login_required;
 use super::preprocess::PreprocessJobs;
 use super::site_setting::SiteSetting;
 use super::util::{PretreatmentRequest, pretreatment_source_with_jobs};
-use super::apply_login_cookie;
 
 /// One author page as read from the site definitions.
 pub(crate) struct AuthorListing<'a> {
@@ -101,18 +110,25 @@ impl<'a> AuthorListing<'a> {
                 setting.sitename
             )));
         }
-        let groups = self.stored_groups(setting).await;
-        let base_cookie = setting.cookie.clone();
+        // 資格情報は必要なときに 1 回だけ読む (読み終えた一覧は保存済み
+        // ログインを読まない)。
+        let mut auth = AuthState::new(setting.cookie.clone());
         // 追加取得 (`request` / `fetch_json`) の結果は試行間で共有する
         // (novel 取得と同じ扱い: 同じ URL は 1 回だけ).
         let mut jobs = PreprocessJobs::new();
 
+        let mut anonymous = setting.clone();
+        let listing = self
+            .fetch_listing(&mut anonymous, &mut auth, page_url, &mut jobs)
+            .await;
         let mut best = Attempt {
-            setting: setting.clone(),
-            listing: self.fetch_listing(setting, page_url, &mut jobs).await,
+            setting: anonymous,
+            listing,
         };
         let merge_logins = setting.author_login_merge;
-        if !groups.is_empty() && (merge_logins || !is_fully_readable(&best.listing)) {
+        if merge_logins || !is_fully_readable(&best.listing) {
+            // 保存済みログインは必要なときに 1 回だけ読む。
+            self.ensure_groups(&mut auth, setting).await;
             // 匿名の一覧に見えている分を種にして、ログインごとの一覧を
             // 足し合わせる (`author_login_merge`)。匿名応答が完全に見えても
             // ログイン限定作品が欠けるサイト (Pixiv の R-18) のための経路。
@@ -122,11 +138,17 @@ impl<'a> AuthorListing<'a> {
             }
             let mut any_readable = false;
             let mut winner: Option<Attempt> = None;
-            for group in &groups {
+            // 採用した資格情報。失効したトークンを更新した状態も保つ。
+            let mut original = auth.active().cloned();
+            while let Some(index) = auth.next_unused() {
                 let mut with_login = setting.clone();
-                with_login.cookie = base_cookie.clone();
-                apply_login_cookie(&mut with_login, &group.merged_cookie(), &group.cookies);
-                let listing = self.fetch_listing(&with_login, page_url, &mut jobs).await;
+                if !auth.apply(&mut with_login, index) {
+                    // Cookie を持たないログインは何も認証できない。
+                    continue;
+                }
+                let listing = self
+                    .fetch_listing(&mut with_login, &mut auth, page_url, &mut jobs)
+                    .await;
                 if let Ok(found) = &listing {
                     if !found.login_walled {
                         any_readable = true;
@@ -142,6 +164,7 @@ impl<'a> AuthorListing<'a> {
                                 setting: with_login.clone(),
                                 listing: Ok(found.clone()),
                             });
+                            original = auth.active().cloned();
                         }
                     }
                 }
@@ -153,9 +176,14 @@ impl<'a> AuthorListing<'a> {
                     if better(&attempt.listing, &best.listing) {
                         let resolved = is_fully_readable(&attempt.listing);
                         best = attempt;
+                        original = auth.active().cloned();
                         if resolved {
                             break;
                         }
+                    } else {
+                        // 採用されなかった候補は元の資格情報へ戻す (その間に
+                        // 更新されたトークンも失わない)。
+                        auth.restore(&mut best.setting, original.as_ref());
                     }
                 }
             }
@@ -166,6 +194,7 @@ impl<'a> AuthorListing<'a> {
                     merged.login_walled = false;
                 }
                 winner.listing = Ok(merged);
+                auth.restore(&mut winner.setting, original.as_ref());
                 best = winner;
             }
         }
@@ -211,6 +240,111 @@ impl<'a> AuthorListing<'a> {
             .unwrap_or_default()
     }
 
+    /// Read the stored logins of the site once, when a credential is needed.
+    ///
+    /// A listing that reads fine never touches the store, and a listing that
+    /// needs several credentials reads them once, not once per page.
+    async fn ensure_groups(&self, auth: &mut AuthState, setting: &SiteSetting) {
+        if auth.groups().is_none() {
+            let groups = self.stored_groups(setting).await;
+            auth.set_groups(groups);
+        }
+    }
+
+    /// Ask the store for a fresh browser-issued token and send it.
+    ///
+    /// Returns `false` when no fresh token was obtained: the site defines no
+    /// browser token, the store cannot renew one, or this page already used
+    /// its renewal. The caller then keeps its legacy behavior of walking the
+    /// stored candidates.
+    ///
+    /// The token is renewed for the account in effect (by its stable id), so
+    /// one account's token never replaces another account's. Only the
+    /// request that follows the renewal says whether the site accepted it.
+    async fn renew_token(
+        &self,
+        setting: &mut SiteSetting,
+        auth: &mut AuthState,
+        target_url: &str,
+    ) -> bool {
+        let Some(cookies) = self.cookies else {
+            return false;
+        };
+        let Some(config) = setting.browser_token.as_ref() else {
+            return false;
+        };
+        // 1 ページの読み直しにつき 1 回だけ。拒否されたトークンが次の更新を
+        // 誘発しない。
+        if !auth.claim_token_refresh() {
+            return false;
+        }
+        // 保存済みログインは必要なときに 1 回だけ読む。
+        self.ensure_groups(auth, setting).await;
+        // 更新するのは生效中のアカウント。安定 ID で表すので、同じログインの
+        // 資格情報が別アカウントと混ざらない。
+        let session_id = auth
+            .active()
+            .map(|login| login.id.clone())
+            .filter(|id| !id.is_empty());
+        let renewed = cookies
+            .refresh_browser_token(
+                &setting.domain,
+                target_url,
+                &config.cookie_name,
+                session_id.as_deref(),
+            )
+            .await;
+        match renewed {
+            Ok(Some(group)) => {
+                tracing::debug!("author listing: browser token renewed, retrying {target_url}");
+                auth.apply_refreshed(setting, group)
+            }
+            // 能力を持たないストア (保存のみ / Worker) や、発行できない
+            // ときは更新できない。保存済みログインを従来どおり試す。
+            Ok(None) => false,
+            Err(error) => {
+                // トークンも資格情報もエラー文に現れない。
+                tracing::warn!("author listing: browser token renewal failed: {error}");
+                false
+            }
+        }
+    }
+
+    /// One page of the listing: fetch it and run the definition's
+    /// preprocessing over the body.
+    async fn fetch_page(
+        &self,
+        setting: &SiteSetting,
+        policy: &FetchPolicy,
+        fetch_url: &str,
+        jobs: &mut PreprocessJobs,
+    ) -> Result<String> {
+        let mut body = fetch_text(
+            self.http,
+            self.rate_limiter,
+            fetch_url,
+            policy,
+            Some(setting.encoding()),
+        )
+        .await?;
+        // `preprocess:` の DSL が `author_novel::` / `author_series::` を
+        // 出せるように、本文を定義に通してから読み取る。取得元 URL を渡す
+        // ので、定義は続きの URL を組み立てられる。`request()` は同じ
+        // policy で実行し、結果は `fetched[<url>]` として見える。
+        pretreatment_source_with_jobs(PretreatmentRequest {
+            http: self.http,
+            rate_limiter: self.rate_limiter,
+            policy,
+            src: &mut body,
+            encoding: setting.encoding(),
+            setting: Some(setting),
+            jobs,
+            url: fetch_url,
+        })
+        .await?;
+        Ok(body)
+    }
+
     /// Read every page of the listing the definition declares.
     ///
     /// Pages are followed through `author_next_pattern` (an explicit next-page
@@ -220,13 +354,19 @@ impl<'a> AuthorListing<'a> {
     /// A listing that the site declared more works for than could be fetched
     /// (the declared total is not reached, or the next start offset is past
     /// the API's range) is an error, not a short success.
+    ///
+    /// A page the site refuses (a browser-verification answer, or a login
+    /// wall served with HTTP 200) is read again with a browser-issued token,
+    /// once per page read. The pages read before stay: the listing continues
+    /// where it was instead of starting over.
     async fn fetch_listing(
         &self,
-        setting: &SiteSetting,
+        setting: &mut SiteSetting,
+        auth: &mut AuthState,
         page_url: &str,
         jobs: &mut PreprocessJobs,
     ) -> Result<Listing> {
-        let policy = FetchPolicy::for_site(setting);
+        let mut policy = FetchPolicy::for_site(setting);
         let captures = setting.extract_author_url_captures(page_url).unwrap_or_default();
         let mut listing = Listing::default();
         let mut fetch_url = setting.author_fetch_url(page_url);
@@ -239,37 +379,45 @@ impl<'a> AuthorListing<'a> {
             if !visited.insert(fetch_url.clone()) {
                 break;
             }
-            let mut body = fetch_text(
-                self.http,
-                self.rate_limiter,
-                &fetch_url,
-                &policy,
-                Some(setting.encoding()),
-            )
-            .await?;
-            // `preprocess:` の DSL が `author_novel::` / `author_series::` を
-            // 出せるように、本文を定義に通してから読み取る。取得元 URL を渡す
-            // ので、定義は続きの URL を組み立てられる。`request()` は同じ
-            // policy で実行し、結果は `fetched[<url>]` として見える。
-            pretreatment_source_with_jobs(PretreatmentRequest {
-                http: self.http,
-                rate_limiter: self.rate_limiter,
-                policy: &policy,
-                src: &mut body,
-                encoding: setting.encoding(),
-                setting: Some(setting),
-                jobs,
-                url: &fetch_url,
-            })
-            .await?;
-            if setting
-                .compiled_login_pattern()
-                .is_some_and(|pattern| pattern.is_match(&body))
-            {
-                listing.login_walled = true;
-            }
+            // 失効したトークンの更新は 1 ページの読み直しにつき 1 回だけ。
+            auth.reset_token_refresh();
+            let fetched = self.fetch_page(setting, &policy, &fetch_url, jobs).await;
+            let mut body = match fetched {
+                Ok(body) => body,
+                Err(error) => {
+                    // ブラウザ確認の答えだけがトークン更新で直りうる。404 や
+                    // 其它の失敗は更新しても直らない。
+                    if !is_login_required(&error)
+                        || !self.renew_token(setting, auth, &fetch_url).await
+                    {
+                        return Err(error);
+                    }
+                    // 更新した資格情報で同じページを読み直す (前のページは
+                    // 捨てない)。
+                    policy = FetchPolicy::for_site(setting);
+                    self.fetch_page(setting, &policy, &fetch_url, jobs).await?
+                }
+            };
             if setting.is_partial_login_view(&body) {
                 listing.partial = true;
+            }
+            if setting.is_login_wall(&body) {
+                // ログイン壁 (HTTP 200) も、更新したトークンで直りうる。
+                if !self.renew_token(setting, auth, &fetch_url).await {
+                    listing.login_walled = true;
+                    break;
+                }
+                policy = FetchPolicy::for_site(setting);
+                let renewed = self.fetch_page(setting, &policy, &fetch_url, jobs).await?;
+                if setting.is_partial_login_view(&renewed) {
+                    listing.partial = true;
+                }
+                if setting.is_login_wall(&renewed) {
+                    // 更新したトークンでも壁が残る = この資格情報では読めない。
+                    listing.login_walled = true;
+                    break;
+                }
+                body = renewed;
             }
             let total = setting.author_page_total(&body);
             if let Some(total) = total {
@@ -569,6 +717,8 @@ mod tests {
     use crate::platform::mocks::{FakeRateLimiter, MemoryCookieStore, MockHttpClient};
     use crate::platform::{HttpRequest, HttpResponse, PlatformFuture};
     use parking_lot::Mutex;
+    use std::collections::{BTreeMap, HashMap, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn load(domain: &str) -> SiteSetting {
         SiteSetting::load_all()
@@ -1382,5 +1532,555 @@ toc_url: https://pre.example/book/\k<ncode>
             .unwrap();
         assert_eq!(urls, vec!["https://pre.example/book/7".to_string()]);
         assert_eq!(http.request_count(), 2);
+    }
+
+    /// A site whose author listing is paged and can be refused by a browser
+    /// check. The token itself is site data: the definition only says which
+    /// cookie carries it.
+    const TOKEN_SITE: &str = r#"
+name: TokenSite
+domain: token.example
+top_url: https://token.example
+url: https://token\.example/story/(?<ncode>\d+)
+author_url: ^https?://token\.example/user/(?<author_id>\d+)
+author_api_url: https://token.example/user/\k<author_id>/story
+author_novel_pattern: '(?<novel_url>https://token\.example/story/\d+)'
+author_next_pattern: '(?<author_next>https://token\.example/user/\d+/story\?p=\d+)'
+login_pattern: 'ログインが必要'
+login_partial_pattern: 'partial'
+browser_token:
+  script_url: https://token.example/token.js
+  function: issueToken
+  cookie_name: token
+sitename: TokenSite
+toc_url: https://token.example/story/\k<ncode>
+"#;
+
+    /// One page of the token site's listing.
+    #[derive(Clone)]
+    struct TokenPage {
+        /// The browser token the request must carry. `None` = the page does
+        /// not ask for one.
+        token: Option<String>,
+        /// The page refuses a request that carries a login cookie.
+        wall_with_cookie: bool,
+        /// The works the page lists.
+        works: Vec<u32>,
+        /// The next page, when there is one.
+        next: Option<String>,
+        /// The body says the listing is incomplete without a login.
+        partial: bool,
+    }
+
+    impl TokenPage {
+        fn new(works: &[u32]) -> Self {
+            Self {
+                token: None,
+                wall_with_cookie: false,
+                works: works.to_vec(),
+                next: None,
+                partial: false,
+            }
+        }
+
+        /// The page demands this browser token.
+        fn guarded(mut self, token: &str) -> Self {
+            self.token = Some(token.to_string());
+            self
+        }
+
+        /// The page refuses every request that carries a login cookie.
+        fn walled_for_logins(mut self) -> Self {
+            self.wall_with_cookie = true;
+            self
+        }
+
+        /// The page says the listing is incomplete without a login.
+        fn partial(mut self) -> Self {
+            self.partial = true;
+            self
+        }
+
+        /// The page links to the next one.
+        fn with_next(mut self, next: &str) -> Self {
+            self.next = Some(next.to_string());
+            self
+        }
+    }
+
+    /// The body of one listing page.
+    fn token_page_body(page: &TokenPage) -> String {
+        let mut body = String::new();
+        if page.partial {
+            body.push_str("<p>partial</p>");
+        }
+        for work in &page.works {
+            body.push_str(&format!(
+                r#"<a href="https://token.example/story/{work}">作品</a>"#
+            ));
+        }
+        if let Some(next) = &page.next {
+            body.push_str(&format!(r#"<a href="{next}">次へ</a>"#));
+        }
+        body
+    }
+
+    /// A listing server whose answer depends on the cookie of the request.
+    struct TokenAuthorClient {
+        pages: HashMap<String, TokenPage>,
+        /// The URL and the cookie of every request, in order.
+        seen: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl TokenAuthorClient {
+        fn new(pages: &[(&str, TokenPage)]) -> Self {
+            Self {
+                pages: pages
+                    .iter()
+                    .map(|(url, page)| ((*url).to_string(), page.clone()))
+                    .collect(),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The cookies the server saw for `url`, in order.
+        fn cookies_for(&self, url: &str) -> Vec<Option<String>> {
+            self.seen
+                .lock()
+                .iter()
+                .filter(|(seen, _)| seen == url)
+                .map(|(_, cookie)| cookie.clone())
+                .collect()
+        }
+    }
+
+    impl HttpClient for TokenAuthorClient {
+        fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
+            Box::pin(async move {
+                let cookie = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, value)| value.clone());
+                self.seen.lock().push((request.url.clone(), cookie.clone()));
+                let Some(page) = self.pages.get(&request.url) else {
+                    return Ok(HttpResponse {
+                        status: 404,
+                        headers: vec![],
+                        body: Vec::new(),
+                    });
+                };
+                let accepted = match &page.token {
+                    Some(token) => cookie
+                        .as_deref()
+                        .is_some_and(|value| value.contains(&format!("token={token}"))),
+                    None => !page.wall_with_cookie || cookie.is_none(),
+                };
+                let body = if accepted {
+                    token_page_body(page)
+                } else {
+                    "ログインが必要".to_string()
+                };
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
+                    body: body.into_bytes(),
+                })
+            })
+        }
+
+        fn send_stream<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<crate::platform::HttpStreamResponse>> {
+            let url = request.url.clone();
+            Box::pin(async move {
+                let response = self.send(request).await?;
+                Ok(crate::platform::HttpStreamResponse {
+                    status: response.status, url, headers: response.headers,
+                    body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
+                })
+            })
+        }
+    }
+
+    /// A store that hands out browser tokens and counts what it was asked.
+    struct TokenStore {
+        groups: Mutex<BTreeMap<String, Vec<LoginGroup>>>,
+        /// How often the stored logins were read.
+        loads: AtomicUsize,
+        /// How often a browser token was renewed.
+        renewals: AtomicUsize,
+        /// The tokens handed out, in order. `None` = no token available.
+        handouts: Mutex<VecDeque<Option<String>>>,
+        /// The login id every renewal was asked for.
+        sessions: Mutex<Vec<Option<String>>>,
+    }
+
+    impl TokenStore {
+        fn new(logins: &[LoginGroup], handouts: &[Option<&str>]) -> Self {
+            let mut groups: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
+            for login in logins {
+                groups
+                    .entry(login.site.clone())
+                    .or_default()
+                    .push(login.clone());
+            }
+            Self {
+                groups: Mutex::new(groups),
+                loads: AtomicUsize::new(0),
+                renewals: AtomicUsize::new(0),
+                handouts: Mutex::new(
+                    handouts
+                        .iter()
+                        .map(|token| token.map(str::to_string))
+                        .collect(),
+                ),
+                sessions: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn renewals(&self) -> usize {
+            self.renewals.load(Ordering::SeqCst)
+        }
+
+        fn loads(&self) -> usize {
+            self.loads.load(Ordering::SeqCst)
+        }
+
+        /// The login id every renewal was asked for, in order.
+        fn sessions(&self) -> Vec<Option<String>> {
+            self.sessions.lock().clone()
+        }
+    }
+
+    impl CookieStore for TokenStore {
+        fn load_groups<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<Vec<LoginGroup>>> {
+            Box::pin(async move {
+                self.loads.fetch_add(1, Ordering::SeqCst);
+                Ok(self
+                    .groups
+                    .lock()
+                    .get(site)
+                    .cloned()
+                    .unwrap_or_default())
+            })
+        }
+
+        fn save_groups<'a>(
+            &'a self,
+            site: &'a str,
+            groups: &'a [LoginGroup],
+        ) -> PlatformFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.groups.lock().insert(site.to_string(), groups.to_vec());
+                Ok(())
+            })
+        }
+
+        fn compare_save_groups<'a>(
+            &'a self,
+            _site: &'a str,
+            _expected: &'a [LoginGroup],
+            _replacement: &'a [LoginGroup],
+        ) -> PlatformFuture<'a, Result<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn clear<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<bool>> {
+            Box::pin(async move { Ok(self.groups.lock().remove(site).is_some()) })
+        }
+
+        fn list_groups(&self) -> PlatformFuture<'_, Result<BTreeMap<String, Vec<LoginGroup>>>> {
+            Box::pin(async move { Ok(self.groups.lock().clone()) })
+        }
+
+        fn save_all_groups<'a>(
+            &'a self,
+            groups: &'a BTreeMap<String, Vec<LoginGroup>>,
+        ) -> PlatformFuture<'a, Result<()>> {
+            Box::pin(async move {
+                *self.groups.lock() = groups.clone();
+                Ok(())
+            })
+        }
+
+        fn merge_all_groups<'a>(
+            &'a self,
+            groups: &'a BTreeMap<String, Vec<LoginGroup>>,
+        ) -> PlatformFuture<'a, Result<usize>> {
+            Box::pin(async move { Ok(groups.len()) })
+        }
+
+        fn renew_response_cookies<'a>(
+            &'a self,
+            _sent_cookie: &'a str,
+            _set_cookie: &'a [String],
+        ) -> PlatformFuture<'a, Result<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        /// Hand out the next token for the login in effect.
+        ///
+        /// The account keeps its identity and its other cookies; only the
+        /// token is replaced.
+        fn refresh_browser_token<'a>(
+            &'a self,
+            site: &'a str,
+            _target_url: &'a str,
+            cookie_name: &'a str,
+            session_id: Option<&'a str>,
+        ) -> PlatformFuture<'a, Result<Option<LoginGroup>>> {
+            Box::pin(async move {
+                self.renewals.fetch_add(1, Ordering::SeqCst);
+                self.sessions.lock().push(session_id.map(str::to_string));
+                let Some(token) = self.handouts.lock().pop_front() else {
+                    return Ok(None);
+                };
+                let Some(token) = token else {
+                    // トークンを発行できない。
+                    return Ok(None);
+                };
+                let mut groups = self.groups.lock();
+                let Some(list) = groups.get_mut(site) else {
+                    return Ok(None);
+                };
+                let index = session_id
+                    .and_then(|id| list.iter().position(|group| group.id == id))
+                    .or_else(|| {
+                        list.iter().position(|group| {
+                            group
+                                .cookies
+                                .iter()
+                                .any(|entry| entry.cookie.contains(cookie_name))
+                        })
+                    });
+                let Some(index) = index else {
+                    return Ok(None);
+                };
+                let group = &mut list[index];
+                for entry in group.cookies.iter_mut() {
+                    entry.cookie = replace_cookie_value(&entry.cookie, cookie_name, &token);
+                }
+                Ok(Some(group.clone()))
+            })
+        }
+    }
+
+    /// Replace one cookie's value and keep the other ones.
+    fn replace_cookie_value(header: &str, name: &str, value: &str) -> String {
+        let mut pairs = Vec::new();
+        for part in header.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let Some((key, old)) = part.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = if key == name { value } else { old.trim() };
+            pairs.push(format!("{key}={value}"));
+        }
+        pairs.join("; ")
+    }
+
+    /// A stored login of the token site.
+    fn token_login(id: &str, cookie: &str) -> LoginGroup {
+        LoginGroup::new(
+            "token.example",
+            vec![HostCookie {
+                host: "token.example".to_string(),
+                cookie: cookie.to_string(),
+            }],
+        )
+        .with_id(id)
+    }
+
+    /// The listing of the token site, read with the store in effect.
+    fn token_works(
+        http: &dyn HttpClient,
+        store: &TokenStore,
+        setting: &SiteSetting,
+        page: &str,
+    ) -> Result<Vec<String>> {
+        futures::executor::block_on(
+            AuthorListing::new(http, &FakeRateLimiter::new(), Some(store)).works_for(&[setting], page),
+        )
+    }
+
+    #[test]
+    fn a_later_author_page_is_read_again_with_a_fresh_browser_token() {
+        // 2 頁目だけがブラウザ確認を要求する。1 頁目で終端にせず、前のページの
+        // 作品を捨てずに、同じ一覧をトークン更新後まで読み続ける。
+        let definitions = SiteSetting::load_bundled(&[TOKEN_SITE]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://token.example/user/5/story";
+        let second = "https://token.example/user/5/story?p=2";
+        let third = "https://token.example/user/5/story?p=3";
+        let http = TokenAuthorClient::new(&[
+            (page, TokenPage::new(&[1, 2]).with_next(second)),
+            (second, TokenPage::new(&[3, 4]).guarded("fresh-1").with_next(third)),
+            (third, TokenPage::new(&[5, 6]).guarded("fresh-1")),
+        ]);
+        let store = TokenStore::new(
+            &[token_login("acct-1", "sid=keep; token=stale")],
+            &[Some("fresh-1")],
+        );
+
+        let urls = token_works(&http, &store, setting, page).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://token.example/story/1".to_string(),
+                "https://token.example/story/2".to_string(),
+                "https://token.example/story/3".to_string(),
+                "https://token.example/story/4".to_string(),
+                "https://token.example/story/5".to_string(),
+                "https://token.example/story/6".to_string(),
+            ],
+            "更新前の作品も残す: {urls:?}"
+        );
+        assert_eq!(store.renewals(), 1, "2 頁目のために 1 回だけ更新する");
+        assert_eq!(store.loads(), 1, "資格情報は必要なときに 1 回だけ読む");
+        let seen = http.cookies_for(third);
+        assert_eq!(seen.len(), 1, "3 頁目は 1 回だけ要求する: {seen:?}");
+        assert!(
+            seen[0]
+                .as_deref()
+                .is_some_and(|cookie| cookie.contains("token=fresh-1")),
+            "3 頁目は更新した資格情報で読む: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn two_invalidated_pages_are_recovered_with_one_renewal_each() {
+        // 2 頁目と 3 頁目が別々に失効する。1 ページにつき 1 回だけ更新する。
+        let definitions = SiteSetting::load_bundled(&[TOKEN_SITE]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://token.example/user/5/story";
+        let second = "https://token.example/user/5/story?p=2";
+        let third = "https://token.example/user/5/story?p=3";
+        let http = TokenAuthorClient::new(&[
+            (page, TokenPage::new(&[1]).with_next(second)),
+            (second, TokenPage::new(&[2]).guarded("fresh-1").with_next(third)),
+            (third, TokenPage::new(&[3]).guarded("fresh-2")),
+        ]);
+        let store = TokenStore::new(
+            &[token_login("acct-1", "token=stale")],
+            &[Some("fresh-1"), Some("fresh-2")],
+        );
+
+        let urls = token_works(&http, &store, setting, page).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://token.example/story/1".to_string(),
+                "https://token.example/story/2".to_string(),
+                "https://token.example/story/3".to_string(),
+            ],
+            "失効したページも読み直す: {urls:?}"
+        );
+        assert_eq!(store.renewals(), 2, "失効したページごとに 1 回ずつ更新する");
+        assert_eq!(
+            http.cookies_for(third),
+            vec![Some("token=fresh-1".to_string()), Some("token=fresh-2".to_string())],
+            "3 頁目の確認要求後は 2 つ目のトークンで再試行する"
+        );
+    }
+
+    #[test]
+    fn a_renewal_keeps_the_account_and_its_stable_id() {
+        // 生效中のログインの ID で更新し、そのアカウントの他の cookie は残す。
+        let definitions = SiteSetting::load_bundled(&[TOKEN_SITE]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://token.example/user/5/story";
+        let second = "https://token.example/user/5/story?p=2";
+        let http = TokenAuthorClient::new(&[
+            (page, TokenPage::new(&[1]).with_next(second)),
+            (second, TokenPage::new(&[2]).guarded("fresh")),
+        ]);
+        // 1 回目はトークンを発行できない (更新できない)。2 回目は発行できる。
+        let store = TokenStore::new(
+            &[token_login("acct-1", "sid=keep; token=stale")],
+            &[None, Some("fresh")],
+        );
+
+        let urls = token_works(&http, &store, setting, page).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://token.example/story/1".to_string(),
+                "https://token.example/story/2".to_string(),
+            ],
+            "保存済みログインの資格情報で最後まで読む: {urls:?}"
+        );
+        assert_eq!(
+            store.sessions(),
+            vec![None, Some("acct-1".to_string())],
+            "生效中のログインの安定 ID で更新する"
+        );
+        let seen = http.cookies_for(second);
+        let last = seen.last().and_then(|cookie| cookie.as_deref()).unwrap_or("");
+        assert!(
+            last.contains("sid=keep") && last.contains("token=fresh"),
+            "アカウントの cookie を残したままトークンだけ差し替える: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_renewal_stops_the_page() {
+        // 発行されたトークンが拒否されても、同じページで更新し直さない。
+        let definitions = SiteSetting::load_bundled(&[TOKEN_SITE]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://token.example/user/5/story";
+        let second = "https://token.example/user/5/story?p=2";
+        let http = TokenAuthorClient::new(&[
+            (page, TokenPage::new(&[1]).with_next(second)),
+            (second, TokenPage::new(&[2]).guarded("wanted")),
+        ]);
+        // 保存済みログインはない: 匿名の試行だけになる。
+        let store = TokenStore::new(&[], &[Some("fresh")]);
+
+        let error = token_works(&http, &store, setting, page).unwrap_err();
+        assert!(matches!(error, NarouError::SiteSetting(_)), "got {error:?}");
+        assert!(error.to_string().contains("ログイン"), "got {error}");
+        assert_eq!(store.renewals(), 1, "同じページで更新し直さない");
+    }
+
+    #[test]
+    fn a_missing_page_is_not_renewed() {
+        // ページが無い (404) のは認証の問題ではない: 更新しない。
+        let definitions = SiteSetting::load_bundled(&[TOKEN_SITE]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://token.example/user/5/story";
+        let http = TokenAuthorClient::new(&[]);
+        let store = TokenStore::new(
+            &[token_login("acct-1", "token=stale")],
+            &[Some("fresh")],
+        );
+
+        let error = token_works(&http, &store, setting, page).unwrap_err();
+        assert!(matches!(error, NarouError::NotFound(_)), "got {error:?}");
+        assert_eq!(store.renewals(), 0, "ページが無いのは更新で直らない");
+    }
+
+    #[test]
+    fn a_readable_partial_listing_survives_a_failed_optional_renewal() {
+        // 匿名では部分一覧しか読めない。保存済みログインの試行が更新に失敗して
+        // 終わっても、読み終えた一覧は捨てない。
+        let definitions = SiteSetting::load_bundled(&[TOKEN_SITE]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://token.example/user/5/story";
+        let http = TokenAuthorClient::new(&[(
+            page,
+            TokenPage::new(&[1]).partial().walled_for_logins(),
+        )]);
+        let store = TokenStore::new(&[token_login("acct-1", "sid=keep")], &[]);
+
+        let urls = token_works(&http, &store, setting, page).unwrap();
+        assert_eq!(
+            urls,
+            vec!["https://token.example/story/1".to_string()],
+            "読める部分一覧は残す: {urls:?}"
+        );
+        assert_eq!(store.renewals(), 1, "任意の試行でも更新は 1 回だけ試す");
     }
 }

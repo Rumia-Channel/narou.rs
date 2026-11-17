@@ -17,6 +17,10 @@ struct Ctx<'a> {
     output: Vec<String>,
     match_start: Option<usize>,
     step_budget: usize,
+    /// The page being preprocessed. The DSL reads it (`extract`,
+    /// `extract_json`, `extract_all`) and rewrites it in place
+    /// (`insert_at_match`), so later reads see the rewritten text.
+    source: &'a mut String,
     /// Results of previously requested URLs, exposed to the DSL as `fetched`.
     jobs: &'a PreprocessJobs,
     /// URLs this run asked for, in request order.
@@ -24,7 +28,7 @@ struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(jobs: &'a PreprocessJobs, url: &str) -> Self {
+    fn new(jobs: &'a PreprocessJobs, url: &str, source: &'a mut String) -> Self {
         let mut vars = HashMap::new();
         vars.insert(
             "fetched".to_string(),
@@ -43,6 +47,7 @@ impl<'a> Ctx<'a> {
             output: Vec::new(),
             match_start: None,
             step_budget: PREPROCESS_STEP_BUDGET,
+            source,
             jobs,
             requested: Vec::new(),
         }
@@ -116,6 +121,24 @@ impl<'a> Ctx<'a> {
         validate_string_size(&value)?;
         self.output.push(value);
         Ok(())
+    }
+
+    /// Every match of `pattern` in the source, in source order.
+    ///
+    /// The first capture group is used when the pattern has one; a group that
+    /// did not take part in the match becomes null. A pattern without capture
+    /// groups yields the whole match. The first match also becomes the
+    /// `insert_at_match` anchor; a pattern that matches nothing leaves the
+    /// anchor of an earlier match alone.
+    fn extract_all(&mut self, pattern: &str, flags: &str) -> PreprocessResult<Value> {
+        let re = cached_preprocess_regex(pattern, flags)?;
+        let mut budget = self.step_budget;
+        let (items, first_start) = collect_matches(&re, self.source.as_str(), &mut budget)?;
+        self.step_budget = budget;
+        if let Some(start) = first_start {
+            self.match_start = Some(start);
+        }
+        Ok(Value::Array(items))
     }
 
     fn resolve_str_parts(&mut self, parts: &[StrPart]) -> PreprocessResult<String> {
@@ -322,34 +345,76 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
                 _ => Value::Null,
             }
         }
+        Expr::ExtractAll(pattern, flags) => ctx.extract_all(pattern, flags)?,
         Expr::ExtractJson(_, _) | Expr::Extract(_, _) | Expr::Regex(_, _) => Value::Null,
     };
     validate_value_limits(&value)?;
     Ok(value)
 }
 
+/// Collect every match of `re` in `source`, in source order.
+///
+/// Each match costs one step of the budget and is size-checked before it is
+/// appended, so a runaway pattern cannot build an unbounded array.
+fn collect_matches(
+    re: &regex::Regex,
+    source: &str,
+    budget: &mut usize,
+) -> PreprocessResult<(Vec<Value>, Option<usize>)> {
+    let has_capture = re.captures_len() > 1;
+    let mut items: Vec<Value> = Vec::new();
+    let mut first_start = None;
+    for caps in re.captures_iter(source) {
+        if *budget == 0 {
+            return Err("preprocess: step budget exceeded".into());
+        }
+        *budget -= 1;
+        let whole = caps.get(0).expect("group 0 always participates");
+        if first_start.is_none() {
+            first_start = Some(whole.start());
+        }
+        let value = if has_capture {
+            match caps.get(1) {
+                Some(group) => Value::String(group.as_str().to_string()),
+                // An optional capture that did not take part in this match.
+                None => Value::Null,
+            }
+        } else {
+            Value::String(whole.as_str().to_string())
+        };
+        if let Value::String(text) = &value {
+            validate_string_size(text)?;
+        }
+        validate_array_len(items.len() + 1)?;
+        items.push(value);
+    }
+    Ok((items, first_start))
+}
+
 fn eval_extract_json(
     ctx: &mut Ctx,
     pattern: &str,
     flags: &str,
-    source: &str,
 ) -> PreprocessResult<Option<Value>> {
     let re = cached_preprocess_regex(pattern, flags)?;
-    let Some(caps) = re.captures(source) else {
-        return Ok(None);
+    let (start, value) = {
+        let Some(caps) = re.captures(ctx.source.as_str()) else {
+            return Ok(None);
+        };
+        let Some(json_match) = caps.get(1) else {
+            return Ok(None);
+        };
+        validate_string_size(json_match.as_str())?;
+        let Some(full_match) = caps.get(0) else {
+            return Ok(None);
+        };
+        let value = serde_json::from_str(json_match.as_str()).ok();
+        if let Some(parsed) = &value {
+            validate_value_limits(parsed)?;
+        }
+        (full_match.start(), value)
     };
-    let Some(json_match) = caps.get(1) else {
-        return Ok(None);
-    };
-    validate_string_size(json_match.as_str())?;
-    let Some(full_match) = caps.get(0) else {
-        return Ok(None);
-    };
-    ctx.match_start = Some(full_match.start());
-    let value = serde_json::from_str(json_match.as_str()).ok();
-    if let Some(ref value) = value {
-        validate_value_limits(value)?;
-    }
+    ctx.match_start = Some(start);
     Ok(value)
 }
 
@@ -566,18 +631,18 @@ fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> PreprocessResult<V
     Ok(value)
 }
 
-fn eval_stmts(ctx: &mut Ctx, stmts: &[Stmt], source: &mut String) -> PreprocessResult<()> {
+fn eval_stmts(ctx: &mut Ctx, stmts: &[Stmt]) -> PreprocessResult<()> {
     for stmt in stmts {
-        eval_stmt(ctx, stmt, source)?;
+        eval_stmt(ctx, stmt)?;
     }
     Ok(())
 }
 
-fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResult<()> {
+fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt) -> PreprocessResult<()> {
     ctx.consume_step()?;
     match stmt {
         Stmt::Guard(guard_text) => {
-            if source.contains(guard_text.as_str()) {
+            if ctx.source.contains(guard_text.as_str()) {
                 ctx.output.clear();
                 ctx.set("__abort__", Value::Bool(true))?;
             }
@@ -588,16 +653,22 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
             }
             let val = match expr {
                 Expr::ExtractJson(pattern, flags) => {
-                    eval_extract_json(ctx, pattern, flags, source)?.unwrap_or(Value::Null)
+                    eval_extract_json(ctx, pattern, flags)?.unwrap_or(Value::Null)
                 }
                 Expr::Extract(pattern, flags) => {
                     let re = cached_preprocess_regex(pattern, flags)?;
-                    if let Some(captures) = re.captures(source) {
-                        ctx.match_start = captures.get(0).map(|matched| matched.start());
-                        captures.get(1).map(|matched| Value::String(matched.as_str().to_string()))
-                            .unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
+                    let matched = re.captures(ctx.source.as_str()).map(|captures| {
+                        (
+                            captures.get(0).map(|whole| whole.start()),
+                            captures.get(1).map(|group| group.as_str().to_string()),
+                        )
+                    });
+                    match matched {
+                        Some((start, capture)) => {
+                            ctx.match_start = start;
+                            capture.map(Value::String).unwrap_or(Value::Null)
+                        }
+                        None => Value::Null,
                     }
                 }
                 _ => eval_expr(ctx, expr)?,
@@ -646,8 +717,8 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
             let block = ctx.output.join("\n");
             validate_string_size(&block)?;
             let pos = ctx.match_start.unwrap_or(0);
-            source.insert_str(pos, &block);
-            validate_string_size(source)?;
+            ctx.source.insert_str(pos, &block);
+            validate_string_size(ctx.source.as_str())?;
             ctx.output.clear();
         }
         Stmt::If {
@@ -660,9 +731,9 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
             }
             let val = eval_expr(ctx, cond)?;
             if is_truthy(&val) {
-                eval_stmts(ctx, body, source)?;
+                eval_stmts(ctx, body)?;
             } else if let Some(else_body) = else_body {
-                eval_stmts(ctx, else_body, source)?;
+                eval_stmts(ctx, else_body)?;
             }
         }
         Stmt::For { var, iter, body } => {
@@ -670,14 +741,13 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
                 return Ok(());
             }
             let iter_val = eval_expr(ctx, iter)?;
-            let arr = match iter_val.as_array() {
-                Some(a) => a.clone(),
-                None => return Ok(()),
+            let Value::Array(arr) = iter_val else {
+                return Ok(());
             };
             validate_array_len(arr.len())?;
             for item in arr {
                 ctx.set(var, item)?;
-                eval_stmts(ctx, body, source)?;
+                eval_stmts(ctx, body)?;
                 if let Some(Value::Bool(true)) = ctx.get("__abort__") {
                     return Ok(());
                 }
@@ -693,8 +763,8 @@ pub(super) fn run_stmts(
     jobs: &PreprocessJobs,
     url: &str,
 ) -> PreprocessResult<super::PreprocessRun> {
-    let mut ctx = Ctx::new(jobs, url);
-    eval_stmts(&mut ctx, stmts, source)?;
+    let mut ctx = Ctx::new(jobs, url, source);
+    eval_stmts(&mut ctx, stmts)?;
     Ok(super::PreprocessRun {
         requested: ctx.requested,
     })
@@ -1387,13 +1457,209 @@ mod tests {
             },
             Stmt::InsertAtMatch,
         ];
-        let mut source =
-            r#"<script id="x" type="application/json">{"items":["a","b","c"]}</script>"#
+let mut source =
+            r#"<script id="x" type="application/json">{"items":[{"a":1,"b":[2,3]}]}</script>"#
                 .to_string();
         run(&stmts, &mut source).unwrap();
-        assert!(source.contains("a"));
-        assert!(source.contains("b"));
-        assert!(source.contains("c"));
+        assert!(source.contains("1"));
+        assert!(source.contains("2"));
+        assert!(source.contains("3"));
     }
 
+    // ---------- extract_all ----------
+
+    /// The author listing a site definition walks: one capture per work, in
+    /// the order the page lists them.
+    #[test]
+    fn extract_all_returns_captures_in_source_order() {
+        let html = "<ul>\
+            <li><a href=\"/story/111\">one</a></li>\
+            <li><a href=\"/story/222\">two</a></li>\
+            <li><a href=\"/story/333\">three</a></li>\
+            </ul>";
+        let out = run_program(
+            "for story in extract_all(/href=\"([^\"]*)\"/)\n\
+             emit \"<i>${story}</i>\"\n\
+             end\n\
+             insert_at_match\n",
+            html,
+        );
+        let first = out.find("<i>/story/111</i>").expect("first story");
+        let second = out.find("<i>/story/222</i>").expect("second story");
+        let third = out.find("<i>/story/333</i>").expect("third story");
+        assert!(first < second && second < third, "source order: {out}");
+    }
+
+    #[test]
+    fn extract_all_without_capture_groups_returns_whole_matches() {
+        let out = run_program(
+            "for tag in extract_all(/<b>.+?<\\/b>/)\n\
+             emit \"[${tag}]\"\n\
+             end\n\
+             insert_at_match\n",
+            "<p><b>one</b><b>two</b></p>",
+        );
+        assert!(out.contains("[<b>one</b>]"), "{out}");
+        assert!(out.contains("[<b>two</b>]"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_optional_capture_is_null_when_it_did_not_match() {
+        let out = run_program(
+            "let rows = extract_all(/id=\"(\\d+)?-(\\w+)\"/)\n\
+             if rows.is_array && rows.size == 2 && rows[0] == \"7\" && rows[1] == null\n\
+             emit \"optional-capture-valid\"\n\
+             end\n\
+             let compact = rows.compact\n\
+             if compact.size == 1 && compact[0] == \"7\"\n\
+             emit \"compact-valid\"\n\
+             end\n\
+             insert_at_match\n",
+            "<p id=\"7-x\">A</p><p id=\"-y\">B</p>",
+        );
+        assert!(out.contains("optional-capture-valid"), "{out}");
+        assert!(out.contains("compact-valid"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_honours_regex_flags() {
+        let out = run_program(
+            "for card in extract_all(/class=\"([a-z]+)\"/i)\n\
+             emit \"<b>${card}</b>\"\n\
+             end\n\
+             insert_at_match\n",
+            "<div CLASS=\"Card\">A</div><div class=\"card\">B</div>",
+        );
+        assert!(out.contains("<b>Card</b>"), "{out}");
+        assert!(out.contains("<b>card</b>"), "{out}");
+
+        // `s` lets the match span a line break; without it the same pattern
+        // finds nothing.
+        let out = run_program(
+            "let body = extract_all(/<div>(.+?)<\\/div>/s).first\n\
+             emit \"[${body}]\"\n\
+             insert_at_match\n",
+            "<div>\nline1\nline2\n</div>",
+        );
+        assert!(out.contains("line1\nline2"), "{out}");
+        let out = run_program(
+            "let body = extract_all(/<div>(.+?)<\\/div>/).first\n\
+             emit \"[${body}]\"\n\
+             insert_at_match\n",
+            "<div>\nline1\nline2\n</div>",
+        );
+        assert!(out.contains("[]"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_without_matches_is_an_empty_array() {
+        let out = run_program(
+            "let hits = extract_all(/no-such-thing/)\n\
+             if hits.is_array && hits.empty\n\
+             emit \"empty-array\"\n\
+             end\n\
+             insert_at_match\n",
+            "<p>body</p>",
+        );
+        assert!(out.starts_with("empty-array"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_result_can_be_chained() {
+        let out = run_program(
+            "let ids = extract_all(/href=\"([0-9])\"/)\n\
+             let names = ids.map { |id| \"n${id}\" }\n\
+             emit \"${names.join(\",\")}|${ids.size}|${ids.first}|${ids.last}\"\n\
+             insert_at_match\n",
+            "<a href=\"1\">a</a><a href=\"2\">b</a><a href=\"3\">c</a>",
+        );
+        assert!(out.contains("n1,n2,n3|3|1|3"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_works_inside_nested_expressions() {
+        let out = run_program(
+            "for story in extract_all(/story-([0-9])/)\n\
+             let tag = extract_all(/tag-([0-9])/).first\n\
+             emit \"<${story}:${tag}>\"\n\
+             end\n\
+             if extract_all(/story-([0-9])/).size == 2\n\
+             emit \"(two)\"\n\
+             end\n\
+             insert_at_match\n",
+            "<i>story-1</i><b>tag-9</b><i>story-2</i>",
+        );
+        assert!(out.contains("<1:9>"), "{out}");
+        assert!(out.contains("<2:9>"), "{out}");
+        assert!(out.contains("(two)"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_first_match_becomes_the_insert_anchor() {
+        let out = run_program(
+            "let hits = extract_all(/<b>(.*?)<\\/b>/)\n\
+             emit \"[${hits.size}]\"\n\
+             insert_at_match\n",
+            "head<b>one</b><b>two</b>",
+        );
+        assert_eq!(out, "head[2]<b>one</b><b>two</b>");
+    }
+
+    #[test]
+    fn extract_all_without_matches_keeps_the_previous_anchor() {
+        let out = run_program(
+            "let title = extract(/<h1>(.*?)<\\/h1>/)\n\
+             let none = extract_all(/no-such-thing/)\n\
+             emit \"[${title}]\"\n\
+             insert_at_match\n",
+            "head<h1>title</h1>",
+        );
+        assert_eq!(out, "head[title]<h1>title</h1>");
+    }
+
+    #[test]
+    fn extract_all_reads_the_source_after_an_insertion() {
+        let out = run_program(
+            "let hits = extract_all(/<p>(.*?)<\\/p>/)\n\
+             emit \"<i>${hits.first}</i>\"\n\
+             insert_at_match\n\
+             let again = extract_all(/<i>(.*?)<\\/i>/)\n\
+             emit \"<b>${again.first}</b>\"\n\
+             insert_at_match\n",
+            "<p>body</p>",
+        );
+        assert_eq!(out, "<b>body</b><i>body</i><p>body</p>");
+    }
+
+    #[test]
+    fn extract_all_handles_zero_width_matches() {
+        let source = "<p>あ</p>";
+        let out = run_program(
+            "emit extract_all(/(?:)/).size\n\
+             emit \"\"\n\
+             insert_at_match\n",
+            source,
+        );
+        let count: usize = out
+            .lines()
+            .next()
+            .and_then(|count| count.parse().ok())
+            .expect("a finite match count");
+        assert_eq!(count, source.chars().count() + 1, "{out}");
+    }
+
+    #[test]
+    fn extract_all_stops_at_the_step_budget() {
+        let source = "a".repeat(PREPROCESS_STEP_BUDGET + 1);
+        let stmts = crate::downloader::preprocess::parser::parse_preprocess(
+            "let hits = extract_all(/a/)\n\
+             emit \"${hits.size}\"\n",
+        )
+        .unwrap();
+        let mut text = source.clone();
+        let error = run_stmts(&stmts, &mut text, &PreprocessJobs::new(), "")
+            .expect_err("a runaway pattern must not run forever");
+        assert_eq!(error.to_string(), "preprocess: step budget exceeded");
+        assert_eq!(text, source, "a failed run leaves the source alone");
+    }
 }
