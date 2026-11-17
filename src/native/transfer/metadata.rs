@@ -11,7 +11,7 @@ impl NativeTransferBackend {
     }
     async fn frozen_source_generation(&self,entry:&ExportNovelEntry,file:&SourceFileEntry,key:&ObjectKey)->TR<String>{
         let generation=self.source_generation(key).await?.ok_or_else(||TransferError::PlanStale{message:"source disappeared before snapshot".into()})?;let binding=format!("source_generation:{}:{}",entry.novel_ordinal,sha256_hex(file.logical_path.as_bytes()));
-        let expected=self.journal.run(|rows|{if let Some(expected)=rows.get::<String>("backend",&entry.session_id.0,&binding)?{return Ok(expected);}rows.put("backend",&entry.session_id.0,&binding,&generation)?;Ok(generation.clone())})?;
+        let expected=self.journal.run_write(|rows|{if let Some(expected)=rows.get::<String>("backend",&entry.session_id.0,&binding)?{return Ok(expected);}rows.put("backend",&entry.session_id.0,&binding,&generation)?;Ok(generation.clone())})?;
         if expected!=generation{return Err(TransferError::PlanStale{message:"source changed between snapshot ranges".into()});}Ok(expected)
     }
     async fn restart_unverified_stage(&self,session:&SessionRow,mut file:FileRow,handle:&str)->TR<()>{

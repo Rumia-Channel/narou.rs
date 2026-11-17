@@ -15,7 +15,7 @@ impl NativeTransferBackend {
     }
     fn save_step(&self,spec:&PublicationSpec,phase:&str,publication:&NativePublication,undo:Option<(&str,&FileUndo)>,step:PublicationStep)->TR<PublicationStep>{
         let result_key=self.step_result_key(spec,phase)?;
-        self.journal.run(|rows|{
+        self.journal.run_write(|rows|{
             if let Some((key,undo))=undo{rows.put("backend",&spec.session_id.0,key,undo)?;}
             rows.put("backend",&spec.session_id.0,&format!("publication:{}",spec.publication_id),publication)?;
             rows.put("backend",&format!("publication_owners:{}",spec.session_id.0),&publication.owner,publication)?;
@@ -32,7 +32,7 @@ impl NativeTransferBackend {
         match self.primary.stage_open(stage,&session.0,1,SESSION_IDLE_TTL_SECS).await{Ok(cursor)=>Ok(cursor),Err(crate::error::NarouError::Platform(message))if message.starts_with("stage_checkpoint_invalid:")=>self.primary.stage_cursor(stage).await.map_err(TransferError::platform)?.ok_or_else(||TransferError::invalid("stage_missing","copy stage ledger missing")),Err(error)=>Err(TransferError::platform(error))}
     }
     async fn prepare_publication(&self,spec:&PublicationSpec)->TR<PublicationStep>{
-        if let Some(step)=self.saved_step(spec,"prepare")?{return Ok(step);}
+        self.journal.require_authority()?;if let Some(step)=self.saved_step(spec,"prepare")?{return Ok(step);}
         let current=self.publication(spec)?;let mut publication=self.work_input(&spec.session_id,&format!("prepare:{}",spec.publication_id),current)?;
         self.check_plan(spec,&publication).await?;let index=publication.prepared;
         if index>=spec.file_count{return self.save_step(spec,"prepare",&publication,None,PublicationStep{done:true,assigned_id:Some(publication.record_id),..Default::default()});}
@@ -82,7 +82,7 @@ impl NativeTransferBackend {
         self.save_step(spec,"prepare",&publication,Some((&undo_key,&undo)),PublicationStep{done:publication.prepared==spec.file_count,processed_bytes:processed,assigned_id:Some(publication.record_id),..Default::default()})
     }
     async fn install_publication(&self,spec:&PublicationSpec)->TR<PublicationStep>{
-        if let Some(step)=self.saved_step(spec,"install")?{return Ok(step);}let current=self.publication(spec)?;let mut publication=self.work_input(&spec.session_id,&format!("install:{}",spec.publication_id),current)?;let index=publication.installed;
+        self.journal.require_authority()?;if let Some(step)=self.saved_step(spec,"install")?{return Ok(step);}let current=self.publication(spec)?;let mut publication=self.work_input(&spec.session_id,&format!("install:{}",spec.publication_id),current)?;let index=publication.installed;
         if index>=spec.file_count{return self.save_step(spec,"install",&publication,None,PublicationStep{done:true,..Default::default()});}let file=self.publication_file(spec,index).await?;let undo_key=format!("undo:{}:{}:{}",spec.publication_id,publication.attempt,number(index));let mut undo:FileUndo=self.journal.backend_get(&spec.session_id.0,&undo_key)?.ok_or_else(||TransferError::invalid("preimage_missing","publication preimage missing"))?;
         if !undo.ready{return Err(TransferError::invalid("preimage_incomplete","cannot install before durable undo"));}
         if let Some(old)=&undo.old_stage{let cursor=self.primary.stage_cursor(old).await.map_err(TransferError::platform)?.ok_or_else(||TransferError::RecoveryRequired{message:"immutable preimage missing".into()})?;if !cursor.sealed||cursor.confirmed_bytes!=undo.old_size||cursor.prefix_sha256()!=undo.old_sha256{return Err(TransferError::RecoveryRequired{message:"immutable preimage seal changed".into()});}}
@@ -100,7 +100,7 @@ impl NativeTransferBackend {
         undo.installed=true;publication.installed=index+1;publication.content_revision=self.primary.gate_info(&ObjectPrefix::new(&publication.prefix).map_err(TransferError::platform)?).await.map_err(TransferError::platform)?.content_revision;self.save_step(spec,"install",&publication,Some((&undo_key,&undo)),PublicationStep{done:publication.installed==spec.file_count,processed_bytes:processed,..Default::default()})
     }
     async fn rollback_publication(&self,spec:&PublicationSpec,cursor:Option<&str>)->TR<PublicationStep>{
-        if self.committed(spec)?{return self.publication_finish(spec,cursor).await;}
+        self.journal.require_authority()?;if self.committed(spec)?{return self.publication_finish(spec,cursor).await;}
         if let Some(step)=self.saved_step(spec,"rollback")?{return Ok(step);}
         if self.journal.backend_get::<NativePublication>(&spec.session_id.0,&format!("publication:{}",spec.publication_id))?.is_none(){return Ok(PublicationStep{done:true,..Default::default()});}
         let publication=self.publication(spec)?;super::recover_metadata(&self.publication_directory(spec)).map_err(TransferError::platform)?;
@@ -128,7 +128,7 @@ impl NativeTransferBackend {
         undo.installed=false;self.save_step(spec,"rollback",&publication,Some((&undo_key,&undo)),PublicationStep{processed_bytes:processed,..finished})
     }
     async fn collect_session_resources(&self,session:&SessionRow,cursor:Option<&str>)->TR<PublicationStep>{
-        if !session.state.is_terminal(){return Err(TransferError::invalid("session_active","live resources cannot be reclaimed"));}
+        self.journal.require_authority()?;if !session.state.is_terminal(){return Err(TransferError::invalid("session_active","live resources cannot be reclaimed"));}
         if !self.journal.active_publications(&session.session_id,1).await?.is_empty(){return Err(TransferError::RecoveryRequired{message:"active publication protects its resources".into()});}
         let mut state:NativeGcCursor=cursor.map(serde_json::from_str).transpose().map_err(TransferError::platform)?.unwrap_or_default();
         match state.phase {

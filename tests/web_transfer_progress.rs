@@ -21,12 +21,17 @@ fn start(library: &Path) -> Server {
     std::fs::create_dir_all(library.join(".narou")).unwrap();
     std::fs::create_dir_all(library.join(".narousetting")).unwrap();
     std::fs::write(library.join(".narousetting/global_setting.yaml"), "server-ws-port: 0\n").unwrap();
+    // Keep SQLite auxiliary scratch files inside the owned fixture rather
+    // than depending on the user's ambient temporary-directory setup.
+    let temp = library.join(".narou/tmp");
+    std::fs::create_dir_all(&temp).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let log_path = library.join("server-test.log");
     let log = std::fs::File::create(&log_path).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_narou_rs"))
         .args(["web", "--port", &port.to_string(), "--no-browser"])
         .current_dir(library).env("HOME", library).env("USERPROFILE", library)
+        .env("TMP", &temp).env("TEMP", &temp)
         .env_remove("NAROU_RS_LEGACY_YAML").env_remove("NAROU_RS_MIRROR_FILES")
         .stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
     let mut server = Server { child, base: format!("http://127.0.0.1:{port}"), token: String::new() };
@@ -273,7 +278,7 @@ fn native_web_v2_roundtrips_158_novels_with_durable_receipts_and_runtime_project
     // finished publication must carry the receipt bytes verbatim, match the
     // immutable expected receipt and resolve its metadata journal as committed.
     let mut marks=0;for session in std::fs::read_dir(target.join(".narou/transfer/publications")).unwrap(){for publication in std::fs::read_dir(session.unwrap().path()).unwrap(){let publication=publication.unwrap().path();if let Ok(committed)=std::fs::read(publication.join("committed")){assert_eq!(committed,std::fs::read(publication.join("expected-receipt")).unwrap(),"durable commit mark must be the immutable receipt");serde_json::from_slice::<Value>(&committed).unwrap();assert_eq!(std::fs::read(publication.join("metadata-resolved")).unwrap(),b"committed");marks+=1;}}}assert!(marks>=3,"{marks}");
-    for admin in [false,true]{let secret=hex::encode([43u8;32]);let mut cancelled=create(&client,&source_server,"exports",&secret,json!({"ids":[ids[0]],"profile":"runtime","extra_roles":[]}));let id=session_id(&cancelled).to_owned();let path=format!("/api/transfer/v2/{}/{id}",if admin{"sessions"}else{"exports"});let body=json!({"operation_id":uuid::Uuid::new_v4().to_string()});let etag=format!("\"{}\"",revision(&cancelled));let send=||with_json(authenticated(&client,&source_server,reqwest::Method::DELETE,&path,(!admin).then_some(secret.as_str())).header("if-match",&etag), &body).send().unwrap();let result=decode(send());assert_eq!(result,decode(send()));cancelled=result;advance(&client,&source_server,"exports",&secret,&mut cancelled);assert_eq!(cancelled["state"],"cancelled");}
+    for admin in [false,true]{let secret=hex::encode([43u8;32]);let mut cancelled=create(&client,&source_server,"exports",&secret,json!({"ids":[ids[0]],"profile":"runtime","extra_roles":[]}));let id=session_id(&cancelled).to_owned();let path=format!("/api/transfer/v2/{}/{id}?operation_id={}",if admin{"sessions"}else{"exports"},uuid::Uuid::new_v4());let etag=format!("\"{}\"",revision(&cancelled));let send=||authenticated(&client,&source_server,reqwest::Method::DELETE,&path,(!admin).then_some(secret.as_str())).header("if-match",&etag).send().unwrap();let result=decode(send());assert_eq!(result,decode(send()));cancelled=result;advance(&client,&source_server,"exports",&secret,&mut cancelled);assert_eq!(cancelled["state"],"cancelled");}
 
 }
 
@@ -348,6 +353,65 @@ fn native_web_v2_sqlite_db_only_imports_exports_and_recovers_without_mirror_file
     for(index,payload)in payloads{assert_eq!(re_payloads.remove(&index).as_deref(),Some(payload.as_slice()),"file {index} payload must round trip byte-exact through DB-only");}
     control(&client,&target_server,"exports",&secret,&mut status,"complete",json!({}));advance(&client,&target_server,"exports",&secret,&mut status);assert_eq!(status["state"],"released");
 }
+
+/// A configured SQLite library must refuse transfer when its authority cannot
+/// open, rather than upload on a YAML fallback and fail during publication.
+#[test]
+fn native_web_v2_refuses_transfer_when_configured_sqlite_is_unavailable(){
+    let temp=test_root();let library:PathBuf=temp.path().join("broken");
+    std::fs::create_dir_all(library.join(".narou")).unwrap();
+    std::fs::write(library.join(".narou/storage-backend"),"sqlite\n").unwrap();
+    std::fs::write(library.join(".narou/local_setting.yaml"),"sqlite.mirror-files: false\n").unwrap();
+    // An existing but unopenable database: `configure` fails on every
+    // `active_for` attempt, deterministically (no environment games).
+    std::fs::write(library.join(".narou/db.sqlite"),b"not a sqlite database").unwrap();
+    let server=start(&library);let client=Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
+    let caps=get(&client,&server,"/api/transfer/v2/capabilities",None);
+    assert_eq!(caps["storage"]["methods"],json!(["sqlite"]),"{caps}");
+    for direction in ["import","export"]{
+        assert_eq!(caps["storage"][direction]["allowed"],false,"{caps}");
+        assert!(caps["storage"][direction]["reason"].as_str().is_some_and(|r|!r.is_empty()),"{caps}");
+    }
+    let secret=hex::encode([23u8;32]);
+    let body=json!({"request_id":uuid::Uuid::new_v4().to_string(),"creation_ticket":caps["creation_ticket"].clone(),
+        "source_fingerprint":"a".repeat(64),"profile":TransferProfile::Runtime,"extra_roles":[],
+        "policy_version":caps["storage"]["policy_version"].as_u64().unwrap(),"conflict_policy":"skip",
+        "manifest_size":"1","manifest_sha256":"b".repeat(64)});
+    let response=with_json(authenticated(&client,&server,reqwest::Method::POST,"/api/transfer/v2/imports",Some(&secret)),&body).send().unwrap();
+    let status=response.status();
+    let error:Value=serde_json::from_str(&response.text().unwrap()).unwrap();
+    assert_eq!(status.as_u16(),501,"{error}");
+    assert_eq!(error["error"]["code"],"import_unsupported","{error}");
+    assert_eq!(error["error"]["retryable"],false,"{error}");
+}
+
+#[test]
+fn native_web_v2_client_delete_cancels_with_query_operation_and_replays_receipt(){
+    let temp=test_root();let client=Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
+    for sqlite in [false,true]{
+        let library=temp.path().join(if sqlite{"sqlite"}else{"yaml"});
+        std::fs::create_dir_all(library.join(".narou")).unwrap();
+        if sqlite{std::fs::write(library.join(".narou/storage-backend"),"sqlite\n").unwrap();}
+        let server=start(&library);let caps=get(&client,&server,"/api/transfer/v2/capabilities",None);
+        assert_eq!(caps["storage"]["import"]["allowed"],true,"{caps}");
+        let secret=hex::encode([29u8;32]);
+        for admin in [false,true]{
+            let body=json!({"request_id":uuid::Uuid::new_v4().to_string(),"creation_ticket":caps["creation_ticket"].clone(),
+                "source_fingerprint":"c".repeat(64),"profile":TransferProfile::Runtime,"extra_roles":[],
+                "policy_version":caps["storage"]["policy_version"].as_u64().unwrap(),"conflict_policy":"skip",
+                "manifest_size":"1","manifest_sha256":"d".repeat(64)});
+            let status=decode(with_json(authenticated(&client,&server,reqwest::Method::POST,"/api/transfer/v2/imports",Some(&secret)),&body).send().unwrap());
+            let path=format!("/api/transfer/v2/{}/{}?operation_id={}",if admin{"sessions"}else{"imports"},session_id(&status),uuid::Uuid::new_v4());
+            let etag=format!("\"{}\"",revision(&status));
+            let send=||authenticated(&client,&server,reqwest::Method::DELETE,&path,if admin{None}else{Some(&secret)}).header("if-match",&etag).send().unwrap();
+            let mut cancelled=decode(send());
+            assert_eq!(cancelled,decode(send()),"a lost DELETE ACK must replay its immutable receipt");
+            advance(&client,&server,"imports",&secret,&mut cancelled);
+            assert_eq!(cancelled["state"],"cancelled","{cancelled}");
+        }
+    }
+}
+
 
 /// Kept alive only while the real-browser CI controller owns the stop file.
 /// The normal HTTP tests never start this fixture.
