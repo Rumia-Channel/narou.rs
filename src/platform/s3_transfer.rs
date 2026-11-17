@@ -327,8 +327,35 @@ impl S3Store {
     pub(super) async fn conditional_stream_write(&self,key:&ObjectKey,stream:AssetStream,size:u64,sha:&str)->Result<WriteOnce>{self.write_stream_once_verified(key,stream,size,sha).await.map(|(outcome,_)|outcome)}
     pub async fn write_stream_once_verified(&self,key:&ObjectKey,stream:AssetStream,size:u64,sha:&str)->Result<(WriteOnce,String)>{
         use crate::platform::TransferStageStore;
-        transfer_stage::check_hash_named_key(key,sha)?;
+        let hash_named_pool=transfer_stage::hash_named_digest(key).is_some_and(|digest|digest.eq_ignore_ascii_case(sha));
+        if !hash_named_pool{transfer_stage::check_hash_named_key(key,sha)?;}
         if !is_sha256_hex(sha){return Err(NarouError::Platform("invalid write-once SHA-256".into()));}
+        // A bounded, content-addressed PUT is atomic and leaves no multipart
+        // identity to reclaim. Version targets and larger streams keep journals.
+        let stream:AssetStream=if hash_named_pool&&(size==u64::MAX||size<=transfer_stage::STAGE_APPEND_MAX as u64){
+            let mut input=transfer_stage::bounded_chunks(stream);
+            let mut buffer=Vec::new();
+            loop{
+                let Some(chunk)=input.next().await else{
+                    let measured=buffer.len() as u64;
+                    if (size!=u64::MAX&&size!=measured)||!hex::encode(sha2::Sha256::digest(&buffer)).eq_ignore_ascii_case(sha){
+                        return Err(NarouError::Platform("write-once size/SHA mismatch".into()));
+                    }
+                    let(response,_)=self.send(HttpMethod::Put,&self.location().object_url(key),&[("if-none-match","*"),("content-type",crate::platform::content_type_for_key(key).unwrap_or("application/octet-stream"))],Some(buffer),Some(XML_LIMIT)).await?;
+                    if matches!(response.status,409|412){return self.verify_immutable_object(key,measured,sha).await.map(|etag|(WriteOnce::Reused,etag));}
+                    super::streaming::require_status(&response,&[200,201,204],"conditional PUT")?;
+                    let etag=response.header("etag").map(|value|value.trim_matches('"').to_owned()).filter(|etag|!etag.is_empty())
+                        .ok_or_else(||NarouError::Platform("conditional PUT omitted ETag proof".into()))?;
+                    return Ok((WriteOnce::Written,etag));
+                };
+                let bytes=chunk?;
+                if bytes.len()>transfer_stage::STAGE_APPEND_MAX-buffer.len(){
+                    let prefix=futures::stream::iter([Ok(buffer),Ok(bytes)]);
+                    break Box::pin(prefix.chain(input)) as AssetStream;
+                }
+                if buffer.is_empty(){buffer=bytes;}else{buffer.extend_from_slice(&bytes);}
+            }
+        }else{stream};
         let random=staging::new_staging_key()?;let id=random.as_ref().strip_prefix(staging::STAGING_PREFIX).expect("stage prefix");let owner=format!("conditional/{id}");
         let stage=transfer_stage::stage_asset_stream(self,id,&owner,1,24*60*60,stream).await?;
         let size=if size==u64::MAX{stage.size}else{size};

@@ -782,15 +782,28 @@ export default class extends Production.default {
     for (const image of imageReferences) assert(animatedImages.has(image), 'the displayed image must retain every animation frame');
     assert.equal(liveReaders(), 0, 'EOF must release the actual D1 reader lease inline');
     const upstreamClosed = Promise.withResolvers();
+    const upstreamPaused = Promise.withResolvers();
     let stalledResponse;
-    multipart.beforeReadBody = async (_req, res, key, bytes) => {
-      if (!key.includes('/.narou-staging/') || !isAnimation(bytes)) return false;
+    const cancellationReads = { total: 0, animation: 0, first: [], last: null };
+    multipart.beforeReadBody = async (_req, res, key, bytes, range) => {
+      cancellationReads.total++;
+      if (isAnimation(bytes)) cancellationReads.animation++;
+      const observed = { key, size: bytes.length, range };
+      if (cancellationReads.first.length < 4) cancellationReads.first.push(observed);
+      cancellationReads.last = observed;
+      if ((!key.includes('/.narou-staging/') && !key.includes('/.narou-transfer/')) || !isAnimation(bytes)) return false;
+      // Header probes use small ranges. The body may use one full-image
+      // Range response while still consuming it in bounded stream chunks.
+      if (range && range.end - range.start + 1 <= 8 * 1024 * 1024) return false;
       assert.equal(stalledResponse, undefined, 'only the EPUB image stream may reach the cancellation gate');
       stalledResponse = res;
       res.once('close', () => upstreamClosed.resolve());
       // Never send EOF: releasing admission by silently finishing the book
       // would not prove cancellation. The upstream request must be aborted.
-      res.write(bytes.subarray(0, 8 * 1024 * 1024));
+      const start = range?.start ?? 0;
+      const length = 8 * 1024 * 1024;
+      res.write(bytes.subarray(start, start + length));
+      upstreamPaused.resolve();
       await upstreamClosed.promise;
       return true;
     };
@@ -805,6 +818,12 @@ export default class extends Production.default {
         const { value, done } = await cancelledReader.read();
         assert(!done, 'cancel must occur while the large image is still being delivered');
         cancelBytes += value.length;
+      }
+      while (!stalledResponse) {
+        const next = await Promise.race([cancelledReader.read(), upstreamPaused.promise.then(() => null)]);
+        if (next === null) break;
+        assert(!next.done, `the upstream image must remain incomplete until cancellation: ${JSON.stringify(cancellationReads)}`);
+        cancelBytes += next.value.length;
       }
       assert(stalledResponse, 'the upstream image must be paused before EOF');
       assert(liveReaders() > 0, 'the paused HTTP body must retain novel admission as well as memory');
@@ -1055,10 +1074,11 @@ export default class extends Entry {
     assert.equal(after.attempts, cancelled.attempts);
     assert.deepEqual([...sourceRequests.entries()], received, 'canceled continuation cannot fetch another episode or TOC');
     assert.deepEqual([...imageRequests.entries()], images, 'canceled continuation cannot fetch another image');
-    assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), 1);
     await settleCreation(jobId);
     assert.equal(scalar(`SELECT checkpoint_json IS NULL FROM worker_jobs WHERE job_id=${quote(jobId)}`), 1,
       'only complete fenced cleanup may clear the durable reservation proof');
+    assert.equal(scalar("SELECT COUNT(*) FROM content_objects WHERE instr(object_key,'/cache/')=0"), 0,
+      'terminal creation cleanup must not retain an unpublished episode');
     console.log('PASS clearing after budget yield preserves the tombstone and original identity through full fenced cleanup');
 
     // The same namespace must now support a REAL fresh acquisition. Pause its
