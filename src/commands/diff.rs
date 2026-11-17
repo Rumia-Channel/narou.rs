@@ -432,6 +432,29 @@ fn display_diff_list(context: &NovelContext) -> std::result::Result<(), String> 
 }
 
 
+/// Remove a directory tree only when it contains no files at all. Legacy
+/// `cache/` and `.cache/` layouts can leave empty version directories the
+/// store never tracked; real files always keep their parent directories.
+fn remove_empty_diff_tree(path: &Path, novel_directory: &Path) -> std::result::Result<bool, String> {
+    let path = narou_rs::db::paths::ensure_within_archive_root(path, novel_directory)
+        .map_err(|error| error.to_string())?;
+    let mut empty = true;
+    for entry in fs::read_dir(&path).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_dir() {
+            empty &= remove_empty_diff_tree(&entry.path(), novel_directory)?;
+        } else {
+            empty = false;
+        }
+    }
+    if !empty {
+        return Ok(false);
+    }
+    fs::remove_dir(path).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
 /// Maintenance edits a private snapshot; canonical deletes and SQL pruning use
 /// the same origin captured before reading the old cache.
 fn clean_diff_data(context: &NovelContext) -> std::result::Result<bool, String> {
@@ -451,13 +474,42 @@ fn clean_diff_data(context: &NovelContext) -> std::result::Result<bool, String> 
     }
     snapshot.publish_changes().map_err(|error| error.to_string())?;
     let primary = narou_rs::native::object_store::NativeStore::for_current_root().map_err(|error| error.to_string())?;
-    if matches!(&primary, narou_rs::native::object_store::NativeStore::Sqlite(_)) {
-        let pruned = primary.with_open_write(snapshot.origin().fence(), || {
+    let is_sqlite = matches!(&primary, narou_rs::native::object_store::NativeStore::Sqlite(_));
+    let archive = db::with_database(|database| Ok(database.archive_root().to_path_buf())).map_err(|error| error.to_string())?;
+    removed |= primary.with_open_write(snapshot.origin().fence(), || {
+        // The store only tracks files; legacy layouts can still leave empty
+        // cache version directories on disk. Retire empty trees under both
+        // cache names while real files keep their parents.
+        let mut legacy_removed = false;
+        for name in DIFF_CACHE_DIR_NAMES {
+            let root = narou_rs::db::paths::ensure_within_archive_root(
+                &directory.join(SECTION_SAVE_DIR).join(name), &archive)?;
+            match fs::read_dir(&root) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry.map_err(narou_rs::error::NarouError::from)?;
+                        let path = narou_rs::db::paths::ensure_within_archive_root(&entry.path(), &archive)?;
+                        if entry.file_type().map_err(narou_rs::error::NarouError::from)?.is_dir()
+                            && remove_empty_diff_tree(&path, &directory).map_err(narou_rs::error::NarouError::Platform)?
+                        {
+                            legacy_removed = true;
+                        }
+                    }
+                    if remove_empty_diff_tree(&root, &directory).map_err(narou_rs::error::NarouError::Platform)? {
+                        legacy_removed = true;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if is_sqlite {
             let connection = version_conn().map_err(narou_rs::error::NarouError::Platform)?;
-            narou_rs::native::sqlite::versions::prune_history(&connection.lock(), context.record.id, 0)
-        }).map_err(|error| error.to_string())?;
-        removed |= pruned > 0;
-    }
+            let pruned = narou_rs::native::sqlite::versions::prune_history(&connection.lock(), context.record.id, 0)?;
+            legacy_removed |= pruned > 0;
+        }
+        Ok(legacy_removed)
+    }).map_err(|error| error.to_string())?;
     Ok(removed)
 }
 

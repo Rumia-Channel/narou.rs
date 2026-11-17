@@ -279,7 +279,9 @@ fn native_web_v2_roundtrips_158_novels_with_durable_receipts_and_runtime_project
 
 #[test]
 fn native_web_v2_roundtrips_six_mebibyte_title_without_prefix_replay(){
-    let temp=test_root();let source=temp.path().join("source");let target=temp.path().join("target");let ids=seed_novels(&source,158);let path=source.join(".narou/database.yaml");let mut records:BTreeMap<i64,Value>=serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();records.get_mut(&ids[0]).unwrap()["title"]=Value::String("\0".repeat(6*1024*1024));std::fs::write(&path,serde_yaml::to_string(&records).unwrap()).unwrap();drop(records);
+    // Exercise the wire scalar, not an unrelated startup rewrite for legacy
+    // records that have never received their immutable attribute classification.
+    let temp=test_root();let source=temp.path().join("source");let target=temp.path().join("target");let ids=seed_novels(&source,158);let path=source.join(".narou/database.yaml");let mut records:BTreeMap<i64,Value>=serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();for record in records.values_mut(){record["attribute_tag"]=json!("小説");}records.get_mut(&ids[0]).unwrap()["title"]=Value::String("\0".repeat(6*1024*1024));std::fs::write(&path,serde_yaml::to_string(&records).unwrap()).unwrap();drop(records);
     let source_server=start(&source);let target_server=start(&target);let client=Client::builder().timeout(Duration::from_secs(60)).build().unwrap();let(manifest,payloads)=export_profile(&client,&source_server,&source,&ids[..1],TransferProfile::Runtime);let title=&manifest.novels[0].title;assert_eq!(title.len(),6*1024*1024);assert!(title.bytes().all(|byte|byte==0));let fingerprint=narou_rs::transfer::source_fingerprint(&manifest).unwrap();let imported=import_projected(&client,&target_server,&manifest,&fingerprint,&payloads,false,TransferProfile::Runtime);assert_eq!(imported["published_novels"],1);
     let records:BTreeMap<i64,narou_rs::db::NovelRecord>=serde_yaml::from_str(&std::fs::read_to_string(target.join(".narou/database.yaml")).unwrap()).unwrap();assert_eq!(records.len(),1);assert_eq!(&records.values().next().unwrap().title,title);
 }
