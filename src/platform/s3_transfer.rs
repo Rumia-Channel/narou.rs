@@ -333,7 +333,9 @@ impl S3Store {
         let stage=transfer_stage::stage_asset_stream(self,id,&owner,1,24*60*60,stream).await?;
         let size=if size==u64::MAX{stage.size}else{size};
         if stage.size!=size||!stage.sha256.eq_ignore_ascii_case(sha){let _=self.stage_abort(id,&owner,1).await;return Err(NarouError::Platform("write-once size/SHA mismatch".into()));}
-        let lock_id=format!("conditional-{}",hex::encode(sha2::Sha256::digest(key.as_ref().as_bytes())));
+        // The conditional destination write arbitrates reuse. Its durable
+        // upload journal belongs to this invocation, not to a shared target.
+        let lock_id=format!("conditional-{id}");
         self.stage_open(&lock_id,&owner,1,24*60*60).await?;
         self.transfer_ledger_mutate(&lock_id,|current|{let mut record=current.ok_or_else(||NarouError::Platform("conditional reservation missing".into()))?;transfer_stage::require_owner(&record,&owner,1)?;record.publication_target=Some(key.to_string());Ok(record)}).await?;
         let result=async {

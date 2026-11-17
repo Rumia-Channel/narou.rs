@@ -136,7 +136,16 @@ impl S3Store {
     pub(super) async fn abort_upload(&self, key: &ObjectKey, upload_id: &str) -> Result<()> {
         let url = format!("{}?uploadId={}", self.location.object_url(key), encode_query(upload_id));
         let (response, _) = self.send(HttpMethod::Delete, &url, &[], None, Some(XML_LIMIT)).await?;
-        require_status(&response, &[200, 204, 404], "abort multipart")
+        // A completed (or already aborted) upload no longer has an upload ID.
+        // Only this documented 404 is idempotent success, not arbitrary Error
+        // XML, a missing bucket, or an embedded error in a 2xx response.
+        if response.status == 404 && std::str::from_utf8(&response.body).ok()
+            .and_then(|xml| super::super::s3_request::xml_result_body(xml, "Error"))
+            .and_then(|xml| super::super::s3_request::element_text(xml, "Code")).as_deref() == Some("NoSuchUpload")
+        {
+            return Ok(());
+        }
+        require_status(&response, &[200, 204], "abort multipart")
     }
 
     pub(super) async fn multipart_write(&self, destination: &ObjectKey, stream: AssetStream) -> Result<()> {
