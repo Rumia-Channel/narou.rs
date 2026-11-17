@@ -241,6 +241,9 @@ impl ConversionWorkspace {
         &self, id: i64, output: &Path, text: Option<&Path>, illustrations: &std::collections::HashSet<String>,
     ) -> crate::error::Result<std::path::PathBuf> {
         let Some(origin) = &self.origin else { return Ok(output.to_path_buf()); };
+        // Settings use this same SQLite connection; resolve them before the
+        // fenced transaction instead of recursively locking it from inside.
+        let keep_text = crate::converter::keep_converted_text_file();
         for name in illustrations {
             let path = self.path().join("挿絵").join(name);
             if path.is_file() { self.publish(&path)?; }
@@ -250,7 +253,7 @@ impl ConversionWorkspace {
             if path.is_file() { self.publish(&path)?; }
         }
         if let Some(text) = text {
-            if output != text && crate::converter::keep_converted_text_file() { self.publish(text)?; }
+            if output != text && keep_text { self.publish(text)?; }
             if let Some(primary) = &self.primary
                 && matches!(primary.as_ref(), crate::native::object_store::NativeStore::Sqlite(_))
             {
@@ -263,7 +266,7 @@ impl ConversionWorkspace {
                 let bytes = std::fs::read(text)?;
                 primary.with_open_fence_transaction(origin.fence(), |connection| {
                     crate::native::sqlite::content::store_sections_in_tx(connection, id, &map)?;
-                    if crate::converter::keep_converted_text_file() {
+                    if keep_text {
                         crate::native::sqlite::content::store_output(connection, id, "converted_text", &bytes)?;
                     } else {
                         crate::native::sqlite::content::delete_output(connection, id, "converted_text")?;

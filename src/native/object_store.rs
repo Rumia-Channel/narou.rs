@@ -211,6 +211,39 @@ impl NativeObjectStore {
         Ok(())
     }
 
+    /// Closed-removal directory hygiene. Object deletion leaves empty
+    /// directories (`本文/`, then the novel directory itself) behind; upstream
+    /// `narou remove --with-file` removes the whole novel directory, so walk
+    /// the removed object's ancestors and unlink directories while they sit
+    /// inside this novel's prefix directory and turn up empty. A foreign file
+    /// (never listed as an object) or a control file outside the prefix stops
+    /// the walk without touching anything outside the removed novel. The
+    /// caller's gate/transfer lock is still held, so no reader or writer can
+    /// admit into the emptied namespace meanwhile.
+    pub(crate) fn prune_empty_dirs_in_prefix(&self, prefix: &ObjectPrefix, path: &Path) -> Result<()> {
+        let stop = self.resolve_prefix_dir(prefix.as_ref())?;
+        let mut current = match path.parent() { Some(parent) => parent, None => return Ok(()) };
+        loop {
+            if !current.starts_with(&stop) { return Ok(()); }
+            match fs::remove_dir(current) {
+                Ok(()) => {
+                    self.created_dirs.lock().remove(current);
+                }
+                Err(error) => {
+                    match error.kind() {
+                        std::io::ErrorKind::NotFound => { self.created_dirs.lock().remove(current); }
+                        std::io::ErrorKind::DirectoryNotEmpty => return Ok(()),
+                        _ => return Err(error.into()),
+                    }
+                }
+            }
+            match current.parent() {
+                Some(parent) => current = parent,
+                None => return Ok(()),
+            }
+        }
+    }
+
     fn write_small_blocking(&self, key: &ObjectKey, data: Vec<u8>) -> Result<()> {
         if data.len() as u64 > MAX_SMALL_OBJECT_BYTES {
             return Err(NarouError::Platform(format!(
@@ -431,7 +464,7 @@ impl ObjectStore for NativeObjectStore {
         let result=self.update_small_blocking(key,mutate)?;if matches!(result,ObjectUpdateResult::Committed){gate.content_revision=gate.content_revision.checked_add(1).ok_or_else(||NarouError::Platform("content revision overflow".into()))?;}Ok(result)
     }))})}
     fn access_fence(&self) -> Option<&dyn NovelAccessFence> { Some(self) }
-    fn delete_closed<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{Box::pin(async move{af::parse_removal_owner(owner)?;run_scoped_blocking(||self.with_gate(prefix,|gate|{gate.require_writer(prefix,owner,epoch)?;if !prefix.matches(key){return Err(NarouError::Platform("closed deletion outside novel".into()));}let path=self.resolve_path(key)?;match fs::remove_file(&path){Ok(())=>{sync_transfer_parent(&path)?;gate.content_revision=gate.content_revision.checked_add(1).ok_or_else(||NarouError::Platform("content revision overflow".into()))?;Ok(())},Err(error)if error.kind()==std::io::ErrorKind::NotFound=>Ok(()),Err(error)=>Err(error.into())}}))})}
+    fn delete_closed<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{Box::pin(async move{af::parse_removal_owner(owner)?;run_scoped_blocking(||self.with_gate(prefix,|gate|{gate.require_writer(prefix,owner,epoch)?;if !prefix.matches(key){return Err(NarouError::Platform("closed deletion outside novel".into()));}let path=self.resolve_path(key)?;match fs::remove_file(&path){Ok(())=>{sync_transfer_parent(&path)?;gate.content_revision=gate.content_revision.checked_add(1).ok_or_else(||NarouError::Platform("content revision overflow".into()))?;},Err(error)if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(error.into())}self.prune_empty_dirs_in_prefix(prefix,&path)}))})}
     fn read_stream_leased<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
         NativeObjectStore::read_stream_leased(self, prefix, lease, key, range)
     }
@@ -832,12 +865,6 @@ impl NativeStore {
         Self::for_narou_root(&narou_root)
     }
 
-    pub(crate) fn prefer_existing_files(self) -> Self {
-        match self {
-            Self::Sqlite(store) => Self::Sqlite(store.prefer_existing_files()),
-            store => store,
-        }
-    }
 
     /// List immediate file children without walking histories or illustrations.
     /// SQLite rows and legacy filesystem-only files are both included.

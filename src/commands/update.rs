@@ -1931,27 +1931,57 @@ mod tests {
         }).unwrap();
         *narou_rs::db::DATABASE.lock() = Some(database);
         let write = narou_rs::native::materialization::capture_write_for_id(1).unwrap();
+        let stores = narou_rs::native::object_store::NativeStores::for_current_root().unwrap();
+        let probe = narou_rs::platform::ObjectKey::try_new(write.prefix().as_ref()).unwrap()
+            .join("metadata-probe.txt").unwrap();
+        narou_rs::native::materialization::block_on(write.write_small(&probe, b"retained content".to_vec())).unwrap();
 
-        // This independent writer leaves the process-global command cache stale.
-        let mut writer = narou_rs::db::Database::with_root(temp.path().to_path_buf()).unwrap();
-        writer.update_records(|mut records| {
-            if deleted {
-                records.remove(&1);
-            } else {
+        // A raw row delete is not what a real deleter produces: the shared
+        // removal boundary closes the novel's gate at a new epoch before
+        // dropping the authoritative row, so the `write` fence captured above
+        // is a retired epoch for BOTH backends and every guarded command below
+        // must surface `novel_epoch_conflict` rather than silently no-oping.
+        if deleted {
+            let inventory = std::sync::Arc::new(narou_rs::db::inventory::Inventory::with_default_root().unwrap());
+            let services = narou_rs::native::application::NativeAppServices::new(inventory).unwrap();
+            let result = narou_rs::native::materialization::block_on(async {
+                services.services.novel_actions
+                    .remove(&narou_rs::application::RemoveRequest { ids: vec![1.into()], delete_files: false })
+                    .await.map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))
+            }).unwrap();
+            assert_eq!(result.removed, vec![narou_rs::platform::NovelId(1)]);
+            assert!(narou_rs::db::with_database(|db| Ok(db.get(1).is_none())).unwrap());
+        } else {
+            // This independent writer leaves the process-global command cache stale.
+            let mut writer = narou_rs::db::Database::with_root(temp.path().to_path_buf()).unwrap();
+            writer.update_records(|mut records| {
                 let current = records.get_mut(&1).unwrap();
                 current.tags = vec!["concurrent tag".into()];
                 current.extra_fields.insert("concurrent_unknown".into(),
                     serde_yaml::from_str("nested: [one, two]").unwrap());
                 current.last_check_date = Some(current.last_update + Duration::hours(4));
-            }
-            Ok((records, ()))
-        }).unwrap();
-        assert!(narou_rs::db::with_database(|db| Ok(db.get(1).unwrap().tags.is_empty())).unwrap());
+                Ok((records, ()))
+            }).unwrap();
+            assert!(narou_rs::db::with_database(|db| Ok(db.get(1).unwrap().tags.is_empty())).unwrap());
+        }
         command(&write);
+        narou_rs::native::materialization::block_on(async {
+            let mut lease = narou_rs::application::novel_access::NovelReadLease::admit(
+                &stores.objects, write.prefix(), "metadata-result-check",
+            ).await?;
+            assert_eq!(lease.read_small(&probe).await?, Some(b"retained content".to_vec()),
+                "metadata helpers must not alter canonical content");
+            lease.release().await
+        }).unwrap();
         // Reopen rather than refresh the writer: Inventory's mtime cache may
         // still match a fast atomic replacement on Windows and hide the result.
         let reader = narou_rs::db::Database::with_root(temp.path().to_path_buf()).unwrap();
         reader.get(1).cloned()
+    }
+
+    fn assert_epoch_conflict(error: narou_rs::error::NarouError) {
+        assert!(matches!(&error, narou_rs::error::NarouError::Platform(message)
+            if message.starts_with("novel_epoch_conflict:")), "{error}");
     }
 
     #[test]
@@ -1979,8 +2009,9 @@ mod tests {
             super::set_convert_failure, super::clear_convert_failure];
         for sqlite in [false, true] {
             for (index, command) in commands.into_iter().enumerate() {
-                assert!(with_stale_command_database(sqlite, true, index == 2, |write| command(write, 1).unwrap()).is_none(),
-                    "command {index}, sqlite={sqlite}");
+                assert!(with_stale_command_database(sqlite, true, index == 2, |write| {
+                    assert_epoch_conflict(command(write, 1).unwrap_err());
+                }).is_none(), "command {index}, sqlite={sqlite}");
             }
         }
     }
@@ -2006,8 +2037,8 @@ mod tests {
                         novelupdated_at: Some(last_update + Duration::hours(2)), general_lastup: Some(last_update + Duration::hours(3)),
                         length: Some(123), is_end: Some(true), checked_at: last_update + Duration::hours(5),
                     }, sync_end,
-                ).unwrap();
-                let record = with_stale_command_database(sqlite, false, false, command).unwrap();
+                );
+                let record = with_stale_command_database(sqlite, false, false, |write| command(write).unwrap()).unwrap();
                 assert!(record.tags.iter().any(|tag| tag == "concurrent tag"));
                 assert!(record.extra_fields.contains_key("concurrent_unknown"));
                 // The authoritative last-check is newer than novelupdated_at;
@@ -2018,7 +2049,9 @@ mod tests {
                 assert_eq!(record.general_lastup, Some(last_update + Duration::hours(3)));
                 assert_eq!(record.length, Some(123));
                 assert!(record.end);
-                assert!(with_stale_command_database(sqlite, true, false, command).is_none());
+                assert!(with_stale_command_database(sqlite, true, false, |write| {
+                    assert_epoch_conflict(command(write).unwrap_err());
+                }).is_none());
             }
         }
     }
@@ -2044,10 +2077,15 @@ mod tests {
         for sqlite in [false, true] {
             assert!(with_stale_command_database(sqlite, true, false, |write| {
                 let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
-                assert!(!repository.update_existing_guarded_sync(write.fence(), 1.into(), |_| panic!("absent mutator called")).unwrap());
+                assert_epoch_conflict(repository.update_existing_guarded_sync(
+                    write.fence(), 1.into(), |_| panic!("retired mutator called"),
+                ).unwrap_err());
             }).is_none());
             let record = with_stale_command_database(sqlite, false, false, |write| {
                 let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
+                assert!(!repository.update_existing_guarded_sync(
+                    write.fence(), 999.into(), |_| panic!("absent mutator called"),
+                ).unwrap(), "an absent row at a live original epoch is a no-op");
                 let result = repository.update_existing_guarded_sync(write.fence(), 1.into(), |record| {
                     record.tags.clear();
                     record.extra_fields.clear();
@@ -2093,7 +2131,8 @@ mod tests {
                 replacement.toc_url = current.toc_url;
                 replacement.sitename = current.sitename;
                 replacement.use_subdirectory = current.use_subdirectory;
-                replacement.tags = vec!["replacement".into()];
+                replacement.tags = vec!["replacement".into(), "漫画".into()];
+                replacement.set_attribute_tag("漫画");
                 narou_rs::native::materialization::block_on(async {
                     repository.apply_batch_guarded(write.fence(), vec![NovelMutation::Upsert(replacement)]).await?;
                     let reservation = repository.allocate_id().await?;
@@ -2101,7 +2140,8 @@ mod tests {
                     created.id = reservation.id().0;
                     created.file_title = format!("created-{}", created.id);
                     created.toc_url = format!("https://example.test/created/{}/", created.id);
-                    created.tags = vec!["created".into()];
+                    created.tags = vec!["created".into(), "漫画".into()];
+                    created.set_attribute_tag("漫画");
                     let keys = NovelObjectKeys::new(&created.sitename, &created.file_title, created.use_subdirectory)?;
                     let stores = narou_rs::native::object_store::NativeStores::for_current_root()?;
                     let mut creation = NovelWriteGuard::capture_for(&stores.objects, Some(&stores.assets), &keys).await?;
@@ -2113,12 +2153,12 @@ mod tests {
                     reservation.adopt();
                     let saved = repository.get_current(id).await?.unwrap();
                     assert_eq!(saved.tags, vec!["created"]);
-                    assert_eq!(saved.attribute_tag(), Some("小説"));
+                    assert_eq!(saved.attribute_tag(), Some("漫画"));
                     Ok::<_, narou_rs::error::NarouError>(())
                 }).unwrap();
             }).unwrap();
             assert_eq!(record.tags, vec!["replacement"]);
-            assert_eq!(record.attribute_tag(), Some("小説"));
+            assert_eq!(record.attribute_tag(), Some("漫画"));
             assert!(!record.extra_fields.contains_key("concurrent_unknown"));
         }
     }

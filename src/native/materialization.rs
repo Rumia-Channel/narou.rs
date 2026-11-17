@@ -52,7 +52,7 @@ pub fn directory_for_origin(write: &crate::application::novel_access::NovelWrite
     primary.with_open_write(write.fence(), || primary.novel_directory(write.prefix()))
 }
 
-/// Compose preferred local mirrors with remote images behind one primary gate.
+/// Compose canonical local inputs with remote images behind one primary gate.
 pub fn read_store(root: &Path) -> Result<Arc<dyn crate::platform::ObjectStore>> {
     let stores = crate::native::object_store::NativeStores::for_narou_root(root)?;
     Ok(read_store_with(&stores))
@@ -60,17 +60,16 @@ pub fn read_store(root: &Path) -> Result<Arc<dyn crate::platform::ObjectStore>> 
 
 /// Rebind the read facade onto already-resolved stores without opening a
 /// second connection set. Canonical keys (toc, body, settings, outputs) stay
-/// on the preferred primary; only illustration keys route to the caller's
+/// on the caller's primary; only illustration keys route to the caller's
 /// alias-aware remote pair, never to bare S3.
 pub(crate) fn read_store_with(stores: &crate::native::object_store::NativeStores) -> Arc<dyn crate::platform::ObjectStore> {
-    let preferred = Arc::new(stores.primary.as_ref().clone().prefer_existing_files());
+    let primary_objects: Arc<dyn crate::platform::ObjectStore> = stores.primary.clone();
     if stores.s3.is_none() {
-        return preferred;
+        return primary_objects;
     }
-    let preferred_objects: Arc<dyn crate::platform::ObjectStore> = preferred.clone();
-    let preferred_assets: Arc<dyn crate::platform::AssetStore> = preferred;
+    let primary_assets: Arc<dyn crate::platform::AssetStore> = stores.primary.clone();
     Arc::new(crate::platform::split_store::SplitStore::new(
-        (preferred_objects, preferred_assets),
+        (primary_objects, primary_assets),
         (stores.objects.clone(), stores.assets.clone()),
     ))
 }
@@ -181,7 +180,10 @@ fn key_for_destination(write: &crate::application::novel_access::NovelWriteGuard
     let directory = crate::db::paths::ensure_within_archive_root(&directory_for_origin(write)?, &archive)?;
     let relative = path.strip_prefix(&directory).map_err(|_| NarouError::Platform("generated output is outside its original novel directory".into()))?;
     let relative = relative.to_str().ok_or_else(|| NarouError::Platform("generated output path is not UTF-8".into()))?.replace('\\', "/");
-    crate::platform::ObjectKey::try_new(write.prefix().as_ref())?.join(&relative)
+    relative.split('/').try_fold(
+        crate::platform::ObjectKey::try_new(write.prefix().as_ref())?,
+        |key, component| key.join(component),
+    )
 }
 
 /// Reuse the caller's admission for a coherent private multi-file input set.

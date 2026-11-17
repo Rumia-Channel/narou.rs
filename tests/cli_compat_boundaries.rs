@@ -16,20 +16,28 @@ fn run(root: &Path, args: &[&str]) -> Output {
 /// Like [`run`] but with the SQLite backend selected by the storage marker —
 /// the mode `sqlite.mirror-files=false` libraries run in.
 fn run_sqlite(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_narou_rs"))
-        .args(args)
-        .current_dir(root)
-        .env("USERPROFILE", root.join("home"))
-        .env("HOME", root.join("home"))
-        .env("TMP", root.join("tmp"))
-        .env("TEMP", root.join("tmp"))
-        .env_remove("NAROU_ENV")
-        .env_remove("NAROU_RS_LEGACY_YAML")
-        .env_remove("NAROU_RS_MIRROR_FILES")
-        .env_remove("NAROU_RS_KEEP_TXT")
-        .env_remove("NAROU_RS_SECTION_CACHE")
-        .stdin(Stdio::null())
-        .output().unwrap()
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        // Drain both pipes while waiting; polling a child with unread pipes
+        // can itself deadlock once either pipe fills.
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_narou_rs"));
+        command.args(args)
+            .current_dir(root)
+            .env("USERPROFILE", root.join("home"))
+            .env("HOME", root.join("home"))
+            .env("TMP", root.join("tmp"))
+            .env("TEMP", root.join("tmp"))
+            .env_remove("NAROU_ENV")
+            .env_remove("NAROU_RS_LEGACY_YAML")
+            .env_remove("NAROU_RS_MIRROR_FILES")
+            .env_remove("NAROU_RS_KEEP_TXT")
+            .env_remove("NAROU_RS_SECTION_CACHE")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+            .await.unwrap_or_else(|_| panic!("SQLite CLI {args:?} did not complete in 30 seconds"))
+            .unwrap()
+    })
 }
 
 #[test]
@@ -191,6 +199,11 @@ fn sqlite_db_only_convert_reads_stored_inputs_and_persists_output() {
     // A corrupt canonical TOC must fail maintenance, not fall back to a stale
     // file or delete sections against an empty/default TOC.
     let connection = rusqlite::Connection::open(root.join(".narou/db.sqlite")).unwrap();
+    assert_eq!(
+        narou_rs::native::sqlite::content::load_output(&connection, 1, "converted_text").unwrap(),
+        Some(converted.into_bytes()),
+        "the saved output must match the command-visible file",
+    );
     let keys_before: Vec<String> = connection.prepare("SELECT object_key FROM objects ORDER BY object_key")
         .unwrap().query_map([], |row| row.get(0)).unwrap()
         .collect::<Result<_, _>>().unwrap();

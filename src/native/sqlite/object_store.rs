@@ -55,7 +55,6 @@ pub struct SqliteObjectStore {
     /// 実ファイルのミラーを書くか (`sqlite.mirror-files=false` で無効)。
     /// 無効時は読み書きが SQLite だけで完結する。
     mirror_files: bool,
-    prefer_existing_files: bool,
     stage_leases: Arc<crate::platform::staging::StageLeaseCache>,
 }
 
@@ -88,19 +87,11 @@ impl SqliteObjectStore {
             conn,
             mirror,
             mirror_files,
-            prefer_existing_files: false,
             stage_leases: Arc::new(crate::platform::staging::StageLeaseCache::default()),
         }
     }
 
-    /// Conversion inputs preserve user-edited files without restoring DB blobs
-    /// into the live library. Normal storage reads remain database-first.
-    pub(crate) fn prefer_existing_files(mut self) -> Self {
-        self.prefer_existing_files = true;
-        self
-    }
     fn has_promoted_reference(conn:&Connection,key:&ObjectKey)->Result<bool>{conn.query_row("SELECT EXISTS(SELECT 1 FROM transfer_object_refs WHERE object_key=?)",[key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)}
-    fn prefer_mirror(&self,key:&ObjectKey)->Result<bool>{Ok(self.prefer_existing_files&&!Self::has_promoted_reference(&self.conn.lock(),key)?)}
     pub fn open_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>>{Box::pin(async move{
         if !prefix.matches(key){return Err(NarouError::Platform("reader key outside novel".into()));}
         run_scoped_blocking(||self.with_reader_transaction(prefix,lease,|conn|self.open_asset_in_connection(conn,key,range)))
@@ -624,7 +615,8 @@ fn insert_stored_object(tx: &Connection, object: StoredObject<'_>) -> Result<()>
 
 impl ObjectStore for SqliteObjectStore {
     fn delete_closed<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{Box::pin(async move{af::parse_removal_owner(owner)?;if !prefix.matches(key){return Err(NarouError::Platform("closed deletion outside novel".into()));}run_scoped_blocking(||self.with_publication_transaction(prefix,owner,epoch,|conn|{
-        self.remove_file_copy(key)?;conn.execute("DELETE FROM transfer_object_refs WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;conn.execute("DELETE FROM object_chunks WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;conn.execute("DELETE FROM objects WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;Ok(())
+        self.remove_file_copy(key)?;conn.execute("DELETE FROM transfer_object_refs WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;conn.execute("DELETE FROM object_chunks WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;conn.execute("DELETE FROM objects WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;
+        let path=self.mirror.resolve_path(key)?;self.mirror.prune_empty_dirs_in_prefix(prefix,&path)
     }))})}
     fn update_small_guarded<'a,'data:'a>(&'a self,fence:&'a WriteFence,key:&'a ObjectKey,mutate:&'a mut SmallObjectMutator<'data>)->PlatformFuture<'a,Result<ObjectUpdateResult>>{Box::pin(async move{run_scoped_blocking(||self.mirror.with_transfer_lock(fence.prefix.as_ref().trim_end_matches('/'),||{
         if !fence.prefix.matches(key){return Err(NarouError::Platform("atomic update outside fence".into()));}
@@ -662,15 +654,8 @@ impl ObjectStore for SqliteObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || {
-            if this.prefer_mirror(&key)? {
-                let path = this.mirror.resolve_read_path(&key)?;
-                if let Some(metadata) = this.mirror.metadata_for_path(&key, &path)? {
-                    return Ok(Some(metadata));
-                }
-            }
             match this.stat_blocking(&key)? {
                 Some(metadata) => Ok(Some(metadata)),
-                None if this.prefer_existing_files => Ok(None),
                 // Pre-import or store-bypassed files still resolve via FS.
                 None => {
                     let path = this.mirror.resolve_read_path(&key)?;
@@ -684,14 +669,8 @@ impl ObjectStore for SqliteObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || {
-            if this.prefer_mirror(&key)?
-                && let Some(data) = this.mirror.read_small_blocking(&key)?
-            {
-                return Ok(Some(data));
-            }
             match this.read_blocking(&key, Some(crate::native::object_store::MAX_SMALL_OBJECT_BYTES))? {
                 Some(data) => Ok(Some(data)),
-                None if this.prefer_existing_files => Ok(None),
                 None => this.mirror.read_small_blocking(&key),
             }
         })
@@ -1277,7 +1256,6 @@ pub fn require_transfer_epoch(conn:&Connection,prefix:&ObjectPrefix,owner:Option
 
 impl SqliteObjectStore {
     pub(crate) fn source_generation(&self,key:&ObjectKey)->Result<Option<String>>{
-        if self.prefer_mirror(key)?&&let Some(stamp)=self.mirror.file_generation(key)?{return Ok(Some(format!("fs:{stamp}")));}
         let conn=self.conn.lock();let physical=resolve_payload_key(&conn,key)?;let generation:Option<String>=conn.query_row("SELECT generation FROM objects WHERE object_key=?",[physical.as_ref()],|row|row.get(0)).optional().map_err(super::sqlite_error)?;
         drop(conn);match generation{Some(generation)=>Ok(Some(format!("db:{physical}:{generation}"))),None=>self.mirror.file_generation(key)}
     }
@@ -1813,7 +1791,6 @@ mod tests {
         for mirror_files in [false, true] {
             let (_dir, mut store) = temp_store();
             store.mirror_files = mirror_files;
-            store.prefer_existing_files = mirror_files;
             futures::executor::block_on(async {
                 let size = crate::platform::staging::ASSET_CHUNK_BYTES;
                 let stage = store.stage_stream(Box::pin(futures::stream::iter([
@@ -2364,9 +2341,9 @@ mod tests {
                 "novels/site/title/本文/2 第二話.yaml".to_string(),
             ]
         );
-        let input = store.clone().prefer_existing_files();
-        assert_eq!(futures::executor::block_on(input.read_small(&managed)).unwrap().unwrap(), b"stale");
-        assert_eq!(futures::executor::block_on(ObjectStore::stat(&input, &managed)).unwrap().unwrap().size, 5);
+        let input = store.clone();
+        assert_eq!(futures::executor::block_on(input.read_small(&managed)).unwrap().unwrap(), b"stored");
+        assert_eq!(futures::executor::block_on(ObjectStore::stat(&input, &managed)).unwrap().unwrap().size, 6);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let bytes = runtime.block_on(async {
             let mut stream = input.read_stream(&managed).await.unwrap().unwrap();
@@ -2376,7 +2353,9 @@ mod tests {
             }
             bytes
         });
-        assert_eq!(bytes, b"stale");
+        assert_eq!(bytes, b"stored");
+        assert_eq!(std::fs::read(&managed_path).unwrap(), b"stale",
+            "canonical reads must leave the stale filesystem copy untouched");
         std::fs::remove_file(managed_path).unwrap();
         assert_eq!(futures::executor::block_on(input.read_small(&managed)).unwrap().unwrap(), b"stored");
     }

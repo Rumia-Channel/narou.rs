@@ -84,7 +84,7 @@ fn export_to(ids:&[i64],sink:&mut dyn Write,report:&mut ImportProgress<'_>)->Res
     let repository=Arc::new(NativeNovelRepository::new());let inventory=crate::db::inventory::Inventory::with_default_root()?;let archive_root=inventory.root_dir().join("小説データ");let mut seen=HashSet::new();let ids=ids.iter().copied().filter(|id|seen.insert(*id)).collect::<Vec<_>>();
     // Identity initialization is a write, and precedes every retained admission.
     for id in &ids{let record=block_on(repository.get_current(NovelId(*id)))?.ok_or_else(||NarouError::NotFound(format!("ID:{id}")))?;if crate::virtual_novel::is_virtual_record(&record){crate::native::virtual_novel::ensure_portable_identity(*id)?;}}
-    let objects:Arc<dyn crate::platform::ObjectStore>=Arc::new(crate::native::object_store::NativeStore::for_current_root()?.prefer_existing_files());let content=crate::application::NovelContentService::new(repository,objects.clone());let mut scope=crate::application::novel_access::NovelReadScope::new(&objects,"cli-transfer-export");
+    let objects:Arc<dyn crate::platform::ObjectStore>=Arc::new(crate::native::object_store::NativeStore::for_current_root()?);let content=crate::application::NovelContentService::new(repository,objects.clone());let mut scope=crate::application::novel_access::NovelReadScope::new(&objects,"cli-transfer-export");
     let result=(||->Result<Vec<ExportedNovelInfo>>{
         // Admit all requested parents before consuming their membership metadata.
         for id in &ids{let record=block_on(async{content.read_record(&mut scope,NovelId(*id)).await.map_err(|error|NarouError::Platform(error.to_string()))})?.ok_or_else(||NarouError::NotFound(format!("ID:{id}")))?;assert_source_namespace(&record)?;}

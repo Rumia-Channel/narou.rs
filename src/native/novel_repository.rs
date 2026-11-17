@@ -183,7 +183,10 @@ where
 impl NovelRepository for NativeNovelRepository {
     fn resume_id(&self,id:NovelId,generation:i64)->PlatformFuture<'_,Result<crate::platform::NovelIdReservation>>{Box::pin(run_db(move||crate::db::with_database_mut(|db|db.resume_id(id,generation))))}
     fn reserve_create<'a>(&'a self,fence:&'a crate::platform::WriteFence,reservation:&'a crate::platform::NovelIdReservation,toc_url:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{crate::native::object_store::run_scoped_blocking(||self.reserve_native_creation(fence,reservation,toc_url))})}
-    fn apply_create_guarded<'a>(&'a self,fence:&'a crate::platform::WriteFence,reservation:&'a crate::platform::NovelIdReservation,record:NovelRecord)->PlatformFuture<'a,Result<()>>{Box::pin(async move{crate::native::object_store::run_scoped_blocking(||{let store=current_store()?;store.with_open_write(fence,||crate::db::with_database_mut(|db|db.apply_create_record(fence,reservation,record)))})})}
+    fn apply_create_guarded<'a>(&'a self,fence:&'a crate::platform::WriteFence,reservation:&'a crate::platform::NovelIdReservation,mut record:NovelRecord)->PlatformFuture<'a,Result<()>>{Box::pin(async move{crate::native::object_store::run_scoped_blocking(||{
+        crate::application::attribute_tags::initialize_record(&mut record, &crate::downloader::site_setting::effective_site_settings());
+        let store=current_store()?;store.with_open_write(fence,||crate::db::with_database_mut(|db|db.apply_create_record(fence,reservation,record)))
+    })})}
     fn remove_closed<'a>(&'a self,prefix:&'a crate::platform::ObjectPrefix,owner:&'a str,epoch:u64,id:NovelId)->PlatformFuture<'a,Result<()>>{let prefix=prefix.clone();let owner=owner.to_owned();Box::pin(run_db(move||{
         if crate::platform::access_fence::parse_removal_owner(&owner)?.0!=id{return Err(NarouError::Platform("removal owner ID mismatch".into()));}let store=current_store()?;store.with_closed_write(&prefix,&owner,epoch,||crate::db::with_database_mut(|db|db.remove_closed_record(&prefix,&owner,epoch,id)))
     }))}

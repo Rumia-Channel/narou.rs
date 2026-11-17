@@ -542,7 +542,7 @@ async fn serve_epub_file(
             .map_err(|error| map_application_error(ApplicationError::platform(error)))?;
         lease.validate().await.map_err(|error| map_application_error(ApplicationError::platform(error)))?;
         let store = crate::native::object_store::NativeStore::for_narou_root(inventory.root_dir())
-            .map_err(|error| map_application_error(ApplicationError::platform(error)))?.prefer_existing_files();
+            .map_err(|error| map_application_error(ApplicationError::platform(error)))?;
         let path = crate::db::paths::ensure_within_archive_root(file_path, &root)
             .map_err(|error| map_application_error(ApplicationError::platform(error)))?;
         let directory = crate::db::paths::ensure_within_archive_root(&store.novel_directory(&prefix)
