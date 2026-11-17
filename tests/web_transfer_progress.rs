@@ -347,3 +347,62 @@ fn native_web_v2_sqlite_db_only_imports_exports_and_recovers_without_mirror_file
     control(&client,&target_server,"exports",&secret,&mut status,"complete",json!({}));advance(&client,&target_server,"exports",&secret,&mut status);assert_eq!(status["state"],"released");
 }
 
+/// Kept alive only while the real-browser CI controller owns the stop file.
+/// The normal HTTP tests never start this fixture.
+#[test]
+#[ignore = "run by scripts/test-transfer-browser.py with a real Firefox"]
+fn native_transfer_browser_fixture() {
+    use std::io::Write;
+    use sha2::{Digest, Sha256};
+
+    let ready = PathBuf::from(std::env::var_os("NAROU_TRANSFER_BROWSER_READY").expect("browser controller ready path"));
+    let root = test_root();
+    let source = root.path().join("source");
+    seed_novels(&source, 168);
+    let first = source.join("小説データ/TransferTest/bulk-0");
+    let large_size = 17 * 1024 * 1024 + 19;
+    let mut large = std::fs::File::create(first.join("client-note.bin")).unwrap();
+    let mut hash = Sha256::new();
+    let mut state = 0x7155_029b_582c_4e37u64;
+    let mut chunk = [0u8; 64 * 1024];
+    let mut remaining = large_size;
+    while remaining != 0 {
+        for bytes in chunk.chunks_exact_mut(8) {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            bytes.copy_from_slice(&state.to_le_bytes());
+        }
+        let count = remaining.min(chunk.len());
+        large.write_all(&chunk[..count]).unwrap();
+        hash.update(&chunk[..count]);
+        remaining -= count;
+    }
+    drop(large);
+    let large_sha = hex::encode(hash.finalize());
+    let zero_size = 1024 * 1024 + 17;
+    std::fs::File::create(first.join("zero-note.bin")).unwrap().set_len(zero_size).unwrap();
+
+    let libraries = [source, root.path().join("yaml"), root.path().join("sqlite")];
+    std::fs::create_dir_all(libraries[2].join(".narou")).unwrap();
+    std::fs::write(libraries[2].join(".narou/storage-backend"), "sqlite\n").unwrap();
+    std::fs::write(libraries[2].join(".narou/local_setting.yaml"), "sqlite.mirror-files: false\n").unwrap();
+    let servers = libraries.iter().map(|library| start(library)).collect::<Vec<_>>();
+    let origins = servers.iter().zip(&libraries).map(|(server, library)| {
+        json!({"base": server.base, "library": library,
+            "ui_token": std::fs::read_to_string(library.join(".narou/ui_token")).unwrap().trim()})
+    }).collect::<Vec<_>>();
+    let stop = root.path().join("stop");
+    let mut descriptor = tempfile::NamedTempFile::new_in(ready.parent().unwrap()).unwrap();
+    serde_json::to_writer(&mut descriptor, &json!({
+        "origins": origins, "stop": stop, "count": 168,
+        "large_size": large_size, "large_sha256": large_sha, "zero_size": zero_size,
+    })).unwrap();
+    descriptor.flush().unwrap();
+    descriptor.persist_noclobber(&ready).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20 * 60);
+    while !stop.exists() {
+        assert!(std::time::Instant::now() < deadline, "real-browser controller exceeded fixture lifetime");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Server guards close every owned process before the TempDir is removed.
+    drop(servers);
+}

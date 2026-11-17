@@ -82,6 +82,24 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       # Verify the non-GPL binaries actually link (check/test do not).
       - run: cargo build -p narou_rs --bins
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: browser-actions/setup-firefox@v1
+        id: transfer-firefox
+      - name: Exercise shipped transfer UI and WASM in real Firefox
+        run: |
+          python -m pip install selenium==4.52.0
+          python scripts/test-transfer-browser.py
+        env:
+          FIREFOX_BINARY: ${{ steps.transfer-firefox.outputs.firefox-path }}
+      - name: Retain browser surface failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transfer-browser-surfaces
+          path: target/transfer-browser-artifacts/*.png
+          if-no-files-found: ignore
 
   native-gpl:
     name: Native check (lite/GPL)
