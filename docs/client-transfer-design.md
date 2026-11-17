@@ -393,6 +393,8 @@ portable metadata commit と origin 更新の間で停止した場合、live `nc
 
 配信専用Workerも同じ作品gateを使う。readerは共有D1/S3のsourceへ書かず、`NAROU_WRITER` service bindingからwriterの管理認証付き `POST /api/control/novel-access` へadmit/renew/release/gate_infoだけを委譲する。writerはprimary D1の既存fenceを呼び、別のgateやwriter権限を発行しない。本文はreaderから既存の検証済みObjectStore経路で読み、初読CRC/SHAとimmutable参照のfingerprint記録を保つ。汎用AssetStoreのRangeへ迂回して検証を落としたり、終端で全話を再取得したりしない。writerのheavy permitが使用中でもこの制御路と他作品の配信は動作させる。
 
+終端の指紋照合はimmutable参照をprimaryで最大100件ずつ比較する。mutable/legacyのbyte再読は、明示的に渡す `ObjectFingerprintReader` を通じて元のleaseへ戻し、最適化のfallbackでunguarded readを再導入しない。照合の前後も元epochをvalidateする。全量Rangeは一度開いた参照を使い、最後のbyteだけでなくEOFのCRC/SHA判定まで消費する。readerの配備はgate migrationとwriter制御路の配備後に行い、未対応writerへ旧経路でfallbackしない。
+
 writerはすべて私有stageへ書き、canonical設置だけをepochで条件付ける。FSはepoch検査とrenameを奪取不能なOSロック内、SQLite/D1は同一transactionのguard内で行う。S3はD1検査の直後にmutable keyへPUTするだけではlate completeを防げないので、以下を必須とする。
 
 - 本文の既存immutable版とwrite-once画像poolはその参照を使う。残るmutableなS3旧配置への新規書込みはimmutable物理版へ行い、logical key→物理版の参照だけをDB transaction / YAML journalで公開する。既存配置は旧データ読出し用に残し、書込みfallbackにはしない。
@@ -560,9 +562,10 @@ CI は core・adapter・WASM 単体に加え、**生成済み配布assetsを使�
 | Cloudflare の隔離 fixture | 268115eの隔離CI44013246489でmetadata全3・publication全9・gates全2scenarioと各cleanup jobが成功。要求数275 / 520 / 1073、WASM高水位34,930,688 / 34,930,688 / 26,607,616byte。各isolateの上限134,217,728byte、既存の全14assertion・時間/通信予算を維持。primary marker・tail接続連続性・sampling・異常outcomeの厳格検査も通過し、本番配備はしていない |
 | Worker の一般契約・S3 | 268115eのCIで一般Web・仮想小説・作者・転送契約とproduction release artifactが成功。8f722の取消契約を含むローカルLTO無効の実S3 lifecycleも終了コード0。500挿絵、16 MiB超64frame animationのmultipart保存とbyte一致export、EPUBのalpha/表示時間、実RangeのEOF前キャンセル・上流切断・admission解放が成功。4096²/6000²画像の658²表紙もpixel/alpha一致、WASM高水位54,067,200byte（JS heap別）。終端回収・同job旧token・旧origin拒否、取消6条件の元予約保持と完全回収、1685話/17目次ページの予算継続・既取得本文の再取得なし・完全EPUB、規則のhot reloadまで成功。最新production profileの成功とは扱わない |
 | Worker の実強制終了復旧 | 47232fのfixtureを実workerdで実行し終了コード0。original ID/generation/prefix/epochとplanned checkpointを保ったまま3回だけ回復し、business attemptsは0のまま。失効させるのはjob leaseだけで、強制終了したreaderの30秒leaseは自然失効を待ち、元予約を保持したclosed cleanupから回収。既存の60秒待機上限・回復予算・TTLは変更せず、同サイトの待機作品が再開。900話では実際のcursor進行だけで回復予算を戻し、既取得話の再取得なしで完全EPUBまで成功 |
-| Rust の全 target / feature | 817061のguard・HTTP helper修正まで `cargo clippy --workspace --all-targets --all-features -- -D warnings` はexit 0。vendored dependency とnative host用Worker manifestの既存警告は別途表示される。後続のreader修正やテスト全体の成功を意味しない |
+| Worker 配信readerの現行回帰 | 現行artifactで実workerdの38/38条件が成功。画像なし・同じ欠落画像の両205話で本文取得は各205回、画像probeは0/1回。初読のS3破損・参照の差替え/削除を拒否し、管理認証・偽造制御・closed/replaced gate・EOF/取消・仮想小説・HEAD・writer並行を確認。全1275 S3要求でD1 source書込試行0、S3 source書込0。ローカルrelease/LTO無効の検証であり、本番配備ではない |
+| Rust の全 target / feature | readerとlease-aware指紋照合を含む `cargo clippy --workspace --all-targets --all-features -- -D warnings` はexit 0。Native reader回帰7件、本文snapshot回帰14件も成功。vendored dependency とnative host用Worker manifestの既存警告は別途表示される。最新workspace全テストの成功とは区別する |
 
-最新Native全CLI、Workerの配信契約、新しいLinux CI browser gate、後続修正を含むproduction profile/Clippyは、まだ完了として記載しない。readerのfence接続後は35/38条件が成功し、管理認証・gate拒否・EOF/取消・writer並行・source書込禁止は通過したが、205話を410回取得する2条件と初読破損の拒否が失敗したため、既存の検証済み読出し経路への接続を修正中。Nativeの168作品・4 GiB超entryの実Firefox往復、Chromium実picker保存、隔離providerの128 MiB試験、ローカルS3の全lifecycleと実強制終了復旧は上表の範囲で確認済み。新しいCI gateは17 MiB利用者fileで配布UI/WASMの書出し・独立ZIP検証・YAML/DB-only取込を行う構成だが、268115eのNative全suiteが先に失敗し未実行。ローカルの新規Selenium Firefoxはheadless・headed双方で起動途中exit 1・registry初期化エラーとなったため、既存の実Firefox操作成功とは区別する。17 MiB smokeを4 GiBの実測とは扱わない。以前の `Array buffer allocation failed` は、テストhelperのpath上書きによりNodeが巨大な失敗差分を生成した箇所で発生したもので、Worker OOMの証拠には数えない。
+最新Native全CLI、新しいLinux CI browser gate、後続修正を含むproduction profileの全体CIは、まだ完了として記載しない。readerの旧35/38実行で見つかった本文二重取得・初読破損の見逃しは、検証済みstream・同じleaseの指紋照合へ接続し直し、上記38/38で修正を確認した。Nativeの168作品・4 GiB超entryの実Firefox往復、Chromium実picker保存、隔離providerの128 MiB試験、ローカルS3の全lifecycleと実強制終了復旧は上表の範囲で確認済み。新しいCI gateは17 MiB利用者fileで配布UI/WASMの書出し・独立ZIP検証・YAML/DB-only取込を行う構成だが、268115eのNative全suiteが先に失敗し未実行。ローカルの新規Selenium Firefoxはheadless・headed双方で起動途中exit 1・registry初期化エラーとなったため、既存の実Firefox操作成功とは区別する。17 MiB smokeを4 GiBの実測とは扱わない。以前の `Array buffer allocation failed` は、テストhelperのpath上書きによりNodeが巨大な失敗差分を生成した箇所で発生したもので、Worker OOMの証拠には数えない。
 
 
 ## 17. 参照と設計検証の範囲

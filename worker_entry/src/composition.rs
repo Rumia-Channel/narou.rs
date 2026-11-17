@@ -242,7 +242,10 @@ async fn build_object_stores(
         let staging = stage_store
             .clone()
             .map(|store| reader_storage::StagingTarget::new(store.clone(), store));
-        let guarded = ReaderStores::new(refs.clone(), refs, staging);
+        // Lease 行だけは共有 D1 の durable mutation なので、配信 isolate
+        // 自身ではなく writer の認証済み制御路へ委譲する。
+        let fence = Some(crate::reader_control::remote_access(env).await?);
+        let guarded = ReaderStores::new(refs.clone(), refs, staging, fence);
         (guarded.objects(), guarded.assets())
     } else {
         (refs.clone(), refs)

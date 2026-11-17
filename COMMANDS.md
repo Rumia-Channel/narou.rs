@@ -405,7 +405,7 @@ narou author remove 1
 - 上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。CLI の既存取り込みでの `sqlite.mirror-files=false` の制限と、Web v2 の参照公開は別経路として確認する。詳細は `WEBUI.md` §6.1b。
 - ブラウザ保存は File System Access または Service Worker の pull 型ストリームを使い、全量 `Blob` 化へフォールバックしない。FSA の picker はクリック中、SW の開始は最初の ZIP byte まで遅らせる。保存先の書き込みを待って次のチャンクを受け取り、中継の状態消失・明示的な完了通知前の切断・キャンセルを成功扱いしない。
 - 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が生成・検証・取り込み計画を共有する。
-- **Web の完了判定**: 別ブランチで統合検証中。実Firefoxで168作品・128 MiBと4 GiB超のentryを保存し、独立ZIP readerで全entryを照合してYAML/SQLite DB-onlyへ公開する往復と、実Chromium FSAの通常保存・同一sessionから別fileへの中断再開を確認した。ローカルLTO無効WorkerのS3全lifecycle・取消6条件・1685話の継続、実強制終了から元予約を保持する復旧と900話の再取得なしの完走も成功。最新のNative全suite・Worker配信・production profile・Linux CI browser等は未完了。サマリの `export` / `import` の完了は CLI を指す。詳細は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) §16.1。公開済み v0.6.6 のサーバー ZIP 経路の修正が配布済みという意味ではない。
+- **Web の完了判定**: 別ブランチで統合検証中。実Firefoxで168作品・128 MiBと4 GiB超のentryを保存し、独立ZIP readerで全entryを照合してYAML/SQLite DB-onlyへ公開する往復と、実Chromium FSAの通常保存・同一sessionから別fileへの中断再開を確認した。ローカルLTO無効WorkerのS3全lifecycle・取消6条件・1685話の継続、実強制終了から元予約を保持する復旧と900話の再取得なしの完走も成功。現行readerは38/38条件で本文205話の取得各1回、初読CRC/SHA、gate・EOF/取消・認証・source書込禁止を確認。最新のNative全suite・production profile・Linux CI browser等は未完了。サマリの `export` / `import` の完了は CLI を指す。詳細は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) §16.1。公開済み v0.6.6 のサーバー ZIP 経路の修正が配布済みという意味ではない。
 - **書式 (ZIP の中身) の詳細は [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md)** を参照 (`manifest.json` のスキーマ・検証ルール・衝突規則・同梱するファイル・挿絵の扱い)。
 
 ### 3.x-hidden `hidden` — ✅ 完了 (narou.rs 独自, Ruby版対応外)

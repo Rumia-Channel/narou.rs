@@ -9,14 +9,22 @@
 //! implementation, never through these adapters).
 //!
 //! Reads are delegated unchanged, so delivery keeps the same content,
-//! streaming and consistency behaviour as the writer.
+//! streaming and consistency behaviour as the writer. Per-novel admission
+//! (`NovelAccessFence`) is the one source-side mutation a read needs —
+//! reader lease rows live next to the gates — so the stores expose an
+//! explicitly supplied fence instead of the source store's own: the reader
+//! must not write the shared D1, and admission/renewal still has to hit the
+//! same durable CAS authority (the writer control path) as the writer uses.
+//! Writer-side primitives (close/open/commit) stay unavailable here; a
+//! reader deployment has no writer fence.
 
 use std::sync::Arc;
 
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
-    AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
-    ObjectStore, ObjectUpdateResult, PlatformFuture, SmallObjectMutator, StagedAsset,
+    AssetStore, AssetStream, GateLease, NovelAccessFence, ObjectKey, ObjectListPage,
+    ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore, ObjectUpdateResult,
+    PlatformFuture, SmallObjectMutator, StagedAsset,
     ObjectFingerprint, ObjectFingerprintMismatch,
     staging::is_staging_key,
 };
@@ -34,6 +42,16 @@ fn staging_unavailable() -> NarouError {
     NarouError::Platform("reader delivery has no S3 private staging target".into())
 }
 
+/// Reader admission requires a durable lease mutation; without the delegated
+/// control-plane authority there is no safe fallback (the source store's own
+/// fence would write the shared D1 from this delivery isolate).
+fn unsupported_fence(prefix: &ObjectPrefix) -> NarouError {
+    NarouError::Platform(format!(
+        "novel access fence unsupported by this store: {}",
+        prefix.as_ref()
+    ))
+}
+
 /// The private staging area of one deployment.
 pub(crate) struct StagingTarget {
     objects: Arc<dyn ObjectStore>,
@@ -47,8 +65,12 @@ impl StagingTarget {
 }
 
 /// Read-only view of the shared source objects, with private staging allowed.
+/// Leased reads keep the primary stores' renew → read → renew contract but
+/// renew through the delegated control fence, never the source store's own.
 struct ReaderObjectStore {
     inner: Arc<dyn ObjectStore>,
+    assets: Arc<dyn AssetStore>,
+    fence: Option<Arc<dyn NovelAccessFence>>,
     staging: Option<Arc<dyn ObjectStore>>,
 }
 
@@ -67,17 +89,23 @@ pub(crate) struct ReaderStores {
 impl ReaderStores {
     /// Guard the composed source stores. `staging` is the private staging
     /// target; without it every staging write is refused instead of falling
-    /// back to a source store.
+    /// back to a source store. `fence` is the durable novel-access authority
+    /// admitted readers are bound to (the writer's control path on the real
+    /// deployment); `None` keeps delivery fail-closed rather than leasing
+    /// through a store that would write the shared source.
     pub(crate) fn new(
         objects: Arc<dyn ObjectStore>,
         assets: Arc<dyn AssetStore>,
         staging: Option<StagingTarget>,
+        fence: Option<Arc<dyn NovelAccessFence>>,
     ) -> Self {
         let staging_objects = staging.as_ref().map(|target| target.objects.clone());
         let staging_assets = staging.map(|target| target.assets);
         Self {
             objects: Arc::new(ReaderObjectStore {
                 inner: objects,
+                assets: assets.clone(),
+                fence,
                 staging: staging_objects,
             }),
             assets: Arc::new(ReaderAssetStore {
@@ -97,6 +125,44 @@ impl ReaderStores {
 }
 
 impl ObjectStore for ReaderObjectStore {
+    /// The delegated control-plane authority, never the source store's own
+    /// fence: leasing through `inner` would write the shared D1 from this
+    /// delivery isolate.
+    fn access_fence(&self) -> Option<&dyn NovelAccessFence> {
+        self.fence.as_deref()
+    }
+
+    /// Same renew → read → renew contract as the primary stores, but the
+    /// lease CAS runs against the delegated fence while the bytes come from
+    /// the source assets (read-only). The renewed lease keeps the admitted
+    /// epoch; every logical open still carries the caller's pinned lease.
+    fn read_stream_leased<'a>(
+        &'a self,
+        prefix: &'a ObjectPrefix,
+        lease: &'a GateLease,
+        key: &'a ObjectKey,
+        range: std::ops::Range<u64>,
+    ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        Box::pin(async move {
+            if !prefix.matches(key) {
+                return Err(NarouError::Platform(format!(
+                    "reader outside novel: {key}"
+                )));
+            }
+            let fence = self
+                .access_fence()
+                .ok_or_else(|| unsupported_fence(prefix))?;
+            fence
+                .renew_reader(prefix, lease, narou_rs::platform::READER_LEASE_SECS)
+                .await?;
+            let stream = self.assets.read_stream_range(key, range).await?;
+            fence
+                .renew_reader(prefix, lease, narou_rs::platform::READER_LEASE_SECS)
+                .await?;
+            Ok(stream)
+        })
+    }
+
     fn stat<'a>(
         &'a self,
         key: &'a ObjectKey,
@@ -115,11 +181,12 @@ impl ObjectStore for ReaderObjectStore {
         self.inner.read_small(key)
     }
 
-    fn verify_fingerprints<'a>(
+    fn verify_fingerprints<'a, 'input: 'a>(
         &'a self,
-        fingerprints: &'a [ObjectFingerprint],
-    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'a>>>> {
-        self.inner.verify_fingerprints(fingerprints)
+        fingerprints: &'input [ObjectFingerprint],
+        reader: &'a mut dyn narou_rs::platform::ObjectFingerprintReader,
+    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'input>>>> {
+        self.inner.verify_fingerprints(fingerprints, reader)
     }
 
     fn write_small<'a>(

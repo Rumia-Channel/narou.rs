@@ -26,6 +26,7 @@ use futures::StreamExt;
 use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, AssetStream, Clock, GateLease, NovelAccessFence, NovelObjectKeys, ObjectKey, ObjectPrefix,
+    ObjectFingerprint, ObjectFingerprintMismatch, ObjectFingerprintReader,
     ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectStore, ObjectUpdateResult,
     PlatformFuture, PlatformService, SmallObjectMutator, SystemClock, WriteFence,
     READER_LEASE_SECS, is_reserved_key,
@@ -512,6 +513,24 @@ impl NovelReadLease {
         Ok(Some(bytes))
     }
 
+    /// Recheck immutable references without re-fetching their bodies. Mutable
+    /// fallbacks still read through this exact lease, never an unguarded store.
+    pub async fn verify_fingerprints<'input>(
+        &mut self,
+        fingerprints: &'input [ObjectFingerprint],
+    ) -> Result<Option<ObjectFingerprintMismatch<'input>>> {
+        for fingerprint in fingerprints {
+            if !self.prefix.matches(&fingerprint.key) {
+                return Err(key_outside_novel(&self.prefix, &fingerprint.key));
+            }
+        }
+        self.validate().await?;
+        let objects = self.objects.clone();
+        let mismatch = objects.verify_fingerprints(fingerprints, self).await?;
+        self.validate().await?;
+        Ok(mismatch)
+    }
+
     /// lease を response body 相当の stream へ移す。
     ///
     /// 先に `open` で対象を開き、成功した read access を返す stream の所有物
@@ -554,6 +573,12 @@ impl NovelReadLease {
     /// 呼び出し側で再試行は要らない。
     pub async fn release(mut self) -> Result<()> {
         self.release_inner().await
+    }
+}
+
+impl ObjectFingerprintReader for NovelReadLease {
+    fn read_small<'a>(&'a mut self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(NovelReadLease::read_small(self, key))
     }
 }
 
