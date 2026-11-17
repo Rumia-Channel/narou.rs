@@ -1671,7 +1671,7 @@ impl TransferStageStore for SqliteObjectStore {
         while let Some(row)=rows.next().map_err(super::sqlite_error)?{if out.len()==cap{return Ok((out,last));}let id:String=row.get(0).map_err(super::sqlite_error)?;let json:String=row.get(1).map_err(super::sqlite_error)?;out.push(ts::decode_ledger(json.as_bytes())?.lease);last=Some(id);}Ok((out,None))
     })})}
     fn stage_reclaim<'a>(&'a self,id:&'a str,owner:&'a str,epoch:u64)->PlatformFuture<'a,Result<bool>>{Box::pin(async move{
-        let claimed=run_scoped_blocking(||self.stage_transaction(id,|conn,current|{
+        let claimed=run_scoped_blocking(||self.stage_transaction(id,|_,current|{
             let Some(mut record)=current else{return Ok((true,None));};if record.lease.owner!=owner||record.lease.epoch!=epoch||(record.lease.state!=ts::StageLeaseState::Aborting&&record.lease.expires_at>ts::now_secs()){return Ok((false,None));}
             record.lease.state=ts::StageLeaseState::Aborting;Ok((true,Some(record)))
         }))?;if !claimed{return Ok(false);}self.stage_abort(id,owner,epoch).await?;Ok(self.stage_cursor(id).await?.is_none())
