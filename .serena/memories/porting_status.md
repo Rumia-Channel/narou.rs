@@ -2,20 +2,23 @@
 
 ## 最新状況: クライアント主体転送の別ブランチ実装（統合検証中・未公開）
 
-- 最新指示は版数更新・リリース中止。0.6.6のまま、develop由来のfeature-client-transferへcommit/pushする。main/develop統合、タグ、Release、本番配備は行わない。チェックポイントfec778dはpush済みで、以後の修正はまだ追加commit前。旧45ブランチの整理は実施済み。
+- 最新指示は版数更新・リリース中止。0.6.6のまま、develop由来のfeature-client-transferへcommit/pushする。main/develop統合、タグ、Release、本番配備は行わない。268115eまでpush済み。Platform44013246463はNative回帰・Workerキャンセルfixtureで失敗し、隔離provider44013246489は全3groupとcleanupが成功。旧45ブランチの整理は実施済み。
 - `/api/transfer/v2` と実配布WASMで、ZIP生成・全体検証・展開をクライアントへ移す。本文・目次・設定・挿絵索引・unknownを保持し、runtimeではraw/任意履歴/確認済み派生物をsnapshotと本文通信の前に除外する。Workerへrawを新規保存しない。旧ZIP全体POST/Base64へのfallbackはない。
 - 実Firefox + 実workerd/D1で17MiBの利用者ファイルと目次を取り込み、raw1MiBの除外と新規1作品の公開を確認。同じexport sessionで一時停止から保存し直し、独立ZIP readerで全entry・SHAを照合。10MiBゲートの最大request bodyは8,323,470B、過大要求拒否0・旧ZIP要求0・記録打切り0。
-- 確認待ち6分で旧SWが0byte保存/次write待機になる不具合を実証。遅延開始・限定したstartup waitUntil・15秒ping/pong・90秒失活検出・close ACK優先のrelay版3へ修正。実Firefoxで最初の出力前と64KiB出力後の各6分停止を跨ぎ、両方1MiBとSHA一致。Chromium FSAの実操作は未確認。
-- Node消費者回帰33件が成功。確認待ち/無通知の状態消失は旧実配布JSで期待byte欠落/永久待機として失敗し、EOF後pong競合も修正前失敗・修正後成功を確認。Rust workspace/all-target/all-feature Clippyはexit0（既存vendor/host manifest警告は表示）。両ライセンスはcanonical LF入力から再生成済み。
-- Nativeの全相対パスjoin、Windows実directory境界、compat lock内の設定再読込、Workerのpinned snapshotと取消creation回収などを修正。Native HTTP・cutover・claim・guarded CLI検証を実行中。旧yaml_cutover_guardのタイムアウトは完了としない。
-- 全受入は未完了。Native保存方式別の実ブラウザ、168作品・100MiB超・4GiB超の実ブラウザ、完全なWorker故障契約、Cloudflare128MiB/provider予算は未検証。直近workerd契約はnpm/Node資源割当て失敗で中断したので成功に数えない。重いfixtureを直列化し、固定Wranglerのcache/offlineを使って再確認する。docs/client-transfer-design.md §16.1を実測の基準とする。
-- 既存browserの元タブは保持し、所有fixture・検証タブ・SW登録は終了時に回収、ダウンロード設定はdefaultへ戻す。Node/WASM単体の4GiB仮想fixtureや旧版の履歴を、新しい実ブラウザ/本番の成功に読み替えない。
+- 確認待ち6分で旧SWが0byte保存/次write待機になる不具合を実証。遅延開始・限定したstartup waitUntil・15秒ping/pong・90秒失活検出・close ACK優先のrelay版3へ修正。実Firefoxで出力前と途中の各6分停止を跨ぎ、両方1MiBとSHA一致。実Chromeの保存pickerも通常2回と、83byte出力後の一時停止→同じsnapshot/sessionから新picker・別fileへの再開が成功。全347entryのCRC/SHA/sizeと全3546要求を独立照合し、旧ZIP/413/除外payloadは0。
+- Node消費者回帰37件とartifact契約12件が成功。412/423を跨ぐ同一操作の再照合、ACK不明時の元fingerprint再送、上限後の未確定receipt保持を検証。上限の423でreceiptを消す追加回帰は修正前の失敗も実証。817061のguard/HTTP helper修正までworkspace/all-target/all-feature Clippyはexit0。S3 ETag修正後の全feature checkとライセンスCIも成功。後続修正を含む最新全体の確認は継続中で、既存vendor/host manifest警告は別に報告する。
+- 実workerd/D1のtransfer.mjsは終了コード0。ACK/再起動/部分batch/SHA拒否、仮想メンバーの投影と消失競合、50,000件の索引、有界な大きいメタデータ、元epochのgate保持を確認。以前のNode割当て失敗はfixtureのpath上書きに対するassert巨大diffであり、Worker OOMの証拠ではない。
+- Nativeの実HTTPで168作品のruntime/complete、YAML receipt、6MiB題名、親子namespace重なりが成功。SQLite DB-onlyも取込・公開・完了・receipt・再書出しのbyte照合が成功した。昇格したblobを残しながらstage制御台帳を回収し、最後のcanonical参照解除時に実体を削除するmigration17を追加。SQLite76件で共有参照の保持と回収を確認。
+- 実Firefoxで168作品・346file・128MiB/4GiB+17byteの利用者データをZIP保存し、同一sessionの停止/再開と独立readerによる全347entry CRC/SHA/sizeを確認。実UIからYAML/SQLite DB-onlyへ各168作品を取込完了し、実体SHAとreceiptも一致。全20,236要求で打切り/413/過大拒否/旧ZIP経路0、最大upload8,323,449byte。所有fixture/タブ/SW/ダウンロード設定/一時ZIPは回収し、利用者の元タブと既存serverは保持。
+- nested path join、SQLite mutex内の設定再読、古いmirror優先、予約作成の属性初期化、削除後の空directoryを修正後、commands108件/実SQLiteCLI3件/object-store38件が成功。probeのCookie jarをYAML formへ引き継がない419も修正し、実HTTP Cookieを含む8取得suite・40件が成功。CIにはSelenium4.52.0の実Firefox・配布WASM・独立ZIP検証・YAML/DB-only取込gateを追加。ローカルの新規Selenium Firefoxはheaded/headlessとも起動途中exit1・registryエラーのため、既存の実Firefox成功とは分けてLinux CI結果を待つ。
+- 隔離providerの128MiB試験は全14scenario成功。metadata275要求/WASM34,930,688byte、publication520/34,930,688、gates1073/26,607,616。連続strict trace・primary marker・異常outcome検査と元予算を維持しcleanupも成功。8f722の取消契約を含むローカルLTO無効S3全lifecycleは終了コード0。500挿絵・16MiB超64frame animation、実Range切断、54,067,200byte高水位、終端回収、同job旧token/旧origin拒否、取消6条件の元予約保持と完全回収、1685話/17目次ページの継続・再取得なし・完全EPUB、規則hot reloadまで成功。47232fの実強制終了復旧も成功し、元予約のまま3回回復・30秒reader leaseの自然失効・完全回収・同サイトの後続再開と900話の再取得なしの完走を確認。TTL・回復回数・既存待機上限は変更なし。readerは35/38条件が成功し、残る205話を410回取得する2条件と初読破損拒否の失敗を修正中。reader単体6件は成功。最新production profile・全Native・配信・Linux browser・後続修正Clippyは未完了。
+- 新しい実FirefoxのSQLite DB-only中断再開が成功。同じsessionで8,512,323byteの停止→19,083,302byteの確定→168作品公開。全346canonical file・18,894,138byteのSHA/size/generationと168committed/created receipt、全6684要求（最大8,323,449byte、413/過大拒否/旧ZIP/打切り0）を親が独立照合。別sessionの実UI破棄も200で公開済みデータを保持。Native転送library44・migration4・HTTP6件は修正後の対象別実行で成功。以前のSQLite失敗とは区別し、最新全体CIはまだ成功扱いしない。
 
 ## EPUB 配信経路と API の待ち時間（未リリース）
 
 - 通常 GET の生成器は UI / 外部 API / ブラウザ API で共通。Native は保存済み EPUB があれば直接配信し、Worker は都度生成する。ヘッダ到着、EOF、外部閲覧ソフトの ZIP 展開・キャッシュ保存後の表示完了を区別して比較する（`docs/external-api.md`）。
 - Worker 外部 API は認証時の `ReadServices` を EPUB に渡して再構築を省く（36話 fixture の応答前 D1 照会は通常47→46回）。HEAD は本文変換・stage 作成・heavy permit を使わずメタデータを返す。サイズ不明なので Content-Length / Accept-Ranges は付けない。実測は本文36話の取得が0回、S3要求45→1回、HEAD 553→63ms、直後の GET は503→200。通常 GET の大幅な時間短縮は確認できていない。
-- `node worker_entry/tests/read_worker.mjs` の実 workerd 34/34 項目で、各入口の HEAD が本文を読まず、直後の GET が有効な EPUB を返すことを確認。外部 API の末尾 `/`・連続 `/` は `webui::external::path_segments` をルータと HEAD 判定で共用し、GET 化による全生成と permit 保持を防ぐ。更新中の参照差し替え・削除・破損の拒否、205話の本文1回取得、source 書き込み禁止も維持。
+- 転送排他の導入前には `node worker_entry/tests/read_worker.mjs` の実 workerd 34/34 項目で、各入口の HEAD が本文を読まず、直後の GET が有効な EPUB を返すことを確認した。外部 API の末尾 `/`・連続 `/` は `webui::external::path_segments` をルータと HEAD 判定で共用し、GET 化による全生成と permit 保持を防ぐ。最新featureのreader fence接続漏れによる失敗とは区別し、再検証が終わるまでは更新中の参照拒否・205話の本文1回取得・source書込禁止の再達成を主張しない。
 - 本番の同一作品比較と実 Dantalian の観測では、通常 GET は1回だけで HEAD や二重取得は無かった。HEAD の改善を、その閲覧ソフトでの体感差の確定原因として説明しない。大きい作品では UI / API ともヘッダ到着前の共通処理が支配的だった。
 
 ## 現況（v0.5.8 公開・本番配備済み）
