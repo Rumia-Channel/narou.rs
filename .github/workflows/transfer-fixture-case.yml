@@ -61,6 +61,10 @@ jobs:
           worker-build --release
       - name: Verify actual migration and namespace contracts
         run: python3 -m unittest discover -s tests -p 'test_transfer_v2_sql.py'
+      - name: Install the pinned tail transport
+        run: |
+          npm install --prefix "$RUNNER_TEMP/transfer-tail-tools" --no-save --ignore-scripts ws@8.23.0
+          echo "NAROU_TRANSFER_TOOLS=$RUNNER_TEMP/transfer-tail-tools" >> "$GITHUB_ENV"
       - name: Provision only uniquely named disposable resources
         id: provision
         run: node ci/transfer_fixture.mjs provision
