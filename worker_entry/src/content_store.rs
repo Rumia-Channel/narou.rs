@@ -162,6 +162,61 @@ impl ObjectStore for TransferReferenceStore{
         use narou_rs::platform::NovelAccessFence;
         if !prefix.matches(key){return Err(error("reader outside novel"));}self.d1.renew_reader(prefix,lease,narou_rs::platform::READER_LEASE_SECS).await?;let stream=AssetStore::read_stream_range(self,key,range).await?;self.d1.renew_reader(prefix,lease,narou_rs::platform::READER_LEASE_SECS).await?;Ok(stream)
     })}
+
+    /// Immutable fingerprints validate against the canonical digest rows, not
+    /// fresh body downloads. A logical key bound to a `transfer_object_refs`
+    /// row compares its stored SHA-256 directly; unmapped keys delegate to the
+    /// ordinary tier, which batches `content_objects` digests for content
+    /// keys and re-reads only mutable/legacy bytes.
+    fn verify_fingerprints<'a, 'input: 'a>(
+        &'a self,
+        fingerprints: &'input [ObjectFingerprint],
+        reader: &'a mut dyn narou_rs::platform::ObjectFingerprintReader,
+    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'input>>>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct TransferFingerprintRow { object_key: String, sha256: String, backend: String }
+            for batch in fingerprints.chunks(FINGERPRINT_BATCH_SIZE) {
+                const PREFIX: &str = "SELECT object_key,sha256,backend FROM transfer_object_refs WHERE object_key IN (";
+                const SUFFIX: &str = ") ORDER BY object_key COLLATE BINARY";
+                let mut query = String::with_capacity(PREFIX.len() + batch.len() * 2 + SUFFIX.len());
+                query.push_str(PREFIX);
+                for index in 0..batch.len() {
+                    if index != 0 { query.push(','); }
+                    query.push('?');
+                }
+                query.push_str(SUFFIX);
+                let values: Vec<JsValue> = batch.iter()
+                    .map(|fingerprint| JsValue::from_str(fingerprint.key.as_ref())).collect();
+                let rows = self.db.prepare(&query).bind(&values).map_err(error)?
+                    .all().await.map_err(error)?.results::<TransferFingerprintRow>().map_err(error)?;
+                let mut ordinary_start = 0;
+                for (position, fingerprint) in batch.iter().enumerate() {
+                    let Ok(index) = rows.binary_search_by(|row| row.object_key.as_str().cmp(fingerprint.key.as_ref())) else {
+                        continue;
+                    };
+                    if ordinary_start < position
+                        && let Some(mismatch) = self.ordinary_objects.verify_fingerprints(&batch[ordinary_start..position], reader).await? {
+                        return Ok(Some(mismatch));
+                    }
+                    if rows[index].backend == "deleted" {
+                        return Ok(Some(ObjectFingerprintMismatch::Missing(&fingerprint.key)));
+                    }
+                    let mut expected = [0u8; 64];
+                    hex::encode_to_slice(fingerprint.sha256.as_slice(), &mut expected).map_err(error)?;
+                    if rows[index].sha256.as_bytes() != expected {
+                        return Ok(Some(ObjectFingerprintMismatch::Changed(&fingerprint.key)));
+                    }
+                    ordinary_start = position + 1;
+                }
+                if ordinary_start < batch.len()
+                    && let Some(mismatch) = self.ordinary_objects.verify_fingerprints(&batch[ordinary_start..], reader).await? {
+                    return Ok(Some(mismatch));
+                }
+            }
+            Ok(None)
+        })
+    }
     fn stat<'a>(&'a self,key:&'a ObjectKey)->PlatformFuture<'a,Result<Option<ObjectMetadata>>>{Box::pin(async move{
         if let Some(row)=self.d1.transfer_reference(key).await?{if row.backend=="deleted"{return Ok(None);}return Ok(Some(ObjectMetadata{key:key.clone(),size:row.size,etag:Some(row.sha256),content_type:content_type_for_key(key).map(str::to_owned),last_modified:chrono::DateTime::parse_from_rfc3339(&row.updated_at).ok().map(|time|time.with_timezone(&Utc))}));}self.ordinary_objects.stat(key).await
     })}
@@ -629,10 +684,11 @@ impl ObjectStore for ContentStore {
             self.legacy.read_small(key).await
         })
     }
-    fn verify_fingerprints<'a>(
+    fn verify_fingerprints<'a, 'input: 'a>(
         &'a self,
-        fingerprints: &'a [ObjectFingerprint],
-    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'a>>>> {
+        fingerprints: &'input [ObjectFingerprint],
+        reader: &'a mut dyn narou_rs::platform::ObjectFingerprintReader,
+    ) -> PlatformFuture<'a, Result<Option<ObjectFingerprintMismatch<'input>>>> {
         Box::pin(async move {
             let mut position = 0;
             while let Some(first) = fingerprints.get(position) {
@@ -642,7 +698,7 @@ impl ObjectStore for ContentStore {
                     } else {
                         self.legacy.as_ref()
                     };
-                    if let Some(mismatch) = store.verify_fingerprints(std::slice::from_ref(first)).await? {
+                    if let Some(mismatch) = store.verify_fingerprints(std::slice::from_ref(first), reader).await? {
                         return Ok(Some(mismatch));
                     }
                     position += 1;
@@ -678,7 +734,7 @@ impl ObjectStore for ContentStore {
                     } else {
                         // Missing refs can still be legacy D1 content during
                         // migration. Keep the existing backend/fallback rules.
-                        let Some(bytes) = self.read_small(&fingerprint.key).await? else {
+                        let Some(bytes) = reader.read_small(&fingerprint.key).await? else {
                             return Ok(Some(ObjectFingerprintMismatch::Missing(&fingerprint.key)));
                         };
                         if <[u8; 32]>::from(Sha256::digest(&bytes)) != fingerprint.sha256 {
