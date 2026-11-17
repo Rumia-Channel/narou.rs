@@ -202,6 +202,7 @@ export function createS3MultipartFixture({ objects, failPut = () => false, maxPa
           res.end(bytes);
         } else {
           res.writeHead(206, { 'content-range': `bytes ${start}-${end}/${bytes.length}`, 'content-length': end - start + 1 });
+          if (state.beforeReadBody && await state.beforeReadBody(req, res, key, bytes, { start, end })) return true;
           res.end(bytes.subarray(start, end + 1));
         }
         return true;

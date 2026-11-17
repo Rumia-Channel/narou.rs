@@ -69,21 +69,43 @@ impl TransferReferenceStore{
         let remote = self.remote.as_ref().filter(|_| !metadata);
         let token=nonce()?;let(blob,size,sha,backend)=if let Some(remote)=remote{
             if role==FileRole::Illustration{
-                // Hash-addressed pool: the physical key derives from the staged
+                // Hash-addressed pool: the physical key derives from the
                 // content SHA-256, so identical images share one immutable
                 // object across novels. Pool objects are shared and exempt
                 // from content_garbage; a failed ref commit keeps them.
-                let stage=remote.stage_stream(stream).await?;
-                let outcome=async{
-                    let mut digest=[0u8;32];hex::decode_to_slice(&stage.sha256,&mut digest).map_err(|error|NarouError::Platform(error.to_string()))?;
-                    let extension=key.as_ref().rsplit_once('.').map(|(_,extension)|extension).ok_or_else(||error("illustration extension missing"))?;
-                    let pool=ObjectKey::try_new(format!("illustrations/{}.{}",base64::display::Base64Display::new(&digest,&base64::engine::general_purpose::URL_SAFE_NO_PAD),extension))?;
-                    let stream=remote.read_stream(&stage.key).await?.ok_or_else(||error("illustration stage missing"))?;
-                    remote.write_stream_once(&pool,stream,stage.size,&stage.sha256).await?;
-                    Ok::<_,NarouError>(pool)
-                }.await;
-                let _=remote.delete(&stage.key).await;
-                (outcome?,stage.size,stage.sha256,"s3")
+                if let Some(claimed_sha)=narou_rs::platform::transfer_stage::hash_named_digest(key){
+                    // The logical `挿絵/<sha256-hex>.<ext>` name already
+                    // declares the content hash; `write_stream_once` rejects a
+                    // stream whose bytes differ, so re-staging here would only
+                    // re-copy what the downloader stage already wrote. Meter
+                    // the stream anyway so the D1 reference row carries the
+                    // measured size and SHA, never the claimed name alone.
+                    let pool=narou_rs::platform::transfer_stage::illustration_pool_key(key)?;
+                    let state=std::sync::Arc::new(std::sync::Mutex::new((sha2::Sha256::new(),0u64)));
+                    let progress=state.clone();
+                    let measured:AssetStream=Box::pin(stream.map(move|chunk|{
+                        if let Ok(bytes)=&chunk{let mut state=progress.lock().expect("illustration meter mutex");
+                            let Some(next)=state.1.checked_add(bytes.len() as u64)else{return Err(error("illustration asset length overflow"));};
+                            state.0.update(bytes);state.1=next;}
+                        chunk
+                    }));
+                    remote.write_stream_once(&pool,measured,u64::MAX,&claimed_sha).await?;
+                    let (hash,size)={let state=state.lock().expect("illustration meter mutex");(hex::encode(state.0.clone().finalize()),state.1)};
+                    if !hash.eq_ignore_ascii_case(&claimed_sha){return Err(error("illustration bytes differ from their hash-named key"));}
+                    (pool,size,hash,"s3")
+                }else{
+                    let stage=remote.stage_stream(stream).await?;
+                    let outcome=async{
+                        let mut digest=[0u8;32];hex::decode_to_slice(&stage.sha256,&mut digest).map_err(|error|NarouError::Platform(error.to_string()))?;
+                        let extension=key.as_ref().rsplit_once('.').map(|(_,extension)|extension).ok_or_else(||error("illustration extension missing"))?;
+                        let pool=ObjectKey::try_new(format!("illustrations/{}.{}",base64::display::Base64Display::new(&digest,&base64::engine::general_purpose::URL_SAFE_NO_PAD),extension))?;
+                        let stream=remote.read_stream(&stage.key).await?.ok_or_else(||error("illustration stage missing"))?;
+                        remote.write_stream_once(&pool,stream,stage.size,&stage.sha256).await?;
+                        Ok::<_,NarouError>(pool)
+                    }.await;
+                    let _=remote.delete(&stage.key).await;
+                    (outcome?,stage.size,stage.sha256,"s3")
+                }
             }else{
                 let blob=ObjectKey::try_new(format!("content/{}.bin",nonce()?))?;
                 self.db.prepare("INSERT INTO content_garbage(blob_key,not_before) VALUES (?,?)").bind(&[blob.as_ref().into(),(Utc::now()+Duration::hours(24)).to_rfc3339().into()]).map_err(error)?.run().await.map_err(error)?;
