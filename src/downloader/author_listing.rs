@@ -116,10 +116,11 @@ impl<'a> AuthorListing<'a> {
         // 追加取得 (`request` / `fetch_json`) の結果は試行間で共有する
         // (novel 取得と同じ扱い: 同じ URL は 1 回だけ).
         let mut jobs = PreprocessJobs::new();
+        let mut token_attempts: HashMap<String, HashSet<Option<String>>> = HashMap::new();
 
         let mut anonymous = setting.clone();
         let listing = self
-            .fetch_listing(&mut anonymous, &mut auth, page_url, &mut jobs)
+            .fetch_listing(&mut anonymous, &mut auth, page_url, &mut jobs, &mut token_attempts)
             .await;
         let mut best = Attempt {
             setting: anonymous,
@@ -147,7 +148,7 @@ impl<'a> AuthorListing<'a> {
                     continue;
                 }
                 let listing = self
-                    .fetch_listing(&mut with_login, &mut auth, page_url, &mut jobs)
+                    .fetch_listing(&mut with_login, &mut auth, page_url, &mut jobs, &mut token_attempts)
                     .await;
                 if let Ok(found) = &listing {
                     if !found.login_walled {
@@ -266,6 +267,7 @@ impl<'a> AuthorListing<'a> {
         setting: &mut SiteSetting,
         auth: &mut AuthState,
         target_url: &str,
+        token_attempts: &mut HashMap<String, HashSet<Option<String>>>,
     ) -> bool {
         let Some(cookies) = self.cookies else {
             return false;
@@ -280,12 +282,25 @@ impl<'a> AuthorListing<'a> {
         }
         // 保存済みログインは必要なときに 1 回だけ読む。
         self.ensure_groups(auth, setting).await;
-        // 更新するのは生效中のアカウント。安定 ID で表すので、同じログインの
-        // 資格情報が別アカウントと混ざらない。
+        // 匿名の更新も Native と同じトークン保持ログインへ解決してから記録する。
+        // 発行に失敗しても、後続の同じログインで予算が復活しないようにする。
         let session_id = auth
             .active()
-            .map(|login| login.id.clone())
-            .filter(|id| !id.is_empty());
+            .map(|login| login.id.as_str())
+            .filter(|id| !id.is_empty())
+            .or_else(|| auth.groups().and_then(|groups| {
+                groups.iter().find(|login| !login.id.is_empty() && login.has_cookie(&config.cookie_name))
+                    .map(|login| login.id.as_str())
+            }))
+            .map(str::to_owned);
+        if let Some(attempted) = token_attempts.get_mut(target_url) {
+            if attempted.contains(&session_id) {
+                return false;
+            }
+            attempted.insert(session_id.clone());
+        } else {
+            token_attempts.insert(target_url.to_owned(), HashSet::from([session_id.clone()]));
+        }
         let renewed = cookies
             .refresh_browser_token(
                 &setting.domain,
@@ -365,6 +380,7 @@ impl<'a> AuthorListing<'a> {
         auth: &mut AuthState,
         page_url: &str,
         jobs: &mut PreprocessJobs,
+        token_attempts: &mut HashMap<String, HashSet<Option<String>>>,
     ) -> Result<Listing> {
         let mut policy = FetchPolicy::for_site(setting);
         let captures = setting.extract_author_url_captures(page_url).unwrap_or_default();
@@ -388,7 +404,7 @@ impl<'a> AuthorListing<'a> {
                     // ブラウザ確認の答えだけがトークン更新で直りうる。404 や
                     // 其它の失敗は更新しても直らない。
                     if !is_login_required(&error)
-                        || !self.renew_token(setting, auth, &fetch_url).await
+                        || !self.renew_token(setting, auth, &fetch_url, token_attempts).await
                     {
                         return Err(error);
                     }
@@ -403,7 +419,7 @@ impl<'a> AuthorListing<'a> {
             }
             if setting.is_login_wall(&body) {
                 // ログイン壁 (HTTP 200) も、更新したトークンで直りうる。
-                if !self.renew_token(setting, auth, &fetch_url).await {
+                if !self.renew_token(setting, auth, &fetch_url, token_attempts).await {
                     listing.login_walled = true;
                     break;
                 }
@@ -1712,6 +1728,7 @@ toc_url: https://token.example/story/\k<ncode>
         handouts: Mutex<VecDeque<Option<String>>>,
         /// The login id every renewal was asked for.
         sessions: Mutex<Vec<Option<String>>>,
+        fail_first: bool,
     }
 
     impl TokenStore {
@@ -1734,6 +1751,7 @@ toc_url: https://token.example/story/\k<ncode>
                         .collect(),
                 ),
                 sessions: Mutex::new(Vec::new()),
+                fail_first: false,
             }
         }
 
@@ -1829,8 +1847,12 @@ toc_url: https://token.example/story/\k<ncode>
             session_id: Option<&'a str>,
         ) -> PlatformFuture<'a, Result<Option<LoginGroup>>> {
             Box::pin(async move {
-                self.renewals.fetch_add(1, Ordering::SeqCst);
+                let attempt = self.renewals.fetch_add(1, Ordering::SeqCst);
                 self.sessions.lock().push(session_id.map(str::to_string));
+                if self.fail_first && attempt == 0 {
+                    self.handouts.lock().pop_front();
+                    return Err(NarouError::Login("fixture browser failure".to_string()));
+                }
                 let Some(token) = self.handouts.lock().pop_front() else {
                     return Ok(None);
                 };
@@ -1994,10 +2016,10 @@ toc_url: https://token.example/story/\k<ncode>
         let page = "https://token.example/user/5/story";
         let second = "https://token.example/user/5/story?p=2";
         let http = TokenAuthorClient::new(&[
-            (page, TokenPage::new(&[1]).with_next(second)),
+            (page, TokenPage::new(&[1]).guarded("stale").with_next(second)),
             (second, TokenPage::new(&[2]).guarded("fresh")),
         ]);
-        // 1 回目はトークンを発行できない (更新できない)。2 回目は発行できる。
+        // 1 頁目は保存済み Cookie で読め、別 URL の 2 頁目でトークンを更新する。
         let store = TokenStore::new(
             &[token_login("acct-1", "sid=keep; token=stale")],
             &[None, Some("fresh")],
@@ -2014,7 +2036,7 @@ toc_url: https://token.example/story/\k<ncode>
         );
         assert_eq!(
             store.sessions(),
-            vec![None, Some("acct-1".to_string())],
+            vec![Some("acct-1".to_string()), Some("acct-1".to_string())],
             "生效中のログインの安定 ID で更新する"
         );
         let seen = http.cookies_for(second);
@@ -2082,5 +2104,43 @@ toc_url: https://token.example/story/\k<ncode>
             "読める部分一覧は残す: {urls:?}"
         );
         assert_eq!(store.renewals(), 1, "任意の試行でも更新は 1 回だけ試す");
+    }
+
+    #[test]
+    fn anonymous_renewal_failure_does_not_launch_again_for_the_same_login() {
+        let definitions = SiteSetting::load_bundled(&[TOKEN_SITE]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://token.example/user/5/story";
+        let http = TokenAuthorClient::new(&[(page, TokenPage::new(&[1]).guarded("fresh"))]);
+        let mut store = TokenStore::new(
+            &[token_login("acct-1", "sid=primary; token=stale")],
+            &[None, Some("fresh")],
+        );
+        store.fail_first = true;
+
+        let result = token_works(&http, &store, setting, page);
+        assert_eq!(store.renewals(), 1, "発行失敗も同じページ・ログインの予算を消費する");
+        assert!(result.is_err(), "同じログインで発行を繰り返さない");
+    }
+
+    #[test]
+    fn anonymous_renewal_failure_still_allows_a_different_login() {
+        let definitions = SiteSetting::load_bundled(&[TOKEN_SITE]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://token.example/user/5/story";
+        let http = TokenAuthorClient::new(&[(page, TokenPage::new(&[1]).guarded("fresh-b"))]);
+        let mut store = TokenStore::new(
+            &[
+                token_login("acct-1", "sid=primary; token=stale-a"),
+                token_login("acct-2", "sid=secondary; token=stale-b"),
+            ],
+            &[None, Some("fresh-b")],
+        );
+        store.fail_first = true;
+
+        let urls = token_works(&http, &store, setting, page).unwrap();
+        assert_eq!(urls, ["https://token.example/story/1"]);
+        assert_eq!(store.sessions(), [Some("acct-1".to_string()), Some("acct-2".to_string())]);
+        assert!(http.cookies_for(page).last().unwrap().as_deref().unwrap().contains("sid=secondary"));
     }
 }

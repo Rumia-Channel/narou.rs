@@ -133,7 +133,7 @@ fn refresh_with(
     let (observed, selected_id) = {
         let groups = store.groups_for(site)?;
         let selected = session_id.map(str::to_owned).or_else(|| {
-            groups.iter().find(|group| carries_token(group, cookie_name)).map(|group| group.id.clone())
+            groups.iter().find(|group| group.has_cookie(cookie_name)).map(|group| group.id.clone())
         });
         if selected.as_deref().is_some_and(|id| !groups.iter().any(|group| group.id == id)) {
             return Err(login_error(ERROR_REMOVED));
@@ -438,10 +438,6 @@ fn token_digest(group: &LoginGroup, cookie_name: &str) -> Option<[u8; 32]> {
     Some(hasher.finalize().into())
 }
 
-/// Whether a login carries the token.
-fn carries_token(group: &LoginGroup, cookie_name: &str) -> bool {
-    group.cookies.iter().any(|entry| token_values(&entry.cookie, cookie_name).next().is_some())
-}
 
 fn token_values<'a>(header: &'a str, cookie_name: &'a str) -> impl Iterator<Item = &'a str> {
     header.split(';').filter_map(move |part| {
@@ -473,7 +469,7 @@ pub(crate) fn merge_token(
             // The login was removed while the helper ran: it must not come back.
             None => return Err(login_error(ERROR_REMOVED)),
         },
-        None => match groups.iter().position(|group| carries_token(group, cookie_name)) {
+        None => match groups.iter().position(|group| group.has_cookie(cookie_name)) {
             Some(index) => index,
             None => {
                 // No login carries the token yet: one is added for it alone.
@@ -818,7 +814,7 @@ mod tests {
         .unwrap();
         let groups = store.groups_for(SITE).unwrap();
         assert_eq!(groups.len(), 2, "トークンだけのログインが加わる");
-        assert!(carries_token(&groups[1], COOKIE), "トークンが保存される");
+        assert!(groups[1].has_cookie(COOKIE), "トークンが保存される");
 
         // A second renewal must not add another login.
         refresh_with_payload(

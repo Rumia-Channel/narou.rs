@@ -115,6 +115,15 @@ impl LoginGroup {
         self.cookies == other.cookies
     }
 
+    /// Whether any host carries this exact (case-sensitive) cookie name.
+    pub fn has_cookie(&self, name: &str) -> bool {
+        self.cookies.iter().any(|entry| {
+            entry.cookie.split(';').any(|part| {
+                part.trim().split_once('=').is_some_and(|(key, _)| key.trim() == name)
+            })
+        })
+    }
+
     /// Hosts of this login, most specific first.
     pub fn hosts(&self) -> Vec<&str> {
         let mut hosts: Vec<&str> = self.cookies.iter().map(|entry| entry.host.as_str()).collect();
