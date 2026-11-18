@@ -38,3 +38,16 @@ export function verifyTraceReceipts(expected, rows) {
   }
   return expected.length - seen.size;
 }
+
+export function missingTraceEvidence(expected, rows, firstSequence) {
+  const seen = new Set(rows.map(row => row.seq));
+  const sample = [];
+  let withoutResponse = 0;
+  for (const [index, status] of expected.entries()) {
+    const seq = firstSequence + index;
+    if (seen.has(seq)) continue;
+    if (status === 0) withoutResponse++;
+    if (sample.length < 8) sample.push({seq, expected_status: status});
+  }
+  return {without_response: withoutResponse, sample};
+}

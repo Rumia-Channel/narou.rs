@@ -7,7 +7,7 @@ import {createHash,randomBytes} from 'node:crypto';
 import {spawn,spawnSync} from 'node:child_process';
 import {dirname,join,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {MAX_TRACE_ATTEMPTS, PREFLIGHT_ATTEMPTS, TRACE_HEADER, TRACE_SCHEMA, verifyTraceReceipts} from './transfer_trace.mjs';
+import {MAX_TRACE_ATTEMPTS, PREFLIGHT_ATTEMPTS, TRACE_HEADER, TRACE_SCHEMA, missingTraceEvidence, verifyTraceReceipts} from './transfer_trace.mjs';
 const root=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const account=process.env.CLOUDFLARE_ACCOUNT_ID??process.env.CLOUDFLARE_ACCOUT_ID;
 const apiToken=process.env.CLOUDFLARE_API_TOKEN;
@@ -144,10 +144,7 @@ async function provision(){
     await sleep(2000);
   }
   assert(readySequence,`deployed disposable fixture did not become ready (${lastResponse})`);
-  await waitForEvidence(async()=>{
-    const rows=await readEvidence(state,readySequence,readySequence);
-    return verifyTraceReceipts([200],rows.map(row=>({...row,seq:1})));
-  },1);
+  await waitForEvidence(state,readySequence,[200]);
   console.log(JSON.stringify({event:'transfer_trace_ready'}));
   if(process.env.GITHUB_ENV)appendFileSync(process.env.GITHUB_ENV,`NAROU_TRANSFER_TEST_URL=${state.url}\nNAROU_TRANSFER_TEST_TOKEN=${state.adminToken}\n`);
   return state;
@@ -168,15 +165,18 @@ async function readEvidence(state,startSequence,highestSequence) {
   return rows;
 }
 
-async function waitForEvidence(countMissing,total) {
+async function waitForEvidence(state,firstSequence,expected) {
   const deadline=Date.now()+90000;
-  let missing;
+  const lastSequence=firstSequence+expected.length-1;
+  let missing,rows;
   do {
-    missing=await countMissing();
+    rows=await readEvidence(state,firstSequence,lastSequence);
+    missing=verifyTraceReceipts(expected,firstSequence===1?rows:rows.map(row=>({...row,seq:row.seq-firstSequence+1})));
     if(missing===0)return;
     await sleep(2000);
   } while(Date.now()<deadline);
-  assert.fail(`missing Cloudflare Tail Worker evidence for ${missing} of ${total} requests`);
+  const details=missingTraceEvidence(expected,rows,firstSequence);
+  assert.fail(`missing Cloudflare Tail Worker evidence for ${missing} of ${expected.length} requests: ${JSON.stringify(details)}`);
 }
 
 async function exercise(state){
@@ -207,7 +207,7 @@ async function exercise(state){
     assert(Array.isArray(expected)&&expected.length>0&&expected.length<=MAX_TRACE_ATTEMPTS-PREFLIGHT_ATTEMPTS,'invalid transfer request ledger');
     // The tail runs after the producer, including after response streaming.
     // Poll durable receipts; a missing attempt can never be called a pass.
-    await waitForEvidence(async()=>verifyTraceReceipts(expected,await readEvidence(state,1,expected.length)),expected.length);
+    await waitForEvidence(state,1,expected);
     console.log(JSON.stringify({event:'transfer_trace_verified',case_group:caseGroup,attempts:expected.length}));
   }finally{
     rmSync(ledger,{force:true});
