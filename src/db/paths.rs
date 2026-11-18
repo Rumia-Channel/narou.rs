@@ -66,11 +66,10 @@ pub fn novel_dir_for_record(archive_root: &Path, record: &NovelRecord) -> PathBu
 /// layout. Worker builds have no filesystem and always use the canonical
 /// logical path from [`novel_dir_for_record`].
 ///
-/// `novel_dir_for_record` already resolves any existing historical `‛`
-/// (U+201B) escaped directory (see
-/// [`resolve_existing_path_components`]); the only extra probe kept here is
-/// the flat (no-subdirectory) fallback the previous helper provided. Nothing
-/// is renamed and `database.yaml` is never rewritten.
+/// [`novel_dir_for_record`] already resolves historical `‛` (U+201B) escaped
+/// directories component by component. This helper additionally checks the
+/// legacy flat layout (without a subdirectory). Nothing is renamed and
+/// `database.yaml` is never rewritten.
 #[cfg(feature = "native-runtime")]
 pub fn existing_novel_dir_for_record(archive_root: &Path, record: &NovelRecord) -> PathBuf {
     let canonical = novel_dir_for_record(archive_root, record);

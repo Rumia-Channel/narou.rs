@@ -402,7 +402,7 @@ pub enum WriteOnce {
 /// renewals driven by the owning session's lease.
 pub trait TransferStageStore: AssetStore {
     /// Minimum payload size for a non-final `stage_append`. 0 on byte
-    /// backends; [`S3_PART_MIN`] semantics on S3 multipart.
+    /// backends; [`S3_STAGE_PART_MIN`] on S3 multipart.
     fn stage_append_min(&self) -> usize {
         0
     }
