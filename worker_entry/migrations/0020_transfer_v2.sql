@@ -231,8 +231,11 @@ CREATE TABLE transfer_inventory_fragments(session_id TEXT NOT NULL,novel_ordinal
 CREATE TABLE transfer_source_materializations(session_id TEXT NOT NULL,novel_ordinal INTEGER NOT NULL,logical_path TEXT NOT NULL,stage_id TEXT NOT NULL REFERENCES transfer_stage_owners(stage_id) ON DELETE CASCADE,source_fingerprint TEXT NOT NULL,PRIMARY KEY(session_id,novel_ordinal,logical_path)) WITHOUT ROWID;
 
 -- Storage primitives: all generations/guards are checked in the actual D1 batch.
+-- The empty generation identifies a pre-transfer row. Range reads pin it by
+-- key just like any other generation, and the first actual write changes it.
+-- Do not backfill: a mass UPDATE rewrites legacy body blobs and would violate
+-- the write guard on libraries that are migrating or already on S3.
 ALTER TABLE objects ADD COLUMN generation TEXT NOT NULL DEFAULT '';
-UPDATE objects SET generation=lower(hex(randomblob(16))) WHERE generation='';
 CREATE TRIGGER transfer_object_insert_generation AFTER INSERT ON objects BEGIN UPDATE objects SET generation=lower(hex(randomblob(16))) WHERE object_key=NEW.object_key; END;
 CREATE TRIGGER transfer_object_update_generation AFTER UPDATE OF size,encoding,crc32,data ON objects BEGIN UPDATE objects SET generation=lower(hex(randomblob(16))) WHERE object_key=NEW.object_key; END;
 CREATE TRIGGER transfer_chunk_insert_generation AFTER INSERT ON object_chunks BEGIN UPDATE objects SET generation=lower(hex(randomblob(16))) WHERE object_key=NEW.object_key; END;
