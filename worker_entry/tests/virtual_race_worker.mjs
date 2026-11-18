@@ -91,31 +91,30 @@ try {
 }
 
 let jobsPaused = false;
+const waitTick = () => new Promise(resolve => setTimeout(resolve, 25));
 async function waitForJobs() {
   // Timers belong to the waiting invocation. Resolving a shared Promise from
   // a later HTTP request can cancel workerd's cross-request continuation.
-  while (jobsPaused) await new Promise(resolve => setTimeout(resolve, 25));
+  while (jobsPaused) await waitTick();
+}
+async function waitForGate(condition, description) {
+  const deadline = Date.now() + 10000;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`D1 snapshot ${description} timed out`);
+    await waitTick();
+  }
 }
 const barriers = new Map();
 async function meet(name) {
   let barrier = barriers.get(name);
   if (!barrier) {
-    let release;
-    const ready = new Promise(resolve => { release = resolve; });
-    barrier = { arrived: 0, completed: 0, ready, release };
+    barrier = { arrived: 0, completed: 0 };
     barriers.set(name, barrier);
   }
-  if (++barrier.arrived === 2) barrier.release();
-  let timer;
+  barrier.arrived += 1;
   try {
-    await Promise.race([
-      barrier.ready,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`D1 snapshot barrier timed out: ${name}`)), 10000);
-      }),
-    ]);
+    await waitForGate(() => barrier.arrived === 2, `barrier ${name}`);
   } finally {
-    clearTimeout(timer);
     if (++barrier.completed === 2) barriers.delete(name);
   }
 }
@@ -123,23 +122,16 @@ async function meet(name) {
 const pauses = new Map();
 function pauseFor(name) {
   if (!pauses.has(name)) {
-    let arrive, release;
-    const entered = new Promise(resolve => { arrive = resolve; });
-    const resumed = new Promise(resolve => { release = resolve; });
-    pauses.set(name, { entered, resumed, arrive, release });
+    pauses.set(name, { entered: false, released: false });
   }
   return pauses.get(name);
 }
 async function pause(name) {
   const gate = pauseFor(name);
-  gate.arrive();
-  let timer;
+  gate.entered = true;
   try {
-    await Promise.race([gate.resumed, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`D1 snapshot pause timed out: ${name}`)), 10000);
-    })]);
+    await waitForGate(() => gate.released, `pause ${name}`);
   } finally {
-    clearTimeout(timer);
     pauses.delete(name);
   }
 }
@@ -214,8 +206,8 @@ export default class SnapshotRaceWorker extends worker {
     const control = new URL(request.url).pathname.match(/^\/__test\/virtual-pause\/([^/]+)\/(wait|release)$/);
     if (control) {
       const gate = pauseFor(control[1]);
-      if (control[2] === 'wait') await gate.entered;
-      else gate.release();
+      if (control[2] === 'wait') await waitForGate(() => gate.entered, `entry ${control[1]}`);
+      else gate.released = true;
       return Response.json({ success: true });
     }
     const phase = request.headers.get('x-narou-test-snapshot-race');

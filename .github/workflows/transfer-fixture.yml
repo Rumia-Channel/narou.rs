@@ -11,8 +11,7 @@ permissions:
 jobs:
   fixture:
     name: Isolated transfer (${{ matrix.case_group }})
-    # Preserve every assertion and the existing per-driver deadline. Each
-    # independent invocation owns its own fixture and guaranteed cleanup.
+    # Each group keeps its assertions, and owns disposable resources and cleanup.
     strategy:
       fail-fast: false
       matrix:

@@ -278,14 +278,14 @@ mod tests {
         let _database = DatabaseRestore(crate::db::DATABASE.lock().take());
         let _legacy = crate::test_support::legacy_yaml_guard();
         std::fs::create_dir(root.path().join(".narou")).unwrap();
+        let path = root.path().join(".narou/database.yaml");
+        let mut record: crate::db::NovelRecord = serde_yaml::from_str("id: 1\ntitle: book\nauthor: author\nfile_title: book\nsitename: site\ntoc_url: https://example.test/book\nnovel_type: 2\nlast_update: 2026-01-01T00:00:00Z\n").unwrap();
+        // Only compare persisted metadata against a loaded cache; publishing a
+        // novel and acquiring its mutation locks is not part of this test.
+        std::fs::write(&path, serde_yaml::to_string(&std::collections::BTreeMap::from([(record.id, &record)])).unwrap()).unwrap();
         crate::db::init_database().unwrap();
-        let record = serde_yaml::from_str("id: 1\ntitle: book\nauthor: author\nfile_title: book\nsitename: site\ntoc_url: https://example.test/book\nnovel_type: 2\nlast_update: 2026-01-01T00:00:00Z\n").unwrap();
-        let (record, _write) = crate::native::materialization::create_test_record(record).unwrap();
-        let path = crate::db::with_database(|database| Ok(database.inventory()
-            .inventory_path("database", crate::db::inventory::InventoryScope::Local))).unwrap();
-        let mut current = record.clone();
-        current.file_title = "moved-book".into();
-        std::fs::write(path, serde_yaml::to_string(&std::collections::BTreeMap::from([(current.id, current)])).unwrap()).unwrap();
+        record.file_title = "moved-book".into();
+        std::fs::write(path, serde_yaml::to_string(&std::collections::BTreeMap::from([(record.id, &record)])).unwrap()).unwrap();
         let prefixes = futures::executor::block_on(NativePrefixes::load()).unwrap();
         assert!(prefixes.0.iter().any(|prefix| prefix.as_ref() == "novels/site/moved-book"));
         assert!(!prefixes.0.iter().any(|prefix| prefix.as_ref() == "novels/site/book"));

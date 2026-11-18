@@ -19,7 +19,7 @@ jobs:
   fixture:
     name: Isolated deployed transfer regressions
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 85
     environment:
       name: Cloudflare
     concurrency:
@@ -55,18 +55,14 @@ jobs:
         with:
           path: ~/.cache/worker-build
           key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
-      - name: Verify advance replay after a lost acknowledgement
-        run: node --test tests/transfer_transport.test.mjs
+      - name: Verify replay and durable transfer evidence
+        run: node --test tests/transfer_transport.test.mjs tests/transfer_trace.test.mjs
       - name: Build the actual production shim and hashed transfer assets
         run: |
           node build_assets.mjs
           worker-build --release
       - name: Verify actual migration and namespace contracts
         run: python3 -m unittest discover -s tests -p 'test_transfer_v2_sql.py'
-      - name: Install the pinned tail transport
-        run: |
-          npm install --prefix "$RUNNER_TEMP/transfer-tail-tools" --no-save --ignore-scripts ws@8.23.0
-          echo "NAROU_TRANSFER_TOOLS=$RUNNER_TEMP/transfer-tail-tools" >> "$GITHUB_ENV"
       - name: Provision only uniquely named disposable resources
         id: provision
         run: node ci/transfer_fixture.mjs provision

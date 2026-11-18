@@ -40,6 +40,19 @@ test('a lost advance response replays the same operation and reads its receipt',
   assert.deepEqual(received, Array.from({ length: 2 }, () => ({ path: advance, method: 'POST', body: init.body })));
 });
 
+test('the read-only gate observer replays a socket reset and keeps its original session', async t => {
+  const path = '/_fixture/transfer-observe?session=sess_transport';
+  const observed = { snapshot: { gates: 33, pinned: 19 } };
+  const calls = [];
+  const client = await serve(t, (req, res) => {
+    calls.push([req.method, req.url]);
+    if (calls.length === 1) return req.socket.resetAndDestroy();
+    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(observed));
+  });
+  assert.deepEqual((await client.json(path)).body, observed);
+  assert.deepEqual(calls, [['GET', path], ['GET', path]]);
+});
+
 test('no reset replay for an unrecognized route or an unidentified operation', async t => {
   let requests = 0;
   const client = await serve(t, (req) => {
