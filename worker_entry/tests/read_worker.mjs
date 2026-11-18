@@ -94,6 +94,8 @@ const MEMBER = {
   author: 'Smoke Author',
   ncode: 'n2222bb',
   tocUrl: 'https://example.test/n2222bb/',
+  // Like archives made by narou.rb, the TOC has a timestamp but the body does not.
+  tocDownloadTime: '2021-01-24 20:20:55.807706000 +09:00',
   sections: [
     {
       index: '1',
@@ -188,7 +190,10 @@ const tocOf = (novel) => ({
   author: novel.author,
   toc_url: novel.tocUrl,
   story: '',
-  subtitles: novel.sections.map((section) => subtitleOf(novel, section)),
+  subtitles: novel.sections.map((section) => ({
+    ...subtitleOf(novel, section),
+    ...(novel.tocDownloadTime ? { download_time: novel.tocDownloadTime } : {}),
+  })),
   novel_type: 1,
 });
 const sectionOf = (novel, section) => ({
@@ -776,7 +781,7 @@ try {
     }
   });
 
-  await check('reader serves the virtual novel EPUB', async () => {
+  await check('reader serves the virtual novel EPUB with an unstamped legacy member', async () => {
     const response = await admin(reader.base, `/api/virtual_novels/${VIRTUAL.id}/download.epub`);
     await assertEpubBody(response, [
       ...NOVEL.sections.map((section) => section.marker),

@@ -8,7 +8,7 @@ use crate::application::novel_access::NovelReadScope;
 use sha2::{Digest, Sha256};
 
 use crate::db::NovelRecord;
-use crate::downloader::persistence::{PersistenceService, deserialize_section, deserialize_toc};
+use crate::downloader::persistence::{PersistenceService, deserialize_section, deserialize_toc, section_matches_generation};
 use crate::downloader::TocFile;
 use crate::error::{NarouError, Result};
 use crate::illustration_store::{IllustrationIndex, is_remote_illustration_source};
@@ -212,9 +212,7 @@ pub async fn load(
                 .ok_or_else(|| NarouError::NotFound(key.to_string()))?;
             let sha256 = Sha256::digest(&bytes).into();
             let section = deserialize_section(&bytes)?;
-            if section.download_revision.max(1) != subtitle.download_revision.max(1)
-                || subtitle.download_time.as_ref().is_some_and(|time| section.download_time.as_ref() != Some(time))
-            {
+            if !section_matches_generation(&section, &subtitle) {
                 return Err(NarouError::Conversion(format!("変換中に入力が更新されました: {key}")));
             }
             drop(bytes);
@@ -438,19 +436,22 @@ mod tests {
     }
 
     #[test]
-    fn virtual_member_revision_change_is_an_error_not_mixed_content() {
+    fn virtual_legacy_member_revision_change_is_an_error_not_mixed_content() {
         use futures::StreamExt;
         use crate::platform::ObjectStore;
         futures::executor::block_on(async {
             let store = Arc::new(crate::platform::mocks::MemoryObjectStore::new());
             let member = record(1, "小説");
             let (keys, toc) = save_member(&store, &member, "original").await;
-            let repository = MemoryNovelRepository::from_records(vec![member]);
-            let persistence = PersistenceService::new(store.clone());
-            let mut book = load(NovelReadScope::new(persistence.objects(), "virtual-test"), &record(9, "小説"), &[1], &repository, &persistence).await.unwrap();
             let key = keys.section("1", "episode");
             let bytes = store.read_small(&key).await.unwrap().unwrap();
             let mut section = deserialize_section(&bytes).unwrap();
+            section.download_revision = 0;
+            section.download_time = None;
+            store.write_small(&key, crate::downloader::persistence::serialize_section(&section).unwrap().into_bytes()).await.unwrap();
+            let repository = MemoryNovelRepository::from_records(vec![member]);
+            let persistence = PersistenceService::new(store.clone());
+            let mut book = load(NovelReadScope::new(persistence.objects(), "virtual-test"), &record(9, "小説"), &[1], &repository, &persistence).await.unwrap();
             // Even a writer that forgot to bump download_revision cannot cause
             // a mixed response: the prepared reference pins actual content.
             section.element.body = "replacement".into();

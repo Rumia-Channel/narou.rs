@@ -64,6 +64,16 @@ pub fn raw_filename(subtitle: &SubtitleInfo) -> String {
     format!("{stem}.html")
 }
 
+/// Match the stored body to the generation declared by its TOC entry.
+pub(crate) fn section_matches_generation(section: &SectionFile, subtitle: &SubtitleInfo) -> bool {
+    // Ruby-era bodies can lack download_time even when their TOC has it.
+    // This exception only applies to the unstamped legacy generation.
+    let unstamped_legacy = section.download_revision == 0 && section.download_time.is_none();
+    section.download_revision.max(1) == subtitle.download_revision.max(1)
+        && (unstamped_legacy || subtitle.download_time.as_ref()
+            .is_none_or(|time| section.download_time.as_ref() == Some(time)))
+}
+
 /// Storage-backed downloader persistence.
 ///
 /// The codec functions below remain pure; this service owns the ObjectStore
@@ -159,13 +169,7 @@ impl PersistenceService {
                                 format!("section file not found: expected '{}' in {}/本文", section_filename(subtitle), keys.prefix())))
                         })?;
                         let section = deserialize_section(&bytes)?;
-                        // Ruby-era bodies can lack download_time even when the
-                        // TOC has it. Only unstamped legacy bodies qualify for
-                        // this exception; the revision and EOF checks still apply.
-                        let unstamped_legacy = section.download_revision == 0 && section.download_time.is_none();
-                        if section.download_revision.max(1) != subtitle.download_revision.max(1)
-                            || (!unstamped_legacy && subtitle.download_time.as_ref()
-                                .is_some_and(|time| section.download_time.as_ref() != Some(time))) {
+                        if !section_matches_generation(&section, subtitle) {
                             return Err(NarouError::Platform(format!("section generation changed during conversion: {key}")));
                         }
                         fingerprints.push(ObjectFingerprint { key, sha256: Sha256::digest(&bytes).into() });

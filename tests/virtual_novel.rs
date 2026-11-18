@@ -46,8 +46,10 @@ fn write_fixture(root: &Path) {
             "title: \"A その{number}\"\nauthor: \"Author\"\ntoc_url: \"https://mock.test/novel/a{number}/\"\nsubtitles:\n- index: '1'\n  href: /novel/a{number}/1/\n  chapter: ''\n  subchapter: ''\n  subtitle: 第{number}話\n  file_subtitle: 第{number}話\n  subdate: '2026-01-01 00:00:00'\n  download_time: '2026-01-01 00:00:00 +0900'\nnovel_type: 1\n"
         );
         std::fs::write(dir.join("toc.yaml"), toc).unwrap();
+        // The first member represents an archive from narou.rb: only its TOC is stamped.
+        let body_stamp = if number == 1 { "" } else { "download_time: '2026-01-01 00:00:00 +0900'\n" };
         let section = format!(
-            "index: '1'\nhref: /novel/a{number}/1/\nchapter: ''\nsubchapter: ''\nsubtitle: 第{number}話\nfile_subtitle: 第{number}話\nsubdate: '2026-01-01 00:00:00'\ndownload_time: '2026-01-01 00:00:00 +0900'\nelement:\n  data_type: text\n  introduction: ''\n  postscript: ''\n  body: '{body}'\n"
+            "index: '1'\nhref: /novel/a{number}/1/\nchapter: ''\nsubchapter: ''\nsubtitle: 第{number}話\nfile_subtitle: 第{number}話\nsubdate: '2026-01-01 00:00:00'\n{body_stamp}element:\n  data_type: text\n  introduction: ''\n  postscript: ''\n  body: '{body}'\n"
         );
         std::fs::write(dir.join(format!("本文/1 第{number}話.yaml")), section).unwrap();
     }
