@@ -89,10 +89,13 @@ jobs:
           python-version: "3.13"
       - uses: browser-actions/setup-firefox@v1
         id: transfer-firefox
+      - run: python -m pip install selenium==4.52.0
+      - name: Exercise tag ordering with Native YAML and SQLite in real Firefox
+        run: python scripts/test-tag-order-browser.py
+        env:
+          FIREFOX_BINARY: ${{ steps.transfer-firefox.outputs.firefox-path }}
       - name: Exercise shipped transfer UI and WASM in real Firefox
-        run: |
-          python -m pip install selenium==4.52.0
-          python scripts/test-transfer-browser.py
+        run: python scripts/test-transfer-browser.py
         env:
           FIREFOX_BINARY: ${{ steps.transfer-firefox.outputs.firefox-path }}
       - name: Retain browser surface failure evidence
