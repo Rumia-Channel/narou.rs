@@ -126,6 +126,57 @@ impl D1NovelRepository {
         rows_from_result(result)
     }
 
+    /// A buffered metadata listing has one commit point: rows, counts and
+    /// closed gates are read in the same primary D1 transaction. Holding
+    /// durable reader leases until HTTP EOF is only needed for deferred reads.
+    pub(crate) async fn web_list_snapshot(&self, query: NovelQuery) -> Result<(u64, u64, Vec<NovelRecord>)> {
+        let primary = self.primary();
+        let all_matches = query.offset == 0 && query.limit == usize::MAX;
+        let unrestricted = query.filter.is_unrestricted();
+        let SqlQuery { sql, binds } = novel_query::query_sql(&query, |bind| bind);
+        let mut statements = vec![
+            primary.prepare(&sql, binds)?,
+            primary.db.prepare("SELECT prefix FROM novel_access_gates WHERE closed=1"),
+        ];
+        let count_statement = |filter: &NovelFilter| {
+            let SqlQuery { sql, binds } = novel_query::count_sql(filter, |bind| bind);
+            primary.prepare(&sql, binds)
+        };
+        if !all_matches {
+            statements.push(count_statement(&query.filter)?);
+        }
+        if !unrestricted {
+            statements.push(count_statement(&NovelFilter::all())?);
+        }
+        let results = primary.db.batch(statements).await.map_err(worker_error)?;
+        ensure_batch_success(&results)?;
+        let mut results = results.into_iter();
+        let mut next = || results.next().ok_or_else(|| worker_error("incomplete list snapshot"));
+        let records = rows_from_result(next()?)?;
+        #[derive(Deserialize)]
+        struct ClosedGate { prefix: String }
+        let closed = next()?.results::<ClosedGate>().map_err(worker_error)?;
+        if !closed.is_empty() {
+            let closed: HashSet<_> = closed.into_iter().map(|gate| gate.prefix).collect();
+            for record in &records {
+                let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+                if closed.contains(keys.prefix().as_ref()) {
+                    return Err(narou_rs::platform::access_fence::gate_closed_error(
+                        &narou_rs::platform::ObjectPrefix::from(keys.prefix().clone()),
+                    ));
+                }
+            }
+        }
+        let mut count = || {
+            let row = next()?.results::<CountRow>().map_err(worker_error)?
+                .into_iter().next().ok_or_else(|| worker_error("missing list snapshot count"))?;
+            u64::try_from(row.count).map_err(worker_error)
+        };
+        let filtered = if all_matches { records.len() as u64 } else { count()? };
+        let total = if unrestricted { filtered } else { count()? };
+        Ok((total, filtered, records))
+    }
+
     async fn one(&self, sql: &str, values: Vec<BindValue>) -> Result<Option<NovelRecord>> {
         let statement = self.prepare(sql, values)?;
         let row = statement

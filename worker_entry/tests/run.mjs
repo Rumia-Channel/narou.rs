@@ -182,7 +182,7 @@ dev = spawn(
     });
     exitCode = tagSequence.status ?? 1;
   }
-  for (const name of ["freeze.mjs", "virtual_attributes.mjs", "virtual_membership.mjs", "virtual_updates.mjs"]) {
+  for (const name of ["list_snapshot.mjs", "freeze.mjs", "virtual_attributes.mjs", "virtual_membership.mjs", "virtual_updates.mjs"]) {
     if (exitCode !== 0) break;
     const virtual = spawnSync(process.execPath, [join(here, name)], {
       cwd: root, stdio: "inherit",

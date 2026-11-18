@@ -970,6 +970,7 @@ narou setting name         # 読み取り
 - `webui.theme` / `webui.performance-mode` / `webui.table.reload-timing` / `webui.new-tag-color` を設定画面と worker 側設定参照経由で反映し、theme 初期値、performance auto/on/off 判定、table reload の every/queue 挙動、新規タグ既定色へ接続する
 - レスポンシブ CSS を分離し、スマートフォン幅でも一覧・キュー・メモ帳を同じ asset 構成で表示できる
 - 一覧 API の `frozen` 取得は DB 再入ロックによる deadlock を避けるよう修正済み
+- Workers の一覧 API は、作品行・件数・転送ゲートを primary D1 の同じ読み取りトランザクションで取得する。全件表示でも作品ごとのリース作成・更新・削除は行わず、選択結果に閉じたゲートが含まれる場合は `503 novel_recovering` を返す。本文・EPUB のリースと Native の一覧は変更しない。
 - 一覧 API の `new_arrivals` 判定は `webnovel/*.yaml` の `timezone` に合わせたサイト現地時刻で行い、`domain` 未保存の既存データは `toc_url` のドメインからサイト定義を解決する
 - favicon は data URL で埋め込み、追加 route なしでブラウザ 404 を出さない
 - バージョン別の機能ツアーを `GET /api/feature_tour/pending` / `GET /api/feature_tour/all` / `POST /api/feature_tour/seen` / `POST /api/feature_tour/config` で提供し、アップデート後に新機能を Web UI で告知する。SQLite 管理への移行はツアー経由の opt-in で、`GET/POST /api/storage/mode` がモードの読み書きを担う（CLI 側の保守コマンドは `narou db`）

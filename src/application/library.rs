@@ -301,15 +301,11 @@ impl LibraryService {
     }
 
 
-    /// Fetch one page of the library.
-    ///
-    /// Runs the count and the page query concurrently, then decorates each
-    /// row with frozen status and the new-arrival marker.
-    pub async fn list(
+    /// Build the same typed filter for leased readers and atomic metadata snapshots.
+    async fn prepare_list(
         &self,
-        scope: &mut crate::application::novel_access::NovelReadScope,
         request: &LibraryListRequest,
-    ) -> Result<LibraryPage, ApplicationError> {
+    ) -> Result<(NovelFilter, NovelSort, HashSet<i64>), ApplicationError> {
         let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
         let mut filter = self.build_filter_with_ids(request.search.as_deref(), &frozen_ids);
         filter.attribute_tags_enabled = request.attribute_tags_enabled;
@@ -323,6 +319,16 @@ impl LibraryService {
             key: request.sort_column.sort_key(),
             reverse: request.sort_order == LibrarySortOrder::Descending,
         };
+        Ok((filter, sort, frozen_ids))
+    }
+
+    /// Fetch the library page and validate its rows in the caller's read scope.
+    pub async fn list(
+        &self,
+        scope: &mut crate::application::novel_access::NovelReadScope,
+        request: &LibraryListRequest,
+    ) -> Result<LibraryPage, ApplicationError> {
+        let (filter, sort, frozen_ids) = self.prepare_list(request).await?;
 
         let (records_total, records_filtered, records) = self
             .list_records(filter, sort, request.start, request.length)
@@ -342,6 +348,25 @@ impl LibraryService {
             records_filtered,
             data,
         })
+    }
+
+    /// Project rows from one authoritative metadata snapshot. The reader must
+    /// read the page, counts and admission state atomically and reject a closed
+    /// namespace. No file or mutable reader lease is used after the snapshot.
+    #[cfg(feature = "worker-runtime")]
+    pub async fn list_metadata_snapshot<F>(
+        &self,
+        request: &LibraryListRequest,
+        read: impl FnOnce(NovelQuery) -> F,
+    ) -> Result<LibraryPage, ApplicationError>
+    where
+        F: std::future::Future<Output = crate::error::Result<(u64, u64, Vec<NovelRecord>)>>,
+    {
+        let (filter, sort, frozen_ids) = self.prepare_list(request).await?;
+        let query = NovelQuery::page(filter, sort, request.start, request.length.unwrap_or(usize::MAX));
+        let (records_total, records_filtered, records) = read(query).await.map_err(ApplicationError::platform)?;
+        let data = self.summarize_records_with_frozen(records, request.attribute_tags_enabled, &frozen_ids).await;
+        Ok(LibraryPage { records_total, records_filtered, data })
     }
 
     /// Project already-admitted authoritative records with the same native and

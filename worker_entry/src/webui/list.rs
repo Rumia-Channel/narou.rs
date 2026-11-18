@@ -114,19 +114,15 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
         }
     };
     let db = super::metadata::primary_database(env)?;
-    let objects: std::sync::Arc<dyn narou_rs::platform::ObjectStore> = std::sync::Arc::new(crate::d1_object_store::D1ObjectStore::new(db.clone()));
-    let repository: std::sync::Arc<dyn narou_rs::platform::NovelRepository> = std::sync::Arc::new(crate::d1_repository::D1NovelRepository::new(db.clone()));
+    let repository = std::sync::Arc::new(crate::d1_repository::D1NovelRepository::new(db.clone()));
     let primary_library = narou_rs::application::LibraryService::new(
         repository.clone(),
         std::sync::Arc::new(narou_rs::platform::SystemClock),
         std::sync::Arc::new(crate::d1_repository::D1FreezeStore::for_writes(db)),
         std::sync::Arc::new(narou_rs::application::EmptySiteTimezoneProvider),
     );
-    let content = narou_rs::application::NovelContentService::new(repository, objects);
-    let mut scope = content.read_scope("web-library-list");
-    let result = async {
     let page = match primary_library
-        .list(&mut scope, &LibraryListRequest {
+        .list_metadata_snapshot(&LibraryListRequest {
             search,
             start,
             length,
@@ -136,7 +132,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
             include_hidden,
             exclude_ids,
             attribute_tags_enabled: narou_rs::application::attribute_tags::enabled(&settings).await,
-        })
+        }, |query| repository.web_list_snapshot(query))
         .await
     {
         Ok(page) => page,
@@ -188,8 +184,6 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
         data,
     })?;
     super::metadata::timed_response(response, "list", started_ms)
-    }.await;
-    super::leased_response(result, scope).await
 }
 
 /// `serde_urlencoded` (= `form_urlencoded`) と同じ規則で生バイト列から
