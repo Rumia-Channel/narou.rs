@@ -10,10 +10,9 @@ development.
 If dependency versions change, regenerate both notices:
 
 ```powershell
-# GPL side: the workspace always enables `lite` through `worker_entry`, and both
-# `lite` (AozoraEpub3_Lite) and the Worker are GPL-3.0-only. Produces the notice
-# shipped with the GPL archives.
-cargo-about generate --workspace --locked --offline -c about.toml -o Third-Party-License.md about.hbs
+# GPL side: explicitly enable Lite for native binaries. about.toml also scans
+# the wasm32 Worker. Both AozoraEpub3_Lite and the Worker are GPL-3.0-only.
+cargo-about generate --workspace --features narou_rs/lite --locked --offline -c about.toml -o Third-Party-License.md about.hbs
 
 # Non-GPL binaries: accepts no GPL at all, so the scan fails if copyleft reaches
 # the non-GPL graph. Produces the notice shipped with the standard archives.
@@ -141,7 +140,7 @@ dependency).
 
 | License | Used by |
 | --- | ---: |
-| MIT License | 354 |
+| MIT License | 357 |
 | Unicode License v3 | 20 |
 | Apache License 2.0 | 12 |
 | BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License | 8 |
@@ -6535,12 +6534,72 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
+- web-time 1.1.0
+
+```text
+MIT License
+
+Copyright (c) 2023 dAxpeDDa
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
 - unit-prefix 0.5.2
 
 ```text
 MIT License
 
 Copyright (c) 2024 Benjamin Sago, Fabio Valentini
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
+- sqlite-wasm-rs 0.6.2
+
+```text
+MIT License
+
+Copyright (c) 2024 Spxg
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -6582,6 +6641,7 @@ Used by:
 - objc2-foundation 0.3.2
 - objc2 0.6.5
 - parse-zoneinfo 0.4.1
+- rsqlite-vfs 0.2.0
 - saphyr-parser 0.3.4
 - windows-core 0.62.2
 - windows-implement 0.60.2

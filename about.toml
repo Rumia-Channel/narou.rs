@@ -1,9 +1,8 @@
 # cargo-about configuration for the GPL-side artifacts (the `lite` binaries and
 # the Cloudflare Worker, which always enables `lite`).
 #
-# The workspace scan sees this graph: `worker_entry` depends on
-# `worker-runtime`, which implies `lite`, so workspace-wide feature unification
-# enables `narou_rs/lite` for every `cargo about` run rooted at the workspace.
+# The GPL scan explicitly enables `narou_rs/lite` for native binaries and
+# includes wasm32 so the Worker runtime and its dependencies are covered too.
 # `lite` embeds AozoraEpub3_Lite, which is GPL-3.0-only.
 #
 # GPL is therefore accepted per crate only, never globally: the two known
@@ -39,6 +38,7 @@ targets = [
     "aarch64-unknown-linux-gnu",
     "armv7-unknown-linux-gnueabihf",
     "arm-unknown-linux-gnueabihf",
+    "wasm32-unknown-unknown",
 ]
 
 workarounds = [

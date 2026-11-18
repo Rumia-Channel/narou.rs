@@ -10,10 +10,9 @@ development.
 If dependency versions change, regenerate both notices:
 
 ```powershell
-# GPL side: the workspace always enables `lite` through `worker_entry`, and both
-# `lite` (AozoraEpub3_Lite) and the Worker are GPL-3.0-only. Produces the notice
-# shipped with the GPL archives.
-cargo-about generate --workspace --locked --offline -c about.toml -o Third-Party-License.md about.hbs
+# GPL side: explicitly enable Lite for native binaries. about.toml also scans
+# the wasm32 Worker. Both AozoraEpub3_Lite and the Worker are GPL-3.0-only.
+cargo-about generate --workspace --features narou_rs/lite --locked --offline -c about.toml -o Third-Party-License.md about.hbs
 
 # Non-GPL binaries: accepts no GPL at all, so the scan fails if copyleft reaches
 # the non-GPL graph. Produces the notice shipped with the standard archives.

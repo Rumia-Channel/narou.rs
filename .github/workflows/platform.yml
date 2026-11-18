@@ -125,7 +125,7 @@ jobs:
       - name: Build the browser transfer codec for GPL Web UI tests
         run: node scripts/build-transfer-wasm.mjs --install-bindgen --assert-lean
       - run: cargo check -p narou_rs --all-targets --features lite
-      - run: cargo test -p narou_rs --lib --features lite
+      - run: cargo test -p narou_rs --lib --test virtual_novel --features lite
       # Verify the GPL (embedded AozoraEpub3_Lite) binary links.
       - run: cargo build -p narou_rs --bin narou_rs --features lite
 
@@ -461,7 +461,7 @@ jobs:
       # dependency reaches the non-GPL dependency graph (about-probe).
       - name: Regenerate notices
         run: |
-          cargo-about generate --workspace --locked -c about.toml -o Third-Party-License.md about.hbs
+          cargo-about generate --workspace --features narou_rs/lite --locked -c about.toml -o Third-Party-License.md about.hbs
           cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked -o Third-Party-License-non-GPL.md about.hbs
       - name: Committed notices are current
         run: git diff --exit-code -- Third-Party-License.md Third-Party-License-non-GPL.md
