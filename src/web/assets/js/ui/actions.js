@@ -3042,12 +3042,6 @@ export async function refreshQueue() {
   });
 }
 
-export function refreshQueueDetailedIfOpen() {
-  if (El.queueModal && !El.queueModal.classList.contains('hide')) {
-    return refreshQueueDetailed();
-  }
-}
-
 export async function refreshQueueDetailed() {
   return runRefresh('queue-details', async () => {
     try {
@@ -3074,6 +3068,12 @@ export async function refreshQueueDetailed() {
       showNotification(error.message || '待機キューを取得できませんでした', 'error');
     }
   });
+}
+
+export function refreshQueueDetailedIfOpen() {
+  if (El.queueModal && !El.queueModal.classList.contains('hide')) {
+    return refreshQueueDetailed();
+  }
 }
 
 export async function refreshTags(redraw = true) {
