@@ -312,8 +312,8 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 
 **Rust版: ✅ 実装済み (issue #46 の要望)**
 
-メインメニューの「タグ」に並んだタグ一覧は、並び順を選べる。設定は
-`webui.tag-sort-order` (Web UI の設定ページ、または `narou setting
+メインメニューの「タグ」と、作品一覧の各行の「タグ」列は同じ並び順を使う。
+設定は `webui.tag-sort-order` (Web UI の設定ページ、または `narou setting
 webui.tag-sort-order=...` で変更)。
 
 | 値 | 並び | 備考 |
@@ -325,9 +325,9 @@ webui.tag-sort-order=...` で変更)。
 
 - 並べ替えは保存しないと次の起動で元に戻る (設定なので永続化される)
 - `webui.tag-sort-order` は Worker 側でも同じ設定名を使う。Native / Worker とも `/api/webui/config` の `tag_sort_order` で現在の選択を返す。
-- 設定画面で保存すると、変更通知を受けたメイン画面がタグ一覧を取り直して並べ替える。
+- 設定画面で保存すると、変更通知を受けたメイン画面がタグ一覧を取り直し、メニューと作品行の両方に反映する。
   Native の CLI から変更した場合は、既存の 30 秒間隔の監視で検知した後に反映する。
-  メイン画面の再読み込みやサーバーの再起動は不要で、お気に入りの登録内容やタグ色は変えない。
+  メイン画面の再読み込みやサーバーの再起動は不要。作品に保存されたタグの順序、お気に入りの登録内容、タグ色は変えない。
 - **登録順の保存先**: 在庫の `tag_sequence` キー (Native は
   `.narou/tag_sequence.yaml`、SQLite 管理と Worker は
   `app_state('inv','tag_sequence')`)。タグごとにグローバルな連番を振り、

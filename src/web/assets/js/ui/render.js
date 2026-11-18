@@ -25,6 +25,8 @@ let queueDragTaskId = null;
 let storyGeneration = 0;
 let storyOwner = null;
 let storyPopover = null;
+let rankedTags = null;
+let tagRanks = new Map();
 
 function closeStoryPopover() {
   ++storyGeneration;
@@ -64,6 +66,13 @@ export function renderNovelList() {
   const start = pageLength === -1 ? 0 : (State.currentPage - 1) * pageLength;
   const end = pageLength === -1 ? totalCount : Math.min(start + pageLength, totalCount);
   const visible = pageLength === -1 ? sorted : sorted.slice(start, end);
+
+  // The menu's server-sorted snapshot also defines the order of row badges.
+  if (rankedTags !== State.tags) {
+    rankedTags = State.tags;
+    tagRanks = new Map();
+    rankedTags.forEach((tag, index) => tagRanks.set(tag, index));
+  }
 
   const fragment = document.createDocumentFragment();
   for (let i = 0; i < visible.length; i++) {
@@ -870,8 +879,14 @@ export function syncAttributeTagControls() {
 }
 
 
+function compareTagRank(a, b) {
+  // A list response can contain a new tag before the menu snapshot does.
+  // Keep those badges visible, in their stored relative order, at the end.
+  return (tagRanks.get(a) ?? Number.MAX_SAFE_INTEGER) - (tagRanks.get(b) ?? Number.MAX_SAFE_INTEGER);
+}
+
 function renderTags(tags) {
-  return tags.filter(attributeTagVisible).map(tag => {
+  return tags.filter(attributeTagVisible).sort(compareTagRank).map(tag => {
     const colorName = State.tagColors[tag] || 'default';
     const cls = TAG_COLOR_MAP[colorName] || 'tag-default';
     return `<span class="tag-label ${cls}" data-tag="${escAttr(tag)}">${esc(tag)}</span>`;

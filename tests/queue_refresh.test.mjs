@@ -102,17 +102,42 @@ test('failure of a queued refresh cannot reauthorize the previous stale payload'
 
 function tagConfigHarness() {
   const state = { tags: ['Zulu', 'Alpha', 'Middle'], tagColors: {}, tagSortOrder: 'count', attributeTagsEnabled: false, performanceMode: 'off' };
+  const migratedTags = Object.freeze(['Middle', 'Alpha', 'Zulu', '小説']);
+  const newTags = Object.freeze(['only-in-row', 'Zulu', 'Middle', 'last-in-row']);
+  Object.assign(state, {
+    novels: [{ id: 8, tags: migratedTags }, { id: 1448, tags: newTags }],
+    selectedIds: new Set(['8']), viewFrozen: true, viewNonfrozen: true,
+    pageLength: 50, sortCol: 'id', sortAsc: true,
+  });
+  const tbody = {
+    rows: [],
+    set textContent(_) { this.rows = []; },
+    appendChild(fragment) { this.rows.push(...fragment.rows); },
+  };
   const canvas = {
     children: [],
     set textContent(_) { this.children = []; },
     appendChild(child) { this.children.push(child); },
     closest() { return null; },
   };
+  const el = { tagListCanvas: canvas, novelListBody: tbody };
   const document = {
     body: { classList: { toggle() {} } },
     addEventListener() {},
     getElementById() { return null; },
-    createElement() { return { dataset: {}, addEventListener() {} }; },
+    querySelectorAll() { return []; },
+    createDocumentFragment() {
+      return { rows: [], appendChild(row) { this.rows.push(row); } };
+    },
+    createElement() {
+      return {
+        dataset: {}, classList: { add() {} }, addEventListener() {}, querySelector: () => null, querySelectorAll: () => [],
+        set innerHTML(value) { this.markup = value; },
+        get innerHTML() {
+          return this.markup ?? String(this.textContent ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+        },
+      };
+    },
   };
   let config = { tag_sort_order: 'alphabetical', attribute_tags_enabled: false };
   let tags = ['Alpha', 'Middle', 'Zulu'];
@@ -132,9 +157,11 @@ function tagConfigHarness() {
     }
     throw new Error(`unexpected request: ${url}`);
   };
-  const render = loadModule('render.js', { State: state, El: { tagListCanvas: canvas }, document, window: {} });
+  const render = loadModule('render.js', {
+    State: state, El: el, document, window: {}, persistListState() {}, applyActionCapabilities() {},
+  });
   const actions = loadModule('actions.js', {
-    State: state, El: {}, fetchJson, renderTagList: render.renderTagList, renderNovelList() {},
+    State: state, El: {}, fetchJson, renderTagList: render.renderTagList, renderNovelList: render.renderNovelList,
   });
   const main = loadModule('../main.js', {
     State: state, El: {}, document, fetchJson,
@@ -142,15 +169,17 @@ function tagConfigHarness() {
     refreshFavoriteTags: actions.refreshFavoriteTags,
     setTimeout: callback => { timers.push(callback); return timers.length; },
     captureThemeRead() {}, setCapabilities() {}, syncAttributeTagControls() {},
-    syncTagSortOrderSelect() {}, renderQueueStatus() {}, renderNovelList() {},
+    syncTagSortOrderSelect() {}, renderQueueStatus() {}, renderNovelList: render.renderNovelList,
     captureTagSortRead: actions.captureTagSortRead, applyTagSortOrder: actions.applyTagSortOrder,
     renderTagList: render.renderTagList, createConsoleHistoryPoller: () => ({}),
   });
   render.renderTagList();
+  render.renderNovelList();
   return {
     state,
     reload: (controls = false) => main.reloadWebConfig(controls),
     displayed: () => canvas.children.map((child) => child.textContent),
+    rowTags: id => Array.from(tbody.rows.find(row => row.dataset.id === id).innerHTML.matchAll(/data-tag="([^"]+)"/g), match => match[1]),
     configure(order, orderedTags) { config = { ...config, tag_sort_order: order }; tags = orderedTags; },
     offline() { offline = true; },
     deferConfigs() { deferConfigs = true; },
@@ -172,6 +201,23 @@ test('an open tag menu follows an external order change without reloading the pa
   h.configure('favorites_first', ['Middle', 'Zulu', 'Alpha']);
   await h.reload();
   assert.deepEqual(h.displayed(), ['Middle', 'Zulu', 'Alpha']);
+});
+
+test('an open novel list reorders the tag column for migrated and new works', async () => {
+  const h = tagConfigHarness();
+  for (const [order, menu, migrated, newer] of [
+    ['alphabetical', ['Alpha', 'Middle', 'Zulu'], ['Alpha', 'Middle', 'Zulu'], ['Middle', 'Zulu']],
+    ['favorites_first', ['Middle', 'Zulu', 'Alpha'], ['Middle', 'Zulu', 'Alpha'], ['Middle', 'Zulu']],
+    ['registered', ['Zulu', 'Alpha', 'Middle'], ['Zulu', 'Alpha', 'Middle'], ['Zulu', 'Middle']],
+    ['count', ['Alpha', 'Zulu', 'Middle'], ['Alpha', 'Zulu', 'Middle'], ['Zulu', 'Middle']],
+    ['alphabetical', ['Alpha', 'Middle', 'Zulu'], ['Alpha', 'Middle', 'Zulu'], ['Middle', 'Zulu']],
+  ]) {
+    h.configure(order, menu);
+    await h.reload();
+    assert.deepEqual(h.rowTags(8), migrated, order);
+    assert.deepEqual(h.rowTags(1448), [...newer, 'only-in-row', 'last-in-row'], order);
+  }
+  assert.deepEqual([...h.state.selectedIds], ['8']);
 });
 
 test('a failed tag refresh preserves the visible tags after an order change', async () => {
@@ -403,6 +449,8 @@ test('favorite invalidations update an already-open menu and registered favorite
   await h.flushEvents();
   assert.deepEqual(h.displayed(), ['Alpha', 'Zulu', 'Middle']);
   assert.deepEqual(h.state.favoriteTags, ['Alpha', 'Zulu']);
+  assert.deepEqual(h.rowTags(8), ['Alpha', 'Zulu', 'Middle']);
+  assert.deepEqual(h.rowTags(1448), ['Zulu', 'Middle', 'only-in-row', 'last-in-row']);
 });
 
 test('a sort invalidation during a pending save is reconciled after its response', async () => {

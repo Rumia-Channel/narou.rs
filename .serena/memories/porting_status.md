@@ -9,6 +9,8 @@
 - 実Firefoxの最終Native往復が成功（854.78秒、artifact c839d49e36ce）。168作品・17,935,008byteの実ZIPを独立CRC/SHA照合し、YAML/SQLite DB-onlyへ各168作品を公開、全実体・receiptを確認した。13,979要求で413・旧ZIP・過大拒否・記録打切り0、最大upload8,323,449byte・最大transfer response8,323,297byte。240秒の無進捗検出と元の20分上限を維持した。ブランチ統合は全original tipと取得し直したtipの祖先関係を保存し、main/developへの通常push後にSHA照合付きで不要headを削除する。
 - `36ab9ce` のCIではNativeのテスト・Clippy後にrustdocのprivateリンクと名称ずれで停止。Cloudflare隔離CIは publication/gates のECONNRESETとmetadataのtail途絶（3scenario自体は完走）で失敗。監視断では試験を即中止し、成功へ読み替えない。取込は短い計画表示と、gate close/commitだけの全メタデータ読込へ変更。取消・回復は既存の公開owner/epochから処理し、書誌断片の欠落に依存しない。
 - 巻き戻し完了を `/plan` の `rolled_back` receipt に保存し、失敗理由を計画上の新規・上書きと区別する。隔離Linuxで公開rustdocの厳格ゲートが成功。最終版のNative転送HTTPは8成功・実Firefox用1件ignore、Worker wasmチェックも成功。公開直前の書誌断片欠損は修正前の通常 `/advance` で `failed` を再現し、修正後は取消と自動巻き戻し双方で閉鎖gate・予約・未公開参照の解放と永続receiptを確認した。Cloudflare隔離先の通信断は未解決で、Workerの新しいreceipt契約は実workerdで未確認。
+- issue #46 の 2026-11-17 追記は、上部タグメニューではなく作品行の「タグ」列が対象。共有 `ui/render.js` が `/api/tag_list` の順序で各行のタグを並べる。遅れて一覧に載るタグも消さず、未順位同士は保存順を保つ。タグの登録内容・保存順・色には書き込まない。
+  `tests/queue_refresh.test.mjs` の新規回帰は修正前の行順序で失敗し、修正後は全 25 件成功。
 
 以下の転送詳細は元ブランチで記録された検証範囲。最終統合ツリーの成功とは区別し、最新の検証状況は上記を優先する。
 
