@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import {brotliCompressSync,crc32} from 'node:zlib';
-import {fixtureNovel,selectionDigest,sourceNamespaceContracts,transferClient} from './transfer.mjs';
+import {fixtureNovel,selectionDigest,sourceNamespaceContracts,transferClient,waitForDeployedTransfer} from './transfer.mjs';
 
 const base=new URL(process.env.NAROU_TRANSFER_TEST_URL??'https://missing.invalid');
 assert.equal(base.protocol,'https:','NAROU_TRANSFER_TEST_URL must be a deployed HTTPS Worker');
@@ -39,9 +39,7 @@ client.request=async(path,init={})=>{
   }
   return response;
 };
-const probe=await client.request('/api/transfer/v2/capabilities');
-assert.equal(probe.status,200,await probe.text());
-assert(probe.headers.get('cf-ray'),'the memory test must execute on Cloudflare');
+await waitForDeployedTransfer(client);
 const slug=`memory-${randomUUID()}`;
 const observe=async session=>(await client.json(`/_fixture/transfer-observe?session=${session.status.session_id}`)).body;
 async function select(session,profile='runtime',roles=[]){const catalog=await session.pages('catalog');await session.op('select',{profile,extra_roles:roles,selection_digest:selectionDigest(session.status.catalog_revision,profile,roles,catalog)});}

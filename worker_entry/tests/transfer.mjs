@@ -48,6 +48,28 @@ export function selectionDigest(revision,profile,roles,items){
   const rows=items.map(item=>`${item.novel_ordinal}\0${item.logical_path}\0${item.size}\0${item.role}`).sort((a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b)));
   return sha256(Buffer.from(`v2\0${revision}\0${profile}\0${[...roles].sort().join(',')}\0${rows.map(r=>r+'\x01').join('')}`));
 }
+
+export async function waitForDeployedTransfer(client){
+  const path='/api/transfer/v2/capabilities';
+  for(let attempt=0;attempt<15;attempt++){
+    const response=await fetch(client.base+path,{redirect:'manual',headers:{Authorization:`Bearer ${client.token}`,...client.extraHeaders},
+      signal:AbortSignal.timeout(5000)});
+    const marker=response.headers.get('x-test-transfer-primary-only');
+    if(response.status===404&&marker===null&&response.headers.has('cf-ray')){
+      // A newly published Workers route can be absent at this edge even
+      // after provisioning observed another successful readiness request.
+      await response.body?.cancel();
+      if(attempt<14){await sleep(1000);continue;}
+    }
+    assert.equal(response.status,200,'deployed transfer readiness HTTP status');
+    assert.equal(marker,'true','deployed transfer readiness must check primary access');
+    assert(response.headers.has('cf-ray'),'the memory test must execute on Cloudflare');
+    const caps=await response.json();
+    assert.equal(caps.protocol_version,2);
+    assert.equal(caps.storage.import.allowed,true);
+    return;
+  }
+}
 export function transferClient(base,token,{verifyPrimary=false}={}){
   const client={base,token,verifyPrimary,requests:[],
     async request(path,init={}){const bytes=init.body===undefined?0:Buffer.byteLength(init.body);if(init.headers?.['content-type']==='application/octet-stream')assert(bytes<=WIRE);

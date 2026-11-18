@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import test from 'node:test';
-import { transferClient } from './transfer.mjs';
+import { transferClient, waitForDeployedTransfer } from './transfer.mjs';
 
 const advance = '/api/transfer/v2/exports/sess_transport/advance';
 const init = {
@@ -62,4 +62,31 @@ test('repeated resets exhaust the bounded advance replay budget', async t => {
   });
   await assert.rejects(client.request(advance, init), { name: 'TypeError' });
   assert.equal(requests, 4);
+});
+
+test('startup waits for the Cloudflare route, then requires the real primary marker', async t => {
+  let requests = 0;
+  const client = await serve(t, (req, res) => {
+    assert.equal(req.url, '/api/transfer/v2/capabilities');
+    requests++;
+    const headers = { 'cf-ray': 'fixture', 'content-type': 'application/json' };
+    if (requests === 1) {
+      res.writeHead(404, headers).end('{}');
+    } else {
+      res.writeHead(200, { ...headers, 'x-test-transfer-primary-only': 'true' })
+        .end(JSON.stringify({ protocol_version: 2, storage: { import: { allowed: true } } }));
+    }
+  });
+  await waitForDeployedTransfer(client);
+  assert.equal(requests, 2);
+});
+
+test('startup fails immediately when the Worker responds without primary proof', async t => {
+  let requests = 0;
+  const client = await serve(t, (_req, res) => {
+    requests++;
+    res.writeHead(200, { 'cf-ray': 'fixture', 'x-test-transfer-primary-only': 'false' }).end('{}');
+  });
+  await assert.rejects(waitForDeployedTransfer(client), /must check primary access/);
+  assert.equal(requests, 1);
 });
