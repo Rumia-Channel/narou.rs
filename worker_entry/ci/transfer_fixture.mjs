@@ -130,7 +130,7 @@ async function readEvidence(state,startSequence,highestSequence) {
     const last=Math.min(first+499,highestSequence);
     const result=await api(`/d1/database/${state.databaseId}/query`,{
       method:'POST',timeout:10000,
-      body:{sql:'SELECT seq,outcome,http_status FROM fixture_transfer_traces WHERE seq BETWEEN ? AND ? ORDER BY seq,outcome,http_status',params:[first,last]},
+      body:{sql:'SELECT seq,outcome,http_status FROM fixture_transfer_traces WHERE seq BETWEEN ? AND ? ORDER BY seq,outcome,http_status',params:[String(first),String(last)]},
     });
     assert.equal(result?.length,1,'invalid D1 trace query result');
     assert.equal(result[0].success,true,'D1 trace lookup failed');
