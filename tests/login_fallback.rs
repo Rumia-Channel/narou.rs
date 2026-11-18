@@ -461,6 +461,11 @@ impl HttpClient for RedirectCookieClient {
 #[tokio::test]
 async fn redirected_sites_use_their_own_consent_and_login_scope() {
     let _serial = PIPELINE.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    std::env::set_current_dir(temp.path()).unwrap();
+    std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+    narou_rs::db::init_database().unwrap();
+
     for (flagged_source, destination_open, same_site) in [
         (false, false, false), (true, false, false), (true, true, false), (true, false, true),
     ] {
