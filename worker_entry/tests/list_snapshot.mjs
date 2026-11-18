@@ -40,6 +40,15 @@ try {
   assert.equal(page.records_filtered, size);
   assert.deepEqual(page.data.map(row => row.id), [last - 2, last - 3, last - 4]);
 
+  // The fixtures have NULL ncode. A negated single Any term must still keep
+  // the non-matching works, including on the paginated query with later binds.
+  const terms = encodeURIComponent(`list-snapshot -${title(first)}`);
+  const withoutFirst = await payload(`filter=${terms}&length=2`);
+  assert.equal(withoutFirst.records_filtered, size - 1);
+  assert.deepEqual(withoutFirst.data.map(row => row.id), [first + 1, first + 2]);
+  const alternatives = encodeURIComponent(`${title(first)}|${title(last)}`);
+  assert.deepEqual((await payload(`filter=${alternatives}&all=true`)).data.map(row => row.id), [first, last]);
+
   const gates = JSON.parse(sql("SELECT count(*) AS count FROM novel_access_gates WHERE prefix LIKE 'novels/list-snapshot/%'"));
   assert.equal(gates[0].results[0].count, 0, 'metadata-only reads must not create durable leases or gates');
 

@@ -108,7 +108,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
         Ok(inputs) => inputs,
         Err(error) => return json_error(503, "service_unavailable", Some(&error.to_string())),
     };
-    let exclude_ids = inputs.members.all_member_ids();
+    let exclude_ids = inputs.members.all_member_ids().into_iter().collect();
     let primary_library = narou_rs::application::LibraryService::new(
         repository.clone(),
         std::sync::Arc::new(narou_rs::platform::SystemClock),
