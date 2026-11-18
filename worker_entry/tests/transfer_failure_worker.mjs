@@ -96,14 +96,18 @@ export default class TransferFailureWorker extends Worker{
     if(url.pathname==='/_fixture/transfer-observe'){
       if(request.headers.get('authorization')!==`Bearer ${this.env.NAROU_ADMIN_TOKEN}`)return new Response('unauthorized',{status:401});
       const id=url.searchParams.get('session');const db=this.env.DB.withSession('first-primary');
-      const publications=await db.prepare('SELECT publication_id,state,assigned_id,receipt,error FROM transfer_publications WHERE session_id=? ORDER BY publication_id').bind(id).all();
-      const targets=await db.prepare('SELECT publication_id,assigned_id,prefix,epoch,committed,rolled_back FROM transfer_targets WHERE session_id=? ORDER BY publication_id').bind(id).all();
-      const stages=await db.prepare('SELECT stage_id,file_id,expected_size,backend,initialized,purpose AS stagepurpose,sealed_key IS NOT NULL AS sealed FROM transfer_stage_owners WHERE session_id=? ORDER BY file_id').bind(id).all();
-      const refs=await db.prepare('SELECT object_key,blob_key,size,sha256,backend FROM transfer_object_refs ORDER BY object_key').all();
-      const snapshot=await db.prepare("SELECT (SELECT COUNT(*) FROM transfer_snapshot_gates s JOIN novel_access_gates g ON g.prefix=s.prefix AND g.owner=s.owner AND g.closed=1 WHERE s.session_id=?) gates,(SELECT COUNT(*) FROM transfer_files WHERE session_id=? AND state IN ('staged','pinned')) pinned,(SELECT COUNT(*) FROM transfer_catalog_entries WHERE session_id=? AND selected=1) selected").bind(id,id,id).first();
-      const frozen=await db.prepare('SELECT COALESCE(MAX(length(CAST(data AS BLOB))),0) max_row_bytes,COUNT(*) fragments FROM transfer_inventory_fragments WHERE session_id=?').bind(id).first();
-      const selection=await db.prepare('SELECT * FROM transfer_export_selection_state WHERE session_id=?').bind(id).first();
-      return Response.json({publications:publications.results,targets:targets.results,stages:stages.results,refs:refs.results,snapshot,frozen,selection});
+      // A read-only batch keeps the observations in one primary snapshot
+      // and avoids seven sequential D1 round trips for every gate check.
+      const [publications,targets,stages,refs,snapshot,frozen,selection]=await db.batch([
+        db.prepare('SELECT publication_id,state,assigned_id,receipt,error FROM transfer_publications WHERE session_id=? ORDER BY publication_id').bind(id),
+        db.prepare('SELECT publication_id,assigned_id,prefix,epoch,committed,rolled_back FROM transfer_targets WHERE session_id=? ORDER BY publication_id').bind(id),
+        db.prepare('SELECT stage_id,file_id,expected_size,backend,initialized,purpose AS stagepurpose,sealed_key IS NOT NULL AS sealed FROM transfer_stage_owners WHERE session_id=? ORDER BY file_id').bind(id),
+        db.prepare('SELECT object_key,blob_key,size,sha256,backend FROM transfer_object_refs ORDER BY object_key'),
+        db.prepare("SELECT (SELECT COUNT(*) FROM transfer_snapshot_gates s JOIN novel_access_gates g ON g.prefix=s.prefix AND g.owner=s.owner AND g.closed=1 WHERE s.session_id=?) gates,(SELECT COUNT(*) FROM transfer_files WHERE session_id=? AND state IN ('staged','pinned')) pinned,(SELECT COUNT(*) FROM transfer_catalog_entries WHERE session_id=? AND selected=1) selected").bind(id,id,id),
+        db.prepare('SELECT COALESCE(MAX(length(CAST(data AS BLOB))),0) max_row_bytes,COUNT(*) fragments FROM transfer_inventory_fragments WHERE session_id=?').bind(id),
+        db.prepare('SELECT * FROM transfer_export_selection_state WHERE session_id=?').bind(id),
+      ]);
+      return Response.json({publications:publications.results,targets:targets.results,stages:stages.results,refs:refs.results,snapshot:snapshot.results[0]??null,frozen:frozen.results[0]??null,selection:selection.results[0]??null});
     }
     const mode=request.headers.get('x-narou-test-transfer-fault');
     if(!url.pathname.startsWith('/api/transfer/v2'))return super.fetch(request);

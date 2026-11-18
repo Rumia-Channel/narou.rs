@@ -115,23 +115,25 @@ export function transferClient(base,token,{verifyPrimary=false,fetcher=fetch}={}
       const v2=client.verifyPrimary&&path.startsWith('/api/transfer/v2/');
       const request = {...init, redirect:'manual', headers:new Headers({Authorization:`Bearer ${token}`,...client.extraHeaders,...init.headers})};
       const canReplay = v2 && canReplayTransferRequest(path, request);
+      const observe = client.verifyPrimary && (request.method??'GET')==='GET' &&
+        path.split('?',1)[0]==='/_fixture/transfer-observe';
       let response;
       for (let attempt = 0; ; attempt++) {
         client.requests.push({path,method:init.method??'GET',bytes,type:init.headers?.['content-type']??''});
-        const retryAvailable = canReplay && attempt < MAX_EDGE_REPLAYS && !request.signal?.aborted;
+        const retryAvailable = attempt < MAX_EDGE_REPLAYS && !request.signal?.aborted;
         let delay = 100 * (attempt + 1);
         let reason;
         try {
           response = await fetcher(client.base + path, request);
         } catch (error) {
           const code = error?.cause?.code;
-          if (!retryAvailable || request.signal?.aborted || !['ECONNRESET','UND_ERR_SOCKET'].includes(code)) throw error;
+          if (!retryAvailable || !(canReplay || observe) || request.signal?.aborted || !['ECONNRESET','UND_ERR_SOCKET'].includes(code)) throw error;
           reason = {code};
         }
         if (!reason) {
           const edge404 = missingCloudflareRoute(response);
           const edge5xx = response.status >= 500 && !response.headers.has('x-test-transfer-primary-only');
-          if (!retryAvailable || (!edge404 && !edge5xx)) break;
+          if (!retryAvailable || !canReplay || (!edge404 && !edge5xx)) break;
           delay = edge404 ? 1000 : delay;
           reason = {status:response.status};
           // Do not turn a completed response into a canceled invocation.
