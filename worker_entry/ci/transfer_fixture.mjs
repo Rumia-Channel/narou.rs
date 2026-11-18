@@ -48,9 +48,37 @@ function validate(state){
   assert(Number.isFinite(Date.parse(state.createdAt)),'missing fixture creation intent');return state;
 }
 function save(state){writeFileSync(statePath,JSON.stringify(state),{mode:0o600});}
+function runWrangler(args,stdio='inherit'){
+  const windows=process.platform==='win32';
+  return spawnSync(windows?'npx.cmd':'npx',['--yes',`wrangler@${pin}`,...args],{
+    cwd:root,stdio,shell:windows,encoding:'utf8',
+    env:{...process.env,CLOUDFLARE_ACCOUNT_ID:account,CI:'true',WRANGLER_SEND_METRICS:'false'},timeout:15*60*1000,
+  });
+}
 function wrangler(args){
-  const windows=process.platform==='win32';const result=spawnSync(windows?'npx.cmd':'npx',['--yes',`wrangler@${pin}`,...args],{cwd:root,stdio:'inherit',shell:windows,env:{...process.env,CLOUDFLARE_ACCOUNT_ID:account,CI:'true',WRANGLER_SEND_METRICS:'false'},timeout:15*60*1000});
+  const result=runWrangler(args);
   assert.equal(result.status,0,`pinned Wrangler command failed: ${args[0]}`);
+}
+async function deployTail(config,name){
+  const args=['deploy','--config',config];
+  const result=runWrangler(args,['ignore','pipe','pipe']);
+  process.stdout.write(result.stdout??'');
+  process.stderr.write(result.stderr??'');
+  if(result.status===0)return;
+  const path=`/workers/workers/${name}`;
+  // The upload can succeed before Wrangler's trigger sync can read the new
+  // script through the Workers metadata API. Retry only that observed race.
+  assert(result.status===1&&result.stdout?.includes(`Uploaded ${name} `)&&
+    result.stderr?.includes(`${path})`)&&result.stderr.includes('[code: 10007]'),
+    'pinned Wrangler Tail Worker deploy failed');
+  for(let attempt=0;attempt<15;attempt++){
+    if(await api(path,{missing:true,timeout:5000})){
+      wrangler(args);
+      return;
+    }
+    await sleep(2000);
+  }
+  assert.fail('uploaded Tail Worker did not become visible to the Cloudflare metadata API');
 }
 async function provision(){
   assert(!existsSync(statePath),'refusing to replace an existing fixture state file');
@@ -89,7 +117,7 @@ async function provision(){
     vars:{NAROU_TRACE_RUN:state.traceRun},
     d1_databases:[{binding:'TRACE_DB',database_name:state.databaseName,database_id:state.databaseId}],
   }),{mode:0o600});
-  wrangler(['deploy','--config',traceConfig]);
+  await deployTail(traceConfig,state.tailName);
   wrangler(['deploy','--config',config,'--secrets-file',secrets]);
   let readySequence,lastResponse='no HTTP response';
   for(let attempt=0;attempt<PREFLIGHT_ATTEMPTS;attempt++){
@@ -157,10 +185,10 @@ async function exercise(state){
   assert.match(state.databaseId??'',/^[a-f0-9-]{36}$/i);
   const ledger=resolve(dirname(statePath),state.workerName,'requests.json');
   assert(!existsSync(ledger),'refusing to reuse a transfer request ledger');
-  // Real D1 can take several seconds per journal step. The 33-source case
-  // exceeded 25 minutes while still advancing; keep the same assertions.
+  // The metadata and 33-source cases both exceeded 25 minutes while still
+  // advancing under real D1 latency. The scenario assertions stay unchanged.
   const caseGroup=process.env.NAROU_TRANSFER_CASE_GROUP??'all';
-  const minutes=caseGroup==='gates'||caseGroup==='all'?55:25;
+  const minutes=55;
   try{
     const signal=AbortSignal.timeout(minutes*60*1000);
     const child=spawn(process.execPath,[join(root,'tests/transfer_memory_deployed.mjs')],{
