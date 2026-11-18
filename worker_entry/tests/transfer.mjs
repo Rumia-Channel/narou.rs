@@ -51,8 +51,22 @@ export function selectionDigest(revision,profile,roles,items){
 export function transferClient(base,token,{verifyPrimary=false}={}){
   const client={base,token,verifyPrimary,requests:[],
     async request(path,init={}){const bytes=init.body===undefined?0:Buffer.byteLength(init.body);if(init.headers?.['content-type']==='application/octet-stream')assert(bytes<=WIRE);
-      const v2=client.verifyPrimary&&path.startsWith('/api/transfer/v2');let response;
-      for(let attempt=0;;attempt++){client.requests.push({path,method:init.method??'GET',bytes,type:init.headers?.['content-type']??''});response=await fetch(client.base+path,{...init,redirect:'manual',headers:{Authorization:`Bearer ${token}`,...client.extraHeaders,...init.headers}});
+      const v2=client.verifyPrimary&&path.startsWith('/api/transfer/v2');let response, resetReplays=0;
+      for(let attempt=0;;attempt++){client.requests.push({path,method:init.method??'GET',bytes,type:init.headers?.['content-type']??''});
+        try{response=await fetch(client.base+path,{...init,redirect:'manual',headers:{Authorization:`Bearer ${token}`,...client.extraHeaders,...init.headers}});}
+        catch(error){
+          const code=error?.cause?.code;
+          if(!v2||resetReplays>=3||init.signal?.aborted||!['ECONNRESET','UND_ERR_SOCKET'].includes(code)
+            ||init.method!=='POST'||!/^\/api\/transfer\/v2\/(?:exports|imports)\/[^/]+\/advance$/.test(path)||typeof init.body!=='string')throw error;
+          let operationId;
+          try{operationId=JSON.parse(init.body)?.operation_id;}catch{throw error;}
+          if(typeof operationId!=='string'||!operationId)throw error;
+          // As in the browser, a lost acknowledgement is ambiguous. Replay
+          // the original bytes/headers, never a newly fetched operation ID.
+          console.log(JSON.stringify({event:'transfer_edge_retry',code,attempt:++resetReplays,path}));
+          await sleep(100*resetReplays);
+          continue;
+        }
         // Markerless 5xx responses are not proof of primary access. Replay only
         // the SAME idempotent operation; the live tail separately rejects
         // isolate exceptions, CPU/memory failures and any coverage gap.

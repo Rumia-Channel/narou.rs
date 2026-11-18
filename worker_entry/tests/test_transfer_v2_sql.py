@@ -27,6 +27,55 @@ def namespace_parameters(values):
     return (*values, json.dumps(ancestors, ensure_ascii=False), canonical + "/", canonical + "0")
 
 
+class TransferV2UpgradeTests(unittest.TestCase):
+    def test_upgrade_preserves_legacy_bodies_during_s3_cutover(self):
+        migrations = sorted((ROOT / "worker_entry/migrations").glob("*.sql"))
+        inline = "novels/Site/book/本文/0001.yaml"
+        history = "novels/Site/book/本文/cache/old/0001.yaml"
+        toc = "novels/Site/book/本文/toc.yaml"
+        for backend in ("d1", "migrating", "s3"):
+            with self.subTest(backend=backend):
+                db = sqlite3.connect(":memory:")
+                self.addCleanup(db.close)
+                db.execute("PRAGMA foreign_keys=ON")
+                for migration in migrations:
+                    if migration.name == "0020_transfer_v2.sql":
+                        break
+                    db.executescript(migration.read_text(encoding="utf-8"))
+                objects = [(inline, b"current"), (history, None), (toc, b"metadata")]
+                db.executemany(
+                    "INSERT INTO objects(object_key,data,size,updated_at) VALUES(?,?,?,'old')",
+                    [(key, data, len(data) if data is not None else len(b"history")) for key, data in objects],
+                )
+                db.execute("INSERT INTO object_chunks VALUES(?,0,?)", (history, b"history"))
+                db.execute("INSERT INTO app_state(scope,key,value_json,value_yaml) VALUES('inv','content_backend',?,?)",
+                           (json.dumps(backend), backend))
+                db.commit()
+
+                db.executescript(migration.read_text(encoding="utf-8"))
+                self.assertEqual(db.execute("SELECT object_key,data FROM objects ORDER BY object_key").fetchall(),
+                                 sorted(objects))
+                self.assertEqual(db.execute("SELECT data FROM object_chunks WHERE object_key=?", (history,)).fetchone(),
+                                 (b"history",))
+                if backend != "d1":
+                    with self.assertRaisesRegex(sqlite3.IntegrityError, "legacy body write rejected"):
+                        db.execute("UPDATE objects SET data=? WHERE object_key=?", (b"changed", inline))
+                    with self.assertRaisesRegex(sqlite3.IntegrityError, "legacy body deletion requires"):
+                        db.execute("DELETE FROM objects WHERE object_key=?", (history,))
+                    db.execute("INSERT INTO content_deletions VALUES(?)", (history,))
+                    db.execute("DELETE FROM objects WHERE object_key=?", (history,))
+                    self.assertIsNone(db.execute("SELECT data FROM object_chunks WHERE object_key=?", (history,)).fetchone())
+                else:
+                    db.execute("UPDATE object_chunks SET data=? WHERE object_key=?", (b"changed", history))
+                    generation, = db.execute("SELECT generation FROM objects WHERE object_key=?", (history,)).fetchone()
+                    self.assertRegex(generation, r"^[0-9a-f]{32}$")
+                old_generation, = db.execute("SELECT generation FROM objects WHERE object_key=?", (toc,)).fetchone()
+                db.execute("UPDATE objects SET data=? WHERE object_key=?", (b"new toc", toc))
+                new_generation, = db.execute("SELECT generation FROM objects WHERE object_key=?", (toc,)).fetchone()
+                self.assertRegex(new_generation, r"^[0-9a-f]{32}$")
+                self.assertNotEqual(new_generation, old_generation)
+
+
 class TransferV2SqlTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:")
