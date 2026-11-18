@@ -26,7 +26,11 @@ def run_mode(driver, root, mode):
     settings = home / ".narousetting"
     settings.mkdir(parents=True)
     (settings / "global_setting.yaml").write_text("server-ws-port: 0\n", encoding="utf-8")
-    (state / "local_setting.yaml").write_text("webui.tag-sort-order: favorites_first\n", encoding="utf-8")
+    # This represents an existing library with first-run prompts already handled.
+    (state / "last-run-version").write_text("0.4.0\n", encoding="utf-8")
+    (state / "local_setting.yaml").write_text(
+        "webui.tag-sort-order: favorites_first\nwebui.feature-tour.disabled: true\n", encoding="utf-8",
+    )
     (state / "favorite_tags.yaml").write_text("- Zulu\n- Middle\n", encoding="utf-8")
     (state / "tag_colors.yaml").write_text("Zulu: blue\nMiddle: magenta\n", encoding="utf-8")
     if mode == "sqlite":
@@ -108,9 +112,6 @@ def exercise_tags(driver, api):
         wait.until(visible, message=f"Expected tag column order {expected}")
 
     expect("Zulu Middle 2 Alpha", "Zulu Middle 2 Beta")
-    if el("#feature-tour-ok").is_displayed():
-        click("#feature-tour-ok")
-        wait.until_not(lambda _: el("#feature-tour-ok").is_displayed())
     colors = api("/api/tag_list?format=json")["tag_colors"]
     menu = '[data-dropdown="tag-menu"]'
     order = "#tag-sort-order-select"
