@@ -178,6 +178,8 @@ async function contracts(){
     for(let i=0;i<100;i++){const observed=(await cb.json(`/_fixture/transfer-observe?session=${blocked.status.session_id}`)).body;if(observed.publications[0]?.state==='committing')break;await blocked.step();}
     await blocked.get();const fail=await cb.request(`${blocked.path}/advance`,{method:'POST',headers:blocked.headers({'content-type':'application/json','x-narou-test-transfer-fault':'commit_before'}),body:JSON.stringify({operation_id:blocked.status.operation_id})});assert([423,503].includes(fail.status));assert.equal(fail.headers.get('x-test-transfer-fault-fired'),'true');await fail.arrayBuffer();
     const beforeCancel=(await cb.json(`/_fixture/transfer-observe?session=${blocked.status.session_id}`)).body;assert.equal(beforeCancel.targets[0].committed,0);await blocked.cancel();
+    const [rolledBack]=await blocked.pages('plan');
+    assert.deepEqual(rolledBack.receipt,{novel_ordinal:0,action:'overwrite',outcome:'rolled_back',assigned_id:idb,files_installed:0,error:null});
     const preserved=await cb.exportData([idb]);assert.equal(preserved.files.get('novels/0/notes.bin').toString(),'replacement');
     console.log('PASS actual D1 commit ACK loss is idempotent; pre-commit failure/cancel preserves old canonical bytes');
 

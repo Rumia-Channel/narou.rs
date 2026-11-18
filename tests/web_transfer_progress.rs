@@ -242,7 +242,7 @@ fn send_batch(client:&Client,server:&Server,path:&str,secret:&str,body:&[u8],cou
     decode(authenticated(client,server,reqwest::Method::PUT,path,Some(secret)).header("content-type","application/octet-stream").header("x-transfer-record-count",count.to_string()).header("x-transfer-body-bytes",body.len().to_string()).body(body.to_vec()).send().unwrap())
 }
 fn frame(file:u32,chunk:u32,bytes:&[u8],is_final:bool,encoder:&mut FrameEncoder,body:&mut Vec<u8>){encoder.encode_into(&BatchHeader{file_id:file,chunk_index:chunk,payload_size:bytes.len() as u64,is_final,sha256:Some(sha256_hex(bytes))},bytes,body).unwrap();}
-fn import_projected(client:&Client,server:&Server,manifest:&ArchiveManifest,fingerprint:&str,payloads:&BTreeMap<u32,Vec<u8>>,overwrite:bool,profile:TransferProfile)->Value{
+fn prepare_projected_import(client:&Client,server:&Server,manifest:&ArchiveManifest,fingerprint:&str,payloads:&BTreeMap<u32,Vec<u8>>,overwrite:bool,profile:TransferProfile)->(Value,String){
     let secret=hex::encode([17u8;32]);let caps=get(client,server,"/api/transfer/v2/capabilities",None);let policy=caps["storage"]["policy_version"].as_u64().unwrap() as u32;let wire=wire_manifest(manifest,fingerprint,policy,profile);let hash=sha256_hex(&wire);
     let mut status=create(client,server,"imports",&secret,json!({"source_fingerprint":fingerprint,"profile":profile,"extra_roles":[],"policy_version":policy,"conflict_policy":if overwrite{"overwrite"}else{"skip"},"manifest_size":wire.len().to_string(),"manifest_sha256":hash}));
     let manifest_path=format!("/api/transfer/v2/imports/{}/manifest/chunks/0",session_id(&status));
@@ -255,7 +255,18 @@ fn import_projected(client:&Client,server:&Server,manifest:&ArchiveManifest,fing
     for file in files.iter().filter(|f|f["upload_required"]==true){let id=file["file_id"].as_u64().unwrap() as u32;assert_eq!(file["manifest_file_index"],id);let bytes=&payloads[&id];for(index,chunk)in bytes.chunks(protocol::CHUNK_BYTES as usize).enumerate(){if count==protocol::BATCH_MAX_RECORDS||body.len()+chunk.len()+protocol::FRAME_HEADER_MAX_BYTES+4>protocol::BINARY_BODY_MAX_BYTES as usize{send(&mut body,&mut count,&mut status);encoder=FrameEncoder::new();}frame(id,index as u32,chunk,(index+1)*protocol::CHUNK_BYTES as usize>=bytes.len(),&mut encoder,&mut body);count+=1;}if bytes.is_empty(){if count==protocol::BATCH_MAX_RECORDS{send(&mut body,&mut count,&mut status);encoder=FrameEncoder::new();}frame(id,0,&[],true,&mut encoder,&mut body);count+=1;}}
     send(&mut body,&mut count,&mut status);advance(client,server,"imports",&secret,&mut status);
     let plan=page_items(client,server,&format!("/api/transfer/v2/imports/{}/plan",session_id(&status)),&secret);assert_eq!(plan.len(),manifest.novels.len());
-    control(client,server,"imports",&secret,&mut status,"ready",json!({}));let plan_revision=status["plan_revision"].clone();control(client,server,"imports",&secret,&mut status,"publish",json!({"plan_revision":plan_revision}));advance(client,server,"imports",&secret,&mut status);assert_eq!(status["state"],"completed","{status}");
+    for entry in plan {
+        let novel=&manifest.novels[entry["novel_ordinal"].as_u64().unwrap() as usize];
+        let display_title:String=novel.title.chars().take(narou_rs::application::transfer::DISPLAY_TITLE_CHARS).collect();
+        assert_eq!(entry["title"],display_title);
+    }
+    control(client,server,"imports",&secret,&mut status,"ready",json!({}));
+    (status,secret)
+}
+
+fn import_projected(client:&Client,server:&Server,manifest:&ArchiveManifest,fingerprint:&str,payloads:&BTreeMap<u32,Vec<u8>>,overwrite:bool,profile:TransferProfile)->Value{
+    let (mut status,secret)=prepare_projected_import(client,server,manifest,fingerprint,payloads,overwrite,profile);
+    let plan_revision=status["plan_revision"].clone();control(client,server,"imports",&secret,&mut status,"publish",json!({"plan_revision":plan_revision}));advance(client,server,"imports",&secret,&mut status);assert_eq!(status["state"],"completed","{status}");
     let receipts=page_items(client,server,&format!("/api/transfer/v2/imports/{}/plan",session_id(&status)),&secret);assert!(receipts.iter().all(|p|!p["receipt"].is_null()),"{receipts:?}");status
 }
 
@@ -413,6 +424,88 @@ fn native_web_v2_client_delete_cancels_with_query_operation_and_replays_receipt(
             assert_eq!(cancelled["state"],"cancelled","{cancelled}");
         }
     }
+}
+
+#[test]
+fn native_web_v2_cancels_a_closed_publication_without_staged_record_metadata() {
+    assert_metadata_loss_releases_publication_gate(true);
+}
+
+#[test]
+fn native_web_v2_rolls_back_when_staged_record_metadata_disappears_before_commit() {
+    assert_metadata_loss_releases_publication_gate(false);
+}
+
+fn assert_metadata_loss_releases_publication_gate(cancel:bool) {
+    let temp=test_root();
+    let source=temp.path().join("source");
+    let target=temp.path().join("target");
+    let ids=seed_novels(&source,1);
+    std::fs::create_dir_all(target.join(".narou")).unwrap();
+    std::fs::write(target.join(".narou/storage-backend"),"sqlite\n").unwrap();
+    let source_server=start(&source);
+    let target_server=start(&target);
+    let client=Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
+    let profile=TransferProfile::Runtime;
+    let (manifest,payloads)=export_profile(&client,&source_server,&source,&ids,profile);
+    let fingerprint=narou_rs::transfer::source_fingerprint(&manifest).unwrap();
+    let (mut status,secret)=prepare_projected_import(&client,&target_server,&manifest,&fingerprint,&payloads,false,profile);
+    let plan_revision=status["plan_revision"].clone();
+    control(&client,&target_server,"imports",&secret,&mut status,"publish",json!({"plan_revision":plan_revision}));
+    let id=session_id(&status).to_owned();
+    let path=format!("/api/transfer/v2/imports/{id}");
+
+    let db=rusqlite::Connection::open(target.join(".narou/db.sqlite")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    let read_publication_state=||db.query_row(
+        "SELECT json_extract(value,'$.state') FROM transfer_native_rows WHERE kind='publication' AND owner=?",
+        [&id], |row|row.get::<_,String>(0),
+    ).unwrap();
+    let stopped_at=if cancel{"draining"}else{"committing"};
+    for _ in 0..64 {
+        if read_publication_state()==stopped_at {break;}
+        status=decode(with_json(authenticated(&client,&target_server,reqwest::Method::POST,&format!("{path}/advance"),Some(&secret)),
+            &json!({"operation_id":status["operation_id"]})).send().unwrap());
+    }
+    assert_eq!(read_publication_state(),stopped_at);
+    let prefix:String=db.query_row(
+        "SELECT c.prefix FROM native_transfer_target_claims c JOIN novel_access_gates g ON g.prefix=c.prefix
+         WHERE c.session_id=? AND g.owner=c.owner AND g.closed=1",
+        [&id], |row|row.get(0),
+    ).expect("publication must hold a real closed gate before metadata loss");
+    assert_eq!(db.execute(
+        "DELETE FROM transfer_native_rows WHERE kind='blob' AND owner LIKE ? AND key='metadata:0:raw:2:0'",
+        [format!("{id}:%")],
+    ).unwrap(),1,"remove only the staged author fragment, not the durable publication identity");
+
+    if cancel {
+        status=decode(authenticated(&client,&target_server,reqwest::Method::DELETE,
+            &format!("{path}?operation_id={}",uuid::Uuid::new_v4()),Some(&secret))
+            .header("if-match",format!("\"{}\"",revision(&status))).send().unwrap());
+    }
+    advance(&client,&target_server,"imports",&secret,&mut status);
+    assert_eq!(status["state"],if cancel{"cancelled"}else{"completed_with_errors"});
+    assert_eq!(status["published_novels"],0);
+    let plan=page_items(&client,&target_server,&format!("{path}/plan"),&secret);
+    assert_eq!(plan.len(),1);
+    assert_eq!(plan[0]["action"],"create");
+    let receipt=&plan[0]["receipt"];
+    assert_eq!(receipt["outcome"],"rolled_back");
+    assert_eq!(receipt["files_installed"],0);
+    assert!(receipt["assigned_id"].is_null());
+    if cancel {
+        assert!(receipt["error"].is_null());
+    } else {
+        assert_eq!(receipt["error"],"metadata_missing: metadata fragment missing");
+    }
+    let closed:i64=db.query_row("SELECT COUNT(*) FROM novel_access_gates WHERE prefix=? AND closed=1",[&prefix],|row|row.get(0)).unwrap();
+    let claims:i64=db.query_row("SELECT COUNT(*) FROM native_transfer_target_claims WHERE session_id=?",[&id],|row|row.get(0)).unwrap();
+    let novels:i64=db.query_row("SELECT COUNT(*) FROM novels",[],|row|row.get(0)).unwrap();
+    let installed:i64=db.query_row(
+        "SELECT COUNT(*) FROM transfer_object_refs WHERE substr(object_key,1,length(?1)+1)=?1||'/'",
+        [&prefix],|row|row.get(0),
+    ).unwrap();
+    assert_eq!((closed,claims,novels,installed),(0,0,0,0));
 }
 
 

@@ -412,6 +412,7 @@ narou author remove 1
 - 一時停止・再開・破棄は同じ操作IDで永続receiptを再送できる。確定したrevision競合だけを再照合し、423や通信断では元のfingerprintを維持する。試行上限後も未確定操作を保持し、未完了を成功表示しない。DELETEの操作IDはqueryまたは専用ヘッダで渡す。
 - NativeでSQLiteを選択済みなのに管理DBを開けない場合、転送capabilitiesはSQLiteのまま利用不可と理由を返し、永続変更を拒否する。転送を黙ってYAML管理へ切り替えない。
 - Web v2 の終端回収は元の owner / epoch で stage を abort してから進め、24時間の lease 期限を待ち続けない。仮想小説のメンバーは、保存済みの投影内 URL 索引で解決し、消失・所属競合は公開前の plan 競合として扱う。
+- Web v2 の計画表示は題名の先頭200文字を使い、公開時は題名全体を保持する。閉鎖後の取消・回復では公開用メタデータを読み直さず、永続化済みの公開ID・owner・epochで巻き戻す。巻き戻し完了時に `rolled_back` の receipt と失敗理由（ある場合）を `/plan` に残し、計画上の新規・上書きを成功と数えない。元の所有権・確定印の検証は維持する。
 - 上書きはアーカイブに含まれるファイルだけを置換し、既存の余分なファイルや新しい話を削らない。CLI の既存取り込みでの `sqlite.mirror-files=false` の制限と、Web v2 の参照公開は別経路として確認する。詳細は `WEBUI.md` §6.1b。
 - ブラウザ保存は File System Access または Service Worker の pull 型ストリームを使い、全量 `Blob` 化へフォールバックしない。FSA の picker はクリック中、SW の開始は最初の ZIP byte まで遅らせる。保存先の書き込みを待って次のチャンクを受け取り、中継の状態消失・明示的な完了通知前の切断・キャンセルを成功扱いしない。
 - 共通コア `src/transfer` は wasm32 でもビルドでき、CLI / Native Web API / Worker / ブラウザ WASM が生成・検証・取り込み計画を共有する。

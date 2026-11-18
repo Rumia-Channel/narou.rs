@@ -1226,7 +1226,8 @@ pub struct PublicationSpec {
     pub toc_url: String,
     pub title: String,
     pub kind: NovelKind,
-    /// Record fields only; long description and member URLs remain indexed raw fragments.
+    /// Record fields for gate close and commit. Other phases use the
+    /// persisted publication identity, even if staged metadata is unavailable.
     pub metadata: crate::transfer::ArchiveNovel,
     /// File IDs are dense within each novel in the sealed wire manifest.
     /// Backends fetch only their current bounded file window by direct ID.
@@ -1904,10 +1905,8 @@ fn invalid_state(row: &SessionRow, expected: &'static str) -> TransferError {
 }
 
 fn truncate_title(title: &str) -> String {
-    if title.chars().count() <= DISPLAY_TITLE_CHARS {
-        return title.to_string();
-    }
-    title.chars().take(DISPLAY_TITLE_CHARS).collect()
+    let end = title.char_indices().nth(DISPLAY_TITLE_CHARS).map_or(title.len(), |(offset, _)| offset);
+    title[..end].to_owned()
 }
 
 
@@ -1928,6 +1927,28 @@ pub struct PublicationReceipt {
     pub assigned_id: Option<i64>,
     pub files_installed: u32,
     pub error: Option<String>,
+}
+
+fn finish_publication(
+    publication: &mut PublicationRow,
+    spec: &PublicationSpec,
+    committed: bool,
+) -> Result<PublicationState, TransferError> {
+    publication.phase_cursor = Some("finished".into());
+    if committed {
+        publication.error = None;
+        return Ok(PublicationState::Committed);
+    }
+    let receipt = PublicationReceipt {
+        novel_ordinal: publication.publication_id,
+        action: spec.target.action,
+        outcome: "rolled_back".into(),
+        assigned_id: spec.target.existing_id,
+        files_installed: 0,
+        error: publication.error.clone(),
+    };
+    publication.receipt = Some(serde_json::to_vec(&receipt).map_err(TransferError::platform)?);
+    Ok(PublicationState::RolledBack)
 }
 
 /// Cursor inside `advance` work, kept in the session's `advance` op rows.
@@ -2783,16 +2804,21 @@ impl TransferService {
             }
             4=>{
                 if let Some(publication)=self.journal.publication(&row.session_id,ordinal).await?&&publication.state==PublicationState::Committed{return {import_ext_mut(row)?.planning_ordinal+=1;Ok(())};}
-                let novel=self.record_metadata(&row.session_id,&key).await?;let layout:crate::transfer::NovelJsonLayout=self.value(&row.session_id,&key).await?.ok_or_else(||TransferError::invalid("metadata_missing","metadata layout missing"))?;let kind=if layout.members.is_some(){NovelKind::VirtualParent}else{NovelKind::Normal};
-                let existing=self.backend.library_index(&row.scope,std::slice::from_ref(&novel.toc_url)).await?.into_iter().next();
+                let layout:crate::transfer::NovelJsonLayout=self.value(&row.session_id,&key).await?.ok_or_else(||TransferError::invalid("metadata_missing","metadata layout missing"))?;let kind=if layout.members.is_some(){NovelKind::VirtualParent}else{NovelKind::Normal};
+                let toc_url=self.metadata_text(&row.session_id,&key,0,8192).await?;
+                // A canonical first fragment contains the entire display prefix,
+                // even when each character is four UTF-8 bytes.
+                let (title,_)=self.metadata_input(&row.session_id,&key,crate::transfer::NovelJsonRequest{field:1,part:0}).await?;
+                let title=truncate_title(std::str::from_utf8(&title).map_err(TransferError::platform)?);
+                let existing=self.backend.library_index(&row.scope,std::slice::from_ref(&toc_url)).await?.into_iter().next();
                 let action=match &existing{Some(m)if m.kind!=kind=>PlanAction::Reject,Some(_)if row.conflict_policy==ConflictPolicy::Skip=>PlanAction::Skip,Some(_)=>PlanAction::Overwrite,None=>PlanAction::Create};
                 let wire:crate::transfer::protocol::WireNovel=self.value(&row.session_id,&format!("{JKEY_NOVEL}{ordinal}")).await?.ok_or_else(||TransferError::invalid("novel_missing","normalized novel missing"))?;
                 let start:u32=self.value(&row.session_id,&format!("file_start:{ordinal}")).await?.ok_or_else(||TransferError::invalid("file_missing","novel first file index missing"))?;
                 let total_bytes:u64=self.value(&row.session_id,&format!("novel_bytes:{ordinal}")).await?.unwrap_or(0);
                 let revision=row.plan_revision.clone().unwrap_or_else(||sha256_hex(format!("{}:{}",row.session_id.0,ext.manifest_sha256).as_bytes()));row.plan_revision=Some(revision.clone());
-                let plan=PlanEntry{novel_ordinal:ordinal,toc_url:novel.toc_url.clone(),title:truncate_title(&novel.title),kind,action,reason:match action{PlanAction::Skip=>Some("policy_skip".into()),PlanAction::Reject=>Some("kind_mismatch".into()),_=>None},existing_id:existing.as_ref().map(|m|m.id.0),record_revision:existing.as_ref().map(|m|m.record_revision.clone()),content_revision:existing.as_ref().map(|m|m.content_revision.clone()),membership_digest:existing.as_ref().and_then(|m|m.membership_digest.clone()),file_count:wire.files,total_bytes,receipt:None};
+                let plan=PlanEntry{novel_ordinal:ordinal,toc_url:toc_url.clone(),title:title.clone(),kind,action,reason:match action{PlanAction::Skip=>Some("policy_skip".into()),PlanAction::Reject=>Some("kind_mismatch".into()),_=>None},existing_id:existing.as_ref().map(|m|m.id.0),record_revision:existing.as_ref().map(|m|m.record_revision.clone()),content_revision:existing.as_ref().map(|m|m.content_revision.clone()),membership_digest:existing.as_ref().and_then(|m|m.membership_digest.clone()),file_count:wire.files,total_bytes,receipt:None};
                 self.journal.put_plan_entries(&row.session_id,&revision,std::slice::from_ref(&plan)).await?;self.save_value(&row.session_id,&format!("action:{ordinal}"),&action).await?;
-                let spec=PublicationSpec{session_id:row.session_id.clone(),plan_revision:revision.clone(),publication_id:ordinal,toc_url:novel.toc_url.clone(),title:truncate_title(&novel.title),kind,file_id_start:start,file_count:wire.files,member_count:layout.members.unwrap_or(0),metadata:novel,member_ids:Vec::new(),target:PublicationTarget{action,existing_id:plan.existing_id,reserved_id:None,record_revision:plan.record_revision.clone(),content_revision:plan.content_revision.clone(),membership_digest:plan.membership_digest.clone()}};self.store_spec(&spec).await?;
+                let spec=PublicationSpec{session_id:row.session_id.clone(),plan_revision:revision.clone(),publication_id:ordinal,toc_url,title,kind,file_id_start:start,file_count:wire.files,member_count:layout.members.unwrap_or(0),metadata:crate::transfer::ArchiveNovel::default(),member_ids:Vec::new(),target:PublicationTarget{action,existing_id:plan.existing_id,reserved_id:None,record_revision:plan.record_revision.clone(),content_revision:plan.content_revision.clone(),membership_digest:plan.membership_digest.clone()}};self.store_spec(&spec).await?;
                 let receipt=if matches!(action,PlanAction::Skip|PlanAction::Reject){Some(serde_json::to_vec(&PublicationReceipt{novel_ordinal:ordinal,action,outcome:if action==PlanAction::Skip{"skipped"}else{"failed"}.into(),assigned_id:plan.existing_id,files_installed:0,error:plan.reason}).map_err(TransferError::platform)?)}else{None};
                 self.journal.put_publication(&PublicationRow{session_id:row.session_id.clone(),publication_id:ordinal,state:if receipt.is_some(){PublicationState::Skipped}else{PublicationState::Pending},spec:serde_json::to_vec(&format!("spec:{ordinal}")).map_err(TransferError::platform)?,phase_cursor:None,assigned_id:plan.existing_id,receipt,error:None}).await?;budget.records+=1;
             }
@@ -2809,8 +2835,7 @@ impl TransferService {
 
     async fn publication_spec(&self,publication:&PublicationRow)->Result<PublicationSpec,TransferError>{
         let key:String=serde_json::from_slice(&publication.spec).map_err(TransferError::platform)?;
-        let mut spec:PublicationSpec=serde_json::from_slice(&self.blob(&publication.session_id,&key,0).await?).map_err(TransferError::platform)?;
-        spec.metadata=self.record_metadata(&publication.session_id,&format!("metadata:{}",publication.publication_id)).await?;Ok(spec)
+        serde_json::from_slice(&self.blob(&publication.session_id,&key,0).await?).map_err(TransferError::platform)
     }
 }
 
@@ -3176,7 +3201,7 @@ impl TransferService {
             cursor += 1; import_ext_mut(row)?.publish_cursor = cursor; budget.records += 1; return Ok(());
         }
         if row.state == SessionState::Paused && publication.state == PublicationState::Pending { row.next_action = NextAction::None; row.operation_id = None; return Ok(()); }
-        if publication.state == PublicationState::Pending {
+        if publication.state == PublicationState::Pending && spec.member_count != 0 {
             let cursor_key=format!("resolved_cursor:{}",spec.publication_id);
             let ids_key=format!("resolved_ids:{}",spec.publication_id);
             let current:u32=self.value(&row.session_id,&cursor_key).await?.unwrap_or(0);let start=self.advance_input(row,"resolved_cursor",current).await?;
@@ -3194,11 +3219,19 @@ impl TransferService {
             spec.member_ids=ids;self.store_spec(&spec).await?;
         }
         let result = match publication.state {
-            PublicationState::Pending => self.backend.publication_gate_close(&spec, publication.phase_cursor.as_deref()).await,
+            PublicationState::Pending | PublicationState::Committing => async {
+                // Missing staged fields must enter the publication rollback
+                // path, not fail the entire session with its gate still closed.
+                spec.metadata = self.record_metadata(&publication.session_id, &format!("metadata:{}", publication.publication_id)).await?;
+                if publication.state == PublicationState::Pending {
+                    self.backend.publication_gate_close(&spec, publication.phase_cursor.as_deref()).await
+                } else {
+                    self.backend.publication_commit(&spec, publication.phase_cursor.as_deref()).await
+                }
+            }.await,
             PublicationState::Draining => self.backend.publication_drain(&spec, publication.phase_cursor.as_deref()).await,
             PublicationState::Prepared => self.backend.publication_prepare(&spec, publication.phase_cursor.as_deref()).await,
             PublicationState::Installing => self.backend.publication_install(&spec, publication.phase_cursor.as_deref()).await,
-            PublicationState::Committing => self.backend.publication_commit(&spec, publication.phase_cursor.as_deref()).await,
             PublicationState::Committed => self.backend.publication_finish(&spec, publication.phase_cursor.as_deref()).await,
             PublicationState::RollingBack | PublicationState::RecoveryRequired => self.backend.publication_rollback(&spec, publication.phase_cursor.as_deref()).await,
             _ => return Ok(()),
@@ -3214,8 +3247,17 @@ impl TransferService {
                     publication.phase_cursor = None;
                     publication.state = match publication.state {
                         PublicationState::Pending => PublicationState::Draining, PublicationState::Draining => PublicationState::Prepared, PublicationState::Prepared => PublicationState::Installing, PublicationState::Installing => PublicationState::Committing, PublicationState::Committing => PublicationState::Committed,
-                        PublicationState::Committed => { self.backend.publication_gate_open(&spec, None).await?; publication.phase_cursor = Some("finished".into()); row.published_novels += 1; import_ext_mut(row)?.publish_cursor += 1; PublicationState::Committed },
-                        PublicationState::RollingBack | PublicationState::RecoveryRequired => { self.backend.publication_gate_open(&spec, None).await?; import_ext_mut(row)?.publish_cursor += 1; PublicationState::RolledBack },
+                        PublicationState::Committed => {
+                            self.backend.publication_gate_open(&spec, None).await?;
+                            row.published_novels += 1;
+                            import_ext_mut(row)?.publish_cursor += 1;
+                            finish_publication(&mut publication, &spec, true)?
+                        },
+                        PublicationState::RollingBack | PublicationState::RecoveryRequired => {
+                            self.backend.publication_gate_open(&spec, None).await?;
+                            import_ext_mut(row)?.publish_cursor += 1;
+                            finish_publication(&mut publication, &spec, false)?
+                        },
                         state => state,
                     };
                 }
@@ -3246,7 +3288,10 @@ impl TransferService {
             publication.phase_cursor=step.cursor;budget.bytes+=step.processed_bytes;budget.records+=1;
             if let Some(receipt)=step.receipt{publication.receipt=Some(receipt);}
             if let Some(id)=step.assigned_id{publication.assigned_id=Some(id);}
-            if step.done{self.backend.publication_gate_open(&spec,None).await?;publication.state=if committed{PublicationState::Committed}else{PublicationState::RolledBack};publication.phase_cursor=Some("finished".into());if committed{publication.error=None;}}
+            if step.done {
+                self.backend.publication_gate_open(&spec,None).await?;
+                publication.state = finish_publication(&mut publication, &spec, committed)?;
+            }
             self.journal.update_publication(&publication).await?;return Ok(());
         }
         row.state=SessionState::Cancelled;row.resume_phase=None;self.schedule(row);self.gc_step(row,budget).await
@@ -3282,7 +3327,12 @@ impl TransferService {
                         report.stepped_publications+=1;bytes=step.processed_bytes;let committed=was_committed||step.committed;publication.phase_cursor=step.cursor;
                         if let Some(receipt)=step.receipt{publication.receipt=Some(receipt);}
                         if let Some(id)=step.assigned_id{publication.assigned_id=Some(id);}
-                        if step.done{self.backend.publication_gate_open(&spec,None).await?;publication.state=if committed{PublicationState::Committed}else{PublicationState::RolledBack};publication.phase_cursor=Some("finished".into());publication.error=None;row.error=None;report.resolved_publications+=1;}
+                        if step.done {
+                            self.backend.publication_gate_open(&spec,None).await?;
+                            publication.state = finish_publication(&mut publication, &spec, committed)?;
+                            row.error = None;
+                            report.resolved_publications += 1;
+                        }
                         else{publication.state=if committed{PublicationState::Committed}else{PublicationState::RollingBack};report.pending_recovery+=1;}
                     },
                     Err(TransferError::Busy{code:"fingerprinting",..})=>{report.stepped_publications+=1;report.pending_recovery+=1;bytes=CHUNK_BYTES;},

@@ -375,6 +375,7 @@ revisionは現状既存ではないためmigrationで追加する。SQLite/D1は
 7. 全ファイル設置後に、record・タグ連番・親所属・作品別receipt・journal committedを確定する。DBは同一transaction/batch、YAMLは §11.3 のjournaled commitであり、同じ保証と偽らない。
 8. このcommit点の前の失敗はpre-imageへ復元して私有の新規分だけを除く。復元失敗ならgate/journalを残す。commit後の取消は作品を巻き戻さず、応答消失はreceiptで回収する。
    undo/redo自体もfile単位のcheckpointと期待fingerprintで冪等にする。旧版へ復元済みならskip、設置済み新版ならundo、どちらでもない値は外部/競合変更としてgateを残す。途中回復のプロセス死から再実行しても、別操作のbyteを削除・上書きしない。
+   Workersは検証済み実体への公開参照も同じD1 batchで切り替える。Native SQLiteはこれと異なり、閉鎖中の手順6で公開用参照を1件ずつ設置し、手順7で作品情報と確定印を保存する。失敗時は各参照をundoする。転送専用テーブルがあること自体は、Nativeの全参照が1トランザクションで確定することを意味しない。
 9. committedまたは回復完了後にgateを開き、pre-imageを回収する。未解決publicationをTTL GCで消さない。
 
 新規・移動した identity は、他の現在作品の folded URL と prefix の完全一致だけでなく、component 境界の祖先・子孫との重なりも拒否する。旧データの既存衝突は、変更前に衝突していた identity の fingerprint が不変な通常 metadata 編集だけ許可し、新しい衝突を追加しない。active claim が0件でも現在作品の検査を省略しない。
@@ -589,6 +590,12 @@ CI は core・adapter・WASM 単体に加え、**生成済み配布assetsを使�
 初回一覧の423は、バックアップ提案の容量計算が同時に snapshot を取得し、reader の gate 更新同士が競合した経路で確認した。Native の reader は共有 namespace ロックと専用の gate 更新ロックを使い、公開・削除は従来の排他ロックを維持する。Windows の自動解放は遅延し得るため、[LockFileEx の保証](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex)に従って明示的に unlock する。gate scanner は atomic write の一時ファイルを stat/read 前に除外し、確定済み情報の破損は無視しない。ブラウザ試験は240秒の無進捗を検出し、元の20分fixture上限と全件数・SHA・通信上限の検査を維持する。
 
 S3中断fixtureは通知前に共有Promise参照を消す自己デッドロックを修正し、producer参照を通知完了まで保持する。実service bindingへ渡した元のAbortSignalで上流ヘッダ前・本文途中を中断し、両方とも元の5秒以内に実上流接続が閉じることを確認した。ローカルdev TCP bridgeの切断は要求signalへ伝播しなかったため、その経路を中断保証の証拠とはしない。readerは即時解放または採番済みの元リースの自然失効を待ち、期限の短縮・行削除・detached cleanupを使わない。取消後の別要求が完全なEPUBを読み出せることも確認した。
+
+統合コミット `36ab9ce` の [Native CI](https://github.com/Rumia-Channel/narou.rs/actions/runs/44150552490) はテスト・Clippy の後、公開 rustdoc の2リンクで停止し、後続のLinux実ブラウザには進まなかった。[Cloudflare隔離CI](https://github.com/Rumia-Channel/narou.rs/actions/runs/44150552508) は publication / gates で `ECONNRESET`、metadata は3シナリオ完走後も tail 途絶のため失敗した。これはOOMが観測された結果ではない。tail切断や異常outcomeの時点で試験子プロセスを停止し、最初の失敗理由を返す。監視の欠落を許容したり、通信断を成功として扱ったりしない。
+
+取込の計画は検証済み断片からURLと題名の表示分だけを読み、通常作品は空の仮想メンバー工程を省く。作品メタデータの全読み出しは gate close と commit に限定する。公開直前に書誌断片が欠けた場合、セッションをいきなり終端失敗にせず、その作品を巻き戻して失敗を報告する。取消・回復も保存済みの公開仕様とバックエンドの巻き戻し記録を使うため、欠けた断片を必要としない。確定印・所有権・本来の題名の保持は変更しない。
+
+巻き戻し完了時は永続 `rolled_back` receipt を記録し、`/plan` に元の操作・失敗理由・確定ファイル0件を返す。未公開の新規IDは返さず、上書きでは既存作品IDを保持する。UIはreceiptを計画上の操作より優先するため、巻き戻しを新規・上書き成功に計上しない。永続的な公開確定印があれば既存の成功receiptを保持する。
 
 
 

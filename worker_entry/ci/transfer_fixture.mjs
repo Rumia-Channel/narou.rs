@@ -98,7 +98,17 @@ async function exercise(state){
   assert(typeof record?.id==='string'&&record.id.length>0,'disposable transfer tail has no opaque identifier');
   const address=new URL(record.url);assert.equal(address.protocol,'wss:');
   let socket,ping,closing=false,tailFailure,waitingForPong=false;
-  const lost=reason=>{if(!closing){tailFailure=tailFailure??reason;console.log(JSON.stringify({event:'transfer_tail_lost',reason}));}};
+  const stop=new AbortController();
+  const fail=reason=>{
+    if(closing||tailFailure!==undefined)return;
+    tailFailure=reason;
+    stop.abort();
+  };
+  const lost=reason=>{
+    if(closing||tailFailure!==undefined)return;
+    console.log(JSON.stringify({event:'transfer_tail_lost',reason}));
+    fail(reason);
+  };
   const pingBytes=Buffer.from('wrangler tail ping');
   try{
     // Match Wrangler's trace-v1 transport: its initial configuration frame is
@@ -119,7 +129,7 @@ async function exercise(state){
       try{const candidate=new URL(value.event?.request?.url).pathname;if(candidate.startsWith('/api/transfer/'))path=candidate;}catch{}
       // Never print tail headers, query strings, console text or exceptions.
       console.log(JSON.stringify({event:'transfer_isolate',outcome:value.outcome,path}));
-      if(value.outcome!=='canceled')tailFailure=tailFailure??`isolate_${value.outcome}`;
+      if(value.outcome!=='canceled')fail(`isolate_${value.outcome}`);
     });
     await new Promise((resolve,reject)=>{
       const timer=setTimeout(()=>reject(new Error('disposable transfer tail did not open')),15000);
@@ -133,12 +143,14 @@ async function exercise(state){
       if(waitingForPong){lost('keepalive_timeout');socket.terminate();return;}
       if(socket.readyState===WebSocket.OPEN){waitingForPong=true;socket.ping(pingBytes);}
     },10000);
+    assert.equal(tailFailure,undefined,'disposable transfer tail failed before exercise');
     console.log(JSON.stringify({event:'transfer_tail_ready'}));
-    const child=spawn(process.execPath,[join(root,'tests/transfer_memory_deployed.mjs')],{cwd:root,stdio:'inherit',env:{...process.env,NAROU_TRANSFER_TEST_URL:state.url,NAROU_TRANSFER_TEST_TOKEN:state.adminToken},signal:AbortSignal.timeout(25*60*1000)});
+    const signal=AbortSignal.any([stop.signal,AbortSignal.timeout(25*60*1000)]);
+    const child=spawn(process.execPath,[join(root,'tests/transfer_memory_deployed.mjs')],{cwd:root,stdio:'inherit',env:{...process.env,NAROU_TRANSFER_TEST_URL:state.url,NAROU_TRANSFER_TEST_TOKEN:state.adminToken},signal});
     let processFailure;
     const result=await new Promise(resolve=>{child.once('error',()=>{processFailure=true;});child.once('close',(code,signal)=>resolve({code,signal}));});
-    assert(!processFailure&&result.code===0,`deployed transfer regressions failed (code=${result.code}, signal=${result.signal})`);
     assert.equal(tailFailure,undefined,'disposable transfer tail lost coverage or observed an isolate failure');
+    assert(!processFailure&&result.code===0,`deployed transfer regressions failed (code=${result.code}, signal=${result.signal})`);
   }finally{
     closing=true;clearInterval(ping);socket?.terminate();
     await api(`${tailPath}/${encodeURIComponent(record.id)}`,{method:'DELETE',missing:true});

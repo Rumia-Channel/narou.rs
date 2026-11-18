@@ -7,6 +7,8 @@
 - 最終artifactは `c839d49e36ce` / ABI 2。lean検証、実codecの37,764,424byte metadata・18,350,080byte heap・最大read/write64KiB、Worker release/wasm-opt・Native bin/browser fixture buildとworkspace/all-target/all-feature Clippy（-D warnings）が成功。別途のWorker wasm厳格Clippyは既存lint91件で未通過（CIのwasm gateはcargo check）。
 - Worker artifact8495875855d2では取得10/10、配信38/38（1275S3要求・D1 source書込0）、元識別子を保持する3回の強制終了復旧と900話継続、一般Web・作者・仮想小説・転送の全フェーズが成功。最終artifact c839d49e36ceのS3全lifecycleも終了コード0。ヘッダ前・本文途中の実service-dispatch取消で上流接続を元の5秒以内に中断し、元readerの自然失効、500画像・64frame alpha/timing、1685話/17目次ページの再取得なし継続、取消6条件・旧token/旧origin拒否を確認。Wasm高水位54,591,488byte（JS heap除外）。fixtureの通知参照の自己デッドロックだけを修正し、期限・取消・自然失効条件は緩めていない。
 - 実Firefoxの最終Native往復が成功（854.78秒、artifact c839d49e36ce）。168作品・17,935,008byteの実ZIPを独立CRC/SHA照合し、YAML/SQLite DB-onlyへ各168作品を公開、全実体・receiptを確認した。13,979要求で413・旧ZIP・過大拒否・記録打切り0、最大upload8,323,449byte・最大transfer response8,323,297byte。240秒の無進捗検出と元の20分上限を維持した。ブランチ統合は全original tipと取得し直したtipの祖先関係を保存し、main/developへの通常push後にSHA照合付きで不要headを削除する。
+- `36ab9ce` のCIではNativeのテスト・Clippy後にrustdocのprivateリンクと名称ずれで停止。Cloudflare隔離CIは publication/gates のECONNRESETとmetadataのtail途絶（3scenario自体は完走）で失敗。監視断では試験を即中止し、成功へ読み替えない。取込は短い計画表示と、gate close/commitだけの全メタデータ読込へ変更。取消・回復は既存の公開owner/epochから処理し、書誌断片の欠落に依存しない。
+- 巻き戻し完了を `/plan` の `rolled_back` receipt に保存し、失敗理由を計画上の新規・上書きと区別する。隔離Linuxで公開rustdocの厳格ゲートが成功。最終版のNative転送HTTPは8成功・実Firefox用1件ignore、Worker wasmチェックも成功。公開直前の書誌断片欠損は修正前の通常 `/advance` で `failed` を再現し、修正後は取消と自動巻き戻し双方で閉鎖gate・予約・未公開参照の解放と永続receiptを確認した。Cloudflare隔離先の通信断は未解決で、Workerの新しいreceipt契約は実workerdで未確認。
 
 以下の転送詳細は元ブランチで記録された検証範囲。最終統合ツリーの成功とは区別し、最新の検証状況は上記を優先する。
 
