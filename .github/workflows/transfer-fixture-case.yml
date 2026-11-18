@@ -55,6 +55,8 @@ jobs:
         with:
           path: ~/.cache/worker-build
           key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
+      - name: Verify advance replay after a lost acknowledgement
+        run: node --test tests/transfer_transport.test.mjs
       - name: Build the actual production shim and hashed transfer assets
         run: |
           node build_assets.mjs
