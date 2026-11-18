@@ -92,7 +92,7 @@ GROUP BY attribute_tag COLLATE BINARY
 // same UI-session snapshot as the tag aggregate, not the whole local scope.
 const TAG_SETTINGS_SQL: &str = r#"
 SELECT key, value_yaml, value_json FROM app_state
-WHERE scope='local' AND key IN (?1, ?2, ?3)
+WHERE scope='local' AND key IN (?, ?, ?)
 "#;
 
 const QUEUE_COUNTS_SQL: &str = r#"

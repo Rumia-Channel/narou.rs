@@ -58,7 +58,7 @@ class SqlAccessPathTests(unittest.TestCase):
         def page(prefix, cursor, cap):
             lower = prefix + '/' if prefix else ''
             return [row[0] for row in self.bounded(OBJECT_SQL,
-                (prefix, lower, lower + '\U0010ffff', cursor, cap), 2000)]
+                dict(zip(("1", "2", "3", "4", "5"), (prefix, lower, lower + '\U0010ffff', cursor, cap))), 2000)]
         self.assertEqual(page('novels/book', '', 2), ['novels/book', 'novels/book/000000'])
         self.assertEqual(page('novels/book', 'novels/book/009998', 3),
             ['novels/book/009999', 'novels/book/本文'])
@@ -96,13 +96,13 @@ class SqlAccessPathTests(unittest.TestCase):
             self.novel(int(key), '小説' if key in ('20002', '20003') else '漫画')
         self.db.execute("INSERT INTO app_state(scope,key,value_json) VALUES ('inv','virtual_novel_members',?)",
                         (json.dumps(groups),))
-        self.bounded(CLASSIFY_SQL, (None, None), 10000)
+        self.bounded(CLASSIFY_SQL, {"1": None, "2": None}, 10000)
         self.assertEqual(dict(self.db.execute('SELECT id,attribute_tag FROM novels WHERE id>=20001')),
                          {20001: '小説', 20002: '漫画', 20003: '小説', 20004: '漫画', 20005: '漫画'})
         # No cached classification may hide changes made by another invocation.
         self.db.execute("UPDATE novels SET attribute_tag='漫画' WHERE id=1")
         self.novel(99999, '小説')
-        self.bounded(CLASSIFY_SQL, (None, None), 10000)
+        self.bounded(CLASSIFY_SQL, {"1": None, "2": None}, 10000)
         self.assertEqual(dict(self.db.execute('SELECT id,attribute_tag FROM novels WHERE id BETWEEN 20001 AND 20005')),
                          {20001: '小説', 20002: '漫画', 20003: '漫画', 20004: '小説', 20005: '漫画'})
 
@@ -114,11 +114,11 @@ class SqlAccessPathTests(unittest.TestCase):
             groups[str(parent)] = [1]
         self.db.execute("INSERT INTO app_state(scope,key,value_json) VALUES ('inv','virtual_novel_members',?)",
                         (json.dumps(groups),))
-        first = self.bounded(CANDIDATES_SQL, (None, None), 30000)
+        first = self.bounded(CANDIDATES_SQL, {"1": None, "2": None}, 30000)
         self.assertEqual(first, [(parent,) for parent in range(100, 132)])
-        second = self.bounded(CANDIDATES_SQL, (None, first[-1][0]), 10000)
+        second = self.bounded(CANDIDATES_SQL, {"1": None, "2": first[-1][0]}, 10000)
         self.assertEqual(second, [(parent,) for parent in range(132, 140)])
-        self.assertEqual(self.bounded(CANDIDATES_SQL, (None, second[-1][0]), 1000), [])
+        self.assertEqual(self.bounded(CANDIDATES_SQL, {"1": None, "2": second[-1][0]}, 1000), [])
 
     def test_admission_aliases_follow_identity_changes_and_rollback(self):
         self.novel(1, '小説')
@@ -143,9 +143,19 @@ class SqlAccessPathTests(unittest.TestCase):
         self.assertEqual(lookup('shared'), 2)
         self.db.execute("UPDATE novels SET id=4 WHERE id=1")
         self.assertEqual(lookup('new'), 4)
-        changes = self.db.total_changes
+        # Count alias writes specifically: an ordinary metadata edit also
+        # updates its revision and must not be mistaken for rewriting aliases.
+        self.db.executescript("""
+            CREATE TEMP TABLE alias_mutations (operation TEXT NOT NULL);
+            CREATE TEMP TRIGGER watch_alias_insert AFTER INSERT ON main.novel_target_aliases
+            BEGIN INSERT INTO alias_mutations VALUES ('insert'); END;
+            CREATE TEMP TRIGGER watch_alias_update AFTER UPDATE ON main.novel_target_aliases
+            BEGIN INSERT INTO alias_mutations VALUES ('update'); END;
+            CREATE TEMP TRIGGER watch_alias_delete AFTER DELETE ON main.novel_target_aliases
+            BEGIN INSERT INTO alias_mutations VALUES ('delete'); END;
+        """)
         self.db.execute("UPDATE novels SET title='renamed',toc_url_fold=toc_url_fold WHERE id=4")
-        self.assertEqual(self.db.total_changes - changes, 1)
+        self.assertEqual(self.db.execute("SELECT operation FROM alias_mutations").fetchall(), [])
         self.db.execute("DELETE FROM novels WHERE id=4")
         self.assertIsNone(lookup('new'))
 
