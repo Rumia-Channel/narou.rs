@@ -10,6 +10,8 @@
 //! and the per-column NULL conventions (e.g. `login_session`) stay
 //! adapter-local.
 
+use std::fmt::Write;
+
 use crate::db::novel_codec::{fold, NovelBind, NOVEL_SELECT_SQL};
 use crate::platform::{NovelFilter, NovelId, NovelQuery, NovelSort, NovelSortKey, SearchField};
 
@@ -186,23 +188,31 @@ pub fn build_where<B>(filter: &NovelFilter, mut bind: impl FnMut(NovelBind) -> B
                 .push_str(if term.negated { " AND 1=1" } else { " AND 0=1" });
             continue;
         }
-        let values = term
-            .values
-            .iter()
-            .map(|value| fold(value))
-            .collect::<Vec<_>>();
-        let json = term_values_json(&values);
-        builder.sql.push_str(if term.negated {
-            " AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE "
+        let with_attribute = filter.attribute_tags_enabled
+            && matches!(term.field, SearchField::Tag | SearchField::Any);
+        if let [value] = term.values.as_slice() {
+            // Refer to one scalar bind even for the multi-column Any predicate.
+            // json_each is only needed when a term has several alternatives.
+            let placeholder = format!("?{}", builder.binds.len() + 1);
+            builder.sql.push_str(" AND (");
+            push_term_expression(&mut builder.sql, term.field, &placeholder, with_attribute);
+            builder.sql.push(')');
+            if term.negated {
+                // NOT EXISTS also matches when nullable columns make the predicate NULL.
+                builder.sql.push_str(" IS NOT TRUE");
+            }
+            builder.binds.push(bind(NovelBind::Text(fold(value))));
         } else {
-            " AND EXISTS (SELECT 1 FROM json_each(?) WHERE "
-        });
-        builder.sql.push_str(&term_expression(term.field));
-        if filter.attribute_tags_enabled && matches!(term.field, SearchField::Tag | SearchField::Any) {
-            builder.sql.push_str(" OR instr(COALESCE(n.attribute_tag, ''), value) > 0");
+            let values = term.values.iter().map(|value| fold(value)).collect::<Vec<_>>();
+            builder.sql.push_str(if term.negated {
+                " AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE "
+            } else {
+                " AND EXISTS (SELECT 1 FROM json_each(?) WHERE "
+            });
+            push_term_expression(&mut builder.sql, term.field, "value", with_attribute);
+            builder.sql.push(')');
+            builder.binds.push(bind(NovelBind::Text(term_values_json(&values))));
         }
-        builder.sql.push(')');
-        builder.binds.push(bind(NovelBind::Text(json)));
     }
     if !filter.exclude_ids.is_empty() {
         let json = serde_json::to_string(&filter.exclude_ids)
@@ -247,6 +257,11 @@ pub fn build_where<B>(filter: &NovelFilter, mut bind: impl FnMut(NovelBind) -> B
 /// `SELECT COUNT(*)` for `filter`. `count` is aliased for the Worker's serde
 /// row struct; the native adapter reads the single column by position.
 pub fn count_sql<B>(filter: &NovelFilter, bind: impl FnMut(NovelBind) -> B) -> SqlQuery<B> {
+    // A bare COUNT uses SQLite's B-tree count opcode. Even WHERE 1=1
+    // would instead visit each row (or covering-index entry).
+    if filter.is_unrestricted() {
+        return SqlQuery { sql: "SELECT COUNT(*) AS count FROM novels".into(), binds: Vec::new() };
+    }
     let WhereSql { sql, binds } = build_where(filter, bind);
     SqlQuery {
         sql: format!("SELECT COUNT(*) AS count FROM novels n {sql}"),
@@ -305,16 +320,26 @@ fn tie_break(reverse: bool) -> &'static str {
     if reverse { ", n.id DESC" } else { ", n.id ASC" }
 }
 
-fn term_expression(field: SearchField) -> String {
-    match field {
-        SearchField::Title => "instr(n.title_fold, value) > 0".to_string(),
-        SearchField::Author => "instr(n.author_fold, value) > 0".to_string(),
-        SearchField::Site => "instr(n.sitename_fold, value) > 0".to_string(),
-        SearchField::Tag => "instr(n.tags_fold, value) > 0".to_string(),
-        SearchField::Status => format!("instr({STATUS_SEARCH_EXPRESSION}, value) > 0"),
-        SearchField::Any => format!(
-            "instr(n.title_fold, value) > 0 OR instr(n.author_fold, value) > 0 OR instr(n.sitename_fold, value) > 0 OR instr(n.tags_fold, value) > 0 OR instr({STATUS_SEARCH_EXPRESSION}, value) > 0 OR instr(n.ncode_fold, value) > 0 OR (instr(value, '://') > 0 AND instr(n.toc_url_fold, rtrim(value, '/')) > 0) OR substr(rtrim(n.toc_url_fold, '/'), -(length(value) + 1)) = '/' || value OR CAST(n.id AS TEXT) = value"
-        ),
+fn push_term_expression(sql: &mut String, field: SearchField, value: &str, with_attribute: bool) {
+    let column = match field {
+        SearchField::Title => "n.title_fold",
+        SearchField::Author => "n.author_fold",
+        SearchField::Site => "n.sitename_fold",
+        SearchField::Tag => "n.tags_fold",
+        SearchField::Status => STATUS_SEARCH_EXPRESSION,
+        SearchField::Any => {
+            write!(sql,
+                "instr(n.title_fold, {value}) > 0 OR instr(n.author_fold, {value}) > 0 OR instr(n.sitename_fold, {value}) > 0 OR instr(n.tags_fold, {value}) > 0 OR instr({STATUS_SEARCH_EXPRESSION}, {value}) > 0 OR instr(n.ncode_fold, {value}) > 0 OR (instr({value}, '://') > 0 AND instr(n.toc_url_fold, rtrim({value}, '/')) > 0) OR substr(rtrim(n.toc_url_fold, '/'), -(length({value}) + 1)) = '/' || {value} OR CAST(n.id AS TEXT) = {value}"
+            ).unwrap();
+            if with_attribute {
+                write!(sql, " OR instr(COALESCE(n.attribute_tag, ''), {value}) > 0").unwrap();
+            }
+            return;
+        }
+    };
+    write!(sql, "instr({column}, {value}) > 0").unwrap();
+    if with_attribute {
+        write!(sql, " OR instr(COALESCE(n.attribute_tag, ''), {value}) > 0").unwrap();
     }
 }
 
@@ -374,7 +399,7 @@ mod tests {
             novel_type: Some(1),
             end: Some(true),
             terms: vec![
-                SearchTerm::new(SearchField::Any, false, vec![" a ".to_string()]),
+                SearchTerm::new(SearchField::Any, false, vec![" a ".to_string(), "alternate".to_string()]),
                 SearchTerm::new(SearchField::Title, true, vec!["b".to_string()]),
             ],
             frozen_ids: None,
