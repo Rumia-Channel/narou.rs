@@ -2465,6 +2465,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use axum::extract::State;
     use chrono::{TimeZone, Utc};
     use serde_yaml::{Mapping, Value};
     use crate::db::NovelRecord;
@@ -2477,8 +2478,8 @@ mod tests {
         build_webui_update_start_message, cancelled_novel_ids, encode_convert_job_target,
         existing_update_job_id, format_queue_job_type,
         format_update_queue_target, normalize_update_targets, push_update_job_if_needed,
-        push_update_job_with_legacy_if_needed, queue_lane_sizes, reboot_args_with_no_browser,
-        release_novel_locks, restorable_tasks_available,
+        push_update_job_with_legacy_if_needed, queue_lane_sizes, queue_status, reboot_args_with_no_browser,
+        release_novel_locks,
         sort_records_for_web_update, validate_diff_number,
         validate_download_targets, validate_general_lastup_option, web_update_sort_key_for_cli,
     };
@@ -2939,13 +2940,13 @@ mod tests {
             auto_update_scheduler: Arc::new(Mutex::new(None)),
         };
 
-        let Json(summary) = queue_status(State(state.clone())).await;
+        let summary = queue_status(State(state.clone())).await.0;
         assert_eq!(summary["restore_prompt_pending"], true);
         assert_eq!(summary["restorable_tasks_available"], true);
         state
             .restorable_tasks_available
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        let Json(summary) = queue_status(State(state)).await;
+        let summary = queue_status(State(state)).await.0;
         assert_eq!(summary["restorable_tasks_available"], false);
     }
 

@@ -23,7 +23,7 @@ import {
   refreshList,
   refreshQueue,
   setQueueStatusObserver,
-  refreshQueueDetailed,
+  refreshQueueDetailedIfOpen,
   refreshTags,
   refreshFavoriteTags,
   replaceConsoleHistory,
@@ -86,16 +86,6 @@ function scheduleTableRefresh(includeList, includeFavorites = false) {
       scheduleTableRefresh(pendingListRefresh, pendingFavoriteRefresh);
     }
   }, 50);
-}
-
-function isQueueModalOpen() {
-  return Boolean(El.queueModal && !El.queueModal.classList.contains('hide'));
-}
-
-function refreshQueueDetailedIfOpen() {
-  if (isQueueModalOpen()) {
-    void refreshQueueDetailed();
-  }
 }
 
 async function init() {
@@ -161,9 +151,7 @@ async function init() {
   const interval = Math.max(State.pollIntervalSeconds, 10) * 1000;
   setInterval(async () => {
     await Promise.all([refreshListWithUiState(), refreshQueue()]);
-    if (isQueueModalOpen()) {
-      await refreshQueueDetailed();
-    }
+    await refreshQueueDetailedIfOpen();
   }, interval);
 }
 

@@ -32,6 +32,43 @@ test('queue response: success:false remains rejected and success formats are pre
   for (const response of [{ status: 'ok' }, { success: true }]) assert.equal(check(response, 'fallback'), response);
 });
 
+test('dismissing the restore prompt refreshes the indicator without loading closed queue details', async () => {
+  let click;
+  const style = {};
+  const restoreClasses = new Set();
+  const requests = [];
+  const queueStatus = { pending: 3, running_count: 0 };
+  const noop = () => {};
+  const button = { addEventListener(_event, handler) { click = handler; } };
+  const state = {};
+  const context = loadModule('actions.js', {
+    State: state,
+    El: {
+      queueRestoreModal: { classList: restoreClasses },
+      queueModal: { classList: new Set(['hide']) },
+    },
+    document: {
+      getElementById: id => id === 'queue-restore-no' ? button : id === 'colvis-style' ? style : null,
+      querySelectorAll: () => [],
+    },
+    localStorage: { getItem: () => '[]' },
+    HTMLElement: class {},
+    postJson: async url => { requests.push(url); return { success: true }; },
+    fetchJson: async url => { requests.push(url); return queueStatus; },
+    assertApiSuccess: loadModule('../core/http.js').assertApiSuccess,
+    syncAttributeTagControls: noop, openFeatureTour: noop,
+    setShortcutHandlers: noop, setContextHandlers: noop, initShortcuts: noop,
+    initContextMenu: noop, initTagColorMenu: noop, syncViewChecks: noop, updateEnableSelected: noop,
+    renderQueueStatus: noop,
+    showNotification: message => assert.fail(message),
+  });
+  context.bindActions();
+  await click({ currentTarget: button, preventDefault: noop });
+  assert(restoreClasses.has('hide'));
+  assert.equal(state.queueStatus?.pending, 3);
+  assert.deepEqual(requests, ['/api/defer_restore_pending_tasks', '/api/queue/status']);
+});
+
 function listHarness() {
   const requests = [];
   const state = { novels: [{ id: 7, title: 'initial', frozen: false }], frozenIds: new Set() };

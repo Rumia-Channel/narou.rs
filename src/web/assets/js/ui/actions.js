@@ -894,14 +894,12 @@ export function bindActions() {
     ['queue-restore-yes', '/api/restore_pending_tasks'],
     ['queue-restore-no', '/api/defer_restore_pending_tasks'],
   ]) {
-    on(id, (e) => {
-      void runGuardedAction(e.currentTarget, async () => {
-        const result = await postJson(endpoint, {});
-        assertApiSuccess(result, '待機キューの復元操作に失敗しました');
-        closeModal(El.queueRestoreModal);
-        await refreshQueueDetailed();
-      }, '待機キューの復元操作に失敗しました');
-    });
+    on(id, (e) => runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson(endpoint, {});
+      assertApiSuccess(result, '待機キューの復元操作に失敗しました');
+      closeModal(El.queueRestoreModal);
+      await Promise.all([refreshQueue(), refreshQueueDetailedIfOpen()]);
+    }, '待機キューの復元操作に失敗しました'));
   }
 
   // --- Column visibility modal ---
@@ -3042,6 +3040,12 @@ export async function refreshQueue() {
     } catch { /* keep the last successfully loaded status */ }
     return null;
   });
+}
+
+export function refreshQueueDetailedIfOpen() {
+  if (El.queueModal && !El.queueModal.classList.contains('hide')) {
+    return refreshQueueDetailed();
+  }
 }
 
 export async function refreshQueueDetailed() {
