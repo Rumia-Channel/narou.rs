@@ -371,7 +371,7 @@ async function download(target, force, expectedFailure = false) {
   assert(accepted.success, JSON.stringify(accepted));
   return waitForAcquisition(accepted.results[0].job_id, expectedFailure);
 }
-async function waitForAcquisition(jobId, expectedFailure = false, timeoutMs = 120000) {
+async function waitForJob(jobId, expectedFailure = false, timeoutMs = 120000) {
   const deadline = Date.now() + timeoutMs;
   let job;
   do {
@@ -380,6 +380,10 @@ async function waitForAcquisition(jobId, expectedFailure = false, timeoutMs = 12
     await new Promise((resolve) => setTimeout(resolve, 500));
   } while (Date.now() < deadline);
   assert.equal(job.status, expectedFailure ? 'retryable' : 'succeeded', JSON.stringify(job));
+  return job;
+}
+async function waitForAcquisition(jobId, expectedFailure = false, timeoutMs = 120000) {
+  const job = await waitForJob(jobId, expectedFailure, timeoutMs);
   if (!expectedFailure) {
     // Acquisition success only promises that its follow-up Convert was enqueued.
     // Drain that lane before changing the source, injecting faults, or restarting.
@@ -467,10 +471,13 @@ try {
   const prefix = 'novels/Storage Smoke/本文/本文';
   const subtitle = (index, name) => ({ index: String(index), href: `https://example.com/n1234ab/${index}/`, chapter: '', subchapter: '', subtitle: name, file_subtitle: name, subdate: '2026-10-15' });
   const first = subtitle(1, '第一話'); const second = subtitle(2, '第二話');
+  // narou.rb archives can have download_time only in the TOC. Keep the
+  // body objects unstamped and require the existing EPUB checks to succeed.
+  const legacySubtitles = [first, second].map((sub) => ({ ...sub, download_time: '2021-01-24 20:20:55.807706000 +09:00' }));
   const section = (sub, body) => ({ ...sub, element: { data_type: 'html', introduction: '', body: `<p>${body.repeat(100)}</p>`, postscript: '' } });
   const firstKey = `${prefix}/本文/1 第一話.yaml`;
   const legacyFixtureSql = `INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update,ncode,ncode_fold,general_all_no,length,use_subdirectory) VALUES (1,'Author','author','本文保存検証','本文保存検証','本文','https://example.com/n1234ab/','https://example.com/n1234ab/','Storage Smoke','storage smoke','2026-10-15T00:00:00Z','n1234ab','n1234ab',2,1000,1); UPDATE novel_id_sequence SET next_id=2;`
-    + objectInsert(`${prefix}/toc.yaml`, { title: '本文保存検証', author: 'Author', toc_url: 'https://example.com/n1234ab/', story: '', subtitles: [first, second], novel_type: 1 })
+    + objectInsert(`${prefix}/toc.yaml`, { title: '本文保存検証', author: 'Author', toc_url: 'https://example.com/n1234ab/', story: '', subtitles: legacySubtitles, novel_type: 1 })
     + objectInsert(firstKey, section(first, '初版本文がここにあります。'))
     + objectInsert(`${prefix}/本文/2 第二話.yaml`, section(second, '第二話の本文です。'))
     + objectInsert(`${prefix}/本文/cache/old/1 第一話.yaml`, section(first, '変更前の旧版本文。'))
@@ -483,6 +490,9 @@ try {
   await migrationCli();
   const plan = await phase('plan'); assert.equal(plan.planned, 4); assert.equal(plan.backend, 'd1');
   await epub();
+  const conversion = await (await api('/api/convert', { targets: ['1'] })).json();
+  assert.equal(conversion.success, true, JSON.stringify(conversion));
+  await waitForJob(conversion.results[0].job_id);
   failPut = true; await phase('copy', 503); failPut = false;
   assert.equal(scalar('SELECT COUNT(*) FROM content_objects'), 0, 'failed PUT cannot publish a reference');
   assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 4, 'failed PUT cannot remove legacy content');

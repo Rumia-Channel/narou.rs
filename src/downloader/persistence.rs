@@ -159,8 +159,13 @@ impl PersistenceService {
                                 format!("section file not found: expected '{}' in {}/本文", section_filename(subtitle), keys.prefix())))
                         })?;
                         let section = deserialize_section(&bytes)?;
+                        // Ruby-era bodies can lack download_time even when the
+                        // TOC has it. Only unstamped legacy bodies qualify for
+                        // this exception; the revision and EOF checks still apply.
+                        let unstamped_legacy = section.download_revision == 0 && section.download_time.is_none();
                         if section.download_revision.max(1) != subtitle.download_revision.max(1)
-                            || subtitle.download_time.as_ref().is_some_and(|time| section.download_time.as_ref() != Some(time)) {
+                            || (!unstamped_legacy && subtitle.download_time.as_ref()
+                                .is_some_and(|time| section.download_time.as_ref() != Some(time))) {
                             return Err(NarouError::Platform(format!("section generation changed during conversion: {key}")));
                         }
                         fingerprints.push(ObjectFingerprint { key, sha256: Sha256::digest(&bytes).into() });
@@ -962,6 +967,43 @@ mod tests {
             let error = stream.next().await.unwrap().unwrap_err();
             assert!(matches!(error, NarouError::Platform(_)));
             assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn section_snapshot_accepts_legacy_body_without_the_toc_timestamp() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let service = PersistenceService::new(store.clone());
+        let keys = NovelObjectKeys::new("site", "book", false).unwrap();
+        let mut subtitle = subtitle();
+        subtitle.download_time = Some("2021-01-24 20:20:55.807706000 +09:00".into());
+        let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+        futures::executor::block_on(async {
+            let mut section = section_file(&subtitle, "legacy body");
+            store.write_small(&key, serialize_section(&section).unwrap().into_bytes()).await.unwrap();
+            let mut toc = TocFile {
+                title: "title".into(), author: "author".into(), toc_url: "https://example.test/".into(),
+                story: None, subtitles: vec![subtitle], novel_type: Some(1),
+            };
+            for revision in [0, 1, 2] {
+                toc.subtitles[0].download_revision = revision;
+                service.save_toc(&test_write(&service, store.clone(), &keys).await, &keys, &toc).await.unwrap();
+                let mut stream = service.stream_sections_snapshot(test_read(&service, &keys).await, keys.clone(), toc.clone());
+                let loaded = stream.next().await.unwrap();
+                if revision < 2 {
+                    assert_eq!(loaded.unwrap().element.body, "legacy body");
+                    assert!(stream.next().await.is_none());
+                } else {
+                    assert!(loaded.unwrap_err().to_string().contains("section generation changed"));
+                }
+            }
+
+            // An explicitly stamped body must still agree with the TOC.
+            section.download_revision = 2;
+            section.download_time = Some("2026-11-18 00:00:00.000000000 +00:00".into());
+            store.write_small(&key, serialize_section(&section).unwrap().into_bytes()).await.unwrap();
+            let mut stream = service.stream_sections_snapshot(test_read(&service, &keys).await, keys, toc);
+            assert!(stream.next().await.unwrap().unwrap_err().to_string().contains("section generation changed"));
         });
     }
 
