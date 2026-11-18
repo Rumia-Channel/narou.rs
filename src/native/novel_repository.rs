@@ -214,6 +214,41 @@ where
     }
 }
 
+/// Count tags and find their earliest novel without decoding whole SQLite rows.
+pub(crate) type TagInventory = std::collections::HashMap<String, (usize, i64)>;
+
+pub(crate) async fn sqlite_tag_inventory(attributes: bool) -> Result<Option<TagInventory>> {
+    use crate::db::novel_query::{ATTRIBUTE_NAMES_SQL, TAG_NAMES_SQL};
+    run_db(move || {
+        crate::db::with_database(|db| db.with_library_metadata_snapshot(|_, connection| {
+            let Some(conn) = connection.filter(|_| !db.metadata_is_yaml_in_snapshot(connection)) else {
+                return Ok(None);
+            };
+            use crate::native::sqlite::sqlite_error;
+            let combined;
+            let query = if attributes {
+                // The normal aggregate's ORDER BY stays inside its subquery.
+                combined = format!("SELECT * FROM ({TAG_NAMES_SQL}) UNION ALL {ATTRIBUTE_NAMES_SQL}");
+                combined.as_str()
+            } else {
+                TAG_NAMES_SQL
+            };
+            let mut statement = conn.prepare(query).map_err(sqlite_error)?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            }).map_err(sqlite_error)?;
+            let mut inventory = TagInventory::new();
+            for row in rows {
+                let (tag, count, first) = row.map_err(sqlite_error)?;
+                let info = inventory.entry(tag).or_insert((0, first));
+                info.0 += count as usize;
+                info.1 = info.1.min(first);
+            }
+            Ok(Some(inventory))
+        }))
+    }).await
+}
+
 impl NovelRepository for NativeNovelRepository {
     fn resume_id(&self,id:NovelId,generation:i64)->PlatformFuture<'_,Result<crate::platform::NovelIdReservation>>{Box::pin(run_db(move||crate::db::with_database_mut(|db|db.resume_id(id,generation))))}
     fn reserve_create<'a>(&'a self,fence:&'a crate::platform::WriteFence,reservation:&'a crate::platform::NovelIdReservation,toc_url:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{crate::native::object_store::run_scoped_blocking(||self.reserve_native_creation(fence,reservation,toc_url))})}

@@ -12,6 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCES = [
+    (ROOT / "src/db/novel_query.rs").read_text(encoding="utf-8"),
     (ROOT / "worker_entry/src/webui/queue.rs").read_text(encoding="utf-8"),
     (ROOT / "worker_entry/src/webui/queue/paging.rs").read_text(encoding="utf-8"),
 ]

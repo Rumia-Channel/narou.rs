@@ -79,7 +79,7 @@ class SqlAccessPathTests(unittest.TestCase):
         groups.update({'4000': [1, 3], '4001': [2, 4], '4002': [999999]})
         self.db.execute("INSERT INTO app_state(scope,key,value_json) VALUES ('inv','virtual_novel_members',?)",
             (json.dumps(groups),))
-        self.bounded(CLASSIFY_SQL, (None, None), 450000)
+        self.bounded(CLASSIFY_SQL, {"1": None, "2": None}, 450000)
         actual = dict(self.db.execute('SELECT id,attribute_tag FROM novels WHERE id>=3000'))
         self.assertEqual(actual, {**{3000+i: '漫画' for i in range(20)},
             4000: '漫画', 4001: '小説', 4002: '漫画'})

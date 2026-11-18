@@ -24,6 +24,20 @@ pub const STATUS_SEARCH_EXPRESSION: &str = include_str!("sql/status_search_expre
 /// 凍結: unfreezing must not reorder a list sorted by status.
 pub const STATUS_SORT_EXPRESSION: &str = include_str!("sql/status_sort_expression.sql");
 
+/// Tag inventory for both SQL backends. The exact-tag index covers this
+/// aggregation, and the foreign key excludes orphan tag rows.
+pub const TAG_NAMES_SQL: &str = r#"
+SELECT t.tag, COUNT(*) AS n, MIN(t.novel_id) AS first_novel_id FROM novel_tags t
+GROUP BY t.tag COLLATE BINARY
+ORDER BY COUNT(*) DESC, t.tag COLLATE BINARY ASC
+"#;
+
+pub const ATTRIBUTE_NAMES_SQL: &str = r#"
+SELECT attribute_tag AS tag, COUNT(*) AS n, MIN(id) AS first_novel_id
+FROM novels WHERE attribute_tag IS NOT NULL
+GROUP BY attribute_tag COLLATE BINARY
+"#;
+
 /// Delete a novel's tag rows before rewriting them (`apply_batch` upsert).
 pub const DELETE_NOVEL_TAGS_SQL: &str = "DELETE FROM novel_tags WHERE novel_id = ?";
 

@@ -55,6 +55,7 @@ use narou_rs::application::webui::queue_view::{
 use narou_rs::application::webui::tag_views::tag_list_html;
 use narou_rs::application::webui::config::TagListConfig;
 use narou_rs::application::webui::tag_order::{TagSortOrder, sort_tags};
+use narou_rs::db::novel_query::{ATTRIBUTE_NAMES_SQL, TAG_NAMES_SQL};
 
 use super::{json_error, query_param};
 use super::metadata::{self, MetadataServices};
@@ -74,20 +75,6 @@ macro_rules! database_or_503 {
 
 // Keep these SQL strings explicit: the SQLite regression tests execute the
 // production queries, including lane/status mappings and the bounded results.
-// D1 enforces novel_tags -> novels ON DELETE CASCADE; the covering tag index
-// therefore suffices without a second row lookup for every tag assignment.
-const TAG_NAMES_SQL: &str = r#"
-SELECT t.tag, COUNT(*) AS n, MIN(t.novel_id) AS first_novel_id FROM novel_tags t
-GROUP BY t.tag COLLATE BINARY
-ORDER BY COUNT(*) DESC, t.tag COLLATE BINARY ASC
-"#;
-
-const ATTRIBUTE_NAMES_SQL: &str = r#"
-SELECT attribute_tag AS tag, COUNT(*) AS n, MIN(id) AS first_novel_id
-FROM novels WHERE attribute_tag IS NOT NULL
-GROUP BY attribute_tag COLLATE BINARY
-"#;
-
 // All three tag-list settings are local. Read only these indexed keys, in the
 // same UI-session snapshot as the tag aggregate, not the whole local scope.
 const TAG_SETTINGS_SQL: &str = r#"

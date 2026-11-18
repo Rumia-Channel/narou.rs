@@ -176,26 +176,30 @@ pub async fn tag_list(
         Ok(config) => config,
         Err(_) => return unavailable(),
     };
-    let mut records = match state.services.library.records().await {
-        Ok(records) => records,
+    let inventory = match crate::native::novel_repository::sqlite_tag_inventory(config.attribute_tags_enabled).await {
+        Ok(Some(inventory)) => inventory,
         Err(_) => return unavailable(),
-    };
-    // 属性タグは独立した項目として扱い、機能 OFF の間は候補に載せない
-    // (Worker の `ATTRIBUTE_NAMES_SQL` と同じ規則)。
-    crate::application::attribute_tags::project(
-        &mut records,
-        config.attribute_tags_enabled,
-    );
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for record in &records {
-        for tag in &record.tags {
-            if crate::virtual_novel::is_internal_tag(tag) {
-                continue;
+        Ok(None) => {
+            let mut records = match state.services.library.records().await {
+                Ok(records) => records,
+                Err(_) => return unavailable(),
+            };
+            crate::application::attribute_tags::project(&mut records, config.attribute_tags_enabled);
+            let mut inventory = crate::native::novel_repository::TagInventory::new();
+            for record in records {
+                for tag in record.tags {
+                    let info = inventory.entry(tag).or_insert((0, record.id));
+                    info.0 += 1;
+                    info.1 = info.1.min(record.id);
+                }
             }
-            *counts.entry(tag.clone()).or_insert(0) += 1;
+            inventory
         }
-    }
-    let mut list: Vec<(String, usize)> = counts.into_iter().collect();
+    };
+    let mut list: Vec<_> = inventory.iter()
+        .filter(|(tag, _)| !crate::virtual_novel::is_internal_tag(tag))
+        .map(|(tag, (count, _))| (tag.clone(), *count))
+        .collect();
     // 件数降順、同数はタグ名の昇順 (Worker の SQL と同じ規則 — 新規タグへの
     // 色割り当ても並び順に依存するため、両ランタイムで一致させる)。
     list.sort_by(tag_count_ordering);
@@ -219,10 +223,10 @@ pub async fn tag_list(
             Ok(sequence) => sequence,
             Err(_) => return unavailable(),
         };
-        let library = crate::application::tag_sequence::library_tags(
-            records.iter().map(|record| (record.id, record.tags.as_slice())),
-            |tag| !crate::virtual_novel::is_internal_tag(tag),
-        );
+        let library = inventory.into_iter()
+            .filter(|(tag, _)| !crate::virtual_novel::is_internal_tag(tag))
+            .map(|(tag, (_, first))| (tag, first))
+            .collect();
         crate::application::tag_sequence::registered_ranks(&sequence, &library)
     } else {
         std::collections::HashMap::new()

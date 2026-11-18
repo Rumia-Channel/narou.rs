@@ -128,6 +128,14 @@ fn legacy_library_orders_and_colors_are_stable_in_yaml_and_sqlite() {
             .body(r#"{"action":"unknown","tags":["unexpected"]}"#).send().unwrap();
         assert_eq!(rejected.status().as_u16(), 400);
         assert_eq!(server.get("/api/favorite_tags"), before);
+        server.post("/api/global_setting", json!({"settings": {
+            "webui.tag-sort-order": "count", "tag.attributes-enabled": true
+        }}));
+        let classified = server.get("/api/tag_list?format=json");
+        assert_eq!(classified["tags"][0], "小説", "attribute counts must include all three works; sqlite={sqlite}");
+        server.post("/api/global_setting", json!({"settings": {"tag.attributes-enabled": false}}));
+        let ordinary = server.get("/api/tag_list?format=json");
+        assert_eq!(ordinary["tags"], json!(["2", "Middle", "1", "1023", "5", "Alpha", "New", "Zulu"]));
     }
 }
 
