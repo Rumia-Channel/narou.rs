@@ -946,6 +946,8 @@ pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Val
         "running": running_label,
         "running_count": running_count,
         "lane_sizes": lane_sizes,
+        "restorable_tasks_available": restorable_tasks_available(&state),
+        "restore_prompt_pending": state.restore_prompt_pending.load(Ordering::Relaxed),
     }))
 }
 
@@ -2900,8 +2902,8 @@ mod tests {
         .is_err());
     }
 
-    #[test]
-    fn restorable_tasks_follow_explicit_availability_flag() {
+    #[tokio::test]
+    async fn queue_summary_reports_restore_prompt_without_fetching_job_details() {
         let temp = tempfile::tempdir().unwrap();
         let queue_path = temp.path().join("queue.yaml");
         std::fs::write(
@@ -2937,11 +2939,14 @@ mod tests {
             auto_update_scheduler: Arc::new(Mutex::new(None)),
         };
 
-        assert!(restorable_tasks_available(&state));
+        let Json(summary) = queue_status(State(state.clone())).await;
+        assert_eq!(summary["restore_prompt_pending"], true);
+        assert_eq!(summary["restorable_tasks_available"], true);
         state
             .restorable_tasks_available
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        assert!(!restorable_tasks_available(&state));
+        let Json(summary) = queue_status(State(state)).await;
+        assert_eq!(summary["restorable_tasks_available"], false);
     }
 
     fn seed_lock_file(dir: &std::path::Path, ids: &[i64]) {

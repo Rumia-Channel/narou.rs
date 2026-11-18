@@ -143,8 +143,8 @@ async function init() {
   void maybeShowPendingFeatureTour();
   void maybeOfferLibraryBackup();
 
-  // Initial data load
-  await Promise.all([refreshListWithUiState(false), refreshQueue(), refreshQueueDetailed(), refreshTags(false)]);
+  // Queue details may span many pages. Fetch them only for the queue modal.
+  await Promise.all([refreshListWithUiState(false), refreshQueue(), refreshTags(false)]);
   void refreshFavoriteTags();
   renderNovelList();
 
@@ -429,14 +429,14 @@ function handleWsMessage(msg) {
     case 'queue.partial':
       removeProgressBarsForScope(queueEventJobId(msg.data));
       refreshQueue();
-      refreshQueueDetailed();
+      refreshQueueDetailedIfOpen();
       notifyQueuePartial(msg.data);
       break;
     case 'queue_cancelled':
     case 'queue.cancelled':
       removeProgressBarsForScope(queueEventJobId(msg.data));
       refreshQueue();
-      refreshQueueDetailed();
+      refreshQueueDetailedIfOpen();
       notifyQueueCancelled(msg.data);
       break;
     case 'library_backup.done': {

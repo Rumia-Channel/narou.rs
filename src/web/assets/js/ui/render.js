@@ -992,6 +992,13 @@ export function renderQueueStatus() {
     if ((qs.failed || 0) > 0) resultParts.push(`失敗 ${qs.failed}件`);
     El.queueResultSummary.textContent = resultParts.join(' / ');
   }
+  if (State.queueRestoreCheckPending && typeof qs.restore_prompt_pending === 'boolean') {
+    State.queueRestoreCheckPending = false;
+    State.queueRestorePrompted = !!(qs.restore_prompt_pending && qs.restorable_tasks_available);
+    if (State.queueRestorePrompted) {
+      El.queueRestoreModal?.classList.remove('hide');
+    }
+  }
 }
 
 /* ===== Queue Detailed ===== */
@@ -1122,13 +1129,6 @@ export function renderQueueDetailed() {
   }
   if (El.queuePendingCount) {
     El.queuePendingCount.textContent = `(${qd.pending_count || 0})`;
-  }
-  if (State.queueRestoreCheckPending) {
-    State.queueRestoreCheckPending = false;
-    State.queueRestorePrompted = !!(qd.restore_prompt_pending && qd.restorable_tasks_available);
-    if (State.queueRestorePrompted) {
-      El.queueRestoreModal?.classList.remove('hide');
-    }
   }
 }
 

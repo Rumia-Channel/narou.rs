@@ -915,7 +915,7 @@ narou setting name         # 読み取り
 - Workers の更新は上記 `update` 節の取得専用4レーンを使う。`GET /api/jobs/{id}` の任意の診断項目 `site_key`・`normalized_target`・`waiting_reason`・`acquisition_lane` で、同系列待ち・空き枠待ち・配信待ち・容量待ちを区別できる。配信トークンは返さない。
 - Workers の未実行の取得予約は、待機ジョブの取消・キュークリアと同じ D1 batch で解放する。旧配信が失われていても後続の同系列を止めず、実行中・中止処理中の所有権は物理処理が戻るまで保持する。
 - 一時的なネットワーク失敗で夜間更新全体が止まらないよう、queue worker は失敗した job を `JobOutcome::Failed` 時に判定し、`retry_count < max_retries` かつ恒久失敗 (detail に "not found" / "invalid argument" / "no such file" / "permanent failure" / "永久失敗" / "恒久失敗" を含む) でなければ `available_at` 付きで `active_pending` へ自動再投入する。`available_at` 経過後の job だけが `pop` 系で取り出されるためスリープを挟まない。Web UI には `queue_retry` イベントを、追加試行なしで `failed` へ落ちた場合は従来どおり `queue_failed` イベントを通知する
-- Web UI のキュー詳細モーダルは `queue_start` / `queue_complete` / `queue_failed` / `queue_retry` / `notification.queue` 受信時に開いていれば再取得し、WebSocket が届かない場合も定期更新時に開いている詳細だけ再取得する
+- Web UI は初期表示でキューの件数と復元案内だけを取得する。キュー詳細はモーダルを開いたときに取得し、開いている間だけキューイベント・定期更新で再取得する
 - リトライ挙動は `narou setting` の `queue.max-retries`（既定 3、`0` で無効）と `queue.retry-backoff`（既定 `1m,5m,15m`、カンマ区切り、`s`/`m`/`h` 単位可、要素数を超えて失敗したときは最後の値を再利用）で調整できる。`QueueJob` の `available_at` フィールドは `#[serde(default, skip_serializing_if = "Option::is_none")]` 付きで読み書きされ、リトライ機能導入前の旧 `queue.yaml` もそのまま再ロード可能
 - `queue.yaml` 保存時は Ruby版に寄せ、先頭 `---` を出さず、job id は UUIDv4 形式、`created_at` / `started_at` / `updated_at` は秒精度の ISO8601 で出力する
 - idle 中の queue worker は同一プロセス内の queue 更新通知で起床し、外部プロセスが `queue.yaml` を更新した場合だけ低頻度フォールバックで検出する。空キュー時に `.narou/queue.yaml` を 500ms ごとに読み続けない

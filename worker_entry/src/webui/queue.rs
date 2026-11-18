@@ -452,6 +452,8 @@ async fn queue_status(req: Request, env: worker::Env) -> Result<Response> {
         "running": running_label,
         "running_count": running_count,
         "lane_sizes": lane_sizes,
+        "restorable_tasks_available": false,
+        "restore_prompt_pending": false,
     }))?, "queue", started_ms)
 }
 
