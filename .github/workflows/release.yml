@@ -78,7 +78,7 @@ jobs:
         run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_updater
 
       - name: Upload unsigned updater
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: unsigned-updater-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/narou_rs_updater.exe
@@ -91,7 +91,7 @@ jobs:
         run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_backup
 
       - name: Upload unsigned backup binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: unsigned-backup-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/narou_rs_backup.exe
@@ -104,7 +104,7 @@ jobs:
         run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_login
 
       - name: Upload unsigned login binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: unsigned-login-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/narou_rs_login.exe
@@ -117,7 +117,7 @@ jobs:
         run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_mcp
 
       - name: Upload unsigned MCP binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: unsigned-mcp-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/narou_rs_mcp.exe
@@ -130,7 +130,7 @@ jobs:
     environment: CodeSining
     steps:
       - name: Download unsigned helper binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: unsigned-*-*
           path: unsigned
@@ -153,56 +153,56 @@ jobs:
             unsigned\unsigned-mcp-aarch64-pc-windows-msvc\narou_rs_mcp.exe
 
       - name: Upload signed updater (x64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: signed-updater-x86_64-pc-windows-msvc
           path: unsigned/unsigned-updater-x86_64-pc-windows-msvc/narou_rs_updater.exe
           if-no-files-found: error
 
       - name: Upload signed updater (ARM64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: signed-updater-aarch64-pc-windows-msvc
           path: unsigned/unsigned-updater-aarch64-pc-windows-msvc/narou_rs_updater.exe
           if-no-files-found: error
 
       - name: Upload signed backup binary (x64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: signed-backup-x86_64-pc-windows-msvc
           path: unsigned/unsigned-backup-x86_64-pc-windows-msvc/narou_rs_backup.exe
           if-no-files-found: error
 
       - name: Upload signed backup binary (ARM64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: signed-backup-aarch64-pc-windows-msvc
           path: unsigned/unsigned-backup-aarch64-pc-windows-msvc/narou_rs_backup.exe
           if-no-files-found: error
 
       - name: Upload signed login binary (x64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: signed-login-x86_64-pc-windows-msvc
           path: unsigned/unsigned-login-x86_64-pc-windows-msvc/narou_rs_login.exe
           if-no-files-found: error
 
       - name: Upload signed login binary (ARM64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: signed-login-aarch64-pc-windows-msvc
           path: unsigned/unsigned-login-aarch64-pc-windows-msvc/narou_rs_login.exe
           if-no-files-found: error
 
       - name: Upload signed MCP binary (x64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: signed-mcp-x86_64-pc-windows-msvc
           path: unsigned/unsigned-mcp-x86_64-pc-windows-msvc/narou_rs_mcp.exe
           if-no-files-found: error
 
       - name: Upload signed MCP binary (ARM64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: signed-mcp-aarch64-pc-windows-msvc
           path: unsigned/unsigned-mcp-aarch64-pc-windows-msvc/narou_rs_mcp.exe
@@ -446,7 +446,7 @@ jobs:
 
       - name: Download signed updater
         if: matrix.platform == 'win'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: signed-updater-${{ matrix.target }}
           path: target/${{ matrix.target }}/release
@@ -490,7 +490,7 @@ jobs:
 
       - name: Upload unsigned Windows binary
         if: matrix.platform == 'win'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: unsigned-main-${{ matrix.target }}${{ matrix.variant != '' && format('-{0}', matrix.variant) || '' }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
@@ -536,7 +536,7 @@ jobs:
 
       - name: Upload release asset
         if: matrix.platform != 'win'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.package.outputs.archive_name }}
           path: ${{ steps.package.outputs.archive_path }}
@@ -553,31 +553,31 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Download unsigned binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: unsigned-main-*
           path: unsigned
 
       - name: Download signed updaters
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: signed-updater-*
           path: signed-updater
 
       - name: Download signed backup binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: signed-backup-*
           path: signed-backup
 
       - name: Download signed login binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: signed-login-*
           path: signed-login
 
       - name: Download signed MCP binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: signed-mcp-*
           path: signed-mcp
@@ -645,7 +645,7 @@ jobs:
             }
           }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: windows-assets
           path: dist
@@ -661,14 +661,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download packaged release zips
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: narou_rs_*.zip
           path: release-assets
           merge-multiple: true
 
       - name: Download signed Windows assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: windows-assets
           path: release-assets

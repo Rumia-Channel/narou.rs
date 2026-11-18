@@ -198,14 +198,6 @@ pub struct ZipArchiveInner {
 }
 
 impl ZipArchiveInner {
-    pub(crate) fn valid_offset(&self, offset: u64) -> Result<u64> {
-        if offset > self.eor {
-            return Err(ZipError::InvalidOffset(offset, self.eor));
-        }
-
-        Ok(offset)
-    }
-
     /// Finds all the file indexes with the given file name. An iterator is returned because the ZIP specification
     /// allows for multiple files with the same file name, and most callers only need the first match.
     pub fn find<'a>(&'a self, file_name: &'a [u8]) -> Result<impl Iterator<Item = usize> + 'a> {

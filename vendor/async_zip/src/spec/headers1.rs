@@ -5,8 +5,8 @@
 
 use std::io::Cursor;
 
-use binrw::{binrw, BinRead, BinWrite};
-use futures_lite::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use binrw::{binrw, BinRead};
+use futures_lite::io::{AsyncRead, AsyncReadExt};
 #[cfg(feature = "tracing")]
 use tracing::{instrument, trace};
 
@@ -257,17 +257,4 @@ where
     trace!("parsed record: {:?}", record);
 
     Ok(record)
-}
-
-/// Writes a fixed-size header to the given writer.
-pub(crate) async fn write<T, W>(writer: &mut W, value: &T) -> Result<()>
-where
-    T: BinWrite,
-    for<'a> T::Args<'a>: Default,
-    W: AsyncWrite + Unpin,
-{
-    let mut buffer = Vec::new();
-    value.write_le(&mut Cursor::new(&mut buffer))?;
-    writer.write_all(&buffer).await?;
-    Ok(())
 }

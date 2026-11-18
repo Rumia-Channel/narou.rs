@@ -92,6 +92,7 @@ pub struct ZipFileReader {
     inner: Arc<Inner>,
 }
 
+#[allow(deprecated, reason = "implementation of the deprecated API itself")]
 impl ZipFileReader {
     /// Constructs a new ZIP reader from an owned vector of bytes.
     pub async fn new(data: Vec<u8>) -> Result<ZipFileReader> {
@@ -117,7 +118,7 @@ impl ZipFileReader {
     }
 
     /// Returns a new entry reader if the provided index is valid.
-    pub async fn reader_without_entry(&self, index: usize) -> Result<ZipEntryReader<Cursor<&[u8]>, WithoutEntry>> {
+    pub async fn reader_without_entry(&self, index: usize) -> Result<ZipEntryReader<'_, Cursor<&[u8]>, WithoutEntry>> {
         let stored_entry = self.inner.file.entries.get(index).ok_or(ZipError::EntryIndexOutOfBounds)?;
         let mut cursor = Cursor::new(&self.inner.data[..]);
 
@@ -131,7 +132,7 @@ impl ZipFileReader {
     }
 
     /// Returns a new entry reader if the provided index is valid.
-    pub async fn reader_with_entry(&self, index: usize) -> Result<ZipEntryReader<Cursor<&[u8]>, WithEntry<'_>>> {
+    pub async fn reader_with_entry(&self, index: usize) -> Result<ZipEntryReader<'_, Cursor<&[u8]>, WithEntry<'_>>> {
         let stored_entry = self.inner.file.entries.get(index).ok_or(ZipError::EntryIndexOutOfBounds)?;
         let mut cursor = Cursor::new(&self.inner.data[..]);
 

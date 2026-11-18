@@ -48,6 +48,7 @@ pub struct ZipFileReader<R> {
     file: ZipFile,
 }
 
+#[allow(deprecated, reason = "implementation of the deprecated API itself")]
 impl<R> ZipFileReader<R>
 where
     R: AsyncBufRead + AsyncSeek + Unpin,
@@ -128,6 +129,7 @@ where
 }
 
 #[cfg(feature = "tokio")]
+#[allow(deprecated, reason = "implementation of the deprecated API itself")]
 impl<R> ZipFileReader<Compat<R>>
 where
     R: tokio::io::AsyncBufRead + tokio::io::AsyncSeek + Unpin,

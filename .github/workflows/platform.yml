@@ -100,7 +100,7 @@ jobs:
           FIREFOX_BINARY: ${{ steps.transfer-firefox.outputs.firefox-path }}
       - name: Retain browser surface failure evidence
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: transfer-browser-surfaces
           path: target/transfer-browser-artifacts/*.png

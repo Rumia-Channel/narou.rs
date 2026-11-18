@@ -15,7 +15,6 @@ pub struct CombinedCentralDirectoryRecord {
     pub num_entries_in_directory: u64,
     pub directory_size: u64,
     pub offset_of_start_of_directory: u64,
-    pub file_comment_length: u16,
 }
 
 impl CombinedCentralDirectoryRecord {
@@ -62,7 +61,6 @@ impl From<&EndOfCentralDirectoryHeader> for CombinedCentralDirectoryRecord {
             num_entries_in_directory: header.num_of_entries as u64,
             directory_size: header.size_cent_dir as u64,
             offset_of_start_of_directory: header.cent_dir_offset as u64,
-            file_comment_length: header.file_comm_length,
         }
     }
 }

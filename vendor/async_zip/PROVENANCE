@@ -15,3 +15,7 @@ Local resource accounting: ZipFileWriter exposes retained record count,
 capacity, record size, and fallible exact reservation. Callers can admit
 central-directory metadata (including old/new allocation overlap) before
 growing it; entry payload streaming and archive semantics are unchanged.
+
+Local warning cleanup: the two legacy reader implementations permit their
+own deprecated types while retaining downstream deprecation diagnostics.
+Unused internal helpers were removed; the active ZIP codec is unchanged.
