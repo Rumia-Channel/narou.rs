@@ -732,6 +732,13 @@ min_interval: 0.01
   const unavailable = await api('/api/storage/mode');
   assert.equal(unavailable.status, 503);
   assert.equal((await unavailable.json()).error.code, 'storage_configuration_unavailable');
+  const sort = await api('/api/sort_state', { column: 1, dir: 'desc' });
+  assert.equal(sort.status, 200);
+  assert.equal((await sort.json()).success, true);
+  const sorted = await api('/api/sort_state');
+  assert.equal(sorted.status, 200);
+  const { column, dir } = await sorted.json();
+  assert.deepEqual({ column, dir }, { column: 1, dir: 'desc' });
   assert.equal(scalar("SELECT COUNT(*) FROM app_state WHERE scope='inv' AND key='content_backend'"), 0, 'invalid S3 configuration must not mutate the marker');
   assert.equal(scalar('SELECT COUNT(*) FROM legacy_content_objects'), 0);
   console.log('PASS invalid S3 configuration fails closed without initializing a misleading backend');

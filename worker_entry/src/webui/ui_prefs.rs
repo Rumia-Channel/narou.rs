@@ -22,7 +22,7 @@ use worker::{Env, Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
 
-use super::{api_response, json_error, load_current_sort_state};
+use super::{api_response, json_error, load_current_sort_state_for, metadata};
 
 /// 親がこの 1 ハンドラを 3 ルートへ割り当てる。パスとメソッドで振り分ける。
 pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
@@ -33,27 +33,30 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     if req.method() == Method::Get && path == "/api/webui/config" {
         return webui_config(&req, &env).await;
     }
+    if path == "/api/sort_state" {
+        let started_ms = js_sys::Date::now();
+        return match req.method() {
+            Method::Get => get_sort_state(&env, started_ms).await,
+            Method::Post => save_sort_state(&mut req, &env).await,
+            _ => json_error(405, "method_not_allowed", None),
+        };
+    }
     // 対象パスとメソッドの組を先に検証する (native のルート定義と同じく、
     // パスはあるがメソッドが違う場合は 405)。
     enum Route {
-        GetSortState,
-        SaveSortState,
         FeatureTourPending,
         FeatureTourAll,
         FeatureTourSeen,
         FeatureTourConfig,
     }
     let route = match (req.method(), path.as_str()) {
-        (Method::Get, "/api/sort_state") => Route::GetSortState,
-        (Method::Post, "/api/sort_state") => Route::SaveSortState,
         (Method::Get, "/api/feature_tour/pending") => Route::FeatureTourPending,
         (Method::Get, "/api/feature_tour/all") => Route::FeatureTourAll,
         (Method::Post, "/api/feature_tour/seen") => Route::FeatureTourSeen,
         (Method::Post, "/api/feature_tour/config") => Route::FeatureTourConfig,
         (
             _,
-            "/api/sort_state"
-            | "/api/webui/config"
+            "/api/webui/config"
             | "/api/feature_tour/pending"
             | "/api/feature_tour/all"
             | "/api/feature_tour/seen"
@@ -73,8 +76,6 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         }
     };
     match route {
-        Route::GetSortState => get_sort_state(&runtime).await,
-        Route::SaveSortState => save_sort_state(&mut req, &runtime).await,
         Route::FeatureTourPending => feature_tour_pending(&runtime).await,
         Route::FeatureTourAll => feature_tour_all(&runtime).await,
         Route::FeatureTourSeen => feature_tour_seen(&mut req, &runtime).await,
@@ -140,17 +141,18 @@ async fn webui_config(req: &Request, env: &Env) -> worker::Result<Response> {
 //                             保存形式: src/web/sort_state.rs)
 // ---------------------------------------------------------------------------
 
-async fn get_sort_state(runtime: &WorkerRuntime) -> worker::Result<Response> {
-    // native は `server_setting` (global) の `current_sort` キーを読む。
-    // Worker では global スコープの `current_sort` 行がその値そのもの
-    // (共有の `super::load_current_sort_state` がそのまま読む)。
-    let sort_state = load_current_sort_state(runtime).await;
-    Response::from_json(&sort_state.to_json_value())
+async fn get_sort_state(env: &Env, started_ms: f64) -> worker::Result<Response> {
+    let Ok(settings) = metadata::settings(env) else {
+        return json_error(503, "service_unavailable", None);
+    };
+    let sort_state = load_current_sort_state_for(&settings).await;
+    let response = Response::from_json(&sort_state.to_json_value())?;
+    metadata::timed_response(response, "sort_state", started_ms)
 }
 
 async fn save_sort_state(
     req: &mut Request,
-    runtime: &WorkerRuntime,
+    env: &Env,
 ) -> worker::Result<Response> {
     let body: serde_json::Value = match req.json().await {
         Ok(body) => body,
@@ -162,14 +164,11 @@ async fn save_sort_state(
             "valid column and dir are required",
         ));
     };
-    match runtime
-        .write_services()
-        .settings
-        .set_raw(
-            SettingScope::Global,
-            CURRENT_SORT_KEY,
-            sort_state.to_yaml_value(),
-        )
+    let Ok(settings) = metadata::settings_for_writes(env) else {
+        return json_error(503, "service_unavailable", None);
+    };
+    match settings
+        .set_raw(SettingScope::Global, CURRENT_SORT_KEY, sort_state.to_yaml_value())
         .await
     {
         Ok(()) => Response::from_json(&api_response(true, "OK")),

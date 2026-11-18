@@ -397,7 +397,7 @@ pub async fn batch_tag(
 async fn sort_ids_for_request(services: &AppServices, ids: &[i64]) -> Vec<i64> {
     let (records, sort_state) = futures::join!(
         services.library.records_by_ids(ids),
-        super::load_current_sort_state_for(services),
+        super::load_current_sort_state_for(&services.settings),
     );
     sort_ids_from_records(ids, &records.unwrap_or_default(), &sort_state)
 }

@@ -103,32 +103,19 @@ pub(crate) async fn max_web_targets_for(
         .await
 }
 
-/// native `load_current_sort_state`: `server_setting` (global) の
-/// `current_sort` キーを読み、無ければ既定値。Worker では global スコープの
-/// `current_sort` 行 (D1 `app_state`, `webui::ui_prefs` の保存先) がその値
-/// そのもの。
-pub(crate) async fn load_current_sort_state(runtime: &WorkerRuntime) -> CurrentSortState {
-    load_current_sort_state_for(&runtime.services).await
-}
-
-/// `load_current_sort_state` の更新系版。ソート状態を書き込み判断
-/// (一括操作の対象順) の材料にするハンドラは、primary + キャッシュ無しの
-/// `write_services` 側から読む。
+/// ソート状態を書き込み判断 (一括操作の対象順) の材料にするハンドラは、
+/// primary + キャッシュ無しの `write_services` 側から読む。
 pub(crate) async fn load_current_sort_state_for_writes(
     runtime: &WorkerRuntime,
 ) -> CurrentSortState {
-    load_current_sort_state_for(runtime.write_services()).await
+    load_current_sort_state_for(&runtime.write_services().settings).await
 }
 
-/// `load_current_sort_state` と同じ設定をフル `WorkerRuntime` 無しで読む版
-/// (`max_web_targets_for` と同じ理由)。
+/// Read `current_sort` from global settings, without composing a WorkerRuntime.
 pub(crate) async fn load_current_sort_state_for(
-    services: &narou_rs::application::AppServices,
+    settings: &narou_rs::application::SettingsService,
 ) -> CurrentSortState {
-    services
-        .settings
-        .get_raw(SettingScope::Global, CURRENT_SORT_KEY)
-        .await
+    settings.get_raw(SettingScope::Global, CURRENT_SORT_KEY).await
         .ok()
         .flatten()
         .and_then(|value| normalize_current_sort_value(&value))
