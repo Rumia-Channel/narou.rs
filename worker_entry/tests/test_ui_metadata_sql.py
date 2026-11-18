@@ -12,13 +12,15 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCES = [
-    (ROOT / "src/db/novel_query.rs").read_text(encoding="utf-8"),
     (ROOT / "worker_entry/src/webui/queue.rs").read_text(encoding="utf-8"),
     (ROOT / "worker_entry/src/webui/queue/paging.rs").read_text(encoding="utf-8"),
 ]
 SQL = {}
 for source in SOURCES:
     SQL.update(re.findall(r'const (\w+_SQL): &str = r#"(.*?)"#;', source, re.S))
+shared = (ROOT / "src/db/novel_query.rs").read_text(encoding="utf-8")
+for name in ("TAG_NAMES_SQL", "ATTRIBUTE_NAMES_SQL"):
+    SQL[name] = re.search(rf'const {name}: &str = r#"(.*?)"#;', shared, re.S).group(1)
 ACTIVE = {"pending", "retryable", "running"}
 SECONDARY = {"convert", "send", "backup", "mail"}
 STATUSES = (*sorted(ACTIVE), "succeeded", "partial", "blocked", "permanent")
