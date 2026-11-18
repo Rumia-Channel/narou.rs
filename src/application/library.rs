@@ -302,12 +302,12 @@ impl LibraryService {
 
 
     /// Build the same typed filter for leased readers and atomic metadata snapshots.
-    async fn prepare_list(
+    fn prepare_list(
         &self,
         request: &LibraryListRequest,
-    ) -> Result<(NovelFilter, NovelSort, HashSet<i64>), ApplicationError> {
-        let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
-        let mut filter = self.build_filter_with_ids(request.search.as_deref(), &frozen_ids);
+        frozen_ids: &HashSet<i64>,
+    ) -> (NovelFilter, NovelSort) {
+        let mut filter = self.build_filter_with_ids(request.search.as_deref(), frozen_ids);
         filter.attribute_tags_enabled = request.attribute_tags_enabled;
         if !request.include_hidden
             && let Some(hidden) = &request.hidden
@@ -319,7 +319,7 @@ impl LibraryService {
             key: request.sort_column.sort_key(),
             reverse: request.sort_order == LibrarySortOrder::Descending,
         };
-        Ok((filter, sort, frozen_ids))
+        (filter, sort)
     }
 
     /// Fetch the library page and validate its rows in the caller's read scope.
@@ -328,7 +328,8 @@ impl LibraryService {
         scope: &mut crate::application::novel_access::NovelReadScope,
         request: &LibraryListRequest,
     ) -> Result<LibraryPage, ApplicationError> {
-        let (filter, sort, frozen_ids) = self.prepare_list(request).await?;
+        let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
+        let (filter, sort) = self.prepare_list(request, &frozen_ids);
 
         let (records_total, records_filtered, records) = self
             .list_records(filter, sort, request.start, request.length)
@@ -357,15 +358,16 @@ impl LibraryService {
     pub async fn list_metadata_snapshot<F>(
         &self,
         request: &LibraryListRequest,
+        frozen_ids: &HashSet<i64>,
         read: impl FnOnce(NovelQuery) -> F,
     ) -> Result<LibraryPage, ApplicationError>
     where
-        F: std::future::Future<Output = crate::error::Result<(u64, u64, Vec<NovelRecord>)>>,
+        F: std::future::Future<Output = Result<(u64, u64, Vec<NovelRecord>), ApplicationError>>,
     {
-        let (filter, sort, frozen_ids) = self.prepare_list(request).await?;
+        let (filter, sort) = self.prepare_list(request, frozen_ids);
         let query = NovelQuery::page(filter, sort, request.start, request.length.unwrap_or(usize::MAX));
-        let (records_total, records_filtered, records) = read(query).await.map_err(ApplicationError::platform)?;
-        let data = self.summarize_records_with_frozen(records, request.attribute_tags_enabled, &frozen_ids).await;
+        let (records_total, records_filtered, records) = read(query).await?;
+        let data = self.summarize_records_with_frozen(records, request.attribute_tags_enabled, frozen_ids).await;
         Ok(LibraryPage { records_total, records_filtered, data })
     }
 

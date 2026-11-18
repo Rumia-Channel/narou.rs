@@ -39,6 +39,14 @@ SELECT CAST(j.key AS INTEGER) AS position,
 FROM json_each(?1) AS j ORDER BY CAST(j.key AS INTEGER)
 "#;
 
+pub(crate) struct WebListInputs {
+    pub(crate) hidden: Option<narou_rs::hidden::HiddenState>,
+    pub(crate) members: narou_rs::virtual_novel::VirtualNovelMembers,
+    pub(crate) raw_members: Option<String>,
+    pub(crate) frozen_ids: HashSet<i64>,
+    pub(crate) attribute_tags_enabled: bool,
+}
+
 #[derive(Clone)]
 pub struct D1NovelRepository {
     db: DbHandle,
@@ -126,10 +134,57 @@ impl D1NovelRepository {
         rows_from_result(result)
     }
 
+    /// Resolve only the list's filter inputs, together on the primary.
+    pub(crate) async fn web_list_inputs(&self, include_hidden: bool) -> Result<WebListInputs> {
+        use narou_rs::application::attribute_tags::ENABLED_SETTING;
+        use narou_rs::setting_core::setting_bool_value;
+
+        let primary = self.primary();
+        let state = primary.prepare(
+            "SELECT key, value_yaml, value_json FROM app_state
+             WHERE (scope='inv' AND (key='virtual_novel_members' OR (?1=0 AND key='hidden')))
+                OR (scope='local' AND key=?2)",
+            vec![BindValue::Int(i64::from(include_hidden)), BindValue::Text(ENABLED_SETTING.into())],
+        )?;
+        let results = primary.db.batch(vec![
+            state,
+            primary.db.prepare(FROZEN_IDS_SQL),
+        ]).await.map_err(worker_error)?;
+        ensure_batch_success(&results)?;
+        let [state, frozen] = results.as_slice() else {
+            return Err(worker_error("incomplete list inputs"));
+        };
+        let mut inputs = WebListInputs {
+            hidden: None,
+            members: Default::default(),
+            raw_members: None,
+            frozen_ids: frozen.results::<IdRow>().map_err(worker_error)?
+                .into_iter().map(|row| row.id).collect(),
+            attribute_tags_enabled: false,
+        };
+        for row in state.results::<StateRow>().map_err(worker_error)? {
+            match row.key.as_str() {
+                "hidden" => inputs.hidden = serde_json::from_str(&row.value_json).ok(),
+                "virtual_novel_members" => {
+                    inputs.members = serde_json::from_str(&row.value_json).map_err(worker_error)?;
+                    inputs.raw_members = Some(row.value_json);
+                }
+                ENABLED_SETTING => {
+                    inputs.attribute_tags_enabled = parse_setting_value(&row.value_yaml, &row.value_json)
+                        .ok().and_then(|value| setting_bool_value(&value)).unwrap_or(false);
+                }
+                _ => unreachable!("unexpected list setting"),
+            }
+        }
+        Ok(inputs)
+    }
+
     /// A buffered metadata listing has one commit point: rows, counts and
     /// closed gates are read in the same primary D1 transaction. Holding
     /// durable reader leases until HTTP EOF is only needed for deferred reads.
-    pub(crate) async fn web_list_snapshot(&self, query: NovelQuery) -> Result<(u64, u64, Vec<NovelRecord>)> {
+    pub(crate) async fn web_list_snapshot(
+        &self, query: NovelQuery, raw_members: Option<String>,
+    ) -> Result<Option<(u64, u64, Vec<NovelRecord>)>> {
         let primary = self.primary();
         let all_matches = query.offset == 0 && query.limit == usize::MAX;
         let unrestricted = query.filter.is_unrestricted();
@@ -137,6 +192,11 @@ impl D1NovelRepository {
         let mut statements = vec![
             primary.prepare(&sql, binds)?,
             primary.db.prepare("SELECT prefix FROM novel_access_gates WHERE closed=1"),
+            primary.prepare(
+                "SELECT (SELECT value_json FROM app_state
+                         WHERE scope='inv' AND key='virtual_novel_members') IS ?1 AS unchanged",
+                vec![raw_members.map_or(BindValue::Null, BindValue::Text)],
+            )?,
         ];
         let count_statement = |filter: &NovelFilter| {
             let SqlQuery { sql, binds } = novel_query::count_sql(filter, |bind| bind);
@@ -156,6 +216,13 @@ impl D1NovelRepository {
         #[derive(Deserialize)]
         struct ClosedGate { prefix: String }
         let closed = next()?.results::<ClosedGate>().map_err(worker_error)?;
+        #[derive(Deserialize)]
+        struct MembershipCheck { unchanged: i64 }
+        let check = next()?.results::<MembershipCheck>().map_err(worker_error)?
+            .into_iter().next().ok_or_else(|| worker_error("missing list membership check"))?;
+        if check.unchanged == 0 {
+            return Ok(None);
+        }
         if !closed.is_empty() {
             let closed: HashSet<_> = closed.into_iter().map(|gate| gate.prefix).collect();
             for record in &records {
@@ -174,7 +241,7 @@ impl D1NovelRepository {
         };
         let filtered = if all_matches { records.len() as u64 } else { count()? };
         let total = if unrestricted { filtered } else { count()? };
-        Ok((total, filtered, records))
+        Ok(Some((total, filtered, records)))
     }
 
     async fn one(&self, sql: &str, values: Vec<BindValue>) -> Result<Option<NovelRecord>> {
@@ -592,6 +659,8 @@ impl D1FreezeStore {
     }
 }
 
+const FROZEN_IDS_SQL: &str = "SELECT novel_id AS id FROM frozen_novels ORDER BY novel_id";
+
 /// isolate ごとの凍結 ID キャッシュ。一覧の描画や検索のたびに読んでいた
 /// ため (1 回 = D1 往復 1 回)、書き込み側 (`set_frozen`) で即時無効化し、
 /// 他の isolate は TTL で追従する。
@@ -607,7 +676,7 @@ impl FreezeStore for D1FreezeStore {
             }
             let rows: Vec<IdRow> = self
                 .db
-                .prepare("SELECT novel_id AS id FROM frozen_novels ORDER BY novel_id")
+                .prepare(FROZEN_IDS_SQL)
                 .all()
                 .await
                 .map_err(worker_error)?

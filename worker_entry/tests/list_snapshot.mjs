@@ -43,6 +43,28 @@ try {
   const gates = JSON.parse(sql("SELECT count(*) AS count FROM novel_access_gates WHERE prefix LIKE 'novels/list-snapshot/%'"));
   assert.equal(gates[0].results[0].count, 0, 'metadata-only reads must not create durable leases or gates');
 
+  const setHidden = async action => {
+    const response = await fetch(new URL('/api/hidden', base), {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, novels: [first] }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).success, true);
+  };
+  await setHidden('add');
+  try {
+    const hidden = await payload(`filter=${title(first)}&all=true`);
+    assert.equal(hidden.records_filtered, 0);
+    assert.deepEqual(hidden.data, []);
+    const included = await payload(`filter=${title(first)}&all=true&show_hidden=true`);
+    assert.equal(included.records_filtered, 1);
+    assert.deepEqual(included.data.map(row => row.id), [first]);
+  } finally {
+    await setHidden('remove');
+  }
+
   // Include an unbound legacy record: gate lookup must use the same derived
   // namespace as ordinary storage, not only newer novel_gate_bindings rows.
   sql(`INSERT INTO novel_access_gates(prefix,epoch,closed,owner,updated_at) VALUES('${prefix(last)}',1,1,'snapshot-fixture',unixepoch());`);

@@ -83,10 +83,6 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
     if total_query_bytes > MAX_WEB_SEARCH_BYTES {
         return json_error(400, "invalid_request", Some("search query is too long"));
     }
-    if let Err(error) = super::metadata::initialize_attributes(env).await {
-        worker::console_log!("attribute migration failed: {error}");
-        return json_error(503, "service_unavailable", None);
-    }
 
     let search = combine_search_terms(params.filter, params.search_value);
     let sort_column = sort_column_from_index(params.order_column);
@@ -96,31 +92,30 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
         LibrarySortOrder::Ascending
     };
     let include_hidden = params.show_hidden.unwrap_or(false);
-    let hidden = if include_hidden {
-        None
-    } else {
-        crate::hidden::load_from_env(env).await.ok()
-    };
-    let members = match crate::virtual_novels::load_from_env(env).await {
-        Ok(members) => members,
-        Err(error) => return json_error(503, "service_unavailable", Some(&error.to_string())),
-    };
-    let exclude_ids = members.all_member_ids().into_iter().collect();
-    let settings = match super::metadata::settings_for_writes(env) {
-        Ok(settings) => settings,
-        Err(error) => {
-            worker::console_log!("service composition failed: {error}");
-            return json_error(503, "service_unavailable", None);
-        }
-    };
     let db = super::metadata::primary_database(env)?;
     let repository = std::sync::Arc::new(crate::d1_repository::D1NovelRepository::new(db.clone()));
+    // Attribute reconciliation does not edit the filter inputs. Wait for it
+    // before reading rows, but overlap its primary round trips with the inputs.
+    let (attributes, inputs) = futures::join!(
+        super::metadata::initialize_attributes(env),
+        repository.web_list_inputs(include_hidden),
+    );
+    if let Err(error) = attributes {
+        worker::console_log!("attribute migration failed: {error}");
+        return json_error(503, "service_unavailable", None);
+    }
+    let inputs = match inputs {
+        Ok(inputs) => inputs,
+        Err(error) => return json_error(503, "service_unavailable", Some(&error.to_string())),
+    };
+    let exclude_ids = inputs.members.all_member_ids();
     let primary_library = narou_rs::application::LibraryService::new(
         repository.clone(),
         std::sync::Arc::new(narou_rs::platform::SystemClock),
-        std::sync::Arc::new(crate::d1_repository::D1FreezeStore::for_writes(db)),
+        std::sync::Arc::new(crate::d1_repository::D1FreezeStore::new(db)),
         std::sync::Arc::new(narou_rs::application::EmptySiteTimezoneProvider),
     );
+    let snapshot_started_ms = js_sys::Date::now();
     let page = match primary_library
         .list_metadata_snapshot(&LibraryListRequest {
             search,
@@ -128,24 +123,21 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
             length,
             sort_column,
             sort_order,
-            hidden,
+            hidden: inputs.hidden,
             include_hidden,
             exclude_ids,
-            attribute_tags_enabled: narou_rs::application::attribute_tags::enabled(&settings).await,
-        }, |query| repository.web_list_snapshot(query))
+            attribute_tags_enabled: inputs.attribute_tags_enabled,
+        }, &inputs.frozen_ids, |query| async {
+            repository.web_list_snapshot(query, inputs.raw_members).await
+                .map_err(ApplicationError::platform)?
+                .ok_or_else(|| ApplicationError::Conflict("virtual membership changed during listing".into()))
+        })
         .await
     {
         Ok(page) => page,
         Err(error) => return map_application_error(error),
     };
-    let latest_members = match crate::virtual_novels::load_from_env(env).await {
-        Ok(members) => members,
-        Err(error) => return json_error(503, "service_unavailable", Some(&error.to_string())),
-    };
-    if latest_members != members {
-        return json_error(409, "conflict", Some("virtual membership changed during listing"));
-    }
-
+    let snapshot_finished_ms = js_sys::Date::now();
 
     let data = page
         .data
@@ -183,7 +175,16 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
         records_filtered: page.records_filtered,
         data,
     })?;
-    super::metadata::timed_response(response, "list", started_ms)
+    let mut response = super::metadata::timed_response(response, "list", started_ms)?;
+    response.headers_mut().append(
+        "Server-Timing",
+        &format!(
+            "list_inputs;dur={:.1}, list_snapshot;dur={:.1}",
+            (snapshot_started_ms - started_ms).max(0.0),
+            (snapshot_finished_ms - snapshot_started_ms).max(0.0),
+        ),
+    )?;
+    Ok(response)
 }
 
 /// `serde_urlencoded` (= `form_urlencoded`) と同じ規則で生バイト列から
