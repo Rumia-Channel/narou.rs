@@ -994,6 +994,8 @@ await check("GET /api/feature_tour/all lists every tour", async () => {
   const body = await json(response);
   assert(body.success === true, `unexpected body: ${JSON.stringify(body).slice(0, 200)}`);
   assert(Array.isArray(body.entries), "entries must be an array");
+  const novelup = body.entries.find(entry => entry.version === "0.6.7" && entry.title === "ノベルアップ＋に対応");
+  assert(novelup?.body.includes("PierreL-H"), "the Novelup Plus tour must include fork attribution");
   assert(
     typeof body.latest_pending_version === "string",
     "latest_pending_version must be a string",

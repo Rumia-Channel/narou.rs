@@ -1,4 +1,4 @@
-"""Exercise tag order in the shipped Web UI against both Native backends."""
+"""Exercise the upgrade tour and tag order against both Native backends."""
 import json
 import os
 from pathlib import Path
@@ -29,7 +29,7 @@ def run_mode(driver, root, mode):
     # This represents an existing library with first-run prompts already handled.
     (state / "last-run-version").write_text("0.4.0\n", encoding="utf-8")
     (state / "local_setting.yaml").write_text(
-        "webui.tag-sort-order: favorites_first\nwebui.feature-tour.disabled: true\n", encoding="utf-8",
+        "webui.tag-sort-order: favorites_first\nwebui.feature-tour.seen-version: '0.6.6'\n", encoding="utf-8",
     )
     (state / "favorite_tags.yaml").write_text("- Zulu\n- Middle\n", encoding="utf-8")
     (state / "tag_colors.yaml").write_text("Zulu: blue\nMiddle: magenta\n", encoding="utf-8")
@@ -78,6 +78,7 @@ def run_mode(driver, root, mode):
             driver.delete_all_cookies()
             driver.add_cookie({"name": "narou_ui_token", "value": token, "path": "/", "httpOnly": True, "sameSite": "Strict"})
             driver.get(base + "/")
+            exercise_upgrade_tour(driver)
             exercise_tags(driver, api)
             print(f"Firefox + Native {mode}: four orders, tag/favorite edits, stored order and colors verified", flush=True)
         finally:
@@ -87,6 +88,16 @@ def run_mode(driver, root, mode):
             except subprocess.TimeoutExpired:
                 server.kill()
                 server.wait(timeout=5)
+
+
+def exercise_upgrade_tour(driver):
+    modal = (By.ID, "feature-tour-modal")
+    wait = WebDriverWait(driver, 12)
+    wait.until(lambda _: driver.find_element(*modal).is_displayed())
+    tour = driver.find_element(*modal).text
+    assert "v0.6.7" in tour and "ノベルアップ＋に対応" in tour and "PierreL-H" in tour, tour
+    driver.find_element(By.ID, "feature-tour-ok").click()
+    wait.until_not(lambda _: driver.find_element(*modal).is_displayed())
 
 
 def exercise_tags(driver, api):
