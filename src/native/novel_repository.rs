@@ -557,7 +557,7 @@ mod tests {
 
                 objects.access_fence().unwrap().close_gate(&prefix, "test-publication").await.unwrap();
                 let mut scope = crate::application::novel_access::NovelReadScope::new(&objects, "native-closed-list");
-                let error = library.list(&mut scope, &request).await.err().expect("selected closed namespace");
+                let error = library.list(&mut scope, &request).await.expect_err("selected closed namespace");
                 assert!(error.to_string().contains("novel_recovering:"), "{error}");
                 scope.release_all().await.unwrap();
             });
