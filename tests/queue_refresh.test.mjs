@@ -45,7 +45,7 @@ test('dismissing the restore prompt refreshes the indicator without loading clos
     State: state,
     El: {
       queueRestoreModal: { classList: restoreClasses },
-      queueModal: { classList: new Set(['hide']) },
+      queueModal: { classList: { contains: name => name === 'hide' } },
     },
     document: {
       getElementById: id => id === 'queue-restore-no' ? button : id === 'colvis-style' ? style : null,
