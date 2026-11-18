@@ -31,7 +31,7 @@ pub(crate) use creation::ancestors;
 /// D1 tolerates much larger statement payloads than the native store's
 /// `novel_codec::MAX_EXTRA_FIELDS_BYTES`; keep the historical D1 cap.
 const MAX_EXTRA_FIELDS_BYTES: usize = 1_900_000;
-const ATTRIBUTE_MARKER: &str = "work_type_attributes_v2";
+pub(crate) const ATTRIBUTE_MARKER: &str = "work_type_attributes_v2";
 
 pub(crate) const KNOWN_TOC_URLS: &str = r#"
 SELECT CAST(j.key AS INTEGER) AS position,
@@ -1205,7 +1205,7 @@ fn parse_extra_fields(value: &str) -> Result<BTreeMap<String, YamlValue>> {
 /// Parse one `app_state` setting value: YAML text first, with the legacy
 /// `value_json` payload as fallback. Fails (no silent empty/default) when
 /// neither format parses.
-fn parse_setting_value(value_yaml: &str, legacy_value_json: &str) -> Result<YamlValue> {
+pub(crate) fn parse_setting_value(value_yaml: &str, legacy_value_json: &str) -> Result<YamlValue> {
     match serde_yaml::from_str::<YamlValue>(value_yaml) {
         Ok(value) => Ok(value),
         Err(yaml_error) => {

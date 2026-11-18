@@ -231,6 +231,38 @@ if (process.env.NAROU_TEST_CONFIG && process.env.NAROU_TEST_PERSIST) {
     ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,value_yaml=excluded.value_yaml;`));
   const original = JSON.stringify({ tags: favoriteState.tags });
   try {
+    const settingKeys = "'webui.new-tag-color','tag.attributes-enabled','webui.tag-sort-order'";
+    const originalSettings = (await sql(`SELECT key,value_json,value_yaml FROM app_state
+      WHERE scope='local' AND key IN (${settingKeys})`))[0].results;
+    const unrelatedKey = `tag-list-unrelated-${stamp}`;
+    const setRaw = (key, yaml, json) => `INSERT INTO app_state(scope,key,value_yaml,value_json)
+      VALUES ('local',${quote(key)},${quote(yaml)},${quote(json)})
+      ON CONFLICT(scope,key) DO UPDATE SET value_yaml=excluded.value_yaml,value_json=excluded.value_json;`;
+    try {
+      await sql(setRaw(unrelatedKey, '[broken YAML', '{broken JSON')
+        + setRaw('webui.new-tag-color', ' BLUE ', '"red"')
+        + setRaw('tag.attributes-enabled', 'false', 'true')
+        + setRaw('webui.tag-sort-order', 'favorites_first', '"registered"'));
+      tags = await tagList();
+      assert.deepEqual(tags.slice(0, 2), [secondTag, firstTag]);
+      assert(!tags.includes('小説'), 'valid YAML false must override legacy JSON true');
+      await sql(setRaw('webui.tag-sort-order', '[broken YAML', '"registered"')
+        + setRaw('tag.attributes-enabled', 'true', 'false'));
+      tags = await tagList();
+      assert(tags.indexOf(firstTag) < tags.indexOf(secondTag), JSON.stringify(tags));
+      assert(tags.includes('小説'), 'enabled attributes must be included in the aggregate');
+      await sql(setRaw('webui.tag-sort-order', '[broken YAML', '{broken JSON'));
+      assert.equal((await request('/api/tag_list?format=json', { headers: auth() })).status, 503);
+      await sql(`DELETE FROM app_state WHERE scope='local' AND key IN (${settingKeys})`);
+      tags = await tagList();
+      assert.deepEqual(tags.slice(0, 2), [secondTag, firstTag], 'missing order must use favorites first');
+      assert(!tags.includes('小説'), 'missing attribute setting must remain disabled');
+      console.log('PASS bounded tag settings retain defaults, YAML precedence and legacy JSON fallback');
+    } finally {
+      await sql(`DELETE FROM app_state WHERE scope='local' AND (key IN (${settingKeys}) OR key=${quote(unrelatedKey)});`
+        + originalSettings.map(row => setRaw(row.key, row.value_yaml, row.value_json)).join(''));
+    }
+
     (await replace(JSON.stringify([firstTag, '1023', '2'])));
     assert.deepEqual(await favoriteMutation({ action: 'add', tags: [secondTag] }),
       [firstTag, '1023', '2', secondTag]);

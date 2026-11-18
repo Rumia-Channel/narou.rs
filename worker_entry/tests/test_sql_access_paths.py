@@ -8,8 +8,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 OBJECT_SQL = re.search(r'LIST_PAGE_SQL: &str = r#"(.*?)"#;',
     (ROOT / 'src/db/object_query.rs').read_text(encoding='utf-8'), re.S).group(1)
-CLASSIFY_SQL = re.search(r'async fn reconcile_attributes.*?prepare\(r#"(.*?)"#\)',
-    (ROOT / 'worker_entry/src/virtual_novels.rs').read_text(encoding='utf-8'), re.S).group(1)
+VIRTUAL_SOURCE = (ROOT / 'worker_entry/src/virtual_novels.rs').read_text(encoding='utf-8')
+CLASSIFIED = re.search(r'const CLASSIFIED: &str = r#"(.*?)"#;', VIRTUAL_SOURCE, re.S).group(1)
+CLASSIFY_SQL = CLASSIFIED + re.search(r'let update = format!\("\{CLASSIFIED\}(.*?)"\);',
+    VIRTUAL_SOURCE, re.S).group(1)
+CANDIDATES_SQL = CLASSIFIED + re.search(r'let enumerate = format!\("\{CLASSIFIED\}(.*?)"\);',
+    VIRTUAL_SOURCE, re.S).group(1)
 
 
 class SqlAccessPathTests(unittest.TestCase):
@@ -75,7 +79,7 @@ class SqlAccessPathTests(unittest.TestCase):
         groups.update({'4000': [1, 3], '4001': [2, 4], '4002': [999999]})
         self.db.execute("INSERT INTO app_state(scope,key,value_json) VALUES ('inv','virtual_novel_members',?)",
             (json.dumps(groups),))
-        self.bounded(CLASSIFY_SQL, (), 450000)
+        self.bounded(CLASSIFY_SQL, (None, None), 450000)
         actual = dict(self.db.execute('SELECT id,attribute_tag FROM novels WHERE id>=3000'))
         self.assertEqual(actual, {**{3000+i: '漫画' for i in range(20)},
             4000: '漫画', 4001: '小説', 4002: '漫画'})
@@ -92,15 +96,29 @@ class SqlAccessPathTests(unittest.TestCase):
             self.novel(int(key), '小説' if key in ('20002', '20003') else '漫画')
         self.db.execute("INSERT INTO app_state(scope,key,value_json) VALUES ('inv','virtual_novel_members',?)",
                         (json.dumps(groups),))
-        self.bounded(CLASSIFY_SQL, (), 10000)
+        self.bounded(CLASSIFY_SQL, (None, None), 10000)
         self.assertEqual(dict(self.db.execute('SELECT id,attribute_tag FROM novels WHERE id>=20001')),
                          {20001: '小説', 20002: '漫画', 20003: '小説', 20004: '漫画', 20005: '漫画'})
         # No cached classification may hide changes made by another invocation.
         self.db.execute("UPDATE novels SET attribute_tag='漫画' WHERE id=1")
         self.novel(99999, '小説')
-        self.bounded(CLASSIFY_SQL, (), 10000)
+        self.bounded(CLASSIFY_SQL, (None, None), 10000)
         self.assertEqual(dict(self.db.execute('SELECT id,attribute_tag FROM novels WHERE id BETWEEN 20001 AND 20005')),
                          {20001: '小説', 20002: '漫画', 20003: '漫画', 20004: '小説', 20005: '漫画'})
+
+    def test_virtual_reconcile_probe_is_bounded_and_continues_by_parent_id(self):
+        self.novel(1, '漫画')
+        groups = {}
+        for parent in range(100, 140):
+            self.novel(parent, '小説')
+            groups[str(parent)] = [1]
+        self.db.execute("INSERT INTO app_state(scope,key,value_json) VALUES ('inv','virtual_novel_members',?)",
+                        (json.dumps(groups),))
+        first = self.bounded(CANDIDATES_SQL, (None, None), 30000)
+        self.assertEqual(first, [(parent,) for parent in range(100, 132)])
+        second = self.bounded(CANDIDATES_SQL, (None, first[-1][0]), 10000)
+        self.assertEqual(second, [(parent,) for parent in range(132, 140)])
+        self.assertEqual(self.bounded(CANDIDATES_SQL, (None, second[-1][0]), 1000), [])
 
     def test_admission_aliases_follow_identity_changes_and_rollback(self):
         self.novel(1, '小説')

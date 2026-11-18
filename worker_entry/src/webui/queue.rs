@@ -53,6 +53,7 @@ use narou_rs::application::webui::queue_view::{
     queue_type_label,
 };
 use narou_rs::application::webui::tag_views::tag_list_html;
+use narou_rs::application::webui::config::TagListConfig;
 use narou_rs::application::webui::tag_order::{TagSortOrder, sort_tags};
 
 use super::{json_error, query_param};
@@ -87,6 +88,13 @@ FROM novels WHERE attribute_tag IS NOT NULL
 GROUP BY attribute_tag COLLATE BINARY
 "#;
 
+// All three tag-list settings are local. Read only these indexed keys, in the
+// same UI-session snapshot as the tag aggregate, not the whole local scope.
+const TAG_SETTINGS_SQL: &str = r#"
+SELECT key, value_yaml, value_json FROM app_state
+WHERE scope='local' AND key IN (?1, ?2, ?3)
+"#;
+
 const QUEUE_COUNTS_SQL: &str = r#"
 SELECT CASE WHEN reason = 1 THEN 'cancelled' ELSE status END AS status, lane, n
 FROM worker_job_counts
@@ -115,9 +123,59 @@ struct TagName {
     first_novel_id: i64,
 }
 
-async fn select_tag_names(db: &DbHandle) -> Result<Vec<TagName>> {
-    let result = db.prepare(TAG_NAMES_SQL).all().await?;
-    result.results::<TagName>()
+#[derive(Deserialize)]
+struct TagSetting {
+    key: String,
+    value_yaml: String,
+    value_json: String,
+}
+
+fn tag_list_config(rows: Vec<TagSetting>) -> Result<TagListConfig> {
+    use narou_rs::application::tag_colors::{NEW_TAG_COLOR_SETTING, is_valid_tag_color};
+    use narou_rs::application::webui::tag_order::TAG_SORT_ORDER_SETTING;
+
+    let mut config = TagListConfig {
+        sort_order: TagSortOrder::default(),
+        attribute_tags_enabled: false,
+        new_tag_color: None,
+    };
+    for row in rows {
+        let value = crate::d1_repository::parse_setting_value(&row.value_yaml, &row.value_json)
+            .map_err(|error| worker::Error::RustError(error.to_string()))?;
+        match row.key.as_str() {
+            NEW_TAG_COLOR_SETTING => {
+                config.new_tag_color = value.as_str()
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .filter(|value| is_valid_tag_color(value));
+            }
+            "tag.attributes-enabled" => {
+                config.attribute_tags_enabled = narou_rs::setting_core::setting_bool_value(&value)
+                    .unwrap_or(false);
+            }
+            TAG_SORT_ORDER_SETTING => {
+                config.sort_order = TagSortOrder::from_setting(value.as_str());
+            }
+            _ => {}
+        }
+    }
+    Ok(config)
+}
+
+async fn select_tag_inputs(db: &DbHandle) -> Result<(TagListConfig, Vec<TagName>)> {
+    let results = db.batch(vec![
+        db.prepare(TAG_NAMES_SQL),
+        db.prepare(TAG_SETTINGS_SQL).bind(&[
+            JsValue::from_str(narou_rs::application::tag_colors::NEW_TAG_COLOR_SETTING),
+            JsValue::from_str("tag.attributes-enabled"),
+            JsValue::from_str(narou_rs::application::webui::tag_order::TAG_SORT_ORDER_SETTING),
+        ])?,
+    ]).await?;
+    crate::d1_repository::ensure_batch_success(&results)
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let [tags, settings] = results.as_slice() else {
+        return Err(worker::Error::RustError("tag inputs batch returned an unexpected result count".into()));
+    };
+    Ok((tag_list_config(settings.results::<TagSetting>()?)?, tags.results::<TagName>()?))
 }
 
 async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
@@ -144,14 +202,10 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         .ok()
         .and_then(|url| query_param(&url, "format"));
 
-    // Independent reads overlap; never materialize all NovelRecords for tags.
-    let (config, tag_rows) = futures::join!(
-        narou_rs::application::webui::config::load_tag_list(&services.settings),
-        select_tag_names(&services.db),
-    );
-    let (config, mut tag_rows) = match (config, tag_rows) {
-        (Ok(config), Ok(rows)) => (config, rows),
-        _ => return Response::error("Service unavailable", 503),
+    // One bounded read batch; never materialize NovelRecords or frozen IDs.
+    let (config, mut tag_rows) = match select_tag_inputs(&services.db).await {
+        Ok(inputs) => inputs,
+        Err(_) => return Response::error("Service unavailable", 503),
     };
     if config.attribute_tags_enabled {
         let result = services.db.prepare(ATTRIBUTE_NAMES_SQL).all().await?;
@@ -163,41 +217,44 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         .map(|row| row.tag.clone())
         .filter(|tag| !narou_rs::virtual_novel::is_internal_tag(tag))
         .collect::<Vec<_>>();
-    let tag_colors = match services.tag_colors
-        .for_tags(tags.clone(), config.new_tag_color.as_deref()).await
-    {
-        Ok(colors) => colors,
-        Err(_) => return Response::error("Service unavailable", 503),
-    };
 
     // 並び順 (お気に入り優先 / アルファベット順 / 件数順 / 登録順) は
     // native と同じ共有実装で決める。
     let order = config.sort_order;
-    let favorites = if order == TagSortOrder::FavoritesFirst {
-        match crate::favorite_tags::load_with_db(&services.db).await {
-            Ok(state) => state.tags,
-            Err(_) => return Response::error("Service unavailable", 503),
-        }
-    } else {
-        Vec::new()
-    };
-    let mut counts = std::collections::HashMap::new();
-    for row in &tag_rows {
-        counts.insert(row.tag.clone(), row.n.max(0) as usize);
-    }
-    let registered = if order == TagSortOrder::Registered {
-        let sequence = match crate::tag_sequence::load_with_db(&services.db).await {
-            Ok(sequence) => sequence,
-            Err(_) => return Response::error("Service unavailable", 503),
+    let sort_inputs = async {
+        // Favorites must remain primary-fresh after edits. Registration order
+        // stays on the UI session, alongside the tag aggregate.
+        let favorites = if order == TagSortOrder::FavoritesFirst {
+            crate::favorite_tags::load_with_db(&services.db).await?.tags
+        } else {
+            Vec::new()
         };
-        let library: Vec<(String, i64)> = tag_rows
-            .iter()
-            .filter(|row| !narou_rs::virtual_novel::is_internal_tag(&row.tag))
-            .map(|row| (row.tag.clone(), row.first_novel_id))
-            .collect();
-        narou_rs::application::tag_sequence::registered_ranks(&sequence, &library)
-    } else {
-        std::collections::HashMap::new()
+        let mut counts = std::collections::HashMap::new();
+        for row in &tag_rows {
+            counts.insert(row.tag.clone(), row.n.max(0) as usize);
+        }
+        let registered = if order == TagSortOrder::Registered {
+            let sequence = crate::tag_sequence::load_with_db(&services.db).await?;
+            let library: Vec<(String, i64)> = tag_rows
+                .iter()
+                .filter(|row| !narou_rs::virtual_novel::is_internal_tag(&row.tag))
+                .map(|row| (row.tag.clone(), row.first_novel_id))
+                .collect();
+            narou_rs::application::tag_sequence::registered_ranks(&sequence, &library)
+        } else {
+            std::collections::HashMap::new()
+        };
+        Ok::<_, narou_rs::error::NarouError>((favorites, counts, registered))
+    };
+    // Color Ensure retains its primary CAS/write semantics. Its independent
+    // read (and any publication) overlaps the one required ordering-state read.
+    let (tag_colors, sort_inputs) = futures::join!(
+        services.tag_colors.for_tags(tags.clone(), config.new_tag_color.as_deref()),
+        sort_inputs,
+    );
+    let (tag_colors, (favorites, counts, registered)) = match (tag_colors, sort_inputs) {
+        (Ok(colors), Ok(inputs)) => (colors, inputs),
+        _ => return Response::error("Service unavailable", 503),
     };
     let tags = sort_tags(
         order,

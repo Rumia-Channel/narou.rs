@@ -351,10 +351,14 @@ async fn composition(db: &DbHandle, members: &[i64]) -> Result<AttributeComposit
     Ok(result)
 }
 
+/// Probe the migration marker and the first reconciliation page in one primary
+/// read batch. Return false before any writes when legacy migration is needed.
+/// No cache can hide member changes made by another invocation.
+///
 /// Reconcile only virtual rows, keeping a mixed work's stored selection.
 /// CROSS JOIN keeps members on the outside of the primary-key probes; otherwise
 /// the attribute index can make SQLite scan every manga for each group.
-pub(crate) async fn reconcile_attributes(db: &DbHandle) -> Result<()> {
+pub(crate) async fn reconcile_attributes(db: &DbHandle) -> Result<bool> {
     const CLASSIFIED: &str = r#"
 WITH groups AS (
   SELECT CAST(g.key AS INTEGER) AS id, g.value AS members
@@ -374,18 +378,26 @@ WITH groups AS (
 "#;
     #[derive(Deserialize)] struct Candidate { id: i64 }
     let db = db.primary_view();
+    let enumerate = format!("{CLASSIFIED} SELECT c.id FROM classified c JOIN novels n ON n.id=c.id WHERE n.attribute_tag IS NOT c.attribute ORDER BY c.id LIMIT 32");
+    let results = db.batch(vec![
+        db.prepare("SELECT 1 AS initialized FROM app_state WHERE scope='inv' AND key=?1")
+            .bind(&[JsValue::from_str(crate::d1_repository::ATTRIBUTE_MARKER)]).map_err(db_error)?,
+        db.prepare(&enumerate).bind(&[JsValue::NULL, JsValue::NULL]).map_err(db_error)?,
+    ]).await.map_err(db_error)?;
+    crate::d1_repository::ensure_batch_success(&results)?;
+    if results.len() != 2 { return Err(db_error("attribute probe batch returned an unexpected result count")); }
+    if results[0].results::<serde_json::Value>().map_err(db_error)?.is_empty() {
+        return Ok(false);
+    }
+    let mut page = results[1].results::<Candidate>().map_err(db_error)?;
+    if page.is_empty() { return Ok(true); }
     let repository = crate::d1_repository::D1NovelRepository::new(db.clone());
     let objects: Arc<dyn narou_rs::platform::ObjectStore> = Arc::new(crate::d1_object_store::D1ObjectStore::new(db.clone()));
     let storage = crate::d1_object_store::D1ObjectStore::new(db.clone());
-    let enumerate = format!("{CLASSIFIED} SELECT c.id FROM classified c JOIN novels n ON n.id=c.id WHERE n.attribute_tag IS NOT c.attribute ORDER BY c.id LIMIT 32");
     let update = format!("{CLASSIFIED} UPDATE novels SET attribute_tag=(SELECT attribute FROM classified WHERE classified.id=novels.id) WHERE id IN (SELECT id FROM classified) AND attribute_tag IS NOT (SELECT attribute FROM classified WHERE classified.id=novels.id)");
-    let mut after = None;
-    loop {
-        let page = db.prepare(&enumerate).bind(&[JsValue::NULL, after.map(|id: i64| JsValue::from_f64(id as f64)).unwrap_or(JsValue::NULL)])
-            .map_err(db_error)?.all().await.map_err(db_error)?.results::<Candidate>().map_err(db_error)?;
-        if page.is_empty() { return Ok(()); }
+    while let Some(last) = page.last() {
+        let after = last.id;
         for candidate in page {
-            after = Some(candidate.id);
             let Some(record) = repository.get(candidate.id.into()).await? else { continue; };
             repository.bind_record_origin(&record).await?;
             let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
@@ -418,7 +430,10 @@ WITH groups AS (
                 return Err(error);
             }
         }
+        page = db.prepare(&enumerate).bind(&[JsValue::NULL, JsValue::from_f64(after as f64)])
+            .map_err(db_error)?.all().await.map_err(db_error)?.results::<Candidate>().map_err(db_error)?;
     }
+    Ok(true)
 }
 
 #[derive(Deserialize)]

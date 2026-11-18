@@ -43,6 +43,12 @@ class UiMetadataSqlTests(unittest.TestCase):
                 options TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, last_error TEXT
             );
             CREATE INDEX jobs_status ON worker_jobs(status);
+            CREATE INDEX novel_tags_exact_tag_idx ON novel_tags(tag, novel_id);
+            CREATE TABLE app_state (
+                scope TEXT NOT NULL, key TEXT NOT NULL,
+                value_json TEXT NOT NULL, value_yaml TEXT NOT NULL,
+                PRIMARY KEY(scope, key)
+            );
         """)
         self.db.executescript(COUNT_MIGRATION)
 
@@ -53,7 +59,10 @@ class UiMetadataSqlTests(unittest.TestCase):
     def query(self, name, params=None):
         self.assertIn(name, SQL, "test must use the production SQL, not a copied query")
         if params is None:
-            params = ("", "", "", 1000) if "?" in SQL[name] else ()
+            if name == "TAG_SETTINGS_SQL":
+                params = ("webui.new-tag-color", "tag.attributes-enabled", "webui.tag-sort-order")
+            else:
+                params = ("", "", "", 1000) if "?" in SQL[name] else ()
         return [dict(row) for row in self.db.execute(SQL[name], params)]
 
     def test_empty_library_and_queue(self):
@@ -115,6 +124,28 @@ class UiMetadataSqlTests(unittest.TestCase):
         rows = self.query("TAG_NAMES_SQL")
         self.assertEqual({r["tag"]: r["n"] for r in rows}, {"冒険": 2, "SF": 1})
         self.assertEqual({r["tag"]: r["first_novel_id"] for r in rows}, {"冒険": 2, "SF": 2})
+
+    def test_tag_settings_only_read_the_three_requested_local_keys(self):
+        selected = ("webui.new-tag-color", "tag.attributes-enabled", "webui.tag-sort-order")
+        self.db.executemany("INSERT INTO app_state VALUES ('local', ?, ?, ?)",
+                            ((key, '"blue"', "blue") for key in selected))
+        self.db.executemany("INSERT INTO app_state VALUES ('local', ?, ?, ?)",
+                            ((f"unrelated-{index}", "invalid JSON", "[" + "x" * 10000)
+                             for index in range(100)))
+        self.db.execute("INSERT INTO app_state VALUES ('global', ?, 'false', 'false')",
+                        (selected[1],))
+        rows = self.query("TAG_SETTINGS_SQL")
+        self.assertEqual({row["key"] for row in rows}, set(selected))
+        self.assertTrue(all(row["value_yaml"] == "blue" for row in rows))
+        plan = self.db.execute("EXPLAIN QUERY PLAN " + SQL["TAG_SETTINGS_SQL"], selected).fetchall()
+        self.assertTrue(any("SEARCH app_state" in row["detail"] and "key=?" in row["detail"] for row in plan),
+                        [dict(row) for row in plan])
+
+    def test_tag_aggregate_uses_the_covering_exact_tag_index(self):
+        plan = self.db.execute("EXPLAIN QUERY PLAN " + SQL["TAG_NAMES_SQL"]).fetchall()
+        self.assertTrue(any("COVERING INDEX novel_tags_exact_tag_idx" in row["detail"] for row in plan),
+                        [dict(row) for row in plan])
+        self.assertFalse(any("novels" in row["detail"] for row in plan))
 
     def test_large_pending_queue_returns_counts_not_payloads(self):
         count = 10000

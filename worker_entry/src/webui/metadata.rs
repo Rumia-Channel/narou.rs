@@ -19,7 +19,6 @@ use crate::db_handle::DbHandle;
 
 pub(crate) struct MetadataServices {
     pub db: DbHandle,
-    pub settings: SettingsService,
     pub tag_colors: TagColorService,
 }
 
@@ -43,20 +42,24 @@ pub(crate) async fn initialize_attributes(env: &Env) -> worker::Result<()> {
         return Ok(());
     }
     let db = primary_database(env)?;
-    let repository = D1NovelRepository::new(db.clone());
-    if repository.attributes_initialized().await.map_err(|error| worker::Error::RustError(error.to_string()))? {
-        crate::virtual_novels::reconcile_attributes(&db).await
-            .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    if crate::virtual_novels::reconcile_attributes(&db).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?
+    {
         return Ok(());
     }
+    let repository = D1NovelRepository::new(db.clone());
     let objects: Arc<dyn narou_rs::platform::ObjectStore> =
         Arc::new(crate::d1_object_store::D1ObjectStore::new(db));
     let sites = crate::bundled_sites::load_site_settings_uncached(&objects).await
         .map_err(|error| worker::Error::RustError(error.to_string()))?;
     repository.initialize_attributes(&sites).await
         .map_err(|error| worker::Error::RustError(error.to_string()))?;
-    crate::virtual_novels::reconcile_attributes(&primary_database(env)?).await
-        .map_err(|error| worker::Error::RustError(error.to_string()))
+    let initialized = crate::virtual_novels::reconcile_attributes(&primary_database(env)?).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    if !initialized {
+        return Err(worker::Error::RustError("attribute migration marker disappeared during initialization".into()));
+    }
+    Ok(())
 }
 
 pub(crate) fn settings(env: &Env) -> worker::Result<SettingsService> {
@@ -77,7 +80,6 @@ impl MetadataServices {
     pub(crate) fn new(env: &Env) -> worker::Result<Self> {
         let db = database(env)?;
         Ok(Self {
-            settings: SettingsService::new(Arc::new(D1SettingsStore::new(db.clone()))),
             tag_colors: TagColorService::new(Arc::new(D1TagColorStore::new(db.clone()))),
             db,
         })

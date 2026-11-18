@@ -48,7 +48,7 @@ try {
   assert.equal(manga.attribute_tag,'漫画'); assert.equal(manga.mixed,false);
   // A legacy misclassified virtual row is repaired before normal indexed reads.
   sql(`UPDATE novels SET attribute_tag='小説' WHERE id=${r.data.id}`);
-  await api('/api/list?all=true');
+  assert.equal((await api('/api/tag_list?format=json')).status,200);
   manga = (await api('/api/virtual_novels')).data.novels.find(n=>n.id===r.data.id);
   assert.equal(manga.attribute_tag,'漫画');
   // Preserve the manual choice when the member set remains mixed.
@@ -59,7 +59,7 @@ try {
   // an isolate cache expiry; returning to mixed keeps the last chosen value.
   await api(`/api/virtual_novels/${mixedId}/attribute`,{attribute_tag:'小説'});
   sql(`UPDATE novels SET attribute_tag='漫画' WHERE id=${ids[0]}`);
-  await api('/api/list?all=true');
+  assert.equal((await api('/api/tag_list?format=json')).status,200);
   assert.equal((await api('/api/virtual_novels')).data.novels.find(n=>n.id===mixedId).attribute_tag,'漫画');
   sql(`UPDATE novels SET attribute_tag='小説' WHERE id=${ids[0]}`);
   await api('/api/list?all=true');
