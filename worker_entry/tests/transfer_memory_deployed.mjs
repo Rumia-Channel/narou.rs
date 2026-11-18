@@ -4,7 +4,10 @@
 // isolated, disposable test D1 library before invoking this driver.
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
+import {writeFileSync} from 'node:fs';
+import {isAbsolute} from 'node:path';
 import {brotliCompressSync,crc32} from 'node:zlib';
+import {MAX_TRACE_ATTEMPTS,PREFLIGHT_ATTEMPTS,TRACE_HEADER} from '../ci/transfer_trace.mjs';
 import {fixtureNovel,selectionDigest,sourceNamespaceContracts,transferClient,waitForDeployedTransfer} from './transfer.mjs';
 
 const base=new URL(process.env.NAROU_TRANSFER_TEST_URL??'https://missing.invalid');
@@ -12,6 +15,21 @@ assert.equal(base.protocol,'https:','NAROU_TRANSFER_TEST_URL must be a deployed 
 assert(base.hostname.endsWith('.workers.dev'),'this test requires real Cloudflare Workers, not local workerd');
 const token=process.env.NAROU_TRANSFER_TEST_TOKEN;
 assert(token,'NAROU_TRANSFER_TEST_TOKEN is required for the disposable test fixture');
+const traceRun=process.env.NAROU_TRACE_RUN;
+assert.match(traceRun??'',/^[0-9a-f]{16}$/,'NAROU_TRACE_RUN must be a fixture nonce');
+const receiptsPath=process.env.NAROU_TRACE_RECEIPTS;
+assert(receiptsPath&&isAbsolute(receiptsPath),'NAROU_TRACE_RECEIPTS must be an absolute private path');
+const ledger=[];
+async function tracedFetch(url,init={}){
+  const seq=ledger.length+1;
+  assert(seq<=MAX_TRACE_ATTEMPTS-PREFLIGHT_ATTEMPTS,'transfer trace attempt limit exceeded');
+  const headers=new Headers(init.headers);
+  headers.set(TRACE_HEADER,`${traceRun}:${seq}`);
+  ledger.push(0); // A fetch failure before any response.
+  const response=await fetch(url,{...init,headers,redirect:'manual'});
+  ledger[seq-1]=response.status;
+  return response;
+}
 const caseGroups={
   metadata:['bounded_metadata_fragments','50000_entry_aliased_index_ack_reuse','16MiB_legacy_initializer_ack_reuse'],
   publication:['17MiB_bounded_wire','runtime_complete','overwrite_skip','create_control_replay','partial_batch_sha_receipts','raw_forbidden','canonical_commit_ack_loss','cancel_before_commit','virtual_members_frozen_order'],
@@ -20,7 +38,7 @@ const caseGroups={
 const caseGroup=process.env.NAROU_TRANSFER_CASE_GROUP??'all';
 assert(caseGroup==='all'||Object.hasOwn(caseGroups,caseGroup),'unknown transfer case group');
 const groups=caseGroup==='all'?Object.keys(caseGroups):[caseGroup];
-const client=transferClient(base.origin,token,{verifyPrimary:true});
+const client=transferClient(base.origin,token,{verifyPrimary:true,fetcher:tracedFetch});
 // Keep diagnostics bounded and omit credentials, payload text and raw backend errors.
 const request=client.request;
 let requestNumber=0,lastFailure;
@@ -40,6 +58,9 @@ client.request=async(path,init={})=>{
   return response;
 };
 await waitForDeployedTransfer(client);
+// Readiness tolerates edge routing convergence. Exercise the actual primary
+// capability route again, now requiring a receipt like every other case.
+await client.caps();
 const slug=`memory-${randomUUID()}`;
 const observe=async session=>(await client.json(`/_fixture/transfer-observe?session=${session.status.session_id}`)).body;
 async function select(session,profile='runtime',roles=[]){const catalog=await session.pages('catalog');await session.op('select',{profile,extra_roles:roles,selection_digest:selectionDigest(session.status.catalog_revision,profile,roles,catalog)});}
@@ -49,9 +70,17 @@ async function faultStep(session,mode){
   if(fired)assert([423,500,503].includes(response.status),text);else{assert.equal(response.status,200,text);session.status=JSON.parse(text);}return{init,fired};
 }
 async function replayStep(session,attempt){const replay=await client.json(`${session.path}/advance`,{...attempt.init,headers:session.headers({'content-type':'application/json'})});assert.equal(replay.response.status,200,JSON.stringify(replay.body));session.status=replay.body;}
-assert.equal((await fetch(`${base.origin}/api/transfer/v2/capabilities`)).status,401);
-assert.equal((await client.request('/api/transfer/export?ids=1')).status,404);
-assert.equal((await client.request('/api/transfer/import',{method:'POST',body:'retired'})).status,404);
+const unauth=await tracedFetch(`${base.origin}/api/transfer/v2/capabilities`);
+// Drain the small body before asserting. A discarded body can cancel the
+// request and change the outcome the tail records for this attempt.
+await unauth.arrayBuffer();
+assert.equal(unauth.status,401);
+const retiredExport=await client.request('/api/transfer/export?ids=1');
+await retiredExport.arrayBuffer();
+assert.equal(retiredExport.status,404);
+const retiredImport=await client.request('/api/transfer/import',{method:'POST',body:'retired'});
+await retiredImport.arrayBuffer();
+assert.equal(retiredImport.status,404);
 if(groups.includes('metadata')){
 const story='\x01'.repeat(3*1024*1024);
 const novel=fixtureNovel(slug,[],{subtitle:story});
@@ -125,7 +154,7 @@ const needed=(await partial.pages('files')).filter(file=>file.upload_required);c
 const partialResult=await partial.batch(recordsToSend);assert.equal(partialResult.receipts.length,1);assert(partialResult.failure);const confirmed=(await partial.get()).confirmed_bytes;assert.equal((await partial.batch([recordsToSend[0]])).receipts[0].outcome,'duplicate');assert.equal((await partial.get()).confirmed_bytes,confirmed);await partial.upload();await partial.op('ready');await partial.op('publish',{plan_revision:partial.status.plan_revision});await partial.until(value=>value.state==='completed');await partial.drain();
 const raw=await client.createImport([fixtureNovel(`${slug}-raw`,[{path:'raw/page.html',bytes:Buffer.from('<html/>')}])],{profile:'complete'});await raw.manifest();await raw.until(value=>value.state==='failed');assert.match(raw.status.error,/file_policy/);await raw.drain();
 
-const uncertain=transferClient(base.origin,token,{verifyPrimary:true});uncertain.extraHeaders={'x-narou-test-transfer-fault':'commit_after'};const uncertainNovel=fixtureNovel(`${slug}-commit-ack`);assert.equal((await uncertain.importData([uncertainNovel])).status.state,'completed');assert(uncertain.faults>0);assert.equal((await client.json('/api/novels?limit=1000')).body.data.filter(row=>row.toc_url===uncertainNovel.toc_url).length,1);
+const uncertain=transferClient(base.origin,token,{verifyPrimary:true,fetcher:tracedFetch});uncertain.extraHeaders={'x-narou-test-transfer-fault':'commit_after'};const uncertainNovel=fixtureNovel(`${slug}-commit-ack`);assert.equal((await uncertain.importData([uncertainNovel])).status.state,'completed');assert(uncertain.faults>0);assert.equal((await client.json('/api/novels?limit=1000')).body.data.filter(row=>row.toc_url===uncertainNovel.toc_url).length,1);
 const blocked=await client.createImport([fixtureNovel(`${slug}-bounded`,[{path:'notes.bin',bytes:Buffer.from('must not publish')}])],{policy:'overwrite'});await blocked.manifest();await blocked.until(value=>value.state==='transferring');await blocked.upload();await blocked.op('ready');await blocked.op('publish',{plan_revision:blocked.status.plan_revision});
 for(let step=0;step<100;step++){if((await observe(blocked)).publications[0]?.state==='committing')break;await blocked.step();}
 await blocked.get();assert((await faultStep(blocked,'commit_before')).fired);assert.equal((await observe(blocked)).targets[0].committed,0);await blocked.cancel();assert.equal((await client.exportData([originalId])).files.get('novels/0/notes.bin').toString(),'replacement');
@@ -157,4 +186,6 @@ assert(client.memoryHighWater>0,'the deployed production WASM must be instrument
 assert(client.memoryHighWater<112*1024*1024,`WASM highwater ${client.memoryHighWater} leaves insufficient room in the enforced 128 MiB isolate`);
 assert(client.requests.filter(request=>request.type==='application/octet-stream').every(request=>request.bytes<=8*1024*1024));
 assert(client.requests.every(request=>request.type!=='application/zip'));
-console.log(JSON.stringify({passed:true,case_group:caseGroup,platform:'Cloudflare Workers',enforced_isolate_bytes:128*1024*1024,wasm_highwater_bytes:client.memoryHighWater,scenarios:groups.flatMap(group=>caseGroups[group])}));
+// The parent reads this file only after the driver exits successfully.
+writeFileSync(receiptsPath,JSON.stringify(ledger),{flag:'wx',mode:0o600});
+console.log(JSON.stringify({passed:true,case_group:caseGroup,platform:'Cloudflare Workers',enforced_isolate_bytes:128*1024*1024,wasm_highwater_bytes:client.memoryHighWater,trace_attempts:ledger.length,scenarios:groups.flatMap(group=>caseGroups[group])}));

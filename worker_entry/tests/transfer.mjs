@@ -13,6 +13,8 @@ const CHUNK=8*1024*1024-64*1024;
 const WIRE=8*1024*1024;
 export const sha256=bytes=>createHash('sha256').update(bytes).digest('hex');
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+// A discarded body can cancel the invocation we are trying to observe.
+async function drainResponse(response){await response.body?.pipeTo(new WritableStream()).catch(()=>{});}
 function assertFileBytes(actual,expected,path){
   assert(actual!==undefined,`${path}: missing file`);
   assert.equal(actual.length,expected.length,`${path}: byte length`);
@@ -107,7 +109,7 @@ export async function waitForDeployedTransfer(client){
     return;
   }
 }
-export function transferClient(base,token,{verifyPrimary=false}={}){
+export function transferClient(base,token,{verifyPrimary=false,fetcher=fetch}={}){
   const client={base,token,verifyPrimary,requests:[],
     async request(path,init={}){const bytes=init.body===undefined?0:Buffer.byteLength(init.body);if(init.headers?.['content-type']==='application/octet-stream')assert(bytes<=WIRE);
       const v2=client.verifyPrimary&&path.startsWith('/api/transfer/v2/');
@@ -120,7 +122,7 @@ export function transferClient(base,token,{verifyPrimary=false}={}){
         let delay = 100 * (attempt + 1);
         let reason;
         try {
-          response = await fetch(client.base + path, request);
+          response = await fetcher(client.base + path, request);
         } catch (error) {
           const code = error?.cause?.code;
           if (!retryAvailable || request.signal?.aborted || !['ECONNRESET','UND_ERR_SOCKET'].includes(code)) throw error;
@@ -132,10 +134,11 @@ export function transferClient(base,token,{verifyPrimary=false}={}){
           if (!retryAvailable || (!edge404 && !edge5xx)) break;
           delay = edge404 ? 1000 : delay;
           reason = {status:response.status};
-          await response.body?.cancel();
+          // Do not turn a completed response into a canceled invocation.
+          await drainResponse(response);
         }
-        // No new IDs, tickets, secrets or bodies. The live tail must still
-        // observe every invocation and fails the whole exercise if coverage is lost.
+        // Preserve operation identity on replay. The fetcher assigns each
+        // wire attempt a different trace sequence in the deployed fixture.
         console.log(JSON.stringify({event:'transfer_edge_retry',...reason,attempt:attempt+1,path}));
         await sleep(delay);
       }
