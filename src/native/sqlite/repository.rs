@@ -21,6 +21,18 @@ use crate::error::{NarouError, Result};
 use crate::native::sqlite::record_map::{query_bind, record_from_row, record_params};
 use crate::platform::{NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository};
 
+// Drive both primary-key probes from the selected namespaces, never from the
+// binding table: legacy rows may not have a binding yet. SQL→FS handoffs retire
+// SQL admission even when a stale/open gate row remains.
+const UNAVAILABLE_METADATA_PREFIX_SQL: &str = "
+    SELECT selected.value
+    FROM json_each(?1) AS selected
+    LEFT JOIN novel_access_gates AS gate ON gate.prefix = selected.value
+    LEFT JOIN fs_gate_handoffs AS handoff ON handoff.prefix = selected.value
+    WHERE gate.closed <> 0 OR handoff.prefix IS NOT NULL
+    ORDER BY CAST(selected.key AS INTEGER)
+    LIMIT 1";
+
 /// Shared guarded connection. Every operation runs on a blocking thread; the
 /// mutex serializes writers, matching the single-writer policy in the plan.
 #[derive(Clone)]
@@ -70,6 +82,62 @@ impl SqliteNovelRepository {
     pub(crate) fn ncode_snapshot_conn(conn:&Connection,ncode:&str)->Result<Option<NovelRecord>>{let folded=fold(ncode);let mut statement=conn.prepare(&select_by_ncode_sql()).map_err(super::sqlite_error)?;let mut rows=statement.query([folded.as_str();3]).map_err(super::sqlite_error)?;rows.next().map_err(super::sqlite_error)?.map(record_from_row).transpose()}
     pub(crate) fn count_snapshot_conn(conn:&Connection,filter:&NovelFilter)->Result<u64>{let SqlQuery{sql,binds}=novel_query::count_sql(filter,query_bind);let count:i64=conn.query_row(&sql,params_from_iter(binds.iter()),|row|row.get(0)).map_err(super::sqlite_error)?;u64::try_from(count).map_err(|_|NarouError::Platform("negative record count".into()))}
     pub(crate) fn scan_snapshot_conn(conn:&Connection,filter:&NovelFilter,after:Option<NovelId>,limit:usize)->Result<Vec<NovelId>>{let SqlQuery{sql,binds}=novel_query::scan_ids_sql(filter,after,limit,query_bind);let mut statement=conn.prepare(&sql).map_err(super::sqlite_error)?;statement.query_map(params_from_iter(binds.iter()),|row|row.get::<_,i64>(0).map(NovelId)).map_err(super::sqlite_error)?.collect::<std::result::Result<_,_>>().map_err(super::sqlite_error)}
+
+    fn frozen_snapshot_conn(conn: &Connection) -> Result<HashSet<i64>> {
+        let mut statement = conn.prepare("SELECT novel_id FROM frozen_novels")
+            .map_err(super::sqlite_error)?;
+        statement.query_map([], |row| row.get::<_, i64>(0))
+            .map_err(super::sqlite_error)?
+            .collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(super::sqlite_error)
+    }
+
+    /// The caller owns one read transaction for records, counts, freeze state
+    /// and admission. No content is opened and no durable reader lease is needed:
+    /// a concurrent close/publication/delete is either entirely before this
+    /// snapshot (and rejected when closed), or entirely after its metadata view.
+    pub(crate) fn metadata_page_snapshot_conn(
+        transaction: &rusqlite::Transaction<'_>,
+        query: &NovelQuery,
+        frozen_ids: HashSet<i64>,
+    ) -> Result<crate::platform::repository::NovelMetadataPage> {
+        let records = Self::query_snapshot_conn(transaction, query)?;
+        let unbounded = query.offset == 0 && query.limit == usize::MAX;
+        let unrestricted = query.filter.is_unrestricted();
+        let records_total = if unbounded && unrestricted {
+            records.len() as u64
+        } else {
+            Self::count_snapshot_conn(transaction, &NovelFilter::all())?
+        };
+        let records_filtered = if unrestricted {
+            records_total
+        } else if unbounded {
+            records.len() as u64
+        } else {
+            Self::count_snapshot_conn(transaction, &query.filter)?
+        };
+        if !records.is_empty() {
+            let prefixes = records.iter().map(|record| {
+                crate::platform::NovelObjectKeys::new(
+                    &record.sitename, &record.file_title, record.use_subdirectory,
+                ).map(|keys| keys.prefix().as_ref().trim_end_matches('/').to_owned())
+            }).collect::<Result<Vec<_>>>()?;
+            let prefixes = serde_json::to_string(&prefixes)
+                .map_err(|error| NarouError::Platform(error.to_string()))?;
+            use rusqlite::OptionalExtension;
+            let unavailable: Option<String> = transaction.query_row(
+                UNAVAILABLE_METADATA_PREFIX_SQL, [prefixes], |row| row.get(0),
+            ).optional().map_err(super::sqlite_error)?;
+            if let Some(prefix) = unavailable {
+                return Err(crate::platform::access_fence::gate_closed_error(
+                    &crate::platform::ObjectPrefix::new(prefix)?,
+                ));
+            }
+        }
+        Ok(crate::platform::repository::NovelMetadataPage {
+            records_total, records_filtered, records, frozen_ids,
+        })
+    }
     /// Raw connection handle for `bulk` persistence helpers.
     pub(crate) fn conn_handle(&self) -> Arc<Mutex<Connection>> {
         self.conn.clone()
@@ -220,6 +288,19 @@ impl NovelRepository for SqliteNovelRepository {
     fn get_current<'a>(&'a self,id:NovelId)->crate::platform::PlatformFuture<'a,Result<Option<NovelRecord>>>{Box::pin(blocking(self.conn.clone(),move|conn|Self::point_snapshot_conn(conn,id)))}
     fn get_many_current<'a>(&'a self,ids:&'a [NovelId])->crate::platform::PlatformFuture<'a,Result<Vec<Option<NovelRecord>>>>{let ids=ids.to_vec();Box::pin(blocking(self.conn.clone(),move|conn|Self::many_snapshot_conn(conn,&ids)))}
     fn query_current<'a>(&'a self,query:&'a NovelQuery)->crate::platform::PlatformFuture<'a,Result<Vec<NovelRecord>>>{self.query(query)}
+    fn metadata_page_snapshot<'a>(
+        &'a self,
+        query: &'a NovelQuery,
+    ) -> crate::platform::PlatformFuture<'a, Result<Option<crate::platform::repository::NovelMetadataPage>>> {
+        let query = query.clone();
+        Box::pin(blocking(self.conn.clone(), move |conn| {
+            let transaction = conn.transaction().map_err(super::sqlite_error)?;
+            let frozen_ids = Self::frozen_snapshot_conn(&transaction)?;
+            let page = Self::metadata_page_snapshot_conn(&transaction, &query, frozen_ids)?;
+            transaction.commit().map_err(super::sqlite_error)?;
+            Ok(Some(page))
+        }))
+    }
     fn find_by_toc_url_current<'a>(&'a self,url:&'a str)->crate::platform::PlatformFuture<'a,Result<Option<NovelRecord>>>{self.find_by_toc_url(url)}
     fn find_by_storage_prefix_current<'a>(&'a self,prefix:&'a crate::platform::ObjectKey)->crate::platform::PlatformFuture<'a,Result<Option<NovelRecord>>>{let prefix=prefix.clone();Box::pin(blocking(self.conn.clone(),move|conn|Self::prefix_snapshot_conn(conn,&prefix)))}
     fn apply_batch_guarded_many<'a>(&'a self,fences:&'a [crate::platform::WriteFence],mutations:Vec<NovelMutation>)->crate::platform::PlatformFuture<'a,Result<()>>{
@@ -515,6 +596,159 @@ mod tests {
         sqlite.apply_batch(mutations.clone()).await.unwrap();
         memory.apply_batch(mutations).await.unwrap();
         (sqlite, memory)
+    }
+
+    #[tokio::test]
+    async fn metadata_page_preserves_filters_counts_pagination_and_freeze_without_writes() {
+        let (sqlite, memory) = seed_both().await;
+        let freeze = SqliteFreezeStore::new(sqlite.conn.clone());
+        freeze.set_frozen(&[NovelId(1)], true).await.unwrap();
+        let before = sqlite.conn.lock().total_changes();
+        for mut filter in [
+            NovelFilter::all(),
+            NovelFilter { ids: Some(Vec::new()), ..Default::default() },
+            NovelFilter { exclude_ids: vec![2], ..Default::default() },
+            NovelFilter {
+                terms: vec![crate::platform::SearchTerm::new(
+                    SearchField::Status, false, vec!["凍結".into()],
+                )],
+                ..Default::default()
+            },
+        ] {
+            filter.frozen_ids = Some(HashSet::from([1]));
+            let total_filtered = memory.count(&filter).await.unwrap();
+            for (offset, limit) in [(0, 0), (0, 1), (1, 1), (0, usize::MAX), (1, usize::MAX), (99, 50)] {
+                let query = NovelQuery::page(filter.clone(), NovelSort::default(), offset, limit);
+                let page = sqlite.metadata_page_snapshot(&query).await.unwrap().unwrap();
+                let expected = memory.query(&query).await.unwrap();
+                assert_eq!(page.records_total, 3);
+                assert_eq!(page.records_filtered, total_filtered);
+                assert_eq!(page.records.iter().map(|record| record.id).collect::<Vec<_>>(),
+                    expected.iter().map(|record| record.id).collect::<Vec<_>>());
+                assert_eq!(page.frozen_ids, HashSet::from([1]));
+            }
+        }
+        let conn = sqlite.conn.lock();
+        assert_eq!(conn.total_changes(), before, "metadata lists must not write gates or leases");
+        let leases: i64 = conn.query_row("SELECT count(*) FROM novel_reader_leases", [], |row| row.get(0)).unwrap();
+        assert_eq!(leases, 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_page_checks_actual_selected_prefixes_without_requiring_bindings() {
+        let (sqlite, _) = seed_both().await;
+        let record = sqlite.get(NovelId(2)).await.unwrap().unwrap();
+        let prefix = crate::platform::NovelObjectKeys::new(
+            &record.sitename, &record.file_title, record.use_subdirectory,
+        ).unwrap().prefix().to_string();
+        {
+            let conn = sqlite.conn.lock();
+            conn.execute("DELETE FROM novel_gate_bindings WHERE novel_id=2", []).unwrap();
+            conn.execute(
+                "INSERT INTO novel_access_gates(prefix,closed,owner,updated_at) VALUES(?1,1,'publication',0)",
+                [&prefix],
+            ).unwrap();
+        }
+        let query = |ids: Vec<NovelId>, offset, limit| NovelQuery::page(
+            NovelFilter { ids: Some(ids), ..Default::default() },
+            NovelSort::default(), offset, limit,
+        );
+        // A closed row outside the requested page must not fail the whole library.
+        let page = sqlite.metadata_page_snapshot(&query(vec![NovelId(1)], 0, 1)).await.unwrap().unwrap();
+        assert_eq!(page.records_total, 3);
+        assert_eq!(page.records[0].id, 1);
+        let selected = query(vec![NovelId(2)], 0, 1);
+        let expected_error = crate::platform::access_fence::gate_closed_error(
+            &crate::platform::ObjectPrefix::new(&prefix).unwrap(),
+        ).to_string();
+        let error = sqlite.metadata_page_snapshot(&selected).await.err().expect("closed selected gate");
+        assert_eq!(error.to_string(), expected_error);
+        for (offset, limit) in [(0, 0), (1, 1)] {
+            let page = sqlite.metadata_page_snapshot(&query(vec![NovelId(2)], offset, limit)).await.unwrap().unwrap();
+            assert_eq!(page.records_filtered, 1);
+            assert!(page.records.is_empty());
+        }
+        {
+            let conn = sqlite.conn.lock();
+            conn.execute("UPDATE novel_access_gates SET closed=0,owner=NULL WHERE prefix=?1", [&prefix]).unwrap();
+            // A wrong/stale binding cannot hide a retired actual namespace.
+            conn.execute("INSERT INTO novel_gate_bindings(novel_id,prefix) VALUES(2,'novels/wrong/binding')", []).unwrap();
+            conn.execute(
+                "INSERT INTO fs_gate_handoffs(prefix,sql_epoch,fs_epoch) VALUES(?1,0,1)",
+                [&prefix],
+            ).unwrap();
+        }
+        let error = sqlite.metadata_page_snapshot(&selected).await.err().expect("retired SQL admission");
+        assert_eq!(error.to_string(), expected_error);
+        sqlite.conn.lock().execute("DELETE FROM novel_access_gates WHERE prefix=?1", [&prefix]).unwrap();
+        let error = sqlite.metadata_page_snapshot(&selected).await.err().expect("handoff without SQL row");
+        assert_eq!(error.to_string(), expected_error);
+
+        let other = SqliteNovelRepository::new(crate::native::sqlite::open_in_memory().unwrap());
+        let page = other.metadata_page_snapshot(&selected).await.unwrap().unwrap();
+        assert_eq!(page.records_total, 0, "snapshots must stay scoped to their connection");
+        assert!(page.records.is_empty());
+    }
+
+    #[test]
+    fn metadata_page_snapshot_pins_rows_counts_freeze_and_gates_across_publication_and_delete() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("library.sqlite");
+        let connection = crate::native::sqlite::open(&path).unwrap();
+        let original = record(1, "before", "author", "https://example.test/1", &[]);
+        let removed = record(2, "removed", "author", "https://example.test/2", &[]);
+        let prefix = crate::platform::NovelObjectKeys::new(
+            &original.sitename, &original.file_title, original.use_subdirectory,
+        ).unwrap().prefix().to_string();
+        let mut conn = connection.lock();
+        upsert_record_conn(&conn, &original).unwrap();
+        upsert_record_conn(&conn, &removed).unwrap();
+        conn.execute("INSERT INTO frozen_novels(novel_id) VALUES(1)", []).unwrap();
+        conn.execute("INSERT INTO novel_access_gates(prefix,updated_at) VALUES(?1,0)", [&prefix]).unwrap();
+        let transaction = conn.transaction().unwrap();
+        // Pin the pre-publication WAL view before another connection commits.
+        assert_eq!(SqliteNovelRepository::count_snapshot_conn(&transaction, &NovelFilter::all()).unwrap(), 2);
+        let mut writer = Connection::open(&path).unwrap();
+        let write = writer.transaction().unwrap();
+        write.execute("UPDATE novel_access_gates SET closed=1,owner='publication',epoch=epoch+1 WHERE prefix=?1", [&prefix]).unwrap();
+        write.execute("UPDATE novels SET title='after',title_fold='after' WHERE id=1", []).unwrap();
+        write.execute("DELETE FROM novels WHERE id=2", []).unwrap();
+        write.execute("DELETE FROM frozen_novels", []).unwrap();
+        write.commit().unwrap();
+        let query = NovelQuery::page(NovelFilter::all(), NovelSort::default(), 0, 50);
+        let frozen = SqliteNovelRepository::frozen_snapshot_conn(&transaction).unwrap();
+        let page = SqliteNovelRepository::metadata_page_snapshot_conn(&transaction, &query, frozen).unwrap();
+        assert_eq!((page.records_total, page.records_filtered), (2, 2));
+        assert_eq!(page.records.iter().map(|record| record.title.as_str()).collect::<Vec<_>>(), ["before", "removed"]);
+        assert_eq!(page.frozen_ids, HashSet::from([1]));
+        transaction.commit().unwrap();
+        let transaction = conn.transaction().unwrap();
+        let frozen = SqliteNovelRepository::frozen_snapshot_conn(&transaction).unwrap();
+        let error = SqliteNovelRepository::metadata_page_snapshot_conn(&transaction, &query, frozen)
+            .err().expect("the new snapshot must reject the closed publication");
+        assert!(error.to_string().contains("novel_recovering:"));
+        transaction.commit().unwrap();
+        writer.execute("UPDATE novel_access_gates SET closed=0,owner=NULL WHERE prefix=?1", [&prefix]).unwrap();
+        let transaction = conn.transaction().unwrap();
+        let frozen = SqliteNovelRepository::frozen_snapshot_conn(&transaction).unwrap();
+        let page = SqliteNovelRepository::metadata_page_snapshot_conn(&transaction, &query, frozen).unwrap();
+        assert_eq!((page.records_total, page.records_filtered), (1, 1));
+        assert_eq!(page.records[0].title, "after");
+        assert!(page.frozen_ids.is_empty());
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn metadata_page_gate_plan_uses_selected_prefix_primary_key_probes() {
+        let conn = crate::native::sqlite::open_in_memory().unwrap();
+        let conn = conn.lock();
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {UNAVAILABLE_METADATA_PREFIX_SQL}")).unwrap();
+        let plan = statement.query_map(["[\"novels/site/book\"]"], |row| row.get::<_, String>(3))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap().join("\n");
+        assert!(plan.contains("SEARCH gate USING PRIMARY KEY (prefix=?)"), "{plan}");
+        assert!(plan.contains("SEARCH handoff USING PRIMARY KEY (prefix=?)"), "{plan}");
+        assert!(!plan.contains("SCAN gate") && !plan.contains("SCAN handoff"), "{plan}");
+        eprintln!("{plan}");
     }
 
     #[test]

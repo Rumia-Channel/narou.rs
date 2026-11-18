@@ -322,17 +322,33 @@ impl LibraryService {
         (filter, sort)
     }
 
-    /// Fetch the library page and validate its rows in the caller's read scope.
+    /// Prefer an atomic metadata-only page; otherwise retain the caller's leases.
     pub async fn list(
         &self,
         scope: &mut crate::application::novel_access::NovelReadScope,
         request: &LibraryListRequest,
     ) -> Result<LibraryPage, ApplicationError> {
-        let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
-        let (filter, sort) = self.prepare_list(request, &frozen_ids);
+        let (filter, sort) = self.prepare_list(request, &HashSet::new());
+        let mut query = NovelQuery::page(
+            filter, sort, request.start, request.length.unwrap_or(usize::MAX),
+        );
+        if let Some(snapshot) = self.novels.metadata_page_snapshot(&query)
+            .await.map_err(ApplicationError::platform)?
+        {
+            let data = self.summarize_records_with_frozen(
+                snapshot.records, request.attribute_tags_enabled, &snapshot.frozen_ids,
+            ).await;
+            return Ok(LibraryPage {
+                records_total: snapshot.records_total,
+                records_filtered: snapshot.records_filtered,
+                data,
+            });
+        }
 
+        let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
+        query.filter.frozen_ids = Some(frozen_ids.clone());
         let (records_total, records_filtered, records) = self
-            .list_records(filter, sort, request.start, request.length)
+            .list_records(query.filter, query.sort, request.start, request.length)
             .await?;
         let admitted = crate::application::novel_content::NovelContentService::read_discovered_records_from(self.novels.as_ref(), scope, &records).await?;
         let mut current = Vec::with_capacity(records.len());

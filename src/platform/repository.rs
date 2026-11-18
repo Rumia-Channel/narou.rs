@@ -366,6 +366,15 @@ impl NovelQuery {
     }
 }
 
+/// A metadata-only library page captured with its counts and admission state.
+/// Frozen IDs come from the same snapshot; legacy `frozen` tags remain on rows.
+pub struct NovelMetadataPage {
+    pub records_total: u64,
+    pub records_filtered: u64,
+    pub records: Vec<NovelRecord>,
+    pub frozen_ids: HashSet<i64>,
+}
+
 /// A single record mutation; several are applied atomically by
 /// [`NovelRepository::apply_batch`] (native: one YAML save; D1: one
 /// transaction/batch).
@@ -400,6 +409,20 @@ pub trait NovelRepository: PlatformService {
     /// missing and repeated IDs). Native YAML decodes the map once per batch.
     fn get_many_current<'a>(&'a self,ids:&'a [NovelId])->PlatformFuture<'a,crate::error::Result<Vec<Option<NovelRecord>>>>{let _=ids;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative batch metadata reads unsupported".into()))})}
     fn query_current<'a>(&'a self,query:&'a NovelQuery)->PlatformFuture<'a,crate::error::Result<Vec<NovelRecord>>>{let _=query;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative metadata query unsupported".into()))})}
+    /// Optional atomic metadata-only list read. A successful snapshot must
+    /// include page rows, both counts, freeze state and open admission for
+    /// every selected row's actual namespace, including unbound legacy rows.
+    /// It must reject unavailable/recovering namespaces, not silently omit them.
+    /// No content or mutable metadata may be read through this result later.
+    /// `filter.frozen_ids` is only a legacy hint; the snapshot owns freeze state.
+    /// Backends without that atomic boundary return `None` and use leased reads.
+    fn metadata_page_snapshot<'a>(
+        &'a self,
+        query: &'a NovelQuery,
+    ) -> PlatformFuture<'a, crate::error::Result<Option<NovelMetadataPage>>> {
+        let _ = query;
+        Box::pin(async { Ok(None) })
+    }
     fn find_by_toc_url_current<'a>(&'a self,url:&'a str)->PlatformFuture<'a,crate::error::Result<Option<NovelRecord>>>{let _=url;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative URL lookup unsupported".into()))})}
     fn find_by_storage_prefix_current<'a>(&'a self,prefix:&'a super::ObjectKey)->PlatformFuture<'a,crate::error::Result<Option<NovelRecord>>>{let _=prefix;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative storage-prefix lookup unsupported".into()))})}
 
