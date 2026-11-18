@@ -49,13 +49,28 @@ export function selectionDigest(revision,profile,roles,items){
   return sha256(Buffer.from(`v2\0${revision}\0${profile}\0${[...roles].sort().join(',')}\0${rows.map(r=>r+'\x01').join('')}`));
 }
 
+function missingCloudflareRoute(response) {
+  return response.status === 404 && response.headers.has('cf-ray')
+    && !response.headers.has('x-test-transfer-primary-only');
+}
+
+function hasOperationId(body) {
+  if (typeof body !== 'string') return false;
+  try {
+    const id = JSON.parse(body)?.operation_id;
+    return typeof id === 'string' && id.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export async function waitForDeployedTransfer(client){
   const path='/api/transfer/v2/capabilities';
   for(let attempt=0;attempt<15;attempt++){
     const response=await fetch(client.base+path,{redirect:'manual',headers:{Authorization:`Bearer ${client.token}`,...client.extraHeaders},
       signal:AbortSignal.timeout(5000)});
     const marker=response.headers.get('x-test-transfer-primary-only');
-    if(response.status===404&&marker===null&&response.headers.has('cf-ray')){
+    if(missingCloudflareRoute(response)){
       // A newly published Workers route can be absent at this edge even
       // after provisioning observed another successful readiness request.
       await response.body?.cancel();
@@ -73,20 +88,26 @@ export async function waitForDeployedTransfer(client){
 export function transferClient(base,token,{verifyPrimary=false}={}){
   const client={base,token,verifyPrimary,requests:[],
     async request(path,init={}){const bytes=init.body===undefined?0:Buffer.byteLength(init.body);if(init.headers?.['content-type']==='application/octet-stream')assert(bytes<=WIRE);
-      const v2=client.verifyPrimary&&path.startsWith('/api/transfer/v2');let response, resetReplays=0;
+      const v2=client.verifyPrimary&&path.startsWith('/api/transfer/v2');let response, resetReplays=0, sealReplays=0;
       for(let attempt=0;;attempt++){client.requests.push({path,method:init.method??'GET',bytes,type:init.headers?.['content-type']??''});
         try{response=await fetch(client.base+path,{...init,redirect:'manual',headers:{Authorization:`Bearer ${token}`,...client.extraHeaders,...init.headers}});}
         catch(error){
           const code=error?.cause?.code;
           if(!v2||resetReplays>=3||init.signal?.aborted||!['ECONNRESET','UND_ERR_SOCKET'].includes(code)
-            ||init.method!=='POST'||!/^\/api\/transfer\/v2\/(?:exports|imports)\/[^/]+\/advance$/.test(path)||typeof init.body!=='string')throw error;
-          let operationId;
-          try{operationId=JSON.parse(init.body)?.operation_id;}catch{throw error;}
-          if(typeof operationId!=='string'||!operationId)throw error;
+            ||init.method!=='POST'||!/^\/api\/transfer\/v2\/(?:exports|imports)\/[^/]+\/advance$/.test(path)||!hasOperationId(init.body))throw error;
           // As in the browser, a lost acknowledgement is ambiguous. Replay
           // the original bytes/headers, never a newly fetched operation ID.
           console.log(JSON.stringify({event:'transfer_edge_retry',code,attempt:++resetReplays,path}));
           await sleep(100*resetReplays);
+          continue;
+        }
+        // A Worker-generated 404 still has the fixture marker. Only replay a
+        // possibly lost edge acknowledgement for the journaled seal, unchanged.
+        if(v2&&missingCloudflareRoute(response)&&sealReplays<3&&!init.signal?.aborted
+          &&init.method==='POST'&&/^\/api\/transfer\/v2\/imports\/[^/]+\/manifest\/seal$/.test(path)
+          &&hasOperationId(init.body)){
+          console.log(JSON.stringify({event:'transfer_edge_retry',status:404,attempt:++sealReplays,path}));
+          await response.body?.cancel();await sleep(1000);
           continue;
         }
         // Markerless 5xx responses are not proof of primary access. Replay only

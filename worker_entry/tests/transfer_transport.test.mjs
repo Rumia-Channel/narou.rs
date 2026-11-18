@@ -64,6 +64,55 @@ test('repeated resets exhaust the bounded advance replay budget', async t => {
   assert.equal(requests, 4);
 });
 
+const seal = '/api/transfer/v2/imports/sess_transport/manifest/seal';
+const sealRequest = {
+  method: 'POST',
+  headers: { ...init.headers, 'if-match': '"2"' },
+  body: JSON.stringify({ operation_id: 'seal-operation', size: '7', sha256: 'a'.repeat(64) }),
+};
+
+test('a markerless Cloudflare 404 during seal replays the original operation and revision', async t => {
+  const received = [];
+  const receipt = { state: 'planning', revision: '3' };
+  const client = await serve(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push([req.url, req.method, req.headers['x-narou-transfer-secret'],
+      req.headers['if-match'], Buffer.concat(chunks).toString()]);
+    if (received.length === 1) {
+      res.writeHead(404, { 'cf-ray': 'fixture' }).end('Not Found');
+      return;
+    }
+    res.writeHead(200, { 'cf-ray': 'fixture', 'x-test-transfer-primary-only': 'true' })
+      .end(JSON.stringify(receipt));
+  });
+  assert.deepEqual((await client.json(seal, sealRequest)).body, receipt);
+  assert.deepEqual(received, Array.from({ length: 2 }, () => [seal, 'POST', 'fixture', '"2"', sealRequest.body]));
+});
+
+test('a persistent markerless edge 404 still fails primary verification after three replays', async t => {
+  let requests = 0;
+  const client = await serve(t, (_req, res) => {
+    requests++;
+    res.writeHead(404, { 'cf-ray': 'fixture' }).end('Not Found');
+  });
+  await assert.rejects(client.json(seal, sealRequest), /HTTP 404, marker absent/);
+  assert.equal(requests, 4);
+});
+
+test('a Worker 404 or a seal without an operation ID is not replayed', async t => {
+  let requests = 0;
+  const client = await serve(t, async (req, res) => {
+    for await (const _chunk of req) { /* drain request body */ }
+    const headers = { 'cf-ray': 'fixture' };
+    if (++requests === 1) headers['x-test-transfer-primary-only'] = 'true';
+    res.writeHead(404, headers).end('{}');
+  });
+  assert.equal((await client.json(seal, sealRequest)).response.status, 404);
+  await assert.rejects(client.json(seal, { ...sealRequest, body: '{}' }), /HTTP 404, marker absent/);
+  assert.equal(requests, 2);
+});
+
 test('startup waits for the Cloudflare route, then requires the real primary marker', async t => {
   let requests = 0;
   const client = await serve(t, (req, res) => {
