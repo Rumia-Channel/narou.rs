@@ -550,6 +550,10 @@ fn native_transfer_browser_fixture() {
     // The real gateway preserves the browser's public Host/Origin, whose port
     // differs from the listener. Keep Host allowlists and UI cookie auth active.
     for library in &libraries {
+        // These are already-initialized libraries, not a pre-0.4.0 upgrade.
+        // Leave the feature tour unread, but don't queue the separate backup offer.
+        std::fs::create_dir_all(library.join(".narou")).unwrap();
+        std::fs::write(library.join(".narou/last-run-version"), "0.4.0\n").unwrap();
         std::fs::create_dir_all(library.join(".narousetting")).unwrap();
         std::fs::write(library.join(".narousetting/global_setting.yaml"),
             "server-ws-port: 0\nserver-reverse-proxy.enable: true\n").unwrap();
