@@ -54,11 +54,33 @@ function missingCloudflareRoute(response) {
     && !response.headers.has('x-test-transfer-primary-only');
 }
 
-function hasOperationId(body) {
-  if (typeof body !== 'string') return false;
+const MAX_EDGE_REPLAYS = 3;
+const sessionRoute = /^\/api\/transfer\/v2\/(?:imports|exports|sessions)\/[^/]+$/;
+const controlRoute = /^\/api\/transfer\/v2\/(?:imports|exports)\/[^/]+\/(?:manifest\/seal|advance|select|publish|ready|pause|resume|complete)$/;
+const uploadRoute = /^\/api\/transfer\/v2\/imports\/[^/]+\/(?:chunks|manifest\/chunks\/\d+)$/;
+const hasIdentity = value => typeof value === 'string' && value.length > 0;
+
+function canReplayTransferRequest(path, { method = 'GET', body, headers }) {
+  const [route, query] = path.split('?', 2);
+  if (method === 'GET') return body === undefined;
+  if (method === 'PUT') {
+    // The server checks the digest and finality of each already-received chunk.
+    return uploadRoute.test(route) && Buffer.isBuffer(body);
+  }
+  if (method === 'DELETE') {
+    return sessionRoute.test(route) && headers.has('if-match')
+      && hasIdentity(new URLSearchParams(query).get('operation_id') ?? headers.get('x-transfer-operation-id'));
+  }
+  if (method !== 'POST' || typeof body !== 'string') return false;
+  const isCreate = route === '/api/transfer/v2/imports' || route === '/api/transfer/v2/exports';
+  if (!isCreate && !controlRoute.test(route)) return false;
   try {
-    const id = JSON.parse(body)?.operation_id;
-    return typeof id === 'string' && id.length > 0;
+    const data = JSON.parse(body);
+    // The creation journal deduplicates by request_id. Keep the original
+    // ticket and secret rather than creating a new request after a lost ACK.
+    return isCreate
+      ? hasIdentity(data?.request_id) && hasIdentity(data?.creation_ticket)
+      : hasIdentity(data?.operation_id) && (route.endsWith('/advance') || headers.has('if-match'));
   } catch {
     return false;
   }
@@ -88,34 +110,35 @@ export async function waitForDeployedTransfer(client){
 export function transferClient(base,token,{verifyPrimary=false}={}){
   const client={base,token,verifyPrimary,requests:[],
     async request(path,init={}){const bytes=init.body===undefined?0:Buffer.byteLength(init.body);if(init.headers?.['content-type']==='application/octet-stream')assert(bytes<=WIRE);
-      const v2=client.verifyPrimary&&path.startsWith('/api/transfer/v2');let response, resetReplays=0, sealReplays=0;
-      for(let attempt=0;;attempt++){client.requests.push({path,method:init.method??'GET',bytes,type:init.headers?.['content-type']??''});
-        try{response=await fetch(client.base+path,{...init,redirect:'manual',headers:{Authorization:`Bearer ${token}`,...client.extraHeaders,...init.headers}});}
-        catch(error){
-          const code=error?.cause?.code;
-          if(!v2||resetReplays>=3||init.signal?.aborted||!['ECONNRESET','UND_ERR_SOCKET'].includes(code)
-            ||init.method!=='POST'||!/^\/api\/transfer\/v2\/(?:exports|imports)\/[^/]+\/advance$/.test(path)||!hasOperationId(init.body))throw error;
-          // As in the browser, a lost acknowledgement is ambiguous. Replay
-          // the original bytes/headers, never a newly fetched operation ID.
-          console.log(JSON.stringify({event:'transfer_edge_retry',code,attempt:++resetReplays,path}));
-          await sleep(100*resetReplays);
-          continue;
+      const v2=client.verifyPrimary&&path.startsWith('/api/transfer/v2/');
+      const request = {...init, redirect:'manual', headers:new Headers({Authorization:`Bearer ${token}`,...client.extraHeaders,...init.headers})};
+      const canReplay = v2 && canReplayTransferRequest(path, request);
+      let response;
+      for (let attempt = 0; ; attempt++) {
+        client.requests.push({path,method:init.method??'GET',bytes,type:init.headers?.['content-type']??''});
+        const retryAvailable = canReplay && attempt < MAX_EDGE_REPLAYS && !request.signal?.aborted;
+        let delay = 100 * (attempt + 1);
+        let reason;
+        try {
+          response = await fetch(client.base + path, request);
+        } catch (error) {
+          const code = error?.cause?.code;
+          if (!retryAvailable || request.signal?.aborted || !['ECONNRESET','UND_ERR_SOCKET'].includes(code)) throw error;
+          reason = {code};
         }
-        // A Worker-generated 404 still has the fixture marker. Only replay a
-        // possibly lost edge acknowledgement for the journaled seal, unchanged.
-        if(v2&&missingCloudflareRoute(response)&&sealReplays<3&&!init.signal?.aborted
-          &&init.method==='POST'&&/^\/api\/transfer\/v2\/imports\/[^/]+\/manifest\/seal$/.test(path)
-          &&hasOperationId(init.body)){
-          console.log(JSON.stringify({event:'transfer_edge_retry',status:404,attempt:++sealReplays,path}));
-          await response.body?.cancel();await sleep(1000);
-          continue;
+        if (!reason) {
+          const edge404 = missingCloudflareRoute(response);
+          const edge5xx = response.status >= 500 && !response.headers.has('x-test-transfer-primary-only');
+          if (!retryAvailable || (!edge404 && !edge5xx)) break;
+          delay = edge404 ? 1000 : delay;
+          reason = {status:response.status};
+          await response.body?.cancel();
         }
-        // Markerless 5xx responses are not proof of primary access. Replay only
-        // the SAME idempotent operation; the live tail separately rejects
-        // isolate exceptions, CPU/memory failures and any coverage gap.
-        if(!v2||response.headers.has('x-test-transfer-primary-only')||response.status<500||attempt>=20)break;
-        console.log(JSON.stringify({event:'transfer_edge_retry',status:response.status,attempt:attempt+1,path}));
-        await response.body?.cancel();await sleep(100);}
+        // No new IDs, tickets, secrets or bodies. The live tail must still
+        // observe every invocation and fails the whole exercise if coverage is lost.
+        console.log(JSON.stringify({event:'transfer_edge_retry',...reason,attempt:attempt+1,path}));
+        await sleep(delay);
+      }
       if(v2)assert.equal(response.headers.get('x-test-transfer-primary-only'),'true',`all v2 store access must use primary (HTTP ${response.status}, marker ${response.headers.get('x-test-transfer-primary-only')===null?'absent':'present'})`);
       const wasmBytes=Number(response.headers.get('x-test-transfer-wasm-bytes'));if(Number.isSafeInteger(wasmBytes)&&wasmBytes>0)client.memoryHighWater=Math.max(client.memoryHighWater??0,wasmBytes);if(response.headers.get('x-test-transfer-fault-fired')==='true')client.faults=(client.faults??0)+1;return response;},
     async json(path,init={}){for(let attempt=0;;attempt++){const response=await client.request(path,init);const text=await response.text();let body;try{body=text?JSON.parse(text):null;}catch{throw new Error(`HTTP ${response.status}: ${text.slice(0,1000)}`);}

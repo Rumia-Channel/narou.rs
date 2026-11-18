@@ -90,6 +90,36 @@ test('a markerless Cloudflare 404 during seal replays the original operation and
   assert.deepEqual(received, Array.from({ length: 2 }, () => [seal, 'POST', 'fixture', '"2"', sealRequest.body]));
 });
 
+test('a lost import creation response reuses the request ID, ticket and session secret', async t => {
+  const creates = [];
+  const receipt = { session_id: 'sess_created_once', state: 'receiving_manifest', revision: '1' };
+  const client = await serve(t, async (req, res) => {
+    const headers = { 'cf-ray': 'fixture', 'x-test-transfer-primary-only': 'true' };
+    if (req.url === '/api/transfer/v2/capabilities') {
+      res.writeHead(200, headers).end(JSON.stringify({
+        protocol_version: 2, creation_ticket: 'original-ticket', storage: { policy_version: '1', import: { allowed: true } },
+      }));
+      return;
+    }
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    creates.push([req.url, req.method, req.headers['x-narou-transfer-secret'], Buffer.concat(chunks).toString()]);
+    if (creates.length === 1) {
+      res.writeHead(404, { 'cf-ray': 'fixture' }).end('Not Found');
+      return;
+    }
+    res.writeHead(200, headers).end(JSON.stringify(receipt));
+  });
+  const session = await client.createImport([], { requestId: 'original-request', secret: 'original-secret' });
+  assert.deepEqual(session.status, receipt);
+  assert.equal(creates.length, 2);
+  assert.deepEqual(creates[0], creates[1]);
+  const [path, method, secret, body] = creates[0];
+  assert.deepEqual([path, method, secret], ['/api/transfer/v2/imports', 'POST', 'original-secret']);
+  assert.equal(JSON.parse(body).request_id, 'original-request');
+  assert.equal(JSON.parse(body).creation_ticket, 'original-ticket');
+});
+
 test('a persistent markerless edge 404 still fails primary verification after three replays', async t => {
   let requests = 0;
   const client = await serve(t, (_req, res) => {
@@ -111,6 +141,17 @@ test('a Worker 404 or a seal without an operation ID is not replayed', async t =
   assert.equal((await client.json(seal, sealRequest)).response.status, 404);
   await assert.rejects(client.json(seal, { ...sealRequest, body: '{}' }), /HTTP 404, marker absent/);
   assert.equal(requests, 2);
+});
+
+test('a markerless 503 does not replay an unknown mutation even if it has an operation ID', async t => {
+  let requests = 0;
+  const client = await serve(t, async (req, res) => {
+    for await (const _chunk of req) { /* drain request body */ }
+    requests++;
+    res.writeHead(503, { 'cf-ray': 'fixture' }).end('Unavailable');
+  });
+  await assert.rejects(client.request(`${advance}/unrecognized`, init), /HTTP 503, marker absent/);
+  assert.equal(requests, 1);
 });
 
 test('startup waits for the Cloudflare route, then requires the real primary marker', async t => {
