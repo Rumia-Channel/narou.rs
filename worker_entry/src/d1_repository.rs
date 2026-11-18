@@ -43,7 +43,6 @@ pub(crate) struct WebListInputs {
     pub(crate) hidden: Option<narou_rs::hidden::HiddenState>,
     pub(crate) members: narou_rs::virtual_novel::VirtualNovelMembers,
     pub(crate) raw_members: Option<String>,
-    pub(crate) frozen_ids: HashSet<i64>,
     pub(crate) attribute_tags_enabled: bool,
 }
 
@@ -146,20 +145,12 @@ impl D1NovelRepository {
                 OR (scope='local' AND key=?2)",
             vec![BindValue::Int(i64::from(include_hidden)), BindValue::Text(ENABLED_SETTING.into())],
         )?;
-        let results = primary.db.batch(vec![
-            state,
-            primary.db.prepare(FROZEN_IDS_SQL),
-        ]).await.map_err(worker_error)?;
-        ensure_batch_success(&results)?;
-        let [state, frozen] = results.as_slice() else {
-            return Err(worker_error("incomplete list inputs"));
-        };
+        let state = state.all().await.map_err(worker_error)?;
+        ensure_batch_success(std::slice::from_ref(&state))?;
         let mut inputs = WebListInputs {
             hidden: None,
             members: Default::default(),
             raw_members: None,
-            frozen_ids: frozen.results::<IdRow>().map_err(worker_error)?
-                .into_iter().map(|row| row.id).collect(),
             attribute_tags_enabled: false,
         };
         for row in state.results::<StateRow>().map_err(worker_error)? {
@@ -184,7 +175,7 @@ impl D1NovelRepository {
     /// durable reader leases until HTTP EOF is only needed for deferred reads.
     pub(crate) async fn web_list_snapshot(
         &self, query: NovelQuery, raw_members: Option<String>,
-    ) -> Result<Option<(u64, u64, Vec<NovelRecord>)>> {
+    ) -> Result<Option<narou_rs::platform::repository::NovelMetadataPage>> {
         let primary = self.primary();
         let all_matches = query.offset == 0 && query.limit == usize::MAX;
         let unrestricted = query.filter.is_unrestricted();
@@ -192,6 +183,7 @@ impl D1NovelRepository {
         let mut statements = vec![
             primary.prepare(&sql, binds)?,
             primary.db.prepare("SELECT prefix FROM novel_access_gates WHERE closed=1"),
+            primary.db.prepare(FROZEN_IDS_SQL),
             primary.prepare(
                 "SELECT (SELECT value_json FROM app_state
                          WHERE scope='inv' AND key='virtual_novel_members') IS ?1 AS unchanged",
@@ -212,10 +204,12 @@ impl D1NovelRepository {
         ensure_batch_success(&results)?;
         let mut results = results.into_iter();
         let mut next = || results.next().ok_or_else(|| worker_error("incomplete list snapshot"));
-        let records = rows_from_result(next()?)?;
+        let rows = next()?;
         #[derive(Deserialize)]
         struct ClosedGate { prefix: String }
         let closed = next()?.results::<ClosedGate>().map_err(worker_error)?;
+        let frozen_ids = next()?.results::<IdRow>().map_err(worker_error)?
+            .into_iter().map(|row| row.id).collect();
         #[derive(Deserialize)]
         struct MembershipCheck { unchanged: i64 }
         let check = next()?.results::<MembershipCheck>().map_err(worker_error)?
@@ -223,6 +217,7 @@ impl D1NovelRepository {
         if check.unchanged == 0 {
             return Ok(None);
         }
+        let records = rows_from_result(rows)?;
         if !closed.is_empty() {
             let closed: HashSet<_> = closed.into_iter().map(|gate| gate.prefix).collect();
             for record in &records {
@@ -241,7 +236,12 @@ impl D1NovelRepository {
         };
         let filtered = if all_matches { records.len() as u64 } else { count()? };
         let total = if unrestricted { filtered } else { count()? };
-        Ok(Some((total, filtered, records)))
+        Ok(Some(narou_rs::platform::repository::NovelMetadataPage {
+            records_total: total,
+            records_filtered: filtered,
+            records,
+            frozen_ids,
+        }))
     }
 
     async fn one(&self, sql: &str, values: Vec<BindValue>) -> Result<Option<NovelRecord>> {

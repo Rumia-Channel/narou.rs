@@ -374,17 +374,22 @@ impl LibraryService {
     pub async fn list_metadata_snapshot<F>(
         &self,
         request: &LibraryListRequest,
-        frozen_ids: &HashSet<i64>,
         read: impl FnOnce(NovelQuery) -> F,
     ) -> Result<LibraryPage, ApplicationError>
     where
-        F: std::future::Future<Output = Result<(u64, u64, Vec<NovelRecord>), ApplicationError>>,
+        F: std::future::Future<Output = Result<crate::platform::repository::NovelMetadataPage, ApplicationError>>,
     {
-        let (filter, sort) = self.prepare_list(request, frozen_ids);
+        let (filter, sort) = self.prepare_list(request, &HashSet::new());
         let query = NovelQuery::page(filter, sort, request.start, request.length.unwrap_or(usize::MAX));
-        let (records_total, records_filtered, records) = read(query).await?;
-        let data = self.summarize_records_with_frozen(records, request.attribute_tags_enabled, frozen_ids).await;
-        Ok(LibraryPage { records_total, records_filtered, data })
+        let snapshot = read(query).await?;
+        let data = self.summarize_records_with_frozen(
+            snapshot.records, request.attribute_tags_enabled, &snapshot.frozen_ids,
+        ).await;
+        Ok(LibraryPage {
+            records_total: snapshot.records_total,
+            records_filtered: snapshot.records_filtered,
+            data,
+        })
     }
 
     /// Project already-admitted authoritative records with the same native and

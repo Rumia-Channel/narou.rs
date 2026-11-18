@@ -127,7 +127,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
             include_hidden,
             exclude_ids,
             attribute_tags_enabled: inputs.attribute_tags_enabled,
-        }, &inputs.frozen_ids, |query| async {
+        }, |query| async {
             repository.web_list_snapshot(query, inputs.raw_members).await
                 .map_err(ApplicationError::platform)?
                 .ok_or_else(|| ApplicationError::Conflict("virtual membership changed during listing".into()))
