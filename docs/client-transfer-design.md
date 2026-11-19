@@ -568,7 +568,7 @@ CI は core・adapter・WASM 単体に加え、**生成済み配布assetsを使�
 
 最新Native全CLI、新しいLinux CI browser gate、後続修正を含むproduction profileの全体CIは、まだ完了として記載しない。readerの旧35/38実行で見つかった本文二重取得・初読破損の見逃しは、検証済みstream・同じleaseの指紋照合へ接続し直し、上記38/38で修正を確認した。Nativeの168作品・4 GiB超entryの実Firefox往復、Chromium実picker保存、隔離providerの128 MiB試験、ローカルS3の全lifecycleと実強制終了復旧は上表の範囲で確認済み。新しいCI gateは17 MiB利用者fileで配布UI/WASMの書出し・独立ZIP検証・YAML/DB-only取込を行う構成だが、268115eのNative全suiteが先に失敗し未実行。ローカルの新規Selenium Firefoxはheadless・headed双方で起動途中exit 1・registry初期化エラーとなったため、既存の実Firefox操作成功とは区別する。17 MiB smokeを4 GiBの実測とは扱わない。以前の `Array buffer allocation failed` は、テストhelperのpath上書きによりNodeが巨大な失敗差分を生成した箇所で発生したもので、Worker OOMの証拠には数えない。
 
-隔離 CI の WebSocket 監視は切断時にイベントを再取得できないため、fixture 専用の Tail Worker で実行証跡を専用 D1 に保存する。HTTP 試行ごとの連番・実行結果・ステータスだけを照合し、再送前の試行も、欠落・不一致・異常終了なら失敗とする。Tail Worker は外部公開せず、テスト終了時に D1 とともに削除する。実 D1 では `metadata` と 33 作品の `gates` が進行中に 25 分を超えたため、判定条件は変えず、ケース実行の上限を 55 分とする。
+隔離 CI の WebSocket 監視は切断時にイベントを再取得できないため、fixture 専用の Tail Worker で実行証跡を専用 D1 に保存する。HTTP 試行ごとの連番・実行結果・ステータスだけを照合し、再送前の試行も、欠落・不一致・異常終了なら失敗とする。fixture Worker は応答へ `x-test-transfer-dispatched` を付け、証跡必須は Worker が応答を生成した試行 (dispatched) に限る。edge が worker へ届かず生成した応答 (route 未収束の 404 等、cf-ray あり・dispatched 印なし) と、応答を受け取らなかった試行は、正当に証跡を持たないため失敗ではなく `transfer_trace_gaps` として記録する。ただし dispatched 印のない応答に証跡がある場合は矛盾として失敗させる。Tail Worker は外部公開せず、テスト終了時に D1 とともに削除する。実 D1 では `metadata` と 33 作品の `gates` が進行中に 55 分を超えたため、判定条件は変えず、ケース実行の上限を 75 分 (job 上限 85 分未満、cleanup の余裕を残す) とする。
 
 ### 16.2 全ブランチ統合ツリーでの確認
 

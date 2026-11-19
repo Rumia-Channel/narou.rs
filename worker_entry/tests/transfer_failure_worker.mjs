@@ -51,6 +51,13 @@ function instrument(database,mode,state){
 }
 export default class TransferFailureWorker extends Worker{
   async fetch(request){
+    const response=await this.dispatch(request);
+    // Mirrors ci/transfer_trace.mjs DISPATCH_HEADER ('x-test-transfer-dispatched').
+    // The client uses it to prove a response came from this Worker, not an
+    // edge-generated error page (e.g. a route not propagated at this colo).
+    try{response.headers.set('x-test-transfer-dispatched','1');return response;}catch{try{const result=new Response(response.body,response);result.headers.set('x-test-transfer-dispatched','1');return result;}catch{return response;}}
+  }
+  async dispatch(request){
     const url=new URL(request.url);
     if(url.pathname==='/_fixture/transfer-memory'){if(request.headers.get('authorization')!==`Bearer ${this.env.NAROU_ADMIN_TOKEN}`)return new Response('unauthorized',{status:401});return Response.json(sample());}
     if(url.pathname==='/_fixture/transfer-namespace'){

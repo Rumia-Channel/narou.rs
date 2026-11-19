@@ -168,14 +168,17 @@ async function readEvidence(state,startSequence,highestSequence) {
 async function waitForEvidence(state,firstSequence,expected) {
   const deadline=Date.now()+90000;
   const lastSequence=firstSequence+expected.length-1;
-  let missing,rows;
+  let details;
   do {
-    rows=await readEvidence(state,firstSequence,lastSequence);
-    missing=verifyTraceReceipts(expected,firstSequence===1?rows:rows.map(row=>({...row,seq:row.seq-firstSequence+1})));
-    if(missing===0)return;
+    const rows=await readEvidence(state,firstSequence,lastSequence);
+    // verifyTraceReceipts throws on contradictory or malformed receipts; an
+    // edge-answered attempt can legitimately never produce one, so only the
+    // dispatched gap count drives the wait.
+    verifyTraceReceipts(expected,firstSequence===1?rows:rows.map(row=>({...row,seq:row.seq-firstSequence+1})));
+    details=missingTraceEvidence(expected,rows,firstSequence);
+    if(details.unaccounted===0)break;
     await sleep(2000);
   } while(Date.now()<deadline);
-  const details=missingTraceEvidence(expected,rows,firstSequence);
   assert.equal(details.unaccounted,0,`missing Cloudflare Tail Worker evidence for ${details.unaccounted} dispatched request(s): ${JSON.stringify(details)}`);
   console.log(JSON.stringify({event:'transfer_trace_gaps',...details}));
 }

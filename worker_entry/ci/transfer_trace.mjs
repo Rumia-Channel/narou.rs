@@ -1,4 +1,7 @@
 export const TRACE_HEADER = 'x-narou-ci-seq';
+// Fixture-only header present on every response the deployed Worker produced.
+// An edge-generated response (route not propagated at this colo) lacks it.
+export const DISPATCH_HEADER = 'x-test-transfer-dispatched';
 export const MAX_TRACE_ATTEMPTS = 20_000;
 export const PREFLIGHT_ATTEMPTS = 90;
 export const TRACE_SCHEMA = `CREATE TABLE fixture_transfer_traces (
@@ -15,6 +18,15 @@ const outcomes = new Set([
 export const traceOutcome = value => outcomes.has(value) ? value : 'unknown';
 export const isHttpStatus = value => Number.isInteger(value) && value >= 100 && value <= 599;
 
+function entryStatus(entry) {
+  return typeof entry === 'number' ? entry : entry.status;
+}
+function entryDispatched(entry) {
+  // Legacy bare-status entries are always treated as dispatched so the
+  // receipt requirement stays strict for callers that do not record it.
+  return typeof entry === 'number' ? true : entry.dispatched === true;
+}
+
 export function verifyTraceReceipts(expected, rows) {
   const seen = new Map();
   for (const {seq, outcome, http_status: status} of rows) {
@@ -24,7 +36,11 @@ export function verifyTraceReceipts(expected, rows) {
     if (outcome !== 'ok' && outcome !== 'canceled') {
       throw new Error(`Cloudflare Tail Worker request ${seq} ended with ${traceOutcome(outcome)}`);
     }
-    const wanted = expected[seq - 1];
+    const entry = expected[seq - 1];
+    const wanted = entryStatus(entry);
+    if (!entryDispatched(entry) && wanted !== 0) {
+      throw new Error(`Cloudflare Tail Worker reported a receipt for request ${seq} the edge answered without dispatching`);
+    }
     if (!(status === 0 || isHttpStatus(status)) ||
         (outcome === 'ok' && (!isHttpStatus(status) || (wanted !== 0 && wanted !== status))) ||
         (outcome === 'canceled' && wanted !== 0)) {
@@ -44,16 +60,16 @@ export function missingTraceEvidence(expected, rows, firstSequence) {
   const sample = [];
   let unaccounted = 0;
   let withoutResponse = 0;
-  for (const [index, status] of expected.entries()) {
+  let edge = 0;
+  for (const [index, entry] of expected.entries()) {
     const seq = firstSequence + index;
     if (seen.has(seq)) continue;
-    // A received response proves the request was dispatched, so a receipt
-    // must exist for it. A request that never received a response may
-    // legitimately have no tail event: a socket reset before dispatch never
-    // reaches the isolate. Those gaps are reported, not fatal.
+    const status = entryStatus(entry);
     if (status === 0) withoutResponse++;
-    else unaccounted++;
-    if (sample.length < 8) sample.push({seq, expected_status: status});
+    else if (entryDispatched(entry)) unaccounted++;
+    else edge++;
+    if (sample.length < 8) sample.push({seq, expected_status: status, dispatched: entryDispatched(entry)});
   }
-  return {unaccounted, without_response: withoutResponse, sample};
+  return {unaccounted, without_response: withoutResponse, edge, sample};
 }
+

@@ -7,7 +7,7 @@ import {randomUUID} from 'node:crypto';
 import {writeFileSync} from 'node:fs';
 import {isAbsolute} from 'node:path';
 import {brotliCompressSync,crc32} from 'node:zlib';
-import {MAX_TRACE_ATTEMPTS,PREFLIGHT_ATTEMPTS,TRACE_HEADER} from '../ci/transfer_trace.mjs';
+import {DISPATCH_HEADER,MAX_TRACE_ATTEMPTS,PREFLIGHT_ATTEMPTS,TRACE_HEADER} from '../ci/transfer_trace.mjs';
 import {fixtureNovel,selectionDigest,sourceNamespaceContracts,transferClient,waitForDeployedTransfer} from './transfer.mjs';
 
 const base=new URL(process.env.NAROU_TRANSFER_TEST_URL??'https://missing.invalid');
@@ -25,9 +25,9 @@ async function tracedFetch(url,init={}){
   assert(seq<=MAX_TRACE_ATTEMPTS-PREFLIGHT_ATTEMPTS,'transfer trace attempt limit exceeded');
   const headers=new Headers(init.headers);
   headers.set(TRACE_HEADER,`${traceRun}:${seq}`);
-  ledger.push(0); // A fetch failure before any response.
+  ledger.push({status:0,dispatched:false});
   const response=await fetch(url,{...init,headers,redirect:'manual'});
-  ledger[seq-1]=response.status;
+  ledger[seq-1]={status:response.status,dispatched:response.headers.has(DISPATCH_HEADER)};
   return response;
 }
 const caseGroups={
