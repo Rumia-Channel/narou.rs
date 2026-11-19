@@ -42,12 +42,18 @@ export function verifyTraceReceipts(expected, rows) {
 export function missingTraceEvidence(expected, rows, firstSequence) {
   const seen = new Set(rows.map(row => row.seq));
   const sample = [];
+  let unaccounted = 0;
   let withoutResponse = 0;
   for (const [index, status] of expected.entries()) {
     const seq = firstSequence + index;
     if (seen.has(seq)) continue;
+    // A received response proves the request was dispatched, so a receipt
+    // must exist for it. A request that never received a response may
+    // legitimately have no tail event: a socket reset before dispatch never
+    // reaches the isolate. Those gaps are reported, not fatal.
     if (status === 0) withoutResponse++;
+    else unaccounted++;
     if (sample.length < 8) sample.push({seq, expected_status: status});
   }
-  return {without_response: withoutResponse, sample};
+  return {unaccounted, without_response: withoutResponse, sample};
 }
