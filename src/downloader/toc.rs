@@ -10,8 +10,8 @@ use super::preprocess::PreprocessJobs;
 use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
 use super::util::{
-    load_length_limit, pretreatment_source_with_jobs, sanitize_filename,
-    sanitize_filename_with_limit,
+    decode_html_text, load_length_limit, pretreatment_source_with_jobs,
+    ruby_filename_special_chars, sanitize_filename, sanitize_filename_with_limit,
 };
 
 pub async fn fetch_toc(
@@ -84,17 +84,20 @@ pub fn parse_subtitles(
                     String::new()
                 }
             });
+        // narou.rb は TOC ソース全体を `Helper.restore_entity` で復号してから
+        // multi_match する。ここではキャプチャ値だけ同じ復号を掛ける (本文側の
+        // 前処理は実体を残す必要があるため、ソース全体は変更しない)。
         let chapter = caps
             .name("chapter")
-            .map(|m| m.as_str().to_string())
+            .map(|m| decode_html_text(m.as_str()))
             .unwrap_or_default();
         let subchapter = caps
             .name("subchapter")
-            .map(|m| m.as_str().to_string())
+            .map(|m| decode_html_text(m.as_str()))
             .unwrap_or_default();
         let subtitle_raw = caps
             .name("subtitle")
-            .map(|m| m.as_str().to_string())
+            .map(|m| decode_html_text(m.as_str()))
             .unwrap_or_default();
         let subdate = caps
             .name("subdate")
@@ -108,10 +111,12 @@ pub fn parse_subtitles(
         };
 
         // narou.rb 準拠: 永続化する subtitle は ruby タグと改行を除去した
-        // クリーンな文字列にする。ファイル名用の file_subtitle はまず
-        // ruby タグだけ落としてから sanitize に渡す。
+        // クリーンな文字列にする。file_subtitle は `title_to_filename` と
+        // 同じ順番で、ruby タグ落とし → 特殊文字の全角化 → 長さ制限 →
+        // Windows ファイル名用サニタイズを行う。
         let subtitle_clean = slim_subtitle(&subtitle_raw);
-        let subtitle_for_filename = delete_ruby_tag(&subtitle_raw);
+        let subtitle_for_filename =
+            ruby_filename_special_chars(&delete_ruby_tag(&subtitle_raw));
 
         let file_subtitle = match filename_length_limit {
             Some(limit) => {
@@ -315,7 +320,7 @@ pub async fn create_short_story_subtitles(
     // narou.rb の `create_short_story_subtitles` と同じく、title に対しても
     // ruby タグ落としと改行除去を行う。
     let subtitle_clean = slim_subtitle(&title);
-    let title_for_filename = delete_ruby_tag(&title);
+    let title_for_filename = ruby_filename_special_chars(&delete_ruby_tag(&title));
 
     Ok(vec![SubtitleInfo {
         index: "1".to_string(),
@@ -408,6 +413,30 @@ mod tests {
 
         assert_eq!(*progress.lengths.lock(), vec![5]);
         assert_eq!(*progress.increments.lock(), vec![1]);
+    }
+
+    #[test]
+    fn toc_captures_decode_entities_and_use_ruby_filename_mapping() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.domain == "ncode.syosetu.com").unwrap();
+        let toc_source = r#"
+<div class="p-eplist__chapter-title">第&amp;章</div>
+
+<div class="p-eplist__sublist">
+<a href="/n1234aa/1/" class="p-eplist__subtitle">
+プロローグ：なぜか江戸時代へ転移　&lt;C201&gt;
+</a>
+
+<div class="p-eplist__update">
+2024年01月01日 00時00分
+</div>
+</div>
+"#;
+        let subtitles = parse_subtitles(setting, toc_source, &HashMap::new()).unwrap();
+        assert_eq!(subtitles.len(), 1);
+        assert_eq!(subtitles[0].subtitle, "プロローグ：なぜか江戸時代へ転移　<C201>");
+        assert_eq!(subtitles[0].file_subtitle, "プロローグ：なぜか江戸時代へ転移　〈C201〉");
+        assert_eq!(subtitles[0].chapter, "第&章");
     }
 
     #[test]

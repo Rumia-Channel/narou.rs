@@ -46,7 +46,7 @@ use self::toc::{
 };
 use self::util::{
     build_section_url, compile_html_pattern, load_length_limit, mask_spoiler_text,
-    parse_two_digit_year_datetime, sanitize_filename_with_limit,
+    parse_two_digit_year_datetime, ruby_filename_special_chars, sanitize_filename_with_limit,
 };
 use crate::application::messages;
 use crate::db::novel_record::NovelRecord;
@@ -3535,7 +3535,7 @@ impl Downloader {
                 return ncode.clone();
             }
             let limit = load_length_limit("folder-length-limit", Some(50));
-            let combined_title = format!("{} {}", ncode, title);
+            let combined_title = ruby_filename_special_chars(&format!("{} {}", ncode, title));
             let sanitized = sanitize_filename_with_limit(&combined_title, limit);
             if sanitized.is_empty() {
                 ncode.clone()
@@ -3543,7 +3543,10 @@ impl Downloader {
                 sanitized
             }
         } else {
-            sanitize_filename_with_limit(title, load_length_limit("folder-length-limit", Some(50)))
+            sanitize_filename_with_limit(
+                &ruby_filename_special_chars(title),
+                load_length_limit("folder-length-limit", Some(50)),
+            )
         }
     }
 
@@ -6511,6 +6514,29 @@ is_narou: false
                 }
             }
         }
+    }
+
+    #[test]
+    fn new_file_title_uses_ruby_fullwidth_special_chars() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let downloader = Downloader::with_platform_and_storage_and_settings(
+            DownloaderPlatform {
+                http: Arc::new(MockHttpClient::new()),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
+                objects: store.clone(), assets: store, clock: Arc::new(SystemClock),
+            },
+            Vec::new(), HashMap::new(),
+        ).unwrap();
+        assert_eq!(
+            downloader.compute_file_title(
+                &Some("n1234ab".to_string()),
+                "作品<C201>タイトル",
+                true,
+                None,
+            ),
+            "n1234ab 作品〈C201〉タイトル"
+        );
     }
 
     #[test]
