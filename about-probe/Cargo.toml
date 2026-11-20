@@ -29,4 +29,4 @@ license = "BSD-2-Clause"
 
 [dependencies]
 narou_rs = { path = "..", default-features = false, features = ["native-runtime"] }
-narou_transfer_wasm = { version = "0.6.8", path = "../transfer_wasm" }
+narou_transfer_wasm = { version = "0.6.9", path = "../transfer_wasm" }
