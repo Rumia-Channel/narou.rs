@@ -3,15 +3,15 @@ use std::collections::{HashMap, HashSet};
 use crate::error::{NarouError, Result};
 use crate::platform::{HttpClient, PlatformFuture, ProgressReporter, RateLimiter};
 
-use super::html::{delete_ruby_tag, slim_subtitle};
+use super::html::{delete_ruby_tag, restore_entities, slim_subtitle};
 use super::http_policy;
 use super::novel_info::NovelInfo;
 use super::preprocess::PreprocessJobs;
 use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
 use super::util::{
-    decode_html_text, load_length_limit, pretreatment_source_with_jobs,
-    ruby_filename_special_chars, sanitize_filename, sanitize_filename_with_limit,
+    load_length_limit, pretreatment_source_with_jobs, ruby_filename_special_chars,
+    sanitize_filename, sanitize_filename_with_limit,
 };
 
 pub async fn fetch_toc(
@@ -85,19 +85,21 @@ pub fn parse_subtitles(
                 }
             });
         // narou.rb は TOC ソース全体を `Helper.restore_entity` で復号してから
-        // multi_match する。ここではキャプチャ値だけ同じ復号を掛ける (本文側の
-        // 前処理は実体を残す必要があるため、ソース全体は変更しない)。
+        // multi_match する。ここではキャプチャ値だけ同じ順序の復号を掛ける
+        // (本文側の前処理は実体を残す必要があるため、ソース全体は変更しない)。
+        // 汎用の `decode_html_text` は &amp; を先に復号するため &amp;quot; が
+        // `"` に化けるなど Ruby と差が出るので使わない。
         let chapter = caps
             .name("chapter")
-            .map(|m| decode_html_text(m.as_str()))
+            .map(|m| restore_entities(m.as_str()))
             .unwrap_or_default();
         let subchapter = caps
             .name("subchapter")
-            .map(|m| decode_html_text(m.as_str()))
+            .map(|m| restore_entities(m.as_str()))
             .unwrap_or_default();
         let subtitle_raw = caps
             .name("subtitle")
-            .map(|m| decode_html_text(m.as_str()))
+            .map(|m| restore_entities(m.as_str()))
             .unwrap_or_default();
         let subdate = caps
             .name("subdate")
@@ -437,6 +439,32 @@ mod tests {
         assert_eq!(subtitles[0].subtitle, "プロローグ：なぜか江戸時代へ転移　<C201>");
         assert_eq!(subtitles[0].file_subtitle, "プロローグ：なぜか江戸時代へ転移　〈C201〉");
         assert_eq!(subtitles[0].chapter, "第&章");
+    }
+
+    #[test]
+    fn toc_capture_entity_restore_follows_ruby_order() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.domain == "ncode.syosetu.com").unwrap();
+        // Ruby の restore_entity は quot → amp → nbsp → lt → gt ... の順。
+        // &amp;quot; は amp の後に quot を再検査しないので `"` ではなく
+        // `&quot;` のまま残る (汎用 decode_html_text とここが異なる)。
+        let toc_source = r#"
+<div class="p-eplist__chapter-title">第&amp;quot;章</div>
+
+<div class="p-eplist__sublist">
+<a href="/n1234aa/1/" class="p-eplist__subtitle">
+&amp;apos; 始まり
+</a>
+
+<div class="p-eplist__update">
+2024年01月01日 00時00分
+</div>
+</div>
+"#;
+        let subtitles = parse_subtitles(setting, toc_source, &HashMap::new()).unwrap();
+        assert_eq!(subtitles[0].chapter, "第&quot;章");
+        assert_eq!(subtitles[0].subtitle, "&apos; 始まり");
+        assert_eq!(subtitles[0].file_subtitle, "&apos; 始まり");
     }
 
     #[test]

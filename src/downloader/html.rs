@@ -158,7 +158,10 @@ pub fn slim_subtitle(text: &str) -> String {
     delete_ruby_tag(text).replace('\n', "")
 }
 
-fn restore_entities(text: &str) -> String {
+/// narou.rb の `Helper.restore_entity` と同じ順序・同じ表で実体を復号する。
+/// TOC キャプチャの復号にも使うため `pub(crate)`。`decode_html_text` は
+/// 順序と集合が異なる (汎用デコーダ) ので、互換性が要る経路ではこれを使う。
+pub(crate) fn restore_entities(text: &str) -> String {
     let mut result = text.to_string();
     let entities: &[(&str, &str)] = &[
         ("&quot;", "\""),

@@ -414,7 +414,7 @@ pub fn mask_spoiler_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_section_url, decode_html_text, mask_spoiler_text, parse_two_digit_year_datetime,
+        build_section_url, mask_spoiler_text, parse_two_digit_year_datetime,
         ruby_filename_special_chars, sanitize_filename_with_limit,
     };
     use crate::downloader::site_setting::SiteSetting;
@@ -440,10 +440,7 @@ mod tests {
         );
         // 実体参照そのものは写像対象外。デコード後の `<` / `>` が `〈` / `〉` になる。
         assert_eq!(ruby_filename_special_chars("&lt;C201&gt;"), "&lt;C201&gt;");
-        assert_eq!(
-            ruby_filename_special_chars(&decode_html_text("&lt;C201&gt;")),
-            "〈C201〉"
-        );
+        assert_eq!(ruby_filename_special_chars("<C201>"), "〈C201〉");
     }
 
     #[test]
