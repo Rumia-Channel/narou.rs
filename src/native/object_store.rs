@@ -358,17 +358,112 @@ impl NativeObjectStore {
     }
 
     pub(crate) fn recursive_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
-        for entry in fs::read_dir(current)? {
-            let entry = entry?;
-            let path = entry.path();
-            let safe_path = crate::db::paths::ensure_within_archive_root(&path, root)?;
-            if safe_path.is_dir() {
-                Self::recursive_files(root, &safe_path, output)?;
-            } else if safe_path.is_file() {
-                output.push(safe_path);
-            }
+        Self::recursive_files_filtered(root, current, output, &mut |_, _, _| false)
+    }
+
+    pub(crate) fn recursive_files_filtered<F>(
+        root: &Path,
+        current: &Path,
+        output: &mut Vec<PathBuf>,
+        skip: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Path, &Path, bool) -> bool,
+    {
+        let safe_root = crate::db::paths::ensure_within_archive_root(root, root)?;
+        let safe_current = crate::db::paths::ensure_within_archive_root(current, &safe_root)?;
+        Self::recursive_files_inner(&safe_root, &safe_current, output, &mut Vec::new(), skip)
+    }
+
+    #[cfg(unix)]
+    fn classify_walk_entry(
+        safe_root: &Path,
+        safe_current: &Path,
+        path: &Path,
+        file_name: &std::ffi::OsStr,
+        file_type: fs::FileType,
+    ) -> Result<(PathBuf, bool, bool)> {
+        if !file_type.is_symlink() && (file_type.is_dir() || file_type.is_file()) {
+            return Ok((safe_current.join(file_name), file_type.is_dir(), file_type.is_file()));
         }
-        Ok(())
+        let safe_path = crate::db::paths::ensure_within_archive_root(path, safe_root)?;
+        Ok((safe_path.clone(), safe_path.is_dir(), safe_path.is_file()))
+    }
+
+    #[cfg(windows)]
+    fn classify_walk_entry(
+        safe_root: &Path,
+        safe_current: &Path,
+        path: &Path,
+        file_name: &std::ffi::OsStr,
+        _file_type: fs::FileType,
+    ) -> Result<(PathBuf, bool, bool)> {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+            && (meta.is_dir() || meta.is_file())
+        {
+            return Ok((safe_current.join(file_name), meta.is_dir(), meta.is_file()));
+        }
+        let safe_path = crate::db::paths::ensure_within_archive_root(path, safe_root)?;
+        Ok((safe_path.clone(), safe_path.is_dir(), safe_path.is_file()))
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    fn classify_walk_entry(
+        safe_root: &Path,
+        _safe_current: &Path,
+        path: &Path,
+        _file_name: &std::ffi::OsStr,
+        _file_type: fs::FileType,
+    ) -> Result<(PathBuf, bool, bool)> {
+        let safe_path = crate::db::paths::ensure_within_archive_root(path, safe_root)?;
+        Ok((safe_path.clone(), safe_path.is_dir(), safe_path.is_file()))
+    }
+
+    fn recursive_files_inner<F>(
+        safe_root: &Path,
+        safe_current: &Path,
+        output: &mut Vec<PathBuf>,
+        ancestors: &mut Vec<PathBuf>,
+        skip: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Path, &Path, bool) -> bool,
+    {
+        if ancestors.iter().any(|path| path == safe_current) {
+            return Err(NarouError::Platform("cyclic native namespace link".into()));
+        }
+        ancestors.push(safe_current.to_path_buf());
+        let result = (|| {
+            let mut entries = Vec::new();
+            for entry in fs::read_dir(safe_current)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                entries.push((entry.path(), entry.file_name(), file_type));
+            }
+            for (path, file_name, file_type) in entries {
+                let (safe_path, is_dir, is_file) = Self::classify_walk_entry(
+                    safe_root,
+                    safe_current,
+                    &path,
+                    &file_name,
+                    file_type,
+                )?;
+                if skip(safe_root, &safe_path, is_dir) {
+                    continue;
+                }
+                if is_dir {
+                    Self::recursive_files_inner(safe_root, &safe_path, output, ancestors, skip)?;
+                } else if is_file {
+                    output.push(safe_path);
+                }
+            }
+            Ok(())
+        })();
+        ancestors.pop();
+        result
     }
 }
 
@@ -432,7 +527,7 @@ pub(crate) fn run_scoped_blocking<T>(operation: impl FnOnce() -> Result<T>) -> R
     }
 }
 
-const ATOMIC_OBJECT_TEMP_PREFIX: &str = ".narou-object-";
+pub(crate) const ATOMIC_OBJECT_TEMP_PREFIX: &str = ".narou-object-";
 
 pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path
@@ -1714,9 +1809,13 @@ impl NativeObjectStore {
     /// passed inside the committed transaction. The identical conflict rules
     /// are re-validated against the committed handoff state.
     pub(crate) fn install_adopted_gate_locked(&self,path:&Path,prefix:&ObjectPrefix,gate:&FsGate,connection:&rusqlite::Connection)->Result<()>{
+        self.install_adopted_gate_nosync(path,prefix,gate,connection)?;sync_transfer_parent(path)
+    }
+
+    pub(crate) fn install_adopted_gate_nosync(&self,path:&Path,prefix:&ObjectPrefix,gate:&FsGate,connection:&rusqlite::Connection)->Result<()>{
         self.require_adopted_gate_target(path,prefix,gate,connection)?;
         self.ensure_parent_dir(path)?;
-        atomic_write_bytes(path,&serde_json::to_vec(gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(path)
+        atomic_write_bytes(path,&serde_json::to_vec(gate).map_err(|error|NarouError::Platform(error.to_string()))?)
     }
 
     /// Durable intent journal for the SQL→FS adoption of `prefix`: a
@@ -1728,8 +1827,12 @@ impl NativeObjectStore {
     }
 
     pub(crate) fn install_pending_gate_locked(&self,prefix:&ObjectPrefix,gate:&FsGate)->Result<()>{
+        let path=self.install_pending_gate_nosync(prefix,gate)?;sync_transfer_parent(&path)
+    }
+
+    pub(crate) fn install_pending_gate_nosync(&self,prefix:&ObjectPrefix,gate:&FsGate)->Result<PathBuf>{
         let path=self.gate_pending_path(prefix)?;self.ensure_parent_dir(&path)?;
-        atomic_write_bytes(&path,&serde_json::to_vec(gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(&path)
+        atomic_write_bytes(&path,&serde_json::to_vec(gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;Ok(path)
     }
 
     pub(crate) fn read_pending_gate_locked(&self,prefix:&ObjectPrefix)->Result<Option<FsGate>>{
@@ -1742,7 +1845,25 @@ impl NativeObjectStore {
 
     pub(crate) fn remove_pending_gate_locked(&self,prefix:&ObjectPrefix)->Result<()>{
         let path=self.gate_pending_path(prefix)?;
-        match fs::remove_file(&path){Ok(())=>{sync_transfer_parent(&path)?;Ok(())},Err(error)if error.kind()==std::io::ErrorKind::NotFound=>Ok(()),Err(error)=>Err(error.into())}
+        if self.remove_pending_gate_nosync(prefix)? { sync_transfer_parent(&path)?; }
+        Ok(())
+    }
+
+    pub(crate) fn remove_pending_gate_nosync(&self,prefix:&ObjectPrefix)->Result<bool>{
+        let path=self.gate_pending_path(prefix)?;
+        match fs::remove_file(&path){Ok(())=>Ok(true),Err(error)if error.kind()==std::io::ErrorKind::NotFound=>Ok(false),Err(error)=>Err(error.into())}
+    }
+
+    pub(crate) fn sync_gate_dir(&self)->Result<()>{
+        let dir=self.root().join(".objects/.narou-transfer/.gate");
+        if dir.is_dir(){crate::compat::fsync_dir(&dir)?;}
+        Ok(())
+    }
+
+    pub(crate) fn sync_pending_gate_dir(&self)->Result<()>{
+        let dir=self.root().join(".objects/.narou-transfer/.gate.pending");
+        if dir.is_dir(){crate::compat::fsync_dir(&dir)?;}
+        Ok(())
     }
 
     /// Clear the `migrated` marker of a gate whose FS→SQL commit never
@@ -1918,7 +2039,7 @@ fn file_stamp_opened(file:&fs::File)->Result<FileStamp>{
 struct VerifiedFile { stamp:FileStamp, sha256:String, source:Option<String>, pending:bool }
 
 impl NativeObjectStore {
-    fn forget_file_proof(&self,key:&ObjectKey)->Result<()>{let path=self.proof_path(key)?;match fs::remove_file(path){Ok(())=>Ok(()),Err(error)if error.kind()==std::io::ErrorKind::NotFound=>Ok(()),Err(error)=>Err(error.into())}}
+    pub(crate) fn forget_file_proof(&self,key:&ObjectKey)->Result<()>{let path=self.proof_path(key)?;match fs::remove_file(path){Ok(())=>Ok(()),Err(error)if error.kind()==std::io::ErrorKind::NotFound=>Ok(()),Err(error)=>Err(error.into())}}
     fn require_open_writer_locked(&self,fence:&crate::platform::WriteFence)->Result<FsGate>{
         let gate:FsGate=serde_json::from_slice(&fs::read(self.gate_path(&fence.prefix)?)?).map_err(|error|NarouError::Platform(error.to_string()))?;
         if gate.migrated{return Err(af::gate_closed_error(&fence.prefix));}
@@ -1969,7 +2090,7 @@ impl NativeObjectStore {
         if proof.pending||file_stamp(&from)?!=proof.stamp{return Err(NarouError::Platform("sealed stage file identity changed".into()));}
         proof.source=Some(stage.to_string());proof.pending=true;self.put_file_proof(key,&proof)?;
         self.ensure_parent_dir(&target)?;fs::rename(&from,&target)?;sync_transfer_parent(&target)?;sync_transfer_parent(&from)?;
-        proof.stamp=file_stamp(&target)?;proof.pending=false;self.put_file_proof(key,&proof)?;Ok((proof.stamp.size,proof.sha256))
+        proof.stamp=file_stamp(&target)?;proof.pending=false;self.put_file_proof(key,&proof)?;let _=self.forget_file_proof(stage);Ok((proof.stamp.size,proof.sha256))
     }
     pub(crate) fn remove_verified_file(&self,key:&ObjectKey,sha:&str)->Result<()>{
         let path=self.resolve_path(key)?;if !path.exists(){return Ok(());}
@@ -1978,7 +2099,34 @@ impl NativeObjectStore {
     }
 }
 
+struct CutoverLockGuard(fs::File);
+
+impl Drop for CutoverLockGuard {
+    fn drop(&mut self) {
+        // Explicit unlock releases immediately before handle close / reuse on both Windows and Unix.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 impl NativeObjectStore {
+    fn acquire_cutover_lock(&self, exclusive: bool) -> Result<CutoverLockGuard> {
+        let path = self.resolve_path(&ObjectKey::try_new(".narou-transfer/.lock/_cutover")?)?;
+        self.ensure_parent_dir(&path)?;
+        let file = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+        let acquired = if exclusive { fs2::FileExt::try_lock_exclusive(&file) } else { fs2::FileExt::try_lock_shared(&file) };
+        acquired.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+                NarouError::Platform("novel_busy: OS mutation lock is held".into())
+            } else { error.into() }
+        })?;
+        Ok(CutoverLockGuard(file))
+    }
+    /// Library-wide exclusive barrier for SQLite→YAML cutover: excludes every
+    /// per-prefix writer/reader lock in one FD instead of opening N prefix FDs.
+    pub(crate) fn with_cutover_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _cutover = self.acquire_cutover_lock(true)?;
+        operation()
+    }
     /// The caller's closure (including canonical rename) runs under this OS lock.
     /// A paused process still owns its kernel lock; no wall-clock takeover exists.
     pub fn with_transfer_lock<T>(&self, identity: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -1990,6 +2138,7 @@ impl NativeObjectStore {
         self.with_namespace_lock(identity, true, operation)
     }
     fn with_namespace_lock<T>(&self, identity: &str, reader: bool, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _cutover = self.acquire_cutover_lock(false)?;
         let digest = hex::encode(sha2::Sha256::digest(identity.as_bytes()));
         let path = self.resolve_path(&ObjectKey::try_new(format!(".narou-transfer/.lock/{digest}"))?)?;
         self.ensure_parent_dir(&path)?;
@@ -2000,22 +2149,12 @@ impl NativeObjectStore {
                 NarouError::Platform("novel_busy: OS mutation lock is held".into())
             } else { error.into() }
         })?;
-        // Windows may defer CloseHandle's automatic unlock; release before reuse.
-        #[cfg(windows)]
-        struct UnlockOnDrop(fs::File);
-        #[cfg(windows)]
-        impl Drop for UnlockOnDrop {
-            fn drop(&mut self) { let _ = fs2::FileExt::unlock(&self.0); }
-        }
-        #[cfg(windows)]
-        let _lock = UnlockOnDrop(lock);
+        let _lock = CutoverLockGuard(lock);
         let _readers = if reader {
             let path = self.resolve_path(&ObjectKey::try_new(format!(".narou-transfer/.lock/{digest}.readers"))?)?;
             let file = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
             fs2::FileExt::lock_exclusive(&file)?;
-            #[cfg(windows)]
-            let file = UnlockOnDrop(file);
-            Some(file)
+            Some(CutoverLockGuard(file))
         } else { None };
         operation()
     }
@@ -3011,6 +3150,32 @@ mod tests {
             visit_namespace_gates(root.path(), &conn.lock(), |p, closed, _, epoch, _| { seen.push((p.to_owned(), closed, epoch)); Ok(()) }).unwrap();
             assert_eq!(seen, vec![("novels/site/visit".to_string(), false, 2u64)]);
         });
+    }
+
+    #[test]
+    fn cutover_lock_excludes_concurrent_transfer_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let busy = store
+            .with_transfer_lock("novels/site/book", || store.with_cutover_lock(|| Ok(())))
+            .unwrap_err();
+        assert!(busy.to_string().contains("novel_busy:"), "{busy}");
+
+        let busy_reverse = store
+            .with_cutover_lock(|| store.with_transfer_lock("novels/site/book", || Ok(())))
+            .unwrap_err();
+        assert!(busy_reverse.to_string().contains("novel_busy:"), "{busy_reverse}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_files_rejects_symlink_cycle() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("site/book")).unwrap();
+        std::os::unix::fs::symlink(root.path(), root.path().join("site/book/loop")).unwrap();
+        let mut files = Vec::new();
+        let err = NativeObjectStore::recursive_files(root.path(), root.path(), &mut files).unwrap_err();
+        assert!(err.to_string().contains("cyclic native namespace link"), "{err}");
     }
 }
 

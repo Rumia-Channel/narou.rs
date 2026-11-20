@@ -160,6 +160,15 @@ async fn api_list_inner(
     } else {
         LibrarySortOrder::Ascending
     };
+    let (hidden, exclude_ids) = tokio::task::spawn_blocking(|| {
+        let hidden = crate::native::hidden::load().unwrap_or_default();
+        let exclude_ids: Vec<i64> = crate::native::virtual_novel::load()
+            .map(|members| members.all_member_ids().into_iter().collect())
+            .unwrap_or_default();
+        (hidden, exclude_ids)
+    })
+    .await
+    .map_err(|error| map_application_error(ApplicationError::Platform(error.to_string())))?;
     let mut reads = state.services.content.read_scope("native-library-list");
     let result = async {
     let page = state
@@ -171,11 +180,9 @@ async fn api_list_inner(
             length,
             sort_column,
             sort_order,
-            hidden: Some(crate::native::hidden::load().unwrap_or_default()),
+            hidden: Some(hidden),
             include_hidden: params.show_hidden.unwrap_or(false),
-            exclude_ids: crate::native::virtual_novel::load()
-                .map(|members| members.all_member_ids().into_iter().collect())
-                .unwrap_or_default(),
+            exclude_ids,
             attribute_tags_enabled: crate::application::attribute_tags::enabled(&state.services.settings).await,
         })
         .await

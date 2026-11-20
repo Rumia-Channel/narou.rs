@@ -62,9 +62,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::Write;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::StreamExt;
 
@@ -72,7 +72,7 @@ use crate::db::state_inventory;
 use crate::error::{NarouError, Result};
 use crate::native::object_store::{FsGate, NativeObjectStore};
 use crate::platform::{
-    AssetStore, AssetStream, ObjectKey, ObjectListRequest, ObjectPrefix, ObjectStore,
+    AssetStore, AssetStream, ObjectKey, ObjectPrefix, ObjectStore,
 };
 
 use super::state::StorageMode;
@@ -84,8 +84,30 @@ const DEFAULT_EXPORT_DIR: &str = "narou-yaml-export";
 /// illustration files the section bodies refer to.
 const ILLUSTRATION_CACHE_FILE: &str = ".illustration_cache.yaml";
 
-/// Listing page size for the object walk (one page per round trip).
-const OBJECT_PAGE: usize = 512;
+/// Listing page size for the SQLite object walk.
+const OBJECT_PAGE: usize = 1024;
+
+static EXPORT_IN_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+
+/// True while at least one SQLite -> YAML export/cutover is active.
+pub(crate) fn export_in_progress() -> bool {
+    EXPORT_IN_PROGRESS.load(Ordering::Acquire) > 0
+}
+
+struct ExportInProgressGuard;
+
+impl ExportInProgressGuard {
+    fn enter() -> Self {
+        EXPORT_IN_PROGRESS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for ExportInProgressGuard {
+    fn drop(&mut self) {
+        EXPORT_IN_PROGRESS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Write the YAML/TXT bundle and return the directory holding it.
 ///
@@ -145,18 +167,29 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
     };
 
     let export_state = (in_place || comparable(&out_dir) == comparable(&narou_dir))
-        .then_some(&state);
+        .then_some(state.clone());
+
+    let _export_guard = ExportInProgressGuard::enter();
 
     if in_place {
-        sweep_stale_staging(&narou_dir)?;
+        let narou_dir_for_sweep = narou_dir.clone();
+        crate::native::object_store::run_blocking(move || sweep_stale_staging(&narou_dir_for_sweep)).await?;
     }
 
     // Phase 1 — coherent capture. The compat authority lock serializes with
     // record/state writers, and one deferred transaction pins the SQL side,
     // so every published byte comes from the same consistent snapshot.
-    let snapshot = state.with_compat_lock(|| {
-        CutoverSnapshot::capture(&state, &narou_dir, &layout.library_archive)
-    })?;
+    let snapshot = {
+        let state = state.clone();
+        let narou_dir = narou_dir.clone();
+        let library_archive = layout.library_archive.clone();
+        crate::native::object_store::run_blocking(move || {
+            state.with_compat_lock(|| {
+                CutoverSnapshot::capture(&state, &narou_dir, &library_archive)
+            })
+        })
+        .await?
+    };
 
     // Phase 2 — stream bodies. In place they are prepared privately (one
     // staging directory inside `.narou`, renamed into position only after the
@@ -176,21 +209,31 @@ pub async fn export_yaml_async(out: Option<PathBuf>, in_place: bool) -> Result<P
     };
 
     // Phase 3 — guarded finalization / bundle publication.
-    let result = if in_place {
-        finalize_in_place(
-            &state,
-            &narou_dir,
-            &layout,
-            &snapshot,
-            &staged,
-            export_state,
-        )
-    } else {
-        publish_metadata(&out_dir, &layout, &snapshot, export_state)
+    let result = {
+        let state = state.clone();
+        let narou_dir = narou_dir.clone();
+        let layout = layout.clone();
+        let out_dir_for_phase3 = out_dir.clone();
+        crate::native::object_store::run_blocking(move || {
+            let result = if in_place {
+                finalize_in_place(
+                    &state,
+                    &narou_dir,
+                    &layout,
+                    &snapshot,
+                    &staged,
+                    export_state.as_ref(),
+                )
+            } else {
+                publish_metadata(&out_dir_for_phase3, &layout, &snapshot, export_state.as_ref())
+            };
+            if let Some(dir) = staging_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            result
+        })
+        .await
     };
-    if let Some(dir) = &staging_dir {
-        let _ = std::fs::remove_dir_all(dir);
-    }
     result.map(|()| out_dir)
 }
 
@@ -286,14 +329,48 @@ fn fingerprint_ignored(relative: &str) -> bool {
     name.ends_with(".lock") || name.starts_with(".narou-export-")
 }
 
+fn is_internal_archive_dir(relative: &str) -> bool {
+    relative == ".objects/.narou-staging"
+        || relative.starts_with(".objects/.narou-staging/")
+        || relative
+            .strip_prefix(".objects/.narou-transfer/")
+            .is_some_and(|rest| rest != ".refs" && !rest.starts_with(".refs/"))
+}
+
+fn fingerprint_ignored_dir(relative: &str) -> bool {
+    if is_internal_archive_dir(relative) {
+        return true;
+    }
+    relative != ".objects/.narou-transfer"
+        && !relative.starts_with(".objects/.narou-transfer/")
+        && relative
+            .split('/')
+            .any(|part| part == ".narou-transfer" || part == ".narou-staging")
+}
+
 fn fingerprint_tree(base: &Path, prefix: &str, out: &mut BTreeMap<String, Option<FileStamp>>) -> Result<()> {
     if !base.is_dir() {
         return Ok(());
     }
+    let canonical_base = crate::db::paths::ensure_within_archive_root(base, base)?;
     let mut files = Vec::new();
-    NativeObjectStore::recursive_files(base, base, &mut files)?;
+    NativeObjectStore::recursive_files_filtered(
+        &canonical_base,
+        &canonical_base,
+        &mut files,
+        &mut |safe_root, path, is_dir| {
+            let Ok(relative) = path.strip_prefix(safe_root) else {
+                return false;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if is_dir {
+                return fingerprint_ignored_dir(&relative);
+            }
+            fingerprint_ignored(&relative)
+        },
+    )?;
     for path in files {
-        let Ok(relative) = path.strip_prefix(base) else { continue };
+        let Ok(relative) = path.strip_prefix(&canonical_base) else { continue };
         let relative = relative.to_string_lossy().replace('\\', "/");
         if fingerprint_ignored(&relative) {
             continue;
@@ -550,22 +627,6 @@ fn sweep_stale_staging(narou_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Hold every prefix transfer lock (sorted, so lock order is consistent with
-/// the per-prefix `lock -> connection` order writers use) for the whole
-/// finalization. Gate mutations and gate-adoption callers serialize here.
-fn with_prefix_locks<T>(
-    mirror: &NativeObjectStore,
-    prefixes: &[String],
-    operation: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    match prefixes.split_first() {
-        Some((first, rest)) => {
-            mirror.with_transfer_lock(first, || with_prefix_locks(mirror, rest, operation))
-        }
-        None => operation(),
-    }
-}
-
 /// Guarded in-place finalization: re-validate the snapshot, publish metadata,
 /// move staged bodies into position, then — inside one Immediate transaction
 /// — journal the durable `yaml_pending` intent, retire every SQL gate and
@@ -612,6 +673,7 @@ fn finalize_in_place(
         // Move staged bodies into place, each under its target's file lock
         // with the captured stamp re-checked so a fallback file edited
         // mid-export is never silently overwritten.
+        let mut synced_parents = BTreeSet::new();
         for (staged_path, target) in staged {
             let canonical_target = comparable(target);
             let canonical_root = comparable(&root);
@@ -634,9 +696,14 @@ fn finalize_in_place(
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::rename(staged_path, target)?;
-                crate::compat::fsync_parent_dir(target)?;
                 Ok(())
             })?;
+            if let Some(parent) = target.parent() {
+                synced_parents.insert(parent.to_path_buf());
+            }
+        }
+        for parent in &synced_parents {
+            crate::compat::fsync_dir(parent)?;
         }
 
         let prefixes: Vec<String> = {
@@ -658,7 +725,7 @@ fn finalize_in_place(
         crate::db::inventory::atomic_write(&intent_path, "sqlite->yaml cutover in flight\n")?;
 
         let mut committed = false;
-        let cutover = with_prefix_locks(&mirror, &prefixes, || -> Result<()> {
+        let cutover = mirror.with_cutover_lock(|| -> Result<()> {
             let mut conn = state.conn_ref().lock();
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -682,13 +749,16 @@ fn finalize_in_place(
             for prefix_key in &prefixes {
                 let prefix = ObjectPrefix::new(prefix_key.clone())?;
                 if let Some(gate) = store
-                    .adopt_sql_gate_in_tx(&tx, &prefix)
+                    .adopt_sql_gate_in_tx_nosync(&tx, &prefix)
                     .map_err(|error| {
                         NarouError::Platform(format!("FS gate adoption failed for {prefix_key}: {error}"))
                     })?
                 {
                     adopted.push((prefix, gate));
                 }
+            }
+            if !prefixes.is_empty() {
+                mirror.sync_pending_gate_dir()?;
             }
             // The marker flips inside the write barrier so the first SQLite
             // commit that can land after it is ordered after YAML authority.
@@ -706,13 +776,25 @@ fn finalize_in_place(
             committed = true;
             for (prefix, gate) in &adopted {
                 store
-                    .finalize_sql_gate_adoption_locked(prefix, gate, &conn)
+                    .install_adopted_gate_nosync(prefix, gate, &conn)
                     .map_err(|error| {
                         NarouError::Platform(format!(
                             "FS gate finalization failed for {}: {error}",
                             prefix.as_ref()
                         ))
                     })?;
+            }
+            if !adopted.is_empty() {
+                mirror.sync_gate_dir()?;
+                for (prefix, _) in &adopted {
+                    mirror.remove_pending_gate_nosync(prefix).map_err(|error| {
+                        NarouError::Platform(format!(
+                            "FS gate finalization failed for {}: {error}",
+                            prefix.as_ref()
+                        ))
+                    })?;
+                }
+                mirror.sync_pending_gate_dir()?;
             }
             // Converged: discharge the in-flight intent evidence (best-effort;
             // the reconciler removes it too if this process dies first).
@@ -883,6 +965,7 @@ fn write_state_file(
 
 /// Where the exported halves go: the real library (`in_place`) or one bundle
 /// directory.
+#[derive(Clone)]
 struct ExportLayout {
     /// The library's real `小説データ/`: reads (and the filesystem fallback)
     /// come from here even when the export itself writes into a bundle.
@@ -1037,32 +1120,33 @@ async fn write_stored_objects(
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut indexes: Vec<(ObjectKey, Vec<String>)> = Vec::new();
 
+    // Phase A: SQLite objects paged by primary key (zero filesystem walks).
     let mut cursor: Option<String> = None;
     loop {
-        let mut request = ObjectListRequest::new(
-            ObjectPrefix::new("")?,
-            NonZeroUsize::new(OBJECT_PAGE).expect("page size is non-zero"),
-        );
-        if let Some(current) = &cursor {
-            request = request.after(current.clone());
-        }
-        let page = store.list_page(&request).await?;
-        for metadata in &page.objects {
-            if !seen.insert(metadata.key.as_ref().to_string()) {
+        let page = crate::native::object_store::run_blocking({
+            let store = store.clone();
+            let cursor = cursor.clone();
+            move || store.list_sqlite_objects_page(cursor.as_deref(), OBJECT_PAGE)
+        })
+        .await?;
+        let rows = page.objects;
+        let next_cursor = page.next_cursor;
+        let mut page_entries: Vec<(ObjectKey, u64, PathBuf)> = Vec::with_capacity(rows.len());
+        for (key, size) in rows {
+            if !seen.insert(key.as_ref().to_string()) {
                 continue;
             }
-            let key = &metadata.key;
             // Remote-reference markers (.narou-transfer/.refs/<logical>) are
             // published metadata the FS/YAML backend reads verbatim — they
             // must cross the cutover. Every other reserved namespace
             // (sessions, stage ledgers, locks, .data blobs) stays out.
-            if crate::platform::is_reserved_key(key)
-                && !crate::native::object_store::is_remote_reference_key(key)
+            if crate::platform::is_reserved_key(&key)
+                && !crate::native::object_store::is_remote_reference_key(&key)
             {
                 continue;
             }
-            if let Some(prefix) = index_prefix(key) {
-                let Some(payload) = store.read_small(key).await? else {
+            if let Some(prefix) = index_prefix(&key) {
+                let Some(payload) = store.read_small(&key).await? else {
                     return Err(NarouError::Database(format!(
                         "挿絵索引を読み出せません: {key}"
                     )));
@@ -1076,25 +1160,153 @@ async fn write_stored_objects(
                     index.filenames().into_iter().collect(),
                 ));
             }
-            let target = layout.target_path(key)?;
-            let path = match staging {
+            let target = layout.target_path(&key)?;
+            page_entries.push((key, size, target));
+        }
+
+        if let Some(staging_dir) = staging {
+            let verdicts = if page_entries.is_empty() {
+                Vec::new()
+            } else {
+                crate::native::object_store::run_blocking({
+                    let store = store.clone();
+                    let items = page_entries.clone();
+                    move || store.check_inline_targets_batch(&items)
+                })
+                .await?
+            };
+            for ((key, size, target), verdict) in page_entries.into_iter().zip(verdicts) {
+                match verdict {
+                    Some(true) => continue,
+                    Some(false) => {}
+                    None => match asset_matches_existing_file(store, &key, Some(size), &target).await? {
+                        Some(true) => continue,
+                        Some(false) => {}
+                        None => {
+                            return Err(NarouError::Database(format!(
+                                "書き出すべきオブジェクトを読み出せません: {key}"
+                            )));
+                        }
+                    },
+                }
+                let path = staged_path(staging_dir, library_root, &target)?;
+                if !write_asset(store, &key, &path).await? {
+                    return Err(NarouError::Database(format!(
+                        "書き出すべきオブジェクトを読み出せません: {key}"
+                    )));
+                }
+                staged.push((path, target));
+            }
+        } else {
+            for (key, _, target) in page_entries {
+                if !write_asset(store, &key, &target).await? {
+                    return Err(NarouError::Database(format!(
+                        "書き出すべきオブジェクトを読み出せません: {key}"
+                    )));
+                }
+            }
+        }
+
+        match next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    // Phase B: single O(N) filesystem scan for pre-import / un-imported fallback files.
+    if layout.library_archive.is_dir() {
+        let files = crate::native::object_store::run_blocking({
+            let archive = layout.library_archive.clone();
+            move || {
+                let mut files = Vec::new();
+                NativeObjectStore::recursive_files_filtered(
+                    &archive,
+                    &archive,
+                    &mut files,
+                    &mut |safe_root, path, is_dir| {
+                        let Ok(relative) = path.strip_prefix(safe_root) else {
+                            return false;
+                        };
+                        let relative = relative.to_string_lossy().replace('\\', "/");
+                        if is_dir {
+                            return is_internal_archive_dir(&relative);
+                        }
+                        if fingerprint_ignored(&relative) {
+                            return true;
+                        }
+                        let name = relative.rsplit('/').next().unwrap_or(&relative);
+                        if name.starts_with(".narou-asset-") {
+                            return true;
+                        }
+                        relative.starts_with(".objects/")
+                            && name.starts_with(crate::native::object_store::ATOMIC_OBJECT_TEMP_PREFIX)
+                    },
+                )?;
+                files.sort();
+                Ok(files)
+            }
+        })
+        .await?;
+
+        for path in files {
+            let Some(key) =
+                crate::native::object_store::logical_key_for_native_path(&layout.library_archive, &path)
+            else {
+                continue;
+            };
+            if !seen.insert(key.as_ref().to_string()) {
+                continue;
+            }
+            if crate::platform::is_reserved_key(&key)
+                && !crate::native::object_store::is_remote_reference_key(&key)
+            {
+                continue;
+            }
+            if let Some(prefix) = index_prefix(&key) {
+                let payload = std::fs::read(&path)?;
+                let index: crate::illustration_store::IllustrationIndex =
+                    serde_yaml::from_slice(&payload).map_err(|error| {
+                        NarouError::Database(format!("挿絵索引 {key} を読めません: {error}"))
+                    })?;
+                indexes.push((
+                    ObjectKey::try_new(prefix.to_string())?,
+                    index.filenames().into_iter().collect(),
+                ));
+            }
+            let target = layout.target_path(&key)?;
+            if staging.is_some() && comparable(&target) == comparable(&path) {
+                continue;
+            }
+            if staging.is_some()
+                && matches!(
+                    asset_matches_existing_file(store, &key, None, &target).await?,
+                    Some(true)
+                )
+            {
+                continue;
+            }
+            let dest = match staging {
                 Some(dir) => staged_path(dir, library_root, &target)?,
                 None => target.clone(),
             };
-            if !write_asset(store, key, &path).await? {
-                return Err(NarouError::Database(format!(
-                    "書き出すべきオブジェクトを読み出せません: {key}"
-                )));
+            if !write_asset(store, &key, &dest).await? {
+                if crate::native::object_store::is_remote_reference_key(&key) {
+                    let bytes = std::fs::read(&path)?;
+                    let stream = Box::pin(futures::stream::once(async move { Ok(bytes) }));
+                    write_stream_to_path(stream, &dest).await?;
+                } else {
+                    return Err(NarouError::Database(format!(
+                        "書き出すべきオブジェクトを読み出せません: {key}"
+                    )));
+                }
             }
             if staging.is_some() {
-                staged.push((path, target));
+                staged.push((dest, target));
             }
         }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok((staged, indexes, seen)),
-        }
     }
+
+    Ok((staged, indexes, seen))
 }
 
 /// Illustrations the index names but the listing does not carry.
@@ -1125,6 +1337,14 @@ async fn write_indexed_illustrations(
                 Some(dir) => staged_path(dir, library_root, &target)?,
                 None => target.clone(),
             };
+            if staging.is_some()
+                && matches!(
+                    asset_matches_existing_file(store, &key, None, &target).await?,
+                    Some(true)
+                )
+            {
+                continue;
+            }
             if write_asset(store, &key, &path).await? {
                 if staging.is_some() {
                     staged.push((path, target));
@@ -1132,6 +1352,14 @@ async fn write_indexed_illustrations(
                 continue;
             }
             let Some(backend) = backend else { continue };
+            if staging.is_some()
+                && matches!(
+                    asset_matches_existing_file(backend, &key, None, &target).await?,
+                    Some(true)
+                )
+            {
+                continue;
+            }
             if write_asset(backend, &key, &path).await? && staging.is_some() {
                 staged.push((path, target));
             }
@@ -1145,6 +1373,45 @@ fn index_prefix(key: &ObjectKey) -> Option<&str> {
     let prefix = key.as_ref().strip_suffix(ILLUSTRATION_CACHE_FILE)?;
     let prefix = prefix.strip_suffix('/')?;
     (!prefix.is_empty()).then_some(prefix)
+}
+
+/// Verify whether `target` already exists with identical decoded bytes (and
+/// full CRC-32 validation of the stored stream). Returns `Ok(None)` when the
+/// store has no object for `key`.
+async fn asset_matches_existing_file(
+    store: &dyn AssetStore,
+    key: &ObjectKey,
+    expected_size: Option<u64>,
+    target: &Path,
+) -> Result<Option<bool>> {
+    let Ok(meta) = std::fs::metadata(target) else {
+        return Ok(Some(false));
+    };
+    if !meta.is_file() || expected_size.is_some_and(|size| meta.len() != size) {
+        return Ok(Some(false));
+    }
+    let Some(mut stream) = store
+        .read_stream(key)
+        .await
+        .map_err(|error| export_error(key, error))?
+    else {
+        return Ok(None);
+    };
+    let mut file = match std::fs::File::open(target) {
+        Ok(file) => file,
+        Err(_) => return Ok(Some(false)),
+    };
+    use std::io::Read;
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| export_error(key, error))?;
+        buf.resize(chunk.len(), 0);
+        if file.read_exact(&mut buf).is_err() || buf != chunk {
+            return Ok(Some(false));
+        }
+    }
+    let mut tail = [0u8; 1];
+    Ok(Some(matches!(file.read(&mut tail), Ok(0))))
 }
 
 /// Stream one stored object into `path`, replacing any previous file
@@ -1402,6 +1669,31 @@ mod tests {
                 b"image"
             );
             assert!(!archive.join("site/title/挿絵/upstream.png").exists());
+
+            // In-place (`staging = Some`): identical existing target skips staging,
+            // while missing target still falls back to `backend`.
+            let staging_root = root_path(&dir).join(".narou/.export-staging-test");
+            crate::platform::AssetStore::write_stream(
+                &backend,
+                &crate::platform::illustration_key(&prefix, "0003.png").unwrap(),
+                Box::pin(futures::stream::iter(vec![Ok(b"fresh".to_vec())])),
+            )
+            .await
+            .unwrap();
+            let staged = write_indexed_illustrations(
+                &store,
+                &layout,
+                &root_path(&dir),
+                Some(&staging_root),
+                &BTreeSet::new(),
+                vec![(prefix, vec!["0002.png".to_string(), "0003.png".to_string()])],
+                Some(backend_ref),
+            )
+            .await
+            .unwrap();
+            assert_eq!(staged.len(), 1);
+            assert_eq!(staged[0].1, archive.join("site/title/挿絵/0003.png"));
+            assert_eq!(std::fs::read(&staged[0].0).unwrap(), b"fresh");
         });
     }
 
@@ -1975,5 +2267,151 @@ mod tests {
             Some(3),
             "reader lease survives at its original epoch"
         );
+    }
+
+    #[test]
+    fn export_in_progress_guard_tracks_active_exports() {
+        let initial = export_in_progress();
+        {
+            let _g1 = ExportInProgressGuard::enter();
+            assert!(export_in_progress());
+            {
+                let _g2 = ExportInProgressGuard::enter();
+                assert!(export_in_progress());
+            }
+            assert!(export_in_progress());
+        }
+        assert_eq!(export_in_progress(), initial);
+    }
+
+    #[test]
+    fn write_stored_objects_batches_inline_handles_chunked_and_fallback() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = temp_layout(true, dir.path());
+            let archive = layout.library_archive.clone();
+            let store = memory_store(&layout);
+
+            // 1. Inline matching (on disk identically) -> skipped in place
+            let k_match = ObjectKey::try_new("novels/site/book/match.txt").unwrap();
+            ObjectStore::write_small(&store, &k_match, b"same-bytes".to_vec())
+                .await
+                .unwrap();
+            let match_target = layout.target_path(&k_match).unwrap();
+            std::fs::create_dir_all(match_target.parent().unwrap()).unwrap();
+            std::fs::write(&match_target, b"same-bytes").unwrap();
+
+            // 2. Inline differing -> staged in place
+            let k_diff = ObjectKey::try_new("novels/site/book/diff.txt").unwrap();
+            ObjectStore::write_small(&store, &k_diff, b"new-bytes!".to_vec())
+                .await
+                .unwrap();
+            let diff_target = layout.target_path(&k_diff).unwrap();
+            std::fs::write(&diff_target, b"old-bytes!").unwrap();
+
+            // 3. Chunked >512 KiB object
+            let chunk_bytes = vec![0x5Au8; 600 * 1024];
+            let k_chunk = ObjectKey::try_new("novels/site/book/big.bin").unwrap();
+            crate::platform::AssetStore::write_stream(
+                &store,
+                &k_chunk,
+                Box::pin(futures::stream::once({
+                    let bytes = chunk_bytes.clone();
+                    async move { Ok(bytes) }
+                })),
+            )
+            .await
+            .unwrap();
+
+            // 4. Filesystem-only fallback under novels/ (skipped in place, copied in bundle)
+            let fs_novel_fallback = archive.join("site/book/fallback.txt");
+            std::fs::write(&fs_novel_fallback, b"fs-fallback").unwrap();
+
+            // 5. Filesystem-only fallback under .objects/webnovel/ -> webnovel/
+            let fs_webnovel_fallback = archive.join(".objects/webnovel/fallback.yaml");
+            std::fs::create_dir_all(fs_webnovel_fallback.parent().unwrap()).unwrap();
+            std::fs::write(&fs_webnovel_fallback, b"name: fallback\n").unwrap();
+
+            let staging = dir.path().join("staging");
+            let (staged, _, _) =
+                write_stored_objects(&store, &layout, &root_path(&dir), Some(&staging))
+                    .await
+                    .unwrap();
+            let staged_targets: Vec<PathBuf> = staged.iter().map(|(_, t)| t.clone()).collect();
+            assert!(!staged_targets.contains(&match_target), "matching inline skipped");
+            assert!(staged_targets.contains(&diff_target), "differing inline staged");
+            assert!(
+                staged_targets.contains(&layout.target_path(&k_chunk).unwrap()),
+                "chunked object staged"
+            );
+            assert!(
+                !staged_targets.contains(&fs_novel_fallback),
+                "in-place novel fallback already at target"
+            );
+            assert!(
+                staged_targets.contains(&root_path(&dir).join("webnovel/fallback.yaml")),
+                "relocated .objects/webnovel fallback staged into webnovel/"
+            );
+
+            // Bundle mode copies everything including fs_novel_fallback
+            let bundle_dir = dir.path().join("bundle_out");
+            std::fs::create_dir_all(&bundle_dir).unwrap();
+            let bundle_layout = ExportLayout::new(&root_path(&dir), bundle_dir.clone(), false).unwrap();
+            let (bundle_staged, _, _) =
+                write_stored_objects(&store, &bundle_layout, &root_path(&dir), None)
+                    .await
+                    .unwrap();
+            assert!(bundle_staged.is_empty());
+            assert_eq!(
+                std::fs::read(bundle_dir.join("小説データ/site/book/fallback.txt")).unwrap(),
+                b"fs-fallback"
+            );
+            assert_eq!(
+                std::fs::read(bundle_dir.join("小説データ/site/book/big.bin")).unwrap(),
+                chunk_bytes
+            );
+            assert_eq!(
+                std::fs::read(bundle_dir.join("webnovel/fallback.yaml")).unwrap(),
+                b"name: fallback\n"
+            );
+
+            // CRC-32 corruption in an existing inline target propagates as an error.
+            {
+                let conn = store.conn_handle();
+                conn.lock()
+                    .execute(
+                        "UPDATE objects SET crc32 = 0 WHERE object_key = ?",
+                        rusqlite::params![k_match.as_ref()],
+                    )
+                    .unwrap();
+            }
+            let err = store
+                .check_inline_targets_batch(&[(k_match, 10, match_target)])
+                .unwrap_err();
+            assert!(err.to_string().contains("match.txt"), "{err}");
+        });
+    }
+
+    #[test]
+    fn fingerprint_tree_prunes_transfer_internals_and_handles_noncanonical_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("lib").join("小説データ");
+        std::fs::create_dir_all(archive.join("site/book")).unwrap();
+        std::fs::create_dir_all(archive.join(".objects/.narou-transfer/.lock")).unwrap();
+        std::fs::create_dir_all(archive.join(".objects/.narou-transfer/.refs/site")).unwrap();
+        std::fs::create_dir_all(archive.join(".objects/.narou-staging")).unwrap();
+
+        std::fs::write(archive.join("site/book/1.txt"), b"body").unwrap();
+        std::fs::write(archive.join(".objects/.narou-transfer/.lock/l1"), b"lock").unwrap();
+        std::fs::write(archive.join(".objects/.narou-transfer/.refs/site/r1"), b"ref").unwrap();
+        std::fs::write(archive.join(".objects/.narou-staging/tmp"), b"stage").unwrap();
+
+        let noncanonical = dir.path().join("lib").join("小説データ").join("..").join("小説データ");
+        let mut stamps = BTreeMap::new();
+        fingerprint_tree(&noncanonical, "小説データ/", &mut stamps).unwrap();
+        assert!(stamps.contains_key("小説データ/site/book/1.txt"));
+        assert!(stamps.contains_key("小説データ/.objects/.narou-transfer/.refs/site/r1"));
+        assert!(!stamps.contains_key("小説データ/.objects/.narou-transfer/.lock/l1"));
+        assert!(!stamps.contains_key("小説データ/.objects/.narou-staging/tmp"));
     }
 }

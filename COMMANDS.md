@@ -329,7 +329,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | `verify` | `PRAGMA integrity_check` + 全 payload の CRC-32 検査。取込済み `freeze.yaml.imported-*` があれば `repair-freeze` を案内する |
 | `export-yaml [--out DIR]` | 管理状態に加え、本文・個別設定・ユーザーサイト定義・挿絵をレガシー配置で書き出す。元の管理方式は変更しない |
 | `export-yaml --in-place` | 同じ内容を実位置へ復元してから `storage-backend` を `yaml` に戻す。読み取り・CRC・保存・S3 取得が失敗した場合は SQLite のまま維持。共有 global_setting は通常のファイル管理を維持 |
-| `vacuum` | VACUUM で容量回収 |
+| `vacuum` | 滞留ステージ・孤立オブジェクト・残骸を回収し、`VACUUM` と WAL トランケートで容量回収 |
 | `repair-freeze [--dry-run]` | 旧ビルドが残した `freeze.yaml.imported-*` を全て合算し、保存済みの凍結状態に無い ID を凍結へ戻す（和集合のみで、解除はしない）。`--dry-run` は復旧予定の表示のみ。取り込んだファイルは削除しない |
 
 **復帰失敗時のデータ保全**: インプレース書き出しの管理ファイルは、保存前に SQLite へ SHA-256 指紋を記録し、原子的に置換する。`narou-compat=false` では、失敗後に残った未編集の書き出しファイルを次回起動で再取り込みせず、その後に正常保存した SQLite の状態・作品レコードを維持する。ユーザーが編集して指紋が変わった旧形式ファイルの取り込みと、`narou-compat=true` のファイル優先は維持する。

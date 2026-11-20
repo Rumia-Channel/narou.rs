@@ -29,12 +29,19 @@ use rusqlite::Connection;
 
 use crate::error::{NarouError, Result};
 
+pub(crate) const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+pub(crate) const SQLITE_CACHE_SIZE_KIB: i64 = -16384;
+
 /// Open (creating if needed) the database file at `path`, apply pending
 /// migrations, and return the guarded connection.
 pub fn open(path: &std::path::Path) -> Result<Arc<Mutex<Connection>>> {
     let mut conn = Connection::open(path)
         .map_err(|error| NarouError::Platform(format!("sqlite open: {error}")))?;
     conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(sqlite_error)?;
+    conn.pragma_update(None, "journal_size_limit", SQLITE_JOURNAL_SIZE_LIMIT_BYTES)
+        .map_err(sqlite_error)?;
+    conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)
         .map_err(sqlite_error)?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(sqlite_error)?;

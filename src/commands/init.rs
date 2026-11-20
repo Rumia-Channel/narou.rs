@@ -260,20 +260,31 @@ fn validate_aozoraepub3_path(path: &str) -> Option<String> {
         std::env::current_dir().ok()?.join(candidate)
     };
     let canonical = std::fs::canonicalize(&candidate).ok()?;
-    let jar_path = canonical.join("AozoraEpub3.jar");
-    if !jar_path.is_file() {
-        return None;
+    for dir_candidate in [canonical.clone(), canonical.join("app")] {
+        let Ok(canonical_target) = std::fs::canonicalize(&dir_candidate) else {
+            continue;
+        };
+        if !canonical_target.starts_with(&canonical) {
+            continue;
+        }
+        let jar_path = canonical_target.join("AozoraEpub3.jar");
+        if !jar_path.is_file() {
+            continue;
+        }
+        if let Some(parent) = jar_path.parent()
+            && let Ok(jar_parent) = std::fs::canonicalize(parent)
+            && jar_parent == canonical_target
+        {
+            return Some(canonical_target.display().to_string());
+        }
     }
-    let jar_parent = std::fs::canonicalize(jar_path.parent()?).ok()?;
-    if jar_parent != canonical {
-        return None;
-    }
-    Some(canonical.display().to_string())
+    None
 }
 
 fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> {
     let preset_dir = preset_dir()?;
-    let aozora_dir = PathBuf::from(aozora_path);
+    let aozora_dir = narou_rs::compat::resolve_aozora_assets_dir(Path::new(aozora_path))
+        .unwrap_or_else(|| PathBuf::from(aozora_path));
 
     let custom_chuki_tag = narou_rs::preset::read_chuki_tag(&preset_dir).ok_or_else(|| {
         std::io::Error::new(
@@ -525,6 +536,22 @@ mod tests {
         assert_eq!(
             std::path::PathBuf::from(validated),
             std::fs::canonicalize(aozora_dir).unwrap()
+        );
+    }
+
+    #[test]
+    fn validate_aozoraepub3_path_accepts_jpackage_app_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("AozoraEpub3");
+        let app_dir = install_dir.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(install_dir.join("AozoraEpub3.exe"), "").unwrap();
+        std::fs::write(app_dir.join("AozoraEpub3.jar"), "").unwrap();
+
+        let validated = validate_aozoraepub3_path(install_dir.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(validated),
+            std::fs::canonicalize(&app_dir).unwrap()
         );
     }
 

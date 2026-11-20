@@ -139,8 +139,11 @@ fn read_notepad_content(path: &Path) -> std::io::Result<String> {
 pub async fn webui_config(State(state): State<AppState>) -> Response {
 
     // 能力宣言 (共有定義)。端末一覧だけは実行時の外部ツール検出値を使う。
+    let detected = tokio::task::spawn_blocking(crate::converter::device::OutputManager::available_devices)
+        .await
+        .unwrap_or_default();
     let capabilities = crate::application::webui::capabilities::WebUiCapabilities::native(
-        crate::converter::device::OutputManager::available_devices()
+        detected
             .into_iter()
             .map(|(name, available)| {
                 crate::application::webui::capabilities::DeviceChoice { name: name.into(), available }

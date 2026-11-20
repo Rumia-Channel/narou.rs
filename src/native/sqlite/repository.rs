@@ -92,6 +92,32 @@ impl SqliteNovelRepository {
             .map_err(super::sqlite_error)
     }
 
+    pub(crate) fn check_metadata_prefixes_open(
+        conn: &rusqlite::Connection,
+        records: &[NovelRecord],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let prefixes = records.iter().map(|record| {
+            crate::platform::NovelObjectKeys::new(
+                &record.sitename, &record.file_title, record.use_subdirectory,
+            ).map(|keys| keys.prefix().as_ref().trim_end_matches('/').to_owned())
+        }).collect::<Result<Vec<_>>>()?;
+        let prefixes = serde_json::to_string(&prefixes)
+            .map_err(|error| NarouError::Platform(error.to_string()))?;
+        use rusqlite::OptionalExtension;
+        let unavailable: Option<String> = conn.query_row(
+            UNAVAILABLE_METADATA_PREFIX_SQL, [prefixes], |row| row.get(0),
+        ).optional().map_err(super::sqlite_error)?;
+        if let Some(prefix) = unavailable {
+            return Err(crate::platform::access_fence::gate_closed_error(
+                &crate::platform::ObjectPrefix::new(prefix)?,
+            ));
+        }
+        Ok(())
+    }
+
     /// The caller owns one read transaction for records, counts, freeze state
     /// and admission. No content is opened and no durable reader lease is needed:
     /// a concurrent close/publication/delete is either entirely before this
@@ -116,24 +142,7 @@ impl SqliteNovelRepository {
         } else {
             Self::count_snapshot_conn(transaction, &query.filter)?
         };
-        if !records.is_empty() {
-            let prefixes = records.iter().map(|record| {
-                crate::platform::NovelObjectKeys::new(
-                    &record.sitename, &record.file_title, record.use_subdirectory,
-                ).map(|keys| keys.prefix().as_ref().trim_end_matches('/').to_owned())
-            }).collect::<Result<Vec<_>>>()?;
-            let prefixes = serde_json::to_string(&prefixes)
-                .map_err(|error| NarouError::Platform(error.to_string()))?;
-            use rusqlite::OptionalExtension;
-            let unavailable: Option<String> = transaction.query_row(
-                UNAVAILABLE_METADATA_PREFIX_SQL, [prefixes], |row| row.get(0),
-            ).optional().map_err(super::sqlite_error)?;
-            if let Some(prefix) = unavailable {
-                return Err(crate::platform::access_fence::gate_closed_error(
-                    &crate::platform::ObjectPrefix::new(prefix)?,
-                ));
-            }
-        }
+        Self::check_metadata_prefixes_open(transaction, &records)?;
         Ok(crate::platform::repository::NovelMetadataPage {
             records_total, records_filtered, records, frozen_ids,
         })

@@ -408,9 +408,20 @@ impl LibraryService {
     ) -> Vec<NovelSummary> {
         let now = self.clock.now_utc();
         let default_timezone = site_timezone(Some(DEFAULT_SITE_TIMEZONE));
+        let mut tz_cache: HashMap<String, SiteTimezone> = HashMap::new();
         let mut data = Vec::with_capacity(records.len());
         for record in records {
-            let timezone = self.record_site_timezone(&record, default_timezone).await.unwrap_or(default_timezone);
+            let timezone = if let Some(domain) = record_domain(&record) {
+                if let Some(&cached) = tz_cache.get(domain) {
+                    cached
+                } else {
+                    let resolved = self.domain_timezone(domain, default_timezone).await;
+                    tz_cache.insert(domain.to_string(), resolved);
+                    resolved
+                }
+            } else {
+                default_timezone
+            };
             let is_new = is_new_arrivals_marker(record.new_arrivals_date, record.last_update, now, timezone);
             let is_frozen = record_is_frozen(&record, Some(frozen_ids), FreezeReadMode::InventoryOrTag);
             let display_url = record.display_url().to_string();
@@ -513,17 +524,14 @@ impl LibraryService {
         }
     }
 
-    /// Resolve the timezone for a record's site domain, falling back to the
-    /// default timezone when the domain is unknown or has no entry.
-    async fn record_site_timezone(
+    async fn domain_timezone(
         &self,
-        record: &NovelRecord,
+        domain: &str,
         default_timezone: SiteTimezone,
-    ) -> Option<SiteTimezone> {
-        let domain = record_domain(record)?;
+    ) -> SiteTimezone {
         match self.timezones.timezone_for_domain(domain).await {
-            Ok(Some(timezone)) => Some(timezone),
-            _ => Some(default_timezone),
+            Ok(Some(timezone)) => timezone,
+            _ => default_timezone,
         }
     }
 }

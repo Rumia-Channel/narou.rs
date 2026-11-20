@@ -155,21 +155,18 @@ pub fn self_update_unavailable_reason() -> Option<&'static str> {
 fn aozoraepub3_jar_from_global_setting() -> Option<PathBuf> {
     let settings = crate::db::settings::load(SettingScope::Global).ok()?;
     let dir = settings.get("aozoraepub3dir")?.as_str()?;
-    let jar = PathBuf::from(dir).join("AozoraEpub3.jar");
-    jar.exists().then_some(jar)
+    crate::compat::find_aozoraepub3_jar_in_dir(Path::new(dir))
 }
 
 fn aozoraepub3_jar_from_narou_root() -> Option<PathBuf> {
     let inv = Inventory::with_default_root().ok()?;
-    let jar = inv.root_dir().join("AozoraEpub3").join("AozoraEpub3.jar");
-    jar.exists().then_some(jar)
+    crate::compat::find_aozoraepub3_jar_in_dir(&inv.root_dir().join("AozoraEpub3"))
 }
 
 fn aozoraepub3_jar_next_to_exe() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let jar = dir.join("AozoraEpub3").join("AozoraEpub3.jar");
-    jar.exists().then_some(jar)
+    crate::compat::find_aozoraepub3_jar_in_dir(&dir.join("AozoraEpub3"))
 }
 
 #[cfg(test)]

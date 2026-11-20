@@ -430,6 +430,7 @@ impl OutputManager {
 
         let mut cmd = if tool_path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
             let java_path = resolve_java_command_path()
+                .or_else(|| crate::compat::resolve_bundled_java_for_jar(&tool_path))
                 .ok_or_else(|| NarouError::Conversion("java not found".into()))?;
             let jar_name = tool_path
                 .file_name()
@@ -877,31 +878,17 @@ impl OutputManager {
     }
 
     pub fn available_devices() -> Vec<(String, bool)> {
-        let devices = vec![
+        let has_aozora = Self::find_external_tool("AozoraEpub3").is_some();
+        let has_kindlegen = has_aozora && Self::find_external_tool("kindlegen").is_some();
+        vec![
             ("text".to_string(), true),
-            (
-                "epub".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
-            ("mobi".to_string(), {
-                Self::find_external_tool("kindlegen").is_some()
-                    && Self::find_external_tool("AozoraEpub3").is_some()
-            }),
-            (
-                "kobo".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
+            ("epub".to_string(), has_aozora),
+            ("mobi".to_string(), has_kindlegen),
+            ("kobo".to_string(), has_aozora),
             ("ibunko".to_string(), true),
-            (
-                "reader".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
-            (
-                "ibooks".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
-        ];
-        devices
+            ("reader".to_string(), has_aozora),
+            ("ibooks".to_string(), has_aozora),
+        ]
     }
 
     pub fn get_documents_path(&self) -> Option<PathBuf> {

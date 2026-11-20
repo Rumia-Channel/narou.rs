@@ -430,6 +430,9 @@ pub fn parse_extra_fields(value: &str) -> Result<BTreeMap<String, serde_yaml::Va
             "extra fields payload exceeds limit".to_string(),
         ));
     }
+    if value.trim() == "{}" {
+        return Ok(BTreeMap::new());
+    }
     let yaml: serde_yaml::Value = serde_yaml::from_str(value).map_err(|error| {
         NarouError::Platform(format!("invalid extra fields YAML: {error}"))
     })?;

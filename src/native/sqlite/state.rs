@@ -834,6 +834,10 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
     restrict_sqlite_permissions(&database);
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(super::sqlite_error)?;
+    conn.pragma_update(None, "journal_size_limit", super::SQLITE_JOURNAL_SIZE_LIMIT_BYTES)
+        .map_err(super::sqlite_error)?;
+    conn.pragma_update(None, "cache_size", super::SQLITE_CACHE_SIZE_KIB)
+        .map_err(super::sqlite_error)?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(super::sqlite_error)?;
     conn.pragma_update(None, "foreign_keys", "ON")
@@ -860,8 +864,12 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
             .map(|root| root.join(crate::downloader::types::ARCHIVE_ROOT_DIR))
             .unwrap_or_else(|| narou_dir.join(crate::downloader::types::ARCHIVE_ROOT_DIR));
         if let Ok(mirror) = crate::native::object_store::NativeObjectStore::from_root(archive_root)
+            && matches!(
+                super::object_store::import_archive_into_objects(state.conn_ref(), &mirror),
+                Ok(imported) if imported > 0
+            )
         {
-            let _ = super::object_store::import_archive_into_objects(state.conn_ref(), &mirror);
+            let _ = state.conn_ref().lock().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         }
     }
     // A crashed management-backend flip heals first: the durable cutover

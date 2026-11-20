@@ -201,11 +201,21 @@ pub fn canonicalize_existing_path(path: impl AsRef<Path>) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
+pub fn fsync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+pub fn fsync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 pub fn fsync_parent_dir(path: &Path) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    fs::File::open(parent)?.sync_all()
+    fsync_dir(parent)
 }
 
 #[cfg(not(unix))]
@@ -213,15 +223,63 @@ pub fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// `dir` (または jpackage MSI 配置の `<dir>/app/`) から `AozoraEpub3.jar` を探す。
+pub fn find_aozoraepub3_jar_in_dir(dir: &Path) -> Option<PathBuf> {
+    let canonical_dir = canonicalize_existing_path(dir)?;
+    for candidate in [
+        canonical_dir.join("AozoraEpub3.jar"),
+        canonical_dir.join("app").join("AozoraEpub3.jar"),
+    ] {
+        if candidate.is_file()
+            && let Some(jar) = canonicalize_existing_path(candidate)
+        {
+            return Some(jar);
+        }
+    }
+    None
+}
+
+/// AozoraEpub3 の資材 (`chuki_tag.txt` / `template/` / `gaiji/`) が置かれた
+/// ディレクトリを解決する。jpackage MSI 版では `<dir>/app/` を返す。
+pub fn resolve_aozora_assets_dir(dir: &Path) -> Option<PathBuf> {
+    if let Some(jar) = find_aozoraepub3_jar_in_dir(dir) {
+        return jar.parent().map(Path::to_path_buf);
+    }
+    let canonical_dir = canonicalize_existing_path(dir)?;
+    let app_dir = canonical_dir.join("app");
+    if app_dir.join("chuki_tag.txt").is_file()
+        && let Some(resolved) = canonicalize_existing_path(app_dir)
+    {
+        return Some(resolved);
+    }
+    Some(canonical_dir)
+}
+
+/// jpackage MSI 版 (`<install_dir>/app/AozoraEpub3.jar` + `<install_dir>/runtime/bin/java`)
+/// に同梱された JRE を探す。
+pub fn resolve_bundled_java_for_jar(jar_path: &Path) -> Option<PathBuf> {
+    let java_name = if cfg!(windows) { "java.exe" } else { "java" };
+    let candidate = jar_path
+        .parent()?
+        .parent()?
+        .join("runtime")
+        .join("bin")
+        .join(java_name);
+    candidate
+        .is_file()
+        .then(|| canonicalize_existing_path(candidate))
+        .flatten()
+}
+
 /// `aozoraepub3dir` 設定が指すディレクトリから変換ツールの実体を解決する。
-/// Java 版 (`AozoraEpub3.jar`) を優先し、無ければ Rust 製 Lite のバイナリ
-/// (`AozoraEpub3_Lite.exe` / `AozoraEpub3.exe`、非 Windows は拡張子なし) を受け付ける。
+/// Java 版 (`AozoraEpub3.jar` または jpackage 配置の `app/AozoraEpub3.jar`) を優先し、
+/// 無ければ Rust 製 Lite のバイナリ (`AozoraEpub3_Lite.exe` / `AozoraEpub3.exe`、
+/// 非 Windows は拡張子なし) を受け付ける。
 pub fn canonicalize_aozoraepub3_tool_path(dir: &str) -> Option<PathBuf> {
-    let canonical_dir = canonicalize_existing_path(PathBuf::from(dir))?;
-    let jar = canonical_dir.join("AozoraEpub3.jar");
-    if let Some(jar) = canonicalize_existing_path(jar) {
+    if let Some(jar) = find_aozoraepub3_jar_in_dir(Path::new(dir)) {
         return Some(jar);
     }
+    let canonical_dir = canonicalize_existing_path(PathBuf::from(dir))?;
     [
         "AozoraEpub3_Lite.exe",
         "AozoraEpub3.exe",
@@ -239,7 +297,7 @@ pub fn canonicalize_aozoraepub3_tool_path(dir: &str) -> Option<PathBuf> {
 /// 同じ資産を読む必要があるため、ツール本体 (jar / exe) の有無とは独立に解決する。
 pub fn aozora_assets_dir() -> Option<PathBuf> {
     let dir = load_global_setting_string("aozoraepub3dir")?;
-    canonicalize_existing_path(PathBuf::from(dir))
+    resolve_aozora_assets_dir(Path::new(&dir))
 }
 
 /// 組み込みエンジン (AozoraEpub3_Lite) の設定ディレクトリ。
@@ -1609,6 +1667,30 @@ mod tests {
         assert_eq!(
             found.canonicalize().unwrap(),
             preset.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn aozora_tool_path_supports_jpackage_app_subdir_over_gui_launcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        let runtime_bin = temp.path().join("runtime").join("bin");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&runtime_bin).unwrap();
+        // jpackage MSI places AozoraEpub3.exe (GUI launcher) in root and JAR + assets under app/.
+        std::fs::write(temp.path().join("AozoraEpub3.exe"), b"gui launcher").unwrap();
+        std::fs::write(app.join("AozoraEpub3.jar"), b"stub jar").unwrap();
+        std::fs::write(app.join("chuki_tag.txt"), b"").unwrap();
+        let java_name = if cfg!(windows) { "java.exe" } else { "java" };
+        std::fs::write(runtime_bin.join(java_name), b"stub java").unwrap();
+
+        let dir = temp.path().to_string_lossy().to_string();
+        let tool = canonicalize_aozoraepub3_tool_path(&dir).expect("app jar resolved");
+        assert_eq!(Some(tool.clone()), canonicalize_existing_path(app.join("AozoraEpub3.jar")));
+        assert_eq!(super::resolve_aozora_assets_dir(temp.path()), canonicalize_existing_path(app));
+        assert_eq!(
+            super::resolve_bundled_java_for_jar(&tool),
+            canonicalize_existing_path(runtime_bin.join(java_name))
         );
     }
 }

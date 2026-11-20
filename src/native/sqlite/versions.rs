@@ -356,6 +356,15 @@ pub fn prune_history(conn: &Connection, novel_id: i64, keep: usize) -> Result<us
             params![novel_id, novel_id, keep as i64],
         )
         .map_err(sqlite_error)?;
+    if deleted > 0 {
+        tx.execute(
+            "DELETE FROM section_bodies
+             WHERE NOT EXISTS (SELECT 1 FROM novel_sections s WHERE s.body_hash = section_bodies.body_hash)
+               AND NOT EXISTS (SELECT 1 FROM novel_version_sections v WHERE v.body_hash = section_bodies.body_hash)",
+            [],
+        )
+        .map_err(sqlite_error)?;
+    }
     tx.commit().map_err(sqlite_error)?;
     Ok(deleted)
 }

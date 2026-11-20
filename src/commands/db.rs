@@ -101,11 +101,37 @@ fn cmd_vacuum() -> narou_rs::error::Result<()> {
             .join(".narou");
         if let Some(state) = narou_rs::native::sqlite::state::active_for(&narou_dir) {
             let conn = state.conn();
-            let guard = conn.lock();
+            let mut guard = conn.lock();
+            let report = narou_rs::native::sqlite::object_store::reclaim_sqlite_bloat(
+                &mut guard,
+                None,
+                0,
+            )?;
+            guard
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .map_err(|error| {
+                    narou_rs::error::NarouError::Database(format!("checkpoint failed: {error}"))
+                })?;
             guard.execute_batch("VACUUM").map_err(|error| {
                 narou_rs::error::NarouError::Database(format!("VACUUM failed: {error}"))
             })?;
+            guard
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .map_err(|error| {
+                    narou_rs::error::NarouError::Database(format!("checkpoint failed: {error}"))
+                })?;
             drop(guard);
+            if report.total() > 0 {
+                println!(
+                    "不要な内部データを回収しました (孤立オブジェクト: {}, ステージ: {}, チェックポイント: {}, 重複本体: {}, 残骸: {}, 本文キャッシュ: {})",
+                    report.unreferenced_blobs,
+                    report.stage_ledgers,
+                    report.stage_checkpoints,
+                    report.shadowed_objects,
+                    report.internal_debris + report.verified_orphans,
+                    report.section_bodies,
+                );
+            }
             println!("最適化しました");
             return Ok(());
         }

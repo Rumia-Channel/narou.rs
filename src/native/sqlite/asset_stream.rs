@@ -170,6 +170,105 @@ impl SqliteObjectStore {
         }).await
     }
 
+    pub(super) async fn stage_local_stream(
+        &self,
+        mut stream: AssetStream,
+    ) -> Result<crate::platform::StagedAsset> {
+        let id = format!("ordinary-{}", uuid::Uuid::new_v4().simple());
+        let key = ts::stage_data_key(&id)?;
+        let mut temporary = run_blocking({
+            let this = self.clone();
+            move || {
+                let path = this.mirror.resolve_path(&new_staging_key()?)?;
+                this.mirror.ensure_parent_dir(&path)?;
+                let temporary = tempfile::Builder::new()
+                    .prefix(".narou-asset-")
+                    .tempfile_in(path.parent().expect("stage parent"))?;
+                fs2::FileExt::lock_exclusive(temporary.as_file())?;
+                Ok(temporary)
+            }
+        })
+        .await?;
+        let mut size = 0u64;
+        let mut crc = crc32fast::Hasher::new();
+        let mut sha = sha2::Sha256::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            size = size
+                .checked_add(chunk.len() as u64)
+                .filter(|&size| size <= i64::MAX as u64)
+                .ok_or_else(|| NarouError::Platform("asset size overflow".into()))?;
+            crc.update(&chunk);
+            sha.update(&chunk);
+            temporary = run_blocking(move || {
+                temporary.as_file_mut().write_all(&chunk)?;
+                Ok(temporary)
+            })
+            .await?;
+        }
+        let crc = crc.finalize();
+        let sha256 = hex::encode(sha.finalize());
+        let this = self.clone();
+        let staged_key = key.clone();
+        run_blocking(move || {
+            let mut input = temporary.as_file_mut();
+            input.seek(SeekFrom::Start(0))?;
+            let now = Self::now_rfc3339();
+            let mut conn = this.conn.lock();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(db_error)?;
+            if size <= OBJECT_CHUNK_BYTES as u64 {
+                let mut inline = vec![0; size as usize];
+                input.read_exact(&mut inline)?;
+                tx.execute(
+                    "INSERT INTO objects(object_key,size,updated_at,content_type,encoding,crc32,data) VALUES (?,?,?,NULL,'none',?,?)",
+                    rusqlite::params![staged_key.as_ref(), size as i64, now, crc, inline],
+                )
+                .map_err(db_error)?;
+            } else {
+                tx.execute(
+                    "INSERT INTO objects(object_key,size,updated_at,content_type,encoding,crc32,data) VALUES (?,?,?,NULL,'none',?,NULL)",
+                    rusqlite::params![staged_key.as_ref(), size as i64, now, crc],
+                )
+                .map_err(db_error)?;
+                let mut buffer = vec![0; OBJECT_CHUNK_BYTES];
+                let mut remaining = size;
+                let mut seq = 0i64;
+                while remaining > 0 {
+                    let length = remaining.min(OBJECT_CHUNK_BYTES as u64) as usize;
+                    input.read_exact(&mut buffer[..length])?;
+                    tx.execute(
+                        "INSERT INTO object_chunks(object_key,seq,data) VALUES (?,?,?)",
+                        rusqlite::params![staged_key.as_ref(), seq, &buffer[..length]],
+                    )
+                    .map_err(db_error)?;
+                    remaining -= length as u64;
+                    seq += 1;
+                }
+            }
+            Self::record_verified_object(&tx, &staged_key, size, &sha256)?;
+            tx.commit().map_err(db_error)?;
+            drop(conn);
+            if this.mirror_files {
+                let path = this.mirror.resolve_path(&staged_key)?;
+                this.mirror.ensure_parent_dir(&path)?;
+                let mut mirror = tempfile::NamedTempFile::new_in(path.parent().expect("asset parent"))?;
+                input.seek(SeekFrom::Start(0))?;
+                std::io::copy(&mut input, mirror.as_file_mut())?;
+                mirror.as_file().sync_all()?;
+                mirror.persist(path).map_err(|error| NarouError::Io(error.error))?;
+                this.mirror.save_verified_file(&staged_key, size, &sha256)?;
+            }
+            Ok(crate::platform::StagedAsset {
+                key: staged_key,
+                size,
+                sha256,
+            })
+        })
+        .await
+    }
+
     #[cfg(test)]
     pub(super) async fn cleanup_asset_stages(&self) -> Result<()> {
         let this = self.clone();

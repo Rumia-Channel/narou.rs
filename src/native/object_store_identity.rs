@@ -151,7 +151,7 @@ impl NativeObjectStore{
             if internal&&path.file_name().is_some_and(|name|name.as_encoded_bytes().starts_with(ATOMIC_OBJECT_TEMP_PREFIX.as_bytes())){return Ok(());}
             let path=crate::db::paths::ensure_within_archive_root(path,store.root())?;
             if !path.starts_with(base){return Err(NarouError::Platform("namespace inventory crosses a physical book boundary".into()));}
-            let metadata=fs::metadata(&path)?;if metadata.is_dir(){if ancestors.contains(&path){return Err(NarouError::Platform("cyclic native namespace link".into()));}ancestors.push(path.clone());for entry in fs::read_dir(&path)?{walk(store,request,base,&entry?.path(),capacity,rows,ancestors)?;}ancestors.pop();return Ok(());}
+            let metadata=fs::metadata(&path)?;if metadata.is_dir(){if ancestors.contains(&path){return Err(NarouError::Platform("cyclic native namespace link".into()));}ancestors.push(path.clone());let mut children=Vec::new();for entry in fs::read_dir(&path)?{children.push(entry?.path());}for child in children{walk(store,request,base,&child,capacity,rows,ancestors)?;}ancestors.pop();return Ok(());}
             if !metadata.is_file(){return Err(NarouError::Platform("unsupported native namespace entry type".into()));}let key=store.logical_key_for_listed_path(request.prefix.as_ref(),base,&path).ok_or_else(||NarouError::Platform("native file has no portable logical key".into()))?;
             if !request.prefix.matches(&key)||request.cursor.as_deref().is_some_and(|cursor|key.as_ref()<=cursor){return Ok(());}
             if rows.len()==capacity&&rows.last_key_value().is_some_and(|(last,_)|key.as_ref()>=last.as_str()){return Ok(());}

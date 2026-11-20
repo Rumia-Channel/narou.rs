@@ -548,3 +548,69 @@ fn crashed_flip_restart_recovers_a_single_authority() {
     assert_eq!(gate["epoch"].as_u64(), Some(10));
     assert_eq!(gate["content_revision"].as_u64(), Some(4));
 }
+
+#[test]
+fn cutover_succeeds_with_over_1100_novel_access_gates() {
+    let _guard = LIBRARY_LOCK.lock();
+    let library = LibraryGuard::enter();
+    let root = library.root.clone();
+    let (state, _store) = db_only_store(&root);
+    {
+        let mut conn = state.conn_ref().lock();
+        let tx = conn.transaction().unwrap();
+        for index in 0..1200usize {
+            let prefix = format!("novels/site/book_{index:04}");
+            tx.execute(
+                "INSERT INTO novel_access_gates(prefix,epoch,closed,updated_at) VALUES(?1,1,0,1)",
+                [&prefix],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    narou_rs::native::sqlite::export_yaml::export_yaml(None, true).unwrap();
+    assert_eq!(state::read_mode(&root.join(".narou")), StorageMode::Yaml);
+    let archive = root.join(narou_rs::downloader::ARCHIVE_ROOT_DIR);
+    assert!(fs_gate_path(&archive, "novels/site/book_0000").is_file());
+    assert!(fs_gate_path(&archive, "novels/site/book_1199").is_file());
+}
+
+#[test]
+fn cutover_skips_rewriting_identical_mirrored_files() {
+    let _guard = LIBRARY_LOCK.lock();
+    let library = LibraryGuard::enter();
+    let root = library.root.clone();
+    let narou_dir = root.join(".narou");
+    state::write_mode(&narou_dir, StorageMode::Sqlite).unwrap();
+    narou_rs::db::init_database().unwrap();
+    let state = state::active_for(&narou_dir).unwrap();
+    let archive = root.join(narou_rs::downloader::ARCHIVE_ROOT_DIR);
+    let mirror = NativeObjectStore::from_root(archive.clone()).unwrap();
+    let store = SqliteObjectStore::with_mirror_files(state.conn_ref().clone(), mirror, true);
+
+    let key_same = ObjectKey::try_new("novels/site/book/toc.yaml").unwrap();
+    let key_missing = ObjectKey::try_new("novels/site/book/setting.ini").unwrap();
+    block_on(store.write_small(&key_same, b"title: same\n".to_vec())).unwrap();
+    block_on(store.write_small(&key_missing, b"setting: value\n".to_vec())).unwrap();
+
+    let mirrored_same = archive.join("site/book/toc.yaml");
+    let mirrored_missing = archive.join("site/book/setting.ini");
+    std::fs::remove_file(&mirrored_missing).unwrap();
+
+    let fixed_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&mirrored_same)
+        .unwrap()
+        .set_modified(fixed_time)
+        .unwrap();
+    let mtime_before = std::fs::metadata(&mirrored_same).unwrap().modified().unwrap();
+
+    narou_rs::native::sqlite::export_yaml::export_yaml(None, true).unwrap();
+    assert_eq!(state::read_mode(&narou_dir), StorageMode::Yaml);
+    let mtime_after = std::fs::metadata(&mirrored_same).unwrap().modified().unwrap();
+    assert_eq!(mtime_after, mtime_before, "identical mirrored file must not be rewritten");
+    assert_eq!(std::fs::read(&mirrored_missing).unwrap(), b"setting: value\n");
+    assert!(!archive.join("site/book/toc.yaml.lock").exists());
+}

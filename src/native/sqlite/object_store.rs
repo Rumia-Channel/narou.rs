@@ -332,8 +332,14 @@ impl SqliteObjectStore {
     fn remove_file_copy(&self, key: &ObjectKey) -> Result<()> {
         let path = self.mirror.resolve_path(key)?;
         match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => {
+                let _ = self.mirror.forget_file_proof(key);
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = self.mirror.forget_file_proof(key);
+                Ok(())
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -440,6 +446,157 @@ impl SqliteObjectStore {
             next_cursor,
         })
     }
+
+    pub(crate) fn list_sqlite_objects_page(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SqliteObjectPage> {
+        let limit = limit.max(1);
+        let cap = (limit + 1) as i64;
+        let cursor_str = cursor.unwrap_or("");
+        let mut raw: Vec<(String, i64)> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT object_key, size FROM (
+                         SELECT o.object_key AS object_key, o.size AS size
+                         FROM objects o
+                         WHERE o.object_key > ?1
+                           AND NOT EXISTS (SELECT 1 FROM transfer_object_refs r WHERE r.object_key = o.object_key)
+                         ORDER BY o.object_key LIMIT ?2
+                     )
+                     UNION ALL
+                     SELECT object_key, size FROM (
+                         SELECT r.object_key AS object_key, r.size AS size
+                         FROM transfer_object_refs r
+                         JOIN objects o ON o.object_key = r.blob_key
+                         WHERE r.backend = 'd1' AND r.object_key > ?1
+                         ORDER BY r.object_key LIMIT ?2
+                     )
+                     ORDER BY object_key LIMIT ?2",
+                )
+                .map_err(super::sqlite_error)?;
+            let mut rows = stmt
+                .query(rusqlite::params![cursor_str, cap])
+                .map_err(super::sqlite_error)?;
+            let mut out = Vec::with_capacity(limit + 1);
+            while let Some(row) = rows.next().map_err(super::sqlite_error)? {
+                out.push((
+                    row.get::<_, String>(0).map_err(super::sqlite_error)?,
+                    row.get::<_, i64>(1).map_err(super::sqlite_error)?,
+                ));
+            }
+            out
+        };
+        let has_more = raw.len() > limit;
+        if has_more {
+            raw.truncate(limit);
+        }
+        let next_cursor = has_more.then(|| raw.last().map(|(key, _)| key.clone())).flatten();
+        let mut objects = Vec::with_capacity(raw.len());
+        for (key_text, size) in raw {
+            let Ok(key) = ObjectKey::try_new(key_text) else {
+                continue;
+            };
+            let Ok(size) = u64::try_from(size) else {
+                continue;
+            };
+            objects.push((key, size));
+        }
+        Ok(SqliteObjectPage { objects, next_cursor })
+    }
+
+    pub(crate) fn check_inline_targets_batch(
+        &self,
+        items: &[(ObjectKey, u64, PathBuf)],
+    ) -> Result<Vec<Option<bool>>> {
+        const BATCH_ROWS: usize = 64;
+        const BATCH_BYTES: usize = 16 * 1024 * 1024;
+        let mut results = vec![None; items.len()];
+        let mut candidates = Vec::new();
+        for (idx, (key, expected_size, target)) in items.iter().enumerate() {
+            let Ok(meta) = std::fs::metadata(target) else {
+                results[idx] = Some(false);
+                continue;
+            };
+            if !meta.is_file() || meta.len() != *expected_size {
+                results[idx] = Some(false);
+                continue;
+            }
+            if crate::native::object_store::legacy_flat_key(key)?.is_some() {
+                continue;
+            }
+            candidates.push(idx);
+        }
+        let mut pos = 0usize;
+        while pos < candidates.len() {
+            let mut fetched = Vec::with_capacity(BATCH_ROWS.min(candidates.len() - pos));
+            {
+                let conn = self.conn.lock();
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT o.data, o.size, o.encoding, o.crc32
+                         FROM objects o
+                         WHERE o.object_key = ?1
+                           AND NOT EXISTS (SELECT 1 FROM transfer_object_refs r WHERE r.object_key = o.object_key)",
+                    )
+                    .map_err(super::sqlite_error)?;
+                let mut batch_bytes = 0usize;
+                while pos < candidates.len() && fetched.len() < BATCH_ROWS {
+                    let idx = candidates[pos];
+                    pos += 1;
+                    let key = &items[idx].0;
+                    let mut rows = stmt.query([key.as_ref()]).map_err(super::sqlite_error)?;
+                    let Some(row) = rows.next().map_err(super::sqlite_error)? else {
+                        continue;
+                    };
+                    let rusqlite::types::ValueRef::Blob(bytes) =
+                        row.get_ref(0).map_err(super::sqlite_error)?
+                    else {
+                        continue;
+                    };
+                    let size: i64 = row.get(1).map_err(super::sqlite_error)?;
+                    let Ok(size) = u64::try_from(size) else {
+                        return Err(NarouError::Database(format!("{key}: invalid object size")));
+                    };
+                    let encoding: String = row.get(2).map_err(super::sqlite_error)?;
+                    let encoding = ObjectEncoding::parse(&encoding)
+                        .map_err(|error| NarouError::Database(format!("{key}: {error}")))?;
+                    let crc32: i64 = row.get(3).map_err(super::sqlite_error)?;
+                    batch_bytes = batch_bytes.saturating_add(bytes.len());
+                    fetched.push((
+                        idx,
+                        StoredPayload {
+                            data: bytes.to_vec(),
+                            encoding,
+                            crc32: crc32 as u32,
+                            size,
+                        },
+                    ));
+                    if batch_bytes >= BATCH_BYTES {
+                        break;
+                    }
+                }
+            }
+            for (idx, payload) in fetched {
+                let (key, _, target) = &items[idx];
+                let decoded = decode_stored_payload(payload, key, None)
+                    .map_err(|error| NarouError::Database(format!("{key}: {error}")))?;
+                let matches = match std::fs::read(target) {
+                    Ok(disk) => disk == decoded,
+                    Err(_) => false,
+                };
+                results[idx] = Some(matches);
+            }
+        }
+        Ok(results)
+    }
+}
+
+pub(crate) struct SqliteObjectPage {
+    pub objects: Vec<(ObjectKey, u64)>,
+    pub next_cursor: Option<String>,
 }
 
 struct StoredPayload {
@@ -725,21 +882,27 @@ impl AssetStore for SqliteObjectStore {
     fn write_stream_guarded<'a>(&'a self,fence:&'a WriteFence,key:&'a ObjectKey,stream:AssetStream)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
         if !fence.prefix.matches(key){return Err(NarouError::Platform("write outside fence".into()));}
         let stage=self.stage_stream(stream).await?;
-        run_scoped_blocking(||self.with_open_fence_transaction(fence,|conn|self.install_reference(conn,&stage.key,key)))
+        let result=run_scoped_blocking(||self.with_open_fence_transaction(fence,|conn|self.install_reference(conn,&stage.key,key)));
+        if result.is_err(){let _=run_scoped_blocking(||self.delete_both(&stage.key));}
+        result
     })}
     fn write_stream_once<'a>(&'a self,key:&'a ObjectKey,stream:AssetStream,size:u64,sha:&'a str)->PlatformFuture<'a,Result<WriteOnce>>{Box::pin(async move{
-        ts::check_hash_named_key(key,sha)?;let stage=self.stage_stream(stream).await?;let size=if size==u64::MAX{stage.size}else{size};
-        if stage.size!=size||!stage.sha256.eq_ignore_ascii_case(sha){return Err(NarouError::Platform("write-once size/SHA mismatch".into()));}
-        let before=run_scoped_blocking(||self.source_generation(key))?;
-        if before.is_some(){let mut stream=self.read_stream(key).await?.ok_or_else(||NarouError::NotFound(key.to_string()))?;let mut seen=0u64;let mut hash=sha2::Sha256::new();
-            while let Some(chunk)=stream.next().await{let bytes=chunk?;seen=seen.checked_add(bytes.len() as u64).filter(|value|*value<=size).ok_or_else(||NarouError::Platform("write-once existing size differs".into()))?;hash.update(&bytes);}
-            if seen!=size||!hex::encode(hash.finalize()).eq_ignore_ascii_case(sha){return Err(NarouError::Platform("write-once existing bytes differ".into()));}
-        }
-        let outcome=run_scoped_blocking(||self.mirror.with_transfer_lock(&format!("write-once/{key}"),||{
-            if self.source_generation(key)?!=before{return Err(NarouError::Platform("write-once existing generation changed".into()));}
-            if before.is_some(){return Ok(WriteOnce::Reused);}let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;self.install_reference(&tx,&stage.key,key)?;tx.commit().map_err(super::sqlite_error)?;Ok(WriteOnce::Written)
-        }))?;
-        if let Some(id)=stage.key.as_ref().strip_prefix(".narou-transfer/data/"){self.stage_abort(id,id,1).await?;}Ok(outcome)
+        ts::check_hash_named_key(key,sha)?;let stage=self.stage_stream(stream).await?;
+        let result:Result<WriteOnce> = async {
+            let size=if size==u64::MAX{stage.size}else{size};
+            if stage.size!=size||!stage.sha256.eq_ignore_ascii_case(sha){return Err(NarouError::Platform("write-once size/SHA mismatch".into()));}
+            let before=run_scoped_blocking(||self.source_generation(key))?;
+            if before.is_some(){let mut stream=self.read_stream(key).await?.ok_or_else(||NarouError::NotFound(key.to_string()))?;let mut seen=0u64;let mut hash=sha2::Sha256::new();
+                while let Some(chunk)=stream.next().await{let bytes=chunk?;seen=seen.checked_add(bytes.len() as u64).filter(|value|*value<=size).ok_or_else(||NarouError::Platform("write-once existing size differs".into()))?;hash.update(&bytes);}
+                if seen!=size||!hex::encode(hash.finalize()).eq_ignore_ascii_case(sha){return Err(NarouError::Platform("write-once existing bytes differ".into()));}
+            }
+            run_scoped_blocking(||self.mirror.with_transfer_lock(&format!("write-once/{key}"),||{
+                if self.source_generation(key)?!=before{return Err(NarouError::Platform("write-once existing generation changed".into()));}
+                if before.is_some(){return Ok(WriteOnce::Reused);}let mut conn=self.conn.lock();let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;self.install_reference(&tx,&stage.key,key)?;tx.commit().map_err(super::sqlite_error)?;Ok(WriteOnce::Written)
+            }))
+        }.await;
+        if !matches!(result,Ok(WriteOnce::Written)){let _=run_scoped_blocking(||self.delete_both(&stage.key));}
+        result
     })}
 
     fn stat<'a>(
@@ -763,11 +926,7 @@ impl AssetStore for SqliteObjectStore {
     }
 
     fn stage_stream<'a>(&'a self, stream: AssetStream) -> PlatformFuture<'a, Result<crate::platform::StagedAsset>> {
-        Box::pin(async move {
-            let id=format!("ordinary-{}",uuid::Uuid::new_v4().simple());
-            let sealed=ts::stage_asset_stream(self,&id,&id,1,crate::platform::staging::STAGE_TTL_SECONDS,stream).await?;
-            Ok(crate::platform::StagedAsset{key:sealed.key,size:sealed.size,sha256:sealed.sha256})
-        })
+        Box::pin(async move { self.stage_local_stream(stream).await })
     }
 
     fn write_stream<'a>(
@@ -820,6 +979,231 @@ pub fn sanitize_transfer_snapshot(conn:&mut Connection)->Result<()>{
     tx.commit().map_err(super::sqlite_error)
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BloatReclaimReport {
+    pub stage_ledgers: usize,
+    pub stage_checkpoints: usize,
+    pub unreferenced_blobs: usize,
+    pub shadowed_objects: usize,
+    pub internal_debris: usize,
+    pub verified_orphans: usize,
+    pub section_bodies: usize,
+}
+
+impl BloatReclaimReport {
+    pub fn total(&self) -> usize {
+        self.stage_ledgers
+            + self.stage_checkpoints
+            + self.unreferenced_blobs
+            + self.shadowed_objects
+            + self.internal_debris
+            + self.verified_orphans
+            + self.section_bodies
+    }
+}
+
+fn sqlite_table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [name],
+        |row| row.get(0),
+    )
+    .map_err(super::sqlite_error)
+}
+
+/// Reclaim leaked ordinary transfer stages, checkpoints, shadowed direct rows,
+/// internal transfer debris, and orphaned section bodies.
+pub fn reclaim_sqlite_bloat(
+    conn: &mut Connection,
+    limit: Option<usize>,
+    min_age_secs: i64,
+) -> Result<BloatReclaimReport> {
+    let cap = limit.unwrap_or(i64::MAX as usize).min(i64::MAX as usize) as i64;
+    let cutoff: Option<String> = (min_age_secs > 0).then(|| {
+        (chrono::Utc::now() - chrono::Duration::seconds(min_age_secs))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    });
+    let mut report = BloatReclaimReport::default();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(super::sqlite_error)?;
+
+    let has_objects = sqlite_table_exists(&tx, "objects")?;
+    let has_ledgers = sqlite_table_exists(&tx, "transfer_stage_ledger")?;
+    let has_refs = sqlite_table_exists(&tx, "transfer_object_refs")?;
+    let has_verified = sqlite_table_exists(&tx, "transfer_verified_objects")?;
+    let has_bodies = sqlite_table_exists(&tx, "section_bodies")?
+        && sqlite_table_exists(&tx, "novel_sections")?
+        && sqlite_table_exists(&tx, "novel_version_sections")?;
+
+    if has_ledgers {
+        let lower = "ordinary-";
+        let upper = prefix_upper_bound(lower);
+        report.stage_ledgers = if has_objects {
+            tx.execute(
+                "DELETE FROM transfer_stage_ledger WHERE stage_id IN (
+                    SELECT stage_id FROM transfer_stage_ledger
+                    WHERE stage_id >= ?1 AND stage_id < ?2
+                      AND (?3 IS NULL OR NOT EXISTS (
+                          SELECT 1 FROM objects o
+                          WHERE o.object_key = '.narou-transfer/data/' || transfer_stage_ledger.stage_id
+                            AND o.updated_at >= ?3
+                      ))
+                    LIMIT ?4
+                )",
+                rusqlite::params![lower, upper, cutoff.as_deref(), cap],
+            )
+            .map_err(super::sqlite_error)?
+        } else {
+            tx.execute(
+                "DELETE FROM transfer_stage_ledger WHERE stage_id IN (
+                    SELECT stage_id FROM transfer_stage_ledger
+                    WHERE stage_id >= ?1 AND stage_id < ?2
+                    LIMIT ?3
+                )",
+                rusqlite::params![lower, upper, cap],
+            )
+            .map_err(super::sqlite_error)?
+        };
+    }
+
+    if has_objects {
+        let cp_lower = ".narou-transfer/.checkpoints/ordinary-";
+        let cp_upper = prefix_upper_bound(cp_lower);
+        report.stage_checkpoints = tx
+            .execute(
+                "DELETE FROM objects WHERE object_key IN (
+                    SELECT object_key FROM objects
+                    WHERE object_key >= ?1 AND object_key < ?2
+                      AND (?3 IS NULL OR updated_at < ?3)
+                    LIMIT ?4
+                )",
+                rusqlite::params![cp_lower, cp_upper, cutoff.as_deref(), cap],
+            )
+            .map_err(super::sqlite_error)?;
+
+        let blob_lower = ".narou-transfer/data/ordinary-";
+        let blob_upper = prefix_upper_bound(blob_lower);
+        report.unreferenced_blobs = match (has_refs, has_ledgers) {
+            (true, true) => tx.execute(
+                "DELETE FROM objects WHERE object_key IN (
+                    SELECT object_key FROM objects
+                    WHERE object_key >= ?1 AND object_key < ?2
+                      AND (?3 IS NULL OR updated_at < ?3)
+                      AND NOT EXISTS (SELECT 1 FROM transfer_object_refs WHERE blob_key = objects.object_key)
+                      AND NOT EXISTS (SELECT 1 FROM transfer_stage_ledger WHERE stage_id = substr(objects.object_key, length('.narou-transfer/data/') + 1))
+                    LIMIT ?4
+                )",
+                rusqlite::params![blob_lower, blob_upper, cutoff.as_deref(), cap],
+            ),
+            (true, false) => tx.execute(
+                "DELETE FROM objects WHERE object_key IN (
+                    SELECT object_key FROM objects
+                    WHERE object_key >= ?1 AND object_key < ?2
+                      AND (?3 IS NULL OR updated_at < ?3)
+                      AND NOT EXISTS (SELECT 1 FROM transfer_object_refs WHERE blob_key = objects.object_key)
+                    LIMIT ?4
+                )",
+                rusqlite::params![blob_lower, blob_upper, cutoff.as_deref(), cap],
+            ),
+            (false, true) => tx.execute(
+                "DELETE FROM objects WHERE object_key IN (
+                    SELECT object_key FROM objects
+                    WHERE object_key >= ?1 AND object_key < ?2
+                      AND (?3 IS NULL OR updated_at < ?3)
+                      AND NOT EXISTS (SELECT 1 FROM transfer_stage_ledger WHERE stage_id = substr(objects.object_key, length('.narou-transfer/data/') + 1))
+                    LIMIT ?4
+                )",
+                rusqlite::params![blob_lower, blob_upper, cutoff.as_deref(), cap],
+            ),
+            (false, false) => tx.execute(
+                "DELETE FROM objects WHERE object_key IN (
+                    SELECT object_key FROM objects
+                    WHERE object_key >= ?1 AND object_key < ?2
+                      AND (?3 IS NULL OR updated_at < ?3)
+                    LIMIT ?4
+                )",
+                rusqlite::params![blob_lower, blob_upper, cutoff.as_deref(), cap],
+            ),
+        }
+        .map_err(super::sqlite_error)?;
+
+        if has_refs {
+            report.shadowed_objects = tx
+                .execute(
+                    "DELETE FROM objects WHERE object_key IN (
+                        SELECT o.object_key FROM objects o
+                        WHERE EXISTS (SELECT 1 FROM transfer_object_refs r WHERE r.object_key = o.object_key)
+                          AND NOT EXISTS (SELECT 1 FROM transfer_object_refs rb WHERE rb.blob_key = o.object_key)
+                        LIMIT ?1
+                    )",
+                    rusqlite::params![cap],
+                )
+                .map_err(super::sqlite_error)?;
+        }
+
+        for prefix in [
+            ".narou-transfer/.lock/",
+            ".narou-transfer/.gate/",
+            ".narou-transfer/.gate.pending/",
+            ".narou-transfer/.proof/",
+        ] {
+            let upper = prefix_upper_bound(prefix);
+            report.internal_debris += tx
+                .execute(
+                    "DELETE FROM objects WHERE object_key IN (
+                        SELECT object_key FROM objects
+                        WHERE object_key >= ?1 AND object_key < ?2
+                        LIMIT ?3
+                    )",
+                    rusqlite::params![prefix, upper, cap],
+                )
+                .map_err(super::sqlite_error)?;
+        }
+        report.internal_debris += tx
+            .execute(
+                "DELETE FROM objects WHERE object_key IN (
+                    SELECT object_key FROM objects
+                    WHERE object_key >= '.narou-staging/' AND object_key < '.narou-staging0'
+                      AND (?1 IS NULL OR updated_at < ?1)
+                    LIMIT ?2
+                )",
+                rusqlite::params![cutoff.as_deref(), cap],
+            )
+            .map_err(super::sqlite_error)?;
+    }
+
+    if has_verified && has_objects {
+        report.verified_orphans = tx
+            .execute(
+                "DELETE FROM transfer_verified_objects WHERE blob_key IN (
+                    SELECT blob_key FROM transfer_verified_objects
+                    WHERE NOT EXISTS (SELECT 1 FROM objects o WHERE o.object_key = transfer_verified_objects.blob_key)
+                    LIMIT ?1
+                )",
+                rusqlite::params![cap],
+            )
+            .map_err(super::sqlite_error)?;
+    }
+
+    if has_bodies {
+        report.section_bodies = tx
+            .execute(
+                "DELETE FROM section_bodies WHERE body_hash IN (
+                    SELECT body_hash FROM section_bodies
+                    WHERE NOT EXISTS (SELECT 1 FROM novel_sections s WHERE s.body_hash = section_bodies.body_hash)
+                      AND NOT EXISTS (SELECT 1 FROM novel_version_sections v WHERE v.body_hash = section_bodies.body_hash)
+                    LIMIT ?1
+                )",
+                rusqlite::params![cap],
+            )
+            .map_err(super::sqlite_error)?;
+    }
+
+    tx.commit().map_err(super::sqlite_error)?;
+    Ok(report)
+}
+
 /// Payload bytes (raw + stored) one import transaction may carry. Keeps
 /// transient memory bounded on large archives while still amortizing commit
 /// and lock costs across a batch.
@@ -843,46 +1227,90 @@ enum ArchiveImportEntry {
     EmptyCacheVersion(ObjectKey),
 }
 
+fn is_import_ignored(safe_root: &Path, path: &Path, is_dir: bool) -> bool {
+    let Ok(rel) = path.strip_prefix(safe_root) else {
+        return false;
+    };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if rel == ".objects/.narou-staging" || rel.starts_with(".objects/.narou-staging/") {
+        return true;
+    }
+    if let Some(rest) = rel.strip_prefix(".objects/.narou-transfer/")
+        && rest != ".refs"
+        && !rest.starts_with(".refs/")
+    {
+        return true;
+    }
+    if !is_dir {
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        if name.ends_with(".lock")
+            || name.starts_with(".narou-export-")
+            || name.starts_with(".narou-asset-")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Preserve only empty version directories in the recognized novel cache
 /// layout, not arbitrary empty folders. Existing marker files are ordinary
 /// files and retain their payloads through the importer.
 fn collect_archive_import_entries(
-    root: &Path,
+    safe_root: &Path,
     current: &Path,
     output: &mut Vec<ArchiveImportEntry>,
+    ancestors: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    let mut has_entries = false;
-    for entry in std::fs::read_dir(current)? {
-        let path = crate::db::paths::ensure_within_archive_root(&entry?.path(), root)?;
-        has_entries = true;
-        if path.is_dir() {
-            collect_archive_import_entries(root, &path, output)?;
-        } else if path.is_file() {
-            output.push(ArchiveImportEntry::File(path));
-        }
+    let safe_current = crate::db::paths::ensure_within_archive_root(current, safe_root)?;
+    if ancestors.contains(&safe_current) {
+        return Err(NarouError::Platform("cyclic native namespace link".into()));
     }
-    if !has_entries {
-        let novel_dir = current.parent().and_then(Path::parent).and_then(Path::parent);
-        if let Some(novel_dir) = novel_dir
-            && let (Some(prefix), Some(marker)) = (
-                logical_key_for_native_path(root, novel_dir),
-                logical_key_for_native_path(root, &current.join(".version")),
-            )
-        {
-            let prefix_depth = prefix.as_ref().split('/').count();
-            if matches!(prefix_depth, 3 | 4)
-                && prefix.as_ref().starts_with("novels/")
-                && crate::application::webui::diff::cached_object_parts(
-                    prefix.as_ref(),
-                    marker.as_ref(),
-                )
-                .is_some()
-            {
-                output.push(ArchiveImportEntry::EmptyCacheVersion(marker));
+    ancestors.push(safe_current.clone());
+    let result = (|| {
+        let mut children = Vec::new();
+        for entry in std::fs::read_dir(&safe_current)? {
+            children.push(entry?.path());
+        }
+        let mut has_entries = false;
+        for raw_path in children {
+            let path = crate::db::paths::ensure_within_archive_root(&raw_path, safe_root)?;
+            let is_dir = path.is_dir();
+            if is_import_ignored(safe_root, &path, is_dir) {
+                continue;
+            }
+            has_entries = true;
+            if is_dir {
+                collect_archive_import_entries(safe_root, &path, output, ancestors)?;
+            } else if path.is_file() {
+                output.push(ArchiveImportEntry::File(path));
             }
         }
-    }
-    Ok(())
+        if !has_entries {
+            let novel_dir = safe_current.parent().and_then(Path::parent).and_then(Path::parent);
+            if let Some(novel_dir) = novel_dir
+                && let (Some(prefix), Some(marker)) = (
+                    logical_key_for_native_path(safe_root, novel_dir),
+                    logical_key_for_native_path(safe_root, &safe_current.join(".version")),
+                )
+            {
+                let prefix_depth = prefix.as_ref().split('/').count();
+                if matches!(prefix_depth, 3 | 4)
+                    && prefix.as_ref().starts_with("novels/")
+                    && crate::application::webui::diff::cached_object_parts(
+                        prefix.as_ref(),
+                        marker.as_ref(),
+                    )
+                    .is_some()
+                {
+                    output.push(ArchiveImportEntry::EmptyCacheVersion(marker));
+                }
+            }
+        }
+        Ok(())
+    })();
+    ancestors.pop();
+    result
 }
 
 /// Import archive files and legitimate empty cache versions into the object tables.
@@ -900,7 +1328,8 @@ pub(crate) fn import_archive_into_objects(
     let root = mirror.root().to_path_buf();
     let mut entries = Vec::new();
     if root.is_dir() {
-        collect_archive_import_entries(&root, &root, &mut entries)?;
+        let safe_root = crate::db::paths::ensure_within_archive_root(&root, &root)?;
+        collect_archive_import_entries(&safe_root, &safe_root, &mut entries, &mut Vec::new())?;
     }
     if entries.is_empty() {
         return Ok(0);
@@ -1274,7 +1703,7 @@ impl SqliteObjectStore {
         let value:Option<(u64,String,String)>=conn.query_row("SELECT v.size,v.sha256,v.generation FROM transfer_verified_objects v JOIN objects o ON o.object_key=v.blob_key AND o.generation=v.generation WHERE v.blob_key=?",[physical.as_ref()],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?))).optional().map_err(super::sqlite_error)?;
         if let Some((size,sha,_))=value{if self.mirror_files&&!crate::platform::is_reserved_key(key){let mirror=self.mirror.trusted_file_fingerprint(key)?.ok_or_else(||NarouError::Platform("canonical mirror proof missing".into()))?;if mirror.0!=size||!mirror.1.eq_ignore_ascii_case(&sha){return Err(NarouError::Platform("canonical mirror fingerprint conflict".into()));}}return Ok(Some((size,sha)));}Ok(None)
     }
-    fn record_verified_object(conn:&Connection,key:&ObjectKey,size:u64,sha:&str)->Result<()>{
+    pub(super) fn record_verified_object(conn:&Connection,key:&ObjectKey,size:u64,sha:&str)->Result<()>{
         let (actual,encoding,generation):(u64,String,String)=conn.query_row("SELECT size,encoding,generation FROM objects WHERE object_key=?",[key.as_ref()],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?))).map_err(super::sqlite_error)?;
         if actual!=size||encoding!="none"{return Err(NarouError::Platform("raw stage metadata changed".into()));}
         conn.execute("INSERT INTO transfer_verified_objects(blob_key,size,sha256,generation) VALUES(?,?,?,?) ON CONFLICT(blob_key) DO UPDATE SET size=excluded.size,sha256=excluded.sha256,generation=excluded.generation",rusqlite::params![key.as_ref(),size as i64,sha.to_ascii_lowercase(),generation]).map_err(super::sqlite_error)?;Ok(())
@@ -1283,6 +1712,7 @@ impl SqliteObjectStore {
         let (size,sha,generation):(u64,String,String)=conn.query_row("SELECT v.size,v.sha256,v.generation FROM transfer_verified_objects v JOIN objects o ON o.object_key=v.blob_key AND o.generation=v.generation WHERE v.blob_key=?",[stage.as_ref()],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?))).optional().map_err(super::sqlite_error)?.ok_or_else(||NarouError::Platform("sealed stage proof missing or changed".into()))?;
         let same:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM transfer_object_refs WHERE object_key=? AND blob_key=? AND blob_generation=? AND sha256=?)",rusqlite::params![key.as_ref(),stage.as_ref(),generation,sha],|row|row.get(0)).map_err(super::sqlite_error)?;
         if self.mirror_files{let installed=self.mirror.install_verified_file(stage,key)?;if installed.0!=size||!installed.1.eq_ignore_ascii_case(&sha){return Err(NarouError::Platform("mirror stage fingerprint differs".into()));}}
+        if stage!=key{conn.execute("DELETE FROM objects WHERE object_key=?",[key.as_ref()]).map_err(super::sqlite_error)?;}
         if same{return Ok(());}
         conn.execute("INSERT INTO transfer_object_refs(object_key,blob_key,size,sha256,backend,updated_at,blob_generation) VALUES(?,?,?,?,'d1',?,?) ON CONFLICT(object_key) DO UPDATE SET blob_key=excluded.blob_key,size=excluded.size,sha256=excluded.sha256,backend=excluded.backend,updated_at=excluded.updated_at,blob_generation=excluded.blob_generation",rusqlite::params![key.as_ref(),stage.as_ref(),size as i64,sha,Self::now_rfc3339(),generation]).map_err(super::sqlite_error)?;Ok(())
     }
@@ -1374,17 +1804,27 @@ impl SqliteObjectStore {
     /// `finalize_sql_gate_adoption_locked` after the caller's COMMIT, or
     /// `None` when the handoff is already proven by the canonical FS gate
     /// (idempotent re-run).
+    #[cfg(test)]
     pub(crate) fn adopt_sql_gate_in_tx(&self,tx:&Connection,prefix:&ObjectPrefix)->Result<Option<FsGate>> {
-        adopt_sql_gate_tx(&self.mirror,tx,prefix)
+        adopt_sql_gate_tx(&self.mirror,tx,prefix,true)
+    }
+
+    pub(crate) fn adopt_sql_gate_in_tx_nosync(&self,tx:&Connection,prefix:&ObjectPrefix)->Result<Option<FsGate>> {
+        adopt_sql_gate_tx(&self.mirror,tx,prefix,false)
     }
 
     /// Post-COMMIT half of SQL→FS adoption: installs the canonical FS gate
     /// (lineage re-validated against the now-committed handoff) and retires
     /// the pending journal. `connection` must be the connection the intent
     /// committed on; the caller still holds the prefix's OS transfer lock.
+    #[cfg(test)]
     pub(crate) fn finalize_sql_gate_adoption_locked(&self,prefix:&ObjectPrefix,gate:&FsGate,connection:&Connection)->Result<()> {
         self.mirror.install_adopted_gate_locked(&self.mirror.gate_path(prefix)?,prefix,gate,connection)?;
         self.mirror.remove_pending_gate_locked(prefix)
+    }
+
+    pub(crate) fn install_adopted_gate_nosync(&self,prefix:&ObjectPrefix,gate:&FsGate,connection:&Connection)->Result<()> {
+        self.mirror.install_adopted_gate_nosync(&self.mirror.gate_path(prefix)?,prefix,gate,connection)
     }
 
     /// SQL→FS gate authority adoption for `prefix`. Under the prefix's OS
@@ -1412,7 +1852,7 @@ impl SqliteObjectStore {
 /// The in-transaction core shared by `SqliteObjectStore::adopt_sql_gate_in_tx`
 /// and `adopt_sql_gate_locked` (the free function used by the startup sweep,
 /// which holds the connection guard rather than a store).
-fn adopt_sql_gate_tx(mirror:&NativeObjectStore,tx:&Connection,prefix:&ObjectPrefix)->Result<Option<FsGate>> {
+fn adopt_sql_gate_tx(mirror:&NativeObjectStore,tx:&Connection,prefix:&ObjectPrefix,sync_parent:bool)->Result<Option<FsGate>> {
     let prefix_key=prefix.as_ref().trim_end_matches('/');
     let row:Option<(u64,bool,String,u64)>=tx.query_row("SELECT epoch,closed,origin_url_fold,content_revision FROM novel_access_gates WHERE prefix=?1",[prefix_key],|row|Ok((super::read_u64(row,0)?,row.get(1)?,row.get(2)?,super::read_u64(row,3)?))).optional().map_err(super::sqlite_error)?;
     let recorded=crate::native::object_store::read_fs_gate_handoff_raw(tx,prefix_key)?;
@@ -1426,7 +1866,7 @@ fn adopt_sql_gate_tx(mirror:&NativeObjectStore,tx:&Connection,prefix:&ObjectPref
             Some(gate)=>{
                 if gate.epoch!=fs_epoch||gate.origin_url_fold!=fs_origin{return Err(NarouError::Platform("FS gate adoption proof mismatch".into()));}
                 if gate.migrated{return Err(NarouError::Platform("migrated FS gate lost its SQL handoff".into()));}
-                mirror.remove_pending_gate_locked(prefix)?;
+                if sync_parent{mirror.remove_pending_gate_locked(prefix)?;}else{mirror.remove_pending_gate_nosync(prefix)?;}
                 return Ok(None);
             }
             None=>{
@@ -1450,7 +1890,7 @@ fn adopt_sql_gate_tx(mirror:&NativeObjectStore,tx:&Connection,prefix:&ObjectPref
     if recorded.is_none(){
         crate::native::object_store::record_fs_gate_handoff(tx,prefix_key,sql_epoch,fs_epoch,&origin)?;
     }
-    mirror.install_pending_gate_locked(prefix,&gate)?;
+    if sync_parent{mirror.install_pending_gate_locked(prefix,&gate)?;}else{mirror.install_pending_gate_nosync(prefix,&gate)?;}
     tx.execute("DELETE FROM novel_reader_leases WHERE prefix=?1",[prefix_key]).map_err(super::sqlite_error)?;
     tx.execute("DELETE FROM novel_access_gates WHERE prefix=?1",[prefix_key]).map_err(super::sqlite_error)?;
     Ok(Some(gate))
@@ -1462,7 +1902,7 @@ fn adopt_sql_gate_tx(mirror:&NativeObjectStore,tx:&Connection,prefix:&ObjectPref
 pub(crate) fn adopt_sql_gate_locked(mirror:&NativeObjectStore,connection:&Connection,prefix:&ObjectPrefix)->Result<()>{
     mirror.with_transfer_lock(prefix.as_ref().trim_end_matches('/'),||{
         let tx=rusqlite::Transaction::new_unchecked(connection,rusqlite::TransactionBehavior::Immediate).map_err(super::sqlite_error)?;
-        let gate=adopt_sql_gate_tx(mirror,&tx,prefix)?;
+        let gate=adopt_sql_gate_tx(mirror,&tx,prefix,true)?;
         tx.commit().map_err(super::sqlite_error)?;
         if let Some(gate)=gate{
             mirror.install_adopted_gate_locked(&mirror.gate_path(prefix)?,prefix,&gate,connection)?;
@@ -2809,7 +3249,7 @@ mod tests {
         // Abandoned intent: the in-tx half ran but the transaction rolled
         // back — SQL stays authoritative and the journal orphan is retired.
         {let conn_lock=conn.lock();let tx=rusqlite::Transaction::new_unchecked(&conn_lock,rusqlite::TransactionBehavior::Immediate).unwrap();
-            let gate=adopt_sql_gate_tx(&mirror,&tx,&resume).unwrap();
+            let gate=adopt_sql_gate_tx(&mirror,&tx,&resume,true).unwrap();
             assert!(gate.is_some());tx.rollback().unwrap();}
         assert!(mirror.read_pending_gate_locked(&resume).unwrap().is_some(),"rolled-back intent leaves its durable journal for the sweep");
         {let row:bool=conn.lock().query_row("SELECT EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix=?1)",[resume.as_ref().trim_end_matches('/')],|row|row.get(0)).unwrap();assert!(row,"rollback restores the SQL row");}
@@ -2996,5 +3436,262 @@ mod tests {
         assert!(matches!(resolved,NativeStore::Sqlite(_)),"uncommitted flip must restore SQLite authority");
         assert_eq!(crate::native::sqlite::state::read_mode(&narou_dir),crate::native::sqlite::state::StorageMode::Sqlite);
         assert!(!narou_dir.join(".cutover-yaml-intent").exists());
+    }
+
+    #[test]
+    fn stage_stream_and_guarded_overwrite_do_not_leak_ledgers_checkpoints_or_old_blobs() {
+        let (_dir, mut store) = temp_store();
+        store.mirror_files = false;
+        let prefix = ObjectPrefix::new("novels/site/book").unwrap();
+        let epub = ObjectKey::try_new("novels/site/book/book.epub").unwrap();
+        futures::executor::block_on(async {
+            // Simulate a pre-existing imported direct row shadowed later by transfer_object_refs.
+            ObjectStore::write_small(&store, &epub, b"legacy imported epub".to_vec()).await.unwrap();
+            let fence = store.rebind_writer(&prefix, 0).await.unwrap();
+
+            for version in [b"v1-epub-payload".repeat(40_000), b"v2-epub-payload".repeat(40_000)] {
+                let stream: AssetStream = Box::pin(futures::stream::iter([
+                    Ok(version[..64 * 1024].to_vec()),
+                    Ok(version[64 * 1024..].to_vec()),
+                ]));
+                store.write_stream_guarded(&fence, &epub, stream).await.unwrap();
+            }
+
+            // A stream failing before installation must not leak stages either.
+            let failing: AssetStream = Box::pin(futures::stream::iter([
+                Ok(vec![1u8; 64 * 1024]),
+                Err(NarouError::Platform("interrupted".into())),
+            ]));
+            assert!(store.write_stream_guarded(&fence, &epub, failing).await.is_err());
+
+            let outside = ObjectKey::try_new("novels/site/other/book.epub").unwrap();
+            let ok_stream: AssetStream = Box::pin(futures::stream::once(async { Ok(b"outside".to_vec()) }));
+            assert!(store.write_stream_guarded(&fence, &outside, ok_stream).await.is_err());
+        });
+
+        let conn = store.conn.lock();
+        let ledgers: i64 = conn.query_row("SELECT COUNT(*) FROM transfer_stage_ledger", [], |r| r.get(0)).unwrap();
+        let refs: i64 = conn.query_row("SELECT COUNT(*) FROM transfer_object_refs", [], |r| r.get(0)).unwrap();
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0)).unwrap();
+        let checkpoints: i64 = conn
+            .query_row("SELECT COUNT(*) FROM objects WHERE object_key >= '.narou-transfer/.checkpoints/' AND object_key < '.narou-transfer/.checkpoints0'", [], |r| r.get(0))
+            .unwrap();
+        let verified: i64 = conn.query_row("SELECT COUNT(*) FROM transfer_verified_objects", [], |r| r.get(0)).unwrap();
+        assert_eq!(ledgers, 0);
+        assert_eq!(checkpoints, 0);
+        assert_eq!(refs, 1);
+        assert_eq!(objects, 1, "shadowed direct row and superseded blobs must all be released");
+        assert_eq!(verified, 1);
+    }
+
+    #[test]
+    fn write_stream_once_cleans_stage_on_reuse_and_mismatch() {
+        let (_dir, mut store) = temp_store();
+        store.mirror_files = false;
+        let bytes = b"content-addressed-payload".to_vec();
+        let sha = hex::encode(sha2::Sha256::digest(&bytes));
+        let key = ObjectKey::try_new(format!("illustrations/{sha}")).unwrap();
+        futures::executor::block_on(async {
+            let s1 = Box::pin(futures::stream::once({
+                let bytes = bytes.clone();
+                async move { Ok(bytes) }
+            }));
+            assert!(matches!(store.write_stream_once(&key, s1, bytes.len() as u64, &sha).await.unwrap(), WriteOnce::Written));
+
+            let s2 = Box::pin(futures::stream::once({
+                let bytes = bytes.clone();
+                async move { Ok(bytes) }
+            }));
+            assert!(matches!(store.write_stream_once(&key, s2, bytes.len() as u64, &sha).await.unwrap(), WriteOnce::Reused));
+
+            let wrong = Box::pin(futures::stream::once(async { Ok(b"wrong".to_vec()) }));
+            assert!(store.write_stream_once(&key, wrong, 5, &sha).await.is_err());
+        });
+
+        let conn = store.conn.lock();
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0)).unwrap();
+        let ledgers: i64 = conn.query_row("SELECT COUNT(*) FROM transfer_stage_ledger", [], |r| r.get(0)).unwrap();
+        assert_eq!(objects, 1);
+        assert_eq!(ledgers, 0);
+    }
+
+    #[test]
+    fn reclaim_sqlite_bloat_cleans_v068_leaked_stages_and_debris() {
+        let (_dir, store) = temp_store();
+        let now = SqliteObjectStore::now_rfc3339();
+        let body_hash_live = b"live-hash".to_vec();
+        let body_hash_orphan = b"orphan-hash".to_vec();
+        let live_blob = ".narou-transfer/data/ordinary-live";
+        let dead_blob = ".narou-transfer/data/ordinary-dead";
+        let canonical = "novels/site/book/book.epub";
+
+        {
+            let mut conn = store.conn.lock();
+            conn.execute(
+                "INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (?1,4,?2,'none',0,X'01020304')",
+                rusqlite::params![live_blob, &now],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (?1,4,?2,'none',0,X'05060708')",
+                rusqlite::params![dead_blob, &now],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (?1,3,?2,'none',0,X'AABBCC')",
+                rusqlite::params![canonical, &now],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (?1,2,?2,'none',0,X'1122')",
+                rusqlite::params![".narou-transfer/.checkpoints/ordinary-dead/65536", &now],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (?1,1,?2,'none',0,X'00')",
+                rusqlite::params![".narou-transfer/.lock/abc", &now],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) VALUES (?1,1,?2,'none',0,X'00')",
+                rusqlite::params![".narou-transfer/.refs/novels/site/book/keep.ref", &now],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO transfer_stage_ledger(stage_id,record_json) VALUES ('ordinary-dead','{}')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO transfer_verified_objects(blob_key,size,sha256,generation) VALUES (?1,4,'00','g1'),('.narou-transfer/data/ordinary-missing',4,'00','g2')",
+                rusqlite::params![live_blob],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO transfer_object_refs(object_key,blob_key,size,sha256,backend,updated_at,blob_generation) VALUES (?1,?2,4,'00','d1',?3,'g1')",
+                rusqlite::params![canonical, live_blob, &now],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO novels(id,author,author_fold,title,title_fold,file_title,toc_url,toc_url_fold,sitename,sitename_fold,last_update) VALUES (1,'a','a','t','t','ft','https://x/1','https://x/1','s','s',?1)",
+                [&now],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO section_bodies(body_hash,size,encoding,crc32,data) VALUES (?1,1,'none',0,X'01'),(?2,1,'none',0,X'02')",
+                rusqlite::params![&body_hash_live, &body_hash_orphan],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO novel_sections(novel_id,idx,subtitle,body_hash) VALUES (1,'1','sub',?1)",
+                [&body_hash_live],
+            ).unwrap();
+
+            let report = reclaim_sqlite_bloat(&mut conn, None, 0).unwrap();
+            assert_eq!(report.stage_ledgers, 1);
+            assert_eq!(report.stage_checkpoints, 1);
+            assert_eq!(report.unreferenced_blobs, 1);
+            assert_eq!(report.shadowed_objects, 1);
+            assert_eq!(report.internal_debris, 1);
+            assert_eq!(report.verified_orphans, 1);
+            assert_eq!(report.section_bodies, 1);
+
+            let remaining: Vec<String> = conn
+                .prepare("SELECT object_key FROM objects ORDER BY object_key")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                remaining,
+                vec![
+                    ".narou-transfer/.refs/novels/site/book/keep.ref".to_string(),
+                    live_blob.to_string(),
+                ]
+            );
+            let live_bodies: i64 = conn.query_row("SELECT COUNT(*) FROM section_bodies", [], |r| r.get(0)).unwrap();
+            assert_eq!(live_bodies, 1);
+        }
+    }
+
+    #[test]
+    fn import_archive_skips_internal_transfer_debris_and_guards_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("site/title")).unwrap();
+        std::fs::write(root.join("site/title/toc.yaml"), b"title: ok\n").unwrap();
+        std::fs::write(root.join("site/title/toc.yaml.lock"), b"lock").unwrap();
+        std::fs::create_dir_all(root.join(".objects/.narou-transfer/.lock")).unwrap();
+        std::fs::write(root.join(".objects/.narou-transfer/.lock/l1"), b"lock").unwrap();
+        std::fs::create_dir_all(root.join(".objects/.narou-transfer/.refs/site")).unwrap();
+        std::fs::write(root.join(".objects/.narou-transfer/.refs/site/k.ref"), b"ref").unwrap();
+        std::fs::create_dir_all(root.join(".objects/.narou-staging")).unwrap();
+        std::fs::write(root.join(".objects/.narou-staging/tmp"), b"stage").unwrap();
+
+        let mirror = NativeObjectStore::from_root(root.to_path_buf()).unwrap();
+        let conn = crate::native::sqlite::open_in_memory().unwrap();
+        let imported = import_archive_into_objects(&conn, &mirror).unwrap();
+        assert_eq!(imported, 2);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root, root.join("site/loop")).unwrap();
+            let err = import_archive_into_objects(&conn, &mirror).unwrap_err();
+            assert!(err.to_string().contains("cyclic native namespace link"), "{err}");
+        }
+    }
+
+    #[test]
+    fn list_sqlite_objects_page_merges_direct_and_ref_objects_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = NativeObjectStore::from_root(dir.path().to_path_buf()).unwrap();
+        let conn = crate::native::sqlite::open_in_memory().unwrap();
+        let store = SqliteObjectStore::with_mirror_files(conn.clone(), mirror, false);
+
+        futures::executor::block_on(async {
+            for (k, body) in [
+                ("novels/site/book/a.txt", b"a-direct".as_slice()),
+                ("novels/site/book/b.txt", b"b-shadowed".as_slice()),
+                ("novels/site/book/d.txt", b"d-direct".as_slice()),
+                (".narou-transfer/.data/blob-b", b"b-blob".as_slice()),
+                (".narou-transfer/.data/blob-c", b"c-blob-ref".as_slice()),
+            ] {
+                let key = ObjectKey::try_new(k).unwrap();
+                ObjectStore::write_small(&store, &key, body.to_vec()).await.unwrap();
+            }
+        });
+        {
+            let guard = conn.lock();
+            for (logical, blob, size) in [
+                ("novels/site/book/b.txt", ".narou-transfer/.data/blob-b", 6i64),
+                ("novels/site/book/c.txt", ".narou-transfer/.data/blob-c", 10i64),
+            ] {
+                let generation: String = guard
+                    .query_row("SELECT generation FROM objects WHERE object_key=?", [blob], |r| r.get(0))
+                    .unwrap();
+                guard
+                    .execute(
+                        "INSERT INTO transfer_object_refs(object_key,blob_key,size,sha256,backend,updated_at,blob_generation)
+                         VALUES(?,?,?,'00','d1','t',?)",
+                        rusqlite::params![logical, blob, size, generation],
+                    )
+                    .unwrap();
+            }
+        }
+        // FS-only file must NOT be included by list_sqlite_objects_page.
+        std::fs::create_dir_all(dir.path().join("site/book")).unwrap();
+        std::fs::write(dir.path().join("site/book/e.txt"), b"fs-only").unwrap();
+
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = store.list_sqlite_objects_page(cursor.as_deref(), 2).unwrap();
+            all.extend(page.objects.into_iter().map(|(k, s)| (k.to_string(), s)));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(
+            all,
+            vec![
+                (".narou-transfer/.data/blob-b".to_string(), 6),
+                (".narou-transfer/.data/blob-c".to_string(), 10),
+                ("novels/site/book/a.txt".to_string(), 8),
+                ("novels/site/book/b.txt".to_string(), 6),
+                ("novels/site/book/c.txt".to_string(), 10),
+                ("novels/site/book/d.txt".to_string(), 8),
+            ]
+        );
     }
 }

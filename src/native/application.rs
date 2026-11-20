@@ -506,6 +506,27 @@ pub fn recover_maintenance(cursor: &mut NativeRecoveryCursor) -> Result<()> {
         cursor.creations = next;
         cursor.removals = service.recover_removals(cursor.removals.as_deref(), 4, 16).await
             .map_err(|error| NarouError::Platform(error.to_string()))?;
+        if !crate::native::sqlite::export_yaml::export_in_progress()
+            && let Some(state) = crate::native::sqlite::state::active_for(&root.join(".narou"))
+        {
+            let mut guard = state.conn_ref().lock();
+            if !crate::native::sqlite::export_yaml::export_in_progress() {
+                let _ = crate::native::sqlite::object_store::reclaim_sqlite_bloat(
+                    &mut guard,
+                    Some(64),
+                    crate::platform::staging::STAGE_TTL_SECONDS,
+                );
+                let _ = guard.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+                let wal_path = root.join(".narou").join("db.sqlite-wal");
+                if std::fs::metadata(&wal_path).is_ok_and(|meta| {
+                    meta.len() > crate::native::sqlite::SQLITE_JOURNAL_SIZE_LIMIT_BYTES as u64
+                }) {
+                    let _ = guard.busy_timeout(std::time::Duration::from_millis(50));
+                    let _ = guard.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                    let _ = guard.busy_timeout(std::time::Duration::from_secs(5));
+                }
+            }
+        }
         match release_error { Some(error) => Err(error), None => Ok(()) }
     })
 }

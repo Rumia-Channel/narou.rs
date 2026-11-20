@@ -69,37 +69,93 @@ impl NativeNovelRepository {
     pub fn get_many_current_sync(&self,ids:&[NovelId])->Result<Vec<Option<NovelRecord>>>{if ids.is_empty(){return Ok(Vec::new());}crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::many_snapshot_conn(connection,ids),None=>Ok(crate::platform::repository::align_current_records(ids,load_current_yaml_records(inventory)?.into_values()))}))}
     pub fn query_current_sync(&self,query:&NovelQuery)->Result<Vec<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::query_snapshot_conn(connection,query),None=>Ok(crate::platform::repository::query_records(load_current_yaml_records(inventory)?.values(),query))}))}
 
-    /// SQLite metadata-only lists share the existing publication/compatibility
-    /// lock order, then pin one read transaction. YAML retains leased reads.
+    /// Metadata-only list snapshots share the publication/compatibility lock
+    /// order so neither SQLite nor YAML/compat mode needs per-novel reader
+    /// leases or `.gate` creation to render the library table.
     pub fn metadata_page_snapshot_sync(
         &self,
         query: &NovelQuery,
     ) -> Result<Option<crate::platform::repository::NovelMetadataPage>> {
-        crate::db::with_database(|db| db.with_library_metadata_snapshot(|_, connection| {
-            let Some(connection) = connection else { return Ok(None); };
-            if db.metadata_is_yaml_in_snapshot(Some(connection)) {
-                return Ok(None);
+        crate::db::with_database(|db| db.with_library_metadata_snapshot(|inventory, connection| {
+            if let Some(connection) = connection && !db.metadata_is_yaml_in_snapshot(Some(connection)) {
+                let transaction = rusqlite::Transaction::new_unchecked(
+                    connection, rusqlite::TransactionBehavior::Deferred,
+                ).map_err(crate::native::sqlite::sqlite_error)?;
+                // Native freeze payloads stay canonical, including parse errors;
+                // the relational table is only their status-search projection.
+                use rusqlite::OptionalExtension;
+                let raw: String = transaction.query_row(
+                    "SELECT value_yaml FROM app_state WHERE scope='inv' AND key='freeze'",
+                    [], |row| row.get(0),
+                ).optional().map_err(crate::native::sqlite::sqlite_error)?.unwrap_or_default();
+                let frozen: std::collections::HashMap<i64, serde_yaml::Value> = if raw.is_empty() {
+                    Default::default()
+                } else {
+                    serde_yaml::from_str(&raw)?
+                };
+                let page = crate::native::sqlite::SqliteNovelRepository::metadata_page_snapshot_conn(
+                    &transaction, query, frozen.into_keys().collect(),
+                )?;
+                transaction.commit().map_err(crate::native::sqlite::sqlite_error)?;
+                return Ok(Some(page));
             }
-            let transaction = rusqlite::Transaction::new_unchecked(
-                connection, rusqlite::TransactionBehavior::Deferred,
-            ).map_err(crate::native::sqlite::sqlite_error)?;
-            // Native freeze payloads stay canonical, including parse errors;
-            // the relational table is only their status-search projection.
-            use rusqlite::OptionalExtension;
-            let raw: String = transaction.query_row(
-                "SELECT value_yaml FROM app_state WHERE scope='inv' AND key='freeze'",
-                [], |row| row.get(0),
-            ).optional().map_err(crate::native::sqlite::sqlite_error)?.unwrap_or_default();
+
+            let records = load_current_yaml_records(inventory)?;
+            let freeze_path = inventory.inventory_path("freeze", crate::db::inventory::InventoryScope::Local);
+            let raw = if freeze_path.is_file() {
+                crate::db::inventory::read_optional_yaml_file(&freeze_path)?
+            } else if let Some(connection) = connection {
+                use rusqlite::OptionalExtension;
+                connection.query_row(
+                    "SELECT value_yaml FROM app_state WHERE scope='inv' AND key='freeze'",
+                    [], |row| row.get(0),
+                ).optional().map_err(crate::native::sqlite::sqlite_error)?.unwrap_or_default()
+            } else {
+                String::new()
+            };
             let frozen: std::collections::HashMap<i64, serde_yaml::Value> = if raw.is_empty() {
                 Default::default()
             } else {
                 serde_yaml::from_str(&raw)?
             };
-            let page = crate::native::sqlite::SqliteNovelRepository::metadata_page_snapshot_conn(
-                &transaction, query, frozen.into_keys().collect(),
-            )?;
-            transaction.commit().map_err(crate::native::sqlite::sqlite_error)?;
-            Ok(Some(page))
+            let frozen_ids: std::collections::HashSet<i64> = frozen.into_keys().collect();
+            let mut effective_query = query.clone();
+            effective_query.filter.frozen_ids = Some(frozen_ids.clone());
+            let records_total = records.len() as u64;
+            let records_filtered = if effective_query.filter.is_unrestricted() {
+                records_total
+            } else {
+                records.values().filter(|record| record_matches_filter(record, &effective_query.filter)).count() as u64
+            };
+            let page_records = crate::platform::repository::query_records(records.values(), &effective_query);
+            if !page_records.is_empty() {
+                if let Some(connection) = connection {
+                    crate::native::sqlite::SqliteNovelRepository::check_metadata_prefixes_open(
+                        connection, &page_records,
+                    )?;
+                } else {
+                    let archive_root = inventory.root_dir().join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+                    let gate_dir = archive_root.join(".objects/.narou-transfer/.gate");
+                    if gate_dir.is_dir() && std::fs::read_dir(&gate_dir)?.next().is_some() {
+                        let store = crate::native::object_store::NativeObjectStore::from_root(archive_root)?;
+                        for record in &page_records {
+                            let prefix = crate::platform::ObjectPrefix::from(
+                                crate::platform::NovelObjectKeys::new(
+                                    &record.sitename, &record.file_title, record.use_subdirectory,
+                                )?.prefix().clone(),
+                            );
+                            if let Some(gate) = crate::native::object_store::read_durable_gate(&store.gate_path(&prefix)?)?
+                                && (gate.owner.is_some() || gate.migrated)
+                            {
+                                return Err(crate::platform::access_fence::gate_closed_error(&prefix));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Some(crate::platform::repository::NovelMetadataPage {
+                records_total, records_filtered, records: page_records, frozen_ids,
+            }))
         }))
     }
     pub fn find_by_toc_url_current_sync(&self,url:&str)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::url_snapshot_conn(connection,url);}let folded=crate::db::novel_codec::fold(url);Ok(load_current_yaml_records(inventory)?.into_values().find(|record|crate::db::novel_codec::fold(&record.toc_url)==folded))}))}
@@ -493,9 +549,9 @@ mod tests {
     }
 
     #[test]
-    fn metadata_page_native_keeps_yaml_leases_and_canonical_sqlite_freeze_state() {
+    fn metadata_page_native_uses_atomic_snapshot_without_leases_across_all_modes() {
         let _global = crate::test_support::global_state_guard();
-        for (mode, compat) in [("yaml", false), ("sqlite", true), ("sqlite", false)] {
+        for (mode, compat) in [("yaml", false), ("yaml", true), ("sqlite", true), ("sqlite", false)] {
             let temp = tempfile::tempdir().unwrap();
             let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
             std::fs::create_dir(temp.path().join(".narou")).unwrap();
@@ -516,16 +572,13 @@ mod tests {
             ).unwrap();
             let novels = NativeNovelRepository::new();
             let query = NovelQuery::page(NovelFilter::all(), Default::default(), 0, 50);
-            let snapshot = novels.metadata_page_snapshot_sync(&query).unwrap();
-            let sqlite_snapshot = mode == "sqlite" && !compat;
-            assert_eq!(snapshot.is_some(), sqlite_snapshot, "{mode}, compat={compat}");
-            if let Some(snapshot) = snapshot {
-                assert_eq!((snapshot.records_total, snapshot.records_filtered), (1, 1));
-                assert_eq!(snapshot.records[0].title, record.title);
-                // The native payload, not the FK-limited search projection, is
-                // authoritative; presence counts even when its value is false.
-                assert_eq!(snapshot.frozen_ids, HashSet::from([record.id, 999]));
-            }
+            let snapshot = novels.metadata_page_snapshot_sync(&query).unwrap()
+                .unwrap_or_else(|| panic!("expected snapshot for {mode}, compat={compat}"));
+            assert_eq!((snapshot.records_total, snapshot.records_filtered), (1, 1));
+            assert_eq!(snapshot.records[0].title, record.title);
+            // The native payload, not the FK-limited search projection, is
+            // authoritative; presence counts even when its value is false.
+            assert_eq!(snapshot.frozen_ids, HashSet::from([record.id, 999]));
             let library = crate::application::LibraryService::new(
                 Arc::new(novels),
                 Arc::new(crate::platform::clock::SystemClock),
@@ -545,6 +598,7 @@ mod tests {
                 hidden: None, include_hidden: true, exclude_ids: Vec::new(),
                 attribute_tags_enabled: false,
             };
+            let gate_dir = temp.path().join("小説データ/.objects/.narou-transfer/.gate");
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             runtime.block_on(async {
                 let mut scope = crate::application::novel_access::NovelReadScope::new(&objects, "native-list-test");
@@ -552,7 +606,14 @@ mod tests {
                 assert_eq!(page.data[0].title, record.title);
                 assert!(page.data[0].frozen);
                 let gate = objects.access_fence().unwrap().gate_info(&prefix).await.unwrap();
-                assert_eq!(gate.pending_readers, u32::from(!sqlite_snapshot));
+                assert_eq!(gate.pending_readers, 0, "no reader leases in {mode}, compat={compat}");
+                scope.release_all().await.unwrap();
+
+                let mut frozen_req = request.clone();
+                frozen_req.search = Some("status:凍結".to_string());
+                let mut scope = crate::application::novel_access::NovelReadScope::new(&objects, "native-frozen-filter");
+                let frozen_page = library.list(&mut scope, &frozen_req).await.unwrap();
+                assert_eq!(frozen_page.records_filtered, 1, "status:凍結 filter in {mode}, compat={compat}");
                 scope.release_all().await.unwrap();
 
                 objects.access_fence().unwrap().close_gate(&prefix, "test-publication").await.unwrap();
@@ -560,14 +621,27 @@ mod tests {
                 let error = library.list(&mut scope, &request).await.expect_err("selected closed namespace");
                 assert!(error.to_string().contains("novel_recovering:"), "{error}");
                 scope.release_all().await.unwrap();
+
+                if mode == "yaml" {
+                    let _ = std::fs::remove_dir_all(&gate_dir);
+                    let mut scope = crate::application::novel_access::NovelReadScope::new(&objects, "native-no-gate");
+                    let page = library.list(&mut scope, &request).await.unwrap();
+                    assert_eq!(page.records_total, 1);
+                    assert!(!gate_dir.exists(), "YAML metadata list must not create gate files");
+                    scope.release_all().await.unwrap();
+                }
             });
-            if sqlite_snapshot {
+            if mode == "sqlite" && !compat {
                 let state = crate::native::sqlite::state::active_for(&temp.path().join(".narou")).unwrap();
                 state.conn().lock().execute(
                     "UPDATE app_state SET value_yaml='[' WHERE scope='inv' AND key='freeze'", [],
                 ).unwrap();
                 assert!(NativeNovelRepository::new().metadata_page_snapshot_sync(&query).is_err(),
                     "a stale relational freeze projection must not hide a malformed canonical payload");
+            } else {
+                std::fs::write(temp.path().join(".narou/freeze.yaml"), "[").unwrap();
+                assert!(NativeNovelRepository::new().metadata_page_snapshot_sync(&query).is_err(),
+                    "malformed freeze.yaml must fail closed in {mode}, compat={compat}");
             }
         }
     }
