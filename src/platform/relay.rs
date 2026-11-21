@@ -62,6 +62,115 @@ pub fn response_wire_limit(decoded_body_limit: usize) -> usize {
 /// 踏み台への認証ヘッダ名。
 pub const TOKEN_HEADER: &str = "x-proxy-token";
 
+/// `download.relay-sites` の値から、取得リレーを試してよい対象サイトを決める。
+///
+/// 値はカンマ区切りのホスト名 (または `auto` / `none`):
+/// - `auto` / 空 / 未設定 … 取得リレーを任意サイトの取得失敗時に試す (既定)。
+/// - `none` … 取得リレーを使わない。
+/// - `host.example` … そのホストとサブドメインだけにリレーを試す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelaySitePolicy {
+    /// 任意の対象で、取得失敗時にリレーを試す (既定)。
+    Auto,
+    /// リレーを使わない。
+    Disabled,
+    /// サイトごとのルール。`fallback` は取得失敗時にだけ、
+    /// `forced` は最初からリレー経由にするホストの一覧
+    /// (いずれも `"*"` で全ホスト、サブドメインも含めて照合)。
+    Scoped {
+        fallback: Vec<String>,
+        forced: Vec<String>,
+    },
+}
+
+impl RelaySitePolicy {
+    /// `download.relay-sites` の生の文字列からポリシーを組み立てる。
+    /// 空・空白のみ・`auto` / `*` は [`RelaySitePolicy::Auto`]。
+    ///
+    /// 各項目はホスト名、`auto` (`*`)、`none` (`off`)、または
+    /// `force:<ホスト名>` / `forced:<ホスト名>` / `relay:<ホスト名>`。
+    /// `none` が 1 つでもあれば [`RelaySitePolicy::Disabled`] が優先される。
+    /// `force:` のないホスト名は「失敗時にだけリレーを試す」対象になる。
+    pub fn parse(value: Option<&str>) -> Self {
+        let Some(raw) = value.map(str::trim).filter(|raw| !raw.is_empty()) else {
+            return Self::Auto;
+        };
+        if raw.eq_ignore_ascii_case("auto") || raw == "*" {
+            return Self::Auto;
+        }
+        if raw.eq_ignore_ascii_case("none") || raw.eq_ignore_ascii_case("off") {
+            return Self::Disabled;
+        }
+        let normalize = |entry: &str| {
+            entry
+                .trim_start_matches("*.")
+                .trim_end_matches('/')
+                .to_ascii_lowercase()
+        };
+        let mut fallback = Vec::new();
+        let mut forced = Vec::new();
+        for entry in raw.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+            if entry.eq_ignore_ascii_case("none") || entry.eq_ignore_ascii_case("off") {
+                return Self::Disabled;
+            }
+            if let Some(host) = ["force:", "forced:", "relay:"]
+                .iter()
+                .find_map(|prefix| entry.strip_prefix(prefix))
+            {
+                let host = normalize(host);
+                if !host.is_empty() {
+                    forced.push(host);
+                }
+            } else if entry.eq_ignore_ascii_case("auto") || entry == "*" {
+                fallback.push("*".to_string());
+            } else {
+                let host = normalize(entry);
+                if !host.is_empty() {
+                    fallback.push(host);
+                }
+            }
+        }
+        if fallback.is_empty() && forced.is_empty() {
+            Self::Auto
+        } else {
+            Self::Scoped { fallback, forced }
+        }
+    }
+
+    /// `url` のホストが `hosts` のいずれかと一致するか (`"*"` は全一致、
+    /// 登録したホストのサブドメインも含む)。
+    fn host_in(hosts: &[String], url: &str) -> bool {
+        let Some(host) = url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        else {
+            return false;
+        };
+        hosts
+            .iter()
+            .any(|entry| *entry == "*" || host == *entry || host.ends_with(&format!(".{entry}")))
+    }
+
+    /// 取得失敗時のフォールバックとして、この対象にリレーを試してよいか。
+    pub fn fallback_allowed(&self, url: &str) -> bool {
+        match self {
+            Self::Auto => true,
+            Self::Disabled => false,
+            Self::Scoped { fallback, .. } => Self::host_in(fallback, url),
+        }
+    }
+
+    /// 直接取得を試さず、最初からリレー経由にする対象か (テスト用)。
+    pub fn forced(&self, url: &str) -> bool {
+        match self {
+            Self::Scoped { forced, .. } => Self::host_in(forced, url),
+            _ => false,
+        }
+    }
+}
+
+
+
 /// リレー呼び出しの失敗理由。
 ///
 /// 踏み台が上流の取得に失敗した場合 (`Rejected`) と、応答そのものが
@@ -266,8 +375,11 @@ impl RelayRequest {
         // 並びに関係なく決定的になる。
         let mut grouped: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
         for (name, value) in headers {
+            // RFC トークン名・制御文字無しの値だけを転送する。1 件の unsafe
+            // ヘッダで組立全体を止めると、サイト Cookie 等で relay を試せ
+            // なくなる (fallback が走らない)。
             if !is_safe_header_name(name) || !is_safe_header_value(value) {
-                return Err(invalid(format!("unsafe header: {name:?}")));
+                continue;
             }
             match grouped.entry(name.to_ascii_lowercase()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -566,19 +678,29 @@ mod tests {
 
     #[test]
     fn request_rejects_unsafe_inputs() {
+        // unsafe なヘッダは要求全体を止めず、その 1 件だけ落とす。
         let long_name = "x".repeat(65);
         let bad = [
-            vec![("Bad\nName".to_string(), "v".to_string())],
-            vec![("bad name".to_string(), "v".to_string())],
-            vec![("Ok".to_string(), "v\r\nInjected: x".to_string())],
-            vec![("Ok".to_string(), "v\u{0}".to_string())],
-            vec![(long_name, "v".to_string())],
+            ("Bad\nName".to_string(), "v".to_string()),
+            ("bad name".to_string(), "v".to_string()),
+            ("Ok".to_string(), "v\r\nInjected: x".to_string()),
+            ("Ok".to_string(), "v\u{0}".to_string()),
+            (long_name, "v".to_string()),
         ];
-        for headers in bad {
-            assert!(matches!(
-                RelayRequest::new(BASE, "t", "https://example.com/", &headers),
-                Err(RelayError::InvalidRequest(_))
-            ));
+        for (name, value) in bad {
+            let headers = vec![(name.clone(), value), ("Accept".to_string(), "text/html".to_string())];
+            let request = RelayRequest::new(BASE, "t", "https://example.com/", &headers)
+                .unwrap()
+                .into_request();
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+            let header_names: Vec<&str> = body["headers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(header_names, ["Accept"], "{name:?} must be dropped");
         }
         assert!(matches!(
             RelayRequest::new(BASE, "to\nken", "https://example.com/", &[]),
@@ -876,5 +998,73 @@ mod tests {
         );
         assert_eq!(body["headers"]["Sec-Fetch-Dest"], "document");
         assert_eq!(body["headers"]["user-agent"], "agent");
+    }
+
+    #[test]
+    fn site_policy_defaults_to_auto_when_unset_or_auto() {
+        for raw in [None, Some(""), Some("   "), Some("auto"), Some("AUTO"), Some("*")] {
+            assert_eq!(RelaySitePolicy::parse(raw), RelaySitePolicy::Auto, "{raw:?}");
+        }
+        let policy = RelaySitePolicy::Auto;
+        assert!(policy.fallback_allowed("https://ncode.syosetu.com/n1/"));
+        assert!(!policy.forced("https://ncode.syosetu.com/n1/"));
+    }
+
+    #[test]
+    fn site_policy_none_disables_relay() {
+        for raw in ["none", "off", "syosetu.org,none", "ncode.syosetu.com,off"] {
+            let policy = RelaySitePolicy::parse(Some(raw));
+            assert_eq!(policy, RelaySitePolicy::Disabled, "{raw:?}");
+            assert!(!policy.fallback_allowed("https://ncode.syosetu.com/n1/"));
+            assert!(!policy.forced("https://ncode.syosetu.com/n1/"));
+        }
+    }
+
+    #[test]
+    fn site_policy_host_list_limits_fallback_to_those_sites() {
+        let policy = RelaySitePolicy::parse(Some("syosetu.org, www.pixiv.net"));
+        assert!(policy.fallback_allowed("https://syosetu.org/novel/1"));
+        // サブドメインも含める (h.syosetu.org)。
+        assert!(policy.fallback_allowed("https://h.syosetu.org/novel/1"));
+        assert!(policy.fallback_allowed("https://www.pixiv.net/novel/show.php?id=1"));
+        assert!(!policy.fallback_allowed("https://ncode.syosetu.com/n1/"));
+        assert!(!policy.fallback_allowed("https://notsyosetu.org/"));
+        assert!(!policy.forced("https://syosetu.org/novel/1"));
+    }
+
+    #[test]
+    fn site_policy_force_prefix_sends_host_through_relay_first() {
+        let policy = RelaySitePolicy::parse(Some("syosetu.org, force:ncode.syosetu.com"));
+        assert!(policy.forced("https://ncode.syosetu.com/n1/"));
+        // 強制対象のサブドメインも強制に含める。
+        assert!(policy.forced("https://www.ncode.syosetu.com/n1/"));
+        assert!(!policy.forced("https://syosetu.org/novel/1"));
+        // 強制対象は fallback 対象の判定には載らない (forced 側で使う)。
+        assert!(policy.fallback_allowed("https://syosetu.org/novel/1"));
+        assert!(!policy.fallback_allowed("https://ncode.syosetu.com/n1/"));
+    }
+
+    #[test]
+    fn site_policy_force_only_list_keeps_other_sites_off_relay() {
+        let policy = RelaySitePolicy::parse(Some("force:syosetu.org"));
+        assert!(policy.forced("https://syosetu.org/novel/1"));
+        assert!(!policy.fallback_allowed("https://ncode.syosetu.com/n1/"));
+    }
+
+    #[test]
+    fn request_skips_unsafe_headers_without_aborting() {
+        // Cookie 等に制御文字が混ざっても、その 1 件だけ落としてリレー要求を
+        // 組み立てる (組立全体を止めると fallback が走らない)。
+        let headers = vec![
+            ("Accept".to_string(), "text/html".to_string()),
+            ("Cookie".to_string(), "a=1\nb=2".to_string()),
+        ];
+        let request = RelayRequest::new(BASE, "t", "https://example.com/", &headers)
+            .unwrap()
+            .into_request();
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["headers"]["Accept"], "text/html");
+        assert!(body["headers"].get("Cookie").is_none());
     }
 }

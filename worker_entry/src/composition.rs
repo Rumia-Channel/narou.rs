@@ -388,10 +388,18 @@ impl WorkerRuntime {
         // それ以外は fail closed で無効化する)。
         let relay_base = crate::secrets::value(env, "NAROU_RELAY_ENDPOINT").await;
         let relay_token = crate::secrets::value(env, "NAROU_RELAY_KEY").await;
+        // `download.relay-sites` は local 設定から、リレー設定と同じ
+        // 組み立てタイミングで読む (`narou setting` / Web UI の変更は次の
+        // ジョブで反映される)。
+        let relay_sites = local_values
+            .get("download.relay-sites")
+            .and_then(|value| value.as_str());
         let mut http_client =
             WorkerHttpClient::new(subrequests.clone()).with_user_agent(user_agent);
         if let (Some(base), Some(token)) = (relay_base, relay_token) {
-            http_client = http_client.with_relay(base, token);
+            http_client = http_client
+                .with_relay(base, token)
+                .with_relay_sites(relay_sites);
         }
         let http: Arc<dyn HttpClient> =
             Arc::new(http_client.with_cookie_store(cookie_store.clone()));

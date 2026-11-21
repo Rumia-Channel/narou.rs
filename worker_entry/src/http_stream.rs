@@ -148,57 +148,124 @@ impl WorkerHttpClient {
                 if !request.trusted_endpoint { self.validate_url(&request.url).await?; }
                 let scope = pacing.map(|policy| policy.scope_for(&chain)).transpose()?;
                 if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.acquire(scope).await?; }
+                // `download.relay-sites` に `force:<ホスト>` が指定されている対象は
+                // 直接取得を試さず、最初からリレーへ送る (検証用の一時切替)。
+                let mut relay_attempted = false;
+                let forced = self
+                    .relay
+                    .as_ref()
+                    .is_some_and(|relay| relay.sites.forced(&request.url));
+                if forced {
+                    if let Some(relay) = self.relay.as_ref() {
+                        if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.acquire(scope).await?; }
+                        let mut relay_request = RelayRequest::new(&relay.base_url, &relay.token, &request.url, &request.headers)?.into_stream_request();
+                        if relay_request.header("User-Agent").is_none() {
+                            let user_agent = request.header("User-Agent").unwrap_or(
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0");
+                            relay_request.headers.push(("User-Agent".into(), user_agent.to_string()));
+                        }
+                        let forced_response = match self.send_fetch_stream_hop(&relay_request).await {
+                            Ok(response) => narou_rs::platform::relay::decode_relay_stream(response).await,
+                            Err(error) => Err(error),
+                        };
+                        if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.complete(scope).await?; }
+                        relay_attempted = true;
+                        match forced_response {
+                            Ok(mut value)
+                                if value.is_success() || value.is_redirection()
+                                    || value.browser_challenge().is_some() =>
+                            {
+                                value.url = request.url.clone();
+                                let head = value.head();
+                                if let Some(store) = self.cookie_store.as_deref() {
+                                    narou_rs::platform::cookie_store::persist_response_set_cookie(
+                                        store, &head, chain.request().header("Cookie"),
+                                    ).await;
+                                }
+                                if !chain.advance(&head)? { return Ok(value); }
+                                continue;
+                            }
+                            Ok(value) => console_warn!("forced relay returned {}, falling back to direct fetch", value.status),
+                            Err(error) => console_warn!("forced relay failed, falling back to direct fetch: {error}"),
+                        }
+                    }
+                }
+                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.acquire(scope).await?; }
                 let result = self.send_fetch_stream_hop(request).await;
                 if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.complete(scope).await?; }
-                let mut response = result?;
-                if response.status == 403 && request.method == HttpMethod::Get && !request.trusted_endpoint {
-                    // Preserve the original complete diagnostic response if all
-                    // alternatives fail; a truncated 403 never starts fallback.
-                    let mut diagnostic = Vec::new();
-                    while let Some(chunk) = response.body.next().await {
-                        let chunk = chunk?;
-                        if chunk.len() > MAX_WORKER_HTTP_BODY - diagnostic.len() { return Err(NarouError::Http("403 body exceeds limit".into())); }
-                        diagnostic.extend_from_slice(&chunk);
+                // A 403 GET — or a transport failure — can be a Cloudflare
+                // egress block, so try socket then relay on any GET failure,
+                // not only a successful 403 response.
+                let should_fallback = request.method == HttpMethod::Get && !request.trusted_endpoint;
+                let is_blocked = result.is_err() || matches!(&result, Ok(r) if r.status == 403);
+                let response = if should_fallback && is_blocked {
+                    let mut result = result;
+                    match &mut result {
+                        Ok(response) => {
+                            // Preserve the original complete diagnostic
+                            // response if all alternatives fail; a truncated
+                            // 403 never starts fallback.
+                            let mut diagnostic = Vec::new();
+                            while let Some(chunk) = response.body.next().await {
+                                let chunk = chunk?;
+                                if chunk.len() > MAX_WORKER_HTTP_BODY - diagnostic.len() {
+                                    return Err(NarouError::Http("403 body exceeds limit".into()));
+                                }
+                                diagnostic.extend_from_slice(&chunk);
+                            }
+                            response.body = owned_bytes_stream(diagnostic);
+                        }
+                        Err(error) => console_warn!("fetch transport failed, trying socket/relay fallback: {error}"),
                     }
-                    response.body = owned_bytes_stream(diagnostic);
                     if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.acquire(scope).await?; }
                     self.subrequests.record();
                     let socket = socket_stream(&request.url, &request.headers).await;
                     if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.complete(scope).await?; }
-                    match socket {
-                        Ok(value) if value.is_success() || value.is_redirection() => response = value,
+                    let mut resolved = match socket {
+                        Ok(value) if value.is_success() || value.is_redirection() => Some(value),
                         // A browser verification is the site's own answer: it
-                        // must not be replaced by the original 403.
-                        Ok(value) if value.browser_challenge().is_some() => response = value,
-                        _ => {
-                            if let Some(relay) = self.relay.as_ref() {
-                                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.acquire(scope).await?; }
-                                let mut relay_request = RelayRequest::new(&relay.base_url, &relay.token, &request.url, &request.headers)?.into_stream_request();
-                                if relay_request.header("User-Agent").is_none() {
-                                    let user_agent = request.header("User-Agent").unwrap_or(
-                                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0");
-                                    relay_request.headers.push(("User-Agent".into(), user_agent.to_string()));
-                                }
-                                let relay_response = match self.send_fetch_stream_hop(&relay_request).await {
-                                    Ok(response) => narou_rs::platform::relay::decode_relay_stream(response).await,
-                                    Err(error) => Err(error),
-                                };
-                                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.complete(scope).await?; }
-                                if let Ok(mut value) = relay_response {
-                                    value.url = request.url.clone();
-                                    // A browser verification is the site's own
-                                    // answer: it must not be replaced by the
-                                    // original 403.
-                                    if value.is_success() || value.is_redirection()
-                                        || value.browser_challenge().is_some()
-                                    {
-                                        response = value;
-                                    }
+                        // must not be replaced by the original failure.
+                        Ok(value) if value.browser_challenge().is_some() => Some(value),
+                        _ => None,
+                    };
+                    if resolved.is_none() && !relay_attempted {
+                        if let Some(relay) = self
+                            .relay
+                            .as_ref()
+                            .filter(|relay| relay.sites.fallback_allowed(&request.url))
+                        {
+                            if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.acquire(scope).await?; }
+                            let mut relay_request = RelayRequest::new(&relay.base_url, &relay.token, &request.url, &request.headers)?.into_stream_request();
+                            if relay_request.header("User-Agent").is_none() {
+                                let user_agent = request.header("User-Agent").unwrap_or(
+                                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0");
+                                relay_request.headers.push(("User-Agent".into(), user_agent.to_string()));
+                            }
+                            let relay_response = match self.send_fetch_stream_hop(&relay_request).await {
+                                Ok(response) => narou_rs::platform::relay::decode_relay_stream(response).await,
+                                Err(error) => Err(error),
+                            };
+                            if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.complete(scope).await?; }
+                            if let Ok(mut value) = relay_response {
+                                value.url = request.url.clone();
+                                // A browser verification is the site's own
+                                // answer: it must not be replaced by the
+                                // original failure.
+                                if value.is_success() || value.is_redirection()
+                                    || value.browser_challenge().is_some()
+                                {
+                                    resolved = Some(value);
                                 }
                             }
                         }
                     }
-                }
+                    match resolved {
+                        Some(value) => value,
+                        None => result?,
+                    }
+                } else {
+                    result?
+                };
                 let head = response.head();
                 if let Some(store) = self.cookie_store.as_deref() {
                     narou_rs::platform::cookie_store::persist_response_set_cookie(store, &head, chain.request().header("Cookie")).await;
