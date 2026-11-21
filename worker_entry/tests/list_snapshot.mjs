@@ -1,6 +1,10 @@
 // Real Worker/D1 regression for the initial Web UI list on a large library.
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { runWrangler } from './read_worker_fixture.mjs';
+
 
 const base = new URL(process.env.BASE_URL);
 const config = process.env.NAROU_TEST_CONFIG;
@@ -13,9 +17,19 @@ const first = 990800001;
 const last = first + size - 1;
 const title = id => `list-snapshot-${id}`;
 const prefix = id => `novels/list-snapshot/${title(id)}`;
-const sql = command => runWrangler([
-  'd1', 'execute', 'DB', '--local', '-c', config, '--persist-to', persist, '--command', command, '--json',
-]);
+// Windows では `shell:true` の spawnSync が `--command` の値を cmd.exe /c で
+// 空白分割するため、複文・括弧を含む SQL が wrangler へ壊れて届く
+// ("--command または --file が必要")。他の fixture と同じく `--file` 経由にする。
+const sqlDir = mkdtempSync(join(tmpdir(), 'narou-list-snapshot-'));
+let sqlIndex = 0;
+const sql = command => {
+  const file = join(sqlDir, `fixture-${sqlIndex++}.sql`);
+  writeFileSync(file, command);
+  return runWrangler([
+    'd1', 'execute', 'DB', '--local', '-c', config, '--persist-to', persist, '--file', file, '--json',
+  ]);
+};
+
 const list = query => fetch(new URL(`/api/list?${query}`, base), { headers, signal: AbortSignal.timeout(35_000) });
 async function payload(query) {
   const response = await list(query);
@@ -87,5 +101,9 @@ try {
   assert.deepEqual(recovered.data.map(row => row.id), [last]);
   console.log(`Worker list: ${size} visible works, matching counts and sorting, no lease writes, recovery boundary verified (${Math.round(performance.now() - start)} ms including checks)`);
 } finally {
-  sql(`DELETE FROM novel_access_gates WHERE prefix LIKE 'novels/list-snapshot/%'; DELETE FROM novels WHERE id BETWEEN ${first} AND ${last};`);
+  try {
+    sql(`DELETE FROM novel_access_gates WHERE prefix LIKE 'novels/list-snapshot/%'; DELETE FROM novels WHERE id BETWEEN ${first} AND ${last};`);
+  } finally {
+    rmSync(sqlDir, { recursive: true, force: true });
+  }
 }
