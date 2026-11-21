@@ -9,14 +9,20 @@ development.
 
 If dependency versions change, regenerate both notices:
 
-```powershell
+```sh
+# Regenerate on Linux (or WSL), matching CI exactly — cargo-about's license
+# block ordering is platform-dependent, and output generated on Windows does
+# NOT match the file the Ubuntu CI job produces. Do NOT add --offline: the CI
+# command has no --offline and resolves license text from `cargo fetch`'d
+# crate sources, which yields a different block order than the vendored path.
+
 # GPL side: explicitly enable Lite for native binaries. about.toml also scans
 # the wasm32 Worker. Both AozoraEpub3_Lite and the Worker are GPL-3.0-only.
-cargo-about generate --workspace --features narou_rs/lite --locked --offline -c about.toml -o Third-Party-License.md about.hbs
+cargo-about generate --workspace --features narou_rs/lite --locked -c about.toml -o Third-Party-License.md about.hbs
 
 # Non-GPL binaries: accepts no GPL at all, so the scan fails if copyleft reaches
 # the non-GPL graph. Produces the notice shipped with the standard archives.
-cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked --offline -o Third-Party-License-non-GPL.md about.hbs
+cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked -o Third-Party-License-non-GPL.md about.hbs
 ```
 
 CI regenerates both and fails on any difference (the `license` job in
