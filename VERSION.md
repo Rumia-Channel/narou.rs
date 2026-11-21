@@ -3,6 +3,16 @@
 各バージョンの主な変更点です。網羅的な差分は各節の compare リンクを参照してください。
 コマンド互換性や未完了項目は [`COMMANDS.md`](COMMANDS.md)、導入と操作は [`README.md`](README.md) を参照してください。
 
+
+## v0.6.10 — Workers の S3・変換まわりの修正
+
+- Workers の S3 互換ストレージで、0 バイトのステージングオブジェクトへの stat が 416 `bytes */0` を返した場合に「存在しない」扱いされ、ダウンロードが `Novel not found: .narou-staging/…` で永久失敗する問題を修正しました。416 は Content-Range で分類し、`bytes */0` は 0 バイト、`bytes */N` (N>0) は範囲超過、サイズ不明は不在として扱います。
+- 目次のサブタイトルに含まれる HTML エンティティを narou.rb と同じくデコードし、ファイル名のタイトルへ narou.rb 互換の順序で反映するようにしました。小説の改名時に本文 YAML のファイル名が更新されない問題も修正しました。
+- Workers の D1 バッチ書き込みでガード (`abs(INT64_MIN)`) が中断したとき、どの書き込み経路が拒否したかをエラーメッセージに含めるようにしました。
+- Workers の取得リレーについて、Fetch が応答自体を返せないトランスポート失敗 (接続拒否・リセット等) でも GET なら生ソケットとリレーを試すようにしました (従来は 403 が返ったときだけ)。`narou setting download.relay-sites` / Web UI 設定 (詳細タブ) で、リレーを試すサイトをカンマ区切りで絞り込めます (`none` で無効、`force:<ホスト>` でそのサイトだけ最初からリレー経由にする検証用切替も可)。
+
+変更一覧は [v0.6.9...v0.6.10](https://github.com/Rumia-Channel/narou.rs/compare/v0.6.9...v0.6.10) を参照してください。
+
 ## v0.6.9 — SQLite の肥大化・YAML 切替・一覧速度と AozoraEpub3 検出の改善
 
 - Native SQLite の通常書き込みで一時ステージ台帳・重複本体・孤立オブジェクト・旧本文キャッシュが残り続け、`db.sqlite` と `db.sqlite-wal` が肥大化する問題を修正しました（issue #48）。書き込み後の片付けと WAL チェックポイントを整え、起動中保守でも不要データを段階回収します。
@@ -10,6 +20,7 @@
 - 作品数が多いライブラリで SQLite から YAML へ切り替える（`narou db export-yaml --in-place` / Web UI 設定からの切替）際、全作品分のロックやファイルを同時に開き続けてファイルディスクリプタ上限 (`EMFILE`) や長時間停止に至る問題を修正しました（issue #48）。切替ロックと書き出しをストリーミング処理へ改め、異常時のロールバック保全を維持します。
 - Native 作品一覧の読み込みで不要なゲート読み直し・再ロック・ドメインごとのタイムゾーン再解決を省き、Web UI の補助読み込みと外部ツール検出をブロッキングプールへ分離して応答時間を短縮しました（issue #46）。
 - Windows の jpackage / MSI 版 AozoraEpub3（`app/AozoraEpub3.jar` 配置）を `narou init`、バージョン確認、変換時および同梱 Java 解決で検出できるようにしました（issue #48）。
+- Workers の S3 互換ストレージ (Wasabi 等) で、存在しないオブジェクトへの stat が 416 (Range Not Satisfiable) を返す環境で、ダウンロード・更新が `S3 metadata GET failed with status 416` で停止する問題を修正しました。404 と同じく「オブジェクト無し」として扱います。
 
 変更一覧は [v0.6.8...v0.6.9](https://github.com/Rumia-Channel/narou.rs/compare/v0.6.8...v0.6.9) を参照してください。
 

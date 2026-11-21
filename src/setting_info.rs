@@ -139,6 +139,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "download.narou-api.interval"
         | "download.narou-api.user-agent"
         | "download.use-subdirectory"
+        | "download.relay-sites"
         | "download.choices-of-digest-options"
         | "send.backup-bookmark"
         | "multiple-delimiter"
@@ -892,6 +893,19 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::Boolean,
                 "小説を一定数ごとにサブフォルダへ分けて保存する",
+            ),
+        ),
+        (
+            "download.relay-sites",
+            vis(
+                VarType::String,
+                concat!(
+                    "外部取得リレーを使うサイト (Workers のみ)。\n",
+                    "auto/空: 全サイトで取得失敗時にリレーを試す (既定)\n",
+                    "none: リレーを使わない\n",
+                    "ホスト名をカンマ区切り: そのサイト (サブドメイン含む) だけ失敗時にリレーを試す\n",
+                    "force:<ホスト名>: 直接取得せず最初からリレー経由にする (検証用の一時切替)"
+                ),
             ),
         ),
         (

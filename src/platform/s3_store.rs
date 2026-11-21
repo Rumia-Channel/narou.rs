@@ -295,8 +295,20 @@ impl S3Store {
     async fn pool_stat(&self, key: &ObjectKey) -> Result<Option<u64>> {
         if !self.location.has_pool_alternate(key) { return Ok(None); }
         let response = self.stream_get(&self.location.object_url(key), &[("range", "bytes=0-0")]).await?;
+        // `bytes */0` は「不在」と「0 バイト」を区別しない。dedup プールは
+        // 存在性だけを問うため空のプールは不在と同じ扱いにする
+        // (サイズを報告する stat_object が Some(0) を返すのと非対称なのは意図的)。
+        // Content-Range が読めない 416 も、存在するなら長さが分かるはずなので
+        // 不在として扱う。`bytes */N` (N>0) は実在するのでサイズを返す。
+        match streaming::range_416_total(&response) {
+            Some(0) => return Ok(None),
+            Some(size) => return Ok(Some(size)),
+            None if response.status == 416 => return Ok(None),
+            None => {}
+        }
         if response.status == 404 { return Ok(None); }
         streaming::metadata_size(&response).map(Some)
+
     }
 
     /// dedup プールにそのキーが存在するか (移行判定用)。
@@ -310,7 +322,18 @@ impl S3Store {
         self.renew_stage_progress(key).await?;
         let response = self.stream_get_object(key, &[("range", "bytes=0-0")]).await?;
         if response.status == 404 { return Ok(None); }
+        // 416 の分類は `bytes */N` のサイズ可否で決める。
+        //   `bytes */0`          … 0 バイト(または不在)。stat は 0 サイズの
+        //                          オブジェクトとして返し、空の staging
+        //                          オブジェクトを欠落扱いしない。
+        //   `bytes */N` (N>0)    … 存在するが範囲外。metadata_size がエラー化する。
+        //   Content-Range 無し等 … 存在するオブジェクトなら長さが分かるため、
+        //                          サイズ不明の 416 は不在として扱う。
+        if response.status == 416 && streaming::range_416_total(&response).is_none() {
+            return Ok(None);
+        }
         let size = streaming::metadata_size(&response)?;
+
         let etag = response
             .header("etag")
             .map(|value| value.trim_matches('"').to_string());
@@ -702,8 +725,8 @@ impl AssetStore for S3Store {
     fn legacy_etag<'a>(&'a self,logical:&'a ObjectKey)->PlatformFuture<'a,Result<Option<String>>>{Box::pin(async move{
         super::transfer_stage::illustration_pool_key(logical)?;
         let response=self.stream_get(&self.location.legacy_object_url(logical),&[("range","bytes=0-0")]).await?;
-        if response.status==404{return Ok(None);}
-        if !matches!(response.status,200|206)&&!(response.status==416&&response.header("content-range")==Some("bytes */0")){return Err(NarouError::Platform(format!("legacy ETag lookup failed with status {}",response.status)));}
+        if response.status==404||(response.status==416&&matches!(streaming::range_416_total(&response),None|Some(0))){return Ok(None);}
+        if response.status==416{return Err(NarouError::Platform(format!("legacy ETag lookup failed with status {}",response.status)));}
         response.header("etag").filter(|etag|!etag.is_empty()).map(|etag|Some(etag.to_owned())).ok_or_else(||NarouError::Platform("legacy object omitted ETag; conditional GC unavailable".into()))
     })}
     fn delete_legacy_if_match<'a>(&'a self,logical:&'a ObjectKey,pool:&'a ObjectKey,etag:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
@@ -986,6 +1009,125 @@ mod tests {
                 .iter()
                 .any(|(name, value)| name.eq_ignore_ascii_case("range") && value == "bytes=0-0")
         );
+    }
+
+    #[test]
+    fn stat_reports_zero_length_object_for_416_empty_range() {
+        // Wasabi 等の互換ストレージは Range GET に対して存在しないキーでも
+        // 416 (Range Not Satisfiable) を返すことがある。ただし `bytes */0` は
+        // 「存在する 0 バイトのオブジェクト」に対しても同じ応答を返すため、
+        // 両者は区別できない。空の staging オブジェクトを欠落扱いしないよう、
+        // stat は 0 サイズのオブジェクトとして返す。
+        let http = Arc::new(MockHttpClient::new());
+        http.add_response(
+            "https://s3.example.com/bucket/narou/test/novels/site/title/novel.txt",
+            HttpResponse {
+                status: 416,
+                headers: vec![("content-range".to_string(), "bytes */0".to_string())],
+                body: Vec::new(),
+            },
+        );
+        let store = store(http);
+        let metadata = futures::executor::block_on(ObjectStore::stat(
+            &store,
+            &key("novels/site/title/novel.txt"),
+        ))
+        .unwrap()
+        .expect("a 416 with bytes */0 must report a zero-length object, not a missing one");
+        assert_eq!(metadata.size, 0);
+    }
+
+    #[test]
+    fn stat_keeps_nonempty_416_as_out_of_range_error() {
+        // 存在するオブジェクトへの範囲超過は `bytes */N` (N>0) で返る。
+        // これは欠落ではないため、metadata_size が範囲外エラーとして返す。
+        let http = Arc::new(MockHttpClient::new());
+        http.add_response(
+            "https://s3.example.com/bucket/narou/test/novels/site/title/novel.txt",
+            HttpResponse {
+                status: 416,
+                headers: vec![("content-range".to_string(), "bytes */10".to_string())],
+                body: Vec::new(),
+            },
+        );
+        let store = store(http);
+        let error = futures::executor::block_on(ObjectStore::stat(
+            &store,
+            &key("novels/site/title/novel.txt"),
+        ))
+        .expect_err("a 416 with bytes */N is an out-of-range error, not a missing object");
+        assert!(error.to_string().contains("S3 metadata GET failed with status 416"));
+    }
+
+    #[test]
+    fn stat_treats_headerless_416_as_missing() {
+        // 存在するオブジェクトへの 416 なら Content-Range に `bytes */N` が
+        // 付くはず。ヘッダ自体が無い (Wasabi の missing-key 応答) 416 は
+        // サイズ不明のため不在として扱い、エラーで止めない。
+        let http = Arc::new(MockHttpClient::new());
+        http.add_response(
+            "https://s3.example.com/bucket/narou/test/novels/site/title/novel.txt",
+            HttpResponse {
+                status: 416,
+                headers: vec![],
+                body: Vec::new(),
+            },
+        );
+        let store = store(http);
+        let metadata = futures::executor::block_on(ObjectStore::stat(
+            &store,
+            &key("novels/site/title/novel.txt"),
+        ))
+        .unwrap();
+        assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn range_read_treats_416_as_missing() {
+        // `range_read` も stat と同じく、先頭からの 416 は欠落へ畳む。
+        // (存在しないキーへの Range GET で Wasabi 等が 416 を返すため)
+        let http = Arc::new(MockHttpClient::new());
+        let url = "https://s3.example.com/bucket/narou/test/novels/site/title/novel.txt";
+        http.add_response(
+            url,
+            HttpResponse {
+                status: 416,
+                headers: vec![("content-range".to_string(), "bytes */0".to_string())],
+                body: Vec::new(),
+            },
+        );
+        let store = store(http);
+        let data = futures::executor::block_on(AssetStore::read_range(
+            &store,
+            &key("novels/site/title/novel.txt"),
+            0..4,
+        ))
+        .unwrap();
+        assert!(data.is_none());
+    }
+
+    #[test]
+    fn range_read_keeps_mid_offset_416_as_out_of_range() {
+        // 先頭からの欠落とは区別し、既存オブジェクトより長い範囲の 416 は
+        // 「範囲超過」エラーを維持する (切り詰め検出を潰さない)。
+        let http = Arc::new(MockHttpClient::new());
+        let url = "https://s3.example.com/bucket/narou/test/novels/site/title/novel.txt";
+        http.add_response(
+            url,
+            HttpResponse {
+                status: 416,
+                headers: vec![("content-range".to_string(), "bytes */10".to_string())],
+                body: Vec::new(),
+            },
+        );
+        let store = store(http);
+        let error = futures::executor::block_on(AssetStore::read_range(
+            &store,
+            &key("novels/site/title/novel.txt"),
+            8..12,
+        ))
+        .expect_err("a mid-offset 416 must remain an out-of-range error");
+        assert!(error.to_string().contains("asset range exceeds object"));
     }
 
     #[test]

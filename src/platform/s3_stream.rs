@@ -114,7 +114,18 @@ impl S3Store {
         }
         let header = format!("bytes={}-{}", range.start, range.end - 1);
         let response = self.stream_get_object(key, &[("range", &header)]).await?;
-        if response.status == 404 { return Ok(None); }
+        match response.status {
+            404 => return Ok(None),
+            // Wasabi 等は存在しないキーへの Range GET でも 416 を返す。
+            // `bytes */N` (N>0) は存在するオブジェクトへの範囲超過なので
+            // エラーを維持し、`bytes */0`・Content-Range 不明・先頭からの
+            // 読み取りは「読むもの無し」として欠落に畳む。
+            416 if range.start == 0
+                || range_416_total(&response).is_none_or(|total| total == 0) => return Ok(None),
+            416 => return Err(NarouError::Platform("asset range exceeds object".into())),
+            _ => {}
+        }
+
         validate_content_range(&response, &range)?;
         let mut stream = exact_stream(response.body, Some(length as u64));
         let mut bytes = Vec::with_capacity(length);
@@ -324,6 +335,19 @@ impl S3Store {
     }
 }
 
+/// 416 (Range Not Satisfiable) の Content-Range `bytes */N` からオブジェクト
+/// サイズ N を取り出す。`bytes */0` = 0 バイト(または不在)、`bytes */N` (N>0) =
+/// 存在するが範囲外。Content-Range が無い・`bytes */*`・他形式など、サイズが
+/// 読めない 416 は `None` を返す — 存在するオブジェクトならサーバーは長さを
+/// 知って `bytes */N` を付けられるので、サイズ不明の 416 は「不在」寄りに扱う。
+pub(super) fn range_416_total(response: &HttpStreamResponse) -> Option<u64> {
+    if response.status != 416 { return None; }
+    response
+        .header("content-range")
+        .and_then(|value| value.strip_prefix("bytes */"))
+        .and_then(|total| total.parse::<u64>().ok())
+}
+
 /// Metadata uses only headers, even when an intermediary changes Range. Never
 /// consume the body of a 200 response just to determine the object's size.
 pub(super) fn metadata_size(response: &HttpStreamResponse) -> Result<u64> {
@@ -331,7 +355,9 @@ pub(super) fn metadata_size(response: &HttpStreamResponse) -> Result<u64> {
         200 => response.header("content-length").and_then(|value| value.parse().ok())
             .ok_or_else(|| NarouError::Platform("S3 metadata omitted a valid Content-Length".into())),
         206 => content_range(response).map(|(_, total)| total),
-        416 if response.header("content-range") == Some("bytes */0") => Ok(0),
+        // `bytes */0` = 0 バイト。それ以外の 416 は stat の呼び出し側が
+        // 不在・範囲外へ振り分けるので、ここではエラーとして残す。
+        416 if range_416_total(response) == Some(0) => Ok(0),
         status => Err(NarouError::Platform(format!("S3 metadata GET failed with status {status}"))),
     }
 }

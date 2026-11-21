@@ -475,7 +475,10 @@ impl S3Store {
                 )))
             }
             200 => Err(NarouError::Platform("S3 ignored Range; refusing a linear prefix scan".into())),
-            416 if range.start==0&&range.end==u64::MAX&&response.header("content-range")==Some("bytes */0")=>Ok(Some(Box::pin(futures::stream::empty()))),
+            // `bytes */N` (N>0) は存在するオブジェクトへの範囲超過。
+            // `bytes */0`・Content-Range 不明・先頭からの読み取りは
+            // 「読むもの無し」として欠落に畳む。
+            416 if range.start==0||super::streaming::range_416_total(&response).is_none_or(|total|total==0)=>Ok(None),
             416 => Err(NarouError::Platform("asset range exceeds object".into())),
             status => Err(NarouError::Platform(format!(
                 "S3 range GET failed with status {status}"

@@ -46,7 +46,7 @@ use self::toc::{
 };
 use self::util::{
     build_section_url, compile_html_pattern, load_length_limit, mask_spoiler_text,
-    parse_two_digit_year_datetime, sanitize_filename_with_limit,
+    parse_two_digit_year_datetime, ruby_filename_special_chars, sanitize_filename_with_limit,
 };
 use crate::application::messages;
 use crate::db::novel_record::NovelRecord;
@@ -3322,7 +3322,13 @@ impl Downloader {
             return Ok((true, None));
         };
 
-        if old.subtitle != latest.subtitle || old.chapter != latest.chapter {
+        // file_subtitle が変わると公開する目次が別の本文キーを参照するよう
+        // なるため、日付が変わっていなくても本文を書き直す。旧サニタイザの
+        // `_` から Ruby 互換の全角写像への移行がこれに該当する。
+        if old.subtitle != latest.subtitle
+            || old.chapter != latest.chapter
+            || old.file_subtitle != latest.file_subtitle
+        {
             return Ok((true, None));
         }
 
@@ -3535,7 +3541,7 @@ impl Downloader {
                 return ncode.clone();
             }
             let limit = load_length_limit("folder-length-limit", Some(50));
-            let combined_title = format!("{} {}", ncode, title);
+            let combined_title = ruby_filename_special_chars(&format!("{} {}", ncode, title));
             let sanitized = sanitize_filename_with_limit(&combined_title, limit);
             if sanitized.is_empty() {
                 ncode.clone()
@@ -3543,7 +3549,10 @@ impl Downloader {
                 sanitized
             }
         } else {
-            sanitize_filename_with_limit(title, load_length_limit("folder-length-limit", Some(50)))
+            sanitize_filename_with_limit(
+                &ruby_filename_special_chars(title),
+                load_length_limit("folder-length-limit", Some(50)),
+            )
         }
     }
 
@@ -6514,6 +6523,29 @@ is_narou: false
     }
 
     #[test]
+    fn new_file_title_uses_ruby_fullwidth_special_chars() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let downloader = Downloader::with_platform_and_storage_and_settings(
+            DownloaderPlatform {
+                http: Arc::new(MockHttpClient::new()),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
+                objects: store.clone(), assets: store, clock: Arc::new(SystemClock),
+            },
+            Vec::new(), HashMap::new(),
+        ).unwrap();
+        assert_eq!(
+            downloader.compute_file_title(
+                &Some("n1234ab".to_string()),
+                "作品<C201>タイトル",
+                true,
+                None,
+            ),
+            "n1234ab 作品〈C201〉タイトル"
+        );
+    }
+
+    #[test]
     fn resolve_user_agent_uses_saved_value_when_cli_value_missing() {
         assert_eq!(
             resolve_user_agent(None, Some("saved-agent".to_string())),
@@ -6534,6 +6566,60 @@ is_narou: false
         let resolved = resolve_user_agent(None, Some("auto".to_string()));
         assert!(!resolved.is_empty());
         assert_ne!(resolved, "auto");
+    }
+
+    #[tokio::test]
+    async fn filename_mapping_change_forces_body_rewrite_with_unchanged_dates() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let mut downloader = Downloader::with_platform_and_storage_and_settings(
+            DownloaderPlatform {
+                http: Arc::new(MockHttpClient::new()),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
+                objects: store.clone(), assets: store, clock: Arc::new(SystemClock),
+            },
+            Vec::new(), HashMap::new(),
+        ).unwrap();
+        let keys = NovelObjectKeys::new("site", "n1234ab", false).unwrap();
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.domain == "ncode.syosetu.com").unwrap().clone();
+        let mut setting = setting;
+
+        // 連載・短編のどちらも、日付と表示名が同じでも file_subtitle が
+        // 変われば本文を書き直す。旧 `_` サニタイザからの移行がこれに当たる。
+        // 3 行目は制御ケース (何も変わっていなければ再取得しない)。
+        for (title, old_name, new_name, expected) in [
+            ("第1話 Part:1", "第1話_Part_1", "第1話_Part：1", true),
+            ("Part:1", "Part_1", "Part：1", true),
+            ("Part:1", "Part_1", "Part_1", false),
+        ] {
+            let old = super::types::SubtitleInfo {
+                index: "1".to_string(), href: String::new(), chapter: String::new(),
+                subchapter: String::new(), subtitle: title.to_string(),
+                file_subtitle: old_name.to_string(), subdate: "2026-01-01".to_string(),
+                subupdate: Some("2026-01-01".to_string()), download_time: None,
+                download_revision: 1,
+            };
+            let mut latest = old.clone();
+            latest.file_subtitle = new_name.to_string();
+            let mut auth = super::auth::AuthState::new(None);
+            let (needs, _) = downloader.section_needs_download(
+                &mut test_read(&downloader.persistence, &keys).await,
+                super::SectionDecision {
+                    setting: &mut setting,
+                    auth: &mut auth,
+                    latest: &latest,
+                    old: Some(&old),
+                    existing_id: None,
+                    keys: &keys,
+                    toc_url: "https://example.com/n1234ab/",
+                    strong_update: false,
+                    timezone: super::SiteTimezone::Named(chrono_tz::Asia::Tokyo),
+                    existed: true,
+                },
+            ).await.unwrap();
+            assert_eq!(needs, expected, "{title}: {old_name} -> {new_name}");
+        }
     }
 
     #[test]

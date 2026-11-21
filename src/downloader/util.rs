@@ -359,6 +359,47 @@ pub fn sanitize_filename(name: &str) -> String {
     sanitize_filename_with_limit(name, Some(80))
 }
 
+/// narou.rb / narou-mod の `Helper#replace_filename_special_chars` と同じ
+/// 文字置換。Windows でファイル名に使えない ASCII 文字を全角文字へ写像し、
+/// タブと改行を除去する。`normalize-filename` が有効なら NFC もかける
+/// (Worker ビルドにはローカル設定が無いため省略する)。
+///
+/// 既存ディレクトリの `‛` (U+201B) 形式は `db::paths` が読み取り時に
+/// probe するだけなので、ここは常に正規の spelling を返す。
+pub fn ruby_filename_special_chars(text: &str) -> String {
+    #[allow(unused_mut)]
+    let mut result = text
+        .chars()
+        .filter_map(|ch| match ch {
+            '\t' | '\n' => None,
+            '/' => Some('／'),
+            ':' => Some('：'),
+            '*' => Some('＊'),
+            '?' => Some('？'),
+            '"' => Some('”'),
+            '<' => Some('〈'),
+            '>' => Some('〉'),
+            '[' => Some('［'),
+            ']' => Some('］'),
+            '{' => Some('｛'),
+            '}' => Some('｝'),
+            '|' => Some('｜'),
+            '.' => Some('．'),
+            '`' => Some('｀'),
+            '\\' => Some('￥'),
+            _ => Some(ch),
+        })
+        .collect::<String>();
+    #[cfg(feature = "native-runtime")]
+    {
+        if crate::compat::load_local_setting_bool("normalize-filename") {
+            use unicode_normalization::UnicodeNormalization;
+            result = result.nfc().collect();
+        }
+    }
+    result
+}
+
 pub fn mask_spoiler_text(text: &str) -> String {
     text.chars()
         .map(|ch| match ch {
@@ -374,7 +415,7 @@ pub fn mask_spoiler_text(text: &str) -> String {
 mod tests {
     use super::{
         build_section_url, mask_spoiler_text, parse_two_digit_year_datetime,
-        sanitize_filename_with_limit,
+        ruby_filename_special_chars, sanitize_filename_with_limit,
     };
     use crate::downloader::site_setting::SiteSetting;
 
@@ -389,6 +430,17 @@ mod tests {
             .with_timezone(&chrono_tz::Asia::Tokyo)
             .format("%Y-%m-%d %H:%M")
             .to_string()
+    }
+
+    #[test]
+    fn ruby_filename_special_chars_matches_narou_rb() {
+        assert_eq!(
+            ruby_filename_special_chars("a/b\\c:d*e?f\"g<h>i[j]k{l}m|n.o`p\tq\nr"),
+            "a／b￥c：d＊e？f”g〈h〉i［j］k｛l｝m｜n．o｀pqr"
+        );
+        // 実体参照そのものは写像対象外。デコード後の `<` / `>` が `〈` / `〉` になる。
+        assert_eq!(ruby_filename_special_chars("&lt;C201&gt;"), "&lt;C201&gt;");
+        assert_eq!(ruby_filename_special_chars("<C201>"), "〈C201〉");
     }
 
     #[test]

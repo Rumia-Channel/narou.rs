@@ -60,6 +60,8 @@ struct RelayConfig {
     base_url: String,
     /// `X-Proxy-Token` に入れる共有トークン。
     token: String,
+    /// `download.relay-sites` の解釈結果。リレーを試す対象・常時経由の対象。
+    sites: narou_rs::platform::relay::RelaySitePolicy,
 }
 
 impl std::fmt::Debug for WorkerHttpClient {
@@ -97,10 +99,23 @@ impl WorkerHttpClient {
     /// 経路になるためやめた。
     pub fn with_relay(mut self, base_url: String, token: String) -> Self {
         match normalize_relay_base(&base_url) {
-            Ok(base_url) => self.relay = Some(RelayConfig { base_url, token }),
+            Ok(base_url) => self.relay = Some(RelayConfig {
+                base_url,
+                token,
+                sites: narou_rs::platform::relay::RelaySitePolicy::Auto,
+            }),
             Err(error) => console_warn!(
                 "NAROU_RELAY_ENDPOINT を無効化しました (リレーは https、またはループバックの http のみ許可): {error}"
             ),
+        }
+        self
+    }
+
+    /// `download.relay-sites` の解釈結果を設定する。
+    /// リレーが未設定なら効果なし (フォールバックも強制も働かない)。
+    pub fn with_relay_sites(mut self, value: Option<&str>) -> Self {
+        if let Some(relay) = self.relay.as_mut() {
+            relay.sites = narou_rs::platform::relay::RelaySitePolicy::parse(value);
         }
         self
     }
@@ -273,17 +288,69 @@ impl WorkerHttpClient {
                 if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
                     policy.limiter.acquire(scope).await?;
                 }
+                // `download.relay-sites` に `force:<ホスト>` が指定されている対象は
+                // 直接取得を試さず、最初からリレーへ送る (検証用の一時切替)。
+                let mut relay_attempted = false;
+                let forced = self
+                    .relay
+                    .as_ref()
+                    .is_some_and(|relay| relay.sites.forced(&request.url));
+                if forced {
+                    if let Some(relay) = self.relay.as_ref() {
+                        if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                            policy.limiter.acquire(scope).await?;
+                        }
+                        let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+                        let forced_result = self.exchange_hop(
+                            &HopExchange::Relay(relay), &request.url,
+                            &request.headers, deadline_ms,
+                        ).await;
+                        if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                            policy.limiter.complete(scope).await?;
+                        }
+                        relay_attempted = true;
+                        match forced_result {
+                            Ok(response)
+                                if response.is_success() || response.is_redirection()
+                                    || response.browser_challenge().is_some() =>
+                            {
+                                if let Some(store) = self.cookie_store.as_deref() {
+                                    narou_rs::platform::cookie_store::persist_response_set_cookie(
+                                        store, &response, chain.request().header("Cookie"),
+                                    ).await;
+                                }
+                                if !chain.advance(&response)? {
+                                    return Ok(response);
+                                }
+                                continue;
+                            }
+                            Ok(response) => console_warn!(
+                                "forced relay returned {}, falling back to direct fetch", response.status
+                            ),
+                            Err(error) => console_warn!(
+                                "forced relay failed, falling back to direct fetch: {error}"
+                            ),
+                        }
+                    }
+                }
                 // Fetch is always manual. A partial/failed Fetch body returns
-                // an error above; only a complete 403 can start fallback.
+                // an error; only a complete response or a transport failure
+                // reaches the fallback decision below.
                 let fetch_result = self.send_fetch_hop(request, MAX_WORKER_HTTP_BODY).await;
                 if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
                     policy.limiter.complete(scope).await?;
                 }
-                let fetch_response = fetch_result?;
-                let response = if fetch_response.status == 403
-                    && request.method == HttpMethod::Get
-                    && !request.trusted_endpoint
-                {
+                // A 403 GET — or a transport failure — can be a Cloudflare
+                // egress block, so try socket then relay on any GET failure,
+                // not only a successful 403 response.
+                let should_fallback = request.method == HttpMethod::Get && !request.trusted_endpoint;
+                let is_blocked = fetch_result.is_err()
+                    || matches!(&fetch_result, Ok(r) if r.status == 403);
+                let response = if should_fallback && is_blocked {
+                    let fetch_failed = fetch_result.is_err();
+                    if fetch_failed {
+                        console_warn!("fetch transport failed, trying socket/relay fallback");
+                    }
                     if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
                         policy.limiter.acquire(scope).await?;
                     }
@@ -297,11 +364,14 @@ impl WorkerHttpClient {
                     match socket_result {
                         Ok(response) if response.is_success() || response.is_redirection() => response,
                         // A browser verification is the site's own answer: it
-                        // must not be replaced by the original 403.
+                        // must not be replaced by the original failure.
                         Ok(response) if response.browser_challenge().is_some() => response,
                         socket_result => {
                             let relay_result = match self.relay.as_ref() {
-                                Some(relay) => {
+                                Some(relay)
+                                    if !relay_attempted
+                                        && relay.sites.fallback_allowed(&request.url) =>
+                                {
                                     if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
                                         policy.limiter.acquire(scope).await?;
                                     }
@@ -315,40 +385,40 @@ impl WorkerHttpClient {
                                     }
                                     result.map(Some)
                                 }
-                                None => Ok(None),
+                                _ => Ok(None),
                             };
                             match relay_result {
                                 Ok(Some(response))
                                     if response.is_success() || response.is_redirection() => response,
                                 // A browser verification is the site's own
                                 // answer: it must not be replaced by the
-                                // original 403.
+                                // original failure.
                                 Ok(Some(response)) if response.browser_challenge().is_some() => response,
                                 relay_result => {
                                     match socket_result {
                                         Ok(response) => console_warn!(
-                                            "socket transport returned {}, keeping fetch 403", response.status
+                                            "socket transport returned {}, keeping fetch result", response.status
                                         ),
                                         Err(error) => console_warn!(
-                                            "socket transport failed, keeping fetch 403: {error}"
+                                            "socket transport failed, keeping fetch result: {error}"
                                         ),
                                     }
                                     match relay_result {
                                         Ok(Some(response)) => console_warn!(
-                                            "relay transport returned {}, keeping fetch 403", response.status
+                                            "relay transport returned {}, keeping fetch result", response.status
                                         ),
                                         Ok(None) => {}
                                         Err(error) => console_warn!(
-                                            "relay transport failed, keeping fetch 403: {error}"
+                                            "relay transport failed, keeping fetch result: {error}"
                                         ),
                                     }
-                                    fetch_response
+                                    fetch_result?
                                 }
                             }
                         }
                     }
                 } else {
-                    fetch_response
+                    fetch_result?
                 };
                 if let Some(store) = self.cookie_store.as_deref() {
                     narou_rs::platform::cookie_store::persist_response_set_cookie(

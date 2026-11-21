@@ -112,6 +112,21 @@ impl D1ObjectStore {
         self.db.prepare(sql).bind(&values).map_err(worker_error)
     }
 
+    /// Same as `db.batch` but the error names the calling line, so a guard
+    /// abort (`abs(INT64_MIN)` -> "integer overflow") records which write
+    /// path rejected it instead of an opaque D1 message.
+    #[track_caller]
+    async fn checked_batch(&self, statements: Vec<D1PreparedStatement>) -> Result<Vec<worker::D1Result>> {
+        let site = std::panic::Location::caller();
+        let results = self.db.batch(statements).await.map_err(|error| {
+            worker_error(format!("D1 batch failed at {site}: {error}"))
+        })?;
+        crate::d1_repository::ensure_batch_success(&results).map_err(|error| {
+            worker_error(format!("guard batch rejected at {site}: {error}"))
+        })?;
+        Ok(results)
+    }
+
     async fn read_snapshot(&self, key: &ObjectKey) -> Result<(update::Snapshot, Vec<JsValue>)> {
         let rows = self.prepare(update::READ_SQL, vec![JsValue::from_str(key.as_ref())])?
             .raw_js_value().await.map_err(worker_error)?;
@@ -219,7 +234,7 @@ impl D1ObjectStore {
                 let token=crate::content_store::nonce()?;let mut statements=Vec::new();if let Some(fence)=fence{if !fence.prefix.matches(key){return Err(worker_error("atomic update outside fence"));}statements.push(primary.open_guard(fence,&token)?);}
                 statements.push(primary.prepare("SELECT CASE WHEN EXISTS(SELECT 1 FROM transfer_object_refs WHERE object_key=? AND blob_key=? AND sha256=? AND blob_generation=?) THEN 1 ELSE abs(-9223372036854775808) END",vec![key.as_ref().into(),reference.blob_key.into(),reference.sha256.into(),reference.blob_generation.into()])?);
                 if let Some(next)=next{primary.append_write_statements(key,&next,None,&mut statements)?;}
-                if fence.is_some(){statements.push(primary.finish_publication_guard(&token)?);}let result=primary.db.batch(statements).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&result)?;return Ok(ObjectUpdateResult::Committed);
+                if fence.is_some(){statements.push(primary.finish_publication_guard(&token)?);}primary.checked_batch(statements).await?;return Ok(ObjectUpdateResult::Committed);
             }
             let (snapshot, rows) = primary.read_snapshot(key).await?;
             let current = snapshot.payload(SMALL_CAP as usize)?;
@@ -271,8 +286,7 @@ impl D1ObjectStore {
             drop(snapshot);
             drop(rows);
             drop(next);
-            let results = primary.db.batch(statements).await.map_err(worker_error)?;
-            crate::d1_repository::ensure_batch_success(&results)?;
+            let results = primary.checked_batch(statements).await?;
             let committed = results.get(finish_index).ok_or_else(|| worker_error("missing object update result"))?
                 .results::<GuardCommit>().map_err(worker_error)?;
             if committed.iter().any(|result| result.committed == 1) {
@@ -308,8 +322,7 @@ impl D1ObjectStore {
     async fn write_all(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
         let mut statements = Vec::with_capacity(2 + data.len().div_ceil(CHUNK_SIZE));
         self.append_write_statements(key, data, None, &mut statements)?;
-        let results = self.db.batch(statements).await.map_err(worker_error)?;
-        crate::d1_repository::ensure_batch_success(&results)?;
+        self.checked_batch(statements).await?;
         Ok(())
     }
 
@@ -325,8 +338,7 @@ impl D1ObjectStore {
             )?,
         ];
         // D1 のバッチは 1 文ずつ成否を確認しないと失敗を握りつぶす。
-        let results = self.db.batch(statements).await.map_err(worker_error)?;
-        crate::d1_repository::ensure_batch_success(&results)?;
+        self.checked_batch(statements).await?;
         self.stage_leases.forget(key);
         Ok(())
     }
@@ -409,7 +421,7 @@ impl D1ObjectStore {
             batch.push(self.prepare("DELETE FROM objects WHERE object_key IN (SELECT object_key FROM objects WHERE object_key>=? AND object_key<? ORDER BY object_key LIMIT 24) AND EXISTS(SELECT 1 FROM transfer_stage_ledger WHERE stage_id=? AND mutation_id=?)",vec![lower.as_str().into(),upper.as_str().into(),id.into(),token.into()])?);
             batch.push(self.prepare("DELETE FROM transfer_stage_ledger WHERE stage_id=?1 AND mutation_id=?2 AND NOT EXISTS(SELECT 1 FROM objects WHERE object_key>=?3 AND object_key<?4) AND NOT EXISTS(SELECT 1 FROM objects WHERE object_key=?5)",vec![id.into(),token.into(),lower.as_str().into(),upper.as_str().into(),ts::stage_data_key(id)?.as_ref().into()])?);
         }
-        let result=self.db.batch(batch).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&result)?;
+        let result=self.checked_batch(batch).await?;
         Ok(result[0].results::<StageChanged>().map_err(worker_error)?.iter().any(|row|row.stage_id==id))
     }
     fn stage_cleanup_statements(&self,id:&str,token:&str)->Result<Vec<D1PreparedStatement>>{
@@ -419,9 +431,9 @@ impl D1ObjectStore {
     }
     async fn gate_row(&self,prefix:&ObjectPrefix)->Result<DbGate>{
         let key=prefix.as_ref().trim_end_matches('/');
-        let results=self.db.batch(vec![self.prepare("INSERT OR IGNORE INTO novel_access_gates(prefix,updated_at) VALUES (?,?)",vec![key.into(),JsValue::from_f64(ts::now_secs() as f64)])?,
-            self.prepare("SELECT epoch,closed,owner,updated_at,content_revision,(SELECT count(*) FROM novel_reader_leases r WHERE r.prefix=g.prefix AND r.expires_at>unixepoch()) AS pending_readers FROM novel_access_gates g WHERE prefix=?",vec![key.into()])?]).await.map_err(worker_error)?;
-        crate::d1_repository::ensure_batch_success(&results)?;results[1].results::<DbGate>().map_err(worker_error)?.into_iter().next().ok_or_else(||worker_error("missing gate"))
+        let results=self.checked_batch(vec![self.prepare("INSERT OR IGNORE INTO novel_access_gates(prefix,updated_at) VALUES (?,?)",vec![key.into(),JsValue::from_f64(ts::now_secs() as f64)])?,
+            self.prepare("SELECT epoch,closed,owner,updated_at,content_revision,(SELECT count(*) FROM novel_reader_leases r WHERE r.prefix=g.prefix AND r.expires_at>unixepoch()) AS pending_readers FROM novel_access_gates g WHERE prefix=?",vec![key.into()])?]).await?;
+        results[1].results::<DbGate>().map_err(worker_error)?.into_iter().next().ok_or_else(||worker_error("missing gate"))
     }
     pub(crate) fn open_guard(&self,fence:&WriteFence,token:&str)->Result<D1PreparedStatement>{
         if fence.epoch>9_007_199_254_740_991{return Err(worker_error("writer epoch exceeds exact D1 range"));}
@@ -437,8 +449,8 @@ impl TransferStageStore for D1ObjectStore {
     fn stage_open<'a>(&'a self,id:&'a str,owner:&'a str,epoch:u64,ttl:i64)->PlatformFuture<'a,Result<StageCursor>>{Box::pin(async move{
         if let Some((record,_))=self.load_stage(id).await?{ts::require_owner(&record,owner,epoch)?;if record.lease.state==ts::StageLeaseState::Aborting{return Err(worker_error("stage_aborted"));}return Ok(record.cursor());}
         let record=ts::StageLedgerRecord::new(id,owner,epoch,ttl)?;let token=crate::content_store::nonce()?;let json=String::from_utf8(ts::encode_ledger(&record)?).map_err(worker_error)?;let key=ts::stage_data_key(id)?;
-        let results=self.db.batch(vec![self.prepare("INSERT OR IGNORE INTO transfer_stage_ledger(stage_id,record_json,mutation_id) VALUES (?,?,?)",vec![id.into(),json.into(),token.as_str().into()])?,
-            self.prepare("INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) SELECT ?,0,?,'none',0,NULL WHERE EXISTS(SELECT 1 FROM transfer_stage_ledger WHERE stage_id=? AND mutation_id=?)",vec![key.as_ref().into(),chrono::Utc::now().to_rfc3339().into(),id.into(),token.as_str().into()])?]).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&results)?;
+        self.checked_batch(vec![self.prepare("INSERT OR IGNORE INTO transfer_stage_ledger(stage_id,record_json,mutation_id) VALUES (?,?,?)",vec![id.into(),json.into(),token.as_str().into()])?,
+            self.prepare("INSERT INTO objects(object_key,size,updated_at,encoding,crc32,data) SELECT ?,0,?,'none',0,NULL WHERE EXISTS(SELECT 1 FROM transfer_stage_ledger WHERE stage_id=? AND mutation_id=?)",vec![key.as_ref().into(),chrono::Utc::now().to_rfc3339().into(),id.into(),token.as_str().into()])?]).await?;
         let(record,_)=self.load_stage(id).await?.ok_or_else(||worker_error("stage reservation disappeared"))?;ts::require_owner(&record,owner,epoch)?;Ok(record.cursor())
     })}
     fn stage_cursor<'a>(&'a self,id:&'a str)->PlatformFuture<'a,Result<Option<StageCursor>>>{Box::pin(async move{let Some((record,_))=self.load_stage(id).await?else{return Ok(None);};if record.lease.state==ts::StageLeaseState::Aborting&&self.transfer_stage_referenced(&ts::stage_data_key(id)?).await?{return Ok(None);}Ok(Some(record.cursor()))})}
@@ -494,7 +506,7 @@ impl NovelAccessFence for D1ObjectStore {
         if let Some(actor)=fence.job_owner(){statements.push(self.prepare("SELECT CASE WHEN EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix=?1 AND closed=1 AND owner=?2 AND epoch=?3) OR EXISTS(SELECT 1 FROM worker_jobs WHERE job_id=?4 AND execution_token=?5 AND status='running' AND julianday(lease_until)>julianday('now')) THEN 1 ELSE abs(-9223372036854775808) END",vec![key.into(),owner.into(),JsValue::from_f64(next as f64),actor.job_id().into(),actor.execution_token().into()])?);}
         statements.push(self.prepare("SELECT CASE WHEN EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix=?1 AND closed=1 AND owner=?6 AND epoch=?7) OR (EXISTS(SELECT 1 FROM novels n JOIN novel_gate_bindings b ON b.novel_id=n.id JOIN novel_access_gates g ON g.prefix=b.prefix WHERE n.id=?2 AND b.prefix=?1 AND (g.origin_url_fold='' OR g.origin_url_fold=n.toc_url_fold)) AND NOT EXISTS(SELECT 1 FROM novel_gate_bindings b JOIN novels n ON n.id=b.novel_id WHERE n.id<>?2 AND (b.prefix IN (SELECT value FROM json_each(?3)) OR (b.prefix>=?4 AND b.prefix<?5))) AND NOT EXISTS(SELECT 1 FROM novel_namespace_claims WHERE prefix IN (SELECT value FROM json_each(?3)) OR (prefix>=?4 AND prefix<?5)) AND NOT EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix<>?1 AND (closed=1 OR origin_url_fold<>'') AND (prefix IN (SELECT value FROM json_each(?3)) OR (prefix>=?4 AND prefix<?5)))) THEN 1 ELSE abs(-9223372036854775808) END",vec![key.into(),JsValue::from_f64(id.0 as f64),ancestors.as_str().into(),lower.as_str().into(),upper.as_str().into(),owner.into(),JsValue::from_f64(next as f64)])?);
         statements.push(self.prepare("UPDATE novel_access_gates SET closed=1,owner=?1,epoch=?2,updated_at=?3,origin_url_fold=COALESCE(NULLIF(origin_url_fold,''),(SELECT toc_url_fold FROM novels WHERE id=?6),'') WHERE prefix=?4 AND closed=0 AND epoch=?5",vec![owner.into(),JsValue::from_f64(next as f64),JsValue::from_f64(ts::now_secs() as f64),key.into(),JsValue::from_f64(fence.epoch as f64),JsValue::from_f64(id.0 as f64)])?);
-        statements.push(self.prepare("SELECT epoch FROM novel_access_gates WHERE prefix=? AND closed=1 AND owner=? AND epoch=?",vec![key.into(),owner.into(),JsValue::from_f64(next as f64)])?);let results=self.db.batch(statements).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&results)?;
+        statements.push(self.prepare("SELECT epoch FROM novel_access_gates WHERE prefix=? AND closed=1 AND owner=? AND epoch=?",vec![key.into(),owner.into(),JsValue::from_f64(next as f64)])?);let results=self.checked_batch(statements).await?;
         results.last().ok_or_else(||worker_error("missing retirement result"))?.results::<Epoch>().map_err(worker_error)?.into_iter().next().map(|row|row.epoch).ok_or_else(||af::gate_closed_error(&fence.prefix))
     })}
     fn pending_removals<'a>(&'a self,cursor:Option<&'a str>,limit:usize)->PlatformFuture<'a,Result<(Vec<(ObjectPrefix,String,u64)>,Option<String>)>>{Box::pin(async move{
@@ -508,8 +520,8 @@ impl NovelAccessFence for D1ObjectStore {
     fn gate_info<'a>(&'a self,prefix:&'a ObjectPrefix)->PlatformFuture<'a,Result<GateInfo>>{Box::pin(async move{let row=self.gate_row(prefix).await?;Ok(GateInfo{epoch:row.epoch,content_revision:row.content_revision,state:if row.closed==0{GateState::Open}else{GateState::Closed},owner:row.owner,updated_at:row.updated_at,pending_readers:row.pending_readers})})}
     fn admit_reader<'a>(&'a self,prefix:&'a ObjectPrefix,id:&'a str,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{
         #[derive(Deserialize)]struct Lease{epoch:u64,expires_at:i64}let key=prefix.as_ref().trim_end_matches('/');let now=ts::now_secs();let expires=now.saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));
-        let results=self.db.batch(vec![self.prepare("INSERT OR IGNORE INTO novel_access_gates(prefix,updated_at) VALUES (?,?)",vec![key.into(),JsValue::from_f64(now as f64)])?,
-            self.prepare("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) SELECT ?,?,epoch,? FROM novel_access_gates WHERE prefix=? AND closed=0 ON CONFLICT(prefix,reader_id) DO UPDATE SET epoch=excluded.epoch,expires_at=excluded.expires_at RETURNING epoch,expires_at",vec![key.into(),id.into(),JsValue::from_f64(expires as f64),key.into()])?]).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&results)?;
+        let results=self.checked_batch(vec![self.prepare("INSERT OR IGNORE INTO novel_access_gates(prefix,updated_at) VALUES (?,?)",vec![key.into(),JsValue::from_f64(now as f64)])?,
+            self.prepare("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) SELECT ?,?,epoch,? FROM novel_access_gates WHERE prefix=? AND closed=0 ON CONFLICT(prefix,reader_id) DO UPDATE SET epoch=excluded.epoch,expires_at=excluded.expires_at RETURNING epoch,expires_at",vec![key.into(),id.into(),JsValue::from_f64(expires as f64),key.into()])?]).await?;
         let lease=results[1].results::<Lease>().map_err(worker_error)?.into_iter().next().ok_or_else(||af::gate_closed_error(prefix))?;Ok(GateLease{reader_id:id.into(),epoch:lease.epoch,expires_at:lease.expires_at})
     })}
     fn renew_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{
@@ -519,9 +531,9 @@ impl NovelAccessFence for D1ObjectStore {
     })}
     fn release_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease)->PlatformFuture<'a,Result<()>>{Box::pin(async move{let result=self.prepare("DELETE FROM novel_reader_leases WHERE prefix=? AND reader_id=? AND epoch=?",vec![prefix.as_ref().trim_end_matches('/').into(),lease.reader_id.as_str().into(),JsValue::from_f64(lease.epoch as f64)])?.run().await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&[result])})}
     fn close_gate<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str)->PlatformFuture<'a,Result<u64>>{Box::pin(async move{
-        let key=prefix.as_ref().trim_end_matches('/');let results=self.db.batch(vec![self.prepare("INSERT OR IGNORE INTO novel_access_gates(prefix,updated_at) VALUES (?,?)",vec![key.into(),JsValue::from_f64(ts::now_secs() as f64)])?,
+        let key=prefix.as_ref().trim_end_matches('/');let results=self.checked_batch(vec![self.prepare("INSERT OR IGNORE INTO novel_access_gates(prefix,updated_at) VALUES (?,?)",vec![key.into(),JsValue::from_f64(ts::now_secs() as f64)])?,
             self.prepare("UPDATE novel_access_gates SET closed=1,owner=?,epoch=epoch+1,updated_at=? WHERE prefix=? AND closed=0",vec![owner.into(),JsValue::from_f64(ts::now_secs() as f64),key.into()])?,
-            self.prepare("SELECT epoch,closed,owner,updated_at,content_revision,0 AS pending_readers FROM novel_access_gates WHERE prefix=?",vec![key.into()])?]).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&results)?;
+            self.prepare("SELECT epoch,closed,owner,updated_at,content_revision,0 AS pending_readers FROM novel_access_gates WHERE prefix=?",vec![key.into()])?]).await?;
         let row=results[2].results::<DbGate>().map_err(worker_error)?.into_iter().next().ok_or_else(||worker_error("missing closed gate"))?;if row.owner.as_deref()!=Some(owner){return Err(af::gate_owner_error(prefix,row.owner.as_deref().unwrap_or("")));}Ok(row.epoch)
     })}
     fn renew_gate<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
@@ -534,14 +546,14 @@ impl NovelAccessFence for D1ObjectStore {
         if !prefix.matches(key)||!narou_rs::platform::is_reserved_key(stage){return Err(worker_error("invalid fenced install namespace"));}
         let sealed=self.sealed_object(stage).await?;let token=crate::content_store::nonce()?;let mut statements=self.publication_guard(prefix,owner,epoch,&token)?;
         self.push_transfer_reference_statements(prefix,owner,epoch,&token,key,&sealed,&mut statements)?;statements.push(self.finish_publication_guard(&token)?);
-        let results=self.db.batch(statements).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&results)
+        self.checked_batch(statements).await.map(|_|())
     })}
     fn remove_committed<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey,sha:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
         if !prefix.matches(key){return Err(worker_error("rollback outside novel"));}
         let Some(reference)=self.transfer_reference(key).await?else{return Ok(());};if !reference.sha256.eq_ignore_ascii_case(sha){return Err(worker_error("recovery fingerprint conflict"));}
         let token=crate::content_store::nonce()?;let mut statements=self.publication_guard(prefix,owner,epoch,&token)?;
         statements.push(self.prepare("SELECT CASE WHEN EXISTS(SELECT 1 FROM transfer_object_refs r WHERE r.object_key=?1 AND r.blob_key=?2 AND r.sha256=?3 AND r.blob_generation=?4 AND (r.backend!='d1' OR EXISTS(SELECT 1 FROM objects o WHERE o.object_key=r.blob_key AND o.generation=r.blob_generation))) THEN 1 ELSE abs(-9223372036854775808) END",vec![key.as_ref().into(),reference.blob_key.as_str().into(),reference.sha256.as_str().into(),reference.blob_generation.as_str().into()])?);
-        statements.push(self.prepare("DELETE FROM transfer_object_refs WHERE object_key=? AND blob_key=? AND sha256=? AND blob_generation=?",vec![key.as_ref().into(),reference.blob_key.as_str().into(),reference.sha256.as_str().into(),reference.blob_generation.as_str().into()])?);statements.push(self.finish_publication_guard(&token)?);let results=self.db.batch(statements).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&results)
+        statements.push(self.prepare("DELETE FROM transfer_object_refs WHERE object_key=? AND blob_key=? AND sha256=? AND blob_generation=?",vec![key.as_ref().into(),reference.blob_key.as_str().into(),reference.sha256.as_str().into(),reference.blob_generation.as_str().into()])?);statements.push(self.finish_publication_guard(&token)?);self.checked_batch(statements).await.map(|_|())
     })}
 }
 
@@ -551,20 +563,20 @@ impl ObjectStore for D1ObjectStore {
         statements.push(self.prepare("INSERT INTO content_garbage(blob_key,not_before) SELECT blob_key,? FROM content_objects WHERE object_key=? ON CONFLICT(blob_key) DO UPDATE SET not_before=excluded.not_before",vec![chrono::Utc::now().to_rfc3339().into(),key.as_ref().into()])?);
         statements.push(self.prepare("DELETE FROM content_objects WHERE object_key=?",vec![key.as_ref().into()])?);
         statements.push(self.prepare("DELETE FROM object_chunks WHERE object_key=?",vec![key.as_ref().into()])?);statements.push(self.prepare("DELETE FROM objects WHERE object_key=?",vec![key.as_ref().into()])?);
-        statements.push(self.prepare("INSERT INTO transfer_object_refs(object_key,blob_key,size,sha256,backend,updated_at,blob_generation) VALUES (?,'',0,'','deleted',?,'') ON CONFLICT(object_key) DO UPDATE SET blob_key='',size=0,sha256='',backend='deleted',updated_at=excluded.updated_at,blob_generation=''",vec![key.as_ref().into(),chrono::Utc::now().to_rfc3339().into()])?);statements.push(self.finish_publication_guard(&token)?);let results=self.db.batch(statements).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&results)
+        statements.push(self.prepare("INSERT INTO transfer_object_refs(object_key,blob_key,size,sha256,backend,updated_at,blob_generation) VALUES (?,'',0,'','deleted',?,'') ON CONFLICT(object_key) DO UPDATE SET blob_key='',size=0,sha256='',backend='deleted',updated_at=excluded.updated_at,blob_generation=''",vec![key.as_ref().into(),chrono::Utc::now().to_rfc3339().into()])?);statements.push(self.finish_publication_guard(&token)?);self.checked_batch(statements).await.map(|_|())
     })}
     fn retire_legacy_guarded<'a>(&'a self,fence:&'a WriteFence,logical:&'a ObjectKey,pool:&'a ObjectKey,size:u64,sha:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{let base=std::sync::Arc::new(self.clone());crate::content_store::TransferReferenceStore::new(self.db.clone(),base.clone(),base.clone(),base,None).retire_legacy_guarded(fence,logical,pool,size,sha).await})}
     fn update_small_guarded<'a,'data:'a>(&'a self,fence:&'a WriteFence,key:&'a ObjectKey,mutate:&'a mut SmallObjectMutator<'data>)->PlatformFuture<'a,Result<ObjectUpdateResult>>{Box::pin(self.update_control(key,mutate,Some(fence)))}
     fn access_fence(&self)->Option<&dyn NovelAccessFence>{Some(self)}
     fn read_stream_leased<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<AssetStream>>>{Box::pin(async move{if !prefix.matches(key){return Err(worker_error("reader outside novel"));}self.renew_reader(prefix,lease,af::READER_LEASE_SECS).await?;let stream=self.read_stream_range(key,range).await?;self.renew_reader(prefix,lease,af::READER_LEASE_SECS).await?;Ok(stream)})}
     fn write_small_guarded<'a>(&'a self,fence:&'a WriteFence,key:&'a ObjectKey,data:Vec<u8>)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
-        if !fence.prefix.matches(key)||data.len() as u64>SMALL_CAP{return Err(worker_error("invalid guarded small write"));}let token=crate::content_store::nonce()?;let mut statements=vec![self.open_guard(fence,&token)?];self.append_write_statements(key,&data,None,&mut statements)?;statements.push(self.finish_publication_guard(&token)?);let results=self.db.batch(statements).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&results)
+        if !fence.prefix.matches(key)||data.len() as u64>SMALL_CAP{return Err(worker_error("invalid guarded small write"));}let token=crate::content_store::nonce()?;let mut statements=vec![self.open_guard(fence,&token)?];self.append_write_statements(key,&data,None,&mut statements)?;statements.push(self.finish_publication_guard(&token)?);self.checked_batch(statements).await.map(|_|())
     })}
     fn delete_guarded<'a>(&'a self,fence:&'a WriteFence,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
         if !fence.prefix.matches(key){return Err(worker_error("delete outside fence"));}let token=crate::content_store::nonce()?;let statements=vec![self.open_guard(fence,&token)?,
             self.prepare("DELETE FROM transfer_object_refs WHERE object_key=?",vec![key.as_ref().into()])?,self.prepare("DELETE FROM object_chunks WHERE object_key=?",vec![key.as_ref().into()])?,self.prepare("DELETE FROM objects WHERE object_key=?",vec![key.as_ref().into()])?,
             self.prepare("INSERT INTO transfer_object_refs(object_key,blob_key,size,sha256,backend,updated_at) VALUES (?,'',0,'','deleted',?) ON CONFLICT(object_key) DO UPDATE SET blob_key='',size=0,sha256='',backend='deleted',updated_at=excluded.updated_at",vec![key.as_ref().into(),chrono::Utc::now().to_rfc3339().into()])?,
-            self.finish_publication_guard(&token)?];let results=self.db.batch(statements).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&results)
+            self.finish_publication_guard(&token)?];self.checked_batch(statements).await.map(|_|())
     })}
 
     fn stat<'a>(
@@ -645,7 +657,7 @@ impl AssetStore for D1ObjectStore {
     fn write_stream_guarded<'a>(&'a self,fence:&'a WriteFence,key:&'a ObjectKey,stream:AssetStream)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
         if !fence.prefix.matches(key){return Err(worker_error("write outside fence"));}let stage=self.stage_stream(stream).await?;let token=crate::content_store::nonce()?;
         let statements=vec![self.open_guard(fence,&token)?,self.prepare("INSERT INTO transfer_object_refs(object_key,blob_key,size,sha256,backend,updated_at,blob_generation) SELECT ?1,?2,?3,?4,'d1',?5,(SELECT v.generation FROM transfer_verified_objects v JOIN objects o ON o.object_key=v.blob_key AND o.generation=v.generation WHERE v.blob_key=?2 AND v.size=?3 AND v.sha256=?4) ON CONFLICT(object_key) DO UPDATE SET blob_key=excluded.blob_key,size=excluded.size,sha256=excluded.sha256,backend='d1',updated_at=excluded.updated_at,blob_generation=excluded.blob_generation",vec![key.as_ref().into(),stage.key.as_ref().into(),JsValue::from_f64(stage.size as f64),stage.sha256.as_str().into(),chrono::Utc::now().to_rfc3339().into()])?,self.finish_publication_guard(&token)?];
-        let results=self.db.batch(statements).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&results)
+        self.checked_batch(statements).await.map(|_|())
     })}
     fn write_stream_once<'a>(&'a self,key:&'a ObjectKey,stream:AssetStream,expected_size:u64,sha:&'a str)->PlatformFuture<'a,Result<narou_rs::platform::WriteOnce>>{Box::pin(async move{
         use futures::StreamExt;use narou_rs::platform::WriteOnce;ts::check_hash_named_key(key,sha)?;let id=format!("once-{}",crate::content_store::nonce()?);
