@@ -295,12 +295,20 @@ impl S3Store {
     async fn pool_stat(&self, key: &ObjectKey) -> Result<Option<u64>> {
         if !self.location.has_pool_alternate(key) { return Ok(None); }
         let response = self.stream_get(&self.location.object_url(key), &[("range", "bytes=0-0")]).await?;
-        if response.status == 404
-            || (response.status == 416 && response.header("content-range") == Some("bytes */0"))
-        {
-            return Ok(None);
+        // `bytes */0` は「不在」と「0 バイト」を区別しない。dedup プールは
+        // 存在性だけを問うため空のプールは不在と同じ扱いにする
+        // (サイズを報告する stat_object が Some(0) を返すのと非対称なのは意図的)。
+        // Content-Range が読めない 416 も、存在するなら長さが分かるはずなので
+        // 不在として扱う。`bytes */N` (N>0) は実在するのでサイズを返す。
+        match streaming::range_416_total(&response) {
+            Some(0) => return Ok(None),
+            Some(size) => return Ok(Some(size)),
+            None if response.status == 416 => return Ok(None),
+            None => {}
         }
+        if response.status == 404 { return Ok(None); }
         streaming::metadata_size(&response).map(Some)
+
     }
 
     /// dedup プールにそのキーが存在するか (移行判定用)。
@@ -314,10 +322,18 @@ impl S3Store {
         self.renew_stage_progress(key).await?;
         let response = self.stream_get_object(key, &[("range", "bytes=0-0")]).await?;
         if response.status == 404 { return Ok(None); }
-        // 416 の `bytes */0` は 0 バイト(または不在)を意味する。stat は 0 サイズの
-        // オブジェクトとして返し、空の staging オブジェクトを欠落扱いしない。
-        // `bytes */N` (N>0) は metadata_size が範囲外エラーとして扱う。
+        // 416 の分類は `bytes */N` のサイズ可否で決める。
+        //   `bytes */0`          … 0 バイト(または不在)。stat は 0 サイズの
+        //                          オブジェクトとして返し、空の staging
+        //                          オブジェクトを欠落扱いしない。
+        //   `bytes */N` (N>0)    … 存在するが範囲外。metadata_size がエラー化する。
+        //   Content-Range 無し等 … 存在するオブジェクトなら長さが分かるため、
+        //                          サイズ不明の 416 は不在として扱う。
+        if response.status == 416 && streaming::range_416_total(&response).is_none() {
+            return Ok(None);
+        }
         let size = streaming::metadata_size(&response)?;
+
         let etag = response
             .header("etag")
             .map(|value| value.trim_matches('"').to_string());
@@ -709,7 +725,7 @@ impl AssetStore for S3Store {
     fn legacy_etag<'a>(&'a self,logical:&'a ObjectKey)->PlatformFuture<'a,Result<Option<String>>>{Box::pin(async move{
         super::transfer_stage::illustration_pool_key(logical)?;
         let response=self.stream_get(&self.location.legacy_object_url(logical),&[("range","bytes=0-0")]).await?;
-        if response.status==404||(response.status==416&&response.header("content-range")==Some("bytes */0")){return Ok(None);}
+        if response.status==404||(response.status==416&&matches!(streaming::range_416_total(&response),None|Some(0))){return Ok(None);}
         if response.status==416{return Err(NarouError::Platform(format!("legacy ETag lookup failed with status {}",response.status)));}
         response.header("etag").filter(|etag|!etag.is_empty()).map(|etag|Some(etag.to_owned())).ok_or_else(||NarouError::Platform("legacy object omitted ETag; conditional GC unavailable".into()))
     })}
@@ -1041,6 +1057,29 @@ mod tests {
         ))
         .expect_err("a 416 with bytes */N is an out-of-range error, not a missing object");
         assert!(error.to_string().contains("S3 metadata GET failed with status 416"));
+    }
+
+    #[test]
+    fn stat_treats_headerless_416_as_missing() {
+        // 存在するオブジェクトへの 416 なら Content-Range に `bytes */N` が
+        // 付くはず。ヘッダ自体が無い (Wasabi の missing-key 応答) 416 は
+        // サイズ不明のため不在として扱い、エラーで止めない。
+        let http = Arc::new(MockHttpClient::new());
+        http.add_response(
+            "https://s3.example.com/bucket/narou/test/novels/site/title/novel.txt",
+            HttpResponse {
+                status: 416,
+                headers: vec![],
+                body: Vec::new(),
+            },
+        );
+        let store = store(http);
+        let metadata = futures::executor::block_on(ObjectStore::stat(
+            &store,
+            &key("novels/site/title/novel.txt"),
+        ))
+        .unwrap();
+        assert!(metadata.is_none());
     }
 
     #[test]

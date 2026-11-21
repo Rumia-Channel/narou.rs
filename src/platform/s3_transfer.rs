@@ -475,10 +475,10 @@ impl S3Store {
                 )))
             }
             200 => Err(NarouError::Platform("S3 ignored Range; refusing a linear prefix scan".into())),
-            // `bytes */0` はサーバーが 0 バイト (=欠落 or 空) を宣言する。
-            // range_read と同じく、先頭からの読み取りなら欠落として扱い、
-            // 途中位置の 416 だけ「範囲超過」を維持する。
-            416 if range.start==0||response.header("content-range")==Some("bytes */0")=>Ok(None),
+            // `bytes */N` (N>0) は存在するオブジェクトへの範囲超過。
+            // `bytes */0`・Content-Range 不明・先頭からの読み取りは
+            // 「読むもの無し」として欠落に畳む。
+            416 if range.start==0||super::streaming::range_416_total(&response).is_none_or(|total|total==0)=>Ok(None),
             416 => Err(NarouError::Platform("asset range exceeds object".into())),
             status => Err(NarouError::Platform(format!(
                 "S3 range GET failed with status {status}"
