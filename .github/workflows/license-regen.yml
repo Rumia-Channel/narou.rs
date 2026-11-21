@@ -1,0 +1,28 @@
+name: Regenerate license notices
+on:
+  workflow_dispatch: {}
+
+jobs:
+  regen:
+    name: Regenerate notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-about
+      - run: cargo install cargo-about --locked --features cli --version "0.9.2"
+        env:
+          CARGO_TARGET_DIR: target/cargo-about
+      - run: cargo fetch --locked
+      - name: Regenerate notices
+        run: |
+          cargo-about generate --workspace --features narou_rs/lite --locked -c about.toml -o Third-Party-License.md about.hbs
+          cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked -o Third-Party-License-non-GPL.md about.hbs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: license-notices
+          path: |
+            Third-Party-License.md
+            Third-Party-License-non-GPL.md
