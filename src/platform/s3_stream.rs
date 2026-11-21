@@ -114,7 +114,16 @@ impl S3Store {
         }
         let header = format!("bytes={}-{}", range.start, range.end - 1);
         let response = self.stream_get_object(key, &[("range", &header)]).await?;
-        if response.status == 404 { return Ok(None); }
+        match response.status {
+            404 => return Ok(None),
+            // Wasabi 等は存在しないキーへの Range GET でも 416 を返す。
+            // `bytes */0` (0 バイト) または先頭からの読み取りは「読むもの無し」として
+            // 欠落に畳む。開始位置が途中の 416 は既存オブジェクトの短さとして残す。
+            416 if range.start == 0
+                || response.header("content-range") == Some("bytes */0") => return Ok(None),
+            416 => return Err(NarouError::Platform("asset range exceeds object".into())),
+            _ => {}
+        }
         validate_content_range(&response, &range)?;
         let mut stream = exact_stream(response.body, Some(length as u64));
         let mut bytes = Vec::with_capacity(length);

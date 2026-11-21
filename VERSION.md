@@ -10,6 +10,7 @@
 - 作品数が多いライブラリで SQLite から YAML へ切り替える（`narou db export-yaml --in-place` / Web UI 設定からの切替）際、全作品分のロックやファイルを同時に開き続けてファイルディスクリプタ上限 (`EMFILE`) や長時間停止に至る問題を修正しました（issue #48）。切替ロックと書き出しをストリーミング処理へ改め、異常時のロールバック保全を維持します。
 - Native 作品一覧の読み込みで不要なゲート読み直し・再ロック・ドメインごとのタイムゾーン再解決を省き、Web UI の補助読み込みと外部ツール検出をブロッキングプールへ分離して応答時間を短縮しました（issue #46）。
 - Windows の jpackage / MSI 版 AozoraEpub3（`app/AozoraEpub3.jar` 配置）を `narou init`、バージョン確認、変換時および同梱 Java 解決で検出できるようにしました（issue #48）。
+- Workers の S3 互換ストレージ (Wasabi 等) で、存在しないオブジェクトへの stat が 416 (Range Not Satisfiable) を返す環境で、ダウンロード・更新が `S3 metadata GET failed with status 416` で停止する問題を修正しました。404 と同じく「オブジェクト無し」として扱います。
 
 変更一覧は [v0.6.8...v0.6.9](https://github.com/Rumia-Channel/narou.rs/compare/v0.6.8...v0.6.9) を参照してください。
 
