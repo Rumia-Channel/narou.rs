@@ -1793,7 +1793,7 @@ dependencies = [
 
 [[package]]
 name = "narou_rs"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "argon2",
  "async-compression",
@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "narou_transfer_wasm"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "futures",
  "js-sys",
