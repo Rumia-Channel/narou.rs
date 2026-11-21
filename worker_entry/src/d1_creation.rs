@@ -29,7 +29,10 @@ fn checkpoint_pair(raw:Option<&str>,job_id:&str)->Result<Option<(NovelId,i64)>>{
 
 impl D1NovelRepository{
     fn guard(&self,condition:&str,binds:Vec<BindValue>)->Result<D1PreparedStatement>{self.prepare(&format!("SELECT CASE WHEN {condition} THEN 1 ELSE {ABORT} END"),binds)}
-    async fn batch_checked(&self,statements:Vec<D1PreparedStatement>)->Result<Vec<D1Result>>{let results=self.db.batch(statements).await.map_err(worker_error)?;ensure_batch_success(&results)?;Ok(results)}
+    /// Wraps each D1 batch so a guard abort (`abs(INT64_MIN)` -> "integer
+    /// overflow") records which creation path rejected it, not just the error.
+    #[track_caller]
+    async fn batch_checked(&self,statements:Vec<D1PreparedStatement>)->Result<Vec<D1Result>>{let site=std::panic::Location::caller();let results=self.db.batch(statements).await.map_err(|e|worker_error(format!("D1 batch failed ({site}): {e}")))?;ensure_batch_success(&results).map_err(|e|worker_error(format!("guard batch rejected ({site}): {e}")))?;Ok(results)}
     fn live_job_guard(&self,owner:&JobExecutionOwner)->Result<D1PreparedStatement>{
         if owner.job_id().is_empty()||owner.execution_token().is_empty(){return Err(NarouError::Platform("empty execution ownership".into()));}
         self.guard("EXISTS(SELECT 1 FROM worker_jobs WHERE job_id=?1 AND execution_token=?2 AND status='running' AND julianday(lease_until)>julianday('now'))",vec![text(owner.job_id()),text(owner.execution_token())])
