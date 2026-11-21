@@ -295,7 +295,11 @@ impl S3Store {
     async fn pool_stat(&self, key: &ObjectKey) -> Result<Option<u64>> {
         if !self.location.has_pool_alternate(key) { return Ok(None); }
         let response = self.stream_get(&self.location.object_url(key), &[("range", "bytes=0-0")]).await?;
-        if matches!(response.status, 404 | 416) { return Ok(None); }
+        if response.status == 404
+            || (response.status == 416 && response.header("content-range") == Some("bytes */0"))
+        {
+            return Ok(None);
+        }
         streaming::metadata_size(&response).map(Some)
     }
 
@@ -309,7 +313,10 @@ impl S3Store {
     async fn stat_object(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>> {
         self.renew_stage_progress(key).await?;
         let response = self.stream_get_object(key, &[("range", "bytes=0-0")]).await?;
-        if matches!(response.status, 404 | 416) { return Ok(None); }
+        if response.status == 404 { return Ok(None); }
+        // 416 の `bytes */0` は 0 バイト(または不在)を意味する。stat は 0 サイズの
+        // オブジェクトとして返し、空の staging オブジェクトを欠落扱いしない。
+        // `bytes */N` (N>0) は metadata_size が範囲外エラーとして扱う。
         let size = streaming::metadata_size(&response)?;
         let etag = response
             .header("etag")
@@ -702,7 +709,8 @@ impl AssetStore for S3Store {
     fn legacy_etag<'a>(&'a self,logical:&'a ObjectKey)->PlatformFuture<'a,Result<Option<String>>>{Box::pin(async move{
         super::transfer_stage::illustration_pool_key(logical)?;
         let response=self.stream_get(&self.location.legacy_object_url(logical),&[("range","bytes=0-0")]).await?;
-        if matches!(response.status,404|416){return Ok(None);}
+        if response.status==404||(response.status==416&&response.header("content-range")==Some("bytes */0")){return Ok(None);}
+        if response.status==416{return Err(NarouError::Platform(format!("legacy ETag lookup failed with status {}",response.status)));}
         response.header("etag").filter(|etag|!etag.is_empty()).map(|etag|Some(etag.to_owned())).ok_or_else(||NarouError::Platform("legacy object omitted ETag; conditional GC unavailable".into()))
     })}
     fn delete_legacy_if_match<'a>(&'a self,logical:&'a ObjectKey,pool:&'a ObjectKey,etag:&'a str)->PlatformFuture<'a,Result<()>>{Box::pin(async move{
@@ -988,10 +996,12 @@ mod tests {
     }
 
     #[test]
-    fn stat_treats_416_as_missing() {
+    fn stat_reports_zero_length_object_for_416_empty_range() {
         // Wasabi 等の互換ストレージは Range GET に対して存在しないキーでも
-        // 416 (Range Not Satisfiable) を返すことがある。404 と同じく
-        // 「オブジェクト無し」へ畳まないと、DL/update が 416 で停止する。
+        // 416 (Range Not Satisfiable) を返すことがある。ただし `bytes */0` は
+        // 「存在する 0 バイトのオブジェクト」に対しても同じ応答を返すため、
+        // 両者は区別できない。空の staging オブジェクトを欠落扱いしないよう、
+        // stat は 0 サイズのオブジェクトとして返す。
         let http = Arc::new(MockHttpClient::new());
         http.add_response(
             "https://s3.example.com/bucket/narou/test/novels/site/title/novel.txt",
@@ -1006,8 +1016,31 @@ mod tests {
             &store,
             &key("novels/site/title/novel.txt"),
         ))
-        .unwrap();
-        assert!(metadata.is_none());
+        .unwrap()
+        .expect("a 416 with bytes */0 must report a zero-length object, not a missing one");
+        assert_eq!(metadata.size, 0);
+    }
+
+    #[test]
+    fn stat_keeps_nonempty_416_as_out_of_range_error() {
+        // 存在するオブジェクトへの範囲超過は `bytes */N` (N>0) で返る。
+        // これは欠落ではないため、metadata_size が範囲外エラーとして返す。
+        let http = Arc::new(MockHttpClient::new());
+        http.add_response(
+            "https://s3.example.com/bucket/narou/test/novels/site/title/novel.txt",
+            HttpResponse {
+                status: 416,
+                headers: vec![("content-range".to_string(), "bytes */10".to_string())],
+                body: Vec::new(),
+            },
+        );
+        let store = store(http);
+        let error = futures::executor::block_on(ObjectStore::stat(
+            &store,
+            &key("novels/site/title/novel.txt"),
+        ))
+        .expect_err("a 416 with bytes */N is an out-of-range error, not a missing object");
+        assert!(error.to_string().contains("S3 metadata GET failed with status 416"));
     }
 
     #[test]
