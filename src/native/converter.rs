@@ -114,7 +114,7 @@ where
 
 pub(crate) fn private_capabilities(path: &Path) -> crate::error::Result<ConverterCapabilities> {
     crate::application::novel_access::require_private_path(path)?;
-    let store = Arc::new(crate::native::object_store::NativeObjectStore::from_root(path.to_path_buf())?);
+    let store = Arc::new(crate::native::object_store::NativeObjectStore::from_private_root(path.to_path_buf())?);
     let objects: Arc<dyn crate::platform::ObjectStore> = store.clone();
     let assets: Arc<dyn crate::platform::AssetStore> = store;
     let write = run_store_io(crate::application::novel_access::NovelWriteGuard::capture(
@@ -184,7 +184,7 @@ impl ConversionWorkspace {
             (None, None, None)
         };
         let input = temporary.as_ref().map(|temp| temp.path()).unwrap_or(novel_dir).to_path_buf();
-        let store = Arc::new(crate::native::object_store::NativeObjectStore::from_root(input.clone())?);
+        let store = Arc::new(crate::native::object_store::NativeObjectStore::from_private_root(input.clone())?);
         let objects: Arc<dyn crate::platform::ObjectStore> = store.clone();
         let assets: Arc<dyn crate::platform::AssetStore> = store;
         let private_write = run_store_io(NovelWriteGuard::capture(

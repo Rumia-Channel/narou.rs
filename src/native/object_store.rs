@@ -73,6 +73,12 @@ pub struct NativeObjectStore {
     /// repeat the same `本文/` parent hundreds of times per novel.
     created_dirs: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<PathBuf>>>,
     stage_leases: Arc<crate::platform::staging::StageLeaseCache>,
+    /// Whether this store's gate admission consults the live `.narou` SQLite
+    /// authority. Private conversion workspaces (`.narou-snapshot-*` temp
+    /// roots) are never a canonical library namespace: consulting the parent
+    /// library's `db.sqlite` would both be meaningless (their FS gates are
+    /// independent of the library's gates) and contention-prone (issue #50).
+    consult_sql_authority: bool,
 }
 
 impl NativeObjectStore {
@@ -82,6 +88,19 @@ impl NativeObjectStore {
     }
 
     pub fn from_root(root: PathBuf) -> Result<Self> {
+        Self::from_root_inner(root, true)
+    }
+
+    /// Same as [`Self::from_root`] but for a private, operation-owned
+    /// workspace root (conversion snapshots, private capability stores):
+    /// gate admission never consults the parent `.narou/db.sqlite`, so a
+    /// contended library handle cannot fabricate a `Conflict` for a
+    /// namespace the library does not manage.
+    pub(crate) fn from_private_root(root: PathBuf) -> Result<Self> {
+        Self::from_root_inner(root, false)
+    }
+
+    fn from_root_inner(root: PathBuf, consult_sql_authority: bool) -> Result<Self> {
         fs::create_dir_all(&root)?;
         Ok(Self {
             root,
@@ -89,6 +108,7 @@ impl NativeObjectStore {
             created_dirs: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            consult_sql_authority,
         })
     }
 
@@ -1627,19 +1647,34 @@ pub(crate) enum SqlGateAuthority{
 /// sweep belong to the configured handle only. A missing file stays `None`
 /// (the `.narou` directory may predate any SQLite use) and the consult never
 /// creates one — opening a not-yet-created database would fabricate an
-/// empty `db.sqlite` as a side effect. Every other open or schema error
-/// propagates so the caller fails closed. The connection is never
-/// registered in `OPEN_HANDLES`, preserving the invariant that a configured
-/// handle observed a reconciled library.
+/// empty `db.sqlite` as a side effect, so `SQLITE_OPEN_CREATE` is never set.
+/// A `CannotOpen` open error only yields `None` while the file stays gone
+/// (deleted between the existence check and open); on an existing file a
+/// `ReadOnly`/`CannotOpen` read-write failure retries read-only, and every
+/// other open or schema error propagates so the caller fails closed. The
+/// connection is never registered in `OPEN_HANDLES`, preserving the
+/// invariant that a configured handle observed a reconciled library.
 fn native_db_gate_connection(narou_dir:&Path)->Result<Option<rusqlite::Connection>>{
     let database=narou_dir.join(crate::native::sqlite::state::DB_FILE_NAME);
-    if !database.exists(){return Ok(None);}
-    match rusqlite::Connection::open(&database){
+    match database.try_exists(){Ok(true)=>{},Ok(false)=>return Ok(None),Err(error)=>return Err(error.into())}
+    let open=|flags|match rusqlite::Connection::open_with_flags(&database,flags){
         Ok(connection)=>Ok(Some(connection)),
         // Deleted between the existence check and open: still absent.
-        Err(rusqlite::Error::SqliteFailure(code,_))if code.code==rusqlite::ErrorCode::CannotOpen=>Ok(None),
-        Err(error)=>Err(crate::native::sqlite::sqlite_error(error)),
-    }
+        Err(rusqlite::Error::SqliteFailure(code,_))if code.code==rusqlite::ErrorCode::CannotOpen&&!database.exists()=>Ok(None),
+        Err(error)=>Err(error),
+    };
+    let mut connection=match open(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX){
+        Ok(connection)=>connection,
+        // A surviving file that rejects read-write open (read-only media or
+        // rights) is consulted read-only; a failing RO open still fails closed.
+        Err(rusqlite::Error::SqliteFailure(code,_))if matches!(code.code,rusqlite::ErrorCode::ReadOnly|rusqlite::ErrorCode::CannotOpen)=>open(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(crate::native::sqlite::sqlite_error)?,
+        Err(error)=>return Err(crate::native::sqlite::sqlite_error(error)),
+    };
+    let Some(connection)=connection.take()else{return Ok(None);};
+    // Same wait budget as `StateDb::configure`: a short checkpoint or VACUUM
+    // must not turn this consult into SQLITE_BUSY.
+    connection.busy_timeout(std::time::Duration::from_secs(5)).map_err(crate::native::sqlite::sqlite_error)?;
+    Ok(Some(connection))
 }
 
 /// Classify the durable FS tuple `(epoch, origin)` against the gate
@@ -1672,12 +1707,17 @@ fn consult_sql_gate_authority(connection:&rusqlite::Connection,prefix:&ObjectPre
 /// handoff still fences this file — an established-handle-only lookup could
 /// never prove absence. The consult only reads committed durable state and
 /// never runs `configure`: migrations, legacy import and the startup gate
-/// sweep belong to the configured handle alone. Open/schema errors and
-/// `try_lock` contention fail closed as `Conflict`.
+/// sweep belong to the configured handle alone. Open/schema errors and real
+/// `Conflict`/`Superseded` provenance still fail closed; `try_lock`
+/// contention on the shared handle is not provenance, so it falls back to a
+/// dedicated consult connection that sees the same committed state (a
+/// parallel update holding the mutex mid-transaction can no longer
+/// fabricate a `Conflict`, issue #50).
 pub(crate) fn live_sql_gate_authority(narou_dir:&Path,prefix:&ObjectPrefix,epoch:u64,origin:&str)->Result<SqlGateAuthority>{
     if crate::native::sqlite::state::read_mode(narou_dir)!=crate::native::sqlite::state::StorageMode::Sqlite{return Ok(SqlGateAuthority::Absent);}
-    if let Some(state)=crate::native::sqlite::state::established_for(narou_dir){
-        let Some(connection)=state.conn_ref().try_lock()else{return Ok(SqlGateAuthority::Conflict);};
+    if let Some(state)=crate::native::sqlite::state::established_for(narou_dir)
+        && let Some(connection)=state.conn_ref().try_lock()
+    {
         return consult_sql_gate_authority(&connection,prefix,epoch,origin);
     }
     let Some(connection)=native_db_gate_connection(narou_dir)?else{return Ok(SqlGateAuthority::Absent);};
@@ -1686,6 +1726,7 @@ pub(crate) fn live_sql_gate_authority(narou_dir:&Path,prefix:&ObjectPrefix,epoch
 
 impl NativeObjectStore {
     fn live_sql_authority(&self,prefix:&ObjectPrefix,epoch:u64,origin:&str)->Result<SqlGateAuthority>{
+        if !self.consult_sql_authority{return Ok(SqlGateAuthority::Absent);}
         let narou_dir=self.root().parent().unwrap_or_else(||self.root()).join(".narou");
         live_sql_gate_authority(&narou_dir,prefix,epoch,origin)
     }
@@ -3165,6 +3206,206 @@ mod tests {
             .with_cutover_lock(|| store.with_transfer_lock("novels/site/book", || Ok(())))
             .unwrap_err();
         assert!(busy_reverse.to_string().contains("novel_busy:"), "{busy_reverse}");
+    }
+
+    // issue #50: an established SQLite handle whose `StateDb.conn` mutex is
+    // held by a parallel update (or re-entrantly by the caller) must not
+    // turn the FS gate authority consult into a fabricated `Conflict`. The
+    // consult falls back to a dedicated read of committed state.
+    fn issue50_sqlite_library(root: &Path) -> crate::native::sqlite::state::StateDb {
+        let narou_dir = root.join(".narou");
+        crate::native::sqlite::state::write_mode(
+            &narou_dir,
+            crate::native::sqlite::state::StorageMode::Sqlite,
+        )
+        .unwrap();
+        crate::native::sqlite::state::active_for(&narou_dir).expect("sqlite state is active")
+    }
+
+    #[test]
+    fn fs_gate_admission_survives_contended_state_connection() {
+        let _guard = crate::test_support::global_state_guard();
+        let root = tempfile::tempdir().unwrap();
+        let narou_dir = root.path().join(".narou");
+        let state = issue50_sqlite_library(root.path());
+        let archive = root.path().join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+        let store = NativeObjectStore::from_root(archive).unwrap();
+        let prefix = ObjectPrefix::new("novels/site/book").unwrap();
+        // A parallel update's transaction holds the shared SQLite mutex on
+        // another thread AND an open `BEGIN IMMEDIATE` write transaction;
+        // every FS-side gate admission must still read the committed
+        // authority through a dedicated WAL snapshot connection.
+        let held_conn = state.conn_ref().clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let held = held_conn.lock();
+            held.execute_batch("BEGIN IMMEDIATE; INSERT OR REPLACE INTO app_state(scope, key, value_json, value_yaml) VALUES('meta', 'issue50_probe', '{}', '1');").unwrap();
+            locked_tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+            held.execute_batch("COMMIT;").unwrap();
+        });
+        locked_rx.recv().unwrap();
+        assert!(matches!(
+            live_sql_gate_authority(&narou_dir, &prefix, 0, "").unwrap(),
+            SqlGateAuthority::Absent
+        ));
+        let guard = futures::executor::block_on(store.gate_info(&prefix)).unwrap();
+        assert_eq!(guard.epoch, 0);
+        let lease =
+            futures::executor::block_on(store.admit_reader(&prefix, "reader", 30)).unwrap();
+        store
+            .with_gate(&prefix, |gate| {
+                gate.updated_at = ts::now_secs();
+                Ok(())
+            })
+            .unwrap();
+        let objects: Arc<dyn ObjectStore> = Arc::new(store.clone());
+        let write = crate::native::converter::run_store_io(
+            crate::application::novel_access::NovelWriteGuard::capture(
+                &objects,
+                None,
+                &crate::platform::ObjectPrefix::new("novels").unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(write.prefix().as_ref(), "novels");
+        done_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // `release_reader` drains the matching SQL lease row through the shared
+        // handle, so it legitimately waits for the other worker's transaction.
+        futures::executor::block_on(store.release_reader(&prefix, &lease)).unwrap();
+    }
+
+    #[test]
+    fn fs_gate_admission_keeps_fail_closed_under_contention() {
+        let _guard = crate::test_support::global_state_guard();
+        let root = tempfile::tempdir().unwrap();
+        let narou_dir = root.path().join(".narou");
+        let state = issue50_sqlite_library(root.path());
+        let archive = root.path().join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+        let store = NativeObjectStore::from_root(archive).unwrap();
+        let conflicted = ObjectPrefix::new("novels/site/conflicted").unwrap();
+        let superseded = ObjectPrefix::new("novels/site/superseded").unwrap();
+        // Plant the durable gate tuple the FS side owns for `superseded`:
+        // closing the gate writes epoch 1 / empty origin.
+        let gate_epoch =
+            futures::executor::block_on(store.close_gate(&superseded, "publication")).unwrap();
+        {
+            let conn = state.conn_ref().lock();
+            conn.execute(
+                "INSERT INTO novel_access_gates(prefix,epoch,closed,owner,updated_at,content_revision,origin_url_fold) VALUES(?1,1,0,NULL,0,0,'')",
+                [conflicted.as_ref()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO native_gate_handoffs(prefix,fs_epoch,sql_epoch,fs_origin_fold,recorded_at) VALUES(?1,?2,?3,'',0)",
+                rusqlite::params![superseded.as_ref(), i64::try_from(gate_epoch).unwrap(), i64::try_from(gate_epoch + 1).unwrap()],
+            )
+            .unwrap();
+            assert!(matches!(
+                live_sql_gate_authority(&narou_dir, &conflicted, 0, "").unwrap(),
+                SqlGateAuthority::Conflict
+            ));
+            assert!(matches!(
+                live_sql_gate_authority(&narou_dir, &superseded, gate_epoch, "").unwrap(),
+                SqlGateAuthority::Superseded
+            ));
+            let busy = futures::executor::block_on(store.admit_reader(&conflicted, "reader", 30))
+                .unwrap_err();
+            assert!(
+                busy.to_string().contains("conflicting live SQL authority"),
+                "{busy}"
+            );
+            let healed = futures::executor::block_on(store.admit_reader(&superseded, "reader", 30))
+                .unwrap_err();
+            assert!(healed.to_string().contains("novel_recovering"), "{healed}");
+            let gate_path = store.gate_path(&superseded).unwrap();
+            let gate: FsGate = serde_json::from_slice(&fs::read(gate_path).unwrap()).unwrap();
+            assert!(gate.migrated, "the unflushed migrated marker must be repaired");
+        }
+    }
+
+    #[test]
+    fn private_conversion_store_never_consults_library_authority() {
+        let _guard = crate::test_support::global_state_guard();
+        let root = tempfile::tempdir().unwrap();
+        let state = issue50_sqlite_library(root.path());
+        let store =
+            NativeObjectStore::from_private_root(root.path().join(".narou-snapshot-test")).unwrap();
+        let prefix = ObjectPrefix::new("novels/site/book").unwrap();
+        let held = state.conn_ref().lock();
+        // Live authority rows for BOTH consulted prefixes in the parent
+        // library: any consult would see `Conflict` rows, so `Absent` and a
+        // successful capture prove the private store never reads this DB.
+        held.execute(
+            "INSERT INTO novel_access_gates(prefix,epoch,closed,owner,updated_at,content_revision,origin_url_fold) VALUES(?1,1,0,NULL,0,0,'')",
+            [prefix.as_ref()],
+        )
+        .unwrap();
+        held.execute(
+            "INSERT INTO novel_access_gates(prefix,epoch,closed,owner,updated_at,content_revision,origin_url_fold) VALUES('novels',1,0,NULL,0,0,'')",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.live_sql_authority(&prefix, 0, "").unwrap(),
+            SqlGateAuthority::Absent
+        ));
+        let objects: Arc<dyn ObjectStore> = Arc::new(store);
+        let write = crate::native::converter::run_store_io(
+            crate::application::novel_access::NovelWriteGuard::capture(
+                &objects,
+                None,
+                &crate::platform::ObjectPrefix::new("novels").unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(write.prefix().as_ref(), "novels");
+        drop(held);
+    }
+
+    #[test]
+    fn private_conversion_workspace_captures_while_connection_is_held() {
+        let _guard = crate::test_support::global_state_guard();
+        let root = tempfile::tempdir().unwrap();
+        let state = issue50_sqlite_library(root.path());
+        let private = tempfile::Builder::new()
+            .prefix(".narou-snapshot-")
+            .tempdir_in(root.path())
+            .unwrap();
+        let held = state.conn_ref().lock();
+        let workspace = crate::native::converter::ConversionWorkspace::begin(
+            private.path(),
+            0,
+            None,
+            crate::native::materialization::ConversionInputSelection {
+                illustrations: false,
+                cover: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(workspace.private_write.prefix().as_ref(), "novels");
+        crate::native::converter::private_capabilities(private.path()).unwrap();
+        drop(held);
+    }
+
+    #[test]
+    fn gate_consult_never_creates_the_database_file() {
+        let _guard = crate::test_support::global_state_guard();
+        let root = tempfile::tempdir().unwrap();
+        let narou_dir = root.path().join(".narou");
+        crate::native::sqlite::state::write_mode(
+            &narou_dir,
+            crate::native::sqlite::state::StorageMode::Sqlite,
+        )
+        .unwrap();
+        let prefix = ObjectPrefix::new("novels/site/book").unwrap();
+        assert!(matches!(
+            live_sql_gate_authority(&narou_dir, &prefix, 0, "").unwrap(),
+            SqlGateAuthority::Absent
+        ));
+        assert!(!narou_dir.join(crate::native::sqlite::state::DB_FILE_NAME).exists());
     }
 
     #[cfg(unix)]
