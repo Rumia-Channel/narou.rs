@@ -80,6 +80,24 @@ fn resolve_novel_origin(target: &str) -> Result<Option<NovelWriteGuard>, String>
 
 fn clean_novel(write: NovelWriteGuard, remove: bool) -> Result<(), String> {
     let novel_dir = narou_rs::native::materialization::directory_for_origin(&write).map_err(|error| error.to_string())?;
+
+    // dry-run は何も書き込まないので、本文全部をスナップショットへ複製する
+    // 必要が無い。toc.yaml だけを取り出し、孤児はストアのキー一覧から判定する。
+    if !remove {
+        let Some((toc, names)) = narou_rs::native::materialization::clean_read_only_inputs(&novel_dir, &write)
+            .map_err(|error| error.to_string())? else {
+            return Ok(());
+        };
+        let expected = expected_section_stems(&toc);
+        for relative in names {
+            let relative = Path::new(&relative);
+            if is_orphan_relative(relative, &expected) {
+                println!("{}", novel_dir.join(relative).display());
+            }
+        }
+        return Ok(());
+    }
+
     let snapshot = narou_rs::native::materialization::NativeMutationSnapshot::begin_with_origin(&novel_dir, write)
         .map_err(|error| error.to_string())?;
     let bytes = match fs::read(snapshot.path().join("toc.yaml")) {
@@ -97,6 +115,23 @@ fn clean_novel(write: NovelWriteGuard, remove: bool) -> Result<(), String> {
     }
     if remove { snapshot.publish_changes().map_err(|error| error.to_string())?; }
     Ok(())
+}
+
+/// ストアの論理キー (raw/xxx.html, 本文/xxx.yaml) が孤児かどうかを判定する。
+/// 拡張子の規則は `collect_orphans()` と同じ (raw は html/txt、本文 は yaml)。
+fn is_orphan_relative(relative: &Path, expected: &HashSet<String>) -> bool {
+    let parent = relative.parent().and_then(|path| path.file_name()).and_then(|name| name.to_str());
+    let extensions: &[&str] = match parent {
+        Some("raw") => &["html", "txt"],
+        Some("本文") => &["yaml"],
+        _ => return false,
+    };
+    let Some(extension) = relative.extension().and_then(|value| value.to_str()) else { return false };
+    if !extensions.iter().any(|candidate| extension.eq_ignore_ascii_case(candidate)) {
+        return false;
+    }
+    let Some(stem) = relative.file_stem().and_then(|value| value.to_str()) else { return false };
+    !expected.contains(stem)
 }
 
 /// トークンに現れる話数 (本文/raw) の期待ファイル名 stem。
@@ -166,9 +201,11 @@ fn collect_orphans(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use narou_rs::downloader::{SubtitleInfo, TocFile};
 
-    use super::{expected_section_stems, find_orphan_files_with_expected};
+    use super::{expected_section_stems, find_orphan_files_with_expected, is_orphan_relative};
 
     #[test]
     fn clean_snapshot_orphans_do_not_touch_nested_history_or_settings() {
@@ -225,6 +262,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(orphan_names, vec!["orphan.html", "orphan.yaml"]);
 
+    }
+
+    #[test]
+    fn clean_read_only_uses_the_same_orphan_rules_as_snapshot_scan() {
+        let expected = ["1 keep".to_string(), "2 kept".to_string()].into_iter().collect();
+        let cases = [
+            ("raw/1 keep.html", false),
+            ("raw/1 keep.txt", false),
+            ("raw/9 orphan.html", true),
+            ("本文/2 kept.yaml", false),
+            ("本文/9 orphan.yaml", true),
+            ("本文/cache/old/9 orphan.yaml", false),
+            ("setting.ini", false),
+        ];
+        for (relative, want) in cases {
+            assert_eq!(
+                is_orphan_relative(Path::new(relative), &expected),
+                want,
+                "{relative}"
+            );
+        }
     }
 
     /// Ruby 版が作った file_subtitle 末尾の半角空白をサニタイズで落とさず、

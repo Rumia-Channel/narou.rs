@@ -166,6 +166,71 @@ pub(crate) async fn selected_files_snapshot_leased(
     Ok((temporary, copied))
 }
 
+/// Read-only inputs for `narou clean -n`: the TOC and the logical names of
+/// direct files under `raw/` and `本文/`.
+///
+/// Only `toc.yaml` is materialized; object bodies are never read, so the cost
+/// does not grow with the number of sections. The read lease and fence checks
+/// are the same ones the mutation snapshot uses, so a concurrent write cannot
+/// make this view inconsistent.
+pub fn clean_read_only_inputs(
+    novel_dir: &Path,
+    write: &crate::application::novel_access::NovelWriteGuard,
+) -> Result<Option<(crate::downloader::TocFile, std::collections::BTreeSet<String>)>> {
+    block_on(async {
+        let inventory = crate::db::inventory::Inventory::with_default_root()?;
+        validate_origin_directory(novel_dir, write)?;
+        let stores = crate::native::object_store::NativeStores::for_narou_root(inventory.root_dir())?;
+        let objects = read_store_with(&stores);
+        let mut lease = crate::application::novel_access::NovelReadLease::admit(
+            &objects, write.prefix(), "native-clean-read",
+        ).await?;
+        let result = async {
+            if write.epoch() != lease.epoch() {
+                return Err(NarouError::Platform("novel_busy: clean origin changed".into()));
+            }
+            let fence = objects.access_fence().ok_or_else(|| NarouError::Platform("snapshot reader fence unavailable".into()))?;
+            let before = fence.gate_info(lease.prefix()).await?;
+
+            // Read only toc.yaml by its exact key. Going through list_page here
+            // would re-walk the whole filesystem on every 100-key page.
+            let prefix_text = lease.prefix().as_ref().to_owned();
+            let toc_key = crate::platform::ObjectKey::try_new(format!("{prefix_text}/toc.yaml"))?;
+            let temporary = tempfile::Builder::new().prefix(".narou-clean-").tempdir_in(inventory.root_dir())?;
+            let toc_path = temporary.path().join("toc.yaml");
+            if !copy_asset(&objects, &mut lease, &toc_key, &toc_path).await? {
+                return Ok(None);
+            }
+            let bytes = std::fs::read(toc_path)?;
+            let toc: crate::downloader::TocFile = serde_yaml::from_slice(&bytes)?;
+
+            // list_direct_files_sync is a single SQL range query plus one FS
+            // directory scan, not a recursive walk repeated once per page.
+            let mut names = std::collections::BTreeSet::new();
+            for subdir in [crate::downloader::RAW_DATA_DIR, crate::downloader::SECTION_SAVE_DIR] {
+                let directory = crate::platform::ObjectKey::try_new(format!("{prefix_text}/{subdir}"))?;
+                for key in stores.primary.list_direct_files_sync(&directory)? {
+                    if crate::platform::is_reserved_key(&key) { continue; }
+                    let Some(relative) = key.as_ref().strip_prefix(&prefix_text)
+                        .and_then(|rest| rest.strip_prefix('/')) else { continue };
+                    let Some((dir, name)) = relative.split_once('/') else { continue };
+                    if dir == subdir && !name.contains('/') {
+                        names.insert(format!("{dir}/{name}"));
+                    }
+                }
+            }
+            lease.validate().await?;
+            let after = fence.gate_info(lease.prefix()).await?;
+            if before.epoch != after.epoch || before.content_revision != after.content_revision {
+                return Err(NarouError::Platform("novel_busy: clean source changed during read".into()));
+            }
+            Ok(Some((toc, names)))
+        }.await;
+        let released = lease.release().await;
+        match result { Ok(value) => { released?; Ok(value) }, Err(error) => Err(error) }
+    })
+}
+
 fn validate_origin_directory(directory: &Path, write: &crate::application::novel_access::NovelWriteGuard) -> Result<()> {
     let archive = crate::db::with_database(|database| Ok(database.archive_root().to_path_buf()))?;
     let source = crate::db::paths::ensure_within_archive_root(directory, &archive)?;
