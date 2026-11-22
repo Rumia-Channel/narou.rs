@@ -80,3 +80,4 @@ __pycache__/
 # SORAHOST のサーバー側に置く設定 (秘密鍵を含む)
 /.env
 
+/geckodriver
