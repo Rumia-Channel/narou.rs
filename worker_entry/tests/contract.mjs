@@ -1098,8 +1098,12 @@ if (!IS_LOCAL && !UNCONFIGURED) {
       "completed",
       `stage→copy import must complete: ${JSON.stringify(result.status).slice(0, 400)}`,
     );
-    // 後始末: 生成した小説を削除してライブラリを汚さない。
-    const listed = await json(await request("/api/novels?limit=1000", auth()));
+    // 後始末: 生成した小説を削除してライブラリを汚さない。一覧の全件走査は
+    // limit 依存なので、`://` を含む検索 (toc_url 一致) で確実に引く。
+    const listed = await json(await request(
+      `/api/list?all=true&search[value]=${encodeURIComponent(novel.toc_url)}`,
+      auth(),
+    ));
     const created = (listed.data ?? []).find((row) => row.toc_url === novel.toc_url);
     if (created) {
       const removed = await request(`/api/novels/${created.id}`, {
