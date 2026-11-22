@@ -646,11 +646,39 @@ mod tests {
     }
 
     #[test]
-    fn akatsuki_toc_pattern_extracts_sections_with_nbsp_indent() {
+    fn akatsuki_toc_pattern_extracts_new_markup_sections() {
         let settings = SiteSetting::load_all().unwrap();
         let setting = settings.iter().find(|s| s.name == "暁").unwrap();
         let toc_source = r#"
-<table class="list" cellpadding="0" cellspacing="0"><thead><tr><th>タイトル</th><th width="250">更新日時</th></tr></thead><tbody><tr><td style="border: 0; padding: 0;word-break:break-all;" colspan=\"2\"><b>ゼンヒ巡査部長編</b></td></tr><tr><td>&nbsp;&nbsp;<a href="/stories/view/313728/novel_id~31149">プロローグ:新任巡査部長、扇皇 ゼンヒ</a>&nbsp;</td><td class="font-s">2025年 10月 24日 07時 00分&nbsp;</td></tr><tr><td><a href="/stories/view/313729/novel_id~31149">Case1:三毛猫の捜索</a>&nbsp;</td><td class="font-s">2025年 10月 24日 12時 00分&nbsp;</td></tr></tbody></table>
+<ol class="mt-3 divide-y divide-border">
+  <li class="pt-4 pb-1 text-sm font-bold">ゼンヒ巡査部長編</li>
+  <li class="flex flex-wrap items-baseline justify-between gap-2 py-2">
+    <span class="flex min-w-0 items-baseline gap-2">
+      <span class="w-8 shrink-0 text-right text-xs text-subtle tabular-nums">1</span>
+      <a href="/stories/view/313728/novel_id~31149"
+         class="min-w-0 hover:text-brand-600 dark:hover:text-brand-300">
+        プロローグ:新任巡査部長、扇皇 ゼンヒ
+      </a>
+    </span>
+    <span class="flex flex-wrap items-baseline gap-x-3 text-xs text-subtle">
+      <span>4,845文字</span>
+      <span>2025年10月24日</span>
+    </span>
+  </li>
+  <li class="flex flex-wrap items-baseline justify-between gap-2 py-2">
+    <span class="flex min-w-0 items-baseline gap-2">
+      <span class="w-8 shrink-0 text-right text-xs text-subtle tabular-nums">2</span>
+      <a href="/stories/view/313729/novel_id~31149"
+         class="min-w-0 hover:text-brand-600 dark:hover:text-brand-300">
+        Case1:三毛猫の捜索
+      </a>
+    </span>
+    <span class="flex flex-wrap items-baseline gap-x-3 text-xs text-subtle">
+      <span>4,855文字</span>
+      <span>2025年10月24日</span>
+    </span>
+  </li>
+</ol>
 "#;
 
         let subtitles = parse_subtitles(setting, toc_source, &HashMap::new()).unwrap();
@@ -666,36 +694,79 @@ mod tests {
             subtitles[0].href,
             "/stories/view/313728/novel_id~31149".to_string()
         );
-        assert_eq!(
-            subtitles[0].subupdate.as_deref(),
-            Some("2025年 10月 24日 07時 00分")
-        );
+        assert_eq!(subtitles[0].subupdate.as_deref(), Some("2025年10月24日"));
         assert_eq!(subtitles[1].chapter, "");
         assert_eq!(subtitles[1].index, "313729");
+        assert_eq!(subtitles[1].subtitle, "Case1:三毛猫の捜索");
+    }
+
+    #[test]
+    fn akatsuki_info_patterns_extract_new_markup_header() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "暁").unwrap();
+        let toc_source = r#"
+<header>
+  <h1 class="min-w-0 text-xl font-bold">シャーレ前交番のヴァルキューレ警官</h1>
+  <p class="mt-1 text-sm text-muted">
+    <a href="/users/akntejfnq"
+       class="hover:text-brand-600 dark:hover:text-brand-300">欄干</a>
+  </p>
+  <p class="mt-3 whitespace-pre-line text-sm text-neutral-700 dark:text-neutral-300">あらすじです。</p>
+</header>
+"#;
+
+        let info = futures::executor::block_on(NovelInfo::from_toc_source(setting, toc_source));
+
+        assert_eq!(info.title.as_deref(), Some("シャーレ前交番のヴァルキューレ警官"));
+        assert_eq!(info.author.as_deref(), Some("欄干"));
+        assert_eq!(info.story.as_deref(), Some("あらすじです。"));
     }
 
     #[test]
     fn akatsuki_multipage_toc_fetches_all_pages() {
         let settings = SiteSetting::load_all().unwrap();
         let setting = settings.iter().find(|s| s.name == "暁").unwrap();
-        let first_page = r#"
-<span class="prev disabled">&lt; previous</span><span class="current">1</span><span><a href="/stories/index/novel_id~27990/page~2">2</a></span>
-<span class="next"><a href="/stories/index/novel_id~27990/page~2" rel="next">next &gt;</a></span>
-<span class="table_of_contents"><a href="/stories/index/page~3/novel_id~27990" rel="table_of_contents">最終ページ</a></span>
-<tr><td><a href="/stories/view/280978/novel_id~27990">第一話</a>&nbsp;</td><td class="font-s">2022年 12月30日 23時41分&nbsp;</td></tr>
-<tr><td><a href="/stories/view/281155/novel_id~27990">第二話</a>&nbsp;</td><td class="font-s">2023年 01月03日 20時09分&nbsp;</td></tr>
-"#;
-        let second_page = r#"
-<span class="prev"><a href="/stories/index/page~1/novel_id~27990" rel="prev">&lt; previous</a></span><span class="current">2</span>
-<span class="next"><a href="/stories/index/page~3/novel_id~27990" rel="next">next &gt;</a></span>
-<span class="table_of_contents"><a href="/stories/index/page~3/novel_id~27990" rel="table_of_contents">最終ページ</a></span>
-<tr><td><a href="/stories/view/281288/novel_id~27990">第三話</a>&nbsp;</td><td class="font-s">2023年 01月05日 22時41分&nbsp;</td></tr>
-"#;
-        let third_page = r#"
-<span class="prev"><a href="/stories/index/page~2/novel_id~27990" rel="prev">&lt; previous</a></span><span class="current">3</span>
-<span class="table_of_contents"><a href="/stories/index/page~3/novel_id~27990" rel="table_of_contents">最終ページ</a></span>
-<tr><td><a href="/stories/view/281445/novel_id~27990">第四話</a>&nbsp;</td><td class="font-s">2023年 01月09日 23時23分&nbsp;</td></tr>
-"#;
+        let page = |current: usize, max: usize, next: &str, id: &str, title: &str, date: &str| {
+            format!(
+                r#"
+<nav role="navigation" aria-label="ページ送り（上）">
+  <p class="text-subtle tabular-nums sm:hidden">{current} / {max} ページ</p>
+  {next}
+</nav>
+<ol class="mt-3 divide-y divide-border">
+  <li class="flex flex-wrap items-baseline justify-between gap-2 py-2">
+    <span class="flex min-w-0 items-baseline gap-2">
+      <span class="w-8 shrink-0 text-right text-xs text-subtle tabular-nums">1</span>
+      <a href="/stories/view/{id}/novel_id~27990"
+         class="min-w-0 hover:text-brand-600 dark:hover:text-brand-300">{title}</a>
+    </span>
+    <span class="flex flex-wrap items-baseline gap-x-3 text-xs text-subtle">
+      <span>930文字</span><span>{date}</span>
+    </span>
+  </li>
+</ol>
+"#
+            )
+        };
+        let first_page = page(
+            1,
+            3,
+            r#"<a href="/stories/index?novel_id=27990&amp;page=2" rel="next"
+   class="tap">次へ</a>"#,
+            "280978",
+            "第一話",
+            "2022年12月30日",
+        );
+        let second_page = page(
+            2,
+            3,
+            r#"<a href="/stories/index?novel_id=27990&amp;page=3" rel="next"
+   class="tap">次へ</a>"#,
+            "281288",
+            "第三話",
+            "2023年1月5日",
+        );
+        let third_page = page(3, 3, "", "281445", "第四話", "2023年1月9日");
         let http = MockHttpClient::new();
         let rate_limiter = FakeRateLimiter::new();
         let fetched_urls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -705,7 +776,7 @@ mod tests {
                 http: &http,
                 rate_limiter: &rate_limiter,
                 setting,
-                toc_source: first_page,
+                toc_source: &first_page,
                 url_captures: &HashMap::new(),
                 title: "",
                 progress: None,
@@ -716,9 +787,9 @@ mod tests {
                 move |_, _, _, next_url, _| {
                     fetched_urls.lock().unwrap().push(next_url.clone());
                     let page = if fetched_urls.lock().unwrap().len() == 1 {
-                        second_page.to_string()
+                        second_page.clone()
                     } else {
-                        third_page.to_string()
+                        third_page.clone()
                     };
                     Box::pin(async move { Ok(page) })
                 }
@@ -731,21 +802,19 @@ mod tests {
         assert_eq!(fetched_urls.len(), 2);
         assert_eq!(
             fetched_urls[0],
-            "https://www.akatsuki-novels.com/stories/index/novel_id~27990/page~2"
+            "https://www.akatsuki-novels.com/stories/index?novel_id=27990&page=2"
         );
         assert_eq!(
             fetched_urls[1],
-            "https://www.akatsuki-novels.com/stories/index/page~3/novel_id~27990"
+            "https://www.akatsuki-novels.com/stories/index?novel_id=27990&page=3"
         );
-        assert_eq!(subtitles.len(), 4);
+        assert_eq!(subtitles.len(), 3);
         assert_eq!(subtitles[0].index, "280978");
         assert_eq!(subtitles[0].subtitle, "第一話");
-        assert_eq!(subtitles[1].index, "281155");
-        assert_eq!(subtitles[1].subtitle, "第二話");
-        assert_eq!(subtitles[2].index, "281288");
-        assert_eq!(subtitles[2].subtitle, "第三話");
-        assert_eq!(subtitles[3].index, "281445");
-        assert_eq!(subtitles[3].subtitle, "第四話");
+        assert_eq!(subtitles[1].index, "281288");
+        assert_eq!(subtitles[1].subtitle, "第三話");
+        assert_eq!(subtitles[2].index, "281445");
+        assert_eq!(subtitles[2].subtitle, "第四話");
     }
 
     #[test]
