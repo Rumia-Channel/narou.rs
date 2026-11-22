@@ -15,7 +15,7 @@ append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: CakeCookie[ALLOWED_ADULT_NOVEL]=on
 sitename: *name
-version: 2.0
+version: 2.1
 
 # ------------------------------------------------------------
 # 書籍情報取得設定 (目次ページから取得)
@@ -29,9 +29,9 @@ story: <p class="mt-3 whitespace-pre-line text-sm text-neutral-700 dark:text-neu
 # 既存ライブラリとの重複登録を避けるためでもある。
 toc_url: \\k<top_url>/stories/index/novel_id~\\k<ncode>
 subtitles: |-
-  (?:<li class="[^"]*font-bold[^"]*">(?<chapter>.+?)</li>\s*)?<li class="[^"]*items-baseline[^"]*justify-between[^"]*">[\s\S]*?<a href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)"[^>]*>\s*(?<subtitle>.+?)\s*</a>[\s\S]*?(?<subupdate>\d{4}年\d{1,2}月\d{1,2}日)
+  (?:<li class="[^"]*font-bold[^"]*">(?<chapter>.+?)</li>\s*)?<li class="[^"]*items-baseline[^"]*justify-between[^"]*">(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?<a\b[^>]*href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)"[^>]*>\s*(?<subtitle>(?:[^<]|<(?:[^/]|/[^a]|/a[^>]))*?)\s*</a>(?:(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?(?<subupdate>\d{4}年\d{1,2}月\d{1,2}日))?(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?</li>
 # ページ送りは /stories/index?novel_id=N&page=M (HTML 内では &amp;)。
-next_toc: <a href="/stories/index\?novel_id=(?<ncode>\d+)(?:&amp;|&)page=(?<next_page>\d+)"\s+rel="next"
+next_toc: <a\b[^>]*href="/stories/index\?(?:[^"]*&(?:amp;)?)?novel_id=(?<ncode>\d+)(?:&amp;|&)page=(?<next_page>\d+)[^"]*"[^>]*rel="next"
 next_url: \\k<top_url>/stories/index?novel_id=\\k<ncode>&page=\\k<next_page>
 toc_page_max: /\s*(?<toc_page_max>\d+)\s*ページ
 

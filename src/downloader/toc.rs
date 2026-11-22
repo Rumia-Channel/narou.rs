@@ -531,6 +531,45 @@ mod tests {
         }
     }
 
+    /// 暁 (`www.akatsuki-novels.com`): 日付を欠いた `<li>` でも `</li>` を越えて
+    /// 次の話を飲み込んだり章見出しを取り違えたりせず、日付なしの話を
+    /// `subupdate == None` で保持したまま次の話も正しく抽出すること。
+    /// また `<a>` の属性順違いや `next_toc` の追加クエリパラメータも許容する。
+    #[test]
+    fn akatsuki_subtitles_do_not_cross_li_boundaries() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "www.akatsuki-novels.com")
+            .unwrap();
+        let toc_source = r#"
+<ul>
+<li class="font-bold">第一章</li>
+<li class="items-baseline justify-between"><a href="/stories/view/1/novel_id~10">日付なし話</a><time>no date</time></li>
+<li class="items-baseline justify-between"><a class="link" href="/stories/view/2/novel_id~10">正常な話</a><span>2025年10月24日</span></li>
+</ul>
+<a class="pager" href="/stories/index?foo=1&amp;novel_id=10&amp;page=2" rel="next">次へ</a>
+"#;
+        let subtitles = parse_subtitles(setting, toc_source, &HashMap::new()).unwrap();
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(subtitles[0].chapter, "第一章");
+        assert_eq!(subtitles[0].index, "1");
+        assert_eq!(subtitles[0].subtitle, "日付なし話");
+        assert_eq!(subtitles[0].subupdate, None);
+        assert_eq!(subtitles[1].chapter, "");
+        assert_eq!(subtitles[1].index, "2");
+        assert_eq!(subtitles[1].subtitle, "正常な話");
+        assert_eq!(subtitles[1].subupdate.as_deref(), Some("2025年10月24日"));
+
+        let caps = setting
+            .next_toc_pattern()
+            .unwrap()
+            .captures(toc_source)
+            .unwrap();
+        assert_eq!(&caps["next_page"], "2");
+        assert_eq!(&caps["ncode"], "10");
+    }
+
     #[test]
     fn multipage_reports_a_partial_listing_from_any_page() {
         // 目次は複数ページに分かれるので、2 ページ目以降の目印も拾う。
