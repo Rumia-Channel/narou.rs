@@ -39,6 +39,12 @@ pub async fn run_scheduled_plan(event: ScheduledEvent, env: &Env) -> Result<()> 
     if let Err(error) = runtime.collect_expired_assets().await {
         console_warn!("asset staging reaper failed: {error}");
     }
+    // Expired reader-lease GC: `novel_reader_leases` rows can accumulate on
+    // prefixes that are never re-admitted (production: 41k+ rows). Sweep a
+    // bounded page per tick; a failure is logged and retried on the next tick.
+    if let Err(error) = sweep_expired_reader_leases(&runtime).await {
+        console_warn!("reader lease reaper failed: {error}");
+    }
     let retirement_error = crate::object_migration::collect_legacy_retirements(env, runtime.write_db(), runtime.subrequests.clone()).await.err();
     if let Some(error) = &retirement_error { console_warn!("legacy object retirement collector failed: {error}"); }
     // Private transfer stage/ref GC (WorkerRepair's `transfer::collect`).
@@ -122,6 +128,17 @@ pub(crate) async fn recover_creation_reservations(runtime: &WorkerRuntime) -> Re
 
 fn creation_recovery_error(error: impl std::fmt::Display) -> NarouError {
     NarouError::Platform(format!("creation reservation recovery: {error}"))
+}
+
+/// Bounded per-tick GC for `novel_reader_leases` rows whose `expires_at` has
+/// passed. Leases on prefixes that are never re-admitted would otherwise
+/// accumulate forever. The tuple-`IN` form keeps the delete bounded without
+/// relying on `DELETE ... LIMIT` (which D1's SQLite dialect does not accept).
+async fn sweep_expired_reader_leases(runtime: &WorkerRuntime) -> Result<()> {
+    runtime.write_db()
+        .prepare("DELETE FROM novel_reader_leases WHERE (prefix, reader_id) IN (SELECT prefix, reader_id FROM novel_reader_leases WHERE expires_at <= unixepoch() LIMIT 500)")
+        .run().await.map_err(|error| NarouError::Platform(format!("reader lease reaper: {error}")))?;
+    Ok(())
 }
 
 /// 1 回の cron で reaper が処理する行数の上限。

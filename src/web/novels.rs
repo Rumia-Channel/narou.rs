@@ -86,19 +86,30 @@ async fn finish_read_response(
     }
 }
 
-fn map_application_error(error: ApplicationError) -> (StatusCode, String) {
-    match error {
-        ApplicationError::InvalidRequest(message) => (StatusCode::BAD_REQUEST, message),
-        ApplicationError::Conflict(message) => (StatusCode::CONFLICT, message),
-        ApplicationError::NotFound(message) => (StatusCode::NOT_FOUND, message),
-        ApplicationError::Platform(message) => {
-            let status = if message.contains("novel_recovering") || message.contains("recovery_required") {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else if message.contains("novel_busy") { StatusCode::LOCKED }
-            else if message.contains("novel_epoch_conflict") { StatusCode::CONFLICT }
-            else { StatusCode::INTERNAL_SERVER_ERROR };
-            (status, message)
-        },
+pub(super) fn map_application_error(error: ApplicationError) -> (StatusCode, String) {
+    let (status, _) = crate::application::external_api::http_error(&error);
+    (StatusCode::from_u16(status).expect("application status"), error.message().to_owned())
+}
+
+pub(super) fn epub_error_code(status: StatusCode, message: &str) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "bad_request",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::CONFLICT | StatusCode::LOCKED | StatusCode::SERVICE_UNAVAILABLE => {
+            let (mapped, code) = crate::application::external_api::http_error(
+                &ApplicationError::Platform(message.to_owned()),
+            );
+            if mapped == status.as_u16() {
+                code
+            } else if status == StatusCode::CONFLICT {
+                "conflict"
+            } else if status == StatusCode::LOCKED {
+                "novel_busy"
+            } else {
+                "service_unavailable"
+            }
+        }
+        _ => "internal_error",
     }
 }
 
@@ -1023,5 +1034,25 @@ mod response_lease_tests {
                 assert_eq!(memory.gate_info(&prefix).await.unwrap().pending_readers, 0);
             }
         });
+    }
+
+    #[test]
+    fn shared_error_mappers_preserve_access_fence_statuses_and_epub_codes() {
+        for (message, expected_status, expected_code) in [
+            ("novel_recovering: closed", StatusCode::SERVICE_UNAVAILABLE, "novel_recovering"),
+            ("novel_lease_expired: reader", StatusCode::SERVICE_UNAVAILABLE, "novel_lease_expired"),
+            ("recovery_required: journal", StatusCode::SERVICE_UNAVAILABLE, "recovery_required"),
+            ("novel_busy: writer", StatusCode::LOCKED, "novel_busy"),
+            ("sqlite: novel_epoch_conflict", StatusCode::CONFLICT, "novel_epoch_conflict"),
+            ("gate_owner_conflict: novels/site/x is owned by remove-v1:1", StatusCode::CONFLICT, "novel_epoch_conflict"),
+            ("storage unavailable", StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+        ] {
+            let (status, _) = map_application_error(ApplicationError::Platform(message.into()));
+            assert_eq!(status, expected_status, "{message}");
+            assert_eq!(epub_error_code(status, message), expected_code, "{message}");
+        }
+        assert_eq!(epub_error_code(StatusCode::NOT_FOUND, "ebook not found"), "not_found");
+        assert_eq!(epub_error_code(StatusCode::BAD_REQUEST, "bad"), "bad_request");
+        assert_eq!(epub_error_code(StatusCode::CONFLICT, "ebook moved"), "conflict");
     }
 }

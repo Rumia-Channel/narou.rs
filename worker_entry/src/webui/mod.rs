@@ -138,6 +138,10 @@ pub(crate) async fn leased_response(
     use futures::StreamExt;
     use narou_rs::platform::AssetStream;
     let response = match response {
+        Ok(response) if response.status_code() >= 400 => {
+            let _ = scope.release_all().await;
+            return Ok(response);
+        }
         Ok(response) => response,
         Err(error) => { let _ = scope.release_all().await; return Err(error); }
     };

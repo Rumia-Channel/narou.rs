@@ -923,7 +923,7 @@ impl NovelConverter {
                     NarouError::Platform("illustration directory has no parent".into())
                 })?;
                 let assets: Arc<dyn AssetStore> = Arc::new(
-                    crate::native::object_store::NativeObjectStore::from_root(root.to_path_buf())?,
+                    crate::native::object_store::NativeObjectStore::from_private_root(root.to_path_buf())?,
                 );
                 (assets, ObjectKey::try_new("novels")?)
             }

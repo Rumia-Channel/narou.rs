@@ -211,4 +211,28 @@ mod tests {
         );
         assert_eq!(section.postscript, "後書き");
     }
+
+    #[test]
+    fn akatsuki_body_pattern_extracts_reading_body() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.domain == "www.akatsuki-novels.com").unwrap();
+        let html = r#"
+<div class="reading-pane">
+  <div class="ad-slot my-6 text-center">広告</div>
+  <div class="whitespace-pre-line reading-body mt-6">　本文一行目。
+<ruby><rb>扇皇</rb><rp>（</rp><rt>せんおう</rt><rp>）</rp></ruby> ゼンヒ。
+　本文二行目。 </div>
+  <div class="ad-slot my-6 text-center">広告</div>
+</div>
+"#;
+
+        let (section, _) = parse_section_html(setting, html.to_string()).unwrap();
+
+        assert_eq!(
+            section.body,
+            "　本文一行目。\n<ruby><rb>扇皇</rb><rp>（</rp><rt>せんおう</rt><rp>）</rp></ruby> ゼンヒ。\n　本文二行目。 "
+        );
+        assert!(section.introduction.is_empty());
+        assert!(section.postscript.is_empty());
+    }
 }

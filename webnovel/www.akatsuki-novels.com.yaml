@@ -3,7 +3,11 @@
 name: &name 暁
 domain: www.akatsuki-novels.com
 top_url: https://\\k<domain>
-url: https?://\\k<domain>/stories/index/novel_id\~(?<ncode>\d+)
+# リニューアル後の正規 URL は /stories/index?novel_id=N のクエリ形式だが、
+# 旧パス形式も引き続き有効 (サイト内のパンくずリンクも旧形式)。両方受け付ける。
+url:
+  - https?://\\k<domain>/stories/index/novel_id\~(?<ncode>\d+)
+  - https?://\\k<domain>/stories/index\?novel_id=(?<ncode>\d+)
 encoding: UTF-8
 timezone: Asia/Tokyo
 confirm_over18: no
@@ -11,23 +15,25 @@ append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: CakeCookie[ALLOWED_ADULT_NOVEL]=on
 sitename: *name
-version: 1.2
+version: 2.1
 
 # ------------------------------------------------------------
-# 書籍情報取得設定
-title: id="LookNovel">(?<title>.+?)</a>
-author: 作者：<a href="/users/view/\d+">(?<author>.+?)</a>
-story: |-
-  <div class=" body-x1 body-normal body-w\d+">.+?<div>(?<story>.+?)</div>
+# 書籍情報取得設定 (目次ページから取得)
+title: <h1 class="min-w-0 text-xl font-bold">(?<title>.+?)</h1>
+author: <p class="mt-1 text-sm text-muted">\s*<a href="/users/[^"]+"[^>]*>\s*(?<author>.+?)\s*</a>
+story: <p class="mt-3 whitespace-pre-line text-sm text-neutral-700 dark:text-neutral-300">(?<story>.+?)</p>
 
 # ------------------------------------------------------------
 # 目次取得設定
+# 旧 toc_url (パス形式) を維持する。レコードの toc_url は更新時に引き直さないため、
+# 既存ライブラリとの重複登録を避けるためでもある。
 toc_url: \\k<top_url>/stories/index/novel_id~\\k<ncode>
 subtitles: |-
-  (?:<tr><td[^>]*colspan=\\"2\\"[^>]*><b>(?<chapter>.+?)</b></td></tr>)*<tr><td>(?:&nbsp;|\s)*<a href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)">(?<subtitle>.+?)</a>(?:&nbsp;|\s)*</td><td class="font-s">(?<subupdate>.+?)(?:&nbsp;|\s)*</td></tr>
-next_toc: <span class="next"><a href="(?<next_page>[^"]+)" rel="next">
-next_url: \\k<top_url>\\k<next_page>
-toc_page_max: <span class="table_of_contents"><a href="/stories/index/page~(?<toc_page_max>\d+)/novel_id~\d+" rel="table_of_contents">
+  (?:<li class="[^"]*font-bold[^"]*">(?<chapter>.+?)</li>\s*)?<li class="[^"]*items-baseline[^"]*justify-between[^"]*">(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?<a\b[^>]*href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)"[^>]*>\s*(?<subtitle>(?:[^<]|<(?:[^/]|/[^a]|/a[^>]))*?)\s*</a>(?:(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?(?<subupdate>\d{4}年\d{1,2}月\d{1,2}日))?(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?</li>
+# ページ送りは /stories/index?novel_id=N&page=M (HTML 内では &amp;)。
+next_toc: <a\b[^>]*href="/stories/index\?(?:[^"]*&(?:amp;)?)?novel_id=(?<ncode>\d+)(?:&amp;|&)page=(?<next_page>\d+)[^"]*"[^>]*rel="next"
+next_url: \\k<top_url>/stories/index?novel_id=\\k<ncode>&page=\\k<next_page>
+toc_page_max: /\s*(?<toc_page_max>\d+)\s*ページ
 
 # subdate(初投稿日)がない場合、一番最初のsubupdateで代用する
 subdate: no
@@ -36,14 +42,17 @@ error_message: この作品は作者の諸事情により非公開にしてい�
 
 # ------------------------------------------------------------
 # 本文取得設定
-body_pattern: |-
-  </h2>(?:<div>&nbsp;</div><div><b>前書き</b></div><div class="body-novel">(?<introduction>.+?)&nbsp;</div><hr width="100%"><div>&nbsp;</div>)?<div class="body-novel">(?<body>.+?)&nbsp;</div>(?:<div>&nbsp;</div><hr width="100%"><div>&nbsp;</div><div><b>後書き</b></div><div class="body-novel">(?<postscript>.+?)&nbsp;</div>)?
+# 本文は <div class="whitespace-pre-line reading-body ..."> の内側だけ。
+# 前書き/後書きは新デザインでは独立した要素を出さない。
+body_pattern: <div class="whitespace-pre-line reading-body[^"]*">(?<body>.+?)</div>
 
 introduction_pattern: null
 postscript_pattern: null
 
+# ロゴや広告の <img> を拾わないよう、本文だけを走査する。
 illust_current_url: null
-illust_grep_pattern: <img src="(?<src>.+?)" />
+illust_from_raw: false
+illust_grep_pattern: '<img\b[^>]*\ssrc="(?<src>[^"]+)"'
 
 # ------------------------------------------------------------
 # 小説情報からパースするための設定

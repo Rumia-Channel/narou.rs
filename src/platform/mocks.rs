@@ -797,16 +797,20 @@ impl super::access_fence::NovelAccessFence for MemoryObjectStore {
             let gate = gates.entry(gate_key_of(prefix)).or_insert_with(MemoryGate::open);
             gate.prune(now);
             if gate.state != af::GateState::Open || gate.epoch != lease.epoch {
-                return Err(af::gate_epoch_error(prefix, lease.epoch, gate.epoch));
-            }
-            let Some(current) = gate.readers.get_mut(&lease.reader_id) else {
                 return Err(af::gate_closed_error(prefix));
+            }
+            // `prune` already dropped expired rows, so a missing id is a dead
+            // admission; a same-id row at another epoch is a stale token.
+            let Some(current) = gate.readers.get_mut(&lease.reader_id) else {
+                return Err(af::lease_expired_error(prefix));
             };
-            if current.0!=lease.epoch{return Err(af::gate_closed_error(prefix));}current.1=now.saturating_add(lease_secs.clamp(1,af::READER_LEASE_SECS));
+            if current.0 != lease.epoch { return Err(af::gate_closed_error(prefix)); }
+            current.1 = now.saturating_add(lease_secs.clamp(1, af::READER_LEASE_SECS));
+            let expires_at = current.1;
             Ok(af::GateLease {
                 reader_id: lease.reader_id.clone(),
                 epoch: gate.epoch,
-                expires_at: current.1,
+                expires_at,
             })
         })
     }
@@ -818,8 +822,11 @@ impl super::access_fence::NovelAccessFence for MemoryObjectStore {
     ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
             let mut gates = self.gate_map();
-            if let Some(gate) = gates.get_mut(&gate_key_of(prefix))&&gate.readers.get(&lease.reader_id).is_some_and(|(epoch,_)|*epoch==lease.epoch) {
-                gate.readers.remove(&lease.reader_id);
+            if let Some(gate) = gates.get_mut(&gate_key_of(prefix)) {
+                gate.prune(super::transfer_stage::now_secs());
+                if gate.readers.get(&lease.reader_id).is_some_and(|(epoch,_)|*epoch==lease.epoch) {
+                    gate.readers.remove(&lease.reader_id);
+                }
             }
             Ok(())
         })

@@ -34,7 +34,7 @@ use self::auth::AuthState;
 use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
 use self::persistence::{PersistenceService, SectionLoadFailure, compute_section_hash};
-use crate::application::novel_access::{AccessOrigin, NovelAccess, NovelReadLease, NovelWriteGuard};
+use crate::application::novel_access::{AccessOrigin, NovelAccess, NovelWriteGuard};
 
 use crate::platform::{CookieStore, LoginGroup};
 use self::section::{SectionCache, download_section};
@@ -1969,7 +1969,7 @@ impl Downloader {
         let operation: Result<DownloadResult> = async {
         let old_toc = self
             .persistence
-            .load_toc(access.read()?, &object_keys)
+            .load_toc(access.ensure_read().await?, &object_keys)
             .await?;
         let old_subtitles: HashMap<String, &SubtitleInfo> = old_toc
             .as_ref()
@@ -2103,7 +2103,7 @@ impl Downloader {
         // パターンで取得するので、どのサイトでも索引を読む。
         let mut illustration_store = self
             .persistence
-            .load_cache(access.read()?, &object_keys)
+            .load_cache(access.ensure_read().await?, &object_keys)
             .await?
             .unwrap_or_default();
         if setting.illust_grep_pattern.is_none() {
@@ -2116,6 +2116,10 @@ impl Downloader {
         }
         // 索引が空なら突き合わせる相手が無いので一覧は取らない (小説 1 件に
         // つき 1〜2 サブリクエスト増えるため、必要なときだけ)。
+        // The store listing/stat enumeration below does not consume the read
+        // lease; release it so a slow S3 LIST cannot leave an idle lease to
+        // expire and stall a writer drain waiting on this novel's readers.
+        let _ = access.release_read().await;
         let mut stored_illustrations = if illustration_store.source_count() > 0 {
             let names = match self.stored_illustration_names(&object_keys).await {
                 // 一覧が取れて空でなければそれを信じる (通常経路)。
@@ -2153,10 +2157,11 @@ impl Downloader {
             // even if it fails before its first budget checkpoint is saved.
             self.persistence.clear_download_resume(&write, &object_keys).await?;
         }
+        let _ = access.release_read().await;
         let existing_names = self.persistence.list_novel_object_names(&object_keys).await?;
         let existing_sections = PersistenceService::existing_section_indices(&existing_names);
         let mut checkpointed_subtitles = if resume_from > 0 {
-            self.persistence.load_download_resume(access.read()?, &object_keys).await?
+            self.persistence.load_download_resume(access.ensure_read().await?, &object_keys).await?
         } else {
             None
         }.map(|toc| (toc.toc_url, toc.subtitles));
@@ -2228,7 +2233,7 @@ impl Downloader {
             } else if force {
                 (true, None)
             } else {
-                self.section_needs_download(access.read()?, SectionDecision {
+                self.section_needs_download(&mut access, SectionDecision {
                     setting: &mut setting,
                     auth: &mut auth,
                     latest: subtitle,
@@ -2271,9 +2276,16 @@ impl Downloader {
         // directly, without collecting the prefix before section execution.
         use futures::StreamExt as _;
         let resume_persistence = self.persistence.clone();
-        let mut resumed_sections = Box::pin(resume_persistence.stream_sections_ordered(
-            access.read()?.clone(), &object_keys, &subtitles[restored_count..resume_from],
-        ));
+        // Only build the ordered reader when a restored prefix actually
+        // exists; an empty slice needs neither the clone nor an extra poll.
+        let resumed_sections = if restored_count < resume_from {
+            futures::future::Either::Left(resume_persistence.stream_sections_ordered(
+                access.ensure_read().await?.clone(), &object_keys, &subtitles[restored_count..resume_from],
+            ))
+        } else {
+            futures::future::Either::Right(futures::stream::empty())
+        };
+        let mut resumed_sections = Box::pin(resumed_sections);
 
         let section_result: Result<()> = async {
             for (section_index, (subtitle, mut plan)) in subtitles.iter().zip(section_plans).enumerate() {
@@ -2286,6 +2298,7 @@ impl Downloader {
                     }
                 }
                 let resumed = if (restored_count..resume_from).contains(&section_index) {
+                    access.ensure_read().await?;
                     match resumed_sections.next().await {
                         Some(Ok(section)) => Some(section),
                         Some(Err(SectionLoadFailure::Missing { section_index })) => {
@@ -2301,7 +2314,7 @@ impl Downloader {
                         ))),
                     }
                 } else if plan.resumed {
-                    Some(self.persistence.load_section(access.read()?, &object_keys, subtitle)
+                    Some(self.persistence.load_section(access.ensure_read().await?, &object_keys, subtitle)
                         .await?.ok_or_else(|| NarouError::Platform(format!(
                             "preserved section {} is missing from storage", subtitle.index,
                         )))?)
@@ -2310,7 +2323,7 @@ impl Downloader {
                 };
                 if defer_strong_update && !force && !plan.resumed && plan.needs_download {
                     let (needs_download, predownloaded) = self
-                        .section_needs_download(access.read()?, SectionDecision {
+                        .section_needs_download(&mut access, SectionDecision {
                             setting: &mut setting,
                             auth: &mut auth,
                             latest: subtitle,
@@ -2348,6 +2361,12 @@ impl Downloader {
                         .map(|resumed| &resumed.element)
                         .or_else(|| plan.predownloaded.as_ref().map(|(section, _)| section));
                     if let Some(section) = section {
+                        // `resumed_sections` still shares `access.read`: releasing
+                        // it here would orphan the stream's lease token, so keep
+                        // the reader admitted until the last restored section.
+                        if section_index + 1 >= resume_from {
+                            let _ = access.release_read().await;
+                        }
                         self.download_illustration(
                             &write,
                             &setting,
@@ -2398,14 +2417,17 @@ impl Downloader {
 
                     let (section, raw_html) = match plan.predownloaded {
                         Some(downloaded) => downloaded,
-                        None => self
+                        None => {
+                            let _ = access.release_read().await;
+                            self
                             .download_section_with_logins(
                                 &mut setting,
                                 &mut auth,
                                 subtitle,
                                 &toc_url,
                             )
-                            .await?,
+                            .await?
+                        },
                     };
                     let had_existing = plan.existed;
                     if had_existing {
@@ -2419,7 +2441,7 @@ impl Downloader {
                         }
                         if let Some(timestamp) = cache_dir.as_deref() {
                             let cached = self.persistence
-                                .cache_section(&write, access.read()?, &object_keys, timestamp, previous)
+                                .cache_section(&write, access.ensure_read().await?, &object_keys, timestamp, previous)
                                 .await?;
                             if cached && !cache_version_recorded {
                                 self.persistence.record_cache_version(&write, &object_keys, timestamp).await?;
@@ -2447,6 +2469,13 @@ impl Downloader {
                         self.persistence
                             .save_raw(&write, &object_keys, subtitle, &raw_html)
                             .await?;
+                    }
+                    // Same guard as above: `resumed_sections` shares `access.read`
+                    // while restored sections remain, so only release once the
+                    // last restored index passed — idle reader leases must not
+                    // be held across the (possibly long) illustration fetch.
+                    if section_index + 1 >= resume_from {
+                        let _ = access.release_read().await;
                     }
                     self.download_illustration(
                             &write,
@@ -3303,7 +3332,7 @@ impl Downloader {
     /// 比較済みの本文を保存・挿絵走査へ渡せば二重取得は起きない。
     async fn section_needs_download(
         &mut self,
-        lease: &mut NovelReadLease,
+        access: &mut NovelAccess,
         probe: SectionDecision<'_>,
     ) -> Result<(bool, Option<(SectionElement, String)>)> {
         let SectionDecision {
@@ -3372,12 +3401,15 @@ impl Downloader {
         }
 
         if strong_update && let Some(basis_date) = strong_basis_date {
-            let Some(old_section) = self.persistence.load_section(lease, keys, old).await? else {
+            let Some(old_section) = self.persistence.load_section(access.ensure_read().await?, keys, old).await? else {
                 return Ok((true, None));
             };
             if date_string_to_ymd_with_timezone(basis_date, timezone)
                 == section_timestamp_ymd(old_section.download_time.as_deref(), timezone)
             {
+                // The comparison fetch can outlive the 30s lease TTL; release
+                // the idle lease first so it does not stall a writer drain.
+                let _ = access.release_read().await;
                 let downloaded = self
                     .download_section_with_logins(setting, auth, latest, toc_url)
                     .await?;
@@ -6603,8 +6635,9 @@ is_narou: false
             let mut latest = old.clone();
             latest.file_subtitle = new_name.to_string();
             let mut auth = super::auth::AuthState::new(None);
+            let mut access = super::NovelAccess::read_only(test_read(&downloader.persistence, &keys).await);
             let (needs, _) = downloader.section_needs_download(
-                &mut test_read(&downloader.persistence, &keys).await,
+                &mut access,
                 super::SectionDecision {
                     setting: &mut setting,
                     auth: &mut auth,

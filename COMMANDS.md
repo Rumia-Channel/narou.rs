@@ -288,6 +288,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Native の `update.max-parallel-domains` 設定対応（既定4）。対象小説をサイト系列別にグルーピングし、系列ごとにワーカーを割り当てて並列にダウンロードする。同一系列内は常に直列のまま処理される。Native Web UI も同じ更新経路を使い、1指定・フォース指定・系列が1種類の場合は逐次処理にフォールバックする。
 - Workers の取得・手動更新・全件更新・タグ更新・定期更新・作者確認は、D1 が空き枠へ動的に割り当てる4つの取得専用 Worker / Queue で実行する。同じ系列は直列、異なる系列は最大4系列まで並列で、固定ハッシュによる系列の衝突は作らない。各 isolate の重い処理は1件のまま維持し、EPUB 配信と取得の実行枠を分離する。待機前に実効 YAML から系列・対象を保存し、枠とメモリを解放してから再配信する。旧 Queue は既存メッセージの取り込み専用として残す。配備前に migration `0020_acquisition_lanes.sql` と取得専用 Worker の配備が必要で、`update.max-parallel-domains` は Native 専用のまま。
 - Workers の定期処理は計画・滞留回収中に変換を再配信せず、メモリ枠の解放後に待機変換を起こす。計画失敗時もこの再配信を行い、容量待ちへ戻された変換が定期処理ごとに再び待機し続ける状態を防ぐ。
+- SQLite 管理時の自動変換（並列ドメイン更新 → 変換）が `conflicting live SQL authority for novels` で失敗しない。FS 側ゲートが共有 SQLite 接続を `try_lock` できない場合は、専用の読み取り接続でコミット済み authority を読む（ロック競合を `Conflict` と誤判定しない）。変換の private snapshot（`.narou-snapshot-*`）はライブラリ本体の `db.sqlite` を参照しない（issue #50）。
 - `update.disabled-author-tracking` で、一括更新後の追跡作者からの新作品追加を停止できる。Native／Worker 共通の設定で、自動確認だけを止め、利用者が明示した作者確認は維持する。
 - 全件更新時の凍結スキップ、個別指定時の凍結メッセージ
 - 終了コード: エラー数（最大127）、中断時126
@@ -532,6 +533,7 @@ Cloudflare Workers では Cloudflare Zero Trust の Service Token (`CF-Access-Cl
 - 作品レコードを Native／Worker 共通の変換入口へ渡し、完結タグ・掲載日・サイト名を使う題名展開をオンデマンド変換でも反映する。
 - `sqlite.mirror-files=false` の変換用取り出しは全ページを走査するが、目次・本文・設定・挿絵索引・表紙だけを対象にする。4,096 件を超えても取りこぼさず、生成物・履歴を一時ファイルとして所有しない。既存の実ファイルは変更しない。
 - Native CLI は、元の操作の読み書きガードを保持した専用 private snapshot で `setting.ini` / `replace.txt`・本文・挿絵を読み、生成物の公開だけを元のガードへ戻す。読み出しのために canonical のミラーを復元・削除せず、実効 ObjectStore の保存値を使う。同期 I/O は既存 Tokio 文脈でも二重 runtime にしない（別ブランチで統合検証中）。
+- 変換の private snapshot（`.narou-snapshot-*`）と private capability store は、ライブラリ本体の `.narou/db.sqlite` を gate authority として参照しない。共有 SQLite 接続が他スレッドでロック中でも変換は `conflicting live SQL authority` で失敗しない（issue #50）。
 - Native のファイル変換は、個別 INI・ローカル設定・ライブラリ探索の I/O エラーを既定値として握り潰さず、呼び出し元へ返す。純粋なテキスト描画と Native I/O の構築を分離する（別ブランチで統合検証中）。
 - 個別 `setting.ini` は Native CLI / Web の変換子プロセスでも実効 ObjectStore から読み、SQLite 移行前の実ファイルが残っていても正準保存値を優先する。`novel_title` / `novel_author` を含む再編集・設定解除を反映し、読み出しのために既存ファイルを上書き・削除しない。YAML 管理とライブラリ外の読み出しは従来どおり（issue #37）。
 - 挿絵の一時取り出しが途中で失敗した場合も、新規作成した完全／不完全ファイルを片付け、再試行時に不完全な画像を再利用しない。

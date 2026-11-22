@@ -104,7 +104,7 @@ pub(crate) async fn build_epub_with_services(
     let record = match services.app.content.read_record(&mut scope, narou_rs::platform::NovelId(id)).await {
         Ok(Some(record)) => record,
         Ok(None) => return Response::error("Not Found", 404),
-        Err(error) => return Response::error(format!("Repository error: {error}"), 500),
+        Err(error) => return crate::webui::application_error_response(&error),
     };
     let is_virtual = record.ncode.as_deref().is_some_and(narou_rs::virtual_novel::is_virtual_ncode);
     if virtual_only && !is_virtual { return Response::error("Not Found", 404); }
@@ -265,6 +265,18 @@ pub(crate) async fn build_epub_with_services(
         },
         None => preparation.await,
     }
+    };
+    let result = match result {
+        Err(worker::Error::RustError(message)) => {
+            let app_error = narou_rs::application::ApplicationError::Platform(message);
+            let (status, _) = narou_rs::application::external_api::http_error(&app_error);
+            if status != 500 {
+                crate::webui::application_error_response(&app_error)
+            } else {
+                Err(worker::Error::RustError(app_error.message().to_owned()))
+            }
+        }
+        other => other,
     };
     crate::webui::leased_response(result, scope).await
 }

@@ -57,9 +57,10 @@ pub fn http_error(error: &ApplicationError) -> (u16, &'static str) {
         ApplicationError::NotFound(_) => (404, "not_found"),
         ApplicationError::Conflict(_) => (409, "conflict"),
         ApplicationError::Platform(message) if message.contains("novel_recovering:") => (503, "novel_recovering"),
+        ApplicationError::Platform(message) if message.contains("novel_lease_expired:") => (503, "novel_lease_expired"),
         ApplicationError::Platform(message) if message.contains("recovery_required:") => (503, "recovery_required"),
         ApplicationError::Platform(message) if message.contains("novel_busy:") => (423, "novel_busy"),
-        ApplicationError::Platform(message) if message.contains("novel_epoch_conflict:") || message.contains("gate_epoch_conflict:") => (409, "novel_epoch_conflict"),
+        ApplicationError::Platform(message) if message.contains("novel_epoch_conflict") || message.contains("gate_owner_conflict:") || message.contains("gate_epoch_conflict:") => (409, "novel_epoch_conflict"),
         ApplicationError::Platform(_) => (500, "internal_error"),
     }
 }
@@ -1404,9 +1405,12 @@ mod tests {
     fn gate_errors_keep_their_public_recovery_and_conflict_statuses() {
         for (message, expected) in [
             ("novel_recovering: closed", (503, "novel_recovering")),
+            ("novel_lease_expired: reader", (503, "novel_lease_expired")),
             ("recovery_required: journal", (503, "recovery_required")),
             ("novel_busy: writer", (423, "novel_busy")),
             ("novel_epoch_conflict: stale", (409, "novel_epoch_conflict")),
+            ("sqlite: novel_epoch_conflict", (409, "novel_epoch_conflict")),
+            ("gate_owner_conflict: novels/site/x is owned by remove-v1:1", (409, "novel_epoch_conflict")),
             ("gate_epoch_conflict: stale", (409, "novel_epoch_conflict")),
             ("storage unavailable", (500, "internal_error")),
         ] {

@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "narou_rs"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "aozora_epub3_lite",
  "argon2",
@@ -1974,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "narou_transfer_wasm"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "futures",
  "js-sys",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "narou_worker"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "base64 0.23.1",
  "brotli",

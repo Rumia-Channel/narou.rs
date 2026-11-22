@@ -239,8 +239,10 @@ impl S3Store {
                 return Err(NarouError::Platform("invalid S3 multipart completion document".into()));
             }
             xml_text(&response.body, "ETag")?;
-            let metadata = self.stat_object(key).await?.ok_or_else(|| NarouError::Platform("completed S3 object missing".into()))?;
-            if metadata.size != total { return Err(NarouError::Platform("completed S3 object length mismatch".into())); }
+            if !super::super::staging::is_staging_key(key) {
+                let metadata = self.stat_object(key).await?.ok_or_else(|| NarouError::Platform("completed S3 object missing".into()))?;
+                if metadata.size != total { return Err(NarouError::Platform("completed S3 object length mismatch".into())); }
+            }
             self.save_reservation(key, None).await
         }.await;
         if result.is_err() { let _ = self.abort_upload(key, &upload_id).await; }

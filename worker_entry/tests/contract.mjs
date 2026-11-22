@@ -1083,7 +1083,8 @@ if (!IS_LOCAL && !UNCONFIGURED) {
     const client = transferClient(BASE_URL, TOKEN);
     client.extraHeaders = accessHeaders();
     // `本文/1 第1話.yaml` は FileRole::Body + is_content_key で stage→copy を
-    // 必ず踏む。挿絵 (pool 経路) も含めて両系統の copy を同時に確認する。
+    // 必ず踏む。挿絵の `挿絵/cover.png` はプール (PUT) 経路を通るので、両系統の
+    // 書き込みを同時に確認する。
     // slug は実行ごとに一意にし、既存レコードへの skip で検証が素通りになる
     // のを防ぐ。
     const slug = `stage-copy-${crypto.randomUUID().slice(0, 8)}`;

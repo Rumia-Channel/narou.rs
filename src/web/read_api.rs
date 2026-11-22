@@ -172,7 +172,7 @@ pub async fn epub(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
     };
     let response = match super::novels::serve_epub(&state, &mut reads, id, &record, &novel_dir).await {
         Ok(response) => response,
-        Err((status, message)) => error(status, "internal_error", &message),
+        Err((status, message)) => error(status, super::novels::epub_error_code(status, &message), &message),
     };
     super::novels::leased_response(response, reads)
 }

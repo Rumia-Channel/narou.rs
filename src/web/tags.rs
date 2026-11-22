@@ -35,20 +35,7 @@ async fn apply_tag_change(
             tags,
         })
         .await
-        .map_err(|error| match error {
-            crate::application::ApplicationError::InvalidRequest(message) => {
-                (StatusCode::BAD_REQUEST, message)
-            }
-            crate::application::ApplicationError::Conflict(message) => {
-                (StatusCode::CONFLICT, message)
-            }
-            crate::application::ApplicationError::NotFound(message) => {
-                (StatusCode::NOT_FOUND, message)
-            }
-            crate::application::ApplicationError::Platform(message) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, message)
-            }
-        })?;
+        .map_err(super::novels::map_application_error)?;
     // 一覧とタグ表示の両方を再読込させる (イベント選択は native/Worker 共通)。
     for event in mutation_events(MutationNotice::TableAndTags) {
         state.push_server.broadcast_raw(event);
