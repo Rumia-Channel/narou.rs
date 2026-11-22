@@ -510,14 +510,23 @@ impl S3Store {
             let source=self.stream_read(source).await?.ok_or_else(||NarouError::NotFound(source.to_string()))?;
             return Box::pin(self.conditional_stream_write(destination,source,u64::MAX,&sha)).await.map(|_|());
         }
-        let metadata = self.stat_object(source).await?
-            .ok_or_else(|| NarouError::NotFound(source.to_string()))?;
+        // staging ソースは直前に同一ストアへ PUT した一時オブジェクト。PUT 直後の
+        // Range stat は一部の S3 互換 (Wasabi) で「実在するのに 404 /
+        // Content-Range 不明の 416」を返し得るため、存在確認を stat に頼らず
+        // COPY 自体に任せる。失敗した COPY は 4xx で明示される。
+        let staged_source = super::staging::is_staging_key(source);
+        let metadata: Option<ObjectMetadata> = if staged_source {
+            None
+        } else {
+            Some(self.stat_object(source).await?
+                .ok_or_else(|| NarouError::NotFound(source.to_string()))?)
+        };
         let copy_source = if self.location.has_pool_alternate(source) && !self.pool_exists(source).await? {
             format!("/{}/{}", self.location.bucket(),
                 s3_sigv4::canonical_path(&self.location.legacy_storage_key(source)).trim_start_matches('/'))
         } else { self.location.copy_source(source) };
         let content_type = content_type_for_key(destination).unwrap_or("application/octet-stream");
-        let etag = metadata.etag.as_ref().map(|value| format!("\"{value}\""));
+        let etag = metadata.as_ref().and_then(|metadata| metadata.etag.as_ref()).map(|value| format!("\"{value}\""));
         let mut copy_headers = vec![("x-amz-copy-source", copy_source.as_str()),
             ("x-amz-metadata-directive", "REPLACE"), ("content-type", content_type)];
         if let Some(etag) = etag.as_deref() { copy_headers.push(("x-amz-copy-source-if-match", etag)); }
@@ -547,10 +556,15 @@ impl S3Store {
                 destination.as_ref()
             )));
         }
-        let copied = self.stat_object(destination).await?
-            .ok_or_else(|| NarouError::Platform("S3 copied object is missing".into()))?;
-        if copied.size != metadata.size {
-            return Err(NarouError::Platform("S3 copied object length mismatch".into()));
+        // コピー結果の存在確認。staging ではソース/コピー結果とも PUT・COPY 直後の
+        // stat が不安定なため、COPY 完了文書を存在証明として stat を行わない。
+        // 非 staging ソースのときだけコピー結果を stat して長さを突き合わせる。
+        if let Some(metadata) = &metadata {
+            let copied = self.stat_object(destination).await?
+                .ok_or_else(|| NarouError::Platform("S3 copied object is missing".into()))?;
+            if copied.size != metadata.size {
+                return Err(NarouError::Platform("S3 copied object length mismatch".into()));
+            }
         }
         Ok(())
     }
@@ -893,6 +907,86 @@ mod tests {
         futures::executor::block_on(AssetStore::move_or_copy(&store, &source, &destination)).unwrap();
         assert_eq!(http.requested_urls(), vec![format!("GET {source_url}"), format!("PUT {destination_url}"),
             format!("GET {destination_url}"), format!("DELETE {source_url}")]);
+    }
+
+    // PUT 直後の staging オブジェクトへの Range stat は一部の S3 互換で
+    // 「実在するのに 404 / Content-Range 不明の 416」を返し得る。staging
+    // ソースの copy は stat に頼らず COPY 自体で存在を確認するため、
+    // GET を一切 mock しなくても完了しなければならない (pre-fix は
+    // ソース stat の GET が "no canned response" で失敗する)。
+    #[test]
+    fn staging_copy_never_stats_source_or_destination() {
+        let http = Arc::new(MockHttpClient::new());
+        let store = store(http.clone());
+        let source = key(".narou-staging/1700000000-0-0123456789abcdef0123456789abcdef");
+        let destination = key("novels/site/title/toc.yaml");
+        let destination_url = store.location.object_url(&destination);
+        http.add_text(&destination_url, 200,
+            "<?xml version=\"1.0\"?><CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>2026-11-22T00:00:00.000Z</LastModified><ETag>\"opaque-etag\"</ETag></CopyObjectResult>");
+
+        futures::executor::block_on(AssetStore::copy(&store, &source, &destination)).unwrap();
+        assert_eq!(http.requested_urls(), vec![format!("PUT {destination_url}")]);
+    }
+
+    #[test]
+    fn staging_move_never_stats_and_deletes_source() {
+        let http = Arc::new(MockHttpClient::new());
+        let store = store(http.clone());
+        let source = key(".narou-staging/1700000000-1-fedcba9876543210fedcba9876543210");
+        let destination = key("novels/site/title/本文/1.yaml");
+        let source_url = store.location.object_url(&source);
+        let destination_url = store.location.object_url(&destination);
+        http.add_text(&destination_url, 200,
+            "<?xml version=\"1.0\"?><CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>2026-11-22T00:00:00.000Z</LastModified><ETag>\"opaque-etag\"</ETag></CopyObjectResult>");
+        // staging キーの delete は journal も消すため、オブジェクトと
+        // journal の両方を mock する (どちらも GET ではなく DELETE)。
+        let journal_url = store.location.object_url(&key(".narou-stage-journal/1700000000-1-fedcba9876543210fedcba9876543210"));
+        http.add_response(&source_url, HttpResponse { status: 204, headers: Vec::new(), body: Vec::new() });
+        http.add_response(&journal_url, HttpResponse { status: 204, headers: Vec::new(), body: Vec::new() });
+
+        futures::executor::block_on(AssetStore::move_or_copy(&store, &source, &destination)).unwrap();
+        assert_eq!(http.requested_urls(), vec![format!("PUT {destination_url}"), format!("DELETE {source_url}"), format!("DELETE {journal_url}")]);
+    }
+
+    /// 実 S3 互換ストアで `write_small` → `AssetStore::copy` の staging 経路を
+    /// 通す実測テスト。PUT 直後の stat が不安定な環境 (Wasabi 等) でも、
+    /// staging ソースは stat に頼らず COPY 自体で存在を確認するため成功する
+    /// ことを確認する。ローカル MinIO / Wasabi 等に向けて
+    /// `NAROU_TEST_S3_ENDPOINT` / `NAROU_TEST_S3_BUCKET` / `NAROU_TEST_S3_REGION` /
+    /// `NAROU_TEST_S3_PREFIX` / `NAROU_TEST_S3_ACCESS_KEY` / `NAROU_TEST_S3_SECRET`
+    /// を設定して `--ignored` で実行する。
+    #[tokio::test]
+    #[ignore = "requires a reachable S3-compatible store and credentials"]
+    async fn live_staging_copy_survives_immediate_copy() {
+        use crate::platform::ObjectStore;
+        let get = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+        let (Some(endpoint), Some(bucket), Some(region), Some(prefix), Some(access), Some(secret)) = (
+            get("NAROU_TEST_S3_ENDPOINT"), get("NAROU_TEST_S3_BUCKET"), get("NAROU_TEST_S3_REGION"),
+            get("NAROU_TEST_S3_PREFIX"), get("NAROU_TEST_S3_ACCESS_KEY"), get("NAROU_TEST_S3_SECRET"),
+        ) else {
+            eprintln!("skipping: NAROU_TEST_S3_* env vars not all set");
+            return;
+        };
+        let http: Arc<dyn crate::platform::HttpClient> = Arc::new(
+            crate::native::http::NativeHttpClient::new("narou_rs-s3-live-test").unwrap());
+        let store = S3Store::new(S3StoreConfig {
+            endpoint, bucket, region, prefix,
+            illustration_dedup: false, access_key_id: access, secret_access_key: secret,
+        }, http, Arc::new(SystemClock)).unwrap();
+
+        let stamp = format!("live-copy-{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+        let stage = key(&format!(".narou-staging/{stamp}-0-{}", "a".repeat(32)));
+        let dest = key(&format!("{stamp}/copied.bin"));
+        let payload = b"staging copy live test payload".to_vec();
+
+        store.write_small(&stage, payload.clone()).await.expect("stage write");
+        // PUT 直後の stat が不安定でも copy は COPY 自体で存在を確認する。
+        AssetStore::copy(&store, &stage, &dest).await.expect("stage->dest copy");
+        let copied = store.read_small(&dest).await.expect("read dest").expect("dest exists");
+        assert_eq!(copied, payload);
+        ObjectStore::delete(&store, &stage).await.ok();
+        ObjectStore::delete(&store, &dest).await.ok();
     }
 
     #[test]
