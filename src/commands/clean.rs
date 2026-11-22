@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use narou_rs::db;
 use narou_rs::application::novel_access::NovelWriteGuard;
-use narou_rs::downloader::persistence::section_filename;
 use narou_rs::downloader::{RAW_DATA_DIR, SECTION_SAVE_DIR};
 
 use super::download;
@@ -101,16 +100,15 @@ fn clean_novel(write: NovelWriteGuard, remove: bool) -> Result<(), String> {
 }
 
 /// トークンに現れる話数 (本文/raw) の期待ファイル名 stem。
+///
+/// narou.rb の `Command::Clean#find_orphans` と同じく `index` と `file_subtitle`
+/// をそのまま連結する。`section_filename()` を通すと末尾の空白やドットが
+/// サニタイズで落とされ、Ruby 版が作った末尾空白付きのファイルを誤って
+/// 孤児と判定してしまうため、ここではサニタイズしない。
 fn expected_section_stems(toc: &narou_rs::downloader::TocFile) -> HashSet<String> {
     toc.subtitles
         .iter()
-        .map(|subtitle| {
-            let filename = section_filename(subtitle);
-            filename
-                .strip_suffix(".yaml")
-                .unwrap_or(&filename)
-                .to_string()
-        })
+        .map(|subtitle| format!("{} {}", subtitle.index, subtitle.file_subtitle))
         .collect()
 }
 
@@ -227,5 +225,48 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(orphan_names, vec!["orphan.html", "orphan.yaml"]);
 
+    }
+
+    /// Ruby 版が作った file_subtitle 末尾の半角空白をサニタイズで落とさず、
+    /// 目次から参照されている本文/raw を孤児と誤判定しないこと。
+    #[test]
+    fn clean_keeps_sections_with_trailing_space_in_file_subtitle() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path();
+        std::fs::create_dir_all(base.join("raw")).unwrap();
+        std::fs::create_dir_all(base.join("本文")).unwrap();
+
+        let trailing = "9　お店妖精からの依頼 ";
+        let toc = TocFile {
+            title: "title".into(),
+            author: "author".into(),
+            toc_url: "https://example.com".into(),
+            story: None,
+            subtitles: vec![SubtitleInfo {
+                index: "65".into(),
+                href: "65".into(),
+                chapter: String::new(),
+                subchapter: String::new(),
+                subtitle: trailing.into(),
+                file_subtitle: trailing.into(),
+                subdate: "2020-05-15".into(),
+                subupdate: None,
+                download_time: None,
+                download_revision: 0,
+            }],
+            novel_type: None,
+        };
+        let referenced_raw = format!("65 {trailing}.html");
+        let referenced_section = format!("65 {trailing}.yaml");
+        std::fs::write(base.join("raw").join(&referenced_raw), "").unwrap();
+        std::fs::write(base.join("本文").join(&referenced_section), "").unwrap();
+        std::fs::write(base.join("本文").join("99 orphan.yaml"), "").unwrap();
+
+        let orphans = find_orphan_files_with_expected(base, &expected_section_stems(&toc)).unwrap();
+        let orphan_names = orphans
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(orphan_names, vec!["99 orphan.yaml"]);
     }
 }
