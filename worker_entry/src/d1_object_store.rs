@@ -520,16 +520,42 @@ impl NovelAccessFence for D1ObjectStore {
     fn gate_info<'a>(&'a self,prefix:&'a ObjectPrefix)->PlatformFuture<'a,Result<GateInfo>>{Box::pin(async move{let row=self.gate_row(prefix).await?;Ok(GateInfo{epoch:row.epoch,content_revision:row.content_revision,state:if row.closed==0{GateState::Open}else{GateState::Closed},owner:row.owner,updated_at:row.updated_at,pending_readers:row.pending_readers})})}
     fn admit_reader<'a>(&'a self,prefix:&'a ObjectPrefix,id:&'a str,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{
         #[derive(Deserialize)]struct Lease{epoch:u64,expires_at:i64}let key=prefix.as_ref().trim_end_matches('/');let now=ts::now_secs();let expires=now.saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));
+        // Sweep this prefix's expired rows in the same batch so a busy prefix
+        // cannot accumulate dead leases (`novel_reader_leases_expiry` index).
         let results=self.checked_batch(vec![self.prepare("INSERT OR IGNORE INTO novel_access_gates(prefix,updated_at) VALUES (?,?)",vec![key.into(),JsValue::from_f64(now as f64)])?,
-            self.prepare("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) SELECT ?,?,epoch,? FROM novel_access_gates WHERE prefix=? AND closed=0 ON CONFLICT(prefix,reader_id) DO UPDATE SET epoch=excluded.epoch,expires_at=excluded.expires_at RETURNING epoch,expires_at",vec![key.into(),id.into(),JsValue::from_f64(expires as f64),key.into()])?]).await?;
+            self.prepare("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) SELECT ?,?,epoch,? FROM novel_access_gates WHERE prefix=? AND closed=0 ON CONFLICT(prefix,reader_id) DO UPDATE SET epoch=excluded.epoch,expires_at=excluded.expires_at RETURNING epoch,expires_at",vec![key.into(),id.into(),JsValue::from_f64(expires as f64),key.into()])?,
+            self.prepare("DELETE FROM novel_reader_leases WHERE prefix=? AND expires_at<=?",vec![key.into(),JsValue::from_f64(now as f64)])?]).await?;
         let lease=results[1].results::<Lease>().map_err(worker_error)?.into_iter().next().ok_or_else(||af::gate_closed_error(prefix))?;Ok(GateLease{reader_id:id.into(),epoch:lease.epoch,expires_at:lease.expires_at})
     })}
     fn renew_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{
-        #[derive(Deserialize)]struct Renewed{expires_at:i64}let now=ts::now_secs();let expires=now.saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));let key=prefix.as_ref().trim_end_matches('/');
+        #[derive(Deserialize)]struct Renewed{expires_at:i64}#[derive(Deserialize)]struct LeaseEpoch{epoch:u64}#[derive(Deserialize)]struct GateRow{closed:i64,epoch:u64}let now=ts::now_secs();let expires=now.saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));let key=prefix.as_ref().trim_end_matches('/');
         let result=self.prepare("UPDATE novel_reader_leases SET expires_at=? WHERE prefix=? AND reader_id=? AND epoch=? AND expires_at>? AND EXISTS(SELECT 1 FROM novel_access_gates WHERE prefix=? AND closed=0 AND epoch=?) RETURNING expires_at",vec![JsValue::from_f64(expires as f64),key.into(),lease.reader_id.as_str().into(),JsValue::from_f64(lease.epoch as f64),JsValue::from_f64(now as f64),key.into(),JsValue::from_f64(lease.epoch as f64)])?.run().await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(std::slice::from_ref(&result))?;
-        let row=result.results::<Renewed>().map_err(worker_error)?.into_iter().next().ok_or_else(||af::gate_closed_error(prefix))?;Ok(GateLease{reader_id:lease.reader_id.clone(),epoch:lease.epoch,expires_at:row.expires_at})
+        let Some(row)=result.results::<Renewed>().map_err(worker_error)?.into_iter().next()else{
+            // No live row matched. Distinguish the gate boundary from a dead
+            // admission: a closed/advanced gate (or a same-id row at another
+            // epoch) is a stale token (`novel_recovering`), while a gate still
+            // open at this epoch with a missing/expired row is a dead lease
+            // (`novel_lease_expired`). Read both rows in one batch so the
+            // classification cannot race a close that lands between probes.
+            let probe=self.db.primary_view().batch(vec![
+                self.prepare("SELECT closed,epoch FROM novel_access_gates WHERE prefix=?",vec![key.into()])?,
+                self.prepare("SELECT epoch FROM novel_reader_leases WHERE prefix=? AND reader_id=?",vec![key.into(),lease.reader_id.as_str().into()])?,
+            ]).await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&probe)?;
+            let gate=probe[0].results::<GateRow>().map_err(worker_error)?.into_iter().next();
+            match gate {
+                Some(gate) if gate.closed==0&&gate.epoch==lease.epoch => {
+                    let row=probe[1].results::<LeaseEpoch>().map_err(worker_error)?.into_iter().next();
+                    match row {
+                        Some(existing) if existing.epoch!=lease.epoch => return Err(af::gate_closed_error(prefix)),
+                        _ => return Err(af::lease_expired_error(prefix)),
+                    }
+                }
+                _ => return Err(af::gate_closed_error(prefix)),
+            }
+        };
+        Ok(GateLease{reader_id:lease.reader_id.clone(),epoch:lease.epoch,expires_at:row.expires_at})
     })}
-    fn release_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease)->PlatformFuture<'a,Result<()>>{Box::pin(async move{let result=self.prepare("DELETE FROM novel_reader_leases WHERE prefix=? AND reader_id=? AND epoch=?",vec![prefix.as_ref().trim_end_matches('/').into(),lease.reader_id.as_str().into(),JsValue::from_f64(lease.epoch as f64)])?.run().await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&[result])})}
+    fn release_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease)->PlatformFuture<'a,Result<()>>{Box::pin(async move{let result=self.prepare("DELETE FROM novel_reader_leases WHERE prefix=? AND ((reader_id=? AND epoch=?) OR expires_at<=?)",vec![prefix.as_ref().trim_end_matches('/').into(),lease.reader_id.as_str().into(),JsValue::from_f64(lease.epoch as f64),JsValue::from_f64(ts::now_secs() as f64)])?.run().await.map_err(worker_error)?;crate::d1_repository::ensure_batch_success(&[result])})}
     fn close_gate<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str)->PlatformFuture<'a,Result<u64>>{Box::pin(async move{
         let key=prefix.as_ref().trim_end_matches('/');let results=self.checked_batch(vec![self.prepare("INSERT OR IGNORE INTO novel_access_gates(prefix,updated_at) VALUES (?,?)",vec![key.into(),JsValue::from_f64(ts::now_secs() as f64)])?,
             self.prepare("UPDATE novel_access_gates SET closed=1,owner=?,epoch=epoch+1,updated_at=? WHERE prefix=? AND closed=0",vec![owner.into(),JsValue::from_f64(ts::now_secs() as f64),key.into()])?,

@@ -246,7 +246,7 @@ pub async fn api_novel_epub(
     };
     let response = match crate::web::novels::serve_epub(&state, &mut reads, id, &record, &novel_dir).await {
         Ok(response) => response,
-        Err((status, message)) => error_response(status, "internal_error", &message),
+        Err((status, message)) => error_response(status, super::novels::epub_error_code(status, &message), &message),
     };
     super::novels::leased_response(response, reads)
 }

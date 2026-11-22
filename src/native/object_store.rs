@@ -1714,7 +1714,7 @@ fn consult_sql_gate_authority(connection:&rusqlite::Connection,prefix:&ObjectPre
 /// parallel update holding the mutex mid-transaction can no longer
 /// fabricate a `Conflict`, issue #50).
 pub(crate) fn live_sql_gate_authority(narou_dir:&Path,prefix:&ObjectPrefix,epoch:u64,origin:&str)->Result<SqlGateAuthority>{
-    if crate::native::sqlite::state::read_mode(narou_dir)!=crate::native::sqlite::state::StorageMode::Sqlite{return Ok(SqlGateAuthority::Absent);}
+    if crate::native::sqlite::state::legacy_yaml_active() || crate::native::sqlite::state::read_mode(narou_dir)!=crate::native::sqlite::state::StorageMode::Sqlite{return Ok(SqlGateAuthority::Absent);}
     if let Some(state)=crate::native::sqlite::state::established_for(narou_dir)
         && let Some(connection)=state.conn_ref().try_lock()
     {
@@ -1960,7 +1960,7 @@ impl NativeObjectStore {
     /// no handle means the SQL side cannot hold the lease.
     fn release_sql_reader_lease(&self,prefix:&ObjectPrefix,lease:&GateLease)->Result<()>{
         let Some(narou_root)=self.root().parent().map(|parent|parent.to_path_buf())else{return Ok(());};
-        let Some(state)=crate::native::sqlite::state::active_for(&narou_root.join(".narou"))else{return Ok(());};
+        let Some(state)=crate::native::sqlite::state::established_for(&narou_root.join(".narou"))else{return Ok(());};
         let epoch=i64::try_from(lease.epoch).map_err(|_|af::gate_epoch_error(prefix,lease.epoch,u64::MAX))?;
         state.conn_ref().lock().execute("DELETE FROM novel_reader_leases WHERE prefix=? AND reader_id=? AND epoch=?",rusqlite::params![prefix.as_ref().trim_end_matches('/'),lease.reader_id,epoch]).map_err(crate::native::sqlite::sqlite_error)?;Ok(())
     }
@@ -2286,7 +2286,12 @@ impl NativeObjectStore {
     pub fn open_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>> {
         let this=self.clone();let prefix=prefix.clone();let lease=lease.clone();let key=key.clone();Box::pin(async move{
             let opened=run_blocking(move||this.with_reader_gate(&prefix,|gate|{
-                if !prefix.matches(&key)||gate.owner.is_some()||gate.epoch!=lease.epoch||!gate.readers.get(&lease.reader_id).is_some_and(|(epoch,expiry)|*epoch==lease.epoch&&*expiry>ts::now_secs()){return Err(af::gate_closed_error(&prefix));}
+                if !prefix.matches(&key)||gate.owner.is_some()||gate.epoch!=lease.epoch{return Err(af::gate_closed_error(&prefix));}
+                match gate.readers.get(&lease.reader_id){
+                    Some((epoch,expiry)) if *epoch==lease.epoch&&*expiry>ts::now_secs()=>{},
+                    Some((epoch,_)) if *epoch!=lease.epoch=>return Err(af::gate_closed_error(&prefix)),
+                    _=>return Err(af::lease_expired_error(&prefix)),
+                }
                 let Some((file,length))=this.open_range(&key,range)?else{return Ok(None);};Ok(Some((Self::metadata_for_open_file(&key,&file)?,file,length)))
             })).await?;Ok(opened.map(|(metadata,file,length)|(metadata,native_range_stream(file,length))))
         })
@@ -2301,7 +2306,12 @@ impl NativeObjectStore {
     pub fn open_local_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>>{
         let this=self.clone();let prefix=prefix.clone();let lease=lease.clone();let key=key.clone();Box::pin(async move{
             let opened=run_blocking(move||this.with_reader_gate(&prefix,|gate|{
-                if !prefix.matches(&key)||gate.owner.is_some()||gate.epoch!=lease.epoch||!gate.readers.get(&lease.reader_id).is_some_and(|(epoch,expiry)|*epoch==lease.epoch&&*expiry>ts::now_secs()){return Err(af::gate_closed_error(&prefix));}
+                if !prefix.matches(&key)||gate.owner.is_some()||gate.epoch!=lease.epoch{return Err(af::gate_closed_error(&prefix));}
+                match gate.readers.get(&lease.reader_id){
+                    Some((epoch,expiry)) if *epoch==lease.epoch&&*expiry>ts::now_secs()=>{},
+                    Some((epoch,_)) if *epoch!=lease.epoch=>return Err(af::gate_closed_error(&prefix)),
+                    _=>return Err(af::lease_expired_error(&prefix)),
+                }
                 if this.ref_marker_exists(&key)?{return Ok(None);}
                 let Some((file,length))=this.open_range(&key,range)?else{return Ok(None);};Ok(Some((Self::metadata_for_open_file(&key,&file)?,file,length)))
             })).await?;Ok(opened.map(|(metadata,file,length)|(metadata,native_range_stream(file,length))))
@@ -2459,7 +2469,14 @@ impl NovelAccessFence for NativeObjectStore {
     }
     fn renew_reader<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a GateLease, ttl: i64) -> PlatformFuture<'a, Result<GateLease>> {
         Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate(prefix, |gate| {
-            if gate.owner.is_some() || gate.epoch != lease.epoch || !gate.readers.get(&lease.reader_id).is_some_and(|(epoch, _)| *epoch == lease.epoch) { return Err(af::gate_closed_error(prefix)); }
+            if gate.owner.is_some() || gate.epoch != lease.epoch { return Err(af::gate_closed_error(prefix)); }
+            match gate.readers.get(&lease.reader_id) {
+                Some((epoch, expiry)) if *epoch == lease.epoch && *expiry > ts::now_secs() => {}
+                // A same-id admission at a different epoch is a stale token
+                // (gate boundary); a missing/expired row is a dead admission.
+                Some((epoch, _)) if *epoch != lease.epoch => return Err(af::gate_closed_error(prefix)),
+                _ => return Err(af::lease_expired_error(prefix)),
+            }
             let expiry = ts::now_secs().saturating_add(ttl.clamp(1, af::READER_LEASE_SECS));
             gate.readers.insert(lease.reader_id.clone(), (gate.epoch, expiry));
             Ok(GateLease { reader_id: lease.reader_id.clone(), epoch: gate.epoch, expires_at: expiry })
@@ -2549,6 +2566,27 @@ mod tests {
             assert!(store.commit_staged(&prefix,"publication",epoch,&stage.key,&key).await.is_err());
             store.release_reader(&prefix,&reader).await.unwrap();store.commit_staged(&prefix,"publication",epoch,&stage.key,&key).await.unwrap();store.open_gate(&prefix,"publication",epoch).await.unwrap();
             assert!(store.write_small_guarded(&old,&key,b"late".to_vec()).await.is_err());assert_eq!(store.read_small(&key).await.unwrap().unwrap(),b"new");
+        });
+    }
+    #[test]
+    fn renew_reader_classifies_stale_epoch_and_expired_lease(){
+        let root=tempfile::tempdir().unwrap();let store=NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        futures::executor::block_on(async{
+            let prefix=ObjectPrefix::new("novels/site/book").unwrap();
+            // close→open bumps the gate epoch: a token minted before it is a
+            // gate boundary error (`novel_recovering`), same as SQLite/D1.
+            let stale=store.admit_reader(&prefix,"stale",30).await.unwrap();
+            let epoch=store.close_gate(&prefix,"transfer").await.unwrap();
+            store.open_gate(&prefix,"transfer",epoch).await.unwrap();
+            store.admit_reader(&prefix,"other",30).await.unwrap();
+            let error=store.renew_reader(&prefix,&stale,30).await.unwrap_err();
+            assert!(error.to_string().contains("novel_recovering"),"unexpected: {error}");
+            // A missing row at the current epoch is a dead admission
+            // (`novel_lease_expired`), never a gate boundary problem.
+            let live=store.admit_reader(&prefix,"live",30).await.unwrap();
+            store.release_reader(&prefix,&live).await.unwrap();
+            let error=store.renew_reader(&prefix,&live,30).await.unwrap_err();
+            assert!(error.to_string().contains("novel_lease_expired"),"unexpected: {error}");
         });
     }
     #[test]
@@ -3406,6 +3444,35 @@ mod tests {
             SqlGateAuthority::Absent
         ));
         assert!(!narou_dir.join(crate::native::sqlite::state::DB_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn legacy_yaml_env_bypasses_sqlite_gate_authority_consult() {
+        let _guard = crate::test_support::global_state_guard();
+        let root = tempfile::tempdir().unwrap();
+        let state = issue50_sqlite_library(root.path());
+        let narou_dir = root.path().join(".narou");
+        let prefix = ObjectPrefix::new("novels/site/book").unwrap();
+        state
+            .conn_ref()
+            .lock()
+            .execute(
+                "INSERT INTO novel_access_gates(prefix,epoch,closed,owner,updated_at,content_revision,origin_url_fold) VALUES(?1,1,0,NULL,0,0,'')",
+                [prefix.as_ref()],
+            )
+            .unwrap();
+        assert!(matches!(
+            live_sql_gate_authority(&narou_dir, &prefix, 0, "").unwrap(),
+            SqlGateAuthority::Conflict
+        ));
+        let prev = std::env::var_os("NAROU_RS_LEGACY_YAML");
+        unsafe { std::env::set_var("NAROU_RS_LEGACY_YAML", "1"); }
+        let outcome = live_sql_gate_authority(&narou_dir, &prefix, 0, "");
+        match prev {
+            Some(value) => unsafe { std::env::set_var("NAROU_RS_LEGACY_YAML", value); },
+            None => unsafe { std::env::remove_var("NAROU_RS_LEGACY_YAML"); },
+        }
+        assert!(matches!(outcome.unwrap(), SqlGateAuthority::Absent));
     }
 
     #[cfg(unix)]

@@ -367,6 +367,7 @@ pub struct NovelReadLease {
     objects: Arc<dyn ObjectStore>,
     clock: Arc<dyn Clock>,
     prefix: Arc<ObjectPrefix>,
+    reader_hint: Arc<str>,
     lease: Arc<GateLease>,
     shared: Arc<SharedReader>,
     retired: bool,
@@ -377,11 +378,12 @@ impl Clone for NovelReadLease {
         self.shared.owners.fetch_add(1, Ordering::Relaxed);
         Self {
             objects: self.objects.clone(), clock: self.clock.clone(),
-            prefix: self.prefix.clone(), lease: self.lease.clone(),
-            shared: self.shared.clone(), retired: false,
+            prefix: self.prefix.clone(), reader_hint: self.reader_hint.clone(),
+            lease: self.lease.clone(), shared: self.shared.clone(), retired: false,
         }
     }
 }
+
 
 impl Drop for NovelReadLease {
     fn drop(&mut self) {
@@ -430,6 +432,7 @@ impl NovelReadLease {
         let next_renewal = clock.now_unix_secs() + RENEW_INTERVAL_SECS;
         Ok(Self {
             objects: objects.clone(), prefix: Arc::new(prefix.clone()), clock,
+            reader_hint: Arc::from(reader_id),
             lease: lease.clone(),
             shared: Arc::new(SharedReader {
                 renewal: futures::lock::Mutex::new(ReaderRenewal { lease, next_renewal }),
@@ -567,18 +570,59 @@ impl NovelReadLease {
     }
 
     /// `into_open` または呼び出し側の EOF/エラー処理で使う内部解放。
+    /// renew/readmit が差し替えた *現在の* token を解放する (`self.lease` の
+    /// スナップショットは clone 間でずれ得るため使わない)。
     async fn release_inner(&mut self) -> Result<()> {
         if self.retired { return Ok(()); }
         self.retired = true;
         if self.shared.owners.fetch_sub(1, Ordering::AcqRel) != 1 { return Ok(()); }
+        let token = self.shared.renewal.lock().await.lease.clone();
         self.objects.access_fence().ok_or_else(|| unsupported_fence(&self.prefix))?
-            .release_reader(&self.prefix, &self.lease).await
+            .release_reader(&self.prefix, &token).await
     }
 
     /// 操作の正常終了時に呼ぶ冪等な早期解放。失敗しても TTL が落とすので
     /// 呼び出し側で再試行は要らない。
     pub async fn release(mut self) -> Result<()> {
         self.release_inner().await
+    }
+
+    /// 共有されている *現在の* token が durable な期限切れかどうか。
+    /// `renewal` ロックを取るので renew/readmit 中の更新を見逃さない。
+    /// 時計は admission に注入されたものと同じ (`self.clock`) を使う。
+    async fn expired(&mut self) -> bool {
+        let current = self.shared.renewal.lock().await;
+        self.clock.now_unix_secs() >= current.lease.expires_at
+    }
+
+    /// TTL 切れした共有 token を、**同じ gate epoch のまま** 新しい admission
+    /// で置き換える。`self.lease` だけでなく共有 renewal を更新するため、
+    /// この lease を clone した既存の leased stream も自動的に生き返る。
+    /// gate が閉じてから再開放されている (`epoch != expected_epoch`) 場合は
+    /// 新しいリースを即座に解放して `novel_busy` で fail-closed する —
+    /// 転送・削除をまたいだ新世代への暗黙昇格はしない。
+    async fn readmit(&mut self, expected_epoch: u64) -> Result<()> {
+        let mut current = self.shared.renewal.lock().await;
+        // `admit_reader` は admission CAS と同じ境界なので、閉鎖中はここで
+        // `novel_recovering` 系のエラーになり epoch 検証に到達しない。
+        let next = self.objects.access_fence()
+            .ok_or_else(|| unsupported_fence(&self.prefix))?
+            .admit_reader(&self.prefix, &unique_reader_id(&self.reader_hint)?, READER_LEASE_SECS)
+            .await?;
+        if next.epoch != expected_epoch {
+            let _ = self.objects.access_fence().ok_or_else(|| unsupported_fence(&self.prefix))?
+                .release_reader(&self.prefix, &next).await;
+            return Err(NarouError::Platform("novel_busy: writer origin changed before reader re-admission".into()));
+        }
+        let previous = std::mem::replace(&mut current.lease, Arc::new(next));
+        current.next_renewal = self.clock.now_unix_secs() + RENEW_INTERVAL_SECS;
+        self.lease = current.lease.clone();
+        drop(current);
+        // 失効行は GC が拾うが、開いている epoch の行は drain 対象として残さない
+        // よう best-effort で削除する (idempotent なので失敗してもよい)。
+        let _ = self.objects.access_fence().ok_or_else(|| unsupported_fence(&self.prefix))?
+            .release_reader(&self.prefix, &previous).await;
+        Ok(())
     }
 }
 
@@ -649,6 +693,8 @@ impl NovelWriteGuard {
 pub struct NovelAccess {
     write: Option<NovelWriteGuard>,
     read: Option<NovelReadLease>,
+    clock: Arc<dyn Clock>,
+    reader_hint: Arc<str>,
 }
 
 impl NovelAccess {
@@ -658,33 +704,114 @@ impl NovelAccess {
         prefix: &ObjectPrefix,
         reader_id: &str,
     ) -> Result<Self> {
+        Self::for_operation_with_clock(objects, assets, prefix, reader_id, Arc::new(SystemClock)).await
+    }
+
+    /// テストが読み取り寿命を制御できる clock 注入版。
+    pub async fn for_operation_with_clock(
+        objects: &Arc<dyn ObjectStore>,
+        assets: Option<&Arc<dyn AssetStore>>,
+        prefix: &ObjectPrefix,
+        reader_id: &str,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
         let write = NovelWriteGuard::capture(objects, assets, prefix).await?;
-        Self::from_writer(write, reader_id).await
+        Self::from_writer_with_clock(write, reader_id, clock).await
     }
 
     pub async fn from_writer(write: NovelWriteGuard, reader_id: &str) -> Result<Self> {
-        let read = NovelReadLease::admit(&write.objects, write.prefix(), reader_id).await?;
+        Self::from_writer_with_clock(write, reader_id, Arc::new(SystemClock)).await
+    }
+
+    /// clock 注入版の [`Self::from_writer`]。`ensure_read` の期限切れ判定に
+    /// 同じ時計を使うため、reader 側には `admit_with_clock` で同じ clock を
+    /// 渡す。
+    pub async fn from_writer_with_clock(
+        write: NovelWriteGuard,
+        reader_id: &str,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
+        let read = NovelReadLease::admit_with_clock(&write.objects, clock.clone(), write.prefix(), reader_id).await?;
         if read.epoch() != write.epoch() {
             let _ = read.release().await;
             return Err(NarouError::Platform("novel_busy: writer origin changed before reader admission".into()));
         }
-        Ok(Self { write: Some(write), read: Some(read) })
+        Ok(Self { write: Some(write), read: Some(read), clock, reader_hint: Arc::from(reader_id) })
     }
 
     pub fn read_only(read: NovelReadLease) -> Self {
-        Self { write: None, read: Some(read) }
+        let clock = read.clock.clone();
+        let reader_hint = read.reader_hint.clone();
+        Self { write: None, read: Some(read), clock, reader_hint }
     }
 
     pub fn write(&self) -> Result<&NovelWriteGuard> {
         self.write.as_ref().ok_or_else(|| NarouError::Platform("novel operation has no writer fence".into()))
     }
 
+    /// 生のリース参照。期限切れかどうかは **見ない**。ストレージ読み取りの
+    /// 直前には [`Self::ensure_read`] を使うこと。
     pub fn read(&mut self) -> Result<&mut NovelReadLease> {
         self.read.as_mut().ok_or_else(|| NarouError::Platform("novel operation has no reader lease".into()))
     }
 
     pub fn take_read(&mut self) -> Result<NovelReadLease> {
         self.read.take().ok_or_else(|| NarouError::Platform("novel operation has no reader lease".into()))
+    }
+
+    /// 外部 HTTP 待機やリースを必要としない重い作業の前に、保持中の
+    /// リースを明示的に解放して `self.read = None` にする。アイドルな
+    /// リースが drain を妨げたり、待機中に TTL 切れで失効したりするのを
+    /// 防ぐ。リースを必要としない呼び出しの前に使うこと。
+    pub async fn release_read(&mut self) -> Result<()> {
+        match self.read.take() {
+            Some(read) => read.release().await,
+            None => Ok(()),
+        }
+    }
+
+    /// ストレージ読み取りの直前に呼ぶ。writer (`self.write`) を持つ操作に
+    /// 限り、失効したリースを **同じ gate epoch** で再 admit する。
+    ///
+    /// - `self.read` がまだ有効なら何もせずそのリースを返す。
+    /// - `None` (前回 `release_read` した) か、TTL が切れているなら再
+    ///   admit する。再 admit が返した `read.epoch() != write.epoch()` なら
+    ///   (その間に転送・削除が gate を閉じて epoch を進めた) 新しいリースを
+    ///   即座に解放して fail-closed する — 新世代への暗黙昇格はしない。
+    /// - `self.write` を持たない `read_only` では再 admit しない。期限切れの
+    ///   まま従来どおりのリースを返し、renew/read で fail-closed させる。
+    ///
+    /// `renew` は同じ CAS 境界で `expires_at > now` を要求する。30 秒を越える
+    /// 外部 I/O の間は `release_read` → `ensure_read` で再 admit するほうが、
+    /// リースを保持したまま期限切れになるより drain も早く安全である。
+    pub async fn ensure_read(&mut self) -> Result<&mut NovelReadLease> {
+        let Some(write) = self.write.as_ref() else {
+            return self.read();
+        };
+        let epoch = write.epoch();
+        match self.read.as_mut() {
+            Some(read) => {
+                if read.epoch() != epoch {
+                    // ゲートが閉じて再開放された (epoch が進んだ)。読み取りを
+                    // 引き継げないので fail-closed する。
+                    return Err(NarouError::Platform("novel_busy: writer origin changed before reader re-admission".into()));
+                }
+                if read.expired().await {
+                    read.readmit(epoch).await?;
+                }
+            }
+            None => {
+                let read = NovelReadLease::admit_with_clock(
+                    &write.objects, self.clock.clone(), write.prefix(), &self.reader_hint,
+                ).await?;
+                if read.epoch() != epoch {
+                    let _ = read.release().await;
+                    return Err(NarouError::Platform("novel_busy: writer origin changed before reader re-admission".into()));
+                }
+                self.read = Some(read);
+            }
+        }
+        self.read()
     }
 
     pub async fn release(mut self) -> Result<()> {
@@ -1637,6 +1764,193 @@ mod tests {
             assert_eq!(actual, b"reader two remains admitted");
             memory.release_reader(&prefix, &second).await.unwrap();
             assert_eq!(memory.gate_info(&prefix).await.unwrap().pending_readers, 0);
+        });
+    }
+
+    /// Test-only controllable clock for lease-TTL regressions.
+    struct TestClock(std::sync::atomic::AtomicI64);
+
+    impl crate::platform::Clock for TestClock {
+        fn now_utc(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::DateTime::from_timestamp(self.0.load(std::sync::atomic::Ordering::SeqCst), 0).unwrap()
+        }
+        fn advance(&self, duration: std::time::Duration) {
+            self.0.fetch_add(duration.as_secs() as i64, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl TestClock {
+        fn set(&self, secs: i64) {
+            self.0.store(secs, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The production failure mode: a >30s external-I/O gap lets the durable
+    /// lease lapse while the gate stays open at the same epoch. `ensure_read`
+    /// must re-admit under the same epoch so the download can continue —
+    /// without crossing a gate boundary (never silently upgraded to a newer
+    /// epoch after a close/reopen).
+    #[test]
+    fn ensure_read_readmits_after_a_long_idle_gap_at_the_same_epoch() {
+        futures::executor::block_on(async {
+            let memory = Arc::new(MemoryObjectStore::new());
+            let objects: Arc<dyn ObjectStore> = memory.clone();
+            let prefix = ObjectPrefix::new("novels/fixture/book").unwrap();
+            let key = ObjectKey::try_new("novels/fixture/book/novel.txt").unwrap();
+            let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(chrono::Utc::now().timestamp())));
+            let write = NovelWriteGuard::capture(&objects, None, &prefix).await.unwrap();
+            write.write_small(&key, b"body".to_vec()).await.unwrap();
+            let epoch = write.epoch();
+            let mut access = NovelAccess::from_writer_with_clock(write, "dl", clock.clone()).await.unwrap();
+            let original_reader = access.read().unwrap().lease.reader_id.clone();
+
+            // 1st section write, then a >30s "external HTTP" gap.
+            clock.advance(std::time::Duration::from_secs(READER_LEASE_SECS as u64 + 1));
+            assert!(access.read().unwrap().expired().await);
+
+            // Same epoch → re-admit succeeds; a fresh lease row now exists.
+            access.ensure_read().await.unwrap();
+            let read = access.read().unwrap();
+            assert_eq!(read.epoch(), epoch);
+            assert_ne!(read.lease.reader_id, original_reader, "the lapsed token must be replaced, not renewed");
+            // The fake clock still sits +31s ahead; the fresh store-side token
+            // was stamped with real time, so bring the test clock back before
+            // checking `expired` (production uses one clock throughout).
+            clock.set(chrono::Utc::now().timestamp());
+            assert!(!read.expired().await);
+            assert_eq!(memory.gate_info(&prefix).await.unwrap().pending_readers, 1);
+            assert_eq!(read.read_small(&key).await.unwrap().unwrap(), b"body");
+        });
+    }
+
+    #[test]
+    fn ensure_read_fails_closed_while_the_gate_is_closed() {
+        futures::executor::block_on(async {
+            let memory = Arc::new(MemoryObjectStore::new());
+            let objects: Arc<dyn ObjectStore> = memory.clone();
+            let prefix = ObjectPrefix::new("novels/fixture/book").unwrap();
+            let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(chrono::Utc::now().timestamp())));
+            let write = NovelWriteGuard::capture(&objects, None, &prefix).await.unwrap();
+            let mut access = NovelAccess::from_writer_with_clock(write, "dl", clock.clone()).await.unwrap();
+            let original_reader = access.read().unwrap().lease.reader_id.clone();
+            clock.advance(std::time::Duration::from_secs(READER_LEASE_SECS as u64 + 1));
+
+            let closed_epoch = memory.close_gate(&prefix, "transfer").await.unwrap();
+            let error = match access.ensure_read().await {
+                Ok(_) => panic!("re-admission behind a closed gate must fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("novel_recovering"), "unexpected: {error}");
+            assert_eq!(memory.gate_info(&prefix).await.unwrap().pending_readers, 1, "no new lease may be granted behind a closed gate");
+            memory.open_gate(&prefix, "transfer", closed_epoch).await.unwrap();
+
+            // Gate closed → reopened (epoch advanced) while the lease was out.
+            let error = match access.ensure_read().await {
+                Ok(_) => panic!("re-admission into an advanced epoch must fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("novel_busy"), "unexpected: {error}");
+            let info = memory.gate_info(&prefix).await.unwrap();
+            assert_eq!(info.pending_readers, 1, "only the stale row may remain; the new-epoch token is released");
+            assert_eq!(access.read().unwrap().lease.reader_id, original_reader);
+        });
+    }
+
+    /// A pure reader (`read_only`, no writer) must never re-admit: the shared
+    /// lease stays dead and reads keep failing at the gate boundary, exactly
+    /// as before the `ensure_read` machinery existed.
+    #[test]
+    fn read_only_never_readmits_and_stays_fail_closed() {
+        futures::executor::block_on(async {
+            let memory = Arc::new(MemoryObjectStore::new());
+            let objects: Arc<dyn ObjectStore> = memory.clone();
+            let prefix = ObjectPrefix::new("novels/fixture/book").unwrap();
+            let key = ObjectKey::try_new("novels/fixture/book/novel.txt").unwrap();
+            let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(chrono::Utc::now().timestamp())));
+            memory.write_small(&key, b"body".to_vec()).await.unwrap();
+
+            let read = NovelReadLease::admit_with_clock(&objects, clock.clone(), &prefix, "epub").await.unwrap();
+            let original_reader = read.lease.reader_id.clone();
+            let mut access = NovelAccess::read_only(read);
+            clock.advance(std::time::Duration::from_secs(READER_LEASE_SECS as u64 + 1));
+
+            // `ensure_read` must NOT re-admit a read-only access.
+            assert_eq!(access.ensure_read().await.unwrap().lease.reader_id, original_reader);
+            assert_eq!(memory.gate_info(&prefix).await.unwrap().pending_readers, 1, "no new admission may appear");
+
+            // The dead lease still fails at the first gated read (fail-closed).
+            let epoch = memory.close_gate(&prefix, "transfer").await.unwrap();
+            assert!(access.ensure_read().await.unwrap().read_small(&key).await.is_err());
+            memory.open_gate(&prefix, "transfer", epoch).await.unwrap();
+            let error = access.ensure_read().await.unwrap().read_small(&key).await.unwrap_err();
+            assert!(error.to_string().contains("novel_recovering"), "unexpected: {error}");
+            assert_eq!(access.read().unwrap().lease.reader_id, original_reader);
+        });
+    }
+
+    /// `release_read` drops the idle lease so a long external wait does not
+    /// hold a reader slot; the next `ensure_read` re-admits at the same epoch.
+    #[test]
+    fn release_read_then_ensure_read_readmits_at_the_same_epoch() {
+        futures::executor::block_on(async {
+            let memory = Arc::new(MemoryObjectStore::new());
+            let objects: Arc<dyn ObjectStore> = memory.clone();
+            let prefix = ObjectPrefix::new("novels/fixture/book").unwrap();
+            let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(chrono::Utc::now().timestamp())));
+            let write = NovelWriteGuard::capture(&objects, None, &prefix).await.unwrap();
+            let epoch = write.epoch();
+            let mut access = NovelAccess::from_writer_with_clock(write, "dl", clock.clone()).await.unwrap();
+            access.release_read().await.unwrap();
+            assert_eq!(memory.gate_info(&prefix).await.unwrap().pending_readers, 0);
+            access.ensure_read().await.unwrap();
+            assert_eq!(access.read().unwrap().epoch(), epoch);
+        });
+    }
+
+    /// `renew_reader` error classification: a missing/expired admission is a
+    /// dead lease (`novel_lease_expired`), not a gate boundary problem; a
+    /// token minted before a close/reopen is `novel_recovering`.
+    #[test]
+    fn renew_reader_distinguishes_expired_from_gate_conflicts() {
+        futures::executor::block_on(async {
+            let memory = Arc::new(MemoryObjectStore::new());
+            let prefix = ObjectPrefix::new("novels/fixture/book").unwrap();
+
+            // Missing row (released before renew raced in) → expired, not closed.
+            let live = memory.admit_reader(&prefix, "r-live", READER_LEASE_SECS).await.unwrap();
+            memory.release_reader(&prefix, &live).await.unwrap();
+            let error = memory.renew_reader(&prefix, &live, READER_LEASE_SECS).await.unwrap_err();
+            assert!(error.to_string().contains("novel_lease_expired"), "unexpected: {error}");
+
+            // A token minted before a close/reopen is a gate boundary
+            // problem: renewing it now reports `novel_recovering` on every
+            // backend.
+            let stale = memory.admit_reader(&prefix, "r-stale", READER_LEASE_SECS).await.unwrap();
+            let epoch = memory.close_gate(&prefix, "transfer").await.unwrap();
+            memory.open_gate(&prefix, "transfer", epoch).await.unwrap();
+            memory.admit_reader(&prefix, "r-stale", READER_LEASE_SECS).await.unwrap();
+            let error = memory.renew_reader(&prefix, &stale, READER_LEASE_SECS).await.unwrap_err();
+            assert!(error.to_string().contains("novel_recovering"), "unexpected: {error}");
+
+            // A live row at the current epoch still renews (control).
+            let mutated = memory.admit_reader(&prefix, "r-epoch", READER_LEASE_SECS).await.unwrap();
+            let renewed = memory.renew_reader(&prefix, &mutated, READER_LEASE_SECS).await.unwrap();
+            assert_eq!(renewed.epoch, 1);
+        });
+    }
+
+    /// A forged stale token (expired `expires_at`, no matching live row) must
+    /// report `novel_lease_expired`, never silently resurrect.
+    #[test]
+    fn renew_reader_with_a_stale_expired_token_reports_lease_expired() {
+        futures::executor::block_on(async {
+            let memory = Arc::new(MemoryObjectStore::new());
+            let prefix = ObjectPrefix::new("novels/fixture/book").unwrap();
+            let stale = crate::platform::access_fence::GateLease {
+                reader_id: "ghost".into(), epoch: 0, expires_at: 1,
+            };
+            let error = memory.renew_reader(&prefix, &stale, READER_LEASE_SECS).await.unwrap_err();
+            assert!(error.to_string().contains("novel_lease_expired"), "unexpected: {error}");
         });
     }
 }

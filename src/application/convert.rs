@@ -385,7 +385,7 @@ impl ConvertService {
             record.use_subdirectory,
         )?;
         let prefix = crate::platform::ObjectPrefix::from(keys.prefix().clone());
-        if access.read()?.prefix() != &prefix {
+        if access.ensure_read().await?.prefix() != &prefix {
             return Err(NarouError::Platform("conversion reader belongs to another novel".into()));
         }
         if store && access.write()?.prefix() != &prefix {
@@ -396,16 +396,19 @@ impl ConvertService {
         // Record source failure before settings failure, as before.
         let source: Result<_> = match source {
             Some((toc, sections)) => Ok((toc, Some(sections))),
-            None => persistence.load_toc(access.read()?, &keys).await.and_then(|toc| {
-                toc.map(|toc| (toc, None)).ok_or_else(|| {
-                    NarouError::Platform(format!("toc がありません: {}", keys.toc()))
+            None => {
+                let lease = access.ensure_read().await?;
+                persistence.load_toc(lease, &keys).await.and_then(|toc| {
+                    toc.map(|toc| (toc, None)).ok_or_else(|| {
+                        NarouError::Platform(format!("toc がありません: {}", keys.toc()))
+                    })
                 })
-            }),
+            }
         };
         let replace_key = keys.replace();
         let (inputs, local_settings) = futures::join!(
             async {
-                let lease = access.read()?;
+                let lease = access.ensure_read().await?;
                 let ini = self.load_ini(lease, &keys).await?;
                 let replacement = self.read_text(lease, &replace_key).await?;
                 let converter_key = ObjectKey::try_new(format!("{}/converter.yaml", keys.prefix()))?;
@@ -417,7 +420,7 @@ impl ConvertService {
         let (toc, sections) = source?;
         let mut sections = match sections {
             Some(sections) => sections,
-            None => persistence.stream_sections_snapshot(access.read()?.clone(), keys.clone(), toc.clone()),
+            None => persistence.stream_sections_snapshot(access.ensure_read().await?.clone(), keys.clone(), toc.clone()),
         };
         if toc.subtitles.is_empty() {
             return Err(NarouError::Platform(format!(
@@ -1312,6 +1315,27 @@ mod tests {
             assert!(service.convert_source(&mut access, &target, toc, source, true).await.is_err());
             access.release().await.unwrap();
             assert_eq!(store.read_small(&output).await.unwrap().unwrap(), b"new published text");
+        });
+    }
+
+    #[test]
+    fn writer_bound_convert_readmits_released_reader_lease() {
+        let _env = KeepTxtEnvGuard::cleared();
+        block_on(async {
+            let store = Arc::new(MemoryObjectStore::new());
+            let service = ConvertService::new(store.clone(), store.clone(), Arc::new(crate::application::settings::MemorySettingsStore::new()));
+            let target = record(1);
+            let keys = NovelObjectKeys::new(&target.sitename, &target.file_title, target.use_subdirectory).unwrap();
+            let (toc, sections) = streaming_fixture(1, "再読込本文");
+            let mut access = test_access(&service, &target).await;
+            let persistence = PersistenceService::new(store.clone());
+            persistence.save_toc(access.write().unwrap(), &keys, &toc).await.unwrap();
+            persistence.save_section(access.write().unwrap(), &keys, &toc.subtitles[0], &sections[0].element, 1).await.unwrap();
+            access.release_read().await.unwrap();
+            let converted = service.convert_only(&mut access, &target).await.unwrap();
+            let text = collected_text(&converted.source).await;
+            assert!(text.contains("再読込本文"), "{text}");
+            access.release().await.unwrap();
         });
     }
 

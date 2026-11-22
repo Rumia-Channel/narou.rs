@@ -184,11 +184,11 @@ async fn prepare(
     narou_rs::application::JobQueue::save_checkpoint(runtime.ledger.as_ref(), job_id, owner.execution_token(), &durable).await?;
     let mut access = NovelAccess::from_writer(guard.clone(), "convert-job").await?;
     let loaded: Result<_> = async {
-        access.read()?.validate().await?;
+        access.ensure_read().await?.validate().await?;
         let record = runtime.novels.get_current(target).await?
             .ok_or_else(|| NarouError::NotFound(format!("小説 {} がありません", target.0)))?;
         let current = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
-        access.read()?.validate().await?;
+        access.ensure_read().await?.validate().await?;
         if current.prefix() != keys.prefix() {
             return Err(NarouError::Platform("conversion namespace changed during admission".into()));
         }
@@ -208,12 +208,12 @@ async fn prepare(
 async fn set_convert_failure_flag(runtime: &WorkerRuntime, guard: &NovelWriteGuard, id: narou_rs::platform::NovelId, failed: bool) -> Result<()> {
     let mut access = NovelAccess::from_writer(guard.clone(), "convert-failure-flag").await?;
     let result: Result<()> = async {
-        access.read()?.validate().await?;
+        access.ensure_read().await?.validate().await?;
         let Some(mut record) = runtime.novels.get_current(id).await? else {
             return Err(narou_rs::error::NarouError::NotFound(format!("novel {} disappeared during conversion", id.0)));
         };
         let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
-        access.read()?.validate().await?;
+        access.ensure_read().await?.validate().await?;
         if keys.prefix().as_ref() != guard.prefix().as_ref().trim_end_matches('/') {
             return Err(narou_rs::error::NarouError::Platform("conversion bookkeeping namespace changed".into()));
         }

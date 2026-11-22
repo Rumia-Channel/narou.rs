@@ -609,10 +609,44 @@ struct StoredPayload {
 fn resolve_payload_key(conn:&Connection,key:&ObjectKey)->Result<ObjectKey>{
     let alias=crate::native::object_store::legacy_flat_key(key)?;
     let logical=if let Some(alias)=alias{let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM native_logical_objects WHERE object_key=?)",[key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;if exists{key.clone()}else{alias}}else{key.clone()};let key=&logical;
+    // Existing narou.rb layouts sometimes changed only the subtitle part of a
+    // section filename. Keep that fallback native-only; normal core paths
+    // always use the canonical ObjectKey generated from the TOC. Mirrors
+    // `NativeObjectStore::resolve_read_path`: `.../本文/<index>.yaml` and
+    // `.../本文/<index> <subtitle>.yaml` resolve to the first stored section
+    // that carries the same index.
+    let logical=resolve_legacy_section_key(conn,key)?;let key=&logical;
     let reference:Option<(String,String)>=conn.query_row("SELECT blob_key,blob_generation FROM transfer_object_refs WHERE object_key=? AND backend='d1'",[key.as_ref()],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(super::sqlite_error)?;
     let Some((physical,generation))=reference else{return Ok(key.clone());};
     let current:Option<String>=conn.query_row("SELECT generation FROM objects WHERE object_key=?",[&physical],|row|row.get(0)).optional().map_err(super::sqlite_error)?;
     if current.as_deref()!=Some(generation.as_str()){return Err(NarouError::Platform("canonical transfer object generation changed".into()));}ObjectKey::try_new(physical)
+}
+
+/// `resolve_payload_key` の `<index>` フォールバック。`native_logical_objects`
+/// に正確なキーが無いときだけ、同じ `本文/` 直下の `<index>.yaml` /
+/// `<index> *.yaml` を B-tree 範囲条件で引く。
+fn resolve_legacy_section_key(conn:&Connection,key:&ObjectKey)->Result<ObjectKey>{
+    let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM native_logical_objects WHERE object_key=?)",[key.as_ref()],|row|row.get(0)).map_err(super::sqlite_error)?;
+    if exists{return Ok(key.clone());}
+    let Some((dir,file_name))=key.as_ref().rsplit_once('/')else{return Ok(key.clone());};
+    if dir.rsplit('/').next()!=Some("本文"){return Ok(key.clone());}
+    let Some(stem)=file_name.strip_suffix(".yaml")else{return Ok(key.clone());};
+    let index=stem.split_once(' ').map(|(index,_)|index).unwrap_or(stem);
+    if index.is_empty(){return Ok(key.clone());}
+    let exact=format!("{dir}/{index}.yaml");
+    let lower=format!("{dir}/{index} ");
+    let upper=format!("{dir}/{index}!");
+    let resolved:Option<String>=conn.query_row(
+        "SELECT object_key FROM native_logical_objects
+         WHERE object_key = ?1
+            OR (object_key >= ?2 AND object_key < ?3
+                AND instr(substr(object_key, length(?2) + 1), '/') = 0
+                AND substr(object_key, -5) = '.yaml')
+         ORDER BY object_key LIMIT 1",
+        rusqlite::params![exact,lower,upper],
+        |row|row.get(0),
+    ).optional().map_err(super::sqlite_error)?;
+    match resolved{Some(resolved)=>ObjectKey::try_new(resolved),None=>Ok(key.clone())}
 }
 
 fn read_stored_payload(
@@ -1737,8 +1771,17 @@ impl SqliteObjectStore {
         let epoch=i64::try_from(lease.epoch).map_err(|_|af::gate_epoch_error(prefix,lease.epoch,u64::MAX))?;
         self.mirror.with_reader_gate_lock(prefix.as_ref().trim_end_matches('/'),||{
             let conn=self.conn.lock();require_transfer_epoch(&conn,prefix,None,lease.epoch,false)?;
-            let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM novel_reader_leases WHERE prefix=? AND reader_id=? AND epoch=? AND expires_at>?)",rusqlite::params![prefix.as_ref().trim_end_matches('/'),lease.reader_id,epoch,ts::now_secs()],|row|row.get(0)).map_err(super::sqlite_error)?;
-            if !valid{return Err(af::gate_closed_error(prefix));}operation(&conn)
+            // A token whose row is missing or past `expires_at` is a dead
+            // admission, not a closed gate: the gate is still open at the
+            // same epoch, so keep the cause distinct for the retry path. A
+            // same-reader-id row at a *different* epoch is a stale token from
+            // a re-admission, which stays `novel_recovering` (gate boundary).
+            let row:Option<(i64,i64)>=conn.query_row("SELECT epoch,expires_at FROM novel_reader_leases WHERE prefix=? AND reader_id=?",rusqlite::params![prefix.as_ref().trim_end_matches('/'),lease.reader_id],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(super::sqlite_error)?;
+            match row {
+                Some((row_epoch,expiry)) if row_epoch==epoch&&expiry>ts::now_secs() => operation(&conn),
+                Some((row_epoch,_)) if row_epoch!=epoch => Err(af::gate_closed_error(prefix)),
+                _ => Err(af::lease_expired_error(prefix)),
+            }
         })
     }
     pub fn with_open_fence_transaction<T>(&self,fence:&WriteFence,operation:impl FnOnce(&Connection)->Result<T>)->Result<T>{
@@ -2117,13 +2160,28 @@ impl NovelAccessFence for SqliteObjectStore {
     fn rebind_writer<'a>(&'a self,prefix:&'a ObjectPrefix,expected_epoch:u64)->PlatformFuture<'a,Result<WriteFence>>{Box::pin(async move{run_scoped_blocking(||self.gate_transaction(prefix,|conn|{require_transfer_epoch(conn,prefix,None,expected_epoch,false)?;Ok(WriteFence::new(prefix.clone(),expected_epoch))}))})}
     fn gate_info<'a>(&'a self,prefix:&'a ObjectPrefix)->PlatformFuture<'a,Result<GateInfo>>{Box::pin(async move{run_scoped_blocking(||self.reader_gate_transaction(prefix,|conn|Self::gate_info_conn(conn,prefix)))})}
     fn admit_reader<'a>(&'a self,prefix:&'a ObjectPrefix,id:&'a str,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{run_scoped_blocking(||self.reader_gate_transaction(prefix,|conn|{
+        // Sweep this prefix's expired rows in the same admission transaction
+        // so a busy prefix cannot accumulate dead leases (matches the FS
+        // gate's `prune` on every gate operation).
         let info=Self::gate_info_conn(conn,prefix)?;if info.state!=GateState::Open{return Err(af::gate_closed_error(prefix));}let expires=ts::now_secs().saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));
+        conn.execute("DELETE FROM novel_reader_leases WHERE prefix=? AND expires_at<=?",rusqlite::params![prefix.as_ref().trim_end_matches('/'),ts::now_secs()]).map_err(super::sqlite_error)?;
         conn.execute("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) VALUES (?,?,?,?) ON CONFLICT(prefix,reader_id) DO UPDATE SET epoch=excluded.epoch,expires_at=excluded.expires_at",rusqlite::params![prefix.as_ref().trim_end_matches('/'),id,i64::try_from(info.epoch).map_err(|_|NarouError::Platform("gate epoch exceeds SQLite integer range".into()))?,expires]).map_err(super::sqlite_error)?;
         Ok(GateLease{reader_id:id.into(),epoch:info.epoch,expires_at:expires})
     }))})}
     fn renew_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,ttl:i64)->PlatformFuture<'a,Result<GateLease>>{Box::pin(async move{run_scoped_blocking(||self.reader_gate_transaction(prefix,|conn|{
-        require_transfer_epoch(conn,prefix,None,lease.epoch,false)?;let now=ts::now_secs();let expires=now.saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));
-        let changed=conn.execute("UPDATE novel_reader_leases SET expires_at=? WHERE prefix=? AND reader_id=? AND epoch=? AND expires_at>?",rusqlite::params![expires,prefix.as_ref().trim_end_matches('/'),lease.reader_id,i64::try_from(lease.epoch).map_err(|_|af::gate_epoch_error(prefix,lease.epoch,u64::MAX))?,now]).map_err(super::sqlite_error)?;if changed!=1{return Err(af::gate_closed_error(prefix));}
+        let info=Self::gate_info_conn(conn,prefix)?;if info.state!=GateState::Open||info.epoch!=lease.epoch{return Err(af::gate_closed_error(prefix));}let now=ts::now_secs();let expires=now.saturating_add(ttl.clamp(1,af::READER_LEASE_SECS));
+        let epoch_i64=i64::try_from(lease.epoch).map_err(|_|af::gate_epoch_error(prefix,lease.epoch,u64::MAX))?;
+        let changed=conn.execute("UPDATE novel_reader_leases SET expires_at=? WHERE prefix=? AND reader_id=? AND epoch=? AND expires_at>?",rusqlite::params![expires,prefix.as_ref().trim_end_matches('/'),lease.reader_id,epoch_i64,now]).map_err(super::sqlite_error)?;
+        if changed!=1{
+            // No live row was updated. Classify: a same-id row at a different
+            // epoch is a stale token (gate boundary), while a missing or
+            // expired row at this epoch is a dead admission.
+            let row:Option<(i64,i64)>=conn.query_row("SELECT epoch,expires_at FROM novel_reader_leases WHERE prefix=? AND reader_id=?",rusqlite::params![prefix.as_ref().trim_end_matches('/'),lease.reader_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(super::sqlite_error)?;
+            match row {
+                Some((row_epoch,_)) if row_epoch!=epoch_i64 => return Err(af::gate_closed_error(prefix)),
+                _ => return Err(af::lease_expired_error(prefix)),
+            }
+        }
         Ok(GateLease{reader_id:lease.reader_id.clone(),epoch:lease.epoch,expires_at:expires})
     }))})}
     fn release_reader<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease)->PlatformFuture<'a,Result<()>>{Box::pin(async move{run_scoped_blocking(||{
@@ -2136,9 +2194,10 @@ impl NovelAccessFence for SqliteObjectStore {
         // admitted at: drain stays legal after close advanced the gate
         // epoch, a stale token cannot touch a same-reader-id lease
         // re-admitted at a newer epoch, and a missing/already-released row
-        // is idempotent.
+        // is idempotent. The second clause sweeps this prefix's expired rows
+        // so a release also reclaims dead admissions for free.
         self.mirror.with_reader_gate_lock(prefix.as_ref().trim_end_matches('/'),||{
-            self.conn.lock().execute("DELETE FROM novel_reader_leases WHERE prefix=? AND reader_id=? AND epoch=?",rusqlite::params![prefix.as_ref().trim_end_matches('/'),lease.reader_id,epoch]).map_err(super::sqlite_error)?;
+            self.conn.lock().execute("DELETE FROM novel_reader_leases WHERE prefix=? AND ((reader_id=? AND epoch=?) OR expires_at<=?)",rusqlite::params![prefix.as_ref().trim_end_matches('/'),lease.reader_id,epoch,ts::now_secs()]).map_err(super::sqlite_error)?;
             self.mirror.release_reader_locked(prefix,lease)
         })
     })})}
@@ -3227,6 +3286,50 @@ mod tests {
         });
     }
 
+    /// `admit_reader` / `release_reader` sweep expired rows in the same
+    /// transaction so a busy prefix cannot accumulate dead leases
+    /// (`novel_reader_leases_expiry` index), while live rows — even on the
+    /// same prefix — are never collected.
+    #[test]
+    fn reader_admission_and_release_reclaim_only_expired_lease_rows(){
+        let root=tempfile::tempdir().unwrap();let conn=crate::native::sqlite::open_in_memory().unwrap();
+        let mirror=NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let store=SqliteObjectStore::with_mirror_files(conn.clone(),mirror,false);
+        let prefix=ObjectPrefix::new("novels/site/gc/").unwrap();
+        let other=ObjectPrefix::new("novels/site/other/").unwrap();
+        futures::executor::block_on(async{
+            store.rebind_writer(&prefix,0).await.unwrap();
+            store.rebind_writer(&other,0).await.unwrap();
+            let key=prefix.as_ref().trim_end_matches('/');
+            let other_key=other.as_ref().trim_end_matches('/');
+            let past=ts::now_secs()-60;
+            let far_future=ts::now_secs()+3600;
+            {
+                let conn=conn.lock();
+                // Expired rows on this prefix (the production accumulation),
+                // plus a live row and an expired row on another prefix that
+                // must not be touched by this prefix's sweep.
+                conn.execute("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) VALUES(?,'dead-a',0,?)",rusqlite::params![key,past]).unwrap();
+                conn.execute("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) VALUES(?,'dead-b',0,?)",rusqlite::params![key,past]).unwrap();
+                conn.execute("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) VALUES(?,'alive',0,?)",rusqlite::params![key,far_future]).unwrap();
+                conn.execute("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) VALUES(?,'dead-other',0,?)",rusqlite::params![other_key,past]).unwrap();
+            }
+            let count=|conn:&std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>,prefix:&str|->i64{
+                conn.lock().query_row("SELECT count(*) FROM novel_reader_leases WHERE prefix=?1",[prefix],|row|row.get(0)).unwrap()
+            };
+            assert_eq!(count(&conn,key),3);
+            store.admit_reader(&prefix,"new-reader",300).await.unwrap();
+            assert_eq!(count(&conn,key),2,"expired rows of this prefix are swept, the live row stays");
+            assert_eq!(count(&conn,other_key),1,"other prefixes are untouched");
+
+            // release_reader also sweeps this prefix's expired leftovers.
+            conn.lock().execute("INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) VALUES(?,'dead-c',0,?)",rusqlite::params![key,past]).unwrap();
+            let lease=GateLease{reader_id:"new-reader".into(),epoch:0,expires_at:far_future};
+            store.release_reader(&prefix,&lease).await.unwrap();
+            assert_eq!(count(&conn,key),1,"release drains the token AND sweeps expired rows; 'alive' survives");
+        });
+    }
+
     /// Crash boundaries of SQL→FS adoption: an uncommitted intent is rolled
     /// back by the startup sweep (journal orphan removed, SQL row stays the
     /// single authority); a committed intent is finalized from its durable
@@ -3693,5 +3796,106 @@ mod tests {
                 ("novels/site/book/d.txt".to_string(), 8),
             ]
         );
+    }
+
+    /// Ruby 版が書いた末尾空白付きキー (`本文/65 テスト .yaml`) だけが
+    /// `native_logical_objects` に残っている小説でも、`.../本文/<index> *.yaml`
+    /// のフォールバック解決で読めること。ミラー無効 (DB のみ) を固定する。
+    #[test]
+    fn section_reads_resolve_ruby_trailing_space_keys_without_mirror() {
+        use crate::application::novel_access::NovelReadLease;
+        use crate::downloader::persistence::PersistenceService;
+        use crate::platform::NovelObjectKeys;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::native::sqlite::migrations::apply(&mut conn).unwrap();
+        let mirror = NativeObjectStore::from_root(dir.path().to_path_buf()).unwrap();
+        let store = SqliteObjectStore::with_mirror_files(Arc::new(Mutex::new(conn)), mirror, false);
+        let objects: Arc<dyn ObjectStore> = Arc::new(store.clone());
+        let keys = NovelObjectKeys::new("site", "title", false).unwrap();
+        let raw_key = ObjectKey::try_new("novels/site/title/本文/65 テスト .yaml").unwrap();
+        let canonical = keys.section("65", "テスト ");
+        assert_ne!(raw_key, canonical);
+        let section_yaml =
+            "index: '65'\nhref: '65'\nsubtitle: 'テスト '\nfile_subtitle: 'テスト '\nsubdate: ''\nelement:\n  body: 末尾空白の本文\n";
+
+        futures::executor::block_on(async {
+            ObjectStore::write_small(&store, &raw_key, section_yaml.as_bytes().to_vec())
+                .await
+                .unwrap();
+            assert!(
+                !dir.path().join("site/title/本文").exists(),
+                "all objects are DB-only"
+            );
+
+            // 正規キーの read_small も同じフォールバックで解決される。
+            assert_eq!(
+                ObjectStore::read_small(&store, &canonical).await.unwrap().unwrap(),
+                section_yaml.as_bytes()
+            );
+
+            let service = PersistenceService::new(objects.clone());
+            let subtitle = crate::downloader::SubtitleInfo {
+                index: "65".into(),
+                href: "65".into(),
+                chapter: String::new(),
+                subchapter: String::new(),
+                subtitle: "テスト ".into(),
+                file_subtitle: "テスト ".into(),
+                subdate: String::new(),
+                subupdate: None,
+                download_time: None,
+                download_revision: 0,
+            };
+
+            let mut lease = NovelReadLease::admit_for(&objects, &keys, "legacy-section").await.unwrap();
+            let loaded = service.load_section(&mut lease, &keys, &subtitle).await.unwrap();
+            assert_eq!(loaded.unwrap().element.body, "末尾空白の本文");
+
+            let toc = crate::downloader::TocFile {
+                title: "title".into(),
+                author: "author".into(),
+                toc_url: "https://example.test/".into(),
+                story: None,
+                subtitles: vec![subtitle],
+                novel_type: None,
+            };
+            ObjectStore::write_small(
+                &store,
+                &keys.toc(),
+                crate::downloader::persistence::serialize_toc(&toc).unwrap().into_bytes(),
+            )
+            .await
+            .unwrap();
+            let snapshot_lease =
+                NovelReadLease::admit_for(&objects, &keys, "legacy-section-snapshot").await.unwrap();
+            let mut stream = service.stream_sections_snapshot(snapshot_lease, keys.clone(), toc);
+            let streamed = futures::StreamExt::next(&mut stream).await.unwrap().unwrap();
+            assert_eq!(streamed.element.body, "末尾空白の本文");
+            assert!(futures::StreamExt::next(&mut stream).await.is_none());
+        });
+    }
+
+    /// `renew_reader` 分類が FS / Memory と一致することを固定する:
+    /// close→open 後の stale トークンは `novel_recovering`、同一 epoch の
+    /// 欠損行は `novel_lease_expired`。
+    #[test]
+    fn renew_reader_classifies_stale_epoch_and_expired_lease() {
+        let (_dir, store) = temp_store();
+        let prefix = ObjectPrefix::new("novels/site/book").unwrap();
+        futures::executor::block_on(async {
+            let stale = store.admit_reader(&prefix, "stale", 30).await.unwrap();
+            let epoch = store.close_gate(&prefix, "transfer").await.unwrap();
+            store.open_gate(&prefix, "transfer", epoch).await.unwrap();
+            store.admit_reader(&prefix, "other", 30).await.unwrap();
+            let error = store.renew_reader(&prefix, &stale, 30).await.unwrap_err();
+            assert!(error.to_string().contains("novel_recovering"), "unexpected: {error}");
+
+            let live = store.admit_reader(&prefix, "live", 30).await.unwrap();
+            store.release_reader(&prefix, &live).await.unwrap();
+            let error = store.renew_reader(&prefix, &live, 30).await.unwrap_err();
+            assert!(error.to_string().contains("novel_lease_expired"), "unexpected: {error}");
+        });
     }
 }

@@ -134,9 +134,11 @@ EPUB の単一範囲 `Range: bytes=0-0` または通常 GET を使います。
 
 エラーは出力形式に関係なく `{"error": {"code": "...", "message": "..."}}`
 で返す。入力不正は 400 (`bad_request`)、作品・目次・本文の欠落は
-404 (`not_found`)、状態競合は 409 (`conflict`)、保存データの破損や
-ストレージ障害は 500 (`internal_error`)。未認証は 401
-(`authentication_required`)。Native／Workers で同じ対応を使う。
+404 (`not_found`)、状態競合は 409 (`conflict` / `novel_epoch_conflict`)、
+作品のロック競合は 423 (`novel_busy`)、転送・復旧中やリース失効による
+一時的な読み取り不能は 503 (`novel_recovering` / `novel_lease_expired` /
+`recovery_required`)、保存データの破損やストレージ障害は 500
+(`internal_error`)。未認証は 401 (`authentication_required`)。Native／Workers で同じ対応を使う。
 
 ## 一覧の絞り込み
 

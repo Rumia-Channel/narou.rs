@@ -1186,7 +1186,7 @@ try {
       const body = await blocked.text();
       assert.match(body, /novel_recovering/, 'the rejection must report the closed gate');
       const epubBlocked = await admin(reader.base, `/api/novels/${NOVEL.id}/download.epub`);
-      await expectStatus(epubBlocked, 500, 'EPUB generation must refuse admission on a closed gate');
+      await expectStatus(epubBlocked, 503, 'EPUB generation must refuse admission on a closed gate');
       assert.match(await epubBlocked.text(), /novel_recovering/, 'the EPUB failure must report the closed gate');
       // gate が (閉鎖→再公開で) 置き換わると旧 epoch の lease は CAS で拒否される。
       const stale = await fetchOn(reader.base, '/api/control/novel-access', {
@@ -1199,10 +1199,50 @@ try {
         }),
       });
       await expectStatus(stale, 200, 'renew verdict');
-      assert.equal((await stale.json()).ok, false, 'a stale-epoch lease must not renew');
+      const staleVerdict = await stale.json();
+      assert.equal(staleVerdict.ok, false, 'a stale-epoch lease must not renew');
+      assert.match(staleVerdict.error ?? '', /novel_recovering/, 'a closed gate must be reported as novel_recovering');
       await sql(
         `UPDATE novel_access_gates SET closed=0,owner=NULL,updated_at=unixepoch() ` +
           `WHERE prefix=${quote(prefix)}`,
+      );
+      // gate が開いたまま同じ epoch なら、リース行の死滅は novel_lease_expired、
+      // 別 epoch の行が残る置き換えは novel_recovering と区別される。
+      const openEpoch = await scalar(
+        `SELECT epoch FROM novel_access_gates WHERE prefix=${quote(prefix)}`,
+      );
+      const missingRow = await fetchOn(reader.base, '/api/control/novel-access', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', Authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({
+          op: 'renew',
+          prefix,
+          lease: { reader_id: 'vanished-reader', epoch: openEpoch, expires_at: 1 },
+        }),
+      });
+      await expectStatus(missingRow, 200, 'open-gate renew verdict');
+      const missingVerdict = await missingRow.json();
+      assert.equal(missingVerdict.ok, false, 'a missing lease row must not renew');
+      assert.match(missingVerdict.error ?? '', /novel_lease_expired/, 'a dead lease row must be reported as novel_lease_expired');
+      await sql(
+        `INSERT INTO novel_reader_leases(prefix,reader_id,epoch,expires_at) ` +
+          `VALUES (${quote(prefix)},'stale-reader',${openEpoch + 1},${Math.floor(Date.now() / 1000) + 60})`,
+      );
+      const staleRow = await fetchOn(reader.base, '/api/control/novel-access', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', Authorization: `Bearer ${adminToken}` },
+        body: JSON.stringify({
+          op: 'renew',
+          prefix,
+          lease: { reader_id: 'stale-reader', epoch: openEpoch, expires_at: 1 },
+        }),
+      });
+      await expectStatus(staleRow, 200, 'other-epoch renew verdict');
+      const staleRowVerdict = await staleRow.json();
+      assert.equal(staleRowVerdict.ok, false, 'a replaced lease row must not renew');
+      assert.match(staleRowVerdict.error ?? '', /novel_recovering/, 'a lease row at another epoch must be reported as novel_recovering');
+      await sql(
+        `DELETE FROM novel_reader_leases WHERE prefix=${quote(prefix)} AND reader_id='stale-reader'`,
       );
       const recovered = await external(`/api/v1/novels/${NOVEL.id}`);
       await expectStatus(recovered, 200, 'delivery resumes once the gate reopens');

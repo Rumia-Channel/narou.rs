@@ -291,6 +291,17 @@ pub fn novel_busy_error(prefix: &ObjectPrefix) -> NarouError {
 }
 
 
+/// A reader lease token that is missing or past `expires_at` even though the
+/// gate itself is open at the expected epoch. Kept distinct from
+/// [`gate_closed_error`] (`novel_recovering`) so callers can tell an expired
+/// admission apart from a real gate closure.
+pub fn lease_expired_error(prefix: &ObjectPrefix) -> NarouError {
+    NarouError::Platform(format!(
+        "novel_lease_expired: reader lease expired for {}",
+        prefix.as_ref()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
