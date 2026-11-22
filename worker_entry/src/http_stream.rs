@@ -7,7 +7,7 @@ use narou_rs::platform::{AssetStream, http::{HttpStreamResponse, HttpPacing}, st
 /// Owns the request that produced a response body. Dropping it aborts the
 /// request, so a cancelled consumer closes the upstream connection instead of
 /// leaving it to the runtime's own drain.
-struct FetchAbortGuard(Option<worker::AbortController>);
+pub(super) struct FetchAbortGuard(pub(super) Option<worker::AbortController>);
 
 impl Drop for FetchAbortGuard {
     fn drop(&mut self) {
@@ -46,6 +46,7 @@ fn fetch_stream(
     limit: Option<u64>,
     expected: Option<u64>,
     mut abort: FetchAbortGuard,
+    body_deadline: Option<f64>,
 ) -> Result<AssetStream> {
     let worker::ResponseBody::Stream(stream) = body else {
         abort.0 = None;
@@ -81,8 +82,13 @@ fn fetch_stream(
                 if end == chunk.length() { state.pending = None; state.offset = 0; }
                 return Ok(Some((bytes, (state, next))));
             }
+            let timeout_ms = match body_deadline {
+                Some(deadline_ms) => deadline_left(deadline_ms, "fetch", "Fetch body read")?
+                    .min(READ_TIMEOUT_SECS as f64 * 1_000.0),
+                None => READ_TIMEOUT_SECS as f64 * 1_000.0,
+            };
             let value = with_timeout(JsFuture::from(state.reader.read()).map(|value| value.map_err(js_error)),
-                READ_TIMEOUT_SECS as f64 * 1_000.0, "Fetch body read").await?;
+                timeout_ms, "fetch", "Fetch body read").await?;
             if js_sys::Reflect::get(&value, &JsValue::from_str("done")).map_err(js_error)?.is_truthy() {
                 if expected.is_some_and(|length| length != total) { return Err(NarouError::Http("truncated Fetch body".into())); }
                 state.abort.0 = None;
@@ -97,7 +103,12 @@ fn fetch_stream(
 }
 
 impl WorkerHttpClient {
-    async fn send_fetch_stream_hop(&self, request: &HttpRequest) -> Result<HttpStreamResponse> {
+    async fn send_fetch_stream_hop(
+        &self,
+        request: &HttpRequest,
+        deadline_ms: f64,
+        body_deadline: Option<f64>,
+    ) -> Result<HttpStreamResponse> {
         let method = match request.method { HttpMethod::Get => Method::Get, HttpMethod::Post => Method::Post,
             HttpMethod::Put => Method::Put, HttpMethod::Delete => Method::Delete };
         let headers = Headers::new();
@@ -117,8 +128,19 @@ impl WorkerHttpClient {
         // open and never has to read the remaining bytes to EOF.
         let abort = FetchAbortGuard(Some(worker::AbortController::default()));
         let signal = abort.0.as_ref().expect("new Fetch owns its controller").signal();
-        let response = Fetch::Request(fetch).send_with_signal(&signal).await
-            .map_err(|error| NarouError::Http(error.to_string()))?;
+        // Same per-hop budget as `send_fetch_hop` in `http.rs`: a stalled
+        // `send()` fails into the socket→relay fallback chain as
+        // `NarouError::Http` instead of hanging the request. On timeout the
+        // pending future is dropped, `FetchAbortGuard` aborts the request,
+        // and `abort` is consumed by `fetch_stream` only after a head was
+        // actually received.
+        let response = with_timeout(
+            async { Fetch::Request(fetch).send_with_signal(&signal).await.map_err(|error| NarouError::Http(error.to_string())) },
+            deadline_left(deadline_ms, "fetch", "request")?.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
+            "fetch",
+            "request",
+        )
+        .await?;
         let status = response.status_code();
         let mut headers = response.headers().entries().filter(|(name, _)| !name.eq_ignore_ascii_case("set-cookie")).collect::<Vec<_>>();
         for cookie in response.headers().get_all("set-cookie").map_err(|error| NarouError::Http(error.to_string()))? {
@@ -132,7 +154,8 @@ impl WorkerHttpClient {
         let limit = if request.trusted_endpoint && (200..300).contains(&status) {
             request.trusted_response_body_limit.map(|value| value as u64)
         } else if !(200..300).contains(&status) { Some(MAX_WORKER_HTTP_BODY as u64) } else { None };
-        let body = fetch_stream(response.into_parts().1, limit, expected, abort)?;
+        let body_deadline = if !(200..300).contains(&status) { Some(deadline_ms) } else { body_deadline };
+        let body = fetch_stream(response.into_parts().1, limit, expected, abort, body_deadline)?;
         Ok(HttpStreamResponse { status, url: request.url.clone(), headers, body })
     }
 
@@ -164,7 +187,8 @@ impl WorkerHttpClient {
                                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0");
                             relay_request.headers.push(("User-Agent".into(), user_agent.to_string()));
                         }
-                        let forced_response = match self.send_fetch_stream_hop(&relay_request).await {
+                        let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+                        let forced_response = match self.send_fetch_stream_hop(&relay_request, deadline_ms, Some(deadline_ms)).await {
                             Ok(response) => narou_rs::platform::relay::decode_relay_stream(response).await,
                             Err(error) => Err(error),
                         };
@@ -191,7 +215,9 @@ impl WorkerHttpClient {
                     }
                 }
                 if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.acquire(scope).await?; }
-                let result = self.send_fetch_stream_hop(request).await;
+                let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+                let body_deadline = (!request.trusted_endpoint).then_some(deadline_ms);
+                let result = self.send_fetch_stream_hop(request, deadline_ms, body_deadline).await;
                 if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) { policy.limiter.complete(scope).await?; }
                 // A 403 GET — or a transport failure — can be a Cloudflare
                 // egress block, so try socket then relay on any GET failure,
@@ -241,7 +267,8 @@ impl WorkerHttpClient {
                                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0");
                                 relay_request.headers.push(("User-Agent".into(), user_agent.to_string()));
                             }
-                            let relay_response = match self.send_fetch_stream_hop(&relay_request).await {
+                            let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+                            let relay_response = match self.send_fetch_stream_hop(&relay_request, deadline_ms, Some(deadline_ms)).await {
                                 Ok(response) => narou_rs::platform::relay::decode_relay_stream(response).await,
                                 Err(error) => Err(error),
                             };

@@ -10,6 +10,8 @@ struct Transport {
     journal: Mutex<std::collections::BTreeMap<String, (Vec<u8>, u64)>>,
     hold_part: AtomicBool,
     ignore_range: AtomicBool,
+    fail_stat: AtomicBool,
+    stat_calls: AtomicUsize,
     body_polls: Arc<AtomicUsize>,
 }
 
@@ -62,6 +64,17 @@ impl HttpClient for Transport {
                 response.body = b"<CompleteMultipartUploadResult><ETag>complete</ETag></CompleteMultipartUploadResult>".to_vec();
             } else if request.method == HttpMethod::Get && request.url.contains("uploads=") {
                 response.body = b"<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>".to_vec();
+            } else if request.method == HttpMethod::Get && request.header("range") == Some("bytes=0-0") {
+                self.stat_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_stat.load(Ordering::SeqCst) {
+                    response.status = 404;
+                } else {
+                    let total = self.uploaded.load(Ordering::SeqCst).max(1);
+                    response.status = 206;
+                    response.headers.push(("content-range".into(), format!("bytes 0-0/{total}")));
+                    response.headers.push(("content-length".into(), "1".into()));
+                    response.body = vec![1];
+                }
             } else if request.method == HttpMethod::Put {
                 self.uploaded.store(request.body.as_ref().map_or(0, |body| body.len()) as u64, Ordering::SeqCst);
             }
@@ -185,5 +198,21 @@ fn progress_survives_creation_ttl_and_claimed_or_deleted_leases_never_revive() {
         store.delete_stage_record(&stage.key).await.unwrap();
         assert!(store.renew_stage_progress(&stage.key).await.is_err());
         assert!(transport.journal.lock().is_empty());
+    });
+}
+
+#[test]
+fn multipart_staging_upload_skips_post_complete_stat() {
+    futures::executor::block_on(async {
+        let transport = Arc::new(Transport::default());
+        transport.fail_stat.store(true, Ordering::SeqCst);
+        let store = store(transport.clone());
+        // Two parts (> 8 MiB) forces the multipart upload path in upload_parts.
+        let chunks = (PART_BYTES / (64 * 1024)) + 2;
+        let stream: AssetStream = Box::pin(futures::stream::iter((0..chunks).map(|_| Ok(vec![0x5a; 64 * 1024]))));
+        let stage = store.stage_stream(stream).await.unwrap();
+        assert_eq!(stage.size, (chunks * 64 * 1024) as u64);
+        assert_eq!(transport.parts.lock().len(), 2);
+        assert_eq!(transport.stat_calls.load(Ordering::SeqCst), 0);
     });
 }

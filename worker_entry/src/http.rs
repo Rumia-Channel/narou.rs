@@ -164,7 +164,7 @@ impl WorkerHttpClient {
                     relay_request.headers.push(("Accept".to_string(), "application/json".to_string()));
                 }
                 let wire_response = self
-                    .send_fetch_hop(&relay_request, response_wire_limit(MAX_WORKER_HTTP_BODY))
+                    .send_fetch_hop(&relay_request, response_wire_limit(MAX_WORKER_HTTP_BODY), deadline_ms)
                     .await?;
                 let relay_response = RelayResponse::parse(
                     wire_response.status, &wire_response.body, MAX_WORKER_HTTP_BODY,
@@ -198,6 +198,7 @@ impl WorkerHttpClient {
         &self,
         request: &HttpRequest,
         response_limit: usize,
+        deadline_ms: f64,
     ) -> Result<HttpResponse> {
         let method = match request.method {
             HttpMethod::Get => Method::Get,
@@ -227,10 +228,20 @@ impl WorkerHttpClient {
         let request = Request::new_with_init(&request.url, &init)
             .map_err(|error| NarouError::Platform(format!("invalid HTTP request: {error}")))?;
         self.subrequests.record();
-        let response = Fetch::Request(request)
-            .send()
-            .await
-            .map_err(|error| NarouError::Http(error.to_string()))?;
+        let mut abort = streaming::FetchAbortGuard(Some(worker::AbortController::default()));
+        let signal = abort.0.as_ref().expect("new Fetch owns its controller").signal();
+        // The primary Fetch hop previously had no timeout at all: a stalled
+        // `send()` could hang the request forever. It now shares the same
+        // per-hop budget as the raw-socket fallback (deadline + per-phase cap)
+        // and aborts the underlying Workers Fetch subrequest on timeout/error
+        // so stalled upstreams are not left dangling while fallback runs.
+        let response = with_timeout(
+            async { Fetch::Request(request).send_with_signal(&signal).await.map_err(|error| NarouError::Http(error.to_string())) },
+            deadline_left(deadline_ms, "fetch", "request")?.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
+            "fetch",
+            "request",
+        )
+        .await?;
         let status = response.status_code();
         let mut headers = response.headers().entries()
             .filter(|(name, _)| !name.eq_ignore_ascii_case("set-cookie"))
@@ -254,14 +265,15 @@ impl WorkerHttpClient {
             if let worker::ResponseBody::Stream(stream) = response.into_parts().1 {
                 let _ = with_timeout(
                     JsFuture::from(stream.cancel()).map(|result| result.map(|_| ()).map_err(js_error)),
-                    5_000.0, "Fetch body cancel",
+                    5_000.0, "fetch", "Fetch body cancel",
                 ).await;
             }
             return Err(NarouError::Platform(
                 "Worker HTTP response body exceeds limit".to_string(),
             ));
         }
-        let body = read_fetch_body(response.into_parts().1, limit).await?;
+        let body = read_fetch_body(response.into_parts().1, limit, deadline_ms).await?;
+        abort.0 = None;
         Ok(HttpResponse {
             status,
             headers,
@@ -336,7 +348,10 @@ impl WorkerHttpClient {
                 // Fetch is always manual. A partial/failed Fetch body returns
                 // an error; only a complete response or a transport failure
                 // reaches the fallback decision below.
-                let fetch_result = self.send_fetch_hop(request, MAX_WORKER_HTTP_BODY).await;
+                let fetch_result = self.send_fetch_hop(
+                    request, MAX_WORKER_HTTP_BODY,
+                    js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0,
+                ).await;
                 if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
                     policy.limiter.complete(scope).await?;
                 }
@@ -472,7 +487,7 @@ impl HttpClient for WorkerHttpClient {
 
 /// Consume the real stream, cancelling it on size/read failure. Using the
 /// reader directly keeps an aborted partial body from becoming successful EOF.
-async fn read_fetch_body(body: worker::ResponseBody, limit: usize) -> Result<Vec<u8>> {
+async fn read_fetch_body(body: worker::ResponseBody, limit: usize, deadline_ms: f64) -> Result<Vec<u8>> {
     match body {
         worker::ResponseBody::Empty => Ok(Vec::new()),
         worker::ResponseBody::Body(body) if body.len() <= limit => Ok(body),
@@ -486,8 +501,14 @@ async fn read_fetch_body(body: worker::ResponseBody, limit: usize) -> Result<Vec
             let result = async {
                 let mut body = Vec::new();
                 loop {
-                    let value = JsFuture::from(reader.read()).await
-                        .map_err(|error| NarouError::Http(format!("Fetch body read failed: {error:?}")))?;
+                    let value = with_timeout(
+                        JsFuture::from(reader.read()).map(|result| result
+                            .map_err(|error| NarouError::Http(format!("Fetch body read failed: {error:?}")))),
+                        deadline_left(deadline_ms, "fetch", "read")?.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
+                        "fetch",
+                        "read",
+                    )
+                    .await?;
                     if js_sys::Reflect::get(&value, &JsValue::from_str("done"))
                         .map_err(js_error)?.is_truthy()
                     {
@@ -509,7 +530,7 @@ async fn read_fetch_body(body: worker::ResponseBody, limit: usize) -> Result<Vec
             if result.is_err() {
                 let _ = with_timeout(
                     JsFuture::from(reader.cancel()).map(|result| result.map(|_| ()).map_err(js_error)),
-                    5_000.0, "Fetch body cancel",
+                    5_000.0, "fetch", "Fetch body cancel",
                 ).await;
             }
             reader.release_lock();
@@ -533,10 +554,10 @@ struct RawSocket {
 
 /// Milliseconds remaining until `deadline_ms` (`Date.now()` clock), or an
 /// error once the total budget is spent.
-fn deadline_left(deadline_ms: f64, what: &str) -> Result<f64> {
+fn deadline_left(deadline_ms: f64, transport: &str, what: &str) -> Result<f64> {
     let left = deadline_ms - js_sys::Date::now();
     if left <= 0.0 {
-        return Err(NarouError::Http(format!("socket {what}: total timeout")));
+        return Err(NarouError::Http(format!("{transport} {what}: total timeout")));
     }
     Ok(left)
 }
@@ -544,7 +565,7 @@ fn deadline_left(deadline_ms: f64, what: &str) -> Result<f64> {
 /// `fut` with a deadline, whichever fires first. The loser is dropped — for
 /// `read()`/`write()` that abandons the pending promise, which the socket's
 /// `close()` then settles.
-async fn with_timeout<T>(fut: impl Future<Output = Result<T>>, ms: f64, what: &str) -> Result<T> {
+async fn with_timeout<T>(fut: impl Future<Output = Result<T>>, ms: f64, transport: &str, what: &str) -> Result<T> {
     match future::select(
         pin!(fut),
         pin!(worker::Delay::from(Duration::from_millis(
@@ -554,7 +575,7 @@ async fn with_timeout<T>(fut: impl Future<Output = Result<T>>, ms: f64, what: &s
     .await
     {
         Either::Left((result, _delay)) => result,
-        Either::Right(((), _pending)) => Err(NarouError::Http(format!("socket {what} timed out"))),
+        Either::Right(((), _pending)) => Err(NarouError::Http(format!("{transport} {what} timed out"))),
     }
 }
 
@@ -597,12 +618,12 @@ async fn connect_socket(target: &SocketTarget, deadline_ms: f64) -> Result<RawSo
     .map_err(js_error)?;
 
     let inner = worker_sys::connect(address.into(), options.into()).map_err(js_error)?;
-    let left = deadline_left(deadline_ms, "connect")?;
+    let left = deadline_left(deadline_ms, "socket", "connect")?;
     with_timeout(
         JsFuture::from(inner.opened().map_err(js_error)?)
             .map(|result| result.map(|_| ()).map_err(js_error)),
         left.min(CONNECT_TIMEOUT_SECS as f64 * 1_000.0),
-        "connect",
+        "socket", "connect",
     )
     .await?;
 
@@ -624,7 +645,7 @@ impl RawSocket {
     /// One atomic write — request heads are a few hundred bytes, far below
     /// the stream's internal queue, so a single `write()` suffices.
     async fn write_all(&self, bytes: &[u8], deadline_ms: f64) -> Result<()> {
-        let left = deadline_left(deadline_ms, "write")?;
+        let left = deadline_left(deadline_ms, "socket", "write")?;
         with_timeout(
             JsFuture::from(
                 self.writer
@@ -632,18 +653,18 @@ impl RawSocket {
             )
             .map(|result| result.map(|_| ()).map_err(js_error)),
             left.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
-            "write",
+            "socket", "write",
         )
         .await
     }
 
     /// Next chunk of response bytes; `None` at EOF.
     async fn read_chunk(&mut self, deadline_ms: f64) -> Result<Option<js_sys::Uint8Array>> {
-        let left = deadline_left(deadline_ms, "read")?;
+        let left = deadline_left(deadline_ms, "socket", "read")?;
         let value = with_timeout(
             JsFuture::from(self.reader.read()).map(|result| result.map_err(js_error)),
             left.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
-            "read",
+            "socket", "read",
         )
         .await?;
         let done = js_sys::Reflect::get(&value, &JsValue::from_str("done"))
@@ -667,6 +688,7 @@ impl RawSocket {
             let _ = with_timeout(
                 JsFuture::from(promise).map(|result| result.map(|_| ()).map_err(js_error)),
                 5_000.0,
+                "socket",
                 "close",
             )
             .await;
