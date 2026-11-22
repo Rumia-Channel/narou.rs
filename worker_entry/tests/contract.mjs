@@ -20,6 +20,7 @@ import https from "node:https";
 import net from "node:net";
 import process from "node:process";
 import test from "node:test";
+import { fixtureNovel, transferClient } from "./transfer.mjs";
 
 const BASE_URL = process.env.BASE_URL ?? "http://127.0.0.1:8787";
 const TOKEN = process.env.NAROU_ADMIN_TOKEN;
@@ -1072,6 +1073,47 @@ await check("GET /api/storage/mode reports the worker storage", async () => {
     assert(result.success === true && result.s3_list === "ok", "S3 LIST must succeed");
   }
 });
+
+// S3 バックエンドの本文書き込みは stage→copy を経る。本番 (Wasabi) では PUT 直後の
+// stat が 404/416 を返し得るため、stage→copy 成功を実書き込みで確認する。
+// transfer import は外部 fetch を伴わず `publish_stream` → `stage→copy` と同じ
+// 経路を駆動するので、deploy 済み環境でのみこの検査を行う。
+if (!IS_LOCAL && !UNCONFIGURED) {
+  await check("a deployed S3 stage→copy content write succeeds (transfer import)", async () => {
+    const client = transferClient(BASE_URL, TOKEN);
+    client.extraHeaders = accessHeaders();
+    // `本文/1 第1話.yaml` は FileRole::Body + is_content_key で stage→copy を
+    // 必ず踏む。挿絵 (pool 経路) も含めて両系統の copy を同時に確認する。
+    // slug は実行ごとに一意にし、既存レコードへの skip で検証が素通りになる
+    // のを防ぐ。
+    const slug = `stage-copy-${crypto.randomUUID().slice(0, 8)}`;
+    const novel = fixtureNovel(slug, [
+      { path: "本文/1 第1話.yaml", bytes: Buffer.from("subtitle: 第1話\ntext: 本文\n") },
+      { path: "挿絵/cover.png", bytes: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64") },
+    ]);
+    const result = await client.importData([novel]);
+    assert.equal(result.plan[0]?.action, "create", "the fixture must be a fresh write");
+    assert.equal(
+      result.status.state,
+      "completed",
+      `stage→copy import must complete: ${JSON.stringify(result.status).slice(0, 400)}`,
+    );
+    // 後始末: 生成した小説を削除してライブラリを汚さない。
+    const listed = await json(await request("/api/novels?limit=1000", auth()));
+    const created = (listed.data ?? []).find((row) => row.toc_url === novel.toc_url);
+    if (created) {
+      const removed = await request(`/api/novels/${created.id}`, {
+        method: "DELETE",
+        headers: {
+          "content-type": "application/json",
+          ...(TOKEN ? { authorization: `Bearer ${TOKEN}` } : {}),
+        },
+        body: JSON.stringify({ with_file: true }),
+      });
+      assert(removed.status === 200, `cleanup delete failed: ${removed.status}`);
+    }
+  });
+}
 
 await check("GET /api/webui/config returns the UI configuration", async () => {
   const response = await request("/api/webui/config", auth());
