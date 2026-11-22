@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{NarouError, Result};
 use crate::application::novel_access::{NovelReadLease, NovelWriteGuard};
 use crate::platform::{
-    Clock, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore, SystemClock,
+    Clock, NovelObjectKeys, ObjectKey, ObjectListRequest, ObjectPrefix, ObjectStore, SystemClock,
     ObjectFingerprint, ObjectFingerprintMismatch,
 };
 
@@ -62,6 +62,27 @@ pub fn raw_filename(subtitle: &SubtitleInfo) -> String {
     let section = section_filename(subtitle);
     let stem = section.strip_suffix(".yaml").unwrap_or(&section);
     format!("{stem}.html")
+}
+
+/// Ruby 版由来のサニタイズ前キー (例: 末尾空白付き) や v0.6.10 以前の
+/// 80 文字切り詰めキーへのフォールバック読み。正規キーが無い場合にだけ
+/// 差分のある旧キー候補を順に試す。通常ケースでは追加の読み出しを行わない。
+/// `(bytes, 実際に読めたキー)` を返す。
+async fn read_section_bytes(
+    lease: &mut NovelReadLease,
+    keys: &NovelObjectKeys,
+    subtitle: &SubtitleInfo,
+) -> Result<Option<(Vec<u8>, ObjectKey)>> {
+    let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+    if let Some(bytes) = lease.read_small(&key).await? {
+        return Ok(Some((bytes, key)));
+    }
+    for fallback in keys.legacy_section_fallbacks(&subtitle.index, &subtitle.file_subtitle) {
+        if let Some(bytes) = lease.read_small(&fallback).await? {
+            return Ok(Some((bytes, fallback)));
+        }
+    }
+    Ok(None)
 }
 
 /// Match the stored body to the generation declared by its TOC entry.
@@ -139,10 +160,7 @@ impl PersistenceService {
         keys: &NovelObjectKeys,
         subtitle: &SubtitleInfo,
     ) -> Result<Option<SectionFile>> {
-        let Some(bytes) = lease
-            .read_small(&keys.section(&subtitle.index, &subtitle.file_subtitle))
-            .await?
-        else {
+        let Some((bytes, _)) = read_section_bytes(lease, keys, subtitle).await? else {
             return Ok(None);
         };
         Ok(Some(deserialize_section(&bytes)?))
@@ -163,8 +181,7 @@ impl PersistenceService {
                 let result: Result<Option<SectionFile>> = async {
                     let expected = expected_toc.as_ref().map_err(|error| NarouError::Platform(error.to_string()))?;
                     if let Some(subtitle) = toc.subtitles.get(position) {
-                        let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
-                        let bytes = lease.read_small(&key).await?.ok_or_else(|| {
+                        let (bytes, key) = read_section_bytes(&mut lease, &keys, subtitle).await?.ok_or_else(|| {
                             NarouError::Io(std::io::Error::new(std::io::ErrorKind::NotFound,
                                 format!("section file not found: expected '{}' in {}/本文", section_filename(subtitle), keys.prefix())))
                         })?;
@@ -1519,7 +1536,7 @@ mod tests {
             let subtitles = [subtitle];
             let error = service.stream_sections_ordered(lease, &keys, &subtitles).try_collect::<Vec<_>>().await.unwrap_err();
             assert!(matches!(error, SectionLoadFailure::Read(_)));
-            assert!(format!("{error:?}").contains("novel_epoch_conflict"), "lease renewal must be denied after the gate closes mid-read: {error:?}");
+            assert!(format!("{error:?}").contains("novel_recovering"), "lease renewal must be denied after the gate closes mid-read: {error:?}");
             assert_eq!(data.read_small(&key).await.unwrap().unwrap(), original);
         });
     }
@@ -1569,5 +1586,72 @@ mod tests {
         ] { assert!(deserialize_toc_metadata(yaml.as_bytes()).is_err(), "{yaml:?}"); }
         let yaml = format!("title: &text '{}'\n", "x".repeat(7 * 1024 * 1024));
         assert!(deserialize_toc_metadata(yaml.as_bytes()).unwrap_err().to_string().contains("transfer_metadata_budget"));
+    }
+
+    /// Ruby 版が書いた末尾空白付きキー (`本文/65 テスト .yaml`) だけが
+    /// 残っている小説でも、正規キー (末尾空白を落としたキー) が見つから
+    /// ない場合は raw キーへ 1 回だけフォールバックして読めること。
+    /// 通常ケース (raw キー == 正規キー) では追加の読み出しは走らない。
+    #[test]
+    fn section_reads_fall_back_to_unsanitized_ruby_key() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let service = PersistenceService::new(store.clone());
+        let keys = NovelObjectKeys::new("site", "title", false).unwrap();
+        let subtitle = SubtitleInfo {
+            file_subtitle: "テスト ".to_string(),
+            ..subtitle()
+        };
+        let section = section_file(&subtitle, "legacy body");
+
+        futures::executor::block_on(async {
+            let raw_key = ObjectKey::try_new("novels/site/title/本文/1 テスト .yaml").unwrap();
+            assert_ne!(raw_key, keys.section(&subtitle.index, &subtitle.file_subtitle));
+            let write = test_write(&service, store.clone(), &keys).await;
+            write.write_small(&raw_key, serialize_section(&section).unwrap().into_bytes()).await.unwrap();
+
+            let mut lease = test_read(&service, &keys).await;
+            let loaded = service.load_section(&mut lease, &keys, &subtitle).await.unwrap();
+            assert_eq!(loaded.unwrap().element.body, "legacy body");
+
+            let toc = TocFile {
+                title: "title".into(), author: "author".into(),
+                toc_url: "https://example.test/".into(), story: None,
+                subtitles: vec![subtitle.clone()], novel_type: None,
+            };
+            write.write_small(&keys.toc(), serialize_toc(&toc).unwrap().into_bytes()).await.unwrap();
+            let snapshot_lease = test_read(&service, &keys).await;
+            let mut stream = service.stream_sections_snapshot(snapshot_lease, keys.clone(), toc);
+            let streamed = stream.next().await.unwrap().unwrap();
+            assert_eq!(streamed.element.body, "legacy body");
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    /// 正規キーが存在するときは raw キーを読みに行かない (raw 側が別の
+    /// 内容を持っていても正規キーの内容が返る)。
+    #[test]
+    fn section_reads_prefer_the_canonical_key() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let service = PersistenceService::new(store.clone());
+        let keys = NovelObjectKeys::new("site", "title", false).unwrap();
+        let subtitle = SubtitleInfo {
+            file_subtitle: "テスト ".to_string(),
+            ..subtitle()
+        };
+
+        futures::executor::block_on(async {
+            let canonical = keys.section(&subtitle.index, &subtitle.file_subtitle);
+            let raw_key = ObjectKey::try_new("novels/site/title/本文/1 テスト .yaml").unwrap();
+            assert_ne!(raw_key, canonical);
+            let write = test_write(&service, store.clone(), &keys).await;
+            let canonical_section = section_file(&subtitle, "canonical body");
+            write.write_small(&canonical, serialize_section(&canonical_section).unwrap().into_bytes()).await.unwrap();
+            let raw_section = section_file(&subtitle, "raw body");
+            write.write_small(&raw_key, serialize_section(&raw_section).unwrap().into_bytes()).await.unwrap();
+
+            let mut lease = test_read(&service, &keys).await;
+            let loaded = service.load_section(&mut lease, &keys, &subtitle).await.unwrap();
+            assert_eq!(loaded.unwrap().element.body, "canonical body");
+        });
     }
 }

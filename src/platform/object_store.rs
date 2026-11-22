@@ -608,8 +608,34 @@ impl NovelObjectKeys {
         self.child(&format!(
             "本文/{} {}.yaml",
             index,
-            sanitize_key_component_with_limit(file_subtitle, Some(80))
+            sanitize_key_component_with_limit(file_subtitle, None)
         ))
+    }
+
+    /// 互換読み出し用の旧本文キー候補 (正規キーと一致するものは含めない)。
+    ///
+    /// 1. Ruby 版由来のサニタイズ前キー (`<index> <file_subtitle>.yaml`、末尾空白等)
+    /// 2. v0.6.10 以前の上限 80 文字で切り詰められた正規キー (`file_subtitle` が 80 文字超のとき)
+    pub fn legacy_section_fallbacks(&self, index: &str, file_subtitle: &str) -> Vec<ObjectKey> {
+        let canonical = self.section(index, file_subtitle);
+        let mut fallbacks = Vec::new();
+        if let Ok(raw_key) = self
+            .prefix()
+            .join("本文")
+            .and_then(|dir| dir.join(format!("{index} {file_subtitle}.yaml")))
+            && raw_key != canonical
+        {
+            fallbacks.push(raw_key);
+        }
+        let truncated = self.child(&format!(
+            "本文/{} {}.yaml",
+            index,
+            sanitize_key_component_with_limit(file_subtitle, Some(80))
+        ));
+        if truncated != canonical && !fallbacks.contains(&truncated) {
+            fallbacks.push(truncated);
+        }
+        fallbacks
     }
 
     pub fn raw_section(&self, index: &str, file_subtitle: &str) -> ObjectKey {
@@ -655,7 +681,7 @@ impl NovelObjectKeys {
         self.child(&format!(
             "本文/cache/{timestamp}/{} {}.yaml",
             index,
-            sanitize_key_component_with_limit(file_subtitle, Some(80))
+            sanitize_key_component_with_limit(file_subtitle, None)
         ))
     }
 
@@ -1144,5 +1170,31 @@ mod tests {
         let (page, next) = paginate_object_listing(metas(&[]), None, 2, meta_key);
         assert!(page.is_empty());
         assert_eq!(next, None);
+    }
+
+    /// `clean` の expected stem (`"{index} {file_subtitle}"` の素直な連結) と
+    /// `keys.section` のファイル名部分が、80 文字を超える file_subtitle でも
+    /// 一致すること。section キーが独自に 80 文字で打ち切られると
+    /// `narou clean` が現行本文を孤児として削除してしまう。
+    #[test]
+    fn section_key_keeps_full_file_subtitle_for_clean_stem_match() {
+        let keys = NovelObjectKeys::new("example.test", "book", false).unwrap();
+        let long = "あ".repeat(120);
+        let file_name = keys
+            .section("7", &long)
+            .as_ref()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(file_name, format!("7 {long}.yaml"));
+        let cached_name = keys
+            .cached_section("20240101000000", "7", &long)
+            .as_ref()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(cached_name, file_name);
     }
 }

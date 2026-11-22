@@ -11,7 +11,7 @@ use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
 use super::util::{
     load_length_limit, pretreatment_source_with_jobs, ruby_filename_special_chars,
-    sanitize_filename, sanitize_filename_with_limit,
+    sanitize_filename_with_limit,
 };
 
 pub async fn fetch_toc(
@@ -338,7 +338,7 @@ pub async fn create_short_story_subtitles(
                     Some(limit.saturating_sub(reserved)),
                 )
             }
-            None => sanitize_filename(&title_for_filename),
+            None => sanitize_filename_with_limit(&title_for_filename, None),
         },
         subdate,
         subupdate,

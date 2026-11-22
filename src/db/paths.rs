@@ -220,22 +220,17 @@ pub fn sanitize_windows_filename_component_with_limit(
             }
         })
         .collect::<String>();
-    let mut candidate = sanitized.trim_end_matches([' ', '.']).to_string();
+    let limited = limit
+        .map(|limit| sanitized.chars().take(limit).collect::<String>())
+        .unwrap_or(sanitized);
+    let mut candidate = limited.trim_end_matches([' ', '.']).to_string();
     if candidate.is_empty() || candidate == "." || candidate == ".." {
         candidate = fallback.to_string();
     }
     if is_windows_reserved_name(&candidate) {
         candidate.insert(0, '_');
     }
-    if let Some(limit) = limit {
-        candidate = candidate.chars().take(limit).collect::<String>();
-        candidate = candidate.trim_end_matches([' ', '.']).to_string();
-    }
-    if candidate.is_empty() || candidate == "." || candidate == ".." {
-        fallback.to_string()
-    } else {
-        candidate
-    }
+    candidate
 }
 
 pub fn sanitize_path_component(value: &str) -> String {
@@ -494,6 +489,22 @@ mod tests {
         assert_eq!(
             sanitize_windows_filename_component_with_limit("   ", None, None, "output"),
             "output"
+        );
+    }
+
+    /// 予約名判定は limit 適用と末尾の空白/ドット除去の**後**に行う。
+    /// 先に判定すると、切り詰めで予約名になる入力 (例: `"auxiliary"` →
+    /// `"aux"`) を素通ししてしまう。`platform::object_store` の
+    /// `sanitize_key_component_with_limit` と順序を一致させる。
+    #[test]
+    fn sanitize_windows_filename_component_checks_reserved_after_limit() {
+        assert_eq!(
+            sanitize_windows_filename_component_with_limit("auxiliary", Some(3), Some('_'), "_"),
+            "_aux"
+        );
+        assert_eq!(
+            crate::platform::object_store::sanitize_key_component_with_limit("auxiliary", Some(3)),
+            "_aux"
         );
     }
 

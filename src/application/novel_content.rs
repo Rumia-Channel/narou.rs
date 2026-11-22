@@ -172,7 +172,15 @@ impl NovelContentService {
         let keys = self.keys_for(scope, id).await?;
         let prefix = ObjectPrefix::from(keys.prefix().clone());
         let key = keys.section(index, file_subtitle);
-        self.read_leased(scope, &key, &prefix).await
+        if let Some(bytes) = self.read_leased(scope, &key, &prefix).await? {
+            return Ok(Some(bytes));
+        }
+        for fallback in keys.legacy_section_fallbacks(index, file_subtitle) {
+            if let Some(bytes) = self.read_leased(scope, &fallback, &prefix).await? {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
     }
 
     async fn keys_for(&self, scope: &mut NovelReadScope, id: NovelId) -> Result<NovelObjectKeys, ApplicationError> {
@@ -289,6 +297,36 @@ mod tests {
             let keys = NovelObjectKeys::new("example", "title", false).unwrap();
             objects.access_fence().unwrap().close_gate(&keys.prefix().clone().into(), "metadata-replacement").await.unwrap();
             assert!(content.read_records(&mut scope, &ids).await.is_err(), "a repeated batch must not acquire a replacement epoch");
+            scope.release_all().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn section_falls_back_to_raw_and_pre_head_80_char_truncated_keys() {
+        futures::executor::block_on(async {
+            let novels = Arc::new(MemoryNovelRepository::from_records(vec![record()]));
+            let objects: Arc<dyn ObjectStore> = Arc::new(MemoryObjectStore::new());
+            let keys = NovelObjectKeys::new("example", "title", false).unwrap();
+
+            // 1. Ruby-era trailing space raw key
+            let raw_key = keys.prefix().join("本文").unwrap().join("1 テスト .yaml").unwrap();
+            objects.write_small(&raw_key, b"raw-body".to_vec()).await.unwrap();
+
+            // 2. Pre-HEAD (v0.6.10) 80-char truncated key for a >80-char subtitle
+            let long_subtitle = "あ".repeat(90);
+            let truncated_key = keys.prefix().join("本文").unwrap()
+                .join(format!("2 {}.yaml", "あ".repeat(80))).unwrap();
+            objects.write_small(&truncated_key, b"truncated-body".to_vec()).await.unwrap();
+
+            let service = NovelContentService::new(novels, objects.clone());
+            let mut scope = service.read_scope("legacy-fallback-reader");
+            assert_eq!(service.section(&mut scope, NovelId(1), "1", "テスト ").await.unwrap().as_deref(), Some(&b"raw-body"[..]));
+            assert_eq!(service.section(&mut scope, NovelId(1), "2", &long_subtitle).await.unwrap().as_deref(), Some(&b"truncated-body"[..]));
+
+            // Canonical key takes precedence once written
+            let canonical_long = keys.section("2", &long_subtitle);
+            objects.write_small(&canonical_long, b"canonical-body".to_vec()).await.unwrap();
+            assert_eq!(service.section(&mut scope, NovelId(1), "2", &long_subtitle).await.unwrap().as_deref(), Some(&b"canonical-body"[..]));
             scope.release_all().await.unwrap();
         });
     }
