@@ -6,7 +6,7 @@ top_url: https://\\k<domain>
 # リニューアル後の正規 URL は /stories/index?novel_id=N のクエリ形式だが、
 # 旧パス形式も引き続き有効 (サイト内のパンくずリンクも旧形式)。両方受け付ける。
 # 作品ページ (/novels/view/N) もユーザーが目にする URL なので受け付ける。
-# ncode さえ撮れれば toc_url テンプレートから目次ページが組み立てられる。
+# ncode さえ取得できれば toc_url テンプレートから目次ページが組み立てられる。
 url:
   - https?://\\k<domain>/stories/index/novel_id\~(?<ncode>\d+)
   - https?://\\k<domain>/stories/index\?novel_id=(?<ncode>\d+)
