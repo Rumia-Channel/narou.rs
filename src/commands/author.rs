@@ -106,12 +106,14 @@ fn remove(target: &str) -> Result<()> {
 pub struct AuthorCheckReport {
     /// Authors that were checked.
     pub checked: usize,
-    /// Works that were not in the library and were downloaded.
+    /// Works that were not in the library: downloaded, or listed by --dry-run.
     pub added: usize,
     /// Works that were already known (skipped).
     pub known: usize,
     /// Authors whose page or definition could not be used.
     pub failed: usize,
+    /// True when the sweep only listed the new works.
+    pub dry_run: bool,
 }
 
 impl AuthorCheckReport {
@@ -119,10 +121,17 @@ impl AuthorCheckReport {
         if self.checked == 0 && self.failed == 0 {
             return;
         }
-        println!(
-            "作者の確認: {} 件を確認、新規 {} 件を追加 (既知 {} 件)",
-            self.checked, self.added, self.known
-        );
+        if self.dry_run {
+            println!(
+                "作者の確認: {} 件を確認、新規 {} 件 (未追加・既知 {} 件)",
+                self.checked, self.added, self.known
+            );
+        } else {
+            println!(
+                "作者の確認: {} 件を確認、新規 {} 件を追加 (既知 {} 件)",
+                self.checked, self.added, self.known
+            );
+        }
     }
 }
 
@@ -141,7 +150,7 @@ pub async fn check_tracked_authors(
     narou_rs::db::init_database()
         .map_err(|error| NarouError::Database(format!("Error initializing database: {error}")))?;
     let authors = author::authors_for_current_root()?;
-    let mut report = AuthorCheckReport::default();
+    let mut report = AuthorCheckReport { dry_run, ..Default::default() };
     if authors.is_empty() {
         return Ok(report);
     }
