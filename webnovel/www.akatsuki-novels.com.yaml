@@ -16,10 +16,11 @@ timezone: Asia/Tokyo
 confirm_over18: no
 append_title_to_folder_name: yes
 title_strip_pattern: null
-cookie: CakeCookie[ALLOWED_ADULT_NOVEL]=on
+# 旧 CakePHP 基盤の CakeCookie[ALLOWED_ADULT_NOVEL] は新基盤で効かず送る意味が
+# ないため削除した (実際のゲート Cookie は login_cookie 側の akatsuki_adult_allowed)。
 cookie_session: true
 sitename: *name
-version: 2.5
+version: 2.6
 
 # ------------------------------------------------------------
 # 書籍情報取得設定 (目次ページから取得)

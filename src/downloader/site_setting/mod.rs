@@ -148,7 +148,7 @@ pub struct SiteSetting {
     pub cookie_hosts: Vec<String>,
     /// Reuse response cookies within a single fetch policy (e.g. CSRF forms).
     /// Anonymous session cookies are never persisted as saved logins.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub cookie_session: bool,
     /// Runtime-only credential destinations; never written into site YAML.
     #[serde(skip)]
@@ -193,7 +193,7 @@ pub struct SiteSetting {
     )]
     pub browser_token: Option<BrowserTokenSetting>,
     /// Retain cached omitted sections on a nonempty partial TOC; indices must be stable numeric positions.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub preserve_missing_sections: bool,
     /// Minimum seconds between requests to this site. Sites that rate-limit
     /// aggressively (Pixiv) declare a floor; `None` uses `download.interval`.
@@ -1798,5 +1798,23 @@ work_type_rules:
         assert_eq!(classify("c311834"), WorkType::Manga);
         assert_eq!(classify("n26352975"), WorkType::Novel);
         assert_eq!(classify("s16299140"), WorkType::Novel);
+    }
+
+    #[test]
+    fn bool_fields_accept_narou_dialect_yes_no() {
+        // narou.rb の YAML 方言では真偽値に yes/no/on/off を書く。ユーザー定義が
+        // cookie_session: yes と書いても定義全体が読めなくならないこと。
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\ncookie_session: yes\npreserve_missing_sections: on\n",
+        ])
+        .expect("yes/no bools must parse");
+        assert!(settings[0].cookie_session);
+        assert!(settings[0].preserve_missing_sections);
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\ncookie_session: no\npreserve_missing_sections: off\n",
+        ])
+        .expect("no/off bools must parse");
+        assert!(!settings[0].cookie_session);
+        assert!(!settings[0].preserve_missing_sections);
     }
 }
