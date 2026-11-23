@@ -1105,11 +1105,12 @@ mod tests {
         // 同名で呼ばれても衝突しないようカウンタで一意化する
         // (host_allowed_* 系のテストが並行で同じディレクトリを消し合うと
         // PersistentQueue::new が不安定になる)。
+        // 他のテストがプロセス全体の cwd を一時ディレクトリへ移すため、
+        // 成果物ディレクトリは cwd ではなく manifest 基準に固定する。
         static COUNTER: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
         let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::current_dir()
-            .unwrap()
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test-artifacts")
             .join(format!("web-mod-{name}-{}-{seq}", std::process::id()));
