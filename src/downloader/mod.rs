@@ -7017,6 +7017,33 @@ is_narou: false
         );
     }
 
+    #[test]
+    fn akatsuki_yaml_preprocess_keeps_body_paragraph_breaks() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "www.akatsuki-novels.com")
+            .expect("bundled www.akatsuki-novels.com.yaml should load");
+        assert!(setting.preprocess_pipeline().is_some());
+
+        // リニューアル後の本文は <br /> ではなく CSS whitespace-pre-line の
+        // 生改行で段落を表す。旧デザインと同じ <br> へ変換されなければならない。
+        let mut html = "<html><body><div class=\"whitespace-pre-line reading-body text-sm\">　はたから見ればほんの一瞬の事だったんだろう。\n\n　スマートフォンに目を落とし、</div></body></html>".to_string();
+        super::util::pretreatment_source(&mut html, "UTF-8", Some(setting));
+
+        assert!(html.contains("AkatsukiPreprocessMagicWord2026"));
+        assert!(html.contains(
+            "はたから見ればほんの一瞬の事だったんだろう。<br><br>　スマートフォンに目を落とし、"
+        ), "got: {html}");
+
+        let (element, _) = super::section::parse_section_html(setting, html).unwrap();
+        let aozora = super::html::to_aozora(&element.body);
+        assert_eq!(
+            aozora,
+            "　はたから見ればほんの一瞬の事だったんだろう。\n\n　スマートフォンに目を落とし、"
+        );
+    }
+
     fn pixiv_setting() -> &'static SiteSetting {
         static SETTING: std::sync::OnceLock<SiteSetting> = std::sync::OnceLock::new();
         SETTING.get_or_init(|| {
