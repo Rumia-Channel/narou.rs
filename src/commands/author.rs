@@ -310,10 +310,40 @@ mod tests {
         // 作者ページを持たない定義は何も返さない。
         let setting = settings
             .iter()
+            .find(|setting| setting.domain == "www.mai-net.net")
+            .expect("Arcadia 定義");
+        assert_eq!(setting.author_novel_urls("<a href=x>"), None);
+        assert!(!setting.matches_author_url("https://www.mai-net.net/bbs/users/1"));
+    }
+
+    #[test]
+    fn akatsuki_author_pages_list_only_posted_works() {
+        let settings = SiteSetting::load_all().expect("site definitions");
+        let setting = settings
+            .iter()
             .find(|setting| setting.domain == "www.akatsuki-novels.com")
             .expect("暁 定義");
-        assert_eq!(setting.author_novel_urls("<a href=x>"), None);
-        assert!(!setting.matches_author_url("https://www.akatsuki-novels.com/users/1"));
+        let page = "https://www.akatsuki-novels.com/users/akn5wbttw";
+        assert!(setting.matches_author_url(page));
+        // お気に入りサブページや他サイトのユーザー URL は作者 URL と見なさない。
+        assert!(!setting.matches_author_url("https://www.akatsuki-novels.com/users/akn5wbttw/favorite_novels"));
+        assert!(!setting.matches_author_url("https://www.akatsuki-novels.com/novels/view/15787"));
+
+        // 実ページの構造: 投稿作品リンクは font-semibold、お気に入り作品は通常クラス。
+        let source = concat!(
+            "<h2 id=\"novels-heading\">投稿作品</h2>",
+            "<a href=\"/novels/view/15787\" class=\"min-w-0 text-base font-semibold hover:text-brand-600\">相良絵梨</a>",
+            "<a href=\"/novels/view/23719\"\n class=\"min-w-0 text-base font-semibold\">他作品</a>",
+            "<h2 id=\"fav-novels-heading\">お気に入りの作品</h2>",
+            "<a href=\"/novels/view/10044\" class=\"hover:text-brand-600\">お気に入り</a>",
+        );
+        assert_eq!(
+            setting.author_novel_urls(source),
+            Some(vec![
+                "https://www.akatsuki-novels.com/novels/view/15787".to_string(),
+                "https://www.akatsuki-novels.com/novels/view/23719".to_string(),
+            ])
+        );
     }
 
     #[test]

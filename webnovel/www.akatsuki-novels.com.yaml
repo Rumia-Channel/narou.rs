@@ -17,8 +17,9 @@ confirm_over18: no
 append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: CakeCookie[ALLOWED_ADULT_NOVEL]=on
+cookie_session: true
 sitename: *name
-version: 2.2
+version: 2.5
 
 # ------------------------------------------------------------
 # 書籍情報取得設定 (目次ページから取得)
@@ -26,13 +27,35 @@ title: <h1 class="min-w-0 text-xl font-bold">(?<title>.+?)</h1>
 author: <p class="mt-1 text-sm text-muted">\s*<a href="/users/[^"]+"[^>]*>\s*(?<author>.+?)\s*</a>
 story: <p class="mt-3 whitespace-pre-line text-sm text-neutral-700 dark:text-neutral-300">(?<story>.+?)</p>
 
+# novel_type / 話数 (目次ページの「全N話 ・完結」行)
+# 完結作品だけ「・完結」が出る。nt はその文字だけを取る。
+nt: 全\d+話\s*・(?<novel_type>完結)\s*・
+novel_type_string:
+  完結: 3
+ga: 全(?<general_all_no>\d+)話
+
+# ------------------------------------------------------------
+# 作者追跡 (narou author)
+# /users/aknXXXX のプロフィールを読む。「投稿作品」セクションだけを
+# 走査し、プロフィール・お気に入り作品のリンクは拾わない。
+author_url: ^https?://\\k<domain>/users/(?<author_id>[a-z0-9]+)/?(?:[?#].*)?$
+# 投稿作品のリンクは class に font-semibold を持ち、お気に入り作品・プロフィール
+# のリンクは持たない。クラスで投稿作品だけを拾う (「お気に入りの作品」内の
+# /novels/view/N リンクを取り込まないため)。
+author_novel_pattern: <a href="(?<work_path>/novels/view/\d+)"[^>]*font-semibold
+author_work_url: \\k<top_url>\\k<work_path>
+
 # ------------------------------------------------------------
 # 目次取得設定
 # 旧 toc_url (パス形式) を維持する。レコードの toc_url は更新時に引き直さないため、
 # 既存ライブラリとの重複登録を避けるためでもある。
 toc_url: \\k<top_url>/stories/index/novel_id~\\k<ncode>
+# 章ヘッダは 2 段ある: font-bold が大見出し (chapter)、font-medium が小見出し
+# (subchapter)。両方が連続し得るので別キャプチャで取り、キャプチャ本体は
+# </li> を跨がない走査で書く (旧 (?<chapter>.+?)</li> は小見出しまで飲み込み、
+# 生の </li><li ...> を章タイトルへ混入させていた)。
 subtitles: |-
-  (?:<li class="[^"]*font-bold[^"]*">(?<chapter>.+?)</li>\s*)?<li class="[^"]*items-baseline[^"]*justify-between[^"]*">(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?<a\b[^>]*href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)"[^>]*>\s*(?<subtitle>(?:[^<]|<(?:[^/]|/[^a]|/a[^>]))*?)\s*</a>(?:(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?(?<subupdate>\d{4}年\d{1,2}月\d{1,2}日))?(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?</li>
+  (?:<li class="[^"]*font-bold[^"]*">(?<chapter>(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?)</li>\s*)?(?:<li class="[^"]*font-medium[^"]*">(?<subchapter>(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?)</li>\s*)?<li class="[^"]*items-baseline[^"]*justify-between[^"]*">(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?<a\b[^>]*href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)"[^>]*>\s*(?<subtitle>(?:[^<]|<(?:[^/]|/[^a]|/a[^>]))*?)\s*</a>(?:(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?(?<subupdate>\d{4}年\d{1,2}月\d{1,2}日))?(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?</li>
 # ページ送りは /stories/index?novel_id=N&page=M (HTML 内では &amp;)。
 next_toc: <a\b[^>]*href="/stories/index\?(?:[^"]*&(?:amp;)?)?novel_id=(?<ncode>\d+)(?:&amp;|&)page=(?<next_page>\d+)[^"]*"[^>]*rel="next"
 next_url: \\k<top_url>/stories/index?novel_id=\\k<ncode>&page=\\k<next_page>
@@ -42,6 +65,16 @@ toc_page_max: /\s*(?<toc_page_max>\d+)\s*ページ
 subdate: no
 
 error_message: この作品は作者の諸事情により非公開にしています
+
+# ------------------------------------------------------------
+# 年齢認証・ログイン設定
+# R-18 作品はセッション Cookie `akatsuki_adult_allowed` (Max-Age 7 日) を要求する。
+# 旧 CakePHP 時代の `CakeCookie[ALLOWED_ADULT_NOVEL]` は新基盤では効かない。
+# ゲートは GET /novels/adult_check で「はい」を押すだけなので、ログイン機構の
+# Cookie 保存で取得できる (narou login / narou_rs_login)。
+login_url: \\k<top_url>/novels/adult_check
+login_pattern: あなたは18歳以上ですか
+login_wall_error: login
 
 # ------------------------------------------------------------
 # 本文取得設定
