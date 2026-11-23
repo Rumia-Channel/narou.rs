@@ -5,9 +5,12 @@ domain: www.akatsuki-novels.com
 top_url: https://\\k<domain>
 # リニューアル後の正規 URL は /stories/index?novel_id=N のクエリ形式だが、
 # 旧パス形式も引き続き有効 (サイト内のパンくずリンクも旧形式)。両方受け付ける。
+# 作品ページ (/novels/view/N) もユーザーが目にする URL なので受け付ける。
+# ncode さえ撮れれば toc_url テンプレートから目次ページが組み立てられる。
 url:
   - https?://\\k<domain>/stories/index/novel_id\~(?<ncode>\d+)
   - https?://\\k<domain>/stories/index\?novel_id=(?<ncode>\d+)
+  - https?://\\k<domain>/novels/view/(?<ncode>\d+)
 encoding: UTF-8
 timezone: Asia/Tokyo
 confirm_over18: no
@@ -15,7 +18,7 @@ append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: CakeCookie[ALLOWED_ADULT_NOVEL]=on
 sitename: *name
-version: 2.1
+version: 2.2
 
 # ------------------------------------------------------------
 # 書籍情報取得設定 (目次ページから取得)
