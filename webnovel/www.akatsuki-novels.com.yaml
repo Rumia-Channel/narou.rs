@@ -18,7 +18,7 @@ append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: CakeCookie[ALLOWED_ADULT_NOVEL]=on
 sitename: *name
-version: 2.2
+version: 2.3
 
 # ------------------------------------------------------------
 # 書籍情報取得設定 (目次ページから取得)
@@ -44,10 +44,31 @@ subdate: no
 error_message: この作品は作者の諸事情により非公開にしています
 
 # ------------------------------------------------------------
+# 前処理
+# リニューアル後の本文は CSS の whitespace-pre-line で生改行を段落として表示する。
+# 一方 to_aozora は HTML の意味上無視される生改行を落とすため、ここで <br> に
+# 変換してから拾う (旧デザインの <br /> と同じ扱い)。変換後のテキストは
+# novelup.plus と同じく前処理マーカー経由で body_pattern が読む。
+preprocess: |-
+  guard "AkatsukiPreprocessMagicWord2026"
+
+  let body = extract(/<div class="whitespace-pre-line reading-body[^"]*">(.+?)<\/div>/s)
+  if body
+    emit "AkatsukiPreprocessMagicWord2026"
+    emit "akatsuki_body::"
+    emit body.gsub(/\n/, "<br>")
+    emit "::akatsuki_body_end"
+    insert_at_match
+  end
+
+# ------------------------------------------------------------
 # 本文取得設定
-# 本文は <div class="whitespace-pre-line reading-body ..."> の内側だけ。
+# 本文は前処理が作ったマーカー block から読む (生改行を <br> に変換済み)。
 # 前書き/後書きは新デザインでは独立した要素を出さない。
-body_pattern: <div class="whitespace-pre-line reading-body[^"]*">(?<body>.+?)</div>
+body_pattern: |-
+  akatsuki_body::
+  (?<body>.+?)
+  ::akatsuki_body_end
 
 introduction_pattern: null
 postscript_pattern: null
