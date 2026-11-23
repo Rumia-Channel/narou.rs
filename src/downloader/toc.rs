@@ -762,6 +762,29 @@ mod tests {
     }
 
     #[test]
+    fn akatsuki_work_page_url_resolves_to_toc_url() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "暁").unwrap();
+        let expected = "https://www.akatsuki-novels.com/stories/index/novel_id~10044";
+
+        // 作品ページ URL はユーザーが目にする形なので、目次ページと同じく
+        // キャプチャから toc_url を組み立てて重複判定にも使える必要がある。
+        for url in [
+            "https://www.akatsuki-novels.com/novels/view/10044",
+            "https://www.akatsuki-novels.com/stories/index/novel_id~10044",
+            "https://www.akatsuki-novels.com/stories/index?novel_id=10044",
+        ] {
+            assert!(setting.matches_url(url), "{url}");
+            assert_eq!(setting.toc_url_with_url_captures(url).as_deref(), Some(expected), "{url}");
+            assert_eq!(
+                crate::application::target_lookup::first_matching_toc_url(&settings, url).as_deref(),
+                Some(expected),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
     fn akatsuki_multipage_toc_fetches_all_pages() {
         let settings = SiteSetting::load_all().unwrap();
         let setting = settings.iter().find(|s| s.name == "暁").unwrap();
