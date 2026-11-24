@@ -39,15 +39,32 @@ fn load_settings_from_dir(dir: PathBuf, settings: &mut Vec<SiteSetting>) {
                     // `super::merge_user_definition_yaml` に一元化してある
                     // (core の `SiteDefinitions::effective_runtime()` と
                     //  規則が逸れないように)。
-                    if let Ok(bundled_yaml) = serde_yaml::to_string(existing)
-                        && let Ok(merged) = serde_yaml::from_str::<SiteSetting>(
-                            &super::merge_user_definition_yaml(&bundled_yaml, &content),
-                        )
-                    {
-                        *existing = merged;
+                    match serde_yaml::to_string(existing) {
+                        Ok(bundled_yaml) => {
+                            let merged = super::merge_user_definition_yaml(&bundled_yaml, &content);
+                            match serde_yaml::from_str::<SiteSetting>(&merged) {
+                                Ok(merged) => *existing = merged,
+                                Err(error) => tracing::warn!(
+                                    "サイト定義 {} を読み込めませんでした ({error})",
+                                    path.display()
+                                ),
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            "サイト定義 {} を書き出せませんでした ({error})",
+                            path.display()
+                        ),
                     }
-                } else if let Ok(setting) = serde_yaml::from_value::<SiteSetting>(raw_yaml) {
-                    settings.push(setting);
+                } else {
+                    match serde_yaml::from_value::<SiteSetting>(raw_yaml) {
+                        Ok(setting) => settings.push(setting),
+                        // 壊れた定義を黙って捨てると、ユーザーは原因不明で
+                        // 「そのサイトが無い」ことになる。読み込み失敗を出す。
+                        Err(error) => tracing::warn!(
+                            "サイト定義 {} を読み込めませんでした ({error})",
+                            path.display()
+                        ),
+                    }
                 }
             }
         }

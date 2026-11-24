@@ -235,7 +235,7 @@ pub struct SiteSetting {
     pub ncode: Option<SiteSettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub is_narou: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narou_api_url: Option<String>,
@@ -244,7 +244,11 @@ pub struct SiteSetting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub illust_grep_pattern: Option<String>,
     /// Search fetched page markup as well as parsed content (default: true).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "serde_helpers::deserialize_yes_no_opt_bool"
+    )]
     pub illust_from_raw: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<SiteSettingValue>,
@@ -1838,5 +1842,20 @@ work_type_rules:
         .expect("no/off bools must parse");
         assert!(!settings[0].cookie_session);
         assert!(!settings[0].preserve_missing_sections);
+        // is_narou / illust_from_raw も同じ方言を受け付ける (以前は yes/no で
+        // 定義全体が読めなくなっていた)。
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\nis_narou: yes\nillust_from_raw: no\n",
+        ])
+        .expect("is_narou/illust_from_raw yes/no must parse");
+        assert!(settings[0].is_narou);
+        assert_eq!(settings[0].illust_from_raw, Some(false));
+        // 整数と null も Psych の真理値判定に合わせる (整数は真、null は偽)。
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\nis_narou: 1\nillust_from_raw: null\n",
+        ])
+        .expect("integer/null bools must parse");
+        assert!(settings[0].is_narou);
+        assert_eq!(settings[0].illust_from_raw, None);
     }
 }
