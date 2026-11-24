@@ -173,6 +173,91 @@ pub fn canonical_query(params: &[(String, String)]) -> String {
         .join("&")
 }
 
+/// wire 上のクエリ文字列 (percent-encode 済み・任意順) を SigV4 の
+/// canonical form に変換する。
+///
+/// サーバーは署名検証時にクエリを decode → sort → re-encode した canonical
+/// form で canonical request を再構成する。呼び出し側が作った順のまま署名
+/// すると一致せず `SignatureDoesNotMatch` (403) になるため、multipart の
+/// `uploadId=…&max-parts=…` のような手組みクエリもここで正規化する。
+/// `+` は本実装の URL が空白として使わないためリテラル扱いにする。
+/// 値を持たないパラメータは `key=` として扱う。
+pub fn canonical_wire_query(query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+    let mut encoded: Vec<(String, String)> = query
+        .split('&')
+        .filter(|param| !param.is_empty())
+        .map(|param| match param.split_once('=') {
+            Some((name, value)) => (percent_decode(name), percent_decode(value)),
+            None => (percent_decode(param), String::new()),
+        })
+        .map(|(name, value)| (uri_encode(&name, false), uri_encode(&value, false)))
+        .collect();
+    encoded.sort();
+    encoded
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// `%XX` エスケープを展開する。`+` はデコードしない (リテラル扱い)。
+/// 不正なエスケープ列はそのまま残す。
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2])) {
+                out.push(hi * 16 + lo);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod wire_query_tests {
+    use super::canonical_wire_query;
+
+    #[test]
+    fn canonical_wire_query_sorts_decodes_and_reencodes() {
+        assert_eq!(canonical_wire_query(""), "");
+        // multipart ListParts: 手組みの順序を canonical 順へ戻す。
+        assert_eq!(
+            canonical_wire_query("uploadId=a%2Fb&max-parts=1000&part-number-marker=0"),
+            "max-parts=1000&part-number-marker=0&uploadId=a%2Fb"
+        );
+        assert_eq!(
+            canonical_wire_query("uploads=&prefix=narou%2Fdev&max-uploads=16"),
+            "max-uploads=16&prefix=narou%2Fdev&uploads="
+        );
+        assert_eq!(canonical_wire_query("acl"), "acl=");
+        assert_eq!(canonical_wire_query("b=2&a=1"), "a=1&b=2");
+        // 値の生 '=' / '+' はそれぞれ値の一部・リテラルとして encode される。
+        assert_eq!(canonical_wire_query("token=a=b&plus=a+b"), "plus=a%2Bb&token=a%3Db");
+        // 不正なエスケープ列は '%' を残したまま encode される。
+        assert_eq!(canonical_wire_query("x=%zz"), "x=%25zz");
+        assert_eq!(canonical_wire_query("x=%4"), "x=%254");
+    }
+}
+
 /// パスを canonical form (`/` は残し、各セグメントを encode) にする。
 pub fn canonical_path(path: &str) -> String {
     if path.is_empty() {

@@ -245,6 +245,11 @@ impl S3Store {
         response_limit: Option<usize>,
     ) -> Result<(super::http::HttpResponse, s3_sigv4::SignedHeaders)> {
         let (path, query) = url_target(url);
+        // 署名対象のクエリは canonical form (decode → sort → re-encode) に
+        // する。wire 上の並びがサーバー側の再構成と違うと
+        // SignatureDoesNotMatch になるため (multipart の手組みクエリで実際に
+        // 発生した)、wire bytes との一致はパスだけに留める。
+        let query = s3_sigv4::canonical_wire_query(&query);
         let payload_sha256 = s3_sigv4::payload_sha256(body.as_deref().unwrap_or(&[]));
         let amz_date = s3_sigv4::amz_date(self.clock.now_utc());
         let signed = s3_sigv4::sign(
@@ -1790,5 +1795,43 @@ mod tests {
         )
         .unwrap();
         assert!(url.contains("illustrations"), "pool URL: {url}");
+    }
+
+    #[test]
+    fn send_signs_the_canonical_query_regardless_of_wire_order() {
+        // multipart の ListParts / copy part / ListMultipartUploads は手組みの
+        // クエリを wire に乗せる。署名は canonical 順に対して行われないと
+        // 厳格な S3 で SignatureDoesNotMatch (403) になる。
+        for query in [
+            "uploadId=abc&max-parts=1000&part-number-marker=0",
+            "max-parts=1000&part-number-marker=0&uploadId=abc",
+        ] {
+            let http = Arc::new(MockHttpClient::new());
+            let store = store(http.clone());
+            let url = format!("{}?{query}", store.location.object_url(&key("novels/site/title/本文/s.yaml")));
+            http.add_response(
+                url.clone(),
+                HttpResponse { status: 200, headers: Vec::new(), body: Vec::new() },
+            );
+            let (_, signed) = futures::executor::block_on(store.send(
+                HttpMethod::Get,
+                &url,
+                &[],
+                None,
+                None,
+            ))
+            .unwrap();
+            assert_eq!(
+                signed.canonical_request.lines().nth(2),
+                Some("max-parts=1000&part-number-marker=0&uploadId=abc"),
+                "wire query: {query}"
+            );
+            // wire の URL (送信先) は書き換えない。
+            assert_eq!(
+                http.requested_urls(),
+                vec![format!("GET {url}")],
+                "wire query: {query}"
+            );
+        }
     }
 }
