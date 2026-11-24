@@ -585,6 +585,9 @@ impl ObjectStore for NativeObjectStore {
     fn read_stream_leased<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
         NativeObjectStore::read_stream_leased(self, prefix, lease, key, range)
     }
+    fn native_source_path(&self, key: &ObjectKey) -> Option<std::path::PathBuf> {
+        self.resolve_path(key).ok()
+    }
     fn write_small_guarded<'a>(&'a self, fence: &'a crate::platform::WriteFence, key: &'a ObjectKey, data: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move { run_scoped_blocking(|| self.with_gate(&fence.prefix, |gate| {
             if !fence.prefix.matches(key) || gate.owner.is_some() || gate.epoch != fence.epoch { return Err(af::gate_closed_error(&fence.prefix)); }
@@ -1377,6 +1380,11 @@ impl ObjectStore for NativeStore {
     fn read_stream_leased<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
         match self { Self::Fs(store) => store.read_stream_leased(prefix, lease, key, range), Self::Sqlite(store) => store.read_stream_leased(prefix, lease, key, range) }
     }
+    /// Fs objects are real files; a snapshot can hardlink instead of copying
+    /// (issue #58). SQLite bodies live in the DB, so they keep the copy path.
+    fn native_source_path(&self, key: &ObjectKey) -> Option<std::path::PathBuf> {
+        match self { Self::Fs(store) => store.resolve_path(key).ok(), Self::Sqlite(_) => None }
+    }
 
     fn is_remote_reference<'a>(&'a self, key:&'a ObjectKey)->PlatformFuture<'a,Result<bool>>{self.has_remote_reference(key)}
     fn write_small_guarded<'a>(&'a self, fence: &'a crate::platform::WriteFence, key: &'a ObjectKey, data: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
@@ -1576,6 +1584,7 @@ native_port!(TransferStageStore {
 });
 native_port!(NovelAccessFence {
     fn pending_removals<'a>(cursor:Option<&'a str>,limit:usize)->(Vec<(ObjectPrefix,String,u64)>,Option<String>);
+    fn capture_writer<'a>(prefix:&'a ObjectPrefix)->crate::platform::WriteFence;
     fn rebind_writer<'a>(prefix:&'a ObjectPrefix,expected_epoch:u64)->crate::platform::WriteFence;
     fn admit_reader<'a>(prefix:&'a ObjectPrefix,id:&'a str,ttl:i64)->GateLease;
     fn renew_reader<'a>(prefix:&'a ObjectPrefix,lease:&'a GateLease,ttl:i64)->GateLease;
@@ -2249,6 +2258,37 @@ impl NativeObjectStore {
             Ok(value)
         })
     }
+    /// Pure read through the shared reader namespace lock: validates the gate
+    /// and runs `operation` without writing the durable gate back. Bulk readers
+    /// (snapshot copies, EPUB builds) open one file per call, so the old
+    /// unconditional rewrite paid a full atomic write+fsync per file (issue #58).
+    /// `gate.prune()`/`prefix` changes are in-memory only here; the single
+    /// read-path gate mutation is the `Superseded` heal, which writes and
+    /// returns before this point.
+    fn with_reader_gate_read<T>(&self, prefix: &ObjectPrefix, operation: impl FnOnce(&mut FsGate) -> Result<T>) -> Result<T> {
+        self.with_namespace_lock(prefix.as_ref().trim_end_matches('/'), true, || {
+            let path = self.gate_path(prefix)?;
+            self.ensure_parent_dir(&path)?;
+            let mut gate: FsGate = match fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| NarouError::Platform(format!("invalid durable gate: {error}")))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => FsGate::default(),
+                Err(error) => return Err(error.into()),
+            };
+            gate.prefix=Some(prefix.as_ref().trim_end_matches('/').to_owned());
+            gate.prune();
+            if gate.migrated{return Err(af::gate_closed_error(prefix));}
+            match self.live_sql_authority(prefix,gate.epoch,&gate.origin_url_fold.clone())?{
+                SqlGateAuthority::Superseded=>{
+                    gate.migrated=true;gate.updated_at=ts::now_secs();
+                    atomic_write_bytes(&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(&path)?;
+                    return Err(af::gate_closed_error(prefix));
+                }
+                SqlGateAuthority::Conflict=>return Err(NarouError::Platform(format!("conflicting live SQL authority for {}",prefix.as_ref()))),
+                _=>{}
+            }
+            operation(&mut gate)
+        })
+    }
     fn with_stage<T>(&self, id: &str, operation: impl FnOnce(Option<ts::StageLedgerRecord>) -> Result<(T, Option<ts::StageLedgerRecord>)>) -> Result<T> {
         let ledger = self.resolve_path(&ts::stage_ledger_key(id)?)?;
         self.ensure_parent_dir(&ledger)?;
@@ -2285,7 +2325,7 @@ impl NativeObjectStore {
     /// Validate admission and open the file within the same OS critical section.
     pub fn open_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>> {
         let this=self.clone();let prefix=prefix.clone();let lease=lease.clone();let key=key.clone();Box::pin(async move{
-            let opened=run_blocking(move||this.with_reader_gate(&prefix,|gate|{
+            let opened=run_blocking(move||this.with_reader_gate_read(&prefix,|gate|{
                 if !prefix.matches(&key)||gate.owner.is_some()||gate.epoch!=lease.epoch{return Err(af::gate_closed_error(&prefix));}
                 match gate.readers.get(&lease.reader_id){
                     Some((epoch,expiry)) if *epoch==lease.epoch&&*expiry>ts::now_secs()=>{},
@@ -2305,7 +2345,7 @@ impl NativeObjectStore {
     /// can be served for a key that already resolved elsewhere.
     pub fn open_local_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>>{
         let this=self.clone();let prefix=prefix.clone();let lease=lease.clone();let key=key.clone();Box::pin(async move{
-            let opened=run_blocking(move||this.with_reader_gate(&prefix,|gate|{
+            let opened=run_blocking(move||this.with_reader_gate_read(&prefix,|gate|{
                 if !prefix.matches(&key)||gate.owner.is_some()||gate.epoch!=lease.epoch{return Err(af::gate_closed_error(&prefix));}
                 match gate.readers.get(&lease.reader_id){
                     Some((epoch,expiry)) if *epoch==lease.epoch&&*expiry>ts::now_secs()=>{},
@@ -2458,6 +2498,17 @@ impl NovelAccessFence for NativeObjectStore {
         for row in page.objects{let Some(bytes)=self.read_small(&row.key).await?else{continue;};let gate:FsGate=serde_json::from_slice(&bytes).map_err(|error|NarouError::Platform(error.to_string()))?;if let Some(owner)=gate.owner.filter(|owner|owner.starts_with("remove-v1:")){af::parse_removal_owner(&owner)?;out.push((ObjectPrefix::new(gate.prefix.ok_or_else(||NarouError::Platform("removal gate prefix missing".into()))?)?,owner,gate.epoch));}}
         Ok((out,page.next_cursor))
     })}
+    /// Writer admission must leave durable gate state: the read-only
+    /// `gate_info` path no longer creates the file, but later
+    /// `namespace_state_locked`/origin binds read it directly. Capture keeps
+    /// the write-back (creating) reader path, which also performs the
+    /// SQL-authority check.
+    fn capture_writer<'a>(&'a self, prefix: &'a ObjectPrefix) -> PlatformFuture<'a, Result<crate::platform::WriteFence>> {
+        Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate(prefix, |gate| {
+            if gate.owner.is_some() { return Err(af::novel_busy_error(prefix)); }
+            Ok(crate::platform::WriteFence::new(prefix.clone(), gate.epoch))
+        })) })
+    }
     fn rebind_writer<'a>(&'a self,prefix:&'a ObjectPrefix,expected_epoch:u64)->PlatformFuture<'a,Result<crate::platform::WriteFence>>{Box::pin(async move{run_scoped_blocking(||self.with_gate(prefix,|gate|{if gate.owner.is_some()||gate.epoch!=expected_epoch{return Err(af::gate_epoch_error(prefix,expected_epoch,gate.epoch));}Ok(crate::platform::WriteFence::new(prefix.clone(),expected_epoch))}))})}
     fn admit_reader<'a>(&'a self, prefix: &'a ObjectPrefix, id: &'a str, ttl: i64) -> PlatformFuture<'a, Result<GateLease>> {
         Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate(prefix, |gate| {
@@ -2494,7 +2545,7 @@ impl NovelAccessFence for NativeObjectStore {
         })) })
     }
     fn gate_info<'a>(&'a self, prefix: &'a ObjectPrefix) -> PlatformFuture<'a, Result<GateInfo>> {
-        Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate(prefix, |gate| Ok(GateInfo { epoch: gate.epoch, content_revision:gate.content_revision,
+        Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate_read(prefix, |gate| Ok(GateInfo { epoch: gate.epoch, content_revision:gate.content_revision,
             state: if gate.owner.is_some() { GateState::Closed } else { GateState::Open }, pending_readers: gate.readers.len() as u32, owner: gate.owner.clone(), updated_at: gate.updated_at }))) })
     }
     fn close_gate<'a>(&'a self, prefix: &'a ObjectPrefix, owner: &'a str) -> PlatformFuture<'a, Result<u64>> {

@@ -469,10 +469,22 @@ fn novel_directory(record: &narou_rs::db::NovelRecord) -> Result<PathBuf, String
 }
 
 fn private_output_path(output: &Path, directory: &Path, snapshot: &Path) -> Result<PathBuf, String> {
-    match output.strip_prefix(directory) {
-        Ok(relative) => Ok(snapshot.join(relative)),
-        Err(_) => { narou_rs::application::novel_access::require_private_path(output).map_err(|error| error.to_string())?; Ok(output.to_path_buf()) }
+    if let Ok(relative) = output.strip_prefix(directory) {
+        return Ok(snapshot.join(relative));
     }
+    // On Windows the canonical novel directory is resolved with the on-disk
+    // case, while `directory` keeps the CWD spelling: a case-sensitive
+    // `strip_prefix` then fails even for an exact match. Retry on resolved
+    // forms before treating the output as foreign.
+    let resolved_dir = std::fs::canonicalize(directory);
+    let resolved_output = std::fs::canonicalize(output);
+    if let (Ok(resolved_dir), Ok(resolved_output)) = (resolved_dir, resolved_output)
+        && let Ok(relative) = resolved_output.strip_prefix(&resolved_dir)
+    {
+        return Ok(snapshot.join(relative));
+    }
+    narou_rs::application::novel_access::require_private_path(output).map_err(|error| error.to_string())?;
+    Ok(output.to_path_buf())
 }
 
 fn publish_generated_file(write: &narou_rs::application::novel_access::NovelWriteGuard, source: &Path, directory: &Path, snapshot: &Path) -> Result<PathBuf, String> {

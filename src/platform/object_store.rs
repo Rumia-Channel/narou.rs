@@ -280,6 +280,14 @@ pub trait ObjectStore: PlatformService {
         let _ = (prefix, lease, key, range);
         Box::pin(async { Err(NarouError::Platform("leased content reads unsupported".into())) })
     }
+    /// Filesystem path backing `key`, when the store keeps each object as a
+    /// real file a snapshot can hardlink. Remote/object-backed stores return
+    /// `None` so callers fall back to a streamed copy. Used only to avoid a
+    /// byte copy for a point-in-time private snapshot (issue #58).
+    fn native_source_path(&self, key: &ObjectKey) -> Option<std::path::PathBuf> {
+        let _ = key;
+        None
+    }
 
     fn write_small_guarded<'a>(&'a self, fence: &'a super::WriteFence, key: &'a ObjectKey, data: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
         let _ = (fence, key, data);

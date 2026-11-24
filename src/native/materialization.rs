@@ -544,6 +544,23 @@ pub(crate) async fn copy_asset(
     key: &crate::platform::ObjectKey,
     destination: &Path,
 ) -> Result<bool> {
+    // Fs-backed keys already have a real file: hardlink it so a bulk snapshot
+    // (convert copies every canonical file) never streams bytes per file
+    // (issue #58). Canonical writes are atomic temp+rename, so the linked
+    // inode keeps the generation the lease admitted. Remote/S3 keys return
+    // `None` and keep the streamed path below.
+    if let Some(source) = objects.native_source_path(key) {
+        if let Some(parent) = destination.parent() { std::fs::create_dir_all(parent)?; }
+        if let Err(error) = std::fs::hard_link(&source, destination) {
+            // A writer may rename/replace the source mid-snapshot: the
+            // hardlink misses the inode and fails. Fail loudly like the
+            // streamed path's missing-object branch; the caller's
+            // before/after epoch check fences mixed generations.
+            if error.kind() == std::io::ErrorKind::NotFound { return Ok(false); }
+            return Err(error.into());
+        }
+        return Ok(true);
+    }
     let Some(mut stream) = objects.read_stream_leased(lease.prefix(), lease.lease(), key, 0..u64::MAX).await? else { return Ok(false); };
     if let Some(parent) = destination.parent() { std::fs::create_dir_all(parent)?; }
     let mut output = File::create(destination)?;
@@ -613,5 +630,44 @@ mod tests {
         assert!(snapshot.publish_changes().is_err());
         assert_eq!(std::fs::read(directory.join("setting.ini")).unwrap(), b"new setting");
         assert_eq!(std::fs::read(directory.join("挿絵/old.png")).unwrap(), b"new image");
+    }
+
+    #[test]
+    fn copy_asset_hardlinks_fs_backed_sources_without_streaming() {
+        // Issue #58: bulk snapshots copy every canonical file; a byte copy
+        // per file was the regression. Fs objects must land as hardlinks
+        // (same inode), never streamed copies.
+        struct DatabaseRestore(Option<crate::db::Database>);
+        impl Drop for DatabaseRestore { fn drop(&mut self) { *crate::db::DATABASE.lock() = self.0.take(); } }
+        let root = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(root.path());
+        let _database = DatabaseRestore(crate::db::DATABASE.lock().take());
+        let _legacy = crate::test_support::legacy_yaml_guard();
+        std::fs::create_dir(root.path().join(".narou")).unwrap();
+        crate::db::init_database().unwrap();
+        let record = serde_yaml::from_str("id: 1\ntitle: book\nauthor: author\nfile_title: book\nsitename: site\ntoc_url: https://example.test/book\nnovel_type: 2\nlast_update: 2026-01-01T00:00:00Z\n").unwrap();
+        let (_, write) = create_test_record(record).unwrap();
+        let key = crate::platform::ObjectKey::try_new(write.prefix().as_ref()).unwrap();
+        block_on(async {
+            write.write_small(&key.join("toc.yaml")?, b"toc body".to_vec()).await
+        }).unwrap();
+        let objects = read_store(root.path()).unwrap();
+        let prefix = crate::platform::ObjectPrefix::new(write.prefix().as_ref()).unwrap();
+        let destination = root.path().join("snapshot/toc.yaml");
+        block_on(async {
+            let mut lease = crate::application::novel_access::NovelReadLease::admit(&objects, &prefix, "snapshot-test").await?;
+            assert!(copy_asset(&objects, &mut lease, &key.join("toc.yaml")?, &destination).await?);
+            lease.release().await
+        }).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"toc body");
+        let source = crate::native::object_store::NativeStore::for_narou_root(root.path())
+            .unwrap().novel_directory(&prefix).unwrap().join("toc.yaml");
+        // Same-inode proof without unstable APIs: a write through the
+        // destination must appear when the canonical path is read back (a
+        // byte copy would diverge).
+        std::fs::write(&destination, b"linked write").unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"linked write",
+            "snapshot destination must hardlink the canonical file, not copy bytes");
+        std::fs::write(&destination, b"toc body").unwrap();
     }
 }

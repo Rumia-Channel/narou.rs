@@ -132,8 +132,15 @@ impl PersistenceService {
     }
 
     pub async fn save_toc(&self, access: &NovelWriteGuard, keys: &NovelObjectKeys, toc: &TocFile) -> Result<()> {
+        let data = serialize_toc(toc)?.into_bytes();
+        // 更新確認では TOC はほぼ常に同一。同一バイト列への書き戻しは
+        // atomic rename + fsync を毎小説支払うだけなので、内容が一致する
+        // ときは書き込み自体を省く (issue #58)。
+        if self.objects.read_small(&keys.toc()).await?.is_some_and(|existing| existing == data) {
+            return Ok(());
+        }
         access
-            .write_small(&keys.toc(), serialize_toc(toc)?.into_bytes())
+            .write_small(&keys.toc(), data)
             .await
     }
 
