@@ -46,7 +46,14 @@ pub async fn cmd_author(action: AuthorAction) -> Result<()> {
         AuthorAction::Check { dry_run } => {
             let report = check_tracked_authors(None, dry_run).await?;
             report.print();
-            Ok(())
+            if report.failed > 0 {
+                Err(NarouError::InvalidTarget(format!(
+                    "作者の確認が {} 件失敗しました",
+                    report.failed
+                )))
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -121,17 +128,31 @@ impl AuthorCheckReport {
         if self.checked == 0 && self.failed == 0 {
             return;
         }
-        if self.dry_run {
-            println!(
-                "作者の確認: {} 件を確認、新規 {} 件 (未追加・既知 {} 件)",
-                self.checked, self.added, self.known
-            );
-        } else {
-            println!(
-                "作者の確認: {} 件を確認、新規 {} 件を追加 (既知 {} 件)",
-                self.checked, self.added, self.known
-            );
-        }
+        println!("{}", report_line(self));
+    }
+}
+
+/// The one-line summary of a sweep.
+///
+/// Failures are part of the line: a sweep where every author failed must not
+/// read like an empty success. `--dry-run` counts the works that would be
+/// added, so it says so instead of reusing the "newly added" wording.
+fn report_line(report: &AuthorCheckReport) -> String {
+    let failed = if report.failed > 0 {
+        format!("、失敗 {} 件", report.failed)
+    } else {
+        String::new()
+    };
+    if report.dry_run {
+        format!(
+            "作者の確認: {} 件を確認、追加予定 {} 件、既知 {} 件{}",
+            report.checked, report.added, report.known, failed
+        )
+    } else {
+        format!(
+            "作者の確認: {} 件を確認、新規 {} 件を追加、既知 {} 件{}",
+            report.checked, report.added, report.known, failed
+        )
     }
 }
 
@@ -237,6 +258,33 @@ mod tests {
                 == 0,
             "作品ページを作者ページと誤認しない"
         );
+    }
+
+    #[test]
+    fn the_author_check_report_shows_failures_and_separates_the_counts() {
+        // 取得に失敗した作者を隠さない: 失敗件数が無ければ「失敗」語を出さない。
+        let report = AuthorCheckReport {
+            checked: 1,
+            added: 2,
+            known: 3,
+            failed: 4,
+            dry_run: true,
+        };
+        let line = report_line(&report);
+        assert!(line.contains("追加予定 2 件"), "{line}");
+        assert!(line.contains("既知 3 件"), "{line}");
+        assert!(line.contains("失敗 4 件"), "{line}");
+
+        let report = AuthorCheckReport {
+            checked: 1,
+            added: 2,
+            known: 3,
+            failed: 0,
+            dry_run: false,
+        };
+        let line = report_line(&report);
+        assert!(line.contains("新規 2 件"), "{line}");
+        assert!(!line.contains("失敗"), "{line}");
     }
 
     #[test]

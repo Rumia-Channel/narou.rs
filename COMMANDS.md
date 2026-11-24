@@ -359,7 +359,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | `add <URL>` | 作者ページを登録。`author_url` に一致するサイト定義が必要 |
 | `list` | 登録済みの作者（サイト / ページ URL） |
 | `remove <URL\|番号>` | `list` の 1 始まりの番号か URL で追跡解除。0 は拒否し、取得済み作品は削除しない |
-| `check [--dry-run]` | 全作者を確認して未管理の作品を取得する。`--dry-run` は追加予定の URL だけを表示し、取得しない |
+| `check [--dry-run]` | 全作者を確認して未管理の作品を取得する。`--dry-run` は追加予定の URL だけを表示し、取得しない。一覧取得に失敗した作者がいる場合は件数を表示して終了コード 1。暁の作者ページは `/users/<id>?page=N` のページ送りを `author_next_pattern` で辿る (相対「次へ」リンクはサイトのルートへ解決する) |
 
 **保存形式**: 小説とは別の inventory `author`（Native は SQLite `app_state` / `.narou/author.yaml`、Workers は D1 の `app_state(scope='inv', key='author')`）に、**作者ページ URL（ユニーク）→ サイト名** だけを持つ。名前や日時などの帳簿は持たない。登録・解除は Native の Inventory 原子更新、Workers の全スナップショット CAS で保存し、別の登録操作を上書きしない。
 
