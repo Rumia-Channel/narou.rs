@@ -147,12 +147,8 @@ pub(crate) async fn selected_files_snapshot_leased(
                 continue;
             }
             let destination = temporary.path().join(name);
-            if !copy_asset(objects, lease, &object.key, &destination).await? {
+            if !copy_asset(objects, lease, &object.key, &destination, object.last_modified.map(Into::into)).await? {
                 return Err(NarouError::NotFound(object.key.to_string()));
-            }
-            if let Some(modified) = object.last_modified {
-                std::fs::OpenOptions::new().write(true).open(&destination)?
-                    .set_modified(std::time::SystemTime::from(modified))?;
             }
             copied.insert(name.to_owned());
         }
@@ -228,7 +224,7 @@ pub(crate) async fn snapshot_leased_excluding(
                 if excluded(relative) { continue; }
                 let destination = temporary.path().join(relative);
                 if destination.is_file() { continue; }
-                if !copy_asset(objects, lease, &object.key, &destination).await? {
+                if !copy_asset(objects, lease, &object.key, &destination, None).await? {
                     return Err(NarouError::NotFound(object.key.to_string()));
                 }
             }
@@ -244,7 +240,7 @@ pub(crate) async fn snapshot_leased_excluding(
                 if excluded(&relative) { continue; }
                 let key = crate::platform::illustration_key(&prefix_key, &filename)?;
                 let destination = temporary.path().join(&relative);
-                if !destination.is_file() && !copy_asset(objects, lease, &key, &destination).await? {
+                if !destination.is_file() && !copy_asset(objects, lease, &key, &destination, None).await? {
                     return Err(NarouError::NotFound(key.to_string()));
                 }
             }
@@ -280,7 +276,7 @@ impl ConversionInputs {
         let directory = tempfile::Builder::new().prefix(".narou-snapshot-").tempdir_in(root)?;
         let prefix = crate::platform::ObjectKey::try_new(lease.prefix().as_ref())?;
         for name in ["toc.yaml", "setting.ini", "replace.txt", "converter.yaml", ".illustration_cache.yaml"] {
-            copy_asset(objects, lease, &prefix.join(name)?, &directory.path().join(name)).await?;
+            copy_asset(objects, lease, &prefix.join(name)?, &directory.path().join(name), None).await?;
         }
         lease.validate().await?;
         Ok(Self { directory, revision })
@@ -309,14 +305,14 @@ impl ConversionInputs {
                         if !selected.contains(index) { continue; }
                     }
                     let destination = self.path().join(relative);
-                    if !copy_asset(objects, lease, &object.key, &destination).await? { return Err(NarouError::NotFound(object.key.to_string())); }
+                    if !copy_asset(objects, lease, &object.key, &destination, None).await? { return Err(NarouError::NotFound(object.key.to_string())); }
                 }
                 match page.next_cursor { Some(cursor) => request = request.after(cursor), None => break }
             }
         }
         if selection.cover {
             for name in ["cover.jpg", "cover.png", "cover.jpeg"] {
-                copy_asset(objects, lease, &prefix.join(name)?, &self.path().join(name)).await?;
+                copy_asset(objects, lease, &prefix.join(name)?, &self.path().join(name), None).await?;
             }
         }
         if selection.illustrations {
@@ -326,7 +322,7 @@ impl ConversionInputs {
                     for filename in index.filenames() {
                         let destination = self.path().join("挿絵").join(&filename);
                         let key = crate::platform::illustration_key(&prefix, &filename)?;
-                        if !destination.is_file() && !copy_asset(objects, lease, &key, &destination).await? { return Err(NarouError::NotFound(key.to_string())); }
+                        if !destination.is_file() && !copy_asset(objects, lease, &key, &destination, None).await? { return Err(NarouError::NotFound(key.to_string())); }
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -543,6 +539,7 @@ pub(crate) async fn copy_asset(
     lease: &mut crate::application::novel_access::NovelReadLease,
     key: &crate::platform::ObjectKey,
     destination: &Path,
+    restore_modified: Option<std::time::SystemTime>,
 ) -> Result<bool> {
     // Fs-backed keys already have a real file: hardlink it so a bulk snapshot
     // (convert copies every canonical file) never streams bytes per file
@@ -559,6 +556,8 @@ pub(crate) async fn copy_asset(
             if error.kind() == std::io::ErrorKind::NotFound { return Ok(false); }
             return Err(error.into());
         }
+        // The link already shares the inode (and mtime): stamping
+        // restore_modified here would write through to the canonical file.
         return Ok(true);
     }
     let Some(mut stream) = objects.read_stream_leased(lease.prefix(), lease.lease(), key, 0..u64::MAX).await? else { return Ok(false); };
@@ -567,6 +566,9 @@ pub(crate) async fn copy_asset(
     while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
         lease.refresh().await?;
         std::io::Write::write_all(&mut output, &chunk?)?;
+    }
+    if let Some(modified) = restore_modified {
+        output.set_modified(modified)?;
     }
     Ok(true)
 }
@@ -656,7 +658,7 @@ mod tests {
         let destination = root.path().join("snapshot/toc.yaml");
         block_on(async {
             let mut lease = crate::application::novel_access::NovelReadLease::admit(&objects, &prefix, "snapshot-test").await?;
-            assert!(copy_asset(&objects, &mut lease, &key.join("toc.yaml")?, &destination).await?);
+            assert!(copy_asset(&objects, &mut lease, &key.join("toc.yaml")?, &destination, None).await?);
             lease.release().await
         }).unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"toc body");

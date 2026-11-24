@@ -716,7 +716,7 @@ async fn generate_epub_on_demand(
             let mut cached = None;
             if crate::converter::keep_converted_text_file() {
                 let relative = relative.to_str().ok_or_else(|| NarouError::Conversion("ebook filename is not UTF-8".into()))?.replace('\\', "/");
-                crate::native::materialization::block_on(crate::native::materialization::copy_asset(&objects, &mut lease, &keys.prefix().join(&relative)?, &text_path))?;
+                crate::native::materialization::block_on(crate::native::materialization::copy_asset(&objects, &mut lease, &keys.prefix().join(&relative)?, &text_path, None))?;
                 if !text_path.is_file() && matches!(stores.primary.as_ref(), crate::native::object_store::NativeStore::Sqlite(_)) {
                     cached = stores.primary.with_reader_transaction(&prefix, lease.lease(), |connection| crate::native::sqlite::content::load_output(connection, id, "converted_text"))?;
                 }

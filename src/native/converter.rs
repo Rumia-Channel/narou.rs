@@ -77,7 +77,7 @@ pub(crate) fn with_novel_settings_input<T: Send>(
             let before = fence.gate_info(&prefix).await?;
             let temporary = tempfile::Builder::new().prefix(".narou-snapshot-").tempdir_in(inventory.root_dir())?;
             for name in ["setting.ini", "replace.txt"] {
-                crate::native::materialization::copy_asset(&objects, &mut lease, &keys.prefix().join(name)?, &temporary.path().join(name)).await?;
+                crate::native::materialization::copy_asset(&objects, &mut lease, &keys.prefix().join(name)?, &temporary.path().join(name), None).await?;
             }
             let configured = configure(temporary.path())?;
             lease.validate().await?;
