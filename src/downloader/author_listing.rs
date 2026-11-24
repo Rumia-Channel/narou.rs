@@ -389,6 +389,9 @@ impl<'a> AuthorListing<'a> {
         // 一覧が宣言した総件数 (定義がある場合)。取り切れずに終わったら
         // 途中までの一覧を成功にしない。
         let mut declared_total: Option<usize> = None;
+        // 宣言件数と突き合わせる作品エントリの生件数 (重複あり)。`listing.urls`
+        // は重複を除くので、宣言件数は並んだエントリ数と同じく重複ありで数える。
+        let mut listed_works: usize = 0;
         // 訪問済みの URL に戻ったら終わり。ページャが先頭へ戻る定義でも止まる。
         let mut visited: HashSet<String> = HashSet::new();
         loop {
@@ -440,6 +443,10 @@ impl<'a> AuthorListing<'a> {
                 declared_total = Some(total);
             }
             let before = listing.urls.len();
+            // 宣言件数は「並んだ作品エントリ」を数えるので、重複ありの生件数を追う
+            // (暁のように同じ作品が一覧へ 2 度出るサイトでも一致する)。unique な
+            // `listing.urls` と突き合わせると重複 1 件ぶん足りずに誤判定になる。
+            listed_works += setting.author_novel_entry_count(&body);
             for url in setting.author_novel_urls(&body).unwrap_or_default() {
                 if listing.seen.insert(url.clone()) {
                     listing.urls.push(url);
@@ -467,14 +474,16 @@ impl<'a> AuthorListing<'a> {
             fetch_url = next;
         }
         if let Some(total) = declared_total
-            && listing.urls.len() < total
+            && listed_works < total
         {
             // 応答が総件数を宣言しているのに読み切れなかった = 一覧は欠けて
-            // いる。空/不足を成功として返さない。
+            // いる。空/不足を成功として返さない。宣言件数は並んだエントリを
+            // 数えるので、同じ作品が一覧に 2 度出るサイトでも一致するよう
+            // 重複ありの生件数 (`listed_works`) と突き合わせる。
             return Err(NarouError::SiteSetting(format!(
                 "{} の作者一覧を最後まで取得できませんでした ({} / {total} 件): {page_url}",
                 setting.sitename,
-                listing.urls.len()
+                listed_works
             )));
         }
         Ok(listing)
@@ -2214,6 +2223,41 @@ toc_url: https://token.example/story/\k<ncode>
         assert!(
             error.to_string().contains("2 / 8597"),
             "宣言件数との不足を報告する: {error}"
+        );
+    }
+
+    #[test]
+    fn a_work_listed_twice_still_satisfies_the_declared_total() {
+        // 宣言件数は「並んだ作品エントリ」を数える。暁のように同じ作品が
+        // 一覧へ 2 度出るサイトでは、重複を除いた一意な作品数が宣言より
+        // 少なくても一覧は欠けていない。宣言件数は重複ありの生件数と
+        // 突き合わせる (実ページ観測: 作品が一覧に 2 度並ぶ例がある)。
+        let setting = load("www.akatsuki-novels.com");
+        let page = "https://www.akatsuki-novels.com/users/aknf43btk";
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            page,
+            200,
+            concat!(
+                r#"<h2 id="novels-heading">投稿作品</h2>"#,
+                r#"<p class="mt-1 text-sm text-muted">3作品（1 / 1ページ）</p>"#,
+                r#"<a href="/novels/view/2795" class="min-w-0 text-base font-semibold">作品1</a>"#,
+                // 同じ作品が一覧に 2 度並ぶ (宣言件数 3 = エントリ 3)。
+                r#"<a href="/novels/view/2795" class="min-w-0 text-base font-semibold">作品1</a>"#,
+                r#"<a href="/novels/view/23837" class="min-w-0 text-base font-semibold">作品2</a>"#,
+            ),
+        );
+
+        // 宣言 3 件 = エントリ 3 件なのでエラーにならない。一意な作品は 2 件。
+        let urls = works(&http, &FakeRateLimiter::new(), &setting, page).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://www.akatsuki-novels.com/novels/view/2795".to_string(),
+                "https://www.akatsuki-novels.com/novels/view/23837".to_string(),
+            ],
+            "同じ作品の重複エントリは宣言件数に含めて数え、一意な一覧へ落とす"
         );
     }
 }
