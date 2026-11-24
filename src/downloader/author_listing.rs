@@ -386,11 +386,8 @@ impl<'a> AuthorListing<'a> {
         let captures = setting.extract_author_url_captures(page_url).unwrap_or_default();
         let mut listing = Listing::default();
         let mut fetch_url = setting.author_fetch_url(page_url);
-        // 一覧が宣言した総件数 (定義がある場合)。取り切れずに終わったら
-        // 途中までの一覧を成功にしない。
         let mut declared_total: Option<usize> = None;
-        // 宣言件数と突き合わせる作品エントリの生件数 (重複あり)。`listing.urls`
-        // は重複を除くので、宣言件数は並んだエントリ数と同じく重複ありで数える。
+        // 宣言件数は並んだエントリを数えるので、重複ありの生件数と突き合わせる。
         let mut listed_works: usize = 0;
         // 訪問済みの URL に戻ったら終わり。ページャが先頭へ戻る定義でも止まる。
         let mut visited: HashSet<String> = HashSet::new();
@@ -443,9 +440,7 @@ impl<'a> AuthorListing<'a> {
                 declared_total = Some(total);
             }
             let before = listing.urls.len();
-            // 宣言件数は「並んだ作品エントリ」を数えるので、重複ありの生件数を追う
-            // (暁のように同じ作品が一覧へ 2 度出るサイトでも一致する)。unique な
-            // `listing.urls` と突き合わせると重複 1 件ぶん足りずに誤判定になる。
+            // 宣言件数は並んだエントリを数えるので、重複ありの生件数を追う。
             listed_works += setting.author_novel_entry_count(&body);
             for url in setting.author_novel_urls(&body).unwrap_or_default() {
                 if listing.seen.insert(url.clone()) {
@@ -473,18 +468,13 @@ impl<'a> AuthorListing<'a> {
             };
             fetch_url = next;
         }
-        // 宣言件数との突き合わせは「最後まで読み切ったはずの一覧」にだけ掛ける。
-        // ログイン壁や部分一覧で早く切れた分は「欠けた一覧」ではなく「読めない
-        // 一覧」なので、ここで件数不足のエラーにすると壁や部分を隠してしまう。
+        // ログイン壁で切れた分は読めない一覧であって欠けではない (壁自体が
+        // より正しいエラーを持つ)。部分一覧は欠けの検出対象に含める。
         if let Some(total) = declared_total
             && !listing.login_walled
-            && !listing.partial
             && listed_works < total
         {
-            // 応答が総件数を宣言しているのに読み切れなかった = 一覧は欠けて
-            // いる。空/不足を成功として返さない。宣言件数は並んだエントリを
-            // 数えるので、同じ作品が一覧に 2 度出るサイトでも一致するよう
-            // 重複ありの生件数 (`listed_works`) と突き合わせる。
+            // 宣言数より少なく読み切れた = 一覧が欠けている。空/不足を成功にしない。
             return Err(NarouError::SiteSetting(format!(
                 "{} の作者一覧を最後まで取得できませんでした ({} / {total} 件): {page_url}",
                 setting.sitename,
@@ -2160,10 +2150,8 @@ toc_url: https://token.example/story/\k<ncode>
 
     #[test]
     fn akatsuki_author_listing_follows_relative_next_links() {
-        // 暁の作者ページは /users/<id>?page=N で分けられる。「次へ」リンクは
-        // `<a href="/users/<id>?page=N" rel="next">` で、href はサイトルート
-        // 相対 (実ページ観測)。author_next_pattern が無かった頃は 1 ページ目の
-        // 20 件だけで終端と判定し、残りを黙って落としていた。
+        // 「次へ」はサイトルート相対の rel=next リンク。これが無かった頃は
+        // 1 ページ目だけで終端と判定し、残りを黙って落としていた。
         let setting = load("www.akatsuki-novels.com");
         let page = "https://www.akatsuki-novels.com/users/aknf43btk";
 
@@ -2206,9 +2194,7 @@ toc_url: https://token.example/story/\k<ncode>
 
     #[test]
     fn a_declared_total_above_the_read_count_fails_instead_of_truncating() {
-        // 暁の作者ページは「8,597作品」という総件数を宣言する。読み切った
-        // 一覧が宣言より少ない (次へリンクを見落とす等) ときは空/不足を
-        // 成功として返さず、一覧が欠けている旨のエラーにする。
+        // 読み切った一覧が宣言件数より少ない = 一覧が欠けている。
         let setting = load("www.akatsuki-novels.com");
         let page = "https://www.akatsuki-novels.com/users/aknf43btk";
 
@@ -2233,10 +2219,7 @@ toc_url: https://token.example/story/\k<ncode>
 
     #[test]
     fn a_work_listed_twice_still_satisfies_the_declared_total() {
-        // 宣言件数は「並んだ作品エントリ」を数える。暁のように同じ作品が
-        // 一覧へ 2 度出るサイトでは、重複を除いた一意な作品数が宣言より
-        // 少なくても一覧は欠けていない。宣言件数は重複ありの生件数と
-        // 突き合わせる (実ページ観測: 作品が一覧に 2 度並ぶ例がある)。
+        // 同じ作品が一覧に 2 度出ても、宣言件数は重複ありのエントリ数と一致する。
         let setting = load("www.akatsuki-novels.com");
         let page = "https://www.akatsuki-novels.com/users/aknf43btk";
 
@@ -2268,10 +2251,7 @@ toc_url: https://token.example/story/\k<ncode>
 
     #[test]
     fn a_login_wall_mid_walk_stays_a_login_error_not_a_truncation() {
-        // ページ送りの途中でログイン壁に当たった一覧は「欠けた一覧」ではなく
-        // 「読めない一覧」。宣言件数との件数チェックを先に通すと、壁の
-        // 報告 (ログインが必要) が「一覧を最後まで取得できませんでした」に
-        // 化けてしまうので、壁で切れた分は件数チェックの対象外にする。
+        // ページ送りの途中のログイン壁は欠けではなく読めない一覧。件数チェックで隠さない。
         const WALLED_PAGED: &str = r#"
 name: Walled
 domain: walled.example

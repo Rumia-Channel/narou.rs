@@ -1100,11 +1100,7 @@ impl SiteSetting {
 
     /// The number of work entries the listing shows (`author_novel_urls` is
     /// unique-per-page; this counts every entry, including duplicates).
-    ///
-    /// A site's declared total counts the entries it lists, and some sites
-    /// list the same work twice (暁). Comparing the declared total against the
-    /// deduplicated work count would falsely flag a complete listing as short,
-    /// so the total check uses this entry count instead.
+    /// The declared total counts listed entries, so the total check uses this.
     pub fn author_novel_entry_count(&self, source: &str) -> usize {
         let mut entries = 0;
         for line in source.lines() {
