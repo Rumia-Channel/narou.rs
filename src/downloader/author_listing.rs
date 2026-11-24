@@ -473,7 +473,12 @@ impl<'a> AuthorListing<'a> {
             };
             fetch_url = next;
         }
+        // 宣言件数との突き合わせは「最後まで読み切ったはずの一覧」にだけ掛ける。
+        // ログイン壁や部分一覧で早く切れた分は「欠けた一覧」ではなく「読めない
+        // 一覧」なので、ここで件数不足のエラーにすると壁や部分を隠してしまう。
         if let Some(total) = declared_total
+            && !listing.login_walled
+            && !listing.partial
             && listed_works < total
         {
             // 応答が総件数を宣言しているのに読み切れなかった = 一覧は欠けて
@@ -2260,4 +2265,58 @@ toc_url: https://token.example/story/\k<ncode>
             "同じ作品の重複エントリは宣言件数に含めて数え、一意な一覧へ落とす"
         );
     }
+
+    #[test]
+    fn a_login_wall_mid_walk_stays_a_login_error_not_a_truncation() {
+        // ページ送りの途中でログイン壁に当たった一覧は「欠けた一覧」ではなく
+        // 「読めない一覧」。宣言件数との件数チェックを先に通すと、壁の
+        // 報告 (ログインが必要) が「一覧を最後まで取得できませんでした」に
+        // 化けてしまうので、壁で切れた分は件数チェックの対象外にする。
+        const WALLED_PAGED: &str = r#"
+name: Walled
+domain: walled.example
+top_url: https://walled.example
+url: https://walled\.example/book/(?<ncode>\d+)
+author_url: ^https?://walled\.example/user/(?<author_id>\d+)/?
+author_api_url: https://walled.example/user/\k<author_id>
+author_novel_pattern: '(?<novel_url>https?://walled\.example/book/\d+)'
+author_next_pattern: '(?<author_next>https?://walled\.example/user/\d+\?page=\d+)'
+author_page_total_pattern: '(?<count>\d+)作品'
+sitename: Walled
+toc_url: https://walled.example/book/\k<ncode>
+login_pattern: 'ログインが必要です'
+"#;
+        let definitions = SiteSetting::load_bundled(&[WALLED_PAGED]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://walled.example/user/7/";
+        let first = setting.author_fetch_url(page);
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            &first,
+            200,
+            concat!(
+                r#"<p>5作品</p>"#,
+                r#"<a href="https://walled.example/book/1">w1</a>"#,
+                r#"<a href="https://walled.example/book/2">w2</a>"#,
+                r#"<a href="https://walled.example/user/7?page=2">next</a>"#,
+            ),
+        );
+        http.add_text(
+            "https://walled.example/user/7?page=2",
+            200,
+            "ログインが必要です",
+        );
+
+        let error = works(&http, &FakeRateLimiter::new(), setting, page).unwrap_err();
+        assert!(
+            error.to_string().contains("ログイン"),
+            "壁の報告が件数不足のエラーに化けない: {error}"
+        );
+        assert!(
+            !error.to_string().contains("最後まで取得"),
+            "壁を欠けた一覧と報告しない: {error}"
+        );
+    }
 }
+
