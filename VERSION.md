@@ -11,8 +11,9 @@
 - 暁の作品ページ URL (`/novels/view/N`) をダウンロード対象として受け付けます。
 - 暁の R-18 年齢ゲート（`/novels/adult_check` へのリダイレクト）に対応し、保存済みのログイン Cookie で年齢認証を抜けるようにしました。旧 `CakeCookie[ALLOWED_ADULT_NOVEL]` は新基盤で無効なため定義から外しています。
 - 暁の作者追跡で、プロフィール内のお気に入り作品を取り込まず「投稿作品」だけを拾うようにしました。
-- サイト定義の真偽値項目 (`cookie_session` / `preserve_missing_sections`) で `yes` / `no` / `on` / `off` を受け付けるようにしました。これまでは `true` / `false` 以外を書くとサイト定義全体が読み込まれず、その定義が無視されていました。
-- `narou author check --dry-run` の出力文言を実際の動作（追加対象の一覧表示）に合わせました。
+- 暁の作者追跡が作品一覧の 2 ページ目以降を読み取れない問題を修正しました。作者ページのページ送り (`/users/<id>?page=N`) を `author_next_pattern` で辿り、相対 URL の「次へ」リンクを解決するようにしました（20 件を超える作品数の作者で残りが黙って落ちていました）。
+- サイト定義の真偽値項目 (`cookie_session` / `preserve_missing_sections` / `is_narou` / `illust_from_raw` ほか) で `yes` / `no` / `on` / `off` を受け付けるようにしました。これまでは `true` / `false` 以外を書くとサイト定義全体が読み込まれず、その定義が無視されていました。
+- `narou author check` で一覧取得に失敗した作者がいる場合、失敗件数を表示して終了コード 1 で終わるようにしました。これまでは失敗していても「0 件を確認、新規 0 件」とだけ出て終了コード 0 でした。`--dry-run` の文言も追加予定件数と既知件数を分けて表示するようにしました。
 
 変更一覧は [v0.6.11...v0.6.12](https://github.com/Rumia-Channel/narou.rs/compare/v0.6.11...v0.6.12) を参照してください。
 
