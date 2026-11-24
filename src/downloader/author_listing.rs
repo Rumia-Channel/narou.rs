@@ -2189,4 +2189,31 @@ toc_url: https://token.example/story/\k<ncode>
             "相対 rel=next を絶対 URL へ解決して終端まで辿る"
         );
     }
+
+    #[test]
+    fn a_declared_total_above_the_read_count_fails_instead_of_truncating() {
+        // 暁の作者ページは「8,597作品」という総件数を宣言する。読み切った
+        // 一覧が宣言より少ない (次へリンクを見落とす等) ときは空/不足を
+        // 成功として返さず、一覧が欠けている旨のエラーにする。
+        let setting = load("www.akatsuki-novels.com");
+        let page = "https://www.akatsuki-novels.com/users/aknf43btk";
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            page,
+            200,
+            concat!(
+                r#"<h2 id="novels-heading">投稿作品</h2>"#,
+                r#"<p class="mt-1 text-sm text-muted">8,597作品（1 / 430ページ）</p>"#,
+                r#"<a href="/novels/view/2795" class="min-w-0 text-base font-semibold">作品1</a>"#,
+                r#"<a href="/novels/view/23837" class="min-w-0 text-base font-semibold">作品2</a>"#,
+            ),
+        );
+
+        let error = works(&http, &FakeRateLimiter::new(), &setting, page).unwrap_err();
+        assert!(
+            error.to_string().contains("2 / 8597"),
+            "宣言件数との不足を報告する: {error}"
+        );
+    }
 }

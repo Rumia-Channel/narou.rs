@@ -20,7 +20,7 @@ title_strip_pattern: null
 # ないため削除した (実際のゲート Cookie は login_cookie 側の akatsuki_adult_allowed)。
 cookie_session: true
 sitename: *name
-version: 2.9
+version: 3.0
 
 # ------------------------------------------------------------
 # 書籍情報取得設定 (目次ページから取得)
@@ -49,6 +49,10 @@ author_work_url: \\k<top_url>\\k<work_path>
 # <a href="..." rel="next"> の形 (href はサイトルート相対)。author_next_url が
 # 相対 href をサイトのルートへ解決する。
 author_next_pattern: <a\b[^>]*href="(?<author_next>(?:https?://www\.akatsuki-novels\.com)?/?users/[^"]+\?page=\d+)"[^>]*rel="next"
+# 「投稿作品」の横に全作品数が出る (例: 8,597作品)。読み切りが宣言件数に
+# 足りないときは一覧が欠けているとしてエラーにする (件数一致で静かな
+# 取りこぼしを検出する)。
+author_page_total_pattern: <p class="mt-1 text-sm text-muted">\s*(?<count>[\d,]+)\s*作品
 
 # ------------------------------------------------------------
 # 目次取得設定
