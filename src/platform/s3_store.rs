@@ -245,11 +245,6 @@ impl S3Store {
         response_limit: Option<usize>,
     ) -> Result<(super::http::HttpResponse, s3_sigv4::SignedHeaders)> {
         let (path, query) = url_target(url);
-        // 署名対象のクエリは canonical form (decode → sort → re-encode) に
-        // する。wire 上の並びがサーバー側の再構成と違うと
-        // SignatureDoesNotMatch になるため (multipart の手組みクエリで実際に
-        // 発生した)、wire bytes との一致はパスだけに留める。
-        let query = s3_sigv4::canonical_wire_query(&query);
         let payload_sha256 = s3_sigv4::payload_sha256(body.as_deref().unwrap_or(&[]));
         let amz_date = s3_sigv4::amz_date(self.clock.now_utc());
         let signed = s3_sigv4::sign(
@@ -593,8 +588,12 @@ fn diagnostic_region(region: &str) -> &str {
 
 /// URL 文字列から署名対象の `path` と `query` を切り出す。
 ///
+/// 返す `query` は SigV4 canonical form (decode → sort → re-encode) に
+/// 正規化する。サーバーは署名検証時にこの形で canonical request を再構成
+/// するため、wire 上の並びと違う値で署名すると SignatureDoesNotMatch
+/// (403) になる。multipart の手組みクエリで実際に発生した。
 /// `url` クレートで再パースすると percent-encoding が正規化されて署名対象と
-/// wire のバイト列がずれる余地があるため、単純な文字列分割で済ませる。
+/// wire のバイト列がずれる余地があるため、切り出しは単純な文字列分割で済ませる。
 /// `endpoint` 構築時に `?`/`#` を拒否しているので、ここで出る `?` は常に
 /// クエリの開始。
 fn url_target(url: &str) -> (String, String) {
@@ -607,7 +606,7 @@ fn url_target(url: &str) -> (String, String) {
         None => "/",
     };
     match target.split_once('?') {
-        Some((path, query)) => (path.to_string(), query.to_string()),
+        Some((path, query)) => (path.to_string(), s3_sigv4::canonical_wire_query(query)),
         None => (target.to_string(), String::new()),
     }
 }

@@ -46,7 +46,11 @@ pub(super) fn xml_escape(value: &str) -> String {
 
 pub(super) fn require_status(response: &super::super::http::HttpResponse, allowed: &[u16], operation: &str) -> Result<()> {
     if !allowed.contains(&response.status) {
-        return Err(NarouError::Platform(format!("S3 {operation} failed with status {}", response.status)));
+        // サーバーが返す <Code> は allowlist 済みの固定名だけを表示する
+        // (SignatureDoesNotMatch と AccessDenied の切り分けに必須)。
+        let detail = std::str::from_utf8(&response.body).ok().filter(|body| body.contains("<Code>"))
+            .map(|body| format!(" ({})", super::super::s3_diagnostics::error_code(body))).unwrap_or_default();
+        return Err(NarouError::Platform(format!("S3 {operation} failed with status {}{detail}", response.status)));
     }
     if std::str::from_utf8(&response.body).is_ok_and(|xml| super::super::s3_request::find_tag(xml, "Error").is_some()) {
         return Err(NarouError::Platform(format!("S3 {operation} returned Error XML")));
