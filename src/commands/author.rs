@@ -47,7 +47,7 @@ pub async fn cmd_author(action: AuthorAction) -> Result<()> {
             let report = check_tracked_authors(None, dry_run).await?;
             report.print();
             if report.failed > 0 {
-                Err(NarouError::InvalidTarget(format!(
+                Err(NarouError::SiteSetting(format!(
                     "作者の確認が {} 件失敗しました",
                     report.failed
                 )))

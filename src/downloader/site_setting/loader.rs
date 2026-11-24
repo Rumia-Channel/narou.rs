@@ -21,11 +21,25 @@ fn load_settings_from_dir(dir: PathBuf, settings: &mut Vec<SiteSetting>) {
         let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
         paths.sort();
         for path in paths {
-            if (path.extension().and_then(|e| e.to_str()) == Some("yaml")
-                || path.extension().and_then(|e| e.to_str()) == Some("yml"))
-                && let Ok(content) = std::fs::read_to_string(&path)
-                && let Ok(raw_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content)
-            {
+            let is_yaml = matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("yml")
+            );
+            if !is_yaml {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                tracing::warn!("サイト定義 {} を読み込めませんでした", path.display());
+                continue;
+            };
+            let parsed = serde_yaml::from_str::<serde_yaml::Value>(&content);
+            if let Err(error) = &parsed {
+                tracing::warn!(
+                    "サイト定義 {} を読み込めませんでした ({error})",
+                    path.display()
+                );
+            }
+            if let Ok(raw_yaml) = parsed {
                 let name = raw_yaml
                     .get("name")
                     .and_then(|v| v.as_str())
