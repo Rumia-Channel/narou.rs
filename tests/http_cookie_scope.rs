@@ -49,7 +49,8 @@ headers:
     FetchPolicy::for_site(&setting)
 }
 
-fn request_head(stream: &mut TcpStream) -> String {
+/// ヘッダと、一度の読み取りで一緒に読み終えた本文の先行分を返す。
+fn request_head(stream: &mut TcpStream) -> (String, Vec<u8>) {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -57,8 +58,11 @@ fn request_head(stream: &mut TcpStream) -> String {
         let count = stream.read(&mut chunk).unwrap();
         assert_ne!(count, 0, "request ended before its head");
         bytes.extend_from_slice(&chunk[..count]);
-        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-            return String::from_utf8(bytes).unwrap();
+        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head_end = position + 4;
+            let leftover = bytes[head_end..].to_vec();
+            let head = String::from_utf8(bytes[..head_end].to_vec()).unwrap();
+            return (head, leftover);
         }
         assert!(bytes.len() <= 64 * 1024);
     }
@@ -70,6 +74,23 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.trim())
 }
 
+/// ヘッダだけ読んで返すと、本文を書き終える前に接続を閉じてしまい、
+/// クライアント側が "request or response body error" で失敗することがある。
+/// Content-Length の分だけ読み切ってから応答する。
+fn drain_request_body(stream: &mut TcpStream, head: &str, leftover: Vec<u8>) {
+    let Some(length) = header(head, "Content-Length").and_then(|value| value.parse::<usize>().ok())
+    else {
+        return;
+    };
+    let mut remaining = length.saturating_sub(leftover.len());
+    let mut chunk = [0u8; 1024];
+    while remaining > 0 {
+        let count = stream.read(&mut chunk).unwrap();
+        assert_ne!(count, 0, "request ended before its body");
+        remaining -= count.min(remaining);
+    }
+}
+
 #[tokio::test]
 async fn first_fetch_limits_cookie_scope_but_keeps_noncredential_site_headers() {
     for (host, authenticated) in [("127.0.0.1", true), ("localhost", false)] {
@@ -77,7 +98,7 @@ async fn first_fetch_limits_cookie_scope_but_keeps_noncredential_site_headers() 
         let url = format!("http://{host}:{}/image", listener.local_addr().unwrap().port());
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let head = request_head(&mut stream);
+            let (head, _) = request_head(&mut stream);
             assert_eq!(header(&head, "Referer"), Some("https://example.com/"));
             let body = if header(&head, "Cookie") == Some("session=canary") {
                 "authenticated"
@@ -104,7 +125,7 @@ async fn redirect_resolution_strips_credentials_and_never_restores_them_on_retur
     let server = thread::spawn(move || {
         for hop in 0..3 {
             let (mut stream, _) = listener.accept().unwrap();
-            let head = request_head(&mut stream);
+            let (head, _) = request_head(&mut stream);
             if hop == 0 {
                 assert_eq!(header(&head, "Cookie"), Some("session=canary"));
                 assert_eq!(header(&head, "Authorization"), Some("Bearer secret"));
@@ -138,7 +159,7 @@ async fn only_an_immediate_content_response_is_reusable_and_304_is_terminal() {
         let url = format!("http://{}/story", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            request_head(&mut stream);
+            let _ = request_head(&mut stream);
             let response = if status == 200 {
                 "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncontent"
             } else {
@@ -178,7 +199,8 @@ cookie_session: true
     let server = thread::spawn(move || {
         for hop in 0..4 {
             let (mut stream, _) = listener.accept().unwrap();
-            let head = request_head(&mut stream);
+            let (head, leftover) = request_head(&mut stream);
+            drain_request_body(&mut stream, &head, leftover);
             let cookie = header(&head, "Cookie");
             let (status, body, extra) = match hop {
                 0 => (200, "reader", "Set-Cookie: csrf-session=canary; Path=/reader; HttpOnly\r\n"),
@@ -201,7 +223,7 @@ cookie_session: true
     let other_url = format!("http://{}/reader/private", other.local_addr().unwrap());
     let foreign = thread::spawn(move || {
         let (mut stream, _) = other.accept().unwrap();
-        let head = request_head(&mut stream);
+        let (head, _) = request_head(&mut stream);
         let body = if header(&head, "Cookie").is_none() { "anonymous" } else { "leaked" };
         stream.write_all(format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
@@ -270,7 +292,8 @@ async fn downloader_reuses_the_probe_session_for_yaml_form_requests() {
                 Err(error) => panic!("{error}"),
             };
             stream.set_nonblocking(false).unwrap();
-            let request = request_head(&mut stream);
+            let (request, leftover) = request_head(&mut stream);
+            drain_request_body(&mut stream, &request, leftover);
             let (status, body, extra) = if request.starts_with("GET /n1234ab/ ") {
                 (200, "form shell", "Set-Cookie: csrf-session=canary; Path=/; HttpOnly\r\n")
             } else if request.starts_with("POST /reader/toc ") {
