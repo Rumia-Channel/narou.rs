@@ -386,9 +386,9 @@ impl<'a> AuthorListing<'a> {
         let captures = setting.extract_author_url_captures(page_url).unwrap_or_default();
         let mut listing = Listing::default();
         let mut fetch_url = setting.author_fetch_url(page_url);
-        // 一覧が宣言した総件数 (定義がある場合)。取り切れずに終わったら
-        // 途中までの一覧を成功にしない。
         let mut declared_total: Option<usize> = None;
+        // 宣言件数は並んだエントリを数えるので、重複ありの生件数と突き合わせる。
+        let mut listed_works: usize = 0;
         // 訪問済みの URL に戻ったら終わり。ページャが先頭へ戻る定義でも止まる。
         let mut visited: HashSet<String> = HashSet::new();
         loop {
@@ -440,6 +440,8 @@ impl<'a> AuthorListing<'a> {
                 declared_total = Some(total);
             }
             let before = listing.urls.len();
+            // 宣言件数は並んだエントリを数えるので、重複ありの生件数を追う。
+            listed_works += setting.author_novel_entry_count(&body);
             for url in setting.author_novel_urls(&body).unwrap_or_default() {
                 if listing.seen.insert(url.clone()) {
                     listing.urls.push(url);
@@ -466,15 +468,17 @@ impl<'a> AuthorListing<'a> {
             };
             fetch_url = next;
         }
+        // ログイン壁で切れた分は読めない一覧であって欠けではない (壁自体が
+        // より正しいエラーを持つ)。部分一覧は欠けの検出対象に含める。
         if let Some(total) = declared_total
-            && listing.urls.len() < total
+            && !listing.login_walled
+            && listed_works < total
         {
-            // 応答が総件数を宣言しているのに読み切れなかった = 一覧は欠けて
-            // いる。空/不足を成功として返さない。
+            // 宣言数より少なく読み切れた = 一覧が欠けている。空/不足を成功にしない。
             return Err(NarouError::SiteSetting(format!(
                 "{} の作者一覧を最後まで取得できませんでした ({} / {total} 件): {page_url}",
                 setting.sitename,
-                listing.urls.len()
+                listed_works
             )));
         }
         Ok(listing)
@@ -2143,4 +2147,156 @@ toc_url: https://token.example/story/\k<ncode>
         assert_eq!(store.sessions(), [Some("acct-1".to_string()), Some("acct-2".to_string())]);
         assert!(http.cookies_for(page).last().unwrap().as_deref().unwrap().contains("sid=secondary"));
     }
+
+    #[test]
+    fn akatsuki_author_listing_follows_relative_next_links() {
+        // 「次へ」はサイトルート相対の rel=next リンク。これが無かった頃は
+        // 1 ページ目だけで終端と判定し、残りを黙って落としていた。
+        let setting = load("www.akatsuki-novels.com");
+        let page = "https://www.akatsuki-novels.com/users/aknf43btk";
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            page,
+            200,
+            concat!(
+                r#"<h2 id="novels-heading">投稿作品</h2>"#,
+                r#"<a href="/novels/view/2795" class="min-w-0 text-base font-semibold">作品1</a>"#,
+                r#"<a href="/users/aknf43btk?page=2" rel="next">次へ</a>"#,
+            ),
+        );
+        http.add_text(
+            "https://www.akatsuki-novels.com/users/aknf43btk?page=2",
+            200,
+            concat!(
+                r#"<a href="/novels/view/23837" class="min-w-0 text-base font-semibold">作品2</a>"#,
+                r#"<a href="/users/aknf43btk?page=1" rel="prev">前へ</a>"#,
+                r#"<a href="/users/aknf43btk?page=3" rel="next">次へ</a>"#,
+            ),
+        );
+        http.add_text(
+            "https://www.akatsuki-novels.com/users/aknf43btk?page=3",
+            200,
+            r#"<a href="/novels/view/32207" class="min-w-0 text-base font-semibold">作品3</a>"#,
+        );
+
+        let urls = works(&http, &FakeRateLimiter::new(), &setting, page).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://www.akatsuki-novels.com/novels/view/2795".to_string(),
+                "https://www.akatsuki-novels.com/novels/view/23837".to_string(),
+                "https://www.akatsuki-novels.com/novels/view/32207".to_string(),
+            ],
+            "相対 rel=next を絶対 URL へ解決して終端まで辿る"
+        );
+    }
+
+    #[test]
+    fn a_declared_total_above_the_read_count_fails_instead_of_truncating() {
+        // 読み切った一覧が宣言件数より少ない = 一覧が欠けている。
+        let setting = load("www.akatsuki-novels.com");
+        let page = "https://www.akatsuki-novels.com/users/aknf43btk";
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            page,
+            200,
+            concat!(
+                r#"<h2 id="novels-heading">投稿作品</h2>"#,
+                r#"<p class="mt-1 text-sm text-muted">8,597作品（1 / 430ページ）</p>"#,
+                r#"<a href="/novels/view/2795" class="min-w-0 text-base font-semibold">作品1</a>"#,
+                r#"<a href="/novels/view/23837" class="min-w-0 text-base font-semibold">作品2</a>"#,
+            ),
+        );
+
+        let error = works(&http, &FakeRateLimiter::new(), &setting, page).unwrap_err();
+        assert!(
+            error.to_string().contains("2 / 8597"),
+            "宣言件数との不足を報告する: {error}"
+        );
+    }
+
+    #[test]
+    fn a_work_listed_twice_still_satisfies_the_declared_total() {
+        // 同じ作品が一覧に 2 度出ても、宣言件数は重複ありのエントリ数と一致する。
+        let setting = load("www.akatsuki-novels.com");
+        let page = "https://www.akatsuki-novels.com/users/aknf43btk";
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            page,
+            200,
+            concat!(
+                r#"<h2 id="novels-heading">投稿作品</h2>"#,
+                r#"<p class="mt-1 text-sm text-muted">3作品（1 / 1ページ）</p>"#,
+                r#"<a href="/novels/view/2795" class="min-w-0 text-base font-semibold">作品1</a>"#,
+                // 同じ作品が一覧に 2 度並ぶ (宣言件数 3 = エントリ 3)。
+                r#"<a href="/novels/view/2795" class="min-w-0 text-base font-semibold">作品1</a>"#,
+                r#"<a href="/novels/view/23837" class="min-w-0 text-base font-semibold">作品2</a>"#,
+            ),
+        );
+
+        // 宣言 3 件 = エントリ 3 件なのでエラーにならない。一意な作品は 2 件。
+        let urls = works(&http, &FakeRateLimiter::new(), &setting, page).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://www.akatsuki-novels.com/novels/view/2795".to_string(),
+                "https://www.akatsuki-novels.com/novels/view/23837".to_string(),
+            ],
+            "同じ作品の重複エントリは宣言件数に含めて数え、一意な一覧へ落とす"
+        );
+    }
+
+    #[test]
+    fn a_login_wall_mid_walk_stays_a_login_error_not_a_truncation() {
+        // ページ送りの途中のログイン壁は欠けではなく読めない一覧。件数チェックで隠さない。
+        const WALLED_PAGED: &str = r#"
+name: Walled
+domain: walled.example
+top_url: https://walled.example
+url: https://walled\.example/book/(?<ncode>\d+)
+author_url: ^https?://walled\.example/user/(?<author_id>\d+)/?
+author_api_url: https://walled.example/user/\k<author_id>
+author_novel_pattern: '(?<novel_url>https?://walled\.example/book/\d+)'
+author_next_pattern: '(?<author_next>https?://walled\.example/user/\d+\?page=\d+)'
+author_page_total_pattern: '(?<count>\d+)作品'
+sitename: Walled
+toc_url: https://walled.example/book/\k<ncode>
+login_pattern: 'ログインが必要です'
+"#;
+        let definitions = SiteSetting::load_bundled(&[WALLED_PAGED]).unwrap();
+        let setting = &definitions[0];
+        let page = "https://walled.example/user/7/";
+        let first = setting.author_fetch_url(page);
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            &first,
+            200,
+            concat!(
+                r#"<p>5作品</p>"#,
+                r#"<a href="https://walled.example/book/1">w1</a>"#,
+                r#"<a href="https://walled.example/book/2">w2</a>"#,
+                r#"<a href="https://walled.example/user/7?page=2">next</a>"#,
+            ),
+        );
+        http.add_text(
+            "https://walled.example/user/7?page=2",
+            200,
+            "ログインが必要です",
+        );
+
+        let error = works(&http, &FakeRateLimiter::new(), setting, page).unwrap_err();
+        assert!(
+            error.to_string().contains("ログイン"),
+            "壁の報告が件数不足のエラーに化けない: {error}"
+        );
+        assert!(
+            !error.to_string().contains("最後まで取得"),
+            "壁を欠けた一覧と報告しない: {error}"
+        );
+    }
 }
+

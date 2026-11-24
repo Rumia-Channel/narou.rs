@@ -21,11 +21,25 @@ fn load_settings_from_dir(dir: PathBuf, settings: &mut Vec<SiteSetting>) {
         let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
         paths.sort();
         for path in paths {
-            if (path.extension().and_then(|e| e.to_str()) == Some("yaml")
-                || path.extension().and_then(|e| e.to_str()) == Some("yml"))
-                && let Ok(content) = std::fs::read_to_string(&path)
-                && let Ok(raw_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content)
-            {
+            let is_yaml = matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("yml")
+            );
+            if !is_yaml {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                tracing::warn!("サイト定義 {} を読み込めませんでした", path.display());
+                continue;
+            };
+            let parsed = serde_yaml::from_str::<serde_yaml::Value>(&content);
+            if let Err(error) = &parsed {
+                tracing::warn!(
+                    "サイト定義 {} を読み込めませんでした ({error})",
+                    path.display()
+                );
+            }
+            if let Ok(raw_yaml) = parsed {
                 let name = raw_yaml
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -39,15 +53,32 @@ fn load_settings_from_dir(dir: PathBuf, settings: &mut Vec<SiteSetting>) {
                     // `super::merge_user_definition_yaml` に一元化してある
                     // (core の `SiteDefinitions::effective_runtime()` と
                     //  規則が逸れないように)。
-                    if let Ok(bundled_yaml) = serde_yaml::to_string(existing)
-                        && let Ok(merged) = serde_yaml::from_str::<SiteSetting>(
-                            &super::merge_user_definition_yaml(&bundled_yaml, &content),
-                        )
-                    {
-                        *existing = merged;
+                    match serde_yaml::to_string(existing) {
+                        Ok(bundled_yaml) => {
+                            let merged = super::merge_user_definition_yaml(&bundled_yaml, &content);
+                            match serde_yaml::from_str::<SiteSetting>(&merged) {
+                                Ok(merged) => *existing = merged,
+                                Err(error) => tracing::warn!(
+                                    "サイト定義 {} を読み込めませんでした ({error})",
+                                    path.display()
+                                ),
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            "サイト定義 {} を書き出せませんでした ({error})",
+                            path.display()
+                        ),
                     }
-                } else if let Ok(setting) = serde_yaml::from_value::<SiteSetting>(raw_yaml) {
-                    settings.push(setting);
+                } else {
+                    match serde_yaml::from_value::<SiteSetting>(raw_yaml) {
+                        Ok(setting) => settings.push(setting),
+                        // 壊れた定義を黙って捨てると、ユーザーは原因不明で
+                        // 「そのサイトが無い」ことになる。読み込み失敗を出す。
+                        Err(error) => tracing::warn!(
+                            "サイト定義 {} を読み込めませんでした ({error})",
+                            path.display()
+                        ),
+                    }
                 }
             }
         }

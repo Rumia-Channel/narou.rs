@@ -284,8 +284,7 @@ mod tests {
     fn test_state() -> AppState {
         let push_server = crate::web::push::PushServer::new();
         push_server.set_accepted_domains(["127.0.0.1", "localhost"]);
-        let queue_dir = std::env::current_dir()
-            .unwrap()
+        let queue_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test-artifacts")
             .join(format!("web-virtual-attribute-{}", std::process::id()));

@@ -148,7 +148,7 @@ pub struct SiteSetting {
     pub cookie_hosts: Vec<String>,
     /// Reuse response cookies within a single fetch policy (e.g. CSRF forms).
     /// Anonymous session cookies are never persisted as saved logins.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub cookie_session: bool,
     /// Runtime-only credential destinations; never written into site YAML.
     #[serde(skip)]
@@ -193,7 +193,7 @@ pub struct SiteSetting {
     )]
     pub browser_token: Option<BrowserTokenSetting>,
     /// Retain cached omitted sections on a nonempty partial TOC; indices must be stable numeric positions.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub preserve_missing_sections: bool,
     /// Minimum seconds between requests to this site. Sites that rate-limit
     /// aggressively (Pixiv) declare a floor; `None` uses `download.interval`.
@@ -235,7 +235,7 @@ pub struct SiteSetting {
     pub ncode: Option<SiteSettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub is_narou: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narou_api_url: Option<String>,
@@ -244,7 +244,11 @@ pub struct SiteSetting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub illust_grep_pattern: Option<String>,
     /// Search fetched page markup as well as parsed content (default: true).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "serde_helpers::deserialize_yes_no_opt_bool"
+    )]
     pub illust_from_raw: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<SiteSettingValue>,
@@ -991,6 +995,23 @@ impl SiteSetting {
             .name("author_next")
             .map(|matched| crate::downloader::util::decode_html_text(matched.as_str()))
             .filter(|url| !url.is_empty())
+            .map(|url| self.resolve_author_page_url(&url))
+    }
+
+    /// Pager captures are page hrefs and may be site-relative (`/users/x?page=2`,
+    /// `//host/...`). The listing fetcher needs an absolute URL; resolve the
+    /// same way `build_section_url` does for TOC links. Bare relative paths join
+    /// `top_url` (site-root-relative, like the site's own links are written).
+    fn resolve_author_page_url(&self, url: &str) -> String {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            url.to_string()
+        } else if let Some(host_and_path) = url.strip_prefix("//") {
+            format!("{}://{}", self.top_url().split("://").next().unwrap_or("https"), host_and_path)
+        } else if let Some(path) = url.strip_prefix('/') {
+            format!("{}/{}", self.top_url().trim_end_matches('/'), path)
+        } else {
+            format!("{}/{}", self.top_url().trim_end_matches('/'), url)
+        }
     }
 
     /// Fetch URL of one continued page of an offset-paged author listing.
@@ -1009,10 +1030,15 @@ impl SiteSetting {
     }
 
     /// Total number of works the listing says it has (`count` capture).
+    ///
+    /// Sites group thousands with commas (`8,597作品`), so the captured digits
+    /// are read with the separators removed; a count that still does not parse
+    /// means "unknown", not zero.
     pub fn author_page_total(&self, source: &str) -> Option<usize> {
         let pattern = self.compiled_author_page_total.as_ref()?;
         let captures = pattern.captures(source)?;
-        captures.name("count")?.as_str().parse().ok()
+        let count = captures.name("count")?.as_str();
+        count.replace(',', "").parse().ok()
     }
 
     /// Captures of `author_url` for a concrete author page.
@@ -1070,6 +1096,24 @@ impl SiteSetting {
             }
         }
         Some(urls)
+    }
+
+    /// The number of work entries the listing shows (`author_novel_urls` is
+    /// unique-per-page; this counts every entry, including duplicates).
+    /// The declared total counts listed entries, so the total check uses this.
+    pub fn author_novel_entry_count(&self, source: &str) -> usize {
+        let mut entries = 0;
+        for line in source.lines() {
+            if let Some(url) = line.trim().strip_prefix(AUTHOR_NOVEL_MARKER) {
+                if !crate::downloader::util::decode_html_text(url.trim()).is_empty() {
+                    entries += 1;
+                }
+            }
+        }
+        if let Some(pattern) = self.compiled_author_novel.as_ref() {
+            entries += pattern.captures_iter(source).count();
+        }
+        entries
     }
 
     pub fn debug_url_pattern(&self) -> Option<String> {
@@ -1798,5 +1842,38 @@ work_type_rules:
         assert_eq!(classify("c311834"), WorkType::Manga);
         assert_eq!(classify("n26352975"), WorkType::Novel);
         assert_eq!(classify("s16299140"), WorkType::Novel);
+    }
+
+    #[test]
+    fn bool_fields_accept_narou_dialect_yes_no() {
+        // narou.rb の YAML 方言では真偽値に yes/no/on/off を書く。ユーザー定義が
+        // cookie_session: yes と書いても定義全体が読めなくならないこと。
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\ncookie_session: yes\npreserve_missing_sections: on\n",
+        ])
+        .expect("yes/no bools must parse");
+        assert!(settings[0].cookie_session);
+        assert!(settings[0].preserve_missing_sections);
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\ncookie_session: no\npreserve_missing_sections: off\n",
+        ])
+        .expect("no/off bools must parse");
+        assert!(!settings[0].cookie_session);
+        assert!(!settings[0].preserve_missing_sections);
+        // is_narou / illust_from_raw も同じ方言を受け付ける (以前は yes/no で
+        // 定義全体が読めなくなっていた)。
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\nis_narou: yes\nillust_from_raw: no\n",
+        ])
+        .expect("is_narou/illust_from_raw yes/no must parse");
+        assert!(settings[0].is_narou);
+        assert_eq!(settings[0].illust_from_raw, Some(false));
+        // 整数と null も Psych の真理値判定に合わせる (整数は真、null は偽)。
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\nis_narou: 1\nillust_from_raw: null\n",
+        ])
+        .expect("integer/null bools must parse");
+        assert!(settings[0].is_narou);
+        assert_eq!(settings[0].illust_from_raw, None);
     }
 }

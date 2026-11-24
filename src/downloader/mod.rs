@@ -1688,7 +1688,13 @@ impl Downloader {
                             true,
                         )
                     } else {
-                        (final_url, None, true)
+                        // 移動先がどのサイト定義にも一致しないページ (暁の
+                        // /novels/adult_check のような中継ゲート) は TOC として
+                        // 採用しない。採用すると壁への認証リトライが作品ではなく
+                        // ゲート URL へ送られ、構造的に必ず失敗する。元の
+                        // toc_url を保持すれば、リトライは作品 URL へ認証付きで
+                        // 届き、壁は login_pattern として従来どおり処理される。
+                        (toc_url, None, false)
                     }
                 }
                 Ok((final_url, body)) => (final_url, body, false),
@@ -3751,11 +3757,14 @@ mod tests {
     use crate::error::{NarouError, Result};
     use crate::platform::{NovelId, NovelIdReservation, NovelRepository, ObjectKey};
     use crate::platform::mocks::{
-        FakeRateLimiter, MemoryNovelRepository, MemoryObjectStore, MockHttpClient,
+        FakeRateLimiter, MemoryCookieStore, MemoryNovelRepository, MemoryObjectStore,
+        MockHttpClient,
     };
+    use crate::platform::cookie_store::LoginGroup;
+    use crate::platform::HostCookie;
     use crate::downloader::settings::DownloaderSettings;
     use crate::platform::{
-        AssetStore, AssetStream, HttpResponse, NovelMutation, NovelObjectKeys, ObjectListRequest,
+        AssetStore, AssetStream, CookieStore, HttpResponse, NovelMutation, NovelObjectKeys, ObjectListRequest,
         ObjectMetadata, ObjectPrefix, ObjectStore, PlatformFuture, SystemClock,
     };
     use base64::Engine;
@@ -4705,6 +4714,83 @@ is_narou: false
             assert_eq!(downloader.site_key_for_target("42", known).await.unwrap(), "syosetu.com");
             assert!(matches!(downloader.site_key_for_target("N1234AB", known).await, Err(crate::error::NarouError::SiteSetting(_))));
         }
+    }
+
+    /// 暁の R-18 ゲート: TOC がサイト定義に一致しない `/novels/adult_check`
+    /// へ 302 しても、採用する toc_url は元の作品 URL のままにする。
+    /// 採用してしまうと認証リトライがゲート URL へ送られて必ず失敗する。
+    #[tokio::test]
+    async fn redirect_to_ungated_page_does_not_replace_toc_url() {
+        let sites = SiteSetting::load_bundled(&[include_str!("../../webnovel/www.akatsuki-novels.com.yaml")]).unwrap();
+        let toc_url = "https://www.akatsuki-novels.com/stories/index/novel_id~10044";
+        let gate_url = "https://www.akatsuki-novels.com/novels/adult_check?back=https%3A%2F%2Fwww.akatsuki-novels.com%2Fstories%2Findex%2Fnovel_id%7E10044";
+        let http = Arc::new(MockHttpClient::new());
+        http.add_response(
+            toc_url,
+            HttpResponse {
+                status: 302,
+                headers: vec![
+                    ("Location".into(), "/novels/adult_check?back=https%3A%2F%2Fwww.akatsuki-novels.com%2Fstories%2Findex%2Fnovel_id%7E10044".into()),
+                    ("Content-Type".into(), "text/html; charset=utf-8".into()),
+                ],
+                body: Vec::new(),
+            },
+        );
+        // ゲートの本文はサイト定義の login_pattern (「あなたは18歳以上ですか」) に一致する。
+        http.add_text(gate_url, 200, "<html>あなたは18歳以上ですか</html>");
+        // 年齢承認を済ませたログイン (akatsuki_adult_allowed) が保存されている。
+        let cookies = Arc::new(MemoryCookieStore::new());
+        cookies.save_groups(
+            "www.akatsuki-novels.com",
+            &[LoginGroup::new(
+                "www.akatsuki-novels.com",
+                vec![HostCookie {
+                    host: "www.akatsuki-novels.com".into(),
+                    cookie: "akatsuki_adult_allowed=on".into(),
+                }],
+            ).with_id("adult")],
+        ).await.unwrap();
+
+        let store = Arc::new(MemoryObjectStore::new());
+        let novels = Arc::new(MemoryNovelRepository::new().with_objects(store.clone()));
+        let mut downloader = Downloader::with_platform_and_storage_and_settings(
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels,
+                objects: store.clone(),
+                assets: store,
+                clock: Arc::new(SystemClock),
+            },
+            sites,
+            HashMap::new(),
+        )
+        .unwrap()
+        .with_cookie_store(cookies);
+
+        // モックは保存 Cookie でもゲートしか返せないので、壁として失敗するのは
+        // 従来どおり。ポイントは認証リトライがどの URL へ届くか。
+        let result = downloader.download_novel(toc_url).await;
+        assert!(result.is_err());
+        // 旧実装はゲート URL を toc_url に採用し、以後の要求がすべて
+        // `/novels/adult_check` になった。修正後は作品 URL へ認証リトライが届く。
+        let sent = http.sent_requests();
+        let urls: Vec<&str> = sent.iter().map(|(url, _)| url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![toc_url, gate_url, toc_url, gate_url, toc_url, gate_url],
+            "cookie リトライは作品の toc_url へ届く必要がある"
+        );
+        // 保存した年齢承認 Cookie が作品 URL のリクエストに乗っていること。
+        // 3 番目の要求 (index 2) は壁検出前の匿名フェッチ、5 番目 (index 4)
+        // が保存済みログインを送るリトライ。
+        let (_, retry_headers) = &sent[4];
+        assert!(
+            retry_headers.iter().any(|(name, value)|
+                name.eq_ignore_ascii_case("cookie")
+                    && value.contains("akatsuki_adult_allowed=on")),
+            "retry to the work URL must carry the stored adult cookie: {retry_headers:?}"
+        );
     }
 
     #[test]
@@ -6928,6 +7014,33 @@ is_narou: false
         assert_eq!(
             subtitles[1].subupdate.as_deref(),
             Some("2021-01-14T16:13:02Z")
+        );
+    }
+
+    #[test]
+    fn akatsuki_yaml_preprocess_keeps_body_paragraph_breaks() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "www.akatsuki-novels.com")
+            .expect("bundled www.akatsuki-novels.com.yaml should load");
+        assert!(setting.preprocess_pipeline().is_some());
+
+        // リニューアル後の本文は <br /> ではなく CSS whitespace-pre-line の
+        // 生改行で段落を表す。旧デザインと同じ <br> へ変換されなければならない。
+        let mut html = "<html><body><div class=\"whitespace-pre-line reading-body text-sm\">　はたから見ればほんの一瞬の事だったんだろう。\n\n　スマートフォンに目を落とし、</div></body></html>".to_string();
+        super::util::pretreatment_source(&mut html, "UTF-8", Some(setting));
+
+        assert!(html.contains("AkatsukiPreprocessMagicWord2026"));
+        assert!(html.contains(
+            "はたから見ればほんの一瞬の事だったんだろう。<br><br>　スマートフォンに目を落とし、"
+        ), "got: {html}");
+
+        let (element, _) = super::section::parse_section_html(setting, html).unwrap();
+        let aozora = super::html::to_aozora(&element.body);
+        assert_eq!(
+            aozora,
+            "　はたから見ればほんの一瞬の事だったんだろう。\n\n　スマートフォンに目を落とし、"
         );
     }
 

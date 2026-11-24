@@ -216,7 +216,7 @@ mod tests {
     fn akatsuki_body_pattern_extracts_reading_body() {
         let settings = SiteSetting::load_all().unwrap();
         let setting = settings.iter().find(|s| s.domain == "www.akatsuki-novels.com").unwrap();
-        let html = r#"
+        let mut html = r#"
 <div class="reading-pane">
   <div class="ad-slot my-6 text-center">広告</div>
   <div class="whitespace-pre-line reading-body mt-6">　本文一行目。
@@ -224,13 +224,15 @@ mod tests {
 　本文二行目。 </div>
   <div class="ad-slot my-6 text-center">広告</div>
 </div>
-"#;
+"#.to_string();
 
-        let (section, _) = parse_section_html(setting, html.to_string()).unwrap();
+        // 実際の取得経路と同じく前処理を先に通す (生改行を <br> に変換する)。
+        crate::downloader::util::pretreatment_source(&mut html, "UTF-8", Some(setting));
+        let (section, _) = parse_section_html(setting, html).unwrap();
 
         assert_eq!(
             section.body,
-            "　本文一行目。\n<ruby><rb>扇皇</rb><rp>（</rp><rt>せんおう</rt><rp>）</rp></ruby> ゼンヒ。\n　本文二行目。 "
+            "　本文一行目。<br><ruby><rb>扇皇</rb><rp>（</rp><rt>せんおう</rt><rp>）</rp></ruby> ゼンヒ。<br>　本文二行目。 "
         );
         assert!(section.introduction.is_empty());
         assert!(section.postscript.is_empty());

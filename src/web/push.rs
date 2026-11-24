@@ -753,8 +753,7 @@ mod tests {
 
     #[test]
     fn ws_request_requires_basic_auth_and_valid_origin() {
-        let queue_dir = std::env::current_dir()
-            .unwrap()
+        let queue_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test-artifacts")
             .join(format!("push-auth-{}", std::process::id()));
@@ -824,8 +823,7 @@ mod tests {
 
     #[test]
     fn ws_request_accepts_same_origin_proxy_mode() {
-        let queue_dir = std::env::current_dir()
-            .unwrap()
+        let queue_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test-artifacts")
             .join(format!("push-proxy-{}", std::process::id()));
@@ -954,8 +952,7 @@ mod tests {
 
     #[test]
     fn ws_request_accepts_same_origin_ws_port() {
-        let queue_dir = std::env::current_dir()
-            .unwrap()
+        let queue_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test-artifacts")
             .join(format!("push-ws-origin-{}", std::process::id()));

@@ -192,6 +192,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Pixiv の小説・漫画シリーズは、目次の `isMasked` / `viewableType`、明示的な閲覧制限応答、作品単位の 404 を YAML / DSL で判定し、保存ログインでも読めない話を除いて閲覧可能分を取得する。漫画の `page.total` とシリーズ総数の差も部分一覧とし、中間の話だけが落ちる場合もログインを試す。小説のページ送りは可視サムネイル数ではなく `seriesContents` の話順を使い、隠れた 30 話目の後にある 31 話目も辿る。HTTP 403 はマイピク・非公開とは決めつけず取得エラーとして扱い、公開うごイラの `original: null` だけでも除外しない。
 - アルファポリス (`webnovel/www.alphapolis.co.jp.yaml`, version 1.4) は小説トップ・各話 URL を作品トップへ正規化し、埋め込み JSON の配列順で無料公開・レンタル済みの話を取得する。未レンタル話は部分一覧として検出し、保存 Cookie で閲覧可能な話が増えれば採用、制限が残れば取得範囲を警告する。章名は最初に閲覧できる話へ付け、全話が閲覧不可の章は出力しない。題名、作者、あらすじ、タグ、更新日時、文字数、完結状態を抽出し、本文はセッション Cookie と CSRF 付きフォーム POST で取得する。R18 は `over18` の同意に従い、電子書籍特典や CAPTCHA は本文として保存しない。サイト固有の処理はすべて YAML / DSL に置く
 - カクヨムネクスト (`webnovel/kakuyomu.jp.yaml`, version 2.6) は目次の `EmptyEpisode` を `login_partial_pattern` で検出し、保存済みログインを順に試す。制限が残れば取得範囲を警告して無料分だけを取得し、後から閲覧権のある Cookie を保存して更新すると残りも取得できる。採用したセッションは本文取得と次回更新でも使い、通常の公開作品には Cookie を送らない。本文 URL が作品トップ等へ戻され、本文枠が無い場合も DSL で失敗させ、空本文をキャッシュ・保存しない。サイト固有の判定は YAML / DSL に置く
+- 暁 (`webnovel/www.akatsuki-novels.com.yaml`, version 2.7) はリニューアル後の新基盤に対応する。目次は大見出し (`font-bold`) と小見出し (`font-medium`) を別キャプチャで取り、「全N話・完結」行から `nt`/`ga` を取る。`/stories/index`・`/novels/view/N` の両 URL を受理する。本文は CSS の `whitespace-pre-line` で生改行が段落を表すため、`preprocess:` DSL で `<br>` へ変換してから拾う (生改行のまま拾うと段落が 1 行に潰れる)。作者追跡は `/users/aknXXXX` の「投稿作品」リンク (`font-semibold` クラスで区別) だけを拾い、お気に入り作品を取り込まない。R-18 作品は全ページが `/novels/adult_check` へリダイレクトする年齢ゲートで、保存ログイン (`akatsuki_adult_allowed`) を作品 URL へ送って抜ける。旧 `CakeCookie[ALLOWED_ADULT_NOVEL]` は新基盤で無効なため定義から外した
 - 部分一覧に保存済みの話が欠ける場合は、既定では話の削除やダイジェスト化とは判定せず `Canceled` で更新を見送り、目次・本文を保持する（force 時も同じ）。サイト定義の `preserve_missing_sections: true`（Pixiv・カクヨムで有効）は、話番号と URL の同一性を確認できる保存済み本文を保持しながら、閲覧できる話を更新・追加する。対応が曖昧な場合は従来どおり見送る。閲覧できる話が 0 件なら部分一覧の目印の有無によらず保存ログインを試し、それでも 0 件なら登録・本文更新・自動変換をせず、既存データと未使用 ID を保持する。
 - サイト定義の `min_interval:` でサイトごとの最低リクエスト間隔 (秒) の下限を宣言でき、該当サイトのレートリミットスコープにだけ適用される
 - HTTP の待機は Native / Worker とも、本文の受信完了または通信失敗から次の取得開始まで確保する。`download.interval`・`min_interval`・`download.wait-steps` の長待機に通信時間を含めず、リダイレクト・通信手段の切替にも適用する。Worker は完了時刻を Durable Object に保存し、ジョブ再開・別作品の取得でも待機状態を引き継ぐ。作品間の `update.interval` は従来の開始基準を維持する。
@@ -358,7 +359,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | `add <URL>` | 作者ページを登録。`author_url` に一致するサイト定義が必要 |
 | `list` | 登録済みの作者（サイト / ページ URL） |
 | `remove <URL\|番号>` | `list` の 1 始まりの番号か URL で追跡解除。0 は拒否し、取得済み作品は削除しない |
-| `check [--dry-run]` | 全作者を確認して未管理の作品を取得する。`--dry-run` は追加予定の URL だけを表示し、取得しない |
+| `check [--dry-run]` | 全作者を確認して未管理の作品を取得する。`--dry-run` は追加予定の URL だけを表示し、取得しない。一覧取得に失敗した作者がいる場合は件数を表示して終了コード 1。暁の作者ページは `/users/<id>?page=N` のページ送りを `author_next_pattern` で辿る (相対「次へ」リンクはサイトのルートへ解決する) |
 
 **保存形式**: 小説とは別の inventory `author`（Native は SQLite `app_state` / `.narou/author.yaml`、Workers は D1 の `app_state(scope='inv', key='author')`）に、**作者ページ URL（ユニーク）→ サイト名** だけを持つ。名前や日時などの帳簿は持たない。登録・解除は Native の Inventory 原子更新、Workers の全スナップショット CAS で保存し、別の登録操作を上書きしない。
 

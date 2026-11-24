@@ -5,17 +5,22 @@ domain: www.akatsuki-novels.com
 top_url: https://\\k<domain>
 # リニューアル後の正規 URL は /stories/index?novel_id=N のクエリ形式だが、
 # 旧パス形式も引き続き有効 (サイト内のパンくずリンクも旧形式)。両方受け付ける。
+# 作品ページ (/novels/view/N) もユーザーが目にする URL なので受け付ける。
+# ncode さえ取得できれば toc_url テンプレートから目次ページが組み立てられる。
 url:
   - https?://\\k<domain>/stories/index/novel_id\~(?<ncode>\d+)
   - https?://\\k<domain>/stories/index\?novel_id=(?<ncode>\d+)
+  - https?://\\k<domain>/novels/view/(?<ncode>\d+)
 encoding: UTF-8
 timezone: Asia/Tokyo
 confirm_over18: no
 append_title_to_folder_name: yes
 title_strip_pattern: null
-cookie: CakeCookie[ALLOWED_ADULT_NOVEL]=on
+# 旧 CakePHP 基盤の CakeCookie[ALLOWED_ADULT_NOVEL] は新基盤で効かず送る意味が
+# ないため削除した (実際のゲート Cookie は login_cookie 側の akatsuki_adult_allowed)。
+cookie_session: true
 sitename: *name
-version: 2.1
+version: 3.0
 
 # ------------------------------------------------------------
 # 書籍情報取得設定 (目次ページから取得)
@@ -23,17 +28,50 @@ title: <h1 class="min-w-0 text-xl font-bold">(?<title>.+?)</h1>
 author: <p class="mt-1 text-sm text-muted">\s*<a href="/users/[^"]+"[^>]*>\s*(?<author>.+?)\s*</a>
 story: <p class="mt-3 whitespace-pre-line text-sm text-neutral-700 dark:text-neutral-300">(?<story>.+?)</p>
 
+# novel_type / 話数 (目次ページの「全N話 ・完結」行)
+# 完結作品だけ「・完結」が出る。nt はその文字だけを取る。
+nt: 全\d+話\s*・(?<novel_type>完結)\s*・
+novel_type_string:
+  完結: 3
+ga: 全(?<general_all_no>\d+)話
+
+# ------------------------------------------------------------
+# 作者追跡 (narou author)
+# /users/aknXXXX のプロフィールを読む。「投稿作品」セクションだけを
+# 走査し、プロフィール・お気に入り作品のリンクは拾わない。
+author_url: ^https?://\\k<domain>/users/(?<author_id>[a-z0-9]+)/?(?:[?#].*)?$
+# 投稿作品のリンクは class に font-semibold を持ち、お気に入り作品・プロフィール
+# のリンクは持たない。クラスで投稿作品だけを拾う (「お気に入りの作品」内の
+# /novels/view/N リンクを取り込まないため)。
+author_novel_pattern: <a href="(?<work_path>/novels/view/\d+)"[^>]*font-semibold
+author_work_url: \\k<top_url>\\k<work_path>
+# 作品一覧は /users/<id>?page=N でページ分けされる。ページャの「次へ」リンクは
+# <a href="..." rel="next"> の形 (href はサイトルート相対)。author_next_url が
+# 相対 href をサイトのルートへ解決する。
+author_next_pattern: <a\b[^>]*href="(?<author_next>(?:https?://www\.akatsuki-novels\.com)?/?users/[^"]+\?page=\d+)"[^>]*rel="next"
+# 「投稿作品」の横に全作品数が出る (例: 8,597作品)。読み切りが宣言件数に
+# 足りないときは一覧が欠けているとしてエラーにする (件数一致で静かな
+# 取りこぼしを検出する)。
+author_page_total_pattern: <p class="mt-1 text-sm text-muted">\s*(?<count>[\d,]+)\s*作品
+
 # ------------------------------------------------------------
 # 目次取得設定
 # 旧 toc_url (パス形式) を維持する。レコードの toc_url は更新時に引き直さないため、
 # 既存ライブラリとの重複登録を避けるためでもある。
 toc_url: \\k<top_url>/stories/index/novel_id~\\k<ncode>
+# 章ヘッダは 2 段ある: font-bold が大見出し (chapter)、font-medium が小見出し
+# (subchapter)。両方が連続し得るので別キャプチャで取り、キャプチャ本体は
+# </li> を跨がない走査で書く (旧 (?<chapter>.+?)</li> は小見出しまで飲み込み、
+# 生の </li><li ...> を章タイトルへ混入させていた)。
 subtitles: |-
-  (?:<li class="[^"]*font-bold[^"]*">(?<chapter>.+?)</li>\s*)?<li class="[^"]*items-baseline[^"]*justify-between[^"]*">(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?<a\b[^>]*href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)"[^>]*>\s*(?<subtitle>(?:[^<]|<(?:[^/]|/[^a]|/a[^>]))*?)\s*</a>(?:(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?(?<subupdate>\d{4}年\d{1,2}月\d{1,2}日))?(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?</li>
+  (?:<li class="[^"]*font-bold[^"]*">(?<chapter>(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?)</li>\s*)?(?:<li class="[^"]*font-medium[^"]*">(?<subchapter>(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?)</li>\s*)?<li class="[^"]*items-baseline[^"]*justify-between[^"]*">(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?<a\b[^>]*href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)"[^>]*>\s*(?<subtitle>(?:[^<]|<(?:[^/]|/[^a]|/a[^>]))*?)\s*</a>(?:(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?(?<subupdate>\d{4}年\d{1,2}月\d{1,2}日))?(?:[^<]|<(?:[^/]|/[^l]|/l[^i]|/li[^>]))*?</li>
 # ページ送りは /stories/index?novel_id=N&page=M (HTML 内では &amp;)。
 next_toc: <a\b[^>]*href="/stories/index\?(?:[^"]*&(?:amp;)?)?novel_id=(?<ncode>\d+)(?:&amp;|&)page=(?<next_page>\d+)[^"]*"[^>]*rel="next"
 next_url: \\k<top_url>/stories/index?novel_id=\\k<ncode>&page=\\k<next_page>
-toc_page_max: /\s*(?<toc_page_max>\d+)\s*ページ
+# 総ページ数は「1 / 5 ページ」の形で出る。スラッシュは任意にする (_site が
+# 「5 ページ」だけの表示に変わっても、ページ数が取れずに 1 ページ目で
+# 止まってしまわないようにするため)。
+toc_page_max: \s*(?:/\s*)?(?<toc_page_max>\d+)\s*ページ
 
 # subdate(初投稿日)がない場合、一番最初のsubupdateで代用する
 subdate: no
@@ -41,10 +79,41 @@ subdate: no
 error_message: この作品は作者の諸事情により非公開にしています
 
 # ------------------------------------------------------------
+# 前処理
+# リニューアル後の本文は CSS の whitespace-pre-line で生改行を段落として表示する。
+# 一方 to_aozora は HTML の意味上無視される生改行を落とすため、ここで <br> に
+# 変換してから拾う (旧デザインの <br /> と同じ扱い)。変換後のテキストは
+# novelup.plus と同じく前処理マーカー経由で body_pattern が読む。
+preprocess: |-
+  guard "AkatsukiPreprocessMagicWord2026"
+
+  let body = extract(/<div class="whitespace-pre-line reading-body[^"]*">(.+?)<\/div>/s)
+  if body
+    emit "AkatsukiPreprocessMagicWord2026"
+    emit "akatsuki_body::"
+    emit body.gsub(/\n/, "<br>")
+    emit "::akatsuki_body_end"
+    insert_at_match
+  end
+
+# ------------------------------------------------------------
+# 年齢認証・ログイン設定
+# R-18 作品はセッション Cookie `akatsuki_adult_allowed` (Max-Age 7 日) を要求する。
+# 旧 CakePHP 時代の `CakeCookie[ALLOWED_ADULT_NOVEL]` は新基盤では効かない。
+# ゲートは GET /novels/adult_check で「はい」を押すだけなので、ログイン機構の
+# Cookie 保存で取得できる (narou login / narou_rs_login)。
+login_url: \\k<top_url>/novels/adult_check
+login_pattern: あなたは18歳以上ですか
+login_wall_error: login
+
+# ------------------------------------------------------------
 # 本文取得設定
-# 本文は <div class="whitespace-pre-line reading-body ..."> の内側だけ。
+# 本文は前処理が作ったマーカー block から読む (生改行を <br> に変換済み)。
 # 前書き/後書きは新デザインでは独立した要素を出さない。
-body_pattern: <div class="whitespace-pre-line reading-body[^"]*">(?<body>.+?)</div>
+body_pattern: |-
+  akatsuki_body::
+  (?<body>.+?)
+  ::akatsuki_body_end
 
 introduction_pattern: null
 postscript_pattern: null

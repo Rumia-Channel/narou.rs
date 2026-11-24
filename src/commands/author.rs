@@ -46,7 +46,14 @@ pub async fn cmd_author(action: AuthorAction) -> Result<()> {
         AuthorAction::Check { dry_run } => {
             let report = check_tracked_authors(None, dry_run).await?;
             report.print();
-            Ok(())
+            if report.failed > 0 {
+                Err(NarouError::SiteSetting(format!(
+                    "作者の確認が {} 件失敗しました",
+                    report.failed
+                )))
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -106,12 +113,14 @@ fn remove(target: &str) -> Result<()> {
 pub struct AuthorCheckReport {
     /// Authors that were checked.
     pub checked: usize,
-    /// Works that were not in the library and were downloaded.
+    /// Works that were not in the library: downloaded, or listed by --dry-run.
     pub added: usize,
     /// Works that were already known (skipped).
     pub known: usize,
     /// Authors whose page or definition could not be used.
     pub failed: usize,
+    /// True when the sweep only listed the new works.
+    pub dry_run: bool,
 }
 
 impl AuthorCheckReport {
@@ -119,10 +128,31 @@ impl AuthorCheckReport {
         if self.checked == 0 && self.failed == 0 {
             return;
         }
-        println!(
-            "作者の確認: {} 件を確認、新規 {} 件を追加 (既知 {} 件)",
-            self.checked, self.added, self.known
-        );
+        println!("{}", report_line(self));
+    }
+}
+
+/// The one-line summary of a sweep.
+///
+/// Failures are part of the line: a sweep where every author failed must not
+/// read like an empty success. `--dry-run` counts the works that would be
+/// added, so it says so instead of reusing the "newly added" wording.
+fn report_line(report: &AuthorCheckReport) -> String {
+    let failed = if report.failed > 0 {
+        format!("、失敗 {} 件", report.failed)
+    } else {
+        String::new()
+    };
+    if report.dry_run {
+        format!(
+            "作者の確認: {} 件を確認、追加予定 {} 件、既知 {} 件{}",
+            report.checked, report.added, report.known, failed
+        )
+    } else {
+        format!(
+            "作者の確認: {} 件を確認、新規 {} 件を追加、既知 {} 件{}",
+            report.checked, report.added, report.known, failed
+        )
     }
 }
 
@@ -141,7 +171,7 @@ pub async fn check_tracked_authors(
     narou_rs::db::init_database()
         .map_err(|error| NarouError::Database(format!("Error initializing database: {error}")))?;
     let authors = author::authors_for_current_root()?;
-    let mut report = AuthorCheckReport::default();
+    let mut report = AuthorCheckReport { dry_run, ..Default::default() };
     if authors.is_empty() {
         return Ok(report);
     }
@@ -231,6 +261,33 @@ mod tests {
     }
 
     #[test]
+    fn the_author_check_report_shows_failures_and_separates_the_counts() {
+        // 取得に失敗した作者を隠さない: 失敗件数が無ければ「失敗」語を出さない。
+        let report = AuthorCheckReport {
+            checked: 1,
+            added: 2,
+            known: 3,
+            failed: 4,
+            dry_run: true,
+        };
+        let line = report_line(&report);
+        assert!(line.contains("追加予定 2 件"), "{line}");
+        assert!(line.contains("既知 3 件"), "{line}");
+        assert!(line.contains("失敗 4 件"), "{line}");
+
+        let report = AuthorCheckReport {
+            checked: 1,
+            added: 2,
+            known: 3,
+            failed: 0,
+            dry_run: false,
+        };
+        let line = report_line(&report);
+        assert!(line.contains("新規 2 件"), "{line}");
+        assert!(!line.contains("失敗"), "{line}");
+    }
+
+    #[test]
     fn the_kakuyomu_definition_reads_the_authors_own_works_page() {
         let settings = SiteSetting::load_all().expect("site definitions");
         let setting = settings
@@ -310,10 +367,40 @@ mod tests {
         // 作者ページを持たない定義は何も返さない。
         let setting = settings
             .iter()
+            .find(|setting| setting.domain == "www.mai-net.net")
+            .expect("Arcadia 定義");
+        assert_eq!(setting.author_novel_urls("<a href=x>"), None);
+        assert!(!setting.matches_author_url("https://www.mai-net.net/bbs/users/1"));
+    }
+
+    #[test]
+    fn akatsuki_author_pages_list_only_posted_works() {
+        let settings = SiteSetting::load_all().expect("site definitions");
+        let setting = settings
+            .iter()
             .find(|setting| setting.domain == "www.akatsuki-novels.com")
             .expect("暁 定義");
-        assert_eq!(setting.author_novel_urls("<a href=x>"), None);
-        assert!(!setting.matches_author_url("https://www.akatsuki-novels.com/users/1"));
+        let page = "https://www.akatsuki-novels.com/users/akn5wbttw";
+        assert!(setting.matches_author_url(page));
+        // お気に入りサブページや他サイトのユーザー URL は作者 URL と見なさない。
+        assert!(!setting.matches_author_url("https://www.akatsuki-novels.com/users/akn5wbttw/favorite_novels"));
+        assert!(!setting.matches_author_url("https://www.akatsuki-novels.com/novels/view/15787"));
+
+        // 実ページの構造: 投稿作品リンクは font-semibold、お気に入り作品は通常クラス。
+        let source = concat!(
+            "<h2 id=\"novels-heading\">投稿作品</h2>",
+            "<a href=\"/novels/view/15787\" class=\"min-w-0 text-base font-semibold hover:text-brand-600\">相良絵梨</a>",
+            "<a href=\"/novels/view/23719\"\n class=\"min-w-0 text-base font-semibold\">他作品</a>",
+            "<h2 id=\"fav-novels-heading\">お気に入りの作品</h2>",
+            "<a href=\"/novels/view/10044\" class=\"hover:text-brand-600\">お気に入り</a>",
+        );
+        assert_eq!(
+            setting.author_novel_urls(source),
+            Some(vec![
+                "https://www.akatsuki-novels.com/novels/view/15787".to_string(),
+                "https://www.akatsuki-novels.com/novels/view/23719".to_string(),
+            ])
+        );
     }
 
     #[test]
