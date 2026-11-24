@@ -2,10 +2,27 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+fn object_io_detail(source: &std::io::Error) -> std::io::Error {
+    // Some filesystem helpers embed absolute paths in their error text.
+    // Show only the OS error or kind; retain the original as the source.
+    match source.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::from(source.kind()),
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum NarouError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("IO error: {operation} for object {key:?}: {}", object_io_detail(.source))]
+    ObjectIo {
+        operation: &'static str,
+        key: String,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("YAML error: {0}")]
     Yaml(#[from] serde_yaml::Error),

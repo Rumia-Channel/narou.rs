@@ -271,10 +271,7 @@ impl NativeObjectStore {
                 MAX_SMALL_OBJECT_BYTES
             )));
         }
-        let path = self.resolve_path(key)?;
-        self.ensure_parent_dir(&path)?;
-        self.forget_file_proof(key)?;
-        atomic_write_bytes(&path, &data)
+        self.write_bytes_blocking(key, &data)
     }
 
     pub(crate) fn update_small_blocking<'data>(
@@ -325,9 +322,11 @@ impl NativeObjectStore {
     /// (EPUB, large sections) may exceed `MAX_SMALL_OBJECT_BYTES`.
     pub(crate) fn write_bytes_blocking(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
         let path = self.resolve_path(key)?;
-        self.ensure_parent_dir(&path)?;
-        self.forget_file_proof(key)?;
-        atomic_write_bytes(&path, data)
+        self.ensure_parent_dir(&path)
+            .map_err(|error| object_io_context(key, "create parent directory", error))?;
+        self.forget_file_proof(key)
+            .map_err(|error| object_io_context(key, "remove file proof", error))?;
+        atomic_write_bytes_with(&path, data, |operation, source| object_io_error(key, operation, source))
     }
 
     pub(crate) fn list_direct_files(&self, prefix: &ObjectKey) -> Result<Vec<ObjectKey>> {
@@ -549,23 +548,47 @@ pub(crate) fn run_scoped_blocking<T>(operation: impl FnOnce() -> Result<T>) -> R
 
 pub(crate) const ATOMIC_OBJECT_TEMP_PREFIX: &str = ".narou-object-";
 
+fn object_io_error(key: &ObjectKey, operation: &'static str, source: std::io::Error) -> NarouError {
+    NarouError::ObjectIo {
+        operation,
+        key: key.as_ref().to_owned(),
+        source,
+    }
+}
+
+fn object_io_context(key: &ObjectKey, operation: &'static str, error: NarouError) -> NarouError {
+    match error {
+        NarouError::Io(source) => object_io_error(key, operation, source),
+        error => error,
+    }
+}
+
 pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
+    atomic_write_bytes_with(path, data, |_, source| NarouError::Io(source))
+}
+
+fn atomic_write_bytes_with(
+    path: &Path,
+    data: &[u8],
+    io_error: impl Fn(&'static str, std::io::Error) -> NarouError,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
     let mut temporary = tempfile::Builder::new()
         .prefix(ATOMIC_OBJECT_TEMP_PREFIX)
-        .tempfile_in(parent)?;
+        .tempfile_in(parent)
+        .map_err(|error| io_error("create temporary file", error))?;
     // NamedTempFile creates exclusively; existing links are never opened.
     for chunk in data.chunks(1024 * 1024) {
-        temporary.write_all(chunk)?;
+        temporary.write_all(chunk).map_err(|error| io_error("write temporary file", error))?;
     }
-    temporary.as_file().sync_all()?;
+    temporary.as_file().sync_all().map_err(|error| io_error("sync temporary file", error))?;
     // std::fs::rename replaces an existing destination atomically on every
     // supported platform (rename(2) on Unix, MoveFileExW with
     // MOVEFILE_REPLACE_EXISTING on Windows). A preceding exists+remove would
     // only open a window where the destination is missing.
-    temporary.persist(path).map_err(|error| NarouError::Io(error.error))?;
+    temporary.persist(path).map_err(|error| io_error("replace destination", error.error))?;
     Ok(())
 }
 
@@ -2586,6 +2609,47 @@ impl NovelAccessFence for NativeObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_write_reports_replace_failure_without_exposing_root() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let key = ObjectKey::try_new("books/chapter.yaml").unwrap();
+        let target = store.resolve_path(&key).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep"), b"original").unwrap();
+
+        let error = store.write_small_blocking(&key, b"replacement".to_vec()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("replace destination for object \"books/chapter.yaml\""));
+        assert!(!message.contains(&*root.path().file_name().unwrap().to_string_lossy()));
+        assert_eq!(
+            crate::application::jobs::classify_failure(&error),
+            crate::application::jobs::JobFailureClass::Retryable,
+        );
+        let NarouError::ObjectIo { source, .. } = error else { panic!("expected contextual I/O error") };
+        assert!(source.raw_os_error().is_some());
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"original");
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn object_write_redacts_paths_added_by_tempfile() {
+        let root = tempfile::tempdir().unwrap();
+        let key = ObjectKey::try_new("missing/chapter.yaml").unwrap();
+        let target = root.path().join(key.as_ref());
+        let error = atomic_write_bytes_with(&target, b"data", |operation, source| {
+            object_io_error(&key, operation, source)
+        })
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("create temporary file for object \"missing/chapter.yaml\""));
+        assert!(!message.contains(&*root.path().file_name().unwrap().to_string_lossy()));
+        let NarouError::ObjectIo { source, .. } = error else { panic!("expected contextual I/O error") };
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        assert!(source.to_string().contains(" at path "));
+    }
 
     #[test]
     fn transfer_checkpoint_survives_reopen_and_rewinds_unreceipted_tail(){
