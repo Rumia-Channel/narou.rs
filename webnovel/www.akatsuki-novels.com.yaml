@@ -20,7 +20,7 @@ title_strip_pattern: null
 # ないため削除した (実際のゲート Cookie は login_cookie 側の akatsuki_adult_allowed)。
 cookie_session: true
 sitename: *name
-version: 2.7
+version: 2.9
 
 # ------------------------------------------------------------
 # 書籍情報取得設定 (目次ページから取得)
@@ -45,6 +45,10 @@ author_url: ^https?://\\k<domain>/users/(?<author_id>[a-z0-9]+)/?(?:[?#].*)?$
 # /novels/view/N リンクを取り込まないため)。
 author_novel_pattern: <a href="(?<work_path>/novels/view/\d+)"[^>]*font-semibold
 author_work_url: \\k<top_url>\\k<work_path>
+# 作品一覧は /users/<id>?page=N でページ分けされる。ページャの「次へ」リンクは
+# <a href="..." rel="next"> の形 (href はサイトルート相対)。author_next_url が
+# 相対 href をサイトのルートへ解決する。
+author_next_pattern: <a\b[^>]*href="(?<author_next>(?:https?://www\.akatsuki-novels\.com)?/?users/[^"]+\?page=\d+)"[^>]*rel="next"
 
 # ------------------------------------------------------------
 # 目次取得設定
@@ -60,7 +64,10 @@ subtitles: |-
 # ページ送りは /stories/index?novel_id=N&page=M (HTML 内では &amp;)。
 next_toc: <a\b[^>]*href="/stories/index\?(?:[^"]*&(?:amp;)?)?novel_id=(?<ncode>\d+)(?:&amp;|&)page=(?<next_page>\d+)[^"]*"[^>]*rel="next"
 next_url: \\k<top_url>/stories/index?novel_id=\\k<ncode>&page=\\k<next_page>
-toc_page_max: /\s*(?<toc_page_max>\d+)\s*ページ
+# 総ページ数は「1 / 5 ページ」の形で出る。スラッシュは任意にする (_site が
+# 「5 ページ」だけの表示に変わっても、ページ数が取れずに 1 ページ目で
+# 止まってしまわないようにするため)。
+toc_page_max: \s*(?:/\s*)?(?<toc_page_max>\d+)\s*ページ
 
 # subdate(初投稿日)がない場合、一番最初のsubupdateで代用する
 subdate: no

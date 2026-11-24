@@ -880,6 +880,81 @@ mod tests {
     }
 
     #[test]
+    fn akatsuki_page_count_without_a_slash_still_fetches_every_page() {
+        // ページ数が取れなければ 1 ページ目で止まる (目次が途中で切れる)。
+        // 「1 / 3 ページ」だけでなく「3 ページ」だけの表示でも全ページを読む。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "暁").unwrap();
+        let page = |pager: &str, next: &str, id: &str, title: &str| {
+            format!(
+                r#"
+<nav role="navigation" aria-label="ページ送り（上）">
+  <p class="text-subtle tabular-nums sm:hidden">{pager}</p>
+  {next}
+</nav>
+<ol class="mt-3 divide-y divide-border">
+  <li class="flex flex-wrap items-baseline justify-between gap-2 py-2">
+    <span class="flex min-w-0 items-baseline gap-2">
+      <a href="/stories/view/{id}/novel_id~27990"
+         class="min-w-0 hover:text-brand-600 dark:hover:text-brand-300">{title}</a>
+    </span>
+  </li>
+</ol>
+"#
+            )
+        };
+        let first_page = page(
+            "3 ページ",
+            r#"<a href="/stories/index?novel_id=27990&amp;page=2" rel="next"
+   class="tap">次へ</a>"#,
+            "280978",
+            "第一話",
+        );
+        let second_page = page(
+            "3 ページ",
+            r#"<a href="/stories/index?novel_id=27990&amp;page=3" rel="next"
+   class="tap">次へ</a>"#,
+            "281288",
+            "第三話",
+        );
+        let third_page = page("3 ページ", "", "281445", "第四話");
+        let http = MockHttpClient::new();
+        let rate_limiter = FakeRateLimiter::new();
+        let fetched = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+
+        let subtitles = futures::executor::block_on(parse_subtitles_multipage_with(
+            MultipageTocRequest {
+                http: &http,
+                rate_limiter: &rate_limiter,
+                setting,
+                toc_source: &first_page,
+                url_captures: &HashMap::new(),
+                title: "",
+                progress: None,
+                jobs: &mut PreprocessJobs::new(),
+            },
+            {
+                let fetched = std::sync::Arc::clone(&fetched);
+                move |_, _, _, _next_url, _| {
+                    let mut count = fetched.lock().unwrap();
+                    *count += 1;
+                    let body = if *count == 1 {
+                        second_page.clone()
+                    } else {
+                        third_page.clone()
+                    };
+                    Box::pin(async move { Ok(body) })
+                }
+            },
+        ))
+        .unwrap()
+        .subtitles;
+
+        assert_eq!(*fetched.lock().unwrap(), 2, "2 ページ目以降も取得する");
+        assert_eq!(subtitles.len(), 3);
+    }
+
+    #[test]
     fn parse_subtitles_strips_ruby_from_subtitle_and_file_subtitle() {
         let settings = SiteSetting::load_all().unwrap();
         let setting = settings

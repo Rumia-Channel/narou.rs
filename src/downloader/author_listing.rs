@@ -2143,4 +2143,50 @@ toc_url: https://token.example/story/\k<ncode>
         assert_eq!(store.sessions(), [Some("acct-1".to_string()), Some("acct-2".to_string())]);
         assert!(http.cookies_for(page).last().unwrap().as_deref().unwrap().contains("sid=secondary"));
     }
+
+    #[test]
+    fn akatsuki_author_listing_follows_relative_next_links() {
+        // 暁の作者ページは /users/<id>?page=N で分けられる。「次へ」リンクは
+        // `<a href="/users/<id>?page=N" rel="next">` で、href はサイトルート
+        // 相対 (実ページ観測)。author_next_pattern が無かった頃は 1 ページ目の
+        // 20 件だけで終端と判定し、残りを黙って落としていた。
+        let setting = load("www.akatsuki-novels.com");
+        let page = "https://www.akatsuki-novels.com/users/aknf43btk";
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            page,
+            200,
+            concat!(
+                r#"<h2 id="novels-heading">投稿作品</h2>"#,
+                r#"<a href="/novels/view/2795" class="min-w-0 text-base font-semibold">作品1</a>"#,
+                r#"<a href="/users/aknf43btk?page=2" rel="next">次へ</a>"#,
+            ),
+        );
+        http.add_text(
+            "https://www.akatsuki-novels.com/users/aknf43btk?page=2",
+            200,
+            concat!(
+                r#"<a href="/novels/view/23837" class="min-w-0 text-base font-semibold">作品2</a>"#,
+                r#"<a href="/users/aknf43btk?page=1" rel="prev">前へ</a>"#,
+                r#"<a href="/users/aknf43btk?page=3" rel="next">次へ</a>"#,
+            ),
+        );
+        http.add_text(
+            "https://www.akatsuki-novels.com/users/aknf43btk?page=3",
+            200,
+            r#"<a href="/novels/view/32207" class="min-w-0 text-base font-semibold">作品3</a>"#,
+        );
+
+        let urls = works(&http, &FakeRateLimiter::new(), &setting, page).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://www.akatsuki-novels.com/novels/view/2795".to_string(),
+                "https://www.akatsuki-novels.com/novels/view/23837".to_string(),
+                "https://www.akatsuki-novels.com/novels/view/32207".to_string(),
+            ],
+            "相対 rel=next を絶対 URL へ解決して終端まで辿る"
+        );
+    }
 }

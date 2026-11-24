@@ -991,6 +991,23 @@ impl SiteSetting {
             .name("author_next")
             .map(|matched| crate::downloader::util::decode_html_text(matched.as_str()))
             .filter(|url| !url.is_empty())
+            .map(|url| self.resolve_author_page_url(&url))
+    }
+
+    /// Pager captures are page hrefs and may be site-relative (`/users/x?page=2`,
+    /// `//host/...`). The listing fetcher needs an absolute URL; resolve the
+    /// same way `build_section_url` does for TOC links. Bare relative paths join
+    /// `top_url` (site-root-relative, like the site's own links are written).
+    fn resolve_author_page_url(&self, url: &str) -> String {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            url.to_string()
+        } else if let Some(host_and_path) = url.strip_prefix("//") {
+            format!("{}://{}", self.top_url().split("://").next().unwrap_or("https"), host_and_path)
+        } else if let Some(path) = url.strip_prefix('/') {
+            format!("{}/{}", self.top_url().trim_end_matches('/'), path)
+        } else {
+            format!("{}/{}", self.top_url().trim_end_matches('/'), url)
+        }
     }
 
     /// Fetch URL of one continued page of an offset-paged author listing.
@@ -1009,10 +1026,15 @@ impl SiteSetting {
     }
 
     /// Total number of works the listing says it has (`count` capture).
+    ///
+    /// Sites group thousands with commas (`8,597作品`), so the captured digits
+    /// are read with the separators removed; a count that still does not parse
+    /// means "unknown", not zero.
     pub fn author_page_total(&self, source: &str) -> Option<usize> {
         let pattern = self.compiled_author_page_total.as_ref()?;
         let captures = pattern.captures(source)?;
-        captures.name("count")?.as_str().parse().ok()
+        let count = captures.name("count")?.as_str();
+        count.replace(',', "").parse().ok()
     }
 
     /// Captures of `author_url` for a concrete author page.
