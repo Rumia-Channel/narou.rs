@@ -606,10 +606,23 @@ pub(crate) fn write_gate_file(archive_root: &Path, path: &Path, bytes: &[u8]) ->
 pub(crate) fn write_gate_file_with(archive_root: &Path, path: &Path, bytes: &[u8], before: Option<GateScanProjection>) -> Result<()> {
     let previous = match before { Some(before) => Some(before), None => scan_relevant_file(path)? };
     let changed = previous != Some(scan_relevant_bytes(bytes)?);
-    let revision = if changed { Some(begin_gate_revision_write(archive_root)?) } else { None };
-    atomic_write_bytes(path, bytes)?;
+    // Stage the content OUTSIDE the revision-lock critical section: the temp
+    // write and its fsync need no interlock with other gate mutations.
+    let parent = path.parent().ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
+    let mut temporary = tempfile::Builder::new().prefix(ATOMIC_OBJECT_TEMP_PREFIX).tempfile_in(parent)?;
+    for chunk in bytes.chunks(1024 * 1024) { temporary.write_all(chunk)?; }
+    temporary.as_file().sync_all()?;
+    if changed {
+        // Critical section: counter transition + rename + counter seal. Only
+        // lock acquisitions and memory-speed writes are inside, so parallel
+        // mutations contend for milliseconds, not for an fsync chain.
+        let revision = begin_gate_revision_write(archive_root)?;
+        temporary.persist(path).map_err(|error| NarouError::Io(error.error))?;
+        revision.finish()?;
+    } else {
+        temporary.persist(path).map_err(|error| NarouError::Io(error.error))?;
+    }
     sync_transfer_parent(path)?;
-    if let Some(revision) = revision { revision.finish()?; }
     Ok(())
 }
 
@@ -635,10 +648,18 @@ pub(crate) fn read_gate_revision(archive_root: &Path) -> Result<u64> {
     }
 }
 fn write_gate_revision(archive_root: &Path, value: u64) -> Result<()> {
+    // Visibility-only write: no fsync chain. The seqlock feeds the
+    // process-local scan cache, and both readers and writers agree through
+    // the OS page cache on one machine; durability across a power loss is
+    // irrelevant because the cache dies with the machine anyway. Every
+    // persisted counter state is consistent with the gate state observed at
+    // the next boot, so skipping fsyncs cannot serve a stale scan.
     let path = gate_revision_path(archive_root);
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
-    atomic_write_bytes(&path, value.to_string().as_bytes())?;
-    sync_transfer_parent(&path)?;
+    if let Some(directory) = path.parent() { fs::create_dir_all(directory)?; }
+    let parent = path.parent().ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
+    let mut temporary = tempfile::Builder::new().prefix(ATOMIC_OBJECT_TEMP_PREFIX).tempfile_in(parent)?;
+    temporary.write_all(value.to_string().as_bytes())?;
+    temporary.persist(&path).map_err(|error| NarouError::Io(error.error))?;
     Ok(())
 }
 
