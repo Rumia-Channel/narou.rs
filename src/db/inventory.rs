@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
@@ -12,6 +13,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::NovelRecord;
 use crate::error::{NarouError, Result};
 
 const CACHE_MAX_SIZE: usize = 200;
@@ -39,9 +41,19 @@ struct CacheKey {
     scope: InventoryScope,
 }
 
+// Unlike the inventory mtime cache, authoritative database callers also
+// accept direct writes from narou.rb and other processes. Compare file bytes
+// even when the mtime (and length) are unchanged.
+#[derive(Default)]
+struct NovelRecordSnapshot {
+    source: String,
+    records: Arc<BTreeMap<i64, NovelRecord>>,
+}
+
 pub struct Inventory {
     root_dir: PathBuf,
     cache: Mutex<InventoryCache>,
+    novel_records: Mutex<NovelRecordSnapshot>,
     /// SQLite-backed management state (P2). `Some` only when the instance's
     /// root owns the process-wide `.narou/db.sqlite` and no legacy escape
     /// hatch is active.
@@ -106,6 +118,7 @@ impl Inventory {
         Self {
             root_dir,
             cache: Mutex::new(InventoryCache::new()),
+            novel_records: Mutex::default(),
             #[cfg(feature = "native-runtime")]
             state,
         }
@@ -122,6 +135,24 @@ impl Inventory {
             InventoryScope::Global => global_setting_dir(&self.root_dir),
         };
         dir.join(format!("{}.yaml", name))
+    }
+
+    pub(crate) fn read_novel_records(&self) -> Result<Arc<BTreeMap<i64, NovelRecord>>> {
+        let path = self.inventory_path("database", InventoryScope::Local);
+        self.parse_novel_records(Cow::Owned(read_optional_yaml_file(&path)?))
+    }
+
+    pub(crate) fn parse_novel_records(&self, raw: Cow<'_, str>) -> Result<Arc<BTreeMap<i64, NovelRecord>>> {
+        let mut snapshot = self.novel_records.lock();
+        if snapshot.source != raw {
+            let mut records: BTreeMap<i64, NovelRecord> =
+                if raw.trim().is_empty() { BTreeMap::new() } else { serde_yaml::from_str(&raw)? };
+            for (&id, record) in &mut records {
+                record.id = id;
+            }
+            *snapshot = NovelRecordSnapshot { source: raw.into_owned(), records: Arc::new(records) };
+        }
+        Ok(Arc::clone(&snapshot.records))
     }
 
     fn cache_key(name: &str, scope: InventoryScope) -> CacheKey {

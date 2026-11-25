@@ -309,3 +309,54 @@ fn explicit_update_still_accepts_the_reduced_toc_and_real_errors_remain_errors()
         assert_eq!(saved_files(&novel), files);
     }
 }
+
+#[test]
+fn yaml_bulk_no_change_updates_only_the_unfrozen_novel_check_date() {
+    let proxy = Proxy::with_toc(concat!(
+        "<h1>Digest Novel</h1><h2>Test Author</h2>",
+        "<a href=\"/novel/n1234ab/1/\">第一話</a><time>2026-01-01 00:00:00</time>",
+        "<a href=\"/novel/n1234ab/2/\">第二話</a><time>2026-01-01 00:00:00</time>",
+    ));
+    let (temp, novel) = library(&proxy, false, None);
+    let root = temp.path();
+    std::fs::write(root.join("webnovel/digest.yaml"),
+        SITE.replace("</a>'", "</a><time>(?<subdate>[^<]+)</time>'")).unwrap();
+    let path = root.join(".narou/database.yaml");
+    let load_records = || {
+        serde_yaml::from_slice::<std::collections::BTreeMap<i64, narou_rs::db::NovelRecord>>(
+            &std::fs::read(&path).unwrap(),
+        ).unwrap()
+    };
+    let mut records = load_records();
+    records.get_mut(&1).unwrap().convert_failure = false;
+    let mut frozen = records[&1].clone();
+    frozen.id = 2;
+    frozen.title = "Frozen novel".into();
+    frozen.file_title = "frozen".into();
+    frozen.toc_url = "http://8.8.8.8/novel/n2345ab/".into();
+    frozen.ncode = Some("n2345ab".into());
+    records.insert(2, frozen);
+    std::fs::write(&path, serde_yaml::to_string(&records).unwrap()).unwrap();
+    std::fs::write(root.join(".narou/freeze.yaml"), "2: true\n").unwrap();
+
+    let args = ["update", "--no-convert", "--sort-by", "last_update"];
+    let initial = run(root, &proxy, false, false, &args);
+    assert!(initial.status.success(), "{}", text(&initial));
+    let before = load_records();
+    let files = saved_files(&novel);
+    proxy.requests.lock().unwrap().clear();
+
+    let output = run(root, &proxy, false, true, &args);
+    let log = text(&output);
+    assert!(output.status.success(), "{log}");
+    assert!(log.contains("Digest Novel に更新はありません"), "{log}");
+    assert_eq!(saved_files(&novel), files);
+    let mut after = load_records();
+    let active = after.get_mut(&1).unwrap();
+    assert!(active.last_check_date > before[&1].last_check_date);
+    active.last_check_date = before[&1].last_check_date;
+    assert_eq!(after, before, "an unchanged update must not rewrite novel metadata");
+    let requests = proxy.requests.lock().unwrap();
+    assert!(!requests.is_empty());
+    assert!(requests.iter().all(|request| request.starts_with(&format!("GET {TOC_URL} "))), "{requests:?}");
+}

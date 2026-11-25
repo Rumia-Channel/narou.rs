@@ -42,7 +42,7 @@ impl NativeNovelRepository{
                 let transaction=rusqlite::Transaction::new_unchecked(connection,rusqlite::TransactionBehavior::Immediate).map_err(sqlite_error)?;
                 if claim(&transaction,&reservation)?.as_ref()!=Some(&existing){return Err(NarouError::Platform("creation namespace changed before release".into()));}
                 let committed=crate::db::database::id_reservations::verify_generation(&transaction,&reservation,yaml)?;
-                let current=if yaml{load_current_yaml_records(inventory)?.remove(&reservation.id().0)}else{crate::native::sqlite::SqliteNovelRepository::point_snapshot_conn(&transaction,reservation.id())?};
+                let current=if yaml{inventory.read_novel_records()?.get(&reservation.id().0).cloned()}else{crate::native::sqlite::SqliteNovelRepository::point_snapshot_conn(&transaction,reservation.id())?};
                 if let Some(record)=current{
                     if !committed||!current_matches(&record,&existing)?{return Err(NarouError::Platform("published creation receipt does not match current book".into()));}
                     if state.state!=crate::platform::GateState::Open||state.epoch!=existing.epoch{return Err(crate::platform::access_fence::gate_closed_error(&existing.prefix));}

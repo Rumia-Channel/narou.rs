@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::index_store::IndexStore;
 use super::inventory::{Inventory, InventoryScope};
@@ -20,7 +21,7 @@ pub struct Database {
     data: HashMap<i64, NovelRecord>,
     /// Last acknowledged persisted snapshot; save() publishes only local edits.
     #[cfg(feature = "native-runtime")]
-    persisted: HashMap<i64, NovelRecord>,
+    persisted: Arc<BTreeMap<i64, NovelRecord>>,
     index: IndexStore,
     inventory: Inventory,
     archive_root: PathBuf,
@@ -142,7 +143,7 @@ impl Database {
         let mut db = Self {
             data: HashMap::new(),
             #[cfg(feature = "native-runtime")]
-            persisted: HashMap::new(),
+            persisted: Arc::default(),
             index: IndexStore::load(&inventory)?,
             inventory,
             archive_root,
@@ -279,34 +280,21 @@ impl Database {
             let loaded = crate::native::sqlite::bulk::load_all_records(
                 &conn.lock(),
             )?;
-            self.data = loaded.into_iter().collect();
-            self.persisted = self.data.clone();
+            self.replace_record_snapshot(Arc::new(loaded));
             // 索引 (`by_toc_url` / `by_title`) はリレーショナル側の全件から作り直す。
             // `get_by_toc_url` / `find_by_title` は索引しか見ないため、SQLite モードで
             // 退避済みの `database_index.yaml` を引き継ぐと、既に登録済みの URL を
             // 再度ダウンロードしたときに重複レコードができる。
-            self.index.reconcile(&self.data);
             return Ok(());
         }
-        let raw = self
-            .inventory
-            .load_raw(DATABASE_NAME, InventoryScope::Local)?;
-        if !raw.is_empty() {
-            let loaded: BTreeMap<i64, NovelRecord> = serde_yaml::from_str(&raw)?;
-            self.data = loaded
-                .into_iter()
-                .map(|(id, mut record)| {
-                    record.id = id;
-                    (id, record)
-                })
-                .collect();
-        } else {
-            self.data.clear();
-        }
-        self.persisted = self.data.clone();
-        // SQLite モードは上で return するため、ここは YAML モードのみ。
-        self.index.reconcile(&self.data);
+        self.replace_record_snapshot(self.inventory.read_novel_records()?);
         Ok(())
+    }
+
+    fn replace_record_snapshot(&mut self, records: Arc<BTreeMap<i64, NovelRecord>>) {
+        self.data = records.iter().map(|(&id, record)| (id, record.clone())).collect();
+        self.persisted = records;
+        self.index.reconcile(&self.data);
     }
 
     pub fn save(&mut self) -> Result<()> {
@@ -591,12 +579,10 @@ impl Database {
                     // mutex alone does not exclude separate processes/connections.
                     let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                         .map_err(crate::native::sqlite::sqlite_error)?;
-                    let mut current = crate::native::sqlite::bulk::load_all_records(&tx)?;
-                    if compat && let Some(raw) = files.original(&yaml_path)? {
-                        current = if raw.trim().is_empty() { BTreeMap::new() }
-                            else { serde_yaml::from_str(raw)? };
-                    }
-                    for (&id, record) in &mut current { record.id = id; }
+                    let current = match if compat { files.original(&yaml_path)? } else { None } {
+                        Some(raw) => (*self.inventory.parse_novel_records(raw.into())?).clone(),
+                        None => crate::native::sqlite::bulk::load_all_records(&tx)?,
+                    };
                     *before_library.borrow_mut() = Some(crate::application::tag_sequence::library_tags(
                         current.iter().map(|(id, record)| (*id, record.tags.as_slice())),
                         |tag| !crate::virtual_novel::is_internal_tag(tag),
@@ -725,9 +711,7 @@ impl Database {
                     operation()
                 }
             })?;
-            self.data = updated.into_iter().collect();
-            self.persisted = self.data.clone();
-            self.index.reconcile(&self.data);
+            self.replace_record_snapshot(Arc::new(updated));
             if compat {
                 self.index.flush(&self.inventory)?;
             }
@@ -744,11 +728,7 @@ impl Database {
             let operation = || crate::db::inventory::with_exclusive_file_lock(&yaml_path, || {
                 let (result, record_claims) = LockedFileUpdates::run(&self.inventory, transfer_marker, true, |files| {
                     let raw = files.original(&yaml_path)?.unwrap_or_default();
-                    let mut current: BTreeMap<i64, NovelRecord> =
-                        if raw.is_empty() { BTreeMap::new() } else { serde_yaml::from_str(raw)? };
-                    for (id, record) in current.iter_mut() {
-                        record.id = *id;
-                    }
+                    let current = (*self.inventory.parse_novel_records(raw.into())?).clone();
                     *before_library.borrow_mut() =
                         Some(crate::application::tag_sequence::library_tags(
                             current.iter().map(|(id, record)| (*id, record.tags.as_slice())),
@@ -1273,13 +1253,24 @@ mod tests {
 
         db.insert(sample_record(1, Some(10), &["old"]));
         db.save().unwrap();
-        std::fs::write(
-            narou_dir.join("database.yaml"),
-            std::fs::read_to_string(narou_dir.join("database.yaml"))
-                .unwrap()
-                .replace("- old", "- edited"),
-        )
-        .unwrap();
+        let path = narou_dir.join("database.yaml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let edited = raw.replace("- old", "- new");
+        assert_ne!(raw, edited);
+        assert_eq!(raw.len(), edited.len());
+        std::fs::write(&path, edited).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap()
+            .set_modified(mtime).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        db.refresh().unwrap();
+        assert_eq!(db.get(1).unwrap().tags, vec!["new"]);
+
+        // A later direct write with the same timestamp must also become the
+        // base for the locked mutation, not only for independent readers.
+        std::fs::write(&path, raw.replace("- old", "- ext")).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap()
+            .set_modified(mtime).unwrap();
 
         db.update_records(|mut records| {
             let record = records.get_mut(&1).unwrap();
@@ -1289,7 +1280,7 @@ mod tests {
         .unwrap();
 
         let record = db.get(1).unwrap();
-        assert_eq!(record.tags, vec!["edited"]);
+        assert_eq!(record.tags, vec!["ext"]);
         assert_eq!(record.length, Some(20));
     }
 

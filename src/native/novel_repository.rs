@@ -42,10 +42,6 @@ fn require_record_origin(record:&NovelRecord,fences:&[crate::platform::WriteFenc
     if !fences.iter().any(|fence|keys.prefix().as_ref()==fence.prefix.as_ref().trim_end_matches('/')){return Err(NarouError::Platform("record origin outside captured fence".into()));}Ok(())
 }
 
-fn load_current_yaml_records(inventory:&crate::db::inventory::Inventory)->Result<std::collections::BTreeMap<i64,NovelRecord>>{
-    let path=inventory.inventory_path("database",crate::db::inventory::InventoryScope::Local);let raw=crate::db::inventory::read_optional_yaml_file(&path)?;
-    let mut records:std::collections::BTreeMap<i64,NovelRecord>=if raw.trim().is_empty(){Default::default()}else{serde_yaml::from_str(&raw)?};for(id,record)in &mut records{record.id = *id;}Ok(records)
-}
 #[path="novel_repository_creation.rs"]
 mod creation;
 
@@ -65,9 +61,9 @@ impl NativeNovelRepository {
     pub fn new() -> Self {
         Self
     }
-    pub fn get_current_sync(&self,id:NovelId)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::point_snapshot_conn(connection,id),None=>Ok(load_current_yaml_records(inventory)?.remove(&id.0))}))}
-    pub fn get_many_current_sync(&self,ids:&[NovelId])->Result<Vec<Option<NovelRecord>>>{if ids.is_empty(){return Ok(Vec::new());}crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::many_snapshot_conn(connection,ids),None=>Ok(crate::platform::repository::align_current_records(ids,load_current_yaml_records(inventory)?.into_values()))}))}
-    pub fn query_current_sync(&self,query:&NovelQuery)->Result<Vec<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::query_snapshot_conn(connection,query),None=>Ok(crate::platform::repository::query_records(load_current_yaml_records(inventory)?.values(),query))}))}
+    pub fn get_current_sync(&self,id:NovelId)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::point_snapshot_conn(connection,id),None=>Ok(inventory.read_novel_records()?.get(&id.0).cloned())}))}
+    pub fn get_many_current_sync(&self,ids:&[NovelId])->Result<Vec<Option<NovelRecord>>>{if ids.is_empty(){return Ok(Vec::new());}crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::many_snapshot_conn(connection,ids),None=>{let records=inventory.read_novel_records()?;Ok(ids.iter().map(|id|records.get(&id.0).cloned()).collect())}}))}
+    pub fn query_current_sync(&self,query:&NovelQuery)->Result<Vec<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::query_snapshot_conn(connection,query),None=>Ok(crate::platform::repository::query_records(inventory.read_novel_records()?.values(),query))}))}
 
     /// Metadata-only list snapshots share the publication/compatibility lock
     /// order so neither SQLite nor YAML/compat mode needs per-novel reader
@@ -100,7 +96,7 @@ impl NativeNovelRepository {
                 return Ok(Some(page));
             }
 
-            let records = load_current_yaml_records(inventory)?;
+            let records = inventory.read_novel_records()?;
             let freeze_path = inventory.inventory_path("freeze", crate::db::inventory::InventoryScope::Local);
             let raw = if freeze_path.is_file() {
                 crate::db::inventory::read_optional_yaml_file(&freeze_path)?
@@ -158,10 +154,10 @@ impl NativeNovelRepository {
             }))
         }))
     }
-    pub fn find_by_toc_url_current_sync(&self,url:&str)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::url_snapshot_conn(connection,url);}let folded=crate::db::novel_codec::fold(url);Ok(load_current_yaml_records(inventory)?.into_values().find(|record|crate::db::novel_codec::fold(&record.toc_url)==folded))}))}
-    pub fn find_by_storage_prefix_current_sync(&self,prefix:&crate::platform::ObjectKey)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::prefix_snapshot_conn(connection,prefix);}for record in load_current_yaml_records(inventory)?.into_values(){let keys=crate::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;if keys.prefix()==prefix{return Ok(Some(record));}}Ok(None)}))}
-    pub fn find_by_title_current_sync(&self,title:&str)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::title_snapshot_conn(connection,title);}let folded=crate::db::novel_codec::fold(title);Ok(load_current_yaml_records(inventory)?.into_values().find(|record|crate::db::novel_codec::fold(&record.title)==folded))}))}
-    pub fn find_by_ncode_current_sync(&self,ncode:&str)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::ncode_snapshot_conn(connection,ncode);}let folded=crate::db::novel_codec::fold(ncode);let suffix=format!("/{folded}");Ok(load_current_yaml_records(inventory)?.into_values().find(|record|record.ncode.as_deref().is_some_and(|value|crate::db::novel_codec::fold(value)==folded)||crate::db::novel_codec::fold(&record.toc_url).trim_end_matches('/').ends_with(&suffix)))}))}
+    pub fn find_by_toc_url_current_sync(&self,url:&str)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::url_snapshot_conn(connection,url);}let folded=crate::db::novel_codec::fold(url);Ok(inventory.read_novel_records()?.values().find(|record|crate::db::novel_codec::fold(&record.toc_url)==folded).cloned())}))}
+    pub fn find_by_storage_prefix_current_sync(&self,prefix:&crate::platform::ObjectKey)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::prefix_snapshot_conn(connection,prefix);}for record in inventory.read_novel_records()?.values(){let keys=crate::platform::NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory)?;if keys.prefix()==prefix{return Ok(Some(record.clone()));}}Ok(None)}))}
+    pub fn find_by_title_current_sync(&self,title:&str)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::title_snapshot_conn(connection,title);}let folded=crate::db::novel_codec::fold(title);Ok(inventory.read_novel_records()?.values().find(|record|crate::db::novel_codec::fold(&record.title)==folded).cloned())}))}
+    pub fn find_by_ncode_current_sync(&self,ncode:&str)->Result<Option<NovelRecord>>{crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|{if let Some(connection)=connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){return crate::native::sqlite::SqliteNovelRepository::ncode_snapshot_conn(connection,ncode);}let folded=crate::db::novel_codec::fold(ncode);let suffix=format!("/{folded}");Ok(inventory.read_novel_records()?.values().find(|record|record.ncode.as_deref().is_some_and(|value|crate::db::novel_codec::fold(value)==folded)||crate::db::novel_codec::fold(&record.toc_url).trim_end_matches('/').ends_with(&suffix)).cloned())}))}
 
     /// Synchronous entry points for native-only callers (CLI commands).
     /// These never spawn blocking work — they lock the shared database
@@ -228,12 +224,12 @@ impl NativeNovelRepository {
     ) -> Result<Vec<NovelId>> {
         crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){
             Some(connection)=>crate::native::sqlite::SqliteNovelRepository::scan_snapshot_conn(connection,filter,after_id,limit),
-            None=>{let after=after_id.map_or(i64::MIN,|id|id.0);Ok(load_current_yaml_records(inventory)?.values().filter(|record|record.id>after&&record_matches_filter(record,filter)).take(limit).map(|record|NovelId(record.id)).collect())}
+            None=>{let after=after_id.map_or(i64::MIN,|id|id.0);Ok(inventory.read_novel_records()?.values().filter(|record|record.id>after&&record_matches_filter(record,filter)).take(limit).map(|record|NovelId(record.id)).collect())}
         }))
     }
 
     pub fn count_sync(&self, filter: &NovelFilter) -> Result<u64> {
-        crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::count_snapshot_conn(connection,filter),None=>Ok(load_current_yaml_records(inventory)?.values().filter(|record|record_matches_filter(record,filter)).count() as u64)}))
+        crate::db::with_database(|db|db.with_library_metadata_snapshot(|inventory,connection|match connection.filter(|_|!db.metadata_is_yaml_in_snapshot(connection)){Some(connection)=>crate::native::sqlite::SqliteNovelRepository::count_snapshot_conn(connection,filter),None=>Ok(inventory.read_novel_records()?.values().filter(|record|record_matches_filter(record,filter)).count() as u64)}))
     }
 
     /// Resolve by ncode with the legacy `toc_url` suffix fallback used by

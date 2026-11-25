@@ -452,16 +452,9 @@ fn resolve_target_to_id(target: &str, site_settings: &[SiteSetting]) -> Option<i
 
 fn sort_update_ids_by_key(ids: &mut [i64], key: &str) {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let records = ids
-        .iter()
-        .filter_map(|id| {
-            novels
-                .get_current_sync((*id).into())
-                .ok()
-                .flatten()
-                .map(|r| (r.id, r))
-        })
-        .collect::<HashMap<_, _>>();
+    let targets: Vec<_> = ids.iter().copied().map(narou_rs::platform::NovelId).collect();
+    let records: HashMap<_, _> = novels.get_many_current_sync(&targets).unwrap_or_default()
+        .into_iter().flatten().map(|record| (record.id, record)).collect();
 
     ids.sort_by(|a, b| {
         let Some(a_record) = records.get(a) else {
@@ -1084,21 +1077,15 @@ fn partition_novels_by_api_support(site_settings: &[SiteSetting], automatic: boo
     let ids = novels
         .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
         .unwrap_or_default();
+    let ids: Vec<_> = ids.into_iter().filter(|id| !frozen_ids.contains(&id.0)).collect();
     let mut records: Vec<(i64, String, Option<String>)> = Vec::new();
-    for id in ids {
-        let Ok(Some(r)) = novels.get_current_sync(id) else {
-            continue;
-        };
-        if frozen_ids.contains(&r.id) {
-            continue;
-        }
+    for r in novels.get_many_current_sync(&ids).unwrap_or_default().into_iter().flatten() {
         let setting = site_settings.iter().find(|s| s.matches_url(&r.toc_url));
         if automatic && !narou_rs::downloader::site_setting::allows_automatic_update(site_settings, &r) {
             continue;
         }
         let ncode = r
             .ncode
-            .clone()
             .or_else(|| {
                 setting
                     .and_then(|s| s.extract_url_captures(&r.toc_url))
@@ -1288,17 +1275,12 @@ fn load_update_max_parallel_domains() -> usize {
 /// in the [`UNKNOWN_DOMAIN_KEY`] bucket — that bucket still runs
 /// serially within whichever worker claims it, so safety is not
 /// compromised.
-fn collect_record_domains(target_ids: &[i64]) -> Result<HashMap<i64, String>, String> {
-    let mut map = HashMap::new();
+fn collect_record_domains(target_ids: &[i64]) -> narou_rs::error::Result<HashMap<i64, String>> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    for &id in target_ids {
-        if let Ok(Some(record)) = novels.get_current_sync(id.into())
-            && let Some(domain) = record.domain.as_ref().filter(|d| !d.is_empty())
-        {
-            map.insert(id, domain.clone());
-        }
-    }
-    Ok(map)
+    let ids: Vec<_> = target_ids.iter().copied().map(narou_rs::platform::NovelId).collect();
+    Ok(novels.get_many_current_sync(&ids)?.into_iter().flatten()
+        .filter_map(|record| record.domain.filter(|domain| !domain.is_empty()).map(|domain| (record.id, domain)))
+        .collect())
 }
 
 /// ダウンロードを直列化するサイトファミリー。
