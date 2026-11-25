@@ -923,6 +923,7 @@ pub fn classify_failure(error: &NarouError) -> JobFailureClass {
         NarouError::Shared(error) => classify_failure(error),
         NarouError::Http(_)
         | NarouError::Io(_)
+        | NarouError::ObjectIo { .. }
         | NarouError::Platform(_)
         | NarouError::SuspendDownload(_)
         | NarouError::DownloadBudgetExpired { .. } => JobFailureClass::Retryable,

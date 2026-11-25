@@ -774,18 +774,24 @@ fn finalize_in_place(
             .map_err(super::sqlite_error)?;
             tx.commit().map_err(super::sqlite_error)?;
             committed = true;
-            for (prefix, gate) in &adopted {
-                store
-                    .install_adopted_gate_nosync(prefix, gate, &conn)
-                    .map_err(|error| {
+            if !adopted.is_empty() {
+                // Mass adoption: one seqlock transition for the whole batch
+                // instead of an exclusive lock-and-fsync cycle per gate file
+                // (issue #58; 1200-file cutovers hit Windows handle contention
+                // and stalling otherwise). The seqlock stays odd until the
+                // batch finishes, so the scan never caches a half-written gate
+                // directory.
+                let batch = crate::native::object_store::begin_gate_revision_batch(store.archive_root())?;
+                for (prefix, gate) in &adopted {
+                    store.install_adopted_gate_batch(prefix, gate, &conn, &batch).map_err(|error| {
                         NarouError::Platform(format!(
                             "FS gate finalization failed for {}: {error}",
                             prefix.as_ref()
                         ))
                     })?;
-            }
-            if !adopted.is_empty() {
+                }
                 mirror.sync_gate_dir()?;
+                batch.finish()?;
                 for (prefix, _) in &adopted {
                     mirror.remove_pending_gate_nosync(prefix).map_err(|error| {
                         NarouError::Platform(format!(

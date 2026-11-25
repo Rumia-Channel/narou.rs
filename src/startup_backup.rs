@@ -448,7 +448,7 @@ fn capture_library_backup_with_stores(
                         if exclude_dir.as_ref().is_some_and(|excluded| stores.primary.path_for_canonical_key(&object.key).is_ok_and(|path| path.starts_with(excluded))) { continue; }
                         if !destination.is_file() {
                             let mut lease = scope.lease_for(&prefix).await?;
-                            if !crate::native::materialization::copy_asset(remote, &mut lease, &object.key, &destination).await? {
+                            if !crate::native::materialization::copy_asset(remote, &mut lease, &object.key, &destination, None).await? {
                                 return Err(NarouError::NotFound(object.key.to_string()));
                             }
                             if fs::metadata(&destination)?.len() != object.size {
@@ -491,7 +491,7 @@ fn capture_library_backup_with_stores(
                         let mut lease = scope.lease_for(&prefix).await?;
                         // Explicitly open the immutable alias even if a local
                         // mirror exists; stale mirrors are not rehosting proof.
-                        if !crate::native::materialization::copy_asset(remote, &mut lease, &key, &destination).await? {
+                        if !crate::native::materialization::copy_asset(remote, &mut lease, &key, &destination, None).await? {
                             return Err(NarouError::NotFound(key.to_string()));
                         }
                         verify_backup_reference(&destination, reference.size, &reference.sha256)?;

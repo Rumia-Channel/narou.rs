@@ -588,8 +588,12 @@ fn diagnostic_region(region: &str) -> &str {
 
 /// URL 文字列から署名対象の `path` と `query` を切り出す。
 ///
+/// 返す `query` は SigV4 canonical form (decode → sort → re-encode) に
+/// 正規化する。サーバーは署名検証時にこの形で canonical request を再構成
+/// するため、wire 上の並びと違う値で署名すると SignatureDoesNotMatch
+/// (403) になる。multipart の手組みクエリで実際に発生した。
 /// `url` クレートで再パースすると percent-encoding が正規化されて署名対象と
-/// wire のバイト列がずれる余地があるため、単純な文字列分割で済ませる。
+/// wire のバイト列がずれる余地があるため、切り出しは単純な文字列分割で済ませる。
 /// `endpoint` 構築時に `?`/`#` を拒否しているので、ここで出る `?` は常に
 /// クエリの開始。
 fn url_target(url: &str) -> (String, String) {
@@ -602,7 +606,7 @@ fn url_target(url: &str) -> (String, String) {
         None => "/",
     };
     match target.split_once('?') {
-        Some((path, query)) => (path.to_string(), query.to_string()),
+        Some((path, query)) => (path.to_string(), s3_sigv4::canonical_wire_query(query)),
         None => (target.to_string(), String::new()),
     }
 }
@@ -1790,5 +1794,43 @@ mod tests {
         )
         .unwrap();
         assert!(url.contains("illustrations"), "pool URL: {url}");
+    }
+
+    #[test]
+    fn send_signs_the_canonical_query_regardless_of_wire_order() {
+        // multipart の ListParts / copy part / ListMultipartUploads は手組みの
+        // クエリを wire に乗せる。署名は canonical 順に対して行われないと
+        // 厳格な S3 で SignatureDoesNotMatch (403) になる。
+        for query in [
+            "uploadId=abc&max-parts=1000&part-number-marker=0",
+            "max-parts=1000&part-number-marker=0&uploadId=abc",
+        ] {
+            let http = Arc::new(MockHttpClient::new());
+            let store = store(http.clone());
+            let url = format!("{}?{query}", store.location.object_url(&key("novels/site/title/本文/s.yaml")));
+            http.add_response(
+                url.clone(),
+                HttpResponse { status: 200, headers: Vec::new(), body: Vec::new() },
+            );
+            let (_, signed) = futures::executor::block_on(store.send(
+                HttpMethod::Get,
+                &url,
+                &[],
+                None,
+                None,
+            ))
+            .unwrap();
+            assert_eq!(
+                signed.canonical_request.lines().nth(2),
+                Some("max-parts=1000&part-number-marker=0&uploadId=abc"),
+                "wire query: {query}"
+            );
+            // wire の URL (送信先) は書き換えない。
+            assert_eq!(
+                http.requested_urls(),
+                vec![format!("GET {url}")],
+                "wire query: {query}"
+            );
+        }
     }
 }

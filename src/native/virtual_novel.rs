@@ -656,12 +656,12 @@ pub fn convert_virtual(
             let owner = key.as_ref().split_once("/挿絵/").map(|(owner, _)| owner)
                 .ok_or_else(|| NarouError::Platform("virtual illustration has no owning novel prefix".into()))?;
             let mut lease = scope.lease_for(&crate::platform::ObjectPrefix::new(owner)?).await?;
-            if !crate::native::materialization::copy_asset(&objects, &mut lease, key, &destination).await? {
+            if !crate::native::materialization::copy_asset(&objects, &mut lease, key, &destination, None).await? {
                 return Err(NarouError::NotFound(key.to_string()));
             }
         }
         for name in ["setting.ini", "replace.txt", "converter.yaml", "cover.jpg", "cover.png", "cover.jpeg"] {
-            crate::native::materialization::copy_asset(&objects, &mut parent_lease, &keys.prefix().join(name)?, &temp.path().join(name)).await?;
+            crate::native::materialization::copy_asset(&objects, &mut parent_lease, &keys.prefix().join(name)?, &temp.path().join(name), None).await?;
         }
         Ok(book.toc)
         }.await;

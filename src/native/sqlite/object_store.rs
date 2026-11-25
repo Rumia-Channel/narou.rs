@@ -1866,9 +1866,13 @@ impl SqliteObjectStore {
         self.mirror.remove_pending_gate_locked(prefix)
     }
 
-    pub(crate) fn install_adopted_gate_nosync(&self,prefix:&ObjectPrefix,gate:&FsGate,connection:&Connection)->Result<()> {
-        self.mirror.install_adopted_gate_nosync(&self.mirror.gate_path(prefix)?,prefix,gate,connection)
+
+    /// Batched variant of [`Self::install_adopted_gate_nosync`] for mass
+    /// adoption (export cutover). See the mirror's `install_adopted_gate_batch`.
+    pub(crate) fn install_adopted_gate_batch(&self,prefix:&ObjectPrefix,gate:&FsGate,connection:&Connection,batch:&crate::native::object_store::GateRevisionBatch)->Result<()> {
+        self.mirror.install_adopted_gate_batch(&self.mirror.gate_path(prefix)?,prefix,gate,connection,batch)
     }
+
 
     /// SQL→FS gate authority adoption for `prefix`. Under the prefix's OS
     /// transfer lock + one immediate transaction: verify the row, journal the

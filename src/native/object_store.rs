@@ -271,10 +271,7 @@ impl NativeObjectStore {
                 MAX_SMALL_OBJECT_BYTES
             )));
         }
-        let path = self.resolve_path(key)?;
-        self.ensure_parent_dir(&path)?;
-        self.forget_file_proof(key)?;
-        atomic_write_bytes(&path, &data)
+        self.write_bytes_blocking(key, &data)
     }
 
     pub(crate) fn update_small_blocking<'data>(
@@ -325,9 +322,11 @@ impl NativeObjectStore {
     /// (EPUB, large sections) may exceed `MAX_SMALL_OBJECT_BYTES`.
     pub(crate) fn write_bytes_blocking(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
         let path = self.resolve_path(key)?;
-        self.ensure_parent_dir(&path)?;
-        self.forget_file_proof(key)?;
-        atomic_write_bytes(&path, data)
+        self.ensure_parent_dir(&path)
+            .map_err(|error| object_io_context(key, "create parent directory", error))?;
+        self.forget_file_proof(key)
+            .map_err(|error| object_io_context(key, "remove file proof", error))?;
+        atomic_write_bytes_with(&path, data, |operation, source| object_io_error(key, operation, source))
     }
 
     pub(crate) fn list_direct_files(&self, prefix: &ObjectKey) -> Result<Vec<ObjectKey>> {
@@ -549,24 +548,225 @@ pub(crate) fn run_scoped_blocking<T>(operation: impl FnOnce() -> Result<T>) -> R
 
 pub(crate) const ATOMIC_OBJECT_TEMP_PREFIX: &str = ".narou-object-";
 
+fn object_io_error(key: &ObjectKey, operation: &'static str, source: std::io::Error) -> NarouError {
+    NarouError::ObjectIo {
+        operation,
+        key: key.as_ref().to_owned(),
+        source,
+    }
+}
+
+fn object_io_context(key: &ObjectKey, operation: &'static str, error: NarouError) -> NarouError {
+    match error {
+        NarouError::Io(source) => object_io_error(key, operation, source),
+        error => error,
+    }
+}
+
 pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
+    atomic_write_bytes_with(path, data, |_, source| NarouError::Io(source))
+}
+
+fn atomic_write_bytes_with(
+    path: &Path,
+    data: &[u8],
+    io_error: impl Fn(&'static str, std::io::Error) -> NarouError,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
     let mut temporary = tempfile::Builder::new()
         .prefix(ATOMIC_OBJECT_TEMP_PREFIX)
-        .tempfile_in(parent)?;
+        .tempfile_in(parent)
+        .map_err(|error| io_error("create temporary file", error))?;
     // NamedTempFile creates exclusively; existing links are never opened.
     for chunk in data.chunks(1024 * 1024) {
-        temporary.write_all(chunk)?;
+        temporary.write_all(chunk).map_err(|error| io_error("write temporary file", error))?;
     }
-    temporary.as_file().sync_all()?;
+    temporary.as_file().sync_all().map_err(|error| io_error("sync temporary file", error))?;
     // std::fs::rename replaces an existing destination atomically on every
     // supported platform (rename(2) on Unix, MoveFileExW with
     // MOVEFILE_REPLACE_EXISTING on Windows). A preceding exists+remove would
     // only open a window where the destination is missing.
-    temporary.persist(path).map_err(|error| NarouError::Io(error.error))?;
+    temporary.persist(path).map_err(|error| io_error("replace destination", error.error))?;
     Ok(())
+}
+
+/// Scan-relevant projection of one durable gate file: `(closed, owner, epoch,
+/// origin, migrated)`. `content_revision`, reader leases and `updated_at` never
+/// affect namespace-authority scans, so ordinary content writes do not
+/// invalidate the scan cache (issue #58).
+/// The scan-visible projection of one gate: `(closed, owner, epoch, origin,
+/// migrated)`.
+type GateScanProjection = (bool, Option<String>, u64, String, bool);
+fn scan_relevant(gate: &FsGate) -> GateScanProjection {
+    (gate.owner.is_some(), gate.owner.clone(), gate.epoch, gate.origin_url_fold.clone(), gate.migrated)
+}
+fn scan_relevant_bytes(bytes: &[u8]) -> Result<GateScanProjection> {
+    let gate: FsGate = serde_json::from_slice(bytes)
+        .map_err(|error| NarouError::Platform(format!("invalid namespace gate: {error}")))?;
+    Ok(scan_relevant(&gate))
+}
+fn scan_relevant_file(path: &Path) -> Result<Option<GateScanProjection>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(scan_relevant_bytes(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Write one durable FS gate file. The scan cache is invalidated only when the
+/// scan-relevant projection actually changes; the seqlock turns odd before the
+/// rename lands and even after the parent sync, so a reader observing a stable
+/// even value across its scan proves every counted mutation is visible.
+/// `content_revision`-only writes (ordinary content saves) keep the cache.
+pub(crate) fn write_gate_file(archive_root: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    write_gate_file_with(archive_root, path, bytes, None)
+}
+
+/// [`write_gate_file`] with the caller's already-known previous projection.
+/// `before` avoids re-reading the gate file on the hot content-write path.
+pub(crate) fn write_gate_file_with(archive_root: &Path, path: &Path, bytes: &[u8], before: Option<GateScanProjection>) -> Result<()> {
+    let previous = match before { Some(before) => Some(before), None => scan_relevant_file(path)? };
+    let changed = previous != Some(scan_relevant_bytes(bytes)?);
+    // Stage the content OUTSIDE the revision-lock critical section: the temp
+    // write and its fsync need no interlock with other gate mutations.
+    let parent = path.parent().ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
+    let mut temporary = tempfile::Builder::new().prefix(ATOMIC_OBJECT_TEMP_PREFIX).tempfile_in(parent)?;
+    for chunk in bytes.chunks(1024 * 1024) { temporary.write_all(chunk)?; }
+    temporary.as_file().sync_all()?;
+    if changed {
+        // Critical section: counter transition + rename + counter seal. Only
+        // lock acquisitions and memory-speed writes are inside, so parallel
+        // mutations contend for milliseconds, not for an fsync chain.
+        let revision = begin_gate_revision_write(archive_root)?;
+        temporary.persist(path).map_err(|error| NarouError::Io(error.error))?;
+        revision.finish()?;
+    } else {
+        temporary.persist(path).map_err(|error| NarouError::Io(error.error))?;
+    }
+    sync_transfer_parent(path)?;
+    Ok(())
+}
+
+/// Archive-root-relative location of the scan-invalidation seqlock. It sits
+/// beside the durable gate directory so writers and the scan agree on one
+/// file regardless of which root convention the caller holds.
+pub(crate) fn gate_revision_path(archive_root: &Path) -> PathBuf {
+    archive_root.join(".objects").join(".narou-transfer").join("gate-revision")
+}
+fn gate_revision_lock_path(archive_root: &Path) -> PathBuf {
+    archive_root.join(".objects").join(".narou-transfer").join(".lock").join("_gate_revision")
+}
+
+/// Read the current scan-invalidation seqlock. Missing means zero; the file
+/// is only ever replaced by atomic rename, so a lock-free read is a
+/// consistent snapshot. Even values are stable (every counted mutation is
+/// fully published); odd values mean a mutation is in flight or crashed.
+pub(crate) fn read_gate_revision(archive_root: &Path) -> Result<u64> {
+    match fs::read_to_string(gate_revision_path(archive_root)) {
+        Ok(raw) => raw.trim().parse::<u64>().map_err(|error| NarouError::Platform(format!("invalid gate revision: {error}"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+fn write_gate_revision(archive_root: &Path, value: u64) -> Result<()> {
+    // Visibility-only write: no fsync chain. The seqlock feeds the
+    // process-local scan cache, and both readers and writers agree through
+    // the OS page cache on one machine; durability across a power loss is
+    // irrelevant because the cache dies with the machine anyway. Every
+    // persisted counter state is consistent with the gate state observed at
+    // the next boot, so skipping fsyncs cannot serve a stale scan.
+    let path = gate_revision_path(archive_root);
+    if let Some(directory) = path.parent() { fs::create_dir_all(directory)?; }
+    let parent = path.parent().ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
+    let mut temporary = tempfile::Builder::new().prefix(ATOMIC_OBJECT_TEMP_PREFIX).tempfile_in(parent)?;
+    temporary.write_all(value.to_string().as_bytes())?;
+    temporary.persist(&path).map_err(|error| NarouError::Io(error.error))?;
+    Ok(())
+}
+
+/// Begin a scan-relevant gate mutation. The returned guard holds the global
+/// revision lock for the entire mutation; `finish` seals the seqlock even
+/// after the mutation is fully published. Seqlock protocol: the counter is
+/// odd while a mutation is in flight and even once fully published, so a
+/// reader observing a stable even value across its scan knows every counted
+/// mutation is visible in that scan. A crashed predecessor leaves an odd
+/// value; the next writer seals it first — atomic renames mean the on-disk
+/// state is consistent regardless of where the crash landed. Never incorrect
+/// on crash: worst case is a permanently odd counter, degrading readers to
+/// the uncached scan (issue #58).
+pub(crate) fn begin_gate_revision_write(archive_root: &Path) -> Result<GateRevisionWrite> {
+    let lock_path = gate_revision_lock_path(archive_root);
+    if let Some(parent) = lock_path.parent() { fs::create_dir_all(parent)?; }
+    let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let mut current = read_gate_revision(archive_root)?;
+    if current % 2 == 1 {
+        current = current.checked_add(1).ok_or_else(|| NarouError::Platform("gate revision overflow".into()))?;
+        write_gate_revision(archive_root, current)?;
+    }
+    let odd = current.checked_add(1).ok_or_else(|| NarouError::Platform("gate revision overflow".into()))?;
+    write_gate_revision(archive_root, odd)?;
+    Ok(GateRevisionWrite { archive_root: archive_root.to_path_buf(), next: odd.checked_add(1).ok_or_else(|| NarouError::Platform("gate revision overflow".into()))?, _lock: lock })
+}
+
+/// Holds the global gate-revision lock across one scan-relevant mutation.
+/// Dropping without `finish` leaves the seqlock odd: safe (readers bypass
+/// the cache) but degraded, so `finish` failures are reported to callers.
+pub(crate) struct GateRevisionWrite {
+    archive_root: PathBuf,
+    next: u64,
+    _lock: fs::File,
+}
+impl GateRevisionWrite {
+    pub(crate) fn finish(self) -> Result<()> {
+        write_gate_revision(&self.archive_root, self.next)
+    }
+}
+
+/// Holds the global gate-revision lock across a batch of gate-file mutations
+/// (mass cutover / adoption). The seqlock turns odd when the batch begins and
+/// even only once at `finish`, so readers see an odd value for the entire
+/// batch and never cache a half-written gate directory. Writes in the batch
+/// skip the per-file parent sync because the caller performs the single
+/// `.gate/` directory sync before `finish` (issue #58).
+pub(crate) struct GateRevisionBatch {
+    archive_root: PathBuf,
+    next: u64,
+    _lock: fs::File,
+}
+impl GateRevisionBatch {
+    /// Write one `.gate/` file inside the batch: no counter work, no parent
+    /// sync. The batch's odd-to-even transition plus the caller's directory
+    /// sync carry the whole batch.
+    pub(crate) fn write_gate(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        atomic_write_bytes(path, bytes)
+    }
+    /// Seal the seqlock even. Must run after the caller's `.gate/` directory
+    /// sync so the published even value covers every rename in the batch.
+    pub(crate) fn finish(self) -> Result<()> {
+        write_gate_revision(&self.archive_root, self.next)
+    }
+}
+
+/// Begin a batched gate mutation. Like [`begin_gate_revision_write`], the
+/// seqlock seals a crashed predecessor first and turns odd for the duration
+/// of the batch; the caller must run [`GateRevisionBatch::finish`] exactly
+/// once after the `.gate/` directory sync.
+pub(crate) fn begin_gate_revision_batch(archive_root: &Path) -> Result<GateRevisionBatch> {
+    let lock_path = gate_revision_lock_path(archive_root);
+    if let Some(parent) = lock_path.parent() { fs::create_dir_all(parent)?; }
+    let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let mut current = read_gate_revision(archive_root)?;
+    if current % 2 == 1 {
+        current = current.checked_add(1).ok_or_else(|| NarouError::Platform("gate revision overflow".into()))?;
+        write_gate_revision(archive_root, current)?;
+    }
+    let odd = current.checked_add(1).ok_or_else(|| NarouError::Platform("gate revision overflow".into()))?;
+    write_gate_revision(archive_root, odd)?;
+    Ok(GateRevisionBatch { archive_root: archive_root.to_path_buf(), next: odd.checked_add(1).ok_or_else(|| NarouError::Platform("gate revision overflow".into()))?, _lock: lock })
 }
 
 pub(crate) fn content_type_for_path(path: &Path) -> Option<&'static str> {
@@ -584,6 +784,9 @@ impl ObjectStore for NativeObjectStore {
     fn delete_closed<'a>(&'a self,prefix:&'a ObjectPrefix,owner:&'a str,epoch:u64,key:&'a ObjectKey)->PlatformFuture<'a,Result<()>>{Box::pin(async move{af::parse_removal_owner(owner)?;run_scoped_blocking(||self.with_gate(prefix,|gate|{gate.require_writer(prefix,owner,epoch)?;if !prefix.matches(key){return Err(NarouError::Platform("closed deletion outside novel".into()));}let path=self.resolve_path(key)?;match fs::remove_file(&path){Ok(())=>{sync_transfer_parent(&path)?;gate.content_revision=gate.content_revision.checked_add(1).ok_or_else(||NarouError::Platform("content revision overflow".into()))?;},Err(error)if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(error.into())}self.prune_empty_dirs_in_prefix(prefix,&path)}))})}
     fn read_stream_leased<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
         NativeObjectStore::read_stream_leased(self, prefix, lease, key, range)
+    }
+    fn native_source_path(&self, key: &ObjectKey) -> Option<std::path::PathBuf> {
+        self.resolve_path(key).ok()
     }
     fn write_small_guarded<'a>(&'a self, fence: &'a crate::platform::WriteFence, key: &'a ObjectKey, data: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move { run_scoped_blocking(|| self.with_gate(&fence.prefix, |gate| {
@@ -1377,6 +1580,11 @@ impl ObjectStore for NativeStore {
     fn read_stream_leased<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
         match self { Self::Fs(store) => store.read_stream_leased(prefix, lease, key, range), Self::Sqlite(store) => store.read_stream_leased(prefix, lease, key, range) }
     }
+    /// Fs objects are real files; a snapshot can hardlink instead of copying
+    /// (issue #58). SQLite bodies live in the DB, so they keep the copy path.
+    fn native_source_path(&self, key: &ObjectKey) -> Option<std::path::PathBuf> {
+        match self { Self::Fs(store) => store.resolve_path(key).ok(), Self::Sqlite(_) => None }
+    }
 
     fn is_remote_reference<'a>(&'a self, key:&'a ObjectKey)->PlatformFuture<'a,Result<bool>>{self.has_remote_reference(key)}
     fn write_small_guarded<'a>(&'a self, fence: &'a crate::platform::WriteFence, key: &'a ObjectKey, data: Vec<u8>) -> PlatformFuture<'a, Result<()>> {
@@ -1576,6 +1784,7 @@ native_port!(TransferStageStore {
 });
 native_port!(NovelAccessFence {
     fn pending_removals<'a>(cursor:Option<&'a str>,limit:usize)->(Vec<(ObjectPrefix,String,u64)>,Option<String>);
+    fn capture_writer<'a>(prefix:&'a ObjectPrefix)->crate::platform::WriteFence;
     fn rebind_writer<'a>(prefix:&'a ObjectPrefix,expected_epoch:u64)->crate::platform::WriteFence;
     fn admit_reader<'a>(prefix:&'a ObjectPrefix,id:&'a str,ttl:i64)->GateLease;
     fn renew_reader<'a>(prefix:&'a ObjectPrefix,lease:&'a GateLease,ttl:i64)->GateLease;
@@ -1596,7 +1805,7 @@ use crate::platform::{TransferStageStore, NovelAccessFence, ObjectPrefix, StageC
 use crate::platform::{transfer_stage as ts, access_fence as af};
 use sha2::Digest;
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FsGate {
     #[serde(default)]
     pub(crate) prefix:Option<String>,
@@ -1749,8 +1958,7 @@ impl NativeObjectStore {
             // post-commit marker write never landed.
             if !gate.migrated&&matches!(self.live_sql_authority(prefix,gate.epoch,&gate.origin_url_fold.clone())?,SqlGateAuthority::Superseded){gate.migrated=true;}
             let value = operation(&mut gate)?;
-            atomic_write_bytes(&path, &serde_json::to_vec(&gate).map_err(|error| NarouError::Platform(error.to_string()))?)?;
-            sync_transfer_parent(&path)?;
+            write_gate_file(&self.root, &path, &serde_json::to_vec(&gate).map_err(|error| NarouError::Platform(error.to_string()))?)?;
             Ok(value)
         })
     }
@@ -1821,7 +2029,7 @@ impl NativeObjectStore {
             // migrated marker retires the file; a crash before this write is
             // repaired by the startup sweep via the recorded handoff.
             gate.migrated=true;gate.updated_at=ts::now_secs();
-            atomic_write_bytes(&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(&path)?;
+            write_gate_file(&self.root,&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;
             Ok(())
         })
     }
@@ -1856,8 +2064,21 @@ impl NativeObjectStore {
     pub(crate) fn install_adopted_gate_nosync(&self,path:&Path,prefix:&ObjectPrefix,gate:&FsGate,connection:&rusqlite::Connection)->Result<()>{
         self.require_adopted_gate_target(path,prefix,gate,connection)?;
         self.ensure_parent_dir(path)?;
-        atomic_write_bytes(path,&serde_json::to_vec(gate).map_err(|error|NarouError::Platform(error.to_string()))?)
+        write_gate_file(&self.root,path,&serde_json::to_vec(gate).map_err(|error|NarouError::Platform(error.to_string()))?)
     }
+
+    /// Batched variant of [`Self::install_adopted_gate_nosync`]: the same
+    /// validation, but the file is written through `batch` (no per-file
+    /// counter work or parent sync). The caller must sync the `.gate/`
+    /// directory and run [`GateRevisionBatch::finish`] once the batch is
+    /// complete (issue #58: 1200-file cutovers cannot afford 1200 exclusive
+    /// lock-and-fsync cycles).
+    pub(crate) fn install_adopted_gate_batch(&self,path:&Path,prefix:&ObjectPrefix,gate:&FsGate,connection:&rusqlite::Connection,batch:&GateRevisionBatch)->Result<()>{
+        self.require_adopted_gate_target(path,prefix,gate,connection)?;
+        self.ensure_parent_dir(path)?;
+        batch.write_gate(path,&serde_json::to_vec(gate).map_err(|error|NarouError::Platform(error.to_string()))?)
+    }
+
 
     /// Durable intent journal for the SQL→FS adoption of `prefix`: a
     /// `.gate.pending/<sha256>` file written inside the intent transaction
@@ -1920,7 +2141,7 @@ impl NativeObjectStore {
             if !gate.migrated{return Ok(());}
             if identity::read_sql_gate_handoff(connection,prefix.as_ref().trim_end_matches('/'),gate.epoch,&gate.origin_url_fold)?{return Ok(());}
             gate.migrated=false;gate.updated_at=ts::now_secs();
-            atomic_write_bytes(&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(&path)
+            write_gate_file(&self.root,&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)
         })
     }
 
@@ -1936,7 +2157,7 @@ impl NativeObjectStore {
             };
             if gate.migrated{return Ok(());}
             gate.migrated=true;gate.updated_at=ts::now_secs();
-            atomic_write_bytes(&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(&path)
+            write_gate_file(&self.root,&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)
         })
     }
 
@@ -1952,7 +2173,7 @@ impl NativeObjectStore {
         gate.prune();
         if gate.readers.get(&lease.reader_id).is_some_and(|(epoch,_)|*epoch==lease.epoch){gate.readers.remove(&lease.reader_id);}else{return Ok(());}
         gate.updated_at=ts::now_secs();
-        atomic_write_bytes(&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(&path)
+        write_gate_file(&self.root,&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)
     }
 
     /// Drain this lease's SQL row through the shared process handle, when a
@@ -1993,25 +2214,113 @@ pub(crate) fn durable_fs_gates(directory:&Path)->Result<Vec<(String,FsGate)>>{
     Ok(out)
 }
 
+/// Process-wide cache of the durable FS gate scan. The seqlock revision proves
+/// whether the cached snapshot is still current, so a scan costs one small
+/// file read instead of one open+read+parse per gate file (issue #58).
+/// An odd revision means a mutation is in flight or crashed: the scan runs
+/// uncached so a stable even value is required before caching again.
+type FsGateScanCache = parking_lot::Mutex<std::collections::HashMap<PathBuf,(u64,Arc<Vec<(String,FsGate)>>)>>;
+static FS_GATE_SCAN_CACHE: std::sync::OnceLock<FsGateScanCache> = std::sync::OnceLock::new();
+
+fn fs_gate_scan_cache()->&'static FsGateScanCache{
+    FS_GATE_SCAN_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Durable FS gates for one archive root, reusing the cached snapshot while the
+/// scan revision proves it current.
+fn cached_fs_gates(archive_root:&Path,directory:&Path)->Result<std::collections::BTreeMap<String,FsGate>>{
+    let revision=read_gate_revision(archive_root)?;
+    if revision%2==0{
+        let cache=fs_gate_scan_cache().lock();
+        if let Some((cached_revision,gates))=cache.get(archive_root)&&*cached_revision==revision{
+            return Ok(gates.iter().cloned().collect());
+        }
+
+    }
+    let gates=Arc::new(durable_fs_gates(directory)?);
+    // Re-read after the scan: a stable even value proves every counted
+    // mutation is visible in this snapshot, so it is safe to cache.
+    let after=read_gate_revision(archive_root)?;
+    if after%2==0&&after==revision{
+        fs_gate_scan_cache().lock().insert(archive_root.to_path_buf(),(after,gates.clone()));
+    }
+    Ok(gates.iter().cloned().collect())
+}
+
 /// Metadata-only visitor. The caller already owns metadata/SQL authority; this
 /// never re-locks a connection or OS gate and never reads novel payloads.
+///
+/// Access budget (issue #58): the durable FS gate scan is cached behind the
+/// gate-revision seqlock (one small file read per scan instead of one
+/// open+read+parse per gate file), and the handoff tables are read with one
+/// query each instead of two queries per gate row. The predicates below
+/// reproduce the per-row readers exactly, including their fail-closed
+/// regression errors.
 pub(crate) fn visit_namespace_gates(root:&Path,connection:&rusqlite::Connection,mut visit:impl FnMut(&str,bool,Option<&str>,u64,&str)->Result<()>)->Result<()>{
-    use rusqlite::OptionalExtension;
-    let table:Option<i64>=connection.query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name='novel_access_gates'",[],|row|row.get(0)).optional().map_err(crate::native::sqlite::sqlite_error)?;
-    let directory=root.join(crate::downloader::types::ARCHIVE_ROOT_DIR).join(".objects/.narou-transfer/.gate");
-    let fs_gates:std::collections::BTreeMap<String,FsGate>=if root.as_os_str().is_empty(){std::collections::BTreeMap::new()}else{durable_fs_gates(&directory)?.into_iter().collect()};
-    if table.is_some(){let mut statement=connection.prepare("SELECT prefix,closed,owner,epoch,origin_url_fold FROM novel_access_gates WHERE closed<>0 OR origin_url_fold<>'' ORDER BY prefix").map_err(crate::native::sqlite::sqlite_error)?;let mut rows=statement.query([]).map_err(crate::native::sqlite::sqlite_error)?;while let Some(row)=rows.next().map_err(crate::native::sqlite::sqlite_error)?{let prefix:String=row.get(0).map_err(crate::native::sqlite::sqlite_error)?;let closed:bool=row.get(1).map_err(crate::native::sqlite::sqlite_error)?;let owner:Option<String>=row.get(2).map_err(crate::native::sqlite::sqlite_error)?;let epoch=crate::native::sqlite::read_u64(row,3).map_err(crate::native::sqlite::sqlite_error)?;let origin:String=row.get(4).map_err(crate::native::sqlite::sqlite_error)?;
+    let archive_root=root.join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+    let directory=archive_root.join(".objects/.narou-transfer/.gate");
+    let fs_gates:std::collections::BTreeMap<String,FsGate>=if root.as_os_str().is_empty(){std::collections::BTreeMap::new()}else{cached_fs_gates(&archive_root,&directory)?};
+    // One existence query for all three tables, then one row query per
+    // handoff table that exists.
+    let mut existing=std::collections::BTreeSet::new();
+    {let mut statement=connection.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('novel_access_gates','fs_gate_handoffs','native_gate_handoffs')").map_err(crate::native::sqlite::sqlite_error)?;let mut rows=statement.query([]).map_err(crate::native::sqlite::sqlite_error)?;while let Some(row)=rows.next().map_err(crate::native::sqlite::sqlite_error)?{let name:String=row.get(0).map_err(crate::native::sqlite::sqlite_error)?;existing.insert(name);}}
+    let fs_handoffs=if existing.contains("fs_gate_handoffs"){load_fs_gate_handoffs(connection)?}else{std::collections::BTreeMap::new()};
+    let sql_handoffs=if existing.contains("native_gate_handoffs"){load_sql_gate_handoffs(connection)?}else{std::collections::BTreeMap::new()};
+    if existing.contains("novel_access_gates"){let mut statement=connection.prepare("SELECT prefix,closed,owner,epoch,origin_url_fold FROM novel_access_gates WHERE closed<>0 OR origin_url_fold<>'' ORDER BY prefix").map_err(crate::native::sqlite::sqlite_error)?;let mut rows=statement.query([]).map_err(crate::native::sqlite::sqlite_error)?;while let Some(row)=rows.next().map_err(crate::native::sqlite::sqlite_error)?{let prefix:String=row.get(0).map_err(crate::native::sqlite::sqlite_error)?;let closed:bool=row.get(1).map_err(crate::native::sqlite::sqlite_error)?;let owner:Option<String>=row.get(2).map_err(crate::native::sqlite::sqlite_error)?;let epoch=crate::native::sqlite::read_u64(row,3).map_err(crate::native::sqlite::sqlite_error)?;let origin:String=row.get(4).map_err(crate::native::sqlite::sqlite_error)?;
         // A SQL→FS handoff supersedes this row only while a live FS gate
-        // carries the recorded fs_epoch and origin: exact tuple proof.
-        if let Some((fs_epoch,fs_origin))=identity::read_fs_gate_handoff(connection,&prefix,epoch)?&&fs_gates.get(&prefix).is_some_and(|gate|gate.epoch==fs_epoch&&gate.origin_url_fold==fs_origin){continue;}
+        // carries the recorded fs_epoch and origin: exact tuple proof. The
+        // handoff applies to this row only when its sql_epoch still equals
+        // the row's epoch; a regressed handoff fails closed.
+        if let Some(handoff)=fs_handoffs.get(prefix.as_str())&&handoff.sql_epoch>=0&&handoff.sql_epoch as u64==epoch{
+            if handoff.fs_epoch<=handoff.sql_epoch as u64{return Err(NarouError::Platform("FS gate handoff regress below the SQL epoch".into()));}
+            if fs_gates.get(&prefix).is_some_and(|gate|gate.epoch==handoff.fs_epoch&&gate.origin_url_fold==handoff.fs_origin){continue;}
+        }
         visit(&prefix,closed,owner.as_deref(),epoch,&origin)?;}}
     for (prefix,gate)in fs_gates{
         if gate.owner.is_none()&&gate.origin_url_fold.is_empty()&&!gate.migrated{continue;}
-        let handed_off=identity::read_sql_gate_handoff(connection,&prefix,gate.epoch,&gate.origin_url_fold)?;
+        // FS→SQL handoff: the row must carry this gate's exact fs_epoch and
+        // origin, and its sql_epoch must advance beyond it.
+        let handed_off=sql_handoffs.get(prefix.as_str()).is_some_and(|handoff|handoff.fs_epoch==gate.epoch&&handoff.sql_epoch>=0&&handoff.sql_epoch as u64>gate.epoch&&handoff.fs_origin==gate.origin_url_fold);
         if gate.migrated&&!handed_off{return Err(NarouError::Platform("migrated FS gate lost its SQL handoff".into()));}
         if handed_off{continue;}
         visit(&prefix,gate.owner.is_some(),gate.owner.as_deref(),gate.epoch,&gate.origin_url_fold)?;}
     Ok(())
+}
+
+/// Durable handoff row. `sql_epoch` keeps its signed form because the
+/// per-row readers treated a negative sql_epoch as "not handed off" rather
+/// than as a hard error.
+struct GateHandoffRow{fs_epoch:u64,sql_epoch:i64,fs_origin:String}
+/// SQL→FS handoff rows keyed by prefix.
+fn load_fs_gate_handoffs(connection:&rusqlite::Connection)->Result<std::collections::BTreeMap<String,GateHandoffRow>>{
+    let mut out=std::collections::BTreeMap::new();
+    let mut statement=connection.prepare("SELECT prefix,fs_epoch,sql_epoch,fs_origin_fold FROM fs_gate_handoffs").map_err(crate::native::sqlite::sqlite_error)?;
+    let mut rows=statement.query([]).map_err(crate::native::sqlite::sqlite_error)?;
+    while let Some(row)=rows.next().map_err(crate::native::sqlite::sqlite_error)?{
+        let prefix:String=row.get(0).map_err(crate::native::sqlite::sqlite_error)?;
+        let fs_epoch:i64=row.get(1).map_err(crate::native::sqlite::sqlite_error)?;
+        let sql_epoch:i64=row.get(2).map_err(crate::native::sqlite::sqlite_error)?;
+        let origin:String=row.get(3).map_err(crate::native::sqlite::sqlite_error)?;
+        if fs_epoch<0{return Err(NarouError::Platform("negative epoch in durable FS gate handoff".into()));}
+        out.insert(prefix,GateHandoffRow{fs_epoch:fs_epoch as u64,sql_epoch,fs_origin:origin});
+    }
+    Ok(out)
+}
+
+/// FS→SQL handoff rows keyed by prefix.
+fn load_sql_gate_handoffs(connection:&rusqlite::Connection)->Result<std::collections::BTreeMap<String,GateHandoffRow>>{
+    let mut out=std::collections::BTreeMap::new();
+    let mut statement=connection.prepare("SELECT prefix,fs_epoch,sql_epoch,fs_origin_fold FROM native_gate_handoffs").map_err(crate::native::sqlite::sqlite_error)?;
+    let mut rows=statement.query([]).map_err(crate::native::sqlite::sqlite_error)?;
+    while let Some(row)=rows.next().map_err(crate::native::sqlite::sqlite_error)?{
+        let prefix:String=row.get(0).map_err(crate::native::sqlite::sqlite_error)?;
+        let fs_epoch:i64=row.get(1).map_err(crate::native::sqlite::sqlite_error)?;
+        let sql_epoch:i64=row.get(2).map_err(crate::native::sqlite::sqlite_error)?;
+        let origin:String=row.get(3).map_err(crate::native::sqlite::sqlite_error)?;
+        if fs_epoch<0{return Err(NarouError::Platform("negative epoch in durable SQL gate handoff".into()));}
+        out.insert(prefix,GateHandoffRow{fs_epoch:fs_epoch as u64,sql_epoch,fs_origin:origin});
+    }
+    Ok(out)
 }
 
 /// Exact borrowed gate state for one prefix under the caller's metadata/SQL
@@ -2092,7 +2401,7 @@ impl NativeObjectStore {
     /// jobs conservatively, but can never resurrect deleted canonical bytes.
     pub(crate) fn invalidate_writer_locked(&self,fence:&crate::platform::WriteFence)->Result<()>{
         let mut gate=self.require_open_writer_locked(fence)?;gate.epoch=gate.epoch.checked_add(1).ok_or_else(||NarouError::Platform("gate epoch overflow".into()))?;gate.updated_at=ts::now_secs();
-        let path=self.gate_path(&fence.prefix)?;atomic_write_bytes(&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(&path)
+        let path=self.gate_path(&fence.prefix)?;write_gate_file(&self.root,&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)
     }
     pub(crate) fn file_generation(&self,key:&ObjectKey)->Result<Option<String>>{
         match file_stamp(&self.resolve_read_path(key)?){Ok(stamp)=>serde_json::to_string(&stamp).map(Some).map_err(|error|NarouError::Platform(error.to_string())),Err(NarouError::Io(error))if error.kind()==std::io::ErrorKind::NotFound=>Ok(None),Err(error)=>Err(error)}
@@ -2237,16 +2546,51 @@ impl NativeObjectStore {
                     // Heal the marker before rejecting so the file stops
                     // presenting live authority even if this op retried.
                     gate.migrated=true;gate.updated_at=ts::now_secs();
-                    atomic_write_bytes(&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(&path)?;
+                    write_gate_file(&self.root,&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;
                     return Err(af::gate_closed_error(prefix));
                 }
                 SqlGateAuthority::Conflict=>return Err(NarouError::Platform(format!("conflicting live SQL authority for {}",prefix.as_ref()))),
                 _=>{}
             }
+            let before = scan_relevant(&gate);
             let value = operation(&mut gate)?;
-            atomic_write_bytes(&path, &serde_json::to_vec(&gate).map_err(|error| NarouError::Platform(error.to_string()))?)?;
-            sync_transfer_parent(&path)?;
+            // The uniform writer compares the scan-relevant projection and
+            // invalidates the scan cache only when it changed; a
+            // content_revision-only write (ordinary content save) keeps the
+            // cache (issue #58).
+            write_gate_file_with(&self.root, &path, &serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?, Some(before))?;
             Ok(value)
+        })
+    }
+    /// Pure read through the shared reader namespace lock: validates the gate
+    /// and runs `operation` without writing the durable gate back. Bulk readers
+    /// (snapshot copies, EPUB builds) open one file per call, so the old
+    /// unconditional rewrite paid a full atomic write+fsync per file (issue #58).
+    /// `gate.prune()`/`prefix` changes are in-memory only here; the single
+    /// read-path gate mutation is the `Superseded` heal, which writes and
+    /// returns before this point.
+    fn with_reader_gate_read<T>(&self, prefix: &ObjectPrefix, operation: impl FnOnce(&mut FsGate) -> Result<T>) -> Result<T> {
+        self.with_namespace_lock(prefix.as_ref().trim_end_matches('/'), true, || {
+            let path = self.gate_path(prefix)?;
+            self.ensure_parent_dir(&path)?;
+            let mut gate: FsGate = match fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| NarouError::Platform(format!("invalid durable gate: {error}")))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => FsGate::default(),
+                Err(error) => return Err(error.into()),
+            };
+            gate.prefix=Some(prefix.as_ref().trim_end_matches('/').to_owned());
+            gate.prune();
+            if gate.migrated{return Err(af::gate_closed_error(prefix));}
+            match self.live_sql_authority(prefix,gate.epoch,&gate.origin_url_fold.clone())?{
+                SqlGateAuthority::Superseded=>{
+                    gate.migrated=true;gate.updated_at=ts::now_secs();
+                    write_gate_file(&self.root,&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;
+                    return Err(af::gate_closed_error(prefix));
+                }
+                SqlGateAuthority::Conflict=>return Err(NarouError::Platform(format!("conflicting live SQL authority for {}",prefix.as_ref()))),
+                _=>{}
+            }
+            operation(&mut gate)
         })
     }
     fn with_stage<T>(&self, id: &str, operation: impl FnOnce(Option<ts::StageLedgerRecord>) -> Result<(T, Option<ts::StageLedgerRecord>)>) -> Result<T> {
@@ -2285,7 +2629,7 @@ impl NativeObjectStore {
     /// Validate admission and open the file within the same OS critical section.
     pub fn open_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>> {
         let this=self.clone();let prefix=prefix.clone();let lease=lease.clone();let key=key.clone();Box::pin(async move{
-            let opened=run_blocking(move||this.with_reader_gate(&prefix,|gate|{
+            let opened=run_blocking(move||this.with_reader_gate_read(&prefix,|gate|{
                 if !prefix.matches(&key)||gate.owner.is_some()||gate.epoch!=lease.epoch{return Err(af::gate_closed_error(&prefix));}
                 match gate.readers.get(&lease.reader_id){
                     Some((epoch,expiry)) if *epoch==lease.epoch&&*expiry>ts::now_secs()=>{},
@@ -2305,7 +2649,7 @@ impl NativeObjectStore {
     /// can be served for a key that already resolved elsewhere.
     pub fn open_local_leased_asset<'a>(&'a self,prefix:&'a ObjectPrefix,lease:&'a GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<(ObjectMetadata,AssetStream)>>>{
         let this=self.clone();let prefix=prefix.clone();let lease=lease.clone();let key=key.clone();Box::pin(async move{
-            let opened=run_blocking(move||this.with_reader_gate(&prefix,|gate|{
+            let opened=run_blocking(move||this.with_reader_gate_read(&prefix,|gate|{
                 if !prefix.matches(&key)||gate.owner.is_some()||gate.epoch!=lease.epoch{return Err(af::gate_closed_error(&prefix));}
                 match gate.readers.get(&lease.reader_id){
                     Some((epoch,expiry)) if *epoch==lease.epoch&&*expiry>ts::now_secs()=>{},
@@ -2458,6 +2802,17 @@ impl NovelAccessFence for NativeObjectStore {
         for row in page.objects{let Some(bytes)=self.read_small(&row.key).await?else{continue;};let gate:FsGate=serde_json::from_slice(&bytes).map_err(|error|NarouError::Platform(error.to_string()))?;if let Some(owner)=gate.owner.filter(|owner|owner.starts_with("remove-v1:")){af::parse_removal_owner(&owner)?;out.push((ObjectPrefix::new(gate.prefix.ok_or_else(||NarouError::Platform("removal gate prefix missing".into()))?)?,owner,gate.epoch));}}
         Ok((out,page.next_cursor))
     })}
+    /// Writer admission must leave durable gate state: the read-only
+    /// `gate_info` path no longer creates the file, but later
+    /// `namespace_state_locked`/origin binds read it directly. Capture keeps
+    /// the write-back (creating) reader path, which also performs the
+    /// SQL-authority check.
+    fn capture_writer<'a>(&'a self, prefix: &'a ObjectPrefix) -> PlatformFuture<'a, Result<crate::platform::WriteFence>> {
+        Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate(prefix, |gate| {
+            if gate.owner.is_some() { return Err(af::novel_busy_error(prefix)); }
+            Ok(crate::platform::WriteFence::new(prefix.clone(), gate.epoch))
+        })) })
+    }
     fn rebind_writer<'a>(&'a self,prefix:&'a ObjectPrefix,expected_epoch:u64)->PlatformFuture<'a,Result<crate::platform::WriteFence>>{Box::pin(async move{run_scoped_blocking(||self.with_gate(prefix,|gate|{if gate.owner.is_some()||gate.epoch!=expected_epoch{return Err(af::gate_epoch_error(prefix,expected_epoch,gate.epoch));}Ok(crate::platform::WriteFence::new(prefix.clone(),expected_epoch))}))})}
     fn admit_reader<'a>(&'a self, prefix: &'a ObjectPrefix, id: &'a str, ttl: i64) -> PlatformFuture<'a, Result<GateLease>> {
         Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate(prefix, |gate| {
@@ -2494,7 +2849,7 @@ impl NovelAccessFence for NativeObjectStore {
         })) })
     }
     fn gate_info<'a>(&'a self, prefix: &'a ObjectPrefix) -> PlatformFuture<'a, Result<GateInfo>> {
-        Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate(prefix, |gate| Ok(GateInfo { epoch: gate.epoch, content_revision:gate.content_revision,
+        Box::pin(async move { run_scoped_blocking(|| self.with_reader_gate_read(prefix, |gate| Ok(GateInfo { epoch: gate.epoch, content_revision:gate.content_revision,
             state: if gate.owner.is_some() { GateState::Closed } else { GateState::Open }, pending_readers: gate.readers.len() as u32, owner: gate.owner.clone(), updated_at: gate.updated_at }))) })
     }
     fn close_gate<'a>(&'a self, prefix: &'a ObjectPrefix, owner: &'a str) -> PlatformFuture<'a, Result<u64>> {
@@ -2535,6 +2890,47 @@ impl NovelAccessFence for NativeObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_write_reports_replace_failure_without_exposing_root() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_owned()).unwrap();
+        let key = ObjectKey::try_new("books/chapter.yaml").unwrap();
+        let target = store.resolve_path(&key).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep"), b"original").unwrap();
+
+        let error = store.write_small_blocking(&key, b"replacement".to_vec()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("replace destination for object \"books/chapter.yaml\""));
+        assert!(!message.contains(&*root.path().file_name().unwrap().to_string_lossy()));
+        assert_eq!(
+            crate::application::jobs::classify_failure(&error),
+            crate::application::jobs::JobFailureClass::Retryable,
+        );
+        let NarouError::ObjectIo { source, .. } = error else { panic!("expected contextual I/O error") };
+        assert!(source.raw_os_error().is_some());
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"original");
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn object_write_redacts_paths_added_by_tempfile() {
+        let root = tempfile::tempdir().unwrap();
+        let key = ObjectKey::try_new("missing/chapter.yaml").unwrap();
+        let target = root.path().join(key.as_ref());
+        let error = atomic_write_bytes_with(&target, b"data", |operation, source| {
+            object_io_error(&key, operation, source)
+        })
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("create temporary file for object \"missing/chapter.yaml\""));
+        assert!(!message.contains(&*root.path().file_name().unwrap().to_string_lossy()));
+        let NarouError::ObjectIo { source, .. } = error else { panic!("expected contextual I/O error") };
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        assert!(source.to_string().contains(" at path "));
+    }
 
     #[test]
     fn transfer_checkpoint_survives_reopen_and_rewinds_unreceipted_tail(){
@@ -3228,6 +3624,72 @@ mod tests {
             seen.clear();
             visit_namespace_gates(root.path(), &conn.lock(), |p, closed, _, epoch, _| { seen.push((p.to_owned(), closed, epoch)); Ok(()) }).unwrap();
             assert_eq!(seen, vec![("novels/site/visit".to_string(), false, 2u64)]);
+        });
+    }
+
+    /// issue #58: the scan cache must survive a content-only gate write
+    /// (content_revision is not scan-relevant) and must be invalidated by a
+    /// scan-relevant change (a closed namespace).
+    #[test]
+    fn gate_scan_cache_ignores_content_writes_and_follows_authority_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = crate::native::sqlite::open_in_memory().unwrap();
+        let archive = root.path().join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+        let mirror = NativeObjectStore::from_root(archive.clone()).unwrap();
+        let prefix = ObjectPrefix::new("novels/site/cached/").unwrap();
+        futures::executor::block_on(async {
+            mirror.rebind_writer(&prefix, 0).await.unwrap();
+            gate_origin::bind_fs_gate_origin_locked(root.path(), &prefix, "https://example.test/").unwrap();
+            let mut seen = Vec::new();
+            visit_namespace_gates(root.path(), &conn.lock(), |p, closed, _, epoch, _| { seen.push((p.to_owned(), closed, epoch)); Ok(()) }).unwrap();
+            assert_eq!(seen, vec![("novels/site/cached".to_string(), false, 0u64)]);
+            // The first scan populated the cache under this revision.
+            let revision = read_gate_revision(&archive).unwrap();
+            assert_eq!(revision % 2, 0, "a published revision must be even");
+
+            // A content-only write (content_revision) keeps the revision: the
+            // scan cache stays valid, so the scan costs one small file read.
+            let keys = crate::platform::NovelObjectKeys::new("site", "cached", false).unwrap();
+            mirror.write_small_guarded(&crate::platform::WriteFence::new(prefix.clone(), 0), &keys.toc(), b"title: x\n".to_vec()).await.unwrap();
+            assert_eq!(read_gate_revision(&archive).unwrap(), revision, "a content-only gate write must not invalidate the scan");
+
+            // A closed namespace is scan-relevant: the revision advances and
+            // the next scan must observe the closed gate.
+            mirror.close_gate(&prefix, "remove-v1:1:1").await.unwrap();
+            assert!(read_gate_revision(&archive).unwrap() > revision, "closing a namespace must invalidate the scan");
+            seen.clear();
+            visit_namespace_gates(root.path(), &conn.lock(), |p, closed, _, epoch, _| { seen.push((p.to_owned(), closed, epoch)); Ok(()) }).unwrap();
+            assert_eq!(seen, vec![("novels/site/cached".to_string(), true, 1u64)]);
+        });
+    }
+
+    /// issue #58: an odd (in-flight or crashed) revision must never serve a
+    /// cached scan, and a crashed writer must be sealed by the next writer.
+    #[test]
+    fn gate_scan_cache_refuses_odd_revision_and_seals_a_crashed_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+        let mirror = NativeObjectStore::from_root(archive.clone()).unwrap();
+        let prefix = ObjectPrefix::new("novels/site/odd/").unwrap();
+        futures::executor::block_on(async {
+            mirror.rebind_writer(&prefix, 0).await.unwrap();
+            gate_origin::bind_fs_gate_origin_locked(root.path(), &prefix, "https://example.test/").unwrap();
+            let conn = crate::native::sqlite::open_in_memory().unwrap();
+            visit_namespace_gates(root.path(), &conn.lock(), |_, _, _, _, _| { Ok(()) }).unwrap();
+            // Simulate a crashed writer: the seqlock stays odd.
+            write_gate_revision(&archive, 7).unwrap();
+            assert_eq!(read_gate_revision(&archive).unwrap(), 7);
+            // A write that changes nothing scan-relevant does not touch the
+            // counter: the odd value only disables the cache, it never
+            // breaks correctness.
+            mirror.rebind_writer(&prefix, 0).await.unwrap();
+            assert_eq!(read_gate_revision(&archive).unwrap(), 7, "a no-op gate write must not disturb the counter");
+            // The next scan-relevant mutation seals the crashed predecessor
+            // first and then publishes an even value again.
+            mirror.close_gate(&prefix, "remove-v1:1:1").await.unwrap();
+            let revision = read_gate_revision(&archive).unwrap();
+            assert_eq!(revision % 2, 0, "a writer must seal a crashed predecessor");
+            assert!(revision > 7, "the sealed revision must advance past the crashed value");
         });
     }
 

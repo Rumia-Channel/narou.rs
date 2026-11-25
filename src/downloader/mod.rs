@@ -2817,9 +2817,11 @@ impl Downloader {
                     }
                     updated.set_attribute_tag(work_type.tag());
                     let merged_id = updated.id;
-                    self.novels
-                        .apply_batch_guarded(write.fence(), vec![NovelMutation::Upsert(updated)])
-                        .await?;
+                    if updated != existing {
+                        self.novels
+                            .apply_batch_guarded(write.fence(), vec![NovelMutation::Upsert(updated)])
+                            .await?;
+                    }
                     merged_id
                 }
                 None => {

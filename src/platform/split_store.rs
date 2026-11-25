@@ -143,6 +143,11 @@ impl ObjectStore for SplitStore {
     fn retire_legacy_guarded<'a>(&'a self,fence:&'a super::WriteFence,logical:&'a ObjectKey,pool:&'a ObjectKey,size:u64,sha:&'a str)->PlatformFuture<'a,Result<()>>{self.pair_for(logical).objects.retire_legacy_guarded(fence,logical,pool,size,sha)}
     fn update_small_guarded<'a,'data:'a>(&'a self,fence:&'a super::WriteFence,key:&'a ObjectKey,mutate:&'a mut SmallObjectMutator<'data>)->PlatformFuture<'a,Result<ObjectUpdateResult>>{self.pair_for(key).objects.update_small_guarded(fence,key,mutate)}
     fn access_fence(&self) -> Option<&dyn super::NovelAccessFence> { self.primary.objects.access_fence() }
+    /// Route to the side that owns `key`; only the Fs-backed side yields a
+    /// real file (remote illustrations return `None` → snapshot copies them).
+    fn native_source_path(&self, key: &ObjectKey) -> Option<std::path::PathBuf> {
+        self.pair_for(key).objects.native_source_path(key)
+    }
     fn read_stream_leased<'a>(&'a self, prefix: &'a ObjectPrefix, lease: &'a super::GateLease, key: &'a ObjectKey, range: std::ops::Range<u64>) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
         let pair = self.pair_for(key);
         if Arc::ptr_eq(&pair.objects, &self.primary.objects) { return pair.objects.read_stream_leased(prefix,lease,key,range); }

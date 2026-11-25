@@ -145,7 +145,7 @@ fn collect_virtual_input_files(
     let mut files = Vec::new();
         for name in crate::transfer::VIRTUAL_INPUT_FILES {
             let key=keys.prefix().join(name)?;let destination=temporary.path().join(name);
-            if block_on(crate::native::materialization::copy_asset(store,lease,&key,&destination))?{files.push((name.to_string(),destination));}
+            if block_on(crate::native::materialization::copy_asset(store,lease,&key,&destination,None))?{files.push((name.to_string(),destination));}
         }
     Ok((temporary, files))
 }
