@@ -20,7 +20,7 @@ impl NativeStore{
             Self::Fs(store)=>{let path=store.gate_path(&fence.prefix)?;let mut gate:FsGate=serde_json::from_slice(&fs::read(&path)?).map_err(|error|NarouError::Platform(error.to_string()))?;
                 if gate.migrated{return Err(af::gate_closed_error(&fence.prefix));}match store.live_sql_authority(&fence.prefix,gate.epoch,&gate.origin_url_fold)?{SqlGateAuthority::Superseded|SqlGateAuthority::Conflict=>return Err(af::gate_closed_error(&fence.prefix)),_=>{}}if gate.owner.as_deref()==Some(owner)&&gate.epoch==next{return Ok(next);}
                 if gate.owner.is_some()||gate.epoch!=fence.epoch{return Err(af::gate_epoch_error(&fence.prefix,fence.epoch,gate.epoch));}
-                gate.prefix=Some(fence.prefix.as_ref().trim_end_matches('/').into());gate.epoch=next;gate.owner=Some(owner.into());gate.updated_at=ts::now_secs();atomic_write_bytes(&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;sync_transfer_parent(&path)?;Ok(next)
+                gate.prefix=Some(fence.prefix.as_ref().trim_end_matches('/').into());gate.epoch=next;gate.owner=Some(owner.into());gate.updated_at=ts::now_secs();crate::native::object_store::write_gate_file(&store.root,&path,&serde_json::to_vec(&gate).map_err(|error|NarouError::Platform(error.to_string()))?)?;Ok(next)
             },
             Self::Sqlite(_)=>{let connection=connection.ok_or_else(||NarouError::Platform("SQL removal has no metadata transaction".into()))?;let next=i64::try_from(next).map_err(|_|NarouError::Platform("SQL gate epoch exhausted".into()))?;
                 crate::native::sqlite::object_store::require_transfer_epoch(connection,&fence.prefix,None,fence.epoch,false)?;let changed=connection.execute("UPDATE novel_access_gates SET closed=1,owner=?1,epoch=?2,updated_at=unixepoch() WHERE prefix=?3 AND closed=0 AND epoch=?4",rusqlite::params![owner,next,fence.prefix.as_ref().trim_end_matches('/'),i64::try_from(fence.epoch).map_err(|_|NarouError::Platform("SQL gate epoch exhausted".into()))?]).map_err(crate::native::sqlite::sqlite_error)?;if changed!=1{return Err(af::gate_closed_error(&fence.prefix));}Ok(next as u64)
@@ -108,6 +108,7 @@ pub(crate) fn record_sql_gate_handoff(connection:&rusqlite::Connection,prefix:&s
 /// table = never cut over this way, SQL stays authoritative.
 /// Returns `(fs_epoch, fs_origin_fold)` of the recorded handoff so the caller
 /// can match it against the actual FS gate it found.
+#[cfg(test)]
 pub(crate) fn read_fs_gate_handoff(connection:&rusqlite::Connection,prefix:&str,sql_epoch:u64)->Result<Option<(u64,String)>>{
     use rusqlite::OptionalExtension;
     let table:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='fs_gate_handoffs')",[],|row|row.get(0)).map_err(crate::native::sqlite::sqlite_error)?;

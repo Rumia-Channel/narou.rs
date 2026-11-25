@@ -59,5 +59,5 @@ fn update(root:&Path,prefix:&ObjectPrefix,rebind:Option<(u64,&str)>,new:&str)->R
     if origin==new&&stored_prefix.is_some(){return Ok(());}
     let encoded_origin=RawValue::from_string(serde_json::to_string(new).map_err(json_error)?).map_err(json_error)?;let encoded_prefix=RawValue::from_string(serde_json::to_string(prefix.as_ref().trim_end_matches('/')).map_err(json_error)?).map_err(json_error)?;
     fields.insert("origin_url_fold".into(),&encoded_origin);if stored_prefix.is_none(){fields.insert("prefix".into(),&encoded_prefix);}
-    atomic_write_bytes(&path,&serde_json::to_vec(&fields).map_err(json_error)?)?;sync_transfer_parent(&path)
+    super::write_gate_file(&root.join(crate::downloader::types::ARCHIVE_ROOT_DIR),&path,&serde_json::to_vec(&fields).map_err(json_error)?)
 }

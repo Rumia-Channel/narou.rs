@@ -3,7 +3,9 @@ use crate::platform::{NovelId,NovelIdReservation,ObjectPrefix,WriteFence};
 fn record(id:i64)->NovelRecord{serde_json::from_value(serde_json::json!({"id":id,"author":"author","title":"title","file_title":"target","toc_url":"https://example.test/book/","sitename":"Test","last_update":"2026-11-15T00:00:00Z"})).unwrap()}
 fn prefix(record:&NovelRecord)->ObjectPrefix{ObjectPrefix::from(NovelObjectKeys::new(&record.sitename,&record.file_title,record.use_subdirectory).unwrap().prefix().clone())}
 fn store_gate(root:&std::path::Path,prefix:&ObjectPrefix,epoch:u64,closed:bool,owner:Option<&str>,origin:&str){
-    let prefix=prefix.as_ref().trim_end_matches('/');let directory=root.join(crate::downloader::types::ARCHIVE_ROOT_DIR).join(".objects/.narou-transfer/.gate");std::fs::create_dir_all(&directory).unwrap();let owner=if closed{Some(owner.unwrap_or("test-closed-owner"))}else{None};std::fs::write(directory.join(crate::application::transfer::sha256_hex(prefix.as_bytes())),serde_json::to_vec(&serde_json::json!({"prefix":prefix,"epoch":epoch,"owner":owner,"origin_url_fold":origin,"updated_at":0,"readers":{},"content_revision":0,"migrated":false})).unwrap()).unwrap();
+    // Write through the production gate writer so the scan-invalidation
+    // counter advances exactly like a real gate mutation does (issue #58).
+    let prefix=prefix.as_ref().trim_end_matches('/');let archive_root=root.join(crate::downloader::types::ARCHIVE_ROOT_DIR);let directory=archive_root.join(".objects/.narou-transfer/.gate");std::fs::create_dir_all(&directory).unwrap();let owner=if closed{Some(owner.unwrap_or("test-closed-owner"))}else{None};let path=directory.join(crate::application::transfer::sha256_hex(prefix.as_bytes()));crate::native::object_store::write_gate_file(&archive_root,&path,&serde_json::to_vec(&serde_json::json!({"prefix":prefix,"epoch":epoch,"owner":owner,"origin_url_fold":origin,"updated_at":0,"readers":{},"content_revision":0,"migrated":false})).unwrap()).unwrap();
 }
 
 #[test]
