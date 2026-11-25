@@ -1,0 +1,16 @@
+name: 機能追加・改善の要望
+description: narou.rs に追加してほしい機能や、改善してほしい点を提案する
+body:
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 追加・改善してほしいこと
+      description: どんな操作や動作ができるようになるとよいか教えてください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: 利用場面・困っていること（任意）
+      description: どんな場面で役立つか、今はどう対応しているかなどを、分かる範囲で教えてください。
