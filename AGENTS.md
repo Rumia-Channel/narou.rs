@@ -153,7 +153,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
   1. `cargo clippy --workspace --all-targets --all-features -- -D warnings` とビルドで警告を確認し、警告を解消する。依存更新で新しく出た警告も対象。
   2. `cargo update` でワークスペースの依存を更新する。`about-probe` も `cargo update --manifest-path about-probe/Cargo.toml` で更新し、両方の `Cargo.lock` を同じコミットに含める。
   3. 依存更新後に `cargo test --workspace` / clippy / Worker wasm / ライセンス再生成 (`cargo about`) を実行し、結果を確認する。更新で壊れた API はこの時点で直す。
-- **0.0.x（パッチ版）では、依存更新 (`cargo update`) とライセンス再生成 (`cargo about`) は必須ではない。** 既存依存のままリリースしてよい。依存を変更した場合に限り、`Cargo.lock` / `about-probe/Cargo.lock` と `Third-Party-License*.md` を同じコミットで更新する。
+- **0.0.x（パッチ版）では、依存更新 (`cargo update`) は必須ではない。** 依存を変更しない場合も、版数更新と同じコミットで `Cargo.lock` / `about-probe/Cargo.lock` と `Third-Party-License*.md` の自プロジェクトの版数を同期する。タグを push する前に、`about.hbs` の手順でライセンス生成結果が CI と一致することを確認する。
 - パッチ版でも `cargo clippy --workspace --all-targets --all-features -- -D warnings` と `cargo test --workspace` による確認は行う（依存更新を伴わないなら clippy の警告対応は不要だが、既存の警告がないことを確認する）。
 - 依存更新はリリースとは独立した単位でよい。依存更新だけのコミットをリリースのコミットに混在させない。
 
