@@ -1,0 +1,61 @@
+name: 不具合報告
+description: narou.rs で発生した不具合を報告する
+body:
+  - type: input
+    id: version
+    attributes:
+      label: narou.rs のバージョン
+      description: CLI では `narou version` で確認できます。分からない場合は「不明」と入力してください。
+      placeholder: 例）v0.6.13
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - その他・不明
+    validations:
+      required: true
+
+  - type: dropdown
+    id: edition
+    attributes:
+      label: 使用している版
+      options:
+        - 通常版（非 GPL）
+        - GPL 版（Lite 組み込み）
+        - 該当なし（Workers）
+        - 不明
+    validations:
+      required: true
+
+  - type: dropdown
+    id: storage
+    attributes:
+      label: データ管理方式・実行環境
+      options:
+        - YAML
+        - SQLite
+        - Cloudflare Workers
+        - 不明
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 起きたこと
+      description: 何をしたときに何が起きたか、期待していた動作とあわせて教えてください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: 再現手順・ログ（任意）
+      description: 分かる範囲で、実行したコマンド、操作手順、エラーメッセージなどを記載してください。Cookie、トークン、鍵などの認証情報は貼らないでください。
