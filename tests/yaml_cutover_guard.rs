@@ -574,6 +574,14 @@ fn cutover_succeeds_with_over_1100_novel_access_gates() {
     let archive = root.join(narou_rs::downloader::ARCHIVE_ROOT_DIR);
     assert!(fs_gate_path(&archive, "novels/site/book_0000").is_file());
     assert!(fs_gate_path(&archive, "novels/site/book_1199").is_file());
+    // A completed batch must leave the scan-invalidation seqlock even: an
+    // odd value degrades every later gate scan to the uncached walk (issue #58).
+    let revision: u64 = std::fs::read_to_string(archive.join(".objects/.narou-transfer/gate-revision"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(revision % 2, 0, "the adoption batch seals the seqlock even");
 }
 
 #[test]

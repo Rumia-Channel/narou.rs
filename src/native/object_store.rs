@@ -681,6 +681,50 @@ impl GateRevisionWrite {
     }
 }
 
+/// Holds the global gate-revision lock across a batch of gate-file mutations
+/// (mass cutover / adoption). The seqlock turns odd when the batch begins and
+/// even only once at `finish`, so readers see an odd value for the entire
+/// batch and never cache a half-written gate directory. Writes in the batch
+/// skip the per-file parent sync because the caller performs the single
+/// `.gate/` directory sync before `finish` (issue #58).
+pub(crate) struct GateRevisionBatch {
+    archive_root: PathBuf,
+    next: u64,
+    _lock: fs::File,
+}
+impl GateRevisionBatch {
+    /// Write one `.gate/` file inside the batch: no counter work, no parent
+    /// sync. The batch's odd-to-even transition plus the caller's directory
+    /// sync carry the whole batch.
+    pub(crate) fn write_gate(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        atomic_write_bytes(path, bytes)
+    }
+    /// Seal the seqlock even. Must run after the caller's `.gate/` directory
+    /// sync so the published even value covers every rename in the batch.
+    pub(crate) fn finish(self) -> Result<()> {
+        write_gate_revision(&self.archive_root, self.next)
+    }
+}
+
+/// Begin a batched gate mutation. Like [`begin_gate_revision_write`], the
+/// seqlock seals a crashed predecessor first and turns odd for the duration
+/// of the batch; the caller must run [`GateRevisionBatch::finish`] exactly
+/// once after the `.gate/` directory sync.
+pub(crate) fn begin_gate_revision_batch(archive_root: &Path) -> Result<GateRevisionBatch> {
+    let lock_path = gate_revision_lock_path(archive_root);
+    if let Some(parent) = lock_path.parent() { fs::create_dir_all(parent)?; }
+    let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let mut current = read_gate_revision(archive_root)?;
+    if current % 2 == 1 {
+        current = current.checked_add(1).ok_or_else(|| NarouError::Platform("gate revision overflow".into()))?;
+        write_gate_revision(archive_root, current)?;
+    }
+    let odd = current.checked_add(1).ok_or_else(|| NarouError::Platform("gate revision overflow".into()))?;
+    write_gate_revision(archive_root, odd)?;
+    Ok(GateRevisionBatch { archive_root: archive_root.to_path_buf(), next: odd.checked_add(1).ok_or_else(|| NarouError::Platform("gate revision overflow".into()))?, _lock: lock })
+}
+
 pub(crate) fn content_type_for_path(path: &Path) -> Option<&'static str> {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -1978,6 +2022,19 @@ impl NativeObjectStore {
         self.ensure_parent_dir(path)?;
         write_gate_file(&self.root,path,&serde_json::to_vec(gate).map_err(|error|NarouError::Platform(error.to_string()))?)
     }
+
+    /// Batched variant of [`Self::install_adopted_gate_nosync`]: the same
+    /// validation, but the file is written through `batch` (no per-file
+    /// counter work or parent sync). The caller must sync the `.gate/`
+    /// directory and run [`GateRevisionBatch::finish`] once the batch is
+    /// complete (issue #58: 1200-file cutovers cannot afford 1200 exclusive
+    /// lock-and-fsync cycles).
+    pub(crate) fn install_adopted_gate_batch(&self,path:&Path,prefix:&ObjectPrefix,gate:&FsGate,connection:&rusqlite::Connection,batch:&GateRevisionBatch)->Result<()>{
+        self.require_adopted_gate_target(path,prefix,gate,connection)?;
+        self.ensure_parent_dir(path)?;
+        batch.write_gate(path,&serde_json::to_vec(gate).map_err(|error|NarouError::Platform(error.to_string()))?)
+    }
+
 
     /// Durable intent journal for the SQL→FS adoption of `prefix`: a
     /// `.gate.pending/<sha256>` file written inside the intent transaction
