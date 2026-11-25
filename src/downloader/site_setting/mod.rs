@@ -1104,10 +1104,10 @@ impl SiteSetting {
     pub fn author_novel_entry_count(&self, source: &str) -> usize {
         let mut entries = 0;
         for line in source.lines() {
-            if let Some(url) = line.trim().strip_prefix(AUTHOR_NOVEL_MARKER) {
-                if !crate::downloader::util::decode_html_text(url.trim()).is_empty() {
-                    entries += 1;
-                }
+            if let Some(url) = line.trim().strip_prefix(AUTHOR_NOVEL_MARKER)
+                && !crate::downloader::util::decode_html_text(url.trim()).is_empty()
+            {
+                entries += 1;
             }
         }
         if let Some(pattern) = self.compiled_author_novel.as_ref() {
