@@ -21,6 +21,12 @@ permissions:
 
 
 env:
+  # crates.io などへのダウンロードの一時的なネットワーク障害で CI が落ちるのを防ぐ。
+  # デフォルトの再試行回数 (3) だと macos-15-intel のような不安定なランナーの
+  # 数分の DNS 停止を吸収できない (v0.6.12 のリリース失敗)。
+  CARGO_NET_RETRY: "10"
+  # curl 8.x の HTTP/2 多重化で "transfer too slow" の偽発生が多発するため無効化。
+  CARGO_HTTP_MULTIPLEXING: "false"
   # worker-build のピン。キャッシュのキーにも使う。
   WORKER_BUILD_VERSION: 0.8.5
 
