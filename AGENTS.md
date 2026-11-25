@@ -570,11 +570,11 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 
 ### Worker の CI デプロイ (2026-09)
 
-- `.github/workflows/platform.yml` の `worker-deploy-{develop,production}`。きっかけは
-  `develop` push / タグ push（+ 手動 dispatch）。staging 環境は持たない。GitHub Environments は
-  用途で `Cloudflare`（Workers の secret と vars）と `CodeSining`（release の署名）の 2 つだけを使い、
-  target は `NAROU_DEPLOY_TARGET` で切り替える（一覧は
-  `docs/cloudflare-workers-migration-plan.md` §2.2.8）。
+- `.github/workflows/platform.yml` の `worker-deploy-{develop,production}` は、`develop` push で
+  develop へ、`main` push で production へ配備する。手動で production を選ぶ場合も `main` に限る。
+  いずれも同じ run の必須検査が通ってから配備し、リリースタグは検証だけを走らせる。
+  staging は持たず、GitHub Environments は `Cloudflare`（Workers）と `CodeSining`（署名）を用途別に使う。
+  target は `NAROU_DEPLOY_TARGET` で切り替える（`docs/cloudflare-workers-migration-plan.md` §2.2.8）。
 - 実体は `worker_entry/ci/deploy_worker.py`（provision → render → migrate → secret 投入 → deploy → smoke）。
   D1/Queue は環境名から導出して冪等に作るので、初回デプロイでも手作業が要らない。
 - 資格情報が無いリポジトリではデプロイだけ理由付きで省略する（テストは走る）。
@@ -741,8 +741,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - `worker_entry/tests/run.mjs` … ビルド → ローカル D1 へ migration → `wrangler dev` → 契約テスト。
   `.dev.vars`（無ければ `NAROU_ADMIN_TOKEN` を書き込む）と `wrangler.test.toml`（`wrangler.toml` から
   `[build]` を外した生成物）は gitignore 済み。
-- CI: `.github/workflows/platform.yml` の `worker-contract`（push で実行）。デプロイは手動トリガーの
-  `worker-deploy`（environment ゲート）で、必要な secret/vars はワークフローのコメント参照。
+- CI: `.github/workflows/platform.yml` の `worker-contract`。`worker-deploy-*` は契約テストを含む
+  必須検査の通過後に動く。配備トリガーは「Worker の CI デプロイ」を参照。
 
 ### Worker 内の変換 (2026-09)
 

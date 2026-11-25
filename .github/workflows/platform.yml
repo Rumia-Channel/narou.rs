@@ -2,10 +2,9 @@ name: Platform portability
 
 on:
   push:
-    # develop 更新で develop 環境へ、v* タグで production 環境へデプロイする
-    # (下の worker-deploy-* を参照)。
+    # develop 更新は develop、main 更新は production にデプロイする。
     branches: [develop, 'feature-*', refactor-platform-abstraction, main]
-    # release.yml と同じタグ集合 (v* と数字始まり) で production へ。
+    # リリースタグでは互換性を検証するだけで、Worker はデプロイしない。
     tags: ["v*", "[0-9]*"]
   pull_request:
   workflow_dispatch:
@@ -351,8 +350,9 @@ jobs:
   worker-deploy-production:
     name: Deploy Worker (production)
     if: >-
-      (github.event_name == 'push' && github.ref_type == 'tag')
-      || (github.event_name == 'workflow_dispatch' && inputs.target == 'production')
+      github.ref == 'refs/heads/main'
+      && (github.event_name == 'push'
+          || (github.event_name == 'workflow_dispatch' && inputs.target == 'production'))
     needs: [native, native-gpl, wasm, worker, worker-contract, license]
     runs-on: ubuntu-latest
     concurrency:
