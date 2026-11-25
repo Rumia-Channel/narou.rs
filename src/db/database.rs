@@ -370,6 +370,22 @@ impl Database {
         })
     }
 
+    pub(crate) fn update_record_with_fence(
+        &mut self, fence: &crate::platform::WriteFence, id: crate::platform::NovelId,
+        update: impl FnOnce(&mut NovelRecord) -> Result<()>,
+    ) -> Result<bool> {
+        let mutation = record_mutation::RecordMutation::ExistingRow { fence, id };
+        self.update_records_inner(false, None, Some(mutation), |mut records, members| {
+            let found = if let Some(record) = records.get_mut(&id.0) {
+                update(record)?;
+                true
+            } else {
+                false
+            };
+            Ok((records, members, found))
+        })
+    }
+
     /// Publish virtual membership, parent metadata and tag registration together.
     #[cfg(test)]
     pub(crate) fn update_virtual_records<T, F>(&mut self, update: F) -> Result<T>
@@ -603,7 +619,13 @@ impl Database {
                     if let Some(marker) = transfer_marker {
                         crate::native::sqlite::content::invalidate_transfer_projection(&tx, marker.novel_id.0)?;
                     }
-                    crate::native::sqlite::bulk::replace_records_conn(&tx, &updated)?;
+                    if !compat && let Some(record_mutation::RecordMutation::ExistingRow { id, .. }) = mutation {
+                        if let Some(record) = updated.get(&id.0) {
+                            crate::native::sqlite::bulk::upsert_record_conn(&tx, record)?;
+                        }
+                    } else {
+                        crate::native::sqlite::bulk::replace_records_conn(&tx, &updated)?;
+                    }
                     record_claims.finish_sql(&tx)?;
                     // 連番表を作品と同じトランザクションで確定する。別の
                     // トランザクションにすると「作品を保存した順」と「連番を
@@ -724,9 +746,9 @@ impl Database {
         let yaml_path = self.inventory.inventory_path(DATABASE_NAME, InventoryScope::Local);
         // 連番表のロックを先に取り、作品の書き込みと同じ直列化境界の中で
         // 連番表も確定する (別に更新すると順序が作品とずれる)。
-        let result = crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
+        let (result, updated) = crate::db::inventory::with_exclusive_file_lock(&sequence_path, || {
             let operation = || crate::db::inventory::with_exclusive_file_lock(&yaml_path, || {
-                let (result, record_claims) = LockedFileUpdates::run(&self.inventory, transfer_marker, true, |files| {
+                let (result, record_claims, content, updated) = LockedFileUpdates::run(&self.inventory, transfer_marker, true, |files| {
                     let raw = files.original(&yaml_path)?.unwrap_or_default();
                     let current = (*self.inventory.parse_novel_records(raw.into())?).clone();
                     *before_library.borrow_mut() =
@@ -755,7 +777,8 @@ impl Database {
                         files.write(path, &crate::db::inventory::serialize_yaml_content(&members)?)?;
                     }
                     crate::native::tag_sequence::notify_record_save_hook()?;
-                    files.write(&yaml_path, &crate::db::inventory::serialize_yaml_content(&updated)?)?;
+                    let content = crate::db::inventory::serialize_yaml_content(&updated)?;
+                    files.write(&yaml_path, &content)?;
                     id_reservations::retire_yaml(self, &updated)?;
                     files.publish_transfer()?;
                     if let Some(marker) = transfer_marker {
@@ -777,19 +800,19 @@ impl Database {
                         };
                         committed?;
                     }
-                    Ok((result, record_claims))
+                    Ok((result, record_claims, content, updated))
                 })?;
                 record_claims.finish_yaml(self.inventory.root_dir())?;
-                Ok(result)
+                let updated = Arc::new(updated);
+                self.inventory.remember_novel_records(content, Arc::clone(&updated));
+                Ok((result, updated))
             });
             if let Some(path) = members_path.as_deref() {
                 crate::db::inventory::with_exclusive_file_lock(path, operation)
             } else { operation() }
         })?;
-        self.refresh()?;
-        if !self.using_sqlite() {
-            self.index.flush(&self.inventory)?;
-        }
+        self.replace_record_snapshot(updated);
+        self.index.flush(&self.inventory)?;
         Ok(result)
     }
 

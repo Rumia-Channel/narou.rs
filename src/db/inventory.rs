@@ -155,6 +155,12 @@ impl Inventory {
         Ok(Arc::clone(&snapshot.records))
     }
 
+    /// Seed the parser cache with this writer's committed YAML and typed
+    /// postimage. Authoritative readers still compare the current file bytes.
+    pub(crate) fn remember_novel_records(&self, source: String, records: Arc<BTreeMap<i64, NovelRecord>>) {
+        *self.novel_records.lock() = NovelRecordSnapshot { source, records };
+    }
+
     fn cache_key(name: &str, scope: InventoryScope) -> CacheKey {
         CacheKey {
             name: name.to_string(),

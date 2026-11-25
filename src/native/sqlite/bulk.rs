@@ -13,7 +13,7 @@ use crate::db::NovelRecord;
 use crate::error::Result;
 
 use super::record_map::record_from_row;
-use super::repository::upsert_record_conn;
+pub(crate) use super::repository::upsert_record_conn;
 use super::sqlite_error;
 
 /// Maximum number of ids bound into one `DELETE ... IN (...)` statement.

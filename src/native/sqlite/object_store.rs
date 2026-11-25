@@ -387,14 +387,16 @@ impl SqliteObjectStore {
         Ok(keys)
     }
 
-    fn list_blocking(&self, request: &ObjectListRequest) -> Result<ObjectListPage> {
+    fn list_blocking(&self, request: &ObjectListRequest, paged: bool) -> Result<ObjectListPage> {
         let mut merged: BTreeMap<String, ObjectMetadata> = BTreeMap::new();
         // Fetch only this SQL page plus one lookahead row. Merging the first
         // limit + 1 database keys with filesystem fallbacks preserves DB wins.
         let base = request.prefix.as_ref().trim_end_matches('/');
         let lower = if base.is_empty() { String::new() } else { format!("{base}/") };
         let upper=if base.is_empty(){prefix_upper_bound(&lower)}else{format!("{base}0")};
-        let limit=request.limit.get().min(100);let cap=(limit+1) as i64;
+        let limit = request.limit.get().min(100);
+        // SQLite LIMIT -1 means no row limit for a Native-only listing.
+        let cap = if paged { (limit + 1) as i64 } else { -1 };
         {
             let conn = self.conn.lock();
             let mut statement = conn
@@ -432,6 +434,12 @@ impl SqliteObjectStore {
         // mirror modes: that is the same fallback `stat`/`read_small`/
         // `read_stream` use, so a listed key and a readable key always agree.
         // Rows win, so a stale file never overrides stored content.
+        if !paged {
+            for (key, metadata) in self.mirror.collect_listing(request, None)? {
+                merged.entry(key).or_insert(metadata);
+            }
+            return Ok(ObjectListPage { objects: merged.into_values().collect(), next_cursor: None });
+        }
         let files=self.mirror.list_window_blocking(request,limit+1)?;
         for metadata in files.objects{merged.entry(metadata.key.to_string()).or_insert(metadata);}
         let objects: Vec<ObjectMetadata> = merged.into_values().collect();
@@ -907,7 +915,13 @@ impl ObjectStore for SqliteObjectStore {
     ) -> PlatformFuture<'a, Result<ObjectListPage>> {
         let this = self.clone();
         let request = request.clone();
-        run_blocking(move || this.list_blocking(&request))
+        run_blocking(move || this.list_blocking(&request, true))
+    }
+
+    fn list_for_native_operation<'a>(&'a self, request: &'a ObjectListRequest) -> PlatformFuture<'a, Result<ObjectListPage>> {
+        let this = self.clone();
+        let request = request.clone();
+        run_blocking(move || this.list_blocking(&request, false))
     }
 }
 
@@ -2680,6 +2694,45 @@ mod tests {
             .collect();
         assert!(keys.contains(&"novels/site/a/toc.yaml".to_string()));
         assert!(keys.contains(&"novels/site/b/toc.yaml".to_string()));
+    }
+
+    #[test]
+    fn native_operation_lists_large_mixed_inventory_in_key_order() {
+        let (dir, mut store) = temp_store();
+        store.mirror_files = false;
+        let keys = crate::platform::NovelObjectKeys::new("site", "title", false).unwrap();
+        let bodies = dir.path().join("site/title/本文");
+        std::fs::create_dir_all(&bodies).unwrap();
+        for index in 1..=125 {
+            std::fs::write(bodies.join(format!("{index:03}.yaml")), b"legacy").unwrap();
+        }
+        let body_key = keys.prefix().join("本文").unwrap();
+        let db_key = body_key.join("001.yaml").unwrap();
+        let next_key = body_key.join("126.yaml").unwrap();
+        futures::executor::block_on(async {
+            store.write_small(&db_key, b"authoritative".to_vec()).await.unwrap();
+            store.write_small(&next_key, b"db".to_vec()).await.unwrap();
+            std::fs::write(bodies.join("001.yaml"), b"stale").unwrap();
+
+            let request = ObjectListRequest::new(
+                ObjectPrefix::from(body_key),
+                NonZeroUsize::new(100).unwrap(),
+            );
+            let fs = store.mirror.list_for_native_operation(&request).await.unwrap();
+            assert_eq!(fs.objects[0].size, 5);
+            assert_eq!(fs.objects.len(), 125, "the SQL-only row must not depend on mirroring");
+            assert!(fs.next_cursor.is_none());
+
+            let page = store.list_for_native_operation(&request).await.unwrap();
+            assert!(page.next_cursor.is_none());
+            assert_eq!(page.objects.len(), 126);
+            assert_eq!(page.objects[0].key, db_key);
+            assert_eq!(page.objects[0].size, 13, "do not surface the stale mirror");
+            assert_eq!(page.objects.last().unwrap().key, next_key);
+            assert!(page.objects.windows(2).all(|pair| pair[0].key.as_ref() < pair[1].key.as_ref()));
+            assert!(store.list_page(&request).await.unwrap().next_cursor.is_some(),
+                "transfer still uses bounded pages");
+        });
     }
 
     #[test]

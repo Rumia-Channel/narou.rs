@@ -7,6 +7,11 @@
 //! version instead of one per section); unified diffs and their compression are
 //! computed *before* the write transaction opens so brotli/TextDiff CPU does
 //! not extend the shared-connection write lock.
+//!
+//! A snapshot of a working set whose logical relation (`idx`, `subtitle`,
+//! `body_hash`) did not change is written without reading any body: the diff
+//! is empty by construction and the new head copies the previous head's rows
+//! with one `INSERT ... SELECT`.
 
 
 use chrono::Utc;
@@ -68,7 +73,14 @@ pub fn snapshot_working_set_in_tx(
     origin: &str,
     note: Option<&str>,
 ) -> Result<i64> {
-    let Some((current, prev_head)) = current_and_prev(conn, novel_id)? else {
+    let prev_head = head_id(conn, novel_id)?;
+    // An unchanged working set renders to the same text as the previous head,
+    // so its diff is empty and its section rows are the previous head's rows.
+    // That case never has to read a body.
+    if let Some(version_id) = snapshot_unchanged_in_tx(conn, novel_id, prev_head, origin, note)? {
+        return Ok(version_id);
+    }
+    let Some(current) = super::content::load_sections(conn, novel_id)? else {
         return Err(NarouError::Platform(
             "version snapshot requires a mirrored working set (novel_sections)".into(),
         ));
@@ -83,13 +95,64 @@ pub fn snapshot_working_set_in_tx(
     store_diff(conn,version_id,prev_head,&diff_stored,diff_encoding)?;Ok(version_id)
 }
 
-fn current_and_prev(conn: &Connection, novel_id: i64) -> Result<Option<(SectionMap, Option<i64>)>> {
-    let working = super::content::load_sections(conn, novel_id)?;
-    let Some(working) = working else {
+/// Snapshot a working set whose logical relation did not change.
+///
+/// The working set's `(idx, subtitle, body_hash)` rows are compared with the
+/// previous head's rows in SQL. Equal rows mean equal rendered text, so the
+/// unified diff is empty and the new head carries the previous head's section
+/// rows via one `INSERT ... SELECT`. Verify the shared bodies once without
+/// loading both novels into memory or rebuilding the full-text diff.
+///
+/// `None` is returned when the fast path does not apply. The caller then
+/// takes the full path, which reads and verifies every body — that path also
+/// keeps the "a missing body row is skipped" behaviour, so a working set with
+/// a missing body never reaches the copy above.
+fn snapshot_unchanged_in_tx(
+    conn: &Connection,
+    novel_id: i64,
+    prev_head: Option<i64>,
+    origin: &str,
+    note: Option<&str>,
+) -> Result<Option<i64>> {
+    let Some(prev_id) = prev_head else {
         return Ok(None);
     };
-    let prev = head_id(conn, novel_id)?;
-    Ok(Some((working, prev)))
+    if !super::content::working_set_matches_version(conn, novel_id, prev_id)? {
+        return Ok(None);
+    }
+    if !super::content::working_set_body_addresses_match(conn, novel_id)? {
+        return Ok(None);
+    }
+    conn.execute(
+        "INSERT INTO novel_versions (novel_id, parent_id, origin, note, created_at) VALUES (?, ?, ?, ?, ?)",
+        params![novel_id, prev_id, origin, note, now_rfc3339()],
+    )
+    .map_err(sqlite_error)?;
+    let version_id = conn.last_insert_rowid();
+    write_version_sections_from_working_set(conn, novel_id, version_id)?;
+    // The diff of an unchanged working set is empty. `compress_object_payload`
+    // encodes an empty payload as no bytes with the `none` codec, which is
+    // exactly what the full path stores for an unchanged set.
+    store_diff(conn, version_id, Some(prev_id), &[], ObjectEncoding::None)?;
+    Ok(Some(version_id))
+}
+
+/// Copy the working set's section rows into one version.
+///
+/// The working set already resolves every body to its content hash, so the
+/// version needs no body read, hash or insert of its own.
+fn write_version_sections_from_working_set(
+    tx: &Connection,
+    novel_id: i64,
+    version_id: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO novel_version_sections (version_id, idx, subtitle, body_hash)
+         SELECT ?1, s.idx, s.subtitle, s.body_hash FROM novel_sections s WHERE s.novel_id = ?2",
+        params![version_id, novel_id],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
 }
 
 /// Latest head id for a novel (`None` before the first snapshot).
@@ -373,6 +436,7 @@ pub fn prune_history(conn: &Connection, novel_id: i64, keep: usize) -> Result<us
 mod tests {
     use super::*;
     use crate::native::sqlite::content::{load_sections, store_sections};
+    use sha2::{Digest, Sha256};
 
     /// Fresh in-memory schema plus the minimal novel row the version tables'
     /// foreign key needs.
@@ -388,6 +452,47 @@ mod tests {
         )
         .unwrap();
         parking_lot::Mutex::new(conn)
+    }
+
+    /// Five ordered sections with distinct bodies.
+    fn sample_sections() -> SectionMap {
+        (1..=5)
+            .map(|index| {
+                (
+                    index.to_string(),
+                    (Some(format!("第{index}話")), format!("body: {index}\n")),
+                )
+            })
+            .collect()
+    }
+
+    /// The rows of one version, in `idx` order.
+    fn version_rows(conn: &Connection, version_id: i64) -> Vec<(String, Option<String>, Vec<u8>)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT idx, subtitle, body_hash FROM novel_version_sections WHERE version_id = ?1 ORDER BY idx",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([version_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.unwrap());
+        }
+        out
+    }
+
+    /// The stored diff of one version: payload bytes and codec.
+    fn diff_row(conn: &Connection, version_id: i64) -> (Vec<u8>, String) {
+        conn.query_row(
+            "SELECT unified_diff, encoding FROM novel_version_diffs WHERE version_id = ?1",
+            [version_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
     }
 
     /// Snapshot/restore/merge keep ordered sections, deduplicated bodies and
@@ -458,5 +563,158 @@ mod tests {
         let pruned = prune_history(&guard, 7, 2).unwrap();
         assert_eq!(pruned, 2);
         assert_eq!(list_versions(&guard, 7).unwrap().len(), 2);
+    }
+
+    /// An unchanged working set still records one history row: the new head
+    /// keeps the previous head as parent, carries the same sections and
+    /// stores the empty diff with the exact encoding of an empty payload.
+    #[test]
+    fn unchanged_working_set_snapshots_an_empty_diff() {
+        let conn = test_conn();
+        let mut guard = conn.lock();
+        let sections = sample_sections();
+        store_sections(&mut guard, 7, &sections).unwrap();
+        let first = snapshot_working_set(&mut guard, 7, "update", None).unwrap();
+        let second = snapshot_working_set(&mut guard, 7, "update", Some("convert")).unwrap();
+
+        let versions = list_versions(&guard, 7).unwrap();
+        assert_eq!(versions.len(), 2, "one history row per snapshot");
+        assert_eq!(versions[0].id, second);
+        assert_eq!(versions[0].parent_id, Some(first));
+        assert_eq!(versions[0].origin, "update");
+        assert_eq!(versions[0].note.as_deref(), Some("convert"));
+        assert_eq!(versions[0].section_count, 5);
+        assert_eq!(version_sections(&guard, second).unwrap().unwrap(), sections);
+
+        // The empty diff is stored like the full path stores it: no bytes
+        // with the `none` codec, and it reads back as an empty diff.
+        let (payload, encoding) = diff_row(&guard, second);
+        assert!(payload.is_empty(), "{payload:?}");
+        assert_eq!(encoding, "none");
+        assert_eq!(version_diff(&guard, 7, second).unwrap().unwrap(), "");
+    }
+
+    /// The unchanged snapshot stores what the full path stores: the same
+    /// section rows and the same diff encoding for the same content.
+    #[test]
+    fn unchanged_snapshot_matches_the_full_path_output() {
+        let conn = test_conn();
+        let mut guard = conn.lock();
+        let sections = sample_sections();
+        store_sections(&mut guard, 7, &sections).unwrap();
+        snapshot_working_set(&mut guard, 7, "update", None).unwrap();
+        let unchanged = snapshot_working_set(&mut guard, 7, "update", None).unwrap();
+
+        // The same content snapshotted as a first version takes the full path.
+        store_sections(&mut guard, 8, &sections).unwrap();
+        let reference = snapshot_working_set(&mut guard, 8, "update", None).unwrap();
+
+        assert_eq!(
+            version_rows(&guard, unchanged),
+            version_rows(&guard, reference)
+        );
+        assert_eq!(diff_row(&guard, unchanged), diff_row(&guard, reference));
+        assert_eq!(
+            version_sections(&guard, unchanged).unwrap(),
+            version_sections(&guard, reference).unwrap()
+        );
+    }
+
+    /// A changed working set keeps the full diff: a rewritten body and a
+    /// changed subtitle both change the rendered text, so the snapshot must
+    /// not take the unchanged path.
+    #[test]
+    fn changed_working_set_keeps_the_full_diff() {
+        let conn = test_conn();
+        let mut guard = conn.lock();
+        let sections = sample_sections();
+        store_sections(&mut guard, 7, &sections).unwrap();
+        snapshot_working_set(&mut guard, 7, "update", None).unwrap();
+
+        let mut changed = sections.clone();
+        changed.insert(
+            "2".to_string(),
+            (Some("第二章".to_string()), "body: rewritten\n".to_string()),
+        );
+        store_sections(&mut guard, 7, &changed).unwrap();
+        let second = snapshot_working_set(&mut guard, 7, "update", None).unwrap();
+
+        let diff = version_diff(&guard, 7, second).unwrap().unwrap();
+        assert!(diff.contains("-=== 2 第2話"), "{diff}");
+        assert!(diff.contains("+=== 2 第二章"), "{diff}");
+        assert!(diff.contains("-body: 2"), "{diff}");
+        assert!(diff.contains("+body: rewritten"), "{diff}");
+        assert_eq!(version_sections(&guard, second).unwrap().unwrap(), changed);
+    }
+
+    /// A working set whose body row vanished is not unchanged: the version
+    /// skips that section like the body-joined read does, and the version
+    /// never links a body that does not exist.
+    #[test]
+    fn snapshot_skips_a_missing_body_instead_of_linking_it() {
+        let conn = test_conn();
+        let mut guard = conn.lock();
+        let sections = sample_sections();
+        store_sections(&mut guard, 7, &sections).unwrap();
+        snapshot_working_set(&mut guard, 7, "update", None).unwrap();
+
+        let hash = Sha256::digest(b"body: 2\n").to_vec();
+        guard
+            .execute("DELETE FROM section_bodies WHERE body_hash = ?", [&hash])
+            .unwrap();
+        let second = snapshot_working_set(&mut guard, 7, "update", None).unwrap();
+
+        let stored = version_sections(&guard, second).unwrap().unwrap();
+        assert_eq!(stored.len(), 4, "the section without a body is skipped");
+        assert!(!stored.contains_key("2"));
+        let linked: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM novel_version_sections WHERE version_id = ?1 AND body_hash = ?2",
+                params![second, hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked, 0, "a missing body must not be linked");
+        assert_eq!(list_versions(&guard, 7).unwrap()[0].section_count, 4);
+        // The missing body is invisible on both sides of the diff: the
+        // previous head's row for that section links the same missing body,
+        // so the section drops out of the comparison as well.
+        let diff = version_diff(&guard, 7, second).unwrap().unwrap();
+        assert_eq!(diff, "", "{diff}");
+    }
+
+    /// The unchanged snapshot is written inside the caller's transaction: a
+    /// rollback takes the new head, its rows and its diff with it.
+    #[test]
+    fn unchanged_snapshot_rolls_back_with_the_callers_transaction() {
+        let conn = test_conn();
+        let mut guard = conn.lock();
+        let sections = sample_sections();
+        store_sections(&mut guard, 7, &sections).unwrap();
+        snapshot_working_set(&mut guard, 7, "update", None).unwrap();
+
+        let tx = guard.transaction().unwrap();
+        snapshot_working_set_in_tx(&tx, 7, "update", Some("convert")).unwrap();
+        tx.rollback().unwrap();
+
+        let versions = list_versions(&guard, 7).unwrap();
+        assert_eq!(versions.len(), 1, "the rolled back head is gone");
+        assert_eq!(load_sections(&guard, 7).unwrap().unwrap(), sections);
+    }
+
+    #[test]
+    fn unchanged_snapshot_still_rejects_damaged_bodies() {
+        let conn = test_conn();
+        let mut guard = conn.lock();
+        let sections = sample_sections();
+        store_sections(&mut guard, 7, &sections).unwrap();
+        snapshot_working_set(&mut guard, 7, "update", None).unwrap();
+
+        guard
+            .execute("UPDATE section_bodies SET crc32 = crc32 + 1", [])
+            .unwrap();
+        let error = snapshot_working_set(&mut guard, 7, "update", None).unwrap_err();
+        assert!(error.to_string().contains("CRC"), "{error}");
+        assert_eq!(list_versions(&guard, 7).unwrap().len(), 1);
     }
 }

@@ -412,6 +412,17 @@ pub trait ObjectStore: PlatformService {
         &'a self,
         request: &'a ObjectListRequest,
     ) -> PlatformFuture<'a, Result<ObjectListPage>>;
+
+    /// One operation may retain a local novel's listing in memory instead of
+    /// restarting a filesystem walk for each page. Remote stores keep paging.
+    /// Not used by transfer, whose pages have independent resource budgets.
+    #[cfg(feature = "native-runtime")]
+    fn list_for_native_operation<'a>(
+        &'a self,
+        request: &'a ObjectListRequest,
+    ) -> PlatformFuture<'a, Result<ObjectListPage>> {
+        self.list_page(request)
+    }
 }
 
 /// Storage boundary for potentially large binary assets.

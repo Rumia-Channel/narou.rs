@@ -164,6 +164,56 @@ pub fn load_sections(conn: &Connection, novel_id: i64) -> Result<Option<SectionM
     load_section_map(conn, "novel_sections", "novel_id", novel_id)
 }
 
+/// Compare the working set's logical relation with one version's rows
+/// without reading a single body.
+///
+/// A section's identity is `(idx, subtitle, body_hash)`: two sets carrying
+/// the same rows render to the same text, so a snapshot of an unchanged
+/// working set has an empty diff and the very same section rows. Both sides
+/// are read in `idx` order, so equal rows also mean equal order.
+///
+/// `false` is returned when the two sides differ, when the working set is
+/// empty, or when a working-set row links no body row: the body-joined read
+/// skips such a row, so a working set with a missing body is *not* unchanged
+/// and must not be copied into a version as is.
+pub(crate) fn working_set_matches_version(
+    conn: &Connection,
+    novel_id: i64,
+    version_id: i64,
+) -> Result<bool> {
+    let (working, version, missing_bodies, working_only, version_only): (i64, i64, i64, i64, i64) =
+        conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM novel_sections WHERE novel_id = ?1),
+                    (SELECT COUNT(*) FROM novel_version_sections WHERE version_id = ?2),
+                    (SELECT COUNT(*) FROM novel_sections s WHERE s.novel_id = ?1
+                       AND NOT EXISTS (SELECT 1 FROM section_bodies b WHERE b.body_hash = s.body_hash)),
+                    (SELECT COUNT(*) FROM novel_sections s WHERE s.novel_id = ?1
+                       AND NOT EXISTS (SELECT 1 FROM novel_version_sections v
+                                        WHERE v.version_id = ?2 AND v.idx = s.idx
+                                          AND v.subtitle IS s.subtitle AND v.body_hash IS s.body_hash)),
+                    (SELECT COUNT(*) FROM novel_version_sections v WHERE v.version_id = ?2
+                       AND NOT EXISTS (SELECT 1 FROM novel_sections s
+                                        WHERE s.novel_id = ?1 AND s.idx = v.idx
+                                          AND v.subtitle IS s.subtitle AND v.body_hash IS s.body_hash))",
+            params![novel_id, version_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .map_err(sqlite_error)?;
+    Ok(working > 0
+        && working == version
+        && missing_bodies == 0
+        && working_only == 0
+        && version_only == 0)
+}
+
 /// Body-joined read shared by `novel_sections` and
 /// `novel_version_sections`: one query fetches each section together with the
 /// stored body instead of one `SELECT` per section. Rows whose body row is
@@ -215,6 +265,32 @@ fn decode_section_body(stored: &[u8], encoding: &str, crc32: i64) -> Result<Stri
     verify_object_crc32(&data, crc32 as u32)?;
     String::from_utf8(data)
         .map_err(|error| NarouError::Platform(format!("section body is not UTF-8: {error}")))
+}
+
+/// Validate each distinct payload before linking a new history row to it.
+/// A mismatching content address needs the normal re-hash path.
+pub(super) fn working_set_body_addresses_match(conn: &Connection, novel_id: i64) -> Result<bool> {
+    use rusqlite::types::ValueRef;
+    let mut query = conn.prepare_cached(
+        "SELECT b.body_hash, b.data, b.encoding, b.crc32 FROM section_bodies b
+         WHERE b.body_hash IN (SELECT body_hash FROM novel_sections WHERE novel_id = ?)",
+    ).map_err(sqlite_error)?;
+    let mut rows = query.query([novel_id]).map_err(sqlite_error)?;
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let ValueRef::Blob(stored) = row.get_ref(1).map_err(sqlite_error)? else {
+            return Err(NarouError::Platform("invalid stored section body".into()));
+        };
+        let encoding: String = row.get(2).map_err(sqlite_error)?;
+        let body = decode_section_body(stored, &encoding, row.get(3).map_err(sqlite_error)?)?;
+        let ValueRef::Blob(expected) = row.get_ref(0).map_err(sqlite_error)? else {
+            return Err(NarouError::Platform("invalid stored section body hash".into()));
+        };
+        let digest: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+        if digest != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Store a generated output blob (`kind` examples: `converted_text`).
@@ -395,6 +471,84 @@ mod tests {
             .unwrap();
         let error = load_sections(&guard, 7).unwrap_err();
         assert!(error.to_string().contains("CRC"), "{error}");
+    }
+
+    /// The relation comparison that drives the unchanged snapshot: identical
+    /// rows match, a changed body or subtitle does not, and a working set
+    /// with a missing body never matches.
+    #[test]
+    fn working_set_relation_comparison() {
+        let conn = test_conn();
+        let mut guard = conn.lock();
+        let sections = (1..=3)
+            .map(|index| {
+                (
+                    index.to_string(),
+                    (Some(format!("第{index}話")), format!("body: {index}\n")),
+                )
+            })
+            .collect::<SectionMap>();
+        store_sections(&mut guard, 7, &sections).unwrap();
+
+        // A version holding the same rows as the working set.
+        guard
+            .execute(
+                "INSERT INTO novel_versions (novel_id, parent_id, origin, note, created_at)
+                 VALUES (7, NULL, 'update', NULL, '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let version_id = guard.last_insert_rowid();
+        guard
+            .execute(
+                "INSERT INTO novel_version_sections (version_id, idx, subtitle, body_hash)
+                 SELECT ?1, idx, subtitle, body_hash FROM novel_sections WHERE novel_id = 7",
+                [version_id],
+            )
+            .unwrap();
+        assert!(working_set_matches_version(&guard, 7, version_id).unwrap());
+
+        // A changed body breaks the relation.
+        let hash = Sha256::digest(b"body: 2\n").to_vec();
+        let other = Sha256::digest(b"body: other\n").to_vec();
+        guard
+            .execute(
+                "UPDATE novel_version_sections SET body_hash = ?1 WHERE version_id = ?2 AND idx = '2'",
+                params![other, version_id],
+            )
+            .unwrap();
+        assert!(!working_set_matches_version(&guard, 7, version_id).unwrap());
+
+        // A changed subtitle breaks it as well.
+        guard
+            .execute(
+                "UPDATE novel_version_sections SET body_hash = ?1, subtitle = '別の話' WHERE version_id = ?2 AND idx = '2'",
+                params![hash, version_id],
+            )
+            .unwrap();
+        assert!(!working_set_matches_version(&guard, 7, version_id).unwrap());
+
+        // With the same rows again the relation matches.
+        guard
+            .execute(
+                "UPDATE novel_version_sections SET subtitle = '第2話' WHERE version_id = ?1 AND idx = '2'",
+                [version_id],
+            )
+            .unwrap();
+        assert!(working_set_matches_version(&guard, 7, version_id).unwrap());
+
+        // A missing body row is never "unchanged": the body-joined read
+        // skips that row, so the working set must not be copied as is.
+        guard
+            .execute("DELETE FROM section_bodies WHERE body_hash = ?1", [&hash])
+            .unwrap();
+        assert!(!working_set_matches_version(&guard, 7, version_id).unwrap());
+
+        // An empty working set never matches either.
+        guard
+            .execute("DELETE FROM novel_sections WHERE novel_id = 7", [])
+            .unwrap();
+        assert!(!working_set_matches_version(&guard, 7, version_id).unwrap());
     }
 
     #[test]

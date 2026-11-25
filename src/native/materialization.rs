@@ -136,7 +136,7 @@ pub(crate) async fn selected_files_snapshot_leased(
     );
     loop {
         lease.validate().await?;
-        let page = objects.list_page(&request).await?;
+        let page = objects.list_for_native_operation(&request).await?;
         for object in page.objects {
             let Some(name) = object.key.as_ref().strip_prefix(&prefix)
                 .and_then(|rest| rest.strip_prefix('/'))
@@ -214,7 +214,7 @@ pub(crate) async fn snapshot_leased_excluding(
         );
         loop {
             lease.validate().await?;
-            let page = objects.list_page(&request).await?;
+            let page = objects.list_for_native_operation(&request).await?;
             for object in page.objects {
                 let relative = object.key.as_ref().strip_prefix(&prefix)
                     .and_then(|rest| rest.strip_prefix('/'))
@@ -294,7 +294,7 @@ impl ConversionInputs {
             let mut request = crate::platform::ObjectListRequest::new(crate::platform::ObjectPrefix::from(listing), std::num::NonZeroUsize::new(100).expect("nonzero conversion page"));
             loop {
                 lease.validate().await?;
-                let page = objects.list_page(&request).await?;
+                let page = objects.list_for_native_operation(&request).await?;
                 for object in page.objects {
                     let relative = object.key.as_ref().strip_prefix(prefix.as_ref()).and_then(|tail| tail.strip_prefix('/'))
                         .ok_or_else(|| NarouError::Platform("conversion input escaped its admitted novel".into()))?;
@@ -547,6 +547,9 @@ pub(crate) async fn copy_asset(
     // inode keeps the generation the lease admitted. Remote/S3 keys return
     // `None` and keep the streamed path below.
     if let Some(source) = objects.native_source_path(key) {
+        // Local inventories can now fit in one page. Keep the read
+        // lease alive during the hardlink loop, not just between pages.
+        lease.refresh().await?;
         if let Some(parent) = destination.parent() { std::fs::create_dir_all(parent)?; }
         if let Err(error) = std::fs::hard_link(&source, destination) {
             // A writer may rename/replace the source mid-snapshot: the

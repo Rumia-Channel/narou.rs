@@ -146,7 +146,16 @@ pub(crate) fn clear_fs_gate_handoff(connection:&rusqlite::Connection,prefix:&str
 
 impl NativeObjectStore{
     pub(crate) fn list_window_blocking(&self,request:&ObjectListRequest,limit:usize)->Result<ObjectListPage>{
-        fn walk(store:&NativeObjectStore,request:&ObjectListRequest,base:&Path,path:&Path,capacity:usize,rows:&mut std::collections::BTreeMap<String,ObjectMetadata>,ancestors:&mut Vec<PathBuf>)->Result<()>{
+        let limit=limit.clamp(1,101);
+        let rows=self.collect_listing(request,Some(limit+1))?;
+        let next_cursor=(rows.len()>limit).then(||rows.keys().nth(limit-1).expect("nonempty lookahead").clone());
+        Ok(ObjectListPage{objects:rows.into_values().take(limit).collect(),next_cursor})
+    }
+
+    pub(crate) fn collect_listing(&self, request: &ObjectListRequest, capacity: Option<usize>)
+        -> Result<std::collections::BTreeMap<String, ObjectMetadata>>
+    {
+        fn walk(store:&NativeObjectStore,request:&ObjectListRequest,base:&Path,path:&Path,capacity:Option<usize>,rows:&mut std::collections::BTreeMap<String,ObjectMetadata>,ancestors:&mut Vec<PathBuf>)->Result<()>{
             let prefix=request.prefix.as_ref().trim_end_matches('/');
             let internal=if prefix.is_empty()||prefix=="novels"{path.strip_prefix(base).is_ok_and(|relative|relative.starts_with(".objects"))}else{!prefix.starts_with("novels/")};
             if internal&&path.file_name().is_some_and(|name|name.as_encoded_bytes().starts_with(ATOMIC_OBJECT_TEMP_PREFIX.as_bytes())){return Ok(());}
@@ -155,10 +164,12 @@ impl NativeObjectStore{
             let metadata=fs::metadata(&path)?;if metadata.is_dir(){if ancestors.contains(&path){return Err(NarouError::Platform("cyclic native namespace link".into()));}ancestors.push(path.clone());let mut children=Vec::new();for entry in fs::read_dir(&path)?{children.push(entry?.path());}for child in children{walk(store,request,base,&child,capacity,rows,ancestors)?;}ancestors.pop();return Ok(());}
             if !metadata.is_file(){return Err(NarouError::Platform("unsupported native namespace entry type".into()));}let key=store.logical_key_for_listed_path(request.prefix.as_ref(),base,&path).ok_or_else(||NarouError::Platform("native file has no portable logical key".into()))?;
             if !request.prefix.matches(&key)||request.cursor.as_deref().is_some_and(|cursor|key.as_ref()<=cursor){return Ok(());}
-            if rows.len()==capacity&&rows.last_key_value().is_some_and(|(last,_)|key.as_ref()>=last.as_str()){return Ok(());}
-            if let Some(metadata)=store.metadata_for_path(&key,&path)?{rows.insert(key.to_string(),metadata);if rows.len()>capacity{rows.pop_last();}}Ok(())
+            if capacity.is_some_and(|cap| rows.len()==cap && rows.last_key_value().is_some_and(|(last,_)|key.as_ref()>=last.as_str())){return Ok(());}
+            if let Some(metadata)=store.metadata_for_path(&key,&path)?{rows.insert(key.to_string(),metadata);if capacity.is_some_and(|cap| rows.len()>cap){rows.pop_last();}}Ok(())
         }
-        let limit=limit.clamp(1,101);let base=self.resolve_prefix_dir(request.prefix.as_ref())?;let mut rows=std::collections::BTreeMap::new();if base.try_exists()?{walk(self,request,&base,&base,limit+1,&mut rows,&mut Vec::new())?;}
-        let next_cursor=(rows.len()>limit).then(||rows.keys().nth(limit-1).expect("nonempty lookahead").clone());let objects=rows.into_values().take(limit).collect();Ok(ObjectListPage{objects,next_cursor})
+        let base=self.resolve_prefix_dir(request.prefix.as_ref())?;
+        let mut rows=std::collections::BTreeMap::new();
+        if base.try_exists()?{walk(self,request,&base,&base,capacity,&mut rows,&mut Vec::new())?;}
+        Ok(rows)
     }
 }

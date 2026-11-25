@@ -231,6 +231,11 @@ impl ObjectStore for SplitStore {
             .objects
             .list_page(request)
     }
+
+    #[cfg(feature = "native-runtime")]
+    fn list_for_native_operation<'a>(&'a self, request: &'a ObjectListRequest) -> PlatformFuture<'a, Result<ObjectListPage>> {
+        self.pair_for_prefix(&request.prefix).objects.list_for_native_operation(request)
+    }
 }
 
 impl AssetStore for SplitStore {

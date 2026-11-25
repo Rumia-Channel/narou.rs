@@ -170,9 +170,14 @@ impl NativeNovelRepository {
     /// Lock order is per-novel OS gate(s), then DATABASE and metadata locks.
     pub fn update_existing_guarded_sync<F>(&self,fence:&crate::platform::WriteFence,id:NovelId,mutator:F)->Result<bool>
     where F:FnOnce(&mut NovelRecord)->Result<()>{
-        let store=current_store()?;store.with_open_write(fence,||crate::db::with_database_mut(|db|db.update_records_with_fences(std::slice::from_ref(fence),|mut records|{
-            let found=if let Some(record)=records.get_mut(&id.0){require_record_origin(record,std::slice::from_ref(fence))?;mutator(record)?;require_record_origin(record,std::slice::from_ref(fence))?;true}else{false};Ok((records,found))
-        })))
+        let store = current_store()?;
+        store.with_open_write(fence, || crate::db::with_database_mut(|db| {
+            db.update_record_with_fence(fence, id, |record| {
+                require_record_origin(record, std::slice::from_ref(fence))?;
+                mutator(record)?;
+                require_record_origin(record, std::slice::from_ref(fence))
+            })
+        }))
     }
 
     pub fn find_by_toc_url_sync(&self, url: &str) -> Result<Option<NovelRecord>> {

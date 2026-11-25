@@ -328,6 +328,9 @@ impl PersistenceService {
         let mut names = HashSet::new();
         let mut request = ObjectListRequest::new(prefix, NonZeroUsize::new(1000).unwrap());
         loop {
+            #[cfg(feature = "native-runtime")]
+            let page = self.objects.list_for_native_operation(&request).await?;
+            #[cfg(not(feature = "native-runtime"))]
             let page = self.objects.list_page(&request).await?;
             for object in &page.objects {
                 if let Some(name) = object

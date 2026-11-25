@@ -862,6 +862,15 @@ impl ObjectStore for NativeObjectStore {
     ) -> PlatformFuture<'a, Result<ObjectListPage>> {
         let this=self.clone();let request=request.clone();run_blocking(move||this.list_window_blocking(&request,request.limit.get().min(100)))
     }
+
+    fn list_for_native_operation<'a>(&'a self, request: &'a ObjectListRequest) -> PlatformFuture<'a, Result<ObjectListPage>> {
+        let this = self.clone();
+        let request = request.clone();
+        run_blocking(move || {
+            let objects = this.collect_listing(&request, None)?.into_values().collect();
+            Ok(ObjectListPage { objects, next_cursor: None })
+        })
+    }
 }
 
 impl AssetStore for NativeObjectStore {
@@ -1657,6 +1666,13 @@ impl ObjectStore for NativeStore {
         match self {
             NativeStore::Fs(store) => store.list_page(request),
             NativeStore::Sqlite(store) => store.list_page(request),
+        }
+    }
+
+    fn list_for_native_operation<'a>(&'a self, request: &'a ObjectListRequest) -> PlatformFuture<'a, Result<ObjectListPage>> {
+        match self {
+            Self::Fs(store) => store.list_for_native_operation(request),
+            Self::Sqlite(store) => store.list_for_native_operation(request),
         }
     }
 }

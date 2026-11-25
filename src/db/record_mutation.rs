@@ -33,6 +33,7 @@ pub(super) enum RecordMutation<'a> {
         candidate: &'a str,
     },
     VirtualFences(&'a [WriteFence]),
+    ExistingRow { fence: &'a WriteFence, id: NovelId },
 }
 
 /// Durable gate origins captured before the record commit decides. The SQL
@@ -127,7 +128,12 @@ pub(super) fn prepare<'a>(
         if let Some(RecordMutation::Rebind { fence, id, observed, candidate }) = mutation {
             prepare_virtual_origin(root, connection, current, fence, id, RebindUrls { observed, candidate }, yaml)?;
         }
-        if let Some(RecordMutation::VirtualFences(fences)) = mutation {
+        let fences = match mutation {
+            Some(RecordMutation::VirtualFences(fences)) => fences,
+            Some(RecordMutation::ExistingRow { fence, .. }) => std::slice::from_ref(fence),
+            _ => &[],
+        };
+        if !fences.is_empty() {
             let by_prefix = fences.iter().map(|fence| (fence.prefix.as_ref().trim_end_matches('/'), fence))
                 .collect::<BTreeMap<_, _>>();
             for (&id, record) in current {
@@ -218,7 +224,7 @@ pub(super) fn prepare<'a>(
                 });
                 None
             }
-            Some(RecordMutation::VirtualFences(_)) | None => None,
+            Some(RecordMutation::VirtualFences(_) | RecordMutation::ExistingRow { .. }) | None => None,
         };
         Ok(PreparedRecords { claims, creation, rebind })
     };
