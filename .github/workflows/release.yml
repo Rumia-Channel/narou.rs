@@ -10,6 +10,12 @@ on:
 permissions:
   contents: write
 
+# Different tags and manual runs share the same Certum signing credentials.
+# An active release must finish or be explicitly cancelled before another runs.
+concurrency:
+  group: narou-release
+  cancel-in-progress: false
+
 env:
   # crates.io などへのダウンロードの一時的なネットワーク障害で CI が落ちるのを防ぐ。
   # デフォルトの再試行回数 (3) だと macos-15-intel のような不安定なランナーの

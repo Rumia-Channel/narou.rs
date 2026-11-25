@@ -12,7 +12,7 @@ Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は�
 | P0b 署名と S3 アダプタ | ✅ 完了 (`23338ec`, `ed87fcd`) |
 | P0c 保存先の振り分け (SplitStore) | ✅ 完了 (`SplitStore` + `asset_backend`、mock 2 系統で固定) |
 | P0d D1→S3 移行 | 挿絵の既存 API に加え、本文・履歴用の独立した `/api/admin/content-migration` を実装。本文を D1 の列へ展開する旧計画は撤回 |
-| P0e 契約テスト + CI デプロイ | ✅ 契約テストは CI (`worker-contract`)、デプロイは develop/main/タグで環境別に自動 (`worker-deploy-*`)。実アカウントでの初回実行のみ未検証 |
+| P0e 契約テスト + CI デプロイ | ✅ 契約テストは CI (`worker-contract`)、配備は `develop` / `main` の push 後に環境別に自動 (`worker-deploy-*`) |
 | P1 取得系を閉じる | ◐ 実行系は実装済み。SSRF・Cookie・設定の 3 点が未了 |
 | P2 変換を Worker へ | ◐ 変換テキスト生成は完了 (`ConvertService`)。残りは device 出力 (MOBI 等) の扱い |
 | P3 Web UI 移植 | ❌ 未着手 |
@@ -197,7 +197,7 @@ flowchart TD
 | 2 | ~~Convert が Worker に存在しない~~ → **解決**: `ConvertService`（core）が保存済み TOC と本文から変換テキストを組み、`<prefix>/novel.txt` へ書く。`JobKind::Convert` は worker 実行可能。native は per-title txt + SQLite `novel_outputs` を使い、固定名ミラーは書かない (issue #40) | `src/application/convert.rs`, `worker_entry/src/convert.rs`, `src/application/jobs.rs` |
 | 3 | ~~CookieStore 未注入~~ → **解決**: `D1CookieStore` の読み書き両方を注入（native と同じ `app_state(inv, login_cookie)`、at-rest 暗号化）。`Set-Cookie` の書き戻しと `/api/login*`（一覧・置き換え・削除）も Worker で動く | `worker_entry/src/d1_cookie_store.rs`, `worker_entry/src/http.rs`, `worker_entry/src/login.rs` |
 | 4 | ~~設定が Worker に届かない~~ → **解決**: `SnapshotDownloaderSettings` に `app_state` の `local`/`global`（`update.strong` / `guard-spoiler` / `auto-add-tags` / `download.use-subdirectory` / `over18`）と `inv` の section hash cache を起動時に読んで注入。書き戻しは同期 API と非同期 D1 の都合で no-op（`over18` は Web UI 側で設定） | `src/downloader/settings.rs`, `worker_entry/src/composition.rs` |
-| 5 | デプロイ設定: `wrangler.<target>.toml` + `ci/render_config.py` は完成。CI の `worker-deploy`（手動トリガー・environment ゲート）に必要な secret/vars を設定すれば動くが、**実アカウントでの実行は未検証** | `worker_entry/wrangler.develop.toml`, `.github/workflows/platform.yml` |
+| 5 | デプロイ設定: `wrangler.<target>.toml` + `ci/render_config.py`。`worker-deploy-*` の起動条件・必要な secret/vars は §2.2.8 を参照 | `worker_entry/wrangler.develop.toml`, `.github/workflows/platform.yml` |
 | 6 | ~~worker のテストが CI で 1 件も走らない~~ → **解決**: `worker_entry/tests/contract.mjs`（HTTP 契約）と `tests/run.mjs`（ローカル workerd 起動）を CI の `worker-contract` ジョブで実行 | `.github/workflows/platform.yml` |
 
 ### 2.2.1 URL 検証の分担（2026-09-26 実装）
@@ -339,9 +339,11 @@ DNS レコード・Access アプリケーション・認証ポリシーは変更
 | きっかけ | GitHub Environment | デプロイ先 (`NAROU_DEPLOY_TARGET`) |
 |---|---|---|
 | `develop` へ push | `Cloudflare` | develop |
-| タグ push (`v*` / 数字始まり) | `Cloudflare` | production (custom domain) |
-| 手動 `workflow_dispatch` (target 選択) | `Cloudflare` | 選択した target |
+| `main` へ push | `Cloudflare` | production (custom domain) |
+| 手動 `workflow_dispatch` (`target: develop`) | `Cloudflare` | develop |
+| `main` から手動 `workflow_dispatch` (`target: production`) | `Cloudflare` | production (custom domain) |
 
+- リリースタグの push は互換性チェックだけを実行し、Workers は配備しない。既存タグの再実行は旧コミット・旧 workflow を使うため、修正版は `main` の新しい run から配備する。
 - 各ジョブは `needs: [native, native-gpl, wasm, worker, worker-contract, license]` で、テストが緑のときだけ動く。
 - Cloudflare の資格情報が未設定のリポジトリ (fork など) では **理由を出してデプロイだけ省略**する
   (`check Cloudflare credentials` ステップ)。テストは通常どおり走る。
@@ -619,7 +621,7 @@ Cloudflare Analytics の UTC `2026-10-21T00:00:00Z`〜`2026-11-06T06:15:42Z` で
 |---|---|
 | 環境分離 | `wrangler.<target>.toml` をテンプレート化し、CI が置換して `wrangler.ci.toml` を生成（生成物は gitignore）。置換前に形式検証 |
 | プロビジョニング | D1・取得用と変換用の Queue・各 DLQ を list→create→再 list の冪等手順で用意し `GITHUB_OUTPUT` で受け渡す |
-| デプロイ | develop=push / production=`v*` タグ + タグが main の祖先かの検証。`needs: [native, worker]`、target 別 `concurrency`、**デプロイ前に `wrangler d1 migrations apply --remote`**、`--secrets-file`、`if: always()` で生成物削除 |
+| デプロイ | `develop` push → develop、`main` push → production。必須検査、target 別 `concurrency`、**デプロイ前に `wrangler d1 migrations apply --remote`**、`--secrets-file`、生成した secret ファイルの削除 |
 | アセット | `[assets]` + ハッシュ付きアセット生成（P3） |
 | 契約テスト | `wrangler dev --local` + `node --test tests/*.mjs`。**トークン未設定時に fail-closed になること**も検証。`/cdn-cgi/local/scheduled` で cron を叩ける |
 | 自己修復 | `scheduled` でリース期限切れの回収と再 dispatch |

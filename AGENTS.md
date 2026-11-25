@@ -153,7 +153,8 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
   1. `cargo clippy --workspace --all-targets --all-features -- -D warnings` とビルドで警告を確認し、警告を解消する。依存更新で新しく出た警告も対象。
   2. `cargo update` でワークスペースの依存を更新する。`about-probe` も `cargo update --manifest-path about-probe/Cargo.toml` で更新し、両方の `Cargo.lock` を同じコミットに含める。
   3. 依存更新後に `cargo test --workspace` / clippy / Worker wasm / ライセンス再生成 (`cargo about`) を実行し、結果を確認する。更新で壊れた API はこの時点で直す。
-- **0.0.x（パッチ版）では、依存更新 (`cargo update`) とライセンス再生成 (`cargo about`) は必須ではない。** 既存依存のままリリースしてよい。依存を変更した場合に限り、`Cargo.lock` / `about-probe/Cargo.lock` と `Third-Party-License*.md` を同じコミットで更新する。
+- **0.0.x（パッチ版）では、依存更新 (`cargo update`) は必須ではない。** 依存を変更しない場合も、版数更新と同じコミットで `Cargo.lock` / `about-probe/Cargo.lock` と `Third-Party-License*.md` の自プロジェクトの版数を同期する。タグを push する前に、`about.hbs` の手順でライセンス生成結果が CI と一致することを確認する。
+  - **依存グラフを変更しない版数更新**では `python scripts/sync-license-versions.py`（Python 3.11+）で両ノーティスを一括更新する。各クレートの `Cargo.toml` を参照し、`Used by:` の自プロジェクトの版数だけを書き換える。差分の有無だけを確認する場合は `--check`。依存変更時の `cargo-about` による再生成やロックファイルの更新はこのツールでは行わない。
 - パッチ版でも `cargo clippy --workspace --all-targets --all-features -- -D warnings` と `cargo test --workspace` による確認は行う（依存更新を伴わないなら clippy の警告対応は不要だが、既存の警告がないことを確認する）。
 - 依存更新はリリースとは独立した単位でよい。依存更新だけのコミットをリリースのコミットに混在させない。
 
@@ -168,6 +169,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **変更履歴は `VERSION.md` に置く**。`README.md` には変更履歴の本文を書かず、`VERSION.md` への参照だけを置く。リリース時は `VERSION.md` の先頭へ新しいバージョンの節を追加し、`README.md` は触らない (バージョン更新そのものは `Cargo.toml` / `worker_entry/Cargo.toml` / `Cargo.lock` / `about-probe/Cargo.lock` / `Third-Party-License*.md` に行う)。
 - **版数の基準は GitHub の tag / Release とする**。ローカルの `Cargo.toml` や `VERSION.md` に未リリースの次版が書かれていても、それを公開済みとしてさらに版数を進めない。ユーザーから「バージョンを上げて」と指示されたら、GitHub の最新 tag / Release の次の版をリリースする（例: ローカルが 0.4.18 でも GitHub の最新が v0.4.17 なら v0.4.18 でリリースする）。公開前に追加する機能・修正・ツアーは同じ未リリース版へまとめる。ユーザーが版数を指定した場合はその指定を優先する（2026-10-17: 公開済み v0.4.12 に対する次版は v0.4.13）。
 - タグ作成はユーザーがバージョン番号を明示した場合だけ行う。`main` へ統合した後、`main` 上でのみタグ作成を許可する。タグは `main` のリリースコミットを指すようにし、作成後に push する。
+- **リリース CI は前の実行が終了してから起動する**。タグ push・手動起動・再実行の前に GitHub Actions の `Release` を確認し、タグやブランチを問わず未終了の run があれば、完了を待つか、やり直す run を `gh run cancel <run-id>` で止めてから `completed` になったことを確認する。キャンセル要求の受理だけでは次を起動しない。`release.yml` は同じ Certum 署名資格情報を使う全 run を固定の `narou-release` グループで直列化し、実行中の run を自動キャンセルしない。古いタグの workflow にはこの制御がない場合もあるため、起動前確認は省略しない。
 - 実装が一区切りついたら、機能単位で git commit する。無関係な変更をひとつの commit に混ぜず、レビューやロールバックがしやすい粒度に分ける。
 - commit 前には `git diff` / `git status` を確認し、ユーザー由来または別作業由来の変更を混ぜない。意図しない整形差分、改行だけの変更、import 並び替えだけの変更を含めない。
 - commit メッセージは英語の短い命令形または要約形にする。例: `Fix web download concurrency`, `Document release setup steps`。
@@ -568,11 +570,11 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 
 ### Worker の CI デプロイ (2026-09)
 
-- `.github/workflows/platform.yml` の `worker-deploy-{develop,production}`。きっかけは
-  `develop` push / タグ push（+ 手動 dispatch）。staging 環境は持たない。GitHub Environments は
-  用途で `Cloudflare`（Workers の secret と vars）と `CodeSining`（release の署名）の 2 つだけを使い、
-  target は `NAROU_DEPLOY_TARGET` で切り替える（一覧は
-  `docs/cloudflare-workers-migration-plan.md` §2.2.8）。
+- `.github/workflows/platform.yml` の `worker-deploy-{develop,production}` は、`develop` push で
+  develop へ、`main` push で production へ配備する。手動で production を選ぶ場合も `main` に限る。
+  いずれも同じ run の必須検査が通ってから配備し、リリースタグは検証だけを走らせる。
+  staging は持たず、GitHub Environments は `Cloudflare`（Workers）と `CodeSining`（署名）を用途別に使う。
+  target は `NAROU_DEPLOY_TARGET` で切り替える（`docs/cloudflare-workers-migration-plan.md` §2.2.8）。
 - 実体は `worker_entry/ci/deploy_worker.py`（provision → render → migrate → secret 投入 → deploy → smoke）。
   D1/Queue は環境名から導出して冪等に作るので、初回デプロイでも手作業が要らない。
 - 資格情報が無いリポジトリではデプロイだけ理由付きで省略する（テストは走る）。
@@ -739,8 +741,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - `worker_entry/tests/run.mjs` … ビルド → ローカル D1 へ migration → `wrangler dev` → 契約テスト。
   `.dev.vars`（無ければ `NAROU_ADMIN_TOKEN` を書き込む）と `wrangler.test.toml`（`wrangler.toml` から
   `[build]` を外した生成物）は gitignore 済み。
-- CI: `.github/workflows/platform.yml` の `worker-contract`（push で実行）。デプロイは手動トリガーの
-  `worker-deploy`（environment ゲート）で、必要な secret/vars はワークフローのコメント参照。
+- CI: `.github/workflows/platform.yml` の `worker-contract`。`worker-deploy-*` は契約テストを含む
+  必須検査の通過後に動く。配備トリガーは「Worker の CI デプロイ」を参照。
 
 ### Worker 内の変換 (2026-09)
 
