@@ -10,6 +10,15 @@ on:
 permissions:
   contents: write
 
+# Release runs are exclusive. A new tag must not build and sign beside an
+# in-flight release: the Certum SimplySign cloud signing session accepts one
+# authentication at a time, and two signing jobs overlap on the same account
+# invalidate each other. Cancelling the older run also keeps a single release
+# pipeline in flight at any time.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # crates.io などへのダウンロードの一時的なネットワーク障害で CI が落ちるのを防ぐ。
   # デフォルトの再試行回数 (3) だと macos-15-intel のような不安定なランナーの
@@ -133,6 +142,10 @@ jobs:
 
   sign-helpers:
     name: Sign Windows helper binaries
+    # One Certum SimplySign session per account: never sign beside another run.
+    concurrency:
+      group: certum-signing
+      cancel-in-progress: false
     needs: build-helpers
     runs-on: windows-2025
     environment: CodeSining
@@ -552,6 +565,10 @@ jobs:
 
   sign-windows:
     name: Sign Windows binaries
+    # One Certum SimplySign session per account: never sign beside another run.
+    concurrency:
+      group: certum-signing
+      cancel-in-progress: false
     needs:
       - validate
       - build
