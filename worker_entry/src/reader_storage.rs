@@ -64,13 +64,27 @@ impl StagingTarget {
     }
 }
 
+pub(crate) trait ReaderLeaseCheck: Send + Sync {
+    fn check_open<'a>(
+        &'a self,
+        renewal: &'a dyn NovelAccessFence,
+        prefix: &'a ObjectPrefix,
+        lease: &'a GateLease,
+    ) -> PlatformFuture<'a, Result<()>>;
+}
+
+pub(crate) struct ReaderLeaseAuthority {
+    pub(crate) controls: Arc<dyn NovelAccessFence>,
+    pub(crate) checks: Arc<dyn ReaderLeaseCheck>,
+}
+
 /// Read-only view of the shared source objects, with private staging allowed.
-/// Leased reads keep the primary stores' renew → read → renew contract but
-/// renew through the delegated control fence, never the source store's own.
+/// Leased opens check primary before and after reading. Only admission and
+/// periodic renewal need the delegated write-capable control path.
 struct ReaderObjectStore {
     inner: Arc<dyn ObjectStore>,
     assets: Arc<dyn AssetStore>,
-    fence: Option<Arc<dyn NovelAccessFence>>,
+    fence: Option<ReaderLeaseAuthority>,
     staging: Option<Arc<dyn ObjectStore>>,
 }
 
@@ -97,7 +111,7 @@ impl ReaderStores {
         objects: Arc<dyn ObjectStore>,
         assets: Arc<dyn AssetStore>,
         staging: Option<StagingTarget>,
-        fence: Option<Arc<dyn NovelAccessFence>>,
+        fence: Option<ReaderLeaseAuthority>,
     ) -> Self {
         let staging_objects = staging.as_ref().map(|target| target.objects.clone());
         let staging_assets = staging.map(|target| target.assets);
@@ -129,13 +143,11 @@ impl ObjectStore for ReaderObjectStore {
     /// fence: leasing through `inner` would write the shared D1 from this
     /// delivery isolate.
     fn access_fence(&self) -> Option<&dyn NovelAccessFence> {
-        self.fence.as_deref()
+        self.fence.as_ref().map(|fence| fence.controls.as_ref())
     }
 
-    /// Same renew → read → renew contract as the primary stores, but the
-    /// lease CAS runs against the delegated fence while the bytes come from
-    /// the source assets (read-only). The renewed lease keeps the admitted
-    /// epoch; every logical open still carries the caller's pinned lease.
+    /// The delivery Worker can validate its existing lease with a primary
+    /// read, but cannot grant or extend one locally.
     fn read_stream_leased<'a>(
         &'a self,
         prefix: &'a ObjectPrefix,
@@ -149,16 +161,10 @@ impl ObjectStore for ReaderObjectStore {
                     "reader outside novel: {key}"
                 )));
             }
-            let fence = self
-                .access_fence()
-                .ok_or_else(|| unsupported_fence(prefix))?;
-            fence
-                .renew_reader(prefix, lease, narou_rs::platform::READER_LEASE_SECS)
-                .await?;
+            let fence = self.fence.as_ref().ok_or_else(|| unsupported_fence(prefix))?;
+            fence.checks.check_open(fence.controls.as_ref(), prefix, lease).await?;
             let stream = self.assets.read_stream_range(key, range).await?;
-            fence
-                .renew_reader(prefix, lease, narou_rs::platform::READER_LEASE_SECS)
-                .await?;
+            fence.checks.check_open(fence.controls.as_ref(), prefix, lease).await?;
             Ok(stream)
         })
     }

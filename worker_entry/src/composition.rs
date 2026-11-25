@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use chrono::SecondsFormat;
 use narou_rs::application::acquisition_lanes::LANE_COUNT;
-use narou_rs::application::settings::SettingsStore;
 use narou_rs::application::{
     AppServiceDependencies, AppServices,
     EmptyWebActionService, FreezeStore, JobClaim, JobId, JobKind, JobLedgerStatus, JobPlan, JobQueue, JobService,
@@ -37,7 +36,7 @@ mod asset_backend;
 use asset_backend::AssetBackend;
 
 #[path = "reader_storage.rs"]
-mod reader_storage;
+pub(crate) mod reader_storage;
 use reader_storage::ReaderStores;
 
 /// Result of the complete ledger + Queue producer operation for one plan.
@@ -246,7 +245,8 @@ async fn build_object_stores(
         split = split.with_staging((store.clone(), store.clone()));
     }
     let split = Arc::new(split);
-    let refs=Arc::new(crate::content_store::TransferReferenceStore::new(db.primary_view(),split.clone(),split,Arc::new(D1ObjectStore::new(db.primary_view())),stage_store.clone().map(|store|store as Arc<dyn AssetStore>)));
+    let lease_store = Arc::new(D1ObjectStore::new(db.primary_view()));
+    let refs=Arc::new(crate::content_store::TransferReferenceStore::new(db.primary_view(),split.clone(),split,lease_store.clone(),stage_store.clone().map(|store|store as Arc<dyn AssetStore>)));
     let (objects, assets): (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) = if reader {
         // 配信は source を書き換えない。private staging (S3) だけを書ける。
         let staging = stage_store
@@ -254,8 +254,11 @@ async fn build_object_stores(
             .map(|store| reader_storage::StagingTarget::new(store.clone(), store));
         // Lease 行だけは共有 D1 の durable mutation なので、配信 isolate
         // 自身ではなく writer の認証済み制御路へ委譲する。
-        let fence = Some(crate::reader_control::remote_access(env).await?);
-        let guarded = ReaderStores::new(refs.clone(), refs, staging, fence);
+        let fence = reader_storage::ReaderLeaseAuthority {
+            controls: crate::reader_control::remote_access(env).await?,
+            checks: lease_store,
+        };
+        let guarded = ReaderStores::new(refs.clone(), refs, staging, Some(fence));
         (guarded.objects(), guarded.assets())
     } else {
         (refs.clone(), refs)
@@ -367,12 +370,12 @@ impl WorkerRuntime {
                 write_objects.clone(),
             ));
         // ジョブの設定は primary から現在値を読み、UI の GET はキャッシュを維持する。
-        let local_store: Arc<dyn SettingsStore> = Arc::new(match profile {
+        let local_store = match profile {
             CompositionProfile::Job => D1SettingsStore::for_writes(write_db.clone()),
             CompositionProfile::Ui => D1SettingsStore::new(db.clone()),
-        });
+        };
         let local_values = local_store
-            .load(SettingScope::Local)
+            .load_selected(SettingScope::Local, &["user-agent", "download.relay-sites"])
             .await
             .unwrap_or_default();
         // User-Agent は保存済み設定から解決する (native の `with_user_agent` と同じ規則)。
@@ -624,17 +627,21 @@ impl WorkerRuntime {
     /// `DownloaderSettings` は同期 API だが D1 は非同期なので、呼び出し単位で
     /// 値を読み切り `SnapshotDownloaderSettings` に固めて渡す。
     async fn downloader_settings(&self) -> Result<Arc<dyn DownloaderSettings>> {
-        const LOCAL_BOOL_KEYS: [&str; 4] = [
+        const LOCAL_KEYS: [&str; 5] = [
             "update.strong",
             "guard-spoiler",
             "auto-add-tags",
             "download.use-subdirectory",
+            "economy",
         ];
         // ジョブの実行パラメータはキャッシュ済みスナップショットではなく
         // 現在値を読む (job 経路のハンドル自体は primary)。
         let store = D1SettingsStore::for_writes(self.write_db.clone());
-        let local_values = store.load(SettingScope::Local).await?;
-        let local: HashMap<String, bool> = LOCAL_BOOL_KEYS
+        let (local_values, global_values) = futures::try_join!(
+            store.load_selected(SettingScope::Local, &LOCAL_KEYS),
+            store.load_selected(SettingScope::Global, &["over18"]),
+        )?;
+        let local: HashMap<String, bool> = LOCAL_KEYS[..4]
             .iter()
             .filter_map(|key| {
                 local_values
@@ -643,7 +650,6 @@ impl WorkerRuntime {
                     .map(|value| ((*key).to_string(), value))
             })
             .collect();
-        let global_values = store.load(SettingScope::Global).await?;
         let over18 = global_values
             .get("over18")
             .and_then(narou_rs::setting_core::setting_bool_value);

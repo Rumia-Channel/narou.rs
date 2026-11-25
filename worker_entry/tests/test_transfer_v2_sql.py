@@ -85,6 +85,40 @@ class TransferV2SqlTests(unittest.TestCase):
         for migration in sorted((ROOT / "worker_entry/migrations").glob("*.sql")):
             self.db.executescript(migration.read_text(encoding="utf-8"))
 
+    def test_expiry_recovery_uses_global_range_and_keeps_live_leases(self):
+        scheduler = (ROOT / "worker_entry/src/scheduler.rs").read_text(encoding="utf-8")
+        sweep = re.search(r'"(DELETE FROM novel_reader_leases WHERE[^"]+)"', scheduler)[1]
+        self.db.executemany(
+            "INSERT INTO novel_reader_leases VALUES (?,?,0,?)",
+            [("prefix", str(i), 1) for i in range(501)]
+            + [("prefix", "live", 9_000_000_000)],
+        )
+        plan = [row[3] for row in self.db.execute("EXPLAIN QUERY PLAN " + sweep)]
+        self.assertTrue(any("novel_reader_leases_global_expiry (expires_at<" in row for row in plan), plan)
+        self.db.execute(sweep)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM novel_reader_leases").fetchone()[0], 2)
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM novel_reader_leases WHERE reader_id='live'").fetchone())
+
+    def test_terminal_creation_recovery_ignores_active_or_cleared_jobs(self):
+        ledger = (ROOT / "worker_entry/src/ledger.rs").read_text(encoding="utf-8")
+        query = re.search(r'"(SELECT job_id FROM worker_jobs INDEXED BY worker_jobs_terminal_checkpoint[^"]+)"', ledger)[1]
+        now, old, future = "2026-11-26T00:00:00Z", "2026-11-25T00:00:00Z", "2026-11-27T00:00:00Z"
+        claim = '{"creation_reservation":[1,1]}'
+        jobs = [
+            ("a-cleared", "succeeded", None, None, None),
+            ("b-eligible", "partial", claim, "old", old),
+            ("c-live", "succeeded", claim, "live", future),
+            ("d-running", "running", claim, "old", old),
+            ("e-eligible", "blocked", claim, None, None),
+        ]
+        self.db.executemany(
+            "INSERT INTO worker_jobs(job_id,kind,target,status,dedupe_key,created_at,updated_at,checkpoint_json,execution_token,lease_until)"
+            " VALUES (?,'download','1',?,?,'now','now',?,?,?)",
+            [(job_id, status, job_id, checkpoint, token, lease) for job_id, status, checkpoint, token, lease in jobs],
+        )
+        self.assertEqual([row[0] for row in self.db.execute(query, ("", now, 1))], ["b-eligible"])
+        self.assertEqual([row[0] for row in self.db.execute(query, ("b-eligible", now, 4))], ["e-eligible"])
+
     def session(self, state="cataloguing", plan="plan-1"):
         values = {
             "session_id": "sess_sql", "library_id": "library", "principal": "admin",

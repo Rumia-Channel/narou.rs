@@ -801,6 +801,34 @@ impl D1SettingsStore {
             SettingScope::Global => "global",
         }
     }
+
+    /// Keyed runtime reads must not populate the full-scope cache used by
+    /// settings editing and CAS. Writers always read the current values.
+    pub(crate) async fn load_selected(
+        &self,
+        scope: SettingScope,
+        keys: &[&str],
+    ) -> Result<HashMap<String, YamlValue>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let scope = Self::scope_name(scope);
+        if !self.fresh_reads && let Some(cached) = SETTINGS_CACHE.get(scope) {
+            return Ok(keys.iter().filter_map(|&key| {
+                cached.get(key).map(|value| (key.to_owned(), value.clone()))
+            }).collect());
+        }
+        let keys = serde_json::to_string(keys).map_err(worker_error)?;
+        let rows = self.db.prepare(
+            "SELECT key, value_yaml, value_json FROM app_state
+             WHERE scope = ?1 AND key IN (SELECT value FROM json_each(?2))",
+        ).bind(&[scope.into(), keys.into()]).map_err(worker_error)?
+            .all().await.map_err(worker_error)?
+            .results::<StateRow>().map_err(worker_error)?;
+        rows.into_iter().map(|row| {
+            Ok((row.key, parse_setting_value(&row.value_yaml, &row.value_json)?))
+        }).collect()
+    }
 }
 
 impl SettingsStore for D1SettingsStore {

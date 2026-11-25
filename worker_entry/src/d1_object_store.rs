@@ -372,7 +372,51 @@ pub struct TransferReference {pub object_key:String,pub blob_key:String,pub size
 #[derive(Deserialize)]struct StageChanged{stage_id:String}
 #[derive(Deserialize)]struct DbGate{epoch:u64,closed:i64,owner:Option<String>,updated_at:i64,pending_readers:u32,#[serde(default)]content_revision:u64}
 
+impl crate::composition::reader_storage::ReaderLeaseCheck for D1ObjectStore {
+    fn check_open<'a>(
+        &'a self, renewal: &'a dyn NovelAccessFence, prefix: &'a ObjectPrefix, lease: &'a GateLease,
+    ) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(self.check_open_reader(renewal, prefix, lease))
+    }
+}
+
 impl D1ObjectStore {
+    /// Keep the normal renewal cadence even if a slow object open crossed
+    /// the renewal boundary. A delivery store supplies its delegated writer.
+    pub(crate) async fn check_open_reader(
+        &self, renewal: &dyn NovelAccessFence, prefix: &ObjectPrefix, lease: &GateLease,
+    ) -> Result<()> {
+        let remaining = lease.expires_at.saturating_sub(ts::now_secs());
+        if remaining <= af::READER_LEASE_SECS - narou_rs::application::novel_access::RENEW_INTERVAL_SECS {
+            renewal.renew_reader(prefix, lease, af::READER_LEASE_SECS).await?;
+            return Ok(());
+        }
+        self.check_reader(prefix, lease).await
+    }
+
+    /// Revalidate a leased open against primary without rewriting its
+    /// expiry. NovelReadLease renews progressing readers separately.
+    async fn check_reader(&self, prefix: &ObjectPrefix, lease: &GateLease) -> Result<()> {
+        #[derive(Deserialize)]
+        struct ReaderState { closed: i64, gate_epoch: u64, reader_epoch: Option<u64>, expires_at: Option<i64> }
+        let row: Option<ReaderState> = self.db.primary_view().prepare(
+            "SELECT g.closed, g.epoch AS gate_epoch, r.epoch AS reader_epoch, r.expires_at
+             FROM novel_access_gates g LEFT JOIN novel_reader_leases r
+             ON r.prefix = g.prefix AND r.reader_id = ?2 WHERE g.prefix = ?1",
+        ).bind(&[prefix.as_ref().trim_end_matches('/').into(), lease.reader_id.as_str().into()])
+            .map_err(worker_error)?.first(None).await.map_err(worker_error)?;
+        let row = row.ok_or_else(|| af::gate_closed_error(prefix))?;
+        if row.closed != 0 || row.gate_epoch != lease.epoch
+            || row.reader_epoch.is_some_and(|epoch| epoch != lease.epoch)
+        {
+            return Err(af::gate_closed_error(prefix));
+        }
+        if row.expires_at.is_none_or(|expiry| expiry <= ts::now_secs()) {
+            return Err(af::lease_expired_error(prefix));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn writer_for_key(&self,key:&ObjectKey)->Result<Option<WriteFence>>{
         if narou_rs::platform::is_reserved_key(key){return Ok(None);}
         let prefix=self.prepare("SELECT prefix FROM (SELECT prefix FROM novel_access_gates UNION SELECT prefix FROM novel_gate_bindings) WHERE ?1=prefix OR substr(?1,1,length(prefix)+1)=prefix||'/' ORDER BY length(prefix) DESC LIMIT 1",vec![key.as_ref().into()])?.first::<String>(Some("prefix")).await.map_err(worker_error)?;

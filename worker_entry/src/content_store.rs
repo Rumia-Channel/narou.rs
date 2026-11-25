@@ -159,8 +159,11 @@ impl ObjectStore for TransferReferenceStore{
     })}
     fn access_fence(&self)->Option<&dyn narou_rs::platform::NovelAccessFence>{Some(self.d1.as_ref())}
     fn read_stream_leased<'a>(&'a self,prefix:&'a narou_rs::platform::ObjectPrefix,lease:&'a narou_rs::platform::GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<AssetStream>>>{Box::pin(async move{
-        use narou_rs::platform::NovelAccessFence;
-        if !prefix.matches(key){return Err(error("reader outside novel"));}self.d1.renew_reader(prefix,lease,narou_rs::platform::READER_LEASE_SECS).await?;let stream=AssetStore::read_stream_range(self,key,range).await?;self.d1.renew_reader(prefix,lease,narou_rs::platform::READER_LEASE_SECS).await?;Ok(stream)
+        if !prefix.matches(key){return Err(error("reader outside novel"));}
+        self.d1.check_open_reader(self.d1.as_ref(),prefix,lease).await?;
+        let stream=AssetStore::read_stream_range(self,key,range).await?;
+        self.d1.check_open_reader(self.d1.as_ref(),prefix,lease).await?;
+        Ok(stream)
     })}
 
     /// Immutable fingerprints validate against the canonical digest rows, not
@@ -654,8 +657,11 @@ impl ObjectStore for ContentStore {
     })}
     fn access_fence(&self)->Option<&dyn narou_rs::platform::NovelAccessFence>{Some(self.legacy.as_ref())}
     fn read_stream_leased<'a>(&'a self,prefix:&'a narou_rs::platform::ObjectPrefix,lease:&'a narou_rs::platform::GateLease,key:&'a ObjectKey,range:std::ops::Range<u64>)->PlatformFuture<'a,Result<Option<AssetStream>>>{Box::pin(async move{
-        use narou_rs::platform::NovelAccessFence;
-        if !prefix.matches(key){return Err(error("reader outside novel"));}self.legacy.renew_reader(prefix,lease,narou_rs::platform::READER_LEASE_SECS).await?;let stream=self.read_stream_range(key,range).await?;self.legacy.renew_reader(prefix,lease,narou_rs::platform::READER_LEASE_SECS).await?;Ok(stream)
+        if !prefix.matches(key){return Err(error("reader outside novel"));}
+        self.legacy.check_open_reader(self.legacy.as_ref(),prefix,lease).await?;
+        let stream=self.read_stream_range(key,range).await?;
+        self.legacy.check_open_reader(self.legacy.as_ref(),prefix,lease).await?;
+        Ok(stream)
     })}
 
     fn stat<'a>(&'a self,key:&'a ObjectKey) -> PlatformFuture<'a,Result<Option<ObjectMetadata>>> {

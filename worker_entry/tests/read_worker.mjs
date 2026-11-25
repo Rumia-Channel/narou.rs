@@ -628,6 +628,13 @@ try {
         ? 'repeated missing illustrations are probed once per EPUB'
         : 'image-free EPUB reads each immutable section only once',
       async () => {
+        await sql([
+          'CREATE TABLE fixture_epub_renewals (renewed INTEGER NOT NULL)',
+          `CREATE TRIGGER fixture_epub_renewal AFTER UPDATE OF expires_at ON novel_reader_leases
+           WHEN NEW.prefix = ${quote(novelPrefix(novel))}
+           BEGIN INSERT INTO fixture_epub_renewals VALUES (1); END`,
+        ]);
+        try {
         const startIndex = fixture.requests.length;
         const start = performance.now();
         const response = await admin(reader.base, `/api/novels/${novel.id}/download.epub`);
@@ -644,9 +651,11 @@ try {
         const imageProbes = requests.filter(request =>
           request.method === 'GET' &&
           request.logicalKey === `${novelPrefix(novel)}/挿絵/illust.png`);
+        const renewals = await scalar('SELECT COUNT(*) FROM fixture_epub_renewals');
         console.log('    EPUB I/O ' + JSON.stringify({
           images: novel.withIllustration ? 'repeated-missing' : 'none',
           sections: novel.sections.length, bodyReads: bodyReads.length,
+          renewals,
           imageProbes: imageProbes.length, totalRequests: requests.length,
           headersMs: Math.round(headersMs), totalMs: Math.round(performance.now() - start),
         }));
@@ -654,6 +663,11 @@ try {
           'snapshot validation must not download the same immutable bodies again');
         assert.equal(imageProbes.length, novel.withIllustration ? 1 : 0,
           'missing-image probes must be bounded by distinct references');
+        assert(renewals < novel.sections.length / 2,
+          `opening chapters must not write a lease on every open (observed ${renewals} renewals)`);
+        } finally {
+          await sql(['DROP TRIGGER fixture_epub_renewal', 'DROP TABLE fixture_epub_renewals']);
+        }
       },
     );
   }

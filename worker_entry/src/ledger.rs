@@ -453,7 +453,10 @@ impl D1JobLedger {
     pub(crate) async fn pending_creation_releases(&self, cursor: Option<&str>, limit: usize) -> Result<(Vec<JobId>, Option<String>)> {
         let limit = limit.clamp(1, 100);
         let rows = self.prepare(
-            "SELECT job_id FROM worker_jobs WHERE job_id>? AND status IN ('succeeded','partial','blocked','permanent') AND (execution_token IS NULL OR lease_until<=?) AND json_extract(checkpoint_json,'$.creation_reservation') IS NOT NULL ORDER BY job_id LIMIT ?",
+            "SELECT job_id FROM worker_jobs INDEXED BY worker_jobs_terminal_checkpoint
+             WHERE job_id>? AND status IN ('succeeded','partial','blocked','permanent') AND checkpoint_json IS NOT NULL
+             AND (execution_token IS NULL OR lease_until<=?) AND json_extract(checkpoint_json,'$.creation_reservation') IS NOT NULL
+             ORDER BY job_id LIMIT ?",
             vec![BindValue::Text(cursor.unwrap_or("").to_owned()), BindValue::Text(self.now_rfc3339()), BindValue::Int(limit as i64)],
         )?.all().await.map_err(worker_error)?.results::<JobIdRow>().map_err(worker_error)?;
         let next = if rows.len() == limit { rows.last().map(|row| row.job_id.clone()) } else { None };

@@ -9,7 +9,7 @@ use narou_rs::platform::{
     AssetStream, GateState, NovelAccessFence, ObjectKey, ObjectPrefix,
     ObjectStore, mocks::MemoryObjectStore,
 };
-use reader_storage::{ReaderStores, StagingTarget};
+use reader_storage::{ReaderLeaseAuthority, ReaderLeaseCheck, ReaderStores, StagingTarget};
 
 fn stream(bytes: &[u8]) -> AssetStream {
     Box::pin(futures::stream::iter([Ok(bytes.to_vec())]))
@@ -72,6 +72,26 @@ fn section_key() -> ObjectKey {
     ObjectKey::try_new("novels/site/book/本文/1.yaml").unwrap()
 }
 
+struct MemoryLeaseCheck;
+
+impl ReaderLeaseCheck for MemoryLeaseCheck {
+    fn check_open<'a>(
+        &'a self,
+        renewal: &'a dyn NovelAccessFence,
+        prefix: &'a ObjectPrefix,
+        lease: &'a narou_rs::platform::GateLease,
+    ) -> narou_rs::platform::PlatformFuture<'a, narou_rs::error::Result<()>> {
+        Box::pin(async move {
+            renewal.renew_reader(prefix, lease, narou_rs::platform::access_fence::READER_LEASE_SECS)
+                .await.map(drop)
+        })
+    }
+}
+
+fn delegated_fence(controls: Arc<dyn NovelAccessFence>) -> ReaderLeaseAuthority {
+    ReaderLeaseAuthority { controls, checks: Arc::new(MemoryLeaseCheck) }
+}
+
 /// The reader delegates admission to its own fence authority, never to the
 /// source store's own fence: the source fence rows must stay untouched so a
 /// miswired delivery store cannot lease (and therefore write) through it.
@@ -87,7 +107,7 @@ async fn reader_admission_uses_the_delegated_fence_not_the_source_store() {
         source.clone(),
         source.clone(),
         Some(StagingTarget::new(staging.clone(), staging)),
-        Some(authority.clone()),
+        Some(delegated_fence(authority.clone())),
     );
     let objects = reader.objects();
 
@@ -150,7 +170,7 @@ async fn closed_or_replaced_gate_denies_the_lease_everywhere() {
         source.clone(),
         source.clone(),
         None,
-        Some(authority.clone()),
+        Some(delegated_fence(authority.clone())),
     );
     let objects = reader.objects();
     let mut lease = NovelReadLease::admit(&objects, &prefix, "reader-test").await.unwrap();
@@ -186,9 +206,8 @@ async fn closed_or_replaced_gate_denies_the_lease_everywhere() {
     next.release().await.unwrap();
 }
 
-/// `read_stream_leased` runs the renew → read → renew contract through the
-/// delegated fence: an expired or fabricated lease never reaches the source
-/// bytes, and each admitted read still streams the real content.
+/// A fabricated lease never reaches the source bytes, and an admitted
+/// read still streams the real content.
 #[tokio::test]
 async fn leased_chunk_reads_stay_pinned_to_the_admitted_lease() {
     use futures::StreamExt;
@@ -201,7 +220,7 @@ async fn leased_chunk_reads_stay_pinned_to_the_admitted_lease() {
         source.clone(),
         source.clone(),
         None,
-        Some(authority.clone()),
+        Some(delegated_fence(authority.clone())),
     );
     let objects = reader.objects();
 
@@ -266,7 +285,7 @@ async fn mutable_fingerprint_fallback_keeps_the_original_admitted_reader() {
     let prefix = novel_prefix();
     let key = section_key();
     ObjectStore::write_small(source.as_ref(), &key, b"original".to_vec()).await.unwrap();
-    let reader = ReaderStores::new(Arc::new(LeasedOnlySource(source.clone())), source.clone(), None, Some(authority.clone()));
+    let reader = ReaderStores::new(Arc::new(LeasedOnlySource(source.clone())), source.clone(), None, Some(delegated_fence(authority.clone())));
     let mut lease = NovelReadLease::admit(&reader.objects(), &prefix, "fingerprint-reader").await.unwrap();
     let fingerprints = [ObjectFingerprint { key: key.clone(), sha256: Sha256::digest(b"original").into() }];
     assert_eq!(lease.verify_fingerprints(&fingerprints).await.unwrap(), None);

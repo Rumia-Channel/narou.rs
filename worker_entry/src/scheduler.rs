@@ -136,7 +136,7 @@ fn creation_recovery_error(error: impl std::fmt::Display) -> NarouError {
 /// relying on `DELETE ... LIMIT` (which D1's SQLite dialect does not accept).
 async fn sweep_expired_reader_leases(runtime: &WorkerRuntime) -> Result<()> {
     runtime.write_db()
-        .prepare("DELETE FROM novel_reader_leases WHERE (prefix, reader_id) IN (SELECT prefix, reader_id FROM novel_reader_leases WHERE expires_at <= unixepoch() LIMIT 500)")
+        .prepare("DELETE FROM novel_reader_leases WHERE (prefix, reader_id) IN (SELECT prefix, reader_id FROM novel_reader_leases WHERE expires_at <= unixepoch() ORDER BY expires_at LIMIT 500)")
         .run().await.map_err(|error| NarouError::Platform(format!("reader lease reaper: {error}")))?;
     Ok(())
 }

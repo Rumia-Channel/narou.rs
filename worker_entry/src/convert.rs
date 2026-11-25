@@ -260,9 +260,8 @@ async fn convert(
 /// 変換テキストは EPUB のダウンロード時に組み立て直す。true にすると
 /// ダウンロードのたびの変換を省ける代わりに 1 作品あたり数 MB を D1 に持つ。
 pub(crate) async fn keep_converted_text(runtime: &WorkerRuntime) -> bool {
-    let local = runtime
-        .settings_store()
-        .load(narou_rs::setting_core::SettingScope::Local)
+    let local = crate::d1_repository::D1SettingsStore::for_writes(runtime.write_db().clone())
+        .load_selected(narou_rs::setting_core::SettingScope::Local, &["convert.keep-txt"])
         .await
         .unwrap_or_default();
     keep_converted_text_with(&local)
