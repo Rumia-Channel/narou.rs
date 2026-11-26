@@ -2,10 +2,9 @@
 //! browser check.
 //!
 //! Some sites answer a request they do not trust with a challenge page that
-//! only a real browser can pass. A site definition can then describe how the
-//! browser obtains the token: which script to load, which function to call
-//! and which cookie carries the result. The values are site data, so they live
-//! in the YAML definition and no site is special-cased in Rust.
+//! only a real browser can pass. A site definition can use the page's normal
+//! flow or specify the SDK it publishes. The expected cookie name and SDK
+//! details live in YAML; no site is special-cased in Rust.
 
 use serde::de;
 use serde::{Deserialize, Serialize};
@@ -19,10 +18,15 @@ use crate::platform::http::{MAX_HEADER_NAME_BYTES, is_safe_header_name};
 /// the browser helper.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserTokenSetting {
-    /// URL of the script that issues the token.
-    pub script_url: String,
-    /// Dotted path of the JavaScript function that issues the token.
-    pub function: String,
+    /// Wait for the page's normal browser flow to issue the cookie.
+    #[serde(default)]
+    pub wait_for_page: bool,
+    /// URL of the configured SDK, when the page does not issue the token itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_url: Option<String>,
+    /// Dotted path of the configured SDK function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
     /// Name of the cookie that carries the issued token.
     pub cookie_name: String,
 }
@@ -34,8 +38,15 @@ impl BrowserTokenSetting {
     /// never repeated, so an error can be logged without leaking the script
     /// URL.
     pub fn validate(&self) -> Result<(), String> {
-        validate_script_url(&self.script_url)?;
-        validate_function_path(&self.function)?;
+        match (self.wait_for_page, &self.script_url, &self.function) {
+            (true, None, None) => {}
+            (false, Some(script_url), Some(function)) => {
+                validate_script_url(script_url)?;
+                validate_function_path(function)?;
+            }
+            (true, _, _) => return Err("browser_token.wait_for_page cannot be combined with script_url or function".to_string()),
+            (false, _, _) => return Err("browser_token requires script_url and function unless wait_for_page is enabled".to_string()),
+        }
         validate_cookie_name(&self.cookie_name)?;
         Ok(())
     }
@@ -113,12 +124,25 @@ mod tests {
 
     fn settings(script_url: &str, function: &str, cookie_name: &str) -> BrowserTokenSetting {
         BrowserTokenSetting {
-            script_url: script_url.to_string(),
-            function: function.to_string(),
+            wait_for_page: false,
+            script_url: Some(script_url.to_string()),
+            function: Some(function.to_string()),
             cookie_name: cookie_name.to_string(),
         }
     }
 
+
+    #[test]
+    fn page_flow_requires_explicit_opt_in_and_no_sdk() {
+        for (definition, valid) in [
+            ("cookie_name: example", false),
+            ("cookie_name: example\nwait_for_page: true", true),
+            ("cookie_name: example\nwait_for_page: true\nscript_url: https://example.com/sdk.js", false),
+        ] {
+            let setting: BrowserTokenSetting = serde_yaml::from_str(definition).unwrap();
+            assert_eq!(setting.validate().is_ok(), valid, "{definition}");
+        }
+    }
 
     #[test]
     fn only_https_scripts_without_credentials_or_fragments_are_accepted() {

@@ -16,7 +16,7 @@ over18_pattern: ^alphapolis_r18::1$
 append_title_to_folder_name: yes
 title_strip_pattern: null
 sitename: *name
-version: 1.4
+version: 1.5
 min_interval: 2
 # 元ページの CSRF セッションを本文の POST に引き継ぐ。
 cookie_session: true
@@ -26,6 +26,10 @@ login_url: \\k<top_url>/login
 login_pattern: '<form\b[^>]*id="UserLoginForm"'
 error_message: '<form\b[^>]*id="UserLoginForm"'
 login_partial_pattern: '(?m:^alphapolis_partial::1$)'
+# SDK を別途読み込まず、公開ページでサイト自身が発行した Cookie のみ使う。
+browser_token:
+  wait_for_page: true
+  cookie_name: aws-waf-token
 
 preprocess: |-
   guard "AlphapolisPreprocessed"

@@ -58,7 +58,7 @@ fn subtitle(id: usize) -> SubtitleInfo {
 }
 
 #[derive(Default)]
-struct ReaderFixture { paid: bool, r18: bool, captcha: bool, illustrated: bool, login_wall: bool, anonymous_toc: AtomicUsize }
+struct ReaderFixture { paid: bool, r18: bool, captcha: bool, illustrated: bool, login_wall: bool, waf: bool, anonymous_toc: AtomicUsize }
 
 impl HttpClient for ReaderFixture {
     fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
@@ -87,6 +87,10 @@ impl HttpClient for ReaderFixture {
 $('div#novelBody').load('{BODY}', {{'episode': {id}, 'token': 'public-token'}});</script>"#),
                     vec![("Set-Cookie".into(), "sid=csrf-session; Path=/; Secure; HttpOnly".into())])
             } else if request.url == BODY && request.method == HttpMethod::Post {
+                if self.waf && !request.header("Cookie").is_some_and(|cookie| cookie.contains("aws-waf-token=issued")) {
+                    return Ok(HttpResponse {status:202, headers:vec![("x-amzn-waf-action".into(),"challenge".into())],
+                        body:b"<p>Browser check</p>".to_vec()});
+                }
                 if request.header("Cookie").is_none_or(|cookie|!cookie.split(';').any(|part|part.trim()=="sid=csrf-session"))
                     || request.header("X-CSRF-TOKEN") != Some("csrf")
                     || request.header("X-Requested-With") != Some("XMLHttpRequest")
@@ -203,6 +207,22 @@ async fn captcha_is_an_error_not_saved_text() {
     let setting=site(); let limiter=FakeRateLimiter::new();
     let error=download_section(&ReaderFixture {captcha:true,..Default::default()}, &limiter, &mut SectionCache::new(), &setting, &subtitle(1), TOP, &mut PreprocessJobs::new()).await.unwrap_err();
     assert!(matches!(error,NarouError::SiteSetting(_)));
+}
+
+#[tokio::test]
+async fn waf_on_episode_post_stays_an_auth_error_and_fresh_cookie_keeps_the_csrf_flow() {
+    let mut setting = site();
+    assert!(setting.browser_token.as_ref().is_some_and(|token| token.wait_for_page && token.cookie_name == "aws-waf-token"));
+    let http = ReaderFixture { waf: true, ..Default::default() };
+    let limiter = FakeRateLimiter::new();
+    let mut cache = SectionCache::new();
+    let mut jobs = PreprocessJobs::new();
+    let sub = subtitle(1);
+    let error = download_section(&http, &limiter, &mut cache, &setting, &sub, TOP, &mut jobs).await.unwrap_err();
+    assert!(matches!(error, NarouError::Login(message) if message.contains("AWS WAF challenge")));
+    setting.cookie = Some("aws-waf-token=issued".into());
+    let (episode, _) = download_section(&http, &limiter, &mut cache, &setting, &sub, TOP, &mut jobs).await.unwrap();
+    assert_eq!(episode.body, TEXTS[1]);
 }
 
 #[tokio::test]

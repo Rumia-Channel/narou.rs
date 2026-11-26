@@ -10,12 +10,11 @@
 //! 1. 親が検証済みの Browser エンドポイントへ短期の接続を開く (受信サイズの上限
 //!    は接続時に決めておく)。
 //! 2. 対象オリジンのページを選び、flatten セッションで接続する。
-//! 3. 1 個の IIFE で、DOM の準備を待ち → 関数が無ければ設定されたスクリプトを
-//!    読み込み → 関数を `this` を保ったまま呼び、返り値は捨てる。
-//! 4. 設定された Cookie がブラウザに存在するか確かめる (値は見ない)。
+//! 3. SDK モードでは定義の関数を呼ぶ。ページモードでは注入せず、対象 URL に
+//!    適用される Cookie がサイト自身から発行されるまで観測する。
 //!
-//! トークンの値は外へ出さない (ログにも載せない)。発行できたことは「サーバが
-//! トークンを受け付ける」証明ではないため、既存の取得・検証の流れはそのまま残す。
+//! Cookie はログに出さない。発行だけでは受理されたことにならないため、
+//! 実際の取得・検証は既存の経路へ戻す。
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +27,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 待ち時間の上限 (全体の期限)。
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A normal page flow has no user interaction in automatic mode.
+const PAGE_TIMEOUT: Duration = Duration::from_secs(15);
+const PAGE_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 /// 受け入れる DevTools メッセージの上限 (受信前に設定する)。
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -45,8 +48,9 @@ pub(super) fn prepare_token(
     websocket_url: &str,
     config: &BrowserTokenSetting,
     target_url: &str,
-) -> Result<(), String> {
-    prepare_token_until(websocket_url, config, target_url, OVERALL_TIMEOUT)
+) -> Result<Option<Vec<(String, String)>>, String> {
+    let timeout = if config.wait_for_page { PAGE_TIMEOUT } else { OVERALL_TIMEOUT };
+    prepare_token_until(websocket_url, config, target_url, timeout)
 }
 
 /// 期限を区切った版 (テストでは短い期限を渡せる)。
@@ -55,8 +59,11 @@ fn prepare_token_until(
     config: &BrowserTokenSetting,
     target_url: &str,
     timeout: Duration,
-) -> Result<(), String> {
+) -> Result<Option<Vec<(String, String)>>, String> {
     let target = url::Url::parse(target_url).map_err(|_| "対象 URL が不正です".to_string())?;
+    if config.wait_for_page && target.scheme() != "https" {
+        return Err("確認トークンの取得には HTTPS が必要です".to_string());
+    }
     let deadline = Instant::now() + timeout;
     let mut socket = super::connect_devtools(websocket_url, CONNECT_TIMEOUT.min(timeout))?;
     socket.set_config(|config| {
@@ -64,9 +71,59 @@ fn prepare_token_until(
         config.max_frame_size = Some(MAX_MESSAGE_BYTES);
     });
     let mut cdp = Cdp::new(socket, deadline);
-    let session = attach_page(&mut cdp, &target)?;
-    issue_token(&mut cdp, &session, &config.function, &config.script_url, &target.origin().ascii_serialization())?;
-    verify_cookie(&mut cdp, &config.cookie_name, &target)?;
+    if config.wait_for_page {
+        // Use the page the helper already opened. Do not navigate again,
+        // evaluate JavaScript, or extract a script from a challenge response.
+        let session = loop {
+            if let Some(session) = find_page(&mut cdp, &target)? {
+                break session;
+            }
+            wait_for_page_step(deadline)?;
+        };
+        let params = serde_json::json!({ "urls": [target.as_str()] });
+        loop {
+            let cookies = cdp.call("Network.getCookies", &params, Some(&session))?;
+            let captured: Vec<_> = token_cookies(&cookies, &config.cookie_name, &target)?
+                .filter_map(|(domain, cookie)| {
+                    // The saved group does not represent Path or a partition key.
+                    if cookie.get("path").and_then(serde_json::Value::as_str) != Some("/")
+                        || cookie.get("partitionKey").is_some()
+                        || cookie.get("partitionKeyOpaque").and_then(serde_json::Value::as_bool) == Some(true)
+                    {
+                        return None;
+                    }
+                    let value = cookie.get("value")?.as_str()?;
+                    if value.is_empty() || value.contains([';', '\r', '\n', '\0']) {
+                        return None;
+                    }
+                    Some((domain.trim_start_matches('.').to_ascii_lowercase(), format!("{}={value}", config.cookie_name)))
+                })
+                .collect();
+            if !captured.is_empty() {
+                return Ok(Some(captured));
+            }
+            wait_for_page_step(deadline)?;
+        }
+    }
+    let session = find_page(&mut cdp, &target)?
+        .ok_or_else(|| "対象のオリジンにページがありません".to_string())?;
+    let (Some(function), Some(script_url)) = (&config.function, &config.script_url) else {
+        return Err("トークン取得スクリプトの設定が不正です".to_string());
+    };
+    issue_token(&mut cdp, &session, function, script_url, &target.origin().ascii_serialization())?;
+    let cookies = cdp.call("Storage.getCookies", &serde_json::json!({}), None)?;
+    if token_cookies(&cookies, &config.cookie_name, &target)?.next().is_none() {
+        return Err(format!("トークンの Cookie ({}) がブラウザに保存されませんでした", config.cookie_name));
+    }
+    Ok(None)
+}
+
+fn wait_for_page_step(deadline: Instant) -> Result<(), String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining <= PAGE_POLL_INTERVAL {
+        return Err("ページから確認トークンを取得できませんでした。ブラウザで確認してください".to_string());
+    }
+    std::thread::sleep(PAGE_POLL_INTERVAL);
     Ok(())
 }
 
@@ -188,7 +245,7 @@ impl Cdp {
 }
 
 /// 対象オリジンのページを選び、flatten セッションで接続する。
-fn attach_page(cdp: &mut Cdp, target: &url::Url) -> Result<String, String> {
+fn find_page(cdp: &mut Cdp, target: &url::Url) -> Result<Option<String>, String> {
     let targets = cdp.call("Target.getTargets", &serde_json::json!({}), None)?;
     let infos = targets
         .get("targetInfos")
@@ -219,10 +276,10 @@ fn attach_page(cdp: &mut Cdp, target: &url::Url) -> Result<String, String> {
         return attached
             .get("sessionId")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
+            .map(|id| Some(id.to_string()))
             .ok_or_else(|| "対象ページへ接続できませんでした".to_string());
     }
-    Err("対象のオリジンにページがありません".to_string())
+    Ok(None)
 }
 
 /// ページの中でトークンを発行させる (1 個の IIFE で済ませる)。
@@ -278,27 +335,22 @@ fn issue_token(
     }
 }
 
-/// 設定された Cookie がブラウザに存在するか確かめる (値には触れない)。
-fn verify_cookie(cdp: &mut Cdp, cookie_name: &str, target: &url::Url) -> Result<(), String> {
-    let cookies = cdp.call("Storage.getCookies", &serde_json::json!({}), None)?;
+/// Select only cookies of the configured name and in the target's domain scope.
+fn token_cookies<'a>(
+    cookies: &'a serde_json::Value,
+    cookie_name: &'a str,
+    target: &'a url::Url,
+) -> Result<impl Iterator<Item = (&'a str, &'a serde_json::Value)> + 'a, String> {
     let list = cookies
         .get("cookies")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "Cookie の一覧を取得できませんでした".to_string())?;
     let host = target.host_str().unwrap_or_default();
-    let found = list.iter().any(|cookie| {
-        cookie.get("name").and_then(serde_json::Value::as_str) == Some(cookie_name)
-            && cookie
-                .get("domain")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|domain| domain_matches(domain, host))
-    });
-    if found {
-        return Ok(());
-    }
-    Err(format!(
-        "トークンの Cookie ({cookie_name}) がブラウザに保存されませんでした"
-    ))
+    Ok(list.iter().filter_map(move |cookie| {
+        let domain = cookie.get("domain")?.as_str()?;
+        (cookie.get("name")?.as_str()? == cookie_name && domain_matches(domain, host))
+            .then_some((domain, cookie))
+    }))
 }
 
 /// Cookie のドメインが対象ホストの配下か。
@@ -430,6 +482,57 @@ mod tests {
             "cookie_name": COOKIE_NAME,
         }))
         .expect("setting")
+    }
+
+    fn page_setting() -> BrowserTokenSetting {
+        serde_json::from_value(serde_json::json!({
+            "wait_for_page": true,
+            "cookie_name": COOKIE_NAME,
+        })).unwrap()
+    }
+
+    #[test]
+    fn page_flow_waits_for_a_cookie_applicable_to_the_requested_url() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let normal = browser(PAGE_URL);
+        let fixture = Fixture::start(move |method, request| {
+            match method {
+                "Network.getCookies" => {
+                    if request.pointer("/params/urls/0").and_then(serde_json::Value::as_str) != Some(TARGET_URL) {
+                        return None;
+                    }
+                    let domain = if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        "unrelated.example.test"
+                    } else {
+                        "novels.example.test"
+                    };
+                    Some(serde_json::json!({ "cookies": [
+                        { "name": COOKIE_NAME, "domain": domain, "path": "/", "value": "issued" },
+                        { "name": COOKIE_NAME, "domain": "novels.example.test", "path": "/read/", "value": "path-scoped" },
+                        { "name": "session", "domain": "novels.example.test", "path": "/", "value": "not-for-the-helper" },
+                    ] }))
+                }
+                "Target.getTargets" | "Target.attachToTarget" => normal(method, request),
+                _ => None,
+            }
+        });
+        let captured = prepare_token_until(&fixture.websocket_url, &page_setting(), TARGET_URL, Duration::from_secs(2)).unwrap();
+        assert_eq!(captured, Some(vec![("novels.example.test".into(), "example-token=issued".into())]));
+        assert_eq!(fixture.methods(), ["Target.getTargets", "Target.attachToTarget", "Network.getCookies", "Network.getCookies"]);
+    }
+
+    #[test]
+    fn page_flow_never_injects_a_script_when_no_cookie_is_issued() {
+        let normal = browser(PAGE_URL);
+        let fixture = Fixture::start(move |method, request| match method {
+            "Target.getTargets" | "Target.attachToTarget" => normal(method, request),
+            "Network.getCookies" => Some(serde_json::json!({ "cookies": [] })),
+            _ => None,
+        });
+        let error = prepare_token_until(&fixture.websocket_url, &page_setting(), TARGET_URL, Duration::from_millis(200)).unwrap_err();
+        assert!(error.contains("ブラウザで確認"), "{error}");
+        assert!(!fixture.methods().iter().any(|method| method == "Runtime.evaluate"));
     }
 
     /// 正常な DevTools の応答 (ページは対象オリジンにある)。

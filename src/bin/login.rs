@@ -59,7 +59,7 @@ struct Args {
     /// ブラウザのリモートデバッグポート (0 = ブラウザに空きポートを選ばせる)
     #[arg(long, default_value_t = 0)]
     port: u16,
-    /// サイト定義の SDK でブラウザ確認トークンを準備する
+    /// サイト定義に従い、ブラウザ確認トークンを準備する
     #[arg(long, conflicts_with = "cookie")]
     browser_token: bool,
     /// Private credential-helper protocol (stdout contains the token).
@@ -163,10 +163,11 @@ fn run(args: Args) -> std::result::Result<(), String> {
         if !args.token_json {
             println!("{login_url} をブラウザで開きます。確認・ログインが終わったら Enter を押してください。");
         }
-        // Port 0 advertises WebDriver automation in Chromium. This explicit
-        // token mode uses a free nonzero port, authenticated by the child's
-        // own endpoint announcement before any cookies are read.
-        let port = if args.browser_token && args.port == 0 {
+        // Retain the existing SDK helper's nonzero-port setup. Ordinary page
+        // flows use the browser-selected port just like interactive login.
+        let port = if args.browser_token && args.port == 0
+            && site.browser_token.as_ref().is_some_and(|token| !token.wait_for_page)
+        {
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
                 .map_err(|_| "ブラウザの起動ポートを確保できません".to_string())?;
             listener.local_addr()
@@ -620,8 +621,12 @@ fn capture_cookies(
     if mode != CaptureMode::Interactive {
         let config = site.browser_token.as_ref()
             .ok_or_else(|| "このサイトにはブラウザトークン取得が定義されていません".to_string())?;
-        browser_token::prepare_token(&websocket_url, config, target_url)?;
-        if mode != CaptureMode::TokenJson {
+        if mode == CaptureMode::TokenJson || !config.wait_for_page {
+            if let Some(captured) = browser_token::prepare_token(&websocket_url, config, target_url)? {
+                return Ok(captured);
+            }
+        }
+        if mode != CaptureMode::TokenJson && !config.wait_for_page {
             println!("ブラウザの確認トークンを準備しました。確認が終わったら Enter で保存します。");
         }
     }
