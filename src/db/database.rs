@@ -374,7 +374,30 @@ impl Database {
         &mut self, fence: &crate::platform::WriteFence, id: crate::platform::NovelId,
         update: impl FnOnce(&mut NovelRecord) -> Result<()>,
     ) -> Result<bool> {
-        let mutation = record_mutation::RecordMutation::ExistingRow { fence, id };
+        self.update_existing_record(record_mutation::RecordMutation::ExistingRow { fence, id }, id, update)
+    }
+
+    pub(crate) fn mark_update_checked_with_fence(
+        &mut self, fence: &crate::platform::WriteFence, id: crate::platform::NovelId,
+    ) -> Result<bool> {
+        let mutation = if self.using_sqlite() {
+            record_mutation::RecordMutation::ExistingRow { fence, id }
+        } else {
+            record_mutation::RecordMutation::UpdateChecked { fence, id }
+        };
+        self.update_existing_record(mutation, id, |record| {
+            if !record_mutation::record_in_prefix(record, &fence.prefix)? {
+                return Err(crate::error::NarouError::Platform("record origin outside captured fence".into()));
+            }
+            crate::application::novel_actions::mark_update_checked(record, chrono::Utc::now());
+            Ok(())
+        })
+    }
+
+    fn update_existing_record(
+        &mut self, mutation: record_mutation::RecordMutation<'_>, id: crate::platform::NovelId,
+        update: impl FnOnce(&mut NovelRecord) -> Result<()>,
+    ) -> Result<bool> {
         self.update_records_inner(false, None, Some(mutation), |mut records, members| {
             let found = if let Some(record) = records.get_mut(&id.0) {
                 update(record)?;
@@ -759,14 +782,18 @@ impl Database {
                     let members = if let Some(path) = members_path.as_deref() {
                         parse_members(files.original(path)?)?
                     } else { Default::default() };
-                    let record_claims = record_mutation::prepare(
-                        self.inventory.root_dir(), None, &current, transfer_marker, mutation,
-                    )?;
+                    let record_claims = if record_mutation::can_stamp_checked_yaml(self.inventory.root_dir(), &current, mutation)? {
+                        None
+                    } else {
+                        Some(record_mutation::prepare(
+                            self.inventory.root_dir(), None, &current, transfer_marker, mutation,
+                        )?)
+                    };
                     let (mut updated, members, result) = update(current, members)?;
                     for (id, record) in updated.iter_mut() {
                         record.id = *id;
                     }
-                    record_claims.validate(&updated)?;
+                    if let Some(claims) = &record_claims { claims.validate(&updated)?; }
                     let written = tags_of_records(&updated);
                     let (content, changed) = crate::native::tag_sequence::advance_content(
                         files.original(&sequence_path)?.unwrap_or_default(),
@@ -802,7 +829,7 @@ impl Database {
                     }
                     Ok((result, record_claims, content, updated))
                 })?;
-                record_claims.finish_yaml(self.inventory.root_dir())?;
+                if let Some(claims) = record_claims { claims.finish_yaml(self.inventory.root_dir())?; }
                 let updated = Arc::new(updated);
                 self.inventory.remember_novel_records(content, Arc::clone(&updated));
                 Ok((result, updated))
@@ -1866,6 +1893,44 @@ mod tests {
             }
             assert_eq!(Database::with_root(root).unwrap().get(1).unwrap().title, "title 1");
         }
+    }
+
+    #[test]
+    fn yaml_update_stamp_respects_a_bound_folder_owner() {
+        use crate::platform::{NovelAccessFence, NovelId, NovelObjectKeys, ObjectPrefix};
+        let _global = crate::test_support::global_state_guard();
+        let root = tempfile::tempdir().unwrap();
+        let mut db = Database::with_root(root.path().to_path_buf()).unwrap();
+        let mut record = sample_record(1, None, &["modified", "user tag"]);
+        record.end = true;
+        let original_url = record.toc_url.clone();
+        let prefix = ObjectPrefix::from(NovelObjectKeys::new(&record.sitename, &record.file_title, false).unwrap().prefix().clone());
+        db.update_records(|mut rows| {
+            rows.insert(record.id, record);
+            Ok((rows, ()))
+        }).unwrap();
+        let store = crate::native::object_store::NativeStore::for_narou_root(root.path()).unwrap();
+        let fence = futures::executor::block_on(store.capture_writer(&prefix)).unwrap();
+        store.with_open_write(&fence, || db.with_library_metadata_snapshot(|inventory, primary| {
+            crate::native::transfer::with_control_metadata_snapshot(inventory.root_dir(), primary, |connection| {
+                crate::native::object_store::bind_namespace_origin(root.path(), connection, &prefix, &original_url)
+            })
+        })).unwrap();
+
+        assert!(store.with_open_write(&fence, || db.mark_update_checked_with_fence(&fence, NovelId(1))).unwrap());
+        let mut current = std::collections::BTreeMap::from([(1, db.get(1).unwrap().clone())]);
+        assert_eq!(current[&1].tags, ["user tag", "end"]);
+        assert!(current[&1].last_check_date.is_some());
+
+        // An external YAML writer has reused the ID and folder. The gate
+        // still belongs to the earlier work even though the epoch is open.
+        current.get_mut(&1).unwrap().toc_url = "https://example.com/replacement/".into();
+        let path = root.path().join(".narou/database.yaml");
+        let replacement = serde_yaml::to_string(&current).unwrap();
+        std::fs::write(&path, &replacement).unwrap();
+        let error = store.with_open_write(&fence, || db.mark_update_checked_with_fence(&fence, NovelId(1))).unwrap_err();
+        assert!(error.to_string().contains("identity_conflict"), "{error}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), replacement);
     }
 
     fn virtual_identity_fixture(root: &std::path::Path, mode: u8, id: i64) -> (

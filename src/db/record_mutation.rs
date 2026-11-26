@@ -34,6 +34,7 @@ pub(super) enum RecordMutation<'a> {
     },
     VirtualFences(&'a [WriteFence]),
     ExistingRow { fence: &'a WriteFence, id: NovelId },
+    UpdateChecked { fence: &'a WriteFence, id: NovelId },
 }
 
 /// Durable gate origins captured before the record commit decides. The SQL
@@ -117,6 +118,29 @@ fn assert_identity_conn(
     } else { Ok(false) }
 }
 
+/// A check result can touch only the existing row's timestamp and status
+/// tags. It cannot create a namespace conflict. The caller holds the
+/// original OPEN epoch and the YAML metadata locks throughout this check.
+pub(super) fn can_stamp_checked_yaml(
+    root: &std::path::Path,
+    current: &BTreeMap<i64, NovelRecord>,
+    mutation: Option<RecordMutation<'_>>,
+) -> Result<bool> {
+    let Some(RecordMutation::UpdateChecked { fence, id }) = mutation else { return Ok(false); };
+    let Some(record) = current.get(&id.0) else { return Ok(true); };
+    if crate::virtual_novel::is_virtual_record(record)
+        || crate::virtual_novel::is_portable_toc_url(&record.toc_url)
+    {
+        return Ok(false);
+    }
+    if read_fs_gate_origin(root, &fence.prefix)?
+        .is_some_and(|origin| !origin.is_empty() && origin != crate::db::novel_codec::fold(&record.toc_url))
+    {
+        return Err(identity_error());
+    }
+    Ok(true)
+}
+
 pub(super) fn prepare<'a>(
     root: &std::path::Path,
     connection: Option<&Connection>,
@@ -130,7 +154,7 @@ pub(super) fn prepare<'a>(
         }
         let fences = match mutation {
             Some(RecordMutation::VirtualFences(fences)) => fences,
-            Some(RecordMutation::ExistingRow { fence, .. }) => std::slice::from_ref(fence),
+            Some(RecordMutation::ExistingRow { fence, .. } | RecordMutation::UpdateChecked { fence, .. }) => std::slice::from_ref(fence),
             _ => &[],
         };
         if !fences.is_empty() {
@@ -224,7 +248,7 @@ pub(super) fn prepare<'a>(
                 });
                 None
             }
-            Some(RecordMutation::VirtualFences(_) | RecordMutation::ExistingRow { .. }) | None => None,
+            Some(RecordMutation::VirtualFences(_) | RecordMutation::ExistingRow { .. } | RecordMutation::UpdateChecked { .. }) | None => None,
         };
         Ok(PreparedRecords { claims, creation, rebind })
     };

@@ -12,7 +12,7 @@ use indicatif::MultiProgress;
 
 use narou_rs::application::convert::{NoConvertScope, needs_convert_after_download};
 use narou_rs::application::messages::{self, MessageSink, Stream};
-use narou_rs::application::novel_actions::{mark_convert_failure, mark_update_checked};
+use narou_rs::application::novel_actions::mark_convert_failure;
 use narou_rs::application::target_lookup::{
     TagExpansionVariant, TargetLookupPlan, UrlSource, expand_tag_targets_sync,
     resolve_target_record_sync,
@@ -549,10 +549,7 @@ fn extract_title_from_file_title(file_title: &str) -> String {
 
 fn record_update_check(write: &narou_rs::application::novel_access::NovelWriteGuard, id: i64) -> narou_rs::error::Result<()> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    novels.update_existing_guarded_sync(write.fence(), id.into(), |record| {
-        mark_update_checked(record, Utc::now());
-        Ok(())
-    })?;
+    novels.mark_update_checked_sync(write.fence(), id.into())?;
     narou_rs::progress::emit_novel_refresh(id);
     Ok(())
 }

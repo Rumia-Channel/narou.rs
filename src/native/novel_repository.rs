@@ -180,6 +180,13 @@ impl NativeNovelRepository {
         }))
     }
 
+    /// Persist the check date and managed status tags under the original OPEN epoch.
+    pub fn mark_update_checked_sync(&self, fence: &crate::platform::WriteFence, id: NovelId) -> Result<bool> {
+        current_store()?.with_open_write(fence, || {
+            crate::db::with_database_mut(|db| db.mark_update_checked_with_fence(fence, id))
+        })
+    }
+
     pub fn find_by_toc_url_sync(&self, url: &str) -> Result<Option<NovelRecord>> {
         crate::db::with_database(|db| Ok(db.get_by_toc_url(url).cloned()))
     }
