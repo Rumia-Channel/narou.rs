@@ -140,12 +140,15 @@ fn refresh_with(
         }
         (TokenState::capture(&groups, cookie_name), selected)
     };
-    // A profile of our own: the helper may be stopped at any time and the
-    // directory still disappears with this scope.
+    // Own the profile in this process so even a stopped helper is cleaned up.
     let profile = crate::native::browser_profile::BrowserProfile::new()
         .map_err(|_| login_error(ERROR_PROFILE))?;
     let payload = run(target_url, profile.path());
-    profile.close().map_err(|_| login_error("ブラウザの一時プロファイルを削除できませんでした"))?;
+    // Cleanup is independent of the browser result. A lingering browser handle
+    // must not discard a valid reply or replace the original helper error.
+    if let Err(error) = profile.close() {
+        tracing::warn!(%error, "ブラウザの一時プロファイルを削除できませんでした");
+    }
     let payload = payload?;
     let tokens = parse_token_payload(&payload, site, target_url, cookie_name)?;
     let group = store.update_groups(|sites| {
@@ -578,6 +581,54 @@ mod tests {
         refresh_with(store, site, "https://novelup.plus/story/1", COOKIE, session_id, |_, _| {
             Ok(payload)
         })
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_profile_does_not_override_the_browser_result() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let _legacy = legacy_yaml_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = set_current_dir_for_test(temp.path());
+        let store = store_in(&temp);
+        store
+            .save_groups_for(SITE, &[group("account", &[(SITE, "sid=abc; aws-waf-token=old")])])
+            .unwrap();
+
+        for succeeds in [false, true] {
+            let mut lock = None;
+            let outcome = refresh_with(&store, SITE, "https://novelup.plus/story/1", COOKIE, Some("account"), |_, profile| {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .share_mode(0)
+                    .open(profile.join("locked"))
+                    .unwrap();
+                lock = Some((file, profile.to_owned()));
+                if succeeds {
+                    Ok(payload(SITE, COOKIE, &[(SITE, "aws-waf-token=new")]))
+                } else {
+                    Err(login_error(ERROR_HELPER_FAILED))
+                }
+            });
+            let (file, profile) = lock.unwrap();
+            let remained_locked = profile.join("locked").is_file();
+            drop(file);
+            crate::native::browser_profile::remove(&profile).unwrap();
+            assert!(remained_locked, "Windows must refuse to delete the locked profile");
+
+            let expected = if succeeds {
+                let refreshed = outcome.unwrap().unwrap();
+                assert_eq!(refreshed.id, "account");
+                assert_eq!(refreshed.merged_cookie(), "sid=abc; aws-waf-token=new");
+                "sid=abc; aws-waf-token=new"
+            } else {
+                assert!(matches!(outcome, Err(NarouError::Login(message)) if message == ERROR_HELPER_FAILED));
+                "sid=abc; aws-waf-token=old"
+            };
+            assert_eq!(store.groups_for(SITE).unwrap()[0].merged_cookie(), expected);
+        }
     }
 
     #[test]

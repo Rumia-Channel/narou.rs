@@ -208,8 +208,11 @@ fn run(args: Args) -> std::result::Result<(), String> {
             }
         };
         stop_browser(&mut launched.child);
-        if let Some(profile) = token_profile.take() {
-            profile.close().map_err(|_| "ブラウザ確認用の一時プロファイルを削除できません".to_string())?;
+        if let Some(token_profile) = token_profile.take()
+            && let Err(error) = token_profile.close()
+        {
+            // Keep stdout reserved for the private reply.
+            eprintln!("WARN: ブラウザの一時プロファイルを削除できませんでした: {error}");
         }
         if args.profile.is_none() && !args.token_json {
             throwaway_profile = Some(profile);
