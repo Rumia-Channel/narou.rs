@@ -30,28 +30,65 @@ pub(crate) fn legacy_flat_key(key:&ObjectKey)->Result<Option<ObjectKey>>{
 }
 
 pub(crate) fn collect_expired_stage_files(root: &Path) -> Result<()> {
+    collect_expired_stage_files_with(root, |_, file| fs2::FileExt::try_lock_exclusive(file))
+}
+
+fn stage_file_expired(metadata: &fs::Metadata) -> std::io::Result<bool> {
+    Ok(metadata.modified()?.elapsed().is_ok_and(|age| {
+        age.as_secs() > crate::platform::staging::STAGE_TTL_SECONDS as u64
+    }))
+}
+
+fn collect_expired_stage_files_with(
+    root: &Path,
+    mut try_lock: impl FnMut(&Path, &fs::File) -> std::io::Result<()>,
+) -> Result<()> {
     let entries = match fs::read_dir(root.join(".objects").join(".narou-staging")) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
     for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() { continue; }
-        let file = match fs::OpenOptions::new().read(true).write(true).open(entry.path()) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if let Err(error) = fs2::FileExt::try_lock_exclusive(&file) {
-            if error.kind() == std::io::ErrorKind::WouldBlock
-                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() { continue; }
-            return Err(error.into());
+        remove_expired_stage_file(entry?, &mut try_lock)?;
+    }
+    Ok(())
+}
+
+fn remove_expired_stage_file(
+    entry: fs::DirEntry,
+    try_lock: &mut impl FnMut(&Path, &fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    let metadata = match entry.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || !stage_file_expired(&metadata)? {
+        return Ok(());
+    }
+    let path = entry.path();
+    let file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if let Err(error) = try_lock(&path, &file) {
+        if error.kind() == std::io::ErrorKind::WouldBlock
+            || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+        {
+            return Ok(());
         }
-        if file.metadata()?.modified()?.elapsed().unwrap_or_default().as_secs()
-            > crate::platform::staging::STAGE_TTL_SECONDS as u64 {
-            fs::remove_file(entry.path())?;
+        // CIFS can deny an advisory lock with EACCES. Cleanup owns
+        // nothing in that case: leave the stage for a later sweep.
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            tracing::warn!(kind = ?error.kind(), "Skipping expired asset stage after lock denial");
+            return Ok(());
         }
+        return Err(error.into());
+    }
+    // A reader may have renewed the lease before we took the lock.
+    if stage_file_expired(&file.metadata()?)? {
+        fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -3163,6 +3200,43 @@ mod tests {
             assert_eq!(&bytes[size..], &[5; 19]);
             AssetStore::delete(&store, &stage.key).await.unwrap();
         });
+    }
+
+    #[test]
+    fn stage_cleanup_skips_fresh_and_lock_denied_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join(".objects/.narou-staging");
+        fs::create_dir_all(&staging).unwrap();
+        let expired = std::time::SystemTime::now() - std::time::Duration::from_secs(
+            crate::platform::staging::STAGE_TTL_SECONDS as u64 * 2,
+        );
+        fs::File::create(staging.join("fresh")).unwrap();
+        for name in ["denied", "renewed", "reapable"] {
+            fs::File::create(staging.join(name)).unwrap().set_modified(expired).unwrap();
+        }
+
+        let mut denied_attempts = 0;
+        collect_expired_stage_files_with(root.path(), |path, file| {
+            let name = path.file_name().unwrap();
+            if name == "fresh" {
+                panic!("a fresh stage must not be locked by cleanup");
+            }
+            if name == "denied" {
+                denied_attempts += 1;
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            fs2::FileExt::try_lock_exclusive(file)?;
+            if name == "renewed" {
+                file.set_modified(std::time::SystemTime::now())?;
+            }
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(denied_attempts, 1);
+        for name in ["fresh", "denied", "renewed"] {
+            assert!(staging.join(name).is_file(), "cleanup must retain {name}");
+        }
+        assert!(!staging.join("reapable").exists());
     }
 
     #[test]
