@@ -145,8 +145,13 @@ impl FetchPolicy {
     /// Private representation identity; credentials are never exposed or logged.
     /// Independently created response-cookie sessions must not share cached input.
     pub(crate) fn cache_context(&self) -> Option<[u8; 32]> {
+        self.session.is_none().then(|| self.initial_request_context())
+    }
+
+    /// Identity of the configured headers and cookie scopes, before any
+    /// cookies from a response have been observed.
+    pub(super) fn initial_request_context(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
-        if self.session.is_some() { return None; }
         let mut digest = Sha256::new();
         for part in self.headers.iter().flat_map(|(name, value)| [name.as_str(), value.as_str()])
             .chain(self.cookie_hosts.iter().map(String::as_str))
@@ -154,7 +159,7 @@ impl FetchPolicy {
             digest.update((part.len() as u64).to_le_bytes());
             digest.update(part.as_bytes());
         }
-        Some(digest.finalize().into())
+        digest.finalize().into()
     }
 }
 

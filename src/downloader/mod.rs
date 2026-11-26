@@ -17,7 +17,7 @@ pub mod toc;
 pub mod types;
 pub mod util;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "native-runtime")]
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -29,6 +29,7 @@ use chrono::{
 };
 use chrono_tz::Tz;
 use regex::Regex;
+use sha2::{Digest, Sha256};
 
 use self::auth::AuthState;
 use self::novel_info::NovelInfo;
@@ -791,6 +792,10 @@ fn illustration_sources<'a>(
 /// メタデータだけを返すので、画像本体の 64MiB 級 buffer は並行に抱えない)。
 const ILLUSTRATION_VERIFY_WINDOW: usize = 8;
 
+// Retain only fingerprints of failed fetches, not arbitrary-length URLs or
+// response bodies. This bound applies to Worker acquisition invocations too.
+const MAX_FAILED_ILLUSTRATIONS: usize = 1024;
+
 /// 挿絵の索引にあるファイル名を、保存側と同じキー生成で 1 枚ずつ確認する。
 ///
 /// `stat` だけを使うので、ストアの一覧 (LIST) が prefix の解釈差などで空を
@@ -1254,6 +1259,7 @@ impl Downloader {
         object_keys: &NovelObjectKeys,
         illustration_store: &mut crate::illustration_store::IllustrationIndex,
         mut stored_illustrations: Option<&mut std::collections::HashSet<String>>,
+        failed_illustrations: &mut HashSet<[u8; 32]>,
         toc_url: &str,
         raw_html: Option<&str>,
         budget: &mut Option<&mut dyn SectionBudget>,
@@ -1282,6 +1288,7 @@ impl Downloader {
         // Illustration hosts (i.pximg.net) reject requests without the site's
         // headers, and login-only images need the same cookie jar.
         let illustration_policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        let mut request_context = None;
 
         // Parsed sections may omit site-specific image markup. Definitions
         // whose fetched page contains only reader controls can opt out.
@@ -1312,6 +1319,15 @@ impl Downloader {
                     &build_section_url(setting, toc_url, raw_url),
                 );
                 let url = resolved.as_str();
+                let mut failure_key = || {
+                    let context = *request_context
+                        .get_or_insert_with(|| illustration_policy.initial_request_context());
+                    Sha256::new().chain_update(context).chain_update(url.as_bytes()).finalize().into()
+                };
+                let key = (!failed_illustrations.is_empty()).then(&mut failure_key);
+                if key.is_some_and(|key| failed_illustrations.contains(&key)) {
+                    continue;
+                }
                 if self.http.validate_url(url).await.is_err() {
                     self.report_warn(&messages::download::warn_unsafe_illustration_url(url)).await;
                     continue;
@@ -1399,6 +1415,9 @@ impl Downloader {
                         }
                     }
                     Err(err) => {
+                        if failed_illustrations.len() < MAX_FAILED_ILLUSTRATIONS {
+                            failed_illustrations.insert(key.unwrap_or_else(failure_key));
+                        }
                         crate::application::debug::emit_error_async(format!(
                             "挿絵の取得に失敗 ({url}): {err}"
                         )).await;
@@ -2112,6 +2131,9 @@ impl Downloader {
             .load_cache(access.ensure_read().await?, &object_keys)
             .await?
             .unwrap_or_default();
+        // A new download invocation can try these URLs again. Do not write
+        // failures into the persistent illustration index or a checkpoint.
+        let mut failed_illustrations = HashSet::new();
         if setting.illust_grep_pattern.is_none() {
             // 既定パターンは本文の `<img>` 全部に当たるため、セクションごとでは
             // なく小説 1 件につき 1 行だけ出す (24 話で 24 行出していた)。
@@ -2380,6 +2402,7 @@ impl Downloader {
                             &object_keys,
                             &mut illustration_store,
                             stored_illustrations.as_mut(),
+                            &mut failed_illustrations,
                             &toc_url,
                             None,
                             &mut budget,
@@ -2490,6 +2513,7 @@ impl Downloader {
                         &object_keys,
                         &mut illustration_store,
                         stored_illustrations.as_mut(),
+                        &mut failed_illustrations,
                         &toc_url,
                         Some(raw_html.as_str()),
                         &mut budget,
@@ -4433,11 +4457,7 @@ is_narou: false
         );
     }
 
-    /// サイト定義に挿絵パターンが無いサイト (なろう等) でも、ダウンロード時に
-    /// narou.rb 既定の `<img>` パターンで挿絵を取得し、挿絵側のストア
-    /// (Worker では S3) へ保存すること。`SplitStore` で Worker と同じ配線にする。
-    #[tokio::test]
-    async fn default_img_pattern_stores_illustrations_in_the_illustration_store() {
+    fn illustration_test_site() -> SiteSetting {
         let mut setting: SiteSetting = serde_yaml::from_str(
             r#"
 name: Illustration Default Test
@@ -4456,8 +4476,15 @@ is_narou: false
         )
         .unwrap();
         setting.compile();
-        assert!(setting.illust_grep_pattern.is_none());
+        setting
+    }
 
+    /// A site without an illustration pattern still saves illustrations
+    /// to the illustration backend, not to the metadata store.
+    #[tokio::test]
+    async fn default_img_pattern_stores_illustrations_in_the_illustration_store() {
+        let setting = illustration_test_site();
+        assert!(setting.illust_grep_pattern.is_none());
 
         let target = "https://illust-default.test/n1234ab/";
         let http = Arc::new(MockHttpClient::new());
@@ -4592,6 +4619,165 @@ is_narou: false
                 .any(|key| key.ends_with("/挿絵/i88657.jpg")),
             "取り直した挿絵が挿絵側のストアへ戻る"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_illustrations_are_skipped_only_for_the_current_download() {
+        let target = "https://illust-default.test/n1234ab/";
+        let urls = [
+            "https://illust-default.test/images/forbidden.jpg",
+            "https://illust-default.test/images/missing.jpg",
+            "https://illust-default.test/images/unreachable.jpg",
+        ];
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(
+            target,
+            200,
+            r#"<h1>挿絵テスト</h1><span>作者</span><a href="/n1234ab/1/">第1話</a><a href="/n1234ab/2/">第2話</a>"#,
+        );
+        let images = urls.iter().map(|url| format!(r#"<img src="{url}" />"#)).collect::<String>();
+        let available = "https://illust-default.test/images/available.jpg";
+        for episode in [1, 2] {
+            http.add_text(
+                format!("{target}{episode}/"),
+                200,
+                format!(r#"<div class="body">本文{episode}{images}<img src="{available}" /></div>"#),
+            );
+        }
+        http.add_text(urls[0], 403, "forbidden");
+        http.add_text(urls[1], 404, "missing");
+        // No response for urls[2]: the mock returns a transport error.
+        let allow_image = |url: &str| {
+            http.add_response(url, HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), "image/jpeg".into())],
+                body: url.as_bytes().to_vec(),
+            });
+        };
+        allow_image(available);
+
+        let store = Arc::new(MemoryObjectStore::new());
+        let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
+                objects: store.clone(),
+                assets: store.clone(),
+                clock: Arc::new(SystemClock),
+            },
+            vec![illustration_test_site()],
+            HashMap::new(),
+            Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
+        )
+        .unwrap();
+        let options = || DownloadExecutionOptions {
+            force: true,
+            budget: None,
+            resume_from_section: None,
+            access: None,
+            creation_reservation: None,
+        };
+        let image_count = || async {
+            let page = store.list_page(&ObjectListRequest::new(
+                ObjectPrefix::new("").unwrap(), std::num::NonZeroUsize::new(100).unwrap(),
+            )).await.unwrap();
+            page.objects.iter().filter(|entry| entry.key.as_ref().contains("/挿絵/")).count()
+        };
+        let result = downloader.download_novel_with_execution_options(target, options()).await.unwrap();
+        assert_eq!(result.updated_count, 2);
+        assert_eq!(image_count().await, 1, "an unrelated image must still be saved");
+        let hits = |url: &str| http.requested_urls().iter().filter(|request| request.ends_with(url)).count();
+        for url in urls {
+            assert_eq!(hits(url), 1, "{url} must not be retried in another episode");
+            allow_image(url);
+        }
+        let result = downloader.download_novel_with_execution_options(target, options()).await.unwrap();
+        assert_eq!(result.updated_count, 2);
+        for url in urls {
+            assert_eq!(hits(url), 2, "{url} must be retried on the next download");
+        }
+        assert_eq!(image_count().await, 4, "all recovered images must be saved");
+    }
+
+    #[tokio::test]
+    async fn anonymous_illustration_failure_does_not_hide_a_logged_in_attempt() {
+        use crate::platform::{HttpClient, HttpRequest, HttpStreamResponse};
+
+        #[derive(Default)]
+        struct Site(MockHttpClient);
+        impl HttpClient for Site {
+            fn send(&self, request: HttpRequest) -> PlatformFuture<'_, Result<HttpResponse>> {
+                if request.url.ends_with("/n1234ab/2/")
+                    && !request.headers.iter().any(|(name, value)| {
+                        name.eq_ignore_ascii_case("cookie") && value == "sid=valid"
+                    })
+                {
+                    return Box::pin(async {
+                        Ok(HttpResponse {
+                            status: 200,
+                            headers: Vec::new(),
+                            body: b"login needed".to_vec(),
+                        })
+                    });
+                }
+                self.0.send(request)
+            }
+
+            fn send_stream(&self, request: HttpRequest) -> PlatformFuture<'_, Result<HttpStreamResponse>> {
+                self.0.send_stream(request)
+            }
+        }
+
+        let mut setting = illustration_test_site();
+        setting.login_pattern = Some(SiteSettingValue::Single("login needed".into()));
+        setting.login_wall_error = super::site_setting::LoginWallError::Login;
+        setting.compile();
+        let http = Arc::new(Site::default());
+        let target = "https://illust-default.test/n1234ab/";
+        let image = "https://illust-default.test/images/forbidden.jpg";
+        http.0.add_text(
+            target,
+            200,
+            r#"<h1>挿絵テスト</h1><span>作者</span><a href="/n1234ab/1/">第1話</a><a href="/n1234ab/2/">第2話</a><a href="/n1234ab/3/">第3話</a>"#,
+        );
+        for index in 1..=3 {
+            http.0.add_text(
+                format!("{target}{index}/"),
+                200,
+                format!(r#"<div class="body">本文{index}<img src="{image}" /></div>"#),
+            );
+        }
+        http.0.add_text(image, 403, "forbidden");
+        let cookies = Arc::new(MemoryCookieStore::new());
+        let group = LoginGroup::new(&setting.domain, vec![HostCookie {
+            host: setting.domain.clone(),
+            cookie: "sid=valid".into(),
+        }]);
+        cookies.save_groups(&setting.domain, &[group]).await.unwrap();
+
+        let store = Arc::new(MemoryObjectStore::new());
+        let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
+                objects: store.clone(),
+                assets: store,
+                clock: Arc::new(SystemClock),
+            },
+            vec![setting],
+            HashMap::new(),
+            Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
+        ).unwrap().with_cookie_store(cookies);
+        let result = downloader.download_novel(target).await.unwrap();
+        assert_eq!(result.updated_count, 3);
+        let image_cookies: Vec<_> = http.0.sent_requests().into_iter()
+            .filter(|(url, _)| url == image)
+            .map(|(_, headers)| headers.into_iter()
+                .find_map(|(name, value)| name.eq_ignore_ascii_case("cookie").then_some(value)))
+            .collect();
+        assert_eq!(image_cookies, [None, Some("sid=valid".into())]);
     }
 
     #[test]
