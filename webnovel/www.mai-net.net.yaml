@@ -12,7 +12,7 @@ timezone: Asia/Tokyo
 append_title_to_folder_name: yes
 title_strip_pattern: (【.+?】|\(.+?\)|（.+?）)
 sitename: *name
-version: 1.0
+version: 1.1
 
 # ------------------------------------------------------------
 # 書籍情報取得設定
@@ -39,6 +39,9 @@ error_message: エラー！恐らく存在しないスレッドを指定して�
 body_pattern: <blockquote><div style="line-height:1.5">(?<body>.+?)</div></blockquote>
 introduction_pattern: null
 postscript_pattern: null
+
+# ページ共通の広告画像ではなく投稿本文の挿絵だけを拾う。
+illust_from_raw: false
 
 # ------------------------------------------------------------
 # 小説情報からパースするための設定

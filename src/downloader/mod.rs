@@ -4241,7 +4241,9 @@ is_narou: false
             introduction: String::new(),
             postscript: String::new(),
         };
-        let raw_html = r#"<a href="https://syosetu.org/?mode=url_jump&amp;url=https%3A%2F%2Fexample.com">通販サイト</a>
+        let raw_html = r#"<img src="https://syosetu.org/site/banner.jpg">
+<a href="https://syosetu.org/?mode=url_jump&amp;url=https%3A%2F%2Fexample.com">通販サイト</a>
+<a href="https://syosetu.org/novel/123/">おすすめ作品</a>
 <span>後書き</span>
 <a href="http://syosetu.org/img/user/10193/110088.jpg" alt="挿絵" name='img'>【挿絵表示】</a>"#;
 
@@ -4257,41 +4259,104 @@ is_narou: false
         assert_eq!(urls, vec!["http://syosetu.org/img/user/10193/110088.jpg"]);
     }
 
-    /// なろうのサイト定義は `illust_grep_pattern: null` で、narou.rb は
-    /// `HTML#initialize` の既定 `<img>` パターンを使う。なろうの挿絵 URL は
-    /// protocol-relative (`//host/...`) なので、本文 URL 基準で解決してから
-    /// mitemin の取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。
-    /// 本文は実際の n9364bq (12話「※【囁くラタトスク】挿絵」) の形。
-    #[test]
-    fn narou_definition_uses_the_default_img_pattern_for_mitemin_illustrations() {
-        let setting: SiteSetting =
-            serde_yaml::from_str(include_str!("../../webnovel/ncode.syosetu.com.yaml")).unwrap();
-        assert!(setting.illust_grep_pattern.is_none());
-
-        let re = compile_html_pattern(super::DEFAULT_ILLUST_GREP_PATTERN).unwrap();
-        let body = r#"<p>前</p><p><a href="//9496.mitemin.net/i88657/" target="_blank"><img src="//9496.mitemin.net/userpageimage/viewimagebig/icode/i88657/" alt="挿絵(By みてみん)" border="0" /></a></p>"#;
-        let captured = re.captures(body).expect("default img pattern matches");
-        let source = captured.get(1).unwrap().as_str();
-        assert_eq!(
-            source,
-            "//9496.mitemin.net/userpageimage/viewimagebig/icode/i88657/"
-        );
-
-        let resolved = crate::illustration_store::normalize_illustration_url(
-            &crate::downloader::util::build_section_url(
-                &setting,
-                "https://ncode.syosetu.com/n9364bq/12/",
-                source,
+    #[tokio::test]
+    async fn bundled_site_illustrations_scan_story_content_not_page_chrome() {
+        const NAROU_PAGE: &str = r#"<header><img src="https://static.syosetu.com/site/banner.png"></header>
+<div class="js-novel-text p-novel__text p-novel__text--preface">
+<p><img src="//9496.mitemin.net/userpageimage/viewimagebig/icode/i88656/" alt="挿絵(By みてみん)" /></p>
+</div>
+<div class="js-novel-text p-novel__text">
+<p><a href="//9496.mitemin.net/i88657/"><img src="//9496.mitemin.net/userpageimage/viewimagebig/icode/i88657/" alt="挿絵(By みてみん)" /></a></p>
+</div>
+<div class="js-novel-text p-novel__text p-novel__text--afterword">
+<p><img src="//9496.mitemin.net/userpageimage/viewimagebig/icode/i88658/" alt="挿絵(By みてみん)" /></p>
+</div>"#;
+        const MITEMIN: &[&str] = &[
+            "https://9496.mitemin.net/userpageimage/viewimage/icode/i88656/",
+            "https://9496.mitemin.net/userpageimage/viewimage/icode/i88657/",
+            "https://9496.mitemin.net/userpageimage/viewimage/icode/i88658/",
+        ];
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            (
+                include_str!("../../webnovel/kakuyomu.jp.yaml"),
+                "https://kakuyomu.jp/works/1/episodes/2",
+                r#"<header><img src="https://cdn-static.kakuyomu.jp/images/brand/10th_KakuyomuLogo.png"></header>
+<div class="widget-episodeBody js-episode-body">本文</div>"#,
+                &[],
             ),
-        );
-        assert_eq!(
-            resolved,
-            "https://9496.mitemin.net/userpageimage/viewimage/icode/i88657/"
-        );
-        assert_eq!(
-            crate::illustration_store::mitemin_illustration_id(&resolved).as_deref(),
-            Some("i88657")
-        );
+            (include_str!("../../webnovel/ncode.syosetu.com.yaml"), "https://ncode.syosetu.com/n9364bq/12/", NAROU_PAGE, MITEMIN),
+            (include_str!("../../webnovel/novel18.syosetu.com.yaml"), "https://novel18.syosetu.com/n9364bq/12/", NAROU_PAGE, MITEMIN),
+            (
+                include_str!("../../webnovel/www.mai-net.net.yaml"),
+                "http://www.mai-net.net/bbs/sst/sst.php?act=dump&cate=all&all=6858&n=0&count=1",
+                r#"<img src="//ad.jp.ap.valuecommerce.com/servlet/gifbanner?sid=24126&amp;pid=872441694">
+<blockquote><div style="line-height:1.5">本文<img src="https://images.example.org/arcadia.jpg"></div></blockquote>"#,
+                &["https://images.example.org/arcadia.jpg"],
+            ),
+            (
+                include_str!("../../webnovel/www.pixiv.net.yaml"),
+                "https://www.pixiv.net/ajax/novel/42",
+                r#"{"body":{"id":"42","description":"<img src=\"https://i.pximg.net/cover.jpg\">","content":"本文[uploadedimage:1]","textEmbeddedImages":{"1":{"urls":{"original":"https://i.pximg.net/story.jpg"}}}}}"#,
+                &["https://i.pximg.net/story.jpg"],
+            ),
+            (
+                include_str!("../../webnovel/www.akatsuki-novels.com.yaml"),
+                "https://www.akatsuki-novels.com/stories/view/1/novel_id~2",
+                r#"<header><img src="https://images.example.org/banner.jpg"></header>
+<div class="whitespace-pre-line reading-body">本文<img src="https://images.example.org/akatsuki.jpg"></div>"#,
+                &["https://images.example.org/akatsuki.jpg"],
+            ),
+            (
+                include_str!("../../webnovel/novelup.plus.yaml"),
+                "https://novelup.plus/story/759726165/907418396",
+                r#"<p id="episode_content">本文<img src="https://novelup.plus/uploads/1/2.jpg"></p>
+<div><img src="https://novelup.plus/s3/stamp/8007.png"></div>"#,
+                &["https://novelup.plus/uploads/1/2.jpg"],
+            ),
+        ];
+        for &(yaml, episode_url, html, wanted) in cases {
+            let setting = SiteSetting::load_bundled(&[yaml]).unwrap().pop().unwrap();
+            let http = Arc::new(MockHttpClient::new());
+            for &url in wanted {
+                http.add_response(url, HttpResponse {
+                    status: 200,
+                    headers: vec![("Content-Type".into(), "image/jpeg".into())],
+                    body: b"jpeg-bytes".to_vec(),
+                });
+            }
+            let mut page = html.to_owned();
+            super::util::pretreatment_source(&mut page, "UTF-8", Some(&setting));
+            let (section, raw_html) = super::section::parse_section_html(&setting, page).unwrap();
+            let store = Arc::new(MemoryObjectStore::new());
+            let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+                DownloaderPlatform {
+                    http: http.clone(),
+                    rate_limiter: Arc::new(FakeRateLimiter::new()),
+                    novels: Arc::new(MemoryNovelRepository::new().with_objects(store.clone())),
+                    objects: store.clone(),
+                    assets: store.clone(),
+                    clock: Arc::new(SystemClock),
+                },
+                Vec::new(),
+                HashMap::new(),
+                Arc::new(super::settings::SnapshotDownloaderSettings::default()),
+            ).unwrap();
+            let keys = NovelObjectKeys::new("Site", "Book", true).unwrap();
+            let writer = test_origin(&downloader, &keys).await;
+            let mut index = crate::illustration_store::IllustrationIndex::default();
+            downloader.download_illustration(
+                &writer, &setting, &section, &keys, &mut index, None, &mut Default::default(),
+                episode_url, Some(&raw_html), &mut None, 0,
+            ).await.unwrap();
+            let mut requested: Vec<_> = http.sent_requests().into_iter().map(|(url, _)| url).collect();
+            requested.sort_unstable();
+            assert_eq!(requested, wanted, "{}", setting.domain);
+            assert_eq!(index.source_count(), wanted.len());
+            for &source in wanted {
+                let key = keys.illustration(index.filename_for_source(source).unwrap()).unwrap();
+                assert_eq!(store.read_small(&key).await.unwrap().as_deref(), Some(b"jpeg-bytes".as_slice()));
+            }
+        }
     }
 
     /// 実体確認の並行度と結果を観測する資産ストア。`stat` は 1 回だけ

@@ -27,7 +27,7 @@ preserve_missing_sections: true
 append_title_to_folder_name: yes
 title_strip_pattern: null
 sitename: *name
-version: 2.6
+version: 2.7
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)
@@ -123,6 +123,8 @@ href: /works/\\k<ncode>/episodes/\\k<index>
 body_pattern: <div class="widget-episodeBody js-episode-body".*?>(?<body>.+?)</div>
 introduction_pattern: null
 postscript_pattern: null
+# ロゴや共有ボタンは話ページの本文外にあるため拾わない。
+illust_from_raw: false
 
 # ------------------------------------------------------------
 # 小説情報からパースするための設定

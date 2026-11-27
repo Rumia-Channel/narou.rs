@@ -28,7 +28,7 @@ append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: over18=yes
 sitename: *name
-version: 2.5
+version: 2.6
 
 # ------------------------------------------------------------
 # 目次取得設定
@@ -66,6 +66,8 @@ postscript_pattern: |-
   (?<postscript>.+?)
   ?</div>
 
+# 本文・前書き・後書きの挿絵だけを取得し、サイト共通の画像は拾わない。
+illust_from_raw: false
 illust_current_url: null
 illust_grep_pattern: null
 

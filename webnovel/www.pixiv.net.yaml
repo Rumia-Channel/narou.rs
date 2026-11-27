@@ -51,7 +51,7 @@ headers:
   Referer: \k<top_url>/
 confirm_over18: no
 append_title_to_folder_name: yes
-version: 1.8
+version: 1.9
 
 # ------------------------------------------------------------
 # 作品属性 (未一致は小説)。a は単体イラスト・漫画、c は漫画シリーズ。
@@ -463,6 +463,8 @@ next_url: \\k<top_url>\\k<next_page>
 # ------------------------------------------------------------
 # 本文取得設定
 # 挿絵は i.pximg.net から落とす。このホストは Referer が無いと 403 を返す。
+# JSON から組み立てた本文・前書き・後書きだけを確認し、作品情報は走査しない。
+illust_from_raw: false
 illust_grep_pattern: <img src="(?<src>.+?)"[^>]*>
 body_pattern: |-
   body::
