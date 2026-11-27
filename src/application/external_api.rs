@@ -145,8 +145,13 @@ pub struct ExternalListRequest {
     pub author: Option<String>,
     /// サイト名 (完全一致)。
     pub site: Option<String>,
-    /// タグ (完全一致)。
-    pub tag: Option<String>,
+    /// タグの完全一致 (大文字小文字を区別)。繰り返し指定は AND、
+    /// 1 つの値の中の `|` 区切りは OR (`tag=a&tag=b|c` は
+    /// `a AND (b OR c)`)。`tag=a` 1 件は従来と同じ完全一致 1 件。
+    pub tag_groups: Vec<Vec<String>>,
+    /// 除外するタグ (完全一致)。いずれかを持つ作品は返さない。
+    /// `not_tag` の繰り返しと `|` 区切りはすべて除外対象へ平たく足される。
+    pub not_tags: Vec<String>,
     /// ncode (完全一致)。
     pub ncode: Option<String>,
     /// 属性タグ (`小説` / `漫画`)。
@@ -196,7 +201,18 @@ impl ExternalListRequest {
                 "title" => request.title = non_empty(value),
                 "author" => request.author = non_empty(value),
                 "site" | "sitename" => request.site = non_empty(value),
-                "tag" => request.tag = non_empty(value),
+                "tag" => {
+                    // 繰り返しは AND、`|` 区切りは OR。空の候補だけの指定は
+                    // 無視する (既定の絞り込み無しと同じ)。
+                    let alternatives = tag_alternatives(value);
+                    if !alternatives.is_empty() {
+                        request.tag_groups.push(alternatives);
+                    }
+                }
+                "not_tag" | "tag_not" | "exclude_tag" => {
+                    // 繰り返しも `|` 区切りも、除外対象へ平たく足す。
+                    request.not_tags.extend(tag_alternatives(value));
+                }
                 "ncode" => request.ncode = non_empty(value),
                 "attribute" | "attribute_tag" => request.attribute = non_empty(value),
                 "novel_type" | "type" => {
@@ -268,9 +284,12 @@ impl ExternalListRequest {
         if let Some(site) = &self.site {
             filter.site = Some(site.clone());
         }
-        if let Some(tag) = &self.tag {
-            filter.tag = Some(tag.clone());
-        }
+        filter.tag_groups.extend(
+            self.tag_groups
+                .iter()
+                .map(|group| group.iter().map(|tag| tag.clone()).collect::<Vec<_>>()),
+        );
+        filter.exclude_tags.extend(self.not_tags.iter().cloned());
         if let Some(ncode) = &self.ncode {
             filter.ncode = Some(ncode.clone());
         }
@@ -1242,6 +1261,19 @@ fn status_text(record: &NovelRecord, frozen: bool) -> String {
     status.join(", ")
 }
 
+/// `|` 区切りのタグ候補を OR 集合へ分ける。タグ名に `|` 自体は使えない。
+/// 空白だけの候補は落とし、集合の中の重複は除く。
+fn tag_alternatives(value: &str) -> Vec<String> {
+    let mut alternatives: Vec<String> = Vec::new();
+    for alternative in value.split('|') {
+        let tag = alternative.trim();
+        if !tag.is_empty() && !alternatives.iter().any(|known| known == tag) {
+            alternatives.push(tag.to_string());
+        }
+    }
+    alternatives
+}
+
 fn invalid(message: String) -> ApplicationError {
     ApplicationError::InvalidRequest(message)
 }
@@ -1346,6 +1378,47 @@ mod tests {
         assert!(matches!(error, ApplicationError::InvalidRequest(_)));
         assert_eq!(parse_format("jsonl").unwrap(), OutputFormat::Jsonl);
         assert!(parse_format("yaml").is_err());
+    }
+
+    #[test]
+    fn repeated_tag_params_are_anded_and_pipe_alternatives_are_ored() {
+        let request = ExternalListRequest::from_pairs(&pairs(&[
+            ("tag", "sf"),
+            ("tag", "ファンタジー|恋愛"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            request.tag_groups,
+            vec![
+                vec!["sf".to_string()],
+                vec!["ファンタジー".to_string(), "恋愛".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn not_tag_flattens_repeats_and_alternatives() {
+        let request = ExternalListRequest::from_pairs(&pairs(&[
+            ("not_tag", "r15|r18"),
+            ("not_tag", "r15"),
+            ("exclude_tag", "404"),
+        ]))
+        .unwrap();
+        assert!(request.not_tags.contains(&"r15".to_string()));
+        assert!(request.not_tags.contains(&"r18".to_string()));
+        assert!(request.not_tags.contains(&"404".to_string()));
+    }
+
+    #[test]
+    fn empty_tag_alternatives_are_dropped() {
+        let request = ExternalListRequest::from_pairs(&pairs(&[("tag", "  |  ")])).unwrap();
+        assert!(request.tag_groups.is_empty());
+        // 前後の空白は除き、候補内の重複は 1 つにする。
+        let request = ExternalListRequest::from_pairs(&pairs(&[("tag", " sf |sf| 恋愛 ")])).unwrap();
+        assert_eq!(
+            request.tag_groups,
+            vec![vec!["sf".to_string(), "恋愛".to_string()]]
+        );
     }
 
     #[test]

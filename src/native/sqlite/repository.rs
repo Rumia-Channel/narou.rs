@@ -953,6 +953,60 @@ mod tests {
         );
     }
 
+    /// `tag_groups` は集合ごとに AND、集合の中は OR。SQLite と memory の
+    /// 両バックエンドで同じ行が返ること。
+    #[tokio::test]
+    async fn dual_run_tag_groups_and_of_or_sets_agree() {
+        let sqlite = SqliteNovelRepository::new(crate::native::sqlite::open_in_memory().unwrap());
+        let memory = MemoryNovelRepository::new();
+        let mutations = vec![
+            NovelMutation::Upsert(record(1, "A", "作者", "https://example.test/1", &["sf", "ファンタジー"])),
+            NovelMutation::Upsert(record(2, "B", "作者", "https://example.test/2", &["sf"])),
+            NovelMutation::Upsert(record(3, "C", "作者", "https://example.test/3", &["恋愛"])),
+            NovelMutation::Upsert(record(4, "D", "作者", "https://example.test/4", &["sf", "r15"])),
+        ];
+        sqlite.apply_batch(mutations.clone()).await.unwrap();
+        memory.apply_batch(mutations).await.unwrap();
+
+        let cases: Vec<(Vec<Vec<&str>>, Vec<i64>)> = vec![
+            // 1 集合 1 候補は従来の完全一致と同じ。
+            (vec![vec!["sf"]], vec![1, 2, 4]),
+            // 集合の中は OR: sf または恋愛。
+            (vec![vec!["sf", "恋愛"]], vec![1, 2, 3, 4]),
+            // 集合ごとに AND: (sf または恋愛) かつ ファンタジー。
+            (vec![vec!["sf", "恋愛"], vec!["ファンタジー"]], vec![1]),
+            // AND の両方に一致しない行は出ない。
+            (vec![vec!["sf"], vec!["恋愛"]], vec![]),
+            // 大文字小文字を区別する完全一致。
+            (vec![vec!["SF"]], vec![]),
+        ];
+        for (groups, expected) in cases {
+            let filter = NovelFilter {
+                tag_groups: groups
+                    .iter()
+                    .map(|group| group.iter().map(|tag| tag.to_string()).collect())
+                    .collect(),
+                ..NovelFilter::default()
+            };
+            let scan_sqlite = sqlite.scan_ids(&filter, None, 100).await.unwrap();
+            let scan_memory = memory.scan_ids(&filter, None, 100).await.unwrap();
+            let expected_ids: Vec<NovelId> = expected.iter().map(|id| NovelId(*id)).collect();
+            assert_eq!(scan_sqlite, expected_ids, "sqlite groups={groups:?}");
+            assert_eq!(scan_memory, expected_ids, "memory groups={groups:?}");
+        }
+
+        // exclude_tags (not_tag) との組み合わせ: sf 持ちから r15 を除く。
+        let filter = NovelFilter {
+            tag_groups: vec![vec!["sf".to_string()]],
+            exclude_tags: vec!["r15".to_string()],
+            ..NovelFilter::default()
+        };
+        let scan_sqlite = sqlite.scan_ids(&filter, None, 100).await.unwrap();
+        let scan_memory = memory.scan_ids(&filter, None, 100).await.unwrap();
+        assert_eq!(scan_sqlite, vec![NovelId(1), NovelId(2)]);
+        assert_eq!(scan_memory, vec![NovelId(1), NovelId(2)]);
+    }
+
     /// 状態ソートは SQL 側の materialized 値 (`status_sort` =
     /// `novel_query::STATUS_SORT_EXPRESSION`) と可搬な比較器 (`db::sort` の
     /// `status` = `record_status_key`) が同じ順序を返すこと。片方だけ更新すると

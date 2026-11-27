@@ -238,7 +238,8 @@ pub fn tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "自由検索。tag: / author: / site: / title: / status: が指定でき、-  negation、a|b の OR、引用符による phrases を使う。"
                     },
-                    "tag": { "type": "string", "description": "タグ (完全一致)" },
+                    "tag": { "type": "string", "description": "タグ (完全一致)。`|` 区切りで OR (`a|b`)。AND は配列で複数指定する。" },
+                    "not_tag": { "type": "string", "description": "除外するタグ (完全一致)。`|` 区切りも繰り返しもすべて除外対象になる。" },
                     "title": { "type": "string", "description": "題名の部分一致" },
                     "author": { "type": "string", "description": "作者名の部分一致" },
                     "site": { "type": "string", "description": "サイト名 (完全一致)" },
@@ -325,14 +326,25 @@ fn tool_error(message: String) -> Value {
 /// `null` の引数は「指定なし」として落とす (未指定の値を渡すと
 /// 「数値です: 」のようなエラーになる)。
 fn argument_pairs(arguments: &Value) -> Vec<(String, String)> {
-    match arguments.as_object() {
-        Some(map) => map
-            .iter()
-            .filter(|(_, value)| !value.is_null())
-            .map(|(key, value)| (key.clone(), argument_value(value)))
-            .collect(),
-        None => Vec::new(),
+    let mut pairs = Vec::new();
+    let Some(map) = arguments.as_object() else {
+        return pairs;
+    };
+    for (key, value) in map {
+        if value.is_null() {
+            continue;
+        }
+        // 配列は繰り返しパラメータへ展開する (`tag` の AND 指定など)。
+        // スカラは従来どおり 1 件のペア。
+        if let Value::Array(items) = value {
+            for item in items {
+                pairs.push((key.clone(), argument_value(item)));
+            }
+        } else {
+            pairs.push((key.clone(), argument_value(value)));
+        }
     }
+    pairs
 }
 
 fn argument_value(value: &Value) -> String {

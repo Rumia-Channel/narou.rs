@@ -176,6 +176,11 @@ pub struct NovelFilter {
     pub domain: Option<String>,
     /// Any of the record's tags equals this tag.
     pub tag: Option<String>,
+    /// Exact-tag conditions (case-sensitive, like [`Self::tag`]). Each inner
+    /// set is OR-combined alternatives, the sets themselves are AND-combined:
+    /// every group must match at least one of the record's tags. API 連携の
+    /// 繰り返し `tag` パラメータと `a|b` の OR に対応する。
+    pub tag_groups: Vec<Vec<String>>,
     /// Include the separately stored classification as a searchable tag.
     pub attribute_tags_enabled: bool,
     pub ncode: Option<String>,
@@ -208,12 +213,12 @@ impl NovelFilter {
     /// Context alone (freeze IDs or attribute projection) does not select rows.
     pub fn is_unrestricted(&self) -> bool {
         let Self {
-            ids, keyword, site, domain, tag, ncode, is_narou, suspend, novel_type, end,
+            ids, keyword, site, domain, tag, tag_groups, ncode, is_narou, suspend, novel_type, end,
             terms, exclude_ids, exclude_tags, exclude_authors, exclude_sites,
             frozen_ids: _, attribute_tags_enabled: _,
         } = self;
         ids.is_none() && keyword.is_none() && site.is_none() && domain.is_none()
-            && tag.is_none() && ncode.is_none() && is_narou.is_none() && suspend.is_none()
+            && tag.is_none() && tag_groups.is_empty() && ncode.is_none() && is_narou.is_none() && suspend.is_none()
             && novel_type.is_none() && end.is_none() && terms.is_empty()
             && exclude_ids.is_empty() && exclude_tags.is_empty()
             && exclude_authors.is_empty() && exclude_sites.is_empty()
@@ -682,6 +687,15 @@ pub(crate) fn record_matches_filter(record: &NovelRecord, filter: &NovelFilter) 
         && !(filter.attribute_tags_enabled && record.attribute_tag() == Some(tag))
     {
         return false;
+    }
+    for group in &filter.tag_groups {
+        let matched = group.iter().any(|wanted| {
+            record.tags.iter().any(|record_tag| record_tag == wanted)
+                || (filter.attribute_tags_enabled && record.attribute_tag() == Some(wanted.as_str()))
+        });
+        if !matched {
+            return false;
+        }
     }
     if let Some(ncode) = &filter.ncode
         && record.ncode.as_deref() != Some(ncode.as_str())

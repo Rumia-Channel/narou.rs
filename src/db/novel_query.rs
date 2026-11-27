@@ -175,6 +175,42 @@ pub fn build_where<B>(filter: &NovelFilter, mut bind: impl FnMut(NovelBind) -> B
         }
         builder.binds.push(bind(NovelBind::Text(tag.clone())));
     }
+    for group in &filter.tag_groups {
+        if group.is_empty() {
+            // 空の OR 集合はどの作品にも一致しない。
+            builder.sql.push_str(" AND 0=1");
+            continue;
+        }
+        // 集合ごとに AND、集合の中は OR。候補が 1 つなら exact-tag index が
+        // そのまま効くスカラ比較にし、複数なら json_each の IN へ寄せる。
+        let placeholder = format!("?{}", builder.binds.len() + 1);
+        let tags_match = if group.len() == 1 {
+            format!("tag = {placeholder}")
+        } else {
+            format!("tag IN (SELECT value FROM json_each({placeholder}))")
+        };
+        let attribute_match = if filter.attribute_tags_enabled {
+            let attribute = if group.len() == 1 {
+                format!("n.attribute_tag = {placeholder}")
+            } else {
+                format!("n.attribute_tag IN (SELECT value FROM json_each({placeholder}))")
+            };
+            format!(" OR {attribute}")
+        } else {
+            String::new()
+        };
+        write!(
+            builder.sql,
+            " AND (n.id IN (SELECT novel_id FROM novel_tags WHERE {tags_match}){attribute_match})"
+        )
+        .expect("writing to a string cannot fail");
+        let values = if group.len() == 1 {
+            NovelBind::Text(group[0].clone())
+        } else {
+            NovelBind::Text(term_values_json(group))
+        };
+        builder.binds.push(bind(values));
+    }
     if let Some(ncode) = &filter.ncode {
         builder.sql.push_str(" AND n.ncode_fold = ?");
         builder.binds.push(bind(NovelBind::Text(fold(ncode))));
@@ -407,6 +443,7 @@ mod tests {
             site: Some(" Site ".to_string()),
             domain: Some("Domain".to_string()),
             tag: Some("tag".to_string()),
+            tag_groups: vec![vec!["one".to_string()], vec!["two".to_string(), "three".to_string()]],
             ncode: Some("NCODE".to_string()),
             is_narou: Some(true),
             suspend: Some(false),

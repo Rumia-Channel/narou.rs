@@ -39,12 +39,14 @@ pub const TOKEN_HEADER: &str = "x-narou-api-token";
 pub async fn api_novels(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
     if let Some(response) = authorize(&state, &headers).await {
         return response;
     }
-    let request = match ExternalListRequest::from_pairs(&pairs(&params)) {
+    // Vec のペアで受けるのは、繰り返しの `tag` / `not_tag` を AND 条件として
+    // 残すため (HashMap では重複キーが潰れる)。
+    let request = match ExternalListRequest::from_pairs(&params) {
         Ok(request) => request,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, "bad_request", error.message()),
     };
@@ -476,14 +478,6 @@ fn invalid_id(id: &str) -> Response {
         "bad_request",
         &format!("ID が不正です: {id}"),
     )
-}
-
-/// クエリパラメータを (キー, 値) の列にする。
-fn pairs(params: &HashMap<String, String>) -> Vec<(String, String)> {
-    params
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
 }
 
 /// 出力形式を取り出す (不正なら 400 のメッセージを返す)。
