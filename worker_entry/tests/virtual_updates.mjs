@@ -165,6 +165,8 @@ try {
   await tick(); // Redeliver the real pending row after deliberately held delivery.
   const failed = await terminalJob(corrupt.ids[0]);
   assert.equal(failed.status, 'permanent', JSON.stringify(failed));
+  assert.match(failed.last_error, /retries exhausted after 1 attempts: .*extra fields must be a mapping/,
+    'the acquisition lane must apply the newly saved retry limit to the actual decode failure');
   assert.equal(failed.attempts, 1, 'a decode failure must consume the configured attempt');
   assert.equal((await sql(`SELECT extra_fields_yaml FROM novels WHERE id=${real}`))[0].extra_fields_yaml, '[]');
   console.log('PASS invalid stored metadata reaches bounded retry settlement without being replaced');

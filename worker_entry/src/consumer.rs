@@ -1283,11 +1283,10 @@ async fn settle_retryable(
     execution_token: &str,
     reason: &str,
 ) -> Result<RetryDisposition> {
-    // リトライ方針は native と同じ local 設定から組み立てる
-    // (`queue.max-retries` / `queue.retry-backoff`)。読み取り失敗は既定値に
-    // 倒す — native の設定読み取り失敗と同じ扱い。
+    // UI 用のキャッシュではなく、設定保存直後の値を primary から読む。
+    // 読み取りに失敗した場合は native と同様に既定値を使う。
     let values = runtime
-        .services
+        .write_services
         .settings
         .get_many(&[
             retry_policy::MAX_RETRIES_KEY,

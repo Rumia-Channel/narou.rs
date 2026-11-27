@@ -624,10 +624,10 @@ fn capture_cookies(
     if mode != CaptureMode::Interactive {
         let config = site.browser_token.as_ref()
             .ok_or_else(|| "このサイトにはブラウザトークン取得が定義されていません".to_string())?;
-        if mode == CaptureMode::TokenJson || !config.wait_for_page {
-            if let Some(captured) = browser_token::prepare_token(&websocket_url, config, target_url)? {
-                return Ok(captured);
-            }
+        if (mode == CaptureMode::TokenJson || !config.wait_for_page)
+            && let Some(captured) = browser_token::prepare_token(&websocket_url, config, target_url)?
+        {
+            return Ok(captured);
         }
         if mode != CaptureMode::TokenJson && !config.wait_for_page {
             println!("ブラウザの確認トークンを準備しました。確認が終わったら Enter で保存します。");

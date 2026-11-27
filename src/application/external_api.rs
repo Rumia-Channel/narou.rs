@@ -264,6 +264,8 @@ impl ExternalListRequest {
     ) -> NovelFilter {
         let mut filter = NovelFilter {
             frozen_ids: Some(frozen_ids.clone()),
+            tag_groups: self.tag_groups.clone(),
+            exclude_tags: self.not_tags.clone(),
             ..NovelFilter::default()
         };
 
@@ -284,12 +286,6 @@ impl ExternalListRequest {
         if let Some(site) = &self.site {
             filter.site = Some(site.clone());
         }
-        filter.tag_groups.extend(
-            self.tag_groups
-                .iter()
-                .map(|group| group.iter().map(|tag| tag.clone()).collect::<Vec<_>>()),
-        );
-        filter.exclude_tags.extend(self.not_tags.iter().cloned());
         if let Some(ncode) = &self.ncode {
             filter.ncode = Some(ncode.clone());
         }

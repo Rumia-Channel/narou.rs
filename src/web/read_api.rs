@@ -139,28 +139,6 @@ pub async fn novels(
     super::novels::leased_response(response, reads)
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn repeated_query_keys_survive_vec_pair_extraction() {
-        // `tag` の繰り返しは AND 条件なので、HashMap へ潰れないことを固定する。
-        let uri = "/api/read/v1/novels?tag=sf&tag=%E6%81%8B%E6%84%9B%7C%E3%83%A9%E3%83%96%E3%82%B3%E3%83%A1&not_tag=r15&limit=all"
-            .parse::<axum::http::Uri>()
-            .unwrap();
-        let axum::extract::Query(pairs): axum::extract::Query<Vec<(String, String)>> =
-            axum::extract::Query::try_from_uri(&uri).unwrap();
-        assert_eq!(
-            pairs,
-            vec![
-                ("tag".to_string(), "sf".to_string()),
-                ("tag".to_string(), "恋愛|ラブコメ".to_string()),
-                ("not_tag".to_string(), "r15".to_string()),
-                ("limit".to_string(), "all".to_string()),
-            ]
-        );
-    }
-}
-
 pub async fn novel(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let mut reads = state.services.content.read_scope("read-api-novel");
     let result = state.services.external_api.novel(&mut reads, id).await;
@@ -198,3 +176,25 @@ pub async fn epub(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
     };
     super::novels::leased_response(response, reads)
 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn repeated_query_keys_survive_vec_pair_extraction() {
+        // `tag` の繰り返しは AND 条件なので、HashMap へ潰れないことを固定する。
+        let uri = "/api/read/v1/novels?tag=sf&tag=%E6%81%8B%E6%84%9B%7C%E3%83%A9%E3%83%96%E3%82%B3%E3%83%A1&not_tag=r15&limit=all"
+            .parse::<axum::http::Uri>()
+            .unwrap();
+        let axum::extract::Query(pairs): axum::extract::Query<Vec<(String, String)>> =
+            axum::extract::Query::try_from_uri(&uri).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                ("tag".to_string(), "sf".to_string()),
+                ("tag".to_string(), "恋愛|ラブコメ".to_string()),
+                ("not_tag".to_string(), "r15".to_string()),
+                ("limit".to_string(), "all".to_string()),
+            ]
+        );
+    }
+}
+

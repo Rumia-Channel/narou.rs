@@ -203,7 +203,7 @@ pub async fn reap_stuck_jobs(runtime: &WorkerRuntime, push: &PushHubClient) -> R
 /// Cloudflare 側の配信上限 (`CF_CONSUMER_MAX_RETRIES`) にクランプする。
 async fn effective_max_retries(runtime: &WorkerRuntime) -> u32 {
     let value = runtime
-        .services
+        .write_services
         .settings
         .get(retry_policy::MAX_RETRIES_KEY)
         .await
